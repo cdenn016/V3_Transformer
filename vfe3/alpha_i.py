@@ -83,6 +83,30 @@ def alpha_state_dependent_per_coord(
     return alpha, alpha_regularizer(alpha, b0=b0, c0=c0)
 
 
+def alpha_gradient_coefficient(
+    kl:    torch.Tensor,             # (..., N) or (..., N, K) self-divergence
+
+    *,
+    value: float = 1.0,
+    b0:    'float | torch.Tensor' = 1.0,
+    c0:    'float | torch.Tensor' = 1.0,
+    mode:  str = "constant",
+) -> torch.Tensor:
+    r"""Effective coefficient a_i multiplying d D(q_i||p_i) in the belief gradient.
+
+    By the alpha-envelope, at the state-dependent stationary point alpha* the
+    coefficient is alpha* itself: d/dx[alpha*(D)*D + R(alpha*(D))] = alpha* dD/dx,
+    because alpha + alpha'(D + b0 - c0/alpha) and the bracket vanishes at alpha*.
+    So no product-rule correction is needed (R must be present in F). Constant
+    mode returns ``value``.
+    """
+    if mode == "constant":
+        return torch.full_like(kl, value)
+    if mode in ("state_dependent", "state_dependent_per_coord"):
+        return c0 / (b0 + kl).clamp(min=1e-12)
+    raise ValueError(f"unknown alpha mode {mode!r}")
+
+
 def self_coupling_alpha(
     kl:       torch.Tensor,          # (..., N) or (..., N, K) self-divergence
 

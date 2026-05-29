@@ -40,3 +40,21 @@ def test_new_form_with_novel_kwarg_reachable_without_editing_dispatcher():
     kl = torch.zeros(3)
     a, r = self_coupling_alpha(kl, mode="_test_scaled", scale=5.0)
     assert torch.allclose(a, torch.full((3,), 5.0))
+
+
+from vfe3.alpha_i import alpha_gradient_coefficient
+
+
+def test_alpha_grad_coefficient_constant_is_value():
+    kl = torch.rand(3, 5)
+    assert torch.allclose(alpha_gradient_coefficient(kl, mode="constant", value=2.0),
+                          torch.full((3, 5), 2.0))
+
+
+def test_alpha_grad_coefficient_state_dependent_is_alpha_star():
+    # By the alpha-envelope, the effective coefficient is alpha* itself (the
+    # alpha'*D and R' paths cancel at the stationary alpha* = c0/(b0+KL)).
+    kl = torch.tensor([0.0, 1.0, 4.0])
+    b0, c0 = 0.5, 2.0
+    coef = alpha_gradient_coefficient(kl, mode="state_dependent", b0=b0, c0=c0)
+    assert torch.allclose(coef, c0 / (b0 + kl), atol=1e-6)
