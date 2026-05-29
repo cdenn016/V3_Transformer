@@ -1,7 +1,6 @@
 r"""Lie-algebra generator construction for VFE_3.0 gauge groups.
 
-Ported from VFE_2.0 math_utils/generators/builders.py. Generators are built in
-float64 (exact integer entries) then cast to the requested dtype, matching 2.0.
+Generators are built in float64 (exact integer entries) then cast to the requested dtype.
 Conventions:
   gl(K)            : full K^2 basis E_ij (1 at (i,j)), row-major.
   block GL(d_head) : per-head gl(d_head) embedded in the head's diagonal block.
@@ -56,7 +55,7 @@ def generate_glk(
     Always returns ``(K^2, K, K)``. With ``include_identity=False`` the
     normalized identity (trace) direction is projected out of each generator,
     yielding an overcomplete spanning set for sl(K) (K^2 matrices spanning a
-    rank K^2-1 space), not a minimal basis — matching VFE_2.0.
+    rank K^2-1 space), not a minimal basis.
     """
     if K < 1:
         raise ValueError(f"K must be >= 1 for GL(K), got K={K}")

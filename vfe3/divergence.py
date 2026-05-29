@@ -24,7 +24,7 @@ def _warn_alpha_gt_one(alpha: float, family: str) -> None:
     For alpha > 1 the blend ``(1 - alpha) Sigma_q + alpha Sigma_t`` is not a
     convex combination and may be non-positive-definite: the diagonal kernel
     clamps it (returning a saturated value), and the full kernel can fail the
-    Cholesky (where VFE_2.0 returns NaN). Robust alpha > 1 handling is a
+    Cholesky (which then returns NaN). Robust alpha > 1 handling is a
     deferred hardening task. Python's default warning filter shows this once
     per unique message + call-site, so it does not spam an inner loop.
 
@@ -34,7 +34,7 @@ def _warn_alpha_gt_one(alpha: float, family: str) -> None:
     warnings.warn(
         f"renyi: alpha={alpha} > 1 (family={family!r}) leaves the convex regime; "
         f"the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite "
-        f"(diagonal clamps; full may fail Cholesky, where 2.0 returns NaN).",
+        f"(diagonal clamps; full may fail Cholesky and return NaN).",
         RuntimeWarning,
         stacklevel=3,
     )
@@ -59,13 +59,12 @@ def safe_kl_clamp(
 ) -> torch.Tensor:
     r"""Clamp to [0, kl_max]; map NaN/+inf -> kl_max, -inf -> 0.
 
-    Matches VFE_2.0 ``safe_kl_clamp`` default (non-propagating) policy:
-    degenerate pairs become repulsive (kl_max) so a downstream softmax
-    ignores them rather than attending to them.
+    Non-propagating clamp policy: degenerate pairs become repulsive (kl_max)
+    so a downstream softmax ignores them rather than attending to them.
     """
     kl = kl.clamp(min=0.0, max=kl_max)
     # clamp(min=0) already maps -inf -> 0; neginf=0.0 is kept for explicitness
-    # and parity with VFE_2.0's safe_kl_clamp.
+    # (kept explicit for clarity).
     return kl.nan_to_num(nan=kl_max, posinf=kl_max, neginf=0.0)
 
 
@@ -106,10 +105,7 @@ def _gaussian_diagonal_renyi(
     kl_max:  float = 100.0,
     eps:     float = 1e-6,
 ) -> torch.Tensor:
-    r"""Diagonal Gaussian Renyi divergence; KL at ``alpha == 1``.
-
-    Ported from VFE_2.0 ``_kl_kernel_diagonal`` (kl_computation.py:419-459).
-    """
+    r"""Closed-form diagonal Gaussian Renyi/KL."""
     K = mu_q.shape[-1]
     mu_q = mu_q.float()
     sigma_q = sigma_q.float().clamp(min=eps)
@@ -150,15 +146,13 @@ def _gaussian_full_renyi(
     kl_max:  float = 100.0,
     eps:     float = 1e-6,
 ) -> torch.Tensor:
-    r"""Full-covariance Gaussian Renyi divergence; KL at ``alpha == 1``.
+    r"""Full-covariance Gaussian Renyi/KL via Cholesky, with the default ``eps * I`` regularization.
 
-    Ported from VFE_2.0 ``_kl_kernel_dense`` (kl_computation.py:270-330),
-    with the default ``eps * I`` regularization. The 5-round Cholesky
-    escalation and NaN-pair masking are 2.0 robustness features not needed
-    for well-conditioned inputs; they are deferred to a later hardening task.
-    For ``alpha > 1`` the blend can be indefinite and the Cholesky may fail
-    (2.0 returns NaN there); the public ``renyi`` emits a RuntimeWarning in
-    that regime. alpha is validated (positive) at the ``renyi`` boundary.
+    A 5-round Cholesky escalation and NaN-pair masking for ill-conditioned inputs
+    are deferred robustness features; for alpha > 1 the blend can be indefinite
+    and the Cholesky may fail (returning NaN), and the public ``renyi`` emits a
+    RuntimeWarning in that regime. alpha is validated (positive) at the ``renyi``
+    boundary.
     """
     K = mu_q.shape[-1]
     device = mu_q.device

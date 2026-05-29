@@ -43,7 +43,7 @@ def test_transport_covariance_diag_matches_full_diagonal():
     assert torch.allclose(approx, torch.diagonal(full, dim1=-2, dim2=-1), atol=1e-5)
 
 
-def test_transport_covariance_diag_matches_vfe2_formula():
+def test_transport_covariance_diag_matches_einsum_formula():
     omega, g = _omega(3)
     sigma_diag = torch.rand(2, 3, 4, generator=g) + 0.1
     approx = transport_covariance(omega, sigma_diag)

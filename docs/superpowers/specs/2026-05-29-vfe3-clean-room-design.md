@@ -21,11 +21,11 @@ There is no natural-parameter, log-partition, sufficient-statistic, or different
 
 The belief representation is a thin transport container, not an object with behavior: `BeliefState` (`core/types.py:13`) is a `NamedTuple(mu, sigma, phi, omega?)` used only at function boundaries and immediately destructured into separate positional tensors that flow through the entire math layer.
 
-The user's stated goal is a clean, production-quality implementation; 2.0 is described as "VERY messy, tangled, and confusing." Because the tangle is structural (no single F, divergence reimplemented many times, gauge and divergence concerns fused), it cannot be fully removed by editing in place without effectively rewriting the core. The chosen strategy is therefore a clean-room rebuild in a new repo, porting verified math kernels one at a time under golden numerical-equivalence tests, with 2.0 left running untouched until 3.0 reaches parity.
+The user's stated goal is a clean, production-quality implementation; 2.0 is described as "VERY messy, tangled, and confusing." Because the tangle is structural (no single F, divergence reimplemented many times, gauge and divergence concerns fused), it cannot be fully removed by editing in place without effectively rewriting the core. The chosen strategy is therefore a clean-room rebuild in a new repo. V3 is fully self-contained: the math is reimplemented in V3 (informed by 2.0's derivations, never copied), and V3 neither imports nor is tested against 2.0. 2.0's structure serves only as background understanding of what the math must do; correctness is established by V3's own analytic, property, and finite-difference tests.
 
 ## 2. Goals and non-goals
 
-Goals. A single authoritative scalar definition of F, canonical with a surrogate toggle (original idea 1). All belief-gradient math derived from or verified against that single F (original idea 2). An exponential-family abstraction housing the multivariate Gaussian first but structured to admit other families at the divergence layer (original idea 3). A clean separation between the family-agnostic divergence layer and the Gaussian-specific gauge layer. Numerical parity with VFE_2.0's `/vfe` path, proven kernel-by-kernel by golden tests. High modularity so features swap in and out by config without editing call sites (registry behind every seam; see section 4). Production code quality: typed signatures, single home per formula, the project's argument-ordering and alignment conventions, finite-difference gradient checks as first-class tests.
+Goals. A single authoritative scalar definition of F, canonical with a surrogate toggle (original idea 1). All belief-gradient math derived from or verified against that single F (original idea 2). An exponential-family abstraction housing the multivariate Gaussian first but structured to admit other families at the divergence layer (original idea 3). A clean separation between the family-agnostic divergence layer and the Gaussian-specific gauge layer. Mathematical correctness established by V3-internal analytic, property, and finite-difference tests (no dependence on or comparison against VFE_2.0). High modularity so features swap in and out by config without editing call sites (registry behind every seam; see section 4). Production code quality: typed signatures, single home per formula, the project's argument-ordering and alignment conventions, finite-difference gradient checks as first-class tests.
 
 Non-goals for this effort. The `coupled_fep` and `pure_fep` subpackages are out of scope (not investigated, not ported). The hyper-prior `lambda_h * KL(s||h)` and model-coupling `gamma * KL(s_i || Omega s_j)` terms are absent from 2.0's main path and are not ported now; they appear in the design only as named extension points. Generalizing the gauge action to non-Gaussian families is explicitly deferred to a Phase 5 investigation, not assumed.
 
@@ -39,7 +39,7 @@ The consequence for the design is the central architectural decision: the `famil
 
 ## 4. Architecture
 
-The package is built strictly bottom-up; build order equals dependency order, and each layer is golden-tested against VFE_2.0 before the next is built. Proposed package root: `vfe3/`.
+The package is built strictly bottom-up; build order equals dependency order, and each layer is verified by V3-internal tests before the next is built. Proposed package root: `vfe3/`.
 
 Modularity is a first-class requirement: features must swap in and out easily. Every seam exposes a small, stable interface plus a config-selected registry, so a new variant is added by writing it and registering it, never by editing call sites. The intended swap points are the divergence (`divergence.py`: KL, Renyi, future divergences), the self-coupling coefficient (`alpha_i.py`: constant, learnable, Bayesian per-dimension), the exponential family (`families/`: Gaussian first, others behind the same interface), the transport and gauge variant (`geometry/`: flat, non-flat connection, RoPE on or off), the retraction (`geometry/`: SPD exp-map, diagonal exponential, phi Lie-algebra), the attention coefficient and temperature, and the decode head (PriorBank versus linear projection). The free energy is canonical-versus-surrogate by a single toggle. Each registry entry is selected from `config.py` by name, and the golden and finite-difference tests run per registered variant, so adding a feature cannot silently break an existing one. This keeps the layers loosely coupled: a caller depends on a seam's interface, not on which concrete variant is active.
 
@@ -82,7 +82,7 @@ The self-coupling coefficient `alpha_i` is general (per-position, and per-dimens
 
 `gradients/oracle.py`: the reference gradient is `torch.autograd.grad(free_energy(...), params)`. This is the correctness source of truth.
 
-`gradients/kernels.py`: the optimized hand-derived (mu, sigma) kernels ported from `core/vfe_gradients.py` (diagonal, fused diagonal, full covariance, RoPE full gauge). Each is pinned by both a finite-difference check against the oracle and a golden test against 2.0. The phi gradient remains autograd, as in 2.0. The diagonal-pair math is factored once, removing the `837-838 == 1240-1241` duplication and the causal-triangle triplication. The self-coupling alpha gradient (and its learnable-alpha product-rule correction) is supplied by `alpha_i.py`, not reimplemented here; the kernels consume it.
+`gradients/kernels.py`: the optimized hand-derived (mu, sigma) kernels ported from `core/vfe_gradients.py` (diagonal, fused diagonal, full covariance, RoPE full gauge). Each is pinned by a finite-difference check against the autograd oracle. The phi gradient remains autograd. The diagonal-pair math is factored once, removing the `837-838 == 1240-1241` duplication and the causal-triangle triplication. The self-coupling alpha gradient (and its learnable-alpha product-rule correction) is supplied by `alpha_i.py`, not reimplemented here; the kernels consume it.
 
 This realizes the "oracle plus dedup everything" decision: F is the specification, the oracle is the correctness reference, the kernels are the optimized implementation, and the three are pinned together by tests rather than drifting independently.
 
@@ -98,9 +98,9 @@ A clean iterative belief-update loop reading `gradients` and `geometry`, with de
 
 A single dataclass with one `__post_init__` of validation, no override tangle, and no dead meta-fields mixed into the main config.
 
-### 4.8 `tests/golden/` — the equivalence harness
+### 4.8 `tests/` — the V3-internal correctness harness
 
-For each ported kernel, a pinned VFE_2.0 snapshot and the 3.0 implementation are run on identical inputs and asserted equal within float32 tolerance. This is the safety net that makes clean-room porting trustworthy.
+V3 is fully standalone: it never imports VFE_2.0, at runtime or in tests. Correctness is established by V3's own tests — analytic known-value cases (e.g. the closed-form 1-D Gaussian KL, exact generator entries), property/invariant tests (non-negativity, self-divergence zero, gauge equivariance, SPD preservation, group membership, KL = Renyi at alpha=1), and finite-difference gradient checks against the autograd oracle. The math is reimplemented in V3 (informed by, never copied from, 2.0); a one-time, out-of-tree spot check against 2.0 may be run manually during development, but it is not part of the suite and 2.0 is not a dependency.
 
 ## 5. Data flow
 
@@ -108,38 +108,38 @@ embeddings -> `PriorBank.encode` -> `BeliefState(mu, Sigma, phi)` -> E-step iter
 
 ## 6. Numerics
 
-SPD eigenvalue floors, safe symmetric-positive-definite inverses, and the `alpha > 1` blended-covariance clamp (the natural-parameter-domain boundary) are ported from 2.0's `_numerics.py` and `vfe_utils.py`, each given a single home in `families` or `geometry` rather than being scattered.
+SPD eigenvalue floors, safe symmetric-positive-definite inverses, and the `alpha > 1` blended-covariance clamp (the natural-parameter-domain boundary) are reimplemented in V3 (informed by 2.0's numerics, not copied), each given a single home in `families` or `geometry` rather than being scattered.
 
 ## 7. Testing strategy
 
-Golden equivalence per kernel (3.0 versus a pinned 2.0 snapshot). Finite-difference gradient checks (kernel versus oracle versus numerical), now a first-class requirement per CLAUDE.md. Property tests: gauge equivariance (transport then divergence equals divergence then transport), canonical-F stationarity (softmax beta is a stationary point of the canonical F), and the canonical-minus-surrogate gradient gap equal to `-tau^{-1} Cov_beta(KL, grad KL)`.
+V3-internal only — no comparison against, or import of, VFE_2.0. Analytic known-value tests (closed-form cases computed independently in the test), finite-difference gradient checks against the autograd oracle (a first-class requirement per CLAUDE.md), and property/invariant tests: gauge equivariance (divergence invariant under common pushforward), SPD preservation under retraction, group membership of the gauge frame, KL = Renyi at alpha=1, canonical-F stationarity (softmax beta is a stationary point of the canonical F), and the canonical-minus-surrogate gradient gap equal to `-tau^{-1} Cov_beta(KL, grad KL)`.
 
 ## 8. Phase plan
 
-Each phase is gated by passing its golden and property tests before the next begins.
+Each phase is gated by passing its V3-internal analytic, property, and finite-difference tests before the next begins. No phase imports or compares against VFE_2.0.
 
-Phase 0. Scaffold the V3_Transformer repo (`git init`, wire the GitHub remote, package skeleton, config dataclass) and build the golden-equivalence harness against a pinned VFE_2.0 snapshot. This is the first implementation step and requires user go-ahead.
+Phase 0. Scaffold the V3_Transformer repo (`git init`, wire the GitHub remote, package skeleton, config dataclass) and the V3-internal test harness. This is the first implementation step and requires user go-ahead.
 
-Phase 1. `divergence.py` (Renyi primitive, KL as `alpha = 1`) plus the `families` Gaussian parameter representation (entropy, log-partition) and the divergence registry seam. Golden against 2.0's `kl_computation`, `gauge_utils` fused kernels, and the two `prior_bank` decode KLs.
+Phase 1. `divergence.py` (Renyi primitive, KL as `alpha = 1`) plus the `families` Gaussian parameter representation (entropy, log-partition) and the divergence registry seam. Tested by analytic known-value KL/Renyi cases (closed-form 1-D Gaussian) and properties (non-negativity, self-divergence zero, KL = Renyi at alpha=1).
 
-Phase 2. `geometry`: gauge, transport, SPD and phi retraction, RoPE. Golden against 2.0's `transport_ops` and `vfe_utils`. Property: equivariance.
+Phase 2. `geometry`: gauge groups, transport (both parameterizations), SPD and phi retraction, RoPE. Tested by analytic/property tests — exact generator entries, gauge equivariance (divergence invariant under pushforward), SPD preservation, group membership.
 
-Phase 3. `free_energy.py` (the single scalar F, `F = sum_i F_i`) and `alpha_i.py` (the self-coupling coefficient forms). Golden against 2.0's `_f_monotone_step` and the implied F of the analytic kernels.
+Phase 3. `free_energy.py` (the single scalar F, `F = sum_i F_i`) and `alpha_i.py` (the self-coupling coefficient forms). Tested by analytic F values on hand-constructed beliefs and finite-difference against the oracle.
 
-Phase 4. `gradients`: oracle plus ported kernels, together with the `alpha_i.py` gradients (including the learnable-alpha product-rule correction), all finite-difference and golden tested.
+Phase 4. `gradients`: oracle plus optimized kernels, together with the `alpha_i.py` gradients (including the learnable-alpha product-rule correction), all finite-difference tested against the autograd oracle.
 
 Phase 5. Gauge-generalization theory investigation: determine whether any non-Gaussian exponential family admits a useful gauge action (for example a natural-parameter affine action), then finalize the `families`/`geometry` boundary and the exp-family extension decision.
 
-Phase 6. `inference` E-step. Golden against 2.0's `e_step` on fixed seeds.
+Phase 6. `inference` E-step. Tested by V3-internal fixed-seed regression and the property that the E-step is a descent on F (F decreases across inner iterations).
 
-Phase 7. `model`, decode, and config. Full-model parity: 3.0 versus 2.0 training curves on a fixed seed match within tolerance.
+Phase 7. `model`, decode, and config. Full-model: V3 trains end-to-end and reproduces its own loss curve on a fixed seed (V3-internal regression), with the expected scaling/PPL behavior sanity-checked.
 
 Phase 8. Cutover criteria and documentation.
 
 ## 9. Risks and open questions
 
-The pinned-2.0-snapshot dependency for golden tests must import VFE_2.0 code; the harness needs a stable path to a 2.0 checkout (sibling directory) and should pin a specific commit so equivalence is reproducible. Full-covariance and RoPE-full-gauge paths in 2.0 are opt-in and less exercised; their golden tests may surface latent 2.0 behavior that must be matched deliberately or consciously corrected (any intentional divergence from 2.0 must be recorded). The Phase 5 investigation may conclude that no non-Gaussian family is worth a gauge hook, in which case the `geometry` layer stays Gaussian-only and the exp-family abstraction is confined to the divergence layer; the design already assumes this as the default.
+Because V3 is reimplemented rather than diffed against 2.0, correctness rests on the quality of the V3-internal tests: analytic known-value cases must be hand-derived correctly, and property tests must be strong enough to catch a wrong-but-plausible formula. Where a closed form is subtle (full-covariance Renyi, the BCH phi retraction, RoPE), the analytic test must pin a genuinely independent expected value (e.g. a 1-D or 2-D case computed by hand, or a property that uniquely determines the result), not merely re-run the same expression. The Phase 5 investigation may conclude that no non-Gaussian family is worth a gauge hook, in which case the `geometry` layer stays Gaussian-only and the exp-family abstraction is confined to the divergence layer; the design already assumes this as the default.
 
 ## 10. Cutover criteria
 
-VFE_3.0 replaces VFE_2.0's `/vfe` path when: all ported kernels pass golden equivalence within tolerance; finite-difference gradient checks pass for every kernel against the oracle; a full training run reproduces 2.0's loss curve on a fixed seed within tolerance; and the exp-family and gauge boundaries are finalized per Phase 5.
+VFE_3.0 stands as the production implementation when: every module passes its V3-internal analytic + property tests; finite-difference gradient checks pass for every kernel against the autograd oracle; a full training run trains end-to-end and reproduces its own loss curve on a fixed seed (V3-internal regression) with the expected scaling/PPL behavior; and the exp-family and gauge boundaries are finalized per Phase 5.

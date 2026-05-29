@@ -2,8 +2,7 @@ r"""SPD-manifold retractions + Fisher natural-gradient preconditioner (VFE_3.0).
 
 The SPD retraction keeps Sigma on the SPD manifold under a tangent update; the
 Fisher preconditioner converts Euclidean (mu, sigma) gradients to natural
-gradients. Ported from VFE_2.0 vfe_utils.py / vfe_gradients.py. The phi
-Lie-algebra retraction is a separate phase.
+gradients. The phi Lie-algebra retraction is a separate phase.
 """
 
 from typing import Tuple
@@ -23,8 +22,7 @@ def retract_spd_diagonal(
 ) -> torch.Tensor:
     r"""Diagonal SPD retraction sigma_new = sigma * exp(tau * clamp(dsigma/sigma)).
 
-    Positivity by construction (exp > 0); clamped to [eps, sigma_max]. Ported
-    from VFE_2.0 retract_spd_diagonal_torch (vfe_utils.py:727).
+    Positivity by construction (exp > 0); clamped to [eps, sigma_max].
     """
     orig_dtype = sigma_diag.dtype
     with torch.amp.autocast('cuda', enabled=False):
@@ -52,10 +50,9 @@ def retract_spd_full(
 
         Sigma_new = S^{1/2} exp(S^{-1/2} (tau dSigma) S^{-1/2}) S^{1/2},
     with a Frobenius trust region on the whitened tangent and an eigenvalue
-    floor/ceiling [eps, sigma_max^2]. Ported from VFE_2.0 retract_spd_torch
-    (vfe_utils.py:635). Uses torch.linalg.eigh; 2.0's gap-regularized custom
-    backward (_safe_eigh) is a gradient-stability feature deferred to a later
-    hardening pass (forward values match on well-conditioned inputs).
+    floor/ceiling [eps, sigma_max^2]. Uses torch.linalg.eigh; a gap-regularized
+    eigh backward for gradient stability on near-degenerate spectra is deferred
+    to a later hardening pass.
     """
     orig_shape = sigma.shape
     orig_dtype = sigma.dtype
@@ -113,8 +110,7 @@ def natural_gradient(
         nat_mu    = Sigma grad_mu
         nat_sigma = 2 Sigma grad_sigma Sigma   (diagonal: 2 sigma^2 grad_sigma)
     The Fisher metric on Sigma is g(dS1,dS2) = (1/2) tr(S^-1 dS1 S^-1 dS2), so
-    g^{kk} = 2 sigma_k^2 in the diagonal case. Ported from VFE_2.0
-    compute_natural_gradient_gpu (vfe_gradients.py:1936).
+    g^{kk} = 2 sigma_k^2 in the diagonal case.
 
     Diagonal vs full is detected by ``sigma_q.dim() == grad_mu.dim()`` (diagonal
     sigma matches the mean rank; full sigma has one extra trailing dim). This is

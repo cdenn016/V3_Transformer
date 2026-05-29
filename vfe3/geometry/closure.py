@@ -1,4 +1,4 @@
-"""Faithful port of VFE_2.0 math_utils/generators/closure.py — Lie-bracket closure."""
+"""Lie-bracket closure: iteratively extend a generator basis until it is closed under [.,.]."""
 import logging
 from typing import Dict, List, Optional, Tuple
 

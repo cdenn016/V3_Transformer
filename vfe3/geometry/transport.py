@@ -27,7 +27,7 @@ def stable_matrix_exp_pair(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""exp(M) and optionally exp(-M) with Frobenius-norm clamp + float64 upcast.
 
-    Ported from VFE_2.0 stable_matrix_exp_pair (gauge_utils.py:53-131).
+    Frobenius-norm clamp + float64 upcast keep matrix_exp stable for large ||M||.
     """
     mat_norm = matrix.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
     scale = (max_norm / mat_norm).clamp(max=1.0)
@@ -59,12 +59,11 @@ def compute_transport_operators(
 ) -> TransportDict:
     r"""phi/exp transport Omega_ij = exp(phi_i) @ exp(-phi_j) in GL+(K).
 
-    Ported from VFE_2.0 compute_transport_operators (transport_ops.py:285-433),
-    flat path. 'trivial' returns Omega = I. Returns 'exp_phi' (B,N,K,K),
-    'exp_neg_phi' (B,N,K,K), 'Omega' (B,N,N,K,K). VFE_2.0's 'constant' gauge
-    mode is intentionally NOT supported here (it depended on a per-head learned
-    Omega parameter injected by the attention module, which does not exist in
-    this no-NN rebuild); 'constant' raises ValueError.
+    Flat (Regime I) transport operator construction. 'trivial' returns Omega = I.
+    Returns 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K), 'Omega' (B,N,N,K,K).
+    The 'constant' gauge mode is intentionally NOT supported (it would require a
+    per-head learned Omega parameter, which this no-NN design does not have);
+    'constant' raises ValueError.
     """
     B, N, _ = phi.shape
     generators = group.generators
@@ -99,13 +98,11 @@ def compute_transport_operators_direct(
 ) -> TransportDict:
     r"""Direct-Omega transport Omega_ij = Omega_i @ Omega_j^{-1} (general GL(K)).
 
-    Ported from VFE_2.0 compute_transport_operators_direct (transport_ops.py:440),
-    flat path. Reaches all of GL(K) (det may be < 0; needs an external det
-    penalty to stay invertible). Inverse via LU solve (exact cocycle), with a
-    ridge then pinv fallback for near-singular Omega. 'trivial' returns Omega=I;
-    VFE_2.0's 'constant' mode is intentionally unsupported (raises ValueError).
-    Deviation from 2.0: the ridge ``eps`` is configurable here (2.0 hardcodes
-    1e-6); at the default value behaviour is identical.
+    Flat (Regime I) direct-Omega transport. Reaches all of GL(K) (det may be < 0;
+    needs an external det penalty to stay invertible). Inverse via LU solve (exact
+    cocycle), with a ridge then pinv fallback for near-singular Omega. 'trivial'
+    returns Omega=I. The 'constant' mode is intentionally unsupported (raises
+    ValueError). The ridge ``eps`` is configurable (default 1e-6).
     Returns 'omega_i' (B,N,K,K), 'omega_j_inv' (B,N,K,K), 'Omega' (B,N,N,K,K).
     """
     B, N, K, _ = omega.shape
@@ -154,7 +151,7 @@ def transport_covariance(
 
     Full input (B,N,K,K) -> full (B,N,N,K,K). Diagonal input (B,N,K) -> the
     diagonal approximation (B,N,N,K), Sigma_t[i,j,k] = sum_l Omega_ijkl^2
-    sigma_jl (matches 2.0 attention.py:270).
+    sigma_jl (the diagonal of the full sandwich).
     """
     is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
     if is_diag:
@@ -169,9 +166,8 @@ def omega_to_block_exp_pairs(
     *,
     eps:        float = 1e-6,
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Slice a block-diagonal Omega into per-block (block, block_inv) pairs.
+    r"""Slices a block-diagonal Omega into per-block (block, block_inv) pairs.
 
-    Ported from VFE_2.0 omega_to_block_exp_pairs (transport_ops.py:554-602).
     Per-block inverse via solve, with ridge then pinv fallback. Returns a list
     aligned with irrep_dims, each a pair of (B, N, d, d) tensors.
     """
