@@ -114,3 +114,56 @@ All 59 tests pass (53 pre-existing + 6 new in test_transport.py + 1 new golden t
 
 Task 6 property tests were included in the `110fe06` commit (test file written in one
 pass); no separate commit needed.
+
+---
+
+## Phase 2c Manifold Retractions + Fisher Preconditioner — 2026-05-29 (continuation)
+
+### Files created
+
+- `vfe3/geometry/retraction.py` — three public functions:
+  `retract_spd_diagonal`, `retract_spd_full`, `natural_gradient`
+- `tests/golden/test_retraction_golden.py` — 4 golden equivalence tests vs VFE_2.0
+- `tests/test_retraction.py` — 4 property/formula tests
+
+### Files modified
+
+- `tests/golden/conftest.py` — added `vfe2_retract` session fixture importing
+  `transformer.core.{vfe_utils, vfe_gradients}` from the sibling VFE_2.0 checkout
+
+### Changes
+
+**`retract_spd_diagonal(sigma_diag, delta_sigma, *, step_size, trust_region, eps, sigma_max)`**
+Diagonal SPD retraction `sigma_new = sigma * exp(step_size * clamp(delta/sigma, ±trust_region))`.
+Positivity by construction; clamped to `[eps, sigma_max]`. Ported from VFE_2.0
+`vfe_utils.retract_spd_diagonal_torch` (line 727). Golden-equal at atol=1e-5.
+
+**`retract_spd_full(sigma, delta_sigma, *, step_size, trust_region, eps, sigma_max)`**
+Full SPD retraction via the affine-invariant exponential map:
+`Sigma_new = S^{1/2} exp(S^{-1/2} (tau dS) S^{-1/2}) S^{1/2}`.
+Frobenius trust region on the whitened tangent; eigenvalue clamp `[eps, sigma_max^2]`
+on output. Uses `torch.linalg.eigh`; VFE_2.0's gap-regularized `_safe_eigh` custom
+backward is deferred to a hardening pass (forward values match on well-conditioned
+inputs). Ported from VFE_2.0 `vfe_utils.retract_spd_torch` (line 635).
+Golden-equal at atol=1e-3 (eigh sign/order invariance under V diag V^T).
+
+**`natural_gradient(grad_mu, grad_sigma, sigma_q, *, eps)`**
+Fisher preconditioner converting Euclidean gradients to natural gradients:
+`nat_mu = Sigma @ grad_mu`, `nat_sigma = 2 Sigma @ grad_sigma @ Sigma` (diagonal: element-wise
+`2 sigma^2 grad_sigma`). Diagonal vs. full path auto-detected by `sigma_q.dim() == grad_mu.dim()`.
+Ported from VFE_2.0 `vfe_gradients.compute_natural_gradient_gpu` (line 1938).
+Golden-equal at atol=1e-5 (diagonal) / 1e-4 (full).
+
+### Test results
+
+```
+67 passed in 0.09s
+```
+
+All 8 new tests pass (4 golden + 4 property); no regressions in the prior 59 tests.
+
+### Commits
+
+- `ee3c1f5 feat(geometry): diagonal SPD retraction, golden-equal to 2.0`
+  (contains all three retraction functions — written in a single pass)
+- `60dab84 test(geometry): SPD-preservation + Fisher-formula properties`
