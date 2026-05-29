@@ -84,13 +84,18 @@ def alpha_state_dependent_per_coord(
 
 
 def self_coupling_alpha(
-    kl:    torch.Tensor,             # (..., N) or (..., N, K) self-divergence
+    kl:       torch.Tensor,          # (..., N) or (..., N, K) self-divergence
 
     *,
-    value: float = 1.0,
-    b0:    'float | torch.Tensor' = 1.0,
-    c0:    'float | torch.Tensor' = 1.0,
-    mode:  str = "constant",
+    mode:     str = "constant",
+    **kwargs,                        # forwarded verbatim to the form (value / b0 / c0 / ...)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Dispatch to the registered alpha form `mode`; returns (alpha, regularizer)."""
-    return get_alpha(mode)(kl, value=value, b0=b0, c0=c0)
+    r"""Dispatch to the registered alpha form `mode`; returns (alpha, regularizer).
+
+    Variant params are forwarded via **kwargs (each form declares its own:
+    `constant` takes `value`; the state-dependent forms take `b0`/`c0`). A new
+    form with a novel param slots in by `register_alpha` + config -- the call site
+    is never edited (matching the divergence seam, which forwards only what the
+    selected leaf declares).
+    """
+    return get_alpha(mode)(kl, **kwargs)

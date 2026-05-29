@@ -2,6 +2,7 @@ import math
 
 import torch
 
+from vfe3.attention_prior import attention_log_prior
 from vfe3.free_energy import (
     attention_weights,
     effective_temperature,
@@ -37,6 +38,30 @@ def test_envelope_identity_canonical_block_equals_neg_tau_logZ():
     assert torch.allclose(canon_block, fred, atol=1e-5)
     # hand-computed literal backstop (catches a tau*log N offset):
     assert torch.allclose(fred, torch.tensor(1.1264), atol=1e-3)
+
+
+def test_envelope_holds_for_raw_registry_priors_uniform_causal_alibi():
+    # The envelope must hold for the RAW seam output B (logsumexp(B) != 0), not only
+    # a hand-normalized log(pi). A non-uniform-but-NORMALIZED prior cannot catch the
+    # +tau*logsumexp(B) per-row offset (uniform B=0 -> offset tau*log N; alibi -> tau*lse(B)).
+    N, tau = 3, 2.0
+    energy = torch.tensor([[1.0, 2.0, 0.5],
+                           [0.7, 0.3, 1.1],
+                           [1.2, 0.9, 0.4]])
+    for name, kw in [("uniform", {}), ("causal", {}), ("alibi", {"slope": 0.5})]:
+        B = attention_log_prior(name, N, N, **kw)            # un-normalized log-bias
+        beta = attention_weights(energy, log_prior=B, tau=tau)
+        pi = torch.softmax(B, dim=-1)
+        canon_block = (beta * energy).sum(-1) + tau * (
+            beta * (torch.log(beta.clamp(min=1e-12)) - torch.log(pi.clamp(min=1e-12)))
+        ).sum(-1)
+        fred = reduced_free_energy(energy, log_prior=B, tau=tau)   # -tau log Z
+        assert torch.allclose(canon_block, fred, atol=1e-5), name
+
+    # None prior -> uniform 1/N; must match the uniform-B result, not drift by tau*log N.
+    B0 = attention_log_prior("uniform", N, N)
+    assert torch.allclose(reduced_free_energy(energy, log_prior=None, tau=tau),
+                          reduced_free_energy(energy, log_prior=B0, tau=tau), atol=1e-5)
 
 
 def test_stationarity_residual_constant_across_keys():
@@ -84,6 +109,45 @@ def test_known_value_F_self_coupling_only():
     assert torch.allclose(fe, torch.tensor(expect), atol=1e-5)
 
 
+def test_pairwise_energy_diagonal_and_full_match_hand_loop():
+    # E_ij = D(q_i || Omega_ij q_j) for every (query i, key j) pair. The key axis is
+    # inserted from the family's covariance structure, so it stays correct even when
+    # sigma_q carries a leading batch dim that mu_q does not.
+    from vfe3.divergence import renyi
+    from vfe3.free_energy import pairwise_energy
+
+    torch.manual_seed(7)
+    N, K = 3, 4
+    mu_q = torch.randn(N, K)
+    mu_t = torch.randn(N, N, K)                              # Omega_ij mu_j, per (i,j)
+
+    # diagonal family
+    sigma_q = torch.rand(N, K) + 0.5
+    sigma_t = torch.rand(N, N, K) + 0.5
+    E = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal")
+    E_ref = torch.stack([torch.stack([
+        renyi(mu_q[i], sigma_q[i], mu_t[i, j], sigma_t[i, j], family="gaussian_diagonal")
+        for j in range(N)]) for i in range(N)])
+    assert torch.allclose(E, E_ref, atol=1e-5)
+
+    # diagonal sigma_q carrying a leading batch dim mu_q lacks (the misclassified case):
+    sigma_q_b = sigma_q.unsqueeze(0)                         # (1, N, K), rank mu_q.dim()+1
+    sigma_t_b = sigma_t.unsqueeze(0)                         # (1, N, N, K)
+    E_b = pairwise_energy(mu_q, sigma_q_b, mu_t, sigma_t_b, family="gaussian_diagonal")
+    assert torch.allclose(E_b[0], E_ref, atol=1e-5)
+
+    # full-covariance family
+    A = torch.randn(N, K, K)
+    sig_q_full = A @ A.transpose(-1, -2) + K * torch.eye(K)
+    Bf = torch.randn(N, N, K, K)
+    sig_t_full = Bf @ Bf.transpose(-1, -2) + K * torch.eye(K)
+    Ef = pairwise_energy(mu_q, sig_q_full, mu_t, sig_t_full, family="gaussian_full")
+    Ef_ref = torch.stack([torch.stack([
+        renyi(mu_q[i], sig_q_full[i], mu_t[i, j], sig_t_full[i, j], family="gaussian_full")
+        for j in range(N)]) for i in range(N)])
+    assert torch.allclose(Ef, Ef_ref, atol=1e-4)
+
+
 def test_autograd_F_matches_finite_difference():
     torch.manual_seed(0)
     N, K = 3, 4
@@ -101,7 +165,11 @@ def test_autograd_F_matches_finite_difference():
 
     F = scalar(mu_q); F.backward()
     g_auto = mu_q.grad.clone()
-    eps = 1e-3
+    # F is fp32 throughout. The central-difference error is truncation O(h^2|F'''|)
+    # plus roundoff O(eps_mach |F| / h); the sum is minimized near h ~ eps_mach^(1/3)
+    # ~ 5e-3 for fp32. h=1e-3 is roundoff-dominated (eps_mach|F|/h ~ 1.2e-3, i.e. AT
+    # the 1e-3 tolerance), so the step -- not the tolerance -- is the right knob.
+    eps = 5e-3
     g_fd = torch.zeros_like(mu_q)
     with torch.no_grad():
         for a in range(N):

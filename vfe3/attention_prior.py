@@ -87,9 +87,15 @@ def attention_log_prior(
     n_key:   int,
 
     *,
-    slope:   float                        = 1.0,
     device:  'torch.device | str | None'  = None,
     dtype:   torch.dtype                   = torch.float32,
+    **kwargs,                              # variant params (e.g. alibi's `slope`)
 ) -> torch.Tensor:
-    r"""Dispatch to the registered attention-prior `name`; returns log-prior bias (Nq, Nk)."""
-    return get_prior(name)(n_query, n_key, slope=slope, device=device, dtype=dtype)
+    r"""Dispatch to the registered attention-prior `name`; returns log-prior bias (Nq, Nk).
+
+    `device`/`dtype` are universal (every builder consumes them); variant-specific
+    params (e.g. ALiBi's `slope`) flow through **kwargs, so a new prior with a novel
+    param (windowed width, learned-bias handle, ...) slots in by `register_prior` +
+    config without editing this dispatcher.
+    """
+    return get_prior(name)(n_query, n_key, device=device, dtype=dtype, **kwargs)

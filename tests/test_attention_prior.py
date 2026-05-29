@@ -1,6 +1,6 @@
 import torch
 
-from vfe3.attention_prior import attention_log_prior
+from vfe3.attention_prior import attention_log_prior, register_prior
 
 
 def test_uniform_is_zero_bias():
@@ -21,3 +21,17 @@ def test_alibi_is_linear_in_distance():
     for i in range(4):
         for j in range(4):
             assert torch.isclose(B[i, j], torch.tensor(-0.5 * abs(i - j)), atol=1e-6)
+
+
+def test_new_prior_with_novel_kwarg_reachable_without_editing_dispatcher():
+    # Modularity: a new prior's OWN param must flow through the dispatcher's **kwargs
+    # (not a hard-coded slope union), so it selects-with-config without editing the call site.
+    @register_prior("_test_windowed")
+    def _windowed(n_query, n_key, *, width=1, **kwargs):
+        i = torch.arange(n_query).unsqueeze(-1)
+        j = torch.arange(n_key).unsqueeze(0)
+        return torch.where((i - j).abs() <= width, 0.0, float("-inf"))
+
+    B = attention_log_prior("_test_windowed", 4, 4, width=1)
+    assert B[0, 0] == 0.0 and B[0, 1] == 0.0
+    assert torch.isneginf(B[0, 2])

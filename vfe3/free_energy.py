@@ -38,9 +38,16 @@ def pairwise_energy(
 
     Divergence-agnostic: swapping `family`/`alpha` (or registering a new kernel)
     changes the energy without touching the free-energy assembly.
+
+    The key axis is inserted from the `family`'s covariance structure, not from a
+    `sigma_q.dim() == mu_q.dim()` guess: a diagonal sigma_q is (..., N, K) and gets
+    the key axis at -2 -> (..., N, 1, K); a full sigma_q is (..., N, K, K) and gets
+    it at -3 -> (..., N, 1, K, K). This stays correct when sigma_q carries a leading
+    batch dim that mu_q does not (the dim-equality heuristic misclassified that case).
     """
+    is_diagonal = "diagonal" in family
     mu_q_b = mu_q.unsqueeze(-2)            # (..., N, 1, K) broadcast query over keys
-    sigma_q_b = sigma_q.unsqueeze(-2) if sigma_q.dim() == mu_q.dim() else sigma_q.unsqueeze(-3)
+    sigma_q_b = sigma_q.unsqueeze(-2) if is_diagonal else sigma_q.unsqueeze(-3)
     return renyi(mu_q_b, sigma_q_b, mu_t, sigma_t, alpha=alpha, kl_max=kl_max, eps=eps, family=family)
 
 
@@ -80,11 +87,22 @@ def log_partition(
     *,
     tau:       float = 1.0,
     log_prior: Optional[torch.Tensor] = None,
-) -> torch.Tensor:                         # (...) log Z_i = logsumexp_j(B - E/tau)
-    r"""Log-partition log Z_i = logsumexp_j(B_ij - E_ij / tau)."""
+) -> torch.Tensor:                         # (...) log Z_i = logsumexp_j(log pi - E/tau)
+    r"""Log-partition log Z_i = logsumexp_j(log pi_ij - E_ij / tau), pi = softmax_j(B).
+
+    The partition Z_i = Sum_j pi_ij exp(-E_ij/tau) is built from the NORMALIZED
+    prior pi (not the raw log-bias B), so the envelope identity
+    Sum_j beta*_ij E_ij + tau Sum_j beta*_ij log(beta*_ij/pi_ij) = -tau log Z_i
+    holds for ANY prior the seam emits. Equivalently log Z = logsumexp(B - E/tau)
+    - logsumexp(B); using log_softmax(B) subtracts that per-row normalizer in one
+    step. With a None prior pi is uniform 1/N, so the bias is -log(N).
+    """
     logits = -energy / tau
     if log_prior is not None:
-        logits = logits + log_prior
+        logits = logits + torch.log_softmax(log_prior, dim=-1)
+    else:
+        logits = logits - torch.log(torch.tensor(float(energy.shape[-1]),
+                                                  device=energy.device, dtype=energy.dtype))
     return torch.logsumexp(logits, dim=-1)
 
 
@@ -96,7 +114,8 @@ def reduced_free_energy(
     log_prior: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:                         # (...) F_red,i = -tau log Z_i
     r"""Reduced (envelope) free energy F_red,i = -tau log Z_i; equals the canonical
-    beta-block evaluated at beta*."""
+    beta-block evaluated at beta* for ANY prior (log_partition normalizes the
+    prior internally, so the +tau logsumexp(B) per-row offset cannot leak in)."""
     return -tau * log_partition(energy, tau=tau, log_prior=log_prior)
 
 

@@ -429,10 +429,10 @@ surrogate gradient gap, and the alpha-envelope — not by re-running F's own for
 
 - `vfe3/alpha_i.py` — a `{constant, state_dependent, state_dependent_per_coord}` self-
   coupling registry (`register_alpha`/`get_alpha`), the precision regularizer
-  `alpha_regularizer`, and the `self_coupling_alpha(kl, *, value, b0, c0, mode)` dispatcher.
+  `alpha_regularizer`, and the `self_coupling_alpha(kl, *, mode, **kwargs)` dispatcher.
 - `vfe3/attention_prior.py` — a `{uniform, causal, alibi}` attention-prior registry
   (`register_prior`/`get_prior`) returning a LOG-PRIOR BIAS `B_ij`, and the
-  `attention_log_prior(name, n_query, n_key, *, slope, device, dtype)` dispatcher.
+  `attention_log_prior(name, n_query, n_key, *, device, dtype, **kwargs)` dispatcher.
 - `vfe3/free_energy.py` — `effective_temperature`, `pairwise_energy`, `self_divergence`,
   `attention_weights`, `log_partition`, `reduced_free_energy`, and the scalar `free_energy`.
 - `tests/test_alpha_i.py` (3 tests), `tests/test_attention_prior.py` (3 tests),
@@ -449,8 +449,9 @@ state-dependent form `alpha*_i = c0/(b0 + D(q_i||p_i))` is the stationary point 
 `alpha*D + R(alpha)`, `R(alpha) = b0*alpha - c0*log(alpha)` (`d/dalpha = D + b0 - c0/alpha
 = 0` at alpha*). The per-coordinate form `alpha^(k)* = c0^(k)/(b0^(k) + D^(k))` is the
 manuscript's implemented choice (`eq:state_dependent_alpha`); `b0`/`c0` accept scalar or
-`(K,)` tensors. Each registered form takes `**kwargs` so the dispatcher forwards one
-uniform argument set.
+`(K,)` tensors. The dispatcher forwards `**kwargs` verbatim to the selected form (each form
+declares its own params: `constant` takes `value`, the state-dependent forms take `b0`/`c0`),
+so a new form with a novel param selects-with-config without editing the call site.
 
 **`attention_prior.py` — the prior is a log-prior bias, default `uniform`.** Each prior
 returns `B_ij` added to the attention logits: `beta*_ij = softmax_j(B_ij - E_ij/tau)`, and
@@ -465,8 +466,9 @@ the input's device/dtype (device-agnostic).
 `pairwise_energy` / `self_divergence` route through `divergence.renyi(..., family, alpha)`
 (KL = Renyi at alpha=1), so swapping the divergence is a `family`/`alpha` change — F is not
 edited. `attention_weights` is `beta* = softmax_j(B - E/tau)`; `log_partition` is
-`log Z_i = logsumexp_j(B - E/tau)`; `reduced_free_energy = -tau log Z_i` (the canonical
-beta-block evaluated at beta*). The scalar `free_energy(self_div, energy, alpha, *, tau,
+`log Z_i = logsumexp_j(log pi_ij - E_ij/tau)` with the NORMALIZED prior `pi = softmax_j(B)`
+(equivalently `logsumexp_j(B - E/tau) - logsumexp_j(B)`); `reduced_free_energy = -tau log Z_i`
+(the canonical beta-block evaluated at beta*, for ANY prior the seam emits). The scalar `free_energy(self_div, energy, alpha, *, tau,
 include_attention_entropy, log_prior, alpha_reg, log_likelihood)` assembles
 `F = sum_i [ alpha_i*D(q_i||p_i) (+ R) + sum_j beta_ij E_ij + tau sum_j beta_ij log(beta_ij
 /pi_ij) (canonical only) - ell_i ]`. The observation likelihood `ell_i` is an OPTIONAL
@@ -509,10 +511,10 @@ surrogate is the toggle (`include_attention_entropy=False`). beta is passed expl
 ### Test results
 
 ```
-97 passed
+101 passed
 ```
 
-15 new tests (3 `test_alpha_i.py` + 3 `test_attention_prior.py` + 9 `test_free_energy.py`);
+19 new tests (4 `test_alpha_i.py` + 4 `test_attention_prior.py` + 11 `test_free_energy.py`);
 no regressions in the 82 pre-existing tests.
 
 ### Commits
@@ -522,4 +524,46 @@ no regressions in the 82 pre-existing tests.
 - `2a0fe49 feat(free-energy): attention weights, log-partition, envelope (non-uniform prior pinned)`
 - `f7e1063 feat(free-energy): scalar F = sum_i F_i, canonical/surrogate toggle, likelihood optional`
 - `db41eee test(free-energy): envelope gradient gap (-cov/tau) + alpha-envelope, live beta`
-- (this entry) `docs(edits): 2026-05-29 phase 3 free energy changes log`
+- `docs(edits): 2026-05-29 phase 3 free energy changes log`
+
+### Phase 3 review fixes — 2026-05-29
+
+Expert review of Phase 3 surfaced four confirmed defects (two coverage/design, two of them
+the same envelope bug under three reviewers). Fixed:
+
+- **`log_partition` normalized the prior, fixing the envelope for every registry prior
+  (HIGH).** The helper formed `logsumexp_j(B - E/tau)` from the RAW log-bias `B`, so
+  `reduced_free_energy = -tau log Z` differed from the canonical beta-block by `+tau*
+  logsumexp(B)` per row — exactly the `tau*log N` offset for the manuscript-default uniform
+  prior (`B = 0` -> gap `tau*log N`), `tau*log(active set)` for `causal`, and `tau*logsumexp(B)`
+  for `alibi`. It agreed only when `B` was already row-normalized (`logsumexp(B) = 0`), which
+  the original envelope test fed (`B = log([.5,.3,.2])`), masking the bug. Now `log_partition`
+  uses `log Z = logsumexp_j(log_softmax(B) - E/tau)` (None prior -> uniform `-log N`), so the
+  envelope holds for ANY prior. `attention_weights` is unchanged (softmax is invariant to the
+  per-row constant, so beta is bit-identical). New
+  `test_envelope_holds_for_raw_registry_priors_uniform_causal_alibi` feeds the RAW seam output
+  (uniform/causal/alibi) — not a hand-normalized `log(pi)` — and asserts `reduced ==` the
+  canonical beta-block.
+- **`pairwise_energy` keys off the family, not a dim guess (MED).** The key axis was chosen by
+  `sigma_q.dim() == mu_q.dim()`, which misclassifies a DIAGONAL `sigma_q` carrying a leading
+  batch dim mu_q lacks (rank `mu_q.dim()+1` -> wrongly treated as full-cov). Now `is_diagonal =
+  "diagonal" in family` drives the unsqueeze, using info already passed. New
+  `test_pairwise_energy_diagonal_and_full_match_hand_loop` covers diagonal, diagonal-with-batch,
+  and full vs a hand `renyi` loop.
+- **Dispatchers forward `**kwargs`, not a hard-coded param union (MED).** `self_coupling_alpha`
+  and `attention_log_prior` hard-coded the union of all variants' params and forwarded all of
+  them to every leaf (so `value=99` was silently swallowed in `state_dependent` mode, and a new
+  variant's novel param raised `TypeError` at the dispatcher — violating "add a variant without
+  editing call sites"). Now they forward `**kwargs` (matching the `divergence.renyi` reference,
+  which forwards only what the leaf declares); `attention_log_prior` keeps the universal
+  `device`/`dtype` explicit. New `test_new_form_with_novel_kwarg_reachable_without_editing_
+  dispatcher` (alpha) and `test_new_prior_with_novel_kwarg_reachable_without_editing_dispatcher`
+  (prior) pin the modularity property.
+- **Finite-difference step moved to the fp32 optimum (MED).** `test_autograd_F_matches_finite_
+  difference` used `h = 1e-3`, which is roundoff-dominated (`eps_mach*|F|/h ~ 1.2e-3`, AT the
+  `atol = 1e-3`) — it passed on seed 0 by luck (7/40 seeds failed). Moved `h` to `5e-3` (the
+  fp32 central-difference optimum `~eps_mach^(1/3)`): all 40 seeds pass at the UNCHANGED
+  `atol = rtol = 1e-3` (no assertion weakened). The noise-floor estimate is documented in a
+  comment.
+
+Rejected: none.
