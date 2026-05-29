@@ -55,3 +55,18 @@ def vfe2_gen():
     except ImportError as exc:
         pytest.skip(f"could not import VFE_2.0 generators: {exc}")
     return {"builders": builders, "closure": closure}
+
+
+@pytest.fixture(scope="session")
+def vfe2_transport():
+    """Return the 2.0 transport + gauge modules, or skip if unavailable."""
+    root = _vfe2_root()
+    if root is None:
+        pytest.skip("VFE_2.0 checkout not found (set VFE2_ROOT)")
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        from transformer.core import gauge_utils, transport_ops
+    except ImportError as exc:
+        pytest.skip(f"could not import VFE_2.0 transport: {exc}")
+    return {"gauge_utils": gauge_utils, "transport_ops": transport_ops}
