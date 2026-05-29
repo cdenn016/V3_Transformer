@@ -109,3 +109,70 @@ def test_autograd_F_matches_finite_difference():
                 d = torch.zeros(N, K); d[a, b] = eps
                 g_fd[a, b] = (scalar(mu_q + d) - scalar(mu_q - d)) / (2 * eps)
     assert torch.allclose(g_auto, g_fd, atol=1e-3, rtol=1e-3)
+
+
+def test_gradient_gap_canonical_minus_surrogate_is_neg_cov_over_tau():
+    # The envelope theorem: with beta* a LIVE function of x, autograd of the canonical
+    # beta-block collapses to the envelope Sum_j beta* dE; the surrogate keeps the
+    # dbeta term, and (surrogate - canonical) gradients = -tau^{-1} Cov_beta*(E, dE).
+    torch.manual_seed(1)
+    tau = 1.5
+    x = torch.randn(4, requires_grad=True)               # a differentiable parameter
+    A = torch.randn(3, 4)
+    log_prior = torch.log(torch.tensor([0.5, 0.3, 0.2]))  # non-uniform
+
+    def energy_of(x_):                                   # (3,) energies, differentiable in x
+        return (A @ x_) ** 2 + 0.2
+
+    def canonical_block(x_):
+        E = energy_of(x_)
+        beta = torch.softmax(log_prior - E / tau, dim=-1)
+        pi = torch.softmax(log_prior, dim=-1)
+        return (beta * E).sum() + tau * (beta * (torch.log(beta) - torch.log(pi))).sum()
+
+    def surrogate_block(x_):
+        E = energy_of(x_)
+        beta = torch.softmax(log_prior - E / tau, dim=-1)
+        return (beta * E).sum()
+
+    gc = torch.autograd.grad(canonical_block(x), x)[0]
+    gs = torch.autograd.grad(surrogate_block(x), x)[0]
+
+    # envelope: canonical grad == Sum_j beta* dE_j  (beta* detached here on purpose)
+    E = energy_of(x)
+    beta = torch.softmax(log_prior - E / tau, dim=-1).detach()
+    JE = torch.autograd.functional.jacobian(energy_of, x)     # (3,4) dE_j/dx
+    env = (beta.unsqueeze(-1) * JE).sum(0)
+    assert torch.allclose(gc, env, atol=1e-4)
+
+    # gap == -tau^{-1} Cov_beta*(E, dE)
+    Edet = E.detach()
+    mean_E  = (beta * Edet).sum()
+    mean_J  = (beta.unsqueeze(-1) * JE).sum(0)                 # (4,)
+    cross   = (beta.unsqueeze(-1) * Edet.unsqueeze(-1) * JE).sum(0)   # (4,)
+    cov = cross - mean_E * mean_J
+    assert torch.allclose(gs - gc, -cov / tau, atol=1e-4)
+
+
+def test_alpha_envelope_grad_q_F_equals_alpha_star_times_grad_q_D():
+    # State-dependent alpha*: at alpha*, dF/dalpha = 0, so d/dq [alpha*(D)*D + R(alpha*(D))]
+    # == alpha* * dD/dq (the explicit alpha-path vanishes). De-risks Phase 4.
+    from vfe3.alpha_i import self_coupling_alpha
+    from vfe3.free_energy import self_divergence
+
+    b0, c0 = 0.5, 2.0
+    mu_q = torch.randn(2, 3, requires_grad=True)
+    sigma_q = torch.rand(2, 3) + 0.5
+    mu_p = torch.randn(2, 3); sigma_p = torch.rand(2, 3) + 0.5
+
+    def adaptive_self(mu):
+        D = self_divergence(mu, sigma_q, mu_p, sigma_p)       # (2,)
+        a, r = self_coupling_alpha(D, mode="state_dependent", b0=b0, c0=c0)
+        return (a * D + r).sum()
+
+    g_full = torch.autograd.grad(adaptive_self(mu_q), mu_q)[0]
+    # envelope RHS: alpha*(D) detached, times dD/dq
+    D = self_divergence(mu_q, sigma_q, mu_p, sigma_p)
+    a_star = (c0 / (b0 + D)).detach()
+    g_env = torch.autograd.grad((a_star * D).sum(), mu_q)[0]
+    assert torch.allclose(g_full, g_env, atol=1e-5)
