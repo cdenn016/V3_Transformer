@@ -260,3 +260,108 @@ claim corrected and a direct coordinate-pin test added).
 - `4b4c6ab test(geometry): pin the unclamped euclidean phi-update directly`
 
 Merged to `main` (fast-forward) and pushed to `origin/main`.
+
+## Phase 2e φ-Gradient Preconditioner — 2026-05-29 (continuation)
+
+Built the gauge-frame (φ) gradient preconditioner — the φ analog of the (μ,σ) Fisher
+natural gradient. It conditions a Euclidean φ-gradient before the Phase 2d retraction
+(the E-step is `grad → precondition → retract`). Self-contained, V3-internal tests only
+(analytic known-value + property + finite-difference); correctness pinned by hand-derived
+anchors and an independent finite-difference oracle, not by re-running the implementation's
+own formula.
+
+### Files created
+
+- `vfe3/geometry/phi_preconditioner.py` — a `{none, clip, killing, killing_per_block,
+  pullback}` preconditioning registry (`register_precond`/`get_precond`/
+  `precondition_phi_gradient`), the Cartan-involution Killing metric (`killing_metric`,
+  `build_killing_preconditioner`), the block-diagonal variant (`_generator_block_index`,
+  `build_killing_preconditioner_per_block`), and the position-dependent pullback metric
+  (`_structure_constants`, `pullback_metric`). Pure: operates on a generator TENSOR
+  (+ optional `irrep_dims`), never a `GaugeGroup`.
+- `tests/test_phi_preconditioner.py` — none/clip behavior, the gl(2) Killing literal +
+  so(3) positivity tell, center-reg exact-inverse-on-sl(K), per-block block-diagonal
+  structure, pullback φ=0 == Frobenius Gram + finite-difference-of-exp match + K-guard.
+
+### Files modified
+
+- (none — additive only.)
+
+### Changes
+
+**Preconditioning is a registry seam, default `none`.** The canonical update applies no
+metric correction: the exponential map exp: 𝔤 → G provides natural coordinates and the
+gradient lives in the Lie algebra 𝔤, a vector space (`GL(K)_supplementary.tex`, §Gauge
+Frame Preconditioning). `none` is the identity; `clip` is the practical robustness baseline
+`grad·min(1, c/‖grad‖)`; `killing`/`killing_per_block`/`pullback` are the principled
+toggles. Coordinates in, coordinates out `(…,n_gen)` — same units as `retract_phi`'s
+`delta_phi`. Each registered rule takes `**kwargs` so the dispatcher forwards one uniform
+argument set; a rule reads only the knobs it needs.
+
+**`killing_metric` is the Cartan-involution form, not the bare Killing form.** `g̃_ab =
+2K·tr(Gₐᵀ G_b) − 2·tr(Gₐ)·tr(G_b)`, i.e. `−B(θX,Y)` with the Cartan involution θ(X) = −Xᵀ;
+positive-definite on sl(K). `gram` is the FROBENIUS inner product `tr(Gₐᵀ G_b) = Σ_ij
+Gₐ[i,j]G_b[i,j]`. The bare Killing form `B(X,Y) = 2K·tr(XY) − 2tr(X)tr(Y)` of gl(K) is
+indefinite (negative-definite on skew directions) and is deliberately NOT used; the gl(2)
+literal anchor below discriminates the two.
+
+**Center-regularization regularizes the numerical nullspace, not a hardcoded direction.**
+`build_killing_preconditioner` eigendecomposes g̃ (`eigh`, **float64**, symmetrized first),
+lifts eigenvalues with `|λ| < tol` to `center_reg` (default 2K), then inverts via
+`V·diag(1/λ)·Vᵀ`. Non-null eigenvalues are untouched, so the inverse is EXACT on sl(K)
+(`g̃ @ (Minv @ v) = v` for v ⊥ the center) — a ridge `center_reg·I` would perturb every
+direction and fail this. so(K), already PD with no near-null eigenvalue, acquires no
+regularization. Storage dtype is restored on return (float32 in/out, float64 internal where
+conditioning demands it).
+
+**Per-block Killing is a direct-sum metric.** `build_killing_preconditioner_per_block`
+groups generators by irrep block (`_generator_block_index` asserts single-block support),
+builds the local-dimension `d_h` Cartan metric on each group, and assembles a
+block-diagonal inverse in generator-index order — no cross-block coupling. A single global
+block (`irrep_dims == [K]`, e.g. cross-coupled bases) reduces to the global
+`build_killing_preconditioner`.
+
+**Pullback is the position-dependent natural gradient, finite-difference-pinned and
+K-guarded.** `pullback_metric` computes `G_ab(φ) = ⟨d exp_φ(Tₐ), d exp_φ(T_b)⟩_F` with
+`d exp_φ(T) = Ψ(ad_φ)(T)·exp(φ)`, `Ψ(z) = (eᶻ−1)/z = Σ_{k≥0} zᵏ/(k+1)!`, where ad_φ acts on
+coordinates via the structure constants `(ad_φ)_{cb} = Σ_a φ^a f[a,b,c]` and `f[a,b,c]` are
+the coordinates of `[Gₐ,G_b]` (reusing the bracket + Gram-pseudo-inverse extraction). The
+truncated Ψ-series is accumulated in float64; `d exp_φ(eₐ)` in coords is column a of
+`Ψ(ad_φ)`, embedded and right-multiplied by `exp(φ)`. The structure-constants tensor is
+O(n_gen²·K²), so K > `max_k` (default 12) raises before allocation. The `pullback` rule
+solves `(G(φ) + εI)·nat = grad` rather than forming an explicit inverse.
+
+### Analytic anchors (independent of the implementation)
+
+- gl(2) elementary basis (E00,E01,E10,E11), K=2: `killing_metric =
+  [[2,0,0,−2],[0,4,0,0],[0,0,4,0],[−2,0,0,2]]`, eigenvalues {0,4,4,4}, the null direction
+  being the identity/center (E00+E11). The bare Killing form would give a different,
+  indefinite matrix — this literal is the discriminator.
+- so(3) (skew, tr=0): g̃ = 2K·gram, gram = 2·I (‖L_ij‖_F² = 2), K=3 → g̃ = 12·I,
+  positive-definite. The bare Killing form is negative-definite on skew — the sign is the
+  tell.
+- Center-reg exact inverse on sl(K): with the gl(2) null eigenvalue lifted to 4, the
+  trace-free directions satisfy `g̃ @ (Minv @ v) = v` exactly; the full regularized metric
+  has spectrum {4,4,4,4} (PD). A ridge would not preserve the sl(K) eigenvalues.
+- Per-block: the (8,8) inverse for gl(2)⊕gl(2) is block-diagonal in 4+4 (zero cross-block
+  coupling), and each diagonal block equals the single-head gl(2) Killing inverse.
+- Pullback @ φ=0 equals the Frobenius Gram (Ψ(0)=I, exp(0)=I); pullback(φ) matches the
+  central finite-difference of `matrix_exp` (`Jₐ = ∂_ε exp(embed(φ±ε eₐ))`, `G_FD[a,b] =
+  tr(JₐᵀJ_b)`) to 1e-4 on so(3) at φ=(0.4,−0.3,0.5) — the independent oracle validating the
+  Ψ-series and operator ordering; symmetric PD.
+
+### Test results
+
+```
+80 passed
+```
+
+12 new tests in `tests/test_phi_preconditioner.py` (3 none/clip + 4 Killing + 2 per-block +
+3 pullback); no regressions in the 68 pre-existing tests.
+
+### Commits
+
+- `aa53e0d feat(geometry): phi preconditioner registry (none default + clip)`
+- `dd8a6ee feat(geometry): Killing (Cartan-involution) preconditioner, nullspace-regularized`
+- `4bb23d5 feat(geometry): per-block Killing preconditioner (block-diagonal natural gradient)`
+- `3884e60 feat(geometry): pullback natural-gradient preconditioner (FD-of-exp pinned)`
