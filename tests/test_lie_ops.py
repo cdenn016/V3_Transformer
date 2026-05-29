@@ -74,10 +74,43 @@ def _bch_residual(order: int, eps: float) -> float:
 
 def test_bch_residual_rate_order_matches_slope():
     # Truncation error of order-k BCH is O(eps^(k+2)); the log-log slope of the
-    # residual vs eps must be ~ k+2 (this is the genuine, independent check that
-    # catches a wrong Dynkin coefficient -- a wrong term degrades the slope).
+    # residual vs eps must be ~ k+2. This pins the SERIES STRUCTURE and the
+    # low-order coefficients: a missing/gross/structural term changes the leading
+    # omitted order and degrades the slope. It does NOT catch a small error in the
+    # highest INCLUDED (degree-(order+1)) coefficient -- that remnant is one order
+    # below the leading omitted term and is masked across the eps grid. The exact
+    # high-order coefficients are pinned separately in
+    # test_bch_order4_coords_match_matrix_log.
     for order, expected in [(1, 3.0), (2, 4.0), (4, 6.0)]:
         eps = [0.2, 0.1, 0.05]
         r = [_bch_residual(order, e) for e in eps]
         slope = (math.log(r[0]) - math.log(r[-1])) / (math.log(eps[0]) - math.log(eps[-1]))
         assert abs(slope - expected) < 0.8, f"order={order}: slope={slope:.2f} != {expected}"
+
+
+def _matrix_log_real(matrix: torch.Tensor) -> torch.Tensor:
+    # Principal real matrix logarithm via complex eigendecomposition (so(3)
+    # rotations have complex eigenvalues e^{+/- i theta}, so a real Schur/eig log
+    # needs the complex route). Returns the real part. float64 caller.
+    w, V = torch.linalg.eig(matrix.to(torch.complex128))
+    log_m = V @ torch.diag_embed(torch.log(w)) @ torch.linalg.inv(V)
+    return log_m.real.to(matrix.dtype)
+
+
+def test_bch_order4_coords_match_matrix_log():
+    # Exact per-coefficient pin: order-4 BCH coords must match the matrix-log
+    # reference extract(log(exp(embed X) exp(embed Y))) at a single small eps.
+    # At eps=0.15 the legitimate O(eps^6) truncation leaves a ~8e-9 coord error,
+    # well under atol=1e-7; a GROSS or STRUCTURAL coefficient error (a zeroed
+    # degree-5 block or a sign flip) lands at ~1.6-1.9e-7 and FAILS this pin --
+    # which the residual-slope test alone cannot do. (A sub-few-percent error in a
+    # single degree-5 coefficient is masked by truncation and is not claimed to be
+    # caught by any aggregate residual test; only structural errors are.)
+    eps = 0.15
+    G = generate_son(3).double()
+    X = eps * torch.tensor([0.9, -0.3, 0.5], dtype=torch.float64)
+    Y = eps * torch.tensor([-0.2, 0.7, 0.4], dtype=torch.float64)
+    z = compose_phi(X, Y, G, mode="bch", order=4)
+    prod = torch.linalg.matrix_exp(embed_phi(X, G)) @ torch.linalg.matrix_exp(embed_phi(Y, G))
+    ref = extract_phi(_matrix_log_real(prod), G)
+    assert torch.allclose(z, ref, atol=1e-7)

@@ -6,12 +6,25 @@ from vfe3.geometry.generators import generate_glk, generate_son
 from vfe3.geometry.lie_ops import embed_phi, retract_glk, retract_son
 
 
-def test_retract_glk_trust_region_and_max_norm():
+def test_retract_glk_trust_region_clamps_step():
+    # Small trust_region caps the per-step coordinate-norm: ||update|| <= trust_region,
+    # so euclidean compose keeps ||phi_new|| <= ||phi|| + trust_region (no amplification).
     G = generate_glk(3)                                   # (9,3,3)
     phi = 0.1 * torch.randn(5, 9)
-    delta = 50.0 * torch.randn(5, 9)                      # huge -> both clamps active
+    delta = 50.0 * torch.randn(5, 9)                      # large step -> trust region binds
     out = retract_glk(phi, delta, G, step_size=1.0, trust_region=0.1, max_norm=5.0)
-    assert (out.norm(dim=-1) <= 5.0 + 1e-5).all()
+    assert (out.norm(dim=-1) <= phi.norm(dim=-1) + 0.1 + 1e-5).all()
+
+
+def test_retract_glk_max_norm_clamps_frame_to_ceiling():
+    # Isolate the max-norm ceiling: a loose trust_region lets the huge aligned step
+    # through, so compose drives ||phi_new|| past max_norm and the clamp pins it to
+    # exactly max_norm (up to the eps=1e-6 bias in max_norm/(n_norm+eps)).
+    G = generate_glk(3)                                   # (9,3,3)
+    phi = torch.zeros(3, 9)
+    delta = 1e3 * torch.ones(3, 9)                        # huge, aligned
+    out = retract_glk(phi, delta, G, step_size=1.0, trust_region=100.0, max_norm=5.0)
+    assert torch.allclose(out.norm(dim=-1), torch.full((3,), 5.0), atol=1e-3)
 
 
 def test_retract_glk_keeps_det_positive():
@@ -99,9 +112,20 @@ def test_retract_phi_son_path_orthogonal_no_det_control():
 
 
 def test_retract_phi_defaults_pick_group_constants():
-    # GL(K) default max_norm=5.0; a huge delta saturates to that, not pi.
-    grp = get_group("glk")(3)
-    phi = torch.zeros(2, 9)
-    delta = 1e3 * torch.ones(2, 9)
-    out = retract_phi(phi, delta, grp)
-    assert (out.norm(dim=-1) <= 5.0 + 1e-4).all()
+    # The dispatcher selects max_norm from the group's compactness: non-compact
+    # GL(K) -> 5.0 (bounds log-singular-values), compact SO(N) -> pi (bounds
+    # principal angles). Override only trust_region (large) so the huge aligned
+    # delta reaches the max-norm ceiling; the defaulted max_norm is what binds.
+    # The frame saturates to exactly that group constant, discriminating 5.0 vs pi.
+    grp_gl = get_group("glk")(3)
+    phi_gl = torch.zeros(2, 9)
+    delta_gl = 1e3 * torch.ones(2, 9)
+    out_gl = retract_phi(phi_gl, delta_gl, grp_gl, trust_region=100.0)
+    assert torch.allclose(out_gl.norm(dim=-1), torch.full((2,), 5.0), atol=1e-3)
+
+    grp_so = get_group("so_k")(4)
+    n_gen = grp_so.generators.shape[0]
+    phi_so = torch.zeros(2, n_gen)
+    delta_so = 1e3 * torch.ones(2, n_gen)
+    out_so = retract_phi(phi_so, delta_so, grp_so, trust_region=100.0)
+    assert torch.allclose(out_so.norm(dim=-1), torch.full((2,), math.pi), atol=1e-3)
