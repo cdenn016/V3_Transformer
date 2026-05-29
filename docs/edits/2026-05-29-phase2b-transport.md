@@ -167,3 +167,96 @@ All 8 new tests pass (4 golden + 4 property); no regressions in the prior 59 tes
 - `ee3c1f5 feat(geometry): diagonal SPD retraction, golden-equal to 2.0`
   (contains all three retraction functions — written in a single pass)
 - `60dab84 test(geometry): SPD-preservation + Fisher-formula properties`
+
+---
+
+## Phase 2d φ Lie-Algebra Retraction — 2026-05-29 (continuation)
+
+Built the gauge-frame (φ) Lie-algebra retraction subsystem. Self-contained, V3-internal
+tests only (analytic known-value + property); correctness pinned by hand-derived anchors,
+not by re-running the implementation's own formula.
+
+### Files created
+
+- `vfe3/geometry/lie_ops.py` — coordinate↔matrix maps (`embed_phi`, `extract_phi`,
+  `gram_pinv`), Lie bracket (`lie_bracket_matrix`, `lie_bracket_coords`), a
+  `{euclidean, bch}` composition registry (`register_compose`/`get_compose`/`compose_phi`),
+  the GL(K)/SO(N) retractions (`retract_glk`, `retract_son`, shared `_retract_core`), and
+  determinant control (`project_phi_to_slk`, `clamp_phi_trace`).
+- `tests/test_lie_ops.py` — embed/extract round-trip + overcomplete projection, so(3)
+  structure constants, BCH (commuting-exact + residual-rate + degree-5 coord pin).
+- `tests/test_phi_retraction.py` — retract_glk/son (trust region, max-norm ceiling,
+  det>0, SO(N) orthogonality), the unclamped euclidean-update pin, det control, dispatcher.
+
+### Files modified
+
+- `vfe3/geometry/retraction.py` — added the group-aware `retract_phi(phi, delta_phi, group, *, …)`
+  dispatcher (imports `GaugeGroup` + the `lie_ops` retraction/det-control names + `math`).
+
+### Changes
+
+**Composition is a registry seam.** Default `euclidean` (the manuscript working update
+`φ⁺ = φ − η ∂F/∂φ`; 𝔤 is a vector space — `GL(K)_supplementary.tex` §Gauge Frame
+Gradients). `bch` is the higher-order chart correction; the exact group retraction
+`U←U·exp(−ηΔ)` is named as the `omega_direct` transport partner (not built).
+
+**BCH in matrix space, extracted once.** `compose_bch` embeds φ₁,φ₂, accumulates the
+symmetric Dynkin series (to order 4 / degree 5) with matrix commutators, then extracts
+coordinates a single time — exact up to truncation for a closed subalgebra.
+
+**Coordinate extraction is overcomplete-safe.** `extract_phi` solves the Frobenius Gram
+system via pseudo-inverse; `gram_pinv` computes the Gram + pinv **in float64** then casts
+back (the overcomplete sl(K) basis from `generate_glk(include_identity=False)` has a true
+1-D nullspace whose eigenvalue is ~−8e-8 in float32, larger than `rcond` — a float32 pinv
+would inject noise into the trace direction). Per the spec's "float32 storage; float64
+internal where conditioning demands it." For a complete orthonormal basis Gram = c·I and
+the upcast is a no-op.
+
+**Determinant control.** `project_phi_to_slk` removes the per-block trace component
+(`V_h[a] = tr(G_a|block h)`, `φ − Σ_h (φ·V_h/‖V_h‖²)V_h`) so `det(Ω_h)=1`; `clamp_phi_trace`
+soft-bounds `|tr|≤T`. The dispatcher applies det control only on the GL(K) path; the
+SO(N) path skips it (det = 1 automatic for skew generators).
+
+### Analytic anchors (independent of the implementation)
+
+- so(3) structure constants `[G₀,G₁]=−G₂, [G₀,G₂]=+G₁, [G₁,G₂]=−G₀`.
+- BCH residual log-log slope = order+2; measured **3.001 / 4.005 / 5.001 / 5.999** for
+  orders 1–4 → all Dynkin coefficients verified, none transposed. A direct coordinate pin
+  against a matrix-log reference additionally catches a zeroed/sign-flipped degree-5 block.
+- `embed∘extract∘embed = embed` for the overcomplete sl(K) set.
+- `det(exp)>0` for GL⁺(K); SO(N) orthogonality + det +1; per-block unit det after sl(K)
+  projection; `|tr|≤T` after the soft clamp.
+- The unclamped euclidean update equals `φ + step·δ` (pins the update formula directly; the
+  det>0 / orthogonality tests are properties of `exp(embed(·))`, true for any output).
+
+### Adversarial review
+
+A 4-expert panel (gauge-theory, numerics, implementation-wiring, code-quality) found no
+logic bugs; it surfaced two test-quality gaps, both fixed by strengthening tests (no
+analytic assertion weakened): the `max_norm` clamp lacked discriminating coverage (the
+trust-region pre-clamp capped the step before the ceiling, so the one-sided `≤5.0`
+assertion could not distinguish GL's 5.0 from SO's π — split into a trust-region test and
+a ceiling-binding equality test), and the "BCH catches a wrong coefficient" claim was
+overstated (a 3% error in the degree-5 coefficient is masked by the O(ε⁶) truncation —
+claim corrected and a direct coordinate-pin test added).
+
+### Test results
+
+```
+68 passed
+```
+
+14 new tests (6 `test_lie_ops.py` + 8 `test_phi_retraction.py`); no regressions in the
+54 pre-existing tests.
+
+### Commits
+
+- `527bd18 feat(geometry): lie_ops embed/extract/bracket (V3-internal analytic tests)`
+- `dc89283 feat(geometry): phi composition registry (euclidean + BCH), residual-rate pinned`
+- `368ee14 feat(geometry): GL(K)/SO(N) phi retraction (group-membership + det>0 pinned)`
+- `e8a5012 feat(geometry): phi determinant control (sl(K) projection + trace clamp)`
+- `610a72d feat(geometry): retract_phi dispatcher (group-aware GL(K)/SO(N) + det control)`
+- `8f2a149 test(geometry): make max_norm clamp and BCH degree-5 coeffs genuinely tested`
+- `4b4c6ab test(geometry): pin the unclamped euclidean phi-update directly`
+
+Merged to `main` (fast-forward) and pushed to `origin/main`.
