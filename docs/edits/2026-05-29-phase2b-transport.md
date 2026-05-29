@@ -567,3 +567,155 @@ the same envelope bug under three reviewers). Fixed:
   comment.
 
 Rejected: none.
+
+---
+
+## Phase 4 Gradient Oracle + Belief Kernels — 2026-05-29 (continuation)
+
+The belief-gradient layer: the autograd-of-F oracle (the correctness source of
+truth), the hand-derived diagonal-KL query-side kernel, and a family-keyed kernel
+registry with oracle fallback, all behind a `gradient_mode` seam. Implements §4.4 +
+§7 of the spec. The φ-gradient stays autograd (deferred).
+
+### Files created
+
+- `vfe3/gradients/__init__.py` — package marker.
+- `vfe3/gradients/oracle.py` — `belief_gradients_autograd` (filtering / smoothing).
+- `vfe3/gradients/kernels.py` — `register_kernel`/`has_kernel`/`get_kernel`,
+  `_diag_kl_filtering_kernel`, `belief_gradients` (kernel-or-oracle dispatch).
+- `tests/test_gradients_oracle.py` — 2 finite-difference / mode-difference tests.
+- `tests/test_gradients_kernels.py` — 5 kernel-vs-oracle / fallback / analytic tests.
+
+### Files modified
+
+- `vfe3/alpha_i.py` — added `alpha_gradient_coefficient`.
+- `tests/test_alpha_i.py` — 2 coefficient tests.
+
+### Changes
+
+#### `vfe3/alpha_i.py`
+
+**`alpha_gradient_coefficient(kl, *, value, b0, c0, mode)`**
+The effective coefficient `a_i` multiplying `∂D(q_i‖p_i)` in the belief gradient.
+By the α-envelope, at the state-dependent stationary point `α* = c0/(b0 + D)` the
+coefficient is `α*` itself: `d/dx[α*(D)·D + R(α*(D))] = α* ∂D/∂x`, because the
+explicit α-path carries the factor `D + b0 − c0/α`, which vanishes at `α*`. So no
+product-rule correction is needed (R must be present in F). `constant` mode returns
+`value`; the two state-dependent modes return `c0/(b0 + D)`.
+
+#### `vfe3/gradients/oracle.py`
+
+**`belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, *, tau, alpha_div,
+kl_max, eps, b0, c0, include_attention_entropy, gradient_mode, family, alpha_mode,
+log_prior)`**
+Differentiates the canonical reduced free energy `F_red` w.r.t. the Gaussian belief
+`(mu, sigma)` by `torch.autograd`. The reference for every family / divergence /
+mode; the hand kernels are pinned to its FILTERING value. Returns the RAW Euclidean
+`(∂F/∂μ, ∂F/∂σ)` (no preconditioning / retraction — those stay downstream in the
+E-step). For state-dependent α the regularizer `R(α)` is included in F (so the
+envelope cancellation holds); for constant α `alpha_reg` is omitted.
+
+#### The filtering / smoothing split (query-leaf / key-detached)
+
+A token's belief appears in two roles in the coupling sum
+`Σ_ij β_ij KL(q_i ‖ Ω_ij q_j)`: query (row i, first KL argument + self-coupling) and
+key (column i, second argument, transported by `Ω_ij`). The oracle builds F so the
+first argument and self-coupling always use the leaf `(mu_q, sigma_q)`, and the
+transported second argument uses `(mu_k, sigma_k)`:
+
+- **filtering** (default; mean-field coordinate-ascent, holding other beliefs fixed):
+  `mu_k = mu_q.detach()`, `sigma_k = sigma_q.detach()` — the key role is frozen, so
+  `autograd.grad(F, [mu_q, sigma_q])` yields the QUERY-SIDE gradient exactly (column-i
+  contributions never flow; β being live in `mu_q` cancels by the envelope, canonical
+  only).
+- **smoothing** (the theoretically pure `∂F_red`, opt-in under the `gradient_mode`
+  toggle): a SINGLE shared leaf `mu_k = mu_q` (no detach), so the second-argument
+  (column) gradient flows back through the transport (`Ωᵀ` pullback via
+  `transport_mean`) — query + key = the full gradient.
+
+A naive single global `detach()` would kill the query role (wrong); one shared leaf
+gives the full gradient, not filtering. The split is what makes the
+`kernel == filtering-oracle` test meaningful (otherwise it would silently compare
+against the full gradient).
+
+#### `vfe3/gradients/kernels.py`
+
+**`_diag_kl_filtering_kernel(mu_q, sigma_q, mu_p, sigma_p, mu_t, sigma_t, beta,
+alpha_coef, *, eps)`** (registered under family `gaussian_diagonal`)
+The hand-derived diagonal-KL QUERY-SIDE (filtering) gradient:
+
+```
+grad_mu_i    = a_i (μ_i − μ_p_i)/σ_p_i        + Σ_j β_ij (μ_i − μ_t,ij)/σ_t,ij
+grad_sigma_i = a_i 0.5(1/σ_p_i − 1/σ_q_i)     + Σ_j β_ij 0.5(1/σ_t,ij − 1/σ_q_i)
+```
+
+with `μ_t,ij = Ω_ij μ_j`, `σ_t,ij = diag(Ω_ij Σ_j Ω_ijᵀ)`, `a_i` the α-coefficient.
+The diagonal-KL partials used are `∂D(q‖p)/∂μ_q = (μ_q − μ_p)/σ_p` and
+`∂D/∂σ_q = 0.5(1/σ_p − 1/σ_q)`; the belief-coupling analogues use the transported
+key `(μ_t, σ_t)`. The kernel returns RAW Euclidean `∂F`.
+
+**`belief_gradients(mu, sigma, mu_p, sigma_p, omega, *, tau, alpha_div, kl_max, eps,
+b0, c0, include_attention_entropy, gradient_mode, family, alpha_mode, value,
+log_prior)`**
+Family-keyed dispatch with oracle fallback. Uses the registered hand kernel ONLY for
+`gradient_mode='filtering'` AND `family='gaussian_diagonal'` AND `alpha_div == 1` (KL)
+AND canonical (`include_attention_entropy`) AND a kernel is registered; EVERY other
+case (smoothing, non-KL family, Rényi `α ≠ 1`, surrogate) FALLS BACK to
+`belief_gradients_autograd`. So a new divergence works immediately and correctly via
+the oracle, and can be accelerated later by registering a kernel — divergence
+modularity carried to the gradient layer. The kernel path builds the frozen
+transported keys, energies, `β = softmax_j(−E/τ + log π)`, and the α-coefficient,
+then calls the registered kernel.
+
+### Analytic / oracle anchors (independent of the implementation)
+
+- **filtering-oracle == finite-difference of `F_filt` (keys frozen).** The FD
+  reference transports the keys ONCE from the unperturbed belief and perturbs only the
+  query role, so it measures the query-side gradient (atol/rtol 1e-3).
+- **smoothing ≠ filtering** — the key-side (column) term is real and non-zero.
+- **kernel == filtering-oracle** for constant α AND for state-dependent α with R on
+  both sides (the α* envelope cancellation: the oracle includes `alpha_reg`, the kernel
+  uses the `α*` coefficient; the two agree to 1e-5).
+- **kernel ≠ smoothing-oracle** — they differ by exactly the deferred key-side term.
+- **dispatch fallback** — smoothing and Rényi `α_div = 0.5` both route to the oracle
+  and match it.
+- **q == p + identity transport + EQUAL means across tokens → zero gradient.** With
+  q == p the self term vanishes; equal means make every coupling-mean residual
+  `(μ_i − μ_t,ij)` vanish too (identity transport ⇒ `μ_t,ij = μ_j = μ_i`).
+
+### Test results
+
+```
+110 passed
+```
+
+9 new tests (2 `test_alpha_i.py` + 2 `test_gradients_oracle.py` +
+5 `test_gradients_kernels.py`); no regressions in the 101 pre-existing tests.
+
+### Deviations
+
+- **`test_gradients_oracle.py` FD helper — keys frozen by transport, not by
+  `.detach()`.** The originally drafted helper re-derived `mu_k = mu_q.detach()` inside
+  the F evaluation. Under finite differencing `.detach()` is a no-op (it blocks
+  autograd, not numeric perturbation), so the FD would have perturbed the key role too
+  and measured the FULL (smoothing) gradient — verified empirically to match the
+  smoothing oracle to four decimals. Corrected: transport the frozen keys ONCE from the
+  unperturbed belief and pass `(μ_t, σ_t)` in, so the FD holds the key role fixed. The
+  oracle implementation is unchanged; tolerances are unchanged (atol/rtol 1e-3).
+- **`test_self_gradient_vanishes_when_q_equals_p_and_identity_transport` — equal means
+  across tokens.** The originally drafted setup used distinct per-token means, which
+  leaves the belief-coupling row sum `Σ_j β_ij (μ_i − μ_j)/σ_t,ij` non-zero even at
+  q == p (only the self term vanishes; the kernel correctly returns this residual —
+  verified to equal the coupling-mean term exactly). Corrected the test premise to use
+  means shared across tokens, so both the self term and the coupling-mean residual
+  vanish, preserving the property under test. Implementation unchanged.
+
+### Commits
+
+- `77c191c feat(gradients): alpha_gradient_coefficient (envelope alpha*, no product-rule correction)`
+- `feat(gradients): autograd belief-gradient oracle (filtering / smoothing split)`
+- `feat(gradients): diagonal-KL filtering kernel + family registry with oracle fallback`
+- `test(gradients): alpha* cancellation (R on both sides) + q==p self-gradient zero`
+- `docs(edits): 2026-05-29 phase 4 gradients changes log`
+
+Rejected: none.
