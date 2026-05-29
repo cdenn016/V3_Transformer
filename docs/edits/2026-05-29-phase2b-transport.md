@@ -412,3 +412,114 @@ pre-existing tests.
 - `d8b1475 docs(edits): 2026-05-29 phase 2e phi-preconditioner changes log`
 - `07f4674 fix(geometry): device-agnostic phi preconditioner + adaptive pullback Psi-series`
 - (this entry) docstring caveat: Killing metric is Ad(K)-invariant, not bi-invariant on GL(K).
+
+## Phase 3 Free Energy + alpha + attention prior — 2026-05-29 (continuation)
+
+Built the single authoritative scalar free energy `F = sum_i F_i` and the two seams it
+pulls from: the self-coupling coefficient (`alpha_i.py`) and the attention prior
+(`attention_prior.py`). `free_energy.py` is the one place F is materialized; it is
+divergence-agnostic (consumes per-pair energies `E_ij` and self-divergences `D(q_i||p_i)`
+from the `divergence` registry, never a concrete kernel). Canonical (with the attention-
+entropy term) vs surrogate is a single `include_attention_entropy` toggle. Self-contained,
+V3-internal tests only (analytic known-value + property + finite-difference + autograd);
+correctness pinned by the envelope identity, beta-stationarity, the canonical-minus-
+surrogate gradient gap, and the alpha-envelope — not by re-running F's own formula.
+
+### Files created
+
+- `vfe3/alpha_i.py` — a `{constant, state_dependent, state_dependent_per_coord}` self-
+  coupling registry (`register_alpha`/`get_alpha`), the precision regularizer
+  `alpha_regularizer`, and the `self_coupling_alpha(kl, *, value, b0, c0, mode)` dispatcher.
+- `vfe3/attention_prior.py` — a `{uniform, causal, alibi}` attention-prior registry
+  (`register_prior`/`get_prior`) returning a LOG-PRIOR BIAS `B_ij`, and the
+  `attention_log_prior(name, n_query, n_key, *, slope, device, dtype)` dispatcher.
+- `vfe3/free_energy.py` — `effective_temperature`, `pairwise_energy`, `self_divergence`,
+  `attention_weights`, `log_partition`, `reduced_free_energy`, and the scalar `free_energy`.
+- `tests/test_alpha_i.py` (3 tests), `tests/test_attention_prior.py` (3 tests),
+  `tests/test_free_energy.py` (9 tests).
+
+### Files modified
+
+- (none — additive only; the existing `divergence.renyi` seam is reused unchanged.)
+
+### Changes
+
+**`alpha_i.py` — self-coupling is a registry seam, default `constant` (alpha=1).** The
+state-dependent form `alpha*_i = c0/(b0 + D(q_i||p_i))` is the stationary point of
+`alpha*D + R(alpha)`, `R(alpha) = b0*alpha - c0*log(alpha)` (`d/dalpha = D + b0 - c0/alpha
+= 0` at alpha*). The per-coordinate form `alpha^(k)* = c0^(k)/(b0^(k) + D^(k))` is the
+manuscript's implemented choice (`eq:state_dependent_alpha`); `b0`/`c0` accept scalar or
+`(K,)` tensors. Each registered form takes `**kwargs` so the dispatcher forwards one
+uniform argument set.
+
+**`attention_prior.py` — the prior is a log-prior bias, default `uniform`.** Each prior
+returns `B_ij` added to the attention logits: `beta*_ij = softmax_j(B_ij - E_ij/tau)`, and
+the normalized prior used in the attention-entropy term is `pi = softmax_j(B)`. `uniform`
+-> 0 (pi = 1/N); `causal` -> 0 for key `j <= i`, `-inf` for `j > i`; `alibi` -> `-slope*
+|i-j|` (Press et al. linear distance bias). A new prior (learned bias, windowed, ...) slots
+in by `register_prior` without editing the free-energy call site. Internal tensors built on
+the input's device/dtype (device-agnostic).
+
+**`free_energy.py` — the single scalar F, divergence-agnostic.**
+`effective_temperature(kappa, K)` is `tau = kappa*sqrt(K)` (standard transformer kappa=1).
+`pairwise_energy` / `self_divergence` route through `divergence.renyi(..., family, alpha)`
+(KL = Renyi at alpha=1), so swapping the divergence is a `family`/`alpha` change — F is not
+edited. `attention_weights` is `beta* = softmax_j(B - E/tau)`; `log_partition` is
+`log Z_i = logsumexp_j(B - E/tau)`; `reduced_free_energy = -tau log Z_i` (the canonical
+beta-block evaluated at beta*). The scalar `free_energy(self_div, energy, alpha, *, tau,
+include_attention_entropy, log_prior, alpha_reg, log_likelihood)` assembles
+`F = sum_i [ alpha_i*D(q_i||p_i) (+ R) + sum_j beta_ij E_ij + tau sum_j beta_ij log(beta_ij
+/pi_ij) (canonical only) - ell_i ]`. The observation likelihood `ell_i` is an OPTIONAL
+passed-in term (default 0; the Gaussian-template observation model is Phase 7 decode). The
+hyper-prior `lambda_h KL(s||h)` and model-coupling `gamma KL(s_i||Omega s_j)` are NAMED
+extension points, absent from the default path, never half-wired.
+
+### Modularity / seams
+
+Three config-selected registries, each swappable without editing call sites: **divergence**
+(existing — `family`/`alpha`; F is divergence-agnostic, so the beta/envelope/gradient-gap
+identities treat `E_ij` as an opaque per-pair energy and hold for any divergence), **self-
+coupling** (`alpha_i`), **attention prior** (`attention_prior`). There always exists a
+theoretically pure path under toggles: canonical F (entropy term present) is the default;
+surrogate is the toggle (`include_attention_entropy=False`). beta is passed explicitly to
+`free_energy` so beta-stationarity is testable.
+
+### Analytic anchors (independent of the implementation)
+
+- **Envelope:** `sum_j beta*_j E_j + tau sum_j beta*_j log(beta*_j/pi_j) = -tau log Z`,
+  `Z = sum_j pi_j exp(-E_j/tau)`. Pinned by the hand literal `F_red = 1.1264` for
+  `E=[1,2,0.5]`, `pi=[0.5,0.3,0.2]`, `tau=2` (a NON-UNIFORM prior — uniform pi cancels in
+  beta*, the entropy, and Z simultaneously, hiding a pi-wiring or `tau*log N` offset; the
+  literal catches that offset). All property tests use the non-uniform prior.
+- **Stationarity:** at beta*, `E_j + tau log(beta*_j/pi_j)` is constant across j (= -tau
+  log Z); the residual spread is < 1e-5 and its mean equals `reduced_free_energy`.
+- **Gradient gap (sign pinned):** `autograd(surrogate beta-block) - autograd(canonical) =
+  -tau^{-1} Cov_{beta*}(E, dE/dx)`, with `Cov(A,B) = sum_j beta*_j A_j B_j - (sum_j beta*_j
+  A_j)(sum_j beta*_j B_j)`. The test builds beta* as a LIVE function of x (not detached) —
+  if beta* were precomputed/detached, both blocks would give `sum beta* dE` and the gap
+  would be identically zero, passing while testing nothing. The envelope `autograd(canonical,
+  beta* live) == sum_j beta*_j dE_j` is also checked.
+- **alpha-envelope:** at alpha*, `dF/dalpha = 0`, so `grad_q [alpha*(D)*D + R(alpha*(D))]
+  == alpha* * grad_q D` (the explicit alpha-path vanishes) — the structural twin of the
+  beta-envelope; de-risks Phase 4's hand-derived alpha product-rule correction.
+- **Canonical minus surrogate** equals the tau-weighted entropy block; **known-value F**
+  for q==p (self_div=0), uniform energy + prior; **autograd-vs-finite-difference** of the
+  full scalar F (mu_q gradient) at atol/rtol 1e-3.
+
+### Test results
+
+```
+97 passed
+```
+
+15 new tests (3 `test_alpha_i.py` + 3 `test_attention_prior.py` + 9 `test_free_energy.py`);
+no regressions in the 82 pre-existing tests.
+
+### Commits
+
+- `793cfd8 feat(free-energy): self-coupling alpha registry (constant / state-dependent / per-coord)`
+- `e4bbc58 feat(free-energy): attention-prior registry (uniform / causal / alibi log-bias)`
+- `2a0fe49 feat(free-energy): attention weights, log-partition, envelope (non-uniform prior pinned)`
+- `f7e1063 feat(free-energy): scalar F = sum_i F_i, canonical/surrogate toggle, likelihood optional`
+- `db41eee test(free-energy): envelope gradient gap (-cov/tau) + alpha-envelope, live beta`
+- (this entry) `docs(edits): 2026-05-29 phase 3 free energy changes log`
