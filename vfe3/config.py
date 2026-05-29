@@ -25,6 +25,11 @@ class VFE3Config:
     alpha_div:         float = 1.0
 
     def __post_init__(self) -> None:
+        # Validate in field-declaration order.
+        if self.eps <= 0.0:
+            raise ValueError(f"eps must be positive, got {self.eps}")
+        if self.kl_max <= 0.0:
+            raise ValueError(f"kl_max must be positive, got {self.kl_max}")
         if self.divergence_family not in _VALID_DIVERGENCE_FAMILIES:
             raise ValueError(
                 f"divergence_family must be one of {_VALID_DIVERGENCE_FAMILIES}, "
@@ -32,7 +37,3 @@ class VFE3Config:
             )
         if self.alpha_div <= 0.0:
             raise ValueError(f"alpha_div must be positive, got {self.alpha_div}")
-        if self.eps <= 0.0:
-            raise ValueError(f"eps must be positive, got {self.eps}")
-        if self.kl_max <= 0.0:
-            raise ValueError(f"kl_max must be positive, got {self.kl_max}")

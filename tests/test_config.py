@@ -1,3 +1,5 @@
+import pytest
+
 from vfe3.config import VFE3Config
 
 
@@ -10,12 +12,20 @@ def test_config_defaults():
 
 
 def test_config_rejects_unknown_family():
-    import pytest
     with pytest.raises(ValueError):
         VFE3Config(divergence_family="not_a_family")
 
 
 def test_config_rejects_nonpositive_alpha():
-    import pytest
     with pytest.raises(ValueError):
         VFE3Config(alpha_div=0.0)
+
+
+def test_config_rejects_nonpositive_eps():
+    with pytest.raises(ValueError):
+        VFE3Config(eps=0.0)
+
+
+def test_config_rejects_nonpositive_kl_max():
+    with pytest.raises(ValueError):
+        VFE3Config(kl_max=0.0)

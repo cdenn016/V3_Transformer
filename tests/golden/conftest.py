@@ -14,14 +14,16 @@ from pathlib import Path
 
 import pytest
 
+# repo root = parents[2] of this file (tests/golden/ -> tests/ -> repo root)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _vfe2_root() -> Path | None:
     env = os.environ.get("VFE2_ROOT")
     if env:
         p = Path(env)
         return p if p.exists() else None
-    # repo root = parents[2] of this file (tests/golden/conftest.py)
-    sibling = Path(__file__).resolve().parents[2].parent / "VFE_2.0"
+    sibling = _REPO_ROOT.parent / "VFE_2.0"
     return sibling if sibling.exists() else None
 
 
@@ -35,6 +37,6 @@ def vfe2_kl():
         sys.path.insert(0, str(root))
     try:
         from transformer.core import kl_computation
-    except Exception as exc:  # import error -> skip, don't fail
+    except ImportError as exc:  # genuinely missing -> skip; other errors surface
         pytest.skip(f"could not import VFE_2.0 kl_computation: {exc}")
     return kl_computation
