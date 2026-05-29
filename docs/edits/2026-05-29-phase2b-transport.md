@@ -326,10 +326,26 @@ K-guarded.** `pullback_metric` computes `G_ab(φ) = ⟨d exp_φ(Tₐ), d exp_φ(
 `d exp_φ(T) = Ψ(ad_φ)(T)·exp(φ)`, `Ψ(z) = (eᶻ−1)/z = Σ_{k≥0} zᵏ/(k+1)!`, where ad_φ acts on
 coordinates via the structure constants `(ad_φ)_{cb} = Σ_a φ^a f[a,b,c]` and `f[a,b,c]` are
 the coordinates of `[Gₐ,G_b]` (reusing the bracket + Gram-pseudo-inverse extraction). The
-truncated Ψ-series is accumulated in float64; `d exp_φ(eₐ)` in coords is column a of
-`Ψ(ad_φ)`, embedded and right-multiplied by `exp(φ)`. The structure-constants tensor is
-O(n_gen²·K²), so K > `max_k` (default 12) raises before allocation. The `pullback` rule
-solves `(G(φ) + εI)·nat = grad` rather than forming an explicit inverse.
+Ψ-series is accumulated in float64 and summed **adaptively**: terms accrue until the new
+term's max |entry| drops below `series_tol` (default 1e-12), capped at `series_order`
+(default 40). The truncation error of Ψ(ad_φ) grows with ‖φ‖ (the ad_φ eigenvalues scale
+with ‖φ‖), so a fixed low order is inaccurate in exactly the non-compact large-norm regime
+the pullback metric exists for; the adaptive cutoff holds it to the FD-of-exp oracle across
+`retract_glk`'s full `max_norm = 5` range (e.g. ‖φ‖ = 2 → ~4e-8, ‖φ‖ = 5 → ~3e-6). The
+`(k+1)!` coefficient is a **float** divisor — an int divisor overflows tensor division past
+order ~20. `d exp_φ(eₐ)` in coords is column a of `Ψ(ad_φ)`, embedded and right-multiplied
+by `exp(φ)`. The structure-constants tensor is O(n_gen²·K²), so K > `max_k` (default 12)
+raises before allocation. The `pullback` rule solves `(G(φ) + εI)·nat = grad` rather than
+forming an explicit inverse.
+
+**Device-agnostic throughout (RTX 5090 / CUDA).** Every internally-created tensor is built
+on the input's device: `pullback_metric`'s identity (`torch.eye(…, device=ad.device)`) and
+`build_killing_preconditioner_per_block`'s block-assembly buffer and block-index buffer
+(`torch.zeros`/`torch.full(…, device=generators.device)`). Without the explicit `device=`,
+those tensors default to CPU and crash on cross-device matmul/index-assign when φ and the
+generators live on CUDA — the multi-block `killing_per_block` and `pullback` modes were the
+affected runtime paths. The Killing single-block path was already device-safe
+(`.double()`/`full_like`/`.to(orig_dtype)` all inherit the input device).
 
 ### Analytic anchors (independent of the implementation)
 
@@ -349,15 +365,22 @@ solves `(G(φ) + εI)·nat = grad` rather than forming an explicit inverse.
   central finite-difference of `matrix_exp` (`Jₐ = ∂_ε exp(embed(φ±ε eₐ))`, `G_FD[a,b] =
   tr(JₐᵀJ_b)`) to 1e-4 on so(3) at φ=(0.4,−0.3,0.5) — the independent oracle validating the
   Ψ-series and operator ordering; symmetric PD.
+- Pullback at the SHIPPED DEFAULT knobs (no explicit `series_order`) on a non-compact
+  symmetric gl(2) φ at ‖φ‖=2 matches the FD-of-exp oracle to 1e-4 — pins the default in the
+  large-norm regime, not just the small-angle compact corner. A second default-knob check
+  drives ‖φ‖=5 and asserts the metric is finite (the float-coefficient series does not
+  overflow at the order-40 cap).
 
 ### Test results
 
 ```
-80 passed
+82 passed
 ```
 
-12 new tests in `tests/test_phi_preconditioner.py` (3 none/clip + 4 Killing + 2 per-block +
-3 pullback); no regressions in the 68 pre-existing tests.
+14 new tests in `tests/test_phi_preconditioner.py` (3 none/clip + 4 Killing + 2 per-block +
+5 pullback — φ=0 Gram, FD-of-exp on so(3), FD-of-exp at the default order on a non-compact
+gl(2) φ, the order-40 finite/no-overflow check, and the K-guard); no regressions in the 68
+pre-existing tests.
 
 ### Commits
 

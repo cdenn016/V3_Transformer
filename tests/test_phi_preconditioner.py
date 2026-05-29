@@ -144,6 +144,33 @@ def test_pullback_matches_finite_difference_of_exp():
     assert (torch.linalg.eigvalsh(Gclosed) > 0).all()
 
 
+def test_pullback_matches_fd_noncompact_at_default_order():
+    # Pins the SHIPPED DEFAULT (no explicit series_order): a non-compact symmetric
+    # gl(2) phi at ||phi||~2 -- well inside retract_glk's max_norm=5. ad_phi eigenvalues
+    # scale with ||phi||, so a fixed low-order Psi truncation is inaccurate here; the
+    # adaptive default must still match the FD-of-exp oracle in the regime the pullback
+    # metric exists for. Closed-form (default knobs) must agree with FD to 1e-4.
+    G = generate_glk(2).double()
+    base = torch.tensor([0.6, 0.5, 0.5, -0.6], dtype=torch.float64)   # E00,E01,E10,E11
+    phi = base / base.norm() * 2.0                        # ||phi|| = 2.0 (non-compact)
+    Gclosed = pullback_metric(phi, G)                     # SHIPPED DEFAULT series knobs
+    Gfd = _fd_dexp_metric(phi, G)
+    assert torch.allclose(Gclosed, Gfd, atol=1e-4)
+    assert torch.allclose(Gclosed, Gclosed.transpose(-1, -2), atol=1e-6)
+    assert (torch.linalg.eigvalsh(Gclosed) > 0).all()
+
+
+def test_pullback_default_order_no_factorial_overflow():
+    # The Psi-series coefficient is a float: an int 1/(k+1)! divisor overflows tensor
+    # division past order ~20. The shipped default cap (40) must run to completion
+    # without raising on a non-compact phi that drives the series deep.
+    G = generate_glk(2).double()
+    base = torch.tensor([0.6, 0.5, 0.5, -0.6], dtype=torch.float64)
+    phi = base / base.norm() * 5.0                        # ||phi|| = 5 (drives series deep)
+    Gclosed = pullback_metric(phi, G)                     # default series_order=40
+    assert torch.isfinite(Gclosed).all()
+
+
 def test_pullback_k_guard():
     import pytest
     G = generate_glk(13)                                  # K=13 > max_k

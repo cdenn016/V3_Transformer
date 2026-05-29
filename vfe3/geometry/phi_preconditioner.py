@@ -137,7 +137,7 @@ def _generator_block_index(
         bounds.append((start, start + d))
         start += d
     n_gen = generators.shape[0]
-    block_of = torch.full((n_gen,), -1, dtype=torch.long)
+    block_of = torch.full((n_gen,), -1, dtype=torch.long, device=generators.device)
     for a in range(n_gen):
         mass  = [float(generators[a, s:e, s:e].abs().sum()) for (s, e) in bounds]
         total = float(generators[a].abs().sum())
@@ -166,7 +166,7 @@ def build_killing_preconditioner_per_block(
         return build_killing_preconditioner(generators, center_reg=center_reg, tol=tol)
     block_of = _generator_block_index(generators, irrep_dims)
     n_gen = generators.shape[0]
-    Minv  = torch.zeros(n_gen, n_gen, dtype=generators.dtype)
+    Minv  = torch.zeros(n_gen, n_gen, dtype=generators.dtype, device=generators.device)
     start = 0
     for h, d in enumerate(irrep_dims):
         idx     = (block_of == h).nonzero(as_tuple=True)[0]
@@ -216,15 +216,21 @@ def pullback_metric(
     generators:   torch.Tensor,           # (n_gen, K, K)
 
     *,
-    series_order: int = 6,
-    max_k:        int = 12,
+    series_tol:   float = 1e-12,
+    series_order: int   = 40,
+    max_k:        int   = 12,
 ) -> torch.Tensor:                        # (..., n_gen, n_gen) position-dependent metric
     r"""Pullback natural-gradient metric G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F.
 
     d exp_phi(T) = Psi(ad_phi)(T) exp(phi), Psi(z) = (e^z - 1)/z = sum_k z^k/(k+1)!.
-    ad_phi acts on coordinates: (ad_phi)_{cb} = sum_a phi^a f[a,b,c]. The structure-
-    constants tensor is O(n_gen^2 K^2); guarded for K > max_k (infeasible for large K).
-    The finite-difference of exp is the correctness arbiter for this kernel.
+    ad_phi acts on coordinates: (ad_phi)_{cb} = sum_a phi^a f[a,b,c]. The Psi series is
+    summed adaptively: terms accumulate until the new term's max |entry| < series_tol,
+    capped at series_order. Truncation error of Psi(ad_phi) grows with ||phi||, so a
+    fixed low order is inaccurate in the non-compact (large-norm) regime the pullback
+    metric exists for; the adaptive cutoff keeps it accurate up to retract_phi's max_norm.
+    The 1/(k+1)! coefficient is a float (an int divisor overflows past order ~20). The
+    structure-constants tensor is O(n_gen^2 K^2); guarded for K > max_k (infeasible for
+    large K). The finite-difference of exp is the correctness arbiter for this kernel.
     """
     K = generators.shape[-1]
     if K > max_k:
@@ -237,12 +243,15 @@ def pullback_metric(
     f  = _structure_constants(G)                           # (n_gen,n_gen,n_gen) f[a,b,c]
     ad = torch.einsum("...a,abc->...cb", phi, f)           # (...,n_gen,n_gen) (ad_phi)_{cb}
 
-    eye    = torch.eye(n_gen, dtype=ad.dtype).expand_as(ad)
+    eye    = torch.eye(n_gen, dtype=ad.dtype, device=ad.device).expand_as(ad).clone()
     psi    = eye.clone()
     ad_pow = eye.clone()
     for k in range(1, series_order):
         ad_pow = torch.einsum("...ij,...jk->...ik", ad_pow, ad)
-        psi    = psi + ad_pow / math.factorial(k + 1)
+        term   = ad_pow * (1.0 / float(math.factorial(k + 1)))   # float coeff: int overflows >~20
+        psi    = psi + term
+        if float(term.abs().max()) < series_tol:           # converged: higher terms negligible
+            break
 
     # d exp_phi(e_a) coords = psi @ e_a = column a of psi -> embed -> times exp(phi)
     W       = torch.einsum("...ca,cij->...aij", psi, G)    # (...,n_gen,K,K) Psi(ad_phi)(T_a)
@@ -259,12 +268,13 @@ def _precond_pullback(
     generators:   torch.Tensor,           # (n_gen, K, K)
 
     *,
-    series_order: int   = 6,
+    series_tol:   float = 1e-12,
     eps:          float = 1e-6,
+    series_order: int   = 40,
     **kwargs,
 ) -> torch.Tensor:
     r"""Position-dependent natural gradient: solve G(phi) nat = grad_phi."""
-    G_metric = pullback_metric(phi, generators, series_order=series_order)
+    G_metric = pullback_metric(phi, generators, series_tol=series_tol, series_order=series_order)
     eye = torch.eye(G_metric.shape[-1], dtype=G_metric.dtype, device=G_metric.device)
     sol = torch.linalg.solve(G_metric + eps * eye, grad_phi.unsqueeze(-1))
     return sol.squeeze(-1)
@@ -277,7 +287,8 @@ def precondition_phi_gradient(
 
     *,
     clip_c:       float = 10.0,
-    series_order: int   = 6,
+    series_tol:   float = 1e-12,
+    series_order: int   = 40,
     mode:         str   = "none",
 
     center_reg:   Optional[float]        = None,   # None -> 2*K
@@ -287,6 +298,6 @@ def precondition_phi_gradient(
     r"""Dispatch to the registered preconditioning rule `mode` (default 'none')."""
     return get_precond(mode)(
         grad_phi, phi, generators,
-        clip_c=clip_c, series_order=series_order, center_reg=center_reg,
-        irrep_dims=irrep_dims, inv_metric=inv_metric,
+        clip_c=clip_c, series_tol=series_tol, series_order=series_order,
+        center_reg=center_reg, irrep_dims=irrep_dims, inv_metric=inv_metric,
     )
