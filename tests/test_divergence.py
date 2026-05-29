@@ -136,3 +136,46 @@ def test_alpha_nonpositive_raises(bad_alpha):
     sigma = torch.rand(2, 4, generator=g) + 0.1
     with pytest.raises(ValueError):
         renyi(mu, sigma, mu, sigma, alpha=bad_alpha, family="gaussian_diagonal")
+
+
+def test_diagonal_kl_matches_torch_distributions():
+    # Independent reference: PyTorch's own Normal KL (summed over dims).
+    from torch.distributions import Normal, kl_divergence
+    from vfe3.divergence import kl
+    g = torch.Generator().manual_seed(20)
+    mu_q = torch.randn(4, 5, generator=g)
+    mu_t = torch.randn(4, 5, generator=g)
+    var_q = torch.rand(4, 5, generator=g) + 0.2
+    var_t = torch.rand(4, 5, generator=g) + 0.2
+    ref = kl_divergence(Normal(mu_q, var_q.sqrt()), Normal(mu_t, var_t.sqrt())).sum(-1)
+    got = kl(mu_q, var_q, mu_t, var_t, family="gaussian_diagonal")
+    assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5)
+
+
+def test_full_kl_matches_torch_distributions():
+    # Independent reference: PyTorch's own MultivariateNormal KL.
+    from torch.distributions import MultivariateNormal, kl_divergence
+    from vfe3.divergence import kl
+    g = torch.Generator().manual_seed(21)
+    K = 4
+    mu_q = torch.randn(3, K, generator=g)
+    mu_t = torch.randn(3, K, generator=g)
+    Aq = torch.randn(3, K, K, generator=g)
+    At = torch.randn(3, K, K, generator=g)
+    S_q = Aq @ Aq.transpose(-1, -2) + torch.eye(K)
+    S_t = At @ At.transpose(-1, -2) + torch.eye(K)
+    ref = kl_divergence(MultivariateNormal(mu_q, S_q), MultivariateNormal(mu_t, S_t))
+    got = kl(mu_q, S_q, mu_t, S_t, family="gaussian_full", eps=0.0)
+    assert torch.allclose(got, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_diagonal_kl_closed_form_1d():
+    # 1-D Gaussian KL: 0.5 (v1/v2 + (m2-m1)^2/v2 - 1 + ln(v2/v1)).
+    from vfe3.divergence import kl
+    mu_q = torch.tensor([[0.5]])
+    mu_t = torch.tensor([[-1.0]])
+    v_q = torch.tensor([[2.0]])
+    v_t = torch.tensor([[0.5]])
+    expected = 0.5 * (2.0 / 0.5 + (1.5 ** 2) / 0.5 - 1.0 + torch.log(torch.tensor(0.5 / 2.0)))
+    got = kl(mu_q, v_q, mu_t, v_t, family="gaussian_diagonal")
+    assert torch.allclose(got, expected.reshape(1), atol=1e-5)

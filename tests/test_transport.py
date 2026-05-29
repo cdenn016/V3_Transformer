@@ -87,3 +87,43 @@ def test_direct_omega_represents_reflection():
     omega = refl.expand(1, 2, 4, 4).contiguous()
     out = compute_transport_operators_direct(omega, gauge_mode="learned")
     assert torch.det(out["omega_i"][0, 0]) < 0
+
+
+def test_so2_transport_is_exact_rotation():
+    # exp(theta * L_01) with L_01 = [[0,1],[-1,0]] is the rotation
+    # [[cos, sin], [-sin, cos]]. Independent closed-form check.
+    import math
+    grp = get_group("so_k")(K=2)
+    theta = 0.7
+    phi = torch.zeros(1, 1, 1)
+    phi[0, 0, 0] = theta
+    out = compute_transport_operators(phi, grp, gauge_mode="learned")
+    c, s = math.cos(theta), math.sin(theta)
+    expected = torch.tensor([[c, s], [-s, c]])
+    assert torch.allclose(out["exp_phi"][0, 0], expected, atol=1e-5)
+
+
+def test_phi_path_cocycle_identity():
+    # Flat (Regime I) transport is a cocycle: Omega_ij @ Omega_jk = Omega_ik.
+    grp = get_group("so_k")(K=4)
+    g = torch.Generator().manual_seed(31)
+    phi = 0.3 * torch.randn(1, 4, grp.generators.shape[0], generator=g)
+    omega = compute_transport_operators(phi, grp, gauge_mode="learned")["Omega"]
+    lhs = omega[0, 0, 1] @ omega[0, 1, 2]
+    rhs = omega[0, 0, 2]
+    assert torch.allclose(lhs, rhs, atol=1e-4)
+
+
+def test_transport_covariance_full_matches_explicit_matmul():
+    # Independent reference for the sandwich: explicit Omega @ Sigma @ Omega^T.
+    grp = get_group("so_k")(K=4)
+    g = torch.Generator().manual_seed(32)
+    phi = 0.3 * torch.randn(1, 2, grp.generators.shape[0], generator=g)
+    omega = compute_transport_operators(phi, grp, gauge_mode="learned")["Omega"]
+    A = torch.randn(1, 2, 4, 4, generator=g)
+    sigma = A @ A.transpose(-1, -2) + torch.eye(4)
+    got = transport_covariance(omega, sigma)
+    # explicit: for each (i,j), Omega_ij @ sigma_j @ Omega_ij^T
+    i, j = 0, 1
+    ref = omega[0, i, j] @ sigma[0, j] @ omega[0, i, j].transpose(-1, -2)
+    assert torch.allclose(got[0, i, j], ref, atol=1e-5)

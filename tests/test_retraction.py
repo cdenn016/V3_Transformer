@@ -44,3 +44,13 @@ def test_natural_gradient_diagonal_formula():
     nmu, nsig = natural_gradient(gmu, gsig, sigma)
     assert torch.allclose(nmu, sigma * gmu, atol=1e-6)
     assert torch.allclose(nsig, 2.0 * sigma * sigma * gsig, atol=1e-6)
+
+
+def test_full_retraction_K1_matches_diagonal_formula():
+    # For K=1 the affine-invariant SPD exp map reduces to the diagonal rule
+    # sigma_new = sigma * exp(tau * delta/sigma).
+    sigma = torch.tensor([[[2.0]]])          # (1,1,1) as (B,K,K) with K=1
+    delta = torch.tensor([[[0.6]]])
+    out = retract_spd_full(sigma, delta, trust_region=0.0)   # disable TR for exact check
+    expected = 2.0 * torch.exp(torch.tensor(0.6 / 2.0))
+    assert torch.allclose(out.reshape(()), expected, atol=1e-4)

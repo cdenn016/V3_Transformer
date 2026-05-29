@@ -86,3 +86,33 @@ def test_full_kl_invariant_under_group_pushforward(spec):
 
     assert grp.invariant_for("gaussian")
     assert torch.allclose(base, moved, atol=1e-3, rtol=1e-3)
+
+
+def test_glk_generators_exact_entries():
+    grp = get_group("glk")(K=2)
+    expected = torch.tensor([
+        [[1., 0.], [0., 0.]],   # E_00
+        [[0., 1.], [0., 0.]],   # E_01
+        [[0., 0.], [1., 0.]],   # E_10
+        [[0., 0.], [0., 1.]],   # E_11
+    ])
+    assert torch.equal(grp.generators, expected)
+
+
+def test_son_generators_exact_entries():
+    grp = get_group("so_k")(K=2)
+    expected = torch.tensor([[[0., 1.], [-1., 0.]]])   # L_01 = E_01 - E_10
+    assert torch.equal(grp.generators, expected)
+
+
+def test_closure_of_e01_e10_is_sl2():
+    # {E01, E10} closes to a 3-dim algebra (adds E00 - E11 direction).
+    from vfe3.geometry.closure import close_under_brackets
+    E01 = torch.tensor([[0., 1.], [0., 0.]])
+    E10 = torch.tensor([[0., 0.], [1., 0.]])
+    gens = torch.stack([E01, E10], dim=0)
+    closed, info = close_under_brackets(gens)
+    assert info["final_dim"] == 3 and info["converged"]
+    # Re-closing an already-closed basis adds nothing.
+    closed2, info2 = close_under_brackets(closed)
+    assert info2["n_added"] == 0
