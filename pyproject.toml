@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vfe3"
+version = "0.0.1"
+description = "Gauge-theoretic VFE transformer, clean-room rebuild (V3)"
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+[tool.setuptools.packages.find]
+include = ["vfe3*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
