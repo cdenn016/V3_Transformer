@@ -38,17 +38,21 @@ def test_son_matches_vfe2(vfe2_gen):
     assert torch.equal(got, ref)
 
 
-def test_closure_of_two_cross_blocks_matches_vfe2(vfe2_gen):
-    from vfe3.geometry.generators import generate_glk_cross_head
+def test_closure_adds_bracket_direction_matches_vfe2(vfe2_gen):
     from vfe3.geometry.closure import close_under_brackets
-    # A single directed cross-coupling is NOT Lie-closed; closing it pulls in
-    # the reverse block + extra diagonal directions.
-    gens = generate_glk_cross_head(4, 2, [(0, 1)])
+    # {E_01, E_10} is NOT Lie-closed: [E_01, E_10] = E_00 - E_11 is a new
+    # direction outside their span, so closure must ADD it (exercises the
+    # additive SVD path, not just input preservation).
+    E01 = torch.tensor([[0.0, 1.0], [0.0, 0.0]])
+    E10 = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
+    gens = torch.stack([E01, E10], dim=0)                    # (2, 2, 2)
     ref_closed, ref_info = vfe2_gen["closure"].close_under_brackets(gens)
     got_closed, got_info = close_under_brackets(gens)
-    assert got_closed.shape == ref_closed.shape
-    assert torch.allclose(got_closed, ref_closed, atol=1e-6)
+    # Closure genuinely grew the basis (gl(2) is 4-dim; sl(2) here -> 3).
+    assert got_info["n_added"] >= 1
     assert got_info["final_dim"] == ref_info["final_dim"]
     assert got_info["converged"] == ref_info["converged"]
+    assert got_closed.shape == ref_closed.shape
+    assert torch.allclose(got_closed, ref_closed, atol=1e-6)
     # Inputs preserved verbatim as the first n_gen rows.
     assert torch.allclose(got_closed[: gens.shape[0]], gens, atol=1e-6)

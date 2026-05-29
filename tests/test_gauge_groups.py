@@ -36,6 +36,11 @@ def test_block_glk_with_cross_coupling_grows_basis():
     base = get_group("block_glk")(K=6, n_heads=3)
     coupled = get_group("block_glk")(K=6, n_heads=3, cross_couplings=[(0, 1)])
     assert coupled.generators.shape[0] == base.generators.shape[0] + 4
+    # A cross-coupled group is not block-diagonal with d_head blocks; its
+    # irrep structure is reported as the single block [K] (super-block
+    # decomposition is deferred to Phase 2b transport).
+    assert base.irrep_dims == [2, 2, 2]
+    assert coupled.irrep_dims == [6]
 
 
 def test_unknown_group_raises():

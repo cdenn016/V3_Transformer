@@ -36,6 +36,14 @@ class GaugeGroup:
     skew_symmetric:     bool                  # exp(-M) = exp(M)^T fast path
     invariant_families: Tuple[str, ...] = ("gaussian",)
 
+    def __post_init__(self) -> None:
+        K = self.generators.shape[-1]
+        if sum(self.irrep_dims) != K:
+            raise ValueError(
+                f"sum(irrep_dims)={sum(self.irrep_dims)} must equal K={K}; "
+                f"irrep_dims={self.irrep_dims}"
+            )
+
     def invariant_for(self, family: str) -> bool:
         """Whether the divergence of ``family`` is invariant under this group."""
         return family in self.invariant_families
@@ -66,10 +74,11 @@ def _build_glk(
     K:       int,
 
     *,
-    dtype:   torch.dtype = torch.float32,
+    dtype:   torch.dtype                  = torch.float32,
+    device:  'torch.device | str | None'  = None,
 ) -> GaugeGroup:
     """Full GL(K): single block, full gl(K) generators."""
-    G = generate_glk(K, dtype=dtype)
+    G = generate_glk(K, dtype=dtype, device=device)
     return GaugeGroup(name="glk", generators=G, irrep_dims=[K], skew_symmetric=False)
 
 
@@ -79,27 +88,34 @@ def _build_block_glk(
     n_heads:         int,
 
     *,
-    cross_couplings: Optional[List[Tuple[int, int]]] = None,
     close_basis:     bool                            = False,
     dtype:           torch.dtype                     = torch.float32,
+    device:          'torch.device | str | None'     = None,
+    cross_couplings: Optional[List[Tuple[int, int]]] = None,
 ) -> GaugeGroup:
     """Block-diagonal GL(K) = GL(d_head)^n_heads, optional cross-head coupling.
 
     With ``cross_couplings`` the basis includes off-block generators; with
     ``close_basis=True`` it is closed under the Lie bracket into a subalgebra
-    of gl(K) (so the exponentiated group is well-defined).
+    of gl(K) (so the exponentiated group is well-defined). A cross-coupled
+    group is NOT block-diagonal with ``d_head`` blocks (its group elements have
+    off-block entries), so ``irrep_dims`` is reported as the single block
+    ``[K]``; the contiguous super-block decomposition (which needs head
+    reordering) is a Phase 2b transport concern.
     """
     d_head = K // n_heads
     if cross_couplings:
-        G = generate_glk_cross_head(K, n_heads, cross_couplings, dtype=dtype)
+        G = generate_glk_cross_head(K, n_heads, cross_couplings, dtype=dtype, device=device)
         if close_basis:
             G, _ = close_under_brackets(G)
+        irrep_dims = [K]
     else:
-        G = generate_glk_multihead(K, n_heads, dtype=dtype)
+        G = generate_glk_multihead(K, n_heads, dtype=dtype, device=device)
+        irrep_dims = [d_head] * n_heads
     return GaugeGroup(
         name="block_glk",
         generators=G,
-        irrep_dims=[d_head] * n_heads,
+        irrep_dims=irrep_dims,
         skew_symmetric=False,
     )
 
@@ -109,8 +125,9 @@ def _build_so_k(
     K:       int,
 
     *,
-    dtype:   torch.dtype = torch.float32,
+    dtype:   torch.dtype                  = torch.float32,
+    device:  'torch.device | str | None'  = None,
 ) -> GaugeGroup:
     """SO(K): skew-symmetric so(K) generators (single block)."""
-    G = generate_son(K, dtype=dtype)
+    G = generate_son(K, dtype=dtype, device=device)
     return GaugeGroup(name="so_k", generators=G, irrep_dims=[K], skew_symmetric=True)
