@@ -77,3 +77,95 @@ def lie_bracket_coords(
     A = embed_phi(phi1, generators)
     B = embed_phi(phi2, generators)
     return extract_phi(lie_bracket_matrix(A, B), generators, gram_pinv_=gram_pinv_)
+
+
+_COMPOSE: Dict[str, Callable[..., torch.Tensor]] = {}
+
+
+def register_compose(name: str) -> Callable:
+    """Decorator registering a composition rule phi1,phi2 -> composed coords."""
+    def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        _COMPOSE[name] = fn
+        return fn
+    return _wrap
+
+
+def get_compose(name: str) -> Callable[..., torch.Tensor]:
+    """Return the registered composition rule (KeyError if absent)."""
+    if name not in _COMPOSE:
+        raise KeyError(f"no composition rule {name!r}; available: {sorted(_COMPOSE)}")
+    return _COMPOSE[name]
+
+
+@register_compose("euclidean")
+def compose_euclidean(
+    phi1:       torch.Tensor,             # (..., n_gen)
+    phi2:       torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K) (unused; kept for a uniform seam)
+
+    *,
+    order:      int = 0,
+    gram_pinv_: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Plain Lie-algebra step phi1 + phi2 (exact iff [phi1, phi2] = 0).
+
+    The manuscript working/default update: g is a vector space, so the tangent
+    step is the sum of coordinates (GL(K)_supplementary.tex ll. 550-557).
+    """
+    return phi1 + phi2
+
+
+@register_compose("bch")
+def compose_bch(
+    phi1:       torch.Tensor,             # (..., n_gen)
+    phi2:       torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    order:      int = 4,
+    gram_pinv_: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""BCH chart correction: coords of log(exp(embed phi1) exp(embed phi2)).
+
+    Symmetric Dynkin series (matrix space, extracted once). Terms by `order`:
+      order>=1: + 1/2 [X,Y]
+      order>=2: + 1/12 ([X,[X,Y]] - [Y,[X,Y]])
+      order>=3: - 1/24 [Y,[X,[X,Y]]]
+      order>=4: - 1/720 ([Y,[Y,[Y,[Y,X]]]] + [X,[X,[X,[X,Y]]]])
+                + 1/360 ([X,[Y,[Y,[Y,X]]]] + [Y,[X,[X,[X,Y]]]])
+                + 1/120 ([Y,[X,[Y,[X,Y]]]] + [X,[Y,[X,[Y,X]]]])
+    Truncation error is O(||X||^{order+2} + ||Y||^{order+2}).
+    """
+    X = embed_phi(phi1, generators)
+    Y = embed_phi(phi2, generators)
+    Z = X + Y
+    br = lie_bracket_matrix
+    if order >= 1:
+        XY = br(X, Y)
+        Z = Z + 0.5 * XY
+    if order >= 2:
+        Z = Z + (1.0 / 12.0) * (br(X, XY) - br(Y, XY))
+    if order >= 3:
+        Z = Z - (1.0 / 24.0) * br(Y, br(X, XY))
+    if order >= 4:
+        YX  = br(Y, X)
+        YYX = br(Y, YX); YYYX = br(Y, YYX)
+        XXY = br(X, XY); XXXY = br(X, XXY)
+        Z = Z - (1.0 / 720.0) * (br(Y, YYYX) + br(X, XXXY))
+        Z = Z + (1.0 / 360.0) * (br(X, YYYX) + br(Y, XXXY))
+        Z = Z + (1.0 / 120.0) * (br(Y, br(X, br(Y, XY))) + br(X, br(Y, br(X, YX))))
+    return extract_phi(Z, generators, gram_pinv_=gram_pinv_)
+
+
+def compose_phi(
+    phi1:       torch.Tensor,             # (..., n_gen)
+    phi2:       torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    order:      int = 4,
+    mode:       str = "euclidean",
+    gram_pinv_: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Dispatch to the registered composition rule `mode`."""
+    return get_compose(mode)(phi1, phi2, generators, order=order, gram_pinv_=gram_pinv_)
