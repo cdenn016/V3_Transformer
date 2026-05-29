@@ -1,4 +1,3 @@
-import pytest
 import torch
 
 from vfe3.geometry.retraction import (

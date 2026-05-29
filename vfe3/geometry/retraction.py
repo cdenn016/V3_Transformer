@@ -115,6 +115,11 @@ def natural_gradient(
     The Fisher metric on Sigma is g(dS1,dS2) = (1/2) tr(S^-1 dS1 S^-1 dS2), so
     g^{kk} = 2 sigma_k^2 in the diagonal case. Ported from VFE_2.0
     compute_natural_gradient_gpu (vfe_gradients.py:1936).
+
+    Diagonal vs full is detected by ``sigma_q.dim() == grad_mu.dim()`` (diagonal
+    sigma matches the mean rank; full sigma has one extra trailing dim). This is
+    correct for the belief shapes used here ((B,N,K) diagonal, (B,N,K,K) full);
+    a caller passing other ranks must pass matching mean/sigma ranks.
     """
     is_diagonal = sigma_q.dim() == grad_mu.dim()
     orig_dtype = sigma_q.dtype
