@@ -70,3 +70,18 @@ def vfe2_transport():
     except ImportError as exc:
         pytest.skip(f"could not import VFE_2.0 transport: {exc}")
     return {"gauge_utils": gauge_utils, "transport_ops": transport_ops}
+
+
+@pytest.fixture(scope="session")
+def vfe2_retract():
+    """Return the 2.0 vfe_utils + vfe_gradients modules, or skip if unavailable."""
+    root = _vfe2_root()
+    if root is None:
+        pytest.skip("VFE_2.0 checkout not found (set VFE2_ROOT)")
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        from transformer.core import vfe_gradients, vfe_utils
+    except ImportError as exc:
+        pytest.skip(f"could not import VFE_2.0 retraction modules: {exc}")
+    return {"vfe_utils": vfe_utils, "vfe_gradients": vfe_gradients}
