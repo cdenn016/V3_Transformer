@@ -27,6 +27,18 @@ def test_retract_glk_max_norm_clamps_frame_to_ceiling():
     assert torch.allclose(out.norm(dim=-1), torch.full((3,), 5.0), atol=1e-3)
 
 
+def test_retract_glk_euclidean_unclamped_is_plain_step():
+    # Pin the UPDATE LOGIC directly: with both clamps disabled (trust_region=0,
+    # max_norm=0) the euclidean retraction is exactly phi + step_size * delta.
+    # The det>0 / orthogonality tests below are properties of exp(embed(.)) that
+    # hold for ANY output, so this is the test that actually pins the formula.
+    G = generate_glk(3)
+    phi = 0.05 * torch.randn(4, 9)
+    delta = 0.01 * torch.randn(4, 9)
+    out = retract_glk(phi, delta, G, step_size=0.5, trust_region=0.0, max_norm=0.0, mode="euclidean")
+    assert torch.allclose(out, phi + 0.5 * delta, atol=1e-6)
+
+
 def test_retract_glk_keeps_det_positive():
     # det(exp(embed phi)) = exp(tr) > 0 always: the GL+(K) identity-component property.
     G = generate_glk(3)
