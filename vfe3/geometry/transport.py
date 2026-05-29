@@ -61,7 +61,10 @@ def compute_transport_operators(
 
     Ported from VFE_2.0 compute_transport_operators (transport_ops.py:285-433),
     flat path. 'trivial' returns Omega = I. Returns 'exp_phi' (B,N,K,K),
-    'exp_neg_phi' (B,N,K,K), 'Omega' (B,N,N,K,K).
+    'exp_neg_phi' (B,N,K,K), 'Omega' (B,N,N,K,K). VFE_2.0's 'constant' gauge
+    mode is intentionally NOT supported here (it depended on a per-head learned
+    Omega parameter injected by the attention module, which does not exist in
+    this no-NN rebuild); 'constant' raises ValueError.
     """
     B, N, _ = phi.shape
     generators = group.generators
@@ -99,7 +102,10 @@ def compute_transport_operators_direct(
     Ported from VFE_2.0 compute_transport_operators_direct (transport_ops.py:440),
     flat path. Reaches all of GL(K) (det may be < 0; needs an external det
     penalty to stay invertible). Inverse via LU solve (exact cocycle), with a
-    ridge then pinv fallback for near-singular Omega. 'trivial' returns Omega=I.
+    ridge then pinv fallback for near-singular Omega. 'trivial' returns Omega=I;
+    VFE_2.0's 'constant' mode is intentionally unsupported (raises ValueError).
+    Deviation from 2.0: the ridge ``eps`` is configurable here (2.0 hardcodes
+    1e-6); at the default value behaviour is identical.
     Returns 'omega_i' (B,N,K,K), 'omega_j_inv' (B,N,K,K), 'Omega' (B,N,N,K,K).
     """
     B, N, K, _ = omega.shape

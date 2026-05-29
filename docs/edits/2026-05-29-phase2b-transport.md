@@ -2,8 +2,12 @@
 
 ## Files created
 
-- `vfe3/geometry/transport.py` — new module; three public functions
-- `tests/golden/test_transport_golden.py` — 6 golden + structural tests
+- `vfe3/geometry/transport.py` — new module; seven public functions
+  (`stable_matrix_exp_pair`, `compute_transport_operators`,
+  `compute_transport_operators_direct`, `transport_mean`,
+  `transport_covariance`, `omega_to_block_exp_pairs`)
+- `tests/golden/test_transport_golden.py` — 7 golden + structural tests
+- `tests/test_transport.py` — belief-action unit + equivariance/det<0 property tests
 
 ## Files modified
 
