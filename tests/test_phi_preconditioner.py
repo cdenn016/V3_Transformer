@@ -74,3 +74,32 @@ def test_killing_mode_applies_inverse_metric():
     Minv = build_killing_preconditioner(G, center_reg=4.0)
     out = precondition_phi_gradient(grad, torch.zeros(1, 4), G, mode="killing", center_reg=4.0)
     assert torch.allclose(out, grad @ Minv, atol=1e-6)
+
+
+from vfe3.geometry.phi_preconditioner import build_killing_preconditioner_per_block
+
+
+def test_per_block_is_block_diagonal_and_matches_local_killing():
+    # block_glk = gl(2) (+) gl(2): generators grouped by head (4 per head). The
+    # per-block metric couples only same-block generators and uses the local
+    # block dimension d_h=2, so the (8,8) inverse is block-diagonal in 4+4.
+    G = generate_glk_multihead(4, 2)                      # 8 generators, irrep [2,2]
+    irrep = [2, 2]
+    Minv = build_killing_preconditioner_per_block(G, irrep, center_reg=4.0)
+    # off-diagonal cross-block coupling is zero
+    assert torch.allclose(Minv[:4, 4:], torch.zeros(4, 4), atol=1e-6)
+    assert torch.allclose(Minv[4:, :4], torch.zeros(4, 4), atol=1e-6)
+    # each diagonal block equals the single-head gl(2) Killing inverse
+    head0 = generate_glk(2)
+    Minv_head = build_killing_preconditioner(head0, center_reg=4.0)
+    assert torch.allclose(Minv[:4, :4], Minv_head, atol=1e-5)
+
+
+def test_killing_per_block_mode():
+    G = generate_glk_multihead(4, 2)
+    irrep = [2, 2]
+    grad = torch.randn(3, 8)
+    Minv = build_killing_preconditioner_per_block(G, irrep, center_reg=4.0)
+    out = precondition_phi_gradient(grad, torch.zeros(3, 8), G, mode="killing_per_block",
+                                    irrep_dims=irrep, center_reg=4.0)
+    assert torch.allclose(out, grad @ Minv, atol=1e-6)

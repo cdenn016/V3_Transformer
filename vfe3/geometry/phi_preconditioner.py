@@ -124,6 +124,79 @@ def _precond_killing(
     return torch.einsum("...a,ab->...b", grad_phi, Minv)
 
 
+def _generator_block_index(
+    generators: torch.Tensor,             # (n_gen, K, K)
+    irrep_dims: List[int],                # block sizes; sum == K
+
+    *,
+    tol:        float = 1e-9,
+) -> torch.Tensor:                        # (n_gen,) block id per generator
+    r"""Block membership of each generator (asserts single-block support)."""
+    bounds, start = [], 0
+    for d in irrep_dims:
+        bounds.append((start, start + d))
+        start += d
+    n_gen = generators.shape[0]
+    block_of = torch.full((n_gen,), -1, dtype=torch.long)
+    for a in range(n_gen):
+        mass  = [float(generators[a, s:e, s:e].abs().sum()) for (s, e) in bounds]
+        total = float(generators[a].abs().sum())
+        hits  = [h for h, m in enumerate(mass) if m > tol]
+        if len(hits) != 1 or abs(sum(mass) - total) > tol:
+            raise ValueError(f"generator {a} is not supported in a single irrep block")
+        block_of[a] = hits[0]
+    return block_of
+
+
+def build_killing_preconditioner_per_block(
+    generators: torch.Tensor,             # (n_gen, K, K)
+    irrep_dims: List[int],                # block sizes; sum == K
+
+    *,
+    center_reg: Optional[float] = None,
+    tol:        float           = 1e-6,
+) -> torch.Tensor:                        # (n_gen, n_gen) block-diagonal inverse metric
+    r"""Block-diagonal Killing inverse: per-block local-dimension Cartan metric.
+
+    Single global block (irrep_dims == [K], e.g. cross-coupled bases) reduces to
+    build_killing_preconditioner. Otherwise each generator's own block supplies
+    the local Killing metric (block dimension d_h), with no cross-block coupling.
+    """
+    if len(irrep_dims) == 1:
+        return build_killing_preconditioner(generators, center_reg=center_reg, tol=tol)
+    block_of = _generator_block_index(generators, irrep_dims)
+    n_gen = generators.shape[0]
+    Minv  = torch.zeros(n_gen, n_gen, dtype=generators.dtype)
+    start = 0
+    for h, d in enumerate(irrep_dims):
+        idx     = (block_of == h).nonzero(as_tuple=True)[0]
+        sub     = generators[idx][:, start:start + d, start:start + d].contiguous()   # local d_h rep
+        sub_inv = build_killing_preconditioner(sub, center_reg=center_reg, tol=tol)
+        Minv[idx.unsqueeze(-1), idx.unsqueeze(0)] = sub_inv
+        start += d
+    return Minv
+
+
+@register_precond("killing_per_block")
+def _precond_killing_per_block(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen) (unused)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    center_reg: Optional[float]        = None,
+    irrep_dims: Optional[List[int]]    = None,
+    inv_metric: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Natural gradient under the per-block Killing metric."""
+    if inv_metric is None:
+        if irrep_dims is None:
+            raise ValueError("killing_per_block requires irrep_dims")
+        inv_metric = build_killing_preconditioner_per_block(generators, irrep_dims, center_reg=center_reg)
+    return torch.einsum("...a,ab->...b", grad_phi, inv_metric)
+
+
 def precondition_phi_gradient(
     grad_phi:     torch.Tensor,           # (..., n_gen) Euclidean grad wrt phi coords
     phi:          torch.Tensor,           # (..., n_gen) current frame (used by pullback)
