@@ -40,3 +40,18 @@ def vfe2_kl():
     except ImportError as exc:  # genuinely missing -> skip; other errors surface
         pytest.skip(f"could not import VFE_2.0 kl_computation: {exc}")
     return kl_computation
+
+
+@pytest.fixture(scope="session")
+def vfe2_gen():
+    """Return the 2.0 generator builders + closure, or skip if unavailable."""
+    root = _vfe2_root()
+    if root is None:
+        pytest.skip("VFE_2.0 checkout not found (set VFE2_ROOT)")
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        from math_utils.generators import builders, closure
+    except ImportError as exc:
+        pytest.skip(f"could not import VFE_2.0 generators: {exc}")
+    return {"builders": builders, "closure": closure}
