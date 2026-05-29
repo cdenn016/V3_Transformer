@@ -197,6 +197,79 @@ def _precond_killing_per_block(
     return torch.einsum("...a,ab->...b", grad_phi, inv_metric)
 
 
+def _structure_constants(
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    gram_pinv_: Optional[torch.Tensor] = None,
+) -> torch.Tensor:                        # (n_gen, n_gen, n_gen) f[a,b,c]: [G_a,G_b]=sum_c f G_c
+    r"""Structure constants f[a,b,c] = coords_c([G_a, G_b]) in the generator basis."""
+    G = generators
+    brak   = torch.einsum("aij,bjk->abik", G, G) - torch.einsum("bij,ajk->abik", G, G)   # [G_a,G_b]
+    gp     = gram_pinv(G) if gram_pinv_ is None else gram_pinv_
+    coords = torch.einsum("cij,abij->abc", G, brak)       # <G_c, [G_a,G_b]>
+    return torch.einsum("abc,cd->abd", coords, gp)
+
+
+def pullback_metric(
+    phi:          torch.Tensor,           # (..., n_gen) frame coordinates
+    generators:   torch.Tensor,           # (n_gen, K, K)
+
+    *,
+    series_order: int = 6,
+    max_k:        int = 12,
+) -> torch.Tensor:                        # (..., n_gen, n_gen) position-dependent metric
+    r"""Pullback natural-gradient metric G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F.
+
+    d exp_phi(T) = Psi(ad_phi)(T) exp(phi), Psi(z) = (e^z - 1)/z = sum_k z^k/(k+1)!.
+    ad_phi acts on coordinates: (ad_phi)_{cb} = sum_a phi^a f[a,b,c]. The structure-
+    constants tensor is O(n_gen^2 K^2); guarded for K > max_k (infeasible for large K).
+    The finite-difference of exp is the correctness arbiter for this kernel.
+    """
+    K = generators.shape[-1]
+    if K > max_k:
+        raise ValueError(f"pullback_metric: K={K} exceeds max_k={max_k} (structure-constants OOM)")
+    n_gen      = generators.shape[0]
+    orig_dtype = phi.dtype
+    G          = generators.double()
+    phi        = phi.double()
+
+    f  = _structure_constants(G)                           # (n_gen,n_gen,n_gen) f[a,b,c]
+    ad = torch.einsum("...a,abc->...cb", phi, f)           # (...,n_gen,n_gen) (ad_phi)_{cb}
+
+    eye    = torch.eye(n_gen, dtype=ad.dtype).expand_as(ad)
+    psi    = eye.clone()
+    ad_pow = eye.clone()
+    for k in range(1, series_order):
+        ad_pow = torch.einsum("...ij,...jk->...ik", ad_pow, ad)
+        psi    = psi + ad_pow / math.factorial(k + 1)
+
+    # d exp_phi(e_a) coords = psi @ e_a = column a of psi -> embed -> times exp(phi)
+    W       = torch.einsum("...ca,cij->...aij", psi, G)    # (...,n_gen,K,K) Psi(ad_phi)(T_a)
+    exp_phi = torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi, G))
+    dexp    = torch.einsum("...aij,...jk->...aik", W, exp_phi)
+    metric  = torch.einsum("...aij,...bij->...ab", dexp, dexp)
+    return metric.to(orig_dtype)
+
+
+@register_precond("pullback")
+def _precond_pullback(
+    grad_phi:     torch.Tensor,           # (..., n_gen)
+    phi:          torch.Tensor,           # (..., n_gen)
+    generators:   torch.Tensor,           # (n_gen, K, K)
+
+    *,
+    series_order: int   = 6,
+    eps:          float = 1e-6,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Position-dependent natural gradient: solve G(phi) nat = grad_phi."""
+    G_metric = pullback_metric(phi, generators, series_order=series_order)
+    eye = torch.eye(G_metric.shape[-1], dtype=G_metric.dtype, device=G_metric.device)
+    sol = torch.linalg.solve(G_metric + eps * eye, grad_phi.unsqueeze(-1))
+    return sol.squeeze(-1)
+
+
 def precondition_phi_gradient(
     grad_phi:     torch.Tensor,           # (..., n_gen) Euclidean grad wrt phi coords
     phi:          torch.Tensor,           # (..., n_gen) current frame (used by pullback)

@@ -103,3 +103,49 @@ def test_killing_per_block_mode():
     out = precondition_phi_gradient(grad, torch.zeros(3, 8), G, mode="killing_per_block",
                                     irrep_dims=irrep, center_reg=4.0)
     assert torch.allclose(out, grad @ Minv, atol=1e-6)
+
+
+from vfe3.geometry.lie_ops import embed_phi
+from vfe3.geometry.phi_preconditioner import pullback_metric
+
+
+def _fd_dexp_metric(phi_vec, G, eps=1e-4):
+    # Independent oracle: G_ab = <d exp_phi(e_a), d exp_phi(e_b)>_F via central
+    # finite differences of matrix_exp. d exp_phi(e_a) = d/dt exp(embed(phi + t e_a)).
+    n = G.shape[0]
+    J = []
+    for a in range(n):
+        ea = torch.zeros(n, dtype=torch.float64); ea[a] = 1.0
+        plus  = torch.linalg.matrix_exp(embed_phi((phi_vec + eps * ea), G))
+        minus = torch.linalg.matrix_exp(embed_phi((phi_vec - eps * ea), G))
+        J.append((plus - minus) / (2 * eps))
+    J = torch.stack(J, 0)                                 # (n, K, K)
+    return torch.einsum("aij,bij->ab", J, J)              # tr(J_a^T J_b)
+
+
+def test_pullback_at_zero_is_frobenius_gram():
+    # Psi(0) = I, exp(0) = I -> G_ab = tr(G_a^T G_b) = Frobenius Gram.
+    G = generate_glk(2)
+    Gmetric = pullback_metric(torch.zeros(4), G)
+    gram = torch.einsum("aij,bij->ab", G, G)
+    assert torch.allclose(Gmetric, gram, atol=1e-5)
+
+
+def test_pullback_matches_finite_difference_of_exp():
+    # The genuine independent check: closed Psi-series vs FD-of-exp. Validates the
+    # operator ordering and every series coefficient.
+    G = generate_son(3).double()                          # K=3, compact -> well-behaved
+    phi = torch.tensor([0.4, -0.3, 0.5], dtype=torch.float64)
+    Gclosed = pullback_metric(phi, G, series_order=10)
+    Gfd = _fd_dexp_metric(phi, G)
+    assert torch.allclose(Gclosed, Gfd, atol=1e-4)
+    # symmetric PD
+    assert torch.allclose(Gclosed, Gclosed.transpose(-1, -2), atol=1e-6)
+    assert (torch.linalg.eigvalsh(Gclosed) > 0).all()
+
+
+def test_pullback_k_guard():
+    import pytest
+    G = generate_glk(13)                                  # K=13 > max_k
+    with pytest.raises((ValueError, RuntimeError)):
+        pullback_metric(torch.zeros(169), G, max_k=12)
