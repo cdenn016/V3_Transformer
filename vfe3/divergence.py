@@ -54,6 +54,7 @@ def _logdet_chol(L: torch.Tensor) -> torch.Tensor:
 def safe_kl_clamp(
     kl:     torch.Tensor,
 
+    *,
     kl_max: float = 100.0,
 ) -> torch.Tensor:
     r"""Clamp to [0, kl_max]; map NaN/+inf -> kl_max, -inf -> 0.
@@ -134,7 +135,7 @@ def _gaussian_diagonal_renyi(
         logdet_term = logdet_per_dim.sum(dim=-1) / (alpha - 1.0)
         div = 0.5 * (mahal_term + logdet_term)
 
-    return safe_kl_clamp(div, kl_max)
+    return safe_kl_clamp(div, kl_max=kl_max)
 
 
 @register_divergence("gaussian_full")
@@ -200,7 +201,7 @@ def _gaussian_full_renyi(
         ) / (alpha - 1.0)
         div = 0.5 * (mahal_term + logdet_term)
 
-    return safe_kl_clamp(div, kl_max)
+    return safe_kl_clamp(div, kl_max=kl_max)
 
 
 def renyi(
