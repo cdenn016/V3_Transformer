@@ -248,3 +248,60 @@ def retract_son(
         max_norm=max_norm, eps=eps, order=order, mode=mode,
         generators=generators, gram_pinv_=gram_pinv_,
     )
+
+
+def _block_trace_vectors(
+    generators: torch.Tensor,             # (n_gen, K, K)
+    irrep_dims: List[int],                # block sizes; sum == K
+
+    *,
+    eps:        float = 1e-12,
+) -> torch.Tensor:                        # (n_blocks, n_gen) V[h,a] = tr(G_a|block h)
+    r"""Per-block trace functionals V[h,a] = tr(G_a restricted to block h)."""
+    rows, start = [], 0
+    for d in irrep_dims:
+        end = start + d
+        rows.append(generators[:, start:end, start:end].diagonal(dim1=-2, dim2=-1).sum(-1))
+        start = end
+    return torch.stack(rows, dim=0)                       # (n_blocks, n_gen)
+
+
+def project_phi_to_slk(
+    phi:        torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K)
+    irrep_dims: List[int],                # block sizes; sum == K
+
+    *,
+    eps:        float = 1e-12,
+) -> torch.Tensor:                        # (..., n_gen) per-block trace-free
+    r"""Hard projection to sl(K) per block: remove the trace component so
+
+        det(Omega_h) = exp(tr(embed(phi)|block h)) = 1.
+    phi <- phi - sum_h (phi . V_h / ||V_h||^2) V_h.
+    """
+    V = _block_trace_vectors(generators, irrep_dims)      # (H, n_gen)
+    v_norm_sq = (V * V).sum(-1).clamp(min=eps)            # (H,)
+    s = phi @ V.transpose(-1, -2)                         # (..., H)
+    coeffs = s / v_norm_sq                                # (..., H)
+    return phi - torch.einsum("...h,hg->...g", coeffs, V)
+
+
+def clamp_phi_trace(
+    phi:        torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K)
+    irrep_dims: List[int],                # block sizes; sum == K
+
+    *,
+    trace_max:  float = 5.0,              # soft cap T on |tr(embed(phi)|block h)|
+    eps:        float = 1e-12,
+) -> torch.Tensor:                        # (..., n_gen) with |s_h| <= T
+    r"""Soft per-block trace clamp: rescale only the trace component so |s_h| <= T,
+
+    bounding log|det(Omega_h)|. Off-trace (sl(K)) directions are untouched.
+    """
+    V = _block_trace_vectors(generators, irrep_dims)      # (H, n_gen)
+    v_norm_sq = (V * V).sum(-1).clamp(min=eps)            # (H,)
+    s = phi @ V.transpose(-1, -2)                         # (..., H)
+    s_clamped = s.clamp(min=-trace_max, max=trace_max)
+    delta = (s_clamped - s) / v_norm_sq                   # (..., H)
+    return phi + torch.einsum("...h,hg->...g", delta, V)

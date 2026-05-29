@@ -36,3 +36,40 @@ def test_retract_son_stays_orthogonal():
     eye = torch.eye(4).expand_as(R)
     assert torch.allclose(R @ R.transpose(-1, -2), eye, atol=1e-4)     # orthogonal
     assert torch.allclose(torch.linalg.det(R), torch.ones(7), atol=1e-4)
+
+
+from vfe3.geometry.generators import generate_glk_multihead
+from vfe3.geometry.lie_ops import clamp_phi_trace, project_phi_to_slk
+
+
+def _block_traces(phi, G, irrep_dims):
+    A = embed_phi(phi, G)
+    outs, start = [], 0
+    for d in irrep_dims:
+        end = start + d
+        outs.append(A[..., start:end, start:end].diagonal(dim1=-2, dim2=-1).sum(-1))
+        start = end
+    return torch.stack(outs, dim=-1)                      # (..., n_blocks)
+
+
+def test_project_slk_zeros_block_trace_and_unit_det():
+    G = generate_glk_multihead(6, 2)                      # 2 blocks of gl(3)
+    irrep = [3, 3]
+    phi = 0.5 * torch.randn(5, G.shape[0])
+    out = project_phi_to_slk(phi, G, irrep)
+    assert torch.allclose(_block_traces(out, G, irrep), torch.zeros(5, 2), atol=1e-5)
+    # det of each block's group element == 1
+    A = embed_phi(out, G)
+    for s, d in [(0, 3), (3, 3)]:
+        blk = A[..., s:s + d, s:s + d]
+        det = torch.linalg.det(torch.linalg.matrix_exp(blk))
+        assert torch.allclose(det, torch.ones(5), atol=1e-4)
+
+
+def test_clamp_phi_trace_bounds_block_trace():
+    G = generate_glk_multihead(6, 2)
+    irrep = [3, 3]
+    phi = 2.0 * torch.randn(5, G.shape[0])                # large traces
+    T = 0.5
+    out = clamp_phi_trace(phi, G, irrep, trace_max=T)
+    assert (_block_traces(out, G, irrep).abs() <= T + 1e-4).all()
