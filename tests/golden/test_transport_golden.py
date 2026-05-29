@@ -68,3 +68,21 @@ def test_transport_operators_direct_trivial_is_identity():
     omega = torch.eye(4) + 0.1 * torch.randn(2, 3, 4, 4)
     out = compute_transport_operators_direct(omega, gauge_mode="trivial")
     assert torch.allclose(out["Omega"], torch.eye(4).expand(2, 3, 3, 4, 4), atol=1e-6)
+
+
+def test_omega_to_block_exp_pairs_matches_vfe2(vfe2_transport):
+    from vfe3.geometry.transport import (
+        compute_transport_operators,
+        omega_to_block_exp_pairs,
+    )
+    from vfe3.geometry.groups import get_group
+    grp = get_group("block_glk")(K=6, n_heads=3)
+    g = torch.Generator(device="cpu").manual_seed(7)
+    phi = 0.2 * torch.randn(2, 3, grp.generators.shape[0], generator=g)
+    exp_phi = compute_transport_operators(phi, grp, gauge_mode="learned")["exp_phi"]
+    ref = vfe2_transport["transport_ops"].omega_to_block_exp_pairs(exp_phi, grp.irrep_dims)
+    got = omega_to_block_exp_pairs(exp_phi, grp.irrep_dims)
+    assert len(got) == len(ref)
+    for (gb, gbi), (rb, rbi) in zip(got, ref):
+        assert torch.allclose(gb, rb, atol=1e-5)
+        assert torch.allclose(gbi, rbi, atol=1e-4)
