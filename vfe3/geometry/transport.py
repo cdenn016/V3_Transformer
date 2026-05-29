@@ -127,3 +127,68 @@ def compute_transport_operators_direct(
 
     omega_ij = torch.einsum("bikl,bjlm->bijkm", omega, omega_j_inv)
     return {"omega_i": omega, "omega_j_inv": omega_j_inv, "Omega": omega_ij}
+
+
+def transport_mean(
+    omega: torch.Tensor,             # (B, N, N, K, K) pairwise transport
+    mu:    torch.Tensor,             # (B, N, K) source (key, index j) means
+) -> torch.Tensor:
+    r"""Gauge action on means: mu_t[i,j] = Omega_ij @ mu_j. Returns (B, N, N, K)."""
+    return torch.einsum("bijkl,bjl->bijk", omega, mu)
+
+
+def transport_covariance(
+    omega: torch.Tensor,             # (B, N, N, K, K) pairwise transport
+    sigma: torch.Tensor,             # (B, N, K) diagonal OR (B, N, K, K) full
+
+    *,
+    diagonal_out: Optional[bool] = None,
+) -> torch.Tensor:
+    r"""Sandwich action Sigma_t[i,j] = Omega_ij Sigma_j Omega_ij^T.
+
+    Full input (B,N,K,K) -> full (B,N,N,K,K). Diagonal input (B,N,K) -> the
+    diagonal approximation (B,N,N,K), Sigma_t[i,j,k] = sum_l Omega_ijkl^2
+    sigma_jl (matches 2.0 attention.py:270).
+    """
+    is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
+    if is_diag:
+        return torch.einsum("bijkl,bijkl,bjl->bijk", omega, omega, sigma)
+    return torch.einsum("bijkl,bjlm,bijnm->bijkn", omega, sigma, omega)
+
+
+def omega_to_block_exp_pairs(
+    omega:      torch.Tensor,        # (B, N, K, K) per-token group elements
+    irrep_dims: List[int],           # block sizes; sum == K
+
+    *,
+    eps:        float = 1e-6,
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    r"""Slice a block-diagonal Omega into per-block (block, block_inv) pairs.
+
+    Ported from VFE_2.0 omega_to_block_exp_pairs (transport_ops.py:554-602).
+    Per-block inverse via solve, with ridge then pinv fallback. Returns a list
+    aligned with irrep_dims, each a pair of (B, N, d, d) tensors.
+    """
+    id_sum = sum(irrep_dims)
+    K = omega.shape[-1]
+    if id_sum != K:
+        raise ValueError(f"omega_to_block_exp_pairs: sum(irrep_dims)={id_sum} != K={K}")
+
+    results: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    start = 0
+    for d in irrep_dims:
+        end = start + d
+        omega_blk = omega[:, :, start:end, start:end].contiguous()
+        eye_d = torch.eye(d, device=omega_blk.device, dtype=omega_blk.dtype)
+        try:
+            omega_blk_inv = torch.linalg.solve(omega_blk, eye_d.expand_as(omega_blk))
+        except (torch.linalg.LinAlgError, RuntimeError):
+            try:
+                omega_blk_inv = torch.linalg.solve(
+                    omega_blk + eps * eye_d, eye_d.expand_as(omega_blk)
+                )
+            except (torch.linalg.LinAlgError, RuntimeError):
+                omega_blk_inv = torch.linalg.pinv(omega_blk)
+        results.append((omega_blk, omega_blk_inv))
+        start = end
+    return results
