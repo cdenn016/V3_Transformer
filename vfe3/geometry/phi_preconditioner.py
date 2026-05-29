@@ -13,6 +13,14 @@ the Lie-algebra retraction. A config-selected registry of metrics:
 Coordinates in, coordinates out (..., n_gen) -- same units as retract_phi's
 delta_phi, so the E-step is grad -> precondition -> retract. Pure: takes a
 generator TENSOR, not a GaugeGroup.
+
+Gauge-equivariance caveat (killing / killing_per_block): the Cartan-involution
+metric uses the Frobenius form tr(G_a^T G_b), which is Ad-invariant only under
+the COMPACT subgroup (tr((gXg^-1)^T gYg^-1) = tr(X^T Y) iff g^T g = I). So the
+Killing-preconditioned natural gradient is gauge-equivariant under SO(N) but NOT
+under general GL(K) in the non-compact (symmetric) directions; it is a left-/
+Ad(K)-invariant metric, not a bi-invariant one. The pullback metric is the
+position-dependent alternative for the non-compact regime.
 """
 
 import math

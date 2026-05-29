@@ -371,6 +371,27 @@ affected runtime paths. The Killing single-block path was already device-safe
   drives ‖φ‖=5 and asserts the metric is finite (the float-coefficient series does not
   overflow at the order-40 cap).
 
+### Adversarial review
+
+A 4-expert panel (gauge-theory, runtime-wiring, code-quality returned; the numerics lens
+failed to emit structured output, but its substantive findings were caught redundantly by
+the other lenses). 6 of 7 actionable findings confirmed and fixed in `07f4674`: the fixed
+order-6 Ψ-series was inaccurate in the large-‖φ‖ regime the pullback metric exists for (now
+adaptive), a latent `OverflowError` from an int factorial divisor (now float), and two CUDA
+device-mismatch bugs (`torch.eye`/`torch.zeros`/`torch.full` without `device=`) on the
+`pullback` and multi-block `killing_per_block` paths. These device fixes are verified by
+code reading and the full CPU suite; they were NOT exercised on a GPU (no CUDA in the build
+environment) and remain to be confirmed on the RTX 5090.
+
+One finding was rejected as a code change but is a correct theory observation, recorded in
+the `killing_metric` module docstring: the Cartan-involution metric uses the Frobenius form
+`tr(G_aᵀ G_b)`, which is Ad-invariant only under the compact subgroup (`tr((gXg⁻¹)ᵀ gYg⁻¹)
+= tr(XᵀY)` iff `gᵀg = I`). So the Killing-preconditioned natural gradient is gauge-
+equivariant under SO(N) but NOT under general GL(K) in the non-compact (symmetric)
+directions — a left-/Ad(K)-invariant metric, not bi-invariant. The `pullback` metric is the
+position-dependent alternative for the non-compact regime. No shipped artifact claims full
+GL(K) gauge-equivariance for the Killing modes.
+
 ### Test results
 
 ```
@@ -388,3 +409,6 @@ pre-existing tests.
 - `dd8a6ee feat(geometry): Killing (Cartan-involution) preconditioner, nullspace-regularized`
 - `4bb23d5 feat(geometry): per-block Killing preconditioner (block-diagonal natural gradient)`
 - `3884e60 feat(geometry): pullback natural-gradient preconditioner (FD-of-exp pinned)`
+- `d8b1475 docs(edits): 2026-05-29 phase 2e phi-preconditioner changes log`
+- `07f4674 fix(geometry): device-agnostic phi preconditioner + adaptive pullback Psi-series`
+- (this entry) docstring caveat: Killing metric is Ad(K)-invariant, not bi-invariant on GL(K).
