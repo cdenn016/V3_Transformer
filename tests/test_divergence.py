@@ -13,14 +13,18 @@ def test_safe_kl_clamp_bounds_and_nan():
 
 
 def test_registry_register_and_get():
-    from vfe3.divergence import register_divergence, get_divergence
+    from vfe3.divergence import register_divergence, get_divergence, _DIVERGENCES
 
     @register_divergence("dummy_family")
     def _dummy(mu_q, sigma_q, mu_t, sigma_t, *, alpha, kl_max, eps):
         return mu_q.sum(dim=-1) * 0.0
 
-    fn = get_divergence("dummy_family")
-    assert fn is _dummy
+    try:
+        fn = get_divergence("dummy_family")
+        assert fn is _dummy
+    finally:
+        # Do not leak the test kernel into the global registry.
+        _DIVERGENCES.pop("dummy_family", None)
 
 
 def test_registry_unknown_raises():
@@ -101,17 +105,34 @@ def test_alpha_gt_one_warns(family):
         renyi(mu_q, sigma, mu_t, sigma, alpha=1.5, family=family)
 
 
+@pytest.mark.parametrize("family", ["gaussian_diagonal", "gaussian_full"])
 @pytest.mark.parametrize("alpha", [0.5, 1.0])
-def test_alpha_le_one_does_not_warn(alpha):
+def test_alpha_le_one_does_not_warn(alpha, family):
     import warnings
 
     from vfe3.divergence import renyi
     g = torch.Generator().manual_seed(14)
-    mu_q = torch.randn(3, 5, generator=g)
-    mu_t = torch.randn(3, 5, generator=g)
-    sigma_q = torch.rand(3, 5, generator=g) + 0.1
-    sigma_t = torch.rand(3, 5, generator=g) + 0.1
+    mu_q = torch.randn(3, 4, generator=g)
+    mu_t = torch.randn(3, 4, generator=g)
+    if family == "gaussian_diagonal":
+        sigma_q = torch.rand(3, 4, generator=g) + 0.1
+        sigma_t = torch.rand(3, 4, generator=g) + 0.1
+    else:
+        Aq = torch.randn(3, 4, 4, generator=g)
+        At = torch.randn(3, 4, 4, generator=g)
+        sigma_q = Aq @ Aq.transpose(-1, -2) + torch.eye(4)
+        sigma_t = At @ At.transpose(-1, -2) + torch.eye(4)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        renyi(mu_q, sigma_q, mu_t, sigma_t, alpha=alpha, family="gaussian_diagonal")
+        renyi(mu_q, sigma_q, mu_t, sigma_t, alpha=alpha, family=family)
     assert not any(issubclass(w.category, RuntimeWarning) for w in caught)
+
+
+@pytest.mark.parametrize("bad_alpha", [0.0, -1.0])
+def test_alpha_nonpositive_raises(bad_alpha):
+    from vfe3.divergence import renyi
+    g = torch.Generator().manual_seed(15)
+    mu = torch.randn(2, 4, generator=g)
+    sigma = torch.rand(2, 4, generator=g) + 0.1
+    with pytest.raises(ValueError):
+        renyi(mu, sigma, mu, sigma, alpha=bad_alpha, family="gaussian_diagonal")

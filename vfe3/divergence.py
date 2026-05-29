@@ -18,7 +18,7 @@ from typing import Callable, Dict
 import torch
 
 
-def _warn_alpha_gt_one(alpha: float, where: str) -> None:
+def _warn_alpha_gt_one(alpha: float, family: str) -> None:
     """Warn that alpha > 1 leaves the convex regime of the Renyi blend.
 
     For alpha > 1 the blend ``(1 - alpha) Sigma_q + alpha Sigma_t`` is not a
@@ -26,15 +26,29 @@ def _warn_alpha_gt_one(alpha: float, where: str) -> None:
     clamps it (returning a saturated value), and the full kernel can fail the
     Cholesky (where VFE_2.0 returns NaN). Robust alpha > 1 handling is a
     deferred hardening task. Python's default warning filter shows this once
-    per call-site, so it does not spam an inner loop.
+    per unique message + call-site, so it does not spam an inner loop.
+
+    Called from the public ``renyi`` boundary so ``stacklevel=3`` points the
+    warning at the user's ``renyi(...)`` call rather than library internals.
     """
     warnings.warn(
-        f"{where}: alpha={alpha} > 1 leaves the convex regime; the Renyi blend "
-        f"(1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite "
+        f"renyi: alpha={alpha} > 1 (family={family!r}) leaves the convex regime; "
+        f"the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite "
         f"(diagonal clamps; full may fail Cholesky, where 2.0 returns NaN).",
         RuntimeWarning,
         stacklevel=3,
     )
+
+
+def _logdet_chol(L: torch.Tensor) -> torch.Tensor:
+    r"""log|Sigma| for an SPD Sigma = L Lᵀ given its Cholesky factor L.
+
+    Uses ``log|Sigma| = 2 sum_k log L_kk`` with a floor on the diagonal for
+    numerical safety.
+    """
+    return 2.0 * torch.log(
+        torch.diagonal(L, dim1=-2, dim2=-1).clamp(min=1e-12)
+    ).sum(dim=-1)
 
 
 def safe_kl_clamp(
@@ -49,6 +63,8 @@ def safe_kl_clamp(
     ignores them rather than attending to them.
     """
     kl = kl.clamp(min=0.0, max=kl_max)
+    # clamp(min=0) already maps -inf -> 0; neginf=0.0 is kept for explicitness
+    # and parity with VFE_2.0's safe_kl_clamp.
     return kl.nan_to_num(nan=kl_max, posinf=kl_max, neginf=0.0)
 
 
@@ -99,9 +115,7 @@ def _gaussian_diagonal_renyi(
     mu_t = mu_t.float()
     sigma_t = sigma_t.float().clamp(min=eps)
 
-    if alpha > 1.0:
-        _warn_alpha_gt_one(alpha, "_gaussian_diagonal_renyi")
-
+    # alpha is validated (positive) and alpha>1 warned at the renyi() boundary.
     if abs(alpha - 1.0) < 1e-6:
         trace_term  = (sigma_q / sigma_t).sum(dim=-1)
         delta       = mu_t - mu_q
@@ -142,7 +156,8 @@ def _gaussian_full_renyi(
     escalation and NaN-pair masking are 2.0 robustness features not needed
     for well-conditioned inputs; they are deferred to a later hardening task.
     For ``alpha > 1`` the blend can be indefinite and the Cholesky may fail
-    (2.0 returns NaN there); a RuntimeWarning is emitted in that regime.
+    (2.0 returns NaN there); the public ``renyi`` emits a RuntimeWarning in
+    that regime. alpha is validated (positive) at the ``renyi`` boundary.
     """
     K = mu_q.shape[-1]
     device = mu_q.device
@@ -151,17 +166,9 @@ def _gaussian_full_renyi(
     mu_t = mu_t.float()
     sigma_t = sigma_t.float()
 
-    if alpha > 1.0:
-        _warn_alpha_gt_one(alpha, "_gaussian_full_renyi")
-
     eye = torch.eye(K, device=device, dtype=torch.float32)
     sigma_q_reg = sigma_q + eps * eye
     sigma_t_reg = sigma_t + eps * eye
-
-    def _logdet_chol(L: torch.Tensor) -> torch.Tensor:
-        return 2.0 * torch.log(
-            torch.diagonal(L, dim1=-2, dim2=-1).clamp(min=1e-12)
-        ).sum(dim=-1)
 
     if abs(alpha - 1.0) < 1e-6:
         L_p = torch.linalg.cholesky(sigma_t_reg)
@@ -197,10 +204,10 @@ def _gaussian_full_renyi(
 
 
 def renyi(
-    mu_q:    torch.Tensor,
-    sigma_q: torch.Tensor,
-    mu_t:    torch.Tensor,
-    sigma_t: torch.Tensor,
+    mu_q:    torch.Tensor,             # (..., K) query means
+    sigma_q: torch.Tensor,             # (..., K) or (..., K, K) query (co)variances
+    mu_t:    torch.Tensor,             # (..., K) transported key means
+    sigma_t: torch.Tensor,             # (..., K) or (..., K, K) transported (co)variances
 
     *,
     alpha:   float = 1.0,
@@ -208,17 +215,25 @@ def renyi(
     eps:     float = 1e-6,
     family:  str   = "gaussian_diagonal",
 ) -> torch.Tensor:
-    """Renyi alpha-divergence D_alpha(q || p) for the selected family."""
+    """Renyi alpha-divergence D_alpha(q || p) for the selected family.
+
+    Validates alpha (must be positive) and warns when alpha > 1 (the blend
+    leaves the convex regime); see ``_warn_alpha_gt_one``.
+    """
+    if alpha <= 0.0:
+        raise ValueError(f"alpha must be positive, got {alpha}")
+    if alpha > 1.0:
+        _warn_alpha_gt_one(alpha, family)
     return get_divergence(family)(
         mu_q, sigma_q, mu_t, sigma_t, alpha=alpha, kl_max=kl_max, eps=eps
     )
 
 
 def kl(
-    mu_q:    torch.Tensor,
-    sigma_q: torch.Tensor,
-    mu_t:    torch.Tensor,
-    sigma_t: torch.Tensor,
+    mu_q:    torch.Tensor,             # (..., K) query means
+    sigma_q: torch.Tensor,             # (..., K) or (..., K, K) query (co)variances
+    mu_t:    torch.Tensor,             # (..., K) transported key means
+    sigma_t: torch.Tensor,             # (..., K) or (..., K, K) transported (co)variances
 
     *,
     kl_max:  float = 100.0,
