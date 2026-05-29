@@ -8,6 +8,7 @@ supplies: coordinate<->matrix maps, the Lie bracket, a composition registry
 determinant control. Pure: operates on a generator TENSOR, not a GaugeGroup.
 """
 
+import math
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -169,3 +170,81 @@ def compose_phi(
 ) -> torch.Tensor:
     r"""Dispatch to the registered composition rule `mode`."""
     return get_compose(mode)(phi1, phi2, generators, order=order, gram_pinv_=gram_pinv_)
+
+
+def _retract_core(
+    phi:          torch.Tensor,           # (..., n_gen) current frame
+    delta_phi:    torch.Tensor,           # (..., n_gen) tangent step direction
+
+    *,
+    step_size:    float = 1.0,
+    trust_region: float = 0.1,
+    max_norm:     float = 5.0,
+    eps:          float = 1e-6,
+    order:        int   = 4,
+    mode:         str   = "euclidean",
+    generators:   Optional[torch.Tensor]  = None,
+    gram_pinv_:   Optional[torch.Tensor]  = None,
+) -> torch.Tensor:
+    r"""Shared retraction: scale -> trust-region clamp -> compose -> max-norm clamp.
+
+      update   = clamp_||.|| ( step_size * delta_phi , trust_region )
+      phi_new  = compose(phi, update; mode, order)
+      phi_new <- clamp_||.|| ( phi_new , max_norm )
+    Trust region and max norm are applied to the coordinate-vector norm.
+    """
+    update = step_size * delta_phi
+    if trust_region is not None and trust_region > 0:
+        u_norm = update.norm(dim=-1, keepdim=True)
+        update = update * (trust_region / (u_norm + eps)).clamp(max=1.0)
+    phi_new = compose_phi(phi, update, generators, order=order, mode=mode, gram_pinv_=gram_pinv_)
+    if max_norm is not None and max_norm > 0:
+        n_norm = phi_new.norm(dim=-1, keepdim=True)
+        phi_new = torch.where(n_norm > max_norm, phi_new * (max_norm / (n_norm + eps)), phi_new)
+    return phi_new
+
+
+def retract_glk(
+    phi:          torch.Tensor,           # (..., n_gen) current GL(K) frame
+    delta_phi:    torch.Tensor,           # (..., n_gen) tangent step
+
+    generators:   torch.Tensor,           # (n_gen, K, K)
+
+    *,
+    step_size:    float = 1.0,
+    trust_region: float = 0.1,            # tighter than SO(N): GL(K) is non-compact
+    max_norm:     float = 5.0,            # bounds singular values to ~[e^-5, e^5]
+    eps:          float = 1e-6,
+    order:        int   = 4,
+    mode:         str   = "euclidean",
+    gram_pinv_:   Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""GL(K) retraction (no det control here; the dispatcher applies it)."""
+    return _retract_core(
+        phi, delta_phi, step_size=step_size, trust_region=trust_region,
+        max_norm=max_norm, eps=eps, order=order, mode=mode,
+        generators=generators, gram_pinv_=gram_pinv_,
+    )
+
+
+def retract_son(
+    phi:          torch.Tensor,           # (..., n_gen) current SO(N) frame
+    delta_phi:    torch.Tensor,           # (..., n_gen) tangent step
+
+    generators:   torch.Tensor,           # (n_gen, K, K) skew so(N) basis
+
+    *,
+    step_size:    float = 1.0,
+    trust_region: float = 0.3,            # compact group
+    max_norm:     float = math.pi,        # bounds principal angles
+    eps:          float = 1e-6,
+    order:        int   = 4,
+    mode:         str   = "euclidean",
+    gram_pinv_:   Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""SO(N) retraction. det(exp) = 1 automatic (skew generators)."""
+    return _retract_core(
+        phi, delta_phi, step_size=step_size, trust_region=trust_region,
+        max_norm=max_norm, eps=eps, order=order, mode=mode,
+        generators=generators, gram_pinv_=gram_pinv_,
+    )
