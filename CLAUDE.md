@@ -44,7 +44,6 @@ phases); property tests (non-negativity, self-divergence zero, gauge
 equivariance). Tests are device-agnostic (default CPU; set
 VFE3_TEST_DEVICE=cuda for the GPU).
 
-**Post Edit Policy**:  Always write a post-edit description of all changes made to the codebase as a .md.  The date the edits were made should be in the naming convention of the document.  there should be only one document per day.  you should update the same document as edits are made
 
 
 **There should ALWAYS exist a theoretically/mathematically "pure" path under appropriate toggles.**  Computationally extreme paths should be 'opt in' toggles and clearly documented.
