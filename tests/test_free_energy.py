@@ -46,3 +46,66 @@ def test_stationarity_residual_constant_across_keys():
     residual = _E + _TAU * (torch.log(beta) - torch.log(pi))
     assert (residual.max() - residual.min()).abs() < 1e-5
     assert torch.allclose(residual.mean(), reduced_free_energy(_E, log_prior=_B, tau=_TAU), atol=1e-5)
+
+
+from vfe3.free_energy import free_energy
+
+
+def test_canonical_minus_surrogate_is_tau_times_entropy():
+    # Canonical F - surrogate F = tau * Sum_i Sum_j beta* log(beta*/pi)  (the entropy block).
+    N = 3
+    self_div = torch.zeros(N)                            # alpha term zero (isolate beta block)
+    energy = torch.tensor([[1.0, 2.0, 0.5],
+                           [0.7, 0.3, 1.1],
+                           [1.2, 0.9, 0.4]])
+    B = torch.log(torch.tensor([0.5, 0.3, 0.2]))
+    log_prior = B.expand(N, N)
+    alpha = torch.zeros(N)
+    fe_canon = free_energy(self_div, energy, alpha, log_prior=log_prior, tau=2.0,
+                           include_attention_entropy=True)
+    fe_surr  = free_energy(self_div, energy, alpha, log_prior=log_prior, tau=2.0,
+                           include_attention_entropy=False)
+    beta = attention_weights(energy, log_prior=log_prior, tau=2.0)
+    pi = torch.softmax(log_prior, dim=-1)
+    entropy_block = 2.0 * (beta * (torch.log(beta) - torch.log(pi))).sum()
+    assert torch.allclose(fe_canon - fe_surr, entropy_block, atol=1e-5)
+
+
+def test_known_value_F_self_coupling_only():
+    # q == p -> self_div == 0; energy all-equal + uniform prior -> beta uniform.
+    # With alpha=2, self_div=[0.5,1.0], no entropy (surrogate), energy uniform=c:
+    # F = sum_i alpha_i*self_div_i + sum_ij beta_ij*c. beta uniform=1/N so sum_j beta*c=c.
+    self_div = torch.tensor([0.5, 1.0])
+    energy = torch.full((2, 2), 0.3)
+    alpha = torch.full((2,), 2.0)
+    fe = free_energy(self_div, energy, alpha, log_prior=None, tau=1.0,
+                     include_attention_entropy=False)
+    expect = (2.0 * 0.5 + 2.0 * 1.0) + (0.3 + 0.3)
+    assert torch.allclose(fe, torch.tensor(expect), atol=1e-5)
+
+
+def test_autograd_F_matches_finite_difference():
+    torch.manual_seed(0)
+    N, K = 3, 4
+    mu_q = torch.randn(N, K, requires_grad=True)
+    base = {"sigma_q": torch.rand(N, K) + 0.5, "mu_p": torch.randn(N, K),
+            "sigma_p": torch.rand(N, K) + 0.5}
+    from vfe3.free_energy import self_divergence
+
+    def scalar(mu):
+        sd = self_divergence(mu, base["sigma_q"], base["mu_p"], base["sigma_p"])
+        energy = torch.cdist(mu, mu) ** 2 + 0.1           # a smooth differentiable (N,N) energy
+        alpha = torch.ones(N)
+        return free_energy(sd, energy, alpha, log_prior=None, tau=1.5,
+                           include_attention_entropy=True)
+
+    F = scalar(mu_q); F.backward()
+    g_auto = mu_q.grad.clone()
+    eps = 1e-3
+    g_fd = torch.zeros_like(mu_q)
+    with torch.no_grad():
+        for a in range(N):
+            for b in range(K):
+                d = torch.zeros(N, K); d[a, b] = eps
+                g_fd[a, b] = (scalar(mu_q + d) - scalar(mu_q - d)) / (2 * eps)
+    assert torch.allclose(g_auto, g_fd, atol=1e-3, rtol=1e-3)

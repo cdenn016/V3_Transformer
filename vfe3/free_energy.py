@@ -98,3 +98,48 @@ def reduced_free_energy(
     r"""Reduced (envelope) free energy F_red,i = -tau log Z_i; equals the canonical
     beta-block evaluated at beta*."""
     return -tau * log_partition(energy, tau=tau, log_prior=log_prior)
+
+
+def free_energy(
+    self_div:                  torch.Tensor,        # (..., N) or (..., N, K) D(q_i||p_i)
+    energy:                    torch.Tensor,        # (..., N, N) E_ij belief-coupling energies
+    alpha:                     torch.Tensor,        # (..., N) or (..., N, K) self-coupling
+
+    *,
+    tau:                       float = 1.0,
+    include_attention_entropy: bool  = True,
+
+    log_prior:                 Optional[torch.Tensor] = None,   # (..., N, N) attention log-prior
+    alpha_reg:                 Optional[torch.Tensor] = None,   # (..., N[,K]) R(alpha) if state-dep
+    log_likelihood:            Optional[torch.Tensor] = None,   # (..., N) E_q[log p(o|k)]
+) -> torch.Tensor:                                  # scalar F = sum_i F_i
+    r"""Single authoritative scalar free energy (default path; lambda_h=0, gamma=0).
+
+        F = sum_i [ alpha_i . D(q_i||p_i)            (+ R(alpha_i) if state-dependent)
+                  + sum_j beta_ij E_ij
+                  + tau sum_j beta_ij log(beta_ij/pi_ij)     (canonical only)
+                  - ell_i ]
+    beta_ij = softmax_j(log_prior - E/tau); pi = softmax_j(log_prior). The hyper-prior
+    lambda_h KL(s||h) and model-coupling gamma KL(s_i||Omega s_j) are extension points,
+    absent from this default path. Divergence-agnostic: `self_div`/`energy` come from the
+    divergence seam, so a new divergence requires no change here.
+    """
+    beta = attention_weights(energy, tau=tau, log_prior=log_prior)        # (..., N, N)
+
+    # self-coupling (sum over coordinate axis too when alpha/self_div are per-coord)
+    self_term = alpha * self_div
+    if alpha_reg is not None:
+        self_term = self_term + alpha_reg
+    self_total = self_term.sum()
+
+    coupling = (beta * energy).sum()
+
+    F = self_total + coupling
+    if include_attention_entropy:
+        pi = torch.softmax(log_prior, dim=-1) if log_prior is not None \
+            else torch.full_like(beta, 1.0 / beta.shape[-1])
+        entropy = tau * (beta * (torch.log(beta.clamp(min=1e-12)) - torch.log(pi.clamp(min=1e-12)))).sum()
+        F = F + entropy
+    if log_likelihood is not None:
+        F = F - log_likelihood.sum()
+    return F
