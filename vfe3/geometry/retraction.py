@@ -5,9 +5,18 @@ Fisher preconditioner converts Euclidean (mu, sigma) gradients to natural
 gradients. The phi Lie-algebra retraction is a separate phase.
 """
 
-from typing import Tuple
+import math
+from typing import Optional, Tuple
 
 import torch
+
+from vfe3.geometry.groups import GaugeGroup
+from vfe3.geometry.lie_ops import (
+    clamp_phi_trace,
+    project_phi_to_slk,
+    retract_glk,
+    retract_son,
+)
 
 
 def retract_spd_diagonal(
@@ -132,3 +141,50 @@ def natural_gradient(
             nat_grad_sigma = 2.0 * torch.einsum('...ij,...jk,...kl->...il', sigma_q, grad_sigma, sigma_q)
             nat_grad_sigma = 0.5 * (nat_grad_sigma + nat_grad_sigma.transpose(-1, -2))
     return nat_grad_mu.to(orig_dtype), nat_grad_sigma.to(orig_dtype)
+
+
+def retract_phi(
+    phi:          torch.Tensor,           # (..., n_gen) current gauge frame
+    delta_phi:    torch.Tensor,           # (..., n_gen) tangent step (e.g. -grad_phi)
+    group:        GaugeGroup,             # supplies generators, skew flag, irrep_dims
+
+    *,
+    step_size:    float = 1.0,
+    eps:          float = 1e-6,
+    order:        int   = 4,
+    project_slk:  bool  = False,
+    mode:         str   = "euclidean",
+
+    trust_region: Optional[float] = None, # None -> group default (GL:0.1, SO:0.3)
+    max_norm:     Optional[float] = None, # None -> group default (GL:5.0, SO:pi)
+    trace_clamp:  Optional[float] = None, # soft per-block |tr| cap (GL only)
+) -> torch.Tensor:
+    r"""Group-aware phi retraction dispatcher (Gaussian-specialized).
+
+    Skew group (SO(N)) -> retract_son, det control is a no-op (det exp = 1).
+    Non-skew (GL(K))   -> retract_glk, then optional det control:
+      project_slk=True  hard-projects each block to sl(K) (det Omega_h = 1);
+      else trace_clamp soft-bounds |tr| per block. Defaults for trust_region /
+      max_norm are taken from the group's compactness when not given.
+    """
+    G = group.generators
+    if trust_region is None:
+        trust_region = 0.3 if group.skew_symmetric else 0.1
+    if max_norm is None:
+        max_norm = math.pi if group.skew_symmetric else 5.0
+
+    if group.skew_symmetric:
+        return retract_son(
+            phi, delta_phi, G, step_size=step_size, trust_region=trust_region,
+            max_norm=max_norm, eps=eps, order=order, mode=mode,
+        )
+
+    phi_new = retract_glk(
+        phi, delta_phi, G, step_size=step_size, trust_region=trust_region,
+        max_norm=max_norm, eps=eps, order=order, mode=mode,
+    )
+    if project_slk:
+        phi_new = project_phi_to_slk(phi_new, G, group.irrep_dims)
+    elif trace_clamp is not None:
+        phi_new = clamp_phi_trace(phi_new, G, group.irrep_dims, trace_max=trace_clamp)
+    return phi_new

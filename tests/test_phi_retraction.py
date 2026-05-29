@@ -73,3 +73,35 @@ def test_clamp_phi_trace_bounds_block_trace():
     T = 0.5
     out = clamp_phi_trace(phi, G, irrep, trace_max=T)
     assert (_block_traces(out, G, irrep).abs() <= T + 1e-4).all()
+
+
+from vfe3.geometry.groups import get_group
+from vfe3.geometry.retraction import retract_phi
+
+
+def test_retract_phi_glk_with_slk_projection():
+    grp = get_group("block_glk")(6, 2)                    # block GL(3)^2, irrep [3,3]
+    phi = 0.5 * torch.randn(4, grp.generators.shape[0])
+    delta = torch.randn_like(phi)
+    out = retract_phi(phi, delta, grp, project_slk=True)
+    assert torch.allclose(_block_traces(out, grp.generators, grp.irrep_dims),
+                          torch.zeros(4, 2), atol=1e-4)
+
+
+def test_retract_phi_son_path_orthogonal_no_det_control():
+    grp = get_group("so_k")(4)
+    phi = 0.2 * torch.randn(4, grp.generators.shape[0])
+    delta = torch.randn_like(phi)
+    out = retract_phi(phi, delta, grp)                    # skew -> SO path, det control ignored
+    R = torch.linalg.matrix_exp(embed_phi(out, grp.generators))
+    eye = torch.eye(4).expand_as(R)
+    assert torch.allclose(R @ R.transpose(-1, -2), eye, atol=1e-4)
+
+
+def test_retract_phi_defaults_pick_group_constants():
+    # GL(K) default max_norm=5.0; a huge delta saturates to that, not pi.
+    grp = get_group("glk")(3)
+    phi = torch.zeros(2, 9)
+    delta = 1e3 * torch.ones(2, 9)
+    out = retract_phi(phi, delta, grp)
+    assert (out.norm(dim=-1) <= 5.0 + 1e-4).all()
