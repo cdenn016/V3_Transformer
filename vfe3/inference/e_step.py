@@ -161,12 +161,19 @@ def e_step_iteration(
 
     phi = belief.phi
     if e_phi_lr > 0.0:
-        phi_g = belief.phi.detach().clone().requires_grad_(True)
-        L = phi_alignment_loss(
-            mu, sigma, phi_g, group, tau=tau, alpha_div=alpha_div, kl_max=kl_max, eps=eps,
-            family=family, include_attention_entropy=include_attention_entropy, log_prior=log_prior,
-        )
-        grad_phi = torch.autograd.grad(L, phi_g)[0]
+        # The phi natural gradient fundamentally requires autograd (autograd.grad on a
+        # fresh requires_grad leaf), so it must run under an enable_grad island even when
+        # the caller wraps the stack in no_grad (the detach_e_step / fixed-point regime).
+        # create_graph defaults to False, so grad_phi is detached from the outer graph and
+        # acts as a constant tangent there; on the default unrolled path enable_grad is a
+        # no-op and the phi-graph connection still flows belief.phi -> retract_phi -> omega.
+        with torch.enable_grad():
+            phi_g = belief.phi.detach().clone().requires_grad_(True)
+            L = phi_alignment_loss(
+                mu, sigma, phi_g, group, tau=tau, alpha_div=alpha_div, kl_max=kl_max, eps=eps,
+                family=family, include_attention_entropy=include_attention_entropy, log_prior=log_prior,
+            )
+            grad_phi = torch.autograd.grad(L, phi_g)[0]
         grad_phi = precondition_phi_gradient(grad_phi, belief.phi, group.generators, mode=phi_precond_mode)
         phi = retract_phi(belief.phi, -grad_phi, group, step_size=e_phi_lr)
 
