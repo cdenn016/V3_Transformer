@@ -7,3 +7,6 @@ __pycache__/
 build/
 dist/
 *.tmp.*
+junit*.xml
+pytest_*.txt
+*_out.txt
