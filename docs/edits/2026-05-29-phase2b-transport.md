@@ -1241,3 +1241,37 @@ end-to-end non-float32 (`model.to(float64)` now carries the generators, but the 
 path still mixes default-dtype intermediates -- a pre-existing latent gap, out of scope
 here, since the project default is float32); the data loader (7d) and the training loop
 (7e).
+
+---
+
+## Phase 7d Tokenized-cache data loader — 2026-05-30 (continuation)
+
+### Files created
+
+- `vfe3/data/__init__.py` (empty) and `vfe3/data/datasets.py` — `load_cached_tokens`,
+  `TokenWindows`, `make_dataloader`, `cache_path`, `default_cache_dir`.
+- `tests/test_data.py` — 5 tests (synthetic .pt + .bin caches, windowing, real wikitext-2).
+
+### Changes
+
+Reads the pre-tokenized cache at `~/.cache/tokenized_cache` (no tokenization here):
+`{dataset}_{split}_{tokenizer}_tokens.{pt|bin}`, tokenizer tag `tiktoken` (gpt2, the
+wikitext datasets) vs `tiktoken_cl100k` (wiki-ja, wiki-en). `load_cached_tokens` tries
+the `.pt` (int64 `torch.load`) path, then the `.bin` int32 memmap whose length comes from
+the `n_tokens` sidecar `.meta.json` (wiki-en's `raw_bin_v1` format); returns a 1-D int64
+stream. `TokenWindows` slices it into causal-LM windows `input = tokens[i:i+L]`,
+`target = tokens[i+1:i+L+1]` (stride-configurable). `make_dataloader` wraps it with a
+`max_tokens` cap for fast smoke runs. No NN, no CLI.
+
+### Test results
+
+```
+155 passed
+```
+
+5 new tests (the real wikitext-2 validation cache loads and windows; the synthetic .pt and
+.bin round-trips pin both cache formats); no regressions in the 150 prior.
+
+### Commits
+
+- `7ada566 feat(data): tokenized-cache loader + causal-LM windows (reads existing .pt/.bin cache)`
