@@ -43,4 +43,44 @@ fallbacks activate only when the pure path fails.
 
 ### Commits
 
-- (this entry) `feat(numerics): SPD conditioning fallbacks + runtime monitor registry`
+- `feat(numerics): SPD conditioning fallbacks + runtime monitor registry`
+
+## Metrics registry
+
+### Files created
+
+- `vfe3/metrics.py` — `effective_rank`, `attention_entropy`, `holonomy_deviation`,
+  `gauge_trace_spread`, `free_energy_terms`, and a `register_metric`/`get_metric`/
+  `compute_metrics` registry.
+- `tests/test_metrics.py` — 7 tests.
+
+### Changes
+
+A registry of pure diagnostic measurements over beliefs / transport / attention, each
+reading what it needs from a keyword context so a new probe slots in by name;
+`compute_metrics` emits a CSV/JSON-friendly record. `effective_rank` is the spectral
+participation ratio `(Σλ)²/Σλ²` (K for a flat spectrum, →1 for one dominant mode).
+`attention_entropy` is the mean row entropy of β (log N for uniform). `holonomy_deviation`
+is the mean Frobenius departure of the triangle holonomy `Ω_ij Ω_jk Ω_ki` from identity — a
+curvature proxy that is ~0 for the flat (Regime I) cocycle and >0 otherwise.
+`gauge_trace_spread` is the std of `log|det Ω| = tr(embed(φ))` across tokens (0 at φ=0).
+`free_energy_terms` decomposes F into self-coupling / belief-coupling / attention-entropy.
+
+### Analytic anchors
+
+- `effective_rank([1,1,1,1])=4`, `effective_rank([1,1e-9,1e-9,1e-9])≈1`.
+- `attention_entropy(uniform)=log N`, `attention_entropy(one-hot)≈0`.
+- `holonomy_deviation(flat φ-cocycle)≈0` (every triangle closes), `>1e-2` for random transport.
+- `gauge_trace_spread(φ=0)=0`; `free_energy_terms` sums its parts to `total`.
+
+### Test results
+
+```
+174 passed (full suite, consolidated)
+```
+
+7 new tests; metrics is additive (new files only), no regressions in the 167 prior.
+
+### Commits
+
+- (this entry) `feat(metrics): diagnostic registry (effective rank, attention entropy, holonomy, F-decomposition)`
