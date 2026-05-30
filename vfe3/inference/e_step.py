@@ -79,3 +79,129 @@ def free_energy_value(
         sd, energy, alpha, tau=tau, include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if alpha_mode != "constant" else None),
     )
+
+
+def phi_alignment_loss(
+    mu:        torch.Tensor,             # (N, K)
+    sigma:     torch.Tensor,             # (N, K)
+    phi:       torch.Tensor,             # (N, n_gen) -- the differentiated variable
+    group:     GaugeGroup,
+
+    *,
+    tau:       float = 1.0,
+    alpha_div: float = 1.0,
+    kl_max:    float = 100.0,
+    eps:       float = 1e-6,
+    family:    str   = "gaussian_diagonal",
+
+    include_attention_entropy: bool = True,
+    log_prior: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Canonical belief-coupling block as a function of phi (mu, sigma fixed):
+
+        L(phi) = Sum_ij [ beta_ij E_ij + tau beta_ij log(beta_ij/pi_ij) ],
+        E_ij = D(q_i || Omega_ij(phi) q_j),  beta = softmax_j(log_prior - E/tau).
+    Both roles of phi flow (Omega_ij depends on phi_i and phi_j); autograd gives the
+    envelope phi-gradient.
+    """
+    omega = _transport(phi, group)
+    mu_t = transport_mean(omega.unsqueeze(0), mu.unsqueeze(0))[0]
+    sigma_t = transport_covariance(omega.unsqueeze(0), sigma.unsqueeze(0))[0]
+    energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps, family=family)
+    beta = attention_weights(energy, tau=tau, log_prior=log_prior)
+    L = (beta * energy).sum()
+    if include_attention_entropy:
+        pi = torch.softmax(log_prior, dim=-1) if log_prior is not None else torch.full_like(beta, 1.0 / beta.shape[-1])
+        L = L + tau * (beta * (torch.log(beta.clamp(min=1e-12)) - torch.log(pi.clamp(min=1e-12)))).sum()
+    return L
+
+
+def e_step_iteration(
+    belief:                    BeliefState,
+    mu_p:                      torch.Tensor,        # (N, K)
+    sigma_p:                   torch.Tensor,        # (N, K)
+    group:                     GaugeGroup,
+
+    *,
+    tau:                       float = 1.0,
+    e_mu_lr:                   float = 0.1,
+    e_sigma_lr:                float = 0.1,
+    e_phi_lr:                  float = 0.1,
+    alpha_div:                 float = 1.0,
+    value:                     float = 1.0,
+    b0:                        float = 1.0,
+    c0:                        float = 1.0,
+    kl_max:                    float = 100.0,
+    eps:                       float = 1e-6,
+    sigma_max:                 float = 5.0,
+
+    include_attention_entropy: bool = True,
+    gradient_mode:             str  = "filtering",
+    family:                    str  = "gaussian_diagonal",
+    alpha_mode:                str  = "constant",
+    phi_precond_mode:          str  = "none",
+
+    e_sigma_q_trust:           float = 5.0,
+    log_prior:                 Optional[torch.Tensor] = None,
+) -> BeliefState:
+    r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
+    (autograd of the alignment block + preconditioner + Lie retraction)."""
+    omega = _transport(belief.phi, group)
+    grad_mu, grad_sigma = belief_gradients(
+        belief.mu, belief.sigma, mu_p, sigma_p, omega,
+        tau=tau, alpha_div=alpha_div, value=value, b0=b0, c0=c0, kl_max=kl_max, eps=eps,
+        include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
+        family=family, alpha_mode=alpha_mode, log_prior=log_prior,
+    )
+    nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
+
+    mu = belief.mu - e_mu_lr * nat_mu
+    sigma = retract_spd_diagonal(
+        belief.sigma, -e_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
+    )
+
+    phi = belief.phi
+    if e_phi_lr > 0.0:
+        phi_g = belief.phi.detach().clone().requires_grad_(True)
+        L = phi_alignment_loss(
+            mu, sigma, phi_g, group, tau=tau, alpha_div=alpha_div, kl_max=kl_max, eps=eps,
+            family=family, include_attention_entropy=include_attention_entropy, log_prior=log_prior,
+        )
+        grad_phi = torch.autograd.grad(L, phi_g)[0]
+        grad_phi = precondition_phi_gradient(grad_phi, belief.phi, group.generators, mode=phi_precond_mode)
+        phi = retract_phi(belief.phi, -grad_phi, group, step_size=e_phi_lr)
+
+    return BeliefState(mu=mu, sigma=sigma, phi=phi)
+
+
+def e_step(
+    belief:            BeliefState,
+    mu_p:              torch.Tensor,        # (N, K)
+    sigma_p:           torch.Tensor,        # (N, K)
+    group:             GaugeGroup,
+
+    *,
+    n_iter:            int   = 1,
+    tau:               float = 1.0,
+    e_mu_lr:           float = 0.1,
+    e_sigma_lr:        float = 0.1,
+    e_phi_lr:          float = 0.1,
+    return_trajectory: bool  = False,
+
+    log_prior:         Optional[torch.Tensor] = None,
+    **kwargs,
+) -> 'BeliefState | Tuple[BeliefState, List[float]]':
+    r"""Iterate ``e_step_iteration`` ``n_iter`` times (parallel mean-field). Optionally
+    returns the global-F trajectory (a DIAGNOSTIC; parallel updates are not guaranteed
+    monotone per iteration)."""
+    traj: List[float] = []
+    if return_trajectory:
+        traj.append(float(free_energy_value(belief, mu_p, sigma_p, group, tau=tau, log_prior=log_prior, **kwargs)))
+    for _ in range(n_iter):
+        belief = e_step_iteration(
+            belief, mu_p, sigma_p, group, tau=tau,
+            e_mu_lr=e_mu_lr, e_sigma_lr=e_sigma_lr, e_phi_lr=e_phi_lr, log_prior=log_prior, **kwargs,
+        )
+        if return_trajectory:
+            traj.append(float(free_energy_value(belief, mu_p, sigma_p, group, tau=tau, log_prior=log_prior, **kwargs)))
+    return (belief, traj) if return_trajectory else belief
