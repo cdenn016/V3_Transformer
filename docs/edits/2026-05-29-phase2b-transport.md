@@ -1275,3 +1275,70 @@ stream. `TokenWindows` slices it into causal-LM windows `input = tokens[i:i+L]`,
 ### Commits
 
 - `7ada566 feat(data): tokenized-cache loader + causal-LM windows (reads existing .pt/.bin cache)`
+
+## Phase 7e Training + cutover — 2026-05-30 (continuation)
+
+### Files created
+
+- `vfe3/train.py` — `build_optimizer` (per-group AdamW), `lr_lambda` (warmup/cosine),
+  `train_step`, `train`, `run_training` (click-to-run entry; no CLI).
+- `tests/test_train.py` — 4 tests (optimizer grouping, schedule shape, the two cutover
+  tests on a structured period-3 stream and a real wikitext-2 slice).
+
+### Changes
+
+The M-step closes Phase 7. The model has no neural layers, so the only parameters are
+the PriorBank prior tables; `loss.backward()` flows through the UNROLLED E-step (default
+`gradient_mode='filtering'`, `detach_e_step=False`) to those tables and AdamW updates
+them. `build_optimizer` groups the parameters by their natural scale into three M-step
+learning rates: `mu_embed` at `m_mu_lr`; `sigma_log_embed` and `decode_log_scale` at
+`m_sigma_lr`; `phi_embed` at `m_phi_lr`; shared `weight_decay`. The grouping covers
+`model.parameters()` exactly. `lr_lambda` is a linear warmup to 1.0 over `warmup_steps`
+then a half-cosine to 0.0 at `max_steps`, driven through a `LambdaLR`. `train_step` zeroes
+the gradients, runs the forward, backpropagates, clips the global gradient norm, and takes
+one optimizer + scheduler step. `train` cycles the loader for `n_steps` and returns the
+per-step CE history (device-agnostic: the batch is moved to the prior-table device).
+`run_training` builds a model and a cached dataloader by dataset name and trains.
+
+### The cutover (spec section 10) — observed loss curves
+
+The cutover deliverable is learnability: the assembled `VFEModel` reduces its own
+cross-entropy.
+
+STRUCTURED period-3 stream (`0,1,2,0,1,2,...`, vocab 6, K=4): CE starts at the uniform-
+over-6 entropy ln(6) ~ 1.7918 and falls to ~1.020, well below the 0.6x start bar
+(1.0752). Observed curve (every 25 steps of 200): `1.792, 1.098, 1.080, 1.040, 1.037,
+1.028, 1.024, 1.020`. Start 1.7920 -> end 1.0200.
+
+ROOT-CAUSE NOTE (recorded for honesty). With the gauge frame frozen (`e_phi_lr =
+m_phi_lr = 0`, the plan's first draft config) the structured CE pins at exactly
+ln(3) ~ 1.0986 across every learning-rate / E-step / depth / alpha sweep, and the
+post-training prediction is identical at every position (probabilities
+`[0.33, 0.33, 0.33, 0, 0, 0]`). The active prior means collapse onto a common point
+(pairwise distance ~0.02) with equal variances: the optimizer finds the symmetric
+"predict the marginal over the active tokens" optimum. The period-3 shift is a DIRECTED
+map (predict the next token from the current one), and causal attention only AVERAGES
+past beliefs, which cannot manufacture a forward shift. The gauge transport
+Omega_ij(phi) is the one degree of freedom that applies a directed (non-averaging)
+rotation to coupled beliefs; turning it on (`e_phi_lr = 0.3`, `m_phi_lr = 0.05`, with
+`n_e_steps = 3`, `max_steps = n_steps = 200`) breaks the symmetry and drives CE below
+ln(3). The final structured-test config therefore enables phi; this is config tuning the
+plan authorizes (raise `n_e_steps` / steps; do not weaken the 0.6x assertion), not a
+relaxation of the margin.
+
+REAL wikitext-2 validation slice (vocab 50257, K=8, seq 16, 30 steps): CE starts at
+10.8249 and falls to 8.7823 (margin 2.04, far past the 0.05 bar), all finite (no NaN).
+Observed curve (every 5 steps): `10.825, 10.777, 10.457, 9.874, 9.559, 9.116, 8.782`.
+
+### Test results
+
+```
+159 passed
+```
+
+4 new tests; no regressions in the 155 prior.
+
+### Commits
+
+- `f8c657d feat(train): AdamW per-group LRs + warmup/cosine schedule`
+- `3ae5ceb feat(train): train loop + cutover (loss decreases on structured + real tokens)`
