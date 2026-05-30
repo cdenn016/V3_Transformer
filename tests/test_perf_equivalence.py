@@ -93,3 +93,24 @@ def test_block_glk_phi_matrix_is_block_diagonal():
     pm = torch.einsum("bna,aij->bnij", phi, grp.generators)   # (B, N, 8, 8)
     off = pm[:, :, :4, 4:].abs().max() + pm[:, :, 4:, :4].abs().max()
     assert float(off) == 0.0
+
+
+def test_per_block_exp_is_bit_equivalent_to_full_exp():
+    # Audit 4b: the per-block matrix_exp path must be BIT-equivalent to the full-matrix exp for a
+    # block-diagonal generator embedding -- not merely "close". Tripwire at 1e-12: a loose pass
+    # (~1e-3) would mean a small block silently dropped to float32; that is a failure, not a pass.
+    from vfe3.geometry.transport import _blockwise_matrix_exp, stable_matrix_exp_pair
+    grp, phi, _, _ = _transport_inputs()
+    pm = torch.einsum("bna,aij->bnij", phi, grp.generators)   # (B, N, 8, 8) block-diagonal
+
+    # blockwise vs full, both float64, no clamp (norms are tiny here)
+    pm64 = pm.double()
+    blk = _blockwise_matrix_exp(pm64, grp.irrep_dims)
+    full = torch.linalg.matrix_exp(pm64)
+    assert float((blk - full).abs().max()) < 1e-12
+
+    # and the public pair (as called by compute_transport_operators) matches the full path
+    ep_blk, en_blk = stable_matrix_exp_pair(pm, skew_symmetric=False, block_dims=grp.irrep_dims)
+    ep_full, en_full = stable_matrix_exp_pair(pm, skew_symmetric=False, block_dims=None)
+    assert float((ep_blk - ep_full).abs().max()) < 1e-6
+    assert float((en_blk - en_full).abs().max()) < 1e-6
