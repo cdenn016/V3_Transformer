@@ -878,3 +878,27 @@ global F per iteration; the trajectory is a diagnostic, never asserted.
 
 Note: the Phase 6 workflow's implement agent failed to emit its structured handoff after Task
 1; Tasks 2–5 were completed directly (same plan, tests green) and committed by hand.
+
+### Adversarial review
+
+A 4-expert panel (variational, numerical-analyst, runtime-wiring, code-quality) found no
+high-severity issues; the descent objective per mode is wired exactly as specified (the
+variational reviewer verified the kernel routes through `belief_gradients` in filtering mode
+with the key role frozen via `mu_q.detach()`, and that `phi_alignment_loss` flows both roles
+of phi). One MEDIUM (DRY): `phi_alignment_loss` hand-rolled the coupling+entropy block ->
+refactored to reuse `reduced_free_energy` (the `-tau log Z` envelope; the phi-gradient is
+identical by the envelope identity, numerically cleaner via logsumexp). Two LOW polishes
+applied: a stepped-belief test now PINS the keys-frozen `F_filt` machinery (a ~7.5e-4 witness
+gap that both descent tests previously left unobserved), and `e_sigma_q_trust` was moved into
+the defined-float argument group. Two LOW findings deferred: the phi-block finite-difference
+check floors at ~1e-3 because transport's `matrix_exp` runs float32 for K<20 (the autograd
+phi-gradient itself is exact at ~7e-11 in float64 — a test-harness gap, folded into the
+forthcoming numerical-monitoring module via a float64 FD-upcast option); and
+`free_energy_value`'s shared `**kwargs` sink (a deliberate, documented one-knob-bag design).
+
+### Review commits
+
+- `9cf16c4 refactor(inference): phi_alignment_loss reuses reduced_free_energy envelope block`
+- `4793985 test(inference): pin keys-frozen F_filt on a stepped belief; fix arg ordering`
+
+Full suite after review: 125 passed, 0 failed.
