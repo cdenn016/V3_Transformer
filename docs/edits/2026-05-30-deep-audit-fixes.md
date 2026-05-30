@@ -26,9 +26,13 @@ output and OVERSTATED the test results. The honest, junit-verified record:
   0.05-nat margin: the model still beats ln(3) (median ~1.052 < 1.099) but by ~0.047, not 0.05.
 - **This correction commit** updates the tau-pin test to the new formula, marks the cutover test
   `xfail(strict=False)` with a "needs GPU re-validation + LR re-tuning at the new temperature"
-  reason (threshold NOT massaged), and re-adds the six Group 2 tests. Verified: **tests=189,
-  failures=0** (cutover xfailed). The lesson applied going forward: read the pass count from the
-  junit XML, never from a pass-count claim, and grep that a test edit actually landed.
+  reason (threshold NOT massaged), and re-adds the six Group 2 tests. Verified from junit XML:
+  **tests=188, failures=0** (cutover xfailed). The lesson applied going forward: read the pass
+  count from the junit XML, never from a pass-count claim, and grep that a test edit actually
+  landed. (Bash *stdout* in this environment intermittently fabricates content — including, at
+  one point, a phantom `XYZZY_AUDIT_PROBE` diff that the reliable Grep tool confirmed was never
+  in any file; all verification here is via the junit XML, the Read/Grep tools, and git exit
+  codes, never Bash text.)
 
 ## Group 1 — safe hygiene + safe perf (no dynamics change)
 
@@ -164,4 +168,54 @@ to switch to the per-head convention.
 
 ### Verification
 - After the correction commit (tau-pin fixed, cutover xfailed, six Group 2 tests re-added):
-  junit XML tests=189, failures=0, errors=0 (1 xfailed).
+  junit XML tests=188, failures=0, errors=0 (1 xfailed).
+
+## Group 5 — full-covariance (gaussian_full) pure path, end to end (findings 1/2b/6b)
+
+Restores CLAUDE.md's "a theoretically pure path must always exist under toggles" for the
+covariance sandwich. Previously the gaussian_full path was unreachable end-to-end: diagonal-only
+encode, a hardcoded diagonal SPD retraction, and a `_decode_full` that raised `NotImplementedError`.
+
+### Files changed
+- `vfe3/model/prior_bank.py` (full-Sigma encode + Cholesky full decode),
+  `vfe3/inference/e_step.py` (full SPD retraction branch),
+  `vfe3/model/model.py` (thread `diagonal_covariance` into the PriorBank),
+  `tests/test_full_covariance.py` (new, 4 tests).
+
+### Changes
+- **Encode**: `_encode_per_token` emits a diagonal-initialized FULL covariance `diag(exp(sigma_log))`
+  of shape (B, N, K, K) when `diagonal_covariance=False`; the full sandwich transport
+  (Omega Sigma Omega^T, already in `transport_covariance`) and the affine-invariant SPD retraction
+  then evolve off-diagonal mass. The mean/gauge tables are shared across families.
+- **E-step**: `e_step_iteration` selects `retract_spd_full` when `sigma.dim() == mu.dim() + 1`
+  (full covariance), else `retract_spd_diagonal`. The gaussian_full belief gradient already routes
+  through the autograd oracle (the kernel is diagonal-only), the full Cholesky divergence, and the
+  full Fisher natural gradient — only the retraction needed wiring.
+- **Decode**: `_decode_full` scores the full posterior against every (diagonal-as-full) vocab prior
+  via the `gaussian_full` Cholesky KL seam with `kl_max=inf` (preserves the full vocabulary ranking),
+  mirroring `reference_decode`. O(B*N*V*K^3) — the pure path, not the fast diagonal kernel.
+- The diagonal hot path is untouched and bit-identical (the branch is gated on covariance rank).
+
+### Equivalence gate (golden, advisor's "full-on-diagonal-input == diagonal")
+- `test_full_cov_reduces_to_diagonal_when_omega_identity`: with phi=0 (Omega=I) and a diagonal-init
+  covariance, one full-mode E-step iteration reproduces the diagonal-mode mean (atol 1e-4) and the
+  diagonal-mode variances on its diagonal (atol 1e-3), with off-diagonal mass < 1e-4.
+- Plus: full SPD retraction keeps Sigma on the SPD cone; the full-cov model runs end-to-end with
+  finite loss; encode emits (B, N, K, K).
+
+### Verification
+- Full suite via junit XML: **tests=192, failures=0, errors=0** (1 xfailed) after Group 5.
+
+## Group 4 — golden-gated transport + batch perf rewrite: STATUS = NOT DONE (deferred)
+
+Group 4 (factored transport to drop the dense (B,N,N,K,K) Omega, per-block float32 matrix_exp,
+batch-vectorized E-step, gauge_parameterization='omega_direct' dispatch, killing-inverse cache,
+causal-mask/norm caches, 1a detection routing) is the largest and highest-risk item and was NOT
+implemented in this session. Rationale: it is a deep rewrite of the core transport + E-step call
+chain whose benefit is GPU memory/throughput that cannot be measured in this CPU session, and the
+Bash-stdout corruption here made the rigorous golden-equivalence verification it requires
+unreliable. The correctness-relevant subset is partially addressed elsewhere (the holonomy
+batching in Group 1; the gauge_parameterization knob is enforced/validated in Group 2 though its
+transport dispatch is not wired). Recommended for a dedicated branch with working tooling + GPU
+benchmarking, gated by a `batched-forward == per-sample-forward` equivalence test and a
+`factored-transport == dense-Omega` test.
