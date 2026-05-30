@@ -206,16 +206,62 @@ encode, a hardcoded diagonal SPD retraction, and a `_decode_full` that raised `N
 ### Verification
 - Full suite via junit XML: **tests=192, failures=0, errors=0** (1 xfailed) after Group 5.
 
-## Group 4 — golden-gated transport + batch perf rewrite: STATUS = NOT DONE (deferred)
+## Group 4 — golden-gated perf rewrite (per-block exp + caches shipped; factored transport + batch deferred)
 
-Group 4 (factored transport to drop the dense (B,N,N,K,K) Omega, per-block float32 matrix_exp,
-batch-vectorized E-step, gauge_parameterization='omega_direct' dispatch, killing-inverse cache,
-causal-mask/norm caches, 1a detection routing) is the largest and highest-risk item and was NOT
-implemented in this session. Rationale: it is a deep rewrite of the core transport + E-step call
-chain whose benefit is GPU memory/throughput that cannot be measured in this CPU session, and the
-Bash-stdout corruption here made the rigorous golden-equivalence verification it requires
-unreliable. The correctness-relevant subset is partially addressed elsewhere (the holonomy
-batching in Group 1; the gauge_parameterization knob is enforced/validated in Group 2 though its
-transport dispatch is not wired). Recommended for a dedicated branch with working tooling + GPU
-benchmarking, gated by a `batched-forward == per-sample-forward` equivalence test and a
-`factored-transport == dense-Omega` test.
+Group 4 was done golden-test-FIRST: the frozen oracle (`tests/test_perf_equivalence.py`) was
+committed BEFORE any perf edit (commit `58a7b3d`) so every change is proven equivalence-preserving.
+The original "NOT DONE" note (an earlier draft of this section) is superseded by the record below.
+The sub-items split by risk and by whether their benefit is measurable on CPU.
+
+### G4a (oracle, FIRST) — committed `58a7b3d`
+Frozen literal-checksum oracle: model.forward loss/logits (B=2, distinct sequences, seed 0);
+the batched-forward == per-sample-loop property (B≥2, distinct seqs, catches cross-batch leakage);
+transport Omega/mean/diagonal-sandwich sums (block_glk K=8, irrep_dims [4,4]); and the
+block-diagonal precondition for per-block exp. These are the gates the refactor was written against
+(and remain in place for the deferred GPU-branch items).
+
+### G4-low — caches (4d, 4e, 2d/4f, 2f), commit `b8229da`
+All equivalence-preserving (golden oracle bit-equal; perf is GPU-side, analyzed not timed):
+- **4e/2f** causal/attention `log_prior` cached on `(N, device, dtype)` instead of rebuilt every
+  forward; the dtype in the key also fixes the float64-model mask mismatch (2f). Cache cleared in `_apply`.
+- **2d/4f** block + final `MahalanobisNorm` built once in `VFEModel.__init__` (parameter-free),
+  threaded through `vfe_stack`/`vfe_block`, not re-instantiated per block/forward.
+- **4d** Killing inverse memoized on the generator-basis identity (`data_ptr`+dtype+device); a
+  `.to()` move is a new tensor → cache miss → recompute, so never stale. Dead on the default
+  (`phi_precond_mode="none"`) but an O(n_gen^3) float64 eigh per E-step iteration when enabled.
+  Exactness on sl(K) preserved (`M·Minv·M=M` to 1.8e-7).
+
+### G4-mid — gauge_parameterization enforced (2c/3a), commit `abac409`
+`omega_direct` (Ω_i Ω_j^{-1}, general GL(K), det possibly < 0) needs a per-token K×K group element.
+The no-NN belief carries only `phi`; the only Ω_i it yields is `exp(embed(phi_i))`, which makes
+Ω_ij identical to the `phi` path. With no source for a non-exponential / det<0 element in the
+belief, `gauge_parameterization="omega_direct"` now raises `NotImplementedError` (live + enforced)
+rather than silently aliasing to `phi`. This closes 2c/3a the same way `use_prior_bank=False` was
+closed: the knob errors instead of lying. (Same outcome the advisor's "reject, don't invent" rule
+prescribed once the belief was confirmed to have no per-token GL(K) source other than `phi`.)
+
+### G4b — per-block matrix_exp (bit-equivalent), commit `88a588a`
+`exp` of a block-diagonal Lie-algebra matrix equals the block-diagonal of the blocks' exps, so
+`block_glk`'s GL(d_head)^H phi-matrix is exponentiated per `d_head` block: O(H·d_head^3) instead of
+O(K^3), and at the default K=64 it stops upcasting a full 64×64 to float64 (each 8×8 block does the
+float64 exp). Gated on `len(irrep_dims) > 1` (multihead-without-cross only; glk, so_k, and
+cross-coupled block_glk are single-block `[K]` → full path). Two guards make it BIT-equivalent, not
+float32-drifted: the global Frobenius clamp is applied to the whole matrix before slicing, and each
+block keeps the dtype the full-K path picks. Verified blockwise == full to 1e-15 (test asserts a
+1e-12 tripwire — a loose ~1e-3 pass would betray a silent float32 drop); downstream `omega` einsum
+byte-identical; frozen transport oracle unchanged.
+
+### G4a + G4c — factored transport + batch vectorization: DEFERRED to a GPU branch (user decision)
+4a (drop the dense `(B,N,N,K,K)` Ω via a K-step factored transport) and 4c (batch-vectorize the
+E-step, remove the per-sample loop) are **coupled**: 4a's only payoff is letting 4c batch without
+memory going B-fold. Both deliver GPU memory/throughput that **cannot be measured on CPU**, and
+4a's serial K-iteration loop may even **regress** 5090 throughput versus the current single fused
+einsum. They are also the highest-blast-radius change (e_step/kernels/retraction/transport/forward).
+The user chose to defer them rather than ship unmeasurable, possibly-regressive complexity on faith.
+The `batched-forward == per-sample` and `factored == dense` golden gates are already committed
+(`58a7b3d`), so the future GPU branch starts with the equivalence harness in place and must add
+live memory + throughput benchmarking before landing.
+
+### Verification
+- Full suite via junit XML after G4b: **tests=198, failures=0, errors=0** (1 xfailed — the
+  per-head-tau cutover margin, pending GPU re-validation).
