@@ -126,6 +126,7 @@ def free_energy(
 
     *,
     tau:                       float = 1.0,
+    log_eps:                   float = 1e-12,                   # floor for log(beta)/log(pi) in the entropy term
     include_attention_entropy: bool  = True,
 
     log_prior:                 Optional[torch.Tensor] = None,   # (..., N, N) attention log-prior
@@ -157,7 +158,7 @@ def free_energy(
     if include_attention_entropy:
         pi = torch.softmax(log_prior, dim=-1) if log_prior is not None \
             else torch.full_like(beta, 1.0 / beta.shape[-1])
-        entropy = tau * (beta * (torch.log(beta.clamp(min=1e-12)) - torch.log(pi.clamp(min=1e-12)))).sum()
+        entropy = tau * (beta * (torch.log(beta.clamp(min=log_eps)) - torch.log(pi.clamp(min=log_eps)))).sum()
         F = F + entropy
     if log_likelihood is not None:
         F = F - log_likelihood.sum()

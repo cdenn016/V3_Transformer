@@ -201,13 +201,20 @@ def e_step(
     returns the global-F trajectory (a DIAGNOSTIC; parallel updates are not guaranteed
     monotone per iteration)."""
     traj: List[float] = []
+
+    def _f_diag(b: BeliefState) -> float:
+        # Diagnostic scalar: under no_grad so the logged trajectory never enters the
+        # training graph, and .item() instead of float(tensor) makes the host sync explicit.
+        with torch.no_grad():
+            return free_energy_value(b, mu_p, sigma_p, group, tau=tau, log_prior=log_prior, **kwargs).item()
+
     if return_trajectory:
-        traj.append(float(free_energy_value(belief, mu_p, sigma_p, group, tau=tau, log_prior=log_prior, **kwargs)))
+        traj.append(_f_diag(belief))
     for _ in range(n_iter):
         belief = e_step_iteration(
             belief, mu_p, sigma_p, group, tau=tau,
             e_mu_lr=e_mu_lr, e_sigma_lr=e_sigma_lr, e_phi_lr=e_phi_lr, log_prior=log_prior, **kwargs,
         )
         if return_trajectory:
-            traj.append(float(free_energy_value(belief, mu_p, sigma_p, group, tau=tau, log_prior=log_prior, **kwargs)))
+            traj.append(_f_diag(belief))
     return (belief, traj) if return_trajectory else belief

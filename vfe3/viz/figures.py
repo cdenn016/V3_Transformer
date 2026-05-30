@@ -31,7 +31,7 @@ def set_publication_style() -> None:
     try:
         import seaborn as sns
         sns.set_palette("colorblind")
-    except Exception:
+    except ImportError:
         pass
     plt.rcParams.update({
         "figure.dpi":      200,

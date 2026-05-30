@@ -7,6 +7,7 @@ the batch around the (unbatched) E-step; decode and CE are batched.
 """
 
 import inspect
+from contextlib import nullcontext
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -62,7 +63,7 @@ class VFEModel(nn.Module):
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
         )
 
-    def _apply(self, fn, recurse: bool = True):
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":
         r"""Carry the gauge group's generators through ``.to(...)`` / ``.cuda()`` etc.
 
         ``self.group`` is a plain ``GaugeGroup`` dataclass, not an ``nn.Module``, so its
@@ -87,7 +88,7 @@ class VFEModel(nn.Module):
         )
 
         outs = []
-        run = torch.no_grad() if self.cfg.detach_e_step else _nullcontext()
+        run = torch.no_grad() if self.cfg.detach_e_step else nullcontext()
         with run:
             for b in range(B):
                 belief_b = BeliefState(mu=beliefs.mu[b], sigma=beliefs.sigma[b], phi=beliefs.phi[b])
@@ -118,8 +119,3 @@ class VFEModel(nn.Module):
             phi_all = torch.stack([o.phi for o in outs], dim=0)
             loss = loss + 0.5 * self.cfg.mass_phi * (phi_all ** 2).mean()
         return logits, loss, ce.detach()
-
-
-class _nullcontext:
-    def __enter__(self): return None
-    def __exit__(self, *a): return False

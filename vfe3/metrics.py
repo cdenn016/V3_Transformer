@@ -13,7 +13,7 @@ gauge_trace_spread (spread of log|det Omega| = tr embed(phi)), and free_energy_t
 """
 
 import math
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -60,21 +60,35 @@ def holonomy_deviation(
     """
     N, K = omega.shape[0], omega.shape[-1]
     eye = torch.eye(K, device=omega.device, dtype=omega.dtype)
-    devs: List[torch.Tensor] = []
-    count = 0
+
+    # Enumerate the first ``max_triangles`` distinct (i, j, k) triples in the same
+    # row-major order the nested-loop form used, then evaluate them as ONE batched
+    # (T, K, K) matmul rather than T Python-dispatched (K, K) matmuls -- same triangles,
+    # same value, one kernel launch instead of T.
+    triples: List[Tuple[int, int, int]] = []
     for i in range(N):
         for j in range(N):
+            if j == i:
+                continue
             for k in range(N):
-                if i == j or j == k or i == k:
+                if k == i or k == j:
                     continue
-                H = omega[i, j] @ omega[j, k] @ omega[k, i]
-                devs.append(torch.linalg.norm(H - eye))
-                count += 1
-                if count >= max_triangles:
-                    return torch.stack(devs).mean()
-    if not devs:
+                triples.append((i, j, k))
+                if len(triples) >= max_triangles:
+                    break
+            if len(triples) >= max_triangles:
+                break
+        if len(triples) >= max_triangles:
+            break
+    if not triples:
         return torch.tensor(0.0, device=omega.device, dtype=omega.dtype)
-    return torch.stack(devs).mean()
+
+    idx = torch.tensor(triples, device=omega.device)                      # (T, 3)
+    o_ij = omega[idx[:, 0], idx[:, 1]]                                     # (T, K, K)
+    o_jk = omega[idx[:, 1], idx[:, 2]]                                     # (T, K, K)
+    o_ki = omega[idx[:, 2], idx[:, 0]]                                     # (T, K, K)
+    H = o_ij @ o_jk @ o_ki                                                # (T, K, K) holonomy
+    return torch.linalg.norm(H - eye, dim=(-2, -1)).mean()
 
 
 def gauge_trace_spread(
@@ -132,26 +146,30 @@ def get_metric(name: str) -> Callable:
     return _METRICS[name]
 
 
+# Each metric's OWN context key is REQUIRED (no None default): a missing or mis-keyed
+# context now raises TypeError at the call instead of an AttributeError deep inside the
+# kernel (effective_rank(None) etc.). The trailing **kw stays only to absorb SIBLING
+# metrics' context keys, since ``compute_metrics`` floods the full context to every metric.
 @register_metric("effective_rank")
-def _m_eff_rank(*, sigma=None, **kw) -> float:
+def _m_eff_rank(*, sigma: torch.Tensor, **kw) -> float:
     """Mean spectral effective rank of the belief covariances."""
     return float(effective_rank(sigma).mean())
 
 
 @register_metric("attention_entropy")
-def _m_attn_entropy(*, beta=None, **kw) -> float:
+def _m_attn_entropy(*, beta: torch.Tensor, **kw) -> float:
     """Mean attention row entropy."""
     return float(attention_entropy(beta))
 
 
 @register_metric("holonomy_deviation")
-def _m_holonomy(*, omega=None, **kw) -> float:
+def _m_holonomy(*, omega: torch.Tensor, **kw) -> float:
     """Mean triangle-holonomy departure from identity (curvature proxy)."""
     return float(holonomy_deviation(omega))
 
 
 @register_metric("gauge_trace_spread")
-def _m_gauge_spread(*, phi=None, generators=None, **kw) -> float:
+def _m_gauge_spread(*, phi: torch.Tensor, generators: torch.Tensor, **kw) -> float:
     """Spread of log|det Omega| across tokens."""
     return float(gauge_trace_spread(phi, generators))
 
