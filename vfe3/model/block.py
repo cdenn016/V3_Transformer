@@ -35,7 +35,8 @@ def vfe_block(
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust,
         include_attention_entropy=cfg.include_attention_entropy,
         gradient_mode=cfg.gradient_mode, family=cfg.family, alpha_mode=cfg.alpha_mode,
-        phi_precond_mode=cfg.phi_precond_mode, log_prior=log_prior,
+        phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
+        log_prior=log_prior,
     )
     if cfg.norm_type_block != "none":
         norm = get_norm(cfg.norm_type_block)(cfg.embed_dim, eps=cfg.eps)

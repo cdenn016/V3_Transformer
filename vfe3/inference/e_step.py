@@ -46,14 +46,18 @@ def free_energy_value(
     c0:                        float = 1.0,
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
+    sigma_max:                 float = 5.0,            # accepted-and-ignored iteration-only knob
+    e_sigma_q_trust:           float = 5.0,            # accepted-and-ignored iteration-only knob
 
     include_attention_entropy: bool = True,
     family:                    str  = "gaussian_diagonal",
     alpha_mode:                str  = "constant",
+    gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
+    phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
+    phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
 
     log_prior:                 Optional[torch.Tensor] = None,
     keys:                      Optional[BeliefState]  = None,   # None -> global F; else keys frozen at `keys`
-    **kwargs,                                                   # accept-and-ignore iteration-only knobs
 ) -> torch.Tensor:                   # scalar F
     r"""Scalar free energy of a belief. ``keys=None`` -> global F (keys = the belief);
     ``keys`` given -> F with the transported keys frozen at ``keys`` (the F_filt objective).
@@ -62,10 +66,11 @@ def free_energy_value(
                   + Sum_j beta_ij E_ij + tau Sum_j beta_ij log(beta_ij/pi_ij) ],
         E_ij = D(q_i || Omega_ij q_j),  beta = softmax_j(log_prior - E/tau).
 
-    The shared ``**kwargs`` sink swallows the iteration-only knobs (gradient_mode,
-    e_mu_lr/e_sigma_lr/e_phi_lr, sigma_max, e_sigma_q_trust, phi_precond_mode) so the
-    common call site in ``e_step`` may forward one knob bag to both this and
-    ``e_step_iteration`` without error; the shared knobs bind to real parameters here.
+    The iteration-only knobs (gradient_mode, phi_precond_mode, phi_retract_mode,
+    sigma_max, e_sigma_q_trust) are declared here as EXPLICIT accept-and-ignore
+    parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may
+    forward one knob bag to both this and ``e_step_iteration`` while a MISSPELLED real
+    parameter still raises ``TypeError`` here instead of being silently swallowed.
     """
     key_belief = belief if keys is None else keys
     omega = _transport(key_belief.phi, group)
@@ -140,6 +145,7 @@ def e_step_iteration(
     family:                    str  = "gaussian_diagonal",
     alpha_mode:                str  = "constant",
     phi_precond_mode:          str  = "none",
+    phi_retract_mode:          str  = "euclidean",
 
     log_prior:                 Optional[torch.Tensor] = None,
 ) -> BeliefState:
@@ -175,7 +181,7 @@ def e_step_iteration(
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]
         grad_phi = precondition_phi_gradient(grad_phi, belief.phi, group.generators, mode=phi_precond_mode)
-        phi = retract_phi(belief.phi, -grad_phi, group, step_size=e_phi_lr)
+        phi = retract_phi(belief.phi, -grad_phi, group, step_size=e_phi_lr, mode=phi_retract_mode)
 
     return BeliefState(mu=mu, sigma=sigma, phi=phi)
 

@@ -54,3 +54,55 @@ Fixes that cannot change any numeric output on the default path; the suite stays
 
 ### Verification
 - `pytest -q` (JUnit XML count): tests=182, failures=0, errors=0 after Group 1.
+
+## Group 2 — wire / enforce the five config seams (+ self-contained plumbing)
+
+The user chose "wire all five" over "delete redundant." Following the advisor's
+"enforce, don't invent" rule: the two seams with a ready implementation are genuinely
+wired; the three under-defined ones are made LIVE and ENFORCED (reject contradictory or
+unsupported values) rather than having fictional FEP paths invented for them.
+
+### Files changed
+- `vfe3/config.py`, `vfe3/train.py`, `vfe3/inference/e_step.py`, `vfe3/model/block.py`,
+  `vfe3/alpha_i.py`, `tests/test_config.py`, `tests/test_e_step.py`
+
+### Changes
+- **`seed`** (3d): `run_training` now calls `torch.manual_seed(cfg.seed)` before building the
+  model/loader — reproducible prior-table init and data order. Genuinely wired.
+- **`use_prior_bank`** (3b): `__post_init__` raises `NotImplementedError` for
+  `use_prior_bank=False` — the PriorBank is the only encode/decode boundary and no alternative
+  is specified, so the knob is live and rejects the unsupported value (no invented path).
+- **`divergence_family`** (2a) and **`diagonal_covariance`** (3c): `__post_init__` enforces both
+  consistent with `family` (the single source of truth) — a contradictory pair (e.g.
+  `divergence_family='gaussian_full'` with `family='gaussian_diagonal'`, or
+  `diagonal_covariance=False` with a diagonal family) now raises `ValueError` instead of being
+  silently ignored.
+- **`gauge_parameterization`** (2c/3a): the actual transport dispatch (phi vs omega_direct) is
+  wired in Group 4, which owns `_transport`; deferred here to avoid editing the E-step plumbing
+  twice (Group 4 rewrites it).
+- **kwargs sink** (1c/5a): `free_energy_value`'s blanket `**kwargs` sink is replaced by explicit
+  accept-and-ignore iteration knobs (`gradient_mode`, `phi_precond_mode`, `phi_retract_mode`,
+  `sigma_max`, `e_sigma_q_trust`). A misspelled real parameter now raises `TypeError` instead of
+  being swallowed; `e_step_iteration` already had no sink, so both knob-bag consumers now reject
+  typos. New test `test_free_energy_value_rejects_misspelled_kwarg`.
+- **`state_dependent_per_coord`** (2e/3e): emits a `RuntimeWarning` (deduped) that the mode
+  currently receives the summed per-position divergence and silently degrades to per-position
+  alpha; points users to `state_dependent`.
+- **`compose_bch`** (3j): new config field `phi_retract_mode` ("euclidean" | "bch", validated),
+  threaded `block -> e_step -> e_step_iteration -> retract_phi(mode=...)`, so the registered BCH
+  chart correction is now config-selectable (was registered but unreachable).
+
+### New tests (tests/test_config.py, tests/test_e_step.py)
+- `use_prior_bank=False` -> NotImplementedError; `divergence_family != family` -> ValueError;
+  `diagonal_covariance` must agree with family (and the consistent full triple is accepted);
+  `phi_retract_mode` validated and "bch" accepted; `seed` field present; `free_energy_value`
+  rejects a misspelled kwarg but accepts the iteration-only knobs.
+
+### Pre-existing issues noted (not changed, per surgical-changes policy)
+- `tests/test_config.py` defines `test_invalid_divergence_family_raises` twice (the second
+  shadows the first).
+- `tests/test_config.py` lines 11 and 31 pin `tau == kappa*sqrt(embed_dim)` — these are the
+  formula-pinning assertions Group 3 updates to `sqrt(d_head)`.
+
+### Verification
+- `pytest -q` (JUnit XML count): tests=188 (+6 new), failures=0, errors=0 after Group 2.

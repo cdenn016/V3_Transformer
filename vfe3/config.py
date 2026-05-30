@@ -17,6 +17,7 @@ _VALID_DECODE_MODES        = ("diagonal", "full")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_per_coord")
 _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback")
+_VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
 _VALID_ATTENTION_PRIORS    = ("uniform", "causal", "alibi")
 _VALID_NORMS               = ("none", "mahalanobis")
 
@@ -74,6 +75,7 @@ class VFE3Config:
     sigma_max:                 float = 5.0
     gradient_mode:             str   = "filtering"
     phi_precond_mode:          str   = "none"
+    phi_retract_mode:          str   = "euclidean"   # Lie-algebra step: euclidean (sum) or bch chart
 
     # decode / encode
     use_prior_bank:            bool  = True
@@ -129,8 +131,21 @@ class VFE3Config:
         _require(self.gauge_group, _VALID_GAUGE_GROUPS, "gauge_group")
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
 
-        # belief family
+        # belief family. ``family`` is the SINGLE source of truth for covariance
+        # structure + divergence; ``divergence_family`` and ``diagonal_covariance`` are
+        # held live and ENFORCED-consistent with it (a contradictory pair is rejected
+        # rather than silently ignored), not deleted.
         _require(self.family, _VALID_DIVERGENCE_FAMILIES, "family")
+        if self.divergence_family != self.family:
+            raise ValueError(
+                f"divergence_family={self.divergence_family!r} must equal family={self.family!r} "
+                f"(family is the single divergence/covariance source of truth)"
+            )
+        if self.diagonal_covariance != (self.family == "gaussian_diagonal"):
+            raise ValueError(
+                f"diagonal_covariance={self.diagonal_covariance} contradicts family={self.family!r}; "
+                f"set diagonal_covariance={self.family == 'gaussian_diagonal'} for this family"
+            )
 
         # free-energy coupling
         if self.kappa <= 0.0:
@@ -148,12 +163,21 @@ class VFE3Config:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         _require(self.phi_precond_mode, _VALID_PHI_PRECOND_MODES, "phi_precond_mode")
+        _require(self.phi_retract_mode, _VALID_PHI_RETRACT_MODES, "phi_retract_mode")
 
         # decode / encode
         if self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be positive, got {self.decode_tau}")
         _require(self.decode_mode, _VALID_DECODE_MODES, "decode_mode")
         _require(self.encode_mode, _VALID_ENCODE_MODES, "encode_mode")
+        # The PriorBank IS the encode/decode boundary; there is no specified
+        # alternative. The knob is live and rejects the unsupported value rather
+        # than silently doing nothing.
+        if not self.use_prior_bank:
+            raise NotImplementedError(
+                "use_prior_bank=False has no alternative encode/decode path; the PriorBank "
+                "is the only belief-encode/decode boundary in VFE_3.0"
+            )
 
         # handoff (both blends must be convex so the prior stays on the SPD cone:
         # sigma_p_next = (1-rho_s) sigma_p + rho_s sigma_q stays > 0 iff rho_s in [0,1])

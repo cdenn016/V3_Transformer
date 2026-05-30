@@ -8,6 +8,7 @@ A config-selected registry of forms:
 Pure: a function of the (per-position or per-coordinate) self-divergence D.
 """
 
+import warnings
 from typing import Callable, Dict, Tuple
 
 import torch
@@ -90,6 +91,14 @@ def alpha_state_dependent_per_coord(
     registered and routed here, prefer `state_dependent` (per-position) for the
     summed D the current pipeline supplies.
     """
+    warnings.warn(
+        "alpha_mode='state_dependent_per_coord' currently receives the summed per-position "
+        "self-divergence and silently degrades to per-position alpha (identical to "
+        "'state_dependent'); the per-coordinate (unsummed) divergence is a deferred path. "
+        "Use 'state_dependent' for per-position alpha.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
     alpha = c0 / (b0 + kl).clamp(min=eps)
     return alpha, alpha_regularizer(alpha, b0=b0, c0=c0)
 
