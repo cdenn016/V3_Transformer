@@ -1129,13 +1129,19 @@ PriorBank. Three new shipped modules, all parameter-free except the priors.
   `token_ids (B,N)` -> `PriorBank.encode` -> initial belief (q = p) -> loop over the
   batch running `vfe_stack` (the E-step is unbatched `(N,K)`) -> stack the final
   beliefs -> `PriorBank.decode` -> logits `(B,N,V)` -> cross-entropy vs `targets`.
-  `build_group` dispatches on the builder signature (`block_glk(K, n_heads)` vs
-  `glk(K)` / `so_k(K)`); the group is built once and held on the model.
+  `build_group` dispatches on the builder's positional arity (arity 1 -> `builder(K)`
+  for `glk`/`so_k`; arity 2 -> `builder(K, n_heads)` for `block_glk`), so a newly
+  registered group slots in by `register_group` alone; the group is built once and held
+  on the model, and `VFEModel._apply` re-maps `group.generators` through `.to(...)` so
+  the non-`nn.Module` group follows dtype/device moves.
 
 ### Files modified
 
-- `tests/test_model.py` -- five new tests (block shapes, stack handoff moves the
-  belief, model forward shapes + finite loss, the crown jewel, no-NN).
+- `tests/test_model.py` -- twelve tests (block shapes, stack handoff moves the
+  belief, model forward shapes + finite loss, the crown jewel, no-NN; plus the
+  review-driven additions: phi-step isolation, detach+phi runs to finite loss,
+  handoff_sigma convexity, all-ignore finite loss, build_group arity dispatch, group
+  dtype move, norm_type_final wired).
 
 ### The crown jewel (unrolled training graph reaches the priors)
 
@@ -1153,8 +1159,18 @@ Why it holds: the Phase-4 filtering kernel detaches only the KEYS
 reached even without the E-step (decode reads it directly); `phi_embed` is reached
 ONLY through `phi -> omega -> mu_t -> grad_mu -> mu_new -> decode`, which runs every
 E-step iteration regardless of `e_phi_lr`. `detach_e_step=True` (the fixed-point /
-truncated regime) wraps the loop in `no_grad`; then the priors are reached only via
-decode + the initial encode (by design; no test exercises gradient there).
+truncated regime) wraps the loop in `no_grad`; the encoded belief is then SEVERED where
+it enters the loop, so the priors are reached ONLY via `decode`'s direct read of
+`mu_embed`/`sigma_log_embed`. Encode is NOT a live gradient source in this regime, and
+`phi_embed` is frozen (phi appears only in encode and the phi step, never in decode).
+The phi natural-gradient step still runs without crashing — it computes its gradient in
+its own `enable_grad` island (`e_step.py`), since `autograd.grad` on a fresh
+requires-grad leaf must work irrespective of the caller's grad context — but it
+contributes no gradient to the priors under detach. Consequently the `mass_phi`
+regularizer `0.5*mass_phi*(phi_all**2).mean()` is also inert under detach: `phi_all` is
+built from the detached belief, so the term is a constant that adds zero gradient. (The
+earlier "decode + the initial encode" wording was imprecise: encode is cut by `no_grad`;
+only decode is live.)
 
 ### No neural networks (hard constraint)
 
@@ -1172,13 +1188,44 @@ attention-prior (`attention_log_prior` gets `device=token_ids.device`), norm,
 gradient mode, alpha mode, phi preconditioner, and the handoff blend are all
 config-selected. The model is device-agnostic (no device-less tensors on the path).
 
+### Review fixes (2026-05-29, expert review of Phase 7c)
+
+- **E-step phi step under `no_grad` (high).** `e_step_iteration`'s phi natural-gradient
+  block calls `torch.autograd.grad(L, phi_g)`; under `detach_e_step=True`'s blanket
+  `no_grad` the loss `L` had no `grad_fn`, so any forward with `e_phi_lr>0` raised
+  `RuntimeError`. Fixed by wrapping the phi-gradient computation in a
+  `with torch.enable_grad():` island (`vfe3/inference/e_step.py`). `create_graph` is
+  False so `grad_phi` is detached from the outer graph; on the default unrolled path
+  `enable_grad` is a no-op and the crown jewel is unchanged. New tests pin the
+  detach+phi forward/backward (finite loss; priors reach decode only; `phi_embed`
+  frozen) and isolate the phi E-step (output `belief.phi` changes between `e_phi_lr=0`
+  and `>0`, which the grad-mass check alone does not exercise).
+- **`prior_handoff_sigma` unvalidated (medium).** `config.__post_init__` now requires
+  `prior_handoff_sigma in [0,1]` (matching `prior_handoff_rho`), so the sigma handoff
+  stays a convex blend on the SPD cone (a non-convex blend could drive `sigma_p<0`,
+  silently clamped to `eps`).
+- **All-ignore CE -> NaN (medium).** `VFEModel.forward` guards the all-`-100` microbatch:
+  `F.cross_entropy` would return `0/0 = NaN`; we emit a finite, grad-connected
+  `flat_logits.sum()*0.0` instead.
+- **`norm_type_final` dead seam (medium).** Now applied to `mu_final` between the batch
+  stack and decode (mirroring `block.py`'s `norm_type_block`), so the validated config
+  field is no longer inert.
+- **`build_group` call-site coupling (medium).** Dispatches on the builder's positional
+  arity (`inspect.signature`) instead of a `== "block_glk"` string literal, honoring the
+  registry promise that a new group needs no dispatcher edit.
+- **Group not on the module dtype/device contract (medium).** `VFEModel._apply` re-maps
+  `group.generators` through `fn`, so the non-`nn.Module` `GaugeGroup` follows
+  `model.to(...)`.
+
 ### Test results
 
 ```
-143 passed
+150 passed
 ```
 
-143 passed (was 138): +5 (block, stack handoff, model forward, crown jewel, no-NN).
+150 passed (was 138): +5 (block, stack handoff, model forward, crown jewel, no-NN)
++7 review-driven (phi-step isolation, detach+phi finite, handoff_sigma convexity,
+all-ignore finite, build_group arity, group dtype move, norm_type_final wired).
 
 ### Commits
 
@@ -1190,5 +1237,7 @@ config-selected. The model is device-agnostic (no device-less tensors on the pat
 
 True batched E-step kernels (perf; the model currently loops over the batch around
 the unbatched stack); positional phi (BCH); a head mixer; the full-covariance path;
-the final-norm seam (`norm_type_final` is a config field not yet wired into the
-forward); the data loader (7d) and the training loop (7e).
+end-to-end non-float32 (`model.to(float64)` now carries the generators, but the kernel
+path still mixes default-dtype intermediates -- a pre-existing latent gap, out of scope
+here, since the project default is float32); the data loader (7d) and the training loop
+(7e).
