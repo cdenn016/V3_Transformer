@@ -83,4 +83,46 @@ curvature proxy that is ~0 for the flat (Regime I) cocycle and >0 otherwise.
 
 ### Commits
 
-- (this entry) `feat(metrics): diagnostic registry (effective rank, attention entropy, holonomy, F-decomposition)`
+- `feat(metrics): diagnostic registry (effective rank, attention entropy, holonomy, F-decomposition)`
+
+## Visualization (publication quality)
+
+### Files created
+
+- `vfe3/viz/__init__.py` (empty) and `vfe3/viz/figures.py` — `set_publication_style`,
+  `umap_embed`, `plot_embedding`, `clustering_metrics`, `attention_graph`,
+  `plot_attention_graph`, `plot_attention_heatmap`, `plot_covariance_ellipses`,
+  `plot_trajectory`, and a `register_figure`/`get_figure` registry.
+- `tests/test_viz.py` — 8 tests (Agg backend, saved-figure smoke + analytic anchors).
+
+### Changes
+
+Publication-quality figure generators (matplotlib, `Agg` backend; colourblind-safe palette
+and journal defaults via `set_publication_style`). The heavy deps are lazy-imported inside
+the function that needs them (all present here: matplotlib 3.10, umap-learn 0.5, networkx
+3.6, scikit-learn 1.8, seaborn 0.13; plotly absent, matplotlib used instead). `umap_embed`
+gives a 2-D UMAP of belief means / gauge frames; `plot_embedding` scatters it by label;
+`clustering_metrics` reports silhouette + Calinski-Harabasz (semantic-cluster quality);
+`attention_graph`/`plot_attention_graph` build and draw a directed graph from β (networkx
+spring layout, edge width ~ weight); `plot_attention_heatmap`, `plot_covariance_ellipses`
+(1-σ Gaussian ellipses), and `plot_trajectory` (loss / free-energy curve) round out the set.
+A `register_figure` registry lets a new figure slot in by name. Each generator returns a
+Figure and optionally saves it.
+
+### Analytic anchors / smoke
+
+- `clustering_metrics` on two well-separated blobs gives silhouette > 0.5.
+- `umap_embed((30,8)) -> (30,2)`; `attention_graph` has N nodes and no self-loops.
+- Every `plot_*` writes a non-empty PNG; the figure registry resolves by name.
+
+### Test results
+
+```
+182 passed (full suite, consolidated)
+```
+
+8 new tests; viz is additive (new files only), no regressions in the 174 prior.
+
+### Commits
+
+- (this entry) `feat(viz): publication figures (UMAP, attention graph, ellipses, trajectory) + registry`
