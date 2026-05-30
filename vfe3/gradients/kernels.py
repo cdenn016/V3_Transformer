@@ -33,6 +33,29 @@ def has_kernel(name: str) -> bool:
     return name in _KERNELS
 
 
+def _raw_diag_kl(
+    mu_q:    torch.Tensor,             # (N, K) query means
+    sigma_q: torch.Tensor,             # (N, K) query variances
+    mu_p:    torch.Tensor,             # (N, K) prior means
+    sigma_p: torch.Tensor,             # (N, K) prior variances
+
+    *,
+    eps:     float = 1e-6,
+) -> torch.Tensor:                     # (N,) UNCLAMPED KL(q_i || p_i)
+    r"""Unclamped diagonal KL(q||p) = 0.5 Sum_k (s_k/t_k + (mu_p-mu_q)^2/t_k - 1 + log(t_k/s_k)).
+
+    The divergence seam returns the clamped value safe_kl_clamp(D, [0, kl_max]);
+    this returns the raw D so the kernel can reproduce the oracle's saturation
+    mask (the oracle differentiates THROUGH the clamp, whose gradient is 0 once
+    D leaves (0, kl_max)).
+    """
+    sq = sigma_q.clamp(min=eps); sp = sigma_p.clamp(min=eps)
+    trace  = (sq / sp).sum(dim=-1)
+    mahal  = (((mu_p - mu_q) ** 2) / sp).sum(dim=-1)
+    logdet = (torch.log(sp) - torch.log(sq)).sum(dim=-1)
+    return 0.5 * (trace + mahal - mu_q.shape[-1] + logdet)
+
+
 @register_kernel("gaussian_diagonal")
 def _diag_kl_filtering_kernel(
     mu_q:       torch.Tensor,             # (N, K)
@@ -45,21 +68,35 @@ def _diag_kl_filtering_kernel(
     alpha_coef: torch.Tensor,             # (N, 1) or (N, K) self-coupling coefficient
 
     *,
+    kl_max:     float = 100.0,
     eps:        float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Diagonal-KL query-side (filtering) gradient.
 
-      grad_mu_i    = a_i (mu_i - mu_p_i)/sigma_p_i + Sum_j beta_ij (mu_i - mu_t_ij)/sigma_t_ij
-      grad_sigma_i = a_i 0.5(1/sigma_p_i - 1/sigma_q_i)
+      grad_mu_i    = m_i a_i (mu_i - mu_p_i)/sigma_p_i + Sum_j beta_ij (mu_i - mu_t_ij)/sigma_t_ij
+      grad_sigma_i = m_i a_i 0.5(1/sigma_p_i - 1/sigma_q_i)
                      + Sum_j beta_ij 0.5(1/sigma_t_ij - 1/sigma_q_i)
+
+    Self-term saturation mask m_i = 1[0 < D(q_i||p_i) < kl_max]: the oracle
+    differentiates through safe_kl_clamp(D, [0, kl_max]) (divergence.safe_kl_clamp),
+    whose gradient is 0 once the raw self-divergence saturates the clamp, so the
+    hand kernel zeros its self-term there to stay EXACTLY equal to the filtering
+    oracle in every regime. The pairwise term needs no explicit mask: a saturated
+    E_ij drives beta_ij = softmax(-E/tau) -> 0, so its contribution vanishes on
+    both sides. (kl_max is irrelevant once the belief stays inside the trust
+    region; the mask only bites a belief that has drifted past kl_max from its
+    prior, matching the oracle / canonical F.)
     """
     sp = sigma_p.clamp(min=eps); sq = sigma_q.clamp(min=eps); st = sigma_t.clamp(min=eps)
 
-    self_mu  = alpha_coef * (mu_q - mu_p) / sp
+    raw_self = _raw_diag_kl(mu_q, sigma_q, mu_p, sigma_p, eps=eps)              # (N,)
+    self_mask = ((raw_self > 0.0) & (raw_self < kl_max)).to(mu_q.dtype).unsqueeze(-1)
+
+    self_mu  = self_mask * alpha_coef * (mu_q - mu_p) / sp
     pair_mu  = torch.einsum("ij,ijk->ik", beta, (mu_q.unsqueeze(-2) - mu_t) / st)
     grad_mu  = self_mu + pair_mu
 
-    self_sig = alpha_coef * 0.5 * (1.0 / sp - 1.0 / sq)
+    self_sig = self_mask * alpha_coef * 0.5 * (1.0 / sp - 1.0 / sq)
     pair_sig = torch.einsum("ij,ijk->ik", beta, 0.5 * (1.0 / st - 1.0 / sq.unsqueeze(-2)))
     grad_sigma = self_sig + pair_sig
     return grad_mu, grad_sigma
@@ -99,7 +136,7 @@ def belief_gradients(
     if not use_kernel:
         return belief_gradients_autograd(
             mu, sigma, mu_p, sigma_p, omega, tau=tau, alpha_div=alpha_div,
-            kl_max=kl_max, eps=eps, b0=b0, c0=c0,
+            kl_max=kl_max, eps=eps, b0=b0, c0=c0, value=value,
             include_attention_entropy=include_attention_entropy,
             gradient_mode=gradient_mode, family=family, alpha_mode=alpha_mode,
             log_prior=log_prior,
@@ -112,7 +149,7 @@ def belief_gradients(
     energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=1.0, kl_max=kl_max, eps=eps, family=family)
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)
     coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=alpha_mode).unsqueeze(-1)
-    return get_kernel(family)(mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta, coef, eps=eps)
+    return get_kernel(family)(mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta, coef, kl_max=kl_max, eps=eps)
 
 
 def get_kernel(name: str) -> Callable:

@@ -37,6 +37,7 @@ def belief_gradients_autograd(
     eps:          float = 1e-6,
     b0:           float = 1.0,
     c0:           float = 1.0,
+    value:        float = 1.0,
 
     include_attention_entropy: bool = True,
     gradient_mode:             str  = "filtering",
@@ -60,7 +61,7 @@ def belief_gradients_autograd(
     sigma_t = transport_covariance(omega.unsqueeze(0), sigma_k.unsqueeze(0))[0]
 
     sd = self_divergence(mu_q, sigma_q, mu_p, sigma_p, alpha=alpha_div, kl_max=kl_max, eps=eps, family=family)
-    alpha, reg = self_coupling_alpha(sd, mode=alpha_mode, b0=b0, c0=c0)
+    alpha, reg = self_coupling_alpha(sd, mode=alpha_mode, value=value, b0=b0, c0=c0)
     energy = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps, family=family)
     F = free_energy(
         sd, energy, alpha, tau=tau, include_attention_entropy=include_attention_entropy,

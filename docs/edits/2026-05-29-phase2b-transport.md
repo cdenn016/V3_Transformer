@@ -719,3 +719,84 @@ then calls the registered kernel.
 - `docs(edits): 2026-05-29 phase 4 gradients changes log`
 
 Rejected: none.
+
+## Phase 4 review remediation — 2026-05-29 (expert-review pass)
+
+Confirmed expert-review findings on the Phase 4 gradient layer, fixed without
+weakening any oracle/FD/analytic anchor.
+
+### `value` (constant-α weight) honored on every path
+
+The constant-α weight `value` was honored on the kernel path but silently dropped
+on every oracle fallback (smoothing, non-KL Rényi, full-covariance), and the oracle
+could not represent it at all — two callers with identical `(mu, …, value)` got
+different self-coupling gradients depending only on the dispatch branch, and the
+kernel's `value ≠ 1` output was unfalsifiable against its declared source of truth.
+
+- `vfe3/gradients/oracle.py` — added `value: float = 1.0` to
+  `belief_gradients_autograd` and forwarded it: `self_coupling_alpha(sd,
+  mode=alpha_mode, value=value, b0=b0, c0=c0)`. For constant α this scales the
+  self-term by `value`; the state-dependent forms absorb a stray `value` via
+  `**kwargs`.
+- `vfe3/gradients/kernels.py` — the fallback call now forwards `value=value`.
+- `vfe3/alpha_i.py` — `alpha_gradient_coefficient` no longer re-derives the α*
+  formula; it returns the α leg of the SAME registered form the oracle uses,
+  `self_coupling_alpha(kl, mode=mode, value=value, b0=b0, c0=c0)[0]` (constant →
+  value, state-dependent → `c0/(b0 + D)`). This removes the divergent-change /
+  shotgun-surgery duplication (the formula appeared twice with two different clamp
+  literals) and makes the envelope-cancellation (kernel coefficient == oracle α) a
+  structural identity. An unknown mode now raises `KeyError` via `get_alpha`
+  (previously `ValueError`).
+- Test: `test_constant_value_honored_on_kernel_and_oracle_fallback` pins `value=3`
+  on the kernel path AND the smoothing fallback, both against the oracle at `value=3`.
+
+### Kernel honors `safe_kl_clamp` saturation (kernel == filtering oracle in EVERY regime)
+
+The oracle differentiates through `safe_kl_clamp(D, [0, kl_max])`, whose gradient is
+0 once the raw self-divergence saturates the clamp; the kernel computed the analytic
+unclamped gradient, so the contract "hand kernel == filtering oracle exactly" broke
+on the SELF term whenever `D(q_i‖p_i)` left `(0, kl_max)` (the pairwise term is
+self-masking: a saturated `E_ij` drives `β_ij → 0`). Empirically the two diverged
+completely there (e.g. `μ_p = 20`: kernel `[-20, -20]` vs oracle `[0, 0]`).
+
+- `vfe3/gradients/kernels.py` — added `_raw_diag_kl` (the UNCLAMPED diagonal KL) and
+  a self-term saturation mask `m_i = 1[0 < D(q_i‖p_i) < kl_max]` applied to the self
+  μ- and σ-terms, so the kernel reproduces the oracle's clamp gradient exactly. The
+  kernel gained a `kl_max` argument (threaded from `belief_gradients`). This makes
+  `kernel == filtering-oracle` hold by construction in the saturated regime too
+  (strengthening, not weakening, the authoritative equality).
+- Test: `test_kernel_honors_clamp_saturation_self_term` (mean-driven and
+  variance-driven saturation, kernel pinned to the oracle).
+
+### `state_dependent_per_coord` docstring (silent per-position degeneration)
+
+`free_energy.self_divergence` sums over the coordinate axis and returns per-position
+`(…, N)`; fed that, `state_dependent_per_coord` silently emits per-position α, not the
+advertised per-coordinate `α^(k)`. No shipped pipeline supplies an unsummed `(…, N, K)`
+self-divergence. Documented in `vfe3/alpha_i.py` that the per-coordinate path is a
+DEFERRED extension point (a per-coordinate divergence variant must be registered and
+routed before this mode realizes per-coordinate α); no behavior change.
+
+### Smoothing positive anchor (the pure-path correctness anchor)
+
+The smoothing branch (the full `∂F_red`, the entire payoff of the query/key/full
+distinction) had only negative `not allclose` guards; a flipped/mis-scaled/missing
+key-side `Ωᵀ` pullback would still ship green.
+
+- Test: `test_smoothing_oracle_matches_finite_difference_of_F_full` builds `F` with a
+  SINGLE shared leaf (keys = the live belief, so the column role moves under FD),
+  central-differences it, and asserts the smoothing oracle matches (atol/rtol 2e-3,
+  FD truncation level). This positive anchor is what makes `kernel ≠ smoothing`
+  meaningful.
+
+### Test results
+
+```
+113 passed
+```
+
+3 new tests (1 `test_gradients_oracle.py` + 2 `test_gradients_kernels.py`); no
+regressions.
+
+Rejected: none confirmed beyond the above (the four `value`-knob findings and the two
+smoothing-anchor findings were duplicate reports of two underlying defects).

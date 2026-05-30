@@ -59,3 +59,37 @@ def test_smoothing_differs_from_filtering_by_keyside():
                                          tau=1.5, gradient_mode="smoothing")
     # the key-side (column) term is non-zero -> the two modes differ
     assert not torch.allclose(gf_mu, gs_mu, atol=1e-4)
+
+
+def _F_full(mu_q, sigma_q, mu_p, sigma_p, omega, tau):
+    # F as a function of a SINGLE shared leaf: the transported keys are rebuilt
+    # from the SAME live (mu_q, sigma_q) on every FD perturbation, so the column
+    # (key-side) role moves too -> a finite difference of this F measures the FULL
+    # d F_red (the smoothing gradient), the Omega^T pullback included.
+    from vfe3.free_energy import free_energy, pairwise_energy, self_divergence
+    from vfe3.geometry.transport import transport_covariance, transport_mean
+    mu_t = transport_mean(omega.unsqueeze(0), mu_q.unsqueeze(0))[0]
+    sigma_t = transport_covariance(omega.unsqueeze(0), sigma_q.unsqueeze(0))[0]
+    sd = self_divergence(mu_q, sigma_q, mu_p, sigma_p)
+    energy = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t)
+    alpha = torch.ones(mu_q.shape[0])
+    return free_energy(sd, energy, alpha, tau=tau, include_attention_entropy=True)
+
+
+def test_smoothing_oracle_matches_finite_difference_of_F_full():
+    # POSITIVE anchor for the pure path: smoothing == FD(full F). Pins the key-side
+    # Omega^T pullback's sign and scale (a flipped/mis-scaled/missing key-side would
+    # fail here, where `smoothing != filtering` alone would still pass).
+    mu, sigma, mu_p, sigma_p, omega = _setup()
+    tau = 1.5
+    gmu, _ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega,
+                                       tau=tau, gradient_mode="smoothing")
+    eps = 1e-3
+    gmu_fd = torch.zeros_like(mu)
+    for a in range(mu.shape[0]):
+        for b in range(mu.shape[1]):
+            d = torch.zeros_like(mu); d[a, b] = eps
+            fp = _F_full(mu + d, sigma, mu_p, sigma_p, omega, tau)
+            fm = _F_full(mu - d, sigma, mu_p, sigma_p, omega, tau)
+            gmu_fd[a, b] = (fp - fm) / (2 * eps)
+    assert torch.allclose(gmu, gmu_fd, atol=2e-3, rtol=2e-3)

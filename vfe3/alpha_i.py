@@ -71,6 +71,7 @@ def alpha_state_dependent(
 @register_alpha("state_dependent_per_coord")
 def alpha_state_dependent_per_coord(
     kl:    torch.Tensor,             # (..., N, K) per-coordinate self-divergence
+                                     # (NOT (..., N): see the deferred-path note)
 
     *,
     b0:    'float | torch.Tensor' = 1.0,   # scalar or (K,)
@@ -78,7 +79,17 @@ def alpha_state_dependent_per_coord(
     eps:   float = 1e-12,
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Per-coordinate alpha^(k)* = c0^(k)/(b0^(k) + D^(k)); R summed by caller."""
+    r"""Per-coordinate alpha^(k)* = c0^(k)/(b0^(k) + D^(k)); R summed by caller.
+
+    The formula is exact for an UNSUMMED per-coordinate self-divergence of shape
+    (..., N, K). The shipped self_divergence (free_energy.self_divergence) sums
+    over the coordinate axis and returns per-position (..., N); fed that, this
+    form silently broadcasts to per-position alpha (one alpha per token), NOT the
+    per-coordinate alpha^(k) advertised. A per-coordinate (unsummed) divergence
+    variant that realizes this mode is a DEFERRED extension point; until it is
+    registered and routed here, prefer `state_dependent` (per-position) for the
+    summed D the current pipeline supplies.
+    """
     alpha = c0 / (b0 + kl).clamp(min=eps)
     return alpha, alpha_regularizer(alpha, b0=b0, c0=c0)
 
@@ -99,12 +110,14 @@ def alpha_gradient_coefficient(
     because alpha + alpha'(D + b0 - c0/alpha) and the bracket vanishes at alpha*.
     So no product-rule correction is needed (R must be present in F). Constant
     mode returns ``value``.
+
+    The coefficient is the alpha leg of the SAME registered form used by the
+    oracle (``self_coupling_alpha``), not a re-derived copy: constant -> value,
+    state-dependent -> alpha* = c0/(b0 + D). Sharing the one formula makes the
+    envelope-cancellation (kernel coefficient == oracle alpha) a structural
+    identity rather than a maintained coincidence.
     """
-    if mode == "constant":
-        return torch.full_like(kl, value)
-    if mode in ("state_dependent", "state_dependent_per_coord"):
-        return c0 / (b0 + kl).clamp(min=1e-12)
-    raise ValueError(f"unknown alpha mode {mode!r}")
+    return self_coupling_alpha(kl, mode=mode, value=value, b0=b0, c0=c0)[0]
 
 
 def self_coupling_alpha(
