@@ -5,26 +5,26 @@ runs the iterative E-step (Phase 6) and an optional gauge-equivariant norm on th
 mean. The belief handoff across blocks lives in stack.py.
 """
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup
-from vfe3.geometry.norms import get_norm
 from vfe3.inference.e_step import e_step
 
 
 def vfe_block(
-    belief:    BeliefState,
-    mu_p:      torch.Tensor,             # (N, K) prior means
-    sigma_p:   torch.Tensor,             # (N, K) prior variances
-    group:     GaugeGroup,
-    cfg:       VFE3Config,
+    belief:     BeliefState,
+    mu_p:       torch.Tensor,             # (N, K) prior means
+    sigma_p:    torch.Tensor,             # (N, K) prior variances
+    group:      GaugeGroup,
+    cfg:        VFE3Config,
 
     *,
-    log_prior: Optional[torch.Tensor] = None,
+    log_prior:  Optional[torch.Tensor] = None,
+    block_norm: Optional[Any]          = None,   # cached norm instance (None -> no block norm)
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm."""
     out = e_step(
@@ -38,7 +38,6 @@ def vfe_block(
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
         log_prior=log_prior,
     )
-    if cfg.norm_type_block != "none":
-        norm = get_norm(cfg.norm_type_block)(cfg.embed_dim, eps=cfg.eps)
-        out = BeliefState(mu=norm(out.mu, out.sigma), sigma=out.sigma, phi=out.phi)
+    if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
+        out = BeliefState(mu=block_norm(out.mu, out.sigma), sigma=out.sigma, phi=out.phi)
     return out

@@ -5,7 +5,7 @@ mu_p_next = (1 - rho) mu_p + rho mu_q (rho = prior_handoff_rho); sigma_p frozen 
 embedding by default; phi flows through the belief, not the prior.
 """
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -16,20 +16,21 @@ from vfe3.model.block import vfe_block
 
 
 def vfe_stack(
-    belief:    BeliefState,
-    mu_p:      torch.Tensor,             # (N, K) initial prior means
-    sigma_p:   torch.Tensor,             # (N, K) initial prior variances
-    group:     GaugeGroup,
-    cfg:       VFE3Config,
+    belief:     BeliefState,
+    mu_p:       torch.Tensor,             # (N, K) initial prior means
+    sigma_p:    torch.Tensor,             # (N, K) initial prior variances
+    group:      GaugeGroup,
+    cfg:        VFE3Config,
 
     *,
-    log_prior: Optional[torch.Tensor] = None,
+    log_prior:  Optional[torch.Tensor] = None,
+    block_norm: Optional[Any]          = None,   # cached norm instance (None -> no block norm)
 ) -> BeliefState:
     r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior."""
     rho = cfg.prior_handoff_rho
     rho_s = cfg.prior_handoff_sigma
     for _ in range(cfg.n_layers):
-        belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior)
+        belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior, block_norm=block_norm)
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
     return belief

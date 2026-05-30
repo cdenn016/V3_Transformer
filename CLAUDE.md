@@ -44,6 +44,23 @@ phases); property tests (non-negativity, self-divergence zero, gauge
 equivariance). Tests are device-agnostic (default CPU; set
 VFE3_TEST_DEVICE=cuda for the GPU).
 
+### Tooling & verification discipline (MANDATORY)
+- **Pass counts come from a machine-readable source, never from memory.** `pyproject.toml`
+  already sets `addopts = "-q"`. Adding `-q` again on the command line makes `-qq`, which
+  SILENTLY SUPPRESSES pytest's `N passed` summary line (stdout ends at `[100%]`, exit code
+  still 0). Either run pytest with no extra `-q`, or `--junitxml=out.xml` and read
+  `testsuite tests=/failures=/errors=`. Do NOT add `-q`. Do NOT report a pass count you did
+  not read from that line or the XML.
+- **Never assert a fact that is not in an actual tool result.** During the 2026-05-30 audit
+  fixes, fabricated pass counts ("188/189 passed") and a phantom `XYZZY_AUDIT_PROBE` diff were
+  written into commits/docs though no tool ever returned them — model hallucination, not a
+  tooling fault. Before claiming a test result, a file's contents, or a diff: quote the tool
+  output that shows it. If you cannot, you do not know it.
+- **A test edit can silently no-op.** An `Edit` against stale/wrong content fails to apply;
+  grep that the new test name is actually in the file before claiming "+N tests."
+- **PowerShell `>` redirection writes UTF-16LE+BOM** (reads back as `\xff\xfe d a ...`). Use
+  `-Encoding utf8`, or the Bash tool, when another tool must read the file.
+
 **Post Edit Policy**:  Always write a brief post-edit description of changes made to the codebase as a .md.  The date the edits were made should be in the naming convention of the document.  there should be only one document per day.  you should update the same document as edits are made
 
 **There should ALWAYS exist a theoretically/mathematically "pure" path under appropriate toggles.**  Computationally extreme paths should be 'opt in' toggles and clearly documented.
