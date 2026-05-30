@@ -155,9 +155,12 @@ class VFE3Config:
         _require(self.decode_mode, _VALID_DECODE_MODES, "decode_mode")
         _require(self.encode_mode, _VALID_ENCODE_MODES, "encode_mode")
 
-        # handoff
+        # handoff (both blends must be convex so the prior stays on the SPD cone:
+        # sigma_p_next = (1-rho_s) sigma_p + rho_s sigma_q stays > 0 iff rho_s in [0,1])
         if not (0.0 <= self.prior_handoff_rho <= 1.0):
             raise ValueError(f"prior_handoff_rho must be in [0,1], got {self.prior_handoff_rho}")
+        if not (0.0 <= self.prior_handoff_sigma <= 1.0):
+            raise ValueError(f"prior_handoff_sigma must be in [0,1], got {self.prior_handoff_sigma}")
 
         # normalization
         _require(self.norm_type_block, _VALID_NORMS, "norm_type_block")
