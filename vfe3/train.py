@@ -9,7 +9,7 @@ so a gradient step on the priors improves inference end to end. Click-to-run: ed
 """
 
 import math
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 
@@ -87,7 +87,7 @@ def train_step(
 
 def train(
     model:  VFEModel,
-    loader,
+    loader: Iterable[Tuple[torch.Tensor, torch.Tensor]],   # yields (tokens, targets) batches
     cfg:    VFE3Config,
 
     *,

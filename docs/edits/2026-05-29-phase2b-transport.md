@@ -1342,3 +1342,61 @@ Observed curve (every 5 steps): `10.825, 10.777, 10.457, 9.874, 9.559, 9.116, 8.
 
 - `f8c657d feat(train): AdamW per-group LRs + warmup/cosine schedule`
 - `3ae5ceb feat(train): train loop + cutover (loss decreases on structured + real tokens)`
+
+## Phase 7e review fixes — 2026-05-30 (cutover discrimination hardening)
+
+### Context
+
+A review of the shipped Phase 7e raised that the structured cutover assertion
+`loss[-1] < 0.6*loss[0]` does not robustly certify LEARNING, only "ended just under the
+unigram marginal in-sample". The bar is coupled to the `ln(vocab)` init magnitude, not to
+the learning target: `0.6*ln(6) = 1.0752` sits only ~0.024 nats below the active-alphabet
+marginal entropy `ln(3) = 1.0986`. Controls (re-run here) confirm the concern: an
+UNLEARNABLE iid random stream over the same 3 active tokens (irreducible floor `ln(3)`,
+no next-token structure) ends at ratio 0.60-0.62 across a 12-seed sweep (end-loss
+1.078-1.117) -- bisected from the structured population (ratio 0.569-0.577, end-loss
+1.019-1.034) by the 0.60 bar with razor-thin margin. The discriminator is the absolute
+floor `ln(3)`, not a fraction of the init magnitude.
+
+The fix STRENGTHENS the gate (never weakens it): the assertions now require the model to
+BEAT the marginal-entropy floor, and a negative control proves an unlearnable stream does
+not. The model and training code are unchanged; only the test assertions/framing and one
+type annotation changed -- so the observed loss curves above are unchanged.
+
+### Changes
+
+- **Structured cutover (load-bearing).** Replaced the lone `loss[-1] < 0.6*loss[0]` ratio
+  with an absolute marginal-entropy anchor: the MEDIAN end-loss over 3 seeds must clear
+  `ln(3) - 0.05 = 1.0486`. The median-of-3 (so a single unlucky `phi` init cannot flip the
+  gate) is warranted by the documented seed-spread (end-loss 1.019-1.034, ~0.015 wide,
+  comparable to the worst-seed headroom of a single-seed assertion). The `0.6*loss[0]`
+  readout is kept as a documented SECONDARY check on seed 0. Measured: median end-loss
+  1.0224 (seeds 0/1/2 end 1.0200/1.0258/1.0224), headroom 0.026 below the anchor.
+- **Negative control (new test).** `test_random_stream_does_not_clear_cutover_anchor`:
+  the same model/config on an iid random(3) stream (data_seed 101) must NOT clear
+  `ln(3) - 0.05`. Verified end-loss ~1.117 (ratio 0.623), robustly ABOVE the anchor. This
+  documents that the structured anchor certifies STRUCTURE learning, not noise-fitting --
+  and removes the need for a held-out split (the random control floor sits above the anchor,
+  so in-sample noise-fitting alone cannot clear it).
+- **Real wikitext-2 smoke (framing).** Assertion unchanged (`finite` + `loss[-1] < loss[0]
+  - 0.05`); the docstring is corrected to state honestly that this is a numerics/wiring
+  SMOKE, not a structure-learning proof: the same config on the SAME tokens randomly
+  PERMUTED (sequential structure destroyed) still drops ~1.75 nats past the bar (start
+  10.825 -> end 9.07), because the uniform-init -> unigram-entropy move is achievable by
+  marginal learning alone. The structured period-3 anchor remains the learnability gate.
+- **Type hint.** Annotated the previously-bare `loader` parameter in `train()` as
+  `Iterable[Tuple[torch.Tensor, torch.Tensor]]` (added `Iterable` to the `typing` import)
+  and re-aligned the `model`/`loader`/`cfg` column, per the MANDATORY signature convention.
+
+### Test results
+
+```
+160 passed
+```
+
+5 train tests (was 4; +1 negative control); no regressions in the 155 prior.
+
+### Commits
+
+- review-fix commit recorded at apply time (structured cutover anchor + negative control;
+  wikitext smoke framing; `train()` loader type hint).
