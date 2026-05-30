@@ -57,3 +57,84 @@ def lr_lambda(
         return step / max(1, cfg.warmup_steps)
     progress = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
     return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+
+def train_step(
+    model:     VFEModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    tokens:    torch.Tensor,             # (B, N) input token ids
+    targets:   torch.Tensor,             # (B, N) next-token ids (-100 = ignore)
+
+    *,
+    grad_clip: float = 1.0,
+) -> float:
+    r"""One M-step on the cross-entropy of a batch; returns the loss scalar.
+
+    Zeroes the prior-table gradients, runs the forward (encode -> unrolled E-step ->
+    decode -> CE), backpropagates the loss through inference to the prior tables, clips
+    the global gradient norm to ``grad_clip``, then takes one AdamW + scheduler step.
+    """
+    optimizer.zero_grad(set_to_none=True)
+    _, loss, _ = model(tokens, targets)
+    loss.backward()
+    if grad_clip is not None and grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+    scheduler.step()
+    return float(loss.detach())
+
+
+def train(
+    model:  VFEModel,
+    loader,
+    cfg:    VFE3Config,
+
+    *,
+    n_steps:   int   = 100,
+    grad_clip: float = 1.0,
+) -> List[float]:
+    r"""Train ``n_steps`` M-step iterations (cycling the loader); return the loss history.
+
+    Builds the per-group AdamW optimizer and the warmup/cosine ``LambdaLR``, then takes
+    ``n_steps`` gradient steps, re-iterating the loader when it is exhausted. The loss
+    history is the per-step cross-entropy; the cutover criterion is that it decreases.
+    """
+    optimizer = build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: lr_lambda(s, cfg))
+    losses: List[float] = []
+    model.train()
+    it = iter(loader)
+    for _ in range(n_steps):
+        try:
+            tokens, targets = next(it)
+        except StopIteration:
+            it = iter(loader)
+            tokens, targets = next(it)
+        tokens = tokens.to(model.prior_bank.mu_embed.device)
+        targets = targets.to(model.prior_bank.mu_embed.device)
+        losses.append(train_step(model, optimizer, scheduler, tokens, targets, grad_clip=grad_clip))
+    return losses
+
+
+def run_training(
+    cfg:     VFE3Config,
+    dataset: str = "wikitext-2",
+    split:   str = "train",
+
+    *,
+    n_steps:    int           = 1000,
+    max_tokens: Optional[int] = None,
+) -> Tuple[VFEModel, List[float]]:
+    r"""Click-to-run entry: build a model + a cached dataloader by name and train (no CLI).
+
+    Constructs a ``VFEModel`` from ``cfg``, a causal-LM dataloader from the tokenized
+    cache for ``dataset``/``split`` (capped at ``max_tokens`` for fast runs), and trains
+    for ``n_steps`` M-steps. Returns the trained model and its loss history.
+    """
+    from vfe3.data.datasets import make_dataloader
+
+    model = VFEModel(cfg)
+    loader = make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size, max_tokens=max_tokens)
+    losses = train(model, loader, cfg, n_steps=n_steps)
+    return model, losses
