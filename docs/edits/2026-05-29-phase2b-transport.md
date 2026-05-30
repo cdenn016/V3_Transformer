@@ -800,3 +800,81 @@ regressions.
 
 Rejected: none confirmed beyond the above (the four `value`-knob findings and the two
 smoothing-anchor findings were duplicate reports of two underlying defects).
+
+---
+
+## Phase 6 E-step — 2026-05-29 (continuation)
+
+The iterative belief-update loop, wiring the free energy (Phase 3), the gradient layer
+(Phase 4), and the geometry retraction/preconditioner (Phases 2c–2e) into one descent on
+F over the Gaussian belief `(mu, sigma, phi)`.
+
+### Files created
+
+- `vfe3/belief.py` — `BeliefState(mu, sigma, phi)` NamedTuple.
+- `vfe3/inference/__init__.py` (empty) and `vfe3/inference/e_step.py` — `free_energy_value`,
+  `phi_alignment_loss`, `e_step_iteration`, `e_step`.
+- `tests/test_e_step.py` — 11 tests.
+
+### Changes
+
+**`free_energy_value(belief, mu_p, sigma_p, group, *, keys, …)`** — scalar F of a belief.
+`keys=None` gives global F (keys = the belief); a passed `keys` transports the second KL
+argument from that frozen belief while the self/query role uses `belief` — the `F_filt`
+objective. The two coincide numerically at a fixed point (detach changes gradients, not the
+value); they differ only as functions under a step.
+
+**`phi_alignment_loss(mu, sigma, phi, group, …)`** — the canonical belief-coupling block
+`Sum_ij[beta_ij E_ij + tau beta_ij log(beta_ij/pi_ij)]` as a function of phi (mu, sigma
+fixed). Both roles of phi flow (`Omega_ij` depends on `phi_i` and `phi_j`); autograd gives
+the envelope phi-gradient.
+
+**`e_step_iteration(belief, mu_p, sigma_p, group, *, e_mu_lr, e_sigma_lr, e_phi_lr, …)`** —
+one inner iteration (all positions parallel, updates sequential): transport `Omega(phi)` ->
+`gradients.belief_gradients` (the Phase-4 envelope kernel for filtering+diagonal+KL+canonical,
+else the autograd oracle — NOT a hand-rolled `dbeta/dmu` form) -> Fisher `natural_gradient`
+-> `mu <- mu - e_mu_lr nat_mu` (Euclidean) + `sigma <- retract_spd_diagonal(sigma, -e_sigma_lr
+nat_sigma)` (SPD) -> phi: `autograd(phi_alignment_loss)` at the updated `(mu,sigma)` ->
+`precondition_phi_gradient` -> `retract_phi`. Decoupled learning rates + `e_sigma_q_trust`.
+
+**`e_step(…, n_iter, return_trajectory)`** — iterates `e_step_iteration`; optionally returns
+the global-F trajectory (a DIAGNOSTIC; parallel mean-field updates are not guaranteed monotone
+per iteration — Jordan 1999, Beal 2003).
+
+### Descent objective per gradient mode (the crux)
+
+The belief-coupling term makes each token both a query (row) and a transported key (column),
+so the true `dF/dq` is query-side + key-side. The default `filtering` (query-side, mean-field)
+gradient descends **`F_filt`** — F with the keys frozen at their pre-step values — NOT global F
+(updating a belief moves F through its key columns too, an omitted term). The `smoothing`
+(full) gradient descends **global F**. The phi-step (beliefs frozen) descends **global F** (its
+alignment loss is the full coupling block). A parallel filtering update is NOT monotone in
+global F per iteration; the trajectory is a diagnostic, never asserted.
+
+### Analytic anchors (independent of the implementation)
+
+- `F_filt(belief_after) < F_filt(belief_before)` for a tiny filtering step (same frozen keys
+  before/after); `F(after) < F(before)` for a tiny smoothing step and for a tiny phi step
+  (beliefs frozen) — all with the trust region / sigma-clamp inactive.
+- `sigma > 0` preserved across iterations; decoupled LRs freeze their components
+  (`e_phi_lr=0` -> phi fixed; `e_mu_lr=0` -> mu fixed); the smoothing loop decreases F overall;
+  deterministic fixed-seed checksum.
+
+### Test results
+
+```
+124 passed
+```
+
+11 new tests in `tests/test_e_step.py` (3 BeliefState/free-energy + 2 iteration invariants +
+3 descent directions + 3 loop/regression); no regressions in the 113 prior.
+
+### Commits
+
+- `5046c66 docs(plan): phase 3, 4, 6 implementation plans`
+- `86fe285 chore: gitignore pytest/junit test artifacts`
+- `6534432 feat(inference): BeliefState + free_energy_value (global / keys-frozen F_filt)`
+- `d5d5c44 feat(inference): e_step_iteration + phi_alignment_loss + e_step loop`
+
+Note: the Phase 6 workflow's implement agent failed to emit its structured handoff after Task
+1; Tasks 2–5 were completed directly (same plan, tests green) and committed by hand.
