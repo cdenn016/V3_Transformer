@@ -1007,3 +1007,103 @@ error ~1e-6).
 `decode_mode='full'` (exact Cholesky full-covariance KL); `encode_mode='gauge_fixed'`
 (gauge orbit from a shared base belief); positional φ (BCH); the block/stack/model
 assembly (Phase 7c).
+
+## Phase 7b review fixes — 2026-05-29 (continuation)
+
+Expert review of the committed Phase 7b raised four confirmed defects (all
+reproduced before fixing); the divergence-agnostic / no-NN / gauge-invariance
+contracts are preserved, not weakened.
+
+### 1. Decode clamp asymmetry (the double-pin held only for KL < 100)
+
+The original `reference_decode` and the test reference called `divergence.kl`
+with the default `kl_max=100`, which clamps every distant prior to `KL=100` and
+flattens its logit to a single `-100` — destroying the ranking a decode exists to
+produce. The fused `_decode_diagonal` never clamped. So for any `(q, pi_v)` with
+true `KL > 100` the two paths diverged without bound and BOTH the exact pin
+(atol 1e-3) and the shift-invariant `log_softmax` pin (atol 1e-4) broke, and the
+two paths predicted DIFFERENT tokens (clamped reference uniform over V; fused
+sharply peaked). Reproduced: tight priors `sigma_v=exp(-4)`, `mu_q=5`,
+`max|fused-ref| ~ 3.5e3`, argmax disagreed.
+
+Fix (the clamp is wrong for a DECODE, not the kernel): `reference_decode` now
+calls `kl(..., kl_max=inf)`, so the seam computes the same unclamped `-KL/tau_eff`
+the fused kernel already produces. Both paths now agree across the WHOLE input
+domain. `safe_kl_clamp`'s `nan_to_num` still maps degenerate NaN/+inf pairs to
++inf → -inf logits. New regression `test_decode_matches_seam_in_large_kl_regime`
+forces `KL > 100` and asserts both pins plus argmax agreement.
+
+### 2. Catastrophic float32 cancellation in the fused matmul
+
+The fused kernel reconstructed `(mu_q-mu_v)^2` as `mu_q^2 - 2 mu_q mu_v + mu_v^2`
+via the matmul — a subtraction of large near-equal quantities that cancels in
+float32 once the means carry a large common offset (error ~ eps·mu²/sigma_v).
+Reproduced: at mean offset ~100 (KL still ~0.07, far below any clamp) the
+fused-vs-seam error was ~3.96e-3, exceeding the atol-1e-3 pin; tight `sigma_v`
+worsened it at modest `mu`; at offset 1000 the error reached ~0.27. The seam
+(direct `mu_t - mu_q`) stayed ~1e-7 throughout. This also makes the GPU TF32 path
+(10-bit mantissa) catastrophic at far smaller magnitudes.
+
+Fix (exact, keeps the single fused matmul): subtract a v-independent shift
+`c = mean_v(mu_v)` (per dim) from both means before the matmul. Since
+`(mu_q-c) - (mu_v-c) == mu_q-mu_v` the closed form is unchanged exactly, but the
+matmul never sees the large magnitudes, so the cancelled spread collapses to the
+residual. Error now ~1e-7 even at offset 1e4 and tight `sigma_v`, and identical
+across `matmul_precision in {highest, high, medium}` (so the TF32 concern is
+addressed intrinsically — no global `allow_tf32` side effect needed). New
+regression `test_decode_exact_at_large_mean_offset` (means clustered at 1000).
+
+### 3. Flaky / unseeded gauge-invariance test
+
+`test_mahalanobis_is_gauge_invariant_scale` drew an unseeded `g = randn + 2I`
+and asserted atol 1e-4. `Sigma_g = g g^T` has `kappa(Sigma_g) = kappa(g)^2`, so the
+full-cov solve amplified fp32 roundoff by that factor; over 5000 unseeded trials
+~1.3% exceeded atol 1e-4 (worst residual ~0.09). Not a math failure — fp32
+conditioning. Fix: seed per suite convention (`torch.Generator().manual_seed`) and
+reject draws with `kappa(g) >= 10`, keeping the gauge-invariance assertion a clean
+atol-1e-4 check. The two previously-unseeded decode tests are now seeded too.
+
+### 4. MahalanobisNorm full-cov solve had no `eps*I` regularization (hard crash)
+
+`torch.linalg.solve(sigma, ...)` on a singular/near-singular `Sigma` RAISED
+`torch._C._LinAlgError` and crashed the forward pass (3 crashes in 100k random
+gauge draws), unlike its diagonal sibling and `divergence._gaussian_full_renyi`,
+which both regularize. Fix: `sigma_reg = sigma + eps*I` before the solve (matching
+the divergence kernel), bounding the conditioning the solve sees and removing the
+crash; verified finite output on a directly-singular `Sigma`.
+
+### Rejected / no-change
+
+- "Default decode is not divergence-agnostic on the hot path" — the fused
+  `diagonal` kernel is, by sanctioned design (plan §Design-decisions 1), a
+  hand-specialized alpha=1 `gaussian_diagonal` shortcut PINNED to the seam, not a
+  re-derivation; `reference_decode` is the literal seam path. Clarified the module
+  docstring to state the contract scope (registry honored at family granularity; a
+  new covariance structure registers a new decode kernel) rather than changing the
+  pinned hot path.
+- "Diagonal KL implemented twice (DRY)" — the two forms are intentional: the slow
+  general seam (`divergence`) and the fast pinned closed form (`decode`), guarded by
+  the double pin. With the clamp policy now unified (`kl_max=inf` for decode) they
+  agree across the domain; factoring would couple the seam's saturation policy onto
+  the decode, which is exactly what the decode must not inherit.
+
+### Test results
+
+```
+138 passed
+```
+
+138 passed (was 136): +2 regression tests covering the large-KL clamp regime and
+the large-mean-offset cancellation regime that the original tests never exercised.
+The decode double pin now holds UNCONDITIONALLY (unclamped both sides; mean-centered
+matmul) rather than only for KL < 100 with small means.
+
+### Commits
+
+- (this continuation) `fix(model): decode double-pin holds for all KL (unclamped seam) + cancellation-free matmul; MahalanobisNorm eps*I + seeded gauge test`
+
+### Deferred (unchanged)
+
+`decode_mode='full'` (exact Cholesky full-covariance KL); `encode_mode='gauge_fixed'`
+(gauge orbit from a shared base belief); positional φ (BCH); the block/stack/model
+assembly (Phase 7c).

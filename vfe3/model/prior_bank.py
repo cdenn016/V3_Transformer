@@ -12,6 +12,16 @@ Modularity:
         named stub (gauge orbit from a shared base belief).
     decode_mode registry -- ``diagonal`` (fused closed form, default); ``full`` a named
         stub (exact Cholesky for full covariances).
+
+Divergence-agnostic, scope clarified: ``reference_decode`` is the literal seam path --
+it calls ``divergence.kl`` and so tracks whatever divergence family/alpha the seam is
+configured for. The default fused ``diagonal`` kernel is a hand-specialized alpha=1
+``gaussian_diagonal`` shortcut (one matmul, no per-V ``kl`` call) that is pinned EXACTLY
+to that seam (and under ``log_softmax``); it does not re-derive itself for a different
+family. The registry seam is therefore honored at the family granularity: a new
+COVARIANCE STRUCTURE (e.g. full-covariance) is added by writing-and-registering a new
+decode kernel (the ``full`` stub), never by editing a call site -- and ``reference_decode``
+already covers any registered divergence for verification.
 """
 
 from typing import Callable, Dict, Optional
@@ -146,13 +156,21 @@ class PriorBank(nn.Module):
         Broadcasts the ``divergence.kl`` seam over the vocabulary V (general but slow,
         O(B*N*V*K)). The fused ``diagonal`` kernel is pinned to this exactly and under
         log-softmax; a new divergence family needs no decode edit (only the seam call).
+
+        The seam is invoked with ``kl_max=inf``: a DECODE must preserve the full KL
+        ranking over the vocabulary, so the divergence saturation policy (default
+        ``kl_max=100``, which flattens every distant prior to a single -100 logit and
+        destroys the argmax) is disabled here. The fused kernel computes the unclamped
+        -KL/tau_eff, so both decode paths agree across the whole input domain, not only
+        where KL < 100. (``nan_to_num`` inside ``safe_kl_clamp`` still maps NaN/+inf
+        from degenerate pairs to +inf -> -inf logits.)
         """
         tau_eff = self._tau_eff(tau)
         mu_v = self.mu_embed                                             # (V, K)
         sigma_v = torch.exp(self.sigma_log_embed).clamp(min=self.eps)    # (V, K)
         mu_q_b = mu_q.unsqueeze(-2)                                      # (B, N, 1, K)
         sigma_q_b = sigma_q.unsqueeze(-2)                               # (B, N, 1, K)
-        kl_v = kl(mu_q_b, sigma_q_b, mu_v, sigma_v)                      # (B, N, V) via broadcast
+        kl_v = kl(mu_q_b, sigma_q_b, mu_v, sigma_v, kl_max=float("inf"))  # (B, N, V), unclamped
         return -kl_v / tau_eff
 
 
@@ -195,23 +213,37 @@ def _decode_diagonal(
 
         KL = 0.5[ sum_k(sigma_q/sigma_v + (mu_q-mu_v)^2/sigma_v) - K + sum_k log(sigma_v/sigma_q) ]
     The v-dependent part A_v expands the Mahalanobis/trace terms into one matmul:
-        lhs = [sigma_q + mu_q^2, -2 mu_q]            (B, N, 2K)
-        rhs = [1/sigma_v,        mu_v/sigma_v]       (V, 2K)
-        A_v = lhs @ rhs^T + sum_k(mu_v^2/sigma_v + log sigma_v)
-            == sum_k(sigma_q/sigma_v + (mu_q-mu_v)^2/sigma_v) + sum_k log sigma_v
+        lhs = [sigma_q + mc_q^2, -2 mc_q]            (B, N, 2K)
+        rhs = [1/sigma_v,        mc_v/sigma_v]       (V, 2K)
+        A_v = lhs @ rhs^T + sum_k(mc_v^2/sigma_v + log sigma_v)
+            == sum_k(sigma_q/sigma_v + (mc_q-mc_v)^2/sigma_v) + sum_k log sigma_v
             == 2 KL + K + sum_k log sigma_q.
     The per-position (-K - sum_k log sigma_q) is v-INDEPENDENT (drops under softmax) but
     is KEPT so logits == -KL/tau_eff EXACTLY.
+
+    NUMERICS: the Mahalanobis term ``(mu_q - mu_v)^2`` is reconstructed by the matmul as
+    ``mc_q^2 - 2 mc_q mc_v + mc_v^2``, a subtraction of large near-equal quantities that
+    catastrophically cancels in float32 once the means carry a large common offset (the
+    error grows like eps * mu^2 / sigma_v and breaks the atol-1e-3 seam pin at modest
+    |mu| / tight sigma_v). We remove the common offset BEFORE the matmul by subtracting
+    the v-independent shift ``c = mean_v(mu_v)`` (per dim) from both means; since
+    ``(mu_q - c) - (mu_v - c) == mu_q - mu_v`` the closed form is unchanged exactly while
+    the cancelled magnitude collapses to the residual spread of the means.
     """
     sigma_v = torch.exp(pb.sigma_log_embed).clamp(min=pb.eps)            # (V, K)
     mu_v = pb.mu_embed                                                  # (V, K)
     inv_v = 1.0 / sigma_v                                               # (V, K) = 1/sigma_v
 
-    lhs = torch.cat([sigma_q + mu_q ** 2, -2.0 * mu_q], dim=-1)          # (B, N, 2K)
-    rhs = torch.cat([inv_v, mu_v * inv_v], dim=-1)                       # (V, 2K)
-    a_v = lhs @ rhs.transpose(-1, -2)                                    # (B, N, V): sum_k[(sigma_q+mu_q^2-2 mu_q mu_v)/sigma_v]
-    a_v = a_v + (mu_v ** 2 * inv_v).sum(-1) + torch.log(sigma_v).sum(-1)  # + sum_k(mu_v^2/sigma_v + log sigma_v)
-    # a_v == sum_k(sigma_q/sigma_v + (mu_q-mu_v)^2/sigma_v) + sum_k log sigma_v = 2 KL + K + sum_k log sigma_q
+    c = mu_v.mean(dim=0, keepdim=True)                                  # (1, K) v-independent shift
+    mc_v = mu_v - c                                                     # (V, K) centered prior means
+    mc_q = mu_q - c                                                     # (B, N, K) centered query means
+
+    lhs = torch.cat([sigma_q + mc_q ** 2, -2.0 * mc_q], dim=-1)          # (B, N, 2K)
+    rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)                       # (V, 2K)
+    a_v = lhs @ rhs.transpose(-1, -2)                                    # (B, N, V): sum_k[(sigma_q+mc_q^2-2 mc_q mc_v)/sigma_v]
+    a_v = a_v + (mc_v ** 2 * inv_v).sum(-1) + torch.log(sigma_v).sum(-1)  # + sum_k(mc_v^2/sigma_v + log sigma_v)
+    # a_v == sum_k(sigma_q/sigma_v + (mc_q-mc_v)^2/sigma_v) + sum_k log sigma_v
+    #     == sum_k(sigma_q/sigma_v + (mu_q-mu_v)^2/sigma_v) + sum_k log sigma_v = 2 KL + K + sum_k log sigma_q
     per_pos = pb.K + torch.log(sigma_q.clamp(min=pb.eps)).sum(-1, keepdim=True)   # (B, N, 1) = K + sum_k log sigma_q
     kl_v = 0.5 * (a_v - per_pos)                                         # (B, N, V)
     return -kl_v / tau_eff

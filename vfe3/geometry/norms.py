@@ -56,7 +56,12 @@ class MahalanobisNorm:
         if sigma.dim() == mu.dim():
             s2 = (mu ** 2 / sigma.clamp(min=self.eps)).sum(dim=-1, keepdim=True)
         else:
-            sig_inv_mu = torch.linalg.solve(sigma, mu.unsqueeze(-1)).squeeze(-1)   # Sigma^-1 mu
+            # eps * I regularization (matching divergence._gaussian_full_renyi) so a
+            # singular / near-singular Sigma does not raise torch._C._LinAlgError and
+            # crash the forward pass; bounds the conditioning the solve sees.
+            eye = torch.eye(self.K, device=sigma.device, dtype=sigma.dtype)        # (K, K)
+            sigma_reg = sigma + self.eps * eye                                     # (..., K, K)
+            sig_inv_mu = torch.linalg.solve(sigma_reg, mu.unsqueeze(-1)).squeeze(-1)   # Sigma^-1 mu
             s2 = (mu * sig_inv_mu).sum(dim=-1, keepdim=True)                       # mu^T Sigma^-1 mu
         return mu * torch.sqrt(self.K / s2.clamp(min=self.eps))
 
