@@ -1107,3 +1107,88 @@ matmul) rather than only for KL < 100 with small means.
 `decode_mode='full'` (exact Cholesky full-covariance KL); `encode_mode='gauge_fixed'`
 (gauge orbit from a shared base belief); positional φ (BCH); the block/stack/model
 assembly (Phase 7c).
+
+## Phase 7c Block + Stack + Model -- 2026-05-29 (continuation)
+
+Assembled the full forward model on top of the Phase-6 E-step and the Phase-7b
+PriorBank. Three new shipped modules, all parameter-free except the priors.
+
+### Files created
+
+- `vfe3/model/block.py` -- `vfe_block`: one VFE block = `n_e_steps` iterations of the
+  Phase-6 `e_step` from the belief toward the prior, then an optional config-selected
+  gauge-equivariant norm (`norm_type_block`, default "none" -> identity). No
+  parameters of its own; a plain function.
+- `vfe3/model/stack.py` -- `vfe_stack`: runs `L = n_layers` blocks with the belief
+  handoff between blocks. After each block the updated belief mean becomes (a blend
+  toward) the next block's prior mean,
+  `mu_p_next = (1 - rho) mu_p + rho mu_q` (`rho = prior_handoff_rho`, 1.0 = full
+  flow); `sigma_p` is frozen at the embedding by default and optionally damped via
+  `prior_handoff_sigma`; phi flows through the belief, not the prior.
+- `vfe3/model/model.py` -- `VFEModel` (an `nn.Module`) + `build_group`. Data flow:
+  `token_ids (B,N)` -> `PriorBank.encode` -> initial belief (q = p) -> loop over the
+  batch running `vfe_stack` (the E-step is unbatched `(N,K)`) -> stack the final
+  beliefs -> `PriorBank.decode` -> logits `(B,N,V)` -> cross-entropy vs `targets`.
+  `build_group` dispatches on the builder signature (`block_glk(K, n_heads)` vs
+  `glk(K)` / `so_k(K)`); the group is built once and held on the model.
+
+### Files modified
+
+- `tests/test_model.py` -- five new tests (block shapes, stack handoff moves the
+  belief, model forward shapes + finite loss, the crown jewel, no-NN).
+
+### The crown jewel (unrolled training graph reaches the priors)
+
+`test_loss_backward_reaches_prior_tables`: with the default
+`gradient_mode='filtering'` and `detach_e_step=False`, the model runs the E-step
+INSIDE the autograd graph, so `loss.backward()` populates both
+`prior_bank.mu_embed.grad` AND `prior_bank.phi_embed.grad` with nonzero mass --
+proving the unrolled E-step keeps the graph connected to the encode/phi priors, not
+just to decode.
+
+Why it holds: the Phase-4 filtering kernel detaches only the KEYS
+(`mu.detach()`), leaving the transport `omega(phi)` and the query-side
+`grad_mu = ... + sum_j beta_ij (mu_i - mu_t_ij)/sigma_t_ij` live w.r.t. both `mu_p`
+(from encode -> `mu_embed`) and `phi` (from encode -> `phi_embed`). `mu_embed` is
+reached even without the E-step (decode reads it directly); `phi_embed` is reached
+ONLY through `phi -> omega -> mu_t -> grad_mu -> mu_new -> decode`, which runs every
+E-step iteration regardless of `e_phi_lr`. `detach_e_step=True` (the fixed-point /
+truncated regime) wraps the loop in `no_grad`; then the priors are reached only via
+decode + the initial encode (by design; no test exercises gradient there).
+
+### No neural networks (hard constraint)
+
+`test_model_has_no_nn_layers` asserts no `nn.Linear` / `nn.MultiheadAttention` /
+`nn.RNNBase` / `nn.Conv1d` module exists anywhere in the model. The model's ONLY
+parameters are the PriorBank tables (`mu_embed`, `sigma_log_embed`, `phi_embed`,
+`decode_log_scale`); block and stack are parameter-free pure-VFE orchestration.
+
+### Seam wiring (config-selected, every seam)
+
+`VFEModel` forwards `encode_mode` and `decode_mode` from config into the PriorBank
+constructor (in addition to `decode_tau`/`eps`), so the encode/decode registry seams
+respect config rather than silently pinning to `per_token`/`diagonal`. Group,
+attention-prior (`attention_log_prior` gets `device=token_ids.device`), norm,
+gradient mode, alpha mode, phi preconditioner, and the handoff blend are all
+config-selected. The model is device-agnostic (no device-less tensors on the path).
+
+### Test results
+
+```
+143 passed
+```
+
+143 passed (was 138): +5 (block, stack handoff, model forward, crown jewel, no-NN).
+
+### Commits
+
+- `feat(model): vfe_block (E-step + norm) + vfe_stack (belief handoff)`
+- `feat(model): VFEModel (encode -> unrolled E-step -> decode -> CE), grad reaches priors`
+- (this continuation) `docs(edits): 2026-05-29 phase 7c model changes log`
+
+### Deferred (named)
+
+True batched E-step kernels (perf; the model currently loops over the batch around
+the unbatched stack); positional phi (BCH); a head mixer; the full-covariance path;
+the final-norm seam (`norm_type_final` is a config field not yet wired into the
+forward); the data loader (7d) and the training loop (7e).
