@@ -199,8 +199,16 @@ class VFE3Config:
 
     @property
     def tau(self) -> float:
-        """Attention softmax temperature tau = kappa * sqrt(K)."""
-        return self.kappa * (self.embed_dim ** 0.5)
+        """Attention softmax temperature tau = kappa * sqrt(d_head).
+
+        Per-head dimension d_head = embed_dim // n_heads, so kappa=1 recovers standard
+        scaled dot-product attention (Vaswani sqrt(d_k)) PER HEAD. Audit finding 6c: the
+        manuscript's free-energy functional (eq:pointwise) writes tau = kappa*sqrt(K) over
+        the full belief, but its standard-attention recovery is derived per-head with
+        sqrt(d_k); the code follows the recovery convention so that kappa=1 is the
+        Vaswani temperature.
+        """
+        return self.kappa * (self.d_head ** 0.5)
 
     @property
     def d_head(self) -> int:

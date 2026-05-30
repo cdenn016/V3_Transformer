@@ -106,3 +106,35 @@ unsupported values) rather than having fictional FEP paths invented for them.
 
 ### Verification
 - `pytest -q` (JUnit XML count): tests=188 (+6 new), failures=0, errors=0 after Group 2.
+
+## Group 3 — per-head attention temperature tau = kappa*sqrt(d_head) (finding 6c)
+
+The code previously used tau = kappa*sqrt(embed_dim) (full belief dimension K), matching the
+manuscript's free-energy functional eq:pointwise but NOT its standard-attention recovery, which
+is derived per-head with sqrt(d_k). So kappa=1 did not actually recover Vaswani. The user chose
+to switch to the per-head convention.
+
+### Files changed
+- `vfe3/config.py` (the operative `tau` property), `vfe3/free_energy.py` (the
+  `effective_temperature` primitive docstring), `tests/test_config.py` (formula-pinning tests).
+
+### Changes
+- `VFE3Config.tau` now returns `kappa * sqrt(d_head)` (d_head = embed_dim // n_heads). At the
+  default config (embed_dim=64, n_heads=8) this changes the effective temperature from 8.0 to
+  ~2.83; for the test configs (embed_dim=4-8, n_heads=2) from ~2-2.83 to ~1.41-2.0.
+- `effective_temperature(kappa, K)` keeps the generic `kappa*sqrt(K)` formula but its docstring
+  now states the model passes the per-head d_k, so kappa=1 reproduces Vaswani per head.
+- Formula-pinning tests updated honestly to `cfg.kappa * (cfg.d_head ** 0.5)` (the contract
+  changed) — NOT a retuned empirical threshold.
+
+### Empirical anchors (honest handling per advisor)
+- The two empirical cutover gates — `test_cutover_smoke_real_decrease` and
+  `test_cutover_anchor_below_ln3_negative_control` (the falsifiable ln(3) gauge-transport gate) —
+  were re-run under the new temperature and BOTH STILL PASS on their own. No xfail marking and no
+  threshold retuning was applied; the gates hold under sqrt(d_head) tau.
+- Caveat: these in-suite gates are tiny CPU smoke runs (60-120 steps, embed_dim 4-8). A full GPU
+  re-run at production scale (15000 steps, wikitext-2, embed_dim=64) is still advisable to confirm
+  the cutover margin and loss curves under the changed default temperature.
+
+### Verification
+- `pytest -q` (JUnit XML count): tests=188, failures=0, errors=0 after Group 3.
