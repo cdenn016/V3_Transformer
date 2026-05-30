@@ -902,3 +902,108 @@ forthcoming numerical-monitoring module via a float64 FD-upcast option); and
 - `4793985 test(inference): pin keys-frozen F_filt on a stepped belief; fix arg ordering`
 
 Full suite after review: 125 passed, 0 failed.
+
+---
+
+## Phase 7b PriorBank + MahalanobisNorm — 2026-05-29 (continuation)
+
+### Files created
+
+- `vfe3/geometry/norms.py` — `MahalanobisNorm` (gauge-equivariant mean
+  normalization) + a `register_norm`/`get_norm` registry (`none`, `mahalanobis`)
+- `vfe3/model/__init__.py` — empty package marker for the new model layer
+- `vfe3/model/prior_bank.py` — `PriorBank` (`encode`, `decode`,
+  `reference_decode`) + `register_encode`/`register_decode` registries
+- `tests/test_norms.py` — 2 formula/gauge-invariance tests
+- `tests/test_prior_bank.py` — 4 encode/decode tests (shapes, lookup, the decode
+  double pin, tau scaling)
+
+### Changes
+
+### `vfe3/geometry/norms.py`
+
+**`MahalanobisNorm(K, *, eps)`** Pure-math (no parameters) gauge-equivariant
+normalization of belief means:
+
+    mu_norm = mu * sqrt(K / (mu^T Sigma^-1 mu + eps)).
+
+The Mahalanobis scalar `s2 = mu^T Sigma^-1 mu` is gauge-invariant — under
+`mu -> g mu`, `Sigma -> g Sigma g^T` it maps to
+`mu^T g^T (g Sigma g^T)^-1 g mu = mu^T Sigma^-1 mu` — so the scale `sqrt(K/s2)` is
+invariant and `mu_norm` transforms as a vector (`mu_norm -> g mu_norm`). Accepts
+diagonal `sigma` (`(..., K)`, reciprocal sum) or full `Sigma` (`(..., K, K)`,
+`torch.linalg.solve`). A `register_norm`/`get_norm` registry exposes `none`
+(identity) and `mahalanobis`.
+
+### `vfe3/model/prior_bank.py`
+
+**`PriorBank(vocab_size, K, n_gen, *, ...)`** An `nn.Module` PARAMETER CONTAINER
+(no `nn.Linear`/MLP/activation anywhere): the tables `mu_embed` (V, K),
+`sigma_log_embed` (V, K), `phi_embed` (V, n_gen) parameterize the per-vocabulary
+PRIORS `pi_v = N(mu_v, exp(sigma_log_v))` with gauge frame `phi_v`. A learnable
+scalar `decode_log_scale` (init 0) tunes the decode temperature. These are priors,
+not a neural map, so the V3 no-NN rule (which bans neural layers, not learnable
+parameters) holds.
+
+**`encode(token_ids)`** Per-token table lookup `(B, N) -> BeliefState` — the
+initial belief `q = p` with `sigma = exp(sigma_log) > 0`. Routed through an
+`encode_mode` registry: `per_token` (default); `gauge_fixed` is a named stub.
+
+**`decode(mu_q, sigma_q, *, tau)`** The output boundary that REPLACES a linear
+output projection: `logits_{i,v} = -KL(q_i || pi_v) / tau_eff` with
+`tau_eff = tau * exp(-clamp(decode_log_scale, -3, 3))`. The default `diagonal`
+kernel is an exact closed form computed with a single fused matmul:
+
+    lhs = [sigma_q + mu_q^2, -2 mu_q]   (B, N, 2K)
+    rhs = [1/sigma_v, mu_v/sigma_v]     (V, 2K)
+    A_v = lhs @ rhs^T + sum_k(mu_v^2/sigma_v + log sigma_v)
+        == 2 KL + K + sum_k log sigma_q
+
+The per-position `(-K - sum_k log sigma_q)` term is `v`-independent (it drops under
+softmax/CE) but is KEPT so `logits == -KL/tau_eff` holds EXACTLY. A `decode_mode`
+registry exposes `diagonal` (default); `full` (Cholesky full-covariance) is a named
+stub.
+
+**`reference_decode(mu_q, sigma_q, *, tau)`** Divergence-AGNOSTIC reference: it
+broadcasts the `vfe3.divergence.kl` seam over the vocabulary V (general but slow,
+O(B*N*V*K)). A new divergence family needs no decode edit — only the seam call. The
+fused `diagonal` kernel is pinned to this reference both EXACTLY
+(`logit_v == -kl_seam(q, pi_v)/tau`, the per-position term kept) and under
+`log_softmax` (shift-invariant — catches a dropped-constant or wrong-tau bug even if
+the exact pin were relaxed).
+
+### Tests
+
+- `test_mahalanobis_formula_diagonal` — `out == mu * sqrt(K/s2)` for diagonal Sigma.
+- `test_mahalanobis_is_gauge_invariant_scale` — under `mu -> g mu`,
+  `Sigma -> g Sigma g^T` the output transforms as a vector (`out -> g out`),
+  confirming the scale is gauge-invariant.
+- `test_encode_shapes_and_positive_sigma` — `(B, N) -> (B, N, K)` belief, sigma > 0.
+- `test_encode_is_a_lookup` — same token id maps to the same prior.
+- `test_decode_matches_divergence_seam_exactly` — THE double pin: fused decode
+  `== reference_decode` (seam over V) to atol 1e-3, and `log_softmax`-equal to 1e-4.
+- `test_decode_tau_scaling` — `logits ∝ 1/tau` (`l1 == 2*l2`).
+
+### Test results
+
+```
+136 passed
+```
+
+6 new tests (2 in `tests/test_norms.py` + 4 in `tests/test_prior_bank.py`); no
+regressions in the 130 prior. The decode double pin holds at the documented exact
+closed form (max KL on the test data is ~3.4, well under the seam's `kl_max=100`
+clamp, so the unclamped fused decode and the clamped seam agree to float32 matmul
+error ~1e-6).
+
+### Commits
+
+- `2918d59 feat(model): gauge-equivariant MahalanobisNorm + norm registry`
+- `51671e9 feat(model): PriorBank learnable vocab priors + encode lookup`
+- `968c29c feat(model): PriorBank KL decode (-KL/tau), seam-exact + log-softmax pinned`
+
+### Deferred (named stubs)
+
+`decode_mode='full'` (exact Cholesky full-covariance KL); `encode_mode='gauge_fixed'`
+(gauge orbit from a shared base belief); positional φ (BCH); the block/stack/model
+assembly (Phase 7c).
