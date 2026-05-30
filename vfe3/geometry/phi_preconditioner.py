@@ -91,6 +91,15 @@ def killing_metric(
     return 2.0 * K * gram - 2.0 * torch.outer(traces, traces)
 
 
+# Memoized Killing inverses, keyed on the generators' IDENTITY (data_ptr) + dtype/device/
+# shape + (center_reg, tol). The inverse depends only on the fixed generator basis, so it is
+# loop-invariant across every E-step iteration; caching avoids rebuilding an O(n_gen^3) float64
+# eigh per iteration when a killing preconditioner is active (audit 4d). Keying on data_ptr is
+# staleness-safe: a .to(device/dtype) move produces a NEW tensor (new ptr) -> cache miss ->
+# recompute, so a moved model never reuses a stale-device inverse.
+_KILLING_INV_CACHE: Dict[tuple, torch.Tensor] = {}
+
+
 def build_killing_preconditioner(
     generators: torch.Tensor,             # (n_gen, K, K) basis
 
@@ -104,7 +113,15 @@ def build_killing_preconditioner(
     direction) are lifted to ``center_reg`` before inversion. Non-null eigenvalues
     are untouched, so the inverse is EXACT on sl(K) (a ridge center_reg*I is not).
     so(K) (already positive-definite) acquires no regularization. eigh in float64.
+    Memoized on the generator basis (see ``_KILLING_INV_CACHE``): loop-invariant, so it is
+    built once per (basis, center_reg, tol), not per E-step iteration.
     """
+    key = (generators.data_ptr(), tuple(generators.shape), generators.dtype,
+           generators.device, center_reg, tol)
+    cached = _KILLING_INV_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     K = generators.shape[-1]
     reg = float(2 * K) if center_reg is None else float(center_reg)
     orig_dtype = generators.dtype
@@ -113,7 +130,9 @@ def build_killing_preconditioner(
     evals, evecs = torch.linalg.eigh(M)
     evals = torch.where(evals.abs() < tol, torch.full_like(evals, reg), evals)
     inv = (evecs * (1.0 / evals).unsqueeze(-2)) @ evecs.transpose(-1, -2)
-    return inv.to(orig_dtype)
+    inv = inv.to(orig_dtype)
+    _KILLING_INV_CACHE[key] = inv
+    return inv
 
 
 @register_precond("killing")
