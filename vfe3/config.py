@@ -130,6 +130,19 @@ class VFE3Config:
         # gauge seam
         _require(self.gauge_group, _VALID_GAUGE_GROUPS, "gauge_group")
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
+        # 'omega_direct' (Omega_ij = Omega_i Omega_j^{-1} for general GL(K), det possibly < 0)
+        # needs a per-token K x K group element Omega_i. The no-NN belief carries only phi
+        # (n_gen Lie-algebra coords), from which the only constructible Omega_i is exp(embed(phi_i))
+        # -- which makes Omega_ij = exp(phi_i) exp(-phi_j), identical to the 'phi' path. There is
+        # no source for a non-exponential / det<0 GL(K) element in the belief, so this mode is
+        # rejected (live + enforced) rather than silently aliased to 'phi' (audit 2c/3a).
+        if self.gauge_parameterization == "omega_direct":
+            raise NotImplementedError(
+                "gauge_parameterization='omega_direct' needs a per-token GL(K) matrix Omega_i, "
+                "but the no-NN belief carries only phi (Lie-algebra coords); exp(phi) reduces it to "
+                "the 'phi' path. Use 'phi'. (compute_transport_operators_direct exists for an "
+                "external-Omega regime that this belief design does not provide.)"
+            )
 
         # belief family. ``family`` is the SINGLE source of truth for covariance
         # structure + divergence; ``divergence_family`` and ``diagonal_covariance`` are

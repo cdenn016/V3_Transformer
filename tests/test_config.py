@@ -96,3 +96,10 @@ def test_phi_retract_mode_validated():
 
 def test_seed_field_present():
     assert VFE3Config(seed=7).seed == 7
+
+
+def test_gauge_parameterization_omega_direct_rejected():
+    """omega_direct has no per-token GL(K) source in the no-NN belief: live knob, rejected."""
+    with pytest.raises(NotImplementedError):
+        VFE3Config(gauge_parameterization="omega_direct")
+    assert VFE3Config(gauge_parameterization="phi").gauge_parameterization == "phi"
