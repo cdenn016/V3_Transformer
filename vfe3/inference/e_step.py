@@ -16,7 +16,7 @@ import torch
 
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
-from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, self_divergence
+from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
 from vfe3.geometry.retraction import natural_gradient, retract_phi, retract_spd_diagonal
@@ -102,18 +102,17 @@ def phi_alignment_loss(
         L(phi) = Sum_ij [ beta_ij E_ij + tau beta_ij log(beta_ij/pi_ij) ],
         E_ij = D(q_i || Omega_ij(phi) q_j),  beta = softmax_j(log_prior - E/tau).
     Both roles of phi flow (Omega_ij depends on phi_i and phi_j); autograd gives the
-    envelope phi-gradient.
+    envelope phi-gradient. The canonical (entropy) branch reuses ``reduced_free_energy``,
+    the -tau log Z envelope form of that block (the pi-fallback + clamp live there, once).
     """
     omega = _transport(phi, group)
     mu_t = transport_mean(omega.unsqueeze(0), mu.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), sigma.unsqueeze(0))[0]
     energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps, family=family)
-    beta = attention_weights(energy, tau=tau, log_prior=log_prior)
-    L = (beta * energy).sum()
     if include_attention_entropy:
-        pi = torch.softmax(log_prior, dim=-1) if log_prior is not None else torch.full_like(beta, 1.0 / beta.shape[-1])
-        L = L + tau * (beta * (torch.log(beta.clamp(min=1e-12)) - torch.log(pi.clamp(min=1e-12)))).sum()
-    return L
+        return reduced_free_energy(energy, tau=tau, log_prior=log_prior).sum()
+    beta = attention_weights(energy, tau=tau, log_prior=log_prior)
+    return (beta * energy).sum()
 
 
 def e_step_iteration(
