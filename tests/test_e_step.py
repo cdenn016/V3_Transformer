@@ -87,6 +87,20 @@ def test_phi_step_descends_global_F_with_beliefs_frozen():
     assert F_after < F_before
 
 
+def test_keys_freezing_bites_on_stepped_belief():
+    # Pin that `keys` actually freezes the transported second KL argument: after a
+    # (phi-frozen) filtering step the query role has moved off the pre-step keys, so
+    # F_filt (keys=b, transported from the frozen pre-step belief) MUST differ from
+    # global F (keys=None, re-transported from the moved belief). Without this the
+    # F_filt machinery is unobserved -- both descent tests stay green if `keys` were dead.
+    b, mu_p, sigma_p, grp = _belief()
+    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=5e-2, e_sigma_lr=5e-2,
+                           e_phi_lr=0.0, gradient_mode="filtering")
+    F_filt = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5, keys=b)      # frozen pre-step keys
+    F_glob = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5, keys=None)   # re-transported
+    assert not torch.allclose(F_filt, F_glob, atol=1e-5)
+
+
 # --- Task 4: e_step loop + trajectory + fixed-seed regression --------------
 from vfe3.inference.e_step import e_step
 

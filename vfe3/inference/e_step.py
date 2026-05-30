@@ -133,6 +133,7 @@ def e_step_iteration(
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
     sigma_max:                 float = 5.0,
+    e_sigma_q_trust:           float = 5.0,
 
     include_attention_entropy: bool = True,
     gradient_mode:             str  = "filtering",
@@ -140,7 +141,6 @@ def e_step_iteration(
     alpha_mode:                str  = "constant",
     phi_precond_mode:          str  = "none",
 
-    e_sigma_q_trust:           float = 5.0,
     log_prior:                 Optional[torch.Tensor] = None,
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
