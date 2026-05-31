@@ -162,3 +162,56 @@ def test_norm_type_final_is_wired():
     torch.manual_seed(0); m_norm = VFEModel(VFE3Config(**base, norm_type_final="mahalanobis"))
     torch.manual_seed(0); m_none = VFEModel(VFE3Config(**base, norm_type_final="none"))
     assert not torch.allclose(m_norm(tok), m_none(tok))
+
+
+# --- Audit 2026-05-31 --------------------------------------------------------
+def test_seed_pins_prior_bank_initialization():
+    """The documented cfg.seed pins the PriorBank table init so a run is reproducible."""
+    cfg = VFE3Config(vocab_size=40, embed_dim=8, n_heads=2, max_seq_len=4, seed=123)
+    m1 = VFEModel(cfg)
+    m2 = VFEModel(cfg)
+    assert torch.equal(m1.prior_bank.mu_embed, m2.prior_bank.mu_embed)
+    assert torch.equal(m1.prior_bank.phi_embed, m2.prior_bank.phi_embed)
+    m3 = VFEModel(VFE3Config(vocab_size=40, embed_dim=8, n_heads=2, max_seq_len=4, seed=999))
+    assert not torch.equal(m1.prior_bank.mu_embed, m3.prior_bank.mu_embed)
+
+
+def test_killing_per_block_precond_runs_through_forward():
+    # phi_precond_mode='killing_per_block' is a validated config seam; with e_phi_lr>0 it
+    # must not crash the forward. The per-block Killing metric needs the group's irrep_dims,
+    # which the E-step must thread into precondition_phi_gradient.
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
+                     n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.05,
+                     phi_precond_mode="killing_per_block")
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, 12, (2, 4)); targets = torch.randint(0, 12, (2, 4))
+    _, loss, _ = model(tokens, targets)
+    assert torch.isfinite(loss)
+
+
+def test_b0_c0_threaded_into_state_dependent_alpha():
+    """cfg.b0/c0 reach the state-dependent self-coupling alpha; changing b0 changes the belief."""
+    grp = get_group("block_glk")(4, 2)
+    n_gen = grp.generators.shape[0]
+
+    def run(b0):
+        b = _belief(K=4, n_gen=n_gen)
+        cfg = VFE3Config(embed_dim=4, n_heads=2, n_layers=1, n_e_steps=2, e_mu_lr=0.1,
+                         e_phi_lr=0.0, alpha_mode="state_dependent", b0=b0)
+        return vfe_block(b, b.mu, b.sigma, grp, cfg).mu
+
+    assert not torch.allclose(run(1.0), run(8.0), atol=1e-5)
+
+
+def test_phi_retract_mode_bch_reachable_and_differs():
+    """phi_retract_mode='bch' is reachable through the E-step and differs from 'euclidean'."""
+    grp = get_group("block_glk")(4, 2)
+    n_gen = grp.generators.shape[0]
+
+    def run(mode):
+        b = _belief(K=4, n_gen=n_gen)
+        cfg = VFE3Config(embed_dim=4, n_heads=2, n_layers=1, n_e_steps=3, e_mu_lr=0.05,
+                         e_phi_lr=0.2, phi_retract_mode=mode)
+        return vfe_stack(b, b.mu, b.sigma, grp, cfg).phi
+
+    assert not torch.allclose(run("euclidean"), run("bch"), atol=1e-7)

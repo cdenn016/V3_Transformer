@@ -53,6 +53,9 @@ class VFEModel(nn.Module):
 
     def __init__(self, cfg: VFE3Config) -> None:
         super().__init__()
+        # Pin the documented seed so the PriorBank prior-table initialization (the only
+        # randomness at construction) is reproducible run-to-run from cfg.seed alone.
+        torch.manual_seed(cfg.seed)
         self.cfg = cfg
         self.group = build_group(cfg)
         n_gen = self.group.generators.shape[0]

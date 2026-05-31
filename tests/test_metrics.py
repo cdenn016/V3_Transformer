@@ -29,6 +29,19 @@ def test_attention_entropy_uniform_and_onehot():
     assert float(attention_entropy(onehot)) < 1e-5
 
 
+def test_free_energy_terms_is_registered_metric():
+    """free_energy_terms is selectable through the metrics registry (compute_metrics), not only
+    as a bare function."""
+    N = 4
+    self_div = torch.rand(N)
+    energy = torch.rand(N, N)
+    beta = torch.softmax(-energy, dim=-1)
+    alpha = torch.ones(N)
+    out = compute_metrics(["free_energy_terms"], self_div=self_div, energy=energy,
+                          beta=beta, alpha=alpha, tau=1.0)
+    assert "free_energy_terms" in out and "total" in out["free_energy_terms"]
+
+
 def test_holonomy_deviation_zero_for_flat_cocycle():
     grp = get_group("glk")(3)
     phi = 0.2 * torch.randn(1, 4, grp.generators.shape[0])

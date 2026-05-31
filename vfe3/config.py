@@ -17,6 +17,7 @@ _VALID_DECODE_MODES        = ("diagonal", "full")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_per_coord")
 _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback")
+_VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
 _VALID_ATTENTION_PRIORS    = ("uniform", "causal", "alibi")
 _VALID_NORMS               = ("none", "mahalanobis")
 
@@ -59,6 +60,8 @@ class VFE3Config:
     # free-energy coupling
     alpha:                     float = 1.0          # constant self-coupling value
     alpha_mode:                str   = "constant"
+    b0:                        float = 1.0          # state-dependent alpha shape: alpha* = c0/(b0 + D)
+    c0:                        float = 1.0          # state-dependent alpha shape (numerator)
     kappa:                     float = 1.0          # temperature tau = kappa * sqrt(K)
     mass_phi:                  float = 0.0          # (mass_phi/2) ||phi||^2 penalty
 
@@ -74,6 +77,7 @@ class VFE3Config:
     sigma_max:                 float = 5.0
     gradient_mode:             str   = "filtering"
     phi_precond_mode:          str   = "none"
+    phi_retract_mode:          str   = "euclidean"  # Lie-algebra step chart: euclidean (sum) or bch
 
     # decode / encode
     use_prior_bank:            bool  = True
@@ -128,6 +132,19 @@ class VFE3Config:
         # gauge seam
         _require(self.gauge_group, _VALID_GAUGE_GROUPS, "gauge_group")
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
+        # 'omega_direct' (Omega_ij = Omega_i Omega_j^{-1} for general GL(K), det possibly < 0)
+        # needs a per-token K x K group element Omega_i. The no-NN belief carries only phi
+        # (n_gen Lie-algebra coords), from which the only constructible Omega_i is exp(embed(phi_i))
+        # -- making Omega_ij = exp(phi_i) exp(-phi_j), identical to the 'phi' path. There is no
+        # source for a non-exponential / det<0 GL(K) element in the belief, so the mode is rejected
+        # (live + enforced) rather than silently aliased to 'phi'. compute_transport_operators_direct
+        # remains for an external-Omega regime this belief design does not provide.
+        if self.gauge_parameterization == "omega_direct":
+            raise NotImplementedError(
+                "gauge_parameterization='omega_direct' needs a per-token GL(K) matrix Omega_i, "
+                "but the no-NN belief carries only phi (Lie-algebra coords); exp(phi) reduces it to "
+                "the 'phi' path. Use 'phi'."
+            )
 
         # belief family
         _require(self.family, _VALID_DIVERGENCE_FAMILIES, "family")
@@ -137,6 +154,9 @@ class VFE3Config:
             raise ValueError(f"kappa must be positive, got {self.kappa}")
         if self.mass_phi < 0.0:
             raise ValueError(f"mass_phi must be >= 0, got {self.mass_phi}")
+        for name in ("b0", "c0"):
+            if getattr(self, name) <= 0.0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
         _require(self.alpha_mode, _VALID_ALPHA_MODES, "alpha_mode")
 
         # attention
@@ -148,12 +168,28 @@ class VFE3Config:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         _require(self.phi_precond_mode, _VALID_PHI_PRECOND_MODES, "phi_precond_mode")
+        _require(self.phi_retract_mode, _VALID_PHI_RETRACT_MODES, "phi_retract_mode")
 
         # decode / encode
         if self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be positive, got {self.decode_tau}")
         _require(self.decode_mode, _VALID_DECODE_MODES, "decode_mode")
         _require(self.encode_mode, _VALID_ENCODE_MODES, "encode_mode")
+        # The PriorBank IS the only encode/decode boundary; there is no specified alternative.
+        # use_prior_bank=False is a live knob that rejects the unsupported value rather than
+        # silently doing nothing (it was a dead config seam).
+        if not self.use_prior_bank:
+            raise NotImplementedError(
+                "use_prior_bank=False has no alternative encode/decode path; the PriorBank is "
+                "the only belief-encode/decode boundary in VFE_3.0"
+            )
+        # 'gauge_fixed' encode (gauge orbit from a shared base belief) is a named stub: reject at
+        # construction so the failure is at config time, not the first forward pass.
+        if self.encode_mode == "gauge_fixed":
+            raise NotImplementedError(
+                "encode_mode='gauge_fixed' is a named stub (gauge orbit from a shared base belief) "
+                "that is not yet implemented; use 'per_token'."
+            )
 
         # handoff (both blends must be convex so the prior stays on the SPD cone:
         # sigma_p_next = (1-rho_s) sigma_p + rho_s sigma_q stays > 0 iff rho_s in [0,1])

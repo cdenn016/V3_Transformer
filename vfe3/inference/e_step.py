@@ -140,6 +140,7 @@ def e_step_iteration(
     family:                    str  = "gaussian_diagonal",
     alpha_mode:                str  = "constant",
     phi_precond_mode:          str  = "none",
+    phi_retract_mode:          str  = "euclidean",
 
     log_prior:                 Optional[torch.Tensor] = None,
 ) -> BeliefState:
@@ -174,8 +175,10 @@ def e_step_iteration(
                 family=family, include_attention_entropy=include_attention_entropy, log_prior=log_prior,
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]
-        grad_phi = precondition_phi_gradient(grad_phi, belief.phi, group.generators, mode=phi_precond_mode)
-        phi = retract_phi(belief.phi, -grad_phi, group, step_size=e_phi_lr)
+        grad_phi = precondition_phi_gradient(
+            grad_phi, belief.phi, group.generators, mode=phi_precond_mode, irrep_dims=group.irrep_dims,
+        )
+        phi = retract_phi(belief.phi, -grad_phi, group, step_size=e_phi_lr, mode=phi_retract_mode)
 
     return BeliefState(mu=mu, sigma=sigma, phi=phi)
 

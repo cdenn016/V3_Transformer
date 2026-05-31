@@ -156,6 +156,13 @@ def _m_gauge_spread(*, phi=None, generators=None, **kw) -> float:
     return float(gauge_trace_spread(phi, generators))
 
 
+@register_metric("free_energy_terms")
+def _m_free_energy_terms(*, self_div=None, energy=None, beta=None, alpha=None,
+                         tau=1.0, log_prior=None, **kw) -> Dict[str, float]:
+    """Per-term free-energy decomposition (self-coupling, belief-coupling, attention entropy)."""
+    return free_energy_terms(self_div, energy, beta, alpha, tau=tau, log_prior=log_prior)
+
+
 def compute_metrics(
     names: List[str],
 

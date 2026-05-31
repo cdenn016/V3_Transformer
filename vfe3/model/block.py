@@ -31,11 +31,13 @@ def vfe_block(
         belief, mu_p, sigma_p, group,
         n_iter=cfg.n_e_steps, tau=cfg.tau,
         e_mu_lr=cfg.e_mu_lr, e_sigma_lr=cfg.e_sigma_lr, e_phi_lr=cfg.e_phi_lr,
-        alpha_div=cfg.alpha_div, value=cfg.alpha, kl_max=cfg.kl_max, eps=cfg.eps,
+        alpha_div=cfg.alpha_div, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+        kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust,
         include_attention_entropy=cfg.include_attention_entropy,
         gradient_mode=cfg.gradient_mode, family=cfg.family, alpha_mode=cfg.alpha_mode,
-        phi_precond_mode=cfg.phi_precond_mode, log_prior=log_prior,
+        phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
+        log_prior=log_prior,
     )
     if cfg.norm_type_block != "none":
         norm = get_norm(cfg.norm_type_block)(cfg.embed_dim, eps=cfg.eps)

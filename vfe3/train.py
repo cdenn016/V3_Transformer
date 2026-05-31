@@ -134,6 +134,7 @@ def run_training(
     """
     from vfe3.data.datasets import make_dataloader
 
+    torch.manual_seed(cfg.seed)              # reproducible prior-table init + data order
     model = VFEModel(cfg)
     loader = make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size, max_tokens=max_tokens)
     losses = train(model, loader, cfg, n_steps=n_steps)
