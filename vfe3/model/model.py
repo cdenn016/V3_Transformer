@@ -154,3 +154,80 @@ class VFEModel(nn.Module):
             phi_all = torch.stack([o.phi for o in outs], dim=0)
             loss = loss + 0.5 * self.cfg.mass_phi * (phi_all ** 2).mean()
         return logits, loss, ce.detach()
+
+    @torch.no_grad()
+    def diagnostics(
+        self,
+        token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+    ) -> dict:
+        r"""Faithful per-step VFE diagnostics at the converged belief (no_grad).
+
+        Recomputes the SAME quantities the E-step uses (transport, pairwise energy
+        E_ij, attention weights beta_ij, self-divergence D(q_i||p_i), self-coupling
+        alpha_i) at the converged belief returned by :func:`vfe_stack`, then feeds
+        them to :mod:`vfe3.metrics`. Every knob matches what the forward pass passed
+        to the E-step (``cfg.tau``, ``cfg.family``, ``cfg.divergence_family``,
+        ``cfg.alpha_div``, ``cfg.kl_max``, ``cfg.eps``,
+        ``cfg.alpha_mode``/``value``/``b0``/``c0``, ``group.irrep_dims``, the cached
+        attention log-prior), so the diagnostic beta is the attention pattern at the
+        fixed point, not a re-derivation.
+
+        This is OFF the training hot path: it is never called on a train step, adds no
+        argument or branch to :meth:`forward`, and runs under ``torch.no_grad``. The
+        last-block prior is reconstructed by mirroring :func:`vfe_stack`'s
+        ``prior_handoff`` fold; this is EXACT when ``n_layers == 1`` (default) or
+        ``prior_handoff_rho == 0``, and an approximation otherwise (the single
+        converged belief stands in for the per-block intermediates).
+
+        Returns ``{attn_entropy, self_coupling, belief_coupling, attention_entropy,
+        total, effective_rank}`` (nats; ``effective_rank`` is the per-token
+        belief-variance spectrum effective rank, not an attention rank).
+        """
+        from vfe3.inference.e_step import _transport
+        from vfe3.geometry.transport import transport_mean, transport_covariance
+        from vfe3.free_energy import pairwise_energy, self_divergence, attention_weights
+        from vfe3.alpha_i import self_coupling_alpha
+        from vfe3 import metrics
+
+        cfg = self.cfg
+        enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
+        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=enc.phi[0])
+        n = belief.mu.shape[0]
+        log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
+        out = vfe_stack(                                              # converged belief
+            belief, belief.mu, belief.sigma, self.group, cfg,
+            log_prior=log_prior, block_norm=self.block_norm,
+        )
+
+        rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
+        rho_s = cfg.prior_handoff_sigma
+        mu_p, sigma_p = belief.mu, belief.sigma
+        for _ in range(cfg.n_layers - 1):                           # exact iff L==1 or rho==0
+            mu_p = (1.0 - rho) * mu_p + rho * out.mu
+            sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
+
+        omega = _transport(out.phi, self.group)                     # (N, N, K, K)
+        mu_t = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
+        sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
+        energy = pairwise_energy(                                    # (N, N) or (H, N, N)
+            out.mu, out.sigma, mu_t, sigma_t,
+            alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+            family=cfg.family, divergence_family=cfg.divergence_family,
+            irrep_dims=self.group.irrep_dims,
+        )
+        beta = attention_weights(energy, tau=cfg.tau, log_prior=log_prior)
+        self_div = self_divergence(                                  # (N,)
+            out.mu, out.sigma, mu_p, sigma_p,
+            alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+            family=cfg.family, divergence_family=cfg.divergence_family,
+        )
+        alpha, _ = self_coupling_alpha(
+            self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+        )
+
+        d = {"attn_entropy": float(metrics.attention_entropy(beta))}
+        terms = metrics.free_energy_terms(self_div, energy, beta, alpha, tau=cfg.tau, log_prior=log_prior)
+        d.update({k: float(v) for k, v in terms.items()})
+        spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
+        d["effective_rank"] = float(metrics.effective_rank(spec).mean())
+        return d

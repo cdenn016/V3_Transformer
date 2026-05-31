@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.train import build_optimizer, lr_lambda, train
+from vfe3.train import build_optimizer, evaluate, lr_lambda, train
 
 
 def test_optimizer_groups_priors_by_m_lr():
@@ -153,3 +153,46 @@ def test_training_smoke_on_real_wikitext2_if_present():
     losses = train(model, loader, cfg, n_steps=30)
     assert all(map(lambda x: x == x, losses))                   # finite (no NaN)
     assert losses[-1] < losses[0] - 0.05                        # CE decreases (marginal learning suffices)
+
+
+def test_evaluate_returns_finite_ppl_bpc_consistent_with_ce():
+    torch.manual_seed(0)
+    cfg = _structured_cfg()
+    model = VFEModel(cfg)
+    loader = _periodic_loader(seed=0)
+    m = evaluate(model, loader)
+    assert set(m.keys()) == {"ce", "ppl", "bpc"}
+    assert all(math.isfinite(v) for v in m.values())
+    assert m["ppl"] == pytest.approx(math.exp(min(m["ce"], 20.0)))
+    assert m["bpc"] == pytest.approx(m["ce"] / math.log(2.0))
+
+
+def test_silent_and_logging_paths_are_bitwise_identical(caplog):
+    torch.manual_seed(0)
+    cfg_a = _structured_cfg()
+    model_a = VFEModel(cfg_a)
+    loader_a = _periodic_loader(seed=0)
+    losses_silent = train(model_a, loader_a, cfg_a, n_steps=20)
+
+    torch.manual_seed(0)
+    cfg_b = _structured_cfg()
+    model_b = VFEModel(cfg_b)
+    loader_b = _periodic_loader(seed=0)
+    with caplog.at_level("INFO"):
+        losses_logged = train(model_b, loader_b, cfg_b, n_steps=20, log_interval=1, eval_interval=0)
+
+    assert losses_silent == losses_logged           # exact: logging must not perturb the hot path
+    assert any("Step 1/20" in r.message for r in caplog.records)
+
+
+def test_train_vfe3_clickrun_importable_and_runs_one_step():
+    from train_vfe3 import config as cr_config, synthetic_period3_loader
+
+    cfg = VFE3Config(**cr_config)
+    loader = synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
+    batch = next(iter(loader))
+    assert len(batch) == 2
+    torch.manual_seed(cfg.seed)
+    model = VFEModel(cfg)
+    losses = train(model, loader, cfg, n_steps=1)
+    assert len(losses) == 1 and math.isfinite(losses[0])
