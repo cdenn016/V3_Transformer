@@ -96,3 +96,47 @@ Deferred (named). A real-data tokenizer and offline cache builder (VFE_3.0 ships
 so only the synthetic stream runs without a pre-populated ~/.cache/tokenized_cache); a
 FLOPs-per-step banner field; learning-rate retuning for GPU runs at scale; checkpointing
 and metrics-CSV / figure emission.
+
+## 2026-05-31 - Full toggle surface + wikitext-103 default (train_vfe3.py)
+
+Only `train_vfe3.py` changed. The click-run `config` dict was expanded from a ~16-field
+subset to the complete 49-field `VFE3Config` surface, and the default corpus was switched
+to the cached wikitext-103 (gpt2/tiktoken, vocab 50257). No `vfe3/` source or test was
+touched.
+
+What changed in `train_vfe3.py`:
+
+- `config` dict now carries every `VFE3Config` field, grouped exactly as in
+  `vfe3/config.py` (numerics, divergence seam, model structure, gauge seam, belief family,
+  free-energy coupling, attention, E-step, decode/encode, handoff, normalization,
+  M-step/training). Each registry field lists its valid keys inline (`gauge_group`,
+  `alpha_mode`, `attention_prior`, `gradient_mode`, `phi_precond_mode`, `phi_retract_mode`,
+  `decode_mode`, `encode_mode`, `norm_type_*`, `family`, `divergence_family`). The three
+  `NotImplementedError`-guarded toggles (`gauge_parameterization='omega_direct'`,
+  `encode_mode='gauge_fixed'`, `use_prior_bank=False`) ship at their working/pure value with
+  the rejected alternative named only in a comment, so the dict always constructs. The
+  `diagonal_covariance == (family == 'gaussian_diagonal')` cross-constraint is noted in place.
+- `DATASET` default is now `"wikitext-103"` and `vocab_size` is `50257`, kept consistent so
+  click-to-run loads the real corpus out of the box (a vocab-6 default would crash on the
+  gpt2 token ids). The cache is read from `~/.cache/tokenized_cache`.
+- New module-level `MAX_TOKENS` knob caps only the *train* stream for fast smoke runs
+  (`None` = the full 116.8M-token corpus); the small validation split is always read in full.
+- `_select_loader` gained a `split` keyword and `main` now builds a held-out validation
+  loader from the `"validation"` split; the final evaluation reports val (not train) CE/PPL.
+  A `FileNotFoundError` still falls back to the synthetic period-3 stream with a warning.
+- `synthetic_period3_loader` now grows its stream to `seq_len * batch_size * 4` tokens when
+  needed. At the new click-run dims (`max_seq_len=128, batch_size=64`) the old fixed 600-token
+  stream yielded 4 windows -> zero batches under `drop_last`, which would `StopIteration` both
+  the fallback and the `tests/test_train.py` click-run test; the scaled stream yields several
+  batches. Small-dim callers (`seq_len=8, batch_size=8`) are unchanged (n stays 600).
+
+Verification. Two read-only expert agents: (1) config completeness - 49/49 fields present,
+all values pass `__post_init__`, cross-constraint holds, every inline option list matches the
+`_VALID_*` tuples; (2) wikitext-103 data path - the computed `.pt` paths exist, meta tokenizer
+is tiktoken/gpt2, loaded validation max token id 50254 < 50257 (no index overflow), 29
+validation batches at N=128/B=64, and no silent synthetic fallback with the cache present.
+`tests/test_train.py`: tests=8 failures=0 errors=0 skipped=0 (7 passed, 1 xpassed). The
+click-run test (`test_train_vfe3_clickrun_importable_and_runs_one_step`) now runs ~256s on
+CPU because it exercises a real vocab-50257 forward (a ~1.6 GB logit tensor for one B=64,N=128
+step); fast on the CUDA interpreter. A full `max_steps` wikitext-103 run is a genuine GPU job,
+not a CPU smoke.
