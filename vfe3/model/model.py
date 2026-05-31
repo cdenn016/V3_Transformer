@@ -62,6 +62,7 @@ class VFEModel(nn.Module):
         self.prior_bank = PriorBank(
             cfg.vocab_size, cfg.embed_dim, n_gen,
             decode_tau=cfg.decode_tau, eps=cfg.eps,
+            diagonal_covariance=cfg.diagonal_covariance,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
         )
 

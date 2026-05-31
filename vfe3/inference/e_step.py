@@ -19,7 +19,7 @@ from vfe3.belief import BeliefState
 from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
-from vfe3.geometry.retraction import natural_gradient, retract_phi, retract_spd_diagonal
+from vfe3.geometry.retraction import natural_gradient, retract_phi, retract_spd_diagonal, retract_spd_full
 from vfe3.geometry.transport import compute_transport_operators, transport_covariance, transport_mean
 from vfe3.gradients.kernels import belief_gradients
 
@@ -156,9 +156,14 @@ def e_step_iteration(
     nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
 
     mu = belief.mu - e_mu_lr * nat_mu
-    sigma = retract_spd_diagonal(
-        belief.sigma, -e_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
-    )
+    if belief.sigma.dim() == belief.mu.dim() + 1:        # full covariance (..., K, K)
+        sigma = retract_spd_full(
+            belief.sigma, -e_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
+        )
+    else:                                                # diagonal variances (..., K)
+        sigma = retract_spd_diagonal(
+            belief.sigma, -e_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
+        )
 
     phi = belief.phi
     if e_phi_lr > 0.0:

@@ -146,8 +146,16 @@ class VFE3Config:
                 "the 'phi' path. Use 'phi'."
             )
 
-        # belief family
+        # belief family. ``family`` selects the covariance-structure divergence kernel
+        # (gaussian_diagonal | gaussian_full); ``diagonal_covariance`` is a SEPARATE live bool,
+        # cross-validated to stay consistent with it (kept distinct per the modularity design,
+        # not collapsed). It threads into the PriorBank encode to choose diagonal vs full SPD.
         _require(self.family, _VALID_DIVERGENCE_FAMILIES, "family")
+        if self.diagonal_covariance != (self.family == "gaussian_diagonal"):
+            raise ValueError(
+                f"diagonal_covariance={self.diagonal_covariance} contradicts family={self.family!r}; "
+                f"set diagonal_covariance={self.family == 'gaussian_diagonal'} for this family"
+            )
 
         # free-energy coupling
         if self.kappa <= 0.0:
