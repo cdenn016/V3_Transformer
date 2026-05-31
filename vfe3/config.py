@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 _VALID_DIVERGENCE_FAMILIES = ("gaussian_diagonal", "gaussian_full")
+_VALID_DIVERGENCE_FUNCTIONALS = ("renyi",)
 _VALID_GAUGE_GROUPS        = ("glk", "block_glk", "so_k")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
@@ -38,8 +39,8 @@ class VFE3Config:
     kl_max:                    float = 100.0
 
     # divergence seam
-    divergence_family:         str   = "gaussian_diagonal"
-    alpha_div:                 float = 1.0
+    divergence_family:         str   = "renyi"        # divergence FUNCTIONAL (renyi, ...); alpha_div selects member
+    alpha_div:                 float = 1.0            # Renyi order (alpha=1 -> KL)
 
     # model structure
     vocab_size:                int   = 50257
@@ -60,6 +61,8 @@ class VFE3Config:
     # free-energy coupling
     alpha:                     float = 1.0          # constant self-coupling value
     alpha_mode:                str   = "constant"
+    b0:                        float = 1.0          # state-dependent alpha shape: alpha* = c0/(b0 + D)
+    c0:                        float = 1.0          # state-dependent alpha shape (numerator)
     kappa:                     float = 1.0          # temperature tau = kappa * sqrt(K)
     mass_phi:                  float = 0.0          # (mass_phi/2) ||phi||^2 penalty
 
@@ -75,7 +78,7 @@ class VFE3Config:
     sigma_max:                 float = 5.0
     gradient_mode:             str   = "filtering"
     phi_precond_mode:          str   = "none"
-    phi_retract_mode:          str   = "euclidean"   # Lie-algebra step: euclidean (sum) or bch chart
+    phi_retract_mode:          str   = "euclidean"  # Lie-algebra step chart: euclidean (sum) or bch
 
     # decode / encode
     use_prior_bank:            bool  = True
@@ -109,8 +112,10 @@ class VFE3Config:
         if self.kl_max <= 0.0:
             raise ValueError(f"kl_max must be positive, got {self.kl_max}")
 
-        # divergence seam
-        _require(self.divergence_family, _VALID_DIVERGENCE_FAMILIES, "divergence_family")
+        # divergence seam: divergence_family is the FUNCTIONAL (f-divergence) registry key
+        # (renyi, ...), distinct from `family` (the covariance-structure kernel). alpha_div is
+        # the Renyi order. Both are live, modular seams (CLAUDE.md: slot in different f-divergences).
+        _require(self.divergence_family, _VALID_DIVERGENCE_FUNCTIONALS, "divergence_family")
         if self.alpha_div <= 0.0:
             raise ValueError(f"alpha_div must be positive, got {self.alpha_div}")
 
@@ -133,27 +138,24 @@ class VFE3Config:
         # 'omega_direct' (Omega_ij = Omega_i Omega_j^{-1} for general GL(K), det possibly < 0)
         # needs a per-token K x K group element Omega_i. The no-NN belief carries only phi
         # (n_gen Lie-algebra coords), from which the only constructible Omega_i is exp(embed(phi_i))
-        # -- which makes Omega_ij = exp(phi_i) exp(-phi_j), identical to the 'phi' path. There is
-        # no source for a non-exponential / det<0 GL(K) element in the belief, so this mode is
-        # rejected (live + enforced) rather than silently aliased to 'phi' (audit 2c/3a).
+        # -- making Omega_ij = exp(phi_i) exp(-phi_j), identical to the 'phi' path. There is no
+        # source for a non-exponential / det<0 GL(K) element in the belief, so the mode is rejected
+        # (live + enforced) rather than silently aliased to 'phi'. compute_transport_operators_direct
+        # remains for an external-Omega regime this belief design does not provide.
         if self.gauge_parameterization == "omega_direct":
             raise NotImplementedError(
                 "gauge_parameterization='omega_direct' needs a per-token GL(K) matrix Omega_i, "
                 "but the no-NN belief carries only phi (Lie-algebra coords); exp(phi) reduces it to "
-                "the 'phi' path. Use 'phi'. (compute_transport_operators_direct exists for an "
-                "external-Omega regime that this belief design does not provide.)"
+                "the 'phi' path. Use 'phi'."
             )
 
-        # belief family. ``family`` is the SINGLE source of truth for covariance
-        # structure + divergence; ``divergence_family`` and ``diagonal_covariance`` are
-        # held live and ENFORCED-consistent with it (a contradictory pair is rejected
-        # rather than silently ignored), not deleted.
+        # belief family. ``family`` selects the covariance-structure divergence kernel
+        # (gaussian_diagonal | gaussian_full). ``divergence_family`` is the SEPARATE functional
+        # (f-divergence) seam (renyi, ...; validated above), and ``diagonal_covariance`` is a
+        # SEPARATE live bool, cross-validated to stay consistent with family. The three are kept
+        # distinct and modular per CLAUDE.md (slot in different f-divergences / families); NOT
+        # collapsed, and divergence_family is NOT forced equal to family.
         _require(self.family, _VALID_DIVERGENCE_FAMILIES, "family")
-        if self.divergence_family != self.family:
-            raise ValueError(
-                f"divergence_family={self.divergence_family!r} must equal family={self.family!r} "
-                f"(family is the single divergence/covariance source of truth)"
-            )
         if self.diagonal_covariance != (self.family == "gaussian_diagonal"):
             raise ValueError(
                 f"diagonal_covariance={self.diagonal_covariance} contradicts family={self.family!r}; "
@@ -165,6 +167,9 @@ class VFE3Config:
             raise ValueError(f"kappa must be positive, got {self.kappa}")
         if self.mass_phi < 0.0:
             raise ValueError(f"mass_phi must be >= 0, got {self.mass_phi}")
+        for name in ("b0", "c0"):
+            if getattr(self, name) <= 0.0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
         _require(self.alpha_mode, _VALID_ALPHA_MODES, "alpha_mode")
 
         # attention
@@ -183,13 +188,20 @@ class VFE3Config:
             raise ValueError(f"decode_tau must be positive, got {self.decode_tau}")
         _require(self.decode_mode, _VALID_DECODE_MODES, "decode_mode")
         _require(self.encode_mode, _VALID_ENCODE_MODES, "encode_mode")
-        # The PriorBank IS the encode/decode boundary; there is no specified
-        # alternative. The knob is live and rejects the unsupported value rather
-        # than silently doing nothing.
+        # The PriorBank IS the only encode/decode boundary; there is no specified alternative.
+        # use_prior_bank=False is a live knob that rejects the unsupported value rather than
+        # silently doing nothing (it was a dead config seam).
         if not self.use_prior_bank:
             raise NotImplementedError(
-                "use_prior_bank=False has no alternative encode/decode path; the PriorBank "
-                "is the only belief-encode/decode boundary in VFE_3.0"
+                "use_prior_bank=False has no alternative encode/decode path; the PriorBank is "
+                "the only belief-encode/decode boundary in VFE_3.0"
+            )
+        # 'gauge_fixed' encode (gauge orbit from a shared base belief) is a named stub: reject at
+        # construction so the failure is at config time, not the first forward pass.
+        if self.encode_mode == "gauge_fixed":
+            raise NotImplementedError(
+                "encode_mode='gauge_fixed' is a named stub (gauge orbit from a shared base belief) "
+                "that is not yet implemented; use 'per_token'."
             )
 
         # handoff (both blends must be convex so the prior stays on the SPD cone:

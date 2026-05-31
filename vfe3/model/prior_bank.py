@@ -94,14 +94,14 @@ class PriorBank(nn.Module):
         n_gen:        int,
 
         *,
-        mu_init_std:        float = 0.02,
-        sigma_init:         float = 1.0,
-        phi_scale:          float = 0.01,
-        decode_tau:         float = 1.0,
-        eps:                float = 1e-6,
-        diagonal_covariance: bool = True,
-        encode_mode:        str   = "per_token",
-        decode_mode:        str   = "diagonal",
+        mu_init_std:         float = 0.02,
+        sigma_init:          float = 1.0,
+        phi_scale:           float = 0.01,
+        decode_tau:          float = 1.0,
+        eps:                 float = 1e-6,
+        diagonal_covariance: bool  = True,
+        encode_mode:         str   = "per_token",
+        decode_mode:         str   = "diagonal",
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -185,13 +185,13 @@ def _encode_per_token(
 
     Diagonal family: sigma is the (B, N, K) variance vector. Full family
     (``diagonal_covariance=False``): the same per-token variances are embedded as a
-    DIAGONAL full covariance (B, N, K, K), the SPD starting point the full-covariance
+    DIAGONAL full covariance (B, N, K, K) -- the SPD starting point the full-covariance
     E-step (full sandwich transport + affine-invariant SPD retraction) then evolves
-    off-diagonal mass into. The mean/gauge tables are shared across families.
+    off-diagonal mass into. The mean / gauge tables are shared across families.
     """
-    mu = pb.mu_embed[token_ids]                                          # (B, N, K)
-    sigma_diag = torch.exp(pb.sigma_log_embed[token_ids]).clamp(min=pb.eps)   # (B, N, K), sigma > 0
-    phi = pb.phi_embed[token_ids]                                        # (B, N, n_gen)
+    mu = pb.mu_embed[token_ids]                                              # (B, N, K)
+    sigma_diag = torch.exp(pb.sigma_log_embed[token_ids]).clamp(min=pb.eps)  # (B, N, K), sigma > 0
+    phi = pb.phi_embed[token_ids]                                            # (B, N, n_gen)
     sigma = sigma_diag if pb.diagonal_covariance else torch.diag_embed(sigma_diag)
     return BeliefState(mu=mu, sigma=sigma, phi=phi)
 
@@ -268,14 +268,13 @@ def _decode_full(
 ) -> torch.Tensor:                       # (B, N, V) logits = -KL(q || pi_v)/tau_eff
     r"""Exact full-covariance decode logits_{i,v} = -KL(q_i || pi_v)/tau_eff via Cholesky.
 
-    Scores the full-covariance posterior q_i = N(mu_q, Sigma_q) against every vocab
-    prior pi_v through the ``gaussian_full`` divergence seam (Cholesky KL). The prior
-    table is diagonal (sigma_log_embed), embedded as a diagonal full covariance
-    diag(exp(sigma_log_v)) so a full q is scored against it. As in ``reference_decode``
-    the seam is invoked with ``kl_max=inf`` so the full KL ranking over the vocabulary
-    is preserved (decode must not saturate distant priors to a single logit). General
-    but O(B*N*V*K^3) (per-pair Cholesky) -- the theoretically pure full-covariance path,
-    not the fast diagonal kernel.
+    Scores the full-covariance posterior q_i = N(mu_q, Sigma_q) against every vocab prior
+    pi_v through the ``gaussian_full`` divergence seam (Cholesky KL). The prior table is
+    diagonal (sigma_log_embed), embedded as a diagonal full covariance diag(exp(sigma_log_v))
+    so a full q is scored against it. As in ``reference_decode`` the seam is invoked with
+    ``kl_max=inf`` so the full KL ranking over the vocabulary is preserved (decode must not
+    saturate distant priors to a single logit). General but O(B*N*V*K^3) (per-pair Cholesky):
+    the theoretically pure full-covariance path, not the fast diagonal kernel.
     """
     mu_v = pb.mu_embed                                                   # (V, K)
     sigma_v = torch.diag_embed(torch.exp(pb.sigma_log_embed).clamp(min=pb.eps))  # (V, K, K) diagonal-as-full

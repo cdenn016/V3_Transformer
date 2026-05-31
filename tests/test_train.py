@@ -82,11 +82,14 @@ def _median(xs):
 
 
 @pytest.mark.xfail(
-    reason="audit 6c: per-head tau=kappa*sqrt(d_head) changed the attention temperature; "
-           "the model STILL beats the ln(3) marginal floor (median ~1.052 < 1.099) but no "
-           "longer by the full 0.05-nat margin (gets ~0.047). The margin/LRs are calibrated "
-           "for the old sqrt(embed_dim) tau and need GPU re-validation + LR re-tuning at the "
-           "new temperature. Threshold deliberately NOT massaged to pass (audit honesty rule).",
+    reason="audit 6c (temperature) + GL(K) finding #1 (per-head beta): at per-head "
+           "tau=kappa*sqrt(d_head) the SINGLE-beta model beat the ln(3) floor but only by ~0.047 "
+           "(< the 0.05 anchor margin), hence this xfail. The 2026-05-31 per-head (per-irrep-block) "
+           "beta is more expressive and now clears the full margin on CPU across the 3 fixed seeds "
+           "(this test XPASSes). Kept as a non-strict xfail because the margin is still thin and the "
+           "LRs were calibrated for the old sqrt(embed_dim) tau -- GPU re-validation + LR re-tuning "
+           "at scale remain advisable before this is promoted to a hard gate. Threshold deliberately "
+           "NOT massaged (audit honesty rule).",
     strict=False,
 )
 def test_training_decreases_loss_on_structured_stream():

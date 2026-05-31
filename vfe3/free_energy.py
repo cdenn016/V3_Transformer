@@ -7,11 +7,11 @@ the attention-entropy term) vs surrogate is a single toggle. The attention prior
 is a log-bias B_ij from the `attention_prior` seam; beta* = softmax_j(B - E/tau).
 """
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
-from vfe3.divergence import renyi
+from vfe3.divergence import get_functional
 
 
 def effective_temperature(
@@ -29,48 +29,82 @@ def effective_temperature(
 
 
 def pairwise_energy(
-    mu_q:    torch.Tensor,                 # (..., N, K) query means
-    sigma_q: torch.Tensor,                 # (..., N, K[,K]) query (co)variances
-    mu_t:    torch.Tensor,                 # (..., N, N, K) transported key means Omega_ij mu_j
-    sigma_t: torch.Tensor,                 # (..., N, N, K[,K]) transported key (co)variances
+    mu_q:              torch.Tensor,       # (..., N, K) query means
+    sigma_q:           torch.Tensor,       # (..., N, K[,K]) query (co)variances
+    mu_t:              torch.Tensor,       # (..., N, N, K) transported key means Omega_ij mu_j
+    sigma_t:           torch.Tensor,       # (..., N, N, K[,K]) transported key (co)variances
 
     *,
-    alpha:   float = 1.0,
-    kl_max:  float = 100.0,
-    eps:     float = 1e-6,
-    family:  str   = "gaussian_diagonal",
-) -> torch.Tensor:                         # (..., N, N) E_ij = D(q_i || Omega_ij q_j)
+    alpha:             float = 1.0,
+    kl_max:            float = 100.0,
+    eps:               float = 1e-6,
+    family:            str   = "gaussian_diagonal",
+    divergence_family: str   = "renyi",
+
+    irrep_dims:        Optional[List[int]] = None,
+) -> torch.Tensor:                         # (..., N, N) or (..., H, N, N) E_ij = D(q_i || Omega_ij q_j)
     r"""Per-pair belief-coupling energy via the divergence seam (KL = Renyi at alpha=1).
 
-    Divergence-agnostic: swapping `family`/`alpha` (or registering a new kernel)
-    changes the energy without touching the free-energy assembly.
+    Divergence-agnostic on two orthogonal axes: ``divergence_family`` selects the FUNCTIONAL
+    (renyi, ...) and ``family`` the covariance kernel (gaussian_diagonal/gaussian_full), so a
+    new f-divergence or covariance structure slots in by registration without editing here.
 
-    The key axis is inserted from the `family`'s covariance structure, not from a
-    `sigma_q.dim() == mu_q.dim()` guess: a diagonal sigma_q is (..., N, K) and gets
-    the key axis at -2 -> (..., N, 1, K); a full sigma_q is (..., N, K, K) and gets
-    it at -3 -> (..., N, 1, K, K). This stays correct when sigma_q carries a leading
-    batch dim that mu_q does not (the dim-equality heuristic misclassified that case).
+    PER-HEAD (GL(K) attention): when ``irrep_dims`` has more than one block the energy is
+    computed PER IRREP BLOCK h -- E_ij^(h) = D(q_i^(h) || Omega_ij^(h) q_j^(h)) over block h's
+    coordinates (the Gaussian MARGINAL d_head x d_head sub-block for the full family) -- and a
+    leading head axis is returned: (..., H, N, N). With ``irrep_dims`` None or a single block
+    the full-K energy (..., N, N) is returned, bit-identical to the legacy single-beta path.
+
+    The key axis is inserted from the `family`'s covariance structure (diagonal -> -2, full
+    -> -3), staying correct when sigma_q carries a leading batch dim mu_q lacks.
     """
+    functional = get_functional(divergence_family)
     is_diagonal = "diagonal" in family
     mu_q_b = mu_q.unsqueeze(-2)            # (..., N, 1, K) broadcast query over keys
     sigma_q_b = sigma_q.unsqueeze(-2) if is_diagonal else sigma_q.unsqueeze(-3)
-    return renyi(mu_q_b, sigma_q_b, mu_t, sigma_t, alpha=alpha, kl_max=kl_max, eps=eps, family=family)
+
+    if irrep_dims is None or len(irrep_dims) == 1:
+        return functional(mu_q_b, sigma_q_b, mu_t, sigma_t, alpha=alpha, kl_max=kl_max, eps=eps, family=family)
+
+    energies = []
+    start = 0
+    for d in irrep_dims:                   # one divergence per irrep block (head)
+        end = start + d
+        if is_diagonal:
+            e_h = functional(
+                mu_q_b[..., start:end], sigma_q_b[..., start:end],
+                mu_t[..., start:end], sigma_t[..., start:end],
+                alpha=alpha, kl_max=kl_max, eps=eps, family=family,
+            )
+        else:                              # full: slice the marginal (h,h) covariance sub-block
+            e_h = functional(
+                mu_q_b[..., start:end], sigma_q_b[..., start:end, start:end],
+                mu_t[..., start:end], sigma_t[..., start:end, start:end],
+                alpha=alpha, kl_max=kl_max, eps=eps, family=family,
+            )
+        energies.append(e_h)
+        start = end
+    return torch.stack(energies, dim=-3)   # (..., H, N, N)
 
 
 def self_divergence(
-    mu_q:    torch.Tensor,                 # (..., N, K)
-    sigma_q: torch.Tensor,                 # (..., N, K[,K])
-    mu_p:    torch.Tensor,                 # (..., N, K)
-    sigma_p: torch.Tensor,                 # (..., N, K[,K])
+    mu_q:              torch.Tensor,       # (..., N, K)
+    sigma_q:           torch.Tensor,       # (..., N, K[,K])
+    mu_p:              torch.Tensor,       # (..., N, K)
+    sigma_p:           torch.Tensor,       # (..., N, K[,K])
 
     *,
-    alpha:   float = 1.0,
-    kl_max:  float = 100.0,
-    eps:     float = 1e-6,
-    family:  str   = "gaussian_diagonal",
+    alpha:             float = 1.0,
+    kl_max:            float = 100.0,
+    eps:               float = 1e-6,
+    family:            str   = "gaussian_diagonal",
+    divergence_family: str   = "renyi",
 ) -> torch.Tensor:                         # (..., N) D(q_i || p_i)
-    r"""Self-coupling divergence via the seam."""
-    return renyi(mu_q, sigma_q, mu_p, sigma_p, alpha=alpha, kl_max=kl_max, eps=eps, family=family)
+    r"""Self-coupling divergence via the seam (full-K, not per-head: D(q_i||p_i) is the whole
+    belief). ``divergence_family`` selects the functional, ``family`` the covariance kernel."""
+    return get_functional(divergence_family)(
+        mu_q, sigma_q, mu_p, sigma_p, alpha=alpha, kl_max=kl_max, eps=eps, family=family,
+    )
 
 
 def attention_weights(

@@ -95,6 +95,35 @@ def test_kernel_honors_clamp_saturation_self_term():
     assert torch.allclose(km2, om2, atol=1e-5) and torch.allclose(ks2, os2, atol=1e-5)
 
 
+def test_single_block_irrep_dims_matches_none():
+    # The opt-in per-head axis must reduce EXACTLY to the legacy single-beta path when the
+    # group is one block (irrep_dims=[K] or None): glk K=2 -> identical gradients.
+    args = _setup(K=2)
+    a = belief_gradients(*args, tau=1.5, gradient_mode="filtering", irrep_dims=[2])
+    b = belief_gradients(*args, tau=1.5, gradient_mode="filtering", irrep_dims=None)
+    assert torch.allclose(a[0], b[0], atol=1e-7) and torch.allclose(a[1], b[1], atol=1e-7)
+
+
+def test_kernel_matches_oracle_multihead_canonical():
+    # THE per-head correctness gate: for a multi-block (block_glk, 2 heads) group, the hand
+    # filtering kernel must equal the autograd oracle of the per-head canonical F. The envelope
+    # cancellation of the softmax-nonlinearity term holds PER HEAD only because the attention
+    # entropy is summed per head -- so this also pins that the entropy stays per-head.
+    g = torch.Generator().manual_seed(2)
+    N, K = 4, 4
+    grp = get_group("block_glk")(4, 2)                  # irrep_dims [2, 2]
+    phi = 0.15 * torch.randn(1, N, grp.generators.shape[0], generator=g)
+    omega = compute_transport_operators(phi, grp)["Omega"][0]
+    mu = torch.randn(N, K, generator=g); sigma = torch.rand(N, K, generator=g) + 0.5
+    mu_p = torch.randn(N, K, generator=g); sigma_p = torch.rand(N, K, generator=g) + 0.5
+    km, ks = belief_gradients(mu, sigma, mu_p, sigma_p, omega, tau=1.5,
+                              gradient_mode="filtering", irrep_dims=grp.irrep_dims)
+    om, os_ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, tau=1.5,
+                                        gradient_mode="filtering", irrep_dims=grp.irrep_dims)
+    assert torch.allclose(km, om, atol=1e-5)
+    assert torch.allclose(ks, os_, atol=1e-5)
+
+
 def test_self_gradient_vanishes_when_q_equals_p_and_identity_transport():
     K = 2
     N = 3
