@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from vfe3.belief import BeliefState
@@ -141,3 +142,20 @@ def test_fixed_seed_regression():
     assert torch.isfinite(out.mu).all() and torch.isfinite(out.sigma).all() and torch.isfinite(out.phi).all()
     checksum = float(out.mu.sum() + out.sigma.sum() + out.phi.sum())
     assert abs(checksum - EXPECTED_CHECKSUM) < 1e-3
+
+
+# --- audit Group 2 (1c/5a): the **kwargs sink became explicit accept-and-ignore knobs ---
+def test_free_energy_value_rejects_misspelled_kwarg():
+    """A misspelled real parameter now raises TypeError instead of being silently swallowed,
+    while genuine iteration-only knobs are still accepted and ignored."""
+    b, mu_p, sigma_p, grp = _belief()
+    # iteration-only knobs accepted and ignored (one call site forwards them to both
+    # free_energy_value and e_step_iteration)
+    F = free_energy_value(
+        b, mu_p, sigma_p, grp, tau=1.0,
+        gradient_mode="filtering", phi_precond_mode="none", phi_retract_mode="euclidean",
+        sigma_max=5.0, e_sigma_q_trust=5.0,
+    )
+    assert torch.isfinite(F)
+    with pytest.raises(TypeError):
+        free_energy_value(b, mu_p, sigma_p, grp, tau=1.0, familly="gaussian_diagonal")

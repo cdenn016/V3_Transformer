@@ -59,15 +59,19 @@ def free_energy_value(
     c0:                        float = 1.0,
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
+    sigma_max:                 float = 5.0,            # accepted-and-ignored iteration-only knob
+    e_sigma_q_trust:           float = 5.0,            # accepted-and-ignored iteration-only knob
 
     include_attention_entropy: bool = True,
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
     alpha_mode:                str  = "constant",
+    gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
+    phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
+    phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
 
     log_prior:                 Optional[torch.Tensor] = None,
     keys:                      Optional[BeliefState]  = None,   # None -> global F; else keys frozen at `keys`
-    **kwargs,                                                   # accept-and-ignore iteration-only knobs
 ) -> torch.Tensor:                   # scalar F
     r"""Scalar free energy of a belief. ``keys=None`` -> global F (keys = the belief);
     ``keys`` given -> F with the transported keys frozen at ``keys`` (the F_filt objective).
@@ -76,10 +80,11 @@ def free_energy_value(
                   + Sum_j beta_ij E_ij + tau Sum_j beta_ij log(beta_ij/pi_ij) ],
         E_ij = D(q_i || Omega_ij q_j),  beta = softmax_j(log_prior - E/tau).
 
-    The shared ``**kwargs`` sink swallows the iteration-only knobs (gradient_mode,
-    e_mu_lr/e_sigma_lr/e_phi_lr, sigma_max, e_sigma_q_trust, phi_precond_mode) so the
-    common call site in ``e_step`` may forward one knob bag to both this and
-    ``e_step_iteration`` without error; the shared knobs bind to real parameters here.
+    The iteration-only knobs (gradient_mode, phi_precond_mode, phi_retract_mode,
+    sigma_max, e_sigma_q_trust) are declared here as EXPLICIT accept-and-ignore
+    parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may
+    forward one knob bag to both this and ``e_step_iteration`` while a MISSPELLED real
+    parameter still raises ``TypeError`` here instead of being silently swallowed.
     """
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
     # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
@@ -238,13 +243,20 @@ def e_step(
     returns the global-F trajectory (a DIAGNOSTIC; parallel updates are not guaranteed
     monotone per iteration)."""
     traj: List[float] = []
+
+    def _f_diag(b: BeliefState) -> float:
+        # Diagnostic scalar: under no_grad so the logged trajectory never enters the
+        # training graph, and .item() instead of float(tensor) makes the host sync explicit.
+        with torch.no_grad():
+            return free_energy_value(b, mu_p, sigma_p, group, tau=tau, log_prior=log_prior, **kwargs).item()
+
     if return_trajectory:
-        traj.append(float(free_energy_value(belief, mu_p, sigma_p, group, tau=tau, log_prior=log_prior, **kwargs)))
+        traj.append(_f_diag(belief))
     for _ in range(n_iter):
         belief = e_step_iteration(
             belief, mu_p, sigma_p, group, tau=tau,
             e_mu_lr=e_mu_lr, e_sigma_lr=e_sigma_lr, e_phi_lr=e_phi_lr, log_prior=log_prior, **kwargs,
         )
         if return_trajectory:
-            traj.append(float(free_energy_value(belief, mu_p, sigma_p, group, tau=tau, log_prior=log_prior, **kwargs)))
+            traj.append(_f_diag(belief))
     return (belief, traj) if return_trajectory else belief

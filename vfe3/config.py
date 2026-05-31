@@ -150,9 +150,11 @@ class VFE3Config:
             )
 
         # belief family. ``family`` selects the covariance-structure divergence kernel
-        # (gaussian_diagonal | gaussian_full); ``diagonal_covariance`` is a SEPARATE live bool,
-        # cross-validated to stay consistent with it (kept distinct per the modularity design,
-        # not collapsed). It threads into the PriorBank encode to choose diagonal vs full SPD.
+        # (gaussian_diagonal | gaussian_full). ``divergence_family`` is the SEPARATE functional
+        # (f-divergence) seam (renyi, ...; validated above), and ``diagonal_covariance`` is a
+        # SEPARATE live bool, cross-validated to stay consistent with family. The three are kept
+        # distinct and modular per CLAUDE.md (slot in different f-divergences / families); NOT
+        # collapsed, and divergence_family is NOT forced equal to family.
         _require(self.family, _VALID_DIVERGENCE_FAMILIES, "family")
         if self.diagonal_covariance != (self.family == "gaussian_diagonal"):
             raise ValueError(
@@ -222,8 +224,16 @@ class VFE3Config:
 
     @property
     def tau(self) -> float:
-        """Attention softmax temperature tau = kappa * sqrt(K)."""
-        return self.kappa * (self.embed_dim ** 0.5)
+        """Attention softmax temperature tau = kappa * sqrt(d_head).
+
+        Per-head dimension d_head = embed_dim // n_heads, so kappa=1 recovers standard
+        scaled dot-product attention (Vaswani sqrt(d_k)) PER HEAD. Audit finding 6c: the
+        manuscript's free-energy functional (eq:pointwise) writes tau = kappa*sqrt(K) over
+        the full belief, but its standard-attention recovery is derived per-head with
+        sqrt(d_k); the code follows the recovery convention so that kappa=1 is the
+        Vaswani temperature.
+        """
+        return self.kappa * (self.d_head ** 0.5)
 
     @property
     def d_head(self) -> int:

@@ -51,9 +51,11 @@ def test_config_model_defaults():
     assert cfg.use_prior_bank is True
 
 
-def test_tau_is_kappa_sqrt_k_and_d_head():
+def test_tau_is_kappa_sqrt_d_head():
+    # Audit finding 6c: tau = kappa * sqrt(d_head) (per-head, Vaswani sqrt(d_k)),
+    # NOT sqrt(embed_dim). embed_dim=16, n_heads=4 -> d_head=4 -> sqrt(d_head)=2.
     cfg = VFE3Config(embed_dim=16, n_heads=4, kappa=1.5)
-    assert abs(cfg.tau - 1.5 * 4.0) < 1e-9
+    assert abs(cfg.tau - 1.5 * 2.0) < 1e-9
     assert cfg.d_head == 4
 
 
@@ -105,6 +107,14 @@ def test_config_has_state_dependent_alpha_shape_params():
         VFE3Config(b0=0.0)
     with pytest.raises(ValueError):
         VFE3Config(c0=-1.0)
+
+
+def test_diagonal_covariance_must_agree_with_family():
+    """diagonal_covariance is a live bool cross-validated against family (kept distinct, not collapsed)."""
+    with pytest.raises(ValueError):
+        VFE3Config(diagonal_covariance=False)          # family defaults to gaussian_diagonal
+    # the consistent full-covariance pair is accepted (divergence_family stays the functional seam)
+    VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="full")
 
 
 def test_config_phi_retract_mode_validated():

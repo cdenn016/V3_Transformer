@@ -165,14 +165,17 @@ def test_norm_type_final_is_wired():
 
 
 # --- Audit 2026-05-31 --------------------------------------------------------
-def test_seed_pins_prior_bank_initialization():
-    """The documented cfg.seed pins the PriorBank table init so a run is reproducible."""
-    cfg = VFE3Config(vocab_size=40, embed_dim=8, n_heads=2, max_seq_len=4, seed=123)
-    m1 = VFEModel(cfg)
-    m2 = VFEModel(cfg)
+def test_manual_seed_makes_model_init_reproducible():
+    """run_training pins reproducibility via torch.manual_seed(cfg.seed) before building the model;
+    verify the mechanism it relies on -- seeding then constructing yields identical prior tables,
+    and a different seed yields different ones. (Seeding lives at the entry point, not __init__, so
+    it does not clobber a caller-set RNG state.)"""
+    cfg = VFE3Config(vocab_size=40, embed_dim=8, n_heads=2, max_seq_len=4)
+    torch.manual_seed(123); m1 = VFEModel(cfg)
+    torch.manual_seed(123); m2 = VFEModel(cfg)
     assert torch.equal(m1.prior_bank.mu_embed, m2.prior_bank.mu_embed)
     assert torch.equal(m1.prior_bank.phi_embed, m2.prior_bank.phi_embed)
-    m3 = VFEModel(VFE3Config(vocab_size=40, embed_dim=8, n_heads=2, max_seq_len=4, seed=999))
+    torch.manual_seed(999); m3 = VFEModel(cfg)
     assert not torch.equal(m1.prior_bank.mu_embed, m3.prior_bank.mu_embed)
 
 

@@ -20,26 +20,49 @@ def stable_matrix_exp_pair(
     matrix:         torch.Tensor,             # (..., d, d) Lie-algebra matrices
 
     *,
-    max_norm:       float = 15.0,
-    dim_threshold:  int   = 20,
-    skew_symmetric: bool  = False,
-    only_forward:   bool  = False,
+    max_norm:       float           = 15.0,
+    dim_threshold:  int             = 20,
+    skew_symmetric: bool            = False,
+    only_forward:   bool            = False,
+    block_dims:     Optional[List[int]] = None,   # per-block sizes (sum==d) for a block-diagonal M
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""exp(M) and optionally exp(-M) with Frobenius-norm clamp + float64 upcast.
 
     Frobenius-norm clamp + float64 upcast keep matrix_exp stable for large ||M||.
+
+    ``block_dims`` (audit 4b): when M is block-diagonal with these blocks (e.g. block_glk's
+    GL(d_head)^H), exp(M) is exactly block-diagonal with the per-block exponentials, so each
+    d_head x d_head block is exponentiated independently -- an O(H * d_head^3) cost instead of
+    O(K^3) for the full K x K. The result is BIT-equivalent to the full exp (the global
+    Frobenius clamp is applied to the WHOLE matrix first, and each block keeps the dtype the
+    full-K path would pick, so neither the scale nor the precision changes). ``None`` (a single
+    block, a cross-coupled basis, or a skew group) takes the full-matrix path unchanged.
     """
+    # Global Frobenius clamp on the FULL matrix (one scale for all blocks) -- identical to the
+    # un-blocked path, so block slicing below cannot change the operator.
     mat_norm = matrix.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
     scale = (max_norm / mat_norm).clamp(max=1.0)
     matrix = matrix * scale
 
     d = matrix.shape[-1]
     orig_dtype = matrix.dtype
+    # The full-K path's dtype choice; the per-block path forces the SAME dtype so a small block
+    # (d_head < dim_threshold) does not silently drop to float32 and drift from the full exp.
+    up_dtype = torch.float64 if d >= dim_threshold else torch.float32
+
     with torch.amp.autocast('cuda', enabled=False):
-        if d >= dim_threshold:
-            matrix_up = matrix.double().contiguous()
-        else:
-            matrix_up = matrix.float().contiguous()
+        matrix_up = matrix.to(up_dtype).contiguous()
+
+        if block_dims is not None and len(block_dims) > 1:
+            exp_pos = _blockwise_matrix_exp(matrix_up, block_dims).to(orig_dtype)
+            if only_forward:
+                exp_neg = None
+            elif skew_symmetric:
+                exp_neg = exp_pos.transpose(-1, -2)
+            else:
+                exp_neg = _blockwise_matrix_exp(-matrix_up, block_dims).to(orig_dtype)
+            return exp_pos, exp_neg
+
         exp_pos = torch.linalg.matrix_exp(matrix_up).to(orig_dtype)
         if only_forward:
             exp_neg = None
@@ -48,6 +71,26 @@ def stable_matrix_exp_pair(
         else:
             exp_neg = torch.linalg.matrix_exp(-matrix_up).to(orig_dtype)
     return exp_pos, exp_neg
+
+
+def _blockwise_matrix_exp(
+    matrix:     torch.Tensor,             # (..., d, d) block-diagonal Lie-algebra matrix
+    block_dims: List[int],                # block sizes; sum == d
+) -> torch.Tensor:                        # (..., d, d) block-diagonal exp
+    r"""exp of a block-diagonal matrix = block-diagonal of the blocks' exps (audit 4b).
+
+    Exact for a block-diagonal M (off-block entries are zero, so the blocks commute trivially
+    and exp does not mix them). Off-block entries of the output are left at zero -- matching the
+    full exp, whose off-block entries are exactly zero for a block-diagonal input.
+    """
+    out = torch.zeros_like(matrix)
+    start = 0
+    for dim in block_dims:
+        end = start + dim
+        blk = matrix[..., start:end, start:end].contiguous()
+        out[..., start:end, start:end] = torch.linalg.matrix_exp(blk)
+        start = end
+    return out
 
 
 def compute_transport_operators(
@@ -82,8 +125,11 @@ def compute_transport_operators(
         raise ValueError(f"gauge_mode must be 'learned' or 'trivial', got {gauge_mode!r}")
 
     phi_matrix = torch.einsum("bna,aij->bnij", phi, generators)
+    # Per-block exp when the group is genuinely block-diagonal (block_glk without cross-couplings
+    # -> irrep_dims [d_head]*H); single-block ([K]: glk, so_k, cross-coupled) takes the full path.
+    block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
-        phi_matrix, skew_symmetric=group.skew_symmetric
+        phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims
     )
     omega = torch.einsum("bikl,bjlm->bijkm", exp_phi, exp_neg_phi)
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}

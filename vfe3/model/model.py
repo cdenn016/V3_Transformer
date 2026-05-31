@@ -7,6 +7,7 @@ the batch around the (unbatched) E-step; decode and CE are batched.
 """
 
 import inspect
+from contextlib import nullcontext
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -53,9 +54,9 @@ class VFEModel(nn.Module):
 
     def __init__(self, cfg: VFE3Config) -> None:
         super().__init__()
-        # Pin the documented seed so the PriorBank prior-table initialization (the only
-        # randomness at construction) is reproducible run-to-run from cfg.seed alone.
-        torch.manual_seed(cfg.seed)
+        # Reproducibility is pinned at the entry point run_training (torch.manual_seed(cfg.seed)
+        # before model + loader are built), NOT here: seeding inside __init__ would clobber a
+        # caller-set RNG state (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
         self.group = build_group(cfg)
         n_gen = self.group.generators.shape[0]
@@ -65,8 +66,18 @@ class VFEModel(nn.Module):
             diagonal_covariance=cfg.diagonal_covariance,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
         )
+        # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
+        # maps (K, eps), so re-instantiating them per block/forward only churned objects.
+        self.block_norm = get_norm(cfg.norm_type_block)(cfg.embed_dim, eps=cfg.eps) \
+            if cfg.norm_type_block != "none" else None
+        self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps) \
+            if cfg.norm_type_final != "none" else None
+        # Causal/attention log-prior is loop-invariant for fixed (N, device, dtype); cache it
+        # (audit 4e) keyed on those so it is built once, not every forward. Not an nn.buffer
+        # because it depends on the runtime N (sequence length), which varies across calls.
+        self._log_prior_cache: dict = {}
 
-    def _apply(self, fn, recurse: bool = True):
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":
         r"""Carry the gauge group's generators through ``.to(...)`` / ``.cuda()`` etc.
 
         ``self.group`` is a plain ``GaugeGroup`` dataclass, not an ``nn.Module``, so its
@@ -76,7 +87,25 @@ class VFEModel(nn.Module):
         device/dtype contract holds (CLAUDE.md: device-agnostic, float32-with-CUDA)."""
         super()._apply(fn, recurse)
         self.group.generators = fn(self.group.generators)
+        self._log_prior_cache.clear()        # device/dtype moved: cached masks are now stale
         return self
+
+    def _attention_log_prior(
+        self,
+        n:      int,                          # sequence length N (varies across calls)
+        device: torch.device,
+    ) -> torch.Tensor:
+        r"""Loop-invariant attention log-prior, cached on (N, device, dtype) (audit 4e).
+
+        The dtype is taken from the prior-bank mean table so the mask matches the belief
+        dtype after a ``.to(torch.float64)`` move (audit 2f: the old call omitted dtype)."""
+        dtype = self.prior_bank.mu_embed.dtype
+        key = (n, device, dtype)
+        cached = self._log_prior_cache.get(key)
+        if cached is None:
+            cached = attention_log_prior(self.cfg.attention_prior, n, n, device=device, dtype=dtype)
+            self._log_prior_cache[key] = cached
+        return cached
 
     def forward(
         self,
@@ -86,23 +115,21 @@ class VFEModel(nn.Module):
         r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given."""
         B, N = token_ids.shape
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
-        log_prior = attention_log_prior(
-            self.cfg.attention_prior, N, N, device=token_ids.device,
-        )
+        log_prior = self._attention_log_prior(N, token_ids.device)
 
         outs = []
-        run = torch.no_grad() if self.cfg.detach_e_step else _nullcontext()
+        run = torch.no_grad() if self.cfg.detach_e_step else nullcontext()
         with run:
             for b in range(B):
                 belief_b = BeliefState(mu=beliefs.mu[b], sigma=beliefs.sigma[b], phi=beliefs.phi[b])
-                out_b = vfe_stack(belief_b, belief_b.mu, belief_b.sigma, self.group, self.cfg, log_prior=log_prior)
+                out_b = vfe_stack(belief_b, belief_b.mu, belief_b.sigma, self.group, self.cfg,
+                                  log_prior=log_prior, block_norm=self.block_norm)
                 outs.append(out_b)
         mu_final = torch.stack([o.mu for o in outs], dim=0)      # (B, N, K)
         sigma_final = torch.stack([o.sigma for o in outs], dim=0)
 
-        if self.cfg.norm_type_final != "none":                   # config-selected final norm
-            norm = get_norm(self.cfg.norm_type_final)(self.cfg.embed_dim, eps=self.cfg.eps)
-            mu_final = norm(mu_final, sigma_final)
+        if self.final_norm is not None:                          # config-selected final norm (cached)
+            mu_final = self.final_norm(mu_final, sigma_final)
 
         logits = self.prior_bank.decode(mu_final, sigma_final)   # (B, N, V)
         if targets is None:
@@ -127,8 +154,3 @@ class VFEModel(nn.Module):
             phi_all = torch.stack([o.phi for o in outs], dim=0)
             loss = loss + 0.5 * self.cfg.mass_phi * (phi_all ** 2).mean()
         return logits, loss, ce.detach()
-
-
-class _nullcontext:
-    def __enter__(self): return None
-    def __exit__(self, *a): return False
