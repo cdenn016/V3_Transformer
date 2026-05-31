@@ -119,6 +119,11 @@ class VFEModel(nn.Module):
             ce = flat_logits.sum() * 0.0
         loss = ce
         if self.cfg.mass_phi > 0.0:
+            # M-step gauge-frame penalty (manuscript Algorithm 1 M-step loss): regularizes the
+            # CONVERGED output phi -> backprops to the learned prior table phi_embed. This is the
+            # outer-loss role; mass_phi ALSO enters the inner phi E-step objective (e_step:
+            # phi_alignment_loss), shaping the inference trajectory. Both roles are in the
+            # manuscript algorithm (E-step phi gradient and M-step loss both carry alpha_phi/2||phi||^2).
             phi_all = torch.stack([o.phi for o in outs], dim=0)
             loss = loss + 0.5 * self.cfg.mass_phi * (phi_all ** 2).mean()
         return logits, loss, ce.detach()

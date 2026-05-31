@@ -203,6 +203,22 @@ def test_b0_c0_threaded_into_state_dependent_alpha():
     assert not torch.allclose(run(1.0), run(8.0), atol=1e-5)
 
 
+def test_mass_phi_penalizes_phi_inside_the_e_step():
+    """mass_phi enters the phi E-step objective (manuscript Algorithm 1: +alpha_phi/2 ||phi||^2
+    inside the phi gradient), pulling the inferred phi toward 0 during inference -- not only the
+    outer M-step training loss. A larger mass_phi must shrink the E-step's output phi."""
+    grp = get_group("block_glk")(4, 2)
+    n_gen = grp.generators.shape[0]
+
+    def run(mass):
+        b = _belief(K=4, n_gen=n_gen)
+        cfg = VFE3Config(embed_dim=4, n_heads=2, n_layers=1, n_e_steps=3, e_mu_lr=0.05,
+                         e_phi_lr=0.2, mass_phi=mass)
+        return vfe_stack(b, b.mu, b.sigma, grp, cfg).phi
+
+    assert run(5.0).norm() < run(0.0).norm()
+
+
 def test_phi_retract_mode_bch_reachable_and_differs():
     """phi_retract_mode='bch' is reachable through the E-step and differs from 'euclidean'."""
     grp = get_group("block_glk")(4, 2)

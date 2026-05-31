@@ -32,6 +32,19 @@ def _transport(
     return compute_transport_operators(phi.unsqueeze(0), group)["Omega"][0]
 
 
+def _transport_qk(
+    query_phi: torch.Tensor,         # (N, n_gen) current query frames phi_i
+    key_phi:   torch.Tensor,         # (N, n_gen) frozen key frames phi_j
+    group:     GaugeGroup,
+) -> torch.Tensor:                   # (N, N, K, K) Omega_ij = exp(phi_i^q) exp(-phi_j^k)
+    r"""Mixed-frame transport for the FILTERED objective: the query frame phi_i is current
+    (belief) and the key frame phi_j is frozen (keys). Reduces to ``_transport`` exactly when
+    query_phi == key_phi (the global / keys-None case)."""
+    exp_q     = compute_transport_operators(query_phi.unsqueeze(0), group)["exp_phi"][0]      # exp(phi_i^q)
+    exp_neg_k = compute_transport_operators(key_phi.unsqueeze(0), group)["exp_neg_phi"][0]    # exp(-phi_j^k)
+    return torch.einsum("ikl,jlm->ijkm", exp_q, exp_neg_k)
+
+
 def free_energy_value(
     belief:                    BeliefState,
     mu_p:                      torch.Tensor,        # (N, K) prior means
@@ -68,8 +81,11 @@ def free_energy_value(
     common call site in ``e_step`` may forward one knob bag to both this and
     ``e_step_iteration`` without error; the shared knobs bind to real parameters here.
     """
+    # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
+    # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
+    # and the transported key beliefs come from `keys`; only the key side is frozen.
     key_belief = belief if keys is None else keys
-    omega = _transport(key_belief.phi, group)
+    omega = _transport(belief.phi, group) if keys is None else _transport_qk(belief.phi, keys.phi, group)
     mu_t = transport_mean(omega.unsqueeze(0), key_belief.mu.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), key_belief.sigma.unsqueeze(0))[0]
 
@@ -95,29 +111,33 @@ def phi_alignment_loss(
     alpha_div: float = 1.0,
     kl_max:    float = 100.0,
     eps:       float = 1e-6,
+    mass_phi:  float = 0.0,
     family:    str   = "gaussian_diagonal",
     divergence_family: str = "renyi",
 
     include_attention_entropy: bool = True,
     log_prior: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    r"""Canonical belief-coupling block as a function of phi (mu, sigma fixed):
+    r"""Canonical belief-coupling block as a function of phi (mu, sigma fixed), plus the
+    gauge-frame penalty (manuscript Algorithm 1, line for nabla_phi F):
 
-        L(phi) = Sum_ij [ beta_ij E_ij + tau beta_ij log(beta_ij/pi_ij) ],
+        L(phi) = Sum_ij [ beta_ij E_ij + tau beta_ij log(beta_ij/pi_ij) ] + (mass_phi/2) ||phi||^2,
         E_ij = D(q_i || Omega_ij(phi) q_j),  beta = softmax_j(log_prior - E/tau).
-    Both roles of phi flow (Omega_ij depends on phi_i and phi_j); autograd gives the
-    envelope phi-gradient. The canonical (entropy) branch reuses ``reduced_free_energy``,
-    the -tau log Z envelope form of that block (the pi-fallback + clamp live there, once).
+    Both roles of phi flow (Omega_ij depends on phi_i and phi_j); autograd gives the envelope
+    phi-gradient. The ``mass_phi`` term makes the phi E-step descend the PENALIZED objective
+    during inference (distinct from the outer M-step ||phi||^2 on the learned prior table). The
+    canonical (entropy) branch reuses ``reduced_free_energy``, the -tau log Z envelope form.
     """
     omega = _transport(phi, group)
     mu_t = transport_mean(omega.unsqueeze(0), mu.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), sigma.unsqueeze(0))[0]
     energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps,
                              family=family, divergence_family=divergence_family, irrep_dims=group.irrep_dims)
+    mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0
     if include_attention_entropy:
-        return reduced_free_energy(energy, tau=tau, log_prior=log_prior).sum()
+        return reduced_free_energy(energy, tau=tau, log_prior=log_prior).sum() + mass
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)
-    return (beta * energy).sum()
+    return (beta * energy).sum() + mass
 
 
 def e_step_iteration(
@@ -139,6 +159,7 @@ def e_step_iteration(
     eps:                       float = 1e-6,
     sigma_max:                 float = 5.0,
     e_sigma_q_trust:           float = 5.0,
+    mass_phi:                  float = 0.0,
 
     include_attention_entropy: bool = True,
     gradient_mode:             str  = "filtering",
@@ -184,7 +205,7 @@ def e_step_iteration(
             phi_g = belief.phi.detach().clone().requires_grad_(True)
             L = phi_alignment_loss(
                 mu, sigma, phi_g, group, tau=tau, alpha_div=alpha_div, kl_max=kl_max, eps=eps,
-                family=family, divergence_family=divergence_family,
+                mass_phi=mass_phi, family=family, divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy, log_prior=log_prior,
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]

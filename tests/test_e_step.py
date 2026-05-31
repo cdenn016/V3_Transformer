@@ -39,6 +39,17 @@ def test_free_energy_filtering_equals_global_at_a_point():
     assert torch.allclose(Fg, Ff, atol=1e-6)
 
 
+def test_filtered_free_energy_tracks_the_current_query_frame():
+    # GL(K) finding #6: with frozen keys, the filtered objective must build Omega_ij from the
+    # CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys) -- not freeze
+    # both at keys. So changing only the query phi (keys fixed) must change the filtered F.
+    b, mu_p, sigma_p, grp = _belief()
+    b2 = BeliefState(mu=b.mu, sigma=b.sigma, phi=b.phi + 0.5)        # same beliefs, shifted query frame
+    F1 = free_energy_value(b,  mu_p, sigma_p, grp, tau=1.5, keys=b)  # keys frozen at b
+    F2 = free_energy_value(b2, mu_p, sigma_p, grp, tau=1.5, keys=b)  # keys still frozen at b
+    assert not torch.allclose(F1, F2, atol=1e-5)
+
+
 # --- Task 2: one inner iteration -------------------------------------------
 from vfe3.inference.e_step import e_step_iteration
 
