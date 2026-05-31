@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 _VALID_DIVERGENCE_FAMILIES = ("gaussian_diagonal", "gaussian_full")
+_VALID_DIVERGENCE_FUNCTIONALS = ("renyi",)
 _VALID_GAUGE_GROUPS        = ("glk", "block_glk", "so_k")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
@@ -38,8 +39,8 @@ class VFE3Config:
     kl_max:                    float = 100.0
 
     # divergence seam
-    divergence_family:         str   = "gaussian_diagonal"
-    alpha_div:                 float = 1.0
+    divergence_family:         str   = "renyi"        # divergence FUNCTIONAL (renyi, ...); alpha_div selects member
+    alpha_div:                 float = 1.0            # Renyi order (alpha=1 -> KL)
 
     # model structure
     vocab_size:                int   = 50257
@@ -111,8 +112,10 @@ class VFE3Config:
         if self.kl_max <= 0.0:
             raise ValueError(f"kl_max must be positive, got {self.kl_max}")
 
-        # divergence seam
-        _require(self.divergence_family, _VALID_DIVERGENCE_FAMILIES, "divergence_family")
+        # divergence seam: divergence_family is the FUNCTIONAL (f-divergence) registry key
+        # (renyi, ...), distinct from `family` (the covariance-structure kernel). alpha_div is
+        # the Renyi order. Both are live, modular seams (CLAUDE.md: slot in different f-divergences).
+        _require(self.divergence_family, _VALID_DIVERGENCE_FUNCTIONALS, "divergence_family")
         if self.alpha_div <= 0.0:
             raise ValueError(f"alpha_div must be positive, got {self.alpha_div}")
 

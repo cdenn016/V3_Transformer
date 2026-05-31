@@ -49,6 +49,7 @@ def free_energy_value(
 
     include_attention_entropy: bool = True,
     family:                    str  = "gaussian_diagonal",
+    divergence_family:         str  = "renyi",
     alpha_mode:                str  = "constant",
 
     log_prior:                 Optional[torch.Tensor] = None,
@@ -72,9 +73,11 @@ def free_energy_value(
     mu_t = transport_mean(omega.unsqueeze(0), key_belief.mu.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), key_belief.sigma.unsqueeze(0))[0]
 
-    sd = self_divergence(belief.mu, belief.sigma, mu_p, sigma_p, alpha=alpha_div, kl_max=kl_max, eps=eps, family=family)
+    sd = self_divergence(belief.mu, belief.sigma, mu_p, sigma_p, alpha=alpha_div, kl_max=kl_max, eps=eps,
+                         family=family, divergence_family=divergence_family)
     alpha, reg = self_coupling_alpha(sd, value=value, mode=alpha_mode, b0=b0, c0=c0)
-    energy = pairwise_energy(belief.mu, belief.sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps, family=family)
+    energy = pairwise_energy(belief.mu, belief.sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps,
+                             family=family, divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     return free_energy(
         sd, energy, alpha, tau=tau, include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if alpha_mode != "constant" else None),
@@ -93,6 +96,7 @@ def phi_alignment_loss(
     kl_max:    float = 100.0,
     eps:       float = 1e-6,
     family:    str   = "gaussian_diagonal",
+    divergence_family: str = "renyi",
 
     include_attention_entropy: bool = True,
     log_prior: Optional[torch.Tensor] = None,
@@ -108,7 +112,8 @@ def phi_alignment_loss(
     omega = _transport(phi, group)
     mu_t = transport_mean(omega.unsqueeze(0), mu.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), sigma.unsqueeze(0))[0]
-    energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps, family=family)
+    energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps,
+                             family=family, divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     if include_attention_entropy:
         return reduced_free_energy(energy, tau=tau, log_prior=log_prior).sum()
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)
@@ -138,6 +143,7 @@ def e_step_iteration(
     include_attention_entropy: bool = True,
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
+    divergence_family:         str  = "renyi",
     alpha_mode:                str  = "constant",
     phi_precond_mode:          str  = "none",
     phi_retract_mode:          str  = "euclidean",
@@ -151,7 +157,8 @@ def e_step_iteration(
         belief.mu, belief.sigma, mu_p, sigma_p, omega,
         tau=tau, alpha_div=alpha_div, value=value, b0=b0, c0=c0, kl_max=kl_max, eps=eps,
         include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
-        family=family, alpha_mode=alpha_mode, log_prior=log_prior,
+        family=family, divergence_family=divergence_family, alpha_mode=alpha_mode,
+        irrep_dims=group.irrep_dims, log_prior=log_prior,
     )
     nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
 
@@ -177,7 +184,8 @@ def e_step_iteration(
             phi_g = belief.phi.detach().clone().requires_grad_(True)
             L = phi_alignment_loss(
                 mu, sigma, phi_g, group, tau=tau, alpha_div=alpha_div, kl_max=kl_max, eps=eps,
-                family=family, include_attention_entropy=include_attention_entropy, log_prior=log_prior,
+                family=family, divergence_family=divergence_family,
+                include_attention_entropy=include_attention_entropy, log_prior=log_prior,
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]
         grad_phi = precondition_phi_gradient(

@@ -148,6 +148,36 @@ def test_pairwise_energy_diagonal_and_full_match_hand_loop():
     assert torch.allclose(Ef, Ef_ref, atol=1e-4)
 
 
+def test_pairwise_energy_per_head_splits_by_irrep_block():
+    # GL(K) finding #1: with irrep_dims the energy carries a per-head (per-irrep-block) axis
+    # (...,H,N,N); head h is the divergence over block h's coordinates, and (diagonal KL being
+    # additive over independent blocks) the heads sum to the full-K energy.
+    from vfe3.divergence import renyi
+    from vfe3.free_energy import pairwise_energy
+
+    torch.manual_seed(3)
+    N, K = 3, 4
+    mu_q = torch.randn(N, K); mu_t = torch.randn(N, N, K)
+    sigma_q = torch.rand(N, K) + 0.5; sigma_t = torch.rand(N, N, K) + 0.5
+
+    E = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal", irrep_dims=[2, 2])
+    assert E.shape == (2, N, N)
+    assert not torch.allclose(E[0], E[1], atol=1e-3)    # heads are genuinely distinct, not a broadcast
+    for h, (s, e) in enumerate([(0, 2), (2, 4)]):
+        Eh_ref = torch.stack([torch.stack([
+            renyi(mu_q[i, s:e], sigma_q[i, s:e], mu_t[i, j, s:e], sigma_t[i, j, s:e],
+                  family="gaussian_diagonal")
+            for j in range(N)]) for i in range(N)])
+        assert torch.allclose(E[h], Eh_ref, atol=1e-5)
+
+    E_full = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal", irrep_dims=None)
+    assert E_full.shape == (N, N)                       # None -> single full-K energy (backward compat)
+    assert torch.allclose(E.sum(0), E_full, atol=1e-5)  # diagonal KL is additive over blocks
+    # single-block irrep_dims reduces to the full-K energy (bit-identical to None)
+    E_one = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal", irrep_dims=[4])
+    assert torch.allclose(E_one, E_full, atol=1e-6)
+
+
 def test_autograd_F_matches_finite_difference():
     torch.manual_seed(0)
     N, K = 3, 4

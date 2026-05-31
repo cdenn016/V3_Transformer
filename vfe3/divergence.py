@@ -240,3 +240,35 @@ def kl(
         mu_q, sigma_q, mu_t, sigma_t,
         alpha=1.0, kl_max=kl_max, eps=eps, family=family,
     )
+
+
+# ---------------------------------------------------------------------------
+# Functional registry: divergence_family name -> divergence FUNCTIONAL. Distinct from the
+# per-family covariance kernels above (gaussian_diagonal/gaussian_full): the functional is
+# the f-divergence form (Renyi today, parameterized by alpha; KL is alpha=1), and dispatches
+# the covariance kernel via its own `family` argument. A new functional (a different
+# f-divergence) slots in by register_functional, never by editing the energy call sites.
+# Signature: fn(mu_q, sigma_q, mu_t, sigma_t, *, alpha, kl_max, eps, family) -> Tensor
+# ---------------------------------------------------------------------------
+_FUNCTIONALS: Dict[str, Callable] = {}
+
+
+def register_functional(name: str) -> Callable:
+    """Decorator registering a divergence functional under ``name``."""
+    def _wrap(fn: Callable) -> Callable:
+        _FUNCTIONALS[name] = fn
+        return fn
+    return _wrap
+
+
+def get_functional(name: str) -> Callable:
+    """Return the registered divergence functional for ``name`` (KeyError if absent)."""
+    if name not in _FUNCTIONALS:
+        raise KeyError(
+            f"no divergence functional registered under {name!r}; "
+            f"available: {sorted(_FUNCTIONALS)}"
+        )
+    return _FUNCTIONALS[name]
+
+
+register_functional("renyi")(renyi)

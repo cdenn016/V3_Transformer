@@ -14,7 +14,7 @@ Reference for every family / divergence / mode; the hand kernels are pinned to t
 FILTERING oracle.
 """
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -42,11 +42,16 @@ def belief_gradients_autograd(
     include_attention_entropy: bool = True,
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
+    divergence_family:         str  = "renyi",
     alpha_mode:                str  = "constant",
 
+    irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:   # (grad_mu, grad_sigma), each (N, K)
-    r"""Autograd of canonical F_red w.r.t. (mu, sigma). See module docstring for modes."""
+    r"""Autograd of canonical F_red w.r.t. (mu, sigma). See module docstring for modes.
+
+    ``irrep_dims`` (when multi-block) routes the per-head energy through ``pairwise_energy``;
+    autograd then yields the correct per-head belief gradient with no special-casing here."""
     mu_q = mu.detach().clone().requires_grad_(True)
     sigma_q = sigma.detach().clone().requires_grad_(True)
 
@@ -60,9 +65,11 @@ def belief_gradients_autograd(
     mu_t = transport_mean(omega.unsqueeze(0), mu_k.unsqueeze(0))[0]            # (N, N, K)
     sigma_t = transport_covariance(omega.unsqueeze(0), sigma_k.unsqueeze(0))[0]
 
-    sd = self_divergence(mu_q, sigma_q, mu_p, sigma_p, alpha=alpha_div, kl_max=kl_max, eps=eps, family=family)
+    sd = self_divergence(mu_q, sigma_q, mu_p, sigma_p, alpha=alpha_div, kl_max=kl_max, eps=eps,
+                         family=family, divergence_family=divergence_family)
     alpha, reg = self_coupling_alpha(sd, mode=alpha_mode, value=value, b0=b0, c0=c0)
-    energy = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps, family=family)
+    energy = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps,
+                             family=family, divergence_family=divergence_family, irrep_dims=irrep_dims)
     F = free_energy(
         sd, energy, alpha, tau=tau, include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if alpha_mode != "constant" else None),

@@ -7,13 +7,25 @@ def test_config_defaults():
     cfg = VFE3Config()
     assert cfg.eps == 1e-6
     assert cfg.kl_max == 100.0
-    assert cfg.divergence_family == "gaussian_diagonal"
+    assert cfg.divergence_family == "renyi"
     assert cfg.alpha_div == 1.0
 
 
 def test_config_rejects_unknown_family():
     with pytest.raises(ValueError):
         VFE3Config(divergence_family="not_a_family")
+
+
+def test_divergence_family_is_functional_seam_distinct_from_family():
+    """divergence_family selects the divergence FUNCTIONAL (renyi, ...); family selects the
+    covariance structure. They are distinct seams: a covariance-family value is not a valid
+    functional, and the default functional is 'renyi'."""
+    cfg = VFE3Config()
+    assert cfg.divergence_family == "renyi" and cfg.family == "gaussian_diagonal"
+    with pytest.raises(ValueError):
+        VFE3Config(divergence_family="gaussian_diagonal")   # covariance family != functional
+    with pytest.raises(ValueError):
+        VFE3Config(divergence_family="not_a_functional")
 
 
 def test_config_rejects_nonpositive_alpha():
