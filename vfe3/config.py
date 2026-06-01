@@ -9,7 +9,6 @@ variant swaps without editing call sites.
 from dataclasses import dataclass
 from typing import Optional
 
-_VALID_DIVERGENCE_FAMILIES = ("gaussian_diagonal", "gaussian_full")
 _VALID_DIVERGENCE_FUNCTIONALS = ("renyi",)
 _VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
@@ -167,11 +166,16 @@ class VFE3Config:
         # SEPARATE live bool, cross-validated to stay consistent with family. The three are kept
         # distinct and modular per CLAUDE.md (slot in different f-divergences / families); NOT
         # collapsed, and divergence_family is NOT forced equal to family.
-        _require(self.family, _VALID_DIVERGENCE_FAMILIES, "family")
-        if self.diagonal_covariance != (self.family == "gaussian_diagonal"):
+        # family is validated against, and its covariance structure read from, the divergence
+        # registry (not a hardcoded list / name literal), so a newly registered family is a valid
+        # config family and its diagonal-vs-full structure is its declared cov_kind.
+        from vfe3.divergence import divergence_families, family_cov_kind
+        _require(self.family, divergence_families(), "family")
+        family_is_diagonal = family_cov_kind(self.family) == "diagonal"
+        if self.diagonal_covariance != family_is_diagonal:
             raise ValueError(
                 f"diagonal_covariance={self.diagonal_covariance} contradicts family={self.family!r}; "
-                f"set diagonal_covariance={self.family == 'gaussian_diagonal'} for this family"
+                f"set diagonal_covariance={family_is_diagonal} for this family"
             )
 
         # free-energy coupling
@@ -189,11 +193,11 @@ class VFE3Config:
         # coordinates through the trace and log-determinant), so reject the inconsistent pair at
         # construction rather than letting the per-coordinate divergence raise mid-forward.
         from vfe3.alpha_i import alpha_is_per_coord
-        if alpha_is_per_coord(self.alpha_mode) and self.family != "gaussian_diagonal":
+        if alpha_is_per_coord(self.alpha_mode) and not family_is_diagonal:
             raise ValueError(
                 f"alpha_mode={self.alpha_mode!r} needs a per-coordinate self-divergence, which "
-                f"exists only for the diagonal family; got family={self.family!r}. Use "
-                f"family='gaussian_diagonal' or a per-position alpha_mode."
+                f"exists only for a diagonal-covariance family; got family={self.family!r}. Use "
+                f"a diagonal family (e.g. 'gaussian_diagonal') or a per-position alpha_mode."
             )
 
         # attention

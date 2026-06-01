@@ -15,7 +15,7 @@ def test_safe_kl_clamp_bounds_and_nan():
 def test_registry_register_and_get():
     from vfe3.divergence import register_divergence, get_divergence, _DIVERGENCES
 
-    @register_divergence("dummy_family")
+    @register_divergence("dummy_family", cov_kind="diagonal")
     def _dummy(mu_q, sigma_q, mu_t, sigma_t, *, alpha, kl_max, eps):
         return mu_q.sum(dim=-1) * 0.0
 
@@ -24,7 +24,9 @@ def test_registry_register_and_get():
         assert fn is _dummy
     finally:
         # Do not leak the test kernel into the global registry.
+        from vfe3.divergence import _COV_KIND
         _DIVERGENCES.pop("dummy_family", None)
+        _COV_KIND.pop("dummy_family", None)
 
 
 def test_registry_unknown_raises():
@@ -179,3 +181,19 @@ def test_diagonal_kl_closed_form_1d():
     expected = 0.5 * (2.0 / 0.5 + (1.5 ** 2) / 0.5 - 1.0 + torch.log(torch.tensor(0.5 / 2.0)))
     got = kl(mu_q, v_q, mu_t, v_t, family="gaussian_diagonal")
     assert torch.allclose(got, expected.reshape(1), atol=1e-5)
+
+
+def test_register_divergence_records_cov_kind():
+    """A family declares its covariance structure at registration; consumers read the declared
+    kind via family_cov_kind rather than sniffing the family name."""
+    from vfe3.divergence import family_cov_kind
+
+    assert family_cov_kind("gaussian_diagonal") == "diagonal"
+    assert family_cov_kind("gaussian_full") == "full"
+
+
+def test_family_cov_kind_unregistered_raises():
+    from vfe3.divergence import family_cov_kind
+
+    with pytest.raises(KeyError):
+        family_cov_kind("no_such_family")

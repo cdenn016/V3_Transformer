@@ -12,7 +12,7 @@ from typing import List, Optional
 import torch
 
 from vfe3.alpha_i import alpha_is_per_coord
-from vfe3.divergence import gaussian_diagonal_renyi_per_coord, get_functional
+from vfe3.divergence import family_cov_kind, gaussian_diagonal_renyi_per_coord, get_functional
 
 
 def effective_temperature(
@@ -60,7 +60,7 @@ def pairwise_energy(
     -> -3), staying correct when sigma_q carries a leading batch dim mu_q lacks.
     """
     functional = get_functional(divergence_family)
-    is_diagonal = "diagonal" in family
+    is_diagonal = family_cov_kind(family) == "diagonal"
     mu_q_b = mu_q.unsqueeze(-2)            # (..., N, 1, K) broadcast query over keys
     sigma_q_b = sigma_q.unsqueeze(-2) if is_diagonal else sigma_q.unsqueeze(-3)
 
@@ -129,10 +129,10 @@ def self_divergence_per_coord(
     enforced by raising, so a future non-decomposing functional cannot silently sum the wrong
     thing. Consumed by the ``state_dependent_per_coord`` alpha form via ``self_divergence_for_alpha``.
     """
-    if family != "gaussian_diagonal":
+    if family_cov_kind(family) != "diagonal":
         raise ValueError(
-            f"self_divergence_per_coord needs the diagonal family (full-covariance KL does not "
-            f"decompose coordinate-wise); got family={family!r}"
+            f"self_divergence_per_coord needs a diagonal-covariance family (full-covariance KL "
+            f"does not decompose coordinate-wise); got family={family!r}"
         )
     if divergence_family != "renyi":
         raise ValueError(

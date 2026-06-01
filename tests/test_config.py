@@ -158,3 +158,30 @@ def test_config_eval_max_batches_default_none_and_validated():
     assert VFE3Config(eval_max_batches=50).eval_max_batches == 50
     with pytest.raises(ValueError):
         VFE3Config(eval_max_batches=0)
+
+
+def test_config_diagonal_covariance_cross_check_uses_cov_kind():
+    """The diagonal_covariance consistency check is driven by the family's declared cov_kind,
+    not the literal family == 'gaussian_diagonal'."""
+    VFE3Config(family="gaussian_full", diagonal_covariance=False)        # full + non-diagonal: ok
+    with pytest.raises(ValueError):
+        VFE3Config(family="gaussian_full", diagonal_covariance=True)     # full + diagonal: mismatch
+
+
+def test_config_accepts_newly_registered_family_without_editing_config():
+    """A new family registered with cov_kind='diagonal' is a valid config family and passes the
+    diagonal_covariance cross-check without editing config.py (no hardcoded family-name list)."""
+    from vfe3 import divergence
+
+    name = "laplace_diagonal_test"
+    divergence.register_divergence(name, cov_kind="diagonal")(
+        divergence._DIVERGENCES["gaussian_diagonal"]
+    )
+    try:
+        cfg = VFE3Config(family=name, diagonal_covariance=True)          # must NOT raise
+        assert cfg.family == name
+        with pytest.raises(ValueError):
+            VFE3Config(family=name, diagonal_covariance=False)          # cov_kind diagonal != False
+    finally:
+        divergence._DIVERGENCES.pop(name, None)
+        divergence._COV_KIND.pop(name, None)

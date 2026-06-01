@@ -89,3 +89,64 @@ correctly.
 - Per-coordinate clamp: each coordinate's `D^(k)` is clamped at `kl_max`, so a token's total can
   reach `K * kl_max` — a deliberate per-coordinate regularisation scale (design decision), not a
   bug.
+
+## M1+M4 — family `cov_kind` seam (branch vfe3-buildout-roadmap-2026-06-01)
+
+First item implemented from the multi-expert buildout roadmap (`docs/2026-06-01-buildout-roadmap.md`,
+findings M1 + M4). Separate session/branch from the per-coordinate-alpha work above; logged here per
+the one-post-edit-doc-per-day policy.
+
+### Motivation
+
+The buildout investigation found the codebase inferred a belief's covariance structure (diagonal vs
+full) from a name SUBSTRING — `is_diagonal = "diagonal" in family` (`free_energy.py`) — and coupled
+config validation to the literal `family == "gaussian_diagonal"` (`config.py`). A future covariance
+family whose registered name lacks the "diagonal" token would silently take the wrong energy branch
+(wrong broadcast axis, no exception), and a new diagonal family could not be configured without
+editing `config.py`'s hardcoded family list. The fix makes covariance structure DATA the family
+declares at registration, not a property guessed from its name.
+
+### What changed
+
+`vfe3/divergence.py`
+  `register_divergence(name, *, cov_kind)` now REQUIRES a covariance-structure tag ("diagonal" |
+  "full"), stored in a new `_COV_KIND` registry. `family_cov_kind(name)` returns it;
+  `divergence_families()` returns the registered family names. `gaussian_diagonal` registers
+  `cov_kind="diagonal"`, `gaussian_full` `cov_kind="full"`.
+
+`vfe3/free_energy.py`
+  `pairwise_energy`'s diagonal-vs-full branch reads `family_cov_kind(family) == "diagonal"` instead
+  of `"diagonal" in family`; `self_divergence_per_coord`'s guard dispatches on `cov_kind` likewise.
+
+`vfe3/config.py`
+  The hardcoded `_VALID_DIVERGENCE_FAMILIES` tuple is removed; `__post_init__` validates `self.family`
+  against `divergence_families()` (the registry) and drives the `diagonal_covariance` consistency
+  check and the per-coordinate-alpha guard off `family_cov_kind`, so a newly registered family is a
+  valid config family with the correct diagonal/full semantics WITHOUT a config edit.
+
+### Modularity
+
+`cov_kind` is the on-ramp to the spec's `families/` `ExponentialFamily` seam (roadmap item 1): adding
+a covariance family is now write-and-register (declare `cov_kind`), never edit-the-call-site. The
+gradient-kernel fast-path guard (`kernels.py`: `family == "gaussian_diagonal"`) is deliberately left
+as-is — it is a has-this-hand-kernel check, not a cov-kind sniff, and any new family correctly falls
+through to the autograd oracle.
+
+### Tests (TDD, watched RED then GREEN)
+
+  - `test_register_divergence_records_cov_kind`, `test_family_cov_kind_unregistered_raises`
+    (`test_divergence.py`)
+  - `test_pairwise_energy_dispatches_on_declared_cov_kind_not_name` (`test_free_energy.py`) — pins M1:
+    a diagonal family whose name lacks "diagonal" still takes the diagonal energy path and equals
+    `gaussian_diagonal`.
+  - `test_config_diagonal_covariance_cross_check_uses_cov_kind`,
+    `test_config_accepts_newly_registered_family_without_editing_config` (`test_config.py`) — the
+    latter pins M4: a newly registered diagonal family validates through config with no config edit.
+  - Existing `test_registry_register_and_get` updated for the required `cov_kind` kwarg.
+  Full suite: `tests=259 failures=0 errors=0` (read from junitxml; 254 baseline + 5 new).
+
+### Behavior preservation
+
+`cov_kind` matches each shipped family's structure, so every existing path is bit-identical; this is a
+refactor of the dispatch mechanism plus a new modular seam, not a formula change. The pure default
+path (`gaussian_diagonal`) is unchanged.
