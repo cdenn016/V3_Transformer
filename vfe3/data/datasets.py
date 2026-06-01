@@ -120,4 +120,9 @@ def make_dataloader(
     if max_tokens is not None:
         tokens = tokens[:max_tokens]
     ds = TokenWindows(tokens, seq_len, stride=stride)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=True)
+    # pin_memory only when a CUDA device exists (it would pin host pages uselessly on a CPU-only
+    # box). With pinned host buffers the per-step .to(device, non_blocking=True) H2D copy in
+    # train()/evaluate() can overlap compute; num_workers stays 0 (the dataset is an in-memory
+    # tensor slice, so worker IPC would cost more than it saves).
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=True,
+                      pin_memory=torch.cuda.is_available())

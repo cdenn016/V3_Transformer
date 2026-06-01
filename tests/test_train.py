@@ -185,6 +185,40 @@ def test_silent_and_logging_paths_are_bitwise_identical(caplog):
     assert any("Step 1/20" in r.message for r in caplog.records)
 
 
+class _CountingLoader:
+    """Yields a fixed list of (tokens, targets) batches, counting how many are consumed.
+
+    Used to prove the PERIODIC eval is capped: ``evaluate`` iterates the loader and breaks at
+    ``max_batches``, so a capped periodic pass draws fewer batches than the loader holds.
+    """
+
+    def __init__(self, batches):
+        self.batches = batches
+        self.count = 0
+
+    def __iter__(self):
+        for b in self.batches:
+            self.count += 1
+            yield b
+
+
+def test_train_caps_periodic_eval_at_eval_max_batches():
+    # train() must thread cfg.eval_max_batches into the PERIODIC validation pass so a large
+    # val split is not fully re-scanned every eval_interval steps. With a 5-batch val loader,
+    # eval_interval=1 over 2 steps (2 eval calls) and eval_max_batches=2, the loader must be
+    # drawn 2*2=4 times, not 2*5=10.
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2,
+                     eval_max_batches=2)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    train_loader = _periodic_loader(V=6, period=3, seq_len=8, batch_size=4, seed=0)
+    val_batches = [(torch.randint(0, 3, (4, 8)), torch.randint(0, 3, (4, 8))) for _ in range(5)]
+    val_loader = _CountingLoader(val_batches)
+    train(model, train_loader, cfg, n_steps=2, eval_interval=1, val_loader=val_loader)
+    assert val_loader.count == 4          # 2 eval calls x cap 2, not x 5
+
+
 def test_train_vfe3_clickrun_importable_and_runs_one_step():
     from train_vfe3 import config as cr_config, synthetic_period3_loader
 

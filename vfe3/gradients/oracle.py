@@ -62,8 +62,8 @@ def belief_gradients_autograd(
     else:
         raise ValueError(f"gradient_mode must be 'filtering' or 'smoothing', got {gradient_mode!r}")
 
-    mu_t = transport_mean(omega.unsqueeze(0), mu_k.unsqueeze(0))[0]            # (N, N, K)
-    sigma_t = transport_covariance(omega.unsqueeze(0), sigma_k.unsqueeze(0))[0]
+    mu_t = transport_mean(omega, mu_k)                  # rank-agnostic: (N,N,K) or (B,N,N,K)
+    sigma_t = transport_covariance(omega, sigma_k)
 
     sd = self_divergence(mu_q, sigma_q, mu_p, sigma_p, alpha=alpha_div, kl_max=kl_max, eps=eps,
                          family=family, divergence_family=divergence_family)

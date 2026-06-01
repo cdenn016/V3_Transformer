@@ -123,3 +123,13 @@ def test_config_phi_retract_mode_validated():
     assert VFE3Config(phi_retract_mode="bch").phi_retract_mode == "bch"
     with pytest.raises(ValueError):
         VFE3Config(phi_retract_mode="not_a_mode")
+
+
+def test_config_eval_max_batches_default_none_and_validated():
+    """eval_max_batches caps the PERIODIC validation pass (diagnostic only). Default None is
+    the pure path -- the full validation split is read, as before. A positive int caps it;
+    a non-positive int is rejected (the final post-training eval stays uncapped at the call site)."""
+    assert VFE3Config().eval_max_batches is None
+    assert VFE3Config(eval_max_batches=50).eval_max_batches == 50
+    with pytest.raises(ValueError):
+        VFE3Config(eval_max_batches=0)
