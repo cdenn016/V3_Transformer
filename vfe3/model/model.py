@@ -251,4 +251,10 @@ class VFEModel(nn.Module):
         d.update({k: float(v) for k, v in terms.items()})
         spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
         d["effective_rank"] = float(metrics.effective_rank(spec).mean())
+        # Gauge-geometry probes (diagnostics tier): the curvature proxy -- mean Frobenius departure
+        # of the triangle holonomy Omega_ij Omega_jk Omega_ki from I (0 for the flat phi-cocycle) --
+        # and the spread of log|det Omega| = tr(embed(phi)) across tokens (0 at phi=0). Pure
+        # measurements at the converged transport; off the training graph (no_grad).
+        d["holonomy_deviation"] = float(metrics.holonomy_deviation(omega))
+        d["gauge_trace_spread"] = float(metrics.gauge_trace_spread(out.phi, self.group.generators))
         return d

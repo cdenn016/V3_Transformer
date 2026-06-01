@@ -256,12 +256,14 @@ def train(
                     "val_ce":            m["ce"],
                     "val_ppl":           m["ppl"],
                     "val_bpc":           m["bpc"],
-                    "attn_entropy":      d["attn_entropy"],
-                    "self_coupling":     d["self_coupling"],
-                    "belief_coupling":   d["belief_coupling"],
-                    "attention_entropy": d["attention_entropy"],
-                    "free_energy_total": d["total"],
-                    "effective_rank":    d["effective_rank"],
+                    "attn_entropy":       d["attn_entropy"],
+                    "self_coupling":      d["self_coupling"],
+                    "belief_coupling":    d["belief_coupling"],
+                    "attention_entropy":  d["attention_entropy"],
+                    "free_energy_total":  d["total"],
+                    "effective_rank":     d["effective_rank"],
+                    "holonomy_deviation": d["holonomy_deviation"],
+                    "gauge_trace_spread": d["gauge_trace_spread"],
                 })
                 artifacts.maybe_save_best(step + 1, model, m["ppl"])
 

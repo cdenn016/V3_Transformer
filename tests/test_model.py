@@ -222,6 +222,20 @@ def test_mass_phi_penalizes_phi_inside_the_e_step():
     assert run(5.0).norm() < run(0.0).norm()
 
 
+def test_diagnostics_includes_gauge_geometry_probes():
+    # Part 1 (diagnostics tier): diagnostics must surface the gauge-geometry probes that
+    # vfe3/metrics.py already provides -- holonomy_deviation (curvature proxy on the converged
+    # transport) and gauge_trace_spread (std of log|det Omega| across tokens) -- as finite floats.
+    import math
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
+                     n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.05)
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, 12, (2, 4))
+    d = model.diagnostics(tokens)
+    assert "holonomy_deviation" in d and "gauge_trace_spread" in d
+    assert math.isfinite(d["holonomy_deviation"]) and math.isfinite(d["gauge_trace_spread"])
+
+
 def test_phi_retract_mode_bch_reachable_and_differs():
     """phi_retract_mode='bch' is reachable through the E-step and differs from 'euclidean'."""
     grp = get_group("block_glk")(4, 2)

@@ -195,6 +195,19 @@ def _save_figures(
             fig = figs.plot_trajectory(val_ppl, ylabel="val PPL", title="Validation perplexity",
                                        path=str(artifacts.run_dir / "val_ppl.png"))
             figs.plt.close(fig)
+        # Gauge-geometry trajectories (diagnostics tier): curvature proxy + gauge-trace spread.
+        holo = [r["holonomy_deviation"] for r in artifacts.history if "holonomy_deviation" in r]
+        if holo:
+            fig = figs.plot_trajectory(holo, ylabel=r"$\langle\|H_{ijk}-I\|_F\rangle$",
+                                       title="Holonomy deviation (curvature proxy)",
+                                       path=str(artifacts.run_dir / "holonomy.png"))
+            figs.plt.close(fig)
+        gts = [r["gauge_trace_spread"] for r in artifacts.history if "gauge_trace_spread" in r]
+        if gts:
+            fig = figs.plot_trajectory(gts, ylabel=r"std $\log|\det\Omega|$",
+                                       title="Gauge trace spread",
+                                       path=str(artifacts.run_dir / "gauge_trace_spread.png"))
+            figs.plt.close(fig)
         if artifacts.history and "self_coupling" in artifacts.history[-1]:
             _save_free_energy_bar(artifacts, figs)
     except Exception as exc:                                    # never let a plot kill a finished run

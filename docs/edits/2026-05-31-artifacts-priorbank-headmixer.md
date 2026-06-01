@@ -133,3 +133,16 @@ Deferred (pre-existing / intentional / explicitly-deferred), documented in the r
   (forward union, diagnostics `dict`, `block_norm: Optional[Any]`) — left per the surgical rule.
 
 Full suite after audit fixes: **241 tests, 0 failures, 0 errors** (240 passed + 1 non-strict xpass).
+
+## Task 3 Part 1 — diagnostics tier completion (gauge-geometry probes)
+
+`vfe3/metrics.py` already provides `holonomy_deviation` (curvature proxy — mean Frobenius departure
+of the triangle holonomy `Ω_ij Ω_jk Ω_ki` from `I`, ~0 for the flat φ-cocycle) and
+`gauge_trace_spread` (std of `log|det Ω| = tr(embed(φ))` across tokens), but they were not surfaced.
+Now `VFEModel.diagnostics()` computes both at the converged transport (`omega`, `out.phi`, and
+`group.generators` were already in scope), the training CSV row carries `holonomy_deviation` +
+`gauge_trace_spread` (added unconditionally to keep the CSV rectangular), and `finalize_run` writes
+`holonomy.png` + `gauge_trace_spread.png` trajectories. Pure measurements, eval-cadence, no_grad —
+no hot-path change. Tests: `test_diagnostics_includes_gauge_geometry_probes`,
+`test_metrics_csv_includes_gauge_geometry_columns`, `test_finalize_writes_gauge_geometry_figure`.
+Full suite: **244 tests, 0 failures, 0 errors** (243 passed + 1 non-strict xpass).

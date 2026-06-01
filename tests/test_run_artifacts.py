@@ -125,6 +125,30 @@ def test_finalize_run_writes_test_results_and_figures(tmp_path):
     assert "test_ppl" in summary and "best_val_ppl" in summary
 
 
+def test_metrics_csv_includes_gauge_geometry_columns(tmp_path):
+    # Part 1 (diagnostics tier): the curvature/gauge probes (holonomy deviation + gauge trace
+    # spread) must be surfaced in the per-eval CSV, not only the free-energy terms.
+    cfg = _cfg()
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model)
+    train(model, _loader(), cfg, n_steps=4, eval_interval=2, val_loader=_loader(seed=1), artifacts=art)
+    header = (tmp_path / "run" / "metrics.csv").read_text().splitlines()[0]
+    assert "holonomy_deviation" in header
+    assert "gauge_trace_spread" in header
+
+
+def test_finalize_writes_gauge_geometry_figure(tmp_path):
+    cfg = _cfg()
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model)
+    losses = train(model, _loader(), cfg, n_steps=4, eval_interval=2,
+                   val_loader=_loader(seed=1), artifacts=art)
+    finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
+    assert (tmp_path / "run" / "holonomy.png").exists()
+
+
 def test_finalize_reloads_best_checkpoint(tmp_path):
     # finalize must report the TEST metric on the reloaded best-val checkpoint, not the final
     # (possibly worse) live weights. Pin the reload happened.
