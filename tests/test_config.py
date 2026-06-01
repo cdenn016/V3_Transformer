@@ -87,10 +87,13 @@ def test_config_rejects_omega_direct_gauge_parameterization():
     assert VFE3Config(gauge_parameterization="phi").gauge_parameterization == "phi"
 
 
-def test_config_rejects_use_prior_bank_false():
-    """use_prior_bank=False has no alternative encode/decode path; rejected, not a silent no-op."""
-    with pytest.raises(NotImplementedError):
-        VFE3Config(use_prior_bank=False)
+def test_config_accepts_use_prior_bank_false():
+    """use_prior_bank=False is the live linear-projection decode ablation (VFE_2.0 parity):
+    encode/self-coupling stay on the PriorBank, only decode becomes a plain mu->logits
+    projection. It must construct cleanly (no NotImplementedError); the default stays True."""
+    assert VFE3Config().use_prior_bank is True
+    cfg = VFE3Config(use_prior_bank=False)
+    assert cfg.use_prior_bank is False
 
 
 def test_config_rejects_gauge_fixed_encode():

@@ -10,3 +10,4 @@ dist/
 junit*.xml
 pytest_*.txt
 *_out.txt
+vfe3_runs/

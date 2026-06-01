@@ -1,18 +1,30 @@
 # V3_Transformer (VFE_3.0)
 
-Clean-room rebuild of the gauge-theoretic VFE transformer. No neural networks:
+Clean-room rebuild of the gauge-theoretic VFE transformer. No neural networks (backprop is allowed):
 all capacity comes from iterative VFE minimization over Gaussian belief tuples
 `(mu, Sigma, phi)`. Built bottom-up, every layer numerically pinned to VFE_2.0
 by golden tests. See `docs/superpowers/specs/2026-05-29-vfe3-clean-room-design.md`.
 
+This V3 is intended to be a production quality continuation of the VFE_2.0 transformer that will allow clean code, clear math, and future expandability
+
 ## Hard constraints
-- NO neural networks (no nn.Linear, no MLP, no activations).
+- NO neural networks (no nn.Linear, no MLP, no activations. backprop is allowed).
+  **Documented exceptions (opt-in toggles, both default OFF; the pure no-NN path is the
+  default and always exists):** (1) `use_prior_bank=False` decodes via a single learned
+  linear output projection `logits = mu @ W^T` (`W` a raw `(V, K)` nn.Parameter, not an
+  nn.Linear module; sigma discarded) — the VFE_2.0-parity ablation the user compares
+  against the KL-to-prior decode. Encode and the free-energy self-coupling stay on the
+  PriorBank. (2) `use_head_mixer=True` applies a learned Schur-commutant per-irrep-block
+  head mixer; under `block_glk`'s untied per-block gauge it breaks strict gauge
+  equivariance (exact at identity init, deviates as the mixer drifts) — user-accepted.
 - NO CLI arg parsing; entry points are click-to-run (edit config dicts, then run).
 - float32 throughout; CUDA where applicable (user has an RTX 5090).
 - High modularity: a config-selected registry behind every seam (divergence,
   alpha_i, family, transport/gauge, retraction, decode). Add a variant by
   writing-and-registering it, never by editing call sites.
 - Always preserve a theoretically pure path under appropriate toggles.
+- Codebase should be modular:  e.g. we should be able to slot in different exponential/mixture families, different f-divergences, different groups, etc)
+
 
 ## Function signature convention (MANDATORY)
 Argument order: all torch.Tensor first, then 'float | torch.Tensor', then
@@ -65,15 +77,19 @@ VFE3_TEST_DEVICE=cuda for the GPU).
 
 **There should ALWAYS exist a theoretically/mathematically "pure" path under appropriate toggles.**  Computationally extreme paths should be 'opt in' toggles and clearly documented.
 
+**Audit Instructions** - when auditing the code base dont concern yourself whether default config toggles are theoretically pure.  rather, concern yourself with whether the theoretically pure paths exist.  i am constantly changing toggles.
+
+**Audit/Verification policy** when verifying mathematical expressions and theory compile a verified.md document briefly stating what was checked, if it was incorrect, and if it was rigorously verified.  When auditing/verifying you should consult this document so you dont reverify things youve already verified. 
 
 **CODE FOCUS** when investigating and/or auditing the codebase do NOT rely on code comments....focus on the actual code and paths
 
 **user has RTX5090 GPU** - use cuda and code accordingly where applicable
 
-
 **ALWAYS BRANCH FRESH FROM MAIN** - each session should be a fresh branch from main
 
 **DONT LEAVE MESSES!!** ALWAYS CLEAN UP temp FILES FROM ATOMIC EDITS AND SUCH WHEN FINISHED!
+
+**avoid parallel bash(cd*)**  it is very buggy
 
 ## Mathematical Reference
 
@@ -106,6 +122,7 @@ tau = kappa * sqrt(K) is the effective softmax temperature. The tau * beta_ij * 
 **Verify with citations** for theoretical and mathematical claims. use /literature-review skill.
 
 **Skip praise preambles.** No "Great question!" or "Excellent point!" — engage with the substance. no sycophancy
+
 ## Before Coding
 
 **Plan first.** State assumptions explicitly; if uncertain, ask. If multiple interpretations exist, present them — don't pick silently. If something is unclear, stop, name it, and ask.

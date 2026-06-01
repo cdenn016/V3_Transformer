@@ -11,13 +11,16 @@ so a gradient step on the priors improves inference end to end. Click-to-run: ed
 import logging
 import math
 import time
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader
 from vfe3.model.model import VFEModel
+
+if TYPE_CHECKING:                                    # avoid an import cycle (run_artifacts imports evaluate)
+    from vfe3.run_artifacts import RunArtifacts
 
 
 def build_optimizer(
@@ -30,8 +33,13 @@ def build_optimizer(
     M-step learning rate: the mean table ``mu_embed`` at ``m_mu_lr``; the (log) scale
     tables ``sigma_log_embed`` and the decode temperature ``decode_log_scale`` together
     at ``m_sigma_lr``; the gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``. The
-    weight decay ``cfg.weight_decay`` is shared. These are the only parameters in the
-    model (no neural layers), so the grouping covers ``model.parameters()`` exactly.
+    weight decay ``cfg.weight_decay`` is shared.
+
+    Two optional parameters are grouped only when their toggle is on: the linear decode
+    weight ``output_proj_weight`` (use_prior_bank=False) at ``m_mu_lr`` (a mean-readout
+    scale), and the head-mixer ``mixer_delta`` (use_head_mixer=True) at ``m_mu_lr``. A
+    final assertion pins that the groups cover ``model.parameters()`` EXACTLY -- a new
+    parameter that is forgotten here would otherwise silently never receive a gradient.
     """
     pb = model.prior_bank
     groups = [
@@ -39,6 +47,22 @@ def build_optimizer(
         {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_sigma_lr},
         {"params": [pb.phi_embed],                             "lr": cfg.m_phi_lr},
     ]
+    if pb.output_proj_weight is not None:                       # use_prior_bank=False linear decode
+        groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_mu_lr})
+    if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
+        groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_mu_lr})
+
+    # Exact-coverage guard: every model parameter must land in exactly one group. A missing
+    # group would leave that weight frozen (no AdamW update) with no error -- the bug class the
+    # optimizer is most prone to as new learnable seams (output_proj, head mixer, ...) are added.
+    grouped = {p for g in groups for p in g["params"]}
+    missing = set(model.parameters()) - grouped
+    if missing:
+        raise AssertionError(
+            f"build_optimizer left {len(missing)} model parameter(s) ungrouped; they would never "
+            f"train. Add them to a param group."
+        )
+
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
     # CUDA-only, so on a CPU box this is the standard AdamW. Per-group LRs are honored either way.
     use_fused = pb.mu_embed.is_cuda
@@ -152,6 +176,7 @@ def train(
     val_loader:    Optional[Iterable]       = None,
     device:        Optional[torch.device]   = None,
     logger:        Optional[logging.Logger] = None,
+    artifacts:     Optional["RunArtifacts"] = None,
 ) -> List[float]:
     r"""Train ``n_steps`` M-step iterations (cycling the loader); return the loss history.
 
@@ -212,6 +237,32 @@ def train(
                 "    Loss: %.4f | CE: %.4f | PPL: %.1f | BPC: %.4f",
                 m["ce"], m["ce"], m["ppl"], m["bpc"],
             )
+            # Persistence is opt-in: with no artifacts object this whole block is skipped, so the
+            # silent/in-memory path is unchanged. A CSV row (train loss + lr + val + the converged
+            # diagnostics off the graph) is logged each periodic eval, and best_model.pt is saved
+            # whenever the validation PPL sets a new minimum.
+            if artifacts is not None:
+                d = model.diagnostics(tokens)
+                artifacts.log_metrics({
+                    "step":              step + 1,
+                    "train_loss":        losses[-1],
+                    "lr":                float(scheduler.get_last_lr()[0]),
+                    "val_ce":            m["ce"],
+                    "val_ppl":           m["ppl"],
+                    "val_bpc":           m["bpc"],
+                    "attn_entropy":      d["attn_entropy"],
+                    "self_coupling":     d["self_coupling"],
+                    "belief_coupling":   d["belief_coupling"],
+                    "attention_entropy": d["attention_entropy"],
+                    "free_energy_total": d["total"],
+                    "effective_rank":    d["effective_rank"],
+                })
+                artifacts.maybe_save_best(step + 1, model, m["ppl"])
+
+        # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
+        if (artifacts is not None and cfg.checkpoint_interval
+                and (step + 1) % cfg.checkpoint_interval == 0):
+            artifacts.save_checkpoint(step + 1, model, optimizer, cfg)
     return losses
 
 
