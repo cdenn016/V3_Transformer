@@ -87,10 +87,13 @@ def test_config_rejects_omega_direct_gauge_parameterization():
     assert VFE3Config(gauge_parameterization="phi").gauge_parameterization == "phi"
 
 
-def test_config_rejects_use_prior_bank_false():
-    """use_prior_bank=False has no alternative encode/decode path; rejected, not a silent no-op."""
-    with pytest.raises(NotImplementedError):
-        VFE3Config(use_prior_bank=False)
+def test_config_accepts_use_prior_bank_false():
+    """use_prior_bank=False is the live linear-projection decode ablation (VFE_2.0 parity):
+    encode/self-coupling stay on the PriorBank, only decode becomes a plain mu->logits
+    projection. It must construct cleanly (no NotImplementedError); the default stays True."""
+    assert VFE3Config().use_prior_bank is True
+    cfg = VFE3Config(use_prior_bank=False)
+    assert cfg.use_prior_bank is False
 
 
 def test_config_rejects_gauge_fixed_encode():
@@ -115,6 +118,18 @@ def test_diagonal_covariance_must_agree_with_family():
         VFE3Config(diagonal_covariance=False)          # family defaults to gaussian_diagonal
     # the consistent full-covariance pair is accepted (divergence_family stays the functional seam)
     VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+
+
+def test_tied_block_glk_rejects_killing_per_block():
+    """killing_per_block builds a per-HEAD Killing metric and needs generators that partition per
+    block (block_glk's independent gl(d) per head). tied_block_glk's shared kron(I_n, gl(d))
+    generators each act on EVERY block, so that preconditioner does not apply -- reject at config
+    time (else it fails cryptically at the first forward). A compatible preconditioner is accepted."""
+    with pytest.raises(ValueError):
+        VFE3Config(embed_dim=4, n_heads=2, gauge_group="tied_block_glk",
+                   phi_precond_mode="killing_per_block")
+    for ok in ("none", "clip", "killing"):
+        VFE3Config(embed_dim=4, n_heads=2, gauge_group="tied_block_glk", phi_precond_mode=ok)
 
 
 def test_config_phi_retract_mode_validated():

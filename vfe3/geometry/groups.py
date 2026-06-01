@@ -22,6 +22,7 @@ from vfe3.geometry.generators import (
     generate_glk,
     generate_glk_cross_head,
     generate_glk_multihead,
+    generate_glk_multihead_tied,
     generate_son,
 )
 
@@ -116,6 +117,36 @@ def _build_block_glk(
         name="block_glk",
         generators=G,
         irrep_dims=irrep_dims,
+        skew_symmetric=False,
+    )
+
+
+@register_group("tied_block_glk")
+def _build_tied_block_glk(
+    K:               int,
+    n_heads:         int,
+
+    *,
+    dtype:           torch.dtype                     = torch.float32,
+    device:          'torch.device | str | None'     = None,
+) -> GaugeGroup:
+    r"""TIED block-diagonal GL(d_head): one shared GL(d_head) frame across all heads.
+
+    Generators ``kron(I_{n_heads}, gl(d_head))`` (n_gen = d_head^2), so one per-token phi drives the
+    SAME GL(d_head) element in every head -- a tied gauge. The group element stays K x K block-
+    diagonal (``irrep_dims = [d_head] * n_heads``), so transport / per-head attention are unchanged;
+    only the gauge is shared rather than per-head independent (``block_glk``). Under this tied gauge
+    the Schur-commutant head mixer is exactly equivariant. NOTE: the per-block Killing preconditioner
+    (``phi_precond_mode='killing_per_block'``) assumes generators that PARTITION per block (one gl
+    per head); the tied generators each act on every block, so that mode does not apply here (config
+    validation warns) -- use ``'none'``, ``'clip'``, or the ambient ``'killing'``.
+    """
+    d_head = K // n_heads
+    G = generate_glk_multihead_tied(K, n_heads, dtype=dtype, device=device)
+    return GaugeGroup(
+        name="tied_block_glk",
+        generators=G,
+        irrep_dims=[d_head] * n_heads,
         skew_symmetric=False,
     )
 

@@ -19,6 +19,7 @@ from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.norms import get_norm
+from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.prior_bank import PriorBank
 from vfe3.model.stack import vfe_stack
 
@@ -64,6 +65,7 @@ class VFEModel(nn.Module):
             cfg.vocab_size, cfg.embed_dim, n_gen,
             decode_tau=cfg.decode_tau, eps=cfg.eps,
             diagonal_covariance=cfg.diagonal_covariance,
+            use_prior_bank=cfg.use_prior_bank,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
@@ -72,6 +74,22 @@ class VFEModel(nn.Module):
             if cfg.norm_type_block != "none" else None
         self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps) \
             if cfg.norm_type_final != "none" else None
+        # Opt-in Schur-commutant head mixer (default off). Built ONCE from the gauge group's
+        # irrep blocks; HeadMixer rejects a single-block group at construction (glk / so_k have
+        # nothing to mix), so a bad gauge_group + use_head_mixer pair fails here, not at forward.
+        self.head_mixer = HeadMixer(self.group.irrep_dims) if cfg.use_head_mixer else None
+        if (not cfg.use_prior_bank) and cfg.detach_e_step:
+            # Joint-toggle footgun (audit 2026-05-31): the detached E-step severs the encode prior
+            # tables (mu/sigma/phi_embed) from the loss, and the linear decode reads only mu_final,
+            # so ONLY output_proj_weight would train -- the prior bank is effectively frozen.
+            import warnings
+            warnings.warn(
+                "use_prior_bank=False with detach_e_step=True freezes the encode prior tables "
+                "(mu_embed/sigma_log_embed/phi_embed): the detached E-step cuts them off and the "
+                "linear decode reads only mu_final, so only output_proj_weight trains. Set "
+                "detach_e_step=False to learn the prior tables.",
+                stacklevel=2,
+            )
         # Causal/attention log-prior is loop-invariant for fixed (N, device, dtype); cache it
         # (audit 4e) keyed on those so it is built once, not every forward. Not an nn.buffer
         # because it depends on the runtime N (sequence length), which varies across calls.
@@ -128,6 +146,9 @@ class VFEModel(nn.Module):
                             log_prior=log_prior, block_norm=self.block_norm)
         mu_final = out.mu                                        # (B, N, K)
         sigma_final = out.sigma
+
+        if self.head_mixer is not None:                          # opt-in head mixing, after E-step / before norm
+            mu_final, sigma_final = self.head_mixer(mu_final, sigma_final)
 
         if self.final_norm is not None:                          # config-selected final norm (cached)
             mu_final = self.final_norm(mu_final, sigma_final)
@@ -230,4 +251,10 @@ class VFEModel(nn.Module):
         d.update({k: float(v) for k, v in terms.items()})
         spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
         d["effective_rank"] = float(metrics.effective_rank(spec).mean())
+        # Gauge-geometry probes (diagnostics tier): the curvature proxy -- mean Frobenius departure
+        # of the triangle holonomy Omega_ij Omega_jk Omega_ki from I (0 for the flat phi-cocycle) --
+        # and the spread of log|det Omega| = tr(embed(phi)) across tokens (0 at phi=0). Pure
+        # measurements at the converged transport; off the training graph (no_grad).
+        d["holonomy_deviation"] = float(metrics.holonomy_deviation(omega))
+        d["gauge_trace_spread"] = float(metrics.gauge_trace_spread(out.phi, self.group.generators))
         return d

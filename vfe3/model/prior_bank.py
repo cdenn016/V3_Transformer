@@ -87,6 +87,8 @@ class PriorBank(nn.Module):
     temperature.
     """
 
+    output_proj_weight: Optional[nn.Parameter]   # (V, K) linear-decode weight; None unless use_prior_bank=False
+
     def __init__(
         self,
         vocab_size:   int,
@@ -100,6 +102,7 @@ class PriorBank(nn.Module):
         decode_tau:          float = 1.0,
         eps:                 float = 1e-6,
         diagonal_covariance: bool  = True,
+        use_prior_bank:      bool  = True,
         encode_mode:         str   = "per_token",
         decode_mode:         str   = "diagonal",
     ) -> None:
@@ -110,6 +113,7 @@ class PriorBank(nn.Module):
         self.decode_tau = decode_tau
         self.eps = eps
         self.diagonal_covariance = diagonal_covariance
+        self.use_prior_bank = use_prior_bank
         self.encode_mode = encode_mode
         self.decode_mode = decode_mode
 
@@ -118,6 +122,19 @@ class PriorBank(nn.Module):
         self.sigma_log_embed  = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
         self.phi_embed        = nn.Parameter(phi_scale * torch.randn(vocab_size, n_gen))
         self.decode_log_scale = nn.Parameter(torch.zeros(1))
+
+        # use_prior_bank=False (VFE_2.0-parity ablation): decode is a plain linear projection
+        # logits = mu_q @ W^T through a learned (V, K) weight, the single authorized neural
+        # exception (a lone linear output readout; see CLAUDE.md). Realized as a raw nn.Parameter
+        # matmul -- NOT an nn.Linear/MLP -- so no neural-layer class enters the module. Created
+        # only on the ablation path so the pure path (use_prior_bank=True) carries no extra weight.
+        # Xavier-uniform init (matches VFE_2.0's nn.Linear default), no bias (a constant shift in
+        # V that softmax/cross-entropy absorbs). Encode stays the prior-bank lookup either way.
+        if use_prior_bank:
+            self.output_proj_weight = None
+        else:
+            self.output_proj_weight = nn.Parameter(torch.empty(vocab_size, K))
+            nn.init.xavier_uniform_(self.output_proj_weight)
 
     def encode(
         self,
@@ -141,9 +158,16 @@ class PriorBank(nn.Module):
 
         *,
         tau:     Optional[float] = None,  # override decode_tau; None -> self.decode_tau
-    ) -> torch.Tensor:                   # (B, N, V) logits = -KL(q || pi_v)/tau_eff
-        r"""Decode logits_{i,v} = -KL(q_i || pi_v)/tau_eff via the selected decode kernel."""
-        return get_decode(self.decode_mode)(self, mu_q, sigma_q, self._tau_eff(tau))
+    ) -> torch.Tensor:                   # (B, N, V) logits
+        r"""Decode logits via the selected kernel; ``use_prior_bank`` is the single gate.
+
+        True (default, pure path): the KL-to-prior readout -KL(q_i || pi_v)/tau_eff with the
+        covariance structure given by ``decode_mode`` (diagonal | full). False (ablation): the
+        ``linear`` kernel logits = mu_q @ W^T (sigma_q and tau_eff ignored). Routing here -- not
+        through a second config value -- keeps ``decode_mode`` and ``use_prior_bank`` from ever
+        silently disagreeing (the linear path simply does not consult ``decode_mode``)."""
+        mode = self.decode_mode if self.use_prior_bank else "linear"
+        return get_decode(mode)(self, mu_q, sigma_q, self._tau_eff(tau))
 
     def reference_decode(
         self,
@@ -282,3 +306,22 @@ def _decode_full(
     sigma_q_b = sigma_q.unsqueeze(-3)                                    # (B, N, 1, K, K)
     kl_v = kl(mu_q_b, sigma_q_b, mu_v, sigma_v, kl_max=float("inf"), family="gaussian_full")  # (B, N, V)
     return -kl_v / tau_eff
+
+
+@register_decode("linear")
+def _decode_linear(
+    pb:      PriorBank,
+    mu_q:    torch.Tensor,               # (B, N, K) posterior means
+    sigma_q: torch.Tensor,               # (B, N, K) posterior variances (DISCARDED)
+    tau_eff: torch.Tensor,               # () effective temperature (DISCARDED)
+) -> torch.Tensor:                       # (B, N, V) logits = mu_q @ W^T
+    r"""Linear-projection decode (use_prior_bank=False, VFE_2.0 parity): logits = mu_q @ W^T.
+
+    The one authorized neural exception: a single learned (V, K) output weight applied to the
+    converged mean, with NO KL geometry at the decode boundary (sigma and the decode temperature
+    are discarded; only encode + the E-step remain gauge-aware). Realized as a raw nn.Parameter
+    matmul, not an nn.Linear module. The pure KL-readout path is always available under
+    use_prior_bank=True; this is the opt-in ablation the user uses to compare with/without the
+    prior-bank decode.
+    """
+    return mu_q @ pb.output_proj_weight.transpose(-1, -2)               # (B, N, V)

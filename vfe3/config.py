@@ -11,7 +11,7 @@ from typing import Optional
 
 _VALID_DIVERGENCE_FAMILIES = ("gaussian_diagonal", "gaussian_full")
 _VALID_DIVERGENCE_FUNCTIONALS = ("renyi",)
-_VALID_GAUGE_GROUPS        = ("glk", "block_glk", "so_k")
+_VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
 _VALID_DECODE_MODES        = ("diagonal", "full")
@@ -53,6 +53,14 @@ class VFE3Config:
     # gauge seam
     gauge_group:               str   = "block_glk"
     gauge_parameterization:    str   = "phi"
+
+    # head mixer (opt-in, default off): a learned Schur-commutant matrix mixes the equal-size
+    # gauge-irrep blocks (under block_glk: the n_heads heads) of the converged belief. Identity
+    # init -> step-0 bit-identical to off. Breaks strict gauge equivariance under block_glk's
+    # untied per-block gauge (exact at init, deviates as the mixer drifts); the tied_block_glk
+    # group restores EXACT equivariance on the full-covariance path. Needs a group with >= 2 equal
+    # blocks (block_glk / tied_block_glk), else VFEModel construction raises.
+    use_head_mixer:            bool  = False
 
     # belief family
     diagonal_covariance:       bool  = True
@@ -106,6 +114,7 @@ class VFE3Config:
     seed:                      int   = 0
     log_interval:              int   = 50           # console log every N steps (0 = off)
     eval_interval:             int   = 0            # periodic validation every N steps (0 = off)
+    checkpoint_interval:       int   = 0            # save a resumable checkpoint every N steps (0 = off)
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
 
     def __post_init__(self) -> None:
@@ -185,20 +194,32 @@ class VFE3Config:
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         _require(self.phi_precond_mode, _VALID_PHI_PRECOND_MODES, "phi_precond_mode")
         _require(self.phi_retract_mode, _VALID_PHI_RETRACT_MODES, "phi_retract_mode")
+        # 'killing_per_block' builds a per-HEAD Killing metric and requires generators that partition
+        # per block (block_glk's independent gl(d_head) per head). The tied gauge's shared generators
+        # kron(I_n, gl(d_head)) each act on EVERY block, so the per-block partition does not exist;
+        # reject at construction (it otherwise fails cryptically inside the first E-step). The ambient
+        # 'killing', 'clip', and 'none' preconditioners are unaffected.
+        if self.gauge_group == "tied_block_glk" and self.phi_precond_mode == "killing_per_block":
+            raise ValueError(
+                "phi_precond_mode='killing_per_block' is incompatible with gauge_group="
+                "'tied_block_glk': the shared kron(I_n, gl(d)) generators do not partition per head, "
+                "so the per-block Killing metric is undefined. Use 'none', 'clip', or the ambient "
+                "'killing'."
+            )
 
         # decode / encode
         if self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be positive, got {self.decode_tau}")
         _require(self.decode_mode, _VALID_DECODE_MODES, "decode_mode")
         _require(self.encode_mode, _VALID_ENCODE_MODES, "encode_mode")
-        # The PriorBank IS the only encode/decode boundary; there is no specified alternative.
-        # use_prior_bank=False is a live knob that rejects the unsupported value rather than
-        # silently doing nothing (it was a dead config seam).
-        if not self.use_prior_bank:
-            raise NotImplementedError(
-                "use_prior_bank=False has no alternative encode/decode path; the PriorBank is "
-                "the only belief-encode/decode boundary in VFE_3.0"
-            )
+        # use_prior_bank is the SINGLE decode gate. True (default, pure path): the KL-to-prior
+        # readout logits = -KL(q_i || pi_v)/tau_eff over the gauge-orbit prior bank, with the
+        # covariance structure selected by decode_mode (diagonal | full). False (VFE_2.0-parity
+        # ablation): decode is a plain linear projection mu_q -> logits via a learned (V, K)
+        # weight (sigma discarded) -- the one authorized neural exception (a single linear output
+        # readout; see CLAUDE.md). Encode and the free-energy self-coupling stay on the PriorBank
+        # either way; decode_mode then only describes the (unused) KL structure, so the two knobs
+        # cannot silently disagree. The pure KL path always exists under use_prior_bank=True.
         # 'gauge_fixed' encode (gauge orbit from a shared base belief) is a named stub: reject at
         # construction so the failure is at config time, not the first forward pass.
         if self.encode_mode == "gauge_fixed":
@@ -228,6 +249,8 @@ class VFE3Config:
             raise ValueError(f"log_interval must be >= 0, got {self.log_interval}")
         if self.eval_interval < 0:
             raise ValueError(f"eval_interval must be >= 0, got {self.eval_interval}")
+        if self.checkpoint_interval < 0:
+            raise ValueError(f"checkpoint_interval must be >= 0, got {self.checkpoint_interval}")
         if self.eval_max_batches is not None and self.eval_max_batches < 1:
             raise ValueError(f"eval_max_batches must be >= 1 if set, got {self.eval_max_batches}")
 

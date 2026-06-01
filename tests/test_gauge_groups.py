@@ -11,6 +11,23 @@ def test_glk_group_full_basis():
     assert grp.skew_symmetric is False
 
 
+def test_tied_block_glk_is_tied_across_heads():
+    # tied_block_glk uses kron(I_n, gl(d)): one shared gl(d) for all heads (n_gen = d^2, vs
+    # n_heads*d^2 for the untied block_glk), so exp(phi.G) is the SAME GL(d) frame in every block.
+    grp = get_group("tied_block_glk")(K=6, n_heads=3)
+    d = 2
+    assert grp.generators.shape == (d * d, 6, 6)            # d^2 generators (shared), not n_heads*d^2
+    assert grp.irrep_dims == [d, d, d]
+    assert grp.skew_symmetric is False
+    phi = torch.randn(d * d)
+    M = torch.einsum("a,aij->ij", phi, grp.generators)
+    expM = torch.matrix_exp(M)
+    for h in range(1, 3):                                   # every diagonal block equals block 0 (tied)
+        assert torch.allclose(expM[:d, :d], expM[h * d:(h + 1) * d, h * d:(h + 1) * d], atol=1e-6)
+    # and it is block-diagonal (zero off-block)
+    assert torch.allclose(expM[:d, d:2 * d], torch.zeros(d, d), atol=1e-6)
+
+
 def test_block_glk_group_is_block_diagonal():
     grp = get_group("block_glk")(K=6, n_heads=3)
     assert grp.irrep_dims == [2, 2, 2]
