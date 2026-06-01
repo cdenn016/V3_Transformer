@@ -93,11 +93,11 @@ def _diag_kl_filtering_kernel(
     self_mask = ((raw_self > 0.0) & (raw_self < kl_max)).to(mu_q.dtype).unsqueeze(-1)
 
     self_mu  = self_mask * alpha_coef * (mu_q - mu_p) / sp
-    pair_mu  = torch.einsum("ijk,ijk->ik", beta_coord, (mu_q.unsqueeze(-2) - mu_t) / st)
+    pair_mu  = torch.einsum("...ijk,...ijk->...ik", beta_coord, (mu_q.unsqueeze(-2) - mu_t) / st)
     grad_mu  = self_mu + pair_mu
 
     self_sig = self_mask * alpha_coef * 0.5 * (1.0 / sp - 1.0 / sq)
-    pair_sig = torch.einsum("ijk,ijk->ik", beta_coord, 0.5 * (1.0 / st - 1.0 / sq.unsqueeze(-2)))
+    pair_sig = torch.einsum("...ijk,...ijk->...ik", beta_coord, 0.5 * (1.0 / st - 1.0 / sq.unsqueeze(-2)))
     grad_sigma = self_sig + pair_sig
     return grad_mu, grad_sigma
 
@@ -150,8 +150,8 @@ def belief_gradients(
         )
 
     mu_k, sigma_k = mu.detach(), sigma.detach()
-    mu_t = transport_mean(omega.unsqueeze(0), mu_k.unsqueeze(0))[0]
-    sigma_t = transport_covariance(omega.unsqueeze(0), sigma_k.unsqueeze(0))[0]
+    mu_t = transport_mean(omega, mu_k)                 # rank-agnostic: (N,N,K) or (B,N,N,K)
+    sigma_t = transport_covariance(omega, sigma_k)
     sd = self_divergence(mu, sigma, mu_p, sigma_p, alpha=1.0, kl_max=kl_max, eps=eps,
                          family=family, divergence_family=divergence_family)
     energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=1.0, kl_max=kl_max, eps=eps,

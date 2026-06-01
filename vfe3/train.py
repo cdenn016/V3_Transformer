@@ -39,7 +39,10 @@ def build_optimizer(
         {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_sigma_lr},
         {"params": [pb.phi_embed],                             "lr": cfg.m_phi_lr},
     ]
-    return torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
+    # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
+    # CUDA-only, so on a CPU box this is the standard AdamW. Per-group LRs are honored either way.
+    use_fused = pb.mu_embed.is_cuda
+    return torch.optim.AdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused)
 
 
 def lr_lambda(
@@ -116,14 +119,14 @@ def evaluate(
         total_nats = 0.0
         total_tok = 0
         for i, (tokens, targets) in enumerate(loader):
-            if max_batches is not None and i >= max_batches:
-                break
-            tokens = tokens.to(device)
-            targets = targets.to(device)
+            tokens = tokens.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             _, _, ce = model(tokens, targets)
             n_b = int((targets != -100).sum())
             total_nats += float(ce) * n_b
             total_tok += n_b
+            if max_batches is not None and i + 1 >= max_batches:
+                break               # draw exactly max_batches (process-then-break; no extra pull)
         ce = total_nats / max(total_tok, 1)
     finally:
         if was_training:
@@ -180,8 +183,8 @@ def train(
         except StopIteration:
             it = iter(loader)
             tokens, targets = next(it)
-        tokens = tokens.to(device)
-        targets = targets.to(device)
+        tokens = tokens.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
         losses.append(train_step(model, optimizer, scheduler, tokens, targets, grad_clip=grad_clip))
 
         if log_interval and (step + 1) % log_interval == 0:
@@ -203,7 +206,7 @@ def train(
             win_i0 = step + 1
 
         if eval_interval and val_loader is not None and (step + 1) % eval_interval == 0:
-            m = evaluate(model, val_loader, device=device)
+            m = evaluate(model, val_loader, max_batches=cfg.eval_max_batches, device=device)
             logger.info("  Validation @ step %d:", step + 1)
             logger.info(
                 "    Loss: %.4f | CE: %.4f | PPL: %.1f | BPC: %.4f",

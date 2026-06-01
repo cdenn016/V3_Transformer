@@ -117,16 +117,17 @@ class VFEModel(nn.Module):
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
         log_prior = self._attention_log_prior(N, token_ids.device)
 
-        outs = []
+        # The E-step stack is vectorized over the batch (audit 4c): the belief tuple carries a
+        # leading B axis through transport / gradients / retraction in one set of kernels, instead
+        # of a serial per-sequence Python loop. Sequences are independent (each reads only its own
+        # belief and the shared, sequence-independent log_prior), so the batched result equals the
+        # per-sample result (pinned by tests/test_perf_equivalence.py::test_batched_forward_equals_per_sample).
         run = torch.no_grad() if self.cfg.detach_e_step else nullcontext()
         with run:
-            for b in range(B):
-                belief_b = BeliefState(mu=beliefs.mu[b], sigma=beliefs.sigma[b], phi=beliefs.phi[b])
-                out_b = vfe_stack(belief_b, belief_b.mu, belief_b.sigma, self.group, self.cfg,
-                                  log_prior=log_prior, block_norm=self.block_norm)
-                outs.append(out_b)
-        mu_final = torch.stack([o.mu for o in outs], dim=0)      # (B, N, K)
-        sigma_final = torch.stack([o.sigma for o in outs], dim=0)
+            out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
+                            log_prior=log_prior, block_norm=self.block_norm)
+        mu_final = out.mu                                        # (B, N, K)
+        sigma_final = out.sigma
 
         if self.final_norm is not None:                          # config-selected final norm (cached)
             mu_final = self.final_norm(mu_final, sigma_final)
@@ -151,8 +152,7 @@ class VFEModel(nn.Module):
             # outer-loss role; mass_phi ALSO enters the inner phi E-step objective (e_step:
             # phi_alignment_loss), shaping the inference trajectory. Both roles are in the
             # manuscript algorithm (E-step phi gradient and M-step loss both carry alpha_phi/2||phi||^2).
-            phi_all = torch.stack([o.phi for o in outs], dim=0)
-            loss = loss + 0.5 * self.cfg.mass_phi * (phi_all ** 2).mean()
+            loss = loss + 0.5 * self.cfg.mass_phi * (out.phi ** 2).mean()
         return logits, loss, ce.detach()
 
     @torch.no_grad()

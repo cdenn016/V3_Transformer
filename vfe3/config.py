@@ -106,6 +106,7 @@ class VFE3Config:
     seed:                      int   = 0
     log_interval:              int   = 50           # console log every N steps (0 = off)
     eval_interval:             int   = 0            # periodic validation every N steps (0 = off)
+    eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
 
     def __post_init__(self) -> None:
         # numerics
@@ -227,6 +228,8 @@ class VFE3Config:
             raise ValueError(f"log_interval must be >= 0, got {self.log_interval}")
         if self.eval_interval < 0:
             raise ValueError(f"eval_interval must be >= 0, got {self.eval_interval}")
+        if self.eval_max_batches is not None and self.eval_max_batches < 1:
+            raise ValueError(f"eval_max_batches must be >= 1 if set, got {self.eval_max_batches}")
 
     @property
     def tau(self) -> float:

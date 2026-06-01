@@ -25,11 +25,18 @@ from vfe3.gradients.kernels import belief_gradients
 
 
 def _transport(
-    phi:   torch.Tensor,             # (N, n_gen)
+    phi:   torch.Tensor,             # (N, n_gen) or (B, N, n_gen)
     group: GaugeGroup,
-) -> torch.Tensor:                   # (N, N, K, K) Omega_ij
-    r"""Build the pairwise transport Omega_ij = exp(phi_i) exp(-phi_j)."""
-    return compute_transport_operators(phi.unsqueeze(0), group)["Omega"][0]
+) -> torch.Tensor:                   # (N, N, K, K) or (B, N, N, K, K) Omega_ij
+    r"""Build the pairwise transport Omega_ij = exp(phi_i) exp(-phi_j).
+
+    Rank-aware: a 2-D (N, n_gen) frame (the unbatched diagnostics / trajectory path) is
+    transported as a batch of one and stripped back to (N, N, K, K); a 3-D (B, N, n_gen)
+    frame (the batched forward) flows straight through ``compute_transport_operators`` (which
+    already carries the leading batch axis) and returns (B, N, N, K, K)."""
+    if phi.dim() == 2:
+        return compute_transport_operators(phi.unsqueeze(0), group)["Omega"][0]
+    return compute_transport_operators(phi, group)["Omega"]
 
 
 def _transport_qk(
@@ -134,8 +141,8 @@ def phi_alignment_loss(
     canonical (entropy) branch reuses ``reduced_free_energy``, the -tau log Z envelope form.
     """
     omega = _transport(phi, group)
-    mu_t = transport_mean(omega.unsqueeze(0), mu.unsqueeze(0))[0]
-    sigma_t = transport_covariance(omega.unsqueeze(0), sigma.unsqueeze(0))[0]
+    mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
+    sigma_t = transport_covariance(omega, sigma)
     energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps,
                              family=family, divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0

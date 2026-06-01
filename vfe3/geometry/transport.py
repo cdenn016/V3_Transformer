@@ -80,10 +80,28 @@ def _blockwise_matrix_exp(
     r"""exp of a block-diagonal matrix = block-diagonal of the blocks' exps (audit 4b).
 
     Exact for a block-diagonal M (off-block entries are zero, so the blocks commute trivially
-    and exp does not mix them). Off-block entries of the output are left at zero -- matching the
-    full exp, whose off-block entries are exactly zero for a block-diagonal input.
+    and exp does not mix them; Higham, Functions of Matrices, Sec 10.3). Off-block entries of the
+    output are left at zero -- matching the full exp, whose off-block entries are exactly zero for
+    a block-diagonal input.
+
+    When the blocks are EQUAL size (block_glk's GL(d_head)^H), the H diagonal blocks are stacked
+    into one batched ``matrix_exp`` (a single call instead of H sequential ones -- the
+    launch-bound pattern a GPU is starved by); ``matrix_exp`` evaluates each (d, d) block
+    independently, so this is bit-identical to the per-block loop (pinned at 1e-12 by
+    tests/test_perf_equivalence.py::test_per_block_exp_is_bit_equivalent_to_full_exp). Unequal
+    block sizes (a general block-diagonal M) fall back to the per-block loop.
     """
     out = torch.zeros_like(matrix)
+    if len(set(block_dims)) == 1 and len(block_dims) > 1:
+        d = block_dims[0]
+        blocks = torch.stack(
+            [matrix[..., h * d:(h + 1) * d, h * d:(h + 1) * d] for h in range(len(block_dims))],
+            dim=0,
+        ).contiguous()                                          # (H, ..., d, d)
+        exps = torch.linalg.matrix_exp(blocks)                  # one batched call
+        for h in range(len(block_dims)):
+            out[..., h * d:(h + 1) * d, h * d:(h + 1) * d] = exps[h]
+        return out
     start = 0
     for dim in block_dims:
         end = start + dim
@@ -179,30 +197,37 @@ def compute_transport_operators_direct(
 
 
 def transport_mean(
-    omega: torch.Tensor,             # (B, N, N, K, K) pairwise transport
-    mu:    torch.Tensor,             # (B, N, K) source (key, index j) means
+    omega: torch.Tensor,             # (..., N, N, K, K) pairwise transport
+    mu:    torch.Tensor,             # (..., N, K) source (key, index j) means
 ) -> torch.Tensor:
-    r"""Gauge action on means: mu_t[i,j] = Omega_ij @ mu_j. Returns (B, N, N, K)."""
-    return torch.einsum("bijkl,bjl->bijk", omega, mu)
+    r"""Gauge action on means: mu_t[i,j] = Omega_ij @ mu_j. Returns (..., N, N, K).
+
+    Rank-agnostic via the leading ellipsis: an optional batch axis (B,N,N,K,K)+(B,N,K)
+    flows through unchanged, and the unbatched (N,N,K,K)+(N,K) call is identical -- so the
+    same primitive serves the batched forward and the unbatched diagnostics path.
+    """
+    return torch.einsum("...ijkl,...jl->...ijk", omega, mu)
 
 
 def transport_covariance(
-    omega: torch.Tensor,             # (B, N, N, K, K) pairwise transport
-    sigma: torch.Tensor,             # (B, N, K) diagonal OR (B, N, K, K) full
+    omega: torch.Tensor,             # (..., N, N, K, K) pairwise transport
+    sigma: torch.Tensor,             # (..., N, K) diagonal OR (..., N, K, K) full
 
     *,
     diagonal_out: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Sandwich action Sigma_t[i,j] = Omega_ij Sigma_j Omega_ij^T.
 
-    Full input (B,N,K,K) -> full (B,N,N,K,K). Diagonal input (B,N,K) -> the
-    diagonal approximation (B,N,N,K), Sigma_t[i,j,k] = sum_l Omega_ijkl^2
-    sigma_jl (the diagonal of the full sandwich).
+    Full input (...,N,K,K) -> full (...,N,N,K,K). Diagonal input (...,N,K) -> the
+    diagonal approximation (...,N,N,K), Sigma_t[i,j,k] = sum_l Omega_ijkl^2
+    sigma_jl (the diagonal of the full sandwich). Rank-agnostic via the leading
+    ellipsis (optional batch axis); diagonal vs full is detected by the rank gap
+    ``sigma.dim() == omega.dim() - 2``, which holds with or without the batch axis.
     """
     is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
     if is_diag:
-        return torch.einsum("bijkl,bijkl,bjl->bijk", omega, omega, sigma)
-    return torch.einsum("bijkl,bjlm,bijnm->bijkn", omega, sigma, omega)
+        return torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega, omega, sigma)
+    return torch.einsum("...ijkl,...jlm,...ijnm->...ijkn", omega, sigma, omega)
 
 
 def omega_to_block_exp_pairs(
