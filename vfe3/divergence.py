@@ -198,6 +198,50 @@ def _gaussian_full_renyi(
     return safe_kl_clamp(div, kl_max=kl_max)
 
 
+def gaussian_diagonal_renyi_per_coord(
+    mu_q:    torch.Tensor,             # (..., K) query means
+    sigma_q: torch.Tensor,             # (..., K) query diagonal variances
+    mu_t:    torch.Tensor,             # (..., K) transported key means
+    sigma_t: torch.Tensor,             # (..., K) transported key diagonal variances
+
+    *,
+    alpha:   float = 1.0,
+    kl_max:  float = 100.0,
+    eps:     float = 1e-6,
+) -> torch.Tensor:                     # (..., K) per-coordinate diagonal Renyi/KL D^(k)
+    r"""Per-coordinate diagonal Gaussian Renyi/KL: the coordinate terms of
+    ``_gaussian_diagonal_renyi`` left UNSUMMED, each clamped independently by safe_kl_clamp.
+
+    The ``-K`` of the summed form becomes ``-1`` per coordinate, so ``sum_k`` of this recovers
+    the pre-clamp summed divergence. The clamp is PER COORDINATE (each D^(k) capped at kl_max),
+    so a token's total can reach K*kl_max -- the per-coordinate regularisation scale (design
+    decision, see the spec). Diagonal family only: full-covariance KL couples coordinates
+    through the trace and log-determinant and does not decompose into a coordinate sum.
+    """
+    mu_q = mu_q.float()
+    sigma_q = sigma_q.float().clamp(min=eps)
+    mu_t = mu_t.float()
+    sigma_t = sigma_t.float().clamp(min=eps)
+    delta = mu_t - mu_q
+
+    if abs(alpha - 1.0) < 1e-6:
+        per_coord = 0.5 * (
+            sigma_q / sigma_t + (delta ** 2) / sigma_t - 1.0
+            + torch.log(sigma_t) - torch.log(sigma_q)
+        )
+    else:
+        sigma_blend = ((1.0 - alpha) * sigma_q + alpha * sigma_t).clamp(min=eps)
+        mahal       = alpha * (delta ** 2) / sigma_blend
+        logdet      = (
+            (1.0 - alpha) * torch.log(sigma_q)
+            + alpha * torch.log(sigma_t)
+            - torch.log(sigma_blend)
+        ) / (alpha - 1.0)
+        per_coord = 0.5 * (mahal + logdet)
+
+    return safe_kl_clamp(per_coord, kl_max=kl_max)
+
+
 def renyi(
     mu_q:    torch.Tensor,             # (..., K) query means
     sigma_q: torch.Tensor,             # (..., K) or (..., K, K) query (co)variances

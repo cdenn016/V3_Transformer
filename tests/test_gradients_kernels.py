@@ -95,6 +95,31 @@ def test_kernel_honors_clamp_saturation_self_term():
     assert torch.allclose(km2, om2, atol=1e-5) and torch.allclose(ks2, os2, atol=1e-5)
 
 
+def test_per_coord_alpha_saturation_mask_is_per_coordinate():
+    # state_dependent_per_coord weights each coordinate's self-divergence by its OWN
+    # alpha^(k) = c0/(b0 + D^(k)), and clamps each coordinate's D^(k) at kl_max
+    # independently. The clamp's gradient is 0 on a saturated coordinate, so the hand
+    # kernel must use a PER-COORDINATE saturation mask to stay equal to the filtering
+    # oracle. A per-POSITION (summed) mask would gate the whole token off the moment any
+    # one coordinate saturates -- wrongly killing the unsaturated coordinate's restoring
+    # force. This builds a belief where coordinate 0 saturates (D^(0)=200>kl_max) while
+    # coordinate 1 does not (D^(1)=0.125), and pins kernel == oracle there.
+    N, K = 1, 2
+    omega = torch.eye(K).expand(N, N, K, K).contiguous()        # identity -> pairwise term is 0
+    mu = torch.zeros(N, K); sigma = torch.ones(N, K)
+    mu_p = torch.tensor([[20.0, 0.5]])                          # coord 0 saturates, coord 1 does not
+    sigma_p = torch.ones(N, K)
+    km, ks = belief_gradients(mu, sigma, mu_p, sigma_p, omega, gradient_mode="filtering",
+                              alpha_mode="state_dependent_per_coord", b0=0.5, c0=2.0)
+    om, os_ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, gradient_mode="filtering",
+                                        alpha_mode="state_dependent_per_coord", b0=0.5, c0=2.0)
+    assert torch.allclose(km, om, atol=1e-5) and torch.allclose(ks, os_, atol=1e-5)
+    # coordinate 0 gated off (saturated); coordinate 1's restoring force SURVIVES -- the
+    # per-coordinate mask is the only thing that keeps km[...,1] != 0 here.
+    assert torch.allclose(km[..., 0], torch.zeros(N), atol=1e-5)
+    assert (km[..., 1].abs() > 1e-3).all()
+
+
 def test_single_block_irrep_dims_matches_none():
     # The opt-in per-head axis must reduce EXACTLY to the legacy single-beta path when the
     # group is one block (irrep_dims=[K] or None): glk K=2 -> identical gradients.

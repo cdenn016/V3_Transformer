@@ -206,7 +206,7 @@ class VFEModel(nn.Module):
         """
         from vfe3.inference.e_step import _transport
         from vfe3.geometry.transport import transport_mean, transport_covariance
-        from vfe3.free_energy import pairwise_energy, self_divergence, attention_weights
+        from vfe3.free_energy import pairwise_energy, self_divergence_for_alpha, attention_weights
         from vfe3.alpha_i import self_coupling_alpha
         from vfe3 import metrics
 
@@ -237,10 +237,10 @@ class VFEModel(nn.Module):
             irrep_dims=self.group.irrep_dims,
         )
         beta = attention_weights(energy, tau=cfg.tau, log_prior=log_prior)
-        self_div = self_divergence(                                  # (N,)
+        self_div = self_divergence_for_alpha(                        # (N,) or (N, K) per-coord
             out.mu, out.sigma, mu_p, sigma_p,
             alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
-            family=cfg.family, divergence_family=cfg.divergence_family,
+            family=cfg.family, divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
         )
         alpha, _ = self_coupling_alpha(
             self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,

@@ -42,6 +42,27 @@ def test_new_form_with_novel_kwarg_reachable_without_editing_dispatcher():
     assert torch.allclose(a, torch.full((3,), 5.0))
 
 
+def test_alpha_is_per_coord_declares_reduction_need():
+    # Modularity: each alpha form DECLARES whether it consumes a per-coordinate (unsummed)
+    # self-divergence, so the routing seam reads that flag rather than hard-coding a mode
+    # name at the call sites. A future per-coordinate form slots in by registering with
+    # per_coord=True -- no consumer is edited.
+    from vfe3.alpha_i import alpha_is_per_coord
+    assert alpha_is_per_coord("state_dependent_per_coord") is True
+    assert alpha_is_per_coord("state_dependent") is False
+    assert alpha_is_per_coord("constant") is False
+
+
+def test_register_alpha_per_coord_flag_is_modular():
+    from vfe3.alpha_i import register_alpha, alpha_is_per_coord
+
+    @register_alpha("_test_pc", per_coord=True)
+    def _pc(kl, **kwargs):
+        return kl, torch.zeros_like(kl)
+
+    assert alpha_is_per_coord("_test_pc") is True
+
+
 from vfe3.alpha_i import alpha_gradient_coefficient
 
 

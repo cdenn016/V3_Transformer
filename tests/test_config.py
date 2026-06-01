@@ -120,6 +120,16 @@ def test_diagonal_covariance_must_agree_with_family():
     VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="full")
 
 
+def test_per_coord_alpha_requires_diagonal_family():
+    """state_dependent_per_coord needs a per-coordinate self-divergence, which exists only for
+    the diagonal family (full-cov KL does not decompose coordinate-wise). The inconsistent pair
+    is rejected at construction; the diagonal pairing (the default family) is accepted."""
+    with pytest.raises(ValueError):
+        VFE3Config(alpha_mode="state_dependent_per_coord",
+                   family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+    VFE3Config(alpha_mode="state_dependent_per_coord")          # family defaults to diagonal -> ok
+
+
 def test_tied_block_glk_rejects_killing_per_block():
     """killing_per_block builds a per-HEAD Killing metric and needs generators that partition per
     block (block_glk's independent gl(d) per head). tied_block_glk's shared kron(I_n, gl(d))

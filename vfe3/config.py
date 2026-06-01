@@ -183,6 +183,18 @@ class VFE3Config:
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
         _require(self.alpha_mode, _VALID_ALPHA_MODES, "alpha_mode")
+        # A per-coordinate alpha form (state_dependent_per_coord) weights each coordinate's
+        # self-divergence by its own alpha^(k), which needs a per-coordinate self-divergence.
+        # That decomposition exists only for the diagonal family (full-covariance KL couples
+        # coordinates through the trace and log-determinant), so reject the inconsistent pair at
+        # construction rather than letting the per-coordinate divergence raise mid-forward.
+        from vfe3.alpha_i import alpha_is_per_coord
+        if alpha_is_per_coord(self.alpha_mode) and self.family != "gaussian_diagonal":
+            raise ValueError(
+                f"alpha_mode={self.alpha_mode!r} needs a per-coordinate self-divergence, which "
+                f"exists only for the diagonal family; got family={self.family!r}. Use "
+                f"family='gaussian_diagonal' or a per-position alpha_mode."
+            )
 
         # attention
         _require(self.attention_prior, _VALID_ATTENTION_PRIORS, "attention_prior")
