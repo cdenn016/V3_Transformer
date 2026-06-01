@@ -87,6 +87,8 @@ class PriorBank(nn.Module):
     temperature.
     """
 
+    output_proj_weight: Optional[nn.Parameter]   # (V, K) linear-decode weight; None unless use_prior_bank=False
+
     def __init__(
         self,
         vocab_size:   int,

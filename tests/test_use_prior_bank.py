@@ -103,3 +103,13 @@ def test_optimizer_still_exactly_covers_params_under_use_prior_bank_true():
     opt = build_optimizer(model, cfg)
     grouped = {p for grp in opt.param_groups for p in grp["params"]}
     assert grouped == set(model.parameters())
+
+
+def test_use_prior_bank_false_with_detach_e_step_warns_encode_tables_frozen():
+    # Audit guardrail: under use_prior_bank=False AND detach_e_step=True the detached E-step
+    # severs the encode tables and the linear decode reads only mu_final, so only
+    # output_proj_weight trains. The model must warn at construction (a silent freeze otherwise).
+    cfg = VFE3Config(vocab_size=10, embed_dim=4, n_heads=2, max_seq_len=3,
+                     use_prior_bank=False, detach_e_step=True)
+    with pytest.warns(UserWarning, match="freezes the encode prior tables"):
+        VFEModel(cfg)

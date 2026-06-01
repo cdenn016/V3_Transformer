@@ -26,6 +26,7 @@ import json
 import logging
 from dataclasses import asdict
 from pathlib import Path
+from types import ModuleType
 from typing import Dict, Iterable, List, Optional
 
 import torch
@@ -43,9 +44,9 @@ class RunArtifacts:
         model:     torch.nn.Module,
 
         *,
-        dataset:   str               = "",
+        dataset:   str                  = "",
         device:    'str | torch.device' = "cpu",
-        timestamp: Optional[str]      = None,
+        timestamp: Optional[str]        = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.ckpt_dir = self.run_dir / "checkpoints"
@@ -123,7 +124,7 @@ def finalize_run(
     device:      Optional[torch.device] = None,
     wall_time:   Optional[float] = None,
     logger:      Optional[logging.Logger] = None,
-) -> Dict[str, float]:
+) -> Dict[str, object]:
     r"""Reload the best-val checkpoint, score the TEST split, and write summary + figures.
 
     The headline metric is the test perplexity of the BEST-validation model (the periodic eval
@@ -139,12 +140,15 @@ def finalize_run(
 
     reloaded_best = False
     if artifacts.best_path.exists():
-        model.load_state_dict(torch.load(artifacts.best_path, map_location=device))
+        # best_model.pt is a pure state_dict (torch.save(model.state_dict(), ...)), so weights_only=True
+        # loads it identically while refusing arbitrary pickle execution on a tampered checkpoint
+        # (matches the datasets.py precedent).
+        model.load_state_dict(torch.load(artifacts.best_path, map_location=device, weights_only=True))
         reloaded_best = True
         logger.info("Reloaded best-val checkpoint (step %s, val PPL %.3f) for test eval",
                     artifacts.best_step, artifacts.best_val_ppl)
 
-    results: Dict[str, float] = {}
+    results: Dict[str, object] = {}                             # mixes float / Optional[float|int] / bool
     if test_loader is not None:
         m = evaluate(model, test_loader, device=device)
         results = {"test_ce": m["ce"], "test_ppl": m["ppl"], "test_bpc": m["bpc"]}
@@ -197,7 +201,7 @@ def _save_figures(
         logger.warning("figure generation failed (%s); numeric results are still saved", exc)
 
 
-def _save_free_energy_bar(artifacts: RunArtifacts, figs) -> None:
+def _save_free_energy_bar(artifacts: RunArtifacts, figs: ModuleType) -> None:
     r"""Bar of the per-term free-energy decomposition at the last eval."""
     last = artifacts.history[-1]
     terms = {k: last[k] for k in ("self_coupling", "belief_coupling", "attention_entropy")

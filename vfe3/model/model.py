@@ -78,6 +78,18 @@ class VFEModel(nn.Module):
         # irrep blocks; HeadMixer rejects a single-block group at construction (glk / so_k have
         # nothing to mix), so a bad gauge_group + use_head_mixer pair fails here, not at forward.
         self.head_mixer = HeadMixer(self.group.irrep_dims) if cfg.use_head_mixer else None
+        if (not cfg.use_prior_bank) and cfg.detach_e_step:
+            # Joint-toggle footgun (audit 2026-05-31): the detached E-step severs the encode prior
+            # tables (mu/sigma/phi_embed) from the loss, and the linear decode reads only mu_final,
+            # so ONLY output_proj_weight would train -- the prior bank is effectively frozen.
+            import warnings
+            warnings.warn(
+                "use_prior_bank=False with detach_e_step=True freezes the encode prior tables "
+                "(mu_embed/sigma_log_embed/phi_embed): the detached E-step cuts them off and the "
+                "linear decode reads only mu_final, so only output_proj_weight trains. Set "
+                "detach_e_step=False to learn the prior tables.",
+                stacklevel=2,
+            )
         # Causal/attention log-prior is loop-invariant for fixed (N, device, dtype); cache it
         # (audit 4e) keyed on those so it is built once, not every forward. Not an nn.buffer
         # because it depends on the runtime N (sequence length), which varies across calls.

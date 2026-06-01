@@ -99,3 +99,37 @@ job is the user's to run; this validates the plumbing, not convergence.
 Full suite after Task 1: **240 tests, 0 failures, 0 errors** (239 passed + 1 non-strict xpass),
 read from `--junitxml`. Branch fresh from `origin/main` (post perf-merge). No autonomous merge to
 main (left for the user's review).
+
+## Task 2 — deep audit + surgical fixes
+
+Five-lens parallel audit (code-reviewer, debugger, refactoring-specialist, performance-engineer,
+python-pro) + per-finding adversarial source verification, run as a workflow (read-only investigators
+=> safe under the shared-tree edit-loss caveat). 33 agents, 28 findings, **28 CONFIRMED / 0 REFUTED**.
+Report: `docs/audits/audit-2026-05-31-task1-buildout.md`. No hard-constraint violations (no-NN pure
+path intact, sandwich transport correct, head-mixer algebra correct).
+
+Triaged → fixed the genuine, surgical subset (mostly Task-1 code):
+- `run_artifacts.py`: `torch.load(..., weights_only=True)` on the best-checkpoint reload (security,
+  matches datasets.py); `finalize_run -> Dict[str, object]` (the dict mixes float/Optional/bool);
+  `_save_free_energy_bar(figs: ModuleType)`; signature `=`-alignment fixed (MANDATORY convention).
+- `prior_bank.py`: class-level `output_proj_weight: Optional[nn.Parameter]` annotation.
+- `train.py`: validation log no longer prints val CE in both "Loss" and "CE" columns (now
+  `CE | PPL | BPC`); `build_optimizer` comment clarifies the coverage assert guards GROUPING, not
+  gradient FLOW, and enumerates the intentional null-gradient toggle cases; `run_training`
+  docstring marked superseded by `train_vfe3.main()`.
+- `train_vfe3.py`: same validation-log de-duplication on the final line.
+- `model.py`: a `warnings.warn` guardrail when `use_prior_bank=False` AND `detach_e_step=True`
+  (that combination freezes the encode prior tables — only `output_proj_weight` trains). New test
+  `test_use_prior_bank_false_with_detach_e_step_warns_encode_tables_frozen`.
+
+Deferred (pre-existing / intentional / explicitly-deferred), documented in the report:
+- The dense `(B,N,N,K,K)` Ω at transport.py:152 saved by autograd each step, and the unexploited
+  block-diagonal structure (the two "high" perf findings) — this IS the deferred perf P0 #2; it
+  needs a golden-test-pinned perf pass on the 5090, not an audit-fix commit. Remains the top
+  speedup-roadmap item.
+- Per-forward GPU→CPU sync (`flat_targets.any()`), 3 forwards per log step, per-iter
+  `torch.tensor(irrep_dims)`, matrix_exp scatter loop — pre-existing; fold into the GPU perf pass.
+- `reference_decode`/`run_training` orphans, duplicate `_banner`, pre-existing type-precision
+  (forward union, diagnostics `dict`, `block_norm: Optional[Any]`) — left per the surgical rule.
+
+Full suite after audit fixes: **241 tests, 0 failures, 0 errors** (240 passed + 1 non-strict xpass).

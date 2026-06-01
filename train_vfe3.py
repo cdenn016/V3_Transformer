@@ -248,9 +248,9 @@ def main() -> None:
 
     m = evaluate(model, val_loader, device=torch.device(DEVICE))
     logger.info("=" * 64)
-    logger.info(
-        "Final (val) | Loss: %.4f | CE: %.4f | PPL: %.1f | BPC: %.4f",
-        m["ce"], m["ce"], m["ppl"], m["bpc"],
+    logger.info(                                          # val-only summary; CE is the loss (no separate train loss here)
+        "Final (val) | CE: %.4f | PPL: %.1f | BPC: %.4f",
+        m["ce"], m["ppl"], m["bpc"],
     )
 
     # End-of-run held-out TEST evaluation on the reloaded best-val checkpoint, plus summary +

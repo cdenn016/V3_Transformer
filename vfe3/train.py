@@ -55,6 +55,12 @@ def build_optimizer(
     # Exact-coverage guard: every model parameter must land in exactly one group. A missing
     # group would leave that weight frozen (no AdamW update) with no error -- the bug class the
     # optimizer is most prone to as new learnable seams (output_proj, head mixer, ...) are added.
+    # NOTE: this guards GROUPING/coverage, not gradient FLOW. A grouped parameter can still receive
+    # a null gradient under specific opt-in toggles, by design: phi_embed under detach_e_step=True
+    # (the E-step is detached; test-pinned in test_model.py), decode_log_scale under
+    # use_prior_bank=False (the linear decode discards tau_eff), and ALL encode tables under
+    # use_prior_bank=False AND detach_e_step=True (only output_proj_weight reaches the loss; the
+    # model emits a warning for that combination). These are intentional, not coverage bugs.
     grouped = {p for g in groups for p in g["params"]}
     missing = set(model.parameters()) - grouped
     if missing:
@@ -233,9 +239,9 @@ def train(
         if eval_interval and val_loader is not None and (step + 1) % eval_interval == 0:
             m = evaluate(model, val_loader, max_batches=cfg.eval_max_batches, device=device)
             logger.info("  Validation @ step %d:", step + 1)
-            logger.info(
-                "    Loss: %.4f | CE: %.4f | PPL: %.1f | BPC: %.4f",
-                m["ce"], m["ce"], m["ppl"], m["bpc"],
+            logger.info(                                         # val has no separate loss; CE is the loss
+                "    CE: %.4f | PPL: %.1f | BPC: %.4f",
+                m["ce"], m["ppl"], m["bpc"],
             )
             # Persistence is opt-in: with no artifacts object this whole block is skipped, so the
             # silent/in-memory path is unchanged. A CSV row (train loss + lr + val + the converged
@@ -300,6 +306,11 @@ def run_training(
     init banner, and trains for ``n_steps`` M-steps with the config-selected console
     logging (``cfg.log_interval``, ``cfg.eval_interval``). Returns the trained model and
     its loss history.
+
+    DEPRECATED / minimal: superseded by ``train_vfe3.main()``, which is the canonical entry
+    point. This helper passes no ``artifacts`` (so ``checkpoint_interval``/best-model/CSV are
+    never written), reuses ``loader`` as the validation loader (train == val), and never runs
+    the end-of-run test eval. Kept only for the lightweight in-process smoke use it already had.
     """
     torch.manual_seed(cfg.seed)              # reproducible prior-table init + data order
     model = VFEModel(cfg)
