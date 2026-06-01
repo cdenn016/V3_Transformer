@@ -99,6 +99,41 @@ def test_optimizer_covers_head_mixer_params():
     assert model.head_mixer.mixer_delta in grouped
 
 
+def test_head_mixer_equivariant_under_tied_gauge_full_cov():
+    # THEORY PAYOFF: under a TIED gauge Omega = kron(I_n, h) (h in GL(d)), the Schur-commutant
+    # mixer M = kron(A, I_d) commutes with Omega, so the FULL-COVARIANCE mixer is EXACTLY gauge-
+    # equivariant at the mixer-operation level:
+    #     mix(Omega mu, Omega Sigma Omega^T) == (Omega (M mu), Omega (M Sigma M^T) Omega^T).
+    # This is the equivariance that block_glk's UNTIED per-head gauge breaks and tied_block_glk
+    # (kron(I_n, gl(d))) restores. NOTE: this is a statement about the MIXER operation under the
+    # tied gauge, NOT a claim that the whole model is gauge-equivariant. It is tested on the
+    # full-covariance path; the diagonal closed form is only equivariant under DIAGONAL gauges
+    # (the diagonal-of-sandwich approximation used throughout V3), so it is deliberately not
+    # asserted under this general tied gauge.
+    torch.manual_seed(0)
+    n, d = 2, 3
+    K = n * d
+    mix = HeadMixer([d, d])
+    with torch.no_grad():
+        mix.mixer_delta.normal_(0.0, 0.4)                    # A = I + Delta, nontrivial
+    h = torch.eye(d) + 0.3 * torch.randn(d, d)               # h in GL(d) (near I, invertible)
+    Omega = torch.kron(torch.eye(n), h)                      # (K, K) tied gauge: same h in every head
+    mu = torch.randn(1, 1, K)
+    base = torch.randn(K, K)
+    Sigma = (base @ base.t() + K * torch.eye(K)).reshape(1, 1, K, K)   # SPD full covariance
+
+    mu_g = (Omega @ mu.unsqueeze(-1)).squeeze(-1)            # gauge then mix
+    Sigma_g = Omega @ Sigma @ Omega.t()
+    mu_L, Sigma_L = mix(mu_g, Sigma_g)
+
+    mu_m, Sigma_m = mix(mu, Sigma)                           # mix then gauge
+    mu_R = (Omega @ mu_m.unsqueeze(-1)).squeeze(-1)
+    Sigma_R = Omega @ Sigma_m @ Omega.t()
+
+    assert torch.allclose(mu_L, mu_R, atol=1e-5)
+    assert torch.allclose(Sigma_L, Sigma_R, atol=1e-4)
+
+
 def test_head_mixer_rejected_for_single_block_group_at_model_build():
     # glk / so_k resolve to a single irrep block (nothing to mix); requesting the mixer there
     # must fail at construction, not silently no-op or crash at the first forward.

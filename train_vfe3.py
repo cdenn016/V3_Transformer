@@ -67,10 +67,11 @@ config = dict(
     n_heads                   = 2,
 
     # gauge seam
-    gauge_group               = "block_glk",         # "glk" | "block_glk" | "so_k"
+    gauge_group               = "block_glk",         # "glk" | "block_glk" | "tied_block_glk" | "so_k"
+                                                     # tied_block_glk: one shared GL(d) frame across heads (kron(I_n, gl(d)))
     gauge_parameterization    = "phi",               # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
-    use_head_mixer            = False,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks, e.g. block_glk);
-                                                     # breaks strict gauge equivariance under untied per-block gauge (exact at init)
+    use_head_mixer            = False,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks: block_glk/tied_block_glk);
+                                                     # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
 
     # belief family -- diagonal_covariance MUST equal (family == "gaussian_diagonal")
     diagonal_covariance       = True,

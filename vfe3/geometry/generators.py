@@ -115,6 +115,45 @@ def generate_glk_multihead(
     return G.to(dtype).to(device)
 
 
+def generate_glk_multihead_tied(
+    K:                int,
+    n_heads:          int,
+
+    *,
+    device:           'torch.device | str | None'     = None,
+    dtype:            torch.dtype                      = torch.float32,
+) -> torch.Tensor:
+    r"""TIED block-diagonal gl(d_head) generators: one shared gl(d_head) acting on every head.
+
+    Each generator is ``kron(I_{n_heads}, E_ij)`` for the d_head x d_head elementary basis E_ij,
+    so the SAME d_head x d_head algebra element acts identically in every diagonal block. With one
+    per-token gauge coordinate vector phi (n_gen = d_head^2), the group element is
+    exp(sum_a phi_a kron(I, E_a)) = kron(I, exp(sum_a phi_a E_a)) -- the SAME GL(d_head) frame in
+    every block (a TIED gauge across heads). Contrast ``generate_glk_multihead`` (n_heads * d_head^2
+    generators, an INDEPENDENT gl(d_head) per head -- an untied gauge). The tied gauge is the one
+    under which the Schur-commutant head mixer kron(A, I_d) is exactly gauge-equivariant.
+
+    Returns (d_head^2, K, K).
+    """
+    if K % n_heads != 0:
+        raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
+
+    d_head       = K // n_heads
+    n_generators = d_head * d_head
+    eye_n        = torch.eye(n_heads, dtype=torch.float64)
+
+    G = torch.zeros(n_generators, K, K, dtype=torch.float64)
+    idx = 0
+    for i in range(d_head):
+        for j in range(d_head):
+            block = torch.zeros(d_head, d_head, dtype=torch.float64)
+            block[i, j] = 1.0
+            G[idx] = torch.kron(eye_n, block)                # same d_head x d_head element in every block
+            idx += 1
+
+    return G.to(dtype).to(device)
+
+
 def generate_glk_cross_head(
     K:                int,
     n_heads:          int,

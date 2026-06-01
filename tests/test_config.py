@@ -120,6 +120,18 @@ def test_diagonal_covariance_must_agree_with_family():
     VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="full")
 
 
+def test_tied_block_glk_rejects_killing_per_block():
+    """killing_per_block builds a per-HEAD Killing metric and needs generators that partition per
+    block (block_glk's independent gl(d) per head). tied_block_glk's shared kron(I_n, gl(d))
+    generators each act on EVERY block, so that preconditioner does not apply -- reject at config
+    time (else it fails cryptically at the first forward). A compatible preconditioner is accepted."""
+    with pytest.raises(ValueError):
+        VFE3Config(embed_dim=4, n_heads=2, gauge_group="tied_block_glk",
+                   phi_precond_mode="killing_per_block")
+    for ok in ("none", "clip", "killing"):
+        VFE3Config(embed_dim=4, n_heads=2, gauge_group="tied_block_glk", phi_precond_mode=ok)
+
+
 def test_config_phi_retract_mode_validated():
     """phi_retract_mode selects the Lie-algebra composition chart (euclidean | bch)."""
     assert VFE3Config().phi_retract_mode == "euclidean"

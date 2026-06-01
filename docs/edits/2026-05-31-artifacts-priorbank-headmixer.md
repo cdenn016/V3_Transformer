@@ -146,3 +146,29 @@ Now `VFEModel.diagnostics()` computes both at the converged transport (`omega`, 
 no hot-path change. Tests: `test_diagnostics_includes_gauge_geometry_probes`,
 `test_metrics_csv_includes_gauge_geometry_columns`, `test_finalize_writes_gauge_geometry_figure`.
 Full suite: **244 tests, 0 failures, 0 errors** (243 passed + 1 non-strict xpass).
+
+## Task 3 Part 2 — `tied_block_glk` group: an equivariant home for the head mixer
+
+The 1c finding was that `block_glk`'s untied per-head gauge breaks the head mixer's equivariance.
+Part 2 closes that gap with a theory-faithful structure-group variant. New
+`generate_glk_multihead_tied(K, n_heads)` builds generators `kron(I_n, E_ij)` — the same `gl(d)`
+basis replicated across all heads, so `n_gen = d²` and one φ drives `exp(sum_a phi_a kron(I,E_a)) =
+kron(I, exp(M))`, i.e. the SAME `GL(d)` frame in every head (a TIED gauge). Registered as
+`tied_block_glk` (irrep_dims `[d]*n_heads`, so transport / per-head attention are unchanged); added
+to `_VALID_GAUGE_GROUPS`.
+
+Viability gated by a throwaway probe before integration (per review): the group builds, the tied
+generators give bit-identical head-blocks with zero off-block, forward+backward is finite, and the
+tied+head_mixer combo trains. The probe also confirmed `killing_per_block` raises under the shared
+generators (they do not partition per head) — so `config.__post_init__` now REJECTS
+`tied_block_glk` + `killing_per_block` at construction (use `none`/`clip`/ambient `killing`).
+
+Payoff, verified as a UNIT test on the mixer (not an end-to-end model claim): under a tied gauge
+`Omega = kron(I_n, h)`, `M = kron(A, I_d)` commutes with `Omega`, so the FULL-COVARIANCE mixer is
+EXACTLY gauge-equivariant — `mix(Omega mu, Omega Sigma Omega^T) == (Omega M mu, Omega M Sigma M^T
+Omega^T)` (`test_head_mixer_equivariant_under_tied_gauge_full_cov`). CAVEAT (documented, not hidden):
+the diagonal closed form is equivariant only under DIAGONAL gauges (the diagonal-of-sandwich
+approximation V3 already uses), so it is deliberately not asserted under a general tied gauge. Tests
+(5): tied-across-heads generator structure, model-runs-under-tied, config rejection, the full-cov
+equivariance, plus the existing mixer suite. Full suite: **248 tests, 0 failures, 0 errors** (247
+passed + 1 non-strict xpass).

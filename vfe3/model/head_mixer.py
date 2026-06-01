@@ -27,8 +27,17 @@ Gauge equivariance: :math:`\mathrm{kron}(A, I_d)` commutes with a block-diagonal
 independent ``gl(d_head)`` sub-algebra -- an UNTIED gauge -- so the mixer does NOT commute with
 the per-head gauge action and breaks strict gauge equivariance there. The deviation is zero at
 the identity init and grows as :math:`A` drifts from :math:`I` during training. This is an
-accepted, opt-in departure (the no-mixer path is the default and stays equivariant); a future
-tied-gauge group (one shared ``gl(d)`` replicated across heads) would restore exact equivariance.
+accepted, opt-in departure (the no-mixer path is the default and stays equivariant).
+
+The ``tied_block_glk`` group (generators ``kron(I_n, gl(d))``, one shared frame across heads)
+restores exact equivariance: under a tied gauge :math:`\Omega = \mathrm{kron}(I_n, h)`,
+:math:`M = \mathrm{kron}(A, I_d)` commutes with :math:`\Omega`, so the FULL-COVARIANCE mixer is
+exactly equivariant -- :math:`\mathrm{mix}(\Omega\mu, \Omega\Sigma\Omega^\top) = (\Omega M\mu,
+\Omega M\Sigma M^\top \Omega^\top)` (pinned by ``test_head_mixer_equivariant_under_tied_gauge_full_cov``).
+This is a statement about the MIXER OPERATION, not a claim that the whole model is gauge-equivariant.
+CAVEAT: the diagonal closed form :math:`\sigma'[m] = \sum_n A[m,n]^2 \sigma[n]` is equivariant only
+under DIAGONAL gauges (the diagonal-of-sandwich approximation V3 already uses when
+``diagonal_covariance=True``), not under a general tied gauge.
 """
 
 from typing import List, Tuple

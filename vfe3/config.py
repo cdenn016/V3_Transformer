@@ -11,7 +11,7 @@ from typing import Optional
 
 _VALID_DIVERGENCE_FAMILIES = ("gaussian_diagonal", "gaussian_full")
 _VALID_DIVERGENCE_FUNCTIONALS = ("renyi",)
-_VALID_GAUGE_GROUPS        = ("glk", "block_glk", "so_k")
+_VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
 _VALID_DECODE_MODES        = ("diagonal", "full")
@@ -57,8 +57,9 @@ class VFE3Config:
     # head mixer (opt-in, default off): a learned Schur-commutant matrix mixes the equal-size
     # gauge-irrep blocks (under block_glk: the n_heads heads) of the converged belief. Identity
     # init -> step-0 bit-identical to off. Breaks strict gauge equivariance under block_glk's
-    # untied per-block gauge (exact at init, deviates as the mixer drifts); needs a group with
-    # >= 2 equal blocks (block_glk), else VFEModel construction raises.
+    # untied per-block gauge (exact at init, deviates as the mixer drifts); the tied_block_glk
+    # group restores EXACT equivariance on the full-covariance path. Needs a group with >= 2 equal
+    # blocks (block_glk / tied_block_glk), else VFEModel construction raises.
     use_head_mixer:            bool  = False
 
     # belief family
@@ -193,6 +194,18 @@ class VFE3Config:
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         _require(self.phi_precond_mode, _VALID_PHI_PRECOND_MODES, "phi_precond_mode")
         _require(self.phi_retract_mode, _VALID_PHI_RETRACT_MODES, "phi_retract_mode")
+        # 'killing_per_block' builds a per-HEAD Killing metric and requires generators that partition
+        # per block (block_glk's independent gl(d_head) per head). The tied gauge's shared generators
+        # kron(I_n, gl(d_head)) each act on EVERY block, so the per-block partition does not exist;
+        # reject at construction (it otherwise fails cryptically inside the first E-step). The ambient
+        # 'killing', 'clip', and 'none' preconditioners are unaffected.
+        if self.gauge_group == "tied_block_glk" and self.phi_precond_mode == "killing_per_block":
+            raise ValueError(
+                "phi_precond_mode='killing_per_block' is incompatible with gauge_group="
+                "'tied_block_glk': the shared kron(I_n, gl(d)) generators do not partition per head, "
+                "so the per-block Killing metric is undefined. Use 'none', 'clip', or the ambient "
+                "'killing'."
+            )
 
         # decode / encode
         if self.decode_tau <= 0.0:
