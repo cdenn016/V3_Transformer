@@ -12,8 +12,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from vfe3.alpha_i import alpha_gradient_coefficient
-from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence
+from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
+from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence_for_alpha
 from vfe3.geometry.transport import transport_covariance, transport_mean
 from vfe3.gradients.oracle import belief_gradients_autograd
 
@@ -56,6 +56,26 @@ def _raw_diag_kl(
     return 0.5 * (trace + mahal - mu_q.shape[-1] + logdet)
 
 
+def _raw_diag_kl_per_coord(
+    mu_q:    torch.Tensor,             # (N, K) query means
+    sigma_q: torch.Tensor,             # (N, K) query variances
+    mu_p:    torch.Tensor,             # (N, K) prior means
+    sigma_p: torch.Tensor,             # (N, K) prior variances
+
+    *,
+    eps:     float = 1e-6,
+) -> torch.Tensor:                     # (N, K) UNCLAMPED per-coordinate KL D^(k)(q_i || p_i)
+    r"""Unclamped per-coordinate diagonal KL D^(k) = 0.5 (s_k/t_k + (mu_p-mu_q)^2/t_k - 1 + log(t_k/s_k)).
+
+    The per-coordinate analog of ``_raw_diag_kl`` (the -K of the summed form becomes -1 per
+    coordinate). The per-coordinate self-term differentiates through a PER-COORDINATE
+    safe_kl_clamp, so the kernel builds its saturation mask from this so a saturated
+    coordinate is gated independently of the others -- matching the filtering oracle.
+    """
+    sq = sigma_q.clamp(min=eps); sp = sigma_p.clamp(min=eps)
+    return 0.5 * (sq / sp + ((mu_p - mu_q) ** 2) / sp - 1.0 + torch.log(sp) - torch.log(sq))
+
+
 @register_kernel("gaussian_diagonal")
 def _diag_kl_filtering_kernel(
     mu_q:       torch.Tensor,             # (N, K)
@@ -86,11 +106,21 @@ def _diag_kl_filtering_kernel(
     safe_kl_clamp(D, [0, kl_max]), whose gradient is 0 once the raw self-divergence saturates the
     clamp, so the hand kernel zeros its self-term there to stay EXACTLY equal to the filtering
     oracle. The pairwise term needs no mask: a saturated E_ij drives beta_ij -> 0 on both sides.
+
+    The mask is shape-driven by ``alpha_coef``: a per-position coefficient (N,1) carries a summed
+    self-divergence clamped as one scalar, so the mask is per-token (N,1); a per-coordinate
+    coefficient (N,K) (the ``state_dependent_per_coord`` form) carries a coordinate-wise clamp, so
+    the mask is per-coordinate (N,K) and a saturated coordinate is gated WITHOUT killing its
+    unsaturated neighbours. The two coincide at K=1.
     """
     sp = sigma_p.clamp(min=eps); sq = sigma_q.clamp(min=eps); st = sigma_t.clamp(min=eps)
 
-    raw_self = _raw_diag_kl(mu_q, sigma_q, mu_p, sigma_p, eps=eps)              # (N,)
-    self_mask = ((raw_self > 0.0) & (raw_self < kl_max)).to(mu_q.dtype).unsqueeze(-1)
+    if alpha_coef.shape[-1] == 1:                                               # per-position alpha
+        raw_self  = _raw_diag_kl(mu_q, sigma_q, mu_p, sigma_p, eps=eps)         # (N,)
+        self_mask = ((raw_self > 0.0) & (raw_self < kl_max)).to(mu_q.dtype).unsqueeze(-1)
+    else:                                                                       # per-coordinate alpha
+        raw_self  = _raw_diag_kl_per_coord(mu_q, sigma_q, mu_p, sigma_p, eps=eps)   # (N, K)
+        self_mask = ((raw_self > 0.0) & (raw_self < kl_max)).to(mu_q.dtype)
 
     self_mu  = self_mask * alpha_coef * (mu_q - mu_p) / sp
     pair_mu  = torch.einsum("...ijk,...ijk->...ik", beta_coord, (mu_q.unsqueeze(-2) - mu_t) / st)
@@ -152,13 +182,15 @@ def belief_gradients(
     mu_k, sigma_k = mu.detach(), sigma.detach()
     mu_t = transport_mean(omega, mu_k)                 # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma_k)
-    sd = self_divergence(mu, sigma, mu_p, sigma_p, alpha=1.0, kl_max=kl_max, eps=eps,
-                         family=family, divergence_family=divergence_family)
+    sd = self_divergence_for_alpha(mu, sigma, mu_p, sigma_p, alpha=1.0, kl_max=kl_max, eps=eps,
+                                   family=family, divergence_family=divergence_family, alpha_mode=alpha_mode)
     energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=1.0, kl_max=kl_max, eps=eps,
                              family=family, divergence_family=divergence_family, irrep_dims=irrep_dims)
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)   # (N,N) or (H,N,N)
     beta_coord = _beta_to_coordinate(beta, irrep_dims, mu.shape[-1])  # (N,N,K) per-coordinate
-    coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=alpha_mode).unsqueeze(-1)
+    coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=alpha_mode)
+    if not alpha_is_per_coord(alpha_mode):
+        coef = coef.unsqueeze(-1)                 # (N,) -> (N,1) per-position broadcast; per-coord sd is already (N,K)
     return get_kernel(family)(mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta_coord, coef, kl_max=kl_max, eps=eps)
 
 

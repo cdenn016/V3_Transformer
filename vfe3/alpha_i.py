@@ -8,18 +8,26 @@ A config-selected registry of forms:
 Pure: a function of the (per-position or per-coordinate) self-divergence D.
 """
 
-import warnings
 from typing import Callable, Dict, Tuple
 
 import torch
 
-_ALPHAS: Dict[str, Callable] = {}
+_ALPHAS:          Dict[str, Callable] = {}
+_ALPHA_PER_COORD: Dict[str, bool]     = {}
 
 
-def register_alpha(name: str) -> Callable:
-    """Decorator registering an alpha form D -> (alpha, regularizer)."""
+def register_alpha(name: str, *, per_coord: bool = False) -> Callable:
+    """Decorator registering an alpha form D -> (alpha, regularizer).
+
+    ``per_coord`` declares whether the form consumes a per-COORDINATE (unsummed) self-
+    divergence of shape (..., N, K) rather than the per-position summed (..., N). The
+    routing seam ``free_energy.self_divergence_for_alpha`` reads this flag to supply the
+    correctly-shaped divergence, so a per-coordinate form slots in by registration alone --
+    no consumer call site is edited.
+    """
     def _wrap(fn: Callable) -> Callable:
         _ALPHAS[name] = fn
+        _ALPHA_PER_COORD[name] = per_coord
         return fn
     return _wrap
 
@@ -29,6 +37,13 @@ def get_alpha(name: str) -> Callable:
     if name not in _ALPHAS:
         raise KeyError(f"no alpha form {name!r}; available: {sorted(_ALPHAS)}")
     return _ALPHAS[name]
+
+
+def alpha_is_per_coord(mode: str) -> bool:
+    """Whether alpha form ``mode`` consumes a per-coordinate (unsummed) self-divergence."""
+    if mode not in _ALPHA_PER_COORD:
+        raise KeyError(f"no alpha form {mode!r}; available: {sorted(_ALPHAS)}")
+    return _ALPHA_PER_COORD[mode]
 
 
 def alpha_regularizer(
@@ -69,10 +84,9 @@ def alpha_state_dependent(
     return alpha, alpha_regularizer(alpha, b0=b0, c0=c0)
 
 
-@register_alpha("state_dependent_per_coord")
+@register_alpha("state_dependent_per_coord", per_coord=True)
 def alpha_state_dependent_per_coord(
-    kl:    torch.Tensor,             # (..., N, K) per-coordinate self-divergence
-                                     # (NOT (..., N): see the deferred-path note)
+    kl:    torch.Tensor,             # (..., N, K) per-coordinate self-divergence D^(k)
 
     *,
     b0:    'float | torch.Tensor' = 1.0,   # scalar or (K,)
@@ -80,25 +94,14 @@ def alpha_state_dependent_per_coord(
     eps:   float = 1e-12,
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Per-coordinate alpha^(k)* = c0^(k)/(b0^(k) + D^(k)); R summed by caller.
+    r"""Per-coordinate alpha^(k)* = c0^(k)/(b0^(k) + D^(k)); R summed by the caller's F.
 
-    The formula is exact for an UNSUMMED per-coordinate self-divergence of shape
-    (..., N, K). The shipped self_divergence (free_energy.self_divergence) sums
-    over the coordinate axis and returns per-position (..., N); fed that, this
-    form silently broadcasts to per-position alpha (one alpha per token), NOT the
-    per-coordinate alpha^(k) advertised. A per-coordinate (unsummed) divergence
-    variant that realizes this mode is a DEFERRED extension point; until it is
-    registered and routed here, prefer `state_dependent` (per-position) for the
-    summed D the current pipeline supplies.
+    A pure function of whatever divergence it is given: the per-coordinate self-term
+    sum_k alpha^(k) D^(k) results when fed the UNSUMMED per-coordinate divergence of shape
+    (..., N, K) that ``free_energy.self_divergence_for_alpha`` routes here for this form
+    (declared ``per_coord=True``). The per-coordinate divergence exists only for the
+    diagonal family + Renyi functional, enforced by the router and at config construction.
     """
-    warnings.warn(
-        "alpha_mode='state_dependent_per_coord' currently receives the summed per-position "
-        "self-divergence and silently degrades to per-position alpha (identical to "
-        "'state_dependent'); the per-coordinate (unsummed) divergence is a deferred path. "
-        "Use 'state_dependent' for per-position alpha.",
-        RuntimeWarning,
-        stacklevel=3,
-    )
     alpha = c0 / (b0 + kl).clamp(min=eps)
     return alpha, alpha_regularizer(alpha, b0=b0, c0=c0)
 

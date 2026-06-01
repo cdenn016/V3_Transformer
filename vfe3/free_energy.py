@@ -11,7 +11,8 @@ from typing import List, Optional
 
 import torch
 
-from vfe3.divergence import get_functional
+from vfe3.alpha_i import alpha_is_per_coord
+from vfe3.divergence import gaussian_diagonal_renyi_per_coord, get_functional
 
 
 def effective_temperature(
@@ -104,6 +105,73 @@ def self_divergence(
     belief). ``divergence_family`` selects the functional, ``family`` the covariance kernel."""
     return get_functional(divergence_family)(
         mu_q, sigma_q, mu_p, sigma_p, alpha=alpha, kl_max=kl_max, eps=eps, family=family,
+    )
+
+
+def self_divergence_per_coord(
+    mu_q:              torch.Tensor,       # (..., N, K)
+    sigma_q:           torch.Tensor,       # (..., N, K)
+    mu_p:              torch.Tensor,       # (..., N, K)
+    sigma_p:           torch.Tensor,       # (..., N, K)
+
+    *,
+    alpha:             float = 1.0,
+    kl_max:            float = 100.0,
+    eps:               float = 1e-6,
+    family:            str   = "gaussian_diagonal",
+    divergence_family: str   = "renyi",
+) -> torch.Tensor:                         # (..., N, K) per-coordinate D^(k)(q_i||p_i)
+    r"""Per-coordinate self-divergence D^(k)(q_i||p_i), unsummed over the coordinate axis.
+
+    Defined only for the diagonal family (full-covariance KL couples coordinates through the
+    trace and log-determinant and does not decompose) and the Renyi functional (KL = Renyi at
+    alpha=1, the only functional whose diagonal form is registered per-coordinate). Both are
+    enforced by raising, so a future non-decomposing functional cannot silently sum the wrong
+    thing. Consumed by the ``state_dependent_per_coord`` alpha form via ``self_divergence_for_alpha``.
+    """
+    if family != "gaussian_diagonal":
+        raise ValueError(
+            f"self_divergence_per_coord needs the diagonal family (full-covariance KL does not "
+            f"decompose coordinate-wise); got family={family!r}"
+        )
+    if divergence_family != "renyi":
+        raise ValueError(
+            f"self_divergence_per_coord is implemented for the 'renyi' functional only "
+            f"(KL = renyi at alpha=1); got divergence_family={divergence_family!r}"
+        )
+    return gaussian_diagonal_renyi_per_coord(
+        mu_q, sigma_q, mu_p, sigma_p, alpha=alpha, kl_max=kl_max, eps=eps,
+    )
+
+
+def self_divergence_for_alpha(
+    mu_q:              torch.Tensor,       # (..., N, K)
+    sigma_q:           torch.Tensor,       # (..., N, K)
+    mu_p:              torch.Tensor,       # (..., N, K)
+    sigma_p:           torch.Tensor,       # (..., N, K)
+
+    *,
+    alpha:             float = 1.0,
+    kl_max:            float = 100.0,
+    eps:               float = 1e-6,
+    family:            str   = "gaussian_diagonal",
+    divergence_family: str   = "renyi",
+    alpha_mode:        str   = "constant",
+) -> torch.Tensor:                         # (..., N) summed, or (..., N, K) per-coordinate
+    r"""Self-divergence shaped for the selected alpha form: per-coordinate (..., N, K) when the
+    form declares ``per_coord=True`` (``alpha_i.alpha_is_per_coord``), else the per-position
+    summed (..., N). This is the single routing seam every alpha consumer (the autograd oracle,
+    the analytic kernel, the e_step F value, model diagnostics) shares, so a new alpha form's
+    divergence-reduction need is honoured by its registration alone, with no consumer edited.
+    """
+    if alpha_is_per_coord(alpha_mode):
+        return self_divergence_per_coord(
+            mu_q, sigma_q, mu_p, sigma_p, alpha=alpha, kl_max=kl_max, eps=eps,
+            family=family, divergence_family=divergence_family,
+        )
+    return self_divergence(
+        mu_q, sigma_q, mu_p, sigma_p, alpha=alpha, kl_max=kl_max, eps=eps,
+        family=family, divergence_family=divergence_family,
     )
 
 

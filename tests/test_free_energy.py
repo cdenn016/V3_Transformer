@@ -274,3 +274,44 @@ def test_alpha_envelope_grad_q_F_equals_alpha_star_times_grad_q_D():
     a_star = (c0 / (b0 + D)).detach()
     g_env = torch.autograd.grad((a_star * D).sum(), mu_q)[0]
     assert torch.allclose(g_full, g_env, atol=1e-5)
+
+
+def test_self_divergence_for_alpha_routes_by_declared_reduction():
+    # The routing seam returns a per-POSITION (N,) divergence for a per-position alpha form
+    # and a per-COORDINATE (N,K) divergence for a per-coordinate one, driven only by the
+    # form's declared per_coord flag. Below kl_max the per-coordinate divergence sums back
+    # to the per-position one, and the per-coordinate alpha genuinely varies across k.
+    from vfe3.alpha_i import self_coupling_alpha
+    from vfe3.free_energy import self_divergence_for_alpha
+
+    N, K = 3, 4
+    torch.manual_seed(0)
+    mu = torch.randn(N, K); sigma = torch.rand(N, K) + 0.5
+    mu_p = torch.randn(N, K); sigma_p = torch.rand(N, K) + 0.5
+
+    summed = self_divergence_for_alpha(mu, sigma, mu_p, sigma_p, alpha_mode="state_dependent")
+    per = self_divergence_for_alpha(mu, sigma, mu_p, sigma_p, alpha_mode="state_dependent_per_coord")
+    assert summed.shape == (N,)
+    assert per.shape == (N, K)
+    assert torch.allclose(per.sum(dim=-1), summed, atol=1e-5)    # unsaturated -> sum recovers it
+
+    a, _ = self_coupling_alpha(per, mode="state_dependent_per_coord", b0=1.0, c0=1.0)
+    assert a.shape == (N, K)
+    assert (a.std(dim=-1) > 1e-6).all()                          # alpha actually varies across coords
+
+
+def test_self_divergence_per_coord_requires_diagonal_renyi():
+    # Per-coordinate self-divergence exists only for the diagonal family (full-cov KL does
+    # not decompose coordinate-wise) and the Renyi functional (the only registered one).
+    # Both restrictions raise rather than silently summing the wrong thing.
+    import pytest
+    from vfe3.free_energy import self_divergence_per_coord
+
+    N, K = 2, 3
+    mu = torch.randn(N, K); sigma = torch.rand(N, K) + 0.5
+    mu_p = torch.randn(N, K); sigma_p = torch.rand(N, K) + 0.5
+    cov = torch.eye(K).expand(N, K, K).contiguous()
+    with pytest.raises((ValueError, NotImplementedError, KeyError)):
+        self_divergence_per_coord(mu, cov, mu_p, cov.clone(), family="gaussian_full")
+    with pytest.raises((ValueError, NotImplementedError, KeyError)):
+        self_divergence_per_coord(mu, sigma, mu_p, sigma_p, divergence_family="not_a_functional")

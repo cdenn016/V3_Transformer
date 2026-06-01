@@ -16,7 +16,7 @@ import torch
 
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
-from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence
+from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
 from vfe3.geometry.retraction import natural_gradient, retract_phi, retract_spd_diagonal, retract_spd_full
@@ -101,8 +101,8 @@ def free_energy_value(
     mu_t = transport_mean(omega.unsqueeze(0), key_belief.mu.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), key_belief.sigma.unsqueeze(0))[0]
 
-    sd = self_divergence(belief.mu, belief.sigma, mu_p, sigma_p, alpha=alpha_div, kl_max=kl_max, eps=eps,
-                         family=family, divergence_family=divergence_family)
+    sd = self_divergence_for_alpha(belief.mu, belief.sigma, mu_p, sigma_p, alpha=alpha_div, kl_max=kl_max, eps=eps,
+                                   family=family, divergence_family=divergence_family, alpha_mode=alpha_mode)
     alpha, reg = self_coupling_alpha(sd, value=value, mode=alpha_mode, b0=b0, c0=c0)
     energy = pairwise_energy(belief.mu, belief.sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps,
                              family=family, divergence_family=divergence_family, irrep_dims=group.irrep_dims)
