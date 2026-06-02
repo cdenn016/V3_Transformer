@@ -18,21 +18,25 @@ from vfe3.families.base import (
     safe_kl_clamp,
     family_cov_kind,
     divergence_families,
+    divergence_functionals,
     register_functional,
     get_functional,
     get_family,
     register_family,
     renyi,
     kl,
+    squared_hellinger,
 )
 from vfe3.families import gaussian as _gaussian     # noqa: F401  (registers the Gaussian families)
 
 __all__ = [
     "renyi",
     "kl",
+    "squared_hellinger",
     "safe_kl_clamp",
     "family_cov_kind",
     "divergence_families",
+    "divergence_functionals",
     "register_functional",
     "get_functional",
     "get_family",

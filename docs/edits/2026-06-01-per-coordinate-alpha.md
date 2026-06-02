@@ -516,3 +516,71 @@ mu/sigma/phi equal the run with no `transport_mode`, atol=0). The wired-forward 
 `tests/test_perf_equivalence.py` passing in the full green suite. Full suite
 `tests=300 failures=0 errors=0 skipped=0` (read from junitxml; 293 baseline + 7 new; viz collected
 normally; 1 xpassed pre-existing).
+
+### squared-Hellinger f-divergence functional (second registry member; roadmap item 11)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Design spec:
+`docs/superpowers/specs/2026-06-01-f-divergence-functional-design.md`. The functional axis of the
+divergence seam (`register_functional`/`get_functional`/`_FUNCTIONALS` in `families/base.py`) was a
+genuine registry carrying exactly one member (`renyi`), so the de-facto interface was the single
+alpha-parameterized `renyi(...)` signature. This adds squared Hellinger — the first non-Renyi
+f-divergence — demonstrating the seam, and generalizes the functional contract so a member can
+ignore params it does not use, with ZERO call-site edits.
+
+Identity used (spec sympy-VERIFIED, exact diff=0, re-verified this session): for Gaussians the
+Bhattacharyya coefficient is `BC = exp(-D_{1/2}(q||p)/2)` where `D_{1/2}` is the Renyi-1/2 divergence
+the pinned `renyi` kernel already computes, so `H^2(q||p) = 1 - exp(-D_{1/2}(q||p)/2)`. Hellinger is
+thus a thin wrapper over machinery already golden-pinned — no new family-specific Cholesky/blend math.
+
+Files:
+- `vfe3/families/base.py`: `renyi` gains a trailing `**kwargs` (additive, harmless — the permissive
+  functional contract; `renyi` still consumes `alpha`). New `squared_hellinger(q, p, *, kl_max=100.0,
+  eps=1e-6, **kwargs)`: absorbs any `alpha` the call sites forward (Hellinger has no order — never
+  reaches `renyi`, so the alpha>1 blend warning cannot fire), forwards `kl_max` so the inner `D_{1/2}`
+  stays bounded in `[0, kl_max]`, and returns `1.0 - torch.exp(-0.5 * renyi(q, p, alpha=0.5, ...))`.
+  NO output `.clamp` — `1 - exp(-D/2)` with `D in [0, kl_max]` is provably in `[0, 1)` (a clamped
+  `D=kl_max` maps to the maximal-Hellinger limit `1 - exp(-kl_max/2)`, which composes correctly), so a
+  second clamp would be dead. Registered `register_functional("squared_hellinger")`. New
+  `divergence_functionals() -> tuple(sorted(_FUNCTIONALS))` helper (mirrors `divergence_families()`).
+- `vfe3/divergence.py`: re-export `squared_hellinger` and `divergence_functionals` (import + `__all__`).
+- `vfe3/config.py`: `divergence_family` validation is now registry-derived — a local
+  `from vfe3.divergence import divergence_functionals` in the divergence-seam block validates against
+  `divergence_functionals()` (the `divergence_families()` pattern), so a new functional is
+  config-selectable WITHOUT editing config. The hardcoded `_VALID_DIVERGENCE_FUNCTIONALS = ("renyi",)`
+  tuple was removed (grep-confirmed dead — its only use was the one `_require` call). Field comment
+  notes `alpha_div` is ignored by non-alpha functionals.
+
+`reverse_kl` (a spec-proposed regression rung) was deliberately NOT registered — the task asks only
+for `squared_hellinger`, and the registry-derived validation makes the valid set exactly
+`{renyi, squared_hellinger}`, which is correct (no scope creep).
+
+Independent oracles (test_divergence.py, TDD watched RED — 13 failing for unregistered functional /
+missing helper / config rejection — then GREEN; the oracles do NOT re-assert the definition):
+- `test_squared_hellinger_diagonal_matches_analytic`: vs the analytic diagonal Gaussian H^2 computed
+  in float64 as `1 - prod_k BC_k`, `BC_k = sqrt(2 sqrt(s_q s_p)/(s_q+s_p)) exp(-(mu_q-mu_p)^2/
+  (4(s_q+s_p)))` — Bhattacharyya factorizes over coordinates, so BC is a PRODUCT then 1-BC (NOT a
+  per-coord H^2 summed). atol 1e-5.
+- `test_squared_hellinger_full_matches_analytic`: vs the analytic full-covariance Bhattacharyya
+  distance `D_B = 1/8 dmu^T Sbar^{-1} dmu + 1/2(ln|Sbar| - 1/2 ln|S_q| - 1/2 ln|S_p|)`, `Sbar =
+  (S_q+S_p)/2`, via slogdet/solve — a DIFFERENT numerical path than the kernel's Cholesky-of-blend
+  (independently sympy/numeric-checked to ~1e-7 this session). atol 1e-5.
+- `test_squared_hellinger_equals_definitional_identity`: pins `H^2 = 1 - exp(-D_{1/2}/2)`.
+- `test_squared_hellinger_is_symmetric` (diagonal + full): the STRONG independent check — Hellinger is
+  symmetric, unlike KL / Renyi at alpha != 1/2; `H^2(q,p) allclose H^2(p,q)` atol 1e-5.
+- `test_squared_hellinger_self_is_zero`, `test_squared_hellinger_bounded` (both families):
+  `H^2(q,q) = 0`, `0 <= H^2 <= 1`.
+- `test_squared_hellinger_ignores_alpha_and_does_not_warn`: `fn(q,p)` allclose `fn(q,p,alpha=2.0)`
+  (atol 0) AND no RuntimeWarning fires — proves `alpha=2.0` never reaches `renyi`'s alpha>1 branch.
+- `test_divergence_functionals_registry_derived`, `test_config_accepts_squared_hellinger_and_rejects_
+  unknown`: registry exposes both members and config accepts `squared_hellinger`/`renyi`, rejects an
+  unknown name.
+- `test_model_forward_under_squared_hellinger`: end-to-end VFEModel forward + finite loss with the new
+  functional flowing through `pairwise_energy`/`self_divergence`.
+
+Renyi/default path byte-identical (the suite is the gate). Full suite after the change:
+`tests=313 failures=0 errors=0 skipped=0` (read from junitxml; 300 baseline + 13 new; viz collected
+normally; 1 xpassed pre-existing). Note: squared_hellinger trains through the autograd oracle
+(`kernels.py` guards renyi-only for the hand kernel) and refuses the per-coord alpha path
+(`self_divergence_per_coord` guards renyi-only) — both automatic and correct; the per-coord refusal
+is the documented known incompatibility, and the forward+finite-loss smoke test covers the oracle
+training path.

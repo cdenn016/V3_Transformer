@@ -9,7 +9,6 @@ variant swaps without editing call sites.
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-_VALID_DIVERGENCE_FUNCTIONALS = ("renyi",)
 _VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
@@ -136,9 +135,14 @@ class VFE3Config:
             raise ValueError(f"kl_max must be positive, got {self.kl_max}")
 
         # divergence seam: divergence_family is the FUNCTIONAL (f-divergence) registry key
-        # (renyi, ...), distinct from `family` (the covariance-structure kernel). alpha_div is
-        # the Renyi order. Both are live, modular seams (CLAUDE.md: slot in different f-divergences).
-        _require(self.divergence_family, _VALID_DIVERGENCE_FUNCTIONALS, "divergence_family")
+        # (renyi, squared_hellinger, ...), distinct from `family` (the covariance-structure
+        # kernel). alpha_div is the Renyi order, IGNORED by non-alpha functionals (e.g.
+        # squared_hellinger). Both are live, modular seams (CLAUDE.md: slot in different
+        # f-divergences). Validated against the functional REGISTRY (not a hardcoded literal
+        # list) so a newly registered functional is config-selectable without editing here;
+        # local import avoids a config <- divergence <- families import cycle.
+        from vfe3.divergence import divergence_functionals
+        _require(self.divergence_family, divergence_functionals(), "divergence_family")
         if self.alpha_div <= 0.0:
             raise ValueError(f"alpha_div must be positive, got {self.alpha_div}")
 
