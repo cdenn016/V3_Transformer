@@ -11,9 +11,9 @@ implementation was SPEC'd for your decision, not built.
 
 ## A. BUILT, GREEN, REVIEWED, PUSHED
 
-Full suite after each: `failures=0 errors=0`; the count climbed 274 -> 280 -> 284 as tests were added
-(includes `test_viz.py`; the FD-gradient-oracle, E-step-descent, gauge-equivariance, and frozen-oracle
-tests are the byte-identity gate).
+Full suite after each: `failures=0 errors=0`; the count climbed 274 -> 280 -> 284 -> 293 -> 300 as
+tests were added (includes `test_viz.py`; the FD-gradient-oracle, E-step-descent, gauge-equivariance,
+and frozen-oracle tests are the byte-identity gate). Final state: 300 passed, 0 failures, 0 errors.
 
 1. **M-step self-coupling regularizer** `alpha_hat * sum_i KL(q_i*||p_i)` (commit `73e6b42`). Manuscript
    Algorithm 1 loss term (`GL(K)_attention.tex:2083`) that was on no path. New config field
@@ -38,6 +38,24 @@ tests are the byte-identity gate).
    is byte-identical (`torch.equal` on generators + frozen-oracle unchanged). NOTE: only the un-closed
    cross-head basis is config-reachable; the bracket-CLOSED subalgebra (`close_basis=True`) stays
    builder-only by design (scope) — say if you want it exposed too.
+
+4. **Autoregressive `generate()`** (commit `ef5ebbe`). The model could only do teacher-forced CE
+   training; it had no generation path. Added `VFEModel.generate(token_ids, max_new_tokens, *,
+   temperature, top_k, top_p, greedy)`, `@torch.no_grad`, which REUSES the existing `forward` (no
+   reimplementation of encode/E-step/decode), reads the last-position logits, samples (greedy / top-k /
+   top-p / temperature), appends, repeats (truncating context to `max_seq_len`). Oracle: greedy is
+   deterministic and equals `argmax(forward(prompt))` on the first token; training-isolated (a param is
+   byte-identical before/after a generate call; additive, changes no existing test). Per-step
+   full-forward is the correct-but-slow first version; incremental belief reuse is a future optimization.
+
+5. **`register_transport` seam** over the gauge transport (commit `310bdf2`). Byte-identity refactor
+   mirroring A.2: `register_transport`/`get_transport`, the flat Regime-I phi-cocycle registered as
+   `"flat"` (a kwargs-tolerant adapter over `compute_transport_operators`), new config
+   `transport_mode = "flat"` validated against the registry (orthogonal to `gauge_parameterization`).
+   The E-step's primary belief-transport build routes through `get_transport(cfg.transport_mode)`; the
+   flat default is `torch.equal`-identical to the direct call (+ frozen-oracle unchanged). This is the
+   home the spec'd Regime-II builder (section B) drops into once you decide the `delta_ij`
+   parameterization. No Regime-II built.
 
 ## B. SPEC-ONLY — AWAITING YOUR DECISION (committed `88ddaac`, in docs/superpowers/specs/2026-06-01-*)
 
@@ -67,9 +85,13 @@ decisions, in one place:
   term alone first, model-coupling `gamma` second). Designed to reuse the divergence/family/group seams
   via a second `BeliefParams` channel (couples to the M3 BeliefState-extensibility finding).
 
-## C. IN PROGRESS / NEXT (this session, if it continues)
-- `register_transport` seam (byte-identity refactor, flat cocycle as default) — safe to build.
-- Autoregressive generation path (`generate()`, additive-isolated, reuses the existing forward) — safe.
+## C. COMPLETED THIS SESSION (both now built — see A.4, A.5)
+- Autoregressive generation path — BUILT (A.4, commit `ef5ebbe`).
+- `register_transport` seam — BUILT (A.5, commit `310bdf2`).
+
+Nothing further was built blind. The remaining roadmap items all fall in section B (they need a
+decision from you) or are the XL hyper-prior channel; building them overnight without an oracle would
+risk shipping a plausible-but-wrong implementation, so they were spec'd instead.
 
 ## D. Notes
 - The user's `train_vfe3.py` toggle experiment and `docs/edits/2026-05-30-diagnostics-tier.md` were left
