@@ -649,3 +649,41 @@ Default `spd_affine` path byte-identical (the two `test_spd_affine_bit_identical
 atol=0 and pass; additive variant, no edits to affine code). Full suite after the change:
 `tests=321 failures=0 errors=0 skipped=0` (read from junitxml; 313 baseline + 8 new; 320 passed +
 1 xpassed pre-existing). 2b deferred.
+
+## 2026-06-02 — Extensible BeliefState (roadmap M3)
+
+Same running log (per the project one-doc-per-day convention; appended here on the M3 task's
+explicit instruction). Branch: vfe3-roadmap-overnight-2026-06-02.
+
+### Motivation
+M3 (modularity architecture): make `BeliefState` carry optional extra per-token channels (the
+future hyper-prior `s_i`/`r_i`, natural params, etc.) WITHOUT a signature sweep, a precondition
+for the hyper-prior/model-coupling work — while keeping the 3-field default byte-identical.
+
+### Form chosen and why
+Kept `BeliefState` a `typing.NamedTuple` and ADDED two trailing optional fields with `None`
+defaults: `s: Optional[torch.Tensor] = None`, `r: Optional[torch.Tensor] = None`. A
+codebase-wide audit (`vfe3/` + `tests/`) found every construction uses keyword arguments
+(`BeliefState(mu=, sigma=, phi=)`) and every read uses attribute access (`.mu/.sigma/.phi`); NO
+site relies on a NamedTuple-only behavior that trailing defaulted fields would break — no 3-way
+positional unpack of a belief (a naming-agnostic `^\s*\w+,\s*\w+,\s*\w+\s*=` grep confirmed no
+BeliefState ever sits on an unpack RHS), no indexing, no iteration, no `_replace`/`_asdict`. This
+is the lowest-surface extensible form (the dataclass conversion was unnecessary).
+
+### Behaviors preserved
+Keyword and positional construction, `.mu/.sigma/.phi` attribute access, `_replace`, indexing,
+and iteration all unchanged. The two new fields default to `None`, so nothing reads them and there
+is no numeric path through them — byte-identity at the model level is the full green suite.
+
+### New capability
+`BeliefState(mu, sigma, phi, s=t)` round-trips (`.s is t`); a default-constructed belief has
+`.s is None` and `.r is None`. A second belief channel can now be threaded without editing every
+signature that passes a belief.
+
+### Tests
+New `tests/test_belief.py` (6 tests): `test_three_field_construction_and_attribute_access`,
+`test_optional_channels_default_to_none`, `test_positional_construction_still_works`,
+`test_replace_preserves_namedtuple_semantics`, `test_extra_channel_round_trips`,
+`test_both_extra_channels_round_trip`. RED first (4 of 6 failed before the field add), then GREEN.
+Full suite after the change: `tests=327 failures=0 errors=0 skipped=0` (read from junitxml; 321
+baseline + 6 new; 326 passed + 1 xpassed pre-existing).
