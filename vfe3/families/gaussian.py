@@ -99,8 +99,8 @@ class DiagonalGaussian(BeliefParams):
         kl_max:  float = 100.0,
         eps:     float = 1e-6,
     ) -> torch.Tensor:
-        r"""Per-coordinate diagonal Gaussian Renyi/KL (ported verbatim from
-        ``divergence.gaussian_diagonal_renyi_per_coord``)."""
+        r"""Per-coordinate diagonal Gaussian Renyi/KL: the diagonal Renyi/KL coordinate terms
+        left UNSUMMED, each clamped independently (sum over k recovers ``renyi_closed_form``)."""
         mu_q = self.mu.float()
         sigma_q = self.sigma.float().clamp(min=eps)
         mu_t = other.mu.float()
