@@ -87,6 +87,7 @@ def free_energy_value(
     transport_mode:            str  = "flat",          # accepted-and-ignored iteration-only knob
 
     log_prior:                 Optional[torch.Tensor] = None,
+    log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
     keys:                      Optional[BeliefState]  = None,   # None -> global F; else keys frozen at `keys`
 ) -> torch.Tensor:                   # scalar F
     r"""Scalar free energy of a belief. ``keys=None`` -> global F (keys = the belief);
@@ -113,7 +114,7 @@ def free_energy_value(
     fam = get_family(family)
     sd = self_divergence_for_alpha(fam(belief.mu, belief.sigma), fam(mu_p, sigma_p), alpha=alpha_div, kl_max=kl_max,
                                    eps=eps, divergence_family=divergence_family, alpha_mode=alpha_mode)
-    alpha, reg = self_coupling_alpha(sd, value=value, mode=alpha_mode, b0=b0, c0=c0)
+    alpha, reg = self_coupling_alpha(sd, value=value, mode=alpha_mode, b0=b0, c0=c0, log_alpha=log_alpha)
     energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_t, sigma_t), alpha=alpha_div, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     return free_energy(
@@ -195,19 +196,23 @@ def e_step_iteration(
     transport_mode:            str  = "flat",
 
     log_prior:                 Optional[torch.Tensor] = None,
+    log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
     (autograd of the alignment block + preconditioner + Lie retraction).
 
     The belief-transport build is config-selected through the connection-regime registry
-    (``transport_mode``); the default 'flat' is the Regime-I phi-cocycle (byte-identical)."""
+    (``transport_mode``); the default 'flat' is the Regime-I phi-cocycle (byte-identical).
+    ``log_alpha`` is the learned self-coupling nn.Parameter (alpha = exp(log_alpha)) under
+    alpha_mode='learnable' (None on the pure path); it flows into the belief gradient so the
+    loss backpropagates to it through the unrolled E-step."""
     omega = _transport(belief.phi, group, transport_mode=transport_mode)
     grad_mu, grad_sigma = belief_gradients(
         belief.mu, belief.sigma, mu_p, sigma_p, omega,
         tau=tau, alpha_div=alpha_div, value=value, b0=b0, c0=c0, kl_max=kl_max, eps=eps,
         include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
         family=family, divergence_family=divergence_family, alpha_mode=alpha_mode,
-        irrep_dims=group.irrep_dims, log_prior=log_prior,
+        irrep_dims=group.irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
     )
     nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
 

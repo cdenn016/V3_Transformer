@@ -23,14 +23,20 @@ def vfe_stack(
     cfg:        VFE3Config,
 
     *,
-    log_prior:  Optional[torch.Tensor] = None,
-    block_norm: Optional[Any]          = None,   # cached norm instance (None -> no block norm)
+    log_prior:  Optional[torch.Tensor]    = None,
+    block_norm: Optional[Any]             = None,   # cached norm instance (None -> no block norm)
+    log_alpha:  Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
 ) -> BeliefState:
-    r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior."""
+    r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior.
+
+    ``log_alpha`` is the model's learned scalar self-coupling parameter under
+    alpha_mode='learnable' (a sanctioned nn.Parameter NN exception; alpha = exp(log_alpha)),
+    forwarded to the E-step; None on every pure no-NN alpha_mode (the default path)."""
     rho = cfg.prior_handoff_rho
     rho_s = cfg.prior_handoff_sigma
     for _ in range(cfg.n_layers):
-        belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior, block_norm=block_norm)
+        belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
+                           block_norm=block_norm, log_alpha=log_alpha)
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
     return belief

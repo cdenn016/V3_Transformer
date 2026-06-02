@@ -23,15 +23,19 @@ def vfe_block(
     cfg:        VFE3Config,
 
     *,
-    log_prior:  Optional[torch.Tensor] = None,
-    block_norm: Optional[Any]          = None,   # cached norm instance (None -> no block norm)
+    log_prior:  Optional[torch.Tensor]    = None,
+    block_norm: Optional[Any]             = None,   # cached norm instance (None -> no block norm)
+    log_alpha:  Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
 ) -> BeliefState:
-    r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm."""
+    r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
+
+    ``log_alpha`` is the model's learned self-coupling nn.Parameter (alpha = exp(log_alpha))
+    under alpha_mode='learnable', forwarded to the E-step; None on the pure path."""
     out = e_step(
         belief, mu_p, sigma_p, group,
         n_iter=cfg.n_e_steps, tau=cfg.tau,
         e_mu_lr=cfg.e_mu_lr, e_sigma_lr=cfg.e_sigma_lr, e_phi_lr=cfg.e_phi_lr,
-        alpha_div=cfg.alpha_div, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+        alpha_div=cfg.alpha_div, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0, log_alpha=log_alpha,
         kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
         include_attention_entropy=cfg.include_attention_entropy,

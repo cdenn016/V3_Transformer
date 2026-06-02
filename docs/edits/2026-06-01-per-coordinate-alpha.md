@@ -739,3 +739,93 @@ irrep_block` (`irrep_dims=[2,2]`, equal) now routes through the batched path as 
 
 Full suite after the change: `tests=335 failures=0 errors=0 skipped=0` (read from junitxml; 327
 baseline + 8 new; 334 passed + 1 xpassed pre-existing; viz collected normally).
+
+## 2026-06-02 — Learnable self-coupling alpha (opt-in nn.Parameter; sanctioned NN exception)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Design spec:
+`docs/superpowers/specs/2026-06-01-learnable-alpha-design.md` (Path a, the LEARNABLE form; the
+fully-Bayesian b2 variant is deferred). The user SANCTIONED a learnable self-coupling alpha as a
+third documented neural-network exception (alongside `use_prior_bank=False`'s linear decode and
+`use_head_mixer`), ON THE CONDITION that an NN comment sits AT THE FUNCTION and AT THE CONFIG
+TOGGLE. Both are present.
+
+### The learnable form
+A single learnable SCALAR alpha (not per-coord/block in this first version). The consumed
+coupling is `alpha = exp(log_alpha)`, where `log_alpha` is a model-owned `nn.Parameter`; init
+`log_alpha = 0` gives `alpha = exp(0) = 1.0`, exactly the `constant alpha=1.0` default at step 0,
+and `exp` keeps alpha strictly positive for any real `log_alpha`. Because `alpha` is now a FREE
+parameter (not a Gamma precision posterior summary), there is NO regularizer: the form returns
+`(exp(log_alpha) * ones_like(kl), zeros_like(kl))`, so F carries the plain self-term `alpha*D` and
+the belief gradient is the plain `alpha*dD` (the `constant` form's contract). The
+alpha-envelope cancellation that `state_dependent` relies on (an explicit R(alpha) whose
+product-rule path cancels at the stationary alpha*) does NOT apply and is NOT added.
+
+### The NN-exception comments (where)
+- `vfe3/alpha_i.py` — `alpha_learnable` docstring opens "NEURAL-NETWORK EXCEPTION (sanctioned,
+  default-off): a LEARNED scalar self-coupling alpha = exp(log_alpha) ... model-owned
+  nn.Parameter trained by backprop (cf. use_head_mixer / use_prior_bank)", and states the default
+  no-NN forms are unchanged.
+- `vfe3/config.py` — comment AT the `alpha_mode` field: the default-and-pure no-NN forms are
+  `constant`/`state_dependent`/`state_dependent_per_coord` and are unchanged; "NEURAL-NETWORK
+  EXCEPTION: 'learnable' introduces a model-owned scalar nn.Parameter log_alpha (alpha =
+  exp(log_alpha)) trained by backprop -- a sanctioned, default-OFF learned-parameter exception".
+- `vfe3/model/model.py` — comment AT the `self.log_alpha` parameter definition, same wording;
+  notes that for every other (pure) alpha_mode the parameter is NOT created at all.
+
+### Files / threading path
+- `vfe3/alpha_i.py`: new `@register_alpha("learnable")` form `alpha_learnable(kl, *,
+  log_alpha=None, **kwargs)`. `alpha_gradient_coefficient` gains a `log_alpha` kwarg and forwards
+  it into `self_coupling_alpha` (the kernel's envelope coefficient is `exp(log_alpha)` since R=0).
+- `vfe3/config.py`: `"learnable"` added to `_VALID_ALPHA_MODES` (the hardcoded validated set; the
+  `alpha_is_per_coord("learnable")` guard is False, so the per-coord/diagonal-family check is
+  inert). No new config field — one new value of the existing `alpha_mode` knob.
+- `vfe3/model/model.py`: `VFEModel.__init__` creates `self.log_alpha = nn.Parameter(torch.zeros(()))`
+  ONLY when `cfg.alpha_mode == "learnable"` (no attribute otherwise — param-free pure path).
+  `forward` reads `getattr(self, "log_alpha", None)` and threads it through `vfe_stack`; the
+  M-step self-coupling block uses only `self_divergence_for_alpha` (a fixed-weight term, no alpha
+  consumption) so it is untouched; `diagnostics` passes `log_alpha` into its `vfe_stack` and
+  `self_coupling_alpha` calls.
+- Threading (one extra defaulted-None keyword, uniform): `VFEModel.forward` -> `vfe_stack(...,
+  log_alpha=)` -> `vfe_block(..., log_alpha=)` -> `e_step(..., log_alpha=)` (flows through `e_step`'s
+  `**kwargs` to BOTH `e_step_iteration` and `free_energy_value` via `_f_diag`) ->
+  `e_step_iteration(..., log_alpha=)` -> `belief_gradients(..., log_alpha=)` -> the hand kernel via
+  `alpha_gradient_coefficient(..., log_alpha=)` OR `belief_gradients_autograd(..., log_alpha=)` ->
+  `self_coupling_alpha(..., log_alpha=)`. `free_energy_value` consumes `log_alpha` in its
+  `self_coupling_alpha` call (it is part of F, not an iteration-only accept-and-ignore knob).
+  When `None`/not-learnable, every signature behaves exactly as before; the default
+  `self_coupling_alpha(..., log_alpha=None)` lands in each pure form's `**kwargs` and is ignored.
+
+### Grad-flow confirmation + a known scope limit
+On the DEFAULT kernel path (renyi + gaussian_diagonal + KL alpha_div=1 + filtering + canonical) the
+self-coupling coefficient `exp(log_alpha)` is grad-connected through the analytic kernel into the
+updated belief and thence the unrolled-E-step loss, so `loss.backward()` populates
+`model.log_alpha.grad` (verified: finite, non-None, nonzero). NOTE: `belief_gradients_autograd`
+detaches `grad_mu/grad_sigma`, so on the OVERSAMPLE oracle fallback (smoothing, non-KL functional,
+Renyi alpha != 1, non-diagonal family) the learned alpha would not receive an E-step gradient
+(only an F/loss-path gradient if present) — out of scope for this scalar first version, which
+targets the default kernel path.
+
+### Default-off + init==constant-1.0 oracles
+- `test_default_off_no_log_alpha_attribute`: a `constant` (default) and a `state_dependent` model
+  have NO `log_alpha` attribute (`not hasattr`) — the pure path is param-free.
+- `test_learnable_init_equals_constant_one` (the independent oracle): a `learnable` model at init
+  (`log_alpha=0`) produces `logits` and `loss` `torch.equal` (byte-identical) to the SAME
+  seed/config with `alpha_mode="constant", alpha=1.0`. This pins learnable-at-init == the
+  constant-1.0 pure path.
+- `test_learnable_log_alpha_grad_populated`: `log_alpha.grad` finite, non-None, nonzero after
+  `forward + backward`.
+- `test_learnable_alpha_changes_forward_when_log_alpha_moves`: moving `log_alpha` 0 -> log(5)
+  changes the loss (the alpha is genuinely consumed, not dead).
+- Form-level (`tests/test_alpha_i.py`): `test_learnable_alpha_is_exp_log_alpha_zero_reg`
+  (alpha == 1.0 at log_alpha=0, == 2.0 at log(2), zero reg) and
+  `test_learnable_alpha_gradient_flows_to_log_alpha` (grad reaches `log_alpha`).
+- Also `test_config_accepts_learnable_alpha_mode`, `test_learnable_creates_scalar_log_alpha_param`,
+  `test_learnable_diagnostics_runs`.
+
+### Default byte-identity + suite
+The default (non-learnable) paths are byte-identical: every new keyword defaults to None and is
+ignored by the pure forms; the frozen-seed regression / byte-identity tests
+(`test_e_step.py`) stay green. New tests: 9 (7 in `tests/test_learnable_alpha.py`, 2 in
+`tests/test_alpha_i.py`), TDD watched RED (8 failing for unregistered form / missing param) then
+GREEN. Full suite after the change: `tests=344 failures=0 errors=0 skipped=0` (read from junitxml;
+335 baseline + 9 new; 343 passed + 1 xpassed pre-existing; viz collected normally).

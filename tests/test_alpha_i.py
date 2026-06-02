@@ -63,6 +63,28 @@ def test_register_alpha_per_coord_flag_is_modular():
     assert alpha_is_per_coord("_test_pc") is True
 
 
+def test_learnable_alpha_is_exp_log_alpha_zero_reg():
+    # The learnable form (NN exception): alpha = exp(log_alpha) broadcast to kl, zero regularizer.
+    # log_alpha = 0 -> alpha = 1.0 (reproduces the constant alpha=1.0 default at init).
+    kl = torch.rand(3, 5) + 0.1
+    a, r = self_coupling_alpha(kl, mode="learnable", log_alpha=torch.zeros(()))
+    assert torch.allclose(a, torch.ones(3, 5), atol=1e-7)
+    assert torch.allclose(r, torch.zeros(3, 5))
+    # log_alpha = log(2) -> alpha = 2.0
+    a2, r2 = self_coupling_alpha(kl, mode="learnable", log_alpha=torch.log(torch.tensor(2.0)))
+    assert torch.allclose(a2, torch.full((3, 5), 2.0), atol=1e-6)
+    assert torch.allclose(r2, torch.zeros(3, 5))
+
+
+def test_learnable_alpha_gradient_flows_to_log_alpha():
+    # The learned scalar must be in the autograd graph: a sum over alpha must produce a grad on log_alpha.
+    kl = torch.rand(4) + 0.1
+    log_alpha = torch.zeros((), requires_grad=True)
+    a, _ = self_coupling_alpha(kl, mode="learnable", log_alpha=log_alpha)
+    a.sum().backward()
+    assert log_alpha.grad is not None and torch.isfinite(log_alpha.grad).all()
+
+
 from vfe3.alpha_i import alpha_gradient_coefficient
 
 

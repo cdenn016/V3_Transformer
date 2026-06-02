@@ -14,7 +14,7 @@ _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
 _VALID_DECODE_MODES        = ("diagonal", "full")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
-_VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_per_coord")
+_VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_per_coord", "learnable")
 _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback")
 _VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
 _VALID_ATTENTION_PRIORS    = ("uniform", "causal", "alibi")
@@ -76,6 +76,13 @@ class VFE3Config:
 
     # free-energy coupling
     alpha:                     float = 1.0          # constant self-coupling value
+    # alpha_mode selects the self-coupling form (registry key). The default-and-pure no-NN forms
+    # are 'constant', 'state_dependent', 'state_dependent_per_coord' (closed-form functions of the
+    # self-divergence D, no learned parameters) and are unchanged. NEURAL-NETWORK EXCEPTION:
+    # 'learnable' introduces a model-owned scalar nn.Parameter log_alpha (alpha = exp(log_alpha))
+    # trained by backprop -- a sanctioned, default-OFF learned-parameter exception in the spirit of
+    # use_head_mixer / use_prior_bank (see VFEModel.__init__ and alpha_i.alpha_learnable). At init
+    # log_alpha=0 -> alpha=1.0, byte-identical to constant alpha=1.0.
     alpha_mode:                str   = "constant"
     b0:                        float = 1.0          # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0:                        float = 1.0          # state-dependent alpha shape (numerator)
