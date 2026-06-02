@@ -150,6 +150,13 @@ def test_config_phi_retract_mode_validated():
         VFE3Config(phi_retract_mode="not_a_mode")
 
 
+def test_config_spd_retract_mode_validated():
+    """spd_retract_mode selects the SPD covariance retraction geometry (registry key)."""
+    assert VFE3Config().spd_retract_mode == "spd_affine"
+    with pytest.raises(ValueError):
+        VFE3Config(spd_retract_mode="not_a_mode")
+
+
 def test_config_eval_max_batches_default_none_and_validated():
     """eval_max_batches caps the PERIODIC validation pass (diagnostic only). Default None is
     the pure path -- the full validation split is read, as before. A positive int caps it;

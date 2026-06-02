@@ -38,6 +38,7 @@ def vfe_block(
         gradient_mode=cfg.gradient_mode, family=cfg.family, divergence_family=cfg.divergence_family,
         alpha_mode=cfg.alpha_mode,
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
+        spd_retract_mode=cfg.spd_retract_mode,
         log_prior=log_prior,
     )
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)

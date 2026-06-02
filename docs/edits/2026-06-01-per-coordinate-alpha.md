@@ -301,3 +301,59 @@ independently recomputed by the forward recipe; `assert sc > 1e-6` keeps it non-
 `test_config_validation` (`-1.0` raises, `0.0`/`0.5` accepted), and
 `test_backward_finite_grads_on_prior_tables` (grad-connected: `loss.backward()` yields finite,
 nonzero `mu_embed.grad`). Suite `tests=274 failures=0 errors=0` (+4 new; viz collected normally).
+
+### register_retraction seam over the SPD retraction (roadmap item 4)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Design spec:
+`docs/superpowers/specs/2026-06-01-spd-retraction-variants-design.md` (Phase 0). The SPD covariance
+retraction was the one geometry seam still dispatched by a hardcoded tensor-rank branch
+(`belief.sigma.dim() == belief.mu.dim() + 1` selecting `retract_spd_full` vs `retract_spd_diagonal`
+in `e_step_iteration`) rather than a config-selected registry, violating the clean-room spec's
+"add a variant by writing-and-registering, never by editing call sites" (sec 4.2). This is a
+BYTE-IDENTITY refactor that adds the registry and registers the current affine-invariant retraction
+as the default; it adds NO new retraction variants (log-Euclidean / Bures-Wasserstein remain
+deferred to the design spec for the user to decide).
+
+Boundary choice: the NARROW seam. The registered retraction owns only the diagonal-vs-full rank
+decision plus the SPD retraction call; the Fisher metric conversion (`natural_gradient`) stays in
+the E-step, so the tangent arrives already preconditioned. (The spec's broader boundary — folding
+`natural_gradient` into each mode and returning `(nat_mu, sigma_new)` — is open user-decision #2,
+needed only once variants land; building it now would implement an unapproved decision and enlarge
+the byte-identity surface.) The task's own oracle is the discriminator: it compares the seam to the
+bare `retract_spd_{diagonal,full}` functions alone, not to a `natural_gradient`+retraction
+composition.
+
+Files:
+- `vfe3/geometry/retraction.py`: new `_RETRACTIONS` registry, `register_retraction(name)` decorator,
+  `get_retraction(name)` (KeyError-with-available-list on miss), mirroring `_PRECOND`/`register_precond`
+  in `phi_preconditioner.py`. New `retract_spd_affine(sigma, delta_sigma, mean_ndim, *, step_size,
+  trust_region, eps, sigma_max)` registered under `"spd_affine"` — a thin dispatcher that replicates
+  the E-step's old branch (`sigma.dim() == mean_ndim + 1` -> `retract_spd_full`, else
+  `retract_spd_diagonal`) and forwards verbatim. The `mean_ndim` int is passed because the seam sees
+  only `sigma` (rank-3 is ambiguous: batched-diagonal `(B,N,K)` vs unbatched-full `(N,K,K)`); the
+  reference is the belief mean's rank, exactly the quantity the old branch used. The bare
+  `retract_spd_diagonal`/`retract_spd_full`/`natural_gradient` functions are untouched.
+- `vfe3/config.py`: new field `spd_retract_mode: str = "spd_affine"` beside `phi_retract_mode`,
+  validated in `__post_init__` against the retraction REGISTRY (`tuple(sorted(_RETRACTIONS))`, the
+  `divergence_families()` pattern) so a future registered retraction is selectable without a config
+  edit. Default keeps the manuscript-canonical pure path.
+- `vfe3/inference/e_step.py`: the rank branch in `e_step_iteration` collapses to
+  `get_retraction(spd_retract_mode)(belief.sigma, -e_sigma_lr * nat_sigma, belief.mu.dim(), ...)`;
+  `spd_retract_mode` threaded as an `e_step_iteration` parameter and as an explicit accept-and-ignore
+  knob on `free_energy_value` (the `e_step` call site forwards one kwarg bag to both, so a missing
+  declaration would TypeError on the trajectory/diagnostics path). Import trimmed to `get_retraction,
+  natural_gradient, retract_phi` (the two bare SPD functions are no longer referenced here).
+- `vfe3/model/block.py`: threads `spd_retract_mode=cfg.spd_retract_mode` into the `e_step` call,
+  beside `phi_retract_mode=cfg.phi_retract_mode`.
+
+Byte-identity gate: `tests/test_retraction.py` adds `test_retraction_registry_round_trip` (register/
+get round-trip + unknown-name KeyError, registration cleaned up in `finally`),
+`test_spd_affine_is_registered`, and `test_spd_affine_bit_identical_{diagonal,full}` — the oracles,
+asserting `torch.equal` (atol=0) between `get_retraction("spd_affine")(...)` and the bare
+`retract_spd_{diagonal,full}` calls on fixed-seed `(B,N,K)` and `(B,N,K,K)` inputs.
+`tests/test_config.py` adds `test_config_spd_retract_mode_validated`. `tests/test_e_step.py` adds
+`test_e_step_iteration_spd_affine_default_is_byte_identical` (the default-routed `e_step_iteration`
+sigma update equals a hand-composed `natural_gradient`+`retract_spd_diagonal`, atol=0); the
+pre-existing `test_fixed_seed_regression` checksum stayed green as an additional end-to-end guard.
+Full suite `tests=280 failures=0 errors=0 skipped=0` (read from junitxml; 274 baseline + 6 new; viz
+collected normally).

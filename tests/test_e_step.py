@@ -71,6 +71,34 @@ def test_decoupled_learning_rates_freeze_components():
     assert torch.allclose(o2.mu, b.mu, atol=1e-7)
 
 
+def test_e_step_iteration_spd_affine_default_is_byte_identical():
+    """The registry-routed default spd_affine retraction reproduces the legacy
+    natural_gradient + retract_spd_diagonal sigma update bit-for-bit (atol=0)."""
+    from vfe3.geometry.retraction import natural_gradient, retract_spd_diagonal
+    from vfe3.gradients.kernels import belief_gradients
+    from vfe3.inference.e_step import _transport
+
+    b, mu_p, sigma_p, grp = _belief()
+    e_sigma_lr, e_sigma_q_trust, eps, sigma_max = 0.05, 5.0, 1e-6, 5.0
+
+    # Hand-compose the legacy sigma update exactly as e_step_iteration did pre-refactor.
+    omega = _transport(b.phi, grp)
+    grad_mu, grad_sigma = belief_gradients(
+        b.mu, b.sigma, mu_p, sigma_p, omega, tau=1.5, irrep_dims=grp.irrep_dims,
+    )
+    _, nat_sigma = natural_gradient(grad_mu, grad_sigma, b.sigma, eps=eps)
+    legacy_sigma = retract_spd_diagonal(
+        b.sigma, -e_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
+    )
+
+    out = e_step_iteration(
+        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.0, e_sigma_lr=e_sigma_lr, e_phi_lr=0.0,
+        e_sigma_q_trust=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
+        spd_retract_mode="spd_affine",
+    )
+    assert torch.equal(out.sigma, legacy_sigma)
+
+
 # --- Task 3: descent directions (the right objective per mode) -------------
 def test_filtering_step_descends_F_filt():
     # filtering (query-side) gradient descends F with KEYS FROZEN at the pre-step belief.

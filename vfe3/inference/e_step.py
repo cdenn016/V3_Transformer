@@ -20,7 +20,7 @@ from vfe3.families.base import get_family
 from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
-from vfe3.geometry.retraction import natural_gradient, retract_phi, retract_spd_diagonal, retract_spd_full
+from vfe3.geometry.retraction import get_retraction, natural_gradient, retract_phi
 from vfe3.geometry.transport import compute_transport_operators, transport_covariance, transport_mean
 from vfe3.gradients.kernels import belief_gradients
 
@@ -77,6 +77,7 @@ def free_energy_value(
     gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
     phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
+    spd_retract_mode:          str  = "spd_affine",    # accepted-and-ignored iteration-only knob
 
     log_prior:                 Optional[torch.Tensor] = None,
     keys:                      Optional[BeliefState]  = None,   # None -> global F; else keys frozen at `keys`
@@ -89,8 +90,8 @@ def free_energy_value(
         E_ij = D(q_i || Omega_ij q_j),  beta = softmax_j(log_prior - E/tau).
 
     The iteration-only knobs (gradient_mode, phi_precond_mode, phi_retract_mode,
-    sigma_max, e_sigma_q_trust) are declared here as EXPLICIT accept-and-ignore
-    parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may
+    spd_retract_mode, sigma_max, e_sigma_q_trust) are declared here as EXPLICIT
+    accept-and-ignore parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may
     forward one knob bag to both this and ``e_step_iteration`` while a MISSPELLED real
     parameter still raises ``TypeError`` here instead of being silently swallowed.
     """
@@ -183,6 +184,7 @@ def e_step_iteration(
     alpha_mode:                str  = "constant",
     phi_precond_mode:          str  = "none",
     phi_retract_mode:          str  = "euclidean",
+    spd_retract_mode:          str  = "spd_affine",
 
     log_prior:                 Optional[torch.Tensor] = None,
 ) -> BeliefState:
@@ -199,14 +201,12 @@ def e_step_iteration(
     nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
 
     mu = belief.mu - e_mu_lr * nat_mu
-    if belief.sigma.dim() == belief.mu.dim() + 1:        # full covariance (..., K, K)
-        sigma = retract_spd_full(
-            belief.sigma, -e_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
-        )
-    else:                                                # diagonal variances (..., K)
-        sigma = retract_spd_diagonal(
-            belief.sigma, -e_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
-        )
+    # The registered SPD retraction owns the diagonal-vs-full rank decision internally (full cov iff
+    # sigma.dim() == mu.dim() + 1); the E-step no longer branches on rank to select the retraction.
+    sigma = get_retraction(spd_retract_mode)(
+        belief.sigma, -e_sigma_lr * nat_sigma, belief.mu.dim(),
+        trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
+    )
 
     phi = belief.phi
     if e_phi_lr > 0.0:

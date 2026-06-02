@@ -87,6 +87,7 @@ class VFE3Config:
     gradient_mode:             str   = "filtering"
     phi_precond_mode:          str   = "none"
     phi_retract_mode:          str   = "euclidean"  # Lie-algebra step chart: euclidean (sum) or bch
+    spd_retract_mode:          str   = "spd_affine" # SPD covariance retraction geometry (registry key)
 
     # decode / encode
     use_prior_bank:            bool  = True
@@ -215,6 +216,12 @@ class VFE3Config:
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         _require(self.phi_precond_mode, _VALID_PHI_PRECOND_MODES, "phi_precond_mode")
         _require(self.phi_retract_mode, _VALID_PHI_RETRACT_MODES, "phi_retract_mode")
+        # spd_retract_mode selects the SPD covariance retraction geometry. Validated against the
+        # retraction REGISTRY (not a hardcoded literal list) so a newly registered retraction is a
+        # valid config value without editing this validator. Default 'spd_affine' is the
+        # manuscript-canonical affine-invariant exponential map (the pure path always exists).
+        from vfe3.geometry.retraction import _RETRACTIONS
+        _require(self.spd_retract_mode, tuple(sorted(_RETRACTIONS)), "spd_retract_mode")
         # 'killing_per_block' builds a per-HEAD Killing metric and requires generators that partition
         # per block (block_glk's independent gl(d_head) per head). The tied gauge's shared generators
         # kron(I_n, gl(d_head)) each act on EVERY block, so the per-block partition does not exist;
