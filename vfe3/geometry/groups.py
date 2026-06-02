@@ -24,6 +24,7 @@ from vfe3.geometry.generators import (
     generate_glk_multihead,
     generate_glk_multihead_tied,
     generate_son,
+    generate_sp,
 )
 
 
@@ -162,3 +163,22 @@ def _build_so_k(
     """SO(K): skew-symmetric so(K) generators (single block)."""
     G = generate_son(K, dtype=dtype, device=device)
     return GaugeGroup(name="so_k", generators=G, irrep_dims=[K], skew_symmetric=True)
+
+
+@register_group("sp")
+def _build_sp(
+    K:       int,
+
+    *,
+    dtype:   torch.dtype                  = torch.float32,
+    device:  'torch.device | str | None'  = None,
+) -> GaugeGroup:
+    """Sp(2m,R): the real symplectic group (single block, NON-skew sp(2m,R) generators).
+
+    K = 2m. sp(2m,R) = {A : J A + A^T J = 0} with J = [[0, I_m], [-I_m, 0]]; dim m(2m+1).
+    The generators are not skew (skew_symmetric=False), so transport exponentiates them via
+    the general matrix_exp path (as for glk). Admissible for the Gaussian family because the
+    GL(K) congruence action makes the divergence invariant under any g in GL(K) <= Sp(2m,R).
+    """
+    G = generate_sp(K, dtype=dtype, device=device)
+    return GaugeGroup(name="sp", generators=G, irrep_dims=[K], skew_symmetric=False)

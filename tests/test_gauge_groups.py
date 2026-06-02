@@ -49,6 +49,54 @@ def test_so_k_group_is_skew():
     )
 
 
+def _symplectic_form(K: int) -> torch.Tensor:
+    # J = [[0, I_m], [-I_m, 0]], the standard symplectic form on R^{2m}.
+    m = K // 2
+    J = torch.zeros(K, K)
+    J[:m, m:] = torch.eye(m)
+    J[m:, :m] = -torch.eye(m)
+    return J
+
+
+@pytest.mark.parametrize("K", [4, 6])
+def test_sp_generators_are_sp_algebra(K):
+    # Every generator G of sp(2m,R) satisfies the algebra membership identity J G + G^T J = 0.
+    grp = get_group("sp")(K=K)
+    J = _symplectic_form(K)
+    lhs = torch.einsum("ij,gjk->gik", J, grp.generators) \
+        + torch.einsum("gji,jk->gik", grp.generators, J)
+    assert torch.allclose(lhs, torch.zeros_like(lhs), atol=1e-6)
+    assert grp.skew_symmetric is False
+    assert grp.irrep_dims == [K]
+
+
+@pytest.mark.parametrize("K", [4, 6])
+def test_sp_basis_count_and_independent(K):
+    # dim sp(2m,R) = m(2m+1); the basis is linearly independent (flattened rank == n_gen).
+    m = K // 2
+    grp = get_group("sp")(K=K)
+    n_gen = grp.generators.shape[0]
+    assert n_gen == m * (2 * m + 1)
+    flat = grp.generators.reshape(n_gen, -1)
+    assert torch.linalg.matrix_rank(flat) == n_gen
+
+
+def test_sp_odd_K_raises():
+    from vfe3.geometry.generators import generate_sp
+    with pytest.raises(ValueError):
+        generate_sp(5)
+
+
+@pytest.mark.parametrize("K", [4, 6])
+def test_sp_exp_preserves_symplectic_form(K):
+    # exp(t G) is a one-parameter symplectic subgroup: g^T J g = J for each generator.
+    grp = get_group("sp")(K=K)
+    J = _symplectic_form(K)
+    for G in grp.generators:
+        g = torch.linalg.matrix_exp(0.3 * G)
+        assert torch.allclose(g.transpose(-1, -2) @ J @ g, J, atol=1e-5)
+
+
 def test_block_glk_with_cross_coupling_grows_basis():
     base = get_group("block_glk")(K=6, n_heads=3)
     coupled = get_group("block_glk")(K=6, n_heads=3, cross_couplings=[(0, 1)])
@@ -102,6 +150,7 @@ def test_gaussian_admissibility_is_declared():
     ("glk",       {"K": 4}),
     ("block_glk", {"K": 6, "n_heads": 3}),
     ("so_k",      {"K": 4}),
+    ("sp",        {"K": 4}),
 ])
 def test_full_kl_invariant_under_group_pushforward(spec):
     # For a random group element g = exp(sum_a c_a G_a), the Gaussian KL is

@@ -9,7 +9,7 @@ variant swaps without editing call sites.
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-_VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k")
+_VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k", "sp")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
 _VALID_DECODE_MODES        = ("diagonal", "diagonal_chunked", "full")
@@ -229,6 +229,13 @@ class VFE3Config:
 
         # gauge seam
         _require(self.gauge_group, _VALID_GAUGE_GROUPS, "gauge_group")
+        # Sp(2m,R) lives in even dimension K = 2m; reject an odd embed_dim at construction with a
+        # clear message rather than letting generate_sp raise mid-build.
+        if self.gauge_group == "sp" and self.embed_dim % 2 != 0:
+            raise ValueError(
+                f"gauge_group='sp' (Sp(2m,R)) requires an EVEN embed_dim (K=2m), got "
+                f"embed_dim={self.embed_dim}"
+            )
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
         # transport_mode selects the connection REGIME. Validated against the transport REGISTRY
         # (not a hardcoded literal list) so a newly registered regime is a valid config value

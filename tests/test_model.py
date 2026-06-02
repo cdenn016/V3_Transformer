@@ -250,6 +250,26 @@ def test_diagnostics_includes_gauge_geometry_probes():
     assert math.isfinite(d["holonomy_deviation"]) and math.isfinite(d["gauge_trace_spread"])
 
 
+def test_model_runs_under_sp_gauge_group():
+    # The symplectic Sp(2m,R) gauge (single-block, non-skew) must run end-to-end through the
+    # same model/E-step machinery: a forward + loss.backward() with targets yields a finite loss
+    # and finite, grad-connected gradients on the prior tables. embed_dim=4 (even, K=2m with m=2);
+    # n_heads=2 divides it for the multihead attention/decode (the gauge group itself is the
+    # single super-block sp(4)). Mirrors test_model_runs_under_cross_coupled_block_glk.
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
+                     gauge_group="sp", phi_precond_mode="none")
+    model = VFEModel(cfg)
+    assert model.group.generators.shape[0] == 2 * (2 * 2 + 1)   # m(2m+1) = 10 for m=2
+    assert model.group.irrep_dims == [4]
+    tok = torch.randint(0, 20, (3, 5)); tgt = torch.randint(0, 20, (3, 5))
+    _, loss, _ = model(tok, tgt)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(model.prior_bank.mu_embed.grad).all()
+    assert torch.isfinite(model.prior_bank.phi_embed.grad).all()
+
+
 def test_model_runs_under_cross_coupled_block_glk():
     # The cross-coupled block_glk gauge (config cross_couplings=[(0,1)]) must run end-to-end
     # through the same model/E-step machinery: a forward + loss.backward() with targets yields a

@@ -1430,3 +1430,66 @@ Surgical scope: `vfe3/config.py` + `vfe3/train.py` (+ the new test file). `model
 untouched. Full suite after the change: `tests=416 failures=0 errors=0 skipped=0` (read from
 junitxml; 407 baseline + 9 new; 415 passed + 1 xpassed pre-existing; all 8 viz tests collected
 normally).
+
+## 2026-06-02 — Sp(2m,R) symplectic gauge group (new structure-group seam member)
+
+Branch: vfe3-roadmap-overnight-2026-06-02 (committed directly). An additive demonstration of the
+group-axis modularity (CLAUDE.md: add a variant by writing-and-registering, never by editing call
+sites): the real symplectic group is registered as a new gauge group with no edits to the transport,
+E-step, attention, or decode call sites.
+
+### The group and its algebra
+Sp(2m,R) = {g in GL(2m,R) : g^T J g = J} with the standard symplectic form J = [[0, I_m], [-I_m, 0]].
+Its Lie algebra sp(2m,R) = {A : J A + A^T J = 0}, equivalently A = [[B, C], [D, -B^T]] with B an
+arbitrary m x m block and C = C^T, D = D^T symmetric. The basis emitted by `generate_sp(K)` (K = 2m)
+has dimension m(2m+1) = m^2 + 2 * m(m+1)/2: the m^2 B-generators [[E_ij, 0], [0, -E_ji]], the
+m(m+1)/2 symmetric C-generators [[0, S], [0, 0]] (S = E_ii and E_ij + E_ji for i < j, top-right
+block), and the m(m+1)/2 symmetric D-generators [[0, 0], [S, 0]] (bottom-left block). sp(2m,R) is NOT
+skew, so the group is registered with `skew_symmetric=False` and transport exponentiates the
+generators through the general `matrix_exp` path (the same path glk uses).
+
+### Admissibility
+The manuscript's GL(K) invariance theorem makes the Gaussian divergence invariant under common
+congruence (mu -> g mu, Sigma -> g Sigma g^T) by ANY g in GL(K). Sp(2m,R) is a subgroup of GL(2m,R),
+so the divergence is invariant under the symplectic congruence and the group is admissible for the
+Gaussian family (`invariant_families=('gaussian',)`).
+
+### Files
+- `vfe3/geometry/generators.py`: new `generate_sp(K)` returning the (m(2m+1), 2m, 2m) sp basis;
+  raises `ValueError` on odd or sub-2 K. Built in float64 then cast, matching `generate_son`.
+- `vfe3/geometry/groups.py`: `@register_group("sp")` builder `_build_sp(K)` ->
+  `GaugeGroup(generators=generate_sp(K), irrep_dims=[K], skew_symmetric=False,
+  invariant_families=('gaussian',))` (single super-block). `build_group` (model.py) needs no edit:
+  sp is arity-1 `builder(K)` like glk/so_k and the existing positional-arity dispatch handles it.
+- `vfe3/config.py`: "sp" added to `_VALID_GAUGE_GROUPS`; `__post_init__` raises a clear ValueError
+  when `gauge_group=="sp"` and `embed_dim` is odd (Sp needs even K = 2m). The odd-K guard exists in
+  BOTH layers (config for an early, clear failure; `generate_sp` for robustness).
+
+### Oracles (TDD, watched RED then GREEN; 10 new tests)
+- sp-algebra membership (exact): `test_sp_generators_are_sp_algebra[4,6]` — every generator G
+  satisfies J G + G^T J = 0 (allclose 0, atol 1e-6), and the group is non-skew with irrep_dims=[K].
+- basis count + independence: `test_sp_basis_count_and_independent[4,6]` — n_gen == m(2m+1) and the
+  flattened-generator matrix has rank n_gen.
+- Sp preservation under exp: `test_sp_exp_preserves_symplectic_form[4,6]` — exp(t G)^T J exp(t G)
+  allclose J (atol 1e-5) for each generator (a one-parameter symplectic subgroup).
+- admissibility / gauge-equivariance: `test_full_kl_invariant_under_group_pushforward[sp,K=4]` (added
+  to the existing parametrize) — for a random g = exp(sum phi_a G_a) in Sp, the Gaussian KL is
+  invariant under common congruence (atol 1e-3). This is the key oracle that sp is a valid gauge
+  group for the family.
+- odd-K guard: `test_sp_odd_K_raises` (`generate_sp(5)` raises) and
+  `test_config_sp_gauge_group_requires_even_embed_dim` (config rejects odd embed_dim under sp,
+  accepts even, leaves other groups unaffected).
+- end-to-end: `test_model_runs_under_sp_gauge_group` — a tiny VFEModel with `gauge_group="sp"`,
+  `embed_dim=4` (m=2, n_gen=10), `n_heads=2` runs forward + `loss.backward()` with finite loss and
+  finite, grad-connected prior-table gradients.
+
+### Deferred
+U(K)/SU(K) are NOT added here: the unitary groups need a complex (or 2m-real) belief embedding for
+the congruence action, which this real-Gaussian belief family does not currently carry; that is a
+larger belief-representation change, deferred.
+
+### Suite
+Additive change; existing group generators are byte-identical (generators.py only adds a new
+function, groups.py only registers a new builder). Full suite after the change:
+`tests=426 failures=0 errors=0 skipped=0` (read from junitxml; 416 baseline + 10 new; 425 passed +
+1 xpassed pre-existing; all 8 viz tests collected normally).
