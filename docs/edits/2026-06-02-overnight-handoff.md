@@ -132,3 +132,27 @@ risk shipping a plausible-but-wrong implementation, so they were spec'd instead.
 - A spec-extraction script briefly created mis-named files (a heredoc collapsed `"\\20"` into an octal
   escape); cleaned up, git status clean. Tooling lesson: use pathlib, never manual `"\\"` path
   concatenation in a heredoc'd script.
+
+## E. Directed session 2026-06-02 (continued, user awake) — items 1-8 + speedups
+
+All committed + pushed to `origin/vfe3-roadmap-overnight-2026-06-02`; suite climbed 313 -> 401, 0 failures throughout. Each is opt-in/default-off or a byte-identity/equivalence-gated refactor; the user steered and sanctioned the two NN exceptions (#5, #6) with the required NN comments at the function AND the config toggle.
+
+BUILT (oracle-verified + self-reviewed diff, green, pushed):
+1. Squared-Hellinger f-divergence (`8d52194`) — `H^2=1-exp(-D_{1/2}/2)`; oracle = analytic Gaussian H^2 + SYMMETRY + self-zero. First non-Renyi functional; signature generalized via `**kwargs`.
+2. log-Euclidean SPD retraction (`09ffb7b`) — into `register_retraction`; SPD-preservation + independent matrix-exp oracle. NOTE: the spec's "LE==affine on diagonal" claim was FALSE under the pre-whitened tangent; the implementer pinned the real relationship + truthful warning (code-truth over unvetted spec).
+3. Extensible `BeliefState` (`56aa955`, roadmap M3) — NamedTuple + optional `s`/`r` fields, 3-field byte-identical; precondition for the hyper-prior channel.
+4. Batched per-head `pairwise_energy` (`db7645b`) — stack equal blocks, one functional call; `torch.equal` bit-identical (diagonal + full).
+5. Learnable alpha (`fe0bfce`,`9caa785`) — SANCTIONED NN exception; `alpha=exp(log_alpha)`, init 0 => alpha=1.0 (init==constant-1.0 oracle, `torch.equal`); NN comments at function/config/param; detach_e_step footgun warning.
+6. Regime-II edge-relaxed transport (`a4ba488`) — SANCTIONED NN exception; bilinear `delta_ij=mu_i^T W^a mu_j`, init W=0 => flat (byte-identical); holonomy_deviation>0 when W!=0; per-edge O(N^2) matrix-exps; breaks strict gauge covariance (head-mixer-analogous, documented).
+7. Hyper-prior channel, increment 1 (`d23211d`) — `lambda_h*KL(s||r)`, default lambda_h=0 (no-op); s/r tables; linear-in-lambda_h oracle. DEFERRED to increment 2: gamma model-coupling, s-channel E-step update, s->q coupling.
+8. Straight-through E-step (`e8a847c`) — `e_step_gradient=unroll|straight_through|detach` (Alg-1:2050); straight_through forward==unroll forward (`torch.equal`), grad differs (no second-order); reconciled with `detach_e_step`.
+
+SPEEDUPS:
+- Dense-Omega fusion / P0 #2 (`d729e6c`) — `FactoredTransport` skips the dense `(B,N,N,K,K)` Omega on the flat block-diagonal path; mean diff 9.5e-7 (1 ULP), diagonal cov exactly 0.0, full cov byte-identical; regime_ii/full/single-block/cross-coupled stay dense (guarded).
+- Mixed-precision opt-in (`dc4c255`) — `amp_dtype in {None,bf16,fp16}`, default None byte-identical (autocast tripwire test); fp32 islands for matrix_exp/SPD + decode/CE; bf16 recommended for the 5090, fp16-GradScaler is a follow-up.
+- Chunked-vocab decode (`5c4618a`) — `decode_mode=diagonal_chunked`, fused chunked decode+CE avoids the `(B,N,V)` logit tensor in training (peak `O(V*K+B*N*K)`, verified via saved_tensors_hooks); chunked CE vs full 4.8e-7 (gate 1e-3), grad ~1e-9; inference still materializes full logits.
+
+REMAINING (flagged, not built):
+- Causal-packed transport (#12) — N-factor win, but now entangled with `FactoredTransport`; do as a focused follow-up.
+- Observation-likelihood seam (#9) — a decide-and-document item (the current CE-external design is the defensible vacuum-plus-source split); needs your call before building.
+- Hyper-prior increment 2 (gamma model-coupling + s-channel E-step + s->q coupling); torch.compile/CUDA-graph (after a 5090 re-profile); the spec-only items still awaiting decisions (Bures-Wasserstein retraction, additional groups U/SU/Sp, f-divergence beyond Hellinger).
