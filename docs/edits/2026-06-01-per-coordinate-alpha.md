@@ -1359,3 +1359,70 @@ divergence tests raised `_LinAlgError`; test_numerics raised ImportError on `saf
 then GREEN. Full suite after the change: `tests=407 failures=0 errors=0 skipped=0` (read
 from junitxml; 401 baseline + 6 new; 406 passed + 1 xpassed pre-existing; all 8 viz tests
 collected normally).
+
+## 2026-06-02 — Gradient accumulation (grad_accum_steps; default-OFF)
+
+Branch: vfe3-roadmap-overnight-2026-06-02 (committed directly). Roadmap source:
+`docs/perf/2026-05-31-speedup-opportunities.md` / `docs/2026-06-01-buildout-roadmap.md` (the
+gradient-accumulation finding). Lets the RTX 5090 reach a large EFFECTIVE batch without the
+memory of one big forward, by accumulating gradients over several microbatches before each
+optimizer step. DDP is a separate, larger item and was NOT added.
+
+### The toggle and the split-the-batch approach
+`vfe3/config.py` adds `grad_accum_steps: int = 1` (default 1 = OFF) beside `batch_size`, with a
+`>= 1` `__post_init__` check. When `grad_accum_steps == K > 1`, `train_step` SPLITS the pulled
+batch into K equal chunks along the batch axis (`torch.chunk(..., K, dim=0)`), forwards each,
+divides its loss by K and `backward()`s it (accumulating into `.grad`), then fires a SINGLE
+gradient clip + `optimizer.step()` + `scheduler.step()` at the accumulation boundary. The
+split-the-batch (rather than consume-K-dataloader-batches) approach was chosen because it makes
+the accum==full-batch equivalence oracle EXACT and keeps the dataloader/step accounting trivial:
+`train()` still calls `train_step` exactly once per dataloader pull. The default `K == 1` takes a
+separate branch with no chunking and no divide, so it is byte-identical to the prior
+single-backward loop.
+
+### The accum == full-batch grad oracle (and the equal-token caveat)
+The key correctness pin: for a batch split into K equal microbatches with EQUAL counted-token
+counts, the accumulated `.grad` on the prior tables after K microbatch backwards (each loss/K)
+equals (to round-off) the `.grad` from one backward on the full batch. This holds because the
+model's CE and the extra F terms are MEANS over the batch axis and there is no cross-sequence
+dependency in the E-step (`for b in range(B)`), so `(1/K) sum_k mean_k == mean_full` for
+equal-sized microbatches. The EQUAL-TOKEN caveat: with per-position `ignore_index` (-100) the
+per-microbatch means re-weight by each chunk's surviving token count, so the K-accum mean would
+not equal the full-batch mean (which weights by the total surviving count) unless every
+microbatch happens to carry the same number of counted tokens. The oracle tests construct inputs
+with NO `-100` (every position counts) and use a batch divisible by K. The grad-clip is applied
+ONCE to the accumulated (already mean-normalized) gradient, so the threshold is NOT rescaled by
+K (that would be the summed-loss variant, which this is not).
+
+### Divisibility guard (loud, not silent)
+`train_step` raises `ValueError` when `B % K != 0` rather than degrading silently: `torch.chunk`
+on a non-divisible batch returns unequal (and possibly fewer than K) chunks, which would break
+both the microbatch count and the /K normalization. The equal-token oracle's precondition is
+exactly `B % K == 0`, so the guard makes the misuse fail at the call rather than miscompute.
+
+### Optimizer-step accounting
+A "step" stays an OPTIMIZER step: `train_step` performs exactly one `optimizer.step()` +
+`scheduler.step()` regardless of K, and `train()` calls `train_step` once per pulled batch, so
+`max_steps`/`warmup`/the LambdaLR cosine all count optimizer steps (not microbatches) with zero
+extra logic. The logged per-step loss is the mean over the K microbatches (the
+accumulation-boundary loss).
+
+### Tests (TDD, watched RED then GREEN; `tests/test_grad_accum.py`, new)
+- `test_accum_grad_equals_full_batch_grad[2]` and `[4]` — the key oracle: accumulated `.grad`
+  over K equal-token microbatches (each loss/K) allclose (atol 1e-5) to the full-batch single
+  backward, for K=2 and K=4, with no optimizer.step between the two measurements.
+- `test_train_step_k1_byte_identical_to_single_step_path` — `grad_accum_steps=1` reproduces the
+  current path exactly (same returned loss; `torch.equal` on all three prior tables after one
+  step; same `scheduler.last_epoch`).
+- `test_optimizer_and_scheduler_step_once_per_K_microbatches` — N train_step calls at K=4 leave
+  AdamW's per-param `step` state == N and `scheduler.last_epoch == N` (one optimizer/scheduler
+  step per K microbatches, not per microbatch).
+- `test_train_loop_runs_under_grad_accum` — end-to-end `train()` at K=4 returns n_steps finite
+  losses.
+- `test_config_grad_accum_steps_validation` — default 1; `0`/`-3` raise.
+- `test_train_step_indivisible_batch_raises` — `B=5`, `K=4` raises `ValueError`.
+
+Surgical scope: `vfe3/config.py` + `vfe3/train.py` (+ the new test file). `model.py` forward
+untouched. Full suite after the change: `tests=414 failures=0 errors=0 skipped=0` (read from
+junitxml; 407 baseline + 7 new; 413 passed + 1 xpassed pre-existing; all 8 viz tests collected
+normally).

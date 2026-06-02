@@ -103,22 +103,54 @@ def train_step(
     targets:   torch.Tensor,             # (B, N) next-token ids (-100 = ignore)
 
     *,
-    grad_clip: float = 1.0,
+    grad_clip:        float = 1.0,
+    grad_accum_steps: int   = 1,
 ) -> float:
-    r"""One M-step on the cross-entropy of a batch; returns the loss scalar.
+    r"""One M-step (one optimizer step) on the cross-entropy of a batch; returns the loss.
 
     Zeroes the prior-table gradients, runs the forward (encode -> unrolled E-step ->
     decode -> CE), backpropagates the loss through inference to the prior tables, clips
     the global gradient norm to ``grad_clip``, then takes one AdamW + scheduler step.
+
+    With ``grad_accum_steps == K > 1`` the batch is split into ``K`` equal chunks along
+    the batch axis; each chunk's loss is divided by ``K`` and ``backward()``-ed,
+    ACCUMULATING into ``.grad``, and the single clip + ``optimizer.step()`` +
+    ``scheduler.step()`` fires once after all ``K`` microbatches. Because the model's CE
+    and the extra F terms are MEANS over the batch axis and there is no cross-sequence
+    dependency, the accumulated ``.grad`` equals (to round-off) the gradient of one
+    backward on the full batch when the microbatches carry EQUAL counted-token counts
+    (i.e. ``B % K == 0`` and no per-position ``ignore_index`` re-weighting); this gives a
+    larger EFFECTIVE batch without the memory of one big forward. A "step" stays an
+    OPTIMIZER step (the scheduler/warmup/max_steps accounting is unchanged). The grad-clip
+    is applied ONCE to the accumulated (already mean-normalized) gradient at the boundary,
+    so the threshold is NOT rescaled by ``K``. The returned loss is the mean over the
+    ``K`` microbatches (the accumulation-boundary loss). ``K == 1`` is byte-identical to
+    the single-backward path (no chunking, no divide). Requires ``B % K == 0``.
     """
     optimizer.zero_grad(set_to_none=True)
-    _, loss, _ = model(tokens, targets)
-    loss.backward()
+    if grad_accum_steps == 1:                                   # default path: byte-identical to the single-step loop
+        _, loss, _ = model(tokens, targets)
+        loss.backward()
+        step_loss = float(loss.detach())
+    else:
+        if tokens.shape[0] % grad_accum_steps != 0:            # equal-token microbatches require an even split
+            raise ValueError(
+                f"grad_accum_steps={grad_accum_steps} must divide the batch size "
+                f"{tokens.shape[0]} for equal microbatches; got remainder "
+                f"{tokens.shape[0] % grad_accum_steps}."
+            )
+        tok_chunks = torch.chunk(tokens, grad_accum_steps, dim=0)
+        tgt_chunks = torch.chunk(targets, grad_accum_steps, dim=0)
+        step_loss = 0.0
+        for tok_mb, tgt_mb in zip(tok_chunks, tgt_chunks):
+            _, loss_mb, _ = model(tok_mb, tgt_mb)
+            (loss_mb / grad_accum_steps).backward()            # accumulate the mean-normalized microbatch grad
+            step_loss += float(loss_mb.detach()) / grad_accum_steps
     if grad_clip is not None and grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
     scheduler.step()
-    return float(loss.detach())
+    return step_loss
 
 
 @torch.no_grad()
@@ -216,7 +248,8 @@ def train(
             tokens, targets = next(it)
         tokens = tokens.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        losses.append(train_step(model, optimizer, scheduler, tokens, targets, grad_clip=grad_clip))
+        losses.append(train_step(model, optimizer, scheduler, tokens, targets,
+                                  grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps))
 
         if log_interval and (step + 1) % log_interval == 0:
             with torch.no_grad():

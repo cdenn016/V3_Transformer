@@ -167,6 +167,12 @@ class VFE3Config:
     m_phi_lr:                  float = 0.015
     weight_decay:              float = 0.05
     batch_size:                int   = 64
+    # Accumulate gradients over N microbatches before an optimizer step, for a larger
+    # effective batch without the memory of one big forward. Each pulled batch is split
+    # into N equal chunks along the batch axis, each backed (loss / N) into .grad, then a
+    # single clip + optimizer.step() + scheduler.step() fires at the boundary. Default 1 =
+    # current single-step behavior (byte-identical: no chunking, no divide).
+    grad_accum_steps:          int   = 1
     max_steps:                 int   = 15000
     warmup_steps:              int   = 100
     seed:                      int   = 0
@@ -424,6 +430,8 @@ class VFE3Config:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
+        if self.grad_accum_steps < 1:
+            raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
         if self.log_interval < 0:
             raise ValueError(f"log_interval must be >= 0, got {self.log_interval}")
         if self.eval_interval < 0:
