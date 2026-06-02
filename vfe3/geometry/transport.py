@@ -7,6 +7,7 @@ Belief action: mu -> Omega @ mu, Sigma -> Omega @ Sigma @ Omega^T (sandwich;
 diagonal approximation for speed). Regime II, retractions, RoPE are later phases.
 """
 
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -14,6 +15,37 @@ import torch
 from vfe3.geometry.groups import GaugeGroup
 
 TransportDict = Dict[str, torch.Tensor]
+
+
+@dataclass
+class FactoredTransport:
+    r"""The flat phi-cocycle transport in FACTORED form: the per-token (B, N, K, K) vertex
+    exponentials, NOT the dense (B, N, N, K, K) pairwise Omega.
+
+    On the flat + block-diagonal-with-equal-blocks path the dense Omega_ij = exp(phi_i) exp(-phi_j)
+    is never materialized; instead ``transport_mean`` / ``transport_covariance`` consume this
+    container on a fast path that fuses the exps into the contraction (P0 #2, perf doc
+    docs/perf/2026-05-31-speedup-opportunities.md): the mean is an EXACT reassociation, and the
+    DIAGONAL sandwich factors per head by block-diagonality (a (d, d) operation per head, never
+    the full K x K square). A FULL-covariance input rebuilds the dense Omega from the factors
+    (byte-identical to ``compute_transport_operators``), so the unfused sandwich is unchanged.
+
+    ``irrep_dims`` (equal blocks, length > 1) drives the per-head slicing of the diagonal cov.
+    """
+
+    exp_phi:     torch.Tensor             # (..., N, K, K) exp(phi_i . G)
+    exp_neg_phi: torch.Tensor             # (..., N, K, K) exp(-phi_j . G)
+    irrep_dims:  List[int]                # equal block sizes; sum == K, len > 1
+
+    def to_dense_omega(self) -> torch.Tensor:
+        r"""Rebuild the dense Omega_ij = exp(phi_i) exp(-phi_j) (..., N, N, K, K).
+
+        Byte-identical to ``compute_transport_operators``'s Omega einsum (same factors, same
+        ``ikl,jlm->ijkm`` contraction); used to keep the FULL-covariance sandwich and any
+        consumer that needs the explicit operator on the existing dense code path. Rank-agnostic
+        via the leading ellipsis (an optional batch axis flows through; the unbatched call matches).
+        """
+        return torch.einsum("...ikl,...jlm->...ijkm", self.exp_phi, self.exp_neg_phi)
 
 
 # -- connection-regime registry (orthogonal to the gauge_parameterization phi|omega_direct axis) --
@@ -270,6 +302,41 @@ def compute_transport_operators(
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
+def build_factored_transport(
+    phi:        torch.Tensor,             # (..., N, n_gen) gauge frames (optional leading batch axis)
+    group:      GaugeGroup,               # block-diagonal with equal blocks (len(irrep_dims) > 1)
+
+    *,
+    gauge_mode: str = "learned",          # 'learned' (Regime I flat) or 'trivial'
+) -> FactoredTransport:
+    r"""Flat phi-cocycle transport in FACTORED form, skipping the dense (..., N, N, K, K) Omega.
+
+    Builds only the per-token vertex exponentials exp(phi_i), exp(-phi_j) (the same factors
+    ``compute_transport_operators`` builds) and the ``ikl,jlm->ijkm`` Omega einsum is NEVER run.
+    The pairwise contraction is deferred into ``transport_mean`` / ``transport_covariance``'s fast
+    path (P0 #2). Caller guards this to the flat + block-diagonal-with-equal-blocks path; here it
+    only requires the exps, which the block-diagonal exp machinery already produces. Rank-agnostic
+    via the leading ellipsis: a (B, N, n_gen) frame (batched forward) and a (N, n_gen) frame (the
+    unbatched block / diagnostics path) both flow through.
+    """
+    if gauge_mode == "trivial":
+        # Trivial gauge: exp = I. Build the same per-token factors the dense path would (the
+        # caller's guard normally excludes trivial, but keep the container well-formed).
+        K = group.generators.shape[-1]
+        eye_K = torch.eye(K, device=phi.device, dtype=phi.dtype)
+        eye = eye_K.expand(*phi.shape[:-1], K, K).contiguous()
+        return FactoredTransport(exp_phi=eye, exp_neg_phi=eye, irrep_dims=list(group.irrep_dims))
+    if gauge_mode != "learned":
+        raise ValueError(f"gauge_mode must be 'learned' or 'trivial', got {gauge_mode!r}")
+
+    phi_matrix = torch.einsum("...na,aij->...nij", phi, group.generators)
+    block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
+    exp_phi, exp_neg_phi = stable_matrix_exp_pair(
+        phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims
+    )
+    return FactoredTransport(exp_phi=exp_phi, exp_neg_phi=exp_neg_phi, irrep_dims=list(group.irrep_dims))
+
+
 def compute_transport_operators_direct(
     omega:      torch.Tensor,             # (B, N, K, K) per-token group elements Omega_i
 
@@ -314,21 +381,30 @@ def compute_transport_operators_direct(
 
 
 def transport_mean(
-    omega: torch.Tensor,             # (..., N, N, K, K) pairwise transport
-    mu:    torch.Tensor,             # (..., N, K) source (key, index j) means
+    omega: 'torch.Tensor | FactoredTransport',   # (..., N, N, K, K) dense OR factored exps
+    mu:    torch.Tensor,                          # (..., N, K) source (key, index j) means
 ) -> torch.Tensor:
     r"""Gauge action on means: mu_t[i,j] = Omega_ij @ mu_j. Returns (..., N, N, K).
 
-    Rank-agnostic via the leading ellipsis: an optional batch axis (B,N,N,K,K)+(B,N,K)
+    Dense path (rank-agnostic via the leading ellipsis): an optional batch axis (B,N,N,K,K)+(B,N,K)
     flows through unchanged, and the unbatched (N,N,K,K)+(N,K) call is identical -- so the
     same primitive serves the batched forward and the unbatched diagnostics path.
+
+    FACTORED path (``omega`` is a :class:`FactoredTransport`, the flat + block fast route): the exps
+    are fused into the contraction -- compute m_j = exp(-phi_j) @ mu_j ONCE (B,N,K), then
+    mu_t[i,j] = exp(phi_i) @ m_j -- an EXACT reassociation of the dense einsum (round-off level),
+    never forming (B,N,N,K,K). Autograd-safe (differentiates through the live exps), so it survives
+    the smoothing-mode oracle if a container ever reaches it.
     """
+    if isinstance(omega, FactoredTransport):
+        m = torch.einsum("...jlp,...jp->...jl", omega.exp_neg_phi, mu)  # (..., N, K): exp(-phi_j) @ mu_j
+        return torch.einsum("...ikl,...jl->...ijk", omega.exp_phi, m)   # (..., N, N, K): exp(phi_i) @ m_j
     return torch.einsum("...ijkl,...jl->...ijk", omega, mu)
 
 
 def transport_covariance(
-    omega: torch.Tensor,             # (..., N, N, K, K) pairwise transport
-    sigma: torch.Tensor,             # (..., N, K) diagonal OR (..., N, K, K) full
+    omega: 'torch.Tensor | FactoredTransport',   # (..., N, N, K, K) dense OR factored exps
+    sigma: torch.Tensor,                          # (..., N, K) diagonal OR (..., N, K, K) full
 
     *,
     diagonal_out: Optional[bool] = None,
@@ -340,11 +416,53 @@ def transport_covariance(
     sigma_jl (the diagonal of the full sandwich). Rank-agnostic via the leading
     ellipsis (optional batch axis); diagonal vs full is detected by the rank gap
     ``sigma.dim() == omega.dim() - 2``, which holds with or without the batch axis.
+
+    FACTORED path (``omega`` is a :class:`FactoredTransport`): a DIAGONAL sigma is sandwiched
+    per head -- by block-diagonality the (d, d) block Omega^(h) = exp(phi_i)^(h) exp(-phi_j)^(h)
+    is the only nonzero part on head h's coordinates, so Sigma_t[i,j,k] = sum_l (Omega^(h)_ijkl)^2
+    sigma_jl runs over head h only (the off-block Omega entries are exactly 0.0, so the full-l sum
+    equals the in-block sum). This materializes H * d^2 per pair, never the full K^2 square -- the
+    square sits inside the l-sum, so it does NOT factor by squaring the full exps; it factors by
+    block-diagonality. A FULL sigma rebuilds the dense Omega (byte-identical) and runs the unchanged
+    sandwich, so full covariance is never the round-off factoring.
     """
+    if isinstance(omega, FactoredTransport):
+        # Diagonal sigma is (..., N, K) -> same rank as exp_phi minus the trailing K axis; a full
+        # sigma is (..., N, K, K) -> same rank as exp_phi (the dense-Omega rank-gap is +1 here
+        # because the factored exps carry one fewer N axis than the dense (..., N, N, K, K)).
+        is_diag = sigma.dim() == omega.exp_phi.dim() - 1 if diagonal_out is None else diagonal_out
+        if not is_diag:
+            return transport_covariance(omega.to_dense_omega(), sigma, diagonal_out=diagonal_out)
+        return _factored_diagonal_covariance(omega, sigma)
     is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
     if is_diag:
         return torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega, omega, sigma)
     return torch.einsum("...ijkl,...jlm,...ijnm->...ijkn", omega, sigma, omega)
+
+
+def _factored_diagonal_covariance(
+    factored: FactoredTransport,
+    sigma:    torch.Tensor,               # (..., N, K) diagonal variances
+) -> torch.Tensor:                        # (..., N, N, K) diagonal sandwich
+    r"""Per-head diagonal sandwich from the factored exps (P0 #2 covariance route).
+
+    For each head h on coordinates [start:end] the block Omega^(h)_ij = exp(phi_i)^(h) exp(-phi_j)^(h)
+    is a (d, d) operator; the diagonal sandwich Sigma_t[i,j,k] = sum_l (Omega^(h)_ijkl)^2 sigma_jl
+    runs over head h's d coordinates only. Materializes the (..., N, N, d, d) block Omega per head
+    (H * d^2 vs the full K^2). Exact w.r.t. the dense diagonal sandwich because the dense Omega is
+    block-diagonal (off-block entries exactly 0.0). Rank-agnostic via the leading ellipsis.
+    """
+    parts: List[torch.Tensor] = []
+    start = 0
+    for d in factored.irrep_dims:
+        end = start + d
+        ep = factored.exp_phi[..., start:end, start:end]               # (..., N, d, d) exp(phi_i)^(h)
+        en = factored.exp_neg_phi[..., start:end, start:end]           # (..., N, d, d) exp(-phi_j)^(h)
+        omega_blk = torch.einsum("...ikl,...jlm->...ijkm", ep, en)     # (..., N, N, d, d) block Omega^(h)
+        sig_blk = sigma[..., start:end]                                # (..., N, d)
+        parts.append(torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega_blk, omega_blk, sig_blk))
+        start = end
+    return torch.cat(parts, dim=-1)                                    # (..., N, N, K)
 
 
 def omega_to_block_exp_pairs(

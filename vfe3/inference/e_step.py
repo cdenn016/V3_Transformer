@@ -21,7 +21,14 @@ from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, re
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
 from vfe3.geometry.retraction import get_retraction, natural_gradient, retract_phi
-from vfe3.geometry.transport import compute_transport_operators, get_transport, transport_covariance, transport_mean
+from vfe3.geometry.transport import (
+    FactoredTransport,
+    build_factored_transport,
+    compute_transport_operators,
+    get_transport,
+    transport_covariance,
+    transport_mean,
+)
 from vfe3.gradients.kernels import belief_gradients
 
 
@@ -55,6 +62,53 @@ def _transport(
                      cocycle_relaxation=cocycle_relaxation)["Omega"][0]
     return build(phi, group, mu=mu, connection_W=connection_W,
                  cocycle_relaxation=cocycle_relaxation)["Omega"]
+
+
+def _can_fuse_flat(transport_mode: str, group: GaugeGroup) -> bool:
+    r"""Whether the forward belief-transport may skip the dense (B,N,N,K,K) Omega (P0 #2).
+
+    The fused factored route is valid ONLY when the connection is flat (``transport_mode='flat'``;
+    regime_ii's Omega is mu-dependent and carries the edge delta factor, so it must stay dense) AND
+    the group is genuinely block-diagonal with EQUAL blocks (``len(irrep_dims) > 1`` and all blocks
+    the same size -- block_glk / tied_block_glk). Single-block (glk, so_k, cross-coupled block_glk
+    all report ``irrep_dims=[K]``) keeps the dense path.
+    """
+    return (
+        transport_mode == "flat"
+        and len(group.irrep_dims) > 1
+        and len(set(group.irrep_dims)) == 1
+    )
+
+
+def build_belief_transport(
+    phi:                torch.Tensor,             # (B, N, n_gen) batched gauge frames
+    group:              GaugeGroup,
+
+    *,
+    transport_mode:     str                    = "flat",   # connection-regime registry key
+    mu:                 Optional[torch.Tensor] = None,      # regime_ii edge connection reads these
+    connection_W:       Optional[torch.Tensor] = None,      # regime_ii learned bilinear connection
+    cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
+) -> 'torch.Tensor | FactoredTransport':
+    r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
+
+    On the flat + block-diagonal-with-equal-blocks path (``_can_fuse_flat``) returns a
+    :class:`FactoredTransport` -- the per-token exps only, NEVER the dense (B,N,N,K,K) Omega --
+    which ``transport_mean`` / ``transport_covariance`` consume on a fused fast path (the mean is an
+    exact reassociation; the diagonal covariance factors per head). Every other case
+    (regime_ii, single-block / cross-coupled groups, trivial gauge) falls back to ``_transport``'s
+    DENSE Omega exactly as before, so those numerics are unchanged. The factored container flows
+    OPAQUELY through ``belief_gradients`` (kernel + oracle), which only ever forward it to
+    ``transport_mean`` / ``transport_covariance``; the oracle's full-cov / smoothing routes rebuild
+    the dense Omega from the factors on demand (byte-identical).
+    """
+    if _can_fuse_flat(transport_mode, group):
+        return build_factored_transport(phi, group)
+    transport_kw = (
+        dict(mu=mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation)
+        if transport_mode == "regime_ii" else {}
+    )
+    return _transport(phi, group, transport_mode=transport_mode, **transport_kw)
 
 
 def _transport_qk(
@@ -229,13 +283,15 @@ def e_step_iteration(
     the pure path); it flows into the belief gradient so the loss backpropagates to it through the
     unrolled E-step. ``connection_W`` likewise flows in only through these belief updates, so the
     loss backpropagates to it (and a detached E-step would freeze it, mirroring log_alpha)."""
-    # Only regime_ii needs the belief means + learned connection; flat ignores them, so the default
-    # call passes the un-threaded defaults (mu=None) and is byte-identical to the pre-regime_ii path.
-    transport_kw = (
-        dict(mu=belief.mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation)
-        if transport_mode == "regime_ii" else {}
+    # Build the forward belief-transport (P0 #2): on the flat + block-diagonal-with-equal-blocks
+    # path this is a FactoredTransport (the per-token exps only, NO dense (B,N,N,K,K) Omega), which
+    # the belief-gradient kernel / oracle consume opaquely through transport_mean / covariance;
+    # regime_ii (mu-dependent Omega) and single-block / cross-coupled groups keep the dense Omega
+    # exactly as before. Only regime_ii needs the belief means + learned connection.
+    omega = build_belief_transport(
+        belief.phi, group, transport_mode=transport_mode,
+        mu=belief.mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
     )
-    omega = _transport(belief.phi, group, transport_mode=transport_mode, **transport_kw)
     grad_mu, grad_sigma = belief_gradients(
         belief.mu, belief.sigma, mu_p, sigma_p, omega,
         tau=tau, alpha_div=alpha_div, value=value, b0=b0, c0=c0, kl_max=kl_max, eps=eps,

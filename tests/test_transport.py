@@ -177,3 +177,66 @@ def test_flat_builder_tolerates_extra_kwargs():
     direct = compute_transport_operators(phi, grp)
     seam = get_transport("flat")(phi, grp, gauge_mode="learned", connection_state=object())
     assert torch.equal(seam["Omega"], direct["Omega"])
+
+
+# --- factored transport (P0 #2): fuse the per-token exps into the mean/cov contractions,
+#     skipping the dense (B,N,N,K,K) Omega on the flat + block-diagonal path ---
+def _block_inputs(seed=0):
+    from vfe3.geometry.groups import get_group as _gg
+    torch.manual_seed(seed)
+    grp = _gg("block_glk")(8, 2)                      # irrep_dims [4, 4]
+    n_gen = grp.generators.shape[0]
+    phi = 0.2 * torch.randn(2, 5, n_gen)
+    mu = torch.randn(2, 5, 8)
+    sig = torch.rand(2, 5, 8) + 0.5
+    return grp, phi, mu, sig
+
+
+def test_factored_mean_equals_dense_mean():
+    """The factored mean (fused exps, no dense Omega) equals transport_mean on the dense Omega."""
+    from vfe3.geometry.transport import build_factored_transport
+    grp, phi, mu, sig = _block_inputs(0)
+    dense = compute_transport_operators(phi, grp)["Omega"]            # (B,N,N,K,K)
+    factored = build_factored_transport(phi, grp)
+    mt_dense = transport_mean(dense, mu)
+    mt_fact = transport_mean(factored, mu)
+    assert mt_fact.shape == mt_dense.shape
+    assert torch.allclose(mt_fact, mt_dense, atol=1e-6)
+
+
+def test_factored_diagonal_cov_equals_dense_diagonal_cov():
+    """The per-head block diagonal sandwich equals the dense diagonal transport_covariance."""
+    from vfe3.geometry.transport import build_factored_transport
+    grp, phi, mu, sig = _block_inputs(1)
+    dense = compute_transport_operators(phi, grp)["Omega"]
+    factored = build_factored_transport(phi, grp)
+    st_dense = transport_covariance(dense, sig)                       # (B,N,N,K) diagonal
+    st_fact = transport_covariance(factored, sig)
+    assert st_fact.shape == st_dense.shape
+    assert torch.allclose(st_fact, st_dense, atol=1e-6)
+
+
+def test_factored_full_cov_rebuilds_dense_sandwich():
+    """A FULL-covariance input through the factored container rebuilds the dense sandwich
+    byte-for-byte (the factored container has no diagonal shortcut for full cov)."""
+    from vfe3.geometry.transport import build_factored_transport
+    grp, phi, mu, sig = _block_inputs(2)
+    dense = compute_transport_operators(phi, grp)["Omega"]
+    factored = build_factored_transport(phi, grp)
+    A = torch.randn(2, 5, 8, 8)
+    full_sigma = A @ A.transpose(-1, -2) + torch.eye(8)
+    st_dense = transport_covariance(dense, full_sigma)               # (B,N,N,K,K)
+    st_fact = transport_covariance(factored, full_sigma)
+    assert st_fact.shape == st_dense.shape
+    assert torch.allclose(st_fact, st_dense, atol=1e-6)
+
+
+def test_build_factored_transport_does_not_form_dense_omega():
+    """The factored builder exposes only the per-token (B,N,K,K) factors, never the dense Omega."""
+    from vfe3.geometry.transport import FactoredTransport, build_factored_transport
+    grp, phi, mu, sig = _block_inputs(3)
+    factored = build_factored_transport(phi, grp)
+    assert isinstance(factored, FactoredTransport)
+    assert factored.exp_phi.shape == (2, 5, 8, 8)
+    assert factored.exp_neg_phi.shape == (2, 5, 8, 8)
+    assert factored.irrep_dims == [4, 4]

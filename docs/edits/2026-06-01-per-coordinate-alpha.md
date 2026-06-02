@@ -1109,3 +1109,87 @@ Default (`unroll`) path byte-identical: the update lines are unchanged when the 
 `straight_through`, and no pre-existing test changed outcome (the unroll byte-identity gate). Full
 suite after the change: `tests=378 failures=0 errors=0 skipped=0` (read from junitxml; 367 baseline +
 11 new; 377 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
+
+## 2026-06-02 — Fuse the per-token exps, skip the dense (B,N,N,K,K) Omega on the flat path (P0 #2)
+
+Branch: vfe3-roadmap-overnight-2026-06-02 (committed directly).
+Recipe + verified equivalence: docs/perf/2026-05-31-speedup-opportunities.md, section "P0 #2".
+
+### What was fused
+
+The forward belief-transport hot path no longer materializes the dense `(B,N,N,K,K)` pairwise
+operator `Omega_ij = exp(phi_i) exp(-phi_j)` on the flat + block-diagonal-with-equal-blocks route.
+Instead the per-token vertex exponentials `exp_phi`/`exp_neg_phi` (each `(B,N,K,K)`) are carried in a
+`FactoredTransport` container, and the pairwise contraction is fused into the mean and per-head
+diagonal covariance:
+
+- Mean (EXACT reassociation): `m_j = exp(-phi_j) @ mu_j` once (`einsum("...jlp,...jp->...jl")`, no
+  i-dependence), then `mu_t[i,j] = exp(phi_i) @ m_j` (`einsum("...ikl,...jl->...ijk")`). Never forms
+  `(B,N,N,K,K)`. Round-off only.
+- Diagonal covariance (per-head block): does NOT factor by squaring the full exps (the square sits
+  inside the l-sum); it factors by BLOCK-DIAGONALITY. Per head h the `(d,d)` block
+  `Omega^(h)_ij = exp_phi^(h) exp_neg_phi^(h)` is the only nonzero part on head h's coordinates, so
+  `Sigma_t[i,j,k] = sum_l (Omega^(h)_ijkl)^2 sigma_jl` runs over head h only (off-block Omega entries
+  are exactly 0.0, courtesy of `_blockwise_matrix_exp`'s `zeros_like` fill). This materializes the
+  per-head `(B,N,N,d,d)` block Omega (H·d^2) instead of the full K^2 square. Exact w.r.t. the dense
+  diagonal sandwich.
+
+### The guard (what stays dense)
+
+`_can_fuse_flat(transport_mode, group)` returns True ONLY when `transport_mode == "flat"` AND
+`len(irrep_dims) > 1` AND all blocks are equal size — i.e. block_glk and tied_block_glk. Everything
+else keeps the dense `_transport` Omega exactly as before: regime_ii (its Omega is mu-dependent and
+carries the edge delta factor — must not be fused), single-block groups glk / so_k (`irrep_dims=[K]`),
+cross-coupled block_glk (also reports `irrep_dims=[K]`), and trivial gauge. A FULL-covariance sigma
+through the factored container rebuilds the dense Omega from the factors (`FactoredTransport.
+to_dense_omega`, byte-identical to `compute_transport_operators`' Omega einsum) and runs the unchanged
+sandwich, so the full-cov path is never the round-off factoring.
+
+### Equivalence oracle + magnitudes
+
+The factored quantities are pinned against `transport_mean`/`transport_covariance` on the explicit
+dense Omega (fixed-seed block_glk K=8/h=2 → [4,4]): factored mean vs dense mean max abs diff
+**9.5e-7** (one float32 ULP relative to the value scale ≈5.7, rel-to-scale 1.7e-7 — pure linear-
+contraction reassociation), factored diagonal cov vs dense diagonal cov **exactly 0.0**, full-cov
+rebuild **byte-identical** (`torch.equal`). The default-config frozen-forward oracle
+(`test_model_forward_matches_frozen_oracle`, `_FWD_LOSS=2.4851524830`, e_phi_lr=0.1, n_e_steps=2)
+exercises the fused kernel path and stays green within 1e-5; `test_batched_forward_equals_per_sample`
+stays green.
+
+### Which consumers are fused vs still dense
+
+The `FactoredTransport` container flows OPAQUELY through `belief_gradients` (kernels.py) and the
+autograd oracle (oracle.py) — those files were NOT edited; they only ever forward `omega` to
+`transport_mean`/`transport_covariance`, which gained the `isinstance(FactoredTransport)` fast path.
+The default filtering kernel (gaussian_diagonal + renyi α=1) and the smoothing-mode oracle both work
+through the container (the oracle's full-cov / smoothing routes rebuild the dense Omega from the
+factors on demand, byte-identical; verified by a smoothing-mode forward+backward with finite, nonzero
+prior-table grads). Left on the dense Omega by design (off the hot path, conscious skips, all
+byte-identical): the phi-objective `phi_alignment_loss` (only runs at e_phi_lr>0; the win is partial
+when φ is learned), the trajectory-diagnostic `free_energy_value`, the mixed-frame `_transport_qk`,
+and `model.diagnostics`. regime_ii and single-block / cross-coupled groups keep the dense Omega via
+`_transport` unchanged.
+
+### Memory / perf note
+
+The mean path forms no `(B,N,N,K,K)` tensor; the diagonal cov path materializes a per-head
+`(B,N,N,d,d)` block intermediate (H·d^2) instead of K^2. Peak transport memory stays O(B·N^2) (the
+outputs `mu_t`/`sigma_t` are themselves O(B·N^2·K) and unavoidable), but the fusion removes the
+dominant K^2 factor and the 838 MB dense-Omega forward+autograd-saved term — a large constant-factor
+cut that makes long context feasible (perf doc: ~13 GB → ~4 GB at N=512). Confirmed by execution that
+the default block_glk forward takes the factored route exclusively (no dense Omega built).
+
+### Files + tests
+
+`vfe3/geometry/transport.py`: new `FactoredTransport` dataclass (+ `to_dense_omega`),
+`build_factored_transport` (factors only, rank-agnostic via leading ellipsis), `transport_mean` /
+`transport_covariance` gain the container fast path, new `_factored_diagonal_covariance`.
+`compute_transport_operators` and the `"flat"` registry builder are UNCHANGED (their dense Omega and
+the `torch.equal` flat-builder oracle / frozen `_OMEGA_SUM` are preserved). `vfe3/inference/e_step.py`:
+new `_can_fuse_flat` guard and `build_belief_transport` (the hot-path selector — factored on
+flat+equal-block, dense `_transport` otherwise); `e_step_iteration` routes its forward transport
+through it. Tests: `tests/test_transport.py` (+4: factored mean / diagonal cov / full-cov rebuild /
+container-has-no-dense-Omega), `tests/test_perf_equivalence.py` (+5 guard correctness: block_glk and
+tied_block_glk fuse; glk / so_k single-block, regime_ii, and cross-coupled block_glk stay dense). Full
+suite after the change: `tests=387 failures=0 errors=0 skipped=0` (read from junitxml; 378 baseline +
+9 new = 4 + 5; 386 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
