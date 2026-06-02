@@ -1041,3 +1041,71 @@ off. The 362-test baseline (including the seeded fixed-seed regression and the p
 perf-equivalence golden tests) stays green. Full suite after the change:
 `tests=367 failures=0 errors=0 skipped=0` (read from junitxml; 362 baseline + 5 new; 366 passed +
 1 xpassed pre-existing; viz collected normally).
+
+## 2026-06-02 — Straight-through E-step gradient mode (roadmap Tier A item 3)
+
+Same running log. Branch: vfe3-roadmap-overnight-2026-06-02. Manuscript reference: Algorithm 1,
+GL(K)_attention.tex:2050 (detached per-iteration snapshots plus a LIVE additive chain, no second-order
+differentiation through the inner trajectory).
+
+### The three modes
+
+`e_step_gradient: str = "unroll"` selects the E-step BACKWARD estimator; it does not touch the forward.
+`unroll` (default) fully differentiates through the inner trajectory, keeping the second-order
+`d delta / d belief_prev` terms (the current path, untouched). `straight_through` computes each
+per-iteration tangent detached but rebuilds the belief grad-connected to the previous belief
+(`mu_next = mu_prev + delta.detach()`, `sigma_next = retract(sigma_prev, delta.detach())`), so
+`d belief_next / d belief_prev = I` flows WITHOUT the second-order term — the manuscript's
+detached-snapshot-plus-live-additive-chain estimator. The phi step was ALREADY straight-through
+(fresh detached `requires_grad_` leaf, `create_graph=False`, live `retract_phi`); this brings the
+mu/sigma updates to match it. `detach` runs the whole E-step under `torch.no_grad` (the legacy
+`detach_e_step=True` behavior — no E-step gradient at all).
+
+### Mechanism (the surgical edit)
+
+In `e_step_iteration`, AFTER `nat_mu, nat_sigma = natural_gradient(...)` and before the additive
+update: `if e_step_gradient == "straight_through": nat_mu, nat_sigma = nat_mu.detach(),
+nat_sigma.detach()`. Detaching the POST-natural-gradient tangents (not `grad_mu`/`grad_sigma`) is
+deliberate — `natural_gradient` reintroduces a live `belief.sigma` dependence (`nat_sigma = 2 sigma^2
+grad_sigma`), so detaching only the raw gradients would leak a second-order term through the Fisher
+metric. The mode is NOT realized by a `no_grad` wrapper around the delta computation, because on any
+non-default config the delta routes to `belief_gradients_autograd`, which calls `torch.autograd.grad`
+and REQUIRES grad enabled (the oracle has no `enable_grad` island of its own). When the mode is not
+`straight_through` the two update lines are byte-for-byte the prior code, so unroll byte-identity is
+automatic and `.detach()` never alters a number, so the forward VALUE is unchanged.
+
+### Reconciliation with detach_e_step
+
+The EFFECTIVE mode is a config property `effective_e_step_gradient`: `"detach"` when
+`detach_e_step=True` (back-compat — the existing detach_e_step tests still pass), else
+`e_step_gradient`. `detach_e_step=True` with a non-`unroll` `e_step_gradient` is contradictory and
+raises in `__post_init__`. Default (`unroll` + `detach_e_step=False`) is the current fully-unrolled
+path, byte-identical. `model.forward` gates `run = torch.no_grad()` on `effective == "detach"` (was
+`self.cfg.detach_e_step`) and threads the effective mode down `vfe_stack -> vfe_block -> e_step ->
+e_step_iteration`. The mode is an EXPLICIT keyword of `e_step` (not in `**kwargs`) so it binds there
+and never rides the forwarded knob bag into the diagnostic `free_energy_value` (which rejects unknown
+kwargs).
+
+### Oracles + tests (TDD, watched RED then GREEN)
+
+`tests/test_straight_through.py` (11 new). Config validation: `test_config_accepts_the_three_modes`,
+`test_config_rejects_unknown_mode`, `test_config_default_is_unroll`,
+`test_config_detach_e_step_true_implies_detach_effective`,
+`test_config_contradictory_detach_plus_nonunroll_raises`, `test_config_effective_mode_passthrough`.
+The forward-identity oracle (the strong independent check):
+`test_straight_through_forward_byte_identical_to_unroll` asserts `torch.equal` on logits/loss/ce
+between unroll and straight_through (same state_dict) — straight_through only changes the BACKWARD.
+`test_detach_forward_byte_identical_to_detach_e_step_true` pins `detach` == legacy `detach_e_step=True`
+forward. Gradient behavior: `test_straight_through_grad_flows_to_encode_tables` (finite, nonzero
+`mu_embed.grad`/`sigma_log_embed.grad` after backward); `test_straight_through_grad_differs_from_unroll`
+(the grad-differs oracle — with `e_mu_lr>0`, `e_sigma_lr>0`, `n_e_steps=2` the `mu_embed.grad` is NOT
+allclose between estimators, since unroll keeps the dropped second-order term);
+`test_detach_grad_matches_detach_e_step_true` (`detach` reproduces `detach_e_step=True` backward,
+`atol=0`; phi prior frozen under both).
+
+### Default byte-identity + suite
+
+Default (`unroll`) path byte-identical: the update lines are unchanged when the mode is not
+`straight_through`, and no pre-existing test changed outcome (the unroll byte-identity gate). Full
+suite after the change: `tests=378 failures=0 errors=0 skipped=0` (read from junitxml; 367 baseline +
+11 new; 377 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).

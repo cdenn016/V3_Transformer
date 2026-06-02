@@ -203,11 +203,18 @@ class VFEModel(nn.Module):
         # E-step like log_alpha so the loss backpropagates to it; getattr keeps the flat path's call
         # identical (None forwards a defaulted kwarg the flat builder ignores).
         connection_W = getattr(self, "connection_W", None)
-        run = torch.no_grad() if self.cfg.detach_e_step else nullcontext()
+        # E-step backward estimator. The EFFECTIVE mode reconciles the legacy detach_e_step bool
+        # with e_step_gradient (cfg.effective_e_step_gradient): 'detach' wraps the whole E-step in
+        # no_grad (the legacy detach_e_step=True path); 'unroll' (default) and 'straight_through'
+        # both run grad-enabled and thread the mode down to e_step_iteration, which only changes the
+        # mu/sigma backward (straight_through detaches the per-iteration tangent; unroll keeps the
+        # second-order term). Forward VALUE is identical across unroll/straight_through.
+        e_step_gradient = self.cfg.effective_e_step_gradient
+        run = torch.no_grad() if e_step_gradient == "detach" else nullcontext()
         with run:
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm, log_alpha=log_alpha,
-                            connection_W=connection_W)
+                            connection_W=connection_W, e_step_gradient=e_step_gradient)
         mu_final = out.mu                                        # (B, N, K)
         sigma_final = out.sigma
 

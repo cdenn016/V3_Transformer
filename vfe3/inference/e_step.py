@@ -210,6 +210,7 @@ def e_step_iteration(
     phi_retract_mode:          str  = "euclidean",
     spd_retract_mode:          str  = "spd_affine",
     transport_mode:            str  = "flat",
+    e_step_gradient:           str  = "unroll",               # backward estimator: unroll | straight_through | detach
     cocycle_relaxation:        float = 1.0,                    # regime_ii homotopy alpha; 0 -> flat (ignored by flat)
 
     log_prior:                 Optional[torch.Tensor] = None,
@@ -243,6 +244,18 @@ def e_step_iteration(
         irrep_dims=group.irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
     )
     nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
+
+    # STRAIGHT-THROUGH (manuscript Algorithm 1, GL(K)_attention.tex:2050): detach the per-iteration
+    # tangent so only the ADDITIVE chain stays live -- the belief is rebuilt as mu_prev + delta and
+    # retract(sigma_prev, delta) below, giving d belief_next/d belief_prev = I WITHOUT the
+    # second-order d delta/d belief_prev term the unrolled path keeps. The tangent is detached AFTER
+    # natural_gradient (which reintroduces a live belief.sigma dependence), not at grad_mu/grad_sigma,
+    # so no second-order term leaks through the Fisher metric. 'unroll' (and the no_grad-wrapped
+    # 'detach') leave nat_mu/nat_sigma untouched, so those lines are byte-identical to before and the
+    # forward VALUE is unchanged (detach never alters a number). This mirrors the phi step, which is
+    # already straight-through (fresh detached leaf, create_graph=False).
+    if e_step_gradient == "straight_through":
+        nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
 
     mu = belief.mu - e_mu_lr * nat_mu
     # The registered SPD retraction owns the diagonal-vs-full rank decision internally (full cov iff
@@ -289,13 +302,21 @@ def e_step(
     e_sigma_lr:        float = 0.1,
     e_phi_lr:          float = 0.1,
     return_trajectory: bool  = False,
+    e_step_gradient:   str   = "unroll",
 
     log_prior:         Optional[torch.Tensor] = None,
     **kwargs,
 ) -> 'BeliefState | Tuple[BeliefState, List[float]]':
     r"""Iterate ``e_step_iteration`` ``n_iter`` times (parallel mean-field). Optionally
     returns the global-F trajectory (a DIAGNOSTIC; parallel updates are not guaranteed
-    monotone per iteration)."""
+    monotone per iteration).
+
+    ``e_step_gradient`` is the backward estimator forwarded to each iteration: 'unroll' (default,
+    full second-order trajectory gradient) or 'straight_through' (per-iteration tangent detached,
+    additive chain live). It is an EXPLICIT keyword (not in ``**kwargs``) so it binds here and does
+    NOT ride the forwarded knob bag into the diagnostic ``free_energy_value`` (which rejects unknown
+    kwargs). 'detach' is realized by the caller wrapping this in no_grad, so it is treated as
+    'unroll' here (no_grad already severs every gradient)."""
     traj: List[float] = []
 
     def _f_diag(b: BeliefState) -> float:
@@ -309,7 +330,8 @@ def e_step(
     for _ in range(n_iter):
         belief = e_step_iteration(
             belief, mu_p, sigma_p, group, tau=tau,
-            e_mu_lr=e_mu_lr, e_sigma_lr=e_sigma_lr, e_phi_lr=e_phi_lr, log_prior=log_prior, **kwargs,
+            e_mu_lr=e_mu_lr, e_sigma_lr=e_sigma_lr, e_phi_lr=e_phi_lr,
+            e_step_gradient=e_step_gradient, log_prior=log_prior, **kwargs,
         )
         if return_trajectory:
             traj.append(_f_diag(belief))

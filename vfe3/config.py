@@ -19,6 +19,7 @@ _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "p
 _VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
 _VALID_ATTENTION_PRIORS    = ("uniform", "causal", "alibi")
 _VALID_NORMS               = ("none", "mahalanobis")
+_VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
 
 
 @dataclass
@@ -138,6 +139,23 @@ class VFE3Config:
     norm_type_final:           str   = "none"
 
     # M-step / training
+    # E-step backward estimator (manuscript Algorithm 1, GL(K)_attention.tex:2050). Three modes:
+    #   'unroll'          (default): fully differentiate through the inner trajectory -- the
+    #                     gradient keeps the second-order d delta/d belief_prev terms.
+    #   'straight_through': each inner update computes its tangent DETACHED but rebuilds the
+    #                     belief grad-connected to the previous belief (mu_next = mu_prev +
+    #                     delta.detach(), sigma_next = retract(sigma_prev, delta.detach())), so
+    #                     d belief_next/d belief_prev = I flows WITHOUT the second-order term --
+    #                     the manuscript's detached-snapshot-plus-live-additive-chain estimator
+    #                     (the phi step is already straight-through; this matches it for mu/sigma).
+    #                     Forward VALUE is byte-identical to 'unroll'; only the BACKWARD differs.
+    #   'detach'          : the whole E-step under torch.no_grad (the legacy detach_e_step=True
+    #                     behavior) -- no E-step gradient at all.
+    # Reconciled with detach_e_step: the EFFECTIVE mode is 'detach' when detach_e_step=True
+    # (back-compat), else e_step_gradient. detach_e_step=True with a non-'unroll' e_step_gradient
+    # is contradictory and raises in __post_init__. The default (unroll + detach_e_step=False) is
+    # the current fully-unrolled path, byte-identical.
+    e_step_gradient:           str   = "unroll"
     detach_e_step:             bool  = False        # False = unroll E-step in the training graph
     m_mu_lr:                   float = 0.025
     m_sigma_lr:                float = 0.0025
@@ -367,6 +385,19 @@ class VFE3Config:
         _require(self.norm_type_final, _VALID_NORMS, "norm_type_final")
 
         # M-step / training
+        # e_step_gradient selects the E-step backward estimator (unroll | straight_through |
+        # detach). Reconciled with the legacy detach_e_step bool WITHOUT breaking it: the
+        # EFFECTIVE mode is 'detach' when detach_e_step=True (back-compat), else e_step_gradient
+        # (see effective_e_step_gradient). detach_e_step=True with a non-'unroll' e_step_gradient
+        # asks for two different things at once, so reject it at construction.
+        _require(self.e_step_gradient, _VALID_E_STEP_GRADIENTS, "e_step_gradient")
+        if self.detach_e_step and self.e_step_gradient != "unroll":
+            raise ValueError(
+                f"detach_e_step=True is contradictory with e_step_gradient="
+                f"{self.e_step_gradient!r}: detach_e_step already forces the effective mode to "
+                f"'detach'. Set detach_e_step=False and use e_step_gradient to select the mode, "
+                f"or leave e_step_gradient='unroll'."
+            )
         for name in ("m_mu_lr", "m_sigma_lr", "m_phi_lr", "weight_decay"):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
@@ -398,6 +429,17 @@ class VFE3Config:
     def d_head(self) -> int:
         """Per-head belief dimension K // n_heads."""
         return self.embed_dim // self.n_heads
+
+    @property
+    def effective_e_step_gradient(self) -> str:
+        """The E-step backward estimator actually used, reconciling detach_e_step.
+
+        detach_e_step=True forces 'detach' (the legacy whole-E-step-under-no_grad behavior);
+        otherwise the chosen e_step_gradient ('unroll' | 'straight_through' | 'detach') applies.
+        The contradictory pair (detach_e_step=True with non-'unroll' e_step_gradient) is rejected
+        in __post_init__, so this never silently overrides a meaningful e_step_gradient.
+        """
+        return "detach" if self.detach_e_step else self.e_step_gradient
 
 
 def _require(value: str, valid: tuple, name: str) -> None:
