@@ -108,3 +108,89 @@ def family_cov_kind(name: str) -> str:
 def divergence_families() -> Tuple[str, ...]:
     r"""Registered family names (the valid ``family`` config values)."""
     return tuple(sorted(_FAMILIES))
+
+
+_FUNCTIONALS: Dict[str, Callable] = {}
+
+
+def register_functional(name: str) -> Callable:
+    r"""Register a divergence functional (renyi, ...) under ``name`` (the ``divergence_family``)."""
+    def _wrap(fn: Callable) -> Callable:
+        _FUNCTIONALS[name] = fn
+        return fn
+    return _wrap
+
+
+def get_functional(name: str) -> Callable:
+    r"""The registered divergence functional for ``name`` (KeyError if absent)."""
+    if name not in _FUNCTIONALS:
+        raise KeyError(f"no functional registered under {name!r}; available: {sorted(_FUNCTIONALS)}")
+    return _FUNCTIONALS[name]
+
+
+def _renyi_from_log_partition(
+    q:       BeliefParams,
+    p:       BeliefParams,
+
+    *,
+    alpha:   float,
+    kl_max:  float,
+    eps:     float,
+) -> torch.Tensor:
+    r"""Generic Renyi/KL from the log-partition (for families with no closed form).
+
+    alpha != 1:  R = 1/(alpha-1) [ A(alpha*tq + (1-alpha)*tp) - alpha*A(tq) - (1-alpha)*A(tp) ].
+    alpha == 1:  KL = A(tp) - A(tq) - <gradA(tq), tp - tq>, gradA(tq) = E_q[T] (expected_statistic).
+    """
+    cls = type(q)
+    tq = q.natural()
+    tp = p.natural()
+    if abs(alpha - 1.0) < 1e-6:
+        grad = q.expected_statistic()                       # E_q[T] = gradA(theta_q)
+        inner = sum(((g * (b - a)).sum(dim=-1) for g, a, b in zip(grad, tq, tp)))
+        div = cls.log_partition_at(tp) - cls.log_partition_at(tq) - inner
+    else:
+        blend = tuple(alpha * a + (1.0 - alpha) * b for a, b in zip(tq, tp))
+        div = (cls.log_partition_at(blend)
+               - alpha * cls.log_partition_at(tq)
+               - (1.0 - alpha) * cls.log_partition_at(tp)) / (alpha - 1.0)
+    return safe_kl_clamp(div, kl_max=kl_max)
+
+
+def renyi(
+    q:       BeliefParams,
+    p:       BeliefParams,
+
+    *,
+    alpha:   float = 1.0,
+    kl_max:  float = 100.0,
+    eps:     float = 1e-6,
+) -> torch.Tensor:
+    r"""Renyi alpha-divergence D_alpha(q || p) between two parameter objects (KL at alpha=1).
+
+    Uses ``q.renyi_closed_form`` when the family provides one (the pinned Gaussian moment
+    form); otherwise the generic Bregman/Renyi-from-A path.
+    """
+    if alpha <= 0.0:
+        raise ValueError(f"alpha must be positive, got {alpha}")
+    if alpha > 1.0:
+        _warn_alpha_gt_one(alpha, type(q).__name__)
+    closed = getattr(q, "renyi_closed_form", None)
+    if closed is not None:
+        return closed(p, alpha=alpha, kl_max=kl_max, eps=eps)
+    return _renyi_from_log_partition(q, p, alpha=alpha, kl_max=kl_max, eps=eps)
+
+
+def kl(
+    q:       BeliefParams,
+    p:       BeliefParams,
+
+    *,
+    kl_max:  float = 100.0,
+    eps:     float = 1e-6,
+) -> torch.Tensor:
+    r"""KL(q || p) = Renyi at alpha = 1."""
+    return renyi(q, p, alpha=1.0, kl_max=kl_max, eps=eps)
+
+
+register_functional("renyi")(renyi)
