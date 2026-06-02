@@ -11,7 +11,7 @@ family slots in behind -- by writing-and-registering a subclass, never editing c
 
 import warnings
 from abc import ABC, abstractmethod
-from typing import Callable, ClassVar, Dict, Tuple, Type
+from typing import Callable, ClassVar, Dict, List, Tuple, Type
 
 import torch
 
@@ -101,6 +101,19 @@ class BeliefParams(ABC):
             f"{type(self).__name__} has no renyi_closed_form and does not override "
             f"expected_statistic, which the generic KL (alpha=1) path requires (it is gradA, "
             f"the mean of the sufficient statistics). Provide either method."
+        )
+
+    @classmethod
+    def stack(cls, parts: List["BeliefParams"], *, dim: int = 0) -> "BeliefParams":
+        r"""Stack a list of same-family parts into one ``BeliefParams`` along a NEW axis ``dim``,
+        stacking each underlying tensor of the parts. Family-agnostic batching primitive: a single
+        functional call over the stacked axis then computes every part's divergence at once (used by
+        ``pairwise_energy`` to batch the per-irrep-block loop). Not abstract -- a family that never
+        takes the batched path need not override it. Overriding is required only to batch."""
+        raise NotImplementedError(
+            f"{cls.__name__} does not override stack, the family-agnostic batching primitive "
+            f"(stack each part's underlying tensor along a new axis). Provide it to batch the "
+            f"per-block loop."
         )
 
 

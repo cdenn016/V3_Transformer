@@ -687,3 +687,55 @@ New `tests/test_belief.py` (6 tests): `test_three_field_construction_and_attribu
 `test_both_extra_channels_round_trip`. RED first (4 of 6 failed before the field add), then GREEN.
 Full suite after the change: `tests=327 failures=0 errors=0 skipped=0` (read from junitxml; 321
 baseline + 6 new; 326 passed + 1 xpassed pre-existing).
+
+## 2026-06-02 — Batched per-head `pairwise_energy` over equal irrep blocks (bit-identical)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. A perf refactor of `pairwise_energy`'s per-irrep-block
+loop; no formula change.
+
+### What changed
+`vfe3/free_energy.py`: when the irrep blocks are EQUAL size and more than one (the default
+`block_glk` case), the H per-block divergences -- the same functional over H disjoint coordinate
+slices -- are now computed in ONE functional call instead of a Python `for`-loop of per-block calls.
+The H equal blocks of the broadcast query and the transported key are sliced and stacked along a NEW
+LEADING axis (`type(q_b).stack(...)`, `type(key).stack(...)`), the functional is invoked once over
+that stacked head axis producing `(H, ..., N, N)`, and `torch.movedim(e, 0, -3)` moves the head axis
+to position `-3` to match the loop's `torch.stack(energies, dim=-3)` layout `(..., H, N, N)` exactly.
+The unequal-block path and the single-block/`None` path keep the existing loop / direct call.
+
+`vfe3/families/base.py`, `vfe3/families/gaussian.py`: a family-agnostic batching primitive
+`BeliefParams.stack(parts, *, dim=0)` -- a concrete classmethod that raises `NotImplementedError`
+(mirroring `expected_statistic`, so the toy subclasses in `test_families.py` still instantiate), with
+`DiagonalGaussian`/`FullGaussian` overrides that `torch.stack` the underlying `mu`/`sigma` tensors.
+
+### The bit-identical oracle and the unequal-block fallback
+Stacking plus one functional call is the SAME arithmetic in a different layout (every op in the
+closed forms is elementwise / last-axis-sum / last-two-axis Cholesky/solve/diagonal, no cross-head
+interaction; `movedim` is a pure permutation), so the batched output is `torch.equal` (atol=0) to the
+explicit per-block loop for both `DiagonalGaussian` and `FullGaussian`. The new tests recompute the
+loop reference in-test and assert `torch.equal`. The default `block_glk` (equal heads) now takes the
+batched path and the frozen-oracle / model / e_step / per-head-attention tests stay bit-for-bit green
+-- the full suite is the real bit-identity gate.
+
+The equal-block branch is guarded (`_stackable_for_batching`) so it fires ONLY when stacking does not
+perturb the mu/sigma broadcast: the misclassified case where `sigma` carries a leading batch dim `mu`
+lacks (Gaussian canonical rank is sigma == mu for diagonal, mu+1 for full) would right-align the new
+head axis against sigma's first batch dim and broadcast spuriously, so it falls back to the loop. A
+family that does not expose mu/sigma tensors also falls back. Unequal block sizes fall back to the
+loop. Every fallback is bit-identical to the loop because it IS the loop.
+
+### Tests (8 new)
+`tests/test_families.py`: `test_diagonal_stack_round_trips`, `test_full_stack_round_trips` (the genuine
+RED-first pair -- `stack` missing -> `AttributeError` before the override, GREEN after).
+`tests/test_free_energy.py`: `test_pairwise_energy_equal_blocks_batched_is_bit_identical_to_loop_diagonal`,
+`..._full`, `..._with_leading_batch_dim` (the `(B,N,K)` training layout -> `(B,H,N,N)`),
+`test_pairwise_energy_unequal_blocks_fall_back_to_loop`,
+`test_pairwise_energy_single_block_and_none_unchanged`,
+`test_pairwise_energy_equal_blocks_mismatched_sigma_rank_falls_back_to_loop` (pins the guard). These
+six `pairwise_energy` tests are characterization/guard tests -- green before AND after, since the
+pre-refactor `pairwise_energy` IS the loop -- recomputing the loop in-test and asserting `torch.equal`
+against the (now batched) implementation. The pre-existing `test_pairwise_energy_per_head_splits_by_
+irrep_block` (`irrep_dims=[2,2]`, equal) now routes through the batched path as a free extra guard.
+
+Full suite after the change: `tests=335 failures=0 errors=0 skipped=0` (read from junitxml; 327
+baseline + 8 new; 334 passed + 1 xpassed pre-existing; viz collected normally).
