@@ -4,6 +4,8 @@ import torch
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.transport import (
     compute_transport_operators,
+    get_transport,
+    register_transport,
     transport_covariance,
     transport_mean,
 )
@@ -128,3 +130,50 @@ def test_transport_covariance_full_matches_explicit_matmul():
     i, j = 0, 1
     ref = omega[0, i, j] @ sigma[0, j] @ omega[0, i, j].transpose(-1, -2)
     assert torch.allclose(got[0, i, j], ref, atol=1e-5)
+
+
+# --- register_transport / get_transport seam (roadmap; connection-regime axis) ---
+def test_transport_registry_round_trip():
+    """register_transport/get_transport round-trip and the unknown-name KeyError."""
+    sentinel = object()
+
+    @register_transport("_test_dummy_transport")
+    def _dummy(*args, **kwargs):
+        return sentinel
+
+    try:
+        assert get_transport("_test_dummy_transport")() is sentinel
+        with pytest.raises(KeyError):
+            get_transport("nope")
+    finally:
+        from vfe3.geometry.transport import _TRANSPORTS
+        _TRANSPORTS.pop("_test_dummy_transport", None)
+
+
+def test_flat_is_registered():
+    """The default flat (Regime I) phi-cocycle builder is registered under 'flat'."""
+    assert callable(get_transport("flat"))
+
+
+def test_flat_builder_bit_identical_to_direct_call():
+    """The 'flat' builder's TransportDict is bit-identical (torch.equal) to a direct
+    ``compute_transport_operators(phi, group)`` call on a fixed-seed phi."""
+    grp = get_group("so_k")(K=4)
+    g = torch.Generator().manual_seed(77)
+    phi = 0.3 * torch.randn(2, 3, grp.generators.shape[0], generator=g)
+    direct = compute_transport_operators(phi, grp)
+    seam = get_transport("flat")(phi, grp, gauge_mode="learned")
+    assert set(seam) == set(direct)
+    for key in ("Omega", "exp_phi", "exp_neg_phi"):
+        assert torch.equal(seam[key], direct[key])
+
+
+def test_flat_builder_tolerates_extra_kwargs():
+    """The 'flat' adapter swallows unknown kwargs (so a future stateful non-flat builder
+    can share the call shape) without changing its output."""
+    grp = get_group("so_k")(K=4)
+    g = torch.Generator().manual_seed(78)
+    phi = 0.3 * torch.randn(1, 2, grp.generators.shape[0], generator=g)
+    direct = compute_transport_operators(phi, grp)
+    seam = get_transport("flat")(phi, grp, gauge_mode="learned", connection_state=object())
+    assert torch.equal(seam["Omega"], direct["Omega"])

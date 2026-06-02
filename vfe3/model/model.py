@@ -37,13 +37,22 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
     r"""Construct the gauge group from config, dispatching on the builder's positional
     arity so a newly registered group slots in by ``register_group`` alone (no call-site
     edit). Arity 1 -> ``builder(K)`` (glk, so_k); arity 2 -> ``builder(K, n_heads)``
-    (block_glk). Higher arities are an unsupported registration error."""
+    (block_glk). Higher arities are an unsupported registration error.
+
+    ``cfg.cross_couplings`` (off-block GL(K) head coupling) is forwarded as a keyword only
+    when set AND the selected builder accepts it (block_glk); otherwise the call is the bare
+    positional dispatch, so the default (``cross_couplings=None``) path produces the SAME group
+    object as before (byte-identical). Config validation already rejects cross_couplings against
+    a builder that does not accept the kwarg, so this is the forwarding seam, not a second guard."""
     builder = get_group(cfg.gauge_group)
     arity = _positional_arity(builder)
+    kwargs: dict = {}
+    if cfg.cross_couplings is not None and "cross_couplings" in inspect.signature(builder).parameters:
+        kwargs["cross_couplings"] = cfg.cross_couplings
     if arity == 1:
-        return builder(cfg.embed_dim)
+        return builder(cfg.embed_dim, **kwargs)
     if arity == 2:
-        return builder(cfg.embed_dim, cfg.n_heads)
+        return builder(cfg.embed_dim, cfg.n_heads, **kwargs)
     raise ValueError(
         f"gauge group {cfg.gauge_group!r} builder has unsupported positional arity {arity}; "
         f"build_group dispatches K (arity 1) or (K, n_heads) (arity 2)"
@@ -174,7 +183,90 @@ class VFEModel(nn.Module):
             # phi_alignment_loss), shaping the inference trajectory. Both roles are in the
             # manuscript algorithm (E-step phi gradient and M-step loss both carry alpha_phi/2||phi||^2).
             loss = loss + 0.5 * self.cfg.mass_phi * (out.phi ** 2).mean()
+        if self.cfg.mstep_self_coupling_weight > 0.0:
+            # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2083):
+            # L += alpha_hat * sum_i KL(q_i*||p_i), the mean self-divergence of the CONVERGED belief
+            # (out.mu/out.sigma, BEFORE head_mixer/norm) vs the per-block prior. Opt-in, default-off
+            # (weight 0 -> byte-identical to the pure path). Grad-connected (no detach), so it
+            # backprops to the learned prior tables, like mass_phi. The last-block prior is rebuilt
+            # by mirroring vfe_stack's prior_handoff fold; EXACT at n_layers=1 (loop empty -> p =
+            # encode belief), an approximation otherwise (one converged belief stands in for the
+            # per-block intermediates), matching diagnostics().
+            from vfe3.families import get_family
+            from vfe3.free_energy import self_divergence_for_alpha
+            cfg = self.cfg
+            rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
+            mu_p, sigma_p = beliefs.mu, beliefs.sigma
+            for _ in range(cfg.n_layers - 1):
+                mu_p = (1.0 - rho) * mu_p + rho * out.mu
+                sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
+            fam = get_family(cfg.family)
+            sc = self_divergence_for_alpha(
+                fam(out.mu, out.sigma), fam(mu_p, sigma_p),
+                alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
+            ).mean()
+            loss = loss + cfg.mstep_self_coupling_weight * sc
         return logits, loss, ce.detach()
+
+    @torch.no_grad()
+    def generate(
+        self,
+        token_ids:      torch.Tensor,        # (B, N0) prompt token ids
+
+        max_new_tokens: int,
+
+        *,
+        temperature:    float          = 1.0,    # >0; applied to logits before sampling; ignored if greedy
+        top_k:          Optional[int]   = None,  # keep the k largest-logit tokens, -inf the rest
+        top_p:          Optional[float] = None,  # nucleus: smallest set with softmax cumsum >= p
+        greedy:         bool           = False,  # True -> argmax; ignores temperature/top_k/top_p
+    ) -> torch.Tensor:                       # (B, N0 + max_new_tokens) prompt followed by generated ids
+        r"""Autoregressively extend each prompt by ``max_new_tokens`` tokens.
+
+        Reuses :meth:`forward` (``targets=None`` -> logits ``(B, N, V)``): each step
+        feeds the running sequence -- TRUNCATED to the last ``cfg.max_seq_len`` tokens,
+        since the model and its attention prior are built for ``N <= max_seq_len`` --
+        through ``forward``, reads the last-position logits ``logits[:, -1, :]``, turns
+        them into a next token, and appends it. The returned sequence keeps the FULL
+        prompt (including any portion beyond ``max_seq_len``) followed by the generated
+        ids. Because it only calls ``forward`` and never the training/loss branch, it
+        cannot corrupt training (runs under ``torch.no_grad``).
+
+        Greedy (``greedy=True``) takes the argmax and ignores ``temperature``/``top_k``/
+        ``top_p``. Otherwise the logits are divided by ``temperature``, then ``top_k``
+        (keep the k largest, ``-inf`` the rest), then ``top_p`` (nucleus: smallest set
+        whose softmax cumsum reaches ``p``, ``-inf`` the rest, always keeping the top
+        token), then softmaxed and sampled with :func:`torch.multinomial`.
+
+        This is the correct-but-slow first version: it re-runs the FULL forward (encode
+        -> E-step -> decode) for every generated token. Incremental belief reuse across
+        steps is a future optimization.
+        """
+        seq = token_ids
+        for _ in range(max_new_tokens):
+            context = seq[:, -self.cfg.max_seq_len:]                 # (B, <=max_seq_len)
+            logits = self.forward(context)                          # (B, n, V)
+            logits = logits[:, -1, :]                               # (B, V) last position
+            if greedy:
+                next_token = logits.argmax(dim=-1, keepdim=True)    # (B, 1)
+            else:
+                logits = logits / temperature
+                if top_k is not None:
+                    kth = logits.topk(top_k, dim=-1).values[:, -1:]  # (B, 1) k-th largest
+                    logits = logits.masked_fill(logits < kth, float("-inf"))
+                if top_p is not None:
+                    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+                    cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                    # Keep the smallest nucleus whose cumprob reaches top_p; the strict
+                    # shift always keeps the top token (its cumprob>=p never removes it).
+                    remove = cumprobs - sorted_logits.softmax(dim=-1) >= top_p
+                    remove_unsorted = remove.scatter(-1, sorted_idx, remove)
+                    logits = logits.masked_fill(remove_unsorted, float("-inf"))
+                probs = logits.softmax(dim=-1)                      # (B, V)
+                next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            seq = torch.cat([seq, next_token], dim=-1)
+        return seq
 
     @torch.no_grad()
     def diagnostics(

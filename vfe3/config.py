@@ -7,7 +7,7 @@ variant swaps without editing call sites.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Tuple
 
 _VALID_DIVERGENCE_FUNCTIONALS = ("renyi",)
 _VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k")
@@ -52,6 +52,16 @@ class VFE3Config:
     # gauge seam
     gauge_group:               str   = "block_glk"
     gauge_parameterization:    str   = "phi"
+    # Connection REGIME (registry key): the flat Regime-I phi-cocycle ('flat', default = current
+    # behavior) vs the design-spec'd non-flat Regime II (deferred). ORTHOGONAL to
+    # gauge_parameterization, which picks how a single flat transport is parameterized; this picks
+    # whether the connection is flat at all. Validated against the transport registry below.
+    transport_mode:            str   = "flat"
+    # Cross-head GL(K) coupling: a list of directed (head_a, head_b) index pairs that add off-block
+    # generators (and a genuinely larger-than-direct-sum subalgebra under the builder's bracket
+    # closure) to the gauge basis. Default None = the current block-diagonal GL(d_head)^H gauge.
+    # Only a group whose builder accepts the kwarg (block_glk) supports it; validated below.
+    cross_couplings:           Optional[List[Tuple[int, int]]] = None
 
     # head mixer (opt-in, default off): a learned Schur-commutant matrix mixes the equal-size
     # gauge-irrep blocks (under block_glk: the n_heads heads) of the converged belief. Identity
@@ -72,6 +82,7 @@ class VFE3Config:
     c0:                        float = 1.0          # state-dependent alpha shape (numerator)
     kappa:                     float = 1.0          # temperature tau = kappa * sqrt(K)
     mass_phi:                  float = 0.0          # (mass_phi/2) ||phi||^2 penalty
+    mstep_self_coupling_weight: float = 0.0         # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
 
     # attention
     include_attention_entropy: bool  = True         # canonical (True) vs surrogate (False)
@@ -86,6 +97,7 @@ class VFE3Config:
     gradient_mode:             str   = "filtering"
     phi_precond_mode:          str   = "none"
     phi_retract_mode:          str   = "euclidean"  # Lie-algebra step chart: euclidean (sum) or bch
+    spd_retract_mode:          str   = "spd_affine" # SPD covariance retraction geometry (registry key)
 
     # decode / encode
     use_prior_bank:            bool  = True
@@ -146,6 +158,13 @@ class VFE3Config:
         # gauge seam
         _require(self.gauge_group, _VALID_GAUGE_GROUPS, "gauge_group")
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
+        # transport_mode selects the connection REGIME. Validated against the transport REGISTRY
+        # (not a hardcoded literal list) so a newly registered regime is a valid config value
+        # without editing this validator. Default 'flat' is the Regime-I phi-cocycle (the pure path
+        # always exists); Regime II is design-spec'd and deferred. Local import avoids a
+        # config <- transport <- groups import cycle (matching the retraction pattern below).
+        from vfe3.geometry.transport import _TRANSPORTS
+        _require(self.transport_mode, tuple(sorted(_TRANSPORTS)), "transport_mode")
         # 'omega_direct' (Omega_ij = Omega_i Omega_j^{-1} for general GL(K), det possibly < 0)
         # needs a per-token K x K group element Omega_i. The no-NN belief carries only phi
         # (n_gen Lie-algebra coords), from which the only constructible Omega_i is exp(embed(phi_i))
@@ -159,6 +178,40 @@ class VFE3Config:
                 "but the no-NN belief carries only phi (Lie-algebra coords); exp(phi) reduces it to "
                 "the 'phi' path. Use 'phi'."
             )
+        # cross_couplings (off-block GL(K) head coupling) is supported only by a group builder that
+        # accepts the kwarg (block_glk). Reject otherwise (glk / so_k / tied_block_glk) by inspecting
+        # the registered builder's signature, not a hardcoded name list, so support tracks the
+        # builders. Each pair must be distinct in-range directed head indices. Local imports avoid a
+        # config <- groups <- closure import cycle (matching the divergence / alpha_i / retraction
+        # pattern below).
+        if self.cross_couplings is not None:
+            import inspect
+            from vfe3.geometry.groups import get_group
+            builder = get_group(self.gauge_group)
+            if "cross_couplings" not in inspect.signature(builder).parameters:
+                raise ValueError(
+                    f"cross_couplings is not supported by gauge_group={self.gauge_group!r} (its "
+                    f"builder does not accept the kwarg); use 'block_glk', or leave cross_couplings "
+                    f"None"
+                )
+            if not isinstance(self.cross_couplings, list):
+                raise ValueError(
+                    f"cross_couplings must be a list of (int, int) head pairs, got "
+                    f"{type(self.cross_couplings).__name__}"
+                )
+            for pair in self.cross_couplings:
+                if (not isinstance(pair, tuple) or len(pair) != 2
+                        or not all(isinstance(x, int) for x in pair)):
+                    raise ValueError(
+                        f"each cross_couplings entry must be an (int, int) head pair, got {pair!r}"
+                    )
+                a, b = pair
+                if a == b:
+                    raise ValueError(f"cross_couplings self-coupling ({a},{a}) not allowed (a != b)")
+                if not (0 <= a < self.n_heads and 0 <= b < self.n_heads):
+                    raise ValueError(
+                        f"cross_couplings head indices ({a},{b}) out of range [0, {self.n_heads})"
+                    )
 
         # belief family. ``family`` selects the covariance-structure divergence kernel
         # (gaussian_diagonal | gaussian_full). ``divergence_family`` is the SEPARATE functional
@@ -183,6 +236,10 @@ class VFE3Config:
             raise ValueError(f"kappa must be positive, got {self.kappa}")
         if self.mass_phi < 0.0:
             raise ValueError(f"mass_phi must be >= 0, got {self.mass_phi}")
+        if self.mstep_self_coupling_weight < 0.0:
+            raise ValueError(
+                f"mstep_self_coupling_weight must be >= 0, got {self.mstep_self_coupling_weight}"
+            )
         for name in ("b0", "c0"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
@@ -210,6 +267,12 @@ class VFE3Config:
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         _require(self.phi_precond_mode, _VALID_PHI_PRECOND_MODES, "phi_precond_mode")
         _require(self.phi_retract_mode, _VALID_PHI_RETRACT_MODES, "phi_retract_mode")
+        # spd_retract_mode selects the SPD covariance retraction geometry. Validated against the
+        # retraction REGISTRY (not a hardcoded literal list) so a newly registered retraction is a
+        # valid config value without editing this validator. Default 'spd_affine' is the
+        # manuscript-canonical affine-invariant exponential map (the pure path always exists).
+        from vfe3.geometry.retraction import _RETRACTIONS
+        _require(self.spd_retract_mode, tuple(sorted(_RETRACTIONS)), "spd_retract_mode")
         # 'killing_per_block' builds a per-HEAD Killing metric and requires generators that partition
         # per block (block_glk's independent gl(d_head) per head). The tied gauge's shared generators
         # kron(I_n, gl(d_head)) each act on EVERY block, so the per-block partition does not exist;

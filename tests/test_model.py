@@ -250,6 +250,28 @@ def test_diagnostics_includes_gauge_geometry_probes():
     assert math.isfinite(d["holonomy_deviation"]) and math.isfinite(d["gauge_trace_spread"])
 
 
+def test_model_runs_under_cross_coupled_block_glk():
+    # The cross-coupled block_glk gauge (config cross_couplings=[(0,1)]) must run end-to-end
+    # through the same model/E-step machinery: a forward + loss.backward() with targets yields a
+    # finite loss and finite, grad-connected gradients on the prior tables. This mirrors the
+    # verify-first check; it is the oracle that the wired cross-coupled path works end-to-end.
+    cfg = VFE3Config(vocab_size=20, embed_dim=8, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
+                     gauge_group="block_glk", cross_couplings=[(0, 1)],
+                     phi_precond_mode="none")
+    model = VFEModel(cfg)
+    # the cross-coupled group is the extended (larger-than-direct-sum) basis
+    assert model.group.generators.shape[0] == 2 * 16 + 16   # base 32 + one coupling block 16
+    tok = torch.randint(0, 20, (3, 5)); tgt = torch.randint(0, 20, (3, 5))
+    _, loss, _ = model(tok, tgt)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(model.prior_bank.mu_embed.grad).all()
+    assert torch.isfinite(model.prior_bank.phi_embed.grad).all()
+    assert model.prior_bank.mu_embed.grad.abs().sum() > 0
+    assert model.prior_bank.phi_embed.grad.abs().sum() > 0
+
+
 def test_phi_retract_mode_bch_reachable_and_differs():
     """phi_retract_mode='bch' is reachable through the E-step and differs from 'euclidean'."""
     grp = get_group("block_glk")(4, 2)

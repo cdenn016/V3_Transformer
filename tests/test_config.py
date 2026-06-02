@@ -150,6 +150,21 @@ def test_config_phi_retract_mode_validated():
         VFE3Config(phi_retract_mode="not_a_mode")
 
 
+def test_config_spd_retract_mode_validated():
+    """spd_retract_mode selects the SPD covariance retraction geometry (registry key)."""
+    assert VFE3Config().spd_retract_mode == "spd_affine"
+    with pytest.raises(ValueError):
+        VFE3Config(spd_retract_mode="not_a_mode")
+
+
+def test_config_transport_mode_validated():
+    """transport_mode selects the connection-regime (registry key); default 'flat'."""
+    assert VFE3Config().transport_mode == "flat"
+    assert VFE3Config(transport_mode="flat").transport_mode == "flat"
+    with pytest.raises(ValueError):
+        VFE3Config(transport_mode="not_a_mode")
+
+
 def test_config_eval_max_batches_default_none_and_validated():
     """eval_max_batches caps the PERIODIC validation pass (diagnostic only). Default None is
     the pure path -- the full validation split is read, as before. A positive int caps it;
@@ -166,6 +181,28 @@ def test_config_diagonal_covariance_cross_check_uses_cov_kind():
     VFE3Config(family="gaussian_full", diagonal_covariance=False)        # full + non-diagonal: ok
     with pytest.raises(ValueError):
         VFE3Config(family="gaussian_full", diagonal_covariance=True)     # full + diagonal: mismatch
+
+
+def test_config_cross_couplings_default_none_and_validated():
+    """cross_couplings (off-block GL(K) head coupling) defaults None (current behavior). A valid
+    list of distinct in-range directed head pairs is accepted under block_glk; out-of-range or
+    self-coupling (a == b) pairs raise; a group whose builder does not accept the kwarg
+    (glk / so_k / tied_block_glk) raises when cross_couplings is set."""
+    assert VFE3Config().cross_couplings is None
+    # valid: distinct in-range pair under block_glk (embed_dim 8 / n_heads 2 -> heads {0, 1})
+    cfg = VFE3Config(embed_dim=8, n_heads=2, gauge_group="block_glk", cross_couplings=[(0, 1)])
+    assert cfg.cross_couplings == [(0, 1)]
+    # self-coupling a == b is rejected
+    with pytest.raises(ValueError):
+        VFE3Config(embed_dim=8, n_heads=2, gauge_group="block_glk", cross_couplings=[(0, 0)])
+    # out-of-range head index is rejected (head 2 not in [0, 2))
+    with pytest.raises(ValueError):
+        VFE3Config(embed_dim=8, n_heads=2, gauge_group="block_glk", cross_couplings=[(0, 2)])
+    # an unsupported group (builder does not accept the kwarg) is rejected
+    with pytest.raises(ValueError):
+        VFE3Config(embed_dim=8, n_heads=2, gauge_group="so_k", cross_couplings=[(0, 1)])
+    with pytest.raises(ValueError):
+        VFE3Config(embed_dim=8, n_heads=2, gauge_group="tied_block_glk", cross_couplings=[(0, 1)])
 
 
 def test_config_accepts_newly_registered_family_without_editing_config():

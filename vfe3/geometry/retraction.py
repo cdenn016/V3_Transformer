@@ -6,7 +6,7 @@ gradients. The phi Lie-algebra retraction is a separate phase.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -17,6 +17,23 @@ from vfe3.geometry.lie_ops import (
     retract_glk,
     retract_son,
 )
+
+_RETRACTIONS: Dict[str, Callable[..., torch.Tensor]] = {}
+
+
+def register_retraction(name: str) -> Callable:
+    """Decorator registering an SPD covariance retraction sigma -> sigma_new."""
+    def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        _RETRACTIONS[name] = fn
+        return fn
+    return _wrap
+
+
+def get_retraction(name: str) -> Callable[..., torch.Tensor]:
+    """Return the registered SPD retraction (KeyError-with-available-list if absent)."""
+    if name not in _RETRACTIONS:
+        raise KeyError(f"no retraction {name!r}; available: {sorted(_RETRACTIONS)}")
+    return _RETRACTIONS[name]
 
 
 def retract_spd_diagonal(
@@ -104,6 +121,39 @@ def retract_spd_full(
     if len(orig_shape) == 4:
         sigma_new = sigma_new.reshape(orig_shape)
     return sigma_new
+
+
+@register_retraction("spd_affine")
+def retract_spd_affine(
+    sigma:        torch.Tensor,             # (..., K) diagonal OR (..., K, K) full covariance
+    delta_sigma:  torch.Tensor,             # matching rank: the tangent step (e.g. -e_sigma_lr * nat_sigma)
+
+    mean_ndim:    int,                      # ndim of the belief mean; full cov iff sigma.dim() == mean_ndim + 1
+
+    *,
+    step_size:    float = 1.0,
+    trust_region: float = 5.0,
+    eps:          float = 1e-6,
+    sigma_max:    float = 5.0,
+) -> torch.Tensor:                          # (...) same rank as sigma
+    r"""Affine-invariant SPD retraction (the manuscript-canonical default, GL(K)_supplementary.tex:640-645).
+
+    The single registered home for the rank dispatch the E-step used to perform inline: a full
+    covariance (sigma.dim() == mean_ndim + 1) steps along the affine-invariant geodesic via
+    ``retract_spd_full``; a diagonal sigma (matching the mean rank) uses ``retract_spd_diagonal``.
+    Both are the same affine-invariant exponential map,
+        Sigma_new = Sigma^{1/2} exp(Sigma^{-1/2} (step_size dSigma) Sigma^{-1/2}) Sigma^{1/2},
+    reduced to sigma_new = sigma exp(step_size dsigma/sigma) on the diagonal cone. Behavior-preserving:
+    a thin dispatcher that forwards verbatim to the bare functions; the Fisher metric conversion stays
+    in the E-step (``natural_gradient``), so the tangent ``delta_sigma`` arrives already preconditioned.
+    """
+    if sigma.dim() == mean_ndim + 1:                     # full covariance (..., K, K)
+        return retract_spd_full(
+            sigma, delta_sigma, step_size=step_size, trust_region=trust_region, eps=eps, sigma_max=sigma_max,
+        )
+    return retract_spd_diagonal(                          # diagonal variances (..., K)
+        sigma, delta_sigma, step_size=step_size, trust_region=trust_region, eps=eps, sigma_max=sigma_max,
+    )
 
 
 def natural_gradient(

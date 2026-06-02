@@ -20,24 +20,30 @@ from vfe3.families.base import get_family
 from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
-from vfe3.geometry.retraction import natural_gradient, retract_phi, retract_spd_diagonal, retract_spd_full
-from vfe3.geometry.transport import compute_transport_operators, transport_covariance, transport_mean
+from vfe3.geometry.retraction import get_retraction, natural_gradient, retract_phi
+from vfe3.geometry.transport import compute_transport_operators, get_transport, transport_covariance, transport_mean
 from vfe3.gradients.kernels import belief_gradients
 
 
 def _transport(
-    phi:   torch.Tensor,             # (N, n_gen) or (B, N, n_gen)
-    group: GaugeGroup,
-) -> torch.Tensor:                   # (N, N, K, K) or (B, N, N, K, K) Omega_ij
-    r"""Build the pairwise transport Omega_ij = exp(phi_i) exp(-phi_j).
+    phi:            torch.Tensor,             # (N, n_gen) or (B, N, n_gen)
+    group:          GaugeGroup,
 
-    Rank-aware: a 2-D (N, n_gen) frame (the unbatched diagnostics / trajectory path) is
-    transported as a batch of one and stripped back to (N, N, K, K); a 3-D (B, N, n_gen)
-    frame (the batched forward) flows straight through ``compute_transport_operators`` (which
-    already carries the leading batch axis) and returns (B, N, N, K, K)."""
+    *,
+    transport_mode: str = "flat",             # connection-regime registry key (default = flat)
+) -> torch.Tensor:                            # (N, N, K, K) or (B, N, N, K, K) Omega_ij
+    r"""Build the pairwise transport Omega_ij = exp(phi_i) exp(-phi_j) via the registry.
+
+    The connection-regime build is config-selected through ``get_transport(transport_mode)``; the
+    default 'flat' is the Regime-I phi-cocycle (byte-identical to a direct
+    ``compute_transport_operators`` call). Rank-aware: a 2-D (N, n_gen) frame (the unbatched
+    diagnostics / trajectory path) is transported as a batch of one and stripped back to
+    (N, N, K, K); a 3-D (B, N, n_gen) frame (the batched forward) flows straight through the
+    builder (which already carries the leading batch axis) and returns (B, N, N, K, K)."""
+    build = get_transport(transport_mode)
     if phi.dim() == 2:
-        return compute_transport_operators(phi.unsqueeze(0), group)["Omega"][0]
-    return compute_transport_operators(phi, group)["Omega"]
+        return build(phi.unsqueeze(0), group)["Omega"][0]
+    return build(phi, group)["Omega"]
 
 
 def _transport_qk(
@@ -77,6 +83,8 @@ def free_energy_value(
     gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
     phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
+    spd_retract_mode:          str  = "spd_affine",    # accepted-and-ignored iteration-only knob
+    transport_mode:            str  = "flat",          # accepted-and-ignored iteration-only knob
 
     log_prior:                 Optional[torch.Tensor] = None,
     keys:                      Optional[BeliefState]  = None,   # None -> global F; else keys frozen at `keys`
@@ -89,8 +97,8 @@ def free_energy_value(
         E_ij = D(q_i || Omega_ij q_j),  beta = softmax_j(log_prior - E/tau).
 
     The iteration-only knobs (gradient_mode, phi_precond_mode, phi_retract_mode,
-    sigma_max, e_sigma_q_trust) are declared here as EXPLICIT accept-and-ignore
-    parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may
+    spd_retract_mode, transport_mode, sigma_max, e_sigma_q_trust) are declared here as EXPLICIT
+    accept-and-ignore parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may
     forward one knob bag to both this and ``e_step_iteration`` while a MISSPELLED real
     parameter still raises ``TypeError`` here instead of being silently swallowed.
     """
@@ -183,12 +191,17 @@ def e_step_iteration(
     alpha_mode:                str  = "constant",
     phi_precond_mode:          str  = "none",
     phi_retract_mode:          str  = "euclidean",
+    spd_retract_mode:          str  = "spd_affine",
+    transport_mode:            str  = "flat",
 
     log_prior:                 Optional[torch.Tensor] = None,
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
-    (autograd of the alignment block + preconditioner + Lie retraction)."""
-    omega = _transport(belief.phi, group)
+    (autograd of the alignment block + preconditioner + Lie retraction).
+
+    The belief-transport build is config-selected through the connection-regime registry
+    (``transport_mode``); the default 'flat' is the Regime-I phi-cocycle (byte-identical)."""
+    omega = _transport(belief.phi, group, transport_mode=transport_mode)
     grad_mu, grad_sigma = belief_gradients(
         belief.mu, belief.sigma, mu_p, sigma_p, omega,
         tau=tau, alpha_div=alpha_div, value=value, b0=b0, c0=c0, kl_max=kl_max, eps=eps,
@@ -199,14 +212,12 @@ def e_step_iteration(
     nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
 
     mu = belief.mu - e_mu_lr * nat_mu
-    if belief.sigma.dim() == belief.mu.dim() + 1:        # full covariance (..., K, K)
-        sigma = retract_spd_full(
-            belief.sigma, -e_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
-        )
-    else:                                                # diagonal variances (..., K)
-        sigma = retract_spd_diagonal(
-            belief.sigma, -e_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
-        )
+    # The registered SPD retraction owns the diagonal-vs-full rank decision internally (full cov iff
+    # sigma.dim() == mu.dim() + 1); the E-step no longer branches on rank to select the retraction.
+    sigma = get_retraction(spd_retract_mode)(
+        belief.sigma, -e_sigma_lr * nat_sigma, belief.mu.dim(),
+        trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
+    )
 
     phi = belief.phi
     if e_phi_lr > 0.0:

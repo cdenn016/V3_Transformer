@@ -273,3 +273,246 @@ closed form). Suite `tests=270 failures=0 errors=0` (+1 new test). Two cosmetic 
 addressed: the stale `test_register_divergence_records_cov_kind` was renamed to
 `test_divergence_reexports_family_cov_kind`, and the unused `_warn_alpha_gt_one` back-compat
 re-export was dropped from `divergence.py`.
+
+### Opt-in M-step self-coupling regularizer alpha_hat * sum_i KL(q_i*||p_i)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Manuscript Algorithm 1 (GL(K)_attention.tex:2083) writes
+the M-step loss as `L = L_CE + alpha_hat * sum_i KL(q_i*||p_i) + (alpha_phi/2)||phi||^2`. The training
+loss in `vfe3/model/model.py` forward previously carried only CE plus the optional `mass_phi` gauge
+penalty (the alpha_phi term); the self-coupling KL term was absent from every path. It is now wired as
+an OPT-IN, DEFAULT-OFF fixed scalar coefficient (like `mass_phi`, not a learned parameter), so the
+pure/current path is byte-identical at the default.
+
+Files: `vfe3/config.py` adds `mstep_self_coupling_weight: float = 0.0` (alpha_hat) with a
+`>= 0.0` `__post_init__` check mirroring `mass_phi`. `vfe3/model/model.py` forward adds, guarded by
+`cfg.mstep_self_coupling_weight > 0.0`, the term `weight * sc` where `sc` is the mean self-divergence
+of the CONVERGED belief (`out.mu`/`out.sigma`, BEFORE head_mixer/norm) vs the per-block prior. The
+last-block prior is reconstructed exactly as `diagnostics()` does it: start from the encode belief and
+fold `vfe_stack`'s `prior_handoff` blend over `n_layers-1` (`rho=prior_handoff_rho`,
+`rho_s=prior_handoff_sigma`), then `self_divergence_for_alpha(fam(out.mu,out.sigma),
+fam(mu_p,sigma_p), ...).mean()`. The term is grad-connected (no detach), so it backprops to the
+learned prior tables like `mass_phi`. Exact at `n_layers=1` (the fold loop is empty, so p = encode
+belief); an approximation otherwise (one converged belief stands in for the per-block intermediates).
+
+Tests (`tests/test_mstep_self_coupling.py`, TDD oracle-first, watched RED then GREEN): `test_noop_at_weight_zero`
+(the key oracle — at weight 0, returned `loss == ce` with `mass_phi=0`, so the new code changes
+nothing), `test_linear_in_weight` (pins the term — `loss` allclose `ce + w * sc` with `sc`
+independently recomputed by the forward recipe; `assert sc > 1e-6` keeps it non-vacuous),
+`test_config_validation` (`-1.0` raises, `0.0`/`0.5` accepted), and
+`test_backward_finite_grads_on_prior_tables` (grad-connected: `loss.backward()` yields finite,
+nonzero `mu_embed.grad`). Suite `tests=274 failures=0 errors=0` (+4 new; viz collected normally).
+
+### register_retraction seam over the SPD retraction (roadmap item 4)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Design spec:
+`docs/superpowers/specs/2026-06-01-spd-retraction-variants-design.md` (Phase 0). The SPD covariance
+retraction was the one geometry seam still dispatched by a hardcoded tensor-rank branch
+(`belief.sigma.dim() == belief.mu.dim() + 1` selecting `retract_spd_full` vs `retract_spd_diagonal`
+in `e_step_iteration`) rather than a config-selected registry, violating the clean-room spec's
+"add a variant by writing-and-registering, never by editing call sites" (sec 4.2). This is a
+BYTE-IDENTITY refactor that adds the registry and registers the current affine-invariant retraction
+as the default; it adds NO new retraction variants (log-Euclidean / Bures-Wasserstein remain
+deferred to the design spec for the user to decide).
+
+Boundary choice: the NARROW seam. The registered retraction owns only the diagonal-vs-full rank
+decision plus the SPD retraction call; the Fisher metric conversion (`natural_gradient`) stays in
+the E-step, so the tangent arrives already preconditioned. (The spec's broader boundary — folding
+`natural_gradient` into each mode and returning `(nat_mu, sigma_new)` — is open user-decision #2,
+needed only once variants land; building it now would implement an unapproved decision and enlarge
+the byte-identity surface.) The task's own oracle is the discriminator: it compares the seam to the
+bare `retract_spd_{diagonal,full}` functions alone, not to a `natural_gradient`+retraction
+composition.
+
+Files:
+- `vfe3/geometry/retraction.py`: new `_RETRACTIONS` registry, `register_retraction(name)` decorator,
+  `get_retraction(name)` (KeyError-with-available-list on miss), mirroring `_PRECOND`/`register_precond`
+  in `phi_preconditioner.py`. New `retract_spd_affine(sigma, delta_sigma, mean_ndim, *, step_size,
+  trust_region, eps, sigma_max)` registered under `"spd_affine"` — a thin dispatcher that replicates
+  the E-step's old branch (`sigma.dim() == mean_ndim + 1` -> `retract_spd_full`, else
+  `retract_spd_diagonal`) and forwards verbatim. The `mean_ndim` int is passed because the seam sees
+  only `sigma` (rank-3 is ambiguous: batched-diagonal `(B,N,K)` vs unbatched-full `(N,K,K)`); the
+  reference is the belief mean's rank, exactly the quantity the old branch used. The bare
+  `retract_spd_diagonal`/`retract_spd_full`/`natural_gradient` functions are untouched.
+- `vfe3/config.py`: new field `spd_retract_mode: str = "spd_affine"` beside `phi_retract_mode`,
+  validated in `__post_init__` against the retraction REGISTRY (`tuple(sorted(_RETRACTIONS))`, the
+  `divergence_families()` pattern) so a future registered retraction is selectable without a config
+  edit. Default keeps the manuscript-canonical pure path.
+- `vfe3/inference/e_step.py`: the rank branch in `e_step_iteration` collapses to
+  `get_retraction(spd_retract_mode)(belief.sigma, -e_sigma_lr * nat_sigma, belief.mu.dim(), ...)`;
+  `spd_retract_mode` threaded as an `e_step_iteration` parameter and as an explicit accept-and-ignore
+  knob on `free_energy_value` (the `e_step` call site forwards one kwarg bag to both, so a missing
+  declaration would TypeError on the trajectory/diagnostics path). Import trimmed to `get_retraction,
+  natural_gradient, retract_phi` (the two bare SPD functions are no longer referenced here).
+- `vfe3/model/block.py`: threads `spd_retract_mode=cfg.spd_retract_mode` into the `e_step` call,
+  beside `phi_retract_mode=cfg.phi_retract_mode`.
+
+Byte-identity gate: `tests/test_retraction.py` adds `test_retraction_registry_round_trip` (register/
+get round-trip + unknown-name KeyError, registration cleaned up in `finally`),
+`test_spd_affine_is_registered`, and `test_spd_affine_bit_identical_{diagonal,full}` — the oracles,
+asserting `torch.equal` (atol=0) between `get_retraction("spd_affine")(...)` and the bare
+`retract_spd_{diagonal,full}` calls on fixed-seed `(B,N,K)` and `(B,N,K,K)` inputs.
+`tests/test_config.py` adds `test_config_spd_retract_mode_validated`. `tests/test_e_step.py` adds
+`test_e_step_iteration_spd_affine_default_is_byte_identical` (the default-routed `e_step_iteration`
+sigma update equals a hand-composed `natural_gradient`+`retract_spd_diagonal`, atol=0); the
+pre-existing `test_fixed_seed_regression` checksum stayed green as an additional end-to-end guard.
+Full suite `tests=280 failures=0 errors=0 skipped=0` (read from junitxml; 274 baseline + 6 new; viz
+collected normally).
+
+### cross_couplings reachable from config (roadmap item)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. The cross-coupled GL(K) gauge basis (off-block head
+generators) was already implemented and verified green in the geometry layer — `groups.py`'s
+`_build_block_glk` accepts a `cross_couplings` kwarg that calls `generate_glk_cross_head`
+(`generators.py`) and optionally closes the basis under the Lie bracket (`closure.py`) — but it was
+unreachable from `VFE3Config`: there was no `cross_couplings` field, and `build_group` dispatched
+purely on the builder's positional arity, so it could never forward a kwarg. This change is the
+config WIRING only; no geometry was touched.
+
+Files:
+- `vfe3/config.py`: new field `cross_couplings: Optional[List[Tuple[int, int]]] = None` beside the
+  gauge-seam fields (imports `List`, `Tuple` added). `__post_init__` validates (after the
+  `gauge_group` `_require`, so the group and `n_heads` are resolved): when not None it must be a
+  list of distinct in-range directed `(int, int)` head pairs with `a != b` and each index in
+  `[0, n_heads)`, and the selected `gauge_group`'s builder must accept the kwarg. Support is checked
+  by `inspect.signature` of the registered builder — NOT a hardcoded group-name list — so only
+  `block_glk` qualifies (its is the only builder with the param); `glk`, `so_k`, and
+  `tied_block_glk` are rejected when cross_couplings is set. (NOTE: the roadmap brief's parenthetical
+  "block_glk / tied_block_glk" is stale — the actual `_build_tied_block_glk` builder does NOT accept
+  `cross_couplings`; per CLAUDE.md CODE-FOCUS the signature is the source of truth, so tied is
+  rejected.) Default None reproduces current behavior exactly.
+- `vfe3/model/model.py::build_group`: the arity dispatch is widened to build a `kwargs` dict that
+  carries `cross_couplings` only when `cfg.cross_couplings is not None` AND the builder's signature
+  has the parameter, then splats it into the existing arity-1/arity-2 calls. None -> empty kwargs ->
+  the SAME group object as before. The glk/so_k (arity 1) and no-cross-coupling block_glk paths are
+  unchanged.
+
+Scope: only `cross_couplings` is exposed; the builder's `close_basis` (bracket closure) stays at its
+default `False`, so the config-reachable cross-coupled basis is the un-closed cross-head basis
+(block-diagonal + off-block generators), which is already strictly larger than the direct sum
+(base `n_heads * d_head^2`, plus `d_head^2` per coupling pair). The bracket-closed subalgebra
+(`close_basis=True`) remains builder-only / not config-reachable by design (one new field, no scope
+creep). For a cross-coupled group `irrep_dims` is `[K]` (single super-block; the per-block
+decomposition is a deferred transport concern), matching the existing geometry code and test.
+
+Default-None byte-identity: `test_build_group_default_none_is_byte_identical` asserts
+`torch.equal(build_group(VFE3Config(...block_glk...)).generators, get_group("block_glk")(8,2).generators)`
+(and equal `irrep_dims`). The wiring adds nothing when unset.
+
+Tests (TDD, watched RED then GREEN):
+  - `tests/test_config.py::test_config_cross_couplings_default_none_and_validated` — default None;
+    valid `[(0,1)]` accepted under block_glk; self-coupling `(0,0)` and out-of-range `(0,2)` raise;
+    `so_k` and `tied_block_glk` with cross_couplings set raise.
+  - `tests/test_gauge_groups.py::test_build_group_default_none_is_byte_identical` — the byte-identity
+    invariance guard (GREEN from the start once the field exists).
+  - `tests/test_gauge_groups.py::test_build_group_forwards_cross_couplings` — the forwarded kwarg
+    grows the basis (32 -> 48 for embed_dim 8 / n_heads 2 / one pair) and reports `irrep_dims=[K]`.
+  - `tests/test_model.py::test_model_runs_under_cross_coupled_block_glk` — the end-to-end oracle: a
+    tiny `VFEModel` under `cross_couplings=[(0,1)]` runs a forward + `loss.backward()` with finite
+    loss and finite, grad-connected gradients on the prior tables (mirrors the verify-first check).
+
+Full suite after the change: `tests=284 failures=0 errors=0 skipped=0` (read from junitxml; 280
+baseline + 4 new; viz collected normally; 1 xpassed pre-existing).
+
+### Autoregressive `generate()` (roadmap item)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. The model could only do teacher-forced CE training; it
+had no way to produce text. Added an ADDITIVE, training-isolated `VFEModel.generate(token_ids,
+max_new_tokens, *, temperature=1.0, top_k=None, top_p=None, greedy=False) -> (B, N0 +
+max_new_tokens)` on `vfe3/model/model.py` (the only production file touched). It REUSES the existing
+`forward` (encode -> E-step -> decode) rather than reimplementing the belief pipeline: each step
+feeds the running sequence -- truncated to the last `cfg.max_seq_len` tokens, since the model and
+its attention prior are built for `N <= max_seq_len` -- through `forward(seq)` (`targets=None` ->
+logits `(B, N, V)`), reads `logits[:, -1, :]`, turns it into a next token, and appends. The returned
+sequence keeps the FULL prompt (including any portion beyond `max_seq_len`) followed by the generated
+ids. Decorated `@torch.no_grad()`; because it never calls the training/loss branch it cannot corrupt
+training (that isolation is the safety oracle).
+
+Samplers (minimal, no registry): `greedy=True` takes the argmax and returns BEFORE any
+temperature/top_k/top_p logic (so those are ignored under greedy). Otherwise logits are divided by
+`temperature`, then `top_k` (keep the k largest, `-inf` the rest via the k-th-largest threshold),
+then `top_p` (nucleus: `-inf` every token for which the strictly-preceding sorted cumulative softmax
+mass already reaches `p`, which always keeps the top token, then scatter the sorted mask back to
+vocab order), then softmax + `torch.multinomial`. Cost note: this is the correct-but-slow first
+version -- it re-runs the FULL forward (encode -> E-step -> decode) for every generated token;
+incremental belief reuse across steps is a future optimization, documented in the docstring.
+
+Tests (`tests/test_generate.py`, TDD oracle-first, watched RED -- 9 `AttributeError: no attribute
+'generate'` -- then GREEN): `test_shape_in_vocab_and_prompt_preserved` (shape `(B, N0+5)`, all ids in
+`[0, V)`, prompt columns preserved), `test_greedy_is_deterministic` (two greedy calls equal),
+`test_greedy_equals_forward_argmax_first_token` (the pin: first greedy token == `argmax` of
+`forward(prompt)[:, -1, :]`; first token only, since step 2+ conditions on a longer sequence),
+`test_greedy_ignores_temperature_topk_topp` (wild temperature + aggressive top_k/top_p alongside
+`greedy=True` change nothing -- pins the branch ordering), `test_top_k_one_is_argmax_first_token`
+(`top_k=1` not-greedy is deterministic and equals argmax), `test_top_k_membership_first_token` (the
+first sampled token lies among the k largest of the last-position logits), `test_top_p_and_
+temperature_paths_run_in_vocab` (both paths run, stay in-vocab), `test_prompt_longer_than_max_seq_len_
+does_not_error` (a prompt longer than `max_seq_len` does not error; full prompt preserved in the
+return), and `test_generate_is_training_isolated` (the safety oracle: `mu_embed` unchanged before/after
+a generate call, and the training forward still returns a finite loss afterward).
+
+Full suite after the change: `tests=293 failures=0 errors=0 skipped=0` (read from junitxml; 284
+baseline + 9 new; viz collected normally; 1 xpassed pre-existing). `generate` is purely additive: it
+changed no existing test.
+
+### register_transport seam over the gauge transport (roadmap item)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Design spec for the deferred non-flat builder:
+`docs/superpowers/specs/2026-06-01-regime-ii-connection-design.md`. The clean-room spec (sec 4.2)
+names the connection REGIME as a registry-backed modular axis "on equal footing with the structure
+group ... config-selected, added by writing-and-registering, never editing call sites". The
+structure-group axis already IS a registry (`register_group`/`get_group`); the transport/connection
+axis was NOT — `vfe3/inference/e_step.py` imported and called `compute_transport_operators` directly.
+This is a BYTE-IDENTITY refactor adding the missing seam with the current flat phi-cocycle as the
+default registered entry. It builds ONLY the seam + flat default; the non-flat Regime II builder is
+deferred to the design spec for the user to decide (NOT built here).
+
+Orthogonality: `transport_mode` is the connection-REGIME axis (is the connection flat at all),
+ORTHOGONAL to the pre-existing `gauge_parameterization` (phi | omega_direct), which only chooses how
+a single flat transport is parameterized. The two are distinct seams; the field comment in
+`config.py` and the registry docstring in `transport.py` state this.
+
+Files:
+- `vfe3/geometry/transport.py`: new `_TRANSPORTS` registry, `register_transport(name)` decorator,
+  `get_transport(name)` (KeyError-with-available-list on miss), mirroring `register_group`/`get_group`
+  and `register_retraction`/`get_retraction`. The flat phi-cocycle is registered under `"flat"` as a
+  thin adapter `_build_flat(phi, group, *, gauge_mode="learned", **kwargs)` that forwards verbatim to
+  `compute_transport_operators(phi, group, gauge_mode=gauge_mode)` and TOLERATES extra keyword args (so
+  a future stateful non-flat builder shares the call shape). `compute_transport_operators` and
+  `compute_transport_operators_direct` are untouched. Regime II is NOT registered.
+- `vfe3/config.py`: new field `transport_mode: str = "flat"` beside the gauge-seam fields, validated
+  in `__post_init__` against the transport REGISTRY (`tuple(sorted(_TRANSPORTS))`, the
+  `divergence_families()` / `_RETRACTIONS` pattern) so a future registered regime is selectable
+  without a config edit. Local import avoids a config <- transport <- groups cycle. Default keeps the
+  flat pure path.
+- `vfe3/inference/e_step.py`: the PRIMARY E-step belief-transport build in `e_step_iteration` routes
+  through the registry — `_transport` gains a `*, transport_mode="flat"` kwarg and swaps its internal
+  `compute_transport_operators` for `get_transport(transport_mode)(...)` (the 2-D/3-D rank logic stays
+  in one place, so the 2-D diagnostics/`free_energy_value` callers keep the `"flat"` default
+  byte-identical with no edit). `e_step_iteration` accepts `transport_mode` and passes it at the
+  build; `free_energy_value` declares `transport_mode` as an explicit accept-and-ignore knob (the
+  `e_step` call site forwards one kwarg bag to both `e_step_iteration` AND `free_energy_value` via the
+  `_f_diag` trajectory path, so a missing declaration would TypeError on `return_trajectory=True`).
+  Import widened to add `get_transport`.
+- `vfe3/model/block.py`: threads `transport_mode=cfg.transport_mode` into the `e_step` call, beside
+  `spd_retract_mode=cfg.spd_retract_mode`.
+
+Intrinsically-flat helpers left on the direct call (byte-identity preserved, conscious skips): the
+mixed-frame `_transport_qk` (FILTERED objective; cannot share the single-phi flat builder),
+`phi_alignment_loss` (phi-objective, `e_phi_lr=0.0` by default; threading it is not required for this
+task), and `model.py::diagnostics` (`_transport(out.phi, ...)` at the `"flat"` default). These keep
+calling `compute_transport_operators` / the defaulted `_transport`, unchanged.
+
+Byte-identity gate: `tests/test_transport.py` adds `test_transport_registry_round_trip` (register/get
+round-trip + unknown-name KeyError, registration cleaned up in `finally`), `test_flat_is_registered`,
+`test_flat_builder_bit_identical_to_direct_call` (the ORACLE — `torch.equal` on Omega / exp_phi /
+exp_neg_phi between `get_transport("flat")(phi, group)` and the bare
+`compute_transport_operators(phi, group)` on a fixed-seed phi), and
+`test_flat_builder_tolerates_extra_kwargs`. `tests/test_config.py` adds
+`test_config_transport_mode_validated`. `tests/test_e_step.py` adds
+`test_transport_flat_kwarg_is_byte_identical_to_default` (the routed `_transport` default equals the
+explicit `"flat"` on both the 2-D and 3-D paths, atol=0) and
+`test_e_step_iteration_transport_flat_default_is_byte_identical` (the default-routed iteration's
+mu/sigma/phi equal the run with no `transport_mode`, atol=0). The wired-forward gate is
+`tests/test_perf_equivalence.py` passing in the full green suite. Full suite
+`tests=300 failures=0 errors=0 skipped=0` (read from junitxml; 293 baseline + 7 new; viz collected
+normally; 1 xpassed pre-existing).
