@@ -357,3 +357,58 @@ sigma update equals a hand-composed `natural_gradient`+`retract_spd_diagonal`, a
 pre-existing `test_fixed_seed_regression` checksum stayed green as an additional end-to-end guard.
 Full suite `tests=280 failures=0 errors=0 skipped=0` (read from junitxml; 274 baseline + 6 new; viz
 collected normally).
+
+### cross_couplings reachable from config (roadmap item)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. The cross-coupled GL(K) gauge basis (off-block head
+generators) was already implemented and verified green in the geometry layer — `groups.py`'s
+`_build_block_glk` accepts a `cross_couplings` kwarg that calls `generate_glk_cross_head`
+(`generators.py`) and optionally closes the basis under the Lie bracket (`closure.py`) — but it was
+unreachable from `VFE3Config`: there was no `cross_couplings` field, and `build_group` dispatched
+purely on the builder's positional arity, so it could never forward a kwarg. This change is the
+config WIRING only; no geometry was touched.
+
+Files:
+- `vfe3/config.py`: new field `cross_couplings: Optional[List[Tuple[int, int]]] = None` beside the
+  gauge-seam fields (imports `List`, `Tuple` added). `__post_init__` validates (after the
+  `gauge_group` `_require`, so the group and `n_heads` are resolved): when not None it must be a
+  list of distinct in-range directed `(int, int)` head pairs with `a != b` and each index in
+  `[0, n_heads)`, and the selected `gauge_group`'s builder must accept the kwarg. Support is checked
+  by `inspect.signature` of the registered builder — NOT a hardcoded group-name list — so only
+  `block_glk` qualifies (its is the only builder with the param); `glk`, `so_k`, and
+  `tied_block_glk` are rejected when cross_couplings is set. (NOTE: the roadmap brief's parenthetical
+  "block_glk / tied_block_glk" is stale — the actual `_build_tied_block_glk` builder does NOT accept
+  `cross_couplings`; per CLAUDE.md CODE-FOCUS the signature is the source of truth, so tied is
+  rejected.) Default None reproduces current behavior exactly.
+- `vfe3/model/model.py::build_group`: the arity dispatch is widened to build a `kwargs` dict that
+  carries `cross_couplings` only when `cfg.cross_couplings is not None` AND the builder's signature
+  has the parameter, then splats it into the existing arity-1/arity-2 calls. None -> empty kwargs ->
+  the SAME group object as before. The glk/so_k (arity 1) and no-cross-coupling block_glk paths are
+  unchanged.
+
+Scope: only `cross_couplings` is exposed; the builder's `close_basis` (bracket closure) stays at its
+default `False`, so the config-reachable cross-coupled basis is the un-closed cross-head basis
+(block-diagonal + off-block generators), which is already strictly larger than the direct sum
+(base `n_heads * d_head^2`, plus `d_head^2` per coupling pair). The bracket-closed subalgebra
+(`close_basis=True`) remains builder-only / not config-reachable by design (one new field, no scope
+creep). For a cross-coupled group `irrep_dims` is `[K]` (single super-block; the per-block
+decomposition is a deferred transport concern), matching the existing geometry code and test.
+
+Default-None byte-identity: `test_build_group_default_none_is_byte_identical` asserts
+`torch.equal(build_group(VFE3Config(...block_glk...)).generators, get_group("block_glk")(8,2).generators)`
+(and equal `irrep_dims`). The wiring adds nothing when unset.
+
+Tests (TDD, watched RED then GREEN):
+  - `tests/test_config.py::test_config_cross_couplings_default_none_and_validated` — default None;
+    valid `[(0,1)]` accepted under block_glk; self-coupling `(0,0)` and out-of-range `(0,2)` raise;
+    `so_k` and `tied_block_glk` with cross_couplings set raise.
+  - `tests/test_gauge_groups.py::test_build_group_default_none_is_byte_identical` — the byte-identity
+    invariance guard (GREEN from the start once the field exists).
+  - `tests/test_gauge_groups.py::test_build_group_forwards_cross_couplings` — the forwarded kwarg
+    grows the basis (32 -> 48 for embed_dim 8 / n_heads 2 / one pair) and reports `irrep_dims=[K]`.
+  - `tests/test_model.py::test_model_runs_under_cross_coupled_block_glk` — the end-to-end oracle: a
+    tiny `VFEModel` under `cross_couplings=[(0,1)]` runs a forward + `loss.backward()` with finite
+    loss and finite, grad-connected gradients on the prior tables (mirrors the verify-first check).
+
+Full suite after the change: `tests=284 failures=0 errors=0 skipped=0` (read from junitxml; 280
+baseline + 4 new; viz collected normally; 1 xpassed pre-existing).

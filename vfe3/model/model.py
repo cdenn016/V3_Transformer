@@ -37,13 +37,22 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
     r"""Construct the gauge group from config, dispatching on the builder's positional
     arity so a newly registered group slots in by ``register_group`` alone (no call-site
     edit). Arity 1 -> ``builder(K)`` (glk, so_k); arity 2 -> ``builder(K, n_heads)``
-    (block_glk). Higher arities are an unsupported registration error."""
+    (block_glk). Higher arities are an unsupported registration error.
+
+    ``cfg.cross_couplings`` (off-block GL(K) head coupling) is forwarded as a keyword only
+    when set AND the selected builder accepts it (block_glk); otherwise the call is the bare
+    positional dispatch, so the default (``cross_couplings=None``) path produces the SAME group
+    object as before (byte-identical). Config validation already rejects cross_couplings against
+    a builder that does not accept the kwarg, so this is the forwarding seam, not a second guard."""
     builder = get_group(cfg.gauge_group)
     arity = _positional_arity(builder)
+    kwargs: dict = {}
+    if cfg.cross_couplings is not None and "cross_couplings" in inspect.signature(builder).parameters:
+        kwargs["cross_couplings"] = cfg.cross_couplings
     if arity == 1:
-        return builder(cfg.embed_dim)
+        return builder(cfg.embed_dim, **kwargs)
     if arity == 2:
-        return builder(cfg.embed_dim, cfg.n_heads)
+        return builder(cfg.embed_dim, cfg.n_heads, **kwargs)
     raise ValueError(
         f"gauge group {cfg.gauge_group!r} builder has unsupported positional arity {arity}; "
         f"build_group dispatches K (arity 1) or (K, n_heads) (arity 2)"
