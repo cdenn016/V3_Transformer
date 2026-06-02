@@ -99,6 +99,14 @@ class VFE3Config:
     kappa:                     float = 1.0          # temperature tau = kappa * sqrt(K)
     mass_phi:                  float = 0.0          # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight: float = 0.0         # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    # Hyper-prior weight lambda_h on the model-channel term lambda_h * mean_i KL(s_i||r)
+    # (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy, lines 1241-1249).
+    # Default 0.0 = OFF: no s/r tables, loss byte-identical to the single-tier path.
+    # FIRST INCREMENT: this wires the second (model) belief channel s_i + the global hyper-prior
+    # r end-to-end at the smallest scope; s_i does NOT yet couple into the belief q / the
+    # prediction path, and the gamma model-coupling block + the s-channel E-step update are
+    # DEFERRED to increment 2.
+    lambda_h:                  float = 0.0
 
     # attention
     include_attention_entropy: bool  = True         # canonical (True) vs surrogate (False)
@@ -261,6 +269,8 @@ class VFE3Config:
             raise ValueError(
                 f"mstep_self_coupling_weight must be >= 0, got {self.mstep_self_coupling_weight}"
             )
+        if self.lambda_h < 0.0:
+            raise ValueError(f"lambda_h must be >= 0, got {self.lambda_h}")
         for name in ("b0", "c0"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")

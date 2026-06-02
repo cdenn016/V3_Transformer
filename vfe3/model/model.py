@@ -76,6 +76,7 @@ class VFEModel(nn.Module):
             diagonal_covariance=cfg.diagonal_covariance,
             use_prior_bank=cfg.use_prior_bank,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
+            lambda_h=cfg.lambda_h,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.
@@ -261,6 +262,31 @@ class VFEModel(nn.Module):
                 divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
             ).mean()
             loss = loss + cfg.mstep_self_coupling_weight * sc
+        if self.cfg.lambda_h > 0.0:
+            # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
+            # lines 1241-1249): L += lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
+            # regularized toward the global hyper-prior centroid r. Opt-in, default-off
+            # (lambda_h=0 -> byte-identical to the term-absent path). Grad-connected (no detach), so
+            # it backprops to the learned s/r tables (the channel trains), and computed from the
+            # converged s/r tables OUTSIDE the E-step (s_i does not couple into q this increment).
+            # FIRST INCREMENT scope: s_i is encoded fresh here and consumed ONLY by this term; the
+            # h->s->p->q coupling, the gamma model-coupling block, and the s-channel E-step update
+            # are DEFERRED to increment 2. The covariance kernel is DiagonalGaussian regardless of
+            # cfg.family (the s/r tables are always diagonal (V,K)/(K,)); divergence_family is the
+            # orthogonal functional seam. r (K,) broadcasts over the (B, N) token axis.
+            from vfe3.families.gaussian import DiagonalGaussian
+            from vfe3.free_energy import self_divergence
+            cfg = self.cfg
+            pb = self.prior_bank
+            s_mu, s_sigma = pb.encode_s(token_ids)                       # (B, N, K)
+            r_mu = pb.r_mu                                               # (K,)
+            r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps)       # (K,)
+            hp = self_divergence(
+                DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),
+                alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family,
+            ).mean()
+            loss = loss + cfg.lambda_h * hp
         return logits, loss, ce.detach()
 
     @torch.no_grad()

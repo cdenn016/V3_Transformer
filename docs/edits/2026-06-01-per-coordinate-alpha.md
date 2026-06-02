@@ -963,3 +963,81 @@ to the flat iteration) and `_nonzero_w_differs_from_flat`. Full suite after the 
 `tests=362 failures=0 errors=0 skipped=0` (read from junitxml; 345 baseline + 17 new; 361 passed +
 1 xpassed pre-existing; viz collected normally). Default flat path byte-identical (the flat
 byte-identity + perf-equivalence golden tests stay green).
+
+## 2026-06-02 — Hyper-prior channel, FIRST INCREMENT: lambda_h * mean_i KL(s_i||r)
+
+Branch: vfe3-roadmap-overnight-2026-06-02 (committed directly; same running log per the
+one-doc-per-day convention). Design spec:
+`docs/superpowers/specs/2026-06-01-hyperprior-model-coupling-design.md` (its DECISION C
+recommendation: build the smallest end-to-end increment, hyper-prior first).
+
+### Scope (what this increment IS — and what it defers)
+
+This establishes the SECOND (model) belief channel `s_i` plus the hyper-prior `r` end-to-end at
+the smallest scope: the manuscript's `lambda_h sum_i KL(s_i||r_i)` hyper-prior term
+(Participatory_it_from_bit.tex eq:pointwise_free_energy, lines 1241-1249), wired as an opt-in,
+default-off, grad-connected training-loss term. `s_i` is a per-token diagonal Gaussian belief
+encoded from new learned PriorBank tables; `r` is a single global diagonal Gaussian centroid the
+`s_i` are regularized toward.
+
+DEFERRED to increment 2 (NOT built here): the gamma model-coupling block
+`sum_ij gamma_ij KL(s_i||Omega_tilde_ij s_j)`, the s-channel E-step update (the slow natural-gradient
+descent of s toward its fixed point), and the `h->s->p->q` coupling (s_i feeding the belief q / the
+prediction path). In this increment `s_i` is encoded fresh in `forward` and consumed ONLY by the
+hyper-prior loss term; it does not enter the E-step or decode. The M3 `BeliefState.s/r` optional
+fields stay `None` (s is not threaded through the belief tuple this increment).
+
+### Files
+
+`vfe3/config.py`
+  New field `lambda_h: float = 0.0` (hyper-prior weight) beside `mstep_self_coupling_weight`, with a
+  `>= 0.0` `__post_init__` check (mirroring `mass_phi`/`mstep_self_coupling_weight`). Comment cites
+  eq:pointwise_free_energy and the first-increment scope. Default 0.0 = OFF.
+
+`vfe3/model/prior_bank.py`
+  `PriorBank.__init__` gains a `lambda_h: float = 0.0` kwarg. When `lambda_h > 0` it creates, at the
+  VERY END of `__init__` (after the `output_proj_weight` block), four `nn.Parameter` tables:
+  `s_mu_embed`/`s_sigma_log_embed` (V, K) — the per-token model-channel belief, looked up like the
+  belief tables — and `r_mu`/`r_sigma_log` (K,) — the global hyper-prior centroid. s init mirrors the
+  belief tables (`mu_init_std * randn`, `sigma_log_init`); r init is `mu=0`, `sigma=sigma_init`, so
+  `s != r` at init (KL > 0, the channel has a gradient). Creating them LAST and only on the
+  `lambda_h>0` path keeps the default path param-free and byte-RNG-unchanged. New `encode_s(token_ids)
+  -> (s_mu, s_sigma)` returns the diagonal s-channel per token (`exp(s_sigma_log).clamp(min=eps)`).
+
+`vfe3/model/model.py`
+  `VFEModel.__init__` threads `lambda_h=cfg.lambda_h` into the `PriorBank` construction. `forward`
+  adds, guarded by `cfg.lambda_h > 0.0` (mirroring the `mstep_self_coupling_weight` block), the term
+  `loss += cfg.lambda_h * hp` where `hp = self_divergence(DiagonalGaussian(s_mu, s_sigma),
+  DiagonalGaussian(r_mu, r_sigma), alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+  divergence_family=cfg.divergence_family).mean()`. The covariance kernel is `DiagonalGaussian`
+  regardless of `cfg.family` (the s/r tables are always diagonal); `divergence_family` is the
+  orthogonal functional seam. `r` (K,) broadcasts over the (B, N) token axis. Grad-connected (no
+  detach), so it backprops to the s/r tables.
+
+### Manuscript cite
+
+Participatory_it_from_bit.tex eq:pointwise_free_energy (lines 1241-1249): the canonical two-tier
+free energy carries `lambda_h sum_i KL(s_i||r_i)`. The manuscript sets `lambda_h=0` in the reported
+simulation regime, so this is a BUILDOUT target (the formal precondition for the meta-agent
+hierarchy), not a fidelity fix.
+
+### Tests (TDD, watched RED then GREEN)
+
+5 new tests, RED-first (`AttributeError: no lambda_h` / `TypeError`/missing `encode_s` before the
+implementation). `tests/test_hyperprior.py` (4): `test_default_off_no_tables_and_loss_is_ce` (the
+pure-path guard — at `lambda_h=0` there is NO `s_mu_embed`/`r_mu` attribute and `loss == ce` with
+`mass_phi=0`), `test_linear_in_lambda_h` (THE ORACLE — two models same seed except `lambda_h` = 0
+vs 0.5; `loss_w - loss_0` allclose `w * hp` with `hp` recomputed independently from the model's s/r
+tables, `atol=1e-6`; asserts the belief tables are byte-identical between the two models via
+`torch.equal`, and `hp > 1e-6` so it is non-vacuous), `test_grad_flows_to_s_and_r_tables` (finite
+nonzero grad on `s_mu_embed`/`s_sigma_log_embed`/`r_mu`/`r_sigma_log` after backward), and
+`test_self_zero_when_s_equals_r` (setting s == r makes the term 0). `tests/test_config.py` (1):
+`test_config_lambda_h_default_zero_and_validated` (default 0.0; `-1.0` raises; `0.0`/`0.5` accepted).
+
+### Default byte-identity + suite
+
+Default (`lambda_h=0`) path byte-identical: no s/r tables drawn (zero new RNG), `forward` term gated
+off. The 362-test baseline (including the seeded fixed-seed regression and the per-sample/batched
+perf-equivalence golden tests) stays green. Full suite after the change:
+`tests=367 failures=0 errors=0 skipped=0` (read from junitxml; 362 baseline + 5 new; 366 passed +
+1 xpassed pre-existing; viz collected normally).
