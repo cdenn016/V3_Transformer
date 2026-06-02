@@ -12,27 +12,20 @@ def test_safe_kl_clamp_bounds_and_nan():
     )
 
 
-def test_registry_register_and_get():
-    from vfe3.divergence import register_divergence, get_divergence, _DIVERGENCES
+def test_divergence_delegates_to_families():
+    """renyi(...) must route through the families layer (DiagonalGaussian closed form)."""
+    from vfe3.divergence import renyi
+    from vfe3.families.gaussian import DiagonalGaussian
+    from vfe3.families.base import renyi as fam_renyi
 
-    @register_divergence("dummy_family", cov_kind="diagonal")
-    def _dummy(mu_q, sigma_q, mu_t, sigma_t, *, alpha, kl_max, eps):
-        return mu_q.sum(dim=-1) * 0.0
-
-    try:
-        fn = get_divergence("dummy_family")
-        assert fn is _dummy
-    finally:
-        # Do not leak the test kernel into the global registry.
-        from vfe3.divergence import _COV_KIND
-        _DIVERGENCES.pop("dummy_family", None)
-        _COV_KIND.pop("dummy_family", None)
-
-
-def test_registry_unknown_raises():
-    from vfe3.divergence import get_divergence
-    with pytest.raises(KeyError):
-        get_divergence("no_such_family")
+    g = torch.Generator().manual_seed(21)
+    mu_q = torch.randn(3, 2, generator=g)
+    mu_p = torch.randn(3, 2, generator=g)
+    s_q = torch.rand(3, 2, generator=g) + 0.5
+    s_p = torch.rand(3, 2, generator=g) + 0.5
+    got = renyi(mu_q, s_q, mu_p, s_p, alpha=0.5, family="gaussian_diagonal")
+    want = fam_renyi(DiagonalGaussian(mu_q, s_q), DiagonalGaussian(mu_p, s_p), alpha=0.5)
+    assert torch.allclose(got, want, atol=0.0)
 
 
 def test_kl_equals_renyi_at_alpha_one():

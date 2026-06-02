@@ -323,13 +323,16 @@ def test_pairwise_energy_dispatches_on_declared_cov_kind_not_name():
     full-covariance branch (wrong broadcast axis); the registered cov_kind drives the dispatch."""
     import torch
 
-    from vfe3 import divergence
     from vfe3.free_energy import pairwise_energy
+    from vfe3.families.base import register_family, _FAMILIES
+    from vfe3.families.gaussian import DiagonalGaussian
 
     name = "elliptical_scale_test"                 # no "diagonal" substring, declared diagonal
-    divergence.register_divergence(name, cov_kind="diagonal")(
-        divergence._DIVERGENCES["gaussian_diagonal"]
-    )
+
+    @register_family(name)
+    class _Elliptical(DiagonalGaussian):
+        cov_kind = "diagonal"
+
     try:
         torch.manual_seed(11)
         N, K = 3, 4
@@ -341,5 +344,4 @@ def test_pairwise_energy_dispatches_on_declared_cov_kind_not_name():
         E_ref = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal")
         assert torch.allclose(E_new, E_ref, atol=1e-6)
     finally:
-        divergence._DIVERGENCES.pop(name, None)
-        divergence._COV_KIND.pop(name, None)
+        _FAMILIES.pop(name, None)
