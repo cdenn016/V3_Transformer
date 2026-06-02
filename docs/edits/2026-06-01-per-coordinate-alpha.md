@@ -150,3 +150,57 @@ through to the autograd oracle.
 `cov_kind` matches each shipped family's structure, so every existing path is bit-identical; this is a
 refactor of the dispatch mechanism plus a new modular seam, not a formula change. The pure default
 path (`gaussian_diagonal`) is unchanged.
+
+## families/ seam — Phase 2 byte-identity gate (branch vfe3-buildout-roadmap-2026-06-01)
+
+Plan: `docs/superpowers/plans/2026-06-01-families-exponential-family-seam.md`, Task 5 (Phase 2).
+Phase 1 (the additive `vfe3/families/{base,gaussian}.py` layer — `BeliefParams` ABC, `DiagonalGaussian`,
+`FullGaussian`, the family/functional registries, and the generic Renyi/KL-from-`A(theta)` path) was
+already committed; this entry covers routing the legacy tensor API through that layer.
+
+### What changed
+
+`vfe3/divergence.py`
+  Rewritten into a thin tensor-API facade over `vfe3.families`. The `renyi`/`kl`/
+  `gaussian_diagonal_renyi_per_coord` entry points keep their historical `(mu_q, sigma_q, mu_t, sigma_t)`
+  signature but now wrap the moments in the registered `BeliefParams` subclass and delegate to
+  `vfe3.families.base.{renyi,kl}` / `DiagonalGaussian.renyi_per_coord`. The old `_DIVERGENCES`/`_COV_KIND`
+  registries, `register_divergence`/`get_divergence`, and the inline `_gaussian_diagonal_renyi`/
+  `_gaussian_full_renyi` kernel bodies are removed (they now live in `families/gaussian.py`).
+  `safe_kl_clamp`, `family_cov_kind`, `divergence_families`, `register_functional`, `get_functional`, and
+  `_warn_alpha_gt_one` are re-exported from `families.base` so callers and back-compat imports are
+  unaffected. Importing `divergence` populates the family registry via `from vfe3.families import gaussian`.
+
+  The functional registry now lives in `families.base` (which registers the PARAM-typed `renyi` under
+  `"renyi"`). Because `free_energy.pairwise_energy`/`self_divergence` still invoke the functional with the
+  TENSOR signature in Phase 2, the facade re-registers the tensor `renyi` under `"renyi"` (mutating the
+  shared `base._FUNCTIONALS`) so those call sites keep working; Phase 3 flips them to parameter objects.
+
+`vfe3/free_energy.py`
+  Unchanged — its `from vfe3.divergence import family_cov_kind, gaussian_diagonal_renyi_per_coord,
+  get_functional` resolves against the re-exports.
+
+### Test migration
+
+The three tests that referenced the removed registry symbols were migrated to the families registry
+(each registers a `BeliefParams` subclass via `register_family` and cleans up `_FAMILIES` in a `finally`):
+  - `test_divergence.py`: the superseded `test_registry_register_and_get` / `test_registry_unknown_raises`
+    (which tested `_DIVERGENCES`/`register_divergence`/`get_divergence`, now covered by
+    `test_families.py`) were DELETED; a new `test_divergence_delegates_to_families` pins that the tensor
+    `renyi` routes through `DiagonalGaussian` (`atol=0.0`). `test_register_divergence_records_cov_kind`
+    and `test_family_cov_kind_unregistered_raises` stay (they use the re-exported `family_cov_kind`).
+  - `test_free_energy.py::test_pairwise_energy_dispatches_on_declared_cov_kind_not_name`: registers a
+    `DiagonalGaussian` subclass under a no-"diagonal"-substring name (`elliptical_scale_test`) and asserts
+    `pairwise_energy(..., family=name) == pairwise_energy(..., family="gaussian_diagonal")`.
+  - `test_config.py::test_config_accepts_newly_registered_family_without_editing_config`: registers a
+    `DiagonalGaussian` subclass (`laplace_diagonal_test`) and asserts `VFE3Config(family=name,
+    diagonal_covariance=True)` passes while `diagonal_covariance=False` raises.
+
+### Byte-identity gate
+
+The closed forms are the same code ported verbatim into `families/gaussian.py`, so the live numerics are
+bit-identical; the full suite is the equivalence gate. Full suite after Phase 2:
+`tests=269 failures=0 errors=0` (read from junitxml; 270 prior − 2 deleted superseded tests + 1 new
+delegation test). No production module references a removed symbol (grep across `vfe3/` for
+`register_divergence`/`_DIVERGENCES`/`get_divergence`/`_COV_KIND` returns none; the only `_gaussian_*_renyi`
+hits are docstring/comment references, not imports).
