@@ -838,3 +838,128 @@ ignored by the pure forms; the frozen-seed regression / byte-identity tests
 `tests/test_alpha_i.py`), TDD watched RED (8 failing for unregistered form / missing param) then
 GREEN. Full suite after the change: `tests=344 failures=0 errors=0 skipped=0` (read from junitxml;
 335 baseline + 9 new; 343 passed + 1 xpassed pre-existing; viz collected normally).
+
+## 2026-06-02 — Regime-II edge-relaxed (non-flat) transport (learned bilinear connection)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Design spec:
+`docs/superpowers/specs/2026-06-01-regime-ii-connection-design.md` (recommendation 3, the bilinear
+learned form; recommendation 4, the `cocycle_relaxation` homotopy knob). The `register_transport`
+seam and the registered `"flat"` (Regime-I) builder already existed; this adds the non-flat Regime-II
+builder behind the seam. The user SANCTIONED the learned bilinear connection as a documented
+neural-network exception ON THE CONDITION of an NN comment at the function and at the config toggle;
+both are present.
+
+### The builder (`vfe3/geometry/transport.py`)
+
+New `@register_transport("regime_ii")` builder `_build_regime_ii(phi, group, *, gauge_mode="learned",
+mu=None, connection_W=None, cocycle_relaxation=1.0, **kw)` realizing the edge-relaxed cocycle
+(spec eq:edge_relaxed_omega):
+
+    Omega_ij = exp(phi_i . G) exp(delta_ij . G) exp(-phi_j . G),
+    delta_ij^a = cocycle_relaxation * (mu_i^T W^a mu_j),   a = 1..n_gen.
+
+Vertex factors `exp(phi_i)`, `exp(-phi_j)` reuse `compute_transport_operators` verbatim (its flat
+Omega is discarded). The edge factor is built by three einsums plus a matrix exp:
+`delta = cocycle_relaxation * einsum("bik,akl,bjl->bija", mu, W, mu)` -> `(B,N,N,n_gen)`;
+`delta_mat = einsum("bija,akl->bijkl", delta, generators)` -> `(B,N,N,K,K)`;
+`exp_delta = stable_matrix_exp_pair(delta_mat, only_forward=True, block_dims=...)` (reuses the
+existing float64 island + block-diagonal exp); then
+`Omega = einsum("bikl,bijlm,bjmn->bijkn", exp_phi, exp_delta, exp_neg_phi)`. Returns the SAME dict
+shape as flat (`exp_phi`, `exp_neg_phi`, `Omega`), so it is a drop-in Omega producer — every
+downstream consumer (`belief_gradients`, `transport_mean/covariance`) is shape-identical and
+untouched. `W` is a raw `(n_gen, K, K)` `nn.Parameter` consumed by one einsum — no activation, no
+bias — directly analogous to the blessed linear-decode `W`.
+
+### The learned connection W (NN exception; comment sites)
+
+`connection_W` is a model-owned `nn.Parameter` of shape `(n_gen, K, K)`, created in
+`VFEModel.__init__` ONLY when `transport_mode == "regime_ii"` (the default flat path is param-free).
+Initialized ZERO -> delta=0 -> exp(0)=I -> Omega = flat cocycle, so a regime_ii model is byte-flat at
+init. NN-exception comment sites (the user's sanction condition):
+`vfe3/geometry/transport.py` (at `_build_regime_ii`), `vfe3/config.py` (at the `transport_mode`
+toggle), and `vfe3/model/model.py` (at the `connection_W` parameter). A `detach_e_step=True` footgun
+warning mirrors the `log_alpha` one (the connection enters the loss only through the E-step, so a
+detached E-step freezes it).
+
+### Threading (mirrors log_alpha / transport_mode)
+
+`cocycle_relaxation` is a cfg field threaded like `transport_mode` (block.py reads
+`cfg.cocycle_relaxation` into the `e_step` call). `connection_W` is a model param threaded like
+`log_alpha`: `getattr(self,"connection_W",None)` -> `vfe_stack(connection_W=)` ->
+`vfe_block(connection_W=)` -> `e_step(..., connection_W=)` -> `e_step_iteration`, which passes
+`mu=belief.mu, connection_W, cocycle_relaxation` to `_transport` ONLY when
+`transport_mode=="regime_ii"` (the flat call is unchanged -> default byte-identity). `_transport`
+gained `mu`/`connection_W`/`cocycle_relaxation` kwargs and unsqueezes 2-D mu the same way it
+unsqueezes 2-D phi, so the builder always sees batched `(B,N,K)`. `free_energy_value` declares the two
+as explicit accept-and-ignore knobs (the `e_step` trajectory path forwards one kwarg bag to both, so
+a missing declaration would TypeError on `return_trajectory=True`). `diagnostics()` threads
+`connection_W` into its `vfe_stack` call and its final `_transport`, so `holonomy_deviation` reads the
+ACTUAL regime (the diagnostic the spec built Regime-II to exercise).
+
+### Per-iteration rebuild
+
+Unlike flat (mu-independent, built once), the Regime-II Omega depends on the current belief means, so
+it is rebuilt from `belief.mu` every E-step iteration. This is automatic: `e_step` re-enters
+`e_step_iteration` with the updated belief each pass, and `_transport` reads `belief.mu` at the top
+(the same place `belief.phi` is read), so Omega tracks the evolving mean with no special logic.
+
+### Design decision — do NOT short-circuit an all-zero (grad-requiring) W
+
+The builder takes the flat fast path (skipping the O(N^2) edge exps) for `connection_W is None`,
+`cocycle_relaxation == 0.0`, or `gauge_mode == "trivial"`. It deliberately does NOT short-circuit on
+an all-ZERO `connection_W`: at W=0 the edge factor `exp(delta)=I` numerically (so the W=0->flat oracle
+holds to float tolerance), but `d Omega / d W` at W=0 is the generator structure (`exp'(0)=I`), NOT
+zero. Short-circuiting on all-zero W severed the autograd graph and left `connection_W.grad=None`
+(caught by the grad-to-W oracle during the RED->GREEN cycle); the full einsum path keeps W in the
+graph so the loss backpropagates to it from the zero init.
+
+### Characteristic — delta is QUADRATIC in mu (not a bug)
+
+`delta = mu_i^T W^a mu_j` is quadratic in the belief means. At the PriorBank's near-zero default init
+(`mu_embed` abs-mean ~0.013), the quadratic delta — and hence its gradient w.r.t. W — is vanishingly
+small (~1e-7), so a fresh regime_ii model barely feels the connection. This is inherent to the
+bilinear form (the means live in the fixed embedding ambient frame, per the spec), not a defect. The
+model-level grad-to-W and forward-change tests therefore inflate `mu_embed` so the connection carries
+real signal; the connection becomes meaningful as the means grow during training.
+
+### Known limitations (documented, not fixed; per the task)
+
+- GAUGE COVARIANCE: the bilinear delta reads mu in the FIXED ambient frame, so it is a learned,
+  frame-fixed object that breaks strict vertex-local gauge covariance — exactly analogous to the
+  head-mixer's equivariance caveat, and precisely why this is a sanctioned NN exception rather than
+  the pure path. No strict-covariance test is asserted (it would be false for this form).
+- The phi E-step (`phi_alignment_loss`, active only when `e_phi_lr > 0`; default 0) uses the FLAT
+  transport even under regime_ii (mirroring `log_alpha`, also not threaded there). So with
+  `transport_mode="regime_ii"` AND `e_phi_lr > 0`, the mu/sigma updates use the regime_ii Omega while
+  the phi update uses flat — a documented inconsistency, out of scope to fix.
+- The trajectory-diagnostic F in `free_energy_value` always uses flat transport (its internal
+  `_transport` omits `transport_mode`), so under regime_ii the logged F-trajectory is a flat-transport
+  diagnostic, not the regime_ii objective. Out of scope (matches log_alpha).
+
+### Cost
+
+O(N^2) per-edge K x K matrix exponentials per build (vs flat's O(N) vertex exps), and the build
+repeats each E-step iteration as mu updates. The `stable_matrix_exp_pair` Frobenius clamp
+(`max_norm=15`) now also bounds `||delta . G||` — safe at zero-init W, a note for a large trained
+connection.
+
+### Tests (TDD, watched RED then GREEN)
+
+17 new tests, RED-first (the new tests failed for `KeyError: no regime_ii` / `TypeError: unexpected
+connection_W` / missing config field before the implementation). `tests/test_regime_ii.py` (15):
+the core oracle `test_regime_ii_w_zero_reduces_to_flat` (+ `_cocycle_relaxation_zero_` and
+`_connection_none_` variants — W=0 or alpha=0 or W=None reduce to the flat
+`compute_transport_operators` Omega, `allclose atol=1e-6`), `_returns_flat_dict_shape`,
+`_is_registered`; the non-flat oracles `_nonzero_w_is_non_flat` and the independent curvature oracle
+`_holonomy_strictly_positive` (flat ~0, regime_ii > 1e-2); the homotopy
+`_cocycle_relaxation_homotopy` (alpha=0.5 with W equals alpha=1 with W/2, pinning delta scales
+linearly in both W and the relaxation); model wiring `_creates_connection_w_zero_init`,
+`_flat_has_no_connection_w`, `_init_flat_equals_flat_forward` (seed both constructions; logits/loss
+allclose), `_gradient_flows_to_w` (finite NONZERO `connection_W.grad`, means inflated),
+`_nonzero_w_changes_forward`, the end-to-end `_diagnostics_holonomy_tracks_regime` (W=0 -> ~0,
+W!=0 -> > 1e-2 through `model.diagnostics`), and `test_config_cocycle_relaxation_default_and_validated`.
+`tests/test_e_step.py` (2): `test_e_step_iteration_regime_ii_w_zero_reduces_to_flat` (W=None reduces
+to the flat iteration) and `_nonzero_w_differs_from_flat`. Full suite after the change:
+`tests=362 failures=0 errors=0 skipped=0` (read from junitxml; 345 baseline + 17 new; 361 passed +
+1 xpassed pre-existing; viz collected normally). Default flat path byte-identical (the flat
+byte-identity + perf-equivalence golden tests stay green).

@@ -132,6 +132,38 @@ def test_e_step_iteration_transport_flat_default_is_byte_identical():
     assert torch.equal(routed.phi, base.phi)
 
 
+def test_e_step_iteration_regime_ii_w_zero_reduces_to_flat():
+    """e_step_iteration under transport_mode='regime_ii' with connection_W=None (or zeros)
+    reduces to the flat iteration bit-for-bit -- the E-step-level W=0->flat oracle."""
+    b, mu_p, sigma_p, grp = _belief()
+    flat = e_step_iteration(
+        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.05, e_phi_lr=0.0,
+    )
+    r2_none = e_step_iteration(
+        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.05, e_phi_lr=0.0,
+        transport_mode="regime_ii", connection_W=None, cocycle_relaxation=1.0,
+    )
+    assert torch.allclose(r2_none.mu, flat.mu, atol=1e-6, rtol=0.0)
+    assert torch.allclose(r2_none.sigma, flat.sigma, atol=1e-6, rtol=0.0)
+
+
+def test_e_step_iteration_regime_ii_nonzero_w_differs_from_flat():
+    """A nonzero connection_W makes the regime_ii E-step move the belief differently from flat
+    (the connection threads all the way through to the belief update)."""
+    b, mu_p, sigma_p, grp = _belief()
+    K, n_gen = grp.generators.shape[-1], grp.generators.shape[0]
+    g = torch.Generator().manual_seed(5)
+    W = 0.5 * torch.randn(n_gen, K, K, generator=g)
+    flat = e_step_iteration(
+        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.2, e_sigma_lr=0.05, e_phi_lr=0.0,
+    )
+    r2 = e_step_iteration(
+        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.2, e_sigma_lr=0.05, e_phi_lr=0.0,
+        transport_mode="regime_ii", connection_W=W, cocycle_relaxation=1.0,
+    )
+    assert not torch.allclose(r2.mu, flat.mu, atol=1e-4)
+
+
 # --- Task 3: descent directions (the right objective per mode) -------------
 def test_filtering_step_descends_F_filt():
     # filtering (query-side) gradient descends F with KEYS FROZEN at the pre-step belief.

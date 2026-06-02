@@ -51,11 +51,21 @@ class VFE3Config:
     # gauge seam
     gauge_group:               str   = "block_glk"
     gauge_parameterization:    str   = "phi"
-    # Connection REGIME (registry key): the flat Regime-I phi-cocycle ('flat', default = current
-    # behavior) vs the design-spec'd non-flat Regime II (deferred). ORTHOGONAL to
-    # gauge_parameterization, which picks how a single flat transport is parameterized; this picks
-    # whether the connection is flat at all. Validated against the transport registry below.
+    # Connection REGIME (registry key): the flat Regime-I phi-cocycle ('flat', default = the pure
+    # NO-NN path) vs the non-flat Regime II ('regime_ii'). ORTHOGONAL to gauge_parameterization,
+    # which picks how a single flat transport is parameterized; this picks whether the connection is
+    # flat at all. Validated against the transport registry below.
+    # NEURAL-NETWORK EXCEPTION (sanctioned, default-OFF): 'regime_ii' introduces a LEARNED bilinear
+    # edge connection delta_ij^a = mu_i^T W^a mu_j, with W a model-owned nn.Parameter (shape
+    # (n_gen, K, K)) trained by backprop on CE -- a documented learned-parameter exception in the
+    # spirit of use_head_mixer / alpha_mode='learnable' (see VFEModel.__init__'s connection_W and
+    # transport._build_regime_ii). At W=0 (init) or cocycle_relaxation=0 it reduces EXACTLY to the
+    # flat cocycle, so init is byte-flat. The pure no-NN path is 'flat' (the default).
     transport_mode:            str   = "flat"
+    # Homotopy alpha for the Regime-II connection (regime_ii only): delta_ij^a = cocycle_relaxation *
+    # (mu_i^T W^a mu_j). 0.0 -> delta=0 -> flat (Regime I); 1.0 -> fully relaxed (Regime II). Ignored
+    # by the flat builder.
+    cocycle_relaxation:        float = 1.0
     # Cross-head GL(K) coupling: a list of directed (head_a, head_b) index pairs that add off-block
     # generators (and a genuinely larger-than-direct-sum subalgebra under the builder's bracket
     # closure) to the gauge basis. Default None = the current block-diagonal GL(d_head)^H gauge.

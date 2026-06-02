@@ -23,14 +23,17 @@ def vfe_block(
     cfg:        VFE3Config,
 
     *,
-    log_prior:  Optional[torch.Tensor]    = None,
-    block_norm: Optional[Any]             = None,   # cached norm instance (None -> no block norm)
-    log_alpha:  Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
+    log_prior:    Optional[torch.Tensor]    = None,
+    block_norm:   Optional[Any]             = None,   # cached norm instance (None -> no block norm)
+    log_alpha:    Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
+    connection_W: Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
     ``log_alpha`` is the model's learned self-coupling nn.Parameter (alpha = exp(log_alpha))
-    under alpha_mode='learnable', forwarded to the E-step; None on the pure path."""
+    under alpha_mode='learnable', forwarded to the E-step; None on the pure path. ``connection_W``
+    is the model's learned bilinear Regime-II connection (a sanctioned NN exception) forwarded under
+    transport_mode='regime_ii'; None on the pure (flat) path."""
     out = e_step(
         belief, mu_p, sigma_p, group,
         n_iter=cfg.n_e_steps, tau=cfg.tau,
@@ -43,6 +46,7 @@ def vfe_block(
         alpha_mode=cfg.alpha_mode,
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
+        cocycle_relaxation=cfg.cocycle_relaxation, connection_W=connection_W,
         log_prior=log_prior,
     )
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)

@@ -60,6 +60,79 @@ def _build_flat(
     return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
 
 
+@register_transport("regime_ii")
+def _build_regime_ii(
+    phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
+    group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims
+
+    *,
+    gauge_mode:         str                       = "learned",   # 'learned' (flat vertex factors) | 'trivial'
+    mu:                 Optional[torch.Tensor]    = None,        # (B, N, K) belief means; the bilinear delta reads these
+    connection_W:       Optional[torch.Tensor]    = None,        # (n_gen, K, K) learned bilinear connection (NN exception)
+    cocycle_relaxation: float                     = 1.0,         # homotopy alpha in [0,1]; 0 -> flat
+    **kwargs,                                                    # tolerated (shares the flat builder's call shape)
+) -> TransportDict:
+    r"""Regime-II edge-relaxed (NON-FLAT) transport (spec eq:edge_relaxed_omega).
+
+    NEURAL-NETWORK EXCEPTION (sanctioned, default-OFF): this builder consumes the LEARNED
+    bilinear connection ``connection_W`` (an nn.Parameter on the model, trained by backprop on
+    CE). The no-NN flat builder (:func:`_build_flat`) is the default and the pure path; this is
+    the non-flat regime selected only by ``transport_mode='regime_ii'``.
+
+    The edge-relaxed cocycle inserts an edge-local connection between the vertex factors:
+
+        Omega_ij = exp(phi_i . G) exp(delta_ij . G) exp(-phi_j . G),
+        delta_ij^a = cocycle_relaxation * (mu_i^T W^a mu_j),   a = 1..n_gen,
+        delta_ij . G = sum_a delta_ij^a G_a   in g,
+
+    with ``{G_a} = group.generators``. Because delta is valued in the group's own generator
+    coordinates, exp(delta_ij . G) lies in the group by construction (block structure / irrep_dims
+    preserved). At ``connection_W=None`` OR all-zero OR ``cocycle_relaxation=0`` the edge factor
+    delta=0 -> exp(0)=I, so Omega = exp(phi_i) exp(-phi_j) is the flat (Regime-I) cocycle EXACTLY
+    -- the byte-identity oracle (verified by tests/test_regime_ii.py). A nonzero W gives the
+    non-trivial triangle holonomy ``metrics.holonomy_deviation`` was built to read.
+
+    COST: unlike flat (mu-independent, O(N) vertex exponentials), Omega here depends on the CURRENT
+    belief means mu and the edge factor is a PER-EDGE K x K matrix exponential -- O(N^2) matrix
+    exponentials per build, and the build must be repeated as mu updates across E-step iterations.
+    The Frobenius clamp in :func:`stable_matrix_exp_pair` (max_norm=15) also bounds ||delta . G||;
+    safe at zero-init W, a note for a large trained connection.
+
+    Returns the SAME dict shape as the flat builder: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K),
+    'Omega' (B,N,N,K,K).
+    """
+    # Vertex factors exp(phi_i), exp(-phi_j): reuse the flat builder verbatim (the dominant cost is
+    # the O(N^2) edge exps below, so this extra Omega matmul is cheap and we just discard its Omega).
+    flat = compute_transport_operators(phi, group, gauge_mode=gauge_mode)
+    exp_phi, exp_neg_phi = flat["exp_phi"], flat["exp_neg_phi"]                 # (B, N, K, K)
+
+    # Flat fast path: no connection at all (None), the homotopy collapses it (alpha=0), or the
+    # vertex factors are trivial -> delta plays no role -> Omega is exactly the flat cocycle. Skip the
+    # O(N^2) edge exps. NOTE: we deliberately do NOT short-circuit on an all-ZERO (but grad-requiring)
+    # connection_W: at W=0 the edge factor exp(delta)=I numerically (so the W=0->flat oracle holds to
+    # float tolerance), but d Omega / d W at W=0 is the generator structure (exp'(0)=I), NOT zero --
+    # short-circuiting there would sever the autograd graph and freeze the parameter at init. The full
+    # einsum path keeps W in the graph so the loss backpropagates to it.
+    if connection_W is None or cocycle_relaxation == 0.0 or gauge_mode == "trivial":
+        return flat
+
+    generators = group.generators                                              # (n_gen, K, K)
+    # delta_ij^a = cocycle_relaxation * mu_i^T W^a mu_j  -> (B, N, N, n_gen)
+    delta = cocycle_relaxation * torch.einsum("bik,akl,bjl->bija", mu, connection_W, mu)
+    # delta_ij . G = sum_a delta_ij^a G_a  -> (B, N, N, K, K) Lie-algebra edge matrix
+    delta_mat = torch.einsum("bija,akl->bijkl", delta, generators)
+    # Per-edge group element exp(delta_ij . G); reuse the stable float64-island / block-exp machinery
+    # (only_forward: the edge factor enters Omega once, no exp(-delta) needed).
+    block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
+    exp_delta, _ = stable_matrix_exp_pair(
+        delta_mat, skew_symmetric=group.skew_symmetric, only_forward=True, block_dims=block_dims,
+    )                                                                          # (B, N, N, K, K)
+
+    # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
+    omega = torch.einsum("bikl,bijlm,bjmn->bijkn", exp_phi, exp_delta, exp_neg_phi)
+    return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
+
+
 def stable_matrix_exp_pair(
     matrix:         torch.Tensor,             # (..., d, d) Lie-algebra matrices
 
