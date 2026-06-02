@@ -173,3 +173,23 @@ def test_generic_kl_without_expected_statistic_raises_clearly():
 
     with pytest.raises(NotImplementedError):
         kl(_NoStat(torch.ones(3, 1)), _NoStat(torch.ones(3, 1) * 2.0))
+
+
+def test_generic_kl_from_A_works_for_matrix_sufficient_statistic():
+    """The generic Bregman KL (alpha=1) must contract a MATRIX sufficient statistic over ALL
+    its parameter axes, not just the last one. FullGaussian's t2 / E[xxᵀ] is (..., K, K), so a
+    last-axis-only reducer returns the wrong shape/value; this pins the full contraction. The
+    fix is what lets a future matrix-parameter family use the generic path (the M2 promise)."""
+    from vfe3.families.gaussian import FullGaussian
+    from vfe3.families.base import _renyi_from_log_partition
+
+    torch.manual_seed(6)
+    N, K = 4, 3
+    mu_q, mu_p = torch.randn(N, K), torch.randn(N, K)
+    Aq = torch.randn(N, K, K); s_q = Aq @ Aq.transpose(-1, -2) + K * torch.eye(K)
+    Ap = torch.randn(N, K, K); s_p = Ap @ Ap.transpose(-1, -2) + K * torch.eye(K)
+    q, p = FullGaussian(mu_q, s_q), FullGaussian(mu_p, s_p)
+    closed = q.renyi_closed_form(p, alpha=1.0, kl_max=float("inf"), eps=1e-6)
+    generic = _renyi_from_log_partition(q, p, alpha=1.0, kl_max=float("inf"), eps=1e-6)
+    assert generic.shape == closed.shape, (generic.shape, closed.shape)
+    assert torch.allclose(generic, closed, atol=1e-3), (generic - closed).abs().max()

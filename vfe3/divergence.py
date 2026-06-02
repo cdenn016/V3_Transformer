@@ -25,7 +25,6 @@ from vfe3.families.base import (
     renyi,
     kl,
 )
-from vfe3.families.base import _warn_alpha_gt_one  # noqa: F401  (kept for back-compat imports)
 from vfe3.families import gaussian as _gaussian     # noqa: F401  (registers the Gaussian families)
 
 __all__ = [

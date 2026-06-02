@@ -172,8 +172,19 @@ def _renyi_from_log_partition(
     tp = p.natural()
     if abs(alpha - 1.0) < 1e-6:
         grad = q.expected_statistic()                       # E_q[T] = gradA(theta_q)
-        inner = sum(((g * (b - a)).sum(dim=-1) for g, a, b in zip(grad, tq, tp)))
-        div = cls.log_partition_at(tp) - cls.log_partition_at(tq) - inner
+        A_q = cls.log_partition_at(tq)                       # batch-shaped (parameter axes summed)
+        batch_ndim = A_q.dim()
+        # Bregman KL = A(tp) - A(tq) - sum_c <gradA_c, (tp - tq)_c>, where each natural-parameter
+        # component c is contracted over ITS parameter axes (the trailing dims beyond the batch).
+        # A vector statistic (..., K) sums the last axis; a matrix statistic (..., K, K) is
+        # Frobenius-contracted over the last two -- so a matrix-parameter family (e.g. the full
+        # Gaussian's t2) works through the generic path, not only vector-parameter families.
+        inner = 0.0
+        for g, a, b in zip(grad, tq, tp):
+            term = g * (b - a)
+            param_axes = tuple(range(batch_ndim, term.dim()))
+            inner = inner + (term.sum(dim=param_axes) if param_axes else term)
+        div = cls.log_partition_at(tp) - A_q - inner
     else:
         blend = tuple(alpha * a + (1.0 - alpha) * b for a, b in zip(tq, tp))
         div = (cls.log_partition_at(blend)

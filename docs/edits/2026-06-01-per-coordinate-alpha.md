@@ -255,4 +255,21 @@ unrelated to this change): `tests=261 failures=0 errors=0 skipped=0` (read from 
 from the pre-change baseline of 261. A repo grep confirms no surviving four-tensor call or stray
 `family=` passed to `renyi`/`kl`/`pairwise_energy`/`self_divergence*` in any `.py` under `vfe3/` or
 `tests/` (the only matches are in `docs/` plan/spec files and the `gaussian.py` docstring source
-reference).
+reference). (The `261` excludes `test_viz.py`'s 8 tests, which fail to COLLECT only under transient
+memory pressure; the full suite including viz is `tests=269 failures=0 errors=0`.)
+
+### Final-review fix: generic Bregman-KL reducer for matrix sufficient statistics
+
+The whole-implementation review surfaced a latent bug that undercut the M2 expandability promise.
+`_renyi_from_log_partition`'s alpha=1 Bregman inner product summed only the last axis
+(`(g*(b-a)).sum(dim=-1)`), correct for a vector sufficient statistic (diagonal Gaussian, the toy
+exponential) but wrong for a MATRIX statistic. It was latent (`FullGaussian` always uses its
+`renyi_closed_form`, never the generic path), but it is exactly the trap a future matrix-parameter
+family using the generic path would hit. Fixed: the reducer now contracts each natural-parameter
+component over ITS parameter axes (the trailing dims beyond the batch, inferred from `A(theta)`'s
+batch rank), so a `(..., K, K)` statistic is Frobenius-contracted. Pinned by
+`test_generic_kl_from_A_works_for_matrix_sufficient_statistic` (`FullGaussian` generic KL equals its
+closed form). Suite `tests=270 failures=0 errors=0` (+1 new test). Two cosmetic minors also
+addressed: the stale `test_register_divergence_records_cov_kind` was renamed to
+`test_divergence_reexports_family_cov_kind`, and the unused `_warn_alpha_gt_one` back-compat
+re-export was dropped from `divergence.py`.

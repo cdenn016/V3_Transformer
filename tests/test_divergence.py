@@ -188,9 +188,9 @@ def test_diagonal_kl_closed_form_1d():
     assert torch.allclose(got, expected.reshape(1), atol=1e-5)
 
 
-def test_register_divergence_records_cov_kind():
+def test_divergence_reexports_family_cov_kind():
     """A family declares its covariance structure at registration; consumers read the declared
-    kind via family_cov_kind rather than sniffing the family name."""
+    kind via family_cov_kind (re-exported from vfe3.divergence) rather than sniffing the name."""
     from vfe3.divergence import family_cov_kind
 
     assert family_cov_kind("gaussian_diagonal") == "diagonal"
