@@ -116,3 +116,28 @@ def test_diagonal_block_and_broadcast():
     assert torch.equal(qb.mu, mu[..., 2:4]) and torch.equal(qb.sigma, s[..., 2:4])
     qk = q.broadcast_over_keys()
     assert qk.mu.shape == (2, 1, 6) and qk.sigma.shape == (2, 1, 6)
+
+
+def test_full_gaussian_closed_form_matches_legacy_and_block():
+    from vfe3.divergence import renyi as legacy_renyi
+    from vfe3.families.gaussian import FullGaussian
+    from vfe3.families.base import renyi as fam_renyi
+    torch.manual_seed(5)
+    N, K = 4, 3
+    mu_q, mu_p = torch.randn(N, K), torch.randn(N, K)
+    Aq = torch.randn(N, K, K); s_q = Aq @ Aq.transpose(-1, -2) + K * torch.eye(K)
+    Ap = torch.randn(N, K, K); s_p = Ap @ Ap.transpose(-1, -2) + K * torch.eye(K)
+    for a in (0.5, 1.0):
+        want = legacy_renyi(mu_q, s_q, mu_p, s_p, alpha=a, family="gaussian_full")
+        got = fam_renyi(FullGaussian(mu_q, s_q), FullGaussian(mu_p, s_p), alpha=a)
+        assert torch.allclose(got, want, atol=1e-4), (a, (got - want).abs().max())
+    qb = FullGaussian(mu_q, s_q).block(1, 3)
+    assert torch.equal(qb.mu, mu_q[..., 1:3]) and torch.equal(qb.sigma, s_q[..., 1:3, 1:3])
+
+
+def test_full_gaussian_per_coord_raises():
+    import pytest
+    from vfe3.families.gaussian import FullGaussian
+    q = FullGaussian(torch.zeros(2, 2), torch.eye(2).expand(2, 2, 2))
+    with pytest.raises((AttributeError, NotImplementedError)):
+        q.renyi_per_coord(q, alpha=1.0)
