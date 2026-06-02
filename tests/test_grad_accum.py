@@ -78,6 +78,34 @@ def test_accum_grad_equals_full_batch_grad(K):
     assert accum_loss == pytest.approx(float(loss_full.detach()), abs=1e-5)
 
 
+@pytest.mark.parametrize("K", [2, 4])
+def test_train_step_accum_grad_matches_full_batch(K):
+    # THE PRODUCTION-PATH ORACLE: drive the REAL train_step at K>1 and assert its accumulated
+    # .grad equals the full-batch single-backward grad. (The sibling
+    # test_accum_grad_equals_full_batch_grad reimplements the chunking inline to pin the math
+    # premise; this one pins train_step's own accumulation branch.) grad_clip=0.0 skips the clip
+    # (train_step checks grad_clip > 0), so .grad is the raw accumulated gradient; zero_grad is at
+    # the START of train_step and optimizer.step() mutates params (not .grad), so the post-call
+    # .grad is the accumulation computed at the SAME params as the full-batch snapshot.
+    torch.manual_seed(0)
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    tokens, targets = _full_batch_no_ignore(B=8, N=8, V=6, seed=0)
+
+    model.zero_grad(set_to_none=True)
+    _, loss_full, _ = model(tokens, targets)
+    loss_full.backward()
+    full = _grad_snapshot(model)
+
+    opt = build_optimizer(model, cfg)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, cfg))
+    train_step(model, opt, sched, tokens, targets, grad_clip=0.0, grad_accum_steps=K)
+    accum = _grad_snapshot(model)
+
+    for name in ("mu", "sigma", "phi"):
+        assert torch.allclose(accum[name], full[name], atol=1e-5, rtol=1e-4), name
+
+
 def test_train_step_k1_byte_identical_to_single_step_path():
     # grad_accum_steps=1 must reproduce the current train_step EXACTLY: same grads, same
     # optimizer/scheduler step, same returned loss. Two identically-seeded models, one

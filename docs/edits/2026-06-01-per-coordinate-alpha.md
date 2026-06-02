@@ -1408,9 +1408,13 @@ extra logic. The logged per-step loss is the mean over the K microbatches (the
 accumulation-boundary loss).
 
 ### Tests (TDD, watched RED then GREEN; `tests/test_grad_accum.py`, new)
-- `test_accum_grad_equals_full_batch_grad[2]` and `[4]` — the key oracle: accumulated `.grad`
-  over K equal-token microbatches (each loss/K) allclose (atol 1e-5) to the full-batch single
-  backward, for K=2 and K=4, with no optimizer.step between the two measurements.
+- `test_train_step_accum_grad_matches_full_batch[2]` and `[4]` — the production-path oracle:
+  the REAL `train_step` at K>1 (with `grad_clip=0.0` so the clip is skipped) leaves a `.grad`
+  allclose (atol 1e-5) to the full-batch single backward (~1e-8 in practice). Mutation-checked:
+  dropping the `/K` makes both fail, so it genuinely gates `train_step`'s accumulation branch.
+- `test_accum_grad_equals_full_batch_grad[2]` and `[4]` — the math-premise sibling: the same
+  equivalence with the chunking reimplemented inline (no `train_step`), for K=2 and K=4, with no
+  optimizer.step between the two measurements.
 - `test_train_step_k1_byte_identical_to_single_step_path` — `grad_accum_steps=1` reproduces the
   current path exactly (same returned loss; `torch.equal` on all three prior tables after one
   step; same `scheduler.last_epoch`).
@@ -1423,6 +1427,6 @@ accumulation-boundary loss).
 - `test_train_step_indivisible_batch_raises` — `B=5`, `K=4` raises `ValueError`.
 
 Surgical scope: `vfe3/config.py` + `vfe3/train.py` (+ the new test file). `model.py` forward
-untouched. Full suite after the change: `tests=414 failures=0 errors=0 skipped=0` (read from
-junitxml; 407 baseline + 7 new; 413 passed + 1 xpassed pre-existing; all 8 viz tests collected
+untouched. Full suite after the change: `tests=416 failures=0 errors=0 skipped=0` (read from
+junitxml; 407 baseline + 9 new; 415 passed + 1 xpassed pre-existing; all 8 viz tests collected
 normally).
