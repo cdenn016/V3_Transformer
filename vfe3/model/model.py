@@ -210,6 +210,65 @@ class VFEModel(nn.Module):
         return logits, loss, ce.detach()
 
     @torch.no_grad()
+    def generate(
+        self,
+        token_ids:      torch.Tensor,        # (B, N0) prompt token ids
+
+        max_new_tokens: int,
+
+        *,
+        temperature:    float          = 1.0,    # >0; applied to logits before sampling; ignored if greedy
+        top_k:          Optional[int]   = None,  # keep the k largest-logit tokens, -inf the rest
+        top_p:          Optional[float] = None,  # nucleus: smallest set with softmax cumsum >= p
+        greedy:         bool           = False,  # True -> argmax; ignores temperature/top_k/top_p
+    ) -> torch.Tensor:                       # (B, N0 + max_new_tokens) prompt followed by generated ids
+        r"""Autoregressively extend each prompt by ``max_new_tokens`` tokens.
+
+        Reuses :meth:`forward` (``targets=None`` -> logits ``(B, N, V)``): each step
+        feeds the running sequence -- TRUNCATED to the last ``cfg.max_seq_len`` tokens,
+        since the model and its attention prior are built for ``N <= max_seq_len`` --
+        through ``forward``, reads the last-position logits ``logits[:, -1, :]``, turns
+        them into a next token, and appends it. The returned sequence keeps the FULL
+        prompt (including any portion beyond ``max_seq_len``) followed by the generated
+        ids. Because it only calls ``forward`` and never the training/loss branch, it
+        cannot corrupt training (runs under ``torch.no_grad``).
+
+        Greedy (``greedy=True``) takes the argmax and ignores ``temperature``/``top_k``/
+        ``top_p``. Otherwise the logits are divided by ``temperature``, then ``top_k``
+        (keep the k largest, ``-inf`` the rest), then ``top_p`` (nucleus: smallest set
+        whose softmax cumsum reaches ``p``, ``-inf`` the rest, always keeping the top
+        token), then softmaxed and sampled with :func:`torch.multinomial`.
+
+        This is the correct-but-slow first version: it re-runs the FULL forward (encode
+        -> E-step -> decode) for every generated token. Incremental belief reuse across
+        steps is a future optimization.
+        """
+        seq = token_ids
+        for _ in range(max_new_tokens):
+            context = seq[:, -self.cfg.max_seq_len:]                 # (B, <=max_seq_len)
+            logits = self.forward(context)                          # (B, n, V)
+            logits = logits[:, -1, :]                               # (B, V) last position
+            if greedy:
+                next_token = logits.argmax(dim=-1, keepdim=True)    # (B, 1)
+            else:
+                logits = logits / temperature
+                if top_k is not None:
+                    kth = logits.topk(top_k, dim=-1).values[:, -1:]  # (B, 1) k-th largest
+                    logits = logits.masked_fill(logits < kth, float("-inf"))
+                if top_p is not None:
+                    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+                    cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                    # Keep the smallest nucleus whose cumprob reaches top_p; the strict
+                    # shift always keeps the top token (its cumprob>=p never removes it).
+                    remove = cumprobs - sorted_logits.softmax(dim=-1) >= top_p
+                    remove_unsorted = remove.scatter(-1, sorted_idx, remove)
+                    logits = logits.masked_fill(remove_unsorted, float("-inf"))
+                probs = logits.softmax(dim=-1)                      # (B, V)
+                next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            seq = torch.cat([seq, next_token], dim=-1)
+        return seq
+
+    @torch.no_grad()
     def diagnostics(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used

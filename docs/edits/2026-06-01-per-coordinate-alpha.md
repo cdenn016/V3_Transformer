@@ -412,3 +412,44 @@ Tests (TDD, watched RED then GREEN):
 
 Full suite after the change: `tests=284 failures=0 errors=0 skipped=0` (read from junitxml; 280
 baseline + 4 new; viz collected normally; 1 xpassed pre-existing).
+
+### Autoregressive `generate()` (roadmap item)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. The model could only do teacher-forced CE training; it
+had no way to produce text. Added an ADDITIVE, training-isolated `VFEModel.generate(token_ids,
+max_new_tokens, *, temperature=1.0, top_k=None, top_p=None, greedy=False) -> (B, N0 +
+max_new_tokens)` on `vfe3/model/model.py` (the only production file touched). It REUSES the existing
+`forward` (encode -> E-step -> decode) rather than reimplementing the belief pipeline: each step
+feeds the running sequence -- truncated to the last `cfg.max_seq_len` tokens, since the model and
+its attention prior are built for `N <= max_seq_len` -- through `forward(seq)` (`targets=None` ->
+logits `(B, N, V)`), reads `logits[:, -1, :]`, turns it into a next token, and appends. The returned
+sequence keeps the FULL prompt (including any portion beyond `max_seq_len`) followed by the generated
+ids. Decorated `@torch.no_grad()`; because it never calls the training/loss branch it cannot corrupt
+training (that isolation is the safety oracle).
+
+Samplers (minimal, no registry): `greedy=True` takes the argmax and returns BEFORE any
+temperature/top_k/top_p logic (so those are ignored under greedy). Otherwise logits are divided by
+`temperature`, then `top_k` (keep the k largest, `-inf` the rest via the k-th-largest threshold),
+then `top_p` (nucleus: `-inf` every token for which the strictly-preceding sorted cumulative softmax
+mass already reaches `p`, which always keeps the top token, then scatter the sorted mask back to
+vocab order), then softmax + `torch.multinomial`. Cost note: this is the correct-but-slow first
+version -- it re-runs the FULL forward (encode -> E-step -> decode) for every generated token;
+incremental belief reuse across steps is a future optimization, documented in the docstring.
+
+Tests (`tests/test_generate.py`, TDD oracle-first, watched RED -- 9 `AttributeError: no attribute
+'generate'` -- then GREEN): `test_shape_in_vocab_and_prompt_preserved` (shape `(B, N0+5)`, all ids in
+`[0, V)`, prompt columns preserved), `test_greedy_is_deterministic` (two greedy calls equal),
+`test_greedy_equals_forward_argmax_first_token` (the pin: first greedy token == `argmax` of
+`forward(prompt)[:, -1, :]`; first token only, since step 2+ conditions on a longer sequence),
+`test_greedy_ignores_temperature_topk_topp` (wild temperature + aggressive top_k/top_p alongside
+`greedy=True` change nothing -- pins the branch ordering), `test_top_k_one_is_argmax_first_token`
+(`top_k=1` not-greedy is deterministic and equals argmax), `test_top_k_membership_first_token` (the
+first sampled token lies among the k largest of the last-position logits), `test_top_p_and_
+temperature_paths_run_in_vocab` (both paths run, stay in-vocab), `test_prompt_longer_than_max_seq_len_
+does_not_error` (a prompt longer than `max_seq_len` does not error; full prompt preserved in the
+return), and `test_generate_is_training_isolated` (the safety oracle: `mu_embed` unchanged before/after
+a generate call, and the training forward still returns a finite loss afterward).
+
+Full suite after the change: `tests=293 failures=0 errors=0 skipped=0` (read from junitxml; 284
+baseline + 9 new; viz collected normally; 1 xpassed pre-existing). `generate` is purely additive: it
+changed no existing test.
