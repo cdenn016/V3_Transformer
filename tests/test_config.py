@@ -171,17 +171,19 @@ def test_config_diagonal_covariance_cross_check_uses_cov_kind():
 def test_config_accepts_newly_registered_family_without_editing_config():
     """A new family registered with cov_kind='diagonal' is a valid config family and passes the
     diagonal_covariance cross-check without editing config.py (no hardcoded family-name list)."""
-    from vfe3 import divergence
+    from vfe3.families.base import register_family, _FAMILIES
+    from vfe3.families.gaussian import DiagonalGaussian
 
     name = "laplace_diagonal_test"
-    divergence.register_divergence(name, cov_kind="diagonal")(
-        divergence._DIVERGENCES["gaussian_diagonal"]
-    )
+
+    @register_family(name)
+    class _LaplaceDiagonal(DiagonalGaussian):                            # cov_kind = "diagonal"
+        pass
+
     try:
         cfg = VFE3Config(family=name, diagonal_covariance=True)          # must NOT raise
         assert cfg.family == name
         with pytest.raises(ValueError):
             VFE3Config(family=name, diagonal_covariance=False)          # cov_kind diagonal != False
     finally:
-        divergence._DIVERGENCES.pop(name, None)
-        divergence._COV_KIND.pop(name, None)
+        _FAMILIES.pop(name, None)

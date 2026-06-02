@@ -53,6 +53,7 @@ def test_transport_covariance_diag_matches_einsum_formula():
 
 def test_transported_kl_is_gauge_consistent():
     from vfe3.divergence import kl
+    from vfe3.families.gaussian import FullGaussian
     grp = get_group("so_k")(K=4)
     g = torch.Generator().manual_seed(9)
     phi = 0.3 * torch.randn(2, 3, grp.generators.shape[0], generator=g)
@@ -69,7 +70,7 @@ def test_transported_kl_is_gauge_consistent():
     S_kt = transport_covariance(omega, S_k)
     mu_qb = mu_q.unsqueeze(2).expand(2, 3, 3, 4)
     S_qb = S_q.unsqueeze(2).expand(2, 3, 3, 4, 4)
-    base = kl(mu_qb, S_qb, mu_kt, S_kt, family="gaussian_full")
+    base = kl(FullGaussian(mu_qb, S_qb), FullGaussian(mu_kt, S_kt))
 
     coeff = 0.25 * torch.randn(grp.generators.shape[0], generator=g)
     h = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", coeff, grp.generators))
@@ -77,7 +78,7 @@ def test_transported_kl_is_gauge_consistent():
     mu_kt2 = torch.einsum("kl,bijl->bijk", h, mu_kt)
     S_qb2 = torch.einsum("kl,bijlm,nm->bijkn", h, S_qb, h)
     S_kt2 = torch.einsum("kl,bijlm,nm->bijkn", h, S_kt, h)
-    moved = kl(mu_qb2, S_qb2, mu_kt2, S_kt2, family="gaussian_full")
+    moved = kl(FullGaussian(mu_qb2, S_qb2), FullGaussian(mu_kt2, S_kt2))
     assert torch.allclose(base, moved, atol=1e-3, rtol=1e-3)
 
 

@@ -30,7 +30,7 @@ import torch
 from torch import nn
 
 from vfe3.belief import BeliefState
-from vfe3.divergence import kl
+from vfe3.divergence import get_family, kl
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +196,8 @@ class PriorBank(nn.Module):
         sigma_v = torch.exp(self.sigma_log_embed).clamp(min=self.eps)    # (V, K)
         mu_q_b = mu_q.unsqueeze(-2)                                      # (B, N, 1, K)
         sigma_q_b = sigma_q.unsqueeze(-2)                               # (B, N, 1, K)
-        kl_v = kl(mu_q_b, sigma_q_b, mu_v, sigma_v, kl_max=float("inf"))  # (B, N, V), unclamped
+        diag = get_family("gaussian_diagonal")
+        kl_v = kl(diag(mu_q_b, sigma_q_b), diag(mu_v, sigma_v), kl_max=float("inf"))  # (B, N, V), unclamped
         return -kl_v / tau_eff
 
 
@@ -304,7 +305,8 @@ def _decode_full(
     sigma_v = torch.diag_embed(torch.exp(pb.sigma_log_embed).clamp(min=pb.eps))  # (V, K, K) diagonal-as-full
     mu_q_b = mu_q.unsqueeze(-2)                                          # (B, N, 1, K)
     sigma_q_b = sigma_q.unsqueeze(-3)                                    # (B, N, 1, K, K)
-    kl_v = kl(mu_q_b, sigma_q_b, mu_v, sigma_v, kl_max=float("inf"), family="gaussian_full")  # (B, N, V)
+    full = get_family("gaussian_full")
+    kl_v = kl(full(mu_q_b, sigma_q_b), full(mu_v, sigma_v), kl_max=float("inf"))  # (B, N, V)
     return -kl_v / tau_eff
 
 

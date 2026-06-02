@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
+from vfe3.families.base import get_family
 from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence_for_alpha
 from vfe3.geometry.transport import transport_covariance, transport_mean
 from vfe3.gradients.oracle import belief_gradients_autograd
@@ -182,10 +183,11 @@ def belief_gradients(
     mu_k, sigma_k = mu.detach(), sigma.detach()
     mu_t = transport_mean(omega, mu_k)                 # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma_k)
-    sd = self_divergence_for_alpha(mu, sigma, mu_p, sigma_p, alpha=1.0, kl_max=kl_max, eps=eps,
-                                   family=family, divergence_family=divergence_family, alpha_mode=alpha_mode)
-    energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=1.0, kl_max=kl_max, eps=eps,
-                             family=family, divergence_family=divergence_family, irrep_dims=irrep_dims)
+    fam = get_family(family)
+    sd = self_divergence_for_alpha(fam(mu, sigma), fam(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
+                                   divergence_family=divergence_family, alpha_mode=alpha_mode)
+    energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0, kl_max=kl_max, eps=eps,
+                             divergence_family=divergence_family, irrep_dims=irrep_dims)
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)   # (N,N) or (H,N,N)
     beta_coord = _beta_to_coordinate(beta, irrep_dims, mu.shape[-1])  # (N,N,K) per-coordinate
     coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=alpha_mode)
