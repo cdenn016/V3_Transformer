@@ -584,3 +584,68 @@ normally; 1 xpassed pre-existing). Note: squared_hellinger trains through the au
 (`self_divergence_per_coord` guards renyi-only) — both automatic and correct; the per-coord refusal
 is the documented known incompatibility, and the forward+finite-loss smoke test covers the oracle
 training path.
+
+## 2026-06-02 — Log-Euclidean SPD retraction variant (spec 2a; 2b deferred)
+
+Branch: vfe3-roadmap-overnight-2026-06-02 (committed directly).
+Design spec: docs/superpowers/specs/2026-06-01-spd-retraction-variants-design.md, PHASE 1 = reading 2a
+(the pure log-Euclidean retraction) ONLY. 2b (the Frechet / Daleckii-Krein natural-gradient kernel)
+remains a deferred sub-flag per the spec — NOT built.
+
+### Files
+- `vfe3/geometry/retraction.py`: new bare `retract_logeuclidean_full` (two-eigh logm/expm) + registered
+  `@register_retraction("log_euclidean")` `retract_log_euclidean(sigma, delta_sigma, mean_ndim, *,
+  step_size, trust_region, eps, sigma_max)` — the SAME signature as `retract_spd_affine`, so the E-step
+  dispatch stays uniform.
+- `vfe3/config.py`: `spd_retract_mode="log_euclidean"` already validates against the retraction registry
+  (registration alone suffices). Added a config-time `UserWarning` (not error) when
+  `spd_retract_mode=="log_euclidean"` is paired with a diagonal family.
+- `tests/test_retraction.py`: 8 new tests (below).
+
+### The LE formula (spec reading 2a)
+    Sigma_new = expm( logm(Sigma) + step_size * sym(delta_sigma) ).
+logm/expm via `torch.linalg.eigh` (logm(Sigma) = V diag(log lambda_j) V^T; expm(M) = U diag(exp mu_j)
+U^T), the same two-eigh structure and fp32-island as `retract_spd_full`. Input eigenvalues floored at
+`eps` before log; output spectrum projected to [eps, sigma_max^2]. SPD-preserving for ANY step (expm of
+a symmetric matrix is SPD); the trust region is a stability knob, not a positivity guard. The trust
+region clamps the TANGENT term only (`logm(Sigma) + frobenius_clamp(step*delta)`), NOT the base point,
+so the retraction axiom R(Sigma, 0) = Sigma holds (matching the affine path, which clamps the whitened
+tangent). Diagonal reduction: `sigma_new = sigma * exp(step_size * delta_sigma)`.
+
+### VERIFIED diagonal relationship (spec contradiction — DONE_WITH_CONCERNS)
+The spec (sec 2, DECISION 5) claims LE EQUALS affine on the diagonal. Verified FALSE under THIS seam's
+tangent convention. Phase 0 kept the Fisher metric conversion in the E-step (`natural_gradient`,
+e_step.py:212), so the seam receives an ALREADY-preconditioned `delta_sigma`. The affine diagonal
+retraction (`retract_spd_diagonal`) then whitens that tangent by 1/sigma (`whitened = delta/sigma`,
+retraction.py:57), giving `sigma exp(step*delta/sigma)`; LE does NOT whiten, giving `sigma
+exp(step*delta)`. Equal only at sigma = I. The spec's equality holds for the 2b log-chart NATURAL
+gradient, not for 2a under a pre-whitened tangent. Consequently the config WARN is worded TRUTHFULLY:
+on a diagonal family LE is a non-canonical log-chart step (lacks the affine Fisher whitening) and does
+NOT reduce to spd_affine — prefer spd_affine on the diagonal family, or use gaussian_full. LE is a
+genuinely new variant only for full covariance (logm != elementwise log). The
+`test_log_euclidean_diagonal_differs_from_affine` test pins this finding; the spec's proposed
+`equals_affine` test was NOT written (it would assert a falsehood).
+
+### Oracles
+- SPD-preservation (core): `test_log_euclidean_stays_spd_unconditionally` — random full-cov SPD Sigma +
+  symmetric tangent, no trust region, symmetric PD output across step sizes; guards that neither the eps
+  floor nor the sigma_max cap engaged (the genuine expm map, not a clamp), plus an ill-conditioned-base
+  contrast where a naive Euclidean step leaves the cone but LE stays PD.
+- Independent matrix reference: `test_log_euclidean_full_matches_independent_expm_logm` — equals an
+  INDEPENDENTLY computed `expm(logm(Sigma) + step*sym(delta))` via `torch.linalg.matrix_exp` + an
+  eigh-based logm written in the test (distinct code path), well-conditioned Sigma + modest step so no
+  clamp binds, atol 1e-5.
+- `test_log_euclidean_identity_tangent_is_identity` — R(Sigma, 0) = Sigma at the operational
+  trust_region=5.0 (pins the tangent-only clamp fix).
+- `test_log_euclidean_diagonal_is_log_chart_step` — diagonal `sigma*exp(step*delta)`.
+- `test_log_euclidean_diagonal_differs_from_affine` — the verified scope finding above.
+- `test_log_euclidean_registered_and_config_accepts`, `test_log_euclidean_diagonal_pairing_warns` —
+  registry + config validation + the diagonal-pairing WARN (pytest.warns).
+- `test_log_euclidean_e_step_full_cov_runs` — full-covariance E-step forward+backward under
+  spd_retract_mode='log_euclidean': finite SPD covariance, finite grads.
+
+### Default path + suite
+Default `spd_affine` path byte-identical (the two `test_spd_affine_bit_identical_*` use torch.equal /
+atol=0 and pass; additive variant, no edits to affine code). Full suite after the change:
+`tests=321 failures=0 errors=0 skipped=0` (read from junitxml; 313 baseline + 8 new; 320 passed +
+1 xpassed pre-existing). 2b deferred.
