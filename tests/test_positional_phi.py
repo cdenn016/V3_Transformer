@@ -41,3 +41,51 @@ def test_apply_none_is_identity():
 def test_get_pos_phi_unknown_raises_keyerror():
     with pytest.raises(KeyError):
         get_pos_phi("not_a_mode")
+
+
+from vfe3.config import VFE3Config
+from vfe3.model.model import VFEModel
+
+
+def _cfg(**kw):
+    base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                n_e_steps=1, e_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
+                warmup_steps=1, max_steps=4)
+    base.update(kw)
+    return VFE3Config(**base)
+
+
+def test_pos_phi_none_logits_byte_identical_to_no_field():
+    torch.manual_seed(0)
+    x = torch.randint(0, 6, (2, 8))
+    m = VFEModel(_cfg(pos_phi="none"))
+    logits_a = m(x)
+    logits_b = m(x)
+    assert torch.equal(logits_a, logits_b)              # determinism guard
+    assert not hasattr(m, "pos_phi_free")               # no parameter created on the pure path
+
+
+def test_pos_phi_learned_creates_parameter_and_changes_logits():
+    torch.manual_seed(0)
+    x = torch.randint(0, 6, (2, 8))
+    base = VFEModel(_cfg(pos_phi="none"))
+    learned = VFEModel(_cfg(pos_phi="learned", pos_phi_scale=0.3))
+    learned.load_state_dict(base.state_dict(), strict=False)   # share priors; pos_phi_free is extra
+    assert hasattr(learned, "pos_phi_free")
+    assert learned.pos_phi_free.shape == (8, base.group.generators.shape[0])
+    with torch.no_grad():
+        learned.pos_phi_free.add_(0.2)
+    assert not torch.allclose(base(x), learned(x), atol=1e-5)
+
+
+def test_pos_phi_learned_receives_gradient():
+    torch.manual_seed(0)
+    x = torch.randint(0, 6, (2, 8))
+    y = torch.randint(0, 6, (2, 8))
+    m = VFEModel(_cfg(pos_phi="learned", pos_phi_scale=0.3))
+    with torch.no_grad():
+        m.pos_phi_free.add_(0.1)
+    _, loss, _ = m(x, y)
+    loss.backward()
+    assert m.pos_phi_free.grad is not None
+    assert m.pos_phi_free.grad.abs().sum() > 0

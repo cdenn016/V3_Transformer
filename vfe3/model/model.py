@@ -21,6 +21,7 @@ from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.norms import get_norm
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import vfe_block
+from vfe3.model.positional_phi import apply_positional_phi
 from vfe3.model.prior_bank import PriorBank
 from vfe3.model.stack import vfe_stack
 
@@ -150,6 +151,25 @@ class VFEModel(nn.Module):
         # (audit 4e) keyed on those so it is built once, not every forward. Not an nn.buffer
         # because it depends on the runtime N (sequence length), which varies across calls.
         self._log_prior_cache: dict = {}
+        # BCH positional encoding (default-off): a learned per-position Lie-algebra element table
+        # composed into the gauge frame before transport. Created ONLY for pos_phi='learned' (a raw
+        # nn.Parameter like log_alpha/connection_W, not a network); the "none"/"frozen" paths add no
+        # parameter, so the pure path stays param-free. Init scaled by pos_phi_scale.
+        if cfg.pos_phi == "learned":
+            self.pos_phi_free = nn.Parameter(
+                torch.randn(cfg.max_seq_len, n_gen) * cfg.pos_phi_scale)
+            if cfg.detach_e_step:
+                # Footgun (mirrors log_alpha / connection_W): pos_phi_free enters the loss ONLY
+                # through the E-step belief transport, which detach_e_step wraps in no_grad, so the
+                # positional table receives no gradient and stays frozen at init. Set
+                # detach_e_step=False to learn it.
+                import warnings
+                warnings.warn(
+                    "pos_phi='learned' with detach_e_step=True freezes pos_phi_free: the positional "
+                    "gauge element enters the loss only through the E-step transport, which the "
+                    "detached (no_grad) E-step severs. Set detach_e_step=False to train it.",
+                    stacklevel=2,
+                )
 
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":
         r"""Carry the gauge group's generators through ``.to(...)`` / ``.cuda()`` etc.
@@ -212,6 +232,18 @@ class VFEModel(nn.Module):
             return nullcontext()
         return torch.autocast(device_type=device.type, enabled=False)
 
+    def _apply_pos_phi(self, phi: torch.Tensor) -> torch.Tensor:
+        r"""Compose the configured BCH positional element into the gauge frame (no-op for 'none')."""
+        if self.cfg.pos_phi == "none":
+            return phi
+        return apply_positional_phi(
+            phi, self.group,
+            mode=self.cfg.pos_phi, compose_mode=self.cfg.pos_phi_compose,
+            order=self.cfg.bch_pe_order, scale=self.cfg.pos_phi_scale,
+            project_slk=self.cfg.pos_phi_project_slk,
+            pos_phi_free=getattr(self, "pos_phi_free", None),
+        )
+
     def forward(
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
@@ -220,6 +252,7 @@ class VFEModel(nn.Module):
         r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given."""
         B, N = token_ids.shape
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
+        beliefs = beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))
         log_prior = self._attention_log_prior(N, token_ids.device)
 
         # The E-step stack is vectorized over the batch (audit 4c): the belief tuple carries a
@@ -510,7 +543,7 @@ class VFEModel(nn.Module):
 
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
-        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=enc.phi[0])
+        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         out = vfe_stack(                                              # converged belief
@@ -599,7 +632,7 @@ class VFEModel(nn.Module):
 
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
-        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=enc.phi[0])
+        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
         fam = get_family(cfg.family)

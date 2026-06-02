@@ -396,3 +396,9 @@ Two small non-behavior-changing fixes applied to `vfe3/model/positional_phi.py` 
 **Fix 2 (coverage).** `tests/test_positional_phi.py` imported `get_pos_phi` but never exercised it. Added `import pytest` at the top and a new test `test_get_pos_phi_unknown_raises_keyerror` that confirms `KeyError` is raised for an unregistered mode name.
 
 Final run: **5 passed** (read from `5 passed in 0.02s`). Commit: `accb330`.
+
+## Task 1.3 — wire BCH-PE into forward / diagnostics / attention_maps (2026-06-02, branch vfe3-positional-encodings-2026-06-02)
+
+Wired the `apply_positional_phi` call into `VFEModel` so the configured positional gauge element is composed into `beliefs.phi` before the E-step and before any diagnostic/map replay.
+
+Changes to `vfe3/model/model.py`: (1) imported `apply_positional_phi` from `vfe3.model.positional_phi`; (2) added `pos_phi_free = nn.Parameter(randn(max_seq_len, n_gen) * pos_phi_scale)` in `__init__` ONLY for `pos_phi='learned'`, mirroring the `log_alpha`/`connection_W` detach-warning idiom (pure "none"/"frozen" paths add no parameter); (3) added private `_apply_pos_phi(phi)` helper that is a no-op for `'none'`; (4) called `beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))` immediately after `prior_bank.encode` in `forward`; (5) wrapped `enc.phi[0]` with `self._apply_pos_phi(...)` in both `diagnostics` and `attention_maps`. Three tests added to `tests/test_positional_phi.py`: determinism + no-param-on-pure-path; parameter shape + logit divergence; gradient flow to `pos_phi_free`. Final runs: **8 passed** (`tests/test_positional_phi.py`), **24 passed** (`tests/test_model.py`), both read from the `N passed` lines.
