@@ -162,6 +162,46 @@ def plot_attention_heatmap(
     return _save(fig, path)
 
 
+def plot_attention_grid(
+    maps,                                # (L, H, N, N) per-layer per-head attention (or (H,N,N) / (N,N))
+
+    *,
+    title: str           = "Attention",
+    path:  Optional[str] = None,
+):
+    """Grid of attention heatmaps: rows = layers, cols = heads (rows query i, cols key j).
+
+    Accepts a per-layer/per-head stack ``(L, H, N, N)`` (as :meth:`VFEModel.attention_maps`
+    returns), a single layer ``(H, N, N)``, or a single map ``(N, N)``. A shared colour scale
+    across all panels makes heads/layers comparable; ``squeeze=False`` keeps the L==1 / H==1
+    axes array 2-D so indexing is uniform.
+    """
+    M = _np(maps)
+    if M.ndim == 2:                      # (N, N) -> one layer, one head
+        M = M[None, None]
+    elif M.ndim == 3:                    # (H, N, N) -> one layer
+        M = M[None]
+    L, H = M.shape[0], M.shape[1]
+    fig, axes = plt.subplots(L, H, figsize=(2.6 * H + 1.0, 2.6 * L + 0.6), squeeze=False)
+    vmax = float(M.max()) if M.size else 1.0
+    im = None
+    for li in range(L):
+        for hi in range(H):
+            ax = axes[li][hi]
+            im = ax.imshow(M[li, hi], cmap="magma", aspect="auto", vmin=0.0, vmax=vmax)
+            ax.set_xticks([]); ax.set_yticks([])
+            if li == 0:
+                ax.set_title(f"head {hi}")
+            if hi == 0:
+                ax.set_ylabel(f"layer {li}\nquery $i$")
+            if li == L - 1:
+                ax.set_xlabel("key $j$")
+    if im is not None:
+        fig.colorbar(im, ax=list(axes.ravel()), shrink=0.85, label=r"$\beta_{ij}$")
+    fig.suptitle(title)
+    return _save(fig, path)
+
+
 def plot_covariance_ellipses(
     mu,                                  # (N, K) belief means
     sigma,                               # (N, K) diagonal variances
@@ -209,6 +249,7 @@ _FIGURES: Dict[str, Callable] = {
     "embedding":           plot_embedding,
     "attention_graph":     plot_attention_graph,
     "attention_heatmap":   plot_attention_heatmap,
+    "attention_grid":      plot_attention_grid,
     "covariance_ellipses": plot_covariance_ellipses,
     "trajectory":          plot_trajectory,
 }

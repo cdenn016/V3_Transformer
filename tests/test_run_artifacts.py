@@ -100,6 +100,25 @@ def test_train_with_artifacts_writes_files(tmp_path):
     assert any((tmp_path / "run" / "checkpoints").glob("step_*.pt"))
 
 
+def test_train_with_artifacts_writes_attention_pngs(tmp_path):
+    # Per-eval per-layer/per-head attention grid: one attention/step_<N>.png per periodic eval.
+    cfg = _cfg(n_layers=2, prior_handoff_rho=0.5)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    train(model, _loader(), cfg, n_steps=4, eval_interval=2, val_loader=_loader(seed=1), artifacts=art)
+    pngs = sorted((tmp_path / "run" / "attention").glob("step_*.png"))
+    assert [p.name for p in pngs] == ["step_2.png", "step_4.png"]
+    assert all(p.stat().st_size > 0 for p in pngs)
+
+
+def test_save_attention_maps_is_best_effort(tmp_path):
+    # A viz/plotting error must be swallowed (logged, never raised) so it cannot kill a run.
+    cfg = _cfg()
+    art = RunArtifacts(tmp_path / "run", cfg, VFEModel(cfg))
+    assert art.save_attention_maps(1, object()) is None         # bad maps -> None, no exception
+
+
 def test_train_without_artifacts_writes_nothing(tmp_path):
     cfg = _cfg()
     torch.manual_seed(0)

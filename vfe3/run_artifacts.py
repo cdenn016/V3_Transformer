@@ -95,6 +95,33 @@ class RunArtifacts:
             return True
         return False
 
+    def save_attention_maps(
+        self,
+        step:   int,
+        maps:   torch.Tensor,                 # (L, H, N, N) per-layer per-head attention
+        logger: Optional[logging.Logger] = None,
+    ) -> Optional[Path]:
+        r"""Best-effort per-layer/per-head attention heatmap grid for one periodic eval.
+
+        Writes ``attention/step_<N>.png`` (an L x H grid of beta heatmaps; see
+        :func:`vfe3.viz.figures.plot_attention_grid`). Mirrors ``_save_figures``: a plotting or
+        dependency error is logged and swallowed (never fatal to the run), and the figure is
+        closed so ~30 evals do not leak figures. Returns the path written, or None on failure.
+        """
+        try:
+            from vfe3.viz import figures as figs
+            figs.set_publication_style()
+            attn_dir = self.run_dir / "attention"
+            attn_dir.mkdir(exist_ok=True)
+            path = attn_dir / f"step_{step}.png"
+            fig = figs.plot_attention_grid(maps, title=f"Attention (step {step})", path=str(path))
+            figs.plt.close(fig)
+            return path
+        except Exception as exc:                                    # a viz error must never kill training
+            (logger or logging.getLogger(__name__)).warning(
+                "attention-map figure at step %d failed (%s); training continues", step, exc)
+            return None
+
     def save_checkpoint(
         self,
         step:      int,

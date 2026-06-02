@@ -312,3 +312,57 @@ centroid, `requires_grad=False`). Done — the coverage guard now exempts non-tr
 `build_optimizer` works for `lambda_h>0` (s trains, r fixed). And note `model_channel` with
 `gamma=lambda_h=0` is a *pure rename* of `mu_embed` (zero added capacity); the model channel changes
 predictions only once `gamma>0`/`lambda_h>0` shape `s` beyond CE.
+
+## Per-eval attention plots + sample text (2026-06-02, separate from the model-channel work above)
+
+Two reporting features were added to the periodic-eval path. Both are opt-in and leave the silent
+training path bitwise-identical when not configured. Full suite green at 457 tests (was 447), 0
+failures, 0 errors, via `--junitxml`.
+
+**Per-layer, per-head attention heatmaps every eval interval.** A new `VFEModel.attention_maps(token_ids)`
+(no_grad, off the training graph) returns `(L, H, N, N)` for sequence 0: it replays the `vfe_stack`
+block loop one block at a time, mirroring the `mu_p`/`sigma_p` handoff in `stack.py` line for line, and
+at the converged output belief of each block recomputes the attention pattern the same way
+`diagnostics()` does at the final belief (transport `Omega_ij(phi)` then `pairwise_energy` then
+`attention_weights`). The per-irrep-block energy supplies the head axis `H = len(group.irrep_dims)` (1 for
+glk/so_k, 2 for the default block_glk at K=20). The canonical definition of "per-layer attention" is
+pinned by construction: the last layer's map equals the attention `diagnostics()` reads, byte-identical at
+`n_layers=1` (where the stack is a single block and the handoff loop is empty), which is asserted as a
+test (`attention_entropy(maps[-1]) == diagnostics()["attn_entropy"]`); for `n_layers>1` the replay uses
+each block's own output, the exact trajectory the model ran, while diagnostics folds the final belief, so
+the two diverge by design. A new figure `plot_attention_grid` renders an `L x H` grid of `beta` heatmaps
+(`squeeze=False`, shared colour scale; rows query `i`, cols key `j`) and a best-effort
+`RunArtifacts.save_attention_maps` writes `attention/step_<N>.png` each periodic eval. The save is wired
+inside the eval block's `if artifacts is not None` guard (so it needs a run directory, matching all other
+persistence) and runs on the same live-batch sequence 0 that the logged diagnostics consume. A viz error
+is logged and swallowed, never fatal, and every figure is closed.
+
+**Sample text directly below the BPC value every eval interval.** `train()` gained three keyword
+arguments (`sample_decode`, `sample_new_tokens=40`, `sample_prompt_len=16`). The decoder is the explicit
+`sample_decode` if given, otherwise an AUTO-DEFAULT (`_default_sample_decoder(cfg)`) chosen from
+`cfg.vocab_size`: gpt2 for a vocab in roughly `[40k, 60k]`, cl100k for `[90k, 110k]`, and `None`
+otherwise. This vocab gate is what preserves the pure path without a new toggle — a real click-to-run on
+wikitext-* (vocab 50257) prints samples with zero wiring and no entry-file edit, while a tiny
+synthetic/test vocab (e.g. 6) gets no decoder and the eval stays silent. When a decoder exists, the eval
+block greedily continues sequence 0 of the live batch by `sample_new_tokens` (`model.generate`, already
+no_grad) and logs `Sample: <prompt> -> <continuation>` immediately under the BPC line, best-effort (a
+generation/decode error is logged, never fatal). This choice (auto-default in `train()`) was the user's,
+made because the click-to-run entry `train_vfe3.py` is user-owned and was to stay untouched. The pure
+silent path stays reachable under a toggle: `train(..., generate_samples=False)` forces no generation and
+no `Sample:` line even at a real vocab, satisfying the project's pure-path constraint without an entry-file
+edit (default `True` preserves the requested auto-on). A companion `datasets.get_tiktoken_decoder(dataset)`
+remains available for an explicit, dataset-named decoder (gpt2 / cl100k by the cache tag, `None` for the
+synthetic anchor / absent tiktoken) should a caller want to pass one explicitly. Caveat on verification:
+the decode round-trip is verified (gpt2 ids `[15496, 995]` -> `"Hello world"`); end-to-end smoke runs used
+the synthetic period-3 stream, so real-corpus continuation quality has not yet been observed in this work.
+
+**Scheduler note (asked in passing).** Yes — `train()` already builds a warmup-then-cosine schedule:
+`lr_lambda(step, cfg)` does a linear warmup to 1.0 over `warmup_steps`, then a half-cosine decay to 0.0 at
+`max_steps` (argument clamped to `[0, pi]` so steps past `max_steps` stay at 0), wired through
+`torch.optim.lr_scheduler.LambdaLR` and advanced once per optimizer step in `train_step`. No change was
+made to it.
+
+Files touched: `vfe3/model/model.py` (attention_maps + the `vfe_block` import), `vfe3/viz/figures.py`
+(plot_attention_grid + registry), `vfe3/run_artifacts.py` (save_attention_maps), `vfe3/train.py`
+(sample-text args + block, attention-save wire-in), `vfe3/data/datasets.py` (get_tiktoken_decoder). Tests
+added across `test_model.py`, `test_viz.py`, `test_run_artifacts.py`, `test_train.py`, `test_data.py`.

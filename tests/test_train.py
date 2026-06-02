@@ -219,6 +219,63 @@ def test_train_caps_periodic_eval_at_eval_max_batches():
     assert val_loader.count == 4          # 2 eval calls x cap 2, not x 5
 
 
+def test_sample_decode_emits_sample_line_each_eval(caplog):
+    # When a decoder is supplied, train() prints a "Sample:" line below the BPC value every eval;
+    # when it is None (the default) nothing is generated. A decode/gen error must not raise.
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    decode = lambda ids: " ".join(str(int(t)) for t in ids)        # trivial token->text decoder
+    with caplog.at_level("INFO"):
+        train(model, _periodic_loader(seed=0), cfg, n_steps=2, eval_interval=1,
+              val_loader=_periodic_loader(seed=1), sample_decode=decode,
+              sample_new_tokens=3, sample_prompt_len=4)
+    assert sum("Sample:" in r.message for r in caplog.records) == 2  # one per eval step
+
+
+def test_tiny_vocab_auto_default_stays_silent(caplog):
+    # The vocab-gated auto-default decoder is None for a tiny synthetic/test vocab (6 is not a
+    # real tokenizer size), so with no explicit decoder no Sample line is emitted -- the pure
+    # silent path is preserved with no extra toggle.
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    with caplog.at_level("INFO"):
+        train(model, _periodic_loader(seed=0), cfg, n_steps=2, eval_interval=1,
+              val_loader=_periodic_loader(seed=1))
+    assert not any("Sample:" in r.message for r in caplog.records)
+
+
+def test_generate_samples_false_is_silent_at_real_vocab(caplog):
+    # The pure-path opt-out: generate_samples=False suppresses sampling even at a real gpt2 vocab
+    # where the auto-default would otherwise fire (CLAUDE.md: a reachable silent path under a toggle).
+    pytest.importorskip("tiktoken")
+    cfg = VFE3Config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    with caplog.at_level("INFO"):
+        train(model, _periodic_loader(seed=0), cfg, n_steps=1, eval_interval=1,
+              val_loader=_periodic_loader(seed=1), generate_samples=False)
+    assert not any("Sample:" in r.message for r in caplog.records)
+
+
+def test_auto_default_sample_decoder_emits_at_gpt2_vocab(caplog):
+    # At a real gpt2 vocab the auto-default decoder activates with NO explicit decoder and NO
+    # entry-file wiring: a Sample line prints below BPC each eval (skip if tiktoken is absent).
+    pytest.importorskip("tiktoken")
+    cfg = VFE3Config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    with caplog.at_level("INFO"):
+        train(model, _periodic_loader(seed=0), cfg, n_steps=1, eval_interval=1,
+              val_loader=_periodic_loader(seed=1), sample_new_tokens=3, sample_prompt_len=4)
+    assert any("Sample:" in r.message for r in caplog.records)
+
+
 def test_train_vfe3_clickrun_importable_and_runs_one_step():
     from train_vfe3 import config as cr_config, synthetic_period3_loader
 

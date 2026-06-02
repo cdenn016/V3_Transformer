@@ -11,7 +11,7 @@ The cache holds 1-D token-id streams under
 import json
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -71,6 +71,26 @@ def load_cached_tokens(
     raise FileNotFoundError(
         f"no tokenized cache for {dataset!r}/{split!r}: tried {pt} and {binp}"
     )
+
+
+def get_tiktoken_decoder(
+    dataset:   str,
+) -> 'Optional[Callable[[Sequence[int]], str]]':
+    """A ``decode(token_ids) -> str`` for ``dataset``'s tokenizer, or None if unavailable.
+
+    Uses the SAME tokenizer the cache was built with (cl100k for wiki-ja/wiki-en, gpt2 otherwise,
+    matching :func:`_tokenizer_tag`), so generated ids map back to text consistently. Lazy-imports
+    tiktoken and returns None when tiktoken is absent or the dataset has no real tokenizer (the
+    synthetic period-3 anchor), letting the caller treat None as "no sample text".
+    """
+    if dataset == "synthetic-period3":
+        return None
+    try:
+        import tiktoken
+    except ImportError:
+        return None
+    enc = tiktoken.get_encoding("cl100k_base" if dataset in _CL100K_DATASETS else "gpt2")
+    return lambda ids: enc.decode([int(t) for t in ids])
 
 
 class TokenWindows(Dataset):

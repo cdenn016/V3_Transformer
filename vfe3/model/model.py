@@ -20,6 +20,7 @@ from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.norms import get_norm
 from vfe3.model.head_mixer import HeadMixer
+from vfe3.model.block import vfe_block
 from vfe3.model.prior_bank import PriorBank
 from vfe3.model.stack import vfe_stack
 
@@ -567,3 +568,73 @@ class VFEModel(nn.Module):
         d["holonomy_deviation"] = float(metrics.holonomy_deviation(omega))
         d["gauge_trace_spread"] = float(metrics.gauge_trace_spread(out.phi, self.group.generators))
         return d
+
+    @torch.no_grad()
+    def attention_maps(
+        self,
+        token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+    ) -> torch.Tensor:                     # (L, H, N, N) per-layer, per-head attention beta_ij
+        r"""Per-layer, per-head attention weights ``beta_ij`` for sequence 0 (no_grad).
+
+        Replays the :func:`vfe_stack` block loop one block at a time -- mirroring its
+        ``mu_p``/``sigma_p`` handoff (``prior_handoff_rho``/``prior_handoff_sigma``) line for
+        line -- and, at the CONVERGED output belief of each block, recomputes the attention
+        pattern the SAME way :meth:`diagnostics` does at the final belief: transport
+        Omega_ij(phi) -> pairwise energy E_ij = D(q_i || Omega_ij q_j) -> beta = softmax_j
+        (log_prior - E/tau). The per-irrep-block (per-head) energy gives a leading head axis
+        ``H = len(group.irrep_dims)`` (1 for a single-block group: glk / so_k), so the result is
+        ``(L, H, N, N)`` (rows = query i, cols = key j).
+
+        This is OFF the training hot path (no_grad, no graph) and is intended for periodic
+        figure generation, not every step. By construction the LAST layer's map equals the
+        attention :meth:`diagnostics` reads (byte-identical at ``n_layers == 1``, where the
+        stack is a single block and the handoff loop is empty; an approximation otherwise, since
+        diagnostics folds the FINAL belief into the handoff while this replay uses each block's
+        own output -- the EXACT trajectory the model ran).
+        """
+        from vfe3.inference.e_step import _transport
+        from vfe3.geometry.transport import transport_mean, transport_covariance
+        from vfe3.families.base import get_family
+        from vfe3.free_energy import pairwise_energy, attention_weights
+
+        cfg = self.cfg
+        enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
+        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=enc.phi[0])
+        n = belief.mu.shape[0]
+        log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
+        fam = get_family(cfg.family)
+        rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
+        mu_p, sigma_p = belief.mu, belief.sigma
+
+        maps = []
+        for _ in range(cfg.n_layers):
+            belief = vfe_block(                                       # converged belief at this block
+                belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
+                block_norm=self.block_norm,
+                log_alpha=getattr(self, "log_alpha", None),
+                connection_W=getattr(self, "connection_W", None),
+            )
+            # Attention at the converged belief, recomputed exactly as diagnostics does: the
+            # transport regime is matched so regime_ii reads the means + learned connection_W
+            # (flat ignores both), and the energy is per-irrep-block (per-head).
+            omega = _transport(
+                belief.phi, self.group, transport_mode=cfg.transport_mode,
+                mu=(belief.mu if cfg.transport_mode == "regime_ii" else None),
+                connection_W=getattr(self, "connection_W", None),
+                cocycle_relaxation=cfg.cocycle_relaxation,
+            )                                                        # (N, N, K, K)
+            mu_t = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
+            sigma_t = transport_covariance(omega.unsqueeze(0), belief.sigma.unsqueeze(0))[0]
+            energy = pairwise_energy(                                 # (N, N) or (H, N, N)
+                fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
+                alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
+            )
+            beta = attention_weights(energy, tau=cfg.tau, log_prior=log_prior)
+            if beta.dim() == 2:                                      # single-block group -> add an H=1 axis
+                beta = beta.unsqueeze(0)
+            maps.append(beta)                                        # (H, N, N)
+
+            mu_p = (1.0 - rho) * mu_p + rho * belief.mu              # handoff (mirrors vfe_stack)
+            sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
+        return torch.stack(maps, dim=0)                              # (L, H, N, N)

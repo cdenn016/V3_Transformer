@@ -11,6 +11,7 @@ from vfe3.viz.figures import (
     clustering_metrics,
     get_figure,
     plot_attention_graph,
+    plot_attention_grid,
     plot_attention_heatmap,
     plot_covariance_ellipses,
     plot_embedding,
@@ -76,7 +77,18 @@ def test_plot_covariance_ellipses_and_trajectory_save(tmp_path):
     assert _saved_nonempty(pe) and _saved_nonempty(pt)
 
 
+def test_plot_attention_grid_saves_4d_and_degenerate(tmp_path):
+    # (L, H, N, N) grid plus the L==1/H==1 degenerate inputs the squeeze=False guard must handle.
+    maps = torch.softmax(torch.randn(2, 3, 5, 5), dim=-1)          # 2 layers x 3 heads
+    p4 = tmp_path / "grid.png"; p3 = tmp_path / "g3.png"; p2 = tmp_path / "g2.png"
+    fig = plot_attention_grid(maps, path=str(p4)); plt.close(fig)
+    fig = plot_attention_grid(maps[0], path=str(p3)); plt.close(fig)   # (H, N, N) -> one layer
+    fig = plot_attention_grid(maps[0, 0], path=str(p2)); plt.close(fig)  # (N, N) -> one panel
+    assert _saved_nonempty(p4) and _saved_nonempty(p3) and _saved_nonempty(p2)
+
+
 def test_figure_registry():
     assert callable(get_figure("attention_heatmap"))
+    assert callable(get_figure("attention_grid"))
     with pytest.raises(KeyError):
         get_figure("not_a_figure")
