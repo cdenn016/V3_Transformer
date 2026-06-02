@@ -384,6 +384,18 @@ from vfe3.model.positional_phi import apply_positional_phi
         if cfg.pos_phi == "learned":
             self.pos_phi_free = nn.Parameter(
                 torch.randn(cfg.max_seq_len, n_gen) * cfg.pos_phi_scale)
+            if cfg.detach_e_step:
+                # Footgun (mirrors log_alpha / connection_W): pos_phi_free enters the loss ONLY
+                # through the E-step belief transport, which detach_e_step wraps in no_grad, so the
+                # positional table receives no gradient and stays frozen at init. Set
+                # detach_e_step=False to learn it.
+                import warnings
+                warnings.warn(
+                    "pos_phi='learned' with detach_e_step=True freezes pos_phi_free: the positional "
+                    "gauge element enters the loss only through the E-step transport, which the "
+                    "detached (no_grad) E-step severs. Set detach_e_step=False to train it.",
+                    stacklevel=2,
+                )
 ```
 
 (c) Add a small private helper (method on VFEModel) used by forward/diagnostics/attention_maps so the call is identical in all three:
@@ -1129,54 +1141,79 @@ git add vfe3/model/model.py tests/test_rope.py
 git commit -m "feat(rope): wrap diagnostics/attention_maps transport in RopeTransport"
 ```
 
-### Task 2.6: FD gradient checks (means-only and full-gauge) + full suite
+### Task 2.6: Gradient correctness (kernel-vs-oracle, covariance sandwich) + full suite
 
 **Files:**
 - Test: `tests/test_rope.py` (append)
 
-- [ ] **Step 1: Write the FD gradient tests**
+**Why not whole-model finite differences:** FD on the model loss through the unrolled E-step is the WRONG gate — the E-step has kinks (trust-region clamps, `sigma_max`, the Frobenius clamp in `matrix_exp`, `kl_max` NaN-cap) where FD != autograd for reasons unrelated to RoPE, so such a test fails spuriously. The codebase's actual discipline is "analytic kernel vs autograd-of-F **oracle**". Both `belief_gradients` (hand kernel) and `belief_gradients_autograd` (oracle) consume the built `omega` identically, so feeding the SAME `RopeTransport` to both isolates RoPE exactly.
 
-These mirror the codebase's autograd-of-F oracle discipline: the loss must backpropagate correctly through the rope-rotated transport. The autograd oracle (`belief_gradients_autograd`) already consumes the `RopeTransport` opaquely via `transport_mean`/`transport_covariance`, so a finite-difference check of the model loss vs autograd is the right gate.
+- [ ] **Step 1: Write the gradient-correctness tests**
 
 ```python
 # tests/test_rope.py  (append)
-import pytest
+from vfe3.gradients.kernels import belief_gradients
+from vfe3.gradients.oracle import belief_gradients_autograd
+from vfe3.inference.e_step import build_belief_transport
+from vfe3.geometry.transport import transport_covariance
 
 
-def _fd_grad_ok(cfg, seed=0, eps=1e-3):
-    torch.manual_seed(seed)
-    m = VFEModel(cfg).double()                              # float64 for a tight FD check
-    x = torch.randint(0, 6, (1, 6))
-    y = torch.randint(0, 6, (1, 6))
-    p = m.prior_bank.mu_embed                               # check grad wrt the mean table
+def test_rope_means_only_kernel_matches_oracle():
+    # The analytic belief-gradient kernel must still agree with autograd-of-F when the transport is
+    # rope-rotated (means-only). Both consume the RopeTransport opaquely; agreement isolates RoPE.
+    torch.manual_seed(0)
+    g = get_group("block_glk")(8, 2)
+    N, K, n_gen = 5, 8, g.generators.shape[0]
+    phi = torch.randn(1, N, n_gen) * 0.1
+    R = build_rope_rotation(torch.arange(N), g.irrep_dims, base=100.0,
+                            device=phi.device, dtype=phi.dtype)
+    omega = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False)
+    mu   = torch.randn(1, N, K); sigma   = torch.rand(1, N, K) + 0.5
+    mu_p = torch.randn(1, N, K); sigma_p = torch.rand(1, N, K) + 0.5
+    kw = dict(tau=1.0, alpha_div=1.0, kl_max=100.0, eps=1e-6, b0=1.0, c0=1.0, value=1.0,
+              include_attention_entropy=True, gradient_mode="filtering", family="gaussian_diagonal",
+              divergence_family="renyi", alpha_mode="constant", irrep_dims=g.irrep_dims, log_prior=None)
+    gk = belief_gradients(mu, sigma, mu_p, sigma_p, omega, **kw)          # hand kernel
+    go = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, **kw)  # autograd-of-F oracle
+    assert torch.allclose(gk[0], go[0], atol=1e-5)
+    assert torch.allclose(gk[1], go[1], atol=1e-5)
+
+
+def test_rope_full_gauge_covariance_equals_manual_sandwich():
+    # Full-gauge covariance: transport_covariance(RopeTransport(on_cov=True)) must equal the manual
+    # sandwich with the rotated operator Omega'_ij = R_i Omega_ij R_j^T. Pure property; no model.
+    from vfe3.geometry.transport import RopeTransport
+    torch.manual_seed(0)
+    N, K = 4, 4
+    R = build_rope_rotation(torch.arange(N), [K], base=10.0,
+                            device=torch.device("cpu"), dtype=torch.float64)
+    omega = torch.randn(N, N, K, K, dtype=torch.float64)
+    A = torch.randn(N, K, K, dtype=torch.float64)
+    sigma = A @ A.transpose(-1, -2) + K * torch.eye(K, dtype=torch.float64)   # SPD full cov
+    got = transport_covariance(RopeTransport(base=omega, rope=R, on_cov=True), sigma)
+    Op = torch.einsum("ikl,ijlm,jnm->ijkn", R, omega, R)                      # R_i Omega_ij R_j^T
+    manual = torch.einsum("ijkl,jlm,ijnm->ijkn", Op, sigma, Op)
+    assert torch.allclose(got, manual, atol=1e-9)
+
+
+def test_full_gauge_model_runs_forward_backward():
+    # Reachability: a full-covariance rope_full_gauge model trains (finite gradients) end to end.
+    # Executor: set the full-covariance family/decode here -- see the procedure note below.
+    cfg = _full_cov_cfg(pos_rotation="rope", rope_full_gauge=True)   # defined per the note
+    torch.manual_seed(0)
+    m = VFEModel(cfg)
+    x = torch.randint(0, 6, (1, 6)); y = torch.randint(0, 6, (1, 6))
     _, loss, _ = m(x, y); loss.backward()
-    g_analytic = p.grad.clone()
-    # central FD on a few entries
-    idx = [(0, 0), (1, 1), (2, 0)]
-    for (i, j) in idx:
-        with torch.no_grad():
-            p[i, j] += eps; lp = m(x, y)[1].item()
-            p[i, j] -= 2 * eps; lm = m(x, y)[1].item()
-            p[i, j] += eps
-        fd = (lp - lm) / (2 * eps)
-        assert abs(fd - g_analytic[i, j].item()) < 1e-3, (i, j, fd, g_analytic[i, j].item())
-
-
-def test_fd_gradient_means_only_rope():
-    _fd_grad_ok(_rope_cfg(pos_rotation="rope", rope_full_gauge=False))
-
-
-def test_fd_gradient_full_gauge_rope():
-    _fd_grad_ok(_rope_cfg(pos_rotation="rope", rope_full_gauge=True,
-                          diagonal_covariance=False))
+    assert torch.isfinite(loss)
+    assert torch.isfinite(m.prior_bank.mu_embed.grad).all()
 ```
 
-Concrete procedure for the full-gauge case (it needs a working full-covariance model): BEFORE adding RoPE, confirm a plain `VFEModel(_rope_cfg(pos_rotation="none", diagonal_covariance=False))` runs forward+backward and its FD check passes. Find the full-covariance-compatible `family`/`decode_mode` by grepping existing tests: `rg "diagonal_covariance=False" tests/` and copy the `family`/`decode_mode`/`spd_retract_mode` they use. Bake those into a `_full_cov_cfg(**kw)` helper, then `test_fd_gradient_full_gauge_rope` builds on it with `pos_rotation="rope", rope_full_gauge=True`. Do not weaken the `1e-3` tolerance to make it pass; if the plain full-cov FD fails, that is a pre-existing issue to report, not a RoPE bug.
+Concrete procedure for `_full_cov_cfg` (the full-gauge path needs a working full-covariance model): grep the existing full-cov tests for the working combination — `rg "diagonal_covariance=False" tests/` — and copy their `family` / `decode_mode` / `spd_retract_mode`. Define `_full_cov_cfg(**kw)` = `_rope_cfg` with `diagonal_covariance=False` plus those values. BEFORE wiring RoPE in, confirm `VFEModel(_full_cov_cfg(pos_rotation="none"))` runs forward+backward; if it does not, that is a pre-existing full-cov issue to report, not a RoPE bug.
 
 - [ ] **Step 2: Run to verify they pass**
 
-Run: `python -m pytest tests/test_rope.py -k fd_gradient`
-Expected: PASS. If the full-gauge case needs a full-covariance family/decode, fix the config per the note (do not loosen `1e-3`).
+Run: `python -m pytest tests/test_rope.py -k "kernel_matches_oracle or covariance_equals_manual or full_gauge_model"`
+Expected: PASS. The kernel-vs-oracle test is the load-bearing RoPE-means correctness gate; the covariance-sandwich test is the full-gauge correctness gate.
 
 - [ ] **Step 3: Run the full suite (RoPE complete)**
 
