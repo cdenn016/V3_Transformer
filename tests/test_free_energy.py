@@ -315,3 +315,31 @@ def test_self_divergence_per_coord_requires_diagonal_renyi():
         self_divergence_per_coord(mu, cov, mu_p, cov.clone(), family="gaussian_full")
     with pytest.raises((ValueError, NotImplementedError, KeyError)):
         self_divergence_per_coord(mu, sigma, mu_p, sigma_p, divergence_family="not_a_functional")
+
+
+def test_pairwise_energy_dispatches_on_declared_cov_kind_not_name():
+    """A diagonal-structured family whose NAME lacks the 'diagonal' substring must still take the
+    diagonal energy path. The retired `"diagonal" in family` name-sniff would route it to the
+    full-covariance branch (wrong broadcast axis); the registered cov_kind drives the dispatch."""
+    import torch
+
+    from vfe3 import divergence
+    from vfe3.free_energy import pairwise_energy
+
+    name = "elliptical_scale_test"                 # no "diagonal" substring, declared diagonal
+    divergence.register_divergence(name, cov_kind="diagonal")(
+        divergence._DIVERGENCES["gaussian_diagonal"]
+    )
+    try:
+        torch.manual_seed(11)
+        N, K = 3, 4
+        mu_q = torch.randn(N, K)
+        mu_t = torch.randn(N, N, K)
+        sigma_q = torch.rand(N, K) + 0.5
+        sigma_t = torch.rand(N, N, K) + 0.5
+        E_new = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family=name)
+        E_ref = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal")
+        assert torch.allclose(E_new, E_ref, atol=1e-6)
+    finally:
+        divergence._DIVERGENCES.pop(name, None)
+        divergence._COV_KIND.pop(name, None)

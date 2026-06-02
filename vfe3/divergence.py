@@ -13,7 +13,7 @@ Diagonal Gaussian Renyi (blend sigma_b = (1-a) s + a t):
 """
 
 import warnings
-from typing import Callable, Dict
+from typing import Callable, Dict, Tuple
 
 import torch
 
@@ -73,12 +73,20 @@ def safe_kl_clamp(
 # Signature: fn(mu_q, sigma_q, mu_t, sigma_t, *, alpha, kl_max, eps) -> Tensor
 # ---------------------------------------------------------------------------
 _DIVERGENCES: Dict[str, Callable] = {}
+_COV_KIND:    Dict[str, str]      = {}     # family name -> "diagonal" | "full" covariance structure
 
 
-def register_divergence(name: str) -> Callable:
-    """Decorator registering a divergence kernel under ``name``."""
+def register_divergence(name: str, *, cov_kind: str) -> Callable:
+    """Decorator registering a divergence kernel under ``name`` with its covariance
+    structure ``cov_kind`` ("diagonal" | "full").
+
+    Consumers dispatch on the declared ``cov_kind`` (via ``family_cov_kind``), never by
+    sniffing the family name, so a new covariance family slots in by declaring its
+    structure at registration -- no call site is edited.
+    """
     def _wrap(fn: Callable) -> Callable:
         _DIVERGENCES[name] = fn
+        _COV_KIND[name] = cov_kind
         return fn
     return _wrap
 
@@ -93,7 +101,30 @@ def get_divergence(name: str) -> Callable:
     return _DIVERGENCES[name]
 
 
-@register_divergence("gaussian_diagonal")
+def family_cov_kind(name: str) -> str:
+    """Covariance structure ("diagonal" | "full") declared for family ``name`` at
+    registration (KeyError if absent).
+
+    The single source of truth for whether a family carries diagonal variances or a full
+    covariance, replacing name-substring sniffing (``"diagonal" in family``), which would
+    silently misclassify a family whose name lacks the substring.
+    """
+    if name not in _COV_KIND:
+        raise KeyError(
+            f"no divergence family registered under {name!r}; "
+            f"available: {sorted(_COV_KIND)}"
+        )
+    return _COV_KIND[name]
+
+
+def divergence_families() -> Tuple[str, ...]:
+    """Registered covariance-kernel family names (the valid ``family`` config values),
+    derived from the registry so a newly registered family is a valid config family
+    without editing config."""
+    return tuple(sorted(_DIVERGENCES))
+
+
+@register_divergence("gaussian_diagonal", cov_kind="diagonal")
 def _gaussian_diagonal_renyi(
     mu_q:    torch.Tensor,             # (..., K) query means
     sigma_q: torch.Tensor,             # (..., K) query diagonal variances
@@ -134,7 +165,7 @@ def _gaussian_diagonal_renyi(
     return safe_kl_clamp(div, kl_max=kl_max)
 
 
-@register_divergence("gaussian_full")
+@register_divergence("gaussian_full", cov_kind="full")
 def _gaussian_full_renyi(
     mu_q:    torch.Tensor,             # (..., K) query means
     sigma_q: torch.Tensor,             # (..., K, K) query covariances
