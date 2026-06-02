@@ -17,6 +17,7 @@ _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_per_coord", "learnable")
 _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback")
 _VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
+_VALID_POS_PHI_COMPOSE     = ("bch", "euclidean")
 _VALID_ATTENTION_PRIORS    = ("uniform", "causal", "alibi")
 _VALID_PRIOR_SOURCES       = ("token", "model_channel")
 _VALID_NORMS               = ("none", "mahalanobis")
@@ -81,6 +82,16 @@ class VFE3Config:
     # group restores EXACT equivariance on the full-covariance path. Needs a group with >= 2 equal
     # blocks (block_glk / tied_block_glk), else VFEModel construction raises.
     use_head_mixer:            bool  = False
+
+    # BCH positional encoding (default-off): a per-position Lie-algebra element pos_phi_i composed
+    # into the token gauge frame via compose_phi BEFORE transport. "learned" owns a model parameter
+    # table (max_seq_len, n_gen); "frozen" is the parameter-free i*pos_phi_scale on one axis. The
+    # pure path is "none" (no composition). Validated against the pos_phi registry.
+    pos_phi:                   str   = "none"      # "none" | "learned" | "frozen"
+    pos_phi_compose:           str   = "bch"       # composition chart: bch (default) | euclidean
+    bch_pe_order:              int   = 4           # BCH Dynkin truncation order (compose_phi order)
+    pos_phi_scale:             float = 0.02        # learned-table init scale AND frozen per-position step
+    pos_phi_project_slk:       bool  = False       # per-block trace projection (det Omega = 1)
 
     # belief family
     diagonal_covariance:       bool  = True
@@ -390,6 +401,9 @@ class VFE3Config:
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         _require(self.phi_precond_mode, _VALID_PHI_PRECOND_MODES, "phi_precond_mode")
         _require(self.phi_retract_mode, _VALID_PHI_RETRACT_MODES, "phi_retract_mode")
+        from vfe3.model.positional_phi import _POS_PHI
+        _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
+        _require(self.pos_phi_compose, _VALID_POS_PHI_COMPOSE, "pos_phi_compose")
         # spd_retract_mode selects the SPD covariance retraction geometry. Validated against the
         # retraction REGISTRY (not a hardcoded literal list) so a newly registered retraction is a
         # valid config value without editing this validator. Default 'spd_affine' is the

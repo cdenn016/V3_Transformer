@@ -251,6 +251,23 @@ def test_config_amp_dtype_default_none_and_validated():
         VFE3Config(amp_dtype="bfloat16")
 
 
+def test_pos_phi_defaults_off_and_validates():
+    cfg = VFE3Config()
+    assert cfg.pos_phi == "none"
+    assert cfg.pos_phi_compose == "bch"
+    assert cfg.bch_pe_order == 4
+
+
+def test_pos_phi_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        VFE3Config(pos_phi="banana")
+
+
+def test_pos_phi_compose_rejects_unknown():
+    with pytest.raises(ValueError):
+        VFE3Config(pos_phi_compose="quaternion")
+
+
 def test_config_accepts_newly_registered_family_without_editing_config():
     """A new family registered with cov_kind='diagonal' is a valid config family and passes the
     diagonal_covariance cross-check without editing config.py (no hardcoded family-name list)."""

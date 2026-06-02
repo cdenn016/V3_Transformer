@@ -120,6 +120,10 @@ Nothing further was built blind. The remaining roadmap items all fall in section
 decision from you) or are the XL hyper-prior channel; building them overnight without an oracle would
 risk shipping a plausible-but-wrong implementation, so they were spec'd instead.
 
+## D. POSITIONAL ENCODING CONFIG (Task 1.2 — 2026-06-02)
+
+Added BCH positional-encoding config fields (`pos_phi`, `pos_phi_compose`, `bch_pe_order`, `pos_phi_scale`, `pos_phi_project_slk`) to `VFE3Config`, along with `_VALID_POS_PHI_COMPOSE` tuple and `__post_init__` validation against the `_POS_PHI` registry. Default `"none"` preserves the pure path byte-identically. Three tests added to `tests/test_config.py` (32 total pass).
+
 ## D. Notes
 - **Training still works.** All 5 new config fields (`mstep_self_coupling_weight`, `spd_retract_mode`,
   `cross_couplings`, `transport_mode`) default to no-op / current behavior, and `test_train.py` is green,
@@ -382,3 +386,13 @@ Created the standalone `pos_phi` module and its unit tests as the first task of 
 **`tests/test_positional_phi.py`** — 4 tests: `none` returns `None`; `frozen` shape + values; `learned` slices the table; `apply` with `mode="none"` is identity.
 
 TDD: test written and confirmed failing (ModuleNotFoundError) before the module was created. Final run: **4 passed** (read from the `N passed` line). Commit: `4df355b`.
+
+## Task 1.1 code-review fixes — `**kwargs` forwarding + `get_pos_phi` test (2026-06-02, branch vfe3-positional-encodings-2026-06-02)
+
+Two small non-behavior-changing fixes applied to `vfe3/model/positional_phi.py` and `tests/test_positional_phi.py`.
+
+**Fix 1 (extensibility).** `positional_phi_coords` and `apply_positional_phi` previously enumerated `scale`/`frozen_axis`/`pos_phi_free` explicitly with no `**kwargs`, meaning a future builder with a novel param would require editing both dispatchers. Added `**kwargs` at the end of both signatures and forwarded it into the builder call (the individual builders already accepted `**kwargs`). This mirrors the `attention_prior.py` registry idiom and satisfies the CLAUDE.md hard constraint: add a variant by writing-and-registering it, never by editing call sites.
+
+**Fix 2 (coverage).** `tests/test_positional_phi.py` imported `get_pos_phi` but never exercised it. Added `import pytest` at the top and a new test `test_get_pos_phi_unknown_raises_keyerror` that confirms `KeyError` is raised for an unregistered mode name.
+
+Final run: **5 passed** (read from `5 passed in 0.02s`). Commit: `accb330`.
