@@ -109,6 +109,8 @@ class PriorBank(nn.Module):
         decode_mode:         str   = "diagonal",
         decode_chunk_size:   int   = 8192,
         lambda_h:            float = 0.0,
+        gamma_coupling:      float = 0.0,
+        prior_source:        str   = "token",
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -121,6 +123,7 @@ class PriorBank(nn.Module):
         self.encode_mode = encode_mode
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
+        self.prior_source = prior_source
 
         sigma_log_init = float(torch.log(torch.tensor(sigma_init)))
         self.mu_embed         = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
@@ -141,23 +144,32 @@ class PriorBank(nn.Module):
             self.output_proj_weight = nn.Parameter(torch.empty(vocab_size, K))
             nn.init.xavier_uniform_(self.output_proj_weight)
 
-        # HYPER-PRIOR CHANNEL (manuscript eq:pointwise_free_energy), FIRST INCREMENT, default-OFF.
-        # When lambda_h > 0, create the model-channel belief tables s_mu_embed/s_sigma_log_embed
-        # (V, K) -- a per-token DIAGONAL Gaussian s_i looked up like the belief tables -- and the
-        # global hyper-prior r_mu/r_sigma_log (K,), a single diagonal Gaussian the s_i are
-        # regularized toward (the manuscript centroid). These are PRIORS (nn.Parameter), not a
-        # neural map. They are created LAST and ONLY on the lambda_h>0 path: the default (lambda_h=0)
-        # path draws zero new RNG, so the belief tables above are byte-unchanged and the pure path
-        # is param-free (no s_mu_embed attribute at all). s init mirrors the belief tables (small mu,
+        # MODEL CHANNEL (manuscript eq:pointwise_free_energy), default-OFF. The model-channel belief
+        # tables s_mu_embed/s_sigma_log_embed (V, K) -- a per-token DIAGONAL Gaussian s_i looked up
+        # like the belief tables -- back BOTH the hyper-prior term lambda_h*KL(s||r) and the gamma
+        # model-coupling block gamma_coupling*F_red^s, so they are created whenever EITHER channel is
+        # active (lambda_h>0 OR gamma_coupling>0). The global hyper-prior r_mu/r_sigma_log (K,) -- a
+        # single diagonal Gaussian the s_i are regularized toward (the manuscript centroid) -- is
+        # consumed ONLY by the hyper-prior term, so it stays gated on lambda_h>0. These are PRIORS
+        # (nn.Parameter), not a neural map. They are created LAST and only on the active-channel path:
+        # the default (both 0) path draws zero new RNG, so the belief tables above are byte-unchanged
+        # and the pure path is param-free. s drawn BEFORE r preserves the existing lambda_h>0 RNG order
+        # (byte-identical to the hyper-prior-only build). s init mirrors the belief tables (small mu,
         # sigma matching sigma_init); r init: mu=0, sigma matching sigma_init -- so s != r at init
-        # (KL(s||r) > 0, the channel has a gradient). NOTE (first increment): s_i is NOT yet coupled
-        # to the belief q; the gamma model-coupling block and the s-channel E-step update are
-        # DEFERRED to increment 2.
-        if lambda_h > 0.0:
+        # (KL(s||r) > 0, the channel has a gradient). NOTE: s_i is NOT coupled to the belief q on
+        # either path (the gamma transport is tied+detached); the s->q coupling and the s-channel
+        # E-step update are DEFERRED.
+        if lambda_h > 0.0 or gamma_coupling > 0.0 or prior_source == "model_channel":
             self.s_mu_embed        = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
             self.s_sigma_log_embed = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
-            self.r_mu              = nn.Parameter(torch.zeros(K))
-            self.r_sigma_log       = nn.Parameter(torch.full((K,), sigma_log_init))
+        if lambda_h > 0.0:
+            # FROZEN hyper-prior centroid r (user decision 2026-06-02): the fixed centroid the model
+            # beliefs s_i are regularized toward via lambda_h*KL(s_i||r). The manuscript determines r
+            # "from a higher, slower meta-level" (GL(K)_supplementary.tex:1081); with no meta-level
+            # built, a FIXED r is the manuscript-consistent stand-in, and requires_grad=False prevents
+            # the KL(s||r)->0 collapse that freely training r alongside s would cause.
+            self.r_mu              = nn.Parameter(torch.zeros(K), requires_grad=False)
+            self.r_sigma_log       = nn.Parameter(torch.full((K,), sigma_log_init), requires_grad=False)
 
     def encode(
         self,
@@ -173,14 +185,32 @@ class PriorBank(nn.Module):
         r"""Look up the per-token model-channel belief s_i = N(s_mu, s_sigma) (diagonal).
 
         Returns (s_mu, s_sigma) with s_mu (B, N, K) and s_sigma (B, N, K) the positive
-        variances exp(s_sigma_log).clamp(min=eps). Available only on the hyper-prior path
-        (lambda_h>0, where the s tables are created); the manuscript hyper-prior term consumes
-        this as DiagonalGaussian(s_mu, s_sigma). FIRST INCREMENT: this is consumed only by the
-        lambda_h * mean_i KL(s_i||r) loss term; s_i is not yet coupled into the belief q.
+        variances exp(s_sigma_log).clamp(min=eps). Available on the active-model-channel path
+        (lambda_h>0 OR gamma_coupling>0, where the s tables are created); consumed as
+        DiagonalGaussian(s_mu, s_sigma) by BOTH the hyper-prior term lambda_h*KL(s_i||r) and the
+        gamma model-coupling block. Through THESE two consumers s_i is NOT coupled into the belief q
+        (the gamma transport is tied+detached), so it stays predictively inert. The s->q coupling is
+        a SEPARATE path: prior_source=='model_channel' routes the belief prior to the SAME s tables
+        via _prior_mu_table/_prior_sigma_log_table (encode/self-coupling/decode), making s the prior.
         """
         s_mu = self.s_mu_embed[token_ids]                                       # (B, N, K)
         s_sigma = torch.exp(self.s_sigma_log_embed[token_ids]).clamp(min=self.eps)  # (B, N, K)
         return s_mu, s_sigma
+
+    def _prior_mu_table(self) -> torch.Tensor:
+        r"""The (V, K) mean prior table feeding p_i: the model-channel s tables when
+        prior_source=='model_channel' (s->q REPLACE: p_i = s_i), else the belief table mu_embed
+        (default). Routed through ONE accessor so encode (q_i(0)=p_i), the E-step self-coupling
+        target alpha*KL(q_i||p_i), and the decode per-vocab readout -KL(q||p_v) all consume the SAME
+        prior, keeping p_i = s_i consistent. On the default 'token' path this returns self.mu_embed
+        (the identical tensor), so the pre-toggle path is byte-identical.
+        """
+        return self.s_mu_embed if self.prior_source == "model_channel" else self.mu_embed
+
+    def _prior_sigma_log_table(self) -> torch.Tensor:
+        r"""The (V, K) log-variance prior table feeding p_i; the model-channel sibling of
+        _prior_mu_table (see there). 'token' -> self.sigma_log_embed (byte-identical)."""
+        return self.s_sigma_log_embed if self.prior_source == "model_channel" else self.sigma_log_embed
 
     def _tau_eff(
         self,
@@ -231,8 +261,8 @@ class PriorBank(nn.Module):
         from degenerate pairs to +inf -> -inf logits.)
         """
         tau_eff = self._tau_eff(tau)
-        mu_v = self.mu_embed                                             # (V, K)
-        sigma_v = torch.exp(self.sigma_log_embed).clamp(min=self.eps)    # (V, K)
+        mu_v = self._prior_mu_table()                                   # (V, K) prior (s tables if model_channel)
+        sigma_v = torch.exp(self._prior_sigma_log_table()).clamp(min=self.eps)    # (V, K)
         mu_q_b = mu_q.unsqueeze(-2)                                      # (B, N, 1, K)
         sigma_q_b = sigma_q.unsqueeze(-2)                               # (B, N, 1, K)
         diag = get_family("gaussian_diagonal")
@@ -273,8 +303,8 @@ class PriorBank(nn.Module):
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
 
-        sigma_v_all = torch.exp(self.sigma_log_embed).clamp(min=self.eps)    # (V, K)
-        mu_v_all = self.mu_embed                                            # (V, K)
+        sigma_v_all = torch.exp(self._prior_sigma_log_table()).clamp(min=self.eps)    # (V, K)
+        mu_v_all = self._prior_mu_table()                                  # (V, K) prior (s tables if model_channel)
         c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
 
         mc_q = mu_q - c                                                     # (B, N, K) centered query means
@@ -353,8 +383,8 @@ def _encode_per_token(
     E-step (full sandwich transport + affine-invariant SPD retraction) then evolves
     off-diagonal mass into. The mean / gauge tables are shared across families.
     """
-    mu = pb.mu_embed[token_ids]                                              # (B, N, K)
-    sigma_diag = torch.exp(pb.sigma_log_embed[token_ids]).clamp(min=pb.eps)  # (B, N, K), sigma > 0
+    mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
+    sigma_diag = torch.exp(pb._prior_sigma_log_table()[token_ids]).clamp(min=pb.eps)  # (B, N, K), sigma > 0
     phi = pb.phi_embed[token_ids]                                            # (B, N, n_gen)
     sigma = sigma_diag if pb.diagonal_covariance else torch.diag_embed(sigma_diag)
     return BeliefState(mu=mu, sigma=sigma, phi=phi)
@@ -404,8 +434,8 @@ def _decode_diagonal(
     ``(mu_q - c) - (mu_v - c) == mu_q - mu_v`` the closed form is unchanged exactly while
     the cancelled magnitude collapses to the residual spread of the means.
     """
-    sigma_v = torch.exp(pb.sigma_log_embed).clamp(min=pb.eps)            # (V, K)
-    mu_v = pb.mu_embed                                                  # (V, K)
+    sigma_v = torch.exp(pb._prior_sigma_log_table()).clamp(min=pb.eps)   # (V, K)
+    mu_v = pb._prior_mu_table()                                         # (V, K) prior (s tables if model_channel)
     inv_v = 1.0 / sigma_v                                               # (V, K) = 1/sigma_v
 
     c = mu_v.mean(dim=0, keepdim=True)                                  # (1, K) v-independent shift
@@ -457,8 +487,8 @@ def _decode_full(
     saturate distant priors to a single logit). General but O(B*N*V*K^3) (per-pair Cholesky):
     the theoretically pure full-covariance path, not the fast diagonal kernel.
     """
-    mu_v = pb.mu_embed                                                   # (V, K)
-    sigma_v = torch.diag_embed(torch.exp(pb.sigma_log_embed).clamp(min=pb.eps))  # (V, K, K) diagonal-as-full
+    mu_v = pb._prior_mu_table()                                          # (V, K) prior (s tables if model_channel)
+    sigma_v = torch.diag_embed(torch.exp(pb._prior_sigma_log_table()).clamp(min=pb.eps))  # (V, K, K) diagonal-as-full
     mu_q_b = mu_q.unsqueeze(-2)                                          # (B, N, 1, K)
     sigma_q_b = sigma_q.unsqueeze(-3)                                    # (B, N, 1, K, K)
     full = get_family("gaussian_full")

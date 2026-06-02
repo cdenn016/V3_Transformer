@@ -77,7 +77,8 @@ class VFEModel(nn.Module):
             use_prior_bank=cfg.use_prior_bank,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
-            lambda_h=cfg.lambda_h,
+            lambda_h=cfg.lambda_h, gamma_coupling=cfg.gamma_coupling,
+            prior_source=cfg.prior_source,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.
@@ -346,9 +347,9 @@ class VFEModel(nn.Module):
             # (lambda_h=0 -> byte-identical to the term-absent path). Grad-connected (no detach), so
             # it backprops to the learned s/r tables (the channel trains), and computed from the
             # converged s/r tables OUTSIDE the E-step (s_i does not couple into q this increment).
-            # FIRST INCREMENT scope: s_i is encoded fresh here and consumed ONLY by this term; the
-            # h->s->p->q coupling, the gamma model-coupling block, and the s-channel E-step update
-            # are DEFERRED to increment 2. The covariance kernel is DiagonalGaussian regardless of
+            # s_i is encoded fresh here and consumed by this term (and, sharing the same s tables, the
+            # gamma model-coupling block below); the h->s->p->q coupling and the s-channel E-step
+            # update remain DEFERRED. The covariance kernel is DiagonalGaussian regardless of
             # cfg.family (the s/r tables are always diagonal (V,K)/(K,)); divergence_family is the
             # orthogonal functional seam. r (K,) broadcasts over the (B, N) token axis.
             from vfe3.families.gaussian import DiagonalGaussian
@@ -364,6 +365,52 @@ class VFEModel(nn.Module):
                 divergence_family=cfg.divergence_family,
             ).mean()
             loss = loss + cfg.lambda_h * hp
+        if self.cfg.gamma_coupling > 0.0:
+            # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
+            # lines 1241-1249): L += gamma_coupling * mean_i F_red^s_i, the reduced (envelope) form of
+            # the model-coupling block sum_ij [ gamma_ij KL(s_i||Omega_tilde_ij s_j) + tau_g gamma_ij
+            # log(gamma_ij/pi^s_ij) ], with optimal gamma_ij = softmax_j(log pi^s - E^s/tau_g) and, at
+            # the optimum, the block = -tau_g log Z^s_i. The s-channel is the SAME softmax-over-KL
+            # object as the belief beta block, so it REUSES pairwise_energy + reduced_free_energy with
+            # (q,p,beta,pi,tau) -> (s,Omega s,gamma,pi^s,tau_g). The s tables are always diagonal (V,K),
+            # so the kernel is DiagonalGaussian regardless of cfg.family; divergence_family is the
+            # orthogonal functional seam. TIED transport: Omega_tilde is the flat phi-cocycle
+            # exp(phi_i)exp(-phi_j) from the CONVERGED belief frame out.phi (exact tie for the default
+            # flat regime; a documented simplification under regime_ii), DETACHED -- so the gamma
+            # gradient flows ONLY to the s tables and the forward (logits/ce above) is byte-identical
+            # to the gamma=0 path (the model channel is predictively INERT: s does NOT feed q). The
+            # detach deliberately severs the phi<-gamma coupling that full tied transport would carry in
+            # the canonical E-step F; restoring it (or keeping it severed) is part of the deferred s->q
+            # design, NOT this term. Computed once per forward at the loss level (like diagnostics()),
+            # via the DENSE Omega (not the hot-path FactoredTransport); the diagonal transport_covariance
+            # keeps only diag(Omega Sigma Omega^T), the same approximation the belief diagonal family
+            # uses. The mean over (B, H, N) makes gamma_coupling=1 a per-token-per-head mean weight, not
+            # the canonical sum-over-ij.
+            from vfe3.attention_prior import attention_log_prior
+            from vfe3.families.gaussian import DiagonalGaussian
+            from vfe3.free_energy import pairwise_energy, reduced_free_energy
+            from vfe3.geometry.transport import (
+                compute_transport_operators,
+                transport_covariance,
+                transport_mean,
+            )
+            cfg = self.cfg
+            pb = self.prior_bank
+            s_mu, s_sigma = pb.encode_s(token_ids)                       # (B, N, K)
+            n_pos = token_ids.shape[1]
+            omega = compute_transport_operators(out.phi.detach(), self.group)["Omega"]   # (B,N,N,K,K) tied+detached
+            s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
+            s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
+            e_s = pairwise_energy(
+                DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(s_mu_t, s_sigma_t),
+                alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
+            )                                                            # (B, H, N, N)
+            gamma_log_prior = attention_log_prior(
+                cfg.gamma_attention_prior, n_pos, n_pos, device=token_ids.device, dtype=s_mu.dtype,
+            )                                                            # (N, N)
+            f_red_s = reduced_free_energy(e_s, tau=cfg.tau_gamma, log_prior=gamma_log_prior)   # (B, H, N)
+            loss = loss + cfg.gamma_coupling * f_red_s.mean()
         return logits, loss, ce.detach()
 
     @torch.no_grad()

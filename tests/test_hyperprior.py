@@ -5,16 +5,17 @@ the canonical two-tier free energy carries a hyper-prior term lambda_h sum_i KL(
 regularizing the model-channel beliefs s_i toward the hyper-prior centroid r. This first
 increment wires the SECOND (model) belief channel s_i + global hyper-prior r end-to-end at
 the smallest scope: new learned PriorBank tables (s_mu_embed/s_sigma_log_embed, r_mu/r_sigma_log)
-created ONLY when lambda_h>0, encoded per token as a diagonal Gaussian s_i, and added to the
-training loss as lambda_h * mean_i KL(s_i||r). s_i does NOT yet couple into the belief q / the
-prediction path (the h->s->p->q coupling, the s-channel E-step update, and the gamma
-model-coupling block are all DEFERRED to increment 2). Default-off (lambda_h=0): no s/r tables,
-loss byte-identical to the term-absent path.
+created when lambda_h>0, encoded per token as a diagonal Gaussian s_i, and added to the training
+loss as lambda_h * mean_i KL(s_i||r). s_i does NOT couple into the belief q / the prediction path
+(the h->s->p->q coupling and the s-channel E-step update remain DEFERRED; the gamma model-coupling
+block, which shares these s tables, is built in test_gamma_coupling.py and is likewise predictively
+inert). Default-off (lambda_h=0): no s/r tables, loss byte-identical to the term-absent path.
 
 These tests pin the contracts: (1) default-off has no s/r tables and loss == ce (the pure path);
 (2) the term is EXACTLY lambda_h * mean KL(s||r) (the linear-in-lambda_h oracle), with hp
-recomputed independently from the model's s/r tables; (3) the channel trains (finite grads on
-the s/r params); (4) s == r => term 0 (self-zero sanity).
+recomputed independently from the model's s/r tables; (3) the model beliefs s train while the
+hyper-prior centroid r is FROZEN (requires_grad=False), and build_optimizer (which exempts frozen
+params) groups s but not r; (4) s == r => term 0 (self-zero sanity).
 """
 
 import torch
@@ -78,20 +79,36 @@ def test_linear_in_lambda_h():
     assert torch.allclose(loss_w - loss_0, w * hp, atol=1e-6)
 
 
-def test_grad_flows_to_s_and_r_tables():
-    # The channel trains: after forward+backward with lambda_h>0, the s/r table params have
-    # finite, nonzero grad.
+def test_grad_flows_to_s_tables_r_is_frozen():
+    # The model beliefs s_i train; the hyper-prior centroid r is a FROZEN fixed centroid
+    # (requires_grad=False), so it never receives a gradient. Free-training r alongside s would
+    # trivially collapse KL(s||r)->0; the manuscript sets r "from a higher, slower meta-level"
+    # (GL(K)_supplementary.tex:1081), so a fixed r is the manuscript-consistent stand-in.
     model = _make_model(0.5)
     tokens = torch.randint(0, 20, (3, 5))
     targets = torch.randint(0, 20, (3, 5))
     _, loss, _ = model(tokens, targets)
     loss.backward()
-    for name in ("s_mu_embed", "s_sigma_log_embed", "r_mu", "r_sigma_log"):
+    for name in ("s_mu_embed", "s_sigma_log_embed"):
         grad = getattr(model.prior_bank, name).grad
         assert grad is not None, f"{name} received no grad"
         assert torch.isfinite(grad).all(), f"{name} grad not finite"
     assert model.prior_bank.s_mu_embed.grad.abs().sum() > 0
-    assert model.prior_bank.r_mu.grad.abs().sum() > 0
+    # r is frozen: not trainable, receives no gradient
+    assert model.prior_bank.r_mu.requires_grad is False
+    assert model.prior_bank.r_sigma_log.requires_grad is False
+    assert model.prior_bank.r_mu.grad is None
+
+
+def test_build_optimizer_with_lambda_h_excludes_frozen_r():
+    # With lambda_h>0 the s tables (trainable) plus the FROZEN r tables exist. build_optimizer must
+    # succeed (the exact-coverage guard exempts non-trainable params) and group s but NOT r.
+    from vfe3.train import build_optimizer
+    model = _make_model(0.5)
+    opt = build_optimizer(model, model.cfg)               # must NOT raise
+    opt_params = {id(p) for g in opt.param_groups for p in g["params"]}
+    assert id(model.prior_bank.s_mu_embed) in opt_params       # s trains
+    assert id(model.prior_bank.r_mu) not in opt_params         # frozen r is not optimized
 
 
 def test_self_zero_when_s_equals_r():
