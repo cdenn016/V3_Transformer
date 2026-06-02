@@ -72,6 +72,7 @@ class VFE3Config:
     c0:                        float = 1.0          # state-dependent alpha shape (numerator)
     kappa:                     float = 1.0          # temperature tau = kappa * sqrt(K)
     mass_phi:                  float = 0.0          # (mass_phi/2) ||phi||^2 penalty
+    mstep_self_coupling_weight: float = 0.0         # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
 
     # attention
     include_attention_entropy: bool  = True         # canonical (True) vs surrogate (False)
@@ -183,6 +184,10 @@ class VFE3Config:
             raise ValueError(f"kappa must be positive, got {self.kappa}")
         if self.mass_phi < 0.0:
             raise ValueError(f"mass_phi must be >= 0, got {self.mass_phi}")
+        if self.mstep_self_coupling_weight < 0.0:
+            raise ValueError(
+                f"mstep_self_coupling_weight must be >= 0, got {self.mstep_self_coupling_weight}"
+            )
         for name in ("b0", "c0"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")

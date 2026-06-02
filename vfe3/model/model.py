@@ -174,6 +174,30 @@ class VFEModel(nn.Module):
             # phi_alignment_loss), shaping the inference trajectory. Both roles are in the
             # manuscript algorithm (E-step phi gradient and M-step loss both carry alpha_phi/2||phi||^2).
             loss = loss + 0.5 * self.cfg.mass_phi * (out.phi ** 2).mean()
+        if self.cfg.mstep_self_coupling_weight > 0.0:
+            # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2083):
+            # L += alpha_hat * sum_i KL(q_i*||p_i), the mean self-divergence of the CONVERGED belief
+            # (out.mu/out.sigma, BEFORE head_mixer/norm) vs the per-block prior. Opt-in, default-off
+            # (weight 0 -> byte-identical to the pure path). Grad-connected (no detach), so it
+            # backprops to the learned prior tables, like mass_phi. The last-block prior is rebuilt
+            # by mirroring vfe_stack's prior_handoff fold; EXACT at n_layers=1 (loop empty -> p =
+            # encode belief), an approximation otherwise (one converged belief stands in for the
+            # per-block intermediates), matching diagnostics().
+            from vfe3.families import get_family
+            from vfe3.free_energy import self_divergence_for_alpha
+            cfg = self.cfg
+            rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
+            mu_p, sigma_p = beliefs.mu, beliefs.sigma
+            for _ in range(cfg.n_layers - 1):
+                mu_p = (1.0 - rho) * mu_p + rho * out.mu
+                sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
+            fam = get_family(cfg.family)
+            sc = self_divergence_for_alpha(
+                fam(out.mu, out.sigma), fam(mu_p, sigma_p),
+                alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
+            ).mean()
+            loss = loss + cfg.mstep_self_coupling_weight * sc
         return logits, loss, ce.detach()
 
     @torch.no_grad()

@@ -273,3 +273,31 @@ closed form). Suite `tests=270 failures=0 errors=0` (+1 new test). Two cosmetic 
 addressed: the stale `test_register_divergence_records_cov_kind` was renamed to
 `test_divergence_reexports_family_cov_kind`, and the unused `_warn_alpha_gt_one` back-compat
 re-export was dropped from `divergence.py`.
+
+### Opt-in M-step self-coupling regularizer alpha_hat * sum_i KL(q_i*||p_i)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Manuscript Algorithm 1 (GL(K)_attention.tex:2083) writes
+the M-step loss as `L = L_CE + alpha_hat * sum_i KL(q_i*||p_i) + (alpha_phi/2)||phi||^2`. The training
+loss in `vfe3/model/model.py` forward previously carried only CE plus the optional `mass_phi` gauge
+penalty (the alpha_phi term); the self-coupling KL term was absent from every path. It is now wired as
+an OPT-IN, DEFAULT-OFF fixed scalar coefficient (like `mass_phi`, not a learned parameter), so the
+pure/current path is byte-identical at the default.
+
+Files: `vfe3/config.py` adds `mstep_self_coupling_weight: float = 0.0` (alpha_hat) with a
+`>= 0.0` `__post_init__` check mirroring `mass_phi`. `vfe3/model/model.py` forward adds, guarded by
+`cfg.mstep_self_coupling_weight > 0.0`, the term `weight * sc` where `sc` is the mean self-divergence
+of the CONVERGED belief (`out.mu`/`out.sigma`, BEFORE head_mixer/norm) vs the per-block prior. The
+last-block prior is reconstructed exactly as `diagnostics()` does it: start from the encode belief and
+fold `vfe_stack`'s `prior_handoff` blend over `n_layers-1` (`rho=prior_handoff_rho`,
+`rho_s=prior_handoff_sigma`), then `self_divergence_for_alpha(fam(out.mu,out.sigma),
+fam(mu_p,sigma_p), ...).mean()`. The term is grad-connected (no detach), so it backprops to the
+learned prior tables like `mass_phi`. Exact at `n_layers=1` (the fold loop is empty, so p = encode
+belief); an approximation otherwise (one converged belief stands in for the per-block intermediates).
+
+Tests (`tests/test_mstep_self_coupling.py`, TDD oracle-first, watched RED then GREEN): `test_noop_at_weight_zero`
+(the key oracle — at weight 0, returned `loss == ce` with `mass_phi=0`, so the new code changes
+nothing), `test_linear_in_weight` (pins the term — `loss` allclose `ce + w * sc` with `sc`
+independently recomputed by the forward recipe; `assert sc > 1e-6` keeps it non-vacuous),
+`test_config_validation` (`-1.0` raises, `0.0`/`0.5` accepted), and
+`test_backward_finite_grads_on_prior_tables` (grad-connected: `loss.backward()` yields finite,
+nonzero `mu_embed.grad`). Suite `tests=274 failures=0 errors=0` (+4 new; viz collected normally).
