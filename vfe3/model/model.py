@@ -76,6 +76,7 @@ class VFEModel(nn.Module):
             diagonal_covariance=cfg.diagonal_covariance,
             use_prior_bank=cfg.use_prior_bank,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
+            lambda_h=cfg.lambda_h,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.
@@ -93,6 +94,28 @@ class VFEModel(nn.Module):
         # learnable model is byte-identical to the constant alpha=1.0 pure path at step 0. For every
         # other (pure no-NN) alpha_mode the parameter is NOT created at all (no log_alpha attribute),
         # so the default path is param-free.
+        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): the LEARNED bilinear edge connection
+        # W for Regime-II (non-flat) transport. When transport_mode='regime_ii', create connection_W
+        # as a trainable nn.Parameter of shape (n_gen, K, K); the edge connection is
+        # delta_ij^a = cocycle_relaxation * (mu_i^T W^a mu_j) (transport._build_regime_ii). Init ZERO
+        # -> delta = 0 -> exp(0) = I -> Omega = exp(phi_i)exp(-phi_j) (the flat cocycle), so a
+        # regime_ii model is byte-flat at init. For the default flat (pure no-NN) regime the parameter
+        # is NOT created (no connection_W attribute), so the default path is param-free here.
+        if cfg.transport_mode == "regime_ii":
+            self.connection_W = nn.Parameter(torch.zeros(n_gen, cfg.embed_dim, cfg.embed_dim))
+            if cfg.detach_e_step:
+                # Footgun (mirrors log_alpha / use_prior_bank): connection_W enters the loss ONLY
+                # through the E-step belief updates, but detach_e_step wraps the E-step in no_grad,
+                # so connection_W receives NO gradient and stays frozen at its zero init (the flat
+                # cocycle). Set detach_e_step=False to train the learned connection.
+                import warnings
+                warnings.warn(
+                    "transport_mode='regime_ii' with detach_e_step=True freezes connection_W: the "
+                    "learned edge connection enters the loss only through the E-step, which the "
+                    "detached (no_grad) E-step severs, so connection_W.grad is None and the transport "
+                    "stays flat. Set detach_e_step=False to train the Regime-II connection.",
+                    stacklevel=2,
+                )
         if cfg.alpha_mode == "learnable":
             self.log_alpha = nn.Parameter(torch.zeros(()))
             if cfg.detach_e_step:
@@ -175,10 +198,23 @@ class VFEModel(nn.Module):
         # E-step so the loss backpropagates to log_alpha. getattr keeps the default path's call
         # identical: None forwards a defaulted-None keyword that every alpha form ignores.
         log_alpha = getattr(self, "log_alpha", None)
-        run = torch.no_grad() if self.cfg.detach_e_step else nullcontext()
+        # connection_W: the learned bilinear Regime-II edge connection (a sanctioned NN exception)
+        # when transport_mode='regime_ii', else None (the flat pure path). Threaded through the
+        # E-step like log_alpha so the loss backpropagates to it; getattr keeps the flat path's call
+        # identical (None forwards a defaulted kwarg the flat builder ignores).
+        connection_W = getattr(self, "connection_W", None)
+        # E-step backward estimator. The EFFECTIVE mode reconciles the legacy detach_e_step bool
+        # with e_step_gradient (cfg.effective_e_step_gradient): 'detach' wraps the whole E-step in
+        # no_grad (the legacy detach_e_step=True path); 'unroll' (default) and 'straight_through'
+        # both run grad-enabled and thread the mode down to e_step_iteration, which only changes the
+        # mu/sigma backward (straight_through detaches the per-iteration tangent; unroll keeps the
+        # second-order term). Forward VALUE is identical across unroll/straight_through.
+        e_step_gradient = self.cfg.effective_e_step_gradient
+        run = torch.no_grad() if e_step_gradient == "detach" else nullcontext()
         with run:
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
-                            log_prior=log_prior, block_norm=self.block_norm, log_alpha=log_alpha)
+                            log_prior=log_prior, block_norm=self.block_norm, log_alpha=log_alpha,
+                            connection_W=connection_W, e_step_gradient=e_step_gradient)
         mu_final = out.mu                                        # (B, N, K)
         sigma_final = out.sigma
 
@@ -233,6 +269,31 @@ class VFEModel(nn.Module):
                 divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
             ).mean()
             loss = loss + cfg.mstep_self_coupling_weight * sc
+        if self.cfg.lambda_h > 0.0:
+            # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
+            # lines 1241-1249): L += lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
+            # regularized toward the global hyper-prior centroid r. Opt-in, default-off
+            # (lambda_h=0 -> byte-identical to the term-absent path). Grad-connected (no detach), so
+            # it backprops to the learned s/r tables (the channel trains), and computed from the
+            # converged s/r tables OUTSIDE the E-step (s_i does not couple into q this increment).
+            # FIRST INCREMENT scope: s_i is encoded fresh here and consumed ONLY by this term; the
+            # h->s->p->q coupling, the gamma model-coupling block, and the s-channel E-step update
+            # are DEFERRED to increment 2. The covariance kernel is DiagonalGaussian regardless of
+            # cfg.family (the s/r tables are always diagonal (V,K)/(K,)); divergence_family is the
+            # orthogonal functional seam. r (K,) broadcasts over the (B, N) token axis.
+            from vfe3.families.gaussian import DiagonalGaussian
+            from vfe3.free_energy import self_divergence
+            cfg = self.cfg
+            pb = self.prior_bank
+            s_mu, s_sigma = pb.encode_s(token_ids)                       # (B, N, K)
+            r_mu = pb.r_mu                                               # (K,)
+            r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps)       # (K,)
+            hp = self_divergence(
+                DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),
+                alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family,
+            ).mean()
+            loss = loss + cfg.lambda_h * hp
         return logits, loss, ce.detach()
 
     @torch.no_grad()
@@ -338,6 +399,7 @@ class VFEModel(nn.Module):
             belief, belief.mu, belief.sigma, self.group, cfg,
             log_prior=log_prior, block_norm=self.block_norm,
             log_alpha=getattr(self, "log_alpha", None),               # learned scalar (None on the pure path)
+            connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
         )
 
         rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
@@ -347,7 +409,15 @@ class VFEModel(nn.Module):
             mu_p = (1.0 - rho) * mu_p + rho * out.mu
             sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
 
-        omega = _transport(out.phi, self.group)                     # (N, N, K, K)
+        # Match the forward's transport regime so holonomy_deviation reads the ACTUAL connection
+        # (flat -> ~0; regime_ii with a trained connection_W -> the non-trivial holonomy). regime_ii
+        # reads the converged means out.mu and the learned connection_W; flat ignores both.
+        omega = _transport(                                          # (N, N, K, K)
+            out.phi, self.group, transport_mode=cfg.transport_mode,
+            mu=(out.mu if cfg.transport_mode == "regime_ii" else None),
+            connection_W=getattr(self, "connection_W", None),
+            cocycle_relaxation=cfg.cocycle_relaxation,
+        )
         mu_t = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
         sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
         fam = get_family(cfg.family)

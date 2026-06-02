@@ -114,3 +114,71 @@ def test_per_block_exp_is_bit_equivalent_to_full_exp():
     ep_full, en_full = stable_matrix_exp_pair(pm, skew_symmetric=False, block_dims=None)
     assert float((ep_blk - ep_full).abs().max()) < 1e-6
     assert float((en_blk - en_full).abs().max()) < 1e-6
+
+
+# --- P0 #2: the E-step fused-transport selector (factored on flat+equal-block, dense otherwise) ---
+def test_estep_fuses_flat_block_glk_to_factored_container():
+    # block_glk (irrep_dims [4,4], multi equal block, flat) -> the E-step builds the FACTORED
+    # container (no dense (B,N,N,K,K) Omega), which transport_mean/covariance consume on a fast path.
+    from vfe3.geometry.transport import FactoredTransport
+    from vfe3.inference.e_step import build_belief_transport
+    grp, phi, mu, sig = _transport_inputs()
+    out = build_belief_transport(phi, grp, transport_mode="flat")
+    assert isinstance(out, FactoredTransport)
+
+
+def test_estep_fuses_tied_block_glk_to_factored_container():
+    # tied_block_glk is also block-diagonal with equal blocks -> qualifies for the fused route.
+    from vfe3.geometry.transport import FactoredTransport
+    from vfe3.inference.e_step import build_belief_transport
+    grp = get_group("tied_block_glk")(8, 2)
+    n_gen = grp.generators.shape[0]
+    torch.manual_seed(0)
+    phi = 0.2 * torch.randn(2, 5, n_gen)
+    out = build_belief_transport(phi, grp, transport_mode="flat")
+    assert isinstance(out, FactoredTransport)
+
+
+def test_estep_single_block_groups_stay_dense():
+    # glk and so_k report irrep_dims [K] (single block) -> the fused route is NOT taken; the
+    # E-step keeps the dense (N,N,K,K)/(B,N,N,K,K) Omega tensor exactly as today.
+    from vfe3.geometry.transport import FactoredTransport
+    from vfe3.inference.e_step import build_belief_transport
+    torch.manual_seed(0)
+    for name, ctor in (("glk", lambda: get_group("glk")(8)),
+                       ("so_k", lambda: get_group("so_k")(8))):
+        grp = ctor()
+        n_gen = grp.generators.shape[0]
+        phi = 0.2 * torch.randn(2, 5, n_gen)
+        out = build_belief_transport(phi, grp, transport_mode="flat")
+        assert not isinstance(out, FactoredTransport), name
+        assert torch.is_tensor(out), name
+
+
+def test_estep_regime_ii_stays_dense():
+    # regime_ii's Omega is mu-dependent (it carries the edge delta factor) and must NOT be fused;
+    # the selector returns the dense tensor for transport_mode='regime_ii'.
+    from vfe3.geometry.transport import FactoredTransport
+    from vfe3.inference.e_step import build_belief_transport
+    grp, phi, mu, sig = _transport_inputs()
+    connection_W = torch.zeros(grp.generators.shape[0], 8, 8)
+    out = build_belief_transport(
+        phi, grp, transport_mode="regime_ii", mu=mu, connection_W=connection_W, cocycle_relaxation=1.0,
+    )
+    assert not isinstance(out, FactoredTransport)
+    assert torch.is_tensor(out)
+
+
+def test_estep_cross_coupled_block_glk_stays_dense():
+    # A cross-coupled block_glk reports irrep_dims [K] (its group elements have off-block entries),
+    # so it is NOT block-diagonal with equal blocks -> the fused route is excluded, dense kept.
+    from vfe3.geometry.transport import FactoredTransport
+    from vfe3.inference.e_step import build_belief_transport
+    grp = get_group("block_glk")(8, 2, cross_couplings=[(0, 1)])
+    assert grp.irrep_dims == [8]
+    n_gen = grp.generators.shape[0]
+    torch.manual_seed(0)
+    phi = 0.2 * torch.randn(2, 5, n_gen)
+    out = build_belief_transport(phi, grp, transport_mode="flat")
+    assert not isinstance(out, FactoredTransport)
+    assert torch.is_tensor(out)

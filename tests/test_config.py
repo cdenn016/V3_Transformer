@@ -183,6 +183,16 @@ def test_config_diagonal_covariance_cross_check_uses_cov_kind():
         VFE3Config(family="gaussian_full", diagonal_covariance=True)     # full + diagonal: mismatch
 
 
+def test_config_lambda_h_default_zero_and_validated():
+    """lambda_h is the hyper-prior weight KL(s_i||r) (manuscript eq:pointwise_free_energy);
+    default 0.0 = OFF (pure single-tier path). A negative weight is rejected; 0.0 and a
+    positive weight are accepted."""
+    assert VFE3Config().lambda_h == 0.0
+    assert VFE3Config(lambda_h=0.5).lambda_h == 0.5
+    with pytest.raises(ValueError):
+        VFE3Config(lambda_h=-1.0)
+
+
 def test_config_cross_couplings_default_none_and_validated():
     """cross_couplings (off-block GL(K) head coupling) defaults None (current behavior). A valid
     list of distinct in-range directed head pairs is accepted under block_glk; out-of-range or

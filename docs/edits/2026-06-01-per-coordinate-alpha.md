@@ -838,3 +838,358 @@ ignored by the pure forms; the frozen-seed regression / byte-identity tests
 `tests/test_alpha_i.py`), TDD watched RED (8 failing for unregistered form / missing param) then
 GREEN. Full suite after the change: `tests=344 failures=0 errors=0 skipped=0` (read from junitxml;
 335 baseline + 9 new; 343 passed + 1 xpassed pre-existing; viz collected normally).
+
+## 2026-06-02 — Regime-II edge-relaxed (non-flat) transport (learned bilinear connection)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Design spec:
+`docs/superpowers/specs/2026-06-01-regime-ii-connection-design.md` (recommendation 3, the bilinear
+learned form; recommendation 4, the `cocycle_relaxation` homotopy knob). The `register_transport`
+seam and the registered `"flat"` (Regime-I) builder already existed; this adds the non-flat Regime-II
+builder behind the seam. The user SANCTIONED the learned bilinear connection as a documented
+neural-network exception ON THE CONDITION of an NN comment at the function and at the config toggle;
+both are present.
+
+### The builder (`vfe3/geometry/transport.py`)
+
+New `@register_transport("regime_ii")` builder `_build_regime_ii(phi, group, *, gauge_mode="learned",
+mu=None, connection_W=None, cocycle_relaxation=1.0, **kw)` realizing the edge-relaxed cocycle
+(spec eq:edge_relaxed_omega):
+
+    Omega_ij = exp(phi_i . G) exp(delta_ij . G) exp(-phi_j . G),
+    delta_ij^a = cocycle_relaxation * (mu_i^T W^a mu_j),   a = 1..n_gen.
+
+Vertex factors `exp(phi_i)`, `exp(-phi_j)` reuse `compute_transport_operators` verbatim (its flat
+Omega is discarded). The edge factor is built by three einsums plus a matrix exp:
+`delta = cocycle_relaxation * einsum("bik,akl,bjl->bija", mu, W, mu)` -> `(B,N,N,n_gen)`;
+`delta_mat = einsum("bija,akl->bijkl", delta, generators)` -> `(B,N,N,K,K)`;
+`exp_delta = stable_matrix_exp_pair(delta_mat, only_forward=True, block_dims=...)` (reuses the
+existing float64 island + block-diagonal exp); then
+`Omega = einsum("bikl,bijlm,bjmn->bijkn", exp_phi, exp_delta, exp_neg_phi)`. Returns the SAME dict
+shape as flat (`exp_phi`, `exp_neg_phi`, `Omega`), so it is a drop-in Omega producer — every
+downstream consumer (`belief_gradients`, `transport_mean/covariance`) is shape-identical and
+untouched. `W` is a raw `(n_gen, K, K)` `nn.Parameter` consumed by one einsum — no activation, no
+bias — directly analogous to the blessed linear-decode `W`.
+
+### The learned connection W (NN exception; comment sites)
+
+`connection_W` is a model-owned `nn.Parameter` of shape `(n_gen, K, K)`, created in
+`VFEModel.__init__` ONLY when `transport_mode == "regime_ii"` (the default flat path is param-free).
+Initialized ZERO -> delta=0 -> exp(0)=I -> Omega = flat cocycle, so a regime_ii model is byte-flat at
+init. NN-exception comment sites (the user's sanction condition):
+`vfe3/geometry/transport.py` (at `_build_regime_ii`), `vfe3/config.py` (at the `transport_mode`
+toggle), and `vfe3/model/model.py` (at the `connection_W` parameter). A `detach_e_step=True` footgun
+warning mirrors the `log_alpha` one (the connection enters the loss only through the E-step, so a
+detached E-step freezes it).
+
+### Threading (mirrors log_alpha / transport_mode)
+
+`cocycle_relaxation` is a cfg field threaded like `transport_mode` (block.py reads
+`cfg.cocycle_relaxation` into the `e_step` call). `connection_W` is a model param threaded like
+`log_alpha`: `getattr(self,"connection_W",None)` -> `vfe_stack(connection_W=)` ->
+`vfe_block(connection_W=)` -> `e_step(..., connection_W=)` -> `e_step_iteration`, which passes
+`mu=belief.mu, connection_W, cocycle_relaxation` to `_transport` ONLY when
+`transport_mode=="regime_ii"` (the flat call is unchanged -> default byte-identity). `_transport`
+gained `mu`/`connection_W`/`cocycle_relaxation` kwargs and unsqueezes 2-D mu the same way it
+unsqueezes 2-D phi, so the builder always sees batched `(B,N,K)`. `free_energy_value` declares the two
+as explicit accept-and-ignore knobs (the `e_step` trajectory path forwards one kwarg bag to both, so
+a missing declaration would TypeError on `return_trajectory=True`). `diagnostics()` threads
+`connection_W` into its `vfe_stack` call and its final `_transport`, so `holonomy_deviation` reads the
+ACTUAL regime (the diagnostic the spec built Regime-II to exercise).
+
+### Per-iteration rebuild
+
+Unlike flat (mu-independent, built once), the Regime-II Omega depends on the current belief means, so
+it is rebuilt from `belief.mu` every E-step iteration. This is automatic: `e_step` re-enters
+`e_step_iteration` with the updated belief each pass, and `_transport` reads `belief.mu` at the top
+(the same place `belief.phi` is read), so Omega tracks the evolving mean with no special logic.
+
+### Design decision — do NOT short-circuit an all-zero (grad-requiring) W
+
+The builder takes the flat fast path (skipping the O(N^2) edge exps) for `connection_W is None`,
+`cocycle_relaxation == 0.0`, or `gauge_mode == "trivial"`. It deliberately does NOT short-circuit on
+an all-ZERO `connection_W`: at W=0 the edge factor `exp(delta)=I` numerically (so the W=0->flat oracle
+holds to float tolerance), but `d Omega / d W` at W=0 is the generator structure (`exp'(0)=I`), NOT
+zero. Short-circuiting on all-zero W severed the autograd graph and left `connection_W.grad=None`
+(caught by the grad-to-W oracle during the RED->GREEN cycle); the full einsum path keeps W in the
+graph so the loss backpropagates to it from the zero init.
+
+### Characteristic — delta is QUADRATIC in mu (not a bug)
+
+`delta = mu_i^T W^a mu_j` is quadratic in the belief means. At the PriorBank's near-zero default init
+(`mu_embed` abs-mean ~0.013), the quadratic delta — and hence its gradient w.r.t. W — is vanishingly
+small (~1e-7), so a fresh regime_ii model barely feels the connection. This is inherent to the
+bilinear form (the means live in the fixed embedding ambient frame, per the spec), not a defect. The
+model-level grad-to-W and forward-change tests therefore inflate `mu_embed` so the connection carries
+real signal; the connection becomes meaningful as the means grow during training.
+
+### Known limitations (documented, not fixed; per the task)
+
+- GAUGE COVARIANCE: the bilinear delta reads mu in the FIXED ambient frame, so it is a learned,
+  frame-fixed object that breaks strict vertex-local gauge covariance — exactly analogous to the
+  head-mixer's equivariance caveat, and precisely why this is a sanctioned NN exception rather than
+  the pure path. No strict-covariance test is asserted (it would be false for this form).
+- The phi E-step (`phi_alignment_loss`, active only when `e_phi_lr > 0`; default 0) uses the FLAT
+  transport even under regime_ii (mirroring `log_alpha`, also not threaded there). So with
+  `transport_mode="regime_ii"` AND `e_phi_lr > 0`, the mu/sigma updates use the regime_ii Omega while
+  the phi update uses flat — a documented inconsistency, out of scope to fix.
+- The trajectory-diagnostic F in `free_energy_value` always uses flat transport (its internal
+  `_transport` omits `transport_mode`), so under regime_ii the logged F-trajectory is a flat-transport
+  diagnostic, not the regime_ii objective. Out of scope (matches log_alpha).
+
+### Cost
+
+O(N^2) per-edge K x K matrix exponentials per build (vs flat's O(N) vertex exps), and the build
+repeats each E-step iteration as mu updates. The `stable_matrix_exp_pair` Frobenius clamp
+(`max_norm=15`) now also bounds `||delta . G||` — safe at zero-init W, a note for a large trained
+connection.
+
+### Tests (TDD, watched RED then GREEN)
+
+17 new tests, RED-first (the new tests failed for `KeyError: no regime_ii` / `TypeError: unexpected
+connection_W` / missing config field before the implementation). `tests/test_regime_ii.py` (15):
+the core oracle `test_regime_ii_w_zero_reduces_to_flat` (+ `_cocycle_relaxation_zero_` and
+`_connection_none_` variants — W=0 or alpha=0 or W=None reduce to the flat
+`compute_transport_operators` Omega, `allclose atol=1e-6`), `_returns_flat_dict_shape`,
+`_is_registered`; the non-flat oracles `_nonzero_w_is_non_flat` and the independent curvature oracle
+`_holonomy_strictly_positive` (flat ~0, regime_ii > 1e-2); the homotopy
+`_cocycle_relaxation_homotopy` (alpha=0.5 with W equals alpha=1 with W/2, pinning delta scales
+linearly in both W and the relaxation); model wiring `_creates_connection_w_zero_init`,
+`_flat_has_no_connection_w`, `_init_flat_equals_flat_forward` (seed both constructions; logits/loss
+allclose), `_gradient_flows_to_w` (finite NONZERO `connection_W.grad`, means inflated),
+`_nonzero_w_changes_forward`, the end-to-end `_diagnostics_holonomy_tracks_regime` (W=0 -> ~0,
+W!=0 -> > 1e-2 through `model.diagnostics`), and `test_config_cocycle_relaxation_default_and_validated`.
+`tests/test_e_step.py` (2): `test_e_step_iteration_regime_ii_w_zero_reduces_to_flat` (W=None reduces
+to the flat iteration) and `_nonzero_w_differs_from_flat`. Full suite after the change:
+`tests=362 failures=0 errors=0 skipped=0` (read from junitxml; 345 baseline + 17 new; 361 passed +
+1 xpassed pre-existing; viz collected normally). Default flat path byte-identical (the flat
+byte-identity + perf-equivalence golden tests stay green).
+
+## 2026-06-02 — Hyper-prior channel, FIRST INCREMENT: lambda_h * mean_i KL(s_i||r)
+
+Branch: vfe3-roadmap-overnight-2026-06-02 (committed directly; same running log per the
+one-doc-per-day convention). Design spec:
+`docs/superpowers/specs/2026-06-01-hyperprior-model-coupling-design.md` (its DECISION C
+recommendation: build the smallest end-to-end increment, hyper-prior first).
+
+### Scope (what this increment IS — and what it defers)
+
+This establishes the SECOND (model) belief channel `s_i` plus the hyper-prior `r` end-to-end at
+the smallest scope: the manuscript's `lambda_h sum_i KL(s_i||r_i)` hyper-prior term
+(Participatory_it_from_bit.tex eq:pointwise_free_energy, lines 1241-1249), wired as an opt-in,
+default-off, grad-connected training-loss term. `s_i` is a per-token diagonal Gaussian belief
+encoded from new learned PriorBank tables; `r` is a single global diagonal Gaussian centroid the
+`s_i` are regularized toward.
+
+DEFERRED to increment 2 (NOT built here): the gamma model-coupling block
+`sum_ij gamma_ij KL(s_i||Omega_tilde_ij s_j)`, the s-channel E-step update (the slow natural-gradient
+descent of s toward its fixed point), and the `h->s->p->q` coupling (s_i feeding the belief q / the
+prediction path). In this increment `s_i` is encoded fresh in `forward` and consumed ONLY by the
+hyper-prior loss term; it does not enter the E-step or decode. The M3 `BeliefState.s/r` optional
+fields stay `None` (s is not threaded through the belief tuple this increment).
+
+### Files
+
+`vfe3/config.py`
+  New field `lambda_h: float = 0.0` (hyper-prior weight) beside `mstep_self_coupling_weight`, with a
+  `>= 0.0` `__post_init__` check (mirroring `mass_phi`/`mstep_self_coupling_weight`). Comment cites
+  eq:pointwise_free_energy and the first-increment scope. Default 0.0 = OFF.
+
+`vfe3/model/prior_bank.py`
+  `PriorBank.__init__` gains a `lambda_h: float = 0.0` kwarg. When `lambda_h > 0` it creates, at the
+  VERY END of `__init__` (after the `output_proj_weight` block), four `nn.Parameter` tables:
+  `s_mu_embed`/`s_sigma_log_embed` (V, K) — the per-token model-channel belief, looked up like the
+  belief tables — and `r_mu`/`r_sigma_log` (K,) — the global hyper-prior centroid. s init mirrors the
+  belief tables (`mu_init_std * randn`, `sigma_log_init`); r init is `mu=0`, `sigma=sigma_init`, so
+  `s != r` at init (KL > 0, the channel has a gradient). Creating them LAST and only on the
+  `lambda_h>0` path keeps the default path param-free and byte-RNG-unchanged. New `encode_s(token_ids)
+  -> (s_mu, s_sigma)` returns the diagonal s-channel per token (`exp(s_sigma_log).clamp(min=eps)`).
+
+`vfe3/model/model.py`
+  `VFEModel.__init__` threads `lambda_h=cfg.lambda_h` into the `PriorBank` construction. `forward`
+  adds, guarded by `cfg.lambda_h > 0.0` (mirroring the `mstep_self_coupling_weight` block), the term
+  `loss += cfg.lambda_h * hp` where `hp = self_divergence(DiagonalGaussian(s_mu, s_sigma),
+  DiagonalGaussian(r_mu, r_sigma), alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+  divergence_family=cfg.divergence_family).mean()`. The covariance kernel is `DiagonalGaussian`
+  regardless of `cfg.family` (the s/r tables are always diagonal); `divergence_family` is the
+  orthogonal functional seam. `r` (K,) broadcasts over the (B, N) token axis. Grad-connected (no
+  detach), so it backprops to the s/r tables.
+
+### Manuscript cite
+
+Participatory_it_from_bit.tex eq:pointwise_free_energy (lines 1241-1249): the canonical two-tier
+free energy carries `lambda_h sum_i KL(s_i||r_i)`. The manuscript sets `lambda_h=0` in the reported
+simulation regime, so this is a BUILDOUT target (the formal precondition for the meta-agent
+hierarchy), not a fidelity fix.
+
+### Tests (TDD, watched RED then GREEN)
+
+5 new tests, RED-first (`AttributeError: no lambda_h` / `TypeError`/missing `encode_s` before the
+implementation). `tests/test_hyperprior.py` (4): `test_default_off_no_tables_and_loss_is_ce` (the
+pure-path guard — at `lambda_h=0` there is NO `s_mu_embed`/`r_mu` attribute and `loss == ce` with
+`mass_phi=0`), `test_linear_in_lambda_h` (THE ORACLE — two models same seed except `lambda_h` = 0
+vs 0.5; `loss_w - loss_0` allclose `w * hp` with `hp` recomputed independently from the model's s/r
+tables, `atol=1e-6`; asserts the belief tables are byte-identical between the two models via
+`torch.equal`, and `hp > 1e-6` so it is non-vacuous), `test_grad_flows_to_s_and_r_tables` (finite
+nonzero grad on `s_mu_embed`/`s_sigma_log_embed`/`r_mu`/`r_sigma_log` after backward), and
+`test_self_zero_when_s_equals_r` (setting s == r makes the term 0). `tests/test_config.py` (1):
+`test_config_lambda_h_default_zero_and_validated` (default 0.0; `-1.0` raises; `0.0`/`0.5` accepted).
+
+### Default byte-identity + suite
+
+Default (`lambda_h=0`) path byte-identical: no s/r tables drawn (zero new RNG), `forward` term gated
+off. The 362-test baseline (including the seeded fixed-seed regression and the per-sample/batched
+perf-equivalence golden tests) stays green. Full suite after the change:
+`tests=367 failures=0 errors=0 skipped=0` (read from junitxml; 362 baseline + 5 new; 366 passed +
+1 xpassed pre-existing; viz collected normally).
+
+## 2026-06-02 — Straight-through E-step gradient mode (roadmap Tier A item 3)
+
+Same running log. Branch: vfe3-roadmap-overnight-2026-06-02. Manuscript reference: Algorithm 1,
+GL(K)_attention.tex:2050 (detached per-iteration snapshots plus a LIVE additive chain, no second-order
+differentiation through the inner trajectory).
+
+### The three modes
+
+`e_step_gradient: str = "unroll"` selects the E-step BACKWARD estimator; it does not touch the forward.
+`unroll` (default) fully differentiates through the inner trajectory, keeping the second-order
+`d delta / d belief_prev` terms (the current path, untouched). `straight_through` computes each
+per-iteration tangent detached but rebuilds the belief grad-connected to the previous belief
+(`mu_next = mu_prev + delta.detach()`, `sigma_next = retract(sigma_prev, delta.detach())`), so
+`d belief_next / d belief_prev = I` flows WITHOUT the second-order term — the manuscript's
+detached-snapshot-plus-live-additive-chain estimator. The phi step was ALREADY straight-through
+(fresh detached `requires_grad_` leaf, `create_graph=False`, live `retract_phi`); this brings the
+mu/sigma updates to match it. `detach` runs the whole E-step under `torch.no_grad` (the legacy
+`detach_e_step=True` behavior — no E-step gradient at all).
+
+### Mechanism (the surgical edit)
+
+In `e_step_iteration`, AFTER `nat_mu, nat_sigma = natural_gradient(...)` and before the additive
+update: `if e_step_gradient == "straight_through": nat_mu, nat_sigma = nat_mu.detach(),
+nat_sigma.detach()`. Detaching the POST-natural-gradient tangents (not `grad_mu`/`grad_sigma`) is
+deliberate — `natural_gradient` reintroduces a live `belief.sigma` dependence (`nat_sigma = 2 sigma^2
+grad_sigma`), so detaching only the raw gradients would leak a second-order term through the Fisher
+metric. The mode is NOT realized by a `no_grad` wrapper around the delta computation, because on any
+non-default config the delta routes to `belief_gradients_autograd`, which calls `torch.autograd.grad`
+and REQUIRES grad enabled (the oracle has no `enable_grad` island of its own). When the mode is not
+`straight_through` the two update lines are byte-for-byte the prior code, so unroll byte-identity is
+automatic and `.detach()` never alters a number, so the forward VALUE is unchanged.
+
+### Reconciliation with detach_e_step
+
+The EFFECTIVE mode is a config property `effective_e_step_gradient`: `"detach"` when
+`detach_e_step=True` (back-compat — the existing detach_e_step tests still pass), else
+`e_step_gradient`. `detach_e_step=True` with a non-`unroll` `e_step_gradient` is contradictory and
+raises in `__post_init__`. Default (`unroll` + `detach_e_step=False`) is the current fully-unrolled
+path, byte-identical. `model.forward` gates `run = torch.no_grad()` on `effective == "detach"` (was
+`self.cfg.detach_e_step`) and threads the effective mode down `vfe_stack -> vfe_block -> e_step ->
+e_step_iteration`. The mode is an EXPLICIT keyword of `e_step` (not in `**kwargs`) so it binds there
+and never rides the forwarded knob bag into the diagnostic `free_energy_value` (which rejects unknown
+kwargs).
+
+### Oracles + tests (TDD, watched RED then GREEN)
+
+`tests/test_straight_through.py` (11 new). Config validation: `test_config_accepts_the_three_modes`,
+`test_config_rejects_unknown_mode`, `test_config_default_is_unroll`,
+`test_config_detach_e_step_true_implies_detach_effective`,
+`test_config_contradictory_detach_plus_nonunroll_raises`, `test_config_effective_mode_passthrough`.
+The forward-identity oracle (the strong independent check):
+`test_straight_through_forward_byte_identical_to_unroll` asserts `torch.equal` on logits/loss/ce
+between unroll and straight_through (same state_dict) — straight_through only changes the BACKWARD.
+`test_detach_forward_byte_identical_to_detach_e_step_true` pins `detach` == legacy `detach_e_step=True`
+forward. Gradient behavior: `test_straight_through_grad_flows_to_encode_tables` (finite, nonzero
+`mu_embed.grad`/`sigma_log_embed.grad` after backward); `test_straight_through_grad_differs_from_unroll`
+(the grad-differs oracle — with `e_mu_lr>0`, `e_sigma_lr>0`, `n_e_steps=2` the `mu_embed.grad` is NOT
+allclose between estimators, since unroll keeps the dropped second-order term);
+`test_detach_grad_matches_detach_e_step_true` (`detach` reproduces `detach_e_step=True` backward,
+`atol=0`; phi prior frozen under both).
+
+### Default byte-identity + suite
+
+Default (`unroll`) path byte-identical: the update lines are unchanged when the mode is not
+`straight_through`, and no pre-existing test changed outcome (the unroll byte-identity gate). Full
+suite after the change: `tests=378 failures=0 errors=0 skipped=0` (read from junitxml; 367 baseline +
+11 new; 377 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
+
+## 2026-06-02 — Fuse the per-token exps, skip the dense (B,N,N,K,K) Omega on the flat path (P0 #2)
+
+Branch: vfe3-roadmap-overnight-2026-06-02 (committed directly).
+Recipe + verified equivalence: docs/perf/2026-05-31-speedup-opportunities.md, section "P0 #2".
+
+### What was fused
+
+The forward belief-transport hot path no longer materializes the dense `(B,N,N,K,K)` pairwise
+operator `Omega_ij = exp(phi_i) exp(-phi_j)` on the flat + block-diagonal-with-equal-blocks route.
+Instead the per-token vertex exponentials `exp_phi`/`exp_neg_phi` (each `(B,N,K,K)`) are carried in a
+`FactoredTransport` container, and the pairwise contraction is fused into the mean and per-head
+diagonal covariance:
+
+- Mean (EXACT reassociation): `m_j = exp(-phi_j) @ mu_j` once (`einsum("...jlp,...jp->...jl")`, no
+  i-dependence), then `mu_t[i,j] = exp(phi_i) @ m_j` (`einsum("...ikl,...jl->...ijk")`). Never forms
+  `(B,N,N,K,K)`. Round-off only.
+- Diagonal covariance (per-head block): does NOT factor by squaring the full exps (the square sits
+  inside the l-sum); it factors by BLOCK-DIAGONALITY. Per head h the `(d,d)` block
+  `Omega^(h)_ij = exp_phi^(h) exp_neg_phi^(h)` is the only nonzero part on head h's coordinates, so
+  `Sigma_t[i,j,k] = sum_l (Omega^(h)_ijkl)^2 sigma_jl` runs over head h only (off-block Omega entries
+  are exactly 0.0, courtesy of `_blockwise_matrix_exp`'s `zeros_like` fill). This materializes the
+  per-head `(B,N,N,d,d)` block Omega (H·d^2) instead of the full K^2 square. Exact w.r.t. the dense
+  diagonal sandwich.
+
+### The guard (what stays dense)
+
+`_can_fuse_flat(transport_mode, group)` returns True ONLY when `transport_mode == "flat"` AND
+`len(irrep_dims) > 1` AND all blocks are equal size — i.e. block_glk and tied_block_glk. Everything
+else keeps the dense `_transport` Omega exactly as before: regime_ii (its Omega is mu-dependent and
+carries the edge delta factor — must not be fused), single-block groups glk / so_k (`irrep_dims=[K]`),
+cross-coupled block_glk (also reports `irrep_dims=[K]`), and trivial gauge. A FULL-covariance sigma
+through the factored container rebuilds the dense Omega from the factors (`FactoredTransport.
+to_dense_omega`, byte-identical to `compute_transport_operators`' Omega einsum) and runs the unchanged
+sandwich, so the full-cov path is never the round-off factoring.
+
+### Equivalence oracle + magnitudes
+
+The factored quantities are pinned against `transport_mean`/`transport_covariance` on the explicit
+dense Omega (fixed-seed block_glk K=8/h=2 → [4,4]): factored mean vs dense mean max abs diff
+**9.5e-7** (one float32 ULP relative to the value scale ≈5.7, rel-to-scale 1.7e-7 — pure linear-
+contraction reassociation), factored diagonal cov vs dense diagonal cov **exactly 0.0**, full-cov
+rebuild **byte-identical** (`torch.equal`). The default-config frozen-forward oracle
+(`test_model_forward_matches_frozen_oracle`, `_FWD_LOSS=2.4851524830`, e_phi_lr=0.1, n_e_steps=2)
+exercises the fused kernel path and stays green within 1e-5; `test_batched_forward_equals_per_sample`
+stays green.
+
+### Which consumers are fused vs still dense
+
+The `FactoredTransport` container flows OPAQUELY through `belief_gradients` (kernels.py) and the
+autograd oracle (oracle.py) — those files were NOT edited; they only ever forward `omega` to
+`transport_mean`/`transport_covariance`, which gained the `isinstance(FactoredTransport)` fast path.
+The default filtering kernel (gaussian_diagonal + renyi α=1) and the smoothing-mode oracle both work
+through the container (the oracle's full-cov / smoothing routes rebuild the dense Omega from the
+factors on demand, byte-identical; verified by a smoothing-mode forward+backward with finite, nonzero
+prior-table grads). Left on the dense Omega by design (off the hot path, conscious skips, all
+byte-identical): the phi-objective `phi_alignment_loss` (only runs at e_phi_lr>0; the win is partial
+when φ is learned), the trajectory-diagnostic `free_energy_value`, the mixed-frame `_transport_qk`,
+and `model.diagnostics`. regime_ii and single-block / cross-coupled groups keep the dense Omega via
+`_transport` unchanged.
+
+### Memory / perf note
+
+The mean path forms no `(B,N,N,K,K)` tensor; the diagonal cov path materializes a per-head
+`(B,N,N,d,d)` block intermediate (H·d^2) instead of K^2. Peak transport memory stays O(B·N^2) (the
+outputs `mu_t`/`sigma_t` are themselves O(B·N^2·K) and unavoidable), but the fusion removes the
+dominant K^2 factor and the 838 MB dense-Omega forward+autograd-saved term — a large constant-factor
+cut that makes long context feasible (perf doc: ~13 GB → ~4 GB at N=512). Confirmed by execution that
+the default block_glk forward takes the factored route exclusively (no dense Omega built).
+
+### Files + tests
+
+`vfe3/geometry/transport.py`: new `FactoredTransport` dataclass (+ `to_dense_omega`),
+`build_factored_transport` (factors only, rank-agnostic via leading ellipsis), `transport_mean` /
+`transport_covariance` gain the container fast path, new `_factored_diagonal_covariance`.
+`compute_transport_operators` and the `"flat"` registry builder are UNCHANGED (their dense Omega and
+the `torch.equal` flat-builder oracle / frozen `_OMEGA_SUM` are preserved). `vfe3/inference/e_step.py`:
+new `_can_fuse_flat` guard and `build_belief_transport` (the hot-path selector — factored on
+flat+equal-block, dense `_transport` otherwise); `e_step_iteration` routes its forward transport
+through it. Tests: `tests/test_transport.py` (+4: factored mean / diagonal cov / full-cov rebuild /
+container-has-no-dense-Omega), `tests/test_perf_equivalence.py` (+5 guard correctness: block_glk and
+tied_block_glk fuse; glk / so_k single-block, regime_ii, and cross-coupled block_glk stay dense). Full
+suite after the change: `tests=387 failures=0 errors=0 skipped=0` (read from junitxml; 378 baseline +
+9 new = 4 + 5; 386 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).

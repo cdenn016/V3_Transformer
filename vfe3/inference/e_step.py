@@ -21,29 +21,94 @@ from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, re
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
 from vfe3.geometry.retraction import get_retraction, natural_gradient, retract_phi
-from vfe3.geometry.transport import compute_transport_operators, get_transport, transport_covariance, transport_mean
+from vfe3.geometry.transport import (
+    FactoredTransport,
+    build_factored_transport,
+    compute_transport_operators,
+    get_transport,
+    transport_covariance,
+    transport_mean,
+)
 from vfe3.gradients.kernels import belief_gradients
 
 
 def _transport(
-    phi:            torch.Tensor,             # (N, n_gen) or (B, N, n_gen)
-    group:          GaugeGroup,
+    phi:                torch.Tensor,             # (N, n_gen) or (B, N, n_gen)
+    group:              GaugeGroup,
 
     *,
-    transport_mode: str = "flat",             # connection-regime registry key (default = flat)
+    transport_mode:     str                    = "flat",   # connection-regime registry key (default = flat)
+    mu:                 Optional[torch.Tensor] = None,      # (N, K) or (B, N, K) means; regime_ii edge connection reads these
+    connection_W:       Optional[torch.Tensor] = None,      # (n_gen, K, K) learned bilinear connection (regime_ii, NN exception)
+    cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
 ) -> torch.Tensor:                            # (N, N, K, K) or (B, N, N, K, K) Omega_ij
-    r"""Build the pairwise transport Omega_ij = exp(phi_i) exp(-phi_j) via the registry.
+    r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
-    The connection-regime build is config-selected through ``get_transport(transport_mode)``; the
-    default 'flat' is the Regime-I phi-cocycle (byte-identical to a direct
-    ``compute_transport_operators`` call). Rank-aware: a 2-D (N, n_gen) frame (the unbatched
-    diagnostics / trajectory path) is transported as a batch of one and stripped back to
-    (N, N, K, K); a 3-D (B, N, n_gen) frame (the batched forward) flows straight through the
-    builder (which already carries the leading batch axis) and returns (B, N, N, K, K)."""
+    The build is config-selected through ``get_transport(transport_mode)``; the default 'flat' is
+    the Regime-I phi-cocycle Omega_ij = exp(phi_i) exp(-phi_j) (byte-identical to a direct
+    ``compute_transport_operators`` call, mu/connection_W ignored). 'regime_ii' is the NON-FLAT
+    edge-relaxed cocycle (a sanctioned learned-connection NN exception): it reads the CURRENT belief
+    means ``mu`` and the learned ``connection_W`` to insert the edge factor exp(delta_ij . G), so it
+    must be REBUILT as mu updates each E-step iteration (flat is mu-independent).
+
+    Rank-aware: a 2-D (N, n_gen) frame (the unbatched diagnostics / trajectory path) is transported
+    as a batch of one and stripped back to (N, N, K, K); a 3-D (B, N, n_gen) frame (the batched
+    forward) flows straight through. ``mu`` is unsqueezed to match so the builder always sees a
+    batched (B, N, K) mean."""
     build = get_transport(transport_mode)
     if phi.dim() == 2:
-        return build(phi.unsqueeze(0), group)["Omega"][0]
-    return build(phi, group)["Omega"]
+        mu_b = mu.unsqueeze(0) if mu is not None else None
+        return build(phi.unsqueeze(0), group, mu=mu_b, connection_W=connection_W,
+                     cocycle_relaxation=cocycle_relaxation)["Omega"][0]
+    return build(phi, group, mu=mu, connection_W=connection_W,
+                 cocycle_relaxation=cocycle_relaxation)["Omega"]
+
+
+def _can_fuse_flat(transport_mode: str, group: GaugeGroup) -> bool:
+    r"""Whether the forward belief-transport may skip the dense (B,N,N,K,K) Omega (P0 #2).
+
+    The fused factored route is valid ONLY when the connection is flat (``transport_mode='flat'``;
+    regime_ii's Omega is mu-dependent and carries the edge delta factor, so it must stay dense) AND
+    the group is genuinely block-diagonal with EQUAL blocks (``len(irrep_dims) > 1`` and all blocks
+    the same size -- block_glk / tied_block_glk). Single-block (glk, so_k, cross-coupled block_glk
+    all report ``irrep_dims=[K]``) keeps the dense path.
+    """
+    return (
+        transport_mode == "flat"
+        and len(group.irrep_dims) > 1
+        and len(set(group.irrep_dims)) == 1
+    )
+
+
+def build_belief_transport(
+    phi:                torch.Tensor,             # (B, N, n_gen) batched gauge frames
+    group:              GaugeGroup,
+
+    *,
+    transport_mode:     str                    = "flat",   # connection-regime registry key
+    mu:                 Optional[torch.Tensor] = None,      # regime_ii edge connection reads these
+    connection_W:       Optional[torch.Tensor] = None,      # regime_ii learned bilinear connection
+    cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
+) -> 'torch.Tensor | FactoredTransport':
+    r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
+
+    On the flat + block-diagonal-with-equal-blocks path (``_can_fuse_flat``) returns a
+    :class:`FactoredTransport` -- the per-token exps only, NEVER the dense (B,N,N,K,K) Omega --
+    which ``transport_mean`` / ``transport_covariance`` consume on a fused fast path (the mean is an
+    exact reassociation; the diagonal covariance factors per head). Every other case
+    (regime_ii, single-block / cross-coupled groups, trivial gauge) falls back to ``_transport``'s
+    DENSE Omega exactly as before, so those numerics are unchanged. The factored container flows
+    OPAQUELY through ``belief_gradients`` (kernel + oracle), which only ever forward it to
+    ``transport_mean`` / ``transport_covariance``; the oracle's full-cov / smoothing routes rebuild
+    the dense Omega from the factors on demand (byte-identical).
+    """
+    if _can_fuse_flat(transport_mode, group):
+        return build_factored_transport(phi, group)
+    transport_kw = (
+        dict(mu=mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation)
+        if transport_mode == "regime_ii" else {}
+    )
+    return _transport(phi, group, transport_mode=transport_mode, **transport_kw)
 
 
 def _transport_qk(
@@ -85,9 +150,11 @@ def free_energy_value(
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
     spd_retract_mode:          str  = "spd_affine",    # accepted-and-ignored iteration-only knob
     transport_mode:            str  = "flat",          # accepted-and-ignored iteration-only knob
+    cocycle_relaxation:        float = 1.0,            # accepted-and-ignored iteration-only knob (regime_ii)
 
     log_prior:                 Optional[torch.Tensor] = None,
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
+    connection_W:              Optional[torch.Tensor] = None,   # accepted-and-ignored iteration-only knob (regime_ii NN exception)
     keys:                      Optional[BeliefState]  = None,   # None -> global F; else keys frozen at `keys`
 ) -> torch.Tensor:                   # scalar F
     r"""Scalar free energy of a belief. ``keys=None`` -> global F (keys = the belief);
@@ -98,10 +165,13 @@ def free_energy_value(
         E_ij = D(q_i || Omega_ij q_j),  beta = softmax_j(log_prior - E/tau).
 
     The iteration-only knobs (gradient_mode, phi_precond_mode, phi_retract_mode,
-    spd_retract_mode, transport_mode, sigma_max, e_sigma_q_trust) are declared here as EXPLICIT
-    accept-and-ignore parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may
-    forward one knob bag to both this and ``e_step_iteration`` while a MISSPELLED real
-    parameter still raises ``TypeError`` here instead of being silently swallowed.
+    spd_retract_mode, transport_mode, cocycle_relaxation, connection_W, sigma_max, e_sigma_q_trust)
+    are declared here as EXPLICIT accept-and-ignore parameters (not a blanket ``**kwargs`` sink) so the
+    common ``e_step`` call site may forward one knob bag to both this and ``e_step_iteration`` while a
+    MISSPELLED real parameter still raises ``TypeError`` here instead of being silently swallowed. NOTE:
+    the trajectory-diagnostic F here always uses the FLAT transport (its internal ``_transport`` omits
+    transport_mode), so under regime_ii the logged F-trajectory is a flat-transport diagnostic, not the
+    regime_ii objective -- wiring it is out of scope (matches log_alpha, also not threaded here).
     """
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
     # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
@@ -194,19 +264,34 @@ def e_step_iteration(
     phi_retract_mode:          str  = "euclidean",
     spd_retract_mode:          str  = "spd_affine",
     transport_mode:            str  = "flat",
+    e_step_gradient:           str  = "unroll",               # backward estimator: unroll | straight_through | detach
+    cocycle_relaxation:        float = 1.0,                    # regime_ii homotopy alpha; 0 -> flat (ignored by flat)
 
     log_prior:                 Optional[torch.Tensor] = None,
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
+    connection_W:              Optional[torch.Tensor] = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
     (autograd of the alignment block + preconditioner + Lie retraction).
 
     The belief-transport build is config-selected through the connection-regime registry
     (``transport_mode``); the default 'flat' is the Regime-I phi-cocycle (byte-identical).
-    ``log_alpha`` is the learned self-coupling nn.Parameter (alpha = exp(log_alpha)) under
-    alpha_mode='learnable' (None on the pure path); it flows into the belief gradient so the
-    loss backpropagates to it through the unrolled E-step."""
-    omega = _transport(belief.phi, group, transport_mode=transport_mode)
+    'regime_ii' is the non-flat edge-relaxed cocycle and consumes the CURRENT belief means and the
+    learned ``connection_W`` (a sanctioned NN exception); because that Omega depends on mu it is
+    rebuilt from ``belief.mu`` every iteration here (flat is mu-independent). ``log_alpha`` is the
+    learned self-coupling nn.Parameter (alpha = exp(log_alpha)) under alpha_mode='learnable' (None on
+    the pure path); it flows into the belief gradient so the loss backpropagates to it through the
+    unrolled E-step. ``connection_W`` likewise flows in only through these belief updates, so the
+    loss backpropagates to it (and a detached E-step would freeze it, mirroring log_alpha)."""
+    # Build the forward belief-transport (P0 #2): on the flat + block-diagonal-with-equal-blocks
+    # path this is a FactoredTransport (the per-token exps only, NO dense (B,N,N,K,K) Omega), which
+    # the belief-gradient kernel / oracle consume opaquely through transport_mean / covariance;
+    # regime_ii (mu-dependent Omega) and single-block / cross-coupled groups keep the dense Omega
+    # exactly as before. Only regime_ii needs the belief means + learned connection.
+    omega = build_belief_transport(
+        belief.phi, group, transport_mode=transport_mode,
+        mu=belief.mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
+    )
     grad_mu, grad_sigma = belief_gradients(
         belief.mu, belief.sigma, mu_p, sigma_p, omega,
         tau=tau, alpha_div=alpha_div, value=value, b0=b0, c0=c0, kl_max=kl_max, eps=eps,
@@ -215,6 +300,18 @@ def e_step_iteration(
         irrep_dims=group.irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
     )
     nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
+
+    # STRAIGHT-THROUGH (manuscript Algorithm 1, GL(K)_attention.tex:2050): detach the per-iteration
+    # tangent so only the ADDITIVE chain stays live -- the belief is rebuilt as mu_prev + delta and
+    # retract(sigma_prev, delta) below, giving d belief_next/d belief_prev = I WITHOUT the
+    # second-order d delta/d belief_prev term the unrolled path keeps. The tangent is detached AFTER
+    # natural_gradient (which reintroduces a live belief.sigma dependence), not at grad_mu/grad_sigma,
+    # so no second-order term leaks through the Fisher metric. 'unroll' (and the no_grad-wrapped
+    # 'detach') leave nat_mu/nat_sigma untouched, so those lines are byte-identical to before and the
+    # forward VALUE is unchanged (detach never alters a number). This mirrors the phi step, which is
+    # already straight-through (fresh detached leaf, create_graph=False).
+    if e_step_gradient == "straight_through":
+        nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
 
     mu = belief.mu - e_mu_lr * nat_mu
     # The registered SPD retraction owns the diagonal-vs-full rank decision internally (full cov iff
@@ -261,13 +358,21 @@ def e_step(
     e_sigma_lr:        float = 0.1,
     e_phi_lr:          float = 0.1,
     return_trajectory: bool  = False,
+    e_step_gradient:   str   = "unroll",
 
     log_prior:         Optional[torch.Tensor] = None,
     **kwargs,
 ) -> 'BeliefState | Tuple[BeliefState, List[float]]':
     r"""Iterate ``e_step_iteration`` ``n_iter`` times (parallel mean-field). Optionally
     returns the global-F trajectory (a DIAGNOSTIC; parallel updates are not guaranteed
-    monotone per iteration)."""
+    monotone per iteration).
+
+    ``e_step_gradient`` is the backward estimator forwarded to each iteration: 'unroll' (default,
+    full second-order trajectory gradient) or 'straight_through' (per-iteration tangent detached,
+    additive chain live). It is an EXPLICIT keyword (not in ``**kwargs``) so it binds here and does
+    NOT ride the forwarded knob bag into the diagnostic ``free_energy_value`` (which rejects unknown
+    kwargs). 'detach' is realized by the caller wrapping this in no_grad, so it is treated as
+    'unroll' here (no_grad already severs every gradient)."""
     traj: List[float] = []
 
     def _f_diag(b: BeliefState) -> float:
@@ -281,7 +386,8 @@ def e_step(
     for _ in range(n_iter):
         belief = e_step_iteration(
             belief, mu_p, sigma_p, group, tau=tau,
-            e_mu_lr=e_mu_lr, e_sigma_lr=e_sigma_lr, e_phi_lr=e_phi_lr, log_prior=log_prior, **kwargs,
+            e_mu_lr=e_mu_lr, e_sigma_lr=e_sigma_lr, e_phi_lr=e_phi_lr,
+            e_step_gradient=e_step_gradient, log_prior=log_prior, **kwargs,
         )
         if return_trajectory:
             traj.append(_f_diag(belief))

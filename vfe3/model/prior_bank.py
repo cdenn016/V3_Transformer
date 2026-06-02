@@ -105,6 +105,7 @@ class PriorBank(nn.Module):
         use_prior_bank:      bool  = True,
         encode_mode:         str   = "per_token",
         decode_mode:         str   = "diagonal",
+        lambda_h:            float = 0.0,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -136,12 +137,46 @@ class PriorBank(nn.Module):
             self.output_proj_weight = nn.Parameter(torch.empty(vocab_size, K))
             nn.init.xavier_uniform_(self.output_proj_weight)
 
+        # HYPER-PRIOR CHANNEL (manuscript eq:pointwise_free_energy), FIRST INCREMENT, default-OFF.
+        # When lambda_h > 0, create the model-channel belief tables s_mu_embed/s_sigma_log_embed
+        # (V, K) -- a per-token DIAGONAL Gaussian s_i looked up like the belief tables -- and the
+        # global hyper-prior r_mu/r_sigma_log (K,), a single diagonal Gaussian the s_i are
+        # regularized toward (the manuscript centroid). These are PRIORS (nn.Parameter), not a
+        # neural map. They are created LAST and ONLY on the lambda_h>0 path: the default (lambda_h=0)
+        # path draws zero new RNG, so the belief tables above are byte-unchanged and the pure path
+        # is param-free (no s_mu_embed attribute at all). s init mirrors the belief tables (small mu,
+        # sigma matching sigma_init); r init: mu=0, sigma matching sigma_init -- so s != r at init
+        # (KL(s||r) > 0, the channel has a gradient). NOTE (first increment): s_i is NOT yet coupled
+        # to the belief q; the gamma model-coupling block and the s-channel E-step update are
+        # DEFERRED to increment 2.
+        if lambda_h > 0.0:
+            self.s_mu_embed        = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
+            self.s_sigma_log_embed = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
+            self.r_mu              = nn.Parameter(torch.zeros(K))
+            self.r_sigma_log       = nn.Parameter(torch.full((K,), sigma_log_init))
+
     def encode(
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
     ) -> BeliefState:
         r"""Look up the per-token Gaussian prior as the initial belief (q = p)."""
         return get_encode(self.encode_mode)(self, token_ids)
+
+    def encode_s(
+        self,
+        token_ids: torch.Tensor,         # (B, N) integer token ids
+    ) -> 'tuple[torch.Tensor, torch.Tensor]':
+        r"""Look up the per-token model-channel belief s_i = N(s_mu, s_sigma) (diagonal).
+
+        Returns (s_mu, s_sigma) with s_mu (B, N, K) and s_sigma (B, N, K) the positive
+        variances exp(s_sigma_log).clamp(min=eps). Available only on the hyper-prior path
+        (lambda_h>0, where the s tables are created); the manuscript hyper-prior term consumes
+        this as DiagonalGaussian(s_mu, s_sigma). FIRST INCREMENT: this is consumed only by the
+        lambda_h * mean_i KL(s_i||r) loss term; s_i is not yet coupled into the belief q.
+        """
+        s_mu = self.s_mu_embed[token_ids]                                       # (B, N, K)
+        s_sigma = torch.exp(self.s_sigma_log_embed[token_ids]).clamp(min=self.eps)  # (B, N, K)
+        return s_mu, s_sigma
 
     def _tau_eff(
         self,

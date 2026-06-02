@@ -19,6 +19,7 @@ _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "p
 _VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
 _VALID_ATTENTION_PRIORS    = ("uniform", "causal", "alibi")
 _VALID_NORMS               = ("none", "mahalanobis")
+_VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
 
 
 @dataclass
@@ -51,11 +52,21 @@ class VFE3Config:
     # gauge seam
     gauge_group:               str   = "block_glk"
     gauge_parameterization:    str   = "phi"
-    # Connection REGIME (registry key): the flat Regime-I phi-cocycle ('flat', default = current
-    # behavior) vs the design-spec'd non-flat Regime II (deferred). ORTHOGONAL to
-    # gauge_parameterization, which picks how a single flat transport is parameterized; this picks
-    # whether the connection is flat at all. Validated against the transport registry below.
+    # Connection REGIME (registry key): the flat Regime-I phi-cocycle ('flat', default = the pure
+    # NO-NN path) vs the non-flat Regime II ('regime_ii'). ORTHOGONAL to gauge_parameterization,
+    # which picks how a single flat transport is parameterized; this picks whether the connection is
+    # flat at all. Validated against the transport registry below.
+    # NEURAL-NETWORK EXCEPTION (sanctioned, default-OFF): 'regime_ii' introduces a LEARNED bilinear
+    # edge connection delta_ij^a = mu_i^T W^a mu_j, with W a model-owned nn.Parameter (shape
+    # (n_gen, K, K)) trained by backprop on CE -- a documented learned-parameter exception in the
+    # spirit of use_head_mixer / alpha_mode='learnable' (see VFEModel.__init__'s connection_W and
+    # transport._build_regime_ii). At W=0 (init) or cocycle_relaxation=0 it reduces EXACTLY to the
+    # flat cocycle, so init is byte-flat. The pure no-NN path is 'flat' (the default).
     transport_mode:            str   = "flat"
+    # Homotopy alpha for the Regime-II connection (regime_ii only): delta_ij^a = cocycle_relaxation *
+    # (mu_i^T W^a mu_j). 0.0 -> delta=0 -> flat (Regime I); 1.0 -> fully relaxed (Regime II). Ignored
+    # by the flat builder.
+    cocycle_relaxation:        float = 1.0
     # Cross-head GL(K) coupling: a list of directed (head_a, head_b) index pairs that add off-block
     # generators (and a genuinely larger-than-direct-sum subalgebra under the builder's bracket
     # closure) to the gauge basis. Default None = the current block-diagonal GL(d_head)^H gauge.
@@ -89,6 +100,14 @@ class VFE3Config:
     kappa:                     float = 1.0          # temperature tau = kappa * sqrt(K)
     mass_phi:                  float = 0.0          # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight: float = 0.0         # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    # Hyper-prior weight lambda_h on the model-channel term lambda_h * mean_i KL(s_i||r)
+    # (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy, lines 1241-1249).
+    # Default 0.0 = OFF: no s/r tables, loss byte-identical to the single-tier path.
+    # FIRST INCREMENT: this wires the second (model) belief channel s_i + the global hyper-prior
+    # r end-to-end at the smallest scope; s_i does NOT yet couple into the belief q / the
+    # prediction path, and the gamma model-coupling block + the s-channel E-step update are
+    # DEFERRED to increment 2.
+    lambda_h:                  float = 0.0
 
     # attention
     include_attention_entropy: bool  = True         # canonical (True) vs surrogate (False)
@@ -120,6 +139,23 @@ class VFE3Config:
     norm_type_final:           str   = "none"
 
     # M-step / training
+    # E-step backward estimator (manuscript Algorithm 1, GL(K)_attention.tex:2050). Three modes:
+    #   'unroll'          (default): fully differentiate through the inner trajectory -- the
+    #                     gradient keeps the second-order d delta/d belief_prev terms.
+    #   'straight_through': each inner update computes its tangent DETACHED but rebuilds the
+    #                     belief grad-connected to the previous belief (mu_next = mu_prev +
+    #                     delta.detach(), sigma_next = retract(sigma_prev, delta.detach())), so
+    #                     d belief_next/d belief_prev = I flows WITHOUT the second-order term --
+    #                     the manuscript's detached-snapshot-plus-live-additive-chain estimator
+    #                     (the phi step is already straight-through; this matches it for mu/sigma).
+    #                     Forward VALUE is byte-identical to 'unroll'; only the BACKWARD differs.
+    #   'detach'          : the whole E-step under torch.no_grad (the legacy detach_e_step=True
+    #                     behavior) -- no E-step gradient at all.
+    # Reconciled with detach_e_step: the EFFECTIVE mode is 'detach' when detach_e_step=True
+    # (back-compat), else e_step_gradient. detach_e_step=True with a non-'unroll' e_step_gradient
+    # is contradictory and raises in __post_init__. The default (unroll + detach_e_step=False) is
+    # the current fully-unrolled path, byte-identical.
+    e_step_gradient:           str   = "unroll"
     detach_e_step:             bool  = False        # False = unroll E-step in the training graph
     m_mu_lr:                   float = 0.025
     m_sigma_lr:                float = 0.0025
@@ -251,6 +287,8 @@ class VFE3Config:
             raise ValueError(
                 f"mstep_self_coupling_weight must be >= 0, got {self.mstep_self_coupling_weight}"
             )
+        if self.lambda_h < 0.0:
+            raise ValueError(f"lambda_h must be >= 0, got {self.lambda_h}")
         for name in ("b0", "c0"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
@@ -347,6 +385,19 @@ class VFE3Config:
         _require(self.norm_type_final, _VALID_NORMS, "norm_type_final")
 
         # M-step / training
+        # e_step_gradient selects the E-step backward estimator (unroll | straight_through |
+        # detach). Reconciled with the legacy detach_e_step bool WITHOUT breaking it: the
+        # EFFECTIVE mode is 'detach' when detach_e_step=True (back-compat), else e_step_gradient
+        # (see effective_e_step_gradient). detach_e_step=True with a non-'unroll' e_step_gradient
+        # asks for two different things at once, so reject it at construction.
+        _require(self.e_step_gradient, _VALID_E_STEP_GRADIENTS, "e_step_gradient")
+        if self.detach_e_step and self.e_step_gradient != "unroll":
+            raise ValueError(
+                f"detach_e_step=True is contradictory with e_step_gradient="
+                f"{self.e_step_gradient!r}: detach_e_step already forces the effective mode to "
+                f"'detach'. Set detach_e_step=False and use e_step_gradient to select the mode, "
+                f"or leave e_step_gradient='unroll'."
+            )
         for name in ("m_mu_lr", "m_sigma_lr", "m_phi_lr", "weight_decay"):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
@@ -378,6 +429,17 @@ class VFE3Config:
     def d_head(self) -> int:
         """Per-head belief dimension K // n_heads."""
         return self.embed_dim // self.n_heads
+
+    @property
+    def effective_e_step_gradient(self) -> str:
+        """The E-step backward estimator actually used, reconciling detach_e_step.
+
+        detach_e_step=True forces 'detach' (the legacy whole-E-step-under-no_grad behavior);
+        otherwise the chosen e_step_gradient ('unroll' | 'straight_through' | 'detach') applies.
+        The contradictory pair (detach_e_step=True with non-'unroll' e_step_gradient) is rejected
+        in __post_init__, so this never silently overrides a meaningful e_step_gradient.
+        """
+        return "detach" if self.detach_e_step else self.e_step_gradient
 
 
 def _require(value: str, valid: tuple, name: str) -> None:
