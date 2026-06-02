@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from vfe3.belief import BeliefState
 from vfe3.divergence import kl as _kl
+from vfe3.families.gaussian import DiagonalGaussian
 from vfe3.model.prior_bank import PriorBank
 
 
@@ -13,7 +14,8 @@ def _reference_decode(pb, mu_q, sigma_q, tau):
     mu_v = pb.mu_embed; sigma_v = torch.exp(pb.sigma_log_embed)
     mu_q_b = mu_q.unsqueeze(-2)                               # (B,N,1,K)
     sigma_q_b = sigma_q.unsqueeze(-2)
-    klv = _kl(mu_q_b, sigma_q_b, mu_v, sigma_v, kl_max=float("inf"))   # (B,N,V) via broadcast
+    klv = _kl(DiagonalGaussian(mu_q_b, sigma_q_b), DiagonalGaussian(mu_v, sigma_v),
+              kl_max=float("inf"))                           # (B,N,V) via broadcast
     return -klv / tau
 
 

@@ -79,6 +79,7 @@ def test_full_kl_invariant_under_group_pushforward(spec):
     # For a random group element g = exp(sum_a c_a G_a), the Gaussian KL is
     # invariant under common pushforward mu->g mu, Sigma->g Sigma g^T.
     from vfe3.divergence import kl
+    from vfe3.families.gaussian import FullGaussian
     name, kwargs = spec
     grp = get_group(name)(**kwargs)
     K = sum(grp.irrep_dims)
@@ -94,12 +95,12 @@ def test_full_kl_invariant_under_group_pushforward(spec):
     S_q = Aq @ Aq.transpose(-1, -2) + torch.eye(K)
     S_p = Ap @ Ap.transpose(-1, -2) + torch.eye(K)
 
-    base = kl(mu_q, S_q, mu_p, S_p, family="gaussian_full")
+    base = kl(FullGaussian(mu_q, S_q), FullGaussian(mu_p, S_p))
     mu_q2 = torch.einsum("kl,nl->nk", g, mu_q)
     mu_p2 = torch.einsum("kl,nl->nk", g, mu_p)
     S_q2 = g @ S_q @ g.transpose(-1, -2)
     S_p2 = g @ S_p @ g.transpose(-1, -2)
-    moved = kl(mu_q2, S_q2, mu_p2, S_p2, family="gaussian_full")
+    moved = kl(FullGaussian(mu_q2, S_q2), FullGaussian(mu_p2, S_p2))
 
     assert grp.invariant_for("gaussian")
     assert torch.allclose(base, moved, atol=1e-3, rtol=1e-3)

@@ -16,6 +16,7 @@ import torch
 
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
+from vfe3.families.base import get_family
 from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
@@ -101,11 +102,12 @@ def free_energy_value(
     mu_t = transport_mean(omega.unsqueeze(0), key_belief.mu.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), key_belief.sigma.unsqueeze(0))[0]
 
-    sd = self_divergence_for_alpha(belief.mu, belief.sigma, mu_p, sigma_p, alpha=alpha_div, kl_max=kl_max, eps=eps,
-                                   family=family, divergence_family=divergence_family, alpha_mode=alpha_mode)
+    fam = get_family(family)
+    sd = self_divergence_for_alpha(fam(belief.mu, belief.sigma), fam(mu_p, sigma_p), alpha=alpha_div, kl_max=kl_max,
+                                   eps=eps, divergence_family=divergence_family, alpha_mode=alpha_mode)
     alpha, reg = self_coupling_alpha(sd, value=value, mode=alpha_mode, b0=b0, c0=c0)
-    energy = pairwise_energy(belief.mu, belief.sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps,
-                             family=family, divergence_family=divergence_family, irrep_dims=group.irrep_dims)
+    energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_t, sigma_t), alpha=alpha_div, kl_max=kl_max, eps=eps,
+                             divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     return free_energy(
         sd, energy, alpha, tau=tau, include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if alpha_mode != "constant" else None),
@@ -143,8 +145,9 @@ def phi_alignment_loss(
     omega = _transport(phi, group)
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma)
-    energy = pairwise_energy(mu, sigma, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps,
-                             family=family, divergence_family=divergence_family, irrep_dims=group.irrep_dims)
+    fam = get_family(family)
+    energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=alpha_div, kl_max=kl_max, eps=eps,
+                             divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0
     if include_attention_entropy:
         return reduced_free_energy(energy, tau=tau, log_prior=log_prior).sum() + mass

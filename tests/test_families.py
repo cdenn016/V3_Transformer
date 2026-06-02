@@ -83,14 +83,15 @@ def test_generic_renyi_from_A_matches_exponential_closed_form():
 
 
 def test_diagonal_gaussian_closed_form_matches_legacy_divergence():
-    from vfe3.divergence import renyi as legacy_renyi          # still the tensor API at this point
+    from vfe3.divergence import renyi as div_renyi             # now the param functional
     from vfe3.families.gaussian import DiagonalGaussian
     from vfe3.families.base import renyi as fam_renyi
+    assert div_renyi is fam_renyi                              # divergence re-exports the param renyi
     torch.manual_seed(3)
     mu_q, mu_p = torch.randn(5, 4), torch.randn(5, 4)
     s_q, s_p = torch.rand(5, 4) + 0.5, torch.rand(5, 4) + 0.5
     for a in (0.5, 1.0):
-        want = legacy_renyi(mu_q, s_q, mu_p, s_p, alpha=a, family="gaussian_diagonal")
+        want = DiagonalGaussian(mu_q, s_q).renyi_closed_form(DiagonalGaussian(mu_p, s_p), alpha=a)
         got = fam_renyi(DiagonalGaussian(mu_q, s_q), DiagonalGaussian(mu_p, s_p), alpha=a)
         assert torch.allclose(got, want, atol=1e-6), (a, (got - want).abs().max())
 
@@ -119,7 +120,6 @@ def test_diagonal_block_and_broadcast():
 
 
 def test_full_gaussian_closed_form_matches_legacy_and_block():
-    from vfe3.divergence import renyi as legacy_renyi
     from vfe3.families.gaussian import FullGaussian
     from vfe3.families.base import renyi as fam_renyi
     torch.manual_seed(5)
@@ -128,7 +128,7 @@ def test_full_gaussian_closed_form_matches_legacy_and_block():
     Aq = torch.randn(N, K, K); s_q = Aq @ Aq.transpose(-1, -2) + K * torch.eye(K)
     Ap = torch.randn(N, K, K); s_p = Ap @ Ap.transpose(-1, -2) + K * torch.eye(K)
     for a in (0.5, 1.0):
-        want = legacy_renyi(mu_q, s_q, mu_p, s_p, alpha=a, family="gaussian_full")
+        want = FullGaussian(mu_q, s_q).renyi_closed_form(FullGaussian(mu_p, s_p), alpha=a)
         got = fam_renyi(FullGaussian(mu_q, s_q), FullGaussian(mu_p, s_p), alpha=a)
         assert torch.allclose(got, want, atol=1e-4), (a, (got - want).abs().max())
     qb = FullGaussian(mu_q, s_q).block(1, 3)

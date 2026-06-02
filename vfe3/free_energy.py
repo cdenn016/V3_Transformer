@@ -12,7 +12,8 @@ from typing import List, Optional
 import torch
 
 from vfe3.alpha_i import alpha_is_per_coord
-from vfe3.divergence import family_cov_kind, gaussian_diagonal_renyi_per_coord, get_functional
+from vfe3.divergence import get_functional
+from vfe3.families.base import BeliefParams
 
 
 def effective_temperature(
@@ -30,16 +31,13 @@ def effective_temperature(
 
 
 def pairwise_energy(
-    mu_q:              torch.Tensor,       # (..., N, K) query means
-    sigma_q:           torch.Tensor,       # (..., N, K[,K]) query (co)variances
-    mu_t:              torch.Tensor,       # (..., N, N, K) transported key means Omega_ij mu_j
-    sigma_t:           torch.Tensor,       # (..., N, N, K[,K]) transported key (co)variances
+    q:                 BeliefParams,        # (..., N, K) query belief
+    key:               BeliefParams,        # (..., N, N, K) transported key belief Omega_ij q_j
 
     *,
     alpha:             float = 1.0,
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
-    family:            str   = "gaussian_diagonal",
     divergence_family: str   = "renyi",
 
     irrep_dims:        Optional[List[int]] = None,
@@ -47,8 +45,9 @@ def pairwise_energy(
     r"""Per-pair belief-coupling energy via the divergence seam (KL = Renyi at alpha=1).
 
     Divergence-agnostic on two orthogonal axes: ``divergence_family`` selects the FUNCTIONAL
-    (renyi, ...) and ``family`` the covariance kernel (gaussian_diagonal/gaussian_full), so a
-    new f-divergence or covariance structure slots in by registration without editing here.
+    (renyi, ...) and the BeliefParams subclass of ``q``/``key`` the covariance kernel
+    (gaussian_diagonal/gaussian_full), so a new f-divergence or covariance structure slots in
+    by registration / constructing the right params, without editing here.
 
     PER-HEAD (GL(K) attention): when ``irrep_dims`` has more than one block the energy is
     computed PER IRREP BLOCK h -- E_ij^(h) = D(q_i^(h) || Omega_ij^(h) q_j^(h)) over block h's
@@ -56,105 +55,85 @@ def pairwise_energy(
     leading head axis is returned: (..., H, N, N). With ``irrep_dims`` None or a single block
     the full-K energy (..., N, N) is returned, bit-identical to the legacy single-beta path.
 
-    The key axis is inserted from the `family`'s covariance structure (diagonal -> -2, full
-    -> -3), staying correct when sigma_q carries a leading batch dim mu_q lacks.
+    The query's key axis is inserted by ``broadcast_over_keys`` (the params own their covariance
+    layout), staying correct when sigma_q carries a leading batch dim mu_q lacks.
     """
     functional = get_functional(divergence_family)
-    is_diagonal = family_cov_kind(family) == "diagonal"
-    mu_q_b = mu_q.unsqueeze(-2)            # (..., N, 1, K) broadcast query over keys
-    sigma_q_b = sigma_q.unsqueeze(-2) if is_diagonal else sigma_q.unsqueeze(-3)
+    q_b = q.broadcast_over_keys()          # (..., N, 1, K) broadcast query over keys
 
     if irrep_dims is None or len(irrep_dims) == 1:
-        return functional(mu_q_b, sigma_q_b, mu_t, sigma_t, alpha=alpha, kl_max=kl_max, eps=eps, family=family)
+        return functional(q_b, key, alpha=alpha, kl_max=kl_max, eps=eps)
 
     energies = []
     start = 0
     for d in irrep_dims:                   # one divergence per irrep block (head)
         end = start + d
-        if is_diagonal:
-            e_h = functional(
-                mu_q_b[..., start:end], sigma_q_b[..., start:end],
-                mu_t[..., start:end], sigma_t[..., start:end],
-                alpha=alpha, kl_max=kl_max, eps=eps, family=family,
-            )
-        else:                              # full: slice the marginal (h,h) covariance sub-block
-            e_h = functional(
-                mu_q_b[..., start:end], sigma_q_b[..., start:end, start:end],
-                mu_t[..., start:end], sigma_t[..., start:end, start:end],
-                alpha=alpha, kl_max=kl_max, eps=eps, family=family,
-            )
+        e_h = functional(
+            q_b.block(start, end), key.block(start, end),
+            alpha=alpha, kl_max=kl_max, eps=eps,
+        )
         energies.append(e_h)
         start = end
     return torch.stack(energies, dim=-3)   # (..., H, N, N)
 
 
 def self_divergence(
-    mu_q:              torch.Tensor,       # (..., N, K)
-    sigma_q:           torch.Tensor,       # (..., N, K[,K])
-    mu_p:              torch.Tensor,       # (..., N, K)
-    sigma_p:           torch.Tensor,       # (..., N, K[,K])
+    q:                 BeliefParams,        # (..., N, K) belief
+    p:                 BeliefParams,        # (..., N, K) prior
 
     *,
     alpha:             float = 1.0,
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
-    family:            str   = "gaussian_diagonal",
     divergence_family: str   = "renyi",
 ) -> torch.Tensor:                         # (..., N) D(q_i || p_i)
     r"""Self-coupling divergence via the seam (full-K, not per-head: D(q_i||p_i) is the whole
-    belief). ``divergence_family`` selects the functional, ``family`` the covariance kernel."""
+    belief). ``divergence_family`` selects the functional; the params' subclass the kernel."""
     return get_functional(divergence_family)(
-        mu_q, sigma_q, mu_p, sigma_p, alpha=alpha, kl_max=kl_max, eps=eps, family=family,
+        q, p, alpha=alpha, kl_max=kl_max, eps=eps,
     )
 
 
 def self_divergence_per_coord(
-    mu_q:              torch.Tensor,       # (..., N, K)
-    sigma_q:           torch.Tensor,       # (..., N, K)
-    mu_p:              torch.Tensor,       # (..., N, K)
-    sigma_p:           torch.Tensor,       # (..., N, K)
+    q:                 BeliefParams,        # (..., N, K) belief
+    p:                 BeliefParams,        # (..., N, K) prior
 
     *,
     alpha:             float = 1.0,
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
-    family:            str   = "gaussian_diagonal",
     divergence_family: str   = "renyi",
 ) -> torch.Tensor:                         # (..., N, K) per-coordinate D^(k)(q_i||p_i)
     r"""Per-coordinate self-divergence D^(k)(q_i||p_i), unsummed over the coordinate axis.
 
-    Defined only for the diagonal family (full-covariance KL couples coordinates through the
-    trace and log-determinant and does not decompose) and the Renyi functional (KL = Renyi at
-    alpha=1, the only functional whose diagonal form is registered per-coordinate). Both are
-    enforced by raising, so a future non-decomposing functional cannot silently sum the wrong
-    thing. Consumed by the ``state_dependent_per_coord`` alpha form via ``self_divergence_for_alpha``.
+    Defined only for a diagonal-covariance family (full-covariance KL couples coordinates
+    through the trace and log-determinant and does not decompose) and the Renyi functional
+    (KL = Renyi at alpha=1, the only functional whose diagonal form is registered
+    per-coordinate). Both are enforced by raising, so a future non-decomposing functional
+    cannot silently sum the wrong thing. Consumed by the ``state_dependent_per_coord`` alpha
+    form via ``self_divergence_for_alpha``.
     """
-    if family_cov_kind(family) != "diagonal":
+    if q.cov_kind != "diagonal":
         raise ValueError(
             f"self_divergence_per_coord needs a diagonal-covariance family (full-covariance KL "
-            f"does not decompose coordinate-wise); got family={family!r}"
+            f"does not decompose coordinate-wise); got cov_kind={q.cov_kind!r}"
         )
     if divergence_family != "renyi":
         raise ValueError(
             f"self_divergence_per_coord is implemented for the 'renyi' functional only "
             f"(KL = renyi at alpha=1); got divergence_family={divergence_family!r}"
         )
-    return gaussian_diagonal_renyi_per_coord(
-        mu_q, sigma_q, mu_p, sigma_p, alpha=alpha, kl_max=kl_max, eps=eps,
-    )
+    return q.renyi_per_coord(p, alpha=alpha, kl_max=kl_max, eps=eps)
 
 
 def self_divergence_for_alpha(
-    mu_q:              torch.Tensor,       # (..., N, K)
-    sigma_q:           torch.Tensor,       # (..., N, K)
-    mu_p:              torch.Tensor,       # (..., N, K)
-    sigma_p:           torch.Tensor,       # (..., N, K)
+    q:                 BeliefParams,        # (..., N, K) belief
+    p:                 BeliefParams,        # (..., N, K) prior
 
     *,
     alpha:             float = 1.0,
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
-    family:            str   = "gaussian_diagonal",
     divergence_family: str   = "renyi",
     alpha_mode:        str   = "constant",
 ) -> torch.Tensor:                         # (..., N) summed, or (..., N, K) per-coordinate
@@ -166,12 +145,12 @@ def self_divergence_for_alpha(
     """
     if alpha_is_per_coord(alpha_mode):
         return self_divergence_per_coord(
-            mu_q, sigma_q, mu_p, sigma_p, alpha=alpha, kl_max=kl_max, eps=eps,
-            family=family, divergence_family=divergence_family,
+            q, p, alpha=alpha, kl_max=kl_max, eps=eps,
+            divergence_family=divergence_family,
         )
     return self_divergence(
-        mu_q, sigma_q, mu_p, sigma_p, alpha=alpha, kl_max=kl_max, eps=eps,
-        family=family, divergence_family=divergence_family,
+        q, p, alpha=alpha, kl_max=kl_max, eps=eps,
+        divergence_family=divergence_family,
     )
 
 

@@ -24,9 +24,10 @@ def _F_filtering(mu_q, sigma_q, mu_p, sigma_p, mu_t, sigma_t, tau):
     # (Re-deriving mu_t = mu_q.detach() inside would NOT freeze the keys under FD,
     # since .detach() blocks autograd, not numeric perturbation -- that would
     # measure the full/smoothing gradient instead.)
+    from vfe3.families.gaussian import DiagonalGaussian
     from vfe3.free_energy import free_energy, pairwise_energy, self_divergence
-    sd = self_divergence(mu_q, sigma_q, mu_p, sigma_p)
-    energy = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t)
+    sd = self_divergence(DiagonalGaussian(mu_q, sigma_q), DiagonalGaussian(mu_p, sigma_p))
+    energy = pairwise_energy(DiagonalGaussian(mu_q, sigma_q), DiagonalGaussian(mu_t, sigma_t))
     alpha = torch.ones(mu_q.shape[0])
     return free_energy(sd, energy, alpha, tau=tau, include_attention_entropy=True)
 
@@ -66,12 +67,13 @@ def _F_full(mu_q, sigma_q, mu_p, sigma_p, omega, tau):
     # from the SAME live (mu_q, sigma_q) on every FD perturbation, so the column
     # (key-side) role moves too -> a finite difference of this F measures the FULL
     # d F_red (the smoothing gradient), the Omega^T pullback included.
+    from vfe3.families.gaussian import DiagonalGaussian
     from vfe3.free_energy import free_energy, pairwise_energy, self_divergence
     from vfe3.geometry.transport import transport_covariance, transport_mean
     mu_t = transport_mean(omega.unsqueeze(0), mu_q.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), sigma_q.unsqueeze(0))[0]
-    sd = self_divergence(mu_q, sigma_q, mu_p, sigma_p)
-    energy = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t)
+    sd = self_divergence(DiagonalGaussian(mu_q, sigma_q), DiagonalGaussian(mu_p, sigma_p))
+    energy = pairwise_energy(DiagonalGaussian(mu_q, sigma_q), DiagonalGaussian(mu_t, sigma_t))
     alpha = torch.ones(mu_q.shape[0])
     return free_energy(sd, energy, alpha, tau=tau, include_attention_entropy=True)
 

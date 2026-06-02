@@ -206,6 +206,7 @@ class VFEModel(nn.Module):
         """
         from vfe3.inference.e_step import _transport
         from vfe3.geometry.transport import transport_mean, transport_covariance
+        from vfe3.families.base import get_family
         from vfe3.free_energy import pairwise_energy, self_divergence_for_alpha, attention_weights
         from vfe3.alpha_i import self_coupling_alpha
         from vfe3 import metrics
@@ -230,17 +231,18 @@ class VFEModel(nn.Module):
         omega = _transport(out.phi, self.group)                     # (N, N, K, K)
         mu_t = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
         sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
+        fam = get_family(cfg.family)
         energy = pairwise_energy(                                    # (N, N) or (H, N, N)
-            out.mu, out.sigma, mu_t, sigma_t,
+            fam(out.mu, out.sigma), fam(mu_t, sigma_t),
             alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
-            family=cfg.family, divergence_family=cfg.divergence_family,
+            divergence_family=cfg.divergence_family,
             irrep_dims=self.group.irrep_dims,
         )
         beta = attention_weights(energy, tau=cfg.tau, log_prior=log_prior)
         self_div = self_divergence_for_alpha(                        # (N,) or (N, K) per-coord
-            out.mu, out.sigma, mu_p, sigma_p,
+            fam(out.mu, out.sigma), fam(mu_p, sigma_p),
             alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
-            family=cfg.family, divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
+            divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
         )
         alpha, _ = self_coupling_alpha(
             self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,

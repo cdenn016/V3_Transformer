@@ -114,6 +114,7 @@ def test_pairwise_energy_diagonal_and_full_match_hand_loop():
     # inserted from the family's covariance structure, so it stays correct even when
     # sigma_q carries a leading batch dim that mu_q does not.
     from vfe3.divergence import renyi
+    from vfe3.families.gaussian import DiagonalGaussian, FullGaussian
     from vfe3.free_energy import pairwise_energy
 
     torch.manual_seed(7)
@@ -124,16 +125,16 @@ def test_pairwise_energy_diagonal_and_full_match_hand_loop():
     # diagonal family
     sigma_q = torch.rand(N, K) + 0.5
     sigma_t = torch.rand(N, N, K) + 0.5
-    E = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal")
+    E = pairwise_energy(DiagonalGaussian(mu_q, sigma_q), DiagonalGaussian(mu_t, sigma_t))
     E_ref = torch.stack([torch.stack([
-        renyi(mu_q[i], sigma_q[i], mu_t[i, j], sigma_t[i, j], family="gaussian_diagonal")
+        renyi(DiagonalGaussian(mu_q[i], sigma_q[i]), DiagonalGaussian(mu_t[i, j], sigma_t[i, j]))
         for j in range(N)]) for i in range(N)])
     assert torch.allclose(E, E_ref, atol=1e-5)
 
     # diagonal sigma_q carrying a leading batch dim mu_q lacks (the misclassified case):
     sigma_q_b = sigma_q.unsqueeze(0)                         # (1, N, K), rank mu_q.dim()+1
     sigma_t_b = sigma_t.unsqueeze(0)                         # (1, N, N, K)
-    E_b = pairwise_energy(mu_q, sigma_q_b, mu_t, sigma_t_b, family="gaussian_diagonal")
+    E_b = pairwise_energy(DiagonalGaussian(mu_q, sigma_q_b), DiagonalGaussian(mu_t, sigma_t_b))
     assert torch.allclose(E_b[0], E_ref, atol=1e-5)
 
     # full-covariance family
@@ -141,9 +142,9 @@ def test_pairwise_energy_diagonal_and_full_match_hand_loop():
     sig_q_full = A @ A.transpose(-1, -2) + K * torch.eye(K)
     Bf = torch.randn(N, N, K, K)
     sig_t_full = Bf @ Bf.transpose(-1, -2) + K * torch.eye(K)
-    Ef = pairwise_energy(mu_q, sig_q_full, mu_t, sig_t_full, family="gaussian_full")
+    Ef = pairwise_energy(FullGaussian(mu_q, sig_q_full), FullGaussian(mu_t, sig_t_full))
     Ef_ref = torch.stack([torch.stack([
-        renyi(mu_q[i], sig_q_full[i], mu_t[i, j], sig_t_full[i, j], family="gaussian_full")
+        renyi(FullGaussian(mu_q[i], sig_q_full[i]), FullGaussian(mu_t[i, j], sig_t_full[i, j]))
         for j in range(N)]) for i in range(N)])
     assert torch.allclose(Ef, Ef_ref, atol=1e-4)
 
@@ -153,28 +154,30 @@ def test_pairwise_energy_per_head_splits_by_irrep_block():
     # (...,H,N,N); head h is the divergence over block h's coordinates, and (diagonal KL being
     # additive over independent blocks) the heads sum to the full-K energy.
     from vfe3.divergence import renyi
+    from vfe3.families.gaussian import DiagonalGaussian
     from vfe3.free_energy import pairwise_energy
 
     torch.manual_seed(3)
     N, K = 3, 4
     mu_q = torch.randn(N, K); mu_t = torch.randn(N, N, K)
     sigma_q = torch.rand(N, K) + 0.5; sigma_t = torch.rand(N, N, K) + 0.5
+    q = DiagonalGaussian(mu_q, sigma_q); key = DiagonalGaussian(mu_t, sigma_t)
 
-    E = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal", irrep_dims=[2, 2])
+    E = pairwise_energy(q, key, irrep_dims=[2, 2])
     assert E.shape == (2, N, N)
     assert not torch.allclose(E[0], E[1], atol=1e-3)    # heads are genuinely distinct, not a broadcast
     for h, (s, e) in enumerate([(0, 2), (2, 4)]):
         Eh_ref = torch.stack([torch.stack([
-            renyi(mu_q[i, s:e], sigma_q[i, s:e], mu_t[i, j, s:e], sigma_t[i, j, s:e],
-                  family="gaussian_diagonal")
+            renyi(DiagonalGaussian(mu_q[i, s:e], sigma_q[i, s:e]),
+                  DiagonalGaussian(mu_t[i, j, s:e], sigma_t[i, j, s:e]))
             for j in range(N)]) for i in range(N)])
         assert torch.allclose(E[h], Eh_ref, atol=1e-5)
 
-    E_full = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal", irrep_dims=None)
+    E_full = pairwise_energy(q, key, irrep_dims=None)
     assert E_full.shape == (N, N)                       # None -> single full-K energy (backward compat)
     assert torch.allclose(E.sum(0), E_full, atol=1e-5)  # diagonal KL is additive over blocks
     # single-block irrep_dims reduces to the full-K energy (bit-identical to None)
-    E_one = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal", irrep_dims=[4])
+    E_one = pairwise_energy(q, key, irrep_dims=[4])
     assert torch.allclose(E_one, E_full, atol=1e-6)
 
 
@@ -184,10 +187,12 @@ def test_autograd_F_matches_finite_difference():
     mu_q = torch.randn(N, K, requires_grad=True)
     base = {"sigma_q": torch.rand(N, K) + 0.5, "mu_p": torch.randn(N, K),
             "sigma_p": torch.rand(N, K) + 0.5}
+    from vfe3.families.gaussian import DiagonalGaussian
     from vfe3.free_energy import self_divergence
 
     def scalar(mu):
-        sd = self_divergence(mu, base["sigma_q"], base["mu_p"], base["sigma_p"])
+        sd = self_divergence(DiagonalGaussian(mu, base["sigma_q"]),
+                             DiagonalGaussian(base["mu_p"], base["sigma_p"]))
         energy = torch.cdist(mu, mu) ** 2 + 0.1           # a smooth differentiable (N,N) energy
         alpha = torch.ones(N)
         return free_energy(sd, energy, alpha, log_prior=None, tau=1.5,
@@ -256,6 +261,7 @@ def test_alpha_envelope_grad_q_F_equals_alpha_star_times_grad_q_D():
     # State-dependent alpha*: at alpha*, dF/dalpha = 0, so d/dq [alpha*(D)*D + R(alpha*(D))]
     # == alpha* * dD/dq (the explicit alpha-path vanishes). De-risks Phase 4.
     from vfe3.alpha_i import self_coupling_alpha
+    from vfe3.families.gaussian import DiagonalGaussian
     from vfe3.free_energy import self_divergence
 
     b0, c0 = 0.5, 2.0
@@ -264,13 +270,13 @@ def test_alpha_envelope_grad_q_F_equals_alpha_star_times_grad_q_D():
     mu_p = torch.randn(2, 3); sigma_p = torch.rand(2, 3) + 0.5
 
     def adaptive_self(mu):
-        D = self_divergence(mu, sigma_q, mu_p, sigma_p)       # (2,)
+        D = self_divergence(DiagonalGaussian(mu, sigma_q), DiagonalGaussian(mu_p, sigma_p))   # (2,)
         a, r = self_coupling_alpha(D, mode="state_dependent", b0=b0, c0=c0)
         return (a * D + r).sum()
 
     g_full = torch.autograd.grad(adaptive_self(mu_q), mu_q)[0]
     # envelope RHS: alpha*(D) detached, times dD/dq
-    D = self_divergence(mu_q, sigma_q, mu_p, sigma_p)
+    D = self_divergence(DiagonalGaussian(mu_q, sigma_q), DiagonalGaussian(mu_p, sigma_p))
     a_star = (c0 / (b0 + D)).detach()
     g_env = torch.autograd.grad((a_star * D).sum(), mu_q)[0]
     assert torch.allclose(g_full, g_env, atol=1e-5)
@@ -282,15 +288,17 @@ def test_self_divergence_for_alpha_routes_by_declared_reduction():
     # form's declared per_coord flag. Below kl_max the per-coordinate divergence sums back
     # to the per-position one, and the per-coordinate alpha genuinely varies across k.
     from vfe3.alpha_i import self_coupling_alpha
+    from vfe3.families.gaussian import DiagonalGaussian
     from vfe3.free_energy import self_divergence_for_alpha
 
     N, K = 3, 4
     torch.manual_seed(0)
     mu = torch.randn(N, K); sigma = torch.rand(N, K) + 0.5
     mu_p = torch.randn(N, K); sigma_p = torch.rand(N, K) + 0.5
+    q, p = DiagonalGaussian(mu, sigma), DiagonalGaussian(mu_p, sigma_p)
 
-    summed = self_divergence_for_alpha(mu, sigma, mu_p, sigma_p, alpha_mode="state_dependent")
-    per = self_divergence_for_alpha(mu, sigma, mu_p, sigma_p, alpha_mode="state_dependent_per_coord")
+    summed = self_divergence_for_alpha(q, p, alpha_mode="state_dependent")
+    per = self_divergence_for_alpha(q, p, alpha_mode="state_dependent_per_coord")
     assert summed.shape == (N,)
     assert per.shape == (N, K)
     assert torch.allclose(per.sum(dim=-1), summed, atol=1e-5)    # unsaturated -> sum recovers it
@@ -305,6 +313,7 @@ def test_self_divergence_per_coord_requires_diagonal_renyi():
     # not decompose coordinate-wise) and the Renyi functional (the only registered one).
     # Both restrictions raise rather than silently summing the wrong thing.
     import pytest
+    from vfe3.families.gaussian import DiagonalGaussian, FullGaussian
     from vfe3.free_energy import self_divergence_per_coord
 
     N, K = 2, 3
@@ -312,19 +321,21 @@ def test_self_divergence_per_coord_requires_diagonal_renyi():
     mu_p = torch.randn(N, K); sigma_p = torch.rand(N, K) + 0.5
     cov = torch.eye(K).expand(N, K, K).contiguous()
     with pytest.raises((ValueError, NotImplementedError, KeyError)):
-        self_divergence_per_coord(mu, cov, mu_p, cov.clone(), family="gaussian_full")
+        self_divergence_per_coord(FullGaussian(mu, cov), FullGaussian(mu_p, cov.clone()))
     with pytest.raises((ValueError, NotImplementedError, KeyError)):
-        self_divergence_per_coord(mu, sigma, mu_p, sigma_p, divergence_family="not_a_functional")
+        self_divergence_per_coord(DiagonalGaussian(mu, sigma), DiagonalGaussian(mu_p, sigma_p),
+                                  divergence_family="not_a_functional")
 
 
 def test_pairwise_energy_dispatches_on_declared_cov_kind_not_name():
     """A diagonal-structured family whose NAME lacks the 'diagonal' substring must still take the
     diagonal energy path. The retired `"diagonal" in family` name-sniff would route it to the
-    full-covariance branch (wrong broadcast axis); the registered cov_kind drives the dispatch."""
+    full-covariance branch (wrong broadcast axis); the registered cov_kind (carried by the
+    BeliefParams subclass via broadcast_over_keys) drives the dispatch."""
     import torch
 
     from vfe3.free_energy import pairwise_energy
-    from vfe3.families.base import register_family, _FAMILIES
+    from vfe3.families.base import get_family, register_family, _FAMILIES
     from vfe3.families.gaussian import DiagonalGaussian
 
     name = "elliptical_scale_test"                 # no "diagonal" substring, declared diagonal
@@ -340,8 +351,9 @@ def test_pairwise_energy_dispatches_on_declared_cov_kind_not_name():
         mu_t = torch.randn(N, N, K)
         sigma_q = torch.rand(N, K) + 0.5
         sigma_t = torch.rand(N, N, K) + 0.5
-        E_new = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family=name)
-        E_ref = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, family="gaussian_diagonal")
+        new = get_family(name)
+        E_new = pairwise_energy(new(mu_q, sigma_q), new(mu_t, sigma_t))
+        E_ref = pairwise_energy(DiagonalGaussian(mu_q, sigma_q), DiagonalGaussian(mu_t, sigma_t))
         assert torch.allclose(E_new, E_ref, atol=1e-6)
     finally:
         _FAMILIES.pop(name, None)

@@ -204,3 +204,55 @@ bit-identical; the full suite is the equivalence gate. Full suite after Phase 2:
 delegation test). No production module references a removed symbol (grep across `vfe3/` for
 `register_divergence`/`_DIVERGENCES`/`get_divergence`/`_COV_KIND` returns none; the only `_gaussian_*_renyi`
 hits are docstring/comment references, not imports).
+
+## Families seam — Phase 3 (M2): parameter-object divergence interface
+
+The divergence interface was flipped from the four-tensor signature
+`(mu_q, sigma_q, mu_t, sigma_t, *, family=..., ...)` to two `BeliefParams` objects
+`(q, p, *, ...)`, and every consumer converted in one atomic change (the suite is RED
+between the flip and the last consumer, so it was done all at once and gated on the full
+suite). The covariance-family selection that used to be a `family=` string is now expressed
+by WHICH `BeliefParams` subclass the caller constructs (`get_family(family)(mu, sigma)`);
+`divergence_family` (the functional, `"renyi"`) is still a kwarg.
+
+- `vfe3/free_energy.py`: `pairwise_energy(q, key, *, ...)` now takes the query belief and the
+  transported key belief, broadcasts the query via `q.broadcast_over_keys()`, and slices irrep
+  blocks via `q.block(start, end)` / `key.block(...)`; the `family`/`is_diagonal` plumbing and
+  the manual `unsqueeze(-2)`/`unsqueeze(-3)` key-axis logic are gone (the params own their
+  layout). `self_divergence`/`self_divergence_per_coord`/`self_divergence_for_alpha` take
+  `(q, p)`; the per-coord guard now checks `q.cov_kind == "diagonal"` (message updated to
+  "diagonal-covariance family") and dispatches `q.renyi_per_coord(p, ...)`. The unused imports
+  `family_cov_kind` and `gaussian_diagonal_renyi_per_coord` were dropped. `free_energy()` (the
+  scalar assembler over already-reduced tensors) is unchanged.
+- `vfe3/divergence.py`: reduced to a re-export module. `renyi`/`kl` now re-export the
+  parameter-typed `vfe3.families.base.renyi`/`kl`; the tensor-signature `renyi`/`kl`/
+  `gaussian_diagonal_renyi_per_coord` facades and the Phase-2 `register_functional("renyi")`
+  scaffold are DELETED, so `get_functional("renyi")` returns base's param `renyi`. The
+  families-registry helpers (`safe_kl_clamp`, `family_cov_kind`, `divergence_families`,
+  `register_functional`, `get_functional`, `get_family`, `register_family`) are still re-exported
+  (plus a new `__all__`).
+- Consumers wrap moment tensors into params at each call site via `fam = get_family(family)`:
+  `vfe3/inference/e_step.py` (`free_energy_value`, `phi_alignment_loss`),
+  `vfe3/gradients/oracle.py`, `vfe3/gradients/kernels.py` (the two `self_divergence_for_alpha`/
+  `pairwise_energy` calls in `belief_gradients`; the analytic kernel math stays tensor-based and
+  the `family == "gaussian_diagonal"` kernel-availability guard is untouched),
+  `vfe3/model/model.py` (`diagnostics`), and `vfe3/model/prior_bank.py` (`reference_decode` with
+  `gaussian_diagonal`, `_decode_full` with `gaussian_full`; the fused `_decode_diagonal` matmul is
+  unchanged, not a `kl` call).
+- Tests converted to the param API by wrapping moment tensors in `DiagonalGaussian`/`FullGaussian`
+  (or `get_family(name)(...)`): `test_divergence.py`, `test_families.py` (the two `legacy_renyi`
+  bridge tests now compare `fam_renyi` against the family's own `renyi_closed_form` and assert
+  `divergence.renyi is families.base.renyi`), `test_free_energy.py`, `test_gradients_oracle.py`,
+  `test_gauge_groups.py`, `test_transport.py`, `test_prior_bank.py`. `test_gradients_kernels.py`,
+  `test_e_step.py`, `test_model.py`, `test_use_prior_bank.py` needed no edits (they call only
+  `belief_gradients*`/the model, not the divergence functions directly).
+
+### Byte-identity gate
+
+Pure signature/plumbing change with identical numerics. Full suite (excluding `test_viz.py`, which
+cannot be collected on this CPU box due to a pre-existing matplotlib/umap `MemoryError` at import,
+unrelated to this change): `tests=261 failures=0 errors=0 skipped=0` (read from junitxml), unchanged
+from the pre-change baseline of 261. A repo grep confirms no surviving four-tensor call or stray
+`family=` passed to `renyi`/`kl`/`pairwise_energy`/`self_divergence*` in any `.py` under `vfe3/` or
+`tests/` (the only matches are in `docs/` plan/spec files and the `gaussian.py` docstring source
+reference).

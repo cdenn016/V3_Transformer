@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from vfe3.alpha_i import self_coupling_alpha
+from vfe3.families.base import get_family
 from vfe3.free_energy import free_energy, pairwise_energy, self_divergence_for_alpha
 from vfe3.geometry.transport import transport_covariance, transport_mean
 
@@ -65,11 +66,12 @@ def belief_gradients_autograd(
     mu_t = transport_mean(omega, mu_k)                  # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma_k)
 
-    sd = self_divergence_for_alpha(mu_q, sigma_q, mu_p, sigma_p, alpha=alpha_div, kl_max=kl_max, eps=eps,
-                                   family=family, divergence_family=divergence_family, alpha_mode=alpha_mode)
+    fam = get_family(family)
+    sd = self_divergence_for_alpha(fam(mu_q, sigma_q), fam(mu_p, sigma_p), alpha=alpha_div, kl_max=kl_max, eps=eps,
+                                   divergence_family=divergence_family, alpha_mode=alpha_mode)
     alpha, reg = self_coupling_alpha(sd, mode=alpha_mode, value=value, b0=b0, c0=c0)
-    energy = pairwise_energy(mu_q, sigma_q, mu_t, sigma_t, alpha=alpha_div, kl_max=kl_max, eps=eps,
-                             family=family, divergence_family=divergence_family, irrep_dims=irrep_dims)
+    energy = pairwise_energy(fam(mu_q, sigma_q), fam(mu_t, sigma_t), alpha=alpha_div, kl_max=kl_max, eps=eps,
+                             divergence_family=divergence_family, irrep_dims=irrep_dims)
     F = free_energy(
         sd, energy, alpha, tau=tau, include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if alpha_mode != "constant" else None),
