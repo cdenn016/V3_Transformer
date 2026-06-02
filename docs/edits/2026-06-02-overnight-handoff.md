@@ -366,3 +366,19 @@ Files touched: `vfe3/model/model.py` (attention_maps + the `vfe_block` import), 
 (plot_attention_grid + registry), `vfe3/run_artifacts.py` (save_attention_maps), `vfe3/train.py`
 (sample-text args + block, attention-save wire-in), `vfe3/data/datasets.py` (get_tiktoken_decoder). Tests
 added across `test_model.py`, `test_viz.py`, `test_run_artifacts.py`, `test_train.py`, `test_data.py`.
+
+## Task 1.1 — BCH-PE pos_phi registry (2026-06-02, branch vfe3-positional-encodings-2026-06-02)
+
+Created the standalone `pos_phi` module and its unit tests as the first task of the BCH positional-encoding feature. The module is default-off and adds no wiring to the model yet; later tasks compose it into the gauge frame.
+
+**`vfe3/model/positional_phi.py`** — a registry of per-position Lie-algebra coordinate builders:
+- `register_pos_phi` / `get_pos_phi` — decorator registry (mirrors the existing retraction/transport seam idiom).
+- `"none"` builder — returns `None`; the pure default-off path.
+- `"frozen"` builder — parameter-free Lie-algebra ALiBi: `pos_phi_i = (i * scale)` on one generator axis.
+- `"learned"` builder — slices the first `n` rows of a model-owned `(max_seq_len, n_gen)` parameter table.
+- `positional_phi_coords` — dispatch shim.
+- `apply_positional_phi` — composes the (N, n_gen) coords into `phi` via `compose_phi` (BCH by default); `"none"` returns `phi` byte-identical; optional `project_slk` removes the per-block trace to preserve `det(Omega_h)=1`.
+
+**`tests/test_positional_phi.py`** — 4 tests: `none` returns `None`; `frozen` shape + values; `learned` slices the table; `apply` with `mode="none"` is identity.
+
+TDD: test written and confirmed failing (ModuleNotFoundError) before the module was created. Final run: **4 passed** (read from the `N passed` line). Commit: `4df355b`.
