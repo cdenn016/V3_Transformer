@@ -250,6 +250,43 @@ def test_diagnostics_includes_gauge_geometry_probes():
     assert math.isfinite(d["holonomy_deviation"]) and math.isfinite(d["gauge_trace_spread"])
 
 
+def test_attention_maps_shape_and_row_stochastic():
+    # Per-layer, per-head attention: (L, H, N, N) with H = len(irrep_dims) (block_glk K=4 -> 2 heads),
+    # and every query row of every head is row-stochastic (softmax over keys -> sums to 1).
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=3,
+                     n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0, prior_handoff_rho=0.5)
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, 12, (2, 6))
+    maps = model.attention_maps(tokens)
+    assert maps.shape == (3, len(model.group.irrep_dims), 6, 6)     # (L, H, N, N), H=2
+    assert torch.allclose(maps.sum(dim=-1), torch.ones_like(maps.sum(dim=-1)), atol=1e-5)
+
+
+def test_attention_maps_last_layer_matches_diagnostics():
+    # The canonical resolution of "what is per-layer attention": the last layer's map is the SAME
+    # attention diagnostics() reads at the converged belief. At n_layers=1 (stack is one block, the
+    # handoff loop is empty) this is exact -- the mean row entropy of maps[-1] equals diagnostics'
+    # attn_entropy byte for byte, which guards the block-by-block replay against trajectory drift.
+    from vfe3 import metrics
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.05)
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, 12, (2, 5))
+    maps = model.attention_maps(tokens)
+    ent = float(metrics.attention_entropy(maps[-1]))
+    assert abs(ent - model.diagnostics(tokens)["attn_entropy"]) < 1e-6
+
+
+def test_attention_maps_single_block_group_has_unit_head_axis():
+    # A single-irrep-block group (so_k) yields H=1: the energy is full-K (N,N) and the method
+    # inserts a unit head axis, so the result is still (L, 1, N, N) (uniform with the multi-head case).
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1,
+                     gauge_group="so_k", n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0)
+    model = VFEModel(cfg)
+    maps = model.attention_maps(torch.randint(0, 12, (2, 5)))
+    assert maps.shape == (1, 1, 5, 5)
+
+
 def test_model_runs_under_sp_gauge_group():
     # The symplectic Sp(2m,R) gauge (single-block, non-skew) must run end-to-end through the
     # same model/E-step machinery: a forward + loss.backward() with targets yields a finite loss

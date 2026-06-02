@@ -8,6 +8,7 @@ from vfe3.data.datasets import (
     TokenWindows,
     cache_path,
     default_cache_dir,
+    get_tiktoken_decoder,
     load_cached_tokens,
 )
 
@@ -20,6 +21,20 @@ def test_token_windows_shift_and_length():
     assert x.shape == (5,) and y.shape == (5,)
     assert torch.equal(x, torch.arange(0, 5))
     assert torch.equal(y, torch.arange(1, 6))                 # target is input shifted by 1
+
+
+def test_get_tiktoken_decoder_synthetic_is_none():
+    # The synthetic anchor has no real tokenizer, so no decoder (the caller emits no sample text).
+    assert get_tiktoken_decoder("synthetic-period3") is None
+
+
+def test_get_tiktoken_decoder_roundtrips_when_tiktoken_present():
+    # When tiktoken is installed, the gpt2 decoder round-trips a known id sequence to text;
+    # skip cleanly on a box without tiktoken (the decoder is None there, never a crash).
+    tiktoken = pytest.importorskip("tiktoken")
+    dec = get_tiktoken_decoder("wikitext-103")
+    assert dec is not None
+    assert dec([15496, 995]) == "Hello world"                  # gpt2 ids for 'Hello world'
 
 
 def test_token_windows_rejects_short_stream():

@@ -11,7 +11,7 @@ so a gradient step on the priors improves inference end to end. Click-to-run: ed
 import logging
 import math
 import time
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -116,6 +116,29 @@ def lr_lambda(
         return step / max(1, cfg.warmup_steps)
     progress = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
     return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+
+def _default_sample_decoder(
+    cfg: VFE3Config,
+) -> 'Optional[Callable[[Sequence[int]], str]]':
+    r"""A best-guess tiktoken ``decode(ids) -> str`` from ``cfg.vocab_size``, or None.
+
+    Activates ONLY for a recognized real-corpus tokenizer vocab -- gpt2 (~50257) or cl100k
+    (~100277) -- so a click-to-run on wikitext-*/wiki-* prints sample text with no wiring, while
+    a tiny synthetic/test vocab (e.g. 6) gets no decoder and stays silent (the pure path is
+    preserved without an extra toggle). The ranges tolerate vocab padding. Lazy-imports tiktoken;
+    returns None if it is absent. An explicit ``sample_decode`` argument always takes precedence."""
+    try:
+        import tiktoken
+    except ImportError:
+        return None
+    if 40_000 <= cfg.vocab_size <= 60_000:
+        enc = tiktoken.get_encoding("gpt2")
+    elif 90_000 <= cfg.vocab_size <= 110_000:
+        enc = tiktoken.get_encoding("cl100k_base")
+    else:
+        return None
+    return lambda ids: enc.decode([int(t) for t in ids])
 
 
 def train_step(
@@ -238,6 +261,11 @@ def train(
     device:        Optional[torch.device]   = None,
     logger:        Optional[logging.Logger] = None,
     artifacts:     Optional["RunArtifacts"] = None,
+
+    generate_samples:  bool                                     = True,   # False -> pure silent path (no sample text)
+    sample_decode:     Optional[Callable[[Sequence[int]], str]] = None,   # token-ids -> text; None -> auto by vocab
+    sample_new_tokens: int                                      = 40,     # greedy continuation length
+    sample_prompt_len: int                                      = 16,     # seq-0 prompt length to continue
 ) -> List[float]:
     r"""Train ``n_steps`` M-step iterations (cycling the loader); return the loss history.
 
@@ -281,7 +309,7 @@ def train(
             d = model.diagnostics(tokens)
             rate = (step + 1 - win_i0) / max(time.perf_counter() - win_t0, 1e-9)
             logger.info(
-                "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | it/s: %.2f | PPL: %.1f",
+                "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | it/s: %.2f | \n\n PPL: %.1f \n",
                 step + 1, n_steps, losses[-1], ce, d["attn_entropy"], rate, math.exp(min(ce, 20.0)),
             )
             logger.info(
@@ -294,11 +322,29 @@ def train(
 
         if eval_interval and val_loader is not None and (step + 1) % eval_interval == 0:
             m = evaluate(model, val_loader, max_batches=cfg.eval_max_batches, device=device)
-            logger.info("  Validation @ step %d:", step + 1)
+            logger.info(" \n Validation @ step %d:", step + 1)
             logger.info(                                         # val has no separate loss; CE is the loss
-                "    CE: %.4f | PPL: %.1f | BPC: %.4f",
+                "\n       CE: %.4f \n       PPL: %.1f \n       BPC: %.4f \n\n",
                 m["ce"], m["ppl"], m["bpc"],
             )
+            # Sample text directly below the BPC value. ``generate_samples=False`` forces the pure
+            # silent path (no generation, no Sample line). Otherwise the decoder is an explicit
+            # ``sample_decode`` if given, else an AUTO-DEFAULT picked from cfg.vocab_size (gpt2 /
+            # cl100k) -- so a real click-to-run prints samples with no wiring, while tiny
+            # synthetic/test vocabs get no decoder. When a decoder exists, greedily continue seq 0 of
+            # the live batch by sample_new_tokens and decode prompt + continuation. Best-effort: a
+            # generation/decode error is logged, never fatal (model.generate is @torch.no_grad).
+            decode = None if not generate_samples else (
+                sample_decode if sample_decode is not None else _default_sample_decoder(cfg))
+            if decode is not None:
+                try:
+                    prompt = tokens[:1, :sample_prompt_len]                       # (1, P) seq-0 prompt
+                    gen = model.generate(prompt, sample_new_tokens, greedy=True)[0]
+                    p_txt = decode(prompt[0].tolist())
+                    c_txt = decode(gen[prompt.shape[1]:].tolist())
+                    logger.info("       Sample: %r  ->  %r\n", p_txt, c_txt)
+                except Exception as exc:                                          # never let sampling kill training
+                    logger.warning("       (sample generation failed: %s)", exc)
             # Persistence is opt-in: with no artifacts object this whole block is skipped, so the
             # silent/in-memory path is unchanged. A CSV row (train loss + lr + val + the converged
             # diagnostics off the graph) is logged each periodic eval, and best_model.pt is saved
@@ -322,6 +368,10 @@ def train(
                     "gauge_trace_spread": d["gauge_trace_spread"],
                 })
                 artifacts.maybe_save_best(step + 1, model, m["ppl"])
+                # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0 of
+                # the live batch -- the same sequence the diagnostics above read). Best-effort inside
+                # save_attention_maps: a viz error is logged, never fatal to the run.
+                artifacts.save_attention_maps(step + 1, model.attention_maps(tokens), logger=logger)
 
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
         if (artifacts is not None and cfg.checkpoint_interval
