@@ -51,6 +51,17 @@ class BeliefParams(ABC):
     Concrete subclasses hold the family's tensors (with arbitrary leading batch dims and a
     trailing coordinate structure) and implement the interface below. ``cov_kind`` is the
     single source of truth for the covariance structure (replacing name sniffing).
+
+    Override tiers (what a new family must provide):
+      - ALWAYS required (abstract): ``coordinate_dim``, ``block``, ``broadcast_over_keys``,
+        ``natural``, ``log_partition_at``, ``entropy``, and the ``cov_kind`` class attribute.
+      - Required ONLY to use the generic divergence path: ``expected_statistic`` (= gradA, the
+        mean of the sufficient statistics), consumed by the generic KL (alpha = 1). A family
+        that supplies its own ``renyi_closed_form`` never hits the generic path and need not
+        override it; the base raises a clear error if the generic path needs it and it is absent.
+      - Optional hooks: ``renyi_closed_form(other, *, alpha, kl_max, eps)`` (a pinned closed form
+        that bypasses the generic A-path) and ``renyi_per_coord(other, ...)`` (the unsummed
+        per-coordinate divergence, defined only for families whose divergence decomposes).
     """
 
     cov_kind: ClassVar[str]
@@ -80,6 +91,17 @@ class BeliefParams(ABC):
     @abstractmethod
     def entropy(self) -> torch.Tensor:
         r"""Differential entropy H of this distribution."""
+
+    def expected_statistic(self) -> Tuple[torch.Tensor, ...]:
+        r"""E_q[T] = gradA(theta), the mean of the sufficient statistics, aligned with
+        ``natural()``. Consumed by the generic KL (alpha = 1) Bregman form. Not abstract:
+        a family that supplies ``renyi_closed_form`` never reaches the generic path and need
+        not override this. Overriding is required only to use the generic KL path."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no renyi_closed_form and does not override "
+            f"expected_statistic, which the generic KL (alpha=1) path requires (it is gradA, "
+            f"the mean of the sufficient statistics). Provide either method."
+        )
 
 
 _FAMILIES: Dict[str, Type[BeliefParams]] = {}
@@ -141,6 +163,9 @@ def _renyi_from_log_partition(
 
     alpha != 1:  R = 1/(alpha-1) [ A(alpha*tq + (1-alpha)*tp) - alpha*A(tq) - (1-alpha)*A(tp) ].
     alpha == 1:  KL = A(tp) - A(tq) - <gradA(tq), tp - tq>, gradA(tq) = E_q[T] (expected_statistic).
+
+    ``eps`` is accepted for signature symmetry with the closed-form path and is intentionally
+    unused here: the A-form is evaluated directly from the natural parameters with no clamp.
     """
     cls = type(q)
     tq = q.natural()

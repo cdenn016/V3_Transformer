@@ -136,8 +136,40 @@ def test_full_gaussian_closed_form_matches_legacy_and_block():
 
 
 def test_full_gaussian_per_coord_raises():
-    import pytest
     from vfe3.families.gaussian import FullGaussian
     q = FullGaussian(torch.zeros(2, 2), torch.eye(2).expand(2, 2, 2))
     with pytest.raises((AttributeError, NotImplementedError)):
         q.renyi_per_coord(q, alpha=1.0)
+
+
+def test_families_package_reexports_api_and_registers_builtins():
+    """`import vfe3.families` exposes the public API and (via __init__ importing the
+    concrete-family module) registers the built-in families, so a config-driven get_family
+    works at the package level without importing vfe3.families.gaussian by hand."""
+    import vfe3.families as families
+    for name in ("BeliefParams", "renyi", "kl", "get_family", "register_family",
+                 "family_cov_kind", "divergence_families"):
+        assert hasattr(families, name), name
+    assert families.get_family("gaussian_diagonal").cov_kind == "diagonal"
+    assert families.get_family("gaussian_full").cov_kind == "full"
+    assert set(families.divergence_families()) >= {"gaussian_diagonal", "gaussian_full"}
+
+
+def test_generic_kl_without_expected_statistic_raises_clearly():
+    """A family with no renyi_closed_form and no expected_statistic must fail the generic
+    KL path with a clear NotImplementedError, not a cryptic AttributeError."""
+    from vfe3.families.base import BeliefParams, kl
+
+    class _NoStat(BeliefParams):
+        cov_kind = "diagonal"
+        def __init__(self, t): self.t = t
+        def coordinate_dim(self): return 1
+        def block(self, start, end): return _NoStat(self.t)
+        def broadcast_over_keys(self): return _NoStat(self.t.unsqueeze(-2))
+        def natural(self): return (self.t,)
+        @classmethod
+        def log_partition_at(cls, theta): return theta[0].sum(dim=-1)
+        def entropy(self): return self.t.sum(dim=-1) * 0.0
+
+    with pytest.raises(NotImplementedError):
+        kl(_NoStat(torch.ones(3, 1)), _NoStat(torch.ones(3, 1) * 2.0))

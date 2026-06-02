@@ -146,6 +146,8 @@ class FullGaussian(BeliefParams):
         return FullGaussian(self.mu.unsqueeze(-2), self.sigma.unsqueeze(-3))
 
     def natural(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Ridge the covariance before inverting to the precision (the natural parameter); the
+        # 1e-6 jitter matches the eps the closed-form full kernel uses for SPD safety.
         eye = torch.eye(self.mu.shape[-1], device=self.mu.device, dtype=self.mu.dtype)
         prec = torch.linalg.solve(self.sigma + 1e-6 * eye, eye.expand_as(self.sigma))
         t1 = (prec @ self.mu.unsqueeze(-1)).squeeze(-1)
