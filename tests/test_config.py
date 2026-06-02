@@ -71,6 +71,18 @@ def test_config_rejects_unknown_gauge_group_and_decode_mode():
         VFE3Config(decode_mode="not_a_mode")
 
 
+def test_config_sp_gauge_group_requires_even_embed_dim():
+    # Sp(2m,R) lives in even dimension K=2m. Even embed_dim is accepted; odd raises a clear
+    # ValueError. Existing groups are unaffected by the even-dim guard.
+    cfg = VFE3Config(embed_dim=4, n_heads=2, gauge_group="sp")
+    assert cfg.gauge_group == "sp"
+    # an odd embed_dim is rejected (n_heads=1 so the divisibility guard cannot mask it):
+    with pytest.raises(ValueError):
+        VFE3Config(embed_dim=5, n_heads=1, gauge_group="sp")
+    # a non-sp group with an odd embed_dim is fine (guard is sp-specific):
+    assert VFE3Config(embed_dim=5, n_heads=1, gauge_group="glk").embed_dim == 5
+
+
 def test_config_accepts_diagonal_chunked_decode_and_validates_chunk_size():
     """diagonal_chunked is the fused chunked-vocab decode+CE mode; decode_chunk_size must be > 0."""
     assert VFE3Config().decode_chunk_size == 8192            # default

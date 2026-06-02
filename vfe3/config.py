@@ -9,7 +9,7 @@ variant swaps without editing call sites.
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-_VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k")
+_VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k", "sp")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
 _VALID_DECODE_MODES        = ("diagonal", "diagonal_chunked", "full")
@@ -167,6 +167,12 @@ class VFE3Config:
     m_phi_lr:                  float = 0.015
     weight_decay:              float = 0.05
     batch_size:                int   = 64
+    # Accumulate gradients over N microbatches before an optimizer step, for a larger
+    # effective batch without the memory of one big forward. Each pulled batch is split
+    # into N equal chunks along the batch axis, each backed (loss / N) into .grad, then a
+    # single clip + optimizer.step() + scheduler.step() fires at the boundary. Default 1 =
+    # current single-step behavior (byte-identical: no chunking, no divide).
+    grad_accum_steps:          int   = 1
     max_steps:                 int   = 15000
     warmup_steps:              int   = 100
     seed:                      int   = 0
@@ -223,6 +229,13 @@ class VFE3Config:
 
         # gauge seam
         _require(self.gauge_group, _VALID_GAUGE_GROUPS, "gauge_group")
+        # Sp(2m,R) lives in even dimension K = 2m; reject an odd embed_dim at construction with a
+        # clear message rather than letting generate_sp raise mid-build.
+        if self.gauge_group == "sp" and self.embed_dim % 2 != 0:
+            raise ValueError(
+                f"gauge_group='sp' (Sp(2m,R)) requires an EVEN embed_dim (K=2m), got "
+                f"embed_dim={self.embed_dim}"
+            )
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
         # transport_mode selects the connection REGIME. Validated against the transport REGISTRY
         # (not a hardcoded literal list) so a newly registered regime is a valid config value
@@ -424,6 +437,8 @@ class VFE3Config:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
+        if self.grad_accum_steps < 1:
+            raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
         if self.log_interval < 0:
             raise ValueError(f"log_interval must be >= 0, got {self.log_interval}")
         if self.eval_interval < 0:

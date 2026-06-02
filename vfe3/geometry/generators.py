@@ -207,6 +207,54 @@ def generate_glk_cross_head(
     return G.to(dtype).to(device)
 
 
+def generate_sp(
+    K:                int,
+
+    *,
+    device:           'torch.device | str | None'     = None,
+    dtype:            torch.dtype                      = torch.float32,
+) -> torch.Tensor:
+    r"""sp(2m,R) generators (real symplectic Lie algebra). Returns (m(2m+1), 2m, 2m).
+
+    With the standard symplectic form J = [[0, I_m], [-I_m, 0]],
+    sp(2m,R) = {A : J A + A^T J = 0}, equivalently A = [[B, C], [D, -B^T]] with B an
+    arbitrary m x m block and C = C^T, D = D^T symmetric m x m blocks. A spanning basis
+    of dimension m^2 + 2 * m(m+1)/2 = m(2m+1) is emitted as three groups:
+      B-block (m^2): [[E_ij, 0], [0, -E_ij^T]] = [[E_ij, 0], [0, -E_ji]], for i, j in [0, m).
+      C-block (m(m+1)/2): [[0, S], [0, 0]] with S symmetric -- S = E_ii, and E_ij + E_ji
+        for i < j (top-right block).
+      D-block (m(m+1)/2): [[0, 0], [S, 0]] with S symmetric (bottom-left block).
+    """
+    if K < 2 or K % 2 != 0:
+        raise ValueError(f"K must be even and >= 2 for Sp(2m,R), got K={K}")
+
+    m            = K // 2
+    n_generators = m * (2 * m + 1)
+    G            = torch.zeros(n_generators, K, K, dtype=torch.float64)
+
+    idx = 0
+    # B-block: A = [[E_ij, 0], [0, -E_ji]]
+    for i in range(m):
+        for j in range(m):
+            G[idx, i, j]         = 1.0
+            G[idx, m + j, m + i] = -1.0
+            idx += 1
+    # C-block: A = [[0, S], [0, 0]], S symmetric (top-right block, columns m..2m-1)
+    for i in range(m):
+        for j in range(i, m):
+            G[idx, i, m + j] = 1.0
+            G[idx, j, m + i] = 1.0
+            idx += 1
+    # D-block: A = [[0, 0], [S, 0]], S symmetric (bottom-left block, rows m..2m-1)
+    for i in range(m):
+        for j in range(i, m):
+            G[idx, m + i, j] = 1.0
+            G[idx, m + j, i] = 1.0
+            idx += 1
+
+    return G.to(dtype).to(device)
+
+
 def generate_son(
     N:                int,
 

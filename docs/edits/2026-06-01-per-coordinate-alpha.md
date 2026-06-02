@@ -1359,3 +1359,137 @@ divergence tests raised `_LinAlgError`; test_numerics raised ImportError on `saf
 then GREEN. Full suite after the change: `tests=407 failures=0 errors=0 skipped=0` (read
 from junitxml; 401 baseline + 6 new; 406 passed + 1 xpassed pre-existing; all 8 viz tests
 collected normally).
+
+## 2026-06-02 — Gradient accumulation (grad_accum_steps; default-OFF)
+
+Branch: vfe3-roadmap-overnight-2026-06-02 (committed directly). Roadmap source:
+`docs/perf/2026-05-31-speedup-opportunities.md` / `docs/2026-06-01-buildout-roadmap.md` (the
+gradient-accumulation finding). Lets the RTX 5090 reach a large EFFECTIVE batch without the
+memory of one big forward, by accumulating gradients over several microbatches before each
+optimizer step. DDP is a separate, larger item and was NOT added.
+
+### The toggle and the split-the-batch approach
+`vfe3/config.py` adds `grad_accum_steps: int = 1` (default 1 = OFF) beside `batch_size`, with a
+`>= 1` `__post_init__` check. When `grad_accum_steps == K > 1`, `train_step` SPLITS the pulled
+batch into K equal chunks along the batch axis (`torch.chunk(..., K, dim=0)`), forwards each,
+divides its loss by K and `backward()`s it (accumulating into `.grad`), then fires a SINGLE
+gradient clip + `optimizer.step()` + `scheduler.step()` at the accumulation boundary. The
+split-the-batch (rather than consume-K-dataloader-batches) approach was chosen because it makes
+the accum==full-batch equivalence oracle EXACT and keeps the dataloader/step accounting trivial:
+`train()` still calls `train_step` exactly once per dataloader pull. The default `K == 1` takes a
+separate branch with no chunking and no divide, so it is byte-identical to the prior
+single-backward loop.
+
+### The accum == full-batch grad oracle (and the equal-token caveat)
+The key correctness pin: for a batch split into K equal microbatches with EQUAL counted-token
+counts, the accumulated `.grad` on the prior tables after K microbatch backwards (each loss/K)
+equals (to round-off) the `.grad` from one backward on the full batch. This holds because the
+model's CE and the extra F terms are MEANS over the batch axis and there is no cross-sequence
+dependency in the E-step (`for b in range(B)`), so `(1/K) sum_k mean_k == mean_full` for
+equal-sized microbatches. The EQUAL-TOKEN caveat: with per-position `ignore_index` (-100) the
+per-microbatch means re-weight by each chunk's surviving token count, so the K-accum mean would
+not equal the full-batch mean (which weights by the total surviving count) unless every
+microbatch happens to carry the same number of counted tokens. The oracle tests construct inputs
+with NO `-100` (every position counts) and use a batch divisible by K. The grad-clip is applied
+ONCE to the accumulated (already mean-normalized) gradient, so the threshold is NOT rescaled by
+K (that would be the summed-loss variant, which this is not).
+
+### Divisibility guard (loud, not silent)
+`train_step` raises `ValueError` when `B % K != 0` rather than degrading silently: `torch.chunk`
+on a non-divisible batch returns unequal (and possibly fewer than K) chunks, which would break
+both the microbatch count and the /K normalization. The equal-token oracle's precondition is
+exactly `B % K == 0`, so the guard makes the misuse fail at the call rather than miscompute.
+
+### Optimizer-step accounting
+A "step" stays an OPTIMIZER step: `train_step` performs exactly one `optimizer.step()` +
+`scheduler.step()` regardless of K, and `train()` calls `train_step` once per pulled batch, so
+`max_steps`/`warmup`/the LambdaLR cosine all count optimizer steps (not microbatches) with zero
+extra logic. The logged per-step loss is the mean over the K microbatches (the
+accumulation-boundary loss).
+
+### Tests (TDD, watched RED then GREEN; `tests/test_grad_accum.py`, new)
+- `test_train_step_accum_grad_matches_full_batch[2]` and `[4]` — the production-path oracle:
+  the REAL `train_step` at K>1 (with `grad_clip=0.0` so the clip is skipped) leaves a `.grad`
+  allclose (atol 1e-5) to the full-batch single backward (~1e-8 in practice). Mutation-checked:
+  dropping the `/K` makes both fail, so it genuinely gates `train_step`'s accumulation branch.
+- `test_accum_grad_equals_full_batch_grad[2]` and `[4]` — the math-premise sibling: the same
+  equivalence with the chunking reimplemented inline (no `train_step`), for K=2 and K=4, with no
+  optimizer.step between the two measurements.
+- `test_train_step_k1_byte_identical_to_single_step_path` — `grad_accum_steps=1` reproduces the
+  current path exactly (same returned loss; `torch.equal` on all three prior tables after one
+  step; same `scheduler.last_epoch`).
+- `test_optimizer_and_scheduler_step_once_per_K_microbatches` — N train_step calls at K=4 leave
+  AdamW's per-param `step` state == N and `scheduler.last_epoch == N` (one optimizer/scheduler
+  step per K microbatches, not per microbatch).
+- `test_train_loop_runs_under_grad_accum` — end-to-end `train()` at K=4 returns n_steps finite
+  losses.
+- `test_config_grad_accum_steps_validation` — default 1; `0`/`-3` raise.
+- `test_train_step_indivisible_batch_raises` — `B=5`, `K=4` raises `ValueError`.
+
+Surgical scope: `vfe3/config.py` + `vfe3/train.py` (+ the new test file). `model.py` forward
+untouched. Full suite after the change: `tests=416 failures=0 errors=0 skipped=0` (read from
+junitxml; 407 baseline + 9 new; 415 passed + 1 xpassed pre-existing; all 8 viz tests collected
+normally).
+
+## 2026-06-02 — Sp(2m,R) symplectic gauge group (new structure-group seam member)
+
+Branch: vfe3-roadmap-overnight-2026-06-02 (committed directly). An additive demonstration of the
+group-axis modularity (CLAUDE.md: add a variant by writing-and-registering, never by editing call
+sites): the real symplectic group is registered as a new gauge group with no edits to the transport,
+E-step, attention, or decode call sites.
+
+### The group and its algebra
+Sp(2m,R) = {g in GL(2m,R) : g^T J g = J} with the standard symplectic form J = [[0, I_m], [-I_m, 0]].
+Its Lie algebra sp(2m,R) = {A : J A + A^T J = 0}, equivalently A = [[B, C], [D, -B^T]] with B an
+arbitrary m x m block and C = C^T, D = D^T symmetric. The basis emitted by `generate_sp(K)` (K = 2m)
+has dimension m(2m+1) = m^2 + 2 * m(m+1)/2: the m^2 B-generators [[E_ij, 0], [0, -E_ji]], the
+m(m+1)/2 symmetric C-generators [[0, S], [0, 0]] (S = E_ii and E_ij + E_ji for i < j, top-right
+block), and the m(m+1)/2 symmetric D-generators [[0, 0], [S, 0]] (bottom-left block). sp(2m,R) is NOT
+skew, so the group is registered with `skew_symmetric=False` and transport exponentiates the
+generators through the general `matrix_exp` path (the same path glk uses).
+
+### Admissibility
+The manuscript's GL(K) invariance theorem makes the Gaussian divergence invariant under common
+congruence (mu -> g mu, Sigma -> g Sigma g^T) by ANY g in GL(K). Sp(2m,R) is a subgroup of GL(2m,R),
+so the divergence is invariant under the symplectic congruence and the group is admissible for the
+Gaussian family (`invariant_families=('gaussian',)`).
+
+### Files
+- `vfe3/geometry/generators.py`: new `generate_sp(K)` returning the (m(2m+1), 2m, 2m) sp basis;
+  raises `ValueError` on odd or sub-2 K. Built in float64 then cast, matching `generate_son`.
+- `vfe3/geometry/groups.py`: `@register_group("sp")` builder `_build_sp(K)` ->
+  `GaugeGroup(generators=generate_sp(K), irrep_dims=[K], skew_symmetric=False,
+  invariant_families=('gaussian',))` (single super-block). `build_group` (model.py) needs no edit:
+  sp is arity-1 `builder(K)` like glk/so_k and the existing positional-arity dispatch handles it.
+- `vfe3/config.py`: "sp" added to `_VALID_GAUGE_GROUPS`; `__post_init__` raises a clear ValueError
+  when `gauge_group=="sp"` and `embed_dim` is odd (Sp needs even K = 2m). The odd-K guard exists in
+  BOTH layers (config for an early, clear failure; `generate_sp` for robustness).
+
+### Oracles (TDD, watched RED then GREEN; 10 new tests)
+- sp-algebra membership (exact): `test_sp_generators_are_sp_algebra[4,6]` — every generator G
+  satisfies J G + G^T J = 0 (allclose 0, atol 1e-6), and the group is non-skew with irrep_dims=[K].
+- basis count + independence: `test_sp_basis_count_and_independent[4,6]` — n_gen == m(2m+1) and the
+  flattened-generator matrix has rank n_gen.
+- Sp preservation under exp: `test_sp_exp_preserves_symplectic_form[4,6]` — exp(t G)^T J exp(t G)
+  allclose J (atol 1e-5) for each generator (a one-parameter symplectic subgroup).
+- admissibility / gauge-equivariance: `test_full_kl_invariant_under_group_pushforward[sp,K=4]` (added
+  to the existing parametrize) — for a random g = exp(sum phi_a G_a) in Sp, the Gaussian KL is
+  invariant under common congruence (atol 1e-3). This is the key oracle that sp is a valid gauge
+  group for the family.
+- odd-K guard: `test_sp_odd_K_raises` (`generate_sp(5)` raises) and
+  `test_config_sp_gauge_group_requires_even_embed_dim` (config rejects odd embed_dim under sp,
+  accepts even, leaves other groups unaffected).
+- end-to-end: `test_model_runs_under_sp_gauge_group` — a tiny VFEModel with `gauge_group="sp"`,
+  `embed_dim=4` (m=2, n_gen=10), `n_heads=2` runs forward + `loss.backward()` with finite loss and
+  finite, grad-connected prior-table gradients.
+
+### Deferred
+U(K)/SU(K) are NOT added here: the unitary groups need a complex (or 2m-real) belief embedding for
+the congruence action, which this real-Gaussian belief family does not currently carry; that is a
+larger belief-representation change, deferred.
+
+### Suite
+Additive change; existing group generators are byte-identical (generators.py only adds a new
+function, groups.py only registers a new builder). Full suite after the change:
+`tests=426 failures=0 errors=0 skipped=0` (read from junitxml; 416 baseline + 10 new; 425 passed +
+1 xpassed pre-existing; all 8 viz tests collected normally).
