@@ -156,3 +156,159 @@ REMAINING (flagged, not built):
 - Causal-packed transport (#12) — N-factor win, but now entangled with `FactoredTransport`; do as a focused follow-up.
 - Observation-likelihood seam (#9) — a decide-and-document item (the current CE-external design is the defensible vacuum-plus-source split); needs your call before building.
 - Hyper-prior increment 2 (gamma model-coupling + s-channel E-step + s->q coupling); torch.compile/CUDA-graph (after a 5090 re-profile); the spec-only items still awaiting decisions (Bures-Wasserstein retraction, additional groups U/SU/Sp, f-divergence beyond Hellinger).
+
+## F. Gamma model-coupling block — hyper-prior increment 2 (WORKING TREE, not yet committed)
+
+The retry of the gamma item that the prior session's subagent dropped on an API socket error
+(working tree was unchanged). Built by hand (the seam is tightly interdependent — config field ↔
+prior_bank table gate ↔ model.py loss assembly ↔ tests — exactly the shape that lost edits in a
+fan-out before; see `[[workflow-shared-tree-lost-edits]]`), TDD red→green, advisor-steered on the
+one load-bearing design decision (the detach). Suite: **437 tests, 0 failures, 0 errors** (was 426
+before this increment; +11 new `tests/test_gamma_coupling.py`). The lone `xpassed`
+(`test_training_decreases_loss_on_structured_stream`) is a pre-existing non-strict xfail, unrelated.
+
+**What it is.** `L += gamma_coupling * mean_i F_red^s_i`, the reduced (envelope) form of the
+model-coupling block `sum_ij [ gamma_ij KL(s_i||Omega_tilde_ij s_j) + tau_g gamma_ij
+log(gamma_ij/pi^s_ij) ]` (manuscript `Participatory_it_from_bit.tex` eq:pointwise_free_energy,
+1241-1249). The s-channel is the SAME softmax-over-KL object as the belief beta block, so it REUSES
+`pairwise_energy` + `reduced_free_energy` with `(q,p,beta,pi,tau) -> (s,Omega s,gamma,pi^s,tau_g)` —
+no new energy/softmax code. New config: `gamma_coupling=0.0` (scale, OFF default), `kappa_gamma=1.0`
+(→ `tau_gamma = kappa_gamma*sqrt(d_head)` property mirroring `tau`), `gamma_attention_prior="causal"`
+(own pi^s seam). The `s` tables are now created on `lambda_h>0 OR gamma_coupling>0` (s drawn before r,
+so the existing `lambda_h`-only RNG order — and hence byte-identity — is preserved); `r` stays
+`lambda_h`-only.
+
+**The load-bearing decision — TIED + DETACHED transport (advisor-confirmed, spec-forced).**
+`Omega_tilde` is the flat phi-cocycle `exp(phi_i)exp(-phi_j)` from the CONVERGED belief frame
+`out.phi`, **detached**. So the gamma gradient flows ONLY to the `s` tables: the forward (logits/ce)
+is **byte-identical** to the gamma=0 path and the model channel stays **predictively INERT** — `s`
+does not feed `q`. This is forced by the user's own framing ("s stays predictively inert until
+s→q"): a live Omega would backprop into `phi_embed`, which feeds the forward, changing predictions.
+The detach deliberately SEVERS the `phi <- gamma` coupling that full tied transport carries in the
+canonical E-step F; restoring it (or keeping it severed) is part of the deferred s→q design, NOT
+this term. (Theory note for whoever builds s→q: "tied transport" here means *evaluated at the
+current phi, frozen* — the coupling is not yet wired.)
+
+**Oracles (all green).** (1) default-off → no s/r tables, `loss==ce`; (2) gamma>0 alone creates `s`
+but not `r`; (3) GOLD: `loss_w - loss_0 == w * gamma_term` against an INDEPENDENT recomputation of
+the term from the s tables + `Omega(encode().phi.detach())` at `atol=1e-6` (only recomputation
+catches a wrong-tensor bug — linearity/envelope are necessary-not-sufficient; the `e_phi_lr=0`
+shortcut makes `out.phi == encode().phi` so the oracle skips re-running `vfe_stack`, guarded by an
+assert); (4) predictive inertness — mutating `s` leaves logits/ce byte-identical; (5) detach contract
+on the REAL forward — `phi_embed.grad` and `mu_embed.grad` are EQUAL across gamma=0/gamma=w, while
+`s` trains only at gamma>0; (6) envelope identity for the gamma channel; (7) self-zero under identity
+transport; (8) config validation + `tau_gamma`.
+
+**Documented simplifications (parity, not new approximations).** `gamma_coupling=1` is a
+per-token-per-head *mean* weight (the reduction is `.mean()` over (B,H,N)), not the canonical
+sum-over-ij — the scale is a free coupling. The diagonal `transport_covariance` keeps only
+`diag(Omega Sigma Omega^T)`, the same approximation the belief diagonal family already uses. The
+tied transport is the flat cocycle (exact under the default flat regime; a documented tie under
+regime_ii). Dense Omega is materialized once per forward at the loss level (like `diagnostics()`),
+not the hot-path `FactoredTransport`.
+
+**Files.** `vfe3/config.py` (3 fields + validation + `tau_gamma` property), `vfe3/model/prior_bank.py`
+(s-table gate split, `gamma_coupling` param), `vfe3/model/model.py` (PriorBank wiring + the gamma
+block in `forward`), `tests/test_gamma_coupling.py` (new, 12 tests), `docs/verified.md` (new).
+
+**Adversarial verification (5-lens workflow, each verifier told to falsify).** math-envelope CONFIRMED
+(sympy envelope identity → 0; hand-matmul falsified Omega^T/Omega_ji; from-scratch per-head loop matched
+to 5.96e-8). detach-inertness CONFIRMED (`autograd.grad(gamma_term,[phi_embed,mu_embed,sigma_log_embed])`
+→ None,None,None; no-detach mutation probe proves the test discriminates). byte-identity CONFIRMED
+(exact-equality forward, pure-path RNG identical, no `'s implies r'` dep). code-quality CONFIRMED (no-NN
+sanctioned; mutation testing confirms the oracle catches missing-detach/wrong-reduction/per-head/forgot-
+transport). manuscript-fidelity CONCERN — NOT a defect in what was built: the term is correct and the
+simplifications honestly documented; the concern IS the deferred s→q design (static-s vs inferred-field;
+detach severs phi←gamma), which the manuscript itself zeroes in its sims (line 1296). Recorded in
+`docs/verified.md`. No FLAWs across all five lenses.
+
+**Post-verification fixes (low-severity, surfaced by the verifiers).** (a) Updated stale comments my
+change rendered false — the `encode_s` docstring and the `lambda_h` comments that said "gamma block
+DEFERRED to increment 2" (it is now built); `config.py`, `model.py`, `prior_bank.py`, `test_hyperprior.py`.
+(b) Corrected my own test docstring that overstated the linearity oracle's independence (it shares
+primitives with the impl, so it pins wiring/isolation/reduction/linearity/per-head, not the math). (c)
+Added `test_gamma_energy_equals_analytic_kl_at_nonzero_phi` — a formula-independent analytic diagonal-KL
+check at NONZERO phi (Omega != I), closing the verifier-flagged coverage gap (every other fixture uses
+e_phi_lr=0 so Omega≈I) and giving the one genuinely-independent `E_s == KL(s_i||Omega s_j)` check.
+Suite after fixes: 438 tests, 0 failures, 0 errors.
+
+**Still deferred (the valuable part — wants your design input):** s→q coupling (the model channel
+actually driving predictions, via `p_i(k_i|m_i)` or making `s` an E-step-iterated state). New
+behavior with no clean oracle — building it blind is the plausible-but-wrong trap. The gamma assembly
+here is reusable infrastructure for it: only the *source* of `s_i` changes (static table → iterated
+state), not the energy/softmax machinery. NOT committed yet (awaiting your go).
+
+## G. s→q coupling — `prior_source="model_channel"` (Realization A; WORKING TREE, not committed)
+
+The user supplied the design input (3 decisions: drive predictions *through the belief prior*; *static*
+s; *replace* `p_i = s_i`) and then chose **Realization A** when examining the decode revealed a
+realization fork. Built by hand, TDD, advisor-grounded; **5-lens adversarial verification**.
+Suite: **446 / 0 / 0** (+8 `tests/test_prior_source.py`).
+
+**What it is.** A default-off config toggle `prior_source ∈ {"token","model_channel"}`. `"token"`
+(default) = the belief tables `mu_embed/sigma_log_embed`, byte-identical to before. `"model_channel"`
+REPLACES the belief prior with the model channel: `p_i = s_i`, routed through one accessor pair
+`PriorBank._prior_mu_table()/_prior_sigma_log_table()` at **every** place the prior is consumed —
+encode (`q_i(0)=p_i`), the E-step self-coupling target `α·KL(q_i‖p_i)`, and **all four decode kernels**
+(diagonal/full/chunked/reference). The model-channel `s` tables (coupled by the γ/λ_h I shipped this
+session) thus become the belief prior and drive predictions; φ stays the belief table (tied,
+`B_state=B_model`). `mu_embed` is dead on this path.
+
+**Trainability fix (caught by grep, not by the unit tests).** `build_optimizer`'s exact-coverage guard
+would have *raised* under `model_channel` (the `s` tables weren't grouped) — the model couldn't train
+its prior. Now the `s` tables are grouped (mean@`m_mu_lr`, log-scale@`m_sigma_lr`), with an end-to-end
+"optimizer steps the prior" test (loss 2.996→2.418 over 20 steps in verification). The hyper-prior
+centroid `r` (lambda_h>0) is **FROZEN** (`requires_grad=False`; your decision) — a fixed centroid per the
+manuscript's "higher, slower meta-level" (`supp:1081`); free-training it would collapse `KL(s‖r)→0`. The
+coverage guard now exempts non-trainable params, so `build_optimizer` works for lambda_h>0 (s grouped,
+frozen r skipped) — the hyper-prior channel now trains end-to-end. Still ungrouped & RAISES
+(**pre-existing**, genuinely trainable): `log_alpha` (`alpha_mode='learnable'`) and `connection_W`
+(`regime_ii`).
+
+**Oracles.** default `token` byte-identical (accessor returns the *literal same object*); **copy-equivalence**
+(s := belief tables → byte-identical, now also through the M-step self-coupling rebuild); directional
+(s live / `mu_embed` dead); grad (trains s, not `mu_embed`); config validation.
+
+**Verification verdicts.** prior-consistency CONFIRMED (no issues — whole-tree grep + empirical directional
+checks on every path), byte-identity CONFIRMED, trainability CONFIRMED. manuscript-fidelity **CONCERN with
+a HIGH-severity finding I fixed**: my citation was WRONG — I attributed `p_i(k_i|m_i)` to
+`Participatory_it_from_bit.tex`, but that conditional is in `GL(K)_supplementary.tex:1083-1085`, and
+Participatory:1440 states the *opposite* ("s_i does not act through p_i at the same scale"; its `p` is a
+*cross-scale* shadow). Verified against the actual `.tex` myself. **The two manuscripts carry different
+s→p mechanisms; this increment realizes the supplementary's same-scale hierarchical-Bayes reading, NOT the
+main manuscript's cross-scale one.** Corrected the citations and disclosed the tension in `config.py` +
+the test docstring + `docs/verified.md`. The realization is mathematically faithful to the supplementary's
+Eq. 1085 (not a code/math flaw); whether the same-scale reading matches your intent (vs the cross-scale
+`p`, which needs a meta-agent/scale-(s+1) object that does not exist yet) is **your call** — see §H.
+
+**Files.** `vfe3/config.py` (field + `_VALID_PRIOR_SOURCES` + validation), `vfe3/model/prior_bank.py`
+(accessor pair + s-table gate + 5 rerouted reads), `vfe3/model/model.py` (wiring), `vfe3/train.py`
+(s optimizer group + NOTE), `tests/test_prior_source.py` (new, 8 tests), `docs/verified.md`.
+
+## H. OPEN QUESTION FOR YOU — I gave you a WRONG premise for this choice; do you still want it?
+
+This is the important one. **Before your Q3 decision I told you "the manuscript route is unambiguous:
+s drives predictions through the belief prior (h→s→p→q — `p_i(k_i|m_i)`, Participatory:1083)." BOTH
+halves were wrong** — the citation (that conditional is in `GL(K)_supplementary.tex:1083`, not
+Participatory) and "unambiguous" (the **main** `Participatory_it_from_bit.tex:1440` states the OPPOSITE
+mechanism: `p_i` is the **cross-scale shadow** of the meta-agent's belief `q^(s+1)` transported down, and
+"`s_i` does not act through `p_i` at the same scale"). You partly chose **replace `p_i = s_i`** because I
+presented it as the settled manuscript route. It is not.
+
+Precisely what is and isn't contaminated: **Q1 ("drive predictions through the prior") still holds** in
+*both* readings — in the cross-scale reading `p_i` is still the prior `q` aligns to, just sourced from
+`q^(s+1)` instead of `s_i`. It is **Q3 (the same-scale identity `p_i = s_i`)** that commits to the
+**supplementary's** reading, which the main manuscript's text contradicts. The code is a correct,
+tractable realization of the supplementary's Eq. 1085 — but the *mechanism choice* was made on a wrong
+premise, so it's genuinely yours to remake with the correct picture:
+- (a) **Keep** the same-scale `p_i = s_i` (the supplementary is explicit; it's what trains today, default
+  `token` unaffected);
+- (b) **Cross-scale instead** — `p_i = Ω·q^(s+1)` (the main manuscript's mechanism; a much larger build,
+  needs a meta-agent / scale-(s+1) hierarchy that does not exist yet);
+- (c) **Both**, behind the toggle.
+
+Smaller related decision — **RESOLVED**: you chose to **freeze** the hyper-prior centroid `r` (fixed
+centroid, `requires_grad=False`). Done — the coverage guard now exempts non-trainable params, so
+`build_optimizer` works for `lambda_h>0` (s trains, r fixed). And note `model_channel` with
+`gamma=lambda_h=0` is a *pure rename* of `mu_embed` (zero added capacity); the model channel changes
+predictions only once `gamma>0`/`lambda_h>0` shape `s` beyond CE.

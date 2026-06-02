@@ -18,6 +18,7 @@ _VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_pe
 _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback")
 _VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
 _VALID_ATTENTION_PRIORS    = ("uniform", "causal", "alibi")
+_VALID_PRIOR_SOURCES       = ("token", "model_channel")
 _VALID_NORMS               = ("none", "mahalanobis")
 _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
 
@@ -103,11 +104,46 @@ class VFE3Config:
     # Hyper-prior weight lambda_h on the model-channel term lambda_h * mean_i KL(s_i||r)
     # (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy, lines 1241-1249).
     # Default 0.0 = OFF: no s/r tables, loss byte-identical to the single-tier path.
-    # FIRST INCREMENT: this wires the second (model) belief channel s_i + the global hyper-prior
-    # r end-to-end at the smallest scope; s_i does NOT yet couple into the belief q / the
-    # prediction path, and the gamma model-coupling block + the s-channel E-step update are
-    # DEFERRED to increment 2.
+    # This wires the second (model) belief channel s_i + the global hyper-prior r end-to-end; s_i
+    # does NOT couple into the belief q / the prediction path (the gamma block below shares the same
+    # s tables and is likewise predictively inert). The s->q coupling and the s-channel E-step update
+    # remain DEFERRED.
     lambda_h:                  float = 0.0
+
+    # Model-coupling weight gamma_coupling on the model-channel block gamma_coupling * mean_i F_red^s_i,
+    # the reduced (envelope) form of sum_ij [ gamma_ij KL(s_i||Omega_ij s_j) + tau_g gamma_ij
+    # log(gamma_ij/pi^s_ij) ] (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
+    # lines 1241-1249). Default 0.0 = OFF. SECOND INCREMENT: a TRAINING-LOSS regularizer on the
+    # model-channel s tables with TIED, DETACHED transport (Omega_tilde = Omega from the converged
+    # belief phi.detach()), so the gamma gradient reaches ONLY the s tables and the forward
+    # (logits/ce) is byte-identical to the gamma=0 path -- the model channel stays predictively INERT
+    # (s does NOT feed q). The detach deliberately severs the phi<-gamma coupling that full tied
+    # transport would carry; restoring it is part of the deferred s->q design. gamma_coupling>0 ALONE
+    # creates the s tables (the r tables stay hyper-prior-only). NB: the mean over (B, H, N) makes
+    # gamma_coupling=1 a per-token-per-head mean weight, NOT the canonical sum-over-ij; the scale is a
+    # free coupling.
+    gamma_coupling:            float = 0.0
+    kappa_gamma:               float = 1.0          # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
+    gamma_attention_prior:     str   = "causal"     # pi^s_ij seam for the model channel (its own prior)
+
+    # s->q coupling: REPLACE the belief prior with the model channel, p_i = s_i. This realizes the
+    # SAME-SCALE hierarchical-Bayes prior of GL(K)_supplementary.tex:1083-1085 (p_i(k_i) = integral
+    # p_i(k_i|m_i) s_i(m_i) dm_i; p_i = s_i is the identity-conditional special case, K_model=K).
+    # THEORETICAL TENSION (disclosed, not settled): the main Participatory_it_from_bit.tex:1440 instead
+    # makes p_i a CROSS-SCALE shadow -- the meta-agent's belief q^(s+1) transported into agent i's frame
+    # -- and states "s_i does not act through p_i at the same scale" (there s_i is regulated only by its
+    # own hyper-prior r_i). This toggle deliberately takes the supplementary's same-scale reading; the
+    # cross-scale realization would need a meta-agent/scale-(s+1) object that does not exist yet.
+    # prior_source selects which table supplies p_i, CONSISTENTLY across encode (q_i(0)=p_i), the E-step
+    # self-coupling target alpha*KL(q_i||p_i), AND the decode per-vocab readout -KL(q||p_v). "token"
+    # (default): the belief table mu_embed/sigma_log_embed -- byte-identical pure path. "model_channel":
+    # the model-channel s tables (coupled by gamma/lambda_h) ARE the belief prior, so the model channel
+    # drives predictions; phi stays the belief table (tied, B_state=B_model). Forces the s tables to
+    # exist; mu_embed is unused (dead) on this path. NB: with gamma_coupling=lambda_h=0, model_channel is
+    # a pure RENAME of mu_embed (s plays mu_embed's role, CE-trained) -- ZERO added capacity; the model
+    # channel changes predictions only once gamma>0 / lambda_h>0 shape s beyond CE. Oracle: s copied from
+    # the belief prior tables -> byte-identical to "token".
+    prior_source:              str   = "token"       # "token" | "model_channel"
 
     # attention
     include_attention_entropy: bool  = True         # canonical (True) vs surrogate (False)
@@ -321,6 +357,12 @@ class VFE3Config:
             )
         if self.lambda_h < 0.0:
             raise ValueError(f"lambda_h must be >= 0, got {self.lambda_h}")
+        if self.gamma_coupling < 0.0:
+            raise ValueError(f"gamma_coupling must be >= 0, got {self.gamma_coupling}")
+        if self.kappa_gamma <= 0.0:
+            raise ValueError(f"kappa_gamma must be > 0, got {self.kappa_gamma}")
+        _require(self.gamma_attention_prior, _VALID_ATTENTION_PRIORS, "gamma_attention_prior")
+        _require(self.prior_source, _VALID_PRIOR_SOURCES, "prior_source")
         for name in ("b0", "c0"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
@@ -463,6 +505,16 @@ class VFE3Config:
         Vaswani temperature.
         """
         return self.kappa * (self.d_head ** 0.5)
+
+    @property
+    def tau_gamma(self) -> float:
+        """Model-channel softmax temperature tau_gamma = kappa_gamma * sqrt(d_head).
+
+        The gamma model-coupling block's own temperature handle, mirroring `tau` for the belief
+        beta block (kappa_gamma=1 -> Vaswani sqrt(d_k) per head). Consumed by the gamma block's
+        reduced_free_energy as the -tau_gamma log Z^s envelope temperature.
+        """
+        return self.kappa_gamma * (self.d_head ** 0.5)
 
     @property
     def d_head(self) -> int:

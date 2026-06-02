@@ -35,11 +35,22 @@ def build_optimizer(
     at ``m_sigma_lr``; the gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``. The
     weight decay ``cfg.weight_decay`` is shared.
 
-    Two optional parameters are grouped only when their toggle is on: the linear decode
-    weight ``output_proj_weight`` (use_prior_bank=False) at ``m_mu_lr`` (a mean-readout
-    scale), and the head-mixer ``mixer_delta`` (use_head_mixer=True) at ``m_mu_lr``. A
-    final assertion pins that the groups cover ``model.parameters()`` EXACTLY -- a new
+    Optional parameters are grouped only when their toggle is on: the linear decode weight
+    ``output_proj_weight`` (use_prior_bank=False) at ``m_mu_lr`` (a mean-readout scale); the
+    head-mixer ``mixer_delta`` (use_head_mixer=True) at ``m_mu_lr``; the model-channel tables
+    ``s_mu_embed``/``s_sigma_log_embed`` (lambda_h>0, gamma_coupling>0, or
+    prior_source='model_channel') and the hyper-prior centroid ``r_mu``/``r_sigma_log``
+    (lambda_h>0), each split mean@``m_mu_lr`` / log-scale@``m_sigma_lr`` like the belief tables.
+    A final assertion pins that the groups cover ``model.parameters()`` EXACTLY -- a new
     parameter that is forgotten here would otherwise silently never receive a gradient.
+    The hyper-prior centroid ``r_mu``/``r_sigma_log`` (lambda_h>0) is FROZEN (requires_grad=False, set in
+    prior_bank.py) -- a fixed centroid per the manuscript's "higher, slower meta-level"
+    (GL(K)_supplementary.tex:1081); the coverage guard exempts it, so it needs no group and is never
+    updated (freely training r alongside s would collapse KL(s||r)->0).
+    KNOWN GAP (still deferred, so this guard RAISES for these toggles): ``log_alpha``
+    (alpha_mode='learnable') and ``connection_W`` (transport_mode='regime_ii') are TRAINABLE model-level
+    nn.Parameters NOT yet grouped; grouping them (with feature-appropriate LRs) is deferred to those
+    features' owners.
     """
     pb = model.prior_bank
     groups = [
@@ -51,18 +62,30 @@ def build_optimizer(
         groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_mu_lr})
     if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
         groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_mu_lr})
+    if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (gamma_coupling>0 or
+        groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_mu_lr})    # prior_source=model_channel):
+        groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_sigma_lr})  # mean@m_mu_lr, log-scale@
+        # m_sigma_lr, mirroring the belief tables. s is the model channel / (under model_channel) the
+        # live belief prior, so it must train. The hyper-prior CENTROID r (lambda_h>0) is NOT grouped
+        # because it is FROZEN (requires_grad=False, prior_bank.py) -- a fixed centroid per the
+        # manuscript's "higher, slower meta-level"; the coverage guard exempts non-trainable params.
 
-    # Exact-coverage guard: every model parameter must land in exactly one group. A missing
-    # group would leave that weight frozen (no AdamW update) with no error -- the bug class the
-    # optimizer is most prone to as new learnable seams (output_proj, head mixer, ...) are added.
+    # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
+    # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the
+    # bug class the optimizer is most prone to as new learnable seams (output_proj, head mixer, ...) are
+    # added. Non-trainable params (requires_grad=False, e.g. the FROZEN hyper-prior centroid r) are
+    # intentionally exempt: they are fixed by design and need no optimizer group.
     # NOTE: this guards GROUPING/coverage, not gradient FLOW. A grouped parameter can still receive
     # a null gradient under specific opt-in toggles, by design: phi_embed under detach_e_step=True
     # (the E-step is detached; test-pinned in test_model.py), decode_log_scale under
-    # use_prior_bank=False (the linear decode discards tau_eff), and ALL encode tables under
+    # use_prior_bank=False (the linear decode discards tau_eff), ALL encode tables under
     # use_prior_bank=False AND detach_e_step=True (only output_proj_weight reaches the loss; the
-    # model emits a warning for that combination). These are intentional, not coverage bugs.
+    # model emits a warning for that combination), and mu_embed/sigma_log_embed under
+    # prior_source='model_channel' (the prior reroutes to the s tables, so the belief tables are dead
+    # but stay grouped -- AdamW skips a None-grad param, though shared weight_decay still decays the
+    # dead table harmlessly since it is never read). These are intentional, not coverage bugs.
     grouped = {p for g in groups for p in g["params"]}
-    missing = set(model.parameters()) - grouped
+    missing = {p for p in model.parameters() if p.requires_grad} - grouped   # frozen params are exempt
     if missing:
         raise AssertionError(
             f"build_optimizer left {len(missing)} model parameter(s) ungrouped; they would never "

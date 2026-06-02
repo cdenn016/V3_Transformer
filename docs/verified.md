@@ -1,0 +1,93 @@
+# Verified — math/theory checks (consult before re-verifying)
+
+Per the CLAUDE.md audit/verification policy: each entry states WHAT was checked, whether it was
+INCORRECT, and whether it was RIGOROUSLY verified. Consult this before re-verifying the same thing.
+
+## 2026-06-02 — Gamma model-coupling block (hyper-prior increment 2)
+
+Code: `vfe3/model/model.py` (gamma block in `forward`), `vfe3/model/prior_bank.py` (s-table gate),
+`vfe3/config.py` (gamma_coupling/kappa_gamma/gamma_attention_prior + tau_gamma). Tests:
+`tests/test_gamma_coupling.py` (12). Verified by a 5-lens adversarial workflow (each verifier told to
+falsify) plus the test oracles. Suite at completion: 438 tests, 0 failures, 0 errors.
+
+- **Envelope assembly = canonical `-tau_g log Z^s_i`.** CHECKED, CORRECT, RIGOROUS. The gamma block
+  assembles `gamma_coupling * mean_i [ -tau_gamma log Z^s_i ]`, the reduced/envelope form of
+  `sum_ij [ gamma_ij KL(s_i||Omega_tilde_ij s_j) + tau_g gamma_ij log(gamma_ij/pi^s_ij) ]`
+  (`Participatory_it_from_bit.tex` eq:pointwise_free_energy, 1241-1249; reduction eq:free_energy_reduced
+  1383-1397). The envelope identity `sum_j beta E + tau sum_j beta log(beta/pi) = -tau log Z` was
+  verified symbolically (sympy → 0). A from-scratch per-head reimplementation matched the model's loss
+  delta to 5.96e-8. `tau_gamma = kappa_gamma*sqrt(d_head)` confirmed.
+
+- **Energy orientation `E_s[i,j] = KL(s_i || Omega_ij s_j)`.** CHECKED, CORRECT, RIGOROUS. A
+  primitive-free K=2/N=2 hand-matmul confirmed the transported key is `Omega_ij @ s_j` (left action,
+  key index j) and FALSIFIED both `Omega_ij^T @ s_j` and `Omega_ji @ s_j`; the diagonal covariance is
+  the sandwich `diag(Omega_ij diag(sigma_j) Omega_ij^T)`. Independently re-pinned in the suite by
+  `test_gamma_energy_equals_analytic_kl_at_nonzero_phi` (analytic diagonal-Gaussian KL at nonzero phi,
+  Omega != I, formula-independent of transport_mean/covariance and of the renyi kernel).
+
+- **Detach / predictive inertness.** CHECKED, CORRECT, RIGOROUS. `Omega` built from
+  `out.phi.detach()`, so `autograd.grad(gamma_term, [phi_embed, mu_embed, sigma_log_embed])` returns
+  `None, None, None` (graph-level disconnection); grad reaches only the s tables. Forward logits/ce are
+  byte-identical to the gamma=0 path (`torch.equal`). A no-detach mutation probe makes the
+  phi-grad-equality test FAIL, proving the test discriminates.
+
+- **Byte-identity of pre-existing paths.** CHECKED, CORRECT, RIGOROUS. The PriorBank s/r gate split
+  (s on `lambda_h>0 OR gamma_coupling>0`, r on `lambda_h>0`) introduces no RNG reordering (s drawn
+  before r; r tables are RNG-free zeros/full). Pure-path RNG state identical; existing `lambda_h>0`
+  build draws byte-identical s and r. No `'s implies r'` dependency. The 3 new config fields are
+  default-safe.
+
+- **Manuscript-fidelity CONCERN (not a defect in what was built).** CHECKED. The implemented term is
+  the CORRECT model-coupling term with its own `s_i`, `pi^s` (`gamma_attention_prior`), and `tau_gamma`,
+  distinct from the belief beta block. The KNOWN, DOCUMENTED scope reductions are: (i) `s_i` is a static
+  per-token table, not the inferred field the manuscript varies (eq:envelope_gradient_model 1410-1419);
+  (ii) the detach severs the `phi<-gamma` coupling line 1420 keeps under a shared frame; (iii) `.mean()`
+  over (B,H,N) vs the canonical sum-over-ij (a free coupling scale); (iv) diagonal sandwich (belief-
+  family parity); (v) flat cocycle under regime_ii. The manuscript sets `gamma_ij=0` in its reported
+  sims (line 1296), so this is a buildout target, not a fidelity fix. Items (i)-(ii) ARE the deferred
+  s->q design — left for explicit design input, NOT built blind.
+
+## 2026-06-02 — s->q coupling (prior_source="model_channel", Realization A)
+
+Code: `vfe3/config.py` (prior_source field), `vfe3/model/prior_bank.py` (_prior_mu_table/
+_prior_sigma_log_table accessors + 5 rerouted prior reads), `vfe3/model/model.py` (wiring),
+`vfe3/train.py` (s/r optimizer groups). Tests: `tests/test_prior_source.py` (8). User-chosen design:
+REPLACE the belief prior with the model channel, p_i = s_i. Verified by a 5-lens adversarial workflow
+(4 returned; code-quality lens failed to emit structured output, self-assessed). Suite: 446 / 0 / 0.
+
+- **Reroute consistency (p_i = s_i everywhere).** CHECKED, CORRECT, RIGOROUS (CONFIRMED). A whole-tree
+  grep found exactly five prior-VALUE reads (encode + 4 decode kernels: diagonal/full/chunked/
+  reference), ALL routed through the single accessor pair; the E-step self-coupling, the M-step
+  self-coupling rebuild, the prior_handoff fold, and diagnostics() all consume the rerouted encode
+  output (no direct mu_embed read). Empirical directional checks on every path: perturbing mu_embed
+  leaves output invariant, perturbing s moves it.
+
+- **Byte-identity of the default 'token' path.** CHECKED, CORRECT, RIGOROUS (CONFIRMED). The accessor
+  returns the LITERAL same object (`_prior_mu_table() is mu_embed` -> True) on token, so the
+  catastrophic-cancellation-sensitive decode is byte-for-byte unchanged. RNG order preserved (s drawn
+  last, only when model channel active). Copy-equivalence (s := belief tables -> byte-identical) is a
+  genuine non-vacuous torch.equal oracle, now also pinned through the M-step self-coupling rebuild.
+
+- **Trainability.** CHECKED, CORRECT, RIGOROUS (CONFIRMED). The s tables (the LIVE prior under
+  model_channel) are grouped into the optimizer (mean@m_mu_lr, log-scale@m_sigma_lr); build_optimizer's
+  exact-coverage guard passes; loss decreases 2.996->2.418 over 20 steps. Dead mu_embed (grad None)
+  is skipped by AdamW. The hyper-prior centroid r (lambda_h>0) is FROZEN (requires_grad=False; user
+  decision): a fixed centroid per the manuscript's "higher, slower meta-level" (supp:1081); the coverage
+  guard now exempts non-trainable params, so build_optimizer works for lambda_h>0 (s grouped, frozen r
+  skipped), and the hyper-prior channel trains end-to-end (s trains, r fixed). Still ungrouped & RAISES
+  (PRE-EXISTING, genuinely trainable): log_alpha (alpha_mode='learnable') and connection_W
+  (transport_mode='regime_ii').
+
+- **Manuscript-fidelity CONCERN — same-scale vs cross-scale s->p (IMPORTANT, user decision).** CHECKED,
+  primary source READ. The realization p_i = s_i is the identity-conditional special case of the
+  SAME-SCALE hierarchical-Bayes prior in GL(K)_supplementary.tex:1083-1085 (p_i(k_i) = integral
+  p_i(k_i|m_i) s_i(m_i) dm_i) — mathematically faithful to THAT equation. BUT the main
+  Participatory_it_from_bit.tex:1440 makes p_i a CROSS-SCALE shadow (the meta-agent's belief q^(s+1)
+  transported down, eq:cross_scale_shadow) and states verbatim "s_i does not act through p_i at the
+  same scale" (there s_i is regulated only by its own hyper-prior r_i). So the two manuscripts carry
+  DIFFERENT s->p mechanisms; this increment realizes the supplementary's same-scale reading, which the
+  main manuscript's text contradicts. INITIAL CITATION WAS WRONG (attributed p_i(k_i|m_i) to
+  Participatory; it is in the supplementary, and Participatory says the opposite) — corrected in
+  config.py / test docstring, and the tension is now disclosed there. The cross-scale realization would
+  need a meta-agent/scale-(s+1) object that does not exist. NOT a code/math flaw; a documented
+  design-choice-in-a-theoretical-tension that the user (manuscript author) should adjudicate.
