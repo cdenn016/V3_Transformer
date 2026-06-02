@@ -7,6 +7,7 @@ from vfe3.numerics import (
     floor_eigenvalues,
     nan_inf_fraction,
     run_monitors,
+    safe_cholesky,
     safe_spd_inverse,
 )
 
@@ -51,6 +52,36 @@ def test_check_finite_warns_and_can_raise():
         assert check_finite(bad) is False
     with pytest.raises(FloatingPointError):
         check_finite(bad, raise_on_nonfinite=True)
+
+
+def test_safe_cholesky_factors_spd_byte_identical():
+    r"""On SPD inputs safe_cholesky's round-0 (zero added jitter) factor is byte-identical
+    to torch.linalg.cholesky, and the ok-mask is all-True."""
+    g = torch.Generator().manual_seed(5)
+    A = torch.randn(3, 4, 4, generator=g)
+    M = A @ A.transpose(-1, -2) + torch.eye(4)              # SPD, well-conditioned
+    L, ok = safe_cholesky(M)
+    assert ok.all()
+    assert torch.equal(L, torch.linalg.cholesky(M))         # byte-identical, not approx
+
+
+def test_safe_cholesky_indefinite_marks_failed_no_raise():
+    r"""An indefinite matrix yields ok=False for that element WITHOUT raising."""
+    bad = torch.diag(torch.tensor([1.0, -1.0]))             # indefinite
+    L, ok = safe_cholesky(bad)                              # must not raise
+    assert ok.item() is False
+
+
+def test_safe_cholesky_mixed_batch_isolates_failure():
+    r"""In a mixed batch the failed (indefinite) element is masked while the good
+    element keeps the exact factor it would get alone."""
+    good = torch.eye(3)
+    bad = torch.diag(torch.tensor([1.0, -2.0, 1.0]))
+    M = torch.stack([good, bad])
+    L, ok = safe_cholesky(M)                               # must not raise
+    assert ok[0].item() is True
+    assert ok[1].item() is False
+    assert torch.equal(L[0], torch.linalg.cholesky(good))  # good element unperturbed
 
 
 def test_run_monitors_record():

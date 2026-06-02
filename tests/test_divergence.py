@@ -142,6 +142,111 @@ def test_alpha_nonpositive_raises(bad_alpha):
         renyi(DiagonalGaussian(mu, sigma), DiagonalGaussian(mu, sigma), alpha=bad_alpha)
 
 
+# ---------------------------------------------------------------------------
+# Full-covariance Renyi at alpha > 1 must be NON-RAISING and per-element robust.
+# At alpha > 1 the blend (1-alpha)Sigma_q + alpha*Sigma_t is NOT convex and can be
+# indefinite for some (i,j) pairs; a single non-PD blend used to make the WHOLE
+# batched torch.linalg.cholesky RAISE (LinAlgError). The hardened path uses
+# cholesky_ex + an info-driven mask so a bad pair maps to kl_max (via safe_kl_clamp)
+# while good pairs in the SAME batch keep their finite divergence.
+# ---------------------------------------------------------------------------
+
+
+def test_full_renyi_alpha_gt_one_mixed_batch_no_raise():
+    r"""Mixed batch at alpha=1.5: one indefinite-blend pair, one fine pair.
+
+    Desired (pinned) behavior: NO exception; the bad pair == kl_max; the good pair
+    finite and equal to its value computed in isolation. (RED against the old code,
+    which raised LinAlgError for the whole batched call.)"""
+    import warnings
+
+    from vfe3.divergence import renyi
+    from vfe3.families.gaussian import FullGaussian
+
+    K = 3
+    eye = torch.eye(K)
+    # pair 0 (GOOD): well-separated SPD covariances; blend stays PD at alpha=1.5.
+    sig_q_good = eye.clone()
+    sig_t_good = 2.0 * eye
+    # pair 1 (BAD): Sigma_q huge, Sigma_t tiny -> (1-1.5)Sigma_q + 1.5 Sigma_t indefinite.
+    sig_q_bad = 100.0 * eye
+    sig_t_bad = 0.01 * eye
+    sigma_q = torch.stack([sig_q_good, sig_q_bad])
+    sigma_t = torch.stack([sig_t_good, sig_t_bad])
+    mu = torch.zeros(2, K)
+    q = FullGaussian(mu, sigma_q)
+    t = FullGaussian(mu, sigma_t)
+
+    kl_max = 100.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                     # alpha>1 warning is expected
+        out = renyi(q, t, alpha=1.5, kl_max=kl_max)         # must NOT raise
+        # good pair computed in ISOLATION (single-element batch) must match in-batch value
+        good_alone = renyi(
+            FullGaussian(mu[:1], sig_q_good.unsqueeze(0)),
+            FullGaussian(mu[:1], sig_t_good.unsqueeze(0)),
+            alpha=1.5,
+            kl_max=kl_max,
+        )
+
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out[0], good_alone[0], atol=1e-6)  # good survives, unperturbed
+    assert out[0] < kl_max                                   # good is a genuine finite divergence
+    assert out[1] == kl_max                                  # bad masked to kl_max
+
+
+def test_full_renyi_alpha_gt_one_mixed_batch_custom_kl_max():
+    r"""Same mixed batch, but a non-default kl_max: bad pair maps to the PASSED kl_max."""
+    import warnings
+
+    from vfe3.divergence import renyi
+    from vfe3.families.gaussian import FullGaussian
+
+    K = 3
+    eye = torch.eye(K)
+    sigma_q = torch.stack([eye.clone(), 100.0 * eye])
+    sigma_t = torch.stack([2.0 * eye, 0.01 * eye])
+    mu = torch.zeros(2, K)
+    q = FullGaussian(mu, sigma_q)
+    t = FullGaussian(mu, sigma_t)
+
+    kl_max = 37.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = renyi(q, t, alpha=1.5, kl_max=kl_max)
+
+    assert torch.isfinite(out).all()
+    assert out[1] == kl_max
+    assert out[0] < kl_max
+
+
+def test_full_renyi_alpha_gt_one_all_good_batch_finite():
+    r"""All-good batch at alpha>1 (equal Sigma_q==Sigma_t so blend==Sigma, PD for any
+    alpha): every pair is finite and below kl_max -- no spurious masking."""
+    import warnings
+
+    from vfe3.divergence import renyi
+    from vfe3.families.gaussian import FullGaussian
+
+    g = torch.Generator().manual_seed(31)
+    K = 4
+    mu_q = torch.randn(5, K, generator=g)
+    mu_t = torch.randn(5, K, generator=g)
+    A = torch.randn(5, K, K, generator=g)
+    sigma = A @ A.transpose(-1, -2) + torch.eye(K)
+    q = FullGaussian(mu_q, sigma)
+    t = FullGaussian(mu_t, sigma)                            # same Sigma -> blend == Sigma (PD)
+
+    kl_max = 100.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = renyi(q, t, alpha=1.5, kl_max=kl_max)
+
+    assert torch.isfinite(out).all()
+    assert (out < kl_max).all()                             # no spurious masking
+    assert (out >= 0.0).all()
+
+
 def test_diagonal_kl_matches_torch_distributions():
     # Independent reference: PyTorch's own Normal KL (summed over dims).
     from torch.distributions import Normal, kl_divergence

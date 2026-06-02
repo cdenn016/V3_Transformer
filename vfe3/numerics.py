@@ -12,7 +12,7 @@ A theoretically pure path is always available (the unregularized op); the fallba
 guards that activate only when the pure path fails, and they are documented as such.
 """
 
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -20,6 +20,44 @@ import torch
 def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
     """Average a matrix with its transpose (kills asymmetric round-off)."""
     return 0.5 * (matrix + matrix.transpose(-1, -2))
+
+
+def safe_cholesky(
+    matrix: torch.Tensor,                # (..., K, K) symmetric ~PD (per-element factored)
+
+    *,
+    eps:    float = 1e-6,
+    rounds: int   = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:  # (factor (..., K, K), ok mask (...))
+    r"""Per-element Cholesky that never raises, with optional per-element jitter escalation.
+
+    Uses ``torch.linalg.cholesky_ex`` (returns a per-batch-element ``info``, does NOT raise)
+    so that a single non-PD element cannot kill the whole batched call. Round 0 adds ZERO
+    extra jitter, so on already-SPD inputs the returned factor is byte-identical to
+    ``torch.linalg.cholesky`` (the pure path). Elements that fail (``info != 0``) are retried
+    with an escalating ridge ``eps * 10^t`` for t = 0..rounds-1, applied ONLY to the failed
+    elements so good elements keep their round-0 factor unperturbed.
+
+    Returns the factor ``L`` together with a boolean ``ok`` mask (True where a PD factor was
+    obtained). Callers MUST drive masking off ``ok`` (not finiteness): on failure ``cholesky_ex``
+    returns a finite *partial* factor, not NaN, so a downstream ``logdet`` would otherwise be a
+    finite-but-wrong value rather than NaN. The mask lets the caller inject NaN for failed
+    elements so a ``safe_kl_clamp`` maps them to ``kl_max``.
+    """
+    M = _symmetrize(matrix)
+    L, info = torch.linalg.cholesky_ex(M)
+    ok = info == 0
+    if rounds > 0 and not bool(ok.all()):
+        K = M.shape[-1]
+        eye = torch.eye(K, device=M.device, dtype=M.dtype)
+        for t in range(rounds):
+            if bool(ok.all()):
+                break
+            L_t, info_t = torch.linalg.cholesky_ex(M + (eps * (10.0 ** t)) * eye)
+            newly = (~ok) & (info_t == 0)
+            L = torch.where(newly.unsqueeze(-1).unsqueeze(-1), L_t, L)
+            ok = ok | (info_t == 0)
+    return L, ok
 
 
 def safe_spd_inverse(

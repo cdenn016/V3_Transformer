@@ -12,7 +12,7 @@ from typing import List, Optional, Tuple
 _VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
-_VALID_DECODE_MODES        = ("diagonal", "full")
+_VALID_DECODE_MODES        = ("diagonal", "diagonal_chunked", "full")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_per_coord", "learnable")
 _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback")
@@ -128,6 +128,11 @@ class VFE3Config:
     use_prior_bank:            bool  = True
     decode_tau:                float = 1.0
     decode_mode:               str   = "diagonal"
+    # decode_chunk_size: vocabulary-chunk width V is iterated over by the fused
+    # decode_mode='diagonal_chunked' CE path (the training-path memory win that never
+    # materializes the (B,N,V) logit tensor). Ignored by every other decode_mode. Default
+    # 8192; validated positive.
+    decode_chunk_size:         int   = 8192
     encode_mode:               str   = "per_token"
 
     # cross-block belief handoff (mu_q -> mu_p)
@@ -169,6 +174,20 @@ class VFE3Config:
     eval_interval:             int   = 0            # periodic validation every N steps (0 = off)
     checkpoint_interval:       int   = 0            # save a resumable checkpoint every N steps (0 = off)
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
+    # Opt-in mixed precision for CUDA throughput (RTX 5090). None (default) = OFF = the pure fp32
+    # path: NO autocast context is entered anywhere in the forward, so the loss/logits are
+    # byte-identical to the no-AMP build. 'bf16' / 'fp16' wrap the E-step / belief pipeline in
+    # torch.autocast. The cancellation-sensitive decode matmul (_decode_diagonal) AND the
+    # cross-entropy stay fp32 even when AMP is on (their inputs are .float()-ed and they run under
+    # an autocast(enabled=False) island), as do the existing matrix_exp / SPD-retraction islands
+    # (transport.py / retraction.py). TF32 is intentionally NOT used here: its 10-bit mantissa
+    # worsens the decode's catastrophic cancellation and breaks the atol-1e-3 decode pin (see
+    # docs/perf/2026-05-31-speedup-opportunities.md, "Rejected: global TF32"); bf16/fp16 autocast
+    # is the safe alternative precisely because those sensitive ops opt out. bf16 needs no
+    # GradScaler and is the recommended default for the 5090; fp16 TRAINING would need a GradScaler
+    # in the M-step (train.py) -- a deferred follow-up (this toggle is forward/inference-correctness
+    # scope).
+    amp_dtype:                 Optional[str] = None
 
     def __post_init__(self) -> None:
         # numerics
@@ -356,6 +375,8 @@ class VFE3Config:
         if self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be positive, got {self.decode_tau}")
         _require(self.decode_mode, _VALID_DECODE_MODES, "decode_mode")
+        if self.decode_chunk_size < 1:
+            raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
         _require(self.encode_mode, _VALID_ENCODE_MODES, "encode_mode")
         # use_prior_bank is the SINGLE decode gate. True (default, pure path): the KL-to-prior
         # readout logits = -KL(q_i || pi_v)/tau_eff over the gauge-orbit prior bank, with the
@@ -411,6 +432,9 @@ class VFE3Config:
             raise ValueError(f"checkpoint_interval must be >= 0, got {self.checkpoint_interval}")
         if self.eval_max_batches is not None and self.eval_max_batches < 1:
             raise ValueError(f"eval_max_batches must be >= 1 if set, got {self.eval_max_batches}")
+        # amp_dtype: None (default, OFF) = pure fp32 / no autocast; 'bf16' / 'fp16' enable autocast.
+        # None is a legal member here, so _require rejects 'fp32' and any other garbage.
+        _require(self.amp_dtype, (None, "bf16", "fp16"), "amp_dtype")
 
     @property
     def tau(self) -> float:

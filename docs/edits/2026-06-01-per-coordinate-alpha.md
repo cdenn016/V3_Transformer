@@ -1193,3 +1193,169 @@ container-has-no-dense-Omega), `tests/test_perf_equivalence.py` (+5 guard correc
 tied_block_glk fuse; glk / so_k single-block, regime_ii, and cross-coupled block_glk stay dense). Full
 suite after the change: `tests=387 failures=0 errors=0 skipped=0` (read from junitxml; 378 baseline +
 9 new = 4 + 5; 386 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
+
+## Opt-in mixed precision (`amp_dtype`), default-OFF — 2026-06-02
+
+Added an opt-in bf16/fp16 autocast path for CUDA throughput on the RTX 5090. The pure fp32 path
+stays the default and is byte-identical to the no-AMP build: when the toggle is off, NO autocast
+context is ever instantiated in the forward.
+
+### The toggle
+
+`cfg.amp_dtype: Optional[str] = None` (config.py). `None` (default) = OFF = pure fp32, no autocast.
+`"bf16"` / `"fp16"` enable `torch.autocast` over the E-step / belief pipeline. Validated by
+`_require(self.amp_dtype, (None, "bf16", "fp16"), "amp_dtype")` — `None` is a legal member, so the
+single guard rejects `"fp32"` and any other string (there is no `"fp32"` member: fp32 is
+`amp_dtype=None`, not a precision value). TF32 is intentionally NOT used here: its 10-bit mantissa
+worsens the decode's catastrophic cancellation and would break the atol-1e-3 decode pin (perf doc
+"Rejected: global TF32"); bf16/fp16 autocast is the safe alternative precisely because the
+sensitive ops already opt out of autocast.
+
+### The fp32 islands (existing + the decode/CE added)
+
+The existing `torch.amp.autocast('cuda', enabled=False)` islands around `matrix_exp` (transport.py)
+and the SPD retractions (retraction.py) are UNCHANGED. Added to the fp32-island set: the decode
+matmul (`prior_bank.decode` / `_decode_diagonal`) AND the cross-entropy. In `model.forward` both are
+wrapped in `torch.autocast(device_type=..., enabled=False)` (via `_amp_off_context`) AND — the
+load-bearing guard — their inputs are explicitly `.float()`-ed (`decode(mu_final.float(),
+sigma_final.float())`, `logits.reshape(...).float()` before `F.cross_entropy`). The `enabled=False`
+context alone does NOT upcast a tensor that already arrived bf16 from the autocast E-step (it only
+blocks FURTHER downcasting); the `.float()` is what makes the fp32 guarantee unconditional, mirroring
+retraction.py's in-island `sigma = sigma.float()`. On the default fp32 path `.float()` is a
+value-identical no-op (confirmed by execution: at the default diagonal config the belief pipeline
+already exits fp32, because the SPD islands upcast — so the guard is defensive there and load-bearing
+only on a path that lets the mean exit bf16).
+
+### Default-off byte-identity and device gating
+
+Both autocast contexts (`_amp_context` for the E-step enable wrapper, `_amp_off_context` for the
+decode/CE disable island) return `contextlib.nullcontext()` when `amp_dtype is None`, so the default
+path enters zero autocast objects — byte-identical to the no-AMP build. The enable wrapper resolves
+`device_type` from the runtime tensors (`token_ids.device.type`), not a hardcoded `'cuda'`, so the
+path is genuinely exercised on the CPU box (a hardcoded-cuda autocast is inert on CPU tensors). The
+broader byte-identity oracle is the full suite: every existing test runs `amp_dtype=None` and stays
+green.
+
+### bf16 vs fp16
+
+bf16 needs no GradScaler and is the recommended/safe default for the 5090. fp16 TRAINING would need a
+GradScaler in the M-step (`train.py`) for stable gradients; this toggle is forward/inference-
+correctness scope, so no GradScaler was added — fp16 M-step GradScaler support is a documented
+follow-up.
+
+### Files + tests
+
+`vfe3/config.py`: `amp_dtype` field + one-line validation. `vfe3/model/model.py`: `_amp_context` /
+`_amp_off_context` helpers, the E-step `with run, amp:` wrap, and the decode/CE fp32 island with
+`.float()`-ed inputs. `prior_bank.py` was NOT touched — the call-site wrap in `model.forward` keeps
+decode dtype-agnostic (the island lives at the call site, not inside the kernel). Tests:
+`tests/test_amp.py` (new, +6: `test_default_off_enters_no_autocast_context` via a `torch.autocast`
+tripwire; `test_default_off_forward_is_deterministic_and_finite`; `test_bf16_forward_runs_and_is_finite`
+with a relaxed allclose, since CPU bf16 autocast is real casting, not a no-op;
+`test_fp16_forward_runs_and_is_finite`; `test_decode_and_ce_stay_fp32_under_bf16` spying the decode
+input/output dtypes; `test_bf16_backward_reaches_prior_tables`), `tests/test_config.py` (+1:
+`test_config_amp_dtype_default_none_and_validated`). RED confirmed against pre-change source (all 7
+failed: TypeError on the unknown kwarg / AttributeError on the missing field), then GREEN. Full suite
+after the change: `tests=394 failures=0 errors=0 skipped=0` (read from junitxml; 387 baseline + 7 new;
+393 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
+
+## Fused chunked-vocab decode+CE (`decode_mode="diagonal_chunked"`, 2026-06-02)
+
+The `(B, N, V=50257)` logit tensor (~412 MB forward + its backward, flagged in
+`docs/perf/2026-05-31-speedup-opportunities.md` as the re-emerging top GPU cost once the serial
+E-step loop is gone) is now avoidable on the TRAINING path. `decode_mode="diagonal_chunked"` (new
+registry member, default stays `"diagonal"`) routes `model.forward`, when targets are given and
+`use_prior_bank=True`, through a FUSED decode+CE that iterates the vocabulary in `decode_chunk_size`
+chunks (new config field, default 8192, validated `>= 1`) and never materializes the full logits.
+
+`PriorBank.decode_ce_diagonal_chunked(mu_q, sigma_q, targets)` reproduces `_decode_diagonal`'s
+closed form per chunk, INCLUDING the same global centering offset `c = mean_v(mu_v)` that tames the
+Mahalanobis catastrophic cancellation. The offset is a per-coordinate `(1, K)` mean over ALL V,
+computed in one up-front `O(V*K)` pass with no big tensor, so it is identical to the full path (the
+closed form is offset-invariant: `(mu_q - c) - (mu_v - c) == mu_q - mu_v`). Per position the
+cross-entropy is `logsumexp_v(logit_v) - logit_target` (the standard -log-softmax at the target),
+meaned over non-ignored positions. The all-ignore microbatch emits the same finite grad-connected
+zero (`ce_per_pos.sum() * 0.0`) as the full path; ignored positions (target `-100 < 0 <= v0`) never
+fall in a chunk window, so their gathered target logit stays 0 and the `valid` mask excludes them.
+
+The memory win required moving the V-axis reduction INSIDE a gradient-checkpointed per-chunk
+function (`torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`). A naive streaming loop
+saves nothing in training: the `(B, N, Vc)` chunk logits returned to an outside `logsumexp`/`exp`/
+`gather` are retained by autograd for those ops' backward, so all `V/chunk` chunks stay alive and
+peak stays `(B, N, V)`. The checkpointed function therefore returns only the two `(B, N)` per-chunk
+summaries (`logsumexp` over the chunk + the gathered target contribution); the `(B, N, Vc)` logit is
+born and dies inside, recomputed deterministically in backward. Verified via
+`torch.autograd.graph.saved_tensors_hooks`: with `chunk < V` NO retained tensor is `B*N*chunk`-sized
+(max retained is the `V*K` prior table, shared with the full path), confirming the chunk logits are
+freed. The per-chunk LSEs are then combined with `torch.logsumexp(torch.stack(...), 0)` (a
+`(n_chunks, B, N)` stack, negligible).
+
+EQUIVALENCE-GATED at the cancellation-sensitive decode's atol-1e-3: chunked CE equals the
+`decode`->`F.cross_entropy` full path to `|diff| ~ 5e-7` across chunk sizes (evenly dividing,
+non-dividing 7/11/13, and `chunk >= V` single-chunk), and `loss.backward()` gives prior-table grads
+allclose at ~`1e-9`. Inference (`targets=None`): `decode_mode="diagonal_chunked"` registers a decode
+kernel that delegates to `_decode_diagonal`, so the materialized logits are byte-identical to
+`"diagonal"` (sampling/generation need full logits; the memory win is training-only). On the fused
+branch `forward` returns `logits=None` (forming them would defeat the purpose; `train.py`/eval
+discard the returned logits via `_, loss, ce`).
+
+### Files + tests
+
+`vfe3/config.py`: `diagonal_chunked` added to `_VALID_DECODE_MODES`, `decode_chunk_size` field +
+positive validation. `vfe3/model/prior_bank.py`: `decode_ce_diagonal_chunked` method (checkpointed
+per-chunk reduction), the `diagonal_chunked` decode-kernel registration (delegates to
+`_decode_diagonal` for inference logits), `decode_chunk_size` threaded into `PriorBank.__init__`;
+`_decode_diagonal` and the existing `decode()` path are UNTOUCHED (new code only -> default
+byte-identity is trivially safe). `vfe3/model/model.py`: the fused branch in `forward` (the original
+decode/CE block moved verbatim into the `else`, so the `diagonal` default is byte-identical) +
+`decode_chunk_size` forwarded to the `PriorBank`. Tests: `tests/test_chunked_decode.py` (new, +6:
+`test_chunked_ce_matches_full_ce_multiple_chunk_sizes`, `test_chunked_ce_honors_ignore_index`,
+`test_chunked_ce_all_ignore_is_finite_zero`, `test_chunked_ce_grad_matches_full`,
+`test_chunked_forward_loss_matches_diagonal_forward_loss`,
+`test_chunked_inference_targets_none_returns_full_logits`), `tests/test_config.py` (+1:
+`test_config_accepts_diagonal_chunked_decode_and_validates_chunk_size`). RED confirmed (7 failed:
+TypeError/AttributeError on the unknown kwarg/missing field), then GREEN. Full suite after the
+change: `tests=401 failures=0 errors=0 skipped=0` (read from junitxml; 394 baseline + 7 new; 400
+passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
+
+## 2026-06-02 — Harden full-cov Renyi at alpha > 1 (non-raising cholesky_ex)
+
+Branch: vfe3-roadmap-overnight-2026-06-02.
+
+Current behavior found (characterization). `FullGaussian.renyi_closed_form` at `alpha > 1`
+forms `sigma_blend = (1-alpha)*sigma_q_reg + alpha*sigma_t_reg` — NOT a convex combination,
+so the blend can be indefinite — then calls `torch.linalg.cholesky`. A single non-PD blend
+in a batched call RAISED `torch._C._LinAlgError` for the WHOLE batch (verified: a mixed
+batch with one indefinite-blend pair and one fine pair raised; it did not return NaN or
+kl_max). The bug was a hard raise, not a silent NaN.
+
+Fix. Added `safe_cholesky(matrix, *, eps, rounds)` to `vfe3/numerics.py` (the single home;
+de-orphans part of numerics.py). It uses `torch.linalg.cholesky_ex` (per-element `info`,
+never raises): round 0 adds ZERO extra jitter (byte-identical to `torch.linalg.cholesky` on
+SPD inputs), then retries only the failed elements with an escalating `eps*10^t` ridge for
+t = 0..rounds-1, returning the factor plus a boolean `ok` mask. The mask is driven off
+`info`, not finiteness, because `cholesky_ex` returns a finite PARTIAL factor (not NaN) on a
+failed element. `families/gaussian.py` imports `safe_cholesky` and, in the `alpha != 1`
+else-branch only, replaces the three `torch.linalg.cholesky` calls (blend, q, t) with it
+(rounds=5), unions the masks, and sets `div = NaN` for any element whose factor failed — so
+`safe_kl_clamp` maps it to `kl_max`. The `alpha == 1` if-branch and the diagonal family are
+untouched.
+
+Result. Bad (indefinite-blend) pairs mask to `kl_max` while GOOD pairs in the same batch
+keep their finite divergence, with NO exception. The `alpha <= 1` / valid-SPD path is
+byte-identical (round-0 zero jitter; verified `cholesky_ex == cholesky` bit-for-bit on SPD,
+and the existing torch.distributions full-KL parity + full-Hellinger tests stay green
+unchanged).
+
+Tests (RED then GREEN). `tests/test_divergence.py` (+3):
+`test_full_renyi_alpha_gt_one_mixed_batch_no_raise` (no exception; bad == kl_max; good
+finite and == its isolated value), `test_full_renyi_alpha_gt_one_mixed_batch_custom_kl_max`
+(bad maps to a passed kl_max=37), `test_full_renyi_alpha_gt_one_all_good_batch_finite`
+(equal Sigma_q==Sigma_t blend stays PD -> all finite, no spurious masking).
+`tests/test_numerics.py` (+3): `test_safe_cholesky_factors_spd_byte_identical`,
+`test_safe_cholesky_indefinite_marks_failed_no_raise`,
+`test_safe_cholesky_mixed_batch_isolates_failure`. RED confirmed first (the two mixed-batch
+divergence tests raised `_LinAlgError`; test_numerics raised ImportError on `safe_cholesky`),
+then GREEN. Full suite after the change: `tests=407 failures=0 errors=0 skipped=0` (read
+from junitxml; 401 baseline + 6 new; 406 passed + 1 xpassed pre-existing; all 8 viz tests
+collected normally).
