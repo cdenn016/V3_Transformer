@@ -13,6 +13,7 @@ import torch
 from vfe3.families.base import (
     BeliefParams, register_family, safe_kl_clamp, _logdet_chol,
 )
+from vfe3.numerics import safe_cholesky
 
 
 @register_family("gaussian_diagonal")
@@ -219,19 +220,29 @@ class FullGaussian(BeliefParams):
             logdet_q = _logdet_chol(torch.linalg.cholesky(sigma_q_reg))
             div = 0.5 * (trace_term + mahal_term - K + logdet_p - logdet_q)
         else:
+            # alpha > 1 leaves the convex regime: the blend can be indefinite for some
+            # (i,j) pairs. safe_cholesky factors per element (cholesky_ex, never raises),
+            # tries an escalating eps ridge on failures, and returns an `ok` mask; a pair
+            # that fails ALL rounds is set to NaN so safe_kl_clamp maps it to kl_max while
+            # good pairs in the same batch keep their finite divergence. Round 0 adds zero
+            # extra jitter, so valid-SPD inputs stay byte-identical to torch.linalg.cholesky.
             sigma_blend = (1.0 - alpha) * sigma_q_reg + alpha * sigma_t_reg
             sigma_blend = 0.5 * (sigma_blend + sigma_blend.transpose(-1, -2))
-            L_blend = torch.linalg.cholesky(sigma_blend)
+            L_blend, ok_blend = safe_cholesky(sigma_blend, eps=eps, rounds=5)
+            L_q, ok_q = safe_cholesky(sigma_q_reg, eps=eps, rounds=5)
+            L_t, ok_t = safe_cholesky(sigma_t_reg, eps=eps, rounds=5)
             delta_mu = mu_t - mu_q
             v = torch.linalg.solve_triangular(
                 L_blend, delta_mu.unsqueeze(-1), upper=False
             ).squeeze(-1)
             mahal_term = alpha * (v ** 2).sum(dim=-1)
-            logdet_q = _logdet_chol(torch.linalg.cholesky(sigma_q_reg))
-            logdet_t = _logdet_chol(torch.linalg.cholesky(sigma_t_reg))
+            logdet_q = _logdet_chol(L_q)
+            logdet_t = _logdet_chol(L_t)
             logdet_blend = _logdet_chol(L_blend)
             logdet_term = (
                 (1.0 - alpha) * logdet_q + alpha * logdet_t - logdet_blend
             ) / (alpha - 1.0)
             div = 0.5 * (mahal_term + logdet_term)
+            ok = ok_blend & ok_q & ok_t            # any failed factor -> NaN -> kl_max
+            div = torch.where(ok, div, div.new_tensor(float("nan")))
         return safe_kl_clamp(div, kl_max=kl_max)

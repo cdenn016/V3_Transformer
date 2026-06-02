@@ -1317,3 +1317,45 @@ decode/CE block moved verbatim into the `else`, so the `diagonal` default is byt
 TypeError/AttributeError on the unknown kwarg/missing field), then GREEN. Full suite after the
 change: `tests=401 failures=0 errors=0 skipped=0` (read from junitxml; 394 baseline + 7 new; 400
 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
+
+## 2026-06-02 — Harden full-cov Renyi at alpha > 1 (non-raising cholesky_ex)
+
+Branch: vfe3-roadmap-overnight-2026-06-02.
+
+Current behavior found (characterization). `FullGaussian.renyi_closed_form` at `alpha > 1`
+forms `sigma_blend = (1-alpha)*sigma_q_reg + alpha*sigma_t_reg` — NOT a convex combination,
+so the blend can be indefinite — then calls `torch.linalg.cholesky`. A single non-PD blend
+in a batched call RAISED `torch._C._LinAlgError` for the WHOLE batch (verified: a mixed
+batch with one indefinite-blend pair and one fine pair raised; it did not return NaN or
+kl_max). The bug was a hard raise, not a silent NaN.
+
+Fix. Added `safe_cholesky(matrix, *, eps, rounds)` to `vfe3/numerics.py` (the single home;
+de-orphans part of numerics.py). It uses `torch.linalg.cholesky_ex` (per-element `info`,
+never raises): round 0 adds ZERO extra jitter (byte-identical to `torch.linalg.cholesky` on
+SPD inputs), then retries only the failed elements with an escalating `eps*10^t` ridge for
+t = 0..rounds-1, returning the factor plus a boolean `ok` mask. The mask is driven off
+`info`, not finiteness, because `cholesky_ex` returns a finite PARTIAL factor (not NaN) on a
+failed element. `families/gaussian.py` imports `safe_cholesky` and, in the `alpha != 1`
+else-branch only, replaces the three `torch.linalg.cholesky` calls (blend, q, t) with it
+(rounds=5), unions the masks, and sets `div = NaN` for any element whose factor failed — so
+`safe_kl_clamp` maps it to `kl_max`. The `alpha == 1` if-branch and the diagonal family are
+untouched.
+
+Result. Bad (indefinite-blend) pairs mask to `kl_max` while GOOD pairs in the same batch
+keep their finite divergence, with NO exception. The `alpha <= 1` / valid-SPD path is
+byte-identical (round-0 zero jitter; verified `cholesky_ex == cholesky` bit-for-bit on SPD,
+and the existing torch.distributions full-KL parity + full-Hellinger tests stay green
+unchanged).
+
+Tests (RED then GREEN). `tests/test_divergence.py` (+3):
+`test_full_renyi_alpha_gt_one_mixed_batch_no_raise` (no exception; bad == kl_max; good
+finite and == its isolated value), `test_full_renyi_alpha_gt_one_mixed_batch_custom_kl_max`
+(bad maps to a passed kl_max=37), `test_full_renyi_alpha_gt_one_all_good_batch_finite`
+(equal Sigma_q==Sigma_t blend stays PD -> all finite, no spurious masking).
+`tests/test_numerics.py` (+3): `test_safe_cholesky_factors_spd_byte_identical`,
+`test_safe_cholesky_indefinite_marks_failed_no_raise`,
+`test_safe_cholesky_mixed_batch_isolates_failure`. RED confirmed first (the two mixed-batch
+divergence tests raised `_LinAlgError`; test_numerics raised ImportError on `safe_cholesky`),
+then GREEN. Full suite after the change: `tests=407 failures=0 errors=0 skipped=0` (read
+from junitxml; 401 baseline + 6 new; 406 passed + 1 xpassed pre-existing; all 8 viz tests
+collected normally).
