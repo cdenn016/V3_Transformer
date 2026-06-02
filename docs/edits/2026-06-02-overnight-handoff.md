@@ -366,3 +366,42 @@ Files touched: `vfe3/model/model.py` (attention_maps + the `vfe_block` import), 
 (plot_attention_grid + registry), `vfe3/run_artifacts.py` (save_attention_maps), `vfe3/train.py`
 (sample-text args + block, attention-save wire-in), `vfe3/data/datasets.py` (get_tiktoken_decoder). Tests
 added across `test_model.py`, `test_viz.py`, `test_run_artifacts.py`, `test_train.py`, `test_data.py`.
+
+## Attention-plot follow-up (afternoon edit, same branch)
+
+The first-pass attention figure was a single `attention/step_<N>.png` grid of `beta_ij` on a LINEAR
+`[0, 1]` colour scale. On a real run (`K20_block_glk_linear_mix`, `N=128`) that buried everything but the
+self-attention diagonal: the dominant near-diagonal entries saturate the scale, so the entire off-diagonal
+lower triangle reads as black and no structure is legible. Three changes fix it, all driven by the user's
+request ("use log beta, each head/layer its own image, provide the text"):
+
+1. **Log scale.** New `figures.plot_attention_map(beta, *, floor=-6.0, ...)` renders a single map as
+   `log10(beta)` (registered as `"attention_map"`). Because `beta` is a softmax row distribution,
+   `beta in (0, 1]` and `log10(beta) <= 0`, so the colour range is PINNED to `[floor, 0]` rather than
+   data-driven. The fixed range is not just cosmetic: it keeps every per-(layer, head) image on ONE scale,
+   so a sharp head and a diffuse head stay visually comparable (the old grid had this via a shared `vmax`;
+   independent per-image scaling would have silently destroyed it). Causally-masked keys (`beta == 0`,
+   upper triangle) map to NaN and render grey via `cmap.set_bad`, distinct from low-but-present attention;
+   active cells below `floor` clip to `floor`. Verified by rendering a synthetic dominant-diagonal causal
+   softmax and inspecting the PNG: the backward exponential-decay gradient and the masked grey triangle are
+   both clearly visible where the linear version showed only the diagonal. `plot_attention_grid` is kept
+   (still registered/tested) but is no longer used by the save path.
+
+2. **One image per (layer, head).** `RunArtifacts.save_attention_maps` now writes
+   `attention/step_<N>/layer<li>_head<hi>.png` (one PNG per layer/head, each via `plot_attention_map`)
+   instead of a single grid file, and closes every figure so `~evals x L x H` renders do not leak.
+
+3. **Text provided.** `save_attention_maps` gained `token_ids` and `decode` parameters; when a decoder is
+   present it writes `attention/step_<N>/tokens.txt` (full decoded seq-0 text plus a per-index token list),
+   so a query/key index reads back to its word. `train()` passes `tokens[0]` and a `resolved_decode`
+   (the sample decoder resolved regardless of `generate_samples`, since the text only labels the maps — a
+   deliberate, cheap broadening of the opt-in artifacts path; the synthetic anchor / absent-tiktoken case
+   yields `None` and no `tokens.txt`).
+
+Tests: `test_viz.py::test_plot_attention_map_log_scale_masks_causal` (log render + exact-zero masked cells),
+`test_run_artifacts.py::test_train_with_artifacts_writes_attention_pngs` (rewritten to assert the per-
+(layer, head) files, count globbed against `attention_maps(...).shape[:2]` rather than hardcoded so it does
+not assume `H == n_heads`), and `test_run_artifacts.py::test_save_attention_maps_writes_token_text`. Targeted
+suite (`test_viz` + `test_run_artifacts` + `test_train`): 37 passed (1 xpassed), 0 failures, read from
+`--junitxml` (`tests=37 failures=0 errors=0`). Files touched: `vfe3/viz/figures.py`,
+`vfe3/run_artifacts.py`, `vfe3/train.py`, `tests/test_viz.py`, `tests/test_run_artifacts.py`.

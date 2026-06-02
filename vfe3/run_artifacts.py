@@ -27,7 +27,7 @@ import logging
 from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 import torch
 
@@ -97,26 +97,42 @@ class RunArtifacts:
 
     def save_attention_maps(
         self,
-        step:   int,
-        maps:   torch.Tensor,                 # (L, H, N, N) per-layer per-head attention
-        logger: Optional[logging.Logger] = None,
+        step:      int,
+        maps:      torch.Tensor,                 # (L, H, N, N) per-layer per-head attention beta_ij
+        token_ids: Optional[torch.Tensor] = None,                       # (N,) seq-0 ids the maps cover
+        decode:    Optional[Callable[[Sequence[int]], str]] = None,     # ids -> text for tokens.txt
+        logger:    Optional[logging.Logger] = None,
     ) -> Optional[Path]:
-        r"""Best-effort per-layer/per-head attention heatmap grid for one periodic eval.
+        r"""Best-effort per-layer/per-head log-scale attention heatmaps for one periodic eval.
 
-        Writes ``attention/step_<N>.png`` (an L x H grid of beta heatmaps; see
-        :func:`vfe3.viz.figures.plot_attention_grid`). Mirrors ``_save_figures``: a plotting or
-        dependency error is logged and swallowed (never fatal to the run), and the figure is
-        closed so ~30 evals do not leak figures. Returns the path written, or None on failure.
+        Writes one PNG per (layer, head) into ``attention/step_<N>/layer<li>_head<hi>.png`` (log10
+        beta; see :func:`vfe3.viz.figures.plot_attention_map`), so each head/layer is its own image
+        on a shared ``[floor, 0]`` colour scale. When a ``decode`` is given, the seq-0 token text the
+        maps were computed on is written alongside as ``tokens.txt`` (full text + per-index tokens),
+        so a query/key index can be read back to its word. Mirrors ``_save_figures``: a plotting or
+        dependency error is logged and swallowed (never fatal to the run), and every figure is closed
+        so ~30 evals x L x H do not leak figures. Returns the step directory written, or None on failure.
         """
         try:
             from vfe3.viz import figures as figs
             figs.set_publication_style()
-            attn_dir = self.run_dir / "attention"
-            attn_dir.mkdir(exist_ok=True)
-            path = attn_dir / f"step_{step}.png"
-            fig = figs.plot_attention_grid(maps, title=f"Attention (step {step})", path=str(path))
-            figs.plt.close(fig)
-            return path
+            step_dir = self.run_dir / "attention" / f"step_{step}"
+            step_dir.mkdir(parents=True, exist_ok=True)
+            n_layers, n_heads = int(maps.shape[0]), int(maps.shape[1])
+            for li in range(n_layers):
+                for hi in range(n_heads):
+                    path = step_dir / f"layer{li}_head{hi}.png"
+                    fig = figs.plot_attention_map(
+                        maps[li, hi], title=f"Attention (step {step}, layer {li}, head {hi})",
+                        path=str(path))
+                    figs.plt.close(fig)
+            if token_ids is not None and decode is not None:
+                ids = [int(t) for t in token_ids.tolist()]
+                lines = [f"# attention step {step}: seq-0 tokens (N={len(ids)})",
+                         "# full text:", decode(ids), "", "# index\ttoken"]
+                lines += [f"{i}\t{decode([tid])!r}" for i, tid in enumerate(ids)]
+                (step_dir / "tokens.txt").write_text("\n".join(lines), encoding="utf-8")
+            return step_dir
         except Exception as exc:                                    # a viz error must never kill training
             (logger or logging.getLogger(__name__)).warning(
                 "attention-map figure at step %d failed (%s); training continues", step, exc)

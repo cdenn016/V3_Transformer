@@ -13,6 +13,7 @@ from vfe3.viz.figures import (
     plot_attention_graph,
     plot_attention_grid,
     plot_attention_heatmap,
+    plot_attention_map,
     plot_covariance_ellipses,
     plot_embedding,
     plot_trajectory,
@@ -87,8 +88,23 @@ def test_plot_attention_grid_saves_4d_and_degenerate(tmp_path):
     assert _saved_nonempty(p4) and _saved_nonempty(p3) and _saved_nonempty(p2)
 
 
+def test_plot_attention_map_log_scale_masks_causal(tmp_path):
+    # A causal-softmax map (upper triangle exactly 0) must render via log10 without raising:
+    # the masked j>i cells (-> NaN) take the colormap 'bad' colour, lower triangle shows gradient.
+    N = 6
+    energy = torch.randn(N, N)
+    mask = torch.triu(torch.ones(N, N, dtype=torch.bool), diagonal=1)
+    energy = energy.masked_fill(mask, float("-inf"))
+    beta = torch.softmax(energy, dim=-1)                          # rows sum to 1; beta[j>i] == 0
+    assert torch.allclose(beta[mask], torch.zeros(int(mask.sum())))
+    p = tmp_path / "map.png"
+    fig = plot_attention_map(beta, floor=-5.0, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
 def test_figure_registry():
     assert callable(get_figure("attention_heatmap"))
+    assert callable(get_figure("attention_map"))
     assert callable(get_figure("attention_grid"))
     with pytest.raises(KeyError):
         get_figure("not_a_figure")
