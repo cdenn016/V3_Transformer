@@ -76,6 +76,7 @@ class VFEModel(nn.Module):
             diagonal_covariance=cfg.diagonal_covariance,
             use_prior_bank=cfg.use_prior_bank,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
+            decode_chunk_size=cfg.decode_chunk_size,
             lambda_h=cfg.lambda_h,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
@@ -271,21 +272,41 @@ class VFEModel(nn.Module):
         # the autocast E-step), mirroring retraction.py's in-island sigma.float(). On the default
         # fp32 path .float() is a value-identical no-op AND the island is a nullcontext (see
         # _amp_off_context), so this block is byte-identical to the no-AMP build.
-        with self._amp_off_context(token_ids.device):
-            logits = self.prior_bank.decode(mu_final.float(), sigma_final.float())   # (B, N, V) fp32
-        if targets is None:
-            return logits
+        # Fused chunked-vocab decode+CE (decode_mode='diagonal_chunked', training path only): when
+        # targets are given on the KL-readout (use_prior_bank) path, compute the cross-entropy by
+        # iterating V in chunks and accumulating a streaming logsumexp + a target-logit gather, so
+        # the (B, N, V) logit tensor is NEVER materialized (the memory win). Equal to the 'diagonal'
+        # decode -> F.cross_entropy path to atol-1e-3 (tests/test_chunked_decode.py). logits is None
+        # on this branch by design -- forming them would defeat the purpose; the training/eval
+        # callers (train.py) discard the returned logits. Inference (targets=None) still routes
+        # through decode() below for full logits (sampling needs them).
+        fused_chunked = (
+            targets is not None
+            and self.cfg.use_prior_bank
+            and self.cfg.decode_mode == "diagonal_chunked"
+        )
+        if fused_chunked:
+            with self._amp_off_context(token_ids.device):
+                ce = self.prior_bank.decode_ce_diagonal_chunked(
+                    mu_final.float(), sigma_final.float(), targets,
+                )
+            logits = None                                        # no (B, N, V) tensor on the fused path
+        else:
+            with self._amp_off_context(token_ids.device):
+                logits = self.prior_bank.decode(mu_final.float(), sigma_final.float())   # (B, N, V) fp32
+            if targets is None:
+                return logits
 
-        with self._amp_off_context(token_ids.device):
-            flat_logits = logits.reshape(-1, self.cfg.vocab_size).float()
-            flat_targets = targets.reshape(-1)
-            if (flat_targets != -100).any():
-                ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100)
-            else:
-                # All-ignore microbatch: F.cross_entropy returns 0/0 = NaN (mean over zero
-                # counted tokens), which poisons logging / NaN-guards / grad-accum means. Emit
-                # a finite, grad-connected zero instead (a dead-but-clean step).
-                ce = flat_logits.sum() * 0.0
+            with self._amp_off_context(token_ids.device):
+                flat_logits = logits.reshape(-1, self.cfg.vocab_size).float()
+                flat_targets = targets.reshape(-1)
+                if (flat_targets != -100).any():
+                    ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100)
+                else:
+                    # All-ignore microbatch: F.cross_entropy returns 0/0 = NaN (mean over zero
+                    # counted tokens), which poisons logging / NaN-guards / grad-accum means. Emit
+                    # a finite, grad-connected zero instead (a dead-but-clean step).
+                    ce = flat_logits.sum() * 0.0
         loss = ce
         if self.cfg.mass_phi > 0.0:
             # M-step gauge-frame penalty (manuscript Algorithm 1 M-step loss): regularizes the

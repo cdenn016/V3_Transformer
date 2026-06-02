@@ -12,7 +12,7 @@ from typing import List, Optional, Tuple
 _VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
-_VALID_DECODE_MODES        = ("diagonal", "full")
+_VALID_DECODE_MODES        = ("diagonal", "diagonal_chunked", "full")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_per_coord", "learnable")
 _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback")
@@ -128,6 +128,11 @@ class VFE3Config:
     use_prior_bank:            bool  = True
     decode_tau:                float = 1.0
     decode_mode:               str   = "diagonal"
+    # decode_chunk_size: vocabulary-chunk width V is iterated over by the fused
+    # decode_mode='diagonal_chunked' CE path (the training-path memory win that never
+    # materializes the (B,N,V) logit tensor). Ignored by every other decode_mode. Default
+    # 8192; validated positive.
+    decode_chunk_size:         int   = 8192
     encode_mode:               str   = "per_token"
 
     # cross-block belief handoff (mu_q -> mu_p)
@@ -370,6 +375,8 @@ class VFE3Config:
         if self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be positive, got {self.decode_tau}")
         _require(self.decode_mode, _VALID_DECODE_MODES, "decode_mode")
+        if self.decode_chunk_size < 1:
+            raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
         _require(self.encode_mode, _VALID_ENCODE_MODES, "encode_mode")
         # use_prior_bank is the SINGLE decode gate. True (default, pure path): the KL-to-prior
         # readout logits = -KL(q_i || pi_v)/tau_eff over the gauge-orbit prior bank, with the

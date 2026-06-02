@@ -71,6 +71,17 @@ def test_config_rejects_unknown_gauge_group_and_decode_mode():
         VFE3Config(decode_mode="not_a_mode")
 
 
+def test_config_accepts_diagonal_chunked_decode_and_validates_chunk_size():
+    """diagonal_chunked is the fused chunked-vocab decode+CE mode; decode_chunk_size must be > 0."""
+    assert VFE3Config().decode_chunk_size == 8192            # default
+    cfg = VFE3Config(decode_mode="diagonal_chunked", decode_chunk_size=4096)
+    assert cfg.decode_mode == "diagonal_chunked" and cfg.decode_chunk_size == 4096
+    with pytest.raises(ValueError):
+        VFE3Config(decode_chunk_size=0)
+    with pytest.raises(ValueError):
+        VFE3Config(decode_chunk_size=-1)
+
+
 def test_config_rejects_negative_learning_rate_and_bad_rho():
     with pytest.raises(ValueError):
         VFE3Config(e_mu_lr=-0.1)

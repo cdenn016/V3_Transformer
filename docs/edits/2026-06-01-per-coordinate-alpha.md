@@ -1258,3 +1258,62 @@ input/output dtypes; `test_bf16_backward_reaches_prior_tables`), `tests/test_con
 failed: TypeError on the unknown kwarg / AttributeError on the missing field), then GREEN. Full suite
 after the change: `tests=394 failures=0 errors=0 skipped=0` (read from junitxml; 387 baseline + 7 new;
 393 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
+
+## Fused chunked-vocab decode+CE (`decode_mode="diagonal_chunked"`, 2026-06-02)
+
+The `(B, N, V=50257)` logit tensor (~412 MB forward + its backward, flagged in
+`docs/perf/2026-05-31-speedup-opportunities.md` as the re-emerging top GPU cost once the serial
+E-step loop is gone) is now avoidable on the TRAINING path. `decode_mode="diagonal_chunked"` (new
+registry member, default stays `"diagonal"`) routes `model.forward`, when targets are given and
+`use_prior_bank=True`, through a FUSED decode+CE that iterates the vocabulary in `decode_chunk_size`
+chunks (new config field, default 8192, validated `>= 1`) and never materializes the full logits.
+
+`PriorBank.decode_ce_diagonal_chunked(mu_q, sigma_q, targets)` reproduces `_decode_diagonal`'s
+closed form per chunk, INCLUDING the same global centering offset `c = mean_v(mu_v)` that tames the
+Mahalanobis catastrophic cancellation. The offset is a per-coordinate `(1, K)` mean over ALL V,
+computed in one up-front `O(V*K)` pass with no big tensor, so it is identical to the full path (the
+closed form is offset-invariant: `(mu_q - c) - (mu_v - c) == mu_q - mu_v`). Per position the
+cross-entropy is `logsumexp_v(logit_v) - logit_target` (the standard -log-softmax at the target),
+meaned over non-ignored positions. The all-ignore microbatch emits the same finite grad-connected
+zero (`ce_per_pos.sum() * 0.0`) as the full path; ignored positions (target `-100 < 0 <= v0`) never
+fall in a chunk window, so their gathered target logit stays 0 and the `valid` mask excludes them.
+
+The memory win required moving the V-axis reduction INSIDE a gradient-checkpointed per-chunk
+function (`torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`). A naive streaming loop
+saves nothing in training: the `(B, N, Vc)` chunk logits returned to an outside `logsumexp`/`exp`/
+`gather` are retained by autograd for those ops' backward, so all `V/chunk` chunks stay alive and
+peak stays `(B, N, V)`. The checkpointed function therefore returns only the two `(B, N)` per-chunk
+summaries (`logsumexp` over the chunk + the gathered target contribution); the `(B, N, Vc)` logit is
+born and dies inside, recomputed deterministically in backward. Verified via
+`torch.autograd.graph.saved_tensors_hooks`: with `chunk < V` NO retained tensor is `B*N*chunk`-sized
+(max retained is the `V*K` prior table, shared with the full path), confirming the chunk logits are
+freed. The per-chunk LSEs are then combined with `torch.logsumexp(torch.stack(...), 0)` (a
+`(n_chunks, B, N)` stack, negligible).
+
+EQUIVALENCE-GATED at the cancellation-sensitive decode's atol-1e-3: chunked CE equals the
+`decode`->`F.cross_entropy` full path to `|diff| ~ 5e-7` across chunk sizes (evenly dividing,
+non-dividing 7/11/13, and `chunk >= V` single-chunk), and `loss.backward()` gives prior-table grads
+allclose at ~`1e-9`. Inference (`targets=None`): `decode_mode="diagonal_chunked"` registers a decode
+kernel that delegates to `_decode_diagonal`, so the materialized logits are byte-identical to
+`"diagonal"` (sampling/generation need full logits; the memory win is training-only). On the fused
+branch `forward` returns `logits=None` (forming them would defeat the purpose; `train.py`/eval
+discard the returned logits via `_, loss, ce`).
+
+### Files + tests
+
+`vfe3/config.py`: `diagonal_chunked` added to `_VALID_DECODE_MODES`, `decode_chunk_size` field +
+positive validation. `vfe3/model/prior_bank.py`: `decode_ce_diagonal_chunked` method (checkpointed
+per-chunk reduction), the `diagonal_chunked` decode-kernel registration (delegates to
+`_decode_diagonal` for inference logits), `decode_chunk_size` threaded into `PriorBank.__init__`;
+`_decode_diagonal` and the existing `decode()` path are UNTOUCHED (new code only -> default
+byte-identity is trivially safe). `vfe3/model/model.py`: the fused branch in `forward` (the original
+decode/CE block moved verbatim into the `else`, so the `diagonal` default is byte-identical) +
+`decode_chunk_size` forwarded to the `PriorBank`. Tests: `tests/test_chunked_decode.py` (new, +6:
+`test_chunked_ce_matches_full_ce_multiple_chunk_sizes`, `test_chunked_ce_honors_ignore_index`,
+`test_chunked_ce_all_ignore_is_finite_zero`, `test_chunked_ce_grad_matches_full`,
+`test_chunked_forward_loss_matches_diagonal_forward_loss`,
+`test_chunked_inference_targets_none_returns_full_logits`), `tests/test_config.py` (+1:
+`test_config_accepts_diagonal_chunked_decode_and_validates_chunk_size`). RED confirmed (7 failed:
+TypeError/AttributeError on the unknown kwarg/missing field), then GREEN. Full suite after the
+change: `tests=401 failures=0 errors=0 skipped=0` (read from junitxml; 394 baseline + 7 new; 400
+passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
