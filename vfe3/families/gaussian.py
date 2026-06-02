@@ -6,7 +6,7 @@ maps are added so the generic Bregman/Renyi-from-A path can be pinned against th
 """
 
 import math
-from typing import Tuple
+from typing import List, Tuple
 
 import torch
 
@@ -37,6 +37,13 @@ class DiagonalGaussian(BeliefParams):
 
     def broadcast_over_keys(self) -> "DiagonalGaussian":
         return DiagonalGaussian(self.mu.unsqueeze(-2), self.sigma.unsqueeze(-2))
+
+    @classmethod
+    def stack(cls, parts: List["DiagonalGaussian"], *, dim: int = 0) -> "DiagonalGaussian":
+        return DiagonalGaussian(
+            torch.stack([p.mu for p in parts], dim=dim),
+            torch.stack([p.sigma for p in parts], dim=dim),
+        )
 
     def natural(self) -> Tuple[torch.Tensor, torch.Tensor]:
         s = self.sigma.clamp(min=1e-12)
@@ -144,6 +151,13 @@ class FullGaussian(BeliefParams):
 
     def broadcast_over_keys(self) -> "FullGaussian":
         return FullGaussian(self.mu.unsqueeze(-2), self.sigma.unsqueeze(-3))
+
+    @classmethod
+    def stack(cls, parts: List["FullGaussian"], *, dim: int = 0) -> "FullGaussian":
+        return FullGaussian(
+            torch.stack([p.mu for p in parts], dim=dim),
+            torch.stack([p.sigma for p in parts], dim=dim),
+        )
 
     def natural(self) -> Tuple[torch.Tensor, torch.Tensor]:
         # Ridge the covariance before inverting to the precision (the natural parameter); the

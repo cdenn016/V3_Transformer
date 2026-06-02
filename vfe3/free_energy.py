@@ -30,6 +30,32 @@ def effective_temperature(
     return kappa * (K ** 0.5)
 
 
+def _stackable_for_batching(
+    q_b: BeliefParams,                     # broadcast query (..., N, 1, K)
+    key: BeliefParams,                     # transported key  (..., N, N, K)
+) -> bool:
+    r"""Whether the equal-block batched path is bit-identical to the per-block loop.
+
+    Stacking the H equal blocks along a NEW LEADING axis is the same arithmetic only when that
+    axis does not perturb the mu/sigma broadcast. For a Gaussian family the canonical layout is
+    sigma rank == mu rank (diagonal) or mu rank + 1 (full); the misclassified case (sigma carries
+    a leading batch dim mu lacks) would make the stacked head axis right-align against sigma's
+    first batch dim and broadcast spuriously. A family that does not expose mu/sigma tensors falls
+    back to the loop. The guard is on q_b AND key, since pairwise_energy slices both.
+    """
+    expected_extra = {"diagonal": 0, "full": 1}.get(getattr(type(q_b), "cov_kind", None))
+    if expected_extra is None:
+        return False
+    for params in (q_b, key):
+        mu = getattr(params, "mu", None)
+        sigma = getattr(params, "sigma", None)
+        if mu is None or sigma is None:
+            return False
+        if sigma.dim() != mu.dim() + expected_extra:
+            return False
+    return True
+
+
 def pairwise_energy(
     q:                 BeliefParams,        # (..., N, K) query belief
     key:               BeliefParams,        # (..., N, N, K) transported key belief Omega_ij q_j
@@ -64,10 +90,28 @@ def pairwise_energy(
     if irrep_dims is None or len(irrep_dims) == 1:
         return functional(q_b, key, alpha=alpha, kl_max=kl_max, eps=eps)
 
+    # EQUAL-size, more-than-one blocks (the default block_glk case): the H per-block divergences
+    # are the SAME functional over H disjoint coordinate slices, so stack the H equal blocks along
+    # a NEW LEADING axis and call the functional ONCE. The leading head axis is then moved to -3 to
+    # match the loop's torch.stack(..., dim=-3) layout (..., H, N, N) EXACTLY. The stacked call is
+    # bit-identical only when stacking does not perturb the mu/sigma broadcast: the misclassified
+    # case where sigma carries a leading batch dim mu lacks would right-align the new head axis
+    # against sigma's first batch dim (a spurious broadcast), so it is excluded by the rank guard
+    # below and falls back to the per-block loop (which broadcasts correctly).
+    H = len(irrep_dims)
+    d = irrep_dims[0]
+    if len(set(irrep_dims)) == 1 and _stackable_for_batching(q_b, key):
+        q_parts   = [q_b.block(h * d, (h + 1) * d) for h in range(H)]      # H x (..., N, 1, d)
+        key_parts = [key.block(h * d, (h + 1) * d) for h in range(H)]      # H x (..., N, N, d)
+        q_stk   = type(q_b).stack(q_parts, dim=0)                          # (H, ..., N, 1, d)
+        key_stk = type(key).stack(key_parts, dim=0)                        # (H, ..., N, N, d)
+        e = functional(q_stk, key_stk, alpha=alpha, kl_max=kl_max, eps=eps)  # (H, ..., N, N)
+        return torch.movedim(e, 0, -3)     # (..., H, N, N), matching the loop's stack(dim=-3)
+
     energies = []
     start = 0
-    for d in irrep_dims:                   # one divergence per irrep block (head)
-        end = start + d
+    for db in irrep_dims:                  # one divergence per irrep block (head)
+        end = start + db
         e_h = functional(
             q_b.block(start, end), key.block(start, end),
             alpha=alpha, kl_max=kl_max, eps=eps,

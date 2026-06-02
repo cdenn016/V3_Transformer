@@ -87,6 +87,27 @@ class VFEModel(nn.Module):
         # irrep blocks; HeadMixer rejects a single-block group at construction (glk / so_k have
         # nothing to mix), so a bad gauge_group + use_head_mixer pair fails here, not at forward.
         self.head_mixer = HeadMixer(self.group.irrep_dims) if cfg.use_head_mixer else None
+        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED scalar self-coupling alpha.
+        # When alpha_mode='learnable', create log_alpha as a trainable nn.Parameter; the consumed
+        # coupling is alpha = exp(log_alpha) (always positive). Init 0 -> alpha = exp(0) = 1.0, so a
+        # learnable model is byte-identical to the constant alpha=1.0 pure path at step 0. For every
+        # other (pure no-NN) alpha_mode the parameter is NOT created at all (no log_alpha attribute),
+        # so the default path is param-free.
+        if cfg.alpha_mode == "learnable":
+            self.log_alpha = nn.Parameter(torch.zeros(()))
+            if cfg.detach_e_step:
+                # Footgun (mirrors the use_prior_bank+detach warning below): log_alpha enters the
+                # loss ONLY through the E-step belief updates, but detach_e_step wraps the whole
+                # E-step in no_grad, so log_alpha receives NO gradient and stays frozen at its init
+                # (alpha = 1.0). Set detach_e_step=False to train the learned alpha.
+                import warnings
+                warnings.warn(
+                    "alpha_mode='learnable' with detach_e_step=True freezes log_alpha: the learned "
+                    "self-coupling alpha enters the loss only through the E-step, which the detached "
+                    "(no_grad) E-step severs, so log_alpha.grad is None and alpha stays at its init "
+                    "1.0. Set detach_e_step=False to train the learnable alpha.",
+                    stacklevel=2,
+                )
         if (not cfg.use_prior_bank) and cfg.detach_e_step:
             # Joint-toggle footgun (audit 2026-05-31): the detached E-step severs the encode prior
             # tables (mu/sigma/phi_embed) from the loss, and the linear decode reads only mu_final,
@@ -149,10 +170,15 @@ class VFEModel(nn.Module):
         # of a serial per-sequence Python loop. Sequences are independent (each reads only its own
         # belief and the shared, sequence-independent log_prior), so the batched result equals the
         # per-sample result (pinned by tests/test_perf_equivalence.py::test_batched_forward_equals_per_sample).
+        # log_alpha: the learned scalar self-coupling parameter (alpha = exp(log_alpha)) when
+        # alpha_mode='learnable', else None (the param-free pure path). Threaded through the
+        # E-step so the loss backpropagates to log_alpha. getattr keeps the default path's call
+        # identical: None forwards a defaulted-None keyword that every alpha form ignores.
+        log_alpha = getattr(self, "log_alpha", None)
         run = torch.no_grad() if self.cfg.detach_e_step else nullcontext()
         with run:
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
-                            log_prior=log_prior, block_norm=self.block_norm)
+                            log_prior=log_prior, block_norm=self.block_norm, log_alpha=log_alpha)
         mu_final = out.mu                                        # (B, N, K)
         sigma_final = out.sigma
 
@@ -311,6 +337,7 @@ class VFEModel(nn.Module):
         out = vfe_stack(                                              # converged belief
             belief, belief.mu, belief.sigma, self.group, cfg,
             log_prior=log_prior, block_norm=self.block_norm,
+            log_alpha=getattr(self, "log_alpha", None),               # learned scalar (None on the pure path)
         )
 
         rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
@@ -338,6 +365,7 @@ class VFEModel(nn.Module):
         )
         alpha, _ = self_coupling_alpha(
             self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+            log_alpha=getattr(self, "log_alpha", None),     # learned scalar (None on the pure path)
         )
 
         d = {"attn_entropy": float(metrics.attention_entropy(beta))}

@@ -9,13 +9,12 @@ variant swaps without editing call sites.
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-_VALID_DIVERGENCE_FUNCTIONALS = ("renyi",)
 _VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k")
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
 _VALID_DECODE_MODES        = ("diagonal", "full")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
-_VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_per_coord")
+_VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_per_coord", "learnable")
 _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback")
 _VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
 _VALID_ATTENTION_PRIORS    = ("uniform", "causal", "alibi")
@@ -77,6 +76,13 @@ class VFE3Config:
 
     # free-energy coupling
     alpha:                     float = 1.0          # constant self-coupling value
+    # alpha_mode selects the self-coupling form (registry key). The default-and-pure no-NN forms
+    # are 'constant', 'state_dependent', 'state_dependent_per_coord' (closed-form functions of the
+    # self-divergence D, no learned parameters) and are unchanged. NEURAL-NETWORK EXCEPTION:
+    # 'learnable' introduces a model-owned scalar nn.Parameter log_alpha (alpha = exp(log_alpha))
+    # trained by backprop -- a sanctioned, default-OFF learned-parameter exception in the spirit of
+    # use_head_mixer / use_prior_bank (see VFEModel.__init__ and alpha_i.alpha_learnable). At init
+    # log_alpha=0 -> alpha=1.0, byte-identical to constant alpha=1.0.
     alpha_mode:                str   = "constant"
     b0:                        float = 1.0          # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0:                        float = 1.0          # state-dependent alpha shape (numerator)
@@ -136,9 +142,14 @@ class VFE3Config:
             raise ValueError(f"kl_max must be positive, got {self.kl_max}")
 
         # divergence seam: divergence_family is the FUNCTIONAL (f-divergence) registry key
-        # (renyi, ...), distinct from `family` (the covariance-structure kernel). alpha_div is
-        # the Renyi order. Both are live, modular seams (CLAUDE.md: slot in different f-divergences).
-        _require(self.divergence_family, _VALID_DIVERGENCE_FUNCTIONALS, "divergence_family")
+        # (renyi, squared_hellinger, ...), distinct from `family` (the covariance-structure
+        # kernel). alpha_div is the Renyi order, IGNORED by non-alpha functionals (e.g.
+        # squared_hellinger). Both are live, modular seams (CLAUDE.md: slot in different
+        # f-divergences). Validated against the functional REGISTRY (not a hardcoded literal
+        # list) so a newly registered functional is config-selectable without editing here;
+        # local import avoids a config <- divergence <- families import cycle.
+        from vfe3.divergence import divergence_functionals
+        _require(self.divergence_family, divergence_functionals(), "divergence_family")
         if self.alpha_div <= 0.0:
             raise ValueError(f"alpha_div must be positive, got {self.alpha_div}")
 
@@ -273,6 +284,23 @@ class VFE3Config:
         # manuscript-canonical affine-invariant exponential map (the pure path always exists).
         from vfe3.geometry.retraction import _RETRACTIONS
         _require(self.spd_retract_mode, tuple(sorted(_RETRACTIONS)), "spd_retract_mode")
+        # log_euclidean is a genuinely new variant only for the full-covariance family. On a
+        # diagonal family it applies the tangent in the matrix-log chart WITHOUT the affine
+        # 1/sigma Fisher whitening, so under this seam's pre-whitened tangent convention it does
+        # NOT coincide with the manuscript-canonical 'spd_affine' there -- it is a non-canonical
+        # log-chart step. Warn (not error) so the harmless-but-non-canonical pairing surfaces; the
+        # user toggles families and retraction modes independently.
+        if self.spd_retract_mode == "log_euclidean" and family_is_diagonal:
+            import warnings
+            warnings.warn(
+                "spd_retract_mode='log_euclidean' with a diagonal-covariance family applies the "
+                "tangent in the log chart without the affine 1/sigma Fisher whitening, so it does "
+                "NOT reduce to the canonical 'spd_affine' here (it is a non-canonical log-chart "
+                "step). log_euclidean is a genuinely new variant only for a full-covariance "
+                "family; prefer 'spd_affine' on the diagonal family, or use 'gaussian_full'.",
+                UserWarning,
+                stacklevel=2,
+            )
         # 'killing_per_block' builds a per-HEAD Killing metric and requires generators that partition
         # per block (block_glk's independent gl(d_head) per head). The tied gauge's shared generators
         # kron(I_n, gl(d_head)) each act on EVERY block, so the per-block partition does not exist;

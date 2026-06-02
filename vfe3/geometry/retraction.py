@@ -156,6 +156,118 @@ def retract_spd_affine(
     )
 
 
+def retract_logeuclidean_full(
+    sigma:        torch.Tensor,             # (..., K, K) SPD covariances
+    delta_log:    torch.Tensor,             # (..., K, K) symmetric tangent (taken in the log chart)
+
+    *,
+    step_size:    float = 1.0,
+    trust_region: float = 5.0,
+    eps:          float = 1e-6,
+    sigma_max:    float = 5.0,
+) -> torch.Tensor:
+    r"""Full log-Euclidean SPD retraction (Arsigny-Fillard-Pennec-Ayache 2006/2007).
+
+        Sigma_new = expm( logm(Sigma) + step_size * sym(delta_log) ),
+    where logm/expm are the matrix log/exp in the eigenbasis (logm(Sigma) =
+    V diag(log lambda_j) V^T; expm(M) = U diag(exp mu_j) U^T). Because logm(Sigma)
+    is symmetric and expm of a symmetric matrix is SPD, this is SPD-preserving for
+    ANY magnitude of the tangent (no trust region needed for positivity; the trust
+    region is a Frobenius stability knob only). The tangent is taken directly in the
+    matrix-log chart (spec reading 2a, the pure retraction). Uses torch.linalg.eigh
+    twice (one for logm(Sigma), one for the expm of the log-sum), the same two-eigh
+    structure as retract_spd_full; floors the input eigenvalues at eps before log and
+    projects the output spectrum to [eps, sigma_max^2].
+    """
+    orig_shape = sigma.shape
+    orig_dtype = sigma.dtype
+    if sigma.dim() == 4:
+        B, N, K, _ = sigma.shape
+        sigma = sigma.reshape(B * N, K, K)
+        delta_log = delta_log.reshape(B * N, K, K)
+
+    with torch.amp.autocast('cuda', enabled=False):
+        sigma     = sigma.float()
+        delta_log = delta_log.float()
+        sigma     = 0.5 * (sigma + sigma.transpose(-1, -2))
+        delta_log = 0.5 * (delta_log + delta_log.transpose(-1, -2))
+
+        eigenvalues, eigenvectors = torch.linalg.eigh(sigma)
+        eigenvalues = eigenvalues.clamp(min=eps)
+        log_eig = torch.log(eigenvalues)
+        log_sigma = eigenvectors * log_eig.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
+
+        tangent = step_size * delta_log
+        if trust_region is not None and trust_region > 0:                # clamp the TANGENT, not the
+            t_norm  = torch.linalg.norm(tangent, ord='fro', dim=(-2, -1), keepdim=True)   # base point,
+            tangent = tangent * torch.clamp(trust_region / (t_norm + eps), max=1.0)       # so R(S,0)=S.
+        M = log_sigma + tangent
+        M = 0.5 * (M + M.transpose(-1, -2))
+
+        M_eval, M_evec = torch.linalg.eigh(M)
+        M_eval = M_eval.clamp(-50.0, 50.0)
+        sigma_new = M_evec * torch.exp(M_eval).unsqueeze(-2) @ M_evec.transpose(-1, -2)
+        sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
+
+        eig_new, vec_new = torch.linalg.eigh(sigma_new)
+        eig_new = eig_new.clamp(min=eps, max=sigma_max * sigma_max)
+        sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
+
+    sigma_new = sigma_new.to(orig_dtype)
+    if len(orig_shape) == 4:
+        sigma_new = sigma_new.reshape(orig_shape)
+    return sigma_new
+
+
+@register_retraction("log_euclidean")
+def retract_log_euclidean(
+    sigma:        torch.Tensor,             # (..., K) diagonal OR (..., K, K) full covariance
+    delta_sigma:  torch.Tensor,             # matching rank: the tangent step, taken in the log chart
+
+    mean_ndim:    int,                      # ndim of the belief mean; full cov iff sigma.dim() == mean_ndim + 1
+
+    *,
+    step_size:    float = 1.0,
+    trust_region: float = 5.0,
+    eps:          float = 1e-6,
+    sigma_max:    float = 5.0,
+) -> torch.Tensor:                          # (...) same rank as sigma
+    r"""Log-Euclidean SPD retraction (spec reading 2a; Arsigny et al. 2006/2007).
+
+    The pure log-Euclidean retraction: the tangent ``delta_sigma`` is interpreted directly
+    in the matrix-log chart and the update closes in the SPD vector-space structure,
+        Sigma_new = expm( logm(Sigma) + step_size * sym(delta_sigma) ).
+    SPD-preserving for ANY step magnitude (expm of a symmetric matrix is SPD), unlike a
+    naive Euclidean step; the trust region is a stability knob, not a positivity guard.
+
+    Full covariance (sigma.dim() == mean_ndim + 1) uses the two-eigh logm/expm in
+    ``retract_logeuclidean_full``. The diagonal case is the elementwise reduction
+        sigma_new = sigma * exp(step_size * delta_sigma),
+    applying the tangent in the log chart WITHOUT the affine 1/sigma whitening. NOTE: under
+    this seam's pre-whitened tangent convention (the E-step hands the retraction the affine
+    Fisher natural gradient 2 Sigma G Sigma, retraction.py natural_gradient), the diagonal LE
+    step does NOT coincide with ``spd_affine`` -- affine whitens by 1/sigma (sigma_new =
+    sigma exp(step delta/sigma)), LE does not -- so on a diagonal family LE is a non-canonical
+    log-chart step, not the manuscript-pinned geometry. LE is a genuinely new variant only for
+    the full-covariance family, where logm != elementwise log. 2b (the Daleckii-Krein Frechet
+    natural gradient) is a deferred sub-flag per the spec, not built here.
+    """
+    if sigma.dim() == mean_ndim + 1:                     # full covariance (..., K, K)
+        return retract_logeuclidean_full(
+            sigma, delta_sigma, step_size=step_size, trust_region=trust_region, eps=eps, sigma_max=sigma_max,
+        )
+    # diagonal: logm/expm are elementwise; sigma_new = sigma * exp(step_size * delta_sigma)
+    orig_dtype = sigma.dtype
+    with torch.amp.autocast('cuda', enabled=False):
+        sigma_safe  = sigma.float().clamp(min=eps)
+        delta_sigma = delta_sigma.float()
+        if trust_region is not None and trust_region > 0:
+            delta_sigma = delta_sigma.clamp(-trust_region, trust_region)
+        exp_arg   = (step_size * delta_sigma).clamp(-50.0, 50.0)
+        sigma_new = sigma_safe * torch.exp(exp_arg)
+    return sigma_new.clamp(min=eps, max=sigma_max).to(orig_dtype)
+
+
 def natural_gradient(
     grad_mu:    torch.Tensor,             # (..., K) Euclidean grad wrt mu
     grad_sigma: torch.Tensor,             # (..., K) or (..., K, K) Euclidean grad wrt sigma

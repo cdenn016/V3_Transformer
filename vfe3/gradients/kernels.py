@@ -157,6 +157,7 @@ def belief_gradients(
 
     irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
+    log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Belief gradient: hand kernel for filtering+gaussian_diagonal+KL+canonical, else oracle.
 
@@ -177,7 +178,7 @@ def belief_gradients(
             kl_max=kl_max, eps=eps, b0=b0, c0=c0, value=value,
             include_attention_entropy=include_attention_entropy,
             gradient_mode=gradient_mode, family=family, divergence_family=divergence_family,
-            alpha_mode=alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior,
+            alpha_mode=alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
         )
 
     mu_k, sigma_k = mu.detach(), sigma.detach()
@@ -190,7 +191,7 @@ def belief_gradients(
                              divergence_family=divergence_family, irrep_dims=irrep_dims)
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)   # (N,N) or (H,N,N)
     beta_coord = _beta_to_coordinate(beta, irrep_dims, mu.shape[-1])  # (N,N,K) per-coordinate
-    coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=alpha_mode)
+    coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=alpha_mode, log_alpha=log_alpha)
     if not alpha_is_per_coord(alpha_mode):
         coef = coef.unsqueeze(-1)                 # (N,) -> (N,1) per-position broadcast; per-coord sd is already (N,K)
     return get_kernel(family)(mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta_coord, coef, kl_max=kl_max, eps=eps)

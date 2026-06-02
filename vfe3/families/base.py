@@ -11,7 +11,7 @@ family slots in behind -- by writing-and-registering a subclass, never editing c
 
 import warnings
 from abc import ABC, abstractmethod
-from typing import Callable, ClassVar, Dict, Tuple, Type
+from typing import Callable, ClassVar, Dict, List, Tuple, Type
 
 import torch
 
@@ -103,6 +103,19 @@ class BeliefParams(ABC):
             f"the mean of the sufficient statistics). Provide either method."
         )
 
+    @classmethod
+    def stack(cls, parts: List["BeliefParams"], *, dim: int = 0) -> "BeliefParams":
+        r"""Stack a list of same-family parts into one ``BeliefParams`` along a NEW axis ``dim``,
+        stacking each underlying tensor of the parts. Family-agnostic batching primitive: a single
+        functional call over the stacked axis then computes every part's divergence at once (used by
+        ``pairwise_energy`` to batch the per-irrep-block loop). Not abstract -- a family that never
+        takes the batched path need not override it. Overriding is required only to batch."""
+        raise NotImplementedError(
+            f"{cls.__name__} does not override stack, the family-agnostic batching primitive "
+            f"(stack each part's underlying tensor along a new axis). Provide it to batch the "
+            f"per-block loop."
+        )
+
 
 _FAMILIES: Dict[str, Type[BeliefParams]] = {}
 
@@ -148,6 +161,11 @@ def get_functional(name: str) -> Callable:
     if name not in _FUNCTIONALS:
         raise KeyError(f"no functional registered under {name!r}; available: {sorted(_FUNCTIONALS)}")
     return _FUNCTIONALS[name]
+
+
+def divergence_functionals() -> Tuple[str, ...]:
+    r"""Registered functional names (the valid ``divergence_family`` config values)."""
+    return tuple(sorted(_FUNCTIONALS))
 
 
 def _renyi_from_log_partition(
@@ -201,11 +219,15 @@ def renyi(
     alpha:   float = 1.0,
     kl_max:  float = 100.0,
     eps:     float = 1e-6,
+    **kwargs,
 ) -> torch.Tensor:
     r"""Renyi alpha-divergence D_alpha(q || p) between two parameter objects (KL at alpha=1).
 
     Uses ``q.renyi_closed_form`` when the family provides one (the pinned Gaussian moment
     form); otherwise the generic Bregman/Renyi-from-A path.
+
+    The trailing ``**kwargs`` is the permissive functional contract every divergence-registry
+    member shares (a member ignores params it does not use); ``renyi`` consumes ``alpha``.
     """
     if alpha <= 0.0:
         raise ValueError(f"alpha must be positive, got {alpha}")
@@ -229,4 +251,32 @@ def kl(
     return renyi(q, p, alpha=1.0, kl_max=kl_max, eps=eps)
 
 
+def squared_hellinger(
+    q:       BeliefParams,
+    p:       BeliefParams,
+
+    *,
+    kl_max:  float = 100.0,
+    eps:     float = 1e-6,
+    **kwargs,
+) -> torch.Tensor:                             # (...) squared Hellinger H^2(q||p) in [0, 1)
+    r"""Squared Hellinger f-divergence H^2(q || p) = 1 - BC(q || p).
+
+    For Gaussians the Bhattacharyya coefficient is BC = exp(-D_{1/2}(q||p)/2), where D_{1/2}
+    is the Renyi-1/2 divergence the pinned ``renyi`` kernel already computes, so
+
+        H^2(q || p) = 1 - exp( -D_{1/2}(q || p) / 2 ),   D_{1/2} = renyi(q, p, alpha=0.5).
+
+    This member ignores any ``alpha`` the call sites forward (Hellinger has no order); it is
+    absorbed by ``**kwargs`` and never reaches ``renyi`` (the inner call always uses alpha=0.5,
+    so the alpha>1 blend warning cannot fire). ``kl_max`` IS forwarded so the inner D_{1/2}
+    stays bounded in [0, kl_max]; the H^2 output is then naturally in [0, 1) without a second
+    clamp (a clamped D_{1/2}=kl_max maps to H^2 = 1 - exp(-kl_max/2), the maximal-Hellinger
+    limit, which composes correctly).
+    """
+    d_half = renyi(q, p, alpha=0.5, kl_max=kl_max, eps=eps)
+    return 1.0 - torch.exp(-0.5 * d_half)
+
+
 register_functional("renyi")(renyi)
+register_functional("squared_hellinger")(squared_hellinger)

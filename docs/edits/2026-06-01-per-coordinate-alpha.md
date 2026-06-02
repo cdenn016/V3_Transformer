@@ -516,3 +516,325 @@ mu/sigma/phi equal the run with no `transport_mode`, atol=0). The wired-forward 
 `tests/test_perf_equivalence.py` passing in the full green suite. Full suite
 `tests=300 failures=0 errors=0 skipped=0` (read from junitxml; 293 baseline + 7 new; viz collected
 normally; 1 xpassed pre-existing).
+
+### squared-Hellinger f-divergence functional (second registry member; roadmap item 11)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Design spec:
+`docs/superpowers/specs/2026-06-01-f-divergence-functional-design.md`. The functional axis of the
+divergence seam (`register_functional`/`get_functional`/`_FUNCTIONALS` in `families/base.py`) was a
+genuine registry carrying exactly one member (`renyi`), so the de-facto interface was the single
+alpha-parameterized `renyi(...)` signature. This adds squared Hellinger — the first non-Renyi
+f-divergence — demonstrating the seam, and generalizes the functional contract so a member can
+ignore params it does not use, with ZERO call-site edits.
+
+Identity used (spec sympy-VERIFIED, exact diff=0, re-verified this session): for Gaussians the
+Bhattacharyya coefficient is `BC = exp(-D_{1/2}(q||p)/2)` where `D_{1/2}` is the Renyi-1/2 divergence
+the pinned `renyi` kernel already computes, so `H^2(q||p) = 1 - exp(-D_{1/2}(q||p)/2)`. Hellinger is
+thus a thin wrapper over machinery already golden-pinned — no new family-specific Cholesky/blend math.
+
+Files:
+- `vfe3/families/base.py`: `renyi` gains a trailing `**kwargs` (additive, harmless — the permissive
+  functional contract; `renyi` still consumes `alpha`). New `squared_hellinger(q, p, *, kl_max=100.0,
+  eps=1e-6, **kwargs)`: absorbs any `alpha` the call sites forward (Hellinger has no order — never
+  reaches `renyi`, so the alpha>1 blend warning cannot fire), forwards `kl_max` so the inner `D_{1/2}`
+  stays bounded in `[0, kl_max]`, and returns `1.0 - torch.exp(-0.5 * renyi(q, p, alpha=0.5, ...))`.
+  NO output `.clamp` — `1 - exp(-D/2)` with `D in [0, kl_max]` is provably in `[0, 1)` (a clamped
+  `D=kl_max` maps to the maximal-Hellinger limit `1 - exp(-kl_max/2)`, which composes correctly), so a
+  second clamp would be dead. Registered `register_functional("squared_hellinger")`. New
+  `divergence_functionals() -> tuple(sorted(_FUNCTIONALS))` helper (mirrors `divergence_families()`).
+- `vfe3/divergence.py`: re-export `squared_hellinger` and `divergence_functionals` (import + `__all__`).
+- `vfe3/config.py`: `divergence_family` validation is now registry-derived — a local
+  `from vfe3.divergence import divergence_functionals` in the divergence-seam block validates against
+  `divergence_functionals()` (the `divergence_families()` pattern), so a new functional is
+  config-selectable WITHOUT editing config. The hardcoded `_VALID_DIVERGENCE_FUNCTIONALS = ("renyi",)`
+  tuple was removed (grep-confirmed dead — its only use was the one `_require` call). Field comment
+  notes `alpha_div` is ignored by non-alpha functionals.
+
+`reverse_kl` (a spec-proposed regression rung) was deliberately NOT registered — the task asks only
+for `squared_hellinger`, and the registry-derived validation makes the valid set exactly
+`{renyi, squared_hellinger}`, which is correct (no scope creep).
+
+Independent oracles (test_divergence.py, TDD watched RED — 13 failing for unregistered functional /
+missing helper / config rejection — then GREEN; the oracles do NOT re-assert the definition):
+- `test_squared_hellinger_diagonal_matches_analytic`: vs the analytic diagonal Gaussian H^2 computed
+  in float64 as `1 - prod_k BC_k`, `BC_k = sqrt(2 sqrt(s_q s_p)/(s_q+s_p)) exp(-(mu_q-mu_p)^2/
+  (4(s_q+s_p)))` — Bhattacharyya factorizes over coordinates, so BC is a PRODUCT then 1-BC (NOT a
+  per-coord H^2 summed). atol 1e-5.
+- `test_squared_hellinger_full_matches_analytic`: vs the analytic full-covariance Bhattacharyya
+  distance `D_B = 1/8 dmu^T Sbar^{-1} dmu + 1/2(ln|Sbar| - 1/2 ln|S_q| - 1/2 ln|S_p|)`, `Sbar =
+  (S_q+S_p)/2`, via slogdet/solve — a DIFFERENT numerical path than the kernel's Cholesky-of-blend
+  (independently sympy/numeric-checked to ~1e-7 this session). atol 1e-5.
+- `test_squared_hellinger_equals_definitional_identity`: pins `H^2 = 1 - exp(-D_{1/2}/2)`.
+- `test_squared_hellinger_is_symmetric` (diagonal + full): the STRONG independent check — Hellinger is
+  symmetric, unlike KL / Renyi at alpha != 1/2; `H^2(q,p) allclose H^2(p,q)` atol 1e-5.
+- `test_squared_hellinger_self_is_zero`, `test_squared_hellinger_bounded` (both families):
+  `H^2(q,q) = 0`, `0 <= H^2 <= 1`.
+- `test_squared_hellinger_ignores_alpha_and_does_not_warn`: `fn(q,p)` allclose `fn(q,p,alpha=2.0)`
+  (atol 0) AND no RuntimeWarning fires — proves `alpha=2.0` never reaches `renyi`'s alpha>1 branch.
+- `test_divergence_functionals_registry_derived`, `test_config_accepts_squared_hellinger_and_rejects_
+  unknown`: registry exposes both members and config accepts `squared_hellinger`/`renyi`, rejects an
+  unknown name.
+- `test_model_forward_under_squared_hellinger`: end-to-end VFEModel forward + finite loss with the new
+  functional flowing through `pairwise_energy`/`self_divergence`.
+
+Renyi/default path byte-identical (the suite is the gate). Full suite after the change:
+`tests=313 failures=0 errors=0 skipped=0` (read from junitxml; 300 baseline + 13 new; viz collected
+normally; 1 xpassed pre-existing). Note: squared_hellinger trains through the autograd oracle
+(`kernels.py` guards renyi-only for the hand kernel) and refuses the per-coord alpha path
+(`self_divergence_per_coord` guards renyi-only) — both automatic and correct; the per-coord refusal
+is the documented known incompatibility, and the forward+finite-loss smoke test covers the oracle
+training path.
+
+## 2026-06-02 — Log-Euclidean SPD retraction variant (spec 2a; 2b deferred)
+
+Branch: vfe3-roadmap-overnight-2026-06-02 (committed directly).
+Design spec: docs/superpowers/specs/2026-06-01-spd-retraction-variants-design.md, PHASE 1 = reading 2a
+(the pure log-Euclidean retraction) ONLY. 2b (the Frechet / Daleckii-Krein natural-gradient kernel)
+remains a deferred sub-flag per the spec — NOT built.
+
+### Files
+- `vfe3/geometry/retraction.py`: new bare `retract_logeuclidean_full` (two-eigh logm/expm) + registered
+  `@register_retraction("log_euclidean")` `retract_log_euclidean(sigma, delta_sigma, mean_ndim, *,
+  step_size, trust_region, eps, sigma_max)` — the SAME signature as `retract_spd_affine`, so the E-step
+  dispatch stays uniform.
+- `vfe3/config.py`: `spd_retract_mode="log_euclidean"` already validates against the retraction registry
+  (registration alone suffices). Added a config-time `UserWarning` (not error) when
+  `spd_retract_mode=="log_euclidean"` is paired with a diagonal family.
+- `tests/test_retraction.py`: 8 new tests (below).
+
+### The LE formula (spec reading 2a)
+    Sigma_new = expm( logm(Sigma) + step_size * sym(delta_sigma) ).
+logm/expm via `torch.linalg.eigh` (logm(Sigma) = V diag(log lambda_j) V^T; expm(M) = U diag(exp mu_j)
+U^T), the same two-eigh structure and fp32-island as `retract_spd_full`. Input eigenvalues floored at
+`eps` before log; output spectrum projected to [eps, sigma_max^2]. SPD-preserving for ANY step (expm of
+a symmetric matrix is SPD); the trust region is a stability knob, not a positivity guard. The trust
+region clamps the TANGENT term only (`logm(Sigma) + frobenius_clamp(step*delta)`), NOT the base point,
+so the retraction axiom R(Sigma, 0) = Sigma holds (matching the affine path, which clamps the whitened
+tangent). Diagonal reduction: `sigma_new = sigma * exp(step_size * delta_sigma)`.
+
+### VERIFIED diagonal relationship (spec contradiction — DONE_WITH_CONCERNS)
+The spec (sec 2, DECISION 5) claims LE EQUALS affine on the diagonal. Verified FALSE under THIS seam's
+tangent convention. Phase 0 kept the Fisher metric conversion in the E-step (`natural_gradient`,
+e_step.py:212), so the seam receives an ALREADY-preconditioned `delta_sigma`. The affine diagonal
+retraction (`retract_spd_diagonal`) then whitens that tangent by 1/sigma (`whitened = delta/sigma`,
+retraction.py:57), giving `sigma exp(step*delta/sigma)`; LE does NOT whiten, giving `sigma
+exp(step*delta)`. Equal only at sigma = I. The spec's equality holds for the 2b log-chart NATURAL
+gradient, not for 2a under a pre-whitened tangent. Consequently the config WARN is worded TRUTHFULLY:
+on a diagonal family LE is a non-canonical log-chart step (lacks the affine Fisher whitening) and does
+NOT reduce to spd_affine — prefer spd_affine on the diagonal family, or use gaussian_full. LE is a
+genuinely new variant only for full covariance (logm != elementwise log). The
+`test_log_euclidean_diagonal_differs_from_affine` test pins this finding; the spec's proposed
+`equals_affine` test was NOT written (it would assert a falsehood).
+
+### Oracles
+- SPD-preservation (core): `test_log_euclidean_stays_spd_unconditionally` — random full-cov SPD Sigma +
+  symmetric tangent, no trust region, symmetric PD output across step sizes; guards that neither the eps
+  floor nor the sigma_max cap engaged (the genuine expm map, not a clamp), plus an ill-conditioned-base
+  contrast where a naive Euclidean step leaves the cone but LE stays PD.
+- Independent matrix reference: `test_log_euclidean_full_matches_independent_expm_logm` — equals an
+  INDEPENDENTLY computed `expm(logm(Sigma) + step*sym(delta))` via `torch.linalg.matrix_exp` + an
+  eigh-based logm written in the test (distinct code path), well-conditioned Sigma + modest step so no
+  clamp binds, atol 1e-5.
+- `test_log_euclidean_identity_tangent_is_identity` — R(Sigma, 0) = Sigma at the operational
+  trust_region=5.0 (pins the tangent-only clamp fix).
+- `test_log_euclidean_diagonal_is_log_chart_step` — diagonal `sigma*exp(step*delta)`.
+- `test_log_euclidean_diagonal_differs_from_affine` — the verified scope finding above.
+- `test_log_euclidean_registered_and_config_accepts`, `test_log_euclidean_diagonal_pairing_warns` —
+  registry + config validation + the diagonal-pairing WARN (pytest.warns).
+- `test_log_euclidean_e_step_full_cov_runs` — full-covariance E-step forward+backward under
+  spd_retract_mode='log_euclidean': finite SPD covariance, finite grads.
+
+### Default path + suite
+Default `spd_affine` path byte-identical (the two `test_spd_affine_bit_identical_*` use torch.equal /
+atol=0 and pass; additive variant, no edits to affine code). Full suite after the change:
+`tests=321 failures=0 errors=0 skipped=0` (read from junitxml; 313 baseline + 8 new; 320 passed +
+1 xpassed pre-existing). 2b deferred.
+
+## 2026-06-02 — Extensible BeliefState (roadmap M3)
+
+Same running log (per the project one-doc-per-day convention; appended here on the M3 task's
+explicit instruction). Branch: vfe3-roadmap-overnight-2026-06-02.
+
+### Motivation
+M3 (modularity architecture): make `BeliefState` carry optional extra per-token channels (the
+future hyper-prior `s_i`/`r_i`, natural params, etc.) WITHOUT a signature sweep, a precondition
+for the hyper-prior/model-coupling work — while keeping the 3-field default byte-identical.
+
+### Form chosen and why
+Kept `BeliefState` a `typing.NamedTuple` and ADDED two trailing optional fields with `None`
+defaults: `s: Optional[torch.Tensor] = None`, `r: Optional[torch.Tensor] = None`. A
+codebase-wide audit (`vfe3/` + `tests/`) found every construction uses keyword arguments
+(`BeliefState(mu=, sigma=, phi=)`) and every read uses attribute access (`.mu/.sigma/.phi`); NO
+site relies on a NamedTuple-only behavior that trailing defaulted fields would break — no 3-way
+positional unpack of a belief (a naming-agnostic `^\s*\w+,\s*\w+,\s*\w+\s*=` grep confirmed no
+BeliefState ever sits on an unpack RHS), no indexing, no iteration, no `_replace`/`_asdict`. This
+is the lowest-surface extensible form (the dataclass conversion was unnecessary).
+
+### Behaviors preserved
+Keyword and positional construction, `.mu/.sigma/.phi` attribute access, `_replace`, indexing,
+and iteration all unchanged. The two new fields default to `None`, so nothing reads them and there
+is no numeric path through them — byte-identity at the model level is the full green suite.
+
+### New capability
+`BeliefState(mu, sigma, phi, s=t)` round-trips (`.s is t`); a default-constructed belief has
+`.s is None` and `.r is None`. A second belief channel can now be threaded without editing every
+signature that passes a belief.
+
+### Tests
+New `tests/test_belief.py` (6 tests): `test_three_field_construction_and_attribute_access`,
+`test_optional_channels_default_to_none`, `test_positional_construction_still_works`,
+`test_replace_preserves_namedtuple_semantics`, `test_extra_channel_round_trips`,
+`test_both_extra_channels_round_trip`. RED first (4 of 6 failed before the field add), then GREEN.
+Full suite after the change: `tests=327 failures=0 errors=0 skipped=0` (read from junitxml; 321
+baseline + 6 new; 326 passed + 1 xpassed pre-existing).
+
+## 2026-06-02 — Batched per-head `pairwise_energy` over equal irrep blocks (bit-identical)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. A perf refactor of `pairwise_energy`'s per-irrep-block
+loop; no formula change.
+
+### What changed
+`vfe3/free_energy.py`: when the irrep blocks are EQUAL size and more than one (the default
+`block_glk` case), the H per-block divergences -- the same functional over H disjoint coordinate
+slices -- are now computed in ONE functional call instead of a Python `for`-loop of per-block calls.
+The H equal blocks of the broadcast query and the transported key are sliced and stacked along a NEW
+LEADING axis (`type(q_b).stack(...)`, `type(key).stack(...)`), the functional is invoked once over
+that stacked head axis producing `(H, ..., N, N)`, and `torch.movedim(e, 0, -3)` moves the head axis
+to position `-3` to match the loop's `torch.stack(energies, dim=-3)` layout `(..., H, N, N)` exactly.
+The unequal-block path and the single-block/`None` path keep the existing loop / direct call.
+
+`vfe3/families/base.py`, `vfe3/families/gaussian.py`: a family-agnostic batching primitive
+`BeliefParams.stack(parts, *, dim=0)` -- a concrete classmethod that raises `NotImplementedError`
+(mirroring `expected_statistic`, so the toy subclasses in `test_families.py` still instantiate), with
+`DiagonalGaussian`/`FullGaussian` overrides that `torch.stack` the underlying `mu`/`sigma` tensors.
+
+### The bit-identical oracle and the unequal-block fallback
+Stacking plus one functional call is the SAME arithmetic in a different layout (every op in the
+closed forms is elementwise / last-axis-sum / last-two-axis Cholesky/solve/diagonal, no cross-head
+interaction; `movedim` is a pure permutation), so the batched output is `torch.equal` (atol=0) to the
+explicit per-block loop for both `DiagonalGaussian` and `FullGaussian`. The new tests recompute the
+loop reference in-test and assert `torch.equal`. The default `block_glk` (equal heads) now takes the
+batched path and the frozen-oracle / model / e_step / per-head-attention tests stay bit-for-bit green
+-- the full suite is the real bit-identity gate.
+
+The equal-block branch is guarded (`_stackable_for_batching`) so it fires ONLY when stacking does not
+perturb the mu/sigma broadcast: the misclassified case where `sigma` carries a leading batch dim `mu`
+lacks (Gaussian canonical rank is sigma == mu for diagonal, mu+1 for full) would right-align the new
+head axis against sigma's first batch dim and broadcast spuriously, so it falls back to the loop. A
+family that does not expose mu/sigma tensors also falls back. Unequal block sizes fall back to the
+loop. Every fallback is bit-identical to the loop because it IS the loop.
+
+### Tests (8 new)
+`tests/test_families.py`: `test_diagonal_stack_round_trips`, `test_full_stack_round_trips` (the genuine
+RED-first pair -- `stack` missing -> `AttributeError` before the override, GREEN after).
+`tests/test_free_energy.py`: `test_pairwise_energy_equal_blocks_batched_is_bit_identical_to_loop_diagonal`,
+`..._full`, `..._with_leading_batch_dim` (the `(B,N,K)` training layout -> `(B,H,N,N)`),
+`test_pairwise_energy_unequal_blocks_fall_back_to_loop`,
+`test_pairwise_energy_single_block_and_none_unchanged`,
+`test_pairwise_energy_equal_blocks_mismatched_sigma_rank_falls_back_to_loop` (pins the guard). These
+six `pairwise_energy` tests are characterization/guard tests -- green before AND after, since the
+pre-refactor `pairwise_energy` IS the loop -- recomputing the loop in-test and asserting `torch.equal`
+against the (now batched) implementation. The pre-existing `test_pairwise_energy_per_head_splits_by_
+irrep_block` (`irrep_dims=[2,2]`, equal) now routes through the batched path as a free extra guard.
+
+Full suite after the change: `tests=335 failures=0 errors=0 skipped=0` (read from junitxml; 327
+baseline + 8 new; 334 passed + 1 xpassed pre-existing; viz collected normally).
+
+## 2026-06-02 — Learnable self-coupling alpha (opt-in nn.Parameter; sanctioned NN exception)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Design spec:
+`docs/superpowers/specs/2026-06-01-learnable-alpha-design.md` (Path a, the LEARNABLE form; the
+fully-Bayesian b2 variant is deferred). The user SANCTIONED a learnable self-coupling alpha as a
+third documented neural-network exception (alongside `use_prior_bank=False`'s linear decode and
+`use_head_mixer`), ON THE CONDITION that an NN comment sits AT THE FUNCTION and AT THE CONFIG
+TOGGLE. Both are present.
+
+### The learnable form
+A single learnable SCALAR alpha (not per-coord/block in this first version). The consumed
+coupling is `alpha = exp(log_alpha)`, where `log_alpha` is a model-owned `nn.Parameter`; init
+`log_alpha = 0` gives `alpha = exp(0) = 1.0`, exactly the `constant alpha=1.0` default at step 0,
+and `exp` keeps alpha strictly positive for any real `log_alpha`. Because `alpha` is now a FREE
+parameter (not a Gamma precision posterior summary), there is NO regularizer: the form returns
+`(exp(log_alpha) * ones_like(kl), zeros_like(kl))`, so F carries the plain self-term `alpha*D` and
+the belief gradient is the plain `alpha*dD` (the `constant` form's contract). The
+alpha-envelope cancellation that `state_dependent` relies on (an explicit R(alpha) whose
+product-rule path cancels at the stationary alpha*) does NOT apply and is NOT added.
+
+### The NN-exception comments (where)
+- `vfe3/alpha_i.py` — `alpha_learnable` docstring opens "NEURAL-NETWORK EXCEPTION (sanctioned,
+  default-off): a LEARNED scalar self-coupling alpha = exp(log_alpha) ... model-owned
+  nn.Parameter trained by backprop (cf. use_head_mixer / use_prior_bank)", and states the default
+  no-NN forms are unchanged.
+- `vfe3/config.py` — comment AT the `alpha_mode` field: the default-and-pure no-NN forms are
+  `constant`/`state_dependent`/`state_dependent_per_coord` and are unchanged; "NEURAL-NETWORK
+  EXCEPTION: 'learnable' introduces a model-owned scalar nn.Parameter log_alpha (alpha =
+  exp(log_alpha)) trained by backprop -- a sanctioned, default-OFF learned-parameter exception".
+- `vfe3/model/model.py` — comment AT the `self.log_alpha` parameter definition, same wording;
+  notes that for every other (pure) alpha_mode the parameter is NOT created at all.
+
+### Files / threading path
+- `vfe3/alpha_i.py`: new `@register_alpha("learnable")` form `alpha_learnable(kl, *,
+  log_alpha=None, **kwargs)`. `alpha_gradient_coefficient` gains a `log_alpha` kwarg and forwards
+  it into `self_coupling_alpha` (the kernel's envelope coefficient is `exp(log_alpha)` since R=0).
+- `vfe3/config.py`: `"learnable"` added to `_VALID_ALPHA_MODES` (the hardcoded validated set; the
+  `alpha_is_per_coord("learnable")` guard is False, so the per-coord/diagonal-family check is
+  inert). No new config field — one new value of the existing `alpha_mode` knob.
+- `vfe3/model/model.py`: `VFEModel.__init__` creates `self.log_alpha = nn.Parameter(torch.zeros(()))`
+  ONLY when `cfg.alpha_mode == "learnable"` (no attribute otherwise — param-free pure path).
+  `forward` reads `getattr(self, "log_alpha", None)` and threads it through `vfe_stack`; the
+  M-step self-coupling block uses only `self_divergence_for_alpha` (a fixed-weight term, no alpha
+  consumption) so it is untouched; `diagnostics` passes `log_alpha` into its `vfe_stack` and
+  `self_coupling_alpha` calls.
+- Threading (one extra defaulted-None keyword, uniform): `VFEModel.forward` -> `vfe_stack(...,
+  log_alpha=)` -> `vfe_block(..., log_alpha=)` -> `e_step(..., log_alpha=)` (flows through `e_step`'s
+  `**kwargs` to BOTH `e_step_iteration` and `free_energy_value` via `_f_diag`) ->
+  `e_step_iteration(..., log_alpha=)` -> `belief_gradients(..., log_alpha=)` -> the hand kernel via
+  `alpha_gradient_coefficient(..., log_alpha=)` OR `belief_gradients_autograd(..., log_alpha=)` ->
+  `self_coupling_alpha(..., log_alpha=)`. `free_energy_value` consumes `log_alpha` in its
+  `self_coupling_alpha` call (it is part of F, not an iteration-only accept-and-ignore knob).
+  When `None`/not-learnable, every signature behaves exactly as before; the default
+  `self_coupling_alpha(..., log_alpha=None)` lands in each pure form's `**kwargs` and is ignored.
+
+### Grad-flow confirmation + two known scope limits
+On the DEFAULT kernel path (renyi + gaussian_diagonal + KL alpha_div=1 + filtering + canonical) the
+self-coupling coefficient `exp(log_alpha)` is grad-connected through the analytic kernel into the
+updated belief and thence the unrolled-E-step loss, so `loss.backward()` populates
+`model.log_alpha.grad` (verified: finite, non-None, nonzero).
+
+Two situations leave `log_alpha` ungradiented, both documented and both out of scope for this
+scalar first version:
+1. `belief_gradients_autograd` detaches `grad_mu/grad_sigma`, so on the oracle fallback (smoothing,
+   non-KL functional, Renyi alpha != 1, non-diagonal family) `log_alpha` receives NO E-step
+   gradient at all — and since alpha enters F only inside the E-step, no forward/loss-path
+   gradient reaches it either, so the parameter is fully dead on that path.
+2. `detach_e_step=True` wraps the whole E-step in `no_grad`; because `log_alpha` enters the loss
+   ONLY through the E-step belief updates (the forward loss carries no alpha term —
+   `mass_phi`/`mstep_self_coupling_weight` do not consume alpha), `log_alpha.grad` is None and the
+   parameter stays frozen at init (alpha = 1.0). `VFEModel.__init__` emits a `UserWarning` for the
+   `alpha_mode='learnable'` + `detach_e_step=True` pair, mirroring the existing
+   `use_prior_bank=False` + `detach_e_step` footgun warning.
+
+### Default-off + init==constant-1.0 oracles
+- `test_default_off_no_log_alpha_attribute`: a `constant` (default) and a `state_dependent` model
+  have NO `log_alpha` attribute (`not hasattr`) — the pure path is param-free.
+- `test_learnable_init_equals_constant_one` (the independent oracle): a `learnable` model at init
+  (`log_alpha=0`) produces `logits` and `loss` `torch.equal` (byte-identical) to the SAME
+  seed/config with `alpha_mode="constant", alpha=1.0`. This pins learnable-at-init == the
+  constant-1.0 pure path.
+- `test_learnable_log_alpha_grad_populated`: `log_alpha.grad` finite, non-None, nonzero after
+  `forward + backward`.
+- `test_learnable_alpha_changes_forward_when_log_alpha_moves`: moving `log_alpha` 0 -> log(5)
+  changes the loss (the alpha is genuinely consumed, not dead).
+- Form-level (`tests/test_alpha_i.py`): `test_learnable_alpha_is_exp_log_alpha_zero_reg`
+  (alpha == 1.0 at log_alpha=0, == 2.0 at log(2), zero reg) and
+  `test_learnable_alpha_gradient_flows_to_log_alpha` (grad reaches `log_alpha`).
+- Also `test_config_accepts_learnable_alpha_mode`, `test_learnable_creates_scalar_log_alpha_param`,
+  `test_learnable_diagnostics_runs`.
+
+### Default byte-identity + suite
+The default (non-learnable) paths are byte-identical: every new keyword defaults to None and is
+ignored by the pure forms; the frozen-seed regression / byte-identity tests
+(`test_e_step.py`) stay green. New tests: 9 (7 in `tests/test_learnable_alpha.py`, 2 in
+`tests/test_alpha_i.py`), TDD watched RED (8 failing for unregistered form / missing param) then
+GREEN. Full suite after the change: `tests=344 failures=0 errors=0 skipped=0` (read from junitxml;
+335 baseline + 9 new; 343 passed + 1 xpassed pre-existing; viz collected normally).

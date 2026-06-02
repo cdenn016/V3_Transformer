@@ -181,6 +181,131 @@ def test_pairwise_energy_per_head_splits_by_irrep_block():
     assert torch.allclose(E_one, E_full, atol=1e-6)
 
 
+def _pairwise_energy_loop_reference(q, key, irrep_dims):
+    # An EXPLICIT per-block-loop reference, recomputed in the test so the batched pairwise_energy
+    # is gated against the loop arithmetic directly (not against itself).
+    from vfe3.divergence import renyi
+    q_b = q.broadcast_over_keys()
+    energies, start = [], 0
+    for d in irrep_dims:
+        end = start + d
+        energies.append(renyi(q_b.block(start, end), key.block(start, end)))
+        start = end
+    return torch.stack(energies, dim=-3)
+
+
+def test_pairwise_energy_equal_blocks_batched_is_bit_identical_to_loop_diagonal():
+    # Equal-size, more-than-one irrep blocks (the default block_glk case) take the batched path;
+    # it is the SAME arithmetic in a different layout, so it equals the explicit per-block loop
+    # EXACTLY (torch.equal, atol=0), not merely allclose.
+    from vfe3.families.gaussian import DiagonalGaussian
+    from vfe3.free_energy import _stackable_for_batching, pairwise_energy
+
+    torch.manual_seed(7)
+    N, K, irrep_dims = 4, 8, [2, 2, 2, 2]
+    q = DiagonalGaussian(torch.randn(N, K), torch.rand(N, K) + 0.5)
+    key = DiagonalGaussian(torch.randn(N, N, K), torch.rand(N, N, K) + 0.5)
+
+    assert _stackable_for_batching(q.broadcast_over_keys(), key) is True   # the batched branch fires
+    E = pairwise_energy(q, key, irrep_dims=irrep_dims)
+    E_ref = _pairwise_energy_loop_reference(q, key, irrep_dims)
+    assert E.shape == (len(irrep_dims), N, N)
+    assert torch.equal(E, E_ref)
+
+
+def test_pairwise_energy_equal_blocks_batched_is_bit_identical_to_loop_full():
+    # Same bit-identity gate for the full-covariance family (matrix sigma sub-blocks).
+    from vfe3.families.gaussian import FullGaussian
+    from vfe3.free_energy import _stackable_for_batching, pairwise_energy
+
+    torch.manual_seed(8)
+    N, K, irrep_dims = 3, 6, [2, 2, 2]
+    A = torch.randn(N, K, K); sig_q = A @ A.transpose(-1, -2) + K * torch.eye(K)
+    Bf = torch.randn(N, N, K, K); sig_t = Bf @ Bf.transpose(-1, -2) + K * torch.eye(K)
+    q = FullGaussian(torch.randn(N, K), sig_q)
+    key = FullGaussian(torch.randn(N, N, K), sig_t)
+
+    assert _stackable_for_batching(q.broadcast_over_keys(), key) is True   # the batched branch fires
+    E = pairwise_energy(q, key, irrep_dims=irrep_dims)
+    E_ref = _pairwise_energy_loop_reference(q, key, irrep_dims)
+    assert E.shape == (len(irrep_dims), N, N)
+    assert torch.equal(E, E_ref)
+
+
+def test_pairwise_energy_equal_blocks_batched_with_leading_batch_dim():
+    # The real training layout: mu (B,N,K), key (B,N,N,K). The loop stacks at dim=-3 -> (B,H,N,N);
+    # the batched path must reproduce that exact layout (movedim of the leading head axis).
+    from vfe3.families.gaussian import DiagonalGaussian
+    from vfe3.free_energy import pairwise_energy
+
+    torch.manual_seed(9)
+    B, N, K, irrep_dims = 2, 3, 8, [2, 2, 2, 2]
+    q = DiagonalGaussian(torch.randn(B, N, K), torch.rand(B, N, K) + 0.5)
+    key = DiagonalGaussian(torch.randn(B, N, N, K), torch.rand(B, N, N, K) + 0.5)
+
+    E = pairwise_energy(q, key, irrep_dims=irrep_dims)
+    E_ref = _pairwise_energy_loop_reference(q, key, irrep_dims)
+    assert E.shape == (B, len(irrep_dims), N, N)
+    assert torch.equal(E, E_ref)
+
+
+def test_pairwise_energy_unequal_blocks_fall_back_to_loop():
+    # Unequal block sizes cannot be stacked into one functional call; the existing per-block loop
+    # is the path, and the result is unchanged from it.
+    from vfe3.families.gaussian import DiagonalGaussian
+    from vfe3.free_energy import pairwise_energy
+
+    torch.manual_seed(10)
+    N, K, irrep_dims = 3, 5, [2, 3]
+    q = DiagonalGaussian(torch.randn(N, K), torch.rand(N, K) + 0.5)
+    key = DiagonalGaussian(torch.randn(N, N, K), torch.rand(N, N, K) + 0.5)
+
+    E = pairwise_energy(q, key, irrep_dims=irrep_dims)
+    E_ref = _pairwise_energy_loop_reference(q, key, irrep_dims)
+    assert E.shape == (len(irrep_dims), N, N)
+    assert torch.equal(E, E_ref)
+
+
+def test_pairwise_energy_single_block_and_none_unchanged():
+    # irrep_dims None or a single block returns the full-K energy (..., N, N), bit-identical to the
+    # direct functional call -- the batched branch must not touch this path.
+    from vfe3.divergence import renyi
+    from vfe3.families.gaussian import DiagonalGaussian
+    from vfe3.free_energy import pairwise_energy
+
+    torch.manual_seed(11)
+    N, K = 3, 4
+    q = DiagonalGaussian(torch.randn(N, K), torch.rand(N, K) + 0.5)
+    key = DiagonalGaussian(torch.randn(N, N, K), torch.rand(N, N, K) + 0.5)
+
+    E_direct = renyi(q.broadcast_over_keys(), key)
+    assert torch.equal(pairwise_energy(q, key, irrep_dims=None), E_direct)
+    assert torch.equal(pairwise_energy(q, key, irrep_dims=[K]), E_direct)
+
+
+def test_pairwise_energy_equal_blocks_mismatched_sigma_rank_falls_back_to_loop():
+    # Guard the BLOCKED concern: when sigma_q carries a leading batch dim mu_q lacks, stacking both
+    # tensors along a new leading axis would right-align H against sigma's first batch dim and
+    # broadcast spuriously. The batched branch must DECLINE this case and fall back to the loop, so
+    # the result still equals the explicit per-block loop reference.
+    from vfe3.families.gaussian import DiagonalGaussian
+    from vfe3.free_energy import pairwise_energy
+
+    torch.manual_seed(12)
+    N, K, irrep_dims = 3, 8, [2, 2, 2, 2]
+    mu_q = torch.randn(N, K)
+    sigma_q = (torch.rand(N, K) + 0.5).unsqueeze(0)          # (1, N, K), rank mu_q.dim()+1
+    mu_t = torch.randn(N, N, K)
+    sigma_t = (torch.rand(N, N, K) + 0.5).unsqueeze(0)       # (1, N, N, K)
+    q = DiagonalGaussian(mu_q, sigma_q)
+    key = DiagonalGaussian(mu_t, sigma_t)
+
+    E = pairwise_energy(q, key, irrep_dims=irrep_dims)
+    E_ref = _pairwise_energy_loop_reference(q, key, irrep_dims)
+    assert E.shape == (1, len(irrep_dims), N, N)
+    assert torch.equal(E, E_ref)
+
+
 def test_autograd_F_matches_finite_difference():
     torch.manual_seed(0)
     N, K = 3, 4

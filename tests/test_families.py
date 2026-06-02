@@ -119,6 +119,23 @@ def test_diagonal_block_and_broadcast():
     assert qk.mu.shape == (2, 1, 6) and qk.sigma.shape == (2, 1, 6)
 
 
+def test_diagonal_stack_round_trips():
+    # `stack` is the family-agnostic primitive pairwise_energy batches the per-head loop on:
+    # it stacks the underlying tensors along a new axis and the result's block/mu/sigma stay
+    # consistent with the part it was built from.
+    from vfe3.families.gaussian import DiagonalGaussian
+    torch.manual_seed(0)
+    N, d = 3, 2
+    parts = [DiagonalGaussian(torch.randn(N, 1, d), torch.rand(N, 1, d) + 0.5) for _ in range(4)]
+    stacked = DiagonalGaussian.stack(parts, dim=0)
+    assert stacked.mu.shape == (4, N, 1, d) and stacked.sigma.shape == (4, N, 1, d)
+    for h, part in enumerate(parts):
+        assert torch.equal(stacked.mu[h], part.mu) and torch.equal(stacked.sigma[h], part.sigma)
+    # the stacked object is a DiagonalGaussian whose block slices the trailing coordinate axis
+    blk = stacked.block(0, 1)
+    assert torch.equal(blk.mu, stacked.mu[..., 0:1])
+
+
 def test_full_gaussian_closed_form_matches_legacy_and_block():
     from vfe3.families.gaussian import FullGaussian
     from vfe3.families.base import renyi as fam_renyi
@@ -133,6 +150,22 @@ def test_full_gaussian_closed_form_matches_legacy_and_block():
         assert torch.allclose(got, want, atol=1e-4), (a, (got - want).abs().max())
     qb = FullGaussian(mu_q, s_q).block(1, 3)
     assert torch.equal(qb.mu, mu_q[..., 1:3]) and torch.equal(qb.sigma, s_q[..., 1:3, 1:3])
+
+
+def test_full_stack_round_trips():
+    # FullGaussian carries a matrix sigma (..., d, d); `stack` adds the new leading axis to both
+    # mu and the matrix sigma and the parts read back unchanged.
+    from vfe3.families.gaussian import FullGaussian
+    torch.manual_seed(1)
+    N, d = 3, 2
+    parts = []
+    for _ in range(4):
+        A = torch.randn(N, 1, d, d)
+        parts.append(FullGaussian(torch.randn(N, 1, d), A @ A.transpose(-1, -2) + d * torch.eye(d)))
+    stacked = FullGaussian.stack(parts, dim=0)
+    assert stacked.mu.shape == (4, N, 1, d) and stacked.sigma.shape == (4, N, 1, d, d)
+    for h, part in enumerate(parts):
+        assert torch.equal(stacked.mu[h], part.mu) and torch.equal(stacked.sigma[h], part.sigma)
 
 
 def test_full_gaussian_per_coord_raises():
