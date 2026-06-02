@@ -95,6 +95,19 @@ class VFEModel(nn.Module):
         # so the default path is param-free.
         if cfg.alpha_mode == "learnable":
             self.log_alpha = nn.Parameter(torch.zeros(()))
+            if cfg.detach_e_step:
+                # Footgun (mirrors the use_prior_bank+detach warning below): log_alpha enters the
+                # loss ONLY through the E-step belief updates, but detach_e_step wraps the whole
+                # E-step in no_grad, so log_alpha receives NO gradient and stays frozen at its init
+                # (alpha = 1.0). Set detach_e_step=False to train the learned alpha.
+                import warnings
+                warnings.warn(
+                    "alpha_mode='learnable' with detach_e_step=True freezes log_alpha: the learned "
+                    "self-coupling alpha enters the loss only through the E-step, which the detached "
+                    "(no_grad) E-step severs, so log_alpha.grad is None and alpha stays at its init "
+                    "1.0. Set detach_e_step=False to train the learnable alpha.",
+                    stacklevel=2,
+                )
         if (not cfg.use_prior_bank) and cfg.detach_e_step:
             # Joint-toggle footgun (audit 2026-05-31): the detached E-step severs the encode prior
             # tables (mu/sigma/phi_embed) from the loss, and the linear decode reads only mu_final,

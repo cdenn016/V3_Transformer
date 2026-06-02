@@ -795,15 +795,24 @@ product-rule path cancels at the stationary alpha*) does NOT apply and is NOT ad
   When `None`/not-learnable, every signature behaves exactly as before; the default
   `self_coupling_alpha(..., log_alpha=None)` lands in each pure form's `**kwargs` and is ignored.
 
-### Grad-flow confirmation + a known scope limit
+### Grad-flow confirmation + two known scope limits
 On the DEFAULT kernel path (renyi + gaussian_diagonal + KL alpha_div=1 + filtering + canonical) the
 self-coupling coefficient `exp(log_alpha)` is grad-connected through the analytic kernel into the
 updated belief and thence the unrolled-E-step loss, so `loss.backward()` populates
-`model.log_alpha.grad` (verified: finite, non-None, nonzero). NOTE: `belief_gradients_autograd`
-detaches `grad_mu/grad_sigma`, so on the OVERSAMPLE oracle fallback (smoothing, non-KL functional,
-Renyi alpha != 1, non-diagonal family) the learned alpha would not receive an E-step gradient
-(only an F/loss-path gradient if present) — out of scope for this scalar first version, which
-targets the default kernel path.
+`model.log_alpha.grad` (verified: finite, non-None, nonzero).
+
+Two situations leave `log_alpha` ungradiented, both documented and both out of scope for this
+scalar first version:
+1. `belief_gradients_autograd` detaches `grad_mu/grad_sigma`, so on the oracle fallback (smoothing,
+   non-KL functional, Renyi alpha != 1, non-diagonal family) `log_alpha` receives NO E-step
+   gradient at all — and since alpha enters F only inside the E-step, no forward/loss-path
+   gradient reaches it either, so the parameter is fully dead on that path.
+2. `detach_e_step=True` wraps the whole E-step in `no_grad`; because `log_alpha` enters the loss
+   ONLY through the E-step belief updates (the forward loss carries no alpha term —
+   `mass_phi`/`mstep_self_coupling_weight` do not consume alpha), `log_alpha.grad` is None and the
+   parameter stays frozen at init (alpha = 1.0). `VFEModel.__init__` emits a `UserWarning` for the
+   `alpha_mode='learnable'` + `detach_e_step=True` pair, mirroring the existing
+   `use_prior_bank=False` + `detach_e_step` footgun warning.
 
 ### Default-off + init==constant-1.0 oracles
 - `test_default_off_no_log_alpha_attribute`: a `constant` (default) and a `state_dependent` model

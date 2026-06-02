@@ -89,6 +89,19 @@ def test_learnable_alpha_changes_forward_when_log_alpha_moves():
     assert not torch.allclose(loss0, loss1, atol=1e-6)
 
 
+def test_learnable_with_detach_e_step_warns_and_freezes_log_alpha():
+    # Footgun: the detached (no_grad) E-step severs log_alpha from the loss (alpha enters F only
+    # through the E-step), so it stays frozen. __init__ must warn, and log_alpha.grad must be None.
+    import pytest
+    with pytest.warns(UserWarning, match="freezes log_alpha"):
+        model = VFEModel(_cfg(alpha_mode="learnable", detach_e_step=True))
+    tok = torch.randint(0, 20, (2, 5))
+    tgt = torch.randint(0, 20, (2, 5))
+    _, loss, _ = model(tok, tgt)
+    loss.backward()
+    assert model.log_alpha.grad is None              # frozen under detach
+
+
 def test_learnable_diagnostics_runs():
     # diagnostics() consumes the learned alpha too (no-grad), and must run with finite outputs.
     import math
