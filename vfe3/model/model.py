@@ -178,6 +178,37 @@ class VFEModel(nn.Module):
             self._log_prior_cache[key] = cached
         return cached
 
+    def _amp_context(
+        self,
+        device: torch.device,            # resolves autocast device_type ('cuda' | 'cpu')
+    ):
+        r"""Opt-in autocast context for the E-step (cfg.amp_dtype), else a nullcontext.
+
+        amp_dtype=None (default) returns ``nullcontext()`` so the default path NEVER instantiates
+        a ``torch.autocast`` object -- the forward stays byte-identical to the no-AMP build. 'bf16'
+        / 'fp16' return ``torch.autocast(device_type=device.type, dtype=...)``; device_type is taken
+        from the runtime tensors so a CPU box still exercises the path (a hardcoded 'cuda' autocast
+        is inert on CPU tensors)."""
+        if self.cfg.amp_dtype is None:
+            return nullcontext()
+        dtype = torch.bfloat16 if self.cfg.amp_dtype == "bf16" else torch.float16
+        return torch.autocast(device_type=device.type, dtype=dtype)
+
+    def _amp_off_context(
+        self,
+        device: torch.device,            # resolves autocast device_type for the disable wrapper
+    ):
+        r"""fp32 island for the decode + cross-entropy, else a nullcontext.
+
+        amp_dtype=None (default) returns ``nullcontext()`` -- no autocast object is entered on the
+        default path (byte-identity). When AMP is on, returns ``torch.autocast(..., enabled=False)``
+        so no FURTHER downcasting happens inside the decode/CE; the actual fp32 guarantee comes from
+        ``.float()``-ing the decode/CE inputs at the call site (autocast-disable alone cannot upcast
+        a tensor that already arrived bf16)."""
+        if self.cfg.amp_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=device.type, enabled=False)
+
     def forward(
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
@@ -211,7 +242,15 @@ class VFEModel(nn.Module):
         # second-order term). Forward VALUE is identical across unroll/straight_through.
         e_step_gradient = self.cfg.effective_e_step_gradient
         run = torch.no_grad() if e_step_gradient == "detach" else nullcontext()
-        with run:
+        # Opt-in mixed precision (cfg.amp_dtype): wrap the E-step / belief pipeline in autocast for
+        # CUDA throughput. amp_dtype=None (default) -> nullcontext -> NO autocast object is ever
+        # instantiated on the default path, so logits/loss are byte-identical to the no-AMP build.
+        # device_type is resolved from the runtime tensors (not hardcoded 'cuda') so the path is
+        # exercised on whatever device the tokens live on; the matrix_exp / SPD islands inside
+        # vfe_stack keep their own autocast(enabled=False) fp32 guards regardless. The decode + CE
+        # below are protected separately (their inputs are .float()-ed; see _amp_off_context).
+        amp = self._amp_context(token_ids.device)
+        with run, amp:
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm, log_alpha=log_alpha,
                             connection_W=connection_W, e_step_gradient=e_step_gradient)
@@ -224,19 +263,29 @@ class VFEModel(nn.Module):
         if self.final_norm is not None:                          # config-selected final norm (cached)
             mu_final = self.final_norm(mu_final, sigma_final)
 
-        logits = self.prior_bank.decode(mu_final, sigma_final)   # (B, N, V)
+        # Decode + cross-entropy fp32 island. The decode matmul (_decode_diagonal) reconstructs the
+        # Mahalanobis term via a catastrophically-cancelling subtraction pinned at atol-1e-3, and CE
+        # is a log-sum-exp over V=50257; both MUST stay fp32 even when amp_dtype is on. The
+        # load-bearing guard is the explicit .float() on the inputs (autocast(enabled=False) only
+        # blocks FURTHER downcasting -- it does NOT upcast a tensor that already arrived bf16 from
+        # the autocast E-step), mirroring retraction.py's in-island sigma.float(). On the default
+        # fp32 path .float() is a value-identical no-op AND the island is a nullcontext (see
+        # _amp_off_context), so this block is byte-identical to the no-AMP build.
+        with self._amp_off_context(token_ids.device):
+            logits = self.prior_bank.decode(mu_final.float(), sigma_final.float())   # (B, N, V) fp32
         if targets is None:
             return logits
 
-        flat_logits = logits.reshape(-1, self.cfg.vocab_size)
-        flat_targets = targets.reshape(-1)
-        if (flat_targets != -100).any():
-            ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100)
-        else:
-            # All-ignore microbatch: F.cross_entropy returns 0/0 = NaN (mean over zero
-            # counted tokens), which poisons logging / NaN-guards / grad-accum means. Emit
-            # a finite, grad-connected zero instead (a dead-but-clean step).
-            ce = flat_logits.sum() * 0.0
+        with self._amp_off_context(token_ids.device):
+            flat_logits = logits.reshape(-1, self.cfg.vocab_size).float()
+            flat_targets = targets.reshape(-1)
+            if (flat_targets != -100).any():
+                ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100)
+            else:
+                # All-ignore microbatch: F.cross_entropy returns 0/0 = NaN (mean over zero
+                # counted tokens), which poisons logging / NaN-guards / grad-accum means. Emit
+                # a finite, grad-connected zero instead (a dead-but-clean step).
+                ce = flat_logits.sum() * 0.0
         loss = ce
         if self.cfg.mass_phi > 0.0:
             # M-step gauge-frame penalty (manuscript Algorithm 1 M-step loss): regularizes the

@@ -169,6 +169,20 @@ class VFE3Config:
     eval_interval:             int   = 0            # periodic validation every N steps (0 = off)
     checkpoint_interval:       int   = 0            # save a resumable checkpoint every N steps (0 = off)
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
+    # Opt-in mixed precision for CUDA throughput (RTX 5090). None (default) = OFF = the pure fp32
+    # path: NO autocast context is entered anywhere in the forward, so the loss/logits are
+    # byte-identical to the no-AMP build. 'bf16' / 'fp16' wrap the E-step / belief pipeline in
+    # torch.autocast. The cancellation-sensitive decode matmul (_decode_diagonal) AND the
+    # cross-entropy stay fp32 even when AMP is on (their inputs are .float()-ed and they run under
+    # an autocast(enabled=False) island), as do the existing matrix_exp / SPD-retraction islands
+    # (transport.py / retraction.py). TF32 is intentionally NOT used here: its 10-bit mantissa
+    # worsens the decode's catastrophic cancellation and breaks the atol-1e-3 decode pin (see
+    # docs/perf/2026-05-31-speedup-opportunities.md, "Rejected: global TF32"); bf16/fp16 autocast
+    # is the safe alternative precisely because those sensitive ops opt out. bf16 needs no
+    # GradScaler and is the recommended default for the 5090; fp16 TRAINING would need a GradScaler
+    # in the M-step (train.py) -- a deferred follow-up (this toggle is forward/inference-correctness
+    # scope).
+    amp_dtype:                 Optional[str] = None
 
     def __post_init__(self) -> None:
         # numerics
@@ -411,6 +425,9 @@ class VFE3Config:
             raise ValueError(f"checkpoint_interval must be >= 0, got {self.checkpoint_interval}")
         if self.eval_max_batches is not None and self.eval_max_batches < 1:
             raise ValueError(f"eval_max_batches must be >= 1 if set, got {self.eval_max_batches}")
+        # amp_dtype: None (default, OFF) = pure fp32 / no autocast; 'bf16' / 'fp16' enable autocast.
+        # None is a legal member here, so _require rejects 'fp32' and any other garbage.
+        _require(self.amp_dtype, (None, "bf16", "fp16"), "amp_dtype")
 
     @property
     def tau(self) -> float:

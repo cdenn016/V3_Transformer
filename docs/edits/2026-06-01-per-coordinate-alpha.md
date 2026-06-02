@@ -1193,3 +1193,68 @@ container-has-no-dense-Omega), `tests/test_perf_equivalence.py` (+5 guard correc
 tied_block_glk fuse; glk / so_k single-block, regime_ii, and cross-coupled block_glk stay dense). Full
 suite after the change: `tests=387 failures=0 errors=0 skipped=0` (read from junitxml; 378 baseline +
 9 new = 4 + 5; 386 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
+
+## Opt-in mixed precision (`amp_dtype`), default-OFF — 2026-06-02
+
+Added an opt-in bf16/fp16 autocast path for CUDA throughput on the RTX 5090. The pure fp32 path
+stays the default and is byte-identical to the no-AMP build: when the toggle is off, NO autocast
+context is ever instantiated in the forward.
+
+### The toggle
+
+`cfg.amp_dtype: Optional[str] = None` (config.py). `None` (default) = OFF = pure fp32, no autocast.
+`"bf16"` / `"fp16"` enable `torch.autocast` over the E-step / belief pipeline. Validated by
+`_require(self.amp_dtype, (None, "bf16", "fp16"), "amp_dtype")` — `None` is a legal member, so the
+single guard rejects `"fp32"` and any other string (there is no `"fp32"` member: fp32 is
+`amp_dtype=None`, not a precision value). TF32 is intentionally NOT used here: its 10-bit mantissa
+worsens the decode's catastrophic cancellation and would break the atol-1e-3 decode pin (perf doc
+"Rejected: global TF32"); bf16/fp16 autocast is the safe alternative precisely because the
+sensitive ops already opt out of autocast.
+
+### The fp32 islands (existing + the decode/CE added)
+
+The existing `torch.amp.autocast('cuda', enabled=False)` islands around `matrix_exp` (transport.py)
+and the SPD retractions (retraction.py) are UNCHANGED. Added to the fp32-island set: the decode
+matmul (`prior_bank.decode` / `_decode_diagonal`) AND the cross-entropy. In `model.forward` both are
+wrapped in `torch.autocast(device_type=..., enabled=False)` (via `_amp_off_context`) AND — the
+load-bearing guard — their inputs are explicitly `.float()`-ed (`decode(mu_final.float(),
+sigma_final.float())`, `logits.reshape(...).float()` before `F.cross_entropy`). The `enabled=False`
+context alone does NOT upcast a tensor that already arrived bf16 from the autocast E-step (it only
+blocks FURTHER downcasting); the `.float()` is what makes the fp32 guarantee unconditional, mirroring
+retraction.py's in-island `sigma = sigma.float()`. On the default fp32 path `.float()` is a
+value-identical no-op (confirmed by execution: at the default diagonal config the belief pipeline
+already exits fp32, because the SPD islands upcast — so the guard is defensive there and load-bearing
+only on a path that lets the mean exit bf16).
+
+### Default-off byte-identity and device gating
+
+Both autocast contexts (`_amp_context` for the E-step enable wrapper, `_amp_off_context` for the
+decode/CE disable island) return `contextlib.nullcontext()` when `amp_dtype is None`, so the default
+path enters zero autocast objects — byte-identical to the no-AMP build. The enable wrapper resolves
+`device_type` from the runtime tensors (`token_ids.device.type`), not a hardcoded `'cuda'`, so the
+path is genuinely exercised on the CPU box (a hardcoded-cuda autocast is inert on CPU tensors). The
+broader byte-identity oracle is the full suite: every existing test runs `amp_dtype=None` and stays
+green.
+
+### bf16 vs fp16
+
+bf16 needs no GradScaler and is the recommended/safe default for the 5090. fp16 TRAINING would need a
+GradScaler in the M-step (`train.py`) for stable gradients; this toggle is forward/inference-
+correctness scope, so no GradScaler was added — fp16 M-step GradScaler support is a documented
+follow-up.
+
+### Files + tests
+
+`vfe3/config.py`: `amp_dtype` field + one-line validation. `vfe3/model/model.py`: `_amp_context` /
+`_amp_off_context` helpers, the E-step `with run, amp:` wrap, and the decode/CE fp32 island with
+`.float()`-ed inputs. `prior_bank.py` was NOT touched — the call-site wrap in `model.forward` keeps
+decode dtype-agnostic (the island lives at the call site, not inside the kernel). Tests:
+`tests/test_amp.py` (new, +6: `test_default_off_enters_no_autocast_context` via a `torch.autocast`
+tripwire; `test_default_off_forward_is_deterministic_and_finite`; `test_bf16_forward_runs_and_is_finite`
+with a relaxed allclose, since CPU bf16 autocast is real casting, not a no-op;
+`test_fp16_forward_runs_and_is_finite`; `test_decode_and_ce_stay_fp32_under_bf16` spying the decode
+input/output dtypes; `test_bf16_backward_reaches_prior_tables`), `tests/test_config.py` (+1:
+`test_config_amp_dtype_default_none_and_validated`). RED confirmed against pre-change source (all 7
+failed: TypeError on the unknown kwarg / AttributeError on the missing field), then GREEN. Full suite
+after the change: `tests=394 failures=0 errors=0 skipped=0` (read from junitxml; 387 baseline + 7 new;
+393 passed + 1 xpassed pre-existing; all 8 viz tests collected normally).
