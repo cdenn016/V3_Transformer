@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from vfe3.geometry.groups import get_group
@@ -35,3 +36,8 @@ def test_apply_none_is_identity():
     phi = torch.randn(2, 5, g.generators.shape[0])
     out = apply_positional_phi(phi, g, mode="none")
     assert torch.equal(out, phi)
+
+
+def test_get_pos_phi_unknown_raises_keyerror():
+    with pytest.raises(KeyError):
+        get_pos_phi("not_a_mode")

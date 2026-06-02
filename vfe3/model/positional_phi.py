@@ -94,11 +94,12 @@ def positional_phi_coords(
     pos_phi_free: Optional[torch.Tensor] = None,
     device:       torch.device,
     dtype:        torch.dtype = torch.float32,
+    **kwargs,                              # variant params flow through (never edit this dispatcher)
 ) -> Optional[torch.Tensor]:
     r"""Dispatch to the registered pos-phi builder ``mode``; returns (N, n_gen) coords or None."""
     return get_pos_phi(mode)(
         n, n_gen, scale=scale, frozen_axis=frozen_axis,
-        pos_phi_free=pos_phi_free, device=device, dtype=dtype,
+        pos_phi_free=pos_phi_free, device=device, dtype=dtype, **kwargs,
     )
 
 
@@ -114,6 +115,7 @@ def apply_positional_phi(
     frozen_axis:  int   = 0,
     project_slk:  bool  = False,
     pos_phi_free: Optional[torch.Tensor] = None,
+    **kwargs,                             # variant params flow through to the builder
 ) -> torch.Tensor:
     r"""Compose the per-position element into ``phi`` via ``compose_phi`` (BCH by default).
 
@@ -124,7 +126,7 @@ def apply_positional_phi(
     n, n_gen = phi.shape[-2], phi.shape[-1]
     coords = positional_phi_coords(
         mode, n, n_gen, scale=scale, frozen_axis=frozen_axis,
-        pos_phi_free=pos_phi_free, device=phi.device, dtype=phi.dtype,
+        pos_phi_free=pos_phi_free, device=phi.device, dtype=phi.dtype, **kwargs,
     )
     if coords is None:
         return phi
