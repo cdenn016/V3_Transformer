@@ -7,13 +7,57 @@ Belief action: mu -> Omega @ mu, Sigma -> Omega @ Sigma @ Omega^T (sandwich;
 diagonal approximation for speed). Regime II, retractions, RoPE are later phases.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from vfe3.geometry.groups import GaugeGroup
 
 TransportDict = Dict[str, torch.Tensor]
+
+
+# -- connection-regime registry (orthogonal to the gauge_parameterization phi|omega_direct axis) --
+# The CONNECTION REGIME (flat Regime I, the non-flat Regime II to come) is a registry-backed modular
+# axis on equal footing with the structure group (clean-room spec sec 4.2): config-selected, added by
+# writing-and-registering, never editing call sites. This is ORTHOGONAL to gauge_parameterization
+# (phi|omega_direct), which chooses how a single flat transport is parameterized; the regime chooses
+# whether the connection is flat at all. Only the flat phi-cocycle is registered here; Regime II is
+# design-spec'd (docs/superpowers/specs/2026-06-01-regime-ii-connection-design.md) and deferred.
+_TRANSPORTS: Dict[str, Callable[..., TransportDict]] = {}
+
+
+def register_transport(name: str) -> Callable:
+    """Decorator registering a transport (connection-regime) builder under ``name``."""
+    def _wrap(fn: Callable[..., TransportDict]) -> Callable[..., TransportDict]:
+        _TRANSPORTS[name] = fn
+        return fn
+    return _wrap
+
+
+def get_transport(name: str) -> Callable[..., TransportDict]:
+    """Return the registered transport builder (KeyError-with-available-list if absent)."""
+    if name not in _TRANSPORTS:
+        raise KeyError(f"no transport {name!r}; available: {sorted(_TRANSPORTS)}")
+    return _TRANSPORTS[name]
+
+
+@register_transport("flat")
+def _build_flat(
+    phi:        torch.Tensor,             # (B, N, n_gen) gauge frames
+    group:      GaugeGroup,               # supplies generators, skew flag, irrep_dims
+
+    *,
+    gauge_mode: str = "learned",          # 'learned' (Regime I flat) or 'trivial'
+    **kwargs,                             # tolerated (a future non-flat builder shares this shape)
+) -> TransportDict:
+    r"""Flat (Regime I) phi-cocycle transport: the registered default.
+
+    A thin adapter forwarding verbatim to :func:`compute_transport_operators`
+    (Omega_ij = exp(phi_i) exp(-phi_j) in GL+(K)); bit-identical to calling it directly. Extra
+    keyword args are tolerated and ignored so a future stateful non-flat (Regime II) builder can
+    share this call shape without editing the registry call sites.
+    """
+    return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
 
 
 def stable_matrix_exp_pair(

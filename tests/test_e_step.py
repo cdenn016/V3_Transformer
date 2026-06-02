@@ -99,6 +99,39 @@ def test_e_step_iteration_spd_affine_default_is_byte_identical():
     assert torch.equal(out.sigma, legacy_sigma)
 
 
+def test_transport_flat_kwarg_is_byte_identical_to_default():
+    """``_transport`` with the default transport_mode='flat' is bit-identical (torch.equal) to
+    the registry-routed flat builder, on both the 2-D (diagnostics) and 3-D (batched) paths."""
+    from vfe3.inference.e_step import _transport
+
+    b, mu_p, sigma_p, grp = _belief()
+    # 2-D (N, n_gen) diagnostics path
+    o2_default = _transport(b.phi, grp)
+    o2_flat    = _transport(b.phi, grp, transport_mode="flat")
+    assert torch.equal(o2_flat, o2_default)
+    # 3-D (B, N, n_gen) batched path
+    phi3 = b.phi.unsqueeze(0).expand(2, *b.phi.shape).contiguous()
+    o3_default = _transport(phi3, grp)
+    o3_flat    = _transport(phi3, grp, transport_mode="flat")
+    assert torch.equal(o3_flat, o3_default)
+
+
+def test_e_step_iteration_transport_flat_default_is_byte_identical():
+    """The registry-routed default transport_mode='flat' reproduces the E-step iteration
+    bit-for-bit (atol=0) against the run with no transport_mode passed."""
+    b, mu_p, sigma_p, grp = _belief()
+    base = e_step_iteration(
+        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.05, e_phi_lr=0.05,
+    )
+    routed = e_step_iteration(
+        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.05, e_phi_lr=0.05,
+        transport_mode="flat",
+    )
+    assert torch.equal(routed.mu, base.mu)
+    assert torch.equal(routed.sigma, base.sigma)
+    assert torch.equal(routed.phi, base.phi)
+
+
 # --- Task 3: descent directions (the right objective per mode) -------------
 def test_filtering_step_descends_F_filt():
     # filtering (query-side) gradient descends F with KEYS FROZEN at the pre-step belief.

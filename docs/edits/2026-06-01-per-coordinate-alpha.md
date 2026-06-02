@@ -453,3 +453,66 @@ a generate call, and the training forward still returns a finite loss afterward)
 Full suite after the change: `tests=293 failures=0 errors=0 skipped=0` (read from junitxml; 284
 baseline + 9 new; viz collected normally; 1 xpassed pre-existing). `generate` is purely additive: it
 changed no existing test.
+
+### register_transport seam over the gauge transport (roadmap item)
+
+Branch: vfe3-roadmap-overnight-2026-06-02. Design spec for the deferred non-flat builder:
+`docs/superpowers/specs/2026-06-01-regime-ii-connection-design.md`. The clean-room spec (sec 4.2)
+names the connection REGIME as a registry-backed modular axis "on equal footing with the structure
+group ... config-selected, added by writing-and-registering, never editing call sites". The
+structure-group axis already IS a registry (`register_group`/`get_group`); the transport/connection
+axis was NOT — `vfe3/inference/e_step.py` imported and called `compute_transport_operators` directly.
+This is a BYTE-IDENTITY refactor adding the missing seam with the current flat phi-cocycle as the
+default registered entry. It builds ONLY the seam + flat default; the non-flat Regime II builder is
+deferred to the design spec for the user to decide (NOT built here).
+
+Orthogonality: `transport_mode` is the connection-REGIME axis (is the connection flat at all),
+ORTHOGONAL to the pre-existing `gauge_parameterization` (phi | omega_direct), which only chooses how
+a single flat transport is parameterized. The two are distinct seams; the field comment in
+`config.py` and the registry docstring in `transport.py` state this.
+
+Files:
+- `vfe3/geometry/transport.py`: new `_TRANSPORTS` registry, `register_transport(name)` decorator,
+  `get_transport(name)` (KeyError-with-available-list on miss), mirroring `register_group`/`get_group`
+  and `register_retraction`/`get_retraction`. The flat phi-cocycle is registered under `"flat"` as a
+  thin adapter `_build_flat(phi, group, *, gauge_mode="learned", **kwargs)` that forwards verbatim to
+  `compute_transport_operators(phi, group, gauge_mode=gauge_mode)` and TOLERATES extra keyword args (so
+  a future stateful non-flat builder shares the call shape). `compute_transport_operators` and
+  `compute_transport_operators_direct` are untouched. Regime II is NOT registered.
+- `vfe3/config.py`: new field `transport_mode: str = "flat"` beside the gauge-seam fields, validated
+  in `__post_init__` against the transport REGISTRY (`tuple(sorted(_TRANSPORTS))`, the
+  `divergence_families()` / `_RETRACTIONS` pattern) so a future registered regime is selectable
+  without a config edit. Local import avoids a config <- transport <- groups cycle. Default keeps the
+  flat pure path.
+- `vfe3/inference/e_step.py`: the PRIMARY E-step belief-transport build in `e_step_iteration` routes
+  through the registry — `_transport` gains a `*, transport_mode="flat"` kwarg and swaps its internal
+  `compute_transport_operators` for `get_transport(transport_mode)(...)` (the 2-D/3-D rank logic stays
+  in one place, so the 2-D diagnostics/`free_energy_value` callers keep the `"flat"` default
+  byte-identical with no edit). `e_step_iteration` accepts `transport_mode` and passes it at the
+  build; `free_energy_value` declares `transport_mode` as an explicit accept-and-ignore knob (the
+  `e_step` call site forwards one kwarg bag to both `e_step_iteration` AND `free_energy_value` via the
+  `_f_diag` trajectory path, so a missing declaration would TypeError on `return_trajectory=True`).
+  Import widened to add `get_transport`.
+- `vfe3/model/block.py`: threads `transport_mode=cfg.transport_mode` into the `e_step` call, beside
+  `spd_retract_mode=cfg.spd_retract_mode`.
+
+Intrinsically-flat helpers left on the direct call (byte-identity preserved, conscious skips): the
+mixed-frame `_transport_qk` (FILTERED objective; cannot share the single-phi flat builder),
+`phi_alignment_loss` (phi-objective, `e_phi_lr=0.0` by default; threading it is not required for this
+task), and `model.py::diagnostics` (`_transport(out.phi, ...)` at the `"flat"` default). These keep
+calling `compute_transport_operators` / the defaulted `_transport`, unchanged.
+
+Byte-identity gate: `tests/test_transport.py` adds `test_transport_registry_round_trip` (register/get
+round-trip + unknown-name KeyError, registration cleaned up in `finally`), `test_flat_is_registered`,
+`test_flat_builder_bit_identical_to_direct_call` (the ORACLE — `torch.equal` on Omega / exp_phi /
+exp_neg_phi between `get_transport("flat")(phi, group)` and the bare
+`compute_transport_operators(phi, group)` on a fixed-seed phi), and
+`test_flat_builder_tolerates_extra_kwargs`. `tests/test_config.py` adds
+`test_config_transport_mode_validated`. `tests/test_e_step.py` adds
+`test_transport_flat_kwarg_is_byte_identical_to_default` (the routed `_transport` default equals the
+explicit `"flat"` on both the 2-D and 3-D paths, atol=0) and
+`test_e_step_iteration_transport_flat_default_is_byte_identical` (the default-routed iteration's
+mu/sigma/phi equal the run with no `transport_mode`, atol=0). The wired-forward gate is
+`tests/test_perf_equivalence.py` passing in the full green suite. Full suite
+`tests=300 failures=0 errors=0 skipped=0` (read from junitxml; 293 baseline + 7 new; viz collected
+normally; 1 xpassed pre-existing).

@@ -52,6 +52,11 @@ class VFE3Config:
     # gauge seam
     gauge_group:               str   = "block_glk"
     gauge_parameterization:    str   = "phi"
+    # Connection REGIME (registry key): the flat Regime-I phi-cocycle ('flat', default = current
+    # behavior) vs the design-spec'd non-flat Regime II (deferred). ORTHOGONAL to
+    # gauge_parameterization, which picks how a single flat transport is parameterized; this picks
+    # whether the connection is flat at all. Validated against the transport registry below.
+    transport_mode:            str   = "flat"
     # Cross-head GL(K) coupling: a list of directed (head_a, head_b) index pairs that add off-block
     # generators (and a genuinely larger-than-direct-sum subalgebra under the builder's bracket
     # closure) to the gauge basis. Default None = the current block-diagonal GL(d_head)^H gauge.
@@ -153,6 +158,13 @@ class VFE3Config:
         # gauge seam
         _require(self.gauge_group, _VALID_GAUGE_GROUPS, "gauge_group")
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
+        # transport_mode selects the connection REGIME. Validated against the transport REGISTRY
+        # (not a hardcoded literal list) so a newly registered regime is a valid config value
+        # without editing this validator. Default 'flat' is the Regime-I phi-cocycle (the pure path
+        # always exists); Regime II is design-spec'd and deferred. Local import avoids a
+        # config <- transport <- groups import cycle (matching the retraction pattern below).
+        from vfe3.geometry.transport import _TRANSPORTS
+        _require(self.transport_mode, tuple(sorted(_TRANSPORTS)), "transport_mode")
         # 'omega_direct' (Omega_ij = Omega_i Omega_j^{-1} for general GL(K), det possibly < 0)
         # needs a per-token K x K group element Omega_i. The no-NN belief carries only phi
         # (n_gen Lie-algebra coords), from which the only constructible Omega_i is exp(embed(phi_i))
