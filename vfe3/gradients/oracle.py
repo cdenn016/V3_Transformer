@@ -24,6 +24,15 @@ from vfe3.free_energy import free_energy, pairwise_energy, self_divergence_for_a
 from vfe3.geometry.transport import transport_covariance, transport_mean
 
 
+# The belief update is part of the model FORWARD (iterative belief minimization), so this
+# oracle must produce a gradient even when the caller runs the forward under no_grad -- the
+# eval() / diagnostics() / generate() regime (evaluate is @torch.no_grad) and the detached
+# E-step. autograd.grad needs grad enabled, so the oracle carries its own enable_grad island,
+# exactly as the phi step does (e_step.py). create_graph stays False and the returned grads are
+# .detach()-ed, so under a no_grad caller this is a constant tangent (no graph leaks to the
+# outer scope); on the grad-enabled unrolled path the decorator is a no-op and behaviour is
+# byte-identical. The closed-form kernel path needs no such island.
+@torch.enable_grad()
 def belief_gradients_autograd(
     mu:           torch.Tensor,           # (N, K) belief means (the variable)
     sigma:        torch.Tensor,           # (N, K) belief variances

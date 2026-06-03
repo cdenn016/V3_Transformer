@@ -62,6 +62,25 @@ def test_smoothing_differs_from_filtering_by_keyside():
     assert not torch.allclose(gf_mu, gs_mu, atol=1e-4)
 
 
+def test_oracle_runs_under_no_grad():
+    # The belief oracle is part of the model FORWARD (iterative belief minimization), so it
+    # must compute the belief gradient even when the caller wraps the forward in no_grad --
+    # the eval() / diagnostics() / generate() regime (evaluate is @torch.no_grad). The
+    # autograd oracle therefore needs its own enable_grad island (the phi step already has
+    # one); without it torch.autograd.grad(F, ...) raises because F has no grad_fn under
+    # no_grad. The closed-form kernel path is unaffected, so this gap silently breaks
+    # evaluation of every NON-kernel config (surrogate / smoothing / full-cov / renyi a!=1).
+    mu, sigma, mu_p, sigma_p, omega = _setup()
+    g_on = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, tau=1.5, gradient_mode="filtering")
+    with torch.no_grad():
+        g_off = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, tau=1.5, gradient_mode="filtering")
+    # value-identical regardless of the caller's ambient grad state, and detached (safe to use
+    # as a constant tangent inside a no_grad forward)
+    assert torch.allclose(g_off[0], g_on[0], atol=1e-6)
+    assert torch.allclose(g_off[1], g_on[1], atol=1e-6)
+    assert not g_off[0].requires_grad and not g_off[1].requires_grad
+
+
 def _F_full(mu_q, sigma_q, mu_p, sigma_p, omega, tau):
     # F as a function of a SINGLE shared leaf: the transported keys are rebuilt
     # from the SAME live (mu_q, sigma_q) on every FD perturbation, so the column
