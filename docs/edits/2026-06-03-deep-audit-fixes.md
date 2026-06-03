@@ -96,6 +96,24 @@ Done in dependency order, each tier committed separately, TDD + golden-verified.
   gaussian_full eigh/cholesky double-backward can yield NaN gradients, so it is left OFF for full-cov.
   This is why the fix is an opt-in mode (as the audit's own note prescribed), not an always-on change.
 
+### Tier 4 — dense-Omega P0 refactor: NOT done (headline already shipped)
+
+Investigation finding (verified from source): the headline P0 #2 win — avoiding the dense
+`(B,N,N,K,K)` Omega in the hot mu/sigma E-step — is **already shipped**. `build_belief_transport`
+(`e_step.py:112`) returns a `FactoredTransport` (per-token exps only, no dense Omega) for the
+flat + equal-block path via `_can_fuse_flat`, consumed by `transport_mean`/`transport_covariance`
+on a fused path (pinned by `test_estep_fuses_*`). The default config (block_glk, flat, e_phi_lr=0,
+gamma=0, token prior) never materializes the dense Omega.
+
+The remaining dense-Omega sites are all NON-DEFAULT or off-hot-path, and their cost is MEMORY (long
+context), not speed: the phi-step (`e_phi_lr>0`, per-iteration), the gamma block (`gamma>0`, once per
+forward), `_transport_qk` (filtered phi-island), single-block groups (inherent — no equal blocks to
+factor), and diagnostics. Whether mopping these up is worthwhile is a fact only the user has: do real
+runs use long context (N>=256) with `gamma>0` or `e_phi_lr>0`? Deferred to the user with that question;
+the bounded SAFE option if yes is gamma-only (forward reassociation of `out.phi.detach()`, no autograd
+through phi). The phi-step is golden-pinned (frozen oracle, e_phi_lr=0.1) and would add backward
+round-off compounded over iterations, so it is intentionally left dense.
+
 ## NOT touched
 
 `ablation.py` and `train_vfe3.py` had concurrent uncommitted edits to their click-to-run config dicts
