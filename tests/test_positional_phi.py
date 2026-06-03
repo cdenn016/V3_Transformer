@@ -89,3 +89,44 @@ def test_pos_phi_learned_receives_gradient():
     loss.backward()
     assert m.pos_phi_free.grad is not None
     assert m.pos_phi_free.grad.abs().sum() > 0
+
+
+from vfe3.geometry.lie_ops import embed_phi
+
+
+def test_bch_differs_from_euclidean_when_bracket_nonzero():
+    g = _glk_group(4)                                       # gl(4): non-abelian -> [X,Y] != 0 generically
+    torch.manual_seed(0)
+    phi = torch.randn(3, g.generators.shape[0])
+    coords = positional_phi_coords("frozen", 3, g.generators.shape[0], scale=0.5,
+                                   device=torch.device("cpu"), dtype=torch.float32)
+    from vfe3.geometry.lie_ops import compose_phi
+    bch = compose_phi(phi, coords, g.generators, order=4, mode="bch")
+    euc = compose_phi(phi, coords, g.generators, order=4, mode="euclidean")
+    assert not torch.allclose(bch, euc, atol=1e-4)         # they agree only when [phi, pos]=0
+
+
+def test_project_slk_makes_blocks_traceless():
+    g = get_group("block_glk")(4, 2)                       # gl(2)^2 blocks
+    coords = positional_phi_coords("frozen", 5, g.generators.shape[0], scale=0.3,
+                                   device=torch.device("cpu"), dtype=torch.float32)
+    out = apply_positional_phi(torch.zeros(5, g.generators.shape[0]), g,
+                               mode="frozen", scale=0.3, project_slk=True)
+    M = embed_phi(out, g.generators)                       # (5, 4, 4) composed algebra element
+    # det(Omega_h)=1  <=>  block-trace of the algebra element = 0
+    assert torch.allclose(M[:, 0:2, 0:2].diagonal(dim1=-2, dim2=-1).sum(-1), torch.zeros(5), atol=1e-5)
+    assert torch.allclose(M[:, 2:4, 2:4].diagonal(dim1=-2, dim2=-1).sum(-1), torch.zeros(5), atol=1e-5)
+
+
+def test_pos_phi_does_not_change_self_coupling_diagnostic():
+    # BCH-PE modifies belief.phi only; the self-coupling KL(q_i||p_i) reads the prior p_i (encode
+    # mu/sigma), which pos_phi never touches -> the diagnostic's self_coupling term is unchanged.
+    torch.manual_seed(0)
+    x = torch.randint(0, 6, (1, 8))
+    base = VFEModel(_cfg(pos_phi="none"))
+    learned = VFEModel(_cfg(pos_phi="learned", pos_phi_scale=0.3))
+    learned.load_state_dict(base.state_dict(), strict=False)
+    with torch.no_grad():
+        learned.pos_phi_free.add_(0.2)
+    # n_e_steps small + same priors: the prior p_i is identical, so the self_coupling read is too.
+    assert abs(base.diagnostics(x)["self_coupling"] - learned.diagnostics(x)["self_coupling"]) < 1e-6
