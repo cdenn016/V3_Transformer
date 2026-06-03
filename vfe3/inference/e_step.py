@@ -284,6 +284,7 @@ def e_step_iteration(
     spd_retract_mode:          str  = "spd_affine",
     transport_mode:            str  = "flat",
     e_step_gradient:           str  = "unroll",               # backward estimator: unroll | straight_through | detach
+    oracle_unroll_grad:        bool = False,                  # opt-in: oracle returns a differentiable grad (unroll)
     cocycle_relaxation:        float = 1.0,                    # regime_ii homotopy alpha; 0 -> flat (ignored by flat)
 
     log_prior:                 Optional[torch.Tensor] = None,
@@ -320,6 +321,12 @@ def e_step_iteration(
         include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
         family=family, divergence_family=divergence_family, alpha_mode=alpha_mode,
         irrep_dims=group.irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
+        # Opt-in unrolled-oracle: make the autograd oracle (non-kernel families) return a
+        # differentiable belief gradient so the through-inference signal reaches the prior, matching
+        # the hand kernel. Gated on the explicit oracle_unroll_grad toggle (default OFF preserves the
+        # detached oracle); only meaningful under the 'unroll' estimator (straight_through detaches
+        # downstream, detach runs under no_grad).
+        create_graph=(oracle_unroll_grad and e_step_gradient == "unroll"),
     )
     nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
 
@@ -383,6 +390,7 @@ def e_step(
     e_phi_lr:          float = 0.1,
     return_trajectory: bool  = False,
     e_step_gradient:   str   = "unroll",
+    oracle_unroll_grad: bool = False,            # explicit (not in kwargs): keep it off the F_diag bag
     rope:              Optional[torch.Tensor] = None,
     rope_on_cov:       bool                   = False,
 
@@ -413,8 +421,8 @@ def e_step(
         belief = e_step_iteration(
             belief, mu_p, sigma_p, group, tau=tau,
             e_mu_lr=e_mu_lr, e_sigma_lr=e_sigma_lr, e_phi_lr=e_phi_lr,
-            e_step_gradient=e_step_gradient, log_prior=log_prior,
-            rope=rope, rope_on_cov=rope_on_cov, **kwargs,
+            e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
+            log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, **kwargs,
         )
         if return_trajectory:
             traj.append(_f_diag(belief))

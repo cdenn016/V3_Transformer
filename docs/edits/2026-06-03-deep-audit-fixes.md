@@ -81,6 +81,21 @@ Done in dependency order, each tier committed separately, TDD + golden-verified.
   for unrelated reasons (the gamma oracle assumes no positional composition; the learnable-alpha signal
   is damped below the 1e-6 floor by pos_phi magnitude) — neither is an RNG issue.
 
+### Tier 3 — oracle unrolled-gradient mode (opt-in, default OFF)
+- `vfe3/gradients/oracle.py` + `kernels.py` (`belief_gradients`) — new `create_graph` flag: when set
+  (and the belief leaves require grad), the autograd oracle differentiates the LIVE belief with
+  `create_graph=True` and returns a non-detached gradient, so the unrolled-through-inference signal
+  reaches the prior tables for the non-kernel families (smoothing / gaussian_full / alpha_div!=1) --
+  matching the closed-form kernel, which already does this. Default (`create_graph=False`) keeps the
+  detached clone + detached return, byte-identical to before; the returned VALUES are identical either
+  way (only connectivity differs), so the oracle==kernel parity tests are unaffected.
+- `vfe3/config.py` — new `oracle_unroll_grad: bool = False` (threaded config -> block -> e_step ->
+  e_step_iteration -> belief_gradients, gated on `e_step_gradient='unroll'`). **Default OFF preserves
+  the long-standing detached-oracle behavior.** CAVEAT (documented on the field): enabling it builds a
+  SECOND-ORDER graph through the E-step -- stable for the diagonal non-kernel families, but the
+  gaussian_full eigh/cholesky double-backward can yield NaN gradients, so it is left OFF for full-cov.
+  This is why the fix is an opt-in mode (as the audit's own note prescribed), not an always-on change.
+
 ## NOT touched
 
 `ablation.py` and `train_vfe3.py` had concurrent uncommitted edits to their click-to-run config dicts

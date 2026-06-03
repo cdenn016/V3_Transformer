@@ -149,6 +149,7 @@ def belief_gradients(
     c0:           float = 1.0,
 
     include_attention_entropy: bool = True,
+    create_graph:              bool = False,   # unroll: oracle returns a differentiable grad (to prior)
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
@@ -160,6 +161,10 @@ def belief_gradients(
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Belief gradient: hand kernel for filtering+gaussian_diagonal+KL+canonical, else oracle.
+
+    The closed-form kernel keeps the gradient live (analytic on the live belief), so the unrolled
+    E-step signal reaches the prior; ``create_graph=True`` makes the oracle fallback do the same for
+    the non-kernel families it serves (else its detached tangent would truncate that signal).
 
     ``irrep_dims`` (when more than one block) makes attention PER HEAD: the energy/beta carry a
     head axis and the per-coordinate beta the kernel consumes is head h's weight on coordinate k.
@@ -176,7 +181,7 @@ def belief_gradients(
         return belief_gradients_autograd(
             mu, sigma, mu_p, sigma_p, omega, tau=tau, alpha_div=alpha_div,
             kl_max=kl_max, eps=eps, b0=b0, c0=c0, value=value,
-            include_attention_entropy=include_attention_entropy,
+            include_attention_entropy=include_attention_entropy, create_graph=create_graph,
             gradient_mode=gradient_mode, family=family, divergence_family=divergence_family,
             alpha_mode=alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
         )

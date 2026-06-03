@@ -54,7 +54,7 @@ def vfe_block(
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
         cocycle_relaxation=cfg.cocycle_relaxation, connection_W=connection_W,
-        e_step_gradient=e_step_gradient,
+        e_step_gradient=e_step_gradient, oracle_unroll_grad=cfg.oracle_unroll_grad,
         log_prior=log_prior,
         rope=rope, rope_on_cov=rope_on_cov,
     )

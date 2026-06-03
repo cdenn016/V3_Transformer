@@ -223,6 +223,16 @@ class VFE3Config:
     # the current fully-unrolled path, byte-identical.
     e_step_gradient:           str   = "unroll"
     detach_e_step:             bool  = False        # False = unroll E-step in the training graph
+    # Opt-in (default OFF): make the autograd belief-gradient ORACLE (used for the non-kernel
+    # families: gradient_mode='smoothing', family='gaussian_full', alpha_div!=1) return a
+    # create_graph (differentiable) gradient under e_step_gradient='unroll', so the unrolled-through-
+    # inference signal reaches the prior tables -- matching the closed-form kernel, which already does
+    # this. Default OFF preserves the detached oracle (the gradient is truncated for those families,
+    # the long-standing behavior), so the default path is unchanged. CAVEAT: this builds a SECOND-ORDER
+    # graph through the E-step; it is numerically stable for the DIAGONAL non-kernel families
+    # (smoothing / alpha_div!=1) but the full-covariance eigh/cholesky double-backward can produce NaN
+    # gradients, so leave OFF for gaussian_full (or expect NaNs there).
+    oracle_unroll_grad:        bool  = False
     m_mu_lr:                   float = 0.025
     m_sigma_lr:                float = 0.0025
     m_phi_lr:                  float = 0.015
