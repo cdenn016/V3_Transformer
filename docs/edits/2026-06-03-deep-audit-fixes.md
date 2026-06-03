@@ -10,17 +10,22 @@ the three corrected math/theory invariants.
 
 - `vfe3/geometry/lie_ops.py` — `project_phi_to_slk` / `clamp_phi_trace`: per-block `1/||V_h||^2`
   projection → joint Gram solve `pinv(V V^T)`. Fixes the n_heads-fold over-subtraction of the per-block
-  trace under `tied_block_glk` (det Omega → 1); byte-identical on untied `block_glk`. Orphaned `eps`
-  kwarg removed.
+  trace under `tied_block_glk` (det Omega → 1); untied `block_glk` unchanged within golden tolerance
+  (atol 1e-5 — `pinv` is SVD-based, not bit-exact). Orphaned `eps` kwarg removed.
 - `vfe3/geometry/retraction.py` — `retract_spd_full` / `retract_logeuclidean_full`: full-cov eigenvalue
   ceiling `sigma_max*sigma_max` → `sigma_max` (one variance convention across the diagonal/full seam).
+  **BEHAVIOR CHANGE on the full-cov pure path:** at default `sigma_max=5.0`, full-cov eigenvalues now
+  cap at 5.0 instead of 25.0 (~5× tighter); the suite stayed green only because no tested config had
+  eigenvalues in (5,25). Raise `sigma_max` if a full-cov run wants the looser ceiling.
 - `vfe3/inference/e_step.py` — `phi_alignment_loss` now takes `transport_mode`/`connection_W`/
   `cocycle_relaxation` and builds Omega under the active regime; the phi E-step call site threads them
   (connection_W detached). Fixes the regime_ii phi-step descending the flat objective.
 - `vfe3/config.py` — corrected the `pos_phi` "default-off" comment (it is default `"learned"`); added a
   `decode_mode` ⟺ covariance-family rank cross-check (gated on `use_prior_bank`); added a
   `pos_rotation='rope'` + `gauge_group='sp'` structure-group warning; `_require(value)` → `Optional[str]`;
-  dropped a stale comment reference to a deleted function.
+  dropped a stale comment reference to a deleted function. **BEHAVIOR CHANGE:** a full-covariance family
+  without `decode_mode="full"` (and `use_prior_bank=True`) now raises at config CONSTRUCTION instead of
+  crashing at the first forward — a config dict that relied on constructing such a pairing will now error.
 - `vfe3/families/gaussian.py` — `FullGaussian.entropy` raw `cholesky` → `safe_cholesky` (non-PD-safe).
 - `vfe3/geometry/transport.py` — clarified the Frobenius-clamp docstring (operator substitution at
   `||M||>max_norm`); **deleted** dead `compute_transport_operators_direct` and `omega_to_block_exp_pairs`.

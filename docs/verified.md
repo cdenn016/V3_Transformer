@@ -11,8 +11,10 @@ INCORRECT, and whether it was RIGOROUSLY verified. Consult this before re-verify
   mutually orthogonal. Under the tied gauge the generators kron(I_n, E_ij) make all n_heads V_h rows
   identical, so the projection over-subtracted by a factor of n_heads (sign flip + n_heads x; det Omega
   -> 0.68 not 1.0). Replaced with the JOINT Gram solve `coeffs = s @ pinv(V V^T)`, which (i) drives each
-  block's trace to 0 / clamps it correctly under tied, and (ii) reduces EXACTLY to `1/||V_h||^2` for an
-  orthogonal (untied) basis (diagonal Gram), so untied `block_glk` is unchanged. Pinned by
+  block's trace to 0 / clamps it correctly under tied, and (ii) reduces to `1/||V_h||^2` for an
+  orthogonal (untied) basis (diagonal Gram) -- within golden tolerance, since `pinv` is SVD-based and
+  not bit-exact (the untied tests pass at atol 1e-5), so untied `block_glk` is unchanged to tolerance.
+  Pinned by
   `tests/test_phi_retraction.py::test_project_slk_zeros_block_trace_under_tied_gauge` and
   `..._clamp_phi_trace_bounds_block_trace_under_tied_gauge`; the pre-existing untied tests still pass.
 
