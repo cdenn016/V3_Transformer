@@ -62,6 +62,8 @@ def build_optimizer(
         groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_mu_lr})
     if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
         groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_mu_lr})
+    if getattr(model, "pos_phi_free", None) is not None:        # pos_phi='learned' positional table
+        groups.append({"params": [model.pos_phi_free], "lr": cfg.m_phi_lr})  # a gauge-frame scale
     if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (gamma_coupling>0 or
         groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_mu_lr})    # prior_source=model_channel):
         groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_sigma_lr})  # mean@m_mu_lr, log-scale@

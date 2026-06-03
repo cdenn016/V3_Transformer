@@ -287,3 +287,12 @@ def test_train_vfe3_clickrun_importable_and_runs_one_step():
     model = VFEModel(cfg)
     losses = train(model, loader, cfg, n_steps=1)
     assert len(losses) == 1 and math.isfinite(losses[0])
+
+
+def test_build_optimizer_groups_pos_phi_free():
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     pos_phi="learned", m_phi_lr=0.009)
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)                      # must NOT raise the coverage AssertionError
+    grouped = {p for g in opt.param_groups for p in g["params"]}
+    assert model.pos_phi_free in grouped
