@@ -149,6 +149,7 @@ def belief_gradients(
     c0:           float = 1.0,
 
     include_attention_entropy: bool = True,
+    create_graph:              bool = False,   # unroll: oracle returns a differentiable grad (to prior)
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
@@ -160,6 +161,10 @@ def belief_gradients(
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Belief gradient: hand kernel for filtering+gaussian_diagonal+KL+canonical, else oracle.
+
+    The closed-form kernel keeps the gradient live (analytic on the live belief), so the unrolled
+    E-step signal reaches the prior; ``create_graph=True`` makes the oracle fallback do the same for
+    the non-kernel families it serves (else its detached tangent would truncate that signal).
 
     ``irrep_dims`` (when more than one block) makes attention PER HEAD: the energy/beta carry a
     head axis and the per-coordinate beta the kernel consumes is head h's weight on coordinate k.
@@ -176,7 +181,7 @@ def belief_gradients(
         return belief_gradients_autograd(
             mu, sigma, mu_p, sigma_p, omega, tau=tau, alpha_div=alpha_div,
             kl_max=kl_max, eps=eps, b0=b0, c0=c0, value=value,
-            include_attention_entropy=include_attention_entropy,
+            include_attention_entropy=include_attention_entropy, create_graph=create_graph,
             gradient_mode=gradient_mode, family=family, divergence_family=divergence_family,
             alpha_mode=alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
         )
@@ -210,8 +215,12 @@ def _beta_to_coordinate(
     """
     if irrep_dims is None or len(irrep_dims) == 1:
         return beta.unsqueeze(-1).expand(*beta.shape, K)
-    reps = torch.tensor(irrep_dims, device=beta.device)
-    return torch.repeat_interleave(beta.movedim(-3, -1), reps, dim=-1)   # (N,N,H)->(N,N,K)
+    x = beta.movedim(-3, -1)                                             # (N, N, H)
+    if len(set(irrep_dims)) == 1:                                        # equal blocks (block_glk):
+        d = irrep_dims[0]                                                # expand/reshape, no gather --
+        return x.unsqueeze(-1).expand(*x.shape, d).reshape(*x.shape[:-1], x.shape[-1] * d)  # bit-identical
+    reps = torch.tensor(irrep_dims, device=beta.device)                 # unequal blocks: gather fallback
+    return torch.repeat_interleave(x, reps, dim=-1)                      # (N,N,H)->(N,N,K)
 
 
 def get_kernel(name: str) -> Callable:

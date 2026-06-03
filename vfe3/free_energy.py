@@ -16,6 +16,22 @@ from vfe3.divergence import get_functional
 from vfe3.families.base import BeliefParams
 
 
+def attention_tau(
+    kappa:      'float | torch.Tensor',   # sharpness scalar (kappa=1 -> Vaswani recovery)
+    irrep_dims: List[int],                # gauge-irrep block sizes; sum == K
+) -> 'float | torch.Tensor':
+    r"""Softmax temperature tau = kappa * sqrt(d_energy), where d_energy is the dimension the
+    per-pair energy E_ij = D(q_i || Omega_ij q_j) accumulates over -- the gauge-irrep BLOCK size.
+
+    Single-block groups (glk / so_k / sp report ``irrep_dims=[K]``) accumulate the divergence over
+    the full K, so d_energy = K. Per-head multi-block groups (block_glk: ``irrep_dims=[d_head]*H``)
+    accumulate per head, so d_energy = d_head. In both cases d_energy = ``irrep_dims[0]`` (the block
+    size), so kappa=1 recovers the Vaswani sqrt(d_k) temperature over the SAME dimension the energy
+    spans -- not sqrt(K/n_heads) on a single-block path whose energy is over the full K.
+    """
+    return kappa * (irrep_dims[0] ** 0.5)
+
+
 def _stackable_for_batching(
     q_b: BeliefParams,                     # broadcast query (..., N, 1, K)
     key: BeliefParams,                     # transported key  (..., N, N, K)

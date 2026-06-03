@@ -28,10 +28,16 @@ from vfe3.geometry.transport import transport_covariance, transport_mean
 # oracle must produce a gradient even when the caller runs the forward under no_grad -- the
 # eval() / diagnostics() / generate() regime (evaluate is @torch.no_grad) and the detached
 # E-step. autograd.grad needs grad enabled, so the oracle carries its own enable_grad island,
-# exactly as the phi step does (e_step.py). create_graph stays False and the returned grads are
-# .detach()-ed, so under a no_grad caller this is a constant tangent (no graph leaks to the
-# outer scope); on the grad-enabled unrolled path the decorator is a no-op and behaviour is
-# byte-identical. The closed-form kernel path needs no such island.
+# exactly as the phi step does (e_step.py).
+#
+# ``create_graph`` mirrors the hand kernel's behaviour on the UNROLLED E-step (e_step_gradient=
+# 'unroll'): with create_graph=True the query leaf is the LIVE belief (not a detached clone) and the
+# returned grads keep their grad_fn, so the unrolled-through-inference signal reaches the prior
+# tables for non-kernel families (smoothing / gaussian_full / alpha_div!=1) -- exactly as the closed-
+# form kernel already does. With create_graph=False (the default, used for detach / straight-through /
+# diagnostics / any no_grad caller) the oracle clones a detached leaf and .detach()-es the result, a
+# constant tangent that leaks no graph -- byte-identical to the previous behaviour. Either way the
+# returned VALUES are the same (autograd.grad gives the same numbers); only connectivity differs.
 @torch.enable_grad()
 def belief_gradients_autograd(
     mu:           torch.Tensor,           # (N, K) belief means (the variable)
@@ -50,6 +56,7 @@ def belief_gradients_autograd(
     value:        float = 1.0,
 
     include_attention_entropy: bool = True,
+    create_graph:              bool = False,   # True (unroll): live leaf + differentiable grad to prior
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
@@ -63,8 +70,16 @@ def belief_gradients_autograd(
 
     ``irrep_dims`` (when multi-block) routes the per-head energy through ``pairwise_energy``;
     autograd then yields the correct per-head belief gradient with no special-casing here."""
-    mu_q = mu.detach().clone().requires_grad_(True)
-    sigma_q = sigma.detach().clone().requires_grad_(True)
+    # Live leaves (keep the unrolled chain) only when create_graph is requested AND the belief
+    # genuinely carries grad upstream; otherwise a detached clone (autograd.grad needs a grad leaf,
+    # and there is no unrolled signal to preserve when the belief is grad-free, e.g. a no_grad caller
+    # or a direct unit-test call).
+    use_live = create_graph and mu.requires_grad and sigma.requires_grad
+    if use_live:
+        mu_q, sigma_q = mu, sigma
+    else:
+        mu_q = mu.detach().clone().requires_grad_(True)
+        sigma_q = sigma.detach().clone().requires_grad_(True)
 
     if gradient_mode == "filtering":
         mu_k, sigma_k = mu_q.detach(), sigma_q.detach()       # key role frozen
@@ -86,5 +101,7 @@ def belief_gradients_autograd(
         sd, energy, alpha, tau=tau, include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if alpha_mode != "constant" else None),
     )
-    grad_mu, grad_sigma = torch.autograd.grad(F, [mu_q, sigma_q])
+    grad_mu, grad_sigma = torch.autograd.grad(F, [mu_q, sigma_q], create_graph=use_live)
+    if use_live:
+        return grad_mu, grad_sigma                         # differentiable -> unrolled signal to prior
     return grad_mu.detach(), grad_sigma.detach()

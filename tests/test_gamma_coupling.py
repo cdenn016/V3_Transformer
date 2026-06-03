@@ -67,8 +67,9 @@ def _make_model(
         mstep_self_coupling_weight=0.0,
         lambda_h=lambda_h, gamma_coupling=gamma_coupling,
         kappa_gamma=kappa_gamma, gamma_attention_prior=gamma_attention_prior, seed=seed,
-        pos_phi="none",   # the gamma oracle assumes out.phi == encode().phi (no positional
-                          # composition) and the s-table draw must not RNG-diverge pos_phi_free
+        pos_phi="none",   # the _gamma_term oracle assumes out.phi == encode().phi (e_phi_lr=0), which
+                          # pos_phi COMPOSITION breaks (pos_phi folds into the frame before transport),
+                          # independent of pos_phi_free's RNG -- so this stays on the pure no-PE path
     )
     torch.manual_seed(seed)              # the model does NOT self-seed; pin RNG before construction
     return VFEModel(cfg)

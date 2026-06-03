@@ -120,7 +120,7 @@ class BeliefParams(ABC):
 _FAMILIES: Dict[str, Type[BeliefParams]] = {}
 
 
-def register_family(name: str) -> Callable:
+def register_family(name: str) -> Callable[[Type[BeliefParams]], Type[BeliefParams]]:
     r"""Register a ``BeliefParams`` subclass under ``name`` (the config ``family`` value)."""
     def _wrap(cls: Type[BeliefParams]) -> Type[BeliefParams]:
         _FAMILIES[name] = cls
@@ -145,18 +145,18 @@ def divergence_families() -> Tuple[str, ...]:
     return tuple(sorted(_FAMILIES))
 
 
-_FUNCTIONALS: Dict[str, Callable] = {}
+_FUNCTIONALS: Dict[str, Callable[..., torch.Tensor]] = {}
 
 
-def register_functional(name: str) -> Callable:
+def register_functional(name: str) -> Callable[[Callable[..., torch.Tensor]], Callable[..., torch.Tensor]]:
     r"""Register a divergence functional (renyi, ...) under ``name`` (the ``divergence_family``)."""
-    def _wrap(fn: Callable) -> Callable:
+    def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
         _FUNCTIONALS[name] = fn
         return fn
     return _wrap
 
 
-def get_functional(name: str) -> Callable:
+def get_functional(name: str) -> Callable[..., torch.Tensor]:
     r"""The registered divergence functional for ``name`` (KeyError if absent)."""
     if name not in _FUNCTIONALS:
         raise KeyError(f"no functional registered under {name!r}; available: {sorted(_FUNCTIONALS)}")
@@ -197,7 +197,7 @@ def _renyi_from_log_partition(
         # A vector statistic (..., K) sums the last axis; a matrix statistic (..., K, K) is
         # Frobenius-contracted over the last two -- so a matrix-parameter family (e.g. the full
         # Gaussian's t2) works through the generic path, not only vector-parameter families.
-        inner = 0.0
+        inner: 'torch.Tensor | float' = 0.0          # float seed; becomes a Tensor on the first term
         for g, a, b in zip(grad, tq, tp):
             term = g * (b - a)
             param_axes = tuple(range(batch_ndim, term.dim()))

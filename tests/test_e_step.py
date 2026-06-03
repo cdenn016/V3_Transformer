@@ -252,3 +252,54 @@ def test_free_energy_value_rejects_misspelled_kwarg():
     assert torch.isfinite(F)
     with pytest.raises(TypeError):
         free_energy_value(b, mu_p, sigma_p, grp, tau=1.0, familly="gaussian_diagonal")
+
+
+def test_oracle_create_graph_keeps_belief_gradient_connected():
+    # Non-kernel configs (alpha_div != 1, gaussian_full, smoothing) fall back to the autograd oracle.
+    # Under the unrolled E-step (create_graph=True) the oracle must return a belief gradient that is
+    # still DIFFERENTIABLE, so the unrolled-through-inference signal reaches the prior tables; the
+    # default (create_graph=False) path returns a detached constant tangent (byte-compatible with old).
+    from vfe3.geometry.transport import compute_transport_operators
+    from vfe3.gradients.kernels import belief_gradients
+
+    grp = get_group("glk")(4)
+    N, K = 3, 4
+    g = torch.Generator().manual_seed(0)
+    mu = torch.randn(N, K, generator=g, requires_grad=True)
+    sigma = (torch.rand(N, K, generator=g) + 0.5).requires_grad_(True)
+    mu_p = torch.randn(N, K, generator=g)
+    sigma_p = torch.rand(N, K, generator=g) + 0.5
+    omega = compute_transport_operators(
+        torch.zeros(1, N, grp.generators.shape[0]), grp)["Omega"][0]      # (N,N,K,K), Omega=I
+    kw = dict(family="gaussian_diagonal", divergence_family="renyi", alpha_div=2.0)  # alpha!=1 -> oracle
+
+    g_mu, _ = belief_gradients(mu, sigma, mu_p, sigma_p, omega, create_graph=True, **kw)
+    assert g_mu.requires_grad and g_mu.grad_fn is not None     # connected -> unrolled signal flows
+    g_mu_d, _ = belief_gradients(mu, sigma, mu_p, sigma_p, omega, **kw)
+    assert not g_mu_d.requires_grad                            # default detached (old behavior)
+    assert torch.allclose(g_mu.detach(), g_mu_d)               # same VALUES; only connectivity differs
+
+
+def test_oracle_unroll_grad_toggle_changes_prior_gradient():
+    # End-to-end: for a DIAGONAL non-kernel family (alpha_div != 1 -> autograd oracle), the opt-in
+    # oracle_unroll_grad adds the unrolled-through-inference term to the prior gradient, so mu_embed's
+    # gradient DIFFERS from the default detached oracle (both finite). gaussian_diagonal keeps the
+    # double-backward stable; gaussian_full is intentionally excluded (its eigh double-backward NaNs).
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+
+    def grad_of(toggle: bool) -> torch.Tensor:
+        cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1,
+                         n_e_steps=3, e_mu_lr=0.2, e_sigma_lr=0.1, e_phi_lr=0.0,
+                         alpha_div=2.0, pos_phi="none", oracle_unroll_grad=toggle, seed=0)
+        torch.manual_seed(0)
+        m = VFEModel(cfg)
+        tok = torch.randint(0, 12, (2, 5), generator=torch.Generator().manual_seed(1))
+        tgt = torch.randint(0, 12, (2, 5), generator=torch.Generator().manual_seed(2))
+        _, loss, _ = m(tok, tgt)
+        loss.backward()
+        return m.prior_bank.mu_embed.grad.clone()
+
+    g_off, g_on = grad_of(False), grad_of(True)
+    assert torch.isfinite(g_off).all() and torch.isfinite(g_on).all()
+    assert not torch.allclose(g_off, g_on)     # the unrolled-through-inference signal reaches the prior
