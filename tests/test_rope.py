@@ -105,3 +105,65 @@ def test_attention_maps_reflect_rope():
     b = roped.attention_maps(x)
     assert a.shape == b.shape
     assert not torch.allclose(a, b, atol=1e-5)             # RoPE changes the per-head attention
+
+
+from vfe3.gradients.kernels import belief_gradients
+from vfe3.gradients.oracle import belief_gradients_autograd
+
+
+def _full_cov_cfg(**kw):
+    """_rope_cfg defaults plus the full-covariance trio (family/diagonal_covariance/decode_mode)."""
+    base = dict(vocab_size=6, embed_dim=8, n_heads=2, max_seq_len=8, n_layers=1,
+                n_e_steps=1, e_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0, gauge_group="block_glk",
+                warmup_steps=1, max_steps=4,
+                family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+    base.update(kw)
+    return VFE3Config(**base)
+
+
+def test_rope_means_only_kernel_matches_oracle():
+    # The analytic belief-gradient kernel must still agree with autograd-of-F when the transport is
+    # rope-rotated (means-only). Both consume the RopeTransport opaquely; agreement isolates RoPE.
+    torch.manual_seed(0)
+    g = get_group("block_glk")(8, 2)
+    N, K, n_gen = 5, 8, g.generators.shape[0]
+    phi = torch.randn(1, N, n_gen) * 0.1
+    R = build_rope_rotation(torch.arange(N), g.irrep_dims, base=100.0,
+                            device=phi.device, dtype=phi.dtype)
+    omega = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False)
+    mu   = torch.randn(1, N, K); sigma   = torch.rand(1, N, K) + 0.5
+    mu_p = torch.randn(1, N, K); sigma_p = torch.rand(1, N, K) + 0.5
+    kw = dict(tau=1.0, alpha_div=1.0, kl_max=100.0, eps=1e-6, b0=1.0, c0=1.0, value=1.0,
+              include_attention_entropy=True, gradient_mode="filtering", family="gaussian_diagonal",
+              divergence_family="renyi", alpha_mode="constant", irrep_dims=g.irrep_dims, log_prior=None)
+    gk = belief_gradients(mu, sigma, mu_p, sigma_p, omega, **kw)          # hand kernel
+    go = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, **kw)  # autograd-of-F oracle
+    assert torch.allclose(gk[0], go[0], atol=1e-5)
+    assert torch.allclose(gk[1], go[1], atol=1e-5)
+
+
+def test_rope_full_gauge_covariance_equals_manual_sandwich():
+    # Full-gauge covariance: transport_covariance(RopeTransport(on_cov=True)) must equal the manual
+    # sandwich with the rotated operator Omega'_ij = R_i Omega_ij R_j^T. Pure property; no model.
+    torch.manual_seed(0)
+    N, K = 4, 4
+    R = build_rope_rotation(torch.arange(N), [K], base=10.0,
+                            device=torch.device("cpu"), dtype=torch.float64)
+    omega = torch.randn(N, N, K, K, dtype=torch.float64)
+    A = torch.randn(N, K, K, dtype=torch.float64)
+    sigma = A @ A.transpose(-1, -2) + K * torch.eye(K, dtype=torch.float64)   # SPD full cov
+    got = transport_covariance(RopeTransport(base=omega, rope=R, on_cov=True), sigma)
+    Op = torch.einsum("ikl,ijlm,jnm->ijkn", R, omega, R)                      # R_i Omega_ij R_j^T
+    manual = torch.einsum("ijkl,jlm,ijnm->ijkn", Op, sigma, Op)
+    assert torch.allclose(got, manual, atol=1e-9)
+
+
+def test_full_gauge_model_runs_forward_backward():
+    # Reachability: a full-covariance rope_full_gauge model trains (finite gradients) end to end.
+    cfg = _full_cov_cfg(pos_rotation="rope", rope_full_gauge=True)
+    torch.manual_seed(0)
+    m = VFEModel(cfg)
+    x = torch.randint(0, 6, (1, 6)); y = torch.randint(0, 6, (1, 6))
+    _, loss, _ = m(x, y); loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(m.prior_bank.mu_embed.grad).all()

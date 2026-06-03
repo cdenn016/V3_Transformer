@@ -441,6 +441,10 @@ Final runs: **6 passed** (`tests/test_rope.py`), **36 passed** (`tests/test_e_st
 
 Added `from vfe3.geometry.transport import RopeTransport` as a module-level import in `vfe3/model/model.py`. In both `diagnostics` and `attention_maps`, computed `rope = self._rope_rotation(n, token_ids.device)` before the `_transport(...)` call site and wrapped the result in `RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge)` when `rope is not None`. Because `RopeTransport` is a dataclass (not a tensor), the existing `.unsqueeze(0)[0]` pattern is bypassed for the RoPE path: `transport_mean`/`transport_covariance` are called directly on the `RopeTransport` and the raw tensors (without batch-axis wrapping), which the functions already handle via their leading-ellipsis dispatch. The non-RoPE path is unchanged. One test added to `tests/test_rope.py`: `test_attention_maps_reflect_rope` — same weights, `pos_rotation="rope"` vs `"none"`, `attention_maps` output differs. Full suite: 483 tests, 0 failures, 0 errors.
 
+## Task 2.6 — gauge-RoPE gradient-correctness tests (2026-06-02, branch vfe3-positional-encodings-2026-06-02)
+
+Three tests appended to `tests/test_rope.py`: `test_rope_means_only_kernel_matches_oracle` (hand kernel vs autograd-of-F oracle with a RopeTransport, means-only, atol=1e-5 — the real correctness gate), `test_rope_full_gauge_covariance_equals_manual_sandwich` (transport_covariance on RopeTransport(on_cov=True) equals the manual R_i Omega_ij R_j^T sandwich in float64, atol=1e-9), and `test_full_gauge_model_runs_forward_backward` (reachability: full-cov rope_full_gauge model runs forward+backward with finite loss and grad). A `_full_cov_cfg(**kw)` helper was added using `_rope_cfg` defaults plus `family="gaussian_full", diagonal_covariance=False, decode_mode="full"`. All three tests pass. Full suite: **testsuite tests=486, failures=0, errors=0**.
+
 ## Task 2.4 — RoPE config fields + thread R(theta) through stack/block/forward (2026-06-02, branch vfe3-positional-encodings-2026-06-02)
 
 Wired the gauge-RoPE rotation from config all the way through the model's `forward` call.
