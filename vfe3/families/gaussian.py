@@ -207,7 +207,14 @@ class FullGaussian(BeliefParams):
         sigma_q_reg = sigma_q + eps * eye
         sigma_t_reg = sigma_t + eps * eye
         if abs(alpha - 1.0) < 1e-6:
-            L_p = torch.linalg.cholesky(sigma_t_reg)
+            # safe_cholesky (jittered cholesky_ex, never raises) hardens the KL against a
+            # numerically non-PD prior/posterior covariance -- reachable once training shifts the
+            # prior, and routed here for any full-cov / non-kernel config via the E-step oracle.
+            # This matches the robustness the alpha != 1 branch already has. Round 0 adds zero
+            # jitter, so valid-SPD inputs stay byte-identical to torch.linalg.cholesky; an element
+            # that fails every round -> NaN -> safe_kl_clamp -> kl_max (mirroring that branch).
+            L_p, ok_p = safe_cholesky(sigma_t_reg, eps=eps, rounds=5)
+            L_q, ok_q = safe_cholesky(sigma_q_reg, eps=eps, rounds=5)
             Y = torch.linalg.solve_triangular(L_p, sigma_q_reg, upper=False)
             Z = torch.linalg.solve_triangular(L_p.transpose(-1, -2), Y, upper=True)
             trace_term = torch.diagonal(Z, dim1=-2, dim2=-1).sum(dim=-1)
@@ -217,8 +224,9 @@ class FullGaussian(BeliefParams):
             ).squeeze(-1)
             mahal_term = (v ** 2).sum(dim=-1)
             logdet_p = _logdet_chol(L_p)
-            logdet_q = _logdet_chol(torch.linalg.cholesky(sigma_q_reg))
+            logdet_q = _logdet_chol(L_q)
             div = 0.5 * (trace_term + mahal_term - K + logdet_p - logdet_q)
+            div = torch.where(ok_p & ok_q, div, div.new_tensor(float("nan")))
         else:
             # alpha > 1 leaves the convex regime: the blend can be indefinite for some
             # (i,j) pairs. safe_cholesky factors per element (cholesky_ex, never raises),

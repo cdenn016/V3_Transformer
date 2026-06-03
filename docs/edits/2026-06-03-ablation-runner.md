@@ -113,12 +113,80 @@ still failing and five passing, which indicates the latter are tied to those edi
 sensitive rather than caused here, but this was not pursued further. The runner's `entropy_term`
 sweep, whose surrogate arm previously crashed, now completes with both arms succeeding.
 
+## Full toggle coverage (train_vfe3 config + ablation registry)
+
+A follow-up request asked for the full set of toggles in both config surfaces. An audit showed
+`train_vfe3.py`'s `config` dict carried only 51 of the 74 `VFE3Config` fields (the docstring
+already claimed every toggle), so the 23 missing fields were added in their proper groups with
+inline comments: the connection regime (`transport_mode`, `cocycle_relaxation`, `cross_couplings`),
+the positional block (`pos_phi_compose`, `bch_pe_order`, `pos_phi_scale`, `pos_phi_project_slk`,
+`pos_rotation`, `rope_base`, `rope_full_gauge`), the model channel (`mstep_self_coupling_weight`,
+`lambda_h`, `gamma_coupling`, `kappa_gamma`, `gamma_attention_prior`, `prior_source`),
+`spd_retract_mode`, `decode_chunk_size`, and the training knobs (`e_step_gradient`,
+`grad_accum_steps`, `eval_max_batches`, `amp_dtype`). The dict now holds all 74 fields and
+constructs.
+
+`ablation.py` was changed (at the user's request) to stop importing the baseline and instead carry
+its own self-contained `BASELINE_CONFIG` listing all 74 toggles, so the ablation operating point is
+fully visible and editable in one place. The runner's safe-resume guard already protects against the
+resulting drift between the two independent copies. The `SWEEPS` registry was expanded from twelve
+to sixty-two entries so there is a ready single-field or multi-arm sweep for every meaningful
+toggle: sixty-four fields are covered by a sweep and the remaining ten are listed in
+`NON_SWEPT_FIELDS` with a reason (dataset-fixed, single live value, or bookkeeping). `SWEEP_ORDER`
+stays a curated eight-sweep default; `mode="list"` now prints the whole registry, marking the
+active ones.
+
+Validation: every arm of all sixty-two sweeps was dry-constructed at the real baseline (zero
+dead-on-arrival), the field-name guard passed over the whole registry, and a representative
+non-default cell of every path-changing sweep was run end-to-end (build, train, the `@no_grad`
+evaluate) on the synthetic stream. The runner correctly surfaced four model-side limitations the
+smoke turned up; three are now fixed (next section) and one is a deeper, codebase-deferred issue.
+The `cross_couplings` sweep merges the heads into one super-block, which the two-or-more-block head
+mixer cannot apply to, so it sets `use_head_mixer=False` (verified to run).
+
+The full test suite was re-run after the twenty-three-field `train_vfe3.py` config addition and
+returned the same pre-existing failure set as before, confirming that the additions (each at its
+`VFE3Config` default) introduce no regressions.
+
+## Second-round model fixes (regime_ii grouping + full-cov KL Cholesky)
+
+Two of the flagged limitations were root-caused and fixed test-first, plus a related one-line gap.
+`build_optimizer` documented but never closed a known gap: the Regime-II learned connection
+`connection_W` (transport_mode='regime_ii') and the learnable self-coupling scalar `log_alpha`
+(alpha_mode='learnable') are trainable model-level parameters that were created but added to no
+optimizer group, so the exact-coverage guard rejected the whole model. Both are now grouped
+(`connection_W` at `m_phi_lr`, `log_alpha` at `m_mu_lr`), so those toggles train; `transport_mode`,
+`cocycle_relaxation`, and `alpha_mode='learnable'` are back in the sweeps and verified to run end to
+end. Separately, the α=1 branch of the full-covariance Renyi/KL (`FullGaussian.renyi_closed_form`)
+used a raw `torch.linalg.cholesky` that raises on a numerically non-PD covariance, while the α≠1
+branch already used the jittered `safe_cholesky`; the α=1 branch now uses `safe_cholesky` too, so a
+failed factorization clamps to `kl_max` (round 0 adds no jitter, so valid-SPD inputs stay
+byte-identical). Two regression tests were added — `test_optimizer_groups_regime_ii_connection_and_learnable_alpha`
+and `test_full_kl_survives_non_pd_covariance` — both confirmed RED before and GREEN after, and the
+full suite still returns the same pre-existing failure set (no regressions).
+
+`decode_mode='full'` is the one that stays excluded. Hardening its KL Cholesky above moved the
+failure one layer down: on the prior-bank path it drives the full-covariance SPD retraction
+(`retraction.py::retract_spd_full`) into a `torch.linalg.eigh` that fails to converge on an
+ill-conditioned spectrum — and that file explicitly defers a gap-regularized robust eigh. Chasing
+that is a deeper, wider-blast-radius numerical change (it touches every full-covariance retraction,
+not just the decode), so following debugging discipline it was stopped and surfaced rather than
+pursued unilaterally. The `decode_mode` sweep therefore still ships only its two diagonal variants;
+full-covariance training remains exercised by the `covariance` sweep.
+
 ## Files
 
-- `ablation.py` — new; the sweep runner.
+- `ablation.py` — new; the sweep runner. Self-contained 74-toggle `BASELINE_CONFIG`; 60-sweep
+  registry covering 62 fields with 12 documented non-swept.
 - `vfe3/gradients/oracle.py` — `belief_gradients_autograd` decorated `@torch.enable_grad()` so the
   oracle computes the belief gradient even when the caller (eval / diagnostics / generate /
   detached E-step) runs under `no_grad`.
 - `tests/test_gradients_oracle.py` — added `test_oracle_runs_under_no_grad`.
-- `train_vfe3.py` — unchanged by this work (the working-tree edits are unrelated click-to-run
-  knob changes left in place).
+- `vfe3/train.py` — `build_optimizer` now groups `connection_W` (regime_ii, at `m_phi_lr`) and
+  `log_alpha` (learnable alpha, at `m_mu_lr`); docstring updated.
+- `vfe3/families/gaussian.py` — `FullGaussian.renyi_closed_form` α=1 branch hardened with
+  `safe_cholesky` (matches the α≠1 branch).
+- `tests/test_train.py` — added `test_optimizer_groups_regime_ii_connection_and_learnable_alpha`.
+- `tests/test_full_covariance.py` — added `test_full_kl_survives_non_pd_covariance`.
+- `train_vfe3.py` — `config` dict completed from 51 to all 74 `VFE3Config` toggles (the 23 missing
+  fields added in their groups). Pre-existing click-to-run knob edits left in place.
