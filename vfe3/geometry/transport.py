@@ -4,7 +4,8 @@ Two parameterizations of the flat (Regime I) transport:
   phi (exp):    Omega_ij = exp(phi_i . G) exp(-phi_j . G) in GL+(K) (det>0).
   omega_direct: Omega_ij = Omega_i Omega_j^{-1} for general GL(K) (det may be <0).
 Belief action: mu -> Omega @ mu, Sigma -> Omega @ Sigma @ Omega^T (sandwich;
-diagonal approximation for speed). Regime II, retractions, RoPE are later phases.
+diagonal approximation for speed). Regime II and retractions are separate modules;
+gauge-RoPE folds a positional rotation into the transport via :class:`RopeTransport`.
 """
 
 from dataclasses import dataclass
@@ -60,8 +61,8 @@ class RopeTransport:
     identical to no RoPE for the covariance, so the diagonal-covariance path stays valid.
     """
 
-    base:   'torch.Tensor | FactoredTransport'
-    rope:   torch.Tensor                  # (N, K, K) block-diagonal orthogonal rotation
+    base:   'torch.Tensor | FactoredTransport'  # (N,N,K,K) dense OR factored transport
+    rope:   torch.Tensor                        # (N, K, K) block-diagonal orthogonal rotation
     on_cov: bool = False
 
 
@@ -406,8 +407,8 @@ def compute_transport_operators_direct(
 
 
 def transport_mean(
-    omega: 'torch.Tensor | FactoredTransport',   # (..., N, N, K, K) dense OR factored exps
-    mu:    torch.Tensor,                          # (..., N, K) source (key, index j) means
+    omega: 'torch.Tensor | FactoredTransport | RopeTransport',   # (..., N, N, K, K) dense OR factored exps
+    mu:    torch.Tensor,                                          # (..., N, K) source (key, index j) means
 ) -> torch.Tensor:
     r"""Gauge action on means: mu_t[i,j] = Omega_ij @ mu_j. Returns (..., N, N, K).
 
@@ -420,6 +421,10 @@ def transport_mean(
     mu_t[i,j] = exp(phi_i) @ m_j -- an EXACT reassociation of the dense einsum (round-off level),
     never forming (B,N,N,K,K). Autograd-safe (differentiates through the live exps), so it survives
     the smoothing-mode oracle if a container ever reaches it.
+
+    ROPETRANSPORT path (``omega`` is a :class:`RopeTransport`): the gauge-RoPE rotation R(theta) is
+    applied as R_i Omega_ij R_j^T mu_j -- pre-rotate the key mean by R_j^T, transport on the
+    un-rotated base, post-rotate by R_i.
     """
     if isinstance(omega, RopeTransport):
         # mu_t[i,j] = R_i Omega_ij R_j^T mu_j: pre-rotate the key mean by R_j^T, transport on the
@@ -434,8 +439,8 @@ def transport_mean(
 
 
 def transport_covariance(
-    omega: 'torch.Tensor | FactoredTransport',   # (..., N, N, K, K) dense OR factored exps
-    sigma: torch.Tensor,                          # (..., N, K) diagonal OR (..., N, K, K) full
+    omega: 'torch.Tensor | FactoredTransport | RopeTransport',   # (..., N, N, K, K) dense OR factored exps
+    sigma: torch.Tensor,                                          # (..., N, K) diagonal OR (..., N, K, K) full
 
     *,
     diagonal_out: Optional[bool] = None,
@@ -456,6 +461,10 @@ def transport_covariance(
     square sits inside the l-sum, so it does NOT factor by squaring the full exps; it factors by
     block-diagonality. A FULL sigma rebuilds the dense Omega (byte-identical) and runs the unchanged
     sandwich, so full covariance is never the round-off factoring.
+
+    ROPETRANSPORT path (``omega`` is a :class:`RopeTransport`): means-only (``on_cov=False``) uses
+    the un-rotated base covariance; full-gauge (``on_cov=True``) sandwiches with the rotated dense
+    operator.
     """
     if isinstance(omega, RopeTransport):
         if not omega.on_cov:
