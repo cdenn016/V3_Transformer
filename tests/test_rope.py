@@ -72,3 +72,24 @@ def test_build_belief_transport_wraps_in_ropetransport_when_rope_set():
     # rope=None reproduces the plain build (no wrapper).
     plain = build_belief_transport(phi, g, transport_mode="flat")
     assert not isinstance(plain, RopeTransport)
+
+
+from vfe3.config import VFE3Config
+from vfe3.model.model import VFEModel
+
+
+def _rope_cfg(**kw):
+    base = dict(vocab_size=6, embed_dim=8, n_heads=2, max_seq_len=8, n_layers=1,
+                n_e_steps=1, e_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0, gauge_group="block_glk",
+                warmup_steps=1, max_steps=4)
+    base.update(kw)
+    return VFE3Config(**base)
+
+
+def test_rope_changes_logits_vs_no_rope():
+    torch.manual_seed(0)
+    x = torch.randint(0, 6, (2, 8))
+    base = VFEModel(_rope_cfg(pos_rotation="none"))
+    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    roped.load_state_dict(base.state_dict())
+    assert not torch.allclose(base(x), roped(x), atol=1e-5)   # RoPE perturbs attention -> logits

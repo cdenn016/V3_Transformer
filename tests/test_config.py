@@ -287,3 +287,12 @@ def test_config_accepts_newly_registered_family_without_editing_config():
             VFE3Config(family=name, diagonal_covariance=False)          # cov_kind diagonal != False
     finally:
         _FAMILIES.pop(name, None)
+
+
+def test_rope_defaults_off_and_full_gauge_requires_full_cov():
+    cfg = VFE3Config()
+    assert cfg.pos_rotation == "none" and cfg.rope_full_gauge is False
+    with pytest.raises(ValueError):
+        VFE3Config(pos_rotation="rope", rope_full_gauge=True, diagonal_covariance=True)
+    # full-gauge with full covariance is allowed
+    VFE3Config(pos_rotation="rope", rope_full_gauge=True, diagonal_covariance=False, family="gaussian_full")

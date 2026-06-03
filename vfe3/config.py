@@ -93,6 +93,13 @@ class VFE3Config:
     pos_phi_scale:             float = 0.02        # learned-table init scale AND frozen per-position step
     pos_phi_project_slk:       bool  = False       # per-block trace projection (det Omega = 1)
 
+    # gauge-RoPE (default-off): a block-diagonal positional rotation R(theta) folded into the
+    # transport (Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T). Means-only by default;
+    # rope_full_gauge=True also rotates the covariance sandwich and REQUIRES full covariance.
+    pos_rotation:              str   = "none"      # "none" | "rope" (the positional-rotation registry)
+    rope_base:                 float = 100.0       # rotary frequency base
+    rope_full_gauge:           bool  = False       # rotate covariance too (needs diagonal_covariance=False)
+
     # belief family
     diagonal_covariance:       bool  = True
     family:                    str   = "gaussian_diagonal"
@@ -404,6 +411,13 @@ class VFE3Config:
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
         _require(self.pos_phi_compose, _VALID_POS_PHI_COMPOSE, "pos_phi_compose")
+        from vfe3.geometry.rope import _POS_ROTATIONS
+        _require(self.pos_rotation, tuple(sorted(_POS_ROTATIONS)), "pos_rotation")
+        if self.rope_full_gauge and self.diagonal_covariance:
+            raise ValueError(
+                "rope_full_gauge=True rotates the covariance sandwich (R Sigma R^T), which the "
+                "diagonal-covariance approximation cannot carry; set diagonal_covariance=False."
+            )
         # spd_retract_mode selects the SPD covariance retraction geometry. Validated against the
         # retraction REGISTRY (not a hardcoded literal list) so a newly registered retraction is a
         # valid config value without editing this validator. Default 'spd_affine' is the

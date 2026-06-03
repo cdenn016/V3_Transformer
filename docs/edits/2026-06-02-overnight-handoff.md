@@ -436,3 +436,17 @@ Changes to `vfe3/inference/e_step.py`: (1) added `RopeTransport` to the transpor
 One new test appended to `tests/test_rope.py`: `test_build_belief_transport_wraps_in_ropetransport_when_rope_set` — confirms the return type is `RopeTransport` when `rope` is given and is NOT `RopeTransport` (plain fused/dense path) when `rope=None`.
 
 Final runs: **6 passed** (`tests/test_rope.py`), **36 passed** (`tests/test_e_step.py tests/test_transport.py`), 0 failures, 0 errors — both read from the `N passed` lines.
+
+## Task 2.4 — RoPE config fields + thread R(theta) through stack/block/forward (2026-06-02, branch vfe3-positional-encodings-2026-06-02)
+
+Wired the gauge-RoPE rotation from config all the way through the model's `forward` call.
+
+Changes to `vfe3/config.py`: added three fields (`pos_rotation: str = "none"`, `rope_base: float = 100.0`, `rope_full_gauge: bool = False`) in the gauge-seam section next to the BCH-PE fields. `__post_init__` validates `pos_rotation` against the `_POS_ROTATIONS` registry and rejects `rope_full_gauge=True` with `diagonal_covariance=True` (the diagonal approximation cannot carry the covariance sandwich `R Sigma R^T`).
+
+Changes to `vfe3/model/stack.py` and `vfe3/model/block.py`: added `rope: Optional[torch.Tensor] = None` and `rope_on_cov: bool = False` as keyword parameters to both `vfe_stack` and `vfe_block`; forwarded through the call chain (`vfe_stack` -> `vfe_block` -> `e_step`).
+
+Changes to `vfe3/model/model.py`: imported `get_pos_rotation`; added `self._rope_cache: dict = {}` alongside `self._log_prior_cache`; added `self._rope_cache.clear()` in `_apply` alongside the log-prior cache clear; added `_rope_rotation(n, device)` method (mirrors `_attention_log_prior`, caches on `(n, device, dtype)`, returns `None` for `pos_rotation="none"`); in `forward` computed `rope = self._rope_rotation(N, token_ids.device)` after the log-prior line and added `rope=rope, rope_on_cov=self.cfg.rope_full_gauge` to the `vfe_stack` call.
+
+Two tests added: `test_rope_defaults_off_and_full_gauge_requires_full_cov` in `tests/test_config.py` (defaults + validation), and `test_rope_changes_logits_vs_no_rope` in `tests/test_rope.py` (end-to-end: same weights, `pos_rotation="rope"` vs `"none"`, logits differ). The `_rope_cfg` helper and the `VFE3Config`/`VFEModel` imports were already present in `test_rope.py` from the full-model test added here.
+
+Final runs: **8 passed** (`tests/test_config.py -k rope tests/test_rope.py`); full suite **testsuite tests=482, failures=0, errors=0** (from `--junitxml`).

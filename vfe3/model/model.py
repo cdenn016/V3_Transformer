@@ -19,6 +19,7 @@ from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.norms import get_norm
+from vfe3.geometry.rope import get_pos_rotation
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import vfe_block
 from vfe3.model.positional_phi import apply_positional_phi
@@ -151,6 +152,9 @@ class VFEModel(nn.Module):
         # (audit 4e) keyed on those so it is built once, not every forward. Not an nn.buffer
         # because it depends on the runtime N (sequence length), which varies across calls.
         self._log_prior_cache: dict = {}
+        # Gauge-RoPE rotation R(theta) is similarly loop-invariant for fixed (N, device, dtype);
+        # cache keyed on (N, device, dtype) so it is built once. None on the 'none' path.
+        self._rope_cache: dict = {}
         # BCH positional encoding (default-off): a learned per-position Lie-algebra element table
         # composed into the gauge frame before transport. Created ONLY for pos_phi='learned' (a raw
         # nn.Parameter like log_alpha/connection_W, not a network); the "none"/"frozen" paths add no
@@ -182,6 +186,7 @@ class VFEModel(nn.Module):
         super()._apply(fn, recurse)
         self.group.generators = fn(self.group.generators)
         self._log_prior_cache.clear()        # device/dtype moved: cached masks are now stale
+        self._rope_cache.clear()             # device/dtype moved: cached rotations are now stale
         return self
 
     def _attention_log_prior(
@@ -199,6 +204,24 @@ class VFEModel(nn.Module):
         if cached is None:
             cached = attention_log_prior(self.cfg.attention_prior, n, n, device=device, dtype=dtype)
             self._log_prior_cache[key] = cached
+        return cached
+
+    def _rope_rotation(
+        self,
+        n:      int,                          # sequence length N (varies across calls)
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        r"""Cached gauge-RoPE rotation R(theta) for length n (None when pos_rotation='none')."""
+        if self.cfg.pos_rotation == "none":
+            return None
+        dtype = self.prior_bank.mu_embed.dtype
+        key = (n, device, dtype)
+        cached = self._rope_cache.get(key)
+        if cached is None:
+            cached = get_pos_rotation(self.cfg.pos_rotation)(
+                torch.arange(n, device=device), self.group.irrep_dims,
+                base=self.cfg.rope_base, device=device, dtype=dtype)
+            self._rope_cache[key] = cached
         return cached
 
     def _amp_context(
@@ -254,6 +277,7 @@ class VFEModel(nn.Module):
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
         beliefs = beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))
         log_prior = self._attention_log_prior(N, token_ids.device)
+        rope = self._rope_rotation(N, token_ids.device)
 
         # The E-step stack is vectorized over the batch (audit 4c): the belief tuple carries a
         # leading B axis through transport / gradients / retraction in one set of kernels, instead
@@ -289,7 +313,8 @@ class VFEModel(nn.Module):
         with run, amp:
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm, log_alpha=log_alpha,
-                            connection_W=connection_W, e_step_gradient=e_step_gradient)
+                            connection_W=connection_W, e_step_gradient=e_step_gradient,
+                            rope=rope, rope_on_cov=self.cfg.rope_full_gauge)
         mu_final = out.mu                                        # (B, N, K)
         sigma_final = out.sigma
 

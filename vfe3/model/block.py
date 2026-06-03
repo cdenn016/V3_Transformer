@@ -28,6 +28,8 @@ def vfe_block(
     log_alpha:       Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
     connection_W:    Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
     e_step_gradient: str                       = "unroll",  # E-step backward estimator (unroll | straight_through | detach)
+    rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
+    rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
@@ -35,7 +37,9 @@ def vfe_block(
     under alpha_mode='learnable', forwarded to the E-step; None on the pure path. ``connection_W``
     is the model's learned bilinear Regime-II connection (a sanctioned NN exception) forwarded under
     transport_mode='regime_ii'; None on the pure (flat) path. ``e_step_gradient`` is the E-step
-    backward estimator forwarded to the E-step (unroll | straight_through | detach)."""
+    backward estimator forwarded to the E-step (unroll | straight_through | detach). ``rope`` is
+    the precomputed block-diagonal positional rotation R(theta) (None = off, the pure path);
+    ``rope_on_cov`` enables the full-gauge covariance sandwich rotation."""
     out = e_step(
         belief, mu_p, sigma_p, group,
         n_iter=cfg.n_e_steps, tau=cfg.tau,
@@ -51,6 +55,7 @@ def vfe_block(
         cocycle_relaxation=cfg.cocycle_relaxation, connection_W=connection_W,
         e_step_gradient=e_step_gradient,
         log_prior=log_prior,
+        rope=rope, rope_on_cov=rope_on_cov,
     )
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         out = BeliefState(mu=block_norm(out.mu, out.sigma), sigma=out.sigma, phi=out.phi)

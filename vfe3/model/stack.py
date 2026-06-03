@@ -28,6 +28,8 @@ def vfe_stack(
     log_alpha:       Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
     connection_W:    Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
     e_step_gradient: str                       = "unroll",  # E-step backward estimator (unroll | straight_through | detach)
+    rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
+    rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
 ) -> BeliefState:
     r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior.
 
@@ -38,13 +40,15 @@ def vfe_stack(
     transport_mode='regime_ii'; None on the pure (flat) path. ``e_step_gradient`` is the E-step
     backward estimator forwarded to the E-step ('unroll' default keeps the second-order trajectory
     gradient, 'straight_through' detaches the per-iteration tangent; both share the forward value).
-    'detach' is handled by the caller's no_grad wrapper, so here it behaves like 'unroll'."""
+    'detach' is handled by the caller's no_grad wrapper, so here it behaves like 'unroll'.
+    ``rope`` is the precomputed block-diagonal positional rotation R(theta) (None = off, the pure
+    path); ``rope_on_cov`` enables the full-gauge covariance sandwich rotation."""
     rho = cfg.prior_handoff_rho
     rho_s = cfg.prior_handoff_sigma
     for _ in range(cfg.n_layers):
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, log_alpha=log_alpha, connection_W=connection_W,
-                           e_step_gradient=e_step_gradient)
+                           e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov)
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
     return belief
