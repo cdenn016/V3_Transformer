@@ -118,9 +118,11 @@ def test_project_slk_makes_blocks_traceless():
     assert torch.allclose(M[:, 2:4, 2:4].diagonal(dim1=-2, dim2=-1).sum(-1), torch.zeros(5), atol=1e-5)
 
 
-def test_pos_phi_does_not_change_self_coupling_diagnostic():
-    # BCH-PE modifies belief.phi only; the self-coupling KL(q_i||p_i) reads the prior p_i (encode
-    # mu/sigma), which pos_phi never touches -> the diagnostic's self_coupling term is unchanged.
+def test_pos_phi_leaves_the_prior_unchanged():
+    # BCH-PE composes the positional element into belief.phi AFTER prior_bank.encode, so the PRIOR
+    # p_i = encode(x) (mu, sigma) is phi-independent. (The self-coupling KL(q_i||p_i) DOES move,
+    # because the converged belief q_i depends on phi via transport -- that is expected; only the
+    # prior is invariant, which is what "pos_phi touches only phi, not the prior" means.)
     torch.manual_seed(0)
     x = torch.randint(0, 6, (1, 8))
     base = VFEModel(_cfg(pos_phi="none"))
@@ -128,5 +130,7 @@ def test_pos_phi_does_not_change_self_coupling_diagnostic():
     learned.load_state_dict(base.state_dict(), strict=False)
     with torch.no_grad():
         learned.pos_phi_free.add_(0.2)
-    # n_e_steps small + same priors: the prior p_i is identical, so the self_coupling read is too.
-    assert abs(base.diagnostics(x)["self_coupling"] - learned.diagnostics(x)["self_coupling"]) < 1e-6
+    eb = base.prior_bank.encode(x)
+    el = learned.prior_bank.encode(x)
+    assert torch.equal(eb.mu, el.mu)
+    assert torch.equal(eb.sigma, el.sigma)
