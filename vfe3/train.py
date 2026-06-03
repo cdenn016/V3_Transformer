@@ -334,8 +334,9 @@ def train(
             # synthetic/test vocabs get no decoder. When a decoder exists, greedily continue seq 0 of
             # the live batch by sample_new_tokens and decode prompt + continuation. Best-effort: a
             # generation/decode error is logged, never fatal (model.generate is @torch.no_grad).
-            decode = None if not generate_samples else (
+            resolved_decode = (
                 sample_decode if sample_decode is not None else _default_sample_decoder(cfg))
+            decode = resolved_decode if generate_samples else None
             if decode is not None:
                 try:
                     prompt = tokens[:1, :sample_prompt_len]                       # (1, P) seq-0 prompt
@@ -368,10 +369,13 @@ def train(
                     "gauge_trace_spread": d["gauge_trace_spread"],
                 })
                 artifacts.maybe_save_best(step + 1, model, m["ppl"])
-                # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0 of
-                # the live batch -- the same sequence the diagnostics above read). Best-effort inside
+                # Per-layer/per-head log10 attention heatmaps for this eval (off the graph, seq 0 of
+                # the live batch -- the same sequence the diagnostics above read), one image per
+                # (layer, head), plus the seq-0 token text (``resolved_decode`` regardless of
+                # ``generate_samples``, since the text just labels the maps). Best-effort inside
                 # save_attention_maps: a viz error is logged, never fatal to the run.
-                artifacts.save_attention_maps(step + 1, model.attention_maps(tokens), logger=logger)
+                artifacts.save_attention_maps(
+                    step + 1, model.attention_maps(tokens), tokens[0], resolved_decode, logger=logger)
 
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
         if (artifacts is not None and cfg.checkpoint_interval

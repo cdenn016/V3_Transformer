@@ -101,15 +101,34 @@ def test_train_with_artifacts_writes_files(tmp_path):
 
 
 def test_train_with_artifacts_writes_attention_pngs(tmp_path):
-    # Per-eval per-layer/per-head attention grid: one attention/step_<N>.png per periodic eval.
+    # Per-eval: one log-scale PNG per (layer, head) under attention/step_<N>/layer*_head*.png.
     cfg = _cfg(n_layers=2, prior_handoff_rho=0.5)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
     train(model, _loader(), cfg, n_steps=4, eval_interval=2, val_loader=_loader(seed=1), artifacts=art)
-    pngs = sorted((tmp_path / "run" / "attention").glob("step_*.png"))
-    assert [p.name for p in pngs] == ["step_2.png", "step_4.png"]
-    assert all(p.stat().st_size > 0 for p in pngs)
+    x, _ = next(iter(_loader()))
+    n_layers, n_heads = model.attention_maps(x).shape[:2]        # H from group.irrep_dims, not n_heads
+    for step in (2, 4):
+        step_dir = tmp_path / "run" / "attention" / f"step_{step}"
+        pngs = sorted(step_dir.glob("layer*_head*.png"))
+        assert len(pngs) == n_layers * n_heads
+        assert all(p.stat().st_size > 0 for p in pngs)
+
+
+def test_save_attention_maps_writes_token_text(tmp_path):
+    # With a decoder, the seq-0 token text the maps were computed on is written as tokens.txt.
+    cfg = _cfg(n_layers=1)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    x, _ = next(iter(_loader()))
+    maps = model.attention_maps(x)
+    decode = lambda ids: "".join(f"[{int(t)}]" for t in ids)     # ids -> deterministic text
+    step_dir = art.save_attention_maps(7, maps, x[0], decode)
+    txt = (step_dir / "tokens.txt").read_text(encoding="utf-8")
+    assert decode(x[0].tolist()) in txt                          # full text present
+    assert f"(N={x.shape[1]})" in txt and "# index\ttoken" in txt
 
 
 def test_save_attention_maps_is_best_effort(tmp_path):

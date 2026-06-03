@@ -162,6 +162,37 @@ def plot_attention_heatmap(
     return _save(fig, path)
 
 
+def plot_attention_map(
+    beta,                                # (N, N) attention weights for ONE layer/head
+
+    *,
+    floor: float          = -6.0,        # log10 floor: active cells below clip here; masked beta=0 -> NaN
+    title: str            = "Attention",
+    path:  Optional[str]  = None,
+):
+    r"""Single-panel ``log10`` heatmap of one attention map (rows = query i, cols = key j).
+
+    ``beta`` is a softmax row distribution, so ``beta in (0, 1]`` and ``log10(beta) <= 0``; the
+    colour range is pinned to ``[floor, 0]`` so every per-(layer, head) image shares one scale and
+    a sharp head stays visually comparable to a diffuse one. Causally-masked keys (``beta == 0``,
+    upper triangle under the causal prior) become NaN and render in the colormap's "bad" colour
+    (grey); active cells below ``floor`` clip to ``floor``. The log scale is what makes the small
+    off-diagonal structure legible -- on a linear ``[0, 1]`` scale only the diagonal shows.
+    """
+    B = _np(beta).astype(np.float64)
+    with np.errstate(divide="ignore"):
+        logB = np.log10(B)                           # (N, N); beta=0 -> -inf
+    logB[~np.isfinite(logB)] = np.nan                # masked / zero -> NaN (grey via set_bad)
+    logB = np.clip(logB, floor, 0.0)                 # np.clip preserves NaN; active floor at `floor`
+    cmap = plt.get_cmap("magma").copy()
+    cmap.set_bad("#d9d9d9")
+    fig, ax = plt.subplots(figsize=(4.5, 4))
+    im = ax.imshow(logB, cmap=cmap, aspect="auto", vmin=floor, vmax=0.0)
+    fig.colorbar(im, ax=ax, shrink=0.8, label=r"$\log_{10}\beta_{ij}$")
+    ax.set(title=title, xlabel="key $j$", ylabel="query $i$")
+    return _save(fig, path)
+
+
 def plot_attention_grid(
     maps,                                # (L, H, N, N) per-layer per-head attention (or (H,N,N) / (N,N))
 
@@ -249,6 +280,7 @@ _FIGURES: Dict[str, Callable] = {
     "embedding":           plot_embedding,
     "attention_graph":     plot_attention_graph,
     "attention_heatmap":   plot_attention_heatmap,
+    "attention_map":       plot_attention_map,
     "attention_grid":      plot_attention_grid,
     "covariance_ellipses": plot_covariance_ellipses,
     "trajectory":          plot_trajectory,
