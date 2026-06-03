@@ -167,3 +167,13 @@ def test_full_gauge_model_runs_forward_backward():
     _, loss, _ = m(x, y); loss.backward()
     assert torch.isfinite(loss)
     assert torch.isfinite(m.prior_bank.mu_embed.grad).all()
+
+
+def test_2x2_positional_ablation_runs():
+    torch.manual_seed(0)
+    x = torch.randint(0, 6, (2, 8))
+    for pr in ("none", "rope"):
+        for pp in ("none", "learned"):
+            m = VFEModel(_rope_cfg(pos_rotation=pr, pos_phi=pp))
+            out = m(x)
+            assert out.shape[0] == 2 and torch.isfinite(out).all()
