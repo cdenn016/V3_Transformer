@@ -47,10 +47,10 @@ def build_optimizer(
     prior_bank.py) -- a fixed centroid per the manuscript's "higher, slower meta-level"
     (GL(K)_supplementary.tex:1081); the coverage guard exempts it, so it needs no group and is never
     updated (freely training r alongside s would collapse KL(s||r)->0).
-    KNOWN GAP (still deferred, so this guard RAISES for these toggles): ``log_alpha``
-    (alpha_mode='learnable') and ``connection_W`` (transport_mode='regime_ii') are TRAINABLE model-level
-    nn.Parameters NOT yet grouped; grouping them (with feature-appropriate LRs) is deferred to those
-    features' owners.
+    The learned MODEL-level parameters are grouped likewise when their toggle is on: the Regime-II
+    edge connection ``connection_W`` (transport_mode='regime_ii') at ``m_phi_lr`` (a gauge-connection
+    scale) and the learnable self-coupling ``log_alpha`` (alpha_mode='learnable') at ``m_mu_lr`` -- so
+    those sanctioned-NN-exception toggles train rather than tripping the coverage guard.
     """
     pb = model.prior_bank
     groups = [
@@ -71,6 +71,10 @@ def build_optimizer(
         # live belief prior, so it must train. The hyper-prior CENTROID r (lambda_h>0) is NOT grouped
         # because it is FROZEN (requires_grad=False, prior_bank.py) -- a fixed centroid per the
         # manuscript's "higher, slower meta-level"; the coverage guard exempts non-trainable params.
+    if getattr(model, "connection_W", None) is not None:        # transport_mode='regime_ii' learned
+        groups.append({"params": [model.connection_W], "lr": cfg.m_phi_lr})  # connection -> gauge LR
+    if getattr(model, "log_alpha", None) is not None:           # alpha_mode='learnable' scalar coupling
+        groups.append({"params": [model.log_alpha], "lr": cfg.m_mu_lr})
 
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
     # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the

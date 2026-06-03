@@ -56,12 +56,121 @@ from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.train import evaluate, train
 
-# The baseline operating point IS train_vfe3.py's config (single source of truth) plus its
-# zero-dependency synthetic stream (the fallback when a corpus cache is absent).
-from train_vfe3 import config as BASELINE_CONFIG
+# Only the zero-dependency synthetic stream is borrowed from train_vfe3 (the corpus-cache
+# fallback); the baseline operating point is self-contained below.
 from train_vfe3 import synthetic_period3_loader
 
 logger = logging.getLogger("ablation")
+
+
+# =============================================================================
+# BASELINE CONFIG  -- self-contained operating point: EVERY VFE3Config toggle.
+# =============================================================================
+# A sweep ablates one (or a few) of these around this point. This is an INDEPENDENT copy
+# (train_vfe3.py keeps its own click-to-run config); edit here for ablations. Grouped exactly as
+# vfe3/config.py; registry fields list valid keys inline. The SWEEPS below pre-satisfy any
+# cross-field constraint per sweep via `requires` / `configs`.
+BASELINE_CONFIG: Dict[str, Any] = dict(
+    # numerics
+    eps                        = 1e-6,
+    kl_max                     = 100.0,
+
+    # divergence seam (f-divergence FUNCTIONAL, distinct from `family`)
+    divergence_family          = "renyi",                    # "renyi"
+    alpha_div                  = 1.0,                         # Renyi order (1.0 -> KL)
+
+    # model structure
+    vocab_size                 = 50257,                       # gpt2/tiktoken vocab (dataset-fixed)
+    embed_dim                  = 20,                          # K (must be divisible by n_heads)
+    max_seq_len                = 128,                         # N, context length
+    n_layers                   = 1,                           # L, number of blocks
+    n_e_steps                  = 1,                           # T, E-step inner iterations
+    n_heads                    = 2,
+
+    # gauge seam
+    gauge_group                = "block_glk",                 # "glk"|"block_glk"|"tied_block_glk"|"so_k"|"sp"
+    gauge_parameterization     = "phi",                       # "phi" (omega_direct: live-rejected)
+    transport_mode             = "flat",                      # "flat" (pure no-NN) | "regime_ii" (learned, NN exception)
+    cocycle_relaxation         = 1.0,                         # regime_ii homotopy (ignored by flat)
+    cross_couplings            = None,                        # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only
+    use_head_mixer             = True,                        # Schur-commutant head mixer (needs >=2 equal blocks)
+
+    # positional encoding
+    pos_phi                    = "learned",                   # "none" (pure path) | "learned" | "frozen"
+    pos_phi_compose            = "bch",                       # "bch" | "euclidean"
+    bch_pe_order               = 4,
+    pos_phi_scale              = 0.02,
+    pos_phi_project_slk        = False,
+    pos_rotation               = "none",                      # "none" | "rope"
+    rope_base                  = 100.0,
+    rope_full_gauge            = False,                       # rotate covariance (REQUIRES diagonal_covariance=False)
+
+    # belief family (diagonal_covariance MUST equal family == "gaussian_diagonal")
+    diagonal_covariance        = True,
+    family                     = "gaussian_diagonal",         # "gaussian_diagonal" | "gaussian_full"
+
+    # free-energy coupling
+    alpha                      = 1.0,                         # constant self-coupling value
+    alpha_mode                 = "state_dependent_per_coord", # "constant"|"state_dependent"|"state_dependent_per_coord"|"learnable"
+    b0                         = 1.0,
+    c0                         = 1.0,
+    kappa                      = 1.0,                         # tau = kappa * sqrt(d_head)
+    mass_phi                   = 0.0,
+    mstep_self_coupling_weight = 0.0,
+    lambda_h                   = 0.0,                         # hyper-prior weight (>0 creates s/r tables)
+    gamma_coupling             = 0.0,                         # model-channel coupling (>0 creates s tables)
+    kappa_gamma                = 1.0,
+    gamma_attention_prior      = "causal",                    # "uniform" | "causal" | "alibi"
+    prior_source               = "token",                     # "token" | "model_channel"
+
+    # attention
+    include_attention_entropy  = True,                        # canonical F vs entropy-suppressed surrogate
+    attention_prior            = "causal",                    # "uniform" | "causal" | "alibi"
+
+    # E-step
+    e_mu_lr                    = 0.7,
+    e_sigma_lr                 = 0.025,
+    e_phi_lr                   = 0.0,
+    e_sigma_q_trust            = 5.0,
+    sigma_max                  = 5.0,
+    gradient_mode              = "filtering",                 # "filtering" | "smoothing"
+    phi_precond_mode           = "killing",                   # "none"|"clip"|"killing"|"killing_per_block"|"pullback"
+    phi_retract_mode           = "bch",                       # "euclidean" | "bch"
+    spd_retract_mode           = "spd_affine",                # "spd_affine" | "log_euclidean"
+
+    # decode / encode
+    use_prior_bank             = False,                       # True: KL-to-prior (pure) | False: linear projection
+    decode_tau                 = 1.0,
+    decode_mode                = "diagonal",                  # "diagonal" | "diagonal_chunked" | "full"
+    decode_chunk_size          = 8192,
+    encode_mode                = "per_token",                 # "per_token" (gauge_fixed: live-rejected)
+
+    # cross-block belief handoff
+    prior_handoff_rho          = 0.0,                         # 1.0 = full flow; 0.0 = frozen
+    prior_handoff_sigma        = 0.0,
+
+    # normalization
+    norm_type_block            = "none",                      # "none" | "mahalanobis"
+    norm_type_final            = "none",                      # "none" | "mahalanobis"
+
+    # M-step / training
+    e_step_gradient            = "unroll",                    # "unroll" | "straight_through" | "detach"
+    detach_e_step              = False,
+    grad_accum_steps           = 1,
+    m_mu_lr                    = 0.01,
+    m_sigma_lr                 = 0.0021,
+    m_phi_lr                   = 0.009,
+    weight_decay               = 0.05,
+    batch_size                 = 64,
+    max_steps                  = 15000,
+    warmup_steps               = 100,
+    seed                       = 6,                           # overridden per run by CONFIG["seed"]
+    log_interval               = 100,
+    eval_interval              = 1000,
+    checkpoint_interval        = 15000,                       # forced to 0 per cell (no checkpoint blowup)
+    eval_max_batches           = None,
+    amp_dtype                  = None,                        # None (pure fp32) | "bf16" | "fp16"
+)
 
 
 # =============================================================================
@@ -82,73 +191,200 @@ logger = logging.getLogger("ablation")
 #                                            clean single-variable comparison rather than a
 #                                            config error.
 
+# One sweep per sweepable VFE3Config toggle. `requires` pre-satisfies a cross-field constraint
+# so the cell is a clean single-variable comparison rather than a config error; multi-arm
+# `configs` is used where arms must differ in several fields at once. The few fields that are NOT
+# meaningfully ablatable are listed under NON_SWEPT_FIELDS below.
 SWEEPS: Dict[str, Dict[str, Any]] = {
 
-    # --- attention temperature ----------------------------------------------
-    "kappa": {
-        "description":    "attention temperature tau = kappa * sqrt(d_head)",
-        "param":          "kappa",
-        "values":         [0.5, 0.7, 1.0, 1.4, 2.0],
-        "baseline_value": 1.0,
+    # === model structure / capacity ========================================
+    # NB the embed_dim / n_heads value lists assume the baseline embed_dim=20, n_heads=2
+    # (n_heads must divide embed_dim); adjust them if you change those in BASELINE_CONFIG.
+    "embed_dim": {
+        "description": "total belief dimension K (kept divisible by n_heads=2)",
+        "param": "embed_dim", "values": [20, 40, 64],
+    },
+    "n_heads": {  # n_heads=1 has no >=2 equal blocks -> disable the head mixer for a clean sweep
+        "description": "number of gauge-irrep blocks / heads (divisors of embed_dim=20)",
+        "param": "n_heads", "values": [1, 2, 4, 5], "requires": {"use_head_mixer": False},
+    },
+    "n_layers": {
+        "description": "number of stacked blocks L",
+        "param": "n_layers", "values": [1, 2, 3],
+    },
+    "n_e_steps": {
+        "description": "E-step inner iterations T per block",
+        "param": "n_e_steps", "values": [1, 2, 4],
+    },
+    "max_seq_len": {  # loader-affecting: the runner rebuilds the loader per cell
+        "description": "context length N",
+        "param": "max_seq_len", "values": [64, 128, 256],
     },
 
-    # --- self-coupling form (closed-form, no learned params) ----------------
-    "alpha_mode": {
-        "description":    "self-coupling alpha form (constant vs state-dependent)",
-        "param":          "alpha_mode",
-        "values":         ["constant", "state_dependent", "state_dependent_per_coord"],
-        "baseline_value": "state_dependent_per_coord",
+    # === divergence / numerics =============================================
+    "alpha_div": {
+        "description": "Renyi divergence order (1.0 -> KL; != 1 routes the non-kernel oracle)",
+        "param": "alpha_div", "values": [0.5, 1.0, 1.5, 2.0],
+    },
+    "kl_max": {
+        "description": "per-pair KL clamp",
+        "param": "kl_max", "values": [50.0, 100.0, 200.0],
+    },
+    "eps": {
+        "description": "numerical floor (variance / log stability)",
+        "param": "eps", "values": [1e-7, 1e-6, 1e-5],
     },
 
-    # --- E-step belief-mean step size ---------------------------------------
-    "e_mu_lr": {
-        "description":    "E-step natural-gradient step size for mu_q",
-        "param":          "e_mu_lr",
-        "values":         [0.3, 0.5, 0.7, 0.9, 1.1],
-        "baseline_value": 0.7,
+    # === gauge seam ========================================================
+    # use_head_mixer (True at baseline) needs >= 2 equal blocks (block_glk / tied_block_glk);
+    # the single-block glk / so_k / sp arms turn it off so the model constructs.
+    "gauge_group": {
+        "description": "gauge group",
+        "configs": [
+            {"label": "block_glk",      "gauge_group": "block_glk"},
+            {"label": "tied_block_glk", "gauge_group": "tied_block_glk"},
+            {"label": "glk",            "gauge_group": "glk",  "use_head_mixer": False},
+            {"label": "so_k",           "gauge_group": "so_k", "use_head_mixer": False},
+            {"label": "sp",             "gauge_group": "sp",   "use_head_mixer": False},
+        ],
+    },
+    "transport_mode": {  # regime_ii is the learned bilinear connection (sanctioned NN exception)
+        "description": "connection regime: flat phi-cocycle vs learned non-flat (regime_ii)",
+        "configs": [
+            {"label": "flat",      "transport_mode": "flat"},
+            {"label": "regime_ii", "transport_mode": "regime_ii"},
+        ],
+    },
+    "cocycle_relaxation": {
+        "description": "regime_ii homotopy (0 -> flat, 1 -> fully relaxed)",
+        "param": "cocycle_relaxation", "values": [0.0, 0.5, 1.0],
+        "requires": {"transport_mode": "regime_ii"},
+    },
+    "cross_couplings": {  # the off-block coupling merges the heads into one super-block, so the
+                          # >=2-block head mixer cannot apply -> turn it off for a clean comparison
+        "description": "cross-head GL(K) coupling (block-diagonal vs one coupled pair)",
+        "configs": [
+            {"label": "none",     "cross_couplings": None},
+            {"label": "pair_0_1", "cross_couplings": [(0, 1)]},
+        ],
+        "requires": {"use_head_mixer": False},
     },
 
-    # --- M-step gauge-frame LR ----------------------------------------------
-    "m_phi_lr": {
-        "description":    "M-step learning rate for the gauge-frame parameters (phi)",
-        "param":          "m_phi_lr",
-        "values":         [0.0, 0.003, 0.006, 0.009, 0.015],
-        "baseline_value": 0.009,
-    },
-
-    # --- gauge-frame L2 prior ------------------------------------------------
-    "mass_phi": {
-        "description":    "gauge prior weight (mass_phi / 2) ||phi||^2",
-        "param":          "mass_phi",
-        "values":         [0.0, 1e-4, 1e-3, 1e-2],
-        "baseline_value": 0.0,
-    },
-
-    # --- phi preconditioner (block_glk supports killing_per_block) -----------
-    "phi_precond_mode": {
-        "description":    "gauge-step preconditioner on the phi update",
-        "param":          "phi_precond_mode",
-        "values":         ["none", "clip", "killing", "killing_per_block"],
-        "baseline_value": "killing",
-    },
-
-    # --- attention prior pi_ij ----------------------------------------------
-    "attention_prior": {
-        "description":    "attention prior pi_ij (uniform vs causal vs alibi)",
-        "param":          "attention_prior",
-        "values":         ["uniform", "causal", "alibi"],
-        "baseline_value": "causal",
-    },
-
-    # --- positional encoding (the pos_phi seam) -----------------------------
+    # === positional encoding ===============================================
     "pos_phi": {
-        "description":    "BCH positional encoding mode (none vs learned vs frozen)",
-        "param":          "pos_phi",
-        "values":         ["none", "learned", "frozen"],
-        "baseline_value": "learned",
+        "description": "BCH positional encoding mode",
+        "param": "pos_phi", "values": ["none", "learned", "frozen"],
+    },
+    "pos_phi_compose": {
+        "description": "BCH composition chart",
+        "param": "pos_phi_compose", "values": ["bch", "euclidean"],
+        "requires": {"pos_phi": "learned"},
+    },
+    "bch_pe_order": {
+        "description": "BCH Dynkin truncation order",
+        "param": "bch_pe_order", "values": [2, 4, 6],
+        "requires": {"pos_phi": "learned", "pos_phi_compose": "bch"},
+    },
+    "pos_phi_scale": {
+        "description": "learned pos_phi table init scale",
+        "param": "pos_phi_scale", "values": [0.005, 0.02, 0.1],
+        "requires": {"pos_phi": "learned"},
+    },
+    "pos_phi_project_slk": {
+        "description": "per-block trace projection (det Omega = 1) on pos_phi",
+        "param": "pos_phi_project_slk", "values": [False, True],
+        "requires": {"pos_phi": "learned"},
+    },
+    "pos_rotation": {
+        "description": "gauge-RoPE positional rotation (means-only) on/off",
+        "configs": [
+            {"label": "none", "pos_rotation": "none"},
+            {"label": "rope", "pos_rotation": "rope"},
+        ],
+    },
+    "rope_base": {
+        "description": "RoPE rotary frequency base",
+        "param": "rope_base", "values": [10.0, 100.0, 1000.0],
+        "requires": {"pos_rotation": "rope"},
+    },
+    "rope_full_gauge": {  # rotating the covariance sandwich needs full covariance
+        "description": "RoPE means-only vs full-gauge (rotates covariance; needs full cov)",
+        "configs": [
+            {"label": "means_only", "pos_rotation": "rope"},
+            {"label": "full_gauge", "pos_rotation": "rope", "rope_full_gauge": True,
+                                    "diagonal_covariance": False, "family": "gaussian_full",
+                                    "alpha_mode": "state_dependent"},
+        ],
     },
 
-    # --- canonical F vs entropy-suppressed surrogate (multi-arm) ------------
+    # === belief family =====================================================
+    # The full arm flips family + diagonal_covariance together and moves off the per-coordinate
+    # alpha form (diagonal-only), all of which a naive single-field sweep would have rejected.
+    "covariance": {
+        "description": "belief covariance structure (diagonal vs full Gaussian)",
+        "configs": [
+            {"label": "diagonal", "family": "gaussian_diagonal", "diagonal_covariance": True},
+            {"label": "full",     "family": "gaussian_full",     "diagonal_covariance": False,
+                                  "alpha_mode": "state_dependent"},
+        ],
+    },
+
+    # === free-energy coupling ==============================================
+    "alpha": {
+        "description": "constant self-coupling value (alpha_mode=constant)",
+        "param": "alpha", "values": [0.5, 1.0, 2.0], "requires": {"alpha_mode": "constant"},
+    },
+    "alpha_mode": {  # 'learnable' is the NN-exception scalar log_alpha (now optimizer-grouped)
+        "description": "self-coupling alpha form",
+        "param": "alpha_mode",
+        "values": ["constant", "state_dependent", "state_dependent_per_coord", "learnable"],
+    },
+    "b0": {
+        "description": "state-dependent alpha shape b0 (alpha* = c0/(b0 + D))",
+        "param": "b0", "values": [0.5, 1.0, 2.0], "requires": {"alpha_mode": "state_dependent"},
+    },
+    "c0": {
+        "description": "state-dependent alpha shape c0 (numerator)",
+        "param": "c0", "values": [0.5, 1.0, 2.0], "requires": {"alpha_mode": "state_dependent"},
+    },
+    "kappa": {
+        "description": "attention temperature tau = kappa * sqrt(d_head)",
+        "param": "kappa", "values": [0.5, 0.7, 1.0, 1.4, 2.0],
+    },
+    "mass_phi": {
+        "description": "gauge prior weight (mass_phi / 2) ||phi||^2",
+        "param": "mass_phi", "values": [0.0, 1e-4, 1e-3, 1e-2],
+    },
+    "mstep_self_coupling_weight": {
+        "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
+        "param": "mstep_self_coupling_weight", "values": [0.0, 0.1, 1.0],
+    },
+    "lambda_h": {
+        "description": "hyper-prior weight lambda_h * mean_i KL(s_i||r) (>0 creates s/r tables)",
+        "param": "lambda_h", "values": [0.0, 0.1, 1.0],
+    },
+    "gamma_coupling": {
+        "description": "model-channel coupling weight (>0 creates s tables)",
+        "param": "gamma_coupling", "values": [0.0, 0.1, 1.0],
+    },
+    "kappa_gamma": {
+        "description": "model-channel temperature tau_gamma = kappa_gamma * sqrt(d_head)",
+        "param": "kappa_gamma", "values": [0.5, 1.0, 2.0], "requires": {"gamma_coupling": 1.0},
+    },
+    "gamma_attention_prior": {
+        "description": "model-channel attention prior pi^s_ij",
+        "param": "gamma_attention_prior", "values": ["uniform", "causal", "alibi"],
+        "requires": {"gamma_coupling": 1.0},
+    },
+    "prior_source": {  # model_channel makes the s tables the belief prior p_i
+        "description": "belief-prior source table (token vs model channel)",
+        "configs": [
+            {"label": "token",         "prior_source": "token"},
+            {"label": "model_channel", "prior_source": "model_channel"},
+        ],
+    },
+
+    # === attention =========================================================
     "entropy_term": {
         "description": "canonical free energy (entropy term) vs entropy-suppressed surrogate",
         "configs": [
@@ -156,8 +392,50 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "surrogate", "include_attention_entropy": False},
         ],
     },
+    "attention_prior": {
+        "description": "attention prior pi_ij",
+        "param": "attention_prior", "values": ["uniform", "causal", "alibi"],
+    },
 
-    # --- decode head: pure KL-to-prior vs linear projection (multi-arm) -----
+    # === E-step ============================================================
+    "e_mu_lr": {
+        "description": "E-step natural-gradient step size for mu_q",
+        "param": "e_mu_lr", "values": [0.3, 0.5, 0.7, 0.9, 1.1],
+    },
+    "e_sigma_lr": {
+        "description": "E-step retraction step size for sigma_q",
+        "param": "e_sigma_lr", "values": [0.0, 0.01, 0.025, 0.05],
+    },
+    "e_phi_lr": {
+        "description": "E-step gauge-frame step size for phi",
+        "param": "e_phi_lr", "values": [0.0, 0.005, 0.01],
+    },
+    "e_sigma_q_trust": {
+        "description": "E-step SPD retraction trust radius",
+        "param": "e_sigma_q_trust", "values": [1.0, 5.0, 10.0],
+    },
+    "sigma_max": {
+        "description": "upper bound on belief variance",
+        "param": "sigma_max", "values": [2.0, 5.0, 10.0],
+    },
+    "gradient_mode": {
+        "description": "E-step coupling gradient (filtering = query-side only; smoothing = full)",
+        "param": "gradient_mode", "values": ["filtering", "smoothing"],
+    },
+    "phi_precond_mode": {
+        "description": "gauge-step preconditioner on the phi update",
+        "param": "phi_precond_mode", "values": ["none", "clip", "killing", "killing_per_block"],
+    },
+    "phi_retract_mode": {
+        "description": "phi Lie-algebra step chart",
+        "param": "phi_retract_mode", "values": ["euclidean", "bch"],
+    },
+    "spd_retract_mode": {  # log_euclidean warns (not errors) on a diagonal family
+        "description": "SPD covariance retraction geometry",
+        "param": "spd_retract_mode", "values": ["spd_affine", "log_euclidean"],
+    },
+
+    # === decode / encode ===================================================
     "decode_head": {
         "description": "KL-to-prior decode (pure path) vs learned linear projection (VFE_2.0 parity)",
         "configs": [
@@ -165,51 +443,126 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "linear_decode", "use_prior_bank": False},
         ],
     },
-
-    # --- gauge group (multi-arm; head mixer needs >= 2 equal blocks) --------
-    # use_head_mixer (True at baseline) requires >= 2 equal gauge-irrep blocks, which only
-    # block_glk / tied_block_glk provide; the single-block glk / so_k arms turn it off so the
-    # model constructs. Each arm therefore differs in exactly the group + the mixer it forces.
-    "gauge_group": {
-        "description": "gauge group (block_glk / tied_block_glk / glk / so_k)",
+    "decode_tau": {
+        "description": "KL-to-prior decode temperature",
+        "param": "decode_tau", "values": [0.5, 1.0, 2.0], "requires": {"use_prior_bank": True},
+    },
+    # Only the two diagonal KL-decode variants are swept. The full-cov KL readout (decode_mode=
+    # 'full') is no longer the blocker -- its Cholesky was hardened with safe_cholesky -- but on the
+    # prior-bank path it drives the full-covariance SPD retraction (retraction.py retract_spd_full)
+    # into an eigh that fails to converge on the ill-conditioned spectrum; a gap-regularized robust
+    # eigh there is explicitly deferred in the codebase, so the 'full' arm stays excluded (see
+    # NON_SWEPT_FIELDS). Full-covariance TRAINING is still exercised by the `covariance` sweep.
+    "decode_mode": {
+        "description": "KL decode covariance structure (diagonal vs chunked, on the pure bank)",
         "configs": [
-            {"label": "block_glk",      "gauge_group": "block_glk"},
-            {"label": "tied_block_glk", "gauge_group": "tied_block_glk"},
-            {"label": "glk",            "gauge_group": "glk",  "use_head_mixer": False},
-            {"label": "so_k",           "gauge_group": "so_k", "use_head_mixer": False},
+            {"label": "diagonal",         "use_prior_bank": True, "decode_mode": "diagonal"},
+            {"label": "diagonal_chunked", "use_prior_bank": True, "decode_mode": "diagonal_chunked"},
         ],
     },
+    "decode_chunk_size": {
+        "description": "vocab-chunk width for the chunked decode",
+        "param": "decode_chunk_size", "values": [4096, 8192, 16384],
+        "requires": {"use_prior_bank": True, "decode_mode": "diagonal_chunked"},
+    },
 
-    # --- diagonal vs full covariance (multi-arm with cross-field requires) ---
-    # The full-covariance arm flips family AND diagonal_covariance together, and also moves
-    # off the per-coordinate alpha form (which is only defined for a diagonal family) -- a
-    # textbook case where a naive single-field sweep would be rejected by __post_init__.
-    "covariance": {
-        "description": "belief covariance structure (diagonal vs full Gaussian)",
+    # === cross-block belief handoff ========================================
+    "prior_handoff_rho": {
+        "description": "mu_q -> mu_p handoff (0 = frozen priors, 1 = full flow)",
+        "param": "prior_handoff_rho", "values": [0.0, 0.5, 1.0],
+    },
+    "prior_handoff_sigma": {
+        "description": "sigma_q -> sigma_p handoff damping",
+        "param": "prior_handoff_sigma", "values": [0.0, 0.5, 1.0],
+    },
+
+    # === normalization =====================================================
+    "norm_type_block": {
+        "description": "inner (per-block) normalization",
+        "param": "norm_type_block", "values": ["none", "mahalanobis"],
+    },
+    "norm_type_final": {
+        "description": "final (outer) normalization",
+        "param": "norm_type_final", "values": ["none", "mahalanobis"],
+    },
+
+    # === M-step / training =================================================
+    "e_step_gradient": {  # 'detach' is consistent only with detach_e_step=False (the baseline)
+        "description": "E-step backward estimator",
+        "param": "e_step_gradient", "values": ["unroll", "straight_through", "detach"],
+    },
+    "detach_e_step": {
+        "description": "detach the whole E-step (no E-step gradient)",
+        "param": "detach_e_step", "values": [False, True],
+    },
+    "m_mu_lr": {
+        "description": "M-step LR for the prior-bank means",
+        "param": "m_mu_lr", "values": [0.005, 0.01, 0.025],
+    },
+    "m_sigma_lr": {
+        "description": "M-step LR for the prior-bank variances",
+        "param": "m_sigma_lr", "values": [0.001, 0.0021, 0.005],
+    },
+    "m_phi_lr": {
+        "description": "M-step LR for the gauge-frame parameters (phi)",
+        "param": "m_phi_lr", "values": [0.0, 0.003, 0.006, 0.009, 0.015],
+    },
+    "weight_decay": {
+        "description": "AdamW weight decay",
+        "param": "weight_decay", "values": [0.0, 0.05, 0.1],
+    },
+    "batch_size": {  # loader-affecting: the runner rebuilds the loader per cell
+        "description": "training batch size",
+        "param": "batch_size", "values": [32, 64, 128],
+    },
+    "grad_accum_steps": {
+        "description": "gradient-accumulation microbatches per optimizer step",
+        "param": "grad_accum_steps", "values": [1, 2, 4],
+    },
+    "warmup_steps": {
+        "description": "LR warmup steps",
+        "param": "warmup_steps", "values": [50, 100, 500],
+    },
+    "amp_dtype": {  # fp16 training would need a GradScaler (deferred); bf16 is the safe arm
+        "description": "mixed precision (pure fp32 vs bf16 autocast)",
         "configs": [
-            {"label": "diagonal", "family": "gaussian_diagonal", "diagonal_covariance": True},
-            {"label": "full",     "family": "gaussian_full",     "diagonal_covariance": False,
-                                   "alpha_mode": "state_dependent"},
+            {"label": "fp32", "amp_dtype": None},
+            {"label": "bf16", "amp_dtype": "bf16"},
         ],
     },
 }
 
 
-# Which sweeps run (and in what order) when CONFIG["sweep"] is None. Comment lines out to
-# narrow a session; cheap-to-expensive is a good ordering for a single GPU.
+# Fields deliberately NOT swept, with the reason:
+#   vocab_size             fixed by the dataset
+#   gauge_parameterization only 'phi' is live ('omega_direct' is config-rejected)
+#   encode_mode            only 'per_token' is live ('gauge_fixed' is a rejected stub)
+#   divergence_family      only 'renyi' is registered (alpha_div is its live knob)
+#   seed                   set per run from CONFIG['seed'] (the runner reseeds each cell)
+#   max_steps              run length, set via CONFIG['max_steps']
+#   log/eval/checkpoint_interval, eval_max_batches   bookkeeping, not model behavior
+# (decode_mode='full' is a valid value left OUT of the decode_mode sweep: on the prior-bank path it
+#  drives the full-covariance SPD retraction's eigh to non-convergence -- a deferred robust-eigh
+#  issue, separate from the now-fixed full-cov KL Cholesky.)
+NON_SWEPT_FIELDS = (
+    "vocab_size", "gauge_parameterization", "encode_mode", "divergence_family", "seed",
+    "max_steps", "log_interval", "eval_interval", "checkpoint_interval", "eval_max_batches",
+)
+
+
+# Which sweeps run (and in what order) when CONFIG["sweep"] is None. This is a CURATED subset of
+# the full SWEEPS registry above (every key in SWEEPS is also runnable on its own via
+# CONFIG["sweep"]="<name>"); add or remove names to shape a session. Cheap-to-expensive is a good
+# ordering for a single GPU. `mode="list"` (with sweep=None) prints every registered sweep.
 SWEEP_ORDER: List[str] = [
     "kappa",
     "alpha_mode",
     "attention_prior",
     "entropy_term",
     "decode_head",
-    # "e_mu_lr",
-    # "m_phi_lr",
-    # "mass_phi",
-    # "phi_precond_mode",
-    # "pos_phi",
-    # "gauge_group",
-    # "covariance",
+    "gauge_group",
+    "phi_precond_mode",
+    "covariance",
 ]
 
 
@@ -797,14 +1150,19 @@ def main() -> None:
     output_dir = Path(CONFIG["output_dir"])
 
     if mode == "list":
-        names = SWEEP_ORDER if CONFIG["sweep"] is None else [CONFIG["sweep"]]
-        print(f"\nAvailable sweeps ({len(names)} selected of {len(SWEEPS)}):\n")
-        print(f"{'name':<22}{'runs':>6}  description")
-        print("-" * 78)
+        # Every registered sweep (CONFIG["sweep"]=None) or just the named one; an asterisk marks
+        # those in the curated SWEEP_ORDER that a None-sweep `train` run would execute.
+        names = sorted(SWEEPS) if CONFIG["sweep"] is None else [CONFIG["sweep"]]
+        active = set(SWEEP_ORDER)
+        print(f"\nRegistered sweeps ({len(names)} shown; * = in SWEEP_ORDER):\n")
+        print(f"  {'name':<28}{'runs':>5}  description")
+        print("-" * 90)
         for name in names:
             s = SWEEPS[name]
-            print(f"{name:<22}{sweep_n_runs(s):>6}  {s['description']}")
-        print(f"\ntotal runs: {sum(sweep_n_runs(SWEEPS[n]) for n in names)}")
+            mark = "*" if name in active else " "
+            print(f"{mark} {name:<28}{sweep_n_runs(s):>5}  {s['description']}")
+        print(f"\n{len(SWEEPS)} sweeps registered; SWEEP_ORDER runs {len(SWEEP_ORDER)} "
+              f"({sum(sweep_n_runs(SWEEPS[n]) for n in SWEEP_ORDER)} runs).")
         return
 
     if mode == "analyze":

@@ -22,6 +22,19 @@ def test_optimizer_groups_priors_by_m_lr():
     assert n_params == len(list(model.parameters()))
 
 
+def test_optimizer_groups_regime_ii_connection_and_learnable_alpha():
+    # connection_W (transport_mode='regime_ii') and log_alpha (alpha_mode='learnable') are
+    # trainable model-level nn.Parameters; build_optimizer must group them so they actually train
+    # and so its exact-coverage guard does not raise. A >=2-head block group lets regime_ii build.
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
+                     transport_mode="regime_ii", alpha_mode="learnable")
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)                           # must not raise (coverage guard)
+    grouped = {id(p) for g in opt.param_groups for p in g["params"]}
+    assert id(model.connection_W) in grouped
+    assert id(model.log_alpha) in grouped
+
+
 def test_lr_lambda_warmup_then_cosine():
     cfg = VFE3Config(warmup_steps=10, max_steps=100)
     assert abs(lr_lambda(0, cfg) - 0.0) < 1e-6

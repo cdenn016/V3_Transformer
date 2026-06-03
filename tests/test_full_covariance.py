@@ -93,3 +93,21 @@ def test_full_covariance_reduces_to_diagonal_at_identity_transport():
     diag_of_full = torch.diagonal(out_full.sigma, dim1=-2, dim2=-1)
     assert torch.allclose(diag_of_full, out_diag.sigma, atol=1e-3)
     assert (out_full.sigma - torch.diag_embed(diag_of_full)).abs().max() < 1e-4
+
+
+def test_full_kl_survives_non_pd_covariance():
+    # The alpha=1 full-covariance KL must CLAMP (not raise) on a numerically non-PD covariance.
+    # Such a prior covariance can arise after training shifts it, and full-cov configs route the
+    # belief KL through this closed form via the E-step oracle (e.g. decode_mode='full'); a raw
+    # torch.linalg.cholesky there raises and kills the run. The alpha != 1 branch was already
+    # hardened with safe_cholesky; this pins the same robustness for alpha = 1.
+    from vfe3.families.gaussian import FullGaussian
+    K = 4
+    mu = torch.zeros(2, K)
+    sigma_q = torch.eye(K).expand(2, K, K).contiguous()
+    bad = torch.eye(K).clone(); bad[0, 0] = -1.0                 # a negative eigenvalue -> not PD
+    sigma_p = bad.expand(2, K, K).contiguous()
+    kl = FullGaussian(mu, sigma_q).renyi_closed_form(            # must NOT raise
+        FullGaussian(mu, sigma_p), alpha=1.0, kl_max=100.0, eps=1e-6)
+    assert torch.isfinite(kl).all()
+    assert (kl <= 100.0 + 1e-3).all()

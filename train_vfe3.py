@@ -53,13 +53,13 @@ config = dict(
     # model structure
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 90,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 6,
+    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 2,
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 32,
-    max_steps                 = 90000,
+    batch_size                = 64,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1,                   # T, E-step inner iterations
@@ -72,6 +72,22 @@ config = dict(
     gauge_parameterization    = "phi",               # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
     use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks: block_glk/tied_block_glk);
                                                      # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
+
+    # connection regime (orthogonal to gauge_parameterization)
+    transport_mode            = "flat",              # "flat" (Regime-I phi-cocycle, pure no-NN) | "regime_ii"
+                                                     # (learned bilinear edge connection; sanctioned NN exception, default-off)
+    cocycle_relaxation        = 1.0,                 # regime_ii homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
+    cross_couplings           = None,                # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only (None = block-diagonal gauge)
+
+    # positional encoding -- BCH gauge-frame PE (pos_phi) + gauge-RoPE (pos_rotation)
+    pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
+    pos_phi_compose           = "bch",               # composition chart: "bch" | "euclidean"
+    bch_pe_order              = 4,                   # BCH Dynkin truncation order (compose_phi)
+    pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
+    pos_phi_project_slk       = False,               # per-block trace projection (det Omega = 1)
+    pos_rotation              = "none",              # "none" | "rope" (block-diagonal positional rotation folded into transport)
+    rope_base                 = 100.0,               # rotary frequency base
+    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES diagonal_covariance=False)
 
     # belief family -- diagonal_covariance MUST equal (family == "gaussian_diagonal")
     diagonal_covariance       = True,
@@ -86,6 +102,13 @@ config = dict(
     kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
    
     mass_phi                  = 0.0,                 # (mass_phi/2) ||phi||^2 penalty
+
+    mstep_self_coupling_weight = 0.0,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    lambda_h                  = 0.0,                 # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
+    gamma_coupling            = 0.0,                 # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
+    kappa_gamma               = 1.0,                 # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
+    gamma_attention_prior     = "causal",            # model-channel prior pi^s_ij: "uniform" | "causal" | "alibi"
+    prior_source              = "token",             # which table supplies the belief prior p_i: "token" | "model_channel"
 
     # attention
     include_attention_entropy = True,                # canonical F (True) vs entropy-suppressed surrogate (False)
@@ -103,12 +126,14 @@ config = dict(
     
     phi_precond_mode          = "killing",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
+    spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
     # decode / encode
     use_prior_bank            = False,                # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
     decode_tau                = 1.0,
-    decode_mode               = "diagonal",          # "diagonal" | "full"
+    decode_mode               = "diagonal",          # "diagonal" | "diagonal_chunked" | "full"
+    decode_chunk_size         = 8192,                # vocab-chunk width for decode_mode="diagonal_chunked" (ignored otherwise)
     encode_mode               = "per_token",         # "per_token" | "gauge_fixed" (gauge_fixed: live-rejected stub)
 
     # cross-block belief handoff (mu_q -> mu_p)
@@ -120,8 +145,10 @@ config = dict(
     norm_type_final           = "none",              # "none" | "mahalanobis"
 
     # M-step / training
-    detach_e_step             = False,               # False = unroll the E-step in the training graph
-    
+    e_step_gradient           = "unroll",            # E-step backward: "unroll" | "straight_through" | "detach" (reconciled w/ detach_e_step)
+    detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
+    grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
+
     m_mu_lr                   = 0.01,
     m_sigma_lr                = 0.0021,
     m_phi_lr                  = 0.009,
@@ -142,6 +169,8 @@ config = dict(
     log_interval              = 100,                  # console log every N steps (0 = off)
     eval_interval             = 1000,                   # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,                  # save a resumable checkpoint every N steps (0 = off)
+    eval_max_batches          = None,                 # cap the PERIODIC eval pass (None = full split)
+    amp_dtype                 = None,                 # None (pure fp32) | "bf16" | "fp16" (opt-in autocast; CUDA throughput)
 )
 
 
