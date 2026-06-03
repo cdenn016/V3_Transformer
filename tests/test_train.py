@@ -16,7 +16,9 @@ def test_optimizer_groups_priors_by_m_lr():
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     lrs = sorted(g["lr"] for g in opt.param_groups)
-    assert lrs == [0.002, 0.005, 0.01]
+    # m_sigma_lr=0.002, then TWO groups at m_phi_lr=0.005 (phi_embed + the default pos_phi='learned'
+    # pos_phi_free table, grouped at m_phi_lr in train.py), then m_mu_lr=0.01.
+    assert lrs == [0.002, 0.005, 0.005, 0.01]
     # every PriorBank parameter is covered by exactly one group
     n_params = sum(len(g["params"]) for g in opt.param_groups)
     assert n_params == len(list(model.parameters()))

@@ -84,14 +84,6 @@ def test_transported_kl_is_gauge_consistent():
     assert torch.allclose(base, moved, atol=1e-3, rtol=1e-3)
 
 
-def test_direct_omega_represents_reflection():
-    from vfe3.geometry.transport import compute_transport_operators_direct
-    refl = torch.diag(torch.tensor([-1.0, 1.0, 1.0, 1.0]))
-    omega = refl.expand(1, 2, 4, 4).contiguous()
-    out = compute_transport_operators_direct(omega, gauge_mode="learned")
-    assert torch.det(out["omega_i"][0, 0]) < 0
-
-
 def test_so2_transport_is_exact_rotation():
     # exp(theta * L_01) with L_01 = [[0,1],[-1,0]] is the rotation
     # [[cos, sin], [-sin, cos]]. Independent closed-form check.

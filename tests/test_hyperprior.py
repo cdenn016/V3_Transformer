@@ -44,7 +44,10 @@ def _hyperprior_term(model: VFEModel, tokens: torch.Tensor) -> torch.Tensor:
 def _make_model(lambda_h: float, *, seed: int = 0) -> VFEModel:
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
-                     mstep_self_coupling_weight=0.0, lambda_h=lambda_h, seed=seed)
+                     mstep_self_coupling_weight=0.0, lambda_h=lambda_h, seed=seed,
+                     pos_phi="none")   # the lambda_h>0 model draws extra s/r tables; pos_phi="none"
+                                       # keeps loss_w - loss_0 == w*KL(s||r) exactly (no pos_phi_free
+                                       # RNG divergence between the two models)
     torch.manual_seed(seed)          # the model does NOT self-seed; pin RNG before construction
     return VFEModel(cfg)
 

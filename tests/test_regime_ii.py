@@ -238,3 +238,26 @@ def test_config_cocycle_relaxation_default_and_validated():
     assert VFE3Config().cocycle_relaxation == 1.0
     assert VFE3Config(transport_mode="regime_ii", cocycle_relaxation=0.0).cocycle_relaxation == 0.0
     assert VFE3Config(transport_mode="regime_ii", cocycle_relaxation=0.5).cocycle_relaxation == 0.5
+
+
+from vfe3.belief import BeliefState
+from vfe3.inference.e_step import e_step_iteration
+
+
+def test_phi_estep_descends_regime_ii_not_flat():
+    # The phi E-step must build its Omega with the ACTIVE transport_mode. Under regime_ii + e_phi_lr>0
+    # with a nonzero learned connection, the regime_ii phi update differs from the flat one; the bug
+    # (phi_alignment_loss always built the flat Omega) made the phi output independent of
+    # transport_mode. e_mu_lr=e_sigma_lr=0 isolates the phi step; W != 0 makes regime_ii != flat.
+    grp = get_group("block_glk")(6, 2)
+    n_gen = grp.generators.shape[0]
+    torch.manual_seed(0)
+    N, K = 4, 6
+    belief = BeliefState(mu=torch.randn(N, K), sigma=torch.rand(N, K) + 0.5,
+                         phi=0.1 * torch.randn(N, n_gen))
+    mu_p, sigma_p = torch.randn(N, K), torch.rand(N, K) + 0.5
+    W = 0.5 * torch.randn(n_gen, K, K)                 # nonzero connection -> regime_ii != flat
+    kw = dict(e_mu_lr=0.0, e_sigma_lr=0.0, e_phi_lr=0.1, connection_W=W, cocycle_relaxation=1.0)
+    out_flat = e_step_iteration(belief, mu_p, sigma_p, grp, transport_mode="flat", **kw)
+    out_rii = e_step_iteration(belief, mu_p, sigma_p, grp, transport_mode="regime_ii", **kw)
+    assert not torch.allclose(out_flat.phi, out_rii.phi, atol=1e-6)

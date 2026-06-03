@@ -76,7 +76,8 @@ def retract_spd_full(
 
         Sigma_new = S^{1/2} exp(S^{-1/2} (tau dSigma) S^{-1/2}) S^{1/2},
     with a Frobenius trust region on the whitened tangent and an eigenvalue
-    floor/ceiling [eps, sigma_max^2]. Uses torch.linalg.eigh; a gap-regularized
+    floor/ceiling [eps, sigma_max] (eigenvalues are variances: the SAME physical ceiling the
+    diagonal arm applies to sigma). Uses torch.linalg.eigh; a gap-regularized
     eigh backward for gradient stability on near-degenerate spectra is deferred
     to a later hardening pass.
     """
@@ -114,7 +115,7 @@ def retract_spd_full(
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
         eig_new, vec_new = torch.linalg.eigh(sigma_new)
-        eig_new = eig_new.clamp(min=eps, max=sigma_max * sigma_max)
+        eig_new = eig_new.clamp(min=eps, max=sigma_max)      # eigenvalues ARE variances: ONE ceiling
         sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
 
     sigma_new = sigma_new.to(orig_dtype)
@@ -210,7 +211,7 @@ def retract_logeuclidean_full(
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
         eig_new, vec_new = torch.linalg.eigh(sigma_new)
-        eig_new = eig_new.clamp(min=eps, max=sigma_max * sigma_max)
+        eig_new = eig_new.clamp(min=eps, max=sigma_max)      # eigenvalues ARE variances: ONE ceiling
         sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
 
     sigma_new = sigma_new.to(orig_dtype)

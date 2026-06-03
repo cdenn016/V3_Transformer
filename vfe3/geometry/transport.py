@@ -205,6 +205,13 @@ def stable_matrix_exp_pair(
 
     Frobenius-norm clamp + float64 upcast keep matrix_exp stable for large ||M||.
 
+    SAFEGUARD, NOT THE EXACT OPERATOR: when ``||M||_F > max_norm`` the matrix is rescaled to
+    ``max_norm``, so the returned factor is ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)`` -- the
+    singular values / determinant of the returned operator differ from the true exponential. This
+    is a stability clamp on extreme inputs only; keep ||phi|| (and the regime_ii edge delta) below
+    ``max_norm`` to stay exact. A per-call runtime monitor is intentionally omitted: detecting
+    activation needs a tensor reduction (a host sync) on this hot path, which the perf budget avoids.
+
     ``block_dims`` (audit 4b): when M is block-diagonal with these blocks (e.g. block_glk's
     GL(d_head)^H), exp(M) is exactly block-diagonal with the per-block exponentials, so each
     d_head x d_head block is exponentiated independently -- an O(H * d_head^3) cost instead of
@@ -363,49 +370,6 @@ def build_factored_transport(
     return FactoredTransport(exp_phi=exp_phi, exp_neg_phi=exp_neg_phi, irrep_dims=list(group.irrep_dims))
 
 
-def compute_transport_operators_direct(
-    omega:      torch.Tensor,             # (B, N, K, K) per-token group elements Omega_i
-
-    *,
-    gauge_mode: str   = "learned",        # 'learned' (flat cocycle) or 'trivial'
-    eps:        float = 1e-6,
-) -> TransportDict:
-    r"""Direct-Omega transport Omega_ij = Omega_i @ Omega_j^{-1} (general GL(K)).
-
-    Flat (Regime I) direct-Omega transport. Reaches all of GL(K) (det may be < 0;
-    needs an external det penalty to stay invertible). Inverse via LU solve (exact
-    cocycle), with a ridge then pinv fallback for near-singular Omega. 'trivial'
-    returns Omega=I. The 'constant' mode is intentionally unsupported (raises
-    ValueError). The ridge ``eps`` is configurable (default 1e-6).
-    Returns 'omega_i' (B,N,K,K), 'omega_j_inv' (B,N,K,K), 'Omega' (B,N,N,K,K).
-    """
-    B, N, K, _ = omega.shape
-    dtype = omega.dtype
-    device = omega.device
-
-    if gauge_mode == "trivial":
-        eye_K = torch.eye(K, device=device, dtype=dtype)
-        return {
-            "omega_i":     eye_K.expand(B, N, K, K).contiguous(),
-            "omega_j_inv": eye_K.expand(B, N, K, K).contiguous(),
-            "Omega":       eye_K.expand(B, N, N, K, K).contiguous(),
-        }
-    if gauge_mode != "learned":
-        raise ValueError(f"gauge_mode must be 'learned' or 'trivial', got {gauge_mode!r}")
-
-    eye_K = torch.eye(K, device=device, dtype=dtype)
-    try:
-        omega_j_inv = torch.linalg.solve(omega, eye_K.expand_as(omega))
-    except (torch.linalg.LinAlgError, RuntimeError):
-        try:
-            omega_j_inv = torch.linalg.solve(omega + eps * eye_K, eye_K.expand_as(omega))
-        except (torch.linalg.LinAlgError, RuntimeError):
-            omega_j_inv = torch.linalg.pinv(omega)
-
-    omega_ij = torch.einsum("bikl,bjlm->bijkm", omega, omega_j_inv)
-    return {"omega_i": omega, "omega_j_inv": omega_j_inv, "Omega": omega_ij}
-
-
 def transport_mean(
     omega: 'torch.Tensor | FactoredTransport | RopeTransport',   # (..., N, N, K, K) dense OR factored exps
     mu:    torch.Tensor,                                          # (..., N, K) source (key, index j) means
@@ -509,40 +473,3 @@ def _factored_diagonal_covariance(
         parts.append(torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega_blk, omega_blk, sig_blk))
         start = end
     return torch.cat(parts, dim=-1)                                    # (..., N, N, K)
-
-
-def omega_to_block_exp_pairs(
-    omega:      torch.Tensor,        # (B, N, K, K) per-token group elements
-    irrep_dims: List[int],           # block sizes; sum == K
-
-    *,
-    eps:        float = 1e-6,
-) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Slices a block-diagonal Omega into per-block (block, block_inv) pairs.
-
-    Per-block inverse via solve, with ridge then pinv fallback. Returns a list
-    aligned with irrep_dims, each a pair of (B, N, d, d) tensors.
-    """
-    id_sum = sum(irrep_dims)
-    K = omega.shape[-1]
-    if id_sum != K:
-        raise ValueError(f"omega_to_block_exp_pairs: sum(irrep_dims)={id_sum} != K={K}")
-
-    results: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    start = 0
-    for d in irrep_dims:
-        end = start + d
-        omega_blk = omega[:, :, start:end, start:end].contiguous()
-        eye_d = torch.eye(d, device=omega_blk.device, dtype=omega_blk.dtype)
-        try:
-            omega_blk_inv = torch.linalg.solve(omega_blk, eye_d.expand_as(omega_blk))
-        except (torch.linalg.LinAlgError, RuntimeError):
-            try:
-                omega_blk_inv = torch.linalg.solve(
-                    omega_blk + eps * eye_d, eye_d.expand_as(omega_blk)
-                )
-            except (torch.linalg.LinAlgError, RuntimeError):
-                omega_blk_inv = torch.linalg.pinv(omega_blk)
-        results.append((omega_blk, omega_blk_inv))
-        start = end
-    return results

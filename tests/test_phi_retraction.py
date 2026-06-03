@@ -101,6 +101,32 @@ def test_clamp_phi_trace_bounds_block_trace():
 
 
 from vfe3.geometry.groups import get_group
+
+
+def test_project_slk_zeros_block_trace_under_tied_gauge():
+    # tied_block_glk's generators kron(I_n, E_ij) make every block's trace functional IDENTICAL,
+    # so the per-block-INDEPENDENT projection (coeffs = s / ||V_h||^2) over-subtracts by n_heads
+    # (sign flip + factor-n_heads). The joint Gram solve coeffs = s @ pinv(V V^T) must still drive
+    # each block's trace to 0 (det Omega_h = 1).
+    grp = get_group("tied_block_glk")(6, 2)               # 2 tied blocks of gl(3)
+    G, irrep = grp.generators, grp.irrep_dims
+    torch.manual_seed(0)
+    phi = 0.5 * torch.randn(5, G.shape[0])
+    out = project_phi_to_slk(phi, G, irrep)
+    assert torch.allclose(_block_traces(out, G, irrep), torch.zeros(5, len(irrep)), atol=1e-5)
+
+
+def test_clamp_phi_trace_bounds_block_trace_under_tied_gauge():
+    grp = get_group("tied_block_glk")(6, 2)
+    G, irrep = grp.generators, grp.irrep_dims
+    torch.manual_seed(0)
+    phi = 2.0 * torch.randn(5, G.shape[0])
+    T = 0.5
+    out = clamp_phi_trace(phi, G, irrep, trace_max=T)
+    assert (_block_traces(out, G, irrep).abs() <= T + 1e-4).all()
+
+
+from vfe3.geometry.groups import get_group
 from vfe3.geometry.retraction import retract_phi
 
 

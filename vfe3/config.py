@@ -86,10 +86,11 @@ class VFE3Config:
     # blocks (block_glk / tied_block_glk), else VFEModel construction raises.
     use_head_mixer:            bool  = False
 
-    # BCH positional encoding (default-off): a per-position Lie-algebra element pos_phi_i composed
-    # into the token gauge frame via compose_phi BEFORE transport. "learned" owns a model parameter
-    # table (max_seq_len, n_gen); "frozen" is the parameter-free i*pos_phi_scale on one axis. The
-    # pure path is "none" (no composition). Validated against the pos_phi registry.
+    # BCH positional encoding (default "learned"): a per-position Lie-algebra element pos_phi_i
+    # composed into the token gauge frame via compose_phi BEFORE transport. "learned" owns a model
+    # parameter table (max_seq_len, n_gen); "frozen" is the parameter-free i*pos_phi_scale on one
+    # axis. The theoretically PURE no-composition path is "none". Validated against the pos_phi
+    # registry.
     pos_phi:                   str   = "learned"      # "none" | "learned" | "frozen"
     pos_phi_compose:           str   = "bch"       # composition chart: bch (default) | euclidean
     bch_pe_order:              int   = 4           # BCH Dynkin truncation order (compose_phi order)
@@ -312,8 +313,7 @@ class VFE3Config:
         # (n_gen Lie-algebra coords), from which the only constructible Omega_i is exp(embed(phi_i))
         # -- making Omega_ij = exp(phi_i) exp(-phi_j), identical to the 'phi' path. There is no
         # source for a non-exponential / det<0 GL(K) element in the belief, so the mode is rejected
-        # (live + enforced) rather than silently aliased to 'phi'. compute_transport_operators_direct
-        # remains for an external-Omega regime this belief design does not provide.
+        # (live + enforced) rather than silently aliased to 'phi'.
         if self.gauge_parameterization == "omega_direct":
             raise NotImplementedError(
                 "gauge_parameterization='omega_direct' needs a per-token GL(K) matrix Omega_i, "
@@ -427,6 +427,21 @@ class VFE3Config:
                 "rope_full_gauge=True rotates the covariance sandwich (R Sigma R^T), which the "
                 "diagonal-covariance approximation cannot carry; set diagonal_covariance=False."
             )
+        # RoPE rotates ADJACENT coordinate pairs (2k, 2k+1); Sp(2m) pairs coordinate i with m+i
+        # (J = [[0,I],[-I,0]]), so the rope-wrapped transport R Omega R^T leaves the symplectic group.
+        # R is orthogonal (a subset of GL(K)), so the GL(K)-congruence divergence invariance and VFE
+        # equivariance survive -- the operator is still valid, just no longer in the SELECTED Sp
+        # structure group. Warn (not error): the symplectic property is not consumed downstream.
+        if self.pos_rotation == "rope" and self.gauge_group == "sp":
+            import warnings
+            warnings.warn(
+                "pos_rotation='rope' with gauge_group='sp' leaves the symplectic group: RoPE rotates "
+                "adjacent pairs (2k, 2k+1) while Sp(2m) pairs i with m+i, so R Omega R^T is no longer "
+                "in Sp(2m). The GL(K)-congruence divergence invariance still holds (R is orthogonal), "
+                "so the model runs; only the structure-group claim is dropped.",
+                UserWarning,
+                stacklevel=2,
+            )
         # spd_retract_mode selects the SPD covariance retraction geometry. Validated against the
         # retraction REGISTRY (not a hardcoded literal list) so a newly registered retraction is a
         # valid config value without editing this validator. Default 'spd_affine' is the
@@ -467,6 +482,18 @@ class VFE3Config:
         if self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be positive, got {self.decode_tau}")
         _require(self.decode_mode, _VALID_DECODE_MODES, "decode_mode")
+        # decode_mode sets the RANK of the prior-bank KL-decode kernel: 'diagonal'/'diagonal_chunked'
+        # consume a diagonal sigma (B,N,K); 'full' consumes a full sigma (B,N,K,K). It must agree with
+        # the covariance family, else the rank mismatch is a shape RuntimeError at the first forward.
+        # Only the prior-bank decode reads decode_mode; the use_prior_bank=False linear decode ignores
+        # it (sigma discarded), so the cross-check is gated on use_prior_bank.
+        if self.use_prior_bank and (self.decode_mode == "full") == family_is_diagonal:
+            raise ValueError(
+                f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
+                f"'full' decode needs a full-covariance family and 'diagonal'/'diagonal_chunked' decode "
+                f"needs a diagonal family. Pair decode_mode='full' with a full family, use a diagonal "
+                f"decode_mode with a diagonal family, or set use_prior_bank=False (linear decode)."
+            )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
         _require(self.encode_mode, _VALID_ENCODE_MODES, "encode_mode")
@@ -570,7 +597,7 @@ class VFE3Config:
         return "detach" if self.detach_e_step else self.e_step_gradient
 
 
-def _require(value: str, valid: tuple, name: str) -> None:
+def _require(value: Optional[str], valid: tuple, name: str) -> None:
     """Raise ValueError unless ``value`` is one of ``valid``."""
     if value not in valid:
         raise ValueError(f"{name} must be one of {valid}, got {value!r}")

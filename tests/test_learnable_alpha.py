@@ -79,7 +79,9 @@ def test_learnable_alpha_changes_forward_when_log_alpha_moves():
     tok = torch.randint(0, 20, (2, 5))
     tgt = torch.randint(0, 20, (2, 5))
     cfg_kw = dict(alpha_mode="learnable", n_layers=1, n_e_steps=4,
-                  e_mu_lr=0.3, e_sigma_lr=0.1, e_phi_lr=0.0)
+                  e_mu_lr=0.3, e_sigma_lr=0.1, e_phi_lr=0.0,
+                  pos_phi="none")   # isolate the alpha sensitivity: the positional gauge composition
+                                    # damps the self-coupling signal below the 1e-6 detection floor
     torch.manual_seed(0)
     model = VFEModel(_cfg(**cfg_kw))
     _, loss0, _ = model(tok, tgt)

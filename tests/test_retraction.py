@@ -5,9 +5,28 @@ from vfe3.geometry.retraction import (
     get_retraction,
     natural_gradient,
     register_retraction,
+    retract_logeuclidean_full,
     retract_spd_diagonal,
     retract_spd_full,
 )
+
+
+def test_sigma_max_caps_variance_consistently_across_diag_and_full():
+    # sigma_max must denote ONE physical variance ceiling on both arms: the eigenvalues of a full
+    # covariance ARE variances, so the full retraction must cap them at sigma_max -- NOT sigma_max**2,
+    # which let the full family hold variances a factor sigma_max larger than the diagonal arm under
+    # the same knob (the cov_kind-seam mismatch).
+    sigma_max, K = 3.0, 4
+    out_d = retract_spd_diagonal(torch.ones(2, K), torch.full((2, K), 1e3), sigma_max=sigma_max)
+    assert out_d.max().item() <= sigma_max + 1e-5
+    sig_f = torch.eye(K).expand(2, K, K).contiguous()
+    huge  = torch.eye(K).expand(2, K, K).contiguous() * 1e3
+    eig_affine = torch.linalg.eigvalsh(
+        retract_spd_full(sig_f, huge, trust_region=0.0, sigma_max=sigma_max))
+    assert eig_affine.max().item() <= sigma_max + 1e-4
+    eig_le = torch.linalg.eigvalsh(
+        retract_logeuclidean_full(sig_f, huge, trust_region=0.0, sigma_max=sigma_max))
+    assert eig_le.max().item() <= sigma_max + 1e-4
 
 
 def test_diagonal_retraction_positive_and_bounded():
@@ -35,7 +54,11 @@ def test_full_retraction_identity_tangent_is_identity():
     A = torch.randn(3, 4, 4, generator=g)
     sigma = A @ A.transpose(-1, -2) + torch.eye(4)
     zero = torch.zeros(3, 4, 4)
-    out = retract_spd_full(sigma, zero)
+    # sigma_max=1e9 keeps the (variance) safety ceiling from binding: this random sigma has
+    # eigenvalues > the default sigma_max, and the centering axiom R(Sigma,0)=Sigma is the geodesic
+    # exp-map property, tested WITHIN the variance box (the output clamp correctly caps an
+    # out-of-box base point at sigma_max on BOTH the diagonal and full arms).
+    out = retract_spd_full(sigma, zero, sigma_max=1e9)
     assert torch.allclose(out, sigma, atol=1e-3)
 
 
@@ -229,7 +252,7 @@ def test_log_euclidean_registered_and_config_accepts():
     from vfe3.config import VFE3Config
     assert callable(get_retraction("log_euclidean"))
     cfg = VFE3Config(spd_retract_mode="log_euclidean", family="gaussian_full",
-                     diagonal_covariance=False)
+                     diagonal_covariance=False, decode_mode="full")
     assert cfg.spd_retract_mode == "log_euclidean"
 
 

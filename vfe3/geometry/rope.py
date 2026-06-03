@@ -37,7 +37,7 @@ def _pos_rotation_none(
 
     *,
     base:   float = 100.0,
-    device: torch.device = None,
+    device: Optional[torch.device] = None,
     dtype:  torch.dtype  = torch.float32,
 ) -> Optional[torch.Tensor]:
     r"""No rotation: returns None (the transport is left un-rotated)."""
@@ -51,7 +51,7 @@ def build_rope_rotation(
 
     *,
     base:   float = 100.0,
-    device: torch.device = None,
+    device: Optional[torch.device] = None,
     dtype:  torch.dtype  = torch.float32,
 ) -> torch.Tensor:                        # (N, K, K) block-diagonal orthogonal rotation
     r"""Per-position block-diagonal rotation R(theta) on ``irrep_dims``.

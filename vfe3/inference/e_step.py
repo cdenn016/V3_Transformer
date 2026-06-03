@@ -219,8 +219,12 @@ def phi_alignment_loss(
     family:    str   = "gaussian_diagonal",
     divergence_family: str = "renyi",
 
-    include_attention_entropy: bool = True,
-    log_prior: Optional[torch.Tensor] = None,
+    include_attention_entropy: bool  = True,
+    transport_mode:            str   = "flat",        # connection-regime registry key (default flat)
+    cocycle_relaxation:        float = 1.0,           # regime_ii homotopy alpha; 0 -> flat
+
+    log_prior:    Optional[torch.Tensor] = None,
+    connection_W: Optional[torch.Tensor] = None,      # learned regime_ii connection (held fixed here)
 ) -> torch.Tensor:
     r"""Canonical belief-coupling block as a function of phi (mu, sigma fixed), plus the
     gauge-frame penalty (manuscript Algorithm 1, line for nabla_phi F):
@@ -232,7 +236,11 @@ def phi_alignment_loss(
     during inference (distinct from the outer M-step ||phi||^2 on the learned prior table). The
     canonical (entropy) branch reuses ``reduced_free_energy``, the -tau log Z envelope form.
     """
-    omega = _transport(phi, group)
+    # Build Omega under the ACTIVE connection regime so the phi step descends the SAME objective as
+    # the mu/sigma step. regime_ii reads the (fixed) belief means mu and the learned connection_W;
+    # mu and connection_W are held constant w.r.t. the phi gradient (only phi varies).
+    omega = _transport(phi, group, transport_mode=transport_mode, mu=mu,
+                       connection_W=connection_W, cocycle_relaxation=cocycle_relaxation)
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma)
     fam = get_family(family)
@@ -349,6 +357,8 @@ def e_step_iteration(
                 mu, sigma, phi_g, group, tau=tau, alpha_div=alpha_div, kl_max=kl_max, eps=eps,
                 mass_phi=mass_phi, family=family, divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy, log_prior=log_prior,
+                transport_mode=transport_mode, cocycle_relaxation=cocycle_relaxation,
+                connection_W=(connection_W.detach() if connection_W is not None else None),
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]
         grad_phi = precondition_phi_gradient(

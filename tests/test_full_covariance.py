@@ -111,3 +111,15 @@ def test_full_kl_survives_non_pd_covariance():
         FullGaussian(mu, sigma_p), alpha=1.0, kl_max=100.0, eps=1e-6)
     assert torch.isfinite(kl).all()
     assert (kl <= 100.0 + 1e-3).all()
+
+
+def test_full_entropy_survives_non_pd_covariance():
+    # FullGaussian.entropy must use the same safe (jittered, never-raising) Cholesky as the full-cov
+    # KL: a raw torch.linalg.cholesky on a numerically non-PD Sigma raises and kills a diagnostics
+    # / entropy call. Mirrors test_full_kl_survives_non_pd_covariance for the entropy path.
+    from vfe3.families.gaussian import FullGaussian
+    K = 4
+    mu = torch.zeros(2, K)
+    bad = torch.eye(K).clone(); bad[0, 0] = -1.0                 # negative eigenvalue -> not PD
+    h = FullGaussian(mu, bad.expand(2, K, K).contiguous()).entropy()   # must NOT raise
+    assert torch.isfinite(h).all()

@@ -183,7 +183,7 @@ class FullGaussian(BeliefParams):
 
     def entropy(self) -> torch.Tensor:
         K = self.mu.shape[-1]
-        L = torch.linalg.cholesky(self.sigma)
+        L, _ = safe_cholesky(self.sigma, rounds=5)     # jittered, never raises on a non-PD Sigma
         return 0.5 * _logdet_chol(L) + 0.5 * K * math.log(2.0 * math.pi * math.e)
 
     def renyi_closed_form(

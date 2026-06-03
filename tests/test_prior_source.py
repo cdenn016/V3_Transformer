@@ -41,6 +41,9 @@ def _make(prior_source: str = "token", *, gamma_coupling: float = 0.0, lambda_h:
         vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
         n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0, mstep_self_coupling_weight=0.0,
         prior_source=prior_source, gamma_coupling=gamma_coupling, lambda_h=lambda_h, seed=seed,
+        pos_phi="none",   # isolate the prior-reroute on the pure path: the model-channel model
+                          # draws an extra s table, which (under pos_phi="learned") RNG-diverges
+                          # the model-owned pos_phi_free and breaks the s:=belief byte-identity floor
     )
     torch.manual_seed(seed)              # the model does NOT self-seed; pin RNG before construction
     return VFEModel(cfg)
@@ -95,6 +98,7 @@ def test_copy_equivalence_holds_through_mstep_and_multilayer():
             vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=2,
             n_e_steps=2, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
             mstep_self_coupling_weight=0.5, prior_source=src, seed=0,
+            pos_phi="none",   # see _make: isolate the reroute byte-identity from pos_phi_free RNG
         )
         torch.manual_seed(0)
         return VFEModel(cfg)
