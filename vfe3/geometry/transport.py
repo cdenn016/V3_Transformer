@@ -48,6 +48,31 @@ class FactoredTransport:
         return torch.einsum("...ikl,...jlm->...ijkm", self.exp_phi, self.exp_neg_phi)
 
 
+@dataclass
+class RopeTransport:
+    r"""A built transport wrapped with a gauge-RoPE positional rotation R(theta).
+
+    ``base`` is the un-rotated transport (a dense (N,N,K,K) Omega OR a FactoredTransport). The
+    effective operator is Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T. ``transport_mean``
+    always applies the rotation; ``transport_covariance`` applies it only when ``on_cov`` (the
+    means+covariance "full-gauge" regime, which the config gates to full covariance). Means-only
+    (``on_cov=False``) leaves the covariance sandwich on the un-rotated ``base`` -- numerically
+    identical to no RoPE for the covariance, so the diagonal-covariance path stays valid.
+    """
+
+    base:   'torch.Tensor | FactoredTransport'
+    rope:   torch.Tensor                  # (N, K, K) block-diagonal orthogonal rotation
+    on_cov: bool = False
+
+
+def _rope_dense_omega(base: 'torch.Tensor | FactoredTransport', rope: torch.Tensor) -> torch.Tensor:
+    r"""Effective dense Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T (full-gauge / dense path)."""
+    omega = base.to_dense_omega() if isinstance(base, FactoredTransport) else base   # (...,N,N,K,K)
+    # R_i Omega_ij R_j^T: contract R on the left of the i-axis output and the right (transposed) of j.
+    rot = torch.einsum("...ikl,...ijlm,...jnm->...ijkn", rope, omega, rope)
+    return rot
+
+
 # -- connection-regime registry (orthogonal to the gauge_parameterization phi|omega_direct axis) --
 # The CONNECTION REGIME (flat Regime I, the non-flat Regime II to come) is a registry-backed modular
 # axis on equal footing with the structure group (clean-room spec sec 4.2): config-selected, added by
@@ -396,6 +421,12 @@ def transport_mean(
     never forming (B,N,N,K,K). Autograd-safe (differentiates through the live exps), so it survives
     the smoothing-mode oracle if a container ever reaches it.
     """
+    if isinstance(omega, RopeTransport):
+        # mu_t[i,j] = R_i Omega_ij R_j^T mu_j: pre-rotate the key mean by R_j^T, transport on the
+        # un-rotated base, post-rotate the result by R_i. R_j^T mu_j = sum_l R[j,l,k] mu[j,l].
+        m = torch.einsum("...jlk,...jl->...jk", omega.rope, mu)        # (..., N, K)
+        t = transport_mean(omega.base, m)                             # (..., N, N, K)
+        return torch.einsum("...ikl,...ijl->...ijk", omega.rope, t)   # post-rotate by R_i
     if isinstance(omega, FactoredTransport):
         m = torch.einsum("...jlp,...jp->...jl", omega.exp_neg_phi, mu)  # (..., N, K): exp(-phi_j) @ mu_j
         return torch.einsum("...ikl,...jl->...ijk", omega.exp_phi, m)   # (..., N, N, K): exp(phi_i) @ m_j
@@ -426,6 +457,12 @@ def transport_covariance(
     block-diagonality. A FULL sigma rebuilds the dense Omega (byte-identical) and runs the unchanged
     sandwich, so full covariance is never the round-off factoring.
     """
+    if isinstance(omega, RopeTransport):
+        if not omega.on_cov:
+            return transport_covariance(omega.base, sigma, diagonal_out=diagonal_out)   # mu-only
+        # full-gauge: sandwich with the rotated dense operator (requires full covariance).
+        return transport_covariance(_rope_dense_omega(omega.base, omega.rope), sigma,
+                                    diagonal_out=diagonal_out)
     if isinstance(omega, FactoredTransport):
         # Diagonal sigma is (..., N, K) -> same rank as exp_phi minus the trailing K axis; a full
         # sigma is (..., N, K, K) -> same rank as exp_phi (the dense-Omega rank-gap is +1 here

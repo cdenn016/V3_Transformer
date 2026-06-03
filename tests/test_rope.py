@@ -24,3 +24,35 @@ def test_rope_position_zero_is_identity():
 def test_pos_rotation_none_registered():
     assert get_pos_rotation("none")(torch.arange(3), [4], base=100.0,
                                     device=torch.device("cpu"), dtype=torch.float32) is None
+
+
+from vfe3.geometry.transport import RopeTransport, transport_mean, transport_covariance
+
+
+def test_rope_mean_at_identity_omega_is_relative():
+    # Omega = I -> Omega^RoPE = R(theta_i) R(theta_j)^T = R(theta_i - theta_j): relative position.
+    N, K = 5, 4
+    R = build_rope_rotation(torch.arange(N), [K], base=100.0,
+                            device=torch.device("cpu"), dtype=torch.float32)
+    omega_I = torch.eye(K).expand(N, N, K, K).contiguous()
+    mu = torch.randn(N, K)
+    rt = RopeTransport(base=omega_I, rope=R, on_cov=False)
+    mu_t = transport_mean(rt, mu)                            # (N, N, K)
+    mu_const = torch.ones(N, K)
+    rt_c = RopeTransport(base=omega_I, rope=R, on_cov=False)
+    t = transport_mean(rt_c, mu_const)                      # (N, N, K)
+    # rows of equal (i-j) give equal transported vectors (relative-position property)
+    assert torch.allclose(t[2, 1], t[3, 2], atol=1e-5)      # both are (i-j)=1
+    assert torch.allclose(t[3, 1], t[4, 2], atol=1e-5)      # both are (i-j)=2
+
+
+def test_rope_mean_only_leaves_covariance_unrotated():
+    N, K = 4, 4
+    R = build_rope_rotation(torch.arange(N), [K], base=10.0,
+                            device=torch.device("cpu"), dtype=torch.float32)
+    omega_I = torch.eye(K).expand(N, N, K, K).contiguous()
+    sigma = torch.rand(N, K) + 0.5
+    rt = RopeTransport(base=omega_I, rope=R, on_cov=False)
+    plain = transport_covariance(omega_I, sigma)            # un-rotated diagonal sandwich
+    roped = transport_covariance(rt, sigma)                 # mu-only -> ignores rope
+    assert torch.allclose(plain, roped, atol=1e-6)
