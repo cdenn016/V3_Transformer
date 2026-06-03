@@ -17,6 +17,7 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader
+from vfe3.free_energy import attention_tau
 from vfe3.model.model import VFEModel
 
 if TYPE_CHECKING:                                    # avoid an import cycle (run_artifacts imports evaluate)
@@ -398,7 +399,8 @@ def _banner(model: VFEModel, cfg: VFE3Config, dataset: str, device: torch.device
         f"group={cfg.gauge_group}  family={cfg.family}",
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         f" M-LRs: mu={cfg.m_mu_lr}  sigma={cfg.m_sigma_lr}  phi={cfg.m_phi_lr}",
-        f" VFE: alpha={cfg.alpha}  kappa={cfg.kappa}  tau={cfg.tau:.4f}  mass_phi={cfg.mass_phi}",
+        f" VFE: alpha={cfg.alpha}  kappa={cfg.kappa}  "
+        f"tau={attention_tau(cfg.kappa, model.group.irrep_dims):.4f}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",
         bar,
     ])

@@ -14,6 +14,16 @@ _B   = torch.log(_PI)                              # log-prior bias
 _TAU = 2.0
 
 
+def test_attention_tau_keys_off_energy_dimension():
+    # The softmax temperature must match the dimension the energy accumulates over: the irrep BLOCK.
+    # Single-block groups (glk/so_k/sp, irrep_dims=[K]) accumulate over the full K -> sqrt(K); per-head
+    # multi-block (block_glk, irrep_dims=[d_head]*H) accumulates per head -> sqrt(d_head).
+    from vfe3.free_energy import attention_tau
+    assert abs(attention_tau(1.0, [64]) - 8.0) < 1e-6           # single block: sqrt(64)
+    assert abs(attention_tau(2.0, [64]) - 16.0) < 1e-6          # kappa scales it
+    assert abs(attention_tau(1.0, [8] * 8) - 8.0 ** 0.5) < 1e-6  # per-head: sqrt(d_head=8)
+
+
 def test_beta_is_softmax_logprior_minus_energy_over_tau():
     beta = attention_weights(_E, log_prior=_B, tau=_TAU)
     logits = _B - _E / _TAU

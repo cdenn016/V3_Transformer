@@ -559,14 +559,15 @@ class VFE3Config:
 
     @property
     def tau(self) -> float:
-        """Attention softmax temperature tau = kappa * sqrt(d_head).
+        """Per-head softmax-temperature convenience value tau = kappa * sqrt(d_head).
 
-        Per-head dimension d_head = embed_dim // n_heads, so kappa=1 recovers standard
-        scaled dot-product attention (Vaswani sqrt(d_k)) PER HEAD. Audit finding 6c: the
-        manuscript's free-energy functional (eq:pointwise) writes tau = kappa*sqrt(K) over
-        the full belief, but its standard-attention recovery is derived per-head with
-        sqrt(d_k); the code follows the recovery convention so that kappa=1 is the
-        Vaswani temperature.
+        NOTE: this is a config-level convenience (used for logging). The ACTIVE attention
+        temperature is computed group-aware by ``free_energy.attention_tau(kappa, group.irrep_dims)``,
+        which keys off the dimension the energy accumulates over -- the gauge-irrep BLOCK: sqrt(K)
+        for a single-block group (glk/so_k/sp, irrep_dims=[K]) and sqrt(d_head) for per-head
+        multi-block (block_glk). This property equals the active tau only for an equal-block group
+        whose block size is d_head (the default block_glk); on a single-block group it understates it
+        by sqrt(n_heads). kappa=1 recovers the Vaswani sqrt(d_k) temperature over the energy dimension.
         """
         return self.kappa * (self.d_head ** 0.5)
 

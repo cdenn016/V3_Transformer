@@ -161,8 +161,15 @@ class VFEModel(nn.Module):
         # nn.Parameter like log_alpha/connection_W, not a network); the "none"/"frozen" paths add no
         # parameter, so the pure path stays param-free. Init scaled by pos_phi_scale.
         if cfg.pos_phi == "learned":
+            # Seed pos_phi_free from a DEDICATED generator (cfg.seed), independent of the global RNG
+            # stream position: its init no longer depends on whether the conditional model-channel
+            # s/r prior tables were drawn, so pos_phi_free is byte-identical across token vs
+            # model_channel models (the s-channel byte-identity oracles then hold under the learned
+            # default). A separate generator does NOT clobber the caller's global RNG, so the
+            # reproducibility seam stays at run_training; mu/sigma/phi inits are unchanged.
+            _g = torch.Generator().manual_seed(int(cfg.seed))
             self.pos_phi_free = nn.Parameter(
-                torch.randn(cfg.max_seq_len, n_gen) * cfg.pos_phi_scale)
+                torch.randn(cfg.max_seq_len, n_gen, generator=_g) * cfg.pos_phi_scale)
             if cfg.detach_e_step:
                 # Footgun (mirrors log_alpha / connection_W): pos_phi_free enters the loss ONLY
                 # through the E-step belief transport, which detach_e_step wraps in no_grad, so the
@@ -567,7 +574,7 @@ class VFEModel(nn.Module):
         from vfe3.inference.e_step import _transport
         from vfe3.geometry.transport import transport_mean, transport_covariance
         from vfe3.families.base import get_family
-        from vfe3.free_energy import pairwise_energy, self_divergence_for_alpha, attention_weights
+        from vfe3.free_energy import pairwise_energy, self_divergence_for_alpha, attention_weights, attention_tau
         from vfe3.alpha_i import self_coupling_alpha
         from vfe3 import metrics
 
@@ -614,7 +621,7 @@ class VFEModel(nn.Module):
             divergence_family=cfg.divergence_family,
             irrep_dims=self.group.irrep_dims,
         )
-        beta = attention_weights(energy, tau=cfg.tau, log_prior=log_prior)
+        beta = attention_weights(energy, tau=attention_tau(cfg.kappa, self.group.irrep_dims), log_prior=log_prior)
         self_div = self_divergence_for_alpha(                        # (N,) or (N, K) per-coord
             fam(out.mu, out.sigma), fam(mu_p, sigma_p),
             alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
@@ -626,7 +633,7 @@ class VFEModel(nn.Module):
         )
 
         d = {"attn_entropy": float(metrics.attention_entropy(beta))}
-        terms = metrics.free_energy_terms(self_div, energy, beta, alpha, tau=cfg.tau, log_prior=log_prior)
+        terms = metrics.free_energy_terms(self_div, energy, beta, alpha, tau=attention_tau(cfg.kappa, self.group.irrep_dims), log_prior=log_prior)
         d.update({k: float(v) for k, v in terms.items()})
         spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
         d["effective_rank"] = float(metrics.effective_rank(spec).mean())
@@ -664,7 +671,7 @@ class VFEModel(nn.Module):
         from vfe3.inference.e_step import _transport
         from vfe3.geometry.transport import transport_mean, transport_covariance
         from vfe3.families.base import get_family
-        from vfe3.free_energy import pairwise_energy, attention_weights
+        from vfe3.free_energy import pairwise_energy, attention_weights, attention_tau
 
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
@@ -705,7 +712,7 @@ class VFEModel(nn.Module):
                 alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
-            beta = attention_weights(energy, tau=cfg.tau, log_prior=log_prior)
+            beta = attention_weights(energy, tau=attention_tau(cfg.kappa, self.group.irrep_dims), log_prior=log_prior)
             if beta.dim() == 2:                                      # single-block group -> add an H=1 axis
                 beta = beta.unsqueeze(0)
             maps.append(beta)                                        # (H, N, N)

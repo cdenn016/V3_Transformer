@@ -12,6 +12,7 @@ import torch
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup
+from vfe3.free_energy import attention_tau
 from vfe3.inference.e_step import e_step
 
 
@@ -42,7 +43,7 @@ def vfe_block(
     ``rope_on_cov`` enables the full-gauge covariance sandwich rotation."""
     out = e_step(
         belief, mu_p, sigma_p, group,
-        n_iter=cfg.n_e_steps, tau=cfg.tau,
+        n_iter=cfg.n_e_steps, tau=attention_tau(cfg.kappa, group.irrep_dims),
         e_mu_lr=cfg.e_mu_lr, e_sigma_lr=cfg.e_sigma_lr, e_phi_lr=cfg.e_phi_lr,
         alpha_div=cfg.alpha_div, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0, log_alpha=log_alpha,
         kl_max=cfg.kl_max, eps=cfg.eps,

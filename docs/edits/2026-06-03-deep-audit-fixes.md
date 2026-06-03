@@ -61,6 +61,26 @@ Done in dependency order, each tier committed separately, TDD + golden-verified.
 - `vfe3/model/block.py`, `vfe3/model/stack.py` — `block_norm: Optional[Any]` → `Optional[Callable[..., torch.Tensor]]`.
 - `vfe3/model/prior_bank.py` — `encode_s` return type `'tuple[...]'` (string) → `Tuple[torch.Tensor, torch.Tensor]`.
 
+### Tier 2 — behavior/numerics changes
+- `vfe3/free_energy.py` — new `attention_tau(kappa, irrep_dims) = kappa*sqrt(irrep_dims[0])`: the
+  softmax temperature now keys off the dimension the energy accumulates over (the irrep BLOCK):
+  `sqrt(K)` for single-block groups (glk/so_k/sp), `sqrt(d_head)` for per-head multi-block (block_glk).
+  Wired into `block.py` (E-step) and `model.py` (diagnostics/decode); the train banner prints it.
+  **BEHAVIOR CHANGE on single-block groups only:** glk/so_k/sp (n_heads>1) tau goes from
+  `kappa*sqrt(K/n_heads)` to `kappa*sqrt(K)` (a `sqrt(n_heads)` softer softmax, the manuscript
+  `tau=kappa*sqrt(K)` convention). The DEFAULT block_glk is UNCHANGED (`irrep_dims[0]=d_head`), so the
+  frozen oracle and all multi-block golden pins are bit-identical. `cfg.tau` kept as a logging
+  convenience with an updated docstring.
+- `vfe3/model/model.py` — `pos_phi_free` is now initialized from a DEDICATED `cfg.seed` generator
+  instead of the global RNG stream, so its init is independent of whether the conditional model-channel
+  s/r tables were drawn. **BEHAVIOR CHANGE on the pos_phi="learned" path:** pos_phi_free init values
+  change (mu/sigma/phi inits are unchanged; the global stream is untouched, so pos_phi="none" and the
+  frozen oracle are bit-identical). This makes the s-channel byte-identity oracles hold under the
+  learned default, so the copy-equivalence (test_prior_source) and hyperprior-linearity tests were
+  UN-PINNED from `pos_phi="none"`. The gamma-linearity and learnable-alpha tests stay on `pos_phi="none"`
+  for unrelated reasons (the gamma oracle assumes no positional composition; the learnable-alpha signal
+  is damped below the 1e-6 floor by pos_phi magnitude) — neither is an RNG issue.
+
 ## NOT touched
 
 `ablation.py` and `train_vfe3.py` had concurrent uncommitted edits to their click-to-run config dicts
