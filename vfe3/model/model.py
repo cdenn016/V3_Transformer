@@ -194,16 +194,21 @@ class VFEModel(nn.Module):
         self,
         n:      int,                          # sequence length N (varies across calls)
         device: torch.device,
+
+        *,
+        prior:  Optional[str] = None,         # prior-registry name; None -> cfg.attention_prior (belief block)
     ) -> torch.Tensor:
-        r"""Loop-invariant attention log-prior, cached on (N, device, dtype) (audit 4e).
+        r"""Loop-invariant attention log-prior, cached on (name, N, device, dtype) (audit 4e).
 
         The dtype is taken from the prior-bank mean table so the mask matches the belief
-        dtype after a ``.to(torch.float64)`` move (audit 2f: the old call omitted dtype)."""
+        dtype after a ``.to(torch.float64)`` move (audit 2f: the old call omitted dtype). ``prior``
+        lets the gamma model-coupling block reuse the same cache under its own attention prior."""
+        name = prior if prior is not None else self.cfg.attention_prior
         dtype = self.prior_bank.mu_embed.dtype
-        key = (n, device, dtype)
+        key = (name, n, device, dtype)
         cached = self._log_prior_cache.get(key)
         if cached is None:
-            cached = attention_log_prior(self.cfg.attention_prior, n, n, device=device, dtype=dtype)
+            cached = attention_log_prior(name, n, n, device=device, dtype=dtype)
             self._log_prior_cache[key] = cached
         return cached
 
@@ -446,7 +451,6 @@ class VFEModel(nn.Module):
             # keeps only diag(Omega Sigma Omega^T), the same approximation the belief diagonal family
             # uses. The mean over (B, H, N) makes gamma_coupling=1 a per-token-per-head mean weight, not
             # the canonical sum-over-ij.
-            from vfe3.attention_prior import attention_log_prior
             from vfe3.families.gaussian import DiagonalGaussian
             from vfe3.free_energy import pairwise_energy, reduced_free_energy
             from vfe3.geometry.transport import (
@@ -466,9 +470,9 @@ class VFEModel(nn.Module):
                 alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )                                                            # (B, H, N, N)
-            gamma_log_prior = attention_log_prior(
-                cfg.gamma_attention_prior, n_pos, n_pos, device=token_ids.device, dtype=s_mu.dtype,
-            )                                                            # (N, N)
+            gamma_log_prior = self._attention_log_prior(
+                n_pos, token_ids.device, prior=cfg.gamma_attention_prior,
+            )                                                            # (N, N), cached buffer
             f_red_s = reduced_free_energy(e_s, tau=cfg.tau_gamma, log_prior=gamma_log_prior)   # (B, H, N)
             loss = loss + cfg.gamma_coupling * f_red_s.mean()
         return logits, loss, ce.detach()

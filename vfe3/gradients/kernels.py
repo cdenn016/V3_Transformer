@@ -210,8 +210,12 @@ def _beta_to_coordinate(
     """
     if irrep_dims is None or len(irrep_dims) == 1:
         return beta.unsqueeze(-1).expand(*beta.shape, K)
-    reps = torch.tensor(irrep_dims, device=beta.device)
-    return torch.repeat_interleave(beta.movedim(-3, -1), reps, dim=-1)   # (N,N,H)->(N,N,K)
+    x = beta.movedim(-3, -1)                                             # (N, N, H)
+    if len(set(irrep_dims)) == 1:                                        # equal blocks (block_glk):
+        d = irrep_dims[0]                                                # expand/reshape, no gather --
+        return x.unsqueeze(-1).expand(*x.shape, d).reshape(*x.shape[:-1], x.shape[-1] * d)  # bit-identical
+    reps = torch.tensor(irrep_dims, device=beta.device)                 # unequal blocks: gather fallback
+    return torch.repeat_interleave(x, reps, dim=-1)                      # (N,N,H)->(N,N,K)
 
 
 def get_kernel(name: str) -> Callable:

@@ -5,7 +5,7 @@ runs the iterative E-step (Phase 6) and an optional gauge-equivariant norm on th
 mean. The belief handoff across blocks lives in stack.py.
 """
 
-from typing import Any, Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -24,7 +24,7 @@ def vfe_block(
 
     *,
     log_prior:       Optional[torch.Tensor]    = None,
-    block_norm:      Optional[Any]             = None,   # cached norm instance (None -> no block norm)
+    block_norm:      Optional[Callable[..., torch.Tensor]] = None,   # cached norm instance (None -> off)
     log_alpha:       Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
     connection_W:    Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
     e_step_gradient: str                       = "unroll",  # E-step backward estimator (unroll | straight_through | detach)

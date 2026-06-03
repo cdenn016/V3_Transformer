@@ -44,7 +44,24 @@ the three corrected math/theory invariants.
   whose oracles require no positional composition. `test_viz` umap test skips gracefully on the native
   `OSError`. Removed the two golden-pin tests for the deleted dead functions.
 
+## Deferred-fix pass (user opted into all four tiers)
+
+Done in dependency order, each tier committed separately, TDD + golden-verified.
+
+### Tier 1 — cosmetic type-precision + bit-identical micro-perf (no behavior change)
+- `vfe3/gradients/kernels.py` — `_beta_to_coordinate`: equal-block path uses `expand/reshape` instead
+  of `repeat_interleave` (skips the gather; BIT-identical, pinned by a new perf-equivalence test);
+  unequal blocks fall back to the gather.
+- `vfe3/model/model.py` — `_attention_log_prior` generalized to take a `prior` name (cache key now
+  `(name, N, device, dtype)`); the gamma block reuses it instead of rebuilding `gamma_log_prior` every
+  forward. Byte-identical; redundant local import dropped.
+- `vfe3/families/base.py` — parameterized the bare `Callable` registry returns (`register_family`,
+  `register_functional`, `get_functional`, `_FUNCTIONALS`); annotated the Bregman accumulator
+  `inner: 'torch.Tensor | float'` (runtime unchanged).
+- `vfe3/model/block.py`, `vfe3/model/stack.py` — `block_norm: Optional[Any]` → `Optional[Callable[..., torch.Tensor]]`.
+- `vfe3/model/prior_bank.py` — `encode_s` return type `'tuple[...]'` (string) → `Tuple[torch.Tensor, torch.Tensor]`.
+
 ## NOT touched
 
 `ablation.py` and `train_vfe3.py` had concurrent uncommitted edits to their click-to-run config dicts
-(not part of this audit) — left untouched and excluded from the audit-fixes commit.
+(not part of this audit) — left untouched and excluded from every audit/deferred commit.

@@ -24,7 +24,7 @@ decode kernel (the ``full`` stub), never by editing a call site -- and ``referen
 already covers any registered divergence for verification.
 """
 
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -181,7 +181,7 @@ class PriorBank(nn.Module):
     def encode_s(
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
-    ) -> 'tuple[torch.Tensor, torch.Tensor]':
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Look up the per-token model-channel belief s_i = N(s_mu, s_sigma) (diagonal).
 
         Returns (s_mu, s_sigma) with s_mu (B, N, K) and s_sigma (B, N, K) the positive

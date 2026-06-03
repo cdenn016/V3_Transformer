@@ -32,6 +32,21 @@ def _fwd_cfg() -> VFE3Config:
                       n_e_steps=2, e_phi_lr=0.1, pos_phi="none")
 
 
+def test_beta_to_coordinate_equal_blocks_matches_repeat_interleave():
+    # The equal-block expand/reshape fast path (avoids the repeat_interleave gather) must be
+    # BIT-identical to the repeat_interleave reference: coordinate k carries head h(k)'s beta_ij.
+    from vfe3.gradients.kernels import _beta_to_coordinate
+    torch.manual_seed(0)
+    H, N, d = 3, 5, 4
+    beta = torch.softmax(torch.randn(H, N, N), dim=-1)
+    irrep = [d, d, d]
+    out = _beta_to_coordinate(beta, irrep, H * d)
+    ref = torch.repeat_interleave(beta.movedim(-3, -1), torch.tensor(irrep), dim=-1)
+    assert torch.equal(out, ref)
+    for h in range(H):
+        assert torch.equal(out[..., h * d:(h + 1) * d], beta[h].unsqueeze(-1).expand(N, N, d))
+
+
 def test_model_forward_matches_frozen_oracle():
     torch.manual_seed(0)
     m = VFEModel(_fwd_cfg())
