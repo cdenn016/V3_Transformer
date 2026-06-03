@@ -17,6 +17,7 @@ import matplotlib
 matplotlib.use("Agg")                                            # non-interactive (headless / tests)
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import LogNorm
 
 
 def _np(x) -> np.ndarray:
@@ -147,18 +148,66 @@ def plot_attention_graph(
     return _save(fig, path)
 
 
+def _attn_log_bounds(
+    M:    np.ndarray,                    # attention weights (any shape)
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+) -> tuple:                              # (vmin, vmax) valid for a LogNorm scale
+    r"""Positive-entry (vmin, vmax) for a log attention scale (dynamic range capped at 3 decades).
+
+    Causal-masked future positions are exact zeros (softmax over a -inf prior), so only the
+    active (positive) entries set the scale. ``vmin`` is floored three decades below ``vmax`` so a
+    few near-zero weights cannot wash a panel out, and kept strictly below ``vmax`` so a uniform
+    map stays a valid LogNorm. Pass both bounds to share one scale across several panels.
+    """
+    if vmax is None:
+        pos = M[M > 0]
+        vmax = float(pos.max()) if pos.size else 1.0
+    if vmin is None:
+        pos = M[M > 0]
+        vmin = float(pos.min()) if pos.size else vmax * 1e-3
+    vmin = max(vmin, vmax * 1e-3)                                 # cap dynamic range at 3 decades
+    if vmin >= vmax:                                             # degenerate / uniform map
+        vmin = vmax * 1e-3
+    return float(vmin), float(vmax)
+
+
+def _attn_imshow(ax, B: np.ndarray, *, vmin: float, vmax: float, log: bool = True):
+    r"""imshow one (N, N) attention map. ``log`` (default) uses ``LogNorm`` to resolve the peaky
+    off-diagonal structure a linear scale washes to black; exact-zero (causal-masked) entries are
+    non-positive, so ``LogNorm`` masks them and ``set_bad`` renders them black."""
+    cmap = plt.cm.magma.copy()
+    cmap.set_bad("black")
+    if log:
+        return ax.imshow(B, cmap=cmap, aspect="auto", norm=LogNorm(vmin=vmin, vmax=vmax))
+    return ax.imshow(B, cmap=cmap, aspect="auto", vmin=0.0, vmax=vmax)
+
+
 def plot_attention_heatmap(
     beta,                                # (N, N)
 
     *,
-    path: Optional[str] = None,
+    log:   bool            = True,
+    title: str             = "Attention",
+    vmin:  Optional[float] = None,
+    vmax:  Optional[float] = None,
+    path:  Optional[str]   = None,
 ):
-    """Heatmap of the attention matrix (rows = queries, cols = keys)."""
+    r"""Log-scaled heatmap of one attention map (rows = queries i, cols = keys j).
+
+    Attention is a peaky causal softmax (most mass on a few keys, exact zeros above the diagonal),
+    so the default ``log`` scale (matplotlib ``LogNorm`` on beta) resolves the off-diagonal
+    structure a linear scale collapses to black; the causal-masked zeros render as the 'bad'
+    colour. Pass shared ``vmin``/``vmax`` to make several panels comparable; otherwise the positive
+    entries set the scale (dynamic range capped at three decades).
+    """
     B = _np(beta)
+    vlo, vhi = _attn_log_bounds(B, vmin, vmax)
     fig, ax = plt.subplots(figsize=(4.5, 4))
-    im = ax.imshow(B, cmap="magma", aspect="auto")
-    fig.colorbar(im, ax=ax, shrink=0.8, label=r"$\beta_{ij}$")
-    ax.set(title="Attention", xlabel="key j", ylabel="query i")
+    im = _attn_imshow(ax, B, vmin=vlo, vmax=vhi, log=log)
+    label = r"$\beta_{ij}$ (log scale)" if log else r"$\beta_{ij}$"
+    fig.colorbar(im, ax=ax, shrink=0.8, label=label)
+    ax.set(title=title, xlabel="key j", ylabel="query i")
     return _save(fig, path)
 
 
@@ -166,15 +215,18 @@ def plot_attention_grid(
     maps,                                # (L, H, N, N) per-layer per-head attention (or (H,N,N) / (N,N))
 
     *,
+    log:   bool          = True,
     title: str           = "Attention",
     path:  Optional[str] = None,
 ):
     """Grid of attention heatmaps: rows = layers, cols = heads (rows query i, cols key j).
 
     Accepts a per-layer/per-head stack ``(L, H, N, N)`` (as :meth:`VFEModel.attention_maps`
-    returns), a single layer ``(H, N, N)``, or a single map ``(N, N)``. A shared colour scale
-    across all panels makes heads/layers comparable; ``squeeze=False`` keeps the L==1 / H==1
-    axes array 2-D so indexing is uniform.
+    returns), a single layer ``(H, N, N)``, or a single map ``(N, N)``. A shared LOG colour scale
+    across all panels (default ``log``) makes heads/layers comparable and resolves the peaky
+    off-diagonal structure; ``squeeze=False`` keeps the L==1 / H==1 axes array 2-D so indexing is
+    uniform. For one figure per (layer, head) instead of a grid, call :func:`plot_attention_heatmap`
+    per panel (as :meth:`RunArtifacts.save_attention_maps` does).
     """
     M = _np(maps)
     if M.ndim == 2:                      # (N, N) -> one layer, one head
@@ -183,12 +235,12 @@ def plot_attention_grid(
         M = M[None]
     L, H = M.shape[0], M.shape[1]
     fig, axes = plt.subplots(L, H, figsize=(2.6 * H + 1.0, 2.6 * L + 0.6), squeeze=False)
-    vmax = float(M.max()) if M.size else 1.0
+    vlo, vhi = _attn_log_bounds(M)                                # one scale shared across panels
     im = None
     for li in range(L):
         for hi in range(H):
             ax = axes[li][hi]
-            im = ax.imshow(M[li, hi], cmap="magma", aspect="auto", vmin=0.0, vmax=vmax)
+            im = _attn_imshow(ax, M[li, hi], vmin=vlo, vmax=vhi, log=log)
             ax.set_xticks([]); ax.set_yticks([])
             if li == 0:
                 ax.set_title(f"head {hi}")
@@ -197,7 +249,8 @@ def plot_attention_grid(
             if li == L - 1:
                 ax.set_xlabel("key $j$")
     if im is not None:
-        fig.colorbar(im, ax=list(axes.ravel()), shrink=0.85, label=r"$\beta_{ij}$")
+        label = r"$\beta_{ij}$ (log scale)" if log else r"$\beta_{ij}$"
+        fig.colorbar(im, ax=list(axes.ravel()), shrink=0.85, label=label)
     fig.suptitle(title)
     return _save(fig, path)
 

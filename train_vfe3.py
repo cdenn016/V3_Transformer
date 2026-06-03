@@ -48,29 +48,29 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Edit any field, then run. Values are the wikitext-103 (real-corpus) defaults.
 # Registry fields list their valid keys inline; cross-field constraints are noted.
 config = dict(
-    # numerics
-    eps                       = 1e-6,
-    kl_max                    = 100.0,
-
-    # divergence seam -- the f-divergence FUNCTIONAL (distinct from `family` below)
-    divergence_family         = "renyi",             # "renyi"
-    alpha_div                 = 1.0,                  # Renyi order (1.0 -> KL)
+    
 
     # model structure
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
-    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    
+    embed_dim                 = 90,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 6,
+    
     max_seq_len               = 128,                 # N, context length
+    
+    batch_size                = 32,
+    max_steps                 = 90000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1,                   # T, E-step inner iterations
     
-    n_heads                   = 2,
+    
 
     # gauge seam
-    gauge_group               = "block_glk",         # "glk" | "block_glk" | "tied_block_glk" | "so_k"
+    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k"
                                                      # tied_block_glk: one shared GL(d) frame across heads (kron(I_n, gl(d)))
     gauge_parameterization    = "phi",               # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
-    use_head_mixer            = False,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks: block_glk/tied_block_glk);
+    use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks: block_glk/tied_block_glk);
                                                      # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
 
     # belief family -- diagonal_covariance MUST equal (family == "gaussian_diagonal")
@@ -79,7 +79,7 @@ config = dict(
 
     # free-energy coupling
     alpha                     = 1.0,                 # constant self-coupling value
-    alpha_mode                = "constant",          # "constant" | "state_dependent" | "state_dependent_per_coord"
+    alpha_mode                = "state_dependent_per_coord",          # "constant" | "state_dependent" | "state_dependent_per_coord"
     b0                        = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0                        = 1.0,                 # state-dependent alpha shape (numerator)
     
@@ -92,8 +92,8 @@ config = dict(
     attention_prior           = "causal",            # "uniform" | "causal" | "alibi"
 
     # E-step
-    e_mu_lr                   = 0.5,
-    e_sigma_lr                = 0.015,
+    e_mu_lr                   = 0.7,
+    e_sigma_lr                = 0.025,
     e_phi_lr                  = 0.0,
     
     e_sigma_q_trust           = 5.0,
@@ -101,11 +101,11 @@ config = dict(
     
     gradient_mode             = "filtering",          # "filtering" | "smoothing"
     
-    phi_precond_mode          = "killing_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
+    phi_precond_mode          = "killing",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
 
     # decode / encode
-    use_prior_bank            = True,                # True: KL-to-prior decode (pure path). False: linear projection
+    use_prior_bank            = False,                # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
     decode_tau                = 1.0,
     decode_mode               = "diagonal",          # "diagonal" | "full"
@@ -125,16 +125,23 @@ config = dict(
     m_mu_lr                   = 0.01,
     m_sigma_lr                = 0.0021,
     m_phi_lr                  = 0.009,
+    
     weight_decay              = 0.05,
     
-    batch_size                = 16,
-    max_steps                 = 15000,
+    # numerics
+    eps                       = 1e-6,
+    kl_max                    = 100.0,
+
+    # divergence seam -- the f-divergence FUNCTIONAL (distinct from `family` below)
+    divergence_family         = "renyi",             # "renyi"
+    alpha_div                 = 1.0,                  # Renyi order (1.0 -> KL)
     
     warmup_steps              = 100,
     seed                      = SEED,
+    
     log_interval              = 100,                  # console log every N steps (0 = off)
-    eval_interval             = 500,                   # periodic validation every N steps (0 = off)
-    checkpoint_interval       = 5000,                  # save a resumable checkpoint every N steps (0 = off)
+    eval_interval             = 1000,                   # periodic validation every N steps (0 = off)
+    checkpoint_interval       = 15000,                  # save a resumable checkpoint every N steps (0 = off)
 )
 
 

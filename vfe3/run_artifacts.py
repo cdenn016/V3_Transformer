@@ -100,23 +100,41 @@ class RunArtifacts:
         step:   int,
         maps:   torch.Tensor,                 # (L, H, N, N) per-layer per-head attention
         logger: Optional[logging.Logger] = None,
-    ) -> Optional[Path]:
-        r"""Best-effort per-layer/per-head attention heatmap grid for one periodic eval.
+    ) -> Optional[list]:
+        r"""Best-effort attention heatmaps for one periodic eval: one figure per (layer, head).
 
-        Writes ``attention/step_<N>.png`` (an L x H grid of beta heatmaps; see
-        :func:`vfe3.viz.figures.plot_attention_grid`). Mirrors ``_save_figures``: a plotting or
-        dependency error is logged and swallowed (never fatal to the run), and the figure is
-        closed so ~30 evals do not leak figures. Returns the path written, or None on failure.
+        Writes ``attention/step_<N>_layer<l>_head<h>.png`` per (layer, head) -- a LOG-scaled beta
+        heatmap (see :func:`vfe3.viz.figures.plot_attention_heatmap`) on a colour scale shared
+        across panels so heads/layers stay comparable. Mirrors ``_save_figures``: a plotting or
+        dependency error is logged and swallowed (never fatal to the run), and each figure is
+        closed so ~30 evals do not leak figures. Returns the paths written, or None on failure.
         """
         try:
             from vfe3.viz import figures as figs
             figs.set_publication_style()
+            m = maps.detach().cpu() if hasattr(maps, "detach") else torch.as_tensor(maps)
+            if m.dim() == 2:                                        # (N, N) -> one layer, one head
+                m = m[None, None]
+            elif m.dim() == 3:                                      # (H, N, N) -> one layer
+                m = m[None]
+            if m.dim() != 4:
+                raise ValueError(f"attention maps must be (L, H, N, N); got {tuple(m.shape)}")
+            n_layers, n_heads = m.shape[0], m.shape[1]
+            pos  = m[m > 0]                                         # shared log scale across all panels
+            vmax = float(pos.max()) if pos.numel() else 1.0
+            vmin = float(pos.min()) if pos.numel() else vmax * 1e-3
             attn_dir = self.run_dir / "attention"
             attn_dir.mkdir(exist_ok=True)
-            path = attn_dir / f"step_{step}.png"
-            fig = figs.plot_attention_grid(maps, title=f"Attention (step {step})", path=str(path))
-            figs.plt.close(fig)
-            return path
+            paths = []
+            for li in range(n_layers):
+                for hi in range(n_heads):
+                    path = attn_dir / f"step_{step}_layer{li}_head{hi}.png"
+                    fig = figs.plot_attention_heatmap(
+                        m[li, hi], log=True, vmin=vmin, vmax=vmax,
+                        title=f"Attention (step {step}) - layer {li} head {hi}", path=str(path))
+                    figs.plt.close(fig)
+                    paths.append(path)
+            return paths
         except Exception as exc:                                    # a viz error must never kill training
             (logger or logging.getLogger(__name__)).warning(
                 "attention-map figure at step %d failed (%s); training continues", step, exc)

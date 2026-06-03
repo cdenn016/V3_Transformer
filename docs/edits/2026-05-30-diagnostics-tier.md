@@ -126,3 +126,17 @@ Figure and optionally saves it.
 ### Commits
 
 - (this entry) `feat(viz): publication figures (UMAP, attention graph, ellipses, trajectory) + registry`
+
+## GL(K) attention audit
+
+### Files created
+
+- `docs/audits/audit-2026-05-30.md` - code/theory audit of the executable VFE_3.0 paths against `Manuscripts-Theory/GL(K)_attention.tex`.
+
+### Changes
+
+No source code was changed. The audit report records six findings about toggle reachability and theory conformance: per-head beta is collapsed to a single shared attention tensor, the full-covariance pure path is not runnable through the integrated model/E-step, `omega_direct` is validated but not wired into the model path, `divergence_family` is a dead config seam, `mass_phi` is M-step-only despite the manuscript phi-gradient form, and filtered diagnostics freeze query frames when `keys` is supplied.
+
+### Test results
+
+Testing was stopped by user request. The partial JUnit XML from `pytest -x --junitxml=.pytest-glk-audit.xml` reported `tests="23"`, `failures="0"`, `errors="1"` before cleanup; the error was a local temp-directory permission failure during `tmp_path` setup, not an assertion failure. The temporary XML file was removed.

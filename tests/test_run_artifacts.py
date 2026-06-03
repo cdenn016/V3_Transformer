@@ -101,14 +101,17 @@ def test_train_with_artifacts_writes_files(tmp_path):
 
 
 def test_train_with_artifacts_writes_attention_pngs(tmp_path):
-    # Per-eval per-layer/per-head attention grid: one attention/step_<N>.png per periodic eval.
+    # Per eval, one LOG-scaled attention/step_<N>_layer<l>_head<h>.png per (layer, head).
     cfg = _cfg(n_layers=2, prior_handoff_rho=0.5)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
     train(model, _loader(), cfg, n_steps=4, eval_interval=2, val_loader=_loader(seed=1), artifacts=art)
+    L, H = cfg.n_layers, len(model.group.irrep_dims)
+    expected = sorted(f"step_{s}_layer{l}_head{h}.png"
+                      for s in (2, 4) for l in range(L) for h in range(H))
     pngs = sorted((tmp_path / "run" / "attention").glob("step_*.png"))
-    assert [p.name for p in pngs] == ["step_2.png", "step_4.png"]
+    assert [p.name for p in pngs] == expected
     assert all(p.stat().st_size > 0 for p in pngs)
 
 

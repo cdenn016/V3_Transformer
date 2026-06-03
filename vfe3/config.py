@@ -54,6 +54,7 @@ class VFE3Config:
     # gauge seam
     gauge_group:               str   = "block_glk"
     gauge_parameterization:    str   = "phi"
+    
     # Connection REGIME (registry key): the flat Regime-I phi-cocycle ('flat', default = the pure
     # NO-NN path) vs the non-flat Regime II ('regime_ii'). ORTHOGONAL to gauge_parameterization,
     # which picks how a single flat transport is parameterized; this picks whether the connection is
@@ -65,10 +66,12 @@ class VFE3Config:
     # transport._build_regime_ii). At W=0 (init) or cocycle_relaxation=0 it reduces EXACTLY to the
     # flat cocycle, so init is byte-flat. The pure no-NN path is 'flat' (the default).
     transport_mode:            str   = "flat"
+    
     # Homotopy alpha for the Regime-II connection (regime_ii only): delta_ij^a = cocycle_relaxation *
     # (mu_i^T W^a mu_j). 0.0 -> delta=0 -> flat (Regime I); 1.0 -> fully relaxed (Regime II). Ignored
     # by the flat builder.
     cocycle_relaxation:        float = 1.0
+   
     # Cross-head GL(K) coupling: a list of directed (head_a, head_b) index pairs that add off-block
     # generators (and a genuinely larger-than-direct-sum subalgebra under the builder's bracket
     # closure) to the gauge basis. Default None = the current block-diagonal GL(d_head)^H gauge.
@@ -87,7 +90,7 @@ class VFE3Config:
     # into the token gauge frame via compose_phi BEFORE transport. "learned" owns a model parameter
     # table (max_seq_len, n_gen); "frozen" is the parameter-free i*pos_phi_scale on one axis. The
     # pure path is "none" (no composition). Validated against the pos_phi registry.
-    pos_phi:                   str   = "none"      # "none" | "learned" | "frozen"
+    pos_phi:                   str   = "learned"      # "none" | "learned" | "frozen"
     pos_phi_compose:           str   = "bch"       # composition chart: bch (default) | euclidean
     bch_pe_order:              int   = 4           # BCH Dynkin truncation order (compose_phi order)
     pos_phi_scale:             float = 0.02        # learned-table init scale AND frozen per-position step
@@ -173,7 +176,9 @@ class VFE3Config:
     e_phi_lr:                  float = 0.0
     e_sigma_q_trust:           float = 5.0
     sigma_max:                 float = 5.0
+   
     gradient_mode:             str   = "filtering"
+    
     phi_precond_mode:          str   = "none"
     phi_retract_mode:          str   = "euclidean"  # Lie-algebra step chart: euclidean (sum) or bch
     spd_retract_mode:          str   = "spd_affine" # SPD covariance retraction geometry (registry key)
@@ -182,6 +187,7 @@ class VFE3Config:
     use_prior_bank:            bool  = True
     decode_tau:                float = 1.0
     decode_mode:               str   = "diagonal"
+    
     # decode_chunk_size: vocabulary-chunk width V is iterated over by the fused
     # decode_mode='diagonal_chunked' CE path (the training-path memory win that never
     # materializes the (B,N,V) logit tensor). Ignored by every other decode_mode. Default
@@ -221,6 +227,7 @@ class VFE3Config:
     m_phi_lr:                  float = 0.015
     weight_decay:              float = 0.05
     batch_size:                int   = 64
+    
     # Accumulate gradients over N microbatches before an optimizer step, for a larger
     # effective batch without the memory of one big forward. Each pulled batch is split
     # into N equal chunks along the batch axis, each backed (loss / N) into .grad, then a
@@ -229,11 +236,13 @@ class VFE3Config:
     grad_accum_steps:          int   = 1
     max_steps:                 int   = 15000
     warmup_steps:              int   = 100
+    
     seed:                      int   = 0
     log_interval:              int   = 50           # console log every N steps (0 = off)
     eval_interval:             int   = 0            # periodic validation every N steps (0 = off)
     checkpoint_interval:       int   = 0            # save a resumable checkpoint every N steps (0 = off)
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
+    
     # Opt-in mixed precision for CUDA throughput (RTX 5090). None (default) = OFF = the pure fp32
     # path: NO autocast context is entered anywhere in the forward, so the loss/logits are
     # byte-identical to the no-AMP build. 'bf16' / 'fp16' wrap the E-step / belief pipeline in
