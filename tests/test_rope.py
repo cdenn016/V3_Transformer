@@ -93,3 +93,15 @@ def test_rope_changes_logits_vs_no_rope():
     roped = VFEModel(_rope_cfg(pos_rotation="rope"))
     roped.load_state_dict(base.state_dict())
     assert not torch.allclose(base(x), roped(x), atol=1e-5)   # RoPE perturbs attention -> logits
+
+
+def test_attention_maps_reflect_rope():
+    torch.manual_seed(0)
+    x = torch.randint(0, 6, (1, 8))
+    base = VFEModel(_rope_cfg(pos_rotation="none"))
+    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    roped.load_state_dict(base.state_dict())
+    a = base.attention_maps(x)
+    b = roped.attention_maps(x)
+    assert a.shape == b.shape
+    assert not torch.allclose(a, b, atol=1e-5)             # RoPE changes the per-head attention

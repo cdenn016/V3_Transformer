@@ -437,6 +437,10 @@ One new test appended to `tests/test_rope.py`: `test_build_belief_transport_wrap
 
 Final runs: **6 passed** (`tests/test_rope.py`), **36 passed** (`tests/test_e_step.py tests/test_transport.py`), 0 failures, 0 errors — both read from the `N passed` lines.
 
+## Task 2.5 — RoPE in diagnostics + attention_maps (2026-06-02, branch vfe3-positional-encodings-2026-06-02)
+
+Added `from vfe3.geometry.transport import RopeTransport` as a module-level import in `vfe3/model/model.py`. In both `diagnostics` and `attention_maps`, computed `rope = self._rope_rotation(n, token_ids.device)` before the `_transport(...)` call site and wrapped the result in `RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge)` when `rope is not None`. Because `RopeTransport` is a dataclass (not a tensor), the existing `.unsqueeze(0)[0]` pattern is bypassed for the RoPE path: `transport_mean`/`transport_covariance` are called directly on the `RopeTransport` and the raw tensors (without batch-axis wrapping), which the functions already handle via their leading-ellipsis dispatch. The non-RoPE path is unchanged. One test added to `tests/test_rope.py`: `test_attention_maps_reflect_rope` — same weights, `pos_rotation="rope"` vs `"none"`, `attention_maps` output differs. Full suite: 483 tests, 0 failures, 0 errors.
+
 ## Task 2.4 — RoPE config fields + thread R(theta) through stack/block/forward (2026-06-02, branch vfe3-positional-encodings-2026-06-02)
 
 Wired the gauge-RoPE rotation from config all the way through the model's `forward` call.

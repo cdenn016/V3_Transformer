@@ -20,6 +20,7 @@ from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.norms import get_norm
 from vfe3.geometry.rope import get_pos_rotation
+from vfe3.geometry.transport import RopeTransport
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import vfe_block
 from vfe3.model.positional_phi import apply_positional_phi
@@ -588,14 +589,20 @@ class VFEModel(nn.Module):
         # Match the forward's transport regime so holonomy_deviation reads the ACTUAL connection
         # (flat -> ~0; regime_ii with a trained connection_W -> the non-trivial holonomy). regime_ii
         # reads the converged means out.mu and the learned connection_W; flat ignores both.
+        rope = self._rope_rotation(n, token_ids.device)
         omega = _transport(                                          # (N, N, K, K)
             out.phi, self.group, transport_mode=cfg.transport_mode,
             mu=(out.mu if cfg.transport_mode == "regime_ii" else None),
             connection_W=getattr(self, "connection_W", None),
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
-        mu_t = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
-        sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
+        if rope is not None:
+            rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge)
+            mu_t    = transport_mean(rope_omega, out.mu)             # (N, N, K)
+            sigma_t = transport_covariance(rope_omega, out.sigma)    # (N, N, K)
+        else:
+            mu_t    = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
+            sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
         fam = get_family(cfg.family)
         energy = pairwise_energy(                                    # (N, N) or (H, N, N)
             fam(out.mu, out.sigma), fam(mu_t, sigma_t),
@@ -664,6 +671,7 @@ class VFEModel(nn.Module):
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
         mu_p, sigma_p = belief.mu, belief.sigma
 
+        rope = self._rope_rotation(n, token_ids.device)
         maps = []
         for _ in range(cfg.n_layers):
             belief = vfe_block(                                       # converged belief at this block
@@ -681,8 +689,13 @@ class VFEModel(nn.Module):
                 connection_W=getattr(self, "connection_W", None),
                 cocycle_relaxation=cfg.cocycle_relaxation,
             )                                                        # (N, N, K, K)
-            mu_t = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
-            sigma_t = transport_covariance(omega.unsqueeze(0), belief.sigma.unsqueeze(0))[0]
+            if rope is not None:
+                rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge)
+                mu_t    = transport_mean(rope_omega, belief.mu)          # (N, N, K)
+                sigma_t = transport_covariance(rope_omega, belief.sigma) # (N, N, K)
+            else:
+                mu_t    = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
+                sigma_t = transport_covariance(omega.unsqueeze(0), belief.sigma.unsqueeze(0))[0]
             energy = pairwise_energy(                                 # (N, N) or (H, N, N)
                 fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
                 alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
