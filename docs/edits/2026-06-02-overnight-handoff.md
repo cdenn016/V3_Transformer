@@ -426,3 +426,13 @@ Created `vfe3/geometry/rope.py` with `build_rope_rotation` (registered as `"rope
 ## Task 1.4 — group `pos_phi_free` in `build_optimizer` (2026-06-02, branch vfe3-positional-encodings-2026-06-02)
 
 `build_optimizer`'s exact-coverage guard would raise for any model instantiated with `pos_phi="learned"` because `pos_phi_free` is a trainable `nn.Parameter` not yet assigned to any optimizer group. Added a conditional group block in `vfe3/train.py` (after the head-mixer block, mirroring its idiom): `if getattr(model, "pos_phi_free", None) is not None: groups.append({"params": [model.pos_phi_free], "lr": cfg.m_phi_lr})`. Learning rate `m_phi_lr` is the gauge-frame scale, matching how `phi_embed` is grouped. One test appended to `tests/test_train.py`: `test_build_optimizer_groups_pos_phi_free` (TDD: confirmed failing with "build_optimizer left 1 model parameter(s) ungrouped" before the fix, passing after). Final runs: **1 passed** (single test), **13 passed, 1 xpassed** (full `test_train.py`), both read from the `N passed` lines.
+
+## Task 2.3 — thread `rope`/`rope_on_cov` to `build_belief_transport`; wrap in `RopeTransport` (2026-06-02, branch vfe3-positional-encodings-2026-06-02)
+
+Threaded the gauge-RoPE rotation through the E-step so that when `rope` is provided the built transport is wrapped in a `RopeTransport` before being consumed by the gradient kernel/oracle.
+
+Changes to `vfe3/inference/e_step.py`: (1) added `RopeTransport` to the transport import block; (2) `build_belief_transport` gained two new keyword params (`rope: Optional[torch.Tensor] = None`, `rope_on_cov: bool = False`) and its body was restructured to capture the built transport in `built` (preserving the exact existing fused / dense routing) then wrap it in `RopeTransport(base=built, rope=rope, on_cov=rope_on_cov)` when `rope is not None`; (3) `e_step_iteration` gained the same two params and forwards them in the `build_belief_transport` call; (4) `e_step` gained the same two params as EXPLICIT keywords (not `**kwargs`) so they do not ride the forwarded knob bag into the `free_energy_value` diagnostic (which rejects unknown kwargs).
+
+One new test appended to `tests/test_rope.py`: `test_build_belief_transport_wraps_in_ropetransport_when_rope_set` — confirms the return type is `RopeTransport` when `rope` is given and is NOT `RopeTransport` (plain fused/dense path) when `rope=None`.
+
+Final runs: **6 passed** (`tests/test_rope.py`), **36 passed** (`tests/test_e_step.py tests/test_transport.py`), 0 failures, 0 errors — both read from the `N passed` lines.

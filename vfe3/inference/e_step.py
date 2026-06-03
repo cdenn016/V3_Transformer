@@ -23,6 +23,7 @@ from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
 from vfe3.geometry.retraction import get_retraction, natural_gradient, retract_phi
 from vfe3.geometry.transport import (
     FactoredTransport,
+    RopeTransport,
     build_factored_transport,
     compute_transport_operators,
     get_transport,
@@ -89,7 +90,9 @@ def build_belief_transport(
     mu:                 Optional[torch.Tensor] = None,      # regime_ii edge connection reads these
     connection_W:       Optional[torch.Tensor] = None,      # regime_ii learned bilinear connection
     cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
-) -> 'torch.Tensor | FactoredTransport':
+    rope:               Optional[torch.Tensor] = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
+    rope_on_cov:        bool                   = False,     # rotate the covariance too (full-gauge)
+) -> 'torch.Tensor | FactoredTransport | RopeTransport':
     r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
 
     On the flat + block-diagonal-with-equal-blocks path (``_can_fuse_flat``) returns a
@@ -101,14 +104,22 @@ def build_belief_transport(
     OPAQUELY through ``belief_gradients`` (kernel + oracle), which only ever forward it to
     ``transport_mean`` / ``transport_covariance``; the oracle's full-cov / smoothing routes rebuild
     the dense Omega from the factors on demand (byte-identical).
+
+    When ``rope`` is given the built transport is wrapped in a :class:`RopeTransport` before being
+    returned; ``transport_mean`` / ``transport_covariance`` consume it opaquely, so no downstream
+    changes are needed.
     """
     if _can_fuse_flat(transport_mode, group):
-        return build_factored_transport(phi, group)
-    transport_kw = (
-        dict(mu=mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation)
-        if transport_mode == "regime_ii" else {}
-    )
-    return _transport(phi, group, transport_mode=transport_mode, **transport_kw)
+        built = build_factored_transport(phi, group)
+    else:
+        transport_kw = (
+            dict(mu=mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation)
+            if transport_mode == "regime_ii" else {}
+        )
+        built = _transport(phi, group, transport_mode=transport_mode, **transport_kw)
+    if rope is None:
+        return built
+    return RopeTransport(base=built, rope=rope, on_cov=rope_on_cov)
 
 
 def _transport_qk(
@@ -270,6 +281,8 @@ def e_step_iteration(
     log_prior:                 Optional[torch.Tensor] = None,
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
     connection_W:              Optional[torch.Tensor] = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
+    rope:                      Optional[torch.Tensor] = None,   # (N, K, K) gauge-RoPE rotation
+    rope_on_cov:               bool                   = False,  # full-gauge: rotate covariance too
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
     (autograd of the alignment block + preconditioner + Lie retraction).
@@ -291,6 +304,7 @@ def e_step_iteration(
     omega = build_belief_transport(
         belief.phi, group, transport_mode=transport_mode,
         mu=belief.mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
+        rope=rope, rope_on_cov=rope_on_cov,
     )
     grad_mu, grad_sigma = belief_gradients(
         belief.mu, belief.sigma, mu_p, sigma_p, omega,
@@ -359,6 +373,8 @@ def e_step(
     e_phi_lr:          float = 0.1,
     return_trajectory: bool  = False,
     e_step_gradient:   str   = "unroll",
+    rope:              Optional[torch.Tensor] = None,
+    rope_on_cov:       bool                   = False,
 
     log_prior:         Optional[torch.Tensor] = None,
     **kwargs,
@@ -387,7 +403,8 @@ def e_step(
         belief = e_step_iteration(
             belief, mu_p, sigma_p, group, tau=tau,
             e_mu_lr=e_mu_lr, e_sigma_lr=e_sigma_lr, e_phi_lr=e_phi_lr,
-            e_step_gradient=e_step_gradient, log_prior=log_prior, **kwargs,
+            e_step_gradient=e_step_gradient, log_prior=log_prior,
+            rope=rope, rope_on_cov=rope_on_cov, **kwargs,
         )
         if return_trajectory:
             traj.append(_f_diag(belief))

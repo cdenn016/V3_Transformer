@@ -56,3 +56,19 @@ def test_rope_mean_only_leaves_covariance_unrotated():
     plain = transport_covariance(omega_I, sigma)            # un-rotated diagonal sandwich
     roped = transport_covariance(rt, sigma)                 # mu-only -> ignores rope
     assert torch.allclose(plain, roped, atol=1e-6)
+
+
+from vfe3.geometry.groups import get_group
+from vfe3.inference.e_step import build_belief_transport
+
+
+def test_build_belief_transport_wraps_in_ropetransport_when_rope_set():
+    g = get_group("block_glk")(8, 2)
+    phi = torch.randn(1, 6, g.generators.shape[0])
+    R = build_rope_rotation(torch.arange(6), g.irrep_dims, base=100.0,
+                            device=phi.device, dtype=phi.dtype)
+    out = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False)
+    assert isinstance(out, RopeTransport)
+    # rope=None reproduces the plain build (no wrapper).
+    plain = build_belief_transport(phi, g, transport_mode="flat")
+    assert not isinstance(plain, RopeTransport)
