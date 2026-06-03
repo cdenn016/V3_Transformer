@@ -8,7 +8,7 @@ A config-selected registry of forms:
 Pure: a function of the (per-position or per-coordinate) self-divergence D.
 """
 
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -89,7 +89,7 @@ def alpha_learnable(
     kl:        torch.Tensor,             # (..., N) or (..., N, K) self-divergence (unused: alpha is free)
 
     *,
-    log_alpha: torch.Tensor = None,      # scalar nn.Parameter from the model; alpha = exp(log_alpha)
+    log_alpha: Optional[torch.Tensor] = None,   # scalar nn.Parameter from the model; alpha = exp(log_alpha)
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED scalar self-coupling
@@ -143,7 +143,7 @@ def alpha_gradient_coefficient(
     b0:        'float | torch.Tensor' = 1.0,
     c0:        'float | torch.Tensor' = 1.0,
     mode:      str = "constant",
-    log_alpha: torch.Tensor = None,      # learned scalar (alpha=exp(log_alpha)); only the 'learnable' form reads it
+    log_alpha: Optional[torch.Tensor] = None,   # learned scalar (alpha=exp(log_alpha)); only 'learnable' reads it
 ) -> torch.Tensor:
     r"""Effective coefficient a_i multiplying d D(q_i||p_i) in the belief gradient.
 

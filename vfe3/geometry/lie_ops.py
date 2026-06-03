@@ -270,19 +270,23 @@ def project_phi_to_slk(
     phi:        torch.Tensor,             # (..., n_gen)
     generators: torch.Tensor,             # (n_gen, K, K)
     irrep_dims: List[int],                # block sizes; sum == K
-
-    *,
-    eps:        float = 1e-12,
 ) -> torch.Tensor:                        # (..., n_gen) per-block trace-free
     r"""Hard projection to sl(K) per block: remove the trace component so
 
         det(Omega_h) = exp(tr(embed(phi)|block h)) = 1.
-    phi <- phi - sum_h (phi . V_h / ||V_h||^2) V_h.
+
+    Orthogonal projection of phi off the span of the per-block trace functionals V_h:
+    ``phi <- phi - (phi V^T) (V V^T)^+ V``. The JOINT Gram solve ``(V V^T)^+`` is required:
+    for the tied gauge (``tied_block_glk``) the V_h coincide (generators kron(I_n, E_ij)), so the
+    per-block-independent form ``s / ||V_h||^2`` would over-subtract by a factor of n_heads. For an
+    untied gauge the V_h have disjoint support, ``V V^T`` is diagonal, and the pseudo-inverse reduces
+    to ``1/||V_h||^2`` (so the untied result is unchanged); a fully traceless basis (so_k) gives
+    ``V = 0`` and the projection is a no-op.
     """
     V = _block_trace_vectors(generators, irrep_dims)      # (H, n_gen)
-    v_norm_sq = (V * V).sum(-1).clamp(min=eps)            # (H,)
+    gram_pinv = torch.linalg.pinv(V @ V.transpose(-1, -2))   # (H, H); diag -> 1/||V_h||^2
     s = phi @ V.transpose(-1, -2)                         # (..., H)
-    coeffs = s / v_norm_sq                                # (..., H)
+    coeffs = s @ gram_pinv                                # (..., H) joint solve, not per-block
     return phi - torch.einsum("...h,hg->...g", coeffs, V)
 
 
@@ -293,15 +297,17 @@ def clamp_phi_trace(
 
     *,
     trace_max:  float = 5.0,              # soft cap T on |tr(embed(phi)|block h)|
-    eps:        float = 1e-12,
 ) -> torch.Tensor:                        # (..., n_gen) with |s_h| <= T
     r"""Soft per-block trace clamp: rescale only the trace component so |s_h| <= T,
 
-    bounding log|det(Omega_h)|. Off-trace (sl(K)) directions are untouched.
+    bounding log|det(Omega_h)|. Off-trace (sl(K)) directions are untouched. Realizes the clamped
+    trace via the JOINT Gram solve ``delta = (s_clamped - s) (V V^T)^+`` so the tied gauge (coinciding
+    V_h) is corrected once, not n_heads times; reduces to ``(s_clamped - s)/||V_h||^2`` for an
+    orthogonal (untied) basis.
     """
     V = _block_trace_vectors(generators, irrep_dims)      # (H, n_gen)
-    v_norm_sq = (V * V).sum(-1).clamp(min=eps)            # (H,)
+    gram_pinv = torch.linalg.pinv(V @ V.transpose(-1, -2))   # (H, H); diag -> 1/||V_h||^2
     s = phi @ V.transpose(-1, -2)                         # (..., H)
     s_clamped = s.clamp(min=-trace_max, max=trace_max)
-    delta = (s_clamped - s) / v_norm_sq                   # (..., H)
+    delta = (s_clamped - s) @ gram_pinv                   # (..., H) joint solve, not per-block
     return phi + torch.einsum("...h,hg->...g", delta, V)

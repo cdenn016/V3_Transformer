@@ -153,6 +153,35 @@ def test_per_coord_alpha_requires_diagonal_family():
     VFE3Config(alpha_mode="state_dependent_per_coord")          # family defaults to diagonal -> ok
 
 
+def test_decode_mode_full_rejects_diagonal_family():
+    # 'full' KL-decode consumes a (B,N,K,K) sigma; with a diagonal family (sigma (B,N,K)) it is a
+    # shape crash at the first prior-bank forward -- reject at construction (the shipped-arm direction).
+    with pytest.raises(ValueError):
+        VFE3Config(family="gaussian_diagonal", diagonal_covariance=True, decode_mode="full")
+
+
+def test_decode_mode_diagonal_rejects_full_family():
+    # The reverse rank mismatch: a full family (sigma (B,N,K,K)) fed to a diagonal decode kernel.
+    with pytest.raises(ValueError):
+        VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="diagonal")
+
+
+def test_decode_mode_family_cross_check_skipped_under_linear_decode():
+    # use_prior_bank=False decodes via the linear projection and ignores decode_mode, so the rank
+    # cross-check does not apply: a 'full' decode_mode with a diagonal family is accepted.
+    cfg = VFE3Config(family="gaussian_diagonal", diagonal_covariance=True,
+                     decode_mode="full", use_prior_bank=False)
+    assert cfg.use_prior_bank is False
+
+
+def test_rope_with_sp_gauge_warns_structure_group():
+    # RoPE rotates adjacent coordinate pairs (2k,2k+1); Sp(2m) pairs i with m+i, so the rope-wrapped
+    # transport leaves the symplectic group. The GL(K)-congruence divergence invariance survives, so
+    # this is a WARNING (not an error): the operator is still a valid GL(K) element, just not in Sp.
+    with pytest.warns(UserWarning, match="symplectic"):
+        VFE3Config(gauge_group="sp", pos_rotation="rope")
+
+
 def test_tied_block_glk_rejects_killing_per_block():
     """killing_per_block builds a per-HEAD Killing metric and needs generators that partition per
     block (block_glk's independent gl(d) per head). tied_block_glk's shared kron(I_n, gl(d))
@@ -201,7 +230,7 @@ def test_config_eval_max_batches_default_none_and_validated():
 def test_config_diagonal_covariance_cross_check_uses_cov_kind():
     """The diagonal_covariance consistency check is driven by the family's declared cov_kind,
     not the literal family == 'gaussian_diagonal'."""
-    VFE3Config(family="gaussian_full", diagonal_covariance=False)        # full + non-diagonal: ok
+    VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="full")   # full: ok
     with pytest.raises(ValueError):
         VFE3Config(family="gaussian_full", diagonal_covariance=True)     # full + diagonal: mismatch
 
@@ -251,9 +280,9 @@ def test_config_amp_dtype_default_none_and_validated():
         VFE3Config(amp_dtype="bfloat16")
 
 
-def test_pos_phi_defaults_off_and_validates():
+def test_pos_phi_default_is_learned_and_validates():
     cfg = VFE3Config()
-    assert cfg.pos_phi == "none"
+    assert cfg.pos_phi == "learned"        # default-ON; the pure no-composition path is "none"
     assert cfg.pos_phi_compose == "bch"
     assert cfg.bch_pe_order == 4
 
@@ -295,4 +324,5 @@ def test_rope_defaults_off_and_full_gauge_requires_full_cov():
     with pytest.raises(ValueError):
         VFE3Config(pos_rotation="rope", rope_full_gauge=True, diagonal_covariance=True)
     # full-gauge with full covariance is allowed
-    VFE3Config(pos_rotation="rope", rope_full_gauge=True, diagonal_covariance=False, family="gaussian_full")
+    VFE3Config(pos_rotation="rope", rope_full_gauge=True, diagonal_covariance=False,
+               family="gaussian_full", decode_mode="full")

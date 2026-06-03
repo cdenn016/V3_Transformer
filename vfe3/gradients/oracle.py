@@ -38,7 +38,7 @@ def belief_gradients_autograd(
     sigma:        torch.Tensor,           # (N, K) belief variances
     mu_p:         torch.Tensor,           # (N, K) prior means
     sigma_p:      torch.Tensor,           # (N, K) prior variances
-    omega:        torch.Tensor,           # (N, N, K, K) transport operators Omega_ij
+    omega:        'torch.Tensor | FactoredTransport | RopeTransport',   # (N,N,K,K) dense OR factored exps
 
     *,
     tau:          float = 1.0,

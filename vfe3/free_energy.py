@@ -16,20 +16,6 @@ from vfe3.divergence import get_functional
 from vfe3.families.base import BeliefParams
 
 
-def effective_temperature(
-    kappa: 'float | torch.Tensor',        # learnable sharpness scalar
-    K:     int,                            # dimension the recovery is derived over (per-head d_k)
-) -> 'float | torch.Tensor':
-    r"""Softmax temperature tau = kappa * sqrt(K) (standard transformer is kappa=1).
-
-    Generic primitive: pass the dimension over which standard scaled dot-product
-    attention is recovered. The model passes the PER-HEAD dimension d_k = d_head
-    (see VFE3Config.tau and audit finding 6c), so kappa=1 reproduces the Vaswani
-    sqrt(d_k) temperature per head, not sqrt(K) over the full belief.
-    """
-    return kappa * (K ** 0.5)
-
-
 def _stackable_for_batching(
     q_b: BeliefParams,                     # broadcast query (..., N, 1, K)
     key: BeliefParams,                     # transported key  (..., N, N, K)

@@ -3,6 +3,38 @@
 Per the CLAUDE.md audit/verification policy: each entry states WHAT was checked, whether it was
 INCORRECT, and whether it was RIGOROUSLY verified. Consult this before re-verifying the same thing.
 
+## 2026-06-03 — Deep-audit corrections (see docs/audits/audit-2026-06-03.md)
+
+- **Per-block sl(K)/trace det-control under `tied_block_glk`.** CHECKED, was **INCORRECT**, now FIXED
+  + test-pinned. `project_phi_to_slk` / `clamp_phi_trace` (`lie_ops.py`) used the per-block-independent
+  orthogonal projection `coeffs = s/||V_h||^2`, valid only when the per-block trace functionals V_h are
+  mutually orthogonal. Under the tied gauge the generators kron(I_n, E_ij) make all n_heads V_h rows
+  identical, so the projection over-subtracted by a factor of n_heads (sign flip + n_heads x; det Omega
+  -> 0.68 not 1.0). Replaced with the JOINT Gram solve `coeffs = s @ pinv(V V^T)`, which (i) drives each
+  block's trace to 0 / clamps it correctly under tied, and (ii) reduces to `1/||V_h||^2` for an
+  orthogonal (untied) basis (diagonal Gram) -- within golden tolerance, since `pinv` is SVD-based and
+  not bit-exact (the untied tests pass at atol 1e-5), so untied `block_glk` is unchanged to tolerance.
+  Pinned by
+  `tests/test_phi_retraction.py::test_project_slk_zeros_block_trace_under_tied_gauge` and
+  `..._clamp_phi_trace_bounds_block_trace_under_tied_gauge`; the pre-existing untied tests still pass.
+
+- **`sigma_max` ceiling convention across the cov_kind retraction seam.** CHECKED, was **INCONSISTENT**,
+  now FIXED + test-pinned. `retract_spd_diagonal` clamped the **variance** to `sigma_max`, but
+  `retract_spd_full` (and `retract_logeuclidean_full`) clamped the **eigenvalues** to `sigma_max^2` --
+  eigenvalues ARE variances, so the same physical quantity was bounded a factor `sigma_max` looser on
+  the full family under one shared knob. Changed the full-cov eigenvalue ceiling to `sigma_max`. Pinned
+  by `tests/test_retraction.py::test_sigma_max_caps_variance_consistently_across_diag_and_full`. (Note:
+  the centering axiom R(Sigma,0)=Sigma now holds only within the variance box on BOTH arms, as the
+  diagonal arm already did -- the full identity test was re-baselined to a non-binding sigma_max.)
+
+- **phi E-step descends the active connection regime.** CHECKED, was **INCORRECT**, now FIXED +
+  test-pinned. `phi_alignment_loss` built its Omega with `_transport(phi, group)` at defaults (flat),
+  so under `transport_mode='regime_ii'` + `e_phi_lr>0` the phi update descended the flat objective while
+  mu/sigma descended the regime_ii one. Threaded `transport_mode`/`connection_W`(detached)/`cocycle_relaxation`
+  through `phi_alignment_loss`. Pinned by `tests/test_regime_ii.py::test_phi_estep_descends_regime_ii_not_flat`.
+  (This was a real correctness gap confined to the opt-in regime_ii NN-exception toggle; the pure flat
+  path was and is correct.)
+
 ## 2026-06-02 — Gamma model-coupling block (hyper-prior increment 2)
 
 Code: `vfe3/model/model.py` (gamma block in `forward`), `vfe3/model/prior_bank.py` (s-table gate),
