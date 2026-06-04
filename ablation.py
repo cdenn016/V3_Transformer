@@ -71,36 +71,42 @@ logger = logging.getLogger("ablation")
 # vfe3/config.py; registry fields list valid keys inline. The SWEEPS below pre-satisfy any
 # cross-field constraint per sweep via `requires` / `configs`.
 BASELINE_CONFIG: Dict[str, Any] = dict(
-    # numerics
-    eps                        = 1e-6,
-    kl_max                     = 100.0,
-
-    # divergence seam (f-divergence FUNCTIONAL, distinct from `family`)
-    divergence_family          = "renyi",                    # "renyi"
-    alpha_div                  = 1.0,                         # Renyi order (1.0 -> KL)
+    
 
     # model structure
     vocab_size                 = 50257,                       # gpt2/tiktoken vocab (dataset-fixed)
+   
     embed_dim                  = 20,                          # K (must be divisible by n_heads)
+    n_heads                    = 2,
+    
     max_seq_len                = 128,                         # N, context length
+    
+    batch_size                 = 64,
+    max_steps                  = 4000,
+    
     n_layers                   = 1,                           # L, number of blocks
     n_e_steps                  = 1,                           # T, E-step inner iterations
-    n_heads                    = 2,
+    
 
     # gauge seam
     gauge_group                = "block_glk",                 # "glk"|"block_glk"|"tied_block_glk"|"so_k"|"sp"
     gauge_parameterization     = "phi",                       # "phi" (omega_direct: live-rejected)
+   
     transport_mode             = "flat",                      # "flat" (pure no-NN) | "regime_ii" (learned, NN exception)
     cocycle_relaxation         = 1.0,                         # regime_ii homotopy (ignored by flat)
+    
     cross_couplings            = None,                        # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only
+    
     use_head_mixer             = True,                        # Schur-commutant head mixer (needs >=2 equal blocks)
 
     # positional encoding
     pos_phi                    = "learned",                   # "none" (pure path) | "learned" | "frozen"
     pos_phi_compose            = "bch",                       # "bch" | "euclidean"
-    bch_pe_order               = 4,
+    
     pos_phi_scale              = 0.02,
+    
     pos_phi_project_slk        = False,
+    
     pos_rotation               = "none",                      # "none" | "rope"
     rope_base                  = 100.0,
     rope_full_gauge            = False,                       # rotate covariance (REQUIRES diagonal_covariance=False)
@@ -114,16 +120,12 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     alpha_mode                 = "state_dependent_per_coord", # "constant"|"state_dependent"|"state_dependent_per_coord"|"learnable"
     b0                         = 1.0,
     c0                         = 1.0,
+    
     kappa                      = 1.0,                         # tau = kappa * sqrt(d_head)
+    
     mass_phi                   = 0.0,
-    mstep_self_coupling_weight = 0.0,
-    lambda_h                   = 0.0,                         # hyper-prior weight (>0 creates s/r tables)
-    gamma_coupling             = 0.0,                         # model-channel coupling (>0 creates s tables)
-    kappa_gamma                = 1.0,
-    gamma_attention_prior      = "causal",                    # "uniform" | "causal" | "alibi"
-    prior_source               = "token",                     # "token" | "model_channel"
-
-    # attention
+    
+        # attention
     include_attention_entropy  = True,                        # canonical F vs entropy-suppressed surrogate
     attention_prior            = "causal",                    # "uniform" | "causal" | "alibi"
 
@@ -131,12 +133,15 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     e_mu_lr                    = 0.7,
     e_sigma_lr                 = 0.025,
     e_phi_lr                   = 0.0,
+   
     e_sigma_q_trust            = 5.0,
-    sigma_max                  = 5.0,
+    sigma_max                  = 15.0,
+    
     gradient_mode              = "filtering",                 # "filtering" | "smoothing"
+    
     phi_precond_mode           = "killing",                   # "none"|"clip"|"killing"|"killing_per_block"|"pullback"
     phi_retract_mode           = "bch",                       # "euclidean" | "bch"
-    spd_retract_mode           = "spd_affine",                # "spd_affine" | "log_euclidean"
+    
 
     # decode / encode
     use_prior_bank             = False,                       # True: KL-to-prior (pure) | False: linear projection
@@ -156,20 +161,32 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     # M-step / training
     e_step_gradient            = "unroll",                    # "unroll" | "straight_through" | "detach"
     detach_e_step              = False,
+    
     grad_accum_steps           = 1,
+    
     m_mu_lr                    = 0.01,
     m_sigma_lr                 = 0.0021,
     m_phi_lr                   = 0.009,
+    
     weight_decay               = 0.05,
-    batch_size                 = 64,
-    max_steps                  = 15000,
+   
+   
     warmup_steps               = 100,
     seed                       = 6,                           # overridden per run by CONFIG["seed"]
-    log_interval               = 100,
-    eval_interval              = 1000,
+    
+    log_interval               = 1000,
+    eval_interval              = 4000,
     checkpoint_interval        = 15000,                       # forced to 0 per cell (no checkpoint blowup)
-    eval_max_batches           = None,
-    amp_dtype                  = None,                        # None (pure fp32) | "bf16" | "fp16"
+    
+    
+    # numerics
+    eps                        = 1e-6,
+    kl_max                     = 100.0,
+
+    # divergence seam (f-divergence FUNCTIONAL, distinct from `family`)
+    divergence_family          = "renyi",                    # "renyi"
+    alpha_div                  = 1.0,                         # Renyi order (1.0 -> KL)
+    
 )
 
 
@@ -495,41 +512,31 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "detach the whole E-step (no E-step gradient)",
         "param": "detach_e_step", "values": [False, True],
     },
+    
+    
+    
+    
     "m_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "values": [0.005, 0.01, 0.025],
+        "param": "m_mu_lr", "values": [0.005, 0.0075, 0.01, 0.02, 0.03],
     },
     "m_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_sigma_lr", "values": [0.001, 0.0021, 0.005],
+        "param": "m_sigma_lr", "values": [0.001, 0.002, 0.005, 0.0075, 0.01],
     },
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.0, 0.003, 0.006, 0.009, 0.015],
+        "param": "m_phi_lr", "values": [0.0125, 0.015, 0.03, 0.05, 0.1],
     },
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "values": [0.0, 0.05, 0.1],
+        "param": "weight_decay", "values": [0.0, 0.00025, 0.0025, 0.01, 0.05, 0.1],
     },
-    "batch_size": {  # loader-affecting: the runner rebuilds the loader per cell
-        "description": "training batch size",
-        "param": "batch_size", "values": [32, 64, 128],
-    },
-    "grad_accum_steps": {
-        "description": "gradient-accumulation microbatches per optimizer step",
-        "param": "grad_accum_steps", "values": [1, 2, 4],
-    },
-    "warmup_steps": {
-        "description": "LR warmup steps",
-        "param": "warmup_steps", "values": [50, 100, 500],
-    },
-    "amp_dtype": {  # fp16 training would need a GradScaler (deferred); bf16 is the safe arm
-        "description": "mixed precision (pure fp32 vs bf16 autocast)",
-        "configs": [
-            {"label": "fp32", "amp_dtype": None},
-            {"label": "bf16", "amp_dtype": "bf16"},
-        ],
-    },
+    
+    
+    
+    
+    
 }
 
 
@@ -553,10 +560,27 @@ NON_SWEPT_FIELDS = (
 # Which sweeps run (and in what order) when CONFIG["sweep"] is None. This is a CURATED subset of
 # the full SWEEPS registry above (every key in SWEEPS is also runnable on its own via
 # CONFIG["sweep"]="<name>"); add or remove names to shape a session. Cheap-to-expensive is a good
-# ordering for a single GPU. `mode="list"` (with sweep=None) prints every registered sweep.
+# ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
+    
+    
+    "m_phi_lr",
+    "m_mu_lr",
+    "e_mu_lr",
+    
+    "weight_decay",
+    "alpha_div",
+    "mstep_self_coupling_weight",
+    
+    "e_sigma_lr",
+    
+    
+    
+    
     "kappa",
+    
     "alpha_mode",
+    
     "attention_prior",
     "entropy_term",
     "decode_head",
@@ -570,8 +594,12 @@ SWEEP_ORDER: List[str] = [
 # CLICK-TO-RUN KNOBS  -- edit, then run.
 # =============================================================================
 CONFIG: Dict[str, Any] = {
-    # Action: 'train' (run sweeps), 'analyze' (print tables), 'plot' (figures), 'list'.
-    "mode":        "train",
+    # The default run is ONE contiguous flow: train each sweep, then (per sweep) write its CSV,
+    # print its analysis table, and save its PPL figure, then the next sweep; after all sweeps,
+    # the cross-sweep comparison plot + best-per-sweep summary. A later re-run with a different
+    # value list TACKS its new cells onto the existing per-sweep figure (union of cell markers).
+    # Set list_only=True to instead just print the sweep registry and exit (no training).
+    "list_only":   False,
 
     # One sweep name, or None -> every sweep in SWEEP_ORDER.
     "sweep":       None,
@@ -919,6 +947,25 @@ def _write_sweep_csv(sweep_dir: Path, results: List[Dict[str, Any]]) -> None:
             writer.writerow({k: r.get(k, "") for k in _CSV_COLUMNS})
 
 
+def _collect_sweep_results(sweep_dir: Path) -> List[Dict[str, Any]]:
+    r"""The union of every persisted cell under ``sweep_dir`` (each ``*/ablation_result.json``).
+
+    This is what makes a re-run "tack on": every cell label maps to its own subdirectory, so a
+    sweep re-run with a DIFFERENT value list (e.g. ``kappa=0.5,2.2,3.7`` after ``1,2,3,4``) writes
+    new cell dirs alongside the old ones, and this union picks up all of them. Re-running the SAME
+    label overwrites that one marker while the others persist, so the union is additive and never
+    subtracts (to drop a point, delete its cell directory). ``sorted`` keeps CSV row order
+    deterministic; unreadable/partial markers are skipped rather than aborting the read.
+    """
+    results: List[Dict[str, Any]] = []
+    for marker in sorted(sweep_dir.glob("*/ablation_result.json")):
+        try:
+            results.append(json.loads(marker.read_text(encoding="utf-8")))
+        except Exception:                                       # unreadable/partial marker -> skip
+            continue
+    return results
+
+
 def run_sweep(
     sweep_name:  str,
     output_dir:  Path,
@@ -978,7 +1025,10 @@ def run_sweep(
             est = result["wall_time_s"] * len(runs)
             print(f"  ** ~{est / 60:.0f} min estimated for the full {len(runs)}-run sweep")
 
-        _write_sweep_csv(sweep_dir, results)               # keep the CSV whole after each cell
+        # Keep the CSV whole AND accumulated after each cell: write the union of every persisted
+        # marker (this cell, the rest of this run, and any prior run's cells) so the tacked-on
+        # frame is live even mid-sweep.
+        _write_sweep_csv(sweep_dir, _collect_sweep_results(sweep_dir))
 
     (sweep_dir / "sweep_meta.json").write_text(json.dumps({
         "sweep_name":  sweep_name,
@@ -989,14 +1039,19 @@ def run_sweep(
         "timestamp":   time.strftime("%Y-%m-%d %H:%M:%S"),
     }, indent=2), encoding="utf-8")
 
-    finished = [r for r in results if r.get("primary_val_ppl", float("inf")) < float("inf")]
+    # Final whole-frame write over the accumulated union (also covers the all-cached case, where
+    # the per-cell write above never fires). The best line and the return value are the union too.
+    union = _collect_sweep_results(sweep_dir)
+    _write_sweep_csv(sweep_dir, union)
+
+    finished = [r for r in union if _as_float(r.get("primary_val_ppl")) < float("inf")]
     if finished:
-        best = min(finished, key=lambda r: r["primary_val_ppl"])
+        best = min(finished, key=lambda r: _as_float(r.get("primary_val_ppl")))
         print(f"\nSWEEP COMPLETE: {sweep_name}  ->  best {best['label']} "
-              f"(val PPL {best['primary_val_ppl']:.3f})")
+              f"(val PPL {_as_float(best['primary_val_ppl']):.3f})")
     else:
         print(f"\nSWEEP COMPLETE: {sweep_name}  ->  no successful run")
-    return results
+    return union
 
 
 # =============================================================================
@@ -1044,17 +1099,19 @@ def analyze_sweep(sweep_dir: Path) -> None:
             print(f"  {r['label']:<34}{(r['_ppl'] - best) / best * 100:+.1f}%")
 
 
-def analyze_all(output_dir: Path) -> None:
-    print(f"\n{'=' * 70}\nABLATION SUMMARY  ({output_dir})\n{'=' * 70}")
+def summarize_sweeps(output_dir: Path) -> None:
+    r"""Cross-sweep comparison table: the best (lowest val PPL) cell of every persisted sweep.
+
+    Printed once after all sweeps in a run (the per-sweep tables come from ``analyze_sweep`` as
+    each sweep finishes). Scans EVERY sweep dir under ``output_dir`` so earlier-session sweeps
+    are included, not just this run's.
+    """
+    print(f"\n{'=' * 70}\nBEST PER SWEEP  ({output_dir})\n{'=' * 70}")
     sweep_dirs = [d for d in sorted(output_dir.iterdir())
                   if d.is_dir() and (d / "sweep_results.csv").exists()]
     if not sweep_dirs:
         print("No completed sweeps found.")
         return
-    for d in sweep_dirs:
-        analyze_sweep(d)
-
-    print(f"\n{'=' * 70}\nBEST PER SWEEP\n{'=' * 70}")
     print(f"{'sweep':<24}{'best config':<30}{'val PPL':>10}")
     print("-" * 64)
     for d in sweep_dirs:
@@ -1069,75 +1126,104 @@ def analyze_all(output_dir: Path) -> None:
 # PLOTS
 # =============================================================================
 
-def generate_plots(output_dir: Path) -> None:
-    r"""Per-sweep PPL line/bar figures plus a cross-sweep sensitivity (PPL-range) summary."""
+def _plt_or_none() -> Any:
+    r"""Import matplotlib and apply the publication style once; return the module or ``None``.
+
+    Plotting is best-effort -- a headless box or a missing matplotlib must never abort a sweep --
+    so a failure prints once and returns ``None``, and the caller silently skips the figure.
+    ``set_publication_style`` is idempotent, so repeated calls across per-sweep figures are fine.
+    """
     try:
         import matplotlib.pyplot as plt
         from vfe3.viz.figures import set_publication_style
         set_publication_style()
-    except Exception as exc:                                 # plotting is best-effort, never fatal
-        print(f"plotting unavailable ({exc}); skipping figures")
+        return plt
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"plotting unavailable ({exc}); skipping figure")
+        return None
+
+
+def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""Write ``figures/<sweep>.png`` from the sweep's ACCUMULATED CSV (so a tacked-on re-run shows
+    every point). Numeric ``param=value`` labels -> line plot, x-sorted by value; categorical arms
+    -> bar plot, sorted by PPL. No-op when the sweep has no finished cell or matplotlib is absent.
+    """
+    rows = [r for r in _read_sweep_csv(sweep_dir) if _as_float(r.get("primary_val_ppl")) < float("inf")]
+    if not rows:
+        return
+    plt = _plt_or_none()
+    if plt is None:
         return
 
+    labels = [r["label"] for r in rows]
+    ppls = [_as_float(r["primary_val_ppl"]) for r in rows]
+
+    # Numeric param=value labels -> line plot; categorical arms -> sorted bar plot.
+    numeric: Optional[List[float]] = []
+    for lab in labels:
+        try:
+            numeric.append(float(str(lab).split("=")[-1]))
+        except ValueError:
+            numeric = None
+            break
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    if numeric is not None:
+        order = sorted(range(len(numeric)), key=lambda k: numeric[k])
+        ax.plot([numeric[k] for k in order], [ppls[k] for k in order], "o-", lw=2, ms=7)
+        ax.set_xlabel(sweep_dir.name)
+    else:
+        order = sorted(range(len(ppls)), key=lambda k: ppls[k])
+        ax.barh(range(len(order)), [ppls[k] for k in order],
+                color=["#2ca02c" if j == 0 else "#1f77b4" for j in range(len(order))])
+        ax.set_yticks(range(len(order)))
+        ax.set_yticklabels([labels[k] for k in order])
+        ax.invert_yaxis()
+    ax.set_ylabel("validation PPL")
+    ax.set_title(sweep_dir.name)
+    fig.tight_layout()
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}.png"
+    fig.savefig(out)
+    plt.close(fig)
+    print(f"  figure -> {out}")
+
+
+def _plot_sensitivity(output_dir: Path, fig_dir: Path) -> None:
+    r"""Cross-sweep comparison: a PPL-range (worst - best) bar per sweep, sorted by sensitivity.
+
+    Made once after all sweeps. Scans EVERY persisted sweep under ``output_dir`` (not just this
+    run's), matching the per-sweep figures' accumulated view.
+    """
     sweep_dirs = [d for d in sorted(output_dir.iterdir())
                   if d.is_dir() and (d / "sweep_results.csv").exists()]
-    if not sweep_dirs:
-        print("No sweeps to plot.")
-        return
-    fig_dir = output_dir / "figures"
-    fig_dir.mkdir(exist_ok=True)
-
     sensitivity: List[Tuple[str, float, str]] = []           # (sweep, ppl range, best label)
     for d in sweep_dirs:
         rows = [r for r in _read_sweep_csv(d) if _as_float(r.get("primary_val_ppl")) < float("inf")]
         if not rows:
             continue
-        labels = [r["label"] for r in rows]
         ppls = [_as_float(r["primary_val_ppl"]) for r in rows]
-
-        # Numeric param=value labels -> line plot; categorical arms -> sorted bar plot.
-        numeric = []
-        for lab in labels:
-            try:
-                numeric.append(float(str(lab).split("=")[-1]))
-            except ValueError:
-                numeric = None
-                break
-
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        if numeric is not None:
-            order = sorted(range(len(numeric)), key=lambda k: numeric[k])
-            ax.plot([numeric[k] for k in order], [ppls[k] for k in order], "o-", lw=2, ms=7)
-            ax.set_xlabel(d.name)
-        else:
-            order = sorted(range(len(ppls)), key=lambda k: ppls[k])
-            ax.barh(range(len(order)), [ppls[k] for k in order],
-                    color=["#2ca02c" if j == 0 else "#1f77b4" for j in range(len(order))])
-            ax.set_yticks(range(len(order)))
-            ax.set_yticklabels([labels[k] for k in order])
-            ax.invert_yaxis()
-        ax.set_ylabel("validation PPL")
-        ax.set_title(d.name)
-        fig.tight_layout()
-        fig.savefig(fig_dir / f"{d.name}.png")
-        plt.close(fig)
-
         best = min(rows, key=lambda r: _as_float(r["primary_val_ppl"]))
         sensitivity.append((d.name, max(ppls) - min(ppls), best["label"]))
-
-    if sensitivity:
-        sensitivity.sort(key=lambda t: t[1], reverse=True)
-        fig, ax = plt.subplots(figsize=(9, max(3, 0.5 * len(sensitivity))))
-        ax.barh(range(len(sensitivity)), [s[1] for s in sensitivity], color="#d62728", alpha=0.8)
-        ax.set_yticks(range(len(sensitivity)))
-        ax.set_yticklabels([f"{s[0]}\n(best: {s[2]})" for s in sensitivity])
-        ax.invert_yaxis()
-        ax.set_xlabel("validation PPL range (worst - best)")
-        ax.set_title("hyperparameter sensitivity")
-        fig.tight_layout()
-        fig.savefig(fig_dir / "sensitivity_summary.png")
-        plt.close(fig)
-    print(f"figures -> {fig_dir}")
+    if not sensitivity:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    sensitivity.sort(key=lambda t: t[1], reverse=True)
+    fig, ax = plt.subplots(figsize=(9, max(3, 0.5 * len(sensitivity))))
+    ax.barh(range(len(sensitivity)), [s[1] for s in sensitivity], color="#d62728", alpha=0.8)
+    ax.set_yticks(range(len(sensitivity)))
+    ax.set_yticklabels([f"{s[0]}\n(best: {s[2]})" for s in sensitivity])
+    ax.invert_yaxis()
+    ax.set_xlabel("validation PPL range (worst - best)")
+    ax.set_title("hyperparameter sensitivity")
+    fig.tight_layout()
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / "sensitivity_summary.png"
+    fig.savefig(out)
+    plt.close(fig)
+    print(f"comparison figure -> {out}")
 
 
 # =============================================================================
@@ -1146,12 +1232,11 @@ def generate_plots(output_dir: Path) -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    mode = CONFIG["mode"]
     output_dir = Path(CONFIG["output_dir"])
 
-    if mode == "list":
+    if CONFIG["list_only"]:
         # Every registered sweep (CONFIG["sweep"]=None) or just the named one; an asterisk marks
-        # those in the curated SWEEP_ORDER that a None-sweep `train` run would execute.
+        # those in the curated SWEEP_ORDER that a None-sweep run would execute.
         names = sorted(SWEEPS) if CONFIG["sweep"] is None else [CONFIG["sweep"]]
         active = set(SWEEP_ORDER)
         print(f"\nRegistered sweeps ({len(names)} shown; * = in SWEEP_ORDER):\n")
@@ -1165,16 +1250,7 @@ def main() -> None:
               f"({sum(sweep_n_runs(SWEEPS[n]) for n in SWEEP_ORDER)} runs).")
         return
 
-    if mode == "analyze":
-        analyze_all(output_dir)
-        return
-    if mode == "plot":
-        generate_plots(output_dir)
-        return
-    if mode != "train":
-        raise ValueError(f"CONFIG['mode']={mode!r} not in {{'train','analyze','plot','list'}}")
-
-    # ---- train mode --------------------------------------------------------
+    # ---- contiguous run: per sweep { train -> analyze table -> PPL figure }, then comparison ----
     if CONFIG["device"] == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -1187,6 +1263,7 @@ def main() -> None:
     validate_sweeps(sweep_names)                             # guard #1: loud field check
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir = output_dir / "figures"
     print(f"\nVFE_3.0 ablation suite\n  device:  {device}\n  dataset: {CONFIG['dataset']}"
           f"\n  output:  {output_dir}\n  seed:    {CONFIG['seed']}"
           f"\n  sweeps:  {', '.join(sweep_names)}")
@@ -1195,9 +1272,13 @@ def main() -> None:
         run_sweep(name, output_dir, dataset=CONFIG["dataset"], device=device,
                   seed=CONFIG["seed"], resume=CONFIG["resume"],
                   max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"])
-        generate_plots(output_dir)                           # refresh figures after each sweep
+        sweep_dir = output_dir / name
+        analyze_sweep(sweep_dir)                             # this sweep's table (accumulated)
+        _plot_one_sweep(sweep_dir, fig_dir)                 # this sweep's PPL figure (tacked on)
 
-    analyze_all(output_dir)
+    # ---- after all sweeps: the cross-sweep comparison ----
+    _plot_sensitivity(output_dir, fig_dir)
+    summarize_sweeps(output_dir)
 
 
 if __name__ == "__main__":
