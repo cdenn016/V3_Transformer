@@ -253,6 +253,13 @@ def _save_figures(
                                        title="Gauge trace spread",
                                        path=str(artifacts.run_dir / "gauge_trace_spread.png"))
             figs.plt.close(fig)
+        # Learnable belief-coupling weight: present in history only on a learnable_lambda_beta run.
+        lam = [r["lambda_beta"] for r in artifacts.history if "lambda_beta" in r]
+        if lam:
+            fig = figs.plot_trajectory(lam, ylabel=r"$\lambda_\beta = e^{\log\lambda_\beta}$",
+                                       title="Learned belief-coupling weight",
+                                       path=str(artifacts.run_dir / "lambda_beta.png"))
+            figs.plt.close(fig)
         if artifacts.history and "self_coupling" in artifacts.history[-1]:
             _save_free_energy_bar(artifacts, figs)
     except Exception as exc:                                    # never let a plot kill a finished run

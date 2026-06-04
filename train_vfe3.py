@@ -34,7 +34,7 @@ SEED = 6
 
 # Cached tokenized corpus (gpt2/tiktoken -> vocab_size 50257) or the zero-dependency
 # synthetic anchor. Caches live in ~/.cache/tokenized_cache.
-#   "wikitext-103" | "wikitext-2" | "wiki-en" | "wiki-ja" | "synthetic-period3"
+#   "wikitext-103" | "wikitext-2" | "wiki-en" | "wiki-ja" | wiki-ar | "synthetic-period3"
 DATASET = "wikitext-103"
 
 # Cap the *training* stream for fast smoke runs (the validation split is always read
@@ -58,8 +58,8 @@ config = dict(
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 64,
-    max_steps                 = 15000,
+    batch_size                = 32,
+    max_steps                 = 30000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1,                   # T, E-step inner iterations
@@ -82,9 +82,12 @@ config = dict(
     # positional encoding -- BCH gauge-frame PE (pos_phi) + gauge-RoPE (pos_rotation)
     pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
     pos_phi_compose           = "bch",               # composition chart: "bch" | "euclidean"
-    bch_pe_order              = 4,                   # BCH Dynkin truncation order (compose_phi)
+    
+       
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
+    
     pos_phi_project_slk       = False,               # per-block trace projection (det Omega = 1)
+    
     pos_rotation              = "none",              # "none" | "rope" (block-diagonal positional rotation folded into transport)
     rope_base                 = 100.0,               # rotary frequency base
     rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES diagonal_covariance=False)
@@ -100,7 +103,10 @@ config = dict(
     c0                        = 1.0,                 # state-dependent alpha shape (numerator)
     
     kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
-   
+
+    lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
+    learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
+
     mass_phi                  = 0.0,                 # (mass_phi/2) ||phi||^2 penalty
 
     mstep_self_coupling_weight = 0.0,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
@@ -115,7 +121,7 @@ config = dict(
     attention_prior           = "causal",            # "uniform" | "causal" | "alibi"
 
     # E-step
-    e_mu_lr                   = 0.7,
+    e_mu_lr                   = 0.9,
     e_sigma_lr                = 0.025,
     e_phi_lr                  = 0.0,
     
@@ -169,6 +175,8 @@ config = dict(
     log_interval              = 100,                  # console log every N steps (0 = off)
     eval_interval             = 1000,                   # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,                  # save a resumable checkpoint every N steps (0 = off)
+    
+    
     eval_max_batches          = None,                 # cap the PERIODIC eval pass (None = full split)
     amp_dtype                 = None,                 # None (pure fp32) | "bf16" | "fp16" (opt-in autocast; CUDA throughput)
 )

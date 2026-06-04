@@ -122,15 +122,18 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     c0                         = 1.0,
     
     kappa                      = 1.0,                         # tau = kappa * sqrt(d_head)
-    
+
+    lambda_beta                = 1.0,                         # belief-coupling block weight (1.0 = pure F)
+    learnable_lambda_beta      = False,                       # learn lambda_beta (NN exception; exp(log_lambda_beta))
+
     mass_phi                   = 0.0,
-    
+
         # attention
     include_attention_entropy  = True,                        # canonical F vs entropy-suppressed surrogate
     attention_prior            = "causal",                    # "uniform" | "causal" | "alibi"
 
     # E-step
-    e_mu_lr                    = 0.7,
+    e_mu_lr                    = 0.9,
     e_sigma_lr                 = 0.025,
     e_phi_lr                   = 0.0,
    
@@ -164,9 +167,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     grad_accum_steps           = 1,
     
-    m_mu_lr                    = 0.01,
+    m_mu_lr                    = 0.02,
     m_sigma_lr                 = 0.0021,
-    m_phi_lr                   = 0.009,
+    m_phi_lr                   = 0.02,
     
     weight_decay               = 0.05,
    
@@ -221,10 +224,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "total belief dimension K (kept divisible by n_heads=2)",
         "param": "embed_dim", "values": [20, 40, 64],
     },
+    
+    
     "n_heads": {  # n_heads=1 has no >=2 equal blocks -> disable the head mixer for a clean sweep
         "description": "number of gauge-irrep blocks / heads (divisors of embed_dim=20)",
         "param": "n_heads", "values": [1, 2, 4, 5], "requires": {"use_head_mixer": False},
     },
+    
+    
     "n_layers": {
         "description": "number of stacked blocks L",
         "param": "n_layers", "values": [1, 2, 3],
@@ -233,16 +240,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "E-step inner iterations T per block",
         "param": "n_e_steps", "values": [1, 2, 4],
     },
-    "max_seq_len": {  # loader-affecting: the runner rebuilds the loader per cell
-        "description": "context length N",
-        "param": "max_seq_len", "values": [64, 128, 256],
-    },
+    
 
     # === divergence / numerics =============================================
-    "alpha_div": {
-        "description": "Renyi divergence order (1.0 -> KL; != 1 routes the non-kernel oracle)",
-        "param": "alpha_div", "values": [0.5, 1.0, 1.5, 2.0],
-    },
+    
     "kl_max": {
         "description": "per-pair KL clamp",
         "param": "kl_max", "values": [50.0, 100.0, 200.0],
@@ -252,6 +253,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "eps", "values": [1e-7, 1e-6, 1e-5],
     },
 
+    
+    
     # === gauge seam ========================================================
     # use_head_mixer (True at baseline) needs >= 2 equal blocks (block_glk / tied_block_glk);
     # the single-block glk / so_k / sp arms turn it off so the model constructs.
@@ -265,6 +268,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "sp",             "gauge_group": "sp",   "use_head_mixer": False},
         ],
     },
+    
+    
     "transport_mode": {  # regime_ii is the learned bilinear connection (sanctioned NN exception)
         "description": "connection regime: flat phi-cocycle vs learned non-flat (regime_ii)",
         "configs": [
@@ -272,11 +277,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "regime_ii", "transport_mode": "regime_ii"},
         ],
     },
+    
+    
     "cocycle_relaxation": {
         "description": "regime_ii homotopy (0 -> flat, 1 -> fully relaxed)",
         "param": "cocycle_relaxation", "values": [0.0, 0.5, 1.0],
         "requires": {"transport_mode": "regime_ii"},
     },
+    
+    
     "cross_couplings": {  # the off-block coupling merges the heads into one super-block, so the
                           # >=2-block head mixer cannot apply -> turn it off for a clean comparison
         "description": "cross-head GL(K) coupling (block-diagonal vs one coupled pair)",
@@ -288,30 +297,36 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
     # === positional encoding ===============================================
+    
     "pos_phi": {
         "description": "BCH positional encoding mode",
         "param": "pos_phi", "values": ["none", "learned", "frozen"],
     },
+    
     "pos_phi_compose": {
         "description": "BCH composition chart",
         "param": "pos_phi_compose", "values": ["bch", "euclidean"],
         "requires": {"pos_phi": "learned"},
     },
+    
     "bch_pe_order": {
         "description": "BCH Dynkin truncation order",
         "param": "bch_pe_order", "values": [2, 4, 6],
         "requires": {"pos_phi": "learned", "pos_phi_compose": "bch"},
     },
+    
     "pos_phi_scale": {
         "description": "learned pos_phi table init scale",
         "param": "pos_phi_scale", "values": [0.005, 0.02, 0.1],
         "requires": {"pos_phi": "learned"},
     },
+    
     "pos_phi_project_slk": {
         "description": "per-block trace projection (det Omega = 1) on pos_phi",
         "param": "pos_phi_project_slk", "values": [False, True],
         "requires": {"pos_phi": "learned"},
     },
+    
     "pos_rotation": {
         "description": "gauge-RoPE positional rotation (means-only) on/off",
         "configs": [
@@ -319,11 +334,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "rope", "pos_rotation": "rope"},
         ],
     },
+    
     "rope_base": {
         "description": "RoPE rotary frequency base",
         "param": "rope_base", "values": [10.0, 100.0, 1000.0],
         "requires": {"pos_rotation": "rope"},
     },
+    ''
     "rope_full_gauge": {  # rotating the covariance sandwich needs full covariance
         "description": "RoPE means-only vs full-gauge (rotates covariance; needs full cov)",
         "configs": [
@@ -364,35 +381,30 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "state-dependent alpha shape c0 (numerator)",
         "param": "c0", "values": [0.5, 1.0, 2.0], "requires": {"alpha_mode": "state_dependent"},
     },
-    "kappa": {
-        "description": "attention temperature tau = kappa * sqrt(d_head)",
-        "param": "kappa", "values": [0.5, 0.7, 1.0, 1.4, 2.0],
-    },
-    "mass_phi": {
-        "description": "gauge prior weight (mass_phi / 2) ||phi||^2",
-        "param": "mass_phi", "values": [0.0, 1e-4, 1e-3, 1e-2],
-    },
-    "mstep_self_coupling_weight": {
-        "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
-        "param": "mstep_self_coupling_weight", "values": [0.0, 0.1, 1.0],
-    },
+    
+    
+    
     "lambda_h": {
         "description": "hyper-prior weight lambda_h * mean_i KL(s_i||r) (>0 creates s/r tables)",
         "param": "lambda_h", "values": [0.0, 0.1, 1.0],
     },
+    
     "gamma_coupling": {
         "description": "model-channel coupling weight (>0 creates s tables)",
         "param": "gamma_coupling", "values": [0.0, 0.1, 1.0],
     },
+    
     "kappa_gamma": {
         "description": "model-channel temperature tau_gamma = kappa_gamma * sqrt(d_head)",
         "param": "kappa_gamma", "values": [0.5, 1.0, 2.0], "requires": {"gamma_coupling": 1.0},
     },
+    
     "gamma_attention_prior": {
         "description": "model-channel attention prior pi^s_ij",
         "param": "gamma_attention_prior", "values": ["uniform", "causal", "alibi"],
         "requires": {"gamma_coupling": 1.0},
     },
+    
     "prior_source": {  # model_channel makes the s tables the belief prior p_i
         "description": "belief-prior source table (token vs model channel)",
         "configs": [
@@ -402,6 +414,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
     # === attention =========================================================
+    
     "entropy_term": {
         "description": "canonical free energy (entropy term) vs entropy-suppressed surrogate",
         "configs": [
@@ -409,24 +422,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "surrogate", "include_attention_entropy": False},
         ],
     },
+    
     "attention_prior": {
         "description": "attention prior pi_ij",
         "param": "attention_prior", "values": ["uniform", "causal", "alibi"],
     },
 
     # === E-step ============================================================
-    "e_mu_lr": {
-        "description": "E-step natural-gradient step size for mu_q",
-        "param": "e_mu_lr", "values": [0.3, 0.5, 0.7, 0.9, 1.1],
-    },
-    "e_sigma_lr": {
-        "description": "E-step retraction step size for sigma_q",
-        "param": "e_sigma_lr", "values": [0.0, 0.01, 0.025, 0.05],
-    },
-    "e_phi_lr": {
-        "description": "E-step gauge-frame step size for phi",
-        "param": "e_phi_lr", "values": [0.0, 0.005, 0.01],
-    },
+    
     "e_sigma_q_trust": {
         "description": "E-step SPD retraction trust radius",
         "param": "e_sigma_q_trust", "values": [1.0, 5.0, 10.0],
@@ -435,31 +438,23 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "upper bound on belief variance",
         "param": "sigma_max", "values": [2.0, 5.0, 10.0],
     },
-    "gradient_mode": {
-        "description": "E-step coupling gradient (filtering = query-side only; smoothing = full)",
-        "param": "gradient_mode", "values": ["filtering", "smoothing"],
-    },
-    "phi_precond_mode": {
-        "description": "gauge-step preconditioner on the phi update",
-        "param": "phi_precond_mode", "values": ["none", "clip", "killing", "killing_per_block"],
-    },
+    
+    
+    
+    
+    
     "phi_retract_mode": {
         "description": "phi Lie-algebra step chart",
         "param": "phi_retract_mode", "values": ["euclidean", "bch"],
     },
+    
     "spd_retract_mode": {  # log_euclidean warns (not errors) on a diagonal family
         "description": "SPD covariance retraction geometry",
         "param": "spd_retract_mode", "values": ["spd_affine", "log_euclidean"],
     },
 
-    # === decode / encode ===================================================
-    "decode_head": {
-        "description": "KL-to-prior decode (pure path) vs learned linear projection (VFE_2.0 parity)",
-        "configs": [
-            {"label": "prior_bank",    "use_prior_bank": True},
-            {"label": "linear_decode", "use_prior_bank": False},
-        ],
-    },
+    
+    
     "decode_tau": {
         "description": "KL-to-prior decode temperature",
         "param": "decode_tau", "values": [0.5, 1.0, 2.0], "requires": {"use_prior_bank": True},
@@ -477,31 +472,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "diagonal_chunked", "use_prior_bank": True, "decode_mode": "diagonal_chunked"},
         ],
     },
-    "decode_chunk_size": {
-        "description": "vocab-chunk width for the chunked decode",
-        "param": "decode_chunk_size", "values": [4096, 8192, 16384],
-        "requires": {"use_prior_bank": True, "decode_mode": "diagonal_chunked"},
-    },
-
-    # === cross-block belief handoff ========================================
-    "prior_handoff_rho": {
-        "description": "mu_q -> mu_p handoff (0 = frozen priors, 1 = full flow)",
-        "param": "prior_handoff_rho", "values": [0.0, 0.5, 1.0],
-    },
-    "prior_handoff_sigma": {
-        "description": "sigma_q -> sigma_p handoff damping",
-        "param": "prior_handoff_sigma", "values": [0.0, 0.5, 1.0],
-    },
-
-    # === normalization =====================================================
-    "norm_type_block": {
-        "description": "inner (per-block) normalization",
-        "param": "norm_type_block", "values": ["none", "mahalanobis"],
-    },
-    "norm_type_final": {
-        "description": "final (outer) normalization",
-        "param": "norm_type_final", "values": ["none", "mahalanobis"],
-    },
+   
+    
 
     # === M-step / training =================================================
     "e_step_gradient": {  # 'detach' is consistent only with detach_e_step=False (the baseline)
@@ -516,25 +488,83 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
+    
+    
+    "alpha_div": {
+        "description": "Renyi divergence order (1.0 -> KL; != 1 routes the non-kernel oracle)",
+        "param": "alpha_div", "values": [0.5, 1.0, 1.5, 2.0],
+    },
+    
+    
+    
+    
+    
+   "e_mu_lr": {
+       "description": "E-step natural-gradient step size for mu_q",
+       "param": "e_mu_lr", "values": [0.3, 0.5, 0.7, 0.9, 1.1],
+   },
+   
+   "e_sigma_lr": {
+       "description": "E-step retraction step size for sigma_q",
+       "param": "e_sigma_lr", "values": [0.0, 0.01, 0.025, 0.05],
+   },
+   
+   "e_phi_lr": {
+       "description": "E-step gauge-frame step size for phi",
+       "param": "e_phi_lr", "values": [0.0, 0.005, 0.01],
+   },
+    
+    
+    
+    
+    
     "m_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "values": [0.005, 0.0075, 0.01, 0.02, 0.03],
+        "param": "m_mu_lr", "values": [0.015, 0.0225, 0.025, 0.0275],
     },
+    
     "m_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
         "param": "m_sigma_lr", "values": [0.001, 0.002, 0.005, 0.0075, 0.01],
     },
+    
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.0125, 0.015, 0.03, 0.05, 0.1],
+        "param": "m_phi_lr", "values": [0.02, 0.025, 0.03, 0.04],
     },
+    
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "values": [0.0, 0.00025, 0.0025, 0.01, 0.05, 0.1],
+        "param": "weight_decay", "values": [0.02, 0.04, 0.06, 0.08],
+    },
+    
+    
+    "mstep_self_coupling_weight": {
+        "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
+        "param": "mstep_self_coupling_weight", "values": [0.0, 0.1, 0.5],
     },
     
     
     
+    "kappa": {
+        "description": "attention temperature tau = kappa * sqrt(d_head)",
+        "param": "kappa", "values": [0.5, 0.7, 1.0, 1.4, 2.0],
+    },
+    "lambda_beta": {
+        "description": "belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)",
+        "param": "lambda_beta", "values": [0.25, 0.5, 1.0, 2.0, 4.0],
+    },
+    "learnable_lambda_beta": {  # 'learnable' is the NN-exception scalar log_lambda_beta (optimizer-grouped)
+        "description": "constant lambda_beta vs learned (exp(log_lambda_beta), trained on CE)",
+        "configs": [
+            {"label": "constant",  "learnable_lambda_beta": False},
+            {"label": "learnable", "learnable_lambda_beta": True},
+        ],
+    },
+    "mass_phi": {
+        "description": "gauge prior weight (mass_phi / 2) ||phi||^2",
+        "param": "mass_phi", "values": [0.0, 1e-4, 1e-3, 1e-2],
+    },
     
     
 }
@@ -564,28 +594,30 @@ NON_SWEPT_FIELDS = (
 SWEEP_ORDER: List[str] = [
     
     
-    "m_phi_lr",
-    "m_mu_lr",
-    "e_mu_lr",
+   # "m_phi_lr",
+   # "m_mu_lr",
+    #"e_mu_lr",
     
     "weight_decay",
+    
     "alpha_div",
     "mstep_self_coupling_weight",
     
     "e_sigma_lr",
-    
+    "m_sigma_lr",
     
     
     
     "kappa",
-    
+    "lambda_beta",
+
     "alpha_mode",
-    
+
     "attention_prior",
     "entropy_term",
-    "decode_head",
+    
     "gauge_group",
-    "phi_precond_mode",
+    
     "covariance",
 ]
 

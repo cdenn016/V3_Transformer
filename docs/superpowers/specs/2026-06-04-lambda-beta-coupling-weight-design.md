@@ -106,8 +106,30 @@ Because λ_β multiplies the live `pair` terms, the M-step CE backpropagates to
 detached (`create_graph=False`), exactly the signal path `log_alpha` already has.
 
 Optimizer: add `log_lambda_beta` to a param group in `vfe3/train.py::build_optimizer`
-(at `m_phi_lr`, a coupling/gauge-scale group, or `m_mu_lr`; decide during
-implementation) so the exact-coverage guard is satisfied and it actually trains.
+at `m_phi_lr` (a coupling/gauge-scale group) so the exact-coverage guard is satisfied
+and it actually trains.
+
+### Learnable diagnostics (metrics.csv + figure)
+
+On a learnable run only, the learned `lambda_beta = exp(log_lambda_beta)` is recorded
+and plotted, so its trajectory is auditable:
+
+- `vfe3/train.py` periodic-eval block: when the model carries `log_lambda_beta`, add a
+  `lambda_beta` key to the `artifacts.log_metrics(...)` row. The column is added only on
+  learnable runs (the run's config is fixed, so the CSV stays rectangular); constant
+  runs are unchanged.
+- `vfe3/run_artifacts.py::_save_figures`: when the logged history carries `lambda_beta`,
+  write `lambda_beta.png` via `figs.plot_trajectory` (the same conditional-trajectory
+  pattern as `holonomy`/`gauge_trace_spread`).
+
+Figure scope (user decision, 2026-06-04): `_save_figures` runs only inside `finalize_run`,
+which `train_vfe3.py` calls but `ablation.py` cells deliberately do not (ablation skips
+per-cell trajectory figures by design). So a full `train_vfe3.py` learnable run produces both
+the `metrics.csv` column and `lambda_beta.png`, while an ablation `learnable` cell produces the
+`metrics.csv` column only. Also: `metrics.free_energy_terms` gains a `lambda_beta` parameter so
+the monitored `total` (the `free_energy_total` CSV column / `free_energy_terms.png`) is the
+runtime-realised scaled F `self + lambda_beta (belief_coupling + entropy)`, while the
+`belief_coupling`/`attention_entropy` components stay raw.
 
 ## Tests (gate)
 

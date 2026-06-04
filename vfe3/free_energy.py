@@ -259,6 +259,7 @@ def free_energy(
 
     *,
     tau:                       float = 1.0,
+    lambda_beta:               'float | torch.Tensor' = 1.0,    # weight on the WHOLE belief-coupling block
     log_eps:                   float = 1e-12,                   # floor for log(beta)/log(pi) in the entropy term
     include_attention_entropy: bool  = True,
 
@@ -269,13 +270,18 @@ def free_energy(
     r"""Single authoritative scalar free energy (default path; lambda_h=0, gamma=0).
 
         F = sum_i [ alpha_i . D(q_i||p_i)            (+ R(alpha_i) if state-dependent)
-                  + sum_j beta_ij E_ij
-                  + tau sum_j beta_ij log(beta_ij/pi_ij)     (canonical only)
+                  + lambda_beta . ( sum_j beta_ij E_ij
+                                    + tau sum_j beta_ij log(beta_ij/pi_ij) )   (entropy: canonical only)
                   - ell_i ]
-    beta_ij = softmax_j(log_prior - E/tau); pi = softmax_j(log_prior). The hyper-prior
-    lambda_h KL(s||h) and model-coupling gamma KL(s_i||Omega s_j) are extension points,
-    absent from this default path. Divergence-agnostic: `self_div`/`energy` come from the
-    divergence seam, so a new divergence requires no change here.
+    beta_ij = softmax_j(log_prior - E/tau); pi = softmax_j(log_prior). ``lambda_beta`` (1.0 = the
+    canonical/pure F) scales the COUPLING and ENTROPY together by the SAME factor and leaves beta
+    untouched (no lambda inside the softmax), so beta = softmax(-E/tau) stays the stationary point of
+    the scaled block and the envelope identity d/dtheta[lambda_beta (coupling+entropy)] =
+    lambda_beta sum_j beta* dE/dtheta still holds -- keeping the analytic kernel (which scales its
+    pair term by lambda_beta) in agreement with autograd of this F. The hyper-prior lambda_h
+    KL(s||h) and model-coupling gamma KL(s_i||Omega s_j) are extension points, absent from this
+    default path. Divergence-agnostic: `self_div`/`energy` come from the divergence seam, so a new
+    divergence requires no change here.
     """
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)        # (..., N, N)
 
@@ -287,12 +293,12 @@ def free_energy(
 
     coupling = (beta * energy).sum()
 
-    F = self_total + coupling
+    F = self_total + lambda_beta * coupling
     if include_attention_entropy:
         pi = torch.softmax(log_prior, dim=-1) if log_prior is not None \
             else torch.full_like(beta, 1.0 / beta.shape[-1])
         entropy = tau * (beta * (torch.log(beta.clamp(min=log_eps)) - torch.log(pi.clamp(min=log_eps)))).sum()
-        F = F + entropy
+        F = F + lambda_beta * entropy
     if log_likelihood is not None:
         F = F - log_likelihood.sum()
     return F

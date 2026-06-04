@@ -108,11 +108,19 @@ def free_energy_terms(
     alpha:    torch.Tensor,              # (..., N) self-coupling
 
     *,
-    tau:       float = 1.0,
-    log_prior: Optional[torch.Tensor] = None,
-    eps:       float = 1e-12,
+    tau:         float = 1.0,
+    lambda_beta: 'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure F)
+    log_prior:   Optional[torch.Tensor] = None,
+    eps:         float = 1e-12,
 ) -> Dict[str, float]:
-    r"""Per-term free-energy decomposition: self-coupling, belief-coupling, attention entropy."""
+    r"""Per-term free-energy decomposition: self-coupling, belief-coupling, attention entropy.
+
+    ``belief_coupling`` and ``attention_entropy`` are the RAW (unweighted) block energies, so each
+    stays individually interpretable; ``total`` is the runtime-realised SCALED free energy
+    self_coupling + lambda_beta (belief_coupling + attention_entropy), matching what the E-step
+    actually minimizes (VFE_2.0 parity). At lambda_beta = 1.0 total is byte-identical to the
+    unscaled sum.
+    """
     self_coupling = float((alpha * self_div).sum())
     belief_coupling = float((beta * energy).sum())
     pi = torch.softmax(log_prior, dim=-1) if log_prior is not None else torch.full_like(beta, 1.0 / beta.shape[-1])
@@ -121,7 +129,7 @@ def free_energy_terms(
         "self_coupling":   self_coupling,
         "belief_coupling": belief_coupling,
         "attention_entropy": entropy,
-        "total":           self_coupling + belief_coupling + entropy,
+        "total":           self_coupling + float(lambda_beta) * (belief_coupling + entropy),
     }
 
 

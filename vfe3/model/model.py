@@ -137,6 +137,26 @@ class VFEModel(nn.Module):
                     "1.0. Set detach_e_step=False to train the learnable alpha.",
                     stacklevel=2,
                 )
+        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED belief-coupling weight
+        # lambda_beta (VFE_2.0 'lambda_align' parity). When learnable_lambda_beta=True, create
+        # log_lambda_beta as a scalar nn.Parameter; the consumed weight is lambda_beta =
+        # exp(log_lambda_beta) (always positive). Init 0 -> lambda_beta = exp(0) = 1.0, byte-identical
+        # to the constant-1.0 pure path at step 0. For learnable_lambda_beta=False the parameter is
+        # NOT created (no log_lambda_beta attribute), so the default path is param-free.
+        if cfg.learnable_lambda_beta:
+            self.log_lambda_beta = nn.Parameter(torch.zeros(()))
+            if cfg.detach_e_step:
+                # Footgun (mirrors log_alpha): log_lambda_beta enters the loss ONLY through the E-step
+                # belief updates, but detach_e_step wraps the whole E-step in no_grad, so it receives
+                # NO gradient and stays frozen at its init (lambda_beta = 1.0).
+                import warnings
+                warnings.warn(
+                    "learnable_lambda_beta=True with detach_e_step=True freezes log_lambda_beta: the "
+                    "learned belief-coupling weight enters the loss only through the E-step, which the "
+                    "detached (no_grad) E-step severs, so log_lambda_beta.grad is None and lambda_beta "
+                    "stays at its init 1.0. Set detach_e_step=False to train the learnable lambda_beta.",
+                    stacklevel=2,
+                )
         if (not cfg.use_prior_bank) and cfg.detach_e_step:
             # Joint-toggle footgun (audit 2026-05-31): the detached E-step severs the encode prior
             # tables (mu/sigma/phi_embed) from the loss, and the linear decode reads only mu_final,
@@ -302,6 +322,12 @@ class VFEModel(nn.Module):
         # E-step so the loss backpropagates to log_alpha. getattr keeps the default path's call
         # identical: None forwards a defaulted-None keyword that every alpha form ignores.
         log_alpha = getattr(self, "log_alpha", None)
+        # lambda_beta: the belief-coupling weight. The learned exp(log_lambda_beta) when
+        # learnable_lambda_beta=True (a live tensor, so the loss backpropagates to log_lambda_beta
+        # through the unrolled E-step, exactly like log_alpha), else the constant cfg.lambda_beta.
+        # A single value is threaded (not the raw param), so consumers just multiply by it.
+        _llb = getattr(self, "log_lambda_beta", None)
+        lambda_beta = self.cfg.lambda_beta if _llb is None else _llb.exp()
         # connection_W: the learned bilinear Regime-II edge connection (a sanctioned NN exception)
         # when transport_mode='regime_ii', else None (the flat pure path). Threaded through the
         # E-step like log_alpha so the loss backpropagates to it; getattr keeps the flat path's call
@@ -326,6 +352,7 @@ class VFEModel(nn.Module):
         with run, amp:
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm, log_alpha=log_alpha,
+                            lambda_beta=lambda_beta,
                             connection_W=connection_W, e_step_gradient=e_step_gradient,
                             rope=rope, rope_on_cov=self.cfg.rope_full_gauge)
         mu_final = out.mu                                        # (B, N, K)
@@ -583,10 +610,12 @@ class VFEModel(nn.Module):
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
+        _llb = getattr(self, "log_lambda_beta", None)
         out = vfe_stack(                                              # converged belief
             belief, belief.mu, belief.sigma, self.group, cfg,
             log_prior=log_prior, block_norm=self.block_norm,
             log_alpha=getattr(self, "log_alpha", None),               # learned scalar (None on the pure path)
+            lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
         )
 
@@ -633,7 +662,10 @@ class VFEModel(nn.Module):
         )
 
         d = {"attn_entropy": float(metrics.attention_entropy(beta))}
-        terms = metrics.free_energy_terms(self_div, energy, beta, alpha, tau=attention_tau(cfg.kappa, self.group.irrep_dims), log_prior=log_prior)
+        _lb = cfg.lambda_beta if _llb is None else float(_llb.detach().exp())   # scaled-F total reflects lambda_beta
+        terms = metrics.free_energy_terms(self_div, energy, beta, alpha,
+                                          tau=attention_tau(cfg.kappa, self.group.irrep_dims),
+                                          lambda_beta=_lb, log_prior=log_prior)
         d.update({k: float(v) for k, v in terms.items()})
         spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
         d["effective_rank"] = float(metrics.effective_rank(spec).mean())
@@ -685,10 +717,12 @@ class VFEModel(nn.Module):
         rope = self._rope_rotation(n, token_ids.device)
         maps = []
         for _ in range(cfg.n_layers):
+            _llb = getattr(self, "log_lambda_beta", None)
             belief = vfe_block(                                       # converged belief at this block
                 belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                 block_norm=self.block_norm,
                 log_alpha=getattr(self, "log_alpha", None),
+                lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
             )
             # Attention at the converged belief, recomputed exactly as diagnostics does: the
