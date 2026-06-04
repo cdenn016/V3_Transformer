@@ -8,12 +8,22 @@ so a gradient step on the priors improves inference end to end. Click-to-run: ed
 ``VFE3Config`` and call ``run_training`` (no CLI).
 """
 
+import contextlib
 import logging
 import math
 import time
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+
+try:                                                # live per-step it/s via a tqdm progress bar
+    from tqdm import tqdm as _tqdm                  # (plain tqdm, not tqdm.auto: the notebook
+    from tqdm.contrib.logging import (              # widget is swallowed by some Run-button
+        logging_redirect_tqdm as _redirect_logging,  # consumers / non-TTY stdout)
+    )
+except ImportError:                                 # tqdm optional: absent -> no bar, the periodic
+    _tqdm = None                                    # log lines still emit at log_interval as before
+    _redirect_logging = contextlib.nullcontext
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader
@@ -285,8 +295,11 @@ def train(
     short-circuit, drawing no RNG, running no extra forward, and printing nothing. When
     ``log_interval`` is positive a VFE_2.0-style per-step line is emitted every
     ``log_interval`` steps (CE and diagnostics recomputed under ``no_grad`` only at those
-    steps, off the training graph); when ``eval_interval`` is positive and ``val_loader``
-    is given a validation block is emitted every ``eval_interval`` steps.
+    steps, off the training graph), AND -- when ``tqdm`` is installed -- the step loop runs
+    under a ``tqdm`` progress bar whose built-in rate readout shows live ``it/s`` every step
+    (the formatted lines render above it via ``logging_redirect_tqdm``); when ``eval_interval``
+    is positive and ``val_loader`` is given a validation block is emitted every
+    ``eval_interval`` steps.
     """
     optimizer = build_optimizer(model, cfg)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: lr_lambda(s, cfg))
@@ -295,10 +308,31 @@ def train(
     logger = logger or logging.getLogger(__name__)
     if device is None:
         device = model.prior_bank.mu_embed.device
+    # Live per-step it/s: iterate the step loop through a tqdm bar whose built-in rate readout
+    # refreshes every step. Gated on log_interval so the documented silent path (log_interval
+    # falsy) stays bitwise-identical -- no bar, no redirect, nothing printed. The generator holds
+    # logging_redirect_tqdm open across the whole loop (it suspends at `yield` INSIDE the `with`),
+    # so the periodic logger.info lines below render above the bar instead of interleaving with it
+    # on stderr; it closes the bar on normal exit or exception.
+    show_bar = bool(log_interval) and _tqdm is not None
+
+    def _step_indices() -> Iterable[int]:
+        if not show_bar:
+            yield from range(n_steps)
+            return
+        bar = _tqdm(range(n_steps), desc="Training", total=n_steps, ascii=True)  # ascii=True: the
+        #                          default block glyph U+2588 is not cp1252-encodable on a Windows
+        #                          console (raises UnicodeEncodeError mid-run); " #" renders anywhere
+        with _redirect_logging():
+            try:
+                yield from bar
+            finally:
+                bar.close()
+
     it = iter(loader)
     win_t0 = time.perf_counter()
     win_i0 = 0
-    for step in range(n_steps):
+    for step in _step_indices():
         try:
             tokens, targets = next(it)
         except StopIteration:
