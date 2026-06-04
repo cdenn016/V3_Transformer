@@ -147,6 +147,7 @@ def free_energy_value(
     value:                     float = 1.0,
     b0:                        float = 1.0,
     c0:                        float = 1.0,
+    lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
     sigma_max:                 float = 5.0,            # accepted-and-ignored iteration-only knob
@@ -199,7 +200,8 @@ def free_energy_value(
     energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_t, sigma_t), alpha=alpha_div, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     return free_energy(
-        sd, energy, alpha, tau=tau, include_attention_entropy=include_attention_entropy,
+        sd, energy, alpha, tau=tau, lambda_beta=lambda_beta,
+        include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if alpha_mode != "constant" else None),
     )
 
@@ -216,6 +218,7 @@ def phi_alignment_loss(
     kl_max:    float = 100.0,
     eps:       float = 1e-6,
     mass_phi:  float = 0.0,
+    lambda_beta: 'float | torch.Tensor' = 1.0,        # weight on the belief-coupling block (1.0 = pure)
     family:    str   = "gaussian_diagonal",
     divergence_family: str = "renyi",
 
@@ -229,12 +232,15 @@ def phi_alignment_loss(
     r"""Canonical belief-coupling block as a function of phi (mu, sigma fixed), plus the
     gauge-frame penalty (manuscript Algorithm 1, line for nabla_phi F):
 
-        L(phi) = Sum_ij [ beta_ij E_ij + tau beta_ij log(beta_ij/pi_ij) ] + (mass_phi/2) ||phi||^2,
+        L(phi) = lambda_beta Sum_ij [ beta_ij E_ij + tau beta_ij log(beta_ij/pi_ij) ] + (mass_phi/2) ||phi||^2,
         E_ij = D(q_i || Omega_ij(phi) q_j),  beta = softmax_j(log_prior - E/tau).
     Both roles of phi flow (Omega_ij depends on phi_i and phi_j); autograd gives the envelope
-    phi-gradient. The ``mass_phi`` term makes the phi E-step descend the PENALIZED objective
-    during inference (distinct from the outer M-step ||phi||^2 on the learned prior table). The
-    canonical (entropy) branch reuses ``reduced_free_energy``, the -tau log Z envelope form.
+    phi-gradient. ``lambda_beta`` (1.0 = pure) scales the coupling block but NOT the ``mass_phi``
+    penalty, so the effective phi step is e_phi_lr * lambda_beta * nabla (lambda_beta and e_phi_lr
+    interact; VFE_2.0 parity). The ``mass_phi`` term makes the phi E-step descend the PENALIZED
+    objective during inference (distinct from the outer M-step ||phi||^2 on the learned prior
+    table). The canonical (entropy) branch reuses ``reduced_free_energy``, the -tau log Z envelope
+    form.
     """
     # Build Omega under the ACTIVE connection regime so the phi step descends the SAME objective as
     # the mu/sigma step. regime_ii reads the (fixed) belief means mu and the learned connection_W;
@@ -248,9 +254,9 @@ def phi_alignment_loss(
                              divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0
     if include_attention_entropy:
-        return reduced_free_energy(energy, tau=tau, log_prior=log_prior).sum() + mass
+        return lambda_beta * reduced_free_energy(energy, tau=tau, log_prior=log_prior).sum() + mass
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)
-    return (beta * energy).sum() + mass
+    return lambda_beta * (beta * energy).sum() + mass
 
 
 def e_step_iteration(
@@ -268,6 +274,7 @@ def e_step_iteration(
     value:                     float = 1.0,
     b0:                        float = 1.0,
     c0:                        float = 1.0,
+    lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
     sigma_max:                 float = 5.0,
@@ -317,7 +324,8 @@ def e_step_iteration(
     )
     grad_mu, grad_sigma = belief_gradients(
         belief.mu, belief.sigma, mu_p, sigma_p, omega,
-        tau=tau, alpha_div=alpha_div, value=value, b0=b0, c0=c0, kl_max=kl_max, eps=eps,
+        tau=tau, alpha_div=alpha_div, value=value, b0=b0, c0=c0, lambda_beta=lambda_beta,
+        kl_max=kl_max, eps=eps,
         include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
         family=family, divergence_family=divergence_family, alpha_mode=alpha_mode,
         irrep_dims=group.irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
@@ -362,7 +370,7 @@ def e_step_iteration(
             phi_g = belief.phi.detach().clone().requires_grad_(True)
             L = phi_alignment_loss(
                 mu, sigma, phi_g, group, tau=tau, alpha_div=alpha_div, kl_max=kl_max, eps=eps,
-                mass_phi=mass_phi, family=family, divergence_family=divergence_family,
+                mass_phi=mass_phi, lambda_beta=lambda_beta, family=family, divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy, log_prior=log_prior,
                 transport_mode=transport_mode, cocycle_relaxation=cocycle_relaxation,
                 connection_W=(connection_W.detach() if connection_W is not None else None),

@@ -27,6 +27,7 @@ def vfe_block(
     log_prior:       Optional[torch.Tensor]    = None,
     block_norm:      Optional[Callable[..., torch.Tensor]] = None,   # cached norm instance (None -> off)
     log_alpha:       Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
+    lambda_beta:     'float | torch.Tensor'    = 1.0,    # belief-coupling weight (cfg.lambda_beta or exp(log_lambda_beta))
     connection_W:    Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
     e_step_gradient: str                       = "unroll",  # E-step backward estimator (unroll | straight_through | detach)
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
@@ -35,8 +36,10 @@ def vfe_block(
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
     ``log_alpha`` is the model's learned self-coupling nn.Parameter (alpha = exp(log_alpha))
-    under alpha_mode='learnable', forwarded to the E-step; None on the pure path. ``connection_W``
-    is the model's learned bilinear Regime-II connection (a sanctioned NN exception) forwarded under
+    under alpha_mode='learnable', forwarded to the E-step; None on the pure path. ``lambda_beta``
+    is the belief-coupling weight (the constant cfg.lambda_beta, or the live exp(log_lambda_beta)
+    when learnable_lambda_beta=True); 1.0 is the pure F. ``connection_W`` is the model's learned
+    bilinear Regime-II connection (a sanctioned NN exception) forwarded under
     transport_mode='regime_ii'; None on the pure (flat) path. ``e_step_gradient`` is the E-step
     backward estimator forwarded to the E-step (unroll | straight_through | detach). ``rope`` is
     the precomputed block-diagonal positional rotation R(theta) (None = off, the pure path);
@@ -46,6 +49,7 @@ def vfe_block(
         n_iter=cfg.n_e_steps, tau=attention_tau(cfg.kappa, group.irrep_dims),
         e_mu_lr=cfg.e_mu_lr, e_sigma_lr=cfg.e_sigma_lr, e_phi_lr=cfg.e_phi_lr,
         alpha_div=cfg.alpha_div, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0, log_alpha=log_alpha,
+        lambda_beta=lambda_beta,
         kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
         include_attention_entropy=cfg.include_attention_entropy,

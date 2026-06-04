@@ -121,6 +121,18 @@ class VFE3Config:
     b0:                        float = 1.0          # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0:                        float = 1.0          # state-dependent alpha shape (numerator)
     kappa:                     float = 1.0          # temperature tau = kappa * sqrt(K)
+    # lambda_beta weights the ENTIRE belief-coupling block of F -- sum_ij [ beta_ij E_ij +
+    # tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-coupling and the likelihood
+    # (VFE_2.0 'lambda_align' parity). 1.0 = the canonical/pure F (byte-identical). It scales the
+    # POST-softmax block (NOT the energy inside the softmax), so beta = softmax(-E/tau) is unchanged
+    # and the analytic kernel stays envelope-consistent with the autograd oracle.
+    lambda_beta:               float = 1.0
+    # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED lambda_beta. When True the model
+    # creates a scalar nn.Parameter log_lambda_beta (lambda_beta = exp(log_lambda_beta)) trained by
+    # backprop through the unrolled E-step -- the spirit of alpha_mode='learnable'. Init 0 ->
+    # lambda_beta = 1.0, byte-identical to the constant-1.0 pure path at step 0. Default False keeps
+    # the path param-free.
+    learnable_lambda_beta:     bool  = False
     mass_phi:                  float = 0.0          # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight: float = 0.0         # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
     # Hyper-prior weight lambda_h on the model-channel term lambda_h * mean_i KL(s_i||r)
@@ -392,6 +404,8 @@ class VFE3Config:
             raise ValueError(
                 f"mstep_self_coupling_weight must be >= 0, got {self.mstep_self_coupling_weight}"
             )
+        if self.lambda_beta < 0.0:
+            raise ValueError(f"lambda_beta must be >= 0, got {self.lambda_beta}")
         if self.lambda_h < 0.0:
             raise ValueError(f"lambda_h must be >= 0, got {self.lambda_h}")
         if self.gamma_coupling < 0.0:

@@ -86,6 +86,8 @@ def build_optimizer(
         groups.append({"params": [model.connection_W], "lr": cfg.m_phi_lr})  # connection -> gauge LR
     if getattr(model, "log_alpha", None) is not None:           # alpha_mode='learnable' scalar coupling
         groups.append({"params": [model.log_alpha], "lr": cfg.m_mu_lr})
+    if getattr(model, "log_lambda_beta", None) is not None:     # learnable_lambda_beta scalar belief-coupling weight
+        groups.append({"params": [model.log_lambda_beta], "lr": cfg.m_phi_lr})  # a coupling/gauge-scale LR
 
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
     # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the
@@ -392,7 +394,7 @@ def train(
             # whenever the validation PPL sets a new minimum.
             if artifacts is not None:
                 d = model.diagnostics(tokens)
-                artifacts.log_metrics({
+                row = {
                     "step":              step + 1,
                     "train_loss":        losses[-1],
                     "lr":                float(scheduler.get_last_lr()[0]),
@@ -407,7 +409,14 @@ def train(
                     "effective_rank":     d["effective_rank"],
                     "holonomy_deviation": d["holonomy_deviation"],
                     "gauge_trace_spread": d["gauge_trace_spread"],
-                })
+                }
+                # Learnable belief-coupling weight: record the current lambda_beta = exp(log_lambda_beta)
+                # so its trajectory lands in metrics.csv (and the lambda_beta.png figure). The column
+                # exists only on a learnable run (config is fixed per run, so the CSV stays rectangular).
+                _llb = getattr(model, "log_lambda_beta", None)
+                if _llb is not None:
+                    row["lambda_beta"] = float(_llb.detach().exp())
+                artifacts.log_metrics(row)
                 artifacts.maybe_save_best(step + 1, model, m["ppl"])
                 # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0 of
                 # the live batch -- the same sequence the diagnostics above read). Best-effort inside

@@ -89,14 +89,20 @@ def _diag_kl_filtering_kernel(
     alpha_coef: torch.Tensor,             # (N, 1) or (N, K) self-coupling coefficient
 
     *,
-    kl_max:     float = 100.0,
-    eps:        float = 1e-6,
+    kl_max:      float = 100.0,
+    eps:         float = 1e-6,
+    lambda_beta: 'float | torch.Tensor' = 1.0,   # weight on the belief-coupling (pair) term
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Diagonal-KL query-side (filtering) gradient (per-head aware).
 
-      grad_mu_i    = m_i a_i (mu_i - mu_p_i)/sigma_p_i + Sum_j beta_ij^(h(k)) (mu_i - mu_t_ij)/sigma_t_ij
+      grad_mu_i    = m_i a_i (mu_i - mu_p_i)/sigma_p_i + lambda_beta Sum_j beta_ij^(h(k)) (mu_i - mu_t_ij)/sigma_t_ij
       grad_sigma_i = m_i a_i 0.5(1/sigma_p_i - 1/sigma_q_i)
-                     + Sum_j beta_ij^(h(k)) 0.5(1/sigma_t_ij - 1/sigma_q_i)
+                     + lambda_beta Sum_j beta_ij^(h(k)) 0.5(1/sigma_t_ij - 1/sigma_q_i)
+
+    ``lambda_beta`` (1.0 = pure) scales ONLY the belief-coupling (pair) term, not the alpha
+    self-term -- the analytic counterpart of scaling the post-softmax coupling+entropy block in
+    ``free_energy`` (the envelope identity makes the pair term equal to d/dtheta of that block at
+    beta*, so scaling both by the same factor keeps kernel == oracle).
 
     ``beta_coord`` is the attention weight broadcast to coordinate k via k's irrep block h(k)
     (the per-head weight beta_ij^(h)); for a single block it is the one beta_ij repeated across
@@ -125,11 +131,11 @@ def _diag_kl_filtering_kernel(
 
     self_mu  = self_mask * alpha_coef * (mu_q - mu_p) / sp
     pair_mu  = torch.einsum("...ijk,...ijk->...ik", beta_coord, (mu_q.unsqueeze(-2) - mu_t) / st)
-    grad_mu  = self_mu + pair_mu
+    grad_mu  = self_mu + lambda_beta * pair_mu
 
     self_sig = self_mask * alpha_coef * 0.5 * (1.0 / sp - 1.0 / sq)
     pair_sig = torch.einsum("...ijk,...ijk->...ik", beta_coord, 0.5 * (1.0 / st - 1.0 / sq.unsqueeze(-2)))
-    grad_sigma = self_sig + pair_sig
+    grad_sigma = self_sig + lambda_beta * pair_sig
     return grad_mu, grad_sigma
 
 
@@ -147,6 +153,7 @@ def belief_gradients(
     eps:          float = 1e-6,
     b0:           float = 1.0,
     c0:           float = 1.0,
+    lambda_beta:  'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure F)
 
     include_attention_entropy: bool = True,
     create_graph:              bool = False,   # unroll: oracle returns a differentiable grad (to prior)
@@ -180,7 +187,7 @@ def belief_gradients(
     if not use_kernel:
         return belief_gradients_autograd(
             mu, sigma, mu_p, sigma_p, omega, tau=tau, alpha_div=alpha_div,
-            kl_max=kl_max, eps=eps, b0=b0, c0=c0, value=value,
+            kl_max=kl_max, eps=eps, b0=b0, c0=c0, value=value, lambda_beta=lambda_beta,
             include_attention_entropy=include_attention_entropy, create_graph=create_graph,
             gradient_mode=gradient_mode, family=family, divergence_family=divergence_family,
             alpha_mode=alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
@@ -199,7 +206,8 @@ def belief_gradients(
     coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=alpha_mode, log_alpha=log_alpha)
     if not alpha_is_per_coord(alpha_mode):
         coef = coef.unsqueeze(-1)                 # (N,) -> (N,1) per-position broadcast; per-coord sd is already (N,K)
-    return get_kernel(family)(mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta_coord, coef, kl_max=kl_max, eps=eps)
+    return get_kernel(family)(mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta_coord, coef,
+                              kl_max=kl_max, eps=eps, lambda_beta=lambda_beta)
 
 
 def _beta_to_coordinate(

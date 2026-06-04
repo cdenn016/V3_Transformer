@@ -54,6 +54,7 @@ def belief_gradients_autograd(
     b0:           float = 1.0,
     c0:           float = 1.0,
     value:        float = 1.0,
+    lambda_beta:  'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure F)
 
     include_attention_entropy: bool = True,
     create_graph:              bool = False,   # True (unroll): live leaf + differentiable grad to prior
@@ -98,7 +99,8 @@ def belief_gradients_autograd(
     energy = pairwise_energy(fam(mu_q, sigma_q), fam(mu_t, sigma_t), alpha=alpha_div, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=irrep_dims)
     F = free_energy(
-        sd, energy, alpha, tau=tau, include_attention_entropy=include_attention_entropy,
+        sd, energy, alpha, tau=tau, lambda_beta=lambda_beta,
+        include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if alpha_mode != "constant" else None),
     )
     grad_mu, grad_sigma = torch.autograd.grad(F, [mu_q, sigma_q], create_graph=use_live)
