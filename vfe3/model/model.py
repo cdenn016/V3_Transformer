@@ -685,7 +685,11 @@ class VFEModel(nn.Module):
         # of the triangle holonomy Omega_ij Omega_jk Omega_ki from I (0 for the flat phi-cocycle) --
         # and the spread of log|det Omega| = tr(embed(phi)) across tokens (0 at phi=0). Pure
         # measurements at the converged transport; off the training graph (no_grad).
-        d["holonomy_deviation"] = float(metrics.holonomy_deviation(omega))
+        # Curvature proxy from the SAMPLED estimator (seeded random distinct triples) rather than the
+        # deterministic row-major prefix, which at N=128/max_triangles=512 covers only anchor i=0's
+        # local neighborhood -- a systematically biased sample. The sampled mean is representative and
+        # still ~0 on the flat phi-cocycle (flatness certificate); the dict key is unchanged.
+        d["holonomy_deviation"] = float(metrics.holonomy_deviation_sampled(omega)["mean"])
         d["gauge_trace_spread"] = float(metrics.gauge_trace_spread(out.phi, self.group.generators))
         return d
 

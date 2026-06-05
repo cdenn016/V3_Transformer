@@ -17,6 +17,13 @@ This V3 is intended to be a production quality continuation of the VFE_2.0 trans
   PriorBank. (2) `use_head_mixer=True` applies a learned Schur-commutant per-irrep-block
   head mixer; under `block_glk`'s untied per-block gauge it breaks strict gauge
   equivariance (exact at identity init, deviates as the mixer drifts) — user-accepted.
+  (3) `transport_mode='regime_ii'` consumes a learned bilinear connection `connection_W`
+  (`(n_gen, K, K)` nn.Parameter, default OFF; flat Regime-I is the pure path). Its edge factor
+  `exp(delta_ij·G)`, `delta_ij^a = mu_i^T W^a mu_j`, is gauge-INVARIANT only at `W=0` (the only
+  constant W with `g^T W^a g = W^a` for all group elements g is zero), so a trained nonzero
+  `connection_W` breaks strict gauge equivariance — exact at zero init, deviates as W drifts (the
+  same footprint as the head mixer) — user-accepted. (Pinned by
+  `tests/test_regime_ii.py::test_regime_ii_edge_factor_breaks_gauge_invariance_for_nonzero_W`.)
 - NO CLI arg parsing; entry points are click-to-run (edit config dicts, then run).
 - float32 throughout; CUDA where applicable (user has an RTX 5090).
 - High modularity: a config-selected registry behind every seam (divergence,

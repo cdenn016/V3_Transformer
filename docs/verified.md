@@ -3,6 +3,21 @@
 Per the CLAUDE.md audit/verification policy: each entry states WHAT was checked, whether it was
 INCORRECT, and whether it was RIGOROUSLY verified. Consult this before re-verifying the same thing.
 
+## 2026-06-05 — Codex deep-audit triage (see docs/audits/audit-2026-06-05-codex-triage.md)
+
+- **Regime-II connection_W gauge-equivariance (audit Finding 6).** CHECKED, CONFIRMED, RIGOROUS.
+  The opt-in regime_ii edge factor exp(delta_ij·G), delta_ij^a = mu_i^T W^a mu_j, is gauge-INVARIANT
+  (NOT covariant — the vertex factors exp(phi_i), exp(-phi_j) already carry the full g_i(.)g_j^{-1}
+  conjugation, so the middle factor must be unchanged) iff g_i^T W^a g_j = W^a for all group elements
+  g; setting g_i=I gives W^a(g_j - I)=0, so the ONLY constant solution is W^a=0. Hence a trained
+  nonzero connection_W breaks strict gauge equivariance — exact at zero init, deviates as W drifts
+  (empirically monotone in ||W||: 0 at W=0, 62.3 at ||W||~1 vs ||E||~9.6), the same footprint as the
+  head mixer. Codex's "covariance / W -> Ad(g) W / constrain to an invariant family" framing is wrong
+  (the only invariant is W=0). Now disclosed in CLAUDE.md and pinned by
+  tests/test_regime_ii.py::test_regime_ii_edge_factor_breaks_gauge_invariance_for_nonzero_W. The other
+  audit findings are implementation/diagnostics/reporting (F1 loader split-semantics, F4 registry
+  consistency, F7 holonomy estimator, F8 banner tau), not theory — see the triage doc.
+
 ## 2026-06-05 — Rényi/alpha-divergence + alpha_div ablation (see docs/audits/audit-2026-06-05.md)
 
 - **Gaussian Rényi closed forms (diagonal, full-cov, per-coordinate).** CHECKED, CORRECT, RIGOROUS

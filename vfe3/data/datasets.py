@@ -132,10 +132,17 @@ def make_dataloader(
     *,
     stride:      Optional[int] = None,
     shuffle:     bool          = True,
+    drop_last:   bool          = True,
     cache_dir:   Optional[Path] = None,
     max_tokens:  Optional[int] = None,   # cap the stream (fast smoke runs)
 ) -> DataLoader:
-    """Build a DataLoader of causal-LM windows from the cached ``dataset``/``split``."""
+    """Build a DataLoader of causal-LM windows from the cached ``dataset``/``split``.
+
+    ``shuffle`` / ``drop_last`` default to the TRAIN regime (shuffle the stream, drop the partial
+    last batch). Evaluation must pass ``shuffle=False, drop_last=False`` so validation/test are a
+    stable corpus measurement that reads the WHOLE split (the token-weighted CE in
+    ``train.evaluate`` is order-independent, but a dropped tail and a randomly-varying drawn subset
+    are not -- see _select_loader)."""
     tokens = load_cached_tokens(dataset, split, cache_dir=cache_dir)
     if max_tokens is not None:
         tokens = tokens[:max_tokens]
@@ -144,5 +151,5 @@ def make_dataloader(
     # box). With pinned host buffers the per-step .to(device, non_blocking=True) H2D copy in
     # train()/evaluate() can overlap compute; num_workers stays 0 (the dataset is an in-memory
     # tensor slice, so worker IPC would cost more than it saves).
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=True,
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
                       pin_memory=torch.cuda.is_available())

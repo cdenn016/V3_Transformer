@@ -311,3 +311,30 @@ def test_build_optimizer_groups_pos_phi_free():
     opt = build_optimizer(model, cfg)                      # must NOT raise the coverage AssertionError
     grouped = {p for g in opt.param_groups for p in g["params"]}
     assert model.pos_phi_free in grouped
+
+
+def test_select_loader_is_split_aware(monkeypatch):
+    r"""Audit F1: _select_loader must request shuffle=False, drop_last=False for validation/test
+    (stable corpus metric) and shuffle=True, drop_last=True only for train. RED against the old
+    _select_loader, which called make_dataloader with neither override (so val/test inherited the
+    shuffle=True, drop_last=True training defaults)."""
+    import logging
+
+    import train_vfe3
+
+    captured = {}
+
+    def fake_make_dataloader(dataset, split, seq_len, batch_size, *,
+                             shuffle=True, drop_last=True, max_tokens=None, **kw):
+        captured[split] = {"shuffle": shuffle, "drop_last": drop_last}
+        return ("loader", split)
+
+    monkeypatch.setattr(train_vfe3, "make_dataloader", fake_make_dataloader)
+    cfg = VFE3Config()
+    log = logging.getLogger("audit-f1")
+    for split in ("train", "validation", "test"):
+        train_vfe3._select_loader("wikitext-103", cfg, log, split=split)
+
+    assert captured["train"] == {"shuffle": True, "drop_last": True}
+    assert captured["validation"] == {"shuffle": False, "drop_last": False}
+    assert captured["test"] == {"shuffle": False, "drop_last": False}
