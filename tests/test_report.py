@@ -63,7 +63,8 @@ def test_generate_figures_drives_live_model(tmp_path):
     # The figures that need no optional dependency (UMAP is best-effort, so belief_umap is excluded).
     robust = {"estep_convergence.png", "belief_trajectories.png", "attention_structure.png",
               "gauge_equivariance.png", "gauge_head_specialization.png", "belief_spectrum.png",
-              "spd_ellipses.png", "holonomy_curvature.png", "numerical_trust.png"}
+              "spd_ellipses.png", "holonomy_curvature.png", "numerical_trust.png",
+              "belief_category_separation.png"}
     missing = robust - written
     assert not missing, f"driver did not produce {missing}"
     assert all((figdir / name).exists() for name in robust)

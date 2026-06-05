@@ -15,6 +15,7 @@ from vfe3.viz.figures import (
     plot_attention_grid,
     plot_attention_heatmap,
     plot_attention_structure,
+    plot_belief_category_separation,
     plot_belief_spectrum,
     plot_belief_trajectories,
     plot_belief_umap,
@@ -162,17 +163,52 @@ def test_plot_belief_trajectories_saves(tmp_path):
     assert _saved_nonempty(p)
 
 
-def test_plot_belief_umap_saves(tmp_path):
-    M, K = 60, 4
+def _category_bank(M=60, K=4):
     bank = {"mu": torch.randn(M, K), "sigma": torch.rand(M, K) + 0.3, "phi": torch.randn(M, 2),
             "token_ids": torch.randint(0, 5, (M,)), "seq_idx": torch.zeros(M)}
-    labels = torch.randint(0, 3, (M,))
+    fake = {0: " the", 1: ",", 2: " cat", 3: "ing", 4: " 42"}    # function/punct/content/subword/number
+    return bank, (lambda ids: fake.get(int(ids[0]), " x"))
+
+
+def test_plot_belief_umap_per_channel_categories(tmp_path):
+    bank, decode = _category_bank()
     p = tmp_path / "f5.png"
     try:
-        fig = plot_belief_umap(bank, labels=labels, seed=0, path=str(p)); plt.close(fig)
+        fig = plot_belief_umap(bank, "mu", decode=decode, n_label=3, seed=0, path=str(p)); plt.close(fig)
     except (ImportError, OSError) as exc:
         pytest.skip(f"umap-learn native layer unavailable: {exc}")
     assert _saved_nonempty(p)
+
+
+def test_plot_belief_umap_fallback_no_decode(tmp_path):
+    bank, _ = _category_bank(M=40)
+    p = tmp_path / "f5b.png"
+    try:
+        fig = plot_belief_umap(bank, "phi", decode=None, seed=0, path=str(p)); plt.close(fig)
+    except (ImportError, OSError) as exc:
+        pytest.skip(f"umap-learn native layer unavailable: {exc}")
+    assert _saved_nonempty(p)
+
+
+def test_plot_belief_category_separation_saves(tmp_path):
+    bank, decode = _category_bank()
+    p = tmp_path / "f5c.png"
+    fig = plot_belief_category_separation(bank, decode=decode, sil_sample=50, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_token_category_helpers():
+    from vfe3.viz.figures import _bpe_category, _funccontent_category
+    assert _bpe_category(",") == 0          # punctuation
+    assert _bpe_category(" 2014") == 1      # number (leading space, all-digit core)
+    assert _bpe_category(" cat") == 2       # word-start lowercase
+    assert _bpe_category(" Cat") == 3       # word-start Capitalized
+    assert _bpe_category("ing") == 4        # continuation subword
+    assert _bpe_category(" ") == 5          # whitespace/other
+    assert _funccontent_category(" the") == 2   # function word
+    assert _funccontent_category(" cat") == 3   # content word
+    assert _funccontent_category(".") == 0      # punctuation
+    assert _funccontent_category("42") == 1     # number
 
 
 def test_plot_gauge_equivariance_saves(tmp_path):
