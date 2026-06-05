@@ -95,14 +95,22 @@ def plot_embedding(
 def clustering_metrics(
     features,                            # (N, D)
     labels,                              # (N,) cluster/class labels
+
+    *,
+    sample_size: Optional[int] = None,   # cap silhouette's O(N^2) pairwise pass (None = full)
+    seed:        int           = 0,
 ) -> Dict[str, float]:
-    """Unsupervised cluster quality of ``features`` under ``labels``: silhouette + CH index."""
+    """Unsupervised cluster quality of ``features`` under ``labels``: silhouette + CH index.
+
+    ``sample_size`` subsamples the silhouette computation (its pairwise distance is O(N^2)), keeping
+    it fast when many points / many label sets are scored; CH is O(N) so it always uses all points."""
     from sklearn.metrics import calinski_harabasz_score, silhouette_score
     X = _np(features); y = _np(labels)
     if len(set(y.tolist())) < 2:
         return {"silhouette": float("nan"), "calinski_harabasz": float("nan")}
+    ss = sample_size if (sample_size is not None and sample_size < X.shape[0]) else None
     return {
-        "silhouette":        float(silhouette_score(X, y)),
+        "silhouette":        float(silhouette_score(X, y, sample_size=ss, random_state=seed)),
         "calinski_harabasz": float(calinski_harabasz_score(X, y)),
     }
 
@@ -551,42 +559,196 @@ def plot_belief_trajectories(
     return _save(fig, path)
 
 
+# --- linguistic-category labelling of gpt2-BPE tokens (colour + legend for the belief UMAP) -----
+
+# A compact English function-word (stopword) set for the function/content taxonomy. Matched on the
+# stripped, lower-cased decoded token, so a BPE word-start (" the") and a bare token ("the") both hit.
+_STOPWORDS = frozenset((
+    "a an the this that these those some any all each every no none "
+    "i you he she it we they me him her us them my your his its our their mine yours hers ours theirs "
+    "is are was were be been being am do does did doing have has had having "
+    "will would shall should can could may might must ought "
+    "of in on at by for with about against between into through during before after "
+    "above below to from up down out off over under again further then once here there "
+    "and or but nor so yet because as if while although though unless until than "
+    "not only own same too very just more most other such "
+    "what which who whom whose where when why how "
+    "s t re ve ll d m"                                       # common BPE contraction fragments
+).split())
+
+_BPE_CAT_NAMES  = ["punctuation", "number", "word (lc)", "word (Cap)", "subword", "space/other"]
+_FUNC_CAT_NAMES = ["punctuation", "number", "function", "content", "other"]
+
+
+def _bpe_category(text: str) -> int:
+    r"""Index into ``_BPE_CAT_NAMES`` from a decoded gpt2 token's STRUCTURE.
+
+    Leverages BPE structure: a leading space marks a word-start, its absence a continuation subword
+    (e.g. ``ing``). Categories: punctuation/symbol (no letters), number (all-digit), word-start
+    lower-case, word-start Capitalized, continuation subword, whitespace/other.
+    """
+    if not text or text.isspace():
+        return 5
+    core = text.strip()
+    if not core:
+        return 5
+    if core.isdigit():
+        return 1
+    if not any(c.isalpha() for c in core):
+        return 0
+    if text[:1] == " ":                                      # leading space -> a new word starts here
+        return 3 if core[:1].isupper() else 2
+    return 4                                                 # no leading space + letters -> subword piece
+
+
+def _funccontent_category(text: str) -> int:
+    r"""Index into ``_FUNC_CAT_NAMES``: punctuation, number, function-word, content-word, or other.
+
+    Linguistic split on the stripped lower-cased token: a purely-alphabetic token is a FUNCTION word
+    if it is in ``_STOPWORDS`` else a CONTENT word; non-alphabetic tokens fall to punctuation / number
+    / other.
+    """
+    core = text.strip().lower()
+    if not core:
+        return 4
+    if core.isdigit():
+        return 1
+    if not any(c.isalpha() for c in core):
+        return 0
+    if not core.isalpha():
+        return 4
+    return 2 if core in _STOPWORDS else 3
+
+
+def _token_category_labels(
+    token_ids: object,                   # (M,) token ids
+    decode:    object,                   # decode(list[int]) -> str (e.g. the gpt2 tiktoken decoder)
+    taxonomy:  str,                      # 'bpe' or 'function_content'
+) -> tuple:                              # (labels (M,) int, names list[str])
+    r"""Per-token category index under ``taxonomy`` (each unique id decoded + classified once)."""
+    if taxonomy == "bpe":
+        fn, names = _bpe_category, _BPE_CAT_NAMES
+    elif taxonomy == "function_content":
+        fn, names = _funccontent_category, _FUNC_CAT_NAMES
+    else:
+        raise ValueError(f"unknown taxonomy {taxonomy!r} (expected 'bpe' / 'function_content')")
+    ids = _np(token_ids).astype(int)
+    cat = {int(t): fn(decode([int(t)])) for t in np.unique(ids)}
+    return np.array([cat[int(t)] for t in ids]), names
+
+
+def _scatter_by_category(ax, coords: np.ndarray, labels, names) -> None:
+    r"""Scatter ``coords`` coloured by integer ``labels`` with a per-category legend (count shown).
+
+    ``labels is None`` (no decoder available) degrades to a single-colour scatter and no legend."""
+    if labels is None:
+        ax.scatter(coords[:, 0], coords[:, 1], s=10, alpha=0.5, color="#999999", linewidths=0)
+        return
+    for idx, name in enumerate(names):
+        m = labels == idx
+        if not m.any():
+            continue
+        ax.scatter(coords[m, 0], coords[m, 1], s=12, alpha=0.6, linewidths=0,
+                   color=_CB[idx % len(_CB)], label=f"{name} ({int(m.sum())})")
+    ax.legend(fontsize=6.5, frameon=False, markerscale=1.6, loc="best")
+
+
+def _annotate_frequent_tokens(ax, coords: np.ndarray, token_ids: np.ndarray, decode, n_label: int) -> None:
+    r"""Mark + label the ``n_label`` most frequent tokens at the CENTROID of their occurrences."""
+    if n_label <= 0:
+        return
+    uniq, counts = np.unique(token_ids, return_counts=True)
+    for t in uniq[np.argsort(counts)[::-1][:n_label]]:
+        m = token_ids == t
+        cx, cy = float(coords[m, 0].mean()), float(coords[m, 1].mean())
+        txt = (decode([int(t)]).strip() if decode is not None else str(int(t))) or "·"
+        ax.scatter([cx], [cy], s=45, marker="*", facecolor="white", edgecolor="black",
+                   linewidths=0.8, zorder=5)
+        ax.annotate(txt, (cx, cy), fontsize=8, fontweight="bold", zorder=6,
+                    xytext=(3, 3), textcoords="offset points",
+                    bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.7))
+
+
 @register_figure("belief_umap")
 def plot_belief_umap(
-    bank:     Dict,                      # belief_bank output: mu, sigma, phi, token_ids, seq_idx
+    bank:       Dict,                    # belief_bank output: mu, sigma, phi, token_ids, seq_idx
+    channel:    str = "mu",              # which belief channel to embed: 'mu' / 'sigma' / 'phi'
 
     *,
-    labels:   Optional[object] = None,   # (M,) colour labels (token id / frequency / POS)
-    channels: tuple            = ("mu", "sigma", "phi"),
-    seed:     int              = 0,
-    path:     Optional[str]    = None,
+    decode:     Optional[object] = None,                       # decode(list[int]) -> str; None -> no categories
+    taxonomies: tuple            = ("bpe", "function_content"),
+    n_label:    int              = 10,
+    seed:       int              = 0,
+    sil_sample: int              = 2000,
+    path:       Optional[str]    = None,
 ):
-    r"""F5: UMAP semantic clustering of converged beliefs -- the mu / Sigma / phi triptych.
+    r"""F5: UMAP of one belief channel, coloured by linguistic token category, with labelled words.
 
-    One UMAP panel per belief channel, each embedded faithfully to its geometry (mu Euclidean,
-    Sigma in the log-Euclidean chart, phi in the gauge coordinates) and coloured by ``labels``;
-    silhouette and Calinski-Harabasz are computed in the channel's NATIVE space (not the 2-D
-    projection) to avoid the projection artifact. The mu panel sizes markers by the Fisher trace
-    so confident beliefs render solid. Surfaces what content (mu), uncertainty (Sigma), and gauge
-    (phi) each encode.
+    ONE figure per channel (the caller emits mu / sigma / phi separately). The channel is embedded
+    faithfully to its geometry (mu Euclidean, Sigma in the log-Euclidean chart, phi in the gauge
+    coordinates), and the SAME 2-D embedding is shown once per taxonomy: a BPE-structure panel and a
+    function/content panel, each coloured by category with a legend. The ``n_label`` most frequent
+    tokens are decoded and annotated at their occurrence-centroid. Each panel title reports the
+    silhouette + Calinski-Harabasz of the CATEGORY labels in the channel's NATIVE space, so the number
+    measures how strongly the channel separates that linguistic taxonomy (not an arbitrary token id).
+    With ``decode is None`` (no tokenizer) it degrades to a single-colour scatter with the same labels.
     """
-    from vfe3 import metrics
-    lab = None if labels is None else _np(labels)
-    sizes_mu = _np(metrics.fisher_trace(bank["sigma"]))
-    sizes_mu = 6 + 24 * (sizes_mu - sizes_mu.min()) / (np.ptp(sizes_mu) + 1e-12)
-    fig, axes = plt.subplots(1, len(channels), figsize=(4.6 * len(channels), 4.2), squeeze=False)
-    for ax, ch in zip(axes[0], channels):
-        feats = _belief_channel_features(bank, ch)
-        coords = umap_embed(feats, seed=seed)
-        s = sizes_mu if ch == "mu" else 12
-        kw = {"c": lab, "cmap": "tab10"} if lab is not None else {"color": _CB[0]}
-        ax.scatter(coords[:, 0], coords[:, 1], s=s, alpha=0.7, linewidths=0, **kw)
-        title = ch
-        if lab is not None:
-            cm = clustering_metrics(_np(feats), lab)
-            title = f"{ch}  (sil {cm['silhouette']:.2f}, CH {cm['calinski_harabasz']:.0f})"
+    feats = _belief_channel_features(bank, channel)
+    fnp = _np(feats)
+    coords = umap_embed(feats, seed=seed)
+    token_ids = _np(bank["token_ids"]).astype(int)
+    fig, axes = plt.subplots(1, len(taxonomies), figsize=(6.4 * len(taxonomies), 5.4), squeeze=False)
+    for ax, tax in zip(axes[0], taxonomies):
+        labels, names = (None, None) if decode is None else _token_category_labels(token_ids, decode, tax)
+        _scatter_by_category(ax, coords, labels, names)
+        _annotate_frequent_tokens(ax, coords, token_ids, decode, n_label)
+        title = f"{channel} · {tax.replace('_', '/')}"
+        if labels is not None:
+            cm = clustering_metrics(fnp, labels, sample_size=sil_sample)
+            title += f"  (sil {cm['silhouette']:.2f}, CH {cm['calinski_harabasz']:.0f})"
         ax.set(xlabel="UMAP 1", ylabel="UMAP 2", title=title)
-    fig.suptitle("Belief semantic clustering (native-space scores)")
+    fig.suptitle(f"Belief semantic clustering — {channel} (colour = linguistic category)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("belief_category_separation")
+def plot_belief_category_separation(
+    bank:       Dict,                    # belief_bank output
+
+    *,
+    decode:     Optional[object] = None,
+    channels:   tuple            = ("mu", "sigma", "phi"),
+    taxonomies: tuple            = ("bpe", "function_content"),
+    sil_sample: int              = 2000,
+    path:       Optional[str]    = None,
+):
+    r"""F5 (companion): how strongly each belief channel is organized by each linguistic taxonomy.
+
+    Grouped bars of the native-space silhouette of the category labels, per channel (mu / Sigma / phi)
+    and taxonomy (BPE structure / function-content). A bar near zero means that channel does not
+    separate that taxonomy; higher means the linguistic category is geometrically encoded. The
+    quantitative companion to the per-channel UMAP scatters. Empty (NaN) bars when ``decode is None``.
+    """
+    token_ids = _np(bank["token_ids"]).astype(int)
+    x = np.arange(len(channels))
+    width = 0.8 / max(len(taxonomies), 1)
+    fig, ax = plt.subplots(figsize=(6.6, 4.2))
+    for j, tax in enumerate(taxonomies):
+        sils = []
+        for ch in channels:
+            if decode is None:
+                sils.append(float("nan"))
+                continue
+            labels, _ = _token_category_labels(token_ids, decode, tax)
+            sils.append(clustering_metrics(_np(_belief_channel_features(bank, ch)),
+                                           labels, sample_size=sil_sample)["silhouette"])
+        ax.bar(x + (j - (len(taxonomies) - 1) / 2) * width, sils, width=width,
+               color=_CB[j % len(_CB)], label=tax.replace("_", "/"))
+    ax.axhline(0.0, color="#444444", lw=0.8)
+    ax.set(xticks=x, xticklabels=list(channels), ylabel="silhouette (native space)",
+           title="Belief organization by linguistic category")
+    ax.legend(fontsize=8, frameon=False, title="taxonomy")
     fig.tight_layout()
     return _save(fig, path)
 

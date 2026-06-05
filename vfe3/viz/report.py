@@ -147,6 +147,15 @@ def generate_figures(
     amaps       = _safe(lambda: model.attention_maps(tok), "attention_maps")
     health      = _safe(lambda: extract.numerical_health(model, tok), "numerical_health")
 
+    # gpt2/cl100k decoder for the belief-UMAP linguistic-category colouring + token labels (None when
+    # tiktoken is absent or the dataset has no real tokenizer -> the UMAP greys out and labels by id).
+    decode = None
+    try:
+        from vfe3.data.datasets import get_tiktoken_decoder
+        decode = get_tiktoken_decoder(dataset)
+    except Exception as exc:
+        logger.warning("token decoder unavailable (%s); belief UMAP will grey out", exc)
+
     written: List[Path] = []
 
     def _emit(name: str, thunk: Callable[[str], object], available: bool) -> None:
@@ -169,8 +178,12 @@ def generate_figures(
     _emit("belief_trajectories",
           lambda p: figs.plot_belief_trajectories(trace, layer_trace, path=p),
           trace is not None)
-    _emit("belief_umap",
-          lambda p: figs.plot_belief_umap(bank, labels=bank["token_ids"], path=p),
+    for ch in ("mu", "sigma", "phi"):                                 # one UMAP file per belief channel
+        _emit(f"belief_umap_{ch}",
+              lambda p, ch=ch: figs.plot_belief_umap(bank, ch, decode=decode, path=p),
+              bank is not None)
+    _emit("belief_category_separation",
+          lambda p: figs.plot_belief_category_separation(bank, decode=decode, path=p),
           bank is not None)
     _emit("attention_structure",
           lambda p: figs.plot_attention_structure(amaps, path=p),
@@ -204,5 +217,5 @@ def generate_figures(
               causal=(metrics.causal_sanity(amaps) if amaps is not None else None), path=p),
           cstate is not None)
 
-    logger.info("wrote %d/%d single-run figures to %s", len(written), 10, figdir)
+    logger.info("wrote %d single-run figures to %s", len(written), figdir)
     return written
