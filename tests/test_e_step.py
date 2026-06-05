@@ -51,6 +51,29 @@ def test_filtered_free_energy_tracks_the_current_query_frame():
     assert not torch.allclose(F1, F2, atol=1e-5)
 
 
+def test_free_energy_value_global_honors_transport_mode():
+    # The global (keys=None) F-trajectory diagnostic must build Omega under the ACTIVE transport
+    # regime: under regime_ii with a nonzero learned connection it must DIFFER from the flat F
+    # (the bug always used flat transport, so the regime_ii F-trajectory was a flat diagnostic).
+    b, mu_p, sigma_p, grp = _belief()
+    n_gen = grp.generators.shape[0]
+    K = b.mu.shape[1]
+    W = 0.5 * torch.randn(n_gen, K, K, generator=torch.Generator().manual_seed(1))  # nonzero -> regime_ii != flat
+    F_flat = free_energy_value(b, mu_p, sigma_p, grp, tau=1.5, transport_mode="flat")
+    F_r2 = free_energy_value(b, mu_p, sigma_p, grp, tau=1.5,
+                             transport_mode="regime_ii", connection_W=W, cocycle_relaxation=1.0)
+    assert torch.isfinite(F_r2)
+    assert not torch.allclose(F_flat, F_r2, atol=1e-5)
+
+
+def test_free_energy_value_filtered_rejects_non_flat_transport():
+    # The filtered (frozen-keys) F has no non-flat transport form; a non-flat mode must RAISE rather
+    # than silently logging a flat-transport filtered F.
+    b, mu_p, sigma_p, grp = _belief()
+    with pytest.raises(NotImplementedError):
+        free_energy_value(b, mu_p, sigma_p, grp, tau=1.5, keys=b, transport_mode="regime_ii")
+
+
 # --- Task 2: one inner iteration -------------------------------------------
 from vfe3.inference.e_step import e_step_iteration
 

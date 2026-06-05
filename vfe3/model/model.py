@@ -621,12 +621,14 @@ class VFEModel(nn.Module):
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         _llb = getattr(self, "log_lambda_beta", None)
+        rope = self._rope_rotation(n, token_ids.device)               # rope shapes the converged belief (as forward)
         out = vfe_stack(                                              # converged belief
             belief, belief.mu, belief.sigma, self.group, cfg,
             log_prior=log_prior, block_norm=self.block_norm,
             log_alpha=getattr(self, "log_alpha", None),               # learned scalar (None on the pure path)
             lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
+            rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
         )
 
         rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
@@ -639,7 +641,7 @@ class VFEModel(nn.Module):
         # Match the forward's transport regime so holonomy_deviation reads the ACTUAL connection
         # (flat -> ~0; regime_ii with a trained connection_W -> the non-trivial holonomy). regime_ii
         # reads the converged means out.mu and the learned connection_W; flat ignores both.
-        rope = self._rope_rotation(n, token_ids.device)
+        # (rope was computed above and now also shaped the converged belief.)
         omega = _transport(                                          # (N, N, K, K)
             out.phi, self.group, transport_mode=cfg.transport_mode,
             mu=(out.mu if cfg.transport_mode == "regime_ii" else None),
@@ -734,6 +736,7 @@ class VFEModel(nn.Module):
                 log_alpha=getattr(self, "log_alpha", None),
                 lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
+                rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
             )
             # Attention at the converged belief, recomputed exactly as diagnostics does: the
             # transport regime is matched so regime_ii reads the means + learned connection_W

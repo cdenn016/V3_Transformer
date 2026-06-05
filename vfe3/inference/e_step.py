@@ -176,20 +176,40 @@ def free_energy_value(
                   + Sum_j beta_ij E_ij + tau Sum_j beta_ij log(beta_ij/pi_ij) ],
         E_ij = D(q_i || Omega_ij q_j),  beta = softmax_j(log_prior - E/tau).
 
-    The iteration-only knobs (gradient_mode, phi_precond_mode, phi_retract_mode,
-    spd_retract_mode, transport_mode, cocycle_relaxation, connection_W, sigma_max, e_sigma_q_trust)
-    are declared here as EXPLICIT accept-and-ignore parameters (not a blanket ``**kwargs`` sink) so the
-    common ``e_step`` call site may forward one knob bag to both this and ``e_step_iteration`` while a
-    MISSPELLED real parameter still raises ``TypeError`` here instead of being silently swallowed. NOTE:
-    the trajectory-diagnostic F here always uses the FLAT transport (its internal ``_transport`` omits
-    transport_mode), so under regime_ii the logged F-trajectory is a flat-transport diagnostic, not the
-    regime_ii objective -- wiring it is out of scope (matches log_alpha, also not threaded here).
+    The step-size / E-step-only knobs (gradient_mode, phi_precond_mode, phi_retract_mode,
+    spd_retract_mode, sigma_max, e_sigma_q_trust) are declared here as EXPLICIT accept-and-ignore
+    parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may forward one knob
+    bag to both this and ``e_step_iteration`` while a MISSPELLED real parameter still raises
+    ``TypeError`` here instead of being silently swallowed. ``transport_mode`` / ``connection_W`` /
+    ``cocycle_relaxation`` ARE honored for the global (``keys=None``) F so the logged trajectory matches
+    the objective the beliefs descend under regime_ii; the filtered (frozen-keys) F has no non-flat
+    transport form and raises under a non-flat ``transport_mode``. ``log_alpha`` is also honored (it
+    flows into ``self_coupling_alpha`` below). NOTE: ``rope`` is not threaded here, so under gauge-RoPE
+    the logged F omits the rotation -- a known diagnostic gap, not the model path.
     """
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
     # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
     # and the transported key beliefs come from `keys`; only the key side is frozen.
     key_belief = belief if keys is None else keys
-    omega = _transport(belief.phi, group) if keys is None else _transport_qk(belief.phi, keys.phi, group)
+    if keys is None:
+        # Build Omega under the ACTIVE connection regime so the logged global F matches the objective
+        # the beliefs actually descend (regime_ii reads the means + learned connection_W; flat ignores
+        # both). Previously this always used flat transport, so under regime_ii the trajectory was a
+        # flat-transport diagnostic, not the regime_ii objective.
+        omega = _transport(
+            belief.phi, group, transport_mode=transport_mode,
+            mu=(belief.mu if transport_mode == "regime_ii" else None),
+            connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
+        )
+    else:
+        # The filtered (mixed current-query / frozen-key frame) transport has no regime_ii form;
+        # reject a non-flat mode rather than silently logging a flat-transport filtered F.
+        if transport_mode != "flat":
+            raise NotImplementedError(
+                f"free_energy_value with frozen keys is flat-only; got transport_mode="
+                f"{transport_mode!r} (the filtered diagnostic has no non-flat transport form)"
+            )
+        omega = _transport_qk(belief.phi, keys.phi, group)
     mu_t = transport_mean(omega.unsqueeze(0), key_belief.mu.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), key_belief.sigma.unsqueeze(0))[0]
 
