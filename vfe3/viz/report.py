@@ -39,15 +39,26 @@ def _load_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
     return VFE3Config(**data["config"]), data.get("dataset", "")
 
 
+def _synthetic_loader(cfg: VFE3Config):
+    r"""A tiny period-3 fallback loader (kept inline so the driver never imports the click-to-run
+    ``train_vfe3.py``, whose ``synthetic_period3_loader`` lives outside the package)."""
+    from torch.utils.data import DataLoader
+    from vfe3.data.datasets import TokenWindows
+    base = torch.arange(3).repeat(600 // 3 + 2)[:600].long()      # {0,1,2} period-3 stream
+    ds = TokenWindows(base, cfg.max_seq_len)
+    return DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, drop_last=True)
+
+
 def _build_loader(dataset: str, cfg: VFE3Config, split: str):
     r"""A stable (unshuffled) loader for ``dataset``/``split``; synthetic fallback when uncached."""
-    from vfe3.data.datasets import make_dataloader, synthetic_period3_loader
-    if not dataset or dataset == "synthetic-period3":
-        return synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
-    try:
-        return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size, shuffle=False)
-    except FileNotFoundError:
-        return synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
+    from vfe3.data.datasets import make_dataloader
+    if dataset and dataset != "synthetic-period3":
+        try:
+            return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
+                                   shuffle=False, drop_last=False)
+        except FileNotFoundError:
+            pass
+    return _synthetic_loader(cfg)
 
 
 def _collect_token_batches(

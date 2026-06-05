@@ -24,6 +24,7 @@ survive a viz problem.
 import csv
 import json
 import logging
+import math
 from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType
@@ -220,6 +221,17 @@ def finalize_run(
     })
 
     _save_figures(artifacts, losses, logger)
+    # Single-run publication figure set (model-replay), auto-run at the end of training unless
+    # cfg.generate_figures is False. Best-effort and off the hot path -- the runners are expensive
+    # (UMAP, E-step replay, holonomy sampling, a belief bank over many sequences), so a failure is
+    # logged and never disturbs the saved numeric results. Drives the BEST-val model reloaded above.
+    if getattr(cfg, "generate_figures", True):
+        try:
+            from vfe3.viz.report import generate_figures
+            generate_figures(artifacts.run_dir, model=model, loader=test_loader,
+                             device=device, logger=logger)
+        except Exception as exc:
+            logger.warning("publication figure generation failed (%s); numeric results are saved", exc)
     return results
 
 
@@ -236,7 +248,8 @@ def _save_figures(
             fig = figs.plot_trajectory(losses, ylabel="train CE (nats)", title="Training loss",
                                        path=str(artifacts.run_dir / "loss_curve.png"))
             figs.plt.close(fig)
-        val_ppl = [r["val_ppl"] for r in artifacts.history if "val_ppl" in r]
+        val_ppl = [r["val_ppl"] for r in artifacts.history
+                   if "val_ppl" in r and math.isfinite(r["val_ppl"])]   # skip pre-first-eval NaNs
         if val_ppl:
             fig = figs.plot_trajectory(val_ppl, ylabel="val PPL", title="Validation perplexity",
                                        path=str(artifacts.run_dir / "val_ppl.png"))
@@ -268,7 +281,10 @@ def _save_figures(
         # total -- the figure the single bar above cannot draw (no time axis, no data term). Best-effort
         # like the rest; needs the per-eval term history (a dense-eval run gives a real trajectory).
         fe_keys = ("self_coupling", "belief_coupling", "attention_entropy", "val_ce")
-        fe_rows = [r for r in artifacts.history if all(k in r for k in fe_keys)]
+        # Require every plotted term FINITE: with the log-cadence CSV, val_* is NaN on rows before
+        # the first eval, and stacking a NaN data term would break the figure.
+        fe_rows = [r for r in artifacts.history
+                   if all(k in r and math.isfinite(r[k]) for k in fe_keys)]
         if fe_rows:
             cfg = getattr(artifacts, "cfg", None)
             hist = {"step": [r.get("step", i) for i, r in enumerate(fe_rows)],
