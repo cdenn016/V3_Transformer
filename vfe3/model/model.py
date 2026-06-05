@@ -486,7 +486,7 @@ class VFEModel(nn.Module):
             # uses. The mean over (B, H, N) makes gamma_coupling=1 a per-token-per-head mean weight, not
             # the canonical sum-over-ij.
             from vfe3.families.gaussian import DiagonalGaussian
-            from vfe3.free_energy import pairwise_energy, reduced_free_energy
+            from vfe3.free_energy import attention_tau, pairwise_energy, reduced_free_energy
             from vfe3.geometry.transport import (
                 compute_transport_operators,
                 transport_covariance,
@@ -503,11 +503,17 @@ class VFEModel(nn.Module):
                 DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(s_mu_t, s_sigma_t),
                 alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
-            )                                                            # (B, H, N, N)
+            )                                                            # (B,H,N,N) block_glk; (B,N,N) single-block
             gamma_log_prior = self._attention_log_prior(
                 n_pos, token_ids.device, prior=cfg.gamma_attention_prior,
             )                                                            # (N, N), cached buffer
-            f_red_s = reduced_free_energy(e_s, tau=cfg.tau_gamma, log_prior=gamma_log_prior)   # (B, H, N)
+            # Group-aware temperature: tau spans the dimension the energy accumulates over (the
+            # gauge-irrep block size), exactly as the belief beta channel does. cfg.tau_gamma uses
+            # sqrt(d_head)=sqrt(K/n_heads), which is correct only for block_glk (irrep_dims=[d_head]*H)
+            # and understates tau by sqrt(n_heads) on a single-block group (irrep_dims=[K], energy over
+            # the full K). kappa_gamma is gamma's own sharpness handle (not cfg.kappa).
+            gamma_tau = attention_tau(cfg.kappa_gamma, self.group.irrep_dims)
+            f_red_s = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior)   # (B,H,N) or (B,N)
             loss = loss + cfg.gamma_coupling * f_red_s.mean()
         return logits, loss, ce.detach()
 

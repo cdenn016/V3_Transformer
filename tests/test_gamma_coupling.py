@@ -44,7 +44,7 @@ import torch
 from vfe3.attention_prior import attention_log_prior
 from vfe3.config import VFE3Config
 from vfe3.families.gaussian import DiagonalGaussian
-from vfe3.free_energy import attention_weights, pairwise_energy, reduced_free_energy
+from vfe3.free_energy import attention_tau, attention_weights, pairwise_energy, reduced_free_energy
 from vfe3.geometry.transport import (
     compute_transport_operators,
     transport_covariance,
@@ -96,7 +96,8 @@ def _gamma_term(model: VFEModel, tokens: torch.Tensor) -> torch.Tensor:
     log_prior = attention_log_prior(
         cfg.gamma_attention_prior, n, n, device=tokens.device, dtype=s_mu.dtype,
     )                                                                    # (N, N)
-    return reduced_free_energy(e_s, tau=cfg.tau_gamma, log_prior=log_prior).mean()
+    gamma_tau = attention_tau(cfg.kappa_gamma, model.group.irrep_dims)   # mirrors the impl (group-aware)
+    return reduced_free_energy(e_s, tau=gamma_tau, log_prior=log_prior).mean()
 
 
 # ---- (1) pure path ---------------------------------------------------------------------------
@@ -196,10 +197,11 @@ def test_gamma_envelope_identity():
     )                                                                    # (B, H, N, N)
     n = tokens.shape[1]
     log_prior = attention_log_prior(cfg.gamma_attention_prior, n, n, dtype=s_mu.dtype)
-    reduced = reduced_free_energy(e_s, tau=cfg.tau_gamma, log_prior=log_prior)             # (B, H, N)
-    gamma = attention_weights(e_s, tau=cfg.tau_gamma, log_prior=log_prior)                 # (B, H, N, N)
+    gamma_tau = attention_tau(cfg.kappa_gamma, model.group.irrep_dims)   # mirrors the impl (group-aware)
+    reduced = reduced_free_energy(e_s, tau=gamma_tau, log_prior=log_prior)                 # (B, H, N)
+    gamma = attention_weights(e_s, tau=gamma_tau, log_prior=log_prior)                     # (B, H, N, N)
     pi = torch.softmax(log_prior, dim=-1)
-    explicit = (gamma * e_s).sum(-1) + cfg.tau_gamma * (
+    explicit = (gamma * e_s).sum(-1) + gamma_tau * (
         gamma * (torch.log(gamma.clamp(min=1e-12)) - torch.log(pi.clamp(min=1e-12)))
     ).sum(-1)
     assert torch.allclose(reduced, explicit, atol=1e-5)
@@ -285,3 +287,62 @@ def test_gamma_energy_equals_analytic_kl_at_nonzero_phi():
     analytic = 0.5 * (sig0 / sig1_eff + (mu1_eff - mu0) ** 2 / sig1_eff - 1.0
                       + torch.log(sig1_eff / sig0)).sum()   # KL(N(mu0,sig0) || N(mu1_eff,sig1_eff))
     assert torch.allclose(e_s[0, 0, 1], analytic, atol=1e-5)
+
+
+# ---- (10) gamma temperature is group-aware: sqrt(K) on a SINGLE-BLOCK group, not sqrt(d_head) ----
+
+def test_gamma_tau_is_group_aware_for_single_block_group():
+    r"""The gamma model-coupling softmax temperature must span the SAME dimension its energy
+    accumulates over (the rule encoded in free_energy.attention_tau). For a SINGLE-BLOCK group
+    (glk reports irrep_dims=[K]) the per-pair energy E^s_ij = D(s_i||Omega_ij s_j) accumulates over
+    the FULL K, so tau = kappa_gamma*sqrt(K) -- NOT kappa_gamma*sqrt(d_head) = kappa_gamma*sqrt(K/n_heads).
+    The belief beta channel already uses attention_tau everywhere; only the gamma channel used the
+    scalar cfg.tau_gamma (sqrt(d_head)), which understates the temperature by sqrt(n_heads) on a
+    single-block group. This pins the gamma term against an INDEPENDENT oracle whose tau is the literal
+    kappa_gamma*sqrt(K) (NOT a call to attention_tau), on glk with n_heads=2 (where sqrt(d_head) != sqrt(K)),
+    so it fails against the sqrt(d_head) bug and passes only for the group-aware temperature."""
+    w = 0.5
+    K = 4                                                    # embed_dim; glk single block of size K
+    base = dict(
+        vocab_size=20, embed_dim=K, n_heads=2, gauge_group="glk", max_seq_len=5, n_layers=1,
+        n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0, mstep_self_coupling_weight=0.0,
+        lambda_h=0.0, kappa_gamma=1.0, gamma_attention_prior="causal", pos_phi="none", seed=0,
+    )
+    torch.manual_seed(0); model_0 = VFEModel(VFE3Config(gamma_coupling=0.0, **base))
+    torch.manual_seed(0); model_w = VFEModel(VFE3Config(gamma_coupling=w,   **base))
+    assert model_w.group.irrep_dims == [K]                  # single block: d_energy = K, d_head = K // 2
+    # belief tables byte-identical (s tables drawn LAST), then make s clearly distinct -> non-vacuous term
+    assert torch.equal(model_0.prior_bank.mu_embed, model_w.prior_bank.mu_embed)
+    torch.manual_seed(123)
+    with torch.no_grad():
+        model_w.prior_bank.s_mu_embed.normal_(0.0, 0.5)
+    tokens  = torch.randint(0, 20, (3, 5))
+    targets = torch.randint(0, 20, (3, 5))
+    _, loss_0, _ = model_0(tokens, targets)
+    _, loss_w, _ = model_w(tokens, targets)
+
+    # independent oracle: same recipe as the forward, but tau written as the literal sqrt(K) single-block value
+    cfg = model_w.cfg
+    pb = model_w.prior_bank
+    s_mu, s_sigma = pb.encode_s(tokens)
+    phi = pb.encode(tokens).phi
+    omega = compute_transport_operators(phi.detach(), model_w.group)["Omega"]
+    e_s = pairwise_energy(
+        DiagonalGaussian(s_mu, s_sigma),
+        DiagonalGaussian(transport_mean(omega, s_mu), transport_covariance(omega, s_sigma)),
+        alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+        divergence_family=cfg.divergence_family, irrep_dims=model_w.group.irrep_dims,
+    )
+    n = tokens.shape[1]
+    log_prior = attention_log_prior(cfg.gamma_attention_prior, n, n, dtype=s_mu.dtype)
+    tau_correct = cfg.kappa_gamma * (K ** 0.5)              # literal: single-block energy spans K
+    g = reduced_free_energy(e_s, tau=tau_correct, log_prior=log_prior).mean()
+    assert g > 1e-6                                          # non-vacuous
+    assert torch.allclose(loss_w - loss_0, w * g, atol=1e-6)
+
+    # the buggy sqrt(d_head) temperature genuinely differs here (guards against a coincident fixture)
+    tau_bug = cfg.kappa_gamma * (cfg.d_head ** 0.5)         # = sqrt(2) != sqrt(4)
+    g_bug = reduced_free_energy(e_s, tau=tau_bug, log_prior=log_prior).mean()
+    assert not torch.allclose(g, g_bug, atol=1e-6)
+    # the group-aware temperature equals the literal (sanity: attention_tau over [K] is sqrt(K))
+    assert math.isclose(attention_tau(cfg.kappa_gamma, model_w.group.irrep_dims), tau_correct)
