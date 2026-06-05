@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows, make_dataloader
+from vfe3.free_energy import attention_tau
 from vfe3.train import evaluate, train
 
 
@@ -58,8 +59,8 @@ config = dict(
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 32,
-    max_steps                 = 30000,
+    batch_size                = 64,
+    max_steps                 = 1000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1,                   # T, E-step inner iterations
@@ -108,8 +109,9 @@ config = dict(
     learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
 
     mass_phi                  = 0.0,                 # (mass_phi/2) ||phi||^2 penalty
-
     mstep_self_coupling_weight = 0.0,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    
+    
     lambda_h                  = 0.0,                 # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
     gamma_coupling            = 0.0,                 # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
     kappa_gamma               = 1.0,                 # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
@@ -121,7 +123,7 @@ config = dict(
     attention_prior           = "causal",            # "uniform" | "causal" | "alibi"
 
     # E-step
-    e_mu_lr                   = 0.9,
+    e_mu_lr                   = 0.7,
     e_sigma_lr                = 0.025,
     e_phi_lr                  = 0.0,
     
@@ -155,11 +157,11 @@ config = dict(
     detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
     grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
 
-    m_mu_lr                   = 0.01,
+    m_mu_lr                   = 0.015,
     m_sigma_lr                = 0.0021,
-    m_phi_lr                  = 0.009,
+    m_phi_lr                  = 0.015,
     
-    weight_decay              = 0.05,
+    weight_decay              = 0.065,
     
     # numerics
     eps                       = 1e-6,
@@ -172,8 +174,8 @@ config = dict(
     warmup_steps              = 100,
     seed                      = SEED,
     
-    log_interval              = 100,                  # console log every N steps (0 = off)
-    eval_interval             = 1000,                   # periodic validation every N steps (0 = off)
+    log_interval              = 200,                  # console log every N steps (0 = off)
+    eval_interval             = 1500,                   # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,                  # save a resumable checkpoint every N steps (0 = off)
     
     
@@ -212,7 +214,8 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int) -> 
         f"group={cfg.gauge_group}  family={cfg.family}",
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         f" M-LRs: mu={cfg.m_mu_lr}  sigma={cfg.m_sigma_lr}  phi={cfg.m_phi_lr}",
-        f" VFE: alpha={cfg.alpha}  kappa={cfg.kappa}  tau={cfg.tau:.4f}  mass_phi={cfg.mass_phi}",
+        f" VFE: alpha={cfg.alpha}  kappa={cfg.kappa}  "
+        f"tau={attention_tau(cfg.kappa, model.group.irrep_dims):.4f}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",
         bar,
     ])
@@ -230,12 +233,18 @@ def _select_loader(
 
     ``MAX_TOKENS`` caps only the train split (smoke runs); the small validation split is
     always read in full. The synthetic anchor ignores ``split`` (its train == val).
+
+    Split-aware loader semantics: only TRAIN shuffles and drops the partial last batch; VALIDATION
+    and TEST read the whole split in deterministic order (shuffle=False, drop_last=False) so the
+    held-out metric is a stable corpus measurement, not a randomly-varying ~97% subset.
     """
+    is_train = (split == "train")
     if dataset == "synthetic-period3":
         return synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
-    cap = MAX_TOKENS if split == "train" else None
+    cap = MAX_TOKENS if is_train else None
     try:
-        return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size, max_tokens=cap)
+        return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
+                               shuffle=is_train, drop_last=is_train, max_tokens=cap)
     except FileNotFoundError:
         logger.warning("cache for %r/%r absent; falling back to synthetic-period3", dataset, split)
         return synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)

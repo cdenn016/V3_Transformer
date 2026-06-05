@@ -338,3 +338,25 @@ def test_rope_defaults_off_and_full_gauge_requires_full_cov():
     # full-gauge with full covariance is allowed
     VFE3Config(pos_rotation="rope", rope_full_gauge=True, diagonal_covariance=False,
                family="gaussian_full", decode_mode="full")
+
+
+def test_gauge_group_validation_reads_registry_not_static_list():
+    r"""Audit F4: a newly registered gauge group must be a valid config value WITHOUT editing
+    config.py (the modularity contract -- add-by-registering). Mirrors transport_mode /
+    spd_retract_mode, which already validate against their registries. RED against the static
+    _VALID_GAUGE_GROUPS tuple."""
+    from vfe3.geometry.groups import _GROUPS, get_group, register_group
+    name = "audit_probe_glk_alias"
+    if name not in _GROUPS:
+        register_group(name)(lambda K, *a, **k: get_group("glk")(K))
+    cfg = VFE3Config(embed_dim=4, n_heads=1, gauge_group=name)
+    assert cfg.gauge_group == name                       # accepted via the registry, not a literal list
+
+
+def test_decode_mode_linear_stays_a_rejected_second_gate():
+    r"""Audit F4 (deliberate NON-change): decode_mode='linear' is reached via use_prior_bank=False,
+    NOT through decode_mode; it must stay rejected as a decode_mode value (intentional second-gate,
+    not a registry oversight). Guards against accidentally opening it when registry-validating the
+    OTHER seams."""
+    with pytest.raises(ValueError):
+        VFE3Config(decode_mode="linear")

@@ -266,3 +266,33 @@ def test_phi_estep_descends_regime_ii_not_flat():
     out_flat = e_step_iteration(belief, mu_p, sigma_p, grp, transport_mode="flat", **kw)
     out_rii = e_step_iteration(belief, mu_p, sigma_p, grp, transport_mode="regime_ii", **kw)
     assert not torch.allclose(out_flat.phi, out_rii.phi, atol=1e-6)
+
+
+def test_regime_ii_edge_factor_breaks_gauge_invariance_for_nonzero_W():
+    r"""Audit F6 (characterization of a documented opt-in impurity): the Regime-II edge factor
+    delta_ij = mu_i^T W^a mu_j is gauge-invariant ONLY at W=0. With phi held fixed (so the vertex
+    factors exp(phi_i), exp(-phi_j) are unchanged), applying a gauge-group element g to the means
+    (mu_i -> g mu_i) leaves Omega unchanged at W=0 (edge factor = I, mu-independent), but for W != 0
+    Omega deviates and the deviation GROWS with ||W|| -- the 'exact at zero init, drifts under
+    training' equivariance break the CLAUDE.md caveat now records (only W=0 is invariant)."""
+    from vfe3.geometry.transport import _build_regime_ii
+
+    K, n_heads = 4, 2
+    phi, mu, grp = _phi_mu(seed=1, B=1, N=3, K=K, group="block_glk", n_heads=n_heads)
+    n_gen = grp.generators.shape[0]
+    g_rng = torch.Generator().manual_seed(7)
+    # a gauge-group element g = exp(sum_a x_a G_a), applied per token: mu_i -> g mu_i
+    x = 0.2 * torch.randn(n_gen, generator=g_rng)
+    g = torch.linalg.matrix_exp(torch.einsum("a,akl->kl", x, grp.generators))
+    mu_g = torch.einsum("kl,bnl->bnk", g, mu)
+
+    def omega(mu_in, W):
+        return _build_regime_ii(phi, grp, mu=mu_in, connection_W=W, cocycle_relaxation=1.0)["Omega"]
+
+    W0 = torch.zeros(n_gen, K, K)
+    assert torch.allclose(omega(mu, W0), omega(mu_g, W0), atol=1e-5)     # W=0: invariant (flat, mu-free)
+
+    W_base = torch.randn(n_gen, K, K, generator=g_rng)
+    devs = [(omega(mu, s * W_base) - omega(mu_g, s * W_base)).norm().item() for s in (0.1, 0.5, 1.0)]
+    assert devs[0] > 1e-4                                                # nonzero W breaks invariance
+    assert devs[0] < devs[1] < devs[2]                                  # break grows with ||W||

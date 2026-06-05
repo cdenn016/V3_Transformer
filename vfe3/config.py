@@ -9,18 +9,21 @@ variant swaps without editing call sites.
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-_VALID_GAUGE_GROUPS        = ("glk", "block_glk", "tied_block_glk", "so_k", "sp")
+# Seams with a live registry (gauge_group, alpha_mode, attention priors, norms; alongside
+# transport/retraction/positional/divergence) are validated against that registry in __post_init__
+# via tuple(sorted(_REGISTRY)), so a newly registered variant is a valid config value WITHOUT
+# editing this validator (the add-by-registering modularity contract). The static tuples below are
+# the seams WITHOUT a registry, plus the two intentional second-gates (encode/decode modes, whose
+# extra members 'gauge_fixed'/'linear' are reached through use_prior_bank / are NotImplementedError
+# stubs, not through these fields).
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
 _VALID_DECODE_MODES        = ("diagonal", "diagonal_chunked", "full")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
-_VALID_ALPHA_MODES         = ("constant", "state_dependent", "state_dependent_per_coord", "learnable")
 _VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback")
 _VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
 _VALID_POS_PHI_COMPOSE     = ("bch", "euclidean")
-_VALID_ATTENTION_PRIORS    = ("uniform", "causal", "alibi")
 _VALID_PRIOR_SOURCES       = ("token", "model_channel")
-_VALID_NORMS               = ("none", "mahalanobis")
 _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
 
 
@@ -313,8 +316,12 @@ class VFE3Config:
                 f"embed_dim={self.embed_dim} must be divisible by n_heads={self.n_heads}"
             )
 
-        # gauge seam
-        _require(self.gauge_group, _VALID_GAUGE_GROUPS, "gauge_group")
+        # gauge seam. Validated against the group REGISTRY (not a hardcoded literal) so a newly
+        # registered group is a valid config value without editing this validator -- the modularity
+        # contract (add-by-registering), matching transport_mode / spd_retract_mode below. Local
+        # import avoids a config <- groups import cycle.
+        from vfe3.geometry.groups import _GROUPS
+        _require(self.gauge_group, tuple(sorted(_GROUPS)), "gauge_group")
         # Sp(2m,R) lives in even dimension K = 2m; reject an odd embed_dim at construction with a
         # clear message rather than letting generate_sp raise mid-build.
         if self.gauge_group == "sp" and self.embed_dim % 2 != 0:
@@ -412,12 +419,18 @@ class VFE3Config:
             raise ValueError(f"gamma_coupling must be >= 0, got {self.gamma_coupling}")
         if self.kappa_gamma <= 0.0:
             raise ValueError(f"kappa_gamma must be > 0, got {self.kappa_gamma}")
-        _require(self.gamma_attention_prior, _VALID_ATTENTION_PRIORS, "gamma_attention_prior")
+        # attention priors validated against the prior REGISTRY (add-by-registering). Local import
+        # avoids a config <- attention_prior cycle; the bound name is reused for attention_prior below.
+        from vfe3.attention_prior import _PRIORS
+        _require(self.gamma_attention_prior, tuple(sorted(_PRIORS)), "gamma_attention_prior")
         _require(self.prior_source, _VALID_PRIOR_SOURCES, "prior_source")
         for name in ("b0", "c0"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
-        _require(self.alpha_mode, _VALID_ALPHA_MODES, "alpha_mode")
+        # alpha_mode validated against the alpha-form REGISTRY (add-by-registering). Local import
+        # avoids a config <- alpha_i cycle.
+        from vfe3.alpha_i import _ALPHAS
+        _require(self.alpha_mode, tuple(sorted(_ALPHAS)), "alpha_mode")
         # A per-coordinate alpha form (state_dependent_per_coord) weights each coordinate's
         # self-divergence by its own alpha^(k), which needs a per-coordinate self-divergence.
         # That decomposition exists only for the diagonal family (full-covariance KL couples
@@ -444,7 +457,7 @@ class VFE3Config:
             )
 
         # attention
-        _require(self.attention_prior, _VALID_ATTENTION_PRIORS, "attention_prior")
+        _require(self.attention_prior, tuple(sorted(_PRIORS)), "attention_prior")
 
         # E-step
         for name in ("e_mu_lr", "e_sigma_lr", "e_phi_lr"):
@@ -562,9 +575,12 @@ class VFE3Config:
         if not (0.0 <= self.cocycle_relaxation <= 1.0):
             raise ValueError(f"cocycle_relaxation must be in [0,1], got {self.cocycle_relaxation}")
 
-        # normalization
-        _require(self.norm_type_block, _VALID_NORMS, "norm_type_block")
-        _require(self.norm_type_final, _VALID_NORMS, "norm_type_final")
+        # normalization validated against the norm REGISTRY (add-by-registering). Local import
+        # avoids a config <- norms cycle.
+        from vfe3.geometry.norms import _NORMS
+        _valid_norms = tuple(sorted(_NORMS))
+        _require(self.norm_type_block, _valid_norms, "norm_type_block")
+        _require(self.norm_type_final, _valid_norms, "norm_type_final")
 
         # M-step / training
         # e_step_gradient selects the E-step backward estimator (unroll | straight_through |

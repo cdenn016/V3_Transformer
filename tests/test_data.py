@@ -75,3 +75,28 @@ def test_load_real_wikitext2_if_present():
     ds = TokenWindows(toks, seq_len=16)
     x, y = ds[0]
     assert x.shape == (16,) and y.shape == (16,)
+
+
+def test_make_dataloader_eval_keeps_tail_and_is_sequential(monkeypatch):
+    r"""Audit F1: an eval loader (shuffle=False, drop_last=False) must read the WHOLE split in a
+    deterministic order, while the train loader (defaults shuffle=True, drop_last=True) drops the
+    partial last batch. RED against the old make_dataloader, which had no drop_last param and
+    hardcoded drop_last=True for every split."""
+    from torch.utils.data import RandomSampler, SequentialSampler
+
+    import vfe3.data.datasets as dsmod
+
+    monkeypatch.setattr(dsmod, "load_cached_tokens", lambda *a, **k: torch.arange(30))
+    seq_len, batch_size = 4, 3                       # 30 tokens -> 7 windows; 7 % 3 = 1 (partial tail)
+
+    val = dsmod.make_dataloader("ds", "validation", seq_len, batch_size, shuffle=False, drop_last=False)
+    n_full = len(val.dataset)
+    assert n_full % batch_size != 0                  # precondition: there IS a partial tail
+    assert val.drop_last is False
+    assert isinstance(val.sampler, SequentialSampler)
+    assert sum(b[0].shape[0] for b in val) == n_full                       # tail kept
+
+    train = dsmod.make_dataloader("ds", "train", seq_len, batch_size)       # defaults: shuffle, drop_last
+    assert train.drop_last is True
+    assert isinstance(train.sampler, RandomSampler)
+    assert sum(b[0].shape[0] for b in train) == n_full - (n_full % batch_size)   # tail dropped
