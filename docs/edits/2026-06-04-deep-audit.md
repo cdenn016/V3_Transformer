@@ -31,3 +31,33 @@ overwrites, int/float spellings stay distinct, corrupt markers are skipped, `_pl
 never raises). An end-to-end synthetic smoke (two `main()` runs, `kappa=[1,2]` then `[2,3]`)
 confirmed the contiguous flow produces 3 accumulated points (the overlapping `2.0` cached, not
 duplicated) plus both figures; the throwaway smoke script and its temp output dir were removed.
+
+## Audit Report Resave
+
+Resaved `docs/audits/audit-2026-06-04.md` as `docs/audits/audit-new.md` at the user's request.
+
+## Fix: per-coordinate alpha rejects non-Renyi functional at construction (prior audit M1)
+
+Addressed the one confirmed finding of the prior `docs/audits/audit-2026-06-04.md` (M1). The config
+already rejected `state_dependent_per_coord` alpha paired with a full-covariance family
+(`vfe3/config.py`, the covariance guard), but it accepted the same per-coordinate alpha paired with a
+non-Renyi `divergence_family` (e.g. `squared_hellinger`); the construction succeeded and only crashed at
+the first forward, where `free_energy.self_divergence_per_coord` raises because the per-coordinate
+self-divergence is registered only for the Renyi functional (KL = Renyi at alpha=1).
+
+Added a construction guard directly after the covariance guard that mirrors the runtime raise:
+`if alpha_is_per_coord(self.alpha_mode) and self.divergence_family != "renyi": raise ValueError(...)`.
+It uses the `alpha_is_per_coord` registry helper (so any future per-coordinate alpha form is covered
+without editing here) and the same `"renyi"` literal the runtime gate uses (so the construction guard
+rejects exactly what the forward would, never over-rejecting). No valid path is lost: this doubly
+opt-in combination already crashed at the first forward, so the guard only moves the failure earlier.
+
+Verification (TDD, red then green): `tests/test_config.py::test_per_coord_alpha_requires_renyi_functional`
+was confirmed FAILING against pre-fix code (`DID NOT RAISE ValueError`, since the config constructs the
+non-Renyi per-coord pair on the default diagonal family) and PASSING after the guard; the existing
+`test_per_coord_alpha_requires_diagonal_family` still passes (no over-rejection on the Renyi default).
+The test uses the DEFAULT diagonal family on purpose so the covariance guard does not mask the functional
+check. Full suite: `tests=569 failures=0 errors=0 skipped=0` (1 xpassed) read from the JUnit XML under a
+workspace-local `--basetemp`; the temp dir and XML were removed after reading.
+
+Replaced `docs/audits/audit-new.md` with the owner-filtered deep-audit report so the new filename reflects the latest disposition: neural output projection and learned/config-toggle paths are excluded from actionable status.
