@@ -235,3 +235,39 @@ dict key is unchanged so existing diagnostics tests hold.
 model.group.irrep_dims)` (group-aware) instead of the per-head `cfg.tau`, which understated the active
 temperature by sqrt(n_heads) for single-block groups (glk/so_k/sp). Matches the in-package banner;
 reporting-only. Distinct from the PR #27 gamma-tau (tau_gamma) fix.
+
+# 2026-06-05 — Belief UMAP / semantic-clustering figure redesign
+
+Branch `vfe3-belief-umap-figure-2026-06-05` (fresh from main). The old `belief_umap` was a single
+mu/Sigma/phi triptych colored by raw `token_id` via `cmap="tab10"` (so colors were arbitrary
+token-id magnitude, no legend). Brainstormed design (user-approved): separate per-channel figures,
+a real legend, labeled tokens, and quantitative semantic-clustering data, colored by LINGUISTIC
+CATEGORY (both BPE-structure and function/content taxonomies).
+
+`vfe3/viz/figures.py`:
+- `clustering_metrics` gained a `sample_size` kwarg (silhouette is O(N^2); the new figures call it
+  per channel x taxonomy, so it subsamples; CH stays full). Backward compatible (default None).
+- New helpers: `_bpe_category` (punctuation / number / word-start lc / word-start Cap / continuation
+  subword / whitespace, from the decoded gpt2 token's structure), `_funccontent_category`
+  (punctuation / number / function-word via a built-in ~140-word stopword set / content-word / other),
+  `_token_category_labels` (decode each unique id once -> category index), `_scatter_by_category`
+  (per-category colored scatter + legend with counts; greys out when no decoder), and
+  `_annotate_frequent_tokens` (mark + label the N most frequent tokens at their occurrence-centroid).
+- `plot_belief_umap` rewritten: now ONE channel per call (`channel="mu"/"sigma"/"phi"`), a 1x2 panel
+  (BPE | function/content), colored by category with a legend, the ~10 most frequent decoded tokens
+  annotated, and each panel title reporting silhouette + CH of the CATEGORY labels in the channel's
+  NATIVE space (so the number measures linguistic separation, not arbitrary token id). `decode=None`
+  -> single-colour fallback. No external deps (tiktoken already present for gpt2; sklearn for silhouette).
+- New `plot_belief_category_separation`: grouped silhouette bars per channel x taxonomy -- the
+  quantitative companion ("how strongly is each belief channel organized by each taxonomy").
+
+`vfe3/viz/report.py`: derives `decode = datasets.get_tiktoken_decoder(dataset)` (gpt2 for wikitext;
+None on synthetic/absent -> greys out), emits `belief_umap_mu/sigma/phi.png` (3 files) +
+`belief_category_separation.png` instead of the single triptych; the final count log is no longer
+hardcoded to 10 (now 13 single-run figures).
+
+Tests: `test_viz.py` belief_umap test rewritten to the per-channel signature; added category-helper
+unit tests, a no-decode fallback test, and a category-separation test (`test_viz.py` 32 passing with
+`test_report.py`). Verified on the real `vfe3_runs/...wikitext-103_K20_block_glk_linear_mix` run:
+13 figures, with `mu` showing the strongest function/content separation (~0.08 silhouette) and
+frequent function words (`the`, `to`, `of`, `a`, `in`, `and`) forming tight peripheral clusters.
