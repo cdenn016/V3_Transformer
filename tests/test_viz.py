@@ -10,11 +10,28 @@ from vfe3.viz.figures import (
     attention_graph,
     clustering_metrics,
     get_figure,
+    plot_ablation_forest,
     plot_attention_graph,
     plot_attention_grid,
     plot_attention_heatmap,
+    plot_attention_structure,
+    plot_belief_spectrum,
+    plot_belief_trajectories,
+    plot_belief_umap,
+    plot_capacity_scaling,
     plot_covariance_ellipses,
     plot_embedding,
+    plot_estep_capacity,
+    plot_estep_convergence,
+    plot_free_energy_descent,
+    plot_gauge_equivariance,
+    plot_gauge_head_specialization,
+    plot_holonomy_curvature,
+    plot_ln3_symmetry_breaking,
+    plot_lr_grid_heatmap,
+    plot_numerical_trust,
+    plot_pareto_frontier,
+    plot_spd_ellipses,
     plot_trajectory,
     set_publication_style,
     umap_embed,
@@ -98,3 +115,144 @@ def test_figure_registry():
     assert callable(get_figure("attention_grid"))
     with pytest.raises(KeyError):
         get_figure("not_a_figure")
+
+
+# --- publication figures (smoke: build synthetic inputs, save a nonempty PNG) ---
+
+def _T():
+    return 5, 6, 4, 2          # T, N, K, H
+
+
+def test_plot_free_energy_descent_saves(tmp_path):
+    s = np.arange(10)
+    hist = {"step": s, "self_coupling": np.linspace(20, 5, 10), "belief_coupling": np.linspace(40, 30, 10),
+            "attention_entropy": np.linspace(10, 8, 10), "val_ce": np.linspace(6, 4, 10),
+            "free_energy_total": np.linspace(120, 80, 10)}
+    p = tmp_path / "f1.png"
+    fig = plot_free_energy_descent(hist, lambda_beta=1.0, self_div=torch.rand(20), path=str(p))
+    plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_plot_estep_convergence_saves(tmp_path):
+    T, N, K, _ = _T()
+    trace = {"mu": torch.randn(T, N, K).cumsum(0), "sigma": torch.rand(T, N, K) + 0.3,
+             "phi": torch.randn(T, N, 2), "free_energy": torch.linspace(50, 30, T)}
+    p = tmp_path / "f2.png"
+    fig = plot_estep_convergence(trace, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_plot_ln3_symmetry_breaking_saves(tmp_path):
+    _, N, K, H = _T()
+    def arm():
+        return {"step": np.arange(8), "val_ce": np.linspace(1.5, 1.1, 8),
+                "omega": torch.randn(N, N, K, K), "beta": torch.softmax(torch.randn(H, N, N), dim=-1)}
+    p = tmp_path / "f3.png"
+    fig = plot_ln3_symmetry_breaking(arm(), arm(), period=3, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_plot_belief_trajectories_saves(tmp_path):
+    T, N, K, _ = _T()
+    trace = {"mu": torch.randn(T, N, K).cumsum(0), "sigma": torch.rand(T, N, K) + 0.3, "phi": torch.randn(T, N, 2)}
+    layer = {"d_ai": torch.tensor([0.0, 0.5, 0.9]), "effective_rank": torch.tensor([3.0, 2.5, 2.0])}
+    p = tmp_path / "f4.png"
+    fig = plot_belief_trajectories(trace, layer, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_plot_belief_umap_saves(tmp_path):
+    M, K = 60, 4
+    bank = {"mu": torch.randn(M, K), "sigma": torch.rand(M, K) + 0.3, "phi": torch.randn(M, 2),
+            "token_ids": torch.randint(0, 5, (M,)), "seq_idx": torch.zeros(M)}
+    labels = torch.randint(0, 3, (M,))
+    p = tmp_path / "f5.png"
+    try:
+        fig = plot_belief_umap(bank, labels=labels, seed=0, path=str(p)); plt.close(fig)
+    except (ImportError, OSError) as exc:
+        pytest.skip(f"umap-learn native layer unavailable: {exc}")
+    assert _saved_nonempty(p)
+
+
+def test_plot_gauge_equivariance_saves(tmp_path):
+    resid = {"energy_in_group": torch.rand(50) * 1e-6, "energy_out_group": torch.rand(50) + 0.5,
+             "beta_in_group": torch.rand(50) * 1e-6, "beta_out_group": torch.rand(50) * 0.3}
+    p = tmp_path / "f6.png"
+    fig = plot_gauge_equivariance(resid, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_plot_gauge_head_specialization_saves(tmp_path):
+    per_head = {"logdet": torch.randn(40, 2), "anisotropy": torch.rand(40, 2) + 1.0}
+    p1 = tmp_path / "f7a.png"; p2 = tmp_path / "f7b.png"
+    fig = plot_gauge_head_specialization(per_head, path=str(p1)); plt.close(fig)
+    fig = plot_gauge_head_specialization(per_head, head_entropy=torch.rand(2), path=str(p2)); plt.close(fig)
+    assert _saved_nonempty(p1) and _saved_nonempty(p2)
+
+
+def test_plot_attention_structure_saves(tmp_path):
+    _, N, _, H = _T()
+    beta = torch.softmax(torch.randn(2, H, N, N), dim=-1)         # (L, H, N, N)
+    p = tmp_path / "f8.png"
+    fig = plot_attention_structure(beta, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_plot_belief_spectrum_and_ellipses_save(tmp_path):
+    _, N, K, _ = _T()
+    sigma = torch.rand(N, K) + 0.3
+    p1 = tmp_path / "f9a.png"; p2 = tmp_path / "f9b.png"
+    fig = plot_belief_spectrum(sigma, eps=1e-6, sigma_max=5.0, path=str(p1)); plt.close(fig)
+    full = torch.diag_embed(sigma)
+    fig = plot_spd_ellipses(torch.randn(N, K), full, dims=(0, 1), path=str(p2)); plt.close(fig)
+    assert _saved_nonempty(p1) and _saved_nonempty(p2)
+
+
+def test_plot_holonomy_curvature_saves(tmp_path):
+    flat = {"per_triple": torch.rand(80) * 1e-6, "span": torch.randint(1, 6, (80,)).float()}
+    regime = {"per_triple": torch.rand(80) + 0.1, "span": torch.randint(1, 6, (80,)).float()}
+    p = tmp_path / "f10.png"
+    fig = plot_holonomy_curvature(flat, regime, curvature=torch.rand(6, 6), path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_plot_capacity_scaling_and_estep_capacity_save(tmp_path):
+    scaling = {"embed_dim": {"x": np.array([20, 40, 64]), "bpc": np.array([7.5, 7.0, 6.8]),
+                             "lo": np.array([7.4, 6.9, 6.7]), "hi": np.array([7.6, 7.1, 6.9])},
+               "n_layers": {"x": np.array([1, 2, 3]), "bpc": np.array([7.5, 7.1, 7.0])}}
+    p1 = tmp_path / "f11a.png"; p2 = tmp_path / "f11b.png"
+    fig = plot_capacity_scaling(scaling, path=str(p1)); plt.close(fig)
+    fig = plot_estep_capacity(np.array([1, 2, 4]), np.array([7.5, 7.1, 6.9]), np.array([100., 90., 85.]),
+                              n_params=12345, wall_time=np.array([10., 18., 33.]), path=str(p2)); plt.close(fig)
+    assert _saved_nonempty(p1) and _saved_nonempty(p2)
+
+
+def test_plot_pareto_frontier_saves(tmp_path):
+    points = {"bpc": np.array([7.5, 7.0, 6.8, 7.2]), "n_params": np.array([1e4, 4e4, 9e4, 2e4]),
+              "wall_time": np.array([10., 30., 60., 18.])}
+    p = tmp_path / "f11c.png"
+    fig = plot_pareto_frontier(points, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_plot_ablation_forest_and_lr_grid_save(tmp_path):
+    rows = [{"label": "frozen gauge", "delta": 0.4, "lo": 0.3, "hi": 0.5},
+            {"label": "surrogate F", "delta": 0.1, "lo": 0.05, "hi": 0.15},
+            {"label": "uniform prior", "delta": 0.25, "lo": 0.2, "hi": 0.3}]
+    grid = {"x": np.array([0.01, 0.02, 0.03]), "y": np.array([0.001, 0.002]),
+            "z": np.array([[190., 185., 188.], [186., 180., 184.]]),
+            "xlabel": "m_mu_lr", "ylabel": "m_sigma_lr", "baseline": (0.02, 0.002)}
+    p1 = tmp_path / "f12a.png"; p2 = tmp_path / "f12b.png"
+    fig = plot_ablation_forest(rows, path=str(p1)); plt.close(fig)
+    fig = plot_lr_grid_heatmap(grid, path=str(p2)); plt.close(fig)
+    assert _saved_nonempty(p1) and _saved_nonempty(p2)
+
+
+def test_plot_numerical_trust_saves(tmp_path):
+    guard = {"sigma_floor_frac": 0.0, "sigma_ceil_frac": 0.0, "energy_klmax_frac": 0.0, "selfdiv_klmax_frac": 0.0}
+    health = {"nan_mu": 0.0, "nan_sigma": 0.0, "nan_phi": 0.0, "nan_energy": 0.0, "nan_beta": 0.0, "max_condition": 12.0}
+    causal = {"future_leakage": torch.zeros(2), "row_sum_error": torch.zeros(2), "active_set_slope": torch.ones(2)}
+    p = tmp_path / "f13.png"
+    fig = plot_numerical_trust(guard, health, causal, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)

@@ -321,3 +321,691 @@ def get_figure(name: str) -> Callable:
     if name not in _FIGURES:
         raise KeyError(f"no figure {name!r}; available: {sorted(_FIGURES)}")
     return _FIGURES[name]
+
+
+# ===========================================================================
+# Publication figures (the claim-linked set; see
+# docs/superpowers/specs/2026-06-04-publication-figures-design.md). Each consumes
+# the new vfe3.metrics measurements / vfe3.viz.extract runner outputs, builds a
+# multi-panel composite, registers by name, and returns the Figure.
+# ===========================================================================
+
+# Wong colourblind-safe qualitative palette.
+_CB = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000"]
+_EPS_F32 = 1.1920929e-7                                           # float32 machine epsilon
+
+
+def _median_band(
+    ax,
+    x:     np.ndarray,
+    mat:   np.ndarray,                   # (T, M) -> median + 10/90 band over axis 1
+    color: str,
+    label: str,
+    lo:    float = 10.0,
+    hi:    float = 90.0,
+):
+    """Plot the median of ``mat`` over axis 1 with a 10-90 percentile band (single-seed spread)."""
+    med = np.median(mat, axis=1)
+    ax.plot(x, med, color=color, lw=1.8, label=label)
+    ax.fill_between(x, np.percentile(mat, lo, axis=1), np.percentile(mat, hi, axis=1),
+                    color=color, alpha=0.2)
+    return med
+
+
+def _ecdf(ax, x, color: str, label: str):
+    """Plot the empirical CDF of ``x`` (clamped positive for a log axis)."""
+    xs = np.sort(np.clip(_np(x).ravel(), 1e-12, None))
+    if xs.size == 0:
+        return
+    ax.plot(xs, np.arange(1, xs.size + 1) / xs.size, color=color, lw=1.8, label=label)
+
+
+def _belief_channel_features(bank: Dict, channel: str):
+    r"""Map a belief channel to its UMAP feature space, faithful to its geometry.
+
+    ``mu`` -> the means directly (Euclidean); ``phi`` -> the gauge coordinates directly;
+    ``sigma`` -> the log-Euclidean chart: log-variances for a diagonal covariance, ``vech(log Sigma)``
+    for a full one (so the Euclidean UMAP metric respects the SPD cone).
+    """
+    import torch
+    if channel == "mu":
+        return bank["mu"]
+    if channel == "phi":
+        return bank["phi"]
+    if channel == "sigma":
+        sig = bank["sigma"]
+        if sig.dim() == 2:                                       # (M, K) diagonal -> log-variances
+            return torch.log(sig.clamp(min=1e-12))
+        sym = 0.5 * (sig + sig.transpose(-1, -2))               # (M, K, K) full -> vech(log Sigma)
+        w, q = torch.linalg.eigh(sym)
+        log_sigma = (q * torch.log(w.clamp(min=1e-12)).unsqueeze(-2)) @ q.transpose(-1, -2)
+        iu = torch.triu_indices(log_sigma.shape[-1], log_sigma.shape[-1])
+        return log_sigma[..., iu[0], iu[1]]
+    raise ValueError(f"unknown belief channel {channel!r} (expected mu / sigma / phi)")
+
+
+@register_figure("free_energy_descent")
+def plot_free_energy_descent(
+    history: Dict,                       # arrays over training steps: step, self_coupling, belief_coupling, attention_entropy, val_ce, [free_energy_total]
+
+    *,
+    lambda_beta: 'float | np.ndarray' = 1.0,
+    self_div:    Optional[object]     = None,   # (M,) converged self-divergences for the violin
+    path:        Optional[str]        = None,
+):
+    r"""F1: the FULL free-energy stack over training plus the F-vs-CE co-descent.
+
+    Panel A stacks self-coupling, the lambda_beta-scaled belief-coupling and attention-entropy, and
+    the data/likelihood term (val CE in nats) so the area CLOSES to the runtime-realised total F
+    (the old single bar omitted the data term). Panel B is the descriptive co-descent of F total
+    and val CE on a twin axis. Panel C (when ``self_div`` is given) is the per-token self-divergence
+    violin. The closure holds only at lambda_h = gamma_coupling = 0 (see free_energy_full_decomposition).
+    """
+    step = _np(history["step"])
+    sc, bc = _np(history["self_coupling"]), _np(history["belief_coupling"])
+    ae, ce = _np(history["attention_entropy"]), _np(history["val_ce"])
+    lb = _np(lambda_beta)
+    stack = np.vstack([sc, lb * bc, lb * ae, ce])
+    ncol = 3 if self_div is not None else 2
+    fig, axes = plt.subplots(1, ncol, figsize=(4.4 * ncol, 3.6))
+    axes[0].stackplot(step, stack, colors=_CB[:4], alpha=0.85,
+                      labels=["self-coupling", r"$\lambda_\beta\cdot$belief-coupling",
+                              r"$\lambda_\beta\cdot$attention-entropy", "data term (CE)"])
+    axes[0].set(xlabel="training step", ylabel="free energy (nats)", title="Free-energy decomposition")
+    axes[0].legend(loc="upper right", fontsize=7, frameon=False)
+    ft = _np(history["free_energy_total"]) if "free_energy_total" in history else stack.sum(0)
+    axes[1].plot(step, ft, color=_CB[0], lw=2)
+    axes[1].set(xlabel="training step", ylabel="F total (nats)", title="Co-descent (descriptive)")
+    ax2 = axes[1].twinx()
+    ax2.plot(step, ce, color=_CB[1], lw=2, ls="--")
+    ax2.set_ylabel("val CE (nats)", color=_CB[1])
+    if self_div is not None:
+        axes[2].violinplot([_np(self_div).ravel()], showmeans=True)
+        axes[2].set(xticks=[1], xticklabels=[r"$D(q_i\|p_i)$"], ylabel="nats",
+                    title="Self-divergence (per token)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("estep_convergence")
+def plot_estep_convergence(
+    trace:    Dict,                      # e_step_belief_trace output: mu, sigma, phi, free_energy
+
+    *,
+    diagonal: Optional[bool] = None,
+    path:     Optional[str]  = None,
+):
+    r"""F2: E-step convergence -- free energy and belief motion across inner iterations.
+
+    Panel A is the global F(t) over inner iterations with the trained budget marked. Panel B is the
+    belief-motion residuals on a log axis -- the mean step, the affine-invariant SPD covariance step,
+    and the gauge step -- each median + 10-90 band over tokens, shrinking toward a fixed point.
+    """
+    from vfe3 import metrics
+    fe = _np(trace["free_energy"])
+    res = metrics.estep_residuals(trace["mu"], trace["sigma"], trace["phi"], diagonal=diagonal)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
+    axes[0].plot(np.arange(fe.size), fe, "o-", color=_CB[0], ms=4, lw=1.6)
+    axes[0].axhline(fe[-1], color="#888888", ls=":", lw=1)
+    axes[0].set(xlabel="E-step inner iteration", ylabel="free energy (nats)", title="E-step descent")
+    t = np.arange(1, _np(res["r_mu"]).shape[0] + 1)
+    _median_band(axes[1], t, _np(res["r_mu"]), _CB[0], r"$r_\mu$")
+    _median_band(axes[1], t, _np(res["r_sigma"]), _CB[1], r"$r_\Sigma$ (SPD)")
+    _median_band(axes[1], t, _np(res["r_phi"]), _CB[2], r"$r_\phi$")
+    axes[1].set_yscale("log")
+    axes[1].set(xlabel="E-step inner iteration", ylabel="belief step length", title="Convergence to fixed point")
+    axes[1].legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("ln3_symmetry_breaking")
+def plot_ln3_symmetry_breaking(
+    frozen:  Dict,                       # {step, val_ce, omega (N,N,K,K), beta (H,N,N)}
+    learned: Dict,
+
+    *,
+    period:  int = 3,
+    path:    Optional[str] = None,
+):
+    r"""F3: the gauge does the work -- ln(3) symmetry-breaking on the period-3 stream.
+
+    Panel A: val CE vs step for the frozen (gauge off) and learned (gauge on) arms, with the
+    analytic averaging floor CE = ln 3 drawn. Panel B: the directed transport asymmetry of the
+    learned arm. Panel C: per-head period-3 / prev-token structure scores, frozen vs learned.
+    """
+    from vfe3 import metrics
+    ln3 = float(np.log(3.0))
+    fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.7))
+    axes[0].plot(_np(frozen["step"]), _np(frozen["val_ce"]), color=_CB[1], lw=2, label="frozen (gauge off)")
+    axes[0].plot(_np(learned["step"]), _np(learned["val_ce"]), color=_CB[2], lw=2, label="learned (gauge on)")
+    axes[0].axhline(ln3, color="#444444", ls="--", lw=1.2, label=r"$\ln 3$ averaging floor")
+    axes[0].set(xlabel="training step", ylabel="val CE (nats)", title="Order learning vs the averaging floor")
+    axes[0].legend(fontsize=8, frameon=False)
+    asym = _np(metrics.transport_asymmetry(learned["omega"]))
+    vmax = float(np.abs(asym).max()) or 1.0
+    im = axes[1].imshow(asym, cmap="coolwarm", vmin=-vmax, vmax=vmax, aspect="auto")
+    fig.colorbar(im, ax=axes[1], shrink=0.8, label=r"$\|\Omega_{ij}-\Omega_{ji}\|_F$")
+    axes[1].set(xlabel="key j", ylabel="query i", title="Transport asymmetry (learned)")
+    fr = metrics.structured_head_scores(frozen["beta"], period=period)
+    le = metrics.structured_head_scores(learned["beta"], period=period)
+    labels = ["prev-token", f"period-{period}"]
+    xs = np.arange(len(labels))
+    axes[2].bar(xs - 0.2, [float(_np(fr["prev_token"]).mean()), float(_np(fr["period_match"]).mean())],
+                width=0.4, color=_CB[1], label="frozen")
+    axes[2].bar(xs + 0.2, [float(_np(le["prev_token"]).mean()), float(_np(le["period_match"]).mean())],
+                width=0.4, color=_CB[2], label="learned")
+    axes[2].set(xticks=xs, xticklabels=labels, ylabel="mean attention mass", title="Structured-head scores")
+    axes[2].legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("belief_trajectories")
+def plot_belief_trajectories(
+    trace:       Dict,                   # e_step_belief_trace output (mu (T+1,N,K), ...)
+    layer_trace: Optional[Dict] = None,  # across_layer_belief_trace output (d_ai, effective_rank)
+
+    *,
+    path:        Optional[str] = None,
+):
+    r"""F4: belief trajectories across E-step iterations (mean-space path) and across layers (SPD).
+
+    Panel A: a shared-PCA 2-D quiver of the belief means as inference iterates (arrows mu_t ->
+    mu_{t+1}, coloured by token position). Panel B: the across-layer cumulative affine-invariant SPD
+    geodesic distance and mean effective rank. The across-training axis is out of scope (needs
+    per-checkpoint replay).
+    """
+    mu = _np(trace["mu"])                                         # (T+1, N, K)
+    t1, n, k = mu.shape
+    flat = mu.reshape(-1, k) - mu.reshape(-1, k).mean(0)
+    _, _, vt = np.linalg.svd(flat, full_matrices=False)
+    proj = (flat @ vt[:2].T).reshape(t1, n, 2)
+    ncol = 2 if layer_trace is not None else 1
+    fig, axes = plt.subplots(1, ncol, figsize=(5.0 * ncol, 4.2), squeeze=False)
+    ax = axes[0][0]
+    cmap = plt.cm.viridis(np.linspace(0, 1, n))
+    for j in range(n):
+        ax.plot(proj[:, j, 0], proj[:, j, 1], "-", color=cmap[j], lw=0.8, alpha=0.7)
+        ax.quiver(proj[:-1, j, 0], proj[:-1, j, 1],
+                  np.diff(proj[:, j, 0]), np.diff(proj[:, j, 1]),
+                  angles="xy", scale_units="xy", scale=1, color=cmap[j], width=0.004, alpha=0.7)
+    ax.scatter(proj[0, :, 0], proj[0, :, 1], s=14, color="#333333", marker="o", label="init")
+    ax.set(xlabel="PC 1", ylabel="PC 2", title="Belief-mean path over E-step iterations")
+    if layer_trace is not None:
+        axb = axes[0][1]
+        layers = np.arange(_np(layer_trace["d_ai"]).size)
+        axb.plot(layers, _np(layer_trace["d_ai"]), "o-", color=_CB[0], label=r"$d_{AI}(\Sigma^0,\Sigma^l)$")
+        axb.set(xlabel="layer", ylabel="cumulative SPD distance", title="Belief geometry vs depth")
+        axc = axb.twinx()
+        axc.plot(layers, _np(layer_trace["effective_rank"]), "s--", color=_CB[1])
+        axc.set_ylabel("mean effective rank", color=_CB[1])
+        axb.legend(fontsize=8, frameon=False, loc="upper left")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("belief_umap")
+def plot_belief_umap(
+    bank:     Dict,                      # belief_bank output: mu, sigma, phi, token_ids, seq_idx
+
+    *,
+    labels:   Optional[object] = None,   # (M,) colour labels (token id / frequency / POS)
+    channels: tuple            = ("mu", "sigma", "phi"),
+    seed:     int              = 0,
+    path:     Optional[str]    = None,
+):
+    r"""F5: UMAP semantic clustering of converged beliefs -- the mu / Sigma / phi triptych.
+
+    One UMAP panel per belief channel, each embedded faithfully to its geometry (mu Euclidean,
+    Sigma in the log-Euclidean chart, phi in the gauge coordinates) and coloured by ``labels``;
+    silhouette and Calinski-Harabasz are computed in the channel's NATIVE space (not the 2-D
+    projection) to avoid the projection artifact. The mu panel sizes markers by the Fisher trace
+    so confident beliefs render solid. Surfaces what content (mu), uncertainty (Sigma), and gauge
+    (phi) each encode.
+    """
+    from vfe3 import metrics
+    lab = None if labels is None else _np(labels)
+    sizes_mu = _np(metrics.fisher_trace(bank["sigma"]))
+    sizes_mu = 6 + 24 * (sizes_mu - sizes_mu.min()) / (np.ptp(sizes_mu) + 1e-12)
+    fig, axes = plt.subplots(1, len(channels), figsize=(4.6 * len(channels), 4.2), squeeze=False)
+    for ax, ch in zip(axes[0], channels):
+        feats = _belief_channel_features(bank, ch)
+        coords = umap_embed(feats, seed=seed)
+        s = sizes_mu if ch == "mu" else 12
+        kw = {"c": lab, "cmap": "tab10"} if lab is not None else {"color": _CB[0]}
+        ax.scatter(coords[:, 0], coords[:, 1], s=s, alpha=0.7, linewidths=0, **kw)
+        title = ch
+        if lab is not None:
+            cm = clustering_metrics(_np(feats), lab)
+            title = f"{ch}  (sil {cm['silhouette']:.2f}, CH {cm['calinski_harabasz']:.0f})"
+        ax.set(xlabel="UMAP 1", ylabel="UMAP 2", title=title)
+    fig.suptitle("Belief semantic clustering (native-space scores)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("gauge_equivariance")
+def plot_gauge_equivariance(
+    resid: Dict,                         # gauge_equivariance_residual output
+
+    *,
+    path:  Optional[str] = None,
+):
+    r"""F6: gauge-equivariance certificate -- energy and attention invariant to the structure group.
+
+    Log-scale ECDFs of the relative residual of E_ij and beta_ij under random IN-group elements
+    (clustered near float32 eps) vs a matched OUT-of-group control (far right), with a machine-eps
+    reference line. A real symmetry, not a decorative one.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+    for ax, key, title in ((axes[0], "energy", r"energy $E_{ij}$"), (axes[1], "beta", r"attention $\beta_{ij}$")):
+        _ecdf(ax, resid[f"{key}_in_group"], _CB[2], "in-group")
+        _ecdf(ax, resid[f"{key}_out_group"], _CB[1], "out-of-group")
+        ax.axvline(_EPS_F32, color="#444444", ls=":", lw=1, label="float32 eps")
+        ax.set_xscale("log")
+        ax.set(xlabel="relative residual", ylabel="ECDF", title=f"Equivariance of {title}")
+        ax.legend(fontsize=8, frameon=False, loc="lower right")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("gauge_head_specialization")
+def plot_gauge_head_specialization(
+    per_head:     Dict,                  # per_head_gauge_invariants output: logdet (M,H), anisotropy (M,H)
+    head_entropy: Optional[object] = None,  # (H,) per-head mean attention entropy
+
+    *,
+    path:         Optional[str] = None,
+):
+    r"""F7: per-head gauge specialization and its link to attention structure.
+
+    Panel A: per-head violins of the group-correct gauge invariant (log-volume). Panel B: per-head
+    violins of the shear/anisotropy, or -- when ``head_entropy`` is given -- a scatter of per-head
+    gauge magnitude vs attention row entropy.
+    """
+    logdet = _np(per_head["logdet"])                             # (M, H)
+    aniso = _np(per_head["anisotropy"])
+    h = logdet.shape[1]
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.8))
+    axes[0].violinplot([logdet[:, i] for i in range(h)], showmeans=True)
+    axes[0].axhline(0.0, color="#888888", ls=":", lw=1)
+    axes[0].set(xticks=range(1, h + 1), xticklabels=[f"h{i}" for i in range(h)],
+                ylabel=r"$\log|\det\exp\phi^{(h)}|$", title="Per-head gauge volume")
+    if head_entropy is not None:
+        axes[1].scatter(np.abs(logdet).mean(0), _np(head_entropy), s=40, color=_CB[0])
+        axes[1].set(xlabel="mean |gauge volume|", ylabel="attention row entropy (nats)",
+                    title="Gauge action vs attention")
+    else:
+        axes[1].violinplot([aniso[:, i] for i in range(h)], showmeans=True)
+        axes[1].set(xticks=range(1, h + 1), xticklabels=[f"h{i}" for i in range(h)],
+                    ylabel=r"$s_{\max}/s_{\min}$", title="Per-head shear")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("attention_structure")
+def plot_attention_structure(
+    beta: object,                        # (L,H,N,N) or (H,N,N) attention weights
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""F8: attention structure -- per-head entropy, head redundancy, and distance decay.
+
+    Panel A: per-head row-entropy violins vs the uniform log N reference (does attention sharpen).
+    Panel B: head-redundancy Jensen-Shannon heatmap (specialized vs redundant heads). Panel C: the
+    per-head attention-vs-offset profile on a log axis (positional decay).
+    """
+    from vfe3 import metrics
+    import torch
+    b = beta if hasattr(beta, "dim") else torch.as_tensor(_np(beta))
+    if b.dim() == 4:                                             # (L, H, N, N) -> flatten to heads
+        b = b.reshape(-1, b.shape[-2], b.shape[-1])
+    rows = _np(metrics.attention_entropy_rows(b))               # (H, N)
+    n = b.shape[-1]
+    h = b.shape[0]
+    fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.8))
+    axes[0].violinplot([rows[i] for i in range(h)], showmeans=True)
+    axes[0].axhline(float(np.log(n)), color="#444444", ls="--", lw=1, label=r"uniform $\log N$")
+    axes[0].set(xticks=range(1, h + 1), xticklabels=[f"h{i}" for i in range(h)],
+                ylabel="row entropy (nats)", title="Per-head attention entropy")
+    axes[0].legend(fontsize=8, frameon=False)
+    js = _np(metrics.head_redundancy_js(b))
+    im = axes[1].imshow(js, cmap="magma", aspect="auto")
+    fig.colorbar(im, ax=axes[1], shrink=0.8, label="JS divergence (nats)")
+    axes[1].set(xlabel="head", ylabel="head", title="Head redundancy")
+    dd = metrics.attention_distance_decay(b)
+    prof = _np(dd["profile"])                                    # (H, N)
+    off = _np(dd["offsets"])
+    for i in range(h):
+        axes[2].plot(off, np.clip(prof[i], 1e-8, None), color=plt.cm.viridis(i / max(h - 1, 1)), lw=1.2)
+    axes[2].set_yscale("log")
+    axes[2].set(xlabel="offset |i - j|", ylabel=r"mean $\beta$", title="Attention distance decay")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("belief_spectrum")
+def plot_belief_spectrum(
+    sigma:     object,                   # (N, K) diagonal OR (N, K, K) full converged covariances
+
+    *,
+    eps:       float = 1e-6,
+    sigma_max: float = 5.0,
+    diagonal:  Optional[bool] = None,
+    path:      Optional[str]  = None,
+):
+    r"""F9: belief covariance geometry -- effective rank, guarded scree, and conditioning.
+
+    Panel A: the per-token effective-rank violin (the distribution the logged mean discards).
+    Panel B: the eigenvalue scree (median + 10-90 band, log axis) with the eps / sigma_max
+    retraction guard lines, exposing whether apparent rank collapse rides the floor. Panel C: the
+    per-token spectral condition-number histogram.
+    """
+    from vfe3 import metrics
+    sp = metrics.belief_spectrum(sigma, diagonal=diagonal)
+    eig = _np(sp["eigenvalues"])                                 # (N, K) descending
+    rank = _np(sp["effective_rank"])
+    cond = _np(sp["condition"])
+    fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.8))
+    axes[0].violinplot([rank], showmeans=True)
+    axes[0].set(xticks=[1], xticklabels=["beliefs"], ylabel="effective rank",
+                title="Per-token effective rank")
+    kk = np.arange(1, eig.shape[1] + 1)
+    _median_band(axes[1], kk, eig.T, _CB[0], "eigenvalue")
+    axes[1].axhline(eps, color=_CB[1], ls="--", lw=1, label=r"$\varepsilon$ floor")
+    axes[1].axhline(sigma_max, color=_CB[2], ls="--", lw=1, label=r"$\sigma_{\max}$ ceiling")
+    axes[1].set_yscale("log")
+    axes[1].set(xlabel="eigenvalue index", ylabel="eigenvalue", title="Guarded spectrum (scree)")
+    axes[1].legend(fontsize=8, frameon=False)
+    axes[2].hist(cond, bins=24, color=_CB[0], alpha=0.85)
+    axes[2].set(xlabel=r"condition number $\lambda_{\max}/\lambda_{\min}$", ylabel="tokens",
+                title="Belief conditioning")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("spd_ellipses")
+def plot_spd_ellipses(
+    mu:       object,                    # (N, K) belief means
+    sigma:    object,                    # (N, K) diagonal OR (N, K, K) full covariances
+
+    *,
+    dims:     tuple = (0, 1),
+    diagonal: Optional[bool] = None,
+    path:     Optional[str]  = None,
+):
+    r"""F9 (companion): correlation-bearing SPD covariance ellipses, coloured by effective rank.
+
+    For a full covariance the ellipse orientation and axes come from the eigendecomposition of the
+    2x2 coordinate sub-block (the old ellipse used diagonal variances only, showing no correlation);
+    a diagonal belief degrades to axis-aligned. Facecolor encodes per-token effective rank.
+    """
+    from matplotlib.patches import Ellipse
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+    from vfe3 import metrics
+    m = _np(mu)
+    s = _np(sigma)
+    a, b = dims
+    is_full = s.ndim >= 3 and s.shape[-1] == s.shape[-2] if diagonal is None else (not diagonal)
+    rank = _np(metrics.effective_rank_per_token(sigma, diagonal=diagonal))
+    norm = Normalize(vmin=rank.min(), vmax=rank.max() + 1e-12)
+    cmap = plt.cm.viridis
+    fig, ax = plt.subplots(figsize=(5, 4.4))
+    for i in range(m.shape[0]):
+        if is_full:
+            sub = s[i][np.ix_([a, b], [a, b])]
+            w, v = np.linalg.eigh(0.5 * (sub + sub.T))
+            ang = np.degrees(np.arctan2(v[1, 1], v[0, 1]))
+            width, height = 2 * np.sqrt(np.clip(w[1], 0, None)), 2 * np.sqrt(np.clip(w[0], 0, None))
+        else:
+            ang, width, height = 0.0, 2 * np.sqrt(s[i, a]), 2 * np.sqrt(s[i, b])
+        ax.add_patch(Ellipse((m[i, a], m[i, b]), width=width, height=height, angle=ang,
+                             alpha=0.35, facecolor=cmap(norm(rank[i])), edgecolor="#26456E", lw=0.5))
+    ax.scatter(m[:, a], m[:, b], s=8, color="#26456E")
+    fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.8, label="effective rank")
+    ax.set(title="Belief SPD covariance ellipses", xlabel=f"dim {a}", ylabel=f"dim {b}")
+    ax.autoscale_view()
+    return _save(fig, path)
+
+
+@register_figure("holonomy_curvature")
+def plot_holonomy_curvature(
+    flat:      Dict,                     # holonomy_deviation_sampled output for a flat run
+    regime:    Optional[Dict] = None,    # ... for a regime_ii run
+
+    *,
+    curvature: Optional[object] = None,  # (N, N) curvature_field for a fixed anchor
+    path:      Optional[str]    = None,
+):
+    r"""F10: holonomy / curvature with corrected sampling.
+
+    Panel A: per-triangle holonomy violins -- the flat cocycle spikes at eps (a flatness
+    certificate), regime_ii spreads to genuine curvature. Panel B: holonomy vs triangle span.
+    Panel C (optional): the regime_ii spatial curvature field for a fixed anchor.
+    """
+    ncol = 2 + (1 if curvature is not None else 0)
+    fig, axes = plt.subplots(1, ncol, figsize=(4.4 * ncol, 3.7), squeeze=False)
+    ax = axes[0][0]
+    data = [np.clip(_np(flat["per_triple"]), 1e-12, None)]
+    ticks = ["flat"]
+    if regime is not None:
+        data.append(np.clip(_np(regime["per_triple"]), 1e-12, None))
+        ticks.append("regime II")
+    ax.violinplot(data, showmeans=True)
+    ax.set_yscale("log")
+    ax.set(xticks=range(1, len(ticks) + 1), xticklabels=ticks,
+           ylabel=r"$\|H_{ijk}-I\|_F$", title="Triangle holonomy")
+    axb = axes[0][1]
+    axb.scatter(_np(flat["span"]), np.clip(_np(flat["per_triple"]), 1e-12, None),
+                s=10, color=_CB[0], alpha=0.5, label="flat")
+    if regime is not None:
+        axb.scatter(_np(regime["span"]), np.clip(_np(regime["per_triple"]), 1e-12, None),
+                    s=10, color=_CB[1], alpha=0.5, label="regime II")
+        axb.legend(fontsize=8, frameon=False)
+    axb.set_yscale("log")
+    axb.set(xlabel="triangle span max|i-j|", ylabel=r"$\|H_{ijk}-I\|_F$", title="Curvature vs separation")
+    if curvature is not None:
+        im = axes[0][2].imshow(_np(curvature), cmap="magma", aspect="auto")
+        fig.colorbar(im, ax=axes[0][2], shrink=0.8, label=r"$\|H-I\|_F$")
+        axes[0][2].set(xlabel="j", ylabel="i", title="Curvature field (regime II)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("capacity_scaling")
+def plot_capacity_scaling(
+    scaling: Dict,                       # {axis_name: {x, bpc, [lo, hi]}}
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""F11 Panel A: capacity scaling of val BPC vs each structural axis (K / heads / layers).
+
+    Each sub-panel shares the BPC axis; a bootstrap-over-validation-SEQUENCES band (NOT a cross-seed
+    CI -- single-seed protocol) is drawn when ``lo`` / ``hi`` are supplied.
+    """
+    keys = list(scaling)
+    fig, axes = plt.subplots(1, len(keys), figsize=(4.2 * len(keys), 3.6), squeeze=False)
+    for ax, key in zip(axes[0], keys):
+        d = scaling[key]
+        x, bpc = _np(d["x"]), _np(d["bpc"])
+        order = np.argsort(x)
+        ax.plot(x[order], bpc[order], "o-", color=_CB[0], lw=1.8)
+        if "lo" in d and "hi" in d:
+            ax.fill_between(x[order], _np(d["lo"])[order], _np(d["hi"])[order], color=_CB[0], alpha=0.2)
+        ax.set(xlabel=key, ylabel="val BPC", title=f"Scaling vs {key}")
+    fig.suptitle("Capacity scaling (within-run bootstrap band)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("estep_capacity")
+def plot_estep_capacity(
+    n_e_steps:    object,                # (T,) E-step iteration counts
+    bpc:          object,                # (T,) val BPC
+    free_energy:  object,                # (T,) converged free energy
+
+    *,
+    n_params:     Optional[int]   = None,
+    wall_time:    Optional[object] = None,
+    path:         Optional[str]   = None,
+):
+    r"""F11 Panel B: E-step-as-capacity -- more inner free-energy minimization lowers loss at flat params.
+
+    val BPC and converged F vs the number of E-step iterations on a twin axis (the controlled
+    intervention: parameters are constant, only inference depth changes). An optional wall-time inset
+    shows the compute cost.
+    """
+    x = _np(n_e_steps)
+    fig, ax = plt.subplots(figsize=(5.4, 4.0))
+    ax.plot(x, _np(bpc), "o-", color=_CB[0], lw=2, label="val BPC")
+    ax.set(xlabel="E-step iterations (n_e_steps)", ylabel="val BPC")
+    ax2 = ax.twinx()
+    ax2.plot(x, _np(free_energy), "s--", color=_CB[1], lw=2)
+    ax2.set_ylabel("converged F (nats)", color=_CB[1])
+    note = "capacity from inference" + (f"; params flat at {n_params:,}" if n_params else "")
+    ax.set_title(f"E-step-as-capacity ({note})")
+    if wall_time is not None:
+        ins = ax.inset_axes([0.6, 0.6, 0.36, 0.34])
+        ins.plot(x, _np(wall_time), "o-", color="#888888", ms=3)
+        ins.set(title="wall time (s)", xlabel="n_e_steps")
+        ins.tick_params(labelsize=6)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("pareto_frontier")
+def plot_pareto_frontier(
+    points: Dict,                        # {bpc, n_params, [wall_time], [label]}
+
+    *,
+    path:   Optional[str] = None,
+):
+    r"""F11 Panel C: quality-vs-cost Pareto frontier of val BPC against parameters and wall time.
+
+    Non-dominated cells (lower BPC at lower cost) are connected into a stepwise frontier; dominated
+    points are faded.
+    """
+    bpc = _np(points["bpc"])
+    npar = _np(points["n_params"])
+    have_time = "wall_time" in points
+    ncol = 2 if have_time else 1
+    fig, axes = plt.subplots(1, ncol, figsize=(5.0 * ncol, 4.0), squeeze=False)
+
+    def _draw(ax, cost, xlabel, logx):
+        order = np.argsort(cost)
+        best = np.inf
+        front = np.zeros(cost.size, dtype=bool)
+        for k in order:
+            if bpc[k] < best:
+                best = bpc[k]; front[k] = True
+        ax.scatter(cost[~front], bpc[~front], s=24, color="#bbbbbb", label="dominated")
+        ax.scatter(cost[front], bpc[front], s=40, color=_CB[1], label="frontier")
+        fo = order[np.isin(order, np.where(front)[0])]
+        ax.plot(cost[fo], bpc[fo], "-", color=_CB[1], lw=1.5)
+        if logx:
+            ax.set_xscale("log")
+        ax.set(xlabel=xlabel, ylabel="val BPC")
+        ax.legend(fontsize=8, frameon=False)
+
+    _draw(axes[0][0], npar, "parameters", True)
+    axes[0][0].set_title("Quality vs parameters")
+    if have_time:
+        _draw(axes[0][1], _np(points["wall_time"]), "wall time (s)", False)
+        axes[0][1].set_title("Quality vs compute")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("ablation_forest")
+def plot_ablation_forest(
+    rows: list,                          # [{label, delta, [lo], [hi]}] delta-BPC vs the full model
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""F12 Panel A: baseline-ladder ablation forest of delta-BPC from the full model.
+
+    Each disabling ablation is a point with a paired bootstrap-over-tokens interval (single-seed
+    within-run, not a cross-seed CI), sorted by effect size; the zero line is the full model.
+    """
+    rows = sorted(rows, key=lambda r: r["delta"])
+    y = np.arange(len(rows))
+    delta = np.array([r["delta"] for r in rows])
+    lo = np.array([r.get("lo", r["delta"]) for r in rows])
+    hi = np.array([r.get("hi", r["delta"]) for r in rows])
+    fig, ax = plt.subplots(figsize=(6.4, 0.5 * len(rows) + 1.5))
+    ax.errorbar(delta, y, xerr=[delta - lo, hi - delta], fmt="o", color=_CB[0],
+                ecolor="#888888", capsize=3)
+    ax.axvline(0.0, color="#444444", ls="--", lw=1)
+    ax.set_yticks(y)
+    ax.set_yticklabels([r["label"] for r in rows])
+    ax.set(xlabel=r"$\Delta$ BPC vs full model", title="Component ablations (paired token bootstrap)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("lr_grid_heatmap")
+def plot_lr_grid_heatmap(
+    grid: Dict,                          # {x, y, z (len(y), len(x)), xlabel, ylabel, [baseline]}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""F12 Panel B: 2-D joint learning-rate sweep heatmap (val PPL), exposing ridge interactions.
+
+    The basin minimum is starred and the baseline operating point marked, proving the tuned point is
+    a joint minimum rather than a 1-D-slice artifact.
+    """
+    x, y, z = _np(grid["x"]), _np(grid["y"]), _np(grid["z"])
+    fig, ax = plt.subplots(figsize=(5.2, 4.4))
+    im = ax.pcolormesh(x, y, z, cmap="viridis", shading="auto")
+    fig.colorbar(im, ax=ax, shrink=0.85, label="val PPL")
+    iy, ix = np.unravel_index(np.nanargmin(z), z.shape)
+    ax.scatter([x[ix]], [y[iy]], marker="*", s=160, color="white", edgecolor="black", label="min")
+    if "baseline" in grid:
+        bx, by = grid["baseline"]
+        ax.scatter([bx], [by], marker="o", s=60, facecolor="none", edgecolor="red", label="baseline")
+    ax.set(xlabel=grid.get("xlabel", "lr x"), ylabel=grid.get("ylabel", "lr y"),
+           title="Joint LR sensitivity")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("numerical_trust")
+def plot_numerical_trust(
+    guard:  Dict,                        # guard_saturation output
+    health: Dict,                        # numerical_health output
+    causal: Optional[Dict] = None,       # causal_sanity output
+
+    *,
+    path:   Optional[str] = None,
+):
+    r"""F13: numerical-trust panel -- guard saturation, finiteness, and causal correctness.
+
+    Panel A: the fraction of converged entries pinned at each numerical guard boundary, with a 1%
+    reference line. Panel B: the non-finite fraction of each intermediate. Panel C (optional):
+    per-head future-attention leakage (must be ~0 under the causal mask).
+    """
+    ncol = 3 if causal is not None else 2
+    fig, axes = plt.subplots(1, ncol, figsize=(4.4 * ncol, 3.6), squeeze=False)
+    gk = list(guard)
+    axes[0][0].bar(range(len(gk)), [float(guard[k]) for k in gk], color=_CB[0])
+    axes[0][0].axhline(0.01, color=_CB[1], ls="--", lw=1, label="1%")
+    axes[0][0].set(xticks=range(len(gk)), ylabel="fraction pinned", title="Guard saturation")
+    axes[0][0].set_xticklabels(gk, rotation=30, ha="right", fontsize=7)
+    axes[0][0].legend(fontsize=8, frameon=False)
+    hk = [k for k in health if k.startswith("nan")]
+    axes[0][1].bar(range(len(hk)), [float(health[k]) for k in hk], color=_CB[2])
+    axes[0][1].set(xticks=range(len(hk)), ylabel="non-finite fraction", title="Numerical health")
+    axes[0][1].set_xticklabels(hk, rotation=30, ha="right", fontsize=7)
+    if causal is not None:
+        leak = _np(causal["future_leakage"]).ravel()
+        axes[0][2].bar(range(leak.size), leak, color=_CB[3])
+        axes[0][2].set(xlabel="head", ylabel="max future-attention", title="Causal leakage (expect 0)")
+    fig.tight_layout()
+    return _save(fig, path)

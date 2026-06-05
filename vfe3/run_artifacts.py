@@ -53,6 +53,7 @@ class RunArtifacts:
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = self.run_dir / "metrics.csv"
         self.best_path = self.run_dir / "best_model.pt"
+        self.cfg = cfg                                       # kept for figure scaling (lambda_beta) + guards
 
         self.best_val_ppl: float = float("inf")
         self.best_step: Optional[int] = None
@@ -262,6 +263,22 @@ def _save_figures(
             figs.plt.close(fig)
         if artifacts.history and "self_coupling" in artifacts.history[-1]:
             _save_free_energy_bar(artifacts, figs)
+        # Publication free-energy DESCENT: the full F stack (self-coupling, lambda_beta-scaled
+        # belief-coupling + attention-entropy, data/CE term) over training, closing to the runtime
+        # total -- the figure the single bar above cannot draw (no time axis, no data term). Best-effort
+        # like the rest; needs the per-eval term history (a dense-eval run gives a real trajectory).
+        fe_keys = ("self_coupling", "belief_coupling", "attention_entropy", "val_ce")
+        fe_rows = [r for r in artifacts.history if all(k in r for k in fe_keys)]
+        if fe_rows:
+            cfg = getattr(artifacts, "cfg", None)
+            hist = {"step": [r.get("step", i) for i, r in enumerate(fe_rows)],
+                    **{k: [r[k] for r in fe_rows] for k in fe_keys}}
+            if all("free_energy_total" in r for r in fe_rows):
+                hist["free_energy_total"] = [r["free_energy_total"] for r in fe_rows]
+            fig = figs.plot_free_energy_descent(
+                hist, lambda_beta=getattr(cfg, "lambda_beta", 1.0),
+                path=str(artifacts.run_dir / "free_energy_descent.png"))
+            figs.plt.close(fig)
     except Exception as exc:                                    # never let a plot kill a finished run
         logger.warning("figure generation failed (%s); numeric results are still saved", exc)
 
