@@ -273,10 +273,14 @@ def _save_figures(
             cfg = getattr(artifacts, "cfg", None)
             hist = {"step": [r.get("step", i) for i, r in enumerate(fe_rows)],
                     **{k: [r[k] for r in fe_rows] for k in fe_keys}}
-            if all("free_energy_total" in r for r in fe_rows):
-                hist["free_energy_total"] = [r["free_energy_total"] for r in fe_rows]
+            # Scale the coupling terms by the LEARNED lambda_beta trajectory when every row carries
+            # it (a learnable_lambda_beta run); else the static config scalar. (The figure now
+            # plots the data-term-inclusive stacked total in both panels, so free_energy_total --
+            # the coupling-only runtime total that excluded the CE term -- is no longer passed.)
+            lam = ([r["lambda_beta"] for r in fe_rows] if all("lambda_beta" in r for r in fe_rows)
+                   else getattr(cfg, "lambda_beta", 1.0))
             fig = figs.plot_free_energy_descent(
-                hist, lambda_beta=getattr(cfg, "lambda_beta", 1.0),
+                hist, lambda_beta=lam,
                 path=str(artifacts.run_dir / "free_energy_descent.png"))
             figs.plt.close(fig)
     except Exception as exc:                                    # never let a plot kill a finished run

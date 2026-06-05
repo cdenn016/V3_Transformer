@@ -393,29 +393,35 @@ def plot_free_energy_descent(
     self_div:    Optional[object]     = None,   # (M,) converged self-divergences for the violin
     path:        Optional[str]        = None,
 ):
-    r"""F1: the FULL free-energy stack over training plus the F-vs-CE co-descent.
+    r"""F1: the per-token free-energy stack over training plus the F-vs-CE co-descent.
 
-    Panel A stacks self-coupling, the lambda_beta-scaled belief-coupling and attention-entropy, and
-    the data/likelihood term (val CE in nats) so the area CLOSES to the runtime-realised total F
-    (the old single bar omitted the data term). Panel B is the descriptive co-descent of F total
-    and val CE on a twin axis. Panel C (when ``self_div`` is given) is the per-token self-divergence
-    violin. The closure holds only at lambda_h = gamma_coupling = 0 (see free_energy_full_decomposition).
+    DESCRIPTIVE, not a literal closed decomposition over one empirical object: the coupling terms
+    are a per-eval converged-belief snapshot from a representative batch (logged off the graph),
+    while the data term is the held-out val CE; both are in NATS PER TOKEN so they are commensurate
+    (the caller normalizes the per-sequence-sum diagnostics by the token count before logging). Panel
+    A stacks self-coupling, the lambda_beta-scaled belief-coupling and attention-entropy, and the
+    data/likelihood term (val CE) -- the stack height is the full per-token F INCLUDING the data
+    term. Panel B plots that SAME stacked total against val CE on a twin axis (so the two panels
+    agree; the older path plotted a coupling-only total here that excluded the data term). Panel C
+    (when ``self_div`` is given) is the per-token self-divergence violin. ``lambda_beta`` accepts a
+    per-row vector (the learned-coupling trajectory) as well as a scalar; literal closure to the
+    runtime F holds only at lambda_h = gamma_coupling = 0 (see free_energy_full_decomposition).
     """
     step = _np(history["step"])
     sc, bc = _np(history["self_coupling"]), _np(history["belief_coupling"])
     ae, ce = _np(history["attention_entropy"]), _np(history["val_ce"])
-    lb = _np(lambda_beta)
+    lb = _np(lambda_beta)                                         # scalar OR (T,) learned trajectory
     stack = np.vstack([sc, lb * bc, lb * ae, ce])
     ncol = 3 if self_div is not None else 2
     fig, axes = plt.subplots(1, ncol, figsize=(4.4 * ncol, 3.6))
     axes[0].stackplot(step, stack, colors=_CB[:4], alpha=0.85,
                       labels=["self-coupling", r"$\lambda_\beta\cdot$belief-coupling",
                               r"$\lambda_\beta\cdot$attention-entropy", "data term (CE)"])
-    axes[0].set(xlabel="training step", ylabel="free energy (nats)", title="Free-energy decomposition")
+    axes[0].set(xlabel="training step", ylabel="free energy (nats/token)", title="Free-energy decomposition")
     axes[0].legend(loc="upper right", fontsize=7, frameon=False)
-    ft = _np(history["free_energy_total"]) if "free_energy_total" in history else stack.sum(0)
+    ft = stack.sum(0)                                            # full per-token F incl. data term (matches panel A)
     axes[1].plot(step, ft, color=_CB[0], lw=2)
-    axes[1].set(xlabel="training step", ylabel="F total (nats)", title="Co-descent (descriptive)")
+    axes[1].set(xlabel="training step", ylabel="F total (nats/token)", title="Co-descent (descriptive)")
     ax2 = axes[1].twinx()
     ax2.plot(step, ce, color=_CB[1], lw=2, ls="--")
     ax2.set_ylabel("val CE (nats)", color=_CB[1])

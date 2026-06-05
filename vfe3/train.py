@@ -284,7 +284,7 @@ def train(
     generate_samples:  bool                                     = True,   # False -> pure silent path (no sample text)
     sample_decode:     Optional[Callable[[Sequence[int]], str]] = None,   # token-ids -> text; None -> auto by vocab
     sample_new_tokens: int                                      = 40,     # greedy continuation length
-    sample_prompt_len: int                                      = 16,     # seq-0 prompt length to continue
+    sample_prompt_len: int                                      = 6,     # seq-0 prompt length to continue
 ) -> List[float]:
     r"""Train ``n_steps`` M-step iterations (cycling the loader); return the loss history.
 
@@ -394,6 +394,11 @@ def train(
             # whenever the validation PPL sets a new minimum.
             if artifacts is not None:
                 d = model.diagnostics(tokens)
+                # The diagnostics free-energy terms are per-sequence SUMS over seq 0; normalize to
+                # PER TOKEN (divide by the sequence length) so the free_energy_descent stack is
+                # commensurate with val_ce, a token-weighted mean (nats/token). The CSV therefore
+                # carries nats/token for the four F-stack terms. (See audit-2026-06-05 Finding 2.)
+                n_tok = max(int(tokens.shape[1]), 1)
                 row = {
                     "step":              step + 1,
                     "train_loss":        losses[-1],
@@ -402,10 +407,10 @@ def train(
                     "val_ppl":           m["ppl"],
                     "val_bpc":           m["bpc"],
                     "attn_entropy":       d["attn_entropy"],
-                    "self_coupling":      d["self_coupling"],
-                    "belief_coupling":    d["belief_coupling"],
-                    "attention_entropy":  d["attention_entropy"],
-                    "free_energy_total":  d["total"],
+                    "self_coupling":      d["self_coupling"]     / n_tok,
+                    "belief_coupling":    d["belief_coupling"]   / n_tok,
+                    "attention_entropy":  d["attention_entropy"] / n_tok,
+                    "free_energy_total":  d["total"]             / n_tok,
                     "effective_rank":     d["effective_rank"],
                     "holonomy_deviation": d["holonomy_deviation"],
                     "gauge_trace_spread": d["gauge_trace_spread"],
