@@ -11,6 +11,12 @@ training hot path. The free-energy descent + trajectory figures are still writte
 ``finalize_run``; this driver adds the model-replay figures that were never wired up.
 """
 
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each ship a
+#   libiomp5md.dll; the duplicate OpenMP init aborts the process. This MUST run before `import torch`
+#   (also covers the umap/numba OpenMP that the figures pull in). The clean fix is one OpenMP in the
+#   env (e.g. `conda install nomkl`); override by exporting KMP_DUPLICATE_LIB_OK yourself.
+
 import logging
 from pathlib import Path
 
