@@ -5,12 +5,35 @@ import torch
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.transport import compute_transport_operators
 from vfe3.metrics import (
+    attention_distance_decay,
     attention_entropy,
+    attention_entropy_rows,
+    belief_spectrum,
+    bootstrap_ce_band,
+    bootstrap_token_ce_band,
+    causal_sanity,
     compute_metrics,
+    curvature_field,
     effective_rank,
+    effective_rank_per_token,
+    energy_directedness,
+    estep_residuals,
+    fisher_trace,
+    free_energy_full_decomposition,
     free_energy_terms,
+    gauge_equivariance_residual,
     gauge_trace_spread,
+    group_gauge_invariant,
+    guard_saturation,
+    head_redundancy_js,
     holonomy_deviation,
+    holonomy_deviation_sampled,
+    per_head_gauge_invariants,
+    positional_content_score,
+    self_coupling_profile,
+    spd_geodesic_distance,
+    structured_head_scores,
+    transport_asymmetry,
 )
 
 
@@ -88,3 +111,232 @@ def test_compute_metrics_registry_record():
     )
     assert set(rec) == {"effective_rank", "attention_entropy", "holonomy_deviation", "gauge_trace_spread"}
     assert all(isinstance(v, float) for v in rec.values())
+
+
+# --- publication-figure metrics --------------------------------------------
+
+def test_effective_rank_per_token_keeps_distribution():
+    sigma = torch.rand(6, 4) + 0.1
+    per = effective_rank_per_token(sigma)
+    assert per.shape == (6,)                                       # per-token, not mean-reduced
+    assert torch.allclose(per.mean(), effective_rank(sigma).mean(), atol=1e-5)
+    per_full = effective_rank_per_token(torch.diag_embed(sigma))   # full-cov path == diagonal
+    assert torch.allclose(per_full, per, atol=1e-4)
+
+
+def test_spd_geodesic_distance_zero_symmetric_diag_full_agree():
+    a = torch.rand(5, 3) + 0.2
+    b = torch.rand(5, 3) + 0.2
+    assert float(spd_geodesic_distance(a, a).abs().max()) < 1e-5   # d(S, S) = 0
+    d_ab = spd_geodesic_distance(a, b)
+    assert torch.allclose(d_ab, spd_geodesic_distance(b, a), atol=1e-4)   # symmetric
+    A, B = torch.diag_embed(a), torch.diag_embed(b)               # full embedding agrees
+    assert torch.allclose(spd_geodesic_distance(A, B), d_ab, atol=1e-4)
+
+
+def test_belief_spectrum_eigenvalues_and_condition():
+    sigma = torch.tensor([[4.0, 1.0, 0.25]])                      # K=3 diagonal
+    sp = belief_spectrum(sigma)
+    assert torch.allclose(sp["eigenvalues"][0], torch.tensor([4.0, 1.0, 0.25]), atol=1e-5)
+    assert abs(float(sp["condition"][0]) - 16.0) < 1e-4           # 4.0 / 0.25
+    assert torch.allclose(sp["effective_rank"], effective_rank_per_token(sigma), atol=1e-5)
+
+
+def test_fisher_trace_diag_full_agree():
+    sigma = torch.rand(5, 3) + 0.3
+    ft = fisher_trace(sigma)
+    assert ft.shape == (5,)
+    assert torch.allclose(ft, (0.5 / sigma).sum(-1), atol=1e-5)
+    assert torch.allclose(fisher_trace(torch.diag_embed(sigma)), ft, atol=1e-4)
+
+
+def test_attention_entropy_rows_reduces_to_global():
+    beta = torch.softmax(torch.randn(2, 5, 5), dim=-1)
+    rows = attention_entropy_rows(beta)
+    assert rows.shape == (2, 5)
+    assert torch.allclose(rows.mean(), attention_entropy(beta), atol=1e-5)
+
+
+def test_causal_sanity_on_causal_softmax():
+    N = 6
+    logits = torch.randn(N, N)
+    mask = torch.tril(torch.ones(N, N, dtype=torch.bool))
+    beta = torch.softmax(logits.masked_fill(~mask, float("-inf")), dim=-1)
+    out = causal_sanity(beta)
+    assert float(out["future_leakage"]) < 1e-6                    # no mass above the diagonal
+    assert float(out["row_sum_error"]) < 1e-5                     # rows sum to 1
+    assert abs(float(out["active_set_slope"]) - 1.0) < 0.2        # one new key per query
+
+
+def test_guard_saturation_inert_then_binds():
+    sigma = torch.rand(4, 3) + 0.5                                # well inside [eps, sigma_max]
+    energy = torch.rand(4, 4) * 5.0                               # well below kl_max
+    self_div = torch.rand(4) * 2.0
+    inert = guard_saturation(sigma, energy, self_div, eps=1e-6, sigma_max=5.0, kl_max=100.0)
+    assert all(v < 1e-9 for v in inert.values())                 # nothing pinned on the pure path
+    pinned = guard_saturation(torch.full((4, 3), 5.0), energy, self_div, sigma_max=5.0)
+    assert pinned["sigma_ceil_frac"] > 0.99                       # variance ceiling binds
+
+
+# --- gauge invariants ------------------------------------------------------
+
+def test_group_gauge_invariant_glk_volume_and_zero_at_identity():
+    grp = get_group("glk")(3)
+    exp0 = compute_transport_operators(torch.zeros(1, 4, grp.generators.shape[0]), grp)["exp_phi"][0]
+    assert float(group_gauge_invariant(exp0, grp).abs().max()) < 1e-6      # det I = 1 -> logdet 0
+    phi = 0.2 * torch.randn(1, 4, grp.generators.shape[0])
+    exp_phi = compute_transport_operators(phi, grp)["exp_phi"][0]
+    inv = group_gauge_invariant(exp_phi, grp)
+    assert torch.allclose(inv, torch.linalg.slogdet(exp_phi).logabsdet, atol=1e-5)
+
+
+def test_group_gauge_invariant_so_k_rotation_angle():
+    grp = get_group("so_k")(4)
+    exp0 = compute_transport_operators(torch.zeros(1, 3, grp.generators.shape[0]), grp)["exp_phi"][0]
+    assert float(group_gauge_invariant(exp0, grp).abs().max()) < 1e-6      # no rotation
+    phi = 0.3 * torch.randn(1, 3, grp.generators.shape[0])
+    exp_phi = compute_transport_operators(phi, grp)["exp_phi"][0]
+    assert float(group_gauge_invariant(exp_phi, grp).min()) >= 0.0         # |angles| >= 0
+
+
+def test_per_head_gauge_invariants_blocks_and_identity():
+    grp = get_group("block_glk")(4, 2)
+    exp0 = compute_transport_operators(torch.zeros(1, 3, grp.generators.shape[0]), grp)["exp_phi"][0]
+    out = per_head_gauge_invariants(exp0, grp.irrep_dims)
+    assert out["logdet"].shape == (3, 2) and out["anisotropy"].shape == (3, 2)
+    assert float(out["logdet"].abs().max()) < 1e-6                # identity blocks
+    assert torch.allclose(out["anisotropy"], torch.ones_like(out["anisotropy"]), atol=1e-5)
+
+
+# --- transport / energy directedness --------------------------------------
+
+def test_transport_asymmetry_zero_at_identity_positive_for_gauge():
+    grp = get_group("glk")(3)
+    omega0 = compute_transport_operators(torch.zeros(1, 5, grp.generators.shape[0]), grp)["Omega"][0]
+    assert float(transport_asymmetry(omega0).abs().max()) < 1e-6  # Omega = I -> symmetric
+    omega = compute_transport_operators(0.3 * torch.randn(1, 5, grp.generators.shape[0]), grp)["Omega"][0]
+    assert float(transport_asymmetry(omega).max()) > 1e-2         # directed transport
+
+
+def test_energy_directedness_symmetric_vs_asymmetric():
+    sym = torch.rand(5, 5); sym = sym + sym.t()
+    out = energy_directedness(sym)
+    assert float(out["abs_asymmetry"]) < 1e-6
+    asym = torch.triu(torch.rand(5, 5) + 0.5, diagonal=1)         # upper-only -> asymmetric
+    assert float(energy_directedness(asym)["abs_asymmetry"]) > 1e-2
+
+
+# --- attention structure ---------------------------------------------------
+
+def test_structured_head_scores_prev_token():
+    N = 6
+    beta = torch.zeros(2, N, N)
+    for i in range(1, N):
+        beta[:, i, i - 1] = 1.0
+    beta[:, 0, 0] = 1.0
+    out = structured_head_scores(beta, period=3)
+    assert float(out["prev_token"].min()) > 0.5                   # mass on the previous token
+    assert out["prev_token"].shape == (2,)
+
+
+def test_head_redundancy_js_identical_vs_distinct():
+    N = 5
+    base = torch.softmax(torch.randn(N, N), dim=-1)
+    beta = torch.stack([base, base], dim=0)                       # two identical heads
+    js = head_redundancy_js(beta)
+    assert float(js[0, 1]) < 1e-6
+    other = torch.softmax(torch.randn(N, N), dim=-1)
+    js2 = head_redundancy_js(torch.stack([base, other], dim=0))
+    assert float(js2[0, 1]) > 1e-3
+
+
+def test_attention_distance_decay_shape_and_offsets():
+    beta = torch.softmax(torch.randn(2, 7, 7), dim=-1)
+    out = attention_distance_decay(beta)
+    assert out["profile"].shape == (2, 7) and out["offsets"].shape == (7,)
+
+
+def test_positional_content_score_distance_driven():
+    N = 8
+    ii = torch.arange(N).unsqueeze(-1); jj = torch.arange(N).unsqueeze(0)
+    logits = -(ii - jj).float().masked_fill(ii < jj, float("inf"))
+    beta = torch.softmax(logits.masked_fill(ii < jj, float("-inf")), dim=-1)
+    assert float(positional_content_score(beta)) > 0.8           # log beta linear in offset
+
+
+# --- holonomy / curvature --------------------------------------------------
+
+def test_holonomy_deviation_sampled_flat_vs_random():
+    grp = get_group("glk")(3)
+    omega = compute_transport_operators(0.2 * torch.randn(1, 8, grp.generators.shape[0]), grp)["Omega"][0]
+    flat = holonomy_deviation_sampled(omega, n_triples=64, seed=0)
+    assert float(flat["mean"]) < 1e-3                            # flat cocycle closes
+    g = torch.Generator().manual_seed(0)
+    rand = torch.eye(3).expand(8, 8, 3, 3) + 0.3 * torch.randn(8, 8, 3, 3, generator=g)
+    assert float(holonomy_deviation_sampled(rand, n_triples=64, seed=0)["mean"]) > 1e-2
+
+
+def test_curvature_field_flat_is_zero():
+    grp = get_group("glk")(3)
+    omega = compute_transport_operators(0.2 * torch.randn(1, 6, grp.generators.shape[0]), grp)["Omega"][0]
+    assert float(curvature_field(omega, anchor=0).abs().max()) < 1e-3
+
+
+# --- free-energy closure / profile / residuals -----------------------------
+
+def test_free_energy_full_decomposition_closes_and_guards():
+    out = free_energy_full_decomposition(2.0, 10.0, 5.0, 188.0, lambda_beta=2.0)
+    assert abs(out["total"] - (2.0 + 2.0 * 10.0 + 2.0 * 5.0 + 188.0)) < 1e-6
+    assert abs(out["belief_coupling"] - 20.0) < 1e-6                # lambda_beta scaling applied
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        free_energy_full_decomposition(1.0, 1.0, 1.0, 1.0, lambda_h=0.1)
+        assert any(issubclass(x.category, RuntimeWarning) for x in w)   # undercount guard fires
+
+
+def test_self_coupling_profile_per_coord_sums():
+    self_div = torch.rand(5, 3)                                    # per-coordinate
+    alpha = torch.ones(5, 3)
+    prof = self_coupling_profile(self_div, alpha)
+    assert prof["self_div"].shape == (5,)
+    assert torch.allclose(prof["self_coupling_per_token"], self_div.sum(-1), atol=1e-5)
+
+
+def test_estep_residuals_zero_for_constant_trajectory():
+    mu = torch.randn(4, 6, 3).cumsum(0)                           # moving means
+    const_mu = mu[:1].expand(4, 6, 3)                             # constant -> zero residual
+    sigma = (torch.rand(4, 6, 3) + 0.5)
+    const_sig = sigma[:1].expand(4, 6, 3)
+    phi = torch.randn(4, 6, 2)
+    const_phi = phi[:1].expand(4, 6, 2)
+    res = estep_residuals(const_mu, const_sig, const_phi)
+    assert float(res["r_mu"].abs().max()) < 1e-6
+    assert float(res["r_sigma"].abs().max()) < 1e-6
+    moving = estep_residuals(mu, sigma, phi)
+    assert moving["r_mu"].shape == (3, 6)                          # T = T+1 - 1
+
+
+def test_bootstrap_ce_band_brackets_point():
+    nats = torch.rand(40) * 5.0 + 1.0
+    toks = torch.full((40,), 10.0)
+    band = bootstrap_ce_band(nats, toks, n_boot=500, seed=0)
+    assert band["lo"] <= band["ce"] <= band["hi"]
+
+
+def test_bootstrap_token_ce_band_paired_zero_when_equal():
+    a = torch.rand(200)
+    band = bootstrap_token_ce_band(a, a, n_boot=300, seed=0)
+    assert abs(band["delta"]) < 1e-6 and abs(band["lo"]) < 1e-6 and abs(band["hi"]) < 1e-6
+
+
+def test_gauge_equivariance_residual_in_vs_out_group():
+    torch.manual_seed(0)
+    grp = get_group("block_glk")(4, 2)
+    n_gen = grp.generators.shape[0]
+    omega = compute_transport_operators(0.2 * torch.randn(1, 5, n_gen), grp)["Omega"][0]
+    mu = torch.randn(5, 4)
+    sigma = torch.rand(5, 4) + 0.5
+    out = gauge_equivariance_residual(mu, sigma, omega, grp, n_samples=4, scale=0.4, seed=0)
+    assert float(out["energy_in_group"].max()) < 1e-2             # invariant to machine tolerance
+    assert float(out["energy_out_group"].mean()) > 10 * float(out["energy_in_group"].mean() + 1e-12)
