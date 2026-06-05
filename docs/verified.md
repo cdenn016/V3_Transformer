@@ -3,6 +3,47 @@
 Per the CLAUDE.md audit/verification policy: each entry states WHAT was checked, whether it was
 INCORRECT, and whether it was RIGOROUSLY verified. Consult this before re-verifying the same thing.
 
+## 2026-06-05 — Rényi/alpha-divergence + alpha_div ablation (see docs/audits/audit-2026-06-05.md)
+
+- **Gaussian Rényi closed forms (diagonal, full-cov, per-coordinate).** CHECKED, CORRECT, RIGOROUS
+  (CONFIRMED). `vfe3/families/gaussian.py:88-99,101-131,230-256` match the canonical multivariate
+  Gaussian Rényi D_alpha(q||p) = (alpha/2)Delta^T Sigma_a^{-1} Delta - 1/(2(alpha-1)) ln(|Sigma_a| /
+  (|Sigma_q|^{1-alpha}|Sigma_p|^alpha)), Sigma_a = (1-alpha)Sigma_q + alpha Sigma_p (van Erven &
+  Harremoës 2014; Gil/Alajaji/Linder 2013), term-for-term, correct q||p orientation. Passes
+  self-divergence-zero, non-negativity, monotonicity in alpha, alpha->1 KL limit, full-vs-diagonal
+  agreement, per-coord summation. Configured alpha genuinely reaches `renyi_closed_form` for BOTH the
+  attention energy and the belief gradient (alpha=1-only geometric-mean kernel correctly gated off for
+  alpha!=1; Rényi is NOT silently running as KL). For alpha in (0,1) the blend is convex -> SPD;
+  autograd gradient finite and FD-matched to fp32; saturates kl_max LESS than KL.
+
+- **Softmax-beta stationarity + EM separation under Rényi.** CHECKED, CORRECT, RIGOROUS (CONFIRMED).
+  The beta-block gradient equals the `-tau log Z` envelope gradient to ~1e-7 at alpha=0.5 and 1.0;
+  the row-Lagrangian needs only linearity in beta + the entropy term, not KL (disclosed
+  `GL(K)_supplementary.tex:1084`). E-step takes only priors (no labels) -> EM separation intact.
+
+- **Variational-bound status for alpha!=1 — INTERPRETIVE, author-disclosed.** CHECKED. For alpha!=1
+  F is an entropy-regularized consensus functional, NOT an evidence bound (the alignment block is no
+  longer KL[q_i||Omega_ij q_j]). Disclosed: forward KL is the unique f-divergence preserving exp-family
+  closure + dual attention (`GL(K)_attention.tex:771`); closed-form stationary belief is alpha=1-specific
+  (`GL(K)_supplementary.tex:1096`). Heuristic generalization by design, not a defect.
+
+- **alpha_div ablation is CONFOUNDED (the user's symptom).** CHECKED, CONFIRMED, reproduced. NOT a
+  divergence-math bug. alpha_div=1 uses the live analytic kernel; alpha_div!=1 falls to the autograd
+  oracle which, under the default `oracle_unroll_grad=False`, returns a DETACHED belief gradient
+  (`oracle.py:118`, gated by `e_step.py:357` + `config.py:247`). With `e_phi_lr=0`, that detaches the
+  prior + gauge-frame tables from the loss (prior grad 651->0; phi_embed/pos_phi_free grad -> None),
+  giving both the 2.5x speedup (dropped backward graph; oracle is 1.9x slower PER CALL) and worse PPL.
+  Falsifier = the sweep's own alpha_div=0.99 row: PPL 159->273, wall 1672->695s discontinuously at the
+  kernel gate `abs(alpha-1)<1e-9`, impossible for continuous divergence-order. Pure path EXISTS
+  (`oracle_unroll_grad=True`, test-pinned `tests/test_e_step.py:306`); fix = force it on alpha_div!=1
+  sweep rows and rerun. Two real non-bug effects remain (self-coupling magnitude shift via larger
+  alpha^(k) for alpha<1; softer attention at fixed tau).
+
+- **Latent (not the user's regime):** diagonal alpha>1 `sigma_blend.clamp(min=eps)`
+  (`gaussian.py:89,123`) masks a non-PD blend as a WRONG finite value instead of NaN->kl_max (full-cov
+  handles it correctly) — MEDIUM, alpha>1 diagonal only. KL-branch threshold mismatch (kernel 1e-9 vs
+  formula 1e-6) and float32 hard-switch near alpha=1 with no Taylor branch — LOW, no config sits there.
+
 ## 2026-06-03 — Deep-audit corrections (see docs/audits/audit-2026-06-03.md)
 
 - **Per-block sl(K)/trace det-control under `tied_block_glk`.** CHECKED, was **INCORRECT**, now FIXED

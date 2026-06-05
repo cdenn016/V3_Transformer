@@ -86,7 +86,14 @@ class DiagonalGaussian(BeliefParams):
             logdet_term = (torch.log(sigma_t) - torch.log(sigma_q)).sum(dim=-1)
             div = 0.5 * (trace_term + mahal_term - K + logdet_term)
         else:
-            sigma_blend = ((1.0 - alpha) * sigma_q + alpha * sigma_t).clamp(min=eps)
+            # alpha in (0,1): the blend is a convex combination of positive variances, so it is
+            # always > 0 and the mask below is inert (byte-identical to the old clamp-only path).
+            # alpha > 1 leaves the convex regime: a coordinate's blend can go non-positive, which
+            # makes the divergence undefined. clamp(min=eps) here only guards log/division on the
+            # GOOD coordinates; a non-PD coordinate maps the whole pair to NaN -> kl_max below,
+            # mirroring the full-cov safe_cholesky mask (instead of emitting a wrong finite value).
+            raw_blend   = (1.0 - alpha) * sigma_q + alpha * sigma_t
+            sigma_blend = raw_blend.clamp(min=eps)
             delta       = mu_t - mu_q
             mahal_term  = (alpha * (delta ** 2) / sigma_blend).sum(dim=-1)
             logdet_per_dim = (
@@ -96,6 +103,8 @@ class DiagonalGaussian(BeliefParams):
             )
             logdet_term = logdet_per_dim.sum(dim=-1) / (alpha - 1.0)
             div = 0.5 * (mahal_term + logdet_term)
+            ok  = (raw_blend > 0.0).all(dim=-1)            # any non-PD coordinate -> NaN -> kl_max
+            div = torch.where(ok, div, div.new_tensor(float("nan")))
         return safe_kl_clamp(div, kl_max=kl_max)
 
     def renyi_per_coord(
@@ -120,7 +129,12 @@ class DiagonalGaussian(BeliefParams):
                 + torch.log(sigma_t) - torch.log(sigma_q)
             )
         else:
-            sigma_blend = ((1.0 - alpha) * sigma_q + alpha * sigma_t).clamp(min=eps)
+            # See renyi_closed_form: alpha in (0,1) blend is always > 0 (mask inert, byte-identical);
+            # for alpha > 1 a non-positive-blend coordinate is masked to NaN -> kl_max PER COORDINATE
+            # (the per-coord twin of the summed mask), so a bad coordinate is gated without killing
+            # its in-bounds neighbours.
+            raw_blend   = (1.0 - alpha) * sigma_q + alpha * sigma_t
+            sigma_blend = raw_blend.clamp(min=eps)
             mahal       = alpha * (delta ** 2) / sigma_blend
             logdet      = (
                 (1.0 - alpha) * torch.log(sigma_q)
@@ -128,6 +142,7 @@ class DiagonalGaussian(BeliefParams):
                 - torch.log(sigma_blend)
             ) / (alpha - 1.0)
             per_coord = 0.5 * (mahal + logdet)
+            per_coord = torch.where(raw_blend > 0.0, per_coord, per_coord.new_tensor(float("nan")))
         return safe_kl_clamp(per_coord, kl_max=kl_max)
 
 
