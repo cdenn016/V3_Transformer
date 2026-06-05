@@ -419,16 +419,26 @@ class VFEModel(nn.Module):
             # manuscript algorithm (E-step phi gradient and M-step loss both carry alpha_phi/2||phi||^2).
             loss = loss + 0.5 * self.cfg.mass_phi * (out.phi ** 2).mean()
         if self.cfg.mstep_self_coupling_weight > 0.0:
-            # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2083):
-            # L += alpha_hat * sum_i KL(q_i*||p_i), the mean self-divergence of the CONVERGED belief
-            # (out.mu/out.sigma, BEFORE head_mixer/norm) vs the per-block prior. Opt-in, default-off
-            # (weight 0 -> byte-identical to the pure path). Grad-connected (no detach), so it
-            # backprops to the learned prior tables, like mass_phi. The last-block prior is rebuilt
-            # by mirroring vfe_stack's prior_handoff fold; EXACT at n_layers=1 (loop empty -> p =
-            # encode belief), an approximation otherwise (one converged belief stands in for the
-            # per-block intermediates), matching diagnostics().
+            # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2111):
+            # L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the alpha-weighted self-coupling of the
+            # CONVERGED belief (out.mu/out.sigma, BEFORE head_mixer/norm) vs the per-block prior.
+            # alpha_i is the SAME registered self-coupling form as the E-step / diagnostics
+            # (self_coupling_alpha keyed off cfg.alpha_mode), so under state_dependent_per_coord the
+            # term carries the per-token, per-coordinate alpha_i^(k)* = c0/(b0+D^(k)) rather than a
+            # flat scalar; cfg.mstep_self_coupling_weight (= alpha_hat) is the overall scale. alpha_i
+            # is DETACHED: by the alpha-envelope (alpha* is the stationary point of alpha*D + R(alpha),
+            # so d/dalpha[alpha*D + R] = 0 there), the M-step gradient of the F self-term w.r.t. the
+            # priors is alpha_i* dD/dtheta with alpha_i* held fixed -- detaching it (and dropping R)
+            # is exact for the closed-form forms (constant/state_dependent/state_dependent_per_coord);
+            # for the learnable NN-exception alpha, log_alpha still trains through the E-step path.
+            # At constant alpha=1.0 (the default) alpha_i==1, byte-identical to the prior mean-D form.
+            # Grad-connected through D (no detach on D), so it backprops to the learned prior tables,
+            # like mass_phi. The last-block prior is rebuilt by mirroring vfe_stack's prior_handoff
+            # fold; EXACT at n_layers=1 (loop empty -> p = encode belief), an approximation otherwise
+            # (one converged belief stands in for the per-block intermediates), matching diagnostics().
             from vfe3.families import get_family
             from vfe3.free_energy import self_divergence_for_alpha
+            from vfe3.alpha_i import self_coupling_alpha, alpha_is_per_coord
             cfg = self.cfg
             rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
             mu_p, sigma_p = beliefs.mu, beliefs.sigma
@@ -436,11 +446,19 @@ class VFEModel(nn.Module):
                 mu_p = (1.0 - rho) * mu_p + rho * out.mu
                 sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
             fam = get_family(cfg.family)
-            sc = self_divergence_for_alpha(
+            self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
                 fam(out.mu, out.sigma), fam(mu_p, sigma_p),
                 alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
-            ).mean()
+            )
+            alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
+                self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+                log_alpha=getattr(self, "log_alpha", None),
+            )
+            coupling = alpha_sc.detach() * self_div            # alpha_i^(k)* D^(k) (envelope: alpha* fixed)
+            if alpha_is_per_coord(cfg.alpha_mode):
+                coupling = coupling.sum(dim=-1)                # sum_k alpha^(k) D^(k) -> per-token
+            sc = coupling.mean()                               # mean over batch and tokens (B, N)
             loss = loss + cfg.mstep_self_coupling_weight * sc
         if self.cfg.lambda_h > 0.0:
             # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
