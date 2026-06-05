@@ -881,6 +881,9 @@ def compute_metrics(
     names: List[str],
 
     **context,
-) -> Dict[str, float]:
-    r"""Run the named metrics against the keyword ``context`` (sigma=, beta=, omega=, ...)."""
+) -> Dict[str, 'float | Dict[str, float]']:
+    r"""Run the named metrics against the keyword ``context`` (sigma=, beta=, omega=, ...).
+
+    Most metrics return a float; ``free_energy_terms`` returns a nested ``Dict[str, float]``,
+    so the value type is widened accordingly."""
     return {n: get_metric(n)(**context) for n in names}

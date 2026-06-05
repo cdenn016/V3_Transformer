@@ -304,8 +304,11 @@ class VFEModel(nn.Module):
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
         targets:   Optional[torch.Tensor] = None,   # (B, N) next-token ids (-100 = ignore)
-    ) -> 'torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
-        r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given."""
+    ) -> 'torch.Tensor | Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]':
+        r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given.
+
+        On the fused-chunked training path logits is None (callers discard it there), hence the
+        Optional first element of the training tuple."""
         B, N = token_ids.shape
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
         beliefs = beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))
@@ -565,10 +568,11 @@ class VFEModel(nn.Module):
                     logits = logits.masked_fill(logits < kth, float("-inf"))
                 if top_p is not None:
                     sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
-                    cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                    sorted_probs = sorted_logits.softmax(dim=-1)       # compute the softmax once
+                    cumprobs = sorted_probs.cumsum(dim=-1)
                     # Keep the smallest nucleus whose cumprob reaches top_p; the strict
                     # shift always keeps the top token (its cumprob>=p never removes it).
-                    remove = cumprobs - sorted_logits.softmax(dim=-1) >= top_p
+                    remove = cumprobs - sorted_probs >= top_p
                     remove_unsorted = remove.scatter(-1, sorted_idx, remove)
                     logits = logits.masked_fill(remove_unsorted, float("-inf"))
                 probs = logits.softmax(dim=-1)                      # (B, V)
