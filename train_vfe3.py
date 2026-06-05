@@ -19,6 +19,12 @@ smoke) job: run it on the CUDA interpreter (the RTX 5090), or drop ``MAX_TOKENS`
 ``max_steps`` for a quick slice on CPU.
 """
 
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each ship a
+#   libiomp5md.dll; the duplicate OpenMP init aborts the process (seen with n_e_steps>1). This MUST
+#   run before `import torch`. The clean fix is one OpenMP in the env (e.g. `conda install nomkl`);
+#   override by exporting KMP_DUPLICATE_LIB_OK yourself. See docs/edits/2026-06-05.
+
 import logging
 
 import torch
@@ -59,11 +65,11 @@ config = dict(
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 64,
-    max_steps                 = 15000,
+    batch_size                = 16,
+    max_steps                 = 500,
     
     n_layers                  = 1,                   # L, number of blocks
-    n_e_steps                 = 1,                   # T, E-step inner iterations
+    n_e_steps                 = 5,                   # T, E-step inner iterations
     
     
 
@@ -128,7 +134,7 @@ config = dict(
     e_phi_lr                  = 0.0,
     
     e_sigma_q_trust           = 5.0,
-    sigma_max                 = 5.0,
+    sigma_max                 = 10.0,
     
     gradient_mode             = "filtering",          # "filtering" | "smoothing"
     
@@ -171,11 +177,11 @@ config = dict(
     divergence_family         = "renyi",             # "renyi"
     alpha_div                 = 1.0,                  # Renyi order (1.0 -> KL)
     
-    warmup_steps              = 100,
+    warmup_steps              = 1,
     seed                      = SEED,
     
-    log_interval              = 200,                  # console log every N steps (0 = off)
-    eval_interval             = 1500,                   # periodic validation every N steps (0 = off)
+    log_interval              = 1,                  # console log every N steps (0 = off)
+    eval_interval             = 50,                   # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,                  # save a resumable checkpoint every N steps (0 = off)
     
     

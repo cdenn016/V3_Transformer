@@ -38,6 +38,12 @@ Three guards make this safe for VFE_3.0's strict config surface:
      as ``ppl = inf``.
 """
 
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each ship a
+#   libiomp5md.dll; the duplicate OpenMP init aborts the process (seen with n_e_steps>1). This MUST
+#   run before `import torch`. The clean fix is one OpenMP in the env (e.g. `conda install nomkl`);
+#   override by exporting KMP_DUPLICATE_LIB_OK yourself. See docs/edits/2026-06-05.
+
 import copy
 import csv
 import gc
@@ -81,8 +87,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     max_seq_len                = 128,                         # N, context length
     
-    batch_size                 = 128,
-    max_steps                  = 2500,
+    batch_size                 = 64,
+    max_steps                  = 15000,
     
     n_layers                   = 1,                           # L, number of blocks
     n_e_steps                  = 1,                           # T, E-step inner iterations
@@ -542,7 +548,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "values": [0.055, 0.06, 0.0625, 0.065, 0.0675],
+        "param": "weight_decay", "values": [0.01, 0.05, 0.06, 0.0625, 0.065, 0.0675, 0.1],
     },
     
     
@@ -605,16 +611,16 @@ SWEEP_ORDER: List[str] = [
     
     
   
-   # "weight_decay",
 
- #   "lambda_beta",
-  #  "kappa",
     
     "m_phi_lr",
     "m_mu_lr",
   #  "alpha_div",
     
- 
+     "weight_decay",
+
+ #   "lambda_beta",
+    "kappa",
     "m_sigma_lr",
     "e_sigma_lr",
     
