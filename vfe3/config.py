@@ -555,6 +555,12 @@ class VFE3Config:
             raise ValueError(f"prior_handoff_rho must be in [0,1], got {self.prior_handoff_rho}")
         if not (0.0 <= self.prior_handoff_sigma <= 1.0):
             raise ValueError(f"prior_handoff_sigma must be in [0,1], got {self.prior_handoff_sigma}")
+        # cocycle_relaxation is the regime_ii homotopy weight delta = cocycle_relaxation * (...) in
+        # transport._build_regime_ii (0 -> flat cocycle, 1 -> fully relaxed). It had no guard and feeds
+        # the connection directly, so a NaN/inf/out-of-range value propagated silently. The bracketed
+        # form also rejects NaN (nan <= 1.0 is False) and +/-inf, unlike a bare `< 0` check.
+        if not (0.0 <= self.cocycle_relaxation <= 1.0):
+            raise ValueError(f"cocycle_relaxation must be in [0,1], got {self.cocycle_relaxation}")
 
         # normalization
         _require(self.norm_type_block, _VALID_NORMS, "norm_type_block")
