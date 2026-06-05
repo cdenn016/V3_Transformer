@@ -309,3 +309,81 @@ def numerical_health(
         "nan_beta":   nan_inf_fraction(beta),
         "max_condition": cond,
     }
+
+
+@torch.no_grad()
+def converged_state(
+    model,
+    token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+) -> Dict[str, torch.Tensor]:
+    r"""The converged-belief diagnostic state of one sequence, as tensors for the figures.
+
+    Mirrors :meth:`VFEModel.diagnostics` EXACTLY (same active config: transport mode,
+    connection_W, rope, family, divergence, alpha) but returns the underlying tensors the scalar
+    diagnostics discard. The gauge-equivariance certificate, per-head gauge invariants, belief
+    spectrum / SPD ellipses, and the guard-saturation / causal panels all read from these. Returns
+    the converged ``mu`` (N, K), ``sigma`` (N, K) or (N, K, K), ``phi`` (N, n_gen), the per-token
+    vertex factor ``exp_phi`` (N, K, K) = exp(embed(phi_i)), the pre-rope pairwise transport
+    ``omega`` (N, N, K, K) (the phi-cocycle the equivariance/holonomy metrics co-transform),
+    the pairwise ``energy`` and attention ``beta`` ((N, N) or (H, N, N)), and the per-token
+    self-divergence ``self_div`` (N,) or (N, K).
+    """
+    from vfe3.model.stack import vfe_stack
+    from vfe3.geometry.transport import RopeTransport, compute_transport_operators
+
+    cfg = model.cfg
+    was_training = model.training
+    model.eval()
+    try:
+        belief, log_prior, rope = _encode_one(model, token_ids)
+        out = vfe_stack(
+            belief, belief.mu, belief.sigma, model.group, cfg,
+            log_prior=log_prior, block_norm=model.block_norm,
+            log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
+            connection_W=getattr(model, "connection_W", None),
+            rope=rope, rope_on_cov=cfg.rope_full_gauge,
+        )
+        rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma     # rebuild last-block prior
+        mu_p, sigma_p = belief.mu, belief.sigma                         # exact iff L==1 or rho==0
+        for _ in range(cfg.n_layers - 1):
+            mu_p = (1.0 - rho) * mu_p + rho * out.mu
+            sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
+        omega = _transport(                                            # (N, N, K, K) phi-cocycle (pre-rope)
+            out.phi, model.group, transport_mode=cfg.transport_mode,
+            mu=(out.mu if cfg.transport_mode == "regime_ii" else None),
+            connection_W=getattr(model, "connection_W", None),
+            cocycle_relaxation=cfg.cocycle_relaxation,
+        )
+        if rope is not None:
+            rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge)
+            mu_t    = transport_mean(rope_omega, out.mu)
+            sigma_t = transport_covariance(rope_omega, out.sigma)
+        else:
+            mu_t    = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
+            sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
+        fam = get_family(cfg.family)
+        energy = pairwise_energy(
+            fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.alpha_div,
+            kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
+            irrep_dims=model.group.irrep_dims,
+        )
+        beta = attention_weights(energy, tau=attention_tau(cfg.kappa, model.group.irrep_dims), log_prior=log_prior)
+        self_div = self_divergence_for_alpha(
+            fam(out.mu, out.sigma), fam(mu_p, sigma_p), alpha=cfg.alpha_div,
+            kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
+            alpha_mode=cfg.alpha_mode,
+        )
+        exp_phi = compute_transport_operators(out.phi.unsqueeze(0), model.group)["exp_phi"][0]
+    finally:
+        if was_training:
+            model.train()
+    return {
+        "mu":       out.mu,
+        "sigma":    out.sigma,
+        "phi":      out.phi,
+        "exp_phi":  exp_phi,
+        "omega":    omega,
+        "energy":   energy,
+        "beta":     beta,
+        "self_div": self_div,
+    }
