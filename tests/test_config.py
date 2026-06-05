@@ -153,6 +153,18 @@ def test_per_coord_alpha_requires_diagonal_family():
     VFE3Config(alpha_mode="state_dependent_per_coord")          # family defaults to diagonal -> ok
 
 
+def test_per_coord_alpha_requires_renyi_functional():
+    """state_dependent_per_coord weights each coordinate by its own alpha^(k), needing a per-coordinate
+    self-divergence. That decomposition is registered only for the Renyi functional (KL = Renyi at
+    alpha=1); a non-Renyi divergence_family otherwise constructs fine and crashes only at the first
+    forward (free_energy.self_divergence_per_coord raises). Reject the pair at construction, mirroring
+    the covariance guard above. The DEFAULT diagonal family is used so the covariance guard does not
+    mask this functional check; the Renyi default is accepted (no over-rejection)."""
+    with pytest.raises(ValueError):
+        VFE3Config(alpha_mode="state_dependent_per_coord", divergence_family="squared_hellinger")
+    VFE3Config(alpha_mode="state_dependent_per_coord")          # divergence_family defaults to renyi -> ok
+
+
 def test_decode_mode_full_rejects_diagonal_family():
     # 'full' KL-decode consumes a (B,N,K,K) sigma; with a diagonal family (sigma (B,N,K)) it is a
     # shape crash at the first prior-bank forward -- reject at construction (the shipped-arm direction).

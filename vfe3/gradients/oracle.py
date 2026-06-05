@@ -21,7 +21,16 @@ import torch
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.families.base import get_family
 from vfe3.free_energy import free_energy, pairwise_energy, self_divergence_for_alpha
-from vfe3.geometry.transport import transport_covariance, transport_mean
+# FactoredTransport / RopeTransport are named in the `omega` forward-ref annotation below; import
+# them at runtime (alongside the transport helpers this module already imports) so
+# typing.get_type_hints resolves the annotation. transport.py does not import this module, so there
+# is no import cycle.
+from vfe3.geometry.transport import (
+    FactoredTransport,
+    RopeTransport,
+    transport_covariance,
+    transport_mean,
+)
 
 
 # The belief update is part of the model FORWARD (iterative belief minimization), so this

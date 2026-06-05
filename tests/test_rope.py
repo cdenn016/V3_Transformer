@@ -107,6 +107,18 @@ def test_attention_maps_reflect_rope():
     assert not torch.allclose(a, b, atol=1e-5)             # RoPE changes the per-head attention
 
 
+def test_diagnostics_runs_under_rope():
+    # diagnostics() replays the E-step and must thread the ACTIVE rope into vfe_stack (matching the
+    # forward), so the rope!=None convergence branch is exercised. Default configs use pos_rotation
+    # 'none', so without this the threaded path is never run. Assert the metrics come back finite
+    # (abs(v) < inf is False for both +/-inf and NaN).
+    torch.manual_seed(0)
+    x = torch.randint(0, 6, (1, 8))
+    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    diag = roped.diagnostics(x)
+    assert diag and all(abs(v) < float("inf") for v in diag.values())
+
+
 from vfe3.gradients.kernels import belief_gradients
 from vfe3.gradients.oracle import belief_gradients_autograd
 

@@ -430,6 +430,18 @@ class VFE3Config:
                 f"exists only for a diagonal-covariance family; got family={self.family!r}. Use "
                 f"a diagonal family (e.g. 'gaussian_diagonal') or a per-position alpha_mode."
             )
+        # The per-coordinate self-divergence is registered only for the Renyi functional (KL = Renyi
+        # at alpha=1); free_energy.self_divergence_per_coord raises for any other divergence_family.
+        # Reject the non-Renyi pair at construction too -- mirroring that runtime raise -- so this
+        # doubly-opt-in path fails fast at config time rather than only at the first forward (the
+        # covariance half is rejected just above).
+        if alpha_is_per_coord(self.alpha_mode) and self.divergence_family != "renyi":
+            raise ValueError(
+                f"alpha_mode={self.alpha_mode!r} needs a per-coordinate self-divergence, which is "
+                f"implemented for the 'renyi' functional only (KL = Renyi at alpha=1); got "
+                f"divergence_family={self.divergence_family!r}. Use divergence_family='renyi' or a "
+                f"per-position alpha_mode."
+            )
 
         # attention
         _require(self.attention_prior, _VALID_ATTENTION_PRIORS, "attention_prior")
@@ -543,6 +555,12 @@ class VFE3Config:
             raise ValueError(f"prior_handoff_rho must be in [0,1], got {self.prior_handoff_rho}")
         if not (0.0 <= self.prior_handoff_sigma <= 1.0):
             raise ValueError(f"prior_handoff_sigma must be in [0,1], got {self.prior_handoff_sigma}")
+        # cocycle_relaxation is the regime_ii homotopy weight delta = cocycle_relaxation * (...) in
+        # transport._build_regime_ii (0 -> flat cocycle, 1 -> fully relaxed). It had no guard and feeds
+        # the connection directly, so a NaN/inf/out-of-range value propagated silently. The bracketed
+        # form also rejects NaN (nan <= 1.0 is False) and +/-inf, unlike a bare `< 0` check.
+        if not (0.0 <= self.cocycle_relaxation <= 1.0):
+            raise ValueError(f"cocycle_relaxation must be in [0,1], got {self.cocycle_relaxation}")
 
         # normalization
         _require(self.norm_type_block, _VALID_NORMS, "norm_type_block")

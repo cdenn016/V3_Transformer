@@ -234,10 +234,15 @@ def test_model_diagnostics_holonomy_tracks_regime():
 
 
 def test_config_cocycle_relaxation_default_and_validated():
-    """cocycle_relaxation defaults to 1.0 and is a plain float field (the homotopy alpha)."""
+    """cocycle_relaxation defaults to 1.0, accepts the [0,1] homotopy range, and rejects
+    out-of-range / non-finite values at construction (it feeds the regime_ii connection directly)."""
     assert VFE3Config().cocycle_relaxation == 1.0
     assert VFE3Config(transport_mode="regime_ii", cocycle_relaxation=0.0).cocycle_relaxation == 0.0
     assert VFE3Config(transport_mode="regime_ii", cocycle_relaxation=0.5).cocycle_relaxation == 0.5
+    assert VFE3Config(transport_mode="regime_ii", cocycle_relaxation=1.0).cocycle_relaxation == 1.0
+    for bad in (-0.1, 1.5, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            VFE3Config(transport_mode="regime_ii", cocycle_relaxation=bad)
 
 
 from vfe3.belief import BeliefState

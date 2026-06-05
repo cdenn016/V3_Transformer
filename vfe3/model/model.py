@@ -304,8 +304,11 @@ class VFEModel(nn.Module):
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
         targets:   Optional[torch.Tensor] = None,   # (B, N) next-token ids (-100 = ignore)
-    ) -> 'torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
-        r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given."""
+    ) -> 'torch.Tensor | Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]':
+        r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given.
+
+        On the fused-chunked training path logits is None (callers discard it there), hence the
+        Optional first element of the training tuple."""
         B, N = token_ids.shape
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
         beliefs = beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))
@@ -486,7 +489,7 @@ class VFEModel(nn.Module):
             # uses. The mean over (B, H, N) makes gamma_coupling=1 a per-token-per-head mean weight, not
             # the canonical sum-over-ij.
             from vfe3.families.gaussian import DiagonalGaussian
-            from vfe3.free_energy import pairwise_energy, reduced_free_energy
+            from vfe3.free_energy import attention_tau, pairwise_energy, reduced_free_energy
             from vfe3.geometry.transport import (
                 compute_transport_operators,
                 transport_covariance,
@@ -503,11 +506,17 @@ class VFEModel(nn.Module):
                 DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(s_mu_t, s_sigma_t),
                 alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
-            )                                                            # (B, H, N, N)
+            )                                                            # (B,H,N,N) block_glk; (B,N,N) single-block
             gamma_log_prior = self._attention_log_prior(
                 n_pos, token_ids.device, prior=cfg.gamma_attention_prior,
             )                                                            # (N, N), cached buffer
-            f_red_s = reduced_free_energy(e_s, tau=cfg.tau_gamma, log_prior=gamma_log_prior)   # (B, H, N)
+            # Group-aware temperature: tau spans the dimension the energy accumulates over (the
+            # gauge-irrep block size), exactly as the belief beta channel does. cfg.tau_gamma uses
+            # sqrt(d_head)=sqrt(K/n_heads), which is correct only for block_glk (irrep_dims=[d_head]*H)
+            # and understates tau by sqrt(n_heads) on a single-block group (irrep_dims=[K], energy over
+            # the full K). kappa_gamma is gamma's own sharpness handle (not cfg.kappa).
+            gamma_tau = attention_tau(cfg.kappa_gamma, self.group.irrep_dims)
+            f_red_s = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior)   # (B,H,N) or (B,N)
             loss = loss + cfg.gamma_coupling * f_red_s.mean()
         return logits, loss, ce.detach()
 
@@ -559,10 +568,11 @@ class VFEModel(nn.Module):
                     logits = logits.masked_fill(logits < kth, float("-inf"))
                 if top_p is not None:
                     sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
-                    cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                    sorted_probs = sorted_logits.softmax(dim=-1)       # compute the softmax once
+                    cumprobs = sorted_probs.cumsum(dim=-1)
                     # Keep the smallest nucleus whose cumprob reaches top_p; the strict
                     # shift always keeps the top token (its cumprob>=p never removes it).
-                    remove = cumprobs - sorted_logits.softmax(dim=-1) >= top_p
+                    remove = cumprobs - sorted_probs >= top_p
                     remove_unsorted = remove.scatter(-1, sorted_idx, remove)
                     logits = logits.masked_fill(remove_unsorted, float("-inf"))
                 probs = logits.softmax(dim=-1)                      # (B, V)
@@ -611,12 +621,14 @@ class VFEModel(nn.Module):
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         _llb = getattr(self, "log_lambda_beta", None)
+        rope = self._rope_rotation(n, token_ids.device)               # rope shapes the converged belief (as forward)
         out = vfe_stack(                                              # converged belief
             belief, belief.mu, belief.sigma, self.group, cfg,
             log_prior=log_prior, block_norm=self.block_norm,
             log_alpha=getattr(self, "log_alpha", None),               # learned scalar (None on the pure path)
             lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
+            rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
         )
 
         rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
@@ -629,7 +641,7 @@ class VFEModel(nn.Module):
         # Match the forward's transport regime so holonomy_deviation reads the ACTUAL connection
         # (flat -> ~0; regime_ii with a trained connection_W -> the non-trivial holonomy). regime_ii
         # reads the converged means out.mu and the learned connection_W; flat ignores both.
-        rope = self._rope_rotation(n, token_ids.device)
+        # (rope was computed above and now also shaped the converged belief.)
         omega = _transport(                                          # (N, N, K, K)
             out.phi, self.group, transport_mode=cfg.transport_mode,
             mu=(out.mu if cfg.transport_mode == "regime_ii" else None),
@@ -724,6 +736,7 @@ class VFEModel(nn.Module):
                 log_alpha=getattr(self, "log_alpha", None),
                 lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
+                rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
             )
             # Attention at the converged belief, recomputed exactly as diagnostics does: the
             # transport regime is matched so regime_ii reads the means + learned connection_W
