@@ -68,6 +68,52 @@ def test_linear_in_weight():
     assert torch.allclose(loss, ce + w * sc, atol=1e-6)
 
 
+def _converged_self_coupling_per_coord(
+    model: VFEModel, tokens: torch.Tensor, *, b0: float, c0: float,
+) -> torch.Tensor:
+    r"""Independent oracle for the per-coord-weighted M-step self-term: replicate forward's
+    converged belief + last-block prior, then weight each coordinate's self-divergence by its
+    OWN alpha^(k)* = c0/(b0 + D^(k)) (detached, the envelope-stationary value), sum over k, mean
+    over (B, N). alpha^(k) is recomputed from the closed form here, not via ``self_coupling_alpha``,
+    so the test is an independent check of the formula forward applies."""
+    cfg = model.cfg
+    beliefs = model.prior_bank.encode(tokens)
+    log_prior = model._attention_log_prior(tokens.shape[1], tokens.device)
+    out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
+                    log_prior=log_prior, block_norm=model.block_norm)
+    rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
+    mu_p, sigma_p = beliefs.mu, beliefs.sigma
+    for _ in range(cfg.n_layers - 1):
+        mu_p = (1.0 - rho) * mu_p + rho * out.mu
+        sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
+    fam = get_family(cfg.family)
+    D = self_divergence_for_alpha(                      # (B, N, K) per-coordinate
+        fam(out.mu, out.sigma), fam(mu_p, sigma_p),
+        alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+        divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
+    )
+    a = (c0 / (b0 + D)).detach()                        # alpha^(k)* = c0/(b0 + D^(k))
+    return (a * D).sum(dim=-1).mean()                   # sum_k alpha^(k) D^(k), then mean over (B, N)
+
+
+def test_per_coord_alpha_weighting():
+    # Under state_dependent_per_coord the M-step self-term must carry the SAME per-token,
+    # per-coordinate alpha^(k)* = c0/(b0+D^(k)) (detached) as the E-step -- NOT a flat scalar:
+    #   loss == ce + w * mean_i sum_k alpha_i^(k)* D_i^(k).
+    w, b0, c0 = 0.5, 0.5, 2.0
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     alpha_mode="state_dependent_per_coord", b0=b0, c0=c0,
+                     mstep_self_coupling_weight=w, seed=0)
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, 20, (3, 5))
+    targets = torch.randint(0, 20, (3, 5))
+    _, loss, ce = model(tokens, targets)
+    sc = _converged_self_coupling_per_coord(model, tokens, b0=b0, c0=c0)
+    assert sc > 1e-6                               # non-vacuous: the belief moved off the prior
+    assert torch.allclose(loss, ce + w * sc, atol=1e-6)
+
+
 def test_config_validation():
     with pytest.raises(ValueError):
         VFE3Config(mstep_self_coupling_weight=-1.0)

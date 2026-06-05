@@ -137,7 +137,7 @@ class VFE3Config:
     # the path param-free.
     learnable_lambda_beta:     bool  = False
     mass_phi:                  float = 0.0          # (mass_phi/2) ||phi||^2 penalty
-    mstep_self_coupling_weight: float = 0.0         # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    mstep_self_coupling_weight: float = 0.0         # alpha_hat: overall scale on M-step sum_i alpha_i D(q_i*||p_i) (0 = OFF; alpha_i = the E-step self-coupling form)
     # Hyper-prior weight lambda_h on the model-channel term lambda_h * mean_i KL(s_i||r)
     # (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy, lines 1241-1249).
     # Default 0.0 = OFF: no s/r tables, loss byte-identical to the single-tier path.
