@@ -334,6 +334,7 @@ def train(
     it = iter(loader)
     win_t0 = time.perf_counter()
     win_i0 = 0
+    last_val: Dict[str, float] = {}                  # most recent validation, carried into each CSV row
     for step in _step_indices():
         try:
             tokens, targets = next(it)
@@ -345,14 +346,20 @@ def train(
         losses.append(train_step(model, optimizer, scheduler, tokens, targets,
                                   grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps))
 
-        if log_interval and (step + 1) % log_interval == 0:
+        do_log  = bool(log_interval) and (step + 1) % log_interval == 0
+        do_eval = bool(eval_interval) and val_loader is not None and (step + 1) % eval_interval == 0
+        do_csv  = artifacts is not None and (do_log or do_eval)
+
+        if do_log or do_csv:                                 # converged CE + diagnostics (off graph), ONCE
             with torch.no_grad():
-                _, _, ce_t = model(tokens, targets)         # true CE (nats), off graph
+                _, _, ce_t = model(tokens, targets)          # true CE (nats)
             ce = float(ce_t)
             d = model.diagnostics(tokens)
+
+        if do_log:
             rate = (step + 1 - win_i0) / max(time.perf_counter() - win_t0, 1e-9)
             logger.info(
-                "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | it/s: %.2f | \n\n PPL: %.1f \n",
+                "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | it/s: %.2f | \n\n         Train PPL: %.1f \n",
                 step + 1, n_steps, losses[-1], ce, d["attn_entropy"], rate, math.exp(min(ce, 20.0)),
             )
             logger.info(
@@ -363,11 +370,11 @@ def train(
             win_t0 = time.perf_counter()
             win_i0 = step + 1
 
-        if eval_interval and val_loader is not None and (step + 1) % eval_interval == 0:
+        if do_eval:
             m = evaluate(model, val_loader, max_batches=cfg.eval_max_batches, device=device)
             logger.info(" \n Validation @ step %d:", step + 1)
             logger.info(                                         # val has no separate loss; CE is the loss
-                "\n       CE: %.4f \n       PPL: %.1f \n       BPC: %.4f \n\n",
+                "\n       CE: %.4f \n      Val PPL: %.1f \n       BPC: %.4f \n\n",
                 m["ce"], m["ppl"], m["bpc"],
             )
             # Sample text directly below the BPC value. ``generate_samples=False`` forces the pure
@@ -388,45 +395,45 @@ def train(
                     logger.info("       Sample: %r  ->  %r\n", p_txt, c_txt)
                 except Exception as exc:                                          # never let sampling kill training
                     logger.warning("       (sample generation failed: %s)", exc)
-            # Persistence is opt-in: with no artifacts object this whole block is skipped, so the
-            # silent/in-memory path is unchanged. A CSV row (train loss + lr + val + the converged
-            # diagnostics off the graph) is logged each periodic eval, and best_model.pt is saved
-            # whenever the validation PPL sets a new minimum.
+            last_val = {"ce": m["ce"], "ppl": m["ppl"], "bpc": m["bpc"]}
             if artifacts is not None:
-                d = model.diagnostics(tokens)
-                # The diagnostics free-energy terms are per-sequence SUMS over seq 0; normalize to
-                # PER TOKEN (divide by the sequence length) so the free_energy_descent stack is
-                # commensurate with val_ce, a token-weighted mean (nats/token). The CSV therefore
-                # carries nats/token for the four F-stack terms. (See audit-2026-06-05 Finding 2.)
-                n_tok = max(int(tokens.shape[1]), 1)
-                row = {
-                    "step":              step + 1,
-                    "train_loss":        losses[-1],
-                    "lr":                float(scheduler.get_last_lr()[0]),
-                    "val_ce":            m["ce"],
-                    "val_ppl":           m["ppl"],
-                    "val_bpc":           m["bpc"],
-                    "attn_entropy":       d["attn_entropy"],
-                    "self_coupling":      d["self_coupling"]     / n_tok,
-                    "belief_coupling":    d["belief_coupling"]   / n_tok,
-                    "attention_entropy":  d["attention_entropy"] / n_tok,
-                    "free_energy_total":  d["total"]             / n_tok,
-                    "effective_rank":     d["effective_rank"],
-                    "holonomy_deviation": d["holonomy_deviation"],
-                    "gauge_trace_spread": d["gauge_trace_spread"],
-                }
-                # Learnable belief-coupling weight: record the current lambda_beta = exp(log_lambda_beta)
-                # so its trajectory lands in metrics.csv (and the lambda_beta.png figure). The column
-                # exists only on a learnable run (config is fixed per run, so the CSV stays rectangular).
-                _llb = getattr(model, "log_lambda_beta", None)
-                if _llb is not None:
-                    row["lambda_beta"] = float(_llb.detach().exp())
-                artifacts.log_metrics(row)
                 artifacts.maybe_save_best(step + 1, model, m["ppl"])
                 # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0 of
-                # the live batch -- the same sequence the diagnostics above read). Best-effort inside
-                # save_attention_maps: a viz error is logged, never fatal to the run.
+                # the live batch). Best-effort inside save_attention_maps: a viz error is logged,
+                # never fatal to the run. Kept at EVAL cadence (one grid per eval, not per log).
                 artifacts.save_attention_maps(step + 1, model.attention_maps(tokens), logger=logger)
+
+        # Persistence is opt-in: with no artifacts object do_csv is False, so the silent/in-memory
+        # path is unchanged. A metrics.csv row is written every LOG_INTERVAL (and every eval) -- the
+        # dense per-step diagnostics off the graph -- with the most recent validation carried forward
+        # (NaN until the first eval; fresh on a step where the eval above just ran). The four F-stack
+        # diagnostics are per-sequence SUMS over seq 0, normalized to PER TOKEN so they are
+        # commensurate with val_ce, a token-weighted mean (nats/token; see audit-2026-06-05 Finding 2).
+        if do_csv:
+            n_tok = max(int(tokens.shape[1]), 1)
+            row = {
+                "step":              step + 1,
+                "train_loss":        losses[-1],
+                "lr":                float(scheduler.get_last_lr()[0]),
+                "val_ce":            last_val.get("ce",  float("nan")),
+                "val_ppl":           last_val.get("ppl", float("nan")),
+                "val_bpc":           last_val.get("bpc", float("nan")),
+                "attn_entropy":       d["attn_entropy"],
+                "self_coupling":      d["self_coupling"]     / n_tok,
+                "belief_coupling":    d["belief_coupling"]   / n_tok,
+                "attention_entropy":  d["attention_entropy"] / n_tok,
+                "free_energy_total":  d["total"]             / n_tok,
+                "effective_rank":     d["effective_rank"],
+                "holonomy_deviation": d["holonomy_deviation"],
+                "gauge_trace_spread": d["gauge_trace_spread"],
+            }
+            # Learnable belief-coupling weight: record lambda_beta = exp(log_lambda_beta) so its
+            # trajectory lands in metrics.csv (and the figure). The column exists only on a learnable
+            # run (config is fixed per run, so the CSV stays rectangular).
+            _llb = getattr(model, "log_lambda_beta", None)
+            if _llb is not None:
+                row["lambda_beta"] = float(_llb.detach().exp())
+            artifacts.log_metrics(row)
 
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
         if (artifacts is not None and cfg.checkpoint_interval

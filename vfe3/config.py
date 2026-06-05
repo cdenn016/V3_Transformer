@@ -268,6 +268,7 @@ class VFE3Config:
     eval_interval:             int   = 0            # periodic validation every N steps (0 = off)
     checkpoint_interval:       int   = 0            # save a resumable checkpoint every N steps (0 = off)
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
+    generate_figures:          bool  = True         # auto-run the single-run publication figures at finalize_run (off the hot path)
     
     # Opt-in mixed precision for CUDA throughput (RTX 5090). None (default) = OFF = the pure fp32
     # path: NO autocast context is entered anywhere in the forward, so the loss/logits are

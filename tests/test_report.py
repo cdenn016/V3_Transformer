@@ -12,7 +12,8 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts
+from vfe3.run_artifacts import RunArtifacts, finalize_run
+from vfe3.train import train
 from vfe3.viz.extract import converged_state
 from vfe3.viz.report import generate_figures
 
@@ -77,3 +78,43 @@ def test_generate_figures_reloads_from_run_dir(tmp_path):
     paths = generate_figures(tmp_path / "run", loader=_loader(), max_sequences=16)
     assert len(paths) >= 6
     assert (tmp_path / "run" / "figures" / "numerical_trust.png").exists()
+
+
+def test_finalize_autoruns_figures(tmp_path):
+    # generate_figures defaults True -> finalize_run auto-writes run_dir/figures/ (the autorun).
+    cfg = _cfg()
+    model = _model()
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    losses = train(model, _loader(), cfg, n_steps=4, log_interval=2, eval_interval=2,
+                   val_loader=_loader(seed=1), artifacts=art)
+    finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
+    figs = list((tmp_path / "run" / "figures").glob("*.png"))
+    assert len(figs) >= 6, f"autorun produced too few figures: {[f.name for f in figs]}"
+
+
+def test_finalize_skips_figures_when_disabled(tmp_path):
+    # generate_figures=False is the opt-out: finalize_run writes no figures/ directory.
+    cfg = _cfg(generate_figures=False)
+    model = _model()
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    losses = train(model, _loader(), cfg, n_steps=4, log_interval=2, eval_interval=2,
+                   val_loader=_loader(seed=1), artifacts=art)
+    finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
+    assert not (tmp_path / "run" / "figures").exists()
+
+
+def test_metrics_csv_logs_at_log_cadence(tmp_path):
+    # metrics.csv gets a row every log_interval (denser than eval_interval), with the most recent
+    # validation carried forward (NaN until the first eval).
+    import csv
+    import math
+    cfg = _cfg()
+    model = _model()
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    train(model, _loader(), cfg, n_steps=8, log_interval=2, eval_interval=4,
+          val_loader=_loader(seed=1), artifacts=art)
+    rows = list(csv.DictReader(open(tmp_path / "run" / "metrics.csv")))
+    assert [r["step"] for r in rows] == ["2", "4", "6", "8"]          # a row every log_interval
+    assert math.isnan(float(rows[0]["val_ce"]))                       # NaN before the first eval (step 4)
+    assert math.isfinite(float(rows[1]["val_ce"]))                    # fresh val at the eval step
+    assert rows[1]["val_ce"] == rows[2]["val_ce"]                     # carried forward between evals
