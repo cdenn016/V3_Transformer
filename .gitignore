@@ -11,5 +11,6 @@ junit*.xml
 pytest_*.txt
 *_out.txt
 vfe3_runs/
+vfe3_ablation_results/
 .claude/
 .codex/

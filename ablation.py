@@ -81,8 +81,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     max_seq_len                = 128,                         # N, context length
     
-    batch_size                 = 64,
-    max_steps                  = 15000,
+    batch_size                 = 128,
+    max_steps                  = 2500,
     
     n_layers                   = 1,                           # L, number of blocks
     n_e_steps                  = 1,                           # T, E-step inner iterations
@@ -167,9 +167,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     grad_accum_steps           = 1,
     
-    m_mu_lr                    = 0.02,
+    m_mu_lr                    = 0.015,
     m_sigma_lr                 = 0.0021,
-    m_phi_lr                   = 0.02,
+    m_phi_lr                   = 0.015,
     
     weight_decay               = 0.05,
    
@@ -499,7 +499,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
         # spuriously ~2.5x faster AND worse). No-op at alpha_div == 1 (the kernel ignores the toggle).
         "description": "Renyi divergence order (1.0 -> KL; != 1 routes the non-kernel oracle)",
-        "param": "alpha_div", "values": [0.99], "requires": {"oracle_unroll_grad": True},
+        "param": "alpha_div", "values": [0.25, 0.5, 0.75, 1], "requires": {"oracle_unroll_grad": True},
     },
     
     
@@ -537,7 +537,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.012, 0.013, 0.014, 0.016, 0.017],
+        "param": "m_phi_lr", "values": [0.011, 0.012, 0.013, 0.014, 0.016, 0.017],
     },
     
     "weight_decay": {
@@ -610,13 +610,13 @@ SWEEP_ORDER: List[str] = [
  #   "lambda_beta",
   #  "kappa",
     
-  #  "m_phi_lr",
-  #  "m_mu_lr",
-   # "alpha_div",
+    "m_phi_lr",
+    "m_mu_lr",
+  #  "alpha_div",
     
  
-  #  "m_sigma_lr",
-  #  "e_sigma_lr",
+    "m_sigma_lr",
+    "e_sigma_lr",
     
        
     "mstep_self_coupling_weight",

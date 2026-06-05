@@ -254,7 +254,7 @@ def generate_sp(
 
     return G.to(dtype).to(device)
 
-
+#TODO: irreps of SO(N) as heads of dim_irrep.  e.g. spin-1, spin-2, etc
 def generate_son(
     N:                int,
 
