@@ -247,6 +247,70 @@ def test_full_renyi_alpha_gt_one_all_good_batch_finite():
     assert (out >= 0.0).all()
 
 
+# ---------------------------------------------------------------------------
+# DIAGONAL Renyi at alpha > 1 must mirror the full-cov mask: a coordinate whose
+# blend (1-alpha)s_q + alpha*s_t goes NON-POSITIVE makes the divergence undefined
+# and must map to kl_max (via NaN -> safe_kl_clamp), NOT be silently clamp(min=eps)'d
+# to a wrong finite value. The convex alpha in (0,1) blend is always > 0, so this is
+# inert there (byte-identical). RED against the clamp(min=eps) code.
+# ---------------------------------------------------------------------------
+
+
+def test_diagonal_renyi_alpha_gt_one_negative_blend_masks_to_kl_max():
+    r"""Summed diagonal Renyi at alpha=1.5: a pair with one negative-blend coordinate
+    maps to kl_max; a good pair stays finite and equal to its isolated value."""
+    import warnings
+
+    from vfe3.families.gaussian import DiagonalGaussian
+
+    K = 3
+    mu = torch.zeros(2, K)
+    # pair 0 (GOOD): blend = -0.5*s_q + 1.5*s_t stays positive on every coordinate.
+    sig_q_good = torch.tensor([1.0, 1.0, 1.0])
+    sig_t_good = torch.tensor([2.0, 2.0, 2.0])
+    # pair 1 (BAD): coord 1 has s_q huge, s_t tiny -> blend = -50 + 0.015 < 0 at alpha=1.5.
+    sig_q_bad = torch.tensor([1.0, 100.0, 1.0])
+    sig_t_bad = torch.tensor([2.0, 0.01, 1.0])
+    q = DiagonalGaussian(mu, torch.stack([sig_q_good, sig_q_bad]))
+    t = DiagonalGaussian(mu, torch.stack([sig_t_good, sig_t_bad]))
+
+    kl_max = 100.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                     # alpha>1 warning not raised here (closed form)
+        out = q.renyi_closed_form(t, alpha=1.5, kl_max=kl_max)
+        good_alone = DiagonalGaussian(mu[:1], sig_q_good.unsqueeze(0)).renyi_closed_form(
+            DiagonalGaussian(mu[:1], sig_t_good.unsqueeze(0)), alpha=1.5, kl_max=kl_max)
+
+    assert torch.isfinite(out).all()
+    assert out[1] == kl_max                                  # bad pair masked
+    assert out[0] < kl_max                                   # good pair finite
+    assert torch.allclose(out[0], good_alone[0], atol=1e-6)  # good unperturbed by the bad pair
+
+
+def test_diagonal_renyi_per_coord_alpha_gt_one_masks_only_bad_coord():
+    r"""Per-coordinate diagonal Renyi at alpha=1.5: only the coordinate whose blend goes
+    non-positive maps to kl_max; the other coordinates keep their finite divergence."""
+    import warnings
+
+    from vfe3.families.gaussian import DiagonalGaussian
+
+    mu = torch.zeros(1, 3)
+    sigma_q = torch.tensor([[1.0, 100.0, 2.0]])             # coord 1 blend goes negative
+    sigma_t = torch.tensor([[2.0, 0.01, 1.0]])
+    q = DiagonalGaussian(mu, sigma_q)
+    t = DiagonalGaussian(mu, sigma_t)
+
+    kl_max = 100.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = q.renyi_per_coord(t, alpha=1.5, kl_max=kl_max)
+
+    assert torch.isfinite(out).all()
+    assert out[0, 1] == kl_max                               # coord 1: blend < 0 -> masked
+    assert out[0, 0] < kl_max                                # coord 0: blend = 2.5 > 0 -> finite
+    assert out[0, 2] < kl_max                                # coord 2: blend = 0.5 > 0 -> finite
+
+
 def test_diagonal_kl_matches_torch_distributions():
     # Independent reference: PyTorch's own Normal KL (summed over dims).
     from torch.distributions import Normal, kl_divergence

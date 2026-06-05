@@ -82,7 +82,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     max_seq_len                = 128,                         # N, context length
     
     batch_size                 = 64,
-    max_steps                  = 4000,
+    max_steps                  = 15000,
     
     n_layers                   = 1,                           # L, number of blocks
     n_e_steps                  = 1,                           # T, E-step inner iterations
@@ -133,7 +133,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     attention_prior            = "causal",                    # "uniform" | "causal" | "alibi"
 
     # E-step
-    e_mu_lr                    = 0.9,
+    e_mu_lr                    = 0.7,
     e_sigma_lr                 = 0.025,
     e_phi_lr                   = 0.0,
    
@@ -178,8 +178,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     seed                       = 6,                           # overridden per run by CONFIG["seed"]
     
     log_interval               = 1000,
-    eval_interval              = 4000,
-    checkpoint_interval        = 15000,                       # forced to 0 per cell (no checkpoint blowup)
+    eval_interval              = 15000,
+    checkpoint_interval        = 25000,                       # forced to 0 per cell (no checkpoint blowup)
     
     
     # numerics
@@ -478,8 +478,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === M-step / training =================================================
     "e_step_gradient": {  # 'detach' is consistent only with detach_e_step=False (the baseline)
         "description": "E-step backward estimator",
-        "param": "e_step_gradient", "values": ["unroll", "straight_through", "detach"],
+        "param": "e_step_gradient", "values": [ "detach"],
     },
+    
+    
     "detach_e_step": {
         "description": "detach the whole E-step (no E-step gradient)",
         "param": "detach_e_step", "values": [False, True],
@@ -491,8 +493,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     "alpha_div": {
+        # oracle_unroll_grad MUST be on for a fair divergence-order comparison: alpha_div != 1 routes
+        # the autograd oracle, whose default (detached) gradient truncates the through-inference signal
+        # to the priors/gauge-frame tables, while alpha_div == 1 uses the always-live analytic kernel.
+        # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
+        # spuriously ~2.5x faster AND worse). No-op at alpha_div == 1 (the kernel ignores the toggle).
         "description": "Renyi divergence order (1.0 -> KL; != 1 routes the non-kernel oracle)",
-        "param": "alpha_div", "values": [0.5, 1.0, 1.5, 2.0],
+        "param": "alpha_div", "values": [0.99], "requires": {"oracle_unroll_grad": True},
     },
     
     
@@ -501,12 +508,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
    "e_mu_lr": {
        "description": "E-step natural-gradient step size for mu_q",
-       "param": "e_mu_lr", "values": [0.3, 0.5, 0.7, 0.9, 1.1],
+       "param": "e_mu_lr", "values": [0.5, 0.7, 0.9, 1.1],
    },
    
    "e_sigma_lr": {
        "description": "E-step retraction step size for sigma_q",
-       "param": "e_sigma_lr", "values": [0.0, 0.01, 0.025, 0.05],
+       "param": "e_sigma_lr", "values": [0.001, 0.0025, 0.01, 0.025, 0.05],
    },
    
    "e_phi_lr": {
@@ -520,50 +527,53 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "values": [0.015, 0.0225, 0.025, 0.0275],
+        "param": "m_mu_lr", "values": [0.01, 0.0125, 0.0135, 0.014, 0.0145],
     },
     
     "m_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_sigma_lr", "values": [0.001, 0.002, 0.005, 0.0075, 0.01],
+        "param": "m_sigma_lr", "values": [0.00175, 0.0019, 0.002, 0.0021, 0.0025],
     },
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.02, 0.025, 0.03, 0.04],
+        "param": "m_phi_lr", "values": [0.012, 0.013, 0.014, 0.016, 0.017],
     },
     
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "values": [0.02, 0.04, 0.06, 0.08],
+        "param": "weight_decay", "values": [0.055, 0.06, 0.0625, 0.065, 0.0675],
     },
     
     
     "mstep_self_coupling_weight": {
         "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
-        "param": "mstep_self_coupling_weight", "values": [0.0, 0.1, 0.5],
+        "param": "mstep_self_coupling_weight", "values": [0, 0.05, 0.1, 0.25, 0.5, 0.75],
     },
     
     
     
     "kappa": {
         "description": "attention temperature tau = kappa * sqrt(d_head)",
-        "param": "kappa", "values": [0.5, 0.7, 1.0, 1.4, 2.0],
+        "param": "kappa", "values": [1.2, 1.3, 1.4, 1.6, 1.7],
     },
+    
     "lambda_beta": {
         "description": "belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)",
         "param": "lambda_beta", "values": [0.25, 0.5, 1.0, 2.0, 4.0],
     },
+    
     "learnable_lambda_beta": {  # 'learnable' is the NN-exception scalar log_lambda_beta (optimizer-grouped)
         "description": "constant lambda_beta vs learned (exp(log_lambda_beta), trained on CE)",
         "configs": [
-            {"label": "constant",  "learnable_lambda_beta": False},
-            {"label": "learnable", "learnable_lambda_beta": True},
+            {"label": "learnable",  "learnable_lambda_beta": True},
+            {"label": "constant", "learnable_lambda_beta": False},
         ],
     },
+    
     "mass_phi": {
         "description": "gauge prior weight (mass_phi / 2) ||phi||^2",
-        "param": "mass_phi", "values": [0.0, 1e-4, 1e-3, 1e-2],
+        "param": "mass_phi", "values": [0.0, 1e-3, 1e-2, 0.1],
     },
     
     
@@ -594,31 +604,33 @@ NON_SWEPT_FIELDS = (
 SWEEP_ORDER: List[str] = [
     
     
-   # "m_phi_lr",
-   # "m_mu_lr",
-    #"e_mu_lr",
+  
+   # "weight_decay",
+
+ #   "lambda_beta",
+  #  "kappa",
     
-    "weight_decay",
+  #  "m_phi_lr",
+  #  "m_mu_lr",
+   # "alpha_div",
     
-    "alpha_div",
+ 
+  #  "m_sigma_lr",
+  #  "e_sigma_lr",
+    
+       
     "mstep_self_coupling_weight",
     
-    "e_sigma_lr",
-    "m_sigma_lr",
+    #"learnable_lambda_beta",
+    
+    "mass_phi",
+    "e_mu_lr",
     
     
     
-    "kappa",
-    "lambda_beta",
+    
 
-    "alpha_mode",
-
-    "attention_prior",
-    "entropy_term",
-    
-    "gauge_group",
-    
-    "covariance",
+   
 ]
 
 
