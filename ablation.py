@@ -309,23 +309,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "pos_phi", "values": ["none", "learned", "frozen"],
     },
     
-    "pos_phi_compose": {
-        "description": "BCH composition chart",
-        "param": "pos_phi_compose", "values": ["bch", "euclidean"],
-        "requires": {"pos_phi": "learned"},
-    },
-    
-    "bch_pe_order": {
-        "description": "BCH Dynkin truncation order",
-        "param": "bch_pe_order", "values": [2, 4, 6],
-        "requires": {"pos_phi": "learned", "pos_phi_compose": "bch"},
-    },
-    
-    "pos_phi_scale": {
-        "description": "learned pos_phi table init scale",
-        "param": "pos_phi_scale", "values": [0.005, 0.02, 0.1],
-        "requires": {"pos_phi": "learned"},
-    },
+
     
     "pos_phi_project_slk": {
         "description": "per-block trace projection (det Omega = 1) on pos_phi",
@@ -436,14 +420,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
     # === E-step ============================================================
     
-    "e_sigma_q_trust": {
-        "description": "E-step SPD retraction trust radius",
-        "param": "e_sigma_q_trust", "values": [1.0, 5.0, 10.0],
-    },
-    "sigma_max": {
-        "description": "upper bound on belief variance",
-        "param": "sigma_max", "values": [2.0, 5.0, 10.0],
-    },
+   
     
     
     
@@ -481,11 +458,38 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
     
 
-    # === M-step / training =================================================
-    "e_step_gradient": {  # 'detach' is consistent only with detach_e_step=False (the baseline)
-        "description": "E-step backward estimator",
-        "param": "e_step_gradient", "values": [ "detach"],
+
+     "e_sigma_q_trust": {
+         "description": "E-step SPD retraction trust radius",
+         "param": "e_sigma_q_trust", "values": [1.0, 5.0, 10.0],
+     },
+     "sigma_max": {
+         "description": "upper bound on belief variance",
+         "param": "sigma_max", "values": [2.0, 5.0, 10.0],
+     },
+
+
+    "pos_phi_compose": {
+        "description": "BCH composition chart",
+        "param": "pos_phi_compose", "values": ["bch", "euclidean"],
+        "requires": {"pos_phi": "learned"},
     },
+    
+    "bch_pe_order": {
+        "description": "BCH Dynkin truncation order",
+        "param": "bch_pe_order", "values": [2, 4, 6],
+        "requires": {"pos_phi": "learned", "pos_phi_compose": "bch"},
+    },
+    
+    "pos_phi_scale": {
+        "description": "learned pos_phi table init scale",
+        "param": "pos_phi_scale", "values": [0.005, 0.02, 0.1],
+        "requires": {"pos_phi": "learned"},
+    },    
+
+
+    # === M-step / training =================================================
+   
     
     
     "detach_e_step": {
@@ -533,28 +537,28 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "values": [0.01, 0.0125, 0.0135, 0.014, 0.0145],
+        "param": "m_mu_lr", "values": [0.0145],
     },
     
     "m_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_sigma_lr", "values": [0.00175, 0.0019, 0.002, 0.0021, 0.0025],
+        "param": "m_sigma_lr", "values": [0.00275, 0.003, 0.0035],
     },
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.011, 0.012, 0.013, 0.014, 0.016, 0.017],
+        "param": "m_phi_lr", "values": [0.0125, 0.0135],
     },
     
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "values": [0.01, 0.05, 0.06, 0.0625, 0.065, 0.0675, 0.1],
+        "param": "weight_decay", "values": [0.01, 0.05, 0.06, 0.07, 0.08, 0.1],
     },
     
     
     "mstep_self_coupling_weight": {
         "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
-        "param": "mstep_self_coupling_weight", "values": [0, 0.05, 0.1, 0.25, 0.5, 0.75],
+        "param": "mstep_self_coupling_weight", "values": [0.0025, 0.025, 0.075],
     },
     
     
@@ -608,35 +612,36 @@ NON_SWEPT_FIELDS = (
 # CONFIG["sweep"]="<name>"); add or remove names to shape a session. Cheap-to-expensive is a good
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
-    
-    
-  
 
     
-    "m_phi_lr",
+   # "m_phi_lr",
     "m_mu_lr",
-  #  "alpha_div",
+  # "alpha_div",
     
-     "weight_decay",
+   #  "weight_decay",
 
- #   "lambda_beta",
-    "kappa",
+ #  "lambda_beta",
+  #  "kappa",
     "m_sigma_lr",
-    "e_sigma_lr",
+  #  "e_sigma_lr",
     
        
-    "mstep_self_coupling_weight",
-    
-    #"learnable_lambda_beta",
-    
-    "mass_phi",
+  #  "mstep_self_coupling_weight",
     "e_mu_lr",
     
     
+    "sigma_max",  
+    "kl_max", 
+    "eps",
+    
+    "mass_phi",
+    
+    "e_sigma_q_trust",
+    
+    "pos_phi_compose", 
+    "pos_phi_scale"
     
     
-
-   
 ]
 
 

@@ -92,6 +92,8 @@ VFE3_TEST_DEVICE=cuda for the GPU).
 
 **user has RTX5090 GPU** - use cuda and code accordingly where applicable
 
+**Local model offload** — when the `qwen-local` `offload_to_local_model` MCP tool is available, delegate voluminous or mechanical low-stakes text generation to it to conserve Claude usage: condensing long docs/logs, first-draft boilerplate (test scaffolds, docstring stubs, post-edit-doc prose), bulk reformatting, and classify/tag-at-volume — then review the output before relying on it. NEVER offload anything that must be correct: math/theory verification, gauge/KL/free-energy derivations, code-correctness judgments (a 27B model hallucinates on exactly that work — see the Tooling & verification discipline above). The tool is stateless (single prompt in, text out, no repo access), so pass it the context it needs; for inputs that exceed its context window, map-reduce (chunk, offload each chunk, then synthesize) rather than letting them silently truncate. The backend (`llama-server`) must be running — launch it with `F:\qwen-mcp\start.ps1`. This policy self-disables on machines where the tool is absent.
+
 **ALWAYS BRANCH FRESH FROM MAIN** - each session should be a fresh branch from main
 
 **DONT LEAVE MESSES!!** ALWAYS CLEAN UP temp FILES FROM ATOMIC EDITS AND SUCH WHEN FINISHED!

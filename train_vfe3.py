@@ -65,11 +65,11 @@ config = dict(
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 16,
-    max_steps                 = 500,
+    batch_size                = 64,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
-    n_e_steps                 = 5,                   # T, E-step inner iterations
+    n_e_steps                 = 1,                   # T, E-step inner iterations
     
     
 
@@ -104,21 +104,22 @@ config = dict(
     family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
 
     # free-energy coupling
-    alpha                     = 1.0,                 # constant self-coupling value
-    alpha_mode                = "state_dependent_per_coord",          # "constant" | "state_dependent" | "state_dependent_per_coord"
+    
+    alpha_mode                = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
     b0                        = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0                        = 1.0,                 # state-dependent alpha shape (numerator)
     
+    learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
+    
     kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
 
+    alpha                     = 1.0,                 # constant self-coupling value
     lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
-    learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
-
     mass_phi                  = 0.0,                 # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight = 0.0,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
     
     
-    lambda_h                  = 0.0,                 # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
+    lambda_h                  = 0.0,           # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
     gamma_coupling            = 0.0,                 # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
     kappa_gamma               = 1.0,                 # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
     gamma_attention_prior     = "causal",            # model-channel prior pi^s_ij: "uniform" | "causal" | "alibi"
@@ -163,9 +164,9 @@ config = dict(
     detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
     grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
 
-    m_mu_lr                   = 0.015,
-    m_sigma_lr                = 0.0021,
-    m_phi_lr                  = 0.015,
+    m_mu_lr                   = 0.0145,  #0.0145
+    m_sigma_lr                = 0.0021,  #0.0025
+    m_phi_lr                  = 0.013,  #0.013
     
     weight_decay              = 0.065,
     
@@ -177,16 +178,13 @@ config = dict(
     divergence_family         = "renyi",             # "renyi"
     alpha_div                 = 1.0,                  # Renyi order (1.0 -> KL)
     
-    warmup_steps              = 1,
+    warmup_steps              = 100,
     seed                      = SEED,
     
-    log_interval              = 1,                  # console log every N steps (0 = off)
-    eval_interval             = 50,                   # periodic validation every N steps (0 = off)
+    log_interval              = 100,                  # console log every N steps (0 = off)
+    eval_interval             = 1500,                   # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,                  # save a resumable checkpoint every N steps (0 = off)
     
-    
-    eval_max_batches          = None,                 # cap the PERIODIC eval pass (None = full split)
-    amp_dtype                 = None,                 # None (pure fp32) | "bf16" | "fp16" (opt-in autocast; CUDA throughput)
 )
 
 
