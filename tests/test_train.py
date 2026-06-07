@@ -45,6 +45,42 @@ def test_lr_lambda_warmup_then_cosine():
     assert abs(lr_lambda(100, cfg) - 0.0) < 1e-3           # ~0 at max_steps
 
 
+def test_scheduler_floors_lr_at_min_lr():
+    # The cosine multiplier decays to 0 at max_steps; the floored per-group scheduler built in
+    # train() must keep EACH group's absolute LR >= cfg.min_lr there (and beyond). Build the real
+    # optimizer+scheduler, fast-forward to max_steps, and check every group.
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
+                     warmup_steps=2, max_steps=10, min_lr=1e-5)
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    base_lrs = [g["lr"] for g in opt.param_groups]
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, [(lambda base: lambda s: max(cfg.min_lr / base, lr_lambda(s, cfg)))(b)
+              for b in base_lrs])
+    for _ in range(cfg.max_steps + 5):                     # step past max_steps into the clamped tail
+        sched.step()
+    for lr in sched.get_last_lr():
+        assert lr >= cfg.min_lr - 1e-12                    # floored, never decays to zero
+        assert math.isclose(lr, cfg.min_lr, rel_tol=1e-9)  # at the tail every group sits exactly on the floor
+
+
+def test_scheduler_min_lr_zero_is_pure_cosine():
+    # min_lr=0.0 is the theoretically pure path: the floor max(0/base, cosine)=cosine, so the LR
+    # decays to exactly zero at max_steps, identical to the unfloored half-cosine.
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
+                     warmup_steps=2, max_steps=10, min_lr=0.0)
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    base_lrs = [g["lr"] for g in opt.param_groups]
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, [(lambda base: lambda s: max(cfg.min_lr / base, lr_lambda(s, cfg)))(b)
+              for b in base_lrs])
+    for _ in range(cfg.max_steps):
+        sched.step()
+    for lr in sched.get_last_lr():
+        assert abs(lr) < 1e-9                              # pure cosine reaches zero
+
+
 # The active alphabet of the period-3 stream is {0,1,2}; a structure-BLIND predictor
 # (one that learns only the unigram frequencies of the active tokens) is pinned at the
 # marginal entropy ln(3) ~ 1.0986. Beating that floor by a margin is the discriminating

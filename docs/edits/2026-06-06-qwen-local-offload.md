@@ -68,3 +68,43 @@ server was deliberately not restarted (a reload could OOM the training run). The
 fit was not measured. Takes effect on the next manual `start.ps1` launch. 16384 is the
 VRAM-safe default; 32768 is worth a fit-test on a free GPU and should be lowered if the load
 OOMs. An "abandoned Option B" `llama-swap` binary downloaded earlier was deleted.
+
+# 2026-06-06 — LR-floor scheduler + metrics.csv train PPL and per-group LRs
+
+Three training-loop fixes per user request (`vfe3/train.py`, `vfe3/config.py`, `tests/test_train.py`).
+
+## Changes
+
+- **Cosine LR floor (`config.py`, `train.py`).** The warmup/cosine multiplier `lr_lambda`
+  decays to exactly 0 at `max_steps`, dragging every per-group LR to zero. Added
+  `min_lr: float = 1e-5` to `VFE3Config` and, in `train()`, replaced the single shared
+  `LambdaLR` lambda with one floored lambda PER param group:
+  `mult = max(min_lr / base_lr, cosine(s))`, so each group's absolute LR is
+  `base * max(min_lr/base, cosine) = max(min_lr, base * cosine)` — it never decays below
+  `min_lr`. `lr_lambda` itself is left as the pure half-cosine (its existing test still
+  pins multiplier → 0 at `max_steps`); the floor is a scheduler-construction concern. The
+  `(lambda base: ...)(b)` closure captures each base LR by value (dodges loop late-binding).
+  `min_lr = 0.0` recovers the theoretically pure cosine-to-zero (the pure-path toggle).
+
+- **`metrics.csv` train PPL (`train.py`).** The CSV row recorded `train_loss` but no
+  train-side perplexity, so every log-interval row carried only the (carried-forward,
+  often-NaN) eval columns. Added `train_ce` (the true CE already recomputed off-graph) and
+  `train_ppl = exp(min(ce, 20))`, mirroring the console "Train PPL" line. The val_* columns
+  keep their carry-forward (pinned by `test_report.py:121` and feeding the dense F1 figure
+  `figures.py:420` — that carry-forward is intended, not the bug; the gap was the missing
+  train metrics).
+
+- **Per-group LRs in `metrics.csv` (`train.py`).** Replaced the single `lr` column (which
+  was only group 0 = mu) with `lr_mu`, `lr_sigma`, `lr_phi` off `scheduler.get_last_lr()`
+  (groups 0,1,2 are always mu_embed / sigma_log+decode / phi_embed; optional toggle groups
+  append after). Nothing read the old `row["lr"]`.
+
+- **Tests (`tests/test_train.py`).** Added `test_scheduler_floors_lr_at_min_lr` (build the
+  real optimizer+scheduler, step past `max_steps`, assert every group's LR sits on `min_lr`)
+  and `test_scheduler_min_lr_zero_is_pure_cosine` (min_lr=0 → LR reaches exactly 0).
+
+## Verification
+
+- Test run was interrupted by the user before the junit summary was read, so the new tests
+  are NOT yet confirmed passing — they are committed as written. Re-run
+  `pytest tests/test_train.py tests/test_run_artifacts.py tests/test_report.py` to confirm.
