@@ -112,12 +112,12 @@ config = dict(
     
     learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
     
-    kappa                     = 1.3,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
 
     alpha                     = 1.0,                 # constant self-coupling value
     lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
     mass_phi                  = 0.0,                 # (mass_phi/2) ||phi||^2 penalty
-    mstep_self_coupling_weight = 0.05,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    mstep_self_coupling_weight = 0.00,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
     
     
     lambda_h                  = 0.0,           # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
@@ -177,8 +177,8 @@ config = dict(
     alpha_div                 = 1.0,                  # Renyi order (1.0 -> KL)
     
     warmup_steps              = 100,
-    min_lr                    = 1e-4,                # absolute cosine-decay LR floor (0.0 = pure cosine)
-    min_lr_frac               = 0.1,                 # proportional LR floor, max(min_lr, frac*base); OFF
+    min_lr                    = 0,                # absolute cosine-decay LR floor (0.0 = pure cosine)
+    min_lr_frac               = 0.01,                 # proportional LR floor, max(min_lr, frac*base); OFF
     amp_dtype                 = None,                # None=fp32 | 'bf16' ('fp16' needs a GradScaler: deferred)
     seed                      = SEED,
     
