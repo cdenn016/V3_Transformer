@@ -262,8 +262,12 @@ class VFE3Config:
     grad_accum_steps:          int   = 1
     max_steps:                 int   = 15000
     warmup_steps:              int   = 100
-    min_lr:                    float = 1e-5         # absolute cosine-decay floor: each group's LR
+    min_lr:                    float = 1e-3         # absolute cosine-decay floor: each group's LR
     #                          never decays below this. 0.0 recovers the pure half-cosine-to-zero.
+    min_lr_frac:               float = 0.01          # fractional cosine-decay floor: each group's LR
+    #                          never decays below min_lr_frac * its OWN base LR, preserving the
+    #                          m_mu:m_sigma:m_phi base ratios into the tail. Combined with min_lr as
+    #                          max(min_lr, min_lr_frac*base). 0.0 (with min_lr=0) is the pure path.
     
     seed:                      int   = 0
     log_interval:              int   = 50           # console log every N steps (0 = off)
@@ -599,7 +603,7 @@ class VFE3Config:
                 f"'detach'. Set detach_e_step=False and use e_step_gradient to select the mode, "
                 f"or leave e_step_gradient='unroll'."
             )
-        for name in ("m_mu_lr", "m_sigma_lr", "m_phi_lr", "weight_decay"):
+        for name in ("m_mu_lr", "m_sigma_lr", "m_phi_lr", "weight_decay", "min_lr", "min_lr_frac"):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         if self.batch_size < 1:

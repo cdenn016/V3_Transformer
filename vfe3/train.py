@@ -137,6 +137,32 @@ def lr_lambda(
     return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
 
+def _floor_lr_lambdas(
+    base_lrs: Sequence[float],
+    cfg:      VFE3Config,
+) -> List[Callable[[int], float]]:
+    r"""Per-group ``LambdaLR`` multipliers that floor each group's ABSOLUTE LR at
+    ``max(cfg.min_lr, cfg.min_lr_frac * base)``.
+
+    A ``LambdaLR`` scales each group's base LR by its multiplier, so flooring the
+    *multiplier* at ``max(min_lr/base, min_lr_frac)`` floors the *product*::
+
+        base * max(min_lr/base, min_lr_frac, cosine) = max(min_lr, min_lr_frac*base, base*cosine).
+
+    The absolute floor ``min_lr`` is shared across groups; the fractional floor
+    ``min_lr_frac`` scales with each group's own base, preserving the m_mu:m_sigma:m_phi
+    ratios into the cosine tail. A group whose base LR is 0 (a deliberately frozen
+    channel, e.g. ``m_phi_lr=0``) drops the ``min_lr/base`` term (no division by zero)
+    and stays frozen: ``min_lr`` does not resurrect it. With ``min_lr=min_lr_frac=0``
+    this is the pure half-cosine-to-zero.
+    """
+    def make(base: float) -> Callable[[int], float]:
+        abs_mult = cfg.min_lr / base if base > 0.0 else 0.0     # shared absolute floor (skip if frozen)
+        floor    = max(abs_mult, cfg.min_lr_frac)               # combined per-group multiplier floor
+        return lambda s: max(floor, lr_lambda(s, cfg))
+    return [make(b) for b in base_lrs]
+
+
 def _default_sample_decoder(
     cfg: VFE3Config,
 ) -> 'Optional[Callable[[Sequence[int]], str]]':
@@ -304,17 +330,11 @@ def train(
     ``eval_interval`` steps.
     """
     optimizer = build_optimizer(model, cfg)
-    # Warmup/cosine multiplier, floored so each group's ABSOLUTE LR never decays below cfg.min_lr.
-    # LambdaLR scales each group's base LR by its lambda; per-group lambdas (one per base LR) floor
-    # the product: base * max(min_lr/base, cosine) = max(min_lr, base * cosine). With cfg.min_lr=0.0
-    # this is exactly the pure half-cosine-to-zero (the theoretically pure path). The (lambda base: ...)
-    # closure captures each base LR by value, dodging late-binding over the loop variable.
+    # Warmup/cosine multiplier, floored per group so each group's ABSOLUTE LR never decays below
+    # max(cfg.min_lr, cfg.min_lr_frac * base) -- see _floor_lr_lambdas. With cfg.min_lr=cfg.min_lr_frac=0
+    # this is exactly the pure half-cosine-to-zero (the theoretically pure path).
     base_lrs = [g["lr"] for g in optimizer.param_groups]
-    sched_lambdas = [
-        (lambda base: lambda s: max(cfg.min_lr / base, lr_lambda(s, cfg)))(b)
-        for b in base_lrs
-    ]
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, sched_lambdas)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _floor_lr_lambdas(base_lrs, cfg))
     losses: List[float] = []
     model.train()
     logger = logger or logging.getLogger(__name__)
