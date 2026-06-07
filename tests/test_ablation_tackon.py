@@ -93,3 +93,45 @@ def test_plot_one_sweep_does_not_raise(tmp_path: Path) -> None:
         _write_marker(sweep_dir, f"kappa={v}", ppl=10.0 + v)
     ablation._write_sweep_csv(sweep_dir, ablation._collect_sweep_results(sweep_dir))
     ablation._plot_one_sweep(sweep_dir, tmp_path / "figures")
+
+
+def test_get_loader_threads_split_aware_shuffle_drop_last(monkeypatch) -> None:
+    r"""ablation.get_loader must mirror train_vfe3._select_loader's F1 split-aware semantics:
+    train requests shuffle=True/drop_last=True, validation/test request shuffle=False/drop_last=False,
+    so the held-out metric reads the WHOLE split in a stable order (datasets.make_dataloader defaults
+    to the TRAIN regime, so get_loader must pass the eval flags explicitly)."""
+    captured: dict = {}
+
+    def fake_make_dataloader(dataset, split, seq_len, batch_size, **kw):
+        captured[split] = kw
+        return object()                                      # a non-None sentinel get_loader caches
+
+    monkeypatch.setattr(ablation, "make_dataloader", fake_make_dataloader)
+    ablation._LOADER_CACHE.clear()
+    ablation.get_loader("wikitext-103", 16, 4, "validation")
+    ablation.get_loader("wikitext-103", 16, 4, "train", max_tokens=None)
+    ablation._LOADER_CACHE.clear()
+    assert captured["validation"].get("shuffle") is False
+    assert captured["validation"].get("drop_last") is False
+    assert captured["train"].get("shuffle") is True
+    assert captured["train"].get("drop_last") is True
+
+
+def test_cell_is_current_false_on_dataset_change(tmp_path: Path) -> None:
+    r"""Resume must not serve a cell trained on a DIFFERENT dataset as current. The cell's
+    VFE3Config carries no dataset field (it is a session knob), so _cell_is_current must also
+    compare the persisted top-level config.json 'dataset' against the current session dataset."""
+    from dataclasses import asdict
+    from vfe3.config import VFE3Config
+
+    run_dir = tmp_path / "cell"
+    run_dir.mkdir()
+    cfg_dict = ablation._cell_cfg_dict({}, seed=6)
+    saved = {
+        "config": json.loads(json.dumps(asdict(VFE3Config(**cfg_dict)), default=str)),
+        "dataset": "wikitext-103",
+    }
+    (run_dir / "config.json").write_text(json.dumps(saved), encoding="utf-8")
+
+    assert ablation._cell_is_current(run_dir, {}, seed=6, dataset="wikitext-103") is True
+    assert ablation._cell_is_current(run_dir, {}, seed=6, dataset="wikitext-2") is False

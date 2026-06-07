@@ -182,6 +182,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
    
     warmup_steps               = 100,
     seed                       = 6,                           # overridden per run by CONFIG["seed"]
+    min_lr                     = 0,
+    
     
     log_interval               = 1000,
     eval_interval              = 15000,
@@ -330,7 +332,6 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "rope_base", "values": [10.0, 100.0, 1000.0],
         "requires": {"pos_rotation": "rope"},
     },
-    ''
     "rope_full_gauge": {  # rotating the covariance sandwich needs full covariance
         "description": "RoPE means-only vs full-gauge (rotates covariance; needs full cov)",
         "configs": [
@@ -483,7 +484,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "pos_phi_scale": {
         "description": "learned pos_phi table init scale",
-        "param": "pos_phi_scale", "values": [0.005, 0.02, 0.1],
+        "param": "pos_phi_scale", "values": [0.01, 0.03, 0.05],
         "requires": {"pos_phi": "learned"},
     },    
 
@@ -537,17 +538,17 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "values": [0.01425, 0.01475],
+        "param": "m_mu_lr", "range": [0.014, 0.015, 0.0001],
     },
     
     "m_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_sigma_lr", "values": [0.0045, 0.00475, 0.009],
+        "param": "m_sigma_lr", "range": [0.00325, 0.00525, 0.00025],
     },
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.0125, 0.0135],
+        "param": "m_phi_lr", "range": [0.0125, 0.01375, 0.00025],
     },
     
     "weight_decay": {
@@ -558,7 +559,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "mstep_self_coupling_weight": {
         "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
-        "param": "mstep_self_coupling_weight", "values": [0.0025, 0.025, 0.075],
+        "param": "mstep_self_coupling_weight", "range": [0.02, 0.08, 0.02],
     },
     
     
@@ -583,7 +584,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "mass_phi": {
         "description": "gauge prior weight (mass_phi / 2) ||phi||^2",
-        "param": "mass_phi", "values": [0.0, 1e-3, 1e-2, 0.1],
+        "param": "mass_phi", "values": [0.0, 1e-4, 5e-4, 5e-3, 0.25],
     },
     
     
@@ -614,32 +615,34 @@ NON_SWEPT_FIELDS = (
 SWEEP_ORDER: List[str] = [
 
     
-   # "m_phi_lr",
-   # "m_mu_lr",
+   
   # "alpha_div",
     
    #  "weight_decay",
 
  #  "lambda_beta",
   #  "kappa",
-  #  "m_sigma_lr",
+    
   #  "e_sigma_lr",
     
-       
-    "mstep_self_coupling_weight",
-    "e_mu_lr",
     
+    "pos_phi_scale",
     
-    "sigma_max",  
-    "kl_max", 
-    "eps",
     
     "mass_phi",
+    
+    "mstep_self_coupling_weight",
+    
+    "m_phi_lr",
+    "m_mu_lr",
+    "m_sigma_lr",
+    
+    "e_mu_lr",
     
     "e_sigma_q_trust",
     
     "pos_phi_compose", 
-    "pos_phi_scale"
+    
     
     
 ]
@@ -809,7 +812,13 @@ def get_loader(
         loader = synthetic_period3_loader(seq_len=seq_len, batch_size=batch_size, seed=seed)
     else:
         try:
-            loader = make_dataloader(dataset, split, seq_len, batch_size, max_tokens=cap)
+            # Split-aware loader semantics, mirroring train_vfe3._select_loader's F1 fix: only the
+            # train stream is shuffled and tail-dropped; validation/test read the WHOLE split in a
+            # stable order so the held-out PPL is a full-corpus measurement (make_dataloader defaults
+            # to the train regime, so the eval flags must be passed explicitly here).
+            loader = make_dataloader(dataset, split, seq_len, batch_size,
+                                     shuffle=(split == "train"), drop_last=(split == "train"),
+                                     max_tokens=cap)
         except FileNotFoundError:
             logger.warning("cache for %r/%r absent; falling back to synthetic-period3", dataset, split)
             loader = synthetic_period3_loader(seq_len=seq_len, batch_size=batch_size, seed=seed)
@@ -963,6 +972,7 @@ def _cell_is_current(
 
     *,
     seed:       int,
+    dataset:    str,
     max_steps:  Optional[int] = None,
 ) -> bool:
     r"""True iff a completed cell's persisted config.json matches the config we would build now.
@@ -972,6 +982,10 @@ def _cell_is_current(
     an unrelated baseline field (e.g. ``embed_dim``) would otherwise let a stale result be
     served as current. A cell is skipped only when its saved VFE3Config equals the freshly
     built one (config-error cells have no config.json, so they are always re-run -- cheap).
+
+    The session ``dataset`` is NOT a VFE3Config field (it is the loader seam), so it is compared
+    separately against the persisted top-level ``config.json["dataset"]`` -- otherwise a rerun on a
+    DIFFERENT dataset would serve the wrong-dataset cell as current (the VFE3Config would match).
     """
     cj = run_dir / "config.json"
     if not cj.exists():
@@ -979,10 +993,12 @@ def _cell_is_current(
     try:
         built = json.loads(json.dumps(asdict(VFE3Config(
             **_cell_cfg_dict(overrides, seed=seed, max_steps=max_steps))), default=str))
-        saved = json.loads(cj.read_text(encoding="utf-8")).get("config")
+        saved_obj = json.loads(cj.read_text(encoding="utf-8"))
     except Exception:                                        # unbuildable now / unreadable -> re-run
         return False
-    return saved == built
+    if saved_obj.get("dataset") != dataset:                  # session dataset changed -> re-run
+        return False
+    return saved_obj.get("config") == built
 
 
 def _sanitize(label: str) -> str:
@@ -1049,7 +1065,7 @@ def run_sweep(
         marker = run_dir / "ablation_result.json"
 
         if resume and marker.exists():
-            if _cell_is_current(run_dir, overrides, seed=seed, max_steps=max_steps):
+            if _cell_is_current(run_dir, overrides, seed=seed, max_steps=max_steps, dataset=dataset):
                 print(f"\n--- {i + 1}/{len(runs)}: {label}  [CACHED] ---")
                 results.append(json.loads(marker.read_text(encoding="utf-8")))
                 continue

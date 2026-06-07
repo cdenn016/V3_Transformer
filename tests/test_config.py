@@ -43,6 +43,27 @@ def test_config_rejects_nonpositive_kl_max():
         VFE3Config(kl_max=0.0)
 
 
+def test_cross_couplings_accepts_list_pairs_from_json_roundtrip():
+    """A config.json reloaded by viz.report._load_config gives LIST pairs (JSON has no tuples);
+    VFE3Config(**reloaded) must accept them so a cold-start generate_figures does not crash on the
+    isinstance(pair, tuple) validator. Coercion normalizes them back to tuples."""
+    cfg = VFE3Config(gauge_group="block_glk", embed_dim=4, n_heads=2,
+                     cross_couplings=[[0, 1]])          # lists, exactly as JSON round-trips tuples
+    assert [tuple(p) for p in cfg.cross_couplings] == [(0, 1)]
+
+
+def test_config_rejects_nan_min_lr():
+    import math
+    with pytest.raises(ValueError):
+        VFE3Config(min_lr=math.nan)
+
+
+def test_config_rejects_nan_min_lr_frac():
+    import math
+    with pytest.raises(ValueError):
+        VFE3Config(min_lr_frac=math.nan)
+
+
 # --- Phase 7 full-config fields --------------------------------------------
 def test_config_model_defaults():
     cfg = VFE3Config()

@@ -3,9 +3,10 @@ r"""Click-to-run training entry for the VFE_3.0 transformer.
 Mirrors VFE_2.0 ``train_vfe.py``: edit the ``config`` dict below, pick a ``DATASET``,
 then run ``python train_vfe3.py``. There is no CLI arg parsing.
 
-The ``config`` dict exposes EVERY ``VFE3Config`` toggle, grouped exactly as in
-``vfe3/config.py``; each registry-backed ``*_mode`` / ``*_family`` / ``*_group`` field
-lists its valid keys inline. The default ``DATASET = "wikitext-103"`` trains on the
+The ``config`` dict exposes the commonly-tuned ``VFE3Config`` toggles, grouped exactly as
+in ``vfe3/config.py``; each registry-backed ``*_mode`` / ``*_family`` / ``*_group`` field
+lists its valid keys inline. Any ``VFE3Config`` field omitted here simply takes its dataclass
+default -- add it to this dict to tune it. The default ``DATASET = "wikitext-103"`` trains on the
 cached gpt2/tiktoken corpus (vocab 50257) under ``~/.cache/tokenized_cache``; the
 ``config`` defaults (``vocab_size=50257``) are kept consistent with it so click-to-run
 works out of the box. ``MAX_TOKENS`` caps the training stream for fast smoke runs.
@@ -179,7 +180,9 @@ config = dict(
     alpha_div                 = 1.0,                  # Renyi order (1.0 -> KL)
     
     warmup_steps              = 100,
-    min_lr                    = 2e-4,
+    min_lr                    = 1e-4,                # absolute cosine-decay LR floor (0.0 = pure cosine)
+    min_lr_frac               = 0.0,                 # proportional LR floor, max(min_lr, frac*base); OFF
+    amp_dtype                 = None,                # None=fp32 | 'bf16' ('fp16' needs a GradScaler: deferred)
     seed                      = SEED,
     
     log_interval              = 100,                  # console log every N steps (0 = off)
