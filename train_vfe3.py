@@ -106,7 +106,7 @@ config = dict(
 
     # free-energy coupling
     
-    alpha_mode                = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    alpha_mode                = "state_dependent_per_coord",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
     b0                        = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0                        = 1.0,                 # state-dependent alpha shape (numerator)
     
@@ -140,14 +140,16 @@ config = dict(
     
     gradient_mode             = "filtering",          # "filtering" | "smoothing"
     
-    phi_precond_mode          = "killing",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
+    m_phi_natural_grad        = True,
+    
+    phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
     # decode / encode
     use_prior_bank            = False,                # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
-    decode_tau                = 1.0,
+    decode_tau                = 0.1,
     decode_mode               = "diagonal",          # "diagonal" | "diagonal_chunked" | "full"
     decode_chunk_size         = 8192,                # vocab-chunk width for decode_mode="diagonal_chunked" (ignored otherwise)
     encode_mode               = "per_token",         # "per_token" | "gauge_fixed" (gauge_fixed: live-rejected stub)
@@ -331,6 +333,13 @@ def main() -> None:
     train_loader = _select_loader(DATASET, cfg, logger, split="train")
     val_loader = _select_loader(DATASET, cfg, logger, split="validation")
 
+    # Bits-per-CHARACTER correction so PPL/BPC compare across tokenizers and languages (gpt2 vs
+    # cl100k; en/ja/ar -- a cl100k token spans ~3 Japanese codepoints). tokens_per_char =
+    # n_tokens/n_codepoints from the held-out stream; None (synthetic / no tiktoken / cache absent)
+    # -> 1.0 = honest bits-per-token. One cheap decode pass over the small val/test stream.
+    from vfe3.data.datasets import tokens_per_char as _tokens_per_char
+    val_tpc = _tokens_per_char(DATASET, "validation") or 1.0
+
     # Run-artifacts directory (config.json, metrics.csv, checkpoints/, best_model.pt, figures).
     # None disables persistence (RUN_ROOT = None); the synthetic fallback also runs unsaved-free.
     run_dir = _run_dir(cfg, DATASET)
@@ -349,13 +358,14 @@ def main() -> None:
         log_interval=cfg.log_interval,
         eval_interval=cfg.eval_interval,
         val_loader=val_loader,
+        tokens_per_char=val_tpc,
         device=torch.device(DEVICE),
         logger=logger,
         artifacts=artifacts,
     )
     wall = time.perf_counter() - t0
 
-    m = evaluate(model, val_loader, device=torch.device(DEVICE))
+    m = evaluate(model, val_loader, tokens_per_char=val_tpc, device=torch.device(DEVICE))
     logger.info("=" * 64)
     logger.info(                                          # val-only summary; CE is the loss (no separate train loss here)
         "Final (val) | CE: %.4f | PPL: %.1f | BPC: %.4f",
@@ -368,9 +378,9 @@ def main() -> None:
     if artifacts is not None:
         test_loader = (val_loader if DATASET == "synthetic-period3"
                        else _select_loader(DATASET, cfg, logger, split="test"))
-        results = finalize_run(model, artifacts, cfg, test_loader=test_loader, losses=losses,
-                               device=torch.device(DEVICE), wall_time=wall, logger=logger)
-        run_dir = _rename_run_by_ppl(run_dir, _run_label(cfg, DATASET), results.get("test_ppl"), logger)
+        test_tpc = val_tpc if DATASET == "synthetic-period3" else (_tokens_per_char(DATASET, "test") or 1.0)
+        finalize_run(model, artifacts, cfg, test_loader=test_loader, losses=losses,
+                     tokens_per_char=test_tpc, device=torch.device(DEVICE), wall_time=wall, logger=logger)
         logger.info("Artifacts written to %s", run_dir)
 
 

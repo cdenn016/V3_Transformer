@@ -148,7 +148,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     gradient_mode              = "filtering",                 # "filtering" | "smoothing"
     
-    phi_precond_mode           = "killing",                   # "none"|"clip"|"killing"|"killing_per_block"|"pullback"
+    m_phi_natural_grad        = False,
+    phi_precond_mode          = "killing_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
+
     phi_retract_mode           = "bch",                       # "euclidean" | "bch"
     
 
@@ -366,7 +368,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
     "b0": {
         "description": "state-dependent alpha shape b0 (alpha* = c0/(b0 + D))",
-        "param": "b0", "values": [0.5, 1.0, 2.0], "requires": {"alpha_mode": "state_dependent"},
+        "param": "b0", "values": [0.1, 10.0, 2.0], "requires": {"alpha_mode": "state_dependent"},
     },
     "c0": {
         "description": "state-dependent alpha shape c0 (numerator)",
@@ -614,7 +616,8 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
 
-    
+    #"c0",
+    #"b0",
    
   # "alpha_div",
     

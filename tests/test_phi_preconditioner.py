@@ -176,3 +176,63 @@ def test_pullback_k_guard():
     G = generate_glk(13)                                  # K=13 > max_k
     with pytest.raises((ValueError, RuntimeError)):
         pullback_metric(torch.zeros(169), G, max_k=12)
+
+
+from vfe3.geometry.phi_preconditioner import pullback_metric_per_block
+
+
+def test_pullback_per_block_single_block_matches_full():
+    # irrep_dims == [K]: the per-block metric reduces to the full pullback exactly.
+    G = generate_glk(3).double()
+    phi = torch.randn(9, dtype=torch.float64) * 0.3
+    a = pullback_metric_per_block(phi, G, [3])
+    b = pullback_metric(phi, G)
+    assert torch.allclose(a, b, atol=1e-8)
+
+
+def test_pullback_per_block_is_block_diagonal_and_fd_per_block():
+    # block_glk = gl(2) (+) gl(2): the pullback metric must be block-diagonal (distinct
+    # blocks have disjoint support, so cross d-exp terms vanish), and EACH diagonal block
+    # must match the FD-of-exp oracle on that block's LOCAL gl(2) representation.
+    G = generate_glk_multihead(4, 2).double()             # K=4, d_h=2, 8 gens, irrep [2,2]
+    irrep = [2, 2]
+    torch.manual_seed(0)
+    phi = torch.randn(8, dtype=torch.float64) * 0.5
+    Gblk = pullback_metric_per_block(phi, G, irrep)        # (8, 8)
+    assert torch.allclose(Gblk[:4, 4:], torch.zeros(4, 4, dtype=torch.float64), atol=1e-6)
+    assert torch.allclose(Gblk[4:, :4], torch.zeros(4, 4, dtype=torch.float64), atol=1e-6)
+    local = generate_glk(2).double()                      # the d_h=2 local rep both blocks use
+    assert torch.allclose(Gblk[:4, :4], _fd_dexp_metric(phi[:4], local), atol=1e-4)
+    assert torch.allclose(Gblk[4:, 4:], _fd_dexp_metric(phi[4:], local), atol=1e-4)
+
+
+def test_pullback_per_block_feasible_at_k20_where_full_pullback_dies():
+    # The feasibility win: full pullback raises at K=20 (>max_k), but per-block builds on
+    # the d_h=10 (<=max_k) local rep, so the shipped block_glk K=20 is buildable.
+    import pytest
+    G20 = generate_glk_multihead(20, 2).double()          # K=20, d_h=10, 200 gens
+    with pytest.raises((ValueError, RuntimeError)):
+        pullback_metric(torch.zeros(400, dtype=torch.float64), G20)   # full: K=20 > max_k
+    phi = torch.randn(200, dtype=torch.float64) * 0.1
+    Gblk = pullback_metric_per_block(phi, G20, [10, 10])   # per-block: must NOT raise
+    assert Gblk.shape == (200, 200)
+    assert torch.isfinite(Gblk).all()
+    assert torch.allclose(Gblk[:100, 100:], torch.zeros(100, 100, dtype=torch.float64), atol=1e-6)
+    assert (torch.linalg.eigvalsh(Gblk[:100, :100]) > 0).all()
+
+
+def test_pullback_per_block_mode_solves_metric_and_reduces_to_identity_at_zero():
+    G = generate_glk_multihead(4, 2).double()
+    irrep = [2, 2]
+    torch.manual_seed(1)
+    phi = torch.randn(3, 8, dtype=torch.float64) * 0.3
+    grad = torch.randn(3, 8, dtype=torch.float64)
+    out = precondition_phi_gradient(grad, phi, G, mode="pullback_per_block", irrep_dims=irrep)
+    Gm = pullback_metric_per_block(phi, G, irrep)
+    eye = torch.eye(8, dtype=torch.float64)
+    expect = torch.linalg.solve(Gm + 1e-6 * eye, grad.unsqueeze(-1)).squeeze(-1)
+    assert torch.allclose(out, expect, atol=1e-6)
+    # at phi=0 the metric is the Frobenius gram = I (orthonormal E_ij), so nat-grad == grad.
+    out0 = precondition_phi_gradient(grad, torch.zeros(3, 8, dtype=torch.float64), G,
+                                     mode="pullback_per_block", irrep_dims=irrep)
+    assert torch.allclose(out0, grad, atol=1e-4)
