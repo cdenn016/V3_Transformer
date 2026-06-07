@@ -20,7 +20,7 @@ _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
 _VALID_DECODE_MODES        = ("diagonal", "diagonal_chunked", "full")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
-_VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback")
+_VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback", "pullback_per_block")
 _VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
 _VALID_POS_PHI_COMPOSE     = ("bch", "euclidean")
 _VALID_PRIOR_SOURCES       = ("token", "model_channel")
@@ -251,6 +251,19 @@ class VFE3Config:
     m_mu_lr:                   float = 0.025
     m_sigma_lr:                float = 0.0025
     m_phi_lr:                  float = 0.015
+    # Geometrically-correct gauge M-step (opt-in, default OFF -> plain AdamW on phi_embed/pos_phi_free).
+    # When True the gauge-frame prior tables (phi_embed, pos_phi_free) are updated by NATURAL-GRADIENT
+    # descent + heavy-ball momentum under the phi_precond_mode metric (set phi_precond_mode=
+    # "pullback_per_block" for the exact exp-map metric), instead of being placed in AdamW. This is the
+    # only way the gauge geometry reaches the M-step: a position-dependent metric cannot ride inside
+    # AdamW -- Adam's per-coordinate normalization re-flattens any metric, and the Killing metric is
+    # conformal (a scalar * I in the Frobenius-orthonormal E_ij basis), so killing/killing_per_block are
+    # exact no-ops here; only the non-conformal pullback metric, applied as a true natural-gradient step
+    # (no Adam normalization), changes the trajectory. Per-token metric solves run on the active rows
+    # only but are still real compute, so this is an opt-in extreme path; the pure AdamW path is the
+    # default. Everything except the gauge frame (mu/sigma/decode/...) stays on AdamW.
+    m_phi_natural_grad:        bool  = False
+    m_gauge_momentum:          float = 0.9   # heavy-ball momentum for the natural-gradient gauge step
     weight_decay:              float = 0.05
     batch_size:                int   = 64
     

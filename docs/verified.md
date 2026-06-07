@@ -243,3 +243,22 @@ REPLACE the belief prior with the model channel, p_i = s_i. Verified by a 5-lens
   config.py / test docstring, and the tension is now disclosed there. The cross-scale realization would
   need a meta-agent/scale-(s+1) object that does not exist. NOT a code/math flaw; a documented
   design-choice-in-a-theoretical-tension that the user (manuscript author) should adjudicate.
+
+
+- **Killing gauge metric is CONFORMAL in V3's basis (M-step gauge optimizer geometry).** CHECKED,
+  CORRECT, RIGOROUS (math + empirical, 2026-06-07). The Cartan-Killing metric on the Frobenius-
+  orthonormal E_ij generators is g~ = 2K*I - 2*t*t^T (t_a = tr(G_a)); spectrum {2K x (n_gen-1), 0 x 1},
+  and build_killing_preconditioner lifts the single null (det/center) eigenvalue to center_reg=2K, so the
+  regularized INVERSE metric is EXACTLY (1/2K)*I (verified at K=20 block_glk:
+  max|Minv - (mean diag)*I| = 4.16e-17). Consequence: killing / killing_per_block preconditioning is a
+  per-variable LR rescale, and because AdamW is scale-invariant it collapses to plain AdamW (verified:
+  cosine(plain-AdamW first-step, Killing-whitened-AdamW first-step) = 1.000000 over 50 random rows). So
+  VFE_2.0's RiemannianAdamW(phi, metric='killing') — precondition-then-AdamW — is a no-op for the gauge
+  COORDINATES, and the E-step phi_precond_mode='killing' is likewise a no-op (moot anyway at the shipped
+  e_phi_lr=0). The ONLY non-conformal gauge metric is the position-dependent pullback (exp-map Jacobian);
+  it carries the genuine geometry, implemented as pullback_per_block + GaugeNaturalGradAdamW (natural
+  gradient stepped WITHOUT Adam's normalization, which would re-flatten it). An earlier "57% non-compact
+  / 1e6 rescaling-span" reading was a MISREAD: the Cartan metric weights symmetric and skew generators
+  identically (both 2K); the 1e6 was 1/eval on the regularized-away center direction, and phi's energy-
+  weighted Killing eigenvalue is 39.26 ~= the bulk 40. FALSIFY IF: build_killing_preconditioner(G)
+  spectrum is not constant, or cosine(plain, Killing-whitened) < 1 for the E_ij basis.

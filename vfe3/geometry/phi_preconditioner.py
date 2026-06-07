@@ -307,6 +307,75 @@ def _precond_pullback(
     return sol.squeeze(-1)
 
 
+def pullback_metric_per_block(
+    phi:          torch.Tensor,           # (..., n_gen) frame coordinates
+    generators:   torch.Tensor,           # (n_gen, K, K)
+    irrep_dims:   List[int],              # block sizes; sum == K
+
+    *,
+    series_tol:   float = 1e-12,
+    series_order: int   = 40,
+    max_k:        int   = 12,
+) -> torch.Tensor:                        # (..., n_gen, n_gen) block-diagonal pullback metric
+    r"""Block-diagonal pullback metric: per-irrep-block exp-map natural-gradient metric.
+
+    For a block-diagonal algebra g = (+)_h gl(d_h) (block_glk: irrep_dims = [d_h]*H),
+    phi is block-diagonal, so d exp_phi stays inside each block and the pullback metric
+    G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F is itself block-diagonal: generators of
+    distinct blocks have disjoint support, so their cross terms vanish. Each diagonal block
+    is built by ``pullback_metric`` on that block's LOCAL d_h-dimensional representation
+    (the d_h x d_h corner). This is the key feasibility win over the full ``pullback_metric``:
+    the structure-constants tensor is O(n_gen_block^2 d_h^2) per block instead of
+    O(n_gen^2 K^2), so a K = 20 block_glk (d_h = 10 <= max_k) is buildable where the full
+    pullback (K = 20 > max_k) raises. Single global block (irrep_dims == [K]) reduces to
+    ``pullback_metric``. Pure: takes a generator TENSOR, not a GaugeGroup.
+    """
+    if len(irrep_dims) == 1:
+        return pullback_metric(phi, generators, series_tol=series_tol,
+                               series_order=series_order, max_k=max_k)
+    block_of = _generator_block_index(generators, irrep_dims)
+    n_gen = generators.shape[0]
+    batch = phi.shape[:-1]
+    G_metric = torch.zeros(*batch, n_gen, n_gen, dtype=phi.dtype, device=phi.device)
+    start = 0
+    for h, d in enumerate(irrep_dims):
+        idx     = (block_of == h).nonzero(as_tuple=True)[0]
+        sub     = generators[idx][:, start:start + d, start:start + d].contiguous()   # (n_h, d, d) local rep
+        phi_blk = phi[..., idx]                                                        # (..., n_h)
+        Gb      = pullback_metric(phi_blk, sub, series_tol=series_tol,
+                                  series_order=series_order, max_k=max_k)              # (..., n_h, n_h)
+        G_metric[..., idx.unsqueeze(-1), idx.unsqueeze(0)] = Gb
+        start += d
+    return G_metric
+
+
+@register_precond("pullback_per_block")
+def _precond_pullback_per_block(
+    grad_phi:     torch.Tensor,           # (..., n_gen)
+    phi:          torch.Tensor,           # (..., n_gen)
+    generators:   torch.Tensor,           # (n_gen, K, K)
+
+    *,
+    series_tol:   float = 1e-12,
+    eps:          float = 1e-6,
+    series_order: int   = 40,
+    irrep_dims:   Optional[List[int]] = None,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Per-block position-dependent natural gradient: solve G_block(phi) nat = grad_phi.
+
+    The block-diagonal counterpart of ``pullback`` (the exact natural gradient for a
+    block-diagonal gauge group like block_glk), feasible at K > max_k because each block's
+    metric is built on its local d_h <= max_k representation."""
+    if irrep_dims is None:
+        raise ValueError("pullback_per_block requires irrep_dims")
+    G_metric = pullback_metric_per_block(phi, generators, irrep_dims,
+                                         series_tol=series_tol, series_order=series_order)
+    eye = torch.eye(G_metric.shape[-1], dtype=G_metric.dtype, device=G_metric.device)
+    sol = torch.linalg.solve(G_metric + eps * eye, grad_phi.unsqueeze(-1))
+    return sol.squeeze(-1)
+
+
 def precondition_phi_gradient(
     grad_phi:     torch.Tensor,           # (..., n_gen) Euclidean grad wrt phi coords
     phi:          torch.Tensor,           # (..., n_gen) current frame (used by pullback)

@@ -166,11 +166,12 @@ def finalize_run(
     cfg:         VFE3Config,
 
     *,
-    test_loader: Optional[Iterable] = None,
-    losses:      Optional[List[float]] = None,
-    device:      Optional[torch.device] = None,
-    wall_time:   Optional[float] = None,
-    logger:      Optional[logging.Logger] = None,
+    test_loader:     Optional[Iterable] = None,
+    losses:          Optional[List[float]] = None,
+    tokens_per_char: float = 1.0,           # test BPC char-correction (1.0 = bits/token)
+    device:          Optional[torch.device] = None,
+    wall_time:       Optional[float] = None,
+    logger:          Optional[logging.Logger] = None,
 ) -> Dict[str, object]:
     r"""Reload the best-val checkpoint, score the TEST split, and write summary + figures.
 
@@ -197,7 +198,7 @@ def finalize_run(
 
     results: Dict[str, object] = {}                             # mixes float / Optional[float|int] / bool
     if test_loader is not None:
-        m = evaluate(model, test_loader, device=device)
+        m = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
         results = {"test_ce": m["ce"], "test_ppl": m["ppl"], "test_bpc": m["bpc"]}
         logger.info("Test (held-out) | CE: %.4f | PPL: %.2f | BPC: %.4f",
                     m["ce"], m["ppl"], m["bpc"])

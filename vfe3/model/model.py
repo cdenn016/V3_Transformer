@@ -354,15 +354,13 @@ class VFEModel(nn.Module):
         amp = self._amp_context(token_ids.device)
         with run, amp:
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
-                            log_prior=log_prior, block_norm=self.block_norm, log_alpha=log_alpha,
+                            log_prior=log_prior, block_norm=self.block_norm,
+                            head_mixer=self.head_mixer, log_alpha=log_alpha,
                             lambda_beta=lambda_beta,
                             connection_W=connection_W, e_step_gradient=e_step_gradient,
                             rope=rope, rope_on_cov=self.cfg.rope_full_gauge)
-        mu_final = out.mu                                        # (B, N, K)
-        sigma_final = out.sigma
-
-        if self.head_mixer is not None:                          # opt-in head mixing, after E-step / before norm
-            mu_final, sigma_final = self.head_mixer(mu_final, sigma_final)
+        mu_final = out.mu                                        # (B, N, K); head mixer (if any) applied PER BLOCK
+        sigma_final = out.sigma                                  # inside vfe_stack now (VFE_2.0 parity), not post-stack
 
         if self.final_norm is not None:                          # config-selected final norm (cached)
             mu_final = self.final_norm(mu_final, sigma_final)
@@ -643,6 +641,7 @@ class VFEModel(nn.Module):
         out = vfe_stack(                                              # converged belief
             belief, belief.mu, belief.sigma, self.group, cfg,
             log_prior=log_prior, block_norm=self.block_norm,
+            head_mixer=self.head_mixer,                               # per-block mixing -> diagnostics' final belief matches forward
             log_alpha=getattr(self, "log_alpha", None),               # learned scalar (None on the pure path)
             lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)

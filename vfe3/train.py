@@ -64,17 +64,35 @@ def build_optimizer(
     those sanctioned-NN-exception toggles train rather than tripping the coverage guard.
     """
     pb = model.prior_bank
+    # Geometric gauge M-step (opt-in, cfg.m_phi_natural_grad): the gauge-frame coordinate groups
+    # (phi_embed, and the full-width pos_phi_free) are flagged gauge=True so GaugeNaturalGradAdamW
+    # steps them by natural gradient under cfg.phi_precond_mode instead of AdamW; weight_decay=0 on
+    # those groups (Euclidean L2 on phi is non-geometric -- mass_phi shrinks the frame in the loss).
+    # Default OFF: the flag is absent and every group is plain AdamW, byte-identical to before.
+    nat = cfg.m_phi_natural_grad
+    n_gen = model.group.generators.shape[0]
+    phi_group = {"params": [pb.phi_embed], "lr": cfg.m_phi_lr}
+    if nat:
+        phi_group["gauge"] = True
+        phi_group["weight_decay"] = 0.0
     groups = [
         {"params": [pb.mu_embed],                              "lr": cfg.m_mu_lr},
         {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_sigma_lr},
-        {"params": [pb.phi_embed],                             "lr": cfg.m_phi_lr},
+        phi_group,
     ]
     if pb.output_proj_weight is not None:                       # use_prior_bank=False linear decode
         groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_mu_lr})
     if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
         groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_mu_lr})
     if getattr(model, "pos_phi_free", None) is not None:        # pos_phi='learned' positional table
-        groups.append({"params": [model.pos_phi_free], "lr": cfg.m_phi_lr})  # a gauge-frame scale
+        pos_group = {"params": [model.pos_phi_free], "lr": cfg.m_phi_lr}      # a gauge-frame scale
+        # Natural-grad the positional frame too, but ONLY at full coordinate width: the pullback
+        # metric is built on the full generator set, so a reduced (pos_phi_project_slk) chart is
+        # shape-incompatible and stays on AdamW.
+        if nat and model.pos_phi_free.shape[-1] == n_gen:
+            pos_group["gauge"] = True
+            pos_group["weight_decay"] = 0.0
+        groups.append(pos_group)
     if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (gamma_coupling>0 or
         groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_mu_lr})    # prior_source=model_channel):
         groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_sigma_lr})  # mean@m_mu_lr, log-scale@
@@ -111,6 +129,17 @@ def build_optimizer(
             f"train. Add them to a param group."
         )
 
+    if nat:
+        # Geometrically-correct gauge frame: natural-gradient + momentum on the gauge groups under
+        # cfg.phi_precond_mode (set it to 'pullback_per_block' for the exact exp-map metric -- killing
+        # is conformal here, hence a no-op), AdamW on every other group. fused is off: the custom
+        # gauge step bypasses the fused kernel, and the non-gauge groups are few.
+        from vfe3.gauge_optim import GaugeNaturalGradAdamW
+        return GaugeNaturalGradAdamW(
+            groups, model.group.generators, list(model.group.irrep_dims),
+            precond_mode=cfg.phi_precond_mode, gauge_momentum=cfg.m_gauge_momentum,
+            weight_decay=cfg.weight_decay,
+        )
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
     # CUDA-only, so on a CPU box this is the standard AdamW. Per-group LRs are honored either way.
     use_fused = pb.mu_embed.is_cuda
@@ -250,19 +279,24 @@ def evaluate(
     loader: Iterable[Tuple[torch.Tensor, torch.Tensor]],   # yields (tokens, targets) batches
 
     *,
-    max_batches: Optional[int]          = None,
-    device:      Optional[torch.device] = None,
+    max_batches:     Optional[int]          = None,
+    tokens_per_char: float                  = 1.0,
+    device:          Optional[torch.device] = None,
 ) -> Dict[str, float]:
     r"""Token-weighted corpus evaluation. Returns ``{ce, ppl, bpc}`` (CE in nats).
 
     .. math::
         \mathrm{CE} = \frac{\sum_b n_b\, \mathrm{ce}_b}{\sum_b n_b},\quad
         \mathrm{PPL} = e^{\min(\mathrm{CE},\,20)},\quad
-        \mathrm{BPC} = \mathrm{CE} / \ln 2,
+        \mathrm{BPC} = \frac{\mathrm{CE}}{\ln 2}\,\cdot\,\mathrm{tokens\_per\_char},
 
     with ``n_b`` the number of non-ignored (``!= -100``) target tokens in batch ``b``.
     Aggregating by token count (not per-batch mean) reproduces one cross-entropy over
-    the concatenated corpus, including a partial last batch.
+    the concatenated corpus, including a partial last batch. ``tokens_per_char`` is the
+    bits-per-CHARACTER correction (``n_tokens / n_codepoints`` from
+    :func:`vfe3.data.datasets.tokens_per_char`); the default 1.0 leaves the honest
+    bits-per-TOKEN value (correct for a character-level / synthetic stream, and the value
+    to pass when the char count is unavailable).
     """
     if device is None:
         device = model.prior_bank.mu_embed.device
@@ -287,7 +321,7 @@ def evaluate(
     return {
         "ce":  ce,
         "ppl": math.exp(min(ce, 20.0)),
-        "bpc": ce / math.log(2.0),
+        "bpc": (ce / math.log(2.0)) * tokens_per_char,
     }
 
 
@@ -300,12 +334,13 @@ def train(
     n_steps:   int   = 100,
     grad_clip: float = 1.0,
 
-    log_interval:  Optional[int]            = None,
-    eval_interval: Optional[int]            = None,
-    val_loader:    Optional[Iterable]       = None,
-    device:        Optional[torch.device]   = None,
-    logger:        Optional[logging.Logger] = None,
-    artifacts:     Optional["RunArtifacts"] = None,
+    log_interval:    Optional[int]            = None,
+    eval_interval:   Optional[int]            = None,
+    val_loader:      Optional[Iterable]       = None,
+    tokens_per_char: float                    = 1.0,    # val BPC char-correction (1.0 = bits/token)
+    device:          Optional[torch.device]   = None,
+    logger:          Optional[logging.Logger] = None,
+    artifacts:       Optional["RunArtifacts"] = None,
 
     generate_samples:  bool                                     = True,   # False -> pure silent path (no sample text)
     sample_decode:     Optional[Callable[[Sequence[int]], str]] = None,   # token-ids -> text; None -> auto by vocab
@@ -395,13 +430,14 @@ def train(
             logger.info(
                 "    F: self %.4f | belief %.4f | entropy %.4f | total %.4f | eff_rank %.2f | BPC %.4f",
                 d["self_coupling"], d["belief_coupling"], d["attention_entropy"],
-                d["total"], d["effective_rank"], ce / math.log(2.0),
+                d["total"], d["effective_rank"], (ce / math.log(2.0)) * tokens_per_char,
             )
             win_t0 = time.perf_counter()
             win_i0 = step + 1
 
         if do_eval:
-            m = evaluate(model, val_loader, max_batches=cfg.eval_max_batches, device=device)
+            m = evaluate(model, val_loader, max_batches=cfg.eval_max_batches,
+                         tokens_per_char=tokens_per_char, device=device)
             logger.info(" \n Validation @ step %d:", step + 1)
             logger.info(                                         # val has no separate loss; CE is the loss
                 "\n       CE: %.4f \n      Val PPL: %.1f \n       BPC: %.4f \n\n",

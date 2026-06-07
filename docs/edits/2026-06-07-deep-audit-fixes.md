@@ -66,3 +66,26 @@ tr(A) = sum(w)` — eigenvalue-only (`gV=0`), blind to the F-term sign.
   for the equal-block default); adjacent to the settled per-irrep-block-beta design.
 - Pre-existing dead code / unused imports — left per CLAUDE.md ("mention, don't delete").
 - ~30 LOW diagnostics/metrics findings — diagnostics-only; recommended as one follow-up pass.
+
+
+## Gauge geometric correctness + head-mixer-per-block + char-corrected BPC (branch vfe3-gauge-geometric-correctness-2026-06-07)
+
+Verified: the Killing gauge metric is CONFORMAL in the E_ij basis (regularized inverse = exactly
+(1/2K)*I; cosine(plain-AdamW step, Killing-whitened-AdamW step) = 1.0), so killing/killing_per_block
+precond is a no-op and a port of VFE_2.0's RiemannianAdamW would do nothing. Only the position-dependent
+PULLBACK metric carries geometry. (docs/verified.md.)
+
+- **Gauge M-step (geometric).** New `pullback_per_block` precond (geometry/phi_preconditioner.py): exact
+  per-irrep-block exp-map metric, feasible at K=20 where full `pullback` raises (K>12). New
+  `GaugeNaturalGradAdamW` (gauge_optim.py): natural-gradient + momentum on phi_embed/pos_phi_free
+  (active rows only, NO Adam normalization — which would re-flatten the metric), AdamW elsewhere. Opt-in
+  cfg.m_phi_natural_grad (+ m_gauge_momentum); geometric path = m_phi_natural_grad=True AND
+  phi_precond_mode="pullback_per_block".
+- **Head mixer now PER-BLOCK** (model/{block,stack,model}.py): after E-step, before norm (V2 order);
+  behavior-preserving at the shipped n_layers=1.
+- **Char-corrected BPC** (data/datasets.py `tokens_per_char` + train.evaluate/train, run_artifacts,
+  train_vfe3): BPC = (ce/ln2)*tokens_per_char (Unicode codepoints) so en/ja/ar compare; default 1.0 =
+  bits/token. PPL/CE unchanged.
+- **CE-by-dim: NOT added** (orthogonal to cross-dataset comparison — a function of K, not the dataset).
+- Tests +12 (pullback_per_block, gauge_optim incl. pullback-rotates-vs-Killing-cannot, head-mixer-per-
+  block, bpc). Full suite 624 passed, 0 failures.

@@ -93,6 +93,48 @@ def get_tiktoken_decoder(
     return lambda ids: enc.decode([int(t) for t in ids])
 
 
+_TOKENS_PER_CHAR_CACHE: dict = {}
+
+
+def tokens_per_char(
+    dataset:    str,
+    split:      str,
+
+    *,
+    cache_dir:  Optional[Path] = None,
+) -> Optional[float]:
+    r"""Corpus constant ``n_tokens / n_unicode_codepoints`` for ``dataset``/``split``, or None.
+
+    The bits-per-character correction factor: ``BPC = (CE / ln 2) * tokens_per_char`` turns the
+    model's bits-per-TOKEN into true bits-per-CHARACTER, so PPL/BPC compare across tokenizers and
+    languages (gpt2 vs cl100k; English vs Japanese/Arabic, where a token spans ~3 codepoints).
+    Computed by decoding the split's cached token stream once with its OWN tokenizer (matching the
+    cache via :func:`get_tiktoken_decoder`) and counting Unicode codepoints ``len(text)`` -- the
+    SAME denominator VFE_2.0 uses (``n_chars = len(text)``). Returns None when the dataset has no
+    real tokenizer (the synthetic anchor), tiktoken is absent, or the cache is missing; the caller
+    then leaves ``tokens_per_char = 1.0`` (honest bits-per-token, labelled as such). Memoized per
+    (dataset, split, cache_dir) -- intended for the SMALL val/test splits that are scored, a single
+    decode pass over the held-out stream.
+    """
+    key = (dataset, split, str(cache_dir) if cache_dir is not None else None)
+    if key in _TOKENS_PER_CHAR_CACHE:
+        return _TOKENS_PER_CHAR_CACHE[key]
+    decode = get_tiktoken_decoder(dataset)
+    if decode is None:                                            # synthetic anchor / no tiktoken
+        _TOKENS_PER_CHAR_CACHE[key] = None
+        return None
+    try:
+        tokens = load_cached_tokens(dataset, split, cache_dir=cache_dir)
+    except FileNotFoundError:
+        _TOKENS_PER_CHAR_CACHE[key] = None
+        return None
+    n_tokens = int(tokens.numel())
+    n_chars = len(decode(tokens.tolist()))                       # Unicode codepoints (lossless BPE round-trip)
+    tpc = (n_tokens / n_chars) if n_chars > 0 else None
+    _TOKENS_PER_CHAR_CACHE[key] = tpc
+    return tpc
+
+
 class TokenWindows(Dataset):
     """Causal-LM windows over a 1-D token stream: item ``i`` -> (input_L, target_L)."""
 
