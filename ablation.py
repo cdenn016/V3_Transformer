@@ -537,12 +537,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "values": [0.0145],
+        "param": "m_mu_lr", "values": [0.01425, 0.01475],
     },
     
     "m_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_sigma_lr", "values": [0.00275, 0.003, 0.0035],
+        "param": "m_sigma_lr", "values": [0.0045, 0.00475, 0.009],
     },
     
     "m_phi_lr": {
@@ -615,18 +615,18 @@ SWEEP_ORDER: List[str] = [
 
     
    # "m_phi_lr",
-    "m_mu_lr",
+   # "m_mu_lr",
   # "alpha_div",
     
    #  "weight_decay",
 
  #  "lambda_beta",
   #  "kappa",
-    "m_sigma_lr",
+  #  "m_sigma_lr",
   #  "e_sigma_lr",
     
        
-  #  "mstep_self_coupling_weight",
+    "mstep_self_coupling_weight",
     "e_mu_lr",
     
     

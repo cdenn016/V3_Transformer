@@ -130,7 +130,7 @@ config = dict(
     attention_prior           = "causal",            # "uniform" | "causal" | "alibi"
 
     # E-step
-    e_mu_lr                   = 0.7,
+    e_mu_lr                   = 0.9,
     e_sigma_lr                = 0.025,
     e_phi_lr                  = 0.0,
     
@@ -164,9 +164,9 @@ config = dict(
     detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
     grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
 
-    m_mu_lr                   = 0.0145,  #0.0145
-    m_sigma_lr                = 0.0021,  #0.0025
-    m_phi_lr                  = 0.013,  #0.013
+    m_mu_lr                   = 0.01475,  #0.01475
+    m_sigma_lr                = 0.005,  #0.005
+    m_phi_lr                  = 0.013,   #0.013
     
     weight_decay              = 0.065,
     
@@ -179,6 +179,7 @@ config = dict(
     alpha_div                 = 1.0,                  # Renyi order (1.0 -> KL)
     
     warmup_steps              = 100,
+    min_lr                    = 2e-4,
     seed                      = SEED,
     
     log_interval              = 100,                  # console log every N steps (0 = off)

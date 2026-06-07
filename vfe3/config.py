@@ -262,6 +262,8 @@ class VFE3Config:
     grad_accum_steps:          int   = 1
     max_steps:                 int   = 15000
     warmup_steps:              int   = 100
+    min_lr:                    float = 1e-5         # absolute cosine-decay floor: each group's LR
+    #                          never decays below this. 0.0 recovers the pure half-cosine-to-zero.
     
     seed:                      int   = 0
     log_interval:              int   = 50           # console log every N steps (0 = off)

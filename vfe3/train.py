@@ -304,7 +304,17 @@ def train(
     ``eval_interval`` steps.
     """
     optimizer = build_optimizer(model, cfg)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: lr_lambda(s, cfg))
+    # Warmup/cosine multiplier, floored so each group's ABSOLUTE LR never decays below cfg.min_lr.
+    # LambdaLR scales each group's base LR by its lambda; per-group lambdas (one per base LR) floor
+    # the product: base * max(min_lr/base, cosine) = max(min_lr, base * cosine). With cfg.min_lr=0.0
+    # this is exactly the pure half-cosine-to-zero (the theoretically pure path). The (lambda base: ...)
+    # closure captures each base LR by value, dodging late-binding over the loop variable.
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
+    sched_lambdas = [
+        (lambda base: lambda s: max(cfg.min_lr / base, lr_lambda(s, cfg)))(b)
+        for b in base_lrs
+    ]
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, sched_lambdas)
     losses: List[float] = []
     model.train()
     logger = logger or logging.getLogger(__name__)
@@ -411,10 +421,15 @@ def train(
         # commensurate with val_ce, a token-weighted mean (nats/token; see audit-2026-06-05 Finding 2).
         if do_csv:
             n_tok = max(int(tokens.shape[1]), 1)
+            lrs = scheduler.get_last_lr()                     # per-group current LR (groups 0,1,2 = mu,sigma,phi)
             row = {
                 "step":              step + 1,
                 "train_loss":        losses[-1],
-                "lr":                float(scheduler.get_last_lr()[0]),
+                "train_ce":          ce,                      # true CE (nats), off the graph
+                "train_ppl":         math.exp(min(ce, 20.0)),  # train perplexity = exp(CE), mirrors the console line
+                "lr_mu":             float(lrs[0]),           # group 0 = mu_embed          (m_mu_lr)
+                "lr_sigma":          float(lrs[1]),           # group 1 = sigma_log+decode  (m_sigma_lr)
+                "lr_phi":            float(lrs[2]),           # group 2 = phi_embed         (m_phi_lr)
                 "val_ce":            last_val.get("ce",  float("nan")),
                 "val_ppl":           last_val.get("ppl", float("nan")),
                 "val_bpc":           last_val.get("bpc", float("nan")),
