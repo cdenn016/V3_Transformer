@@ -47,7 +47,7 @@ class _EighDamped(torch.autograd.Function):
     eigendecomposition's intermediate adjoint blows up, poisoning the whole backward with NaN.
 
     Replacing ``1/Delta`` by the Lorentzian ``Delta / (Delta^2 + gap_eps)`` leaves a well-separated
-    spectrum unchanged (relative error ~ ``gap_eps / Delta^3`` for gaps ``Delta``) while damping the
+    spectrum unchanged (relative error ~ ``gap_eps / Delta^2`` for gaps ``Delta``) while damping the
     degenerate gap term to 0 instead of +/-inf -- it kills the (physically immaterial) gradient
     component within a degenerate eigenspace rather than emitting NaN. Forward is bit-identical to
     ``torch.linalg.eigh`` (only the backward is regularized), so every forward-value contract on the
@@ -66,9 +66,10 @@ class _EighDamped(torch.autograd.Function):
     def backward(ctx, gw: Optional[torch.Tensor], gV: Optional[torch.Tensor]):
         w, V = ctx.saved_tensors
         Vt = V.transpose(-1, -2)
-        # delta_ij = w_i - w_j; the diagonal (w_i - w_i = 0) gives F_ii = 0 for gap_eps > 0.
-        delta = w.unsqueeze(-1) - w.unsqueeze(-2)            # (..., n, n)
-        F = delta / (delta * delta + ctx.gap_eps)           # Lorentzian-damped 1/(w_i - w_j)
+        # delta_ij = w_j - w_i (the symmetric-eigh adjoint's F_ij = 1/(w_j - w_i); the j index is the
+        # eigenvector being perturbed). The diagonal (w_i - w_i = 0) gives F_ii = 0 for gap_eps > 0.
+        delta = w.unsqueeze(-2) - w.unsqueeze(-1)            # (..., n, n), delta_ij = w_j - w_i
+        F = delta / (delta * delta + ctx.gap_eps)           # Lorentzian-damped 1/(w_j - w_i)
         inner = F * (Vt @ gV) if gV is not None else torch.zeros_like(V)
         if gw is not None:
             inner = inner + torch.diag_embed(gw)

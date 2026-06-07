@@ -49,7 +49,7 @@ def test_cross_couplings_accepts_list_pairs_from_json_roundtrip():
     isinstance(pair, tuple) validator. Coercion normalizes them back to tuples."""
     cfg = VFE3Config(gauge_group="block_glk", embed_dim=4, n_heads=2,
                      cross_couplings=[[0, 1]])          # lists, exactly as JSON round-trips tuples
-    assert [tuple(p) for p in cfg.cross_couplings] == [(0, 1)]
+    assert cfg.cross_couplings == [(0, 1)]              # actual tuples (a stored list would fail this)
 
 
 def test_config_rejects_nan_min_lr():
@@ -64,12 +64,24 @@ def test_config_rejects_nan_min_lr_frac():
         VFE3Config(min_lr_frac=math.nan)
 
 
-def test_straight_through_with_learnable_alpha_warns():
-    """straight_through detaches the per-iteration E-step tangent, so a learnable param that enters
-    the loss ONLY through it (log_alpha, connection_W, log_lambda_beta) gets no gradient. Warn so the
-    silent freeze is not a footgun (non-breaking: 'unroll' is the default that trains them)."""
-    with pytest.warns(UserWarning, match="straight_through"):
-        VFE3Config(e_step_gradient="straight_through", alpha_mode="learnable")
+@pytest.mark.parametrize("overrides", [
+    {"alpha_mode": "learnable"},
+    {"transport_mode": "regime_ii"},
+    {"learnable_lambda_beta": True},
+])
+def test_straight_through_with_each_learnable_trigger_warns(overrides):
+    """straight_through severs the per-iteration E-step tangent, so a learnable param that enters the
+    loss ONLY through it (log_alpha / connection_W / log_lambda_beta) gets no gradient. All three
+    triggers must warn (non-breaking: 'unroll' is the default that trains them)."""
+    with pytest.warns(UserWarning, match="frozen"):
+        VFE3Config(e_step_gradient="straight_through", **overrides)
+
+
+def test_detach_with_learnable_trigger_warns():
+    """The 'detach' sibling severs the same tangent and must warn too (the un-warned route:
+    detach_e_step=True is forced to 'unroll' here and is warned at the model level instead)."""
+    with pytest.warns(UserWarning, match="frozen"):
+        VFE3Config(e_step_gradient="detach", alpha_mode="learnable")
 
 
 def test_straight_through_without_learnable_does_not_warn():
@@ -77,7 +89,7 @@ def test_straight_through_without_learnable_does_not_warn():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         VFE3Config(e_step_gradient="straight_through")          # no learnable param active
-    assert not any("straight_through" in str(w.message) for w in caught)
+    assert not any("frozen" in str(w.message) for w in caught)
 
 
 # --- Phase 7 full-config fields --------------------------------------------

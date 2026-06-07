@@ -267,11 +267,18 @@ def test_log_euclidean_diagonal_pairing_warns():
 
 # --- gap-regularized (Lorentzian-damped) eigh backward: full-cov retraction at degenerate spectra ---
 def _f_uses_eigvecs(eighfn, A):
-    """A scalar that depends on BOTH eigenvalues and eigenvectors (exercises the V-gradient, where
-    the 1/(lambda_i - lambda_j) gap terms live)."""
+    """A scalar whose gradient genuinely depends on the EIGENVECTORS, so the off-diagonal
+    F = 1/(lambda_i - lambda_j) gap term (and its SIGN) is actually exercised. Contracting sqrtA with
+    a FIXED ASYMMETRIC weight G picks up the off-diagonal entries of sqrtA = V diag(sqrt w) V^T, which
+    depend on V. (The earlier ``(sqrtA*sqrtA).sum()`` was secretly eigenvalue-only: it equals
+    ||sqrtA||_F^2 = tr(A) = sum(w), so its gradient lives entirely in the eigenvalue path and the test
+    passed for EITHER sign of F -- it could not catch a wrong-sign adjoint.)"""
     w, V = eighfn(A)
     sqrtA = (V * w.clamp(min=1e-6).sqrt().unsqueeze(-2)) @ V.transpose(-1, -2)   # V diag(sqrt w) V^T
-    return (sqrtA * sqrtA).sum() + (w * w).sum()
+    n = A.shape[-1]
+    idx = torch.arange(n, dtype=A.dtype, device=A.device)
+    G = (1.0 + idx).unsqueeze(-1) * (1.0 + 2.0 * idx).unsqueeze(-2)              # fixed, asymmetric
+    return (sqrtA * G).sum() + (w * w).sum()
 
 
 def test_eigh_damped_matches_stock_eigh_backward_on_separated_spectrum():
