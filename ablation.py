@@ -584,7 +584,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "mass_phi": {
         "description": "gauge prior weight (mass_phi / 2) ||phi||^2",
-        "param": "mass_phi", "values": [0.0, 1e-4, 5e-4, 5e-3, 0.25],
+        "param": "mass_phi", "values": [0.0, 1e-5, 1e-4, 5e-4, 5e-3, 1e-2],
     },
     
     
@@ -626,10 +626,10 @@ SWEEP_ORDER: List[str] = [
   #  "e_sigma_lr",
     
     
-    "pos_phi_scale",
+   # "pos_phi_scale",
     
     
-    "mass_phi",
+  #  "mass_phi",
     
     "mstep_self_coupling_weight",
     

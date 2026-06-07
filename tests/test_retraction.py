@@ -267,11 +267,18 @@ def test_log_euclidean_diagonal_pairing_warns():
 
 # --- gap-regularized (Lorentzian-damped) eigh backward: full-cov retraction at degenerate spectra ---
 def _f_uses_eigvecs(eighfn, A):
-    """A scalar that depends on BOTH eigenvalues and eigenvectors (exercises the V-gradient, where
-    the 1/(lambda_i - lambda_j) gap terms live)."""
+    """A scalar whose gradient genuinely depends on the EIGENVECTORS, so the off-diagonal
+    F = 1/(lambda_i - lambda_j) gap term (and its SIGN) is actually exercised. Contracting sqrtA with
+    a FIXED ASYMMETRIC weight G picks up the off-diagonal entries of sqrtA = V diag(sqrt w) V^T, which
+    depend on V. (The earlier ``(sqrtA*sqrtA).sum()`` was secretly eigenvalue-only: it equals
+    ||sqrtA||_F^2 = tr(A) = sum(w), so its gradient lives entirely in the eigenvalue path and the test
+    passed for EITHER sign of F -- it could not catch a wrong-sign adjoint.)"""
     w, V = eighfn(A)
     sqrtA = (V * w.clamp(min=1e-6).sqrt().unsqueeze(-2)) @ V.transpose(-1, -2)   # V diag(sqrt w) V^T
-    return (sqrtA * sqrtA).sum() + (w * w).sum()
+    n = A.shape[-1]
+    idx = torch.arange(n, dtype=A.dtype, device=A.device)
+    G = (1.0 + idx).unsqueeze(-1) * (1.0 + 2.0 * idx).unsqueeze(-2)              # fixed, asymmetric
+    return (sqrtA * G).sum() + (w * w).sum()
 
 
 def test_eigh_damped_matches_stock_eigh_backward_on_separated_spectrum():
@@ -351,6 +358,27 @@ def test_full_cov_e_step_isotropic_init_finite_backward():
     (out.mu.pow(2).sum() + out.sigma.pow(2).sum()).backward()
     assert torch.isfinite(mu.grad).all()
     assert torch.isfinite(sigma.grad).all()
+
+
+def test_full_cov_model_first_backward_finite_at_default_init():
+    """Model-level reachability of the eigh-NaN fix: a full-covariance VFEModel at its DEFAULT init
+    (prior sigma = diag_embed(exp(0)) = I, the degenerate spectrum) must produce a finite FIRST
+    backward on the default 'unroll' estimator. Pre-fix this NaN-poisoned prior_bank.sigma_log_embed
+    on the very first step (the defender's end-to-end repro)."""
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=8, embed_dim=4, n_heads=2, n_layers=1,
+                     family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+    model = VFEModel(cfg)
+    x = torch.randint(0, 8, (2, 6))
+    y = torch.randint(0, 8, (2, 6))
+    _, loss, _ = model(x, y)
+    assert torch.isfinite(loss)
+    loss.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads, "no parameter received a gradient"
+    assert all(torch.isfinite(g).all() for g in grads), "non-finite gradient on the full-cov first step"
 
 
 def test_log_euclidean_e_step_full_cov_runs():

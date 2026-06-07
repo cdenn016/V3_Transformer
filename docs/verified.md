@@ -13,10 +13,21 @@ INCORRECT, and whether it was RIGOROUSLY verified. Consult this before re-verify
   the full-covariance pure path was unusable from its own default init. The forward is smooth there
   (`V f(lambda) V^T` is basis-independent); only the eigh adjoint blows up. Fix: custom autograd
   `_EighDamped` with a Lorentzian-damped gap `Delta/(Delta^2+gap_eps)` at every eigendecomposition site;
-  forward bit-identical, backward finite. The adjoint was VERIFIED against the stock `torch.linalg.eigh`
-  backward on well-separated spectra (independent oracle, agree to 1e-4), FD gradcheck (float64), and
-  finite-backward at `Sigma=I` end-to-end (`tests/test_retraction.py`, 6 new tests; 24/24 retraction
-  tests pass). The damping is a small bounded bias near genuine degeneracies (factor capped at
+  forward bit-identical, backward finite.
+  **CORRECTION (commit 63368fd, found by the audit's own pass 2):** the FIRST fix (f069a8a) shipped the
+  adjoint with the WRONG SIGN (`delta_ij = w_i - w_j` giving `F = +1/(w_i-w_j)`; the symmetric-eigh
+  adjoint requires `1/(w_j-w_i)`). The forward / NaN-cure was correct, but the backward returned
+  plausible-but-WRONG gradients on `gaussian_full` whenever eigenvectors rotate. It shipped because the
+  original "agreement" test used `(sqrtA*sqrtA).sum() = tr(A) = sum(w)`, which is EIGENVALUE-ONLY
+  (`gV=0`), so the F-term (where the sign lives) never participated and the test passed for either sign.
+  Now corrected: `delta_ij = w_j - w_i`, the test downstream rebuilt to be eigenvector-dependent (a
+  fixed asymmetric contraction), and the adjoint VERIFIED against stock `torch.linalg.eigh` backward to
+  MACHINE PRECISION (6.7e-14; the wrong sign was 0.44 off) + FD (1.3e-8) on that downstream + the
+  strengthened test confirmed RED on the wrong sign / GREEN on the corrected one. Finiteness at `Sigma=I`
+  holds for either sign (`F=0` at exact degeneracy). `tests/test_retraction.py` (now 9 eigh/full-cov
+  tests incl. a mutation-discriminating model-level guard); full suite 612 passed.
+  LESSON: an eigh-adjoint validation test MUST use an eigenvector-dependent downstream, else it is blind
+  to the F-term sign. The damping is a small bounded bias near genuine degeneracies (factor capped at
   `1/(2 sqrt(gap_eps))`, gap_eps=1e-8); `gaussian_diagonal` is untouched. Commit f069a8a.
   WHY THE DAMPED GRADIENT IS CORRECT (not merely finite) at EXACT degeneracy: a smooth matrix function
   `V f(lambda) V^T` cannot depend on the arbitrary eigenvector choice within a degenerate eigenspace, so

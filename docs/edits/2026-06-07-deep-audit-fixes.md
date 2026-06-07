@@ -4,8 +4,27 @@ Multi-agent deep audit (deep-audit skill via the Workflow tool, 30 finders → p
 adversarial challenge, all read-only) + the resulting fixes. Full audit report:
 `docs/audits/audit-2026-06-07.md`. Verified-ledger entries: `docs/verified.md` (2026-06-07 section).
 
-Tests: baseline `595 (2 failing)` → **`606 passed / 0 failed`** (junit). TDD throughout (every new
+Tests: baseline `595 (2 failing)` → **`612 passed / 0 failed`** (junit). TDD throughout (every new
 test confirmed RED first, then GREEN; no forward-value regression).
+
+## Commit `63368fd` — CORRECTION: eigh-adjoint wrong sign (found by the audit's pass 2)
+
+The `_EighDamped` backward in `f069a8a` shipped with a WRONG SIGN (`delta_ij = w_i - w_j` →
+`F = +1/(w_i-w_j)`; the symmetric-eigh adjoint requires `1/(w_j-w_i)`). The forward / Sigma=I NaN-cure
+was correct, but the backward returned plausible-but-wrong gradients on `gaussian_full` when
+eigenvectors rotate. It shipped because the original agreement/FD tests used `(sqrtA*sqrtA).sum() =
+tr(A) = sum(w)` — eigenvalue-only (`gV=0`), blind to the F-term sign.
+- `retraction.py`: `delta = w_j - w_i`; corrected docstring error order (`gap_eps/Delta^2` relative).
+- `test_retraction.py`: `_f_uses_eigvecs` rebuilt eigenvector-dependent (fixed asymmetric contraction);
+  RED-on-wrong-sign confirmed, GREEN-on-fix. Verified vs stock eigh backward to 6.7e-14 + FD 1.3e-8.
+- `config.py`: extended the straight_through frozen-param warning to its `detach` sibling.
+- `test_config.py`: parametrized the warn test over all three triggers; cross_couplings asserts
+  `== [(0,1)]` directly (requires real coercion).
+
+## Commits `fed1c29`, `3b23764`
+- `fed1c29`: non-breaking warning when `straight_through` would silently freeze a learnable param;
+  verified.md symmetry-argument note for the eigh gradient at exact degeneracy.
+- `3b23764`: model-level full-cov first-backward regression guard, verified by mutation to discriminate.
 
 ## Commit `f069a8a` — HIGH: gap-regularized eigh backward (full-cov SPD retraction)
 
