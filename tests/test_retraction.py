@@ -353,6 +353,27 @@ def test_full_cov_e_step_isotropic_init_finite_backward():
     assert torch.isfinite(sigma.grad).all()
 
 
+def test_full_cov_model_first_backward_finite_at_default_init():
+    """Model-level reachability of the eigh-NaN fix: a full-covariance VFEModel at its DEFAULT init
+    (prior sigma = diag_embed(exp(0)) = I, the degenerate spectrum) must produce a finite FIRST
+    backward on the default 'unroll' estimator. Pre-fix this NaN-poisoned prior_bank.sigma_log_embed
+    on the very first step (the defender's end-to-end repro)."""
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=8, embed_dim=4, n_heads=2, n_layers=1,
+                     family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+    model = VFEModel(cfg)
+    x = torch.randint(0, 8, (2, 6))
+    y = torch.randint(0, 8, (2, 6))
+    _, loss, _ = model(x, y)
+    assert torch.isfinite(loss)
+    loss.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads, "no parameter received a gradient"
+    assert all(torch.isfinite(g).all() for g in grads), "non-finite gradient on the full-cov first step"
+
+
 def test_log_euclidean_e_step_full_cov_runs():
     """A full-covariance E-step under spd_retract_mode='log_euclidean' produces a
     finite SPD covariance and finite grads (forward+backward)."""
