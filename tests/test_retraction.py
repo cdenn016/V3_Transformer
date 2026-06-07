@@ -265,6 +265,94 @@ def test_log_euclidean_diagonal_pairing_warns():
                    diagonal_covariance=True)
 
 
+# --- gap-regularized (Lorentzian-damped) eigh backward: full-cov retraction at degenerate spectra ---
+def _f_uses_eigvecs(eighfn, A):
+    """A scalar that depends on BOTH eigenvalues and eigenvectors (exercises the V-gradient, where
+    the 1/(lambda_i - lambda_j) gap terms live)."""
+    w, V = eighfn(A)
+    sqrtA = (V * w.clamp(min=1e-6).sqrt().unsqueeze(-2)) @ V.transpose(-1, -2)   # V diag(sqrt w) V^T
+    return (sqrtA * sqrtA).sum() + (w * w).sum()
+
+
+def test_eigh_damped_matches_stock_eigh_backward_on_separated_spectrum():
+    """De-risking check against an INDEPENDENT oracle: with a tiny gap_eps and a well-separated
+    spectrum (all gaps >> sqrt(gap_eps)), the damped-eigh backward must agree with stock
+    torch.linalg.eigh's backward to tolerance -- this validates the adjoint formula itself
+    (sign, symmetrization, the F-circ-(V^T gV) term), not just that it stopped NaN-ing."""
+    from vfe3.geometry.retraction import _eigh_damped
+    torch.manual_seed(0)
+    A = torch.randn(3, 5, 5)
+    A = A @ A.transpose(-1, -2) + torch.diag_embed(torch.arange(1.0, 6.0).expand(3, 5))
+    A = 0.5 * (A + A.transpose(-1, -2))                     # well-separated SPD
+    a1 = A.clone().requires_grad_(True)
+    a2 = A.clone().requires_grad_(True)
+    _f_uses_eigvecs(lambda X: torch.linalg.eigh(X), a1).backward()
+    _f_uses_eigvecs(lambda X: _eigh_damped(X, 1e-12), a2).backward()
+    assert torch.allclose(a1.grad, a2.grad, atol=1e-4, rtol=1e-3)
+
+
+def test_eigh_damped_fd_gradient_on_separated_spectrum():
+    """Finite-difference check on a well-separated spectrum with gap_eps small enough that the
+    damping is negligible there (so FD does not pass trivially while masking a formula error)."""
+    from vfe3.geometry.retraction import _eigh_damped
+    torch.manual_seed(1)
+    A = torch.randn(4, 4, dtype=torch.float64)
+    A = A @ A.t() + torch.diag(torch.arange(1.0, 5.0, dtype=torch.float64))
+    A = (0.5 * (A + A.t())).requires_grad_(True)
+    torch.autograd.gradcheck(
+        lambda X: _f_uses_eigvecs(lambda Y: _eigh_damped(Y, 1e-14), 0.5 * (X + X.transpose(-1, -2))),
+        (A,), eps=1e-6, atol=1e-4, rtol=1e-3,
+    )
+
+
+def test_eigh_damped_finite_backward_at_isotropic():
+    """At the fully-degenerate spectrum (Sigma = I) the stock eigh backward is all-NaN; the damped
+    version stays finite (the gap term is Lorentzian-damped to 0, not 1/0)."""
+    from vfe3.geometry.retraction import _eigh_damped
+    A = torch.eye(4, requires_grad=True)
+    _f_uses_eigvecs(lambda X: _eigh_damped(X, 1e-8), A).backward()
+    assert torch.isfinite(A.grad).all()
+
+
+def test_retract_spd_full_finite_backward_at_isotropic_init():
+    """The default gaussian_full prior init is Sigma = I (fully degenerate spectrum); the unrolled
+    E-step backward through retract_spd_full must NOT be NaN there (was 100% NaN before the fix)."""
+    sigma = torch.eye(4).reshape(1, 4, 4).clone().requires_grad_(True)
+    out = retract_spd_full(sigma, torch.zeros(1, 4, 4))
+    out.sum().backward()
+    assert torch.isfinite(sigma.grad).all()
+
+
+def test_retract_logeuclidean_full_finite_backward_at_isotropic_init():
+    sigma = torch.eye(4).reshape(1, 4, 4).clone().requires_grad_(True)
+    out = retract_logeuclidean_full(sigma, torch.zeros(1, 4, 4))
+    out.sum().backward()
+    assert torch.isfinite(sigma.grad).all()
+
+
+def test_full_cov_e_step_isotropic_init_finite_backward():
+    """End-to-end reachability: a full-cov E-step at the ISOTROPIC Sigma = I init (the real default
+    prior init) gives finite grads on the DEFAULT 'unroll' estimator via spd_affine -> retract_spd_full."""
+    from vfe3.belief import BeliefState
+    from vfe3.geometry.groups import get_group
+    from vfe3.inference.e_step import e_step_iteration
+    torch.manual_seed(2)
+    N, K = 4, 4
+    group = get_group("glk")(K)
+    mu = torch.randn(1, N, K, requires_grad=True)
+    sigma = torch.eye(K).expand(1, N, K, K).clone().requires_grad_(True)   # isotropic == default init
+    phi = torch.zeros(1, N, group.generators.shape[0])
+    belief = BeliefState(mu=mu, sigma=sigma, phi=phi)
+    mu_p = torch.randn(N, K)
+    sigma_p = torch.eye(K).expand(N, K, K).clone()
+    out = e_step_iteration(belief, mu_p, sigma_p, group,
+                           e_mu_lr=0.1, e_sigma_lr=0.05, e_phi_lr=0.0,
+                           family="gaussian_full", spd_retract_mode="spd_affine")
+    (out.mu.pow(2).sum() + out.sigma.pow(2).sum()).backward()
+    assert torch.isfinite(mu.grad).all()
+    assert torch.isfinite(sigma.grad).all()
+
+
 def test_log_euclidean_e_step_full_cov_runs():
     """A full-covariance E-step under spd_retract_mode='log_euclidean' produces a
     finite SPD covariance and finite grads (forward+backward)."""

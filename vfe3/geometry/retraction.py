@@ -36,6 +36,55 @@ def get_retraction(name: str) -> Callable[..., torch.Tensor]:
     return _RETRACTIONS[name]
 
 
+class _EighDamped(torch.autograd.Function):
+    r"""``torch.linalg.eigh`` with a gap-regularized (Lorentzian-damped) backward.
+
+    The symmetric-eigendecomposition adjoint carries ``1/(lambda_i - lambda_j)`` gap terms that
+    diverge on repeated eigenvalues (Higham, *Functions of Matrices* 2008, Sec 3.2). At a degenerate
+    spectrum -- e.g. the isotropic ``Sigma = I`` that is the default ``gaussian_full`` prior init --
+    the eigenvectors are arbitrary but the downstream function ``V f(lambda) V^T`` (matrix
+    sqrt / inv-sqrt / log / exp here) is smooth, so the *true* gradient is finite; only the
+    eigendecomposition's intermediate adjoint blows up, poisoning the whole backward with NaN.
+
+    Replacing ``1/Delta`` by the Lorentzian ``Delta / (Delta^2 + gap_eps)`` leaves a well-separated
+    spectrum unchanged (relative error ~ ``gap_eps / Delta^3`` for gaps ``Delta``) while damping the
+    degenerate gap term to 0 instead of +/-inf -- it kills the (physically immaterial) gradient
+    component within a degenerate eigenspace rather than emitting NaN. Forward is bit-identical to
+    ``torch.linalg.eigh`` (only the backward is regularized), so every forward-value contract on the
+    retractions is preserved. Validated against the stock ``eigh`` backward on well-separated spectra
+    (tests/test_retraction.py).
+    """
+
+    @staticmethod
+    def forward(ctx, A: torch.Tensor, gap_eps: float):     # noqa: D401
+        w, V = torch.linalg.eigh(A)
+        ctx.save_for_backward(w, V)
+        ctx.gap_eps = gap_eps
+        return w, V
+
+    @staticmethod
+    def backward(ctx, gw: Optional[torch.Tensor], gV: Optional[torch.Tensor]):
+        w, V = ctx.saved_tensors
+        Vt = V.transpose(-1, -2)
+        # delta_ij = w_i - w_j; the diagonal (w_i - w_i = 0) gives F_ii = 0 for gap_eps > 0.
+        delta = w.unsqueeze(-1) - w.unsqueeze(-2)            # (..., n, n)
+        F = delta / (delta * delta + ctx.gap_eps)           # Lorentzian-damped 1/(w_i - w_j)
+        inner = F * (Vt @ gV) if gV is not None else torch.zeros_like(V)
+        if gw is not None:
+            inner = inner + torch.diag_embed(gw)
+        gA = V @ inner @ Vt
+        gA = 0.5 * (gA + gA.transpose(-1, -2))              # A is symmetric -> symmetric cotangent
+        return gA, None
+
+
+def _eigh_damped(A: torch.Tensor, gap_eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""``(eigenvalues, eigenvectors)`` of symmetric ``A`` with a gap-regularized backward (see
+    :class:`_EighDamped`). Drop-in for ``torch.linalg.eigh`` on the full-cov SPD retraction paths so a
+    degenerate spectrum (the ``Sigma = I`` default init) yields finite -- not NaN -- gradients on the
+    unrolled E-step. ``gap_eps`` bounds the worst-case gap factor at ``1/(2 sqrt(gap_eps))``."""
+    return _EighDamped.apply(A, gap_eps)
+
+
 def retract_spd_diagonal(
     sigma_diag:   torch.Tensor,             # (..., K) diagonal variances
     delta_sigma:  torch.Tensor,             # (..., K) diagonal tangent
@@ -77,9 +126,9 @@ def retract_spd_full(
         Sigma_new = S^{1/2} exp(S^{-1/2} (tau dSigma) S^{-1/2}) S^{1/2},
     with a Frobenius trust region on the whitened tangent and an eigenvalue
     floor/ceiling [eps, sigma_max] (eigenvalues are variances: the SAME physical ceiling the
-    diagonal arm applies to sigma). Uses torch.linalg.eigh; a gap-regularized
-    eigh backward for gradient stability on near-degenerate spectra is deferred
-    to a later hardening pass.
+    diagonal arm applies to sigma). Uses the gap-regularized ``_eigh_damped`` eigendecomposition so
+    the unrolled backward stays finite on a degenerate spectrum -- the isotropic ``Sigma = I`` default
+    gaussian_full init makes the stock eigh backward 100% NaN; forward values are unchanged.
     """
     orig_shape = sigma.shape
     orig_dtype = sigma.dtype
@@ -94,7 +143,7 @@ def retract_spd_full(
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
         delta_sigma = 0.5 * (delta_sigma + delta_sigma.transpose(-1, -2))
 
-        eigenvalues, eigenvectors = torch.linalg.eigh(sigma)
+        eigenvalues, eigenvectors = _eigh_damped(sigma)
         eigenvalues = eigenvalues.clamp(min=eps)
         sqrt_eig     = torch.sqrt(eigenvalues)
         inv_sqrt_eig = 1.0 / sqrt_eig
@@ -107,14 +156,14 @@ def retract_spd_full(
             R_norm = torch.linalg.norm(R, ord='fro', dim=(-2, -1), keepdim=True)
             R = R * torch.clamp(trust_region / (R_norm + eps), max=1.0)
 
-        R_eval, R_evec = torch.linalg.eigh(R)
+        R_eval, R_evec = _eigh_damped(R)
         R_eval = R_eval.clamp(-50.0, 50.0)
         exp_R = R_evec * torch.exp(R_eval).unsqueeze(-2) @ R_evec.transpose(-1, -2)
 
         sigma_new = sigma_sqrt @ exp_R @ sigma_sqrt
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
-        eig_new, vec_new = torch.linalg.eigh(sigma_new)
+        eig_new, vec_new = _eigh_damped(sigma_new)
         eig_new = eig_new.clamp(min=eps, max=sigma_max)      # eigenvalues ARE variances: ONE ceiling
         sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
 
@@ -193,7 +242,7 @@ def retract_logeuclidean_full(
         sigma     = 0.5 * (sigma + sigma.transpose(-1, -2))
         delta_log = 0.5 * (delta_log + delta_log.transpose(-1, -2))
 
-        eigenvalues, eigenvectors = torch.linalg.eigh(sigma)
+        eigenvalues, eigenvectors = _eigh_damped(sigma)
         eigenvalues = eigenvalues.clamp(min=eps)
         log_eig = torch.log(eigenvalues)
         log_sigma = eigenvectors * log_eig.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
@@ -205,12 +254,12 @@ def retract_logeuclidean_full(
         M = log_sigma + tangent
         M = 0.5 * (M + M.transpose(-1, -2))
 
-        M_eval, M_evec = torch.linalg.eigh(M)
+        M_eval, M_evec = _eigh_damped(M)
         M_eval = M_eval.clamp(-50.0, 50.0)
         sigma_new = M_evec * torch.exp(M_eval).unsqueeze(-2) @ M_evec.transpose(-1, -2)
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
-        eig_new, vec_new = torch.linalg.eigh(sigma_new)
+        eig_new, vec_new = _eigh_damped(sigma_new)
         eig_new = eig_new.clamp(min=eps, max=sigma_max)      # eigenvalues ARE variances: ONE ceiling
         sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
 
