@@ -189,8 +189,9 @@ config = dict(
 )
 
 
-# Where each run's artifacts go: vfe3_runs/<timestamp>_<label>/ (config.json, metrics.csv,
-# checkpoints/, best_model.pt, test_results.json, summary.json, *.png). None disables persistence.
+# Where each run's artifacts go: vfe3_runs/<timestamp>_<label>/ while training (config.json,
+# metrics.csv, checkpoints/, best_model.pt, test_results.json, summary.json, *.png), renamed to
+# vfe3_runs/<test_ppl>_<label>/ (timestamp dropped) at finalize. None disables persistence.
 RUN_ROOT = "vfe3_runs"
 
 
@@ -255,15 +256,64 @@ def _select_loader(
         return synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
 
 
+def _run_label(cfg: VFE3Config, dataset: str) -> str:
+    r"""Descriptive run label ``<dataset>_K<embed_dim>_<group>[_linear][_mix]`` (no timestamp, no PPL).
+
+    The stable part of the run-folder name: ``_run_dir`` prefixes it with a timestamp while the run is
+    in progress, and ``_rename_run_by_ppl`` swaps that prefix for the test perplexity at finalize.
+    """
+    tags = ("_linear" if not cfg.use_prior_bank else "") + ("_mix" if cfg.use_head_mixer else "")
+    return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}"
+
+
 def _run_dir(cfg: VFE3Config, dataset: str) -> 'str | None':
-    r"""``vfe3_runs/<timestamp>_<dataset>_K<embed_dim>_<group>[_linear][_mix]/`` (None if RUN_ROOT is None)."""
+    r"""In-progress run dir ``vfe3_runs/<timestamp>_<label>/`` (None if RUN_ROOT is None).
+
+    The timestamp keeps concurrent runs from colliding while training; ``_rename_run_by_ppl`` drops it in
+    favour of the held-out test perplexity once ``finalize_run`` has scored the test split.
+    """
     if RUN_ROOT is None:
         return None
     from datetime import datetime
     from pathlib import Path
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    tags = "" + ("_linear" if not cfg.use_prior_bank else "") + ("_mix" if cfg.use_head_mixer else "")
-    return str(Path(RUN_ROOT) / f"{stamp}_{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}")
+    return str(Path(RUN_ROOT) / f"{stamp}_{_run_label(cfg, dataset)}")
+
+
+def _rename_run_by_ppl(
+    run_dir:  str,                       # in-progress timestamped run directory
+    label:    str,                       # descriptive part to keep (see _run_label)
+    test_ppl: 'float | None',            # held-out test perplexity (None / non-finite -> no rename)
+
+    logger:   logging.Logger,
+) -> str:
+    r"""Rename ``run_dir`` to ``vfe3_runs/<test_ppl:.2f>_<label>/`` so runs sort by test perplexity.
+
+    The folder is created with a timestamp prefix (the PPL is unknown until ``finalize_run`` scores the
+    test split); this swaps that prefix for the formatted test PPL and drops the timestamp. Returns the
+    new path -- or the original unchanged when the PPL is missing/non-finite (the timestamped name is
+    then the only stable handle) or when the OS refuses the move (an open handle / locked directory --
+    the numeric results are already on disk, so a failed rename is logged, never fatal). A name clash
+    gets a ``_2``, ``_3``, ... suffix so an existing run is never clobbered.
+    """
+    import math
+    from pathlib import Path
+
+    src = Path(run_dir)
+    if test_ppl is None or not math.isfinite(test_ppl) or not src.exists():
+        return run_dir
+    dst = src.parent / f"{test_ppl:.2f}_{label}"
+    i = 2
+    while dst.exists():
+        dst = src.parent / f"{test_ppl:.2f}_{label}_{i}"
+        i += 1
+    try:
+        src.rename(dst)
+    except OSError as exc:                                # open handle / locked dir -> keep run, log it
+        logger.warning("could not rename run dir to %s (%s); kept %s", dst.name, exc, src.name)
+        return run_dir
+    logger.info("Renamed run dir -> %s", dst.name)
+    return str(dst)
 
 
 def main() -> None:
@@ -318,8 +368,9 @@ def main() -> None:
     if artifacts is not None:
         test_loader = (val_loader if DATASET == "synthetic-period3"
                        else _select_loader(DATASET, cfg, logger, split="test"))
-        finalize_run(model, artifacts, cfg, test_loader=test_loader, losses=losses,
-                     device=torch.device(DEVICE), wall_time=wall, logger=logger)
+        results = finalize_run(model, artifacts, cfg, test_loader=test_loader, losses=losses,
+                               device=torch.device(DEVICE), wall_time=wall, logger=logger)
+        run_dir = _rename_run_by_ppl(run_dir, _run_label(cfg, DATASET), results.get("test_ppl"), logger)
         logger.info("Artifacts written to %s", run_dir)
 
 

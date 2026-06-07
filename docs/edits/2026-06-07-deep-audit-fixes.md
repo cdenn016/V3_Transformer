@@ -66,3 +66,38 @@ tr(A) = sum(w)` — eigenvalue-only (`gV=0`), blind to the F-term sign.
   for the equal-block default); adjacent to the settled per-irrep-block-beta design.
 - Pre-existing dead code / unused imports — left per CLAUDE.md ("mention, don't delete").
 - ~30 LOW diagnostics/metrics findings — diagnostics-only; recommended as one follow-up pass.
+
+## Run folders named by test PPL (separate from the audit)
+
+`train_vfe3.py`: run folders now finalize as `vfe3_runs/<test_ppl:.2f>_<label>/` (e.g.
+`154.29_wikitext-103_K20_block_glk_linear_mix`) — no timestamp — so runs sort by perplexity in the
+file browser (automating a rename the user had been doing by hand). The folder is still created with a
+`<timestamp>_<label>` name while training (the PPL is unknown until `finalize_run` scores the test
+split); the entry point swaps the timestamp prefix for the test PPL at the end.
+
+- Factored `_run_label(cfg, dataset)` (`<dataset>_K<embed_dim>_<group>[_linear][_mix]`) out of
+  `_run_dir`, which now prefixes it with the timestamp.
+- Added `_rename_run_by_ppl(run_dir, label, test_ppl, logger)`: renames to `<test_ppl:.2f>_<label>`;
+  keeps the timestamped name when the PPL is missing/non-finite; on a name clash appends `_2`, `_3`,
+  ...; a failed move (open handle / locked dir) is logged, never fatal (numbers are already on disk).
+- `main()` now captures `finalize_run`'s result and calls the rename after figures are written.
+- Placement: the entry point, not `finalize_run` — `ablation.py` does NOT call `finalize_run` (it
+  copies the winning config into `train_vfe3.py` for the test eval), and `make_figures.py` finds runs
+  by `config.json` + mtime, so neither depends on the timestamp being in the folder name. The ISO
+  timestamp is still preserved inside each run's `config.json`.
+- `tests/test_run_naming.py`: +7 tests (label/tags, timestamped in-progress dir, rename, collision
+  suffix, non-finite/missing-PPL skip, absent-dir skip).
+
+Also in this working tree: click-to-run config operating-point tuning (`kappa`, `mstep_self_coupling_weight`,
+`min_lr`, `min_lr_frac`) — committed separately as it carries the run's config.
+
+## UMAP figure-gen warnings (investigated, no code change)
+
+End-of-run console warnings from `report.generate_figures` → `figures.umap_embed` are both benign.
+`n_jobs value 1 overridden to 1 by setting random_state` is the reproducibility/parallelism tradeoff
+(`umap_embed` passes `random_state=seed`; once per channel). `Spectral initialisation failed! The
+eigenvector solver failed` is caught inside UMAP (`umap/spectral.py:547-554`) and falls back to random
+init, so the embedding completes — all `belief_umap_*.png` were written. By loop order (mu→sigma→phi)
+it was the phi (gauge) embedding; the trigger is a near-disconnected / tiny-eigengap kNN graph, which
+is *consistent with* (unconfirmed — no wikitext cache on the CPU box to re-extract) low gauge-frame
+diversity across tokens. Left as-is; the warnings are informative.
