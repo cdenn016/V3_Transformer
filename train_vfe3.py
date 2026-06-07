@@ -112,12 +112,12 @@ config = dict(
     
     learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
     
-    kappa                     = 1.3,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
 
     alpha                     = 1.0,                 # constant self-coupling value
     lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
     mass_phi                  = 0.0,                 # (mass_phi/2) ||phi||^2 penalty
-    mstep_self_coupling_weight = 0.05,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    mstep_self_coupling_weight = 0.00,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
     
     
     lambda_h                  = 0.0,           # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
@@ -179,8 +179,8 @@ config = dict(
     alpha_div                 = 1.0,                  # Renyi order (1.0 -> KL)
     
     warmup_steps              = 100,
-    min_lr                    = 1e-4,                # absolute cosine-decay LR floor (0.0 = pure cosine)
-    min_lr_frac               = 0.1,                 # proportional LR floor, max(min_lr, frac*base); OFF
+    min_lr                    = 0,                # absolute cosine-decay LR floor (0.0 = pure cosine)
+    min_lr_frac               = 0.01,                 # proportional LR floor, max(min_lr, frac*base); OFF
     amp_dtype                 = None,                # None=fp32 | 'bf16' ('fp16' needs a GradScaler: deferred)
     seed                      = SEED,
     
@@ -191,8 +191,9 @@ config = dict(
 )
 
 
-# Where each run's artifacts go: vfe3_runs/<timestamp>_<label>/ (config.json, metrics.csv,
-# checkpoints/, best_model.pt, test_results.json, summary.json, *.png). None disables persistence.
+# Where each run's artifacts go: vfe3_runs/<timestamp>_<label>/ while training (config.json,
+# metrics.csv, checkpoints/, best_model.pt, test_results.json, summary.json, *.png), renamed to
+# vfe3_runs/<test_ppl>_<label>/ (timestamp dropped) at finalize. None disables persistence.
 RUN_ROOT = "vfe3_runs"
 
 
@@ -257,15 +258,64 @@ def _select_loader(
         return synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
 
 
+def _run_label(cfg: VFE3Config, dataset: str) -> str:
+    r"""Descriptive run label ``<dataset>_K<embed_dim>_<group>[_linear][_mix]`` (no timestamp, no PPL).
+
+    The stable part of the run-folder name: ``_run_dir`` prefixes it with a timestamp while the run is
+    in progress, and ``_rename_run_by_ppl`` swaps that prefix for the test perplexity at finalize.
+    """
+    tags = ("_linear" if not cfg.use_prior_bank else "") + ("_mix" if cfg.use_head_mixer else "")
+    return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}"
+
+
 def _run_dir(cfg: VFE3Config, dataset: str) -> 'str | None':
-    r"""``vfe3_runs/<timestamp>_<dataset>_K<embed_dim>_<group>[_linear][_mix]/`` (None if RUN_ROOT is None)."""
+    r"""In-progress run dir ``vfe3_runs/<timestamp>_<label>/`` (None if RUN_ROOT is None).
+
+    The timestamp keeps concurrent runs from colliding while training; ``_rename_run_by_ppl`` drops it in
+    favour of the held-out test perplexity once ``finalize_run`` has scored the test split.
+    """
     if RUN_ROOT is None:
         return None
     from datetime import datetime
     from pathlib import Path
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    tags = "" + ("_linear" if not cfg.use_prior_bank else "") + ("_mix" if cfg.use_head_mixer else "")
-    return str(Path(RUN_ROOT) / f"{stamp}_{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}")
+    return str(Path(RUN_ROOT) / f"{stamp}_{_run_label(cfg, dataset)}")
+
+
+def _rename_run_by_ppl(
+    run_dir:  str,                       # in-progress timestamped run directory
+    label:    str,                       # descriptive part to keep (see _run_label)
+    test_ppl: 'float | None',            # held-out test perplexity (None / non-finite -> no rename)
+
+    logger:   logging.Logger,
+) -> str:
+    r"""Rename ``run_dir`` to ``vfe3_runs/<test_ppl:.2f>_<label>/`` so runs sort by test perplexity.
+
+    The folder is created with a timestamp prefix (the PPL is unknown until ``finalize_run`` scores the
+    test split); this swaps that prefix for the formatted test PPL and drops the timestamp. Returns the
+    new path -- or the original unchanged when the PPL is missing/non-finite (the timestamped name is
+    then the only stable handle) or when the OS refuses the move (an open handle / locked directory --
+    the numeric results are already on disk, so a failed rename is logged, never fatal). A name clash
+    gets a ``_2``, ``_3``, ... suffix so an existing run is never clobbered.
+    """
+    import math
+    from pathlib import Path
+
+    src = Path(run_dir)
+    if test_ppl is None or not math.isfinite(test_ppl) or not src.exists():
+        return run_dir
+    dst = src.parent / f"{test_ppl:.2f}_{label}"
+    i = 2
+    while dst.exists():
+        dst = src.parent / f"{test_ppl:.2f}_{label}_{i}"
+        i += 1
+    try:
+        src.rename(dst)
+    except OSError as exc:                                # open handle / locked dir -> keep run, log it
+        logger.warning("could not rename run dir to %s (%s); kept %s", dst.name, exc, src.name)
+        return run_dir
+    logger.info("Renamed run dir -> %s", dst.name)
+    return str(dst)
 
 
 def main() -> None:
