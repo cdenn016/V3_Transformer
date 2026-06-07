@@ -80,25 +80,21 @@ VFE3_TEST_DEVICE=cuda for the GPU).
 - **PowerShell `>` redirection writes UTF-16LE+BOM** (reads back as `\xff\xfe d a ...`). Use
   `-Encoding utf8`, or the Bash tool, when another tool must read the file.
 
-**Post Edit Policy**:  Always write a brief post-edit description of changes made to the codebase as a .md.  The date the edits were made should be in the naming convention of the document.  there should be only one document per day.  you should update the same document as edits are made
+**Post Edit Policy**:  Always write a brief (BRIEF DAMMIT!) post-edit description of changes made to the codebase as a .md.  The date the edits were made should be in the naming convention of the document.  there should be only one document per day.  you should update the same document as edits are made
 
 **There should ALWAYS exist a theoretically/mathematically "pure" path under appropriate toggles.**  Computationally extreme paths should be 'opt in' toggles and clearly documented.
 
 **Audit Instructions** - when auditing the code base dont concern yourself whether default config toggles are theoretically pure.  rather, concern yourself with whether the theoretically pure paths exist.  i am constantly changing toggles.
 
-**Audit/Verification policy** when verifying mathematical expressions and theory compile a verified.md document briefly stating what was checked, if it was incorrect, and if it was rigorously verified.  When auditing/verifying you should consult this document so you dont reverify things youve already verified. 
 
 **CODE FOCUS** when investigating and/or auditing the codebase do NOT rely on code comments....focus on the actual code and paths
 
 **user has RTX5090 GPU** - use cuda and code accordingly where applicable
 
-**Local model offload** — when the `qwen-local` `offload_to_local_model` MCP tool is available, delegate voluminous or mechanical low-stakes text generation to it to conserve Claude usage: condensing long docs/logs, first-draft boilerplate (test scaffolds, docstring stubs, post-edit-doc prose), bulk reformatting, and classify/tag-at-volume — then review the output before relying on it. NEVER offload anything that must be correct: math/theory verification, gauge/KL/free-energy derivations, code-correctness judgments (a 27B model hallucinates on exactly that work — see the Tooling & verification discipline above). The tool is stateless (single prompt in, text out, no repo access), so pass it the context it needs; for inputs that exceed its context window, map-reduce (chunk, offload each chunk, then synthesize) rather than letting them silently truncate. The backend (`llama-server`) must be running — launch it with `F:\qwen-mcp\start.ps1`. This policy self-disables on machines where the tool is absent.
-
-**ALWAYS BRANCH FRESH FROM MAIN** - each session should be a fresh branch from main
+**ALWAYS BRANCH FRESH FROM MAIN** - each session should be a fresh branch from main and you should maintain a tidy worktree!
 
 **DONT LEAVE MESSES!!** ALWAYS CLEAN UP temp FILES FROM ATOMIC EDITS AND SUCH WHEN FINISHED!
 
-**avoid parallel bash(cd*)**  it is very buggy
 
 ## Mathematical Reference
 
@@ -116,7 +112,7 @@ F = alpha * KL(q_i || p_i)                                          # self-coupl
              + tau * gamma_ij * log(gamma_ij / pi^(s)_ij) ]         # model coupling + meta entropy
   - E_q[log p(o | x)]                                               # observation likelihood
 ```
-tau = kappa * sqrt(K) is the effective softmax temperature. The tau * beta_ij * log(beta_ij/pi_ij) term is the attention-distribution entropy with uniform prior pi_ij = 1/N; it is required for the softmax β to be a stationary point of F (without it the row-Lagrangian gives a delta, not softmax). The canonical F vs "entropy-suppressed surrogate" sum β KL distinction is made explicitly in Attention/GL(K)_attention.tex  (the surrogate is acknowledged again in Attention/GL(K)_supplementary.tex ) — their gradients differ by -tau^{-1} Cov_β(KL, ∇KL). See participatory_it_from_bit.tex for the FULL GENERAL theory
+tau = kappa * sqrt(dim_h) is the effective softmax temperature per head. The tau * beta_ij * log(beta_ij/pi_ij) term is the attention-distribution entropy with uniform prior pi_ij = 1/N; it is required for the softmax β to be a stationary point of F (without it the row-Lagrangian gives a delta, not softmax). The canonical F vs "entropy-suppressed surrogate" sum β KL distinction is made explicitly in Attention/GL(K)_attention.tex  (the surrogate is acknowledged again in Attention/GL(K)_supplementary.tex ) — their gradients differ by -tau^{-1} Cov_β(KL, ∇KL). See participatory_it_from_bit.tex for the FULL GENERAL theory
 
 ## Communication
 
@@ -128,7 +124,7 @@ tau = kappa * sqrt(K) is the effective softmax temperature. The tau * beta_ij * 
 
 **No bullshit.** If a correspondence is interpretive rather than mathematically exact, say so. Admit gaps; never dress up hand-waving as theorem. When asked "what does X have to do with anything?" and the answer is "not much," say that.
 
-**Verify with citations** for theoretical and mathematical claims. use /literature-review skill.
+**Verify with citations** for theoretical and mathematical claims. use /literature-review skill
 
 **Skip praise preambles.** No "Great question!" or "Excellent point!" — engage with the substance. no sycophancy
 
