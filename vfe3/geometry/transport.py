@@ -58,7 +58,12 @@ class RopeTransport:
     always applies the rotation; ``transport_covariance`` applies it only when ``on_cov`` (the
     means+covariance "full-gauge" regime, which the config gates to full covariance). Means-only
     (``on_cov=False``) leaves the covariance sandwich on the un-rotated ``base`` -- numerically
-    identical to no RoPE for the covariance, so the diagonal-covariance path stays valid.
+    identical to no RoPE for the covariance tensor itself, so the diagonal-covariance path stays
+    valid. NOTE: under means-only the mean transports under R_i Omega_ij R_j^T but the covariance
+    under the bare Omega_ij, so the transported (mu_t, Sigma_t) is NOT a single coherent congruence
+    image -- affine/Mahalanobis invariants (e.g. mu^T Sigma^{-1} mu, norms.MahalanobisNorm) are not
+    preserved for that belief. The coherent pure path is ``on_cov=True`` (rope_full_gauge), where
+    both transform under the same rotated operator.
     """
 
     base:   'torch.Tensor | FactoredTransport'  # (N,N,K,K) dense OR factored transport

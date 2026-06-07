@@ -43,6 +43,43 @@ def test_config_rejects_nonpositive_kl_max():
         VFE3Config(kl_max=0.0)
 
 
+def test_cross_couplings_accepts_list_pairs_from_json_roundtrip():
+    """A config.json reloaded by viz.report._load_config gives LIST pairs (JSON has no tuples);
+    VFE3Config(**reloaded) must accept them so a cold-start generate_figures does not crash on the
+    isinstance(pair, tuple) validator. Coercion normalizes them back to tuples."""
+    cfg = VFE3Config(gauge_group="block_glk", embed_dim=4, n_heads=2,
+                     cross_couplings=[[0, 1]])          # lists, exactly as JSON round-trips tuples
+    assert [tuple(p) for p in cfg.cross_couplings] == [(0, 1)]
+
+
+def test_config_rejects_nan_min_lr():
+    import math
+    with pytest.raises(ValueError):
+        VFE3Config(min_lr=math.nan)
+
+
+def test_config_rejects_nan_min_lr_frac():
+    import math
+    with pytest.raises(ValueError):
+        VFE3Config(min_lr_frac=math.nan)
+
+
+def test_straight_through_with_learnable_alpha_warns():
+    """straight_through detaches the per-iteration E-step tangent, so a learnable param that enters
+    the loss ONLY through it (log_alpha, connection_W, log_lambda_beta) gets no gradient. Warn so the
+    silent freeze is not a footgun (non-breaking: 'unroll' is the default that trains them)."""
+    with pytest.warns(UserWarning, match="straight_through"):
+        VFE3Config(e_step_gradient="straight_through", alpha_mode="learnable")
+
+
+def test_straight_through_without_learnable_does_not_warn():
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        VFE3Config(e_step_gradient="straight_through")          # no learnable param active
+    assert not any("straight_through" in str(w.message) for w in caught)
+
+
 # --- Phase 7 full-config fields --------------------------------------------
 def test_config_model_defaults():
     cfg = VFE3Config()

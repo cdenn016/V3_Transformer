@@ -262,8 +262,13 @@ class VFE3Config:
     grad_accum_steps:          int   = 1
     max_steps:                 int   = 15000
     warmup_steps:              int   = 100
-    min_lr:                    float = 1e-5         # absolute cosine-decay floor: each group's LR
+    min_lr:                    float = 1e-4         # absolute cosine-decay floor: each group's LR
     #                          never decays below this. 0.0 recovers the pure half-cosine-to-zero.
+    min_lr_frac:               float = 0.0           # fractional cosine-decay floor (default OFF):
+    #                          each group's LR never decays below min_lr_frac * its OWN base LR,
+    #                          preserving the m_mu:m_sigma:m_phi base ratios into the tail. Combined
+    #                          with min_lr as max(min_lr, min_lr_frac*base). 0.0 (with min_lr=0) is
+    #                          the pure half-cosine-to-zero path.
     
     seed:                      int   = 0
     log_interval:              int   = 50           # console log every N steps (0 = off)
@@ -373,6 +378,11 @@ class VFE3Config:
                     f"cross_couplings must be a list of (int, int) head pairs, got "
                     f"{type(self.cross_couplings).__name__}"
                 )
+            # JSON has no tuple type, so a config.json reloaded by viz.report._load_config hands
+            # back list pairs; coerce them to tuples so the round-trip rebuild does not trip the
+            # isinstance(pair, tuple) gate below (and downstream builders see a consistent type).
+            self.cross_couplings = [tuple(p) if isinstance(p, list) else p
+                                    for p in self.cross_couplings]
             for pair in self.cross_couplings:
                 if (not isinstance(pair, tuple) or len(pair) != 2
                         or not all(isinstance(x, int) for x in pair)):
@@ -599,9 +609,28 @@ class VFE3Config:
                 f"'detach'. Set detach_e_step=False and use e_step_gradient to select the mode, "
                 f"or leave e_step_gradient='unroll'."
             )
-        for name in ("m_mu_lr", "m_sigma_lr", "m_phi_lr", "weight_decay"):
-            if getattr(self, name) < 0.0:
-                raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
+        # straight_through detaches the per-iteration E-step tangent, so a learnable parameter whose
+        # only loss path IS that tangent receives no gradient and silently freezes. Warn (non-breaking;
+        # 'unroll' is the default that trains them) rather than restrict the toggle combination.
+        if self.e_step_gradient == "straight_through" and (
+            self.alpha_mode == "learnable"
+            or self.transport_mode == "regime_ii"
+            or self.learnable_lambda_beta
+        ):
+            import warnings
+            warnings.warn(
+                "e_step_gradient='straight_through' detaches the per-iteration E-step tangent, so a "
+                "learnable parameter that enters the loss only through it (log_alpha under "
+                "alpha_mode='learnable', connection_W under transport_mode='regime_ii', log_lambda_beta "
+                "under learnable_lambda_beta) receives NO gradient and stays frozen. Use "
+                "e_step_gradient='unroll' (the default) to train these.",
+                UserWarning,
+                stacklevel=2,
+            )
+        for name in ("m_mu_lr", "m_sigma_lr", "m_phi_lr", "weight_decay", "min_lr", "min_lr_frac"):
+            v = getattr(self, name)
+            if v < 0.0 or v != v:                            # v != v rejects NaN (which passes < 0.0)
+                raise ValueError(f"{name} must be >= 0 (and not NaN), got {v}")
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
         if self.grad_accum_steps < 1:
