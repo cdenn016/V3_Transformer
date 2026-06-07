@@ -101,3 +101,27 @@ init, so the embedding completes — all `belief_umap_*.png` were written. By lo
 it was the phi (gauge) embedding; the trigger is a near-disconnected / tiny-eigengap kNN graph, which
 is *consistent with* (unconfirmed — no wikitext cache on the CPU box to re-extract) low gauge-frame
 diversity across tokens. Left as-is; the warnings are informative.
+
+## README rewrite: architecture + math/theory + ASCII diagram
+
+Replaced the 7-line stub `README.md` with a full architecture/theory overview written
+from the actual code (not docstrings): `vfe3/model/{model,stack,block,prior_bank}.py`,
+`vfe3/inference/e_step.py`, `vfe3/free_energy.py`, `vfe3/geometry/{groups,transport,
+retraction}.py`, `vfe3/config.py`, `vfe3/train.py`, and the diagonal KL kernel in
+`vfe3/families/gaussian.py`.
+
+Content: the no-NN core idea; an ASCII diagram showing the three nested loops (inner
+E-step iteration x T -> per-block handoff loop x L -> outer M-step backprop through the
+unrolled E-step into the PriorBank tables); encode / E-step (transport cocycle, per-irrep
+energy, softmax beta, Fisher natgrad, Euclidean mu + affine-invariant SPD Sigma + Lie phi
+retractions) / block handoff / KL-readout decode / M-step; the canonical free energy with
+the attention-entropy term; the gauge-group registry and admissibility; the registry-based
+modularity and the pure-path discipline.
+
+Guardrails applied: decode is described as the KL-nearest-prior readout the code computes,
+with the FEP "agent community" framing flagged explicitly as interpretation; all
+default-OFF / predictively-inert / deferred features (s-channel `lambda_h`/`gamma`,
+`regime_ii`, head mixer, learnable alpha/lambda_beta, the partially-wired h->s->p->q
+hierarchy) presented as opt-in extension points, not the live default; the dead
+`docs/superpowers/specs/...` spec link (file absent from the repo) dropped in favor of
+`Manuscripts-Theory/` and `docs/`. No `---` rules / banned Claude-isms.
