@@ -18,6 +18,12 @@ INCORRECT, and whether it was RIGOROUSLY verified. Consult this before re-verify
   finite-backward at `Sigma=I` end-to-end (`tests/test_retraction.py`, 6 new tests; 24/24 retraction
   tests pass). The damping is a small bounded bias near genuine degeneracies (factor capped at
   `1/(2 sqrt(gap_eps))`, gap_eps=1e-8); `gaussian_diagonal` is untouched. Commit f069a8a.
+  WHY THE DAMPED GRADIENT IS CORRECT (not merely finite) at EXACT degeneracy: a smooth matrix function
+  `V f(lambda) V^T` cannot depend on the arbitrary eigenvector choice within a degenerate eigenspace, so
+  the true eigenvector-gradient contribution there genuinely vanishes — exactly what
+  `F = Delta/(Delta^2+gap_eps) -> 0` produces, leaving only the correct eigenvalue path. So the fix
+  returns the RIGHT gradient at `Sigma=I`, not just a non-NaN one (corroborated by the stock-eigh
+  agreement test on well-separated spectra).
 
 - **`min_lr_frac` intended default is 0.0.** CHECKED. The 2026-06-06 edit-doc states the proportional
   LR floor was added with default 0.0 ("keeps current behavior"); the committed 0.01 contradicted that

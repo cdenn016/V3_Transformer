@@ -64,6 +64,22 @@ def test_config_rejects_nan_min_lr_frac():
         VFE3Config(min_lr_frac=math.nan)
 
 
+def test_straight_through_with_learnable_alpha_warns():
+    """straight_through detaches the per-iteration E-step tangent, so a learnable param that enters
+    the loss ONLY through it (log_alpha, connection_W, log_lambda_beta) gets no gradient. Warn so the
+    silent freeze is not a footgun (non-breaking: 'unroll' is the default that trains them)."""
+    with pytest.warns(UserWarning, match="straight_through"):
+        VFE3Config(e_step_gradient="straight_through", alpha_mode="learnable")
+
+
+def test_straight_through_without_learnable_does_not_warn():
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        VFE3Config(e_step_gradient="straight_through")          # no learnable param active
+    assert not any("straight_through" in str(w.message) for w in caught)
+
+
 # --- Phase 7 full-config fields --------------------------------------------
 def test_config_model_defaults():
     cfg = VFE3Config()

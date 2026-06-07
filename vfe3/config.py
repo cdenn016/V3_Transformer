@@ -609,6 +609,24 @@ class VFE3Config:
                 f"'detach'. Set detach_e_step=False and use e_step_gradient to select the mode, "
                 f"or leave e_step_gradient='unroll'."
             )
+        # straight_through detaches the per-iteration E-step tangent, so a learnable parameter whose
+        # only loss path IS that tangent receives no gradient and silently freezes. Warn (non-breaking;
+        # 'unroll' is the default that trains them) rather than restrict the toggle combination.
+        if self.e_step_gradient == "straight_through" and (
+            self.alpha_mode == "learnable"
+            or self.transport_mode == "regime_ii"
+            or self.learnable_lambda_beta
+        ):
+            import warnings
+            warnings.warn(
+                "e_step_gradient='straight_through' detaches the per-iteration E-step tangent, so a "
+                "learnable parameter that enters the loss only through it (log_alpha under "
+                "alpha_mode='learnable', connection_W under transport_mode='regime_ii', log_lambda_beta "
+                "under learnable_lambda_beta) receives NO gradient and stays frozen. Use "
+                "e_step_gradient='unroll' (the default) to train these.",
+                UserWarning,
+                stacklevel=2,
+            )
         for name in ("m_mu_lr", "m_sigma_lr", "m_phi_lr", "weight_decay", "min_lr", "min_lr_frac"):
             v = getattr(self, name)
             if v < 0.0 or v != v:                            # v != v rejects NaN (which passes < 0.0)
