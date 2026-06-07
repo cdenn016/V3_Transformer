@@ -3,6 +3,53 @@
 Per the CLAUDE.md audit/verification policy: each entry states WHAT was checked, whether it was
 INCORRECT, and whether it was RIGOROUSLY verified. Consult this before re-verifying the same thing.
 
+## 2026-06-07 — Overnight multi-agent deep audit + fixes (see docs/audits/audit-2026-06-07.md)
+
+- **Full-covariance SPD retraction backward at the isotropic spectrum.** CHECKED, was **INCORRECT
+  (NaN gradients)**, now FIXED + test-pinned + RIGOROUS. `retract_spd_full` / `retract_logeuclidean_full`
+  (`geometry/retraction.py`) called `torch.linalg.eigh`, whose adjoint carries `1/(lambda_i-lambda_j)`
+  gap terms that diverge on a degenerate spectrum. `Sigma=I` (the default `gaussian_full` prior init)
+  is fully degenerate, so the first unrolled-E-step backward was 100% NaN on the DEFAULT estimator —
+  the full-covariance pure path was unusable from its own default init. The forward is smooth there
+  (`V f(lambda) V^T` is basis-independent); only the eigh adjoint blows up. Fix: custom autograd
+  `_EighDamped` with a Lorentzian-damped gap `Delta/(Delta^2+gap_eps)` at every eigendecomposition site;
+  forward bit-identical, backward finite. The adjoint was VERIFIED against the stock `torch.linalg.eigh`
+  backward on well-separated spectra (independent oracle, agree to 1e-4), FD gradcheck (float64), and
+  finite-backward at `Sigma=I` end-to-end (`tests/test_retraction.py`, 6 new tests; 24/24 retraction
+  tests pass). The damping is a small bounded bias near genuine degeneracies (factor capped at
+  `1/(2 sqrt(gap_eps))`, gap_eps=1e-8); `gaussian_diagonal` is untouched. Commit f069a8a.
+
+- **`min_lr_frac` intended default is 0.0.** CHECKED. The 2026-06-06 edit-doc states the proportional
+  LR floor was added with default 0.0 ("keeps current behavior"); the committed 0.01 contradicted that
+  and reddened two pre-existing scheduler tests. Restored to 0.0 (the proportional floor stays opt-in;
+  `min_lr=min_lr_frac=0` is the pure half-cosine-to-zero). NOT a correctness/math defect. Commit ac19d2b.
+
+- **Pure gauge transport path.** CHECKED, CONFIRMED CORRECT (clean negative, model-assembly gauge lens,
+  `geometry/transport.py:449-450`). The flat phi-cocycle transport on the pure path is correct; no defect.
+
+- **`cross_couplings` JSON round-trip.** CHECKED, was **INCORRECT (cold-start crash)**, now FIXED. A
+  config.json reloaded by `viz.report._load_config` rebuilds `VFE3Config` with list pairs (JSON has no
+  tuples), which failed the `isinstance(pair, tuple)` gate. Now coerced list→tuple in `__post_init__`.
+  Implementation robustness, not theory. Commit ac19d2b.
+
+- **Means-only RoPE invariant (documentation).** CHECKED, CONFIRMED (gauge lens). Means-only RoPE
+  transports the mean under `R_i Omega_ij R_j^T` but the covariance under the bare `Omega_ij`, so the
+  transported (mu,Sigma) is not a single congruence image and the Mahalanobis/affine invariant is not
+  preserved for that belief — the coherent pure path is `rope_full_gauge` (`on_cov=True`). This is a
+  by-design opt-in (not a code bug); the `RopeTransport` docstring was tightened to disclose it. No fix
+  to behavior. (Consistent with the means-only-default / full-gauge-opt-in design in
+  vfe3-positional-encodings memory.)
+
+- **Diagnostics/metrics LOW findings — NOT yet addressed (deferred follow-up).** CHECKED, several
+  registered metrics are subtly off but all are diagnostics-only (off the differentiated F): registered
+  `holonomy_deviation` uses the biased row-major estimator not the sampled one; `effective_rank` passes
+  raw sigma not eigenvalues under full-cov; the `attention_entropy` registered metric returns Shannon
+  H(beta) while the CSV column under the same key carries `tau*KL(beta||pi)`; `gauge_trace_spread` is
+  identically 0 for unimodular SO/Sp; `fisher_trace` inverts an unfloored matrix; `condition_number`
+  mis-ranks a non-PD input; several `FullGaussian` non-PD paths discard the `safe_cholesky` ok-mask
+  (finite-but-wrong instead of NaN→kl_max, confined to the opt-in alpha>1 full-cov toggle). None affect
+  training; recommended as a single diagnostics-hardening pass. Do NOT re-flag as new.
+
 ## 2026-06-05 — Codex deep-audit triage (see docs/audits/audit-2026-06-05-codex-triage.md)
 
 - **Regime-II connection_W gauge-equivariance (audit Finding 6).** CHECKED, CONFIRMED, RIGOROUS.
