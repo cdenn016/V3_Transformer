@@ -230,8 +230,9 @@ def train_step(
     targets:   torch.Tensor,             # (B, N) next-token ids (-100 = ignore)
 
     *,
-    grad_clip:        float = 1.0,
-    grad_accum_steps: int   = 1,
+    grad_clip:        float                              = 1.0,
+    grad_accum_steps: int                                = 1,
+    scaler:           Optional['torch.amp.GradScaler']  = None,
 ) -> float:
     r"""One M-step (one optimizer step) on the cross-entropy of a batch; returns the loss.
 
@@ -253,11 +254,22 @@ def train_step(
     so the threshold is NOT rescaled by ``K``. The returned loss is the mean over the
     ``K`` microbatches (the accumulation-boundary loss). ``K == 1`` is byte-identical to
     the single-backward path (no chunking, no divide). Requires ``B % K == 0``.
+
+    ``scaler`` is an optional :class:`torch.amp.GradScaler` for fp16 training (prevents
+    gradient underflow through the unrolled E-step). A disabled scaler (``enabled=False``)
+    is a documented no-op: ``scale`` is identity, ``unscale_`` is a no-op, and ``step``
+    calls ``optimizer.step()`` directly — so passing ``scaler=None`` (or an
+    ``enabled=False`` instance) keeps this function byte-identical to the unscaled path.
     """
+    # A disabled scaler is a documented no-op (scale -> identity, unscale_ -> nothing,
+    # step -> optimizer.step()), so scaler=None keeps this path byte-identical to the unscaled loop.
+    _scaler = scaler if scaler is not None else torch.amp.GradScaler(
+        device=tokens.device.type, enabled=False)
+
     optimizer.zero_grad(set_to_none=True)
     if grad_accum_steps == 1:                                   # default path: byte-identical to the single-step loop
         _, loss, _ = model(tokens, targets)
-        loss.backward()
+        _scaler.scale(loss).backward()
         step_loss = float(loss.detach())
     else:
         if tokens.shape[0] % grad_accum_steps != 0:            # equal-token microbatches require an even split
@@ -271,11 +283,13 @@ def train_step(
         step_loss = 0.0
         for tok_mb, tgt_mb in zip(tok_chunks, tgt_chunks):
             _, loss_mb, _ = model(tok_mb, tgt_mb)
-            (loss_mb / grad_accum_steps).backward()            # accumulate the mean-normalized microbatch grad
+            _scaler.scale(loss_mb / grad_accum_steps).backward()   # accumulate the mean-normalized microbatch grad
             step_loss += float(loss_mb.detach()) / grad_accum_steps
     if grad_clip is not None and grad_clip > 0:
+        _scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    optimizer.step()
+    _scaler.step(optimizer)
+    _scaler.update()
     scheduler.step()
     return step_loss
 
@@ -402,6 +416,9 @@ def train(
     logger = logger or logging.getLogger(__name__)
     if device is None:
         device = model.prior_bank.mu_embed.device
+    # fp16 training needs loss scaling (gradients underflow through the unrolled E-step); bf16/fp32
+    # do not. enabled=False is a no-op, so non-fp16 amp_dtype keeps this loop byte-identical.
+    scaler = torch.amp.GradScaler(device=device.type, enabled=(cfg.amp_dtype == "fp16"))
     # Live per-step it/s: iterate the step loop through a tqdm bar whose built-in rate readout
     # refreshes every step. Gated on log_interval so the documented silent path (log_interval
     # falsy) stays bitwise-identical -- no bar, no redirect, nothing printed. The generator holds
@@ -438,7 +455,8 @@ def train(
         tokens = tokens.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         losses.append(train_step(model, optimizer, scheduler, tokens, targets,
-                                  grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps))
+                                  grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
+                                  scaler=scaler))
 
         do_log  = bool(log_interval) and (step + 1) % log_interval == 0
         do_eval = bool(eval_interval) and val_loader is not None and (step + 1) % eval_interval == 0
