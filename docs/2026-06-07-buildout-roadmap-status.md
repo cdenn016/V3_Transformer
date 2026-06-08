@@ -118,7 +118,10 @@ per-item commits. See `docs/edits/2026-06-07-deep-audit-fixes.md` for the runnin
 1. **PL8 checkpoint resume (load side)** — `run_artifacts.load_checkpoint` restores model + AdamW
    momentum + RNG; `train(resume_from=...)` (or `cfg.resume_from`) rebuilds the cosine `LambdaLR`
    at the saved step and continues `range(start_step, n_steps)`. The gold test pins that a straight
-   run equals (train → checkpoint → resume) bit-for-bit under a constant stream.
+   run equals (train → checkpoint → resume) bit-for-bit under a constant stream. A follow-up test
+   on the geometric M-step (`m_phi_natural_grad=True`) caught a real bug — `GaugeNaturalGradAdamW`'s
+   `gauge_mom`-only state crashed `Adam.__setstate__`'s `KeyError: 'step'` on resume — fixed by a
+   `__setstate__` override, so resume is verified for both AdamW and the gauge optimizer.
 2. **PL13-priors T5 + windowed attention priors** — `windowed`, `causal_windowed`, and
    `t5_relative_bias` (faithful T5 bucketing, optional learnable per-bucket handle) registered;
    config-selectable via the live `_PRIORS` validation with no call-site edit.
@@ -135,4 +138,4 @@ unsupervised-failure risk for their value (PL10 causal-packed transport's golden
 (`b0`/`c0` sequence config) was deliberately deferred: the per-coordinate kernel already accepts a
 `(K,)` tensor, but a tensor-valued config field is against the codebase grain (no precedent, breaks
 `asdict`→`config.json` serialization), so it is left as documented-contained work rather than added
-unsupervised. The pure path is preserved across every change; all 689 tests pass (664 baseline + 25 new).
+unsupervised. The pure path is preserved across every change; all 690 tests pass (664 baseline + 26 new).

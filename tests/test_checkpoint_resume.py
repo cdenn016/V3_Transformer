@@ -121,6 +121,37 @@ def test_resume_matches_uninterrupted_run(tmp_path):
         torch.testing.assert_close(a, c, atol=1e-6, rtol=1e-5)  # bit-equivalent continuation
 
 
+def test_resume_matches_uninterrupted_run_geometric_mstep(tmp_path):
+    r"""Resume equivalence for the GEOMETRIC M-step optimizer (m_phi_natural_grad=True).
+
+    This branch develops the gauge-geometric M-step, whose GaugeNaturalGradAdamW keeps a
+    heavy-ball ``gauge_mom`` buffer in ``self.state[p]``. Resume restores the optimizer via the
+    inherited ``state_dict``/``load_state_dict``; this pins that ``gauge_mom`` actually round-trips
+    (a dropped buffer would silently restore wrong gauge momentum and diverge here)."""
+    cfg = _cfg(checkpoint_interval=2, m_phi_natural_grad=True, m_phi_lr=0.05,
+               phi_precond_mode="pullback_per_block")            # the documented geometric gauge M-step
+
+    torch.manual_seed(0)
+    model_a = VFEModel(cfg)
+    phi0 = model_a.prior_bank.phi_embed.detach().clone()
+    train(model_a, _const_loader(), cfg, n_steps=4)
+    final_a = _params(model_a)
+    assert not torch.equal(phi0, model_a.prior_bank.phi_embed)   # the gauge frame actually moved (non-vacuous)
+
+    torch.manual_seed(0)
+    model_b = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model_b)
+    train(model_b, _const_loader(), cfg, n_steps=2, artifacts=art)
+    ckpt = tmp_path / "run" / "checkpoints" / "step_2.pt"
+    opt_state = torch.load(ckpt, weights_only=False)["optimizer_state"]
+    assert any("gauge_mom" in s for s in opt_state["state"].values())   # the buffer was actually saved
+
+    model_c = VFEModel(cfg)
+    train(model_c, _const_loader(), cfg, n_steps=4, resume_from=ckpt)
+    for a, c in zip(final_a, _params(model_c)):
+        torch.testing.assert_close(a, c, atol=1e-6, rtol=1e-5)   # gauge-momentum round-trips correctly
+
+
 def test_resume_from_cfg_field_is_picked_up(tmp_path):
     r"""cfg.resume_from (click-to-run) is honored when no explicit resume_from arg is passed."""
     cfg = _cfg(checkpoint_interval=2)

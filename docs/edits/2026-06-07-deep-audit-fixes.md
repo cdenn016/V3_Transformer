@@ -249,3 +249,17 @@ documented non-training case); (2) the flag is live in the E-step descent — ma
 surrogate models give different logits; (3) the F gate is exact — at the converged beliefs the canonical
 `total` exceeds the surrogate `total` by exactly lambda_beta*attention_entropy (metrics.free_energy_terms).
 No production code; closes the flagged coverage gap on the standard-transformer training baseline.
+
+## PL8 follow-up — gauge-optimizer checkpoint resume (real bug caught) [done]
+
+Resume was tested only on plain AdamW. Adding a resume-equivalence test under the geometric M-step
+(m_phi_natural_grad=True, pullback_per_block) exposed a REAL bug: GaugeNaturalGradAdamW keeps a
+heavy-ball `gauge_mom` buffer in `self.state[p]`, but its gauge params carry NO AdamW `step` (the
+step() consumes their grad to None so AdamW skips them). `Adam.__setstate__` (reached via
+`Optimizer.load_state_dict`) assumes every non-empty per-param state has `"step"` and raised
+`KeyError: 'step'` on resume — so checkpoint resume silently crashed on the very gauge M-step this
+branch develops. Fix: `gauge_optim.py` overrides `__setstate__` to restore via the base Optimizer and
+run the float->tensor step migration only where `"step"` exists. New test pins gauge-momentum
+round-trip (straight run == resume, bit-equivalent) and asserts the buffer is actually saved.
+Also: a cache caveat in the t5_relative_bias docstring (the model prior cache would serve a stale
+table if a learnable bias_values is ever threaded through the model).
