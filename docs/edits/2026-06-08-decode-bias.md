@@ -199,6 +199,57 @@ unchanged.
 **Verification.** `13 passed` (full `test_live_s_model_channel.py`); regression `test_model.py` +
 `test_train.py`: `44 passed, 1 xpassed`, 0 failures, 0 errors.
 
+## VFEModel.diagnostics wires live s channel (Task 5 of live model channel)
+
+**What.** Under `s_e_step=True`, `diagnostics` now refines s and anchors the single-sequence
+belief to it before `vfe_stack`, giving train/inference parity for a model trained with the live
+channel. The insertion point is after `belief = BeliefState(...)` (pos-phi already applied) and
+before `vfe_stack`. Because `_refine_s` is batched (`(B, N)`) and `diagnostics` builds an
+unbatched belief (`(N, K)`), the call uses `token_ids[:1]` and `belief.phi.unsqueeze(0)`, then
+indexes `[0]` off each returned tensor. `generate` required no edit: it delegates to `forward`,
+which already has the s_e_step anchor from Task 4. The pure `s_e_step=False` path is unchanged.
+
+**Tests (tests/test_live_s_model_channel.py, 2 new tests).**
+- `test_generate_runs_under_s_e_step`: `generate(prompt, max_new_tokens=2)` runs without raising
+  and returns shape `(1, 5)` under `s_e_step=True`.
+- `test_diagnostics_runs_under_s_e_step`: `diagnostics(tok)` runs without raising and returns a
+  non-None dict under `s_e_step=True`.
+
+**Verification.** `15 passed` (full `test_live_s_model_channel.py`); regression `test_model.py`:
+`24 passed, 0 failures, 0 errors` (confirmed via junitxml).
+
+**Note.** `attention_maps` (model.py line ~821) builds the same single-sequence belief pattern
+and currently has the same no-live-s gap; it is out of scope for this task.
+
+## Live model channel s (s_e_step) — dynamic prior tie, default OFF
+
+Tasks 1–6 implement the live model-channel E-step across config, `PriorBank`, `VFEModel`, and tests. Per-task notes are recorded in sections above; this section gives the consolidated picture.
+
+**What it does.** Under `s_e_step=True` (requires `prior_source='model_channel'`), `forward` calls `VFEModel._refine_s(token_ids, phi0)` immediately before `vfe_stack`. That method runs the channel-agnostic `e_step` on the `(s_mu, s_sigma)` tables with the frozen global centroid `r` as the self-target (`lambda_h` coupling), `gamma_coupling` as the model-consensus weight, and `e_phi_lr=0` so the gauge frame is held fixed. The refined `s1_mu`, `s1_sigma` then replace the belief's `mu`/`sigma` and also serve as the prior passed to `vfe_stack`, anchoring every E-step iteration to the live s. Because the self-coupling force is present inside `_refine_s`, s reaches the vicinity of `mu_final` even at the operative `n_e_steps=1`. The `r` centroid is frozen (`requires_grad=False`); see `TODO(B)` below.
+
+**Default-OFF invariant.** `s_e_step=False` is byte-identical to the pre-feature code: s-tables are drawn last (belief tables unchanged), the `_refine_s` branch is never entered, and the `lambda_h`/`gamma` supersede guards (`and not self.cfg.s_e_step`) reduce to the originals.
+
+**Supersede logic.** Under `s_e_step` the loss-level `lambda_h` and `gamma_coupling` blocks are skipped (those forces now live inside `_refine_s`; double-counting would be incorrect). The frozen global `r` is the manuscript-consistent stand-in for the top-down meta-agent; `TODO(B)` in `prior_bank.py` and `model.py` marks the deferred upgrade to a token-dependent, per-token hyper-prior once the scale-(s+1) meta-agent exists.
+
+**Limiting case.** Setting `e_s_mu_lr=e_s_sigma_lr=0` makes `_refine_s` a no-op (s1 == s0), recovering the static `prior_source='model_channel'` tie. This is the manuscript's slow-channel limit (`e_s_lr -> 0`) and is verified by `test_e_s_lr_zero_reduces_to_static_model_channel` (atol=1e-6).
+
+**Parity.** `generate` inherits the live-s behaviour via `forward` with no additional edits. `diagnostics` anchors explicitly: it calls `_refine_s(token_ids[:1], phi.unsqueeze(0))` and indexes `[0]` off the returned tensors to match its unbatched `(N, K)` belief. KNOWN FOLLOW-UP: `attention_maps` builds an un-anchored single-sequence belief and does NOT yet use the live s under `s_e_step` (visualisation-only; tracked as a follow-up).
+
+**Files.** `vfe3/config.py` (three new fields: `s_e_step`, `e_s_mu_lr`, `e_s_sigma_lr`; validation); `vfe3/model/prior_bank.py` (s-tables gate, r gate, `encode_s`, `TODO(B)` comment); `vfe3/model/model.py` (`_refine_s`, forward anchor + supersede guards, diagnostics anchor, `TODO(B)` comment); `tests/test_live_s_model_channel.py` (17 tests). Spec: `docs/superpowers/specs/2026-06-08-live-s-model-channel-design.md`; plan: `docs/superpowers/plans/2026-06-08-live-s-model-channel.md`.
+
+**To ablate (user adds to ablation.py).** A sweep entry of the form
+
+```python
+    "s_e_step": {
+        "param": "s_e_step", "values": [False, True],
+        "fixed": {"prior_source": "model_channel", "lambda_h": 1.0, "gamma_coupling": 1.0},
+    },
+```
+
+plus companion sweeps over `e_s_mu_lr` and `e_s_sigma_lr`, following the schema of existing entries.
+
+**Verification.** Full suite: `tests=731, failures=0, errors=0, skipped=0` (731 passed, 1 xpassed).
+
 ## Audit-doc status sync — `docs/audits/audit-2026-06-07-lifecycle-multiagent.md`
 
 Doc-only (no code change). Marked the verified findings closed since the audit: **V2** (`close_basis`

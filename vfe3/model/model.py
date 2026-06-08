@@ -534,6 +534,8 @@ class VFEModel(nn.Module):
                 coupling = coupling.sum(dim=-1)                # sum_k alpha^(k) D^(k) -> per-token
             sc = coupling.mean()                               # mean over batch and tokens (B, N)
             loss = loss + cfg.mstep_self_coupling_weight * sc
+        # TODO(B): the frozen global r here becomes a per-token top-down shadow once the meta-agent
+        # (scale-(s+1)) exists. See docs/superpowers/specs/2026-06-08-live-s-model-channel-design.md.
         if self.cfg.lambda_h > 0.0 and not self.cfg.s_e_step:
             # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
             # lines 1241-1249): L += lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i

@@ -186,6 +186,9 @@ class PriorBank(nn.Module):
             # the KL(s||r)->0 collapse that freely training r alongside s would cause.
             self.r_mu              = nn.Parameter(torch.zeros(K), requires_grad=False)
             self.r_sigma_log       = nn.Parameter(torch.full((K,), sigma_log_init), requires_grad=False)
+            # TODO(B): un-freeze r -> a token-dependent, top-down hyper-prior r_i = Omega_tilde[s_I^{(s+1)}]
+            # requires the scale-(s+1) meta-agent (out of scope). See
+            # docs/superpowers/specs/2026-06-08-live-s-model-channel-design.md (option B).
 
     def encode(
         self,

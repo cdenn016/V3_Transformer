@@ -165,3 +165,27 @@ def test_diagnostics_runs_under_s_e_step():
     tok = torch.randint(0, m.cfg.vocab_size, (1, 4))
     d = m.diagnostics(tok)            # must not raise
     assert d is not None
+
+
+def test_model_channel_self_divergence_zero_at_s_equals_r():
+    from vfe3.families.gaussian import DiagonalGaussian
+    from vfe3.free_energy import self_divergence
+    K = 4
+    mu = torch.randn(2, 3, K)
+    sig = torch.rand(2, 3, K) + 0.1
+    d = self_divergence(DiagonalGaussian(mu, sig), DiagonalGaussian(mu, sig)).abs().max()
+    assert d < 1e-5            # D(s||s) == 0
+
+
+def test_s_e_step_forward_runs_finite_under_so_k():
+    # Smoke: the live-s forward runs and stays finite under a non-trivial group (so_k).
+    # (Full gauge-invariance is inherited from the shared phi machinery + existing gauge tests;
+    # an exact global-invariance assertion is intentionally NOT used here because the base
+    # forward carries the global-diagonal stabilizer residual by design.)
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel",
+                           lambda_h=1.0, gamma_coupling=1.0, e_s_mu_lr=0.5,
+                           gauge_group="so_k"))
+    tok = torch.randint(0, m.cfg.vocab_size, (1, 4))
+    lg = m(tok)
+    assert torch.isfinite(lg).all()
