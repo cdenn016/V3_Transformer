@@ -11,7 +11,8 @@ Config-selected so a new prior (learned bias, windowed, ...) slots in by
 register_prior without editing the free-energy call site.
 """
 
-from typing import Callable, Dict
+import math
+from typing import Callable, Dict, Optional, Sequence
 
 import torch
 
@@ -108,6 +109,138 @@ def prior_causal_alibi(
     allowed = j <= i
     B = (-slope * (i - j)).to(dtype)
     return B.masked_fill(~allowed, float("-inf"))
+
+
+@register_prior("windowed")
+def prior_windowed(
+    n_query: int,
+    n_key:   int,
+
+    *,
+    window:  int                          = 128,
+    device:  'torch.device | str | None'  = None,
+    dtype:   torch.dtype                   = torch.float32,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Windowed (local-attention) prior: 0 inside a symmetric band, -inf outside.
+
+        B_ij = 0      for |i - j| <= window,
+             = -inf   otherwise,
+    a hard local-attention restriction (a mask-like prior, like `causal`). The bidirectional
+    band; for the autoregressive form use `causal_windowed`. ``window`` defaults to a moderate
+    local span; tuning it per run is the call-site-threading item (the model invokes the prior at
+    its default, mirroring `alibi`'s default slope)."""
+    i = torch.arange(n_query, device=device).unsqueeze(-1)
+    j = torch.arange(n_key, device=device).unsqueeze(0)
+    allowed = (i - j).abs() <= window
+    B = torch.zeros(n_query, n_key, device=device, dtype=dtype)
+    return B.masked_fill(~allowed, float("-inf"))
+
+
+@register_prior("causal_windowed")
+def prior_causal_windowed(
+    n_query: int,
+    n_key:   int,
+
+    *,
+    window:  int                          = 128,
+    device:  'torch.device | str | None'  = None,
+    dtype:   torch.dtype                   = torch.float32,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Causal windowed (sliding-window local-attention) prior.
+
+        B_ij = 0      for 0 <= i - j <= window   (past keys within the band),
+             = -inf   otherwise                  (future keys, or keys further back than window).
+    The causal counterpart of `windowed`: it forbids the future like `causal` and additionally
+    drops keys more than ``window`` steps in the past, the sliding-window local attention of
+    Longformer/Mistral. ``window`` is default-only from the model (as `alibi`'s slope is)."""
+    i = torch.arange(n_query, device=device).unsqueeze(-1)
+    j = torch.arange(n_key, device=device).unsqueeze(0)
+    d = i - j
+    allowed = (d >= 0) & (d <= window)
+    B = torch.zeros(n_query, n_key, device=device, dtype=dtype)
+    return B.masked_fill(~allowed, float("-inf"))
+
+
+def _t5_relative_position_bucket(
+    relative_position: torch.Tensor,        # (..., Nq, Nk) long: key_pos - query_pos
+
+    *,
+    bidirectional: bool = False,
+    num_buckets:   int  = 32,
+    max_distance:  int  = 128,
+) -> torch.Tensor:                          # (..., Nq, Nk) long bucket index in [0, num_buckets)
+    r"""T5 relative-position bucketing (Raffel et al. 2020), the standard piecewise map.
+
+    The first half of the buckets are EXACT for small relative distances; the second half are
+    LOG-spaced up to ``max_distance`` (everything beyond shares the last bucket). With
+    ``bidirectional=True`` the sign of the relative position selects a half-range of buckets so
+    forward and backward distances are distinguished; with ``bidirectional=False`` (the causal
+    decoder form) future positions collapse to bucket 0 and only the past distance is bucketed.
+    Matches the reference HuggingFace implementation.
+    """
+    rel = relative_position
+    buckets = torch.zeros_like(rel)
+    if bidirectional:
+        nb = num_buckets // 2
+        buckets = buckets + (rel > 0).long() * nb
+        n = rel.abs()
+    else:
+        nb = num_buckets
+        n = (-torch.minimum(rel, torch.zeros_like(rel)))        # past distance (>=0); future -> 0
+    max_exact = nb // 2
+    is_small = n < max_exact
+    n_large = n.clamp(min=max_exact).float()                    # clamp avoids log(0); used only where ~is_small
+    large = max_exact + (
+        torch.log(n_large / max_exact) / math.log(max_distance / max_exact) * (nb - max_exact)
+    ).long()
+    large = torch.minimum(large, torch.full_like(large, nb - 1))
+    return buckets + torch.where(is_small, n, large)
+
+
+@register_prior("t5_relative_bias")
+def prior_t5_relative_bias(
+    n_query: int,
+    n_key:   int,
+
+    *,
+    bias_values:   Optional['torch.Tensor | Sequence[float]'] = None,   # learnable (num_buckets,) handle; None -> fixed default
+    num_buckets:   int                    = 32,
+    max_distance:  int                    = 128,
+    bidirectional: bool                   = False,
+    device:        'torch.device | str | None' = None,
+    dtype:         torch.dtype             = torch.float32,
+    **kwargs,
+) -> torch.Tensor:
+    r"""T5-style relative-position bias prior (Raffel et al. 2020).
+
+    Buckets the relative position ``key - query`` (see ``_t5_relative_position_bucket``) and reads
+    a per-bucket bias. ``bias_values`` is the per-bucket bias vector ``(num_buckets,)``: pass the
+    model's learnable handle to get the trainable T5 bias (the registry's documented learned-bias
+    extension point), or leave it ``None`` for a deterministic monotone log-distance default
+    ``-log1p(bucket)`` (nearer keys ~0, farther keys more negative) so the prior is usable
+    standalone. In the causal (``bidirectional=False``) decoder form the future is masked to
+    ``-inf``, matching how a T5 decoder pairs its relative bias with a causal mask. A genuinely
+    per-HEAD T5 bias (a ``(num_buckets, H)`` table and a head axis on the prior) is the separate
+    head-axis item; this returns the per-bucket 2D bias the current registry contract carries.
+
+    CACHE CAVEAT: the model caches the prior on ``(name, n, device, dtype)`` (``model._attention_log_prior``).
+    The default (``bias_values=None``) bias is constant, so the cache is correct. If a LEARNABLE
+    ``bias_values`` is ever threaded through the model, that cache must be bypassed/invalidated per step,
+    or it will serve a stale table as the parameter trains."""
+    i = torch.arange(n_query, device=device).unsqueeze(-1)
+    j = torch.arange(n_key, device=device).unsqueeze(0)
+    bucket = _t5_relative_position_bucket(
+        j - i, bidirectional=bidirectional, num_buckets=num_buckets, max_distance=max_distance)
+    if bias_values is None:
+        table = -torch.log1p(torch.arange(num_buckets, device=device, dtype=dtype))
+    else:
+        table = torch.as_tensor(bias_values, device=device, dtype=dtype)
+    B = table[bucket]
+    if not bidirectional:                                       # causal decoder form: forbid the future
+        B = B.masked_fill(j > i, float("-inf"))
+    return B
 
 
 def attention_log_prior(

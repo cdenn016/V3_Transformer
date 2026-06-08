@@ -165,6 +165,85 @@ def _build_so_k(
     return GaugeGroup(name="so_k", generators=G, irrep_dims=[K], skew_symmetric=True)
 
 
+def check_admissible(
+    group:      GaugeGroup,
+    family:     str   = "gaussian",
+
+    *,
+    functional: str   = "renyi",
+    alpha:      float = 1.0,
+    n_samples:  int   = 8,
+    batch:      int   = 5,
+    scale:      float = 0.2,
+    atol:       float = 1e-3,
+    rtol:       float = 1e-3,
+    seed:       int   = 0,
+) -> bool:
+    r"""Executably verify that ``functional`` is invariant under ``group``'s representation on ``family``.
+
+    Draws ``n_samples`` random group elements ``g = exp(sum_a c_a G_a)`` (coefficients ~ ``scale`` *
+    N(0,1)) and a random Gaussian belief PAIR, pushes the pair forward by the family's representation,
+    and asserts ``D(rho(g) q || rho(g) p) == D(q || p)`` to tolerance, where ``D`` is the registered
+    divergence ``functional`` (renyi/squared_hellinger). Returns ``True`` iff invariant for every
+    sample, else ``False`` -- so it turns ``GaugeGroup.invariant_for``'s string declaration into a
+    verified invariant and catches a wrongly-declared ``invariant_families``.
+
+    The representation is family-specific. The FULL Gaussian uses the GL(K) congruence
+    ``mu -> g mu, Sigma -> g Sigma g^T``, under which the divergence is invariant for every
+    ``g in GL(K)``. The DIAGONAL Gaussian re-diagonalizes ``g Sigma g^T``, which is NOT invariant
+    under a non-diagonal ``g`` (the verifier returns ``False``, correctly) -- the diagonal family is
+    admissible only for the diagonal-scaling subgroup. A family with no implemented representation
+    raises ``NotImplementedError`` (the extension point: expose its pushforward to widen this check).
+    """
+    if family in ("gaussian", "gaussian_full"):
+        diagonal_readout = False
+    elif family == "gaussian_diagonal":
+        diagonal_readout = True
+    else:
+        raise NotImplementedError(
+            f"check_admissible implements only the Gaussian GL(K)-congruence representation; "
+            f"family={family!r} needs its own pushforward map (expose it on the (family, group) "
+            f"admissibility object to extend this check)."
+        )
+    from vfe3.families.base import get_functional                 # local import: avoid an import cycle
+    from vfe3.families.gaussian import DiagonalGaussian, FullGaussian
+
+    fn = get_functional(functional)
+    G = group.generators
+    K = sum(group.irrep_dims)
+    dev, dt = G.device, G.dtype
+    gen = torch.Generator(device=dev).manual_seed(seed)
+    eye = torch.eye(K, device=dev, dtype=dt)
+
+    def _div(mu_q, S_q, mu_p, S_p):
+        if diagonal_readout:                                      # diagonal family reads only the variances
+            q = DiagonalGaussian(mu_q, torch.diagonal(S_q, dim1=-2, dim2=-1))
+            p = DiagonalGaussian(mu_p, torch.diagonal(S_p, dim1=-2, dim2=-1))
+        else:
+            q = FullGaussian(mu_q, S_q)
+            p = FullGaussian(mu_p, S_p)
+        return fn(q, p, alpha=alpha, kl_max=1e12)                 # kl_max high so no clamp masks invariance
+
+    for _ in range(n_samples):
+        coeff = scale * torch.randn(G.shape[0], generator=gen, device=dev, dtype=dt)
+        g = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", coeff, G))
+        mu_q = torch.randn(batch, K, generator=gen, device=dev, dtype=dt)
+        mu_p = torch.randn(batch, K, generator=gen, device=dev, dtype=dt)
+        Aq = torch.randn(batch, K, K, generator=gen, device=dev, dtype=dt)
+        Ap = torch.randn(batch, K, K, generator=gen, device=dev, dtype=dt)
+        S_q = Aq @ Aq.transpose(-1, -2) + eye                    # random SPD
+        S_p = Ap @ Ap.transpose(-1, -2) + eye
+        base = _div(mu_q, S_q, mu_p, S_p)
+        mu_q2 = torch.einsum("kl,nl->nk", g, mu_q)
+        mu_p2 = torch.einsum("kl,nl->nk", g, mu_p)
+        S_q2 = g @ S_q @ g.transpose(-1, -2)                     # congruence Sigma -> g Sigma g^T
+        S_p2 = g @ S_p @ g.transpose(-1, -2)
+        moved = _div(mu_q2, S_q2, mu_p2, S_p2)
+        if not torch.allclose(base, moved, atol=atol, rtol=rtol):
+            return False
+    return True
+
+
 @register_group("sp")
 def _build_sp(
     K:       int,

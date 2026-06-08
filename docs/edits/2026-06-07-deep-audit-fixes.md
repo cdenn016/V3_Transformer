@@ -190,3 +190,76 @@ init, so the embedding completes — all `belief_umap_*.png` were written. By lo
 it was the phi (gauge) embedding; the trigger is a near-disconnected / tiny-eigengap kNN graph, which
 is *consistent with* (unconfirmed — no wikitext cache on the CPU box to re-extract) low gauge-frame
 diversity across tokens. Left as-is; the warnings are informative.
+
+# Buildout-roadmap implementation (evening session)
+
+Re-verified the 2026-06-01 buildout roadmap against the live code via an 8-investigator
+read-only sweep (see `docs/2026-06-07-buildout-roadmap-status.md`): the prioritized top-ten
+punch list is built and wired; the one high-value survivor was checkpoint resume. Implementing
+the genuine gaps, each an opt-in toggle (default OFF, pure path preserved), TDD, per-item commit.
+
+## PL8 — checkpoint resume (load side) [done]
+
+Save side existed write-only (`save_checkpoint`); `train()` always rebuilt a fresh optimizer and
+looped from 0. Added the load half:
+- `config.py`: `resume_from: Optional[str] = None` (default OFF) + validation.
+- `run_artifacts.py`: `load_checkpoint(path, model, optimizer=None, *, map_location, restore_rng)`
+  restores model + AdamW momentum + RNG, returns the saved step; `save_checkpoint` now also
+  persists CPU/CUDA `rng_state`.
+- `train.py`: `train(resume_from=...)` (falls back to `cfg.resume_from`); on resume restores via
+  `load_checkpoint`, sets each group's `initial_lr` from the configured base, rebuilds the cosine
+  `LambdaLR` with `last_epoch=start_step-1`, and runs `range(start_step, n_steps)`.
+Test `tests/test_checkpoint_resume.py` (5): the gold test pins that a straight 4-step run equals
+(2 steps → checkpoint → resume to 4) bit-for-bit under a constant token stream — sensitive to all
+three restore legs (weights, optimizer momentum, LR-schedule `last_epoch`). Full suite 669 passed.
+
+## PL13-priors — T5 relative-bias + windowed attention priors [done]
+
+`attention_prior.py` registered only uniform/causal/alibi/causal_alibi. Added three pure builders
+(config-selectable via the live `_PRIORS` validation, no config-validator or call-site edit):
+- `windowed` — symmetric local band (`|i-j|<=window`, else -inf).
+- `causal_windowed` — sliding-window local attention (`0<=i-j<=window`, else -inf).
+- `t5_relative_bias` — T5 relative-position bucketing (`_t5_relative_position_bucket`, exact-then-
+  log-spaced, HF-faithful) gathering a per-bucket bias; accepts a learnable `(num_buckets,)`
+  `bias_values` handle, else a deterministic `-log1p(bucket)` default; causal form masks the future.
+Variant params (`window`, T5 bucketing) run at defaults from the model, mirroring `alibi`'s
+default slope; per-head/learnable-table threading is the separate head-axis item.
+Test `tests/test_attention_prior_t5_windowed.py` (8): banding/causality structure, T5 bucket
+reference values + monotonicity + clamp, supplied-table gather, and end-to-end model forwards.
+
+## PL17 — executable group/family admissibility verifier [done]
+
+`GaugeGroup.invariant_for` was only string membership. Added `groups.check_admissible(group, family,
+*, functional, alpha, n_samples, ...)`: draws random `g = exp(c.G)`, pushes a random Gaussian belief
+pair forward by the family's representation (GL(K) congruence `mu->g mu, Sigma->g Sigma g^T`), and
+asserts the registered divergence is invariant `D(rho(g)q||rho(g)p)==D(q||p)` to tolerance. Returns a
+bool, turning the declaration into a verified invariant. Non-vacuous: FULL Gaussian invariant for every
+group (verifies the 'gaussian' declaration for glk/block_glk/tied_block_glk/so_k/sp under renyi,
+squared_hellinger, and alpha!=1); DIAGONAL Gaussian returns False under a general GL(K) congruence
+(the diagonal structure is broken) — the catchable wrong-declaration case. Unknown family ->
+NotImplementedError (the representation-map extension point).
+Test `tests/test_admissibility_verifier.py` (9). No regression (test_gauge_groups 23 pass).
+
+## PL19 — surrogate (include_attention_entropy=False) end-to-end test [done, test-only]
+
+The -tau^-1 Cov gradient gap was tested only by local closures. Added `tests/test_surrogate_end_to_end.py`
+(3) through VFEModel: (1) the surrogate forwards + backprops to the prior tables via the oracle branch
+(needs oracle_unroll_grad=True for a differentiable tangent — the default detached-tangent path is the
+documented non-training case); (2) the flag is live in the E-step descent — matched-weight canonical vs
+surrogate models give different logits; (3) the F gate is exact — at the converged beliefs the canonical
+`total` exceeds the surrogate `total` by exactly lambda_beta*attention_entropy (metrics.free_energy_terms).
+No production code; closes the flagged coverage gap on the standard-transformer training baseline.
+
+## PL8 follow-up — gauge-optimizer checkpoint resume (real bug caught) [done]
+
+Resume was tested only on plain AdamW. Adding a resume-equivalence test under the geometric M-step
+(m_phi_natural_grad=True, pullback_per_block) exposed a REAL bug: GaugeNaturalGradAdamW keeps a
+heavy-ball `gauge_mom` buffer in `self.state[p]`, but its gauge params carry NO AdamW `step` (the
+step() consumes their grad to None so AdamW skips them). `Adam.__setstate__` (reached via
+`Optimizer.load_state_dict`) assumes every non-empty per-param state has `"step"` and raised
+`KeyError: 'step'` on resume — so checkpoint resume silently crashed on the very gauge M-step this
+branch develops. Fix: `gauge_optim.py` overrides `__setstate__` to restore via the base Optimizer and
+run the float->tensor step migration only where `"step"` exists. New test pins gauge-momentum
+round-trip (straight run == resume, bit-equivalent) and asserts the buffer is actually saved.
+Also: a cache caveat in the t5_relative_bias docstring (the model prior cache would serve a stale
+table if a learnable bias_values is ever threaded through the model).

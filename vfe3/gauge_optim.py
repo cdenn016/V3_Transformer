@@ -72,6 +72,23 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         self._precond_mode   = precond_mode
         self._gauge_momentum = float(gauge_momentum)
 
+    def __setstate__(self, state) -> None:                             # type: ignore[override]
+        r"""Restore generically, running Adam's step migration only where ``"step"`` exists.
+
+        ``Optimizer.load_state_dict`` dispatches to ``__setstate__``; ``Adam.__setstate__`` migrates
+        a legacy float ``"step"`` to a tensor and assumes EVERY non-empty per-parameter state carries
+        ``"step"``. A gauge param's state holds ONLY ``"gauge_mom"`` -- AdamW skips it because
+        :meth:`step` consumes its grad to ``None`` -- so Adam's assumption raises ``KeyError: 'step'``
+        and checkpoint RESUME would crash on the geometric M-step. Restore via the base ``Optimizer``
+        (which carries the current-format param-group hyperparameters from our own checkpoints) and
+        run the float->tensor step migration only on states that actually have ``"step"``.
+        """
+        torch.optim.Optimizer.__setstate__(self, state)
+        for s in self.state.values():
+            step = s.get("step")
+            if step is not None and not torch.is_tensor(step):
+                s["step"] = torch.tensor(float(step))
+
     @torch.no_grad()
     def step(self, closure=None):                                      # type: ignore[override]
         for group in self.param_groups:

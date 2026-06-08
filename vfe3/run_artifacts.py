@@ -149,15 +149,63 @@ class RunArtifacts:
         optimizer: torch.optim.Optimizer,
         cfg:       VFE3Config,
     ) -> Path:
-        r"""Write a resumable ``checkpoints/step_<N>.pt`` (model + optimizer + config + step)."""
+        r"""Write a resumable ``checkpoints/step_<N>.pt`` (model + optimizer + RNG + config + step).
+
+        ``load_checkpoint`` reads this back to continue training: ``model_state`` and
+        ``optimizer_state`` restore the weights and AdamW momentum, ``rng_state`` restores the
+        CPU (and CUDA) generators for reproducible continuation, and ``step`` is the number of
+        completed M-steps so the resumed run rebuilds the cosine ``LambdaLR`` at the right point.
+        """
         path = self.ckpt_dir / f"step_{step}.pt"
+        rng_state = {
+            "cpu":  torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
         torch.save({
             "step":            int(step),
             "model_state":     model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
+            "rng_state":       rng_state,
             "config":          asdict(cfg),
         }, path)
         return path
+
+
+def load_checkpoint(
+    path:      'str | Path',
+    model:     torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+
+    *,
+    map_location: 'Optional[str | torch.device]' = None,
+    restore_rng:  bool = True,
+) -> int:
+    r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
+
+    This is the LOAD half of the resumable checkpoint. It always restores the model weights;
+    it restores the AdamW optimizer state (momentum buffers + per-parameter step counts) when an
+    ``optimizer`` is supplied, and the CPU/CUDA RNG when ``restore_rng`` is set and the bundle
+    carries it (checkpoints written before RNG was persisted simply skip that step). The returned
+    integer is the number of completed M-steps; ``train(resume_from=...)`` uses it to rebuild the
+    cosine ``LambdaLR`` at the saved step and to start the loop from there.
+
+    ``weights_only=False`` is required because the bundle carries the optimizer state and the RNG
+    tensors (not a pure ``state_dict``); the file is a trusted run artifact this process wrote
+    (matching ``test_run_artifacts.py::test_save_checkpoint_is_loadable``).
+    """
+    if map_location is None:
+        map_location = next(model.parameters()).device
+    ckpt = torch.load(Path(path), map_location=map_location, weights_only=False)
+    model.load_state_dict(ckpt["model_state"])
+    if optimizer is not None and ckpt.get("optimizer_state") is not None:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+    if restore_rng and ckpt.get("rng_state") is not None:
+        rng = ckpt["rng_state"]
+        # RNG tensors must be CPU ByteTensors regardless of map_location (set_rng_state asserts this).
+        torch.set_rng_state(rng["cpu"].cpu() if hasattr(rng["cpu"], "cpu") else rng["cpu"])
+        if rng.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
+    return int(ckpt["step"])
 
 
 def finalize_run(
