@@ -26,9 +26,9 @@ def test_s_e_step_defaults_off():
 
 
 def test_s_e_step_lr_validation_rejects_negative():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="e_s_mu_lr"):
         _tiny_cfg(s_e_step=True, prior_source="model_channel", e_s_mu_lr=-1.0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="e_s_sigma_lr"):
         _tiny_cfg(s_e_step=True, prior_source="model_channel", e_s_sigma_lr=-0.5)
 
 

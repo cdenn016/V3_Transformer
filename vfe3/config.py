@@ -548,6 +548,9 @@ class VFE3Config:
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         if self.s_e_step:
+            # Intentional narrowing (not a membership check): of the valid prior_source values, only
+            # 'model_channel' routes encode AND decode through the s-tables, which the live s-refine
+            # anchors the belief to. 'token' would decode against the separate belief table.
             if self.prior_source != "model_channel":
                 raise ValueError(
                     "s_e_step=True requires prior_source='model_channel' so the s-tables are the "
