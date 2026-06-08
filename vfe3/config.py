@@ -54,6 +54,14 @@ class VFE3Config:
     n_e_steps:                 int   = 1            # T (E-step inner iterations)
     n_heads:                   int   = 8
 
+    # belief-table init scales (PriorBank.__init__): mu_v ~ N(0, mu_init_std^2), every coordinate
+    # variance set to the constant sigma_init (stored as log(sigma_init); not random spread), and the
+    # gauge frame phi_v ~ N(0, phi_scale^2). mu_init_std and phi_scale may be 0 (deterministic zero
+    # table); sigma_init must be > 0 for the log.
+    mu_init_std:               float = 0.02         # std of the random mean table mu_embed
+    sigma_init:                float = 1.0          # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale:                 float = 0.01         # std of the random gauge-frame table phi_embed
+
     # gauge seam
     gauge_group:               str   = "block_glk"
     gauge_parameterization:    str   = "phi"
@@ -489,6 +497,11 @@ class VFE3Config:
         for name in ("b0", "c0"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        if self.sigma_init <= 0.0:
+            raise ValueError(f"sigma_init must be positive (log is taken), got {self.sigma_init}")
+        for name in ("mu_init_std", "phi_scale"):
+            if getattr(self, name) < 0.0:
+                raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         # alpha_mode validated against the alpha-form REGISTRY (add-by-registering). Local import
         # avoids a config <- alpha_i cycle.
         from vfe3.alpha_i import _ALPHAS

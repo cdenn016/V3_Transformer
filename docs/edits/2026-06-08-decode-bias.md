@@ -100,3 +100,28 @@ batch size, seq_len, and stride.
   splice the coverage lines into the banner; `train_vfe3.main` computes the uncapped count via
   `load_cached_tokens` only when `MAX_TOKENS` is active.
 - `ablation.py`: per-cell print now also emits `coverage_lines(...)`.
+
+## Config-wired belief-table init scales — mu_init_std / sigma_init / phi_scale
+
+**Why.** `PriorBank.__init__` already accepted `mu_init_std`/`sigma_init`/`phi_scale`, but
+`VFEModel` constructed the bank without passing them, so they were pinned at the PriorBank
+defaults and unreachable from config. The user wants the init variance of `mu`, `Sigma`, and
+`phi` adjustable (and sweepable).
+
+**Change.**
+- `vfe3/config.py`: three new fields `mu_init_std=0.02`, `sigma_init=1.0`, `phi_scale=0.01`
+  (model-structure group). Validation: `sigma_init>0` (log is taken); `mu_init_std`/`phi_scale`
+  `>= 0` (0 = deterministic zero table).
+- `vfe3/model/model.py`: thread the three into the `PriorBank(...)` construction.
+- `ablation.py`: the three added to `BASELINE_CONFIG` and as single-field sweeps (`mu_init_std`,
+  `sigma_init`, `phi_scale`).
+- `tests/test_belief_init_scales.py` (new, 5 tests): defaults match; scales thread through to
+  `mu_embed`/`phi_embed` std and the constant `sigma_log_embed`; zero scales give zero tables;
+  non-positive `sigma_init` and negative `mu_init_std` rejected.
+
+**Note (decode init).** On the `use_prior_bank=False` linear-decode path the output weight is
+`xavier_uniform_` (fan-based, no std knob) — left unchanged; encode still uses the prior-bank
+tables above on both paths.
+
+**Verification.** New 5/5 pass; `test_model`/`test_prior_bank`/`test_train` 50 passed +1 xpassed,
+no regressions; ablation sweep field-validation OK.

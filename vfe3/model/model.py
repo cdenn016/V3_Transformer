@@ -85,6 +85,7 @@ class VFEModel(nn.Module):
         n_gen = self.group.generators.shape[0]
         self.prior_bank = PriorBank(
             cfg.vocab_size, cfg.embed_dim, n_gen,
+            mu_init_std=cfg.mu_init_std, sigma_init=cfg.sigma_init, phi_scale=cfg.phi_scale,
             decode_tau=cfg.decode_tau, eps=cfg.eps,
             diagonal_covariance=cfg.diagonal_covariance,
             use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
