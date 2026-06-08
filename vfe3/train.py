@@ -343,6 +343,7 @@ def train(
     device:          Optional[torch.device]   = None,
     logger:          Optional[logging.Logger] = None,
     artifacts:       Optional["RunArtifacts"] = None,
+    resume_from:     'Optional[str | Path]'   = None,   # checkpoints/step_<N>.pt to resume from (None -> cfg.resume_from -> from scratch)
 
     generate_samples:  bool                                     = True,   # False -> pure silent path (no sample text)
     sample_decode:     Optional[Callable[[Sequence[int]], str]] = None,   # token-ids -> text; None -> auto by vocab
@@ -369,9 +370,28 @@ def train(
     optimizer = build_optimizer(model, cfg)
     # Warmup/cosine multiplier, floored per group so each group's ABSOLUTE LR never decays below
     # max(cfg.min_lr, cfg.min_lr_frac * base) -- see _floor_lr_lambdas. With cfg.min_lr=cfg.min_lr_frac=0
-    # this is exactly the pure half-cosine-to-zero (the theoretically pure path).
+    # this is exactly the pure half-cosine-to-zero (the theoretically pure path). base_lrs are the
+    # CONFIGURED per-group LRs, captured before any scheduler multiplier or resume-load mutates group['lr'].
     base_lrs = [g["lr"] for g in optimizer.param_groups]
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _floor_lr_lambdas(base_lrs, cfg))
+
+    # Opt-in RESUME (PL8): an explicit resume_from arg, else cfg.resume_from, else from scratch. When set,
+    # restore model weights + AdamW momentum + RNG from the checkpoint and rebuild the cosine LambdaLR at
+    # the saved step so the continuation is equivalent to an uninterrupted run. start_step is the number of
+    # completed M-steps; the loop runs range(start_step, n_steps). resume_path None leaves the from-scratch
+    # path byte-identical (scheduler built with last_epoch=-1, loop from 0).
+    resume_path = resume_from if resume_from is not None else cfg.resume_from
+    start_step = 0
+    if resume_path is not None:
+        from vfe3.run_artifacts import load_checkpoint           # local import avoids any import cycle
+        start_step = load_checkpoint(resume_path, model, optimizer, map_location=device)
+        # LambdaLR with last_epoch != -1 requires 'initial_lr' on every group; set it from the configured
+        # base (not the post-load group['lr'], which the restored optimizer state overwrote with base*cos).
+        for group, base in zip(optimizer.param_groups, base_lrs):
+            group["initial_lr"] = base
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, _floor_lr_lambdas(base_lrs, cfg), last_epoch=start_step - 1)
+    else:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _floor_lr_lambdas(base_lrs, cfg))
     losses: List[float] = []
     model.train()
     logger = logger or logging.getLogger(__name__)
@@ -387,11 +407,13 @@ def train(
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
-            yield from range(n_steps)
+            yield from range(start_step, n_steps)               # range start_step..n_steps (== 0..n_steps from scratch)
             return
-        bar = _tqdm(range(n_steps), desc="Training", total=n_steps, ascii=True)  # ascii=True: the
-        #                          default block glyph U+2588 is not cp1252-encodable on a Windows
-        #                          console (raises UnicodeEncodeError mid-run); " #" renders anywhere
+        bar = _tqdm(range(start_step, n_steps), desc="Training", total=n_steps,
+                    initial=start_step, ascii=True)             # ascii=True: the default block glyph
+        #                          U+2588 is not cp1252-encodable on a Windows console (raises
+        #                          UnicodeEncodeError mid-run); " #" renders anywhere. initial=start_step
+        #                          keeps the bar's absolute step readout correct on a resumed run.
         with _redirect_logging():
             try:
                 yield from bar
@@ -400,7 +422,7 @@ def train(
 
     it = iter(loader)
     win_t0 = time.perf_counter()
-    win_i0 = 0
+    win_i0 = start_step
     last_val: Dict[str, float] = {}                  # most recent validation, carried into each CSV row
     for step in _step_indices():
         try:

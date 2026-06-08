@@ -190,3 +190,25 @@ init, so the embedding completes — all `belief_umap_*.png` were written. By lo
 it was the phi (gauge) embedding; the trigger is a near-disconnected / tiny-eigengap kNN graph, which
 is *consistent with* (unconfirmed — no wikitext cache on the CPU box to re-extract) low gauge-frame
 diversity across tokens. Left as-is; the warnings are informative.
+
+# Buildout-roadmap implementation (evening session)
+
+Re-verified the 2026-06-01 buildout roadmap against the live code via an 8-investigator
+read-only sweep (see `docs/2026-06-07-buildout-roadmap-status.md`): the prioritized top-ten
+punch list is built and wired; the one high-value survivor was checkpoint resume. Implementing
+the genuine gaps, each an opt-in toggle (default OFF, pure path preserved), TDD, per-item commit.
+
+## PL8 — checkpoint resume (load side) [done]
+
+Save side existed write-only (`save_checkpoint`); `train()` always rebuilt a fresh optimizer and
+looped from 0. Added the load half:
+- `config.py`: `resume_from: Optional[str] = None` (default OFF) + validation.
+- `run_artifacts.py`: `load_checkpoint(path, model, optimizer=None, *, map_location, restore_rng)`
+  restores model + AdamW momentum + RNG, returns the saved step; `save_checkpoint` now also
+  persists CPU/CUDA `rng_state`.
+- `train.py`: `train(resume_from=...)` (falls back to `cfg.resume_from`); on resume restores via
+  `load_checkpoint`, sets each group's `initial_lr` from the configured base, rebuilds the cosine
+  `LambdaLR` with `last_epoch=start_step-1`, and runs `range(start_step, n_steps)`.
+Test `tests/test_checkpoint_resume.py` (5): the gold test pins that a straight 4-step run equals
+(2 steps → checkpoint → resume to 4) bit-for-bit under a constant token stream — sensitive to all
+three restore legs (weights, optimizer momentum, LR-schedule `last_epoch`). Full suite 669 passed.

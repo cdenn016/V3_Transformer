@@ -301,6 +301,12 @@ class VFE3Config:
     log_interval:              int   = 50           # console log every N steps (0 = off)
     eval_interval:             int   = 0            # periodic validation every N steps (0 = off)
     checkpoint_interval:       int   = 0            # save a resumable checkpoint every N steps (0 = off)
+    # Opt-in training RESUME (default None = OFF = the pure from-scratch path): a path to a
+    # checkpoints/step_<N>.pt written by checkpoint_interval. When set, train() restores the model
+    # weights, the AdamW optimizer state (momentum), the RNG, and rebuilds the per-group cosine
+    # LambdaLR at the saved step, then continues from step N to max_steps. An explicit train(resume_from=...)
+    # argument takes precedence over this field. None leaves train() byte-identical to the from-scratch loop.
+    resume_from:               Optional[str] = None
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
     generate_figures:          bool  = True         # auto-run the single-run publication figures at finalize_run (off the hot path)
     
@@ -742,6 +748,11 @@ class VFE3Config:
             raise ValueError(f"eval_interval must be >= 0, got {self.eval_interval}")
         if self.checkpoint_interval < 0:
             raise ValueError(f"checkpoint_interval must be >= 0, got {self.checkpoint_interval}")
+        if self.resume_from is not None and not isinstance(self.resume_from, str):
+            raise ValueError(
+                f"resume_from must be None or a path string to a checkpoints/step_<N>.pt, got "
+                f"{type(self.resume_from).__name__}"
+            )
         if self.eval_max_batches is not None and self.eval_max_batches < 1:
             raise ValueError(f"eval_max_batches must be >= 1 if set, got {self.eval_max_batches}")
         # amp_dtype: None (default, OFF) = pure fp32 / no autocast; 'bf16' / 'fp16' enable autocast.
