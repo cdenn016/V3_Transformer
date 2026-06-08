@@ -88,7 +88,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     max_seq_len                = 128,                         # N, context length
     
     batch_size                 = 128,
-    max_steps                  = 3750,
+    max_steps                  = 2000,
     
     n_layers                   = 1,                           # L, number of blocks
     n_e_steps                  = 1,                           # T, E-step inner iterations
@@ -262,21 +262,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "n_e_steps", "values": [1, 2, 3, 5],
     },
 
-    # === belief-table init scales (PriorBank) ===============================
-    "mu_init_std": {
-        "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
-        "param": "mu_init_std", "values": [0.0, 0.01, 0.02, 0.05, 0.1],
-    },
-    "sigma_init": {
-        "description": "constant initial coordinate variance of the prior table (>0)",
-        "param": "sigma_init", "values": [0.25, 0.5, 1.0, 2.0, 4.0],
-    },
-    "phi_scale": {
-        "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
-        "param": "phi_scale", "values": [0.0, 0.001, 0.01, 0.05],
-    },
     
-
     
     
     
@@ -488,7 +474,21 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
    
     
+    # === belief-table init scales (PriorBank) ===============================
+    "mu_init_std": {
+        "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
+        "param": "mu_init_std", "values": [0.07, 0.09, 0.11, 0.15],
+    },
+    "sigma_init": {
+        "description": "constant initial coordinate variance of the prior table (>0)",
+        "param": "sigma_init", "values": [0.25, 0.5, 1.0, 2.0, 4.0],
+    },
+    "phi_scale": {
+        "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
+        "param": "phi_scale", "values": [0.025, 0.075],
+    },
     
+
     
     
     
@@ -574,7 +574,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "phi_weight_decay":{
         "description": "weight decay on phi",
-        "param": "phi_weight_decay", "values": [0.0, 1e-5, 1e-4, 1e-3, 1e-2, 0.1],
+        "param": "phi_weight_decay", "values": [0.125, 0.15, 0.175],
     },
 }
 
@@ -602,7 +602,11 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
 
-  #  "phi_weight_decay",    
+   # "phi_weight_decay",    
+
+   # "phi_scale",
+   # "mu_init_std",
+    "sigma_init", 
 
   #  "m_phi_lr",
     "m_mu_lr",
