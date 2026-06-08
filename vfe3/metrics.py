@@ -108,28 +108,52 @@ def free_energy_terms(
     alpha:    torch.Tensor,              # (..., N) self-coupling
 
     *,
-    tau:         float = 1.0,
-    lambda_beta: 'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure F)
-    log_prior:   Optional[torch.Tensor] = None,
-    eps:         float = 1e-12,
+    tau:                       float = 1.0,
+    lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure F)
+    eps:                       float = 1e-12,
+    include_attention_entropy: bool  = True,                   # gate the entropy term in ``total``
+
+    log_prior:                 Optional[torch.Tensor] = None,  # (..., N, N) attention log-prior
+    alpha_reg:                 Optional[torch.Tensor] = None,  # (..., N[,K]) R(alpha_i) if state-dependent
 ) -> Dict[str, float]:
     r"""Per-term free-energy decomposition: self-coupling, belief-coupling, attention entropy.
+
+    Mirrors ``vfe3.free_energy.free_energy`` so the reported ``total`` equals the scalar that
+    function returns for the SAME inputs (within float32 rounding):
+
+        F = sum_i [ alpha_i D(q_i||p_i) + R(alpha_i)
+                  + lambda_beta ( sum_j beta_ij E_ij
+                                  + tau sum_j beta_ij log(beta_ij/pi_ij) ) ]   (entropy: canonical only)
 
     ``belief_coupling`` and ``attention_entropy`` are the RAW (unweighted) block energies, so each
     stays individually interpretable; ``total`` is the runtime-realised SCALED free energy
     self_coupling + lambda_beta (belief_coupling + attention_entropy), matching what the E-step
     actually minimizes (VFE_2.0 parity). At lambda_beta = 1.0 total is byte-identical to the
     unscaled sum.
+
+    ``alpha_reg`` is the per-position regularizer R(alpha_i) (b0 alpha - c0 log alpha under
+    ``state_dependent_per_coord``); when supplied it is added elementwise into the self-coupling
+    term (and so into ``total``), matching ``free_energy``. Default None leaves the result
+    byte-identical to the unregularized path. ``include_attention_entropy`` gates the entropy
+    contribution to ``total`` exactly as ``free_energy`` does -- when False the surrogate objective
+    the E-step descends omits the entropy term, but its value is still reported under
+    ``attention_entropy`` for diagnostics.
     """
-    self_coupling = float((alpha * self_div).sum())
+    self_term = alpha * self_div
+    if alpha_reg is not None:
+        self_term = self_term + alpha_reg
+    self_coupling = float(self_term.sum())
     belief_coupling = float((beta * energy).sum())
     pi = torch.softmax(log_prior, dim=-1) if log_prior is not None else torch.full_like(beta, 1.0 / beta.shape[-1])
     entropy = float(tau * (beta * (torch.log(beta.clamp(min=eps)) - torch.log(pi.clamp(min=eps)))).sum())
+    total = self_coupling + float(lambda_beta) * belief_coupling
+    if include_attention_entropy:
+        total = total + float(lambda_beta) * entropy
     return {
         "self_coupling":   self_coupling,
         "belief_coupling": belief_coupling,
         "attention_entropy": entropy,
-        "total":           self_coupling + float(lambda_beta) * (belief_coupling + entropy),
+        "total":           total,
     }
 
 

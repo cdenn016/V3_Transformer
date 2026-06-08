@@ -123,6 +123,63 @@ call. The functions were left defined but unreachable, so runs were NOT renamed 
 two-line hook in `main()` (capture `results`, call `_rename_run_by_ppl` with `test_ppl`), and restored
 the two post-edit doc sections above that the same merge dropped. No other code changed.
 
+## model.py audit fixes (V4 / _amp_context / V6 / V2)
+
+Four surgical fixes in `vfe3/model/model.py` (+ `tests/test_fix_model_audit.py`, 10 tests, all GREEN);
+default forward/loss byte-identical.
+- **V4 pos_phi freeze guard**: the `pos_phi='learned'` freeze warning was gated on `cfg.detach_e_step`
+  (bool only), missing the string estimators that also sever pos_phi_free's path. Now gates on
+  `cfg.effective_e_step_gradient in ("detach", "straight_through")`.
+- **_amp_context explicit mapping**: replaced the bare-else silent-fp16 fallthrough with bf16→bfloat16,
+  fp16→float16, else `ValueError`. Default `amp_dtype=None` still returns `nullcontext()`.
+- **V6 diagnostics reg/entropy**: capture `alpha_reg` from `self_coupling_alpha` and thread
+  `alpha_reg=(reg if alpha_mode != "constant" else None)` + `include_attention_entropy=cfg...` into
+  `metrics.free_energy_terms`, so the logged `total` equals the F the E-step minimizes. Diagnostics
+  `total` changes only when `alpha_mode != "constant"` or the surrogate is on; default (constant)
+  unchanged. M-step block and `gauge_trace_spread` untouched.
+- **V2 close_basis forward**: `build_group` now resolves the AUTO default
+  `close = cfg.close_basis if not None else (cfg.cross_couplings is not None)` and forwards
+  `close_basis=close` when the builder accepts it. Default (`cross_couplings=None`) → `close=False` →
+  byte-identical group.
+
+## Lifecycle multi-agent audit fixes (report: docs/audits/audit-2026-06-07-lifecycle-multiagent.md)
+
+Six expert fix-agents over disjoint files (CONFIG/MODEL/METRICS/GAUGE/NUMERICS/DOCS) + integration.
+Full suite **664 tests, 0 failures** (junit). All pure paths and default behavior preserved.
+
+- **config.py** (+`test_fix_config_audit.py`): NEW unroll+oracle freeze-warning (a learnable E-step-only
+  param under `unroll` + a non-kernel family routes to the DETACHED oracle → silent freeze unless
+  `oracle_unroll_grad=True`); `m_phi_natural_grad=True` + non-pullback `phi_precond_mode` footgun warning;
+  encode/decode validated against the LIVE `_ENCODERS`/`_DECODERS` registries (decode minus the `linear`
+  second-gate) instead of stale literals; corrected the false "killing = exact no-op" doc; new
+  `close_basis: Optional[bool]=None` gauge-seam field. (fp16 raise was tried then REVERTED — fp16 forward
+  is a sanctioned path, only fp16 *training*/GradScaler is the deferred gap; pos_phi freeze left to the
+  model-level warning to keep the default config silent at config time.)
+- **metrics.py** (+`test_fix_metrics_audit.py`): `free_energy_terms` now accepts `alpha_reg`/
+  `include_attention_entropy` (defaults preserve old output) and equals `free_energy.free_energy(...)`
+  exactly, so the logged/CSV/figure total reflects R(alpha) and the surrogate toggle (audit V6, CONFIRMED).
+- **attention_prior.py** (+`test_fix_attention_prior_audit.py`): registered `causal_alibi` (causal −inf mask
+  + the ALiBi linear distance bias on the causal triangle, Press-et-al.-faithful); `alibi`/`causal`/
+  `uniform` byte-identical.
+- **lie_ops.py / phi_preconditioner.py** (+`test_fix_gauge_audit.py`): bracket-closure guard for cross-
+  coupled 3+-head chains (audit V2). HOT-PATH FIX after the user hit a `requires_grad→scalar` warning: the
+  per-call `float(Z)` residual (grad-carrying, host-syncing the E-step) is replaced by ONE cached,
+  phi-independent structural check on the fixed generators (`warn_if_basis_not_closed`, warns once per call
+  site; silent + cost-free on the default closed basis).
+- **numerics SPD routing** (user-requested) (+`test_fix_numerics_audit.py`): audited every SPD inverse /
+  eigenvalue-floor site in retraction/gaussian/transport against `safe_spd_inverse`/`floor_eigenvalues`.
+  Outcome: NO live site is behavior-equivalently routable (the helpers' ridge/floor policy genuinely
+  differs from the gap-damped eigh + `sigma_max`-capped clamps + vector variance floors; routing would
+  change numerics or break the Sigma=I backward) — each leave is golden-test-pinned. No live numerical
+  change. Doc fixes: retraction `[eps,sigma_max^2]→[eps,sigma_max]`, transport regime_ii "deferred" stale
+  comment, `renyi_per_coord` kl_max-saturation caveat.
+- **docs (gauge_optim/train/prior_bank)**: V5 killing-conformal docstrings corrected; prior_bank `full`
+  decode relabeled implemented (it is registered), not a "named stub".
+
+Deferred (need design/author calls, not in this batch): the manuscript-hierarchy buildouts (s→q channel,
+meta-agent/scale-(s+1), observation-likelihood term), checkpoint resume, fp16 GradScaler, pullback-metric
+vs Eq 2714 reconciliation, lambda_h/gamma mean-vs-sum. See the audit report §3 roadmap.
+
 ## UMAP figure-gen warnings (investigated, no code change)
 
 End-of-run console warnings from `report.generate_figures` → `figures.umap_embed` are both benign.

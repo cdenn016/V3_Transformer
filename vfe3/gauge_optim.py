@@ -8,10 +8,18 @@ induces on the chart, ``G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F`` (the
 
 A position-dependent metric cannot be realized by preconditioning the gradient and then
 handing it to AdamW: Adam divides by the per-coordinate second moment, which re-flattens any
-metric scaling. (The Killing metric is conformal -- a scalar multiple of the identity in the
-Frobenius-orthonormal E_ij basis -- so killing/killing_per_block are exact no-ops under Adam;
-only the non-conformal pullback metric carries geometry, and only when stepped WITHOUT Adam's
-normalization.) So the gauge frame is stepped by natural-gradient descent with heavy-ball
+metric scaling. (The Killing metric is conformal -- in the Frobenius-orthonormal E_ij basis the
+global ``killing`` inverse is exactly c*I on sl(K), so its natural gradient grad@(c*I) = c*grad
+is a uniform scalar rescale: direction-preserving, cos(nat,grad)=1. ``killing_per_block`` applies
+one such conformal factor c_h = 1/(2 d_h) per irrep block, so it is block-wise direction-preserving
+and globally direction-preserving exactly when the blocks share that factor -- which V3's equal-size
+irrep blocks guarantee; unequal blocks would reweight blocks against each other.) Because this
+natural-grad M-step steps the gauge group manually (``p.add_(buf, alpha=-lr)``, then sets
+``p.grad=None`` so AdamW never touches it), the conformal factor is NOT normalized away: here
+killing/killing_per_block are a direction-preserving effective-LR rescale by that conformal factor,
+NOT a no-op. They are an exact no-op only under Adam's per-coordinate scale-invariance, which this
+branch deliberately bypasses. Only the non-conformal ``pullback`` metric reshapes the step DIRECTION.
+So the gauge frame is stepped by natural-gradient descent with heavy-ball
 momentum, while every non-gauge parameter (mu / sigma / decode / ...) keeps standard AdamW --
 those carry diagonal Gaussian Fisher metrics that AdamW's per-coordinate adaptivity already
 realizes, so explicit preconditioning there is the documented no-op.

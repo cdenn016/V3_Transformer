@@ -228,7 +228,8 @@ def retract_logeuclidean_full(
     matrix-log chart (spec reading 2a, the pure retraction). Uses torch.linalg.eigh
     twice (one for logm(Sigma), one for the expm of the log-sum), the same two-eigh
     structure as retract_spd_full; floors the input eigenvalues at eps before log and
-    projects the output spectrum to [eps, sigma_max^2].
+    projects the output spectrum to [eps, sigma_max] (eigenvalues ARE variances: the same
+    physical ceiling the diagonal arm and retract_spd_full apply, matching the code at ~264).
     """
     orig_shape = sigma.shape
     orig_dtype = sigma.dtype

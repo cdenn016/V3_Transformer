@@ -81,6 +81,16 @@ class VFE3Config:
     # Only a group whose builder accepts the kwarg (block_glk) supports it; validated below.
     cross_couplings:           Optional[List[Tuple[int, int]]] = None
 
+    # Close the cross-coupled gauge basis under the Lie bracket (close_under_brackets) so it is a
+    # genuine Lie SUBALGEBRA. When a cross_couplings chain spans 3+ heads the raw chain basis is NOT
+    # bracket-closed: [E_ab, E_bc] = E_ac lands OUTSIDE the spanned generators, so the pullback
+    # structure constants and the BCH composition silently TRUNCATE those out-of-span terms (the
+    # transport composes in a non-closed span). Closing the basis adds the missing bracket-generated
+    # generators so composition stays inside the algebra. Default None = AUTO: closure is applied iff
+    # cross_couplings is set (model.build_group resolves the auto default and reads this field;
+    # config only declares it). True / False force it on / off.
+    close_basis:               Optional[bool] = None
+
     # head mixer (opt-in, default off): a learned Schur-commutant matrix mixes the equal-size
     # gauge-irrep blocks (under block_glk: the n_heads heads) of the converged belief. Identity
     # init -> step-0 bit-identical to off. Breaks strict gauge equivariance under block_glk's
@@ -256,10 +266,14 @@ class VFE3Config:
     # descent + heavy-ball momentum under the phi_precond_mode metric (set phi_precond_mode=
     # "pullback_per_block" for the exact exp-map metric), instead of being placed in AdamW. This is the
     # only way the gauge geometry reaches the M-step: a position-dependent metric cannot ride inside
-    # AdamW -- Adam's per-coordinate normalization re-flattens any metric, and the Killing metric is
-    # conformal (a scalar * I in the Frobenius-orthonormal E_ij basis), so killing/killing_per_block are
-    # exact no-ops here; only the non-conformal pullback metric, applied as a true natural-gradient step
-    # (no Adam normalization), changes the trajectory. Per-token metric solves run on the active rows
+    # AdamW -- Adam's per-coordinate normalization re-flattens any metric. Here the gauge group is
+    # stepped manually WITHOUT Adam normalization (gauge_optim clears p.grad=None after the natural-
+    # gradient step), so the Killing metric is NOT a no-op: being conformal (a scalar * I in the
+    # Frobenius-orthonormal E_ij basis), killing/killing_per_block rescale the phi step by that
+    # constant conformal factor -- a direction-preserving effective-LR change, an exact no-op ONLY
+    # under Adam's scale-invariance. The non-conformal pullback metric additionally changes the step
+    # direction (it reshapes the gradient along the metric's eigendirections -- the genuinely position-
+    # dependent geometry). Per-token metric solves run on the active rows
     # only but are still real compute, so this is an opt-in extreme path; the pure AdamW path is the
     # default. Everything except the gauge frame (mu/sigma/decode/...) stays on AdamW.
     m_phi_natural_grad:        bool  = False
@@ -491,6 +505,23 @@ class VFE3Config:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         _require(self.phi_precond_mode, _VALID_PHI_PRECOND_MODES, "phi_precond_mode")
+        # The natural-gradient gauge M-step (m_phi_natural_grad=True) carries a POSITION-DEPENDENT
+        # metric only under the pullback family ('pullback' / 'pullback_per_block'). With any other
+        # phi_precond_mode it degenerates to plain heavy-ball momentum SGD on phi with NO geometric
+        # metric: 'killing'/'killing_per_block' are conformal (a scalar * I) -> only an effective-LR
+        # rescale, and 'none'/'clip' apply no metric at all. Warn (non-breaking) so the geometric step
+        # is actually selected; set phi_precond_mode='pullback_per_block' for the documented step.
+        if self.m_phi_natural_grad and self.phi_precond_mode not in ("pullback", "pullback_per_block"):
+            import warnings
+            warnings.warn(
+                f"m_phi_natural_grad=True with phi_precond_mode={self.phi_precond_mode!r} runs plain "
+                "heavy-ball momentum SGD on phi with NO position-dependent metric: "
+                "'killing'/'killing_per_block' are conformal (only an effective-LR rescale) and "
+                "'none'/'clip' apply no metric. Set phi_precond_mode='pullback_per_block' for the "
+                "documented geometric (pullback natural-gradient) gauge M-step.",
+                UserWarning,
+                stacklevel=2,
+            )
         _require(self.phi_retract_mode, _VALID_PHI_RETRACT_MODES, "phi_retract_mode")
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
@@ -556,7 +587,14 @@ class VFE3Config:
         # decode / encode
         if self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be positive, got {self.decode_tau}")
-        _require(self.decode_mode, _VALID_DECODE_MODES, "decode_mode")
+        # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not the
+        # static _VALID_*_MODES literals) so a newly registered kernel is config-selectable without
+        # editing this validator (the add-by-registering contract, matching gauge_group / transport_mode
+        # / spd_retract_mode above). Local import avoids a config <- prior_bank cycle. decode_mode must
+        # NOT accept 'linear': that kernel is reached only through the use_prior_bank=False second-gate
+        # (a learned linear readout), never via decode_mode, so it is excluded from the valid set.
+        from vfe3.model.prior_bank import _DECODERS, _ENCODERS
+        _require(self.decode_mode, tuple(sorted(set(_DECODERS) - {"linear"})), "decode_mode")
         # decode_mode sets the RANK of the prior-bank KL-decode kernel: 'diagonal'/'diagonal_chunked'
         # consume a diagonal sigma (B,N,K); 'full' consumes a full sigma (B,N,K,K). It must agree with
         # the covariance family, else the rank mismatch is a shape RuntimeError at the first forward.
@@ -571,7 +609,9 @@ class VFE3Config:
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
-        _require(self.encode_mode, _VALID_ENCODE_MODES, "encode_mode")
+        # encode_mode validated against the live encoder registry (per_token + the 'gauge_fixed'
+        # stub, which the existing NotImplementedError guard below then rejects).
+        _require(self.encode_mode, tuple(sorted(_ENCODERS)), "encode_mode")
         # use_prior_bank is the SINGLE decode gate. True (default, pure path): the KL-to-prior
         # readout logits = -KL(q_i || pi_v)/tau_eff over the gauge-orbit prior bank, with the
         # covariance structure selected by decode_mode (diagonal | full). False (VFE_2.0-parity
@@ -628,6 +668,9 @@ class VFE3Config:
         # at the model level, so keying off the e_step_gradient literal covers exactly the un-warned
         # routes.) Warn (non-breaking; 'unroll' is the default that trains them) rather than restrict
         # the toggle combination.
+        # (pos_phi='learned' ALSO freezes under these estimators, but it is the DEFAULT and is warned
+        # at the MODEL level -- VFEModel.__init__, keyed on the EFFECTIVE estimator -- so it is left out
+        # of this config-level predicate to keep the default config silent here.)
         if self.e_step_gradient in ("straight_through", "detach") and (
             self.alpha_mode == "learnable"
             or self.transport_mode == "regime_ii"
@@ -640,6 +683,48 @@ class VFE3Config:
                 "alpha_mode='learnable', connection_W under transport_mode='regime_ii', log_lambda_beta "
                 "under learnable_lambda_beta) receives NO gradient and stays frozen. Use "
                 "e_step_gradient='unroll' (the default) to train these.",
+                UserWarning,
+                stacklevel=2,
+            )
+        # A SECOND un-warned freeze route: under e_step_gradient='unroll' the closed-form belief-gradient
+        # KERNEL keeps the unrolled E-step signal live to the prior tables, but the autograd ORACLE
+        # fallback (served for every NON-kernel family) returns a DETACHED tangent unless
+        # oracle_unroll_grad=True, truncating that signal. The kernel covers exactly
+        # gradient_mode=='filtering' AND family=='gaussian_diagonal' AND divergence_family=='renyi' AND
+        # alpha_div==1.0 AND include_attention_entropy (verified against gradients.kernels.use_kernel);
+        # any other combination routes to the oracle. When it does and an E-step-only learnable param is
+        # active (alpha_mode='learnable' / transport_mode='regime_ii' / learnable_lambda_beta /
+        # pos_phi='learned'), that param receives NO gradient through the detached oracle. Warn
+        # (non-breaking); oracle_unroll_grad=True restores the differentiable oracle gradient.
+        _routes_to_oracle = not (
+            self.gradient_mode == "filtering"
+            and self.family == "gaussian_diagonal"
+            and self.divergence_family == "renyi"
+            and self.alpha_div == 1.0
+            and self.include_attention_entropy
+        )
+        if (
+            self.e_step_gradient == "unroll"
+            and not self.oracle_unroll_grad
+            and _routes_to_oracle
+            and (
+                self.alpha_mode == "learnable"
+                or self.transport_mode == "regime_ii"
+                or self.learnable_lambda_beta
+                or self.pos_phi == "learned"
+            )
+        ):
+            import warnings
+            warnings.warn(
+                "e_step_gradient='unroll' but this family/gradient_mode routes the belief gradient to "
+                "the autograd ORACLE (NOT the closed-form kernel: that covers only "
+                "gradient_mode='filtering' + family='gaussian_diagonal' + divergence_family='renyi' + "
+                "alpha_div=1.0 + include_attention_entropy=True), which returns a DETACHED tangent while "
+                "oracle_unroll_grad=False. A learnable parameter that enters the loss only through the "
+                "E-step tangent (log_alpha under alpha_mode='learnable', connection_W under "
+                "transport_mode='regime_ii', log_lambda_beta under learnable_lambda_beta, pos_phi_free "
+                "under pos_phi='learned') therefore receives NO gradient and stays frozen. Set "
+                "oracle_unroll_grad=True to make the oracle return a differentiable (unrolled) gradient.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -660,7 +745,10 @@ class VFE3Config:
         if self.eval_max_batches is not None and self.eval_max_batches < 1:
             raise ValueError(f"eval_max_batches must be >= 1 if set, got {self.eval_max_batches}")
         # amp_dtype: None (default, OFF) = pure fp32 / no autocast; 'bf16' / 'fp16' enable autocast.
-        # None is a legal member here, so _require rejects 'fp32' and any other garbage.
+        # None is a legal member here, so _require rejects 'fp32' and any other garbage. fp16 is
+        # accepted for FORWARD/inference; fp16 TRAINING still needs a GradScaler in the M-step
+        # (train.py) -- a documented buildout -- so it is not enforced-rejected here (that would also
+        # block the legitimate fp16 inference path that tests/test_amp.py pins).
         _require(self.amp_dtype, (None, "bf16", "fp16"), "amp_dtype")
 
     @property

@@ -132,8 +132,10 @@ def build_optimizer(
     if nat:
         # Geometrically-correct gauge frame: natural-gradient + momentum on the gauge groups under
         # cfg.phi_precond_mode (set it to 'pullback_per_block' for the exact exp-map metric -- killing
-        # is conformal here, hence a no-op), AdamW on every other group. fused is off: the custom
-        # gauge step bypasses the fused kernel, and the non-gauge groups are few.
+        # is conformal, so under this manual natural-grad step (which AdamW never normalizes) it is a
+        # direction-preserving effective-LR rescale by the conformal factor, NOT a no-op; only the
+        # non-conformal pullback metric reshapes the step direction), AdamW on every other group.
+        # fused is off: the custom gauge step bypasses the fused kernel, and the non-gauge groups are few.
         from vfe3.gauge_optim import GaugeNaturalGradAdamW
         return GaugeNaturalGradAdamW(
             groups, model.group.generators, list(model.group.irrep_dims),

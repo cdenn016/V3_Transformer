@@ -6,6 +6,7 @@ and the normalized prior used in the attention-entropy term is pi = softmax_j(B)
   uniform  B = 0            -> pi_ij = 1/N (manuscript default).
   causal   B = 0 (j<=i), -inf (j>i)   -> uniform over the causal active set.
   alibi    B_ij = -slope*|i-j|        -> linear distance bias (Press et al.).
+  causal_alibi  B_ij = -slope*(i-j) (j<=i), -inf (j>i) -> causal + ALiBi (Press et al.).
 Config-selected so a new prior (learned bias, windowed, ...) slots in by
 register_prior without editing the free-energy call site.
 """
@@ -79,6 +80,34 @@ def prior_alibi(
     i = torch.arange(n_query, device=device).unsqueeze(-1)
     j = torch.arange(n_key, device=device).unsqueeze(0)
     return (-slope * (i - j).abs()).to(dtype)
+
+
+@register_prior("causal_alibi")
+def prior_causal_alibi(
+    n_query: int,
+    n_key:   int,
+
+    *,
+    slope:   float                        = 1.0,
+    device:  'torch.device | str | None'  = None,
+    dtype:   torch.dtype                   = torch.float32,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Causal + ALiBi prior (Press et al. 2022 faithful, autoregressive form).
+
+    The linear distance bias rides on top of the causal mask:
+        B_ij = -slope * (i - j)   for j <= i   (allowed lower triangle),
+        B_ij = -inf               for j >  i   (causal mask, identical to `causal`).
+    On the causal triangle ``i - j >= 0``, so ``-slope*(i - j) == -slope*|i - j|``:
+    the bias magnitude matches ALiBi's on the allowed keys, while ``-inf`` above the
+    diagonal forbids attending to future keys. Distinct from the ``alibi`` prior,
+    which is the bidirectional/symmetric ``-slope*|i - j|`` with no causal mask.
+    """
+    i = torch.arange(n_query, device=device).unsqueeze(-1)
+    j = torch.arange(n_key, device=device).unsqueeze(0)
+    allowed = j <= i
+    B = (-slope * (i - j)).to(dtype)
+    return B.masked_fill(~allowed, float("-inf"))
 
 
 def attention_log_prior(

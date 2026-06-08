@@ -10,8 +10,8 @@ replacing a linear output projection.
 Modularity:
     encode_mode registry -- ``per_token`` (table lookup, default); ``gauge_fixed`` a
         named stub (gauge orbit from a shared base belief).
-    decode_mode registry -- ``diagonal`` (fused closed form, default); ``full`` a named
-        stub (exact Cholesky for full covariances).
+    decode_mode registry -- ``diagonal`` (fused closed form, default); ``full``
+        implemented and registered (the exact full-covariance Cholesky decode).
 
 Divergence-agnostic, scope clarified: ``reference_decode`` is the literal seam path --
 it calls ``divergence.kl`` and so tracks whatever divergence family/alpha the seam is
@@ -20,8 +20,8 @@ configured for. The default fused ``diagonal`` kernel is a hand-specialized alph
 to that seam (and under ``log_softmax``); it does not re-derive itself for a different
 family. The registry seam is therefore honored at the family granularity: a new
 COVARIANCE STRUCTURE (e.g. full-covariance) is added by writing-and-registering a new
-decode kernel (the ``full`` stub), never by editing a call site -- and ``reference_decode``
-already covers any registered divergence for verification.
+decode kernel (the registered ``full`` Cholesky kernel), never by editing a call site --
+and ``reference_decode`` already covers any registered divergence for verification.
 """
 
 from typing import Callable, Dict, Optional, Tuple

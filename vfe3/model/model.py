@@ -50,9 +50,18 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
     a builder that does not accept the kwarg, so this is the forwarding seam, not a second guard."""
     builder = get_group(cfg.gauge_group)
     arity = _positional_arity(builder)
+    params = inspect.signature(builder).parameters
     kwargs: dict = {}
-    if cfg.cross_couplings is not None and "cross_couplings" in inspect.signature(builder).parameters:
+    if cfg.cross_couplings is not None and "cross_couplings" in params:
         kwargs["cross_couplings"] = cfg.cross_couplings
+    # close_basis: AUTO (None) defaults to closing the basis under the Lie bracket exactly when a
+    # cross_couplings chain is present (so the exponentiated off-block group is a well-defined
+    # subalgebra of gl(K)); explicit True/False overrides. Forwarded only when the builder accepts
+    # it. On the DEFAULT path (cross_couplings=None) close resolves to False and the builder's own
+    # default is False, so the group object is byte-identical to before.
+    close = cfg.close_basis if cfg.close_basis is not None else (cfg.cross_couplings is not None)
+    if "close_basis" in params:
+        kwargs["close_basis"] = close
     if arity == 1:
         return builder(cfg.embed_dim, **kwargs)
     if arity == 2:
@@ -190,16 +199,21 @@ class VFEModel(nn.Module):
             _g = torch.Generator().manual_seed(int(cfg.seed))
             self.pos_phi_free = nn.Parameter(
                 torch.randn(cfg.max_seq_len, n_gen, generator=_g) * cfg.pos_phi_scale)
-            if cfg.detach_e_step:
+            if cfg.effective_e_step_gradient in ("detach", "straight_through"):
                 # Footgun (mirrors log_alpha / connection_W): pos_phi_free enters the loss ONLY
-                # through the E-step belief transport, which detach_e_step wraps in no_grad, so the
-                # positional table receives no gradient and stays frozen at init. Set
-                # detach_e_step=False to learn it.
+                # through the E-step belief transport. The 'detach' and 'straight_through' estimators
+                # both sever that path (no_grad / a detached tangent), so the positional table
+                # receives no gradient and stays frozen at init. Gate on the EFFECTIVE estimator
+                # (cfg.effective_e_step_gradient reconciles the legacy detach_e_step bool with the
+                # string e_step_gradient route) so the string-estimator paths warn too. Set the
+                # effective E-step estimator to 'unroll' (detach_e_step=False) to learn it.
                 import warnings
                 warnings.warn(
-                    "pos_phi='learned' with detach_e_step=True freezes pos_phi_free: the positional "
-                    "gauge element enters the loss only through the E-step transport, which the "
-                    "detached (no_grad) E-step severs. Set detach_e_step=False to train it.",
+                    "pos_phi='learned' with the effective E-step estimator "
+                    f"{cfg.effective_e_step_gradient!r} freezes pos_phi_free: the positional gauge "
+                    "element enters the loss only through the E-step transport, which the "
+                    "detached / straight-through E-step severs. Use an 'unroll' E-step "
+                    "(detach_e_step=False, e_step_gradient='unroll') to train it.",
                     stacklevel=2,
                 )
 
@@ -270,7 +284,15 @@ class VFEModel(nn.Module):
         is inert on CPU tensors)."""
         if self.cfg.amp_dtype is None:
             return nullcontext()
-        dtype = torch.bfloat16 if self.cfg.amp_dtype == "bf16" else torch.float16
+        # Explicit, defensive mapping (no bare-else silent-fp16 fallthrough). config.py rejects
+        # amp_dtype='fp16' at construction (deferred: needs a GradScaler), so 'bf16' is the only
+        # reachable non-None value, but map both and raise on anything else.
+        if self.cfg.amp_dtype == "bf16":
+            dtype = torch.bfloat16
+        elif self.cfg.amp_dtype == "fp16":
+            dtype = torch.float16
+        else:
+            raise ValueError(f"unsupported amp_dtype {self.cfg.amp_dtype!r}")
         return torch.autocast(device_type=device.type, dtype=dtype)
 
     def _amp_off_context(
@@ -685,7 +707,7 @@ class VFEModel(nn.Module):
             alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
         )
-        alpha, _ = self_coupling_alpha(
+        alpha, alpha_reg = self_coupling_alpha(
             self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
             log_alpha=getattr(self, "log_alpha", None),     # learned scalar (None on the pure path)
         )
@@ -694,7 +716,9 @@ class VFEModel(nn.Module):
         _lb = cfg.lambda_beta if _llb is None else float(_llb.detach().exp())   # scaled-F total reflects lambda_beta
         terms = metrics.free_energy_terms(self_div, energy, beta, alpha,
                                           tau=attention_tau(cfg.kappa, self.group.irrep_dims),
-                                          lambda_beta=_lb, log_prior=log_prior)
+                                          lambda_beta=_lb, log_prior=log_prior,
+                                          include_attention_entropy=cfg.include_attention_entropy,
+                                          alpha_reg=(alpha_reg if cfg.alpha_mode != "constant" else None))
         d.update({k: float(v) for k, v in terms.items()})
         spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
         d["effective_rank"] = float(metrics.effective_rank(spec).mean())

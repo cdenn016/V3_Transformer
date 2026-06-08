@@ -265,7 +265,7 @@ def free_energy(
 
     log_prior:                 Optional[torch.Tensor] = None,   # (..., N, N) attention log-prior
     alpha_reg:                 Optional[torch.Tensor] = None,   # (..., N[,K]) R(alpha) if state-dep
-    log_likelihood:            Optional[torch.Tensor] = None,   # (..., N) E_q[log p(o|k)]
+    log_likelihood:            Optional[torch.Tensor] = None,   # (..., N) E_q[log p(o|k)] observation term; GATED STUB (see docstring)
 ) -> torch.Tensor:                                  # scalar F = sum_i F_i
     r"""Single authoritative scalar free energy (default path; lambda_h=0, gamma=0).
 
@@ -280,7 +280,21 @@ def free_energy(
     lambda_beta sum_j beta* dE/dtheta still holds -- keeping the analytic kernel (which scales its
     pair term by lambda_beta) in agreement with autograd of this F. The hyper-prior lambda_h
     KL(s||h) and model-coupling gamma KL(s_i||Omega s_j) are extension points, absent from this
-    default path. Divergence-agnostic: `self_div`/`energy` come from the divergence seam, so a new
+    default path.
+
+    The observation/data term -E_q[log p(o|k)] enters via the optional ``log_likelihood`` arg
+    (subtracted below) but is a GATED STUB: no production caller supplies it, and this is the
+    ORACLE-path mirror only. The default belief descent runs through the analytic kernel
+    (``gradients/kernels.py`` -> ``get_kernel``), which never calls this function, so a live
+    observation pull must ALSO be injected into ``gradients/kernels.py`` and ``gradients/oracle.py``;
+    wiring it here alone is inert. The term is non-vacuous only once the per-token prior is replaced
+    by a top-down cross-scale shadow prior (PIFB:1233): in the current next-token model the input
+    token already sets p_i (encode q=p) and the next token already drives the cross-entropy
+    (``metrics.py`` books that CE as the data term), so an observation carries no information distinct
+    from both. Do NOT "complete the canonical functional" by wiring ``log_likelihood`` here plus one
+    caller and believing it live. See docs/2026-06-07-observation-likelihood-term-brainstorm.md.
+
+    Divergence-agnostic: `self_div`/`energy` come from the divergence seam, so a new
     divergence requires no change here.
     """
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)        # (..., N, N)
@@ -299,6 +313,6 @@ def free_energy(
             else torch.full_like(beta, 1.0 / beta.shape[-1])
         entropy = tau * (beta * (torch.log(beta.clamp(min=log_eps)) - torch.log(pi.clamp(min=log_eps)))).sum()
         F = F + lambda_beta * entropy
-    if log_likelihood is not None:
+    if log_likelihood is not None:                              # observation/data term -E_q[log p(o|k)] (gated stub; no live caller)
         F = F - log_likelihood.sum()
     return F

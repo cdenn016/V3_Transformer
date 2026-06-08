@@ -117,7 +117,11 @@ class DiagonalGaussian(BeliefParams):
         eps:     float = 1e-6,
     ) -> torch.Tensor:
         r"""Per-coordinate diagonal Gaussian Renyi/KL: the diagonal Renyi/KL coordinate terms
-        left UNSUMMED, each clamped independently (sum over k recovers ``renyi_closed_form``)."""
+        left UNSUMMED, each clamped independently. Summing over k recovers ``renyi_closed_form``
+        ONLY when no per-coordinate term saturates ``kl_max``: this routine clamps each coordinate
+        to kl_max independently, whereas the closed form clamps the single summed scalar once, so a
+        coordinate that individually exceeds kl_max diverges between the two. The independent
+        per-coordinate clamp is the intended behavior here; only the recovery identity is conditional."""
         mu_q = self.mu.float()
         sigma_q = self.sigma.float().clamp(min=eps)
         mu_t = other.mu.float()
@@ -177,7 +181,11 @@ class FullGaussian(BeliefParams):
 
     def natural(self) -> Tuple[torch.Tensor, torch.Tensor]:
         # Ridge the covariance before inverting to the precision (the natural parameter); the
-        # 1e-6 jitter matches the eps the closed-form full kernel uses for SPD safety.
+        # 1e-6 jitter matches the eps the closed-form full kernel uses for SPD safety. NOT routed
+        # through ``safe_spd_inverse``: that helper's Cholesky-inverse diverges from this LU solve by
+        # ~1.5e-4 once cond(Sigma) >= 1e3 (reachable here, eps=1e-6 floor / sigma_max=5 cap give
+        # cond up to ~5e6), so centralizing would CHANGE the live result -- pinned by
+        # tests/test_fix_numerics_audit.py::test_natural_inverse_not_routed_solve_vs_safe_spd_diverges.
         eye = torch.eye(self.mu.shape[-1], device=self.mu.device, dtype=self.mu.dtype)
         prec = torch.linalg.solve(self.sigma + 1e-6 * eye, eye.expand_as(self.sigma))
         t1 = (prec @ self.mu.unsqueeze(-1)).squeeze(-1)
