@@ -87,7 +87,7 @@ class VFEModel(nn.Module):
             cfg.vocab_size, cfg.embed_dim, n_gen,
             decode_tau=cfg.decode_tau, eps=cfg.eps,
             diagonal_covariance=cfg.diagonal_covariance,
-            use_prior_bank=cfg.use_prior_bank,
+            use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             lambda_h=cfg.lambda_h, gamma_coupling=cfg.gamma_coupling,

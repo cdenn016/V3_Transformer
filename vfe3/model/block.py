@@ -53,6 +53,7 @@ def vfe_block(
         lambda_beta=lambda_beta,
         kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
+        e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
         include_attention_entropy=cfg.include_attention_entropy,
         gradient_mode=cfg.gradient_mode, family=cfg.family, divergence_family=cfg.divergence_family,
         alpha_mode=cfg.alpha_mode,

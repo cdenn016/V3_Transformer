@@ -90,6 +90,7 @@ class PriorBank(nn.Module):
     """
 
     output_proj_weight: Optional[nn.Parameter]   # (V, K) linear-decode weight; None unless use_prior_bank=False
+    output_proj_bias:   Optional[nn.Parameter]   # (V,) linear-decode log-unigram bias; None unless use_prior_bank=False and decode_bias
 
     def __init__(
         self,
@@ -105,6 +106,7 @@ class PriorBank(nn.Module):
         eps:                 float = 1e-6,
         diagonal_covariance: bool  = True,
         use_prior_bank:      bool  = True,
+        decode_bias:         bool  = False,
         encode_mode:         str   = "per_token",
         decode_mode:         str   = "diagonal",
         decode_chunk_size:   int   = 8192,
@@ -140,9 +142,21 @@ class PriorBank(nn.Module):
         # V that softmax/cross-entropy absorbs). Encode stays the prior-bank lookup either way.
         if use_prior_bank:
             self.output_proj_weight = None
+            self.output_proj_bias   = None
         else:
             self.output_proj_weight = nn.Parameter(torch.empty(vocab_size, K))
             nn.init.xavier_uniform_(self.output_proj_weight)
+            # Optional per-vocab bias (decode_bias): a *per-class* bias is NOT a softmax-invariant
+            # constant shift -- it is a learned log-unigram prior, and a 50k Zipfian vocab is the
+            # opposite of balanced, so the bias-free map can represent token base rates only by
+            # spending rank-K mean capacity. Zero-init -> logits bit-identical to decode_bias=False
+            # at construction (drawn AFTER the weight, so the weight's RNG is unchanged); the CE
+            # gradient drives it toward log p(token). Routed to a weight-decay-free optimizer group
+            # in build_optimizer (decaying a unigram prior toward zero biases it to flat). VFE_2.0
+            # parity: transformer/vfe/model.py output_proj.bias.
+            self.output_proj_bias = (
+                nn.Parameter(torch.zeros(vocab_size)) if decode_bias else None
+            )
 
         # MODEL CHANNEL (manuscript eq:pointwise_free_energy), default-OFF. The model-channel belief
         # tables s_mu_embed/s_sigma_log_embed (V, K) -- a per-token DIAGONAL Gaussian s_i looked up
@@ -502,14 +516,18 @@ def _decode_linear(
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
     sigma_q: torch.Tensor,               # (B, N, K) posterior variances (DISCARDED)
     tau_eff: torch.Tensor,               # () effective temperature (DISCARDED)
-) -> torch.Tensor:                       # (B, N, V) logits = mu_q @ W^T
-    r"""Linear-projection decode (use_prior_bank=False, VFE_2.0 parity): logits = mu_q @ W^T.
+) -> torch.Tensor:                       # (B, N, V) logits = mu_q @ W^T (+ b)
+    r"""Linear-projection decode (use_prior_bank=False, VFE_2.0 parity): logits = mu_q @ W^T (+ b).
 
     The one authorized neural exception: a single learned (V, K) output weight applied to the
     converged mean, with NO KL geometry at the decode boundary (sigma and the decode temperature
     are discarded; only encode + the E-step remain gauge-aware). Realized as a raw nn.Parameter
-    matmul, not an nn.Linear module. The pure KL-readout path is always available under
+    matmul, not an nn.Linear module. With ``decode_bias`` a learned per-vocab log-unigram bias
+    ``b`` (V,) is added (see __init__). The pure KL-readout path is always available under
     use_prior_bank=True; this is the opt-in ablation the user uses to compare with/without the
     prior-bank decode.
     """
-    return mu_q @ pb.output_proj_weight.transpose(-1, -2)               # (B, N, V)
+    logits = mu_q @ pb.output_proj_weight.transpose(-1, -2)             # (B, N, V)
+    if pb.output_proj_bias is not None:
+        logits = logits + pb.output_proj_bias                           # learned log-unigram prior
+    return logits

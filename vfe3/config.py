@@ -200,7 +200,15 @@ class VFE3Config:
     e_mu_lr:                   float = 0.5
     e_sigma_lr:                float = 0.015
     e_phi_lr:                  float = 0.0
+    
     e_sigma_q_trust:           float = 5.0
+    # E-step MEAN trust region (VFE_2.0 parity, default OFF = current unbounded update). When set to
+    # a float, every per-iteration mean step delta_mu = e_mu_lr*nat_mu is clamped in sigma-whitened
+    # units to at most this many standard deviations (mu_trust_mode='box' per-coord, 'ball' = 2-norm
+    # Mahalanobis ball). None reproduces the bare mu = mu - e_mu_lr*nat_mu bit-for-bit. V2's winning
+    # run used e_mu_q_trust=5.0, mu_trust_mode='box'.
+    e_mu_q_trust:              Optional[float] = None
+    mu_trust_mode:             str   = "box"          # "box" | "ball" (consulted only when e_mu_q_trust is not None)
     sigma_max:                 float = 5.0
    
     gradient_mode:             str   = "filtering"
@@ -211,6 +219,7 @@ class VFE3Config:
 
     # decode / encode
     use_prior_bank:            bool  = True
+    decode_bias:               bool  = False  # use_prior_bank=False only: learned per-vocab log-unigram bias on logits=mu_q@W^T+b (zero-init, weight-decay-free). Inert (warns) under use_prior_bank=True.
     decode_tau:                float = 1.0
     decode_mode:               str   = "diagonal"
     
@@ -279,6 +288,13 @@ class VFE3Config:
     m_phi_natural_grad:        bool  = False
     m_gauge_momentum:          float = 0.9   # heavy-ball momentum for the natural-gradient gauge step
     weight_decay:              float = 0.05
+    # SEPARATE AdamW weight decay for the gauge-frame coordinate tables (phi_embed, learned
+    # pos_phi_free), default 0.065. Decoupled decay on phi sets an LR-invariant frame-norm ceiling
+    # (|phi*| ~ E[normalized-grad]/wd) that pulls the transport exp(phi.G) toward the identity; this
+    # knob decouples that from the belief-table weight_decay so it can be swept (set 0 for VFE_2.0's
+    # gauge-frame protection). Inert under m_phi_natural_grad=True (phi is natural-gradient stepped,
+    # AdamW decay 0 on the gauge groups regardless).
+    phi_weight_decay:          float = 0.065
     batch_size:                int   = 64
     
     # Accumulate gradients over N microbatches before an optimizer step, for a larger
@@ -298,8 +314,8 @@ class VFE3Config:
     #                          the pure half-cosine-to-zero path.
     
     seed:                      int   = 0
-    log_interval:              int   = 50           # console log every N steps (0 = off)
-    eval_interval:             int   = 0            # periodic validation every N steps (0 = off)
+    log_interval:              int   = 100           # console log every N steps (0 = off)
+    eval_interval:             int   = 2000            # periodic validation every N steps (0 = off)
     checkpoint_interval:       int   = 0            # save a resumable checkpoint every N steps (0 = off)
     # Opt-in training RESUME (default None = OFF = the pure from-scratch path): a path to a
     # checkpoints/step_<N>.pt written by checkpoint_interval. When set, train() restores the model
@@ -308,7 +324,7 @@ class VFE3Config:
     # argument takes precedence over this field. None leaves train() byte-identical to the from-scratch loop.
     resume_from:               Optional[str] = None
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
-    generate_figures:          bool  = True         # auto-run the single-run publication figures at finalize_run (off the hot path)
+    generate_figures:          bool          = True         # auto-run the single-run publication figures at finalize_run (off the hot path)
     
     # Opt-in mixed precision for CUDA throughput (RTX 5090). None (default) = OFF = the pure fp32
     # path: NO autocast context is entered anywhere in the forward, so the loss/logits are
@@ -615,6 +631,18 @@ class VFE3Config:
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
+        # decode_bias is a learned per-vocab log-unigram bias on the use_prior_bank=False LINEAR
+        # decode (logits = mu_q @ W^T + b). On the prior-bank KL path the per-vocab priors
+        # (mu_p, sigma_p) already carry the unigram role, so the bias is never created there; warn
+        # so a True+prior_bank pair is not silently a no-op (mirrors VFE_2.0 config.py).
+        if self.decode_bias and self.use_prior_bank:
+            import warnings
+            warnings.warn(
+                "decode_bias=True is inert when use_prior_bank=True: the KL-to-prior decode's "
+                "per-vocab priors already play the log-unigram role. Set use_prior_bank=False "
+                "(linear decode) for the learned bias to take effect.",
+                UserWarning,
+            )
         # encode_mode validated against the live encoder registry (per_token + the 'gauge_fixed'
         # stub, which the existing NotImplementedError guard below then rejects).
         _require(self.encode_mode, tuple(sorted(_ENCODERS)), "encode_mode")
@@ -734,7 +762,11 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
-        for name in ("m_mu_lr", "m_sigma_lr", "m_phi_lr", "weight_decay", "min_lr", "min_lr_frac"):
+        if self.e_mu_q_trust is not None and self.e_mu_q_trust <= 0.0:
+            raise ValueError(f"e_mu_q_trust must be > 0 or None, got {self.e_mu_q_trust}")
+        if self.mu_trust_mode not in ("box", "ball"):
+            raise ValueError(f"mu_trust_mode must be 'box' or 'ball', got {self.mu_trust_mode!r}")
+        for name in ("m_mu_lr", "m_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr", "min_lr_frac"):
             v = getattr(self, name)
             if v < 0.0 or v != v:                            # v != v rejects NaN (which passes < 0.0)
                 raise ValueError(f"{name} must be >= 0 (and not NaN), got {v}")

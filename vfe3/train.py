@@ -71,7 +71,7 @@ def build_optimizer(
     # Default OFF: the flag is absent and every group is plain AdamW, byte-identical to before.
     nat = cfg.m_phi_natural_grad
     n_gen = model.group.generators.shape[0]
-    phi_group = {"params": [pb.phi_embed], "lr": cfg.m_phi_lr}
+    phi_group = {"params": [pb.phi_embed], "lr": cfg.m_phi_lr, "weight_decay": cfg.phi_weight_decay}
     if nat:
         phi_group["gauge"] = True
         phi_group["weight_decay"] = 0.0
@@ -82,10 +82,15 @@ def build_optimizer(
     ]
     if pb.output_proj_weight is not None:                       # use_prior_bank=False linear decode
         groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_mu_lr})
+    if pb.output_proj_bias is not None:                         # decode_bias: learned log-unigram prior
+        # weight_decay=0 -- decaying a unigram prior toward zero biases it to a flat distribution
+        # (the same protection phi/Omega carry). VFE_2.0 parity: trainer.py m_decode_nodecay group.
+        groups.append({"params": [pb.output_proj_bias], "lr": cfg.m_mu_lr, "weight_decay": 0.0})
     if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
         groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_mu_lr})
     if getattr(model, "pos_phi_free", None) is not None:        # pos_phi='learned' positional table
-        pos_group = {"params": [model.pos_phi_free], "lr": cfg.m_phi_lr}      # a gauge-frame scale
+        pos_group = {"params": [model.pos_phi_free], "lr": cfg.m_phi_lr,      # a gauge-frame scale
+                     "weight_decay": cfg.phi_weight_decay}                    # decayed like phi_embed
         # Natural-grad the positional frame too, but ONLY at full coordinate width: the pullback
         # metric is built on the full generator set, so a reduced (pos_phi_project_slk) chart is
         # shape-incompatible and stays on AdamW.
@@ -537,10 +542,64 @@ def train(
     return losses
 
 
-def _banner(model: VFEModel, cfg: VFE3Config, dataset: str, device: torch.device, n_steps: int) -> str:
+def coverage_lines(
+    loader:     object,                  # DataLoader over a TokenWindows stream
+    n_steps:    int,                     # optimizer steps == batches consumed (grad_accum subdivides one batch)
+    dataset:    str,
+
+    *,
+    full_corpus_tokens: Optional[int] = None,   # uncapped corpus size; emits a "stream is X% of full" line when it exceeds the loaded stream
+) -> List[str]:
+    r"""Banner lines reporting corpus coverage and epoch count for a training run.
+
+    One optimizer step pulls exactly one ``batch_size`` window-batch from ``loader``
+    (``grad_accum_steps`` only ``torch.chunk``-subdivides that single batch -- it draws no extra
+    batches), so ``n_steps`` is the number of batches consumed. With ``steps_per_epoch = len(loader)``
+    (already ``drop_last``-aware), ``epochs = n_steps / steps_per_epoch``. The default
+    ``stride == seq_len`` tiles the corpus exactly once per epoch, so unique corpus coverage saturates
+    at one epoch (``min(1, epochs)``); past that the corpus is re-seen ``epochs`` times.
+    ``tokens_seen = n_steps * batch_size * seq_len`` is the raw token throughput (counts re-seen tokens).
+    """
+    ds = loader.dataset
+    T = int(ds.tokens.numel())                       # tokens in the (possibly capped) stream
+    seq_len = int(ds.seq_len)
+    stride = int(ds.stride)
+    batch = int(loader.batch_size)
+    windows = len(ds)
+    spe = len(loader)                                # batches per epoch (honours drop_last)
+    epochs = (n_steps / spe) if spe > 0 else float("nan")
+    tokens_seen = n_steps * batch * seq_len
+
+    lines = [
+        f" data: {dataset}  tokens={T:,}  windows={windows:,}  seq_len={seq_len} stride={stride}",
+    ]
+    if dataset == "synthetic-period3":               # "% of wiki" is meaningless on the synthetic anchor
+        lines.append(f" coverage: epochs={epochs:.2f}  steps/epoch={spe:,}  tokens_seen={tokens_seen:,}")
+    else:
+        cov_pct = min(1.0, epochs) * 100.0           # unique fraction of corpus, saturating at one epoch
+        passes = f"  ({epochs:.2f}x passes)" if epochs >= 1.0 else ""
+        lines.append(
+            f" coverage: epochs={epochs:.2f}  corpus={cov_pct:.1f}%{passes}  "
+            f"steps/epoch={spe:,}  tokens_seen={tokens_seen:,}"
+        )
+        if full_corpus_tokens is not None and full_corpus_tokens > T:
+            frac = T / full_corpus_tokens * 100.0
+            lines.append(f" stream: {T:,}/{full_corpus_tokens:,} tokens = {frac:.1f}% of full {dataset} (capped)")
+    return lines
+
+
+def _banner(
+    model:       VFEModel,
+    cfg:         VFE3Config,
+    dataset:     str,
+    device:      torch.device,
+    n_steps:     int,
+    train_loader: object = None,
+) -> str:
     r"""Compact VFE_2.0-style init banner (no FLOPs counter, no lambda_h: V3 has neither)."""
     n_params = sum(p.numel() for p in model.parameters())
     bar = "=" * 64
+    cov = coverage_lines(train_loader, n_steps, dataset) if train_loader is not None else []
     return "\n".join([
         bar,
         f" Gauge VFE Transformer | {n_params} params | {device}",
@@ -548,6 +607,7 @@ def _banner(model: VFEModel, cfg: VFE3Config, dataset: str, device: torch.device
         f" K={cfg.embed_dim}  N={cfg.max_seq_len}  L={cfg.n_layers}  heads={cfg.n_heads}  "
         f"group={cfg.gauge_group}  family={cfg.family}",
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
+        *cov,
         f" M-LRs: mu={cfg.m_mu_lr}  sigma={cfg.m_sigma_lr}  phi={cfg.m_phi_lr}",
         f" VFE: alpha={cfg.alpha}  kappa={cfg.kappa}  "
         f"tau={attention_tau(cfg.kappa, model.group.irrep_dims):.4f}  mass_phi={cfg.mass_phi}",
@@ -583,7 +643,7 @@ def run_training(
     device = model.prior_bank.mu_embed.device
     loader = make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size, max_tokens=max_tokens)
     logger = logging.getLogger(__name__)
-    logger.info(_banner(model, cfg, dataset, device, n_steps))
+    logger.info(_banner(model, cfg, dataset, device, n_steps, train_loader=loader))
     losses = train(
         model, loader, cfg,
         n_steps=n_steps,

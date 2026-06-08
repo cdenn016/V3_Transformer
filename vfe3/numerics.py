@@ -22,6 +22,39 @@ def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
     return 0.5 * (matrix + matrix.transpose(-1, -2))
 
 
+def apply_mu_trust_region(
+    delta_mu: torch.Tensor,              # (..., K) proposed mean step (e_mu_lr * nat_grad_mu)
+    sigma_q:  torch.Tensor,              # (..., K) diagonal variances OR (..., K, K) covariance
+
+    *,
+    trust:       float = 5.0,
+    mode:        str   = "box",
+    is_diagonal: bool  = True,
+    eps:         float = 1e-8,
+) -> torch.Tensor:                       # (..., K) clamped step, same shape/dtype as delta_mu
+    r"""Whitened E-step mean trust region (VFE_2.0 ``apply_mu_trust_region`` parity).
+
+    Bounds the per-iteration mean update in :math:`\sigma`-whitened (Mahalanobis) units so a
+    large VFE mean gradient cannot overshoot the belief by more than ``trust`` standard deviations:
+
+        scale    = sqrt(diag(sigma_q)),  whitened = delta_mu / scale
+        box      : clamp(whitened, -trust, +trust) * scale          (per-coordinate)
+        ball     : delta_mu * min(trust / ||whitened||_2, 1)        (direction-preserving)
+
+    ``box`` is V2's winning-run mode. This is a step-size guard, OFF by default at the call site
+    (``e_mu_q_trust=None``); when ``trust`` does not bind it is the identity.
+    """
+    sigma_diag = sigma_q if is_diagonal else sigma_q.diagonal(dim1=-2, dim2=-1)
+    scale = sigma_diag.clamp(min=eps).sqrt()
+    whitened = delta_mu / scale
+    if mode == "ball":
+        norm2 = whitened.norm(dim=-1, keepdim=True)
+        return delta_mu * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
+    if mode != "box":
+        raise ValueError(f"apply_mu_trust_region mode={mode!r}; expected 'box' or 'ball'.")
+    return whitened.clamp(-trust, trust) * scale
+
+
 def safe_cholesky(
     matrix: torch.Tensor,                # (..., K, K) symmetric ~PD (per-element factored)
 
