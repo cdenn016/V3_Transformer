@@ -155,6 +155,50 @@ hyper-prior centroid (`r_mu`, `r_sigma_log`) must exist whenever `s_e_step` is o
 **Verification.** 36 passed (full targeted regression: `test_live_s_model_channel.py`,
 `test_prior_bank.py`, `test_model.py`); no regressions.
 
+## VFEModel._refine_s — model-channel E-step (Task 3 of live model channel)
+
+**Why.** With the s-tables and frozen r in place (Task 2), the model needs a method that runs
+the s-channel E-step: refine s toward r plus the gamma model-consensus with the gauge frame
+held fixed. This is the precursor to wiring the live channel into `forward` (Task 4).
+
+**Change (vfe3/model/model.py only; method not yet called by forward).**
+- New private method `VFEModel._refine_s(token_ids, phi0, *, e_step_gradient)` inserted between
+  `_apply_pos_phi` and `forward`. It calls the existing channel-agnostic `e_step` with
+  `BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0)`, `r_mu`/`r_sigma` as the prior, `e_phi_lr=0.0`
+  (frame held fixed), `transport_mode="flat"` (tied flat cocycle), `value=cfg.lambda_h` (s->r
+  self-coupling), and `lambda_beta=cfg.gamma_coupling` (s->s consensus weight).
+- No kwarg or config-field adaptations were needed: all names matched exactly.
+
+**Tests (tests/test_live_s_model_channel.py, 2 new tests).**
+- `test_refine_s_preserves_shape_and_zero_lr_is_static`: shape (B,N,K) correct; `e_s_lr=0` is
+  a no-op (s1 == s0).
+- `test_refine_s_moves_s_with_nonzero_lr`: `e_s_lr=0.5` moves s away from its initial value.
+
+**Verification.** `9 passed` (full `test_live_s_model_channel.py`); 2 new tests pass.
+
+## VFEModel.forward wires live s channel (Task 4 of live model channel)
+
+**What.** Under `s_e_step=True`, `forward` now: (1) calls `_refine_s(token_ids, beliefs.phi,
+e_step_gradient=...)` inside the `with run, amp:` block immediately before `vfe_stack`, then
+replaces the belief's `mu`/`sigma` with the refined `s1` — so both the initial belief state and
+the prior passed to `vfe_stack` are the live s; (2) suppresses the loss-level `lambda_h` and
+`gamma_coupling` blocks (guarded `and not self.cfg.s_e_step`) because those forces now live
+inside `_refine_s` and double-counting them would be wrong. The pure `s_e_step=False` path is
+unchanged.
+
+**Tests (tests/test_live_s_model_channel.py, 4 new tests).**
+- `test_default_off_forward_is_unchanged_by_the_new_code`: `s_e_step=False` gives finite logits.
+- `test_s_e_step_changes_logits_at_n_e_steps_1`: same seed + bit-identical belief tables; the
+  live channel alone changes the logits.
+- `test_e_s_lr_zero_reduces_to_static_model_channel`: `e_s_lr=0` gives logits matching the
+  static `model_channel` path (`atol=1e-6, rtol=1e-5`; NOT bit-exact due to SPD retraction
+  exp/log roundtrip, but well within tolerance).
+- `test_s_e_step_gradient_reaches_s_tables_at_t1`: `loss.backward()` produces non-zero grad on
+  `s_mu_embed` via the unrolled `_refine_s`.
+
+**Verification.** `13 passed` (full `test_live_s_model_channel.py`); regression `test_model.py` +
+`test_train.py`: `44 passed, 1 xpassed`, 0 failures, 0 errors.
+
 ## Audit-doc status sync — `docs/audits/audit-2026-06-07-lifecycle-multiagent.md`
 
 Doc-only (no code change). Marked the verified findings closed since the audit: **V2** (`close_basis`

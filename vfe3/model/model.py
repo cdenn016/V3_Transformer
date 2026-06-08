@@ -423,6 +423,12 @@ class VFEModel(nn.Module):
         # below are protected separately (their inputs are .float()-ed; see _amp_off_context).
         amp = self._amp_context(token_ids.device)
         with run, amp:
+            if self.cfg.s_e_step:
+                # Live model channel: refine s (phi0 fixed), then anchor the belief to it -- q0 and
+                # the belief prior (mu_p, sigma_p) both become the refined s1. The belief E-step
+                # self-couples to its prior every iteration, so s reaches mu_final even at n_e_steps=1.
+                s_mu1, s_sigma1 = self._refine_s(token_ids, beliefs.phi, e_step_gradient=e_step_gradient)
+                beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm,
                             head_mixer=self.head_mixer, log_alpha=log_alpha,
@@ -528,7 +534,7 @@ class VFEModel(nn.Module):
                 coupling = coupling.sum(dim=-1)                # sum_k alpha^(k) D^(k) -> per-token
             sc = coupling.mean()                               # mean over batch and tokens (B, N)
             loss = loss + cfg.mstep_self_coupling_weight * sc
-        if self.cfg.lambda_h > 0.0:
+        if self.cfg.lambda_h > 0.0 and not self.cfg.s_e_step:
             # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
             # lines 1241-1249): L += lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
             # regularized toward the global hyper-prior centroid r. Opt-in, default-off
@@ -553,7 +559,7 @@ class VFEModel(nn.Module):
                 divergence_family=cfg.divergence_family,
             ).mean()
             loss = loss + cfg.lambda_h * hp
-        if self.cfg.gamma_coupling > 0.0:
+        if self.cfg.gamma_coupling > 0.0 and not self.cfg.s_e_step:
             # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
             # lines 1241-1249): L += gamma_coupling * mean_i F_red^s_i, the reduced (envelope) form of
             # the model-coupling block sum_ij [ gamma_ij KL(s_i||Omega_tilde_ij s_j) + tau_g gamma_ij

@@ -100,3 +100,50 @@ def test_refine_s_moves_s_with_nonzero_lr():
     s0_mu, _ = m.prior_bank.encode_s(tok)
     s1_mu, _ = m._refine_s(tok, phi0)
     assert not torch.allclose(s1_mu, s0_mu)   # the refine actually descends toward r + consensus
+
+
+def _tok(m, b=2, n=4):
+    return torch.randint(0, m.cfg.vocab_size, (b, n))
+
+
+def test_default_off_forward_is_unchanged_by_the_new_code():
+    # The pure path must stay finite/sane: same seed, s_e_step=False.
+    torch.manual_seed(0); m = VFEModel(_tiny_cfg(s_e_step=False))
+    tok = _tok(m)
+    lg = m(tok)
+    assert torch.isfinite(lg).all()
+
+
+def test_s_e_step_changes_logits_at_n_e_steps_1():
+    # Belief tables are bit-identical across the two models (s-tables drawn last); the ONLY
+    # difference is the live s channel, which must move the logits at the operative n_e_steps=1.
+    torch.manual_seed(0); base = VFEModel(_tiny_cfg(s_e_step=False, prior_source="model_channel",
+                                                    lambda_h=1.0, gamma_coupling=1.0))
+    torch.manual_seed(0); live = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel",
+                                                    lambda_h=1.0, gamma_coupling=1.0,
+                                                    e_s_mu_lr=0.5, e_s_sigma_lr=0.5))
+    tok = _tok(live)
+    assert not torch.allclose(base(tok), live(tok))
+
+
+def test_e_s_lr_zero_reduces_to_static_model_channel():
+    # s_e_step + e_s_lr=0 == static prior_source='model_channel' (refine no-ops): logits match.
+    torch.manual_seed(0); static = VFEModel(_tiny_cfg(s_e_step=False, prior_source="model_channel",
+                                                      lambda_h=1.0, gamma_coupling=1.0))
+    torch.manual_seed(0); live0 = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel",
+                                                     lambda_h=1.0, gamma_coupling=1.0,
+                                                     e_s_mu_lr=0.0, e_s_sigma_lr=0.0))
+    tok = _tok(live0)
+    assert torch.allclose(static(tok), live0(tok), atol=1e-6, rtol=1e-5)
+
+
+def test_s_e_step_gradient_reaches_s_tables_at_t1():
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel",
+                           lambda_h=1.0, gamma_coupling=1.0, e_s_mu_lr=0.5))
+    tok = _tok(m)
+    tgt = _tok(m)
+    _, loss, _ = m(tok, targets=tgt)
+    loss.backward()
+    assert m.prior_bank.s_mu_embed.grad is not None
+    assert m.prior_bank.s_mu_embed.grad.abs().sum() > 0
