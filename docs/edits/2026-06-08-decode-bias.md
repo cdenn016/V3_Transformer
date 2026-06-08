@@ -250,6 +250,111 @@ plus companion sweeps over `e_s_mu_lr` and `e_s_sigma_lr`, following the schema 
 
 **Verification.** Full suite: `tests=731, failures=0, errors=0, skipped=0` (731 passed, 1 xpassed).
 
+## fp16 GradScaler — close the silent-mistrain footgun (Task 1)
+
+**Why.** `amp_dtype='fp16'` wrapped the E-step in `autocast(fp16)` but left `loss.backward()`
+and `optimizer.step()` unscaled. fp16 gradients underflow through the deep unrolled E-step
+and the prior tables receive near-zero updates, silently mistraining without any error or NaN.
+
+**Change (byte-identical for default/bf16/fp32).**
+- `vfe3/train.py train_step`: added keyword-only `scaler: Optional['torch.amp.GradScaler'] = None`
+  param (after `grad_accum_steps`, vertical-alignment convention matched). Body: constructs a
+  `torch.amp.GradScaler(device=tokens.device.type, enabled=False)` when `scaler=None`; replaces
+  `loss.backward()` / `optimizer.step()` with `_scaler.scale(loss).backward()` /
+  `_scaler.unscale_(optimizer)` / `_scaler.step(optimizer)` / `_scaler.update()`. A disabled
+  scaler is a documented no-op (scale = identity, unscale_ = no-op, step = optimizer.step()),
+  so `scaler=None` (default) is byte-identical to the pre-feature unscaled path.
+- `vfe3/train.py train()`: after `device` is resolved, builds
+  `scaler = torch.amp.GradScaler(device=device.type, enabled=(cfg.amp_dtype == "fp16"))` and
+  passes `scaler=scaler` to the `train_step` call. Non-fp16 `amp_dtype` constructs an
+  `enabled=False` instance — no-op, loop unchanged.
+- `tests/test_fp16_gradscaler.py` (new, 2 tests):
+  - `test_gradscaler_disabled_is_byte_identical_to_unscaled_step`: with `amp_dtype=None` the
+    scaler-wired `train_step` produces parameter values bit-identical to the manual
+    `loss.backward()/optimizer.step()` reference path.
+  - `test_fp16_forward_keeps_logits_and_sigma_finite`: under `amp_dtype='fp16'` the forward
+    pass returns finite logits (confirms existing sigma fp32 islands are intact).
+
+**GradScaler API.** `torch.amp.GradScaler(device=..., enabled=...)` works on torch 2.11+cpu
+(confirmed). No fallback to the deprecated `torch.cuda.amp.GradScaler` was needed.
+
+**Verification.** Both new tests pass; regression `tests/test_train.py` + `tests/test_amp.py`:
+`tests=27, failures=0, errors=0` (27 passed, 1 xpassed). Spec:
+`docs/superpowers/specs/2026-06-08-fp16-gradscaler-design.md`.
+
+## fp16 training GradScaler
+
+**Why.** amp_dtype='fp16' was accepted but trained UNSCALED -> fp16 gradients underflow through the
+unrolled E-step (silent mistrain). Audit Tier-2 #5.
+
+**Change (default/bf16/fp32 byte-identical).**
+- vfe3/train.py: train_step gains a keyword-only `scaler`; scale(loss).backward() (per microbatch on
+  grad-accum), unscale_ before grad-clip, scaler.step + scaler.update. train() builds
+  torch.amp.GradScaler(device=device.type, enabled=(amp_dtype=='fp16')) and threads it in. A disabled
+  scaler is a no-op, so the default/bf16/fp32 paths are bitwise-unchanged (no config change).
+- sigma stays fp32: the SPD/matrix_exp islands and decode+CE run under autocast(enabled=False)
+  regardless of amp_dtype; verified by an fp16 forward-finite test (no Cholesky/eigh NaN).
+- Option A: fp16 + m_phi_natural_grad (GaugeNaturalGradAdamW) composes with the scaler (test: gauge
+  frame moves under a scaled step). Both behavioral tests run CPU-real (torch 2.11+cpu wheel;
+  torch.cuda.is_available() is False on this machine despite the RTX 5090 — CPU-only wheel installed).
+- tests/test_fp16_gradscaler.py (4 tests): disabled-scaler byte-identity, fp16-forward sigma-finite,
+  fp16 scaler scales+updates, fp16+gauge frame moves.
+
+**Out of scope.** Scaler state is not yet checkpointed (a resumed fp16 run re-warms the scale factor
+within a few steps -- a transient, not a gradient-correctness defect). bf16 stays the recommended 5090
+path (no scaler).
+
+**Verification.** Full suite 735 passed, 0 failures, 0 errors.
+
+## M6: b0/c0 accept a length-K list (per-coordinate alpha constants)
+
+**Why.** The state-dependent-alpha kernel already accepts `b0`/`c0` as `float | torch.Tensor` and handles `(K,)` tensors, but `VFE3Config` only accepted scalar floats, so per-coordinate alpha constants were unreachable from config.
+
+**Change.**
+- `vfe3/config.py`: `b0`/`c0` annotations widened to `float | List[float]` (using the already-imported `List`). `__post_init__` gains a list branch: validates `len == embed_dim` and all entries `> 0`; scalar branch unchanged.
+- `vfe3/model/block.py`: module-level helper `_as_coeff(v, device)` — passes scalars through unchanged, converts lists to `(K,)` float32 tensors on the given device. Wired at the `e_step` call (site 1, device from `belief.mu.device`).
+- `vfe3/model/model.py`: imports `_as_coeff` from `block`. Wired at three sites: (2) s-model E-step `_refine_s` call (`s_mu.device`); (3) M-step forward self-coupling `self_coupling_alpha` (`out.mu.device`); (4) diagnostics `self_coupling_alpha` (`out.mu.device`).
+
+**Invariant.** A scalar `b0`/`c0` passes through `_as_coeff` unchanged — default path is byte-identical. A list becomes a `(K,)` tensor only at consumption, so `dataclasses.asdict` sees a plain Python list (JSON-serializable; checkpoint round-trips cleanly).
+
+**Tests.** `tests/test_cheap_ledger_wins.py` (new, 5 tests): default scalar; list length mismatch rejected; non-positive entry rejected; list config JSON-serializable; per-coord b0 threads into the model and changes logits vs scalar baseline.
+
+**Verification.** 5/5 new tests pass. Regression: `test_config.py` + `test_model.py` — `72 passed, 0 failures, 0 errors`; `test_alpha_i.py` + `test_learnable_alpha.py` — `18 passed, 0 failures, 0 errors`.
+
+## T3: per-head Press ALiBi slopes + config-reachable alibi_slope
+
+**Why.** `prior_alibi` and `prior_causal_alibi` previously returned `(N,N)` with a single
+pinned `slope=1.0`. Press et al. use a per-head geometric schedule; this makes the alibi
+priors return `(H,N,N)` with the Press schedule and wires a base slope from config.
+The default `attention_prior` is `causal` (unchanged); this only affects the `alibi` and
+`causal_alibi` variants.
+
+**Change.**
+- `vfe3/attention_prior.py`: added module-level `_press_slopes(n_heads, base, device, dtype) -> (H,)`
+  helper. Rewrote `prior_alibi` to accept `n_heads: int = 1` and `alibi_slope: float = 1.0`
+  (replacing `slope`), returning `(H, N_q, N_k)`. Rewrote `prior_causal_alibi` analogously,
+  applying the causal mask uniformly across heads.
+- `vfe3/config.py`: added `alibi_slope: float = 1.0` in the attention block.
+- `vfe3/model/model.py`: `_attention_log_prior` now passes `n_heads=self.cfg.n_heads` and
+  `alibi_slope=self.cfg.alibi_slope` to `attention_log_prior(...)`. Non-alibi priors accept
+  `**kwargs` and ignore extras; default causal path is unchanged and broadcast-identical.
+
+**Existing tests updated.** `tests/test_attention_prior.py` and
+`tests/test_fix_attention_prior_audit.py` pinned the old `slope=` param name and `(N,N)` shape;
+both files updated to use `n_heads=H, alibi_slope=...` and assert `(H,N,N)` shape. The Press
+slope formula (`base * 2^(-8h/H)`) replaces the raw `slope` in expected values.
+
+**Broadcast.** Default group is `block_glk` with `H = len(irrep_dims) = n_heads`. Energy is
+`(B,H,N,N)` on this path; `(H,N,N)` prior broadcasts correctly. Verified by forward-pass with
+`attention_prior='alibi'` and `'causal_alibi'`: both return finite logits of shape `(B,N,V)`.
+
+**New tests.** 4 appended to `tests/test_cheap_ledger_wins.py`: per-head shape and slope
+ordering; causal mask per head; config field default; default-causal forward unchanged.
+
+**Verification.** 4/4 T3 targeted tests pass. Regression (junit):
+`tests=55, failures=0, errors=0` across `test_attention_prior.py`,
+`test_fix_attention_prior_audit.py`, `test_model.py`, `test_free_energy.py`.
+
 ## Audit-doc status sync — `docs/audits/audit-2026-06-07-lifecycle-multiagent.md`
 
 Doc-only (no code change). Marked the verified findings closed since the audit: **V2** (`close_basis`
@@ -259,3 +364,27 @@ wired, `model.py:62-64` + `geometry/closure.py`), **V3**/**V4** (freeze warning 
 Tier-2 #4 **checkpoint resume** (`run_artifacts.py:145,174` + `train(resume_from=...)`). Added a
 Status column + status block; annotated resolved (not deleted) to keep the forensic record. V5 (low,
 doc-only) and V1 (refuted) left open/n/a.
+
+## Cheap ledger wins — T1 per-head kappa
+
+**Why.** Roadmap T1: one global softmax temperature. `cfg.kappa`/`cfg.kappa_gamma` now accept a
+length-`n_heads` `list[float]` (per-head sharpness). Default scalar = byte-identical.
+
+**Change.**
+- `vfe3/config.py`: `kappa`/`kappa_gamma` widened to `float | list[float]`; a list requires an
+  equal-block group (`block_glk`/`tied_block_glk`) and `len == n_heads`.
+- `vfe3/free_energy.py`: `_broadcast_tau(tau, energy_ndim)` reshapes a `(H,)` tau to `(H,1,1)` so it
+  aligns with the head axis of the `(B,H,N,N)` energy; applied at `attention_weights`, `log_partition`,
+  `reduced_free_energy` (`(H,1)` vs `log Z`), and the `free_energy` entropy term. Scalar tau is a no-op.
+- A list kappa is converted to a `(H,)` tensor (`_as_coeff`) at every `attention_tau` call site
+  (`model/block.py`, `model/model.py` x4, `viz/extract.py` x4, `metrics.py`, and the `train.py` banner
+  via `_fmt_tau`). The belief-gradient kernel needs no change (it uses tau only via `attention_weights`).
+
+**Tests.** 6 in `tests/test_cheap_ledger_wins.py` (per-head `(H,)` tau; default scalar bitwise; equal
+list == scalar; per-head list changes logits; single-block group rejects a list; banner `_fmt_tau`).
+
+**Process note.** Per-head kappa was built across two truncated subagent passes; the controller
+completed the un-converted `train.py` banner site, removed an unused `_broadcast_tau` import in
+`gradients/kernels.py`, and added the banner guard test.
+
+**Verification.** Full suite `750 passed, 1 xpassed, 0 failures, 0 errors` (M6+T3+T1 all in).

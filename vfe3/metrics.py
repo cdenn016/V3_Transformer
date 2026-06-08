@@ -804,7 +804,8 @@ def gauge_equivariance_residual(
     is_full = _is_full_cov(sigma, diagonal)
     sigma0 = sigma if is_full else torch.diag_embed(sigma)                    # (N, K, K)
     k = mu.shape[-1]
-    tau = attention_tau(kappa, group.irrep_dims)
+    _kappa = torch.as_tensor(kappa, dtype=torch.float32, device=mu.device) if isinstance(kappa, (list, tuple)) else kappa
+    tau = attention_tau(_kappa, group.irrep_dims)
     off = ~torch.eye(mu.shape[0], dtype=torch.bool, device=mu.device)
     gen = torch.Generator(device=mu.device).manual_seed(int(seed))
 

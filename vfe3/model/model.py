@@ -22,7 +22,7 @@ from vfe3.geometry.norms import get_norm
 from vfe3.geometry.rope import get_pos_rotation
 from vfe3.geometry.transport import RopeTransport
 from vfe3.model.head_mixer import HeadMixer
-from vfe3.model.block import vfe_block
+from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.positional_phi import apply_positional_phi
 from vfe3.model.prior_bank import PriorBank
 from vfe3.model.stack import vfe_stack
@@ -250,7 +250,11 @@ class VFEModel(nn.Module):
         key = (name, n, device, dtype)
         cached = self._log_prior_cache.get(key)
         if cached is None:
-            cached = attention_log_prior(name, n, n, device=device, dtype=dtype)
+            cached = attention_log_prior(
+                name, n, n,
+                device=device, dtype=dtype,
+                n_heads=self.cfg.n_heads, alibi_slope=self.cfg.alibi_slope,
+            )
             self._log_prior_cache[key] = cached
         return cached
 
@@ -342,7 +346,7 @@ class VFEModel(nn.Module):
         s_mu, s_sigma = pb.encode_s(token_ids)                         # (B, N, K)
         r_mu    = pb.r_mu.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
         r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s_sigma)
-        gamma_tau       = attention_tau(cfg.kappa_gamma, grp.irrep_dims)
+        gamma_tau       = attention_tau(_as_coeff(cfg.kappa_gamma, s_mu.device), grp.irrep_dims)
         gamma_log_prior = self._attention_log_prior(
             token_ids.shape[1], token_ids.device, prior=cfg.gamma_attention_prior,
         )
@@ -351,7 +355,7 @@ class VFEModel(nn.Module):
             n_iter=cfg.n_e_steps,         tau=gamma_tau,
             e_mu_lr=cfg.e_s_mu_lr,        e_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
             alpha_div=cfg.alpha_div,       value=cfg.lambda_h,          alpha_mode="constant",
-            b0=cfg.b0,                     c0=cfg.c0,
+            b0=_as_coeff(cfg.b0, s_mu.device), c0=_as_coeff(cfg.c0, s_mu.device),
             lambda_beta=cfg.gamma_coupling,
             kl_max=cfg.kl_max,             eps=cfg.eps,
             sigma_max=cfg.sigma_max,       e_sigma_q_trust=cfg.e_sigma_q_trust,
@@ -526,7 +530,7 @@ class VFEModel(nn.Module):
                 divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
             )
             alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
-                self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+                self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
                 log_alpha=getattr(self, "log_alpha", None),
             )
             coupling = alpha_sc.detach() * self_div            # alpha_i^(k)* D^(k) (envelope: alpha* fixed)
@@ -609,7 +613,7 @@ class VFEModel(nn.Module):
             # sqrt(d_head)=sqrt(K/n_heads), which is correct only for block_glk (irrep_dims=[d_head]*H)
             # and understates tau by sqrt(n_heads) on a single-block group (irrep_dims=[K], energy over
             # the full K). kappa_gamma is gamma's own sharpness handle (not cfg.kappa).
-            gamma_tau = attention_tau(cfg.kappa_gamma, self.group.irrep_dims)
+            gamma_tau = attention_tau(_as_coeff(cfg.kappa_gamma, e_s.device), self.group.irrep_dims)
             f_red_s = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior)   # (B,H,N) or (B,N)
             loss = loss + cfg.gamma_coupling * f_red_s.mean()
         return logits, loss, ce.detach()
@@ -760,21 +764,21 @@ class VFEModel(nn.Module):
             divergence_family=cfg.divergence_family,
             irrep_dims=self.group.irrep_dims,
         )
-        beta = attention_weights(energy, tau=attention_tau(cfg.kappa, self.group.irrep_dims), log_prior=log_prior)
+        beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), self.group.irrep_dims), log_prior=log_prior)
         self_div = self_divergence_for_alpha(                        # (N,) or (N, K) per-coord
             fam(out.mu, out.sigma), fam(mu_p, sigma_p),
             alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
         )
         alpha, alpha_reg = self_coupling_alpha(
-            self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+            self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
             log_alpha=getattr(self, "log_alpha", None),     # learned scalar (None on the pure path)
         )
 
         d = {"attn_entropy": float(metrics.attention_entropy(beta))}
         _lb = cfg.lambda_beta if _llb is None else float(_llb.detach().exp())   # scaled-F total reflects lambda_beta
         terms = metrics.free_energy_terms(self_div, energy, beta, alpha,
-                                          tau=attention_tau(cfg.kappa, self.group.irrep_dims),
+                                          tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), self.group.irrep_dims),
                                           lambda_beta=_lb, log_prior=log_prior,
                                           include_attention_entropy=cfg.include_attention_entropy,
                                           alpha_reg=(alpha_reg if cfg.alpha_mode != "constant" else None))
@@ -863,7 +867,7 @@ class VFEModel(nn.Module):
                 alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
-            beta = attention_weights(energy, tau=attention_tau(cfg.kappa, self.group.irrep_dims), log_prior=log_prior)
+            beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, belief.mu.device), self.group.irrep_dims), log_prior=log_prior)
             if beta.dim() == 2:                                      # single-block group -> add an H=1 axis
                 beta = beta.unsqueeze(0)
             maps.append(beta)                                        # (H, N, N)

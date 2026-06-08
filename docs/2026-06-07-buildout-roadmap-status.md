@@ -70,12 +70,12 @@ theory-fidelity findings (Tn), and Tier-D items.
 | PL19-USU | U(K)/SU(K) groups | MISSING | needs an anti-Hermitian/complex basis; low value |
 | PL19-alpha-bayesian | Fully-Bayesian alpha (Gamma posterior) | MISSING | only Gamma-MAP forms; threading a 2-param posterior through F is large, low value |
 | M5 | Norm registry `(mu,sigma)` contract | MISSING | `norms.py:69-72` mean-only; blocks SPD/whitening norms |
-| M6 | `b0`/`c0` accept `float\|Sequence[float]` | MISSING (config leg) | kernel already `(K,)`-capable `alpha_i.py:121`; only config types them scalar |
+| M6 | `b0`/`c0` accept `float\|Sequence[float]` | ADDRESSED (2026-06-08) | `cfg.b0`/`cfg.c0` accept `float\|list[float]` (len `K`, validated); converted to a `(K,)` tensor via `_as_coeff` at every consumption site (block/model/viz); `list[float]` is json-serializable. Test `test_cheap_ledger_wins.py` |
 | M7 | Decode registry blind to `alpha_div` | MISSING | `prior_bank.py` hardcodes alpha=1 KL readout |
 | M8 | `transport_covariance` cov_action seam | MISSING (Phase-5) | single hardcoded sandwich `transport.py:412` |
-| T1 | Per-head `kappa_a` scalar | MISSING | one global `tau` `free_energy.py:19` |
+| T1 | Per-head `kappa_a` scalar | ADDRESSED (2026-06-08) | `cfg.kappa`/`cfg.kappa_gamma` accept `float\|list[float]` (len `n_heads`, block_glk only); `free_energy._broadcast_tau` reshapes the `(H,)` tau to `(H,1,1)` at the softmax sites; list converted at every `attention_tau` site. Default scalar byte-identical. Test `test_cheap_ledger_wins.py` |
 | T2 | `kappa` learnable | PARTIAL (doc) | fixed scalar, faithful to Alg 1; rationale undocumented |
-| T3 | ALiBi per-head slope schedule | MISSING | single global slope 1.0, no head axis `attention_prior.py:68` |
+| T3 | ALiBi per-head slope schedule | ADDRESSED (2026-06-08) | `prior_alibi`/`prior_causal_alibi` return `(H,N,N)` with the Press geometric slope `2^(-8(h+1)/H)`; config `alibi_slope`; `_attention_log_prior` passes `n_heads`. Default `causal` unaffected. Test `test_cheap_ledger_wins.py` |
 | TierD-sandwich | Diagonal-sandwich config/call warn | PARTIAL | docstring only; no config warn |
 | TierD-kappa | `kappa_max` condition-number cap | MISSING | monitor-only; `[eps,sigma_max]` clamp bounds it incidentally |
 | TierD-expM | exp(M) clamp activation monitor | MISSING (by choice) | hot-path host-sync deliberately avoided; cannot fire on default path |

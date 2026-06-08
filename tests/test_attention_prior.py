@@ -16,11 +16,15 @@ def test_causal_masks_future_keys():
 
 
 def test_alibi_is_linear_in_distance():
-    B = attention_log_prior("alibi", 4, 4, slope=0.5)
-    # B_ij = -slope * |i - j|
-    for i in range(4):
-        for j in range(4):
-            assert torch.isclose(B[i, j], torch.tensor(-0.5 * abs(i - j)), atol=1e-6)
+    # n_heads=1 -> (1, N, N); Press slope for h=1, H=1: 2^(-8) * alibi_slope
+    H, N = 1, 4
+    B = attention_log_prior("alibi", N, N, n_heads=H, alibi_slope=1.0)
+    assert B.shape == (H, N, N)
+    import math
+    slope = 1.0 * (2.0 ** (-8.0 * 1 / 1))          # _press_slopes(1, 1.0)[0]
+    for i in range(N):
+        for j in range(N):
+            assert torch.isclose(B[0, i, j], torch.tensor(-slope * abs(i - j)), atol=1e-6)
 
 
 def test_new_prior_with_novel_kwarg_reachable_without_editing_dispatcher():

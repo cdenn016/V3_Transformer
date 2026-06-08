@@ -17,6 +17,7 @@ from vfe3 import metrics
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
 from vfe3.families.base import get_family
+from vfe3.model.block import _as_coeff       # list b0/c0 -> (K,) tensor (M6), mirroring vfe_block
 from vfe3.free_energy import (
     attention_tau,
     attention_weights,
@@ -52,9 +53,11 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
     r"""The full ``e_step_iteration`` knob bag assembled from the model config (mirrors vfe_block)."""
     cfg = model.cfg
     return dict(
-        tau=attention_tau(cfg.kappa, model.group.irrep_dims),
+        tau=attention_tau(_as_coeff(cfg.kappa, model.prior_bank.mu_embed.device), model.group.irrep_dims),
         e_mu_lr=cfg.e_mu_lr, e_sigma_lr=cfg.e_sigma_lr, e_phi_lr=cfg.e_phi_lr,
-        alpha_div=cfg.alpha_div, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+        alpha_div=cfg.alpha_div, value=cfg.alpha,
+        b0=_as_coeff(cfg.b0, model.prior_bank.mu_embed.device),
+        c0=_as_coeff(cfg.c0, model.prior_bank.mu_embed.device),
         lambda_beta=_lambda_beta(model), kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
         e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
@@ -72,8 +75,10 @@ def _fe_kwargs(model, log_prior: torch.Tensor) -> dict:
     r"""The ``free_energy_value`` knob subset (it rejects the iteration-only step-size knobs)."""
     cfg = model.cfg
     return dict(
-        tau=attention_tau(cfg.kappa, model.group.irrep_dims),
-        alpha_div=cfg.alpha_div, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+        tau=attention_tau(_as_coeff(cfg.kappa, model.prior_bank.mu_embed.device), model.group.irrep_dims),
+        alpha_div=cfg.alpha_div, value=cfg.alpha,
+        b0=_as_coeff(cfg.b0, model.prior_bank.mu_embed.device),
+        c0=_as_coeff(cfg.c0, model.prior_bank.mu_embed.device),
         lambda_beta=_lambda_beta(model), kl_max=cfg.kl_max, eps=cfg.eps,
         include_attention_entropy=cfg.include_attention_entropy, family=cfg.family,
         divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
@@ -298,7 +303,7 @@ def numerical_health(
     energy = pairwise_energy(fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.alpha_div,
                              kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
                              irrep_dims=model.group.irrep_dims)
-    beta = attention_weights(energy, tau=attention_tau(cfg.kappa, model.group.irrep_dims), log_prior=log_prior)
+    beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), model.group.irrep_dims), log_prior=log_prior)
     spec = out.sigma if out.sigma.dim() == out.mu.dim() else condition_number(out.sigma)
     cond = float(condition_number(out.sigma).max()) if out.sigma.dim() > out.mu.dim() else \
         float((spec.amax(dim=-1) / spec.amin(dim=-1).clamp(min=1e-12)).max())
@@ -368,7 +373,7 @@ def converged_state(
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
             irrep_dims=model.group.irrep_dims,
         )
-        beta = attention_weights(energy, tau=attention_tau(cfg.kappa, model.group.irrep_dims), log_prior=log_prior)
+        beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), model.group.irrep_dims), log_prior=log_prior)
         self_div = self_divergence_for_alpha(
             fam(out.mu, out.sigma), fam(mu_p, sigma_p), alpha=cfg.alpha_div,
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,

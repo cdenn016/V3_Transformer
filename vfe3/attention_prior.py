@@ -16,6 +16,18 @@ from typing import Callable, Dict, Optional, Sequence
 
 import torch
 
+
+def _press_slopes(
+    n_heads: int,
+    base:    float,
+    device,
+    dtype:   torch.dtype,
+) -> torch.Tensor:                          # (H,)
+    r"""Press et al. geometric per-head ALiBi slopes: slope_h = base * 2^(-8*h / n_heads)."""
+    h = torch.arange(1, n_heads + 1, device=device, dtype=dtype)
+    return base * torch.pow(2.0, -8.0 * h / n_heads)
+
+
 _PRIORS: Dict[str, Callable] = {}
 
 
@@ -68,47 +80,58 @@ def prior_causal(
 
 @register_prior("alibi")
 def prior_alibi(
-    n_query: int,
-    n_key:   int,
+    n_query:     int,
+    n_key:       int,
 
     *,
-    slope:   float                        = 1.0,
-    device:  'torch.device | str | None'  = None,
-    dtype:   torch.dtype                   = torch.float32,
+    n_heads:     int                          = 1,
+    alibi_slope: float                        = 1.0,
+    device:      'torch.device | str | None'  = None,
+    dtype:       torch.dtype                  = torch.float32,
     **kwargs,
 ) -> torch.Tensor:
-    r"""ALiBi prior: B_ij = -slope * |i - j| (linear distance bias)."""
-    i = torch.arange(n_query, device=device).unsqueeze(-1)
-    j = torch.arange(n_key, device=device).unsqueeze(0)
-    return (-slope * (i - j).abs()).to(dtype)
+    r"""ALiBi prior with per-head Press et al. slopes: B_hij = -slope_h * |i - j|.
+
+    Returns shape ``(H, N_q, N_k)`` where ``H = n_heads`` and
+    ``slope_h = alibi_slope * 2^(-8*h / n_heads)`` (h = 1..H).
+    """
+    i      = torch.arange(n_query, device=device).unsqueeze(-1)
+    j      = torch.arange(n_key,   device=device).unsqueeze(0)
+    dist   = (i - j).abs().to(dtype)                                # (N_q, N_k)
+    slopes = _press_slopes(n_heads, alibi_slope, device, dtype)     # (H,)
+    return (-slopes.view(n_heads, 1, 1) * dist)                     # (H, N_q, N_k)
 
 
 @register_prior("causal_alibi")
 def prior_causal_alibi(
-    n_query: int,
-    n_key:   int,
+    n_query:     int,
+    n_key:       int,
 
     *,
-    slope:   float                        = 1.0,
-    device:  'torch.device | str | None'  = None,
-    dtype:   torch.dtype                   = torch.float32,
+    n_heads:     int                          = 1,
+    alibi_slope: float                        = 1.0,
+    device:      'torch.device | str | None'  = None,
+    dtype:       torch.dtype                  = torch.float32,
     **kwargs,
 ) -> torch.Tensor:
-    r"""Causal + ALiBi prior (Press et al. 2022 faithful, autoregressive form).
+    r"""Causal + ALiBi prior (Press et al. 2022 faithful, autoregressive form), per head.
 
-    The linear distance bias rides on top of the causal mask:
-        B_ij = -slope * (i - j)   for j <= i   (allowed lower triangle),
-        B_ij = -inf               for j >  i   (causal mask, identical to `causal`).
-    On the causal triangle ``i - j >= 0``, so ``-slope*(i - j) == -slope*|i - j|``:
-    the bias magnitude matches ALiBi's on the allowed keys, while ``-inf`` above the
-    diagonal forbids attending to future keys. Distinct from the ``alibi`` prior,
-    which is the bidirectional/symmetric ``-slope*|i - j|`` with no causal mask.
+    Returns shape ``(H, N_q, N_k)`` where ``H = n_heads``.  Each head h has slope
+    ``alibi_slope * 2^(-8*h / n_heads)``; the causal mask is applied uniformly across heads:
+
+        B_hij = -slope_h * |i - j|   for j <= i   (allowed lower triangle),
+        B_hij = -inf                  for j >  i   (causal mask).
+
+    On the causal triangle ``i - j >= 0`` so ``|i - j| == i - j``, matching the
+    directed ``-slope*(i-j)`` convention of the original ``causal_alibi`` prior.
     """
-    i = torch.arange(n_query, device=device).unsqueeze(-1)
-    j = torch.arange(n_key, device=device).unsqueeze(0)
-    allowed = j <= i
-    B = (-slope * (i - j)).to(dtype)
-    return B.masked_fill(~allowed, float("-inf"))
+    i       = torch.arange(n_query, device=device).unsqueeze(-1)
+    j       = torch.arange(n_key,   device=device).unsqueeze(0)
+    dist    = (i - j).abs().to(dtype)                               # (N_q, N_k)
+    slopes  = _press_slopes(n_heads, alibi_slope, device, dtype)    # (H,)
+    B       = (-slopes.view(n_heads, 1, 1) * dist)                  # (H, N_q, N_k)
+    allowed = (j <= i)                                              # (N_q, N_k)
+    return B.masked_fill(~allowed.unsqueeze(0), float("-inf"))      # (H, N_q, N_k)
 
 
 @register_prior("windowed")
