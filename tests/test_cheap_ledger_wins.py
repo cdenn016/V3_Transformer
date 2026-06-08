@@ -50,3 +50,15 @@ def test_b0_list_threads_per_coord_alpha_into_the_model():
     lg_base, lg_perc = base(tok), perc(tok)
     assert torch.isfinite(lg_perc).all()
     assert not torch.allclose(lg_base, lg_perc)
+
+
+def test_b0_list_through_viz_extract_trajectory():
+    # viz/extract.py is a parallel b0/c0 consumption surface; a list b0 must not crash it (M6
+    # completeness -- the extractor mirrors vfe_block and must also convert the list to a (K,) tensor).
+    from vfe3.viz.extract import e_step_belief_trace
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(alpha_mode="state_dependent_per_coord",
+                           b0=[0.2, 0.5, 2.0, 5.0], n_e_steps=2))
+    tok = torch.randint(0, m.cfg.vocab_size, (1, 4))
+    tr = e_step_belief_trace(m, tok, n_iter=2)
+    assert torch.isfinite(tr["free_energy"]).all()
