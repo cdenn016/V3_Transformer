@@ -60,7 +60,7 @@ from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
-from vfe3.train import evaluate, train
+from vfe3.train import coverage_lines, evaluate, train
 
 # Only the zero-dependency synthetic stream is borrowed from train_vfe3 (the corpus-cache
 # fallback); the baseline operating point is self-contained below.
@@ -87,8 +87,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     max_seq_len                = 128,                         # N, context length
     
-    batch_size                 = 64,
-    max_steps                  = 15000,
+    batch_size                 = 128,
+    max_steps                  = 3750,
     
     n_layers                   = 1,                           # L, number of blocks
     n_e_steps                  = 1,                           # T, E-step inner iterations
@@ -104,6 +104,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     cross_couplings            = None,                        # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only
     
     use_head_mixer             = True,                        # Schur-commutant head mixer (needs >=2 equal blocks)
+
+    decode_bias                = False,
 
     # positional encoding
     pos_phi                    = "learned",                   # "none" (pure path) | "learned" | "frozen"
@@ -143,13 +145,15 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     e_sigma_lr                 = 0.025,
     e_phi_lr                   = 0.0,
    
+    
+    e_mu_q_trust              = None,
     e_sigma_q_trust            = 5.0,
     sigma_max                  = 15.0,
     
     gradient_mode              = "filtering",                 # "filtering" | "smoothing"
     
     m_phi_natural_grad        = False,
-    phi_precond_mode          = "killing_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
+    phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
 
     phi_retract_mode           = "bch",                       # "euclidean" | "bch"
     
@@ -180,12 +184,12 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     m_phi_lr                   = 0.015,
     
     weight_decay               = 0.05,
+    phi_weight_decay           = 0.065,
    
-   
-    warmup_steps               = 100,
+    warmup_steps               = 1,
     seed                       = 6,                           # overridden per run by CONFIG["seed"]
     min_lr                     = 0,
-    
+    min_lr_frac                = 0.01,   
     
     log_interval               = 1000,
     eval_interval              = 15000,
@@ -210,8 +214,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 #   description : str                       one-line human summary (printed + plotted)
 #   single-field form:
 #     param         : str                   the VFE3Config field to vary
-#     values        : [v1, v2, ...]   OR    range : [start, stop, step]
-#     baseline_value: Any                   the train_vfe3 value (for reference only)
+#     values        : [v1, v2, ...]   OR    
+#     range : [start, stop, step]
+#     
+#   baseline_value: Any                   the train_vfe3 value (for reference only)
 #   multi-arm form:
 #     configs       : [{label: str, <field>: <value>, ...}, ...]
 #   optional, both forms:
@@ -244,25 +250,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "n_layers": {
         "description": "number of stacked blocks L",
-        "param": "n_layers", "values": [1, 2, 3],
+        "param": "n_layers", "values": [1, 2, 3, 5],
     },
     "n_e_steps": {
         "description": "E-step inner iterations T per block",
-        "param": "n_e_steps", "values": [1, 2, 4],
+        "param": "n_e_steps", "values": [1, 2, 3, 5],
     },
     
 
-    # === divergence / numerics =============================================
     
-    "kl_max": {
-        "description": "per-pair KL clamp",
-        "param": "kl_max", "values": [50.0, 100.0, 200.0],
-    },
-    "eps": {
-        "description": "numerical floor (variance / log stability)",
-        "param": "eps", "values": [1e-7, 1e-6, 1e-5],
-    },
-
     
     
     # === gauge seam ========================================================
@@ -357,39 +353,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
     # === free-energy coupling ==============================================
-    "alpha": {
-        "description": "constant self-coupling value (alpha_mode=constant)",
-        "param": "alpha", "values": [0.5, 1.0, 2.0], "requires": {"alpha_mode": "constant"},
-    },
+    
+    
     "alpha_mode": {  # 'learnable' is the NN-exception scalar log_alpha (now optimizer-grouped)
         "description": "self-coupling alpha form",
         "param": "alpha_mode",
         "values": ["constant", "state_dependent", "state_dependent_per_coord", "learnable"],
-    },
-    "b0": {
-        "description": "state-dependent alpha shape b0 (alpha* = c0/(b0 + D))",
-        "param": "b0", "values": [0.1, 10.0, 2.0], "requires": {"alpha_mode": "state_dependent"},
-    },
-    "c0": {
-        "description": "state-dependent alpha shape c0 (numerator)",
-        "param": "c0", "values": [0.5, 1.0, 2.0], "requires": {"alpha_mode": "state_dependent"},
-    },
-    
-    
-    
-    "lambda_h": {
-        "description": "hyper-prior weight lambda_h * mean_i KL(s_i||r) (>0 creates s/r tables)",
-        "param": "lambda_h", "values": [0.0, 0.1, 1.0],
-    },
-    
-    "gamma_coupling": {
-        "description": "model-channel coupling weight (>0 creates s tables)",
-        "param": "gamma_coupling", "values": [0.0, 0.1, 1.0],
-    },
-    
-    "kappa_gamma": {
-        "description": "model-channel temperature tau_gamma = kappa_gamma * sqrt(d_head)",
-        "param": "kappa_gamma", "values": [0.5, 1.0, 2.0], "requires": {"gamma_coupling": 1.0},
     },
     
     "gamma_attention_prior": {
@@ -429,15 +398,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
-    "phi_retract_mode": {
-        "description": "phi Lie-algebra step chart",
-        "param": "phi_retract_mode", "values": ["euclidean", "bch"],
-    },
     
-    "spd_retract_mode": {  # log_euclidean warns (not errors) on a diagonal family
-        "description": "SPD covariance retraction geometry",
-        "param": "spd_retract_mode", "values": ["spd_affine", "log_euclidean"],
-    },
+    
 
     
     
@@ -445,19 +407,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "KL-to-prior decode temperature",
         "param": "decode_tau", "values": [0.5, 1.0, 2.0], "requires": {"use_prior_bank": True},
     },
-    # Only the two diagonal KL-decode variants are swept. The full-cov KL readout (decode_mode=
-    # 'full') is no longer the blocker -- its Cholesky was hardened with safe_cholesky -- but on the
-    # prior-bank path it drives the full-covariance SPD retraction (retraction.py retract_spd_full)
-    # into an eigh that fails to converge on the ill-conditioned spectrum; a gap-regularized robust
-    # eigh there is explicitly deferred in the codebase, so the 'full' arm stays excluded (see
-    # NON_SWEPT_FIELDS). Full-covariance TRAINING is still exercised by the `covariance` sweep.
-    "decode_mode": {
-        "description": "KL decode covariance structure (diagonal vs chunked, on the pure bank)",
-        "configs": [
-            {"label": "diagonal",         "use_prior_bank": True, "decode_mode": "diagonal"},
-            {"label": "diagonal_chunked", "use_prior_bank": True, "decode_mode": "diagonal_chunked"},
-        ],
-    },
+    
    
     
 
@@ -466,17 +416,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
          "description": "E-step SPD retraction trust radius",
          "param": "e_sigma_q_trust", "values": [1.0, 5.0, 10.0],
      },
-     "sigma_max": {
-         "description": "upper bound on belief variance",
-         "param": "sigma_max", "values": [2.0, 5.0, 10.0],
-     },
+    
 
 
-    "pos_phi_compose": {
-        "description": "BCH composition chart",
-        "param": "pos_phi_compose", "values": ["bch", "euclidean"],
-        "requires": {"pos_phi": "learned"},
-    },
+    
     
     "bch_pe_order": {
         "description": "BCH Dynkin truncation order",
@@ -486,20 +429,45 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "pos_phi_scale": {
         "description": "learned pos_phi table init scale",
-        "param": "pos_phi_scale", "values": [0.01, 0.03, 0.05],
+        "param": "pos_phi_scale", "range": [0.00, 0.1, 0.025],
         "requires": {"pos_phi": "learned"},
     },    
 
 
-    # === M-step / training =================================================
+    # === training =================================================
    
-    
-    
-    "detach_e_step": {
-        "description": "detach the whole E-step (no E-step gradient)",
-        "param": "detach_e_step", "values": [False, True],
+    "b0": {
+        "description": "state-dependent alpha shape b0 (alpha* = c0/(b0 + D))",
+        "param": "b0", "values": [0.1, 1, 5.0], "requires": {"alpha_mode": "state_dependent"},
+    },
+    "c0": {
+        "description": "state-dependent alpha shape c0 (numerator)",
+        "param": "c0", "values": [0.1, 1.0, 5.0], "requires": {"alpha_mode": "state_dependent"},
     },
     
+    
+    "alpha": {
+        "description": "constant self-coupling value (alpha_mode=constant)",
+        "param": "alpha", "range": [0.0, 1.0, 0.2], "requires": {"alpha_mode": "constant"},
+    },
+    
+    
+    "lambda_h": {
+        "description": "hyper-prior weight lambda_h * mean_i KL(s_i||r) (>0 creates s/r tables)",
+        "param": "lambda_h", "range": [0.0, 1, 0.25],
+    },
+    
+    "gamma_coupling": {
+        "description": "model-channel coupling weight (>0 creates s tables)",
+        "param": "gamma_coupling", "range": [0.0, 1, 0.25],
+    },
+    
+    "kappa_gamma": {
+        "description": "model-channel temperature tau_gamma = kappa_gamma * sqrt(d_head)",
+        "param": "kappa_gamma", "range": [0.2, 1.0, 0.2], "requires": {"gamma_coupling": 1.0},
+    },
+    
+   
     
     
     
@@ -512,7 +480,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
         # spuriously ~2.5x faster AND worse). No-op at alpha_div == 1 (the kernel ignores the toggle).
         "description": "Renyi divergence order (1.0 -> KL; != 1 routes the non-kernel oracle)",
-        "param": "alpha_div", "values": [0.25, 0.5, 0.75, 1], "requires": {"oracle_unroll_grad": True},
+        "param": "alpha_div", "range": [0.2, 1, 0.2], "requires": {"oracle_unroll_grad": True},
     },
     
     
@@ -521,7 +489,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
    "e_mu_lr": {
        "description": "E-step natural-gradient step size for mu_q",
-       "param": "e_mu_lr", "values": [0.5, 0.7, 0.9, 1.1],
+       "param": "e_mu_lr", "range": [0, 1, 0.2],
    },
    
    "e_sigma_lr": {
@@ -540,56 +508,55 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "range": [0.014, 0.015, 0.0001],
+        "param": "m_mu_lr", "range": [0.013, 0.014, 0.00025],
     },
     
     "m_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_sigma_lr", "range": [0.00325, 0.00525, 0.00025],
+        "param": "m_sigma_lr", "values": [0.0001, 0.0005, 0.001, 0.01],
     },
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "range": [0.0125, 0.01375, 0.00025],
+        "param": "m_phi_lr", "values": [0.001, 0.005, 0.01, 0.015, 0.02, 0.05,  0.1],
     },
+    
+    
     
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "values": [0.01, 0.05, 0.06, 0.07, 0.08, 0.1],
+        "param": "weight_decay", "range": [0.00, 0.08, 0.02],
     },
     
     
     "mstep_self_coupling_weight": {
         "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
-        "param": "mstep_self_coupling_weight", "range": [0.02, 0.08, 0.02],
+        "param": "mstep_self_coupling_weight", "range": [0.00, 0.08, 0.02],
     },
     
     
     
     "kappa": {
         "description": "attention temperature tau = kappa * sqrt(d_head)",
-        "param": "kappa", "values": [1.2, 1.3, 1.4, 1.6, 1.7],
+        "param": "kappa", "range": [0.1, 1.6, 0.25],
     },
     
     "lambda_beta": {
         "description": "belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)",
-        "param": "lambda_beta", "values": [0.25, 0.5, 1.0, 2.0, 4.0],
+        "param": "lambda_beta", "range": [0, 2, 0.5],
     },
     
-    "learnable_lambda_beta": {  # 'learnable' is the NN-exception scalar log_lambda_beta (optimizer-grouped)
-        "description": "constant lambda_beta vs learned (exp(log_lambda_beta), trained on CE)",
-        "configs": [
-            {"label": "learnable",  "learnable_lambda_beta": True},
-            {"label": "constant", "learnable_lambda_beta": False},
-        ],
-    },
+    
     
     "mass_phi": {
         "description": "gauge prior weight (mass_phi / 2) ||phi||^2",
         "param": "mass_phi", "values": [0.0, 1e-5, 1e-4, 5e-4, 5e-3, 1e-2],
     },
     
-    
+    "phi_weight_decay":{
+        "description": "weight decay on phi",
+        "param": "phi_weight_decay", "values": [0.0, 1e-5, 1e-4, 1e-3, 1e-2, 0.1],
+    },
 }
 
 
@@ -616,14 +583,26 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
 
+    "phi_weight_decay",    
+
+  #  "m_phi_lr",
+    "m_mu_lr",
+   # "m_sigma_lr",
+    
+    "weight_decay",
+    
+    "e_mu_lr",
+    "lambda_beta",
+    
+
     #"c0",
     #"b0",
    
   # "alpha_div",
     
-   #  "weight_decay",
+   #  
 
- #  "lambda_beta",
+ #  
   #  "kappa",
     
   #  "e_sigma_lr",
@@ -634,17 +613,13 @@ SWEEP_ORDER: List[str] = [
     
   #  "mass_phi",
     
-    "mstep_self_coupling_weight",
+    #"mstep_self_coupling_weight",
     
-    "m_phi_lr",
-    "m_mu_lr",
-    "m_sigma_lr",
     
-    "e_mu_lr",
     
-    "e_sigma_q_trust",
+    #"e_sigma_q_trust",
     
-    "pos_phi_compose", 
+    #"pos_phi_compose", 
     
     
     
@@ -913,6 +888,8 @@ def run_single(
 
     print(f"    K={cfg.embed_dim} heads={cfg.n_heads} group={cfg.gauge_group} "
           f"family={cfg.family} | steps={cfg.max_steps} batch={cfg.batch_size} | {n_params:,} params")
+    for _cov in coverage_lines(train_loader, cfg.max_steps, dataset):
+        print(f"   {_cov}")
 
     losses = train(
         model, train_loader, cfg,

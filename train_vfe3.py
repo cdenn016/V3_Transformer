@@ -81,6 +81,8 @@ config = dict(
     use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks: block_glk/tied_block_glk);
                                                      # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
 
+    decode_bias               = False,
+
     # connection regime (orthogonal to gauge_parameterization)
     transport_mode            = "flat",              # "flat" (Regime-I phi-cocycle, pure no-NN) | "regime_ii"
                                                      # (learned bilinear edge connection; sanctioned NN exception, default-off)
@@ -135,6 +137,7 @@ config = dict(
     e_sigma_lr                = 0.025,
     e_phi_lr                  = 0.0,
     
+    e_mu_q_trust              = None,
     e_sigma_q_trust           = 5.0,
     sigma_max                 = 10.0,
     
@@ -142,7 +145,7 @@ config = dict(
     
     m_phi_natural_grad        = False,
     
-    phi_precond_mode          = "pullback",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
+    phi_precond_mode          = "pullback_per_block",         # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
@@ -167,12 +170,12 @@ config = dict(
     detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
     grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
 
-    m_mu_lr                   = 0.01475,  #0.01475
-    m_sigma_lr                = 0.005,  #0.005
-    m_phi_lr                  = 0.01375,   #0.013
+    m_mu_lr                   = 0.0140,   
+    m_sigma_lr                = 0.00425,     
+    m_phi_lr                  = 0.0135,   
     
     weight_decay              = 0.065,
-    
+    phi_weight_decay          = 0.00,
     
     # divergence seam -- the f-divergence FUNCTIONAL (distinct from `family` below)
     divergence_family         = "renyi",             # "renyi"
@@ -211,9 +214,13 @@ def synthetic_period3_loader(period=3, n=600, seq_len=8, batch_size=8, seed=0) -
     return DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True, generator=g)
 
 
-def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int) -> str:
+def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
+            train_loader=None, full_corpus_tokens: 'int | None' = None) -> str:
+    from vfe3.train import coverage_lines
     n_params = sum(p.numel() for p in model.parameters())
     bar = "=" * 64
+    cov = (coverage_lines(train_loader, n_steps, dataset, full_corpus_tokens=full_corpus_tokens)
+           if train_loader is not None else [])
     return "\n".join([
         bar,
         f" Gauge VFE Transformer | {n_params} params | {device}",
@@ -221,6 +228,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int) -> 
         f" K={cfg.embed_dim}  N={cfg.max_seq_len}  L={cfg.n_layers}  heads={cfg.n_heads}  "
         f"group={cfg.gauge_group}  family={cfg.family}",
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
+        *cov,
         f" M-LRs: mu={cfg.m_mu_lr}  sigma={cfg.m_sigma_lr}  phi={cfg.m_phi_lr}",
         f" VFE: alpha={cfg.alpha}  kappa={cfg.kappa}  "
         f"tau={attention_tau(cfg.kappa, model.group.irrep_dims):.4f}  mass_phi={cfg.mass_phi}",
@@ -350,7 +358,17 @@ def main() -> None:
                                  timestamp=datetime.now().isoformat(timespec="seconds"))
         logger.info("Saving run artifacts to %s", run_dir)
 
-    logger.info(_banner(model, cfg, DATASET, DEVICE, cfg.max_steps))
+    # Full uncapped corpus size for the "stream is X% of full" banner line -- only computed when
+    # MAX_TOKENS actually caps the train stream (the default None loads the whole corpus, so no cap line).
+    full_corpus_tokens = None
+    if MAX_TOKENS is not None and DATASET != "synthetic-period3":
+        from vfe3.data.datasets import load_cached_tokens
+        try:
+            full_corpus_tokens = int(load_cached_tokens(DATASET, "train").numel())
+        except FileNotFoundError:
+            full_corpus_tokens = None
+    logger.info(_banner(model, cfg, DATASET, DEVICE, cfg.max_steps,
+                        train_loader=train_loader, full_corpus_tokens=full_corpus_tokens))
     t0 = time.perf_counter()
     losses = train(
         model, train_loader, cfg,

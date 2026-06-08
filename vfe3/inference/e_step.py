@@ -21,6 +21,7 @@ from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, re
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
 from vfe3.geometry.retraction import get_retraction, natural_gradient, retract_phi
+from vfe3.numerics import apply_mu_trust_region
 from vfe3.geometry.transport import (
     FactoredTransport,
     RopeTransport,
@@ -152,6 +153,8 @@ def free_energy_value(
     eps:                       float = 1e-6,
     sigma_max:                 float = 5.0,            # accepted-and-ignored iteration-only knob
     e_sigma_q_trust:           float = 5.0,            # accepted-and-ignored iteration-only knob
+    e_mu_q_trust:              Optional[float] = None, # accepted-and-ignored iteration-only knob
+    mu_trust_mode:             str  = "box",           # accepted-and-ignored iteration-only knob
 
     include_attention_entropy: bool = True,
     family:                    str  = "gaussian_diagonal",
@@ -299,6 +302,8 @@ def e_step_iteration(
     eps:                       float = 1e-6,
     sigma_max:                 float = 5.0,
     e_sigma_q_trust:           float = 5.0,
+    e_mu_q_trust:              Optional[float] = None,   # mean trust radius (sigma units); None = unbounded
+    mu_trust_mode:             str  = "box",             # "box" | "ball" (only when e_mu_q_trust is not None)
     mass_phi:                  float = 0.0,
 
     include_attention_entropy: bool = True,
@@ -370,7 +375,17 @@ def e_step_iteration(
     if e_step_gradient == "straight_through":
         nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
 
-    mu = belief.mu - e_mu_lr * nat_mu
+    delta_mu = e_mu_lr * nat_mu
+    # E-step MEAN trust region (VFE_2.0 parity, default OFF). When e_mu_q_trust is set, bound the
+    # per-iteration mean step in sigma-whitened units before the additive update; None reproduces the
+    # bare mu = belief.mu - e_mu_lr*nat_mu bit-for-bit. is_diagonal mirrors the SPD-retraction rank
+    # rule below (full cov iff sigma.dim() == mu.dim() + 1).
+    if e_mu_q_trust is not None:
+        delta_mu = apply_mu_trust_region(
+            delta_mu, belief.sigma, trust=e_mu_q_trust, mode=mu_trust_mode,
+            is_diagonal=(belief.sigma.dim() == belief.mu.dim()), eps=eps,
+        )
+    mu = belief.mu - delta_mu
     # The registered SPD retraction owns the diagonal-vs-full rank decision internally (full cov iff
     # sigma.dim() == mu.dim() + 1); the E-step no longer branches on rank to select the retraction.
     sigma = get_retraction(spd_retract_mode)(
