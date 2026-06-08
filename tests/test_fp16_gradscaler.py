@@ -55,3 +55,39 @@ def test_fp16_forward_keeps_logits_and_sigma_finite():
     tok = torch.randint(0, m.cfg.vocab_size, (2, 4))
     lg = m(tok)
     assert torch.isfinite(lg).all()
+
+
+def _run_one_fp16_step(cfg):
+    torch.manual_seed(0)
+    m = VFEModel(cfg)
+    opt = build_optimizer(m, cfg); sch = _sched(opt)
+    scaler = torch.amp.GradScaler(device="cpu", enabled=True)
+    before = {n: p.detach().clone() for n, p in m.named_parameters() if p.requires_grad}
+    tok, tgt = _batch(cfg)
+    train_step(m, opt, sch, tok, tgt, grad_clip=1.0, scaler=scaler)
+    moved = any(not torch.equal(before[n], p) for n, p in m.named_parameters()
+                if p.requires_grad and n in before)
+    return m, scaler, moved
+
+
+def test_fp16_scaler_scales_and_updates_params():
+    # Under amp_dtype='fp16' with an ENABLED scaler, a train_step must move parameters
+    # (i.e. fp16 grads are scaled, not underflowed to zero).
+    cfg = _tiny_cfg(amp_dtype="fp16")
+    m, scaler, moved = _run_one_fp16_step(cfg)
+    assert torch.isfinite(torch.tensor(scaler.get_scale()))
+    assert moved, "no parameter moved under the enabled fp16 scaler (gradients underflowed?)"
+
+
+def test_fp16_with_gauge_natural_grad_steps_the_frame():
+    # Option A: fp16 + m_phi_natural_grad (custom GaugeNaturalGradAdamW) must compose with the
+    # scaler -- the gauge-frame table must move under a scaled step (not silently no-op).
+    cfg = _tiny_cfg(amp_dtype="fp16", m_phi_natural_grad=True, pos_phi="learned")
+    torch.manual_seed(0)
+    m = VFEModel(cfg)
+    opt = build_optimizer(m, cfg); sch = _sched(opt)
+    scaler = torch.amp.GradScaler(device="cpu", enabled=True)
+    phi0 = m.prior_bank.phi_embed.detach().clone()
+    tok, tgt = _batch(cfg)
+    train_step(m, opt, sch, tok, tgt, grad_clip=1.0, scaler=scaler)
+    assert not torch.equal(phi0, m.prior_bank.phi_embed), "gauge frame did not move under fp16 scaler"

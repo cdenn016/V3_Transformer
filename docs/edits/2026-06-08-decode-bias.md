@@ -250,6 +250,62 @@ plus companion sweeps over `e_s_mu_lr` and `e_s_sigma_lr`, following the schema 
 
 **Verification.** Full suite: `tests=731, failures=0, errors=0, skipped=0` (731 passed, 1 xpassed).
 
+## fp16 GradScaler — close the silent-mistrain footgun (Task 1)
+
+**Why.** `amp_dtype='fp16'` wrapped the E-step in `autocast(fp16)` but left `loss.backward()`
+and `optimizer.step()` unscaled. fp16 gradients underflow through the deep unrolled E-step
+and the prior tables receive near-zero updates, silently mistraining without any error or NaN.
+
+**Change (byte-identical for default/bf16/fp32).**
+- `vfe3/train.py train_step`: added keyword-only `scaler: Optional['torch.amp.GradScaler'] = None`
+  param (after `grad_accum_steps`, vertical-alignment convention matched). Body: constructs a
+  `torch.amp.GradScaler(device=tokens.device.type, enabled=False)` when `scaler=None`; replaces
+  `loss.backward()` / `optimizer.step()` with `_scaler.scale(loss).backward()` /
+  `_scaler.unscale_(optimizer)` / `_scaler.step(optimizer)` / `_scaler.update()`. A disabled
+  scaler is a documented no-op (scale = identity, unscale_ = no-op, step = optimizer.step()),
+  so `scaler=None` (default) is byte-identical to the pre-feature unscaled path.
+- `vfe3/train.py train()`: after `device` is resolved, builds
+  `scaler = torch.amp.GradScaler(device=device.type, enabled=(cfg.amp_dtype == "fp16"))` and
+  passes `scaler=scaler` to the `train_step` call. Non-fp16 `amp_dtype` constructs an
+  `enabled=False` instance — no-op, loop unchanged.
+- `tests/test_fp16_gradscaler.py` (new, 2 tests):
+  - `test_gradscaler_disabled_is_byte_identical_to_unscaled_step`: with `amp_dtype=None` the
+    scaler-wired `train_step` produces parameter values bit-identical to the manual
+    `loss.backward()/optimizer.step()` reference path.
+  - `test_fp16_forward_keeps_logits_and_sigma_finite`: under `amp_dtype='fp16'` the forward
+    pass returns finite logits (confirms existing sigma fp32 islands are intact).
+
+**GradScaler API.** `torch.amp.GradScaler(device=..., enabled=...)` works on torch 2.11+cpu
+(confirmed). No fallback to the deprecated `torch.cuda.amp.GradScaler` was needed.
+
+**Verification.** Both new tests pass; regression `tests/test_train.py` + `tests/test_amp.py`:
+`tests=27, failures=0, errors=0` (27 passed, 1 xpassed). Spec:
+`docs/superpowers/specs/2026-06-08-fp16-gradscaler-design.md`.
+
+## fp16 training GradScaler
+
+**Why.** amp_dtype='fp16' was accepted but trained UNSCALED -> fp16 gradients underflow through the
+unrolled E-step (silent mistrain). Audit Tier-2 #5.
+
+**Change (default/bf16/fp32 byte-identical).**
+- vfe3/train.py: train_step gains a keyword-only `scaler`; scale(loss).backward() (per microbatch on
+  grad-accum), unscale_ before grad-clip, scaler.step + scaler.update. train() builds
+  torch.amp.GradScaler(device=device.type, enabled=(amp_dtype=='fp16')) and threads it in. A disabled
+  scaler is a no-op, so the default/bf16/fp32 paths are bitwise-unchanged (no config change).
+- sigma stays fp32: the SPD/matrix_exp islands and decode+CE run under autocast(enabled=False)
+  regardless of amp_dtype; verified by an fp16 forward-finite test (no Cholesky/eigh NaN).
+- Option A: fp16 + m_phi_natural_grad (GaugeNaturalGradAdamW) composes with the scaler (test: gauge
+  frame moves under a scaled step). Both behavioral tests run CPU-real (torch 2.11+cpu wheel;
+  torch.cuda.is_available() is False on this machine despite the RTX 5090 — CPU-only wheel installed).
+- tests/test_fp16_gradscaler.py (4 tests): disabled-scaler byte-identity, fp16-forward sigma-finite,
+  fp16 scaler scales+updates, fp16+gauge frame moves.
+
+**Out of scope.** Scaler state is not yet checkpointed (a resumed fp16 run re-warms the scale factor
+within a few steps -- a transient, not a gradient-correctness defect). bf16 stays the recommended 5090
+path (no scaler).
+
+**Verification.** Full suite 735 passed, 0 failures, 0 errors.
+
 ## Audit-doc status sync — `docs/audits/audit-2026-06-07-lifecycle-multiagent.md`
 
 Doc-only (no code change). Marked the verified findings closed since the audit: **V2** (`close_basis`
