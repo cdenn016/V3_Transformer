@@ -346,7 +346,7 @@ class VFEModel(nn.Module):
         s_mu, s_sigma = pb.encode_s(token_ids)                         # (B, N, K)
         r_mu    = pb.r_mu.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
         r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s_sigma)
-        gamma_tau       = attention_tau(cfg.kappa_gamma, grp.irrep_dims)
+        gamma_tau       = attention_tau(_as_coeff(cfg.kappa_gamma, s_mu.device), grp.irrep_dims)
         gamma_log_prior = self._attention_log_prior(
             token_ids.shape[1], token_ids.device, prior=cfg.gamma_attention_prior,
         )
@@ -613,7 +613,7 @@ class VFEModel(nn.Module):
             # sqrt(d_head)=sqrt(K/n_heads), which is correct only for block_glk (irrep_dims=[d_head]*H)
             # and understates tau by sqrt(n_heads) on a single-block group (irrep_dims=[K], energy over
             # the full K). kappa_gamma is gamma's own sharpness handle (not cfg.kappa).
-            gamma_tau = attention_tau(cfg.kappa_gamma, self.group.irrep_dims)
+            gamma_tau = attention_tau(_as_coeff(cfg.kappa_gamma, e_s.device), self.group.irrep_dims)
             f_red_s = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior)   # (B,H,N) or (B,N)
             loss = loss + cfg.gamma_coupling * f_red_s.mean()
         return logits, loss, ce.detach()
@@ -764,7 +764,7 @@ class VFEModel(nn.Module):
             divergence_family=cfg.divergence_family,
             irrep_dims=self.group.irrep_dims,
         )
-        beta = attention_weights(energy, tau=attention_tau(cfg.kappa, self.group.irrep_dims), log_prior=log_prior)
+        beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), self.group.irrep_dims), log_prior=log_prior)
         self_div = self_divergence_for_alpha(                        # (N,) or (N, K) per-coord
             fam(out.mu, out.sigma), fam(mu_p, sigma_p),
             alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
@@ -778,7 +778,7 @@ class VFEModel(nn.Module):
         d = {"attn_entropy": float(metrics.attention_entropy(beta))}
         _lb = cfg.lambda_beta if _llb is None else float(_llb.detach().exp())   # scaled-F total reflects lambda_beta
         terms = metrics.free_energy_terms(self_div, energy, beta, alpha,
-                                          tau=attention_tau(cfg.kappa, self.group.irrep_dims),
+                                          tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), self.group.irrep_dims),
                                           lambda_beta=_lb, log_prior=log_prior,
                                           include_attention_entropy=cfg.include_attention_entropy,
                                           alpha_reg=(alpha_reg if cfg.alpha_mode != "constant" else None))
@@ -867,7 +867,7 @@ class VFEModel(nn.Module):
                 alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
-            beta = attention_weights(energy, tau=attention_tau(cfg.kappa, self.group.irrep_dims), log_prior=log_prior)
+            beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, belief.mu.device), self.group.irrep_dims), log_prior=log_prior)
             if beta.dim() == 2:                                      # single-block group -> add an H=1 axis
                 beta = beta.unsqueeze(0)
             maps.append(beta)                                        # (H, N, N)

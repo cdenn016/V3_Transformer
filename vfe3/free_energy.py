@@ -16,8 +16,21 @@ from vfe3.divergence import get_functional
 from vfe3.families.base import BeliefParams
 
 
+def _broadcast_tau(tau: 'float | torch.Tensor', energy_ndim: int) -> 'float | torch.Tensor':
+    r"""Reshape a per-head (H,) tau so it broadcasts against an (..., H, N, N) energy.
+
+    Scalar/0-d tau passes through unchanged (the single-block / scalar-kappa path).
+    A 1-d (H,) tau is reshaped to (H, 1, 1): the head axis is always 3rd from the last
+    in the energy tensor, so two trailing 1s align correctly for both the unbatched
+    (H, N, N) and batched (B, H, N, N) layouts.
+    """
+    if isinstance(tau, torch.Tensor) and tau.dim() == 1:
+        return tau.reshape(tau.shape[0], 1, 1)
+    return tau
+
+
 def attention_tau(
-    kappa:      'float | torch.Tensor',   # sharpness scalar (kappa=1 -> Vaswani recovery)
+    kappa:      'float | torch.Tensor',   # sharpness scalar or (H,) per-head (kappa=1 -> Vaswani recovery)
     irrep_dims: List[int],                # gauge-irrep block sizes; sum == K
 ) -> 'float | torch.Tensor':
     r"""Softmax temperature tau = kappa * sqrt(d_energy), where d_energy is the dimension the
@@ -208,7 +221,7 @@ def attention_weights(
     log_prior: Optional[torch.Tensor] = None,   # (..., N/NxN) bias B_ij; None -> 0
 ) -> torch.Tensor:                         # (...) softmax_j(B - E/tau)
     r"""Attention weights beta*_ij = softmax_j(B_ij - E_ij / tau)."""
-    logits = -energy / tau
+    logits = -energy / _broadcast_tau(tau, energy.dim())
     if log_prior is not None:
         logits = logits + log_prior
     return torch.softmax(logits, dim=-1)
@@ -230,7 +243,7 @@ def log_partition(
     - logsumexp(B); using log_softmax(B) subtracts that per-row normalizer in one
     step. With a None prior pi is uniform 1/N, so the bias is -log(N).
     """
-    logits = -energy / tau
+    logits = -energy / _broadcast_tau(tau, energy.dim())
     if log_prior is not None:
         logits = logits + torch.log_softmax(log_prior, dim=-1)
     else:
@@ -249,7 +262,12 @@ def reduced_free_energy(
     r"""Reduced (envelope) free energy F_red,i = -tau log Z_i; equals the canonical
     beta-block evaluated at beta* for ANY prior (log_partition normalizes the
     prior internally, so the +tau logsumexp(B) per-row offset cannot leak in)."""
-    return -tau * log_partition(energy, tau=tau, log_prior=log_prior)
+    lz = log_partition(energy, tau=tau, log_prior=log_prior)   # (..., N) or (..., H, N)
+    # Per-head (H,) tau must broadcast against lz (..., H, N): reshape to (H, 1) so it aligns
+    # with the head axis at -2 of lz. (H,1) right-aligns correctly for both (H,N) and (B,H,N).
+    # Scalar tau passes through _broadcast_tau unchanged.
+    _tau = tau.reshape(tau.shape[0], 1) if isinstance(tau, torch.Tensor) and tau.dim() == 1 else tau
+    return -_tau * lz
 
 
 def free_energy(
@@ -311,7 +329,8 @@ def free_energy(
     if include_attention_entropy:
         pi = torch.softmax(log_prior, dim=-1) if log_prior is not None \
             else torch.full_like(beta, 1.0 / beta.shape[-1])
-        entropy = tau * (beta * (torch.log(beta.clamp(min=log_eps)) - torch.log(pi.clamp(min=log_eps)))).sum()
+        _tau_e = _broadcast_tau(tau, energy.dim())    # (H,1,1) for per-head, scalar otherwise
+        entropy = (_tau_e * (beta * (torch.log(beta.clamp(min=log_eps)) - torch.log(pi.clamp(min=log_eps))))).sum()
         F = F + lambda_beta * entropy
     if log_likelihood is not None:                              # observation/data term -E_q[log p(o|k)] (gated stub; no live caller)
         F = F - log_likelihood.sum()

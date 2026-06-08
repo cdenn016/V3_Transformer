@@ -28,6 +28,7 @@ except ImportError:                                 # tqdm optional: absent -> n
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader
 from vfe3.free_energy import attention_tau
+from vfe3.model.block import _as_coeff
 from vfe3.model.model import VFEModel
 
 if TYPE_CHECKING:                                    # avoid an import cycle (run_artifacts imports evaluate)
@@ -606,6 +607,17 @@ def coverage_lines(
     return lines
 
 
+def _fmt_tau(cfg: VFE3Config, model: VFEModel) -> str:
+    r"""Banner format for the softmax temperature: a scalar kappa -> '1.5000', a per-head
+    (list) kappa -> '[t0, t1, ...]' (T1). Converts a list kappa to a tensor first so attention_tau
+    does not choke on a raw list."""
+    dev = model.prior_bank.mu_embed.device
+    tau = attention_tau(_as_coeff(cfg.kappa, dev), model.group.irrep_dims)
+    if isinstance(tau, torch.Tensor) and tau.dim() >= 1:
+        return "[" + ", ".join(f"{x:.4f}" for x in tau.tolist()) + "]"
+    return f"{float(tau):.4f}"
+
+
 def _banner(
     model:       VFEModel,
     cfg:         VFE3Config,
@@ -628,7 +640,7 @@ def _banner(
         *cov,
         f" M-LRs: mu={cfg.m_mu_lr}  sigma={cfg.m_sigma_lr}  phi={cfg.m_phi_lr}",
         f" VFE: alpha={cfg.alpha}  kappa={cfg.kappa}  "
-        f"tau={attention_tau(cfg.kappa, model.group.irrep_dims):.4f}  mass_phi={cfg.mass_phi}",
+        f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",
         bar,
     ])

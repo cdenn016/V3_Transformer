@@ -97,3 +97,55 @@ def test_default_causal_forward_byte_identical_to_pre_change():
     torch.manual_seed(0); m = VFEModel(_tiny_cfg())        # attention_prior default = causal
     tok = torch.randint(0, m.cfg.vocab_size, (2, 4))
     assert torch.isfinite(m(tok)).all()
+
+
+# ---------------------------------------------------------------------------
+# T1: per-head kappa (per-head softmax temperature)
+# ---------------------------------------------------------------------------
+
+def test_attention_tau_returns_per_head_vector():
+    from vfe3.free_energy import attention_tau
+    tau = attention_tau(torch.tensor([1.0, 2.0]), irrep_dims=[3, 3])
+    assert tau.shape == (2,)
+    assert torch.allclose(tau, torch.tensor([1.0, 2.0]) * (3 ** 0.5))
+
+
+def test_kappa_default_scalar_byte_identical():
+    torch.manual_seed(0); a = VFEModel(_tiny_cfg(kappa=1.0))
+    torch.manual_seed(0); b = VFEModel(_tiny_cfg(kappa=1.0))
+    tok = torch.randint(0, a.cfg.vocab_size, (2, 4))
+    assert torch.equal(a(tok), b(tok))
+
+
+def test_kappa_equal_list_equals_scalar():
+    torch.manual_seed(0); sca = VFEModel(_tiny_cfg(kappa=1.5, n_e_steps=2))
+    torch.manual_seed(0); lst = VFEModel(_tiny_cfg(kappa=[1.5, 1.5], n_e_steps=2))
+    tok = torch.randint(0, sca.cfg.vocab_size, (2, 4))
+    assert torch.allclose(sca(tok), lst(tok), atol=1e-6, rtol=1e-5)
+
+
+def test_kappa_per_head_changes_logits():
+    torch.manual_seed(0); sca = VFEModel(_tiny_cfg(kappa=1.5, n_e_steps=2))
+    torch.manual_seed(0); per = VFEModel(_tiny_cfg(kappa=[0.5, 4.0], n_e_steps=2))
+    tok = torch.randint(0, sca.cfg.vocab_size, (2, 4))
+    assert not torch.allclose(sca(tok), per(tok))
+
+
+def test_single_block_group_rejects_list_kappa():
+    # Per-head kappa needs equal irrep blocks; a single-block group must reject a list.
+    # glk has irrep_dims=[K] (one block) at any embed_dim.
+    with pytest.raises(ValueError, match="kappa"):
+        _tiny_cfg(gauge_group="glk", kappa=[1.0, 2.0])
+
+
+def test_banner_tau_format_handles_scalar_and_list_kappa():
+    # The training banner formats tau; a per-head (list) kappa makes attention_tau return a (H,)
+    # tensor that ':.4f' cannot format. _fmt_tau must handle both without crashing.
+    from vfe3.train import _fmt_tau
+    torch.manual_seed(0)
+    m_list = VFEModel(_tiny_cfg(kappa=[0.5, 4.0]))
+    s_list = _fmt_tau(m_list.cfg, m_list)
+    assert isinstance(s_list, str) and s_list.startswith("[")    # per-head -> bracketed vector
+    m_sca = VFEModel(_tiny_cfg(kappa=1.5))
+    s_sca = _fmt_tau(m_sca.cfg, m_sca)
+    assert isinstance(s_sca, str) and not s_sca.startswith("[")  # scalar -> plain float

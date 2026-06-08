@@ -52,7 +52,7 @@ def vfe_block(
     ``rope_on_cov`` enables the full-gauge covariance sandwich rotation."""
     out = e_step(
         belief, mu_p, sigma_p, group,
-        n_iter=cfg.n_e_steps, tau=attention_tau(cfg.kappa, group.irrep_dims),
+        n_iter=cfg.n_e_steps, tau=attention_tau(_as_coeff(cfg.kappa, belief.mu.device), group.irrep_dims),
         e_mu_lr=cfg.e_mu_lr, e_sigma_lr=cfg.e_sigma_lr, e_phi_lr=cfg.e_phi_lr,
         alpha_div=cfg.alpha_div, value=cfg.alpha, b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device), log_alpha=log_alpha,
         lambda_beta=lambda_beta,

@@ -141,7 +141,7 @@ class VFE3Config:
     alpha_mode:                str   = "constant"
     b0:                        'float | List[float]' = 1.0   # state-dependent alpha shape: alpha* = c0/(b0 + D); list -> (K,) per-coord
     c0:                        'float | List[float]' = 1.0   # state-dependent alpha shape (numerator); list -> (K,) per-coord
-    kappa:                     float = 1.0          # temperature tau = kappa * sqrt(K)
+    kappa:                     'float | List[float]' = 1.0   # sharpness; list (len n_heads) -> per-head tau
     # lambda_beta weights the ENTIRE belief-coupling block of F -- sum_ij [ beta_ij E_ij +
     # tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-coupling and the likelihood
     # (VFE_2.0 'lambda_align' parity). 1.0 = the canonical/pure F (byte-identical). It scales the
@@ -178,7 +178,7 @@ class VFE3Config:
     # gamma_coupling=1 a per-token-per-head mean weight, NOT the canonical sum-over-ij; the scale is a
     # free coupling.
     gamma_coupling:            float = 0.0
-    kappa_gamma:               float = 1.0          # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
+    kappa_gamma:               'float | List[float]' = 1.0   # model-channel sharpness; list -> per-head tau_gamma
     gamma_attention_prior:     str   = "causal"     # pi^s_ij seam for the model channel (its own prior)
 
     # s->q coupling: REPLACE the belief prior with the model channel, p_i = s_i. This realizes the
@@ -490,8 +490,21 @@ class VFE3Config:
             )
 
         # free-energy coupling
-        if self.kappa <= 0.0:
-            raise ValueError(f"kappa must be positive, got {self.kappa}")
+        for _name in ("kappa", "kappa_gamma"):
+            _v = getattr(self, _name)
+            if isinstance(_v, (list, tuple)):
+                if self.gauge_group not in ("block_glk", "tied_block_glk"):
+                    raise ValueError(
+                        f"{_name} list (per-head) requires an equal-block group "
+                        f"(block_glk/tied_block_glk); got gauge_group={self.gauge_group!r}")
+                if len(_v) != self.n_heads:
+                    raise ValueError(
+                        f"{_name} list must have length n_heads={self.n_heads}, got {len(_v)}")
+                if any(x <= 0.0 for x in _v):
+                    raise ValueError(f"{_name} entries must be > 0, got {_v}")
+            else:
+                if _v <= 0.0:
+                    raise ValueError(f"{_name} must be positive, got {_v}")
         if self.mass_phi < 0.0:
             raise ValueError(f"mass_phi must be >= 0, got {self.mass_phi}")
         if self.mstep_self_coupling_weight < 0.0:
@@ -504,8 +517,6 @@ class VFE3Config:
             raise ValueError(f"lambda_h must be >= 0, got {self.lambda_h}")
         if self.gamma_coupling < 0.0:
             raise ValueError(f"gamma_coupling must be >= 0, got {self.gamma_coupling}")
-        if self.kappa_gamma <= 0.0:
-            raise ValueError(f"kappa_gamma must be > 0, got {self.kappa_gamma}")
         # attention priors validated against the prior REGISTRY (add-by-registering). Local import
         # avoids a config <- attention_prior cycle; the bound name is reused for attention_prior below.
         from vfe3.attention_prior import _PRIORS
@@ -859,8 +870,10 @@ class VFE3Config:
         multi-block (block_glk). This property equals the active tau only for an equal-block group
         whose block size is d_head (the default block_glk); on a single-block group it understates it
         by sqrt(n_heads). kappa=1 recovers the Vaswani sqrt(d_k) temperature over the energy dimension.
+        When kappa is a per-head list, returns the mean tau (for logging only).
         """
-        return self.kappa * (self.d_head ** 0.5)
+        k = float(sum(self.kappa) / len(self.kappa)) if isinstance(self.kappa, (list, tuple)) else self.kappa
+        return k * (self.d_head ** 0.5)
 
     @property
     def tau_gamma(self) -> float:
@@ -869,8 +882,10 @@ class VFE3Config:
         The gamma model-coupling block's own temperature handle, mirroring `tau` for the belief
         beta block (kappa_gamma=1 -> Vaswani sqrt(d_k) per head). Consumed by the gamma block's
         reduced_free_energy as the -tau_gamma log Z^s envelope temperature.
+        When kappa_gamma is a per-head list, returns the mean tau_gamma (for logging only).
         """
-        return self.kappa_gamma * (self.d_head ** 0.5)
+        k = float(sum(self.kappa_gamma) / len(self.kappa_gamma)) if isinstance(self.kappa_gamma, (list, tuple)) else self.kappa_gamma
+        return k * (self.d_head ** 0.5)
 
     @property
     def d_head(self) -> int:
