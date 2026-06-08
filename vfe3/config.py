@@ -139,8 +139,8 @@ class VFE3Config:
     # use_head_mixer / use_prior_bank (see VFEModel.__init__ and alpha_i.alpha_learnable). At init
     # log_alpha=0 -> alpha=1.0, byte-identical to constant alpha=1.0.
     alpha_mode:                str   = "constant"
-    b0:                        float = 1.0          # state-dependent alpha shape: alpha* = c0/(b0 + D)
-    c0:                        float = 1.0          # state-dependent alpha shape (numerator)
+    b0:                        'float | List[float]' = 1.0   # state-dependent alpha shape: alpha* = c0/(b0 + D); list -> (K,) per-coord
+    c0:                        'float | List[float]' = 1.0   # state-dependent alpha shape (numerator); list -> (K,) per-coord
     kappa:                     float = 1.0          # temperature tau = kappa * sqrt(K)
     # lambda_beta weights the ENTIRE belief-coupling block of F -- sum_ij [ beta_ij E_ij +
     # tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-coupling and the likelihood
@@ -219,6 +219,8 @@ class VFE3Config:
     e_s_sigma_lr:              float = 0.1
 
     e_sigma_q_trust:           float = 5.0
+    
+    
     # E-step MEAN trust region (VFE_2.0 parity, default OFF = current unbounded update). When set to
     # a float, every per-iteration mean step delta_mu = e_mu_lr*nat_mu is clamped in sigma-whitened
     # units to at most this many standard deviations (mu_trust_mode='box' per-coord, 'ball' = 2-norm
@@ -274,6 +276,8 @@ class VFE3Config:
     # the current fully-unrolled path, byte-identical.
     e_step_gradient:           str   = "unroll"
     detach_e_step:             bool  = False        # False = unroll E-step in the training graph
+    
+    
     # Opt-in (default OFF): make the autograd belief-gradient ORACLE (used for the non-kernel
     # families: gradient_mode='smoothing', family='gaussian_full', alpha_div!=1) return a
     # create_graph (differentiable) gradient under e_step_gradient='unroll', so the unrolled-through-
@@ -287,6 +291,8 @@ class VFE3Config:
     m_mu_lr:                   float = 0.025
     m_sigma_lr:                float = 0.0025
     m_phi_lr:                  float = 0.015
+    
+    
     # Geometrically-correct gauge M-step (opt-in, default OFF -> plain AdamW on phi_embed/pos_phi_free).
     # When True the gauge-frame prior tables (phi_embed, pos_phi_free) are updated by NATURAL-GRADIENT
     # descent + heavy-ball momentum under the phi_precond_mode metric (set phi_precond_mode=
@@ -305,6 +311,7 @@ class VFE3Config:
     m_phi_natural_grad:        bool  = False
     m_gauge_momentum:          float = 0.9   # heavy-ball momentum for the natural-gradient gauge step
     weight_decay:              float = 0.05
+   
     # SEPARATE AdamW weight decay for the gauge-frame coordinate tables (phi_embed, learned
     # pos_phi_free), default 0.065. Decoupled decay on phi sets an LR-invariant frame-norm ceiling
     # (|phi*| ~ E[normalized-grad]/wd) that pulls the transport exp(phi.G) toward the identity; this
@@ -504,8 +511,16 @@ class VFE3Config:
         _require(self.gamma_attention_prior, tuple(sorted(_PRIORS)), "gamma_attention_prior")
         _require(self.prior_source, _VALID_PRIOR_SOURCES, "prior_source")
         for name in ("b0", "c0"):
-            if getattr(self, name) <= 0.0:
-                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+            _v = getattr(self, name)
+            if isinstance(_v, (list, tuple)):
+                if len(_v) != self.embed_dim:
+                    raise ValueError(
+                        f"{name} list must have length embed_dim={self.embed_dim}, got {len(_v)}")
+                if any(x <= 0.0 for x in _v):
+                    raise ValueError(f"{name} entries must be > 0, got {_v}")
+            else:
+                if _v <= 0.0:
+                    raise ValueError(f"{name} must be positive, got {_v}")
         if self.sigma_init <= 0.0:
             raise ValueError(f"sigma_init must be positive (log is taken), got {self.sigma_init}")
         for name in ("mu_init_std", "phi_scale"):

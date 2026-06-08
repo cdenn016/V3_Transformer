@@ -22,7 +22,7 @@ from vfe3.geometry.norms import get_norm
 from vfe3.geometry.rope import get_pos_rotation
 from vfe3.geometry.transport import RopeTransport
 from vfe3.model.head_mixer import HeadMixer
-from vfe3.model.block import vfe_block
+from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.positional_phi import apply_positional_phi
 from vfe3.model.prior_bank import PriorBank
 from vfe3.model.stack import vfe_stack
@@ -351,7 +351,7 @@ class VFEModel(nn.Module):
             n_iter=cfg.n_e_steps,         tau=gamma_tau,
             e_mu_lr=cfg.e_s_mu_lr,        e_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
             alpha_div=cfg.alpha_div,       value=cfg.lambda_h,          alpha_mode="constant",
-            b0=cfg.b0,                     c0=cfg.c0,
+            b0=_as_coeff(cfg.b0, s_mu.device), c0=_as_coeff(cfg.c0, s_mu.device),
             lambda_beta=cfg.gamma_coupling,
             kl_max=cfg.kl_max,             eps=cfg.eps,
             sigma_max=cfg.sigma_max,       e_sigma_q_trust=cfg.e_sigma_q_trust,
@@ -526,7 +526,7 @@ class VFEModel(nn.Module):
                 divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
             )
             alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
-                self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+                self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
                 log_alpha=getattr(self, "log_alpha", None),
             )
             coupling = alpha_sc.detach() * self_div            # alpha_i^(k)* D^(k) (envelope: alpha* fixed)
@@ -767,7 +767,7 @@ class VFEModel(nn.Module):
             divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
         )
         alpha, alpha_reg = self_coupling_alpha(
-            self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0,
+            self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
             log_alpha=getattr(self, "log_alpha", None),     # learned scalar (None on the pure path)
         )
 

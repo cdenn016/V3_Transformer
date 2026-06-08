@@ -16,6 +16,11 @@ from vfe3.free_energy import attention_tau
 from vfe3.inference.e_step import e_step
 
 
+def _as_coeff(v, device):
+    r"""Pass a scalar b0/c0 through unchanged; turn a list into a (K,) float32 tensor on device."""
+    return torch.as_tensor(v, dtype=torch.float32, device=device) if isinstance(v, (list, tuple)) else v
+
+
 def vfe_block(
     belief:     BeliefState,
     mu_p:       torch.Tensor,             # (N, K) prior means
@@ -49,7 +54,7 @@ def vfe_block(
         belief, mu_p, sigma_p, group,
         n_iter=cfg.n_e_steps, tau=attention_tau(cfg.kappa, group.irrep_dims),
         e_mu_lr=cfg.e_mu_lr, e_sigma_lr=cfg.e_sigma_lr, e_phi_lr=cfg.e_phi_lr,
-        alpha_div=cfg.alpha_div, value=cfg.alpha, b0=cfg.b0, c0=cfg.c0, log_alpha=log_alpha,
+        alpha_div=cfg.alpha_div, value=cfg.alpha, b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device), log_alpha=log_alpha,
         lambda_beta=lambda_beta,
         kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
