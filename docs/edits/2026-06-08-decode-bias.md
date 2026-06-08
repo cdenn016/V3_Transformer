@@ -126,6 +126,14 @@ tables above on both paths.
 **Verification.** New 5/5 pass; `test_model`/`test_prior_bank`/`test_train` 50 passed +1 xpassed,
 no regressions; ablation sweep field-validation OK.
 
+## s_e_step + e_s_*_lr fields (live model channel, default off)
+
+Config-only. Added three fields to `vfe3/config.py` (E-step group): `s_e_step: bool = False`,
+`e_s_mu_lr: float = 0.1`, `e_s_sigma_lr: float = 0.1`. Validation: negative `e_s_*_lr` raises;
+`s_e_step=True` with `prior_source != 'model_channel'` raises; `s_e_step=True` with both
+`lambda_h=0` and `gamma_coupling=0` warns (inert path). New test file
+`tests/test_live_s_model_channel.py` (4 tests). Full suite: 717 passed, 1 xpassed.
+
 ## Audit-doc status sync — `docs/audits/audit-2026-06-07-lifecycle-multiagent.md`
 
 Doc-only (no code change). Marked the verified findings closed since the audit: **V2** (`close_basis`

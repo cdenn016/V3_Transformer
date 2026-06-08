@@ -208,7 +208,16 @@ class VFE3Config:
     e_mu_lr:                   float = 0.5
     e_sigma_lr:                float = 0.015
     e_phi_lr:                  float = 0.0
-    
+
+    # Live model channel s (default OFF -> the manuscript's frozen slow channel). When True, s is
+    # refined by its own E-step each forward and fed in as the belief's prior (dynamic fiber tie,
+    # manuscript line 1399). Requires prior_source='model_channel' so the s-tables are the model's
+    # vocab table for encode AND decode. e_s_*_lr are the refine learning rates; small -> slow
+    # channel, and e_s_lr=0 collapses to the static model_channel tie. Inert when s_e_step=False.
+    s_e_step:                  bool  = False
+    e_s_mu_lr:                 float = 0.1
+    e_s_sigma_lr:              float = 0.1
+
     e_sigma_q_trust:           float = 5.0
     # E-step MEAN trust region (VFE_2.0 parity, default OFF = current unbounded update). When set to
     # a float, every per-iteration mean step delta_mu = e_mu_lr*nat_mu is clamped in sigma-whitened
@@ -535,9 +544,22 @@ class VFE3Config:
         _require(self.attention_prior, tuple(sorted(_PRIORS)), "attention_prior")
 
         # E-step
-        for name in ("e_mu_lr", "e_sigma_lr", "e_phi_lr"):
+        for name in ("e_mu_lr", "e_sigma_lr", "e_phi_lr", "e_s_mu_lr", "e_s_sigma_lr"):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
+        if self.s_e_step:
+            if self.prior_source != "model_channel":
+                raise ValueError(
+                    "s_e_step=True requires prior_source='model_channel' so the s-tables are the "
+                    f"model's vocab table for encode and decode; got prior_source={self.prior_source!r}."
+                )
+            if self.lambda_h == 0.0 and self.gamma_coupling == 0.0:
+                import warnings
+                warnings.warn(
+                    "s_e_step=True with lambda_h=0 and gamma_coupling=0: the s-refine has no force, "
+                    "so s1==s0 and the channel reduces to the static prior_source='model_channel' tie.",
+                    UserWarning, stacklevel=2,
+                )
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         _require(self.phi_precond_mode, _VALID_PHI_PRECOND_MODES, "phi_precond_mode")
         # The natural-gradient gauge M-step (m_phi_natural_grad=True) carries a POSITION-DEPENDENT
