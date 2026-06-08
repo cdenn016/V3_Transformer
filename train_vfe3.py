@@ -379,8 +379,9 @@ def main() -> None:
         test_loader = (val_loader if DATASET == "synthetic-period3"
                        else _select_loader(DATASET, cfg, logger, split="test"))
         test_tpc = val_tpc if DATASET == "synthetic-period3" else (_tokens_per_char(DATASET, "test") or 1.0)
-        finalize_run(model, artifacts, cfg, test_loader=test_loader, losses=losses,
-                     tokens_per_char=test_tpc, device=torch.device(DEVICE), wall_time=wall, logger=logger)
+        results = finalize_run(model, artifacts, cfg, test_loader=test_loader, losses=losses,
+                               tokens_per_char=test_tpc, device=torch.device(DEVICE), wall_time=wall, logger=logger)
+        run_dir = _rename_run_by_ppl(run_dir, _run_label(cfg, DATASET), results.get("test_ppl"), logger)
         logger.info("Artifacts written to %s", run_dir)
 
 
