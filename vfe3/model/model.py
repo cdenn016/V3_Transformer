@@ -710,6 +710,9 @@ class VFEModel(nn.Module):
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
+        if self.cfg.s_e_step:
+            s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
+            belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         _llb = getattr(self, "log_lambda_beta", None)

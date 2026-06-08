@@ -147,3 +147,21 @@ def test_s_e_step_gradient_reaches_s_tables_at_t1():
     loss.backward()
     assert m.prior_bank.s_mu_embed.grad is not None
     assert m.prior_bank.s_mu_embed.grad.abs().sum() > 0
+
+
+def test_generate_runs_under_s_e_step():
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel",
+                           lambda_h=1.0, gamma_coupling=1.0, e_s_mu_lr=0.5))
+    prompt = torch.randint(0, m.cfg.vocab_size, (1, 3))
+    out = m.generate(prompt, max_new_tokens=2)
+    assert out.shape == (1, 5)
+
+
+def test_diagnostics_runs_under_s_e_step():
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel",
+                           lambda_h=1.0, gamma_coupling=1.0, e_s_mu_lr=0.5))
+    tok = torch.randint(0, m.cfg.vocab_size, (1, 4))
+    d = m.diagnostics(tok)            # must not raise
+    assert d is not None
