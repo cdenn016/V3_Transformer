@@ -54,6 +54,17 @@ def test_s_tables_and_frozen_r_created_under_s_e_step():
     assert pb.r_sigma_log.requires_grad is False
 
 
+def test_frozen_r_created_when_s_e_step_is_the_only_trigger():
+    # The r-gate's new `or s_e_step` is the load-bearing change: with lambda_h=0 the OLD gate
+    # (`if lambda_h > 0`) would NOT create r, so s_e_step alone must create it. (lambda_h=0 AND
+    # gamma_coupling=0 fires the inert-misconfig warning by design.)
+    with pytest.warns(UserWarning, match="s_e_step"):
+        m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel",
+                               lambda_h=0.0, gamma_coupling=0.0))
+    assert getattr(m.prior_bank, "r_mu", None) is not None
+    assert m.prior_bank.r_mu.requires_grad is False
+
+
 def test_belief_tables_byte_identical_with_or_without_s_e_step():
     # s-tables are drawn LAST, so the belief tables (drawn first) are bit-identical.
     torch.manual_seed(0); off = VFEModel(_tiny_cfg(s_e_step=False))
