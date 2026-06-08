@@ -364,3 +364,27 @@ wired, `model.py:62-64` + `geometry/closure.py`), **V3**/**V4** (freeze warning 
 Tier-2 #4 **checkpoint resume** (`run_artifacts.py:145,174` + `train(resume_from=...)`). Added a
 Status column + status block; annotated resolved (not deleted) to keep the forensic record. V5 (low,
 doc-only) and V1 (refuted) left open/n/a.
+
+## Cheap ledger wins — T1 per-head kappa
+
+**Why.** Roadmap T1: one global softmax temperature. `cfg.kappa`/`cfg.kappa_gamma` now accept a
+length-`n_heads` `list[float]` (per-head sharpness). Default scalar = byte-identical.
+
+**Change.**
+- `vfe3/config.py`: `kappa`/`kappa_gamma` widened to `float | list[float]`; a list requires an
+  equal-block group (`block_glk`/`tied_block_glk`) and `len == n_heads`.
+- `vfe3/free_energy.py`: `_broadcast_tau(tau, energy_ndim)` reshapes a `(H,)` tau to `(H,1,1)` so it
+  aligns with the head axis of the `(B,H,N,N)` energy; applied at `attention_weights`, `log_partition`,
+  `reduced_free_energy` (`(H,1)` vs `log Z`), and the `free_energy` entropy term. Scalar tau is a no-op.
+- A list kappa is converted to a `(H,)` tensor (`_as_coeff`) at every `attention_tau` call site
+  (`model/block.py`, `model/model.py` x4, `viz/extract.py` x4, `metrics.py`, and the `train.py` banner
+  via `_fmt_tau`). The belief-gradient kernel needs no change (it uses tau only via `attention_weights`).
+
+**Tests.** 6 in `tests/test_cheap_ledger_wins.py` (per-head `(H,)` tau; default scalar bitwise; equal
+list == scalar; per-head list changes logits; single-block group rejects a list; banner `_fmt_tau`).
+
+**Process note.** Per-head kappa was built across two truncated subagent passes; the controller
+completed the un-converted `train.py` banner site, removed an unused `_broadcast_tau` import in
+`gradients/kernels.py`, and added the banner guard test.
+
+**Verification.** Full suite `750 passed, 1 xpassed, 0 failures, 0 errors` (M6+T3+T1 all in).
