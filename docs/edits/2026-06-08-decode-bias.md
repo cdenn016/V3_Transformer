@@ -134,6 +134,27 @@ Config-only. Added three fields to `vfe3/config.py` (E-step group): `s_e_step: b
 `lambda_h=0` and `gamma_coupling=0` warns (inert path). New test file
 `tests/test_live_s_model_channel.py` (4 tests). Full suite: 717 passed, 1 xpassed.
 
+## PriorBank s-tables + frozen r under s_e_step (Task 2 of live model channel)
+
+**Why.** `s_e_step=True` enables the live model-channel E-step that refines the per-token
+model beliefs `s_i`. The `PriorBank` tables (`s_mu_embed`, `s_sigma_log_embed`) and the frozen
+hyper-prior centroid (`r_mu`, `r_sigma_log`) must exist whenever `s_e_step` is on, independent of
+`lambda_h` and `gamma_coupling`.
+
+**Change.**
+- `vfe3/model/prior_bank.py`: added `s_e_step: bool = False` keyword param to `PriorBank.__init__`
+  (placed after `prior_source`, vertical-alignment convention matched); stored as `self.s_e_step`.
+  Extended the s-table gate to `lambda_h > 0.0 or gamma_coupling > 0.0 or prior_source == "model_channel" or s_e_step`.
+  Extended the `r` gate to `lambda_h > 0.0 or s_e_step`. Both blocks remain the last parameters
+  drawn in `__init__` so the belief tables keep their RNG draw and stay byte-identical.
+- `vfe3/model/model.py`: added `s_e_step=cfg.s_e_step` alongside `prior_source=cfg.prior_source`
+  in the `PriorBank(...)` construction.
+- `tests/test_live_s_model_channel.py`: two new tests (`test_s_tables_and_frozen_r_created_under_s_e_step`,
+  `test_belief_tables_byte_identical_with_or_without_s_e_step`).
+
+**Verification.** 36 passed (full targeted regression: `test_live_s_model_channel.py`,
+`test_prior_bank.py`, `test_model.py`); no regressions.
+
 ## Audit-doc status sync — `docs/audits/audit-2026-06-07-lifecycle-multiagent.md`
 
 Doc-only (no code change). Marked the verified findings closed since the audit: **V2** (`close_basis`

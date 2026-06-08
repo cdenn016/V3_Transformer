@@ -113,6 +113,7 @@ class PriorBank(nn.Module):
         lambda_h:            float = 0.0,
         gamma_coupling:      float = 0.0,
         prior_source:        str   = "token",
+        s_e_step:            bool  = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -126,6 +127,7 @@ class PriorBank(nn.Module):
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
         self.prior_source = prior_source
+        self.s_e_step = s_e_step
 
         sigma_log_init = float(torch.log(torch.tensor(sigma_init)))
         self.mu_embed         = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
@@ -173,10 +175,10 @@ class PriorBank(nn.Module):
         # (KL(s||r) > 0, the channel has a gradient). NOTE: s_i is NOT coupled to the belief q on
         # either path (the gamma transport is tied+detached); the s->q coupling and the s-channel
         # E-step update are DEFERRED.
-        if lambda_h > 0.0 or gamma_coupling > 0.0 or prior_source == "model_channel":
+        if lambda_h > 0.0 or gamma_coupling > 0.0 or prior_source == "model_channel" or s_e_step:
             self.s_mu_embed        = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
             self.s_sigma_log_embed = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
-        if lambda_h > 0.0:
+        if lambda_h > 0.0 or s_e_step:
             # FROZEN hyper-prior centroid r (user decision 2026-06-02): the fixed centroid the model
             # beliefs s_i are regularized toward via lambda_h*KL(s_i||r). The manuscript determines r
             # "from a higher, slower meta-level" (GL(K)_supplementary.tex:1081); with no meta-level

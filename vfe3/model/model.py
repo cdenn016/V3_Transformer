@@ -92,7 +92,7 @@ class VFEModel(nn.Module):
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             lambda_h=cfg.lambda_h, gamma_coupling=cfg.gamma_coupling,
-            prior_source=cfg.prior_source,
+            prior_source=cfg.prior_source, s_e_step=cfg.s_e_step,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.
