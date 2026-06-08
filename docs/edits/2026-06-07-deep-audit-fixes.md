@@ -239,3 +239,13 @@ squared_hellinger, and alpha!=1); DIAGONAL Gaussian returns False under a genera
 (the diagonal structure is broken) — the catchable wrong-declaration case. Unknown family ->
 NotImplementedError (the representation-map extension point).
 Test `tests/test_admissibility_verifier.py` (9). No regression (test_gauge_groups 23 pass).
+
+## PL19 — surrogate (include_attention_entropy=False) end-to-end test [done, test-only]
+
+The -tau^-1 Cov gradient gap was tested only by local closures. Added `tests/test_surrogate_end_to_end.py`
+(3) through VFEModel: (1) the surrogate forwards + backprops to the prior tables via the oracle branch
+(needs oracle_unroll_grad=True for a differentiable tangent — the default detached-tangent path is the
+documented non-training case); (2) the flag is live in the E-step descent — matched-weight canonical vs
+surrogate models give different logits; (3) the F gate is exact — at the converged beliefs the canonical
+`total` exceeds the surrogate `total` by exactly lambda_beta*attention_entropy (metrics.free_energy_terms).
+No production code; closes the flagged coverage gap on the standard-transformer training baseline.
