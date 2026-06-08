@@ -33,14 +33,24 @@ that truncates without error, and diagnostics that under-report the objective.
 
 ## 1. Verified findings (adversarial skeptic + defender + judge)
 
-| # | Finding | Filed | **Verdict** | Final |
-|---|---------|:---:|:---:|:---:|
-| V1 | ALiBi prior is symmetric and replaces the causal mask → "future-token leak" | high | **REFUTED** | low |
-| V2 | Cross-coupled gauge basis never closed under the bracket (`close_basis` dead) | high | **severity-adjusted** | medium |
-| V3 | Oracle E-step severs `log_alpha`/`connection_W`/`log_lambda_beta` under `unroll`, un-warned | high | **severity-adjusted** | medium |
-| V4 | `pos_phi='learned'` (default) silently freezes under `straight_through`/`detach` | high | **severity-adjusted** | medium |
-| V5 | `killing`/`killing_per_block` are not no-ops in the gauge natural-grad M-step | medium | **severity-adjusted** | low |
-| V6 | `free_energy_terms` omits `R(alpha)` and ignores `include_attention_entropy` | medium | **CONFIRMED** | medium |
+| # | Finding | Filed | **Verdict** | Final | Status (2026-06-08) |
+|---|---------|:---:|:---:|:---:|:---:|
+| V1 | ALiBi prior is symmetric and replaces the causal mask → "future-token leak" | high | **REFUTED** | low | n/a (refuted) |
+| V2 | Cross-coupled gauge basis never closed under the bracket (`close_basis` dead) | high | **severity-adjusted** | medium | ✅ **fixed** |
+| V3 | Oracle E-step severs `log_alpha`/`connection_W`/`log_lambda_beta` under `unroll`, un-warned | high | **severity-adjusted** | medium | ✅ **fixed** |
+| V4 | `pos_phi='learned'` (default) silently freezes under `straight_through`/`detach` | high | **severity-adjusted** | medium | ✅ **fixed** |
+| V5 | `killing`/`killing_per_block` are not no-ops in the gauge natural-grad M-step | medium | **severity-adjusted** | low | open (doc-only, low) |
+| V6 | `free_energy_terms` omits `R(alpha)` and ignores `include_attention_entropy` | medium | **CONFIRMED** | medium | ✅ **fixed** |
+
+**Status update (2026-06-08).** Re-verification against the live tree closes the actionable verified
+set. **V2** — a `close_basis` config field (`config.py:100`, AUTO-True when `cross_couplings` is set)
+forwards into `build_group` (`model.py:62-64`) and closes the basis via `geometry/closure.py`
+(`tests/test_fix_gauge_audit.py`). **V3**/**V4** — the freeze-warning predicate now also covers the
+`unroll`+oracle route and `pos_phi='learned'` (`config.py:736-766`), and the pos_phi warning fires on
+the *effective* estimator (`model.py:204-214`). **V6** — `free_energy_terms` now threads `alpha_reg` and
+`include_attention_entropy` (`metrics.py:104-150`), wired from `model.py:721`
+(`tests/test_fix_metrics_audit.py`, `test_fix_model_audit.py`). **V5** remains open (low, doc-only);
+**V1** needed no fix. Findings are annotated resolved rather than deleted to preserve the forensic record.
 
 **V1 — ALiBi "leak" — REFUTED (→ low).** The mechanism is real (`prior_alibi` returns a symmetric
 `-slope*|i-j|`, `attention_prior.py:81`, no `-inf` mask) but the headline is false for the operative
@@ -218,9 +228,10 @@ The user explicitly asked for features to plan/build. Ordered by leverage.
    remove the half-wired argument. Roadmap already flags the decision. PIFB:1273,1949.
 
 **Tier 2 — systems / scale.**
-4. **Checkpoint resume.** The checkpoint path is write-only (`run_artifacts.py:145,157`); no
-   `load_checkpoint`/`start_step`/`last_epoch` reader exists. Add resume (model+optimizer+LambdaLR
-   `last_epoch`+RNG+dataloader position). *(medium)*
+4. ~~**Checkpoint resume.**~~ ✅ **RESOLVED (2026-06-08).** `save_checkpoint`/`load_checkpoint`
+   (`run_artifacts.py:145,174`) now round-trip model + optimizer + RNG + step, and
+   `train(resume_from=...)` rebuilds the cosine `LambdaLR` at the saved step. Residual: exact
+   dataloader-position restoration is not claimed (resume restarts the token stream). *(low)*
 5. **fp16 `GradScaler`.** Wire `torch.amp.GradScaler` in `train.py` gated on `amp_dtype=='fp16'` (bf16/fp32
    unscaled) — see V-section; today fp16 silently mistrains. *(medium)*
 6. **Incremental belief reuse in `generate()`** — `model.py:569-597`. Every token re-runs the full

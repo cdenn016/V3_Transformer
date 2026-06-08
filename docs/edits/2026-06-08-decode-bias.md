@@ -125,3 +125,13 @@ tables above on both paths.
 
 **Verification.** New 5/5 pass; `test_model`/`test_prior_bank`/`test_train` 50 passed +1 xpassed,
 no regressions; ablation sweep field-validation OK.
+
+## Audit-doc status sync — `docs/audits/audit-2026-06-07-lifecycle-multiagent.md`
+
+Doc-only (no code change). Marked the verified findings closed since the audit: **V2** (`close_basis`
+wired, `model.py:62-64` + `geometry/closure.py`), **V3**/**V4** (freeze warning now covers the
+`unroll`+oracle route and `pos_phi='learned'`, `config.py:736-766` + `model.py:204-214`), **V6**
+(`free_energy_terms` threads `alpha_reg`/`include_attention_entropy`, `metrics.py:104-150`); and
+Tier-2 #4 **checkpoint resume** (`run_artifacts.py:145,174` + `train(resume_from=...)`). Added a
+Status column + status block; annotated resolved (not deleted) to keep the forensic record. V5 (low,
+doc-only) and V1 (refuted) left open/n/a.
