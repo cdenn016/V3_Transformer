@@ -212,3 +212,17 @@ looped from 0. Added the load half:
 Test `tests/test_checkpoint_resume.py` (5): the gold test pins that a straight 4-step run equals
 (2 steps → checkpoint → resume to 4) bit-for-bit under a constant token stream — sensitive to all
 three restore legs (weights, optimizer momentum, LR-schedule `last_epoch`). Full suite 669 passed.
+
+## PL13-priors — T5 relative-bias + windowed attention priors [done]
+
+`attention_prior.py` registered only uniform/causal/alibi/causal_alibi. Added three pure builders
+(config-selectable via the live `_PRIORS` validation, no config-validator or call-site edit):
+- `windowed` — symmetric local band (`|i-j|<=window`, else -inf).
+- `causal_windowed` — sliding-window local attention (`0<=i-j<=window`, else -inf).
+- `t5_relative_bias` — T5 relative-position bucketing (`_t5_relative_position_bucket`, exact-then-
+  log-spaced, HF-faithful) gathering a per-bucket bias; accepts a learnable `(num_buckets,)`
+  `bias_values` handle, else a deterministic `-log1p(bucket)` default; causal form masks the future.
+Variant params (`window`, T5 bucketing) run at defaults from the model, mirroring `alibi`'s
+default slope; per-head/learnable-table threading is the separate head-axis item.
+Test `tests/test_attention_prior_t5_windowed.py` (8): banding/causality structure, T5 bucket
+reference values + monotonicity + clamp, supplied-table gather, and end-to-end model forwards.
