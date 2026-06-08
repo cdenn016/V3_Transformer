@@ -85,13 +85,14 @@ class VFEModel(nn.Module):
         n_gen = self.group.generators.shape[0]
         self.prior_bank = PriorBank(
             cfg.vocab_size, cfg.embed_dim, n_gen,
+            mu_init_std=cfg.mu_init_std, sigma_init=cfg.sigma_init, phi_scale=cfg.phi_scale,
             decode_tau=cfg.decode_tau, eps=cfg.eps,
             diagonal_covariance=cfg.diagonal_covariance,
             use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             lambda_h=cfg.lambda_h, gamma_coupling=cfg.gamma_coupling,
-            prior_source=cfg.prior_source,
+            prior_source=cfg.prior_source, s_e_step=cfg.s_e_step,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.
@@ -322,6 +323,53 @@ class VFEModel(nn.Module):
             pos_phi_free=getattr(self, "pos_phi_free", None),
         )
 
+    def _refine_s(
+        self,
+        token_ids:       torch.Tensor,   # (B, N) integer token ids
+        phi0:            torch.Tensor,   # (B, N, n_gen) encoded gauge frame (shared, held FIXED)
+
+        *,
+        e_step_gradient: str = "unroll",
+    ) -> 'tuple[torch.Tensor, torch.Tensor]':
+        r"""Refine the model channel s by its own E-step toward the frozen hyper-prior r plus the
+        gamma model-consensus, with the shared gauge frame phi0 held fixed (e_phi_lr=0). Returns the
+        refined (mu_s, sigma_s); the s-tables train through the unrolled trajectory."""
+        from vfe3.belief import BeliefState
+        from vfe3.inference.e_step import e_step
+        from vfe3.free_energy import attention_tau
+
+        cfg, pb, grp = self.cfg, self.prior_bank, self.group
+        s_mu, s_sigma = pb.encode_s(token_ids)                         # (B, N, K)
+        r_mu    = pb.r_mu.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
+        r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s_sigma)
+        gamma_tau       = attention_tau(cfg.kappa_gamma, grp.irrep_dims)
+        gamma_log_prior = self._attention_log_prior(
+            token_ids.shape[1], token_ids.device, prior=cfg.gamma_attention_prior,
+        )
+        out = e_step(
+            BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0), r_mu, r_sigma, grp,
+            n_iter=cfg.n_e_steps,         tau=gamma_tau,
+            e_mu_lr=cfg.e_s_mu_lr,        e_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
+            alpha_div=cfg.alpha_div,       value=cfg.lambda_h,          alpha_mode="constant",
+            b0=cfg.b0,                     c0=cfg.c0,
+            lambda_beta=cfg.gamma_coupling,
+            kl_max=cfg.kl_max,             eps=cfg.eps,
+            sigma_max=cfg.sigma_max,       e_sigma_q_trust=cfg.e_sigma_q_trust,
+            e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
+            include_attention_entropy=cfg.include_attention_entropy,
+            gradient_mode=cfg.gradient_mode,
+            family="gaussian_diagonal",
+            divergence_family=cfg.divergence_family,
+            phi_precond_mode=cfg.phi_precond_mode,
+            phi_retract_mode=cfg.phi_retract_mode,
+            spd_retract_mode=cfg.spd_retract_mode,
+            transport_mode="flat",
+            e_step_gradient=e_step_gradient,
+            oracle_unroll_grad=cfg.oracle_unroll_grad,
+            log_prior=gamma_log_prior,
+        )
+        return out.mu, out.sigma
+
     def forward(
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
@@ -375,6 +423,12 @@ class VFEModel(nn.Module):
         # below are protected separately (their inputs are .float()-ed; see _amp_off_context).
         amp = self._amp_context(token_ids.device)
         with run, amp:
+            if self.cfg.s_e_step:
+                # Live model channel: refine s (phi0 fixed), then anchor the belief to it -- q0 and
+                # the belief prior (mu_p, sigma_p) both become the refined s1. The belief E-step
+                # self-couples to its prior every iteration, so s reaches mu_final even at n_e_steps=1.
+                s_mu1, s_sigma1 = self._refine_s(token_ids, beliefs.phi, e_step_gradient=e_step_gradient)
+                beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm,
                             head_mixer=self.head_mixer, log_alpha=log_alpha,
@@ -480,7 +534,9 @@ class VFEModel(nn.Module):
                 coupling = coupling.sum(dim=-1)                # sum_k alpha^(k) D^(k) -> per-token
             sc = coupling.mean()                               # mean over batch and tokens (B, N)
             loss = loss + cfg.mstep_self_coupling_weight * sc
-        if self.cfg.lambda_h > 0.0:
+        # TODO(B): the frozen global r here becomes a per-token top-down shadow once the meta-agent
+        # (scale-(s+1)) exists. See docs/superpowers/specs/2026-06-08-live-s-model-channel-design.md.
+        if self.cfg.lambda_h > 0.0 and not self.cfg.s_e_step:
             # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
             # lines 1241-1249): L += lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
             # regularized toward the global hyper-prior centroid r. Opt-in, default-off
@@ -505,7 +561,7 @@ class VFEModel(nn.Module):
                 divergence_family=cfg.divergence_family,
             ).mean()
             loss = loss + cfg.lambda_h * hp
-        if self.cfg.gamma_coupling > 0.0:
+        if self.cfg.gamma_coupling > 0.0 and not self.cfg.s_e_step:
             # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
             # lines 1241-1249): L += gamma_coupling * mean_i F_red^s_i, the reduced (envelope) form of
             # the model-coupling block sum_ij [ gamma_ij KL(s_i||Omega_tilde_ij s_j) + tau_g gamma_ij
@@ -656,6 +712,9 @@ class VFEModel(nn.Module):
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
+        if self.cfg.s_e_step:
+            s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
+            belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         _llb = getattr(self, "log_lambda_beta", None)

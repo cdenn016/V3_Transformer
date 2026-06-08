@@ -44,7 +44,7 @@ theory-fidelity findings (Tn), and Tier-D items.
 | PL3 | Straight-through E-step toggle | ADDRESSED | `e_step.py:370-379`; cfg `config.py:249`; test `test_straight_through.py` (16 passed) |
 | PL4 | SPD retraction registry | ADDRESSED | `retraction.py:24,177,274` (spd_affine, log_euclidean); cfg `config.py:210`; test `test_retraction.py:250,384` (5 passed) |
 | PL5 | Autoregressive `generate()` + sampling | ADDRESSED | `model.py:562`; reached from `train.py:460`; test `test_generate.py:32-129`. *No `_SAMPLERS` registry (samplers inline); capability complete.* |
-| PL6 | Hyper-prior `lambda_h` + gamma model-coupling | ADDRESSED | `model.py:483-558`, `prior_bank.py:162-198`; cfg `config.py:158,172`; tests `test_hyperprior.py`, `test_gamma_coupling.py` (18 passed). *As an M-step loss regularizer; the E-step s-update is deferred by design.* |
+| PL6 | Hyper-prior `lambda_h` + gamma model-coupling | ADDRESSED | `model.py:483-558`, `prior_bank.py:162-198`; cfg `config.py:158,172`; tests `test_hyperprior.py`, `test_gamma_coupling.py` (18 passed). *As an M-step loss regularizer; the live E-step s-update is now the opt-in `s_e_step` channel (PL6-3, 2026-06-08).* |
 | PL7 | Transport registry + Regime II | ADDRESSED | `transport.py:94-128`; cfg `config.py:71,76`; test `test_regime_ii.py` |
 | PL9 | Chunked-vocab decode | ADDRESSED | `prior_bank.py:272,456`; cfg `config.py:215`; test `test_chunked_decode.py:114` (atol-1e-3 vs full) |
 | PL11 | f-divergence beyond Rényi (`squared_hellinger`) | ADDRESSED | `families/base.py:254-282`; cfg `config.py:46`; test `test_divergence.py:556` |
@@ -80,7 +80,7 @@ theory-fidelity findings (Tn), and Tier-D items.
 | TierD-kappa | `kappa_max` condition-number cap | MISSING | monitor-only; `[eps,sigma_max]` clamp bounds it incidentally |
 | TierD-expM | exp(M) clamp activation monitor | MISSING (by choice) | hot-path host-sync deliberately avoided; cannot fire on default path |
 | TierD-son | SO(N) principal-ball wrapping | MISSING | `lie_ops.py:303` radial rescale only |
-| PL6-3 | Slow-channel s-update in E-step | MISSING (deferred) | s is a backprop-trained table, not E-step-iterated |
+| PL6-3 | Slow-channel s-update in E-step | ADDRESSED (2026-06-08) | opt-in `s_e_step` (default OFF, requires `prior_source='model_channel'`): `model._refine_s` runs a model-channel E-step (frozen `r` self-target, `gamma_coupling` consensus, frame fixed), anchored as the belief prior+init in `forward` so `s` reaches `mu_final` at `n_e_steps=1`; cfg `config.py` (`s_e_step`/`e_s_mu_lr`/`e_s_sigma_lr`); tests `test_live_s_model_channel.py` (default-off byte-identity, T=1 liveness, gradient-to-s-tables, `e_s_lr=0` reduction). Spec `docs/superpowers/specs/2026-06-08-live-s-model-channel-design.md` |
 | PL19-estep-conv | E-step convergence diagnostic test | PARTIAL | `estep_residuals` exists; non-increasing-on-default-loop assertion absent |
 | PL19-diag-reuse | `diagnostics()` forward reuse flag | MISSING | low impact (~4% of steps) |
 | PL19-recognition | Recognition-factor registry | MISSING | two-branch dispatch; roadmap rates speculative |

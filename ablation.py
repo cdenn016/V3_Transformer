@@ -92,7 +92,12 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     n_layers                   = 1,                           # L, number of blocks
     n_e_steps                  = 1,                           # T, E-step inner iterations
-    
+
+    # belief-table init scales (PriorBank)
+    mu_init_std                = 0.02,                         # std of mu_embed ~ N(0, mu_init_std^2)
+    sigma_init                 = 1.0,                          # constant initial coordinate variance (>0)
+    phi_scale                  = 0.01,                         # std of phi_embed ~ N(0, phi_scale^2)
+
 
     # gauge seam
     gauge_group                = "block_glk",                 # "glk"|"block_glk"|"tied_block_glk"|"so_k"|"sp"
@@ -184,7 +189,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     m_phi_lr                   = 0.015,
     
     weight_decay               = 0.05,
-    phi_weight_decay           = 0.065,
+    phi_weight_decay           = 0.05,
    
     warmup_steps               = 1,
     seed                       = 6,                           # overridden per run by CONFIG["seed"]
@@ -255,6 +260,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "n_e_steps": {
         "description": "E-step inner iterations T per block",
         "param": "n_e_steps", "values": [1, 2, 3, 5],
+    },
+
+    # === belief-table init scales (PriorBank) ===============================
+    "mu_init_std": {
+        "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
+        "param": "mu_init_std", "values": [0.0, 0.01, 0.02, 0.05, 0.1],
+    },
+    "sigma_init": {
+        "description": "constant initial coordinate variance of the prior table (>0)",
+        "param": "sigma_init", "values": [0.25, 0.5, 1.0, 2.0, 4.0],
+    },
+    "phi_scale": {
+        "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
+        "param": "phi_scale", "values": [0.0, 0.001, 0.01, 0.05],
     },
     
 
@@ -583,7 +602,7 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
 
-    "phi_weight_decay",    
+  #  "phi_weight_decay",    
 
   #  "m_phi_lr",
     "m_mu_lr",
@@ -1071,7 +1090,7 @@ def run_sweep(
 
         ppl = result["primary_val_ppl"]
         tag = f" [{result['error_kind'].upper()}]" if result.get("error_kind") else ""
-        print(f"  -> val PPL {ppl:.3f}{tag}  ({result['wall_time_s']:.0f}s)")
+        print(f"\n\n  -> val PPL {ppl:.3f}{tag}  ({result['wall_time_s']:.0f}s)\n")
         if i == 0 and len(runs) > 1:
             est = result["wall_time_s"] * len(runs)
             print(f"  ** ~{est / 60:.0f} min estimated for the full {len(runs)}-run sweep")
