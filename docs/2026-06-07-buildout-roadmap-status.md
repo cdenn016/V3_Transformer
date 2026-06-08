@@ -113,6 +113,26 @@ overnight-failure risk for low marginal value.
 ## Implemented this session
 
 Each feature below is an opt-in toggle, default OFF, with the pure path preserved, built TDD with
-per-item commits. See the dated edit log for the running change record.
+per-item commits. See `docs/edits/2026-06-07-deep-audit-fixes.md` for the running change record.
 
-(Updated as work lands.)
+1. **PL8 checkpoint resume (load side)** — `run_artifacts.load_checkpoint` restores model + AdamW
+   momentum + RNG; `train(resume_from=...)` (or `cfg.resume_from`) rebuilds the cosine `LambdaLR`
+   at the saved step and continues `range(start_step, n_steps)`. The gold test pins that a straight
+   run equals (train → checkpoint → resume) bit-for-bit under a constant stream.
+2. **PL13-priors T5 + windowed attention priors** — `windowed`, `causal_windowed`, and
+   `t5_relative_bias` (faithful T5 bucketing, optional learnable per-bucket handle) registered;
+   config-selectable via the live `_PRIORS` validation with no call-site edit.
+3. **PL17 admissibility verifier** — `groups.check_admissible(group, family)` turns
+   `invariant_for`'s string declaration into a verified invariant (full Gaussian invariant for every
+   registered group; diagonal Gaussian correctly fails under a general GL(K) congruence).
+4. **PL19 surrogate end-to-end test** — `include_attention_entropy=False` exercised through VFEModel
+   (oracle-branch forward+backward, E-step descent change, exact F gate), closing the
+   local-closure-only coverage gap. Test-only.
+
+The remaining gaps are all low value (M5–M8, T1–T3, the Tier-D hygiene items, U/SU groups, the
+fully-Bayesian alpha, the recognition-factor registry, M7's decode KL-pin) or carry high
+unsupervised-failure risk for their value (PL10 causal-packed transport's golden re-pin). M6
+(`b0`/`c0` sequence config) was deliberately deferred: the per-coordinate kernel already accepts a
+`(K,)` tensor, but a tensor-valued config field is against the codebase grain (no precedent, breaks
+`asdict`→`config.json` serialization), so it is left as documented-contained work rather than added
+unsupervised. The pure path is preserved across every change; all 689 tests pass (664 baseline + 25 new).
