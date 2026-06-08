@@ -226,3 +226,16 @@ Variant params (`window`, T5 bucketing) run at defaults from the model, mirrorin
 default slope; per-head/learnable-table threading is the separate head-axis item.
 Test `tests/test_attention_prior_t5_windowed.py` (8): banding/causality structure, T5 bucket
 reference values + monotonicity + clamp, supplied-table gather, and end-to-end model forwards.
+
+## PL17 — executable group/family admissibility verifier [done]
+
+`GaugeGroup.invariant_for` was only string membership. Added `groups.check_admissible(group, family,
+*, functional, alpha, n_samples, ...)`: draws random `g = exp(c.G)`, pushes a random Gaussian belief
+pair forward by the family's representation (GL(K) congruence `mu->g mu, Sigma->g Sigma g^T`), and
+asserts the registered divergence is invariant `D(rho(g)q||rho(g)p)==D(q||p)` to tolerance. Returns a
+bool, turning the declaration into a verified invariant. Non-vacuous: FULL Gaussian invariant for every
+group (verifies the 'gaussian' declaration for glk/block_glk/tied_block_glk/so_k/sp under renyi,
+squared_hellinger, and alpha!=1); DIAGONAL Gaussian returns False under a general GL(K) congruence
+(the diagonal structure is broken) — the catchable wrong-declaration case. Unknown family ->
+NotImplementedError (the representation-map extension point).
+Test `tests/test_admissibility_verifier.py` (9). No regression (test_gauge_groups 23 pass).
