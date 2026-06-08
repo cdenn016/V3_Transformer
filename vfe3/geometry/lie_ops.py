@@ -9,6 +9,7 @@ determinant control. Pure: operates on a generator TENSOR, not a GaugeGroup.
 """
 
 import math
+import warnings
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -116,15 +117,70 @@ def compose_euclidean(
     return phi1 + phi2
 
 
-@register_compose("bch")
-def compose_bch(
-    phi1:       torch.Tensor,             # (..., n_gen)
-    phi2:       torch.Tensor,             # (..., n_gen)
-    generators: torch.Tensor,             # (n_gen, K, K)
+# Bracket-closure of a generator basis is a property of the FIXED generators, not of any
+# belief phi, so it is measured ONCE per basis and cached -- never per compose/precondition
+# call. Keyed by object id; the basis tensor is retained in the cache so its id cannot be
+# reused (a stale-id false positive). The residual is computed under no_grad off the autograd
+# graph; the old per-call float(Z) on a grad-carrying Z both host-synced the hot E-step and
+# raised the "requires_grad to scalar" warning.
+_BRACKET_CLOSURE_RES:    Dict[int, list] = {}      # id(generators) -> [generators_ref, max_rel_residual]
+_BRACKET_CLOSURE_WARNED: set             = set()    # (id(generators), where) already-warned call sites
+
+
+def warn_if_basis_not_closed(
+    generators:  torch.Tensor,            # (n_gen, K, K) fixed gauge generator basis
 
     *,
-    order:      int = 4,
-    gram_pinv_: Optional[torch.Tensor] = None,
+    where:       str,                     # call-site label (also the per-site warn-once key)
+    closure_tol: float                  = 1e-4,
+    eps:         float                  = 1e-12,
+    gram_pinv_:  Optional[torch.Tensor] = None,
+) -> None:
+    r"""Warn once (per call site) if ``generators`` is not closed under the Lie bracket.
+
+    Measures the max relative out-of-span residual
+    :math:`\max_{a,b} \lVert [G_a,G_b] - \mathrm{embed}(\mathrm{extract}([G_a,G_b]))\rVert_F /
+    (\lVert [G_a,G_b]\rVert_F + \epsilon)`. On a closed (default direct-sum) basis this is ~0 and
+    nothing is warned; on a non-closed 3+-head ``cross_couplings`` chain it is O(1) and the span
+    projection in BCH composition / structure-constants silently truncates the out-of-span part.
+    The result depends only on the generators, so it is cached and the hot path pays a dict lookup.
+    """
+    key = id(generators)
+    entry = _BRACKET_CLOSURE_RES.get(key)
+    if entry is None:
+        with torch.no_grad():
+            G    = generators                                                   # (n_gen, K, K)
+            brak = torch.einsum("aij,bjk->abik", G, G) - torch.einsum("bij,ajk->abik", G, G)  # [G_a,G_b]
+            proj = embed_phi(extract_phi(brak, G, gram_pinv_=gram_pinv_), G)     # span projection of each bracket
+            res  = (brak - proj).norm(dim=(-2, -1))                             # (n_gen, n_gen)
+            den  = brak.norm(dim=(-2, -1)) + eps                                # (n_gen, n_gen)
+            max_res = float((res / den).max())
+        entry = _BRACKET_CLOSURE_RES[key] = [generators, max_res]               # retain the basis -> stable id
+    max_res = entry[1]
+    wkey = (key, where)
+    if max_res > closure_tol and wkey not in _BRACKET_CLOSURE_WARNED:
+        _BRACKET_CLOSURE_WARNED.add(wkey)
+        warnings.warn(
+            f"{where}: gauge generator basis is not closed under the Lie bracket (max relative "
+            f"out-of-span residual {max_res:.3e} > {closure_tol:.1e}); BCH composition / structure "
+            f"constants truncate the out-of-span [G_a,G_b] terms. Build the group with "
+            f"close_basis=True for cross-coupled (3+-head chain) bases.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+@register_compose("bch")
+def compose_bch(
+    phi1:        torch.Tensor,            # (..., n_gen)
+    phi2:        torch.Tensor,            # (..., n_gen)
+    generators:  torch.Tensor,            # (n_gen, K, K)
+
+    *,
+    closure_tol: float                  = 1e-4,
+    eps:         float                  = 1e-12,
+    order:       int                    = 4,
+    gram_pinv_:  Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""BCH chart correction: coords of log(exp(embed phi1) exp(embed phi2)).
 
@@ -136,6 +192,15 @@ def compose_bch(
                 + 1/360 ([X,[Y,[Y,[Y,X]]]] + [Y,[X,[X,[X,Y]]]])
                 + 1/120 ([Y,[X,[Y,[X,Y]]]] + [X,[Y,[X,[Y,X]]]])
     Truncation error is O(||X||^{order+2} + ||Y||^{order+2}).
+
+    On a basis NOT closed under the Lie bracket the Dynkin commutator terms push
+    :math:`Z` out of :math:`\mathrm{span}\{G_a\}`, and the final
+    :math:`\mathrm{extract\_phi}(Z)` least-squares projection silently discards that
+    out-of-span component. A diagnostic guard measures the max relative residual
+    :math:`\max \lVert Z - \mathrm{embed}(\mathrm{extract}(Z))\rVert_F /
+    (\lVert Z\rVert_F + \epsilon)` and warns once if it exceeds ``closure_tol``; on a
+    closed (default direct-sum) basis the residual is ~0 so the guard is silent and the
+    returned phi is unchanged.
     """
     X = embed_phi(phi1, generators)
     Y = embed_phi(phi2, generators)
@@ -155,7 +220,15 @@ def compose_bch(
         Z = Z - (1.0 / 720.0) * (br(Y, YYYX) + br(X, XXXY))
         Z = Z + (1.0 / 360.0) * (br(X, YYYX) + br(Y, XXXY))
         Z = Z + (1.0 / 120.0) * (br(Y, br(X, br(Y, XY))) + br(X, br(Y, br(X, YX))))
-    return extract_phi(Z, generators, gram_pinv_=gram_pinv_)
+    phi = extract_phi(Z, generators, gram_pinv_=gram_pinv_)
+
+    # Diagnostic (cached, phi-independent): warn once if the generator basis is not bracket-closed,
+    # in which case the Dynkin commutators leave span{G_a} and the extract_phi projection above drops
+    # that part. Closure depends only on the fixed generators, so this never host-syncs the hot E-step
+    # nor touches Z's autograd graph (the old per-call float(Z) did both -> the requires_grad warning).
+    warn_if_basis_not_closed(generators, where="compose_bch",
+                             closure_tol=closure_tol, eps=eps, gram_pinv_=gram_pinv_)
+    return phi
 
 
 def compose_phi(

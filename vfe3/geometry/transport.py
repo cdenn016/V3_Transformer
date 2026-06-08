@@ -84,8 +84,10 @@ def _rope_dense_omega(base: 'torch.Tensor | FactoredTransport', rope: torch.Tens
 # axis on equal footing with the structure group (clean-room spec sec 4.2): config-selected, added by
 # writing-and-registering, never editing call sites. This is ORTHOGONAL to gauge_parameterization
 # (phi|omega_direct), which chooses how a single flat transport is parameterized; the regime chooses
-# whether the connection is flat at all. Only the flat phi-cocycle is registered here; Regime II is
-# design-spec'd (docs/superpowers/specs/2026-06-01-regime-ii-connection-design.md) and deferred.
+# whether the connection is flat at all. Both regimes are registered here: the flat phi-cocycle
+# under 'flat' (:func:`_build_flat`, the no-NN pure default) and the non-flat edge-relaxed Regime II
+# under 'regime_ii' (:func:`_build_regime_ii` below, the sanctioned default-OFF learned-connection
+# exception; spec docs/superpowers/specs/2026-06-01-regime-ii-connection-design.md).
 _TRANSPORTS: Dict[str, Callable[..., TransportDict]] = {}
 
 

@@ -28,7 +28,7 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
-from vfe3.geometry.lie_ops import gram_pinv
+from vfe3.geometry.lie_ops import gram_pinv, warn_if_basis_not_closed
 
 _PRECOND: Dict[str, Callable[..., torch.Tensor]] = {}
 
@@ -228,14 +228,35 @@ def _structure_constants(
     generators: torch.Tensor,             # (n_gen, K, K)
 
     *,
-    gram_pinv_: Optional[torch.Tensor] = None,
+    closure_tol: float                 = 1e-4,
+    eps:         float                 = 1e-12,
+    gram_pinv_:  Optional[torch.Tensor] = None,
 ) -> torch.Tensor:                        # (n_gen, n_gen, n_gen) f[a,b,c]: [G_a,G_b]=sum_c f G_c
-    r"""Structure constants f[a,b,c] = coords_c([G_a, G_b]) in the generator basis."""
+    r"""Structure constants f[a,b,c] = coords_c([G_a, G_b]) in the generator basis.
+
+    On a basis NOT closed under the Lie bracket (e.g. a 3+-head ``cross_couplings``
+    chain built with ``close_basis=False``) the bracket :math:`[G_a, G_b]` carries an
+    out-of-span component that the span projection
+    :math:`f[a,b,c] = \langle G_c, [G_a,G_b]\rangle\,(\mathrm{Gram}^+)_{cd}` silently
+    truncates, so the structure constants (and any pullback metric built on them) drop
+    those terms. A diagnostic guard measures the max relative out-of-span residual
+    :math:`\max_{a,b} \lVert [G_a,G_b] - \mathrm{embed}(f_{ab\cdot})\rVert_F /
+    (\lVert [G_a,G_b]\rVert_F + \epsilon)` and warns once if it exceeds ``closure_tol``;
+    on a closed (default direct-sum) basis the residual is ~0 so the guard is silent and
+    the returned tensor is unchanged.
+    """
     G = generators
     brak   = torch.einsum("aij,bjk->abik", G, G) - torch.einsum("bij,ajk->abik", G, G)   # [G_a,G_b]
     gp     = gram_pinv(G) if gram_pinv_ is None else gram_pinv_
     coords = torch.einsum("cij,abij->abc", G, brak)       # <G_c, [G_a,G_b]>
-    return torch.einsum("abc,cd->abd", coords, gp)
+    f      = torch.einsum("abc,cd->abd", coords, gp)      # (n_gen, n_gen, n_gen)
+
+    # Diagnostic (cached, one-time): warn if the basis is not bracket-closed, in which case the
+    # span projection above truncates the out-of-span part of [G_a,G_b]. Depends only on the fixed
+    # generators, so it runs once per basis (the shared lie_ops cache), off the hot path.
+    warn_if_basis_not_closed(G, where="_structure_constants (pullback metric)",
+                             closure_tol=closure_tol, eps=eps, gram_pinv_=gp)
+    return f
 
 
 def pullback_metric(
