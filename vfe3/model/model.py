@@ -250,7 +250,11 @@ class VFEModel(nn.Module):
         key = (name, n, device, dtype)
         cached = self._log_prior_cache.get(key)
         if cached is None:
-            cached = attention_log_prior(name, n, n, device=device, dtype=dtype)
+            cached = attention_log_prior(
+                name, n, n,
+                device=device, dtype=dtype,
+                n_heads=self.cfg.n_heads, alibi_slope=self.cfg.alibi_slope,
+            )
             self._log_prior_cache[key] = cached
         return cached
 

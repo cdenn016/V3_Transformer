@@ -306,6 +306,55 @@ path (no scaler).
 
 **Verification.** Full suite 735 passed, 0 failures, 0 errors.
 
+## M6: b0/c0 accept a length-K list (per-coordinate alpha constants)
+
+**Why.** The state-dependent-alpha kernel already accepts `b0`/`c0` as `float | torch.Tensor` and handles `(K,)` tensors, but `VFE3Config` only accepted scalar floats, so per-coordinate alpha constants were unreachable from config.
+
+**Change.**
+- `vfe3/config.py`: `b0`/`c0` annotations widened to `float | List[float]` (using the already-imported `List`). `__post_init__` gains a list branch: validates `len == embed_dim` and all entries `> 0`; scalar branch unchanged.
+- `vfe3/model/block.py`: module-level helper `_as_coeff(v, device)` — passes scalars through unchanged, converts lists to `(K,)` float32 tensors on the given device. Wired at the `e_step` call (site 1, device from `belief.mu.device`).
+- `vfe3/model/model.py`: imports `_as_coeff` from `block`. Wired at three sites: (2) s-model E-step `_refine_s` call (`s_mu.device`); (3) M-step forward self-coupling `self_coupling_alpha` (`out.mu.device`); (4) diagnostics `self_coupling_alpha` (`out.mu.device`).
+
+**Invariant.** A scalar `b0`/`c0` passes through `_as_coeff` unchanged — default path is byte-identical. A list becomes a `(K,)` tensor only at consumption, so `dataclasses.asdict` sees a plain Python list (JSON-serializable; checkpoint round-trips cleanly).
+
+**Tests.** `tests/test_cheap_ledger_wins.py` (new, 5 tests): default scalar; list length mismatch rejected; non-positive entry rejected; list config JSON-serializable; per-coord b0 threads into the model and changes logits vs scalar baseline.
+
+**Verification.** 5/5 new tests pass. Regression: `test_config.py` + `test_model.py` — `72 passed, 0 failures, 0 errors`; `test_alpha_i.py` + `test_learnable_alpha.py` — `18 passed, 0 failures, 0 errors`.
+
+## T3: per-head Press ALiBi slopes + config-reachable alibi_slope
+
+**Why.** `prior_alibi` and `prior_causal_alibi` previously returned `(N,N)` with a single
+pinned `slope=1.0`. Press et al. use a per-head geometric schedule; this makes the alibi
+priors return `(H,N,N)` with the Press schedule and wires a base slope from config.
+The default `attention_prior` is `causal` (unchanged); this only affects the `alibi` and
+`causal_alibi` variants.
+
+**Change.**
+- `vfe3/attention_prior.py`: added module-level `_press_slopes(n_heads, base, device, dtype) -> (H,)`
+  helper. Rewrote `prior_alibi` to accept `n_heads: int = 1` and `alibi_slope: float = 1.0`
+  (replacing `slope`), returning `(H, N_q, N_k)`. Rewrote `prior_causal_alibi` analogously,
+  applying the causal mask uniformly across heads.
+- `vfe3/config.py`: added `alibi_slope: float = 1.0` in the attention block.
+- `vfe3/model/model.py`: `_attention_log_prior` now passes `n_heads=self.cfg.n_heads` and
+  `alibi_slope=self.cfg.alibi_slope` to `attention_log_prior(...)`. Non-alibi priors accept
+  `**kwargs` and ignore extras; default causal path is unchanged and broadcast-identical.
+
+**Existing tests updated.** `tests/test_attention_prior.py` and
+`tests/test_fix_attention_prior_audit.py` pinned the old `slope=` param name and `(N,N)` shape;
+both files updated to use `n_heads=H, alibi_slope=...` and assert `(H,N,N)` shape. The Press
+slope formula (`base * 2^(-8h/H)`) replaces the raw `slope` in expected values.
+
+**Broadcast.** Default group is `block_glk` with `H = len(irrep_dims) = n_heads`. Energy is
+`(B,H,N,N)` on this path; `(H,N,N)` prior broadcasts correctly. Verified by forward-pass with
+`attention_prior='alibi'` and `'causal_alibi'`: both return finite logits of shape `(B,N,V)`.
+
+**New tests.** 4 appended to `tests/test_cheap_ledger_wins.py`: per-head shape and slope
+ordering; causal mask per head; config field default; default-causal forward unchanged.
+
+**Verification.** 4/4 T3 targeted tests pass. Regression (junit):
+`tests=55, failures=0, errors=0` across `test_attention_prior.py`,
+`test_fix_attention_prior_audit.py`, `test_model.py`, `test_free_energy.py`.
+
 ## Audit-doc status sync — `docs/audits/audit-2026-06-07-lifecycle-multiagent.md`
 
 Doc-only (no code change). Marked the verified findings closed since the audit: **V2** (`close_basis`

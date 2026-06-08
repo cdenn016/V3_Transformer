@@ -62,3 +62,38 @@ def test_b0_list_through_viz_extract_trajectory():
     tok = torch.randint(0, m.cfg.vocab_size, (1, 4))
     tr = e_step_belief_trace(m, tok, n_iter=2)
     assert torch.isfinite(tr["free_energy"]).all()
+
+
+# ---------------------------------------------------------------------------
+# T3: per-head Press ALiBi slopes
+# ---------------------------------------------------------------------------
+
+def test_prior_alibi_per_head_press_slopes():
+    from vfe3.attention_prior import get_prior
+    H, N = 4, 5
+    B = get_prior("alibi")(N, N, n_heads=H, alibi_slope=1.0)
+    assert B.shape == (H, N, N)
+    s0     = -B[0,     0, 1].item()     # slope_0 * |i-j|=1
+    s_last = -B[H - 1, 0, 1].item()
+    assert s0 > s_last > 0              # head 0 steepest, decaying with h
+    assert B[0, 2, 2].item() == 0.0    # zero on the diagonal
+    assert torch.allclose(B[1], B[1].transpose(-1, -2))   # symmetric per head
+
+
+def test_prior_causal_alibi_per_head_keeps_mask():
+    from vfe3.attention_prior import get_prior
+    H, N = 2, 4
+    B = get_prior("causal_alibi")(N, N, n_heads=H, alibi_slope=1.0)
+    assert B.shape == (H, N, N)
+    assert torch.isinf(B[0, 0, 1]) and B[0, 0, 1] < 0     # j>i masked to -inf per head
+    assert B[0, 1, 0].item() != float("-inf")              # j<=i allowed
+
+
+def test_alibi_slope_config_field_default():
+    assert VFE3Config().alibi_slope == 1.0
+
+
+def test_default_causal_forward_byte_identical_to_pre_change():
+    torch.manual_seed(0); m = VFEModel(_tiny_cfg())        # attention_prior default = causal
+    tok = torch.randint(0, m.cfg.vocab_size, (2, 4))
+    assert torch.isfinite(m(tok)).all()

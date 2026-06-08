@@ -203,6 +203,7 @@ class VFE3Config:
     # attention
     include_attention_entropy: bool  = True         # canonical (True) vs surrogate (False)
     attention_prior:           str   = "causal"
+    alibi_slope:               float = 1.0          # base slope for alibi/causal_alibi priors (Press et al. schedule)
 
     # E-step
     e_mu_lr:                   float = 0.5
