@@ -73,3 +73,30 @@ def test_belief_tables_byte_identical_with_or_without_s_e_step():
     assert torch.equal(off.prior_bank.mu_embed, on.prior_bank.mu_embed)
     assert torch.equal(off.prior_bank.phi_embed, on.prior_bank.phi_embed)
     assert torch.equal(off.prior_bank.sigma_log_embed, on.prior_bank.sigma_log_embed)
+
+
+def test_refine_s_preserves_shape_and_zero_lr_is_static():
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel",
+                           lambda_h=1.0, gamma_coupling=1.0,
+                           e_s_mu_lr=0.0, e_s_sigma_lr=0.0))
+    tok = torch.randint(0, m.cfg.vocab_size, (2, 4))
+    phi0 = m._apply_pos_phi(m.prior_bank.encode(tok).phi)
+    s0_mu, s0_sigma = m.prior_bank.encode_s(tok)
+    s1_mu, s1_sigma = m._refine_s(tok, phi0)
+    assert s1_mu.shape == s0_mu.shape == (2, 4, m.cfg.embed_dim)
+    # e_s_lr=0 -> the refine is a no-op -> s1 == s0.
+    assert torch.allclose(s1_mu, s0_mu)
+    assert torch.allclose(s1_sigma, s0_sigma)
+
+
+def test_refine_s_moves_s_with_nonzero_lr():
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel",
+                           lambda_h=1.0, gamma_coupling=1.0,
+                           e_s_mu_lr=0.5, e_s_sigma_lr=0.5))
+    tok = torch.randint(0, m.cfg.vocab_size, (2, 4))
+    phi0 = m._apply_pos_phi(m.prior_bank.encode(tok).phi)
+    s0_mu, _ = m.prior_bank.encode_s(tok)
+    s1_mu, _ = m._refine_s(tok, phi0)
+    assert not torch.allclose(s1_mu, s0_mu)   # the refine actually descends toward r + consensus

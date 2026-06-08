@@ -323,6 +323,53 @@ class VFEModel(nn.Module):
             pos_phi_free=getattr(self, "pos_phi_free", None),
         )
 
+    def _refine_s(
+        self,
+        token_ids:       torch.Tensor,   # (B, N) integer token ids
+        phi0:            torch.Tensor,   # (B, N, n_gen) encoded gauge frame (shared, held FIXED)
+
+        *,
+        e_step_gradient: str = "unroll",
+    ) -> 'tuple[torch.Tensor, torch.Tensor]':
+        r"""Refine the model channel s by its own E-step toward the frozen hyper-prior r plus the
+        gamma model-consensus, with the shared gauge frame phi0 held fixed (e_phi_lr=0). Returns the
+        refined (mu_s, sigma_s); the s-tables train through the unrolled trajectory."""
+        from vfe3.belief import BeliefState
+        from vfe3.inference.e_step import e_step
+        from vfe3.free_energy import attention_tau
+
+        cfg, pb, grp = self.cfg, self.prior_bank, self.group
+        s_mu, s_sigma = pb.encode_s(token_ids)                         # (B, N, K)
+        r_mu    = pb.r_mu.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
+        r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s_sigma)
+        gamma_tau       = attention_tau(cfg.kappa_gamma, grp.irrep_dims)
+        gamma_log_prior = self._attention_log_prior(
+            token_ids.shape[1], token_ids.device, prior=cfg.gamma_attention_prior,
+        )
+        out = e_step(
+            BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0), r_mu, r_sigma, grp,
+            n_iter=cfg.n_e_steps,         tau=gamma_tau,
+            e_mu_lr=cfg.e_s_mu_lr,        e_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
+            alpha_div=cfg.alpha_div,       value=cfg.lambda_h,          alpha_mode="constant",
+            b0=cfg.b0,                     c0=cfg.c0,
+            lambda_beta=cfg.gamma_coupling,
+            kl_max=cfg.kl_max,             eps=cfg.eps,
+            sigma_max=cfg.sigma_max,       e_sigma_q_trust=cfg.e_sigma_q_trust,
+            e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
+            include_attention_entropy=cfg.include_attention_entropy,
+            gradient_mode=cfg.gradient_mode,
+            family="gaussian_diagonal",
+            divergence_family=cfg.divergence_family,
+            phi_precond_mode=cfg.phi_precond_mode,
+            phi_retract_mode=cfg.phi_retract_mode,
+            spd_retract_mode=cfg.spd_retract_mode,
+            transport_mode="flat",
+            e_step_gradient=e_step_gradient,
+            oracle_unroll_grad=cfg.oracle_unroll_grad,
+            log_prior=gamma_log_prior,
+        )
+        return out.mu, out.sigma
+
     def forward(
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
