@@ -140,9 +140,9 @@ config = dict(
     
     gradient_mode             = "filtering",          # "filtering" | "smoothing"
     
-    m_phi_natural_grad        = True,
+    m_phi_natural_grad        = False,
     
-    phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
+    phi_precond_mode          = "pullback",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
