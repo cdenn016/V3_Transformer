@@ -119,3 +119,16 @@ def test_cg_coupling_self_product_reaches_other_types():
     mu2, _ = cpl(mu, torch.ones(3, 9, dtype=torch.float64))
     assert not torch.allclose(mu2[:, 4:9], mu[:, 4:9])   # l2 head updated
     assert torch.equal(mu2[:, 0:4], mu[:, 0:4])          # l0 and l1 heads untouched
+
+
+def test_cg_coupling_full_cov_sigma_passes_through():
+    from vfe3.model.cg_coupling import CGCoupling
+    grp = _tower_group()
+    cpl = CGCoupling(3, "so", grp.irrep_dims, grp.irrep_labels).double()
+    with torch.no_grad():
+        cpl.path_weights.fill_(0.3)
+    mu = torch.randn(2, 4, 9, dtype=torch.float64)
+    S = torch.randn(2, 4, 9, 9, dtype=torch.float64)
+    mu2, S2 = cpl(mu, S)
+    assert S2 is S                                       # untouched, same object
+    assert not torch.equal(mu2, mu)                      # means did move
