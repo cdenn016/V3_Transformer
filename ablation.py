@@ -105,8 +105,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     # mult), ...] with block dims summing to embed_dim (so_n 'l<p>': spin-p for group_n=3, dim
     # 2p+1; sp_n 'sym<p>': Sym^p of the defining rep). Both REQUIRED for so_n/sp_n, None
     # otherwise. These groups need phi_precond_mode in none/clip/killing (per-block modes are
-    # rejected: tied gauge) and equal blocks for use_head_mixer -- the sweep arms below handle
-    # both overrides.
+    # rejected: tied gauge) -- the sweep arms below override phi_precond_mode.
+    # use_head_mixer works on every tower (per-isotypic-component mixing).
     group_n                   = None,                # so_n/sp_n only: N of SO(N) / 2m of Sp(2m)
     irrep_spec                = None,                # so_n/sp_n only: [(label, mult), ...]; dims sum == embed_dim
 
@@ -288,7 +288,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     # === gauge seam ========================================================
-    # use_head_mixer (True at baseline) needs >= 2 equal blocks (block_glk / tied_block_glk);
+    # use_head_mixer (True at baseline) needs >= 2 equal blocks (block_glk / tied_block_glk) or a labeled irrep tower (so_n/sp_n);
     # the single-block glk / so_k / sp arms turn it off so the model constructs.
     # so_n / sp_n irrep-tower arms (heads = irreps; group_n decoupled from K): irrep_spec dims
     # must sum to the baseline embed_dim=20, and the TIED gauge rejects the per-block phi

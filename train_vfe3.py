@@ -85,11 +85,11 @@ config = dict(
     # unequal block dims get per-head tau_h = kappa_h*sqrt(d_h). Both REQUIRED for so_n/sp_n,
     # must stay None for every other group. CONSTRAINTS for these groups: phi_precond_mode must
     # be "none"/"clip"/"killing" (the per-block modes are rejected -- tied generators do not
-    # partition per block); use_head_mixer needs EQUAL blocks; alibi-family priors need
+    # partition per block); use_head_mixer mixes per isotypic component (equal-mult towers mix copies; mults-one towers get scalar gains); alibi-family priors need
     # n_heads == number of blocks.
     # embed_dim=20 examples:
     #   so_n: group_n=3, irrep_spec=[("l2", 4)]                            # 4 equal spin-2 heads (mixer OK)
-    #   so_n: group_n=3, irrep_spec=[("l0",1),("l1",1),("l3",1),("l4",1)]  # spins 0,1,3,4 = 1+3+7+9 (unequal -> use_head_mixer=False)
+    #   so_n: group_n=3, irrep_spec=[("l0",1),("l1",1),("l3",1),("l4",1)]  # spins 0,1,3,4 = 1+3+7+9 (unequal: mixer = per-head scalar gains)
     #   sp_n: group_n=4, irrep_spec=[("sym2", 2)]                          # 2 equal Sym^2(R^4) heads, dim 10 each
     group_n                   = None,                # so_n/sp_n only: N of SO(N) / 2m of Sp(2m)
     irrep_spec                = None,                # so_n/sp_n only: [(label, mult), ...]; dims sum == embed_dim
