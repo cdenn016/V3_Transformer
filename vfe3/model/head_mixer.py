@@ -77,6 +77,11 @@ class HeadMixer(nn.Module):
                 )
             runs = [(0, len(irrep_dims))]                       # one component: all blocks
         else:
+            if len(irrep_labels) != len(irrep_dims):
+                raise ValueError(
+                    f"irrep_labels has {len(irrep_labels)} entries but there are "
+                    f"{len(irrep_dims)} irrep blocks"
+                )
             runs, i = [], 0                                     # maximal runs of equal labels
             while i < len(irrep_dims):
                 j = i
@@ -84,6 +89,12 @@ class HeadMixer(nn.Module):
                     j += 1
                 runs.append((i, j))
                 i = j
+            for i, j in runs:
+                if len(set(irrep_dims[i:j])) != 1:
+                    raise ValueError(
+                        f"blocks {i}:{j} share label {irrep_labels[i]!r} but have unequal dims "
+                        f"{irrep_dims[i:j]}; copies of one irrep must share its dimension"
+                    )
         # components: (coordinate start, copies m, block dim d); spec layout makes runs contiguous
         starts = [0]
         for d in irrep_dims:
@@ -106,6 +117,15 @@ class HeadMixer(nn.Module):
 
     def is_identity(self) -> bool:
         return all(bool((d.detach() == 0).all().item()) for d in self.mixer_deltas)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        r"""Remap the pre-isotypic key ``mixer_delta`` -> ``mixer_deltas.0`` so strict
+        checkpoint resume of single-component mixers written before the ParameterList
+        refactor keeps working."""
+        old = prefix + "mixer_delta"
+        if old in state_dict and len(self.mixer_deltas) == 1:
+            state_dict[prefix + "mixer_deltas.0"] = state_dict.pop(old)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(
         self,

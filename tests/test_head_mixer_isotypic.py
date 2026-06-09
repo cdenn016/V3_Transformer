@@ -64,3 +64,17 @@ def test_mults_one_tower_gives_scalar_gains():
     mu2, _ = m(mu, torch.ones(3, 16))
     assert torch.allclose(mu2[:, 4:9], 1.5 * mu[:, 4:9])
     assert torch.equal(mu2[:, :4], mu[:, :4])   # other heads untouched
+
+
+def test_same_label_run_with_unequal_dims_raises():
+    with pytest.raises(ValueError, match="share label"):
+        HeadMixer([1, 3, 3, 7], irrep_labels=["x", "x", "x", "x"])
+    with pytest.raises(ValueError, match="irrep_labels has"):
+        HeadMixer([3, 3], irrep_labels=["a"])
+
+
+def test_old_single_component_state_dict_still_loads():
+    m = HeadMixer([4, 4, 4])
+    old_style = {"mixer_delta": 0.25 * torch.ones(3, 3)}
+    m.load_state_dict(old_style)
+    assert torch.allclose(m.mixer_deltas[0], 0.25 * torch.ones(3, 3))
