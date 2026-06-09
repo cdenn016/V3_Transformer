@@ -464,10 +464,18 @@ def _factored_diagonal_covariance(
     r"""Per-head diagonal sandwich from the factored exps (P0 #2 covariance route).
 
     For each head h on coordinates [start:end] the block Omega^(h)_ij = exp(phi_i)^(h) exp(-phi_j)^(h)
-    is a (d, d) operator; the diagonal sandwich Sigma_t[i,j,k] = sum_l (Omega^(h)_ijkl)^2 sigma_jl
-    runs over head h's d coordinates only. Materializes the (..., N, N, d, d) block Omega per head
-    (H * d^2 vs the full K^2). Exact w.r.t. the dense diagonal sandwich because the dense Omega is
-    block-diagonal (off-block entries exactly 0.0). Rank-agnostic via the leading ellipsis.
+    is a (d, d) operator and the diagonal sandwich is the quadratic form
+
+        Sigma_t[i,j,k] = sum_l (Omega^(h)_ijkl)^2 sigma_jl
+                       = sum_{m,n} ep_i[k,m] G_j[m,n] ep_i[k,n],   G_j = en_j diag(sigma_j) en_j^T,
+
+    so the per-PAIR (..., N, N, d, d) block Omega never needs to exist (audit 2026-06-09 P3): the
+    key-side second moment G_j is (..., N, d, d), the query-side outer product ep_i[k,m] ep_i[k,n]
+    is (..., N, d, d, d), and the contraction lands directly on the (..., N, N, d) output -- peak
+    memory N d^3 + N^2 d instead of N^2 d^2, at identical flop count. Exact w.r.t. the dense
+    diagonal sandwich because the dense Omega is block-diagonal (off-block entries exactly 0.0);
+    the regrouping is algebraically exact (rounding differs at fp32 epsilon, covered by the
+    factored-vs-dense allclose pins). Rank-agnostic via the leading ellipsis.
     """
     parts: List[torch.Tensor] = []
     start = 0
@@ -475,8 +483,9 @@ def _factored_diagonal_covariance(
         end = start + d
         ep = factored.exp_phi[..., start:end, start:end]               # (..., N, d, d) exp(phi_i)^(h)
         en = factored.exp_neg_phi[..., start:end, start:end]           # (..., N, d, d) exp(-phi_j)^(h)
-        omega_blk = torch.einsum("...ikl,...jlm->...ijkm", ep, en)     # (..., N, N, d, d) block Omega^(h)
         sig_blk = sigma[..., start:end]                                # (..., N, d)
-        parts.append(torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega_blk, omega_blk, sig_blk))
+        g = torch.einsum("...jml,...jnl,...jl->...jmn", en, en, sig_blk)   # (..., N, d, d) G_j
+        ep2 = ep.unsqueeze(-1) * ep.unsqueeze(-2)                      # (..., N, d, d, d) ep[k,m] ep[k,n]
+        parts.append(torch.einsum("...ikmn,...jmn->...ijk", ep2, g))   # (..., N, N, d)
         start = end
     return torch.cat(parts, dim=-1)                                    # (..., N, N, K)

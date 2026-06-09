@@ -25,18 +25,29 @@ def test_b0_c0_default_scalar():
 
 def test_b0_c0_list_length_must_match_embed_dim():
     with pytest.raises(ValueError, match="b0"):
-        _tiny_cfg(b0=[1.0, 1.0, 1.0])           # embed_dim=4, list len 3 -> reject
-    cfg = _tiny_cfg(b0=[1.0, 2.0, 3.0, 4.0])
+        _tiny_cfg(b0=[1.0, 1.0, 1.0],            # embed_dim=4, list len 3 -> reject
+                  alpha_mode="state_dependent_per_coord")
+    cfg = _tiny_cfg(b0=[1.0, 2.0, 3.0, 4.0], alpha_mode="state_dependent_per_coord")
     assert list(cfg.b0) == [1.0, 2.0, 3.0, 4.0]
 
 
 def test_b0_c0_list_entries_must_be_positive():
     with pytest.raises(ValueError, match="c0"):
-        _tiny_cfg(c0=[1.0, 0.0, 1.0, 1.0])
+        _tiny_cfg(c0=[1.0, 0.0, 1.0, 1.0], alpha_mode="state_dependent_per_coord")
+
+
+def test_b0_c0_list_requires_per_coord_alpha_mode():
+    # audit 2026-06-09 P2: a (K,) b0/c0 against a per-position scalar D crashes at the first
+    # forward (or silently mis-broadcasts when K == N); the pair is rejected at construction.
+    for mode in ("constant", "state_dependent", "learnable"):
+        with pytest.raises(ValueError, match="per-coordinate alpha form"):
+            _tiny_cfg(b0=[1.0, 2.0, 3.0, 4.0], alpha_mode=mode)
+        with pytest.raises(ValueError, match="per-coordinate alpha form"):
+            _tiny_cfg(c0=[1.0, 2.0, 3.0, 4.0], alpha_mode=mode)
 
 
 def test_b0_list_config_is_json_serializable():
-    cfg = _tiny_cfg(b0=[1.0, 2.0, 3.0, 4.0])
+    cfg = _tiny_cfg(b0=[1.0, 2.0, 3.0, 4.0], alpha_mode="state_dependent_per_coord")
     json.dumps(dataclasses.asdict(cfg))         # must not raise (list -> json, no tensor)
 
 

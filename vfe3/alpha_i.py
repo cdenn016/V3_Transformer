@@ -89,7 +89,9 @@ def alpha_learnable(
     kl:        torch.Tensor,             # (..., N) or (..., N, K) self-divergence (unused: alpha is free)
 
     *,
-    log_alpha: Optional[torch.Tensor] = None,   # scalar nn.Parameter from the model; alpha = exp(log_alpha)
+    log_alpha: Optional[torch.Tensor] = None,   # scalar nn.Parameter; REQUIRED at call time (Optional
+                                                # only for the registry's uniform kwargs bag -- every
+                                                # alpha form shares one signature; None raises below)
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED scalar self-coupling

@@ -148,6 +148,9 @@ class RunArtifacts:
         model:     torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         cfg:       VFE3Config,
+
+        *,
+        scaler:    Optional['torch.amp.GradScaler'] = None,
     ) -> Path:
         r"""Write a resumable ``checkpoints/step_<N>.pt`` (model + optimizer + RNG + config + step).
 
@@ -155,6 +158,9 @@ class RunArtifacts:
         ``optimizer_state`` restore the weights and AdamW momentum, ``rng_state`` restores the
         CPU (and CUDA) generators for reproducible continuation, and ``step`` is the number of
         completed M-steps so the resumed run rebuilds the cosine ``LambdaLR`` at the right point.
+        ``scaler`` (audit 2026-06-09 IE3): an ENABLED fp16 GradScaler's state (current scale +
+        growth counters) is bundled so a resumed fp16 run does not restart at the init scale
+        65536 and re-converge by skipped steps; a disabled/None scaler stores None.
         """
         path = self.ckpt_dir / f"step_{step}.pt"
         rng_state = {
@@ -167,6 +173,8 @@ class RunArtifacts:
             "optimizer_state": optimizer.state_dict(),
             "rng_state":       rng_state,
             "config":          asdict(cfg),
+            "scaler_state":    (scaler.state_dict()
+                                if scaler is not None and scaler.is_enabled() else None),
         }, path)
         return path
 
@@ -177,8 +185,10 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
 
     *,
-    map_location: 'Optional[str | torch.device]' = None,
-    restore_rng:  bool = True,
+    map_location: 'Optional[str | torch.device]'        = None,
+    restore_rng:  bool                                   = True,
+    scaler:       Optional['torch.amp.GradScaler']       = None,
+    cfg:          Optional[VFE3Config]                   = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
@@ -188,6 +198,14 @@ def load_checkpoint(
     carries it (checkpoints written before RNG was persisted simply skip that step). The returned
     integer is the number of completed M-steps; ``train(resume_from=...)`` uses it to rebuild the
     cosine ``LambdaLR`` at the saved step and to start the loop from there.
+
+    ``scaler`` (audit 2026-06-09 IE3): when given AND the bundle carries a saved scaler state,
+    the fp16 GradScaler's scale/growth counters are restored (bundles written before the scaler
+    was persisted, or written from a non-fp16 run, simply skip the step). ``cfg`` (audit IE4):
+    when given, the CURRENT config is compared against the bundle's saved config and any
+    differing fields are warned about -- strict ``load_state_dict`` already catches
+    shape-changing divergence, but shape-preserving semantic drift (LR schedule, n_e_steps,
+    e_*_lr, ...) would otherwise pass silently.
 
     ``weights_only=False`` is required because the bundle carries the optimizer state and the RNG
     tensors (not a pure ``state_dict``); the file is a trusted run artifact this process wrote
@@ -199,6 +217,25 @@ def load_checkpoint(
     model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
         optimizer.load_state_dict(ckpt["optimizer_state"])
+    if scaler is not None and ckpt.get("scaler_state") is not None:
+        scaler.load_state_dict(ckpt["scaler_state"])
+    if cfg is not None and ckpt.get("config") is not None:
+        saved = ckpt["config"]
+        current = asdict(cfg)
+        # resume_from is run bookkeeping (the resumed run necessarily sets it; the saved run
+        # rarely did) -- not semantic drift.
+        drift = sorted(k for k in (saved.keys() | current.keys())
+                       if k != "resume_from" and saved.get(k) != current.get(k))
+        if drift:
+            import warnings
+            warnings.warn(
+                f"resume config drift: the checkpoint at {Path(path).name} was written under a "
+                f"different config for field(s) {drift}; the resumed run uses the CURRENT values "
+                f"(weights/optimizer load strictly, but semantic knobs are not restored from the "
+                f"bundle).",
+                UserWarning,
+                stacklevel=2,
+            )
     if restore_rng and ckpt.get("rng_state") is not None:
         rng = ckpt["rng_state"]
         # RNG tensors must be CPU ByteTensors regardless of map_location (set_rng_state asserts this).

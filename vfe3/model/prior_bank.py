@@ -27,7 +27,6 @@ and ``reference_decode`` already covers any registered divergence for verificati
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 import torch.utils.checkpoint as _checkpoint
 from torch import nn
 

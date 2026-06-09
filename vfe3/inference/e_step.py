@@ -31,7 +31,7 @@ from vfe3.geometry.transport import (
     transport_covariance,
     transport_mean,
 )
-from vfe3.gradients.kernels import belief_gradients
+from vfe3.gradients.kernels import belief_gradients, uses_kernel_route
 
 
 def _transport(
@@ -143,7 +143,7 @@ def free_energy_value(
     group:                     GaugeGroup,
 
     *,
-    tau:                       float = 1.0,
+    tau:                       'float | torch.Tensor' = 1.0,
     alpha_div:                 float = 1.0,
     value:                     float = 1.0,
     b0:                        float = 1.0,
@@ -157,6 +157,7 @@ def free_energy_value(
     mu_trust_mode:             str  = "box",           # accepted-and-ignored iteration-only knob
 
     include_attention_entropy: bool = True,
+    rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
     alpha_mode:                str  = "constant",
@@ -167,6 +168,7 @@ def free_energy_value(
     transport_mode:            str  = "flat",          # accepted-and-ignored iteration-only knob
     cocycle_relaxation:        float = 1.0,            # accepted-and-ignored iteration-only knob (regime_ii)
 
+    rope:                      Optional[torch.Tensor] = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     log_prior:                 Optional[torch.Tensor] = None,
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
     connection_W:              Optional[torch.Tensor] = None,   # accepted-and-ignored iteration-only knob (regime_ii NN exception)
@@ -187,8 +189,9 @@ def free_energy_value(
     ``cocycle_relaxation`` ARE honored for the global (``keys=None``) F so the logged trajectory matches
     the objective the beliefs descend under regime_ii; the filtered (frozen-keys) F has no non-flat
     transport form and raises under a non-flat ``transport_mode``. ``log_alpha`` is also honored (it
-    flows into ``self_coupling_alpha`` below). NOTE: ``rope`` is not threaded here, so under gauge-RoPE
-    the logged F omits the rotation -- a known diagnostic gap, not the model path.
+    flows into ``self_coupling_alpha`` below). ``rope``/``rope_on_cov`` are honored too (audit
+    2026-06-09 PP6): the built transport is wrapped in :class:`RopeTransport` exactly as on the
+    model path, so under gauge-RoPE the logged F is the F being descended, not the un-rotated one.
     """
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
     # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
@@ -213,8 +216,15 @@ def free_energy_value(
                 f"{transport_mode!r} (the filtered diagnostic has no non-flat transport form)"
             )
         omega = _transport_qk(belief.phi, keys.phi, group)
-    mu_t = transport_mean(omega.unsqueeze(0), key_belief.mu.unsqueeze(0))[0]
-    sigma_t = transport_covariance(omega.unsqueeze(0), key_belief.sigma.unsqueeze(0))[0]
+    if rope is not None:
+        # Mirror the model path: R_i Omega_ij R_j^T on the means (and the covariance sandwich
+        # under the full gauge). The Rope einsums are rank-agnostic, so no unsqueeze dance.
+        wrapped = RopeTransport(base=omega, rope=rope, on_cov=rope_on_cov)
+        mu_t = transport_mean(wrapped, key_belief.mu)
+        sigma_t = transport_covariance(wrapped, key_belief.sigma)
+    else:
+        mu_t = transport_mean(omega.unsqueeze(0), key_belief.mu.unsqueeze(0))[0]
+        sigma_t = transport_covariance(omega.unsqueeze(0), key_belief.sigma.unsqueeze(0))[0]
 
     fam = get_family(family)
     sd = self_divergence_for_alpha(fam(belief.mu, belief.sigma), fam(mu_p, sigma_p), alpha=alpha_div, kl_max=kl_max,
@@ -236,7 +246,7 @@ def phi_alignment_loss(
     group:     GaugeGroup,
 
     *,
-    tau:       float = 1.0,
+    tau:       'float | torch.Tensor' = 1.0,
     alpha_div: float = 1.0,
     kl_max:    float = 100.0,
     eps:       float = 1e-6,
@@ -267,9 +277,13 @@ def phi_alignment_loss(
     """
     # Build Omega under the ACTIVE connection regime so the phi step descends the SAME objective as
     # the mu/sigma step. regime_ii reads the (fixed) belief means mu and the learned connection_W;
-    # mu and connection_W are held constant w.r.t. the phi gradient (only phi varies).
-    omega = _transport(phi, group, transport_mode=transport_mode, mu=mu,
-                       connection_W=connection_W, cocycle_relaxation=cocycle_relaxation)
+    # mu and connection_W are held constant w.r.t. the phi gradient (only phi varies). The
+    # factored-when-fusable dispatch (audit 2026-06-09 PE3) builds the per-token exps FROM THE
+    # LIVE phi leaf -- the factored container is differentiable in phi, so the envelope
+    # phi-gradient is preserved while the per-iteration dense (N,N,K,K) Omega disappears on the
+    # flat equal-blocks path.
+    omega = build_belief_transport(phi, group, transport_mode=transport_mode, mu=mu,
+                                   connection_W=connection_W, cocycle_relaxation=cocycle_relaxation)
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma)
     fam = get_family(family)
@@ -289,7 +303,7 @@ def e_step_iteration(
     group:                     GaugeGroup,
 
     *,
-    tau:                       float = 1.0,
+    tau:                       'float | torch.Tensor' = 1.0,
     e_mu_lr:                   float = 0.1,
     e_sigma_lr:                float = 0.1,
     e_phi_lr:                  float = 0.1,
@@ -347,6 +361,25 @@ def e_step_iteration(
         mu=belief.mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
         rope=rope, rope_on_cov=rope_on_cov,
     )
+    # Runtime truncation warning (audit 2026-06-09 P8): under the 'unroll' estimator with a LIVE
+    # belief, a non-kernel route is served by the autograd oracle, which returns a DETACHED
+    # tangent unless oracle_unroll_grad=True -- silently severing the unrolled-through-inference
+    # signal to the prior tables. The config-time warning covers only the learnable-parameter
+    # cases; this fires when the truncation actually happens (default warnings filter: once).
+    if (e_step_gradient == "unroll" and not oracle_unroll_grad and belief.mu.requires_grad
+            and not uses_kernel_route(
+                alpha_div=alpha_div, gradient_mode=gradient_mode, family=family,
+                divergence_family=divergence_family,
+                include_attention_entropy=include_attention_entropy)):
+        import warnings
+        warnings.warn(
+            "e_step_gradient='unroll' is being served by the autograd ORACLE with "
+            "oracle_unroll_grad=False: the belief gradient is a detached tangent, so the "
+            "unrolled-through-inference signal to the prior tables is truncated. Set "
+            "oracle_unroll_grad=True for the differentiable oracle (or use the kernel route).",
+            UserWarning,
+            stacklevel=2,
+        )
     grad_mu, grad_sigma = belief_gradients(
         belief.mu, belief.sigma, mu_p, sigma_p, omega,
         tau=tau, alpha_div=alpha_div, value=value, b0=b0, c0=c0, lambda_beta=lambda_beta,
@@ -408,6 +441,11 @@ def e_step_iteration(
                 mass_phi=mass_phi, lambda_beta=lambda_beta, family=family, divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy, log_prior=log_prior,
                 transport_mode=transport_mode, cocycle_relaxation=cocycle_relaxation,
+                # INTENTIONAL asymmetry (audit 2026-06-09 D3): connection_W is detached here, so
+                # the learned Regime-II connection trains ONLY through the mu/sigma belief path,
+                # never through the phi-step autograd island (whose grad is a constant tangent to
+                # the outer graph anyway when create_graph=False). Removing the detach would leak
+                # second-order phi-step terms into connection_W's gradient.
                 connection_W=(connection_W.detach() if connection_W is not None else None),
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]
@@ -427,7 +465,7 @@ def e_step(
 
     *,
     n_iter:            int   = 1,
-    tau:               float = 1.0,
+    tau:               'float | torch.Tensor' = 1.0,
     e_mu_lr:           float = 0.1,
     e_sigma_lr:        float = 0.1,
     e_phi_lr:          float = 0.1,
@@ -455,8 +493,11 @@ def e_step(
     def _f_diag(b: BeliefState) -> float:
         # Diagnostic scalar: under no_grad so the logged trajectory never enters the
         # training graph, and .item() instead of float(tensor) makes the host sync explicit.
+        # rope/rope_on_cov are forwarded explicitly (audit PP6): the logged F carries the same
+        # RoPE-wrapped transport the iterations descend.
         with torch.no_grad():
-            return free_energy_value(b, mu_p, sigma_p, group, tau=tau, log_prior=log_prior, **kwargs).item()
+            return free_energy_value(b, mu_p, sigma_p, group, tau=tau, log_prior=log_prior,
+                                     rope=rope, rope_on_cov=rope_on_cov, **kwargs).item()
 
     if return_trajectory:
         traj.append(_f_diag(belief))

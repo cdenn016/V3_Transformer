@@ -47,13 +47,19 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
     when set AND the selected builder accepts it (block_glk); otherwise the call is the bare
     positional dispatch, so the default (``cross_couplings=None``) path produces the SAME group
     object as before (byte-identical). Config validation already rejects cross_couplings against
-    a builder that does not accept the kwarg, so this is the forwarding seam, not a second guard."""
+    a builder that does not accept the kwarg, so this is the forwarding seam, not a second guard.
+    ``cfg.group_n`` / ``cfg.irrep_spec`` are forwarded the same way (the so_n/sp_n irrep-tower
+    builders; config validation rejects them for any other group)."""
     builder = get_group(cfg.gauge_group)
     arity = _positional_arity(builder)
     params = inspect.signature(builder).parameters
     kwargs: dict = {}
     if cfg.cross_couplings is not None and "cross_couplings" in params:
         kwargs["cross_couplings"] = cfg.cross_couplings
+    if cfg.group_n is not None and "group_n" in params:
+        kwargs["group_n"] = cfg.group_n
+    if cfg.irrep_spec is not None and "irrep_spec" in params:
+        kwargs["irrep_spec"] = cfg.irrep_spec
     # close_basis: AUTO (None) defaults to closing the basis under the Lie bracket exactly when a
     # cross_couplings chain is present (so the exponentiated off-block group is a well-defined
     # subalgebra of gl(K)); explicit True/False overrides. Forwarded only when the builder accepts
@@ -82,6 +88,22 @@ class VFEModel(nn.Module):
         # caller-set RNG state (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
         self.group = build_group(cfg)
+        # ALiBi-family priors carry a per-head (n_heads, N, N) axis, while the energy's head axis
+        # is len(irrep_dims); a mismatch right-aligns the prior's head axis against the BATCH axis
+        # of a single-block (B, N, N) energy -- silent corruption at B=1, RuntimeError otherwise
+        # (audit 2026-06-09 P1). Reject at construction. Single-block groups may run alibi with
+        # n_heads=1 (the (1, N, N) prior is squeezed to the (N, N) convention in
+        # _attention_log_prior below).
+        for _pname in ("attention_prior", "gamma_attention_prior"):
+            if (getattr(cfg, _pname) in ("alibi", "causal_alibi")
+                    and cfg.n_heads != len(self.group.irrep_dims)):
+                raise ValueError(
+                    f"{_pname}={getattr(cfg, _pname)!r} builds an (n_heads, N, N) prior but the "
+                    f"energy head axis is {len(self.group.irrep_dims)} "
+                    f"(irrep_dims={self.group.irrep_dims}); set "
+                    f"n_heads={len(self.group.irrep_dims)} or use a headless prior "
+                    f"(uniform/causal/windowed/...)."
+                )
         n_gen = self.group.generators.shape[0]
         self.prior_bank = PriorBank(
             cfg.vocab_size, cfg.embed_dim, n_gen,
@@ -247,14 +269,24 @@ class VFEModel(nn.Module):
         lets the gamma model-coupling block reuse the same cache under its own attention prior."""
         name = prior if prior is not None else self.cfg.attention_prior
         dtype = self.prior_bank.mu_embed.dtype
-        key = (name, n, device, dtype)
+        # The key carries every cfg field a builder consumes (n_heads, alibi_slope, window, T5
+        # bucketing) so a post-construction cfg mutation cannot serve a stale prior (audit PP4/P9).
+        key = (name, n, device, dtype, self.cfg.n_heads, self.cfg.alibi_slope,
+               self.cfg.attention_window, self.cfg.t5_num_buckets, self.cfg.t5_max_distance)
         cached = self._log_prior_cache.get(key)
         if cached is None:
             cached = attention_log_prior(
                 name, n, n,
                 device=device, dtype=dtype,
                 n_heads=self.cfg.n_heads, alibi_slope=self.cfg.alibi_slope,
+                window=self.cfg.attention_window,
+                num_buckets=self.cfg.t5_num_buckets, max_distance=self.cfg.t5_max_distance,
             )
+            # A (1, N, N) per-head prior on a single-block group collapses to the (N, N)
+            # single-block convention (the energy carries no head axis there); the construction
+            # guard above pins n_heads == 1 for that case, so shape[0] == 1 here.
+            if cached.dim() == 3 and len(self.group.irrep_dims) == 1:
+                cached = cached.squeeze(0)
             self._log_prior_cache[key] = cached
         return cached
 
@@ -547,24 +579,9 @@ class VFEModel(nn.Module):
             # (lambda_h=0 -> byte-identical to the term-absent path). Grad-connected (no detach), so
             # it backprops to the learned s/r tables (the channel trains), and computed from the
             # converged s/r tables OUTSIDE the E-step (s_i does not couple into q this increment).
-            # s_i is encoded fresh here and consumed by this term (and, sharing the same s tables, the
-            # gamma model-coupling block below); the h->s->p->q coupling and the s-channel E-step
-            # update remain DEFERRED. The covariance kernel is DiagonalGaussian regardless of
-            # cfg.family (the s/r tables are always diagonal (V,K)/(K,)); divergence_family is the
-            # orthogonal functional seam. r (K,) broadcasts over the (B, N) token axis.
-            from vfe3.families.gaussian import DiagonalGaussian
-            from vfe3.free_energy import self_divergence
-            cfg = self.cfg
-            pb = self.prior_bank
-            s_mu, s_sigma = pb.encode_s(token_ids)                       # (B, N, K)
-            r_mu = pb.r_mu                                               # (K,)
-            r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps)       # (K,)
-            hp = self_divergence(
-                DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),
-                alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
-                divergence_family=cfg.divergence_family,
-            ).mean()
-            loss = loss + cfg.lambda_h * hp
+            # The h->s->p->q coupling and the s-channel E-step update remain DEFERRED. The body
+            # lives in _hyper_prior_term so diagnostics logs the SAME term (audit V2).
+            loss = loss + self.cfg.lambda_h * self._hyper_prior_term(token_ids)
         if self.cfg.gamma_coupling > 0.0 and not self.cfg.s_e_step:
             # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
             # lines 1241-1249): L += gamma_coupling * mean_i F_red^s_i, the reduced (envelope) form of
@@ -581,42 +598,87 @@ class VFEModel(nn.Module):
             # to the gamma=0 path (the model channel is predictively INERT: s does NOT feed q). The
             # detach deliberately severs the phi<-gamma coupling that full tied transport would carry in
             # the canonical E-step F; restoring it (or keeping it severed) is part of the deferred s->q
-            # design, NOT this term. Computed once per forward at the loss level (like diagnostics()),
-            # via the DENSE Omega (not the hot-path FactoredTransport); the diagonal transport_covariance
-            # keeps only diag(Omega Sigma Omega^T), the same approximation the belief diagonal family
-            # uses. The mean over (B, H, N) makes gamma_coupling=1 a per-token-per-head mean weight, not
-            # the canonical sum-over-ij.
-            from vfe3.families.gaussian import DiagonalGaussian
-            from vfe3.free_energy import attention_tau, pairwise_energy, reduced_free_energy
-            from vfe3.geometry.transport import (
-                compute_transport_operators,
-                transport_covariance,
-                transport_mean,
-            )
-            cfg = self.cfg
-            pb = self.prior_bank
-            s_mu, s_sigma = pb.encode_s(token_ids)                       # (B, N, K)
-            n_pos = token_ids.shape[1]
-            omega = compute_transport_operators(out.phi.detach(), self.group)["Omega"]   # (B,N,N,K,K) tied+detached
-            s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
-            s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
-            e_s = pairwise_energy(
-                DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(s_mu_t, s_sigma_t),
-                alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
-                divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
-            )                                                            # (B,H,N,N) block_glk; (B,N,N) single-block
-            gamma_log_prior = self._attention_log_prior(
-                n_pos, token_ids.device, prior=cfg.gamma_attention_prior,
-            )                                                            # (N, N), cached buffer
-            # Group-aware temperature: tau spans the dimension the energy accumulates over (the
-            # gauge-irrep block size), exactly as the belief beta channel does. cfg.tau_gamma uses
-            # sqrt(d_head)=sqrt(K/n_heads), which is correct only for block_glk (irrep_dims=[d_head]*H)
-            # and understates tau by sqrt(n_heads) on a single-block group (irrep_dims=[K], energy over
-            # the full K). kappa_gamma is gamma's own sharpness handle (not cfg.kappa).
-            gamma_tau = attention_tau(_as_coeff(cfg.kappa_gamma, e_s.device), self.group.irrep_dims)
-            f_red_s = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior)   # (B,H,N) or (B,N)
-            loss = loss + cfg.gamma_coupling * f_red_s.mean()
+            # design, NOT this term. Computed once per forward at the loss level (like diagnostics()).
+            # The body lives in _gamma_coupling_term so diagnostics logs the SAME term (audit V2).
+            loss = loss + self.cfg.gamma_coupling * self._gamma_coupling_term(
+                token_ids, out.phi.detach())
         return logits, loss, ce.detach()
+
+    def _hyper_prior_term(
+        self,
+        token_ids: torch.Tensor,             # (B, N) integer token ids
+    ) -> torch.Tensor:                       # () mean_i KL(s_i || r)
+        r"""The hyper-prior channel term mean_i KL(s_i||r) (the lambda_h block, UNWEIGHTED).
+
+        s_i is encoded fresh from the s tables and pulled toward the global centroid r;
+        grad-connected (no detach) so the channel trains through forward, and shared with
+        :meth:`diagnostics` so the logged decomposition carries the SAME term (audit 2026-06-09
+        V2). The covariance kernel is DiagonalGaussian regardless of cfg.family (the s/r tables
+        are always diagonal (V,K)/(K,)); r (K,) broadcasts over the (B, N) token axis.
+        """
+        from vfe3.families.gaussian import DiagonalGaussian
+        from vfe3.free_energy import self_divergence
+        cfg = self.cfg
+        pb = self.prior_bank
+        s_mu, s_sigma = pb.encode_s(token_ids)                       # (B, N, K)
+        r_mu = pb.r_mu                                               # (K,)
+        r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps)       # (K,)
+        return self_divergence(
+            DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),
+            alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+            divergence_family=cfg.divergence_family,
+        ).mean()
+
+    def _gamma_coupling_term(
+        self,
+        token_ids: torch.Tensor,             # (B, N) integer token ids
+        phi:       torch.Tensor,             # (B, N, n_gen) converged gauge frame (detached by caller)
+    ) -> torch.Tensor:                       # () model-coupling block (UNWEIGHTED)
+        r"""The gamma model-coupling block at the given gauge frame (UNWEIGHTED).
+
+        The s-channel mirror of the belief beta block: tied flat transport from ``phi``,
+        E^s_ij = D(s_i || Omega s_j), gamma = softmax_j(log pi^s - E^s/tau_g), and either the
+        canonical envelope -tau_g log Z^s (include_attention_entropy=True) or the surrogate
+        sum_j gamma_ij E^s_ij (False; audit P6 -- one toggle, both channels). Shared by
+        ``forward`` (grad to the s tables; caller detaches phi) and :meth:`diagnostics`
+        (audit V2). Transport is factored-when-fusable (audit P4), exactly the E-step dispatch.
+        """
+        from vfe3.families.gaussian import DiagonalGaussian
+        from vfe3.free_energy import (
+            attention_tau,
+            attention_weights,
+            pairwise_energy,
+            reduced_free_energy,
+        )
+        from vfe3.geometry.transport import transport_covariance, transport_mean
+        from vfe3.inference.e_step import build_belief_transport
+        cfg = self.cfg
+        pb = self.prior_bank
+        s_mu, s_sigma = pb.encode_s(token_ids)                       # (B, N, K)
+        n_pos = token_ids.shape[1]
+        omega = build_belief_transport(phi, self.group, transport_mode="flat")
+        s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
+        s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
+        e_s = pairwise_energy(
+            DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(s_mu_t, s_sigma_t),
+            alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+            divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
+        )                                                            # (B,H,N,N) block_glk; (B,N,N) single-block
+        gamma_log_prior = self._attention_log_prior(
+            n_pos, token_ids.device, prior=cfg.gamma_attention_prior,
+        )                                                            # (N, N), cached buffer
+        # Group-aware temperature: tau spans the dimension the energy accumulates over (the
+        # gauge-irrep block size), exactly as the belief beta channel does. kappa_gamma is
+        # gamma's own sharpness handle (not cfg.kappa).
+        gamma_tau = attention_tau(_as_coeff(cfg.kappa_gamma, e_s.device), self.group.irrep_dims)
+        if cfg.include_attention_entropy:
+            # canonical: the envelope -tau_g log Z^s equals coupling + entropy at gamma*
+            f_red_s = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior)   # (B,H,N) or (B,N)
+            return f_red_s.mean()
+        # Surrogate parity with the belief channel (audit 2026-06-09 P6): with the
+        # attention-entropy term suppressed the block is sum_j gamma_ij E^s_ij at gamma*.
+        gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
+        return (gamma_w * e_s).sum(dim=-1).mean()
 
     @torch.no_grad()
     def generate(
@@ -783,6 +845,17 @@ class VFEModel(nn.Module):
                                           include_attention_entropy=cfg.include_attention_entropy,
                                           alpha_reg=(alpha_reg if cfg.alpha_mode != "constant" else None))
         d.update({k: float(v) for k, v in terms.items()})
+        # Model-channel terms (audit 2026-06-09 V2): when the lambda_h / gamma channels are live
+        # (and not folded into the belief anchor by s_e_step), the runtime loss carries them;
+        # report them and fold them into ``total`` so the logged decomposition equals the F the
+        # run actually descends (same helpers as forward, sequence 0 like the rest of this method).
+        if cfg.lambda_h > 0.0 and not cfg.s_e_step:
+            d["hyper_prior"] = float(cfg.lambda_h * self._hyper_prior_term(token_ids[:1]))
+            d["total"] += d["hyper_prior"]
+        if cfg.gamma_coupling > 0.0 and not cfg.s_e_step:
+            d["gamma_coupling"] = float(
+                cfg.gamma_coupling * self._gamma_coupling_term(token_ids[:1], out.phi.unsqueeze(0)))
+            d["total"] += d["gamma_coupling"]
         spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
         d["effective_rank"] = float(metrics.effective_rank(spec).mean())
         # Gauge-geometry probes (diagnostics tier): the curvature proxy -- mean Frobenius departure
@@ -828,6 +901,12 @@ class VFEModel(nn.Module):
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
+        if cfg.s_e_step:
+            # Live model channel (audit 2026-06-09 IE1): refine s and anchor the replayed belief
+            # (q0 AND the handoff prior below) to it, exactly as forward/diagnostics do, so the
+            # figure attention replays the model that actually trained.
+            s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
+            belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
         fam = get_family(cfg.family)

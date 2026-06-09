@@ -16,16 +16,19 @@ from vfe3.divergence import get_functional
 from vfe3.families.base import BeliefParams
 
 
-def _broadcast_tau(tau: 'float | torch.Tensor', energy_ndim: int) -> 'float | torch.Tensor':
+def _broadcast_tau(tau: 'float | torch.Tensor', energy: torch.Tensor) -> 'float | torch.Tensor':
     r"""Reshape a per-head (H,) tau so it broadcasts against an (..., H, N, N) energy.
 
     Scalar/0-d tau passes through unchanged (the single-block / scalar-kappa path).
     A 1-d (H,) tau is reshaped to (H, 1, 1): the head axis is always 3rd from the last
     in the energy tensor, so two trailing 1s align correctly for both the unbatched
-    (H, N, N) and batched (B, H, N, N) layouts.
+    (H, N, N) and batched (B, H, N, N) layouts. The reshape also moves tau onto the
+    energy's device (no-op when already there): attention_tau builds a CPU (H,) tau
+    when a SCALAR kappa meets unequal irrep dims, and this is the one funnel every
+    tau-consuming division passes through.
     """
     if isinstance(tau, torch.Tensor) and tau.dim() == 1:
-        return tau.reshape(tau.shape[0], 1, 1)
+        return tau.to(device=energy.device).reshape(tau.shape[0], 1, 1)
     return tau
 
 
@@ -38,11 +41,26 @@ def attention_tau(
 
     Single-block groups (glk / so_k / sp report ``irrep_dims=[K]``) accumulate the divergence over
     the full K, so d_energy = K. Per-head multi-block groups (block_glk: ``irrep_dims=[d_head]*H``)
-    accumulate per head, so d_energy = d_head. In both cases d_energy = ``irrep_dims[0]`` (the block
-    size), so kappa=1 recovers the Vaswani sqrt(d_k) temperature over the SAME dimension the energy
-    spans -- not sqrt(K/n_heads) on a single-block path whose energy is over the full K.
+    accumulate per head, so d_energy = d_head. In both EQUAL-block cases d_energy =
+    ``irrep_dims[0]`` and the return is the scalar kappa * sqrt(d) (byte-identical to before).
+    UNEQUAL blocks (the so_n/sp_n irrep towers, e.g. the SO(3) spin dims [1, 3, 5, 7]) get a
+    per-head (H,) tau with tau_h = kappa_h * sqrt(d_h), so every head's softmax runs at the
+    Vaswani temperature of the dimension ITS energy accumulates over; a scalar kappa broadcasts
+    across heads, a per-head (H,) kappa is elementwise. The (H,) tau broadcasts downstream via
+    ``_broadcast_tau`` (which also handles device placement against the energy).
     """
-    return kappa * (irrep_dims[0] ** 0.5)
+    if (isinstance(kappa, torch.Tensor) and kappa.dim() == 1
+            and kappa.shape[0] != len(irrep_dims)):
+        raise ValueError(
+            f"per-head kappa has {kappa.shape[0]} entries but the group has "
+            f"{len(irrep_dims)} irrep blocks (irrep_dims={irrep_dims})"
+        )
+    if len(set(irrep_dims)) == 1:
+        return kappa * (irrep_dims[0] ** 0.5)
+    sqrt_d = torch.tensor([float(d) for d in irrep_dims]).sqrt()   # (H,) per-block sqrt(d_h)
+    if isinstance(kappa, torch.Tensor):
+        sqrt_d = sqrt_d.to(device=kappa.device, dtype=kappa.dtype)
+    return kappa * sqrt_d
 
 
 def _stackable_for_batching(
@@ -217,11 +235,11 @@ def attention_weights(
     energy:    torch.Tensor,               # (..., N) or (..., N, N) per-key energies E_ij
 
     *,
-    tau:       float = 1.0,
+    tau:       'float | torch.Tensor' = 1.0,
     log_prior: Optional[torch.Tensor] = None,   # (..., N/NxN) bias B_ij; None -> 0
 ) -> torch.Tensor:                         # (...) softmax_j(B - E/tau)
     r"""Attention weights beta*_ij = softmax_j(B_ij - E_ij / tau)."""
-    logits = -energy / _broadcast_tau(tau, energy.dim())
+    logits = -energy / _broadcast_tau(tau, energy)
     if log_prior is not None:
         logits = logits + log_prior
     return torch.softmax(logits, dim=-1)
@@ -231,7 +249,7 @@ def log_partition(
     energy:    torch.Tensor,               # (..., N) or (..., N, N)
 
     *,
-    tau:       float = 1.0,
+    tau:       'float | torch.Tensor' = 1.0,
     log_prior: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:                         # (...) log Z_i = logsumexp_j(log pi - E/tau)
     r"""Log-partition log Z_i = logsumexp_j(log pi_ij - E_ij / tau), pi = softmax_j(B).
@@ -243,7 +261,7 @@ def log_partition(
     - logsumexp(B); using log_softmax(B) subtracts that per-row normalizer in one
     step. With a None prior pi is uniform 1/N, so the bias is -log(N).
     """
-    logits = -energy / _broadcast_tau(tau, energy.dim())
+    logits = -energy / _broadcast_tau(tau, energy)
     if log_prior is not None:
         logits = logits + torch.log_softmax(log_prior, dim=-1)
     else:
@@ -256,7 +274,7 @@ def reduced_free_energy(
     energy:    torch.Tensor,               # (..., N) or (..., N, N)
 
     *,
-    tau:       float = 1.0,
+    tau:       'float | torch.Tensor' = 1.0,
     log_prior: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:                         # (...) F_red,i = -tau log Z_i
     r"""Reduced (envelope) free energy F_red,i = -tau log Z_i; equals the canonical
@@ -265,8 +283,10 @@ def reduced_free_energy(
     lz = log_partition(energy, tau=tau, log_prior=log_prior)   # (..., N) or (..., H, N)
     # Per-head (H,) tau must broadcast against lz (..., H, N): reshape to (H, 1) so it aligns
     # with the head axis at -2 of lz. (H,1) right-aligns correctly for both (H,N) and (B,H,N).
-    # Scalar tau passes through _broadcast_tau unchanged.
-    _tau = tau.reshape(tau.shape[0], 1) if isinstance(tau, torch.Tensor) and tau.dim() == 1 else tau
+    # Scalar tau passes through unchanged. The .to() mirrors _broadcast_tau's device hop (a
+    # scalar-kappa x unequal-irrep-dims tau is born on CPU).
+    _tau = tau.to(device=lz.device).reshape(tau.shape[0], 1) \
+        if isinstance(tau, torch.Tensor) and tau.dim() == 1 else tau
     return -_tau * lz
 
 
@@ -276,7 +296,7 @@ def free_energy(
     alpha:                     torch.Tensor,        # (..., N) or (..., N, K) self-coupling
 
     *,
-    tau:                       float = 1.0,
+    tau:                       'float | torch.Tensor' = 1.0,
     lambda_beta:               'float | torch.Tensor' = 1.0,    # weight on the WHOLE belief-coupling block
     log_eps:                   float = 1e-12,                   # floor for log(beta)/log(pi) in the entropy term
     include_attention_entropy: bool  = True,
@@ -329,7 +349,7 @@ def free_energy(
     if include_attention_entropy:
         pi = torch.softmax(log_prior, dim=-1) if log_prior is not None \
             else torch.full_like(beta, 1.0 / beta.shape[-1])
-        _tau_e = _broadcast_tau(tau, energy.dim())    # (H,1,1) for per-head, scalar otherwise
+        _tau_e = _broadcast_tau(tau, energy)          # (H,1,1) for per-head, scalar otherwise
         entropy = (_tau_e * (beta * (torch.log(beta.clamp(min=log_eps)) - torch.log(pi.clamp(min=log_eps))))).sum()
         F = F + lambda_beta * entropy
     if log_likelihood is not None:                              # observation/data term -E_q[log p(o|k)] (gated stub; no live caller)
