@@ -174,8 +174,13 @@ config = dict(
     m_sigma_lr                = 0.00425,     
     m_phi_lr                  = 0.0135,   
     
+    mu_init_std               = 0.02,         # std of the random mean table mu_embed
+    sigma_init                = 1.0,          # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale                 = 0.01,         # std
+    
+    
     weight_decay              = 0.065,
-    phi_weight_decay          = 0.00,
+    phi_weight_decay          = 0.1,
     
     # divergence seam -- the f-divergence FUNCTIONAL (distinct from `family` below)
     divergence_family         = "renyi",             # "renyi"
