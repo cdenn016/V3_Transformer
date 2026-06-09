@@ -77,6 +77,18 @@ def irrep_dim(
     return _IRREPS[key][0](N, p)
 
 
+def irrep_generators(
+    G_def:   torch.Tensor,                 # (n_gen, N, N) defining-rep algebra basis (float64)
+
+    *,
+    algebra: str,                          # 'so' | 'sp'
+    label:   str,                          # e.g. 'l2' (so), 'sym3' (sp)
+) -> torch.Tensor:                         # (n_gen, d, d) generator images on the irrep
+    """Build one irrep's generator images (the registry's public single-label entry point)."""
+    key, p = _parse_label(algebra, label)
+    return _IRREPS[key][1](G_def, p)
+
+
 def _guard_cost(N: int, p: int) -> None:
     """The tensor-power construction works on N^p x N^p matrices with p! symmetrizer terms."""
     if p > 6 or N ** p > 60000:

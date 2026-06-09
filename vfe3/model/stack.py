@@ -26,6 +26,7 @@ def vfe_stack(
     log_prior:       Optional[torch.Tensor]    = None,
     block_norm:      Optional[Callable[..., torch.Tensor]] = None,   # cached norm instance (None -> off)
     head_mixer:      Optional[Callable[..., 'tuple']]      = None,   # opt-in Schur head mixer (None -> off)
+    cg_coupling:     Optional[Callable[..., 'tuple']]      = None,   # opt-in CG cross-type coupling (None -> off)
     log_alpha:       Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
     lambda_beta:     'float | torch.Tensor'    = 1.0,    # belief-coupling weight (cfg.lambda_beta or exp(log_lambda_beta))
     connection_W:    Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
@@ -49,7 +50,7 @@ def vfe_stack(
     rho_s = cfg.prior_handoff_sigma
     for _ in range(cfg.n_layers):
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
-                           block_norm=block_norm, head_mixer=head_mixer,
+                           block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
                            log_alpha=log_alpha, lambda_beta=lambda_beta,
                            connection_W=connection_W,
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov)

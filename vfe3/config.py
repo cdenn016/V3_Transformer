@@ -118,6 +118,12 @@ class VFE3Config:
     # blocks (block_glk / tied_block_glk), else VFEModel construction raises.
     use_head_mixer:            bool  = False
 
+    # CG cross-type coupling (opt-in, default off; so_n/sp_n only): bilinear Clebsch-Gordan
+    # between-block update on the means, exactly equivariant for any weights; sigma untouched
+    # (means-only phase; see the 2026-06-09 design spec). NEURAL-NETWORK EXCEPTION (sanctioned,
+    # default-off): learned scalar path weights, zero-init (step 0 byte-identical).
+    use_cg_coupling:           bool  = False
+
     # BCH positional encoding (default "learned"): a per-position Lie-algebra element pos_phi_i
     # composed into the token gauge frame via compose_phi BEFORE transport. "learned" owns a model
     # parameter table (max_seq_len, n_gen); "frozen" is the parameter-free i*pos_phi_scale on one
@@ -492,6 +498,11 @@ class VFE3Config:
         elif self.group_n is not None or self.irrep_spec is not None:
             raise ValueError(
                 f"group_n/irrep_spec are consumed only by gauge_group 'so_n'/'sp_n'; got "
+                f"gauge_group={self.gauge_group!r}"
+            )
+        if self.use_cg_coupling and self.gauge_group not in ("so_n", "sp_n"):
+            raise ValueError(
+                f"use_cg_coupling requires an irrep-labeled tower group ('so_n'/'sp_n'); got "
                 f"gauge_group={self.gauge_group!r}"
             )
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")

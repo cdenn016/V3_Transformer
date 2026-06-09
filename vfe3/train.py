@@ -89,6 +89,8 @@ def build_optimizer(
         groups.append({"params": [pb.output_proj_bias], "lr": cfg.m_mu_lr, "weight_decay": 0.0})
     if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
         groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_mu_lr})
+    if getattr(model, "cg_coupling", None) is not None:         # use_cg_coupling=True CG path weights
+        groups.append({"params": [model.cg_coupling.path_weights], "lr": cfg.m_mu_lr})
     if getattr(model, "pos_phi_free", None) is not None:        # pos_phi='learned' positional table
         pos_group = {"params": [model.pos_phi_free], "lr": cfg.m_phi_lr,      # a gauge-frame scale
                      "weight_decay": cfg.phi_weight_decay}                    # decayed like phi_embed

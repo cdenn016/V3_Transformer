@@ -105,14 +105,16 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     # mult), ...] with block dims summing to embed_dim (so_n 'l<p>': spin-p for group_n=3, dim
     # 2p+1; sp_n 'sym<p>': Sym^p of the defining rep). Both REQUIRED for so_n/sp_n, None
     # otherwise. These groups need phi_precond_mode in none/clip/killing (per-block modes are
-    # rejected: tied gauge) and equal blocks for use_head_mixer -- the sweep arms below handle
-    # both overrides.
+    # rejected: tied gauge) -- the sweep arms below override phi_precond_mode.
+    # use_head_mixer works on every tower (per-isotypic-component mixing).
     group_n                   = None,                # so_n/sp_n only: N of SO(N) / 2m of Sp(2m)
     irrep_spec                = None,                # so_n/sp_n only: [(label, mult), ...]; dims sum == embed_dim
 
     gauge_parameterization    = "phi",               # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
-    use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks: block_glk/tied_block_glk);
+    use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                                      # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
+    use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling (bilinear, exactly
+                                                     # equivariant, means-only sigma; zero-init path weights)
 
     decode_bias               = False,
 
@@ -288,14 +290,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     # === gauge seam ========================================================
-    # use_head_mixer (True at baseline) needs >= 2 equal blocks (block_glk / tied_block_glk);
+    # use_head_mixer (True at baseline) needs >= 2 equal blocks (block_glk / tied_block_glk) or a labeled irrep tower (so_n/sp_n);
     # the single-block glk / so_k / sp arms turn it off so the model constructs.
     # so_n / sp_n irrep-tower arms (heads = irreps; group_n decoupled from K): irrep_spec dims
     # must sum to the baseline embed_dim=20, and the TIED gauge rejects the per-block phi
     # preconditioners, so these arms override phi_precond_mode (baseline pullback_per_block).
     # Equal-block arms keep the head mixer (kron(A, I_d) IS the Schur commutant of mult copies
-    # of one irrep, exactly equivariant under the tied gauge); the unequal spin-tower arm
-    # disables it.
+    # of one irrep, exactly equivariant under the tied gauge).
     "gauge_group": {
         "description": "gauge group",
         "configs": [
@@ -308,7 +309,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
              "irrep_spec": [("l2", 4)],                       "phi_precond_mode": "killing"},
             {"label": "so3_tower",      "gauge_group": "so_n", "group_n": 3,
              "irrep_spec": [("l0", 1), ("l1", 1), ("l3", 1), ("l4", 1)],
-             "use_head_mixer": False,                         "phi_precond_mode": "killing"},
+                                                              "phi_precond_mode": "killing"},
             {"label": "sp4_sym2x2",     "gauge_group": "sp_n", "group_n": 4,
              "irrep_spec": [("sym2", 2)],                     "phi_precond_mode": "killing"},
         ],
@@ -511,7 +512,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === belief-table init scales (PriorBank) ===============================
     "mu_init_std": {
         "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
-        "param": "mu_init_std", "values": [0.0575, 0.0625],
+        "param": "mu_init_std", "values": [0.055, 0.065],
     },
     
     "sigma_init": {
@@ -521,7 +522,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "phi_scale": {
         "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
-        "param": "phi_scale", "values": [0.01, 0.025, 0.05, 0.075, 0.1],
+        "param": "phi_scale", "values": [0.06, 0.07],
     },
     
 
