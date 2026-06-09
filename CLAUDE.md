@@ -16,7 +16,7 @@ This V3 is intended to be a production quality continuation of the VFE_2.0 trans
   against the KL-to-prior decode. Encode and the free-energy self-coupling stay on the
   PriorBank. (2) `use_head_mixer=True` applies a learned Schur-commutant per-irrep-block
   head mixer; under `block_glk`'s untied per-block gauge it breaks strict gauge
-  equivariance (exact at identity init, deviates as the mixer drifts) — user-accepted.
+  equivariance (exact at identity init, deviates as the mixer drifts) — user-accepted. Its irrep-tower siblings (so_n/sp_n) are the isotypic per-type mixer (exactly equivariant under the tied gauge) and, under use_cg_coupling=True, learned scalar Clebsch-Gordan path weights (exactly equivariant for any weights; means-only sigma) -- both zero-init, default OFF.
   (3) `transport_mode='regime_ii'` consumes a learned bilinear connection `connection_W`
   (`(n_gen, K, K)` nn.Parameter, default OFF; flat Regime-I is the pure path). Its edge factor
   `exp(delta_ij·G)`, `delta_ij^a = mu_i^T W^a mu_j`, is gauge-INVARIANT only at `W=0` (the only

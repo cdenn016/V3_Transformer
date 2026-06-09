@@ -32,6 +32,7 @@ def vfe_block(
     log_prior:       Optional[torch.Tensor]    = None,
     block_norm:      Optional[Callable[..., torch.Tensor]] = None,   # cached norm instance (None -> off)
     head_mixer:      Optional[Callable[..., 'tuple']]      = None,   # opt-in Schur head mixer (None -> off)
+    cg_coupling:     Optional[Callable[..., 'tuple']]      = None,   # opt-in CG cross-type coupling (None -> off)
     log_alpha:       Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
     lambda_beta:     'float | torch.Tensor'    = 1.0,    # belief-coupling weight (cfg.lambda_beta or exp(log_lambda_beta))
     connection_W:    Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
@@ -72,6 +73,9 @@ def vfe_block(
     if head_mixer is not None:               # opt-in head mixing: after the E-step, BEFORE the norm
         mu_mixed, sigma_mixed = head_mixer(out.mu, out.sigma)   # so the mixed belief feeds norm + handoff
         out = BeliefState(mu=mu_mixed, sigma=sigma_mixed, phi=out.phi)   # (VFE_2.0 per-block order)
+    if cg_coupling is not None:              # opt-in CG cross-type coupling: after mixing, before norm
+        mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)
+        out = BeliefState(mu=mu_cg, sigma=sigma_cg, phi=out.phi)
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         out = BeliefState(mu=block_norm(out.mu, out.sigma), sigma=out.sigma, phi=out.phi)
     return out

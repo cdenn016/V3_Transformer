@@ -97,6 +97,8 @@ config = dict(
     gauge_parameterization    = "phi",               # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
     use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                                      # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
+    use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling (bilinear, exactly
+                                                     # equivariant, means-only sigma; zero-init path weights)
 
     decode_bias               = False,
 

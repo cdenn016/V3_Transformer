@@ -130,6 +130,15 @@ class VFEModel(nn.Module):
         self.head_mixer = HeadMixer(self.group.irrep_dims,
                                     irrep_labels=self.group.irrep_labels) \
             if cfg.use_head_mixer else None
+        # Opt-in CG cross-type coupling (default off; so_n/sp_n only). Built ONCE from the
+        # group's labels; CGCoupling raises at construction when no admissible paths exist.
+        if cfg.use_cg_coupling:
+            from vfe3.model.cg_coupling import CGCoupling
+            self.cg_coupling = CGCoupling(
+                cfg.group_n, "so" if cfg.gauge_group == "so_n" else "sp",
+                self.group.irrep_dims, self.group.irrep_labels)
+        else:
+            self.cg_coupling = None
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED scalar self-coupling alpha.
         # When alpha_mode='learnable', create log_alpha as a trainable nn.Parameter; the consumed
         # coupling is alpha = exp(log_alpha) (always positive). Init 0 -> alpha = exp(0) = 1.0, so a
@@ -471,7 +480,8 @@ class VFEModel(nn.Module):
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm,
-                            head_mixer=self.head_mixer, log_alpha=log_alpha,
+                            head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
+                            log_alpha=log_alpha,
                             lambda_beta=lambda_beta,
                             connection_W=connection_W, e_step_gradient=e_step_gradient,
                             rope=rope, rope_on_cov=self.cfg.rope_full_gauge)
@@ -793,6 +803,7 @@ class VFEModel(nn.Module):
             belief, belief.mu, belief.sigma, self.group, cfg,
             log_prior=log_prior, block_norm=self.block_norm,
             head_mixer=self.head_mixer,                               # per-block mixing -> diagnostics' final belief matches forward
+            cg_coupling=self.cg_coupling,
             log_alpha=getattr(self, "log_alpha", None),               # learned scalar (None on the pure path)
             lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
@@ -927,6 +938,7 @@ class VFEModel(nn.Module):
                 log_alpha=getattr(self, "log_alpha", None),
                 lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
+                cg_coupling=self.cg_coupling,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
             )
             # Attention at the converged belief, recomputed exactly as diagnostics does: the
