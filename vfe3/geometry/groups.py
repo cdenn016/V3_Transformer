@@ -38,6 +38,8 @@ class GaugeGroup:
     irrep_dims:         List[int]             # block sizes; sum == K
     skew_symmetric:     bool                  # exp(-M) = exp(M)^T fast path
     invariant_families: Tuple[str, ...] = ("gaussian",)
+    irrep_labels:       Optional[List[str]]   = None              # per-block irrep label ('l1', 'sym2', ...);
+                                                                  # None for label-less groups (glk/block_glk/...)
 
     def __post_init__(self) -> None:
         K = self.generators.shape[-1]
@@ -45,6 +47,11 @@ class GaugeGroup:
             raise ValueError(
                 f"sum(irrep_dims)={sum(self.irrep_dims)} must equal K={K}; "
                 f"irrep_dims={self.irrep_dims}"
+            )
+        if self.irrep_labels is not None and len(self.irrep_labels) != len(self.irrep_dims):
+            raise ValueError(
+                f"irrep_labels has {len(self.irrep_labels)} entries but there are "
+                f"{len(self.irrep_dims)} irrep blocks"
             )
 
     def invariant_for(self, family: str) -> bool:
@@ -284,11 +291,13 @@ def _build_so_n(
         raise ValueError(
             f"irrep_spec blocks {dims} sum to {sum(dims)} != K={K} (group_n={group_n})"
         )
+    labels = [lab for lab, mult in irrep_spec for _ in range(int(mult))]
     return GaugeGroup(
         name="so_n",
         generators=G.to(dtype).to(device),
         irrep_dims=dims,
         skew_symmetric=True,
+        irrep_labels=labels,
     )
 
 
@@ -324,11 +333,13 @@ def _build_sp_n(
         raise ValueError(
             f"irrep_spec blocks {dims} sum to {sum(dims)} != K={K} (group_n={group_n})"
         )
+    labels = [lab for lab, mult in irrep_spec for _ in range(int(mult))]
     return GaugeGroup(
         name="sp_n",
         generators=G.to(dtype).to(device),
         irrep_dims=dims,
         skew_symmetric=False,
+        irrep_labels=labels,
     )
 
 

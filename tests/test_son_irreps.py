@@ -227,3 +227,24 @@ def test_model_runs_under_so_n_irrep_tower():
     # per-head attention over UNEQUAL irrep blocks: H = number of blocks
     maps = model.attention_maps(torch.randint(0, 20, (2, 5)))
     assert maps.shape == (1, 2, 5, 5)
+
+
+# ---------------------------------------------------------------- irrep_labels field
+
+def test_groups_expose_irrep_labels():
+    grp = get_group("so_n")(14, group_n=3,
+                            irrep_spec=[("l0", 1), ("l1", 2), ("l3", 1)])
+    assert grp.irrep_dims == [1, 3, 3, 7]
+    assert grp.irrep_labels == ["l0", "l1", "l1", "l3"]
+    grp2 = get_group("sp_n")(5, group_n=4, irrep_spec=[("sym0", 1), ("sym1", 1)])
+    assert grp2.irrep_labels == ["sym0", "sym1"]
+    # legacy groups carry no labels
+    assert get_group("glk")(4).irrep_labels is None
+    assert get_group("block_glk")(6, 3).irrep_labels is None
+
+
+def test_irrep_labels_length_validated():
+    from vfe3.geometry.groups import GaugeGroup
+    with pytest.raises(ValueError, match="irrep_labels"):
+        GaugeGroup(name="x", generators=torch.zeros(1, 4, 4), irrep_dims=[2, 2],
+                   skew_symmetric=True, irrep_labels=["a"])
