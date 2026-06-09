@@ -79,135 +79,156 @@ logger = logging.getLogger("ablation")
 BASELINE_CONFIG: Dict[str, Any] = dict(
     
 
+
     # model structure
-    vocab_size                 = 50257,                       # gpt2/tiktoken vocab (dataset-fixed)
-   
-    embed_dim                  = 20,                          # K (must be divisible by n_heads)
-    n_heads                    = 2,
+    vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    max_seq_len                = 128,                         # N, context length
+    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 2,
     
-    batch_size                 = 128,
-    max_steps                  = 2000,
+    max_seq_len               = 128,                 # N, context length
     
-    n_layers                   = 1,                           # L, number of blocks
-    n_e_steps                  = 1,                           # T, E-step inner iterations
-
-    # belief-table init scales (PriorBank)
-    mu_init_std                = 0.02,                         # std of mu_embed ~ N(0, mu_init_std^2)
-    sigma_init                 = 1.0,                          # constant initial coordinate variance (>0)
-    phi_scale                  = 0.01,                         # std of phi_embed ~ N(0, phi_scale^2)
-
+    batch_size                = 64,
+    max_steps                 = 10000,
+    
+    n_layers                  = 1,                   # L, number of blocks
+    n_e_steps                 = 1,                   # T, E-step inner iterations
+    
+    
 
     # gauge seam
-    gauge_group                = "block_glk",                 # "glk"|"block_glk"|"tied_block_glk"|"so_k"|"sp"
-    gauge_parameterization     = "phi",                       # "phi" (omega_direct: live-rejected)
-   
-    transport_mode             = "flat",                      # "flat" (pure no-NN) | "regime_ii" (learned, NN exception)
-    cocycle_relaxation         = 1.0,                         # regime_ii homotopy (ignored by flat)
-    
-    cross_couplings            = None,                        # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only
-    
-    use_head_mixer             = True,                        # Schur-commutant head mixer (needs >=2 equal blocks)
+    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+                                                     # tied_block_glk: one shared GL(d) frame across heads (kron(I_n, gl(d)))
 
-    decode_bias                = False,
+    # so_n / sp_n irrep towers (heads = irreps; see train_vfe3.py for the full notes). Structure
+    # group SO(group_n) / Sp(group_n), group_n DECOUPLED from embed_dim; irrep_spec = [(label,
+    # mult), ...] with block dims summing to embed_dim (so_n 'l<p>': spin-p for group_n=3, dim
+    # 2p+1; sp_n 'sym<p>': Sym^p of the defining rep). Both REQUIRED for so_n/sp_n, None
+    # otherwise. These groups need phi_precond_mode in none/clip/killing (per-block modes are
+    # rejected: tied gauge) and equal blocks for use_head_mixer -- the sweep arms below handle
+    # both overrides.
+    group_n                   = None,                # so_n/sp_n only: N of SO(N) / 2m of Sp(2m)
+    irrep_spec                = None,                # so_n/sp_n only: [(label, mult), ...]; dims sum == embed_dim
 
-    # positional encoding
-    pos_phi                    = "learned",                   # "none" (pure path) | "learned" | "frozen"
-    pos_phi_compose            = "bch",                       # "bch" | "euclidean"
-    
-    pos_phi_scale              = 0.02,
-    
-    pos_phi_project_slk        = False,
-    
-    pos_rotation               = "none",                      # "none" | "rope"
-    rope_base                  = 100.0,
-    rope_full_gauge            = False,                       # rotate covariance (REQUIRES diagonal_covariance=False)
+    gauge_parameterization    = "phi",               # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
+    use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks: block_glk/tied_block_glk);
+                                                     # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
 
-    # belief family (diagonal_covariance MUST equal family == "gaussian_diagonal")
-    diagonal_covariance        = True,
-    family                     = "gaussian_diagonal",         # "gaussian_diagonal" | "gaussian_full"
+    decode_bias               = False,
+
+    # connection regime (orthogonal to gauge_parameterization)
+    transport_mode            = "flat",              # "flat" (Regime-I phi-cocycle, pure no-NN) | "regime_ii"
+                                                     # (learned bilinear edge connection; sanctioned NN exception, default-off)
+    cocycle_relaxation        = 1.0,                 # regime_ii homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
+    cross_couplings           = None,                # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only (None = block-diagonal gauge)
+
+    # positional encoding -- BCH gauge-frame PE (pos_phi) + gauge-RoPE (pos_rotation)
+    pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
+    pos_phi_compose           = "bch",               # composition chart: "bch" | "euclidean"
+    
+       
+    pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
+    
+    pos_phi_project_slk       = False,               # per-block trace projection (det Omega = 1)
+    
+    pos_rotation              = "none",              # "none" | "rope" (block-diagonal positional rotation folded into transport)
+    rope_base                 = 100.0,               # rotary frequency base
+    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES diagonal_covariance=False)
+
+    # belief family -- diagonal_covariance MUST equal (family == "gaussian_diagonal")
+    diagonal_covariance       = True,
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
 
     # free-energy coupling
-    alpha                      = 1.0,                         # constant self-coupling value
-    alpha_mode                 = "state_dependent_per_coord", # "constant"|"state_dependent"|"state_dependent_per_coord"|"learnable"
-    b0                         = 1.0,
-    c0                         = 1.0,
     
-    kappa                      = 1.0,                         # tau = kappa * sqrt(d_head)
+    alpha_mode                = "state_dependent_per_coord",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
+    b0                        = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
+    c0                        = 1.0,                 # state-dependent alpha shape (numerator)
+    
+    learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
+    
+    kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
 
-    lambda_beta                = 1.0,                         # belief-coupling block weight (1.0 = pure F)
-    learnable_lambda_beta      = False,                       # learn lambda_beta (NN exception; exp(log_lambda_beta))
+    alpha                     = 1.0,                 # constant self-coupling value
+    lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
+    mass_phi                  = 0.0,                 # (mass_phi/2) ||phi||^2 penalty
+    mstep_self_coupling_weight = 0.00,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    
+    
+    lambda_h                  = 0.0,           # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
+    gamma_coupling            = 0.0,                 # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
+    kappa_gamma               = 1.0,                 # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
+    gamma_attention_prior     = "causal",            # model-channel prior pi^s_ij: "uniform" | "causal" | "alibi"
+    prior_source              = "token",             # which table supplies the belief prior p_i: "token" | "model_channel"
 
-    mass_phi                   = 0.0,
-
-        # attention
-    include_attention_entropy  = True,                        # canonical F vs entropy-suppressed surrogate
-    attention_prior            = "causal",                    # "uniform" | "causal" | "alibi"
+    # attention
+    include_attention_entropy = True,                # canonical F (True) vs entropy-suppressed surrogate (False)
+    attention_prior           = "causal",            # "uniform" | "causal" | "alibi"
 
     # E-step
-    e_mu_lr                    = 0.7,
-    e_sigma_lr                 = 0.025,
-    e_phi_lr                   = 0.0,
-   
+    e_mu_lr                   = 0.9,
+    e_sigma_lr                = 0.025,
+    e_phi_lr                  = 0.0,
     
     e_mu_q_trust              = None,
-    e_sigma_q_trust            = 5.0,
-    sigma_max                  = 15.0,
+    e_sigma_q_trust           = 5.0,
+    sigma_max                 = 10.0,
     
-    gradient_mode              = "filtering",                 # "filtering" | "smoothing"
+    gradient_mode             = "filtering",          # "filtering" | "smoothing"
     
     m_phi_natural_grad        = False,
-    phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
-
-    phi_retract_mode           = "bch",                       # "euclidean" | "bch"
     
+    phi_precond_mode          = "pullback_per_block",         # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
+    phi_retract_mode          = "bch",                # "euclidean" | "bch"
+    spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
     # decode / encode
-    use_prior_bank             = False,                       # True: KL-to-prior (pure) | False: linear projection
-    decode_tau                 = 1.0,
-    decode_mode                = "diagonal",                  # "diagonal" | "diagonal_chunked" | "full"
-    decode_chunk_size          = 8192,
-    encode_mode                = "per_token",                 # "per_token" (gauge_fixed: live-rejected)
+    use_prior_bank            = False,                # True: KL-to-prior decode (pure path). False: linear projection
+                                                     # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
+    decode_tau                = 0.1,
+    decode_mode               = "diagonal",          # "diagonal" | "diagonal_chunked" | "full"
+    decode_chunk_size         = 8192,                # vocab-chunk width for decode_mode="diagonal_chunked" (ignored otherwise)
+    encode_mode               = "per_token",         # "per_token" | "gauge_fixed" (gauge_fixed: live-rejected stub)
 
-    # cross-block belief handoff
-    prior_handoff_rho          = 0.0,                         # 1.0 = full flow; 0.0 = frozen
-    prior_handoff_sigma        = 0.0,
+    # cross-block belief handoff (mu_q -> mu_p)
+    prior_handoff_rho         = 0.0,                 # 1.0 = full flow; 0.0 = priors frozen
+    prior_handoff_sigma       = 0.0,                 # sigma damping in [0,1] (0.0 = frozen at embedding)
 
     # normalization
-    norm_type_block            = "none",                      # "none" | "mahalanobis"
-    norm_type_final            = "none",                      # "none" | "mahalanobis"
+    norm_type_block           = "none",              # "none" | "mahalanobis"
+    norm_type_final           = "none",              # "none" | "mahalanobis"
 
     # M-step / training
-    e_step_gradient            = "unroll",                    # "unroll" | "straight_through" | "detach"
-    detach_e_step              = False,
-    
-    grad_accum_steps           = 1,
-    
-    m_mu_lr                    = 0.015,
-    m_sigma_lr                 = 0.0021,
-    m_phi_lr                   = 0.015,
-    
-    weight_decay               = 0.05,
-    phi_weight_decay           = 0.05,
-   
-    warmup_steps               = 1,
-    seed                       = 6,                           # overridden per run by CONFIG["seed"]
-    min_lr                     = 0,
-    min_lr_frac                = 0.01,   
-    
-    log_interval               = 1000,
-    eval_interval              = 15000,
-    checkpoint_interval        = 25000,                       # forced to 0 per cell (no checkpoint blowup)
-    
-    
-    # numerics
-    eps                        = 1e-6,
-    kl_max                     = 100.0,
+    e_step_gradient           = "unroll",            # E-step backward: "unroll" | "straight_through" | "detach" (reconciled w/ detach_e_step)
+    detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
+    grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
 
-    # divergence seam (f-divergence FUNCTIONAL, distinct from `family`)
-    divergence_family          = "renyi",                    # "renyi"
-    alpha_div                  = 1.0,                         # Renyi order (1.0 -> KL)
+    m_mu_lr                   = 0.0140,   
+    m_sigma_lr                = 0.00425,     
+    m_phi_lr                  = 0.015,   
+    
+    mu_init_std               = 0.06,         # std of the random mean table mu_embed
+    sigma_init                = 4.0,          # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale                 = 0.05,         # std
+    
+    
+    weight_decay              = 0.02,
+    phi_weight_decay          = 0.05,
+    
+    # divergence seam -- the f-divergence FUNCTIONAL (distinct from `family` below)
+    divergence_family         = "renyi",             # "renyi"
+    alpha_div                 = 1.0,                  # Renyi order (1.0 -> KL)
+    
+    warmup_steps              = 100,
+    min_lr                    = 0,                # absolute cosine-decay LR floor (0.0 = pure cosine)
+    min_lr_frac               = 0.01,                 # proportional LR floor, max(min_lr, frac*base); OFF
+    amp_dtype                 = None,                # None=fp32 | 'bf16' ('fp16' needs a GradScaler: deferred)
+    
+    
+    log_interval              = 2500,                  # console log every N steps (0 = off)
+    eval_interval             = 10000,                   # periodic validation every N steps (0 = off)
+    checkpoint_interval       = 15000,                  # save a resumable checkpoint every N steps (0 = off)
+                        # Renyi order (1.0 -> KL)
     
 )
 
@@ -269,6 +290,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === gauge seam ========================================================
     # use_head_mixer (True at baseline) needs >= 2 equal blocks (block_glk / tied_block_glk);
     # the single-block glk / so_k / sp arms turn it off so the model constructs.
+    # so_n / sp_n irrep-tower arms (heads = irreps; group_n decoupled from K): irrep_spec dims
+    # must sum to the baseline embed_dim=20, and the TIED gauge rejects the per-block phi
+    # preconditioners, so these arms override phi_precond_mode (baseline pullback_per_block).
+    # Equal-block arms keep the head mixer (kron(A, I_d) IS the Schur commutant of mult copies
+    # of one irrep, exactly equivariant under the tied gauge); the unequal spin-tower arm
+    # disables it.
     "gauge_group": {
         "description": "gauge group",
         "configs": [
@@ -277,6 +304,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "glk",            "gauge_group": "glk",  "use_head_mixer": False},
             {"label": "so_k",           "gauge_group": "so_k", "use_head_mixer": False},
             {"label": "sp",             "gauge_group": "sp",   "use_head_mixer": False},
+            {"label": "so3_spin2x4",    "gauge_group": "so_n", "group_n": 3,
+             "irrep_spec": [("l2", 4)],                       "phi_precond_mode": "killing"},
+            {"label": "so3_tower",      "gauge_group": "so_n", "group_n": 3,
+             "irrep_spec": [("l0", 1), ("l1", 1), ("l3", 1), ("l4", 1)],
+             "use_head_mixer": False,                         "phi_precond_mode": "killing"},
+            {"label": "sp4_sym2x2",     "gauge_group": "sp_n", "group_n": 4,
+             "irrep_spec": [("sym2", 2)],                     "phi_precond_mode": "killing"},
         ],
     },
     
@@ -477,15 +511,17 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === belief-table init scales (PriorBank) ===============================
     "mu_init_std": {
         "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
-        "param": "mu_init_std", "values": [0.07, 0.09, 0.11, 0.15],
+        "param": "mu_init_std", "values": [0.0575, 0.0625],
     },
+    
     "sigma_init": {
         "description": "constant initial coordinate variance of the prior table (>0)",
-        "param": "sigma_init", "values": [0.25, 0.5, 1.0, 2.0, 4.0],
+        "param": "sigma_init", "values": [0.5, 1, 3, 4],
     },
+    
     "phi_scale": {
         "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
-        "param": "phi_scale", "values": [0.025, 0.075],
+        "param": "phi_scale", "values": [0.01, 0.025, 0.05, 0.075, 0.1],
     },
     
 
@@ -521,30 +557,28 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
        "param": "e_phi_lr", "values": [0.0, 0.005, 0.01],
    },
     
-    
-    
-    
+        
     
     "m_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "range": [0.013, 0.014, 0.00025],
+        "param": "m_mu_lr", "values": [0.010, 0.014, 0.016, 0.02],
     },
     
     "m_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_sigma_lr", "values": [0.0001, 0.0005, 0.001, 0.01],
+        "param": "m_sigma_lr", "values": [0.001, 0.004, 0.006, 0.01],
     },
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.001, 0.005, 0.01, 0.015, 0.02, 0.05,  0.1],
+        "param": "m_phi_lr", "values": [ 0.01, 0.0125, 0.015, 0.0175],
     },
     
     
     
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "range": [0.00, 0.08, 0.02],
+        "param": "weight_decay", "range": [0.00, 0.1, 0.02],
     },
     
     
@@ -574,7 +608,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "phi_weight_decay":{
         "description": "weight decay on phi",
-        "param": "phi_weight_decay", "values": [0.125, 0.15, 0.175],
+        "param": "phi_weight_decay", "values": [0.025, 0.05, 0.075, 0.1],
     },
 }
 
@@ -601,32 +635,34 @@ NON_SWEPT_FIELDS = (
 # CONFIG["sweep"]="<name>"); add or remove names to shape a session. Cheap-to-expensive is a good
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
+    
+    "mu_init_std",
+    "phi_scale",
+    
+    "m_sigma_lr",
+    
+    "m_mu_lr",
+    "m_phi_lr",
 
-   # "phi_weight_decay",    
-
-   # "phi_scale",
-   # "mu_init_std",
+    
+    
     "sigma_init", 
 
-  #  "m_phi_lr",
-    "m_mu_lr",
-   # "m_sigma_lr",
     
-    "weight_decay",
     
-    "e_mu_lr",
-    "lambda_beta",
+     #   "weight_decay",
+    
+  #  "kappa",
+  #  "alpha_div",
+  #$  "phi_weight_decay",    
+   # 
+    
+  #  "e_mu_lr",
+ #   "lambda_beta",
     
 
     #"c0",
     #"b0",
-   
-  # "alpha_div",
-    
-   #  
-
- #  
-  #  "kappa",
     
   #  "e_sigma_lr",
     

@@ -151,6 +151,8 @@ def test_gaussian_admissibility_is_declared():
     ("block_glk", {"K": 6, "n_heads": 3}),
     ("so_k",      {"K": 4}),
     ("sp",        {"K": 4}),
+    ("so_n",      {"K": 4, "group_n": 3, "irrep_spec": [("l0", 1), ("l1", 1)]}),
+    ("sp_n",      {"K": 5, "group_n": 4, "irrep_spec": [("sym0", 1), ("sym1", 1)]}),
 ])
 def test_full_kl_invariant_under_group_pushforward(spec):
     # For a random group element g = exp(sum_a c_a G_a), the Gaussian KL is

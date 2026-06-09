@@ -26,6 +26,7 @@ from vfe3.geometry.generators import (
     generate_son,
     generate_sp,
 )
+from vfe3.geometry.irreps import direct_sum_generators
 
 
 @dataclass
@@ -242,6 +243,93 @@ def check_admissible(
         if not torch.allclose(base, moved, atol=atol, rtol=rtol):
             return False
     return True
+
+
+@register_group("so_n")
+def _build_so_n(
+    K:          int,
+
+    *,
+    group_n:    Optional[int]                   = None,
+    irrep_spec: Optional[List[Tuple[str, int]]] = None,
+    dtype:      torch.dtype                     = torch.float32,
+    device:     'torch.device | str | None'     = None,
+) -> GaugeGroup:
+    r"""SO(N) acting on R^K through a DIRECT SUM of irreps (tied gauge; heads = irreps).
+
+    The structure group is SO(N) with N = ``group_n`` DECOUPLED from K. ``irrep_spec`` lists
+    (label, multiplicity) pairs; label 'l<p>' is the symmetric-traceless rank-p tensor irrep
+    (for N = 3 the spin-p block, dim 2p + 1), laid out contiguously in spec order with
+    sum(mult * dim) == K. One per-token phi coordinate vector (n_gen = N(N-1)/2) drives EVERY
+    block through that block's irrep image -- the SAME group element in different irreps, a
+    TIED gauge -- so the embedded generators are block-diagonal but do NOT partition per block
+    (per-block phi preconditioners are undefined; config rejects them). All blocks are built
+    in real orthonormal bases, so every embedded generator is exactly skew
+    (skew_symmetric=True: exp(-M) = exp(M)^T transport fast path; det Omega = 1 structurally).
+    'l0' (trivial) blocks carry ZERO generators: those coordinates are gauge-invariant by
+    construction. Unequal block dims are supported end-to-end (per-block energy loop,
+    per-head tau = kappa_h sqrt(d_h)); equal-dims specs (one label, mult > 1) additionally
+    keep the fused factored-transport fast path and the Schur-commutant head mixer (kron(A, I_d)
+    IS the commutant of mult copies of one irrep, and the tied gauge keeps it exactly
+    equivariant).
+    """
+    if group_n is None or irrep_spec is None:
+        raise ValueError(
+            "gauge_group='so_n' requires group_n (the N of SO(N)) and irrep_spec "
+            "([(label, mult), ...], labels 'l<p>'); set both in the config"
+        )
+    G_def = generate_son(group_n, dtype=torch.float64)
+    G, dims = direct_sum_generators(G_def, algebra="so", irrep_spec=irrep_spec)
+    if sum(dims) != K:
+        raise ValueError(
+            f"irrep_spec blocks {dims} sum to {sum(dims)} != K={K} (group_n={group_n})"
+        )
+    return GaugeGroup(
+        name="so_n",
+        generators=G.to(dtype).to(device),
+        irrep_dims=dims,
+        skew_symmetric=True,
+    )
+
+
+@register_group("sp_n")
+def _build_sp_n(
+    K:          int,
+
+    *,
+    group_n:    Optional[int]                   = None,
+    irrep_spec: Optional[List[Tuple[str, int]]] = None,
+    dtype:      torch.dtype                     = torch.float32,
+    device:     'torch.device | str | None'     = None,
+) -> GaugeGroup:
+    r"""Sp(2m,R) acting on R^K through a DIRECT SUM of Sym^p irreps (tied gauge).
+
+    The structure group is Sp(group_n, R), group_n = 2m even, decoupled from K. Label
+    'sym<p>' is Sym^p of the defining 2m-dim rep, dim C(2m+p-1, p) -- irreducible because
+    contraction with the antisymmetric symplectic form annihilates symmetric tensors.
+    'sym1' is the defining rep itself; 'sym0' is trivial (zero generators). One per-token
+    phi (n_gen = m(2m+1)) drives every block (tied gauge; generators do not partition per
+    block). sp images are NOT skew (skew_symmetric=False: transport pays both matrix
+    exponentials, as for 'sp'/'glk'). Admissible for the Gaussian family via the GL(K)
+    congruence, as every group here.
+    """
+    if group_n is None or irrep_spec is None:
+        raise ValueError(
+            "gauge_group='sp_n' requires group_n (= 2m, even) and irrep_spec "
+            "([(label, mult), ...], labels 'sym<p>'); set both in the config"
+        )
+    G_def = generate_sp(group_n, dtype=torch.float64)
+    G, dims = direct_sum_generators(G_def, algebra="sp", irrep_spec=irrep_spec)
+    if sum(dims) != K:
+        raise ValueError(
+            f"irrep_spec blocks {dims} sum to {sum(dims)} != K={K} (group_n={group_n})"
+        )
+    return GaugeGroup(
+        name="sp_n",
+        generators=G.to(dtype).to(device),
+        irrep_dims=dims,
+        skew_symmetric=False,
+    )
 
 
 @register_group("sp")
