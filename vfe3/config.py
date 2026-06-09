@@ -99,6 +99,17 @@ class VFE3Config:
     # config only declares it). True / False force it on / off.
     close_basis:               Optional[bool] = None
 
+    # SO(N)/Sp(2m) irrep-tower groups ('so_n' / 'sp_n'): the structure group is SO(group_n)
+    # (resp. Sp(group_n), group_n = 2m even) with group_n DECOUPLED from embed_dim. The embedding
+    # carries the direct sum of the irreps in irrep_spec -- (label, multiplicity) pairs laid out
+    # contiguously in order; heads = irrep blocks (possibly UNEQUAL dims). so_n labels 'l<p>' are
+    # the symmetric-traceless rank-p tensor irreps (group_n=3: the spin-p tower, dim 2p+1); sp_n
+    # labels 'sym<p>' are Sym^p of the defining rep (dim C(2m+p-1, p)). sum(mult * dim) must equal
+    # embed_dim. One shared per-token phi (n_gen = dim of the algebra) drives every block -- a
+    # TIED gauge. Both fields are consumed ONLY by these two groups (rejected otherwise).
+    group_n:                   Optional[int] = None
+    irrep_spec:                Optional[List[Tuple[str, int]]] = None
+
     # head mixer (opt-in, default off): a learned Schur-commutant matrix mixes the equal-size
     # gauge-irrep blocks (under block_glk: the n_heads heads) of the converged belief. Identity
     # init -> step-0 bit-identical to off. Breaks strict gauge equivariance under block_glk's
@@ -204,6 +215,9 @@ class VFE3Config:
     include_attention_entropy: bool  = True         # canonical (True) vs surrogate (False)
     attention_prior:           str   = "causal"
     alibi_slope:               float = 1.0          # base slope for alibi/causal_alibi priors (Press et al. schedule)
+    attention_window:          int   = 128          # band half-width for the windowed/causal_windowed priors
+    t5_num_buckets:            int   = 32           # t5_relative_bias: relative-position bucket count
+    t5_max_distance:           int   = 128          # t5_relative_bias: log-bucketing horizon (beyond -> last bucket)
 
     # E-step
     e_mu_lr:                   float = 0.5
@@ -411,6 +425,75 @@ class VFE3Config:
                 f"gauge_group='sp' (Sp(2m,R)) requires an EVEN embed_dim (K=2m), got "
                 f"embed_dim={self.embed_dim}"
             )
+        # so_n / sp_n irrep towers: validate group_n + irrep_spec at construction (labels resolve,
+        # block dims sum to embed_dim) so a bad spec fails here with the computed dims, not inside
+        # the generator build. Local import avoids a config <- irreps cycle.
+        if self.gauge_group in ("so_n", "sp_n"):
+            _algebra = "so" if self.gauge_group == "so_n" else "sp"
+            if self.group_n is None or self.irrep_spec is None:
+                raise ValueError(
+                    f"gauge_group={self.gauge_group!r} requires both group_n and irrep_spec "
+                    f"([(label, mult), ...]); got group_n={self.group_n}, "
+                    f"irrep_spec={self.irrep_spec}"
+                )
+            if not isinstance(self.group_n, int) or self.group_n < 2:
+                raise ValueError(f"group_n must be an int >= 2, got {self.group_n!r}")
+            if self.gauge_group == "sp_n" and self.group_n % 2 != 0:
+                raise ValueError(
+                    f"gauge_group='sp_n' (Sp(2m,R)) requires an EVEN group_n (= 2m), got "
+                    f"group_n={self.group_n}"
+                )
+            if not isinstance(self.irrep_spec, list) or not self.irrep_spec:
+                raise ValueError(
+                    f"irrep_spec must be a non-empty list of (label, mult) pairs, got "
+                    f"{self.irrep_spec!r}"
+                )
+            # JSON has no tuple type; coerce reloaded list pairs to tuples (the cross_couplings
+            # round-trip pattern above).
+            self.irrep_spec = [tuple(p) if isinstance(p, list) else p for p in self.irrep_spec]
+            from vfe3.geometry.irreps import irrep_dim
+            _block_dims: List[int] = []
+            for _entry in self.irrep_spec:
+                if (not isinstance(_entry, tuple) or len(_entry) != 2
+                        or not isinstance(_entry[0], str)
+                        or not isinstance(_entry[1], int) or _entry[1] < 1):
+                    raise ValueError(
+                        f"each irrep_spec entry must be a (label: str, mult: int >= 1) pair, "
+                        f"got {_entry!r}"
+                    )
+                _d = irrep_dim(self.group_n, algebra=_algebra, label=_entry[0])
+                _block_dims.extend([_d] * _entry[1])
+            if sum(_block_dims) != self.embed_dim:
+                raise ValueError(
+                    f"irrep_spec blocks {_block_dims} sum to {sum(_block_dims)} != "
+                    f"embed_dim={self.embed_dim} (group_n={self.group_n})"
+                )
+            # One shared phi drives EVERY block, so the generators do not partition per block:
+            # the per-block phi preconditioners are undefined (the tied_block_glk footprint).
+            if self.phi_precond_mode in ("killing_per_block", "pullback_per_block"):
+                raise ValueError(
+                    f"phi_precond_mode={self.phi_precond_mode!r} is incompatible with "
+                    f"gauge_group={self.gauge_group!r}: the shared so/sp generators act in every "
+                    f"irrep block, so a per-block metric is undefined. Use 'none', 'clip', or "
+                    f"the ambient 'killing'."
+                )
+            # ALiBi-family priors are built with H = n_heads (model._attention_log_prior) while
+            # the energy head axis is the number of irrep blocks; require they agree so the
+            # (H, N, N) prior aligns with the (..., H, N, N) energy.
+            for _pname in ("attention_prior", "gamma_attention_prior"):
+                if (getattr(self, _pname) in ("alibi", "causal_alibi")
+                        and self.n_heads != len(_block_dims)):
+                    raise ValueError(
+                        f"{_pname}={getattr(self, _pname)!r} builds an (n_heads, N, N) prior but "
+                        f"gauge_group={self.gauge_group!r} has {len(_block_dims)} irrep blocks; "
+                        f"set n_heads={len(_block_dims)} or use a headless prior "
+                        f"(uniform/causal/...)."
+                    )
+        elif self.group_n is not None or self.irrep_spec is not None:
+            raise ValueError(
+                f"group_n/irrep_spec are consumed only by gauge_group 'so_n'/'sp_n'; got "
+                f"gauge_group={self.gauge_group!r}"
+            )
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
         # transport_mode selects the connection REGIME. Validated against the transport REGISTRY
         # (not a hardcoded literal list) so a newly registered regime is a valid config value
@@ -493,11 +576,19 @@ class VFE3Config:
         for _name in ("kappa", "kappa_gamma"):
             _v = getattr(self, _name)
             if isinstance(_v, (list, tuple)):
-                if self.gauge_group not in ("block_glk", "tied_block_glk"):
+                if self.gauge_group in ("so_n", "sp_n"):
+                    # heads = irrep blocks (possibly unequal dims): one kappa entry per block
+                    # (irrep_spec already validated/coerced in the gauge seam above).
+                    _n_blocks = sum(m for _, m in self.irrep_spec)
+                    if len(_v) != _n_blocks:
+                        raise ValueError(
+                            f"{_name} list must have one entry per irrep block; gauge_group="
+                            f"{self.gauge_group!r} has {_n_blocks} blocks, got {len(_v)}")
+                elif self.gauge_group not in ("block_glk", "tied_block_glk"):
                     raise ValueError(
                         f"{_name} list (per-head) requires an equal-block group "
                         f"(block_glk/tied_block_glk); got gauge_group={self.gauge_group!r}")
-                if len(_v) != self.n_heads:
+                elif len(_v) != self.n_heads:
                     raise ValueError(
                         f"{_name} list must have length n_heads={self.n_heads}, got {len(_v)}")
                 if any(x <= 0.0 for x in _v):
@@ -522,9 +613,26 @@ class VFE3Config:
         from vfe3.attention_prior import _PRIORS
         _require(self.gamma_attention_prior, tuple(sorted(_PRIORS)), "gamma_attention_prior")
         _require(self.prior_source, _VALID_PRIOR_SOURCES, "prior_source")
+        # prior-shape knobs (threaded into model._attention_log_prior; audit P9): the windowed
+        # band half-width and the T5 bucketing parameters must be positive ints.
+        for name in ("attention_window", "t5_num_buckets", "t5_max_distance"):
+            if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be an int >= 1, got {getattr(self, name)!r}")
         for name in ("b0", "c0"):
             _v = getattr(self, name)
             if isinstance(_v, (list, tuple)):
+                # A (K,) per-coordinate b0/c0 shapes the PER-COORDINATE alpha*_k = c0_k/(b0_k + D_k);
+                # every other alpha form carries a per-position scalar D, against which a (K,) list
+                # either crashes at the first forward or (when K == N) silently mis-broadcasts.
+                # Reject the pair at construction (audit 2026-06-09 P2). Local import matches the
+                # alpha_i pattern below.
+                from vfe3.alpha_i import alpha_is_per_coord
+                if not alpha_is_per_coord(self.alpha_mode):
+                    raise ValueError(
+                        f"{name} list (per-coordinate) requires a per-coordinate alpha form "
+                        f"(alpha_mode='state_dependent_per_coord'); got "
+                        f"alpha_mode={self.alpha_mode!r}"
+                    )
                 if len(_v) != self.embed_dim:
                     raise ValueError(
                         f"{name} list must have length embed_dim={self.embed_dim}, got {len(_v)}")
@@ -622,9 +730,14 @@ class VFE3Config:
             )
         # RoPE rotates ADJACENT coordinate pairs (2k, 2k+1); Sp(2m) pairs coordinate i with m+i
         # (J = [[0,I],[-I,0]]), so the rope-wrapped transport R Omega R^T leaves the symplectic group.
-        # R is orthogonal (a subset of GL(K)), so the GL(K)-congruence divergence invariance and VFE
-        # equivariance survive -- the operator is still valid, just no longer in the SELECTED Sp
-        # structure group. Warn (not error): the symplectic property is not consumed downstream.
+        # R is orthogonal, so each per-pair divergence D(q_i || R_i Omega_ij R_j^T q_j) stays a
+        # well-defined GL(K)-congruence value. But the position-FIXED R(theta_i) do not commute
+        # with a global gauge element g, so gauge-RoPE breaks the global gauge EQUIVARIANCE of
+        # F/beta for EVERY group -- including rope_full_gauge=True (executable probe, audit
+        # 2026-06-09 G1: beta residual 0.44-0.61 under rope vs 7e-6 without). RoPE is therefore a
+        # deliberate residual gauge-FIXING layer, not an equivariant operator; the pure
+        # (equivariant) positional path remains pos_phi (a gauge element composed into phi).
+        # Warn (not error): the symplectic property is not consumed downstream.
         if self.pos_rotation == "rope" and self.gauge_group == "sp":
             import warnings
             warnings.warn(
@@ -632,6 +745,36 @@ class VFE3Config:
                 "adjacent pairs (2k, 2k+1) while Sp(2m) pairs i with m+i, so R Omega R^T is no longer "
                 "in Sp(2m). The GL(K)-congruence divergence invariance still holds (R is orthogonal), "
                 "so the model runs; only the structure-group claim is dropped.",
+                UserWarning,
+                stacklevel=2,
+            )
+        # Same structural fact for the irrep-tower groups: RoPE's adjacent-pair rotation R is
+        # orthogonal but generally NOT in the irrep image rho(SO(N)) / rho(Sp(2m)) inside GL(K),
+        # so R Omega R^T leaves the SELECTED structure group (the GL(K)-congruence divergence
+        # invariance survives; only the structure-group claim is dropped).
+        if self.pos_rotation == "rope" and self.gauge_group in ("so_n", "sp_n"):
+            import warnings
+            warnings.warn(
+                f"pos_rotation='rope' with gauge_group={self.gauge_group!r} leaves the structure "
+                f"group: the coordinate-pair rotation R(theta) is generally not in the irrep image "
+                f"of SO(N)/Sp(2m), so R Omega R^T is no longer in the selected group. The "
+                f"GL(K)-congruence divergence invariance still holds (R is orthogonal), so the "
+                f"model runs; only the structure-group claim is dropped.",
+                UserWarning,
+                stacklevel=2,
+            )
+        # Means-only RoPE (the default pairing) transports mu under R Omega R^T but Sigma under
+        # the UN-rotated Omega -- an affine-incoherent operator pair: the Mahalanobis form is not
+        # preserved (executable probe, audit 2026-06-09 G2: invariant drift 0.18 -> 0.74, while
+        # rope_full_gauge=True preserves it). It stays available as a deliberate cheap
+        # approximation; warn so the non-coherent pairing is explicit.
+        if self.pos_rotation == "rope" and not self.rope_full_gauge:
+            import warnings
+            warnings.warn(
+                "pos_rotation='rope' with rope_full_gauge=False rotates the transported MEANS but "
+                "not the covariance sandwich -- an affine-incoherent transport pair (Mahalanobis "
+                "invariants are not preserved). The coherent gauge-RoPE is rope_full_gauge=True "
+                "with a full-covariance family.",
                 UserWarning,
                 stacklevel=2,
             )

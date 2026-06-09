@@ -67,9 +67,11 @@ class MahalanobisNorm:
 
 
 @register_norm("none")
-def _norm_none(K: int, **kwargs) -> Callable:
+def _norm_none(K: int, **kwargs) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Identity norm (no rescaling)."""
-    return lambda mu, sigma: mu
+    def _identity(mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        return mu
+    return _identity
 
 
 @register_norm("mahalanobis")

@@ -40,9 +40,17 @@ def _lambda_beta(model) -> 'float | torch.Tensor':
 
 
 def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tensor, Optional[torch.Tensor]]:
-    r"""Encode sequence 0 to the initial belief (pos_phi applied), with its log-prior and RoPE."""
+    r"""Encode sequence 0 to the initial belief (pos_phi applied), with its log-prior and RoPE.
+
+    Under ``s_e_step`` the live model channel is replayed too (audit 2026-06-09 IE2): s is refined
+    with the frozen gauge frame and the belief is anchored to it, exactly as ``forward`` /
+    ``diagnostics`` do -- the callers' ``mu_p = belief.mu`` handoff then anchors to the refined s,
+    so every extracted trajectory/figure describes the model that actually trained."""
     enc = model.prior_bank.encode(token_ids[:1])                  # (1, N, ...)
     belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=model._apply_pos_phi(enc.phi[0]))
+    if model.cfg.s_e_step:
+        s_mu1, s_sigma1 = model._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
+        belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
     n = belief.mu.shape[0]
     log_prior = model._attention_log_prior(n, token_ids.device)
     rope = model._rope_rotation(n, token_ids.device)
@@ -71,8 +79,9 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
     )
 
 
-def _fe_kwargs(model, log_prior: torch.Tensor) -> dict:
-    r"""The ``free_energy_value`` knob subset (it rejects the iteration-only step-size knobs)."""
+def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = None) -> dict:
+    r"""The ``free_energy_value`` knob subset (it rejects the iteration-only step-size knobs).
+    ``rope`` is honored (audit PP6): the logged F carries the RoPE-wrapped transport."""
     cfg = model.cfg
     return dict(
         tau=attention_tau(_as_coeff(cfg.kappa, model.prior_bank.mu_embed.device), model.group.irrep_dims),
@@ -85,6 +94,7 @@ def _fe_kwargs(model, log_prior: torch.Tensor) -> dict:
         transport_mode=cfg.transport_mode, cocycle_relaxation=cfg.cocycle_relaxation,
         log_prior=log_prior, log_alpha=getattr(model, "log_alpha", None),
         connection_W=getattr(model, "connection_W", None),
+        rope=rope, rope_on_cov=cfg.rope_full_gauge,
     )
 
 
@@ -220,7 +230,7 @@ def e_step_belief_trace(
     belief, log_prior, rope = _encode_one(model, token_ids)
     mu_p, sigma_p = belief.mu, belief.sigma
     ikw = _iter_kwargs(model, log_prior, rope)
-    fkw = _fe_kwargs(model, log_prior)
+    fkw = _fe_kwargs(model, log_prior, rope)
 
     mus = [belief.mu]
     sigmas = [belief.sigma]

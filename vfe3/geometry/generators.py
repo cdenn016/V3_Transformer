@@ -254,7 +254,8 @@ def generate_sp(
 
     return G.to(dtype).to(device)
 
-#TODO: irreps of SO(N) as heads of dim_irrep.  e.g. spin-1, spin-2, etc
+# Irreps of SO(N) as heads (spin towers etc.) live in vfe3/geometry/irreps.py; the
+# 'so_n'/'sp_n' groups in groups.py assemble blockdiag direct sums of those images.
 def generate_son(
     N:                int,
 

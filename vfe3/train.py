@@ -401,9 +401,17 @@ def train(
     # path byte-identical (scheduler built with last_epoch=-1, loop from 0).
     resume_path = resume_from if resume_from is not None else cfg.resume_from
     start_step = 0
+    if device is None:
+        device = model.prior_bank.mu_embed.device
+    # fp16 training needs loss scaling (gradients underflow through the unrolled E-step); bf16/fp32
+    # do not. enabled=False is a no-op, so non-fp16 amp_dtype keeps this loop byte-identical.
+    # Created BEFORE the resume block so load_checkpoint can restore its scale/growth state
+    # (audit 2026-06-09 IE3).
+    scaler = torch.amp.GradScaler(device=device.type, enabled=(cfg.amp_dtype == "fp16"))
     if resume_path is not None:
         from vfe3.run_artifacts import load_checkpoint           # local import avoids any import cycle
-        start_step = load_checkpoint(resume_path, model, optimizer, map_location=device)
+        start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
+                                     scaler=scaler, cfg=cfg)
         # LambdaLR with last_epoch != -1 requires 'initial_lr' on every group; set it from the configured
         # base (not the post-load group['lr'], which the restored optimizer state overwrote with base*cos).
         for group, base in zip(optimizer.param_groups, base_lrs):
@@ -415,11 +423,6 @@ def train(
     losses: List[float] = []
     model.train()
     logger = logger or logging.getLogger(__name__)
-    if device is None:
-        device = model.prior_bank.mu_embed.device
-    # fp16 training needs loss scaling (gradients underflow through the unrolled E-step); bf16/fp32
-    # do not. enabled=False is a no-op, so non-fp16 amp_dtype keeps this loop byte-identical.
-    scaler = torch.amp.GradScaler(device=device.type, enabled=(cfg.amp_dtype == "fp16"))
     # Live per-step it/s: iterate the step loop through a tqdm bar whose built-in rate readout
     # refreshes every step. Gated on log_interval so the documented silent path (log_interval
     # falsy) stays bitwise-identical -- no bar, no redirect, nothing printed. The generator holds
@@ -557,7 +560,7 @@ def train(
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
         if (artifacts is not None and cfg.checkpoint_interval
                 and (step + 1) % cfg.checkpoint_interval == 0):
-            artifacts.save_checkpoint(step + 1, model, optimizer, cfg)
+            artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler)
     return losses
 
 

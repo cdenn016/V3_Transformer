@@ -139,6 +139,28 @@ def _diag_kl_filtering_kernel(
     return grad_mu, grad_sigma
 
 
+def uses_kernel_route(
+    *,
+    alpha_div:                 float,
+    gradient_mode:             str,
+    family:                    str,
+    divergence_family:         str,
+    include_attention_entropy: bool,
+) -> bool:
+    r"""Whether ``belief_gradients`` serves the closed-form KERNEL (else the autograd oracle).
+
+    The single source of truth for the kernel-coverage predicate, exposed so callers (the
+    E-step's unroll-truncation warning) cannot drift from the dispatch below."""
+    return (
+        gradient_mode == "filtering"
+        and family == "gaussian_diagonal"
+        and divergence_family == "renyi"
+        and abs(alpha_div - 1.0) < 1e-9
+        and include_attention_entropy
+        and has_kernel(family)
+    )
+
+
 def belief_gradients(
     mu:           torch.Tensor,           # (N, K)
     sigma:        torch.Tensor,           # (N, K)
@@ -147,7 +169,7 @@ def belief_gradients(
     omega:        torch.Tensor,           # (N, N, K, K)
 
     *,
-    tau:          float = 1.0,
+    tau:          'float | torch.Tensor' = 1.0,
     alpha_div:    float = 1.0,
     kl_max:       float = 100.0,
     eps:          float = 1e-6,
@@ -176,13 +198,10 @@ def belief_gradients(
     ``irrep_dims`` (when more than one block) makes attention PER HEAD: the energy/beta carry a
     head axis and the per-coordinate beta the kernel consumes is head h's weight on coordinate k.
     """
-    use_kernel = (
-        gradient_mode == "filtering"
-        and family == "gaussian_diagonal"
-        and divergence_family == "renyi"
-        and abs(alpha_div - 1.0) < 1e-9
-        and include_attention_entropy
-        and has_kernel(family)
+    use_kernel = uses_kernel_route(
+        alpha_div=alpha_div, gradient_mode=gradient_mode, family=family,
+        divergence_family=divergence_family,
+        include_attention_entropy=include_attention_entropy,
     )
     if not use_kernel:
         return belief_gradients_autograd(
@@ -202,7 +221,14 @@ def belief_gradients(
     energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=irrep_dims)
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)   # (N,N) or (H,N,N)
-    beta_coord = _beta_to_coordinate(beta, irrep_dims, mu.shape[-1])  # (N,N,K) per-coordinate
+    # Pair-term saturation mask (audit 2026-06-09 P7): the oracle differentiates
+    # beta_ij * clamp(E_ij, [0, kl_max]), whose pair gradient VANISHES wherever the raw energy
+    # saturates the clamp (the clamp emits the exact bounds, so the equality tests are robust).
+    # Without the mask a fully saturated row softmaxes to uniform beta over constant energies and
+    # the kernel's transported pair term deviates from autograd-of-F by orders of magnitude.
+    # Mirrors the self-term mask inside the kernel body; beta itself (the weights) is unchanged.
+    pair_mask = ((energy > 0.0) & (energy < kl_max)).to(beta.dtype)
+    beta_coord = _beta_to_coordinate(beta * pair_mask, irrep_dims, mu.shape[-1])  # (N,N,K) per-coordinate
     coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=alpha_mode, log_alpha=log_alpha)
     if not alpha_is_per_coord(alpha_mode):
         coef = coef.unsqueeze(-1)                 # (N,) -> (N,1) per-position broadcast; per-coord sd is already (N,K)

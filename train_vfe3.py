@@ -33,8 +33,7 @@ from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows, make_dataloader
-from vfe3.free_energy import attention_tau
-from vfe3.train import evaluate, train
+from vfe3.train import _fmt_tau, evaluate, train
 
 
 # --- click-to-run knobs -------------------------------------------------------
@@ -75,8 +74,26 @@ config = dict(
     
 
     # gauge seam
-    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k"
+    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
                                                      # tied_block_glk: one shared GL(d) frame across heads (kron(I_n, gl(d)))
+
+    # so_n / sp_n irrep towers (heads = irreps). Structure group SO(group_n) / Sp(group_n) with
+    # group_n DECOUPLED from embed_dim; irrep_spec = [(label, mult), ...] blocks laid out in order,
+    # block dims summing to embed_dim. Labels: so_n 'l<p>' = symmetric-traceless rank-p irrep
+    # (group_n=3: spin-p, dim 2p+1); sp_n 'sym<p>' = Sym^p of the defining rep (dim C(2m+p-1, p)).
+    # One shared per-token phi drives EVERY block (TIED gauge; n_gen = dim of the algebra), and
+    # unequal block dims get per-head tau_h = kappa_h*sqrt(d_h). Both REQUIRED for so_n/sp_n,
+    # must stay None for every other group. CONSTRAINTS for these groups: phi_precond_mode must
+    # be "none"/"clip"/"killing" (the per-block modes are rejected -- tied generators do not
+    # partition per block); use_head_mixer needs EQUAL blocks; alibi-family priors need
+    # n_heads == number of blocks.
+    # embed_dim=20 examples:
+    #   so_n: group_n=3, irrep_spec=[("l2", 4)]                            # 4 equal spin-2 heads (mixer OK)
+    #   so_n: group_n=3, irrep_spec=[("l0",1),("l1",1),("l3",1),("l4",1)]  # spins 0,1,3,4 = 1+3+7+9 (unequal -> use_head_mixer=False)
+    #   sp_n: group_n=4, irrep_spec=[("sym2", 2)]                          # 2 equal Sym^2(R^4) heads, dim 10 each
+    group_n                   = None,                # so_n/sp_n only: N of SO(N) / 2m of Sp(2m)
+    irrep_spec                = None,                # so_n/sp_n only: [(label, mult), ...]; dims sum == embed_dim
+
     gauge_parameterization    = "phi",               # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
     use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks: block_glk/tied_block_glk);
                                                      # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
@@ -172,15 +189,15 @@ config = dict(
 
     m_mu_lr                   = 0.0140,   
     m_sigma_lr                = 0.00425,     
-    m_phi_lr                  = 0.0135,   
+    m_phi_lr                  = 0.015,   
     
-    mu_init_std               = 0.02,         # std of the random mean table mu_embed
-    sigma_init                = 1.0,          # constant initial coordinate variance (sigma_log = log of this)
-    phi_scale                 = 0.01,         # std
+    mu_init_std               = 0.06,         # std of the random mean table mu_embed
+    sigma_init                = 4.0,          # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale                 = 0.05,         # std
     
     
-    weight_decay              = 0.065,
-    phi_weight_decay          = 0.1,
+    weight_decay              = 0.02,
+    phi_weight_decay          = 0.05,
     
     # divergence seam -- the f-divergence FUNCTIONAL (distinct from `family` below)
     divergence_family         = "renyi",             # "renyi"
@@ -236,7 +253,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         *cov,
         f" M-LRs: mu={cfg.m_mu_lr}  sigma={cfg.m_sigma_lr}  phi={cfg.m_phi_lr}",
         f" VFE: alpha={cfg.alpha}  kappa={cfg.kappa}  "
-        f"tau={attention_tau(cfg.kappa, model.group.irrep_dims):.4f}  mass_phi={cfg.mass_phi}",
+        f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",
         bar,
     ])

@@ -108,7 +108,7 @@ def free_energy_terms(
     alpha:    torch.Tensor,              # (..., N) self-coupling
 
     *,
-    tau:                       float = 1.0,
+    tau:                       'float | torch.Tensor' = 1.0,
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure F)
     eps:                       float = 1e-12,
     include_attention_entropy: bool  = True,                   # gate the entropy term in ``total``
@@ -249,7 +249,10 @@ def fisher_trace(
     """
     if _is_full_cov(sigma, diagonal):
         sym = 0.5 * (sigma + sigma.transpose(-1, -2))
-        inv = torch.linalg.inv(sym)
+        # eps ridge floors the inverse like the diagonal branch's clamp (audit 2026-06-09 IG1):
+        # a singular belief covariance must not crash the figure path.
+        eye = torch.eye(sym.shape[-1], device=sym.device, dtype=sym.dtype)
+        inv = torch.linalg.inv(sym + eps * eye)
         return 0.5 * torch.diagonal(inv, dim1=-2, dim2=-1).sum(dim=-1)
     return (0.5 / sigma.clamp(min=eps)).sum(dim=-1)
 
@@ -387,14 +390,15 @@ def group_gauge_invariant(
     The logged ``gauge_trace_spread`` (= std of log|det Omega| = tr embed(phi)) is identically 0
     for the unimodular groups SO(K) and Sp(2m) (traceless generators, det == 1), so it is blind
     off block_glk. This dispatches the correct invariant: GL volume log|det exp(phi)| for
-    glk / block_glk / tied_block_glk, total rotation angle (1/2) sum_k |arg(eig)| for so_k, and
-    the symplectic squeeze log(s_max / s_min) of the singular values for sp.
+    glk / block_glk / tied_block_glk, total rotation angle (1/2) sum_k |arg(eig)| for so_k and
+    the orthogonal so_n irrep towers, and the squeeze log(s_max / s_min) of the singular values
+    for sp / sp_n (whose Sym^p images are traceless, so logdet is blind there too).
     """
     name = getattr(group, "name", "glk")
-    if name == "so_k":
+    if name in ("so_k", "so_n"):
         ang = torch.angle(torch.linalg.eigvals(exp_phi))         # (..., K) eigenphases
         return 0.5 * ang.abs().sum(dim=-1)
-    if name == "sp":
+    if name in ("sp", "sp_n"):
         s = torch.linalg.svdvals(exp_phi)                        # (..., K) descending
         return torch.log(s[..., 0].clamp(min=eps)) - torch.log(s[..., -1].clamp(min=eps))
     return torch.linalg.slogdet(exp_phi).logabsdet              # GL volume log|det|

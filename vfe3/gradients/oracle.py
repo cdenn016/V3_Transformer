@@ -56,7 +56,7 @@ def belief_gradients_autograd(
     omega:        'torch.Tensor | FactoredTransport | RopeTransport',   # (N,N,K,K) dense OR factored exps
 
     *,
-    tau:          float = 1.0,
+    tau:          'float | torch.Tensor' = 1.0,
     alpha_div:    float = 1.0,
     kl_max:       float = 100.0,
     eps:          float = 1e-6,
