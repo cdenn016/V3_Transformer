@@ -61,3 +61,12 @@ def test_cg_cost_guard():
     from vfe3.geometry.cg import cg_intertwiners
     with pytest.raises(ValueError, match="construction size"):
         cg_intertwiners(8, algebra="so", label_a="l3", label_b="l3", label_c="l3")
+
+
+def test_cg_cache_immune_to_caller_mutation():
+    from vfe3.geometry.cg import cg_intertwiners
+    C1 = cg_intertwiners(3, algebra="so", label_a="l1", label_b="l1", label_c="l2")
+    C1.mul_(0.0)                                         # caller misbehaves in place
+    C2 = cg_intertwiners(3, algebra="so", label_a="l1", label_b="l1", label_c="l2")
+    assert C2.abs().max() > 0                            # cache unharmed
+    assert C1.data_ptr() != C2.data_ptr()                # no aliasing

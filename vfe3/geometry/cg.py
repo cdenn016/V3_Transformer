@@ -11,6 +11,20 @@ is verified by an equivariance-residual assert (raise, not warn) before caching.
 
 Row-major vec convention (torch.reshape): vec(C rho) = kron(I_dc, rho^T) vec(C) and
 vec(rho_c C) = kron(rho_c, I_D) vec(C).
+
+Multiplicity counting rests on the spectral gap of the Gram matrix (measured at 13+
+orders of magnitude in practice); the absolute `atol` cut is required rather than a
+relative one because all-trivial triples such as l0 (x) l0 -> l0 have an identically
+zero Gram, making a relative threshold undefined. The equivariance assert catches
+spurious slots (false positives from numerical drift) but is structurally blind to
+dropped slots (false negatives) — the gap is what protects those. Within a multiplicity
+slot (n_mult > 1) the eigh-defined basis is arbitrary up to an orthogonal rotation but
+is stable for the process lifetime, so any persisted downstream weights depending on
+this basis are tied to a fixed torch build's eigh ordering.
+
+`cg_intertwiners` returns a clone of the cached tensor on every call (both cache-hit
+and first-build paths). This protects the process-global `_CG_CACHE` from in-place
+caller mutations.
 """
 
 from typing import Dict, List, Tuple
@@ -44,7 +58,7 @@ def cg_intertwiners(
     """All independent intertwiners V_a (x) V_b -> V_c (empty leading axis if none)."""
     key = (algebra, N, label_a, label_b, label_c)
     if key in _CG_CACHE:
-        return _CG_CACHE[key]
+        return _CG_CACHE[key].clone()
     da = irrep_dim(N, algebra=algebra, label=label_a)
     db = irrep_dim(N, algebra=algebra, label=label_b)
     dc = irrep_dim(N, algebra=algebra, label=label_c)
@@ -82,7 +96,7 @@ def cg_intertwiners(
                 f"{float(res):.3e} exceeds 1e-7 at generator {a}"
             )
     _CG_CACHE[key] = C
-    return C
+    return C.clone()
 
 
 def cg_selection(
