@@ -70,3 +70,52 @@ def test_cg_cache_immune_to_caller_mutation():
     C2 = cg_intertwiners(3, algebra="so", label_a="l1", label_b="l1", label_c="l2")
     assert C2.abs().max() > 0                            # cache unharmed
     assert C1.data_ptr() != C2.data_ptr()                # no aliasing
+
+
+def _tower_group():
+    from vfe3.geometry.groups import get_group
+    return get_group("so_n")(9, group_n=3,
+                             irrep_spec=[("l0", 1), ("l1", 1), ("l2", 1)],
+                             dtype=torch.float64)
+
+
+def test_cg_coupling_zero_init_is_exact_passthrough():
+    from vfe3.model.cg_coupling import CGCoupling
+    grp = _tower_group()
+    cpl = CGCoupling(3, "so", grp.irrep_dims, grp.irrep_labels).double()
+    assert cpl.path_weights.shape[0] > 0
+    mu = torch.randn(2, 4, 9, dtype=torch.float64)
+    sig = torch.rand(2, 4, 9, dtype=torch.float64)
+    mu2, sig2 = cpl(mu, sig)
+    assert torch.equal(mu2, mu) and torch.equal(sig2, sig)
+
+
+def test_cg_coupling_means_update_is_exactly_equivariant():
+    from vfe3.model.cg_coupling import CGCoupling
+    grp = _tower_group()
+    cpl = CGCoupling(3, "so", grp.irrep_dims, grp.irrep_labels).double()
+    with torch.no_grad():
+        cpl.path_weights.copy_(0.3 * torch.randn(cpl.path_weights.shape[0],
+                                                 dtype=torch.float64))
+    g = torch.linalg.matrix_exp(
+        torch.einsum("a,aij->ij", 0.4 * torch.randn(3, dtype=torch.float64), grp.generators))
+    mu = torch.randn(5, 9, dtype=torch.float64)
+    sig = torch.rand(5, 9, dtype=torch.float64)
+    out_then_g = torch.einsum("kl,nl->nk", g, cpl(mu, sig)[0])
+    g_then_out = cpl(torch.einsum("kl,nl->nk", g, mu), sig)[0]
+    assert (out_then_g - g_then_out).abs().max() < 1e-12
+
+
+def test_cg_coupling_self_product_reaches_other_types():
+    # zero everything except one l1 (x) l1 -> l2 path: the l2 head must move, others must not.
+    from vfe3.model.cg_coupling import CGCoupling
+    grp = _tower_group()
+    cpl = CGCoupling(3, "so", grp.irrep_dims, grp.irrep_labels).double()
+    idx = next(p for p, (a, b, c) in enumerate(cpl.path_types)
+               if (a, b, c) == ("l1", "l1", "l2"))
+    with torch.no_grad():
+        cpl.path_weights[idx] = 1.0
+    mu = torch.randn(3, 9, dtype=torch.float64)
+    mu2, _ = cpl(mu, torch.ones(3, 9, dtype=torch.float64))
+    assert not torch.allclose(mu2[:, 4:9], mu[:, 4:9])   # l2 head updated
+    assert torch.equal(mu2[:, 0:4], mu[:, 0:4])          # l0 and l1 heads untouched
