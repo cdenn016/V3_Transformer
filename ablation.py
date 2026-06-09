@@ -111,7 +111,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     irrep_spec                = None,                # so_n/sp_n only: [(label, mult), ...]; dims sum == embed_dim
 
     gauge_parameterization    = "phi",               # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
-    use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks: block_glk/tied_block_glk);
+    use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                                      # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
 
     decode_bias               = False,
@@ -294,8 +294,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # must sum to the baseline embed_dim=20, and the TIED gauge rejects the per-block phi
     # preconditioners, so these arms override phi_precond_mode (baseline pullback_per_block).
     # Equal-block arms keep the head mixer (kron(A, I_d) IS the Schur commutant of mult copies
-    # of one irrep, exactly equivariant under the tied gauge); the unequal spin-tower arm
-    # disables it.
+    # of one irrep, exactly equivariant under the tied gauge).
     "gauge_group": {
         "description": "gauge group",
         "configs": [
@@ -308,7 +307,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
              "irrep_spec": [("l2", 4)],                       "phi_precond_mode": "killing"},
             {"label": "so3_tower",      "gauge_group": "so_n", "group_n": 3,
              "irrep_spec": [("l0", 1), ("l1", 1), ("l3", 1), ("l4", 1)],
-             "use_head_mixer": False,                         "phi_precond_mode": "killing"},
+                                                              "phi_precond_mode": "killing"},
             {"label": "sp4_sym2x2",     "gauge_group": "sp_n", "group_n": 4,
              "irrep_spec": [("sym2", 2)],                     "phi_precond_mode": "killing"},
         ],

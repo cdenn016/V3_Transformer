@@ -123,9 +123,13 @@ class VFEModel(nn.Module):
         self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps) \
             if cfg.norm_type_final != "none" else None
         # Opt-in Schur-commutant head mixer (default off). Built ONCE from the gauge group's
-        # irrep blocks; HeadMixer rejects a single-block group at construction (glk / so_k have
-        # nothing to mix), so a bad gauge_group + use_head_mixer pair fails here, not at forward.
-        self.head_mixer = HeadMixer(self.group.irrep_dims) if cfg.use_head_mixer else None
+        # irrep blocks. Label-less groups need >= 2 EQUAL blocks (block_glk/tied_block_glk);
+        # labeled irrep towers (so_n/sp_n) mix per isotypic component (mults-one towers get
+        # per-head scalar gains -- the entire linear commutant there). Bad pairings fail here,
+        # not at forward.
+        self.head_mixer = HeadMixer(self.group.irrep_dims,
+                                    irrep_labels=self.group.irrep_labels) \
+            if cfg.use_head_mixer else None
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED scalar self-coupling alpha.
         # When alpha_mode='learnable', create log_alpha as a trainable nn.Parameter; the consumed
         # coupling is alpha = exp(log_alpha) (always positive). Init 0 -> alpha = exp(0) = 1.0, so a
