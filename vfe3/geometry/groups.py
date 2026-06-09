@@ -38,8 +38,7 @@ class GaugeGroup:
     irrep_dims:         List[int]             # block sizes; sum == K
     skew_symmetric:     bool                  # exp(-M) = exp(M)^T fast path
     invariant_families: Tuple[str, ...] = ("gaussian",)
-    irrep_labels:       Optional[List[str]]   = None              # per-block irrep label ('l1', 'sym2', ...);
-                                                                  # None for label-less groups (glk/block_glk/...)
+    irrep_labels:       Optional[List[str]] = None # per-block label ('l1', 'sym2', ...); None = label-less
 
     def __post_init__(self) -> None:
         K = self.generators.shape[-1]

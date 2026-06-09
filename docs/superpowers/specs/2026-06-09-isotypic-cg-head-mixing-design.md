@@ -77,7 +77,9 @@ mixer:
 where the path set p ranges over all admissible triples of isotypic types (a, b, c) with
 N^c_ab > 0 — INCLUDING the self-products a = b, which are what give a multiplicity-one spin
 tower any cross-type flow at all — over copy indices (i, j, r) within the source and target
-components, and over independent intertwiners when the multiplicity N^c_ab exceeds one. Each
+components, and over independent intertwiners when the multiplicity N^c_ab exceeds one. As
+built, source pairs are canonicalized UNORDERED (a <= b lexicographically; swapped duplicates
+are not independent bilinear maps), and copies within an equal-label pair take i <= j. Each
 path carries one learned scalar w_p, zero-initialized (step 0 byte-identical). Intertwiners
 are normalized to unit Frobenius norm so the w_p share a common scale. Realistic specs make
 the path count small (a four-type mults-one tower has on the order of tens of paths); a
@@ -151,7 +153,7 @@ out-of-group control. Existing suites must pass unchanged.
 
 `use_cg_coupling` without labels: config ValueError. Mixer on unlabeled unequal dims:
 unchanged ValueError. CG solve too large: ValueError with the cost guard message. Degenerate
-path set (no admissible triples, e.g. a single-type spec): `CGCoupling` construction raises
+path set (no admissible triples -- rare, since self-products l (x) l -> l are usually admissible; reachable only for towers whose products all land outside the spec's labels): `CGCoupling` construction raises
 with the explanation that there is nothing to couple (prefer a loud config error over a
 silent no-op module). All asserts fire at model construction, never mid-step.
 
