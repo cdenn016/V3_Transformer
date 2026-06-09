@@ -1,0 +1,106 @@
+r"""Numerical Clebsch-Gordan intertwiners for VFE_3.0 irrep towers.
+
+For irrep labels a, b, c of one structure algebra, an intertwiner is a map
+C: V_a (x) V_b -> V_c with C rho_{a(x)b}(X) = rho_c(X) C for every algebra basis
+element X, where rho_{a(x)b}(X) = rho_a(X) (x) I + I (x) rho_b(X) (the Leibniz action
+on the tensor product). The solution space is computed NUMERICALLY: accumulate the
+Gram matrix of the stacked Sylvester operators over the basis and take its null space
+(eigh), so no symbol tables and no per-family sign conventions exist. Each null vector
+is one independent intertwiner (multiplicity slot), orthonormal in Frobenius norm, and
+is verified by an equivariance-residual assert (raise, not warn) before caching.
+
+Row-major vec convention (torch.reshape): vec(C rho) = kron(I_dc, rho^T) vec(C) and
+vec(rho_c C) = kron(rho_c, I_D) vec(C).
+"""
+
+from typing import Dict, List, Tuple
+
+import torch
+
+from vfe3.geometry.generators import generate_son, generate_sp
+from vfe3.geometry.irreps import irrep_dim, irrep_generators
+
+_CG_CACHE: Dict[Tuple[str, int, str, str, str], torch.Tensor] = {}
+
+
+def _defining(N: int, algebra: str) -> torch.Tensor:
+    if algebra == "so":
+        return generate_son(N, dtype=torch.float64)
+    if algebra == "sp":
+        return generate_sp(N, dtype=torch.float64)
+    raise ValueError(f"unknown algebra {algebra!r}; registered: 'so', 'sp'")
+
+
+def cg_intertwiners(
+    N:       int,                          # defining-rep dimension (N of SO(N); 2m of Sp(2m))
+
+    *,
+    algebra: str,                          # 'so' | 'sp'
+    label_a: str,                          # first source irrep label
+    label_b: str,                          # second source irrep label
+    label_c: str,                          # target irrep label
+    atol:    float = 1e-8,
+) -> torch.Tensor:                         # (n_mult, d_c, d_a * d_b) float64; n_mult may be 0
+    """All independent intertwiners V_a (x) V_b -> V_c (empty leading axis if none)."""
+    key = (algebra, N, label_a, label_b, label_c)
+    if key in _CG_CACHE:
+        return _CG_CACHE[key]
+    da = irrep_dim(N, algebra=algebra, label=label_a)
+    db = irrep_dim(N, algebra=algebra, label=label_b)
+    dc = irrep_dim(N, algebra=algebra, label=label_c)
+    D = da * db
+    if dc * D > 5000:
+        raise ValueError(
+            f"CG solve for ({label_a}, {label_b}) -> {label_c} over R^{N} exceeds the supported "
+            f"construction size (d_c * d_a * d_b = {dc * D} > 5000); larger products await a "
+            f"matrix-free solver."
+        )
+    G_def = _defining(N, algebra)
+    ra = irrep_generators(G_def, algebra=algebra, label=label_a)
+    rb = irrep_generators(G_def, algebra=algebra, label=label_b)
+    rc = irrep_generators(G_def, algebra=algebra, label=label_c)
+    I_a = torch.eye(da, dtype=torch.float64)
+    I_b = torch.eye(db, dtype=torch.float64)
+    I_c = torch.eye(dc, dtype=torch.float64)
+    I_D = torch.eye(D, dtype=torch.float64)
+    gram = torch.zeros(dc * D, dc * D, dtype=torch.float64)
+    rho_ab = []
+    for a in range(G_def.shape[0]):
+        r = torch.kron(ra[a], I_b) + torch.kron(I_a, rb[a])        # (D, D) Leibniz action
+        rho_ab.append(r)
+        op = torch.kron(I_c, r.T.contiguous()) - torch.kron(rc[a], I_D)
+        gram += op.T @ op
+    evals, evecs = torch.linalg.eigh(gram)
+    null = evecs[:, evals < atol]                                  # (dc*D, n_mult), orthonormal
+    C = null.T.reshape(-1, dc, D).contiguous()
+    for a in range(G_def.shape[0]):                                # build-time verification
+        res = (C @ rho_ab[a] - torch.einsum("ij,mjk->mik", rc[a], C)).abs().max() \
+            if C.shape[0] else torch.tensor(0.0)
+        if float(res) > 1e-7:
+            raise RuntimeError(
+                f"CG intertwiner ({label_a}, {label_b}) -> {label_c} equivariance residual "
+                f"{float(res):.3e} exceeds 1e-7 at generator {a}"
+            )
+    _CG_CACHE[key] = C
+    return C
+
+
+def cg_selection(
+    N:       int,                          # defining-rep dimension
+
+    *,
+    algebra: str,                          # 'so' | 'sp'
+    labels:  List[str],                    # the spec's irrep labels (duplicates allowed)
+) -> List[Tuple[str, str, str, int]]:      # admissible (a, b, c, n_mult), a <= b, n_mult > 0
+    """Enumerate admissible CG triples among the spec's labels (unordered source pairs:
+    swapped duplicates are not independent bilinear maps, so a <= b canonically)."""
+    uniq = sorted(set(labels))
+    out: List[Tuple[str, str, str, int]] = []
+    for i, a in enumerate(uniq):
+        for b in uniq[i:]:
+            for c in uniq:
+                n = cg_intertwiners(N, algebra=algebra, label_a=a, label_b=b,
+                                    label_c=c).shape[0]
+                if n > 0:
+                    out.append((a, b, c, n))
+    return out
