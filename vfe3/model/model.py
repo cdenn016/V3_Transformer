@@ -502,13 +502,18 @@ class VFEModel(nn.Module):
                 # self-couples to its prior every iteration, so s reaches mu_final even at n_e_steps=1.
                 s_mu1, s_sigma1 = self._refine_s(token_ids, beliefs.phi, e_step_gradient=e_step_gradient)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
+            # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
+            # M-step self-coupling term below (manuscript: the self-term reads q*, not the
+            # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.
+            cap = {} if self.cfg.mstep_self_coupling_weight > 0.0 else None
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm,
                             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                             log_alpha=log_alpha,
                             lambda_beta=lambda_beta,
                             connection_W=connection_W, e_step_gradient=e_step_gradient,
-                            rope=rope, rope_on_cov=self.cfg.rope_full_gauge)
+                            rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
+                            capture=cap)
         mu_final = out.mu                                        # (B, N, K); head mixer (if any) applied PER BLOCK
         sigma_final = out.sigma                                  # inside vfe_stack now (VFE_2.0 parity), not post-stack
 
@@ -568,16 +573,16 @@ class VFEModel(nn.Module):
             loss = loss + 0.5 * self.cfg.mass_phi * (out.phi ** 2).mean()
         if self.cfg.mstep_self_coupling_weight > 0.0:
             # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2111):
-            # L += alpha_hat * sum_i alpha_i D(q_i||p_i), computed from the stack's HANDOFF belief
-            # `out` -- which is POST head_mixer / cg_coupling / block_norm (block.py:73-80
-            # overwrites the E-step output before returning), i.e. the belief the next layer and
-            # the decode consume. With those three toggles at their defaults (off / off / 'none')
-            # `out` IS the converged variational belief q* exactly, so the pure path matches the
-            # manuscript's D(q*||p). When a post-E-step transform is enabled the term anchors the
-            # priors to the TRANSFORMED handoff belief T(q*) rather than q* -- consistent with
-            # what downstream consumes, but a departure from the manuscript's q* (audit
-            # 2026-06-09 overnight F19, challenge-upheld; the belief-source choice under those
-            # toggles is an open design decision, see the audit's User Decisions).
+            # L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the alpha-weighted self-coupling of the
+            # CONVERGED variational belief q* (captured by vfe_block BEFORE head_mixer /
+            # cg_coupling / block_norm -- the belief the E-step's F was actually minimized over,
+            # which the manuscript pins the self-term to) against the per-block prior. The prior
+            # fold below mirrors vfe_stack's handoff with the TRANSFORMED outputs (out.mu), since
+            # that is what the real stack hands the next block. With the three transform toggles
+            # at their defaults q* IS the returned `out` (same object), so the pure path is
+            # unchanged; under the toggles the term now reads q* rather than the transformed
+            # handoff T(q*) it accidentally read before (audit 2026-06-09 overnight F19,
+            # challenge-upheld; restores the documented intent and E-step/M-step consistency).
             # alpha_i is the SAME registered self-coupling form as the E-step / diagnostics
             # (self_coupling_alpha keyed off cfg.alpha_mode), so under state_dependent_per_coord the
             # term carries the per-token, per-coordinate alpha_i^(k)* = c0/(b0+D^(k)) rather than a
@@ -602,8 +607,9 @@ class VFEModel(nn.Module):
                 mu_p = (1.0 - rho) * mu_p + rho * out.mu
                 sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
             fam = get_family(cfg.family)
+            q_conv = cap["converged"]                           # q*: pre-transform converged belief
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
-                fam(out.mu, out.sigma), fam(mu_p, sigma_p),
+                fam(q_conv.mu, q_conv.sigma), fam(mu_p, sigma_p),
                 alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
             )
@@ -831,6 +837,7 @@ class VFEModel(nn.Module):
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         _llb = getattr(self, "log_lambda_beta", None)
         rope = self._rope_rotation(n, token_ids.device)               # rope shapes the converged belief (as forward)
+        cap: dict = {}                                                # q* capture (F self-term reads it, as forward)
         out = vfe_stack(                                              # converged belief
             belief, belief.mu, belief.sigma, self.group, cfg,
             log_prior=log_prior, block_norm=self.block_norm,
@@ -840,6 +847,7 @@ class VFEModel(nn.Module):
             lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
             rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
+            capture=cap,
         )
 
         rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
@@ -874,8 +882,9 @@ class VFEModel(nn.Module):
             irrep_dims=self.group.irrep_dims,
         )
         beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), self.group.irrep_dims), log_prior=log_prior)
-        self_div = self_divergence_for_alpha(                        # (N,) or (N, K) per-coord
-            fam(out.mu, out.sigma), fam(mu_p, sigma_p),
+        _q_conv = cap["converged"]                                   # q*: the F self-term reads the
+        self_div = self_divergence_for_alpha(                        # pre-transform converged belief
+            fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p),      # (matches the M-step term; F19)
             alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
         )

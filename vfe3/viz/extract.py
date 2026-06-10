@@ -356,6 +356,7 @@ def converged_state(
     model.eval()
     try:
         belief, log_prior, rope = _encode_one(model, token_ids)
+        cap: dict = {}                                       # q* capture (F self-term, as diagnostics)
         out = vfe_stack(
             belief, belief.mu, belief.sigma, model.group, cfg,
             log_prior=log_prior, block_norm=model.block_norm,
@@ -363,6 +364,7 @@ def converged_state(
             log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
             connection_W=getattr(model, "connection_W", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge,
+            capture=cap,
         )
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma     # rebuild last-block prior
         mu_p, sigma_p = belief.mu, belief.sigma                         # exact iff L==1 or rho==0
@@ -389,8 +391,9 @@ def converged_state(
             irrep_dims=model.group.irrep_dims,
         )
         beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), model.group.irrep_dims), log_prior=log_prior)
-        self_div = self_divergence_for_alpha(
-            fam(out.mu, out.sigma), fam(mu_p, sigma_p), alpha=cfg.alpha_div,
+        _q_conv = cap["converged"]                           # q*: the F self-term reads the pre-
+        self_div = self_divergence_for_alpha(                # transform converged belief (F19,
+            fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p), alpha=cfg.alpha_div,   # as diagnostics)
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
             alpha_mode=cfg.alpha_mode,
         )

@@ -233,6 +233,79 @@ def test_factored_diagonal_covariance_tall_block_matches_dense():
     assert torch.allclose(fast, dense, atol=1e-12)
 
 
+# ---------------------------------------------------------------- F19: M-step reads converged q*
+
+def test_vfe_block_capture_returns_pre_transform_belief():
+    from vfe3.model.model import VFEModel
+    from vfe3.model.stack import vfe_stack
+    torch.manual_seed(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = VFEModel(_cfg(use_head_mixer=True))
+    with torch.no_grad():
+        for dlt in model.head_mixer.mixer_deltas:
+            dlt.add_(0.3)                                     # material transform
+    tok = torch.randint(0, 20, (1, 5))
+    beliefs = model.prior_bank.encode(tok)
+    beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi))
+    cap: dict = {}
+    out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, model.group, model.cfg,
+                    log_prior=model._attention_log_prior(5, tok.device),
+                    head_mixer=model.head_mixer, capture=cap)
+    assert not torch.allclose(cap["converged"].mu, out.mu)    # q* != mixed handoff
+    plain = VFEModel(_cfg())                                  # transforms off: same object
+    beliefs2 = plain.prior_bank.encode(tok)
+    beliefs2 = beliefs2._replace(phi=plain._apply_pos_phi(beliefs2.phi))
+    cap2: dict = {}
+    out2 = vfe_stack(beliefs2, beliefs2.mu, beliefs2.sigma, plain.group, plain.cfg,
+                     log_prior=plain._attention_log_prior(5, tok.device), capture=cap2)
+    assert cap2["converged"] is out2                          # pure path: byte-identical
+
+
+def test_mstep_self_coupling_reads_converged_pretransform_belief():
+    # The M-step regularizer must equal ce + w * sc(q*, p) with q* the CAPTURED pre-transform
+    # converged belief -- not the post-mixer handoff (audit F19, challenge-upheld).
+    import torch.nn.functional as F
+    from vfe3.model.model import VFEModel
+    from vfe3.model.stack import vfe_stack
+    from vfe3.families import get_family
+    from vfe3.free_energy import self_divergence_for_alpha
+    torch.manual_seed(0)
+    w = 0.5
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = VFEModel(_cfg(use_head_mixer=True, mstep_self_coupling_weight=w,
+                              mass_phi=0.0))
+    with torch.no_grad():
+        for dlt in model.head_mixer.mixer_deltas:
+            dlt.add_(0.3)
+    tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
+    logits, loss, _ = model(tok, tgt)
+    ce = F.cross_entropy(logits.reshape(-1, model.cfg.vocab_size), tgt.reshape(-1),
+                         ignore_index=-100)
+    # replicate the forward's belief pipeline with the capture
+    beliefs = model.prior_bank.encode(tok)
+    beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi))
+    cap: dict = {}
+    out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, model.group, model.cfg,
+                    log_prior=model._attention_log_prior(5, tok.device),
+                    head_mixer=model.head_mixer, capture=cap)
+    fam = get_family(model.cfg.family)
+
+    def sc_of(b):
+        sd = self_divergence_for_alpha(
+            fam(b.mu, b.sigma), fam(beliefs.mu, beliefs.sigma),   # n_layers=1: prior = encode
+            alpha=model.cfg.alpha_div, kl_max=model.cfg.kl_max, eps=model.cfg.eps,
+            divergence_family=model.cfg.divergence_family, alpha_mode=model.cfg.alpha_mode,
+        )
+        return sd.mean()
+
+    sc_conv, sc_post = sc_of(cap["converged"]), sc_of(out)
+    assert not torch.allclose(sc_conv, sc_post)               # the transform is material
+    assert torch.allclose(loss, ce + w * sc_conv, atol=1e-6)  # loss anchors to q*
+    assert not torch.allclose(loss, ce + w * sc_post, atol=1e-6)
+
+
 # ---------------------------------------------------------------- replay threading smoke (F29/F32/F33)
 
 def test_replays_thread_mixer_and_cg():

@@ -313,14 +313,16 @@ No critical or high item survived. Mediums first, then grouped lows.
 
 ## User Decisions (flagged, not fixed autonomously)
 
-1. **F19 — which belief should the M-step self-coupling anchor the priors to when post-E-step
-   transforms are enabled?** The manuscript's F pins the self-term to the converged variational
-   belief q*; the code anchors to the post-mixer/post-norm handoff belief (what the next layer
-   and decode consume). Both semantics are defensible for the documented NN-exception
-   extensions; they differ measurably (probe: 1.6e-2 under mahalanobis norm). Tonight's action
-   was limited to correcting the false comment and documenting the current behavior. If you want
-   the manuscript semantics, vfe_block would need to return (or stash) the pre-transform
-   converged belief for the M-step term.
+1. **F19 — RESOLVED (2026-06-10, user delegated the call).** The M-step self-coupling now
+   anchors to the converged pre-transform belief q* via a `capture` out-param on
+   vfe_block/vfe_stack, restoring the manuscript semantics, the in-code documented intent
+   (the original comment claimed "BEFORE head_mixer/norm"), and E-step/M-step consistency
+   (the E-step's own self-term acts on the pre-transform belief). The diagnostics and
+   converged_state F self-term panels read the same captured belief. The prior-fold mirror
+   keeps using the transformed handoff, since that is what the real stack hands forward. Pure
+   path byte-identical; active config unaffected (weight 0.0). See
+   docs/edits/2026-06-10-edits.md and the two new pins in
+   tests/test_audit_fixes_2026_06_10.py.
 2. **CGCoupling dead-path pruning and checkpoint shape.** Pruning the structurally dead
    antisymmetric self-pair paths (punch 6) changes the length of `path_weights`; any existing
    checkpoint trained with `use_cg_coupling=True` under the old enumeration would fail a strict
