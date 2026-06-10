@@ -149,7 +149,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
     
-    kappa                     = 1.10,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa                     = 1.00,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
 
     alpha                     = 1.0,                 # constant self-coupling value
     lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
@@ -205,7 +205,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
     grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
 
-    m_mu_lr                   = 0.015,   
+    m_mu_lr                   = 0.014,   
     m_sigma_lr                = 0.0035,     
     m_phi_lr                  = 0.015,   
     
@@ -564,7 +564,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "range": [0.010, 0.016, 0.001],
+        "param": "m_mu_lr", "range": [0.001, 0.11, 0.01],
     },
     
     "m_sigma_lr": {
@@ -574,7 +574,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.0135, 0.0145, 0.0155],
+        "param": "m_phi_lr", "values": [0.015],
     },
     
     
@@ -645,8 +645,8 @@ SWEEP_ORDER: List[str] = [
    
    
     
-    "m_phi_lr",
-  #  "m_mu_lr",
+   # "m_phi_lr",
+    "m_mu_lr",
     
   #  "weight_decay",
   #  "lambda_beta",

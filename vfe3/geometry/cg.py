@@ -94,7 +94,28 @@ def cg_intertwiners(
         op = torch.kron(I_c, r.T.contiguous()) - torch.kron(rc[a], I_D)
         gram += op.T @ op
     evals, evecs = torch.linalg.eigh(gram)
-    null = evecs[:, evals < atol]                                  # (dc*D, n_mult), orthonormal
+    null_mask = evals < atol
+    # Runtime spectral-gap monitor (audit 2026-06-09 overnight F12): the multiplicity
+    # count is trustworthy only while the Gram spectrum splits cleanly across the atol
+    # cut (13+ orders of magnitude in practice). The equivariance assert below catches
+    # SPURIOUS slots but is structurally blind to DROPPED ones, so warn when a nonzero
+    # eigenvalue sits within two decades ABOVE the cut (a possible dropped slot). The
+    # lower side is left to the assert: at tight atol the eigh's machine-eps null
+    # eigenvalues legitimately approach the cut from below. The all-zero Gram
+    # (all-trivial triples) and the empty null space skip — no cut is straddled there.
+    if bool(null_mask.any()) and bool((~null_mask).any()):
+        gap_lo = float(evals[null_mask].max())         # largest "zero" eigenvalue
+        gap_hi = float(evals[~null_mask].min())        # smallest nonzero eigenvalue
+        if gap_hi < 100.0 * atol:
+            warnings.warn(
+                f"CG multiplicity cut for ({label_a}, {label_b}) -> {label_c} over R^{N} "
+                f"is thin: Gram eigenvalues straddle atol={atol:.1e} with largest-null "
+                f"{gap_lo:.3e} / smallest-nonnull {gap_hi:.3e}. The multiplicity count "
+                f"may be wrong (a DROPPED slot is not caught by the equivariance "
+                f"assert); adjust atol to restore a clean spectral gap.",
+                stacklevel=2,
+            )
+    null = evecs[:, null_mask]                                     # (dc*D, n_mult), orthonormal
     C = null.T.reshape(-1, dc, D).contiguous()
     # The verify gate scales with the null-space cut: a looser atol legitimately admits
     # vectors with proportionally larger residual (residual^2 ~ eigenvalue), so a fixed

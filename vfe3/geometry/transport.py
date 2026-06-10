@@ -319,6 +319,15 @@ def compute_transport_operators(
     The 'constant' gauge mode is intentionally NOT supported (it would require a
     per-head learned Omega parameter, which this no-NN design does not have);
     'constant' raises ValueError.
+
+    Conditioning note (audit 2026-06-09 overnight F26): for the NON-COMPACT groups
+    (glk/block_glk/sp_n; skew_symmetric=False) Omega is not orthogonal and cond(Omega)
+    grows like exp(2 ||phi_matrix||); at the phi retraction's default max_norm=5.0 a
+    draw can reach cond ~1e7-1e10, and the full-covariance sandwich Omega Sigma Omega^T
+    SQUARES it, so a gaussian_full run at fp32 can lose all significant digits there.
+    Compact so towers give orthogonal Omega (cond = 1) and are unaffected. No guard is
+    imposed here — bound phi via the retraction max_norm, or prefer a compact group /
+    diagonal family when conditioning matters at fp32.
     """
     B, N, _ = phi.shape
     generators = group.generators
