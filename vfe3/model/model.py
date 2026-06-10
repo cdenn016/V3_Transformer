@@ -132,13 +132,37 @@ class VFEModel(nn.Module):
             if cfg.use_head_mixer else None
         # Opt-in CG cross-type coupling (default off; so_n/sp_n only). Built ONCE from the
         # group's labels; CGCoupling raises at construction when no admissible paths exist.
+        # The algebra key comes from the GROUP OBJECT (set by the so_n/sp_n builders), not a
+        # re-derivation from the config string, so a newly registered labeled-tower group
+        # cannot mis-dispatch here (audit 2026-06-09 overnight RF1).
         if cfg.use_cg_coupling:
             from vfe3.model.cg_coupling import CGCoupling
             self.cg_coupling = CGCoupling(
-                cfg.group_n, "so" if cfg.gauge_group == "so_n" else "sp",
+                cfg.group_n, self.group.algebra,
                 self.group.irrep_dims, self.group.irrep_labels)
         else:
             self.cg_coupling = None
+        if (cfg.use_head_mixer or cfg.use_cg_coupling) \
+                and cfg.effective_e_step_gradient == "detach":
+            # Footgun (mirrors connection_W / log_alpha / pos_phi_free above and below): the
+            # mixer and the CG coupling are applied INSIDE the vfe_stack call, which the
+            # 'detach' estimator wraps wholesale in no_grad (block.py:73-78 under
+            # model.forward's `run`), so mixer_deltas / path_weights build no graph, receive
+            # no gradient, and silently stay frozen at their identity/zero init -- the model
+            # trains its other parameters and LOOKS healthy while these two opt-in components
+            # never adapt (audit 2026-06-09 overnight F31, challenge-upheld). Gate on the
+            # EFFECTIVE estimator so both the detach_e_step bool and the
+            # e_step_gradient='detach' string route warn; 'unroll' and 'straight_through'
+            # run the stack grad-enabled and train them.
+            import warnings
+            warnings.warn(
+                "use_head_mixer/use_cg_coupling with the effective E-step estimator 'detach' "
+                "freezes mixer_deltas/path_weights: both modules are applied inside the "
+                "no_grad-wrapped vfe_stack, so they receive NO gradient and stay at their "
+                "identity/zero init. Use an 'unroll' E-step (detach_e_step=False, "
+                "e_step_gradient='unroll') or 'straight_through' to train them.",
+                stacklevel=2,
+            )
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED scalar self-coupling alpha.
         # When alpha_mode='learnable', create log_alpha as a trainable nn.Parameter; the consumed
         # coupling is alpha = exp(log_alpha) (always positive). Init 0 -> alpha = exp(0) = 1.0, so a
@@ -478,13 +502,18 @@ class VFEModel(nn.Module):
                 # self-couples to its prior every iteration, so s reaches mu_final even at n_e_steps=1.
                 s_mu1, s_sigma1 = self._refine_s(token_ids, beliefs.phi, e_step_gradient=e_step_gradient)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
+            # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
+            # M-step self-coupling term below (manuscript: the self-term reads q*, not the
+            # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.
+            cap = {} if self.cfg.mstep_self_coupling_weight > 0.0 else None
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm,
                             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                             log_alpha=log_alpha,
                             lambda_beta=lambda_beta,
                             connection_W=connection_W, e_step_gradient=e_step_gradient,
-                            rope=rope, rope_on_cov=self.cfg.rope_full_gauge)
+                            rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
+                            capture=cap)
         mu_final = out.mu                                        # (B, N, K); head mixer (if any) applied PER BLOCK
         sigma_final = out.sigma                                  # inside vfe_stack now (VFE_2.0 parity), not post-stack
 
@@ -545,7 +574,15 @@ class VFEModel(nn.Module):
         if self.cfg.mstep_self_coupling_weight > 0.0:
             # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2111):
             # L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the alpha-weighted self-coupling of the
-            # CONVERGED belief (out.mu/out.sigma, BEFORE head_mixer/norm) vs the per-block prior.
+            # CONVERGED variational belief q* (captured by vfe_block BEFORE head_mixer /
+            # cg_coupling / block_norm -- the belief the E-step's F was actually minimized over,
+            # which the manuscript pins the self-term to) against the per-block prior. The prior
+            # fold below mirrors vfe_stack's handoff with the TRANSFORMED outputs (out.mu), since
+            # that is what the real stack hands the next block. With the three transform toggles
+            # at their defaults q* IS the returned `out` (same object), so the pure path is
+            # unchanged; under the toggles the term now reads q* rather than the transformed
+            # handoff T(q*) it accidentally read before (audit 2026-06-09 overnight F19,
+            # challenge-upheld; restores the documented intent and E-step/M-step consistency).
             # alpha_i is the SAME registered self-coupling form as the E-step / diagnostics
             # (self_coupling_alpha keyed off cfg.alpha_mode), so under state_dependent_per_coord the
             # term carries the per-token, per-coordinate alpha_i^(k)* = c0/(b0+D^(k)) rather than a
@@ -570,8 +607,9 @@ class VFEModel(nn.Module):
                 mu_p = (1.0 - rho) * mu_p + rho * out.mu
                 sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
             fam = get_family(cfg.family)
+            q_conv = cap["converged"]                           # q*: pre-transform converged belief
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
-                fam(out.mu, out.sigma), fam(mu_p, sigma_p),
+                fam(q_conv.mu, q_conv.sigma), fam(mu_p, sigma_p),
                 alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
             )
@@ -799,6 +837,7 @@ class VFEModel(nn.Module):
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         _llb = getattr(self, "log_lambda_beta", None)
         rope = self._rope_rotation(n, token_ids.device)               # rope shapes the converged belief (as forward)
+        cap: dict = {}                                                # q* capture (F self-term reads it, as forward)
         out = vfe_stack(                                              # converged belief
             belief, belief.mu, belief.sigma, self.group, cfg,
             log_prior=log_prior, block_norm=self.block_norm,
@@ -808,6 +847,7 @@ class VFEModel(nn.Module):
             lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
             rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
+            capture=cap,
         )
 
         rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
@@ -842,8 +882,9 @@ class VFEModel(nn.Module):
             irrep_dims=self.group.irrep_dims,
         )
         beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), self.group.irrep_dims), log_prior=log_prior)
-        self_div = self_divergence_for_alpha(                        # (N,) or (N, K) per-coord
-            fam(out.mu, out.sigma), fam(mu_p, sigma_p),
+        _q_conv = cap["converged"]                                   # q*: the F self-term reads the
+        self_div = self_divergence_for_alpha(                        # pre-transform converged belief
+            fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p),      # (matches the M-step term; F19)
             alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
         )
@@ -935,7 +976,8 @@ class VFEModel(nn.Module):
             belief = vfe_block(                                       # converged belief at this block
                 belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                 block_norm=self.block_norm,
-                log_alpha=getattr(self, "log_alpha", None),
+                head_mixer=self.head_mixer,                            # replay the mixer too (audit
+                log_alpha=getattr(self, "log_alpha", None),            # 2026-06-09 overnight F32)
                 lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
                 cg_coupling=self.cg_coupling,

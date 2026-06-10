@@ -282,14 +282,19 @@ def _blockwise_matrix_exp(
     """
     out = torch.zeros_like(matrix)
     if len(set(block_dims)) == 1 and len(block_dims) > 1:
-        d = block_dims[0]
-        blocks = torch.stack(
-            [matrix[..., h * d:(h + 1) * d, h * d:(h + 1) * d] for h in range(len(block_dims))],
-            dim=0,
-        ).contiguous()                                          # (H, ..., d, d)
+        # Diagonal-block gather/scatter without the H-iteration Python loops (audit
+        # 2026-06-09 overnight F3): viewing (..., H*d, H*d) as (..., H, d, H, d), the H
+        # diagonal blocks are torch.diagonal over the two H axes -- one view each way --
+        # so the read is a single copy and the write-back a single in-place copy_ into the
+        # diagonal view of the zero output (same kernel-level semantics as the former
+        # slice assignments, H+H fewer launches).
+        H, d = len(block_dims), block_dims[0]
+        batch = matrix.shape[:-2]
+        m5 = matrix.reshape(*batch, H, d, H, d)
+        blocks = torch.diagonal(m5, dim1=-4, dim2=-2).movedim(-1, 0).contiguous()  # (H, ..., d, d)
         exps = torch.linalg.matrix_exp(blocks)                  # one batched call
-        for h in range(len(block_dims)):
-            out[..., h * d:(h + 1) * d, h * d:(h + 1) * d] = exps[h]
+        out5 = out.reshape(*batch, H, d, H, d)
+        torch.diagonal(out5, dim1=-4, dim2=-2).copy_(exps.movedim(0, -1))
         return out
     start = 0
     for dim in block_dims:
@@ -479,13 +484,24 @@ def _factored_diagonal_covariance(
     """
     parts: List[torch.Tensor] = []
     start = 0
+    n_tokens = sigma.shape[-2]
     for d in factored.irrep_dims:
         end = start + d
         ep = factored.exp_phi[..., start:end, start:end]               # (..., N, d, d) exp(phi_i)^(h)
         en = factored.exp_neg_phi[..., start:end, start:end]           # (..., N, d, d) exp(-phi_j)^(h)
         sig_blk = sigma[..., start:end]                                # (..., N, d)
-        g = torch.einsum("...jml,...jnl,...jl->...jmn", en, en, sig_blk)   # (..., N, d, d) G_j
-        ep2 = ep.unsqueeze(-1) * ep.unsqueeze(-2)                      # (..., N, d, d, d) ep[k,m] ep[k,n]
-        parts.append(torch.einsum("...ikmn,...jmn->...ijk", ep2, g))   # (..., N, N, d)
+        if d <= n_tokens:
+            g = torch.einsum("...jml,...jnl,...jl->...jmn", en, en, sig_blk)   # (..., N, d, d) G_j
+            ep2 = ep.unsqueeze(-1) * ep.unsqueeze(-2)                  # (..., N, d, d, d) ep[k,m] ep[k,n]
+            parts.append(torch.einsum("...ikmn,...jmn->...ijk", ep2, g))   # (..., N, N, d)
+        else:
+            # Tall-block regime d > N (audit 2026-06-09 overnight F4): the query-side outer
+            # product N d^3 would EXCEED the per-pair dense block's N^2 d^2 there, so rebuild
+            # the (exactly equivalent) per-pair block Omega and run the squared diagonal
+            # sandwich; for d <= N (the usual case) the factored route above stays the
+            # memory winner (N d^3 + N^2 d < N^2 d^2).
+            omega_blk = torch.einsum("...ikm,...jml->...ijkl", ep, en)  # (..., N, N, d, d)
+            parts.append(torch.einsum("...ijkl,...ijkl,...jl->...ijk",
+                                      omega_blk, omega_blk, sig_blk))
         start = end
     return torch.cat(parts, dim=-1)                                    # (..., N, N, K)

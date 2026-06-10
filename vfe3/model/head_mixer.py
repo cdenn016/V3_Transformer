@@ -103,6 +103,33 @@ class HeadMixer(nn.Module):
         self.mixer_deltas = nn.ParameterList(
             nn.Parameter(torch.zeros(m, m)) for _, m, _ in self.components
         )
+        if irrep_labels is not None:
+            # Silent-degeneracy warnings (audit 2026-06-09 overnight PP6/DB3). Runs are
+            # CONTIGUOUS by construction, so (a) a label appearing in two non-adjacent runs
+            # gets NO cross-copy mixing (each run mixes only within itself -- a proper
+            # subspace of the tower's true commutant), and (b) an all-length-1 tower
+            # degenerates to per-block scalar gains (Schur-forced for inequivalent irreps,
+            # but worth a heads-up when the user enabled the mixer expecting mixing).
+            import warnings
+            run_labels = [irrep_labels[i] for i, _j in runs]
+            if len(set(run_labels)) != len(run_labels):
+                dup = sorted({lab for lab in run_labels if run_labels.count(lab) > 1})
+                warnings.warn(
+                    f"HeadMixer: label(s) {dup} appear in NON-ADJACENT blocks of the irrep "
+                    f"spec, so their copies are mixed per contiguous run only (no cross-copy "
+                    f"mixing between the separated runs). List equal-label copies adjacently "
+                    f"in irrep_spec to mix them jointly.",
+                    stacklevel=2,
+                )
+            if len(set(irrep_labels)) == len(irrep_labels):
+                warnings.warn(
+                    "HeadMixer: every irrep label in this tower is distinct, so the isotypic "
+                    "mixer degenerates to one scalar gain per block (Schur: no linear "
+                    "equivariant map exists between inequivalent irreps). Use multiplicity "
+                    "> 1 (or use_cg_coupling=True for bilinear cross-type flow) if you "
+                    "intended inter-block mixing.",
+                    stacklevel=2,
+                )
 
     @property
     def mixer_delta(self) -> nn.Parameter:
@@ -132,9 +159,17 @@ class HeadMixer(nn.Module):
         mu:    torch.Tensor,             # (..., K) belief means
         sigma: torch.Tensor,             # (..., K) diagonal variances OR (..., K, K) full covariance
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Grad-free identity short-circuit only: under autograd a zero-delta short-circuit
+        # would sever mixer_deltas from the graph and the zero-init deltas could never train
+        # (audit 2026-06-09 overnight CR3 verifier correction).
+        if not torch.is_grad_enabled() and self.is_identity():
+            return mu, sigma
         mu_parts, sig_parts = [], []
         for t, (s, m, d) in enumerate(self.components):
-            A = self._A(t)
+            # Cast to the INPUT dtype (audit 2026-06-09 overnight DB1): the parameter dtype
+            # follows the module (.double()/.float()), and an uncast A crashes the einsum
+            # on any module/input dtype mixture; a same-dtype .to is a free no-op.
+            A = self._A(t).to(dtype=mu.dtype, device=mu.device)
             blk = mu[..., s:s + m * d].reshape(*mu.shape[:-1], m, d)
             mu_parts.append(torch.einsum("mn,...nd->...md", A, blk)
                             .reshape(*mu.shape[:-1], m * d))
@@ -150,7 +185,11 @@ class HeadMixer(nn.Module):
         return mu_out, M @ sigma @ M.transpose(-1, -2)
 
     def _dense_m(self, device, dtype) -> torch.Tensor:
-        r"""blockdiag_t(A_t kron I_d) materialized once per call (K x K, full-cov path only)."""
+        r"""blockdiag_t(A_t kron I_d) materialized once per call (K x K, full-cov path only).
+
+        Deliberately NOT cached: M is differentiable through the trainable deltas, so a
+        (device, dtype)-keyed cache would serve stale gradients during training (audit
+        2026-06-09 overnight CR4); the rebuild is O(K^2) against the O(K^3) sandwich it feeds."""
         K = sum(m * d for _, m, d in self.components)
         M = torch.zeros(K, K, device=device, dtype=dtype)
         for t, (s, m, d) in enumerate(self.components):

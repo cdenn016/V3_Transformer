@@ -33,6 +33,7 @@ def vfe_stack(
     e_step_gradient: str                       = "unroll",  # E-step backward estimator (unroll | straight_through | detach)
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
+    capture:         Optional[dict]            = None,   # out-param: LAST block's converged (pre-transform) belief under 'converged'
 ) -> BeliefState:
     r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior.
 
@@ -53,7 +54,8 @@ def vfe_stack(
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
                            log_alpha=log_alpha, lambda_beta=lambda_beta,
                            connection_W=connection_W,
-                           e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov)
+                           e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,
+                           capture=capture)                       # each block overwrites; last wins
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
     return belief

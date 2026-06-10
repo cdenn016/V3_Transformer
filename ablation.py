@@ -89,7 +89,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     max_seq_len               = 128,                 # N, context length
     
     batch_size                = 64,
-    max_steps                 = 10000,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1,                   # T, E-step inner iterations
@@ -98,7 +98,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 
     # gauge seam
     gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
-                                                     # tied_block_glk: one shared GL(d) frame across heads (kron(I_n, gl(d)))
+                                           # tied_block_glk: one shared GL(d) frame across heads (kron(I_n, gl(d)))
 
     # so_n / sp_n irrep towers (heads = irreps; see train_vfe3.py for the full notes). Structure
     # group SO(group_n) / Sp(group_n), group_n DECOUPLED from embed_dim; irrep_spec = [(label,
@@ -149,7 +149,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
     
-    kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa                     = 1.10,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
 
     alpha                     = 1.0,                 # constant self-coupling value
     lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
@@ -205,13 +205,13 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
     grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
 
-    m_mu_lr                   = 0.0140,   
-    m_sigma_lr                = 0.00425,     
+    m_mu_lr                   = 0.015,   
+    m_sigma_lr                = 0.0035,     
     m_phi_lr                  = 0.015,   
     
-    mu_init_std               = 0.06,         # std of the random mean table mu_embed
-    sigma_init                = 4.0,          # constant initial coordinate variance (sigma_log = log of this)
-    phi_scale                 = 0.05,         # std
+    mu_init_std               = 0.065,         # std of the random mean table mu_embed
+    sigma_init                = 3,          # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale                 = 0.06,         # std
     
     
     weight_decay              = 0.02,
@@ -452,13 +452,6 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
 
 
-     "e_sigma_q_trust": {
-         "description": "E-step SPD retraction trust radius",
-         "param": "e_sigma_q_trust", "values": [1.0, 5.0, 10.0],
-     },
-    
-
-
     
     
     "bch_pe_order": {
@@ -469,7 +462,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "pos_phi_scale": {
         "description": "learned pos_phi table init scale",
-        "param": "pos_phi_scale", "range": [0.00, 0.1, 0.025],
+        "param": "pos_phi_scale", "range": [0.01, 0.1, 0.01],
         "requires": {"pos_phi": "learned"},
     },    
 
@@ -509,20 +502,29 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
    
     
+    
+     "e_sigma_q_trust": {
+         "description": "E-step SPD retraction trust radius",
+         "param": "e_sigma_q_trust", "values": [10.0, 15],
+     },
+    
+
+
+    
     # === belief-table init scales (PriorBank) ===============================
     "mu_init_std": {
         "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
-        "param": "mu_init_std", "values": [0.055, 0.065],
+        "param": "mu_init_std", "values": [0.060, 0.0625, 0.065, 0.0675, 0.070],
     },
     
     "sigma_init": {
         "description": "constant initial coordinate variance of the prior table (>0)",
-        "param": "sigma_init", "values": [0.5, 1, 3, 4],
+        "param": "sigma_init", "values": [3.5],
     },
     
     "phi_scale": {
         "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
-        "param": "phi_scale", "values": [0.06, 0.07],
+        "param": "phi_scale", "values": [0.055, 0.06, 0.065],
     },
     
 
@@ -536,7 +538,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
         # spuriously ~2.5x faster AND worse). No-op at alpha_div == 1 (the kernel ignores the toggle).
         "description": "Renyi divergence order (1.0 -> KL; != 1 routes the non-kernel oracle)",
-        "param": "alpha_div", "range": [0.2, 1, 0.2], "requires": {"oracle_unroll_grad": True},
+        "param": "alpha_div", "range": [0.2, 1, 0.1], "requires": {"oracle_unroll_grad": True},
     },
     
     
@@ -545,7 +547,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
    "e_mu_lr": {
        "description": "E-step natural-gradient step size for mu_q",
-       "param": "e_mu_lr", "range": [0, 1, 0.2],
+       "param": "e_mu_lr", "range": [0.2, 1, 0.1],
    },
    
    "e_sigma_lr": {
@@ -562,17 +564,17 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "values": [0.010, 0.014, 0.016, 0.02],
+        "param": "m_mu_lr", "range": [0.010, 0.016, 0.001],
     },
     
     "m_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_sigma_lr", "values": [0.001, 0.004, 0.006, 0.01],
+        "param": "m_sigma_lr", "range": [0.0025, 0.0045, 0.00025],
     },
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [ 0.01, 0.0125, 0.015, 0.0175],
+        "param": "m_phi_lr", "values": [0.0135, 0.0145, 0.0155],
     },
     
     
@@ -585,19 +587,19 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "mstep_self_coupling_weight": {
         "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
-        "param": "mstep_self_coupling_weight", "range": [0.00, 0.08, 0.02],
+        "param": "mstep_self_coupling_weight", "values": [0.00, 1e-4, 0.001, 0.005, 0.01],
     },
     
     
     
     "kappa": {
         "description": "attention temperature tau = kappa * sqrt(d_head)",
-        "param": "kappa", "range": [0.1, 1.6, 0.25],
+        "param": "kappa", "range": [0.1, 1.3, 0.1],
     },
     
     "lambda_beta": {
-        "description": "belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)",
-        "param": "lambda_beta", "range": [0, 2, 0.5],
+        "description": "belief-coupling block weight (1.0 = pure F)",
+        "param": "lambda_beta", "range": [0, 2, 0.25],
     },
     
     
@@ -609,7 +611,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "phi_weight_decay":{
         "description": "weight decay on phi",
-        "param": "phi_weight_decay", "values": [0.025, 0.05, 0.075, 0.1],
+        "param": "phi_weight_decay", "range": [0.01, 0.1, 0.01],
     },
 }
 
@@ -637,47 +639,36 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
     
-    "mu_init_std",
-    "phi_scale",
+  #  "mu_init_std",
+  #  "phi_scale",
+   # "sigma_init", 
+   
+   
     
-    "m_sigma_lr",
-    
-    "m_mu_lr",
     "m_phi_lr",
-
+  #  "m_mu_lr",
     
+  #  "weight_decay",
+  #  "lambda_beta",
     
-    "sigma_init", 
-
-    
-    
-     #   "weight_decay",
-    
+  #  "mstep_self_coupling_weight",
   #  "kappa",
   #  "alpha_div",
-  #$  "phi_weight_decay",    
-   # 
+    "m_sigma_lr",
     
-  #  "e_mu_lr",
- #   "lambda_beta",
+    "e_mu_lr",
+    "phi_weight_decay",
     
-
     #"c0",
     #"b0",
     
   #  "e_sigma_lr",
     
-    
-   # "pos_phi_scale",
-    
-    
+    "pos_phi_scale",   
   #  "mass_phi",
     
-    #"mstep_self_coupling_weight",
+   
     
-    
-    
-    #"e_sigma_q_trust",
     
     #"pos_phi_compose", 
     

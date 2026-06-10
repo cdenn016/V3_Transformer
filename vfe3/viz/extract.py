@@ -160,8 +160,9 @@ def belief_bank(
 ) -> Dict[str, torch.Tensor]:
     r"""Collect converged beliefs (mu, Sigma, phi) over many sequences into one bank.
 
-    For each batch runs the model's belief pipeline (prior_bank.encode -> pos_phi -> vfe_stack,
-    mirroring forward up to the converged belief, BEFORE head-mixer / final-norm decode prep) and
+    For each batch runs the model's belief pipeline (prior_bank.encode -> pos_phi -> vfe_stack
+    with the SAME per-block head_mixer / cg_coupling / block_norm the training forward applies,
+    mirroring forward up to the stack's handoff belief; only final-norm decode prep is omitted) and
     stacks the per-token converged ``mu`` (M, K), ``sigma`` (M, K) or (M, K, K), ``phi``
     (M, n_gen), with ``token_ids`` (M,) and ``seq_idx`` (M,). Feeds the mu / Sigma / phi UMAP
     triptych and the at-scale clustering scores.
@@ -184,7 +185,8 @@ def belief_bank(
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
                 log_prior=log_prior, block_norm=model.block_norm,
-                log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
+                head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained
+                log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),  # model
                 connection_W=getattr(model, "connection_W", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,
             )
@@ -269,7 +271,9 @@ def across_layer_belief_trace(
     for _ in range(cfg.n_layers):
         belief = vfe_block(
             belief, mu_p, sigma_p, model.group, cfg, log_prior=log_prior,
-            block_norm=model.block_norm, log_alpha=getattr(model, "log_alpha", None),
+            block_norm=model.block_norm, head_mixer=model.head_mixer,
+            cg_coupling=model.cg_coupling,                       # replay the trained model
+            log_alpha=getattr(model, "log_alpha", None),
             lambda_beta=_lambda_beta(model), connection_W=getattr(model, "connection_W", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge,
         )
@@ -352,12 +356,15 @@ def converged_state(
     model.eval()
     try:
         belief, log_prior, rope = _encode_one(model, token_ids)
+        cap: dict = {}                                       # q* capture (F self-term, as diagnostics)
         out = vfe_stack(
             belief, belief.mu, belief.sigma, model.group, cfg,
             log_prior=log_prior, block_norm=model.block_norm,
+            head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained model
             log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
             connection_W=getattr(model, "connection_W", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge,
+            capture=cap,
         )
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma     # rebuild last-block prior
         mu_p, sigma_p = belief.mu, belief.sigma                         # exact iff L==1 or rho==0
@@ -384,8 +391,9 @@ def converged_state(
             irrep_dims=model.group.irrep_dims,
         )
         beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), model.group.irrep_dims), log_prior=log_prior)
-        self_div = self_divergence_for_alpha(
-            fam(out.mu, out.sigma), fam(mu_p, sigma_p), alpha=cfg.alpha_div,
+        _q_conv = cap["converged"]                           # q*: the F self-term reads the pre-
+        self_div = self_divergence_for_alpha(                # transform converged belief (F19,
+            fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p), alpha=cfg.alpha_div,   # as diagnostics)
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
             alpha_mode=cfg.alpha_mode,
         )

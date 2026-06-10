@@ -27,6 +27,7 @@ and first-build paths). This protects the process-global `_CG_CACHE` from in-pla
 caller mutations.
 """
 
+import warnings
 from typing import Dict, List, Tuple
 
 import torch
@@ -34,7 +35,13 @@ import torch
 from vfe3.geometry.generators import generate_son, generate_sp
 from vfe3.geometry.irreps import irrep_dim, irrep_generators
 
-_CG_CACHE: Dict[Tuple[str, int, str, str, str], torch.Tensor] = {}
+_CG_CACHE: Dict[Tuple[str, int, str, str, str, float], torch.Tensor] = {}
+
+
+def clear_cg_cache() -> None:
+    """Drop every cached intertwiner (process-global; entries are otherwise kept for the
+    process lifetime, bounded only by the distinct (algebra, N, triple, atol) keys built)."""
+    _CG_CACHE.clear()
 
 
 def _defining(N: int, algebra: str) -> torch.Tensor:
@@ -56,7 +63,9 @@ def cg_intertwiners(
     atol:    float = 1e-8,
 ) -> torch.Tensor:                         # (n_mult, d_c, d_a * d_b) float64; n_mult may be 0
     """All independent intertwiners V_a (x) V_b -> V_c (empty leading axis if none)."""
-    key = (algebra, N, label_a, label_b, label_c)
+    # atol is part of the key: it sets the null-space cut, so two calls with different
+    # tolerances are different solves and must not alias (audit 2026-06-09 overnight CR1).
+    key = (algebra, N, label_a, label_b, label_c, float(atol))
     if key in _CG_CACHE:
         return _CG_CACHE[key].clone()
     da = irrep_dim(N, algebra=algebra, label=label_a)
@@ -87,13 +96,19 @@ def cg_intertwiners(
     evals, evecs = torch.linalg.eigh(gram)
     null = evecs[:, evals < atol]                                  # (dc*D, n_mult), orthonormal
     C = null.T.reshape(-1, dc, D).contiguous()
+    # The verify gate scales with the null-space cut: a looser atol legitimately admits
+    # vectors with proportionally larger residual (residual^2 ~ eigenvalue), so a fixed
+    # 1e-7 would spuriously reject them (audit 2026-06-09 overnight PP2). At the default
+    # atol=1e-8 the gate stays exactly 1e-7. Note the gate (and the float64 construction)
+    # bounds the BUILD residual; the fp32 runtime cast adds its own ~1e-7-scale epsilon.
+    verify_gate = max(1e-7, 10.0 * float(atol))
     for a in range(G_def.shape[0]):                                # build-time verification
         res = (C @ rho_ab[a] - torch.einsum("ij,mjk->mik", rc[a], C)).abs().max() \
             if C.shape[0] else torch.tensor(0.0)
-        if float(res) > 1e-7:
+        if float(res) > verify_gate:
             raise RuntimeError(
                 f"CG intertwiner ({label_a}, {label_b}) -> {label_c} equivariance residual "
-                f"{float(res):.3e} exceeds 1e-7 at generator {a}"
+                f"{float(res):.3e} exceeds {verify_gate:.1e} at generator {a}"
             )
     _CG_CACHE[key] = C
     return C.clone()
@@ -113,6 +128,21 @@ def cg_selection(
     for i, a in enumerate(uniq):
         for b in uniq[i:]:
             for c in uniq:
+                # Pre-check the construction-size guard via the closed-form dims so one
+                # oversize triple skips (with a warning) instead of raising mid-enumeration
+                # and blocking an otherwise-valid tower (audit 2026-06-09 overnight F25).
+                da = irrep_dim(N, algebra=algebra, label=a)
+                db = irrep_dim(N, algebra=algebra, label=b)
+                dc = irrep_dim(N, algebra=algebra, label=c)
+                if dc * da * db > 5000:
+                    warnings.warn(
+                        f"cg_selection skipping ({a}, {b}) -> {c} over R^{N}: solve size "
+                        f"d_c*d_a*d_b = {dc * da * db} > 5000 exceeds the supported "
+                        f"construction guard, so this coupling path is OMITTED from the "
+                        f"tower (larger products await a matrix-free solver).",
+                        stacklevel=2,
+                    )
+                    continue
                 n = cg_intertwiners(N, algebra=algebra, label_a=a, label_b=b,
                                     label_c=c).shape[0]
                 if n > 0:

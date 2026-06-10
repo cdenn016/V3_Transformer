@@ -133,7 +133,7 @@ config = dict(
     
     learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
     
-    kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa                     = 1.1,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
 
     alpha                     = 1.0,                 # constant self-coupling value
     lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
@@ -189,13 +189,13 @@ config = dict(
     detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
     grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
 
-    m_mu_lr                   = 0.0140,   
-    m_sigma_lr                = 0.00425,     
+    m_mu_lr                   = 0.0150,   
+    m_sigma_lr                = 0.0035,     
     m_phi_lr                  = 0.015,   
     
-    mu_init_std               = 0.06,         # std of the random mean table mu_embed
-    sigma_init                = 4.0,          # constant initial coordinate variance (sigma_log = log of this)
-    phi_scale                 = 0.05,         # std
+    mu_init_std               = 0.065,         # std of the random mean table mu_embed
+    sigma_init                = 3.0,          # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale                 = 0.06,         # std
     
     
     weight_decay              = 0.02,

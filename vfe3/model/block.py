@@ -39,6 +39,7 @@ def vfe_block(
     e_step_gradient: str                       = "unroll",  # E-step backward estimator (unroll | straight_through | detach)
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
+    capture:         Optional[dict]            = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
@@ -70,6 +71,13 @@ def vfe_block(
         log_prior=log_prior,
         rope=rope, rope_on_cov=rope_on_cov,
     )
+    if capture is not None:
+        # The CONVERGED variational belief q* -- what the E-step's F was minimized over,
+        # BEFORE the post-inference transforms below. The manuscript's self-coupling
+        # alpha*KL(q||p) is pinned to THIS belief (audit 2026-06-09 overnight F19); the
+        # M-step regularizer and the diagnostics F self-term read it from here. With the
+        # transforms off (the pure path) it is the SAME object the block returns.
+        capture["converged"] = out
     if head_mixer is not None:               # opt-in head mixing: after the E-step, BEFORE the norm
         mu_mixed, sigma_mixed = head_mixer(out.mu, out.sigma)   # so the mixed belief feeds norm + handoff
         out = BeliefState(mu=mu_mixed, sigma=sigma_mixed, phi=out.phi)   # (VFE_2.0 per-block order)
