@@ -132,13 +132,37 @@ class VFEModel(nn.Module):
             if cfg.use_head_mixer else None
         # Opt-in CG cross-type coupling (default off; so_n/sp_n only). Built ONCE from the
         # group's labels; CGCoupling raises at construction when no admissible paths exist.
+        # The algebra key comes from the GROUP OBJECT (set by the so_n/sp_n builders), not a
+        # re-derivation from the config string, so a newly registered labeled-tower group
+        # cannot mis-dispatch here (audit 2026-06-09 overnight RF1).
         if cfg.use_cg_coupling:
             from vfe3.model.cg_coupling import CGCoupling
             self.cg_coupling = CGCoupling(
-                cfg.group_n, "so" if cfg.gauge_group == "so_n" else "sp",
+                cfg.group_n, self.group.algebra,
                 self.group.irrep_dims, self.group.irrep_labels)
         else:
             self.cg_coupling = None
+        if (cfg.use_head_mixer or cfg.use_cg_coupling) \
+                and cfg.effective_e_step_gradient == "detach":
+            # Footgun (mirrors connection_W / log_alpha / pos_phi_free above and below): the
+            # mixer and the CG coupling are applied INSIDE the vfe_stack call, which the
+            # 'detach' estimator wraps wholesale in no_grad (block.py:73-78 under
+            # model.forward's `run`), so mixer_deltas / path_weights build no graph, receive
+            # no gradient, and silently stay frozen at their identity/zero init -- the model
+            # trains its other parameters and LOOKS healthy while these two opt-in components
+            # never adapt (audit 2026-06-09 overnight F31, challenge-upheld). Gate on the
+            # EFFECTIVE estimator so both the detach_e_step bool and the
+            # e_step_gradient='detach' string route warn; 'unroll' and 'straight_through'
+            # run the stack grad-enabled and train them.
+            import warnings
+            warnings.warn(
+                "use_head_mixer/use_cg_coupling with the effective E-step estimator 'detach' "
+                "freezes mixer_deltas/path_weights: both modules are applied inside the "
+                "no_grad-wrapped vfe_stack, so they receive NO gradient and stay at their "
+                "identity/zero init. Use an 'unroll' E-step (detach_e_step=False, "
+                "e_step_gradient='unroll') or 'straight_through' to train them.",
+                stacklevel=2,
+            )
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED scalar self-coupling alpha.
         # When alpha_mode='learnable', create log_alpha as a trainable nn.Parameter; the consumed
         # coupling is alpha = exp(log_alpha) (always positive). Init 0 -> alpha = exp(0) = 1.0, so a
@@ -544,8 +568,16 @@ class VFEModel(nn.Module):
             loss = loss + 0.5 * self.cfg.mass_phi * (out.phi ** 2).mean()
         if self.cfg.mstep_self_coupling_weight > 0.0:
             # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2111):
-            # L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the alpha-weighted self-coupling of the
-            # CONVERGED belief (out.mu/out.sigma, BEFORE head_mixer/norm) vs the per-block prior.
+            # L += alpha_hat * sum_i alpha_i D(q_i||p_i), computed from the stack's HANDOFF belief
+            # `out` -- which is POST head_mixer / cg_coupling / block_norm (block.py:73-80
+            # overwrites the E-step output before returning), i.e. the belief the next layer and
+            # the decode consume. With those three toggles at their defaults (off / off / 'none')
+            # `out` IS the converged variational belief q* exactly, so the pure path matches the
+            # manuscript's D(q*||p). When a post-E-step transform is enabled the term anchors the
+            # priors to the TRANSFORMED handoff belief T(q*) rather than q* -- consistent with
+            # what downstream consumes, but a departure from the manuscript's q* (audit
+            # 2026-06-09 overnight F19, challenge-upheld; the belief-source choice under those
+            # toggles is an open design decision, see the audit's User Decisions).
             # alpha_i is the SAME registered self-coupling form as the E-step / diagnostics
             # (self_coupling_alpha keyed off cfg.alpha_mode), so under state_dependent_per_coord the
             # term carries the per-token, per-coordinate alpha_i^(k)* = c0/(b0+D^(k)) rather than a
@@ -935,7 +967,8 @@ class VFEModel(nn.Module):
             belief = vfe_block(                                       # converged belief at this block
                 belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                 block_norm=self.block_norm,
-                log_alpha=getattr(self, "log_alpha", None),
+                head_mixer=self.head_mixer,                            # replay the mixer too (audit
+                log_alpha=getattr(self, "log_alpha", None),            # 2026-06-09 overnight F32)
                 lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
                 cg_coupling=self.cg_coupling,

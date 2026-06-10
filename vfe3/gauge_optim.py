@@ -55,6 +55,9 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
     stay on AdamW (the caller gates on width).
     """
 
+    # Signature-convention exception: torch.optim.Optimizer's contract REQUIRES params as the
+    # first positional argument (super().__init__(params, ...)), so the tensor `generators`
+    # cannot lead here as the project convention would otherwise mandate.
     def __init__(
         self,
         params,

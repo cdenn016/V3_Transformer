@@ -7,7 +7,7 @@ the attention-entropy term) vs surrogate is a single toggle. The attention prior
 is a log-bias B_ij from the `attention_prior` seam; beta* = softmax_j(B - E/tau).
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -57,10 +57,27 @@ def attention_tau(
         )
     if len(set(irrep_dims)) == 1:
         return kappa * (irrep_dims[0] ** 0.5)
-    sqrt_d = torch.tensor([float(d) for d in irrep_dims]).sqrt()   # (H,) per-block sqrt(d_h)
-    if isinstance(kappa, torch.Tensor):
-        sqrt_d = sqrt_d.to(device=kappa.device, dtype=kappa.dtype)
+    sqrt_d = _sqrt_dims(                                           # (H,) per-block sqrt(d_h), cached
+        tuple(irrep_dims),
+        kappa.device if isinstance(kappa, torch.Tensor) else torch.device("cpu"),
+        kappa.dtype if isinstance(kappa, torch.Tensor) else torch.float32,
+    )
     return kappa * sqrt_d
+
+
+_SQRT_D_CACHE: Dict[Tuple[Tuple[int, ...], torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def _sqrt_dims(dims: Tuple[int, ...], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    r"""Cached per-block sqrt(d_h) vector: attention_tau is called every vfe_block invocation,
+    and the unequal-dims branch was allocating this loop-invariant tensor each time (audit
+    2026-06-09 overnight F7)."""
+    key = (dims, device, dtype)
+    t = _SQRT_D_CACHE.get(key)
+    if t is None:
+        t = torch.tensor([float(d) for d in dims], device=device, dtype=dtype).sqrt()
+        _SQRT_D_CACHE[key] = t
+    return t
 
 
 def _stackable_for_batching(

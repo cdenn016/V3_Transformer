@@ -108,14 +108,17 @@ class VFE3Config:
     # embed_dim. One shared per-token phi (n_gen = dim of the algebra) drives every block -- a
     # TIED gauge. Both fields are consumed ONLY by these two groups (rejected otherwise).
     group_n:                   Optional[int] = None
+    # annotation reflects the POST-coercion type: __post_init__ also accepts the JSON/TOML
+    # round-trip list-of-lists form ([["l1", 3], ...]) and coerces each pair to a tuple.
     irrep_spec:                Optional[List[Tuple[str, int]]] = None
 
     # head mixer (opt-in, default off): a learned Schur-commutant matrix mixes the equal-size
     # gauge-irrep blocks (under block_glk: the n_heads heads) of the converged belief. Identity
     # init -> step-0 bit-identical to off. Breaks strict gauge equivariance under block_glk's
     # untied per-block gauge (exact at init, deviates as the mixer drifts); the tied_block_glk
-    # group restores EXACT equivariance on the full-covariance path. Needs a group with >= 2 equal
-    # blocks (block_glk / tied_block_glk), else VFEModel construction raises.
+    # group restores EXACT equivariance on the full-covariance path. Needs a group with >= 2
+    # blocks (block_glk / tied_block_glk heads, or an so_n/sp_n tower); rejected at config
+    # validation otherwise.
     use_head_mixer:            bool  = False
 
     # CG cross-type coupling (opt-in, default off; so_n/sp_n only): bilinear Clebsch-Gordan
@@ -504,6 +507,22 @@ class VFE3Config:
             raise ValueError(
                 f"use_cg_coupling requires an irrep-labeled tower group ('so_n'/'sp_n'); got "
                 f"gauge_group={self.gauge_group!r}"
+            )
+        # Mirror of the use_cg_coupling guard for the mixer (audit 2026-06-09 overnight PP1):
+        # a single-block group has nothing to mix, and HeadMixer would reject it anyway at
+        # VFEModel construction -- fail at CONFIG validation like every other toggle pairing.
+        # block_glk/tied_block_glk mix the n_heads >= 2 head blocks; so_n/sp_n mix per
+        # isotypic component (their block counts were validated above).
+        if self.use_head_mixer and (
+            self.gauge_group in ("glk", "so_k", "sp")
+            or (self.gauge_group in ("block_glk", "tied_block_glk") and self.n_heads < 2)
+        ):
+            raise ValueError(
+                f"use_head_mixer=True needs >= 2 gauge blocks to mix, but "
+                f"gauge_group={self.gauge_group!r}"
+                + (f" with n_heads={self.n_heads}" if self.gauge_group in ("block_glk", "tied_block_glk") else "")
+                + " yields a single block. Use block_glk/tied_block_glk with n_heads >= 2, or an "
+                "so_n/sp_n irrep tower."
             )
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
         # transport_mode selects the connection REGIME. Validated against the transport REGISTRY

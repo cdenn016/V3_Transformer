@@ -160,8 +160,9 @@ def belief_bank(
 ) -> Dict[str, torch.Tensor]:
     r"""Collect converged beliefs (mu, Sigma, phi) over many sequences into one bank.
 
-    For each batch runs the model's belief pipeline (prior_bank.encode -> pos_phi -> vfe_stack,
-    mirroring forward up to the converged belief, BEFORE head-mixer / final-norm decode prep) and
+    For each batch runs the model's belief pipeline (prior_bank.encode -> pos_phi -> vfe_stack
+    with the SAME per-block head_mixer / cg_coupling / block_norm the training forward applies,
+    mirroring forward up to the stack's handoff belief; only final-norm decode prep is omitted) and
     stacks the per-token converged ``mu`` (M, K), ``sigma`` (M, K) or (M, K, K), ``phi``
     (M, n_gen), with ``token_ids`` (M,) and ``seq_idx`` (M,). Feeds the mu / Sigma / phi UMAP
     triptych and the at-scale clustering scores.
@@ -184,7 +185,8 @@ def belief_bank(
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
                 log_prior=log_prior, block_norm=model.block_norm,
-                log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
+                head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained
+                log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),  # model
                 connection_W=getattr(model, "connection_W", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,
             )
@@ -269,7 +271,9 @@ def across_layer_belief_trace(
     for _ in range(cfg.n_layers):
         belief = vfe_block(
             belief, mu_p, sigma_p, model.group, cfg, log_prior=log_prior,
-            block_norm=model.block_norm, log_alpha=getattr(model, "log_alpha", None),
+            block_norm=model.block_norm, head_mixer=model.head_mixer,
+            cg_coupling=model.cg_coupling,                       # replay the trained model
+            log_alpha=getattr(model, "log_alpha", None),
             lambda_beta=_lambda_beta(model), connection_W=getattr(model, "connection_W", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge,
         )
@@ -355,6 +359,7 @@ def converged_state(
         out = vfe_stack(
             belief, belief.mu, belief.sigma, model.group, cfg,
             log_prior=log_prior, block_norm=model.block_norm,
+            head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained model
             log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
             connection_W=getattr(model, "connection_W", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge,
