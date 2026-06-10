@@ -306,6 +306,48 @@ def test_mstep_self_coupling_reads_converged_pretransform_belief():
     assert not torch.allclose(loss, ce + w * sc_post, atol=1e-6)
 
 
+# ---------------------------------------------------------------- CG overlapping-slice gradcheck (F18)
+
+def test_cg_coupling_gradcheck_through_overlapping_slices():
+    # Numeric finite-difference check (correctness, not just finiteness) of the batched
+    # forward's delta accumulation, where multiple (triple, mult) groups write the SAME
+    # target slice (e.g. (l1,l1)->l0 and (l2,l2)->l0 both write the l0 block).
+    from torch.func import functional_call
+    from vfe3.model.cg_coupling import CGCoupling
+    torch.manual_seed(0)
+    grp = _tower_group()
+    cpl = CGCoupling(3, "so", grp.irrep_dims, grp.irrep_labels).double()
+    sig = torch.rand(2, 9, dtype=torch.float64)
+    mu = torch.randn(2, 9, dtype=torch.float64, requires_grad=True)
+    w = (0.3 * torch.randn(cpl.path_weights.shape[0],
+                           dtype=torch.float64)).requires_grad_(True)
+
+    def f(mu_in, w_in):
+        return functional_call(cpl, {"path_weights": w_in}, (mu_in, sig))[0]
+
+    assert torch.autograd.gradcheck(f, (mu, w))
+
+
+# ---------------------------------------------------------------- uniform-pi entropy scalar (F8/PE7)
+
+def test_free_energy_uniform_pi_scalar_matches_explicit_reference():
+    # log_prior=None branch: the scalar -log N must reproduce the old explicit
+    # full_like(beta, 1/N) reference term-for-term (audit F8 / morning PE7).
+    from vfe3.free_energy import attention_weights, free_energy
+    torch.manual_seed(0)
+    N, tau = 7, 2.0
+    energy = torch.rand(N, N)
+    self_div = torch.rand(N)
+    alpha = torch.ones(N)
+    F_new = free_energy(self_div, energy, alpha, tau=tau, log_prior=None)
+    beta = attention_weights(energy, tau=tau, log_prior=None)
+    pi = torch.full_like(beta, 1.0 / N)
+    ref = (alpha * self_div).sum() + (beta * energy).sum() + (
+        tau * (beta * (torch.log(beta.clamp(min=1e-12))
+                       - torch.log(pi.clamp(min=1e-12))))).sum()
+    assert torch.allclose(F_new, ref, atol=1e-6)
+
+
 # ---------------------------------------------------------------- replay threading smoke (F29/F32/F33)
 
 def test_replays_thread_mixer_and_cg():

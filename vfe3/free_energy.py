@@ -7,6 +7,7 @@ the attention-entropy term) vs surrogate is a single toggle. The attention prior
 is a log-bias B_ij from the `attention_prior` seam; beta* = softmax_j(B - E/tau).
 """
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -364,10 +365,15 @@ def free_energy(
 
     F = self_total + lambda_beta * coupling
     if include_attention_entropy:
-        pi = torch.softmax(log_prior, dim=-1) if log_prior is not None \
-            else torch.full_like(beta, 1.0 / beta.shape[-1])
+        # Uniform prior (log_prior=None): log pi = -log N is a SCALAR, so no (..., N, N) pi
+        # tensor is materialized (audit 2026-06-09 overnight F8 / morning PE7). The max()
+        # mirrors the tensor branch's clamp exactly (inert for any real N < 1/log_eps).
+        if log_prior is not None:
+            log_pi = torch.log(torch.softmax(log_prior, dim=-1).clamp(min=log_eps))
+        else:
+            log_pi = math.log(max(1.0 / beta.shape[-1], log_eps))
         _tau_e = _broadcast_tau(tau, energy)          # (H,1,1) for per-head, scalar otherwise
-        entropy = (_tau_e * (beta * (torch.log(beta.clamp(min=log_eps)) - torch.log(pi.clamp(min=log_eps))))).sum()
+        entropy = (_tau_e * (beta * (torch.log(beta.clamp(min=log_eps)) - log_pi))).sum()
         F = F + lambda_beta * entropy
     if log_likelihood is not None:                              # observation/data term -E_q[log p(o|k)] (gated stub; no live caller)
         F = F - log_likelihood.sum()

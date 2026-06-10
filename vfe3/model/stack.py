@@ -3,6 +3,15 @@ r"""The VFE block stack for VFE_3.0: L blocks with the belief handoff mu_q -> mu
 After each block the updated belief becomes (a blend toward) the next block's prior:
 mu_p_next = (1 - rho) mu_p + rho mu_q (rho = prior_handoff_rho); sigma_p frozen at the
 embedding by default; phi flows through the belief, not the prior.
+
+Placement note (audit 2026-06-09 overnight F23): the opt-in head_mixer / cg_coupling
+transforms run INSIDE each block (after its E-step, before its norm), so the belief
+handed off above is the POST-transform belief — at n_layers > 1 the transforms recurse
+into every subsequent block's prior. The manuscript places the mixer in the single
+W_O-readout slot (Manuscripts-Theory/GL(K)_attention.tex) and concedes genuine
+cross-head capacity at depth > 1, but does not state this per-block prior-handoff
+recursion; the pre-transform converged belief stays available via the ``capture``
+out-param (the M-step self-coupling reads it from there).
 """
 
 from typing import Callable, Optional
