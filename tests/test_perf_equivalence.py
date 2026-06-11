@@ -157,6 +157,75 @@ def test_estep_fuses_tied_block_glk_to_factored_container():
     assert isinstance(out, FactoredTransport)
 
 
+# --- vram audit 2026-06-10: flat exp float64-island keyed on the block dim, blocked BCH,
+# --- and the beta_coord-free kernel pair contraction -------------------------------------
+def test_flat_builders_key_float64_island_on_block_dim(monkeypatch):
+    # Both flat transport builders must pass exp_dim=max(block_dims) so the float64-island
+    # decision keys on the dimension actually exponentiated (the per-head block), mirroring
+    # the regime_ii edge exp -- not on full K, which upcast every (B, N, K, K) phi_matrix to
+    # float64 whenever K >= 20.
+    import vfe3.geometry.transport as T
+    from vfe3.geometry.transport import build_factored_transport
+    calls = []
+    orig = T.stable_matrix_exp_pair
+    def spy(matrix, **kw):
+        calls.append(kw.get("exp_dim"))
+        return orig(matrix, **kw)
+    monkeypatch.setattr(T, "stable_matrix_exp_pair", spy)
+    grp, phi, _, _ = _transport_inputs()                   # block_glk K=8, irrep_dims [4,4]
+    build_factored_transport(phi, grp)
+    compute_transport_operators(phi, grp)
+    assert calls == [4, 4]
+
+
+def test_compose_bch_blocked_matches_dense():
+    # The blocked Dynkin cascade (brackets on the (H, d, d) diagonal-block stacks) must equal
+    # the dense (K, K) cascade for a block-diagonal embedding, at every truncation order and
+    # under the broadcast (unbatched positional element) pattern, in value AND gradient.
+    from vfe3.geometry.lie_ops import compose_bch
+    grp, phi, _, _ = _transport_inputs()                   # block_glk K=8, irrep_dims [4,4]
+    n_gen = grp.generators.shape[0]
+    torch.manual_seed(1)
+    coords = 0.1 * torch.randn(5, n_gen)                   # unbatched positional element
+    for order in (1, 2, 3, 4):
+        p1 = phi.clone().requires_grad_(True)
+        p2 = phi.clone().requires_grad_(True)
+        dense = compose_bch(p1, coords, grp.generators, order=order, block_dims=None)
+        blocked = compose_bch(p2, coords, grp.generators, order=order,
+                              block_dims=list(grp.irrep_dims))
+        assert torch.allclose(dense, blocked, atol=1e-6), f"order={order}"
+        g_dense, = torch.autograd.grad(dense.sum(), p1)
+        g_blocked, = torch.autograd.grad(blocked.sum(), p2)
+        assert torch.allclose(g_dense, g_blocked, atol=1e-6), f"order={order} grad"
+
+
+def test_pair_contract_matches_beta_coord_reference():
+    # _pair_contract (beta in compact per-head form against a head-shaped view of the pair
+    # difference) must reproduce the legacy beta_coord-broadcast einsum on every branch:
+    # per-head equal blocks, single block, and the unequal-tower fallback.
+    from vfe3.gradients.kernels import _beta_to_coordinate, _pair_contract
+    torch.manual_seed(2)
+    B, N, H, d = 2, 5, 3, 4
+    K = H * d
+    diff = torch.randn(B, N, N, K)
+    beta_h = torch.softmax(torch.randn(B, H, N, N), dim=-1)
+    ref = torch.einsum("...ijk,...ijk->...ik",
+                       _beta_to_coordinate(beta_h, [d] * H, K), diff)
+    assert torch.allclose(_pair_contract(beta_h, diff, [d] * H), ref, atol=1e-6)
+
+    beta_1 = torch.softmax(torch.randn(B, N, N), dim=-1)   # single block
+    ref_1 = torch.einsum("...ijk,...ijk->...ik",
+                         beta_1.unsqueeze(-1).expand(B, N, N, K), diff)
+    assert torch.allclose(_pair_contract(beta_1, diff, None), ref_1, atol=1e-6)
+    assert torch.allclose(_pair_contract(beta_1, diff, [K]), ref_1, atol=1e-6)
+
+    irrep_uneq = [3, 9]                                    # unequal blocks -> gather fallback
+    beta_u = torch.softmax(torch.randn(B, 2, N, N), dim=-1)
+    ref_u = torch.einsum("...ijk,...ijk->...ik",
+                         _beta_to_coordinate(beta_u, irrep_uneq, K), diff)
+    assert torch.allclose(_pair_contract(beta_u, diff, irrep_uneq), ref_u, atol=1e-6)
+
+
 def test_estep_single_block_groups_stay_dense():
     # glk and so_k report irrep_dims [K] (single block) -> the fused route is NOT taken; the
     # E-step keeps the dense (N,N,K,K)/(B,N,N,K,K) Omega tensor exactly as today.

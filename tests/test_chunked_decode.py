@@ -142,3 +142,102 @@ def test_chunked_inference_targets_none_returns_full_logits():
     logits_ch = ch(tokens)
     assert logits_ch.shape == (2, 5, V)
     assert torch.allclose(logits_ch, logits_full, atol=1e-3)
+
+
+# --- vram audit 2026-06-10: fused chunked CE for the LINEAR decode (use_prior_bank=False) ---
+def _linear_model(vocab_size=64, **kw):
+    cfg = VFE3Config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6,
+                     n_layers=1, n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0,
+                     use_prior_bank=False, **kw)
+    return VFEModel(cfg)
+
+
+def test_linear_chunked_ce_matches_dense_value_and_grads():
+    # decode_ce_linear_chunked must equal F.cross_entropy over the dense logits = mu @ W^T
+    # in value AND in the gradients to mu and W, for chunk sizes that divide / don't divide /
+    # exceed V. The linear map has no cancellation, so the tolerance is tighter than the
+    # diagonal kernel's 1e-3.
+    torch.manual_seed(6)
+    V = 64
+    tokens = torch.randint(0, V, (3, 6))
+    targets = torch.randint(0, V, (3, 6))
+    targets[0, 1] = -100
+    m = _linear_model(vocab_size=V, decode_mode="diagonal_chunked", decode_chunk_size=13)
+    mu, _ = _converged(m, tokens)
+    W = m.prior_bank.output_proj_weight
+
+    mu_a = mu.detach().clone().requires_grad_(True)
+    dense = F.cross_entropy(
+        (mu_a @ W.transpose(-1, -2)).reshape(-1, V), targets.reshape(-1), ignore_index=-100,
+    )
+    dense.backward()
+    g_mu_dense, g_w_dense = mu_a.grad.clone(), W.grad.clone()
+
+    for chunk in (13, 16, V, 100):
+        W.grad = None
+        mu_b = mu.detach().clone().requires_grad_(True)
+        ce = m.prior_bank.decode_ce_linear_chunked(mu_b, targets, chunk_size=chunk)
+        assert torch.allclose(ce, dense, atol=1e-5), f"chunk={chunk}"
+        ce.backward()
+        assert torch.allclose(mu_b.grad, g_mu_dense, atol=1e-5), f"chunk={chunk} mu grad"
+        assert torch.allclose(W.grad, g_w_dense, atol=1e-5), f"chunk={chunk} W grad"
+
+
+def test_linear_chunked_ce_with_decode_bias():
+    # decode_bias=True: the learned per-vocab log-unigram bias must enter every chunk's logits
+    # and receive the same gradient as on the dense path.
+    torch.manual_seed(7)
+    V = 50
+    tokens = torch.randint(0, V, (2, 6))
+    targets = torch.randint(0, V, (2, 6))
+    m = _linear_model(vocab_size=V, decode_mode="diagonal_chunked", decode_chunk_size=11,
+                      decode_bias=True)
+    with torch.no_grad():
+        m.prior_bank.output_proj_bias.normal_(std=0.3)     # nonzero so the bias is load-bearing
+    mu, _ = _converged(m, tokens)
+    W, b = m.prior_bank.output_proj_weight, m.prior_bank.output_proj_bias
+
+    mu_a = mu.detach().clone().requires_grad_(True)
+    dense = F.cross_entropy(
+        (mu_a @ W.transpose(-1, -2) + b).reshape(-1, V), targets.reshape(-1), ignore_index=-100,
+    )
+    dense.backward()
+    g_b_dense = b.grad.clone()
+
+    b.grad = None
+    mu_b = mu.detach().clone().requires_grad_(True)
+    ce = m.prior_bank.decode_ce_linear_chunked(mu_b, targets)
+    assert torch.allclose(ce, dense, atol=1e-5)
+    ce.backward()
+    assert torch.allclose(b.grad, g_b_dense, atol=1e-5)
+
+
+def test_linear_chunked_ce_all_ignore_is_finite_zero():
+    torch.manual_seed(8)
+    V = 32
+    tokens = torch.randint(0, V, (2, 4))
+    targets = torch.full((2, 4), -100)
+    m = _linear_model(vocab_size=V, decode_mode="diagonal_chunked", decode_chunk_size=10)
+    mu, _ = _converged(m, tokens)
+    mu = mu.detach().requires_grad_(True)
+    ce = m.prior_bank.decode_ce_linear_chunked(mu, targets)
+    assert torch.isfinite(ce) and ce.item() == 0.0
+    ce.backward()                                          # grad-connected (no autograd error)
+
+
+def test_linear_chunked_forward_loss_matches_dense_forward_loss():
+    # End-to-end: forward under use_prior_bank=False + diagonal_chunked returns None logits
+    # and the same loss/ce as the dense linear decode -> F.cross_entropy path.
+    torch.manual_seed(9)
+    V = 40
+    tokens = torch.randint(0, V, (3, 6))
+    targets = torch.randint(0, V, (3, 6))
+    base = _linear_model(vocab_size=V)                     # decode_mode='diagonal' -> dense path
+    _, loss_full, ce_full = base(tokens, targets)
+
+    ch = _linear_model(vocab_size=V, decode_mode="diagonal_chunked", decode_chunk_size=9)
+    ch.load_state_dict(base.state_dict())
+    logits_ch, loss_ch, ce_ch = ch(tokens, targets)
+    assert logits_ch is None                               # fused path forms no (B,N,V) logits
+    assert torch.allclose(loss_ch, loss_full, atol=1e-5)
+    assert torch.allclose(ce_ch, ce_full, atol=1e-5)

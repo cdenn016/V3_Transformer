@@ -767,6 +767,26 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
+        # Dead-knob disclosure (vram audit 2026-06-10): the phi preconditioner has exactly two
+        # consumers -- the E-step phi substep (gated by e_phi_lr > 0) and the natural-gradient
+        # gauge M-step (gated by m_phi_natural_grad). With both gates closed NO preconditioner
+        # code runs, so switching phi_precond_mode cannot change VRAM, speed, or numerics;
+        # observed differences in such runs are confounded. Warn (non-breaking) so a tuning
+        # session doesn't attribute effects to a knob that is not wired into the active paths.
+        if (
+            self.phi_precond_mode != "none"
+            and self.e_phi_lr == 0.0
+            and not self.m_phi_natural_grad
+        ):
+            import warnings
+            warnings.warn(
+                f"phi_precond_mode={self.phi_precond_mode!r} has NO effect under e_phi_lr=0.0 with "
+                "m_phi_natural_grad=False: its only consumers are the E-step phi substep "
+                "(e_phi_lr > 0) and the natural-gradient gauge M-step (m_phi_natural_grad=True). "
+                "Set one of those gates, or phi_precond_mode='none' to silence this.",
+                UserWarning,
+                stacklevel=2,
+            )
         _require(self.phi_retract_mode, _VALID_PHI_RETRACT_MODES, "phi_retract_mode")
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
@@ -878,8 +898,10 @@ class VFE3Config:
         # decode_mode sets the RANK of the prior-bank KL-decode kernel: 'diagonal'/'diagonal_chunked'
         # consume a diagonal sigma (B,N,K); 'full' consumes a full sigma (B,N,K,K). It must agree with
         # the covariance family, else the rank mismatch is a shape RuntimeError at the first forward.
-        # Only the prior-bank decode reads decode_mode; the use_prior_bank=False linear decode ignores
-        # it (sigma discarded), so the cross-check is gated on use_prior_bank.
+        # The use_prior_bank=False linear decode discards sigma and reads decode_mode for exactly one
+        # thing: 'diagonal_chunked' selects the fused chunked-CE training path over logits = mu @ W^T
+        # (vram audit 2026-06-10) -- rank is irrelevant there, so the cross-check stays gated on
+        # use_prior_bank.
         if self.use_prior_bank and (self.decode_mode == "full") == family_is_diagonal:
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "

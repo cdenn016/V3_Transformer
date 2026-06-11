@@ -538,23 +538,28 @@ class VFEModel(nn.Module):
         # fp32 path .float() is a value-identical no-op AND the island is a nullcontext (see
         # _amp_off_context), so this block is byte-identical to the no-AMP build.
         # Fused chunked-vocab decode+CE (decode_mode='diagonal_chunked', training path only): when
-        # targets are given on the KL-readout (use_prior_bank) path, compute the cross-entropy by
-        # iterating V in chunks and accumulating a streaming logsumexp + a target-logit gather, so
-        # the (B, N, V) logit tensor is NEVER materialized (the memory win). Equal to the 'diagonal'
-        # decode -> F.cross_entropy path to atol-1e-3 (tests/test_chunked_decode.py). logits is None
-        # on this branch by design -- forming them would defeat the purpose; the training/eval
-        # callers (train.py) discard the returned logits. Inference (targets=None) still routes
-        # through decode() below for full logits (sampling needs them).
+        # targets are given, compute the cross-entropy by iterating V in chunks and accumulating a
+        # streaming logsumexp + a target-logit gather, so the (B, N, V) logit tensor is NEVER
+        # materialized (the memory win). KL-readout (use_prior_bank=True) routes to the diagonal
+        # kernel's fused CE (equal to 'diagonal' decode -> F.cross_entropy to atol-1e-3,
+        # tests/test_chunked_decode.py); the linear ablation (use_prior_bank=False) routes to its
+        # own fused CE over logits = mu @ W^T (+ b) (vram audit 2026-06-10: the dense linear path
+        # retained logits + cross_entropy's log-softmax copy, ~2 x B*N*V fp32, the single largest
+        # decode cost at large B). logits is None on this branch by design -- forming them would
+        # defeat the purpose; the training/eval callers (train.py) discard the returned logits.
+        # Inference (targets=None) still routes through decode() below for full logits.
         fused_chunked = (
             targets is not None
-            and self.cfg.use_prior_bank
             and self.cfg.decode_mode == "diagonal_chunked"
         )
         if fused_chunked:
             with self._amp_off_context(token_ids.device):
-                ce = self.prior_bank.decode_ce_diagonal_chunked(
-                    mu_final.float(), sigma_final.float(), targets,
-                )
+                if self.cfg.use_prior_bank:
+                    ce = self.prior_bank.decode_ce_diagonal_chunked(
+                        mu_final.float(), sigma_final.float(), targets,
+                    )
+                else:
+                    ce = self.prior_bank.decode_ce_linear_chunked(mu_final.float(), targets)
             logits = None                                        # no (B, N, V) tensor on the fused path
         else:
             with self._amp_off_context(token_ids.device):
