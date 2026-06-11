@@ -146,17 +146,27 @@ def uses_kernel_route(
     family:                    str,
     divergence_family:         str,
     include_attention_entropy: bool,
+    transport_mode:            str  = "flat",
 ) -> bool:
     r"""Whether ``belief_gradients`` serves the closed-form KERNEL (else the autograd oracle).
 
     The single source of truth for the kernel-coverage predicate, exposed so callers (the
-    E-step's unroll-truncation warning) cannot drift from the dispatch below."""
+    E-step's unroll-truncation warning, the config-time freeze warning) cannot drift from the
+    dispatch below.
+
+    ``transport_mode='regime_ii'`` excludes the kernel (audit 2026-06-10 F1): the hand kernel is
+    the FLAT-transport gradient -- it treats the transported keys (Omega mu_j, Omega Sigma_j
+    Omega^T) as constants in mu, but the regime_ii Omega depends on mu through
+    delta_ij = mu_i^T W^a mu_j, so the kernel would silently descend a frozen-Omega objective.
+    regime_ii routes to the autograd oracle, which rebuilds Omega from its differentiation
+    leaves (``omega_builder``) and therefore carries the d Omega/d mu term."""
     return (
         gradient_mode == "filtering"
         and family == "gaussian_diagonal"
         and divergence_family == "renyi"
         and abs(alpha_div - 1.0) < 1e-9
         and include_attention_entropy
+        and transport_mode != "regime_ii"
         and has_kernel(family)
     )
 
@@ -166,7 +176,7 @@ def belief_gradients(
     sigma:        torch.Tensor,           # (N, K)
     mu_p:         torch.Tensor,           # (N, K)
     sigma_p:      torch.Tensor,           # (N, K)
-    omega:        torch.Tensor,           # (N, N, K, K)
+    omega:        Optional[torch.Tensor], # (N, N, K, K); None ONLY with omega_builder (regime_ii)
 
     *,
     tau:          'float | torch.Tensor' = 1.0,
@@ -183,13 +193,15 @@ def belief_gradients(
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
     alpha_mode:                str  = "constant",
+    transport_mode:            str  = "flat",  # 'regime_ii' excludes the kernel (mu-dependent Omega)
     value:                     float = 1.0,
 
     irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
+    omega_builder:             Optional[Callable]     = None,   # (mu_q, mu_k) -> transport (regime_ii oracle rebuild)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Belief gradient: hand kernel for filtering+gaussian_diagonal+KL+canonical, else oracle.
+    r"""Belief gradient: hand kernel for filtering+gaussian_diagonal+KL+canonical+flat, else oracle.
 
     The closed-form kernel keeps the gradient live (analytic on the live belief), so the unrolled
     E-step signal reaches the prior; ``create_graph=True`` makes the oracle fallback do the same for
@@ -197,11 +209,16 @@ def belief_gradients(
 
     ``irrep_dims`` (when more than one block) makes attention PER HEAD: the energy/beta carry a
     head axis and the per-coordinate beta the kernel consumes is head h's weight on coordinate k.
+
+    ``transport_mode='regime_ii'`` always routes to the ORACLE (audit 2026-06-10 F1: the kernel is
+    the flat-transport gradient and would drop d Omega/d mu); the caller supplies ``omega_builder``
+    so the oracle rebuilds the mu-dependent transport from its differentiation leaves.
     """
     use_kernel = uses_kernel_route(
         alpha_div=alpha_div, gradient_mode=gradient_mode, family=family,
         divergence_family=divergence_family,
         include_attention_entropy=include_attention_entropy,
+        transport_mode=transport_mode,
     )
     if not use_kernel:
         return belief_gradients_autograd(
@@ -210,6 +227,7 @@ def belief_gradients(
             include_attention_entropy=include_attention_entropy, create_graph=create_graph,
             gradient_mode=gradient_mode, family=family, divergence_family=divergence_family,
             alpha_mode=alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
+            omega_builder=omega_builder,
         )
 
     mu_k, sigma_k = mu.detach(), sigma.detach()

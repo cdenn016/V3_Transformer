@@ -174,8 +174,10 @@ class VFEModel(nn.Module):
         # as a trainable nn.Parameter of shape (n_gen, K, K); the edge connection is
         # delta_ij^a = cocycle_relaxation * (mu_i^T W^a mu_j) (transport._build_regime_ii). Init ZERO
         # -> delta = 0 -> exp(0) = I -> Omega = exp(phi_i)exp(-phi_j) (the flat cocycle), so a
-        # regime_ii model is byte-flat at init. For the default flat (pure no-NN) regime the parameter
-        # is NOT created (no connection_W attribute), so the default path is param-free here.
+        # regime_ii model is flat at init to fp32 tolerance (atol 1e-6 pinned; NOT bit-exact -- the
+        # zero-tensor W takes the generic einsum path to keep d Omega/d W alive; audit 2026-06-10
+        # F11). For the default flat (pure no-NN) regime the parameter is NOT created (no
+        # connection_W attribute), so the default path is param-free here.
         if cfg.transport_mode == "regime_ii":
             self.connection_W = nn.Parameter(torch.zeros(n_gen, cfg.embed_dim, cfg.embed_dim))
             if cfg.detach_e_step:
@@ -436,6 +438,13 @@ class VFEModel(nn.Module):
             phi_precond_mode=cfg.phi_precond_mode,
             phi_retract_mode=cfg.phi_retract_mode,
             spd_retract_mode=cfg.spd_retract_mode,
+            # TIED FLAT transport for the s-channel, INTENTIONALLY ignoring cfg.transport_mode
+            # (audit 2026-06-10 F7, mirroring _gamma_coupling_term's documented choice): the model
+            # channel refines under the flat phi0 cocycle even when the belief channel runs
+            # regime_ii -- the learned edge connection is a belief-channel object (delta reads the
+            # belief means, not s), and the s E-step runs with phi held fixed. Thread
+            # cfg.transport_mode + connection_W here if the s-channel is ever meant to share the
+            # learned connection.
             transport_mode="flat",
             e_step_gradient=e_step_gradient,
             oracle_unroll_grad=cfg.oracle_unroll_grad,

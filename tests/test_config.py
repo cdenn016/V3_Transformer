@@ -257,7 +257,8 @@ def test_tied_block_glk_rejects_killing_per_block():
 
 def test_config_phi_retract_mode_validated():
     """phi_retract_mode selects the Lie-algebra composition chart (euclidean | bch)."""
-    assert VFE3Config().phi_retract_mode == "euclidean"
+    assert VFE3Config().phi_retract_mode == "bch"          # operating-point default (2026-06-10)
+    assert VFE3Config(phi_retract_mode="euclidean").phi_retract_mode == "euclidean"
     assert VFE3Config(phi_retract_mode="bch").phi_retract_mode == "bch"
     with pytest.raises(ValueError):
         VFE3Config(phi_retract_mode="not_a_mode")

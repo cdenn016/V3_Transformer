@@ -109,7 +109,10 @@ def build_optimizer(
         # because it is FROZEN (requires_grad=False, prior_bank.py) -- a fixed centroid per the
         # manuscript's "higher, slower meta-level"; the coverage guard exempts non-trainable params.
     if getattr(model, "connection_W", None) is not None:        # transport_mode='regime_ii' learned
-        groups.append({"params": [model.connection_W], "lr": cfg.m_phi_lr})  # connection -> gauge LR
+        w_group = {"params": [model.connection_W], "lr": cfg.m_phi_lr}        # connection -> gauge LR
+        if cfg.connection_weight_decay is not None:             # dedicated connection-norm ceiling
+            w_group["weight_decay"] = cfg.connection_weight_decay   # (audit 2026-06-10 F9); None ->
+        groups.append(w_group)                                  # inherit the global weight_decay
     if getattr(model, "log_alpha", None) is not None:           # alpha_mode='learnable' scalar coupling
         groups.append({"params": [model.log_alpha], "lr": cfg.m_mu_lr})
     if getattr(model, "log_lambda_beta", None) is not None:     # learnable_lambda_beta scalar belief-coupling weight

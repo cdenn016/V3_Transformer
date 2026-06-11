@@ -40,9 +40,11 @@ def _transport(
 
     *,
     transport_mode:     str                    = "flat",   # connection-regime registry key (default = flat)
+    gauge_mode:         str                    = "learned", # 'learned' | 'trivial' (forwarded to the builder)
+    cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
     mu:                 Optional[torch.Tensor] = None,      # (N, K) or (B, N, K) means; regime_ii edge connection reads these
     connection_W:       Optional[torch.Tensor] = None,      # (n_gen, K, K) learned bilinear connection (regime_ii, NN exception)
-    cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
+    mu_key:             Optional[torch.Tensor] = None,      # regime_ii KEY-slot means (None -> mu; oracle detach split)
 ) -> torch.Tensor:                            # (N, N, K, K) or (B, N, N, K, K) Omega_ij
     r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
@@ -51,18 +53,23 @@ def _transport(
     ``compute_transport_operators`` call, mu/connection_W ignored). 'regime_ii' is the NON-FLAT
     edge-relaxed cocycle (a sanctioned learned-connection NN exception): it reads the CURRENT belief
     means ``mu`` and the learned ``connection_W`` to insert the edge factor exp(delta_ij . G), so it
-    must be REBUILT as mu updates each E-step iteration (flat is mu-independent).
+    must be REBUILT as mu updates each E-step iteration (flat is mu-independent). ``gauge_mode`` is
+    forwarded to the builder (audit 2026-06-10 F6: previously dropped, so the builders always saw
+    the 'learned' default).
 
     Rank-aware: a 2-D (N, n_gen) frame (the unbatched diagnostics / trajectory path) is transported
     as a batch of one and stripped back to (N, N, K, K); a 3-D (B, N, n_gen) frame (the batched
-    forward) flows straight through. ``mu`` is unsqueezed to match so the builder always sees a
-    batched (B, N, K) mean."""
+    forward) flows straight through. ``mu``/``mu_key`` are unsqueezed to match so the builder always
+    sees batched (B, N, K) means."""
     build = get_transport(transport_mode)
     if phi.dim() == 2:
         mu_b = mu.unsqueeze(0) if mu is not None else None
-        return build(phi.unsqueeze(0), group, mu=mu_b, connection_W=connection_W,
+        mu_kb = mu_key.unsqueeze(0) if mu_key is not None else None
+        return build(phi.unsqueeze(0), group, gauge_mode=gauge_mode, mu=mu_b, mu_key=mu_kb,
+                     connection_W=connection_W,
                      cocycle_relaxation=cocycle_relaxation)["Omega"][0]
-    return build(phi, group, mu=mu, connection_W=connection_W,
+    return build(phi, group, gauge_mode=gauge_mode, mu=mu, mu_key=mu_key,
+                 connection_W=connection_W,
                  cocycle_relaxation=cocycle_relaxation)["Omega"]
 
 
@@ -88,11 +95,13 @@ def build_belief_transport(
 
     *,
     transport_mode:     str                    = "flat",   # connection-regime registry key
+    gauge_mode:         str                    = "learned", # 'learned' | 'trivial' (forwarded to the builder)
+    cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
+    rope_on_cov:        bool                   = False,     # rotate the covariance too (full-gauge)
     mu:                 Optional[torch.Tensor] = None,      # regime_ii edge connection reads these
     connection_W:       Optional[torch.Tensor] = None,      # regime_ii learned bilinear connection
-    cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
+    mu_key:             Optional[torch.Tensor] = None,      # regime_ii KEY-slot means (None -> mu)
     rope:               Optional[torch.Tensor] = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
-    rope_on_cov:        bool                   = False,     # rotate the covariance too (full-gauge)
 ) -> 'torch.Tensor | FactoredTransport | RopeTransport':
     r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
 
@@ -111,13 +120,15 @@ def build_belief_transport(
     changes are needed.
     """
     if _can_fuse_flat(transport_mode, group):
-        built = build_factored_transport(phi, group)
+        built = build_factored_transport(phi, group, gauge_mode=gauge_mode)
     else:
         transport_kw = (
-            dict(mu=mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation)
+            dict(mu=mu, mu_key=mu_key, connection_W=connection_W,
+                 cocycle_relaxation=cocycle_relaxation)
             if transport_mode == "regime_ii" else {}
         )
-        built = _transport(phi, group, transport_mode=transport_mode, **transport_kw)
+        built = _transport(phi, group, transport_mode=transport_mode, gauge_mode=gauge_mode,
+                           **transport_kw)
     if rope is None:
         return built
     return RopeTransport(base=built, rope=rope, on_cov=rope_on_cov)
@@ -165,13 +176,13 @@ def free_energy_value(
     phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
     spd_retract_mode:          str  = "spd_affine",    # accepted-and-ignored iteration-only knob
-    transport_mode:            str  = "flat",          # accepted-and-ignored iteration-only knob
-    cocycle_relaxation:        float = 1.0,            # accepted-and-ignored iteration-only knob (regime_ii)
+    transport_mode:            str  = "flat",          # HONORED for global F; raises for frozen keys
+    cocycle_relaxation:        float = 1.0,            # HONORED for the global-F transport build (regime_ii)
 
     rope:                      Optional[torch.Tensor] = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     log_prior:                 Optional[torch.Tensor] = None,
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
-    connection_W:              Optional[torch.Tensor] = None,   # accepted-and-ignored iteration-only knob (regime_ii NN exception)
+    connection_W:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii NN exception)
     keys:                      Optional[BeliefState]  = None,   # None -> global F; else keys frozen at `keys`
 ) -> torch.Tensor:                   # scalar F
     r"""Scalar free energy of a belief. ``keys=None`` -> global F (keys = the belief);
@@ -354,13 +365,33 @@ def e_step_iteration(
     # Build the forward belief-transport (P0 #2): on the flat + block-diagonal-with-equal-blocks
     # path this is a FactoredTransport (the per-token exps only, NO dense (B,N,N,K,K) Omega), which
     # the belief-gradient kernel / oracle consume opaquely through transport_mean / covariance;
-    # regime_ii (mu-dependent Omega) and single-block / cross-coupled groups keep the dense Omega
-    # exactly as before. Only regime_ii needs the belief means + learned connection.
-    omega = build_belief_transport(
-        belief.phi, group, transport_mode=transport_mode,
-        mu=belief.mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
-        rope=rope, rope_on_cov=rope_on_cov,
-    )
+    # single-block / cross-coupled groups keep the dense Omega exactly as before.
+    #
+    # regime_ii (audit 2026-06-10 F1/F2): the mu-DEPENDENT Omega is NOT pre-built here. The hand
+    # kernel is the flat-transport gradient (it drops d Omega/d mu), so regime_ii always routes to
+    # the autograd oracle, and the oracle must rebuild the transport from its own differentiation
+    # leaves for the gradient VALUE to carry d Omega/d mu in every regime (train, eval, detached
+    # E-step). The builder closure below binds phi/W/rope and receives (mu_query, mu_key) from the
+    # oracle -- the key slot is the oracle's detached key under filtering (query-side coordinate
+    # ascent) and the shared live leaf under smoothing (full gradient). Pre-building here as well
+    # would only double the most expensive build in the codebase.
+    if transport_mode == "regime_ii":
+        omega = None
+
+        def _omega_builder(mu_q: torch.Tensor, mu_k: torch.Tensor):
+            return build_belief_transport(
+                belief.phi, group, transport_mode=transport_mode,
+                mu=mu_q, mu_key=mu_k, connection_W=connection_W,
+                cocycle_relaxation=cocycle_relaxation, rope=rope, rope_on_cov=rope_on_cov,
+            )
+        omega_builder = _omega_builder
+    else:
+        omega = build_belief_transport(
+            belief.phi, group, transport_mode=transport_mode,
+            mu=belief.mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
+            rope=rope, rope_on_cov=rope_on_cov,
+        )
+        omega_builder = None
     # Runtime truncation warning (audit 2026-06-09 P8): under the 'unroll' estimator with a LIVE
     # belief, a non-kernel route is served by the autograd oracle, which returns a DETACHED
     # tangent unless oracle_unroll_grad=True -- silently severing the unrolled-through-inference
@@ -370,7 +401,8 @@ def e_step_iteration(
             and not uses_kernel_route(
                 alpha_div=alpha_div, gradient_mode=gradient_mode, family=family,
                 divergence_family=divergence_family,
-                include_attention_entropy=include_attention_entropy)):
+                include_attention_entropy=include_attention_entropy,
+                transport_mode=transport_mode)):
         import warnings
         warnings.warn(
             "e_step_gradient='unroll' is being served by the autograd ORACLE with "
@@ -386,6 +418,7 @@ def e_step_iteration(
         kl_max=kl_max, eps=eps,
         include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
         family=family, divergence_family=divergence_family, alpha_mode=alpha_mode,
+        transport_mode=transport_mode, omega_builder=omega_builder,
         irrep_dims=group.irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
         # Opt-in unrolled-oracle: make the autograd oracle (non-kernel families) return a
         # differentiable belief gradient so the through-inference signal reaches the prior, matching
@@ -428,6 +461,11 @@ def e_step_iteration(
 
     phi = belief.phi
     if e_phi_lr > 0.0:
+        # Sequential (Gauss-Seidel) coordinate descent, by design (audit 2026-06-10 F15): the phi
+        # substep is evaluated at the UPDATED (mu, sigma) with the pre-update phi -- each substep
+        # descends F at the current point of the sweep, so under regime_ii the edge factor inside
+        # phi_alignment_loss reads the post-mu-step means. This mixed state is the standard
+        # coordinate-descent sweep, not a frozen joint state.
         # The phi natural gradient fundamentally requires autograd (autograd.grad on a
         # fresh requires_grad leaf), so it must run under an enable_grad island even when
         # the caller wraps the stack in no_grad (the detach_e_step / fixed-point regime).

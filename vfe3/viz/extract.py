@@ -310,7 +310,15 @@ def numerical_health(
     out = belief
     for _ in range(cfg.n_e_steps):
         out = e_step_iteration(out, belief.mu, belief.sigma, model.group, **ikw)
-    omega = _transport(out.phi, model.group)
+    # Build Omega under the ACTIVE connection regime (audit 2026-06-10 F8e): this previously
+    # defaulted to flat transport, so under regime_ii the reported nan/beta/energy fractions
+    # described a flat-transport belief, not the model that trained. Mirrors converged_state.
+    omega = _transport(
+        out.phi, model.group, transport_mode=cfg.transport_mode,
+        mu=(out.mu if cfg.transport_mode == "regime_ii" else None),
+        connection_W=getattr(model, "connection_W", None),
+        cocycle_relaxation=cfg.cocycle_relaxation,
+    )
     mu_t = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
     fam = get_family(cfg.family)
@@ -321,7 +329,7 @@ def numerical_health(
     spec = out.sigma if out.sigma.dim() == out.mu.dim() else condition_number(out.sigma)
     cond = float(condition_number(out.sigma).max()) if out.sigma.dim() > out.mu.dim() else \
         float((spec.amax(dim=-1) / spec.amin(dim=-1).clamp(min=1e-12)).max())
-    return {
+    health = {
         "nan_mu":     nan_inf_fraction(out.mu),
         "nan_sigma":  nan_inf_fraction(out.sigma),
         "nan_phi":    nan_inf_fraction(out.phi),
@@ -329,6 +337,15 @@ def numerical_health(
         "nan_beta":   nan_inf_fraction(beta),
         "max_condition": cond,
     }
+    # regime_ii edge-factor saturation readout (audit 2026-06-10 F3 monitoring): the PRE-cap
+    # per-edge ||delta_ij||_2 against the builder's smooth cap (12). A max far above the cap
+    # means the trained connection lives in the saturated regime (the operator is norm-limited);
+    # off the hot path, eval-interval cost only.
+    if cfg.transport_mode == "regime_ii" and getattr(model, "connection_W", None) is not None:
+        delta = cfg.cocycle_relaxation * torch.einsum(
+            "ik,akl,jl->ija", out.mu, model.connection_W, out.mu)
+        health["regime_ii_delta_max_norm"] = float(delta.norm(dim=-1).max())
+    return health
 
 
 @torch.no_grad()

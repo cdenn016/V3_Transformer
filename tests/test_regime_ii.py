@@ -133,11 +133,11 @@ def test_regime_ii_cocycle_relaxation_homotopy():
 
 
 # --- model wiring: init-flat, gradient-to-W, init-flat == flat ---
-def _tiny_cfg(transport_mode="flat", cocycle_relaxation=1.0):
+def _tiny_cfg(transport_mode="flat", cocycle_relaxation=1.0, **kw):
     return VFE3Config(
         vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
         n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.0,
-        transport_mode=transport_mode, cocycle_relaxation=cocycle_relaxation,
+        transport_mode=transport_mode, cocycle_relaxation=cocycle_relaxation, **kw,
     )
 
 
@@ -185,9 +185,14 @@ def test_model_regime_ii_gradient_flows_to_w():
     structure (exp'(0) = I), not zero. (If the gradient were zero at W=0 the parameter would
     never train; this pins that it does.) The PriorBank means are inflated so the QUADRATIC
     bilinear delta = mu_i^T W^a mu_j carries real signal (at the near-zero default init the
-    quadratic delta, hence its gradient, is vanishingly small)."""
+    quadratic delta, hence its gradient, is vanishingly small).
+
+    oracle_unroll_grad=True is REQUIRED since the audit 2026-06-10 F1 reroute: regime_ii's
+    belief gradient is served by the autograd oracle (the kernel is the flat-transport gradient),
+    and only the differentiable (use_live) oracle keeps the unrolled chain to W. The config-time
+    freeze warning pins the inverse case."""
     torch.manual_seed(0)
-    model = VFEModel(_tiny_cfg(transport_mode="regime_ii"))
+    model = VFEModel(_tiny_cfg(transport_mode="regime_ii", oracle_unroll_grad=True))
     with torch.no_grad():                                                    # non-tiny means -> non-vacuous bilinear
         model.prior_bank.mu_embed *= 50.0
     tokens = torch.randint(0, 15, (2, 4))
@@ -266,6 +271,139 @@ def test_phi_estep_descends_regime_ii_not_flat():
     out_flat = e_step_iteration(belief, mu_p, sigma_p, grp, transport_mode="flat", **kw)
     out_rii = e_step_iteration(belief, mu_p, sigma_p, grp, transport_mode="regime_ii", **kw)
     assert not torch.allclose(out_flat.phi, out_rii.phi, atol=1e-6)
+
+
+# --- audit 2026-06-10 fixes: self-edge identity, soft cap, dOmega/dmu gradient route ---
+from vfe3.gradients.kernels import belief_gradients, uses_kernel_route
+from vfe3.gradients.oracle import belief_gradients_autograd
+from vfe3.inference.e_step import build_belief_transport, free_energy_value
+
+
+def test_regime_ii_self_edge_equals_flat_identity():
+    """Audit F4: the connection is an EDGE object, so the self-edge carries NO edge factor --
+    Omega_ii = exp(phi_i)exp(-phi_i) exactly as on the flat path (delta_ii is zeroed before the
+    exp). Off-diagonal edges still carry the connection (pinned by the non-flat test above)."""
+    phi, mu, grp = _phi_mu(seed=5)
+    K, n_gen = grp.generators.shape[-1], grp.generators.shape[0]
+    g = torch.Generator().manual_seed(7)
+    W = 0.4 * torch.randn(n_gen, K, K, generator=g)
+    flat = compute_transport_operators(phi, grp)["Omega"]
+    r2 = get_transport("regime_ii")(phi, grp, mu=mu, connection_W=W, cocycle_relaxation=1.0)["Omega"]
+    N = phi.shape[1]
+    idx = torch.arange(N)
+    assert torch.allclose(r2[:, idx, idx], flat[:, idx, idx], atol=1e-6, rtol=0.0)
+    eye = torch.eye(K).expand(phi.shape[0], N, K, K)
+    assert torch.allclose(r2[:, idx, idx], eye, atol=1e-5)
+
+
+def test_regime_ii_homotopy_stays_responsive_past_old_clamp():
+    """Audit F3: delta is quadratic in the mean scale; before the smooth norm cap, every edge past
+    stable_matrix_exp_pair's hard Frobenius clamp received the SAME rescaled operator, so
+    cocycle_relaxation became inert (alpha=0.5 and 1.0 produced identical Omegas). The smooth cap
+    is strictly monotone in alpha, so the homotopy stays responsive even at large ||delta||, and
+    the result stays finite."""
+    phi, mu, grp = _phi_mu(seed=8)
+    mu = 5.0 * mu                                                # ||delta . G|| >> 15: old-clamp regime
+    K, n_gen = grp.generators.shape[-1], grp.generators.shape[0]
+    g = torch.Generator().manual_seed(13)
+    W = 0.5 * torch.randn(n_gen, K, K, generator=g)
+    build = get_transport("regime_ii")
+    half = build(phi, grp, mu=mu, connection_W=W, cocycle_relaxation=0.5)["Omega"]
+    full = build(phi, grp, mu=mu, connection_W=W, cocycle_relaxation=1.0)["Omega"]
+    assert torch.isfinite(half).all() and torch.isfinite(full).all()
+    assert not torch.allclose(half, full, atol=1e-5)
+
+
+def test_regime_ii_excluded_from_kernel_route():
+    """Audit F1: the hand kernel is the flat-transport gradient (it drops dOmega/dmu), so the
+    kernel-coverage predicate must exclude transport_mode='regime_ii' even at the canonical
+    operating point."""
+    base = dict(alpha_div=1.0, gradient_mode="filtering", family="gaussian_diagonal",
+                divergence_family="renyi", include_attention_entropy=True)
+    assert uses_kernel_route(**base, transport_mode="flat")
+    assert not uses_kernel_route(**base, transport_mode="regime_ii")
+
+
+def _grad_setup(seed=0, N=3, K=4):
+    grp = get_group("block_glk")(K, 2)
+    n_gen = grp.generators.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    mu      = 0.5 * torch.randn(N, K, generator=g)
+    sigma   = torch.rand(N, K, generator=g) + 0.5
+    phi     = 0.1 * torch.randn(N, n_gen, generator=g)
+    mu_p    = 0.5 * torch.randn(N, K, generator=g)
+    sigma_p = torch.rand(N, K, generator=g) + 0.5
+    W       = 0.3 * torch.randn(n_gen, K, K, generator=g)
+    return grp, mu, sigma, phi, mu_p, sigma_p, W
+
+
+def test_regime_ii_filtering_gradient_carries_domega_dmu():
+    """Audit F1/F2: the belief gradient served under regime_ii must differ from the frozen-Omega
+    gradient (a pre-built Omega treated as constant) -- the difference IS the dOmega/dmu term the
+    kernel route silently dropped."""
+    grp, mu, sigma, phi, mu_p, sigma_p, W = _grad_setup(seed=1)
+
+    def builder(mu_q, mu_k):
+        return build_belief_transport(phi, grp, transport_mode="regime_ii", mu=mu_q, mu_key=mu_k,
+                                      connection_W=W, cocycle_relaxation=1.0)
+
+    g_live, _ = belief_gradients(mu, sigma, mu_p, sigma_p, None, gradient_mode="filtering",
+                                 transport_mode="regime_ii", omega_builder=builder,
+                                 irrep_dims=grp.irrep_dims)
+    omega_frozen = build_belief_transport(phi, grp, transport_mode="regime_ii", mu=mu,
+                                          connection_W=W, cocycle_relaxation=1.0)
+    g_frozen, _ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega_frozen,
+                                            gradient_mode="filtering", irrep_dims=grp.irrep_dims)
+    assert torch.isfinite(g_live).all()
+    assert not torch.allclose(g_live, g_frozen, atol=1e-6)
+
+
+def test_regime_ii_smoothing_gradient_matches_autograd_of_global_f():
+    """Audit F1/F2 ground truth: under gradient_mode='smoothing' the served gradient must equal
+    the autograd of the GLOBAL regime_ii F (free_energy_value, keys=None, which rebuilds Omega
+    from the live belief means -- both delta slots live, exactly the smoothing key-role split),
+    plus a central-difference spot check on a few coordinates."""
+    grp, mu, sigma, phi, mu_p, sigma_p, W = _grad_setup(seed=2)
+    fkw = dict(transport_mode="regime_ii", connection_W=W, cocycle_relaxation=1.0)
+
+    def F(m):
+        return free_energy_value(BeliefState(mu=m, sigma=sigma, phi=phi), mu_p, sigma_p, grp, **fkw)
+
+    def builder(mu_q, mu_k):
+        return build_belief_transport(phi, grp, transport_mode="regime_ii", mu=mu_q, mu_key=mu_k,
+                                      connection_W=W, cocycle_relaxation=1.0)
+
+    g_mu, _ = belief_gradients(mu, sigma, mu_p, sigma_p, None, gradient_mode="smoothing",
+                               transport_mode="regime_ii", omega_builder=builder,
+                               irrep_dims=grp.irrep_dims)
+    mu_leaf = mu.clone().requires_grad_(True)
+    (g_ref,) = torch.autograd.grad(F(mu_leaf), mu_leaf)
+    assert torch.allclose(g_mu, g_ref, atol=1e-5, rtol=1e-4)
+    h = 1e-3                                                     # FD spot check (fp32-loose)
+    for (i, k) in ((0, 0), (1, 2), (2, 3)):
+        e = torch.zeros_like(mu); e[i, k] = h
+        fd = (F(mu + e) - F(mu - e)) / (2.0 * h)
+        assert abs(float(g_mu[i, k]) - float(fd)) <= 0.05 * abs(float(fd)) + 5e-3
+
+
+def test_regime_ii_df_dw_matches_fd():
+    """Audit F2: dF/d connection_W against central differences -- the ground-truth gradient check
+    for the learned connection that the suite previously lacked (existence-only pin)."""
+    grp, mu, sigma, phi, mu_p, sigma_p, W = _grad_setup(seed=3)
+
+    def F(w):
+        return free_energy_value(BeliefState(mu=mu, sigma=sigma, phi=phi), mu_p, sigma_p, grp,
+                                 transport_mode="regime_ii", connection_W=w, cocycle_relaxation=1.0)
+
+    W_leaf = W.clone().requires_grad_(True)
+    (g_w,) = torch.autograd.grad(F(W_leaf), W_leaf)
+    assert torch.isfinite(g_w).all()
+    assert g_w.abs().sum() > 1e-6
+    h = 1e-3
+    for (a, r, c) in ((0, 0, 1), (1, 2, 0), (3, 1, 3)):
+        e = torch.zeros_like(W); e[a, r, c] = h
+        fd = (F(W + e) - F(W - e)) / (2.0 * h)
+        assert abs(float(g_w[a, r, c]) - float(fd)) <= 0.05 * abs(float(fd)) + 5e-3
 
 
 def test_regime_ii_edge_factor_breaks_gauge_invariance_for_nonzero_W():
