@@ -85,13 +85,14 @@ def _diag_kl_filtering_kernel(
     sigma_p:    torch.Tensor,             # (N, K)
     mu_t:       torch.Tensor,             # (N, N, K) transported key means
     sigma_t:    torch.Tensor,             # (N, N, K) transported key variances
-    beta_coord: torch.Tensor,             # (N, N, K) PER-COORDINATE attention weights
+    beta:       torch.Tensor,             # (N, N) or (H, N, N) MASKED attention weights
     alpha_coef: torch.Tensor,             # (N, 1) or (N, K) self-coupling coefficient
 
     *,
     kl_max:      float = 100.0,
     eps:         float = 1e-6,
     lambda_beta: 'float | torch.Tensor' = 1.0,   # weight on the belief-coupling (pair) term
+    irrep_dims:  Optional[List[int]] = None,     # block sizes; maps head h(k) onto coordinate k
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Diagonal-KL query-side (filtering) gradient (per-head aware).
 
@@ -104,10 +105,11 @@ def _diag_kl_filtering_kernel(
     ``free_energy`` (the envelope identity makes the pair term equal to d/dtheta of that block at
     beta*, so scaling both by the same factor keeps kernel == oracle).
 
-    ``beta_coord`` is the attention weight broadcast to coordinate k via k's irrep block h(k)
-    (the per-head weight beta_ij^(h)); for a single block it is the one beta_ij repeated across
-    every coordinate, so the per-coordinate einsum ``ijk,ijk->ik`` reduces bit-identically to the
-    legacy ``ij,ijk->ik``. The caller (belief_gradients) builds beta_coord from the per-head beta.
+    ``beta`` is the (already pair-masked) attention weight in its COMPACT per-head form; the
+    coordinate-resolution weight beta_ij^(h(k)) is realized inside ``_pair_contract`` by
+    contracting the head axis against a head-shaped VIEW of the pair difference, so the
+    (..., N, N, K) ``beta_coord`` broadcast the old kernel consumed is never materialized
+    (vram audit 2026-06-10: one full B x N^2 x K tensor saved for backward, for free).
 
     Self-term saturation mask m_i = 1[0 < D(q_i||p_i) < kl_max]: the oracle differentiates through
     safe_kl_clamp(D, [0, kl_max]), whose gradient is 0 once the raw self-divergence saturates the
@@ -130,13 +132,37 @@ def _diag_kl_filtering_kernel(
         self_mask = ((raw_self > 0.0) & (raw_self < kl_max)).to(mu_q.dtype)
 
     self_mu  = self_mask * alpha_coef * (mu_q - mu_p) / sp
-    pair_mu  = torch.einsum("...ijk,...ijk->...ik", beta_coord, (mu_q.unsqueeze(-2) - mu_t) / st)
+    pair_mu  = _pair_contract(beta, (mu_q.unsqueeze(-2) - mu_t) / st, irrep_dims)
     grad_mu  = self_mu + lambda_beta * pair_mu
 
     self_sig = self_mask * alpha_coef * 0.5 * (1.0 / sp - 1.0 / sq)
-    pair_sig = torch.einsum("...ijk,...ijk->...ik", beta_coord, 0.5 * (1.0 / st - 1.0 / sq.unsqueeze(-2)))
+    pair_sig = _pair_contract(beta, 0.5 * (1.0 / st - 1.0 / sq.unsqueeze(-2)), irrep_dims)
     grad_sigma = self_sig + lambda_beta * pair_sig
     return grad_mu, grad_sigma
+
+
+def _pair_contract(
+    beta:       torch.Tensor,             # (..., N, N) single-block OR (..., H, N, N) per-head
+    diff:       torch.Tensor,             # (..., N, N, K) pair-difference tensor
+    irrep_dims: Optional[List[int]],      # block sizes; None/[K] -> single block
+) -> torch.Tensor:                        # (..., N, K) Sum_j beta_ij^(h(k)) diff_ijk
+    r"""Pair-term contraction Sum_j beta_ij^(h(k)) diff_ijk WITHOUT the beta_coord broadcast.
+
+    Single block: the legacy ``ij,ijk->ik`` einsum directly. Equal blocks: the per-head beta
+    contracts against a (..., N, N, H, d) VIEW of ``diff`` (a reshape of the trailing K axis --
+    no copy), the same per-(i, k) sums over j as the old coordinate-broadcast einsum, term for
+    term. Unequal blocks (irrep towers): falls back to materializing beta_coord via
+    ``_beta_to_coordinate`` (repeat_interleave has no view form).
+    """
+    if irrep_dims is None or len(irrep_dims) == 1:
+        return torch.einsum("...ij,...ijk->...ik", beta, diff)
+    if len(set(irrep_dims)) == 1:
+        H, d = len(irrep_dims), irrep_dims[0]
+        dv = diff.reshape(*diff.shape[:-1], H, d)                 # (..., N, N, H, d) view
+        out = torch.einsum("...hij,...ijhd->...ihd", beta, dv)    # (..., N, H, d)
+        return out.reshape(*out.shape[:-2], H * d)
+    beta_coord = _beta_to_coordinate(beta, irrep_dims, diff.shape[-1])
+    return torch.einsum("...ijk,...ijk->...ik", beta_coord, diff)
 
 
 def uses_kernel_route(
@@ -246,12 +272,14 @@ def belief_gradients(
     # the kernel's transported pair term deviates from autograd-of-F by orders of magnitude.
     # Mirrors the self-term mask inside the kernel body; beta itself (the weights) is unchanged.
     pair_mask = ((energy > 0.0) & (energy < kl_max)).to(beta.dtype)
-    beta_coord = _beta_to_coordinate(beta * pair_mask, irrep_dims, mu.shape[-1])  # (N,N,K) per-coordinate
     coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=alpha_mode, log_alpha=log_alpha)
     if not alpha_is_per_coord(alpha_mode):
         coef = coef.unsqueeze(-1)                 # (N,) -> (N,1) per-position broadcast; per-coord sd is already (N,K)
-    return get_kernel(family)(mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta_coord, coef,
-                              kl_max=kl_max, eps=eps, lambda_beta=lambda_beta)
+    # The masked beta stays in its COMPACT per-head form; the kernel's _pair_contract realizes
+    # beta_ij^(h(k)) against a head-shaped view of the pair difference, so the (..., N, N, K)
+    # beta_coord broadcast is never materialized (vram audit 2026-06-10).
+    return get_kernel(family)(mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta * pair_mask, coef,
+                              kl_max=kl_max, eps=eps, lambda_beta=lambda_beta, irrep_dims=irrep_dims)
 
 
 def _beta_to_coordinate(

@@ -387,6 +387,69 @@ class PriorBank(nn.Module):
             return ce_per_pos.sum() * 0.0
         return (ce_per_pos * valid).sum() / n_valid
 
+    def decode_ce_linear_chunked(
+        self,
+        mu_q:    torch.Tensor,           # (B, N, K) posterior means
+        targets: torch.Tensor,           # (B, N) next-token ids (-100 = ignore)
+
+        *,
+        chunk_size:   Optional[int]   = None,   # vocab-chunk width; None -> self.decode_chunk_size
+        ignore_index: int             = -100,
+    ) -> torch.Tensor:                   # () scalar mean cross-entropy
+        r"""Fused chunked-vocab cross-entropy for the LINEAR decode (``use_prior_bank=False``).
+
+        The ``_decode_linear`` CE -- ``logits = mu_q @ W^T (+ b)`` -> ``F.cross_entropy`` --
+        WITHOUT the (B, N, V) logit tensor (plus cross_entropy's same-size log-softmax copy,
+        both retained for backward on the dense path; the dominant decode VRAM at large B,
+        vram audit 2026-06-10). Same streaming contract as ``decode_ce_diagonal_chunked``:
+        each vocab chunk's logits are born and die inside a gradient-checkpointed reduction
+        that returns only the (B, N) chunk logsumexp and target-logit summaries; recompute is
+        deterministic, so value and gradient (to mu_q, W, and b) match the dense path exactly.
+        """
+        chunk = self.decode_chunk_size if chunk_size is None else chunk_size
+        V = self.vocab_size
+        W = self.output_proj_weight                                        # (V, K)
+        bias = self.output_proj_bias                                       # (V,) or None
+
+        def _chunk_summaries(mu_:     torch.Tensor, w_c:       torch.Tensor,
+                             in_chunk_f: torch.Tensor, local_idx: torch.Tensor,
+                             b_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
+            r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside."""
+            logit_chunk = mu_ @ w_c.transpose(-1, -2)                      # (B, N, Vc)
+            if b_c is not None:
+                logit_chunk = logit_chunk + b_c                            # learned log-unigram prior
+            lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
+            gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
+            return lse_chunk, gathered * in_chunk_f                        # zero where target not in chunk
+
+        valid = targets != ignore_index                                    # (B, N) bool
+        lse_chunks = []
+        target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)  # (B, N)
+
+        for v0 in range(0, V, chunk):
+            v1 = min(v0 + chunk, V)
+            w_c = W[v0:v1]                                                 # (Vc, K)
+            b_c = bias[v0:v1] if bias is not None else None                # (Vc,) or None
+            in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
+            in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
+            local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
+            if torch.is_grad_enabled() and (mu_q.requires_grad or W.requires_grad):
+                lse_chunk, contrib = _checkpoint.checkpoint(
+                    _chunk_summaries, mu_q, w_c, in_chunk_f, local_idx, b_c,
+                    use_reentrant=False,
+                )
+            else:
+                lse_chunk, contrib = _chunk_summaries(mu_q, w_c, in_chunk_f, local_idx, b_c)
+            lse_chunks.append(lse_chunk)
+            target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
+
+        logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
+        ce_per_pos = logsumexp_v - target_logit                           # (B, N) = -log-softmax at target
+        n_valid = valid.sum()
+        if n_valid == 0:
+            return ce_per_pos.sum() * 0.0                                  # all-ignore: finite grad-connected zero
+        return (ce_per_pos * valid).sum() / n_valid
+
 
 @register_encode("per_token")
 def _encode_per_token(

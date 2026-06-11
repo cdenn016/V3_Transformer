@@ -415,9 +415,17 @@ def compute_transport_operators(
     phi_matrix = torch.einsum("bna,aij->bnij", phi, generators)
     # Per-block exp when the group is genuinely block-diagonal (block_glk without cross-couplings
     # -> irrep_dims [d_head]*H); single-block ([K]: glk, so_k, cross-coupled) takes the full path.
+    # exp_dim keys the float64-island decision on the dimension actually exponentiated -- the
+    # per-head block -- mirroring the regime_ii edge exp (audit F8c) and VFE_2.0's always-fp32
+    # per-block exp at d_head < 20. The conditioning argument lives at the block scale: the
+    # retraction bounds ||phi|| (coords) by max_norm=5.0, so each block's Frobenius norm is far
+    # inside fp32 matrix_exp's exact regime; without the override every flat run at K >= 20 paid
+    # a (B, N, K, K) float64 upcast (vram audit 2026-06-10: ~0.4 GB of f64 transients per build
+    # plus fp64-throughput matrix_exp on a consumer GPU) for blocks that never needed it.
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
-        phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims
+        phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims,
+        exp_dim=(max(block_dims) if block_dims is not None else None),
     )
     omega = torch.einsum("bikl,bjlm->bijkm", exp_phi, exp_neg_phi)
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
@@ -452,8 +460,11 @@ def build_factored_transport(
 
     phi_matrix = torch.einsum("...na,aij->...nij", phi, group.generators)
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
+    # exp_dim: same block-scale float64-island keying as compute_transport_operators (see the
+    # comment there) -- the factored hot path is exactly where the (B, N, K, K) f64 upcast hurt.
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
-        phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims
+        phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims,
+        exp_dim=(max(block_dims) if block_dims is not None else None),
     )
     return FactoredTransport(exp_phi=exp_phi, exp_neg_phi=exp_neg_phi, irrep_dims=list(group.irrep_dims))
 

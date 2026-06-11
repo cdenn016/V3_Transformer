@@ -108,6 +108,7 @@ def compose_euclidean(
     *,
     order:      int = 0,
     gram_pinv_: Optional[torch.Tensor] = None,
+    block_dims: Optional[List[int]]    = None,   # unused; uniform seam with compose_bch
 ) -> torch.Tensor:
     r"""Plain Lie-algebra step phi1 + phi2 (exact iff [phi1, phi2] = 0).
 
@@ -170,6 +171,54 @@ def warn_if_basis_not_closed(
         )
 
 
+def _bch_dynkin_correction(
+    X:     torch.Tensor,                  # (..., d, d) embedded left element
+    Y:     torch.Tensor,                  # (..., d, d) embedded right element
+
+    order: int,                           # Dynkin truncation order (>= 1)
+) -> torch.Tensor:                        # (..., d, d) Z - (X + Y), the commutator series
+    r"""The commutator part of the symmetric Dynkin series (shapes are whatever the
+    caller passes -- full (K, K) matrices or per-block (H, d, d) stacks; the series is
+    pure matmul algebra either way)."""
+    br = lie_bracket_matrix
+    XY = br(X, Y)
+    C = 0.5 * XY
+    if order >= 2:
+        C = C + (1.0 / 12.0) * (br(X, XY) - br(Y, XY))
+    if order >= 3:
+        C = C - (1.0 / 24.0) * br(Y, br(X, XY))
+    if order >= 4:
+        YX  = br(Y, X)
+        YYX = br(Y, YX); YYYX = br(Y, YYX)
+        XXY = br(X, XY); XXXY = br(X, XXY)
+        C = C - (1.0 / 720.0) * (br(Y, YYYX) + br(X, XXXY))
+        C = C + (1.0 / 360.0) * (br(X, YYYX) + br(Y, XXXY))
+        C = C + (1.0 / 120.0) * (br(Y, br(X, br(Y, XY))) + br(X, br(Y, br(X, YX))))
+    return C
+
+
+def _equal_diag_blocks(
+    matrix: torch.Tensor,                 # (..., K, K) block-diagonal, H equal blocks
+    n_blocks: int,
+    block_dim: int,
+) -> torch.Tensor:                        # (..., H, d, d) the diagonal blocks
+    r"""Gather the H equal diagonal blocks (the same view trick as _blockwise_matrix_exp)."""
+    m5 = matrix.reshape(*matrix.shape[:-2], n_blocks, block_dim, n_blocks, block_dim)
+    return torch.diagonal(m5, dim1=-4, dim2=-2).movedim(-1, -3).contiguous()
+
+
+def _from_equal_diag_blocks(
+    blocks: torch.Tensor,                 # (..., H, d, d) per-block matrices
+    K:      int,                          # full dimension H * d
+) -> torch.Tensor:                        # (..., K, K) block-diagonal embedding (zeros off-block)
+    r"""Scatter per-block matrices back onto the block diagonal of a zero (K, K) matrix."""
+    H, d = blocks.shape[-3], blocks.shape[-1]
+    out = torch.zeros(*blocks.shape[:-3], K, K, dtype=blocks.dtype, device=blocks.device)
+    o5 = out.reshape(*out.shape[:-2], H, d, H, d)
+    torch.diagonal(o5, dim1=-4, dim2=-2).copy_(blocks.movedim(-3, -1))
+    return out
+
+
 @register_compose("bch")
 def compose_bch(
     phi1:        torch.Tensor,            # (..., n_gen)
@@ -181,6 +230,7 @@ def compose_bch(
     eps:         float                  = 1e-12,
     order:       int                    = 4,
     gram_pinv_:  Optional[torch.Tensor] = None,
+    block_dims:  Optional[List[int]]    = None,   # group irrep_dims; >1 equal blocks -> blocked brackets
 ) -> torch.Tensor:
     r"""BCH chart correction: coords of log(exp(embed phi1) exp(embed phi2)).
 
@@ -193,6 +243,20 @@ def compose_bch(
                 + 1/120 ([Y,[X,[Y,[X,Y]]]] + [X,[Y,[X,[Y,X]]]])
     Truncation error is O(||X||^{order+2} + ||Y||^{order+2}).
 
+    MEMORY (vram audit 2026-06-10). Two structural costs of the naive cascade dominated the
+    training-step VRAM: (a) when one operand is unbatched (the (N, n_gen) positional element
+    composed into a (B, N, n_gen) frame) every bracket matmul broadcast-materialized its own
+    full-batch copy of the SAME embedded Y -- 22 saved (B, N, K, K) copies at order 4; the
+    operands are now broadcast to a common shape ONCE so all brackets share one storage
+    (bit-identical values). (b) ``block_dims`` (the group's irrep_dims, passed by callers that
+    hold the group): when the embedding is block-diagonal with >1 EQUAL blocks -- the same
+    invariant the per-block matrix_exp relies on; every multi-entry ``irrep_dims`` basis
+    (block_glk / tied_block_glk / so_n / sp_n towers) embeds block-diagonally for EVERY phi --
+    each commutator is block-diagonal, so the whole Dynkin cascade runs on the (..., H, d, d)
+    diagonal-block stacks and is scattered back once. Identical values (the off-block entries
+    are exactly zero throughout), 1/H the bracket memory and H^2 fewer matmul FLOPs. ``None``
+    (single block / cross-coupled / unequal towers) keeps the dense cascade unchanged.
+
     On a basis NOT closed under the Lie bracket the Dynkin commutator terms push
     :math:`Z` out of :math:`\mathrm{span}\{G_a\}`, and the final
     :math:`\mathrm{extract\_phi}(Z)` least-squares projection silently discards that
@@ -204,22 +268,27 @@ def compose_bch(
     """
     X = embed_phi(phi1, generators)
     Y = embed_phi(phi2, generators)
+    if X.shape != Y.shape:
+        # Broadcast ONCE so every bracket matmul saves the same storage instead of each
+        # materializing its own full-batch copy of the unbatched operand. contiguous() is a
+        # no-op on the side that already carries the batch.
+        X, Y = torch.broadcast_tensors(X, Y)
+        X = X.contiguous()
+        Y = Y.contiguous()
     Z = X + Y
-    br = lie_bracket_matrix
-    if order >= 1:
-        XY = br(X, Y)
-        Z = Z + 0.5 * XY
-    if order >= 2:
-        Z = Z + (1.0 / 12.0) * (br(X, XY) - br(Y, XY))
-    if order >= 3:
-        Z = Z - (1.0 / 24.0) * br(Y, br(X, XY))
-    if order >= 4:
-        YX  = br(Y, X)
-        YYX = br(Y, YX); YYYX = br(Y, YYX)
-        XXY = br(X, XY); XXXY = br(X, XXY)
-        Z = Z - (1.0 / 720.0) * (br(Y, YYYX) + br(X, XXXY))
-        Z = Z + (1.0 / 360.0) * (br(X, YYYX) + br(Y, XXXY))
-        Z = Z + (1.0 / 120.0) * (br(Y, br(X, br(Y, XY))) + br(X, br(Y, br(X, YX))))
+    blocked = (
+        order >= 1
+        and block_dims is not None
+        and len(block_dims) > 1
+        and len(set(block_dims)) == 1
+    )
+    if blocked:
+        H, d = len(block_dims), block_dims[0]
+        Xb = _equal_diag_blocks(X, H, d)
+        Yb = _equal_diag_blocks(Y, H, d)
+        Z = Z + _from_equal_diag_blocks(_bch_dynkin_correction(Xb, Yb, order), X.shape[-1])
+    elif order >= 1:
+        Z = Z + _bch_dynkin_correction(X, Y, order)
     phi = extract_phi(Z, generators, gram_pinv_=gram_pinv_)
 
     # Diagnostic (cached, phi-independent): warn once if the generator basis is not bracket-closed,
@@ -240,9 +309,11 @@ def compose_phi(
     order:      int = 4,
     mode:       str = "euclidean",
     gram_pinv_: Optional[torch.Tensor] = None,
+    block_dims: Optional[List[int]]    = None,   # group irrep_dims (compose_bch blocked brackets)
 ) -> torch.Tensor:
     r"""Dispatch to the registered composition rule `mode`."""
-    return get_compose(mode)(phi1, phi2, generators, order=order, gram_pinv_=gram_pinv_)
+    return get_compose(mode)(phi1, phi2, generators, order=order, gram_pinv_=gram_pinv_,
+                             block_dims=block_dims)
 
 
 def _retract_core(

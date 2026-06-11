@@ -132,4 +132,9 @@ def apply_positional_phi(
         return phi
     if project_slk:
         coords = project_phi_to_slk(coords, group.generators, group.irrep_dims)
-    return compose_phi(phi, coords, group.generators, order=order, mode=compose_mode)
+    # block_dims: lets compose_bch run its Dynkin brackets on the (H, d, d) diagonal-block
+    # stacks for a multi-equal-block group (identical values, 1/H the bracket memory; vram
+    # audit 2026-06-10 -- this call pinned ~34 (B, N, K, K) bracket tensors in the unrolled
+    # graph). compose_euclidean ignores it; single-block groups pass [K] and stay dense.
+    return compose_phi(phi, coords, group.generators, order=order, mode=compose_mode,
+                       block_dims=list(group.irrep_dims))
