@@ -69,7 +69,7 @@ config = dict(
     max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
-    n_e_steps                 = 1,                   # T, E-step inner iterations
+    n_e_steps                 = 2,                   # T, E-step inner iterations
     
     
 
@@ -128,12 +128,13 @@ config = dict(
     # free-energy coupling
     
     alpha_mode                = "state_dependent_per_coord",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
+    learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
+    
     b0                        = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0                        = 1.0,                 # state-dependent alpha shape (numerator)
     
-    learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
     
-    kappa                     = 1.1,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
 
     alpha                     = 1.0,                 # constant self-coupling value
     lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
@@ -153,11 +154,11 @@ config = dict(
 
     # E-step
     e_mu_lr                   = 0.9,
-    e_sigma_lr                = 0.025,
+    e_sigma_lr                = 0.001,
     e_phi_lr                  = 0.0,
     
     e_mu_q_trust              = None,
-    e_sigma_q_trust           = 5.0,
+    e_sigma_q_trust           = 10.0,
     sigma_max                 = 10.0,
     
     gradient_mode             = "filtering",          # "filtering" | "smoothing"
@@ -189,12 +190,12 @@ config = dict(
     detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
     grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
 
-    m_mu_lr                   = 0.0150,   
+    m_mu_lr                   = 0.015,   
     m_sigma_lr                = 0.0035,     
     m_phi_lr                  = 0.015,   
     
     mu_init_std               = 0.065,         # std of the random mean table mu_embed
-    sigma_init                = 3.0,          # constant initial coordinate variance (sigma_log = log of this)
+    sigma_init                = 3,         # constant initial coordinate variance (sigma_log = log of this)
     phi_scale                 = 0.06,         # std
     
     
@@ -208,7 +209,7 @@ config = dict(
     warmup_steps              = 100,
     min_lr                    = 0,                # absolute cosine-decay LR floor (0.0 = pure cosine)
     min_lr_frac               = 0.01,                 # proportional LR floor, max(min_lr, frac*base); OFF
-    amp_dtype                 = None,                # None=fp32 | 'bf16' ('fp16' needs a GradScaler: deferred)
+    amp_dtype                 = None,                # None=fp32 | 'bf16' , 'fp16'
     seed                      = SEED,
     
     log_interval              = 100,                  # console log every N steps (0 = off)

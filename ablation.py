@@ -89,10 +89,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     max_seq_len               = 128,                 # N, context length
     
     batch_size                = 64,
-    max_steps                 = 15000,
+    max_steps                 = 7500,
     
     n_layers                  = 1,                   # L, number of blocks
-    n_e_steps                 = 1,                   # T, E-step inner iterations
+    n_e_steps                 = 2,                   # T, E-step inner iterations
     
     
 
@@ -143,16 +143,17 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 
     # free-energy coupling
     
-    alpha_mode                = "state_dependent_per_coord",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
+    alpha_mode                = "constant",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
     b0                        = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0                        = 1.0,                 # state-dependent alpha shape (numerator)
     
     learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
     
-    kappa                     = 1.00,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
 
     alpha                     = 1.0,                 # constant self-coupling value
     lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
+    
     mass_phi                  = 0.0,                 # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight = 0.00,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
     
@@ -173,7 +174,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     e_phi_lr                  = 0.0,
     
     e_mu_q_trust              = None,
-    e_sigma_q_trust           = 5.0,
+    e_sigma_q_trust           = 10.0,
     sigma_max                 = 10.0,
     
     gradient_mode             = "filtering",          # "filtering" | "smoothing"
@@ -205,7 +206,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
     grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
 
-    m_mu_lr                   = 0.014,   
+    m_mu_lr                   = 0.015,   
     m_sigma_lr                = 0.0035,     
     m_phi_lr                  = 0.015,   
     
@@ -479,10 +480,6 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
     
     
-    "alpha": {
-        "description": "constant self-coupling value (alpha_mode=constant)",
-        "param": "alpha", "range": [0.0, 1.0, 0.2], "requires": {"alpha_mode": "constant"},
-    },
     
     
     "lambda_h": {
@@ -519,7 +516,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "sigma_init": {
         "description": "constant initial coordinate variance of the prior table (>0)",
-        "param": "sigma_init", "values": [3.5],
+        "param": "sigma_init", "values": [3, 3.5, 4, 4.5],
     },
     
     "phi_scale": {
@@ -529,6 +526,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
 
     
+    "alpha": {
+        "description": "constant self-coupling value (alpha_mode=constant)",
+        "param": "alpha", "values": [0.0, 0.5, 1, 2.5, 5, 7.5, 10], "requires": {"alpha_mode": "constant"},
+    },
     
     
     "alpha_div": {
@@ -547,12 +548,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
    "e_mu_lr": {
        "description": "E-step natural-gradient step size for mu_q",
-       "param": "e_mu_lr", "range": [0.2, 1, 0.1],
+       "param": "e_mu_lr", "values": [0.7, 0.9],
    },
    
    "e_sigma_lr": {
        "description": "E-step retraction step size for sigma_q",
-       "param": "e_sigma_lr", "values": [0.001, 0.0025, 0.01, 0.025, 0.05],
+       "param": "e_sigma_lr", "values": [0, 0.0005, 0.0015],
    },
    
    "e_phi_lr": {
@@ -574,14 +575,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.015],
+        "param": "m_phi_lr", "values": [0.001, 0.01, 0.013, 0.015, 0.016, 0.025, 0.05, 0.075, 0.1],
     },
     
     
     
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "range": [0.00, 0.1, 0.02],
+        "param": "weight_decay", "values": [0.01, 0.015, 0.02, 0.025, 0.03],
     },
     
     
@@ -602,6 +603,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "lambda_beta", "range": [0, 2, 0.25],
     },
     
+    "e_mu_q_trust": {
+        "description": "mu trust sd",
+        "param": "e_mu_q_trust", "values": [0, 1, 2, 3, 4, 5],
+    },
+    
+    "min_lr_frac": {
+        "description": "lower bound multiplier on m-learning rate",
+        "param": "min_lr_frac", "values": [0.0, 1e-4, 1e-3, 1e-2, 0.1],
+    },
     
     
     "mass_phi": {
@@ -641,38 +651,39 @@ SWEEP_ORDER: List[str] = [
     
   #  "mu_init_std",
   #  "phi_scale",
-   # "sigma_init", 
-   
-   
+  
+    #"e_sigma_lr",
+    "alpha",
     
-   # "m_phi_lr",
-    "m_mu_lr",
+    #"prior_source",
+  #  "attention_prior",
+  #  "entropy_term",
     
-  #  "weight_decay",
+  # "gauge_group",
+ #  "bch_pe_order",
+   #"e_mu_q_trust",
+   # "min_lr_frac",
+  #  "m_phi_lr",
+ #   "m_mu_lr",
+    
+   # "weight_decay",
   #  "lambda_beta",
-    
+  #  "sigma_init", 
   #  "mstep_self_coupling_weight",
   #  "kappa",
   #  "alpha_div",
-    "m_sigma_lr",
+  #  "m_sigma_lr",
     
-    "e_mu_lr",
-    "phi_weight_decay",
+   # "e_mu_lr",
+  #  "phi_weight_decay",
     
-    #"c0",
-    #"b0",
+       
+  #  
     
-  #  "e_sigma_lr",
-    
-    "pos_phi_scale",   
+  #  "pos_phi_scale",   
   #  "mass_phi",
-    
-   
-    
-    
+
     #"pos_phi_compose", 
-    
-    
     
 ]
 

@@ -74,8 +74,13 @@ class VFE3Config:
     # edge connection delta_ij^a = mu_i^T W^a mu_j, with W a model-owned nn.Parameter (shape
     # (n_gen, K, K)) trained by backprop on CE -- a documented learned-parameter exception in the
     # spirit of use_head_mixer / alpha_mode='learnable' (see VFEModel.__init__'s connection_W and
-    # transport._build_regime_ii). At W=0 (init) or cocycle_relaxation=0 it reduces EXACTLY to the
-    # flat cocycle, so init is byte-flat. The pure no-NN path is 'flat' (the default).
+    # transport._build_regime_ii). At cocycle_relaxation=0 the flat builder's dict is returned
+    # byte-identically; at W=0 (the zero-tensor init) the generic path reduces to the flat cocycle
+    # to fp32 tolerance (atol 1e-6, pinned -- not bit-exact: the exp(0)=I einsum reorders fp32 ops;
+    # audit 2026-06-10 F11). The pure no-NN path is 'flat' (the default). NOTE: regime_ii's belief
+    # gradient is served by the autograd ORACLE (the closed-form kernel is the flat-transport
+    # gradient and would drop d Omega/d mu), so training connection_W through the unrolled E-step
+    # requires oracle_unroll_grad=True (the freeze warning below fires otherwise).
     transport_mode:            str   = "flat"
     
     # Homotopy alpha for the Regime-II connection (regime_ii only): delta_ij^a = cocycle_relaxation *
@@ -151,6 +156,7 @@ class VFE3Config:
 
     # free-energy coupling
     alpha:                     float = 1.0          # constant self-coupling value
+    
     # alpha_mode selects the self-coupling form (registry key). The default-and-pure no-NN forms
     # are 'constant', 'state_dependent', 'state_dependent_per_coord' (closed-form functions of the
     # self-divergence D, no learned parameters) and are unchanged. NEURAL-NETWORK EXCEPTION:
@@ -162,20 +168,24 @@ class VFE3Config:
     b0:                        'float | List[float]' = 1.0   # state-dependent alpha shape: alpha* = c0/(b0 + D); list -> (K,) per-coord
     c0:                        'float | List[float]' = 1.0   # state-dependent alpha shape (numerator); list -> (K,) per-coord
     kappa:                     'float | List[float]' = 1.0   # sharpness; list (len n_heads) -> per-head tau
+   
     # lambda_beta weights the ENTIRE belief-coupling block of F -- sum_ij [ beta_ij E_ij +
     # tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-coupling and the likelihood
     # (VFE_2.0 'lambda_align' parity). 1.0 = the canonical/pure F (byte-identical). It scales the
     # POST-softmax block (NOT the energy inside the softmax), so beta = softmax(-E/tau) is unchanged
     # and the analytic kernel stays envelope-consistent with the autograd oracle.
     lambda_beta:               float = 1.0
+    
     # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED lambda_beta. When True the model
     # creates a scalar nn.Parameter log_lambda_beta (lambda_beta = exp(log_lambda_beta)) trained by
     # backprop through the unrolled E-step -- the spirit of alpha_mode='learnable'. Init 0 ->
     # lambda_beta = 1.0, byte-identical to the constant-1.0 pure path at step 0. Default False keeps
     # the path param-free.
     learnable_lambda_beta:     bool  = False
+    
     mass_phi:                  float = 0.0          # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight: float = 0.0         # alpha_hat: overall scale on M-step sum_i alpha_i D(q_i*||p_i) (0 = OFF; alpha_i = the E-step self-coupling form)
+    
     # Hyper-prior weight lambda_h on the model-channel term lambda_h * mean_i KL(s_i||r)
     # (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy, lines 1241-1249).
     # Default 0.0 = OFF: no s/r tables, loss byte-identical to the single-tier path.
@@ -252,12 +262,12 @@ class VFE3Config:
     # run used e_mu_q_trust=5.0, mu_trust_mode='box'.
     e_mu_q_trust:              Optional[float] = None
     mu_trust_mode:             str   = "box"          # "box" | "ball" (consulted only when e_mu_q_trust is not None)
-    sigma_max:                 float = 5.0
+    sigma_max:                 float = 10.0
    
     gradient_mode:             str   = "filtering"
     
     phi_precond_mode:          str   = "none"
-    phi_retract_mode:          str   = "euclidean"  # Lie-algebra step chart: euclidean (sum) or bch
+    phi_retract_mode:          str   = "bch"  # Lie-algebra step chart: euclidean (sum) or bch
     spd_retract_mode:          str   = "spd_affine" # SPD covariance retraction geometry (registry key)
 
     # decode / encode
@@ -343,6 +353,13 @@ class VFE3Config:
     # gauge-frame protection). Inert under m_phi_natural_grad=True (phi is natural-gradient stepped,
     # AdamW decay 0 on the gauge groups regardless).
     phi_weight_decay:          float = 0.065
+
+    # SEPARATE AdamW weight decay for the Regime-II edge connection connection_W (audit 2026-06-10
+    # F9): the analogue of phi_weight_decay's frame-norm ceiling for the learned connection, whose
+    # growth drives the ||mu||^2 ||W||-scaled edge factor. Default None = inherit the global
+    # weight_decay (the long-standing behavior, unchanged); set explicitly for an LR-invariant
+    # connection-norm ceiling that pulls the transport toward the flat cocycle.
+    connection_weight_decay:   Optional[float] = None
     batch_size:                int   = 64
     
     # Accumulate gradients over N microbatches before an optimizer step, for a larger
@@ -353,8 +370,10 @@ class VFE3Config:
     grad_accum_steps:          int   = 1
     max_steps:                 int   = 15000
     warmup_steps:              int   = 100
+    
     min_lr:                    float = 1e-4         # absolute cosine-decay floor: each group's LR
     #                          never decays below this. 0.0 recovers the pure half-cosine-to-zero.
+    
     min_lr_frac:               float = 0.0           # fractional cosine-decay floor (default OFF):
     #                          each group's LR never decays below min_lr_frac * its OWN base LR,
     #                          preserving the m_mu:m_sigma:m_phi base ratios into the tail. Combined
@@ -365,6 +384,7 @@ class VFE3Config:
     log_interval:              int   = 100           # console log every N steps (0 = off)
     eval_interval:             int   = 2000            # periodic validation every N steps (0 = off)
     checkpoint_interval:       int   = 0            # save a resumable checkpoint every N steps (0 = off)
+    
     # Opt-in training RESUME (default None = OFF = the pure from-scratch path): a path to a
     # checkpoints/step_<N>.pt written by checkpoint_interval. When set, train() restores the model
     # weights, the AdamW optimizer state (momentum), the RNG, and rebuilds the per-group cosine
@@ -912,6 +932,24 @@ class VFE3Config:
         # form also rejects NaN (nan <= 1.0 is False) and +/-inf, unlike a bare `< 0` check.
         if not (0.0 <= self.cocycle_relaxation <= 1.0):
             raise ValueError(f"cocycle_relaxation must be in [0,1], got {self.cocycle_relaxation}")
+        # regime_ii x gaussian_full (audit 2026-06-10 F10): the per-edge factor exp(delta . G) is
+        # non-orthogonal for the non-compact groups, and the FULL-covariance sandwich
+        # Omega Sigma Omega^T can go indefinite at fp32 -- the full-family KL then masks the NaN
+        # Cholesky to kl_max SILENTLY (the edge contributes a saturated constant, and under
+        # oracle_unroll_grad=True the double-backward can NaN connection_W.grad). Warn (non-
+        # breaking, mirroring the estimator warnings below); prefer the diagonal family or a
+        # compact so tower when running regime_ii at fp32 full covariance.
+        if self.transport_mode == "regime_ii" and self.family == "gaussian_full":
+            import warnings
+            warnings.warn(
+                "transport_mode='regime_ii' with family='gaussian_full': the non-orthogonal edge "
+                "factor can drive the transported full covariance indefinite at fp32; the full-"
+                "family KL masks the failed Cholesky to kl_max SILENTLY, and the unrolled oracle's "
+                "double-backward can produce NaN connection_W gradients. Prefer gaussian_diagonal "
+                "or a compact so-tower group with regime_ii.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         # normalization validated against the norm REGISTRY (add-by-registering). Local import
         # avoids a config <- norms cycle.
@@ -968,7 +1006,11 @@ class VFE3Config:
         # active (alpha_mode='learnable' / transport_mode='regime_ii' / learnable_lambda_beta /
         # pos_phi='learned'), that param receives NO gradient through the detached oracle. Warn
         # (non-breaking); oracle_unroll_grad=True restores the differentiable oracle gradient.
-        _routes_to_oracle = not (
+        # transport_mode='regime_ii' ALWAYS routes to the oracle (audit 2026-06-10 F1: the kernel
+        # is the flat-transport gradient and drops d Omega/d mu), regardless of the kernel-family
+        # predicate below -- so connection_W training requires oracle_unroll_grad=True on every
+        # regime_ii config.
+        _routes_to_oracle = self.transport_mode == "regime_ii" or not (
             self.gradient_mode == "filtering"
             and self.family == "gaussian_diagonal"
             and self.divergence_family == "renyi"
@@ -1008,6 +1050,13 @@ class VFE3Config:
             v = getattr(self, name)
             if v < 0.0 or v != v:                            # v != v rejects NaN (which passes < 0.0)
                 raise ValueError(f"{name} must be >= 0 (and not NaN), got {v}")
+        if self.connection_weight_decay is not None and (
+                self.connection_weight_decay < 0.0
+                or self.connection_weight_decay != self.connection_weight_decay):
+            raise ValueError(
+                f"connection_weight_decay must be >= 0 (and not NaN) or None, "
+                f"got {self.connection_weight_decay}"
+            )
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
         if self.grad_accum_steps < 1:

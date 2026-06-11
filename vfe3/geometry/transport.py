@@ -132,9 +132,13 @@ def _build_regime_ii(
 
     *,
     gauge_mode:         str                       = "learned",   # 'learned' (flat vertex factors) | 'trivial'
-    mu:                 Optional[torch.Tensor]    = None,        # (B, N, K) belief means; the bilinear delta reads these
-    connection_W:       Optional[torch.Tensor]    = None,        # (n_gen, K, K) learned bilinear connection (NN exception)
     cocycle_relaxation: float                     = 1.0,         # homotopy alpha in [0,1]; 0 -> flat
+    delta_soft_cap:     float                     = 12.0,        # smooth bound on ||delta_ij||_2 (< exp clamp max_norm=15)
+    mu:                 Optional[torch.Tensor]    = None,        # (B, N, K) QUERY-slot means; the bilinear delta reads these
+    connection_W:       Optional[torch.Tensor]    = None,        # (n_gen, K, K) learned bilinear connection (NN exception)
+    mu_key:             Optional[torch.Tensor]    = None,        # (B, N, K) KEY-slot means (None -> mu); the filtering
+    #                                                              oracle passes a DETACHED key slot so d delta/d mu
+    #                                                              flows query-side only (values are detach-invariant)
     **kwargs,                                                    # tolerated (shares the flat builder's call shape)
 ) -> TransportDict:
     r"""Regime-II edge-relaxed (NON-FLAT) transport (spec eq:edge_relaxed_omega).
@@ -146,31 +150,46 @@ def _build_regime_ii(
 
     The edge-relaxed cocycle inserts an edge-local connection between the vertex factors:
 
-        Omega_ij = exp(phi_i . G) exp(delta_ij . G) exp(-phi_j . G),
+        Omega_ij = exp(phi_i . G) exp(delta_ij . G) exp(-phi_j . G),       i != j,
+        Omega_ii = exp(phi_i . G) exp(-phi_i . G) = I (self-edge excluded: delta_ii := 0),
         delta_ij^a = cocycle_relaxation * (mu_i^T W^a mu_j),   a = 1..n_gen,
+        delta_ij -> delta_ij / sqrt(1 + ||delta_ij||^2 / delta_soft_cap^2)   (smooth norm cap),
         delta_ij . G = sum_a delta_ij^a G_a   in g,
 
     with ``{G_a} = group.generators``. Because delta is valued in the group's own generator
     coordinates, exp(delta_ij . G) lies in the group by construction (block structure / irrep_dims
-    preserved). At ``connection_W=None`` OR all-zero OR ``cocycle_relaxation=0`` the edge factor
-    delta=0 -> exp(0)=I, so Omega = exp(phi_i) exp(-phi_j) is the flat (Regime-I) cocycle EXACTLY
-    -- the byte-identity oracle (verified by tests/test_regime_ii.py). A nonzero W gives the
-    non-trivial triangle holonomy ``metrics.holonomy_deviation`` was built to read.
+    preserved). At ``connection_W=None`` or ``cocycle_relaxation=0`` the flat dict is returned
+    byte-identically; an all-ZERO W tensor (the model init) takes the generic path and reduces to
+    the flat cocycle to fp32 tolerance (atol 1e-6, pinned by tests/test_regime_ii.py -- NOT
+    bit-exact: the extra exp(0)=I einsum reorders fp32 ops). A nonzero W gives the non-trivial
+    triangle holonomy ``metrics.holonomy_deviation_sampled`` was built to read.
+
+    NOT a symmetric cocycle: delta_ji = mu_j^T W^a mu_i != -delta_ij for a general learned W, so
+    Omega_ji != Omega_ij^{-1} (reciprocity holds only for the flat cocycle). No current consumer
+    assumes the inverse property -- the attention energies are directional and both directions are
+    built independently -- but a future reverse-message path must NOT reuse the transpose/inverse
+    shortcut here (audit 2026-06-10 F5).
+
+    Design notes (audit 2026-06-10 F13): each coefficient delta_ij^a reads the FULL K-vector of
+    both means through the unmasked (n_gen, K, K) ``W^a`` -- cross-head content coupling is
+    intended (the connection is a model-level object, not a per-head projection). The bilinear is
+    computed on RAW means: relative position enters the energy only through the outer gauge-RoPE
+    rotation R_i Omega_ij R_j^T, never through delta itself (position-blind content interaction,
+    by design).
 
     COST: unlike flat (mu-independent, O(N) vertex exponentials), Omega here depends on the CURRENT
     belief means mu and the edge factor is a PER-EDGE K x K matrix exponential -- O(N^2) matrix
-    exponentials per build, and the build must be repeated as mu updates across E-step iterations.
-    The Frobenius clamp in :func:`stable_matrix_exp_pair` (max_norm=15) also bounds ||delta . G||;
-    safe at zero-init W, a note for a large trained connection.
+    exponentials per build, and the build must be repeated as mu updates across E-step iterations
+    (twice per iteration when the phi step runs; ``e_phi_lr=0`` halves the build count). The smooth
+    ``delta_soft_cap`` keeps ||delta . G||_F below ``stable_matrix_exp_pair``'s hard Frobenius
+    clamp (max_norm=15) for the unit-Frobenius orthonormal generator bases the groups ship
+    (||delta . G||_F = ||delta||_2 there), so the exp is always the EXACT operator, the
+    cocycle_relaxation homotopy never saturates, and autograd never optimizes a clamped surrogate
+    (audit 2026-06-10 F3); the hard clamp remains as a backstop for any non-orthonormal basis.
 
     Returns the SAME dict shape as the flat builder: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K),
     'Omega' (B,N,N,K,K).
     """
-    # Vertex factors exp(phi_i), exp(-phi_j): reuse the flat builder verbatim (the dominant cost is
-    # the O(N^2) edge exps below, so this extra Omega matmul is cheap and we just discard its Omega).
-    flat = compute_transport_operators(phi, group, gauge_mode=gauge_mode)
-    exp_phi, exp_neg_phi = flat["exp_phi"], flat["exp_neg_phi"]                 # (B, N, K, K)
-
     # Flat fast path: no connection at all (None), the homotopy collapses it (alpha=0), or the
     # vertex factors are trivial -> delta plays no role -> Omega is exactly the flat cocycle. Skip the
     # O(N^2) edge exps. NOTE: we deliberately do NOT short-circuit on an all-ZERO (but grad-requiring)
@@ -179,18 +198,48 @@ def _build_regime_ii(
     # short-circuiting there would sever the autograd graph and freeze the parameter at init. The full
     # einsum path keeps W in the graph so the loss backpropagates to it.
     if connection_W is None or cocycle_relaxation == 0.0 or gauge_mode == "trivial":
-        return flat
+        return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
+
+    # Vertex factors exp(phi_i), exp(-phi_j) in FACTORED form (audit 2026-06-10 F8a): the same
+    # stable exp machinery as the flat builder, WITHOUT materializing the dense (B, N, N, K, K)
+    # flat Omega this path would immediately discard.
+    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
+    exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
 
     generators = group.generators                                              # (n_gen, K, K)
-    # delta_ij^a = cocycle_relaxation * mu_i^T W^a mu_j  -> (B, N, N, n_gen)
-    delta = cocycle_relaxation * torch.einsum("bik,akl,bjl->bija", mu, connection_W, mu)
+    # delta_ij^a = cocycle_relaxation * mu_i^T W^a mu_j  -> (B, N, N, n_gen). ``mu`` fills the
+    # QUERY (i) slot and ``mu_key`` the KEY (j) slot; the VALUES are identical for any detach
+    # combination, but the filtering oracle passes a detached key slot so d delta / d mu flows
+    # query-side only (mean-field coordinate ascent).
+    mu_k = mu_key if mu_key is not None else mu
+    delta = cocycle_relaxation * torch.einsum("bik,akl,bjl->bija", mu, connection_W, mu_k)
+    # Self-edge exclusion (audit 2026-06-10 F4): the connection is an EDGE object; the degenerate
+    # i==i "edge" transports along the constant path, so Omega_ii stays exp(phi_i) exp(-phi_i) = I
+    # exactly as on the flat path. Without this, delta_ii = mu_i^T W^a mu_i injects a spurious
+    # nonzero self-energy E_ii into the (unmasked) attention softmax.
+    n_tok = delta.shape[1]
+    eye = torch.eye(n_tok, dtype=torch.bool, device=delta.device)
+    delta = delta.masked_fill(eye.view(1, n_tok, n_tok, 1), 0.0)
+    # Smooth per-edge norm cap (audit 2026-06-10 F3): delta is QUADRATIC in the unconstrained mean
+    # scale (||delta|| ~ ||mu_i|| ||mu_j|| ||W||). delta -> delta * rsqrt(1 + ||delta||^2/cap^2)
+    # bounds ||delta||_2 < delta_soft_cap, is the identity map to O(||delta||^2/cap^2) near zero
+    # (the W=0 oracle and d Omega/d W at W=0 are untouched), and is STRICTLY monotone in
+    # cocycle_relaxation everywhere -- the homotopy never saturates, unlike the hard matrix clamp
+    # it pre-empts.
+    sq = delta.pow(2).sum(dim=-1, keepdim=True)
+    delta = delta * torch.rsqrt(1.0 + sq / (delta_soft_cap * delta_soft_cap))
     # delta_ij . G = sum_a delta_ij^a G_a  -> (B, N, N, K, K) Lie-algebra edge matrix
     delta_mat = torch.einsum("bija,akl->bijkl", delta, generators)
-    # Per-edge group element exp(delta_ij . G); reuse the stable float64-island / block-exp machinery
-    # (only_forward: the edge factor enters Omega once, no exp(-delta) needed).
+    # Per-edge group element exp(delta_ij . G); reuse the stable block-exp machinery
+    # (only_forward: the edge factor enters Omega once, no exp(-delta) needed). exp_dim keys the
+    # float64-island decision on the dimension actually exponentiated -- the per-head block --
+    # so the O(N^2) edge exps of a block-diagonal group run at the block's own precision instead
+    # of upcasting the whole (B, N, N, K, K) batch to float64 whenever K >= 20 (audit 2026-06-10
+    # F8c; the soft cap above keeps the blocks in the well-conditioned exp regime).
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     exp_delta, _ = stable_matrix_exp_pair(
         delta_mat, skew_symmetric=group.skew_symmetric, only_forward=True, block_dims=block_dims,
+        exp_dim=(max(block_dims) if block_dims is not None else None),
     )                                                                          # (B, N, N, K, K)
 
     # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
@@ -207,6 +256,7 @@ def stable_matrix_exp_pair(
     skew_symmetric: bool            = False,
     only_forward:   bool            = False,
     block_dims:     Optional[List[int]] = None,   # per-block sizes (sum==d) for a block-diagonal M
+    exp_dim:        Optional[int]       = None,   # dimension for the float64-island decision (None -> d)
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""exp(M) and optionally exp(-M) with Frobenius-norm clamp + float64 upcast.
 
@@ -226,18 +276,35 @@ def stable_matrix_exp_pair(
     Frobenius clamp is applied to the WHOLE matrix first, and each block keeps the dtype the
     full-K path would pick, so neither the scale nor the precision changes). ``None`` (a single
     block, a cross-coupled basis, or a skew group) takes the full-matrix path unchanged.
+
+    ``exp_dim`` (audit 2026-06-10 F8c, default None = unchanged): an explicit override of the
+    dimension the float64-island decision keys on. By DEFAULT the per-block path keeps the
+    full-K dtype so blocking never changes precision (the bit-equivalence pin above). A caller
+    whose conditioning argument lives at the BLOCK scale -- the regime_ii per-edge factor, whose
+    delta is norm-capped upstream -- may pass ``exp_dim=max(block_dims)`` to run small blocks in
+    fp32 instead of upcasting the whole batch to float64 at K >= dim_threshold.
     """
     # Global Frobenius clamp on the FULL matrix (one scale for all blocks) -- identical to the
-    # un-blocked path, so block slicing below cannot change the operator.
-    mat_norm = matrix.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
-    scale = (max_norm / mat_norm).clamp(max=1.0)
+    # un-blocked path, so block slicing below cannot change the operator. The norm/scale is kept
+    # OUT of the autograd graph (no_grad): the clamp is a numerical SAFEGUARD, not part of the
+    # modeled operator, and differentiating through the rescale (a) biases the gradient toward
+    # the clamped surrogate where the clamp is active and (b) makes the norm's DOUBLE-backward
+    # NaN on exactly-zero matrices (regime_ii's zeroed self-edges and the W=0 init, reached by
+    # the unrolled oracle's create_graph path). Where the clamp is inactive (scale == 1.0 -- the
+    # soft-capped regime_ii edge factor and any ||phi|| < max_norm) multiplying by the detached
+    # constant 1.0 is byte-identical to the previous through-graph multiply.
+    with torch.no_grad():
+        mat_norm = matrix.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+        scale = (max_norm / mat_norm).clamp(max=1.0)
     matrix = matrix * scale
 
     d = matrix.shape[-1]
     orig_dtype = matrix.dtype
     # The full-K path's dtype choice; the per-block path forces the SAME dtype so a small block
     # (d_head < dim_threshold) does not silently drop to float32 and drift from the full exp.
-    up_dtype = torch.float64 if d >= dim_threshold else torch.float32
+    # exp_dim (when given) overrides the keying dimension -- see the docstring.
+    d_eff = exp_dim if exp_dim is not None else d
+    up_dtype = torch.float64 if d_eff >= dim_threshold else torch.float32
 
     with torch.amp.autocast('cuda', enabled=False):
         matrix_up = matrix.to(up_dtype).contiguous()

@@ -799,6 +799,16 @@ def gauge_equivariance_residual(
     makes a diagonal Sigma full), and returns the relative residuals. In-group residuals cluster at
     float32 eps; the out-of-group control sits far above. (For glk the group IS all of GL(K), so the
     control is also invariant -- correct, there is no 'outside'.)
+
+    SCOPE (audit 2026-06-10 F12): this certifies the joint-congruence invariance of the GIVEN
+    operator tensor -- (mu, Sigma, Omega) co-transformed together -- which holds for ANY omega,
+    including a regime_ii one. It is therefore BLIND to a BUILDER-level equivariance break: under
+    transport_mode='regime_ii' the built operator satisfies Omega(g mu) != g Omega(mu) g^{-1} for
+    nonzero connection_W (the documented user-accepted break, pinned by
+    tests/test_regime_ii.py::test_regime_ii_edge_factor_breaks_gauge_invariance_for_nonzero_W),
+    and that deviation never enters this residual because omega is supplied, not rebuilt. Read
+    the in-group panel as "congruence consistency of the converged operator", NOT as a
+    certificate that the regime_ii construction is equivariant.
     """
     from vfe3.families.base import get_family
     from vfe3.free_energy import attention_tau, attention_weights, pairwise_energy
@@ -889,8 +899,13 @@ def _m_attn_entropy(*, beta: torch.Tensor, **kw) -> float:
 
 @register_metric("holonomy_deviation")
 def _m_holonomy(*, omega: torch.Tensor, **kw) -> float:
-    """Mean triangle-holonomy departure from identity (curvature proxy)."""
-    return float(holonomy_deviation(omega))
+    """Mean triangle-holonomy departure from identity (curvature proxy).
+
+    Routes to the SAMPLED estimator (audit 2026-06-10 F16): the deterministic row-major
+    ``holonomy_deviation`` always reads the same low-index-token triangles -- a systematically
+    biased curvature estimate -- and ``diagnostics()`` already logs the sampled one, so the
+    registry key now agrees with the training log."""
+    return float(holonomy_deviation_sampled(omega)["mean"])
 
 
 @register_metric("gauge_trace_spread")
