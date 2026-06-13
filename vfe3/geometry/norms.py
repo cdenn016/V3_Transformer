@@ -31,10 +31,14 @@ def get_norm(name: str) -> Callable:
 class MahalanobisNorm:
     r"""mu_norm = mu * sqrt(K / (mu^T Sigma^-1 mu + eps)).
 
-    The Mahalanobis scalar ``s2 = mu^T Sigma^-1 mu`` is gauge-invariant: under
-    mu->g mu, Sigma->g Sigma g^T it maps to ``mu^T g^T (g Sigma g^T)^-1 g mu = mu^T Sigma^-1 mu``.
-    The scale ``sqrt(K/s2)`` is therefore invariant and ``mu_norm`` transforms as a
-    vector. Pure math, no parameters.
+    The Mahalanobis scalar ``s2 = mu^T Sigma^-1 mu`` is gauge-invariant under the FULL-covariance
+    congruence: with mu->g mu, Sigma->g Sigma g^T it maps to
+    ``mu^T g^T (g Sigma g^T)^-1 g mu = mu^T Sigma^-1 mu`` (the ``linalg.solve`` branch below), so the
+    scale ``sqrt(K/s2)`` is invariant and ``mu_norm`` transforms as a vector. The DIAGONAL branch
+    (``sum(mu^2 / sigma)``) is the Mahalanobis form only for a diagonal Sigma: it is invariant under
+    the diagonal-scaling subgroup, NOT a general non-diagonal g in GL(K) -- consistent with the
+    gaussian_diagonal family being declared non-GL(K)-invariant (groups.check_admissible). Pure math,
+    no parameters.
     """
 
     def __init__(

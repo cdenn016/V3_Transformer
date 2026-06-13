@@ -16,6 +16,15 @@ from vfe3.families.base import (
 from vfe3.numerics import safe_cholesky
 
 
+# fp32 catastrophic-cancellation band around the alpha->1 (KL) limit of the Renyi logdet term.
+# The |alpha-1| < 1e-6 KL switch in each kernel is exact in float64, but in float32 the three
+# nearly-equal logs in the logdet term cancel and are divided by a tiny (alpha-1), losing ~1%
+# accuracy out to roughly |alpha-1| ~ 1e-3. Inside this band the closed forms evaluate the logdet
+# term in float64 (the same dtype-guarded headroom the geometry Gram pseudo-inverse already uses)
+# and cast back; outside it the float32 quotient is accurate and used verbatim (byte-identical).
+_RENYI_KL_BAND: float = 1e-2
+
+
 @register_family("gaussian_diagonal")
 class DiagonalGaussian(BeliefParams):
     r"""Diagonal Gaussian: mu (..., K), sigma (..., K) variances.
@@ -96,12 +105,22 @@ class DiagonalGaussian(BeliefParams):
             sigma_blend = raw_blend.clamp(min=eps)
             delta       = mu_t - mu_q
             mahal_term  = (alpha * (delta ** 2) / sigma_blend).sum(dim=-1)
-            logdet_per_dim = (
-                (1.0 - alpha) * torch.log(sigma_q)
-                + alpha * torch.log(sigma_t)
-                - torch.log(sigma_blend)
-            )
-            logdet_term = logdet_per_dim.sum(dim=-1) / (alpha - 1.0)
+            if abs(alpha - 1.0) < _RENYI_KL_BAND:
+                # fp32 cancellation band: evaluate the logdet term in float64, then cast back.
+                sq64 = sigma_q.double()
+                st64 = sigma_t.double()
+                sb64 = ((1.0 - alpha) * sq64 + alpha * st64).clamp(min=eps)
+                logdet_term = (
+                    ((1.0 - alpha) * torch.log(sq64) + alpha * torch.log(st64) - torch.log(sb64)).sum(dim=-1)
+                    / (alpha - 1.0)
+                ).to(sigma_q.dtype)
+            else:
+                logdet_per_dim = (
+                    (1.0 - alpha) * torch.log(sigma_q)
+                    + alpha * torch.log(sigma_t)
+                    - torch.log(sigma_blend)
+                )
+                logdet_term = logdet_per_dim.sum(dim=-1) / (alpha - 1.0)
             div = 0.5 * (mahal_term + logdet_term)
             ok  = (raw_blend > 0.0).all(dim=-1)            # any non-PD coordinate -> NaN -> kl_max
             div = torch.where(ok, div, div.new_tensor(float("nan")))
@@ -140,11 +159,22 @@ class DiagonalGaussian(BeliefParams):
             raw_blend   = (1.0 - alpha) * sigma_q + alpha * sigma_t
             sigma_blend = raw_blend.clamp(min=eps)
             mahal       = alpha * (delta ** 2) / sigma_blend
-            logdet      = (
-                (1.0 - alpha) * torch.log(sigma_q)
-                + alpha * torch.log(sigma_t)
-                - torch.log(sigma_blend)
-            ) / (alpha - 1.0)
+            if abs(alpha - 1.0) < _RENYI_KL_BAND:
+                # fp32 cancellation band: evaluate the per-coord logdet term in float64 (see
+                # renyi_closed_form / _RENYI_KL_BAND), then cast back.
+                sq64   = sigma_q.double()
+                st64   = sigma_t.double()
+                sb64   = ((1.0 - alpha) * sq64 + alpha * st64).clamp(min=eps)
+                logdet = (
+                    ((1.0 - alpha) * torch.log(sq64) + alpha * torch.log(st64) - torch.log(sb64))
+                    / (alpha - 1.0)
+                ).to(sigma_q.dtype)
+            else:
+                logdet  = (
+                    (1.0 - alpha) * torch.log(sigma_q)
+                    + alpha * torch.log(sigma_t)
+                    - torch.log(sigma_blend)
+                ) / (alpha - 1.0)
             per_coord = 0.5 * (mahal + logdet)
             per_coord = torch.where(raw_blend > 0.0, per_coord, per_coord.new_tensor(float("nan")))
         return safe_kl_clamp(per_coord, kl_max=kl_max)
@@ -195,10 +225,11 @@ class FullGaussian(BeliefParams):
     def log_partition_at(cls, theta: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         t1, t2 = theta
         neg2t2 = -2.0 * t2
-        L = torch.linalg.cholesky(neg2t2)
+        L, ok = safe_cholesky(neg2t2, rounds=5)        # never raises; ok=False on a non-PD -2*t2
         inv_neg2t2 = torch.cholesky_inverse(L)
         quad = (t1.unsqueeze(-2) @ inv_neg2t2 @ t1.unsqueeze(-1)).squeeze(-1).squeeze(-1)
-        return 0.5 * quad - 0.5 * _logdet_chol(L)
+        out = 0.5 * quad - 0.5 * _logdet_chol(L)
+        return torch.where(ok, out, out.new_tensor(float("nan")))
 
     def expected_statistic(self) -> Tuple[torch.Tensor, torch.Tensor]:
         outer = self.mu.unsqueeze(-1) * self.mu.unsqueeze(-2)
@@ -267,12 +298,27 @@ class FullGaussian(BeliefParams):
                 L_blend, delta_mu.unsqueeze(-1), upper=False
             ).squeeze(-1)
             mahal_term = alpha * (v ** 2).sum(dim=-1)
-            logdet_q = _logdet_chol(L_q)
-            logdet_t = _logdet_chol(L_t)
-            logdet_blend = _logdet_chol(L_blend)
-            logdet_term = (
-                (1.0 - alpha) * logdet_q + alpha * logdet_t - logdet_blend
-            ) / (alpha - 1.0)
+            if abs(alpha - 1.0) < _RENYI_KL_BAND:
+                # fp32 cancellation band: the three logdets nearly cancel before the /(alpha-1).
+                # Recompute them in float64 via slogdet on the f64 regularized covariances; the
+                # fp32 cholesky factors above still drive mahal_term and the ok mask.
+                sq64 = sigma_q_reg.double()
+                st64 = sigma_t_reg.double()
+                sb64 = (1.0 - alpha) * sq64 + alpha * st64
+                sb64 = 0.5 * (sb64 + sb64.transpose(-1, -2))
+                logdet_term = (
+                    ((1.0 - alpha) * torch.linalg.slogdet(sq64).logabsdet
+                     + alpha * torch.linalg.slogdet(st64).logabsdet
+                     - torch.linalg.slogdet(sb64).logabsdet)
+                    / (alpha - 1.0)
+                ).to(sigma_q.dtype)
+            else:
+                logdet_q = _logdet_chol(L_q)
+                logdet_t = _logdet_chol(L_t)
+                logdet_blend = _logdet_chol(L_blend)
+                logdet_term = (
+                    (1.0 - alpha) * logdet_q + alpha * logdet_t - logdet_blend
+                ) / (alpha - 1.0)
             div = 0.5 * (mahal_term + logdet_term)
             ok = ok_blend & ok_q & ok_t            # any failed factor -> NaN -> kl_max
             div = torch.where(ok, div, div.new_tensor(float("nan")))

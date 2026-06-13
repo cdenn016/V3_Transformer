@@ -96,9 +96,11 @@ def build_optimizer(
     if getattr(model, "pos_phi_free", None) is not None:        # pos_phi='learned' positional table
         pos_group = {"params": [model.pos_phi_free], "lr": cfg.m_phi_lr,      # a gauge-frame scale
                      "weight_decay": cfg.phi_weight_decay}                    # decayed like phi_embed
-        # Natural-grad the positional frame too, but ONLY at full coordinate width: the pullback
-        # metric is built on the full generator set, so a reduced (pos_phi_project_slk) chart is
-        # shape-incompatible and stays on AdamW.
+        # Natural-grad the positional frame too. pos_phi_free is created at FULL coordinate width
+        # (n_gen) and project_phi_to_slk preserves that width, so this width guard is currently
+        # ALWAYS satisfied (audit 2026-06-13 L2: there is no reduced-width chart today). It is kept
+        # defensively: a future reduced-width pos_phi would be shape-incompatible with the
+        # full-generator pullback metric and must fall back to AdamW here.
         if nat and model.pos_phi_free.shape[-1] == n_gen:
             pos_group["gauge"] = True
             pos_group["weight_decay"] = 0.0
@@ -140,8 +142,8 @@ def build_optimizer(
     # use_prior_bank=False AND detach_e_step=True (only output_proj_weight reaches the loss; the
     # model emits a warning for that combination), and mu_embed/sigma_log_embed under
     # prior_source='model_channel' (the prior reroutes to the s tables, so the belief tables are dead
-    # but stay grouped -- AdamW skips a None-grad param, though shared weight_decay still decays the
-    # dead table harmlessly since it is never read). These are intentional, not coverage bugs.
+    # but stay grouped -- AdamW skips a None-grad param ENTIRELY, so neither an update NOR weight
+    # decay fires on the dead table; audit 2026-06-13 L3). These are intentional, not coverage bugs.
     grouped = {p for g in groups for p in g["params"]}
     missing = {p for p in model.parameters() if p.requires_grad} - grouped   # frozen params are exempt
     if missing:

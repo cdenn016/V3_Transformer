@@ -153,6 +153,15 @@ def warn_if_basis_not_closed(
     exceeds ``max_elements`` the scan is skipped and the basis is treated as closed (cached, no
     warning). Non-closed bases in practice are the small cross_couplings chains, which stay well
     under the budget and are scanned exactly.
+
+    LIMITATION (audit 2026-06-13 L5): the size-skip ASSUMES a too-large basis is closed-by-
+    construction, which holds for the shipped direct-sum / full-algebra groups but is NOT verified for
+    a LARGE ``close_basis=False`` cross_couplings basis (the one case that can be non-closed and also
+    exceed the budget) -- there the scan is silently skipped. A general closed/non-closed test for a
+    large single-block basis needs the O(K^4) scan itself, so distinguishing ``so_k``/``glk`` (large,
+    closed) from a large cross-coupled subset (non-closed) cheaply is not possible. The guaranteed
+    path is to build cross-coupled towers with ``close_basis=True`` (close_under_brackets), which
+    yields a bracket-closed algebra rather than relying on this size-gated diagnostic.
     """
     key = id(generators)
     entry = _BRACKET_CLOSURE_RES.get(key)

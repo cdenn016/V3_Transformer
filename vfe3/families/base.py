@@ -231,8 +231,8 @@ def renyi(
     """
     if alpha <= 0.0:
         raise ValueError(f"alpha must be positive, got {alpha}")
-    if alpha > 1.0:
-        _warn_alpha_gt_one(alpha, type(q).__name__)
+    if alpha > 1.0 + 1e-6:                              # only when the closed form takes the blend
+        _warn_alpha_gt_one(alpha, type(q).__name__)     # branch; alpha in (1, 1+1e-6] is plain KL
     closed = getattr(q, "renyi_closed_form", None)
     if closed is not None:
         return closed(p, alpha=alpha, kl_max=kl_max, eps=eps)

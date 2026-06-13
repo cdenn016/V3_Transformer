@@ -141,9 +141,15 @@ def cg_selection(
     *,
     algebra: str,                          # 'so' | 'sp'
     labels:  List[str],                    # the spec's irrep labels (duplicates allowed)
+    atol:    float = 1e-8,                  # null-space cut; MUST match the buffer build's atol
 ) -> List[Tuple[str, str, str, int]]:      # admissible (a, b, c, n_mult), a <= b, n_mult > 0
     """Enumerate admissible CG triples among the spec's labels (unordered source pairs:
-    swapped duplicates are not independent bilinear maps, so a <= b canonically)."""
+    swapped duplicates are not independent bilinear maps, so a <= b canonically).
+
+    ``atol`` is threaded into the per-triple ``cg_intertwiners`` null-space solve so the
+    enumerated ``n_mult`` uses the SAME tolerance as a later buffer build (audit 2026-06-13 L20):
+    a mismatch at a thin Gram gap would otherwise disagree on the multiplicity / buffer leading dim.
+    """
     uniq = sorted(set(labels))
     out: List[Tuple[str, str, str, int]] = []
     for i, a in enumerate(uniq):
@@ -165,7 +171,7 @@ def cg_selection(
                     )
                     continue
                 n = cg_intertwiners(N, algebra=algebra, label_a=a, label_b=b,
-                                    label_c=c).shape[0]
+                                    label_c=c, atol=atol).shape[0]
                 if n > 0:
                     out.append((a, b, c, n))
     return out

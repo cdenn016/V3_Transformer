@@ -133,7 +133,7 @@ def _build_regime_ii(
     *,
     gauge_mode:         str                       = "learned",   # 'learned' (flat vertex factors) | 'trivial'
     cocycle_relaxation: float                     = 1.0,         # homotopy alpha in [0,1]; 0 -> flat
-    delta_soft_cap:     float                     = 12.0,        # smooth bound on ||delta_ij||_2 (< exp clamp max_norm=15)
+    delta_soft_cap:     float                     = 12.0,        # smooth bound on ||delta_ij . G||_F (< exp clamp max_norm=15)
     mu:                 Optional[torch.Tensor]    = None,        # (B, N, K) QUERY-slot means; the bilinear delta reads these
     connection_W:       Optional[torch.Tensor]    = None,        # (n_gen, K, K) learned bilinear connection (NN exception)
     mu_key:             Optional[torch.Tensor]    = None,        # (B, N, K) KEY-slot means (None -> mu); the filtering
@@ -153,8 +153,8 @@ def _build_regime_ii(
         Omega_ij = exp(phi_i . G) exp(delta_ij . G) exp(-phi_j . G),       i != j,
         Omega_ii = exp(phi_i . G) exp(-phi_i . G) = I (self-edge excluded: delta_ii := 0),
         delta_ij^a = cocycle_relaxation * (mu_i^T W^a mu_j),   a = 1..n_gen,
-        delta_ij -> delta_ij / sqrt(1 + ||delta_ij||^2 / delta_soft_cap^2)   (smooth norm cap),
         delta_ij . G = sum_a delta_ij^a G_a   in g,
+        delta_ij . G -> (delta_ij . G) / sqrt(1 + ||delta_ij . G||_F^2 / delta_soft_cap^2)   (cap),
 
     with ``{G_a} = group.generators``. Because delta is valued in the group's own generator
     coordinates, exp(delta_ij . G) lies in the group by construction (block structure / irrep_dims
@@ -181,11 +181,13 @@ def _build_regime_ii(
     belief means mu and the edge factor is a PER-EDGE K x K matrix exponential -- O(N^2) matrix
     exponentials per build, and the build must be repeated as mu updates across E-step iterations
     (twice per iteration when the phi step runs; ``e_phi_lr=0`` halves the build count). The smooth
-    ``delta_soft_cap`` keeps ||delta . G||_F below ``stable_matrix_exp_pair``'s hard Frobenius
-    clamp (max_norm=15) for the unit-Frobenius orthonormal generator bases the groups ship
-    (||delta . G||_F = ||delta||_2 there), so the exp is always the EXACT operator, the
-    cocycle_relaxation homotopy never saturates, and autograd never optimizes a clamped surrogate
-    (audit 2026-06-10 F3); the hard clamp remains as a backstop for any non-orthonormal basis.
+    ``delta_soft_cap`` is applied to the EMBEDDED matrix Frobenius norm ||delta . G||_F (audit
+    2026-06-13 M3), so it keeps the edge factor below ``stable_matrix_exp_pair``'s hard Frobenius
+    clamp (max_norm=15) for EVERY generator basis -- orthonormal (Gram=I: glk/block_glk, where it is
+    value-equivalent to the old coordinate cap: analytically equal, ~5e-7 fp32 op-reorder) and the orthogonal-but-not-orthonormal towers
+    (so_n/sp_n, where the old coordinate cap underbounded the operator and the exp silently fell back
+    to the clamped surrogate). The exp is therefore always the EXACT operator, the cocycle_relaxation
+    homotopy never saturates, and autograd never optimizes a clamped surrogate.
 
     Returns the SAME dict shape as the flat builder: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K),
     'Omega' (B,N,N,K,K).
@@ -220,16 +222,23 @@ def _build_regime_ii(
     n_tok = delta.shape[1]
     eye = torch.eye(n_tok, dtype=torch.bool, device=delta.device)
     delta = delta.masked_fill(eye.view(1, n_tok, n_tok, 1), 0.0)
-    # Smooth per-edge norm cap (audit 2026-06-10 F3): delta is QUADRATIC in the unconstrained mean
-    # scale (||delta|| ~ ||mu_i|| ||mu_j|| ||W||). delta -> delta * rsqrt(1 + ||delta||^2/cap^2)
-    # bounds ||delta||_2 < delta_soft_cap, is the identity map to O(||delta||^2/cap^2) near zero
-    # (the W=0 oracle and d Omega/d W at W=0 are untouched), and is STRICTLY monotone in
-    # cocycle_relaxation everywhere -- the homotopy never saturates, unlike the hard matrix clamp
-    # it pre-empts.
-    sq = delta.pow(2).sum(dim=-1, keepdim=True)
-    delta = delta * torch.rsqrt(1.0 + sq / (delta_soft_cap * delta_soft_cap))
     # delta_ij . G = sum_a delta_ij^a G_a  -> (B, N, N, K, K) Lie-algebra edge matrix
     delta_mat = torch.einsum("bija,akl->bijkl", delta, generators)
+    # Smooth per-edge cap on the EMBEDDED MATRIX Frobenius norm (audit 2026-06-13 M3, supersedes the
+    # 2026-06-10 F3 coordinate-norm cap). stable_matrix_exp_pair's exactness needs ||delta . G||_F <
+    # max_norm; that equals ||delta||_2 ONLY for orthoNORMAL bases (Gram=I: glk/block_glk). For the
+    # orthogonal-but-not-orthonormal towers (so_n/sp_n: Gram diag up to ~12) the old coordinate cap
+    # left ||delta . G||_F = sqrt(Gram)*||delta||_2 ABOVE the hard clamp, so the edge exp silently
+    # became the clamped surrogate. Capping the embedded operator's Frobenius norm directly bounds it
+    # below max_norm for ANY basis. delta is QUADRATIC in the unconstrained mean scale; the squared
+    # norm (pow(2).sum, NO sqrt) keeps the cap's gradient finite at delta_mat=0 (the W=0 oracle and
+    # d Omega/d W at W=0 are untouched -- the zero-norm NaN-grad trap), the map is the identity to
+    # O(||M||_F^2/cap^2) near zero and STRICTLY monotone in cocycle_relaxation (the homotopy never
+    # saturates). For block_glk (Gram=I) ||delta . G||_F == ||delta||_2, so this is value-equivalent
+    # to the old coordinate cap (analytically equal; ~5e-7 fp32 op-reorder from embed-then-cap), and
+    # regime_ii is opt-in -- the default flat transport never reaches this builder at all.
+    fro_sq = delta_mat.pow(2).sum(dim=(-2, -1), keepdim=True)
+    delta_mat = delta_mat * torch.rsqrt(1.0 + fro_sq / (delta_soft_cap * delta_soft_cap))
     # Per-edge group element exp(delta_ij . G); reuse the stable block-exp machinery
     # (only_forward: the edge factor enters Omega once, no exp(-delta) needed). exp_dim keys the
     # float64-island decision on the dimension actually exponentiated -- the per-head block --
@@ -391,10 +400,11 @@ def compute_transport_operators(
     (glk/block_glk/sp_n; skew_symmetric=False) Omega is not orthogonal and cond(Omega)
     grows like exp(2 ||phi_matrix||); at the phi retraction's default max_norm=5.0 a
     draw can reach cond ~1e7-1e10, and the full-covariance sandwich Omega Sigma Omega^T
-    SQUARES it, so a gaussian_full run at fp32 can lose all significant digits there.
-    Compact so towers give orthogonal Omega (cond = 1) and are unaffected. No guard is
-    imposed here — bound phi via the retraction max_norm, or prefer a compact group /
-    diagonal family when conditioning matters at fp32.
+    SQUARES it. ``transport_covariance`` evaluates that full-covariance sandwich in a
+    float64 island (audit 2026-06-13 M4) so the squared conditioning no longer loses all
+    fp32 digits; compact so towers give orthogonal Omega (cond = 1) and are unaffected.
+    Omega itself is still built at the working dtype here, so for extreme draws prefer a
+    compact group / diagonal family or bound phi via the retraction max_norm.
     """
     B, N, _ = phi.shape
     generators = group.generators
@@ -546,7 +556,19 @@ def transport_covariance(
     is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
     if is_diag:
         return torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega, omega, sigma)
-    return torch.einsum("...ijkl,...jlm,...ijnm->...ijkn", omega, sigma, omega)
+    # Full-covariance congruence sandwich Omega Sigma Omega^T SQUARES cond(Omega) (audit 2026-06-13
+    # M4). Evaluate the contraction in a float64 island (like the matrix-exp upcast) then cast back:
+    # this CORRECTLY-ROUNDS the sandwich (removes the fp32 sum-over-l,m accumulation error), so the
+    # fp32-stored result is the best fp32 representation of the true sandwich. NOTE this does not
+    # rescue the EXTREME regime: for the non-compact groups (glk/block_glk/sp_n) cond(Omega) ~
+    # exp(2||phi||) can reach ~1e6 at the retraction's default max_norm=5, and the squared sandwich
+    # (~1e12) is then unrepresentable in fp32 STORAGE regardless of compute precision -- bound ||phi||
+    # or use a compact group / diagonal family there. Reached only on the full-covariance path
+    # (family='gaussian_full'); the diagonal default above and the compact (orthogonal Omega, cond=1)
+    # groups are untouched, so the hot path is unchanged.
+    out = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
+                       omega.double(), sigma.double(), omega.double())
+    return out.to(sigma.dtype)
 
 
 def _factored_diagonal_covariance(

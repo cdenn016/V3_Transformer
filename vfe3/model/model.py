@@ -641,6 +641,14 @@ class VFEModel(nn.Module):
         # empirical-Bayes centroid (grad flows through this KL(s||r) term). The manuscript-pure
         # token-dependent top-down shadow r_i=Omega_tilde[s^(s+1)] still awaits the scale-(s+1)
         # meta-agent (not built).
+        # TRANSPARENCY (audit 2026-06-13 L17/L18): both s-channel blocks below are gated on
+        # `not s_e_step`. Under s_e_step=True the SAME hyper-prior/gamma objective is realized as the
+        # E-step descent direction that refines s (in _refine_s), so scoring it here too would
+        # double-count -- the assembled scalar loss is then deliberately NOT literally
+        # F + lambda_h KL(s||r) + gamma-block (consistent EM, not an omission). When scored
+        # (s_e_step=False) the s-channel blocks reduce with mean() (per-position) while the belief
+        # channel sums (free_energy.py); lambda_h / gamma_coupling are calibrated against that
+        # per-position scale, a fixed 1/(B*N) relative to the sum-reduced belief block.
         if self.cfg.lambda_h > 0.0 and not self.cfg.s_e_step:
             # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
             # lines 1241-1249): L += lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
