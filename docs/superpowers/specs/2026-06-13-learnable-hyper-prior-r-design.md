@@ -34,13 +34,12 @@ A single new toggle, default-off, mirroring the existing `s`-table treatment.
 
 ### `vfe3/config.py`
 - New field `learnable_r: bool = False` (default = current frozen behavior).
-- `__post_init__` guard warning: fire `warnings.warn(...)` when **all** hold —
-  `learnable_r=True`, `r` is consumed by the forward hyper-prior term
-  (`lambda_h > 0 and not s_e_step`), and `s` is not data-anchored
-  (`prior_source != 'model_channel'`). In that regime the only force on `s`/`r` is
-  `KL(s||r)`, so a free `r` collapses it. Note: `s_e_step` already requires
-  `model_channel` (anchored, no warning); `gamma`-only without `model_channel` still
-  collapses (warned).
+- `__post_init__` guards (both gated on `learnable_r and not s_e_step`):
+  - **Inert** (`lambda_h == 0`): `r` is created only under `lambda_h>0 or s_e_step`, so with
+    `lambda_h=0` (e.g. `gamma`-only) the toggle silently does nothing — warn it has no effect.
+  - **Collapse** (`lambda_h > 0` and `prior_source != 'model_channel'`): the only force on `s`/`r`
+    is `KL(s||r)`, whose joint optimum is `s_i=r=const` (collapse) — warn. `s_e_step` already
+    requires `model_channel` (anchored); `gamma`-only without `model_channel` still collapses (warned).
 
 ### `vfe3/model/prior_bank.py`
 - `PriorBank.__init__` gains `learnable_r: bool = False`.
@@ -57,10 +56,12 @@ A single new toggle, default-off, mirroring the existing `s`-table treatment.
 
 ### `vfe3/train.py` `build_optimizer`
 - When `pb.r_mu` exists **and** `pb.r_mu.requires_grad` is True, append groups
-  `r_mu` @ `m_mu_lr` and `r_sigma_log` @ `m_sigma_lr` (mirroring the `s` tables; shared
-  `weight_decay`). The exact-coverage guard then passes — a trainable `r` *must* be grouped
-  or it would silently never update. Frozen `r` stays exempt (guard skips non-trainable
-  params). Docstring note updated.
+  `r_mu` @ `m_mu_lr` and `r_sigma_log` @ `m_sigma_lr` with **`weight_decay=0.0`**: `r` is a
+  hyper-prior *centroid* (a prior), not capacity — L2-decaying it would pull the learned centroid
+  toward the degenerate `(r_mu=0, r_sigma=1)` fixed point and corrupt the `KL(s||r)` m-projection,
+  so it carries the same decay-exemption the unigram-bias prior and gauge frame already do. The
+  exact-coverage guard then passes — a trainable `r` *must* be grouped or it would silently never
+  update. Frozen `r` stays exempt (guard skips non-trainable params). Docstring note updated.
 
 ## Testing (`tests/test_hyperprior.py`)
 - Regression pin: `learnable_r=False` (default) -> `r` frozen, ungrouped, `grad is None`.

@@ -115,6 +115,7 @@ class VFEModel(nn.Module):
             decode_chunk_size=cfg.decode_chunk_size,
             lambda_h=cfg.lambda_h, gamma_coupling=cfg.gamma_coupling,
             prior_source=cfg.prior_source, s_e_step=cfg.s_e_step,
+            learnable_r=cfg.learnable_r,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.
@@ -636,8 +637,10 @@ class VFEModel(nn.Module):
                 coupling = coupling.sum(dim=-1)                # sum_k alpha^(k) D^(k) -> per-token
             sc = coupling.mean()                               # mean over batch and tokens (B, N)
             loss = loss + cfg.mstep_self_coupling_weight * sc
-        # TODO(B): the frozen global r here becomes a per-token top-down shadow once the meta-agent
-        # (scale-(s+1)) exists. See docs/superpowers/specs/2026-06-08-live-s-model-channel-design.md.
+        # TODO(B): the global r here is frozen by default; cfg.learnable_r=True trains it as an
+        # empirical-Bayes centroid (grad flows through this KL(s||r) term). The manuscript-pure
+        # token-dependent top-down shadow r_i=Omega_tilde[s^(s+1)] still awaits the scale-(s+1)
+        # meta-agent (not built).
         if self.cfg.lambda_h > 0.0 and not self.cfg.s_e_step:
             # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
             # lines 1241-1249): L += lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
