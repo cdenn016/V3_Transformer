@@ -390,3 +390,24 @@ def test_l16_free_energy_terms_metric_requires_tau():
         get_metric("free_energy_terms")(self_div=sd, energy=e, beta=b, alpha=a)
     out = get_metric("free_energy_terms")(self_div=sd, energy=e, beta=b, alpha=a, tau=2.0)
     assert isinstance(out, dict)
+
+
+# ---------------------------------------------------------------------------
+# L20 — CGCoupling must thread a single atol through BOTH cg_selection (n_mult) and the
+#       per-triple cg_intertwiners buffer build, so the prune and the multiplicities agree
+# ---------------------------------------------------------------------------
+def test_l20_cg_coupling_threads_atol_consistently():
+    from vfe3.geometry.groups import get_group
+    from vfe3.model.cg_coupling import CGCoupling
+
+    # SO(3) tower with a self-coupling triple (l1 x l1 -> l2 exists), K = 2*3 + 5 = 11
+    g = get_group("so_n")(11, group_n=3, irrep_spec=[("l1", 2), ("l2", 1)])
+    base = CGCoupling(3, "so", g.irrep_dims, g.irrep_labels)          # default atol (param present)
+    assert len(base.paths) > 0
+    # an explicit default-equal atol must give an identical path set (the param is threaded, not
+    # ignored); a non-default atol in the clean-gap regime must stay consistent (cg_selection's
+    # n_mult and the buffer leading dim agree -- no mismatch crash, same count)
+    same = CGCoupling(3, "so", g.irrep_dims, g.irrep_labels, atol=1e-8)
+    other = CGCoupling(3, "so", g.irrep_dims, g.irrep_labels, atol=1e-6)
+    assert len(same.paths) == len(base.paths)
+    assert len(other.paths) == len(base.paths)

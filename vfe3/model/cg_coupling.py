@@ -47,7 +47,7 @@ class CGCoupling(nn.Module):
         blocks = list(zip(irrep_labels, starts[:-1], irrep_dims))     # (label, start, d)
 
         # one stacked intertwiner buffer per admissible type triple
-        triples = cg_selection(group_n, algebra=algebra, labels=irrep_labels)
+        triples = cg_selection(group_n, algebra=algebra, labels=irrep_labels, atol=atol)
         self._triple_index = {}
         for t, (a, b, c, _n) in enumerate(triples):
             C = cg_intertwiners(group_n, algebra=algebra,

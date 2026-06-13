@@ -184,7 +184,7 @@ def _build_regime_ii(
     ``delta_soft_cap`` is applied to the EMBEDDED matrix Frobenius norm ||delta . G||_F (audit
     2026-06-13 M3), so it keeps the edge factor below ``stable_matrix_exp_pair``'s hard Frobenius
     clamp (max_norm=15) for EVERY generator basis -- orthonormal (Gram=I: glk/block_glk, where it is
-    byte-identical to the old coordinate cap) and the orthogonal-but-not-orthonormal towers
+    value-equivalent to the old coordinate cap: analytically equal, ~5e-7 fp32 op-reorder) and the orthogonal-but-not-orthonormal towers
     (so_n/sp_n, where the old coordinate cap underbounded the operator and the exp silently fell back
     to the clamped surrogate). The exp is therefore always the EXACT operator, the cocycle_relaxation
     homotopy never saturates, and autograd never optimizes a clamped surrogate.
@@ -234,8 +234,9 @@ def _build_regime_ii(
     # norm (pow(2).sum, NO sqrt) keeps the cap's gradient finite at delta_mat=0 (the W=0 oracle and
     # d Omega/d W at W=0 are untouched -- the zero-norm NaN-grad trap), the map is the identity to
     # O(||M||_F^2/cap^2) near zero and STRICTLY monotone in cocycle_relaxation (the homotopy never
-    # saturates). For block_glk (Gram=I) ||delta . G||_F == ||delta||_2, so this is byte-identical to
-    # the old coordinate cap and the default path is unchanged.
+    # saturates). For block_glk (Gram=I) ||delta . G||_F == ||delta||_2, so this is value-equivalent
+    # to the old coordinate cap (analytically equal; ~5e-7 fp32 op-reorder from embed-then-cap), and
+    # regime_ii is opt-in -- the default flat transport never reaches this builder at all.
     fro_sq = delta_mat.pow(2).sum(dim=(-2, -1), keepdim=True)
     delta_mat = delta_mat * torch.rsqrt(1.0 + fro_sq / (delta_soft_cap * delta_soft_cap))
     # Per-edge group element exp(delta_ij . G); reuse the stable block-exp machinery
@@ -555,13 +556,16 @@ def transport_covariance(
     is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
     if is_diag:
         return torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega, omega, sigma)
-    # Full-covariance congruence sandwich Omega Sigma Omega^T SQUARES cond(Omega). For the
-    # non-compact groups (glk/block_glk/sp_n) cond(Omega) ~ exp(2||phi||) reaches ~1e6 at the
-    # retraction's default max_norm=5, so the squared sandwich blows past fp32's ~1e7 headroom and
-    # loses every significant digit (audit 2026-06-13 M4). Evaluate this contraction in a float64
-    # island (like the matrix-exp upcast) then cast back. Reached only on the full-covariance path
-    # (family='gaussian_full'); the diagonal default above and the compact (orthogonal Omega,
-    # cond=1) groups are untouched, so the hot path is unchanged.
+    # Full-covariance congruence sandwich Omega Sigma Omega^T SQUARES cond(Omega) (audit 2026-06-13
+    # M4). Evaluate the contraction in a float64 island (like the matrix-exp upcast) then cast back:
+    # this CORRECTLY-ROUNDS the sandwich (removes the fp32 sum-over-l,m accumulation error), so the
+    # fp32-stored result is the best fp32 representation of the true sandwich. NOTE this does not
+    # rescue the EXTREME regime: for the non-compact groups (glk/block_glk/sp_n) cond(Omega) ~
+    # exp(2||phi||) can reach ~1e6 at the retraction's default max_norm=5, and the squared sandwich
+    # (~1e12) is then unrepresentable in fp32 STORAGE regardless of compute precision -- bound ||phi||
+    # or use a compact group / diagonal family there. Reached only on the full-covariance path
+    # (family='gaussian_full'); the diagonal default above and the compact (orthogonal Omega, cond=1)
+    # groups are untouched, so the hot path is unchanged.
     out = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
                        omega.double(), sigma.double(), omega.double())
     return out.to(sigma.dtype)
