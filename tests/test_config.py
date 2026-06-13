@@ -97,7 +97,7 @@ def test_config_model_defaults():
     cfg = VFE3Config()
     assert cfg.embed_dim == 64 and cfg.n_heads == 8 and cfg.n_layers == 1
     assert cfg.gauge_group == "block_glk" and cfg.decode_mode == "diagonal"
-    assert cfg.use_prior_bank is True
+    assert cfg.use_prior_bank is False              # default is the linear-decode ablation (VFE_2.0 parity)
 
 
 def test_tau_is_kappa_sqrt_d_head():
@@ -162,10 +162,10 @@ def test_config_rejects_omega_direct_gauge_parameterization():
 def test_config_accepts_use_prior_bank_false():
     """use_prior_bank=False is the live linear-projection decode ablation (VFE_2.0 parity):
     encode/self-coupling stay on the PriorBank, only decode becomes a plain mu->logits
-    projection. It must construct cleanly (no NotImplementedError); the default stays True."""
-    assert VFE3Config().use_prior_bank is True
-    cfg = VFE3Config(use_prior_bank=False)
-    assert cfg.use_prior_bank is False
+    projection. It must construct cleanly (no NotImplementedError); it is the current default."""
+    assert VFE3Config().use_prior_bank is False
+    cfg = VFE3Config(use_prior_bank=True)
+    assert cfg.use_prior_bank is True
 
 
 def test_config_rejects_gauge_fixed_encode():
@@ -217,14 +217,20 @@ def test_per_coord_alpha_requires_renyi_functional():
 def test_decode_mode_full_rejects_diagonal_family():
     # 'full' KL-decode consumes a (B,N,K,K) sigma; with a diagonal family (sigma (B,N,K)) it is a
     # shape crash at the first prior-bank forward -- reject at construction (the shipped-arm direction).
+    # use_prior_bank=True: the rank check is a PRIOR-BANK decode constraint (linear decode ignores
+    # decode_mode; that skip is covered by test_decode_mode_family_cross_check_skipped_under_linear_decode).
     with pytest.raises(ValueError):
-        VFE3Config(family="gaussian_diagonal", diagonal_covariance=True, decode_mode="full")
+        VFE3Config(family="gaussian_diagonal", diagonal_covariance=True, decode_mode="full",
+                   use_prior_bank=True)
 
 
 def test_decode_mode_diagonal_rejects_full_family():
     # The reverse rank mismatch: a full family (sigma (B,N,K,K)) fed to a diagonal decode kernel.
+    # use_prior_bank=True: the rank check is a prior-bank decode constraint (see the linear-decode
+    # skip test below).
     with pytest.raises(ValueError):
-        VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="diagonal")
+        VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="diagonal",
+                   use_prior_bank=True)
 
 
 def test_decode_mode_family_cross_check_skipped_under_linear_decode():

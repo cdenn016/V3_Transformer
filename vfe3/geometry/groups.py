@@ -37,7 +37,7 @@ class GaugeGroup:
     generators:         torch.Tensor          # (n_gen, K, K) Lie-algebra basis
     irrep_dims:         List[int]             # block sizes; sum == K
     skew_symmetric:     bool                  # exp(-M) = exp(M)^T fast path
-    invariant_families: Tuple[str, ...] = ("gaussian",)
+    invariant_families: Tuple[str, ...] = ("gaussian", "gaussian_full")  # exactly invariant under the GL(K) congruence; the diagonal readout is NOT (see check_admissible)
     irrep_labels:       Optional[List[str]] = None # per-block label ('l1', 'sym2', ...); None = label-less
     algebra:            Optional[str] = None  # irrep-registry algebra key ('so' | 'sp'); None = label-less
 

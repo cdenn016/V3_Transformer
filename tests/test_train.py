@@ -11,8 +11,10 @@ from vfe3.train import build_optimizer, evaluate, lr_lambda, train, _floor_lr_la
 
 
 def test_optimizer_groups_priors_by_m_lr():
+    # use_prior_bank=True: the prior-bank decode has no output_proj_weight group, so the four prior
+    # tables map to exactly four LR groups (the linear-decode default adds an output_proj group).
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
-                     m_mu_lr=0.01, m_sigma_lr=0.002, m_phi_lr=0.005)
+                     m_mu_lr=0.01, m_sigma_lr=0.002, m_phi_lr=0.005, use_prior_bank=True)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     lrs = sorted(g["lr"] for g in opt.param_groups)

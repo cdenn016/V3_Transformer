@@ -24,6 +24,8 @@ def _model(e_step_gradient="unroll", detach_e_step=False, **over):
         n_e_steps=2, e_mu_lr=0.1, e_sigma_lr=0.02, e_phi_lr=0.0,
         gradient_mode="filtering", e_step_gradient=e_step_gradient,
         detach_e_step=detach_e_step,
+        use_prior_bank=True,    # these grad-flow checks observe encode tables via the KL-to-prior
+        #                         decode (the default is now the linear-decode ablation)
     )
     cfg.update(over)
     return VFEModel(VFE3Config(**cfg))

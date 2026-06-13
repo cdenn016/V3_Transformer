@@ -66,14 +66,14 @@ def test_causal_alibi_is_not_symmetric():
 
 
 def test_default_slope_matches_alibi():
-    # Default n_heads=1, alibi_slope=1.0: Press slope for h=1,H=1 is 2^(-8).
-    # On the diagonal dist=0 so bias is 0; one step below: -2^(-8) * 1.
+    # Default n_heads=1, alibi_slope=0.5: Press slope for h=1,H=1 is 2^(-8), scaled by base 0.5.
+    # On the diagonal dist=0 so bias is 0; one step below: -0.5 * 2^(-8) * 1.
     import math
     H, n = 1, 3
-    B = attention_log_prior("causal_alibi", n, n)   # default n_heads=1, alibi_slope=1.0
+    B = attention_log_prior("causal_alibi", n, n)   # default n_heads=1, alibi_slope=0.5
     assert B.shape == (H, n, n)
     assert B[0, 1, 1].item() == 0.0
-    expected = -(2.0 ** -8.0)                       # _press_slopes(1, 1.0)[0] * 1 step
+    expected = -(0.5 * 2.0 ** -8.0)                 # _press_slopes(1, 0.5)[0] * 1 step
     assert torch.isclose(B[0, 1, 0], torch.tensor(expected), atol=1e-6)
 
 

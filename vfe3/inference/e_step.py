@@ -157,8 +157,8 @@ def free_energy_value(
     tau:                       'float | torch.Tensor' = 1.0,
     alpha_div:                 float = 1.0,
     value:                     float = 1.0,
-    b0:                        float = 1.0,
-    c0:                        float = 1.0,
+    b0:                        'float | torch.Tensor' = 1.0,   # scalar, or (K,) per-coord for state_dependent_per_coord
+    c0:                        'float | torch.Tensor' = 1.0,   # scalar, or (K,) per-coord
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
@@ -320,8 +320,8 @@ def e_step_iteration(
     e_phi_lr:                  float = 0.1,
     alpha_div:                 float = 1.0,
     value:                     float = 1.0,
-    b0:                        float = 1.0,
-    c0:                        float = 1.0,
+    b0:                        'float | torch.Tensor' = 1.0,   # scalar, or (K,) per-coord for state_dependent_per_coord
+    c0:                        'float | torch.Tensor' = 1.0,   # scalar, or (K,) per-coord
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,

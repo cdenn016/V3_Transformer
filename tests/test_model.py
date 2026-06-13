@@ -90,8 +90,11 @@ def test_detach_e_step_with_phi_runs_and_reaches_decode_priors():
     # under its own enable_grad island, so the blanket no_grad does not strangle it.
     # Under detach the E-step is severed, so priors are reached only via decode (mu/sigma);
     # phi_embed is frozen (no gradient path) -- pin both as the as-built semantics.
+    # use_prior_bank=True: the mu prior (mu_embed) is reached because the KL-to-prior decode scores
+    # against it; the linear-decode default would leave mu_embed grad None under a severed E-step.
     cfg = VFE3Config(vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
-                     n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.02, detach_e_step=True)
+                     n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.02, detach_e_step=True,
+                     use_prior_bank=True)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 15, (2, 4)); targets = torch.randint(0, 15, (2, 4))
     _, loss, _ = model(tokens, targets)

@@ -36,8 +36,8 @@ from vfe3.data.datasets import TokenWindows, make_dataloader
 from vfe3.train import _fmt_tau, evaluate, train
 
 
-# --- click-to-run knobs -------------------------------------------------------
-SEED = 6
+
+
 
 # Cached tokenized corpus (gpt2/tiktoken -> vocab_size 50257) or the zero-dependency
 # synthetic anchor. Caches live in ~/.cache/tokenized_cache.
@@ -51,29 +51,76 @@ MAX_TOKENS = None
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# --- full config: every VFE3Config toggle, grouped as in vfe3/config.py --------
-# Edit any field, then run. Values are the wikitext-103 (real-corpus) defaults.
-# Registry fields list their valid keys inline; cross-field constraints are noted.
 config = dict(
     
 
-    # model structure
+    #################################
+    #            Training
+    #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 2,
+    embed_dim                 = 140,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 7,
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 64,
-    max_steps                 = 15000,
+    batch_size                = 16,
+    max_steps                 = 120000,
     
     n_layers                  = 1,                   # L, number of blocks
-    n_e_steps                 = 2,                   # T, E-step inner iterations
+    n_e_steps                 = 1 ,                   # T, E-step inner iterations
     
+    seed                      = 6,
+    warmup_steps              = 100,
     
+    #################################
+    # f-divergence and e/m family
+    #################################
+    
+    divergence_family         = "renyi",   # "renyi" only
+    alpha_div                 = 1.0,       # Renyi order (1.0 -> KL)
 
-    # gauge seam
+    diagonal_covariance       = True,                # diagonal_covariance MUST equal (family == "gaussian_diagonal")
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
+    
+    #################################
+    #        Initialization
+    #################################
+    mu_init_std               = 0.065,     # std of the random mean table mu_embed
+    sigma_init                = 3,         # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale                 = 0.06,      # std
+    
+    
+    #################################
+    #        Encode/Decode          #
+    #################################
+    decode_bias               = True,     # only if use_prior_bank = False
+    use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+                                           # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
+    
+    use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
+                                                     # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
+    decode_tau                = 0.1,
+    decode_mode               = "diagonal_chunked",  # "diagonal" | "diagonal_chunked" | "full"; chunked = fused streaming
+                                                     # CE on the training path, never materializes (B,N,V) logits -- works
+                                                     # for BOTH use_prior_bank paths (vram audit 2026-06-11), saves ~2x
+                                                     # B*N*V fp32 retained for backward at identical loss/grads
+    decode_chunk_size         = 8192,                # vocab-chunk width for decode_mode="diagonal_chunked" (ignored otherwise)
+    encode_mode               = "per_token",         # "per_token" | "gauge_fixed" (gauge_fixed: live-rejected stub)
+
+ 
+    #################################
+    #          Gauge Group
+    #################################
+    gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
+    
+    m_phi_natural_grad        = False,        # natural gradient on phi m-step
+    
+    phi_precond_mode          = "killing_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
+    phi_retract_mode          = "bch",                # "euclidean" | "bch"
+    spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
+
+    
     gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
                                                      # tied_block_glk: one shared GL(d) frame across heads (kron(I_n, gl(d)))
 
@@ -91,131 +138,141 @@ config = dict(
     #   so_n: group_n=3, irrep_spec=[("l2", 4)]                            # 4 equal spin-2 heads (mixer OK)
     #   so_n: group_n=3, irrep_spec=[("l0",1),("l1",1),("l3",1),("l4",1)]  # spins 0,1,3,4 = 1+3+7+9 (unequal: mixer = per-head scalar gains)
     #   sp_n: group_n=4, irrep_spec=[("sym2", 2)]                          # 2 equal Sym^2(R^4) heads, dim 10 each
+    
     group_n                   = None,                # so_n/sp_n only: N of SO(N) / 2m of Sp(2m)
     irrep_spec                = None,                # so_n/sp_n only: [(label, mult), ...]; dims sum == embed_dim
 
-    gauge_parameterization    = "phi",               # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
-    use_head_mixer            = True,               # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
-                                                     # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
     use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling (bilinear, exactly
                                                      # equivariant, means-only sigma; zero-init path weights)
 
-    decode_bias               = False,
+    ####################################
+    # Non-Flat Connection - Regime II
+    ####################################
+    transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii"
+                                            # (learned bilinear edge connection; sanctioned NN exception, default-off)
+    cocycle_relaxation        =   1.0,        # regime_ii homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
+    cross_couplings           = None,       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only (None = block-diagonal gauge)
+                                               #if enabled and head-mixer = True or causal_alibi it will fail
+    close_basis               = False,
+    ####################################
+    #       Positional Encoding
+    #    BCH gauge-frame PE (pos_phi)
+    #     gauge-RoPE (pos_rotation)
+    ####################################
 
-    # connection regime (orthogonal to gauge_parameterization)
-    transport_mode            = "flat",              # "flat" (Regime-I phi-cocycle, pure no-NN) | "regime_ii"
-                                                     # (learned bilinear edge connection; sanctioned NN exception, default-off)
-    cocycle_relaxation        = 1.0,                 # regime_ii homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
-    cross_couplings           = None,                # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only (None = block-diagonal gauge)
-
-    # positional encoding -- BCH gauge-frame PE (pos_phi) + gauge-RoPE (pos_rotation)
     pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
+    pos_rotation              = "none",              # "none" | "rope" (block-diagonal positional rotation folded into transport)
     pos_phi_compose           = "bch",               # composition chart: "bch" | "euclidean"
-    
-       
+               
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
     
-    pos_phi_project_slk       = False,               # per-block trace projection (det Omega = 1)
-    
-    pos_rotation              = "none",              # "none" | "rope" (block-diagonal positional rotation folded into transport)
     rope_base                 = 100.0,               # rotary frequency base
     rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES diagonal_covariance=False)
-
-    # belief family -- diagonal_covariance MUST equal (family == "gaussian_diagonal")
-    diagonal_covariance       = True,
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
-
-    # free-energy coupling
+   
     
+    ######################################
+    #                Self Energy:  
+    #        Sum_i alpha_i * KL(q_i||p_i)
+    ######################################
     alpha_mode                = "state_dependent_per_coord",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
     learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
     
-    b0                        = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
-    c0                        = 1.0,                 # state-dependent alpha shape (numerator)
+    b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
+    c0                         = 1.0,                 # state-dependent alpha shape (numerator)
+       
+    alpha                      = 1,                   # constant self-coupling value
+    lambda_h                   = 0.25,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
+    
+    # Further Regularizers
+    mass_phi                   = 0.0,       # (mass_phi/2) ||phi||^2 penalty
+    mstep_self_coupling_weight = 0.00,      # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
     
     
-    kappa                     = 1.0,                 # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    ##################################################
+    #              Attention Energy: 
+    # lambda_beta*Sum_i beta_ij * KL(q_i||Omega_ij q_j) 
+    ##################################################
+    
+    lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)    
+    gamma_coupling             = 0.75,       # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
+         
 
-    alpha                     = 1.0,                 # constant self-coupling value
-    lambda_beta               = 1.0,                 # belief-coupling block weight (1.0 = pure F; VFE_2.0 lambda_align)
-    mass_phi                  = 0.0,                 # (mass_phi/2) ||phi||^2 penalty
-    mstep_self_coupling_weight = 0.00,                # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    ########################################
+    #     Attention Belief/Model Settings
+    #            & Temperatures
+    ########################################
     
+    kappa                     = 1,        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa_gamma               = 1,        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
+        
+    attention_prior           = "causal_alibi",  # "uniform" | "causal" | "causal_alibi" | "causal_windowed
+    gamma_attention_prior     = "causal",        # model-channel prior pi^s_ij: # "t5_relative_bias" | "windowed"
+
     
-    lambda_h                  = 0.0,           # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
-    gamma_coupling            = 0.0,                 # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
-    kappa_gamma               = 1.0,                 # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
-    gamma_attention_prior     = "causal",            # model-channel prior pi^s_ij: "uniform" | "causal" | "alibi"
-    prior_source              = "token",             # which table supplies the belief prior p_i: "token" | "model_channel"
-
-    # attention
-    include_attention_entropy = True,                # canonical F (True) vs entropy-suppressed surrogate (False)
-    attention_prior           = "causal",            # "uniform" | "causal" | "alibi"
-
-    # E-step
+    #################################
+    #         Belief E-step 
+    #         Learning Rates
+    #################################
+    
     e_mu_lr                   = 0.9,
     e_sigma_lr                = 0.001,
-    e_phi_lr                  = 0.0,
+    e_phi_lr                  = 0.0,     
+    
+    
+    ####################################
+    #       Model E-step LR's
+    #      If s_e_step = True
+    # and prior_source = 'model_channel'
+    ####################################
+    
+    prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"    
+    s_e_step                  = True,
+    e_s_mu_lr                 = 0.85,
+    e_s_sigma_lr              = 0.1,
+    
+    #################################
+    #    Embedding/Priors M-step 
+    #        Learning Rates
+    #################################
+        
+    m_mu_lr                   = 0.015,   
+    m_sigma_lr                = 0.0035,     
+    m_phi_lr                  = 0.015,   
+    
+    weight_decay              = 0.02,
+    phi_weight_decay          = 0.05,
+    
+    min_lr                    = 0,       # absolute cosine-decay LR floor (0.0 = pure cosine)
+    min_lr_frac               = 0.01,    # proportional LR floor, max(min_lr, frac*base); OFF
+    
+    #################################
+    #     Layer Normalization 
+    #        and Hand-Off
+    #################################
+    
+    norm_type_block           = "none",              # "none" | "mahalanobis"
+    norm_type_final           = "none",              # "none" | "mahalanobis"
+    
+    prior_handoff_rho         = 0,                 # 1.0 = full flow; 0.0 = priors frozen
+    prior_handoff_sigma       = 0,                 # sigma damping in [0,1] (0.0 = frozen at embedding)
+    
+    #################################
+    #        Numerical Safety
+    #################################
     
     e_mu_q_trust              = None,
     e_sigma_q_trust           = 10.0,
     sigma_max                 = 10.0,
     
-    gradient_mode             = "filtering",          # "filtering" | "smoothing"
-    
-    m_phi_natural_grad        = False,
-    
-    phi_precond_mode          = "pullback_per_block",         # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
-    phi_retract_mode          = "bch",                # "euclidean" | "bch"
-    spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
-
-    # decode / encode
-    use_prior_bank            = False,                # True: KL-to-prior decode (pure path). False: linear projection
-                                                     # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
-    decode_tau                = 0.1,
-    decode_mode               = "diagonal",          # "diagonal" | "diagonal_chunked" | "full"
-    decode_chunk_size         = 8192,                # vocab-chunk width for decode_mode="diagonal_chunked" (ignored otherwise)
-    encode_mode               = "per_token",         # "per_token" | "gauge_fixed" (gauge_fixed: live-rejected stub)
-
-    # cross-block belief handoff (mu_q -> mu_p)
-    prior_handoff_rho         = 0.0,                 # 1.0 = full flow; 0.0 = priors frozen
-    prior_handoff_sigma       = 0.0,                 # sigma damping in [0,1] (0.0 = frozen at embedding)
-
-    # normalization
-    norm_type_block           = "none",              # "none" | "mahalanobis"
-    norm_type_final           = "none",              # "none" | "mahalanobis"
-
-    # M-step / training
-    e_step_gradient           = "unroll",            # E-step backward: "unroll" | "straight_through" | "detach" (reconciled w/ detach_e_step)
-    detach_e_step             = False,               # False = unroll the E-step in the training graph (True forces effective "detach")
-    grad_accum_steps          = 1,                   # microbatches accumulated before an optimizer step (1 = single-step)
-
-    m_mu_lr                   = 0.015,   
-    m_sigma_lr                = 0.0035,     
-    m_phi_lr                  = 0.015,   
-    
-    mu_init_std               = 0.065,         # std of the random mean table mu_embed
-    sigma_init                = 3,         # constant initial coordinate variance (sigma_log = log of this)
-    phi_scale                 = 0.06,         # std
-    
-    
-    weight_decay              = 0.02,
-    phi_weight_decay          = 0.05,
-    
-    # divergence seam -- the f-divergence FUNCTIONAL (distinct from `family` below)
-    divergence_family         = "renyi",             # "renyi"
-    alpha_div                 = 1.0,                  # Renyi order (1.0 -> KL)
-    
-    warmup_steps              = 100,
-    min_lr                    = 0,                # absolute cosine-decay LR floor (0.0 = pure cosine)
-    min_lr_frac               = 0.01,                 # proportional LR floor, max(min_lr, frac*base); OFF
-    amp_dtype                 = None,                # None=fp32 | 'bf16' , 'fp16'
-    seed                      = SEED,
-    
-    log_interval              = 100,                  # console log every N steps (0 = off)
-    eval_interval             = 1500,                   # periodic validation every N steps (0 = off)
-    checkpoint_interval       = 15000,                  # save a resumable checkpoint every N steps (0 = off)
-    
+    #################################
+    #         Misc/Logging
+    #################################     
+    amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
+        
+    log_interval              = 100,       # console log every N steps (0 = off)
+    eval_interval             = 1500,      # periodic validation every N steps (0 = off)
+    checkpoint_interval       = 25000,     # save a resumable checkpoint every N steps (0 = off)
+               
 )
 
 

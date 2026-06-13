@@ -132,10 +132,11 @@ def warn_if_basis_not_closed(
     generators:  torch.Tensor,            # (n_gen, K, K) fixed gauge generator basis
 
     *,
-    where:       str,                     # call-site label (also the per-site warn-once key)
-    closure_tol: float                  = 1e-4,
-    eps:         float                  = 1e-12,
-    gram_pinv_:  Optional[torch.Tensor] = None,
+    where:        str,                     # call-site label (also the per-site warn-once key)
+    closure_tol:  float                  = 1e-4,
+    eps:          float                  = 1e-12,
+    max_elements: int                    = 50_000_000,  # skip the O(n_gen^2 K^2) scan above this
+    gram_pinv_:   Optional[torch.Tensor] = None,
 ) -> None:
     r"""Warn once (per call site) if ``generators`` is not closed under the Lie bracket.
 
@@ -145,10 +146,21 @@ def warn_if_basis_not_closed(
     nothing is warned; on a non-closed 3+-head ``cross_couplings`` chain it is O(1) and the span
     projection in BCH composition / structure-constants silently truncates the out-of-span part.
     The result depends only on the generators, so it is cached and the hot path pays a dict lookup.
+
+    The bracket scan materializes an ``(n_gen, n_gen, K, K)`` tensor; for large bases (e.g.
+    block_glk at K=140: n_gen=2800 -> ~1.5e11 elements) this would OOM. Such large bases here are the
+    direct-sum block groups, which are bracket-closed BY CONSTRUCTION, so when ``n_gen^2 * K^2``
+    exceeds ``max_elements`` the scan is skipped and the basis is treated as closed (cached, no
+    warning). Non-closed bases in practice are the small cross_couplings chains, which stay well
+    under the budget and are scanned exactly.
     """
     key = id(generators)
     entry = _BRACKET_CLOSURE_RES.get(key)
     if entry is None:
+        n_gen, K = generators.shape[0], generators.shape[-1]
+        if n_gen * n_gen * K * K > max_elements:                  # too large to scan; closed by construction
+            _BRACKET_CLOSURE_RES[key] = [generators, 0.0]
+            return
         with torch.no_grad():
             G    = generators                                                   # (n_gen, K, K)
             brak = torch.einsum("aij,bjk->abik", G, G) - torch.einsum("bij,ajk->abik", G, G)  # [G_a,G_b]
@@ -295,6 +307,8 @@ def compose_bch(
     # in which case the Dynkin commutators leave span{G_a} and the extract_phi projection above drops
     # that part. Closure depends only on the fixed generators, so this never host-syncs the hot E-step
     # nor touches Z's autograd graph (the old per-call float(Z) did both -> the requires_grad warning).
+    # The scan is size-gated (max_elements): large direct-sum bases (e.g. block_glk K=140, the prior
+    # O(K^4) OOM) are skipped as closed-by-construction; small non-closed cross_couplings chains scan.
     warn_if_basis_not_closed(generators, where="compose_bch",
                              closure_tol=closure_tol, eps=eps, gram_pinv_=gram_pinv_)
     return phi
@@ -322,8 +336,8 @@ def _retract_core(
 
     *,
     step_size:    float = 1.0,
-    trust_region: float = 0.1,
-    max_norm:     float = 5.0,
+    trust_region: Optional[float] = 0.1,   # None / <=0 disables the trust-region clamp
+    max_norm:     Optional[float] = 5.0,   # None / <=0 disables the max-norm clamp
     eps:          float = 1e-6,
     order:        int   = 4,
     mode:         str   = "euclidean",
