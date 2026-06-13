@@ -133,11 +133,19 @@ def floor_eigenvalues(
 
 
 def condition_number(
-    matrix: torch.Tensor,                # (..., K, K) symmetric PD
+    matrix: torch.Tensor,                # (..., K, K) symmetric PD OR (..., K) diagonal variances
     *,
     eps:    float = 1e-12,
 ) -> torch.Tensor:                       # (...) lambda_max / lambda_min
-    r"""Spectral condition number lambda_max / lambda_min (clamped at ``eps``)."""
+    r"""Spectral condition number lambda_max / lambda_min (clamped at ``eps``).
+
+    Accepts a full covariance (square trailing dims (..., K, K), via ``eigvalsh``) OR a diagonal
+    variance spectrum (non-square trailing dims (..., K), max/min over the last axis) so the monitor
+    works on the default ``gaussian_diagonal`` family instead of raising on the rank mismatch (audit
+    2026-06-13 L13). The square-trailing test resolves the two for any (..., N, K) with N != K."""
+    if matrix.dim() < 2 or matrix.shape[-1] != matrix.shape[-2]:
+        spec = matrix.float().clamp(min=0.0)
+        return (spec.max(dim=-1).values / spec.min(dim=-1).values.clamp(min=eps)).to(matrix.dtype)
     evals = torch.linalg.eigvalsh(_symmetrize(matrix.float()))
     return (evals[..., -1] / evals[..., 0].clamp(min=eps)).to(matrix.dtype)
 

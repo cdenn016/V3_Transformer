@@ -889,8 +889,12 @@ def get_metric(name: str) -> Callable:
 # metrics' context keys, since ``compute_metrics`` floods the full context to every metric.
 @register_metric("effective_rank")
 def _m_eff_rank(*, sigma: torch.Tensor, **kw) -> float:
-    """Mean spectral effective rank of the belief covariances."""
-    return float(effective_rank(sigma).mean())
+    """Mean spectral effective rank of the belief covariances.
+
+    Routes through ``_spectrum`` so a FULL covariance (..., K, K) is reduced to its eigenvalue
+    spectrum before the participation ratio (audit 2026-06-13 L15); passing the matrix directly
+    treated its rows as a spectrum. A diagonal (..., K) variance tensor is its own spectrum."""
+    return float(effective_rank(_spectrum(sigma)).mean())
 
 
 @register_metric("attention_entropy")
@@ -918,8 +922,13 @@ def _m_gauge_spread(*, phi: torch.Tensor, generators: torch.Tensor, **kw) -> flo
 
 @register_metric("free_energy_terms")
 def _m_free_energy_terms(*, self_div=None, energy=None, beta=None, alpha=None,
-                         tau=1.0, log_prior=None, **kw) -> Dict[str, float]:
-    """Per-term free-energy decomposition (self-coupling, belief-coupling, attention entropy)."""
+                         tau, log_prior=None, **kw) -> Dict[str, float]:
+    """Per-term free-energy decomposition (self-coupling, belief-coupling, attention entropy).
+
+    ``tau`` is REQUIRED (no default): the wrapper has no way to recover the group-aware softmax
+    temperature tau = kappa*sqrt(d_head), and a silent tau=1.0 makes the attention-entropy term (and
+    so ``total``) wrong for any K>1 (audit 2026-06-13 L16). Callers pass ``attention_tau(...)`` -- as
+    the live diagnostics path already does -- matching this module's required-context-key convention."""
     return free_energy_terms(self_div, energy, beta, alpha, tau=tau, log_prior=log_prior)
 
 

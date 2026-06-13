@@ -113,6 +113,11 @@ def build_killing_preconditioner(
     direction) are lifted to ``center_reg`` before inversion. Non-null eigenvalues
     are untouched, so the inverse is EXACT on sl(K) (a ridge center_reg*I is not).
     so(K) (already positive-definite) acquires no regularization. eigh in float64.
+    ASSUMPTION (audit 2026-06-13 L12): the magnitude cut ``|lambda| < tol`` isolates ONLY the
+    intended center because the Killing/trace-form spectrum of the shipped groups is 0 (the center)
+    or O(K) (the semisimple part) -- a clean gap, no genuine eigenvalue near ``tol``. A custom basis
+    with a true small-but-nonzero Killing eigenvalue would have it wrongly lifted; on this inactive
+    opt-in path (mode='none' is the default pure path) that case does not arise for shipped groups.
     Memoized on the generator basis (see ``_KILLING_INV_CACHE``): loop-invariant, so it is
     built once per (basis, center_reg, tol), not per E-step iteration.
     """

@@ -57,8 +57,10 @@ def build_rope_rotation(
     r"""Per-position block-diagonal rotation R(theta) on ``irrep_dims``.
 
     Within a block of size d at offset s, pairs (s+2k, s+2k+1) rotate by
-    theta_{n,k} = n * base^{-2k/d}; an odd leftover coordinate stays identity. The result is
-    orthogonal and block-diagonal, so it preserves the block-diagonal exp fast path.
+    theta_{n,k} = n * base^{-2k/d}; an odd-dim block's leftover last coordinate stays identity and is
+    therefore POSITIONALLY INERT (it carries zero positional content) -- a future un-gating of rope
+    onto an odd-dim block must not assume full positional coverage (audit 2026-06-13 L21). The result
+    is orthogonal and block-diagonal, so it preserves the block-diagonal exp fast path.
     """
     pos = positions.to(device=device, dtype=dtype)                 # (N,)
     K = int(sum(irrep_dims))

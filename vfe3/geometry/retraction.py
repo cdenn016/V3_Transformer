@@ -82,8 +82,26 @@ def _eigh_damped(A: torch.Tensor, gap_eps: float = 1e-8) -> Tuple[torch.Tensor, 
     r"""``(eigenvalues, eigenvectors)`` of symmetric ``A`` with a gap-regularized backward (see
     :class:`_EighDamped`). Drop-in for ``torch.linalg.eigh`` on the full-cov SPD retraction paths so a
     degenerate spectrum (the ``Sigma = I`` default init) yields finite -- not NaN -- gradients on the
-    unrolled E-step. ``gap_eps`` bounds the worst-case gap factor at ``1/(2 sqrt(gap_eps))``."""
+    unrolled E-step. ``gap_eps`` bounds the worst-case gap factor at ``1/(2 sqrt(gap_eps))``; the
+    retraction call sites pass a spectrum-relative value via :func:`_rel_gap_eps`."""
     return _EighDamped.apply(A, gap_eps)
+
+
+def _rel_gap_eps(
+    A:     torch.Tensor,
+
+    *,
+    rel:   float = 1e-6,
+    floor: float = 1e-12,
+) -> float:                                # gap regularizer scaled to A's spectrum
+    r"""Spectrum-relative ``gap_eps`` for :func:`_eigh_damped` on the SPD retraction paths (audit
+    2026-06-13 L11). The fixed ``gap_eps=1e-8`` over-damps the eigh adjoint ``F_ij = 1/(w_j - w_i)``
+    for MEANINGFUL gaps near the variance floor -- a resolvable gap of 1e-4 is biased ~50%. Scaling
+    to ``(rel * ||A||_max)^2`` -- the squared fp32 noise floor of the spectrum -- damps only gaps
+    below fp32 resolution (true degeneracy stays finite, ``F = 0``) and leaves resolvable gaps
+    accurate. ``rel`` is a few machine epsilons; ``floor`` keeps a tiny near-zero spectrum finite."""
+    scale = float(A.detach().abs().max())
+    return max(floor, (rel * scale) ** 2)
 
 
 def retract_spd_diagonal(
@@ -144,7 +162,7 @@ def retract_spd_full(
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
         delta_sigma = 0.5 * (delta_sigma + delta_sigma.transpose(-1, -2))
 
-        eigenvalues, eigenvectors = _eigh_damped(sigma)
+        eigenvalues, eigenvectors = _eigh_damped(sigma, _rel_gap_eps(sigma))
         eigenvalues = eigenvalues.clamp(min=eps)
         sqrt_eig     = torch.sqrt(eigenvalues)
         inv_sqrt_eig = 1.0 / sqrt_eig
@@ -157,14 +175,14 @@ def retract_spd_full(
             R_norm = torch.linalg.norm(R, ord='fro', dim=(-2, -1), keepdim=True)
             R = R * torch.clamp(trust_region / (R_norm + eps), max=1.0)
 
-        R_eval, R_evec = _eigh_damped(R)
+        R_eval, R_evec = _eigh_damped(R, _rel_gap_eps(R))
         R_eval = R_eval.clamp(-50.0, 50.0)
         exp_R = R_evec * torch.exp(R_eval).unsqueeze(-2) @ R_evec.transpose(-1, -2)
 
         sigma_new = sigma_sqrt @ exp_R @ sigma_sqrt
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
-        eig_new, vec_new = _eigh_damped(sigma_new)
+        eig_new, vec_new = _eigh_damped(sigma_new, _rel_gap_eps(sigma_new))
         eig_new = eig_new.clamp(min=eps, max=sigma_max)      # eigenvalues ARE variances: ONE ceiling
         sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
 
@@ -244,7 +262,7 @@ def retract_logeuclidean_full(
         sigma     = 0.5 * (sigma + sigma.transpose(-1, -2))
         delta_log = 0.5 * (delta_log + delta_log.transpose(-1, -2))
 
-        eigenvalues, eigenvectors = _eigh_damped(sigma)
+        eigenvalues, eigenvectors = _eigh_damped(sigma, _rel_gap_eps(sigma))
         eigenvalues = eigenvalues.clamp(min=eps)
         log_eig = torch.log(eigenvalues)
         log_sigma = eigenvectors * log_eig.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
@@ -256,12 +274,12 @@ def retract_logeuclidean_full(
         M = log_sigma + tangent
         M = 0.5 * (M + M.transpose(-1, -2))
 
-        M_eval, M_evec = _eigh_damped(M)
+        M_eval, M_evec = _eigh_damped(M, _rel_gap_eps(M))
         M_eval = M_eval.clamp(-50.0, 50.0)
         sigma_new = M_evec * torch.exp(M_eval).unsqueeze(-2) @ M_evec.transpose(-1, -2)
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
-        eig_new, vec_new = _eigh_damped(sigma_new)
+        eig_new, vec_new = _eigh_damped(sigma_new, _rel_gap_eps(sigma_new))
         eig_new = eig_new.clamp(min=eps, max=sigma_max)      # eigenvalues ARE variances: ONE ceiling
         sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
 

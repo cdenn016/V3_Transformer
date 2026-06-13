@@ -224,6 +224,13 @@ def check_admissible(
     under a non-diagonal ``g`` (the verifier returns ``False``, correctly) -- the diagonal family is
     admissible only for the diagonal-scaling subgroup. A family with no implemented representation
     raises ``NotImplementedError`` (the extension point: expose its pushforward to widen this check).
+
+    USAGE (audit 2026-06-13 L6): this is a VERIFICATION TOOL, exercised by the admissibility tests
+    (test_admissibility_verifier.py), not a runtime guard wired into model/config construction --
+    the per-build random-sample congruence draws would tax every model build for a contract that
+    holds for all shipped (group, family) pairs. Run it in tests/CI when adding a group or declaring
+    a new ``invariant_families`` entry; ``invariant_for`` is the cheap string-membership check used at
+    runtime.
     """
     if family in ("gaussian", "gaussian_full"):
         diagonal_readout = False

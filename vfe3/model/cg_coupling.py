@@ -32,6 +32,9 @@ class CGCoupling(nn.Module):
         algebra:      str,                       # 'so' | 'sp'
         irrep_dims:   List[int],                 # per-block dims
         irrep_labels: Optional[List[str]],       # per-block labels (REQUIRED non-None)
+
+        *,
+        atol:         float = 1e-8,              # CG null-space solve tolerance (shared with the prune)
     ) -> None:
         super().__init__()
         if irrep_labels is None:
@@ -48,7 +51,8 @@ class CGCoupling(nn.Module):
         self._triple_index = {}
         for t, (a, b, c, _n) in enumerate(triples):
             C = cg_intertwiners(group_n, algebra=algebra,
-                                label_a=a, label_b=b, label_c=c)      # (n_mult, dc, da*db)
+                                label_a=a, label_b=b, label_c=c,
+                                atol=atol)                            # (n_mult, dc, da*db)
             # Stored float64 (the solver's construction precision). A model-wide .float()/
             # .double() converts buffers like everything else; forward re-casts to mu's dtype
             # from the cast cache either way, so numerics follow the RUNTIME dtype -- float64
@@ -78,10 +82,15 @@ class CGCoupling(nn.Module):
                             # gradient forever (audit 2026-06-09 overnight F10/F13/F20).
                             # Prune it at enumeration. Slots that are symmetric or mixed
                             # under copy swap stay (mixed can only arise from an eigh basis
-                            # rotation inside an n_mult > 1 null space and is live).
+                            # rotation inside an n_mult > 1 null space and is live). The prune
+                            # threshold is tied to the CG solve's null-space atol (audit 2026-06-13
+                            # L20): a slot antisymmetric only to ~10*atol from a thin-gap/loosened
+                            # solve must still be pruned, not kept as a near-dead live parameter.
+                            # For the shipped towers the split is clean (antisymmetric ~1e-12 in
+                            # float64 vs symmetric ~O(1)), so this is byte-identical at the default.
                             if sa == sb:
                                 Cm = C64[m].reshape(dc, da, db)
-                                if (Cm + Cm.transpose(-1, -2)).abs().max() < 1e-10:
+                                if (Cm + Cm.transpose(-1, -2)).abs().max() < max(1e-10, 10.0 * atol):
                                     continue
                             self.paths.append((sa, da, sb, db, sc, dc, t, m))
                             self.path_types.append((a, b, c))

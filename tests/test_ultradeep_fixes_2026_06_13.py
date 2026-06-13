@@ -164,19 +164,12 @@ def test_l7_alpha_gt_one_warning_still_fires_outside_switch():
 
 
 # ---------------------------------------------------------------------------
-# L9 — FullGaussian.entropy() must honor the safe_cholesky ok mask (NaN on non-PD)
+# L9 — NOT LANDED. The audit recommended FullGaussian.entropy() return NaN on a non-PD
+# Sigma, but that conflicts with the deliberate, separately-tested robustness contract
+# (tests/test_full_covariance.py::test_full_entropy_survives_non_pd_covariance): entropy
+# mirrors the KL path's jittered-Cholesky robustness (finite, never NaN to the caller, as KL
+# clamps non-PD to kl_max). The deliberate tested design is kept; L9 is overruled.
 # ---------------------------------------------------------------------------
-def test_l9_full_entropy_nan_on_non_pd():
-    K = 3
-    fg = FullGaussian(torch.zeros(K), -5.0 * torch.eye(K))
-    assert math.isnan(float(fg.entropy()))
-
-
-def test_l9_full_entropy_correct_on_pd():
-    K = 3
-    fg = FullGaussian(torch.zeros(K), torch.eye(K))
-    expected = 0.5 * K * math.log(2.0 * math.pi * math.e)
-    assert abs(float(fg.entropy()) - expected) <= 1e-5
 
 
 # ---------------------------------------------------------------------------
@@ -279,3 +272,121 @@ def test_m4_full_cov_sandwich_diagonal_path_unchanged():
     got = transport_covariance(omega, sigma, diagonal_out=True)
     ref = torch.einsum("ijkl,ijkl,jl->ijk", omega, omega, sigma)  # fp32, unchanged
     assert torch.equal(got, ref)
+
+
+# ---------------------------------------------------------------------------
+# L11 — the SPD full retraction's gap-regularized eigh backward must scale gap_eps
+#       to the spectrum so small-but-MEANINGFUL eigenvalue gaps are not over-damped
+# ---------------------------------------------------------------------------
+def _eigh_loss(eigh_fn, A):
+    w, V = eigh_fn(A)
+    return V.sum() + w.sum()
+
+
+def test_l11_rel_gap_eps_keeps_small_meaningful_gaps_accurate():
+    from vfe3.geometry.retraction import _eigh_damped, _rel_gap_eps
+
+    torch.manual_seed(0)
+    K = 4
+    Q, _ = torch.linalg.qr(torch.randn(K, K))
+    base, gap = 2.0, 1e-4
+    evals = torch.tensor([base, base + gap, base + 0.7, base + 1.5])
+    A0 = (Q @ torch.diag(evals) @ Q.transpose(-1, -2)).float()
+    A0 = 0.5 * (A0 + A0.transpose(-1, -2))
+
+    A1 = A0.clone().requires_grad_(True)
+    _eigh_loss(torch.linalg.eigh, A1).backward()
+    g_exact = A1.grad
+
+    A2 = A0.clone().requires_grad_(True)
+    ge = _rel_gap_eps(A2)
+    _eigh_loss(lambda X: _eigh_damped(X, ge), A2).backward()
+    rel_new = float((A2.grad - g_exact).norm() / g_exact.norm())
+    assert rel_new < 1e-2, (rel_new, ge)
+
+    # contrast: the OLD fixed gap_eps=1e-8 over-damps this meaningful 1e-4 gap
+    A3 = A0.clone().requires_grad_(True)
+    _eigh_loss(lambda X: _eigh_damped(X, 1e-8), A3).backward()
+    rel_old = float((A3.grad - g_exact).norm() / g_exact.norm())
+    assert rel_old > 1e-1, rel_old
+
+
+def test_l11_retract_spd_full_still_finite_at_isotropic():
+    from vfe3.geometry.retraction import retract_spd_full
+
+    K = 4
+    sigma = torch.eye(K).reshape(1, K, K).clone().requires_grad_(True)
+    delta = torch.zeros(1, K, K)
+    out = retract_spd_full(sigma, delta)
+    out.sum().backward()
+    assert torch.isfinite(sigma.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# L13 — the SPD condition_number monitor must handle a diagonal (...,K) spectrum
+#       (the default gaussian_diagonal family), not raise on the rank mismatch
+# ---------------------------------------------------------------------------
+def test_l13_condition_number_diagonal_spectrum():
+    from vfe3.numerics import condition_number
+
+    sigma = torch.tensor([[1.0, 2.0, 4.0], [0.5, 0.5, 0.5]])     # (2, 3) diagonal variances, N!=K
+    cond = condition_number(sigma)
+    assert torch.allclose(cond, torch.tensor([4.0, 1.0]), atol=1e-5)
+
+
+def test_l13_condition_number_monitor_diagonal_no_raise():
+    from vfe3.numerics import get_monitor
+
+    sigma = torch.rand(2, 3, 5) + 0.1                            # (B,N,K) diagonal, N=3 != K=5
+    val = get_monitor("condition_number")(sigma)
+    assert math.isfinite(val) and val >= 1.0
+
+
+def test_l13_condition_number_full_matrix_unchanged():
+    from vfe3.numerics import condition_number
+
+    M = torch.diag(torch.tensor([1.0, 2.0, 4.0]))               # (3,3) full SPD, cond 4
+    assert abs(float(condition_number(M)) - 4.0) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# L15 — the registered effective_rank metric must use the eigenvalue spectrum
+#       for a full covariance (not treat matrix rows as a spectrum)
+# ---------------------------------------------------------------------------
+def test_l15_effective_rank_full_cov_uses_eigenvalues():
+    from vfe3.metrics import get_metric, effective_rank, _spectrum
+
+    torch.manual_seed(0)
+    K = 4
+    A = torch.randn(2, K, K)
+    sigma = A @ A.transpose(-1, -2) + torch.eye(K)              # (2,K,K) full covariance
+    got = get_metric("effective_rank")(sigma=sigma)
+    ref = float(effective_rank(_spectrum(sigma)).mean())
+    assert abs(got - ref) < 1e-5
+
+
+def test_l15_effective_rank_diagonal_unchanged():
+    from vfe3.metrics import get_metric, effective_rank
+
+    torch.manual_seed(0)
+    sigma = torch.rand(2, 5, 4) + 0.1                            # (B,N,K) diagonal variances
+    got = get_metric("effective_rank")(sigma=sigma)
+    ref = float(effective_rank(sigma).mean())                    # diagonal: variances ARE the spectrum
+    assert abs(got - ref) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# L16 — the free_energy_terms metric wrapper must require tau (no silent tau=1.0
+#       that drops the group-aware softmax temperature)
+# ---------------------------------------------------------------------------
+def test_l16_free_energy_terms_metric_requires_tau():
+    from vfe3.metrics import get_metric
+
+    sd = torch.zeros(2)
+    e = torch.zeros(2, 2)
+    b = torch.full((2, 2), 0.5)
+    a = torch.ones(2)
+    with pytest.raises(TypeError, match="tau"):
+        get_metric("free_energy_terms")(self_div=sd, energy=e, beta=b, alpha=a)
+    out = get_metric("free_energy_terms")(self_div=sd, energy=e, beta=b, alpha=a, tau=2.0)
+    assert isinstance(out, dict)
