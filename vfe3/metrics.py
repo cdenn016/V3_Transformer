@@ -145,7 +145,9 @@ def free_energy_terms(
     self_coupling = float(self_term.sum())
     belief_coupling = float((beta * energy).sum())
     pi = torch.softmax(log_prior, dim=-1) if log_prior is not None else torch.full_like(beta, 1.0 / beta.shape[-1])
-    entropy = float(tau * (beta * (torch.log(beta.clamp(min=eps)) - torch.log(pi.clamp(min=eps)))).sum())
+    from vfe3.free_energy import _broadcast_tau          # align a per-head (H,) tau to the head axis
+    _tau_e = _broadcast_tau(tau, energy)
+    entropy = float((_tau_e * (beta * (torch.log(beta.clamp(min=eps)) - torch.log(pi.clamp(min=eps))))).sum())
     total = self_coupling + float(lambda_beta) * belief_coupling
     if include_attention_entropy:
         total = total + float(lambda_beta) * entropy

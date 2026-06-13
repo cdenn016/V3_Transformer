@@ -50,6 +50,11 @@ def attention_tau(
     across heads, a per-head (H,) kappa is elementwise. The (H,) tau broadcasts downstream via
     ``_broadcast_tau`` (which also handles device placement against the energy).
     """
+    if isinstance(kappa, torch.Tensor) and kappa.dim() not in (0, 1):
+        raise ValueError(
+            f"kappa tensor must be 0-d (scalar) or 1-d (per-head); got {kappa.dim()}-d "
+            f"shape {tuple(kappa.shape)}"
+        )
     if (isinstance(kappa, torch.Tensor) and kappa.dim() == 1
             and kappa.shape[0] != len(irrep_dims)):
         raise ValueError(

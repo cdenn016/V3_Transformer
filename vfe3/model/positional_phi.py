@@ -137,4 +137,4 @@ def apply_positional_phi(
     # audit 2026-06-10 -- this call pinned ~34 (B, N, K, K) bracket tensors in the unrolled
     # graph). compose_euclidean ignores it; single-block groups pass [K] and stay dense.
     return compose_phi(phi, coords, group.generators, order=order, mode=compose_mode,
-                       block_dims=list(group.irrep_dims))
+                       gram_pinv_=group.gram_pinv(), block_dims=list(group.irrep_dims))

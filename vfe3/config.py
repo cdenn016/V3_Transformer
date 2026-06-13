@@ -12,17 +12,14 @@ from typing import List, Optional, Tuple
 # Seams with a live registry (gauge_group, alpha_mode, attention priors, norms; alongside
 # transport/retraction/positional/divergence) are validated against that registry in __post_init__
 # via tuple(sorted(_REGISTRY)), so a newly registered variant is a valid config value WITHOUT
-# editing this validator (the add-by-registering modularity contract). The static tuples below are
-# the seams WITHOUT a registry, plus the two intentional second-gates (encode/decode modes, whose
-# extra members 'gauge_fixed'/'linear' are reached through use_prior_bank / are NotImplementedError
-# stubs, not through these fields).
+# editing this validator (the add-by-registering modularity contract). phi_precond_mode,
+# phi_retract_mode and pos_phi_compose are ALSO validated against their live registries
+# (phi_preconditioner._PRECOND, lie_ops._COMPOSE) for the same reason, as are encode/decode modes
+# (_ENCODERS/_DECODERS; their extra members 'gauge_fixed'/'linear' are reached through
+# use_prior_bank / are NotImplementedError second-gates after the registry check). The static
+# tuples below are the remaining seams WITHOUT a registry.
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
-_VALID_ENCODE_MODES        = ("per_token", "gauge_fixed")
-_VALID_DECODE_MODES        = ("diagonal", "diagonal_chunked", "full")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
-_VALID_PHI_PRECOND_MODES   = ("none", "clip", "killing", "killing_per_block", "pullback", "pullback_per_block")
-_VALID_PHI_RETRACT_MODES   = ("euclidean", "bch")
-_VALID_POS_PHI_COMPOSE     = ("bch", "euclidean")
 _VALID_PRIOR_SOURCES       = ("token", "model_channel")
 _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
 
@@ -113,6 +110,7 @@ class VFE3Config:
     # embed_dim. One shared per-token phi (n_gen = dim of the algebra) drives every block -- a
     # TIED gauge. Both fields are consumed ONLY by these two groups (rejected otherwise).
     group_n:                   Optional[int] = None
+    
     # annotation reflects the POST-coercion type: __post_init__ also accepts the JSON/TOML
     # round-trip list-of-lists form ([["l1", 3], ...]) and coerces each pair to a tuple.
     irrep_spec:                Optional[List[Tuple[str, int]]] = None
@@ -139,7 +137,9 @@ class VFE3Config:
     # registry.
     pos_phi:                   str   = "learned"      # "none" | "learned" | "frozen"
     pos_phi_compose:           str   = "bch"       # composition chart: bch (default) | euclidean
-    bch_pe_order:              int   = 4           # BCH Dynkin truncation order (compose_phi order)
+    
+    bch_pe_order:              int   = 4           # BCH Dynkin truncation order (compose_phi order) 4 is just as good as 6
+   
     pos_phi_scale:             float = 0.02        # learned-table init scale AND frozen per-position step
     pos_phi_project_slk:       bool  = False       # per-block trace projection (det Omega = 1)
 
@@ -165,6 +165,7 @@ class VFE3Config:
     # use_head_mixer / use_prior_bank (see VFEModel.__init__ and alpha_i.alpha_learnable). At init
     # log_alpha=0 -> alpha=1.0, byte-identical to constant alpha=1.0.
     alpha_mode:                str   = "constant"
+    
     b0:                        'float | List[float]' = 1.0   # state-dependent alpha shape: alpha* = c0/(b0 + D); list -> (K,) per-coord
     c0:                        'float | List[float]' = 1.0   # state-dependent alpha shape (numerator); list -> (K,) per-coord
     kappa:                     'float | List[float]' = 1.0   # sharpness; list (len n_heads) -> per-head tau
@@ -181,9 +182,9 @@ class VFE3Config:
     # backprop through the unrolled E-step -- the spirit of alpha_mode='learnable'. Init 0 ->
     # lambda_beta = 1.0, byte-identical to the constant-1.0 pure path at step 0. Default False keeps
     # the path param-free.
-    learnable_lambda_beta:     bool  = False
+    learnable_lambda_beta:      bool  = False
     
-    mass_phi:                  float = 0.0          # (mass_phi/2) ||phi||^2 penalty
+    mass_phi:                   float = 0.0          # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight: float = 0.0         # alpha_hat: overall scale on M-step sum_i alpha_i D(q_i*||p_i) (0 = OFF; alpha_i = the E-step self-coupling form)
     
     # Hyper-prior weight lambda_h on the model-channel term lambda_h * mean_i KL(s_i||r)
@@ -232,9 +233,12 @@ class VFE3Config:
 
     # attention
     include_attention_entropy: bool  = True         # canonical (True) vs surrogate (False)
+    
     attention_prior:           str   = "causal"
+    
     alibi_slope:               float = 1.0          # base slope for alibi/causal_alibi priors (Press et al. schedule)
     attention_window:          int   = 128          # band half-width for the windowed/causal_windowed priors
+    
     t5_num_buckets:            int   = 32           # t5_relative_bias: relative-position bucket count
     t5_max_distance:           int   = 128          # t5_relative_bias: log-bucketing horizon (beyond -> last bucket)
 
@@ -252,16 +256,19 @@ class VFE3Config:
     e_s_mu_lr:                 float = 0.1
     e_s_sigma_lr:              float = 0.1
 
-    e_sigma_q_trust:           float = 5.0
     
     
-    # E-step MEAN trust region (VFE_2.0 parity, default OFF = current unbounded update). When set to
+    
+    # E-step MEAN trust region (default OFF = current unbounded update). When set to
     # a float, every per-iteration mean step delta_mu = e_mu_lr*nat_mu is clamped in sigma-whitened
     # units to at most this many standard deviations (mu_trust_mode='box' per-coord, 'ball' = 2-norm
     # Mahalanobis ball). None reproduces the bare mu = mu - e_mu_lr*nat_mu bit-for-bit. V2's winning
     # run used e_mu_q_trust=5.0, mu_trust_mode='box'.
     e_mu_q_trust:              Optional[float] = None
+    e_sigma_q_trust:           float = 5.0
+    
     mu_trust_mode:             str   = "box"          # "box" | "ball" (consulted only when e_mu_q_trust is not None)
+    
     sigma_max:                 float = 10.0
    
     gradient_mode:             str   = "filtering"
@@ -271,7 +278,7 @@ class VFE3Config:
     spd_retract_mode:          str   = "spd_affine" # SPD covariance retraction geometry (registry key)
 
     # decode / encode
-    use_prior_bank:            bool  = True
+    use_prior_bank:            bool  = False
     decode_bias:               bool  = False  # use_prior_bank=False only: learned per-vocab log-unigram bias on logits=mu_q@W^T+b (zero-init, weight-decay-free). Inert (warns) under use_prior_bank=True.
     decode_tau:                float = 1.0
     decode_mode:               str   = "diagonal"
@@ -322,6 +329,7 @@ class VFE3Config:
     # (smoothing / alpha_div!=1) but the full-covariance eigh/cholesky double-backward can produce NaN
     # gradients, so leave OFF for gaussian_full (or expect NaNs there).
     oracle_unroll_grad:        bool  = False
+    
     m_mu_lr:                   float = 0.025
     m_sigma_lr:                float = 0.0025
     m_phi_lr:                  float = 0.015
@@ -344,6 +352,7 @@ class VFE3Config:
     # default. Everything except the gauge frame (mu/sigma/decode/...) stays on AdamW.
     m_phi_natural_grad:        bool  = False
     m_gauge_momentum:          float = 0.9   # heavy-ball momentum for the natural-gradient gauge step
+    
     weight_decay:              float = 0.05
    
     # SEPARATE AdamW weight decay for the gauge-frame coordinate tables (phi_embed, learned
@@ -371,7 +380,7 @@ class VFE3Config:
     max_steps:                 int   = 15000
     warmup_steps:              int   = 100
     
-    min_lr:                    float = 1e-4         # absolute cosine-decay floor: each group's LR
+    min_lr:                    float = 0         # absolute cosine-decay floor: each group's LR
     #                          never decays below this. 0.0 recovers the pure half-cosine-to-zero.
     
     min_lr_frac:               float = 0.0           # fractional cosine-decay floor (default OFF):
@@ -603,6 +612,51 @@ class VFE3Config:
                     raise ValueError(
                         f"cross_couplings head indices ({a},{b}) out of range [0, {self.n_heads})"
                     )
+            # Cross-coupling's off-block generators destroy the per-head direct sum, so the group
+            # builder reports a SINGLE irrep block [K]: n_heads no longer sets the runtime
+            # attention-head count and the energy is one full-K block. Fail FAST here on the
+            # combinations that would otherwise crash late at VFEModel construction / first forward,
+            # and warn on the semantic shift (cross-coupling audit 2026-06-12). The coherent
+            # single-block cross-coupled gauge itself still runs.
+            import warnings
+            for _pname in ("attention_prior", "gamma_attention_prior"):
+                if getattr(self, _pname) in ("alibi", "causal_alibi"):
+                    raise ValueError(
+                        f"{_pname}={getattr(self, _pname)!r} is incompatible with cross_couplings: an "
+                        f"alibi prior builds an (n_heads, N, N) per-head bias, but cross-coupled "
+                        f"block_glk collapses irrep_dims to a single block [K] (one runtime attention "
+                        f"head). Use a headless prior (uniform/causal/causal_windowed/...) with "
+                        f"cross_couplings."
+                    )
+            if self.use_head_mixer:
+                raise ValueError(
+                    "use_head_mixer=True is incompatible with cross_couplings: cross-coupled block_glk "
+                    "collapses irrep_dims to a single block [K], and the head mixer needs >= 2 blocks "
+                    "to mix. Disable use_head_mixer or remove cross_couplings."
+                )
+            for _name in ("kappa", "kappa_gamma"):
+                if isinstance(getattr(self, _name), (list, tuple)):
+                    raise ValueError(
+                        f"{_name} per-head list is incompatible with cross_couplings: the cross-coupled "
+                        f"group has a single irrep block [K], not n_heads blocks. Use a scalar {_name}."
+                    )
+            if self.family == "gaussian_diagonal":
+                warnings.warn(
+                    "cross_couplings with family='gaussian_diagonal' is an APPROXIMATION: the off-block "
+                    "GL(K) congruence g*Sigma*g^T is not diagonal, so the diagonal readout is not "
+                    "gauge-invariant. family='gaussian_full' (diagonal_covariance=False) is the exact "
+                    "congruence path.",
+                    UserWarning, stacklevel=2,
+                )
+            if self.n_heads > 1:
+                warnings.warn(
+                    f"cross_couplings collapses block_glk to a single irrep block [K]: n_heads="
+                    f"{self.n_heads} no longer sets the attention-head count (runtime is 1 head) and "
+                    f"the softmax temperature shifts from kappa*sqrt(d_head) to kappa*sqrt(K). This is "
+                    f"the coherent single-block cross-coupled gauge; n_heads only partitions the "
+                    f"generators.",
+                    UserWarning, stacklevel=2,
+                )
 
         # belief family. ``family`` selects the covariance-structure divergence kernel
         # (gaussian_diagonal | gaussian_full). ``divergence_family`` is the SEPARATE functional
@@ -665,9 +719,13 @@ class VFE3Config:
         _require(self.prior_source, _VALID_PRIOR_SOURCES, "prior_source")
         # prior-shape knobs (threaded into model._attention_log_prior; audit P9): the windowed
         # band half-width and the T5 bucketing parameters must be positive ints.
-        for name in ("attention_window", "t5_num_buckets", "t5_max_distance"):
+        for name in ("attention_window", "t5_max_distance"):
             if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be an int >= 1, got {getattr(self, name)!r}")
+        # t5_num_buckets needs >= 2: the bucket function uses max_exact = num_buckets // 2, and
+        # num_buckets=1 -> max_exact=0 -> division by zero in the log-bucketing (attention_prior).
+        if not isinstance(self.t5_num_buckets, int) or self.t5_num_buckets < 2:
+            raise ValueError(f"t5_num_buckets must be an int >= 2, got {self.t5_num_buckets!r}")
         for name in ("b0", "c0"):
             _v = getattr(self, name)
             if isinstance(_v, (list, tuple)):
@@ -749,7 +807,8 @@ class VFE3Config:
                     UserWarning, stacklevel=2,
                 )
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
-        _require(self.phi_precond_mode, _VALID_PHI_PRECOND_MODES, "phi_precond_mode")
+        from vfe3.geometry.phi_preconditioner import _PRECOND
+        _require(self.phi_precond_mode, tuple(sorted(_PRECOND)), "phi_precond_mode")
         # The natural-gradient gauge M-step (m_phi_natural_grad=True) carries a POSITION-DEPENDENT
         # metric only under the pullback family ('pullback' / 'pullback_per_block'). With any other
         # phi_precond_mode it degenerates to plain heavy-ball momentum SGD on phi with NO geometric
@@ -767,30 +826,12 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
-        # Dead-knob disclosure (vram audit 2026-06-10): the phi preconditioner has exactly two
-        # consumers -- the E-step phi substep (gated by e_phi_lr > 0) and the natural-gradient
-        # gauge M-step (gated by m_phi_natural_grad). With both gates closed NO preconditioner
-        # code runs, so switching phi_precond_mode cannot change VRAM, speed, or numerics;
-        # observed differences in such runs are confounded. Warn (non-breaking) so a tuning
-        # session doesn't attribute effects to a knob that is not wired into the active paths.
-        if (
-            self.phi_precond_mode != "none"
-            and self.e_phi_lr == 0.0
-            and not self.m_phi_natural_grad
-        ):
-            import warnings
-            warnings.warn(
-                f"phi_precond_mode={self.phi_precond_mode!r} has NO effect under e_phi_lr=0.0 with "
-                "m_phi_natural_grad=False: its only consumers are the E-step phi substep "
-                "(e_phi_lr > 0) and the natural-gradient gauge M-step (m_phi_natural_grad=True). "
-                "Set one of those gates, or phi_precond_mode='none' to silence this.",
-                UserWarning,
-                stacklevel=2,
-            )
-        _require(self.phi_retract_mode, _VALID_PHI_RETRACT_MODES, "phi_retract_mode")
+        
+        from vfe3.geometry.lie_ops import _COMPOSE      # phi retraction & pos-phi share the compose registry
+        _require(self.phi_retract_mode, tuple(sorted(_COMPOSE)), "phi_retract_mode")
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
-        _require(self.pos_phi_compose, _VALID_POS_PHI_COMPOSE, "pos_phi_compose")
+        _require(self.pos_phi_compose, tuple(sorted(_COMPOSE)), "pos_phi_compose")
         from vfe3.geometry.rope import _POS_ROTATIONS
         _require(self.pos_rotation, tuple(sorted(_POS_ROTATIONS)), "pos_rotation")
         if self.rope_full_gauge and self.diagonal_covariance:

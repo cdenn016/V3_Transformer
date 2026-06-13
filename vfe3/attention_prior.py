@@ -109,7 +109,7 @@ def prior_causal_alibi(
 
     *,
     n_heads:     int                          = 1,
-    alibi_slope: float                        = 1.0,
+    alibi_slope: float                        = 0.5,
     device:      'torch.device | str | None'  = None,
     dtype:       torch.dtype                  = torch.float32,
     **kwargs,

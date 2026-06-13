@@ -28,8 +28,10 @@ def _fwd_cfg() -> VFE3Config:
     # pos_phi="none" pins the canonical no-positional-composition forward these checksums were
     # captured on; the perf refactor this oracle guards (factored transport / per-block exp / batch
     # vectorization) is independent of the pos_phi gauge composition.
+    # use_prior_bank=True: these checksums were captured on the KL-to-prior decode (the prior-bank
+    # path the oracle guards); the default is now the linear-decode ablation.
     return VFE3Config(vocab_size=12, embed_dim=8, n_heads=2, max_seq_len=6, n_layers=2,
-                      n_e_steps=2, e_phi_lr=0.1, pos_phi="none")
+                      n_e_steps=2, e_phi_lr=0.1, pos_phi="none", use_prior_bank=True)
 
 
 def test_beta_to_coordinate_equal_blocks_matches_repeat_interleave():

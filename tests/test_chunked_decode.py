@@ -88,21 +88,28 @@ def test_chunked_ce_all_ignore_is_finite_zero():
 
 
 def test_chunked_ce_grad_matches_full():
+    # The reference ('diagonal') and the chunked path must BOTH run through model.forward() so
+    # each applies the positional-phi gauge composition identically; the only difference is the
+    # decode+CE reassociation. A reference built from a bare vfe_stack (_full_ce -> _converged)
+    # skips _apply_pos_phi, so with a nonzero learned pos_phi the two graphs diverge and the grads
+    # differ by the pos_phi Jacobian -- not a kernel bug (the same-mu kernel-grad equivalence is
+    # gated to atol-1e-5 by test_linear_chunked_ce_matches_dense_value_and_grads). This is the
+    # faithful "chunked forward grad == diagonal forward grad" gate, robust to the use_prior_bank
+    # default.
     torch.manual_seed(3)
     V = 48
     tokens = torch.randint(0, V, (2, 5))
     targets = torch.randint(0, V, (2, 5))
 
-    full = _model(vocab_size=V)
-    full_loss = _full_ce(full, tokens, targets)
+    full = _model(vocab_size=V)                            # decode_mode='diagonal'
+    _, full_loss, _ = full(tokens, targets)                # through forward(): applies pos_phi
     full_loss.backward()
     g_mu_full = full.prior_bank.mu_embed.grad.clone()
     g_sig_full = full.prior_bank.sigma_log_embed.grad.clone()
 
     ch = _model(vocab_size=V, decode_mode="diagonal_chunked", decode_chunk_size=11)
     ch.load_state_dict(full.state_dict())
-    # Drive the chunked CE through the full forward so the gradient reaches the prior tables.
-    _, loss, _ = ch(tokens, targets)
+    _, loss, _ = ch(tokens, targets)                       # same forward(), chunked decode+CE
     loss.backward()
     g_mu_ch = ch.prior_bank.mu_embed.grad
     g_sig_ch = ch.prior_bank.sigma_log_embed.grad

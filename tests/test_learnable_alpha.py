@@ -80,6 +80,9 @@ def test_learnable_alpha_changes_forward_when_log_alpha_moves():
     tgt = torch.randint(0, 20, (2, 5))
     cfg_kw = dict(alpha_mode="learnable", n_layers=1, n_e_steps=4,
                   e_mu_lr=0.3, e_sigma_lr=0.1, e_phi_lr=0.0,
+                  use_prior_bank=True,   # observe alpha through the KL-to-prior decode (it reads
+                  #                        sigma, where the self-coupling signal is strongest; the
+                  #                        linear-decode default discards sigma)
                   pos_phi="none")   # isolate the alpha sensitivity: the positional gauge composition
                                     # damps the self-coupling signal below the 1e-6 detection floor
     torch.manual_seed(0)

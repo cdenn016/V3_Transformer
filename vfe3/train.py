@@ -12,7 +12,8 @@ import contextlib
 import logging
 import math
 import time
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -30,9 +31,8 @@ from vfe3.data.datasets import make_dataloader
 from vfe3.free_energy import attention_tau
 from vfe3.model.block import _as_coeff
 from vfe3.model.model import VFEModel
-
-if TYPE_CHECKING:                                    # avoid an import cycle (run_artifacts imports evaluate)
-    from vfe3.run_artifacts import RunArtifacts
+from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
+#                                                      lazily (function-local), so there is no cycle
 
 
 def build_optimizer(
@@ -677,8 +677,8 @@ def run_training(
     the end-of-run test eval. Kept only for the lightweight in-process smoke use it already had.
     """
     torch.manual_seed(cfg.seed)              # reproducible prior-table init + data order
-    model = VFEModel(cfg)
-    device = model.prior_bank.mu_embed.device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = VFEModel(cfg).to(device)         # move to CUDA where available (mirrors train_vfe3.main)
     loader = make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size, max_tokens=max_tokens)
     logger = logging.getLogger(__name__)
     logger.info(_banner(model, cfg, dataset, device, n_steps, train_loader=loader))

@@ -253,7 +253,9 @@ def _structure_constants(
 
     # Diagnostic (cached, one-time): warn if the basis is not bracket-closed, in which case the
     # span projection above truncates the out-of-span part of [G_a,G_b]. Depends only on the fixed
-    # generators, so it runs once per basis (the shared lie_ops cache), off the hot path.
+    # generators, so it runs once per basis (the shared lie_ops cache), off the hot path. Size-gated
+    # (max_elements): large direct-sum bases are skipped as closed-by-construction (avoids the O(K^4)
+    # OOM); small non-closed cross_couplings chains are scanned exactly.
     warn_if_basis_not_closed(G, where="_structure_constants (pullback metric)",
                              closure_tol=closure_tol, eps=eps, gram_pinv_=gp)
     return f

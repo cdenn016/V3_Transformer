@@ -16,7 +16,7 @@ from vfe3.free_energy import attention_tau
 from vfe3.inference.e_step import e_step
 
 
-def _as_coeff(v, device):
+def _as_coeff(v: 'float | list', device: torch.device) -> 'float | torch.Tensor':
     r"""Pass a scalar b0/c0 through unchanged; turn a list into a (K,) float32 tensor on device."""
     return torch.as_tensor(v, dtype=torch.float32, device=device) if isinstance(v, (list, tuple)) else v
 
