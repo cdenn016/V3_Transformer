@@ -811,6 +811,18 @@ class VFE3Config:
                     "s_e_step=True requires prior_source='model_channel' so the s-tables are the "
                     f"model's vocab table for encode and decode; got prior_source={self.prior_source!r}."
                 )
+            # The live s-refine (_refine_s) and the s/r tables are DIAGONAL by construction (the s
+            # table is (V,K) and the centroid r is (K,)). Under a full-covariance family the belief
+            # sigma is (B,N,K,K) and the diagonal refined-s would overwrite it with a (B,N,K) tensor,
+            # crashing deep in the full kernel with an opaque shape error. Reject at construction so
+            # the (unsupported) full-cov s-channel fails fast with a clear message; the diagonal
+            # family is the supported pure path for the s E-step.
+            if not family_is_diagonal:
+                raise ValueError(
+                    "s_e_step=True refines the model channel as a DIAGONAL Gaussian (the s/r tables "
+                    f"are diagonal by construction), incompatible with family={self.family!r}. Use a "
+                    "diagonal-covariance family (e.g. 'gaussian_diagonal') for the live s E-step."
+                )
             if self.lambda_h == 0.0 and self.gamma_coupling == 0.0:
                 import warnings
                 warnings.warn(
