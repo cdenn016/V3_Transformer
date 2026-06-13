@@ -66,7 +66,9 @@ class HeadMixer(nn.Module):
         if len(irrep_dims) < 2:
             raise ValueError(
                 f"HeadMixer needs >= 2 blocks to mix, got irrep_dims={irrep_dims}; a single-block "
-                f"group (glk / so_k) has nothing to mix. Use block_glk (n_heads >= 2)."
+                f"group (glk / so_k) has nothing to mix. Use block_glk (n_heads >= 2). (If using "
+                f"block_glk with cross_couplings, the off-block basis collapses irrep_dims to [K]; "
+                f"remove cross_couplings or disable the mixer.)"
             )
         if irrep_labels is None:
             if len(set(irrep_dims)) != 1:

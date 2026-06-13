@@ -603,6 +603,51 @@ class VFE3Config:
                     raise ValueError(
                         f"cross_couplings head indices ({a},{b}) out of range [0, {self.n_heads})"
                     )
+            # Cross-coupling's off-block generators destroy the per-head direct sum, so the group
+            # builder reports a SINGLE irrep block [K]: n_heads no longer sets the runtime
+            # attention-head count and the energy is one full-K block. Fail FAST here on the
+            # combinations that would otherwise crash late at VFEModel construction / first forward,
+            # and warn on the semantic shift (cross-coupling audit 2026-06-12). The coherent
+            # single-block cross-coupled gauge itself still runs.
+            import warnings
+            for _pname in ("attention_prior", "gamma_attention_prior"):
+                if getattr(self, _pname) in ("alibi", "causal_alibi"):
+                    raise ValueError(
+                        f"{_pname}={getattr(self, _pname)!r} is incompatible with cross_couplings: an "
+                        f"alibi prior builds an (n_heads, N, N) per-head bias, but cross-coupled "
+                        f"block_glk collapses irrep_dims to a single block [K] (one runtime attention "
+                        f"head). Use a headless prior (uniform/causal/causal_windowed/...) with "
+                        f"cross_couplings."
+                    )
+            if self.use_head_mixer:
+                raise ValueError(
+                    "use_head_mixer=True is incompatible with cross_couplings: cross-coupled block_glk "
+                    "collapses irrep_dims to a single block [K], and the head mixer needs >= 2 blocks "
+                    "to mix. Disable use_head_mixer or remove cross_couplings."
+                )
+            for _name in ("kappa", "kappa_gamma"):
+                if isinstance(getattr(self, _name), (list, tuple)):
+                    raise ValueError(
+                        f"{_name} per-head list is incompatible with cross_couplings: the cross-coupled "
+                        f"group has a single irrep block [K], not n_heads blocks. Use a scalar {_name}."
+                    )
+            if self.family == "gaussian_diagonal":
+                warnings.warn(
+                    "cross_couplings with family='gaussian_diagonal' is an APPROXIMATION: the off-block "
+                    "GL(K) congruence g*Sigma*g^T is not diagonal, so the diagonal readout is not "
+                    "gauge-invariant. family='gaussian_full' (diagonal_covariance=False) is the exact "
+                    "congruence path.",
+                    UserWarning, stacklevel=2,
+                )
+            if self.n_heads > 1:
+                warnings.warn(
+                    f"cross_couplings collapses block_glk to a single irrep block [K]: n_heads="
+                    f"{self.n_heads} no longer sets the attention-head count (runtime is 1 head) and "
+                    f"the softmax temperature shifts from kappa*sqrt(d_head) to kappa*sqrt(K). This is "
+                    f"the coherent single-block cross-coupled gauge; n_heads only partitions the "
+                    f"generators.",
+                    UserWarning, stacklevel=2,
+                )
 
         # belief family. ``family`` selects the covariance-structure divergence kernel
         # (gaussian_diagonal | gaussian_full). ``divergence_family`` is the SEPARATE functional
@@ -764,26 +809,6 @@ class VFE3Config:
                 "'killing'/'killing_per_block' are conformal (only an effective-LR rescale) and "
                 "'none'/'clip' apply no metric. Set phi_precond_mode='pullback_per_block' for the "
                 "documented geometric (pullback natural-gradient) gauge M-step.",
-                UserWarning,
-                stacklevel=2,
-            )
-        # Dead-knob disclosure (vram audit 2026-06-10): the phi preconditioner has exactly two
-        # consumers -- the E-step phi substep (gated by e_phi_lr > 0) and the natural-gradient
-        # gauge M-step (gated by m_phi_natural_grad). With both gates closed NO preconditioner
-        # code runs, so switching phi_precond_mode cannot change VRAM, speed, or numerics;
-        # observed differences in such runs are confounded. Warn (non-breaking) so a tuning
-        # session doesn't attribute effects to a knob that is not wired into the active paths.
-        if (
-            self.phi_precond_mode != "none"
-            and self.e_phi_lr == 0.0
-            and not self.m_phi_natural_grad
-        ):
-            import warnings
-            warnings.warn(
-                f"phi_precond_mode={self.phi_precond_mode!r} has NO effect under e_phi_lr=0.0 with "
-                "m_phi_natural_grad=False: its only consumers are the E-step phi substep "
-                "(e_phi_lr > 0) and the natural-gradient gauge M-step (m_phi_natural_grad=True). "
-                "Set one of those gates, or phi_precond_mode='none' to silence this.",
                 UserWarning,
                 stacklevel=2,
             )
