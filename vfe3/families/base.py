@@ -278,5 +278,52 @@ def squared_hellinger(
     return 1.0 - torch.exp(-0.5 * d_half)
 
 
+def bhattacharyya(
+    q:       BeliefParams,
+    p:       BeliefParams,
+
+    *,
+    kl_max:  float = 100.0,
+    eps:     float = 1e-6,
+    **kwargs,
+) -> torch.Tensor:                             # (...) Bhattacharyya distance D_B(q||p) >= 0
+    r"""Bhattacharyya distance D_B(q || p) = -log BC(q || p), BC the Bhattacharyya coefficient.
+
+    For Gaussians BC = exp(-D_{1/2}(q||p)/2) (the same coefficient squared-Hellinger uses), so
+
+        D_B(q || p) = D_{1/2}(q || p) / 2,   D_{1/2} = renyi(q, p, alpha=0.5).
+
+    SYMMETRIC (the Renyi-1/2 divergence is) and zero iff q == p. Reuses the pinned Gaussian renyi
+    closed form at alpha=0.5; ``kl_max`` bounds the inner D_{1/2}. A forwarded ``alpha`` is absorbed
+    by ``**kwargs`` (Bhattacharyya has no order) and never reaches the inner renyi call (always 0.5).
+    """
+    return 0.5 * renyi(q, p, alpha=0.5, kl_max=kl_max, eps=eps)
+
+
+def jeffreys(
+    q:       BeliefParams,
+    p:       BeliefParams,
+
+    *,
+    kl_max:  float = 100.0,
+    eps:     float = 1e-6,
+    **kwargs,
+) -> torch.Tensor:                             # (...) Jeffreys (symmetrized KL) J(q||p) >= 0
+    r"""Jeffreys divergence J(q || p) = KL(q || p) + KL(p || q), the symmetrized KL.
+
+    Each term is renyi at alpha=1 (the pinned Gaussian KL closed form):
+
+        J(q || p) = renyi(q, p, alpha=1) + renyi(p, q, alpha=1).
+
+    SYMMETRIC by construction and zero iff q == p. Each KL is clamped to ``kl_max``, so J is bounded
+    in [0, 2*kl_max]. A forwarded ``alpha`` is absorbed by ``**kwargs`` (Jeffreys has no order); the
+    two inner calls always use alpha=1.
+    """
+    return (renyi(q, p, alpha=1.0, kl_max=kl_max, eps=eps)
+            + renyi(p, q, alpha=1.0, kl_max=kl_max, eps=eps))
+
+
 register_functional("renyi")(renyi)
 register_functional("squared_hellinger")(squared_hellinger)
+register_functional("bhattacharyya")(bhattacharyya)
+register_functional("jeffreys")(jeffreys)
