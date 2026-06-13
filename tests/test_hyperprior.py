@@ -18,6 +18,9 @@ hyper-prior centroid r is FROZEN (requires_grad=False), and build_optimizer (whi
 params) groups s but not r; (4) s == r => term 0 (self-zero sanity).
 """
 
+import warnings
+
+import pytest
 import torch
 
 from vfe3.config import VFE3Config
@@ -125,3 +128,166 @@ def test_self_zero_when_s_equals_r():
     tokens = torch.randint(0, 20, (3, 5))
     hp = _hyperprior_term(model, tokens)
     assert torch.allclose(hp, torch.zeros_like(hp), atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# learnable_r: opt-in trainable hyper-prior centroid (default frozen).
+# Spec: docs/superpowers/specs/2026-06-13-learnable-hyper-prior-r-design.md.
+# The TODO(B) un-freezing: a single learnable_r toggle makes r a trainable
+# empirical-Bayes centroid; the default stays frozen (byte-identical current
+# behavior). A config guard warns when r is un-frozen while s is unanchored
+# (only KL(s||r) binds them -> KL(s||r)->0 collapse).
+# ---------------------------------------------------------------------------
+def _lr_model(
+    *,
+    learnable_r: bool,
+    seed:        int  = 0,
+) -> VFEModel:
+    r"""Tiny pure-path model (use_prior_bank=True) with the hyper-prior channel live (lambda_h>0) and s
+    data-anchored (prior_source='model_channel'), i.e. the non-collapse regime for a learnable r."""
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     mstep_self_coupling_weight=0.0, use_prior_bank=True,
+                     lambda_h=0.5, prior_source="model_channel",
+                     learnable_r=learnable_r, seed=seed)
+    torch.manual_seed(seed)          # the model does NOT self-seed; pin RNG before construction
+    return VFEModel(cfg)
+
+
+def test_learnable_r_defaults_false():
+    # The default is frozen r (current behavior): the toggle must default off.
+    assert VFE3Config().learnable_r is False
+
+
+def test_default_path_r_still_frozen_and_ungrouped():
+    # Regression pin: with learnable_r unset, r is frozen and build_optimizer does NOT group it
+    # (the coverage guard exempts non-trainable params).
+    from vfe3.train import build_optimizer
+    m = _lr_model(learnable_r=False)
+    assert m.prior_bank.r_mu.requires_grad is False
+    assert m.prior_bank.r_sigma_log.requires_grad is False
+    opt = build_optimizer(m, m.cfg)
+    opt_params = {id(p) for g in opt.param_groups for p in g["params"]}
+    assert id(m.prior_bank.r_mu) not in opt_params
+    assert id(m.prior_bank.r_sigma_log) not in opt_params
+
+
+def test_learnable_r_makes_r_trainable():
+    # The opt-in toggle un-freezes r: both centroid tables become trainable leaves.
+    m = _lr_model(learnable_r=True)
+    assert m.prior_bank.r_mu.requires_grad is True
+    assert m.prior_bank.r_sigma_log.requires_grad is True
+
+
+def test_learnable_r_grad_reaches_r():
+    # With r un-frozen, the lambda_h*KL(s||r) term backprops a finite, nonzero gradient into r
+    # (s != r at init, so the centroid actually moves).
+    m = _lr_model(learnable_r=True)
+    tokens = torch.randint(0, 20, (3, 5))
+    targets = torch.randint(0, 20, (3, 5))
+    _, loss, _ = m(tokens, targets)
+    loss.backward()
+    g_mu = m.prior_bank.r_mu.grad
+    g_sig = m.prior_bank.r_sigma_log.grad
+    assert g_mu is not None and torch.isfinite(g_mu).all() and g_mu.abs().sum() > 0
+    assert g_sig is not None and torch.isfinite(g_sig).all() and g_sig.abs().sum() > 0
+
+
+def test_build_optimizer_groups_learnable_r():
+    # A trainable r MUST be grouped or the exact-coverage guard fails (it would silently never
+    # train). Both centroid tables are grouped (mean@m_mu_lr, log-scale@m_sigma_lr like s).
+    from vfe3.train import build_optimizer
+    m = _lr_model(learnable_r=True)
+    opt = build_optimizer(m, m.cfg)                       # must NOT raise the coverage guard
+    opt_params = {id(p) for g in opt.param_groups for p in g["params"]}
+    assert id(m.prior_bank.r_mu) in opt_params
+    assert id(m.prior_bank.r_sigma_log) in opt_params
+
+
+def test_forward_loss_identical_frozen_vs_learnable_at_init():
+    # Un-freezing only flips requires_grad: the r tables (drawn last) are byte-identical and the
+    # forward loss at init is unchanged. learnable_r changes training dynamics, not the forward value.
+    m0 = _lr_model(learnable_r=False, seed=0)
+    m1 = _lr_model(learnable_r=True, seed=0)
+    assert torch.equal(m0.prior_bank.r_mu, m1.prior_bank.r_mu)
+    assert torch.equal(m0.prior_bank.s_mu_embed, m1.prior_bank.s_mu_embed)
+    tokens = torch.randint(0, 20, (3, 5))
+    targets = torch.randint(0, 20, (3, 5))
+    _, l0, _ = m0(tokens, targets)
+    _, l1, _ = m1(tokens, targets)
+    assert torch.equal(l0, l1)       # byte-identical: un-freezing only flips requires_grad
+
+
+def test_learnable_r_collapse_warning_when_s_unanchored():
+    # Un-freezing r while s is NOT data-anchored (prior_source='token', no gamma, no s_e_step)
+    # leaves KL(s||r) the only force on s/r -> the collapse the freeze guards against. Warn.
+    with pytest.warns(UserWarning, match="learnable_r"):
+        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
+                   lambda_h=0.5, learnable_r=True)        # prior_source='token', gamma_coupling=0
+
+
+def test_learnable_r_no_collapse_warning_when_model_channel_anchors():
+    # prior_source='model_channel' routes the CE gradient into s, anchoring it -> r learning the
+    # population centroid is empirical Bayes, not a collapse. No collapse warning.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
+                   lambda_h=0.5, learnable_r=True, prior_source="model_channel")
+    assert not any("learnable_r" in str(wi.message) for wi in caught)
+
+
+def test_learnable_r_grad_reaches_r_under_s_e_step():
+    # Second gradient route: under s_e_step the forward hyper-prior term is OFF and r is instead the
+    # self-coupling target of the s E-step (_refine_s). With r un-frozen, grad still reaches it through
+    # the unrolled refine (s is anchored by CE under the required model_channel, so this is non-collapse).
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     mstep_self_coupling_weight=0.0, use_prior_bank=True,
+                     lambda_h=1.0, gamma_coupling=1.0, prior_source="model_channel",
+                     s_e_step=True, e_s_mu_lr=0.5, learnable_r=True, seed=0)
+    torch.manual_seed(0)
+    m = VFEModel(cfg)
+    tokens = torch.randint(0, 20, (2, 5))
+    targets = torch.randint(0, 20, (2, 5))
+    _, loss, _ = m(tokens, targets)
+    loss.backward()
+    g = m.prior_bank.r_mu.grad
+    assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
+
+
+def test_learnable_r_inert_warning_when_no_r_channel():
+    # learnable_r=True but lambda_h=0 and not s_e_step: r is never created (gamma_coupling>0 builds only
+    # the s tables), so the toggle is a silent no-op -> warn the user it has no effect.
+    with pytest.warns(UserWarning, match="learnable_r=True has no effect"):
+        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
+                   lambda_h=0.0, gamma_coupling=0.5, learnable_r=True)
+
+
+def test_learnable_r_centroid_has_no_weight_decay():
+    # A hyper-prior centroid is a prior, not capacity: its optimizer groups must NOT carry weight decay
+    # (decaying it biases r toward the degenerate (0,1) fixed point), like the unigram-bias/gauge groups.
+    from vfe3.train import build_optimizer
+    m = _lr_model(learnable_r=True)
+    opt = build_optimizer(m, m.cfg)
+    rids = {id(m.prior_bank.r_mu), id(m.prior_bank.r_sigma_log)}
+    r_groups = [g for g in opt.param_groups if any(id(p) in rids for p in g["params"])]
+    assert len(r_groups) == 2
+    assert all(g["weight_decay"] == 0.0 for g in r_groups)
+
+
+def test_learnable_r_grouped_under_natural_grad_optimizer():
+    # The other authorized optimizer path: m_phi_natural_grad=True returns GaugeNaturalGradAdamW; a
+    # trainable r must still be grouped (in a plain non-gauge group, mean@m_mu_lr / log-scale@m_sigma_lr).
+    from vfe3.train import build_optimizer
+    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=1, use_prior_bank=True, lambda_h=0.5, prior_source="model_channel",
+                     learnable_r=True, m_phi_natural_grad=True,
+                     phi_precond_mode="pullback_per_block", seed=0)
+    torch.manual_seed(0)
+    m = VFEModel(cfg)
+    opt = build_optimizer(m, cfg)
+    assert isinstance(opt, GaugeNaturalGradAdamW)
+    opt_params = {id(p) for g in opt.param_groups for p in g["params"]}
+    assert id(m.prior_bank.r_mu) in opt_params
+    assert id(m.prior_bank.r_sigma_log) in opt_params

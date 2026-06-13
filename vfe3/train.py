@@ -55,10 +55,12 @@ def build_optimizer(
     (lambda_h>0), each split mean@``m_mu_lr`` / log-scale@``m_sigma_lr`` like the belief tables.
     A final assertion pins that the groups cover ``model.parameters()`` EXACTLY -- a new
     parameter that is forgotten here would otherwise silently never receive a gradient.
-    The hyper-prior centroid ``r_mu``/``r_sigma_log`` (lambda_h>0) is FROZEN (requires_grad=False, set in
-    prior_bank.py) -- a fixed centroid per the manuscript's "higher, slower meta-level"
-    (GL(K)_supplementary.tex:1081); the coverage guard exempts it, so it needs no group and is never
-    updated (freely training r alongside s would collapse KL(s||r)->0).
+    The hyper-prior centroid ``r_mu``/``r_sigma_log`` (lambda_h>0) is FROZEN by default
+    (requires_grad=False, set in prior_bank.py) -- a fixed centroid per the manuscript's "higher, slower
+    meta-level" (GL(K)_supplementary.tex:1081); the coverage guard exempts it, so it needs no group and is
+    never updated (freely training an unanchored r alongside s would collapse KL(s||r)->0). Under
+    ``cfg.learnable_r=True`` it is un-frozen and grouped here (mean@``m_mu_lr``, log-scale@``m_sigma_lr``,
+    like the s tables) so it trains as an empirical-Bayes centroid.
     The learned MODEL-level parameters are grouped likewise when their toggle is on: the Regime-II
     edge connection ``connection_W`` (transport_mode='regime_ii') at ``m_phi_lr`` (a gauge-connection
     scale) and the learnable self-coupling ``log_alpha`` (alpha_mode='learnable') at ``m_mu_lr`` -- so
@@ -105,9 +107,17 @@ def build_optimizer(
         groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_mu_lr})    # prior_source=model_channel):
         groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_sigma_lr})  # mean@m_mu_lr, log-scale@
         # m_sigma_lr, mirroring the belief tables. s is the model channel / (under model_channel) the
-        # live belief prior, so it must train. The hyper-prior CENTROID r (lambda_h>0) is NOT grouped
-        # because it is FROZEN (requires_grad=False, prior_bank.py) -- a fixed centroid per the
-        # manuscript's "higher, slower meta-level"; the coverage guard exempts non-trainable params.
+        # live belief prior, so it must train. The hyper-prior CENTROID r is grouped only when
+        # learnable_r un-freezes it (next block); FROZEN-by-default r (requires_grad=False, prior_bank.py)
+        # is exempt from the coverage guard -- a fixed centroid per the manuscript's "higher, slower
+        # meta-level".
+    if getattr(pb, "r_mu", None) is not None and pb.r_mu.requires_grad:  # learnable_r=True: un-frozen r
+        # weight_decay=0: r is a hyper-prior CENTROID, not capacity. L2-decaying it pulls the learned
+        # centroid toward the degenerate (r_mu=0, r_sigma=1) fixed point, fighting the empirical-Bayes
+        # population-centroid objective (and corrupting the KL(s||r) m-projection at sigma_init != 1) --
+        # the same exemption the learned unigram-bias prior (output_proj_bias) and the gauge frame carry.
+        groups.append({"params": [pb.r_mu],        "lr": cfg.m_mu_lr,    "weight_decay": 0.0})  # centroid mean
+        groups.append({"params": [pb.r_sigma_log], "lr": cfg.m_sigma_lr, "weight_decay": 0.0})  # centroid log-scale
     if getattr(model, "connection_W", None) is not None:        # transport_mode='regime_ii' learned
         w_group = {"params": [model.connection_W], "lr": cfg.m_phi_lr}        # connection -> gauge LR
         if cfg.connection_weight_decay is not None:             # dedicated connection-norm ceiling

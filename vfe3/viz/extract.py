@@ -428,3 +428,44 @@ def converged_state(
         "beta":     beta,
         "self_div": self_div,
     }
+
+
+@torch.no_grad()
+def s_channel_refinement(model, token_ids: torch.Tensor) -> Optional[dict]:
+    r"""Model-channel (s) refinement diagnostics for the ``s_e_step=True`` path (sequence 0).
+
+    Returns ``None`` when ``cfg.s_e_step`` is False (the s-channel does not run, so the figure is
+    skipped). Otherwise replays the SAME two steps ``forward``/``diagnostics`` take -- the static
+    encode ``s0 = encode_s(tokens)`` and the refined ``s1 = _refine_s(tokens, pos_phi(phi))`` under
+    the frozen gauge frame -- and measures, per token position, how far the model channel moved and
+    how it tracks the frozen hyper-prior centroid ``r = (r_mu, exp(r_sigma_log))``:
+
+      mu_delta[i]       = ||s1_mu[i]   - s0_mu[i]||_2                         (mean refinement)
+      logsigma_delta[i] = ||log s1_sigma[i] - log s0_sigma[i]||_2            (variance refinement)
+      kl_s0_r[i], kl_s1_r[i] = KL(s . || r) before / after refinement        (consensus toward r)
+
+    The s-channel descends ``lambda_h * KL(s||r) + gamma_coupling * model-consensus``, so a healthy
+    refinement pulls ``KL(s1||r) < KL(s0||r)``; the deltas show where on the sequence it acts.
+    """
+    if not model.cfg.s_e_step:
+        return None
+    from vfe3.families.gaussian import DiagonalGaussian
+    from vfe3.divergence import get_functional
+    cfg, pb = model.cfg, model.prior_bank
+    enc  = pb.encode(token_ids[:1])                                # (1, N, ...)
+    phi0 = model._apply_pos_phi(enc.phi[0]).unsqueeze(0)           # (1, N, n_gen) frozen gauge frame
+    s0_mu, s0_sigma = (t[0] for t in pb.encode_s(token_ids[:1]))   # (N, K) static model channel
+    s1_mu, s1_sigma = (t[0] for t in model._refine_s(token_ids[:1], phi0))  # (N, K) refined
+    r_mu    = pb.r_mu.expand_as(s1_mu)                             # (N, K) frozen hyper-prior centroid
+    r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s1_sigma)
+    kl = get_functional("renyi")                                  # KL = renyi at alpha=1
+    r  = DiagonalGaussian(r_mu, r_sigma)
+    kl_s0_r = kl(DiagonalGaussian(s0_mu, s0_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
+    kl_s1_r = kl(DiagonalGaussian(s1_mu, s1_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
+    return {
+        "mu_delta":       (s1_mu - s0_mu).norm(dim=-1).cpu(),
+        "logsigma_delta": (s1_sigma.clamp(min=cfg.eps).log()
+                           - s0_sigma.clamp(min=cfg.eps).log()).norm(dim=-1).cpu(),
+        "kl_s0_r":        kl_s0_r.cpu(),
+        "kl_s1_r":        kl_s1_r.cpu(),
+    }

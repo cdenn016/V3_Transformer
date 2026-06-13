@@ -196,6 +196,18 @@ class VFE3Config:
     # remain DEFERRED.
     lambda_h:                  float = 0.0
 
+    # Un-freeze the global hyper-prior centroid r (r_mu/r_sigma_log). Default False = FROZEN (current
+    # behavior, byte-identical): a fixed centroid the model beliefs s_i are regularized toward, the
+    # stand-in for the manuscript's "higher, slower meta-level". True trains r by gradient (grouped in
+    # build_optimizer like the s tables, mean@m_mu_lr / log-scale@m_sigma_lr) as an empirical-Bayes
+    # population centroid -- meaningful ONLY when s carries an independent data force
+    # (prior_source='model_channel' routes the CE gradient into s). With s unanchored the only force on
+    # s/r is lambda_h*KL(s||r), whose joint optimum is s_i=r=const (KL->0, the regularizer vanishes);
+    # __post_init__ warns for that regime. The manuscript-pure token-dependent top-down
+    # r_i=Omega_tilde[s^(s+1)] needs the scale-(s+1) meta-agent (not built); learnable_r is the
+    # same-scale empirical-Bayes stand-in.
+    learnable_r:               bool  = False
+
     # Model-coupling weight gamma_coupling on the model-channel block gamma_coupling * mean_i F_red^s_i,
     # the reduced (envelope) form of sum_ij [ gamma_ij KL(s_i||Omega_ij s_j) + tau_g gamma_ij
     # log(gamma_ij/pi^s_ij) ] (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
@@ -804,6 +816,35 @@ class VFE3Config:
                 warnings.warn(
                     "s_e_step=True with lambda_h=0 and gamma_coupling=0: the s-refine has no force, "
                     "so s1==s0 and the channel reduces to the static prior_source='model_channel' tie.",
+                    UserWarning, stacklevel=2,
+                )
+        # learnable_r diagnostics. The centroid r is created only under lambda_h>0 or s_e_step
+        # (prior_bank.py), and the forward hyper-prior term that governs it runs only when lambda_h>0
+        # and not s_e_step. (s_e_step is excluded here: it structurally requires model_channel, so r is
+        # both created and CE-anchored -- never inert, never collapsing.)
+        if self.learnable_r and not self.s_e_step:
+            import warnings
+            if self.lambda_h == 0.0:
+                # Inert: with lambda_h=0 no r table is created (gamma_coupling>0 builds only the s
+                # tables), so the toggle silently does nothing -- warn rather than no-op in silence.
+                warnings.warn(
+                    "learnable_r=True has no effect: the hyper-prior centroid r is created only when "
+                    "lambda_h>0 or s_e_step=True. Set lambda_h>0 (with prior_source='model_channel') "
+                    "to train r.",
+                    UserWarning, stacklevel=2,
+                )
+            elif self.prior_source != "model_channel":
+                # Collapse guard: un-freezing r while the forward hyper-prior term is live but s is NOT
+                # data-anchored leaves lambda_h*KL(s||r) the only force on s/r. Its joint optimum is
+                # s_i=r=const (KL->0), so r collapses onto s and the term vanishes -- exactly what
+                # freezing r guards against. Only the CE gradient (routed into s by
+                # prior_source='model_channel') anchors s; gamma is a self-referential consensus among
+                # the same free s and does not prevent the collapse, so this warns regardless of gamma.
+                warnings.warn(
+                    f"learnable_r=True with an unanchored model channel (prior_source={self.prior_source!r}, "
+                    "lambda_h>0): the only force on s and r is lambda_h*KL(s||r), whose joint optimum is "
+                    "s_i=r=const (KL->0, the hyper-prior term vanishes). Anchor s to data with "
+                    "prior_source='model_channel', or keep r frozen (learnable_r=False).",
                     UserWarning, stacklevel=2,
                 )
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")

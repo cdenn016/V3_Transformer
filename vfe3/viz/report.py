@@ -146,6 +146,7 @@ def generate_figures(
     cstate      = _safe(lambda: extract.converged_state(model, tok), "converged_state")
     amaps       = _safe(lambda: model.attention_maps(tok), "attention_maps")
     health      = _safe(lambda: extract.numerical_health(model, tok), "numerical_health")
+    s_channel   = _safe(lambda: extract.s_channel_refinement(model, tok), "s_channel_refinement")
 
     # gpt2/cl100k decoder for the belief-UMAP linguistic-category colouring + token labels (None when
     # tiktoken is absent or the dataset has no real tokenizer -> the UMAP greys out and labels by id).
@@ -216,6 +217,9 @@ def generate_figures(
               health if health is not None else {},
               causal=(metrics.causal_sanity(amaps) if amaps is not None else None), path=p),
           cstate is not None)
+    _emit("s_channel_refinement",                                 # only when s_e_step=True (else None)
+          lambda p: figs.plot_s_channel_refinement(s_channel, path=p),
+          s_channel is not None)
 
     logger.info("wrote %d single-run figures to %s", len(written), figdir)
     return written

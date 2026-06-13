@@ -113,6 +113,7 @@ class PriorBank(nn.Module):
         gamma_coupling:      float = 0.0,
         prior_source:        str   = "token",
         s_e_step:            bool  = False,
+        learnable_r:         bool  = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -178,16 +179,20 @@ class PriorBank(nn.Module):
             self.s_mu_embed        = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
             self.s_sigma_log_embed = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
         if lambda_h > 0.0 or s_e_step:
-            # FROZEN hyper-prior centroid r (user decision 2026-06-02): the fixed centroid the model
-            # beliefs s_i are regularized toward via lambda_h*KL(s_i||r). The manuscript determines r
-            # "from a higher, slower meta-level" (GL(K)_supplementary.tex:1081); with no meta-level
-            # built, a FIXED r is the manuscript-consistent stand-in, and requires_grad=False prevents
-            # the KL(s||r)->0 collapse that freely training r alongside s would cause.
-            self.r_mu              = nn.Parameter(torch.zeros(K), requires_grad=False)
-            self.r_sigma_log       = nn.Parameter(torch.full((K,), sigma_log_init), requires_grad=False)
-            # TODO(B): un-freeze r -> a token-dependent, top-down hyper-prior r_i = Omega_tilde[s_I^{(s+1)}]
-            # requires the scale-(s+1) meta-agent (out of scope). See
-            # docs/superpowers/specs/2026-06-08-live-s-model-channel-design.md (option B).
+            # Hyper-prior centroid r (r_mu, r_sigma_log): the centroid the model beliefs s_i are
+            # regularized toward via lambda_h*KL(s_i||r). DEFAULT FROZEN (learnable_r=False,
+            # requires_grad=False): the fixed centroid the manuscript determines "from a higher, slower
+            # meta-level" (GL(K)_supplementary.tex:1081); with no meta-level built, a FIXED r is the
+            # manuscript-consistent stand-in, and freezing prevents the KL(s||r)->0 collapse that freely
+            # training r alongside an unanchored s would cause. learnable_r=True un-freezes r as an
+            # empirical-Bayes population centroid (grouped in build_optimizer like the s tables);
+            # meaningful only when s carries an independent data force (prior_source='model_channel'),
+            # which VFE3Config.__post_init__ warns about.
+            self.r_mu              = nn.Parameter(torch.zeros(K), requires_grad=learnable_r)
+            self.r_sigma_log       = nn.Parameter(torch.full((K,), sigma_log_init), requires_grad=learnable_r)
+            # TODO(B): the manuscript-pure un-freezing is a token-dependent, top-down hyper-prior
+            # r_i = Omega_tilde[s_I^{(s+1)}] driven by the scale-(s+1) meta-agent (not built);
+            # learnable_r is the same-scale empirical-Bayes stand-in for that.
 
     def encode(
         self,
