@@ -681,17 +681,27 @@ class VFEModel(nn.Module):
                 token_ids, out.phi.detach())
         return logits, loss, ce.detach()
 
-    def _hyper_prior_term(
+    @property
+    def _model_channel_active(self) -> bool:
+        r"""Whether the model channel (the s tables) exists: any of ``lambda_h>0``,
+        ``gamma_coupling>0``, ``prior_source=='model_channel'``, or ``s_e_step``. Matches
+        :class:`PriorBank`'s s-table creation gate, so the s/r/h/gamma diagnostics and figures
+        gate on the SAME condition the tables are built under."""
+        cfg = self.cfg
+        return (cfg.lambda_h > 0.0 or cfg.gamma_coupling > 0.0
+                or cfg.prior_source == "model_channel" or cfg.s_e_step)
+
+    def _hyper_prior_kl(
         self,
         token_ids: torch.Tensor,             # (B, N) integer token ids
-    ) -> torch.Tensor:                       # () mean_i KL(s_i || r)
-        r"""The hyper-prior channel term mean_i KL(s_i||r) (the lambda_h block, UNWEIGHTED).
+    ) -> torch.Tensor:                       # (B, N) KL(s_i || r) per token
+        r"""Per-token hyper-prior divergence KL(s_i||r), unreduced (the lambda_h block integrand).
 
-        s_i is encoded fresh from the s tables and pulled toward the global centroid r;
-        grad-connected (no detach) so the channel trains through forward, and shared with
-        :meth:`diagnostics` so the logged decomposition carries the SAME term (audit 2026-06-09
-        V2). The covariance kernel is DiagonalGaussian regardless of cfg.family (the s/r tables
-        are always diagonal (V,K)/(K,)); r (K,) broadcasts over the (B, N) token axis.
+        s_i is encoded fresh from the s tables and measured against the global centroid r;
+        grad-connected (no detach). The covariance kernel is DiagonalGaussian regardless of
+        cfg.family (the s/r tables are always diagonal (V,K)/(K,)); r (K,) broadcasts over the
+        (B, N) token axis. :meth:`_hyper_prior_term` reduces this to its mean (the forward-loss
+        scale); :meth:`diagnostics` and the s/r/h figures consume the per-token vector / its sum.
         """
         from vfe3.families.gaussian import DiagonalGaussian
         from vfe3.free_energy import self_divergence
@@ -704,29 +714,37 @@ class VFEModel(nn.Module):
             DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),
             alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family,
-        ).mean()
+        )                                                            # (B, N)
 
-    def _gamma_coupling_term(
+    def _hyper_prior_term(
         self,
         token_ids: torch.Tensor,             # (B, N) integer token ids
-        phi:       torch.Tensor,             # (B, N, n_gen) converged gauge frame (detached by caller)
-    ) -> torch.Tensor:                       # () model-coupling block (UNWEIGHTED)
-        r"""The gamma model-coupling block at the given gauge frame (UNWEIGHTED).
+    ) -> torch.Tensor:                       # () mean_i KL(s_i || r)
+        r"""The hyper-prior channel term mean_i KL(s_i||r) (the lambda_h block, UNWEIGHTED).
 
-        The s-channel mirror of the belief beta block: tied flat transport from ``phi``,
-        E^s_ij = D(s_i || Omega s_j), gamma = softmax_j(log pi^s - E^s/tau_g), and either the
-        canonical envelope -tau_g log Z^s (include_attention_entropy=True) or the surrogate
-        sum_j gamma_ij E^s_ij (False; audit P6 -- one toggle, both channels). Shared by
-        ``forward`` (grad to the s tables; caller detaches phi) and :meth:`diagnostics`
-        (audit V2). Transport is factored-when-fusable (audit P4), exactly the E-step dispatch.
+        The forward-loss reduction (mean over tokens) of :meth:`_hyper_prior_kl`; grad-connected
+        so the channel trains through forward. Shared with :meth:`diagnostics` (which sums the SAME
+        per-token vector) so the logged decomposition carries the SAME term (audit 2026-06-09 V2).
+        """
+        return self._hyper_prior_kl(token_ids).mean()
+
+    def _gamma_energy(
+        self,
+        token_ids: torch.Tensor,             # (B, N) integer token ids
+        phi:       torch.Tensor,             # (B, N, n_gen) gauge frame (TIED flat transport)
+    ) -> 'tuple[torch.Tensor, float | torch.Tensor, Optional[torch.Tensor]]':
+        r"""Shared model-coupling setup: the s-channel pairwise energy E^s_ij, the gamma softmax
+        temperature tau_g, and the gamma attention log-prior.
+
+        The s-channel mirror of the belief beta channel under TIED FLAT transport from ``phi``
+        (Omega_tilde_ij = exp(phi_i) exp(-phi_j)): E^s_ij = D(s_i || Omega_tilde_ij s_j) on the
+        diagonal s tables, per irrep block (head). Transport is factored-when-fusable (audit P4),
+        exactly the E-step dispatch. Consumed by :meth:`_gamma_coupling_term` (the forward loss),
+        :meth:`_gamma_coupling_terms` (the split diagnostic), and :meth:`gamma_attention_maps`
+        (the gamma_ij figure), so all three read the SAME energy/temperature/prior.
         """
         from vfe3.families.gaussian import DiagonalGaussian
-        from vfe3.free_energy import (
-            attention_tau,
-            attention_weights,
-            pairwise_energy,
-            reduced_free_energy,
-        )
+        from vfe3.free_energy import attention_tau, pairwise_energy
         from vfe3.geometry.transport import transport_covariance, transport_mean
         from vfe3.inference.e_step import build_belief_transport
         cfg = self.cfg
@@ -748,14 +766,104 @@ class VFEModel(nn.Module):
         # gauge-irrep block size), exactly as the belief beta channel does. kappa_gamma is
         # gamma's own sharpness handle (not cfg.kappa).
         gamma_tau = attention_tau(_as_coeff(cfg.kappa_gamma, e_s.device), self.group.irrep_dims)
-        if cfg.include_attention_entropy:
+        return e_s, gamma_tau, gamma_log_prior
+
+    def _gamma_coupling_term(
+        self,
+        token_ids: torch.Tensor,             # (B, N) integer token ids
+        phi:       torch.Tensor,             # (B, N, n_gen) converged gauge frame (detached by caller)
+    ) -> torch.Tensor:                       # () model-coupling block (UNWEIGHTED)
+        r"""The gamma model-coupling block at the given gauge frame (UNWEIGHTED).
+
+        gamma = softmax_j(log pi^s - E^s/tau_g) over the :meth:`_gamma_energy` energy, reduced to
+        either the canonical envelope -tau_g log Z^s (include_attention_entropy=True) or the
+        surrogate sum_j gamma_ij E^s_ij (False; audit P6 -- one toggle, both channels). Shared by
+        ``forward`` (grad to the s tables; caller detaches phi) and :meth:`diagnostics` (audit V2).
+        :meth:`_gamma_coupling_terms` is the SPLIT (coupling vs meta-entropy) diagnostic sibling.
+        """
+        from vfe3.free_energy import attention_weights, reduced_free_energy
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi)
+        if self.cfg.include_attention_entropy:
             # canonical: the envelope -tau_g log Z^s equals coupling + entropy at gamma*
-            f_red_s = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior)   # (B,H,N) or (B,N)
-            return f_red_s.mean()
+            return reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior).mean()
         # Surrogate parity with the belief channel (audit 2026-06-09 P6): with the
         # attention-entropy term suppressed the block is sum_j gamma_ij E^s_ij at gamma*.
         gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
         return (gamma_w * e_s).sum(dim=-1).mean()
+
+    def _gamma_coupling_terms(
+        self,
+        token_ids: torch.Tensor,             # (B, N) integer token ids
+        phi:       torch.Tensor,             # (B, N, n_gen) converged gauge frame
+
+        *,
+        eps:       float = 1e-12,
+    ) -> 'Dict[str, torch.Tensor]':          # SUM-scale {coupling, meta_entropy, total}
+        r"""Split the gamma model-coupling block into its coupling and meta-entropy parts (UNWEIGHTED,
+        SUM over heads and token pairs -- the scale the belief blocks report in :meth:`diagnostics`).
+
+            coupling     = sum_{h,i,j} gamma_ij^(h) E^s_ij^(h)
+            meta_entropy = sum_{h,i,j} tau_g gamma_ij^(h) log( gamma_ij^(h) / pi^s_ij )
+            total        = sum_{h,i} ( -tau_g log Z^s_i )           (= coupling + meta_entropy at gamma*)
+
+        The s-channel mirror of :func:`vfe3.metrics.free_energy_terms` (belief_coupling /
+        attention_entropy): the diagnostic the figure pipeline needs to show gamma_ij KL(s_i||Omega s_j)
+        and its meta-entropy SEPARATELY, which the fused envelope :meth:`_gamma_coupling_term` returns
+        does not expose. pi^s is softmax(gamma_log_prior) (uniform 1/N when no prior); tau_g broadcasts
+        per head exactly as the belief entropy term does.
+        """
+        from vfe3.free_energy import _broadcast_tau, attention_weights, reduced_free_energy
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi)
+        gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
+        pi_s = (torch.softmax(gamma_log_prior, dim=-1) if gamma_log_prior is not None
+                else torch.full_like(gamma_w, 1.0 / gamma_w.shape[-1]))
+        tau_e = _broadcast_tau(gamma_tau, e_s)                       # (H,1,1) per-head, else scalar
+        coupling = (gamma_w * e_s).sum()
+        meta = (tau_e * gamma_w
+                * (torch.log(gamma_w.clamp(min=eps)) - torch.log(pi_s.clamp(min=eps)))).sum()
+        total = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior).sum()
+        return {"coupling": coupling, "meta_entropy": meta, "total": total}
+
+    @torch.no_grad()
+    def gamma_attention_maps(
+        self,
+        token_ids: torch.Tensor,             # (B, N) token ids; only sequence 0 is used
+    ) -> Optional[torch.Tensor]:             # (H, N, N) gamma_ij, or None when the s channel is off
+        r"""Per-head model-coupling attention gamma_ij for sequence 0 (no_grad), the s-channel mirror
+        of :meth:`attention_maps`.
+
+        gamma_ij = softmax_j( log pi^s_ij - E^s_ij / tau_g ) on the model-channel beliefs s under the
+        TIED FLAT transport from the CONVERGED belief gauge frame (the frame :meth:`diagnostics` and
+        the gamma loss evaluate the block at). Returns ``(H, N, N)`` (rows = query i, cols = key j;
+        H = len(group.irrep_dims), 1 for a single-block group) or ``None`` when the model channel is
+        inactive (no s tables). OFF the training hot path (no_grad); for periodic figure generation.
+        """
+        if not self._model_channel_active:
+            return None
+        from vfe3.free_energy import attention_weights
+        enc = self.prior_bank.encode(token_ids[:1])
+        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
+        if self.cfg.s_e_step:
+            s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
+            belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
+        n = belief.mu.shape[0]
+        log_prior = self._attention_log_prior(n, token_ids.device)
+        rope = self._rope_rotation(n, token_ids.device)
+        _llb = getattr(self, "log_lambda_beta", None)
+        out = vfe_stack(                                             # converged belief gauge frame
+            belief, belief.mu, belief.sigma, self.group, self.cfg,
+            log_prior=log_prior, block_norm=self.block_norm,
+            head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
+            log_alpha=getattr(self, "log_alpha", None),
+            lambda_beta=(self.cfg.lambda_beta if _llb is None else _llb.exp()),
+            connection_W=getattr(self, "connection_W", None),
+            rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
+        )
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids[:1], out.phi.unsqueeze(0))
+        gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)[0]   # drop batch
+        if gamma.dim() == 2:                                        # single-block group -> add an H=1 axis
+            gamma = gamma.unsqueeze(0)
+        return gamma                                                # (H, N, N)
 
     @torch.no_grad()
     def generate(
@@ -926,17 +1034,24 @@ class VFEModel(nn.Module):
                                           include_attention_entropy=cfg.include_attention_entropy,
                                           alpha_reg=(alpha_reg if cfg.alpha_mode != "constant" else None))
         d.update({k: float(v) for k, v in terms.items()})
-        # Model-channel terms (audit 2026-06-09 V2): when the lambda_h / gamma channels are live
-        # (and not folded into the belief anchor by s_e_step), the runtime loss carries them;
-        # report them and fold them into ``total`` so the logged decomposition equals the F the
-        # run actually descends (same helpers as forward, sequence 0 like the rest of this method).
-        if cfg.lambda_h > 0.0 and not cfg.s_e_step:
-            d["hyper_prior"] = float(cfg.lambda_h * self._hyper_prior_term(token_ids[:1]))
-            d["total"] += d["hyper_prior"]
-        if cfg.gamma_coupling > 0.0 and not cfg.s_e_step:
-            d["gamma_coupling"] = float(
-                cfg.gamma_coupling * self._gamma_coupling_term(token_ids[:1], out.phi.unsqueeze(0)))
-            d["total"] += d["gamma_coupling"]
+        # Model-channel F blocks (audit obs 18497 + the s/r/h/gamma figures): surface the hyper-prior
+        # and the gamma model-coupling block whenever their tables exist, INDEPENDENT of the loss
+        # gating. The loss folds these into the s-refinement under s_e_step to avoid a double GRADIENT,
+        # but the free-energy VALUE still carries them, so the diagnostic decomposition reports them in
+        # EVERY model-channel regime (including s_e_step=True, where they were previously invisible).
+        # Reported RAW and SUM-scale over seq 0 (like the belief blocks self/belief/attention above),
+        # gamma SPLIT into its coupling and meta-entropy parts; the WEIGHTED contributions are folded
+        # into ``total`` at the SAME sum scale, so train.py's uniform per-token /n_tok yields a
+        # commensurate decomposition (the prior fold added per-token MEANS into the per-sequence SUM
+        # total -- a 1/N under-weight of the model channel).
+        if cfg.lambda_h > 0.0 or cfg.s_e_step:                       # r table exists on this path
+            d["hyper_prior"] = float(self._hyper_prior_kl(token_ids[:1]).sum())          # raw sum_i KL(s_i||r)
+            d["total"] += cfg.lambda_h * d["hyper_prior"]
+        if cfg.gamma_coupling > 0.0 or cfg.s_e_step:                # gamma block evaluated at out.phi
+            g = self._gamma_coupling_terms(token_ids[:1], out.phi.unsqueeze(0))
+            d["gamma_coupling"]     = float(g["coupling"])           # raw sum_{h,i,j} gamma E^s
+            d["gamma_meta_entropy"] = float(g["meta_entropy"])       # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
+            d["total"] += cfg.gamma_coupling * (d["gamma_coupling"] + d["gamma_meta_entropy"])
         spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
         d["effective_rank"] = float(metrics.effective_rank(spec).mean())
         # Gauge-geometry probes (diagnostics tier): the curvature proxy -- mean Frobenius departure

@@ -147,6 +147,10 @@ def generate_figures(
     amaps       = _safe(lambda: model.attention_maps(tok), "attention_maps")
     health      = _safe(lambda: extract.numerical_health(model, tok), "numerical_health")
     s_channel   = _safe(lambda: extract.s_channel_refinement(model, tok), "s_channel_refinement")
+    mc_belief   = _safe(lambda: extract.model_channel_belief(model, tok), "model_channel_belief")
+    r_centroid  = _safe(lambda: extract.hyper_prior_centroid(model, tok), "hyper_prior_centroid")
+    h_coupling  = _safe(lambda: extract.hyper_prior_coupling(model, tok), "hyper_prior_coupling")
+    gamma_attn  = _safe(lambda: extract.gamma_attention(model, tok), "gamma_attention")
 
     # gpt2/cl100k decoder for the belief-UMAP linguistic-category colouring + token labels (None when
     # tiktoken is absent or the dataset has no real tokenizer -> the UMAP greys out and labels by id).
@@ -220,6 +224,21 @@ def generate_figures(
     _emit("s_channel_refinement",                                 # only when s_e_step=True (else None)
           lambda p: figs.plot_s_channel_refinement(s_channel, path=p),
           s_channel is not None)
+    # Model-channel (s / r / h) and gamma_ij figures: present whenever the model channel is active
+    # (s table exists); the r/h figures additionally require the centroid r (lambda_h>0 OR s_e_step),
+    # so their extractors return None and _emit skips them when r is absent.
+    _emit("model_channel_belief",                                 # the s figure
+          lambda p: figs.plot_model_channel_belief(mc_belief, path=p),
+          mc_belief is not None)
+    _emit("hyper_prior_centroid",                                 # the r figure
+          lambda p: figs.plot_hyper_prior_centroid(r_centroid, path=p),
+          r_centroid is not None)
+    _emit("hyper_prior_coupling",                                 # the h figure (lambda_h block)
+          lambda p: figs.plot_hyper_prior_coupling(h_coupling, path=p),
+          h_coupling is not None)
+    _emit("gamma_attention",                                      # the gamma_ij model-coupling attention
+          lambda p: figs.plot_gamma_attention(gamma_attn, path=p),
+          gamma_attn is not None)
 
     logger.info("wrote %d single-run figures to %s", len(written), figdir)
     return written

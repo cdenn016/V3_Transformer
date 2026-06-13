@@ -11,8 +11,10 @@ A training run produces a self-contained directory::
       test_results.json  end-of-run TEST-split eval on the reloaded best checkpoint
       summary.json       headline numbers (best_val_ppl, test_ppl, wall_time, ...)
       loss_curve.png     training cross-entropy trajectory
-      val_ppl.png        validation perplexity trajectory
-      free_energy_terms.png   the per-term free-energy decomposition at the last eval
+      val_ppl.png        validation perplexity trajectory (log-y, best marked)
+      holonomy.png / gauge_trace_spread.png   gauge-geometry diagnostics
+      free_energy_decomposition.png   per-token F budget snapshot + early/mid/late evolution
+      free_energy_codescent.png       F-vs-validation-CE co-descent (twin axis)
 
 ``RunArtifacts`` is OPT-IN: ``train`` only touches it when an instance is passed, so the silent
 path (``artifacts=None``) writes nothing and is unchanged. ``finalize_run`` reloads the best-val
@@ -27,7 +29,6 @@ import logging
 import math
 from dataclasses import asdict
 from pathlib import Path
-from types import ModuleType
 from typing import Dict, Iterable, List, Optional
 
 import torch
@@ -330,74 +331,95 @@ def _save_figures(
     try:
         from vfe3.viz import figures as figs
         figs.set_publication_style()
+        run = artifacts.run_dir
+
+        def _aligned(key: str) -> tuple:
+            r"""Aligned (step, value) for a history column, dropping pre-first-eval NaN rows."""
+            xs, ys = [], []
+            for i, r in enumerate(artifacts.history):
+                if key in r and math.isfinite(r[key]):
+                    xs.append(r.get("step", i))
+                    ys.append(r[key])
+            return xs, ys
+
         if losses:
-            fig = figs.plot_trajectory(losses, ylabel="train CE (nats)", title="Training loss",
-                                       path=str(artifacts.run_dir / "loss_curve.png"))
+            # losses is one entry per optimizer step, so the 1-based step index IS the x-axis.
+            n = len(losses)
+            fig = figs.plot_trajectory(
+                losses, list(range(1, n + 1)), ylabel="train CE (nats/token)",
+                title="Training cross-entropy", color=figs._CB[0],
+                smooth=max(25, n // 240), annotate_final=True,
+                path=str(run / "loss_curve.png"))
             figs.plt.close(fig)
-        val_ppl = [r["val_ppl"] for r in artifacts.history
-                   if "val_ppl" in r and math.isfinite(r["val_ppl"])]   # skip pre-first-eval NaNs
-        if val_ppl:
-            fig = figs.plot_trajectory(val_ppl, ylabel="val PPL", title="Validation perplexity",
-                                       path=str(artifacts.run_dir / "val_ppl.png"))
+        sx, sy = _aligned("val_ppl")
+        if sy:
+            fig = figs.plot_trajectory(
+                sy, sx, ylabel="validation perplexity", title="Validation perplexity",
+                color=figs._CB[1], logy=True, smooth=max(5, len(sy) // 80), annotate="min",
+                path=str(run / "val_ppl.png"))
             figs.plt.close(fig)
         # Gauge-geometry trajectories (diagnostics tier): curvature proxy + gauge-trace spread.
-        holo = [r["holonomy_deviation"] for r in artifacts.history if "holonomy_deviation" in r]
-        if holo:
-            fig = figs.plot_trajectory(holo, ylabel=r"$\langle\|H_{ijk}-I\|_F\rangle$",
-                                       title="Holonomy deviation (curvature proxy)",
-                                       path=str(artifacts.run_dir / "holonomy.png"))
+        hx, hy = _aligned("holonomy_deviation")
+        if hy:
+            # Heavy-tailed (median ~1e-3, rare spikes ~1e3): log y + a median reference; NOT smoothed,
+            # so the curvature spikes survive.
+            fig = figs.plot_trajectory(
+                hy, hx, ylabel=r"$\langle\|H_{ijk}-I\|_F\rangle$",
+                title="Holonomy deviation (curvature proxy)", color=figs._CB[2],
+                logy=True, median_line=True, annotate="max",
+                path=str(run / "holonomy.png"))
             figs.plt.close(fig)
-        gts = [r["gauge_trace_spread"] for r in artifacts.history if "gauge_trace_spread" in r]
-        if gts:
-            fig = figs.plot_trajectory(gts, ylabel=r"std $\log|\det\Omega|$",
-                                       title="Gauge trace spread",
-                                       path=str(artifacts.run_dir / "gauge_trace_spread.png"))
+        gx, gy = _aligned("gauge_trace_spread")
+        if gy:
+            fig = figs.plot_trajectory(
+                gy, gx, ylabel=r"std $\log|\det\Omega|$", title="Gauge trace spread",
+                color=figs._CB[3], smooth=max(5, len(gy) // 60), annotate_final=True,
+                path=str(run / "gauge_trace_spread.png"))
             figs.plt.close(fig)
         # Learnable belief-coupling weight: present in history only on a learnable_lambda_beta run.
-        lam = [r["lambda_beta"] for r in artifacts.history if "lambda_beta" in r]
-        if lam:
-            fig = figs.plot_trajectory(lam, ylabel=r"$\lambda_\beta = e^{\log\lambda_\beta}$",
-                                       title="Learned belief-coupling weight",
-                                       path=str(artifacts.run_dir / "lambda_beta.png"))
+        lx, ly = _aligned("lambda_beta")
+        if ly:
+            fig = figs.plot_trajectory(
+                ly, lx, ylabel=r"$\lambda_\beta = e^{\log\lambda_\beta}$",
+                title="Learned belief-coupling weight", color=figs._CB[4],
+                smooth=max(5, len(ly) // 60), annotate_final=True,
+                path=str(run / "lambda_beta.png"))
             figs.plt.close(fig)
-        if artifacts.history and "self_coupling" in artifacts.history[-1]:
-            _save_free_energy_bar(artifacts, figs)
-        # Publication free-energy DESCENT: the full F stack (self-coupling, lambda_beta-scaled
-        # belief-coupling + attention-entropy, data/CE term) over training, closing to the runtime
-        # total -- the figure the single bar above cannot draw (no time axis, no data term). Best-effort
-        # like the rest; needs the per-eval term history (a dense-eval run gives a real trajectory).
+        # Free-energy figures: the per-token budget DECOMPOSITION (snapshot + early/mid/late evolution)
+        # and, as a SEPARATE figure, the F-vs-CE CO-DESCENT over training. Both need every plotted term
+        # finite, so rows before the first eval (NaN val_*) are dropped.
         fe_keys = ("self_coupling", "belief_coupling", "attention_entropy", "val_ce")
-        # Require every plotted term FINITE: with the log-cadence CSV, val_* is NaN on rows before
-        # the first eval, and stacking a NaN data term would break the figure.
         fe_rows = [r for r in artifacts.history
                    if all(k in r and math.isfinite(r[k]) for k in fe_keys)]
         if fe_rows:
             cfg = getattr(artifacts, "cfg", None)
             hist = {"step": [r.get("step", i) for i, r in enumerate(fe_rows)],
                     **{k: [r[k] for r in fe_rows] for k in fe_keys}}
-            # Scale the coupling terms by the LEARNED lambda_beta trajectory when every row carries
-            # it (a learnable_lambda_beta run); else the static config scalar. (The figure now
-            # plots the data-term-inclusive stacked total in both panels, so free_energy_total --
-            # the coupling-only runtime total that excluded the CE term -- is no longer passed.)
+            # Scale the coupling terms by the LEARNED lambda_beta trajectory when every row carries it
+            # (a learnable_lambda_beta run); else the static config scalar.
             lam = ([r["lambda_beta"] for r in fe_rows] if all("lambda_beta" in r for r in fe_rows)
                    else getattr(cfg, "lambda_beta", 1.0))
-            fig = figs.plot_free_energy_descent(
-                hist, lambda_beta=lam,
-                path=str(artifacts.run_dir / "free_energy_descent.png"))
+            fig = figs.plot_free_energy_decomposition(
+                hist, lambda_beta=lam, path=str(run / "free_energy_decomposition.png"))
             figs.plt.close(fig)
+            fig = figs.plot_free_energy_codescent(
+                hist, lambda_beta=lam, path=str(run / "free_energy_codescent.png"))
+            figs.plt.close(fig)
+        # Model-channel free-energy blocks (s-channel): the hyper-prior KL(s||r), the gamma
+        # model-coupling, and its meta-entropy over training. Present only when the model channel
+        # is active (diagnostics logs these columns, gated on STATIC config), so the figure appears
+        # exactly on the runs that have a model channel. RAW per-token blocks, a SEPARATE figure
+        # since the model channel is a distinct hierarchical tier (h -> s -> p -> q).
+        mc_keys = ("hyper_prior", "gamma_coupling", "gamma_meta_entropy")
+        mc_present = [k for k in mc_keys
+                      if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
+        if mc_present:
+            mc_rows = [r for r in artifacts.history
+                       if all(k in r and math.isfinite(r[k]) for k in mc_present)]
+            if mc_rows:
+                hist_mc = {"step": [r.get("step", i) for i, r in enumerate(mc_rows)],
+                           **{k: [r[k] for r in mc_rows] for k in mc_present}}
+                fig = figs.plot_model_channel_terms(hist_mc, path=str(run / "model_channel_terms.png"))
+                figs.plt.close(fig)
     except Exception as exc:                                    # never let a plot kill a finished run
         logger.warning("figure generation failed (%s); numeric results are still saved", exc)
-
-
-def _save_free_energy_bar(artifacts: RunArtifacts, figs: ModuleType) -> None:
-    r"""Bar of the per-term free-energy decomposition at the last eval."""
-    last = artifacts.history[-1]
-    terms = {k: last[k] for k in ("self_coupling", "belief_coupling", "attention_entropy")
-             if k in last}
-    fig, ax = figs.plt.subplots(figsize=(4.5, 3.2))
-    ax.bar(range(len(terms)), list(terms.values()), color="#4C72B0")
-    ax.set_xticks(range(len(terms)))
-    ax.set_xticklabels(list(terms.keys()), rotation=20, ha="right")
-    ax.set(title="Free-energy decomposition (last eval)", ylabel="nats")
-    fig.savefig(str(artifacts.run_dir / "free_energy_terms.png"))
-    figs.plt.close(fig)
