@@ -26,6 +26,8 @@ from vfe3.families.base import (
     renyi,
     kl,
     squared_hellinger,
+    bhattacharyya,
+    jeffreys,
 )
 from vfe3.families import gaussian as _gaussian     # noqa: F401  (registers the Gaussian families)
 
@@ -33,6 +35,8 @@ __all__ = [
     "renyi",
     "kl",
     "squared_hellinger",
+    "bhattacharyya",
+    "jeffreys",
     "safe_kl_clamp",
     "family_cov_kind",
     "divergence_families",

@@ -568,3 +568,83 @@ def test_model_forward_under_squared_hellinger():
     assert logits.shape == (3, 5, 20)
     _, loss, _ = model(tokens, targets)
     assert loss.shape == () and torch.isfinite(loss)
+
+
+# --- bhattacharyya and jeffreys (added 2026-06-13: extend the f-divergence registry) -----------
+def test_bhattacharyya_equals_half_d_half():
+    """D_B(q||p) = D_{1/2}(q||p)/2 = renyi(q,p,alpha=0.5)/2 (the Bhattacharyya-distance identity)."""
+    from vfe3.divergence import get_functional, renyi
+    from vfe3.families.gaussian import DiagonalGaussian
+    g = torch.Generator().manual_seed(201)
+    q = DiagonalGaussian(torch.randn(6, 4, generator=g), torch.rand(6, 4, generator=g) + 0.5)
+    p = DiagonalGaussian(torch.randn(6, 4, generator=g), torch.rand(6, 4, generator=g) + 0.5)
+    d_b = get_functional("bhattacharyya")(q, p)
+    assert torch.allclose(d_b, 0.5 * renyi(q, p, alpha=0.5), atol=1e-6)
+
+
+def test_jeffreys_equals_symmetrized_kl():
+    """J(q||p) = KL(q||p) + KL(p||q) = renyi(q,p,1) + renyi(p,q,1)."""
+    from vfe3.divergence import get_functional, renyi
+    from vfe3.families.gaussian import DiagonalGaussian
+    g = torch.Generator().manual_seed(202)
+    q = DiagonalGaussian(torch.randn(6, 4, generator=g), torch.rand(6, 4, generator=g) + 0.5)
+    p = DiagonalGaussian(torch.randn(6, 4, generator=g), torch.rand(6, 4, generator=g) + 0.5)
+    j = get_functional("jeffreys")(q, p)
+    assert torch.allclose(j, renyi(q, p, alpha=1.0) + renyi(p, q, alpha=1.0), atol=1e-6)
+
+
+@pytest.mark.parametrize("name", ["bhattacharyya", "jeffreys"])
+@pytest.mark.parametrize("family", ["gaussian_diagonal", "gaussian_full"])
+def test_new_divergence_symmetric_and_nonneg(name, family):
+    """Both are SYMMETRIC (unlike KL) and non-negative across both Gaussian families."""
+    from vfe3.divergence import get_family, get_functional
+    g = torch.Generator().manual_seed(203)
+    mu_q = torch.randn(5, 4, generator=g)
+    mu_p = torch.randn(5, 4, generator=g)
+    if family == "gaussian_diagonal":
+        s_q = torch.rand(5, 4, generator=g) + 0.5
+        s_p = torch.rand(5, 4, generator=g) + 0.5
+    else:
+        Aq = torch.randn(5, 4, 4, generator=g)
+        Ap = torch.randn(5, 4, 4, generator=g)
+        s_q = Aq @ Aq.transpose(-1, -2) + 4 * torch.eye(4)
+        s_p = Ap @ Ap.transpose(-1, -2) + 4 * torch.eye(4)
+    fam, fn = get_family(family), get_functional(name)
+    qp = fn(fam(mu_q, s_q), fam(mu_p, s_p))
+    pq = fn(fam(mu_p, s_p), fam(mu_q, s_q))
+    assert torch.allclose(qp, pq, atol=1e-5), (qp - pq).abs().max()
+    assert bool((qp >= 0).all())
+
+
+@pytest.mark.parametrize("name", ["bhattacharyya", "jeffreys"])
+@pytest.mark.parametrize("family", ["gaussian_diagonal", "gaussian_full"])
+def test_new_divergence_self_is_zero(name, family):
+    from vfe3.divergence import get_family, get_functional
+    g = torch.Generator().manual_seed(204)
+    mu = torch.randn(4, 6, generator=g)
+    if family == "gaussian_diagonal":
+        sigma = torch.rand(4, 6, generator=g) + 0.1
+    else:
+        A = torch.randn(4, 6, 6, generator=g)
+        sigma = A @ A.transpose(-1, -2) + 6 * torch.eye(6)
+    fam = get_family(family)
+    out = get_functional(name)(fam(mu, sigma), fam(mu, sigma))
+    assert torch.allclose(out, torch.zeros(4), atol=1e-5)
+
+
+@pytest.mark.parametrize("name", ["bhattacharyya", "jeffreys"])
+def test_model_forward_under_new_divergence(name):
+    """End-to-end: a VFEModel forward + finite loss with the new functional flowing through
+    pairwise_energy / self_divergence (the autograd-oracle route, as for squared_hellinger)."""
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=2,
+                     n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0, divergence_family=name)
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, 20, (3, 5))
+    targets = torch.randint(0, 20, (3, 5))
+    assert model(tokens).shape == (3, 5, 20)
+    _, loss, _ = model(tokens, targets)
+    assert loss.shape == () and torch.isfinite(loss)
+    loss.backward()
+    assert model.prior_bank.mu_embed.grad is not None or model.prior_bank.output_proj_weight.grad is not None
