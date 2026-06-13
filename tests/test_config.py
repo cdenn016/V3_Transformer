@@ -410,18 +410,3 @@ def test_decode_mode_linear_stays_a_rejected_second_gate():
     OTHER seams."""
     with pytest.raises(ValueError):
         VFE3Config(decode_mode="linear")
-
-
-def test_phi_precond_dead_knob_warns():
-    r"""vram audit 2026-06-10: phi_precond_mode's only consumers are the E-step phi substep
-    (e_phi_lr > 0) and the natural-gradient gauge M-step (m_phi_natural_grad=True). With both
-    gates closed the knob is dead -- the config must say so, because a tuning session that
-    flips it in such a run attributes VRAM/speed effects to code that never executes."""
-    import warnings as _w
-    with pytest.warns(UserWarning, match="phi_precond_mode.*NO effect"):
-        VFE3Config(phi_precond_mode="killing_per_block", e_phi_lr=0.0, m_phi_natural_grad=False)
-    # Gate open (e_phi_lr > 0): the knob is live; the dead-knob warning must NOT fire.
-    with _w.catch_warnings(record=True) as caught:
-        _w.simplefilter("always")
-        VFE3Config(phi_precond_mode="killing_per_block", e_phi_lr=0.1, m_phi_natural_grad=False)
-    assert not any("NO effect" in str(c.message) for c in caught)

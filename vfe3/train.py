@@ -12,7 +12,8 @@ import contextlib
 import logging
 import math
 import time
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -30,9 +31,8 @@ from vfe3.data.datasets import make_dataloader
 from vfe3.free_energy import attention_tau
 from vfe3.model.block import _as_coeff
 from vfe3.model.model import VFEModel
-
-if TYPE_CHECKING:                                    # avoid an import cycle (run_artifacts imports evaluate)
-    from vfe3.run_artifacts import RunArtifacts
+from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
+#                                                      lazily (function-local), so there is no cycle
 
 
 def build_optimizer(

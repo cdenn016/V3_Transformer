@@ -250,7 +250,8 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         bar,
         f" Gauge VFE Transformer | {n_params} params | {device}",
         bar,
-        f" K={cfg.embed_dim}  N={cfg.max_seq_len}  L={cfg.n_layers}  heads={cfg.n_heads}  "
+        f" K={cfg.embed_dim}  N={cfg.max_seq_len}  L={cfg.n_layers}  "
+        f"heads={len(model.group.irrep_dims)}  "  # runtime attention heads = irrep blocks (cross_couplings -> 1)
         f"group={cfg.gauge_group}  family={cfg.family}",
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
@@ -297,7 +298,9 @@ def _run_label(cfg: VFE3Config, dataset: str) -> str:
     The stable part of the run-folder name: ``_run_dir`` prefixes it with a timestamp while the run is
     in progress, and ``_rename_run_by_ppl`` swaps that prefix for the test perplexity at finalize.
     """
-    tags = ("_linear" if not cfg.use_prior_bank else "") + ("_mix" if cfg.use_head_mixer else "")
+    tags = (("_linear" if not cfg.use_prior_bank else "")
+            + ("_mix" if cfg.use_head_mixer else "")
+            + ("_cross" if cfg.cross_couplings else ""))
     return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}"
 
 

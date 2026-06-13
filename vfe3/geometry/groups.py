@@ -12,7 +12,7 @@ congruence action (mu -> g mu, Sigma -> g Sigma g^T) this holds for every
 g in G <= GL(K), so every group here is admissible for "gaussian".
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -40,6 +40,28 @@ class GaugeGroup:
     invariant_families: Tuple[str, ...] = ("gaussian",)
     irrep_labels:       Optional[List[str]] = None # per-block label ('l1', 'sym2', ...); None = label-less
     algebra:            Optional[str] = None  # irrep-registry algebra key ('so' | 'sp'); None = label-less
+
+    # Cached pseudo-inverse of the generator Frobenius Gram (computed once, off __init__/eq/repr).
+    _gram_pinv_cache:   Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
+
+    def gram_pinv(self) -> torch.Tensor:
+        r"""Cached ``gram_pinv(generators)`` -- the Gram pseudo-inverse ``extract_phi`` projects with.
+
+        ``extract_phi`` recovers algebra coordinates by solving ``Gram c = g`` with
+        ``c = Gram^+ g``; ``Gram_ab = <G_a, G_b>_F`` depends ONLY on the fixed generator basis.
+        The BCH positional-composition hot path (``compose_bch -> extract_phi``) recomputed a dense
+        ``(n_gen, n_gen)`` float64 ``pinv`` every forward (for the orthonormal block_glk basis the
+        Gram is exactly ``I``, so the recompute was pure waste). Caching is value-identical -- the
+        returned tensor equals ``gram_pinv(self.generators)`` -- and recomputed only if the device
+        changes (e.g. the group's generators were moved after the first call).
+        """
+        if (self._gram_pinv_cache is None
+                or self._gram_pinv_cache.device != self.generators.device
+                or self._gram_pinv_cache.dtype != self.generators.dtype):
+            from vfe3.geometry.lie_ops import gram_pinv as _gram_pinv
+            with torch.no_grad():
+                self._gram_pinv_cache = _gram_pinv(self.generators)
+        return self._gram_pinv_cache
 
     def __post_init__(self) -> None:
         K = self.generators.shape[-1]
