@@ -119,3 +119,27 @@ def test_metrics_csv_logs_at_log_cadence(tmp_path):
     assert math.isnan(float(rows[0]["val_ce"]))                       # NaN before the first eval (step 4)
     assert math.isfinite(float(rows[1]["val_ce"]))                    # fresh val at the eval step
     assert rows[1]["val_ce"] == rows[2]["val_ce"]                     # carried forward between evals
+
+
+def test_s_channel_refinement_extractor_present_iff_s_e_step():
+    # s_e_step=True replays encode_s -> _refine_s and returns the per-position refinement diagnostics;
+    # s_e_step=False (the model channel never runs) returns None so the figure is skipped downstream.
+    from vfe3.viz.extract import s_channel_refinement
+    tok = torch.randint(0, 6, (2, 8))
+    on = _model(s_e_step=True, prior_source="model_channel", lambda_h=0.25, gamma_coupling=0.75)
+    d = s_channel_refinement(on, tok)
+    assert d is not None and set(d) == {"mu_delta", "logsigma_delta", "kl_s0_r", "kl_s1_r"}
+    for key, v in d.items():
+        assert v.shape == (8,) and torch.isfinite(v).all(), key
+    off = _model(s_e_step=False)
+    assert s_channel_refinement(off, tok) is None
+
+
+def test_generate_figures_emits_s_channel_under_s_e_step(tmp_path):
+    # The s-channel figure is written iff s_e_step=True (guarded by the None extractor).
+    on = _model(s_e_step=True, prior_source="model_channel", lambda_h=0.25, gamma_coupling=0.75)
+    written = {p.name for p in generate_figures(tmp_path / "on", model=on, loader=_loader(), max_sequences=16)}
+    assert "s_channel_refinement.png" in written
+    off = _model(s_e_step=False)
+    written_off = {p.name for p in generate_figures(tmp_path / "off", model=off, loader=_loader(), max_sequences=16)}
+    assert "s_channel_refinement.png" not in written_off

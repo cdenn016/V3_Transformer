@@ -473,6 +473,37 @@ def plot_estep_convergence(
     return _save(fig, path)
 
 
+def plot_s_channel_refinement(
+    s_data:  Dict,                       # extract.s_channel_refinement output (caller skips when None)
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""Model-channel (s) refinement under ``s_e_step=True``: how the s E-step moves the model belief.
+
+    Panel A is the per-position KL to the frozen hyper-prior centroid r BEFORE (static ``s0``) and
+    AFTER (refined ``s1``) the s E-step -- a healthy model channel pulls toward r, so the refined
+    bars sit at or below the static ones. Panel B is the per-position refinement magnitude
+    ``||Delta mu_s||`` and ``||Delta log sigma_s||`` -- where on the sequence the s-channel acts.
+    """
+    kl0 = _np(s_data["kl_s0_r"]); kl1 = _np(s_data["kl_s1_r"])
+    dmu = _np(s_data["mu_delta"]); dls = _np(s_data["logsigma_delta"])
+    pos = np.arange(kl0.size)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
+    w = 0.4
+    axes[0].bar(pos - w / 2, kl0, width=w, color=_CB[0], label=r"$\mathrm{KL}(s_0\|r)$ (static)")
+    axes[0].bar(pos + w / 2, kl1, width=w, color=_CB[1], label=r"$\mathrm{KL}(s_1\|r)$ (refined)")
+    axes[0].set(xlabel="token position", ylabel="KL to hyper-prior $r$ (nats)",
+                title="Model-channel consensus toward $r$")
+    axes[0].legend(fontsize=8, frameon=False)
+    axes[1].plot(pos, dmu, "o-", color=_CB[2], ms=4, lw=1.5, label=r"$\|\Delta\mu_s\|$")
+    axes[1].plot(pos, dls, "s-", color=_CB[3 % len(_CB)], ms=4, lw=1.5, label=r"$\|\Delta\log\sigma_s\|$")
+    axes[1].set(xlabel="token position", ylabel="refinement magnitude", title="s-channel E-step motion")
+    axes[1].legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
 @register_figure("ln3_symmetry_breaking")
 def plot_ln3_symmetry_breaking(
     frozen:  Dict,                       # {step, val_ce, omega (N,N,K,K), beta (H,N,N)}
