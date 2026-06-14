@@ -74,28 +74,38 @@ def build_optimizer(
     # Default OFF: the flag is absent and every group is plain AdamW, byte-identical to before.
     nat = cfg.m_phi_natural_grad
     n_gen = model.group.generators.shape[0]
-    phi_group = {"params": [pb.phi_embed], "lr": cfg.m_phi_lr, "weight_decay": cfg.phi_weight_decay}
+    # Each group carries an explicit "role" in {mu, sigma, phi} -- the belief-component family it
+    # steps (mean-LR / scale-LR / gauge-LR). The grad-norm decomposition (train_step) aggregates the
+    # pre-clip grad by role, so the figure attributes the signal correctly REGARDLESS of group order
+    # or which tables are live (e.g. under prior_source='model_channel' the dead mu_embed contributes
+    # 0 while the live s_mu_embed carries the mean signal -- both are role='mu'). Role is used in
+    # preference to the group INDEX (the old 0/1/2 assumption broke whenever a config rerouted the
+    # active mean/scale capacity off mu_embed/sigma_log_embed) and to the LR VALUE (m_p_mu_lr and
+    # m_phi_lr may coincide). Extra dict keys ride alongside "gauge"/"weight_decay" and are ignored
+    # by AdamW / GaugeNaturalGradAdamW.
+    phi_group = {"params": [pb.phi_embed], "lr": cfg.m_phi_lr, "weight_decay": cfg.phi_weight_decay,
+                 "role": "phi"}
     if nat:
         phi_group["gauge"] = True
         phi_group["weight_decay"] = 0.0
     groups = [
-        {"params": [pb.mu_embed],                              "lr": cfg.m_p_mu_lr},
-        {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_p_sigma_lr},
+        {"params": [pb.mu_embed],                              "lr": cfg.m_p_mu_lr,    "role": "mu"},
+        {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_p_sigma_lr, "role": "sigma"},
         phi_group,
     ]
     if pb.output_proj_weight is not None:                       # use_prior_bank=False linear decode
-        groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_p_mu_lr})
+        groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_p_mu_lr, "role": "mu"})
     if pb.output_proj_bias is not None:                         # decode_bias: learned log-unigram prior
         # weight_decay=0 -- decaying a unigram prior toward zero biases it to a flat distribution
         # (the same protection phi/Omega carry). VFE_2.0 parity: trainer.py m_decode_nodecay group.
-        groups.append({"params": [pb.output_proj_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0})
+        groups.append({"params": [pb.output_proj_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
     if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
-        groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_p_mu_lr})
+        groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_p_mu_lr, "role": "mu"})
     if getattr(model, "cg_coupling", None) is not None:         # use_cg_coupling=True CG path weights
-        groups.append({"params": [model.cg_coupling.path_weights], "lr": cfg.m_p_mu_lr})
+        groups.append({"params": [model.cg_coupling.path_weights], "lr": cfg.m_p_mu_lr, "role": "mu"})
     if getattr(model, "pos_phi_free", None) is not None:        # pos_phi='learned' positional table
         pos_group = {"params": [model.pos_phi_free], "lr": cfg.m_phi_lr,      # a gauge-frame scale
-                     "weight_decay": cfg.phi_weight_decay}                    # decayed like phi_embed
+                     "weight_decay": cfg.phi_weight_decay, "role": "phi"}     # decayed like phi_embed
         # Natural-grad the positional frame too. pos_phi_free is created at FULL coordinate width
         # (n_gen) and project_phi_to_slk preserves that width, so this width guard is currently
         # ALWAYS satisfied (audit 2026-06-13 L2: there is no reduced-width chart today). It is kept
@@ -106,8 +116,8 @@ def build_optimizer(
             pos_group["weight_decay"] = 0.0
         groups.append(pos_group)
     if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (lambda_gamma>0 or
-        groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_p_mu_lr})    # prior_source=model_channel):
-        groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_p_sigma_lr})  # mean@m_p_mu_lr, log-scale@
+        groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu"})    # prior_source=model_channel):
+        groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_p_sigma_lr, "role": "sigma"})  # mean@m_p_mu_lr, log-scale@
         # m_p_sigma_lr, mirroring the belief tables. s is the model channel / (under model_channel) the
         # live belief prior, so it must train. The hyper-prior CENTROID r is grouped only when
         # learnable_r un-freezes it (next block); FROZEN-by-default r (requires_grad=False, prior_bank.py)
@@ -118,19 +128,19 @@ def build_optimizer(
         # centroid toward the degenerate (r_mu=0, r_sigma=1) fixed point, fighting the empirical-Bayes
         # population-centroid objective (and corrupting the KL(s||r) m-projection at sigma_init != 1) --
         # the same exemption the learned unigram-bias prior (output_proj_bias) and the gauge frame carry.
-        groups.append({"params": [pb.r_mu],        "lr": cfg.m_p_mu_lr,    "weight_decay": 0.0})  # centroid mean
-        groups.append({"params": [pb.r_sigma_log], "lr": cfg.m_p_sigma_lr, "weight_decay": 0.0})  # centroid log-scale
+        groups.append({"params": [pb.r_mu],        "lr": cfg.m_p_mu_lr,    "weight_decay": 0.0, "role": "mu"})     # centroid mean
+        groups.append({"params": [pb.r_sigma_log], "lr": cfg.m_p_sigma_lr, "weight_decay": 0.0, "role": "sigma"})  # centroid log-scale
     if getattr(model, "connection_W", None) is not None:        # transport_mode='regime_ii' learned
-        w_group = {"params": [model.connection_W], "lr": cfg.m_phi_lr}        # connection -> gauge LR
+        w_group = {"params": [model.connection_W], "lr": cfg.m_phi_lr, "role": "phi"}   # connection -> gauge LR
         if cfg.connection_weight_decay is not None:             # dedicated connection-norm ceiling
             w_group["weight_decay"] = cfg.connection_weight_decay   # (audit 2026-06-10 F9); None ->
         groups.append(w_group)                                  # inherit the global weight_decay
     if getattr(model, "log_alpha", None) is not None:           # lambda_alpha_mode='learnable' scalar coupling
-        groups.append({"params": [model.log_alpha], "lr": cfg.m_p_mu_lr})
+        groups.append({"params": [model.log_alpha], "lr": cfg.m_p_mu_lr, "role": "mu"})
     if getattr(model, "log_lambda_beta", None) is not None:     # learnable_lambda_beta scalar belief-coupling weight
-        groups.append({"params": [model.log_lambda_beta], "lr": cfg.m_phi_lr})  # a coupling/gauge-scale LR
+        groups.append({"params": [model.log_lambda_beta], "lr": cfg.m_phi_lr, "role": "phi"})  # a coupling/gauge-scale LR
     if getattr(model, "log_lambda_h", None) is not None:        # lambda_h_mode='learnable' scalar hyper-prior weight
-        groups.append({"params": [model.log_lambda_h], "lr": cfg.m_p_mu_lr})  # a precision-coupling scale (like log_alpha)
+        groups.append({"params": [model.log_lambda_h], "lr": cfg.m_p_mu_lr, "role": "mu"})  # a precision-coupling scale (like log_alpha)
 
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
     # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the
@@ -289,8 +299,12 @@ def train_step(
 
     optimizer.zero_grad(set_to_none=True)
     _mb_tok: List[int] = []                                     # per-microbatch counted-token spread (accum only)
+    # E-step belief-gradient capture: a dict the forward fills with the raw ||grad_mu/sigma/phi|| of F
+    # (the inference analogue of the M-step per-role grad norms). Created ONLY when metrics are being
+    # logged this step; None -> the forward skips the capture entirely (zero overhead, byte-identical).
+    _egrad = {} if metrics_out is not None else None
     if grad_accum_steps == 1:                                   # default path: byte-identical to the single-step loop
-        _, loss, _ = model(tokens, targets)
+        _, loss, _ = model(tokens, targets, estep_grad_out=_egrad)
         _scaler.scale(loss).backward()
         step_loss = float(loss.detach())
     else:
@@ -304,7 +318,7 @@ def train_step(
         tgt_chunks = torch.chunk(targets, grad_accum_steps, dim=0)
         step_loss = 0.0
         for tok_mb, tgt_mb in zip(tok_chunks, tgt_chunks):
-            _, loss_mb, _ = model(tok_mb, tgt_mb)
+            _, loss_mb, _ = model(tok_mb, tgt_mb, estep_grad_out=_egrad)   # last microbatch wins the E-step grads
             _scaler.scale(loss_mb / grad_accum_steps).backward()   # accumulate the mean-normalized microbatch grad
             step_loss += float(loss_mb.detach()) / grad_accum_steps
             _mb_tok.append(int((tgt_mb != -100).sum()))            # counted tokens per microbatch (spread = bias)
@@ -317,23 +331,37 @@ def train_step(
         _scaler.unscale_(optimizer)
     if metrics_out is not None:
         # Pre-clip gradient health -- the global L2 norm clip_grad_norm_ RETURNS-and-discards, plus
-        # per-group norms (groups 0/1/2 = mu/sigma/phi from build_optimizer). Captured AFTER unscale_
-        # but BEFORE clip so the value is the true pre-clip gradient magnitude.
+        # per-ROLE norms (mu/sigma/phi from each group's "role" tag in build_optimizer, aggregated in
+        # quadrature across ALL groups carrying that role). Role -- not the old groups[0/1/2] index --
+        # so the LIVE tables are attributed correctly under any config (e.g. under
+        # prior_source='model_channel' the dead mu_embed adds 0 while the live s_mu_embed carries the
+        # role='mu' signal; previously mu/sigma logged a flat 0). Captured AFTER unscale_ but BEFORE
+        # clip so the value is the true pre-clip gradient magnitude. The three roles partition every
+        # group, so role grads sum in quadrature to grad_norm.
         total_sq: float = 0.0
-        per_group: List[float] = []
+        role_g_sq = {"mu": 0.0, "sigma": 0.0, "phi": 0.0}
+        role_w_sq = {"mu": 0.0, "sigma": 0.0, "phi": 0.0}
         for g in optimizer.param_groups:
             gsq = sum(float(p.grad.detach().pow(2).sum())
                       for p in g["params"] if p.grad is not None)
-            per_group.append(gsq ** 0.5)
             total_sq += gsq
+            _role = g.get("role")
+            if _role in role_g_sq:
+                role_g_sq[_role] += gsq
+                role_w_sq[_role] += sum(float(p.detach().pow(2).sum()) for p in g["params"])
         metrics_out["grad_norm"] = total_sq ** 0.5
-        for _i, _name in enumerate(("mu", "sigma", "phi")):
-            if _i < len(per_group):
-                metrics_out[f"grad_norm_{_name}"] = per_group[_i]
-                # weight norm of the same group: with the logged grad_norm + per-group LR, the
-                # update-to-weight ratio (the ~1e-3 LR-scale sanity check) is derivable offline.
-                _wn = sum(float(p.detach().pow(2).sum()) for p in optimizer.param_groups[_i]["params"])
-                metrics_out[f"weight_norm_{_name}"] = _wn ** 0.5
+        for _name in ("mu", "sigma", "phi"):
+            metrics_out[f"grad_norm_{_name}"] = role_g_sq[_name] ** 0.5
+            # weight norm of the same role: with the logged grad_norm + per-group LR, the
+            # update-to-weight ratio (the ~1e-3 LR-scale sanity check) is derivable offline.
+            metrics_out[f"weight_norm_{_name}"] = role_w_sq[_name] ** 0.5
+        # E-step belief-gradient norms: the raw ||grad_mu/sigma/phi|| of F captured inside the last
+        # E-step iteration (model.forward estep_grad_out) -- the INFERENCE analogue of the M-step
+        # per-role grads above (parameter learning). 0.0 for a component whose substep is off (e.g.
+        # phi when e_phi_lr=0); the figure masks non-positive points.
+        if _egrad is not None:
+            for _name in ("mu", "sigma", "phi"):
+                metrics_out[f"estep_grad_norm_{_name}"] = float(_egrad.get(_name, 0.0))
         metrics_out["loss_finite"] = float(math.isfinite(step_loss))
         if _mb_tok:                                             # grad_accum_steps>1: token-spread bias check
             metrics_out["grad_accum_tok_spread"] = float(max(_mb_tok) - min(_mb_tok))
@@ -760,6 +788,7 @@ def train(
             if step_metrics:
                 for _gk in ("grad_norm", "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi",
                             "weight_norm_mu", "weight_norm_sigma", "weight_norm_phi",
+                            "estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi",
                             "loss_finite", "grad_scale", "grad_accum_tok_spread"):
                     if _gk in step_metrics:
                         row[_gk] = step_metrics[_gk]

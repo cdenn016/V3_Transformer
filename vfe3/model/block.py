@@ -40,6 +40,7 @@ def vfe_block(
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
     capture:         Optional[dict]            = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
+    grad_record:     Optional[dict]            = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
@@ -68,6 +69,7 @@ def vfe_block(
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
         cocycle_relaxation=cfg.cocycle_relaxation, connection_W=connection_W,
         e_step_gradient=e_step_gradient, oracle_unroll_grad=cfg.oracle_unroll_grad,
+        grad_record=grad_record,
         log_prior=log_prior,
         rope=rope, rope_on_cov=rope_on_cov,
     )

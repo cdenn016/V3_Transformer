@@ -82,8 +82,64 @@ def test_train_step_metrics_out_captures_grad_norm() -> None:
     for k in ("grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"):
         assert k in out and math.isfinite(out[k])
     assert out["loss_finite"] == 1.0
-    # global norm is the L2 combine of the per-group norms (groups 0/1/2 are mu/sigma/phi + any extra)
-    assert out["grad_norm"] >= out["grad_norm_mu"] - 1e-5
+    # the three roles partition every optimizer group, so they combine in quadrature to the global norm
+    quad = (out["grad_norm_mu"] ** 2 + out["grad_norm_sigma"] ** 2 + out["grad_norm_phi"] ** 2) ** 0.5
+    assert abs(quad - out["grad_norm"]) < 1e-4 * max(1.0, out["grad_norm"])
+
+
+def test_grad_norm_decomposition_attributes_live_tables_under_model_channel() -> None:
+    # Regression (2026-06-14): under prior_source='model_channel' the belief prior tables
+    # mu_embed/sigma_log_embed are DEAD (the prior reroutes to the s tables), so the old
+    # groups[0/1/2] index logged grad_norm_mu/sigma == 0.0 and the decomposition figure showed only
+    # phi. With role-tagged groups the LIVE s_mu_embed/s_sigma_log_embed (role mu/sigma) carry the
+    # signal, so all three roles are attributed and nonzero.
+    torch.manual_seed(0)
+    cfg = _cfg(use_prior_bank=False, prior_source="model_channel", s_e_step=True, e_s_mu_lr=0.5,
+               lambda_h=0.25, lambda_h_mode="state_dependent", lambda_gamma=0.5,
+               decode_mode="diagonal_chunked")
+    model = VFEModel(cfg).to(DEVICE)
+    opt = build_optimizer(model, cfg)
+    assert all(g.get("role") in ("mu", "sigma", "phi") for g in opt.param_groups)  # every group tagged
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, _floor_lr_lambdas([g["lr"] for g in opt.param_groups], cfg))
+    tok = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.max_seq_len), device=DEVICE)
+    tgt = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.max_seq_len), device=DEVICE)
+    out: dict = {}
+    train_step(model, opt, sched, tok, tgt, grad_clip=1.0, metrics_out=out)
+    assert out["grad_norm_mu"] > 0.0, "role-aggregated mu grad must be nonzero (live s_mu_embed)"
+    assert out["grad_norm_sigma"] > 0.0, "role-aggregated sigma grad must be nonzero (live s_sigma_log_embed)"
+
+
+def test_train_step_captures_estep_grad_norms() -> None:
+    # The E-step belief-gradient norms ||grad_mu/sigma/phi|| of F (the INFERENCE analogue of the
+    # M-step per-role grads) are captured by model.forward(estep_grad_out=...) and logged per step.
+    torch.manual_seed(0)
+    cfg = _cfg()
+    model = VFEModel(cfg).to(DEVICE)
+    opt = build_optimizer(model, cfg)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, _floor_lr_lambdas([g["lr"] for g in opt.param_groups], cfg))
+    tok = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.max_seq_len), device=DEVICE)
+    tgt = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.max_seq_len), device=DEVICE)
+    out: dict = {}
+    train_step(model, opt, sched, tok, tgt, grad_clip=1.0, metrics_out=out)
+    for k in ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi"):
+        assert k in out and math.isfinite(out[k]) and out[k] >= 0.0
+    # the belief E-step always runs the mean and scale substeps, so their F-gradients are nonzero
+    assert out["estep_grad_norm_mu"] > 0.0 and out["estep_grad_norm_sigma"] > 0.0
+
+
+def test_estep_grad_out_does_not_perturb_the_forward() -> None:
+    # estep_grad_out is a pure out-param: the captured belief grads are detached norms, so passing
+    # the dict must not change the loss VALUE; the default (None) is zero-overhead.
+    torch.manual_seed(0)
+    cfg = _cfg()
+    model = VFEModel(cfg).to(DEVICE)
+    tok = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.max_seq_len), device=DEVICE)
+    tgt = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.max_seq_len), device=DEVICE)
+    rec: dict = {}
+    _, loss_capt, _ = model(tok, tgt, estep_grad_out=rec)
+    _, loss_plain, _ = model(tok, tgt)
+    assert set(rec) == {"mu", "sigma", "phi"}
+    assert torch.allclose(loss_capt, loss_plain)
 
 
 def test_train_step_without_metrics_out_is_plain_float() -> None:
@@ -113,6 +169,7 @@ def test_metrics_csv_has_tier1_columns_and_is_rectangular() -> None:
     assert rows, "no metrics rows written"
     cols = set(rows[0].keys())
     need = (["grad_norm", "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi", "loss_finite",
+             "estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi",
              "tokens_per_s", "peak_mem_mb", "generalization_gap",
              "self_coupling", "self_divergence"] + _NEW_DIAG_KEYS)
     assert not [c for c in need if c not in cols], f"CSV missing Tier-1 columns: {[c for c in need if c not in cols]}"

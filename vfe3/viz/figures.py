@@ -719,29 +719,20 @@ def plot_model_channel_terms(
     return _save(fig, path)
 
 
-@register_figure("grad_norm_decomposition")
-def plot_grad_norm_decomposition(
-    history: Dict,                       # step + any of: grad_norm_mu, grad_norm_sigma, grad_norm_phi
-
-    *,
-    path:    Optional[str] = None,
+def _grad_norm_decomp_fig(
+    history: Dict,
+    spec:    list,                       # [(column_key, latex_label, color), ...]
+    title:   str,
+    ylabel:  str,
+    path:    Optional[str],
 ):
-    r"""Per-parameter-group pre-clip gradient L2 norms over training: the mu / sigma / phi
-    decomposition of the aggregate ``grad_norm`` curve.
+    r"""Shared body for the mu / sigma / phi gradient-norm decomposition figures (M-step and E-step).
 
-    The optimizer parameter groups 0/1/2 are mu / sigma / phi (build_optimizer), so a per-group
-    norm isolates WHICH channel the optimization signal flows into -- the aggregate grad_norm.png
-    sums them and hides that. Each series is a faint raw line under a rolling-mean trend on a log y
-    (the norms are strictly positive and span orders of magnitude, like grad_norm.png's logy), with
-    the final value tagged. Captured AFTER unscale_ but BEFORE clip in train_step, so these are the
-    true pre-clip magnitudes; a SEPARATE figure from the aggregate that it decomposes.
+    Each series is a faint raw line under a rolling-mean trend on a log y (norms are strictly positive
+    and span orders of magnitude), with the final value tagged. A component that is identically zero /
+    absent (a dead or off substep) drops out under the log-y positive mask rather than flatlining at 0.
     """
     step = _np(history["step"]).astype(float)
-    spec = [
-        ("grad_norm_mu",    r"$\|\nabla_\mu\|_2$",    _CB[0]),
-        ("grad_norm_sigma", r"$\|\nabla_\Sigma\|_2$", _CB[1]),
-        ("grad_norm_phi",   r"$\|\nabla_\phi\|_2$",   _CB[2]),
-    ]
     fig, ax = plt.subplots(figsize=(6.8, 4.0))
     w = max(5, step.size // 80)
     plotted = False
@@ -749,7 +740,7 @@ def plot_grad_norm_decomposition(
         if key not in history:
             continue
         v = _np(history[key]).astype(float)
-        keep = np.isfinite(v) & (v > 0)                           # log y: drop non-positive (frozen-group) points
+        keep = np.isfinite(v) & (v > 0)                           # log y: drop non-positive (dead/off-substep) points
         x, vv = step[keep], v[keep]
         if not vv.size:
             continue
@@ -763,10 +754,63 @@ def plot_grad_norm_decomposition(
         if step.size:
             ax.set_xlim(float(step.min()), float(step.max()))
         ax.legend(fontsize=8, frameon=False, loc="upper right")
-    ax.set(xlabel="training step", ylabel=r"pre-clip $\|\nabla\|_2$ (per group)",
-           title="Gradient norm decomposition (mu / sigma / phi)")
+    ax.set(xlabel="training step", ylabel=ylabel, title=title)
     fig.tight_layout()
     return _save(fig, path)
+
+
+@register_figure("grad_norm_decomposition")
+def plot_grad_norm_decomposition(
+    history: Dict,                       # step + any of: grad_norm_mu, grad_norm_sigma, grad_norm_phi
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""M-STEP per-role pre-clip parameter-gradient L2 norms over training: the mu / sigma / phi
+    decomposition of the aggregate ``grad_norm`` curve.
+
+    Each optimizer group is tagged with a role in {mu, sigma, phi} (build_optimizer); the logged
+    norm aggregates the pre-clip grad over ALL groups of a role, so it isolates WHICH belief-component
+    family the LEARNING signal flows into regardless of which tables are live (e.g. the s_* tables under
+    prior_source='model_channel') -- the aggregate grad_norm.png sums them and hides that. Captured
+    AFTER unscale_ but BEFORE clip in train_step, so these are the true pre-clip magnitudes; the E-step
+    inference analogue is estep_grad_norm_decomposition.
+    """
+    spec = [
+        ("grad_norm_mu",    r"$\|\nabla_\mu \mathcal{L}\|_2$",    _CB[0]),
+        ("grad_norm_sigma", r"$\|\nabla_\Sigma \mathcal{L}\|_2$", _CB[1]),
+        ("grad_norm_phi",   r"$\|\nabla_\phi \mathcal{L}\|_2$",   _CB[2]),
+    ]
+    return _grad_norm_decomp_fig(
+        history, spec, "M-step gradient norm decomposition (mu / sigma / phi)",
+        r"pre-clip $\|\nabla_\theta \mathcal{L}\|_2$ (per role)", path)
+
+
+@register_figure("estep_grad_norm_decomposition")
+def plot_estep_grad_norm_decomposition(
+    history: Dict,                       # step + any of: estep_grad_norm_mu, estep_grad_norm_sigma, estep_grad_norm_phi
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""E-STEP per-component belief-gradient L2 norms over training: the mu / sigma / phi decomposition
+    of the inference free-energy gradient.
+
+    The companion to the M-step grad_norm_decomposition: where that shows how hard the LEARNING (M-step,
+    parameter) gradient pushes each belief-component family, this shows how hard the INFERENCE (E-step)
+    gradient ``\nabla F`` pushes the belief tuple ``(mu, Sigma, phi)`` itself -- the RAW gradient inside
+    the last E-step iteration, before the Fisher / natural-gradient preconditioning, captured by
+    model.forward(estep_grad_out=...). A component reads 0 (dropped on the log y) when its substep is off
+    (e.g. phi when e_phi_lr=0).
+    """
+    spec = [
+        ("estep_grad_norm_mu",    r"$\|\nabla_\mu F\|_2$",    _CB[0]),
+        ("estep_grad_norm_sigma", r"$\|\nabla_\Sigma F\|_2$", _CB[1]),
+        ("estep_grad_norm_phi",   r"$\|\nabla_\phi F\|_2$",   _CB[2]),
+    ]
+    return _grad_norm_decomp_fig(
+        history, spec, "E-step gradient norm decomposition (mu / sigma / phi)",
+        r"E-step $\|\nabla F\|_2$ (per component)", path)
 
 
 @register_figure("estep_convergence")

@@ -43,6 +43,7 @@ def vfe_stack(
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
     capture:         Optional[dict]            = None,   # out-param: LAST block's converged (pre-transform) belief under 'converged'
+    grad_record:     Optional[dict]            = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
 ) -> BeliefState:
     r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior.
 
@@ -64,7 +65,7 @@ def vfe_stack(
                            log_alpha=log_alpha, lambda_beta=lambda_beta,
                            connection_W=connection_W,
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,
-                           capture=capture)                       # each block overwrites; last wins
+                           capture=capture, grad_record=grad_record)   # each block overwrites; last wins
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
     return belief

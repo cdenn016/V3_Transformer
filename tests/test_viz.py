@@ -31,6 +31,7 @@ from vfe3.viz.figures import (
     plot_gauge_equivariance,
     plot_gauge_head_specialization,
     plot_grad_norm_decomposition,
+    plot_estep_grad_norm_decomposition,
     plot_holonomy_curvature,
     plot_ln3_symmetry_breaking,
     plot_lr_grid_heatmap,
@@ -231,6 +232,23 @@ def test_plot_grad_norm_decomposition_partial_columns(tmp_path):
     p = tmp_path / "grad_decomp_partial.png"
     fig = plot_grad_norm_decomposition(hist, path=str(p)); plt.close(fig)
     assert _saved_nonempty(p)
+
+
+def test_plot_estep_grad_norm_decomposition_saves(tmp_path):
+    # the E-step (inference) belief-gradient decomposition: separate figure from the M-step one,
+    # reads the estep_grad_norm_* columns. phi may be identically 0 (e_phi_lr=0) -> dropped on log y.
+    n = 60
+    rng = np.random.default_rng(1)
+    hist = {
+        "step":                  list(range(1, n + 1)),
+        "estep_grad_norm_mu":    list(np.abs(rng.standard_normal(n)) * 1e-1 + 1e-2),
+        "estep_grad_norm_sigma": list(np.abs(rng.standard_normal(n)) * 1e-2 + 1e-3),
+        "estep_grad_norm_phi":   [0.0] * n,                           # phi substep off -> all dropped
+    }
+    p = tmp_path / "estep_grad_decomp.png"
+    fig = plot_estep_grad_norm_decomposition(hist, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+    assert callable(get_figure("estep_grad_norm_decomposition"))
 
 
 def test_plot_estep_convergence_saves(tmp_path):

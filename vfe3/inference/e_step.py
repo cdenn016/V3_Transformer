@@ -349,6 +349,7 @@ def e_step_iteration(
     connection_W:              Optional[torch.Tensor] = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
     rope:                      Optional[torch.Tensor] = None,   # (N, K, K) gauge-RoPE rotation
     rope_on_cov:               bool                   = False,  # full-gauge: rotate covariance too
+    grad_record:               Optional[dict]         = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
     (autograd of the alignment block + preconditioner + Lie retraction).
@@ -427,6 +428,13 @@ def e_step_iteration(
         # downstream, detach runs under no_grad).
         create_graph=(oracle_unroll_grad and e_step_gradient == "unroll"),
     )
+    if grad_record is not None:
+        # Diagnostic: the RAW belief-gradient L2 norms ||grad_mu||, ||grad_sigma|| (pre-natural-grade,
+        # the E-step analogue of the M-step's raw per-group grad_norm). Detached 0-dim tensors (no host
+        # sync here, no graph retained); phi defaults to 0 and is overwritten below iff phi steps.
+        grad_record["mu"]    = grad_mu.detach().pow(2).sum().sqrt()
+        grad_record["sigma"] = grad_sigma.detach().pow(2).sum().sqrt()
+        grad_record["phi"]   = grad_mu.new_zeros(())
     nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
 
     # STRAIGHT-THROUGH (manuscript Algorithm 1, GL(K)_attention.tex:2050): detach the per-iteration
@@ -487,6 +495,8 @@ def e_step_iteration(
                 connection_W=(connection_W.detach() if connection_W is not None else None),
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]
+        if grad_record is not None:                      # RAW phi-gradient norm (pre-precondition)
+            grad_record["phi"] = grad_phi.detach().pow(2).sum().sqrt()
         grad_phi = precondition_phi_gradient(
             grad_phi, belief.phi, group.generators, mode=phi_precond_mode, irrep_dims=group.irrep_dims,
         )
@@ -510,6 +520,7 @@ def e_step(
     return_trajectory: bool  = False,
     e_step_gradient:   str   = "unroll",
     oracle_unroll_grad: bool = False,            # explicit (not in kwargs): keep it off the F_diag bag
+    grad_record:       Optional[dict]         = None,   # diag out-param (explicit): LAST iteration's belief-grad norms
     rope:              Optional[torch.Tensor] = None,
     rope_on_cov:       bool                   = False,
 
@@ -548,6 +559,7 @@ def e_step(
             belief, mu_p, sigma_p, group, tau=tau,
             e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, e_phi_lr=e_phi_lr,
             e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
+            grad_record=grad_record,                       # last iteration overwrites -> converged-ish grad
             log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, **kwargs,
         )
         if return_trajectory:

@@ -247,6 +247,15 @@ class PriorBank(nn.Module):
         targets diverge for far-drifted rows). Under s_e_step=True r additionally couples to the CE
         through _refine_s, so it is only a consistent population target there -- prefer
         r_update_mode='gradient' for the scored s_e_step=False exactness and the s_e_step coupled regime.
+
+        DIVERGENCE (audit 2026-06-14): this closed form is the ALPHA=1 (KL) m-projection and reads NO
+        cfg, so it is the exact M-step only for the canonical KL objective (renyi_order=1,
+        divergence_family='renyi', lambda_h_mode='constant'). The scored gradient path descends
+        D_alpha(s||r) at cfg.renyi_order / cfg.divergence_family with the lambda_h_mode envelope, so
+        under any non-canonical setting the 'barycenter' and 'gradient' r-updates do NOT share a fixed
+        point (VFE3Config.__post_init__ warns). It also drops the model-fiber transport Omega_tilde and
+        the per-type weights of the manuscript meta-agent barycenter, so it is a same-scale,
+        UNTRANSPORTED, uniform-weight centroid -- not the cross-scale shadow r_i=Omega_tilde[s^(s+1)].
         """
         s_mu = self.s_mu_embed                                                   # (V, K)
         s_sigma = torch.exp(self.s_sigma_log_embed).clamp(min=self.eps)          # (V, K)
