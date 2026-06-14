@@ -533,6 +533,10 @@ def e_step(
         # training graph, and .item() instead of float(tensor) makes the host sync explicit.
         # rope/rope_on_cov are forwarded explicitly (audit PP6): the logged F carries the same
         # RoPE-wrapped transport the iterations descend.
+        # NOTE (audit 2026-06-13): under a non-'constant' alpha_mode/lambda_h_mode the forwarded kwargs
+        # carry the regularizer into free_energy_value (alpha_reg=R), so the logged F is the AUGMENTED
+        # objective F+R the iterations actually descend (the envelope-correct value), not the bare
+        # divergence-weighted F. At the constant default alpha_reg=None, so the trajectory is the pure F.
         with torch.no_grad():
             return free_energy_value(b, mu_p, sigma_p, group, tau=tau, log_prior=log_prior,
                                      rope=rope, rope_on_cov=rope_on_cov, **kwargs).item()

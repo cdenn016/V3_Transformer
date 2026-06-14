@@ -212,12 +212,17 @@ class VFE3Config:
     # is frozen). 'gradient' (default): r trains by the AdamW M-step like the s/embedding tables
     # (byte-identical to the pre-toggle learnable_r behavior). 'barycenter': r is set each M-step to
     # the closed-form forward-KL barycenter (population centroid) of the s tables --
-    # r_mu = mean_v s_mu_v, r_sigma = mean_v[s_sigma_v + (s_mu_v - r_mu)^2] -- the exact variational
-    # M-step of the isolated lambda_h*KL(s||r) block (the same closed-form-stationary-point treatment
+    # r_mu = mean_v s_mu_v, r_sigma = mean_v[s_sigma_v + (s_mu_v - r_mu)^2] -- the exact minimizer of
+    # the UNIFORM-over-vocab sum_v KL(s_v||r) (the same closed-form-stationary-point treatment
     # alpha*/beta*/gamma* already receive), so r is NOT grouped in the optimizer and never receives a
-    # gradient. The barycenter is the EXACT M-step optimum in the scored s_e_step=False regime; under
-    # s_e_step=True (r coupled to the CE through the unrolled _refine_s) it is the population centroid
-    # of the s tables, a consistent but no-longer-exact target -- see the 2026-06-13 r/lambda_h spec.
+    # gradient. CAVEAT (audit 2026-06-13): this is a uniform-over-VOCABULARY empirical-Bayes centroid,
+    # one row per vocab type. The SCORED hyper-prior term reduces with mean() over (B,N) token
+    # OCCURRENCES, i.e. the frequency-weighted sum_v f_v KL(s_v||r); the uniform barycenter equals that
+    # argmin only when token frequencies are uniform (for a Zipfian vocab the two minimizers differ).
+    # So even in the scored s_e_step=False regime the barycenter is the exact M-step of the uniform-vocab
+    # objective, NOT of the frequency-weighted scored loss. Under s_e_step=True (r coupled to the CE
+    # through the unrolled _refine_s) it is further only a consistent population target, not the argmin
+    # -- use r_update_mode='gradient' there. See the 2026-06-13 r/lambda_h spec.
     r_update_mode:             str   = "gradient"   # "gradient" | "barycenter"
 
     # lambda_h_mode selects the hyper-prior coupling form (the model-fiber analogue of alpha_mode;
@@ -943,6 +948,22 @@ class VFE3Config:
                 "is never updated. Set learnable_r=True to enable the closed-form barycenter M-step.",
                 UserWarning, stacklevel=2,
             )
+        # r_update_mode='barycenter' is the EXACT M-step only when KL(s||r) is r's sole objective, i.e.
+        # the scored s_e_step=False regime. Under s_e_step=True the scored hyper-prior term is gated off
+        # (model.py, `... and not s_e_step`) and r enters the loss only through the unrolled _refine_s,
+        # so r is coupled to the cross-entropy and the closed-form moment-matched barycenter is NOT the
+        # argmin of what the model minimizes -- AdamW-through-unroll (r_update_mode='gradient') is the
+        # consistent update there (2026-06-13 r/lambda_h spec). Warn (non-breaking) rather than restrict.
+        if self.r_update_mode == "barycenter" and self.s_e_step:
+            import warnings
+            warnings.warn(
+                "r_update_mode='barycenter' with s_e_step=True applies an INEXACT M-step: the closed-form "
+                "barycenter is the exact M-step only in the scored s_e_step=False regime. Under s_e_step "
+                "the hyper-prior centroid r is coupled to the cross-entropy through the unrolled _refine_s, "
+                "so the moment-matched centroid is a consistent population target, not the variational "
+                "optimum. Use r_update_mode='gradient' for the coupled s_e_step regime.",
+                UserWarning, stacklevel=2,
+            )
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         from vfe3.geometry.phi_preconditioner import _PRECOND
         _require(self.phi_precond_mode, tuple(sorted(_PRECOND)), "phi_precond_mode")
@@ -1205,13 +1226,15 @@ class VFE3Config:
             or self.transport_mode == "regime_ii"
             or self.learnable_lambda_beta
             or (self.lambda_h_mode == "learnable" and self.s_e_step)
+            or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
         ):
             import warnings
             warnings.warn(
                 f"e_step_gradient={self.e_step_gradient!r} severs the per-iteration E-step tangent, so a "
                 "learnable parameter that enters the loss only through it (log_alpha under "
                 "alpha_mode='learnable', connection_W under transport_mode='regime_ii', log_lambda_beta "
-                "under learnable_lambda_beta, log_lambda_h under lambda_h_mode='learnable'+s_e_step) "
+                "under learnable_lambda_beta, log_lambda_h under lambda_h_mode='learnable'+s_e_step, "
+                "r_mu/r_sigma_log under learnable_r+r_update_mode='gradient'+s_e_step) "
                 "receives NO gradient and stays frozen. Use e_step_gradient='unroll' (the default) to "
                 "train these.",
                 UserWarning,
@@ -1247,6 +1270,7 @@ class VFE3Config:
                 or self.transport_mode == "regime_ii"
                 or self.learnable_lambda_beta
                 or (self.lambda_h_mode == "learnable" and self.s_e_step)
+                or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
                 or self.pos_phi == "learned"
             )
         ):
@@ -1259,7 +1283,8 @@ class VFE3Config:
                 "oracle_unroll_grad=False. A learnable parameter that enters the loss only through the "
                 "E-step tangent (log_alpha under alpha_mode='learnable', connection_W under "
                 "transport_mode='regime_ii', log_lambda_beta under learnable_lambda_beta, log_lambda_h "
-                "under lambda_h_mode='learnable'+s_e_step, pos_phi_free under pos_phi='learned') "
+                "under lambda_h_mode='learnable'+s_e_step, r_mu/r_sigma_log under "
+                "learnable_r+r_update_mode='gradient'+s_e_step, pos_phi_free under pos_phi='learned') "
                 "therefore receives NO gradient and stays frozen. Set "
                 "oracle_unroll_grad=True to make the oracle return a differentiable (unrolled) gradient.",
                 UserWarning,
