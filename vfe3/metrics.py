@@ -683,24 +683,24 @@ def free_energy_full_decomposition(
     *,
     lambda_beta:     'float | torch.Tensor' = 1.0,
     lambda_h:        float = 0.0,
-    gamma_coupling:  float = 0.0,
+    lambda_gamma:    float = 0.0,
 ) -> Dict[str, 'float | torch.Tensor']:
     r"""Close the free-energy stack: add the data/likelihood term and the lambda_beta scaling.
 
     The runtime-realised total is self_coupling + lambda_beta (belief_coupling + attention_entropy)
     + data_term, so the stacked-area figure CLOSES to the F the E-step minimizes (the current
     one-bar snapshot omits the data term and the scaling). GUARDED: the closure holds only because
-    the model-channel terms are inert at the defaults lambda_h = gamma_coupling = 0 (free_energy_terms
+    the model-channel terms are inert at the defaults lambda_h = lambda_gamma = 0 (free_energy_terms
     carries no s-channel term); a nonzero value means the displayed total UNDERCOUNTS the
     hierarchical h->s->p->q F, so warn loudly. Accepts scalars or per-step arrays elementwise.
     """
-    if lambda_h != 0.0 or gamma_coupling != 0.0:
+    if lambda_h != 0.0 or lambda_gamma != 0.0:
         import warnings
         warnings.warn(
-            f"free_energy_full_decomposition: lambda_h={lambda_h}, gamma_coupling={gamma_coupling} "
+            f"free_energy_full_decomposition: lambda_h={lambda_h}, lambda_gamma={lambda_gamma} "
             f"are nonzero, but free_energy_terms carries NO model-channel (s) term, so the returned "
             f"'total' UNDERCOUNTS the hierarchical free energy. The stack closes to the runtime F "
-            f"only at lambda_h = gamma_coupling = 0.",
+            f"only at lambda_h = lambda_gamma = 0.",
             RuntimeWarning, stacklevel=2,
         )
     belief_scaled = lambda_beta * belief_coupling
@@ -823,7 +823,7 @@ def gauge_equivariance_residual(
 
     *,
     kappa:             float = 1.0,
-    alpha_div:         float = 1.0,
+    renyi_order:       float = 1.0,
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
     diagonal:          Optional[bool] = None,
@@ -870,7 +870,7 @@ def gauge_equivariance_residual(
         mu_t = transport_mean(om.unsqueeze(0), mu_q.unsqueeze(0))[0]          # (N, N, K)
         sig_t = transport_covariance(om.unsqueeze(0), sig_q.unsqueeze(0))[0]  # (N, N, K, K)
         e = pairwise_energy(full(mu_q, sig_q), full(mu_t, sig_t),
-                            alpha=alpha_div, kl_max=kl_max, eps=eps,
+                            alpha=renyi_order, kl_max=kl_max, eps=eps,
                             divergence_family=divergence_family, irrep_dims=group.irrep_dims)
         return e, attention_weights(e, tau=tau)
 

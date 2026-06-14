@@ -61,16 +61,16 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
     r"""The full ``e_step_iteration`` knob bag assembled from the model config (mirrors vfe_block)."""
     cfg = model.cfg
     return dict(
-        tau=attention_tau(_as_coeff(cfg.kappa, model.prior_bank.mu_embed.device), model.group.irrep_dims),
-        e_mu_lr=cfg.e_mu_lr, e_sigma_lr=cfg.e_sigma_lr, e_phi_lr=cfg.e_phi_lr,
-        alpha_div=cfg.alpha_div, value=cfg.alpha,
+        tau=attention_tau(_as_coeff(cfg.kappa_beta, model.prior_bank.mu_embed.device), model.group.irrep_dims),
+        e_q_mu_lr=cfg.e_q_mu_lr, e_q_sigma_lr=cfg.e_q_sigma_lr, e_phi_lr=cfg.e_phi_lr,
+        renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
         b0=_as_coeff(cfg.b0, model.prior_bank.mu_embed.device),
         c0=_as_coeff(cfg.c0, model.prior_bank.mu_embed.device),
         lambda_beta=_lambda_beta(model), kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
         e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
         include_attention_entropy=cfg.include_attention_entropy, gradient_mode=cfg.gradient_mode,
-        family=cfg.family, divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
+        family=cfg.family, divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
         cocycle_relaxation=cfg.cocycle_relaxation, connection_W=getattr(model, "connection_W", None),
@@ -84,13 +84,13 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
     ``rope`` is honored (audit PP6): the logged F carries the RoPE-wrapped transport."""
     cfg = model.cfg
     return dict(
-        tau=attention_tau(_as_coeff(cfg.kappa, model.prior_bank.mu_embed.device), model.group.irrep_dims),
-        alpha_div=cfg.alpha_div, value=cfg.alpha,
+        tau=attention_tau(_as_coeff(cfg.kappa_beta, model.prior_bank.mu_embed.device), model.group.irrep_dims),
+        renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
         b0=_as_coeff(cfg.b0, model.prior_bank.mu_embed.device),
         c0=_as_coeff(cfg.c0, model.prior_bank.mu_embed.device),
         lambda_beta=_lambda_beta(model), kl_max=cfg.kl_max, eps=cfg.eps,
         include_attention_entropy=cfg.include_attention_entropy, family=cfg.family,
-        divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
+        divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
         transport_mode=cfg.transport_mode, cocycle_relaxation=cfg.cocycle_relaxation,
         log_prior=log_prior, log_alpha=getattr(model, "log_alpha", None),
         connection_W=getattr(model, "connection_W", None),
@@ -322,10 +322,10 @@ def numerical_health(
     mu_t = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
     sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
     fam = get_family(cfg.family)
-    energy = pairwise_energy(fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.alpha_div,
+    energy = pairwise_energy(fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.renyi_order,
                              kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
                              irrep_dims=model.group.irrep_dims)
-    beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), model.group.irrep_dims), log_prior=log_prior)
+    beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), model.group.irrep_dims), log_prior=log_prior)
     spec = out.sigma if out.sigma.dim() == out.mu.dim() else condition_number(out.sigma)
     cond = float(condition_number(out.sigma).max()) if out.sigma.dim() > out.mu.dim() else \
         float((spec.amax(dim=-1) / spec.amin(dim=-1).clamp(min=1e-12)).max())
@@ -403,16 +403,16 @@ def converged_state(
             sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
         fam = get_family(cfg.family)
         energy = pairwise_energy(
-            fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.alpha_div,
+            fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.renyi_order,
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
             irrep_dims=model.group.irrep_dims,
         )
-        beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), model.group.irrep_dims), log_prior=log_prior)
+        beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), model.group.irrep_dims), log_prior=log_prior)
         _q_conv = cap["converged"]                           # q*: the F self-term reads the pre-
         self_div = self_divergence_for_alpha(                # transform converged belief (F19,
-            fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p), alpha=cfg.alpha_div,   # as diagnostics)
+            fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p), alpha=cfg.renyi_order,   # as diagnostics)
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
-            alpha_mode=cfg.alpha_mode,
+            lambda_alpha_mode=cfg.lambda_alpha_mode,
         )
         exp_phi = compute_transport_operators(out.phi.unsqueeze(0), model.group)["exp_phi"][0]
     finally:
@@ -444,7 +444,7 @@ def s_channel_refinement(model, token_ids: torch.Tensor) -> Optional[dict]:
       logsigma_delta[i] = ||log s1_sigma[i] - log s0_sigma[i]||_2            (variance refinement)
       kl_s0_r[i], kl_s1_r[i] = KL(s . || r) before / after refinement        (consensus toward r)
 
-    The s-channel descends ``lambda_h * KL(s||r) + gamma_coupling * model-consensus``, so a healthy
+    The s-channel descends ``lambda_h * KL(s||r) + lambda_gamma * model-consensus``, so a healthy
     refinement pulls ``KL(s1||r) < KL(s0||r)``; the deltas show where on the sequence it acts.
     """
     if not model.cfg.s_e_step:
@@ -480,7 +480,7 @@ def model_channel_belief(model, token_ids: torch.Tensor) -> Optional[dict]:
     ``sigma_mean``), the per-token variance spectrum sorted descending (``spectrum`` (N, K) -- the s
     tables are diagonal so the variances ARE the spectrum), and the per-token effective rank
     (``eff_rank`` (N,)). Available on the broader model-channel-active path (lambda_h>0 OR
-    gamma_coupling>0 OR prior_source=='model_channel' OR s_e_step), so it covers prior_source=='model_channel'
+    lambda_gamma>0 OR prior_source=='model_channel' OR s_e_step), so it covers prior_source=='model_channel'
     where the s_e_step refinement figure does not run."""
     if not model._model_channel_active:
         return None

@@ -111,7 +111,7 @@ def alpha_learnable(
     exp keeps alpha strictly positive for any real log_alpha.
     """
     if log_alpha is None:
-        raise ValueError("alpha_mode='learnable' requires log_alpha (the model's nn.Parameter)")
+        raise ValueError("lambda_alpha_mode='learnable' requires log_alpha (the model's nn.Parameter)")
     return torch.exp(log_alpha) * torch.ones_like(kl), torch.zeros_like(kl)
 
 

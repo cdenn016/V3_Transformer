@@ -1,7 +1,7 @@
 r"""Regression pins for the audit-2026-06-09 punch-list fixes: the ALiBi x single-block guard
 (P1), the filtering-kernel pair-term saturation mask (P7), windowed/T5 prior-parameter
 threading (P9), the gamma-channel entropy toggle (P6), and the resume config-drift warning /
-scaler persistence (P11). The b0/c0 x alpha_mode cross-check (P2) is pinned in
+scaler persistence (P11). The b0/c0 x lambda_alpha_mode cross-check (P2) is pinned in
 test_cheap_ledger_wins; the oracle truncation warning (P8) and the RoPE means-only warning (P5)
 fire inside existing suites.
 """
@@ -17,7 +17,7 @@ from vfe3.train import build_optimizer
 
 def _cfg(**kw) -> VFE3Config:
     base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0)
+                n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0)
     base.update(kw)
     return VFE3Config(**base)
 
@@ -27,7 +27,7 @@ def _cfg(**kw) -> VFE3Config:
 def test_alibi_with_single_block_group_rejected_at_construction():
     # so_k has irrep_dims=[K] (energy head axis 1); an (n_heads=2, N, N) prior would broadcast
     # into the batch axis -- silent corruption at B=1, crash at B>1 (audit P1).
-    for pname in ("attention_prior", "gamma_attention_prior"):
+    for pname in ("beta_attention_prior", "gamma_attention_prior"):
         with pytest.raises(ValueError, match="energy head axis"):
             VFEModel(_cfg(gauge_group="so_k", **{pname: "causal_alibi"}))
 
@@ -35,7 +35,7 @@ def test_alibi_with_single_block_group_rejected_at_construction():
 def test_alibi_single_block_runs_with_n_heads_1_at_any_batch():
     # n_heads=1 is the legal single-block pairing: the (1, N, N) prior is squeezed to the (N, N)
     # single-block convention, so a B=3 forward (the pre-fix crash case) runs with sane shapes.
-    cfg = _cfg(gauge_group="so_k", n_heads=1, attention_prior="causal_alibi")
+    cfg = _cfg(gauge_group="so_k", n_heads=1, beta_attention_prior="causal_alibi")
     model = VFEModel(cfg)
     prior = model._attention_log_prior(5, torch.device("cpu"))
     assert prior.shape == (5, 5)                                # squeezed, no phantom head axis
@@ -46,7 +46,7 @@ def test_alibi_single_block_runs_with_n_heads_1_at_any_batch():
 
 
 def test_alibi_block_glk_with_matching_heads_still_constructs():
-    model = VFEModel(_cfg(gauge_group="block_glk", attention_prior="causal_alibi"))
+    model = VFEModel(_cfg(gauge_group="block_glk", beta_attention_prior="causal_alibi"))
     assert model._attention_log_prior(5, torch.device("cpu")).shape == (2, 5, 5)
 
 
@@ -79,7 +79,7 @@ def test_kernel_matches_oracle_on_fully_saturated_rows():
 # ------------------------------------------------- P9: prior parameter threading
 
 def test_attention_window_threads_into_the_windowed_prior():
-    model = VFEModel(_cfg(attention_prior="causal_windowed", attention_window=1))
+    model = VFEModel(_cfg(beta_attention_prior="causal_windowed", attention_window=1))
     prior = model._attention_log_prior(5, torch.device("cpu"))  # (N, N)
     d = torch.arange(5).unsqueeze(-1) - torch.arange(5).unsqueeze(0)   # i - j
     inside = (d >= 0) & (d <= 1)
@@ -100,7 +100,7 @@ def test_gamma_block_honors_include_attention_entropy():
     losses = {}
     for ent in (True, False):
         torch.manual_seed(0)
-        m = VFEModel(_cfg(gamma_coupling=0.5, include_attention_entropy=ent))
+        m = VFEModel(_cfg(lambda_gamma=0.5, include_attention_entropy=ent))
         torch.manual_seed(1)
         _, loss, _ = m(tok, tgt)
         assert torch.isfinite(loss)
@@ -113,15 +113,15 @@ def test_gamma_block_honors_include_attention_entropy():
 
 def test_resume_warns_on_config_drift(tmp_path):
     cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
                      warmup_steps=1, max_steps=4)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     art = RunArtifacts(tmp_path / "r", cfg, model)
     path = art.save_checkpoint(2, model, opt, cfg)
-    drifted = VFE3Config(**{**cfg.__dict__, "e_mu_lr": 0.05})
-    with pytest.warns(UserWarning, match=r"config drift.*e_mu_lr"):
+    drifted = VFE3Config(**{**cfg.__dict__, "e_q_mu_lr": 0.05})
+    with pytest.warns(UserWarning, match=r"config drift.*e_q_mu_lr"):
         load_checkpoint(path, model, opt, cfg=drifted)
     # identical config -> silent
     import warnings as _w
@@ -132,7 +132,7 @@ def test_resume_warns_on_config_drift(tmp_path):
 
 def test_checkpoint_bundle_carries_scaler_state_slot(tmp_path):
     cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
                      warmup_steps=1, max_steps=4)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)

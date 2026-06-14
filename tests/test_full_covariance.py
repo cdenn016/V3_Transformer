@@ -29,7 +29,7 @@ def test_full_covariance_config_requires_consistent_flags():
 def test_full_covariance_model_runs_end_to_end():
     """The full-covariance pure path runs encode -> E-step -> full decode -> CE, forward+backward."""
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_mu_lr=0.05, e_sigma_lr=0.01, e_phi_lr=0.0,
+                     n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.01, e_phi_lr=0.0,
                      family="gaussian_full", diagonal_covariance=False, decode_mode="full")
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (2, 5)); targets = torch.randint(0, 20, (2, 5))
@@ -60,7 +60,7 @@ def test_full_covariance_e_step_keeps_sigma_spd_and_symmetric():
     )
     mu_p = torch.randn(N, K, generator=g)
     sigma_p = _spd(N, K, g)
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.05,
+    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.05,
                            e_phi_lr=0.0, family="gaussian_full")
     assert out.sigma.shape == (N, K, K)
     assert torch.allclose(out.sigma, out.sigma.transpose(-1, -2), atol=1e-5)   # symmetric
@@ -82,12 +82,12 @@ def test_full_covariance_reduces_to_diagonal_at_identity_transport():
 
     out_diag = e_step_iteration(
         BeliefState(mu=mu, sigma=sigma_diag, phi=phi), mu_p, sigma_p_diag, grp,
-        tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.01, e_phi_lr=0.0, family="gaussian_diagonal",
+        tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.01, e_phi_lr=0.0, family="gaussian_diagonal",
     )
     out_full = e_step_iteration(
         BeliefState(mu=mu, sigma=torch.diag_embed(sigma_diag), phi=phi),
         mu_p, torch.diag_embed(sigma_p_diag), grp,
-        tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.01, e_phi_lr=0.0, family="gaussian_full",
+        tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.01, e_phi_lr=0.0, family="gaussian_full",
     )
     assert torch.allclose(out_full.mu, out_diag.mu, atol=1e-4)
     diag_of_full = torch.diagonal(out_full.sigma, dim1=-2, dim2=-1)

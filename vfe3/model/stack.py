@@ -47,8 +47,8 @@ def vfe_stack(
     r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior.
 
     ``log_alpha`` is the model's learned scalar self-coupling parameter under
-    alpha_mode='learnable' (a sanctioned nn.Parameter NN exception; alpha = exp(log_alpha)),
-    forwarded to the E-step; None on every pure no-NN alpha_mode (the default path). ``connection_W``
+    lambda_alpha_mode='learnable' (a sanctioned nn.Parameter NN exception; alpha = exp(log_alpha)),
+    forwarded to the E-step; None on every pure no-NN lambda_alpha_mode (the default path). ``connection_W``
     is the model's learned bilinear Regime-II connection (a sanctioned NN exception) forwarded under
     transport_mode='regime_ii'; None on the pure (flat) path. ``e_step_gradient`` is the E-step
     backward estimator forwarded to the E-step ('unroll' default keeps the second-order trajectory

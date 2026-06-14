@@ -181,12 +181,12 @@ def _fe_hist_model_channel(n=30):
 
 def test_fe_terms_total_sums_components_and_excludes_ce():
     h = _fe_hist_model_channel(20)
-    step, comps, total, ce = _fe_terms(h, lambda_beta=1.0, gamma_coupling=0.75, include_attention_entropy=True)
+    step, comps, total, ce = _fe_terms(h, lambda_beta=1.0, lambda_gamma=0.75, include_attention_entropy=True)
     assert [k for k, _ in comps] == ["self", "belief", "attention_entropy", "hyper_prior", "model_coupling"]
     assert np.allclose(total, sum(c for _, c in comps))           # F total is the sum of the shown bars
     assert np.allclose(ce, np.asarray(h["val_ce"], dtype=float))  # CE returned separately, not summed in
     h2 = dict(h); h2["val_ce"] = np.asarray(h["val_ce"], dtype=float) + 1000.0
-    _, _, total2, _ = _fe_terms(h2, lambda_beta=1.0, gamma_coupling=0.75)
+    _, _, total2, _ = _fe_terms(h2, lambda_beta=1.0, lambda_gamma=0.75)
     assert np.allclose(total, total2)                             # total is independent of CE (no data term in F)
 
 
@@ -203,7 +203,7 @@ def test_fe_figures_render_with_model_channel(tmp_path):
                      (plot_free_energy_decomposition, "decompmc.png"),
                      (plot_free_energy_codescent, "codescentmc.png")):
         p = tmp_path / name
-        fig = fn(h, lambda_beta=1.0, gamma_coupling=0.75, include_attention_entropy=True, path=str(p))
+        fig = fn(h, lambda_beta=1.0, lambda_gamma=0.75, include_attention_entropy=True, path=str(p))
         plt.close(fig)
         assert _saved_nonempty(p)
 
@@ -397,7 +397,7 @@ def test_plot_ablation_forest_and_lr_grid_save(tmp_path):
             {"label": "uniform prior", "delta": 0.25, "lo": 0.2, "hi": 0.3}]
     grid = {"x": np.array([0.01, 0.02, 0.03]), "y": np.array([0.001, 0.002]),
             "z": np.array([[190., 185., 188.], [186., 180., 184.]]),
-            "xlabel": "m_mu_lr", "ylabel": "m_sigma_lr", "baseline": (0.02, 0.002)}
+            "xlabel": "m_p_mu_lr", "ylabel": "m_p_sigma_lr", "baseline": (0.02, 0.002)}
     p1 = tmp_path / "f12a.png"; p2 = tmp_path / "f12b.png"
     fig = plot_ablation_forest(rows, path=str(p1)); plt.close(fig)
     fig = plot_lr_grid_heatmap(grid, path=str(p2)); plt.close(fig)

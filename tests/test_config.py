@@ -8,7 +8,7 @@ def test_config_defaults():
     assert cfg.eps == 1e-6
     assert cfg.kl_max == 100.0
     assert cfg.divergence_family == "renyi"
-    assert cfg.alpha_div == 1.0
+    assert cfg.renyi_order == 1.0
 
 
 def test_config_rejects_unknown_family():
@@ -30,7 +30,7 @@ def test_divergence_family_is_functional_seam_distinct_from_family():
 
 def test_config_rejects_nonpositive_alpha():
     with pytest.raises(ValueError):
-        VFE3Config(alpha_div=0.0)
+        VFE3Config(renyi_order=0.0)
 
 
 def test_config_rejects_nonpositive_eps():
@@ -65,7 +65,7 @@ def test_config_rejects_nan_min_lr_frac():
 
 
 @pytest.mark.parametrize("overrides", [
-    {"alpha_mode": "learnable"},
+    {"lambda_alpha_mode": "learnable"},
     {"transport_mode": "regime_ii"},
     {"learnable_lambda_beta": True},
 ])
@@ -81,7 +81,7 @@ def test_detach_with_learnable_trigger_warns():
     """The 'detach' sibling severs the same tangent and must warn too (the un-warned route:
     detach_e_step=True is forced to 'unroll' here and is warned at the model level instead)."""
     with pytest.warns(UserWarning, match="frozen"):
-        VFE3Config(e_step_gradient="detach", alpha_mode="learnable")
+        VFE3Config(e_step_gradient="detach", lambda_alpha_mode="learnable")
 
 
 def test_straight_through_without_learnable_does_not_warn():
@@ -103,7 +103,7 @@ def test_config_model_defaults():
 def test_tau_is_kappa_sqrt_d_head():
     # Audit finding 6c: tau = kappa * sqrt(d_head) (per-head, Vaswani sqrt(d_k)),
     # NOT sqrt(embed_dim). embed_dim=16, n_heads=4 -> d_head=4 -> sqrt(d_head)=2.
-    cfg = VFE3Config(embed_dim=16, n_heads=4, kappa=1.5)
+    cfg = VFE3Config(embed_dim=16, n_heads=4, kappa_beta=1.5)
     assert abs(cfg.tau - 1.5 * 2.0) < 1e-9
     assert cfg.d_head == 4
 
@@ -145,7 +145,7 @@ def test_config_accepts_diagonal_chunked_decode_and_validates_chunk_size():
 
 def test_config_rejects_negative_learning_rate_and_bad_rho():
     with pytest.raises(ValueError):
-        VFE3Config(e_mu_lr=-0.1)
+        VFE3Config(e_q_mu_lr=-0.1)
     with pytest.raises(ValueError):
         VFE3Config(prior_handoff_rho=1.5)
 
@@ -197,9 +197,9 @@ def test_per_coord_alpha_requires_diagonal_family():
     the diagonal family (full-cov KL does not decompose coordinate-wise). The inconsistent pair
     is rejected at construction; the diagonal pairing (the default family) is accepted."""
     with pytest.raises(ValueError):
-        VFE3Config(alpha_mode="state_dependent_per_coord",
+        VFE3Config(lambda_alpha_mode="state_dependent_per_coord",
                    family="gaussian_full", diagonal_covariance=False, decode_mode="full")
-    VFE3Config(alpha_mode="state_dependent_per_coord")          # family defaults to diagonal -> ok
+    VFE3Config(lambda_alpha_mode="state_dependent_per_coord")          # family defaults to diagonal -> ok
 
 
 def test_per_coord_alpha_requires_renyi_functional():
@@ -212,8 +212,8 @@ def test_per_coord_alpha_requires_renyi_functional():
     the covariance guard above. The DEFAULT diagonal family is used so the covariance guard does not
     mask this functional check; the Renyi default is accepted (no over-rejection)."""
     with pytest.raises(ValueError):
-        VFE3Config(alpha_mode="state_dependent_per_coord", divergence_family="squared_hellinger")
-    VFE3Config(alpha_mode="state_dependent_per_coord")          # divergence_family defaults to renyi -> ok
+        VFE3Config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="squared_hellinger")
+    VFE3Config(lambda_alpha_mode="state_dependent_per_coord")          # divergence_family defaults to renyi -> ok
 
 
 def test_decode_mode_full_rejects_diagonal_family():

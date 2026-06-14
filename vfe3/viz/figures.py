@@ -466,7 +466,7 @@ def plot_free_energy_descent(
 
     *,
     lambda_beta:               'float | np.ndarray' = 1.0,
-    gamma_coupling:            float = 0.0,
+    lambda_gamma:              float = 0.0,
     include_attention_entropy: bool  = True,
     self_div:                  Optional[object] = None,   # (M,) converged self-divergences for the violin
     path:                      Optional[str]    = None,
@@ -485,7 +485,7 @@ def plot_free_energy_descent(
     a per-row vector (the learned-coupling trajectory) as well as a scalar; ``total`` matches the
     free_energy_total column (the complexity F).
     """
-    step, comps, total, ce = _fe_terms(history, lambda_beta, gamma_coupling=gamma_coupling,
+    step, comps, total, ce = _fe_terms(history, lambda_beta, lambda_gamma=lambda_gamma,
                                        include_attention_entropy=include_attention_entropy)
     stack  = np.vstack([c for _, c in comps])
     labels = [_FE_LABELS[k][0] for k, _ in comps]
@@ -520,7 +520,7 @@ _FE_LABELS = {
 }
 
 
-def _fe_terms(history: Dict, lambda_beta, *, gamma_coupling=0.0, include_attention_entropy=True) -> tuple:
+def _fe_terms(history: Dict, lambda_beta, *, lambda_gamma=0.0, include_attention_entropy=True) -> tuple:
     r"""Per-eval complexity free-energy components (nats/token) shared by the descent/decomposition/
     co-descent figures.
 
@@ -533,7 +533,7 @@ def _fe_terms(history: Dict, lambda_beta, *, gamma_coupling=0.0, include_attenti
     ``include_attention_entropy`` (matching ``free_energy_terms``' gate on ``total``). The model channel
     is added only when its columns are present: ``hyper_prior_weighted`` is the EXACT weighted hyper-prior
     folded into the runtime total (so state_dependent/learnable lambda_h need no reconstruction), and the
-    gamma blocks are scaled by ``gamma_coupling``. The logged diagnostics are already per token, so every
+    gamma blocks are scaled by ``lambda_gamma``. The logged diagnostics are already per token, so every
     component is commensurate and ``total`` matches the ``free_energy_total`` column.
     """
     step = _np(history["step"]).astype(float)
@@ -547,7 +547,7 @@ def _fe_terms(history: Dict, lambda_beta, *, gamma_coupling=0.0, include_attenti
         comps.append(("hyper_prior", _np(history["hyper_prior_weighted"]).astype(float)))
     gkeys = [k for k in ("gamma_coupling", "gamma_meta_entropy") if k in history]
     if gkeys:                                                        # gamma block scaled like the belief block
-        gc = float(gamma_coupling) * sum((_np(history[k]).astype(float) for k in gkeys), zeros.copy())
+        gc = float(lambda_gamma) * sum((_np(history[k]).astype(float) for k in gkeys), zeros.copy())
         comps.append(("model_coupling", gc))
     total = sum((c for _, c in comps), zeros.copy())
     ce = _np(history["val_ce"]).astype(float) if "val_ce" in history else np.full(step.shape, np.nan)
@@ -560,7 +560,7 @@ def plot_free_energy_codescent(
 
     *,
     lambda_beta:               'float | np.ndarray' = 1.0,
-    gamma_coupling:            float = 0.0,
+    lambda_gamma:              float = 0.0,
     include_attention_entropy: bool  = True,
     path:                      Optional[str] = None,
 ):
@@ -575,7 +575,7 @@ def plot_free_energy_codescent(
     is in the title; a high positive r is the co-descent signature, the evidence that minimizing the
     inference F lowers held-out loss.
     """
-    step, _comps, total, ce = _fe_terms(history, lambda_beta, gamma_coupling=gamma_coupling,
+    step, _comps, total, ce = _fe_terms(history, lambda_beta, lambda_gamma=lambda_gamma,
                                         include_attention_entropy=include_attention_entropy)
     keep = np.isfinite(total) & np.isfinite(ce)
     step, total, ce = step[keep], total[keep], ce[keep]
@@ -613,7 +613,7 @@ def plot_free_energy_decomposition(
 
     *,
     lambda_beta:               'float | np.ndarray' = 1.0,
-    gamma_coupling:            float = 0.0,
+    lambda_gamma:              float = 0.0,
     include_attention_entropy: bool  = True,
     path:                      Optional[str] = None,
 ):
@@ -629,7 +629,7 @@ def plot_free_energy_decomposition(
     and gamma model-coupling. The data/likelihood term (CE) is NOT shown: it is not part of F (no
     observation channel in the LM); see the co-descent figure for F vs the held-out CE.
     """
-    step, comps, _total, _ce = _fe_terms(history, lambda_beta, gamma_coupling=gamma_coupling,
+    step, comps, _total, _ce = _fe_terms(history, lambda_beta, lambda_gamma=lambda_gamma,
                                          include_attention_entropy=include_attention_entropy)
     names  = [_FE_LABELS[k][1] for k, _ in comps]
     labels = [_FE_LABELS[k][0] for k, _ in comps]

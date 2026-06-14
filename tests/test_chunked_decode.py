@@ -34,7 +34,7 @@ def _converged(model: VFEModel, tokens: torch.Tensor):
 
 def _model(vocab_size=64, **kw):
     cfg = VFE3Config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6,
-                     n_layers=1, n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0, **kw)
+                     n_layers=1, n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, **kw)
     return VFEModel(cfg)
 
 
@@ -154,7 +154,7 @@ def test_chunked_inference_targets_none_returns_full_logits():
 # --- vram audit 2026-06-10: fused chunked CE for the LINEAR decode (use_prior_bank=False) ---
 def _linear_model(vocab_size=64, **kw):
     cfg = VFE3Config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6,
-                     n_layers=1, n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0,
+                     n_layers=1, n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      use_prior_bank=False, **kw)
     return VFEModel(cfg)
 

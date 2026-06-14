@@ -23,7 +23,7 @@ def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
 
 
 def apply_mu_trust_region(
-    delta_mu: torch.Tensor,              # (..., K) proposed mean step (e_mu_lr * nat_grad_mu)
+    delta_mu: torch.Tensor,              # (..., K) proposed mean step (e_q_mu_lr * nat_grad_mu)
     sigma_q:  torch.Tensor,              # (..., K) diagonal variances OR (..., K, K) covariance
 
     *,

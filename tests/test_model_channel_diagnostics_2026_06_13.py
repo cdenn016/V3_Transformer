@@ -45,7 +45,7 @@ def _loader(seed: int = 0, n: int = 600, seq_len: int = 8, bs: int = 8) -> DataL
 
 def _cfg(**kw) -> VFE3Config:
     base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=2, e_mu_lr=0.1, e_phi_lr=0.05)
+                n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.05)
     base.update(kw)
     return VFE3Config(**base)
 
@@ -57,7 +57,7 @@ def _model(**kw) -> VFEModel:
 
 def _active(**kw) -> VFEModel:
     r"""A model with the full model channel live (s_e_step + hyper-prior + gamma), distinct s tables."""
-    m = _model(s_e_step=True, prior_source="model_channel", lambda_h=0.25, gamma_coupling=0.75, **kw)
+    m = _model(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75, **kw)
     torch.manual_seed(123)
     with torch.no_grad():                                          # make the blocks robustly non-vacuous
         m.prior_bank.s_mu_embed.normal_(0.0, 0.5)
@@ -105,7 +105,7 @@ def test_diagnostics_total_is_consistent_weighted_sum():
     lb = cfg.lambda_beta                                           # 1.0 on the pure path
     expected = (d["self_coupling"] + lb * d["belief_coupling"] + lb * d["attention_entropy"]
                 + cfg.lambda_h * d["hyper_prior"]
-                + cfg.gamma_coupling * (d["gamma_coupling"] + d["gamma_meta_entropy"]))
+                + cfg.lambda_gamma * (d["gamma_coupling"] + d["gamma_meta_entropy"]))
     assert abs(d["total"] - expected) < 1e-3                       # every block folded at ONE (sum) scale
 
 
@@ -124,7 +124,7 @@ def test_fe_decomposition_reconstructs_total_from_weighted_blocks():
         lb = cfg.lambda_beta
         recon = (d["self_coupling"] + lb * d["belief_coupling"] + lb * d["attention_entropy"]
                  + d["hyper_prior_weighted"]
-                 + cfg.gamma_coupling * (d["gamma_coupling"] + d["gamma_meta_entropy"]))
+                 + cfg.lambda_gamma * (d["gamma_coupling"] + d["gamma_meta_entropy"]))
         assert abs(d["total"] - recon) < 1e-3, mode               # figure rebuilds the runtime total exactly
     # state_dependent: the envelope weight is NOT cfg.lambda_h*raw (why the weighted value is logged)
     m_sd = _active(lambda_h_mode="state_dependent"); d_sd = m_sd.diagnostics(tok)
@@ -225,7 +225,7 @@ def test_model_channel_terms_figure_renders(tmp_path):
 # ---- (8) metrics.csv columns under an active channel, NONE on the pure path -----------------------
 
 def test_metrics_csv_has_model_channel_columns(tmp_path):
-    cfg = _cfg(s_e_step=True, prior_source="model_channel", lambda_h=0.25, gamma_coupling=0.75)
+    cfg = _cfg(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
@@ -265,7 +265,7 @@ def test_generate_figures_emits_model_channel_figures(tmp_path):
 # ---- (10) finalize_run's root figures emit model_channel_terms.png iff active ---------------------
 
 def test_finalize_emits_model_channel_terms_iff_active(tmp_path):
-    cfg = _cfg(s_e_step=True, prior_source="model_channel", lambda_h=0.25, gamma_coupling=0.75)
+    cfg = _cfg(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")

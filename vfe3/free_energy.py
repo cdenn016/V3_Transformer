@@ -232,7 +232,7 @@ def self_divergence_per_coord(
             f"coordinate-wise on a diagonal Gaussian are registered "
             f"({divergence_functionals_per_coord()}). 'squared_hellinger' is excluded (H^2 = "
             f"1 - exp(-D_{{1/2}}/2) is a nonlinear transform of the summed divergence). Use a "
-            f"decomposable divergence or a per-position alpha_mode."
+            f"decomposable divergence or a per-position lambda_alpha_mode."
         )
     return get_functional_per_coord(divergence_family)(q, p, alpha=alpha, kl_max=kl_max, eps=eps)
 
@@ -246,7 +246,7 @@ def self_divergence_for_alpha(
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
     divergence_family: str   = "renyi",
-    alpha_mode:        str   = "constant",
+    lambda_alpha_mode: str   = "constant",
 ) -> torch.Tensor:                         # (..., N) summed, or (..., N, K) per-coordinate
     r"""Self-divergence shaped for the selected alpha form: per-coordinate (..., N, K) when the
     form declares ``per_coord=True`` (``alpha_i.alpha_is_per_coord``), else the per-position
@@ -254,7 +254,7 @@ def self_divergence_for_alpha(
     the analytic kernel, the e_step F value, model diagnostics) shares, so a new alpha form's
     divergence-reduction need is honoured by its registration alone, with no consumer edited.
     """
-    if alpha_is_per_coord(alpha_mode):
+    if alpha_is_per_coord(lambda_alpha_mode):
         return self_divergence_per_coord(
             q, p, alpha=alpha, kl_max=kl_max, eps=eps,
             divergence_family=divergence_family,

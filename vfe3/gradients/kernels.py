@@ -2,7 +2,7 @@ r"""Optimized hand-derived belief-gradient kernels for VFE_3.0, with oracle fall
 
 A family-keyed registry of analytic (grad_mu, grad_sigma) kernels for the QUERY-SIDE
 (filtering) gradient. belief_gradients() uses the registered kernel only for the
-filtering + gaussian_diagonal + KL (alpha_div=1) + canonical case; every other case
+filtering + gaussian_diagonal + KL (renyi_order=1) + canonical case; every other case
 (smoothing, non-KL family, Renyi alpha != 1, surrogate) FALLS BACK to the autograd
 oracle -- so a new divergence works immediately and correctly, accelerated later by
 registering a kernel. Kernels return RAW Euclidean dF (no preconditioning/retraction).
@@ -167,7 +167,7 @@ def _pair_contract(
 
 def uses_kernel_route(
     *,
-    alpha_div:                 float,
+    renyi_order:               float,
     gradient_mode:             str,
     family:                    str,
     divergence_family:         str,
@@ -190,7 +190,7 @@ def uses_kernel_route(
         gradient_mode == "filtering"
         and family == "gaussian_diagonal"
         and divergence_family == "renyi"
-        and abs(alpha_div - 1.0) < 1e-9
+        and abs(renyi_order - 1.0) < 1e-9
         and include_attention_entropy
         and transport_mode != "regime_ii"
         and has_kernel(family)
@@ -206,7 +206,7 @@ def belief_gradients(
 
     *,
     tau:          'float | torch.Tensor' = 1.0,
-    alpha_div:    float = 1.0,
+    renyi_order:  float = 1.0,
     kl_max:       float = 100.0,
     eps:          float = 1e-6,
     b0:           float = 1.0,
@@ -218,7 +218,7 @@ def belief_gradients(
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
-    alpha_mode:                str  = "constant",
+    lambda_alpha_mode:         str  = "constant",
     transport_mode:            str  = "flat",  # 'regime_ii' excludes the kernel (mu-dependent Omega)
     value:                     float = 1.0,
 
@@ -241,18 +241,18 @@ def belief_gradients(
     so the oracle rebuilds the mu-dependent transport from its differentiation leaves.
     """
     use_kernel = uses_kernel_route(
-        alpha_div=alpha_div, gradient_mode=gradient_mode, family=family,
+        renyi_order=renyi_order, gradient_mode=gradient_mode, family=family,
         divergence_family=divergence_family,
         include_attention_entropy=include_attention_entropy,
         transport_mode=transport_mode,
     )
     if not use_kernel:
         return belief_gradients_autograd(
-            mu, sigma, mu_p, sigma_p, omega, tau=tau, alpha_div=alpha_div,
+            mu, sigma, mu_p, sigma_p, omega, tau=tau, renyi_order=renyi_order,
             kl_max=kl_max, eps=eps, b0=b0, c0=c0, value=value, lambda_beta=lambda_beta,
             include_attention_entropy=include_attention_entropy, create_graph=create_graph,
             gradient_mode=gradient_mode, family=family, divergence_family=divergence_family,
-            alpha_mode=alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
+            lambda_alpha_mode=lambda_alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
             omega_builder=omega_builder,
         )
 
@@ -261,7 +261,7 @@ def belief_gradients(
     sigma_t = transport_covariance(omega, sigma_k)
     fam = get_family(family)
     sd = self_divergence_for_alpha(fam(mu, sigma), fam(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
-                                   divergence_family=divergence_family, alpha_mode=alpha_mode)
+                                   divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=irrep_dims)
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)   # (N,N) or (H,N,N)
@@ -272,8 +272,8 @@ def belief_gradients(
     # the kernel's transported pair term deviates from autograd-of-F by orders of magnitude.
     # Mirrors the self-term mask inside the kernel body; beta itself (the weights) is unchanged.
     pair_mask = ((energy > 0.0) & (energy < kl_max)).to(beta.dtype)
-    coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=alpha_mode, log_alpha=log_alpha)
-    if not alpha_is_per_coord(alpha_mode):
+    coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=lambda_alpha_mode, log_alpha=log_alpha)
+    if not alpha_is_per_coord(lambda_alpha_mode):
         coef = coef.unsqueeze(-1)                 # (N,) -> (N,1) per-position broadcast; per-coord sd is already (N,K)
     # The masked beta stays in its COMPACT per-head form; the kernel's _pair_contract realizes
     # beta_ij^(h(k)) against a head-shaped view of the pair difference, so the (..., N, N, K)

@@ -16,7 +16,7 @@ Modularity:
 Covariance-structure seam (NOT divergence-agnostic): both ``reference_decode`` and the fused
 kernels score logits = -KL(q || pi_v)/tau_eff at a FIXED alpha=1 KL on a HARDCODED family --
 ``gaussian_diagonal`` for the diagonal kernels and ``reference_decode``, ``gaussian_full`` for
-the full kernels. They call ``divergence.kl`` (Renyi at alpha=1) and never read ``cfg.alpha_div``
+the full kernels. They call ``divergence.kl`` (Renyi at alpha=1) and never read ``cfg.renyi_order``
 or ``cfg.divergence_family``, so the decode boundary stays alpha=1 KL even when the E-step
 minimizes under a different alpha/functional (config.py warns when ``use_prior_bank=True`` is
 paired with a non-KL/non-alpha=1 seam). The registry seam is honored at the COVARIANCE-STRUCTURE
@@ -114,7 +114,7 @@ class PriorBank(nn.Module):
         decode_mode:         str   = "diagonal",
         decode_chunk_size:   int   = 8192,
         lambda_h:            float = 0.0,
-        gamma_coupling:      float = 0.0,
+        lambda_gamma:        float = 0.0,
         prior_source:        str   = "token",
         s_e_step:            bool  = False,
         learnable_r:         bool  = False,
@@ -167,8 +167,8 @@ class PriorBank(nn.Module):
         # MODEL CHANNEL (manuscript eq:pointwise_free_energy), default-OFF. The model-channel belief
         # tables s_mu_embed/s_sigma_log_embed (V, K) -- a per-token DIAGONAL Gaussian s_i looked up
         # like the belief tables -- back BOTH the hyper-prior term lambda_h*KL(s||r) and the gamma
-        # model-coupling block gamma_coupling*F_red^s, so they are created whenever EITHER channel is
-        # active (lambda_h>0 OR gamma_coupling>0). The global hyper-prior r_mu/r_sigma_log (K,) -- a
+        # model-coupling block lambda_gamma*F_red^s, so they are created whenever EITHER channel is
+        # active (lambda_h>0 OR lambda_gamma>0). The global hyper-prior r_mu/r_sigma_log (K,) -- a
         # single diagonal Gaussian the s_i are regularized toward (the manuscript centroid) -- is
         # consumed ONLY by the hyper-prior term, so it stays gated on lambda_h>0. These are PRIORS
         # (nn.Parameter), not a neural map. They are created LAST and only on the active-channel path:
@@ -179,7 +179,7 @@ class PriorBank(nn.Module):
         # (KL(s||r) > 0, the channel has a gradient). NOTE: s_i is NOT coupled to the belief q on
         # either path (the gamma transport is tied+detached); the s->q coupling and the s-channel
         # E-step update are DEFERRED.
-        if lambda_h > 0.0 or gamma_coupling > 0.0 or prior_source == "model_channel" or s_e_step:
+        if lambda_h > 0.0 or lambda_gamma > 0.0 or prior_source == "model_channel" or s_e_step:
             self.s_mu_embed        = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
             self.s_sigma_log_embed = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
         if lambda_h > 0.0 or s_e_step:
@@ -213,7 +213,7 @@ class PriorBank(nn.Module):
 
         Returns (s_mu, s_sigma) with s_mu (B, N, K) and s_sigma (B, N, K) the positive
         variances exp(s_sigma_log).clamp(min=eps). Available on the active-model-channel path
-        (lambda_h>0 OR gamma_coupling>0, where the s tables are created); consumed as
+        (lambda_h>0 OR lambda_gamma>0, where the s tables are created); consumed as
         DiagonalGaussian(s_mu, s_sigma) by BOTH the hyper-prior term lambda_h*KL(s_i||r) and the
         gamma model-coupling block. Through THESE two consumers s_i is NOT coupled into the belief q
         (the gamma transport is tied+detached), so it stays predictively inert. The s->q coupling is

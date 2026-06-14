@@ -27,7 +27,7 @@ def _loader(seed=0, n=600, seq_len=8, bs=8):
 
 def _cfg(**kw):
     base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=2, e_mu_lr=0.1, e_phi_lr=0.05)
+                n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.05)
     base.update(kw)
     return VFE3Config(**base)
 
@@ -126,7 +126,7 @@ def test_s_channel_refinement_extractor_present_iff_s_e_step():
     # s_e_step=False (the model channel never runs) returns None so the figure is skipped downstream.
     from vfe3.viz.extract import s_channel_refinement
     tok = torch.randint(0, 6, (2, 8))
-    on = _model(s_e_step=True, prior_source="model_channel", lambda_h=0.25, gamma_coupling=0.75)
+    on = _model(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
     d = s_channel_refinement(on, tok)
     assert d is not None and set(d) == {"mu_delta", "logsigma_delta", "kl_s0_r", "kl_s1_r"}
     for key, v in d.items():
@@ -137,7 +137,7 @@ def test_s_channel_refinement_extractor_present_iff_s_e_step():
 
 def test_generate_figures_emits_s_channel_under_s_e_step(tmp_path):
     # The s-channel figure is written iff s_e_step=True (guarded by the None extractor).
-    on = _model(s_e_step=True, prior_source="model_channel", lambda_h=0.25, gamma_coupling=0.75)
+    on = _model(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
     written = {p.name for p in generate_figures(tmp_path / "on", model=on, loader=_loader(), max_sequences=16)}
     assert "s_channel_refinement.png" in written
     off = _model(s_e_step=False)

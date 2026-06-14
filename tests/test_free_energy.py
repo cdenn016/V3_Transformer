@@ -425,8 +425,8 @@ def test_self_divergence_for_alpha_routes_by_declared_reduction():
     mu_p = torch.randn(N, K); sigma_p = torch.rand(N, K) + 0.5
     q, p = DiagonalGaussian(mu, sigma), DiagonalGaussian(mu_p, sigma_p)
 
-    summed = self_divergence_for_alpha(q, p, alpha_mode="state_dependent")
-    per = self_divergence_for_alpha(q, p, alpha_mode="state_dependent_per_coord")
+    summed = self_divergence_for_alpha(q, p, lambda_alpha_mode="state_dependent")
+    per = self_divergence_for_alpha(q, p, lambda_alpha_mode="state_dependent_per_coord")
     assert summed.shape == (N,)
     assert per.shape == (N, K)
     assert torch.allclose(per.sum(dim=-1), summed, atol=1e-5)    # unsaturated -> sum recovers it

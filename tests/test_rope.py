@@ -80,7 +80,7 @@ from vfe3.model.model import VFEModel
 
 def _rope_cfg(**kw):
     base = dict(vocab_size=6, embed_dim=8, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=1, e_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0, gauge_group="block_glk",
+                n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0, gauge_group="block_glk",
                 warmup_steps=1, max_steps=4)
     base.update(kw)
     return VFE3Config(**base)
@@ -126,7 +126,7 @@ from vfe3.gradients.oracle import belief_gradients_autograd
 def _full_cov_cfg(**kw):
     """_rope_cfg defaults plus the full-covariance trio (family/diagonal_covariance/decode_mode)."""
     base = dict(vocab_size=6, embed_dim=8, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=1, e_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0, gauge_group="block_glk",
+                n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0, gauge_group="block_glk",
                 warmup_steps=1, max_steps=4,
                 family="gaussian_full", diagonal_covariance=False, decode_mode="full")
     base.update(kw)
@@ -145,9 +145,9 @@ def test_rope_means_only_kernel_matches_oracle():
     omega = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False)
     mu   = torch.randn(1, N, K); sigma   = torch.rand(1, N, K) + 0.5
     mu_p = torch.randn(1, N, K); sigma_p = torch.rand(1, N, K) + 0.5
-    kw = dict(tau=1.0, alpha_div=1.0, kl_max=100.0, eps=1e-6, b0=1.0, c0=1.0, value=1.0,
+    kw = dict(tau=1.0, renyi_order=1.0, kl_max=100.0, eps=1e-6, b0=1.0, c0=1.0, value=1.0,
               include_attention_entropy=True, gradient_mode="filtering", family="gaussian_diagonal",
-              divergence_family="renyi", alpha_mode="constant", irrep_dims=g.irrep_dims, log_prior=None)
+              divergence_family="renyi", lambda_alpha_mode="constant", irrep_dims=g.irrep_dims, log_prior=None)
     gk = belief_gradients(mu, sigma, mu_p, sigma_p, omega, **kw)          # hand kernel
     go = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, **kw)  # autograd-of-F oracle
     assert torch.allclose(gk[0], go[0], atol=1e-5)

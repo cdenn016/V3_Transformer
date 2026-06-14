@@ -30,7 +30,7 @@ def _loader(seed=0, n=600, seq_len=8, bs=8):
 
 def _cfg(**kw):
     base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=1, e_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
+                n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
                 warmup_steps=1, max_steps=4)
     base.update(kw)
     return VFE3Config(**base)

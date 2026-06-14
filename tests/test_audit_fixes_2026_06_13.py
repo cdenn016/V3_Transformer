@@ -42,14 +42,14 @@ def test_extract_phi_cached_pinv_matches_none():
 # ----------------------------------------------------------------------------- cross_couplings guards
 def _cross_cfg(**kw):
     base = dict(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=6,
-                gauge_group="block_glk", cross_couplings=[(0, 1)], attention_prior="causal")
+                gauge_group="block_glk", cross_couplings=[(0, 1)], beta_attention_prior="causal")
     base.update(kw)
     return base
 
 
 def test_cross_couplings_rejects_alibi_prior():            # CC-F1
     with pytest.raises(ValueError, match="alibi"):
-        VFE3Config(**_cross_cfg(attention_prior="causal_alibi"))
+        VFE3Config(**_cross_cfg(beta_attention_prior="causal_alibi"))
 
 
 def test_cross_couplings_rejects_head_mixer():             # CC-F1
@@ -59,7 +59,7 @@ def test_cross_couplings_rejects_head_mixer():             # CC-F1
 
 def test_cross_couplings_rejects_per_head_kappa_list():    # CC-F5
     with pytest.raises(ValueError, match="kappa"):
-        VFE3Config(**_cross_cfg(kappa=[1.0, 1.0]))
+        VFE3Config(**_cross_cfg(kappa_beta=[1.0, 1.0]))
     with pytest.raises(ValueError, match="kappa_gamma"):
         VFE3Config(**_cross_cfg(kappa_gamma=[1.0, 1.0]))
 

@@ -42,7 +42,7 @@ from vfe3.geometry.transport import (
 # ``create_graph`` mirrors the hand kernel's behaviour on the UNROLLED E-step (e_step_gradient=
 # 'unroll'): with create_graph=True the query leaf is the LIVE belief (not a detached clone) and the
 # returned grads keep their grad_fn, so the unrolled-through-inference signal reaches the prior
-# tables for non-kernel families (smoothing / gaussian_full / alpha_div!=1) -- exactly as the closed-
+# tables for non-kernel families (smoothing / gaussian_full / renyi_order!=1) -- exactly as the closed-
 # form kernel already does. With create_graph=False (the default, used for detach / straight-through /
 # diagnostics / any no_grad caller) the oracle clones a detached leaf and .detach()-es the result, a
 # constant tangent that leaks no graph -- byte-identical to the previous behaviour. Either way the
@@ -57,7 +57,7 @@ def belief_gradients_autograd(
 
     *,
     tau:          'float | torch.Tensor' = 1.0,
-    alpha_div:    float = 1.0,
+    renyi_order:  float = 1.0,
     kl_max:       float = 100.0,
     eps:          float = 1e-6,
     b0:           float = 1.0,
@@ -70,7 +70,7 @@ def belief_gradients_autograd(
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
-    alpha_mode:                str  = "constant",
+    lambda_alpha_mode:         str  = "constant",
 
     irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
@@ -118,15 +118,15 @@ def belief_gradients_autograd(
     sigma_t = transport_covariance(omega, sigma_k)
 
     fam = get_family(family)
-    sd = self_divergence_for_alpha(fam(mu_q, sigma_q), fam(mu_p, sigma_p), alpha=alpha_div, kl_max=kl_max, eps=eps,
-                                   divergence_family=divergence_family, alpha_mode=alpha_mode)
-    alpha, reg = self_coupling_alpha(sd, mode=alpha_mode, value=value, b0=b0, c0=c0, log_alpha=log_alpha)
-    energy = pairwise_energy(fam(mu_q, sigma_q), fam(mu_t, sigma_t), alpha=alpha_div, kl_max=kl_max, eps=eps,
+    sd = self_divergence_for_alpha(fam(mu_q, sigma_q), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max, eps=eps,
+                                   divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
+    alpha, reg = self_coupling_alpha(sd, mode=lambda_alpha_mode, value=value, b0=b0, c0=c0, log_alpha=log_alpha)
+    energy = pairwise_energy(fam(mu_q, sigma_q), fam(mu_t, sigma_t), alpha=renyi_order, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=irrep_dims)
     F = free_energy(
         sd, energy, alpha, tau=tau, lambda_beta=lambda_beta,
         include_attention_entropy=include_attention_entropy,
-        log_prior=log_prior, alpha_reg=(reg if alpha_mode != "constant" else None),
+        log_prior=log_prior, alpha_reg=(reg if lambda_alpha_mode != "constant" else None),
     )
     grad_mu, grad_sigma = torch.autograd.grad(F, [mu_q, sigma_q], create_graph=use_live)
     if use_live:

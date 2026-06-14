@@ -18,7 +18,7 @@ from vfe3.model.model import VFEModel
 
 def _tiny_model(**overrides) -> VFEModel:
     base = dict(vocab_size=20, embed_dim=8, n_heads=2, max_seq_len=5, n_layers=1,
-                n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.0)
+                n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0)
     base.update(overrides)
     return VFEModel(VFE3Config(**base))
 

@@ -19,7 +19,7 @@ def _tower_group(spec=(("l0", 1), ("l1", 1), ("l2", 1)), K=9):
 def _cfg(**kw):
     from vfe3.config import VFE3Config
     base = dict(vocab_size=20, embed_dim=9, n_heads=3, max_seq_len=5, n_layers=1,
-                n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0,
+                n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
                 gauge_group="so_n", group_n=3,
                 irrep_spec=[("l0", 1), ("l1", 1), ("l2", 1)],
                 phi_precond_mode="none")
@@ -295,8 +295,8 @@ def test_mstep_self_coupling_reads_converged_pretransform_belief():
     def sc_of(b):
         sd = self_divergence_for_alpha(
             fam(b.mu, b.sigma), fam(beliefs.mu, beliefs.sigma),   # n_layers=1: prior = encode
-            alpha=model.cfg.alpha_div, kl_max=model.cfg.kl_max, eps=model.cfg.eps,
-            divergence_family=model.cfg.divergence_family, alpha_mode=model.cfg.alpha_mode,
+            alpha=model.cfg.renyi_order, kl_max=model.cfg.kl_max, eps=model.cfg.eps,
+            divergence_family=model.cfg.divergence_family, lambda_alpha_mode=model.cfg.lambda_alpha_mode,
         )
         return sd.mean()
 

@@ -155,7 +155,7 @@ def free_energy_value(
 
     *,
     tau:                       'float | torch.Tensor' = 1.0,
-    alpha_div:                 float = 1.0,
+    renyi_order:               float = 1.0,
     value:                     float = 1.0,
     b0:                        'float | torch.Tensor' = 1.0,   # scalar, or (K,) per-coord for state_dependent_per_coord
     c0:                        'float | torch.Tensor' = 1.0,   # scalar, or (K,) per-coord
@@ -171,7 +171,7 @@ def free_energy_value(
     rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
-    alpha_mode:                str  = "constant",
+    lambda_alpha_mode:         str  = "constant",
     gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
     phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
@@ -238,15 +238,15 @@ def free_energy_value(
         sigma_t = transport_covariance(omega.unsqueeze(0), key_belief.sigma.unsqueeze(0))[0]
 
     fam = get_family(family)
-    sd = self_divergence_for_alpha(fam(belief.mu, belief.sigma), fam(mu_p, sigma_p), alpha=alpha_div, kl_max=kl_max,
-                                   eps=eps, divergence_family=divergence_family, alpha_mode=alpha_mode)
-    alpha, reg = self_coupling_alpha(sd, value=value, mode=alpha_mode, b0=b0, c0=c0, log_alpha=log_alpha)
-    energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_t, sigma_t), alpha=alpha_div, kl_max=kl_max, eps=eps,
+    sd = self_divergence_for_alpha(fam(belief.mu, belief.sigma), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max,
+                                   eps=eps, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
+    alpha, reg = self_coupling_alpha(sd, value=value, mode=lambda_alpha_mode, b0=b0, c0=c0, log_alpha=log_alpha)
+    energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_t, sigma_t), alpha=renyi_order, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     return free_energy(
         sd, energy, alpha, tau=tau, lambda_beta=lambda_beta,
         include_attention_entropy=include_attention_entropy,
-        log_prior=log_prior, alpha_reg=(reg if alpha_mode != "constant" else None),
+        log_prior=log_prior, alpha_reg=(reg if lambda_alpha_mode != "constant" else None),
     )
 
 
@@ -258,7 +258,7 @@ def phi_alignment_loss(
 
     *,
     tau:       'float | torch.Tensor' = 1.0,
-    alpha_div: float = 1.0,
+    renyi_order: float = 1.0,
     kl_max:    float = 100.0,
     eps:       float = 1e-6,
     mass_phi:  float = 0.0,
@@ -298,7 +298,7 @@ def phi_alignment_loss(
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma)
     fam = get_family(family)
-    energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=alpha_div, kl_max=kl_max, eps=eps,
+    energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=renyi_order, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0
     if include_attention_entropy:
@@ -315,10 +315,10 @@ def e_step_iteration(
 
     *,
     tau:                       'float | torch.Tensor' = 1.0,
-    e_mu_lr:                   float = 0.1,
-    e_sigma_lr:                float = 0.1,
+    e_q_mu_lr:                 float = 0.1,
+    e_q_sigma_lr:              float = 0.1,
     e_phi_lr:                  float = 0.1,
-    alpha_div:                 float = 1.0,
+    renyi_order:               float = 1.0,
     value:                     float = 1.0,
     b0:                        'float | torch.Tensor' = 1.0,   # scalar, or (K,) per-coord for state_dependent_per_coord
     c0:                        'float | torch.Tensor' = 1.0,   # scalar, or (K,) per-coord
@@ -335,7 +335,7 @@ def e_step_iteration(
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
-    alpha_mode:                str  = "constant",
+    lambda_alpha_mode:         str  = "constant",
     phi_precond_mode:          str  = "none",
     phi_retract_mode:          str  = "euclidean",
     spd_retract_mode:          str  = "spd_affine",
@@ -358,7 +358,7 @@ def e_step_iteration(
     'regime_ii' is the non-flat edge-relaxed cocycle and consumes the CURRENT belief means and the
     learned ``connection_W`` (a sanctioned NN exception); because that Omega depends on mu it is
     rebuilt from ``belief.mu`` every iteration here (flat is mu-independent). ``log_alpha`` is the
-    learned self-coupling nn.Parameter (alpha = exp(log_alpha)) under alpha_mode='learnable' (None on
+    learned self-coupling nn.Parameter (alpha = exp(log_alpha)) under lambda_alpha_mode='learnable' (None on
     the pure path); it flows into the belief gradient so the loss backpropagates to it through the
     unrolled E-step. ``connection_W`` likewise flows in only through these belief updates, so the
     loss backpropagates to it (and a detached E-step would freeze it, mirroring log_alpha)."""
@@ -399,7 +399,7 @@ def e_step_iteration(
     # cases; this fires when the truncation actually happens (default warnings filter: once).
     if (e_step_gradient == "unroll" and not oracle_unroll_grad and belief.mu.requires_grad
             and not uses_kernel_route(
-                alpha_div=alpha_div, gradient_mode=gradient_mode, family=family,
+                renyi_order=renyi_order, gradient_mode=gradient_mode, family=family,
                 divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy,
                 transport_mode=transport_mode)):
@@ -414,10 +414,10 @@ def e_step_iteration(
         )
     grad_mu, grad_sigma = belief_gradients(
         belief.mu, belief.sigma, mu_p, sigma_p, omega,
-        tau=tau, alpha_div=alpha_div, value=value, b0=b0, c0=c0, lambda_beta=lambda_beta,
+        tau=tau, renyi_order=renyi_order, value=value, b0=b0, c0=c0, lambda_beta=lambda_beta,
         kl_max=kl_max, eps=eps,
         include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
-        family=family, divergence_family=divergence_family, alpha_mode=alpha_mode,
+        family=family, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode,
         transport_mode=transport_mode, omega_builder=omega_builder,
         irrep_dims=group.irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
         # Opt-in unrolled-oracle: make the autograd oracle (non-kernel families) return a
@@ -441,10 +441,10 @@ def e_step_iteration(
     if e_step_gradient == "straight_through":
         nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
 
-    delta_mu = e_mu_lr * nat_mu
+    delta_mu = e_q_mu_lr * nat_mu
     # E-step MEAN trust region (VFE_2.0 parity, default OFF). When e_mu_q_trust is set, bound the
     # per-iteration mean step in sigma-whitened units before the additive update; None reproduces the
-    # bare mu = belief.mu - e_mu_lr*nat_mu bit-for-bit. is_diagonal mirrors the SPD-retraction rank
+    # bare mu = belief.mu - e_q_mu_lr*nat_mu bit-for-bit. is_diagonal mirrors the SPD-retraction rank
     # rule below (full cov iff sigma.dim() == mu.dim() + 1).
     if e_mu_q_trust is not None:
         delta_mu = apply_mu_trust_region(
@@ -455,7 +455,7 @@ def e_step_iteration(
     # The registered SPD retraction owns the diagonal-vs-full rank decision internally (full cov iff
     # sigma.dim() == mu.dim() + 1); the E-step no longer branches on rank to select the retraction.
     sigma = get_retraction(spd_retract_mode)(
-        belief.sigma, -e_sigma_lr * nat_sigma, belief.mu.dim(),
+        belief.sigma, -e_q_sigma_lr * nat_sigma, belief.mu.dim(),
         trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
     )
 
@@ -475,7 +475,7 @@ def e_step_iteration(
         with torch.enable_grad():
             phi_g = belief.phi.detach().clone().requires_grad_(True)
             L = phi_alignment_loss(
-                mu, sigma, phi_g, group, tau=tau, alpha_div=alpha_div, kl_max=kl_max, eps=eps,
+                mu, sigma, phi_g, group, tau=tau, renyi_order=renyi_order, kl_max=kl_max, eps=eps,
                 mass_phi=mass_phi, lambda_beta=lambda_beta, family=family, divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy, log_prior=log_prior,
                 transport_mode=transport_mode, cocycle_relaxation=cocycle_relaxation,
@@ -504,8 +504,8 @@ def e_step(
     *,
     n_iter:            int   = 1,
     tau:               'float | torch.Tensor' = 1.0,
-    e_mu_lr:           float = 0.1,
-    e_sigma_lr:        float = 0.1,
+    e_q_mu_lr:         float = 0.1,
+    e_q_sigma_lr:      float = 0.1,
     e_phi_lr:          float = 0.1,
     return_trajectory: bool  = False,
     e_step_gradient:   str   = "unroll",
@@ -533,7 +533,7 @@ def e_step(
         # training graph, and .item() instead of float(tensor) makes the host sync explicit.
         # rope/rope_on_cov are forwarded explicitly (audit PP6): the logged F carries the same
         # RoPE-wrapped transport the iterations descend.
-        # NOTE (audit 2026-06-13): under a non-'constant' alpha_mode/lambda_h_mode the forwarded kwargs
+        # NOTE (audit 2026-06-13): under a non-'constant' lambda_alpha_mode/lambda_h_mode the forwarded kwargs
         # carry the regularizer into free_energy_value (alpha_reg=R), so the logged F is the AUGMENTED
         # objective F+R the iterations actually descend (the envelope-correct value), not the bare
         # divergence-weighted F. At the constant default alpha_reg=None, so the trajectory is the pure F.
@@ -546,7 +546,7 @@ def e_step(
     for _ in range(n_iter):
         belief = e_step_iteration(
             belief, mu_p, sigma_p, group, tau=tau,
-            e_mu_lr=e_mu_lr, e_sigma_lr=e_sigma_lr, e_phi_lr=e_phi_lr,
+            e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, e_phi_lr=e_phi_lr,
             e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
             log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, **kwargs,
         )

@@ -55,7 +55,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # run-folder label so they never collide). NUM_RUNS=1 with SEEDS=[] keeps the single-run path on the
 # config `seed` above, unchanged. Example: NUM_RUNS=3, SEEDS=[3, 64, 23] trains all three seeds.
 NUM_RUNS = 1
-SEEDS    = []        # e.g. [3, 64, 23]; must list at least NUM_RUNS seeds when NUM_RUNS > 1
+SEEDS    = [6]        # e.g. [3, 64, 23]; must list at least NUM_RUNS seeds when NUM_RUNS > 1
 
 
 config = dict(
@@ -77,7 +77,7 @@ config = dict(
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
     
-    seed                      = 16,
+    seed                      = 6,
     warmup_steps              = 100,
     
     #################################
@@ -85,7 +85,7 @@ config = dict(
     #################################
     
     divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    alpha_div                 = 1.0,       # Renyi order (1.0 -> KL)
+    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
     diagonal_covariance       = True,                # diagonal_covariance MUST equal (family == "gaussian_diagonal")
     family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
@@ -181,21 +181,21 @@ config = dict(
     #                Self Energy:  
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    alpha_mode                = "state_dependent_per_coord",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
-    learnable_lambda_beta     = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
+    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
+    lambda_h_mode              = "state_dependent",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h) | "learnable" (NN exc.)
     
     b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0                         = 1.0,                 # state-dependent alpha shape (numerator)
        
-    alpha                      = 1,                   # constant self-coupling value
+    lambda_alpha               = 1,          # constant self-coupling value
     lambda_h                   = 0.25,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
-    lambda_h_mode              = "state_dependent",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h) | "learnable" (NN exc.)
+    
     b0_h                       = 1.0,        # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
     c0_h                       = 1.0,        # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h
 
     # Further Regularizers
     mass_phi                   = 0.0,       # (mass_phi/2) ||phi||^2 penalty
-    mstep_self_coupling_weight = 0.00,      # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    mstep_self_coupling_weight = 0.0,      # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
     
     
     ##################################################
@@ -204,7 +204,7 @@ config = dict(
     ##################################################
     
     lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)    
-    gamma_coupling             = 0.75,       # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
+    lambda_gamma               = 0.75,       # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
          
 
     ########################################
@@ -212,10 +212,10 @@ config = dict(
     #            & Temperatures
     ########################################
     
-    kappa                     = 1,        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa_beta                = 1,        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
     kappa_gamma               = 1,        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
         
-    attention_prior           = "causal_alibi",  # "uniform" | "causal" | "causal_alibi" | "causal_windowed
+    beta_attention_prior      = "causal_alibi",  # "uniform" | "causal" | "causal_alibi" | "causal_windowed
     gamma_attention_prior     = "causal",        # model-channel prior pi^s_ij: # "t5_relative_bias" | "windowed"
 
     
@@ -224,8 +224,8 @@ config = dict(
     #         Learning Rates
     #################################
     
-    e_mu_lr                   = 0.9,
-    e_sigma_lr                = 0.001,
+    e_q_mu_lr                 = 0.9,
+    e_q_sigma_lr              = 0.001,
     e_phi_lr                  = 0.0,     
     
     
@@ -235,9 +235,9 @@ config = dict(
     # and prior_source = 'model_channel'
     ####################################
     
+    r_update_mode             = "gradient",          # "gradient" (AdamW M-step; correct under s_e_step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
     prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"
     learnable_r               = True,               # un-freeze hyper-prior centroid r (empirical-Bayes)
-    r_update_mode             = "gradient",          # "gradient" (AdamW M-step; correct under s_e_step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
     s_e_step                  = True,
     
     e_s_mu_lr                 = 0.85,
@@ -248,8 +248,8 @@ config = dict(
     #        Learning Rates
     #################################
         
-    m_mu_lr                   = 0.015,   
-    m_sigma_lr                = 0.0035,     
+    m_p_mu_lr                 = 0.015,   
+    m_p_sigma_lr              = 0.0035,     
     m_phi_lr                  = 0.015,   
     
     weight_decay              = 0.02,
@@ -325,8 +325,8 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f"group={cfg.gauge_group}  family={cfg.family}",
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
-        f" M-LRs: mu={cfg.m_mu_lr}  sigma={cfg.m_sigma_lr}  phi={cfg.m_phi_lr}",
-        f" VFE: alpha={cfg.alpha}  kappa={cfg.kappa}  "
+        f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  phi={cfg.m_phi_lr}",
+        f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",
         bar,
