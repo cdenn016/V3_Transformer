@@ -964,6 +964,29 @@ class VFE3Config:
                 "optimum. Use r_update_mode='gradient' for the coupled s_e_step regime.",
                 UserWarning, stacklevel=2,
             )
+        # barycenter_r_ is the closed-form ALPHA=1 forward-KL m-projection (moment match) of the s
+        # tables and reads NO cfg, so it is the EXACT M-step only for the canonical KL objective:
+        # renyi_order=1, divergence_family='renyi', lambda_h_mode='constant'. The scored hyper-prior
+        # gradient (_hyper_prior_kl) descends D_alpha(s||r) at cfg.renyi_order / cfg.divergence_family
+        # with the lambda_h_mode envelope, so under any non-canonical setting the closed-form barycenter
+        # and a gradient M-step descend DIFFERENT divergences/weightings and no longer share a fixed
+        # point. Warn (non-breaking) rather than restrict (2026-06-14 multi-expert investigation of the
+        # model.py TODO(B)); gated on learnable_r so it fires only when the barycenter actually runs.
+        if (self.r_update_mode == "barycenter" and self.learnable_r
+                and (self.renyi_order != 1.0 or self.divergence_family != "renyi"
+                     or self.lambda_h_mode != "constant")):
+            import warnings
+            warnings.warn(
+                "r_update_mode='barycenter' applies the alpha=1 forward-KL moment-match centroid, the "
+                "exact M-step only for renyi_order=1.0, divergence_family='renyi', and "
+                f"lambda_h_mode='constant'. The active config (renyi_order={self.renyi_order}, "
+                f"divergence_family={self.divergence_family!r}, lambda_h_mode={self.lambda_h_mode!r}) "
+                "makes the scored hyper-prior gradient descend a different divergence/weighting, so the "
+                "closed-form barycenter and a gradient M-step no longer share a fixed point. Use "
+                "r_update_mode='gradient' for a consistent M-step under non-KL / state_dependent / "
+                "learnable settings.",
+                UserWarning, stacklevel=2,
+            )
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         from vfe3.geometry.phi_preconditioner import _PRECOND
         _require(self.phi_precond_mode, tuple(sorted(_PRECOND)), "phi_precond_mode")

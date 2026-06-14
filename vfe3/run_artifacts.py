@@ -600,10 +600,11 @@ def _save_figures(
                 color=figs._CB[5 % len(figs._CB)], logy=True, smooth=max(5, len(ny) // 80),
                 annotate="max", path=str(run / "grad_norm.png"))
             figs.plt.close(fig)
-        # Per-group gradient-norm decomposition (mu / sigma / phi): the channels the aggregate
-        # grad_norm.png folds together. Columns logged by train_step (groups 0/1/2 = mu/sigma/phi);
-        # present only on a run that captured step_metrics, so gate on their presence (the CSV stays
-        # rectangular per run). A SEPARATE figure from the aggregate, same pre-clip magnitudes.
+        # M-step per-role gradient-norm decomposition (mu / sigma / phi): the parameter-learning
+        # channels the aggregate grad_norm.png folds together. Columns logged by train_step (aggregated
+        # by each optimizer group's "role" tag, so the live tables are attributed correctly under any
+        # config); present only on a run that captured step_metrics, so gate on their presence (the CSV
+        # stays rectangular per run). A SEPARATE figure from the aggregate, same pre-clip magnitudes.
         gd_keys = ("grad_norm_mu", "grad_norm_sigma", "grad_norm_phi")
         gd_present = [k for k in gd_keys
                       if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
@@ -614,6 +615,21 @@ def _save_figures(
                 hist_gd = {"step": [r.get("step", i) for i, r in enumerate(gd_rows)],
                            **{k: [r[k] for r in gd_rows] for k in gd_present}}
                 fig = figs.plot_grad_norm_decomposition(hist_gd, path=str(run / "grad_norm_decomposition.png"))
+                figs.plt.close(fig)
+        # E-step belief-gradient decomposition (mu / sigma / phi): the INFERENCE analogue of the M-step
+        # figure above -- ||grad F|| over the belief tuple per inner-loop component, logged by train_step
+        # from model.forward's estep_grad_out. Same presence gate; independent of the M-step columns (a
+        # component may be present in one and absent in the other), so build its own row set.
+        eg_keys = ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi")
+        eg_present = [k for k in eg_keys
+                      if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
+        if eg_present:
+            eg_rows = [r for r in artifacts.history
+                       if all(k in r and math.isfinite(r[k]) for k in eg_present)]
+            if eg_rows:
+                hist_eg = {"step": [r.get("step", i) for i, r in enumerate(eg_rows)],
+                           **{k: [r[k] for r in eg_rows] for k in eg_present}}
+                fig = figs.plot_estep_grad_norm_decomposition(hist_eg, path=str(run / "estep_grad_norm_decomposition.png"))
                 figs.plt.close(fig)
         cx, cy = _aligned("belief_cond_median")
         if cy:

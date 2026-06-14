@@ -450,3 +450,24 @@ def test_r_update_mode_barycenter_inert_warning_without_learnable_r():
         VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
                    lambda_h=0.5, prior_source="model_channel",
                    learnable_r=False, r_update_mode="barycenter")
+
+
+def test_barycenter_warns_under_non_canonical_divergence():
+    # barycenter_r_ is the alpha=1 forward-KL m-projection (reads no cfg); the scored gradient path
+    # descends D_alpha at cfg.renyi_order/divergence_family with the lambda_h_mode envelope. Under a
+    # non-canonical setting the 'barycenter' and 'gradient' r-updates do not share a fixed point -> warn.
+    with pytest.warns(UserWarning, match="exact M-step only for renyi_order=1.0"):
+        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
+                   lambda_h=0.5, prior_source="model_channel",
+                   learnable_r=True, r_update_mode="barycenter", renyi_order=2.0)
+
+
+def test_barycenter_no_divergence_warning_at_canonical_kl():
+    # At the canonical KL objective (renyi_order=1, divergence_family='renyi', lambda_h_mode='constant')
+    # the closed-form barycenter IS the exact M-step, so the divergence-mismatch warning must NOT fire.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
+                   lambda_h=0.5, prior_source="model_channel",
+                   learnable_r=True, r_update_mode="barycenter")
+    assert not any("exact M-step only for renyi_order" in str(wi.message) for wi in caught)

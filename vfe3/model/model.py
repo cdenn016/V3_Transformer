@@ -8,7 +8,7 @@ the batch around the (unbatched) E-step; decode and CE are batched.
 
 import inspect
 from contextlib import nullcontext
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Dict
 
 import torch
 import torch.nn.functional as F
@@ -505,11 +505,17 @@ class VFEModel(nn.Module):
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
         targets:   Optional[torch.Tensor] = None,   # (B, N) next-token ids (-100 = ignore)
+
+        *,
+        estep_grad_out: Optional[dict] = None,   # diag out-param: filled with the E-step belief-grad norms
     ) -> 'torch.Tensor | Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]':
         r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given.
 
         On the fused-chunked training path logits is None (callers discard it there), hence the
-        Optional first element of the training tuple."""
+        Optional first element of the training tuple. When ``estep_grad_out`` (a dict) is passed, it
+        is filled with the LAST-block / LAST-iteration raw E-step belief-gradient norms
+        ``{'mu','sigma','phi'}`` (||grad_mu/sigma/phi|| of F over the belief tuple) -- the E-step
+        analogue of the M-step per-group grad norms; default None is zero-overhead and byte-identical."""
         B, N = token_ids.shape
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
         beliefs = beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))
@@ -564,6 +570,7 @@ class VFEModel(nn.Module):
             # M-step self-coupling term below (manuscript: the self-term reads q*, not the
             # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.
             cap = {} if self.cfg.mstep_self_coupling_weight > 0.0 else None
+            grad_rec = {} if estep_grad_out is not None else None   # E-step belief-grad capture (gated, off by default)
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm,
                             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
@@ -571,7 +578,11 @@ class VFEModel(nn.Module):
                             lambda_beta=lambda_beta,
                             connection_W=connection_W, e_step_gradient=e_step_gradient,
                             rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
-                            capture=cap)
+                            capture=cap, grad_record=grad_rec)
+        if estep_grad_out is not None:                           # one host sync, only when requested
+            for _gk in ("mu", "sigma", "phi"):
+                _gv = grad_rec.get(_gk) if grad_rec is not None else None
+                estep_grad_out[_gk] = float(_gv) if _gv is not None else 0.0
         mu_final = out.mu                                        # (B, N, K); head mixer (if any) applied PER BLOCK
         sigma_final = out.sigma                                  # inside vfe_stack now (VFE_2.0 parity), not post-stack
 
@@ -693,10 +704,19 @@ class VFEModel(nn.Module):
                 coupling = coupling.sum(dim=-1)                # sum_k alpha^(k) D^(k) -> per-token
             sc = coupling.mean()                               # mean over batch and tokens (B, N)
             loss = loss + cfg.mstep_self_coupling_weight * sc
-        # TODO(B): the global r here is frozen by default; cfg.learnable_r=True trains it as an
-        # empirical-Bayes centroid (grad flows through this KL(s||r) term). The manuscript-pure
-        # token-dependent top-down shadow r_i=Omega_tilde[s^(s+1)] still awaits the scale-(s+1)
-        # meta-agent (not built).
+        # TODO(B): r is frozen by default (learnable_r=False). learnable_r=True + r_update_mode=
+        # 'gradient' trains it as an empirical-Bayes centroid; on the scored s_e_step=False path grad
+        # flows through THIS KL(s||r) term, but under s_e_step=True that term is gated off (see the
+        # TRANSPARENCY note just below) and r instead trains through the unrolled _refine_s E-step,
+        # where it inherits the straight_through/detach/oracle-truncation freeze footguns (config
+        # __post_init__ warns). The empirical-Bayes reading is non-degenerate only when s is
+        # data-anchored (prior_source='model_channel' or s_e_step); else KL(s||r) collapses s->r. The
+        # global r is a stand-in along TWO axes: frozen-vs-learned (this toggle) AND token-UNIFORM
+        # (one (K,) tensor broadcast over all tokens) vs the manuscript-pure token-dependent
+        # CROSS-SCALE shadow r_i=Omega_tilde[s^(s+1)] -- the model-fiber transport of a scale-(s+1)
+        # meta-agent (Participatory_it_from_bit.tex eq:cross_scale_shadow / eq:topdown_priors). The
+        # frozen global r IS the manuscript's sanctioned s_max boundary condition; the token-dependent
+        # r_i still awaits the scale-(s+1) meta-agent (not built).
         # TRANSPARENCY (audit 2026-06-13 L17/L18): both s-channel blocks below are gated on
         # `not s_e_step`. Under s_e_step=True the SAME hyper-prior/gamma objective is realized as the
         # E-step descent direction that refines s (in _refine_s), so scoring it here too would
