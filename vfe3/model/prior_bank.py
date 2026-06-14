@@ -222,6 +222,27 @@ class PriorBank(nn.Module):
         s_sigma = torch.exp(self.s_sigma_log_embed[token_ids]).clamp(min=self.eps)  # (B, N, K)
         return s_mu, s_sigma
 
+    @torch.no_grad()
+    def barycenter_r_(self) -> None:
+        r"""Closed-form forward-KL barycenter M-step for the hyper-prior centroid r (IN PLACE).
+
+        Sets r to the moment-matched centroid (m-projection) of the model-channel s tables:
+        ``r_mu = mean_v s_mu_v`` and ``r_sigma = mean_v[s_sigma_v + (s_mu_v - r_mu)^2]`` (within-table
+        variance plus the spread of the means) -- the unique minimizer of ``sum_v KL(s_v || r)`` for
+        diagonal Gaussians (Amari-Nagaoka m-projection = moment matching; the diagonal unit-weight
+        specialization of the manuscript meta-agent barycenter). Computed over the FULL vocab s tables
+        (the population centroid, batch-independent), under no_grad: in r_update_mode='barycenter' r is
+        NOT an optimizer leaf (requires_grad=False), so it carries no gradient and is set here once per
+        M-step (driven from train_step). The exact M-step optimum of the isolated lambda_h*KL(s||r)
+        block in the scored s_e_step=False regime; a consistent population target under s_e_step=True.
+        """
+        s_mu = self.s_mu_embed                                                   # (V, K)
+        s_sigma = torch.exp(self.s_sigma_log_embed).clamp(min=self.eps)          # (V, K)
+        r_mu = s_mu.mean(dim=0)                                                  # (K,)
+        r_var = (s_sigma + (s_mu - r_mu) ** 2).mean(dim=0)                       # (K,) within + between
+        self.r_mu.copy_(r_mu)
+        self.r_sigma_log.copy_(torch.log(r_var.clamp(min=self.eps)))
+
     def _prior_mu_table(self) -> torch.Tensor:
         r"""The (V, K) mean prior table feeding p_i: the model-channel s tables when
         prior_source=='model_channel' (s->q REPLACE: p_i = s_i), else the belief table mu_embed

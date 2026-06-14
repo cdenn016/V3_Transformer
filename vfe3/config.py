@@ -208,6 +208,32 @@ class VFE3Config:
     # same-scale empirical-Bayes stand-in.
     learnable_r:               bool  = False
 
+    # How the un-frozen centroid r is updated (only consulted when learnable_r=True; ignored when r
+    # is frozen). 'gradient' (default): r trains by the AdamW M-step like the s/embedding tables
+    # (byte-identical to the pre-toggle learnable_r behavior). 'barycenter': r is set each M-step to
+    # the closed-form forward-KL barycenter (population centroid) of the s tables --
+    # r_mu = mean_v s_mu_v, r_sigma = mean_v[s_sigma_v + (s_mu_v - r_mu)^2] -- the exact variational
+    # M-step of the isolated lambda_h*KL(s||r) block (the same closed-form-stationary-point treatment
+    # alpha*/beta*/gamma* already receive), so r is NOT grouped in the optimizer and never receives a
+    # gradient. The barycenter is the EXACT M-step optimum in the scored s_e_step=False regime; under
+    # s_e_step=True (r coupled to the CE through the unrolled _refine_s) it is the population centroid
+    # of the s tables, a consistent but no-longer-exact target -- see the 2026-06-13 r/lambda_h spec.
+    r_update_mode:             str   = "gradient"   # "gradient" | "barycenter"
+
+    # lambda_h_mode selects the hyper-prior coupling form (the model-fiber analogue of alpha_mode;
+    # registry vfe3/lambda_h_i.py). The default-and-pure forms are 'constant' (lambda_h = cfg.lambda_h,
+    # today's bare scalar) and 'state_dependent' (the closed-form envelope lambda_h*_i =
+    # c0_h/(b0_h + KL(s_i||r)), which REQUIRES R_h(lambda_h)=b0_h*lambda_h - c0_h*log lambda_h added to
+    # F and the s E-step for the envelope cancellation -- threaded automatically through both paths).
+    # NEURAL-NETWORK EXCEPTION: 'learnable' introduces a model-owned scalar nn.Parameter log_lambda_h
+    # (lambda_h = exp(log_lambda_h)), a sanctioned default-OFF sibling of alpha_mode='learnable' /
+    # learnable_lambda_beta. At init log_lambda_h=log(cfg.lambda_h) -> lambda_h=cfg.lambda_h, so a
+    # learnable model is byte-identical to constant lambda_h at step 0. Non-'constant' modes require
+    # lambda_h>0 (the channel-on gate and, for 'learnable', the log-init value); __post_init__ warns.
+    lambda_h_mode:             str   = "constant"   # "constant" | "state_dependent" | "learnable"
+    b0_h:                      float = 1.0          # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
+    c0_h:                      float = 1.0          # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h
+
     # Model-coupling weight gamma_coupling on the model-channel block gamma_coupling * mean_i F_red^s_i,
     # the reduced (envelope) form of sum_ij [ gamma_ij KL(s_i||Omega_ij s_j) + tau_g gamma_ij
     # log(gamma_ij/pi^s_ij) ] (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
@@ -777,6 +803,11 @@ class VFE3Config:
         # avoids a config <- alpha_i cycle.
         from vfe3.alpha_i import _ALPHAS
         _require(self.alpha_mode, tuple(sorted(_ALPHAS)), "alpha_mode")
+        # lambda_h_mode validated against the hyper-prior-coupling registry (the model-fiber mirror of
+        # alpha_mode). r_update_mode selects the centroid M-step (gradient vs closed-form barycenter).
+        from vfe3.lambda_h_i import _LAMBDA_H_MODES
+        _require(self.lambda_h_mode, _LAMBDA_H_MODES, "lambda_h_mode")
+        _require(self.r_update_mode, ("gradient", "barycenter"), "r_update_mode")
         # A per-coordinate alpha form (state_dependent_per_coord) weights each coordinate's
         # self-divergence by its own alpha^(k), which needs a per-coordinate self-divergence.
         # That decomposition exists only for the diagonal family (full-covariance KL couples
@@ -891,6 +922,27 @@ class VFE3Config:
                     "prior_source='model_channel', or keep r frozen (learnable_r=False).",
                     UserWarning, stacklevel=2,
                 )
+        # lambda_h_mode inert guard: a non-'constant' mode (state_dependent envelope / learnable
+        # log_lambda_h) only takes effect when the hyper-prior channel is live (lambda_h>0 creates
+        # r and gates the forward term; learnable additionally needs lambda_h>0 for its log-init).
+        if self.lambda_h_mode != "constant" and self.lambda_h == 0.0:
+            import warnings
+            warnings.warn(
+                f"lambda_h_mode={self.lambda_h_mode!r} has no effect with lambda_h=0: the hyper-prior "
+                "channel (and its centroid r) is created only when lambda_h>0 or s_e_step=True, and the "
+                "weight defaults to lambda_h. Set lambda_h>0 to activate the state-dependent/learnable "
+                "hyper-prior precision.",
+                UserWarning, stacklevel=2,
+            )
+        # r_update_mode='barycenter' is a no-op unless r is un-frozen (learnable_r=True); a frozen r
+        # is never updated by either mechanism.
+        if self.r_update_mode == "barycenter" and not self.learnable_r:
+            import warnings
+            warnings.warn(
+                "r_update_mode='barycenter' has no effect with learnable_r=False: a frozen centroid r "
+                "is never updated. Set learnable_r=True to enable the closed-form barycenter M-step.",
+                UserWarning, stacklevel=2,
+            )
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         from vfe3.geometry.phi_preconditioner import _PRECOND
         _require(self.phi_precond_mode, tuple(sorted(_PRECOND)), "phi_precond_mode")
@@ -1152,14 +1204,16 @@ class VFE3Config:
             self.alpha_mode == "learnable"
             or self.transport_mode == "regime_ii"
             or self.learnable_lambda_beta
+            or (self.lambda_h_mode == "learnable" and self.s_e_step)
         ):
             import warnings
             warnings.warn(
                 f"e_step_gradient={self.e_step_gradient!r} severs the per-iteration E-step tangent, so a "
                 "learnable parameter that enters the loss only through it (log_alpha under "
                 "alpha_mode='learnable', connection_W under transport_mode='regime_ii', log_lambda_beta "
-                "under learnable_lambda_beta) receives NO gradient and stays frozen. Use "
-                "e_step_gradient='unroll' (the default) to train these.",
+                "under learnable_lambda_beta, log_lambda_h under lambda_h_mode='learnable'+s_e_step) "
+                "receives NO gradient and stays frozen. Use e_step_gradient='unroll' (the default) to "
+                "train these.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -1192,6 +1246,7 @@ class VFE3Config:
                 self.alpha_mode == "learnable"
                 or self.transport_mode == "regime_ii"
                 or self.learnable_lambda_beta
+                or (self.lambda_h_mode == "learnable" and self.s_e_step)
                 or self.pos_phi == "learned"
             )
         ):
@@ -1203,8 +1258,9 @@ class VFE3Config:
                 "alpha_div=1.0 + include_attention_entropy=True), which returns a DETACHED tangent while "
                 "oracle_unroll_grad=False. A learnable parameter that enters the loss only through the "
                 "E-step tangent (log_alpha under alpha_mode='learnable', connection_W under "
-                "transport_mode='regime_ii', log_lambda_beta under learnable_lambda_beta, pos_phi_free "
-                "under pos_phi='learned') therefore receives NO gradient and stays frozen. Set "
+                "transport_mode='regime_ii', log_lambda_beta under learnable_lambda_beta, log_lambda_h "
+                "under lambda_h_mode='learnable'+s_e_step, pos_phi_free under pos_phi='learned') "
+                "therefore receives NO gradient and stays frozen. Set "
                 "oracle_unroll_grad=True to make the oracle return a differentiable (unrolled) gradient.",
                 UserWarning,
                 stacklevel=2,

@@ -115,7 +115,10 @@ class VFEModel(nn.Module):
             decode_chunk_size=cfg.decode_chunk_size,
             lambda_h=cfg.lambda_h, gamma_coupling=cfg.gamma_coupling,
             prior_source=cfg.prior_source, s_e_step=cfg.s_e_step,
-            learnable_r=cfg.learnable_r,
+            # r is a GRADIENT leaf only under r_update_mode='gradient'; under 'barycenter' it is
+            # set in-place each M-step by the closed-form barycenter (PriorBank.barycenter_r_,
+            # driven from train_step) and so must stay ungrouped/requires_grad=False.
+            learnable_r=cfg.learnable_r and cfg.r_update_mode == "gradient",
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.
@@ -227,6 +230,30 @@ class VFEModel(nn.Module):
                     "learned belief-coupling weight enters the loss only through the E-step, which the "
                     "detached (no_grad) E-step severs, so log_lambda_beta.grad is None and lambda_beta "
                     "stays at its init 1.0. Set detach_e_step=False to train the learnable lambda_beta.",
+                    stacklevel=2,
+                )
+        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED hyper-prior weight lambda_h
+        # (the model-fiber analogue of alpha_mode='learnable'). When lambda_h_mode='learnable', create
+        # log_lambda_h as a scalar nn.Parameter; the consumed weight is lambda_h = exp(log_lambda_h)
+        # (always positive). Init log(cfg.lambda_h) -> lambda_h = cfg.lambda_h, byte-identical to the
+        # constant lambda_h at step 0 (unlike log_alpha/log_lambda_beta, whose constant default is 1.0
+        # so they init at 0). For every other lambda_h_mode the parameter is NOT created, so those paths
+        # are param-free. Trains through the scored forward term (s_e_step=False) or the unrolled s
+        # E-step (_refine_s, s_e_step=True) -- the latter is the E-step-tangent route the detach/oracle
+        # config warnings cover.
+        if cfg.lambda_h_mode == "learnable":
+            self.log_lambda_h = nn.Parameter(torch.tensor(max(float(cfg.lambda_h), cfg.eps)).log())
+            if cfg.detach_e_step and cfg.s_e_step:
+                # Footgun (mirrors log_alpha / log_lambda_beta): under s_e_step the learned lambda_h
+                # enters the loss ONLY through the s E-step (_refine_s), which detach_e_step wraps in
+                # no_grad, so log_lambda_h receives NO gradient and stays frozen at its init.
+                import warnings
+                warnings.warn(
+                    "lambda_h_mode='learnable' with detach_e_step=True and s_e_step=True freezes "
+                    "log_lambda_h: under s_e_step the learned hyper-prior weight enters the loss only "
+                    "through the s E-step, which the detached (no_grad) E-step severs, so "
+                    "log_lambda_h.grad is None and lambda_h stays at its init. Set detach_e_step=False "
+                    "to train it.",
                     stacklevel=2,
                 )
         if (not cfg.use_prior_bank) and cfg.detach_e_step:
@@ -426,8 +453,15 @@ class VFEModel(nn.Module):
             BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0), r_mu, r_sigma, grp,
             n_iter=cfg.n_e_steps,         tau=gamma_tau,
             e_mu_lr=cfg.e_s_mu_lr,        e_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
-            alpha_div=cfg.alpha_div,       value=cfg.lambda_h,          alpha_mode="constant",
-            b0=_as_coeff(cfg.b0, s_mu.device), c0=_as_coeff(cfg.c0, s_mu.device),
+            # The s-channel self-coupling weight IS lambda_h (the hyper-prior precision): route it
+            # through the lambda_h_mode registry, not a hardcoded constant. e_step's self_coupling_alpha
+            # consumes (value, alpha_mode, b0, c0, log_alpha) exactly as lambda_h_i.hyper_prior_lambda_h
+            # does, and adds the regularizer R_h to the s free energy for non-constant modes
+            # (e_step.py: alpha_reg when alpha_mode != 'constant'), so state_dependent lambda_h gets the
+            # envelope cancellation here for free; learnable feeds log_lambda_h. b0_h/c0_h are the
+            # hyper-prior's own precision shape (NOT alpha's b0/c0).
+            alpha_div=cfg.alpha_div,       value=cfg.lambda_h,          alpha_mode=cfg.lambda_h_mode,
+            b0=cfg.b0_h, c0=cfg.c0_h, log_alpha=getattr(self, "log_lambda_h", None),
             lambda_beta=cfg.gamma_coupling,
             kl_max=cfg.kl_max,             eps=cfg.eps,
             sigma_max=cfg.sigma_max,       e_sigma_q_trust=cfg.e_sigma_q_trust,
@@ -664,9 +698,11 @@ class VFEModel(nn.Module):
             # (lambda_h=0 -> byte-identical to the term-absent path). Grad-connected (no detach), so
             # it backprops to the learned s/r tables (the channel trains), and computed from the
             # converged s/r tables OUTSIDE the E-step (s_i does not couple into q this increment).
-            # The h->s->p->q coupling and the s-channel E-step update remain DEFERRED. The body
-            # lives in _hyper_prior_term so diagnostics logs the SAME term (audit V2).
-            loss = loss + self.cfg.lambda_h * self._hyper_prior_term(token_ids)
+            # The h->s->p->q coupling and the s-channel E-step update remain DEFERRED. The weight is
+            # now applied INSIDE _hyper_prior_term via the lambda_h_mode registry (constant: cfg.lambda_h;
+            # state_dependent: the envelope lambda_h*_i=c0_h/(b0_h+KL) + R_h; learnable: exp(log_lambda_h)),
+            # so the term is added directly with NO external lambda_h factor (byte-identical for constant).
+            loss = loss + self._hyper_prior_term(token_ids)
         if self.cfg.gamma_coupling > 0.0 and not self.cfg.s_e_step:
             # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
             # lines 1241-1249): L += gamma_coupling * mean_i F_red^s_i, the reduced (envelope) form of
@@ -724,17 +760,41 @@ class VFEModel(nn.Module):
             divergence_family=cfg.divergence_family,
         )                                                            # (B, N)
 
+    def _hyper_prior_weighted(
+        self,
+        token_ids: torch.Tensor,             # (B, N) integer token ids
+    ) -> torch.Tensor:                       # (B, N) lambda_h_i KL(s_i||r) + R_h(lambda_h_i)
+        r"""Per-token WEIGHTED+regularized hyper-prior integrand lambda_h_i*KL(s_i||r) + R_h(lambda_h_i).
+
+        Applies the lambda_h_mode registry (vfe3/lambda_h_i.py) to the raw per-token KL: ``constant``
+        -> cfg.lambda_h*KL with R_h=0 (byte-identical to the pre-registry cfg.lambda_h weighting);
+        ``state_dependent`` -> the envelope lambda_h*_i = c0_h/(b0_h+KL) PLUS R_h, left UNDETACHED so
+        autograd's product rule cancels to lambda_h*_i dKL by the envelope theorem (R_h must be in F
+        for that cancellation); ``learnable`` -> exp(log_lambda_h)*KL (grad flows to log_lambda_h).
+        """
+        from vfe3.lambda_h_i import hyper_prior_lambda_h
+        cfg = self.cfg
+        kl = self._hyper_prior_kl(token_ids)                          # (B, N) raw KL(s_i||r)
+        lam, reg = hyper_prior_lambda_h(
+            kl, mode=cfg.lambda_h_mode, value=cfg.lambda_h,
+            b0_h=cfg.b0_h, c0_h=cfg.c0_h, log_lambda_h=getattr(self, "log_lambda_h", None),
+        )
+        term = lam * kl
+        if cfg.lambda_h_mode != "constant":
+            term = term + reg                                         # R_h in F -> envelope cancellation
+        return term                                                  # (B, N)
+
     def _hyper_prior_term(
         self,
         token_ids: torch.Tensor,             # (B, N) integer token ids
-    ) -> torch.Tensor:                       # () mean_i KL(s_i || r)
-        r"""The hyper-prior channel term mean_i KL(s_i||r) (the lambda_h block, UNWEIGHTED).
-
-        The forward-loss reduction (mean over tokens) of :meth:`_hyper_prior_kl`; grad-connected
-        so the channel trains through forward. Shared with :meth:`diagnostics` (which sums the SAME
-        per-token vector) so the logged decomposition carries the SAME term (audit 2026-06-09 V2).
+    ) -> torch.Tensor:                       # () mean_i [ lambda_h_i KL(s_i||r) + R_h ]
+        r"""Forward-loss reduction (mean over tokens) of :meth:`_hyper_prior_weighted` -- the FULLY
+        WEIGHTED lambda_h block (the caller adds it to the loss directly, with NO external lambda_h
+        factor). At lambda_h_mode='constant' this is cfg.lambda_h * mean_i KL(s_i||r), byte-identical
+        to the prior ``cfg.lambda_h * _hyper_prior_term`` form. The raw per-token KL stays available as
+        :meth:`_hyper_prior_kl` for diagnostics / the s/r/h figures.
         """
-        return self._hyper_prior_kl(token_ids).mean()
+        return self._hyper_prior_weighted(token_ids).mean()
 
     def _gamma_energy(
         self,
@@ -1055,7 +1115,7 @@ class VFEModel(nn.Module):
         # total -- a 1/N under-weight of the model channel).
         if cfg.lambda_h > 0.0 or cfg.s_e_step:                       # r table exists on this path
             d["hyper_prior"] = float(self._hyper_prior_kl(token_ids[:1]).sum())          # raw sum_i KL(s_i||r)
-            d["total"] += cfg.lambda_h * d["hyper_prior"]
+            d["total"] += float(self._hyper_prior_weighted(token_ids[:1]).sum())         # WEIGHTED (lambda_h_mode); == cfg.lambda_h*hyper_prior for 'constant'
         if cfg.gamma_coupling > 0.0 or cfg.s_e_step:                # gamma block evaluated at out.phi
             g = self._gamma_coupling_terms(token_ids[:1], out.phi.unsqueeze(0))
             d["gamma_coupling"]     = float(g["coupling"])           # raw sum_{h,i,j} gamma E^s
