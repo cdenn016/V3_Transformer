@@ -102,21 +102,32 @@ def safe_spd_inverse(
 ) -> torch.Tensor:                       # (..., K, K) inverse
     r"""SPD inverse via Cholesky with escalating jitter, falling back to the pseudo-inverse.
 
-    Tries ``cholesky_inverse`` on ``M + (eps * 10^t) I`` for t = 0..max_tries-1; if every
-    jitter level fails (or the input is too ill-conditioned), returns ``pinv``. The pure
-    path is ``t=0`` with the documented default ridge; larger jitter is the fallback.
+    Per element (via ``cholesky_ex``, which never raises): tries ``cholesky_inverse`` on
+    ``M + (eps * 10^t) I`` for t = 0..max_tries-1, escalating the ridge ONLY on the elements that
+    still fail; an element where every jitter level fails falls back to ``pinv``. The per-element
+    retry mirrors ``safe_cholesky`` so one non-PD batch element cannot poison the exact inverse of
+    its well-conditioned siblings. The pure path is ``t=0`` with the documented default ridge.
     """
     M = _symmetrize(matrix.float())
     K = M.shape[-1]
     eye = torch.eye(K, device=M.device, dtype=M.dtype)
-    for t in range(max_tries):
-        ridge = eps * (10.0 ** t)
-        try:
-            L = torch.linalg.cholesky(M + ridge * eye)
-            return torch.cholesky_inverse(L).to(matrix.dtype)
-        except (torch.linalg.LinAlgError, RuntimeError):
-            continue
-    return torch.linalg.pinv(M).to(matrix.dtype)
+    L, info = torch.linalg.cholesky_ex(M + eps * eye)        # round 0: documented eps ridge
+    ok = info == 0
+    if bool(ok.all()):
+        return torch.cholesky_inverse(L).to(matrix.dtype)
+    out = torch.cholesky_inverse(L)                          # ok elements keep their good inverse
+    for t in range(1, max_tries):                            # retry ONLY the still-failed elements
+        if bool(ok.all()):
+            break
+        L_t, info_t = torch.linalg.cholesky_ex(M + (eps * (10.0 ** t)) * eye)
+        newly = (~ok) & (info_t == 0)
+        if bool(newly.any()):
+            inv_t = torch.cholesky_inverse(L_t)
+            out = torch.where(newly.unsqueeze(-1).unsqueeze(-1), inv_t, out)
+            ok = ok | (info_t == 0)
+    if not bool(ok.all()):                                   # pinv ONLY the still-failed elements
+        out = torch.where(ok.unsqueeze(-1).unsqueeze(-1), out, torch.linalg.pinv(M))
+    return out.to(matrix.dtype)
 
 
 def floor_eigenvalues(

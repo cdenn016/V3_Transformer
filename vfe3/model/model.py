@@ -396,9 +396,10 @@ class VFEModel(nn.Module):
         is inert on CPU tensors)."""
         if self.cfg.amp_dtype is None:
             return nullcontext()
-        # Explicit, defensive mapping (no bare-else silent-fp16 fallthrough). config.py rejects
-        # amp_dtype='fp16' at construction (deferred: needs a GradScaler), so 'bf16' is the only
-        # reachable non-None value, but map both and raise on anything else.
+        # Explicit, defensive mapping (no bare-else silent-fp16 fallthrough). config.py
+        # (_require) accepts amp_dtype in (None, 'bf16', 'fp16'), so both 'bf16' and 'fp16' are
+        # reachable non-None values; fp16 training is loss-scaled by the GradScaler in train.py
+        # (enabled when amp_dtype=='fp16'). Map both and raise on anything else.
         if self.cfg.amp_dtype == "bf16":
             dtype = torch.bfloat16
         elif self.cfg.amp_dtype == "fp16":
