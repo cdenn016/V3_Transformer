@@ -189,3 +189,42 @@ def test_2x2_positional_ablation_runs():
             m = VFEModel(_rope_cfg(pos_rotation=pr, pos_phi=pp))
             out = m(x)
             assert out.shape[0] == 2 and torch.isfinite(out).all()
+
+
+# --- value-gauge decoupling toggle (rope_on_value) -------------------------
+
+def test_rope_on_value_defaults_true():
+    assert VFE3Config().rope_on_value is True
+
+
+def test_rope_on_value_false_decouples_and_changes_logits():
+    # With RoPE on, factoring the value gauge from the attention gauge (rope_on_value=False) gives a
+    # different forward than the coherent single-gauge default -- the value aggregation drops RoPE.
+    torch.manual_seed(0)
+    x = torch.randint(0, 6, (2, 8))
+    coupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=True))
+    decoupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=False))
+    decoupled.load_state_dict(coupled.state_dict())
+    assert not torch.allclose(coupled(x), decoupled(x), atol=1e-5)
+
+
+def test_rope_on_value_inert_without_rope():
+    # rope_on_value only factors the gauge-RoPE rotation; with pos_rotation='none' there is no
+    # rotation, so the flag is a no-op and the forward is byte-identical.
+    torch.manual_seed(0)
+    x = torch.randint(0, 6, (2, 8))
+    a = VFEModel(_rope_cfg(pos_rotation="none", rope_on_value=True))
+    b = VFEModel(_rope_cfg(pos_rotation="none", rope_on_value=False))
+    b.load_state_dict(a.state_dict())
+    assert torch.allclose(a(x), b(x), atol=1e-6)
+
+
+def test_rope_on_value_false_model_trains_end_to_end():
+    # Decoupled value gauge routes the belief gradient to the autograd oracle; the model must still
+    # train (finite loss and prior-table gradients) end to end.
+    torch.manual_seed(0)
+    m = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=False))
+    x = torch.randint(0, 6, (1, 8)); y = torch.randint(0, 6, (1, 8))
+    _, loss, _ = m(x, y); loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(m.prior_bank.mu_embed.grad).all()

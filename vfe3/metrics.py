@@ -628,6 +628,60 @@ def holonomy_deviation_sampled(
     }
 
 
+def holonomy_wilson_sampled(
+    omega:      torch.Tensor,            # (N, N, K, K) pairwise transport Omega_ij
+
+    *,
+    n_heads:    int  = 1,
+    n_triples:  int  = 512,
+    n_boot:     int  = 200,
+    seed:       int  = 0,
+) -> Dict[str, torch.Tensor]:
+    r"""Wilson holonomy observable W_ijk = Re Tr(H_ijk) over random distinct triples.
+
+    The gauge-INVARIANT triangle observable (PIFB:862-869): H_ijk = Omega_ij Omega_jk Omega_ki,
+    W_ijk = Re Tr(H_ijk), reported normalized as W/K so a closed triangle H = I gives W/K = 1,
+    with the Wilson-action density 1 - W/K (flat -> 0) -- the trace complement of
+    ``holonomy_deviation_sampled``'s Frobenius ||H - I||_F. When ``n_heads > 1`` the gauge is
+    block-diagonal H = oplus_h H^(h), so Tr(H) = sum_h Tr(H^(h)) and the per-head observable is
+    W^(h)/d_k with d_k = K / n_heads; the per-head normalized values average back to the full W/K.
+    The real part is exact (= Tr) for the real groups built today; it would need ``.real`` only for
+    a complex GL(K, C) gauge. On the flat phi-cocycle every triangle closes so W/K = 1 (deviation 0);
+    genuine holonomy appears only under the opt-in regime_ii connection. Seeded random triples match
+    ``holonomy_deviation_sampled`` so the two observables are directly comparable.
+    """
+    n, k = omega.shape[0], omega.shape[-1]
+    if n_heads > 1 and k % n_heads != 0:
+        raise ValueError(f"n_heads={n_heads} must divide K={k} for the per-head Wilson decomposition")
+    gen = torch.Generator(device=omega.device).manual_seed(int(seed))
+    draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=omega.device)
+    keep = (draw[:, 0] != draw[:, 1]) & (draw[:, 1] != draw[:, 2]) & (draw[:, 0] != draw[:, 2])
+    idx = draw[keep][:n_triples]
+    if idx.numel() == 0:
+        z = omega.new_zeros(())
+        return {"wilson_mean": omega.new_ones(()), "deviation_mean": z, "ci_lo": z, "ci_hi": z,
+                "per_triple": omega.new_zeros(0), "span": omega.new_zeros(0),
+                "per_head": omega.new_ones(n_heads)}
+    h = omega[idx[:, 0], idx[:, 1]] @ omega[idx[:, 1], idx[:, 2]] @ omega[idx[:, 2], idx[:, 0]]   # (T, K, K)
+    diag = torch.diagonal(h, dim1=-2, dim2=-1)                   # (T, K) Re diagonal of H
+    per = diag.sum(dim=-1) / k                                   # (T,) W_ijk / K
+    span = (idx.amax(dim=1) - idx.amin(dim=1)).to(omega.dtype)
+    dev = 1.0 - per                                              # (T,) Wilson-action density 1 - W/K
+    ridx = torch.randint(0, dev.shape[0], (n_boot, dev.shape[0]), generator=gen, device=omega.device)
+    boot = dev[ridx].mean(dim=1)
+    d_k = k // n_heads
+    per_head = diag.reshape(diag.shape[0], n_heads, d_k).sum(dim=-1).mean(dim=0) / d_k   # (n_heads,) W^(h)/d_k
+    return {
+        "wilson_mean":    per.mean(),
+        "deviation_mean": dev.mean(),
+        "ci_lo":          torch.quantile(boot, 0.025),
+        "ci_hi":          torch.quantile(boot, 0.975),
+        "per_triple":     per,
+        "span":           span,
+        "per_head":       per_head,
+    }
+
+
 def curvature_field(
     omega:  torch.Tensor,                # (N, N, K, K) pairwise transport Omega_ij
     anchor: int = 0,

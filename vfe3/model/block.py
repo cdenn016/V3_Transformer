@@ -39,6 +39,7 @@ def vfe_block(
     e_step_gradient: str                       = "unroll",  # E-step backward estimator (unroll | straight_through | detach)
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
+    rope_on_value:   bool                      = True,   # False -> value aggregation uses the un-rotated base
     capture:         Optional[dict]            = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
     grad_record:     Optional[dict]            = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
 ) -> BeliefState:
@@ -71,7 +72,7 @@ def vfe_block(
         e_step_gradient=e_step_gradient, oracle_unroll_grad=cfg.oracle_unroll_grad,
         grad_record=grad_record,
         log_prior=log_prior,
-        rope=rope, rope_on_cov=rope_on_cov,
+        rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
     )
     if capture is not None:
         # The CONVERGED variational belief q* -- what the E-step's F was minimized over,

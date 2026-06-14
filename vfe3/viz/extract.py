@@ -75,7 +75,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
         cocycle_relaxation=cfg.cocycle_relaxation, connection_W=getattr(model, "connection_W", None),
         log_prior=log_prior, log_alpha=getattr(model, "log_alpha", None),
-        rope=rope, rope_on_cov=cfg.rope_full_gauge,
+        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
 
 
@@ -94,7 +94,7 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
         transport_mode=cfg.transport_mode, cocycle_relaxation=cfg.cocycle_relaxation,
         log_prior=log_prior, log_alpha=getattr(model, "log_alpha", None),
         connection_W=getattr(model, "connection_W", None),
-        rope=rope, rope_on_cov=cfg.rope_full_gauge,
+        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
 
 
@@ -188,7 +188,7 @@ def belief_bank(
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained
                 log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),  # model
                 connection_W=getattr(model, "connection_W", None),
-                rope=rope, rope_on_cov=cfg.rope_full_gauge,
+                rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
             )
             b = tokens.shape[0]
             mus.append(out.mu.reshape(b * n, -1))
@@ -275,7 +275,7 @@ def across_layer_belief_trace(
             cg_coupling=model.cg_coupling,                       # replay the trained model
             log_alpha=getattr(model, "log_alpha", None),
             lambda_beta=_lambda_beta(model), connection_W=getattr(model, "connection_W", None),
-            rope=rope, rope_on_cov=cfg.rope_full_gauge,
+            rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
         )
         mus.append(belief.mu)
         sigmas.append(belief.sigma)
@@ -380,7 +380,7 @@ def converged_state(
             head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained model
             log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
             connection_W=getattr(model, "connection_W", None),
-            rope=rope, rope_on_cov=cfg.rope_full_gauge,
+            rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
             capture=cap,
         )
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma     # rebuild last-block prior
@@ -395,7 +395,8 @@ def converged_state(
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
         if rope is not None:
-            rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge)
+            rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                                       on_value=cfg.rope_on_value)
             mu_t    = transport_mean(rope_omega, out.mu)
             sigma_t = transport_covariance(rope_omega, out.sigma)
         else:

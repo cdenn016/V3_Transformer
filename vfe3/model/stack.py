@@ -42,6 +42,7 @@ def vfe_stack(
     e_step_gradient: str                       = "unroll",  # E-step backward estimator (unroll | straight_through | detach)
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
+    rope_on_value:   bool                      = True,   # False -> value aggregation uses the un-rotated base
     capture:         Optional[dict]            = None,   # out-param: LAST block's converged (pre-transform) belief under 'converged'
     grad_record:     Optional[dict]            = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
 ) -> BeliefState:
@@ -65,6 +66,7 @@ def vfe_stack(
                            log_alpha=log_alpha, lambda_beta=lambda_beta,
                            connection_W=connection_W,
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,
+                           rope_on_value=rope_on_value,
                            capture=capture, grad_record=grad_record)   # each block overwrites; last wins
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma

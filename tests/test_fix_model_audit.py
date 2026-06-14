@@ -6,6 +6,7 @@ concurrently-edited config.py / metrics.py / groups.py beyond their already-live
 """
 
 import contextlib
+import math
 import warnings
 
 import pytest
@@ -124,6 +125,18 @@ def test_diagnostics_reg_is_none_when_constant(monkeypatch):
     model.diagnostics(token_ids)
     assert seen["alpha_reg"] is None
     assert seen["iae"] == cfg.include_attention_entropy
+
+
+def test_diagnostics_exposes_wilson_holonomy_zero_on_flat_default():
+    # The Wilson-action density 1 - Re Tr(H)/K is exposed alongside the Frobenius holonomy and is
+    # ~0 on the default flat phi-cocycle (every triangle closes), the complement of the certificate.
+    cfg = _tiny_cfg()
+    model = VFEModel(cfg)
+    token_ids = torch.zeros((1, cfg.max_seq_len), dtype=torch.long)
+    d = model.diagnostics(token_ids)
+    assert "holonomy_wilson" in d
+    assert math.isfinite(d["holonomy_wilson"])
+    assert abs(d["holonomy_wilson"]) < 1e-3
 
 
 # ---------------------------------------------------------------------------
