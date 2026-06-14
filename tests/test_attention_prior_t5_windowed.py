@@ -103,3 +103,84 @@ def _model_forward_finite(prior_name: str):
 def test_model_forward_under_windowed_priors():
     for name in ("causal_windowed", "windowed", "t5_relative_bias"):
         _model_forward_finite(name)
+
+
+# --- learnable T5 relative-position bias (t5_learnable_bias) -----------------
+# GL(K)_attention.tex:826-838 derives the relative-position bias as a LEARNABLE function of offset
+# (pi_j ∝ exp(b_{i-j})); the model owns a (num_buckets,) nn.Parameter table read by the prior.
+# Sanctioned no-NN exception (default OFF): the bias is a scalar function of position offset, touches
+# no gauge transport, so it does NOT break equivariance.
+
+def _t5_learnable_cfg(**kw):
+    base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0,
+                beta_attention_prior="t5_relative_bias", t5_learnable_bias=True)
+    base.update(kw)
+    return VFE3Config(**base)
+
+
+def test_t5_learnable_bias_defaults_false():
+    assert VFE3Config().t5_learnable_bias is False
+
+
+def test_t5_relative_bias_gradient_flows_to_table():
+    # Function-level contract: a requires_grad bias_values table receives gradient through the gather
+    # (the future-masked -inf entries overwrite table values, so grad reaches only the lower-triangle
+    # buckets -- which is exactly what trains).
+    table = torch.zeros(8, requires_grad=True)
+    B = attention_log_prior("t5_relative_bias", 4, 4, bias_values=table,
+                            num_buckets=8, max_distance=16)
+    B[torch.isfinite(B)].sum().backward()
+    assert table.grad is not None
+    assert table.grad.abs().sum() > 0
+
+
+def test_t5_learnable_bias_creates_trainable_parameter():
+    m = VFEModel(_t5_learnable_cfg())
+    assert isinstance(m.t5_bias, torch.nn.Parameter)
+    assert m.t5_bias.shape == (m.cfg.t5_num_buckets,)
+    assert m.t5_bias.requires_grad
+    assert any(p is m.t5_bias for p in m.parameters())   # registered, so the optimizer sees it
+
+
+def test_t5_learnable_bias_absent_when_off():
+    # Pure path: t5_learnable_bias=False creates no parameter (no t5_bias attribute).
+    m = VFEModel(_t5_learnable_cfg(t5_learnable_bias=False))
+    assert not hasattr(m, "t5_bias")
+
+
+def test_t5_learnable_bias_inits_to_fixed_default():
+    # Byte-identical at step 0: the parameter inits to the fixed-table default -log1p(bucket), so the
+    # learnable model's attention prior equals the non-learnable t5_relative_bias prior before training.
+    m = VFEModel(_t5_learnable_cfg())
+    dev = torch.device("cpu")
+    a = m._attention_log_prior(8, dev)
+    b = attention_log_prior("t5_relative_bias", 8, 8, device=dev, dtype=a.dtype,
+                            num_buckets=m.cfg.t5_num_buckets, max_distance=m.cfg.t5_max_distance)
+    mask = torch.isfinite(a)
+    assert torch.equal(mask, torch.isfinite(b))          # identical -inf (future-mask) structure
+    assert torch.allclose(a[mask], b[mask], atol=1e-6)
+
+
+def test_t5_learnable_bias_cache_bypassed_when_table_changes():
+    # The learnable table is a live parameter that changes every step, so the (name,N,...) prior cache
+    # MUST be bypassed -- a cached tensor would serve a stale table. Mutating the parameter must change
+    # the produced prior.
+    m = VFEModel(_t5_learnable_cfg())
+    dev = torch.device("cpu")
+    a1 = m._attention_log_prior(8, dev)
+    with torch.no_grad():
+        m.t5_bias.sub_(1.0)                              # shift every bucket bias
+    a2 = m._attention_log_prior(8, dev)
+    mask = torch.isfinite(a1)
+    assert not torch.allclose(a1[mask], a2[mask])
+
+
+def test_t5_learnable_bias_trains_end_to_end():
+    torch.manual_seed(0)
+    m = VFEModel(_t5_learnable_cfg())
+    x = torch.randint(0, 12, (2, 8)); y = torch.randint(0, 12, (2, 8))
+    _, loss, _ = m(x, y); loss.backward()
+    assert torch.isfinite(loss)
+    assert m.t5_bias.grad is not None
+    assert torch.isfinite(m.t5_bias.grad).all() and m.t5_bias.grad.abs().sum() > 0
