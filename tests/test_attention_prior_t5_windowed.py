@@ -184,3 +184,13 @@ def test_t5_learnable_bias_trains_end_to_end():
     assert torch.isfinite(loss)
     assert m.t5_bias.grad is not None
     assert torch.isfinite(m.t5_bias.grad).all() and m.t5_bias.grad.abs().sum() > 0
+
+
+def test_t5_learnable_bias_is_grouped_by_build_optimizer():
+    # build_optimizer asserts every trainable parameter lands in exactly one group; the learnable
+    # T5 bias must be grouped or it silently never trains (and the coverage guard raises).
+    from vfe3.train import build_optimizer
+    m = VFEModel(_t5_learnable_cfg())
+    opt = build_optimizer(m, m.cfg)                       # raised AssertionError before the fix
+    grouped = {p for g in opt.param_groups for p in g["params"]}
+    assert any(p is m.t5_bias for p in grouped)

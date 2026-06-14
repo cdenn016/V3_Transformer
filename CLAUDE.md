@@ -24,6 +24,14 @@ This V3 is intended to be a production quality continuation of the VFE_2.0 trans
   `connection_W` breaks strict gauge equivariance — exact at zero init, deviates as W drifts (the
   same footprint as the head mixer) — user-accepted. (Pinned by
   `tests/test_regime_ii.py::test_regime_ii_edge_factor_breaks_gauge_invariance_for_nonzero_W`.)
+  (4) `t5_learnable_bias=True` learns the per-bucket T5 relative-position attention-bias table
+  `b_{i-j}` (a raw `(t5_num_buckets,)` nn.Parameter read by the `t5_relative_bias` attention prior;
+  default OFF, created only when a T5 channel is active, init to the fixed `-log1p(bucket)` table so
+  step 0 is byte-identical). Unlike (2)/(3) this bias is a scalar function of position OFFSET only and
+  touches no gauge transport, so it does NOT break gauge equivariance — the cleanest exception. Like
+  the E-step-coupled params above it carries a `detach_e_step` freeze footgun. (`learnable_r`,
+  `lambda_alpha_mode='learnable'`, `learnable_lambda_beta`, `lambda_h_mode='learnable'`,
+  `pos_phi='learned'` are the other default-OFF learned-scalar/table toggles in the same family.)
 - NO CLI arg parsing; entry points are click-to-run (edit config dicts, then run).
 - float32 throughout; CUDA where applicable (user has an RTX 5090).
 - High modularity: a config-selected registry behind every seam (divergence,
