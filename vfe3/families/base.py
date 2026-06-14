@@ -206,6 +206,14 @@ def divergence_functionals_per_coord() -> Tuple[str, ...]:
     return tuple(sorted(_FUNCTIONALS_PER_COORD))
 
 
+# fp32 catastrophic-cancellation band around the alpha->1 (KL) limit of the generic Renyi A-form:
+# outside the |alpha-1| < 1e-6 KL switch but inside this band the three nearly-equal log-partition
+# values cancel before the /(alpha-1) divide, losing ~1% accuracy in float32 out to ~|alpha-1| ~ 1e-3.
+# Inside the band the A-form is evaluated in float64 and cast back. Kept as a separate constant from
+# gaussian._RENYI_KL_BAND because base.py cannot import gaussian (gaussian imports base).
+_RENYI_KL_BAND: float = 1e-2
+
+
 def _renyi_from_log_partition(
     q:       BeliefParams,
     p:       BeliefParams,
@@ -241,6 +249,15 @@ def _renyi_from_log_partition(
             param_axes = tuple(range(batch_ndim, term.dim()))
             inner = inner + (term.sum(dim=param_axes) if param_axes else term)
         div = cls.log_partition_at(tp) - A_q - inner
+    elif abs(alpha - 1.0) < _RENYI_KL_BAND:
+        # fp32 cancellation band: evaluate the three log-partitions in float64, then cast back
+        # (mirrors the closed-form gaussian._RENYI_KL_BAND float64 island).
+        tq64    = tuple(t.double() for t in tq)
+        tp64    = tuple(t.double() for t in tp)
+        blend64 = tuple(alpha * a + (1.0 - alpha) * b for a, b in zip(tq64, tp64))
+        div = ((cls.log_partition_at(blend64)
+                - alpha * cls.log_partition_at(tq64)
+                - (1.0 - alpha) * cls.log_partition_at(tp64)) / (alpha - 1.0)).to(tq[0].dtype)
     else:
         blend = tuple(alpha * a + (1.0 - alpha) * b for a, b in zip(tq, tp))
         div = (cls.log_partition_at(blend)
@@ -297,7 +314,7 @@ def squared_hellinger(
     kl_max:  float = 100.0,
     eps:     float = 1e-6,
     **kwargs,
-) -> torch.Tensor:                             # (...) squared Hellinger H^2(q||p) in [0, 1)
+) -> torch.Tensor:                             # (...) squared Hellinger H^2(q||p) in [0, 1]
     r"""Squared Hellinger f-divergence H^2(q || p) = 1 - BC(q || p).
 
     For Gaussians the Bhattacharyya coefficient is BC = exp(-D_{1/2}(q||p)/2), where D_{1/2}
@@ -308,9 +325,10 @@ def squared_hellinger(
     This member ignores any ``alpha`` the call sites forward (Hellinger has no order); it is
     absorbed by ``**kwargs`` and never reaches ``renyi`` (the inner call always uses alpha=0.5,
     so the alpha>1 blend warning cannot fire). ``kl_max`` IS forwarded so the inner D_{1/2}
-    stays bounded in [0, kl_max]; the H^2 output is then naturally in [0, 1) without a second
-    clamp (a clamped D_{1/2}=kl_max maps to H^2 = 1 - exp(-kl_max/2), the maximal-Hellinger
-    limit, which composes correctly).
+    stays bounded in [0, kl_max]; the H^2 output is then naturally in [0, 1] without a second
+    clamp (mathematically the range is the half-open [0, 1), but in float32 ``1 - exp(-0.5 d_half)``
+    saturates to exactly 1.0 for d_half >= ~35, so at the default kl_max=100 a clamped
+    D_{1/2}=kl_max maps to H^2 = 1.0, the maximal-Hellinger limit, which composes correctly).
     """
     d_half = renyi(q, p, alpha=0.5, kl_max=kl_max, eps=eps)
     return 1.0 - torch.exp(-0.5 * d_half)

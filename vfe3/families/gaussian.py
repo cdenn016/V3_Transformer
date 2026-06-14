@@ -82,7 +82,15 @@ class DiagonalGaussian(BeliefParams):
         eps:     float = 1e-6,
     ) -> torch.Tensor:
         r"""Closed-form diagonal Gaussian Renyi/KL (ported verbatim from
-        ``divergence._gaussian_diagonal_renyi``; mu_q=self, mu_t=other)."""
+        ``divergence._gaussian_diagonal_renyi``; mu_q=self, mu_t=other).
+
+        ``eps`` is the variance floor for the log/division terms and MUST equal the upstream belief
+        sigma floor (``cfg.eps``, default 1e-6; the SPD retraction clamps every sigma to
+        [eps, sigma_max], so on the live pipeline every input sigma is already >= cfg.eps and this
+        clamp is inert defense-in-depth, never the binding floor). This is a DIFFERENT, looser floor
+        than the hardcoded 1e-12 in ``natural()``/``entropy()`` (the generic A-path): the closed form
+        tracks the pipeline floor, while the natural-parameter maps only need positivity for
+        log(-2 t2)."""
         K = self.mu.shape[-1]
         mu_q = self.mu.float()
         sigma_q = self.sigma.float().clamp(min=eps)

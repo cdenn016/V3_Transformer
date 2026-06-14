@@ -1,11 +1,16 @@
 r"""Gauge-RoPE: a block-diagonal positional rotation R(theta) for VFE_3.0 transport.
 
-Realizes the manuscript's identification of the per-token frame U_i with a rotary positional
-rotation (GL(K)_attention.tex, "Identification with rotary positional structure"): within each
-irrep block of size d, coordinate pairs (2k, 2k+1) rotate by theta_{n,k} = n * base^{-2k/d}, so
-the combined frame is U_i = R(theta_i) exp(phi_i) and Omega_ij = R(theta_i) Omega_ij^learned
-R(theta_j)^T. Block-diagonal on irrep_dims so R is orthogonal and preserves the block-diagonal
-exp fast path. Parameter-free; default-off via the ``pos_rotation`` registry ("none").
+Realizes the manuscript's rotary positional structure (GL(K)_attention.tex, "Identification with
+rotary positional structure"): within each irrep block of size d, coordinate pairs (2k, 2k+1)
+rotate by theta_{n,k} = n * base^{-2k/d}, and transport composes as the outer orthogonal similarity
+Omega_ij = R(theta_i) Omega_ij^learned R(theta_j)^T. R(theta) coincides with a structure-group
+gauge element (the frame U_i = R(theta_i) exp(phi_i)) ONLY on blocks where the irrep image is full
+SO(d) (glk/so_k; the l1 defining rep of SO(3)). On higher so_n/sp_n irrep blocks (dim > N) the
+coordinate-pair rotation is a generic SO(d) element OUTSIDE the irrep image rho(SO(N))/rho(Sp(2m)),
+so R Omega R^T leaves the selected structure group (config.py warns at build); the code never
+assumes R in rho(G) -- it enters only as the outer similarity. Block-diagonal on irrep_dims so R is
+orthogonal (the GL(K)-congruence divergence invariance and the block-diagonal exp fast path are
+unaffected). Parameter-free; default-off via the ``pos_rotation`` registry ("none").
 """
 
 from typing import Callable, Dict, List, Optional

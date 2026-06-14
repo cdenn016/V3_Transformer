@@ -13,15 +13,17 @@ Modularity:
     decode_mode registry -- ``diagonal`` (fused closed form, default); ``full``
         implemented and registered (the exact full-covariance Cholesky decode).
 
-Divergence-agnostic, scope clarified: ``reference_decode`` is the literal seam path --
-it calls ``divergence.kl`` and so tracks whatever divergence family/alpha the seam is
-configured for. The default fused ``diagonal`` kernel is a hand-specialized alpha=1
-``gaussian_diagonal`` shortcut (one matmul, no per-V ``kl`` call) that is pinned EXACTLY
-to that seam (and under ``log_softmax``); it does not re-derive itself for a different
-family. The registry seam is therefore honored at the family granularity: a new
-COVARIANCE STRUCTURE (e.g. full-covariance) is added by writing-and-registering a new
-decode kernel (the registered ``full`` Cholesky kernel), never by editing a call site --
-and ``reference_decode`` already covers any registered divergence for verification.
+Covariance-structure seam (NOT divergence-agnostic): both ``reference_decode`` and the fused
+kernels score logits = -KL(q || pi_v)/tau_eff at a FIXED alpha=1 KL on a HARDCODED family --
+``gaussian_diagonal`` for the diagonal kernels and ``reference_decode``, ``gaussian_full`` for
+the full kernels. They call ``divergence.kl`` (Renyi at alpha=1) and never read ``cfg.alpha_div``
+or ``cfg.divergence_family``, so the decode boundary stays alpha=1 KL even when the E-step
+minimizes under a different alpha/functional (config.py warns when ``use_prior_bank=True`` is
+paired with a non-KL/non-alpha=1 seam). The registry seam is honored at the COVARIANCE-STRUCTURE
+granularity only: a new covariance structure (e.g. full-covariance) is added by writing-and-
+registering a new decode kernel (the registered ``full`` Cholesky kernel), never by editing a call
+site. ``reference_decode`` is the slow per-V seam-call cross-check that the fused ``diagonal``
+kernel is pinned to EXACTLY (and under ``log_softmax``); both are alpha=1 KL.
 """
 
 from typing import Callable, Dict, Optional, Tuple

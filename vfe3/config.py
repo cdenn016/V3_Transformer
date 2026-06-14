@@ -1124,6 +1124,20 @@ class VFE3Config:
                 "(linear decode) for the learned bias to take effect.",
                 UserWarning,
             )
+        # use_prior_bank decode is a FIXED alpha=1 KL readout on the hardcoded Gaussian family
+        # (prior_bank.reference_decode / the fused kernels call divergence.kl); it does NOT read
+        # alpha_div / divergence_family. An opt-in non-KL/non-alpha=1 seam therefore minimizes the
+        # E-step under one divergence and reads logits out under another -- warn so the mismatch is a
+        # deliberate choice (the pure path is use_prior_bank=True with renyi / alpha_div=1).
+        if self.use_prior_bank and (self.alpha_div != 1.0 or self.divergence_family != "renyi"):
+            import warnings
+            warnings.warn(
+                f"use_prior_bank=True decodes at a FIXED alpha=1 KL, but the E-step minimizes under "
+                f"divergence_family={self.divergence_family!r}/alpha_div={self.alpha_div}: inference "
+                f"and the KL-to-prior readout use different divergences.",
+                UserWarning,
+                stacklevel=2,
+            )
         # Full-covariance compute discarded at the decode boundary (B4): use_prior_bank=False decodes
         # by the linear readout logits = mu_q @ W^T, which DISCARDS sigma. With a full-covariance family
         # the E-step still evolves a (B, N, K, K) covariance (it shapes the mean trajectory, so the
