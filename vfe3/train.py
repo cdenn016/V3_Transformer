@@ -129,6 +129,8 @@ def build_optimizer(
         groups.append({"params": [model.log_alpha], "lr": cfg.m_mu_lr})
     if getattr(model, "log_lambda_beta", None) is not None:     # learnable_lambda_beta scalar belief-coupling weight
         groups.append({"params": [model.log_lambda_beta], "lr": cfg.m_phi_lr})  # a coupling/gauge-scale LR
+    if getattr(model, "log_lambda_h", None) is not None:        # lambda_h_mode='learnable' scalar hyper-prior weight
+        groups.append({"params": [model.log_lambda_h], "lr": cfg.m_mu_lr})  # a precision-coupling scale (like log_alpha)
 
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
     # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the
@@ -333,6 +335,13 @@ def train_step(
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     _scaler.step(optimizer)
     _scaler.update()
+    # Closed-form hyper-prior M-step (r_update_mode='barycenter'): after AdamW updates the s tables,
+    # set the centroid r to their forward-KL barycenter (the closed-form variational M-step, in place
+    # of an AdamW step on r -- r is ungrouped/frozen-from-the-optimizer under this mode). No-op for the
+    # default gradient r (trained inside optimizer.step above) and for frozen r (learnable_r=False).
+    _cfg = model.cfg
+    if _cfg.learnable_r and _cfg.r_update_mode == "barycenter":
+        model.prior_bank.barycenter_r_()
     scheduler.step()
     return step_loss
 

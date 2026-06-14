@@ -291,3 +291,162 @@ def test_learnable_r_grouped_under_natural_grad_optimizer():
     opt_params = {id(p) for g in opt.param_groups for p in g["params"]}
     assert id(m.prior_bank.r_mu) in opt_params
     assert id(m.prior_bank.r_sigma_log) in opt_params
+
+
+# ---------------------------------------------------------------------------
+# lambda_h_mode: the model-fiber analogue of alpha_mode (constant / state_dependent
+# envelope / learnable), and r_update_mode='barycenter': the closed-form forward-KL
+# barycenter M-step for r. Spec: docs/.../2026-06-13-lambda-h-mode-and-r-update-mechanism.md.
+# lambda_h weights KL(s_i||r) the way alpha weights KL(q_i||p_i); the manuscript names the
+# state-dependent lambda_h "a parallel extension not developed here" (Participatory ~3766).
+# ---------------------------------------------------------------------------
+from vfe3.lambda_h_i import hyper_prior_lambda_h, _LAMBDA_H_MODES
+
+
+def _scored_model(lambda_h: float, *, lambda_h_mode: str = "constant",
+                  b0_h: float = 1.0, c0_h: float = 1.0, seed: int = 0) -> VFEModel:
+    r"""Scored-regime model (s_e_step=False): the hyper-prior term is added directly to the loss as
+    _hyper_prior_term, so the lambda_h_mode weighting/regularizer is exercised at the loss level."""
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     mstep_self_coupling_weight=0.0, lambda_h=lambda_h, lambda_h_mode=lambda_h_mode,
+                     b0_h=b0_h, c0_h=c0_h, seed=seed)
+    torch.manual_seed(seed)
+    return VFEModel(cfg)
+
+
+def test_lambda_h_mode_and_r_update_mode_defaults():
+    # Defaults preserve current behavior exactly: constant lambda_h, gradient r.
+    c = VFE3Config()
+    assert c.lambda_h_mode == "constant"
+    assert c.r_update_mode == "gradient"
+    assert c.b0_h == 1.0 and c.c0_h == 1.0
+
+
+def test_constant_lambda_h_mode_is_byte_identical():
+    # constant lambda_h_mode reproduces the pre-registry weighting: loss_w - loss_0 == w * mean KL.
+    w = 0.5
+    m0 = _scored_model(0.0); mw = _scored_model(w, lambda_h_mode="constant")
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, l0, _ = m0(tokens, targets)
+    _, lw, _ = mw(tokens, targets)
+    hp = _hyperprior_term(mw, tokens)            # mean KL oracle
+    assert hp > 1e-6
+    assert torch.allclose(lw - l0, w * hp, atol=1e-6)
+
+
+def test_state_dependent_lambda_h_scored_term_matches_envelope():
+    # The scored term equals mean_i[ c0_h/(b0_h+KL(s_i||r)) * KL + R_h ], the exact lambda_h envelope.
+    m = _scored_model(0.5, lambda_h_mode="state_dependent", b0_h=0.3, c0_h=0.7)
+    tokens = torch.randint(0, 20, (3, 5))
+    kl = m._hyper_prior_kl(tokens)
+    lam, reg = hyper_prior_lambda_h(kl, mode="state_dependent", value=0.5, b0_h=0.3, c0_h=0.7)
+    oracle = (lam * kl + reg).mean()
+    assert torch.allclose(m._hyper_prior_term(tokens), oracle, atol=1e-7)
+    # lambda_h*_i = c0_h/(b0_h+KL): bounded above by c0_h/b0_h, strictly positive, KL-decreasing.
+    assert (lam <= 0.7 / 0.3 + 1e-6).all() and (lam > 0).all()
+
+
+def test_state_dependent_lambda_h_grad_flows_to_s():
+    # The state-dependent scored term backprops a finite, nonzero gradient into the s tables.
+    m = _scored_model(0.5, lambda_h_mode="state_dependent")
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, loss, _ = m(tokens, targets)
+    loss.backward()
+    g = m.prior_bank.s_mu_embed.grad
+    assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
+
+
+def test_learnable_lambda_h_param_grad_and_grouping():
+    # lambda_h_mode='learnable' creates log_lambda_h init log(cfg.lambda_h); it trains and is grouped.
+    from vfe3.train import build_optimizer
+    import math
+    m = _scored_model(0.5, lambda_h_mode="learnable")
+    assert hasattr(m, "log_lambda_h")
+    assert torch.allclose(m.log_lambda_h.detach(), torch.tensor(math.log(0.5)), atol=1e-6)
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, loss, _ = m(tokens, targets)
+    loss.backward()
+    gh = m.log_lambda_h.grad
+    assert gh is not None and torch.isfinite(gh).all() and gh.abs().sum() > 0
+    opt = build_optimizer(m, m.cfg)              # must NOT trip the coverage guard
+    assert id(m.log_lambda_h) in {id(p) for g in opt.param_groups for p in g["params"]}
+
+
+def test_learnable_lambda_h_byte_identical_to_constant_at_init():
+    # Init log_lambda_h=log(cfg.lambda_h) -> lambda_h=cfg.lambda_h, so the forward loss at step 0 is
+    # identical to constant lambda_h (creating the scalar param draws no RNG).
+    mc = _scored_model(0.5, lambda_h_mode="constant", seed=0)
+    ml = _scored_model(0.5, lambda_h_mode="learnable", seed=0)
+    assert torch.equal(mc.prior_bank.s_mu_embed, ml.prior_bank.s_mu_embed)
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, lc, _ = mc(tokens, targets)
+    _, ll, _ = ml(tokens, targets)
+    assert torch.allclose(lc, ll, atol=1e-6)
+
+
+def test_state_dependent_lambda_h_in_s_e_step_trains_s():
+    # The s E-step routing (model.py _refine_s): under s_e_step the lambda_h_mode is threaded into the
+    # e_step self-coupling (with R_h via alpha_reg), so a state_dependent lambda_h trains s through the
+    # unrolled refine. (model_channel anchors s, so this is the non-collapse regime.)
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     mstep_self_coupling_weight=0.0, use_prior_bank=True,
+                     lambda_h=1.0, lambda_h_mode="state_dependent", prior_source="model_channel",
+                     s_e_step=True, e_s_mu_lr=0.5, seed=0)
+    torch.manual_seed(0)
+    m = VFEModel(cfg)
+    tokens = torch.randint(0, 20, (2, 5)); targets = torch.randint(0, 20, (2, 5))
+    _, loss, _ = m(tokens, targets)
+    loss.backward()
+    g = m.prior_bank.s_mu_embed.grad
+    assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
+
+
+def test_lambda_h_mode_inert_warning_when_lambda_h_zero():
+    # A non-constant lambda_h_mode with lambda_h=0 has no effect (no channel) -> warn.
+    with pytest.warns(UserWarning, match="lambda_h_mode"):
+        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
+                   lambda_h=0.0, lambda_h_mode="state_dependent")
+
+
+def test_barycenter_r_sets_closed_form_centroid():
+    # PriorBank.barycenter_r_ sets r to the moment-matched barycenter of the s tables:
+    # r_mu = mean_v s_mu_v, r_sigma = mean_v[s_sigma_v + (s_mu_v - r_mu)^2].
+    m = _lr_model(learnable_r=True)
+    pb = m.prior_bank
+    with torch.no_grad():
+        pb.s_mu_embed.copy_(torch.randn_like(pb.s_mu_embed))
+        pb.s_sigma_log_embed.copy_(0.3 * torch.randn_like(pb.s_sigma_log_embed))
+    pb.barycenter_r_()
+    s_mu = pb.s_mu_embed
+    s_sig = torch.exp(pb.s_sigma_log_embed).clamp(min=m.cfg.eps)
+    r_mu_cf = s_mu.mean(0)
+    r_var_cf = (s_sig + (s_mu - r_mu_cf) ** 2).mean(0)
+    assert torch.allclose(pb.r_mu, r_mu_cf, atol=1e-6)
+    assert torch.allclose(torch.exp(pb.r_sigma_log), r_var_cf, atol=1e-5)
+
+
+def test_r_update_mode_barycenter_keeps_r_out_of_optimizer():
+    # r_update_mode='barycenter' un-grads r (it is set by the closed-form M-step, not AdamW): r is
+    # requires_grad=False and NOT grouped, while the s tables still train.
+    from vfe3.train import build_optimizer
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=1, use_prior_bank=True, lambda_h=0.5, prior_source="model_channel",
+                     learnable_r=True, r_update_mode="barycenter", seed=0)
+    torch.manual_seed(0)
+    m = VFEModel(cfg)
+    assert m.prior_bank.r_mu.requires_grad is False
+    assert m.prior_bank.r_sigma_log.requires_grad is False
+    opt = build_optimizer(m, cfg)                # frozen r is exempt from the coverage guard
+    opt_ids = {id(p) for g in opt.param_groups for p in g["params"]}
+    assert id(m.prior_bank.r_mu) not in opt_ids
+    assert id(m.prior_bank.s_mu_embed) in opt_ids
+
+
+def test_r_update_mode_barycenter_inert_warning_without_learnable_r():
+    # barycenter with learnable_r=False is a no-op (frozen r never updates) -> warn.
+    with pytest.warns(UserWarning, match="r_update_mode='barycenter' has no effect"):
+        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
+                   lambda_h=0.5, prior_source="model_channel",
+                   learnable_r=False, r_update_mode="barycenter")
