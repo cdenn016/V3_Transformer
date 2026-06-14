@@ -411,7 +411,8 @@ def evaluate(
 # or not an eval has run yet). Config-conditional keys (val_head_redundancy_js needs >= 2 heads;
 # pos_loss_* needs targets and seq_len >= 4) stay NaN on runs where they do not apply.
 _VAL_DIAG_KEYS = (
-    "val_self_coupling", "val_belief_coupling", "val_attention_entropy", "val_free_energy_total",
+    "val_self_coupling", "val_self_divergence", "val_belief_coupling", "val_attention_entropy",
+    "val_free_energy_total",
     "val_attn_entropy", "val_effective_rank", "val_belief_cond_median", "val_attn_entropy_min",
     "val_attn_entropy_min_all", "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
@@ -448,6 +449,7 @@ def _val_diagnostics(
 
     vd = model.diagnostics(val_tok)                              # held-out F decomposition (per token)
     out["val_self_coupling"]      = vd["self_coupling"]     / vn
+    out["val_self_divergence"]    = vd["self_divergence"]   / vn
     out["val_belief_coupling"]    = vd["belief_coupling"]   / vn
     out["val_attention_entropy"]  = vd["attention_entropy"] / vn
     out["val_free_energy_total"]  = vd["total"]             / vn
@@ -713,7 +715,8 @@ def train(
                 "val_ppl":           last_val.get("ppl", float("nan")),
                 "val_bpc":           last_val.get("bpc", float("nan")),
                 "attn_entropy":       d["attn_entropy"],
-                "self_coupling":      d["self_coupling"]     / n_tok,
+                "self_coupling":      d["self_coupling"]     / n_tok,   # alpha-regularized F self-term sum_i[alpha_i D + R(alpha_i)]
+                "self_divergence":    d["self_divergence"]   / n_tok,   # raw sum_i D(q_i||p_i) drift; == self_coupling only at alpha_mode='constant'
                 "belief_coupling":    d["belief_coupling"]   / n_tok,
                 "attention_entropy":  d["attention_entropy"] / n_tok,
                 "free_energy_total":  d["total"]             / n_tok,
