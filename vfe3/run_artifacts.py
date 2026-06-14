@@ -143,6 +143,50 @@ class RunArtifacts:
                 "attention-map figure at step %d failed (%s); training continues", step, exc)
             return None
 
+    def save_gamma_attention_maps(
+        self,
+        step:   int,
+        maps:   'Optional[torch.Tensor]',     # (H, N, N) per-head model-coupling gamma, or None (channel off)
+        logger: Optional[logging.Logger] = None,
+    ) -> Optional[list]:
+        r"""Best-effort model-coupling (gamma) heatmaps for one periodic eval: one figure per head.
+
+        The s-channel sibling of :meth:`save_attention_maps`. Writes
+        ``attention/step_<N>_gamma_head<h>.png`` per head -- a LOG-scaled gamma_ij heatmap on the
+        VIRIDIS colour map (the belief beta channel uses magma) so the two channels read apart, on a
+        scale shared across heads. ``maps`` is None when the model channel is inactive
+        (``gamma_attention_maps`` returns None) -> no-op. A plotting error is logged and swallowed.
+        """
+        if maps is None:                                            # model channel inactive -> nothing to plot
+            return None
+        try:
+            from vfe3.viz import figures as figs
+            figs.set_publication_style()
+            m = maps.detach().cpu() if hasattr(maps, "detach") else torch.as_tensor(maps)
+            if m.dim() == 2:                                        # (N, N) -> one head
+                m = m[None]
+            if m.dim() != 3:
+                raise ValueError(f"gamma maps must be (H, N, N); got {tuple(m.shape)}")
+            n_heads = m.shape[0]
+            pos  = m[m > 0]                                         # shared log scale across heads
+            vmax = float(pos.max()) if pos.numel() else 1.0
+            vmin = float(pos.min()) if pos.numel() else vmax * 1e-3
+            attn_dir = self.run_dir / "attention"
+            attn_dir.mkdir(exist_ok=True)
+            paths = []
+            for hi in range(n_heads):
+                path = attn_dir / f"step_{step}_gamma_head{hi}.png"
+                fig = figs.plot_attention_heatmap(
+                    m[hi], log=True, vmin=vmin, vmax=vmax, cmap="viridis", symbol=r"\gamma",
+                    title=f"Model-coupling attention (step {step}) - head {hi}", path=str(path))
+                figs.plt.close(fig)
+                paths.append(path)
+            return paths
+        except Exception as exc:                                    # a viz error must never kill training
+            (logger or logging.getLogger(__name__)).warning(
+                "gamma-map figure at step %d failed (%s); training continues", step, exc)
+            return None
+
     def save_checkpoint(
         self,
         step:      int,

@@ -222,13 +222,17 @@ def test_model_channel_figures_render(tmp_path):
         ("s.png",     figs.plot_model_channel_belief,  extract.model_channel_belief(m, tok)),
         ("r.png",     figs.plot_hyper_prior_centroid,  extract.hyper_prior_centroid(m, tok)),
         ("h.png",     figs.plot_hyper_prior_coupling,  extract.hyper_prior_coupling(m, tok)),
-        ("gamma.png", figs.plot_gamma_attention,       extract.gamma_attention(m, tok)),
     ]
     for name, fn, data in cases:
         p = tmp_path / name
         fig = fn(data, path=str(p))
         figs.plt.close(fig)
         assert p.exists() and p.stat().st_size > 0, name
+    # gamma is now per-head heatmaps (viridis colour), not a combined grid
+    g = extract.gamma_attention(m, tok)["gamma"]                  # (H, N, N)
+    pg = tmp_path / "gamma_head0.png"
+    figs.plt.close(figs.plot_attention_heatmap(g[0], cmap="viridis", symbol=r"\gamma", path=str(pg)))
+    assert pg.exists() and pg.stat().st_size > 0
 
 
 def test_model_channel_terms_figure_renders(tmp_path):
@@ -274,18 +278,43 @@ def test_metrics_csv_pure_path_has_no_model_channel_columns(tmp_path):
     assert not ({"hyper_prior", "gamma_coupling", "gamma_meta_entropy"} & set(rows[0]))
 
 
+# ---- (8b) per-eval attention files: belief beta (magma) + model gamma (viridis), full parity ------
+
+def test_training_writes_per_head_gamma_attention_files(tmp_path):
+    r"""Training-side parity: an active model channel writes per-head gamma heatmaps
+    (attention/step_*_gamma_head*.png) alongside the belief beta maps; the pure path writes beta only."""
+    cfg = _cfg(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "on", cfg, model, dataset="synthetic-period3")
+    train(model, _loader(), cfg, n_steps=4, log_interval=2, eval_interval=2,
+          val_loader=_loader(seed=1), artifacts=art)
+    attn = list((tmp_path / "on" / "attention").glob("*.png"))
+    assert any("gamma_head" in p.name for p in attn)              # model-channel gamma maps present
+    assert any("layer0_head" in p.name for p in attn)            # belief beta maps present
+
+    cfg0 = _cfg()
+    torch.manual_seed(0)
+    model0 = VFEModel(cfg0)
+    art0 = RunArtifacts(tmp_path / "off", cfg0, model0, dataset="synthetic-period3")
+    train(model0, _loader(), cfg0, n_steps=4, log_interval=2, eval_interval=2,
+          val_loader=_loader(seed=1), artifacts=art0)
+    attn0 = list((tmp_path / "off" / "attention").glob("*.png"))
+    assert attn0 and not any("gamma_head" in p.name for p in attn0)   # beta only on the pure path
+
+
 # ---- (9) generate_figures emits the publication figures under an active channel -------------------
 
 def test_generate_figures_emits_model_channel_figures(tmp_path):
     on = _active()
     written = {p.name for p in generate_figures(tmp_path / "on", model=on, loader=_loader(), max_sequences=16)}
     for name in ("model_channel_belief.png", "hyper_prior_centroid.png",
-                 "hyper_prior_coupling.png", "gamma_attention.png"):
+                 "hyper_prior_coupling.png", "attention_gamma_head0.png"):
         assert name in written, name
     off = _model()
     written_off = {p.name for p in generate_figures(tmp_path / "off", model=off, loader=_loader(), max_sequences=16)}
     assert not ({"model_channel_belief.png", "hyper_prior_centroid.png",
-                 "hyper_prior_coupling.png", "gamma_attention.png"} & written_off)
+                 "hyper_prior_coupling.png", "attention_gamma_head0.png"} & written_off)
 
 
 # ---- (10) finalize_run's root figures emit model_channel_terms.png iff active ---------------------

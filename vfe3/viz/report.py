@@ -183,6 +183,19 @@ def generate_figures(
     _emit("attention_structure",
           lambda p: figs.plot_attention_structure(amaps, path=p),
           amaps is not None)
+    # Per-head belief-beta attention heatmaps (magma), one file per (layer, head) -- the per-head
+    # detail behind attention_structure; matched by the model-channel gamma maps (viridis) below.
+    if amaps is not None:
+        bm = amaps if amaps.dim() == 4 else amaps[None]              # (L, H, N, N)
+        for li in range(bm.shape[0]):
+            for hi in range(bm.shape[1]):
+                bname = (f"attention_beta_head{hi}" if bm.shape[0] == 1
+                         else f"attention_beta_layer{li}_head{hi}")
+                _emit(bname,
+                      lambda p, li=li, hi=hi: figs.plot_attention_heatmap(
+                          bm[li, hi], cmap="magma", symbol=r"\beta",
+                          title=f"Belief attention - layer {li} head {hi}", path=p),
+                      True)
     _emit("gauge_equivariance",
           lambda p: figs.plot_gauge_equivariance(metrics.gauge_equivariance_residual(
               cstate["mu"], cstate["sigma"], cstate["omega"], model.group,
@@ -228,9 +241,17 @@ def generate_figures(
     _emit("hyper_prior_coupling",                                 # the h figure (lambda_h block)
           lambda p: figs.plot_hyper_prior_coupling(h_coupling, path=p),
           h_coupling is not None)
-    _emit("gamma_attention",                                      # the gamma_ij model-coupling attention
-          lambda p: figs.plot_gamma_attention(gamma_attn, path=p),
-          gamma_attn is not None)
+    # Per-head model-coupling (gamma) attention heatmaps (viridis), one file per head -- the
+    # s-channel sibling of the belief beta maps, in a distinct colour family.
+    if gamma_attn is not None:
+        gm = gamma_attn["gamma"]                                  # (H, N, N)
+        gm = gm if gm.dim() == 3 else gm[None]
+        for hi in range(gm.shape[0]):
+            _emit(f"attention_gamma_head{hi}",
+                  lambda p, hi=hi: figs.plot_attention_heatmap(
+                      gm[hi], cmap="viridis", symbol=r"\gamma",
+                      title=f"Model-coupling attention - head {hi}", path=p),
+                  True)
     for ch in ("mu", "sigma"):                                    # model-channel s UMAP (no phi: shares belief gauge)
         _emit(f"belief_umap_s_{ch}",
               lambda p, ch=ch: figs.plot_belief_umap(mc_bank, ch, decode=decode, path=p),
