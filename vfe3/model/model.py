@@ -1142,6 +1142,9 @@ class VFEModel(nn.Module):
                                       eps=cfg.eps, sigma_max=cfg.sigma_max, kl_max=cfg.kl_max)
         for _k, _v in gs.items():
             d[f"guard_{_k}"] = float(_v)
+        # Renyi cancellation-band proximity: fraction of energies in [0.9, 1.0)*kl_max where the fp32
+        # Renyi closed form catastrophically cancels (a softer signal than guard's exact-pin saturation).
+        d["renyi_band_frac"] = float(((energy > 0.9 * cfg.kl_max) & (energy < cfg.kl_max)).float().mean())
 
         # Non-finite fraction over the converged operator tensors (one NaN silently poisons AdamW).
         d["nonfinite_frac"] = float(max(

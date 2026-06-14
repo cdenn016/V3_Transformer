@@ -181,3 +181,42 @@ def test_val_diagnostics_columns_rectangular_and_finite() -> None:
     assert float(last["val_future_leakage"]) < 1e-3
     # Tier-2a transport/gauge + weight-norm columns present too
     assert {"cocycle_residual", "transport_asymmetry", "weight_norm_mu"} <= cols
+
+
+def test_diagnostics_has_renyi_band_frac() -> None:
+    torch.manual_seed(0)
+    model = VFEModel(_cfg()).to(DEVICE)
+    d = model.diagnostics(torch.randint(0, 16, (2, 8), device=DEVICE))
+    assert "renyi_band_frac" in d and 0.0 <= d["renyi_band_frac"] <= 1.0
+
+
+def test_finalize_writes_tier3_research_and_provenance() -> None:
+    import json
+    from vfe3.run_artifacts import RunArtifacts, finalize_run
+    torch.manual_seed(0)
+    cfg = _cfg(log_interval=6, eval_interval=12, eval_max_batches=2, generate_figures=False)
+    model = VFEModel(cfg).to(DEVICE)
+    loader = _loader(cfg)
+    with tempfile.TemporaryDirectory() as tmp:
+        art = RunArtifacts(tmp, cfg, model, dataset="synthetic-period3", device=str(DEVICE))
+        losses = train(model, loader, cfg, n_steps=24, log_interval=6, eval_interval=12,
+                       val_loader=loader, artifacts=art, device=DEVICE, generate_samples=False)
+        res = finalize_run(model, art, cfg, test_loader=loader, losses=losses, device=DEVICE)
+        root = Path(tmp)
+        # the n_e_steps=0 capacity-gain falsifier is computed and the budget is restored
+        assert "estep_capacity_gain" in res and math.isfinite(res["estep_capacity_gain"])
+        assert model.cfg.n_e_steps == cfg.n_e_steps                # restored after the probe
+        # provenance.json: code/data/env state a config-only record omits
+        prov = json.loads((root / "provenance.json").read_text())
+        assert {"seed", "torch_version", "git_sha", "git_dirty"} <= set(prov)
+        # summary.json scaling-law point
+        summ = json.loads((root / "summary.json").read_text())
+        assert {"n_params", "tokens_seen", "est_flops_6ND"} <= set(summ["scaling_point"])
+        assert summ["scaling_point"]["tokens_seen"] == cfg.max_steps * cfg.batch_size * cfg.max_seq_len
+        # research.json: calibration + frequency strata + FD gradient check
+        rj = json.loads((root / "research.json").read_text())
+        assert math.isfinite(rj["ece"]) and "freq_strata_ce" in rj
+        assert math.isfinite(rj["fd_gradient_worst_rel_error"]) and rj["fd_gradient_worst_rel_error"] >= 0.0
+        # history-only trend figures
+        for fig in ("grad_norm.png", "belief_condition.png", "estep_convergence_trend.png"):
+            assert (root / fig).exists(), f"missing trend figure {fig}"

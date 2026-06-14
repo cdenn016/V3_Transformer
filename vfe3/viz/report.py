@@ -214,7 +214,9 @@ def generate_figures(
           lambda p: figs.plot_spd_ellipses(cstate["mu"], cstate["sigma"], path=p),
           cstate is not None)
     _emit("holonomy_curvature",
-          lambda p: figs.plot_holonomy_curvature(metrics.holonomy_deviation_sampled(cstate["omega"]), path=p),
+          lambda p: figs.plot_holonomy_curvature(
+              metrics.holonomy_deviation_sampled(cstate["omega"]),
+              curvature=metrics.curvature_field(cstate["omega"]), path=p),   # Panel C: spatial curvature field
           cstate is not None)
     _emit("numerical_trust",
           lambda p: figs.plot_numerical_trust(

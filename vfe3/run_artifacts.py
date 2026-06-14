@@ -246,6 +246,173 @@ def load_checkpoint(
     return int(ckpt["step"])
 
 
+def _write_provenance(
+    artifacts:   RunArtifacts,
+    cfg:         VFE3Config,
+    model:       torch.nn.Module,
+    test_loader: Optional[Iterable],
+    logger:      logging.Logger,
+) -> None:
+    r"""Best-effort ``provenance.json``: git SHA + dirty flag, library/CUDA versions, the data hash,
+    and the seed -- so two runs with an identical ``config.json`` are still distinguishable by CODE
+    and DATA state (the reproducibility gap a config-only record leaves open). Every probe is
+    guarded; a missing git binary or uncacheable loader simply records ``None``."""
+    import hashlib
+    import subprocess
+
+    prov: Dict[str, object] = {
+        "seed":          cfg.seed,
+        "n_params":      int(sum(p.numel() for p in model.parameters())),
+        "torch_version": torch.__version__,
+        "cuda_version":  torch.version.cuda,
+        "device_name":   (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
+    }
+    try:
+        root = Path(__file__).resolve().parent.parent
+        prov["git_sha"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(root), stderr=subprocess.DEVNULL).decode().strip()
+        prov["git_dirty"] = bool(subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=str(root), stderr=subprocess.DEVNULL).decode().strip())
+    except Exception:
+        prov["git_sha"], prov["git_dirty"] = None, None
+    try:                                                        # content hash of the token stream
+        ds = getattr(test_loader, "dataset", None)
+        toks = getattr(ds, "tokens", None)
+        if toks is not None:
+            prov["data_sha256"]   = hashlib.sha256(toks.detach().cpu().numpy().tobytes()).hexdigest()
+            prov["data_n_tokens"] = int(toks.numel())
+    except Exception:
+        pass
+    artifacts.save_json("provenance.json", prov)
+    logger.info("wrote provenance.json (git_sha=%s dirty=%s)", prov.get("git_sha"), prov.get("git_dirty"))
+
+
+@torch.no_grad()
+def _calibration_and_strata(
+    model:       torch.nn.Module,
+    test_loader: Iterable,
+    device:      torch.device,
+
+    *,
+    max_batches: int = 20,
+    n_bins:      int = 15,
+) -> Dict[str, object]:
+    r"""Decode calibration (ECE + reliability curve) and token-frequency-stratified CE over the test
+    split. The decode is non-standard (KL-to-prior Mahalanobis or mu @ W^T with Sigma feeding the
+    logit scale), so a mis-scaled ``decode_log_scale`` can leave PPL acceptable while the probability
+    mass is wrong -- PPL alone cannot catch it. The frequency strata expose prior-table tail
+    stagnation (rare-token rows may be undertrained). Off-graph; capped at ``max_batches``."""
+    import torch.nn.functional as F
+
+    confs, corrects, nats, tgts = [], [], [], []
+    for i, (tok, tgt) in enumerate(test_loader):
+        tok, tgt = tok.to(device), tgt.to(device)
+        logits = model(tok)                                     # (B, N, V) inference path
+        lp = logits.reshape(-1, logits.shape[-1]).float()
+        t = tgt.reshape(-1)
+        valid = t != -100
+        lp, t = lp[valid], t[valid]
+        prob = torch.softmax(lp, dim=-1)
+        p_max, pred = prob.max(dim=-1)
+        confs.append(p_max)
+        corrects.append((pred == t).float())
+        nats.append(F.cross_entropy(lp, t, reduction="none"))
+        tgts.append(t)
+        if i + 1 >= max_batches:
+            break
+    if not confs:
+        return {}
+    conf, corr = torch.cat(confs), torch.cat(corrects)
+    nat, tg = torch.cat(nats), torch.cat(tgts)
+
+    edges = torch.linspace(0.0, 1.0, n_bins + 1, device=conf.device)
+    ece, rel = 0.0, []
+    for b in range(n_bins):                                     # expected calibration error (15-bin)
+        m = (conf > edges[b]) & (conf <= edges[b + 1])
+        if m.any():
+            acc, cf, w = corr[m].mean(), conf[m].mean(), m.float().mean()
+            ece += float(w * (acc - cf).abs())
+            rel.append({"conf": float(cf), "acc": float(acc), "frac": float(w)})
+    counts = torch.bincount(tg, minlength=int(tg.max()) + 1).float()
+    tok_count = counts[tg]                                      # unigram count of each token's target
+    q1, q2 = torch.quantile(tok_count, torch.tensor([1 / 3, 2 / 3], device=tok_count.device)).tolist()
+    strata = {}
+    for name, mask in (("rare", tok_count <= q1),
+                       ("mid", (tok_count > q1) & (tok_count <= q2)),
+                       ("frequent", tok_count > q2)):
+        strata[name] = float(nat[mask].mean()) if mask.any() else float("nan")
+    return {"ece": ece, "reliability": rel, "overall_ce": float(nat.mean()), "freq_strata_ce": strata}
+
+
+def _fd_gradient_check(
+    model:       torch.nn.Module,
+    test_loader: Iterable,
+    device:      torch.device,
+
+    *,
+    n_coords:    int   = 4,
+    fd_eps:      float = 1e-3,
+) -> float:
+    r"""Worst relative error between autograd-of-CE and a central finite difference on a few
+    ``mu_embed`` coordinates -- the CLAUDE.md-mandated FD-vs-autograd-of-F check the run path
+    (backprop through eigh / matrix_exp / SPD retraction / straight-through detaches) most needs to
+    catch a broken detach or poisoned adjoint. Best-effort on one tiny batch; restores every coord."""
+    batch = next(iter(test_loader))
+    tok, tgt = (batch if isinstance(batch, (tuple, list)) else (batch, None))
+    tok = tok[:2].to(device)
+    tgt = tgt[:2].to(device)
+    p = model.prior_bank.mu_embed
+    model.zero_grad(set_to_none=True)
+    _, loss, _ = model(tok, tgt)
+    loss.backward()
+    flat, gflat = p.detach().view(-1), p.grad.detach().view(-1).clone()
+    # Probe the LARGEST-gradient coords, not random ones: a random coord usually has near-zero
+    # gradient where the central difference is dominated by fp rounding (a spurious large rel error),
+    # so this checks the gradient where its signal actually dominates -- where a real adjoint bug shows.
+    idx = torch.topk(gflat.abs(), min(n_coords, gflat.numel())).indices.tolist()
+    worst = 0.0
+    with torch.no_grad():
+        for j in idx:
+            orig = float(flat[j])
+            flat[j] = orig + fd_eps
+            _, lp, _ = model(tok, tgt)
+            flat[j] = orig - fd_eps
+            _, lm, _ = model(tok, tgt)
+            flat[j] = orig
+            fd = (float(lp) - float(lm)) / (2.0 * fd_eps)
+            ana = float(gflat[j])
+            worst = max(worst, abs(fd - ana) / max(abs(fd), abs(ana), 1e-8))
+    model.zero_grad(set_to_none=True)
+    return worst
+
+
+def _write_research_artifacts(
+    model:       torch.nn.Module,
+    artifacts:   RunArtifacts,
+    cfg:         VFE3Config,
+    test_loader: Optional[Iterable],
+    device:      torch.device,
+    logger:      logging.Logger,
+) -> None:
+    r"""Best-effort ``research.json``: decode calibration (ECE) + frequency-stratified loss + the FD
+    gradient-check residual. Each probe is independently guarded so one failure never blocks the
+    others or the saved numeric results."""
+    if test_loader is None:
+        return
+    out: Dict[str, object] = {}
+    try:
+        out.update(_calibration_and_strata(model, test_loader, device))
+    except Exception as exc:
+        logger.warning("calibration/strata probe failed (%s); skipped", exc)
+    try:
+        out["fd_gradient_worst_rel_error"] = _fd_gradient_check(model, test_loader, device)
+        logger.info("FD gradient-check worst rel error: %.2e", out["fd_gradient_worst_rel_error"])
+    except Exception as exc:
+        logger.warning("FD gradient-check failed (%s); skipped", exc)
+    if out:
+        artifacts.save_json("research.json", out)
+
+
 def finalize_run(
     model:       torch.nn.Module,
     artifacts:   RunArtifacts,
@@ -291,21 +458,61 @@ def finalize_run(
     best_val_ppl = artifacts.best_val_ppl if artifacts.best_val_ppl != float("inf") else None
     results.update({"best_val_ppl": best_val_ppl, "best_step": artifacts.best_step,
                     "reloaded_best": reloaded_best})
+
+    # E-step capacity attribution (the no-NN thesis falsifier): test CE with the inner E-step
+    # DISABLED (n_e_steps=0 -> belief = prior, the loop runs zero iterations) minus the
+    # configured-budget test CE. A near-zero gain means the iterative VFE minimization is
+    # decorative -- the concrete test of the central "capacity from the E-step, not a lookup
+    # table" claim. Off-graph, best-effort; n_e_steps is restored in the finally.
+    if test_loader is not None and results.get("test_ce") is not None:
+        _saved_ne = model.cfg.n_e_steps
+        try:
+            model.cfg.n_e_steps = 0
+            m0 = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
+            results["test_ce_no_estep"]    = m0["ce"]
+            results["estep_capacity_gain"] = m0["ce"] - results["test_ce"]
+            logger.info("E-step capacity gain (CE@n_e_steps=0 - CE@%d): %.4f",
+                        _saved_ne, results["estep_capacity_gain"])
+        except Exception as exc:
+            logger.warning("estep capacity-gain probe failed (%s); skipped", exc)
+        finally:
+            model.cfg.n_e_steps = _saved_ne
     artifacts.save_json("test_results.json", results)
 
+    # Reproducibility provenance (git SHA / data hash / versions) + a scaling-law data point -- the
+    # externally-grounded records a config-only artifact omits (identical config.json can come from
+    # different code and data, and a single run carries no (N, tokens, FLOPs, loss) frontier point).
+    _write_provenance(artifacts, cfg, model, test_loader, logger)
+    n_params = int(sum(p.numel() for p in model.parameters()))
+    tokens_seen = int(cfg.max_steps) * int(cfg.batch_size) * int(cfg.max_seq_len)
     artifacts.save_json("summary.json", {
         "n_steps":      cfg.max_steps,
-        "n_params":     int(sum(p.numel() for p in model.parameters())),
+        "n_params":     n_params,
         "best_val_ppl": best_val_ppl,
         "best_step":    artifacts.best_step,
         "test_ppl":     results.get("test_ppl"),
         "test_ce":      results.get("test_ce"),
         "test_bpc":     results.get("test_bpc"),
+        "test_ce_no_estep":    results.get("test_ce_no_estep"),
+        "estep_capacity_gain": results.get("estep_capacity_gain"),
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,
         "use_prior_bank":  cfg.use_prior_bank,
         "use_head_mixer":  cfg.use_head_mixer,
+        # scaling-law point: the 6ND FLOP proxy is LOOSE for a no-NN E-step model, so record the
+        # inputs too -- a cross-run frontier can be re-fit offline with the right cost model.
+        "scaling_point": {
+            "n_params":      n_params,
+            "tokens_seen":   tokens_seen,
+            "est_flops_6ND": 6 * n_params * tokens_seen,
+            "test_ce":       results.get("test_ce"),
+        },
     })
+
+    # Research artifacts (decode calibration / frequency-stratified loss / FD gradient check) -- the
+    # externally-grounded probes that do NOT presuppose the gauge framework. Best-effort, AFTER the
+    # test-eval n_e_steps restore so the model is in its trained state. Run before the figure pass.
+    _write_research_artifacts(model, artifacts, cfg, test_loader, device, logger)
 
     _save_figures(artifacts, losses, logger)
     # Single-run publication figure set (model-replay), auto-run at the end of training unless
@@ -375,6 +582,31 @@ def _save_figures(
                 gy, gx, ylabel=r"std $\log|\det\Omega|$", title="Gauge trace spread",
                 color=figs._CB[3], smooth=max(5, len(gy) // 60), annotate_final=True,
                 path=str(run / "gauge_trace_spread.png"))
+            figs.plt.close(fig)
+        # Optimization + convergence trends (history-only; no model re-run): the pre-clip gradient
+        # norm (THE optimization-health curve, previously discarded), the belief-covariance
+        # conditioning, and the per-eval E-step F-descent (negative = the inner loop reduced F).
+        nx, ny = _aligned("grad_norm")
+        if ny:
+            fig = figs.plot_trajectory(
+                ny, nx, ylabel=r"$\|\nabla\|_2$ (pre-clip)", title="Gradient norm",
+                color=figs._CB[5 % len(figs._CB)], logy=True, smooth=max(5, len(ny) // 80),
+                annotate="max", path=str(run / "grad_norm.png"))
+            figs.plt.close(fig)
+        cx, cy = _aligned("belief_cond_median")
+        if cy:
+            fig = figs.plot_trajectory(
+                cy, cx, ylabel=r"median $\lambda_{\max}/\lambda_{\min}$",
+                title="Belief covariance conditioning", color=figs._CB[6 % len(figs._CB)],
+                logy=True, smooth=max(5, len(cy) // 80), annotate="max",
+                path=str(run / "belief_condition.png"))
+            figs.plt.close(fig)
+        ex, ey = _aligned("estep_f_drop")
+        if ey:
+            fig = figs.plot_trajectory(
+                ey, ex, ylabel=r"$F_{\mathrm{end}}-F_{\mathrm{start}}$ (inner E-step)",
+                title="E-step free-energy descent", color=figs._CB[2 % len(figs._CB)],
+                median_line=True, path=str(run / "estep_convergence_trend.png"))
             figs.plt.close(fig)
         # Learnable belief-coupling weight: present in history only on a learnable_lambda_beta run.
         lx, ly = _aligned("lambda_beta")
