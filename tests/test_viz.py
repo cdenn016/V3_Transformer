@@ -24,6 +24,8 @@ from vfe3.viz.figures import (
     plot_embedding,
     plot_estep_capacity,
     plot_estep_convergence,
+    plot_free_energy_codescent,
+    plot_free_energy_decomposition,
     plot_free_energy_descent,
     plot_gauge_equivariance,
     plot_gauge_head_specialization,
@@ -101,6 +103,19 @@ def test_plot_covariance_ellipses_and_trajectory_save(tmp_path):
     assert _saved_nonempty(pe) and _saved_nonempty(pt)
 
 
+def test_plot_trajectory_options_save(tmp_path):
+    # Real step x-axis + log y + smoothing + annotations on a long heavy-tailed series.
+    steps = np.arange(100, 100 * 401, 100)                         # 400 points, real "step" values
+    vals = 300.0 * np.exp(-steps / 4e4) + np.random.default_rng(0).random(steps.size)
+    p_log = tmp_path / "logy.png"; p_med = tmp_path / "median.png"
+    fig = plot_trajectory(vals, steps, ylabel="ppl", logy=True, smooth=15, annotate="min",
+                          annotate_final=True, path=str(p_log)); plt.close(fig)
+    # median_line + 'max' annotate on a positive series (the holonomy treatment).
+    fig = plot_trajectory(np.abs(vals) + 1e-4, steps, logy=True, median_line=True, annotate="max",
+                          path=str(p_med)); plt.close(fig)
+    assert _saved_nonempty(p_log) and _saved_nonempty(p_med)
+
+
 def test_plot_attention_grid_saves_4d_and_degenerate(tmp_path):
     # (L, H, N, N) grid plus the L==1/H==1 degenerate inputs the squeeze=False guard must handle.
     maps = torch.softmax(torch.randn(2, 3, 5, 5), dim=-1)          # 2 layers x 3 heads
@@ -132,6 +147,25 @@ def test_plot_free_energy_descent_saves(tmp_path):
     p = tmp_path / "f1.png"
     fig = plot_free_energy_descent(hist, lambda_beta=1.0, self_div=torch.rand(20), path=str(p))
     plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def _fe_hist(n=30):
+    s = np.arange(1, n + 1) * 100
+    return {"step": s, "self_coupling": np.full(n, 140.0), "belief_coupling": np.linspace(30, 20, n),
+            "attention_entropy": np.linspace(34, 13, n), "val_ce": np.linspace(5.7, 4.27, n)}
+
+
+def test_plot_free_energy_decomposition_saves(tmp_path):
+    p = tmp_path / "decomp.png"
+    fig = plot_free_energy_decomposition(_fe_hist(), lambda_beta=1.0, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_plot_free_energy_codescent_saves(tmp_path):
+    p = tmp_path / "codescent.png"
+    # per-row learned lambda_beta vector is accepted as well as a scalar
+    fig = plot_free_energy_codescent(_fe_hist(), lambda_beta=np.ones(30), path=str(p)); plt.close(fig)
     assert _saved_nonempty(p)
 
 

@@ -19,6 +19,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LogNorm
 
+# Wong colourblind-safe qualitative palette (used module-wide, incl. the trajectory defaults).
+_CB = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000"]
+
 
 def _np(x) -> np.ndarray:
     """Detach a torch tensor (or pass an array) to a contiguous numpy array."""
@@ -287,19 +290,76 @@ def plot_covariance_ellipses(
     return _save(fig, path)
 
 
+def _rolling_mean(v: np.ndarray, window: int) -> np.ndarray:
+    r"""Centered moving average of ``v`` with edge-normalized windows (no zero-padding bias)."""
+    if window <= 1 or v.size <= 2:
+        return v
+    window = int(min(window, v.size))
+    kernel = np.ones(window)
+    num = np.convolve(v, kernel, mode="same")
+    den = np.convolve(np.ones_like(v), kernel, mode="same")     # tap count per position (edge-correct)
+    return num / den
+
+
 def plot_trajectory(
-    values,                              # (T,) a scalar series (loss / free energy)
+    values,                              # (T,) a scalar series (loss / free energy / diagnostic)
+    steps          = None,               # (T,) x-coordinates (real training step); None -> sample index
 
     *,
-    ylabel: str = "loss",
-    title:  str = "Training trajectory",
-    path:   Optional[str] = None,
+    ylabel:         str           = "loss",
+    title:          str           = "Training trajectory",
+    color:          str           = _CB[0],
+    logy:           bool          = False,
+    annotate_final: bool          = False,
+    median_line:    bool          = False,
+    smooth:         int           = 0,
+    annotate:       Optional[str] = None,   # 'min' | 'max' -> mark + label the running best point
+    path:           Optional[str] = None,
 ):
-    """Line plot of a scalar trajectory over steps."""
-    v = _np(values).reshape(-1)
-    fig, ax = plt.subplots(figsize=(5, 3.2))
-    ax.plot(np.arange(len(v)), v, marker="o", ms=3, lw=1.5, color="#C44E52")
-    ax.set(title=title, xlabel="step", ylabel=ylabel)
+    r"""Line plot of a scalar trajectory over the real training step.
+
+    The x-axis is ``steps`` when given (else the sample index, so the axis is no longer mislabelled
+    as a step). A long noisy series (pass ``smooth=w``) draws a faint raw line under a centered
+    ``w``-point rolling mean and no per-point markers, which a thousand-point series otherwise
+    collapses into a solid band; a short series (<=50 points) keeps markers. ``logy`` is for wide-range
+    or heavy-tailed series (perplexity, holonomy). ``annotate='min'|'max'`` marks that extremum with
+    its step, ``annotate_final`` tags the last value at the right edge, and ``median_line`` draws the
+    series median as a dashed reference (the typical value on a heavy-tailed log axis where the
+    spikes sit decades above the floor).
+    """
+    v = _np(values).reshape(-1).astype(float)
+    x = np.arange(v.size, dtype=float) if steps is None else _np(steps).reshape(-1).astype(float)
+    vplot = np.where(v > 0, v, np.nan) if logy else v            # log axis drops non-positive entries
+    fig, ax = plt.subplots(figsize=(5.2, 3.3))
+    if smooth and smooth > 1 and v.size > 50:
+        ax.plot(x, vplot, lw=0.7, color=color, alpha=0.25)            # faint raw underlay
+        ax.plot(x, _rolling_mean(vplot, smooth), lw=1.8, color=color) # rolling-mean trend
+    elif v.size <= 50:
+        ax.plot(x, vplot, marker="o", ms=3, lw=1.5, color=color)
+    else:
+        ax.plot(x, vplot, lw=1.2, color=color)
+    if logy:
+        ax.set_yscale("log")
+    if median_line and v.size:
+        med = float(np.median(v))
+        ax.axhline(med, color="#444444", ls="--", lw=1)
+        ax.annotate(f"median {med:.2g}", xy=(0.985, med), xycoords=("axes fraction", "data"),
+                    ha="right", va="bottom", fontsize=7, color="#444444")
+    if annotate in ("min", "max") and v.size:
+        idx = int(np.argmin(v) if annotate == "min" else np.argmax(v))
+        tag = "best" if annotate == "min" else "max"
+        ax.scatter([x[idx]], [v[idx]], s=28, color="black", zorder=5)
+        ax.annotate(f"{tag} {v[idx]:.1f}\n@ step {int(x[idx]):,}",
+                    xy=(x[idx], v[idx]), xytext=(-12, 30), textcoords="offset points",
+                    fontsize=7.5, ha="right",
+                    arrowprops=dict(arrowstyle="->", lw=0.8, color="black"))
+    if annotate_final and v.size:
+        ax.annotate(f"{v[-1]:.4g}", xy=(x[-1], v[-1]), xytext=(6, 0), textcoords="offset points",
+                    va="center", fontsize=8, fontweight="bold", color=color)
+    if steps is not None and v.size:
+        ax.set_xlim(float(np.min(x)), float(np.max(x)))
+    ax.set(title=title, xlabel="training step", ylabel=ylabel)
+    fig.tight_layout()
     return _save(fig, path)
 
 
@@ -338,8 +398,6 @@ def get_figure(name: str) -> Callable:
 # multi-panel composite, registers by name, and returns the Figure.
 # ===========================================================================
 
-# Wong colourblind-safe qualitative palette.
-_CB = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000"]
 _EPS_F32 = 1.1920929e-7                                           # float32 machine epsilon
 
 
@@ -441,6 +499,177 @@ def plot_free_energy_descent(
     return _save(fig, path)
 
 
+def _fe_terms(history: Dict, lambda_beta) -> tuple:
+    r"""Per-eval free-energy term arrays (nats/token) shared by the decomposition + co-descent figures.
+
+    Returns ``(step, self_coupling, lb*belief_coupling, lb*attention_entropy, data_ce, total)`` where the
+    coupling terms carry the (scalar or per-row) ``lambda_beta`` weight that enters F and ``total`` is the
+    full per-token F INCLUDING the data/likelihood term. The logged diagnostics are already per token, so
+    the four contributions are commensurate.
+    """
+    step = _np(history["step"]).astype(float)
+    sc   = _np(history["self_coupling"]).astype(float)
+    lb   = _np(lambda_beta).astype(float)
+    bc   = lb * _np(history["belief_coupling"]).astype(float)
+    ae   = lb * _np(history["attention_entropy"]).astype(float)
+    ce   = _np(history["val_ce"]).astype(float)
+    return step, sc, bc, ae, ce, sc + bc + ae + ce
+
+
+@register_figure("free_energy_codescent")
+def plot_free_energy_codescent(
+    history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce
+
+    *,
+    lambda_beta: 'float | np.ndarray' = 1.0,
+    path:        Optional[str]        = None,
+):
+    r"""F-vs-CE co-descent: the full per-token free energy and the held-out loss fall together.
+
+    Twin y-axes over the real training step -- the stacked total F (self-coupling + the lambda_beta-scaled
+    belief-coupling and attention-entropy + the data/likelihood term, left, solid) and the held-out
+    validation CE (right, dashed) -- each a faint raw line under a rolling-mean trend. The final values
+    are tagged and the Pearson correlation of the two curves is in the title; a high positive r is the
+    co-descent signature, the evidence that minimizing F lowers held-out loss.
+    """
+    step, sc, bc, ae, ce, total = _fe_terms(history, lambda_beta)
+    keep = np.isfinite(total) & np.isfinite(ce)
+    step, total, ce = step[keep], total[keep], ce[keep]
+    w = max(5, total.size // 80)
+    fig, ax = plt.subplots(figsize=(6.6, 3.9))
+    ax.plot(step, total, lw=0.7, color=_CB[0], alpha=0.25)
+    ln1, = ax.plot(step, _rolling_mean(total, w), lw=2.0, color=_CB[0], label="F total (left)")
+    ax.set(xlabel="training step", ylabel="free energy F (nats/token)")
+    ax.yaxis.label.set_color(_CB[0]); ax.tick_params(axis="y", colors=_CB[0])
+    if step.size:
+        ax.set_xlim(float(step.min()), float(step.max()))
+        ax.annotate(f"{total[-1]:.1f}", xy=(step[-1], total[-1]), xytext=(6, 0),
+                    textcoords="offset points", va="center", fontsize=8, fontweight="bold", color=_CB[0])
+    ax2 = ax.twinx()
+    ax2.spines["right"].set_visible(True)                         # set_publication_style hides it by default
+    ax2.plot(step, ce, lw=0.7, color=_CB[1], alpha=0.25)
+    ln2, = ax2.plot(step, _rolling_mean(ce, w), lw=2.0, color=_CB[1], ls="--", label="val CE (right)")
+    ax2.set_ylabel("validation CE (nats/token)", color=_CB[1]); ax2.tick_params(axis="y", colors=_CB[1])
+    if step.size:
+        ax2.annotate(f"{ce[-1]:.2f}", xy=(step[-1], ce[-1]), xytext=(6, 0),
+                     textcoords="offset points", va="center", fontsize=8, fontweight="bold", color=_CB[1])
+    if total.size > 2:
+        r = float(np.corrcoef(total, ce)[0, 1])
+        ax.set_title(rf"Free-energy / data-term co-descent (Pearson $r={r:+.2f}$)")
+    else:
+        ax.set_title("Free-energy / data-term co-descent")
+    ax.legend([ln1, ln2], [ln1.get_label(), ln2.get_label()], loc="upper right", fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("free_energy_decomposition")
+def plot_free_energy_decomposition(
+    history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce
+
+    *,
+    lambda_beta: 'float | np.ndarray' = 1.0,
+    path:        Optional[str]        = None,
+):
+    r"""The per-token free-energy budget at convergence and how its terms move over training.
+
+    Panel A: the four F-contributions at the LAST eval on a LOG x-axis with the value past each bar, so
+    the dominant self-coupling and the order-of-magnitude-smaller terms are all legible (a linear bar
+    collapses the small ones to slivers, the failure mode of the old single bar). Panel B: the same terms
+    at the early/mid/late thirds of training on a log y-axis -- self-coupling sits flat near its value
+    while the belief-coupling, attention-entropy, and data terms carry the descent. Coupling terms carry
+    the lambda_beta weight (so the bars are the actual F-contributions).
+    """
+    step, sc, bc, ae, ce, _ = _fe_terms(history, lambda_beta)
+    names = ["self-coupling\n$\\mathrm{KL}(q\\|p)$",
+             "belief-coupling\n$\\sum\\mathrm{KL}(q\\|\\Omega q)$",
+             "attention-entropy\n$\\tau\\beta\\log(\\beta/\\pi)$",
+             "data term\n$-\\mathbb{E}_q[\\log p]$"]
+    labels = ["self-coupling", "belief coupling", "attention entropy", "data term"]
+    series = [sc, bc, ae, ce]
+    colors = _CB[:4]
+    last = np.array([s[-1] for s in series])
+    fig, axes = plt.subplots(1, 2, figsize=(11.4, 4.2))
+    # Panel A -- convergence snapshot (largest at top), log x so every term reads despite the ~30x gap.
+    y = np.arange(len(series))[::-1]
+    axes[0].barh(y, last, color=colors, height=0.62)
+    axes[0].set_xscale("log")
+    axes[0].set_yticks(y); axes[0].set_yticklabels(names, fontsize=8)
+    for yi, val in zip(y, last):
+        axes[0].annotate(f"{val:.1f}", xy=(val, yi), xytext=(4, 0), textcoords="offset points",
+                         va="center", ha="left", fontsize=9)
+    axes[0].set_xlim(float(last.min()) * 0.5, float(last.max()) * 3.0)
+    axes[0].set(xlabel="free-energy contribution (nats/token, log scale)",
+                title=f"Budget at step {int(step[-1]):,}")
+    # Panel B -- early/mid/late medians, log y so the flat dominant term and the moving terms coexist.
+    thirds  = np.array_split(np.arange(step.size), 3)
+    centers = np.arange(3)
+    width   = 0.2
+    for j, arr in enumerate(series):
+        meds = [float(np.median(arr[idx])) if idx.size else np.nan for idx in thirds]   # skip empty thirds
+        axes[1].bar(centers + (j - 1.5) * width, meds, width=width, color=colors[j], label=labels[j])
+    axes[1].set_yscale("log")
+    axes[1].set_ylim(top=axes[1].get_ylim()[1] * 2.2)            # headroom for the legend above the bars
+    axes[1].set_xticks(centers); axes[1].set_xticklabels(["early", "mid", "late"])
+    axes[1].set(xlabel="training third", ylabel="F term (median, nats/token, log scale)",
+                title="Self-coupling flat; other terms descend")
+    axes[1].legend(fontsize=7.5, frameon=False, ncol=2, loc="upper right")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("model_channel_terms")
+def plot_model_channel_terms(
+    history: Dict,                       # step + any of: hyper_prior, gamma_coupling, gamma_meta_entropy
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""The model-channel (s) free-energy blocks over training: the s-channel analogue of the belief
+    decomposition.
+
+    Plots whichever of the hyper-prior KL(s_i||r), the gamma model-coupling sum_j gamma_ij KL(s_i||Omega s_j),
+    and its meta-entropy tau_g sum_j gamma_ij log(gamma_ij/pi^s_ij) are logged (per token, RAW/unweighted --
+    the s-channel siblings of self-coupling / belief-coupling / attention-entropy). Each is a faint raw
+    line under a rolling-mean trend on a symlog y (the blocks are non-negative and can sit near zero at
+    init), with the final value tagged. These are the blocks the model channel descends -- under
+    ``s_e_step`` inside the s E-step, otherwise as additive loss terms -- so a healthy channel pulls them
+    down over training. A separate figure from the belief decomposition because the model channel is a
+    distinct hierarchical tier (h -> s -> p -> q).
+    """
+    step = _np(history["step"]).astype(float)
+    spec = [
+        ("hyper_prior",        r"$\mathrm{KL}(s_i\|r)$ (hyper-prior)",                              _CB[0]),
+        ("gamma_coupling",     r"$\sum_j\gamma_{ij}\mathrm{KL}(s_i\|\Omega s_j)$ (model-coupling)", _CB[1]),
+        ("gamma_meta_entropy", r"$\tau_g\sum_j\gamma_{ij}\log(\gamma_{ij}/\pi^s)$ (meta-entropy)",  _CB[2]),
+    ]
+    fig, ax = plt.subplots(figsize=(6.8, 4.0))
+    w = max(5, step.size // 80)
+    plotted = False
+    for key, label, color in spec:
+        if key not in history:
+            continue
+        v = _np(history[key]).astype(float)
+        keep = np.isfinite(v)
+        x, vv = step[keep], v[keep]
+        if not vv.size:
+            continue
+        plotted = True
+        ax.plot(x, vv, lw=0.7, color=color, alpha=0.25)
+        ax.plot(x, _rolling_mean(vv, w), lw=2.0, color=color, label=label)
+        ax.annotate(f"{vv[-1]:.3g}", xy=(x[-1], vv[-1]), xytext=(6, 0), textcoords="offset points",
+                    va="center", fontsize=8, fontweight="bold", color=color)
+    if plotted:
+        ax.set_yscale("symlog", linthresh=1e-4)                   # non-negative blocks, near-zero at init
+        if step.size:
+            ax.set_xlim(float(step.min()), float(step.max()))
+        ax.legend(fontsize=8, frameon=False, loc="upper right")
+    ax.set(xlabel="training step", ylabel="model-channel F block (nats/token)",
+           title="Model-channel free-energy blocks (raw)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
 @register_figure("estep_convergence")
 def plot_estep_convergence(
     trace:    Dict,                      # e_step_belief_trace output: mu, sigma, phi, free_energy
@@ -501,6 +730,128 @@ def plot_s_channel_refinement(
     axes[1].set(xlabel="token position", ylabel="refinement magnitude", title="s-channel E-step motion")
     axes[1].legend(fontsize=8, frameon=False)
     fig.tight_layout()
+    return _save(fig, path)
+
+
+def plot_model_channel_belief(
+    s_data:  Dict,                       # extract.model_channel_belief output (caller skips when None)
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""The model channel ``s`` (the ``s`` figure): the per-token model-channel beliefs s_i = N(s_mu, s_sigma).
+
+    Panel A is s_mu per coordinate (mean +/- sd over tokens) -- the model channel's mean structure and its
+    spread across the sequence. Panel B is the per-token variance spectrum (sorted descending), median with
+    a 10-90 band over tokens on a log axis -- how confident / how anisotropic the model beliefs are. The s
+    tables are always diagonal (V, K), so the spectrum IS the variances.
+    """
+    mu_m = _np(s_data["mu_mean"]); mu_s = _np(s_data["mu_std"]); spec = _np(s_data["spectrum"])
+    coord = np.arange(mu_m.size)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
+    axes[0].errorbar(coord, mu_m, yerr=mu_s, fmt="o", color=_CB[0], ms=4, capsize=2,
+                     label=r"$s_\mu$ (mean $\pm$ sd over tokens)")
+    axes[0].axhline(0.0, color="#888888", ls=":", lw=1)
+    axes[0].set(xlabel="coordinate $k$", ylabel=r"$s_\mu$", title="Model channel $s$: mean per coordinate")
+    axes[0].legend(fontsize=8, frameon=False)
+    rank = np.arange(spec.shape[1])
+    _median_band(axes[1], rank, spec.T, _CB[1], r"$s_\Sigma$ spectrum (median, 10-90)")   # (K, N): median over tokens
+    axes[1].set_yscale("log")
+    axes[1].set(xlabel="spectral rank", ylabel=r"$s$ variance", title="Model-channel variance spectrum")
+    axes[1].legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def plot_hyper_prior_centroid(
+    r_data:  Dict,                       # extract.hyper_prior_centroid output (caller skips when None)
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""The hyper-prior centroid ``r`` (the ``r`` figure) and how the model channel ``s`` clusters around it.
+
+    Panel A overlays the centroid mean r_mu on the s_mu population (mean +/- sd over tokens) per coordinate
+    -- r is the consensus the model beliefs are regularized toward by lambda_h KL(s||r). Panel B is the
+    centroid variance r_Sigma against the mean model-channel variance, log y. A frozen r (the default) is a
+    fixed reference; a learnable r tracks the s population.
+    """
+    r_mu = _np(r_data["r_mu"]); r_sig = _np(r_data["r_sigma"])
+    s_mu_m = _np(r_data["s_mu_mean"]); s_mu_s = _np(r_data["s_mu_std"]); s_sig_m = _np(r_data["s_sigma_mean"])
+    coord = np.arange(r_mu.size)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
+    axes[0].fill_between(coord, s_mu_m - s_mu_s, s_mu_m + s_mu_s, color=_CB[0], alpha=0.2,
+                         label=r"$s_\mu$ population (mean $\pm$ sd)")
+    axes[0].plot(coord, s_mu_m, color=_CB[0], lw=1.5)
+    axes[0].plot(coord, r_mu, "o-", color=_CB[1], lw=1.5, ms=4, label=r"centroid $r_\mu$")
+    axes[0].set(xlabel="coordinate $k$", ylabel="mean", title=r"Hyper-prior centroid $r$ vs model channel $s$")
+    axes[0].legend(fontsize=8, frameon=False)
+    axes[1].plot(coord, r_sig, "o-", color=_CB[1], lw=1.5, ms=4, label=r"$r_\Sigma$ (centroid)")
+    axes[1].plot(coord, s_sig_m, "s-", color=_CB[0], lw=1.5, ms=4, label=r"$s_\Sigma$ (mean over tokens)")
+    axes[1].set_yscale("log")
+    axes[1].set(xlabel="coordinate $k$", ylabel="variance", title="Centroid vs model-channel variance")
+    axes[1].legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def plot_hyper_prior_coupling(
+    h_data:  Dict,                       # extract.hyper_prior_coupling output (caller skips when None)
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""The hyper-prior coupling block ``h`` (the ``h`` figure): per-token KL(s_i||r), the lambda_h block.
+
+    The per-position divergence of the model channel from the hyper-prior centroid -- the integrand of the
+    hyper-prior term lambda_h mean_i KL(s_i||r) that the model channel descends. The dashed line is the
+    mean (the value lambda_h scales); a healthy / converged channel sits low and flat across positions.
+    """
+    kl = _np(h_data["kl_s_r"]); pos = np.arange(kl.size); lam = float(h_data.get("lambda_h", 0.0))
+    fig, ax = plt.subplots(figsize=(7, 3.6))
+    ax.bar(pos, kl, color=_CB[2])
+    ax.axhline(float(np.mean(kl)) if kl.size else 0.0, color="#888888", ls="--", lw=1,
+               label=f"mean {float(np.mean(kl)) if kl.size else 0.0:.3g}")
+    ax.set(xlabel="token position", ylabel=r"$\mathrm{KL}(s_i\|r)$ (nats)",
+           title=rf"Hyper-prior coupling (the $\lambda_h$ block, $\lambda_h={lam:g}$)")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def plot_gamma_attention(
+    g_data:  Dict,                       # extract.gamma_attention output (caller skips when None)
+
+    *,
+    log:     bool          = True,
+    path:    Optional[str] = None,
+):
+    r"""Model-coupling attention gamma_ij (the gamma figure): the s-channel analogue of the belief beta maps.
+
+    A grid of per-head gamma_ij = softmax_j(log pi^s_ij - E^s_ij/tau_g) heatmaps (rows = query i, cols =
+    key j) on a shared LOG colour scale -- the model-channel consensus pattern, the structure the gamma
+    block sum_ij gamma_ij KL(s_i||Omega s_j) weights. Causal-masked future positions are exact zeros
+    (rendered black). Compare against :meth:`VFEModel.attention_maps`'s belief beta to see whether the
+    model channel attends like the belief channel.
+    """
+    G = _np(g_data["gamma"])                                      # (H, N, N)
+    if G.ndim == 2:
+        G = G[None]
+    H = G.shape[0]
+    fig, axes = plt.subplots(1, H, figsize=(2.8 * H + 1.0, 3.0), squeeze=False)
+    vlo, vhi = _attn_log_bounds(G)
+    im = None
+    for hi in range(H):
+        ax = axes[0][hi]
+        im = _attn_imshow(ax, G[hi], vmin=vlo, vmax=vhi, log=log)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"head {hi}")
+        ax.set_xlabel("key $j$")
+        if hi == 0:
+            ax.set_ylabel("query $i$")
+    fig.suptitle(r"Model-coupling attention $\gamma_{ij}$ (s-channel)", y=1.04)
+    label = r"$\gamma_{ij}$ (log scale)" if log else r"$\gamma_{ij}$"
+    fig.colorbar(im, ax=list(axes[0]), shrink=0.8, label=label)
     return _save(fig, path)
 
 

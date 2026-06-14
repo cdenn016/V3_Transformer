@@ -469,3 +469,77 @@ def s_channel_refinement(model, token_ids: torch.Tensor) -> Optional[dict]:
         "kl_s0_r":        kl_s0_r.cpu(),
         "kl_s1_r":        kl_s1_r.cpu(),
     }
+
+
+@torch.no_grad()
+def model_channel_belief(model, token_ids: torch.Tensor) -> Optional[dict]:
+    r"""Model-channel beliefs s_i = N(s_mu, s_sigma) for sequence 0 (the ``s`` figure).
+
+    Returns ``None`` when the model channel is inactive (no s tables). Otherwise looks up the static
+    s tables and returns the per-coordinate population statistics over tokens (``mu_mean``, ``mu_std``,
+    ``sigma_mean``), the per-token variance spectrum sorted descending (``spectrum`` (N, K) -- the s
+    tables are diagonal so the variances ARE the spectrum), and the per-token effective rank
+    (``eff_rank`` (N,)). Available on the broader model-channel-active path (lambda_h>0 OR
+    gamma_coupling>0 OR prior_source=='model_channel' OR s_e_step), so it covers prior_source=='model_channel'
+    where the s_e_step refinement figure does not run."""
+    if not model._model_channel_active:
+        return None
+    cfg, pb = model.cfg, model.prior_bank
+    s_mu, s_sigma = (t[0] for t in pb.encode_s(token_ids[:1]))     # (N, K)
+    lam = torch.sort(s_sigma.clamp(min=cfg.eps), dim=-1, descending=True).values   # (N, K)
+    return {
+        "mu_mean":    s_mu.mean(dim=0).cpu(),                      # (K,)
+        "mu_std":     s_mu.std(dim=0).cpu(),                       # (K,)
+        "sigma_mean": s_sigma.mean(dim=0).cpu(),                   # (K,)
+        "spectrum":   lam.cpu(),                                   # (N, K)
+        "eff_rank":   metrics.effective_rank(s_sigma).cpu(),       # (N,)
+    }
+
+
+@torch.no_grad()
+def hyper_prior_centroid(model, token_ids: torch.Tensor) -> Optional[dict]:
+    r"""The hyper-prior centroid r and how the model channel s clusters around it (the ``r`` figure).
+
+    Returns ``None`` when r does not exist (it is created only when lambda_h>0 OR s_e_step). Otherwise
+    returns the centroid per coordinate (``r_mu`` (K,), ``r_sigma`` (K,) = exp(r_sigma_log)) and the
+    model-channel population per coordinate over sequence 0 (``s_mu_mean``, ``s_mu_std``, ``s_sigma_mean``),
+    so the figure can show the consensus r against the s distribution it anchors."""
+    cfg, pb = model.cfg, model.prior_bank
+    if getattr(pb, "r_mu", None) is None:
+        return None
+    s_mu, s_sigma = (t[0] for t in pb.encode_s(token_ids[:1]))     # (N, K)
+    return {
+        "r_mu":         pb.r_mu.detach().cpu(),                                      # (K,)
+        "r_sigma":      torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).detach().cpu(), # (K,)
+        "s_mu_mean":    s_mu.mean(dim=0).cpu(),                                      # (K,)
+        "s_mu_std":     s_mu.std(dim=0).cpu(),                                       # (K,)
+        "s_sigma_mean": s_sigma.mean(dim=0).cpu(),                                   # (K,)
+    }
+
+
+@torch.no_grad()
+def hyper_prior_coupling(model, token_ids: torch.Tensor) -> Optional[dict]:
+    r"""Per-token hyper-prior divergence KL(s_i||r) for sequence 0 (the ``h`` figure: the lambda_h block).
+
+    Returns ``None`` when r does not exist. Uses ``model._hyper_prior_kl`` so the plotted per-position
+    KL(s_i||r) is the SAME quantity the diagnostics decomposition and the forward loss carry; ``lambda_h``
+    is returned for the title (the weight the block enters F with)."""
+    pb = model.prior_bank
+    if getattr(pb, "r_mu", None) is None:
+        return None
+    kl = model._hyper_prior_kl(token_ids[:1])[0]                   # (N,)
+    return {"kl_s_r": kl.cpu(), "lambda_h": float(model.cfg.lambda_h)}
+
+
+@torch.no_grad()
+def gamma_attention(model, token_ids: torch.Tensor) -> Optional[dict]:
+    r"""Model-coupling attention gamma_ij for sequence 0 (the gamma figure), via
+    :meth:`VFEModel.gamma_attention_maps`.
+
+    Returns ``None`` when the model channel is inactive. Otherwise returns the per-head gamma weights
+    ``gamma`` (H, N, N) = softmax_j(log pi^s - E^s/tau_g) on the model-channel beliefs s under the tied
+    flat transport from the converged belief gauge frame -- the s-channel analogue of the belief beta maps."""
+    g = model.gamma_attention_maps(token_ids[:1])
+    if g is None:
+        return None
+    return {"gamma": g.cpu()}

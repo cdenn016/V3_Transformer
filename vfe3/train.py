@@ -566,6 +566,17 @@ def train(
                 "holonomy_deviation": d["holonomy_deviation"],
                 "gauge_trace_spread": d["gauge_trace_spread"],
             }
+            # Model-channel F blocks (per-token, like the belief blocks above): present iff the
+            # s-channel tables exist (diagnostics gates them on STATIC config -- lambda_h / gamma /
+            # prior_source / s_e_step), so the column set is fixed per run and the CSV stays
+            # rectangular. free_energy_total above already carries their WEIGHTED contribution
+            # (diagnostics folds it into d["total"] at the same per-sequence-sum scale, so the
+            # uniform /n_tok normalizes every block consistently -- audit obs 18497). Stored RAW
+            # (unweighted); the decomposition figure scales by cfg.lambda_h / cfg.gamma_coupling,
+            # exactly as the belief block is scaled by lambda_beta.
+            for _mck in ("hyper_prior", "gamma_coupling", "gamma_meta_entropy"):
+                if _mck in d:
+                    row[_mck] = d[_mck] / n_tok
             # Learnable belief-coupling weight: record lambda_beta = exp(log_lambda_beta) so its
             # trajectory lands in metrics.csv (and the figure). The column exists only on a learnable
             # run (config is fixed per run, so the CSV stays rectangular).
