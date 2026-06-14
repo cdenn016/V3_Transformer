@@ -11,9 +11,9 @@ cached gpt2/tiktoken corpus (vocab 50257) under ``~/.cache/tokenized_cache``; th
 ``config`` defaults (``vocab_size=50257``) are kept consistent with it so click-to-run
 works out of the box. ``MAX_TOKENS`` caps the training stream for fast smoke runs.
 
-If a real corpus' cache is absent the loader falls back to a deterministic period-3
-token stream (the cutover anchor used by ``tests/test_train.py``), so this file never
-crashes for lack of data. Selecting ``DATASET = "synthetic-period3"`` forces that stream.
+A missing tokenized cache raises ``FileNotFoundError`` rather than substituting toy data:
+held-out numbers are never silently computed on a synthetic stream and mislabeled as the
+real corpus. Build the corpus cache first (see ``vfe3/data``).
 
 A full ``max_steps`` run on the 116.8M-token wikitext-103 train split is a real (not
 smoke) job: run it on the CUDA interpreter (the RTX 5090), or drop ``MAX_TOKENS`` /
@@ -32,16 +32,16 @@ import torch
 from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
-from vfe3.data.datasets import TokenWindows, make_dataloader
+from vfe3.data.datasets import make_dataloader
 from vfe3.train import _fmt_tau, evaluate, train
 
 
 
 
 
-# Cached tokenized corpus (gpt2/tiktoken -> vocab_size 50257) or the zero-dependency
-# synthetic anchor. Caches live in ~/.cache/tokenized_cache.
-#   "wikitext-103" | "wikitext-2" | "wiki-en" | "wiki-ja" | wiki-ar | "synthetic-period3"
+# Cached tokenized corpus (gpt2/tiktoken -> vocab_size 50257). Caches live in
+# ~/.cache/tokenized_cache; a missing cache raises (no synthetic substitution).
+#   "wikitext-103" | "wikitext-2" | "wiki-en" | "wiki-ja" | "wiki-ar"
 DATASET = "wikitext-103"
 
 # Cap the *training* stream for fast smoke runs (the validation split is always read
@@ -72,7 +72,7 @@ config = dict(
     max_seq_len               = 128,                 # N, context length
     
     batch_size                = 64,
-    max_steps                 = 15000,
+    max_steps                 = 150000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -181,8 +181,8 @@ config = dict(
     #                Self Energy:  
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
-    lambda_h_mode              = "state_dependent",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h) | "learnable" (NN exc.)
+    lambda_alpha_mode          = "constant",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
+    lambda_h_mode              = "constant",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h) | "learnable" (NN exc.)
     
     b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0                         = 1.0,                 # state-dependent alpha shape (numerator)
@@ -295,20 +295,6 @@ config = dict(
 RUN_ROOT = "vfe3_runs"
 
 
-def synthetic_period3_loader(period=3, n=600, seq_len=8, batch_size=8, seed=0) -> DataLoader:
-    r"""Deterministic period-3 token stream (mirrors tests/test_train.py).
-
-    ``n`` is grown to ``seq_len * batch_size * 4`` when needed so the stream yields at
-    least a few ``batch_size`` windows under ``drop_last`` -- otherwise large click-run
-    dims (``seq_len=128, batch_size=64``) would produce zero batches.
-    """
-    g = torch.Generator().manual_seed(seed)
-    n = max(n, seq_len * batch_size * 4)
-    base = torch.arange(period).repeat(n // period + 2)
-    ds = TokenWindows(base[:n].to(torch.long), seq_len)
-    return DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True, generator=g)
-
-
 def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
             train_loader=None, full_corpus_tokens: 'int | None' = None) -> str:
     from vfe3.train import coverage_lines
@@ -336,31 +322,24 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
 def _select_loader(
     dataset: str,
     cfg:     VFE3Config,
-    logger:  logging.Logger,
 
     *,
     split:   str = "train",
 ) -> DataLoader:
-    r"""Loader for ``dataset``/``split``; falls back to the synthetic stream if absent.
+    r"""Loader for ``dataset``/``split``. A missing cache raises ``FileNotFoundError``.
 
-    ``MAX_TOKENS`` caps only the train split (smoke runs); the small validation split is
-    always read in full. The synthetic anchor ignores ``split`` (its train == val).
+    ``MAX_TOKENS`` caps only the train split (smoke runs); the small validation/test splits are
+    always read in full. The loader never substitutes synthetic data for a missing real corpus --
+    that would silently compute held-out numbers on a toy stream and mislabel them as the corpus.
 
     Split-aware loader semantics: only TRAIN shuffles and drops the partial last batch; VALIDATION
     and TEST read the whole split in deterministic order (shuffle=False, drop_last=False) so the
     held-out metric is a stable corpus measurement, not a randomly-varying ~97% subset.
     """
     is_train = (split == "train")
-    if dataset == "synthetic-period3":
-        return synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
-    
     cap = MAX_TOKENS if is_train else None
-    try:
-        return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
-                               shuffle=is_train, drop_last=is_train, max_tokens=cap)
-    except FileNotFoundError:
-        logger.warning("cache for %r/%r absent; falling back to synthetic-period3", dataset, split)
-        return synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
+    return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
+                           shuffle=is_train, drop_last=is_train, max_tokens=cap)
 
 
 def _run_label(cfg: VFE3Config, dataset: str) -> str:
@@ -442,8 +421,8 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     cfg = VFE3Config(**{**config, "seed": seed})         # per-run seed override (config `seed` is the default)
     torch.manual_seed(cfg.seed)
     model = VFEModel(cfg).to(DEVICE)
-    train_loader = _select_loader(DATASET, cfg, logger, split="train")
-    val_loader = _select_loader(DATASET, cfg, logger, split="validation")
+    train_loader = _select_loader(DATASET, cfg, split="train")
+    val_loader = _select_loader(DATASET, cfg, split="validation")
 
     # Bits-per-CHARACTER correction so PPL/BPC compare across tokenizers and languages (gpt2 vs
     # cl100k; en/ja/ar -- a cl100k token spans ~3 Japanese codepoints). tokens_per_char =
@@ -465,7 +444,7 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     # Full uncapped corpus size for the "stream is X% of full" banner line -- only computed when
     # MAX_TOKENS actually caps the train stream (the default None loads the whole corpus, so no cap line).
     full_corpus_tokens = None
-    if MAX_TOKENS is not None and DATASET != "synthetic-period3":
+    if MAX_TOKENS is not None:
         from vfe3.data.datasets import load_cached_tokens
         try:
             full_corpus_tokens = int(load_cached_tokens(DATASET, "train").numel())
@@ -495,12 +474,10 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     )
 
     # End-of-run held-out TEST evaluation on the reloaded best-val checkpoint, plus summary +
-    # figures. Uses the dataset's test split when its cache exists (wikitext-* do); falls back to
-    # the validation loader for the synthetic anchor (no separate test stream).
+    # figures, on the dataset's test split (a missing cache raises -- no synthetic substitution).
     if artifacts is not None:
-        test_loader = (val_loader if DATASET == "synthetic-period3"
-                       else _select_loader(DATASET, cfg, logger, split="test"))
-        test_tpc = val_tpc if DATASET == "synthetic-period3" else (_tokens_per_char(DATASET, "test") or 1.0)
+        test_loader = _select_loader(DATASET, cfg, split="test")
+        test_tpc = _tokens_per_char(DATASET, "test") or 1.0
         results = finalize_run(model, artifacts, cfg, test_loader=test_loader, losses=losses,
                                tokens_per_char=test_tpc, device=torch.device(DEVICE), wall_time=wall, logger=logger)
         run_dir = _rename_run_by_ppl(run_dir, _run_label(cfg, DATASET), results.get("test_ppl"), logger)

@@ -527,7 +527,8 @@ def hyper_prior_coupling(model, token_ids: torch.Tensor) -> Optional[dict]:
     pb = model.prior_bank
     if getattr(pb, "r_mu", None) is None:
         return None
-    kl = model._hyper_prior_kl(token_ids[:1])[0]                   # (N,)
+    s_belief = model._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
+    kl = model._hyper_prior_kl(token_ids[:1], s_belief=s_belief)[0]   # (N,)
     return {"kl_s_r": kl.cpu(), "lambda_h": float(model.cfg.lambda_h)}
 
 

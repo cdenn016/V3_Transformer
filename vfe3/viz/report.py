@@ -39,26 +39,14 @@ def _load_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
     return VFE3Config(**data["config"]), data.get("dataset", "")
 
 
-def _synthetic_loader(cfg: VFE3Config):
-    r"""A tiny period-3 fallback loader (kept inline so the driver never imports the click-to-run
-    ``train_vfe3.py``, whose ``synthetic_period3_loader`` lives outside the package)."""
-    from torch.utils.data import DataLoader
-    from vfe3.data.datasets import TokenWindows
-    base = torch.arange(3).repeat(600 // 3 + 2)[:600].long()      # {0,1,2} period-3 stream
-    ds = TokenWindows(base, cfg.max_seq_len)
-    return DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, drop_last=True)
-
-
 def _build_loader(dataset: str, cfg: VFE3Config, split: str):
-    r"""A stable (unshuffled) loader for ``dataset``/``split``; synthetic fallback when uncached."""
+    r"""A stable (unshuffled) loader for ``dataset``/``split``. Raises ``FileNotFoundError`` if the
+    cache is absent: the figure driver never substitutes synthetic data for a real corpus (that
+    would silently drive the publication figures off a toy stream). Pass ``loader=`` to
+    :func:`generate_figures` to drive a custom stream instead."""
     from vfe3.data.datasets import make_dataloader
-    if dataset and dataset != "synthetic-period3":
-        try:
-            return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
-                                   shuffle=False, drop_last=False)
-        except FileNotFoundError:
-            pass
-    return _synthetic_loader(cfg)
+    return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
+                           shuffle=False, drop_last=False)
 
 
 def _collect_token_batches(
@@ -93,7 +81,7 @@ def generate_figures(
     With ``model=None`` the trained model is rebuilt from ``run_dir/config.json`` and
     ``run_dir/best_model.pt``; pass ``model`` to drive a live in-memory model instead (the test
     path, and any post-train call that still holds the weights). ``loader`` defaults to a stable
-    unshuffled loader for the run's dataset (synthetic fallback when the cache is absent).
+    unshuffled loader for the run's dataset (raises if the cache is absent; pass ``loader`` to override).
     ``max_sequences`` caps the belief bank that feeds the UMAP triptych; ``n_e_steps`` overrides
     the E-step trace length (default: the trained ``cfg.n_e_steps``). Returns the figure paths
     actually written (best-effort: a failed figure is logged and omitted).

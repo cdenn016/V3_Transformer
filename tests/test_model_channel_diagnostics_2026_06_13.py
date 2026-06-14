@@ -79,6 +79,32 @@ def test_diagnostics_surfaces_model_channel_blocks_under_s_e_step():
     assert not ({"hyper_prior", "gamma_coupling", "gamma_meta_entropy"} & set(d0))
 
 
+# ---- (1b) M2: diagnostics/gamma maps measure the REFINED s1 the forward uses, not the raw s tables --
+
+def test_diagnostics_use_refined_s1_under_s_e_step():
+    r"""M2: under s_e_step the forward anchors the belief to the refined s1, so the model-channel
+    diagnostics (hyper-prior KL, gamma energy) must measure s1 -- NOT re-encode the un-refined s
+    tables. Pin that diagnostics' hyper_prior equals KL(s1||r) and differs from the raw-table KL."""
+    m = _active(e_s_mu_lr=0.6, e_s_sigma_lr=0.2)                   # non-trivial s refinement
+    tok = torch.randint(0, 6, (2, 8))
+    with torch.no_grad():
+        s1 = m._refined_s_belief(tok)
+        assert s1 is not None                                      # refinement is live under s_e_step
+        raw     = float(m._hyper_prior_kl(tok[:1]).sum())                      # raw s tables
+        refined = float(m._hyper_prior_kl(tok[:1], s_belief=s1).sum())         # refined s1
+    d = m.diagnostics(tok)
+    assert abs(d["hyper_prior"] - refined) < 1e-5                  # diagnostics measures s1 ...
+    assert abs(raw - refined) > 1e-3                               # ... and s1 is materially != raw s
+
+
+def test_refined_s_belief_is_none_off_s_e_step():
+    r"""M2: with s_e_step off there is no refinement -- the model-channel helpers fall back to the raw
+    s tables (s_belief=None), so the forward-loss path is unchanged."""
+    m = _model(lambda_h=0.25)                                      # model channel on (r table), s_e_step off
+    tok = torch.randint(0, 6, (1, 8))
+    assert m._refined_s_belief(tok) is None
+
+
 # ---- (2) gamma split: envelope identity + mean/sum reduction consistency ---------------------------
 
 def test_gamma_split_envelope_identity_and_reduction():
