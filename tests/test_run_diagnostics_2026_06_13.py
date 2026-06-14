@@ -113,7 +113,8 @@ def test_metrics_csv_has_tier1_columns_and_is_rectangular() -> None:
     assert rows, "no metrics rows written"
     cols = set(rows[0].keys())
     need = (["grad_norm", "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi", "loss_finite",
-             "tokens_per_s", "peak_mem_mb", "generalization_gap"] + _NEW_DIAG_KEYS)
+             "tokens_per_s", "peak_mem_mb", "generalization_gap",
+             "self_coupling", "self_divergence"] + _NEW_DIAG_KEYS)
     assert not [c for c in need if c not in cols], f"CSV missing Tier-1 columns: {[c for c in need if c not in cols]}"
     # rectangular: every row carries the identical column set
     assert all(set(r.keys()) == cols for r in rows)
@@ -188,6 +189,26 @@ def test_diagnostics_has_renyi_band_frac() -> None:
     model = VFEModel(_cfg()).to(DEVICE)
     d = model.diagnostics(torch.randint(0, 16, (2, 8), device=DEVICE))
     assert "renyi_band_frac" in d and 0.0 <= d["renyi_band_frac"] <= 1.0
+
+
+def test_self_divergence_is_raw_unregularized_self_coupling() -> None:
+    # self_coupling logs the alpha-regularized F self-term sum_i[alpha_i D + R(alpha_i)]; the
+    # self_divergence column logs the RAW sum_i D(q_i||p_i). They coincide ONLY at
+    # alpha_mode='constant' (alpha=1, R=0); under the state-dependent per-coordinate envelope the
+    # R(alpha*) regularizer floor makes self_coupling distinct from (and uninformative vs) raw D.
+    torch.manual_seed(0)
+    tok = torch.randint(0, 16, (2, 8), device=DEVICE)
+
+    d_const = VFEModel(_cfg(alpha_mode="constant")).to(DEVICE).diagnostics(tok)
+    assert "self_divergence" in d_const and math.isfinite(d_const["self_divergence"])
+    assert d_const["self_divergence"] >= 0.0
+    # constant alpha=1 with no regularizer  ->  raw divergence == the logged self-coupling term
+    assert math.isclose(d_const["self_coupling"], d_const["self_divergence"], rel_tol=1e-5, abs_tol=1e-5)
+
+    # state-dependent per-coord: the regularizer floor lifts self_coupling off the raw divergence
+    d_sd = VFEModel(_cfg(alpha_mode="state_dependent_per_coord")).to(DEVICE).diagnostics(tok)
+    assert "self_divergence" in d_sd and math.isfinite(d_sd["self_divergence"])
+    assert not math.isclose(d_sd["self_coupling"], d_sd["self_divergence"], rel_tol=1e-6, abs_tol=1e-6)
 
 
 def test_group_gauge_invariant_sp_is_conjugation_invariant() -> None:

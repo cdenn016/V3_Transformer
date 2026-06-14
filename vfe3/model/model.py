@@ -241,12 +241,20 @@ class VFEModel(nn.Module):
         # are param-free. Trains through the scored forward term (s_e_step=False) or the unrolled s
         # E-step (_refine_s, s_e_step=True) -- the latter is the E-step-tangent route the detach/oracle
         # config warnings cover.
-        if cfg.lambda_h_mode == "learnable":
+        # Create log_lambda_h only on the active-channel path (lambda_h>0 or s_e_step), matching the
+        # r-table gate (prior_bank.py): with lambda_h=0 and not s_e_step the hyper-prior channel is
+        # inert (no r table, scored term gated off) and config warns, so creating the parameter would
+        # only orphan it. getattr(...,"log_lambda_h",None) at every consumer keeps this None-safe.
+        if cfg.lambda_h_mode == "learnable" and (cfg.lambda_h > 0.0 or cfg.s_e_step):
             self.log_lambda_h = nn.Parameter(torch.tensor(max(float(cfg.lambda_h), cfg.eps)).log())
             if cfg.detach_e_step and cfg.s_e_step:
                 # Footgun (mirrors log_alpha / log_lambda_beta): under s_e_step the learned lambda_h
                 # enters the loss ONLY through the s E-step (_refine_s), which detach_e_step wraps in
-                # no_grad, so log_lambda_h receives NO gradient and stays frozen at its init.
+                # no_grad, so log_lambda_h receives NO gradient and stays frozen at its init. This guard
+                # deliberately keys on the LEGACY detach_e_step bool; the e_step_gradient='detach' /
+                # 'straight_through' route (with detach_e_step=False) is the complementary CONFIG-level
+                # warning's job (config.py, keyed on the e_step_gradient literal), so the two cover both
+                # freeze routes with no double-warn -- do NOT broaden this to effective_e_step_gradient.
                 import warnings
                 warnings.warn(
                     "lambda_h_mode='learnable' with detach_e_step=True and s_e_step=True freezes "
@@ -456,10 +464,15 @@ class VFEModel(nn.Module):
             # The s-channel self-coupling weight IS lambda_h (the hyper-prior precision): route it
             # through the lambda_h_mode registry, not a hardcoded constant. e_step's self_coupling_alpha
             # consumes (value, alpha_mode, b0, c0, log_alpha) exactly as lambda_h_i.hyper_prior_lambda_h
-            # does, and adds the regularizer R_h to the s free energy for non-constant modes
-            # (e_step.py: alpha_reg when alpha_mode != 'constant'), so state_dependent lambda_h gets the
-            # envelope cancellation here for free; learnable feeds log_lambda_h. b0_h/c0_h are the
-            # hyper-prior's own precision shape (NOT alpha's b0/c0).
+            # does. ENVELOPE CANCELLATION (audit 2026-06-13): under state_dependent the s E-step gets the
+            # correct lam*(KL)*dKL gradient by the envelope theorem -- on the LIVE kernel route the
+            # belief-gradient kernel multiplies dKL by the envelope COEFFICIENT alpha*=c0_h/(b0_h+KL) and
+            # never literally adds R_h (R_h's d/dbelief is 0, so omitting it is exact); only the autograd
+            # ORACLE route's free_energy_value materializes alpha_reg=R_h. Either way the descent
+            # direction is correct. learnable feeds log_lambda_h. b0_h/c0_h are the hyper-prior's own
+            # precision shape (NOT alpha's b0/c0). NOTE: under state_dependent, value=cfg.lambda_h is
+            # IGNORED (alpha_state_dependent reads only b0_h/c0_h); the coupling magnitude is c0_h/(b0_h+KL),
+            # and cfg.lambda_h then acts ONLY as the channel-on gate -- it does not scale the s coupling.
             alpha_div=cfg.alpha_div,       value=cfg.lambda_h,          alpha_mode=cfg.lambda_h_mode,
             b0=cfg.b0_h, c0=cfg.c0_h, log_alpha=getattr(self, "log_lambda_h", None),
             lambda_beta=cfg.gamma_coupling,
@@ -774,13 +787,17 @@ class VFEModel(nn.Module):
         """
         from vfe3.lambda_h_i import hyper_prior_lambda_h
         cfg = self.cfg
-        kl = self._hyper_prior_kl(token_ids)                          # (B, N) raw KL(s_i||r)
+        kl_s = self._hyper_prior_kl(token_ids)                        # (B, N) raw KL(s_i||r)
         lam, reg = hyper_prior_lambda_h(
-            kl, mode=cfg.lambda_h_mode, value=cfg.lambda_h,
+            kl_s, mode=cfg.lambda_h_mode, value=cfg.lambda_h,
             b0_h=cfg.b0_h, c0_h=cfg.c0_h, log_lambda_h=getattr(self, "log_lambda_h", None),
         )
-        term = lam * kl
-        if cfg.lambda_h_mode != "constant":
+        term = lam * kl_s
+        if cfg.lambda_h_mode == "state_dependent":
+            # Only the state_dependent envelope carries a nonzero R_h (constant/learnable return a zero
+            # regularizer); add it UNDETACHED so autograd's product rule cancels to lam*dKL by the
+            # envelope theorem. Gating on 'state_dependent' (not '!= constant') skips the zero-add on the
+            # learnable path.
             term = term + reg                                         # R_h in F -> envelope cancellation
         return term                                                  # (B, N)
 
@@ -1103,6 +1120,12 @@ class VFEModel(nn.Module):
                                           include_attention_entropy=cfg.include_attention_entropy,
                                           alpha_reg=(alpha_reg if cfg.alpha_mode != "constant" else None))
         d.update({k: float(v) for k, v in terms.items()})
+        # Raw (un-regularized) belief->prior drift sum_i D(q_i||p_i): the divergence WITHOUT the
+        # alpha_i coefficient OR the R(alpha_i) regularizer that free_energy_terms folds into
+        # self_coupling. Under alpha_mode='constant' (alpha=1, R=0) the two coincide; under the
+        # state-dependent envelope self_coupling is pinned near the K*c0 regularizer floor (alpha_i*
+        # D + R = c0[1 + log((b0+D)/c0)] per coord), so this raw term is the informative drift signal.
+        d["self_divergence"] = float(self_div.sum())            # sum over tokens (and coords if per-coord)
         # Model-channel F blocks (audit obs 18497 + the s/r/h/gamma figures): surface the hyper-prior
         # and the gamma model-coupling block whenever their tables exist, INDEPENDENT of the loss
         # gating. The loss folds these into the s-refinement under s_e_step to avoid a double GRADIENT,

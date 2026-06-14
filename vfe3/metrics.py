@@ -675,7 +675,7 @@ def cocycle_residual_sampled(
 # --- free-energy closure and per-token profile (the headline F figure) ---
 
 def free_energy_full_decomposition(
-    self_coupling:   'float | torch.Tensor',     # alpha * sum_i D(q_i||p_i) (nats)
+    self_coupling:   'float | torch.Tensor',     # F self-term sum_i[alpha_i D(q_i||p_i) + R(alpha_i)] (nats)
     belief_coupling: 'float | torch.Tensor',     # raw sum_ij beta_ij E_ij (nats)
     attention_ent:   'float | torch.Tensor',     # raw tau sum_ij beta_ij log(beta_ij/pi_ij) (nats)
     data_term:       'float | torch.Tensor',     # -E_q[log p(o|x)] = val_ce in nats
