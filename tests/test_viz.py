@@ -208,7 +208,7 @@ def test_plot_belief_umap_per_channel_categories(tmp_path):
     bank, decode = _category_bank()
     p = tmp_path / "f5.png"
     try:
-        fig = plot_belief_umap(bank, "mu", decode=decode, n_label=3, seed=0, path=str(p)); plt.close(fig)
+        fig = plot_belief_umap(bank, "mu", decode=decode, seed=0, path=str(p)); plt.close(fig)
     except (ImportError, OSError) as exc:
         pytest.skip(f"umap-learn native layer unavailable: {exc}")
     assert _saved_nonempty(p)
@@ -243,6 +243,27 @@ def test_token_category_helpers():
     assert _funccontent_category(" cat") == 3   # content word
     assert _funccontent_category(".") == 0      # punctuation
     assert _funccontent_category("42") == 1     # number
+
+
+def test_cluster_embedding_and_lift_labels():
+    # the belief-UMAP redesign clusters the embedding and labels each cluster by DISTINCTIVE (lift)
+    # tokens, not raw frequency: a global stopword present in every cluster must not dominate the labels.
+    import numpy as np
+    from vfe3.viz.figures import _cluster_embedding, _cluster_lift_labels
+    rng = np.random.default_rng(0)
+    c0 = rng.normal([0, 0], 0.2, (80, 2)); c1 = rng.normal([10, 10], 0.2, (80, 2))
+    coords = np.vstack([c0, c1])
+    # cluster 0 = mostly token 5 ('apple') + stopword 0 ('the'); cluster 1 = mostly token 9 ('zebra') + 'the'
+    tids = np.concatenate([np.array([5] * 60 + [0] * 20), np.array([9] * 60 + [0] * 20)])
+    labels = _cluster_embedding(coords, seed=0)
+    assert set(labels.tolist()) - {-1}                          # at least one real cluster found
+    names = {5: "apple", 9: "zebra", 0: "the"}
+    # top-1 by lift: the distinctive token (apple lift 2.0, zebra lift 2.0) outranks the stopword
+    # 'the' (present in both clusters -> lift ~1.0), so the per-cluster top label is never the stopword.
+    lab = _cluster_lift_labels(tids, labels, decode=lambda l: names[int(l[0])], k=1)
+    joined = " ".join(lab.values())
+    assert "apple" in joined and "zebra" in joined             # distinctive tokens surface
+    assert "the" not in joined                                  # the in-every-cluster stopword does not
 
 
 def test_plot_gauge_equivariance_saves(tmp_path):
