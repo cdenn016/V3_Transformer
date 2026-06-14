@@ -52,6 +52,22 @@ def test_cross_couplings_accepts_list_pairs_from_json_roundtrip():
     assert cfg.cross_couplings == [(0, 1)]              # actual tuples (a stored list would fail this)
 
 
+def test_load_config_drops_legacy_diagonal_covariance_key(tmp_path):
+    """Old config.json files (written when diagonal_covariance was a dataclass field) carry the key
+    under 'config'; report._load_config must drop it (it is now a derived property of family) so a
+    figure regeneration from a pre-change run does not crash on the unexpected kwarg."""
+    import json
+    from dataclasses import asdict
+    from vfe3.viz.report import _load_config
+
+    cfg_dict = asdict(VFE3Config())
+    cfg_dict["diagonal_covariance"] = True                   # legacy field, no longer a constructor arg
+    (tmp_path / "config.json").write_text(
+        json.dumps({"config": cfg_dict, "dataset": "wikitext-103"}))
+    cfg, dataset = _load_config(tmp_path)
+    assert cfg.diagonal_covariance is True and dataset == "wikitext-103"
+
+
 def test_config_rejects_nan_min_lr():
     import math
     with pytest.raises(ValueError):
@@ -184,12 +200,13 @@ def test_config_has_state_dependent_alpha_shape_params():
         VFE3Config(c0=-1.0)
 
 
-def test_diagonal_covariance_must_agree_with_family():
-    """diagonal_covariance is a live bool cross-validated against family (kept distinct, not collapsed)."""
-    with pytest.raises(ValueError):
-        VFE3Config(diagonal_covariance=False)          # family defaults to gaussian_diagonal
-    # the consistent full-covariance pair is accepted (divergence_family stays the functional seam)
-    VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+def test_diagonal_covariance_derived_from_family():
+    """diagonal_covariance is a DERIVED read-only property of family (single source of truth),
+    not a settable field: it tracks the family's cov_kind and passing it as a kwarg raises."""
+    assert VFE3Config(family="gaussian_diagonal").diagonal_covariance is True
+    assert VFE3Config(family="gaussian_full", decode_mode="full").diagonal_covariance is False
+    with pytest.raises(TypeError):
+        VFE3Config(diagonal_covariance=False)          # no longer a constructor field
 
 
 def test_per_coord_alpha_requires_diagonal_family():
@@ -198,7 +215,7 @@ def test_per_coord_alpha_requires_diagonal_family():
     is rejected at construction; the diagonal pairing (the default family) is accepted."""
     with pytest.raises(ValueError):
         VFE3Config(lambda_alpha_mode="state_dependent_per_coord",
-                   family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+                   family="gaussian_full", decode_mode="full")
     VFE3Config(lambda_alpha_mode="state_dependent_per_coord")          # family defaults to diagonal -> ok
 
 
@@ -222,7 +239,7 @@ def test_decode_mode_full_rejects_diagonal_family():
     # use_prior_bank=True: the rank check is a PRIOR-BANK decode constraint (linear decode ignores
     # decode_mode; that skip is covered by test_decode_mode_family_cross_check_skipped_under_linear_decode).
     with pytest.raises(ValueError):
-        VFE3Config(family="gaussian_diagonal", diagonal_covariance=True, decode_mode="full",
+        VFE3Config(family="gaussian_diagonal", decode_mode="full",
                    use_prior_bank=True)
 
 
@@ -231,14 +248,14 @@ def test_decode_mode_diagonal_rejects_full_family():
     # use_prior_bank=True: the rank check is a prior-bank decode constraint (see the linear-decode
     # skip test below).
     with pytest.raises(ValueError):
-        VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="diagonal",
+        VFE3Config(family="gaussian_full", decode_mode="diagonal",
                    use_prior_bank=True)
 
 
 def test_decode_mode_family_cross_check_skipped_under_linear_decode():
     # use_prior_bank=False decodes via the linear projection and ignores decode_mode, so the rank
     # cross-check does not apply: a 'full' decode_mode with a diagonal family is accepted.
-    cfg = VFE3Config(family="gaussian_diagonal", diagonal_covariance=True,
+    cfg = VFE3Config(family="gaussian_diagonal",
                      decode_mode="full", use_prior_bank=False)
     assert cfg.use_prior_bank is False
 
@@ -297,12 +314,13 @@ def test_config_eval_max_batches_default_none_and_validated():
         VFE3Config(eval_max_batches=0)
 
 
-def test_config_diagonal_covariance_cross_check_uses_cov_kind():
-    """The diagonal_covariance consistency check is driven by the family's declared cov_kind,
-    not the literal family == 'gaussian_diagonal'."""
-    VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="full")   # full: ok
-    with pytest.raises(ValueError):
-        VFE3Config(family="gaussian_full", diagonal_covariance=True)     # full + diagonal: mismatch
+def test_diagonal_covariance_is_read_only_property():
+    """diagonal_covariance is a derived read-only property (no setter): family is the single
+    source of truth, so assigning it raises AttributeError."""
+    cfg = VFE3Config()
+    assert cfg.diagonal_covariance is True
+    with pytest.raises(AttributeError):
+        cfg.diagonal_covariance = False
 
 
 def test_config_lambda_h_default_zero_and_validated():
@@ -368,8 +386,9 @@ def test_pos_phi_compose_rejects_unknown():
 
 
 def test_config_accepts_newly_registered_family_without_editing_config():
-    """A new family registered with cov_kind='diagonal' is a valid config family and passes the
-    diagonal_covariance cross-check without editing config.py (no hardcoded family-name list)."""
+    """A new family registered with cov_kind='diagonal' is a valid config family and its derived
+    diagonal_covariance property reads the registered cov_kind, without editing config.py (no
+    hardcoded family-name list)."""
     from vfe3.families.base import register_family, _FAMILIES
     from vfe3.families.gaussian import DiagonalGaussian
 
@@ -380,10 +399,9 @@ def test_config_accepts_newly_registered_family_without_editing_config():
         pass
 
     try:
-        cfg = VFE3Config(family=name, diagonal_covariance=True)          # must NOT raise
+        cfg = VFE3Config(family=name)                                    # must NOT raise
         assert cfg.family == name
-        with pytest.raises(ValueError):
-            VFE3Config(family=name, diagonal_covariance=False)          # cov_kind diagonal != False
+        assert cfg.diagonal_covariance is True                          # derived from registered cov_kind
     finally:
         _FAMILIES.pop(name, None)
 
@@ -392,9 +410,9 @@ def test_rope_defaults_off_and_full_gauge_requires_full_cov():
     cfg = VFE3Config()
     assert cfg.pos_rotation == "none" and cfg.rope_full_gauge is False
     with pytest.raises(ValueError):
-        VFE3Config(pos_rotation="rope", rope_full_gauge=True, diagonal_covariance=True)
+        VFE3Config(pos_rotation="rope", rope_full_gauge=True)            # family defaults to diagonal
     # full-gauge with full covariance is allowed
-    VFE3Config(pos_rotation="rope", rope_full_gauge=True, diagonal_covariance=False,
+    VFE3Config(pos_rotation="rope", rope_full_gauge=True,
                family="gaussian_full", decode_mode="full")
 
 

@@ -148,10 +148,12 @@ class VFE3Config:
     # rope_full_gauge=True also rotates the covariance sandwich and REQUIRES full covariance.
     pos_rotation:              str   = "none"      # "none" | "rope" (the positional-rotation registry)
     rope_base:                 float = 100.0       # rotary frequency base
-    rope_full_gauge:           bool  = False       # rotate covariance too (needs diagonal_covariance=False)
+    rope_full_gauge:           bool  = False       # rotate covariance too (needs family="gaussian_full")
 
-    # belief family
-    diagonal_covariance:       bool  = True
+    # belief family. ``family`` is the SINGLE covariance-structure toggle (a registry key;
+    # gaussian_diagonal | gaussian_full | ...). The diagonal-vs-full flag is its derived,
+    # read-only ``diagonal_covariance`` property (see below) -- one source of truth, no second
+    # field to keep in sync.
     family:                    str   = "gaussian_diagonal"
 
     # free-energy coupling
@@ -708,23 +710,17 @@ class VFE3Config:
                     UserWarning, stacklevel=2,
                 )
 
-        # belief family. ``family`` selects the covariance-structure divergence kernel
-        # (gaussian_diagonal | gaussian_full). ``divergence_family`` is the SEPARATE functional
-        # (f-divergence) seam (renyi, ...; validated above), and ``diagonal_covariance`` is a
-        # SEPARATE live bool, cross-validated to stay consistent with family. The three are kept
-        # distinct and modular per CLAUDE.md (slot in different f-divergences / families); NOT
-        # collapsed, and divergence_family is NOT forced equal to family.
-        # family is validated against, and its covariance structure read from, the divergence
-        # registry (not a hardcoded list / name literal), so a newly registered family is a valid
-        # config family and its diagonal-vs-full structure is its declared cov_kind.
+        # belief family. ``family`` is the SINGLE covariance-structure toggle: a registry key
+        # whose declared ``cov_kind`` ('diagonal'|'full') is the one source of truth for the
+        # diagonal-vs-full path, exposed read-only as the derived ``diagonal_covariance`` property.
+        # ``divergence_family`` is the SEPARATE functional (f-divergence) seam (renyi, ...;
+        # validated above) and is NOT forced equal to family. family is validated against the
+        # divergence registry (not a hardcoded list / name literal), so a newly registered family
+        # is a valid config value and its diagonal-vs-full structure is its declared cov_kind;
+        # ``family_is_diagonal`` below drives the downstream rank / decode / alpha consistency guards.
         from vfe3.divergence import divergence_families, family_cov_kind
         _require(self.family, divergence_families(), "family")
         family_is_diagonal = family_cov_kind(self.family) == "diagonal"
-        if self.diagonal_covariance != family_is_diagonal:
-            raise ValueError(
-                f"diagonal_covariance={self.diagonal_covariance} contradicts family={self.family!r}; "
-                f"set diagonal_covariance={family_is_diagonal} for this family"
-            )
 
         # free-energy coupling
         for _name in ("kappa_beta", "kappa_gamma"):
@@ -1018,7 +1014,7 @@ class VFE3Config:
         if self.rope_full_gauge and self.diagonal_covariance:
             raise ValueError(
                 "rope_full_gauge=True rotates the covariance sandwich (R Sigma R^T), which the "
-                "diagonal-covariance approximation cannot carry; set diagonal_covariance=False."
+                "diagonal-covariance approximation cannot carry; set family='gaussian_full'."
             )
         # RoPE rotates ADJACENT coordinate pairs (2k, 2k+1); Sp(2m) pairs coordinate i with m+i
         # (J = [[0,I],[-I,0]]), so the rope-wrapped transport R Omega R^T leaves the symplectic group.
@@ -1393,6 +1389,18 @@ class VFE3Config:
         """
         k = float(sum(self.kappa_gamma) / len(self.kappa_gamma)) if isinstance(self.kappa_gamma, (list, tuple)) else self.kappa_gamma
         return k * (self.d_head ** 0.5)
+
+    @property
+    def diagonal_covariance(self) -> bool:
+        """Whether the belief covariance is diagonal -- DERIVED from ``family``.
+
+        ``family`` is the single covariance-structure toggle; this returns its declared
+        ``cov_kind == 'diagonal'`` (gaussian_diagonal -> True, gaussian_full -> False). Read-only:
+        switch the covariance structure by setting ``family``, never this. Consumers that want a
+        fast boolean (e.g. PriorBank) read it once at construction.
+        """
+        from vfe3.divergence import family_cov_kind
+        return family_cov_kind(self.family) == "diagonal"
 
     @property
     def d_head(self) -> int:

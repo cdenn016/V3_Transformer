@@ -66,7 +66,7 @@ def test_cross_couplings_rejects_per_head_kappa_list():    # CC-F5
 
 def test_cross_couplings_diagonal_family_warns():          # CC-F3
     with pytest.warns(UserWarning, match="APPROXIMATION"):
-        VFE3Config(**_cross_cfg(family="gaussian_diagonal", diagonal_covariance=True))
+        VFE3Config(**_cross_cfg(family="gaussian_diagonal"))
 
 
 def test_cross_couplings_semantic_shift_warns():           # CC-F2
@@ -77,6 +77,6 @@ def test_cross_couplings_semantic_shift_warns():           # CC-F2
 def test_cross_couplings_headless_scalar_config_is_valid():
     # The coherent single-block cross-coupled gauge (headless prior, scalar kappa, no mixer) must
     # still construct -- the guards reject only the genuinely-incompatible combinations.
-    cfg = VFE3Config(**_cross_cfg(family="gaussian_full", diagonal_covariance=False,
+    cfg = VFE3Config(**_cross_cfg(family="gaussian_full",
                                   use_prior_bank=False))
     assert cfg.cross_couplings == [(0, 1)]
