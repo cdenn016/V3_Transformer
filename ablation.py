@@ -98,7 +98,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     # f-divergence and e/m family
     #################################
     
-    divergence_family         = "renyi",   # "renyi" only
+    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
     alpha_div                 = 1.0,       # Renyi order (1.0 -> KL)
 
     diagonal_covariance       = True,                # diagonal_covariance MUST equal (family == "gaussian_diagonal")
@@ -248,6 +248,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     ####################################
     
     prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"    
+    learnable_r               = True,
     s_e_step                  = True,
     e_s_mu_lr                 = 0.85,
     e_s_sigma_lr              = 0.1,
@@ -493,10 +494,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
-    "decode_tau": {
-        "description": "KL-to-prior decode temperature",
-        "param": "decode_tau", "values": [0.5, 1.0, 2.0], "requires": {"use_prior_bank": True},
-    },
+    
 
 
     "mstep_self_coupling_weight": {
@@ -567,7 +565,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
     
     
-    
+    "decode_tau": {
+        "description": "KL-to-prior decode temperature",
+        "param": "decode_tau", "values": [0.2, 0.5, 0.75, 1.0, 2.0], "requires": {"use_prior_bank": True},
+    },
     
     
     
@@ -720,10 +721,9 @@ SWEEP_ORDER: List[str] = [
     
   #  "mu_init_std",
   #  "phi_scale",
+  #  "sigma_init", 
   
-    #"e_sigma_lr",
-   # "alpha",
-    
+  # "decode_tau",
    
    "gamma_coupling",
    "lambda_h",
@@ -736,21 +736,23 @@ SWEEP_ORDER: List[str] = [
     
   #  "weight_decay",
   #  "lambda_beta",
-  #  "sigma_init", 
-  #  "mstep_self_coupling_weight",
+  
+  
   #  "kappa",
   ##  "alpha_div",
     
     
    # "e_mu_lr",
   #  "phi_weight_decay",
-    
+     
+   #"e_sigma_lr",
+   # "alpha",
        
   #  
     
   #  "pos_phi_scale",   
   #  "mass_phi",
-
+#  "mstep_self_coupling_weight",
     
     
 ]

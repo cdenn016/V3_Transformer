@@ -50,6 +50,13 @@ MAX_TOKENS = None
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Multi-seed training: launch NUM_RUNS independent runs back-to-back on click-to-run, run i using
+# SEEDS[i]. Each run is fully independent (its own model, RNG, and artifacts dir -- the seed is in the
+# run-folder label so they never collide). NUM_RUNS=1 with SEEDS=[] keeps the single-run path on the
+# config `seed` above, unchanged. Example: NUM_RUNS=3, SEEDS=[3, 64, 23] trains all three seeds.
+NUM_RUNS = 1
+SEEDS    = []        # e.g. [3, 64, 23]; must list at least NUM_RUNS seeds when NUM_RUNS > 1
+
 
 config = dict(
     
@@ -59,25 +66,25 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 140,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 7,
+    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 2,
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 16,
-    max_steps                 = 120000,
+    batch_size                = 64,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
     
-    seed                      = 6,
+    seed                      = 16,
     warmup_steps              = 100,
     
     #################################
     # f-divergence and e/m family
     #################################
     
-    divergence_family         = "renyi",   # "renyi" only
+    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
     alpha_div                 = 1.0,       # Renyi order (1.0 -> KL)
 
     diagonal_covariance       = True,                # diagonal_covariance MUST equal (family == "gaussian_diagonal")
@@ -232,6 +239,7 @@ config = dict(
     learnable_r               = True,               # un-freeze hyper-prior centroid r (empirical-Bayes)
     r_update_mode             = "gradient",          # "gradient" (AdamW M-step; correct under s_e_step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
     s_e_step                  = True,
+    
     e_s_mu_lr                 = 0.85,
     e_s_sigma_lr              = 0.1,
     
@@ -267,7 +275,7 @@ config = dict(
     
     e_mu_q_trust              = None,
     e_sigma_q_trust           = 10.0,
-    sigma_max                 = 10.0,
+    sigma_max                 = 100.0,
     
     #################################
     #         Misc/Logging
@@ -345,6 +353,7 @@ def _select_loader(
     is_train = (split == "train")
     if dataset == "synthetic-period3":
         return synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
+    
     cap = MAX_TOKENS if is_train else None
     try:
         return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
@@ -355,15 +364,17 @@ def _select_loader(
 
 
 def _run_label(cfg: VFE3Config, dataset: str) -> str:
-    r"""Descriptive run label ``<dataset>_K<embed_dim>_<group>[_linear][_mix]`` (no timestamp, no PPL).
+    r"""Descriptive run label ``<dataset>_K<embed_dim>_<group>[_linear][_mix][_cross]_s<seed>`` (no
+    timestamp, no PPL).
 
     The stable part of the run-folder name: ``_run_dir`` prefixes it with a timestamp while the run is
-    in progress, and ``_rename_run_by_ppl`` swaps that prefix for the test perplexity at finalize.
+    in progress, and ``_rename_run_by_ppl`` swaps that prefix for the test perplexity at finalize. The
+    ``_s<seed>`` suffix keeps a multi-seed launch's run folders distinct (and identifiable by seed).
     """
     tags = (("_linear" if not cfg.use_prior_bank else "")
             + ("_mix" if cfg.use_head_mixer else "")
             + ("_cross" if cfg.cross_couplings else ""))
-    return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}"
+    return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}_s{cfg.seed}"
 
 
 def _run_dir(cfg: VFE3Config, dataset: str) -> 'str | None':
@@ -416,16 +427,19 @@ def _rename_run_by_ppl(
     return str(dst)
 
 
-def main() -> None:
-    import time
+def _run_once(seed: int, logger: logging.Logger) -> None:
+    r"""One full, independent training run at ``seed`` (build -> train -> val -> test/finalize).
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    logger = logging.getLogger("train_vfe3")
+    Builds a fresh ``VFE3Config`` from ``config`` with ``seed`` overridden, seeds the RNG, and runs the
+    complete pipeline into its own seed-labelled artifacts dir. Called once per resolved seed by
+    :func:`main`, so a multi-seed launch yields one independent, comparable run folder per seed.
+    """
+    import time
 
     from vfe3.model.model import VFEModel
     from vfe3.run_artifacts import RunArtifacts, finalize_run
 
-    cfg = VFE3Config(**config)
+    cfg = VFE3Config(**{**config, "seed": seed})         # per-run seed override (config `seed` is the default)
     torch.manual_seed(cfg.seed)
     model = VFEModel(cfg).to(DEVICE)
     train_loader = _select_loader(DATASET, cfg, logger, split="train")
@@ -491,6 +505,28 @@ def main() -> None:
                                tokens_per_char=test_tpc, device=torch.device(DEVICE), wall_time=wall, logger=logger)
         run_dir = _rename_run_by_ppl(run_dir, _run_label(cfg, DATASET), results.get("test_ppl"), logger)
         logger.info("Artifacts written to %s", run_dir)
+
+
+def main() -> None:
+    r"""Click-to-run entry: train ``NUM_RUNS`` independent seeds back-to-back (default: one run on the
+    config ``seed``). Run i uses ``SEEDS[i]``; each run is fully independent with its own seed-labelled
+    artifacts directory, so a multi-seed launch produces one comparable run folder per seed.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logger = logging.getLogger("train_vfe3")
+    if SEEDS:
+        if len(SEEDS) < NUM_RUNS:
+            raise ValueError(
+                f"SEEDS lists {len(SEEDS)} seed(s) but NUM_RUNS={NUM_RUNS}; provide at least NUM_RUNS seeds")
+        seeds = list(SEEDS[:NUM_RUNS])
+    elif NUM_RUNS != 1:
+        raise ValueError(f"NUM_RUNS={NUM_RUNS} > 1 but SEEDS is empty; list one seed per run in SEEDS")
+    else:
+        seeds = [config["seed"]]                          # single run on the config seed (unchanged path)
+    for i, s in enumerate(seeds):
+        if len(seeds) > 1:
+            logger.info("\n%s\n# Run %d/%d  (seed=%d)\n%s", "#" * 64, i + 1, len(seeds), int(s), "#" * 64)
+        _run_once(int(s), logger)
 
 
 if __name__ == "__main__":
