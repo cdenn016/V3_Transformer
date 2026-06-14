@@ -71,8 +71,18 @@ def umap_embed(
     except ImportError as exc:           # pragma: no cover
         raise ImportError("umap_embed needs umap-learn (pip install umap-learn)") from exc
     X = _np(features)
+    # A fully collapsed channel (every point identical -> zero variance) has no embedding, and PCA
+    # init would divide by total variance 0 and yield NaN. Return a trivial finite layout so the
+    # downstream clustering / KDE stay valid (faithful: constant features carry no 2-D structure).
+    if X.shape[0] < 3 or float(np.ptp(X, axis=0).max()) <= 0.0:
+        return np.zeros((X.shape[0], 2), dtype=float)
     n_neighbors = min(n_neighbors, max(2, X.shape[0] - 1))
-    reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=min_dist, n_components=2, random_state=seed)
+    # init="pca" skips UMAP's spectral eigensolver, which on disconnected / near-degenerate belief
+    # clouds fails to converge (tiny eigengap) and silently falls back to uniform-random init; PCA is
+    # deterministic and data-aware. n_jobs=1 matches what random_state already forces, so it also
+    # silences UMAP's "n_jobs overridden" warning. Same compute, no warning cascade.
+    reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=min_dist, n_components=2,
+                        init="pca", random_state=seed, n_jobs=1)
     return reducer.fit_transform(X)
 
 
