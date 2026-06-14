@@ -2,8 +2,8 @@ r"""Full-covariance (gaussian_full) pure path: end-to-end runnability + golden e
 
 GL(K) audit finding #2: the GL(K)-invariant covariance sandwich Omega Sigma Omega^T must be
 runnable end-to-end through VFEModel / the E-step under appropriate toggles, not only as
-isolated kernels. The toggles are family='gaussian_full' + diagonal_covariance=False +
-decode_mode='full' (the three are cross-validated for consistency).
+isolated kernels. The toggles are family='gaussian_full' + decode_mode='full'
+(diagonal_covariance is a derived read-only property of family).
 """
 
 import pytest
@@ -16,21 +16,19 @@ from vfe3.inference.e_step import e_step_iteration
 from vfe3.model.model import VFEModel
 
 
-def test_full_covariance_config_requires_consistent_flags():
-    """diagonal_covariance is a live field cross-validated against family (kept, not collapsed)."""
-    VFE3Config(family="gaussian_diagonal", diagonal_covariance=True)
-    VFE3Config(family="gaussian_full", diagonal_covariance=False, decode_mode="full")
-    with pytest.raises(ValueError):
-        VFE3Config(family="gaussian_full", diagonal_covariance=True)
-    with pytest.raises(ValueError):
-        VFE3Config(family="gaussian_diagonal", diagonal_covariance=False)
+def test_full_covariance_config_derives_diagonal_covariance_flag():
+    """diagonal_covariance is a derived read-only property of family (single source of truth)."""
+    assert VFE3Config(family="gaussian_diagonal").diagonal_covariance is True
+    assert VFE3Config(family="gaussian_full", decode_mode="full").diagonal_covariance is False
+    with pytest.raises(TypeError):
+        VFE3Config(family="gaussian_full", diagonal_covariance=True)    # no longer a settable field
 
 
 def test_full_covariance_model_runs_end_to_end():
     """The full-covariance pure path runs encode -> E-step -> full decode -> CE, forward+backward."""
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.01, e_phi_lr=0.0,
-                     family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+                     family="gaussian_full", decode_mode="full")
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (2, 5)); targets = torch.randint(0, 20, (2, 5))
     beliefs = model.prior_bank.encode(tokens)

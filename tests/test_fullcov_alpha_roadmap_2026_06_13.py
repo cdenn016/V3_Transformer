@@ -91,7 +91,7 @@ def test_per_coord_bhattacharyya_forward_backward_runs():
 def _fullcov_model(renyi_order=1.0, oracle_unroll_grad=True, **kw):
     cfg = VFE3Config(vocab_size=24, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.02, e_phi_lr=0.01,
-                     family="gaussian_full", diagonal_covariance=False, decode_mode="full",
+                     family="gaussian_full", decode_mode="full",
                      use_prior_bank=True, pos_phi="learned",
                      renyi_order=renyi_order, e_step_gradient="unroll",
                      oracle_unroll_grad=oracle_unroll_grad, **kw)
@@ -211,7 +211,7 @@ def test_state_dependent_per_position_nonrenyi_forward_backward(div_name):
 def _full_model(vocab_size=64, **kw):
     cfg = VFE3Config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.02, e_phi_lr=0.0,
-                     family="gaussian_full", diagonal_covariance=False, use_prior_bank=True, **kw)
+                     family="gaussian_full", use_prior_bank=True, **kw)
     return VFEModel(cfg)
 
 
@@ -229,10 +229,10 @@ def _full_converged(model):
 
 
 def test_full_chunked_config_accepts_with_full_family_and_rejects_diagonal():
-    VFE3Config(family="gaussian_full", diagonal_covariance=False,
+    VFE3Config(family="gaussian_full",
                decode_mode="full_chunked", use_prior_bank=True)
     with pytest.raises(ValueError):
-        VFE3Config(family="gaussian_diagonal", diagonal_covariance=True,
+        VFE3Config(family="gaussian_diagonal",
                    decode_mode="full_chunked", use_prior_bank=True)
 
 
@@ -378,10 +378,10 @@ def _warns_matching(substr, **cfg_kw):
 
 def test_warn_fullcov_linear_decode_discards_covariance():
     assert _warns_matching("discards the converged",
-                           family="gaussian_full", diagonal_covariance=False, use_prior_bank=False)
+                           family="gaussian_full", use_prior_bank=False)
     # The pure full-cov KL decode (use_prior_bank=True) does NOT emit the discard warning.
     assert not _warns_matching("discards the converged",
-                               family="gaussian_full", diagonal_covariance=False,
+                               family="gaussian_full",
                                use_prior_bank=True, decode_mode="full")
 
 

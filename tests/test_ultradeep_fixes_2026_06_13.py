@@ -26,7 +26,6 @@ def test_m1_s_e_step_rejects_full_covariance_family():
             s_e_step=True,
             prior_source="model_channel",
             family="gaussian_full",
-            diagonal_covariance=False,
             lambda_h=0.5,
         )
 

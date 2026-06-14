@@ -58,7 +58,6 @@ def test_unroll_oracle_route_warns_for_active_param() -> None:
     with pytest.warns(UserWarning, match="oracle"):
         VFE3Config(
             family="gaussian_full",
-            diagonal_covariance=False,
             decode_mode="full",
         )
 

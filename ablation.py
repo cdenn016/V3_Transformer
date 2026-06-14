@@ -10,7 +10,7 @@ Two sweep shapes are supported, both declared in the ``SWEEPS`` registry:
     ``range = [start, stop, step]`` (one-at-a-time ablation around the baseline);
   * multi-arm     -- a ``configs`` list of named arms, each a dict of field overrides,
     for categorical comparisons whose arms differ in more than one field (e.g. a
-    full-covariance arm that flips ``family`` AND ``diagonal_covariance`` together).
+    full-covariance arm that flips ``family`` and the per-coordinate alpha form together).
 
 The baseline is IMPORTED from ``train_vfe3.py`` (``from train_vfe3 import config``), so a
 sweep ablates around exactly what a normal ``train_vfe3.py`` run would train -- there is no
@@ -97,8 +97,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
     renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    diagonal_covariance       = True,                # diagonal_covariance MUST equal (family == "gaussian_diagonal")
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" (single covariance toggle; diagonal_covariance is derived)
     
     #################################
     #        Initialization
@@ -183,7 +182,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
     
     rope_base                 = 100.0,               # rotary frequency base
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES diagonal_covariance=False)
+    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
    
     
     #############################################
@@ -442,19 +441,19 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "configs": [
             {"label": "means_only", "pos_rotation": "rope"},
             {"label": "full_gauge", "pos_rotation": "rope", "rope_full_gauge": True,
-                                    "diagonal_covariance": False, "family": "gaussian_full",
+                                    "family": "gaussian_full",
                                     "lambda_alpha_mode": "state_dependent"},
         ],
     },
 
     # === belief family =====================================================
-    # The full arm flips family + diagonal_covariance together and moves off the per-coordinate
-    # alpha form (diagonal-only), all of which a naive single-field sweep would have rejected.
+    # The full arm flips family (which derives diagonal_covariance) and moves off the per-coordinate
+    # alpha form (diagonal-only), both of which a naive single-field sweep would have rejected.
     "covariance": {
         "description": "belief covariance structure (diagonal vs full Gaussian)",
         "configs": [
-            {"label": "diagonal", "family": "gaussian_diagonal", "diagonal_covariance": True},
-            {"label": "full",     "family": "gaussian_full",     "diagonal_covariance": False,
+            {"label": "diagonal", "family": "gaussian_diagonal"},
+            {"label": "full",     "family": "gaussian_full",
                                   "lambda_alpha_mode": "state_dependent"},
         ],
     },

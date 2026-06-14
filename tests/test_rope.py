@@ -124,11 +124,11 @@ from vfe3.gradients.oracle import belief_gradients_autograd
 
 
 def _full_cov_cfg(**kw):
-    """_rope_cfg defaults plus the full-covariance trio (family/diagonal_covariance/decode_mode)."""
+    """_rope_cfg defaults plus the full-covariance pair (family/decode_mode); diagonal_covariance derived."""
     base = dict(vocab_size=6, embed_dim=8, n_heads=2, max_seq_len=8, n_layers=1,
                 n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0, gauge_group="block_glk",
                 warmup_steps=1, max_steps=4,
-                family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+                family="gaussian_full", decode_mode="full")
     base.update(kw)
     return VFE3Config(**base)
 

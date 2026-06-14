@@ -36,7 +36,11 @@ from vfe3.viz import figures as figs
 def _load_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
     r"""Rebuild ``(cfg, dataset)`` from ``run_dir/config.json`` (the RunArtifacts metadata)."""
     data = json.loads((run_dir / "config.json").read_text())
-    return VFE3Config(**data["config"]), data.get("dataset", "")
+    cfg_dict = dict(data["config"])
+    # Legacy: config.json files written when diagonal_covariance was a dataclass field carry the
+    # key under "config"; it is now a derived property of family, so drop it before the rebuild.
+    cfg_dict.pop("diagonal_covariance", None)
+    return VFE3Config(**cfg_dict), data.get("dataset", "")
 
 
 def _build_loader(dataset: str, cfg: VFE3Config, split: str):

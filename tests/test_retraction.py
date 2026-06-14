@@ -252,7 +252,7 @@ def test_log_euclidean_registered_and_config_accepts():
     from vfe3.config import VFE3Config
     assert callable(get_retraction("log_euclidean"))
     cfg = VFE3Config(spd_retract_mode="log_euclidean", family="gaussian_full",
-                     diagonal_covariance=False, decode_mode="full")
+                     decode_mode="full")
     assert cfg.spd_retract_mode == "log_euclidean"
 
 
@@ -261,8 +261,7 @@ def test_log_euclidean_diagonal_pairing_warns():
     (the log-chart step lacks the affine Fisher whitening there)."""
     from vfe3.config import VFE3Config
     with pytest.warns(UserWarning, match="log_euclidean"):
-        VFE3Config(spd_retract_mode="log_euclidean", family="gaussian_diagonal",
-                   diagonal_covariance=True)
+        VFE3Config(spd_retract_mode="log_euclidean", family="gaussian_diagonal")
 
 
 # --- gap-regularized (Lorentzian-damped) eigh backward: full-cov retraction at degenerate spectra ---
@@ -369,7 +368,7 @@ def test_full_cov_model_first_backward_finite_at_default_init():
     from vfe3.model.model import VFEModel
     torch.manual_seed(0)
     cfg = VFE3Config(vocab_size=8, embed_dim=4, n_heads=2, n_layers=1,
-                     family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+                     family="gaussian_full", decode_mode="full")
     model = VFEModel(cfg)
     x = torch.randint(0, 8, (2, 6))
     y = torch.randint(0, 8, (2, 6))

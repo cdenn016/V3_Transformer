@@ -87,8 +87,7 @@ config = dict(
     divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
     renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    diagonal_covariance       = True,                # diagonal_covariance MUST equal (family == "gaussian_diagonal")
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" (single covariance toggle; diagonal_covariance is derived)
     
     #################################
     #        Initialization
@@ -174,7 +173,7 @@ config = dict(
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
     
     rope_base                 = 100.0,               # rotary frequency base
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES diagonal_covariance=False)
+    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
    
     
     ######################################
