@@ -182,7 +182,10 @@ config = dict(
        
     alpha                      = 1,                   # constant self-coupling value
     lambda_h                   = 0.25,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
-    
+    lambda_h_mode              = "state_dependent",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h) | "learnable" (NN exc.)
+    b0_h                       = 1.0,        # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
+    c0_h                       = 1.0,        # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h
+
     # Further Regularizers
     mass_phi                   = 0.0,       # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight = 0.00,      # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
@@ -225,7 +228,9 @@ config = dict(
     # and prior_source = 'model_channel'
     ####################################
     
-    prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"    
+    prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"
+    learnable_r               = True,               # un-freeze hyper-prior centroid r (empirical-Bayes)
+    r_update_mode             = "gradient",          # "gradient" (AdamW M-step; correct under s_e_step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
     s_e_step                  = True,
     e_s_mu_lr                 = 0.85,
     e_s_sigma_lr              = 0.1,

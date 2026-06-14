@@ -1,7 +1,7 @@
 # The hyper-prior `(r, lambda_h)`: is `learnable_r` a neural network, how should `r` evolve, and should `lambda_h` mirror `alpha_mode`
 
 Date: 2026-06-13
-Status: investigation complete; implementation decision pending user approval
+Status: investigation complete; full implementation delivered (see "Implementation" below)
 Branch: `vfe3-learnable-r-lambda-h-mechanism-2026-06-13`
 Method: 6-expert workflow panel (variational, info-geometry, implementation, ML/optimizer,
 philosophy-of-science, gauge) plus 3 adversarial red-team verifications; every load-bearing
@@ -188,3 +188,28 @@ manuscript as deriving them. The closed-form barycenter is the exact M-step only
 manuscript's truly pure `r` remains the deferred top-down `r_i = Ω̃[s_I^{(s+1)}]`; both
 `learnable_r` and a closed-form barycenter are same-scale empirical-Bayes stand-ins for it, which
 the manuscript sanctions as the training-time boundary condition.
+
+## Implementation
+
+Delivered on this branch, all defaults byte-identical to the prior behavior. New registry
+`vfe3/lambda_h_i.py` (`hyper_prior_lambda_h`, modes `constant` / `state_dependent` / `learnable`)
+delegates to `vfe3/alpha_i.py` so the envelope `lambda_h* = c0_h/(b0_h+KL)` and `R_h` share alpha's
+single verified implementation. Config gains `lambda_h_mode` (default `constant`), `b0_h`/`c0_h`
+(default `1.0`), and `r_update_mode` (default `gradient`), each registry-validated, with inert-toggle
+warnings and `log_lambda_h` added to the two E-step gradient-flow freeze warnings. In `model.py`,
+`lambda_h_mode='learnable'` builds `log_lambda_h` (init `log(cfg.lambda_h)`, so step-0 byte-identical
+to constant) with a detach footgun; `_refine_s` routes the `s` E-step self-coupling through
+`cfg.lambda_h_mode` with `b0_h`/`c0_h`/`log_lambda_h` (the `e_step` already adds `alpha_reg = R_h` for
+non-constant modes, so the envelope cancellation transfers automatically); a new
+`_hyper_prior_weighted` applies the registry weight plus `R_h` to the raw per-token KL, the scored
+caller drops its external `lambda_h` factor, and diagnostics fold the registry-weighted contribution
+into `total` (raw KL preserved for observability). The closed-form M-step lives in
+`PriorBank.barycenter_r_()` (moment-matched centroid of the `s` tables, under `no_grad`); under
+`r_update_mode='barycenter'` `r` is constructed `requires_grad=False` (out of the optimizer) and set
+each M-step from `train_step` after `optimizer.step()`. `build_optimizer` groups `log_lambda_h` at
+`m_mu_lr`.
+
+Verified: smoke checks (constant linear oracle, `state_dependent` term equal to the envelope
+oracle, `learnable` init/grad/grouping, exact barycenter) plus the test suites — `test_hyperprior.py`
+28 passed (12 new), and the config/alpha/gamma/model/train/live-s batches green. The pure default
+path (`lambda_h_mode='constant'`, `r_update_mode='gradient'`, `learnable_r=False`) is unchanged.

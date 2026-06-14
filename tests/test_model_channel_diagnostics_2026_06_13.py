@@ -11,7 +11,8 @@ had no figures. These tests pin:
       term's mean reduction is consistent with the sum-scale diagnostic;
   (3) the reduction-consistent total assembly (the per-token MEAN-into-per-sequence-SUM bug, obs 18497):
       d["total"] is the weighted sum of every reported block at one scale;
-  (4) _hyper_prior_term is the mean of the _hyper_prior_kl vector (byte-identical refactor);
+  (4) _hyper_prior_term is the lambda_h_mode-WEIGHTED mean of the _hyper_prior_kl vector
+      (cfg.lambda_h * mean KL for the default 'constant' mode);
   (5) gamma_attention_maps shape + gating;
   (6) the s/r/h/gamma extractors gate correctly (None when their tables are absent);
   (7) every new figure renders (the s/r/h + gamma publication figures and the root model_channel_terms);
@@ -110,12 +111,14 @@ def test_diagnostics_total_is_consistent_weighted_sum():
 
 # ---- (4) hyper-prior vector / term consistency (byte-identical refactor) --------------------------
 
-def test_hyper_prior_term_is_mean_of_kl_vector():
-    m = _active()
+def test_hyper_prior_term_is_weighted_mean_of_kl_vector():
+    m = _active()                                                 # lambda_h=0.25, lambda_h_mode='constant'
     tok = torch.randint(0, 6, (2, 8))
-    kl = m._hyper_prior_kl(tok)                                    # (B, N)
+    kl = m._hyper_prior_kl(tok)                                    # (B, N) RAW per-token KL (unchanged)
     assert kl.shape == (2, 8) and torch.isfinite(kl).all()
-    assert torch.equal(m._hyper_prior_term(tok), kl.mean())       # exact: term IS the mean
+    # Post lambda_h_mode rollout: _hyper_prior_term is the WEIGHTED block mean_i[lambda_h_i KL + R_h];
+    # for the default 'constant' mode that is cfg.lambda_h * mean KL (was the raw mean before).
+    assert torch.allclose(m._hyper_prior_term(tok), m.cfg.lambda_h * kl.mean(), atol=1e-7)
 
 
 # ---- (5) gamma_attention_maps shape + gating ------------------------------------------------------
