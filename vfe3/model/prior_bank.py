@@ -233,8 +233,18 @@ class PriorBank(nn.Module):
         specialization of the manuscript meta-agent barycenter). Computed over the FULL vocab s tables
         (the population centroid, batch-independent), under no_grad: in r_update_mode='barycenter' r is
         NOT an optimizer leaf (requires_grad=False), so it carries no gradient and is set here once per
-        M-step (driven from train_step). The exact M-step optimum of the isolated lambda_h*KL(s||r)
-        block in the scored s_e_step=False regime; a consistent population target under s_e_step=True.
+        M-step (driven from train_step).
+
+        POPULATION (audit 2026-06-13): this is the exact argmin of the UNIFORM-over-vocab objective
+        ``sum_v KL(s_v||r)`` -- one equal-weight row per vocab type. The scored hyper-prior term
+        (``_hyper_prior_term``) reduces with mean() over (B,N) token OCCURRENCES, i.e. the
+        frequency-weighted ``sum_v f_v KL(s_v||r)``; the uniform centroid equals that argmin only for a
+        uniform token distribution, so for a Zipfian vocab the two differ. Treat this as the
+        empirical-Bayes prior-over-TYPES centroid, NOT the argmin of the frequency-weighted scored loss.
+        It is also the UNCLAMPED moment-match, whereas the scored KL runs through kl_max (so the two
+        targets diverge for far-drifted rows). Under s_e_step=True r additionally couples to the CE
+        through _refine_s, so it is only a consistent population target there -- prefer
+        r_update_mode='gradient' for the scored s_e_step=False exactness and the s_e_step coupled regime.
         """
         s_mu = self.s_mu_embed                                                   # (V, K)
         s_sigma = torch.exp(self.s_sigma_log_embed).clamp(min=self.eps)          # (V, K)
