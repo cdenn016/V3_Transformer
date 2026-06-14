@@ -186,6 +186,19 @@ of the self-divergence, or a per-coordinate variant. For the diagonal Gaussian t
 kernel is the familiar `0.5 [ sum_k (sigma_q/sigma_p + (mu_q - mu_p)^2/sigma_p) - K + sum_k
 log(sigma_p/sigma_q) ]`.
 
+The belief family is likewise a registry. Beyond the diagonal and full-covariance
+Gaussians, the first genuinely non-Gaussian family is a factorized (diagonal) Laplace
+(`laplace_diagonal`) — exponential L1 tails rather than the Gaussian's L2, with a
+non-differentiable cusp at the mode. Because a varying-location Laplace is not a natural
+exponential family (its sufficient statistic `|x - mu|` depends on the parameter), it
+supplies a closed-form Renyi/KL divergence directly rather than going through the generic
+log-partition path; and because a rotated diagonal Laplace is not a diagonal Laplace, its
+gauge transport is distributionally exact only under a permutation/sign gauge element and
+becomes a marginal-scale projection under a general rotation — the same projection the
+diagonal Gaussian already incurs in the live pipeline, plus a shape-level break. It is the
+first family to exercise the closed-form-override seam (rather than the generic Bregman
+path), so adding a non-Gaussian belief is genuinely write-and-register.
+
 ## Gauge theory
 
 The geometric content lives in the gauge group acting on beliefs. A `GaugeGroup` bundles
@@ -203,7 +216,9 @@ registry also provides full `glk` (a single `GL(K)` block), `tied_block_glk` (on
 equivariant), `so_k` (the orthogonal group, with the skew-symmetric fast path), and `sp`
 (the real symplectic group `Sp(2m, R)` in even dimension). Transport between two tokens is
 the flat phi-cocycle, and its triangle holonomy `Omega_ij Omega_jk Omega_ki` is the
-identity for the flat connection, which the diagnostics use as a flatness certificate.
+identity for the flat connection, which the diagnostics use as a flatness certificate —
+reported both as the Frobenius deviation `||H - I||_F` and as the gauge-invariant Wilson
+observable `Re Tr(H)/K` with a per-head trace decomposition.
 
 ## Modularity and the pure-path discipline
 
@@ -227,10 +242,12 @@ network and each byte-identical to the pure path at initialization, are: a linea
 projection that replaces the KL decode (`use_prior_bank=False`, the VFE_2.0-parity
 ablation); a learned Schur-commutant head mixer (`use_head_mixer=True`); a learned bilinear
 edge connection for non-flat Regime-II transport (`transport_mode='regime_ii'`); a learned
-scalar self-coupling (`lambda_alpha_mode='learnable'`); and a learned belief-coupling weight
-(`learnable_lambda_beta=True`). The Regime-II connection and the head mixer break strict
-gauge equivariance away from their zero/identity initialization, which is documented and
-user-accepted.
+scalar self-coupling (`lambda_alpha_mode='learnable'`); a learned belief-coupling weight
+(`learnable_lambda_beta=True`); and a learned per-bucket T5 relative-position attention bias
+(`t5_learnable_bias=True`). The Regime-II connection and the head mixer break strict gauge
+equivariance away from their zero/identity initialization, which is documented and
+user-accepted; the T5 bias, a scalar function of position offset that touches no gauge
+transport, does not, which makes it the cleanest of the exceptions.
 
 The hierarchical channel of the manuscript — a hyper-prior `h -> s -> p -> q` with a
 model-channel belief `s` and a global centroid `r` — is only partially realized. The

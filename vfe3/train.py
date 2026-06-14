@@ -141,6 +141,13 @@ def build_optimizer(
         groups.append({"params": [model.log_lambda_beta], "lr": cfg.m_phi_lr, "role": "phi"})  # a coupling/gauge-scale LR
     if getattr(model, "log_lambda_h", None) is not None:        # lambda_h_mode='learnable' scalar hyper-prior weight
         groups.append({"params": [model.log_lambda_h], "lr": cfg.m_p_mu_lr, "role": "mu"})  # a precision-coupling scale (like log_alpha)
+    if getattr(model, "t5_bias", None) is not None:             # t5_learnable_bias=True relative-position bias
+        # weight_decay=0: the per-bucket T5 bias b_{i-j} is a relative-position PRIOR shaping the
+        # attention pi, not capacity; L2-decaying it toward zero biases the prior toward a flat/uniform
+        # relative-position distribution (the same exemption output_proj_bias / r / the gauge frame
+        # carry). role='mu' is the catch-all for learned non-variance/non-gauge tables (log_alpha,
+        # head_mixer, ...); the bias is not a gauge frame, so it steps under the mean LR, not m_phi_lr.
+        groups.append({"params": [model.t5_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
 
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
     # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the
