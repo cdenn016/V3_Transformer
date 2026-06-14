@@ -14,12 +14,12 @@ def test_optimizer_groups_priors_by_m_lr():
     # use_prior_bank=True: the prior-bank decode has no output_proj_weight group, so the four prior
     # tables map to exactly four LR groups (the linear-decode default adds an output_proj group).
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
-                     m_mu_lr=0.01, m_sigma_lr=0.002, m_phi_lr=0.005, use_prior_bank=True)
+                     m_p_mu_lr=0.01, m_p_sigma_lr=0.002, m_phi_lr=0.005, use_prior_bank=True)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     lrs = sorted(g["lr"] for g in opt.param_groups)
-    # m_sigma_lr=0.002, then TWO groups at m_phi_lr=0.005 (phi_embed + the default pos_phi='learned'
-    # pos_phi_free table, grouped at m_phi_lr in train.py), then m_mu_lr=0.01.
+    # m_p_sigma_lr=0.002, then TWO groups at m_phi_lr=0.005 (phi_embed + the default pos_phi='learned'
+    # pos_phi_free table, grouped at m_phi_lr in train.py), then m_p_mu_lr=0.01.
     assert lrs == [0.002, 0.005, 0.005, 0.01]
     # every PriorBank parameter is covered by exactly one group
     n_params = sum(len(g["params"]) for g in opt.param_groups)
@@ -27,11 +27,11 @@ def test_optimizer_groups_priors_by_m_lr():
 
 
 def test_optimizer_groups_regime_ii_connection_and_learnable_alpha():
-    # connection_W (transport_mode='regime_ii') and log_alpha (alpha_mode='learnable') are
+    # connection_W (transport_mode='regime_ii') and log_alpha (lambda_alpha_mode='learnable') are
     # trainable model-level nn.Parameters; build_optimizer must group them so they actually train
     # and so its exact-coverage guard does not raise. A >=2-head block group lets regime_ii build.
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
-                     transport_mode="regime_ii", alpha_mode="learnable")
+                     transport_mode="regime_ii", lambda_alpha_mode="learnable")
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)                           # must not raise (coverage guard)
     grouped = {id(p) for g in opt.param_groups for p in g["params"]}
@@ -85,7 +85,7 @@ def test_fractional_floor_scales_each_group_to_min_lr_frac_times_base():
     # absolute min_lr, which floors every group at the same value regardless of base).
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
                      warmup_steps=2, max_steps=10, min_lr=0.0, min_lr_frac=0.01,
-                     m_mu_lr=0.02, m_sigma_lr=0.004, m_phi_lr=0.01)
+                     m_p_mu_lr=0.02, m_p_sigma_lr=0.004, m_phi_lr=0.01)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     base_lrs = [g["lr"] for g in opt.param_groups]
@@ -101,7 +101,7 @@ def test_floor_is_max_of_absolute_min_lr_and_fractional():
     # min_lr=1e-3, min_lr_frac=0.01: mu(base 0.2)->frac 2e-3 wins; sigma(base 0.05)->abs 1e-3 wins.
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
                      warmup_steps=2, max_steps=10, min_lr=1e-3, min_lr_frac=0.01,
-                     m_mu_lr=0.2, m_sigma_lr=0.05, m_phi_lr=0.2)
+                     m_p_mu_lr=0.2, m_p_sigma_lr=0.05, m_phi_lr=0.2)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     base_lrs = [g["lr"] for g in opt.param_groups]
@@ -174,8 +174,8 @@ def _structured_cfg() -> VFE3Config:
     # below therefore gates exactly that sub-marginal (phi) improvement: a future config edit
     # that detunes phi drops CE back to the ln(3) pin and fails the anchor loudly.
     return VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                      n_e_steps=3, e_mu_lr=0.3, e_phi_lr=0.3,
-                      m_mu_lr=0.05, m_sigma_lr=0.01, m_phi_lr=0.05, warmup_steps=5, max_steps=200)
+                      n_e_steps=3, e_q_mu_lr=0.3, e_phi_lr=0.3,
+                      m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.05, warmup_steps=5, max_steps=200)
 
 
 def _median(xs):
@@ -247,8 +247,8 @@ def test_training_smoke_on_real_wikitext2_if_present():
         pytest.skip("wikitext-2 cache absent")
     torch.manual_seed(0)
     cfg = VFE3Config(vocab_size=50257, embed_dim=8, n_heads=2, max_seq_len=16, n_layers=1,
-                     n_e_steps=1, e_mu_lr=0.3, e_phi_lr=0.0,
-                     m_mu_lr=0.05, m_sigma_lr=0.01, m_phi_lr=0.0, warmup_steps=3, max_steps=30)
+                     n_e_steps=1, e_q_mu_lr=0.3, e_phi_lr=0.0,
+                     m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.0, warmup_steps=3, max_steps=30)
     model = VFEModel(cfg)
     ds = TokenWindows(toks[:4000], 16)
     loader = DataLoader(ds, batch_size=8, shuffle=True, drop_last=True)

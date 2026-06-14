@@ -1,4 +1,4 @@
-r"""Model-coupling channel, second increment: gamma_coupling * mean_i F_red^s_i.
+r"""Model-coupling channel, second increment: lambda_gamma * mean_i F_red^s_i.
 
 Manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy (lines 1241-1249): the
 canonical two-tier free energy carries a model-coupling block
@@ -54,7 +54,7 @@ from vfe3.model.model import VFEModel
 
 
 def _make_model(
-    gamma_coupling: float = 0.0,
+    lambda_gamma:   float = 0.0,
     lambda_h:       float = 0.0,
     *,
     seed:                  int   = 0,
@@ -63,9 +63,9 @@ def _make_model(
 ) -> VFEModel:
     cfg = VFE3Config(
         vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-        n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+        n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
         mstep_self_coupling_weight=0.0,
-        lambda_h=lambda_h, gamma_coupling=gamma_coupling,
+        lambda_h=lambda_h, lambda_gamma=lambda_gamma,
         kappa_gamma=kappa_gamma, gamma_attention_prior=gamma_attention_prior, seed=seed,
         pos_phi="none",   # the _gamma_term oracle assumes out.phi == encode().phi (e_phi_lr=0), which
                           # pos_phi COMPOSITION breaks (pos_phi folds into the frame before transport),
@@ -89,7 +89,7 @@ def _gamma_term(model: VFEModel, tokens: torch.Tensor) -> torch.Tensor:
     s_sigma_t = transport_covariance(omega, s_sigma)                     # (B, N, N, K) diagonal sandwich
     e_s = pairwise_energy(
         DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(s_mu_t, s_sigma_t),
-        alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+        alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
         divergence_family=cfg.divergence_family, irrep_dims=model.group.irrep_dims,
     )                                                                    # (B, H, N, N)
     n = tokens.shape[1]
@@ -115,13 +115,13 @@ def test_default_off_no_tables_and_loss_is_ce():
 # ---- (2) the s-table gate splits from the r-table (hyper-prior) gate -------------------------
 
 def test_gamma_creates_s_tables_but_not_r_tables():
-    model = _make_model(gamma_coupling=0.5, lambda_h=0.0)
+    model = _make_model(lambda_gamma=0.5, lambda_h=0.0)
     assert hasattr(model.prior_bank, "s_mu_embed")          # model channel s tables exist for gamma
     assert hasattr(model.prior_bank, "s_sigma_log_embed")
     assert not hasattr(model.prior_bank, "r_mu")            # r is hyper-prior-only (lambda_h>0)
 
 
-# ---- (3) GOLD oracle: linear in gamma_coupling, against an independent recomputation ----------
+# ---- (3) GOLD oracle: linear in lambda_gamma, against an independent recomputation ----------
 
 def test_gamma_linear_against_independent_recomputation():
     w = 0.5
@@ -192,7 +192,7 @@ def test_gamma_envelope_identity():
     e_s = pairwise_energy(
         DiagonalGaussian(s_mu, s_sigma),
         DiagonalGaussian(transport_mean(omega, s_mu), transport_covariance(omega, s_sigma)),
-        alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+        alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
         divergence_family=cfg.divergence_family, irrep_dims=model.group.irrep_dims,
     )                                                                    # (B, H, N, N)
     n = tokens.shape[1]
@@ -229,10 +229,10 @@ def test_tau_gamma_property():
 
 def test_config_negative_gamma_coupling_raises():
     try:
-        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, gamma_coupling=-0.1)
+        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, lambda_gamma=-0.1)
     except ValueError:
         return
-    raise AssertionError("expected ValueError for gamma_coupling < 0")
+    raise AssertionError("expected ValueError for lambda_gamma < 0")
 
 def test_config_nonpositive_kappa_gamma_raises():
     try:
@@ -260,8 +260,8 @@ def test_gamma_energy_equals_analytic_kl_at_nonzero_phi():
     # KL formula explicitly -- independent of transport_mean/transport_covariance and of the renyi
     # kernel -- so a wrong orientation (Omega^T or Omega_ji) or a wrong divergence direction fails.
     cfg = VFE3Config(vocab_size=20, embed_dim=2, n_heads=1, gauge_group="glk", max_seq_len=4,
-                     n_layers=1, n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, gamma_coupling=0.5, seed=0)
-    assert cfg.alpha_div == 1.0                              # the analytic is the KL (alpha=1) limit
+                     n_layers=1, n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, lambda_gamma=0.5, seed=0)
+    assert cfg.renyi_order == 1.0                            # the analytic is the KL (alpha=1) limit
     torch.manual_seed(0)
     model = VFEModel(cfg)
     pb = model.prior_bank
@@ -276,7 +276,7 @@ def test_gamma_energy_equals_analytic_kl_at_nonzero_phi():
     e_s = pairwise_energy(
         DiagonalGaussian(s_mu, s_sigma),
         DiagonalGaussian(transport_mean(omega, s_mu), transport_covariance(omega, s_sigma)),
-        alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+        alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
         divergence_family=cfg.divergence_family, irrep_dims=model.group.irrep_dims,
     )                                                        # (1, N, N) single-block
     o01 = omega[0, 0, 1]                                     # (K, K) the (i=0, j=1) operator
@@ -305,11 +305,11 @@ def test_gamma_tau_is_group_aware_for_single_block_group():
     K = 4                                                    # embed_dim; glk single block of size K
     base = dict(
         vocab_size=20, embed_dim=K, n_heads=2, gauge_group="glk", max_seq_len=5, n_layers=1,
-        n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0, mstep_self_coupling_weight=0.0,
+        n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0, mstep_self_coupling_weight=0.0,
         lambda_h=0.0, kappa_gamma=1.0, gamma_attention_prior="causal", pos_phi="none", seed=0,
     )
-    torch.manual_seed(0); model_0 = VFEModel(VFE3Config(gamma_coupling=0.0, **base))
-    torch.manual_seed(0); model_w = VFEModel(VFE3Config(gamma_coupling=w,   **base))
+    torch.manual_seed(0); model_0 = VFEModel(VFE3Config(lambda_gamma=0.0, **base))
+    torch.manual_seed(0); model_w = VFEModel(VFE3Config(lambda_gamma=w,   **base))
     assert model_w.group.irrep_dims == [K]                  # single block: d_energy = K, d_head = K // 2
     # belief tables byte-identical (s tables drawn LAST), then make s clearly distinct -> non-vacuous term
     assert torch.equal(model_0.prior_bank.mu_embed, model_w.prior_bank.mu_embed)
@@ -330,7 +330,7 @@ def test_gamma_tau_is_group_aware_for_single_block_group():
     e_s = pairwise_energy(
         DiagonalGaussian(s_mu, s_sigma),
         DiagonalGaussian(transport_mean(omega, s_mu), transport_covariance(omega, s_sigma)),
-        alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+        alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
         divergence_family=cfg.divergence_family, irrep_dims=model_w.group.irrep_dims,
     )
     n = tokens.shape[1]

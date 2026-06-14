@@ -559,7 +559,7 @@ def test_model_forward_under_squared_hellinger():
     from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=2,
-                     n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      divergence_family="squared_hellinger")
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))
@@ -639,7 +639,7 @@ def test_model_forward_under_new_divergence(name):
     from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=2,
-                     n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0, divergence_family=name)
+                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, divergence_family=name)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))
     targets = torch.randint(0, 20, (3, 5))

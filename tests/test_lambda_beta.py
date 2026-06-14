@@ -145,7 +145,7 @@ def test_config_rejects_negative_lambda_beta():
 
 def _cfg(**over):
     base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                n_e_steps=4, e_mu_lr=0.3, e_sigma_lr=0.1, e_phi_lr=0.0)
+                n_e_steps=4, e_q_mu_lr=0.3, e_q_sigma_lr=0.1, e_phi_lr=0.0)
     base.update(over)
     return VFE3Config(**base)
 

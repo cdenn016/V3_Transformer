@@ -94,7 +94,7 @@ class VFEModel(nn.Module):
         # (audit 2026-06-09 P1). Reject at construction. Single-block groups may run alibi with
         # n_heads=1 (the (1, N, N) prior is squeezed to the (N, N) convention in
         # _attention_log_prior below).
-        for _pname in ("attention_prior", "gamma_attention_prior"):
+        for _pname in ("beta_attention_prior", "gamma_attention_prior"):
             if (getattr(cfg, _pname) in ("alibi", "causal_alibi")
                     and cfg.n_heads != len(self.group.irrep_dims)):
                 raise ValueError(
@@ -113,7 +113,7 @@ class VFEModel(nn.Module):
             use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
-            lambda_h=cfg.lambda_h, gamma_coupling=cfg.gamma_coupling,
+            lambda_h=cfg.lambda_h, lambda_gamma=cfg.lambda_gamma,
             prior_source=cfg.prior_source, s_e_step=cfg.s_e_step,
             # r is a GRADIENT leaf only under r_update_mode='gradient'; under 'barycenter' it is
             # set in-place each M-step by the closed-form barycenter (PriorBank.barycenter_r_,
@@ -168,10 +168,10 @@ class VFEModel(nn.Module):
                 stacklevel=2,
             )
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED scalar self-coupling alpha.
-        # When alpha_mode='learnable', create log_alpha as a trainable nn.Parameter; the consumed
+        # When lambda_alpha_mode='learnable', create log_alpha as a trainable nn.Parameter; the consumed
         # coupling is alpha = exp(log_alpha) (always positive). Init 0 -> alpha = exp(0) = 1.0, so a
         # learnable model is byte-identical to the constant alpha=1.0 pure path at step 0. For every
-        # other (pure no-NN) alpha_mode the parameter is NOT created at all (no log_alpha attribute),
+        # other (pure no-NN) lambda_alpha_mode the parameter is NOT created at all (no log_alpha attribute),
         # so the default path is param-free.
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): the LEARNED bilinear edge connection
         # W for Regime-II (non-flat) transport. When transport_mode='regime_ii', create connection_W
@@ -197,7 +197,7 @@ class VFEModel(nn.Module):
                     "stays flat. Set detach_e_step=False to train the Regime-II connection.",
                     stacklevel=2,
                 )
-        if cfg.alpha_mode == "learnable":
+        if cfg.lambda_alpha_mode == "learnable":
             self.log_alpha = nn.Parameter(torch.zeros(()))
             if cfg.detach_e_step:
                 # Footgun (mirrors the use_prior_bank+detach warning below): log_alpha enters the
@@ -206,7 +206,7 @@ class VFEModel(nn.Module):
                 # (alpha = 1.0). Set detach_e_step=False to train the learned alpha.
                 import warnings
                 warnings.warn(
-                    "alpha_mode='learnable' with detach_e_step=True freezes log_alpha: the learned "
+                    "lambda_alpha_mode='learnable' with detach_e_step=True freezes log_alpha: the learned "
                     "self-coupling alpha enters the loss only through the E-step, which the detached "
                     "(no_grad) E-step severs, so log_alpha.grad is None and alpha stays at its init "
                     "1.0. Set detach_e_step=False to train the learnable alpha.",
@@ -233,7 +233,7 @@ class VFEModel(nn.Module):
                     stacklevel=2,
                 )
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED hyper-prior weight lambda_h
-        # (the model-fiber analogue of alpha_mode='learnable'). When lambda_h_mode='learnable', create
+        # (the model-fiber analogue of lambda_alpha_mode='learnable'). When lambda_h_mode='learnable', create
         # log_lambda_h as a scalar nn.Parameter; the consumed weight is lambda_h = exp(log_lambda_h)
         # (always positive). Init log(cfg.lambda_h) -> lambda_h = cfg.lambda_h, byte-identical to the
         # constant lambda_h at step 0 (unlike log_alpha/log_lambda_beta, whose constant default is 1.0
@@ -335,14 +335,14 @@ class VFEModel(nn.Module):
         device: torch.device,
 
         *,
-        prior:  Optional[str] = None,         # prior-registry name; None -> cfg.attention_prior (belief block)
+        prior:  Optional[str] = None,         # prior-registry name; None -> cfg.beta_attention_prior (belief block)
     ) -> torch.Tensor:
         r"""Loop-invariant attention log-prior, cached on (name, N, device, dtype) (audit 4e).
 
         The dtype is taken from the prior-bank mean table so the mask matches the belief
         dtype after a ``.to(torch.float64)`` move (audit 2f: the old call omitted dtype). ``prior``
         lets the gamma model-coupling block reuse the same cache under its own attention prior."""
-        name = prior if prior is not None else self.cfg.attention_prior
+        name = prior if prior is not None else self.cfg.beta_attention_prior
         dtype = self.prior_bank.mu_embed.dtype
         # The key carries every cfg field a builder consumes (n_heads, alibi_slope, window, T5
         # bucketing) so a post-construction cfg mutation cannot serve a stale prior (audit PP4/P9).
@@ -461,10 +461,10 @@ class VFEModel(nn.Module):
         out = e_step(
             BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0), r_mu, r_sigma, grp,
             n_iter=cfg.n_e_steps,         tau=gamma_tau,
-            e_mu_lr=cfg.e_s_mu_lr,        e_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
+            e_q_mu_lr=cfg.e_s_mu_lr,      e_q_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
             # The s-channel self-coupling weight IS lambda_h (the hyper-prior precision): route it
             # through the lambda_h_mode registry, not a hardcoded constant. e_step's self_coupling_alpha
-            # consumes (value, alpha_mode, b0, c0, log_alpha) exactly as lambda_h_i.hyper_prior_lambda_h
+            # consumes (value, lambda_alpha_mode, b0, c0, log_alpha) exactly as lambda_h_i.hyper_prior_lambda_h
             # does. ENVELOPE CANCELLATION (audit 2026-06-13): under state_dependent the s E-step gets the
             # correct lam*(KL)*dKL gradient by the envelope theorem -- on the LIVE kernel route the
             # belief-gradient kernel multiplies dKL by the envelope COEFFICIENT alpha*=c0_h/(b0_h+KL) and
@@ -474,9 +474,9 @@ class VFEModel(nn.Module):
             # precision shape (NOT alpha's b0/c0). NOTE: under state_dependent, value=cfg.lambda_h is
             # IGNORED (alpha_state_dependent reads only b0_h/c0_h); the coupling magnitude is c0_h/(b0_h+KL),
             # and cfg.lambda_h then acts ONLY as the channel-on gate -- it does not scale the s coupling.
-            alpha_div=cfg.alpha_div,       value=cfg.lambda_h,          alpha_mode=cfg.lambda_h_mode,
+            renyi_order=cfg.renyi_order,   value=cfg.lambda_h,          lambda_alpha_mode=cfg.lambda_h_mode,
             b0=cfg.b0_h, c0=cfg.c0_h, log_alpha=getattr(self, "log_lambda_h", None),
-            lambda_beta=cfg.gamma_coupling,
+            lambda_beta=cfg.lambda_gamma,
             kl_max=cfg.kl_max,             eps=cfg.eps,
             sigma_max=cfg.sigma_max,       e_sigma_q_trust=cfg.e_sigma_q_trust,
             e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
@@ -522,7 +522,7 @@ class VFEModel(nn.Module):
         # belief and the shared, sequence-independent log_prior), so the batched result equals the
         # per-sample result (pinned by tests/test_perf_equivalence.py::test_batched_forward_equals_per_sample).
         # log_alpha: the learned scalar self-coupling parameter (alpha = exp(log_alpha)) when
-        # alpha_mode='learnable', else None (the param-free pure path). Threaded through the
+        # lambda_alpha_mode='learnable', else None (the param-free pure path). Threaded through the
         # E-step so the loss backpropagates to log_alpha. getattr keeps the default path's call
         # identical: None forwards a defaulted-None keyword that every alpha form ignores.
         log_alpha = getattr(self, "log_alpha", None)
@@ -655,7 +655,7 @@ class VFEModel(nn.Module):
             # handoff T(q*) it accidentally read before (audit 2026-06-09 overnight F19,
             # challenge-upheld; restores the documented intent and E-step/M-step consistency).
             # alpha_i is the SAME registered self-coupling form as the E-step / diagnostics
-            # (self_coupling_alpha keyed off cfg.alpha_mode), so under state_dependent_per_coord the
+            # (self_coupling_alpha keyed off cfg.lambda_alpha_mode), so under state_dependent_per_coord the
             # term carries the per-token, per-coordinate alpha_i^(k)* = c0/(b0+D^(k)) rather than a
             # flat scalar; cfg.mstep_self_coupling_weight (= alpha_hat) is the overall scale. alpha_i
             # is DETACHED: by the alpha-envelope (alpha* is the stationary point of alpha*D + R(alpha),
@@ -681,15 +681,15 @@ class VFEModel(nn.Module):
             q_conv = cap["converged"]                           # q*: pre-transform converged belief
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
                 fam(q_conv.mu, q_conv.sigma), fam(mu_p, sigma_p),
-                alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
-                divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
+                alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
             )
             alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
-                self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
+                self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
                 log_alpha=getattr(self, "log_alpha", None),
             )
             coupling = alpha_sc.detach() * self_div            # alpha_i^(k)* D^(k) (envelope: alpha* fixed)
-            if alpha_is_per_coord(cfg.alpha_mode):
+            if alpha_is_per_coord(cfg.lambda_alpha_mode):
                 coupling = coupling.sum(dim=-1)                # sum_k alpha^(k) D^(k) -> per-token
             sc = coupling.mean()                               # mean over batch and tokens (B, N)
             loss = loss + cfg.mstep_self_coupling_weight * sc
@@ -703,7 +703,7 @@ class VFEModel(nn.Module):
         # double-count -- the assembled scalar loss is then deliberately NOT literally
         # F + lambda_h KL(s||r) + gamma-block (consistent EM, not an omission). When scored
         # (s_e_step=False) the s-channel blocks reduce with mean() (per-position) while the belief
-        # channel sums (free_energy.py); lambda_h / gamma_coupling are calibrated against that
+        # channel sums (free_energy.py); lambda_h / lambda_gamma are calibrated against that
         # per-position scale, a fixed 1/(B*N) relative to the sum-reduced belief block.
         if self.cfg.lambda_h > 0.0 and not self.cfg.s_e_step:
             # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
@@ -717,9 +717,9 @@ class VFEModel(nn.Module):
             # state_dependent: the envelope lambda_h*_i=c0_h/(b0_h+KL) + R_h; learnable: exp(log_lambda_h)),
             # so the term is added directly with NO external lambda_h factor (byte-identical for constant).
             loss = loss + self._hyper_prior_term(token_ids)
-        if self.cfg.gamma_coupling > 0.0 and not self.cfg.s_e_step:
+        if self.cfg.lambda_gamma > 0.0 and not self.cfg.s_e_step:
             # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
-            # lines 1241-1249): L += gamma_coupling * mean_i F_red^s_i, the reduced (envelope) form of
+            # lines 1241-1249): L += lambda_gamma * mean_i F_red^s_i, the reduced (envelope) form of
             # the model-coupling block sum_ij [ gamma_ij KL(s_i||Omega_tilde_ij s_j) + tau_g gamma_ij
             # log(gamma_ij/pi^s_ij) ], with optimal gamma_ij = softmax_j(log pi^s - E^s/tau_g) and, at
             # the optimum, the block = -tau_g log Z^s_i. The s-channel is the SAME softmax-over-KL
@@ -735,18 +735,18 @@ class VFEModel(nn.Module):
             # the canonical E-step F; restoring it (or keeping it severed) is part of the deferred s->q
             # design, NOT this term. Computed once per forward at the loss level (like diagnostics()).
             # The body lives in _gamma_coupling_term so diagnostics logs the SAME term (audit V2).
-            loss = loss + self.cfg.gamma_coupling * self._gamma_coupling_term(
+            loss = loss + self.cfg.lambda_gamma * self._gamma_coupling_term(
                 token_ids, out.phi.detach())
         return logits, loss, ce.detach()
 
     @property
     def _model_channel_active(self) -> bool:
         r"""Whether the model channel (the s tables) exists: any of ``lambda_h>0``,
-        ``gamma_coupling>0``, ``prior_source=='model_channel'``, or ``s_e_step``. Matches
+        ``lambda_gamma>0``, ``prior_source=='model_channel'``, or ``s_e_step``. Matches
         :class:`PriorBank`'s s-table creation gate, so the s/r/h/gamma diagnostics and figures
         gate on the SAME condition the tables are built under."""
         cfg = self.cfg
-        return (cfg.lambda_h > 0.0 or cfg.gamma_coupling > 0.0
+        return (cfg.lambda_h > 0.0 or cfg.lambda_gamma > 0.0
                 or cfg.prior_source == "model_channel" or cfg.s_e_step)
 
     def _hyper_prior_kl(
@@ -770,7 +770,7 @@ class VFEModel(nn.Module):
         r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps)       # (K,)
         return self_divergence(
             DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),
-            alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+            alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family,
         )                                                            # (B, N)
 
@@ -842,7 +842,7 @@ class VFEModel(nn.Module):
         s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
         e_s = pairwise_energy(
             DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(s_mu_t, s_sigma_t),
-            alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+            alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
         )                                                            # (B,H,N,N) block_glk; (B,N,N) single-block
         gamma_log_prior = self._attention_log_prior(
@@ -850,7 +850,7 @@ class VFEModel(nn.Module):
         )                                                            # (N, N), cached buffer
         # Group-aware temperature: tau spans the dimension the energy accumulates over (the
         # gauge-irrep block size), exactly as the belief beta channel does. kappa_gamma is
-        # gamma's own sharpness handle (not cfg.kappa).
+        # gamma's own sharpness handle (not cfg.kappa_beta).
         gamma_tau = attention_tau(_as_coeff(cfg.kappa_gamma, e_s.device), self.group.irrep_dims)
         return e_s, gamma_tau, gamma_log_prior
 
@@ -1023,8 +1023,8 @@ class VFEModel(nn.Module):
         alpha_i) at the converged belief returned by :func:`vfe_stack`, then feeds
         them to :mod:`vfe3.metrics`. Every knob matches what the forward pass passed
         to the E-step (``cfg.tau``, ``cfg.family``, ``cfg.divergence_family``,
-        ``cfg.alpha_div``, ``cfg.kl_max``, ``cfg.eps``,
-        ``cfg.alpha_mode``/``value``/``b0``/``c0``, ``group.irrep_dims``, the cached
+        ``cfg.renyi_order``, ``cfg.kl_max``, ``cfg.eps``,
+        ``cfg.lambda_alpha_mode``/``value``/``b0``/``c0``, ``group.irrep_dims``, the cached
         attention log-prior), so the diagnostic beta is the attention pattern at the
         fixed point, not a re-derivation.
 
@@ -1097,33 +1097,33 @@ class VFEModel(nn.Module):
         fam = get_family(cfg.family)
         energy = pairwise_energy(                                    # (N, N) or (H, N, N)
             fam(out.mu, out.sigma), fam(mu_t, sigma_t),
-            alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+            alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family,
             irrep_dims=self.group.irrep_dims,
         )
-        beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), self.group.irrep_dims), log_prior=log_prior)
+        beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), self.group.irrep_dims), log_prior=log_prior)
         _q_conv = cap["converged"]                                   # q*: the F self-term reads the
         self_div = self_divergence_for_alpha(                        # pre-transform converged belief
             fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p),      # (matches the M-step term; F19)
-            alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
-            divergence_family=cfg.divergence_family, alpha_mode=cfg.alpha_mode,
+            alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+            divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
         )
         alpha, alpha_reg = self_coupling_alpha(
-            self_div, mode=cfg.alpha_mode, value=cfg.alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
+            self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
             log_alpha=getattr(self, "log_alpha", None),     # learned scalar (None on the pure path)
         )
 
         d = {"attn_entropy": float(metrics.attention_entropy(beta))}
         _lb = cfg.lambda_beta if _llb is None else float(_llb.detach().exp())   # scaled-F total reflects lambda_beta
         terms = metrics.free_energy_terms(self_div, energy, beta, alpha,
-                                          tau=attention_tau(_as_coeff(cfg.kappa, out.mu.device), self.group.irrep_dims),
+                                          tau=attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), self.group.irrep_dims),
                                           lambda_beta=_lb, log_prior=log_prior,
                                           include_attention_entropy=cfg.include_attention_entropy,
-                                          alpha_reg=(alpha_reg if cfg.alpha_mode != "constant" else None))
+                                          alpha_reg=(alpha_reg if cfg.lambda_alpha_mode != "constant" else None))
         d.update({k: float(v) for k, v in terms.items()})
         # Raw (un-regularized) belief->prior drift sum_i D(q_i||p_i): the divergence WITHOUT the
         # alpha_i coefficient OR the R(alpha_i) regularizer that free_energy_terms folds into
-        # self_coupling. Under alpha_mode='constant' (alpha=1, R=0) the two coincide; under the
+        # self_coupling. Under lambda_alpha_mode='constant' (alpha=1, R=0) the two coincide; under the
         # state-dependent envelope self_coupling is pinned near the K*c0 regularizer floor (alpha_i*
         # D + R = c0[1 + log((b0+D)/c0)] per coord), so this raw term is the informative drift signal.
         d["self_divergence"] = float(self_div.sum())            # sum over tokens (and coords if per-coord)
@@ -1142,11 +1142,11 @@ class VFEModel(nn.Module):
             _hp_weighted = float(self._hyper_prior_weighted(token_ids[:1]).sum())         # WEIGHTED (lambda_h_mode); == cfg.lambda_h*hyper_prior for 'constant'
             d["hyper_prior_weighted"] = _hp_weighted                                      # EXACT contribution folded into total (state_dependent/learnable != cfg.lambda_h*raw); the F-decomposition figure reads this
             d["total"] += _hp_weighted
-        if cfg.gamma_coupling > 0.0 or cfg.s_e_step:                # gamma block evaluated at out.phi
+        if cfg.lambda_gamma > 0.0 or cfg.s_e_step:                  # gamma block evaluated at out.phi
             g = self._gamma_coupling_terms(token_ids[:1], out.phi.unsqueeze(0))
             d["gamma_coupling"]     = float(g["coupling"])           # raw sum_{h,i,j} gamma E^s
             d["gamma_meta_entropy"] = float(g["meta_entropy"])       # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
-            d["total"] += cfg.gamma_coupling * (d["gamma_coupling"] + d["gamma_meta_entropy"])
+            d["total"] += cfg.lambda_gamma * (d["gamma_coupling"] + d["gamma_meta_entropy"])
         spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
         d["effective_rank"] = float(metrics.effective_rank(spec).mean())
         # Gauge-geometry probes (diagnostics tier): the curvature proxy -- mean Frobenius departure
@@ -1341,10 +1341,10 @@ class VFEModel(nn.Module):
                 sigma_t = transport_covariance(omega.unsqueeze(0), belief.sigma.unsqueeze(0))[0]
             energy = pairwise_energy(                                 # (N, N) or (H, N, N)
                 fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
-                alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+                alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
-            beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa, belief.mu.device), self.group.irrep_dims), log_prior=log_prior)
+            beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), self.group.irrep_dims), log_prior=log_prior)
             if beta.dim() == 2:                                      # single-block group -> add an H=1 axis
                 beta = beta.unsqueeze(0)
             maps.append(beta)                                        # (H, N, N)

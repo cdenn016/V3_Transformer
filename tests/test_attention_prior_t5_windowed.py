@@ -2,7 +2,7 @@ r"""T5 relative-position bias and windowed (local-attention) attention priors (P
 
 These extend the attention-prior registry beyond uniform/causal/alibi. Each is a pure builder
 returning a log-prior bias (Nq, Nk); they are config-selectable through the live _PRIORS
-registry (config.py validates attention_prior / gamma_attention_prior against tuple(sorted(_PRIORS))),
+registry (config.py validates beta_attention_prior / gamma_attention_prior against tuple(sorted(_PRIORS))),
 so no config-validator edit is needed. Variant params (window, T5 bucketing) use defaults when
 invoked through the model's call site, mirroring the existing alibi prior (whose slope is also
 default-only from the model); tuning them from config is the separate call-site-threading item.
@@ -25,7 +25,7 @@ def test_new_priors_are_registered_and_config_selectable():
     for name in ("windowed", "causal_windowed", "t5_relative_bias"):
         assert name in _PRIORS
         # config validation accepts the new prior names against the live registry
-        VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, attention_prior=name)
+        VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, beta_attention_prior=name)
 
 
 def test_windowed_is_a_symmetric_band():
@@ -91,7 +91,7 @@ def test_t5_relative_bias_uses_supplied_learnable_table():
 
 def _model_forward_finite(prior_name: str):
     cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, attention_prior=prior_name)
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, beta_attention_prior=prior_name)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (2, 8))

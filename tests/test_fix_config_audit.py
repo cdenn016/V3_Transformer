@@ -21,11 +21,11 @@ from vfe3.config import VFE3Config
 
 
 def test_learnable_alpha_warns_under_straight_through() -> None:
-    """A config-level E-step-only learnable param (alpha_mode='learnable') + straight_through
+    """A config-level E-step-only learnable param (lambda_alpha_mode='learnable') + straight_through
     warns that it freezes. (pos_phi='learned' is the default and is warned at the MODEL level,
     not here, so the default config stays silent at config construction.)"""
     with pytest.warns(UserWarning, match="frozen"):
-        VFE3Config(alpha_mode="learnable", e_step_gradient="straight_through")
+        VFE3Config(lambda_alpha_mode="learnable", e_step_gradient="straight_through")
 
 
 def test_amp_dtype_fp16_accepted_for_forward() -> None:
@@ -67,7 +67,7 @@ def test_default_config_constructs_silently() -> None:
     """The DEFAULT config constructs with no error and emits NO warning.
 
     This is the load-bearing negative test: the default (filtering / gaussian_diagonal /
-    renyi / alpha_div=1.0 / entropy=True) is exactly the closed-form kernel path, so neither
+    renyi / renyi_order=1.0 / entropy=True) is exactly the closed-form kernel path, so neither
     freeze-warning may fire even though pos_phi='learned' is on by default. Promoting every
     warning to an error makes any spurious warning a test failure.
     """

@@ -42,28 +42,28 @@ def build_optimizer(
     r"""AdamW with per-group M-step learning rates over the PriorBank prior tables.
 
     The three prior tables carry distinct natural scales, so each is given its own
-    M-step learning rate: the mean table ``mu_embed`` at ``m_mu_lr``; the (log) scale
+    M-step learning rate: the mean table ``mu_embed`` at ``m_p_mu_lr``; the (log) scale
     tables ``sigma_log_embed`` and the decode temperature ``decode_log_scale`` together
-    at ``m_sigma_lr``; the gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``. The
+    at ``m_p_sigma_lr``; the gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``. The
     weight decay ``cfg.weight_decay`` is shared.
 
     Optional parameters are grouped only when their toggle is on: the linear decode weight
-    ``output_proj_weight`` (use_prior_bank=False) at ``m_mu_lr`` (a mean-readout scale); the
-    head-mixer ``mixer_delta`` (use_head_mixer=True) at ``m_mu_lr``; the model-channel tables
-    ``s_mu_embed``/``s_sigma_log_embed`` (lambda_h>0, gamma_coupling>0, or
+    ``output_proj_weight`` (use_prior_bank=False) at ``m_p_mu_lr`` (a mean-readout scale); the
+    head-mixer ``mixer_delta`` (use_head_mixer=True) at ``m_p_mu_lr``; the model-channel tables
+    ``s_mu_embed``/``s_sigma_log_embed`` (lambda_h>0, lambda_gamma>0, or
     prior_source='model_channel') and the hyper-prior centroid ``r_mu``/``r_sigma_log``
-    (lambda_h>0), each split mean@``m_mu_lr`` / log-scale@``m_sigma_lr`` like the belief tables.
+    (lambda_h>0), each split mean@``m_p_mu_lr`` / log-scale@``m_p_sigma_lr`` like the belief tables.
     A final assertion pins that the groups cover ``model.parameters()`` EXACTLY -- a new
     parameter that is forgotten here would otherwise silently never receive a gradient.
     The hyper-prior centroid ``r_mu``/``r_sigma_log`` (lambda_h>0) is FROZEN by default
     (requires_grad=False, set in prior_bank.py) -- a fixed centroid per the manuscript's "higher, slower
     meta-level" (GL(K)_supplementary.tex:1081); the coverage guard exempts it, so it needs no group and is
     never updated (freely training an unanchored r alongside s would collapse KL(s||r)->0). Under
-    ``cfg.learnable_r=True`` it is un-frozen and grouped here (mean@``m_mu_lr``, log-scale@``m_sigma_lr``,
+    ``cfg.learnable_r=True`` it is un-frozen and grouped here (mean@``m_p_mu_lr``, log-scale@``m_p_sigma_lr``,
     like the s tables) so it trains as an empirical-Bayes centroid.
     The learned MODEL-level parameters are grouped likewise when their toggle is on: the Regime-II
     edge connection ``connection_W`` (transport_mode='regime_ii') at ``m_phi_lr`` (a gauge-connection
-    scale) and the learnable self-coupling ``log_alpha`` (alpha_mode='learnable') at ``m_mu_lr`` -- so
+    scale) and the learnable self-coupling ``log_alpha`` (lambda_alpha_mode='learnable') at ``m_p_mu_lr`` -- so
     those sanctioned-NN-exception toggles train rather than tripping the coverage guard.
     """
     pb = model.prior_bank
@@ -79,20 +79,20 @@ def build_optimizer(
         phi_group["gauge"] = True
         phi_group["weight_decay"] = 0.0
     groups = [
-        {"params": [pb.mu_embed],                              "lr": cfg.m_mu_lr},
-        {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_sigma_lr},
+        {"params": [pb.mu_embed],                              "lr": cfg.m_p_mu_lr},
+        {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_p_sigma_lr},
         phi_group,
     ]
     if pb.output_proj_weight is not None:                       # use_prior_bank=False linear decode
-        groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_mu_lr})
+        groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_p_mu_lr})
     if pb.output_proj_bias is not None:                         # decode_bias: learned log-unigram prior
         # weight_decay=0 -- decaying a unigram prior toward zero biases it to a flat distribution
         # (the same protection phi/Omega carry). VFE_2.0 parity: trainer.py m_decode_nodecay group.
-        groups.append({"params": [pb.output_proj_bias], "lr": cfg.m_mu_lr, "weight_decay": 0.0})
+        groups.append({"params": [pb.output_proj_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0})
     if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
-        groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_mu_lr})
+        groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_p_mu_lr})
     if getattr(model, "cg_coupling", None) is not None:         # use_cg_coupling=True CG path weights
-        groups.append({"params": [model.cg_coupling.path_weights], "lr": cfg.m_mu_lr})
+        groups.append({"params": [model.cg_coupling.path_weights], "lr": cfg.m_p_mu_lr})
     if getattr(model, "pos_phi_free", None) is not None:        # pos_phi='learned' positional table
         pos_group = {"params": [model.pos_phi_free], "lr": cfg.m_phi_lr,      # a gauge-frame scale
                      "weight_decay": cfg.phi_weight_decay}                    # decayed like phi_embed
@@ -105,10 +105,10 @@ def build_optimizer(
             pos_group["gauge"] = True
             pos_group["weight_decay"] = 0.0
         groups.append(pos_group)
-    if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (gamma_coupling>0 or
-        groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_mu_lr})    # prior_source=model_channel):
-        groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_sigma_lr})  # mean@m_mu_lr, log-scale@
-        # m_sigma_lr, mirroring the belief tables. s is the model channel / (under model_channel) the
+    if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (lambda_gamma>0 or
+        groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_p_mu_lr})    # prior_source=model_channel):
+        groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_p_sigma_lr})  # mean@m_p_mu_lr, log-scale@
+        # m_p_sigma_lr, mirroring the belief tables. s is the model channel / (under model_channel) the
         # live belief prior, so it must train. The hyper-prior CENTROID r is grouped only when
         # learnable_r un-freezes it (next block); FROZEN-by-default r (requires_grad=False, prior_bank.py)
         # is exempt from the coverage guard -- a fixed centroid per the manuscript's "higher, slower
@@ -118,19 +118,19 @@ def build_optimizer(
         # centroid toward the degenerate (r_mu=0, r_sigma=1) fixed point, fighting the empirical-Bayes
         # population-centroid objective (and corrupting the KL(s||r) m-projection at sigma_init != 1) --
         # the same exemption the learned unigram-bias prior (output_proj_bias) and the gauge frame carry.
-        groups.append({"params": [pb.r_mu],        "lr": cfg.m_mu_lr,    "weight_decay": 0.0})  # centroid mean
-        groups.append({"params": [pb.r_sigma_log], "lr": cfg.m_sigma_lr, "weight_decay": 0.0})  # centroid log-scale
+        groups.append({"params": [pb.r_mu],        "lr": cfg.m_p_mu_lr,    "weight_decay": 0.0})  # centroid mean
+        groups.append({"params": [pb.r_sigma_log], "lr": cfg.m_p_sigma_lr, "weight_decay": 0.0})  # centroid log-scale
     if getattr(model, "connection_W", None) is not None:        # transport_mode='regime_ii' learned
         w_group = {"params": [model.connection_W], "lr": cfg.m_phi_lr}        # connection -> gauge LR
         if cfg.connection_weight_decay is not None:             # dedicated connection-norm ceiling
             w_group["weight_decay"] = cfg.connection_weight_decay   # (audit 2026-06-10 F9); None ->
         groups.append(w_group)                                  # inherit the global weight_decay
-    if getattr(model, "log_alpha", None) is not None:           # alpha_mode='learnable' scalar coupling
-        groups.append({"params": [model.log_alpha], "lr": cfg.m_mu_lr})
+    if getattr(model, "log_alpha", None) is not None:           # lambda_alpha_mode='learnable' scalar coupling
+        groups.append({"params": [model.log_alpha], "lr": cfg.m_p_mu_lr})
     if getattr(model, "log_lambda_beta", None) is not None:     # learnable_lambda_beta scalar belief-coupling weight
         groups.append({"params": [model.log_lambda_beta], "lr": cfg.m_phi_lr})  # a coupling/gauge-scale LR
     if getattr(model, "log_lambda_h", None) is not None:        # lambda_h_mode='learnable' scalar hyper-prior weight
-        groups.append({"params": [model.log_lambda_h], "lr": cfg.m_mu_lr})  # a precision-coupling scale (like log_alpha)
+        groups.append({"params": [model.log_lambda_h], "lr": cfg.m_p_mu_lr})  # a precision-coupling scale (like log_alpha)
 
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
     # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the
@@ -708,15 +708,15 @@ def train(
                 "train_loss":        losses[-1],
                 "train_ce":          ce,                      # true CE (nats), off the graph
                 "train_ppl":         math.exp(min(ce, 20.0)),  # train perplexity = exp(CE), mirrors the console line
-                "lr_mu":             float(lrs[0]),           # group 0 = mu_embed          (m_mu_lr)
-                "lr_sigma":          float(lrs[1]),           # group 1 = sigma_log+decode  (m_sigma_lr)
+                "lr_mu":             float(lrs[0]),           # group 0 = mu_embed          (m_p_mu_lr)
+                "lr_sigma":          float(lrs[1]),           # group 1 = sigma_log+decode  (m_p_sigma_lr)
                 "lr_phi":            float(lrs[2]),           # group 2 = phi_embed         (m_phi_lr)
                 "val_ce":            last_val.get("ce",  float("nan")),
                 "val_ppl":           last_val.get("ppl", float("nan")),
                 "val_bpc":           last_val.get("bpc", float("nan")),
                 "attn_entropy":       d["attn_entropy"],
                 "self_coupling":      d["self_coupling"]     / n_tok,   # alpha-regularized F self-term sum_i[alpha_i D + R(alpha_i)]
-                "self_divergence":    d["self_divergence"]   / n_tok,   # raw sum_i D(q_i||p_i) drift; == self_coupling only at alpha_mode='constant'
+                "self_divergence":    d["self_divergence"]   / n_tok,   # raw sum_i D(q_i||p_i) drift; == self_coupling only at lambda_alpha_mode='constant'
                 "belief_coupling":    d["belief_coupling"]   / n_tok,
                 "attention_entropy":  d["attention_entropy"] / n_tok,
                 "free_energy_total":  d["total"]             / n_tok,
@@ -775,7 +775,7 @@ def train(
             # are stored for the model_channel_terms figure; hyper_prior_weighted is the EXACT weighted
             # contribution folded into total (state_dependent/learnable lambda_h != cfg.lambda_h*raw,
             # so the F-decomposition figure reads this directly), while the gamma block is scaled by
-            # cfg.gamma_coupling in that figure, exactly as the belief block is scaled by lambda_beta.
+            # cfg.lambda_gamma in that figure, exactly as the belief block is scaled by lambda_beta.
             for _mck in ("hyper_prior", "hyper_prior_weighted", "gamma_coupling", "gamma_meta_entropy"):
                 if _mck in d:
                     row[_mck] = d[_mck] / n_tok
@@ -845,7 +845,7 @@ def _fmt_tau(cfg: VFE3Config, model: VFEModel) -> str:
     (list) kappa -> '[t0, t1, ...]' (T1). Converts a list kappa to a tensor first so attention_tau
     does not choke on a raw list."""
     dev = model.prior_bank.mu_embed.device
-    tau = attention_tau(_as_coeff(cfg.kappa, dev), model.group.irrep_dims)
+    tau = attention_tau(_as_coeff(cfg.kappa_beta, dev), model.group.irrep_dims)
     if isinstance(tau, torch.Tensor) and tau.dim() >= 1:
         return "[" + ", ".join(f"{x:.4f}" for x in tau.tolist()) + "]"
     return f"{float(tau):.4f}"
@@ -871,8 +871,8 @@ def _banner(
         f"group={cfg.gauge_group}  family={cfg.family}",
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
-        f" M-LRs: mu={cfg.m_mu_lr}  sigma={cfg.m_sigma_lr}  phi={cfg.m_phi_lr}",
-        f" VFE: alpha={cfg.alpha}  kappa={cfg.kappa}  "
+        f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  phi={cfg.m_phi_lr}",
+        f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",
         bar,

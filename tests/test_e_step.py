@@ -81,16 +81,16 @@ from vfe3.inference.e_step import e_step_iteration
 def test_iteration_keeps_sigma_positive_and_shapes():
     b, mu_p, sigma_p, grp = _belief()
     out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5,
-                           e_mu_lr=0.05, e_sigma_lr=0.05, e_phi_lr=0.05)
+                           e_q_mu_lr=0.05, e_q_sigma_lr=0.05, e_phi_lr=0.05)
     assert (out.sigma > 0).all()
     assert out.mu.shape == b.mu.shape and out.phi.shape == b.phi.shape
 
 
 def test_decoupled_learning_rates_freeze_components():
     b, mu_p, sigma_p, grp = _belief()
-    o1 = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.05, e_phi_lr=0.0)
+    o1 = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.05, e_phi_lr=0.0)
     assert torch.allclose(o1.phi, b.phi, atol=1e-7)
-    o2 = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.0, e_sigma_lr=0.05, e_phi_lr=0.0)
+    o2 = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.0, e_q_sigma_lr=0.05, e_phi_lr=0.0)
     assert torch.allclose(o2.mu, b.mu, atol=1e-7)
 
 
@@ -102,7 +102,7 @@ def test_e_step_iteration_spd_affine_default_is_byte_identical():
     from vfe3.inference.e_step import _transport
 
     b, mu_p, sigma_p, grp = _belief()
-    e_sigma_lr, e_sigma_q_trust, eps, sigma_max = 0.05, 5.0, 1e-6, 5.0
+    e_q_sigma_lr, e_sigma_q_trust, eps, sigma_max = 0.05, 5.0, 1e-6, 5.0
 
     # Hand-compose the legacy sigma update exactly as e_step_iteration did pre-refactor.
     omega = _transport(b.phi, grp)
@@ -111,11 +111,11 @@ def test_e_step_iteration_spd_affine_default_is_byte_identical():
     )
     _, nat_sigma = natural_gradient(grad_mu, grad_sigma, b.sigma, eps=eps)
     legacy_sigma = retract_spd_diagonal(
-        b.sigma, -e_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
+        b.sigma, -e_q_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
     )
 
     out = e_step_iteration(
-        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.0, e_sigma_lr=e_sigma_lr, e_phi_lr=0.0,
+        b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.0, e_q_sigma_lr=e_q_sigma_lr, e_phi_lr=0.0,
         e_sigma_q_trust=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
         spd_retract_mode="spd_affine",
     )
@@ -144,10 +144,10 @@ def test_e_step_iteration_transport_flat_default_is_byte_identical():
     bit-for-bit (atol=0) against the run with no transport_mode passed."""
     b, mu_p, sigma_p, grp = _belief()
     base = e_step_iteration(
-        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.05, e_phi_lr=0.05,
+        b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.05, e_phi_lr=0.05,
     )
     routed = e_step_iteration(
-        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.05, e_phi_lr=0.05,
+        b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.05, e_phi_lr=0.05,
         transport_mode="flat",
     )
     assert torch.equal(routed.mu, base.mu)
@@ -160,10 +160,10 @@ def test_e_step_iteration_regime_ii_w_zero_reduces_to_flat():
     reduces to the flat iteration bit-for-bit -- the E-step-level W=0->flat oracle."""
     b, mu_p, sigma_p, grp = _belief()
     flat = e_step_iteration(
-        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.05, e_phi_lr=0.0,
+        b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.05, e_phi_lr=0.0,
     )
     r2_none = e_step_iteration(
-        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.05, e_sigma_lr=0.05, e_phi_lr=0.0,
+        b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.05, e_phi_lr=0.0,
         transport_mode="regime_ii", connection_W=None, cocycle_relaxation=1.0,
     )
     assert torch.allclose(r2_none.mu, flat.mu, atol=1e-6, rtol=0.0)
@@ -178,10 +178,10 @@ def test_e_step_iteration_regime_ii_nonzero_w_differs_from_flat():
     g = torch.Generator().manual_seed(5)
     W = 0.5 * torch.randn(n_gen, K, K, generator=g)
     flat = e_step_iteration(
-        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.2, e_sigma_lr=0.05, e_phi_lr=0.0,
+        b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.2, e_q_sigma_lr=0.05, e_phi_lr=0.0,
     )
     r2 = e_step_iteration(
-        b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.2, e_sigma_lr=0.05, e_phi_lr=0.0,
+        b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.2, e_q_sigma_lr=0.05, e_phi_lr=0.0,
         transport_mode="regime_ii", connection_W=W, cocycle_relaxation=1.0,
     )
     assert not torch.allclose(r2.mu, flat.mu, atol=1e-4)
@@ -192,7 +192,7 @@ def test_filtering_step_descends_F_filt():
     # filtering (query-side) gradient descends F with KEYS FROZEN at the pre-step belief.
     b, mu_p, sigma_p, grp = _belief()
     F_before = free_energy_value(b, mu_p, sigma_p, grp, tau=1.5, keys=b)
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=1e-3, e_sigma_lr=1e-3,
+    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=1e-3, e_q_sigma_lr=1e-3,
                            e_phi_lr=0.0, gradient_mode="filtering", e_sigma_q_trust=0.0)
     F_after = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5, keys=b)   # SAME frozen keys b
     assert F_after < F_before
@@ -201,7 +201,7 @@ def test_filtering_step_descends_F_filt():
 def test_smoothing_step_descends_global_F():
     b, mu_p, sigma_p, grp = _belief()
     F_before = free_energy_value(b, mu_p, sigma_p, grp, tau=1.5)            # global (keys=belief)
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=1e-3, e_sigma_lr=1e-3,
+    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=1e-3, e_q_sigma_lr=1e-3,
                            e_phi_lr=0.0, gradient_mode="smoothing", e_sigma_q_trust=0.0)
     F_after = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5)
     assert F_after < F_before
@@ -210,7 +210,7 @@ def test_smoothing_step_descends_global_F():
 def test_phi_step_descends_global_F_with_beliefs_frozen():
     b, mu_p, sigma_p, grp = _belief()
     F_before = free_energy_value(b, mu_p, sigma_p, grp, tau=1.5)
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=0.0, e_sigma_lr=0.0, e_phi_lr=1e-3)
+    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.0, e_q_sigma_lr=0.0, e_phi_lr=1e-3)
     F_after = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5)
     assert F_after < F_before
 
@@ -222,7 +222,7 @@ def test_keys_freezing_bites_on_stepped_belief():
     # global F (keys=None, re-transported from the moved belief). Without this the
     # F_filt machinery is unobserved -- both descent tests stay green if `keys` were dead.
     b, mu_p, sigma_p, grp = _belief()
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_mu_lr=5e-2, e_sigma_lr=5e-2,
+    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=5e-2, e_q_sigma_lr=5e-2,
                            e_phi_lr=0.0, gradient_mode="filtering")
     F_filt = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5, keys=b)      # frozen pre-step keys
     F_glob = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5, keys=None)   # re-transported
@@ -238,7 +238,7 @@ EXPECTED_CHECKSUM = 6.6499   # frozen from the first trusted green run (seed=7, 
 def test_e_step_runs_n_iter_and_returns_trajectory():
     b, mu_p, sigma_p, grp = _belief()
     out, traj = e_step(b, mu_p, sigma_p, grp, tau=1.5, n_iter=5,
-                       e_mu_lr=1e-2, e_sigma_lr=1e-2, e_phi_lr=1e-2, return_trajectory=True)
+                       e_q_mu_lr=1e-2, e_q_sigma_lr=1e-2, e_phi_lr=1e-2, return_trajectory=True)
     assert len(traj) == 6
     assert (out.sigma > 0).all()
 
@@ -246,7 +246,7 @@ def test_e_step_runs_n_iter_and_returns_trajectory():
 def test_smoothing_loop_decreases_F_overall():
     b, mu_p, sigma_p, grp = _belief()
     out, traj = e_step(b, mu_p, sigma_p, grp, tau=1.5, n_iter=10,
-                       e_mu_lr=2e-3, e_sigma_lr=2e-3, e_phi_lr=2e-3,
+                       e_q_mu_lr=2e-3, e_q_sigma_lr=2e-3, e_phi_lr=2e-3,
                        gradient_mode="smoothing", e_sigma_q_trust=0.0, return_trajectory=True)
     assert traj[-1] < traj[0]
 
@@ -254,7 +254,7 @@ def test_smoothing_loop_decreases_F_overall():
 def test_fixed_seed_regression():
     b, mu_p, sigma_p, grp = _belief(seed=7)
     out = e_step(b, mu_p, sigma_p, grp, tau=1.5, n_iter=3,
-                 e_mu_lr=1e-2, e_sigma_lr=1e-2, e_phi_lr=1e-2)
+                 e_q_mu_lr=1e-2, e_q_sigma_lr=1e-2, e_phi_lr=1e-2)
     assert torch.isfinite(out.mu).all() and torch.isfinite(out.sigma).all() and torch.isfinite(out.phi).all()
     checksum = float(out.mu.sum() + out.sigma.sum() + out.phi.sum())
     assert abs(checksum - EXPECTED_CHECKSUM) < 1e-3
@@ -278,7 +278,7 @@ def test_free_energy_value_rejects_misspelled_kwarg():
 
 
 def test_oracle_create_graph_keeps_belief_gradient_connected():
-    # Non-kernel configs (alpha_div != 1, gaussian_full, smoothing) fall back to the autograd oracle.
+    # Non-kernel configs (renyi_order != 1, gaussian_full, smoothing) fall back to the autograd oracle.
     # Under the unrolled E-step (create_graph=True) the oracle must return a belief gradient that is
     # still DIFFERENTIABLE, so the unrolled-through-inference signal reaches the prior tables; the
     # default (create_graph=False) path returns a detached constant tangent (byte-compatible with old).
@@ -294,7 +294,7 @@ def test_oracle_create_graph_keeps_belief_gradient_connected():
     sigma_p = torch.rand(N, K, generator=g) + 0.5
     omega = compute_transport_operators(
         torch.zeros(1, N, grp.generators.shape[0]), grp)["Omega"][0]      # (N,N,K,K), Omega=I
-    kw = dict(family="gaussian_diagonal", divergence_family="renyi", alpha_div=2.0)  # alpha!=1 -> oracle
+    kw = dict(family="gaussian_diagonal", divergence_family="renyi", renyi_order=2.0)  # alpha!=1 -> oracle
 
     g_mu, _ = belief_gradients(mu, sigma, mu_p, sigma_p, omega, create_graph=True, **kw)
     assert g_mu.requires_grad and g_mu.grad_fn is not None     # connected -> unrolled signal flows
@@ -304,7 +304,7 @@ def test_oracle_create_graph_keeps_belief_gradient_connected():
 
 
 def test_oracle_unroll_grad_toggle_changes_prior_gradient():
-    # End-to-end: for a DIAGONAL non-kernel family (alpha_div != 1 -> autograd oracle), the opt-in
+    # End-to-end: for a DIAGONAL non-kernel family (renyi_order != 1 -> autograd oracle), the opt-in
     # oracle_unroll_grad adds the unrolled-through-inference term to the prior gradient, so mu_embed's
     # gradient DIFFERS from the default detached oracle (both finite). gaussian_diagonal keeps the
     # double-backward stable; gaussian_full is intentionally excluded (its eigh double-backward NaNs).
@@ -313,8 +313,8 @@ def test_oracle_unroll_grad_toggle_changes_prior_gradient():
 
     def grad_of(toggle: bool) -> torch.Tensor:
         cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1,
-                         n_e_steps=3, e_mu_lr=0.2, e_sigma_lr=0.1, e_phi_lr=0.0,
-                         alpha_div=2.0, pos_phi="none", oracle_unroll_grad=toggle, seed=0)
+                         n_e_steps=3, e_q_mu_lr=0.2, e_q_sigma_lr=0.1, e_phi_lr=0.0,
+                         renyi_order=2.0, pos_phi="none", oracle_unroll_grad=toggle, seed=0)
         torch.manual_seed(0)
         m = VFEModel(cfg)
         tok = torch.randint(0, 12, (2, 5), generator=torch.Generator().manual_seed(1))

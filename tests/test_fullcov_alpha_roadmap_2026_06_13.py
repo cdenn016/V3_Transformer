@@ -34,11 +34,11 @@ def test_per_coord_bhattacharyya_and_jeffreys_construct_squared_hellinger_still_
     """state_dependent_per_coord now accepts the divergences that DECOMPOSE coordinate-wise
     (bhattacharyya = 0.5 D_1/2, jeffreys = KL + KL_rev), and still rejects squared_hellinger
     (H^2 = 1 - exp(-D_1/2/2) is a nonlinear transform of the SUMMED divergence)."""
-    VFE3Config(alpha_mode="state_dependent_per_coord", divergence_family="bhattacharyya")
-    VFE3Config(alpha_mode="state_dependent_per_coord", divergence_family="jeffreys")
-    VFE3Config(alpha_mode="state_dependent_per_coord", divergence_family="renyi")
+    VFE3Config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="bhattacharyya")
+    VFE3Config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="jeffreys")
+    VFE3Config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="renyi")
     with pytest.raises(ValueError):
-        VFE3Config(alpha_mode="state_dependent_per_coord", divergence_family="squared_hellinger")
+        VFE3Config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="squared_hellinger")
 
 
 def test_per_coord_bhattacharyya_jeffreys_sum_to_scalar():
@@ -71,8 +71,8 @@ def test_per_coord_bhattacharyya_forward_backward_runs():
     """A model with state_dependent_per_coord + bhattacharyya runs forward+backward (routes to the
     autograd oracle; the per-coordinate self-divergence shapes a per-coordinate alpha)."""
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.0,
-                     alpha_mode="state_dependent_per_coord", divergence_family="bhattacharyya")
+                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
+                     lambda_alpha_mode="state_dependent_per_coord", divergence_family="bhattacharyya")
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (2, 5)); targets = torch.randint(0, 20, (2, 5))
     _, loss, _ = model(tokens, targets)
@@ -88,23 +88,23 @@ def test_per_coord_bhattacharyya_forward_backward_runs():
 # the _eigh_damped gap-regularized eigh backward (retraction.py); the single training backward is
 # now finite. This pins that, and contrasts it with the truncated default (oracle_unroll_grad=False).
 # ---------------------------------------------------------------------------
-def _fullcov_model(alpha_div=1.0, oracle_unroll_grad=True, **kw):
+def _fullcov_model(renyi_order=1.0, oracle_unroll_grad=True, **kw):
     cfg = VFE3Config(vocab_size=24, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_mu_lr=0.05, e_sigma_lr=0.02, e_phi_lr=0.01,
+                     n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.02, e_phi_lr=0.01,
                      family="gaussian_full", diagonal_covariance=False, decode_mode="full",
                      use_prior_bank=True, pos_phi="learned",
-                     alpha_div=alpha_div, e_step_gradient="unroll",
+                     renyi_order=renyi_order, e_step_gradient="unroll",
                      oracle_unroll_grad=oracle_unroll_grad, **kw)
     return VFEModel(cfg)
 
 
-@pytest.mark.parametrize("alpha_div", [0.5, 1.0, 1.5])
-def test_fullcov_unroll_oracle_grad_is_finite(alpha_div):
+@pytest.mark.parametrize("renyi_order", [0.5, 1.0, 1.5])
+def test_fullcov_unroll_oracle_grad_is_finite(renyi_order):
     """gaussian_full + e_step_gradient='unroll' + oracle_unroll_grad=True: the single training
     backward is finite across Renyi orders (the _eigh_damped/safe_cholesky fix; the old
     'expect NaNs' docstring is stale for the single-backward training path)."""
     torch.manual_seed(0)
-    model = _fullcov_model(alpha_div=alpha_div)
+    model = _fullcov_model(renyi_order=renyi_order)
     tokens = torch.randint(0, 24, (2, 5)); targets = torch.randint(0, 24, (2, 5))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")                  # alpha>1 convex-regime + oracle notices
@@ -113,7 +113,7 @@ def test_fullcov_unroll_oracle_grad_is_finite(alpha_div):
     assert torch.isfinite(loss)
     for name, p in model.named_parameters():
         if p.grad is not None:
-            assert torch.isfinite(p.grad).all(), f"non-finite grad in {name} at alpha_div={alpha_div}"
+            assert torch.isfinite(p.grad).all(), f"non-finite grad in {name} at renyi_order={renyi_order}"
 
 
 def test_fullcov_unroll_oracle_grad_reaches_gauge_frame_only_when_enabled():
@@ -188,8 +188,8 @@ def test_state_dependent_per_position_nonrenyi_forward_backward(div_name):
     """Per-position state_dependent + a non-Renyi divergence constructs and trains (routes to the
     oracle); the prior tables get a finite gradient."""
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.0,
-                     alpha_mode="state_dependent", divergence_family=div_name, b0=0.3)
+                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
+                     lambda_alpha_mode="state_dependent", divergence_family=div_name, b0=0.3)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (2, 5)); targets = torch.randint(0, 20, (2, 5))
     with warnings.catch_warnings():
@@ -210,7 +210,7 @@ def test_state_dependent_per_position_nonrenyi_forward_backward(div_name):
 # ---------------------------------------------------------------------------
 def _full_model(vocab_size=64, **kw):
     cfg = VFE3Config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1,
-                     n_e_steps=2, e_mu_lr=0.05, e_sigma_lr=0.02, e_phi_lr=0.0,
+                     n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.02, e_phi_lr=0.0,
                      family="gaussian_full", diagonal_covariance=False, use_prior_bank=True, **kw)
     return VFEModel(cfg)
 
@@ -387,10 +387,10 @@ def test_warn_fullcov_linear_decode_discards_covariance():
 
 def test_warn_state_dependent_bounded_divergence_b0():
     assert _warns_matching("nearly constant",
-                           alpha_mode="state_dependent", divergence_family="squared_hellinger", b0=1.0)
+                           lambda_alpha_mode="state_dependent", divergence_family="squared_hellinger", b0=1.0)
     # A small b0 (restoring a wide alpha* range) does NOT warn about the range.
     assert not _warns_matching("nearly constant",
-                               alpha_mode="state_dependent", divergence_family="squared_hellinger", b0=0.05)
+                               lambda_alpha_mode="state_dependent", divergence_family="squared_hellinger", b0=0.05)
     # An unbounded divergence (renyi/KL) does NOT warn at b0=1.
     assert not _warns_matching("nearly constant",
-                               alpha_mode="state_dependent", divergence_family="renyi", b0=1.0)
+                               lambda_alpha_mode="state_dependent", divergence_family="renyi", b0=1.0)

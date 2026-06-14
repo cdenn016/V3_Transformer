@@ -21,7 +21,7 @@ from vfe3.model.model import VFEModel
 def _model(e_step_gradient="unroll", detach_e_step=False, **over):
     cfg = dict(
         vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-        n_e_steps=2, e_mu_lr=0.1, e_sigma_lr=0.02, e_phi_lr=0.0,
+        n_e_steps=2, e_q_mu_lr=0.1, e_q_sigma_lr=0.02, e_phi_lr=0.0,
         gradient_mode="filtering", e_step_gradient=e_step_gradient,
         detach_e_step=detach_e_step,
         use_prior_bank=True,    # these grad-flow checks observe encode tables via the KL-to-prior
@@ -121,7 +121,7 @@ def test_straight_through_grad_flows_to_encode_tables():
 # --- gradients DIFFER from unroll (distinct estimators) ---------------------
 def test_straight_through_grad_differs_from_unroll():
     # unroll keeps the second-order d delta/d belief term; straight_through drops it. With a
-    # config where the delta depends on the belief (e_mu_lr>0, e_sigma_lr>0, n_e_steps>=2 to
+    # config where the delta depends on the belief (e_q_mu_lr>0, e_q_sigma_lr>0, n_e_steps>=2 to
     # compound the second-order term), the mu_embed.grad must DIFFER between the two estimators.
     tokens, targets = _data()
     m_un = _model("unroll")

@@ -37,18 +37,18 @@ def test_dispatch_falls_back_to_oracle():
     a = belief_gradients(*args, tau=1.5, gradient_mode="smoothing")
     b = belief_gradients_autograd(*args, tau=1.5, gradient_mode="smoothing")
     assert torch.allclose(a[0], b[0], atol=1e-6) and torch.allclose(a[1], b[1], atol=1e-6)
-    # non-KL (Renyi alpha_div != 1) -> oracle
-    c = belief_gradients(*args, tau=1.5, gradient_mode="filtering", alpha_div=0.5)
-    d = belief_gradients_autograd(*args, tau=1.5, gradient_mode="filtering", alpha_div=0.5)
+    # non-KL (Renyi renyi_order != 1) -> oracle
+    c = belief_gradients(*args, tau=1.5, gradient_mode="filtering", renyi_order=0.5)
+    d = belief_gradients_autograd(*args, tau=1.5, gradient_mode="filtering", renyi_order=0.5)
     assert torch.allclose(c[0], d[0], atol=1e-5) and torch.allclose(c[1], d[1], atol=1e-5)
 
 
 def test_kernel_matches_filtering_oracle_state_dependent_alpha_with_R():
     args = _setup()
     km, ks = belief_gradients(*args, tau=1.5, gradient_mode="filtering",
-                              alpha_mode="state_dependent", b0=0.5, c0=2.0)
+                              lambda_alpha_mode="state_dependent", b0=0.5, c0=2.0)
     om, os_ = belief_gradients_autograd(*args, tau=1.5, gradient_mode="filtering",
-                                        alpha_mode="state_dependent", b0=0.5, c0=2.0)
+                                        lambda_alpha_mode="state_dependent", b0=0.5, c0=2.0)
     assert torch.allclose(km, om, atol=1e-5)                 # alpha* cancellation (R on both sides)
     assert torch.allclose(ks, os_, atol=1e-5)
 
@@ -110,9 +110,9 @@ def test_per_coord_alpha_saturation_mask_is_per_coordinate():
     mu_p = torch.tensor([[20.0, 0.5]])                          # coord 0 saturates, coord 1 does not
     sigma_p = torch.ones(N, K)
     km, ks = belief_gradients(mu, sigma, mu_p, sigma_p, omega, gradient_mode="filtering",
-                              alpha_mode="state_dependent_per_coord", b0=0.5, c0=2.0)
+                              lambda_alpha_mode="state_dependent_per_coord", b0=0.5, c0=2.0)
     om, os_ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, gradient_mode="filtering",
-                                        alpha_mode="state_dependent_per_coord", b0=0.5, c0=2.0)
+                                        lambda_alpha_mode="state_dependent_per_coord", b0=0.5, c0=2.0)
     assert torch.allclose(km, om, atol=1e-5) and torch.allclose(ks, os_, atol=1e-5)
     # coordinate 0 gated off (saturated); coordinate 1's restoring force SURVIVES -- the
     # per-coordinate mask is the only thing that keeps km[...,1] != 0 here.

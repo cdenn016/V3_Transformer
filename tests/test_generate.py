@@ -22,7 +22,7 @@ def _tiny_model(seed: int = 0, **overrides) -> VFEModel:
     """A tiny fixed-seed VFEModel. vocab_size is kept comfortably larger than any
     top_k used below so torch.topk never sees k > vocab_size."""
     base = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0, seed=seed)
+                n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, seed=seed)
     base.update(overrides)
     cfg = VFE3Config(**base)
     torch.manual_seed(seed)

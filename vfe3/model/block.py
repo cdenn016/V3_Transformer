@@ -44,7 +44,7 @@ def vfe_block(
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
     ``log_alpha`` is the model's learned self-coupling nn.Parameter (alpha = exp(log_alpha))
-    under alpha_mode='learnable', forwarded to the E-step; None on the pure path. ``lambda_beta``
+    under lambda_alpha_mode='learnable', forwarded to the E-step; None on the pure path. ``lambda_beta``
     is the belief-coupling weight (the constant cfg.lambda_beta, or the live exp(log_lambda_beta)
     when learnable_lambda_beta=True); 1.0 is the pure F. ``connection_W`` is the model's learned
     bilinear Regime-II connection (a sanctioned NN exception) forwarded under
@@ -54,16 +54,16 @@ def vfe_block(
     ``rope_on_cov`` enables the full-gauge covariance sandwich rotation."""
     out = e_step(
         belief, mu_p, sigma_p, group,
-        n_iter=cfg.n_e_steps, tau=attention_tau(_as_coeff(cfg.kappa, belief.mu.device), group.irrep_dims),
-        e_mu_lr=cfg.e_mu_lr, e_sigma_lr=cfg.e_sigma_lr, e_phi_lr=cfg.e_phi_lr,
-        alpha_div=cfg.alpha_div, value=cfg.alpha, b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device), log_alpha=log_alpha,
+        n_iter=cfg.n_e_steps, tau=attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims),
+        e_q_mu_lr=cfg.e_q_mu_lr, e_q_sigma_lr=cfg.e_q_sigma_lr, e_phi_lr=cfg.e_phi_lr,
+        renyi_order=cfg.renyi_order, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device), log_alpha=log_alpha,
         lambda_beta=lambda_beta,
         kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
         e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
         include_attention_entropy=cfg.include_attention_entropy,
         gradient_mode=cfg.gradient_mode, family=cfg.family, divergence_family=cfg.divergence_family,
-        alpha_mode=cfg.alpha_mode,
+        lambda_alpha_mode=cfg.lambda_alpha_mode,
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
         cocycle_relaxation=cfg.cocycle_relaxation, connection_W=connection_W,

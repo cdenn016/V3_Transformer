@@ -195,7 +195,7 @@ def retract_spd_full(
 @register_retraction("spd_affine")
 def retract_spd_affine(
     sigma:        torch.Tensor,             # (..., K) diagonal OR (..., K, K) full covariance
-    delta_sigma:  torch.Tensor,             # matching rank: the tangent step (e.g. -e_sigma_lr * nat_sigma)
+    delta_sigma:  torch.Tensor,             # matching rank: the tangent step (e.g. -e_q_sigma_lr * nat_sigma)
 
     mean_ndim:    int,                      # ndim of the belief mean; full cov iff sigma.dim() == mean_ndim + 1
 

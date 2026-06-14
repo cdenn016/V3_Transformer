@@ -650,7 +650,7 @@ def _save_figures(
             # Model-channel F components fold into the complexity-F total when the channel is live;
             # included only when present on EVERY plotted row (model-channel run). hyper_prior_weighted
             # is the EXACT weighted hyper-prior (state_dependent/learnable lambda_h != cfg.lambda_h*raw,
-            # so it is read directly); the gamma blocks are scaled by cfg.gamma_coupling in the figure,
+            # so it is read directly); the gamma blocks are scaled by cfg.lambda_gamma in the figure,
             # exactly as the belief block is scaled by lambda_beta.
             mc_fe_keys = [k for k in ("hyper_prior_weighted", "gamma_coupling", "gamma_meta_entropy")
                           if all(k in r and math.isfinite(r[k]) for r in fe_rows)]
@@ -660,14 +660,14 @@ def _save_figures(
             # (a learnable_lambda_beta run); else the static config scalar.
             lam = ([r["lambda_beta"] for r in fe_rows] if all("lambda_beta" in r for r in fe_rows)
                    else getattr(cfg, "lambda_beta", 1.0))
-            gam = getattr(cfg, "gamma_coupling", 0.0)
+            gam = getattr(cfg, "lambda_gamma", 0.0)
             iae = getattr(cfg, "include_attention_entropy", True)
             fig = figs.plot_free_energy_decomposition(
-                hist, lambda_beta=lam, gamma_coupling=gam, include_attention_entropy=iae,
+                hist, lambda_beta=lam, lambda_gamma=gam, include_attention_entropy=iae,
                 path=str(run / "free_energy_decomposition.png"))
             figs.plt.close(fig)
             fig = figs.plot_free_energy_codescent(
-                hist, lambda_beta=lam, gamma_coupling=gam, include_attention_entropy=iae,
+                hist, lambda_beta=lam, lambda_gamma=gam, include_attention_entropy=iae,
                 path=str(run / "free_energy_codescent.png"))
             figs.plt.close(fig)
         # Model-channel free-energy blocks (s-channel): the hyper-prior KL(s||r), the gamma

@@ -39,14 +39,14 @@ def _hyperprior_term(model: VFEModel, tokens: torch.Tensor) -> torch.Tensor:
     r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps)    # (K,)
     return self_divergence(
         DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),
-        alpha=cfg.alpha_div, kl_max=cfg.kl_max, eps=cfg.eps,
+        alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
         divergence_family=cfg.divergence_family,
     ).mean()
 
 
 def _make_model(lambda_h: float, *, seed: int = 0) -> VFEModel:
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
                      mstep_self_coupling_weight=0.0, lambda_h=lambda_h, seed=seed)
     # pos_phi default "learned" is fine: pos_phi_free is seeded from a dedicated cfg.seed generator
     # (model.py), so it is byte-identical between the lambda_h=0 and lambda_h>0 models and
@@ -146,7 +146,7 @@ def _lr_model(
     r"""Tiny pure-path model (use_prior_bank=True) with the hyper-prior channel live (lambda_h>0) and s
     data-anchored (prior_source='model_channel'), i.e. the non-collapse regime for a learnable r."""
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
                      mstep_self_coupling_weight=0.0, use_prior_bank=True,
                      lambda_h=0.5, prior_source="model_channel",
                      learnable_r=learnable_r, seed=seed)
@@ -195,7 +195,7 @@ def test_learnable_r_grad_reaches_r():
 
 def test_build_optimizer_groups_learnable_r():
     # A trainable r MUST be grouped or the exact-coverage guard fails (it would silently never
-    # train). Both centroid tables are grouped (mean@m_mu_lr, log-scale@m_sigma_lr like s).
+    # train). Both centroid tables are grouped (mean@m_p_mu_lr, log-scale@m_p_sigma_lr like s).
     from vfe3.train import build_optimizer
     m = _lr_model(learnable_r=True)
     opt = build_optimizer(m, m.cfg)                       # must NOT raise the coverage guard
@@ -223,7 +223,7 @@ def test_learnable_r_collapse_warning_when_s_unanchored():
     # leaves KL(s||r) the only force on s/r -> the collapse the freeze guards against. Warn.
     with pytest.warns(UserWarning, match="learnable_r"):
         VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
-                   lambda_h=0.5, learnable_r=True)        # prior_source='token', gamma_coupling=0
+                   lambda_h=0.5, learnable_r=True)        # prior_source='token', lambda_gamma=0
 
 
 def test_learnable_r_no_collapse_warning_when_model_channel_anchors():
@@ -241,9 +241,9 @@ def test_learnable_r_grad_reaches_r_under_s_e_step():
     # self-coupling target of the s E-step (_refine_s). With r un-frozen, grad still reaches it through
     # the unrolled refine (s is anchored by CE under the required model_channel, so this is non-collapse).
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
                      mstep_self_coupling_weight=0.0, use_prior_bank=True,
-                     lambda_h=1.0, gamma_coupling=1.0, prior_source="model_channel",
+                     lambda_h=1.0, lambda_gamma=1.0, prior_source="model_channel",
                      s_e_step=True, e_s_mu_lr=0.5, learnable_r=True, seed=0)
     torch.manual_seed(0)
     m = VFEModel(cfg)
@@ -256,11 +256,11 @@ def test_learnable_r_grad_reaches_r_under_s_e_step():
 
 
 def test_learnable_r_inert_warning_when_no_r_channel():
-    # learnable_r=True but lambda_h=0 and not s_e_step: r is never created (gamma_coupling>0 builds only
+    # learnable_r=True but lambda_h=0 and not s_e_step: r is never created (lambda_gamma>0 builds only
     # the s tables), so the toggle is a silent no-op -> warn the user it has no effect.
     with pytest.warns(UserWarning, match="learnable_r=True has no effect"):
         VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
-                   lambda_h=0.0, gamma_coupling=0.5, learnable_r=True)
+                   lambda_h=0.0, lambda_gamma=0.5, learnable_r=True)
 
 
 def test_learnable_r_centroid_has_no_weight_decay():
@@ -277,7 +277,7 @@ def test_learnable_r_centroid_has_no_weight_decay():
 
 def test_learnable_r_grouped_under_natural_grad_optimizer():
     # The other authorized optimizer path: m_phi_natural_grad=True returns GaugeNaturalGradAdamW; a
-    # trainable r must still be grouped (in a plain non-gauge group, mean@m_mu_lr / log-scale@m_sigma_lr).
+    # trainable r must still be grouped (in a plain non-gauge group, mean@m_p_mu_lr / log-scale@m_p_sigma_lr).
     from vfe3.train import build_optimizer
     from vfe3.gauge_optim import GaugeNaturalGradAdamW
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
@@ -294,10 +294,10 @@ def test_learnable_r_grouped_under_natural_grad_optimizer():
 
 
 # ---------------------------------------------------------------------------
-# lambda_h_mode: the model-fiber analogue of alpha_mode (constant / state_dependent
+# lambda_h_mode: the model-fiber analogue of lambda_alpha_mode (constant / state_dependent
 # envelope / learnable), and r_update_mode='barycenter': the closed-form forward-KL
 # barycenter M-step for r. Spec: docs/.../2026-06-13-lambda-h-mode-and-r-update-mechanism.md.
-# lambda_h weights KL(s_i||r) the way alpha weights KL(q_i||p_i); the manuscript names the
+# lambda_h weights KL(s_i||r) the way lambda_alpha weights KL(q_i||p_i); the manuscript names the
 # state-dependent lambda_h "a parallel extension not developed here" (Participatory ~3766).
 # ---------------------------------------------------------------------------
 from vfe3.lambda_h_i import hyper_prior_lambda_h, _LAMBDA_H_MODES
@@ -308,7 +308,7 @@ def _scored_model(lambda_h: float, *, lambda_h_mode: str = "constant",
     r"""Scored-regime model (s_e_step=False): the hyper-prior term is added directly to the loss as
     _hyper_prior_term, so the lambda_h_mode weighting/regularizer is exercised at the loss level."""
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
                      mstep_self_coupling_weight=0.0, lambda_h=lambda_h, lambda_h_mode=lambda_h_mode,
                      b0_h=b0_h, c0_h=c0_h, seed=seed)
     torch.manual_seed(seed)
@@ -390,7 +390,7 @@ def test_state_dependent_lambda_h_in_s_e_step_trains_s():
     # e_step self-coupling (with R_h via alpha_reg), so a state_dependent lambda_h trains s through the
     # unrolled refine. (model_channel anchors s, so this is the non-collapse regime.)
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
                      mstep_self_coupling_weight=0.0, use_prior_bank=True,
                      lambda_h=1.0, lambda_h_mode="state_dependent", prior_source="model_channel",
                      s_e_step=True, e_s_mu_lr=0.5, seed=0)

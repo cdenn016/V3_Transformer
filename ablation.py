@@ -99,7 +99,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
     
     divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    alpha_div                 = 1.0,       # Renyi order (1.0 -> KL)
+    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
     diagonal_covariance       = True,                # diagonal_covariance MUST equal (family == "gaussian_diagonal")
     family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
@@ -194,13 +194,13 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #                Self Energy:  
     #        Sum_i alpha_i * KL(q_i||p_i)
     #############################################
-    alpha_mode                 = "state_dependent_per_coord",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
     learnable_lambda_beta      = False,               # learn lambda_beta (NN exception; exp(log_lambda_beta), trained on CE)
     
     b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0                         = 1.0,                 # state-dependent alpha shape (numerator)
        
-    alpha                      = 1,                   # constant self-coupling value
+    lambda_alpha               = 1,                   # constant self-coupling value
     lambda_h                   = 0.25,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
     
     # Further Regularizers
@@ -214,7 +214,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     ##################################################
     
     lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)    
-    gamma_coupling             = 0.75,       # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
+    lambda_gamma               = 0.75,       # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
          
 
     #################################
@@ -224,10 +224,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     include_attention_entropy = True,      # canonical F (True) vs entropy-suppressed surrogate (False)
     
-    kappa                     = 1.0,        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa_beta                = 1.0,        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
     kappa_gamma               = 0.5,        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
         
-    attention_prior           = "causal_alibi",  # "uniform" | "causal" | "causal_alibi" | "causal_windowed
+    beta_attention_prior      = "causal_alibi",  # "uniform" | "causal" | "causal_alibi" | "causal_windowed
     gamma_attention_prior     = "causal",        # model-channel prior pi^s_ij: # "t5_relative_bias" | "windowed"
 
     
@@ -236,8 +236,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #         Learning Rates
     #################################
     
-    e_mu_lr                   = 0.9,
-    e_sigma_lr                = 0.001,
+    e_q_mu_lr                 = 0.9,
+    e_q_sigma_lr              = 0.001,
     e_phi_lr                  = 0.0,     # != 0 if treating phi as a fast variable
     
     
@@ -258,8 +258,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        Learning Rates
     #################################
         
-    m_mu_lr                   = 0.015,   
-    m_sigma_lr                = 0.0035,     
+    m_p_mu_lr                 = 0.015,   
+    m_p_sigma_lr              = 0.0035,     
     m_phi_lr                  = 0.015,   
     
     weight_decay              = 0.02,
@@ -447,7 +447,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "means_only", "pos_rotation": "rope"},
             {"label": "full_gauge", "pos_rotation": "rope", "rope_full_gauge": True,
                                     "diagonal_covariance": False, "family": "gaussian_full",
-                                    "alpha_mode": "state_dependent"},
+                                    "lambda_alpha_mode": "state_dependent"},
         ],
     },
 
@@ -459,7 +459,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "configs": [
             {"label": "diagonal", "family": "gaussian_diagonal", "diagonal_covariance": True},
             {"label": "full",     "family": "gaussian_full",     "diagonal_covariance": False,
-                                  "alpha_mode": "state_dependent"},
+                                  "lambda_alpha_mode": "state_dependent"},
         ],
     },
 
@@ -471,24 +471,24 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === free-energy coupling ==============================================
     
     
-    "alpha_mode": {  # 'learnable' is the NN-exception scalar log_alpha (now optimizer-grouped)
+    "lambda_alpha_mode": {  # 'learnable' is the NN-exception scalar log_alpha (now optimizer-grouped)
         "description": "self-coupling alpha form",
-        "param": "alpha_mode",
+        "param": "lambda_alpha_mode",
         "values": ["constant", "state_dependent", "state_dependent_per_coord", "learnable"],
     },
     
     "b0": {
         "description": "state-dependent alpha shape b0 (alpha* = c0/(b0 + D))",
-        "param": "b0", "values": [0.1, 1, 5.0], "requires": {"alpha_mode": "state_dependent"},
+        "param": "b0", "values": [0.1, 1, 5.0], "requires": {"lambda_alpha_mode": "state_dependent"},
     },
     "c0": {
         "description": "state-dependent alpha shape c0 (numerator)",
-        "param": "c0", "values": [0.1, 1.0, 5.0], "requires": {"alpha_mode": "state_dependent"},
+        "param": "c0", "values": [0.1, 1.0, 5.0], "requires": {"lambda_alpha_mode": "state_dependent"},
     },
     
-    "alpha": {
-        "description": "constant self-coupling value (alpha_mode=constant)",
-        "param": "alpha", "values": [0.0, 0.5, 1, 2.5, 5, 7.5, 10], "requires": {"alpha_mode": "constant"},
+    "lambda_alpha": {
+        "description": "constant self-coupling value (lambda_alpha_mode=constant)",
+        "param": "lambda_alpha", "values": [0.0, 0.5, 1, 2.5, 5, 7.5, 10], "requires": {"lambda_alpha_mode": "constant"},
     },
     
     
@@ -515,9 +515,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
-    "attention_prior": {
+    "beta_attention_prior": {
         "description": "attention prior pi_ij",
-        "param": "attention_prior", "values": ["causal", "t5_relative_bias", 
+        "param": "beta_attention_prior", "values": ["causal", "t5_relative_bias", 
                                                "causal_windowed", "causal_alibi"],
     },
     "gamma_attention_prior": {
@@ -579,9 +579,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
-    "gamma_coupling": {
+    "lambda_gamma": {
         "description": "model-channel coupling weight (>0 creates s tables)",
-        "param": "gamma_coupling", "values": [0.65, 0.7, 0.8, 0.9],
+        "param": "lambda_gamma", "values": [0.65, 0.7, 0.8, 0.9],
     },
     
     
@@ -599,9 +599,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "kappa_gamma", "values": [0.25, 0.5, 0.6, 0.75, 1], 
     },
     
-    "kappa": {
+    "kappa_beta": {
        "description": "attention temperature tau = kappa * sqrt(d_head)",
-       "param": "kappa", "range": [0.1, 1.3, 0.1],
+       "param": "kappa_beta", "range": [0.1, 1.3, 0.1],
     },
    
   
@@ -615,14 +615,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
-    "alpha_div": {
-        # oracle_unroll_grad MUST be on for a fair divergence-order comparison: alpha_div != 1 routes
+    "renyi_order": {
+        # oracle_unroll_grad MUST be on for a fair divergence-order comparison: renyi_order != 1 routes
         # the autograd oracle, whose default (detached) gradient truncates the through-inference signal
-        # to the priors/gauge-frame tables, while alpha_div == 1 uses the always-live analytic kernel.
+        # to the priors/gauge-frame tables, while renyi_order == 1 uses the always-live analytic kernel.
         # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
-        # spuriously ~2.5x faster AND worse). No-op at alpha_div == 1 (the kernel ignores the toggle).
+        # spuriously ~2.5x faster AND worse). No-op at renyi_order == 1 (the kernel ignores the toggle).
         "description": "Renyi divergence order (1.0 -> KL; != 1 routes the non-kernel oracle)",
-        "param": "alpha_div", "range": [0.2, 1, 0.1], "requires": {"oracle_unroll_grad": True},
+        "param": "renyi_order", "range": [0.2, 1, 0.1], "requires": {"oracle_unroll_grad": True},
     },
     
     
@@ -640,14 +640,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
-    "e_mu_lr": {
+    "e_q_mu_lr": {
        "description": "E-step natural-gradient step size for mu_q",
-       "param": "e_mu_lr", "values": [0.7, 0.9],
+       "param": "e_q_mu_lr", "values": [0.7, 0.9],
     },
    
-    "e_sigma_lr": {
+    "e_q_sigma_lr": {
        "description": "E-step retraction step size for sigma_q",
-       "param": "e_sigma_lr", "values": [0, 0.0005, 0.0015],
+       "param": "e_q_sigma_lr", "values": [0, 0.0005, 0.0015],
     },
    
     "e_phi_lr": {
@@ -661,14 +661,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
    
    
-    "m_mu_lr": {
+    "m_p_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_mu_lr", "values": [0.0075, 0.01, 0.012, 0.014, 0.015, 0.016, 0.0175],
+        "param": "m_p_mu_lr", "values": [0.0075, 0.01, 0.012, 0.014, 0.015, 0.016, 0.0175],
     },
     
-    "m_sigma_lr": {
+    "m_p_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_sigma_lr", "range": [0.0025, 0.0045, 0.00025],
+        "param": "m_p_sigma_lr", "range": [0.0025, 0.0045, 0.00025],
     },
     
     "m_phi_lr": {
@@ -700,7 +700,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 #   vocab_size             fixed by the dataset
 #   gauge_parameterization only 'phi' is live ('omega_direct' is config-rejected)
 #   encode_mode            only 'per_token' is live ('gauge_fixed' is a rejected stub)
-#   divergence_family      only 'renyi' is registered (alpha_div is its live knob)
+#   divergence_family      only 'renyi' is registered (renyi_order is its live knob)
 #   seed                   set per run from CONFIG['seed'] (the runner reseeds each cell)
 #   max_steps              run length, set via CONFIG['max_steps']
 #   log/eval/checkpoint_interval, eval_max_batches   bookkeeping, not model behavior
@@ -725,28 +725,28 @@ SWEEP_ORDER: List[str] = [
   
   # "decode_tau",
    
-   "gamma_coupling",
+   "lambda_gamma",
    "lambda_h",
    "kappa_gamma",   
    "e_s_mu_lr",
    
   # "m_phi_lr",
- #   "m_mu_lr",
-  #  "m_sigma_lr",
+ #   "m_p_mu_lr",
+  #  "m_p_sigma_lr",
     
   #  "weight_decay",
   #  "lambda_beta",
   
   
-  #  "kappa",
-  ##  "alpha_div",
+  #  "kappa_beta",
+  ##  "renyi_order",
     
     
-   # "e_mu_lr",
+   # "e_q_mu_lr",
   #  "phi_weight_decay",
      
-   #"e_sigma_lr",
-   # "alpha",
+   #"e_q_sigma_lr",
+   # "lambda_alpha",
        
   #  
     
@@ -1134,7 +1134,7 @@ def _collect_sweep_results(sweep_dir: Path) -> List[Dict[str, Any]]:
     r"""The union of every persisted cell under ``sweep_dir`` (each ``*/ablation_result.json``).
 
     This is what makes a re-run "tack on": every cell label maps to its own subdirectory, so a
-    sweep re-run with a DIFFERENT value list (e.g. ``kappa=0.5,2.2,3.7`` after ``1,2,3,4``) writes
+    sweep re-run with a DIFFERENT value list (e.g. ``kappa_beta=0.5,2.2,3.7`` after ``1,2,3,4``) writes
     new cell dirs alongside the old ones, and this union picks up all of them. Re-running the SAME
     label overwrites that one marker while the others persist, so the union is additive and never
     subtracts (to drop a point, delete its cell directory). ``sorted`` keeps CSV row order

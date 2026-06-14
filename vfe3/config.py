@@ -9,7 +9,7 @@ variant swaps without editing call sites.
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-# Seams with a live registry (gauge_group, alpha_mode, attention priors, norms; alongside
+# Seams with a live registry (gauge_group, lambda_alpha_mode, attention priors, norms; alongside
 # transport/retraction/positional/divergence) are validated against that registry in __post_init__
 # via tuple(sorted(_REGISTRY)), so a newly registered variant is a valid config value WITHOUT
 # editing this validator (the add-by-registering modularity contract). phi_precond_mode,
@@ -40,8 +40,8 @@ class VFE3Config:
     kl_max:                    float = 100.0
 
     # divergence seam
-    divergence_family:         str   = "renyi"        # divergence FUNCTIONAL (renyi, ...); alpha_div selects member
-    alpha_div:                 float = 1.0            # Renyi order (alpha=1 -> KL)
+    divergence_family:         str   = "renyi"        # divergence FUNCTIONAL (renyi, ...); renyi_order selects member
+    renyi_order:               float = 1.0            # Renyi order (alpha=1 -> KL)
 
     # model structure
     vocab_size:                int   = 50257
@@ -70,7 +70,7 @@ class VFE3Config:
     # NEURAL-NETWORK EXCEPTION (sanctioned, default-OFF): 'regime_ii' introduces a LEARNED bilinear
     # edge connection delta_ij^a = mu_i^T W^a mu_j, with W a model-owned nn.Parameter (shape
     # (n_gen, K, K)) trained by backprop on CE -- a documented learned-parameter exception in the
-    # spirit of use_head_mixer / alpha_mode='learnable' (see VFEModel.__init__'s connection_W and
+    # spirit of use_head_mixer / lambda_alpha_mode='learnable' (see VFEModel.__init__'s connection_W and
     # transport._build_regime_ii). At cocycle_relaxation=0 the flat builder's dict is returned
     # byte-identically; at W=0 (the zero-tensor init) the generic path reduces to the flat cocycle
     # to fp32 tolerance (atol 1e-6, pinned -- not bit-exact: the exp(0)=I einsum reorders fp32 ops;
@@ -155,20 +155,20 @@ class VFE3Config:
     family:                    str   = "gaussian_diagonal"
 
     # free-energy coupling
-    alpha:                     float = 1.0          # constant self-coupling value
+    lambda_alpha:              float = 1.0          # constant self-coupling value
     
-    # alpha_mode selects the self-coupling form (registry key). The default-and-pure no-NN forms
+    # lambda_alpha_mode selects the self-coupling form (registry key). The default-and-pure no-NN forms
     # are 'constant', 'state_dependent', 'state_dependent_per_coord' (closed-form functions of the
     # self-divergence D, no learned parameters) and are unchanged. NEURAL-NETWORK EXCEPTION:
     # 'learnable' introduces a model-owned scalar nn.Parameter log_alpha (alpha = exp(log_alpha))
     # trained by backprop -- a sanctioned, default-OFF learned-parameter exception in the spirit of
     # use_head_mixer / use_prior_bank (see VFEModel.__init__ and alpha_i.alpha_learnable). At init
     # log_alpha=0 -> alpha=1.0, byte-identical to constant alpha=1.0.
-    alpha_mode:                str   = "constant"
+    lambda_alpha_mode:         str   = "constant"
     
     b0:                        'float | List[float]' = 1.0   # state-dependent alpha shape: alpha* = c0/(b0 + D); list -> (K,) per-coord
     c0:                        'float | List[float]' = 1.0   # state-dependent alpha shape (numerator); list -> (K,) per-coord
-    kappa:                     'float | List[float]' = 1.0   # sharpness; list (len n_heads) -> per-head tau
+    kappa_beta:                'float | List[float]' = 1.0   # sharpness; list (len n_heads) -> per-head tau
    
     # lambda_beta weights the ENTIRE belief-coupling block of F -- sum_ij [ beta_ij E_ij +
     # tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-coupling and the likelihood
@@ -179,7 +179,7 @@ class VFE3Config:
     
     # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED lambda_beta. When True the model
     # creates a scalar nn.Parameter log_lambda_beta (lambda_beta = exp(log_lambda_beta)) trained by
-    # backprop through the unrolled E-step -- the spirit of alpha_mode='learnable'. Init 0 ->
+    # backprop through the unrolled E-step -- the spirit of lambda_alpha_mode='learnable'. Init 0 ->
     # lambda_beta = 1.0, byte-identical to the constant-1.0 pure path at step 0. Default False keeps
     # the path param-free.
     learnable_lambda_beta:      bool  = False
@@ -199,7 +199,7 @@ class VFE3Config:
     # Un-freeze the global hyper-prior centroid r (r_mu/r_sigma_log). Default False = FROZEN (current
     # behavior, byte-identical): a fixed centroid the model beliefs s_i are regularized toward, the
     # stand-in for the manuscript's "higher, slower meta-level". True trains r by gradient (grouped in
-    # build_optimizer like the s tables, mean@m_mu_lr / log-scale@m_sigma_lr) as an empirical-Bayes
+    # build_optimizer like the s tables, mean@m_p_mu_lr / log-scale@m_p_sigma_lr) as an empirical-Bayes
     # population centroid -- meaningful ONLY when s carries an independent data force
     # (prior_source='model_channel' routes the CE gradient into s). With s unanchored the only force on
     # s/r is lambda_h*KL(s||r), whose joint optimum is s_i=r=const (KL->0, the regularizer vanishes);
@@ -225,13 +225,13 @@ class VFE3Config:
     # -- use r_update_mode='gradient' there. See the 2026-06-13 r/lambda_h spec.
     r_update_mode:             str   = "gradient"   # "gradient" | "barycenter"
 
-    # lambda_h_mode selects the hyper-prior coupling form (the model-fiber analogue of alpha_mode;
+    # lambda_h_mode selects the hyper-prior coupling form (the model-fiber analogue of lambda_alpha_mode;
     # registry vfe3/lambda_h_i.py). The default-and-pure forms are 'constant' (lambda_h = cfg.lambda_h,
     # today's bare scalar) and 'state_dependent' (the closed-form envelope lambda_h*_i =
     # c0_h/(b0_h + KL(s_i||r)), which REQUIRES R_h(lambda_h)=b0_h*lambda_h - c0_h*log lambda_h added to
     # F and the s E-step for the envelope cancellation -- threaded automatically through both paths).
     # NEURAL-NETWORK EXCEPTION: 'learnable' introduces a model-owned scalar nn.Parameter log_lambda_h
-    # (lambda_h = exp(log_lambda_h)), a sanctioned default-OFF sibling of alpha_mode='learnable' /
+    # (lambda_h = exp(log_lambda_h)), a sanctioned default-OFF sibling of lambda_alpha_mode='learnable' /
     # learnable_lambda_beta. At init log_lambda_h=log(cfg.lambda_h) -> lambda_h=cfg.lambda_h, so a
     # learnable model is byte-identical to constant lambda_h at step 0. Non-'constant' modes require
     # lambda_h>0 (the channel-on gate and, for 'learnable', the log-init value); __post_init__ warns.
@@ -239,7 +239,7 @@ class VFE3Config:
     b0_h:                      float = 1.0          # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
     c0_h:                      float = 1.0          # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h
 
-    # Model-coupling weight gamma_coupling on the model-channel block gamma_coupling * mean_i F_red^s_i,
+    # Model-coupling weight lambda_gamma on the model-channel block lambda_gamma * mean_i F_red^s_i,
     # the reduced (envelope) form of sum_ij [ gamma_ij KL(s_i||Omega_ij s_j) + tau_g gamma_ij
     # log(gamma_ij/pi^s_ij) ] (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
     # lines 1241-1249). Default 0.0 = OFF. SECOND INCREMENT: a TRAINING-LOSS regularizer on the
@@ -247,11 +247,11 @@ class VFE3Config:
     # belief phi.detach()), so the gamma gradient reaches ONLY the s tables and the forward
     # (logits/ce) is byte-identical to the gamma=0 path -- the model channel stays predictively INERT
     # (s does NOT feed q). The detach deliberately severs the phi<-gamma coupling that full tied
-    # transport would carry; restoring it is part of the deferred s->q design. gamma_coupling>0 ALONE
+    # transport would carry; restoring it is part of the deferred s->q design. lambda_gamma>0 ALONE
     # creates the s tables (the r tables stay hyper-prior-only). NB: the mean over (B, H, N) makes
-    # gamma_coupling=1 a per-token-per-head mean weight, NOT the canonical sum-over-ij; the scale is a
+    # lambda_gamma=1 a per-token-per-head mean weight, NOT the canonical sum-over-ij; the scale is a
     # free coupling.
-    gamma_coupling:            float = 0.0
+    lambda_gamma:              float = 0.0
     kappa_gamma:               'float | List[float]' = 1.0   # model-channel sharpness; list -> per-head tau_gamma
     gamma_attention_prior:     str   = "causal"     # pi^s_ij seam for the model channel (its own prior)
 
@@ -268,7 +268,7 @@ class VFE3Config:
     # (default): the belief table mu_embed/sigma_log_embed -- byte-identical pure path. "model_channel":
     # the model-channel s tables (coupled by gamma/lambda_h) ARE the belief prior, so the model channel
     # drives predictions; phi stays the belief table (tied, B_state=B_model). Forces the s tables to
-    # exist; mu_embed is unused (dead) on this path. NB: with gamma_coupling=lambda_h=0, model_channel is
+    # exist; mu_embed is unused (dead) on this path. NB: with lambda_gamma=lambda_h=0, model_channel is
     # a pure RENAME of mu_embed (s plays mu_embed's role, CE-trained) -- ZERO added capacity; the model
     # channel changes predictions only once gamma>0 / lambda_h>0 shape s beyond CE. Oracle: s copied from
     # the belief prior tables -> byte-identical to "token".
@@ -277,8 +277,8 @@ class VFE3Config:
     # attention
     include_attention_entropy: bool  = True         # canonical (True) vs surrogate (False)
     
-    attention_prior:           str   = "causal"
-    
+    beta_attention_prior:      str   = "causal"
+
     alibi_slope:               float = 1.0          # base slope for alibi/causal_alibi priors (Press et al. schedule)
     attention_window:          int   = 128          # band half-width for the windowed/causal_windowed priors
     
@@ -286,8 +286,8 @@ class VFE3Config:
     t5_max_distance:           int   = 128          # t5_relative_bias: log-bucketing horizon (beyond -> last bucket)
 
     # E-step
-    e_mu_lr:                   float = 0.5
-    e_sigma_lr:                float = 0.015
+    e_q_mu_lr:                 float = 0.5
+    e_q_sigma_lr:              float = 0.015
     e_phi_lr:                  float = 0.0
 
     # Live model channel s (default OFF -> the manuscript's frozen slow channel). When True, s is
@@ -303,9 +303,9 @@ class VFE3Config:
     
     
     # E-step MEAN trust region (default OFF = current unbounded update). When set to
-    # a float, every per-iteration mean step delta_mu = e_mu_lr*nat_mu is clamped in sigma-whitened
+    # a float, every per-iteration mean step delta_mu = e_q_mu_lr*nat_mu is clamped in sigma-whitened
     # units to at most this many standard deviations (mu_trust_mode='box' per-coord, 'ball' = 2-norm
-    # Mahalanobis ball). None reproduces the bare mu = mu - e_mu_lr*nat_mu bit-for-bit. V2's winning
+    # Mahalanobis ball). None reproduces the bare mu = mu - e_q_mu_lr*nat_mu bit-for-bit. V2's winning
     # run used e_mu_q_trust=5.0, mu_trust_mode='box'.
     e_mu_q_trust:              Optional[float] = None
     e_sigma_q_trust:           float = 5.0
@@ -363,7 +363,7 @@ class VFE3Config:
     
     
     # Opt-in (default OFF): make the autograd belief-gradient ORACLE (used for the non-kernel
-    # families: gradient_mode='smoothing', family='gaussian_full', alpha_div!=1) return a
+    # families: gradient_mode='smoothing', family='gaussian_full', renyi_order!=1) return a
     # create_graph (differentiable) gradient under e_step_gradient='unroll', so the unrolled-through-
     # inference signal reaches the prior tables -- matching the closed-form kernel, which already does
     # this. Default OFF preserves the detached oracle (the gradient is truncated for those families,
@@ -374,14 +374,14 @@ class VFE3Config:
     # finite on the degenerate isotropic Sigma = I default gaussian_full init (stock eigh backward is
     # 100% NaN there), and the full-cov KL/entropy use safe_cholesky. So oracle_unroll_grad=True is the
     # correct setting to keep the through-inference signal live under gaussian_full (pinned across
-    # alpha_div in {0.5,1,1.5} by tests/test_fullcov_alpha_roadmap_2026_06_13.py). The residual caveat
+    # renyi_order in {0.5,1,1.5} by tests/test_fullcov_alpha_roadmap_2026_06_13.py). The residual caveat
     # is HIGHER order only: a genuine SECOND backward (double-grad / Hessian-vector product) can still
-    # NaN at large Renyi order (alpha_div>=2, the blend leaving the convex regime); do not rely on this
+    # NaN at large Renyi order (renyi_order>=2, the blend leaving the convex regime); do not rely on this
     # toggle for >1st-order autograd on gaussian_full.
     oracle_unroll_grad:        bool  = False
     
-    m_mu_lr:                   float = 0.025
-    m_sigma_lr:                float = 0.0025
+    m_p_mu_lr:                 float = 0.025
+    m_p_sigma_lr:              float = 0.0025
     m_phi_lr:                  float = 0.015
     
     
@@ -477,15 +477,15 @@ class VFE3Config:
 
         # divergence seam: divergence_family is the FUNCTIONAL (f-divergence) registry key
         # (renyi, squared_hellinger, ...), distinct from `family` (the covariance-structure
-        # kernel). alpha_div is the Renyi order, IGNORED by non-alpha functionals (e.g.
+        # kernel). renyi_order is the Renyi order, IGNORED by non-alpha functionals (e.g.
         # squared_hellinger). Both are live, modular seams (CLAUDE.md: slot in different
         # f-divergences). Validated against the functional REGISTRY (not a hardcoded literal
         # list) so a newly registered functional is config-selectable without editing here;
         # local import avoids a config <- divergence <- families import cycle.
         from vfe3.divergence import divergence_functionals
         _require(self.divergence_family, divergence_functionals(), "divergence_family")
-        if self.alpha_div <= 0.0:
-            raise ValueError(f"alpha_div must be positive, got {self.alpha_div}")
+        if self.renyi_order <= 0.0:
+            raise ValueError(f"renyi_order must be positive, got {self.renyi_order}")
 
         # model structure
         for name in ("vocab_size", "embed_dim", "max_seq_len", "n_heads"):
@@ -568,7 +568,7 @@ class VFE3Config:
             # ALiBi-family priors are built with H = n_heads (model._attention_log_prior) while
             # the energy head axis is the number of irrep blocks; require they agree so the
             # (H, N, N) prior aligns with the (..., H, N, N) energy.
-            for _pname in ("attention_prior", "gamma_attention_prior"):
+            for _pname in ("beta_attention_prior", "gamma_attention_prior"):
                 if (getattr(self, _pname) in ("alibi", "causal_alibi")
                         and self.n_heads != len(_block_dims)):
                     raise ValueError(
@@ -669,7 +669,7 @@ class VFE3Config:
             # and warn on the semantic shift (cross-coupling audit 2026-06-12). The coherent
             # single-block cross-coupled gauge itself still runs.
             import warnings
-            for _pname in ("attention_prior", "gamma_attention_prior"):
+            for _pname in ("beta_attention_prior", "gamma_attention_prior"):
                 if getattr(self, _pname) in ("alibi", "causal_alibi"):
                     raise ValueError(
                         f"{_pname}={getattr(self, _pname)!r} is incompatible with cross_couplings: an "
@@ -684,7 +684,7 @@ class VFE3Config:
                     "collapses irrep_dims to a single block [K], and the head mixer needs >= 2 blocks "
                     "to mix. Disable use_head_mixer or remove cross_couplings."
                 )
-            for _name in ("kappa", "kappa_gamma"):
+            for _name in ("kappa_beta", "kappa_gamma"):
                 if isinstance(getattr(self, _name), (list, tuple)):
                     raise ValueError(
                         f"{_name} per-head list is incompatible with cross_couplings: the cross-coupled "
@@ -727,7 +727,7 @@ class VFE3Config:
             )
 
         # free-energy coupling
-        for _name in ("kappa", "kappa_gamma"):
+        for _name in ("kappa_beta", "kappa_gamma"):
             _v = getattr(self, _name)
             if isinstance(_v, (list, tuple)):
                 if self.gauge_group in ("so_n", "sp_n"):
@@ -760,10 +760,10 @@ class VFE3Config:
             raise ValueError(f"lambda_beta must be >= 0, got {self.lambda_beta}")
         if self.lambda_h < 0.0:
             raise ValueError(f"lambda_h must be >= 0, got {self.lambda_h}")
-        if self.gamma_coupling < 0.0:
-            raise ValueError(f"gamma_coupling must be >= 0, got {self.gamma_coupling}")
+        if self.lambda_gamma < 0.0:
+            raise ValueError(f"lambda_gamma must be >= 0, got {self.lambda_gamma}")
         # attention priors validated against the prior REGISTRY (add-by-registering). Local import
-        # avoids a config <- attention_prior cycle; the bound name is reused for attention_prior below.
+        # avoids a config <- attention_prior cycle; the bound name is reused for beta_attention_prior below.
         from vfe3.attention_prior import _PRIORS
         _require(self.gamma_attention_prior, tuple(sorted(_PRIORS)), "gamma_attention_prior")
         _require(self.prior_source, _VALID_PRIOR_SOURCES, "prior_source")
@@ -785,11 +785,11 @@ class VFE3Config:
                 # Reject the pair at construction (audit 2026-06-09 P2). Local import matches the
                 # alpha_i pattern below.
                 from vfe3.alpha_i import alpha_is_per_coord
-                if not alpha_is_per_coord(self.alpha_mode):
+                if not alpha_is_per_coord(self.lambda_alpha_mode):
                     raise ValueError(
                         f"{name} list (per-coordinate) requires a per-coordinate alpha form "
-                        f"(alpha_mode='state_dependent_per_coord'); got "
-                        f"alpha_mode={self.alpha_mode!r}"
+                        f"(lambda_alpha_mode='state_dependent_per_coord'); got "
+                        f"lambda_alpha_mode={self.lambda_alpha_mode!r}"
                     )
                 if len(_v) != self.embed_dim:
                     raise ValueError(
@@ -804,12 +804,12 @@ class VFE3Config:
         for name in ("mu_init_std", "phi_scale"):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
-        # alpha_mode validated against the alpha-form REGISTRY (add-by-registering). Local import
+        # lambda_alpha_mode validated against the alpha-form REGISTRY (add-by-registering). Local import
         # avoids a config <- alpha_i cycle.
         from vfe3.alpha_i import _ALPHAS
-        _require(self.alpha_mode, tuple(sorted(_ALPHAS)), "alpha_mode")
+        _require(self.lambda_alpha_mode, tuple(sorted(_ALPHAS)), "lambda_alpha_mode")
         # lambda_h_mode validated against the hyper-prior-coupling registry (the model-fiber mirror of
-        # alpha_mode). r_update_mode selects the centroid M-step (gradient vs closed-form barycenter).
+        # lambda_alpha_mode). r_update_mode selects the centroid M-step (gradient vs closed-form barycenter).
         from vfe3.lambda_h_i import _LAMBDA_H_MODES
         _require(self.lambda_h_mode, _LAMBDA_H_MODES, "lambda_h_mode")
         _require(self.r_update_mode, ("gradient", "barycenter"), "r_update_mode")
@@ -819,11 +819,11 @@ class VFE3Config:
         # coordinates through the trace and log-determinant), so reject the inconsistent pair at
         # construction rather than letting the per-coordinate divergence raise mid-forward.
         from vfe3.alpha_i import alpha_is_per_coord
-        if alpha_is_per_coord(self.alpha_mode) and not family_is_diagonal:
+        if alpha_is_per_coord(self.lambda_alpha_mode) and not family_is_diagonal:
             raise ValueError(
-                f"alpha_mode={self.alpha_mode!r} needs a per-coordinate self-divergence, which "
+                f"lambda_alpha_mode={self.lambda_alpha_mode!r} needs a per-coordinate self-divergence, which "
                 f"exists only for a diagonal-covariance family; got family={self.family!r}. Use "
-                f"a diagonal family (e.g. 'gaussian_diagonal') or a per-position alpha_mode."
+                f"a diagonal family (e.g. 'gaussian_diagonal') or a per-position lambda_alpha_mode."
             )
         # The per-coordinate self-divergence exists only for a divergence that DECOMPOSES
         # coordinate-wise on a diagonal Gaussian -- the per-coordinate functional registry: Renyi/KL
@@ -833,13 +833,13 @@ class VFE3Config:
         # unregistered functional; reject the pair at construction too -- mirroring that raise -- so
         # this doubly-opt-in path fails fast at config time (the covariance half is rejected above).
         from vfe3.divergence import has_per_coord_functional, divergence_functionals_per_coord
-        if alpha_is_per_coord(self.alpha_mode) and not has_per_coord_functional(self.divergence_family):
+        if alpha_is_per_coord(self.lambda_alpha_mode) and not has_per_coord_functional(self.divergence_family):
             raise ValueError(
-                f"alpha_mode={self.alpha_mode!r} needs a per-coordinate self-divergence, which is "
+                f"lambda_alpha_mode={self.lambda_alpha_mode!r} needs a per-coordinate self-divergence, which is "
                 f"implemented only for divergences that decompose coordinate-wise on a diagonal "
                 f"Gaussian ({divergence_functionals_per_coord()}); got "
                 f"divergence_family={self.divergence_family!r} (e.g. 'squared_hellinger' does not "
-                f"decompose). Use a decomposable divergence or a per-position alpha_mode."
+                f"decompose). Use a decomposable divergence or a per-position lambda_alpha_mode."
             )
         # Calibration footgun (B4): the state-dependent envelope alpha* = c0/(b0 + D) is correct for
         # ANY divergence, but its RANGE collapses when D is BOUNDED. squared_hellinger has D = H^2 in
@@ -848,13 +848,13 @@ class VFE3Config:
         # b0/c0 are free, positivity-validated fields) -- set b0 ~ Dmax/10 (here ~0.1) to restore a
         # wide alpha* range. Only squared_hellinger is bounded-small; bhattacharyya/jeffreys are
         # bounded by kl_max/2 / 2*kl_max, wide enough that b0 = O(1) is not degenerate.
-        if (self.alpha_mode in ("state_dependent", "state_dependent_per_coord")
+        if (self.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord")
                 and self.divergence_family == "squared_hellinger"):
             _b0_vals = self.b0 if isinstance(self.b0, (list, tuple)) else [self.b0]
             if min(_b0_vals) >= 1.0:
                 import warnings
                 warnings.warn(
-                    f"alpha_mode={self.alpha_mode!r} with divergence_family='squared_hellinger' and "
+                    f"lambda_alpha_mode={self.lambda_alpha_mode!r} with divergence_family='squared_hellinger' and "
                     f"b0={self.b0}: squared Hellinger is bounded (H^2 in [0,1)), so the state-dependent "
                     f"alpha* = c0/(b0 + D) spans only a ~{1.0 + 1.0/min(_b0_vals):.1f}x range and the "
                     f"adaptive self-coupling is nearly constant. Set b0 ~ 0.1 (Dmax/10) for a wide "
@@ -864,10 +864,10 @@ class VFE3Config:
                 )
 
         # attention
-        _require(self.attention_prior, tuple(sorted(_PRIORS)), "attention_prior")
+        _require(self.beta_attention_prior, tuple(sorted(_PRIORS)), "beta_attention_prior")
 
         # E-step
-        for name in ("e_mu_lr", "e_sigma_lr", "e_phi_lr", "e_s_mu_lr", "e_s_sigma_lr"):
+        for name in ("e_q_mu_lr", "e_q_sigma_lr", "e_phi_lr", "e_s_mu_lr", "e_s_sigma_lr"):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         if self.s_e_step:
@@ -891,10 +891,10 @@ class VFE3Config:
                     f"are diagonal by construction), incompatible with family={self.family!r}. Use a "
                     "diagonal-covariance family (e.g. 'gaussian_diagonal') for the live s E-step."
                 )
-            if self.lambda_h == 0.0 and self.gamma_coupling == 0.0:
+            if self.lambda_h == 0.0 and self.lambda_gamma == 0.0:
                 import warnings
                 warnings.warn(
-                    "s_e_step=True with lambda_h=0 and gamma_coupling=0: the s-refine has no force, "
+                    "s_e_step=True with lambda_h=0 and lambda_gamma=0: the s-refine has no force, "
                     "so s1==s0 and the channel reduces to the static prior_source='model_channel' tie.",
                     UserWarning, stacklevel=2,
                 )
@@ -905,7 +905,7 @@ class VFE3Config:
         if self.learnable_r and not self.s_e_step:
             import warnings
             if self.lambda_h == 0.0:
-                # Inert: with lambda_h=0 no r table is created (gamma_coupling>0 builds only the s
+                # Inert: with lambda_h=0 no r table is created (lambda_gamma>0 builds only the s
                 # tables), so the toggle silently does nothing -- warn rather than no-op in silence.
                 warnings.warn(
                     "learnable_r=True has no effect: the hyper-prior centroid r is created only when "
@@ -1126,14 +1126,14 @@ class VFE3Config:
             )
         # use_prior_bank decode is a FIXED alpha=1 KL readout on the hardcoded Gaussian family
         # (prior_bank.reference_decode / the fused kernels call divergence.kl); it does NOT read
-        # alpha_div / divergence_family. An opt-in non-KL/non-alpha=1 seam therefore minimizes the
+        # renyi_order / divergence_family. An opt-in non-KL/non-alpha=1 seam therefore minimizes the
         # E-step under one divergence and reads logits out under another -- warn so the mismatch is a
-        # deliberate choice (the pure path is use_prior_bank=True with renyi / alpha_div=1).
-        if self.use_prior_bank and (self.alpha_div != 1.0 or self.divergence_family != "renyi"):
+        # deliberate choice (the pure path is use_prior_bank=True with renyi / renyi_order=1).
+        if self.use_prior_bank and (self.renyi_order != 1.0 or self.divergence_family != "renyi"):
             import warnings
             warnings.warn(
                 f"use_prior_bank=True decodes at a FIXED alpha=1 KL, but the E-step minimizes under "
-                f"divergence_family={self.divergence_family!r}/alpha_div={self.alpha_div}: inference "
+                f"divergence_family={self.divergence_family!r}/renyi_order={self.renyi_order}: inference "
                 f"and the KL-to-prior readout use different divergences.",
                 UserWarning,
                 stacklevel=2,
@@ -1236,7 +1236,7 @@ class VFE3Config:
         # at the MODEL level -- VFEModel.__init__, keyed on the EFFECTIVE estimator -- so it is left out
         # of this config-level predicate to keep the default config silent here.)
         if self.e_step_gradient in ("straight_through", "detach") and (
-            self.alpha_mode == "learnable"
+            self.lambda_alpha_mode == "learnable"
             or self.transport_mode == "regime_ii"
             or self.learnable_lambda_beta
             or (self.lambda_h_mode == "learnable" and self.s_e_step)
@@ -1246,7 +1246,7 @@ class VFE3Config:
             warnings.warn(
                 f"e_step_gradient={self.e_step_gradient!r} severs the per-iteration E-step tangent, so a "
                 "learnable parameter that enters the loss only through it (log_alpha under "
-                "alpha_mode='learnable', connection_W under transport_mode='regime_ii', log_lambda_beta "
+                "lambda_alpha_mode='learnable', connection_W under transport_mode='regime_ii', log_lambda_beta "
                 "under learnable_lambda_beta, log_lambda_h under lambda_h_mode='learnable'+s_e_step, "
                 "r_mu/r_sigma_log under learnable_r+r_update_mode='gradient'+s_e_step) "
                 "receives NO gradient and stays frozen. Use e_step_gradient='unroll' (the default) to "
@@ -1259,9 +1259,9 @@ class VFE3Config:
         # fallback (served for every NON-kernel family) returns a DETACHED tangent unless
         # oracle_unroll_grad=True, truncating that signal. The kernel covers exactly
         # gradient_mode=='filtering' AND family=='gaussian_diagonal' AND divergence_family=='renyi' AND
-        # alpha_div==1.0 AND include_attention_entropy (verified against gradients.kernels.use_kernel);
+        # renyi_order==1.0 AND include_attention_entropy (verified against gradients.kernels.use_kernel);
         # any other combination routes to the oracle. When it does and an E-step-only learnable param is
-        # active (alpha_mode='learnable' / transport_mode='regime_ii' / learnable_lambda_beta /
+        # active (lambda_alpha_mode='learnable' / transport_mode='regime_ii' / learnable_lambda_beta /
         # pos_phi='learned'), that param receives NO gradient through the detached oracle. Warn
         # (non-breaking); oracle_unroll_grad=True restores the differentiable oracle gradient.
         # transport_mode='regime_ii' ALWAYS routes to the oracle (audit 2026-06-10 F1: the kernel
@@ -1272,7 +1272,7 @@ class VFE3Config:
             self.gradient_mode == "filtering"
             and self.family == "gaussian_diagonal"
             and self.divergence_family == "renyi"
-            and self.alpha_div == 1.0
+            and self.renyi_order == 1.0
             and self.include_attention_entropy
         )
         if (
@@ -1280,7 +1280,7 @@ class VFE3Config:
             and not self.oracle_unroll_grad
             and _routes_to_oracle
             and (
-                self.alpha_mode == "learnable"
+                self.lambda_alpha_mode == "learnable"
                 or self.transport_mode == "regime_ii"
                 or self.learnable_lambda_beta
                 or (self.lambda_h_mode == "learnable" and self.s_e_step)
@@ -1293,9 +1293,9 @@ class VFE3Config:
                 "e_step_gradient='unroll' but this family/gradient_mode routes the belief gradient to "
                 "the autograd ORACLE (NOT the closed-form kernel: that covers only "
                 "gradient_mode='filtering' + family='gaussian_diagonal' + divergence_family='renyi' + "
-                "alpha_div=1.0 + include_attention_entropy=True), which returns a DETACHED tangent while "
+                "renyi_order=1.0 + include_attention_entropy=True), which returns a DETACHED tangent while "
                 "oracle_unroll_grad=False. A learnable parameter that enters the loss only through the "
-                "E-step tangent (log_alpha under alpha_mode='learnable', connection_W under "
+                "E-step tangent (log_alpha under lambda_alpha_mode='learnable', connection_W under "
                 "transport_mode='regime_ii', log_lambda_beta under learnable_lambda_beta, log_lambda_h "
                 "under lambda_h_mode='learnable'+s_e_step, r_mu/r_sigma_log under "
                 "learnable_r+r_update_mode='gradient'+s_e_step, pos_phi_free under pos_phi='learned') "
@@ -1308,7 +1308,7 @@ class VFE3Config:
             raise ValueError(f"e_mu_q_trust must be > 0 or None, got {self.e_mu_q_trust}")
         if self.mu_trust_mode not in ("box", "ball"):
             raise ValueError(f"mu_trust_mode must be 'box' or 'ball', got {self.mu_trust_mode!r}")
-        for name in ("m_mu_lr", "m_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr", "min_lr_frac"):
+        for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr", "min_lr_frac"):
             v = getattr(self, name)
             if v < 0.0 or v != v:                            # v != v rejects NaN (which passes < 0.0)
                 raise ValueError(f"{name} must be >= 0 (and not NaN), got {v}")
@@ -1356,7 +1356,7 @@ class VFE3Config:
         by sqrt(n_heads). kappa=1 recovers the Vaswani sqrt(d_k) temperature over the energy dimension.
         When kappa is a per-head list, returns the mean tau (for logging only).
         """
-        k = float(sum(self.kappa) / len(self.kappa)) if isinstance(self.kappa, (list, tuple)) else self.kappa
+        k = float(sum(self.kappa_beta) / len(self.kappa_beta)) if isinstance(self.kappa_beta, (list, tuple)) else self.kappa_beta
         return k * (self.d_head ** 0.5)
 
     @property

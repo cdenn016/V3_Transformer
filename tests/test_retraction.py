@@ -353,7 +353,7 @@ def test_full_cov_e_step_isotropic_init_finite_backward():
     mu_p = torch.randn(N, K)
     sigma_p = torch.eye(K).expand(N, K, K).clone()
     out = e_step_iteration(belief, mu_p, sigma_p, group,
-                           e_mu_lr=0.1, e_sigma_lr=0.05, e_phi_lr=0.0,
+                           e_q_mu_lr=0.1, e_q_sigma_lr=0.05, e_phi_lr=0.0,
                            family="gaussian_full", spd_retract_mode="spd_affine")
     (out.mu.pow(2).sum() + out.sigma.pow(2).sum()).backward()
     assert torch.isfinite(mu.grad).all()
@@ -402,7 +402,7 @@ def test_log_euclidean_e_step_full_cov_runs():
 
     out = e_step_iteration(
         belief, mu_p, sigma_p, group,
-        e_mu_lr=0.1, e_sigma_lr=0.05, e_phi_lr=0.0,
+        e_q_mu_lr=0.1, e_q_sigma_lr=0.05, e_phi_lr=0.0,
         family="gaussian_full", spd_retract_mode="log_euclidean",
     )
     assert torch.isfinite(out.sigma).all()

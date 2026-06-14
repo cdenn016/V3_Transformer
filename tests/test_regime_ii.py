@@ -136,7 +136,7 @@ def test_regime_ii_cocycle_relaxation_homotopy():
 def _tiny_cfg(transport_mode="flat", cocycle_relaxation=1.0, **kw):
     return VFE3Config(
         vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-        n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.0,
+        n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
         transport_mode=transport_mode, cocycle_relaxation=cocycle_relaxation, **kw,
     )
 
@@ -258,7 +258,7 @@ def test_phi_estep_descends_regime_ii_not_flat():
     # The phi E-step must build its Omega with the ACTIVE transport_mode. Under regime_ii + e_phi_lr>0
     # with a nonzero learned connection, the regime_ii phi update differs from the flat one; the bug
     # (phi_alignment_loss always built the flat Omega) made the phi output independent of
-    # transport_mode. e_mu_lr=e_sigma_lr=0 isolates the phi step; W != 0 makes regime_ii != flat.
+    # transport_mode. e_q_mu_lr=e_q_sigma_lr=0 isolates the phi step; W != 0 makes regime_ii != flat.
     grp = get_group("block_glk")(6, 2)
     n_gen = grp.generators.shape[0]
     torch.manual_seed(0)
@@ -267,7 +267,7 @@ def test_phi_estep_descends_regime_ii_not_flat():
                          phi=0.1 * torch.randn(N, n_gen))
     mu_p, sigma_p = torch.randn(N, K), torch.rand(N, K) + 0.5
     W = 0.5 * torch.randn(n_gen, K, K)                 # nonzero connection -> regime_ii != flat
-    kw = dict(e_mu_lr=0.0, e_sigma_lr=0.0, e_phi_lr=0.1, connection_W=W, cocycle_relaxation=1.0)
+    kw = dict(e_q_mu_lr=0.0, e_q_sigma_lr=0.0, e_phi_lr=0.1, connection_W=W, cocycle_relaxation=1.0)
     out_flat = e_step_iteration(belief, mu_p, sigma_p, grp, transport_mode="flat", **kw)
     out_rii = e_step_iteration(belief, mu_p, sigma_p, grp, transport_mode="regime_ii", **kw)
     assert not torch.allclose(out_flat.phi, out_rii.phi, atol=1e-6)
@@ -318,7 +318,7 @@ def test_regime_ii_excluded_from_kernel_route():
     """Audit F1: the hand kernel is the flat-transport gradient (it drops dOmega/dmu), so the
     kernel-coverage predicate must exclude transport_mode='regime_ii' even at the canonical
     operating point."""
-    base = dict(alpha_div=1.0, gradient_mode="filtering", family="gaussian_diagonal",
+    base = dict(renyi_order=1.0, gradient_mode="filtering", family="gaussian_diagonal",
                 divergence_family="renyi", include_attention_entropy=True)
     assert uses_kernel_route(**base, transport_mode="flat")
     assert not uses_kernel_route(**base, transport_mode="regime_ii")

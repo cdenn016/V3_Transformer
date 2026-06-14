@@ -157,7 +157,7 @@ def test_attention_tau_equal_blocks_unchanged_scalar():
 def _so_n_cfg(**overrides) -> VFE3Config:
     base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                 gauge_group="so_n", group_n=3, irrep_spec=[("l0", 1), ("l1", 1)],
-                n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0)
+                n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0)
     base.update(overrides)
     return VFE3Config(**base)
 
@@ -190,17 +190,17 @@ def test_config_so_n_rejects_per_block_phi_preconditioners():
 
 
 def test_config_so_n_per_head_kappa_keyed_to_block_count():
-    cfg = _so_n_cfg(kappa=[1.0, 2.0])                         # 2 irrep blocks -> ok
-    assert list(cfg.kappa) == [1.0, 2.0]
+    cfg = _so_n_cfg(kappa_beta=[1.0, 2.0])                    # 2 irrep blocks -> ok
+    assert list(cfg.kappa_beta) == [1.0, 2.0]
     with pytest.raises(ValueError, match="one entry per irrep block"):
-        _so_n_cfg(kappa=[1.0, 2.0, 3.0])
+        _so_n_cfg(kappa_beta=[1.0, 2.0, 3.0])
 
 
 def test_config_so_n_alibi_requires_head_count_match():
     with pytest.raises(ValueError, match="irrep blocks"):
-        _so_n_cfg(attention_prior="causal_alibi", n_heads=4)
-    cfg = _so_n_cfg(attention_prior="causal_alibi", n_heads=2)    # 2 blocks == n_heads
-    assert cfg.attention_prior == "causal_alibi"
+        _so_n_cfg(beta_attention_prior="causal_alibi", n_heads=4)
+    cfg = _so_n_cfg(beta_attention_prior="causal_alibi", n_heads=2)    # 2 blocks == n_heads
+    assert cfg.beta_attention_prior == "causal_alibi"
 
 
 # ---------------------------------------------------------------- end-to-end model
@@ -210,7 +210,7 @@ def test_model_runs_under_so_n_irrep_tower():
     # same model/E-step machinery: forward + loss.backward() with targets yields a finite loss
     # and finite grad on the prior tables. Mirrors test_model_runs_under_sp_gauge_group.
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
+                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
                      gauge_group="so_n", group_n=3, irrep_spec=[("l0", 1), ("l1", 1)],
                      phi_precond_mode="none")
     model = VFEModel(cfg)

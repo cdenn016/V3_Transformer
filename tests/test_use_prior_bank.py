@@ -71,7 +71,7 @@ def test_no_nn_linear_module_even_under_use_prior_bank_false():
 
 def test_model_forward_and_backward_under_use_prior_bank_false():
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0, use_prior_bank=False)
+                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, use_prior_bank=False)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))
     targets = torch.randint(0, 20, (3, 5))

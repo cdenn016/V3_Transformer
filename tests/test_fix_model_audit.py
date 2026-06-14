@@ -106,7 +106,7 @@ def _spy_free_energy_terms(monkeypatch):
 
 
 def test_diagnostics_threads_reg_when_state_dependent(monkeypatch):
-    cfg = _tiny_cfg(alpha_mode="state_dependent_per_coord")
+    cfg = _tiny_cfg(lambda_alpha_mode="state_dependent_per_coord")
     model = VFEModel(cfg)
     token_ids = torch.zeros((1, cfg.max_seq_len), dtype=torch.long)
     seen = _spy_free_energy_terms(monkeypatch)
@@ -117,7 +117,7 @@ def test_diagnostics_threads_reg_when_state_dependent(monkeypatch):
 
 
 def test_diagnostics_reg_is_none_when_constant(monkeypatch):
-    cfg = _tiny_cfg(alpha_mode="constant")
+    cfg = _tiny_cfg(lambda_alpha_mode="constant")
     model = VFEModel(cfg)
     token_ids = torch.zeros((1, cfg.max_seq_len), dtype=torch.long)
     seen = _spy_free_energy_terms(monkeypatch)

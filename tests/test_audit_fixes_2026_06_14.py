@@ -3,7 +3,7 @@ r"""Regression pins for the behavioral fixes from the 2026-06-14 overnight deep 
 Covers the three NON-doc changes (the doc-only fixes L1/L2/L6/L7 and the prior_bank M1 docstring
 are not string-pinned, per repo convention):
   M1 -- config warns when use_prior_bank=True decodes at fixed alpha=1 KL under a non-KL/non-alpha=1
-        E-step seam (and is silent on the pure renyi/alpha_div=1 path).
+        E-step seam (and is silent on the pure renyi/renyi_order=1 path).
   L5 -- the generic Renyi-from-A path is float64-guarded near alpha=1 (was ~1e-2 fp32 rel err).
   L8 -- safe_spd_inverse retries per element, so one non-PD batch element no longer poisons the
         exact Cholesky inverse of its well-conditioned siblings.
@@ -33,17 +33,17 @@ _M1_SUBSTR = "decodes at a FIXED alpha=1 KL"
 
 
 def test_m1_use_prior_bank_nonkl_seam_warns():
-    # alpha_div != 1 under the prior-bank (KL) decode: warn.
-    assert _warns_matching(_M1_SUBSTR, use_prior_bank=True, alpha_div=0.5)
+    # renyi_order != 1 under the prior-bank (KL) decode: warn.
+    assert _warns_matching(_M1_SUBSTR, use_prior_bank=True, renyi_order=0.5)
     # a non-renyi functional under the prior-bank decode: warn.
     assert _warns_matching(_M1_SUBSTR, use_prior_bank=True, divergence_family="squared_hellinger")
 
 
 def test_m1_pure_kl_seam_does_not_warn():
-    # the pure path (renyi / alpha_div=1) is silent.
+    # the pure path (renyi / renyi_order=1) is silent.
     assert not _warns_matching(_M1_SUBSTR, use_prior_bank=True)
     # use_prior_bank=False decodes linearly -- the decode/E-step mismatch does not apply.
-    assert not _warns_matching(_M1_SUBSTR, use_prior_bank=False, alpha_div=0.5)
+    assert not _warns_matching(_M1_SUBSTR, use_prior_bank=False, renyi_order=0.5)
 
 
 # --- L5: generic Renyi-from-A float64 cancellation guard near alpha=1 --------------------------

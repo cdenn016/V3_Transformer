@@ -156,7 +156,7 @@ the prior tables and a linear-warmup-then-cosine schedule with an optional learn
 floor. Because the E-step is unrolled into the autograd graph, the cross-entropy loss
 backpropagates through the entire inference trajectory and into the prior tables; the
 mean, log-variance, and gauge-frame tables each get their own learning rate
-(`m_mu_lr`, `m_sigma_lr`, `m_phi_lr`).
+(`m_p_mu_lr`, `m_p_sigma_lr`, `m_phi_lr`).
 
 ## The free energy
 
@@ -227,14 +227,14 @@ network and each byte-identical to the pure path at initialization, are: a linea
 projection that replaces the KL decode (`use_prior_bank=False`, the VFE_2.0-parity
 ablation); a learned Schur-commutant head mixer (`use_head_mixer=True`); a learned bilinear
 edge connection for non-flat Regime-II transport (`transport_mode='regime_ii'`); a learned
-scalar self-coupling (`alpha_mode='learnable'`); and a learned belief-coupling weight
+scalar self-coupling (`lambda_alpha_mode='learnable'`); and a learned belief-coupling weight
 (`learnable_lambda_beta=True`). The Regime-II connection and the head mixer break strict
 gauge equivariance away from their zero/identity initialization, which is documented and
 user-accepted.
 
 The hierarchical channel of the manuscript — a hyper-prior `h -> s -> p -> q` with a
 model-channel belief `s` and a global centroid `r` — is only partially realized. The
-hyper-prior term `lambda_h * KL(s || r)` and the model-coupling term `gamma_coupling *
+hyper-prior term `lambda_h * KL(s || r)` and the model-coupling term `lambda_gamma *
 F_red^s` exist as default-off training-loss regularizers on a second set of `s` tables, but
 the `s` channel does not feed the belief `q` (its transport is tied and detached, so it is
 predictively inert), and the full `s -> q` coupling and the `s`-channel E-step update are

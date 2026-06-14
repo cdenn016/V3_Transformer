@@ -137,7 +137,7 @@ def test_cg_coupling_full_cov_sigma_passes_through():
 def _e2e_cfg(**kw):
     from vfe3.config import VFE3Config
     base = dict(vocab_size=20, embed_dim=9, n_heads=3, max_seq_len=5, n_layers=1,
-                n_e_steps=1, e_mu_lr=0.05, e_phi_lr=0.0,
+                n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
                 gauge_group="so_n", group_n=3,
                 irrep_spec=[("l0", 1), ("l1", 1), ("l2", 1)],
                 phi_precond_mode="none")
