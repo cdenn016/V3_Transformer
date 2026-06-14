@@ -336,10 +336,17 @@ class VFE3Config:
     # create_graph (differentiable) gradient under e_step_gradient='unroll', so the unrolled-through-
     # inference signal reaches the prior tables -- matching the closed-form kernel, which already does
     # this. Default OFF preserves the detached oracle (the gradient is truncated for those families,
-    # the long-standing behavior), so the default path is unchanged. CAVEAT: this builds a SECOND-ORDER
-    # graph through the E-step; it is numerically stable for the DIAGONAL non-kernel families
-    # (smoothing / alpha_div!=1) but the full-covariance eigh/cholesky double-backward can produce NaN
-    # gradients, so leave OFF for gaussian_full (or expect NaNs there).
+    # the long-standing behavior), so the default path is unchanged. NUMERICS: this builds a
+    # SECOND-ORDER graph through the E-step. The SINGLE training backward is FINITE for ALL the
+    # non-kernel families, full covariance included: the SPD retractions route their eigendecomposition
+    # through the gap-regularized _eigh_damped (retraction.py), whose Lorentzian-damped adjoint is
+    # finite on the degenerate isotropic Sigma = I default gaussian_full init (stock eigh backward is
+    # 100% NaN there), and the full-cov KL/entropy use safe_cholesky. So oracle_unroll_grad=True is the
+    # correct setting to keep the through-inference signal live under gaussian_full (pinned across
+    # alpha_div in {0.5,1,1.5} by tests/test_fullcov_alpha_roadmap_2026_06_13.py). The residual caveat
+    # is HIGHER order only: a genuine SECOND backward (double-grad / Hessian-vector product) can still
+    # NaN at large Renyi order (alpha_div>=2, the blend leaving the convex regime); do not rely on this
+    # toggle for >1st-order autograd on gaussian_full.
     oracle_unroll_grad:        bool  = False
     
     m_mu_lr:                   float = 0.025
@@ -782,18 +789,43 @@ class VFE3Config:
                 f"exists only for a diagonal-covariance family; got family={self.family!r}. Use "
                 f"a diagonal family (e.g. 'gaussian_diagonal') or a per-position alpha_mode."
             )
-        # The per-coordinate self-divergence is registered only for the Renyi functional (KL = Renyi
-        # at alpha=1); free_energy.self_divergence_per_coord raises for any other divergence_family.
-        # Reject the non-Renyi pair at construction too -- mirroring that runtime raise -- so this
-        # doubly-opt-in path fails fast at config time rather than only at the first forward (the
-        # covariance half is rejected just above).
-        if alpha_is_per_coord(self.alpha_mode) and self.divergence_family != "renyi":
+        # The per-coordinate self-divergence exists only for a divergence that DECOMPOSES
+        # coordinate-wise on a diagonal Gaussian -- the per-coordinate functional registry: Renyi/KL
+        # and the two divergences AFFINE in it (Bhattacharyya = 0.5 D_{1/2}, Jeffreys = KL + KL_rev).
+        # squared_hellinger is excluded (H^2 = 1 - exp(-D_{1/2}/2) is a nonlinear transform of the
+        # SUMMED divergence). free_energy.self_divergence_per_coord raises at runtime for an
+        # unregistered functional; reject the pair at construction too -- mirroring that raise -- so
+        # this doubly-opt-in path fails fast at config time (the covariance half is rejected above).
+        from vfe3.divergence import has_per_coord_functional, divergence_functionals_per_coord
+        if alpha_is_per_coord(self.alpha_mode) and not has_per_coord_functional(self.divergence_family):
             raise ValueError(
                 f"alpha_mode={self.alpha_mode!r} needs a per-coordinate self-divergence, which is "
-                f"implemented for the 'renyi' functional only (KL = Renyi at alpha=1); got "
-                f"divergence_family={self.divergence_family!r}. Use divergence_family='renyi' or a "
-                f"per-position alpha_mode."
+                f"implemented only for divergences that decompose coordinate-wise on a diagonal "
+                f"Gaussian ({divergence_functionals_per_coord()}); got "
+                f"divergence_family={self.divergence_family!r} (e.g. 'squared_hellinger' does not "
+                f"decompose). Use a decomposable divergence or a per-position alpha_mode."
             )
+        # Calibration footgun (B4): the state-dependent envelope alpha* = c0/(b0 + D) is correct for
+        # ANY divergence, but its RANGE collapses when D is BOUNDED. squared_hellinger has D = H^2 in
+        # [0, 1), so the alpha* ratio max/min = 1 + 1/b0; at the default b0 = 1 that is only ~2x (vs
+        # ~1 + kl_max/b0 for the unbounded KL), so the adaptive coupling is nearly inert. Warn (the
+        # b0/c0 are free, positivity-validated fields) -- set b0 ~ Dmax/10 (here ~0.1) to restore a
+        # wide alpha* range. Only squared_hellinger is bounded-small; bhattacharyya/jeffreys are
+        # bounded by kl_max/2 / 2*kl_max, wide enough that b0 = O(1) is not degenerate.
+        if (self.alpha_mode in ("state_dependent", "state_dependent_per_coord")
+                and self.divergence_family == "squared_hellinger"):
+            _b0_vals = self.b0 if isinstance(self.b0, (list, tuple)) else [self.b0]
+            if min(_b0_vals) >= 1.0:
+                import warnings
+                warnings.warn(
+                    f"alpha_mode={self.alpha_mode!r} with divergence_family='squared_hellinger' and "
+                    f"b0={self.b0}: squared Hellinger is bounded (H^2 in [0,1)), so the state-dependent "
+                    f"alpha* = c0/(b0 + D) spans only a ~{1.0 + 1.0/min(_b0_vals):.1f}x range and the "
+                    f"adaptive self-coupling is nearly constant. Set b0 ~ 0.1 (Dmax/10) for a wide "
+                    f"alpha* range, or use an unbounded divergence (renyi/KL).",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         # attention
         _require(self.attention_prior, tuple(sorted(_PRIORS)), "attention_prior")
@@ -990,18 +1022,20 @@ class VFE3Config:
         from vfe3.model.prior_bank import _DECODERS, _ENCODERS
         _require(self.decode_mode, tuple(sorted(set(_DECODERS) - {"linear"})), "decode_mode")
         # decode_mode sets the RANK of the prior-bank KL-decode kernel: 'diagonal'/'diagonal_chunked'
-        # consume a diagonal sigma (B,N,K); 'full' consumes a full sigma (B,N,K,K). It must agree with
-        # the covariance family, else the rank mismatch is a shape RuntimeError at the first forward.
-        # The use_prior_bank=False linear decode discards sigma and reads decode_mode for exactly one
-        # thing: 'diagonal_chunked' selects the fused chunked-CE training path over logits = mu @ W^T
-        # (vram audit 2026-06-10) -- rank is irrelevant there, so the cross-check stays gated on
-        # use_prior_bank.
-        if self.use_prior_bank and (self.decode_mode == "full") == family_is_diagonal:
+        # consume a diagonal sigma (B,N,K); 'full'/'full_chunked' consume a full sigma (B,N,K,K). It
+        # must agree with the covariance family, else the rank mismatch is a shape RuntimeError at the
+        # first forward. The use_prior_bank=False linear decode discards sigma and reads decode_mode
+        # for exactly one thing: '*_chunked' selects the fused chunked-CE training path over
+        # logits = mu @ W^T (vram audit 2026-06-10) -- rank is irrelevant there, so the cross-check
+        # stays gated on use_prior_bank.
+        decode_is_full = self.decode_mode in ("full", "full_chunked")
+        if self.use_prior_bank and decode_is_full == family_is_diagonal:
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
-                f"'full' decode needs a full-covariance family and 'diagonal'/'diagonal_chunked' decode "
-                f"needs a diagonal family. Pair decode_mode='full' with a full family, use a diagonal "
-                f"decode_mode with a diagonal family, or set use_prior_bank=False (linear decode)."
+                f"'full'/'full_chunked' decode needs a full-covariance family and "
+                f"'diagonal'/'diagonal_chunked' decode needs a diagonal family. Pair a full decode_mode "
+                f"with a full family, use a diagonal decode_mode with a diagonal family, or set "
+                f"use_prior_bank=False (linear decode)."
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
@@ -1016,6 +1050,23 @@ class VFE3Config:
                 "per-vocab priors already play the log-unigram role. Set use_prior_bank=False "
                 "(linear decode) for the learned bias to take effect.",
                 UserWarning,
+            )
+        # Full-covariance compute discarded at the decode boundary (B4): use_prior_bank=False decodes
+        # by the linear readout logits = mu_q @ W^T, which DISCARDS sigma. With a full-covariance family
+        # the E-step still evolves a (B, N, K, K) covariance (it shapes the mean trajectory, so the
+        # result is correct, not wasted) but that covariance never reaches the output. Warn so the
+        # combination is a deliberate choice, not a silent surprise; the full covariance reaches the
+        # logits only under the use_prior_bank=True KL decode (decode_mode='full'/'full_chunked').
+        if not family_is_diagonal and not self.use_prior_bank:
+            import warnings
+            warnings.warn(
+                f"family={self.family!r} (full covariance) with use_prior_bank=False: the linear "
+                f"decode logits = mu_q @ W^T discards the converged (B,N,K,K) covariance at the output "
+                f"boundary (it still shapes the E-step mean trajectory, so the result is correct). For "
+                f"the covariance to reach the logits use use_prior_bank=True with "
+                f"decode_mode='full'/'full_chunked' (the KL-to-prior decode).",
+                UserWarning,
+                stacklevel=2,
             )
         # encode_mode validated against the live encoder registry (per_token + the 'gauge_fixed'
         # stub, which the existing NotImplementedError guard below then rejects).

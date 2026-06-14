@@ -551,15 +551,23 @@ class VFEModel(nn.Module):
         # Inference (targets=None) still routes through decode() below for full logits.
         fused_chunked = (
             targets is not None
-            and self.cfg.decode_mode == "diagonal_chunked"
+            and self.cfg.decode_mode in ("diagonal_chunked", "full_chunked")
         )
         if fused_chunked:
             with self._amp_off_context(token_ids.device):
-                if self.cfg.use_prior_bank:
+                if self.cfg.use_prior_bank and self.cfg.decode_mode == "full_chunked":
+                    # full-covariance KL CE via the diagonal-prior closed form: no (B,N,V) logits
+                    # AND no (B,N,V,K,K) per-pair Cholesky workspace (decode_ce_full_chunked).
+                    ce = self.prior_bank.decode_ce_full_chunked(
+                        mu_final.float(), sigma_final.float(), targets,
+                    )
+                elif self.cfg.use_prior_bank:
                     ce = self.prior_bank.decode_ce_diagonal_chunked(
                         mu_final.float(), sigma_final.float(), targets,
                     )
                 else:
+                    # linear ablation discards sigma; the chunked-CE path is rank-agnostic, so a
+                    # '*_chunked' decode_mode (diagonal_chunked or full_chunked) both route here.
                     ce = self.prior_bank.decode_ce_linear_chunked(mu_final.float(), targets)
             logits = None                                        # no (B, N, V) tensor on the fused path
         else:

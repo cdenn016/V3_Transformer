@@ -28,6 +28,13 @@ from vfe3.families.base import (
     squared_hellinger,
     bhattacharyya,
     jeffreys,
+    renyi_per_coord,
+    bhattacharyya_per_coord,
+    jeffreys_per_coord,
+    register_functional_per_coord,
+    get_functional_per_coord,
+    has_per_coord_functional,
+    divergence_functionals_per_coord,
 )
 from vfe3.families import gaussian as _gaussian     # noqa: F401  (registers the Gaussian families)
 
@@ -37,12 +44,19 @@ __all__ = [
     "squared_hellinger",
     "bhattacharyya",
     "jeffreys",
+    "renyi_per_coord",
+    "bhattacharyya_per_coord",
+    "jeffreys_per_coord",
     "safe_kl_clamp",
     "family_cov_kind",
     "divergence_families",
     "divergence_functionals",
     "register_functional",
     "get_functional",
+    "register_functional_per_coord",
+    "get_functional_per_coord",
+    "has_per_coord_functional",
+    "divergence_functionals_per_coord",
     "get_family",
     "register_family",
 ]

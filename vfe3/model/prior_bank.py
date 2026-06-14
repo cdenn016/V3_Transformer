@@ -32,6 +32,8 @@ from torch import nn
 
 from vfe3.belief import BeliefState
 from vfe3.divergence import get_family, kl
+from vfe3.families.base import _logdet_chol
+from vfe3.numerics import safe_cholesky
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +394,122 @@ class PriorBank(nn.Module):
             return ce_per_pos.sum() * 0.0
         return (ce_per_pos * valid).sum() / n_valid
 
+    def _full_cov_query_invariants(
+        self,
+        sigma_q: torch.Tensor,           # (B, N, K, K) posterior covariances
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Per-position, v-INDEPENDENT pieces of the full-cov KL against a DIAGONAL prior.
+
+        Scoring a full q = N(mu_q, Sigma_q) against a diagonal prior pi_v = N(mu_v, diag(sigma_v))
+        is the gaussian_full KL with a DIAGONAL second covariance, which collapses every per-pair
+        (K, K) Cholesky into matmuls over V PLUS one per-position log|Sigma_q|. This returns the two
+        pieces that depend on q only (not on the vocabulary):
+            diag_sq_reg = diag(Sigma_q) + eps         (B, N, K)  -- the regularized query variances
+            logdet_q    = log|Sigma_q + eps I|        (B, N)
+        regularized with the SAME eps the gaussian_full closed form adds to both covariances
+        (families/gaussian.py renyi_closed_form), so the diagonal-prior closed form is value-equal
+        to ``_decode_full`` (the per-pair Cholesky seam) without ever forming a (B, N, V, K, K)
+        workspace. ``safe_cholesky`` (jittered, never raises) yields a finite log-det; the SPD
+        retraction keeps Sigma_q PD in training, so the gaussian_full all-rounds-fail NaN mask is
+        not replicated here (a negligible degenerate edge the dense path maps to a -inf logit).
+        """
+        K = sigma_q.shape[-1]
+        eye = torch.eye(K, device=sigma_q.device, dtype=sigma_q.dtype)
+        sq_reg = sigma_q + self.eps * eye                                  # (B, N, K, K)
+        diag_sq_reg = torch.diagonal(sq_reg, dim1=-2, dim2=-1)             # (B, N, K) = diag(Sigma_q)+eps
+        L, _ = safe_cholesky(sq_reg, eps=self.eps, rounds=5)
+        logdet_q = _logdet_chol(L)                                         # (B, N)
+        return diag_sq_reg, logdet_q
+
+    def decode_ce_full_chunked(
+        self,
+        mu_q:    torch.Tensor,           # (B, N, K) posterior means
+        sigma_q: torch.Tensor,           # (B, N, K, K) posterior covariances
+        targets: torch.Tensor,           # (B, N) next-token ids (-100 = ignore)
+
+        *,
+        tau:          Optional[float] = None,   # override decode_tau; None -> self.decode_tau
+        chunk_size:   Optional[int]   = None,   # vocab-chunk width; None -> self.decode_chunk_size
+        ignore_index: int             = -100,
+    ) -> torch.Tensor:                   # () scalar mean cross-entropy
+        r"""Fused chunked-vocab cross-entropy for the FULL-covariance KL decode WITHOUT the dense
+        (B, N, V) logits OR the (B, N, V, K, K) per-pair Cholesky workspace ``_decode_full`` builds.
+
+        The prior table is DIAGONAL (sigma_log_embed), so KL(q_full || pi_v_diag) needs no per-pair
+        (K, K) Cholesky: the v-dependent trace and Mahalanobis terms are matmuls over V and the only
+        (K, K) work is ONE log|Sigma_q| per position (``_full_cov_query_invariants``). This is the
+        full-cov twin of ``decode_ce_diagonal_chunked`` -- same streaming logsumexp + target gather
+        inside a gradient checkpoint, same global centering offset c = mean_v(mu_v) for fp32
+        stability -- with the diagonal query variance replaced by diag(Sigma_q)+eps, the prior
+        regularized by sigma_v+eps, and the per-position v-independent term K + sum_k log sigma_q
+        replaced by K + log|Sigma_q|. Value-equal to F.cross_entropy(_decode_full(...)) to the
+        decode's atol-1e-3 (tests/test_fullcov_alpha_roadmap_2026_06_13.py).
+        """
+        tau_eff = self._tau_eff(tau)
+        chunk = self.decode_chunk_size if chunk_size is None else chunk_size
+        V = self.vocab_size
+
+        sigma_v_all = torch.exp(self._prior_sigma_log_table()).clamp(min=self.eps)    # (V, K)
+        mu_v_all = self._prior_mu_table()                                  # (V, K) prior (s if model_channel)
+        c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
+
+        diag_sq_reg, logdet_q = self._full_cov_query_invariants(sigma_q)   # (B,N,K), (B,N)
+        mc_q = mu_q - c                                                     # (B, N, K) centered query means
+        lhs = torch.cat([diag_sq_reg + mc_q ** 2, -2.0 * mc_q], dim=-1)     # (B, N, 2K)
+        # v-INDEPENDENT term of -KL/tau_eff (cancels in the CE difference, carried so each chunk's
+        # logits equal _decode_full's): K + log|Sigma_q| (the full-cov analogue of K + sum_k log sigma_q).
+        per_pos = self.K + logdet_q.unsqueeze(-1)                          # (B, N, 1)
+
+        def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
+                             mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
+                             lsum_c:  torch.Tensor, in_chunk_f:      torch.Tensor,
+                             local_idx: torch.Tensor) -> 'tuple[torch.Tensor, torch.Tensor]':
+            r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
+
+            a_v = sum_k[(diag(Sigma_q)+eps + (mc_q-mc_v)^2)/sigma_v_reg] + sum_k log sigma_v_reg
+                = trace_term + mahalanobis + log|diag(sigma_v)+eps I|, the gaussian_full KL with a
+            diagonal prior; logit = -0.5(a_v - per_pos)/tau_eff. The (B, N, Vc) chunk logit lives
+            only here so checkpointing frees it after forward.
+            """
+            rhs = torch.cat([inv_v_c, mu_v_c * inv_v_c], dim=-1)            # (Vc, 2K), mu_v_c centered
+            a_v = lhs_ @ rhs.transpose(-1, -2)                             # (B, N, Vc)
+            a_v = a_v + (mu_v_c ** 2 * inv_v_c).sum(-1) + lsum_c            # + sum_k(mc_v^2/sigma_v_reg + log sigma_v_reg)
+            logit_chunk = -0.5 * (a_v - per_pos_) / tau_eff                # (B, N, Vc)
+            lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
+            gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
+            return lse_chunk, gathered * in_chunk_f                        # zero where target not in chunk
+
+        valid = targets != ignore_index                                    # (B, N) bool
+        lse_chunks = []
+        target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)  # (B, N)
+
+        for v0 in range(0, V, chunk):
+            v1 = min(v0 + chunk, V)
+            mc_v_c = (mu_v_all[v0:v1] - c)                                  # (Vc, K) centered prior means
+            inv_v_c = 1.0 / (sigma_v_all[v0:v1] + self.eps)                # (Vc, K) = 1/(sigma_v+eps)
+            lsum_c = torch.log(sigma_v_all[v0:v1] + self.eps).sum(-1)      # (Vc,) = sum_k log(sigma_v+eps)
+            in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
+            in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
+            local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
+            if torch.is_grad_enabled() and lhs.requires_grad:
+                lse_chunk, contrib = _checkpoint.checkpoint(
+                    _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx,
+                    use_reentrant=False,
+                )
+            else:
+                lse_chunk, contrib = _chunk_summaries(
+                    lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx
+                )
+            lse_chunks.append(lse_chunk)
+            target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
+
+        logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
+        ce_per_pos = logsumexp_v - target_logit                            # (B, N) = -log-softmax at target
+        n_valid = valid.sum()
+        if n_valid == 0:
+            return ce_per_pos.sum() * 0.0                                  # all-ignore: finite grad-connected zero
+        return (ce_per_pos * valid).sum() / n_valid
+
     def decode_ce_linear_chunked(
         self,
         mu_q:    torch.Tensor,           # (B, N, K) posterior means
@@ -579,6 +697,40 @@ def _decode_full(
     sigma_q_b = sigma_q.unsqueeze(-3)                                    # (B, N, 1, K, K)
     full = get_family("gaussian_full")
     kl_v = kl(full(mu_q_b, sigma_q_b), full(mu_v, sigma_v), kl_max=float("inf"))  # (B, N, V)
+    return -kl_v / tau_eff
+
+
+@register_decode("full_chunked")
+def _decode_full_chunked(
+    pb:      PriorBank,
+    mu_q:    torch.Tensor,               # (B, N, K) posterior means
+    sigma_q: torch.Tensor,               # (B, N, K, K) posterior covariances
+    tau_eff: torch.Tensor,               # () effective temperature
+) -> torch.Tensor:                       # (B, N, V) logits = -KL(q || pi_v)/tau_eff
+    r"""Inference (targets=None) decode for ``decode_mode='full_chunked'``: full-cov KL logits via
+    the DIAGONAL-prior closed form -- NO per-pair (K, K) Cholesky.
+
+    The training memory win is the fused decode+CE in ``decode_ce_full_chunked`` (never forms
+    (B, N, V)); for logits (sampling / generation) this materializes (B, N, V) -- inherent to
+    producing every vocab logit -- but still avoids the (B, N, V, K, K) Cholesky/solve workspace
+    that ``_decode_full`` builds, by exploiting the diagonal prior (see ``_full_cov_query_invariants``).
+    Value-equal to ``decode_mode='full'`` to atol-1e-3 (tests/test_fullcov_alpha_roadmap_2026_06_13.py).
+    """
+    sigma_v = torch.exp(pb._prior_sigma_log_table()).clamp(min=pb.eps)   # (V, K) diagonal prior variances
+    mu_v = pb._prior_mu_table()                                          # (V, K)
+    inv_v = 1.0 / (sigma_v + pb.eps)                                     # (V, K) = 1/(sigma_v+eps)
+
+    diag_sq_reg, logdet_q = pb._full_cov_query_invariants(sigma_q)       # (B,N,K), (B,N)
+    c = mu_v.mean(dim=0, keepdim=True)                                   # (1, K) v-independent shift
+    mc_v = mu_v - c                                                      # (V, K) centered prior means
+    mc_q = mu_q - c                                                      # (B, N, K) centered query means
+
+    lhs = torch.cat([diag_sq_reg + mc_q ** 2, -2.0 * mc_q], dim=-1)      # (B, N, 2K)
+    rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)                       # (V, 2K)
+    a_v = lhs @ rhs.transpose(-1, -2)                                    # (B, N, V): trace + mahalanobis core
+    a_v = a_v + (mc_v ** 2 * inv_v).sum(-1) + torch.log(sigma_v + pb.eps).sum(-1)  # + sum_k(mc_v^2/sigma_v_reg + log sigma_v_reg)
+    per_pos = pb.K + logdet_q.unsqueeze(-1)                              # (B, N, 1) = K + log|Sigma_q|
+    kl_v = 0.5 * (a_v - per_pos)                                         # (B, N, V)
     return -kl_v / tau_eff
 
 

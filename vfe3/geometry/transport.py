@@ -551,7 +551,7 @@ def transport_covariance(
         # because the factored exps carry one fewer N axis than the dense (..., N, N, K, K)).
         is_diag = sigma.dim() == omega.exp_phi.dim() - 1 if diagonal_out is None else diagonal_out
         if not is_diag:
-            return transport_covariance(omega.to_dense_omega(), sigma, diagonal_out=diagonal_out)
+            return _factored_full_covariance(omega, sigma)
         return _factored_diagonal_covariance(omega, sigma)
     is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
     if is_diag:
@@ -614,3 +614,54 @@ def _factored_diagonal_covariance(
                                       omega_blk, omega_blk, sig_blk))
         start = end
     return torch.cat(parts, dim=-1)                                    # (..., N, N, K)
+
+
+def _factored_full_covariance(
+    factored: FactoredTransport,
+    sigma:    torch.Tensor,               # (..., N, K, K) full SPD covariances
+) -> torch.Tensor:                        # (..., N, N, K, K) full congruence sandwich
+    r"""Per-head full-covariance congruence sandwich Sigma_t[i,j] = Omega_ij Sigma_j Omega_ij^T from
+    the factored exps, WITHOUT materializing the dense (..., N, N, K, K) Omega (the full-cov twin of
+    ``_factored_diagonal_covariance``).
+
+    For a block-diagonal gauge (block_glk: Omega = exp(phi_i) exp(-phi_j) is block-diagonal with
+    EQUAL d x d blocks Omega^(h)_ij = exp(phi_i)^(h) exp(-phi_j)^(h)), the (h, h') output block is
+
+        Sigma_t[i,j]^(h,h') = Omega^(h)_ij  Sigma_j^(h,h')  (Omega^(h')_ij)^T,
+
+    because the off-block entries of Omega are exactly 0 (Higham, block-diagonal product), so only the
+    per-head (d, d) blocks of Omega ever multiply. The OUTPUT is still the full (..., N, N, K, K)
+    sandwich (a full Sigma's off-diagonal blocks survive, mapped by Omega^(h) on the left and
+    Omega^(h') on the right -- exactly what the dense path computes); the win is that the dense
+    (..., N, N, K, K) Omega is never built (only the H per-head (..., N, N, d, d) operators) and each
+    block-pair sandwich runs in its own float64 island (M4) at the BLOCK scale, not the full K x K.
+    Value-equal to the dense ``transport_covariance(to_dense_omega(), sigma)``; pinned by
+    tests/test_fullcov_alpha_roadmap_2026_06_13.py.
+    """
+    dims = factored.irrep_dims
+    K = sum(dims)
+    batch = sigma.shape[:-3]
+    N = sigma.shape[-3]
+    out = sigma.new_zeros(*batch, N, N, K, K)
+
+    # Per-head pairwise operators Omega^(h)_ij = exp(phi_i)^(h) @ exp(-phi_j)^(h), each (..., N, N, d, d):
+    # the per-head diagonal blocks of the dense Omega (its off-blocks are zero), never the dense K x K.
+    blocks = []
+    start = 0
+    for d in dims:
+        end = start + d
+        ep = factored.exp_phi[..., start:end, start:end]               # (..., N, d, d) exp(phi_i)^(h)
+        en = factored.exp_neg_phi[..., start:end, start:end]           # (..., N, d, d) exp(-phi_j)^(h)
+        omega_h = torch.einsum("...ikl,...jlm->...ijkm", ep, en)       # (..., N, N, d, d)
+        blocks.append((start, end, omega_h))
+        start = end
+
+    # (h, h') output block = Omega^(h)_ij Sigma_j^(h,h') (Omega^(h')_ij)^T, in a float64 island (the
+    # congruence squares cond(Omega); audit M4) at the block scale, then cast back.
+    for s1, e1, oh in blocks:
+        for s2, e2, oh2 in blocks:
+            sig_blk = sigma[..., s1:e1, s2:e2]                          # (..., N, d1, d2) key-side block
+            res = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
+                               oh.double(), sig_blk.double(), oh2.double())
+            out[..., s1:e1, s2:e2] = res.to(sigma.dtype)
+    return out

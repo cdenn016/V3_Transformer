@@ -204,8 +204,10 @@ def test_per_coord_alpha_requires_diagonal_family():
 
 def test_per_coord_alpha_requires_renyi_functional():
     """state_dependent_per_coord weights each coordinate by its own alpha^(k), needing a per-coordinate
-    self-divergence. That decomposition is registered only for the Renyi functional (KL = Renyi at
-    alpha=1); a non-Renyi divergence_family otherwise constructs fine and crashes only at the first
+    self-divergence. That decomposition exists only for a divergence that DECOMPOSES coordinate-wise
+    (the per-coordinate functional registry: Renyi/KL, Bhattacharyya, Jeffreys); squared_hellinger is
+    excluded because H^2 = 1 - exp(-D_{1/2}/2) is a nonlinear transform of the summed divergence.
+    A non-decomposable divergence_family otherwise constructs fine and crashes only at the first
     forward (free_energy.self_divergence_per_coord raises). Reject the pair at construction, mirroring
     the covariance guard above. The DEFAULT diagonal family is used so the covariance guard does not
     mask this functional check; the Renyi default is accepted (no over-rejection)."""
