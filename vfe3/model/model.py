@@ -962,11 +962,12 @@ class VFEModel(nn.Module):
         belief-variance spectrum effective rank, not an attention rank).
         """
         from vfe3.inference.e_step import _transport
-        from vfe3.geometry.transport import transport_mean, transport_covariance
+        from vfe3.geometry.transport import transport_mean, transport_covariance, compute_transport_operators
         from vfe3.families.base import get_family
         from vfe3.free_energy import pairwise_energy, self_divergence_for_alpha, attention_weights, attention_tau
         from vfe3.alpha_i import self_coupling_alpha
         from vfe3 import metrics
+        from vfe3 import numerics
 
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
@@ -1070,8 +1071,84 @@ class VFEModel(nn.Module):
         # deterministic row-major prefix, which at N=128/max_triangles=512 covers only anchor i=0's
         # local neighborhood -- a systematically biased sample. The sampled mean is representative and
         # still ~0 on the flat phi-cocycle (flatness certificate); the dict key is unchanged.
-        d["holonomy_deviation"] = float(metrics.holonomy_deviation_sampled(omega)["mean"])
+        # ---- extended per-eval observability (2026-06-13 run-diagnostics rollout) ----
+        # Every reduction below reads tensors already materialized above (out.mu/sigma/phi, exp_phi,
+        # omega, energy, beta, self_div); no extra forward, no_grad. NEW keys only -- d["total"] and
+        # the existing block values are untouched (test_model_channel_diagnostics pins total's closure;
+        # test_regime_ii pins d["holonomy_deviation"], whose semantics is preserved as the mean below).
+        _LOG2 = 0.6931471805599453                                   # row-entropy floor for a 2-way split
+        _diag = out.sigma.dim() == out.mu.dim()                      # diagonal (N,K) vs full (N,K,K);
+        #   passed explicitly to the spectrum/Fisher/guard metrics below because shape-squareness
+        #   auto-inference mis-reads a diagonal (N, K) table as a full covariance when N == K
+        #   (e.g. max_seq_len == embed_dim) -- the same dim-based test the effective_rank line uses.
+
+        hol = metrics.holonomy_deviation_sampled(omega)
+        d["holonomy_deviation"] = float(hol["mean"])                 # unchanged key/semantics
+        d["holonomy_ci_lo"]     = float(hol["ci_lo"])                # bootstrap band: real curvature vs jitter
+        d["holonomy_ci_hi"]     = float(hol["ci_hi"])
         d["gauge_trace_spread"] = float(metrics.gauge_trace_spread(out.phi, self.group.generators))
+
+        # Group-correct gauge invariant: gauge_trace_spread is identically 0 on SO(N)/Sp(2m) (traceless
+        # generators), so dispatch the right invariant of exp(phi) and report its spread over tokens.
+        exp_phi = compute_transport_operators(out.phi.unsqueeze(0), self.group)["exp_phi"][0]  # (N, K, K)
+        ginv = metrics.group_gauge_invariant(exp_phi, self.group).float()
+        d["gauge_invariant_mean"]   = float(ginv.mean())
+        d["gauge_invariant_spread"] = float(ginv.std(unbiased=False))
+
+        # phi frame magnitude: a collapse to phi=0 silently degenerates to an UNGAUGED transformer
+        # (trivially equivariant, so no equivariance metric flags it).
+        phi_norm = torch.linalg.norm(out.phi, dim=-1)               # (N,)
+        d["phi_norm_mean"] = float(phi_norm.mean())
+        d["phi_norm_std"]  = float(phi_norm.std(unbiased=False))
+
+        # Belief covariance conditioning + PD margin (effective_rank is blind to one collapsing mode).
+        bs = metrics.belief_spectrum(out.sigma, diagonal=_diag, eps=cfg.eps)
+        cond = bs["condition"].float()
+        d["belief_cond_median"] = float(cond.median())
+        d["belief_cond_p95"]    = float(torch.quantile(cond, 0.95))
+        d["belief_cond_max"]    = float(cond.max())
+        d["belief_pd_margin"]   = float((bs["eigenvalues"][..., -1].float() / cfg.eps).min())
+
+        # Per-token effective-rank distribution (the logged mean hides a bimodal rank-1/rank-K collapse).
+        er = metrics.effective_rank_per_token(out.sigma, diagonal=_diag, eps=cfg.eps).float()
+        d["eff_rank_p5"]     = float(torch.quantile(er, 0.05))
+        d["eff_rank_median"] = float(er.median())
+        d["eff_rank_p95"]    = float(torch.quantile(er, 0.95))
+
+        # Belief Fisher-information trace (tr Sigma^-1 / 2 = total belief precision/confidence).
+        fish = metrics.fisher_trace(out.sigma, diagonal=_diag, eps=cfg.eps).float()
+        d["fisher_trace_mean"]   = float(fish.mean())
+        d["fisher_trace_median"] = float(fish.median())
+
+        # Numerical safety rails inert (pure path) vs load-bearing (fixed point is a clamp artifact)?
+        gs = metrics.guard_saturation(out.sigma, energy, self_div, diagonal=_diag,
+                                      eps=cfg.eps, sigma_max=cfg.sigma_max, kl_max=cfg.kl_max)
+        for _k, _v in gs.items():
+            d[f"guard_{_k}"] = float(_v)
+
+        # Non-finite fraction over the converged operator tensors (one NaN silently poisons AdamW).
+        d["nonfinite_frac"] = float(max(
+            numerics.nan_inf_fraction(out.mu),  numerics.nan_inf_fraction(out.sigma),
+            numerics.nan_inf_fraction(out.phi), numerics.nan_inf_fraction(energy),
+            numerics.nan_inf_fraction(beta),
+        ))
+
+        # Attention-entropy COLLAPSE: per-head min row entropy + count of near-deterministic heads at
+        # the converged (last-block) belief; the single logged attn_entropy averages collapse away.
+        ent_rows = metrics.attention_entropy_rows(beta)             # (N,) single head or (H, N) multi-head
+        head_min = ent_rows.min(dim=-1).values if ent_rows.dim() >= 2 else ent_rows.min().reshape(1)
+        d["attn_entropy_min"]             = float(head_min.min())
+        d["attn_entropy_collapsed_heads"] = float((head_min < _LOG2).float().sum())
+
+        # Equivariance-break order parameters (CONDITIONAL columns, mirroring lambda_beta): present
+        # only when the breaking toggle is on, so the per-run CSV stays rectangular.
+        _cW = getattr(self, "connection_W", None)
+        if _cW is not None:                                          # transport_mode='regime_ii'
+            d["connection_w_norm"] = float(torch.linalg.norm(_cW.detach()))
+        _hm = getattr(self, "head_mixer", None)
+        if _hm is not None and hasattr(_hm, "mixer_deltas"):        # use_head_mixer=True
+            d["head_mixer_drift"] = max(
+                (float(torch.linalg.norm(p.detach())) for p in _hm.mixer_deltas), default=0.0)
         return d
 
     @torch.no_grad()
