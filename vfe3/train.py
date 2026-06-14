@@ -286,6 +286,7 @@ def train_step(
         device=tokens.device.type, enabled=False)
 
     optimizer.zero_grad(set_to_none=True)
+    _mb_tok: List[int] = []                                     # per-microbatch counted-token spread (accum only)
     if grad_accum_steps == 1:                                   # default path: byte-identical to the single-step loop
         _, loss, _ = model(tokens, targets)
         _scaler.scale(loss).backward()
@@ -304,6 +305,7 @@ def train_step(
             _, loss_mb, _ = model(tok_mb, tgt_mb)
             _scaler.scale(loss_mb / grad_accum_steps).backward()   # accumulate the mean-normalized microbatch grad
             step_loss += float(loss_mb.detach()) / grad_accum_steps
+            _mb_tok.append(int((tgt_mb != -100).sum()))            # counted tokens per microbatch (spread = bias)
     # Unscale once when EITHER clipping or metrics capture needs true-unit gradients; GradScaler
     # tracks that unscale_ already ran so the later _scaler.step() does not re-unscale. With a
     # disabled scaler (the default) unscale_ is a no-op, and with metrics_out=None this is
@@ -326,7 +328,13 @@ def train_step(
         for _i, _name in enumerate(("mu", "sigma", "phi")):
             if _i < len(per_group):
                 metrics_out[f"grad_norm_{_name}"] = per_group[_i]
+                # weight norm of the same group: with the logged grad_norm + per-group LR, the
+                # update-to-weight ratio (the ~1e-3 LR-scale sanity check) is derivable offline.
+                _wn = sum(float(p.detach().pow(2).sum()) for p in optimizer.param_groups[_i]["params"])
+                metrics_out[f"weight_norm_{_name}"] = _wn ** 0.5
         metrics_out["loss_finite"] = float(math.isfinite(step_loss))
+        if _mb_tok:                                             # grad_accum_steps>1: token-spread bias check
+            metrics_out["grad_accum_tok_spread"] = float(max(_mb_tok) - min(_mb_tok))
         if scaler is not None and scaler.is_enabled():          # fp16: surface the loss-scale (Tier-2 health)
             metrics_out["grad_scale"] = float(scaler.get_scale())
     if grad_clip is not None and grad_clip > 0:
@@ -387,6 +395,98 @@ def evaluate(
         "ppl": math.exp(min(ce, 20.0)),
         "bpc": (ce / math.log(2.0)) * tokens_per_char,
     }
+
+
+# Fixed column set for the held-out per-eval probes (initialized to NaN before training and carried
+# forward like last_val, so every metrics.csv row carries the SAME columns -- rectangular -- whether
+# or not an eval has run yet). Config-conditional keys (val_head_redundancy_js needs >= 2 heads;
+# pos_loss_* needs targets and seq_len >= 4) stay NaN on runs where they do not apply.
+_VAL_DIAG_KEYS = (
+    "val_self_coupling", "val_belief_coupling", "val_attention_entropy", "val_free_energy_total",
+    "val_attn_entropy", "val_effective_rank", "val_belief_cond_median", "val_attn_entropy_min",
+    "val_attn_entropy_min_all", "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
+    "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
+    "estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
+    "estep_r_phi_last", "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
+)
+
+
+@torch.no_grad()
+def _val_diagnostics(
+    model:      VFEModel,
+    val_loader: Iterable,
+    device:     torch.device,
+) -> Dict[str, float]:
+    r"""Held-out per-eval probes (the train-loop ``diagnostics`` runs on the live TRAIN batch).
+
+    Computes the validation-side F decomposition, attention-map structure across ALL layers/heads
+    (entropy collapse, causal-mask sanity, positional-vs-content, induction/copy, head redundancy),
+    the E-step F-descent + belief-residual convergence certificate, and the per-position
+    within-sequence loss. Off the graph (no_grad). Best-effort: the CALLER wraps this so a replay
+    error simply leaves the previous values carried forward; the returned subset is ``.update``-d
+    into a NaN-initialized dict, so the CSV stays rectangular.
+    """
+    import torch.nn.functional as F
+    from vfe3 import metrics as M
+    from vfe3.viz import extract as ex
+
+    out: Dict[str, float] = {}
+    batch = next(iter(val_loader))
+    val_tok, val_tgt = (batch if isinstance(batch, (tuple, list)) else (batch, None))
+    val_tok = val_tok.to(device)
+    val_tgt = val_tgt.to(device) if val_tgt is not None else None
+    vn = max(int(val_tok.shape[1]), 1)
+
+    vd = model.diagnostics(val_tok)                              # held-out F decomposition (per token)
+    out["val_self_coupling"]      = vd["self_coupling"]     / vn
+    out["val_belief_coupling"]    = vd["belief_coupling"]   / vn
+    out["val_attention_entropy"]  = vd["attention_entropy"] / vn
+    out["val_free_energy_total"]  = vd["total"]             / vn
+    out["val_attn_entropy"]       = vd["attn_entropy"]
+    out["val_effective_rank"]     = vd["effective_rank"]
+    out["val_belief_cond_median"] = vd["belief_cond_median"]
+    out["val_attn_entropy_min"]   = vd["attn_entropy_min"]
+
+    amaps = model.attention_maps(val_tok)                       # (L, H, N, N) all layers/heads
+    hmin = M.attention_entropy_rows(amaps).min(dim=-1).values   # (L, H) per-head min row entropy
+    out["val_attn_entropy_min_all"] = float(hmin.min())
+    out["val_attn_collapsed_heads"] = float((hmin < 0.6931471805599453).float().sum())
+    cs = M.causal_sanity(amaps)
+    out["val_future_leakage"] = float(cs["future_leakage"].max())   # soft causal prior can leak silently
+    out["val_row_sum_error"]  = float(cs["row_sum_error"].max())
+    out["val_pos_content_r2"] = float(M.positional_content_score(amaps).mean())
+    sh = M.structured_head_scores(amaps)
+    out["val_prev_token_mass"]   = float(sh["prev_token"].mean())
+    out["val_period_match_mass"] = float(sh["period_match"].mean())
+    if amaps.shape[1] > 1:                                       # head redundancy needs >= 2 heads
+        h = amaps.shape[1]
+        off = ~torch.eye(h, dtype=torch.bool, device=amaps.device)
+        out["val_head_redundancy_js"] = float(torch.stack(
+            [M.head_redundancy_js(amaps[li])[off].mean() for li in range(amaps.shape[0])]).mean())
+
+    tr = ex.e_step_belief_trace(model, val_tok)                 # variational-EM convergence certificate
+    f = tr["free_energy"]
+    out["estep_f_drop"] = float(f[-1] - f[0])                   # < 0 = F descended over the inner loop
+    out["estep_f_nondecreasing_frac"] = (
+        float((f[1:] > f[:-1] + 1e-9).float().mean()) if f.numel() > 1 else 0.0)
+    res = M.estep_residuals(tr["mu"], tr["sigma"], tr["phi"])   # last-iter belief change (SPD metric for sigma)
+    for _nm, _key in (("r_mu", "estep_r_mu_last"), ("r_sigma", "estep_r_sigma_last"),
+                      ("r_phi", "estep_r_phi_last")):
+        out[_key] = float(res[_nm][-1].mean()) if res[_nm].numel() else 0.0
+
+    if val_tgt is not None:                                     # per-position within-sequence loss
+        vlog = model(val_tok)                                   # (B, N, V) inference path
+        b, n = val_tok.shape
+        per = F.cross_entropy(vlog.reshape(-1, vlog.shape[-1]).float(), val_tgt.reshape(-1),
+                              ignore_index=-100, reduction="none").reshape(b, n)
+        valid = (val_tgt != -100).float()
+        pos_ce = (per * valid).sum(0) / valid.sum(0).clamp(min=1.0)   # (N,) mean CE at each position
+        q = n // 4
+        if q > 0:
+            out["pos_loss_first_q"] = float(pos_ce[:q].mean())
+            out["pos_loss_last_q"]  = float(pos_ce[-q:].mean())
+            out["pos_loss_ratio"]   = float(pos_ce[-q:].mean() / pos_ce[:q].mean().clamp(min=1e-9))
+    return out
 
 
 def train(
@@ -492,6 +592,7 @@ def train(
     win_t0 = time.perf_counter()
     win_i0 = start_step
     last_val: Dict[str, float] = {}                  # most recent validation, carried into each CSV row
+    last_val_diag: Dict[str, float] = {k: float("nan") for k in _VAL_DIAG_KEYS}   # held-out probes, carried forward
     for step in _step_indices():
         try:
             tokens, targets = next(it)
@@ -566,6 +667,13 @@ def train(
                     logger.warning("       (sample generation failed: %s)", exc)
             last_val = {"ce": m["ce"], "ppl": m["ppl"], "bpc": m["bpc"]}
             if artifacts is not None:
+                # Held-out per-eval probes (validation F decomposition, attention-map structure,
+                # E-step convergence certificate, per-position loss). Best-effort: a replay error
+                # leaves the prior values carried forward, so a viz/replay fault never kills training.
+                try:
+                    last_val_diag.update(_val_diagnostics(model, val_loader, device))
+                except Exception as exc:
+                    logger.warning("       (validation diagnostics failed: %s); continuing", exc)
                 artifacts.maybe_save_best(step + 1, model, m["ppl"])
                 # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0 of
                 # the live batch). Best-effort inside save_attention_maps: a viz error is logged,
@@ -622,16 +730,24 @@ def train(
                         "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
                         "guard_energy_klmax_frac", "guard_selfdiv_klmax_frac",
                         "nonfinite_frac", "attn_entropy_min", "attn_entropy_collapsed_heads",
+                        "cocycle_residual", "vertex_cond_max", "sandwich_absmax", "transport_asymmetry",
+                        "energy_abs_asymmetry", "energy_rel_asymmetry",
+                        "gauge_head_aniso_mean", "gauge_head_logdet_spread",
                         "connection_w_norm", "head_mixer_drift"):
                 if _dk in d:
                     row[_dk] = d[_dk]
-            # Pre-clip gradient health (Tier-1): global + per-group (mu/sigma/phi) norms, loss
-            # finiteness, and the fp16 loss-scale -- captured by train_step into step_metrics this step.
+            # Gradient health (Tier-1/2): global + per-group (mu/sigma/phi) grad AND weight norms (so
+            # the update-to-weight ratio is derivable with the logged LR), loss finiteness, the fp16
+            # loss-scale, and the grad-accum token spread -- captured by train_step into step_metrics.
             if step_metrics:
                 for _gk in ("grad_norm", "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi",
-                            "loss_finite", "grad_scale"):
+                            "weight_norm_mu", "weight_norm_sigma", "weight_norm_phi",
+                            "loss_finite", "grad_scale", "grad_accum_tok_spread"):
                     if _gk in step_metrics:
                         row[_gk] = step_metrics[_gk]
+            # Held-out per-eval probes (Tier-2): the full fixed val-diag column set, carried forward
+            # (NaN until the first eval) so the CSV stays rectangular.
+            row.update(last_val_diag)
             # Model-channel F blocks (per-token, like the belief blocks above): present iff the
             # s-channel tables exist (diagnostics gates them on STATIC config -- lambda_h / gamma /
             # prior_source / s_e_step), so the column set is fixed per run and the CSV stays

@@ -631,6 +631,34 @@ def curvature_field(
     return torch.linalg.norm(h - eye, dim=(-2, -1))
 
 
+def cocycle_residual_sampled(
+    omega:      torch.Tensor,            # (N, N, K, K) pairwise transport Omega_ij
+
+    *,
+    n_triples:  int = 512,
+    seed:       int = 0,
+) -> torch.Tensor:                       # () mean ||Omega_ik - Omega_ij Omega_jk||_F over random triples
+    r"""Cocycle defect mean ||Omega_ik - Omega_ij Omega_jk||_F over random distinct triples.
+
+    The flatness certificate at the level of the COMPOSITION law itself: a flat Regime-I phi-cocycle
+    Omega_ij = exp(phi_i) exp(-phi_j) satisfies Omega_ik = Omega_ij Omega_jk exactly, so this is ~0
+    (cheaper and more fundamental than the triangle holonomy, which is the special case k -> i). A
+    non-cocycle (regime_ii) transport gives > 0. Seeded random triples (matching
+    ``holonomy_deviation_sampled``) avoid the row-major low-index sampling bias.
+    """
+    n, k = omega.shape[0], omega.shape[-1]
+    gen = torch.Generator(device=omega.device).manual_seed(int(seed))
+    draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=omega.device)
+    keep = (draw[:, 0] != draw[:, 1]) & (draw[:, 1] != draw[:, 2]) & (draw[:, 0] != draw[:, 2])
+    idx = draw[keep][:n_triples]
+    if idx.numel() == 0:
+        return omega.new_zeros(())
+    o_ik = omega[idx[:, 0], idx[:, 2]]                           # (T, K, K)
+    o_ij = omega[idx[:, 0], idx[:, 1]]
+    o_jk = omega[idx[:, 1], idx[:, 2]]
+    return torch.linalg.norm(o_ik - o_ij @ o_jk, dim=(-2, -1)).mean()
+
+
 # --- free-energy closure and per-token profile (the headline F figure) ---
 
 def free_energy_full_decomposition(

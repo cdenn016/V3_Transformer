@@ -1095,6 +1095,23 @@ class VFEModel(nn.Module):
         d["gauge_invariant_mean"]   = float(ginv.mean())
         d["gauge_invariant_spread"] = float(ginv.std(unbiased=False))
 
+        # Transport directedness / conditioning / sandwich overflow (the ln(3) symmetry-breaking
+        # signal, and cond(Omega) which SQUARES in the covariance sandwich vs the fp32 ~1e7 line).
+        d["cocycle_residual"] = float(metrics.cocycle_residual_sampled(omega))   # composition-law flatness
+        _svd_v = torch.linalg.svdvals(exp_phi)                      # (N, K) vertex-factor singular values
+        d["vertex_cond_max"]  = float((_svd_v[..., 0] / _svd_v[..., -1].clamp(min=cfg.eps)).max())
+        #   pairwise cond(Omega_ij) = cond(exp_phi_i exp(-phi_j)) <= vertex_cond_max^2 (a cheap bound).
+        d["sandwich_absmax"]  = float(sigma_t.abs().max())          # |Omega Sigma Omega^T| overflow proximity
+        d["transport_asymmetry"]  = float(metrics.transport_asymmetry(omega).mean())
+        _ed = metrics.energy_directedness(energy)
+        d["energy_abs_asymmetry"] = float(_ed["abs_asymmetry"])
+        d["energy_rel_asymmetry"] = float(_ed["rel_asymmetry"])
+        # Per-head gauge specialization: do the per-head GL(d_head) frames specialize, or collapse to a
+        # shared frame? Mean block anisotropy + spread of log|det| across heads (single block -> 0 spread).
+        _ghi = metrics.per_head_gauge_invariants(exp_phi, self.group.irrep_dims)
+        d["gauge_head_aniso_mean"]    = float(_ghi["anisotropy"].float().mean())
+        d["gauge_head_logdet_spread"] = float(_ghi["logdet"].float().std(unbiased=False))
+
         # phi frame magnitude: a collapse to phi=0 silently degenerates to an UNGAUGED transformer
         # (trivially equivariant, so no equivariance metric flags it).
         phi_norm = torch.linalg.norm(out.phi, dim=-1)               # (N,)

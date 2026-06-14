@@ -133,3 +133,51 @@ def test_conditional_break_columns_present_only_under_toggle() -> None:
     # head mixer -> head_mixer_drift column appears (zero at identity init, but present)
     d_hm = VFEModel(_cfg(use_head_mixer=True)).to(DEVICE).diagnostics(tok)
     assert "head_mixer_drift" in d_hm and math.isfinite(d_hm["head_mixer_drift"])
+
+
+_TIER2A_KEYS = [
+    "cocycle_residual", "vertex_cond_max", "sandwich_absmax", "transport_asymmetry",
+    "energy_abs_asymmetry", "energy_rel_asymmetry", "gauge_head_aniso_mean", "gauge_head_logdet_spread",
+]
+
+
+def test_diagnostics_has_tier2a_transport_gauge_keys() -> None:
+    torch.manual_seed(0)
+    cfg = _cfg()
+    model = VFEModel(cfg).to(DEVICE)
+    tok = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len), device=DEVICE)
+    d = model.diagnostics(tok)
+    missing = [k for k in _TIER2A_KEYS if k not in d]
+    assert not missing, f"diagnostics missing Tier-2a keys: {missing}"
+    assert all(math.isfinite(d[k]) for k in _TIER2A_KEYS)
+    # the flat (default) transport is an EXACT phi-cocycle -> the cocycle residual is ~0
+    assert d["cocycle_residual"] < 1e-3
+    # directed phi-cocycle Omega_ij = exp(phi_i) exp(-phi_j) breaks i<->j symmetry -> asymmetry >= 0
+    assert d["transport_asymmetry"] >= 0.0 and d["vertex_cond_max"] >= 1.0
+
+
+def test_val_diagnostics_columns_rectangular_and_finite() -> None:
+    from vfe3.run_artifacts import RunArtifacts
+    from vfe3.train import _VAL_DIAG_KEYS
+    torch.manual_seed(0)
+    cfg = _cfg(log_interval=6, eval_interval=12, eval_max_batches=2)
+    model = VFEModel(cfg).to(DEVICE)
+    loader = _loader(cfg)
+    with tempfile.TemporaryDirectory() as tmp:
+        art = RunArtifacts(tmp, cfg, model, dataset="synthetic-period3", device=str(DEVICE))
+        train(model, loader, cfg, n_steps=24, log_interval=6, eval_interval=12,
+              val_loader=loader, artifacts=art, device=DEVICE, generate_samples=False)
+        with open(Path(tmp) / "metrics.csv", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+    cols = set(rows[0].keys())
+    assert not [k for k in _VAL_DIAG_KEYS if k not in cols], "missing val-diag columns"
+    assert all(set(r.keys()) == cols for r in rows), "CSV not rectangular"
+    # after the step-24 eval the held-out probes are finite
+    last = rows[-1]
+    for k in ("val_free_energy_total", "estep_f_drop", "val_future_leakage", "pos_loss_ratio",
+              "val_head_redundancy_js"):
+        assert math.isfinite(float(last[k])), f"{k} not finite: {last[k]!r}"
+    # the soft causal prior must not leak future tokens
+    assert float(last["val_future_leakage"]) < 1e-3
+    # Tier-2a transport/gauge + weight-norm columns present too
+    assert {"cocycle_residual", "transport_asymmetry", "weight_norm_mu"} <= cols
