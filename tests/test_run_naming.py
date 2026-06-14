@@ -18,13 +18,19 @@ def _cfg(**kw) -> VFE3Config:
 
 
 def test_run_label_is_descriptive_with_tags_and_no_timestamp():
-    assert train_vfe3._run_label(_cfg(), "wikitext-103") == "wikitext-103_K20_block_glk_linear_mix"
+    assert train_vfe3._run_label(_cfg(), "wikitext-103") == "wikitext-103_K20_block_glk_linear_mix_s0"
 
 
 def test_run_label_drops_tags_when_off():
     # use_prior_bank=True drops _linear; use_head_mixer=False drops _mix
     label = train_vfe3._run_label(_cfg(use_prior_bank=True, use_head_mixer=False), "wikitext-103")
-    assert label == "wikitext-103_K20_block_glk"
+    assert label == "wikitext-103_K20_block_glk_s0"
+
+
+def test_run_label_seed_suffix_distinguishes_seeds():
+    # the _s<seed> suffix keeps a multi-seed launch's run folders distinct (and seed-identifiable)
+    assert train_vfe3._run_label(_cfg(seed=3), "wikitext-103").endswith("_s3")
+    assert train_vfe3._run_label(_cfg(seed=64), "wikitext-103").endswith("_s64")
 
 
 def test_run_dir_prefixes_label_with_timestamp():
@@ -32,7 +38,7 @@ def test_run_dir_prefixes_label_with_timestamp():
     name = rd.replace("\\", "/").split("/")[-1]
     stamp, _, rest = name.partition("_")
     assert "-" in stamp and stamp.replace("-", "").isdigit()        # YYYYMMDD-HHMMSS
-    assert rest == "wikitext-103_K20_block_glk_linear_mix"
+    assert rest == "wikitext-103_K20_block_glk_linear_mix_s0"
 
 
 def test_rename_uses_test_ppl_and_drops_timestamp(tmp_path):
