@@ -543,3 +543,57 @@ def gamma_attention(model, token_ids: torch.Tensor) -> Optional[dict]:
     if g is None:
         return None
     return {"gamma": g.cpu()}
+
+
+@torch.no_grad()
+def model_channel_bank(
+    model,
+    token_batches:  Iterable[torch.Tensor],   # iterable of (B, N) token-id batches
+
+    *,
+    device:         Optional[torch.device] = None,
+    max_sequences:  Optional[int]          = None,
+) -> Optional[Dict[str, torch.Tensor]]:
+    r"""Collect the model-channel beliefs s_i over many sequences -- the bank for the model-channel UMAP.
+
+    ``None`` when the model channel is inactive (no s tables). The s-channel sibling of :func:`belief_bank`:
+    for each batch it looks up the static model-channel belief ``s_i = N(s_mu, s_sigma)`` via ``encode_s``,
+    and -- when ``s_e_step`` -- refines it through the s E-step (so s is position-dependent, exactly as the
+    belief bank's q is), then stacks the per-token ``mu = s_mu`` (M, K) and ``sigma = s_sigma`` (M, K) with
+    ``token_ids`` (M,) and ``seq_idx`` (M,). There is NO ``phi`` channel: the model channel shares the belief
+    gauge frame, so an s-channel phi UMAP would duplicate the belief one. Feeds ``plot_belief_umap`` directly
+    (channels mu / sigma), so the redesigned cluster-and-distinctive-token view applies to the slow channel.
+    NB i and j are token POSITIONS, not separate channels: this single bank embeds every s_i (all positions);
+    the i<->j pairing lives only in the gamma_ij model-coupling attention (see :func:`gamma_attention`).
+    """
+    if not model._model_channel_active:
+        return None
+    device = device or _model_device(model)
+    was_training = model.training
+    model.eval()
+    mus, sigmas, tids, sidx = [], [], [], []
+    seq_counter = 0
+    try:
+        for tokens in token_batches:
+            tokens = tokens.to(device)
+            s_mu, s_sigma = model.prior_bank.encode_s(tokens)         # (B, N, K) static model channel
+            if model.cfg.s_e_step:                                    # refine -> position-dependent, like q
+                phi0 = model._apply_pos_phi(model.prior_bank.encode(tokens).phi)
+                s_mu, s_sigma = model._refine_s(tokens, phi0)
+            b, n = tokens.shape
+            mus.append(s_mu.reshape(b * n, -1))
+            sigmas.append(s_sigma.reshape(b * n, -1))
+            tids.append(tokens.reshape(b * n))
+            sidx.append(torch.arange(seq_counter, seq_counter + b, device=device).repeat_interleave(n))
+            seq_counter += b
+            if max_sequences is not None and seq_counter >= max_sequences:
+                break
+    finally:
+        if was_training:
+            model.train()
+    return {
+        "mu":        torch.cat(mus),
+        "sigma":     torch.cat(sigmas),
+        "token_ids": torch.cat(tids),
+        "seq_idx":   torch.cat(sidx),
+    }

@@ -254,3 +254,23 @@ def test_finalize_emits_model_channel_terms_iff_active(tmp_path):
                     val_loader=_loader(seed=1), artifacts=art0)
     finalize_run(model0, art0, cfg0, test_loader=_loader(seed=2), losses=losses0)
     assert not (tmp_path / "run0" / "model_channel_terms.png").exists()
+
+
+# ---- (11) model-channel UMAP bank: gating + the redesigned figure renders on the s channel --------
+
+def test_model_channel_bank_gating_and_umap_render(tmp_path):
+    import pytest
+    batches = [torch.randint(0, 6, (8, 8)) for _ in range(2)]
+    assert extract.model_channel_bank(_model(), batches) is None           # pure path: no s tables
+    bk = extract.model_channel_bank(_active(), batches, max_sequences=16)
+    assert bk is not None and "mu" in bk and "sigma" in bk
+    assert bk["mu"].shape[0] == bk["token_ids"].shape[0] == bk["sigma"].shape[0]
+    assert "phi" not in bk                                                  # s shares the belief gauge frame
+    figs.set_publication_style()
+    p = tmp_path / "s_umap.png"
+    try:
+        fig = figs.plot_belief_umap(bk, "mu", decode=lambda l: str(int(l[0])), seed=0, path=str(p))
+        figs.plt.close(fig)
+    except (ImportError, OSError) as exc:                                   # umap native layer best-effort
+        pytest.skip(f"umap-learn unavailable: {exc}")
+    assert p.exists() and p.stat().st_size > 0

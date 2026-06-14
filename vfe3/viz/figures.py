@@ -1051,45 +1051,188 @@ def _annotate_frequent_tokens(ax, coords: np.ndarray, token_ids: np.ndarray, dec
                     bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.7))
 
 
-@register_figure("belief_umap")
-def plot_belief_umap(
-    bank:       Dict,                    # belief_bank output: mu, sigma, phi, token_ids, seq_idx
-    channel:    str = "mu",              # which belief channel to embed: 'mu' / 'sigma' / 'phi'
+def _cluster_embedding(
+    coords: np.ndarray,                  # (M, 2) UMAP coordinates
 
     *,
-    decode:     Optional[object] = None,                       # decode(list[int]) -> str; None -> no categories
-    taxonomies: tuple            = ("bpe", "function_content"),
-    n_label:    int              = 10,
-    seed:       int              = 0,
-    sil_sample: int              = 2000,
-    path:       Optional[str]    = None,
+    seed:   int = 0,
+) -> np.ndarray:                         # (M,) integer cluster labels (-1 = noise)
+    r"""Density-cluster a 2-D embedding into data-driven groups (HDBSCAN; KMeans fallback).
+
+    HDBSCAN finds variable-density clusters AND an explicit noise label (-1) -- the right tool for the
+    belief embedding's tight peripheral function-word islands around a diffuse content core -- with
+    ``min_cluster_size`` scaled to the cloud size. Falls back to KMeans (no noise label) only when the
+    installed sklearn predates ``cluster.HDBSCAN`` (<1.3). Deterministic given ``coords``."""
+    M = coords.shape[0]
+    try:
+        from sklearn.cluster import HDBSCAN
+        return HDBSCAN(min_cluster_size=max(20, M // 60), min_samples=5).fit_predict(coords)
+    except Exception:                                            # pragma: no cover - old sklearn only
+        from sklearn.cluster import KMeans
+        return KMeans(n_clusters=max(2, min(14, M // 50)), n_init=10, random_state=seed).fit_predict(coords)
+
+
+def _cluster_lift_labels(
+    token_ids: np.ndarray,               # (M,) token ids
+    labels:    np.ndarray,               # (M,) cluster labels (-1 = noise)
+    decode:    Optional[object],         # decode([id]) -> str; None -> raw id string
+
+    *,
+    k:         int = 3,
+    floor:     int = 2,
+) -> Dict[int, str]:
+    r"""Per-cluster DISTINCTIVE-token label by enrichment (lift): one comma-joined string per cluster.
+
+    The globally frequent tokens (the, comma, of) occur in EVERY cluster, so raw-frequency labels are
+    uninformative; the lift score lift(t, c) = (count of t in c / |c|) / (count of t / M) ranks a token by
+    how CONCENTRATED it is in cluster c -- surfacing what the cluster is about. Keeps candidates with
+    in-cluster count >= ``floor``, ranks by lift, and returns the top-``k`` unique decoded strings
+    (stripped; replacement-char / non-printable BPE-byte fragments dropped). ``decode is None`` -> raw id.
+    """
+    ids = token_ids.astype(int)
+    M = ids.size
+    uniq = np.unique(ids)
+    sm = {int(t): (decode([int(t)]) if decode is not None else str(int(t))) for t in uniq}
+    glob = {int(t): int((ids == t).sum()) for t in uniq}
+    out: Dict[int, str] = {}
+    for c in sorted(set(labels.tolist()) - {-1}):
+        m = labels == c
+        n_c = int(m.sum())
+        if not n_c:
+            continue
+        loc_ids, loc_ct = np.unique(ids[m], return_counts=True)
+        scored = []
+        for t, ct in zip(loc_ids.tolist(), loc_ct.tolist()):
+            if ct < floor:
+                continue
+            s = str(sm[int(t)]).strip()
+            if not s or "�" in s or not s.isprintable():    # drop empty / replacement-char / byte fragments
+                continue
+            scored.append(((ct / n_c) / (glob[int(t)] / M), s))
+        scored.sort(reverse=True)
+        seen, toks = set(), []
+        for _, s in scored:
+            if s not in seen:
+                seen.add(s)
+                toks.append(s)
+            if len(toks) >= k:
+                break
+        if toks:
+            out[c] = ", ".join(toks)
+    return out
+
+
+@register_figure("belief_umap")
+def plot_belief_umap(
+    bank:             Dict,              # belief_bank output: mu, sigma, phi, token_ids, seq_idx
+    channel:          str = "mu",        # which belief channel to embed: 'mu' / 'sigma' / 'phi'
+
+    *,
+    decode:           Optional[object] = None,   # decode(list[int]) -> str; None -> id labels
+    n_clusters_label: int              = 14,     # annotate the N largest clusters
+    seed:             int              = 0,
+    sil_sample:       int              = 2000,
+    path:             Optional[str]    = None,
 ):
-    r"""F5: UMAP of one belief channel, coloured by linguistic token category, with labelled words.
+    r"""F5: data-driven cluster map of one belief channel, each cluster labelled by its distinctive tokens.
 
     ONE figure per channel (the caller emits mu / sigma / phi separately). The channel is embedded
     faithfully to its geometry (mu Euclidean, Sigma in the log-Euclidean chart, phi in the gauge
-    coordinates), and the SAME 2-D embedding is shown once per taxonomy: a BPE-structure panel and a
-    function/content panel, each coloured by category with a legend. The ``n_label`` most frequent
-    tokens are decoded and annotated at their occurrence-centroid. Each panel title reports the
-    silhouette + Calinski-Harabasz of the CATEGORY labels in the channel's NATIVE space, so the number
-    measures how strongly the channel separates that linguistic taxonomy (not an arbitrary token id).
-    With ``decode is None`` (no tokenizer) it degrades to a single-colour scatter with the same labels.
+    coordinates), the 2-D cloud is density-clustered (:func:`_cluster_embedding`), and the
+    ``n_clusters_label`` largest clusters are annotated -- a star at the cluster MEDOID and a leader to a
+    collision-free margin label of its top distinctive tokens by enrichment/lift (:func:`_cluster_lift_labels`),
+    so the reader sees WHAT each cluster is. A faint grey kernel-density underlay makes the dense core read
+    as density rather than an opaque blob; partial-opacity rasterized points keep overplotting legible; and
+    HDBSCAN noise is drawn light grey behind. This replaces the a-priori linguistic-category colouring,
+    which does NOT separate the belief geometry (silhouette near zero) -- that quantitative view lives in the
+    companion :func:`plot_belief_category_separation`; the function/content silhouette is noted in the title
+    for context when ``decode`` is available. ``decode is None`` falls back to raw token-id labels.
     """
     feats = _belief_channel_features(bank, channel)
-    fnp = _np(feats)
-    coords = umap_embed(feats, seed=seed)
+    coords = _np(umap_embed(feats, seed=seed)).astype(float)
     token_ids = _np(bank["token_ids"]).astype(int)
-    fig, axes = plt.subplots(1, len(taxonomies), figsize=(6.4 * len(taxonomies), 5.4), squeeze=False)
-    for ax, tax in zip(axes[0], taxonomies):
-        labels, names = (None, None) if decode is None else _token_category_labels(token_ids, decode, tax)
-        _scatter_by_category(ax, coords, labels, names)
-        _annotate_frequent_tokens(ax, coords, token_ids, decode, n_label)
-        title = f"{channel} · {tax.replace('_', '/')}"
-        if labels is not None:
-            cm = clustering_metrics(fnp, labels, sample_size=sil_sample)
-            title += f"  (sil {cm['silhouette']:.2f}, CH {cm['calinski_harabasz']:.0f})"
-        ax.set(xlabel="UMAP 1", ylabel="UMAP 2", title=title)
-    fig.suptitle(f"Belief semantic clustering — {channel} (colour = linguistic category)")
+    labels = _cluster_embedding(coords, seed=seed)
+    cl = sorted(set(labels.tolist()) - {-1}, key=lambda c: -int((labels == c).sum()))
+    noise = float((labels == -1).mean())
+    lab_text = _cluster_lift_labels(token_ids, labels, decode, k=3)
+
+    fig, ax = plt.subplots(figsize=(9.0, 6.6))
+    xmin, xmax = float(coords[:, 0].min()), float(coords[:, 0].max())
+    ymin, ymax = float(coords[:, 1].min()), float(coords[:, 1].max())
+    rx, ry = (xmax - xmin) or 1.0, (ymax - ymin) or 1.0
+    try:                                                         # faint density underlay (best-effort)
+        from scipy.stats import gaussian_kde
+        gx, gy = np.mgrid[xmin:xmax:120j, ymin:ymax:120j]
+        zz = gaussian_kde(coords.T)(np.vstack([gx.ravel(), gy.ravel()])).reshape(gx.shape)
+        ax.contourf(gx, gy, zz, levels=8, cmap="Greys", alpha=0.28, zorder=0)
+    except Exception:                                            # singular cloud / no scipy -> skip underlay
+        pass
+    nm = labels == -1
+    if nm.any():
+        ax.scatter(coords[nm, 0], coords[nm, 1], s=4, c="#bbbbbb", alpha=0.30, linewidths=0,
+                   rasterized=True, zorder=1)
+    palette = plt.cm.tab20(np.linspace(0, 1, 20))
+    col = {c: palette[i % 20] for i, c in enumerate(cl)}
+    for c in cl:
+        m = labels == c
+        ax.scatter(coords[m, 0], coords[m, 1], s=6, color=col[c], alpha=0.5, linewidths=0,
+                   rasterized=True, zorder=2)
+    # Collision-free margin callouts: assign each labelled cluster to its NEAREST margin (top / bottom /
+    # left / right), then space the labels evenly along that margin with a leader to the cluster medoid.
+    # Four sides (vs one top + one bottom row) spread ~14 labels to ~3-4 per side, so neither crowds and
+    # the leaders stay short -- the failure the single-row layout hit when most clusters sat one side of
+    # the centre.
+    cx, cy = float(np.median(coords[:, 0])), float(np.median(coords[:, 1]))
+    items = []
+    for c in cl[:n_clusters_label]:
+        if c not in lab_text:
+            continue
+        pts = coords[labels == c]
+        md = pts[np.argmin(((pts - pts.mean(0)) ** 2).sum(1))]   # medoid: robust in-cluster anchor
+        items.append((c, md, lab_text[c]))
+    sides: Dict[str, list] = {"top": [], "bottom": [], "left": [], "right": []}
+    for c, md, lab in items:
+        dx, dy = (md[0] - cx) / rx, (md[1] - cy) / ry
+        if abs(dx) >= abs(dy):
+            sides["right" if dx >= 0 else "left"].append((c, md, lab))
+        else:
+            sides["top" if dy >= 0 else "bottom"].append((c, md, lab))
+    x_left, x_right = xmin - 0.04 * rx, xmax + 0.04 * rx
+    y_top, y_bot = ymax + 0.15 * ry, ymin - 0.15 * ry
+
+    def _callout(c, md, lab, lx, ly, ha, va):
+        ax.plot([md[0], lx], [md[1], ly], color=col[c], lw=0.7, alpha=0.7, zorder=4)
+        ax.scatter([md[0]], [md[1]], marker="*", s=55, color=col[c], edgecolor="black",
+                   linewidths=0.5, zorder=6)
+        ax.annotate(lab, xy=(lx, ly), fontsize=8, fontweight="bold", zorder=7, ha=ha, va=va,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=col[c], lw=1.0, alpha=0.9))
+
+    for side in ("top", "bottom"):
+        row = sorted(sides[side], key=lambda it: it[1][0])      # order by x
+        xs = np.linspace(xmin, xmax, len(row)) if len(row) > 1 else [0.5 * (xmin + xmax)]
+        yrow, va = (y_top, "bottom") if side == "top" else (y_bot, "top")
+        for (c, md, lab), lx in zip(row, xs):
+            _callout(c, md, lab, lx, yrow, "center", va)
+    for side in ("left", "right"):
+        col_ = sorted(sides[side], key=lambda it: it[1][1])     # order by y
+        ys = np.linspace(ymin, ymax, len(col_)) if len(col_) > 1 else [0.5 * (ymin + ymax)]
+        xcol, ha = (x_left, "right") if side == "left" else (x_right, "left")
+        for (c, md, lab), ly in zip(col_, ys):
+            _callout(c, md, lab, xcol, ly, ha, "center")
+    ax.set_xlim(xmin - 0.30 * rx, xmax + 0.30 * rx)             # room for the left / right label boxes
+    ax.set_ylim(y_bot - 0.08 * ry, y_top + 0.08 * ry)
+    ax.set_xticks([]); ax.set_yticks([])
+    title = (f"Belief {channel} — {len(cl)} data-driven clusters ({noise * 100:.0f}% noise); "
+             f"labels = distinctive (lift) tokens")
+    if decode is not None:
+        try:
+            cats, _ = _token_category_labels(token_ids, decode, "function_content")
+            sil = clustering_metrics(_np(feats), cats, sample_size=sil_sample)["silhouette"]
+            title += (f"\nfunction/content category silhouette {sil:+.2f} "
+                      f"(~0 -> a-priori categories do not separate; clusters above are data-driven)")
+        except Exception:
+            pass
+    ax.set_title(title, fontsize=10)
     fig.tight_layout()
     return _save(fig, path)
 

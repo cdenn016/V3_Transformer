@@ -151,6 +151,8 @@ def generate_figures(
     r_centroid  = _safe(lambda: extract.hyper_prior_centroid(model, tok), "hyper_prior_centroid")
     h_coupling  = _safe(lambda: extract.hyper_prior_coupling(model, tok), "hyper_prior_coupling")
     gamma_attn  = _safe(lambda: extract.gamma_attention(model, tok), "gamma_attention")
+    mc_bank     = _safe(lambda: extract.model_channel_bank(model, token_batches, max_sequences=max_sequences),
+                        "model_channel_bank")
 
     # gpt2/cl100k decoder for the belief-UMAP linguistic-category colouring + token labels (None when
     # tiktoken is absent or the dataset has no real tokenizer -> the UMAP greys out and labels by id).
@@ -239,6 +241,10 @@ def generate_figures(
     _emit("gamma_attention",                                      # the gamma_ij model-coupling attention
           lambda p: figs.plot_gamma_attention(gamma_attn, path=p),
           gamma_attn is not None)
+    for ch in ("mu", "sigma"):                                    # model-channel s UMAP (no phi: shares belief gauge)
+        _emit(f"belief_umap_s_{ch}",
+              lambda p, ch=ch: figs.plot_belief_umap(mc_bank, ch, decode=decode, path=p),
+              mc_bank is not None)
 
     logger.info("wrote %d single-run figures to %s", len(written), figdir)
     return written
