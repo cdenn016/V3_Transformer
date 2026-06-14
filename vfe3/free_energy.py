@@ -13,7 +13,12 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from vfe3.alpha_i import alpha_is_per_coord
-from vfe3.divergence import get_functional
+from vfe3.divergence import (
+    get_functional,
+    get_functional_per_coord,
+    has_per_coord_functional,
+    divergence_functionals_per_coord,
+)
 from vfe3.families.base import BeliefParams
 
 
@@ -207,23 +212,29 @@ def self_divergence_per_coord(
     r"""Per-coordinate self-divergence D^(k)(q_i||p_i), unsummed over the coordinate axis.
 
     Defined only for a diagonal-covariance family (full-covariance KL couples coordinates
-    through the trace and log-determinant and does not decompose) and the Renyi functional
-    (KL = Renyi at alpha=1, the only functional whose diagonal form is registered
-    per-coordinate). Both are enforced by raising, so a future non-decomposing functional
-    cannot silently sum the wrong thing. Consumed by the ``state_dependent_per_coord`` alpha
-    form via ``self_divergence_for_alpha``.
+    through the trace and log-determinant and does not decompose) and for a divergence that
+    decomposes coordinate-wise -- the per-coordinate functional registry: Renyi/KL, plus the
+    two divergences AFFINE in the Renyi divergence (Bhattacharyya = 0.5 D_{1/2}, Jeffreys =
+    KL + KL_rev). ``squared_hellinger`` is excluded (H^2 = 1 - exp(-D_{1/2}/2) is a nonlinear
+    transform of the SUMMED divergence). Both are enforced by raising, so a non-decomposing
+    functional cannot silently sum the wrong thing. Consumed by the ``state_dependent_per_coord``
+    alpha form via ``self_divergence_for_alpha``.
     """
     if q.cov_kind != "diagonal":
         raise ValueError(
             f"self_divergence_per_coord needs a diagonal-covariance family (full-covariance KL "
             f"does not decompose coordinate-wise); got cov_kind={q.cov_kind!r}"
         )
-    if divergence_family != "renyi":
+    if not has_per_coord_functional(divergence_family):
         raise ValueError(
-            f"self_divergence_per_coord is implemented for the 'renyi' functional only "
-            f"(KL = renyi at alpha=1); got divergence_family={divergence_family!r}"
+            f"self_divergence_per_coord has no per-coordinate form for "
+            f"divergence_family={divergence_family!r}: only divergences that decompose "
+            f"coordinate-wise on a diagonal Gaussian are registered "
+            f"({divergence_functionals_per_coord()}). 'squared_hellinger' is excluded (H^2 = "
+            f"1 - exp(-D_{{1/2}}/2) is a nonlinear transform of the summed divergence). Use a "
+            f"decomposable divergence or a per-position alpha_mode."
         )
-    return q.renyi_per_coord(p, alpha=alpha, kl_max=kl_max, eps=eps)
+    return get_functional_per_coord(divergence_family)(q, p, alpha=alpha, kl_max=kl_max, eps=eps)
 
 
 def self_divergence_for_alpha(

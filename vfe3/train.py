@@ -251,6 +251,7 @@ def train_step(
     grad_clip:        float                              = 1.0,
     grad_accum_steps: int                                = 1,
     scaler:           Optional['torch.amp.GradScaler']  = None,
+    metrics_out:      Optional[dict]                     = None,
 ) -> float:
     r"""One M-step (one optimizer step) on the cross-entropy of a batch; returns the loss.
 
@@ -303,8 +304,32 @@ def train_step(
             _, loss_mb, _ = model(tok_mb, tgt_mb)
             _scaler.scale(loss_mb / grad_accum_steps).backward()   # accumulate the mean-normalized microbatch grad
             step_loss += float(loss_mb.detach()) / grad_accum_steps
-    if grad_clip is not None and grad_clip > 0:
+    # Unscale once when EITHER clipping or metrics capture needs true-unit gradients; GradScaler
+    # tracks that unscale_ already ran so the later _scaler.step() does not re-unscale. With a
+    # disabled scaler (the default) unscale_ is a no-op, and with metrics_out=None this is
+    # byte-identical to the prior clip-only path.
+    need_unscale = (grad_clip is not None and grad_clip > 0) or (metrics_out is not None)
+    if need_unscale:
         _scaler.unscale_(optimizer)
+    if metrics_out is not None:
+        # Pre-clip gradient health -- the global L2 norm clip_grad_norm_ RETURNS-and-discards, plus
+        # per-group norms (groups 0/1/2 = mu/sigma/phi from build_optimizer). Captured AFTER unscale_
+        # but BEFORE clip so the value is the true pre-clip gradient magnitude.
+        total_sq: float = 0.0
+        per_group: List[float] = []
+        for g in optimizer.param_groups:
+            gsq = sum(float(p.grad.detach().pow(2).sum())
+                      for p in g["params"] if p.grad is not None)
+            per_group.append(gsq ** 0.5)
+            total_sq += gsq
+        metrics_out["grad_norm"] = total_sq ** 0.5
+        for _i, _name in enumerate(("mu", "sigma", "phi")):
+            if _i < len(per_group):
+                metrics_out[f"grad_norm_{_name}"] = per_group[_i]
+        metrics_out["loss_finite"] = float(math.isfinite(step_loss))
+        if scaler is not None and scaler.is_enabled():          # fp16: surface the loss-scale (Tier-2 health)
+            metrics_out["grad_scale"] = float(scaler.get_scale())
+    if grad_clip is not None and grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     _scaler.step(optimizer)
     _scaler.update()
@@ -475,22 +500,34 @@ def train(
             tokens, targets = next(it)
         tokens = tokens.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        losses.append(train_step(model, optimizer, scheduler, tokens, targets,
-                                  grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
-                                  scaler=scaler))
-
         do_log  = bool(log_interval) and (step + 1) % log_interval == 0
         do_eval = bool(eval_interval) and val_loader is not None and (step + 1) % eval_interval == 0
         do_csv  = artifacts is not None and (do_log or do_eval)
+        # Capture pre-clip gradient health only on a step that will log or persist, so the silent
+        # hot path stays byte-identical (metrics_out=None -> no extra unscale_, no grad-norm pass).
+        step_metrics: Optional[Dict[str, float]] = {} if (do_log or do_csv) else None
+        losses.append(train_step(model, optimizer, scheduler, tokens, targets,
+                                  grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
+                                  scaler=scaler, metrics_out=step_metrics))
 
         if do_log or do_csv:                                 # converged CE + diagnostics (off graph), ONCE
             with torch.no_grad():
                 _, _, ce_t = model(tokens, targets)          # true CE (nats)
             ce = float(ce_t)
             d = model.diagnostics(tokens)
+            # Throughput + peak memory over the window since the last log/eval, then reset the window.
+            # Computed here (not inside do_log) so a CSV row on an eval-only step still carries the rate.
+            now = time.perf_counter()
+            rate = (step + 1 - win_i0) / max(now - win_t0, 1e-9)             # optimizer steps/s
+            toks_per_s = rate * int(tokens.shape[0]) * int(tokens.shape[1])  # tokens/s
+            if torch.cuda.is_available():
+                peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+                torch.cuda.reset_peak_memory_stats()
+            else:
+                peak_mem_mb = float("nan")
+            win_t0, win_i0 = now, step + 1
 
         if do_log:
-            rate = (step + 1 - win_i0) / max(time.perf_counter() - win_t0, 1e-9)
             logger.info(
                 "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | it/s: %.2f | \n\n         Train PPL: %.1f \n",
                 step + 1, n_steps, losses[-1], ce, d["attn_entropy"], rate, math.exp(min(ce, 20.0)),
@@ -500,8 +537,6 @@ def train(
                 d["self_coupling"], d["belief_coupling"], d["attention_entropy"],
                 d["total"], d["effective_rank"], (ce / math.log(2.0)) * tokens_per_char,
             )
-            win_t0 = time.perf_counter()
-            win_i0 = step + 1
 
         if do_eval:
             m = evaluate(model, val_loader, max_batches=cfg.eval_max_batches,
@@ -566,6 +601,37 @@ def train(
                 "holonomy_deviation": d["holonomy_deviation"],
                 "gauge_trace_spread": d["gauge_trace_spread"],
             }
+            # Throughput + peak memory (Tier-1): tokens/s over the window and CUDA peak MB.
+            row["tokens_per_s"] = toks_per_s
+            row["peak_mem_mb"]  = peak_mem_mb
+            # Derived gaps (Tier-1): generalization (train vs val CE) and the variational complexity
+            # overhead the bound carries over pure fit (F_total - val_ce); both per-token nats. NaN
+            # until the first eval populates last_val.
+            row["generalization_gap"] = ce - last_val.get("ce", float("nan"))
+            row["elbo_ce_gap"]        = (d["total"] / n_tok) - last_val.get("ce", float("nan"))
+            # Extended per-eval diagnostics (Tier-1/2): already-reduced gauge / geometry / numerical-
+            # health scalars from diagnostics() -- NOT per-token sums, so logged RAW (no /n_tok).
+            # Conditional keys (connection_w_norm, head_mixer_drift) appear only with their toggle; the
+            # config is fixed per run so the CSV stays rectangular.
+            for _dk in ("holonomy_ci_lo", "holonomy_ci_hi",
+                        "gauge_invariant_mean", "gauge_invariant_spread",
+                        "phi_norm_mean", "phi_norm_std",
+                        "belief_cond_median", "belief_cond_p95", "belief_cond_max", "belief_pd_margin",
+                        "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
+                        "fisher_trace_mean", "fisher_trace_median",
+                        "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
+                        "guard_energy_klmax_frac", "guard_selfdiv_klmax_frac",
+                        "nonfinite_frac", "attn_entropy_min", "attn_entropy_collapsed_heads",
+                        "connection_w_norm", "head_mixer_drift"):
+                if _dk in d:
+                    row[_dk] = d[_dk]
+            # Pre-clip gradient health (Tier-1): global + per-group (mu/sigma/phi) norms, loss
+            # finiteness, and the fp16 loss-scale -- captured by train_step into step_metrics this step.
+            if step_metrics:
+                for _gk in ("grad_norm", "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi",
+                            "loss_finite", "grad_scale"):
+                    if _gk in step_metrics:
+                        row[_gk] = step_metrics[_gk]
             # Model-channel F blocks (per-token, like the belief blocks above): present iff the
             # s-channel tables exist (diagnostics gates them on STATIC config -- lambda_h / gamma /
             # prior_source / s_e_step), so the column set is fixed per run and the CSV stays

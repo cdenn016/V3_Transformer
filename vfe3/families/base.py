@@ -168,6 +168,44 @@ def divergence_functionals() -> Tuple[str, ...]:
     return tuple(sorted(_FUNCTIONALS))
 
 
+# Per-COORDINATE divergence registry (the unsummed (..., K) form consumed by the
+# state_dependent_per_coord alpha). A divergence has a per-coordinate form ONLY when it decomposes
+# as a sum over the diagonal-Gaussian coordinates: Renyi/KL does (renyi_per_coord), and so do the
+# divergences that are AFFINE in the Renyi divergence -- Bhattacharyya (0.5 D_{1/2}) and Jeffreys
+# (KL + KL_rev). squared_hellinger is deliberately ABSENT: H^2 = 1 - exp(-D_{1/2}/2) is a nonlinear
+# transform of the SUMMED divergence and does not split coordinate-wise. A functional with no member
+# here is rejected by ``free_energy.self_divergence_per_coord`` (and at config construction).
+_FUNCTIONALS_PER_COORD: Dict[str, Callable[..., torch.Tensor]] = {}
+
+
+def register_functional_per_coord(name: str) -> Callable[[Callable[..., torch.Tensor]], Callable[..., torch.Tensor]]:
+    r"""Register a PER-COORDINATE divergence functional under ``name`` (the ``divergence_family``)."""
+    def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        _FUNCTIONALS_PER_COORD[name] = fn
+        return fn
+    return _wrap
+
+
+def get_functional_per_coord(name: str) -> Callable[..., torch.Tensor]:
+    r"""The registered per-coordinate functional for ``name`` (KeyError if absent)."""
+    if name not in _FUNCTIONALS_PER_COORD:
+        raise KeyError(
+            f"no per-coordinate functional registered under {name!r}; available: "
+            f"{sorted(_FUNCTIONALS_PER_COORD)}"
+        )
+    return _FUNCTIONALS_PER_COORD[name]
+
+
+def has_per_coord_functional(name: str) -> bool:
+    r"""Whether divergence ``name`` has a registered per-coordinate (coordinate-decomposing) form."""
+    return name in _FUNCTIONALS_PER_COORD
+
+
+def divergence_functionals_per_coord() -> Tuple[str, ...]:
+    r"""Registered per-coordinate functional names (the divergences that decompose coordinate-wise)."""
+    return tuple(sorted(_FUNCTIONALS_PER_COORD))
+
+
 def _renyi_from_log_partition(
     q:       BeliefParams,
     p:       BeliefParams,
@@ -323,7 +361,68 @@ def jeffreys(
             + renyi(p, q, alpha=1.0, kl_max=kl_max, eps=eps))
 
 
+def renyi_per_coord(
+    q:       BeliefParams,
+    p:       BeliefParams,
+
+    *,
+    alpha:   float = 1.0,
+    kl_max:  float = 100.0,
+    eps:     float = 1e-6,
+    **kwargs,
+) -> torch.Tensor:                             # (..., K) per-coordinate Renyi/KL D^(k)
+    r"""Per-coordinate Renyi/KL: the unsummed diagonal coordinate terms (family hook).
+
+    Defined only for a family exposing ``renyi_per_coord`` (the diagonal Gaussian); the caller
+    (``free_energy.self_divergence_per_coord``) guards ``cov_kind == 'diagonal'`` first.
+    """
+    return q.renyi_per_coord(p, alpha=alpha, kl_max=kl_max, eps=eps)
+
+
+def bhattacharyya_per_coord(
+    q:       BeliefParams,
+    p:       BeliefParams,
+
+    *,
+    kl_max:  float = 100.0,
+    eps:     float = 1e-6,
+    **kwargs,
+) -> torch.Tensor:                             # (..., K) per-coordinate Bhattacharyya D_B^(k)
+    r"""Per-coordinate Bhattacharyya D_B^(k) = 0.5 D_{1/2}^(k); sum_k recovers ``bhattacharyya``.
+
+    Bhattacharyya is AFFINE in the Renyi-1/2 divergence (D_B = 0.5 D_{1/2}), so it decomposes
+    coordinate-wise as 0.5 times the per-coordinate Renyi-1/2. A forwarded ``alpha`` is absorbed
+    (Bhattacharyya has no order; the inner per-coord call always uses alpha=0.5).
+    """
+    return 0.5 * q.renyi_per_coord(p, alpha=0.5, kl_max=kl_max, eps=eps)
+
+
+def jeffreys_per_coord(
+    q:       BeliefParams,
+    p:       BeliefParams,
+
+    *,
+    kl_max:  float = 100.0,
+    eps:     float = 1e-6,
+    **kwargs,
+) -> torch.Tensor:                             # (..., K) per-coordinate Jeffreys J^(k)
+    r"""Per-coordinate Jeffreys J^(k) = KL^(k)(q||p) + KL^(k)(p||q); sum_k recovers ``jeffreys``.
+
+    Jeffreys is a SUM of two KLs, each of which decomposes coordinate-wise (per-coord Renyi at
+    alpha=1), so the symmetrized divergence decomposes too. Both q and p are diagonal Gaussians
+    (the belief and its prior). A forwarded ``alpha`` is absorbed (the inner calls always use 1).
+    """
+    return (q.renyi_per_coord(p, alpha=1.0, kl_max=kl_max, eps=eps)
+            + p.renyi_per_coord(q, alpha=1.0, kl_max=kl_max, eps=eps))
+
+
 register_functional("renyi")(renyi)
 register_functional("squared_hellinger")(squared_hellinger)
 register_functional("bhattacharyya")(bhattacharyya)
 register_functional("jeffreys")(jeffreys)
+
+# Per-coordinate forms for the divergences that decompose coordinate-wise (see _FUNCTIONALS_PER_COORD).
+# squared_hellinger is intentionally NOT registered here (non-additive outer transform).
+register_functional_per_coord("renyi")(renyi_per_coord)
+register_functional_per_coord("bhattacharyya")(bhattacharyya_per_coord)
+register_functional_per_coord("jeffreys")(jeffreys_per_coord)
