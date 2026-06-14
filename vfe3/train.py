@@ -721,6 +721,9 @@ def train(
                 # the live batch). Best-effort inside save_attention_maps: a viz error is logged,
                 # never fatal to the run. Kept at EVAL cadence (one grid per eval, not per log).
                 artifacts.save_attention_maps(step + 1, model.attention_maps(tokens), logger=logger)
+                # Model-coupling (gamma) heatmaps alongside the belief beta maps, in a distinct colour
+                # (viridis vs magma); gamma_attention_maps returns None when the model channel is off -> no-op.
+                artifacts.save_gamma_attention_maps(step + 1, model.gamma_attention_maps(tokens), logger=logger)
 
         # Persistence is opt-in: with no artifacts object do_csv is False, so the silent/in-memory
         # path is unchanged. A metrics.csv row is written every LOG_INTERVAL (and every eval) -- the

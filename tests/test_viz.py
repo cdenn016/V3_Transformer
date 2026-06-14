@@ -98,6 +98,16 @@ def test_plot_attention_graph_and_heatmap_save(tmp_path):
     assert _saved_nonempty(pg) and _saved_nonempty(ph)
 
 
+def test_plot_attention_heatmap_channel_colors(tmp_path):
+    # The belief (beta, magma) and model (gamma, viridis) channels render as distinct-coloured
+    # per-head heatmaps through the same plotter -- cmap/symbol select the channel identity.
+    beta = torch.softmax(torch.randn(6, 6), dim=-1)
+    pb = tmp_path / "beta.png"; pg = tmp_path / "gamma.png"
+    fig1 = plot_attention_heatmap(beta, cmap="magma", symbol=r"\beta", path=str(pb)); plt.close(fig1)
+    fig2 = plot_attention_heatmap(beta, cmap="viridis", symbol=r"\gamma", path=str(pg)); plt.close(fig2)
+    assert _saved_nonempty(pb) and _saved_nonempty(pg)
+
+
 def test_plot_covariance_ellipses_and_trajectory_save(tmp_path):
     mu = torch.randn(8, 3); sigma = torch.rand(8, 3) + 0.5
     pe = tmp_path / "ell.png"; pt = tmp_path / "traj.png"

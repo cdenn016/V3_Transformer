@@ -193,26 +193,29 @@ def _attn_log_bounds(
     return float(vmin), float(vmax)
 
 
-def _attn_imshow(ax, B: np.ndarray, *, vmin: float, vmax: float, log: bool = True):
+def _attn_imshow(ax, B: np.ndarray, *, vmin: float, vmax: float, log: bool = True, cmap: str = "magma"):
     r"""imshow one (N, N) attention map. ``log`` (default) uses ``LogNorm`` to resolve the peaky
     off-diagonal structure a linear scale washes to black; exact-zero (causal-masked) entries are
-    non-positive, so ``LogNorm`` masks them and ``set_bad`` renders them black."""
-    cmap = plt.cm.magma.copy()
-    cmap.set_bad("black")
+    non-positive, so ``LogNorm`` masks them and ``set_bad`` renders them black. ``cmap`` selects the
+    colour family so the channels read apart: belief beta = 'magma' (warm), model gamma = 'viridis' (cool)."""
+    cmap_obj = plt.get_cmap(cmap).copy()
+    cmap_obj.set_bad("black")
     if log:
-        return ax.imshow(B, cmap=cmap, aspect="auto", norm=LogNorm(vmin=vmin, vmax=vmax))
-    return ax.imshow(B, cmap=cmap, aspect="auto", vmin=0.0, vmax=vmax)
+        return ax.imshow(B, cmap=cmap_obj, aspect="auto", norm=LogNorm(vmin=vmin, vmax=vmax))
+    return ax.imshow(B, cmap=cmap_obj, aspect="auto", vmin=0.0, vmax=vmax)
 
 
 def plot_attention_heatmap(
     beta,                                # (N, N)
 
     *,
-    log:   bool            = True,
-    title: str             = "Attention",
-    vmin:  Optional[float] = None,
-    vmax:  Optional[float] = None,
-    path:  Optional[str]   = None,
+    log:    bool            = True,
+    title:  str             = "Attention",
+    cmap:   str             = "magma",   # 'magma' belief beta, 'viridis' model gamma
+    symbol: str             = r"\beta",  # colorbar math symbol (\beta belief, \gamma model)
+    vmin:   Optional[float] = None,
+    vmax:   Optional[float] = None,
+    path:   Optional[str]   = None,
 ):
     r"""Log-scaled heatmap of one attention map (rows = queries i, cols = keys j).
 
@@ -220,13 +223,14 @@ def plot_attention_heatmap(
     so the default ``log`` scale (matplotlib ``LogNorm`` on beta) resolves the off-diagonal
     structure a linear scale collapses to black; the causal-masked zeros render as the 'bad'
     colour. Pass shared ``vmin``/``vmax`` to make several panels comparable; otherwise the positive
-    entries set the scale (dynamic range capped at three decades).
+    entries set the scale (dynamic range capped at three decades). ``cmap``/``symbol`` select the
+    channel identity: belief beta ('magma', \beta) vs model gamma ('viridis', \gamma).
     """
     B = _np(beta)
     vlo, vhi = _attn_log_bounds(B, vmin, vmax)
     fig, ax = plt.subplots(figsize=(4.5, 4))
-    im = _attn_imshow(ax, B, vmin=vlo, vmax=vhi, log=log)
-    label = r"$\beta_{ij}$ (log scale)" if log else r"$\beta_{ij}$"
+    im = _attn_imshow(ax, B, vmin=vlo, vmax=vhi, log=log, cmap=cmap)
+    label = rf"${symbol}_{{ij}}$ (log scale)" if log else rf"${symbol}_{{ij}}$"
     fig.colorbar(im, ax=ax, shrink=0.8, label=label)
     ax.set(title=title, xlabel="key j", ylabel="query i")
     return _save(fig, path)
@@ -959,42 +963,6 @@ def plot_hyper_prior_coupling(
            title=rf"Hyper-prior coupling (the $\lambda_h$ block, $\lambda_h={lam:g}$)")
     ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
-    return _save(fig, path)
-
-
-def plot_gamma_attention(
-    g_data:  Dict,                       # extract.gamma_attention output (caller skips when None)
-
-    *,
-    log:     bool          = True,
-    path:    Optional[str] = None,
-):
-    r"""Model-coupling attention gamma_ij (the gamma figure): the s-channel analogue of the belief beta maps.
-
-    A grid of per-head gamma_ij = softmax_j(log pi^s_ij - E^s_ij/tau_g) heatmaps (rows = query i, cols =
-    key j) on a shared LOG colour scale -- the model-channel consensus pattern, the structure the gamma
-    block sum_ij gamma_ij KL(s_i||Omega s_j) weights. Causal-masked future positions are exact zeros
-    (rendered black). Compare against :meth:`VFEModel.attention_maps`'s belief beta to see whether the
-    model channel attends like the belief channel.
-    """
-    G = _np(g_data["gamma"])                                      # (H, N, N)
-    if G.ndim == 2:
-        G = G[None]
-    H = G.shape[0]
-    fig, axes = plt.subplots(1, H, figsize=(2.8 * H + 1.0, 3.0), squeeze=False)
-    vlo, vhi = _attn_log_bounds(G)
-    im = None
-    for hi in range(H):
-        ax = axes[0][hi]
-        im = _attn_imshow(ax, G[hi], vmin=vlo, vmax=vhi, log=log)
-        ax.set_xticks([]); ax.set_yticks([])
-        ax.set_title(f"head {hi}")
-        ax.set_xlabel("key $j$")
-        if hi == 0:
-            ax.set_ylabel("query $i$")
-    fig.suptitle(r"Model-coupling attention $\gamma_{ij}$ (s-channel)", y=1.04)
-    label = r"$\gamma_{ij}$ (log scale)" if log else r"$\gamma_{ij}$"
-    fig.colorbar(im, ax=list(axes[0]), shrink=0.8, label=label)
     return _save(fig, path)
 
 
