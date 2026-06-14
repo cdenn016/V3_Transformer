@@ -1,0 +1,374 @@
+r"""Click-to-run analysis + figures for the VFE_3.0 PARAMETER-scaling runs written by ``scaling.py``.
+
+Harvests every run directory under ``input_dir`` (each carries ``summary.json`` with the enriched
+``scaling_point`` block, plus ``config.json`` / ``provenance.json`` / ``scaling_cell.json``), writes a
+tidy ``scaling_points.csv`` (one row per run), aggregates seeds per (route, size) point, fits the loss
+power law ``test_ce = A * N^{-alpha}`` (with bootstrap confidence on the exponent), runs the multi-route
+frontier-collapse F-test (do different ways of growing N share one ``L(N)`` curve?), prints the tables,
+and writes the scaling figures via ``vfe3.viz.figures``. There is no model re-run and no CLI parsing:
+edit ``CONFIG`` and run ``python scaling_analysis.py``.
+
+The y-axis is ``test_ce`` (nats/token), the canonical additive scaling quantity; perplexity is a
+nonlinear re-read. The x-axis is the recorded ``n_params`` (never a derived ``d^2`` proxy). Runs whose
+``test_ce`` is null (no test split) or non-positive are dropped before the log fit; the analysis warns
+if the harvested points span more than one ``data_sha256`` (mixed corpus) or ``git_sha`` (code drift),
+either of which confounds a frontier.
+"""
+
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # keep parity with the rest of the suite; numpy
+#   here pulls no torch, but the figures import vfe3.viz which may, so set it before any heavy import.
+
+import csv
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+logger = logging.getLogger("scaling_analysis")
+
+INFERENCE_ROUTE = "inference"                                # flat-N routes, plotted separately from L(N)
+
+CONFIG: Dict[str, Any] = {
+    "input_dir":   "vfe3_scaling_results",                  # where scaling.py wrote the run dirs
+    "with_offset": False,                                   # headline fit: False -> A*N^-alpha; True -> E + A*N^-alpha
+    "n_bootstrap": 2000,                                    # nested (points x seeds) bootstrap for the exponent CI
+    "min_points":  2,                                       # a route needs this many sizes to get its own fit
+}
+
+_CSV_COLUMNS = [
+    "route", "scale_knob", "label", "seed", "n_params", "n_learnable_params", "embed_dim", "n_heads",
+    "n_gen", "gauge_group", "n_layers", "n_e_steps", "family", "tokens_seen", "est_flops_6ND",
+    "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl", "best_val_ppl",
+    "wall_time_s", "data_sha256", "git_sha",
+]
+
+
+# =============================================================================
+# HARVEST
+# =============================================================================
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def harvest(input_dir: Path) -> List[Dict[str, Any]]:
+    r"""One row per run directory (a dir containing ``summary.json``). Pulls the scaling point, the
+    held-out test numbers, the structural config, the cell's route/scale_knob, and provenance."""
+    rows: List[Dict[str, Any]] = []
+    for summ_path in sorted(input_dir.glob("**/summary.json")):
+        run = summ_path.parent
+        summ = _read_json(summ_path)
+        sp = summ.get("scaling_point", {})
+        cfgj = _read_json(run / "config.json")
+        cfg = cfgj.get("config", {})
+        prov = _read_json(run / "provenance.json")
+        cell = _read_json(run / "scaling_cell.json")
+        test = _read_json(run / "test_results.json")
+        test_ce = sp.get("test_ce", test.get("test_ce"))
+        rows.append({
+            "run_dir":     str(run),
+            "route":       cell.get("route", "(unlabeled)"),
+            "scale_knob":  cell.get("scale_knob", "(unknown)"),
+            "label":       cell.get("label", run.name),
+            "seed":        prov.get("seed", cfg.get("seed")),
+            "n_params":    summ.get("n_params", sp.get("n_params")),
+            "n_learnable_params":      sp.get("n_learnable_params"),
+            "embed_dim":   sp.get("embed_dim", cfg.get("embed_dim")),
+            "n_heads":     sp.get("n_heads", cfg.get("n_heads")),
+            "n_gen":       sp.get("n_gen", cell.get("n_gen")),
+            "gauge_group": sp.get("gauge_group", cfg.get("gauge_group")),
+            "n_layers":    sp.get("n_layers", cfg.get("n_layers")),
+            "n_e_steps":   sp.get("n_e_steps", cfg.get("n_e_steps")),
+            "family":      cfg.get("family"),
+            "tokens_seen": sp.get("tokens_seen"),
+            "est_flops_6ND":           sp.get("est_flops_6ND"),
+            "est_flops_analytic":      sp.get("est_flops_analytic"),
+            "active_params_per_token": sp.get("active_params_per_token"),
+            "test_ce":     test_ce,
+            "test_ppl":    test.get("test_ppl", sp.get("test_ppl")),
+            "best_val_ppl": (summ.get("best_val_ppl") if summ.get("best_val_ppl") is not None
+                             else test.get("best_val_ppl")),
+            "wall_time_s": summ.get("wall_time_s", sp.get("wall_time_s")),
+            "data_sha256": prov.get("data_sha256"),
+            "git_sha":     prov.get("git_sha"),
+        })
+    return rows
+
+
+def write_csv(rows: List[Dict[str, Any]], out_path: Path) -> None:
+    r"""Tidy ``scaling_points.csv`` (fixed columns; missing keys blank). Python file I/O, never
+    PowerShell ``>`` redirection (which writes UTF-16LE+BOM that numpy/csv misread)."""
+    with open(out_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=_CSV_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in _CSV_COLUMNS})
+
+
+# =============================================================================
+# AGGREGATION  (seeds -> one point per (route, label))
+# =============================================================================
+
+def _as_float(x: Any) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    r"""Collapse seeds: one point per (route, label) carrying ``ce_seeds`` (the per-seed test CE) and
+    the shared structural fields. n_params is averaged across seeds (identical by construction; a
+    spread is warned about). Points with no finite positive CE are dropped."""
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for r in rows:
+        groups.setdefault((r["route"], r["label"]), []).append(r)
+    points: List[Dict[str, Any]] = []
+    for (route, label), grp in sorted(groups.items()):
+        ce = [_as_float(g["test_ce"]) for g in grp]
+        ce = [c for c in ce if np.isfinite(c) and c > 0]
+        if not ce:
+            continue
+        npars = [_as_float(g["n_params"]) for g in grp if np.isfinite(_as_float(g["n_params"]))]
+        if npars and (max(npars) - min(npars)) > 0:
+            logger.warning("n_params varies across seeds for %s/%s (%s); using the mean", route, label, npars)
+        points.append({
+            "route": route, "label": label, "scale_knob": grp[0]["scale_knob"],
+            "n_params": float(np.mean(npars)) if npars else float("nan"),
+            "n_gen": _as_float(grp[0].get("n_gen")),
+            "tokens_seen": _as_float(grp[0].get("tokens_seen")),
+            "est_flops_6ND": _as_float(grp[0].get("est_flops_6ND")),
+            "est_flops_analytic": _as_float(grp[0].get("est_flops_analytic")),
+            "n_e_steps": _as_float(grp[0].get("n_e_steps")),
+            "n_layers": _as_float(grp[0].get("n_layers")),
+            "ce_seeds": ce, "n_seeds": len(ce),
+            "ce_mean": float(np.mean(ce)),
+            "ce_sem": float(np.std(ce, ddof=1) / np.sqrt(len(ce))) if len(ce) > 1 else 0.0,
+        })
+    return points
+
+
+# =============================================================================
+# FITTING  (power law + bootstrap exponent CI + multi-route ANCOVA)
+# =============================================================================
+
+def bootstrap_exponent_ci(
+    points:      List[Dict[str, Any]],
+
+    *,
+    n_boot:      int = 2000,
+    with_offset: bool = False,
+) -> Tuple[float, float, float]:
+    r"""Nested cluster bootstrap of the power-law exponent: each replicate resamples the SIZE points
+    with replacement (the lever-arm effect) and, within each kept point, resamples its seed CEs, then
+    refits. Returns (alpha_hat, lo2.5, hi97.5). Needs >= 2 points; degenerate -> NaNs."""
+    from vfe3.viz.figures import _fit_power_law
+    xs = np.array([p["n_params"] for p in points], dtype=float)
+    if xs.size < 2:
+        return float("nan"), float("nan"), float("nan")
+    seed_arrays = [np.asarray(p["ce_seeds"], dtype=float) for p in points]
+    means = np.array([a.mean() for a in seed_arrays])
+    alpha_hat = _fit_power_law(xs, means, with_offset=with_offset)["alpha"]
+    rng = np.random.default_rng(0)                           # fixed -> reproducible CI
+    boot: List[float] = []
+    n = len(points)
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        bx = xs[idx]
+        by = np.array([float(rng.choice(seed_arrays[i], size=seed_arrays[i].size).mean()) for i in idx])
+        a = _fit_power_law(bx, by, with_offset=with_offset)["alpha"]
+        if np.isfinite(a):
+            boot.append(a)
+    if not boot:
+        return alpha_hat, float("nan"), float("nan")
+    return alpha_hat, float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
+
+
+def _loglog_rss(x: np.ndarray, y: np.ndarray) -> float:
+    r"""Residual sum of squares of a 1-D log-log least-squares line (NaN if < 2 points)."""
+    if x.size < 2:
+        return float("nan")
+    b, a = np.polyfit(x, y, 1)
+    return float(np.sum((y - (b * x + a)) ** 2))
+
+
+def ancova_frontier_collapse(points: List[Dict[str, Any]], min_points: int = 2) -> Dict[str, Any]:
+    r"""F-test for whether the routes share ONE log-log L(N) line. Pooled model (1 line, 2 params) vs
+    full model (a separate slope+intercept per route, 2R params); a significant F means the routes do
+    NOT collapse (route-specific slope and/or intercept). Uses only routes with >= ``min_points`` sizes
+    and a total dof margin (n > 2R). Returns the F statistic, dof, p-value, and per-route point counts."""
+    by_route: Dict[str, List[Dict[str, Any]]] = {}
+    for p in points:
+        by_route.setdefault(p["route"], []).append(p)
+    routes = {r: ps for r, ps in by_route.items() if len(ps) >= min_points}
+    out: Dict[str, Any] = {"routes": {r: len(ps) for r, ps in routes.items()}, "testable": False}
+    if len(routes) < 2:
+        out["reason"] = "need >= 2 routes with enough sizes"
+        return out
+    x_all, y_all = [], []
+    rss_full, n_total, R = 0.0, 0, len(routes)
+    for r, ps in routes.items():
+        x = np.log(np.array([p["n_params"] for p in ps], dtype=float))
+        y = np.log(np.array([p["ce_mean"] for p in ps], dtype=float))
+        x_all.append(x); y_all.append(y)
+        rss_full += _loglog_rss(x, y)
+        n_total += x.size
+    rss_pooled = _loglog_rss(np.concatenate(x_all), np.concatenate(y_all))
+    df1, df2 = 2 * R - 2, n_total - 2 * R
+    if df2 <= 0 or not np.isfinite(rss_full) or rss_full <= 0:
+        out["reason"] = "insufficient dof for the F-test"
+        return out
+    F = ((rss_pooled - rss_full) / df1) / (rss_full / df2)
+    try:
+        from scipy.stats import f as f_dist
+        p_value = float(f_dist.sf(F, df1, df2))
+    except Exception:
+        p_value = float("nan")
+    out.update({"testable": True, "F": float(F), "df1": int(df1), "df2": int(df2),
+                "p_value": p_value, "rss_pooled": rss_pooled, "rss_full": rss_full,
+                "collapses": (p_value > 0.05) if np.isfinite(p_value) else None})
+    return out
+
+
+# =============================================================================
+# REPORT + FIGURES
+# =============================================================================
+
+def _print_points_table(points: List[Dict[str, Any]]) -> None:
+    print(f"\n{'route':<14}{'label':<18}{'N params':>14}{'n_gen':>8}{'seeds':>7}"
+          f"{'test_ce':>11}{'+/-SEM':>10}")
+    print("-" * 82)
+    for p in sorted(points, key=lambda q: (q["route"], q["n_params"])):
+        print(f"{p['route']:<14}{p['label']:<18}{int(p['n_params']):>14,}{int(p['n_gen']):>8}"
+              f"{p['n_seeds']:>7}{p['ce_mean']:>11.4f}{p['ce_sem']:>10.4f}")
+
+
+def analyze() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    input_dir = Path(CONFIG["input_dir"])
+    if not input_dir.exists():
+        raise FileNotFoundError(f"input_dir {input_dir} does not exist; run scaling.py first")
+
+    rows = harvest(input_dir)
+    if not rows:
+        print(f"No runs (with summary.json) under {input_dir}; run scaling.py first.")
+        return
+    fig_dir = input_dir / "figures"
+    fig_dir.mkdir(exist_ok=True)
+    write_csv(rows, input_dir / "scaling_points.csv")
+    print(f"\nVFE_3.0 scaling analysis\n  input:   {input_dir}\n  runs:    {len(rows)}"
+          f"\n  csv:     {input_dir / 'scaling_points.csv'}")
+
+    # provenance guards: a frontier must be one corpus + (ideally) one code state.
+    shas = {r["data_sha256"] for r in rows if r.get("data_sha256")}
+    gits = {r["git_sha"] for r in rows if r.get("git_sha")}
+    if len(shas) > 1:
+        logger.warning("harvested runs span %d distinct data_sha256 -- mixed corpus confounds the fit", len(shas))
+    if len(gits) > 1:
+        logger.warning("harvested runs span %d distinct git_sha -- code drift across the sweep", len(gits))
+
+    points = aggregate_points(rows)
+    param_points = [p for p in points if p["route"] != INFERENCE_ROUTE]
+    infer_points = [p for p in points if p["route"] == INFERENCE_ROUTE]
+    _print_points_table(points)
+
+    # ---- L(N) power law + bootstrap exponent CI (pooled over the parameter routes) ----
+    if len(param_points) >= 2:
+        from vfe3.viz.figures import _fit_power_law
+        xs = np.array([p["n_params"] for p in param_points], dtype=float)
+        ys = np.array([p["ce_mean"] for p in param_points], dtype=float)
+        sem = np.array([p["ce_sem"] for p in param_points], dtype=float)
+        w = np.where(sem > 0, (ys / np.where(sem > 0, sem, 1.0)) ** 2, 1.0)
+        fit = _fit_power_law(xs, ys, weights=w, with_offset=CONFIG["with_offset"])
+        a_hat, lo, hi = bootstrap_exponent_ci(param_points, n_boot=CONFIG["n_bootstrap"],
+                                              with_offset=CONFIG["with_offset"])
+        print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}  "
+              f"[95% CI {lo:.4f}, {hi:.4f}]   A = {fit['A']:.4g}   "
+              + (f"E = {fit['E']:.4f}   " if CONFIG["with_offset"] else "")
+              + f"R^2 = {fit['r2']:.4f}   over {fit['n_points']} sizes")
+        # ---- per-route fits + frontier-collapse F-test ----
+        routes = sorted({p["route"] for p in param_points})
+        if len(routes) > 1:
+            print("\nper-route exponents:")
+            for r in routes:
+                pr = [p for p in param_points if p["route"] == r]
+                if len(pr) >= 2:
+                    fr = _fit_power_law(np.array([p["n_params"] for p in pr], dtype=float),
+                                        np.array([p["ce_mean"] for p in pr], dtype=float))
+                    print(f"  {r:<14} alpha={fr['alpha']:.4f}  R^2={fr['r2']:.4f}  ({len(pr)} sizes)")
+                else:
+                    print(f"  {r:<14} (only {len(pr)} size; need >= 2 to fit)")
+            anc = ancova_frontier_collapse(param_points, min_points=CONFIG["min_points"])
+            if anc.get("testable"):
+                verdict = ("ONE shared frontier (routes collapse)" if anc["collapses"]
+                           else "routes DIVERGE (route-specific slope/intercept)")
+                print(f"\nfrontier-collapse F-test:  F({anc['df1']},{anc['df2']}) = {anc['F']:.3f}  "
+                      f"p = {anc['p_value']:.4g}  ->  {verdict}")
+            else:
+                print(f"\nfrontier-collapse F-test: not testable ({anc.get('reason')})")
+    else:
+        print("\n(only one parameter size present; add more sizes to fit L(N))")
+
+    # ---- figures (best-effort, never fatal) ----
+    _make_figures(param_points, infer_points, fig_dir)
+    print(f"\nfigures -> {fig_dir}")
+
+
+def _make_figures(param_points: List[Dict[str, Any]], infer_points: List[Dict[str, Any]],
+                  fig_dir: Path) -> None:
+    try:
+        from vfe3.viz import figures as figs
+        figs.set_publication_style()
+    except Exception as exc:
+        logger.warning("figures unavailable (%s); skipping the figure pass", exc)
+        return
+
+    def _try(name: str, fn) -> None:
+        try:
+            fig = fn()
+            figs.plt.close(fig)
+            print(f"  figure -> {fig_dir / name}")
+        except Exception as exc:
+            logger.warning("figure %s failed (%s); skipped", name, exc)
+
+    if len(param_points) >= 2:
+        _try("scaling_ce_vs_params.png", lambda: figs.plot_scaling_law(
+            param_points, x_key="n_params", xlabel="parameters N",
+            with_offset=CONFIG["with_offset"], path=str(fig_dir / "scaling_ce_vs_params.png")))
+        if len({p["route"] for p in param_points}) > 1:
+            _try("scaling_routes_overlay.png", lambda: figs.plot_scaling_routes(
+                param_points, x_key="n_params", xlabel="parameters N",
+                path=str(fig_dir / "scaling_routes_overlay.png")))
+        # compute axis (a proxy): CE vs estimated FLOPs across the size grid (tokens fixed -> compute
+        # grows with N). Labeled a proxy; uses the 6ND column.
+        if any(np.isfinite(p["est_flops_6ND"]) for p in param_points):
+            _try("scaling_ce_vs_flops.png", lambda: figs.plot_scaling_law(
+                param_points, x_key="est_flops_6ND", xlabel="est FLOPs (6ND proxy)",
+                title="Scaling vs compute (6ND proxy)", path=str(fig_dir / "scaling_ce_vs_flops.png")))
+        # data axis: only meaningful if tokens_seen actually varies (add a data route to populate it).
+        toks = {p["tokens_seen"] for p in param_points if np.isfinite(p["tokens_seen"])}
+        if len(toks) > 1:
+            _try("scaling_ce_vs_tokens.png", lambda: figs.plot_scaling_law(
+                param_points, x_key="tokens_seen", xlabel="tokens seen (data)",
+                title="Scaling vs data", path=str(fig_dir / "scaling_ce_vs_tokens.png")))
+
+    if infer_points:
+        # group the flat-N inference points by the knob they swept (n_e_steps / n_layers).
+        series: Dict[str, List[Dict[str, Any]]] = {}
+        for p in infer_points:
+            knob = p["scale_knob"]
+            x = p.get(knob, float("nan"))
+            series.setdefault(knob, []).append({"x": _as_float(x), "ce_seeds": p["ce_seeds"]})
+        n_flat = int(infer_points[0]["n_params"]) if np.isfinite(infer_points[0]["n_params"]) else None
+        _try("inference_capacity.png", lambda: figs.plot_inference_capacity(
+            series, n_params=n_flat, path=str(fig_dir / "inference_capacity.png")))
+
+
+if __name__ == "__main__":
+    analyze()

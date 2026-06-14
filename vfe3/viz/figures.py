@@ -1845,3 +1845,219 @@ def plot_numerical_trust(
         axes[0][2].set(xlabel="head", ylabel="max future-attention", title="Causal leakage (expect 0)")
     fig.tight_layout()
     return _save(fig, path)
+
+
+# ===========================================================================
+# Scaling-law figures (x-axis = number of parameters N; y = test CE in nats/token).
+# Consume the cross-run aggregate produced by scaling_analysis.py: a list of
+# per-point dicts {x_key: N, "ce_seeds": [per-seed test_ce], "route", "label"}.
+# The shared power-law fit lives here (_fit_power_law) so both the figures and the
+# analyzer tables use one implementation.
+# ===========================================================================
+
+def _fit_power_law(
+    N:       object,                     # (P,) parameter counts (or tokens / FLOPs)
+    L:       object,                     # (P,) loss at each point (test CE)
+
+    *,
+    weights:     object = None,          # (P,) WLS weights (e.g. (L/SEM)^2); None -> ordinary LS
+    with_offset: bool   = False,         # True -> Chinchilla L = E + A N^-alpha (scipy); else log-log power law
+) -> Dict[str, object]:
+    r"""Fit ``L(N)``. Default: log-log (weighted) least squares ``L = A * N^{-alpha}`` (returns
+    ``alpha = -slope``); ``with_offset=True`` fits the Chinchilla irreducible-loss form
+    ``L = E + A * N^{-alpha}`` via ``scipy.optimize.curve_fit`` and silently falls back to the
+    log-log fit if scipy is absent or the solve fails. Never raises; degenerate input (<2 finite
+    positive points) returns NaNs so the caller can skip the overlay."""
+    N = _np(N).astype(float).reshape(-1)
+    L = _np(L).astype(float).reshape(-1)
+    m = np.isfinite(N) & np.isfinite(L) & (N > 0) & (L > 0)
+    N, L = N[m], L[m]
+    out: Dict[str, object] = {"alpha": float("nan"), "A": float("nan"), "E": 0.0,
+                              "r2": float("nan"), "n_points": int(N.size), "form": "power_law"}
+    if N.size < 2:
+        return out
+    x, y = np.log(N), np.log(L)
+    w = None if weights is None else _np(weights).astype(float).reshape(-1)[m]
+    if with_offset and N.size >= 3:
+        try:
+            from scipy.optimize import curve_fit
+            p0 = [max(0.0, float(L.min()) * 0.5), float(np.exp(np.mean(y))), 0.3]
+            popt, _ = curve_fit(lambda n, E, A, al: E + A * np.power(n, -al), N, L, p0=p0,
+                                bounds=([0.0, 1e-12, 1e-3], [float(L.min()), np.inf, 3.0]),
+                                maxfev=20000)
+            E, A, al = (float(v) for v in popt)
+            Lp = E + A * np.power(N, -al)
+            ss_res = float(np.sum((L - Lp) ** 2))
+            ss_tot = float(np.sum((L - L.mean()) ** 2))
+            return {"alpha": al, "A": A, "E": E, "n_points": int(N.size), "form": "offset_power_law",
+                    "r2": (1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"))}
+        except Exception:
+            pass                                                # fall through to the log-log fit
+    import warnings
+    with warnings.catch_warnings():                          # bootstrap resamples can repeat x's -> ill-conditioned
+        warnings.simplefilter("ignore", np.exceptions.RankWarning)
+        coef = np.polyfit(x, y, 1, w=(None if w is None else np.sqrt(np.clip(w, 0.0, None))))
+    slope, intercept = float(coef[0]), float(coef[1])
+    yhat = slope * x + intercept
+    ss_res = float(np.sum((y - yhat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    out.update({"alpha": -slope, "A": float(np.exp(intercept)),
+                "r2": (1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"))})
+    return out
+
+
+def _t95(n: int) -> float:
+    r"""Two-sided 95% t-multiplier for ``n`` samples (``n-1`` dof); 0 for n<2, 1.96 if scipy absent."""
+    if n < 2:
+        return 0.0
+    try:
+        from scipy.stats import t
+        return float(t.ppf(0.975, n - 1))
+    except Exception:
+        return 1.96
+
+
+def _scaling_point_stats(points: list, x_key: str = "n_params") -> Dict[str, np.ndarray]:
+    r"""Per-point seed aggregation: returns x, mean, sem, ci95, n (one entry per point with >=1 finite
+    seed) plus the flattened per-seed (seed_x, seed_y) cloud for the faint scatter."""
+    x, mean, sem, ci, ns, sx, sy = [], [], [], [], [], [], []
+    for p in points:
+        seeds = [float(s) for s in p.get("ce_seeds", []) if np.isfinite(s)]
+        if not seeds or not np.isfinite(p.get(x_key, float("nan"))):
+            continue
+        arr = np.asarray(seeds, dtype=float)
+        xv = float(p[x_key])
+        x.append(xv); mean.append(float(arr.mean())); ns.append(arr.size)
+        s = float(arr.std(ddof=1)) / np.sqrt(arr.size) if arr.size > 1 else 0.0
+        sem.append(s); ci.append(_t95(arr.size) * s)
+        sx.extend([xv] * arr.size); sy.extend(seeds)
+    return {"x": np.asarray(x), "mean": np.asarray(mean), "sem": np.asarray(sem),
+            "ci95": np.asarray(ci), "n": np.asarray(ns, dtype=int),
+            "seed_x": np.asarray(sx), "seed_y": np.asarray(sy)}
+
+
+@register_figure("scaling_law")
+def plot_scaling_law(
+    points: list,                        # [{n_params, ce_seeds:[...], route, label}, ...]
+
+    *,
+    x_key:       str  = "n_params",
+    xlabel:      str  = "parameters N",
+    with_offset: bool = False,
+    title:       str  = "Scaling law (test CE vs parameters)",
+    path:        Optional[str] = None,
+):
+    r"""Headline scaling figure: log-log ``test_ce`` vs ``N`` with per-seed points, cross-seed 95% CI
+    error bars, the fitted power law overlaid, and a residual subpanel.
+
+    The fit is a (SEM-weighted) log-log least squares ``L = A N^{-alpha}`` (or the Chinchilla
+    ``E + A N^{-alpha}`` when ``with_offset``); the exponent ``alpha`` and ``R^2`` are annotated.
+    The residual panel plots ``log(mean / fit)`` against ``log N`` -- systematic curvature there is
+    the signature of a pre-asymptotic (not-yet-power-law) regime. The point count is annotated so a
+    two-or-three-size fit is never read as more precise than it is."""
+    st = _scaling_point_stats(points, x_key)
+    fig, (ax, axr) = plt.subplots(2, 1, figsize=(5.8, 5.4), sharex=True,
+                                  gridspec_kw={"height_ratios": [3, 1]})
+    if st["seed_x"].size:
+        ax.scatter(st["seed_x"], st["seed_y"], s=14, color=_CB[0], alpha=0.22, label="per seed", zorder=2)
+    if st["x"].size:
+        ax.errorbar(st["x"], st["mean"], yerr=st["ci95"], fmt="o", color=_CB[1], ms=6,
+                    capsize=3, lw=0, elinewidth=1.2, label="mean (95% CI)", zorder=3)
+    fit = None
+    if st["x"].size >= 2:
+        w = np.where(st["sem"] > 0, (st["mean"] / np.where(st["sem"] > 0, st["sem"], 1.0)) ** 2, 1.0)
+        fit = _fit_power_law(st["x"], st["mean"], weights=w, with_offset=with_offset)
+        xx = np.geomspace(st["x"].min(), st["x"].max(), 100)
+        yy = fit["E"] + fit["A"] * np.power(xx, -fit["alpha"])
+        lbl = (rf"fit $\alpha$={fit['alpha']:.3f}, $R^2$={fit['r2']:.3f}"
+               + (f", E={fit['E']:.3f}" if with_offset else ""))
+        ax.plot(xx, yy, "--", color="#444444", lw=1.6, label=lbl, zorder=4)
+        yfit_pts = fit["E"] + fit["A"] * np.power(st["x"], -fit["alpha"])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            resid = np.log(st["mean"] / yfit_pts)
+        axr.axhline(0.0, color="#444444", ls="--", lw=1)
+        axr.scatter(st["x"], resid, s=28, color=_CB[1])
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set(ylabel="test CE (nats/token)", title=f"{title}  (P={int(st['x'].size)} sizes)")
+    ax.legend(fontsize=8, frameon=False)
+    axr.set_xscale("log")
+    axr.set(xlabel=xlabel, ylabel=r"log(obs/fit)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("scaling_routes")
+def plot_scaling_routes(
+    points: list,                        # [{n_params, ce_seeds:[...], route, label}, ...]
+
+    *,
+    x_key:  str = "n_params",
+    xlabel: str = "parameters N",
+    title:  str = "Routes to N: does the frontier collapse?",
+    path:   Optional[str] = None,
+):
+    r"""Multi-route overlay: ``test_ce`` vs ``N`` with points colored AND markered by which knob grew
+    ``N`` (embed_dim / gauge block size / depth / ...), each route's own power-law fit, and a dashed
+    pooled fit. Routes that fall on one line share a frontier; a route offset above/below it (or a
+    different slope) does not -- the visual companion to the analyzer's ANCOVA test. Marker shape
+    duplicates the color so the routes survive greyscale printing."""
+    routes = sorted({str(p.get("route", "?")) for p in points})
+    markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
+    fig, ax = plt.subplots(figsize=(6.4, 4.8))
+    for i, r in enumerate(routes):
+        st = _scaling_point_stats([p for p in points if str(p.get("route", "?")) == r], x_key)
+        if not st["x"].size:
+            continue
+        c, mk = _CB[i % len(_CB)], markers[i % len(markers)]
+        ax.errorbar(st["x"], st["mean"], yerr=st["ci95"], fmt=mk, color=c, ms=6, capsize=2,
+                    lw=0, elinewidth=1.0)
+        if st["x"].size >= 2:
+            fit = _fit_power_law(st["x"], st["mean"])
+            xx = np.geomspace(st["x"].min(), st["x"].max(), 60)
+            ax.plot(xx, fit["A"] * np.power(xx, -fit["alpha"]), color=c, lw=1.4,
+                    label=rf"{r} ($\alpha$={fit['alpha']:.3f})")
+        else:
+            ax.plot([], [], marker=mk, color=c, lw=0, label=f"{r} (1 pt)")
+    stall = _scaling_point_stats(points, x_key)
+    if stall["x"].size >= 2:
+        g = _fit_power_law(stall["x"], stall["mean"])
+        xx = np.geomspace(stall["x"].min(), stall["x"].max(), 60)
+        ax.plot(xx, g["A"] * np.power(xx, -g["alpha"]), "--", color="#444444", lw=1.6,
+                label=rf"pooled ($\alpha$={g['alpha']:.3f})")
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set(xlabel=xlabel, ylabel="test CE (nats/token)", title=title)
+    ax.legend(fontsize=7.5, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("inference_capacity")
+def plot_inference_capacity(
+    series: Dict,                        # {knob_name: [{x, ce_seeds:[...]}, ...]} at FLAT params
+
+    *,
+    n_params: Optional[int] = None,
+    title:    str = "Inference-compute capacity (flat N)",
+    path:     Optional[str] = None,
+):
+    r"""Flat-``N`` inference-compute frontier: ``test_ce`` vs each inference depth knob (``n_e_steps``,
+    ``n_layers``) at CONSTANT parameter count -- the architecture's unique capacity-from-inference
+    axis. One panel per knob, x linear, mean +/- 95% CI over seeds. Kept SEPARATE from the ``L(N)``
+    figures because depth/T add zero parameters and would make an ``L(N)`` curve spuriously
+    multi-valued at fixed ``N``."""
+    keys = [k for k in series if series[k]]
+    if not keys:
+        keys = list(series)
+    fig, axes = plt.subplots(1, max(1, len(keys)), figsize=(4.6 * max(1, len(keys)), 3.8),
+                             squeeze=False)
+    for ax, k in zip(axes[0], keys):
+        st = _scaling_point_stats(series[k], x_key="x")
+        order = np.argsort(st["x"]) if st["x"].size else np.array([], dtype=int)
+        if order.size:
+            ax.errorbar(st["x"][order], st["mean"][order], yerr=st["ci95"][order], fmt="o-",
+                        color=_CB[0], capsize=3, lw=1.6)
+        ax.set(xlabel=k, ylabel="test CE (nats/token)", title=f"vs {k}")
+    note = f"params flat at {n_params:,}" if n_params else "params flat"
+    fig.suptitle(f"{title} ({note})")
+    fig.tight_layout()
+    return _save(fig, path)

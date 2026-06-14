@@ -419,6 +419,78 @@ def _write_research_artifacts(
         artifacts.save_json("research.json", out)
 
 
+def _cost_model_fields(
+    model:       torch.nn.Module,
+    cfg:         VFE3Config,
+
+    n_params:    int,
+    tokens_seen: int,
+
+    *,
+    wall_time:   Optional[float] = None,
+) -> Dict[str, object]:
+    r"""Structural axes + a faithful compute proxy for the scaling frontier (extends scaling_point).
+
+    The ``6ND`` rule (``6 * n_params * tokens_seen``) is LOOSE here: ``n_params`` is dominated by the
+    vocab-size gauge/prior tables (``phi_embed`` is ``V * n_gen``), but only the active tokens' rows
+    participate per step, while the decode reads all ``V`` rows every forward. So this records
+    (a) the structural axes that set the real per-token work, (b) ``active_params_per_token`` -- the
+    honest working set (decode-bound, ~``K``, NOT ``phi``/``n_gen``-bound, the mirror image of
+    ``n_params`` being ``n_gen``-dominated), and (c) a transparent analytic FLOP proxy assembled from
+    those drivers (order-1 constants; for a calibrated frontier use ``wall_time`` or a profiler).
+    ``wall_time`` on a fixed GPU is the empirical ground truth the analytic constants calibrate
+    against. ``n_gen`` / ``n_blocks`` are read from the GROUP OBJECT so they track ``cross_couplings``,
+    bracket closure, and the ``so_n``/``sp_n`` decoupling of ``n_gen`` from ``K``.
+    """
+    V, K = int(cfg.vocab_size), int(cfg.embed_dim)
+    n_gen = int(model.group.generators.shape[0])
+    n_blocks = max(1, len(model.group.irrep_dims))
+    d_head = K / n_blocks                                        # representative block dim
+    model_channel = (cfg.lambda_h > 0.0 or cfg.lambda_gamma > 0.0
+                     or cfg.prior_source == "model_channel" or cfg.s_e_step)
+    # ACTIVE params per token: decode reads every vocab row (2*V*K: mu+sigma readout) plus the single
+    # looked-up belief row (2K + n_gen). The V*n_gen phi bulk is NOT touched by decode.
+    active = (2 * V * K) + (2 * K + n_gen)
+    if not cfg.use_prior_bank:
+        active += V * K                                         # output_proj_weight (linear readout)
+    if model_channel:
+        active += 2 * V * K                                     # s tables enter encode/decode
+    # Transparent analytic FLOP proxy. Per token: decode matmul over all V (2VK) + L*T E-step
+    # iterations whose per-token cost is the O(N) attention energy (2*N*K) and the O(N) transport
+    # apply (2*N*d_head^2). Constants are O(1); this is a proxy, not a calibrated count.
+    L, T, N = int(cfg.n_layers), int(cfg.n_e_steps), int(cfg.max_seq_len)
+    fpt_decode = 2.0 * V * K
+    fpt_estep  = L * T * (2.0 * N * K + 2.0 * N * d_head * d_head)
+    est_flops_analytic = (fpt_decode + fpt_estep) * float(tokens_seen)
+    out: Dict[str, object] = {
+        "embed_dim":               K,
+        "n_heads":                 int(cfg.n_heads),
+        "n_blocks":                n_blocks,
+        "n_gen":                   n_gen,
+        "n_layers":                L,
+        "n_e_steps":               T,
+        "max_seq_len":             N,
+        "batch_size":              int(cfg.batch_size),
+        "diagonal_covariance":     bool(cfg.diagonal_covariance),
+        "gauge_group":             cfg.gauge_group,
+        "use_prior_bank":          bool(cfg.use_prior_bank),
+        "model_channel_active":    bool(model_channel),
+        "vocab_size":              V,
+        "n_learnable_params":      int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+        "active_params_per_token": int(active),
+        "est_flops_analytic":      est_flops_analytic,
+        "flops_per_token_decode":  fpt_decode,
+        "flops_per_token_estep":   fpt_estep,
+        "device_name":             (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
+        "amp_dtype":               cfg.amp_dtype,
+    }
+    if wall_time is not None and tokens_seen > 0:
+        out["wall_time_s"]         = float(wall_time)
+        out["wall_time_per_token"] = float(wall_time) / float(tokens_seen)
+        out["wall_time_per_step"]  = float(wall_time) / max(1, int(cfg.max_steps))
+    return out
+
+
 def finalize_run(
     model:       torch.nn.Module,
     artifacts:   RunArtifacts,
@@ -492,6 +564,20 @@ def finalize_run(
     _write_provenance(artifacts, cfg, model, test_loader, logger)
     n_params = int(sum(p.numel() for p in model.parameters()))
     tokens_seen = int(cfg.max_steps) * int(cfg.batch_size) * int(cfg.max_seq_len)
+    # scaling-law data point: the 6ND FLOP proxy is LOOSE for a no-NN E-step model, so record the
+    # inputs too (a cross-run frontier can be re-fit offline with the right cost model). The
+    # _cost_model_fields block adds the structural axes + active-params-per-token + a faithful
+    # analytic proxy so each point is standalone; best-effort, never blocks the saved numbers.
+    scaling_point: Dict[str, object] = {
+        "n_params":      n_params,
+        "tokens_seen":   tokens_seen,
+        "est_flops_6ND": 6 * n_params * tokens_seen,
+        "test_ce":       results.get("test_ce"),
+    }
+    try:
+        scaling_point.update(_cost_model_fields(model, cfg, n_params, tokens_seen, wall_time=wall_time))
+    except Exception as exc:
+        logger.warning("cost-model fields failed (%s); scaling_point keeps the 6ND proxy only", exc)
     artifacts.save_json("summary.json", {
         "n_steps":      cfg.max_steps,
         "n_params":     n_params,
@@ -506,14 +592,7 @@ def finalize_run(
         "wall_time_s":  wall_time,
         "use_prior_bank":  cfg.use_prior_bank,
         "use_head_mixer":  cfg.use_head_mixer,
-        # scaling-law point: the 6ND FLOP proxy is LOOSE for a no-NN E-step model, so record the
-        # inputs too -- a cross-run frontier can be re-fit offline with the right cost model.
-        "scaling_point": {
-            "n_params":      n_params,
-            "tokens_seen":   tokens_seen,
-            "est_flops_6ND": 6 * n_params * tokens_seen,
-            "test_ce":       results.get("test_ce"),
-        },
+        "scaling_point":   scaling_point,
     })
 
     # Research artifacts (decode calibration / frequency-stratified loss / FD gradient check) -- the
