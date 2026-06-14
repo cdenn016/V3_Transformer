@@ -769,7 +769,7 @@ def train(
             # health scalars from diagnostics() -- NOT per-token sums, so logged RAW (no /n_tok).
             # Conditional keys (connection_w_norm, head_mixer_drift) appear only with their toggle; the
             # config is fixed per run so the CSV stays rectangular.
-            for _dk in ("holonomy_ci_lo", "holonomy_ci_hi",
+            for _dk in ("holonomy_ci_lo", "holonomy_ci_hi", "holonomy_wilson",
                         "gauge_invariant_mean", "gauge_invariant_spread",
                         "phi_norm_mean", "phi_norm_std",
                         "belief_cond_median", "belief_cond_p95", "belief_cond_max", "belief_pd_margin",

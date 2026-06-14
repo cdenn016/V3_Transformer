@@ -28,6 +28,7 @@ from vfe3.metrics import (
     head_redundancy_js,
     holonomy_deviation,
     holonomy_deviation_sampled,
+    holonomy_wilson_sampled,
     per_head_gauge_invariants,
     positional_content_score,
     self_coupling_profile,
@@ -280,6 +281,47 @@ def test_curvature_field_flat_is_zero():
     grp = get_group("glk")(3)
     omega = compute_transport_operators(0.2 * torch.randn(1, 6, grp.generators.shape[0]), grp)["Omega"][0]
     assert float(curvature_field(omega, anchor=0).abs().max()) < 1e-3
+
+
+def test_holonomy_wilson_flat_cocycle_is_unity():
+    # Wilson observable W/K = Re Tr(H)/K -> 1 (deviation 1 - W/K -> 0) when every triangle closes.
+    grp = get_group("glk")(3)
+    omega = compute_transport_operators(0.2 * torch.randn(1, 8, grp.generators.shape[0]), grp)["Omega"][0]
+    out = holonomy_wilson_sampled(omega, n_triples=64, seed=0)
+    assert abs(float(out["wilson_mean"]) - 1.0) < 1e-3
+    assert float(out["deviation_mean"]) < 1e-3
+
+
+def test_holonomy_wilson_constant_rotation_matches_analytic():
+    # omega_ij = R(theta) for all distinct pairs -> H_ijk = R(theta)^3 = R(3*theta),
+    # so Re Tr(H)/K = Tr(R(3*theta))/2 = cos(3*theta) for every triple.
+    theta = 0.3
+    c, s = math.cos(theta), math.sin(theta)
+    R = torch.tensor([[c, -s], [s, c]])
+    omega = R.expand(5, 5, 2, 2).contiguous()
+    out = holonomy_wilson_sampled(omega, n_triples=32, seed=1)
+    assert abs(float(out["wilson_mean"]) - math.cos(3.0 * theta)) < 1e-4
+    assert torch.allclose(out["per_triple"], torch.full_like(out["per_triple"], math.cos(3.0 * theta)), atol=1e-4)
+
+
+def test_holonomy_wilson_per_head_decomposition_averages_to_full():
+    # Tr(H) = sum_h Tr(H^(h)) over the n_heads diagonal blocks, so the per-head normalized
+    # Wilson values (each Tr(H^(h))/d_k) average back to the full Wilson observable Tr(H)/K.
+    g = torch.Generator().manual_seed(0)
+    omega = torch.eye(4).expand(6, 6, 4, 4) + 0.3 * torch.randn(6, 6, 4, 4, generator=g)
+    out = holonomy_wilson_sampled(omega, n_heads=2, n_triples=64, seed=0)
+    assert out["per_head"].shape == (2,)
+    assert abs(float(out["per_head"].mean()) - float(out["wilson_mean"])) < 1e-5
+
+
+def test_holonomy_wilson_rejects_indivisible_head_count():
+    omega = torch.eye(3).expand(4, 4, 3, 3).contiguous()
+    try:
+        holonomy_wilson_sampled(omega, n_heads=2)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError when n_heads does not divide K")
 
 
 # --- free-energy closure / profile / residuals -----------------------------

@@ -597,6 +597,7 @@ class VFEModel(nn.Module):
                             lambda_beta=lambda_beta,
                             connection_W=connection_W, e_step_gradient=e_step_gradient,
                             rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
+                            rope_on_value=self.cfg.rope_on_value,
                             capture=cap, grad_record=grad_rec)
         if estep_grad_out is not None:                           # one host sync, only when requested
             for _gk in ("mu", "sigma", "phi"):
@@ -994,7 +995,7 @@ class VFEModel(nn.Module):
             log_alpha=getattr(self, "log_alpha", None),
             lambda_beta=(self.cfg.lambda_beta if _llb is None else _llb.exp()),
             connection_W=getattr(self, "connection_W", None),
-            rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
+            rope=rope, rope_on_cov=self.cfg.rope_full_gauge, rope_on_value=self.cfg.rope_on_value,
         )
         e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids[:1], out.phi.unsqueeze(0))
         gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)[0]   # drop batch
@@ -1118,6 +1119,7 @@ class VFEModel(nn.Module):
             lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
             rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
+            rope_on_value=cfg.rope_on_value,
             capture=cap,
         )
 
@@ -1139,7 +1141,8 @@ class VFEModel(nn.Module):
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
         if rope is not None:
-            rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge)
+            rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                                       on_value=cfg.rope_on_value)
             mu_t    = transport_mean(rope_omega, out.mu)             # (N, N, K)
             sigma_t = transport_covariance(rope_omega, out.sigma)    # (N, N, K)
         else:
@@ -1223,6 +1226,9 @@ class VFEModel(nn.Module):
         d["holonomy_deviation"] = float(hol["mean"])                 # unchanged key/semantics
         d["holonomy_ci_lo"]     = float(hol["ci_lo"])                # bootstrap band: real curvature vs jitter
         d["holonomy_ci_hi"]     = float(hol["ci_hi"])
+        # Manuscript-canonical gauge invariant: the Wilson-action density 1 - Re Tr(H)/K (PIFB:862-869),
+        # the trace complement of the Frobenius certificate above; ~0 on the flat cocycle, > 0 under regime_ii.
+        d["holonomy_wilson"]    = float(metrics.holonomy_wilson_sampled(omega)["deviation_mean"])
         d["gauge_trace_spread"] = float(metrics.gauge_trace_spread(out.phi, self.group.generators))
 
         # Group-correct gauge invariant: gauge_trace_spread is identically 0 on SO(N)/Sp(2m) (traceless
@@ -1373,6 +1379,7 @@ class VFEModel(nn.Module):
                 connection_W=getattr(self, "connection_W", None),
                 cg_coupling=self.cg_coupling,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
+                rope_on_value=cfg.rope_on_value,
             )
             # Attention at the converged belief, recomputed exactly as diagnostics does: the
             # transport regime is matched so regime_ii reads the means + learned connection_W
@@ -1384,7 +1391,8 @@ class VFEModel(nn.Module):
                 cocycle_relaxation=cfg.cocycle_relaxation,
             )                                                        # (N, N, K, K)
             if rope is not None:
-                rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge)
+                rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                                           on_value=cfg.rope_on_value)
                 mu_t    = transport_mean(rope_omega, belief.mu)          # (N, N, K)
                 sigma_t = transport_covariance(rope_omega, belief.sigma) # (N, N, K)
             else:

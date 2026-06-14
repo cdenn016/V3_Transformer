@@ -15,7 +15,7 @@ import torch
 from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
 from vfe3.families.base import get_family
 from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence_for_alpha
-from vfe3.geometry.transport import transport_covariance, transport_mean
+from vfe3.geometry.transport import RopeTransport, transport_covariance, transport_mean
 from vfe3.gradients.oracle import belief_gradients_autograd
 
 _KERNELS: Dict[str, Callable] = {}
@@ -173,6 +173,7 @@ def uses_kernel_route(
     divergence_family:         str,
     include_attention_entropy: bool,
     transport_mode:            str  = "flat",
+    decoupled_value_gauge:     bool = False,
 ) -> bool:
     r"""Whether ``belief_gradients`` serves the closed-form KERNEL (else the autograd oracle).
 
@@ -185,7 +186,14 @@ def uses_kernel_route(
     Omega^T) as constants in mu, but the regime_ii Omega depends on mu through
     delta_ij = mu_i^T W^a mu_j, so the kernel would silently descend a frozen-Omega objective.
     regime_ii routes to the autograd oracle, which rebuilds Omega from its differentiation
-    leaves (``omega_builder``) and therefore carries the d Omega/d mu term."""
+    leaves (``omega_builder``) and therefore carries the d Omega/d mu term.
+
+    ``decoupled_value_gauge`` (RopeTransport.on_value=False) likewise excludes the kernel: with the
+    attention gauge and value gauge factored apart (GL(K)_attention.tex:1909), beta is the softmax of
+    the rotated SCORE energy but the coupling sum uses the un-rotated value energy, so beta is no
+    longer that sum's stationary point and the closed-form envelope kernel (which assumes it is) does
+    not apply. The oracle differentiates the decoupled F directly and carries the extra d beta/d mu
+    term."""
     return (
         gradient_mode == "filtering"
         and family == "gaussian_diagonal"
@@ -193,6 +201,7 @@ def uses_kernel_route(
         and abs(renyi_order - 1.0) < 1e-9
         and include_attention_entropy
         and transport_mode != "regime_ii"
+        and not decoupled_value_gauge
         and has_kernel(family)
     )
 
@@ -240,11 +249,16 @@ def belief_gradients(
     the flat-transport gradient and would drop d Omega/d mu); the caller supplies ``omega_builder``
     so the oracle rebuilds the mu-dependent transport from its differentiation leaves.
     """
+    # Value-gauge decoupling (RopeTransport.on_value=False) breaks beta's stationarity for the
+    # coupling sum, so the closed-form kernel does not apply -- route to the oracle (which builds the
+    # value-gauge coupling energy). The omega object is the source of truth here.
+    decoupled_value = isinstance(omega, RopeTransport) and not omega.on_value
     use_kernel = uses_kernel_route(
         renyi_order=renyi_order, gradient_mode=gradient_mode, family=family,
         divergence_family=divergence_family,
         include_attention_entropy=include_attention_entropy,
         transport_mode=transport_mode,
+        decoupled_value_gauge=decoupled_value,
     )
     if not use_kernel:
         return belief_gradients_autograd(

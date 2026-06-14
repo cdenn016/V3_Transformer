@@ -149,6 +149,14 @@ class VFE3Config:
     pos_rotation:              str   = "none"      # "none" | "rope" (the positional-rotation registry)
     rope_base:                 float = 100.0       # rotary frequency base
     rope_full_gauge:           bool  = False       # rotate covariance too (needs family="gaussian_full")
+    # rope_on_value=True (default) is the coherent single-gauge path: the gauge-RoPE rotation feeds
+    # BOTH the attention score and the value aggregation. =False factors the transport into an
+    # attention gauge and a value gauge (GL(K)_attention.tex:1909): the score keeps the rotation but
+    # the value aggregation mu_hat_i = sum_j beta_ij Omega_ij mu_j uses the UN-rotated base -- RoPE's
+    # "position-dependent attention, position-independent values" asymmetry. Decoupled breaks beta's
+    # coupling-sum stationarity, so the belief gradient routes to the autograd oracle (no closed-form
+    # kernel). Inert unless pos_rotation='rope'.
+    rope_on_value:             bool  = True        # False -> value aggregation uses the un-rotated base (RoPE on Q/K only)
 
     # belief family. ``family`` is the SINGLE covariance-structure toggle (a registry key;
     # gaussian_diagonal | gaussian_full | ...). The diagonal-vs-full flag is its derived,

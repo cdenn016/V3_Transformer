@@ -98,6 +98,7 @@ def build_belief_transport(
     gauge_mode:         str                    = "learned", # 'learned' | 'trivial' (forwarded to the builder)
     cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
     rope_on_cov:        bool                   = False,     # rotate the covariance too (full-gauge)
+    rope_on_value:      bool                   = True,      # False -> value aggregation uses the un-rotated base
     mu:                 Optional[torch.Tensor] = None,      # regime_ii edge connection reads these
     connection_W:       Optional[torch.Tensor] = None,      # regime_ii learned bilinear connection
     mu_key:             Optional[torch.Tensor] = None,      # regime_ii KEY-slot means (None -> mu)
@@ -131,7 +132,7 @@ def build_belief_transport(
                            **transport_kw)
     if rope is None:
         return built
-    return RopeTransport(base=built, rope=rope, on_cov=rope_on_cov)
+    return RopeTransport(base=built, rope=rope, on_cov=rope_on_cov, on_value=rope_on_value)
 
 
 def _transport_qk(
@@ -169,6 +170,7 @@ def free_energy_value(
 
     include_attention_entropy: bool = True,
     rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
+    rope_on_value:             bool = True,            # False -> value aggregation uses the un-rotated base
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
@@ -227,12 +229,18 @@ def free_energy_value(
                 f"{transport_mode!r} (the filtered diagnostic has no non-flat transport form)"
             )
         omega = _transport_qk(belief.phi, keys.phi, group)
+    mu_tv = sigma_tv = None
     if rope is not None:
         # Mirror the model path: R_i Omega_ij R_j^T on the means (and the covariance sandwich
         # under the full gauge). The Rope einsums are rank-agnostic, so no unsqueeze dance.
-        wrapped = RopeTransport(base=omega, rope=rope, on_cov=rope_on_cov)
+        wrapped = RopeTransport(base=omega, rope=rope, on_cov=rope_on_cov, on_value=rope_on_value)
         mu_t = transport_mean(wrapped, key_belief.mu)
         sigma_t = transport_covariance(wrapped, key_belief.sigma)
+        if not rope_on_value:
+            # Diagnostic fidelity: log the DECOUPLED F the beliefs actually descend -- beta from the
+            # rotated SCORE energy (mu_t/sigma_t), coupling sum from the UN-rotated base VALUE energy.
+            mu_tv = transport_mean(wrapped.base, key_belief.mu)
+            sigma_tv = transport_covariance(wrapped.base, key_belief.sigma)
     else:
         mu_t = transport_mean(omega.unsqueeze(0), key_belief.mu.unsqueeze(0))[0]
         sigma_t = transport_covariance(omega.unsqueeze(0), key_belief.sigma.unsqueeze(0))[0]
@@ -243,10 +251,16 @@ def free_energy_value(
     alpha, reg = self_coupling_alpha(sd, value=value, mode=lambda_alpha_mode, b0=b0, c0=c0, log_alpha=log_alpha)
     energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_t, sigma_t), alpha=renyi_order, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=group.irrep_dims)
+    coupling_energy = None
+    if mu_tv is not None:
+        coupling_energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_tv, sigma_tv), alpha=renyi_order,
+                                          kl_max=kl_max, eps=eps, divergence_family=divergence_family,
+                                          irrep_dims=group.irrep_dims)
     return free_energy(
         sd, energy, alpha, tau=tau, lambda_beta=lambda_beta,
         include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if lambda_alpha_mode != "constant" else None),
+        coupling_energy=coupling_energy,
     )
 
 
@@ -349,6 +363,7 @@ def e_step_iteration(
     connection_W:              Optional[torch.Tensor] = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
     rope:                      Optional[torch.Tensor] = None,   # (N, K, K) gauge-RoPE rotation
     rope_on_cov:               bool                   = False,  # full-gauge: rotate covariance too
+    rope_on_value:             bool                   = True,   # False -> value aggregation uses the un-rotated base
     grad_record:               Optional[dict]         = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
@@ -384,13 +399,14 @@ def e_step_iteration(
                 belief.phi, group, transport_mode=transport_mode,
                 mu=mu_q, mu_key=mu_k, connection_W=connection_W,
                 cocycle_relaxation=cocycle_relaxation, rope=rope, rope_on_cov=rope_on_cov,
+                rope_on_value=rope_on_value,
             )
         omega_builder = _omega_builder
     else:
         omega = build_belief_transport(
             belief.phi, group, transport_mode=transport_mode,
             mu=belief.mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
-            rope=rope, rope_on_cov=rope_on_cov,
+            rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
         )
         omega_builder = None
     # Runtime truncation warning (audit 2026-06-09 P8): under the 'unroll' estimator with a LIVE
@@ -403,7 +419,8 @@ def e_step_iteration(
                 renyi_order=renyi_order, gradient_mode=gradient_mode, family=family,
                 divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy,
-                transport_mode=transport_mode)):
+                transport_mode=transport_mode,
+                decoupled_value_gauge=(rope is not None and not rope_on_value))):
         import warnings
         warnings.warn(
             "e_step_gradient='unroll' is being served by the autograd ORACLE with "
@@ -523,6 +540,7 @@ def e_step(
     grad_record:       Optional[dict]         = None,   # diag out-param (explicit): LAST iteration's belief-grad norms
     rope:              Optional[torch.Tensor] = None,
     rope_on_cov:       bool                   = False,
+    rope_on_value:     bool                   = True,
 
     log_prior:         Optional[torch.Tensor] = None,
     **kwargs,
@@ -550,7 +568,8 @@ def e_step(
         # divergence-weighted F. At the constant default alpha_reg=None, so the trajectory is the pure F.
         with torch.no_grad():
             return free_energy_value(b, mu_p, sigma_p, group, tau=tau, log_prior=log_prior,
-                                     rope=rope, rope_on_cov=rope_on_cov, **kwargs).item()
+                                     rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                                     **kwargs).item()
 
     if return_trajectory:
         traj.append(_f_diag(belief))
@@ -560,7 +579,7 @@ def e_step(
             e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, e_phi_lr=e_phi_lr,
             e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
             grad_record=grad_record,                       # last iteration overwrites -> converged-ish grad
-            log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, **kwargs,
+            log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, **kwargs,
         )
         if return_trajectory:
             traj.append(_f_diag(belief))

@@ -1,8 +1,20 @@
+import math
+
 import torch
 
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.transport import compute_transport_operators
 from vfe3.gradients.oracle import belief_gradients_autograd
+
+
+def _rope_rotation(N, K, base_theta=0.3):
+    # Block-diagonal SO(2) gauge-RoPE rotation R(theta_i), theta_i = i * base_theta (K=2 single block).
+    rot = torch.zeros(N, K, K)
+    for i in range(N):
+        th = i * base_theta
+        c, s = math.cos(th), math.sin(th)
+        rot[i, 0, 0] = c; rot[i, 0, 1] = -s; rot[i, 1, 0] = s; rot[i, 1, 1] = c
+    return rot
 
 
 def _setup(N=3, K=2, seed=0):
@@ -114,3 +126,61 @@ def test_smoothing_oracle_matches_finite_difference_of_F_full():
             fm = _F_full(mu - d, sigma, mu_p, sigma_p, omega, tau)
             gmu_fd[a, b] = (fp - fm) / (2 * eps)
     assert torch.allclose(gmu, gmu_fd, atol=2e-3, rtol=2e-3)
+
+
+# --- value-gauge decoupling (RopeTransport.on_value=False) ------------------
+
+def test_value_gauge_decoupling_excluded_from_kernel_route():
+    from vfe3.gradients.kernels import uses_kernel_route
+    common = dict(renyi_order=1.0, gradient_mode="filtering", family="gaussian_diagonal",
+                  divergence_family="renyi", include_attention_entropy=True)
+    assert uses_kernel_route(**common, decoupled_value_gauge=False) is True
+    assert uses_kernel_route(**common, decoupled_value_gauge=True) is False
+
+
+def test_value_gauge_decoupling_changes_oracle_gradient():
+    from vfe3.geometry.transport import RopeTransport
+    mu, sigma, mu_p, sigma_p, omega = _setup(N=4, K=2)
+    rope = _rope_rotation(4, 2)
+    coh = RopeTransport(base=omega, rope=rope, on_cov=False, on_value=True)
+    dec = RopeTransport(base=omega, rope=rope, on_cov=False, on_value=False)
+    g_coh, _ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, coh, tau=1.5, gradient_mode="filtering")
+    g_dec, _ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, dec, tau=1.5, gradient_mode="filtering")
+    # Decoupling the value gauge from the score gauge genuinely changes the belief-coupling pull.
+    assert not torch.allclose(g_coh, g_dec, atol=1e-4)
+
+
+def _F_decoupled_filtering(mu_q, sigma_q, mu_p, sigma_p, mu_ts, sigma_ts, mu_tv, sigma_tv, tau):
+    # Decoupled filtering F: beta from the rotated SCORE energy, coupling sum from the base VALUE
+    # energy; both transported-key sets frozen from the unperturbed belief (filtering split).
+    from vfe3.families.gaussian import DiagonalGaussian
+    from vfe3.free_energy import free_energy, pairwise_energy, self_divergence
+    sd = self_divergence(DiagonalGaussian(mu_q, sigma_q), DiagonalGaussian(mu_p, sigma_p))
+    energy = pairwise_energy(DiagonalGaussian(mu_q, sigma_q), DiagonalGaussian(mu_ts, sigma_ts))
+    coupling_energy = pairwise_energy(DiagonalGaussian(mu_q, sigma_q), DiagonalGaussian(mu_tv, sigma_tv))
+    alpha = torch.ones(mu_q.shape[0])
+    return free_energy(sd, energy, alpha, tau=tau, coupling_energy=coupling_energy,
+                       include_attention_entropy=True)
+
+
+def test_value_gauge_decoupled_oracle_matches_fd_of_decoupled_F():
+    from vfe3.geometry.transport import RopeTransport, transport_covariance, transport_mean
+    mu, sigma, mu_p, sigma_p, omega = _setup(N=4, K=2)
+    rope = _rope_rotation(4, 2)
+    dec = RopeTransport(base=omega, rope=rope, on_cov=False, on_value=False)
+    tau = 1.5
+    gmu, _ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, dec, tau=tau, gradient_mode="filtering")
+    # Frozen keys (filtering): score keys via the rotated transport, value keys via the base transport.
+    mu_ts = transport_mean(dec, mu)
+    sigma_ts = transport_covariance(dec, sigma)
+    mu_tv = transport_mean(omega.unsqueeze(0), mu.unsqueeze(0))[0]
+    sigma_tv = transport_covariance(omega.unsqueeze(0), sigma.unsqueeze(0))[0]
+    eps = 5e-3
+    gmu_fd = torch.zeros_like(mu)
+    for a in range(mu.shape[0]):
+        for b in range(mu.shape[1]):
+            d = torch.zeros_like(mu); d[a, b] = eps
+            fp = _F_decoupled_filtering(mu + d, sigma, mu_p, sigma_p, mu_ts, sigma_ts, mu_tv, sigma_tv, tau)
+            fm = _F_decoupled_filtering(mu - d, sigma, mu_p, sigma_p, mu_ts, sigma_ts, mu_tv, sigma_tv, tau)
+            gmu_fd[a, b] = (fp - fm) / (2 * eps)
+    assert torch.allclose(gmu, gmu_fd, atol=1e-3, rtol=1e-3)

@@ -337,6 +337,7 @@ def free_energy(
 
     log_prior:                 Optional[torch.Tensor] = None,   # (..., N, N) attention log-prior
     alpha_reg:                 Optional[torch.Tensor] = None,   # (..., N[,K]) R(alpha) if state-dep
+    coupling_energy:           Optional[torch.Tensor] = None,   # (..., N, N) VALUE-gauge energy for the coupling sum (None -> energy)
     log_likelihood:            Optional[torch.Tensor] = None,   # (..., N) E_q[log p(o|k)] observation term; GATED STUB (see docstring)
 ) -> torch.Tensor:                                  # scalar F = sum_i F_i
     r"""Single authoritative scalar free energy (default path; lambda_h=0, gamma=0).
@@ -369,7 +370,7 @@ def free_energy(
     Divergence-agnostic: `self_div`/`energy` come from the divergence seam, so a new
     divergence requires no change here.
     """
-    beta = attention_weights(energy, tau=tau, log_prior=log_prior)        # (..., N, N)
+    beta = attention_weights(energy, tau=tau, log_prior=log_prior)        # (..., N, N) from the SCORE energy
 
     # self-coupling (sum over coordinate axis too when alpha/self_div are per-coord)
     self_term = alpha * self_div
@@ -377,7 +378,13 @@ def free_energy(
         self_term = self_term + alpha_reg
     self_total = self_term.sum()
 
-    coupling = (beta * energy).sum()
+    # The coupling sum carries the belief-coupling energy beta_ij E_ij. ``coupling_energy`` (None ->
+    # the score ``energy``, the coherent single-operator default) lets the VALUE gauge differ from the
+    # ATTENTION gauge: beta is still softmax of the score energy, but the energy summed (the pull the
+    # belief descends) is the value-gauge energy. With coupling_energy=energy this is byte-identical;
+    # decoupled, beta is no longer the stationary point of the summed block, so the envelope theorem
+    # fails and only the autograd oracle (not the closed-form kernel) computes the gradient correctly.
+    coupling = (beta * (energy if coupling_energy is None else coupling_energy)).sum()
 
     F = self_total + lambda_beta * coupling
     if include_attention_entropy:

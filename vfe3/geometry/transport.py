@@ -64,11 +64,23 @@ class RopeTransport:
     image -- affine/Mahalanobis invariants (e.g. mu^T Sigma^{-1} mu, norms.MahalanobisNorm) are not
     preserved for that belief. The coherent pure path is ``on_cov=True`` (rope_full_gauge), where
     both transform under the same rotated operator.
+
+    ``on_value`` (default True = the coherent single-gauge path) factors the transport into an
+    ATTENTION gauge and a VALUE gauge (GL(K)_attention.tex:1909): the attention score
+    D_KL(q_i || R_i Omega_ij R_j^T q_j) always carries the rotation, but with ``on_value=False`` the
+    value aggregation mu_hat_i = sum_j beta_ij Omega_ij mu_j uses the UN-rotated base transport --
+    exactly RoPE's "position-dependent attention, position-independent values" asymmetry. The flag is
+    consumed at the GRADIENT layer: ``gradients/oracle.py`` builds the value-gauge coupling energy from
+    ``base`` while beta comes from the rotated score energy, and ``gradients/kernels.py`` routes the
+    decoupled case to the oracle (beta is no longer the coupling sum's stationary point, so the
+    closed-form envelope kernel does not apply). ``transport_mean`` / ``transport_covariance`` always
+    honour the rotation (the score path); the value path transports on ``base`` directly.
     """
 
-    base:   'torch.Tensor | FactoredTransport'  # (N,N,K,K) dense OR factored transport
-    rope:   torch.Tensor                        # (N, K, K) block-diagonal orthogonal rotation
-    on_cov: bool = False
+    base:     'torch.Tensor | FactoredTransport'  # (N,N,K,K) dense OR factored transport
+    rope:     torch.Tensor                        # (N, K, K) block-diagonal orthogonal rotation
+    on_cov:   bool = False
+    on_value: bool = True                         # False -> value aggregation uses the UN-rotated base (RoPE Q/K only)
 
 
 def _rope_dense_omega(base: 'torch.Tensor | FactoredTransport', rope: torch.Tensor) -> torch.Tensor:

@@ -3,6 +3,7 @@ import torch
 from vfe3.attention_prior import attention_log_prior
 from vfe3.free_energy import (
     attention_weights,
+    free_energy,
     log_partition,
     reduced_free_energy,
 )
@@ -485,3 +486,36 @@ def test_pairwise_energy_dispatches_on_declared_cov_kind_not_name():
         assert torch.allclose(E_new, E_ref, atol=1e-6)
     finally:
         _FAMILIES.pop(name, None)
+
+
+# --- value-gauge decoupling: free_energy coupling_energy --------------------
+
+def test_free_energy_coupling_energy_none_equals_passing_same_energy():
+    # coupling_energy defaults to `energy`; passing it explicitly is byte-identical.
+    torch.manual_seed(0)
+    N = 4
+    sd = torch.rand(N)
+    energy = torch.rand(N, N)
+    alpha = torch.ones(N)
+    f_default = free_energy(sd, energy, alpha, tau=1.3)
+    f_explicit = free_energy(sd, energy, alpha, tau=1.3, coupling_energy=energy)
+    assert torch.allclose(f_default, f_explicit)
+
+
+def test_free_energy_coupling_energy_decouples_beta_from_coupling_sum():
+    # beta = softmax(-energy/tau) from the SCORE energy; the coupling sum uses coupling_energy.
+    torch.manual_seed(1)
+    N = 4
+    sd = torch.zeros(N)
+    alpha = torch.zeros(N)                      # kill the self term to isolate the coupling block
+    energy = torch.rand(N, N)                   # drives beta
+    coupling_energy = torch.rand(N, N)          # drives the coupling sum
+    tau = 1.0
+    f = free_energy(sd, energy, alpha, tau=tau, coupling_energy=coupling_energy,
+                    include_attention_entropy=False)
+    beta = torch.softmax(-energy / tau, dim=-1)
+    expected = (beta * coupling_energy).sum()
+    assert torch.allclose(f, expected)
+    # And it genuinely differs from the coherent (coupling_energy=None) free energy.
+    f_coherent = free_energy(sd, energy, alpha, tau=tau, include_attention_entropy=False)
+    assert not torch.allclose(f, f_coherent)
