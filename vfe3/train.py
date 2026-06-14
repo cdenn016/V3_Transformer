@@ -771,10 +771,12 @@ def train(
             # prior_source / s_e_step), so the column set is fixed per run and the CSV stays
             # rectangular. free_energy_total above already carries their WEIGHTED contribution
             # (diagnostics folds it into d["total"] at the same per-sequence-sum scale, so the
-            # uniform /n_tok normalizes every block consistently -- audit obs 18497). Stored RAW
-            # (unweighted); the decomposition figure scales by cfg.lambda_h / cfg.gamma_coupling,
-            # exactly as the belief block is scaled by lambda_beta.
-            for _mck in ("hyper_prior", "gamma_coupling", "gamma_meta_entropy"):
+            # uniform /n_tok normalizes every block consistently -- audit obs 18497). The raw blocks
+            # are stored for the model_channel_terms figure; hyper_prior_weighted is the EXACT weighted
+            # contribution folded into total (state_dependent/learnable lambda_h != cfg.lambda_h*raw,
+            # so the F-decomposition figure reads this directly), while the gamma block is scaled by
+            # cfg.gamma_coupling in that figure, exactly as the belief block is scaled by lambda_beta.
+            for _mck in ("hyper_prior", "hyper_prior_weighted", "gamma_coupling", "gamma_meta_entropy"):
                 if _mck in d:
                     row[_mck] = d[_mck] / n_tok
             # Learnable belief-coupling weight: record lambda_beta = exp(log_lambda_beta) so its

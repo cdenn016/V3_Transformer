@@ -109,6 +109,31 @@ def test_diagnostics_total_is_consistent_weighted_sum():
     assert abs(d["total"] - expected) < 1e-3                       # every block folded at ONE (sum) scale
 
 
+def test_fe_decomposition_reconstructs_total_from_weighted_blocks():
+    r"""The F-decomposition figure (vfe3.viz.figures._fe_terms) rebuilds the complexity-F total from the
+    logged per-block columns -- the COMPLEXITY F, no CE/data term. Under lambda_h_mode='state_dependent'
+    the hyper-prior weight is the envelope c0_h/(b0_h+KL)+R_h, so cfg.lambda_h*raw_hyper_prior does NOT
+    reconstruct total; the figure must read the EXACT hyper_prior_weighted column (the reason it is
+    logged). This pins reconstruction for both modes."""
+    tok = torch.randint(0, 6, (2, 8))
+    for mode in ("constant", "state_dependent"):
+        m = _active(lambda_h_mode=mode)
+        cfg = m.cfg
+        d = m.diagnostics(tok)
+        assert "hyper_prior_weighted" in d
+        lb = cfg.lambda_beta
+        recon = (d["self_coupling"] + lb * d["belief_coupling"] + lb * d["attention_entropy"]
+                 + d["hyper_prior_weighted"]
+                 + cfg.gamma_coupling * (d["gamma_coupling"] + d["gamma_meta_entropy"]))
+        assert abs(d["total"] - recon) < 1e-3, mode               # figure rebuilds the runtime total exactly
+    # state_dependent: the envelope weight is NOT cfg.lambda_h*raw (why the weighted value is logged)
+    m_sd = _active(lambda_h_mode="state_dependent"); d_sd = m_sd.diagnostics(tok)
+    assert abs(d_sd["hyper_prior_weighted"] - m_sd.cfg.lambda_h * d_sd["hyper_prior"]) > 1e-2
+    # constant: the weighted value reduces to cfg.lambda_h*raw exactly
+    m_c = _active(lambda_h_mode="constant"); d_c = m_c.diagnostics(tok)
+    assert abs(d_c["hyper_prior_weighted"] - m_c.cfg.lambda_h * d_c["hyper_prior"]) < 1e-4
+
+
 # ---- (4) hyper-prior vector / term consistency (byte-identical refactor) --------------------------
 
 def test_hyper_prior_term_is_weighted_mean_of_kl_vector():
