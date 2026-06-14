@@ -9,6 +9,7 @@ end-to-end reachability through the autograd-of-F oracle and a full model.
 
 import math
 
+import pytest
 import torch
 
 from vfe3.config import VFE3Config
@@ -198,3 +199,135 @@ def test_laplace_model_trains_end_to_end():
     _, loss, _ = m(x, y); loss.backward()
     assert torch.isfinite(loss)
     assert torch.isfinite(m.prior_bank.mu_embed.grad).all()
+
+
+# ---- gradient correctness: finite difference of F vs the autograd oracle ----
+# The family's tests above pin divergence VALUES; these pin that the oracle's belief GRADIENTS are
+# correct -- the |x-mu| cusp and the float64 singularity island must differentiate to match a central
+# finite difference of the exact same F (CLAUDE.md: FD checks against the autograd-of-F oracle).
+
+def _oracle_setup(N=3, K=2, seed=3):
+    from vfe3.geometry.groups import get_group
+    from vfe3.geometry.transport import compute_transport_operators
+    g = torch.Generator().manual_seed(seed)
+    grp = get_group("glk")(K)
+    phi = 0.15 * torch.randn(1, N, grp.generators.shape[0], generator=g)
+    omega = compute_transport_operators(phi, grp)["Omega"][0]            # (N, N, K, K)
+    mu = torch.randn(N, K, generator=g)
+    sigma = torch.rand(N, K, generator=g) + 0.5
+    mu_p = torch.randn(N, K, generator=g)
+    sigma_p = torch.rand(N, K, generator=g) + 0.5
+    return mu, sigma, mu_p, sigma_p, omega
+
+
+def _F_laplace_filtering(mu_q, sigma_q, mu_p, sigma_p, mu_t, sigma_t, tau, order):
+    # Mirrors belief_gradients_autograd's F construction EXACTLY for family='laplace_diagonal',
+    # constant alpha, no rope / no omega_builder. Keys (mu_t, sigma_t) frozen -> the filtering F.
+    from vfe3.alpha_i import self_coupling_alpha
+    from vfe3.free_energy import free_energy, pairwise_energy, self_divergence_for_alpha
+    sd = self_divergence_for_alpha(DiagonalLaplace(mu_q, sigma_q), DiagonalLaplace(mu_p, sigma_p),
+                                   alpha=order, kl_max=100.0, eps=1e-6,
+                                   divergence_family="renyi", lambda_alpha_mode="constant")
+    alpha, _reg = self_coupling_alpha(sd, mode="constant", value=1.0, b0=1.0, c0=1.0, log_alpha=None)
+    energy = pairwise_energy(DiagonalLaplace(mu_q, sigma_q), DiagonalLaplace(mu_t, sigma_t),
+                             alpha=order, kl_max=100.0, eps=1e-6, divergence_family="renyi", irrep_dims=None)
+    return free_energy(sd, energy, alpha, tau=tau, lambda_beta=1.0,
+                       include_attention_entropy=True, log_prior=None, alpha_reg=None, coupling_energy=None)
+
+
+def _check_oracle_fd(order, atol):
+    from vfe3.geometry.transport import transport_covariance, transport_mean
+    from vfe3.gradients.oracle import belief_gradients_autograd
+    mu, sigma, mu_p, sigma_p, omega = _oracle_setup()
+    tau = 1.5
+    gmu, gsig = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, tau=tau,
+                                          renyi_order=order, gradient_mode="filtering",
+                                          family="laplace_diagonal")
+    mu_t = transport_mean(omega.unsqueeze(0), mu.unsqueeze(0))[0]          # frozen keys (filtering)
+    sigma_t = transport_covariance(omega.unsqueeze(0), sigma.unsqueeze(0))[0]
+
+    # 4th-order central difference: f'(x) = [f(x-2h) - 8 f(x-h) + 8 f(x+h) - f(x+2h)] / (12 h).
+    # O(h^4) truncation keeps the FD tight even where the Renyi curvature is high near a coordinate's
+    # singular order alpha*_k (a 2-point stencil there leaves ~5e-3 truncation; this stays ~1e-4).
+    h = 1e-3
+    gmu_fd = torch.zeros_like(mu); gsig_fd = torch.zeros_like(sigma)
+    for a in range(mu.shape[0]):
+        for b in range(mu.shape[1]):
+            def fm(t, a=a, b=b):
+                d = torch.zeros_like(mu); d[a, b] = t
+                return _F_laplace_filtering(mu + d, sigma, mu_p, sigma_p, mu_t, sigma_t, tau, order)
+            def fs(t, a=a, b=b):
+                d = torch.zeros_like(sigma); d[a, b] = t
+                return _F_laplace_filtering(mu, sigma + d, mu_p, sigma_p, mu_t, sigma_t, tau, order)
+            gmu_fd[a, b] = (fm(-2 * h) - 8 * fm(-h) + 8 * fm(h) - fm(2 * h)) / (12 * h)
+            gsig_fd[a, b] = (fs(-2 * h) - 8 * fs(-h) + 8 * fs(h) - fs(2 * h)) / (12 * h)
+    assert torch.allclose(gmu, gmu_fd, atol=atol, rtol=atol)
+    assert torch.allclose(gsig, gsig_fd, atol=atol, rtol=atol)
+
+
+def test_laplace_oracle_gradient_matches_fd_kl():
+    _check_oracle_fd(order=1.0, atol=2e-3)
+
+
+def test_laplace_oracle_gradient_matches_fd_renyi():
+    # alpha=0.5 drives the float64 singularity-island branch; autograd through the .double()/.to()
+    # casts and the where-limit must still match a (4th-order) finite difference of F.
+    _check_oracle_fd(order=0.5, atol=2e-3)
+
+
+# ---- alpha>1 (non-convex regime), saturation, cusp, eps floor --------------
+
+def test_laplace_alpha_gt_one_divergent_saturates_to_kl_max():
+    # csum = alpha/b_q + (1-alpha)/b_p <= 0 -> the affinity integral diverges -> NaN -> kl_max
+    # (the Gaussian non-PD-blend policy). c_q=0.15, c_p=-0.5 -> csum<0.
+    d = _lap([0.0], [10.0]).renyi_closed_form(_lap([1.0], [1.0]), alpha=1.5, kl_max=100.0)
+    assert torch.allclose(d, torch.tensor(100.0), atol=1e-4)
+
+
+def test_laplace_alpha_gt_one_convergent_matches_reference():
+    # csum > 0 (equal scales): the closed form holds beyond the convex regime; finite, >=0, == ref.
+    got = _lap([0.0], [1.0]).renyi_closed_form(_lap([1.2], [1.0]), alpha=1.5, kl_max=100.0).item()
+    assert math.isfinite(got) and got >= 0.0
+    assert abs(got - _renyi_ref(0.0, 1.0, 1.2, 1.0, 1.5)) < 1e-3
+
+
+def test_laplace_kl_max_saturation():
+    # KL ~ 199 for a far-separated pair -> clamped to kl_max.
+    d = _lap([0.0], [1.0]).renyi_closed_form(_lap([200.0], [1.0]), alpha=1.0, kl_max=100.0)
+    assert torch.allclose(d, torch.tensor(100.0), atol=1e-4)
+
+
+def test_laplace_cusp_and_eps_floor_finite():
+    # s=0 cusp (equal means, unequal scales): finite and matches the reference at both KL and Renyi.
+    for alpha in (0.5, 1.0):
+        got = _lap([0.5], [1.0]).renyi_closed_form(_lap([0.5], [2.0]), alpha=alpha).item()
+        ref = _kl_ref(0.5, 1.0, 0.5, 2.0) if alpha == 1.0 else _renyi_ref(0.5, 1.0, 0.5, 2.0, alpha)
+        assert math.isfinite(got) and abs(got - ref) < 1e-3
+    # scale below the eps floor is clamped, not NaN/inf (defense-in-depth)
+    tiny, other = _lap([0.0], [1e-9]), _lap([0.3], [1.0])
+    assert torch.isfinite(tiny.renyi_closed_form(other, alpha=1.0)).all()
+    assert torch.isfinite(other.renyi_closed_form(tiny, alpha=1.0)).all()
+
+
+# ---- device agreement (runs on the user's CUDA box; skipped on a CPU-only build) ----
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_laplace_cuda_matches_cpu():
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(0)
+    mu_q = torch.randn(5, 3, generator=g); b_q = torch.rand(5, 3, generator=g) + 0.3
+    mu_p = torch.randn(5, 3, generator=g); b_p = torch.rand(5, 3, generator=g) + 0.3
+    for alpha in (0.5, 1.0):
+        cpu = DiagonalLaplace(mu_q, b_q).renyi_closed_form(DiagonalLaplace(mu_p, b_p), alpha=alpha)
+        cu = DiagonalLaplace(mu_q.to(dev), b_q.to(dev)).renyi_closed_form(
+            DiagonalLaplace(mu_p.to(dev), b_p.to(dev)), alpha=alpha)
+        assert torch.allclose(cpu, cu.cpu(), atol=1e-5)
+    assert torch.allclose(DiagonalLaplace(mu_q, b_q).entropy(),
+                          DiagonalLaplace(mu_q.to(dev), b_q.to(dev)).entropy().cpu(), atol=1e-5)
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, family="laplace_diagonal")
+    torch.manual_seed(0)
+    m = VFEModel(cfg).to(dev)
+    x = torch.randint(0, 12, (2, 8), device=dev); y = torch.randint(0, 12, (2, 8), device=dev)
+    _, loss, _ = m(x, y); loss.backward()
+    assert torch.isfinite(loss)

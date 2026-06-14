@@ -140,11 +140,24 @@ class DiagonalLaplace(BeliefParams):
         e_q  = torch.exp(-c_q * s64)
         e_p  = torch.exp(-c_p * s64)
         term1 = (e_p + e_q) / csum
-        # removable singularity c_p == c_q -> (e_q - e_p)/(c_p - c_q) -> s exp(-c s)
-        safe_d = torch.where(d.abs() < 1e-12, torch.ones_like(d), d)
-        ratio  = (e_q - e_p) / safe_d
-        limit  = s64 * torch.exp(-0.5 * (c_p + c_q) * s64)
-        term2  = torch.where(d.abs() < 1e-12, limit, ratio)
+        # term2 = (e_q - e_p) / (c_p - c_q). Near the removable singularity c_p == c_q this is a 0/0
+        # whose VALUE float64 survives but whose GRADIENT it does not -- the quotient rule amplifies
+        # the cancellation by a further 1/d, so a coordinate at b_q ~ b_p (every self-pair, where
+        # omega_ii ~ I gives d ~ 1e-7 fp noise, AND any pair when renyi_order ~ 0.5) gets a spurious
+        # belief gradient. Rewrite it EXACTLY as term2 = exp(-c_m s) * s * sinhc(d s / 2), where
+        # c_m = (c_p + c_q)/2 and sinhc(x) = sinh(x)/x, and use the Taylor sinhc (1 + x^2/6 + x^4/120)
+        # for small |x| -- stable in BOTH value and autograd through the singularity, with the direct
+        # ratio kept for larger |x| (where sinh would overflow). x is zeroed off-branch so the dead
+        # Taylor branch never evaluates a large argument. Pinned by the FD-of-F oracle gradient test.
+        c_m   = 0.5 * (c_p + c_q)
+        x     = 0.5 * d * s64                                       # d s / 2
+        small = x.abs() < 1e-3
+        x_s   = torch.where(small, x, torch.zeros_like(x))          # Taylor sees only small x
+        sinhc = 1.0 + x_s * x_s / 6.0 + x_s ** 4 / 120.0           # sinh(x)/x near 0
+        safe_d = torch.where(small, torch.ones_like(d), d)
+        term2 = torch.where(small,
+                            torch.exp(-c_m * s64) * s64 * sinhc,
+                            (e_q - e_p) / safe_d)
         integral = term1 + term2
         log_int = (torch.log(integral) - math.log(2.0)
                    - alpha * torch.log(b_q64) - (1.0 - alpha) * torch.log(b_p64))
