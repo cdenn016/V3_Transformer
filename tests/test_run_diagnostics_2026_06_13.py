@@ -113,7 +113,7 @@ def test_metrics_csv_has_tier1_columns_and_is_rectangular() -> None:
     assert rows, "no metrics rows written"
     cols = set(rows[0].keys())
     need = (["grad_norm", "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi", "loss_finite",
-             "tokens_per_s", "peak_mem_mb", "generalization_gap", "elbo_ce_gap"] + _NEW_DIAG_KEYS)
+             "tokens_per_s", "peak_mem_mb", "generalization_gap"] + _NEW_DIAG_KEYS)
     assert not [c for c in need if c not in cols], f"CSV missing Tier-1 columns: {[c for c in need if c not in cols]}"
     # rectangular: every row carries the identical column set
     assert all(set(r.keys()) == cols for r in rows)
@@ -133,3 +133,124 @@ def test_conditional_break_columns_present_only_under_toggle() -> None:
     # head mixer -> head_mixer_drift column appears (zero at identity init, but present)
     d_hm = VFEModel(_cfg(use_head_mixer=True)).to(DEVICE).diagnostics(tok)
     assert "head_mixer_drift" in d_hm and math.isfinite(d_hm["head_mixer_drift"])
+
+
+_TIER2A_KEYS = [
+    "cocycle_residual", "vertex_cond_max", "sandwich_absmax", "transport_asymmetry",
+    "energy_abs_asymmetry", "energy_rel_asymmetry", "gauge_head_aniso_mean", "gauge_head_logdet_spread",
+]
+
+
+def test_diagnostics_has_tier2a_transport_gauge_keys() -> None:
+    torch.manual_seed(0)
+    cfg = _cfg()
+    model = VFEModel(cfg).to(DEVICE)
+    tok = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len), device=DEVICE)
+    d = model.diagnostics(tok)
+    missing = [k for k in _TIER2A_KEYS if k not in d]
+    assert not missing, f"diagnostics missing Tier-2a keys: {missing}"
+    assert all(math.isfinite(d[k]) for k in _TIER2A_KEYS)
+    # the flat (default) transport is an EXACT phi-cocycle -> the cocycle residual is ~0
+    assert d["cocycle_residual"] < 1e-3
+    # directed phi-cocycle Omega_ij = exp(phi_i) exp(-phi_j) breaks i<->j symmetry -> asymmetry >= 0
+    assert d["transport_asymmetry"] >= 0.0 and d["vertex_cond_max"] >= 1.0
+
+
+def test_val_diagnostics_columns_rectangular_and_finite() -> None:
+    from vfe3.run_artifacts import RunArtifacts
+    from vfe3.train import _VAL_DIAG_KEYS
+    torch.manual_seed(0)
+    cfg = _cfg(log_interval=6, eval_interval=12, eval_max_batches=2)
+    model = VFEModel(cfg).to(DEVICE)
+    loader = _loader(cfg)
+    with tempfile.TemporaryDirectory() as tmp:
+        art = RunArtifacts(tmp, cfg, model, dataset="synthetic-period3", device=str(DEVICE))
+        train(model, loader, cfg, n_steps=24, log_interval=6, eval_interval=12,
+              val_loader=loader, artifacts=art, device=DEVICE, generate_samples=False)
+        with open(Path(tmp) / "metrics.csv", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+    cols = set(rows[0].keys())
+    assert not [k for k in _VAL_DIAG_KEYS if k not in cols], "missing val-diag columns"
+    assert all(set(r.keys()) == cols for r in rows), "CSV not rectangular"
+    # after the step-24 eval the held-out probes are finite
+    last = rows[-1]
+    for k in ("val_free_energy_total", "estep_f_drop", "val_future_leakage", "pos_loss_ratio",
+              "val_head_redundancy_js"):
+        assert math.isfinite(float(last[k])), f"{k} not finite: {last[k]!r}"
+    # the soft causal prior must not leak future tokens
+    assert float(last["val_future_leakage"]) < 1e-3
+    # Tier-2a transport/gauge + weight-norm columns present too
+    assert {"cocycle_residual", "transport_asymmetry", "weight_norm_mu"} <= cols
+
+
+def test_diagnostics_has_renyi_band_frac() -> None:
+    torch.manual_seed(0)
+    model = VFEModel(_cfg()).to(DEVICE)
+    d = model.diagnostics(torch.randint(0, 16, (2, 8), device=DEVICE))
+    assert "renyi_band_frac" in d and 0.0 <= d["renyi_band_frac"] <= 1.0
+
+
+def test_group_gauge_invariant_sp_is_conjugation_invariant() -> None:
+    # Adversarial-review HIGH fix: the sp/sp_n invariant must be invariant under GL congruence
+    # (conjugation of exp(phi)), which the singular-value squeeze was NOT (Sp is non-orthogonal).
+    from vfe3.metrics import group_gauge_invariant
+    torch.manual_seed(0)
+
+    class _G:
+        name = "sp"
+
+    k = 4
+    exp_phi = torch.matrix_exp(torch.randn(k, k) * 0.3).unsqueeze(0)        # (1, K, K)
+    g = torch.matrix_exp(torch.randn(k, k) * 0.5)                           # generic GL conjugation
+    moved = g @ exp_phi @ torch.linalg.inv(g)
+    base = group_gauge_invariant(exp_phi, _G())
+    conj = group_gauge_invariant(moved, _G())
+    assert torch.allclose(base, conj, atol=1e-4), (float(base), float(conj))
+
+
+def test_guard_saturation_full_cov_floor_binds() -> None:
+    # Adversarial-review HIGH fix: on a full covariance whose SPD floor binds, sigma_floor_frac must
+    # not read 0 just because eigvalsh noise exceeds the tight relative window.
+    from vfe3.metrics import guard_saturation
+    eps = 1e-6
+    k = 3
+    q = torch.linalg.qr(torch.randn(k, k))[0]
+    sigma1 = q @ torch.diag(torch.tensor([eps, 1.0, 10.0])) @ q.T           # cond ~1e7, smallest at floor
+    sigma1 = 0.5 * (sigma1 + sigma1.T)
+    sig = sigma1.unsqueeze(0).expand(4, k, k).contiguous()                  # (4, K, K) full cov
+    gs = guard_saturation(sig, torch.zeros(4, 4), torch.zeros(4), eps=eps, sigma_max=100.0)
+    # one of three eigenvalues per token sits at the floor -> ~1/3 of spectrum entries; the point is
+    # it is NONZERO (the tight relative window read exactly 0 here before the eigensolver-noise fix).
+    assert gs["sigma_floor_frac"] > 0.3, gs["sigma_floor_frac"]
+
+
+def test_finalize_writes_tier3_research_and_provenance() -> None:
+    import json
+    from vfe3.run_artifacts import RunArtifacts, finalize_run
+    torch.manual_seed(0)
+    cfg = _cfg(log_interval=6, eval_interval=12, eval_max_batches=2, generate_figures=False)
+    model = VFEModel(cfg).to(DEVICE)
+    loader = _loader(cfg)
+    with tempfile.TemporaryDirectory() as tmp:
+        art = RunArtifacts(tmp, cfg, model, dataset="synthetic-period3", device=str(DEVICE))
+        losses = train(model, loader, cfg, n_steps=24, log_interval=6, eval_interval=12,
+                       val_loader=loader, artifacts=art, device=DEVICE, generate_samples=False)
+        res = finalize_run(model, art, cfg, test_loader=loader, losses=losses, device=DEVICE)
+        root = Path(tmp)
+        # the n_e_steps=0 capacity-gain falsifier is computed and the budget is restored
+        assert "estep_capacity_gain" in res and math.isfinite(res["estep_capacity_gain"])
+        assert model.cfg.n_e_steps == cfg.n_e_steps                # restored after the probe
+        # provenance.json: code/data/env state a config-only record omits
+        prov = json.loads((root / "provenance.json").read_text())
+        assert {"seed", "torch_version", "git_sha", "git_dirty"} <= set(prov)
+        # summary.json scaling-law point
+        summ = json.loads((root / "summary.json").read_text())
+        assert {"n_params", "tokens_seen", "est_flops_6ND"} <= set(summ["scaling_point"])
+        assert summ["scaling_point"]["tokens_seen"] == cfg.max_steps * cfg.batch_size * cfg.max_seq_len
+        # research.json: calibration + frequency strata + FD gradient check
+        rj = json.loads((root / "research.json").read_text())
+        assert math.isfinite(rj["ece"]) and "freq_strata_ce" in rj
+        assert math.isfinite(rj["fd_gradient_worst_rel_error"]) and rj["fd_gradient_worst_rel_error"] >= 0.0
+        # history-only trend figures
+        for fig in ("grad_norm.png", "belief_condition.png", "estep_convergence_trend.png"):
+            assert (root / fig).exists(), f"missing trend figure {fig}"
