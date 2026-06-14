@@ -379,10 +379,12 @@ def test_auto_default_sample_decoder_emits_at_gpt2_vocab(caplog):
 
 
 def test_train_vfe3_clickrun_importable_and_runs_one_step():
-    from train_vfe3 import config as cr_config, synthetic_period3_loader
+    from train_vfe3 import config as cr_config
 
     cfg = VFE3Config(**cr_config)
-    loader = synthetic_period3_loader(seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
+    # grow the stream so the click-run dims (seq_len=128, batch_size=64) yield >=1 batch under drop_last
+    loader = _periodic_loader(n=cfg.max_seq_len * cfg.batch_size * 4,
+                              seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
     batch = next(iter(loader))
     assert len(batch) == 2
     torch.manual_seed(cfg.seed)
@@ -405,8 +407,6 @@ def test_select_loader_is_split_aware(monkeypatch):
     (stable corpus metric) and shuffle=True, drop_last=True only for train. RED against the old
     _select_loader, which called make_dataloader with neither override (so val/test inherited the
     shuffle=True, drop_last=True training defaults)."""
-    import logging
-
     import train_vfe3
 
     captured = {}
@@ -418,10 +418,25 @@ def test_select_loader_is_split_aware(monkeypatch):
 
     monkeypatch.setattr(train_vfe3, "make_dataloader", fake_make_dataloader)
     cfg = VFE3Config()
-    log = logging.getLogger("audit-f1")
     for split in ("train", "validation", "test"):
-        train_vfe3._select_loader("wikitext-103", cfg, log, split=split)
+        train_vfe3._select_loader("wikitext-103", cfg, split=split)
 
     assert captured["train"] == {"shuffle": True, "drop_last": True}
     assert captured["validation"] == {"shuffle": False, "drop_last": False}
     assert captured["test"] == {"shuffle": False, "drop_last": False}
+
+
+def test_select_loader_raises_on_missing_cache(monkeypatch):
+    r"""H1: a missing real-corpus cache must RAISE, never silently substitute the synthetic
+    period-3 stream. The old fallback computed held-out numbers on a 3-token toy stream and
+    persisted them mislabeled as the real corpus (config.json / test_results.json / run-folder name)."""
+    import train_vfe3
+
+    def raise_fnf(*a, **kw):
+        raise FileNotFoundError("no cache")
+
+    monkeypatch.setattr(train_vfe3, "make_dataloader", raise_fnf)
+    cfg = VFE3Config()
+    for split in ("train", "validation", "test"):
+        with pytest.raises(FileNotFoundError):
+            train_vfe3._select_loader("wikitext-103", cfg, split=split)

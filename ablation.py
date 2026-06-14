@@ -62,10 +62,6 @@ from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.train import coverage_lines, evaluate, train
 
-# Only the zero-dependency synthetic stream is borrowed from train_vfe3 (the corpus-cache
-# fallback); the baseline operating point is self-contained below.
-from train_vfe3 import synthetic_period3_loader
-
 logger = logging.getLogger("ablation")
 
 
@@ -776,7 +772,7 @@ CONFIG: Dict[str, Any] = {
     "device":      "auto",
 
     # Dataset for every run in the session (NOT a VFE3Config field; the loader seam).
-    #   "wikitext-103" | "wikitext-2" | "wiki-en" | "wiki-ja" | "synthetic-period3"
+    #   "wikitext-103" | "wikitext-2" | "wiki-en" | "wiki-ja"
     "dataset":     "wikitext-103",
 
     # Cap the TRAIN stream for fast sweeps (validation is always read in full). None = full.
@@ -905,33 +901,26 @@ def get_loader(
 
     *,
     max_tokens:  Optional[int] = None,
-    seed:        int           = 0,
 ) -> Any:
-    r"""DataLoader for ``dataset``/``split``, falling back to the synthetic stream if absent.
+    r"""DataLoader for ``dataset``/``split``. A missing cache raises ``FileNotFoundError``.
 
     Memoised on ``(dataset, seq_len, batch_size, split, cap)`` so runs that do not change
     those reuse one cached loader (the corpus cache loads once), while a sweep over
     ``batch_size`` / ``max_seq_len`` correctly builds a distinct, matching loader. ``max_tokens``
-    caps only the train split (validation is always full).
+    caps only the train split (validation is always full). The loader never substitutes synthetic
+    data for a missing real corpus -- that would mislabel synthetic numbers as a corpus measurement.
     """
     cap = max_tokens if split == "train" else None
     key = (dataset, seq_len, batch_size, split, cap)
     if key in _LOADER_CACHE:
         return _LOADER_CACHE[key]
-    if dataset == "synthetic-period3":
-        loader = synthetic_period3_loader(seq_len=seq_len, batch_size=batch_size, seed=seed)
-    else:
-        try:
-            # Split-aware loader semantics, mirroring train_vfe3._select_loader's F1 fix: only the
-            # train stream is shuffled and tail-dropped; validation/test read the WHOLE split in a
-            # stable order so the held-out PPL is a full-corpus measurement (make_dataloader defaults
-            # to the train regime, so the eval flags must be passed explicitly here).
-            loader = make_dataloader(dataset, split, seq_len, batch_size,
-                                     shuffle=(split == "train"), drop_last=(split == "train"),
-                                     max_tokens=cap)
-        except FileNotFoundError:
-            logger.warning("cache for %r/%r absent; falling back to synthetic-period3", dataset, split)
-            loader = synthetic_period3_loader(seq_len=seq_len, batch_size=batch_size, seed=seed)
+    # Split-aware loader semantics, mirroring train_vfe3._select_loader: only the train stream is
+    # shuffled and tail-dropped; validation/test read the WHOLE split in a stable order so the
+    # held-out PPL is a full-corpus measurement (make_dataloader defaults to the train regime, so
+    # the eval flags must be passed explicitly here).
+    loader = make_dataloader(dataset, split, seq_len, batch_size,
+                             shuffle=(split == "train"), drop_last=(split == "train"),
+                             max_tokens=cap)
     _LOADER_CACHE[key] = loader
     return loader
 
@@ -1000,9 +989,8 @@ def run_single(
     n_params = int(sum(p.numel() for p in model.parameters()))
 
     train_loader = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "train",
-                              max_tokens=max_tokens, seed=cfg.seed)
-    val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation",
-                              seed=cfg.seed)
+                              max_tokens=max_tokens)
+    val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation")
 
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts = RunArtifacts(run_dir, cfg, model, dataset=dataset, device=device)
