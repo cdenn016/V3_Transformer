@@ -294,6 +294,8 @@ class VFE3Config:
     
     t5_num_buckets:            int   = 32           # t5_relative_bias: relative-position bucket count
     t5_max_distance:           int   = 128          # t5_relative_bias: log-bucketing horizon (beyond -> last bucket)
+    t5_learnable_bias:         bool  = False        # t5_relative_bias: learn the per-bucket bias table b_{i-j}
+                                                    #   (sanctioned no-NN exception, default OFF; needs a t5 channel)
 
     # E-step
     e_q_mu_lr:                 float = 0.5

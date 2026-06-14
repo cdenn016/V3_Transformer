@@ -314,6 +314,33 @@ class VFEModel(nn.Module):
                     "(detach_e_step=False, e_step_gradient='unroll') to train it.",
                     stacklevel=2,
                 )
+        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED T5 relative-position
+        # attention-bias table. When t5_learnable_bias=True, create t5_bias as a trainable
+        # nn.Parameter of shape (t5_num_buckets,); the attention log-prior reads it as the per-bucket
+        # bias b_{i-j} (manuscript GL(K)_attention.tex:826-838: pi_j ∝ exp(b_{i-j}), beta_ij =
+        # softmax_j(-E_ij/tau + b_{i-j}), the first-principles T5 derivation). Init to the fixed-table
+        # default -log1p(bucket) so a learnable model is byte-identical to the fixed t5_relative_bias
+        # prior at step 0, then trains. Unlike the gauge/value exceptions this bias is a scalar
+        # function of position OFFSET only and touches NO gauge transport, so it does NOT break gauge
+        # equivariance. Created ONLY when t5_relative_bias is an active channel (mirrors the log_lambda_h
+        # active-channel gate so the parameter is never orphaned); else no t5_bias attribute and the
+        # pure path stays param-free (the fixed-table default still runs).
+        if cfg.t5_learnable_bias and "t5_relative_bias" in (cfg.beta_attention_prior, cfg.gamma_attention_prior):
+            self.t5_bias = nn.Parameter(-torch.log1p(torch.arange(cfg.t5_num_buckets, dtype=torch.float32)))
+            if cfg.effective_e_step_gradient == "detach":
+                # Footgun (mirrors log_alpha / connection_W / pos_phi_free): the attention log-prior is
+                # consumed INSIDE vfe_stack (the E-step), which the 'detach' estimator wraps in no_grad
+                # (model.forward's `run`), so t5_bias would receive NO gradient and stay frozen at its
+                # fixed-table init. Use an 'unroll' (default) or 'straight_through' E-step to train it.
+                import warnings
+                warnings.warn(
+                    "t5_learnable_bias=True with the effective E-step estimator 'detach' freezes "
+                    "t5_bias: the T5 relative-position bias enters the loss only through the attention "
+                    "log-prior consumed inside the no_grad-wrapped E-step, so t5_bias.grad is None and "
+                    "the bias stays at its fixed-table init. Use an 'unroll' E-step "
+                    "(detach_e_step=False, e_step_gradient='unroll') to train it.",
+                    stacklevel=2,
+                )
 
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":
         r"""Carry the gauge group's generators through ``.to(...)`` / ``.cuda()`` etc.
@@ -344,6 +371,22 @@ class VFEModel(nn.Module):
         lets the gamma model-coupling block reuse the same cache under its own attention prior."""
         name = prior if prior is not None else self.cfg.beta_attention_prior
         dtype = self.prior_bank.mu_embed.dtype
+        # Learnable T5 bias: the per-bucket table is a live nn.Parameter that changes every step, so
+        # the (name, N, ...) cache MUST be bypassed -- a cached tensor would serve a stale table and
+        # sever the gradient. Build fresh each call, passing the parameter as bias_values so the loss
+        # backpropagates to t5_bias (through the E-step). getattr keeps this None-safe when the param
+        # was not created (t5_learnable_bias off, or no active t5 channel); .to preserves the graph.
+        if name == "t5_relative_bias" and getattr(self, "t5_bias", None) is not None:
+            out = attention_log_prior(
+                name, n, n,
+                device=device, dtype=dtype,
+                n_heads=self.cfg.n_heads, alibi_slope=self.cfg.alibi_slope,
+                window=self.cfg.attention_window,
+                num_buckets=self.cfg.t5_num_buckets, max_distance=self.cfg.t5_max_distance,
+                bias_values=self.t5_bias.to(device=device, dtype=dtype))
+            if out.dim() == 3 and len(self.group.irrep_dims) == 1:
+                out = out.squeeze(0)
+            return out
         # The key carries every cfg field a builder consumes (n_heads, alibi_slope, window, T5
         # bucketing) so a post-construction cfg mutation cannot serve a stale prior (audit PP4/P9).
         key = (name, n, device, dtype, self.cfg.n_heads, self.cfg.alibi_slope,

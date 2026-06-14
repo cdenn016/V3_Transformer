@@ -1,0 +1,200 @@
+r"""DiagonalLaplace -- the first non-Gaussian belief family (vfe3/families/laplace.py).
+
+Pins the closed-form KL/Renyi against deterministic float64 trapezoidal integration, the divergence
+axioms (non-negativity, self-divergence=0), the non-EF contract (natural/log_partition_at raise so
+the generic Bregman path is bypassed by renyi_closed_form), gauge-transport honesty (permutation
+preserves the diagonal Laplace exactly; a non-permutation rotation projects the marginal scale), and
+end-to-end reachability through the autograd-of-F oracle and a full model.
+"""
+
+import math
+
+import torch
+
+from vfe3.config import VFE3Config
+from vfe3.divergence import (
+    bhattacharyya,
+    divergence_families,
+    get_family,
+    jeffreys,
+    kl,
+    renyi,
+    squared_hellinger,
+)
+from vfe3.families.laplace import DiagonalLaplace
+from vfe3.model.model import VFEModel
+
+
+# ---- deterministic 1-D references (float64 trapezoid) -----------------------
+
+def _grid(mu_q, b_q, mu_p, b_p):
+    lo = min(mu_q, mu_p) - 60.0 * max(b_q, b_p)
+    hi = max(mu_q, mu_p) + 60.0 * max(b_q, b_p)
+    return torch.linspace(lo, hi, 2_000_001, dtype=torch.float64)
+
+
+def _logpdf(x, mu, b):
+    return -math.log(2.0 * b) - (x - mu).abs() / b
+
+
+def _kl_ref(mu_q, b_q, mu_p, b_p):
+    x = _grid(mu_q, b_q, mu_p, b_p)
+    q = torch.exp(_logpdf(x, mu_q, b_q))
+    return torch.trapz(q * (_logpdf(x, mu_q, b_q) - _logpdf(x, mu_p, b_p)), x).item()
+
+
+def _renyi_ref(mu_q, b_q, mu_p, b_p, alpha):
+    x = _grid(mu_q, b_q, mu_p, b_p)
+    aff = torch.trapz(torch.exp(alpha * _logpdf(x, mu_q, b_q) + (1.0 - alpha) * _logpdf(x, mu_p, b_p)), x)
+    return (torch.log(aff) / (alpha - 1.0)).item()
+
+
+def _entropy_ref(b):
+    x = torch.linspace(-80.0 * b, 80.0 * b, 2_000_001, dtype=torch.float64)
+    q = torch.exp(_logpdf(x, 0.0, b))
+    return torch.trapz(-q * _logpdf(x, 0.0, b), x).item()
+
+
+def _lap(mu, b):
+    return DiagonalLaplace(torch.tensor(mu), torch.tensor(b))
+
+
+# ---- registration / config ------------------------------------------------
+
+def test_laplace_registered_and_config_selectable():
+    assert "laplace_diagonal" in divergence_families()
+    assert get_family("laplace_diagonal") is DiagonalLaplace
+    assert DiagonalLaplace.cov_kind == "diagonal"
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, family="laplace_diagonal")
+    assert cfg.family == "laplace_diagonal" and cfg.diagonal_covariance is True
+
+
+# ---- non-EF contract: generic path is bypassed ----------------------------
+
+def test_natural_and_log_partition_raise():
+    q = _lap([0.0, 1.0], [1.0, 2.0])
+    for fn in (q.natural, lambda: type(q).log_partition_at((q.mu, q.sigma))):
+        try:
+            fn()
+            assert False, "expected NotImplementedError (Laplace is not an EF when location varies)"
+        except NotImplementedError:
+            pass
+
+
+def test_all_registered_divergences_use_closed_form():
+    # natural()/log_partition_at() raise, so a finite result PROVES renyi_closed_form was used
+    # (the generic Bregman/Renyi-from-A path would have raised).
+    q = _lap([0.0, 0.5], [1.0, 1.5])
+    p = _lap([0.3, -0.2], [1.2, 0.8])
+    for d in (kl(q, p), renyi(q, p, alpha=0.5), squared_hellinger(q, p), bhattacharyya(q, p), jeffreys(q, p)):
+        assert torch.isfinite(d).all()
+
+
+# ---- axioms ---------------------------------------------------------------
+
+def test_self_divergence_is_zero():
+    g = torch.Generator().manual_seed(0)
+    q = DiagonalLaplace(torch.randn(4, 3, generator=g), torch.rand(4, 3, generator=g) + 0.3)
+    for alpha in (0.1, 0.5, 0.9, 1.0):
+        d = q.renyi_closed_form(q, alpha=alpha)
+        assert torch.allclose(d, torch.zeros_like(d), atol=1e-5)
+
+
+def test_non_negativity():
+    g = torch.Generator().manual_seed(1)
+    q = DiagonalLaplace(torch.randn(6, 3, generator=g), torch.rand(6, 3, generator=g) + 0.3)
+    p = DiagonalLaplace(torch.randn(6, 3, generator=g), torch.rand(6, 3, generator=g) + 0.3)
+    for alpha in (0.1, 0.25, 0.5, 0.9, 1.0):
+        assert (q.renyi_closed_form(p, alpha=alpha) >= 0.0).all()
+
+
+def test_per_coord_sums_to_closed_form():
+    g = torch.Generator().manual_seed(2)
+    q = DiagonalLaplace(torch.randn(5, 4, generator=g), torch.rand(5, 4, generator=g) + 0.5)
+    p = DiagonalLaplace(torch.randn(5, 4, generator=g), torch.rand(5, 4, generator=g) + 0.5)
+    for alpha in (0.3, 0.5, 1.0):
+        summed = q.renyi_per_coord(p, alpha=alpha).sum(dim=-1)
+        assert torch.allclose(summed, q.renyi_closed_form(p, alpha=alpha), atol=1e-4)
+
+
+# ---- golden vs deterministic integration ----------------------------------
+
+_PAIRS = [(0.3, 1.0, -0.7, 2.0), (0.0, 0.5, 1.5, 0.5), (-2.0, 3.0, 2.0, 0.8)]
+
+
+def test_kl_matches_reference():
+    for mu_q, b_q, mu_p, b_p in _PAIRS:
+        got = _lap([mu_q], [b_q]).renyi_closed_form(_lap([mu_p], [b_p]), alpha=1.0).item()
+        assert abs(got - _kl_ref(mu_q, b_q, mu_p, b_p)) < 1e-4
+
+
+def test_renyi_matches_reference():
+    for alpha in (0.1, 0.25, 0.5, 0.9):
+        for mu_q, b_q, mu_p, b_p in _PAIRS:
+            got = _lap([mu_q], [b_q]).renyi_closed_form(_lap([mu_p], [b_p]), alpha=alpha).item()
+            assert abs(got - _renyi_ref(mu_q, b_q, mu_p, b_p, alpha)) < 1e-4
+
+
+def test_renyi_singularity_branch_is_continuous():
+    # alpha* = b_q/(b_p+b_q): with b_q=1,b_p=2 the singular order is 1/3; the float64 limit branch
+    # must stay continuous and match the (smooth) reference integral straddling and AT alpha*.
+    b_q, b_p, mu_q, mu_p = 1.0, 2.0, 0.0, 1.0
+    astar = b_q / (b_p + b_q)
+    for alpha in (astar - 1e-3, astar, astar + 1e-3):
+        got = _lap([mu_q], [b_q]).renyi_closed_form(_lap([mu_p], [b_p]), alpha=alpha).item()
+        assert math.isfinite(got)
+        assert abs(got - _renyi_ref(mu_q, b_q, mu_p, b_p, alpha)) < 1e-3
+
+
+def test_entropy_matches_reference():
+    for b in (0.5, 1.0, 2.5):
+        got = _lap([0.0], [b]).entropy().item()
+        assert abs(got - _entropy_ref(b)) < 1e-4
+        assert abs(got - math.log(2.0 * b * math.e)) < 1e-6
+
+
+# ---- gauge-transport honesty (the corrected boundary) ---------------------
+
+def test_transport_permutation_exact_rotation_projects():
+    from vfe3.geometry.transport import transport_covariance
+    K = 2
+    b = torch.tensor([[1.0, 4.0]])                                  # (1, K) diagonal scale
+    perm = torch.tensor([[0.0, 1.0], [1.0, 0.0]]).reshape(1, 1, K, K)   # coord swap (permutation)
+    bt_perm = transport_covariance(perm, b)[0, 0]                   # diag(P diag(b) P^T) = permuted b
+    assert torch.allclose(bt_perm, torch.tensor([4.0, 1.0]), atol=1e-6)
+    theta = 0.5
+    R = torch.tensor([[math.cos(theta), -math.sin(theta)],
+                      [math.sin(theta), math.cos(theta)]]).reshape(1, 1, K, K)
+    bt_rot = torch.sort(transport_covariance(R, b)[0, 0]).values    # diag(R diag(b) R^T): scales mix
+    assert not torch.allclose(bt_rot, torch.sort(b[0]).values, atol=1e-3)   # not any permutation of b
+
+
+# ---- end-to-end reachability ----------------------------------------------
+
+def test_oracle_gradients_finite_for_laplace():
+    from vfe3.geometry.groups import get_group
+    from vfe3.gradients.oracle import belief_gradients_autograd
+    from vfe3.inference.e_step import build_belief_transport
+    torch.manual_seed(0)
+    g = get_group("block_glk")(8, 2)
+    N, K, n_gen = 5, 8, g.generators.shape[0]
+    phi = torch.randn(1, N, n_gen) * 0.1
+    omega = build_belief_transport(phi, g, transport_mode="flat")
+    mu = torch.randn(1, N, K); sigma = torch.rand(1, N, K) + 0.5
+    mu_p = torch.randn(1, N, K); sigma_p = torch.rand(1, N, K) + 0.5
+    kw = dict(tau=1.0, renyi_order=1.0, kl_max=100.0, eps=1e-6, b0=1.0, c0=1.0, value=1.0,
+              include_attention_entropy=True, gradient_mode="filtering", family="laplace_diagonal",
+              divergence_family="renyi", lambda_alpha_mode="constant", irrep_dims=g.irrep_dims, log_prior=None)
+    g_mu, g_sigma = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, **kw)
+    assert torch.isfinite(g_mu).all() and torch.isfinite(g_sigma).all()
+
+
+def test_laplace_model_trains_end_to_end():
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, family="laplace_diagonal")
+    torch.manual_seed(0)
+    m = VFEModel(cfg)
+    x = torch.randint(0, 12, (2, 8)); y = torch.randint(0, 12, (2, 8))
+    _, loss, _ = m(x, y); loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(m.prior_bank.mu_embed.grad).all()
