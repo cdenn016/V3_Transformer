@@ -7,6 +7,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from vfe3.viz.figures import (
+    _fe_terms,
     attention_graph,
     clustering_metrics,
     get_figure,
@@ -29,6 +30,7 @@ from vfe3.viz.figures import (
     plot_free_energy_descent,
     plot_gauge_equivariance,
     plot_gauge_head_specialization,
+    plot_grad_norm_decomposition,
     plot_holonomy_curvature,
     plot_ln3_symmetry_breaking,
     plot_lr_grid_heatmap,
@@ -166,6 +168,68 @@ def test_plot_free_energy_codescent_saves(tmp_path):
     p = tmp_path / "codescent.png"
     # per-row learned lambda_beta vector is accepted as well as a scalar
     fig = plot_free_energy_codescent(_fe_hist(), lambda_beta=np.ones(30), path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def _fe_hist_model_channel(n=30):
+    h = _fe_hist(n)
+    h["hyper_prior_weighted"] = np.linspace(3.0, 1.5, n)          # exact weighted contribution to F
+    h["gamma_coupling"]       = np.linspace(2.0, 1.0, n)          # raw; figure scales by gamma_coupling
+    h["gamma_meta_entropy"]   = np.linspace(0.2, 0.05, n)
+    return h
+
+
+def test_fe_terms_total_sums_components_and_excludes_ce():
+    h = _fe_hist_model_channel(20)
+    step, comps, total, ce = _fe_terms(h, lambda_beta=1.0, gamma_coupling=0.75, include_attention_entropy=True)
+    assert [k for k, _ in comps] == ["self", "belief", "attention_entropy", "hyper_prior", "model_coupling"]
+    assert np.allclose(total, sum(c for _, c in comps))           # F total is the sum of the shown bars
+    assert np.allclose(ce, np.asarray(h["val_ce"], dtype=float))  # CE returned separately, not summed in
+    h2 = dict(h); h2["val_ce"] = np.asarray(h["val_ce"], dtype=float) + 1000.0
+    _, _, total2, _ = _fe_terms(h2, lambda_beta=1.0, gamma_coupling=0.75)
+    assert np.allclose(total, total2)                             # total is independent of CE (no data term in F)
+
+
+def test_fe_terms_belief_only_and_entropy_gate():
+    _, comps, _, _ = _fe_terms(_fe_hist(10), lambda_beta=1.0)     # no model-channel columns
+    assert [k for k, _ in comps] == ["self", "belief", "attention_entropy"]
+    _, comps_off, _, _ = _fe_terms(_fe_hist(10), lambda_beta=1.0, include_attention_entropy=False)
+    assert [k for k, _ in comps_off] == ["self", "belief"]        # entropy gated out of F, matching the column
+
+
+def test_fe_figures_render_with_model_channel(tmp_path):
+    h = _fe_hist_model_channel(30)
+    for fn, name in ((plot_free_energy_descent, "f1mc.png"),
+                     (plot_free_energy_decomposition, "decompmc.png"),
+                     (plot_free_energy_codescent, "codescentmc.png")):
+        p = tmp_path / name
+        fig = fn(h, lambda_beta=1.0, gamma_coupling=0.75, include_attention_entropy=True, path=str(p))
+        plt.close(fig)
+        assert _saved_nonempty(p)
+
+
+def test_plot_grad_norm_decomposition_saves(tmp_path):
+    n = 60
+    rng = np.random.default_rng(0)
+    hist = {
+        "step":            list(range(1, n + 1)),
+        "grad_norm_mu":    list(np.abs(rng.standard_normal(n)) * 1e-1 + 1e-2),   # spans orders of magnitude
+        "grad_norm_sigma": list(np.abs(rng.standard_normal(n)) * 1e-3 + 1e-4),
+        "grad_norm_phi":   list(np.abs(rng.standard_normal(n)) * 1e-2 + 1e-3),
+    }
+    hist["grad_norm_mu"][5]  = float("nan")                        # NaN dropped by the finite filter
+    hist["grad_norm_phi"][7] = 0.0                                 # non-positive dropped on the log axis
+    p = tmp_path / "grad_decomp.png"
+    fig = plot_grad_norm_decomposition(hist, path=str(p)); plt.close(fig)
+    assert _saved_nonempty(p)
+    assert callable(get_figure("grad_norm_decomposition"))
+
+
+def test_plot_grad_norm_decomposition_partial_columns(tmp_path):
+    # a run may log only a subset of the per-group norms; the figure still renders
+    hist = {"step": list(range(1, 21)), "grad_norm_sigma": list(np.linspace(1e-3, 1e-2, 20))}
+    p = tmp_path / "grad_decomp_partial.png"
+    fig = plot_grad_norm_decomposition(hist, path=str(p)); plt.close(fig)
     assert _saved_nonempty(p)
 
 

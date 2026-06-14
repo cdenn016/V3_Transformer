@@ -1139,7 +1139,9 @@ class VFEModel(nn.Module):
         # total -- a 1/N under-weight of the model channel).
         if cfg.lambda_h > 0.0 or cfg.s_e_step:                       # r table exists on this path
             d["hyper_prior"] = float(self._hyper_prior_kl(token_ids[:1]).sum())          # raw sum_i KL(s_i||r)
-            d["total"] += float(self._hyper_prior_weighted(token_ids[:1]).sum())         # WEIGHTED (lambda_h_mode); == cfg.lambda_h*hyper_prior for 'constant'
+            _hp_weighted = float(self._hyper_prior_weighted(token_ids[:1]).sum())         # WEIGHTED (lambda_h_mode); == cfg.lambda_h*hyper_prior for 'constant'
+            d["hyper_prior_weighted"] = _hp_weighted                                      # EXACT contribution folded into total (state_dependent/learnable != cfg.lambda_h*raw); the F-decomposition figure reads this
+            d["total"] += _hp_weighted
         if cfg.gamma_coupling > 0.0 or cfg.s_e_step:                # gamma block evaluated at out.phi
             g = self._gamma_coupling_terms(token_ids[:1], out.phi.unsqueeze(0))
             d["gamma_coupling"]     = float(g["coupling"])           # raw sum_{h,i,j} gamma E^s

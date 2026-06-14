@@ -462,41 +462,39 @@ def _belief_channel_features(bank: Dict, channel: str):
 
 @register_figure("free_energy_descent")
 def plot_free_energy_descent(
-    history: Dict,                       # arrays over training steps: step, self_coupling, belief_coupling, attention_entropy, val_ce, [free_energy_total]
+    history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce, [hyper_prior_weighted, gamma_*]
 
     *,
-    lambda_beta: 'float | np.ndarray' = 1.0,
-    self_div:    Optional[object]     = None,   # (M,) converged self-divergences for the violin
-    path:        Optional[str]        = None,
+    lambda_beta:               'float | np.ndarray' = 1.0,
+    gamma_coupling:            float = 0.0,
+    include_attention_entropy: bool  = True,
+    self_div:                  Optional[object] = None,   # (M,) converged self-divergences for the violin
+    path:                      Optional[str]    = None,
 ):
-    r"""F1: the per-token free-energy stack over training plus the F-vs-CE co-descent.
+    r"""F1: the per-token complexity free-energy stack over training plus the F-vs-CE co-descent.
 
-    DESCRIPTIVE, not a literal closed decomposition over one empirical object: the coupling terms
-    are a per-eval converged-belief snapshot from a representative batch (logged off the graph),
-    while the data term is the held-out val CE; both are in NATS PER TOKEN so they are commensurate
-    (the caller normalizes the per-sequence-sum diagnostics by the token count before logging). Panel
-    A stacks self-coupling, the lambda_beta-scaled belief-coupling and attention-entropy, and the
-    data/likelihood term (val CE) -- the stack height is the full per-token F INCLUDING the data
-    term. Panel B plots that SAME stacked total against val CE on a twin axis (so the two panels
-    agree; the older path plotted a coupling-only total here that excluded the data term). Panel C
-    (when ``self_div`` is given) is the per-token self-divergence violin. ``lambda_beta`` accepts a
-    per-row vector (the learned-coupling trajectory) as well as a scalar; literal closure to the
-    runtime F holds only at lambda_h = gamma_coupling = 0 (see free_energy_full_decomposition).
+    DESCRIPTIVE per-eval converged-belief snapshots from a representative batch (logged off the graph),
+    all in NATS PER TOKEN so the terms are commensurate (the caller normalizes the per-sequence-sum
+    diagnostics by the token count before logging). Panel A stacks the complexity / inference F that the
+    E-step descends -- self-coupling, the lambda_beta-scaled belief-coupling and attention-entropy, and
+    (when the model channel is live) the weighted hyper-prior and gamma model-coupling; the stack height
+    is that F. The data/likelihood term (CE) is NOT in the stack: there is no observation channel in the
+    LM, so the held-out CE is a readout, drawn separately. Panel B plots that SAME complexity F against
+    the held-out val CE on a twin axis -- the co-descent, evidence that minimizing F tracks the loss.
+    Panel C (when ``self_div`` is given) is the per-token self-divergence violin. ``lambda_beta`` accepts
+    a per-row vector (the learned-coupling trajectory) as well as a scalar; ``total`` matches the
+    free_energy_total column (the complexity F).
     """
-    step = _np(history["step"])
-    sc, bc = _np(history["self_coupling"]), _np(history["belief_coupling"])
-    ae, ce = _np(history["attention_entropy"]), _np(history["val_ce"])
-    lb = _np(lambda_beta)                                         # scalar OR (T,) learned trajectory
-    stack = np.vstack([sc, lb * bc, lb * ae, ce])
+    step, comps, total, ce = _fe_terms(history, lambda_beta, gamma_coupling=gamma_coupling,
+                                       include_attention_entropy=include_attention_entropy)
+    stack  = np.vstack([c for _, c in comps])
+    labels = [_FE_LABELS[k][0] for k, _ in comps]
     ncol = 3 if self_div is not None else 2
     fig, axes = plt.subplots(1, ncol, figsize=(4.4 * ncol, 3.6))
-    axes[0].stackplot(step, stack, colors=_CB[:4], alpha=0.85,
-                      labels=["self-coupling", r"$\lambda_\beta\cdot$belief-coupling",
-                              r"$\lambda_\beta\cdot$attention-entropy", "data term (CE)"])
-    axes[0].set(xlabel="training step", ylabel="free energy (nats/token)", title="Free-energy decomposition")
+    axes[0].stackplot(step, stack, colors=_CB[:len(comps)], alpha=0.85, labels=labels)
+    axes[0].set(xlabel="training step", ylabel="free energy (nats/token)", title="Complexity-F decomposition")
     axes[0].legend(loc="upper right", fontsize=7, frameon=False)
-    ft = stack.sum(0)                                            # full per-token F incl. data term (matches panel A)
-    axes[1].plot(step, ft, color=_CB[0], lw=2)
+    axes[1].plot(step, total, color=_CB[0], lw=2)                # complexity F (matches the panel-A stack height)
     axes[1].set(xlabel="training step", ylabel="F total (nats/token)", title="Co-descent (descriptive)")
     ax2 = axes[1].twinx()
     ax2.plot(step, ce, color=_CB[1], lw=2, ls="--")
@@ -509,40 +507,76 @@ def plot_free_energy_descent(
     return _save(fig, path)
 
 
-def _fe_terms(history: Dict, lambda_beta) -> tuple:
-    r"""Per-eval free-energy term arrays (nats/token) shared by the decomposition + co-descent figures.
+# Canonical key -> (legend label, multi-line bar name) for the complexity-F components, in the
+# order they stack. Belief channel always present; the model channel (hyper-prior, model-coupling)
+# only when those columns are logged. The data term (CE) is NOT a component of F -- it is co-plotted
+# as a held-out reference, never summed in.
+_FE_LABELS = {
+    "self":              ("self-coupling",     "self-coupling\n$\\mathrm{KL}(q\\|p)$"),
+    "belief":            ("belief coupling",   "belief-coupling\n$\\lambda_\\beta\\sum\\mathrm{KL}(q\\|\\Omega q)$"),
+    "attention_entropy": ("attention entropy", "attention-entropy\n$\\lambda_\\beta\\tau\\beta\\log(\\beta/\\pi)$"),
+    "hyper_prior":       ("hyper-prior",       "hyper-prior\n$\\lambda_h\\mathrm{KL}(s\\|r)$"),
+    "model_coupling":    ("model coupling",    "model-coupling\n$\\gamma[\\sum\\mathrm{KL}(s\\|\\Omega s)+\\mathrm{ent}]$"),
+}
 
-    Returns ``(step, self_coupling, lb*belief_coupling, lb*attention_entropy, data_ce, total)`` where the
-    coupling terms carry the (scalar or per-row) ``lambda_beta`` weight that enters F and ``total`` is the
-    full per-token F INCLUDING the data/likelihood term. The logged diagnostics are already per token, so
-    the four contributions are commensurate.
+
+def _fe_terms(history: Dict, lambda_beta, *, gamma_coupling=0.0, include_attention_entropy=True) -> tuple:
+    r"""Per-eval complexity free-energy components (nats/token) shared by the descent/decomposition/
+    co-descent figures.
+
+    Returns ``(step, components, total, ce)`` where ``components`` is an ordered list of
+    ``(canonical_key, array)`` pairs whose sum is ``total`` -- the per-token COMPLEXITY / inference free
+    energy that the E-step descends. ``total`` does NOT include the data/likelihood term: there is no
+    observation channel in the LM, so the cross-entropy is a held-out readout, returned separately as
+    ``ce`` for co-plotting, never summed into F. The belief blocks carry the (scalar or per-row)
+    ``lambda_beta`` weight; the attention-entropy block is included only when
+    ``include_attention_entropy`` (matching ``free_energy_terms``' gate on ``total``). The model channel
+    is added only when its columns are present: ``hyper_prior_weighted`` is the EXACT weighted hyper-prior
+    folded into the runtime total (so state_dependent/learnable lambda_h need no reconstruction), and the
+    gamma blocks are scaled by ``gamma_coupling``. The logged diagnostics are already per token, so every
+    component is commensurate and ``total`` matches the ``free_energy_total`` column.
     """
     step = _np(history["step"]).astype(float)
-    sc   = _np(history["self_coupling"]).astype(float)
     lb   = _np(lambda_beta).astype(float)
-    bc   = lb * _np(history["belief_coupling"]).astype(float)
-    ae   = lb * _np(history["attention_entropy"]).astype(float)
-    ce   = _np(history["val_ce"]).astype(float)
-    return step, sc, bc, ae, ce, sc + bc + ae + ce
+    zeros = np.zeros(step.shape, dtype=float)
+    comps = [("self",   _np(history["self_coupling"]).astype(float)),
+             ("belief", lb * _np(history["belief_coupling"]).astype(float))]
+    if include_attention_entropy:
+        comps.append(("attention_entropy", lb * _np(history["attention_entropy"]).astype(float)))
+    if "hyper_prior_weighted" in history:                            # exact weighted contribution to total
+        comps.append(("hyper_prior", _np(history["hyper_prior_weighted"]).astype(float)))
+    gkeys = [k for k in ("gamma_coupling", "gamma_meta_entropy") if k in history]
+    if gkeys:                                                        # gamma block scaled like the belief block
+        gc = float(gamma_coupling) * sum((_np(history[k]).astype(float) for k in gkeys), zeros.copy())
+        comps.append(("model_coupling", gc))
+    total = sum((c for _, c in comps), zeros.copy())
+    ce = _np(history["val_ce"]).astype(float) if "val_ce" in history else np.full(step.shape, np.nan)
+    return step, comps, total, ce
 
 
 @register_figure("free_energy_codescent")
 def plot_free_energy_codescent(
-    history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce
+    history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce, [hyper_prior_weighted, gamma_*]
 
     *,
-    lambda_beta: 'float | np.ndarray' = 1.0,
-    path:        Optional[str]        = None,
+    lambda_beta:               'float | np.ndarray' = 1.0,
+    gamma_coupling:            float = 0.0,
+    include_attention_entropy: bool  = True,
+    path:                      Optional[str] = None,
 ):
-    r"""F-vs-CE co-descent: the full per-token free energy and the held-out loss fall together.
+    r"""F-vs-CE co-descent: the per-token complexity free energy and the held-out loss fall together.
 
-    Twin y-axes over the real training step -- the stacked total F (self-coupling + the lambda_beta-scaled
-    belief-coupling and attention-entropy + the data/likelihood term, left, solid) and the held-out
-    validation CE (right, dashed) -- each a faint raw line under a rolling-mean trend. The final values
-    are tagged and the Pearson correlation of the two curves is in the title; a high positive r is the
-    co-descent signature, the evidence that minimizing F lowers held-out loss.
+    Twin y-axes over the real training step -- the complexity / inference free energy F (self-coupling +
+    the lambda_beta-scaled belief-coupling and attention-entropy + the weighted hyper-prior and gamma
+    model-coupling when the model channel is live, left, solid) and the held-out validation CE (right,
+    dashed) -- each a faint raw line under a rolling-mean trend. F is the quantity the E-step minimizes;
+    the CE is NOT part of F (there is no observation channel in the LM), it is the held-out readout the
+    descent is meant to track. The final values are tagged and the Pearson correlation of the two curves
+    is in the title; a high positive r is the co-descent signature, the evidence that minimizing the
+    inference F lowers held-out loss.
     """
-    step, sc, bc, ae, ce, total = _fe_terms(history, lambda_beta)
+    step, _comps, total, ce = _fe_terms(history, lambda_beta, gamma_coupling=gamma_coupling,
+                                        include_attention_entropy=include_attention_entropy)
     keep = np.isfinite(total) & np.isfinite(ce)
     step, total, ce = step[keep], total[keep], ce[keep]
     w = max(5, total.size // 80)
@@ -575,29 +609,32 @@ def plot_free_energy_codescent(
 
 @register_figure("free_energy_decomposition")
 def plot_free_energy_decomposition(
-    history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce
+    history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce, [hyper_prior_weighted, gamma_*]
 
     *,
-    lambda_beta: 'float | np.ndarray' = 1.0,
-    path:        Optional[str]        = None,
+    lambda_beta:               'float | np.ndarray' = 1.0,
+    gamma_coupling:            float = 0.0,
+    include_attention_entropy: bool  = True,
+    path:                      Optional[str] = None,
 ):
-    r"""The per-token free-energy budget at convergence and how its terms move over training.
+    r"""The per-token complexity free-energy budget at convergence and how its terms move over training.
 
-    Panel A: the four F-contributions at the LAST eval on a LOG x-axis with the value past each bar, so
-    the dominant self-coupling and the order-of-magnitude-smaller terms are all legible (a linear bar
+    Panel A: the F-contributions at the LAST eval on a LOG x-axis with the value past each bar, so the
+    dominant self-coupling and the order-of-magnitude-smaller terms are all legible (a linear bar
     collapses the small ones to slivers, the failure mode of the old single bar). Panel B: the same terms
     at the early/mid/late thirds of training on a log y-axis -- self-coupling sits flat near its value
-    while the belief-coupling, attention-entropy, and data terms carry the descent. Coupling terms carry
-    the lambda_beta weight (so the bars are the actual F-contributions).
+    while the belief-coupling, attention-entropy, and model-channel terms carry the descent. The bars are
+    the complexity / inference F (the quantity the E-step minimizes): self-coupling, the lambda_beta-scaled
+    belief-coupling and attention-entropy, and -- when the model channel is live -- the weighted hyper-prior
+    and gamma model-coupling. The data/likelihood term (CE) is NOT shown: it is not part of F (no
+    observation channel in the LM); see the co-descent figure for F vs the held-out CE.
     """
-    step, sc, bc, ae, ce, _ = _fe_terms(history, lambda_beta)
-    names = ["self-coupling\n$\\mathrm{KL}(q\\|p)$",
-             "belief-coupling\n$\\sum\\mathrm{KL}(q\\|\\Omega q)$",
-             "attention-entropy\n$\\tau\\beta\\log(\\beta/\\pi)$",
-             "data term\n$-\\mathbb{E}_q[\\log p]$"]
-    labels = ["self-coupling", "belief coupling", "attention entropy", "data term"]
-    series = [sc, bc, ae, ce]
-    colors = _CB[:4]
+    step, comps, _total, _ce = _fe_terms(history, lambda_beta, gamma_coupling=gamma_coupling,
+                                         include_attention_entropy=include_attention_entropy)
+    names  = [_FE_LABELS[k][1] for k, _ in comps]
+    labels = [_FE_LABELS[k][0] for k, _ in comps]
+    series = [c for _, c in comps]
+    colors = _CB[:len(series)]
     last = np.array([s[-1] for s in series])
     fig, axes = plt.subplots(1, 2, figsize=(11.4, 4.2))
     # Panel A -- convergence snapshot (largest at top), log x so every term reads despite the ~30x gap.
@@ -614,10 +651,12 @@ def plot_free_energy_decomposition(
     # Panel B -- early/mid/late medians, log y so the flat dominant term and the moving terms coexist.
     thirds  = np.array_split(np.arange(step.size), 3)
     centers = np.arange(3)
-    width   = 0.2
+    n_bars  = len(series)
+    width   = min(0.2, 0.8 / max(n_bars, 1))                         # keep the grouped bars inside one tick
+    off0    = (n_bars - 1) / 2.0                                     # center the group regardless of bar count
     for j, arr in enumerate(series):
         meds = [float(np.median(arr[idx])) if idx.size else np.nan for idx in thirds]   # skip empty thirds
-        axes[1].bar(centers + (j - 1.5) * width, meds, width=width, color=colors[j], label=labels[j])
+        axes[1].bar(centers + (j - off0) * width, meds, width=width, color=colors[j], label=labels[j])
     axes[1].set_yscale("log")
     axes[1].set_ylim(top=axes[1].get_ylim()[1] * 2.2)            # headroom for the legend above the bars
     axes[1].set_xticks(centers); axes[1].set_xticklabels(["early", "mid", "late"])
@@ -676,6 +715,56 @@ def plot_model_channel_terms(
         ax.legend(fontsize=8, frameon=False, loc="upper right")
     ax.set(xlabel="training step", ylabel="model-channel F block (nats/token)",
            title="Model-channel free-energy blocks (raw)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("grad_norm_decomposition")
+def plot_grad_norm_decomposition(
+    history: Dict,                       # step + any of: grad_norm_mu, grad_norm_sigma, grad_norm_phi
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""Per-parameter-group pre-clip gradient L2 norms over training: the mu / sigma / phi
+    decomposition of the aggregate ``grad_norm`` curve.
+
+    The optimizer parameter groups 0/1/2 are mu / sigma / phi (build_optimizer), so a per-group
+    norm isolates WHICH channel the optimization signal flows into -- the aggregate grad_norm.png
+    sums them and hides that. Each series is a faint raw line under a rolling-mean trend on a log y
+    (the norms are strictly positive and span orders of magnitude, like grad_norm.png's logy), with
+    the final value tagged. Captured AFTER unscale_ but BEFORE clip in train_step, so these are the
+    true pre-clip magnitudes; a SEPARATE figure from the aggregate that it decomposes.
+    """
+    step = _np(history["step"]).astype(float)
+    spec = [
+        ("grad_norm_mu",    r"$\|\nabla_\mu\|_2$",    _CB[0]),
+        ("grad_norm_sigma", r"$\|\nabla_\Sigma\|_2$", _CB[1]),
+        ("grad_norm_phi",   r"$\|\nabla_\phi\|_2$",   _CB[2]),
+    ]
+    fig, ax = plt.subplots(figsize=(6.8, 4.0))
+    w = max(5, step.size // 80)
+    plotted = False
+    for key, label, color in spec:
+        if key not in history:
+            continue
+        v = _np(history[key]).astype(float)
+        keep = np.isfinite(v) & (v > 0)                           # log y: drop non-positive (frozen-group) points
+        x, vv = step[keep], v[keep]
+        if not vv.size:
+            continue
+        plotted = True
+        ax.plot(x, vv, lw=0.7, color=color, alpha=0.25)
+        ax.plot(x, _rolling_mean(vv, w), lw=2.0, color=color, label=label)
+        ax.annotate(f"{vv[-1]:.3g}", xy=(x[-1], vv[-1]), xytext=(6, 0), textcoords="offset points",
+                    va="center", fontsize=8, fontweight="bold", color=color)
+    if plotted:
+        ax.set_yscale("log")
+        if step.size:
+            ax.set_xlim(float(step.min()), float(step.max()))
+        ax.legend(fontsize=8, frameon=False, loc="upper right")
+    ax.set(xlabel="training step", ylabel=r"pre-clip $\|\nabla\|_2$ (per group)",
+           title="Gradient norm decomposition (mu / sigma / phi)")
     fig.tight_layout()
     return _save(fig, path)
 

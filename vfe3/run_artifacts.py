@@ -600,6 +600,21 @@ def _save_figures(
                 color=figs._CB[5 % len(figs._CB)], logy=True, smooth=max(5, len(ny) // 80),
                 annotate="max", path=str(run / "grad_norm.png"))
             figs.plt.close(fig)
+        # Per-group gradient-norm decomposition (mu / sigma / phi): the channels the aggregate
+        # grad_norm.png folds together. Columns logged by train_step (groups 0/1/2 = mu/sigma/phi);
+        # present only on a run that captured step_metrics, so gate on their presence (the CSV stays
+        # rectangular per run). A SEPARATE figure from the aggregate, same pre-clip magnitudes.
+        gd_keys = ("grad_norm_mu", "grad_norm_sigma", "grad_norm_phi")
+        gd_present = [k for k in gd_keys
+                      if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
+        if gd_present:
+            gd_rows = [r for r in artifacts.history
+                       if all(k in r and math.isfinite(r[k]) for k in gd_present)]
+            if gd_rows:
+                hist_gd = {"step": [r.get("step", i) for i, r in enumerate(gd_rows)],
+                           **{k: [r[k] for r in gd_rows] for k in gd_present}}
+                fig = figs.plot_grad_norm_decomposition(hist_gd, path=str(run / "grad_norm_decomposition.png"))
+                figs.plt.close(fig)
         cx, cy = _aligned("belief_cond_median")
         if cy:
             fig = figs.plot_trajectory(
@@ -632,17 +647,28 @@ def _save_figures(
                    if all(k in r and math.isfinite(r[k]) for k in fe_keys)]
         if fe_rows:
             cfg = getattr(artifacts, "cfg", None)
+            # Model-channel F components fold into the complexity-F total when the channel is live;
+            # included only when present on EVERY plotted row (model-channel run). hyper_prior_weighted
+            # is the EXACT weighted hyper-prior (state_dependent/learnable lambda_h != cfg.lambda_h*raw,
+            # so it is read directly); the gamma blocks are scaled by cfg.gamma_coupling in the figure,
+            # exactly as the belief block is scaled by lambda_beta.
+            mc_fe_keys = [k for k in ("hyper_prior_weighted", "gamma_coupling", "gamma_meta_entropy")
+                          if all(k in r and math.isfinite(r[k]) for r in fe_rows)]
             hist = {"step": [r.get("step", i) for i, r in enumerate(fe_rows)],
-                    **{k: [r[k] for r in fe_rows] for k in fe_keys}}
+                    **{k: [r[k] for r in fe_rows] for k in (*fe_keys, *mc_fe_keys)}}
             # Scale the coupling terms by the LEARNED lambda_beta trajectory when every row carries it
             # (a learnable_lambda_beta run); else the static config scalar.
             lam = ([r["lambda_beta"] for r in fe_rows] if all("lambda_beta" in r for r in fe_rows)
                    else getattr(cfg, "lambda_beta", 1.0))
+            gam = getattr(cfg, "gamma_coupling", 0.0)
+            iae = getattr(cfg, "include_attention_entropy", True)
             fig = figs.plot_free_energy_decomposition(
-                hist, lambda_beta=lam, path=str(run / "free_energy_decomposition.png"))
+                hist, lambda_beta=lam, gamma_coupling=gam, include_attention_entropy=iae,
+                path=str(run / "free_energy_decomposition.png"))
             figs.plt.close(fig)
             fig = figs.plot_free_energy_codescent(
-                hist, lambda_beta=lam, path=str(run / "free_energy_codescent.png"))
+                hist, lambda_beta=lam, gamma_coupling=gam, include_attention_entropy=iae,
+                path=str(run / "free_energy_codescent.png"))
             figs.plt.close(fig)
         # Model-channel free-energy blocks (s-channel): the hyper-prior KL(s||r), the gamma
         # model-coupling, and its meta-entropy over training. Present only when the model channel
