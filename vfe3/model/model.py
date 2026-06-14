@@ -1095,19 +1095,26 @@ class VFEModel(nn.Module):
         d["gauge_invariant_mean"]   = float(ginv.mean())
         d["gauge_invariant_spread"] = float(ginv.std(unbiased=False))
 
-        # Transport directedness / conditioning / sandwich overflow (the ln(3) symmetry-breaking
-        # signal, and cond(Omega) which SQUARES in the covariance sandwich vs the fp32 ~1e7 line).
+        # Transport DIRECTEDNESS + conditioning + sandwich overflow. NOTE: directedness
+        # (transport_asymmetry, energy_*_asymmetry) is intrinsic to ANY nonzero gauge -- it is nonzero
+        # on the FLAT cocycle (Omega_ji = Omega_ij^{-1} != Omega_ij), so it is NOT a curvature /
+        # non-flatness signal; cocycle_residual and holonomy_deviation are the flatness diagnostics.
         d["cocycle_residual"] = float(metrics.cocycle_residual_sampled(omega))   # composition-law flatness
         _svd_v = torch.linalg.svdvals(exp_phi)                      # (N, K) vertex-factor singular values
         d["vertex_cond_max"]  = float((_svd_v[..., 0] / _svd_v[..., -1].clamp(min=cfg.eps)).max())
-        #   pairwise cond(Omega_ij) = cond(exp_phi_i exp(-phi_j)) <= vertex_cond_max^2 (a cheap bound).
-        d["sandwich_absmax"]  = float(sigma_t.abs().max())          # |Omega Sigma Omega^T| overflow proximity
+        #   FLAT path: pairwise cond(Omega_ij) = cond(exp_phi_i exp(-phi_j)) <= vertex_cond_max^2. Under
+        #   regime_ii the edge factor exp(delta_ij) adds conditioning NOT captured here -- sandwich_absmax
+        #   below is the direct (Omega Sigma Omega^T) overflow signal that DOES see it.
+        d["sandwich_absmax"]  = float(sigma_t.abs().max())          # |Omega Sigma Omega^T| overflow vs fp32 ~1e7
         d["transport_asymmetry"]  = float(metrics.transport_asymmetry(omega).mean())
         _ed = metrics.energy_directedness(energy)
         d["energy_abs_asymmetry"] = float(_ed["abs_asymmetry"])
         d["energy_rel_asymmetry"] = float(_ed["rel_asymmetry"])
         # Per-head gauge specialization: do the per-head GL(d_head) frames specialize, or collapse to a
-        # shared frame? Mean block anisotropy + spread of log|det| across heads (single block -> 0 spread).
+        # shared frame? Mean block anisotropy + spread of log|det| across heads (single block -> 0
+        # spread). Informative for block_glk / tied_block_glk (independent per-block GL frames); for the
+        # orthogonal/symplectic tied towers (so_k/so_n/sp_n) it is structurally vacuous (det=1, unit
+        # singular values, one shared group element), so read it only on the GL-block groups.
         _ghi = metrics.per_head_gauge_invariants(exp_phi, self.group.irrep_dims)
         d["gauge_head_aniso_mean"]    = float(_ghi["anisotropy"].float().mean())
         d["gauge_head_logdet_spread"] = float(_ghi["logdet"].float().std(unbiased=False))
@@ -1124,7 +1131,9 @@ class VFEModel(nn.Module):
         d["belief_cond_median"] = float(cond.median())
         d["belief_cond_p95"]    = float(torch.quantile(cond, 0.95))
         d["belief_cond_max"]    = float(cond.max())
-        d["belief_pd_margin"]   = float((bs["eigenvalues"][..., -1].float() / cfg.eps).min())
+        # clamp lam_min at eps before dividing -- matches the floor belief_spectrum's condition number
+        # uses, so a floored / sub-floor belief reads ~1.0 (not 0.0) consistently across the reductions.
+        d["belief_pd_margin"]   = float((bs["eigenvalues"][..., -1].clamp(min=cfg.eps).float() / cfg.eps).min())
 
         # Per-token effective-rank distribution (the logged mean hides a bimodal rank-1/rank-K collapse).
         er = metrics.effective_rank_per_token(out.sigma, diagonal=_diag, eps=cfg.eps).float()

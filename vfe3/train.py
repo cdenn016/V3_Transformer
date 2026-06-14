@@ -464,9 +464,12 @@ def _val_diagnostics(
         out["val_head_redundancy_js"] = float(torch.stack(
             [M.head_redundancy_js(amaps[li])[off].mean() for li in range(amaps.shape[0])]).mean())
 
-    tr = ex.e_step_belief_trace(model, val_tok)                 # variational-EM convergence certificate
-    f = tr["free_energy"]
+    tr = ex.e_step_belief_trace(model, val_tok)                 # E-step inner-loop trajectory
+    f = tr["free_energy"] / vn                                  # PER-TOKEN (free_energy_value is a per-seq SUM)
     out["estep_f_drop"] = float(f[-1] - f[0])                   # < 0 = F descended over the inner loop
+    # fraction of inner iterations that did NOT decrease F. EXPECTED to be nonzero for parallel
+    # (Jacobi) mean-field with a finite step (e_step.py: 'not guaranteed monotone per iteration') --
+    # a descent-quality readout, not a convergence-FAILURE flag.
     out["estep_f_nondecreasing_frac"] = (
         float((f[1:] > f[:-1] + 1e-9).float().mean()) if f.numel() > 1 else 0.0)
     res = M.estep_residuals(tr["mu"], tr["sigma"], tr["phi"])   # last-iter belief change (SPD metric for sigma)
@@ -712,11 +715,13 @@ def train(
             # Throughput + peak memory (Tier-1): tokens/s over the window and CUDA peak MB.
             row["tokens_per_s"] = toks_per_s
             row["peak_mem_mb"]  = peak_mem_mb
-            # Derived gaps (Tier-1): generalization (train vs val CE) and the variational complexity
-            # overhead the bound carries over pure fit (F_total - val_ce); both per-token nats. NaN
-            # until the first eval populates last_val.
-            row["generalization_gap"] = ce - last_val.get("ce", float("nan"))
-            row["elbo_ce_gap"]        = (d["total"] / n_tok) - last_val.get("ce", float("nan"))
+            # Generalization gap (Tier-1): val-set CE minus the per-step train CE (positive = overfit,
+            # the standard convention). The train side is seq-0 (diagnostics runs on seq 0) while val is
+            # the token-weighted val-set mean, so read it as a TREND, not an absolute. NaN until the
+            # first eval populates last_val. (The complexity-vs-fit comparison is free_energy_total vs
+            # val_ce, both already columns; a separate "elbo_ce_gap" would subtract a CE from a
+            # complexity-only F -- d["total"] carries no -E_q[log p] data term -- so it is NOT emitted.)
+            row["generalization_gap"] = last_val.get("ce", float("nan")) - ce
             # Extended per-eval diagnostics (Tier-1/2): already-reduced gauge / geometry / numerical-
             # health scalars from diagnostics() -- NOT per-token sums, so logged RAW (no /n_tok).
             # Conditional keys (connection_w_norm, head_mixer_drift) appear only with their toggle; the
@@ -729,7 +734,8 @@ def train(
                         "fisher_trace_mean", "fisher_trace_median",
                         "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
                         "guard_energy_klmax_frac", "guard_selfdiv_klmax_frac",
-                        "nonfinite_frac", "attn_entropy_min", "attn_entropy_collapsed_heads",
+                        "nonfinite_frac", "renyi_band_frac",
+                        "attn_entropy_min", "attn_entropy_collapsed_heads",
                         "cocycle_residual", "vertex_cond_max", "sandwich_absmax", "transport_asymmetry",
                         "energy_abs_asymmetry", "energy_rel_asymmetry",
                         "gauge_head_aniso_mean", "gauge_head_logdet_spread",

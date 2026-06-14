@@ -353,18 +353,24 @@ def _fd_gradient_check(
     n_coords:    int   = 4,
     fd_eps:      float = 1e-3,
 ) -> float:
-    r"""Worst relative error between autograd-of-CE and a central finite difference on a few
-    ``mu_embed`` coordinates -- the CLAUDE.md-mandated FD-vs-autograd-of-F check the run path
-    (backprop through eigh / matrix_exp / SPD retraction / straight-through detaches) most needs to
-    catch a broken detach or poisoned adjoint. Best-effort on one tiny batch; restores every coord."""
+    r"""Worst relative error between autograd-of-CE and a central finite difference on a few DECODE
+    coordinates (``output_proj_weight``, else the decode log-scale) -- a parameter whose gradient does
+    NOT pass through the E-step belief adjoint (which the default kernel/oracle route detaches), so a
+    healthy model reads ~1e-4 and a broken decode adjoint spikes far above it. (Probing ``mu_embed``
+    instead would sit at the detached-oracle's ~10-25% plateau with no headroom to flag a real bug.)
+    The CLAUDE.md-mandated FD-vs-autograd check. Best-effort on one tiny batch; restores every coord."""
     batch = next(iter(test_loader))
     tok, tgt = (batch if isinstance(batch, (tuple, list)) else (batch, None))
     tok = tok[:2].to(device)
     tgt = tgt[:2].to(device)
-    p = model.prior_bank.mu_embed
+    pb = model.prior_bank
+    p = pb.output_proj_weight if getattr(pb, "output_proj_weight", None) is not None else pb.decode_log_scale
     model.zero_grad(set_to_none=True)
     _, loss, _ = model(tok, tgt)
     loss.backward()
+    if p.grad is None:                                          # decode param severed under this config
+        model.zero_grad(set_to_none=True)
+        return float("nan")
     flat, gflat = p.detach().view(-1), p.grad.detach().view(-1).clone()
     # Probe the LARGEST-gradient coords, not random ones: a random coord usually has near-zero
     # gradient where the central difference is dominated by fp rounding (a spurious large rel error),
@@ -459,11 +465,12 @@ def finalize_run(
     results.update({"best_val_ppl": best_val_ppl, "best_step": artifacts.best_step,
                     "reloaded_best": reloaded_best})
 
-    # E-step capacity attribution (the no-NN thesis falsifier): test CE with the inner E-step
-    # DISABLED (n_e_steps=0 -> belief = prior, the loop runs zero iterations) minus the
-    # configured-budget test CE. A near-zero gain means the iterative VFE minimization is
-    # decorative -- the concrete test of the central "capacity from the E-step, not a lookup
-    # table" claim. Off-graph, best-effort; n_e_steps is restored in the finally.
+    # E-step inference-time value: test CE with the inner E-step DISABLED (n_e_steps=0 -> belief =
+    # prior, the loop runs zero iterations) minus the configured-budget test CE. NOTE this is the
+    # INFERENCE-TIME marginal value of the E-step under tables that were TRAINED with it (the M-step
+    # co-adapts the priors to the refinement) -- NOT a clean capacity split into table vs E-step, which
+    # would need a second model trained at n_e_steps=0. A near-zero value still flags an E-step that
+    # buys little at inference. Off-graph, best-effort; n_e_steps is restored in the finally.
     if test_loader is not None and results.get("test_ce") is not None:
         _saved_ne = model.cfg.n_e_steps
         try:

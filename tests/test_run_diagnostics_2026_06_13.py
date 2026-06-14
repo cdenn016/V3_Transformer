@@ -113,7 +113,7 @@ def test_metrics_csv_has_tier1_columns_and_is_rectangular() -> None:
     assert rows, "no metrics rows written"
     cols = set(rows[0].keys())
     need = (["grad_norm", "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi", "loss_finite",
-             "tokens_per_s", "peak_mem_mb", "generalization_gap", "elbo_ce_gap"] + _NEW_DIAG_KEYS)
+             "tokens_per_s", "peak_mem_mb", "generalization_gap"] + _NEW_DIAG_KEYS)
     assert not [c for c in need if c not in cols], f"CSV missing Tier-1 columns: {[c for c in need if c not in cols]}"
     # rectangular: every row carries the identical column set
     assert all(set(r.keys()) == cols for r in rows)
@@ -188,6 +188,40 @@ def test_diagnostics_has_renyi_band_frac() -> None:
     model = VFEModel(_cfg()).to(DEVICE)
     d = model.diagnostics(torch.randint(0, 16, (2, 8), device=DEVICE))
     assert "renyi_band_frac" in d and 0.0 <= d["renyi_band_frac"] <= 1.0
+
+
+def test_group_gauge_invariant_sp_is_conjugation_invariant() -> None:
+    # Adversarial-review HIGH fix: the sp/sp_n invariant must be invariant under GL congruence
+    # (conjugation of exp(phi)), which the singular-value squeeze was NOT (Sp is non-orthogonal).
+    from vfe3.metrics import group_gauge_invariant
+    torch.manual_seed(0)
+
+    class _G:
+        name = "sp"
+
+    k = 4
+    exp_phi = torch.matrix_exp(torch.randn(k, k) * 0.3).unsqueeze(0)        # (1, K, K)
+    g = torch.matrix_exp(torch.randn(k, k) * 0.5)                           # generic GL conjugation
+    moved = g @ exp_phi @ torch.linalg.inv(g)
+    base = group_gauge_invariant(exp_phi, _G())
+    conj = group_gauge_invariant(moved, _G())
+    assert torch.allclose(base, conj, atol=1e-4), (float(base), float(conj))
+
+
+def test_guard_saturation_full_cov_floor_binds() -> None:
+    # Adversarial-review HIGH fix: on a full covariance whose SPD floor binds, sigma_floor_frac must
+    # not read 0 just because eigvalsh noise exceeds the tight relative window.
+    from vfe3.metrics import guard_saturation
+    eps = 1e-6
+    k = 3
+    q = torch.linalg.qr(torch.randn(k, k))[0]
+    sigma1 = q @ torch.diag(torch.tensor([eps, 1.0, 10.0])) @ q.T           # cond ~1e7, smallest at floor
+    sigma1 = 0.5 * (sigma1 + sigma1.T)
+    sig = sigma1.unsqueeze(0).expand(4, k, k).contiguous()                  # (4, K, K) full cov
+    gs = guard_saturation(sig, torch.zeros(4, 4), torch.zeros(4), eps=eps, sigma_max=100.0)
+    # one of three eigenvalues per token sits at the floor -> ~1/3 of spectrum entries; the point is
+    # it is NONZERO (the tight relative window read exactly 0 here before the eigensolver-noise fix).
+    assert gs["sigma_floor_frac"] > 0.3, gs["sigma_floor_frac"]
 
 
 def test_finalize_writes_tier3_research_and_provenance() -> None:

@@ -363,16 +363,23 @@ def guard_saturation(
     the eigenvalues for a full covariance. A near-zero map means the clamps never bind.
     """
     spec = _spectrum(sigma, diagonal=diagonal)
+    # eigvalsh error scales with the largest eigenvalue (~eps_machine * lam_max), so on a FULL
+    # covariance the tight relative window rtol*eps at the SPD FLOOR (eps ~ 1e-6) sits far below the
+    # eigensolver noise -- which would report sigma_floor as NEVER binding even when it binds on every
+    # token. Widen the spectrum-boundary tolerance to that noise floor on the full-cov path only; the
+    # diagonal path (_spectrum returns the variances bit-exact) keeps the tight relative window.
+    spec_atol = (64.0 * 2.0 ** -23 * float(spec.detach().abs().max())
+                 if (_is_full_cov(sigma, diagonal) and spec.numel()) else 0.0)
 
-    def _frac(x: torch.Tensor, boundary: float) -> float:
+    def _frac(x: torch.Tensor, boundary: float, *, atol: float = 0.0) -> float:
         if x.numel() == 0:
             return 0.0
         scale = max(abs(boundary), eps)
-        return float(((x - boundary).abs() < rtol * scale).float().mean())
+        return float(((x - boundary).abs() < max(rtol * scale, atol)).float().mean())
 
     return {
-        "sigma_floor_frac":   _frac(spec, eps),
-        "sigma_ceil_frac":    _frac(spec, sigma_max),
+        "sigma_floor_frac":   _frac(spec, eps, atol=spec_atol),
+        "sigma_ceil_frac":    _frac(spec, sigma_max, atol=spec_atol),
         "energy_klmax_frac":  _frac(energy, kl_max),
         "selfdiv_klmax_frac": _frac(self_div, kl_max),
     }
@@ -393,16 +400,22 @@ def group_gauge_invariant(
     for the unimodular groups SO(K) and Sp(2m) (traceless generators, det == 1), so it is blind
     off block_glk. This dispatches the correct invariant: GL volume log|det exp(phi)| for
     glk / block_glk / tied_block_glk, total rotation angle (1/2) sum_k |arg(eig)| for so_k and
-    the orthogonal so_n irrep towers, and the squeeze log(s_max / s_min) of the singular values
-    for sp / sp_n (whose Sym^p images are traceless, so logdet is blind there too).
+    the orthogonal so_n irrep towers, and the eigenvalue-modulus squeeze max_k log|lambda_k| -
+    min_k log|lambda_k| for sp / sp_n (whose Sym^p images are traceless, so logdet is blind there
+    too; the eigenvalue moduli are conjugation-invariant, unlike the singular values).
     """
     name = getattr(group, "name", "glk")
     if name in ("so_k", "so_n"):
         ang = torch.angle(torch.linalg.eigvals(exp_phi))         # (..., K) eigenphases
         return 0.5 * ang.abs().sum(dim=-1)
     if name in ("sp", "sp_n"):
-        s = torch.linalg.svdvals(exp_phi)                        # (..., K) descending
-        return torch.log(s[..., 0].clamp(min=eps)) - torch.log(s[..., -1].clamp(min=eps))
+        # The gauge action is GL(K) CONGRUENCE, so exp(phi) transforms by conjugation g exp(phi) g^{-1};
+        # the singular-value squeeze log(s_max/s_min) is invariant only under ORTHOGONAL conjugation, and
+        # Sp(2m,R) is not orthogonal. Use the eigenvalue-MODULUS squeeze instead -- eigenvalues are
+        # conjugation-invariant and symplectic spectra come in reciprocal pairs, so this is the natural
+        # Ad-invariant squeeze (was frame-dependent under svdvals; audit 2026-06-13 review).
+        logmod = torch.log(torch.linalg.eigvals(exp_phi).abs().clamp(min=eps))   # (..., K) log|eig|
+        return logmod.amax(dim=-1) - logmod.amin(dim=-1)
     return torch.linalg.slogdet(exp_phi).logabsdet              # GL volume log|det|
 
 
