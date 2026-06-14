@@ -501,6 +501,25 @@ class VFEModel(nn.Module):
         )
         return out.mu, out.sigma
 
+    @torch.no_grad()
+    def _refined_s_belief(
+        self,
+        token_ids: torch.Tensor,             # (B, N) integer token ids
+    ) -> 'Optional[tuple[torch.Tensor, torch.Tensor]]':   # refined (mu_s, sigma_s) for seq 0, or None
+        r"""The refined model-channel belief s1 = (mu_s, sigma_s) the forward uses under ``s_e_step``
+        (sequence 0), or ``None`` when ``s_e_step`` is off so callers fall back to the raw s tables.
+
+        M2: lets the model-channel diagnostics and figures (hyper-prior KL, gamma energy / attention)
+        read the SAME refined s the forward computes (model.py forward s_e_step branch), instead of
+        re-encoding the un-refined tables. Mirrors the forward refine (``_refine_s`` with the
+        encoded+positional gauge frame held fixed); no_grad, off the hot path.
+        """
+        if not self.cfg.s_e_step:
+            return None
+        enc = self.prior_bank.encode(token_ids[:1])
+        phi0 = self._apply_pos_phi(enc.phi[0]).unsqueeze(0)          # (1, N, n_gen) encoded frame, fixed
+        return self._refine_s(token_ids[:1], phi0)                   # (1, N, K) x2
+
     def forward(
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
@@ -772,20 +791,25 @@ class VFEModel(nn.Module):
     def _hyper_prior_kl(
         self,
         token_ids: torch.Tensor,             # (B, N) integer token ids
+
+        *,
+        s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
     ) -> torch.Tensor:                       # (B, N) KL(s_i || r) per token
         r"""Per-token hyper-prior divergence KL(s_i||r), unreduced (the lambda_h block integrand).
 
-        s_i is encoded fresh from the s tables and measured against the global centroid r;
-        grad-connected (no detach). The covariance kernel is DiagonalGaussian regardless of
-        cfg.family (the s/r tables are always diagonal (V,K)/(K,)); r (K,) broadcasts over the
-        (B, N) token axis. :meth:`_hyper_prior_term` reduces this to its mean (the forward-loss
-        scale); :meth:`diagnostics` and the s/r/h figures consume the per-token vector / its sum.
+        s_i is the refined model belief when ``s_belief`` is supplied (the forward's s1 under
+        ``s_e_step``, so the diagnostic reads the SAME s the model uses), else encoded fresh from the
+        s tables; measured against the global centroid r, grad-connected (no detach). The covariance
+        kernel is DiagonalGaussian regardless of cfg.family (the s/r tables are always diagonal
+        (V,K)/(K,)); r (K,) broadcasts over the (B, N) token axis. :meth:`_hyper_prior_term` reduces
+        this to its mean (the forward-loss scale); :meth:`diagnostics` and the s/r/h figures consume
+        the per-token vector / its sum.
         """
         from vfe3.families.gaussian import DiagonalGaussian
         from vfe3.free_energy import self_divergence
         cfg = self.cfg
         pb = self.prior_bank
-        s_mu, s_sigma = pb.encode_s(token_ids)                       # (B, N, K)
+        s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B, N, K)
         r_mu = pb.r_mu                                               # (K,)
         r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps)       # (K,)
         return self_divergence(
@@ -797,6 +821,9 @@ class VFEModel(nn.Module):
     def _hyper_prior_weighted(
         self,
         token_ids: torch.Tensor,             # (B, N) integer token ids
+
+        *,
+        s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
     ) -> torch.Tensor:                       # (B, N) lambda_h_i KL(s_i||r) + R_h(lambda_h_i)
         r"""Per-token WEIGHTED+regularized hyper-prior integrand lambda_h_i*KL(s_i||r) + R_h(lambda_h_i).
 
@@ -808,7 +835,7 @@ class VFEModel(nn.Module):
         """
         from vfe3.lambda_h_i import hyper_prior_lambda_h
         cfg = self.cfg
-        kl_s = self._hyper_prior_kl(token_ids)                        # (B, N) raw KL(s_i||r)
+        kl_s = self._hyper_prior_kl(token_ids, s_belief=s_belief)     # (B, N) KL(s_i||r) (refined s1 under s_e_step)
         lam, reg = hyper_prior_lambda_h(
             kl_s, mode=cfg.lambda_h_mode, value=cfg.lambda_h,
             b0_h=cfg.b0_h, c0_h=cfg.c0_h, log_lambda_h=getattr(self, "log_lambda_h", None),
@@ -838,6 +865,9 @@ class VFEModel(nn.Module):
         self,
         token_ids: torch.Tensor,             # (B, N) integer token ids
         phi:       torch.Tensor,             # (B, N, n_gen) gauge frame (TIED flat transport)
+
+        *,
+        s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
     ) -> 'tuple[torch.Tensor, float | torch.Tensor, Optional[torch.Tensor]]':
         r"""Shared model-coupling setup: the s-channel pairwise energy E^s_ij, the gamma softmax
         temperature tau_g, and the gamma attention log-prior.
@@ -855,7 +885,7 @@ class VFEModel(nn.Module):
         from vfe3.inference.e_step import build_belief_transport
         cfg = self.cfg
         pb = self.prior_bank
-        s_mu, s_sigma = pb.encode_s(token_ids)                       # (B, N, K)
+        s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B, N, K)
         n_pos = token_ids.shape[1]
         omega = build_belief_transport(phi, self.group, transport_mode="flat")
         s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
@@ -904,6 +934,7 @@ class VFEModel(nn.Module):
 
         *,
         eps:       float = 1e-12,
+        s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
     ) -> 'Dict[str, torch.Tensor]':          # SUM-scale {coupling, meta_entropy, total}
         r"""Split the gamma model-coupling block into its coupling and meta-entropy parts (UNWEIGHTED,
         SUM over heads and token pairs -- the scale the belief blocks report in :meth:`diagnostics`).
@@ -919,7 +950,7 @@ class VFEModel(nn.Module):
         per head exactly as the belief entropy term does.
         """
         from vfe3.free_energy import _broadcast_tau, attention_weights, reduced_free_energy
-        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi)
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, s_belief=s_belief)
         gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
         pi_s = (torch.softmax(gamma_log_prior, dim=-1) if gamma_log_prior is not None
                 else torch.full_like(gamma_w, 1.0 / gamma_w.shape[-1]))
@@ -949,9 +980,9 @@ class VFEModel(nn.Module):
         from vfe3.free_energy import attention_weights
         enc = self.prior_bank.encode(token_ids[:1])
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
-        if self.cfg.s_e_step:
-            s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
-            belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
+        s_belief = self._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
+        if s_belief is not None:
+            belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)
         rope = self._rope_rotation(n, token_ids.device)
@@ -1070,9 +1101,9 @@ class VFEModel(nn.Module):
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
-        if self.cfg.s_e_step:
-            s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
-            belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
+        s_belief = self._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
+        if s_belief is not None:
+            belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         _llb = getattr(self, "log_lambda_beta", None)
@@ -1158,12 +1189,12 @@ class VFEModel(nn.Module):
         # commensurate decomposition (the prior fold added per-token MEANS into the per-sequence SUM
         # total -- a 1/N under-weight of the model channel).
         if cfg.lambda_h > 0.0 or cfg.s_e_step:                       # r table exists on this path
-            d["hyper_prior"] = float(self._hyper_prior_kl(token_ids[:1]).sum())          # raw sum_i KL(s_i||r)
-            _hp_weighted = float(self._hyper_prior_weighted(token_ids[:1]).sum())         # WEIGHTED (lambda_h_mode); == cfg.lambda_h*hyper_prior for 'constant'
+            d["hyper_prior"] = float(self._hyper_prior_kl(token_ids[:1], s_belief=s_belief).sum())   # sum_i KL(s_i||r) (refined s1 under s_e_step)
+            _hp_weighted = float(self._hyper_prior_weighted(token_ids[:1], s_belief=s_belief).sum())  # WEIGHTED (lambda_h_mode); == cfg.lambda_h*hyper_prior for 'constant'
             d["hyper_prior_weighted"] = _hp_weighted                                      # EXACT contribution folded into total (state_dependent/learnable != cfg.lambda_h*raw); the F-decomposition figure reads this
             d["total"] += _hp_weighted
         if cfg.lambda_gamma > 0.0 or cfg.s_e_step:                  # gamma block evaluated at out.phi
-            g = self._gamma_coupling_terms(token_ids[:1], out.phi.unsqueeze(0))
+            g = self._gamma_coupling_terms(token_ids[:1], out.phi.unsqueeze(0), s_belief=s_belief)
             d["gamma_coupling"]     = float(g["coupling"])           # raw sum_{h,i,j} gamma E^s
             d["gamma_meta_entropy"] = float(g["meta_entropy"])       # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
             d["total"] += cfg.lambda_gamma * (d["gamma_coupling"] + d["gamma_meta_entropy"])
