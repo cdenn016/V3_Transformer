@@ -352,8 +352,11 @@ def test_model_channel_bank_gating_and_umap_render(tmp_path):
     figs.set_publication_style()
     p = tmp_path / "s_umap.png"
     try:
-        fig = figs.plot_belief_umap(bk, "mu", decode=lambda l: str(int(l[0])), seed=0, path=str(p))
-        figs.plt.close(fig)
+        fig = figs.plot_belief_umap(bk, "mu", kind="Model", decode=lambda l: str(int(l[0])), seed=0, path=str(p))
     except (ImportError, OSError) as exc:                                   # umap native layer best-effort
         pytest.skip(f"umap-learn unavailable: {exc}")
+    # The s channel must title itself 'Model', not 'Belief' -- the q/s naming the report relies on
+    # (belief_umap_* vs model_umap_*) to keep the two channels' figures distinct.
+    assert fig.axes[0].get_title().startswith("Model mu")
+    figs.plt.close(fig)
     assert p.exists() and p.stat().st_size > 0

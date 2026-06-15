@@ -1239,6 +1239,7 @@ def plot_belief_umap(
     channel:          str = "mu",        # which belief channel to embed: 'mu' / 'sigma' / 'phi'
 
     *,
+    kind:             str              = "Belief",  # title noun: 'Belief' (q channel) / 'Model' (s channel)
     decode:           Optional[object] = None,   # decode(list[int]) -> str; None -> id labels
     n_clusters_label: int              = 14,     # annotate the N largest clusters
     seed:             int              = 0,
@@ -1333,7 +1334,7 @@ def plot_belief_umap(
     ax.set_xlim(xmin - 0.30 * rx, xmax + 0.30 * rx)             # room for the left / right label boxes
     ax.set_ylim(y_bot - 0.08 * ry, y_top + 0.08 * ry)
     ax.set_xticks([]); ax.set_yticks([])
-    title = (f"Belief {channel} — {len(cl)} data-driven clusters ({noise * 100:.0f}% noise); "
+    title = (f"{kind} {channel} — {len(cl)} data-driven clusters ({noise * 100:.0f}% noise); "
              f"labels = distinctive (lift) tokens")
     if decode is not None:
         try:
