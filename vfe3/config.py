@@ -782,6 +782,20 @@ class VFE3Config:
         # num_buckets=1 -> max_exact=0 -> division by zero in the log-bucketing (attention_prior).
         if not isinstance(self.t5_num_buckets, int) or self.t5_num_buckets < 2:
             raise ValueError(f"t5_num_buckets must be an int >= 2, got {self.t5_num_buckets!r}")
+        # The log-bucketing divides by log(max_distance / max_exact) with max_exact = num_buckets // 2
+        # (the non-bidirectional/causal half-range; bidirectional uses num_buckets // 4, a fortiori
+        # safe under this guard). max_distance == max_exact -> log(1) = 0 -> division by zero ->
+        # garbage .long() bucket index (IndexError into the bias table); max_distance < max_exact ->
+        # a NEGATIVE bucket index that silently reads the wrong end of the table. Require strict
+        # max_distance > num_buckets // 2 so every bucket index stays in [0, num_buckets) (defaults
+        # 128 > 16 are safe). Mirrors the num_buckets >= 2 guard above.
+        if self.t5_max_distance <= self.t5_num_buckets // 2:
+            raise ValueError(
+                f"t5_max_distance must be > t5_num_buckets // 2 (={self.t5_num_buckets // 2}) so the "
+                f"T5 log-bucketing denominator log(t5_max_distance / (t5_num_buckets // 2)) is "
+                f"positive; got t5_max_distance={self.t5_max_distance}, t5_num_buckets="
+                f"{self.t5_num_buckets}."
+            )
         for name in ("b0", "c0"):
             _v = getattr(self, name)
             if isinstance(_v, (list, tuple)):
@@ -896,6 +910,23 @@ class VFE3Config:
                     "s_e_step=True refines the model channel as a DIAGONAL Gaussian (the s/r tables "
                     f"are diagonal by construction), incompatible with family={self.family!r}. Use a "
                     "diagonal-covariance family (e.g. 'gaussian_diagonal') for the live s E-step."
+                )
+            # The s-refine (_refine_s) hardcodes family='gaussian_diagonal': the model channel is
+            # uniformly DiagonalGaussian by design. A non-Gaussian (but diagonal) belief family
+            # therefore still runs a GAUSSIAN s E-step while the belief runs its own family -- a
+            # well-posed mixed prior/posterior (no NaN), but the model channel is NOT refined in the
+            # belief's family. Warn (do not raise) so the double-opt-in (s_e_step + non-Gaussian
+            # family) is not silent; the pure path is family='gaussian_diagonal'.
+            elif self.family != "gaussian_diagonal":
+                import warnings
+                warnings.warn(
+                    f"s_e_step=True refines the model channel as a Gaussian (_refine_s hardcodes "
+                    f"family='gaussian_diagonal'), but family={self.family!r}: the s-channel E-step "
+                    f"runs Gaussian while the belief is {self.family!r}. This is a well-posed "
+                    f"mixed-family prior/posterior (no NaN), but the model channel is not refined in "
+                    f"the belief's family. Use family='gaussian_diagonal' to match, or accept the "
+                    f"mixed-family s-refine.",
+                    UserWarning, stacklevel=2,
                 )
             if self.lambda_h == 0.0 and self.lambda_gamma == 0.0:
                 import warnings
@@ -1164,6 +1195,25 @@ class VFE3Config:
                 f"use_prior_bank=True decodes at a FIXED alpha=1 KL, but the E-step minimizes under "
                 f"divergence_family={self.divergence_family!r}/renyi_order={self.renyi_order}: inference "
                 f"and the KL-to-prior readout use different divergences.",
+                UserWarning,
+                stacklevel=2,
+            )
+        # The use_prior_bank decode kernels hardcode the GAUSSIAN family (prior_bank.reference_decode /
+        # the fused kernels call get_family('gaussian_diagonal')/('gaussian_full'); they read neither
+        # `family` nor `divergence_family`). A non-Gaussian belief family runs a genuine non-Gaussian
+        # E-step but is then projected to logits through the WRONG (Gaussian) metric -- the converged
+        # belief is correct, only its readout uses the wrong divergence (argmax can flip). No
+        # Gaussian-only decode kernel for the other families exists, so warn (the pure readout paths
+        # are a Gaussian family, or use_prior_bank=False's linear decode which is family-agnostic).
+        if self.use_prior_bank and self.family not in ("gaussian_diagonal", "gaussian_full"):
+            import warnings
+            warnings.warn(
+                f"use_prior_bank=True decodes through a hardcoded GAUSSIAN KL readout, but "
+                f"family={self.family!r} is non-Gaussian: the E-step minimizes in the {self.family!r} "
+                f"geometry while the logits are read out under the Gaussian metric (the converged "
+                f"belief is correct; only its projection to logits uses the wrong divergence). Use a "
+                f"Gaussian family for the KL-to-prior decode, or use_prior_bank=False (the linear "
+                f"decode is family-agnostic).",
                 UserWarning,
                 stacklevel=2,
             )

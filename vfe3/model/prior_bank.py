@@ -10,8 +10,10 @@ replacing a linear output projection.
 Modularity:
     encode_mode registry -- ``per_token`` (table lookup, default); ``gauge_fixed`` a
         named stub (gauge orbit from a shared base belief).
-    decode_mode registry -- ``diagonal`` (fused closed form, default); ``full``
-        implemented and registered (the exact full-covariance Cholesky decode).
+    decode_mode registry -- ``diagonal`` (fused closed form, default); ``diagonal_chunked``
+        (fused decode+CE, inference delegates to ``diagonal``); ``full`` (exact full-covariance
+        Cholesky decode); ``full_chunked`` (full-cov KL via the diagonal-prior closed form); plus
+        the registered-but-config-excluded ``linear`` ablation kernel (reached via use_prior_bank=False).
 
 Covariance-structure seam (NOT divergence-agnostic): both ``reference_decode`` and the fused
 kernels score logits = -KL(q || pi_v)/tau_eff at a FIXED alpha=1 KL on a HARDCODED family --

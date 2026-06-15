@@ -2,7 +2,8 @@ r"""SPD-manifold retractions + Fisher natural-gradient preconditioner (VFE_3.0).
 
 The SPD retraction keeps Sigma on the SPD manifold under a tangent update; the
 Fisher preconditioner converts Euclidean (mu, sigma) gradients to natural
-gradients. The phi Lie-algebra retraction is a separate phase.
+gradients. The phi Lie-algebra retraction (retract_phi) lives here too, dispatching to the
+GL(K)/SO(N) retractions in lie_ops.py.
 """
 
 import math

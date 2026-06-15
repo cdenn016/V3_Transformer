@@ -1,0 +1,22 @@
+fix(audit): resolve 2026-06-14 ultra-deep punch list (7 mediums + CR-1)
+
+Family-keyed Fisher natural gradient -- the one finding with no existing pure
+path: new BeliefParams.natural_gradient hook; Gaussian families delegate to the
+pinned geometry kernel (byte-identical); DiagonalLaplace uses I_mu=I_b=1/b^2
+(b^2*grad on both coords, sympy-verified). Plus footgun warnings (Laplace decode
+under use_prior_bank, s_e_step+non-Gaussian family, t5_bias freeze under
+straight_through, t5_learnable_bias inert with no t5 channel), a T5 bucket config
+guard (t5_max_distance > t5_num_buckets//2), a _refine_s RoPE-omission doc note,
+and the full-cov sandwich oh.double() hoist (O(H) casts).
+
+New regression pins: tests/test_audit_fixes_2026_06_15.py (14). Targeted suites:
+393 passed, 0 failures/errors (incl. test_train end-to-end and the golden
+Gaussian/full-cov byte-identity pins). Adversarially reviewed via a 3-agent
+workflow: all fixes confirmed correct, no broken pure path. See
+docs/edits/2026-06-15-edits.md.
+
+Also sweeps in pre-existing scaling-experiment WIP already in the tree
+(ablation/train_vfe3/train/block/attention_prior/phi_preconditioner/retraction/
+prior_bank/make_figures + the 2026-06-14 edits doc) to leave a clean worktree.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

@@ -20,7 +20,7 @@ from vfe3.families.base import get_family
 from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
-from vfe3.geometry.retraction import get_retraction, natural_gradient, retract_phi
+from vfe3.geometry.retraction import get_retraction, retract_phi
 from vfe3.numerics import apply_mu_trust_region
 from vfe3.geometry.transport import (
     FactoredTransport,
@@ -452,7 +452,12 @@ def e_step_iteration(
         grad_record["mu"]    = grad_mu.detach().pow(2).sum().sqrt()
         grad_record["sigma"] = grad_sigma.detach().pow(2).sum().sqrt()
         grad_record["phi"]   = grad_mu.new_zeros(())
-    nat_mu, nat_sigma = natural_gradient(grad_mu, grad_sigma, belief.sigma, eps=eps)
+    # Fisher preconditioner is FAMILY-KEYED (add-by-registering): each BeliefParams owns its Fisher
+    # metric, so a non-Gaussian family (e.g. laplace_diagonal, I_mu=I_b=1/b^2) is descended in its
+    # own geometry instead of the hardcoded Gaussian Fisher. The Gaussian families delegate to the
+    # pinned geometry kernel (byte-identical); 'family' is the same key passed to belief_gradients.
+    nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
+        grad_mu, grad_sigma, eps=eps)
 
     # STRAIGHT-THROUGH (manuscript Algorithm 1, GL(K)_attention.tex:2050): detach the per-iteration
     # tangent so only the ADDITIVE chain stays live -- the belief is rebuilt as mu_prev + delta and

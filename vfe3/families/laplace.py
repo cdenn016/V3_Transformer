@@ -109,6 +109,30 @@ class DiagonalLaplace(BeliefParams):
         # H = sum_k log(2 b_k e) = sum_k [ log(2 b_k) + 1 ].
         return (torch.log(2.0 * self.sigma.clamp(min=1e-12)) + 1.0).sum(dim=-1)
 
+    def natural_gradient(
+        self,
+        grad_mu:    torch.Tensor,             # (..., K) Euclidean grad wrt mu (location)
+        grad_sigma: torch.Tensor,             # (..., K) Euclidean grad wrt the scale b
+
+        *,
+        eps:        float = 1e-6,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:   # (nat_mu, nat_b) = Fisher^{-1} grad
+        r"""Diagonal-Laplace Fisher preconditioner. The Laplace(mu, b) Fisher information is
+        DIAGONAL and EQUAL on both coordinates, ``I_mu = I_b = 1 / b^2`` (a location-scale family;
+        verified symbolically), so the natural gradient is ``b^2 * grad`` on BOTH the location and
+        the scale. This differs from the Gaussian preconditioner ``(sigma*grad_mu, 2 sigma^2
+        grad_sigma)``: routing the Laplace belief through the Gaussian Fisher mis-scales the mean by
+        a state-dependent ``1/b`` (a wrong direction on the product manifold, not a rescaled LR).
+        ``b^2 > 0`` strictly, so the step is sign-preserving and ``grad=0 -> step=0`` (every
+        stationary point of F preserved). ``eps`` floors ``b`` (the belief sigma floor, ``cfg.eps``)
+        exactly as the divergence does."""
+        orig_dtype = self.sigma.dtype
+        with torch.amp.autocast('cuda', enabled=False):
+            b2        = self.sigma.float().clamp(min=eps).square()      # (..., K) b^2 = I^{-1}
+            nat_mu    = b2 * grad_mu.float()
+            nat_sigma = b2 * grad_sigma.float()
+        return nat_mu.to(orig_dtype), nat_sigma.to(orig_dtype)
+
     def _renyi_terms(
         self,
         other:  "DiagonalLaplace",
