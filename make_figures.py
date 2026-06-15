@@ -7,8 +7,9 @@ to ``<run_dir>/figures/``. With ``run_dir=None`` the most recent run under ``RUN
 
 This is a SEPARATE, opt-in step from training: the figure runners are expensive (UMAP, E-step
 replay, holonomy sampling, a belief bank over many sequences), so they are not produced on the
-training hot path. The free-energy descent + trajectory figures are still written at training
-``finalize_run``; this driver adds the model-replay figures that were never wired up.
+training hot path. Training's ``finalize_run`` already auto-runs the full publication set (the
+free-energy/trajectory figures and these model-replay figures) unless ``cfg.generate_figures=False``;
+this driver re-runs that same model-replay set on demand for an already-trained run.
 """
 
 import os

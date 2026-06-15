@@ -66,13 +66,13 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 2,
+    embed_dim                 = 10,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 1,
     
     max_seq_len               = 128,                 # N, context length
     
     batch_size                = 64,
-    max_steps                 = 150000,
+    max_steps                 = 45000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -87,7 +87,7 @@ config = dict(
     divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
     renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" (single covariance toggle; diagonal_covariance is derived)
     
     #################################
     #        Initialization
@@ -101,19 +101,13 @@ config = dict(
     #        Encode/Decode          #
     #################################
     decode_bias               = True,     # only if use_prior_bank = False
-    use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer            = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
     
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
     decode_tau                = 0.1,
-    decode_mode               = "diagonal_chunked",  # "diagonal" | "diagonal_chunked" | "full"; chunked = fused streaming
-                                                     # CE on the training path, never materializes (B,N,V) logits -- works
-                                                     # for BOTH use_prior_bank paths (vram audit 2026-06-11), saves ~2x
-                                                     # B*N*V fp32 retained for backward at identical loss/grads
-    decode_chunk_size         = 8192,                # vocab-chunk width for decode_mode="diagonal_chunked" (ignored otherwise)
-    encode_mode               = "per_token",         # "per_token" | "gauge_fixed" (gauge_fixed: live-rejected stub)
-
+    
  
     #################################
     #          Gauge Group
@@ -122,7 +116,7 @@ config = dict(
     
     m_phi_natural_grad        = False,        # natural gradient on phi m-step
     
-    phi_precond_mode          = "killing_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback"
+    phi_precond_mode          = "killing_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
@@ -174,7 +168,7 @@ config = dict(
     
     rope_base                 = 100.0,               # rotary frequency base
     rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
-   
+    rope_on_value             = True,
     
     ######################################
     #                Self Energy:  
@@ -214,10 +208,10 @@ config = dict(
     kappa_beta                = 1,        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
     kappa_gamma               = 1,        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
         
-    beta_attention_prior      = "causal_alibi",  # "uniform" | "causal" | "causal_alibi" | "causal_windowed
-    gamma_attention_prior     = "causal",        # model-channel prior pi^s_ij: # "t5_relative_bias" | "windowed"
+    beta_attention_prior      = "causal",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+    gamma_attention_prior     = "causal",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
-    
+    t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
     #################################
     #         Belief E-step 
     #         Learning Rates

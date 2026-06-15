@@ -4,7 +4,7 @@ Two parameterizations of the flat (Regime I) transport:
   phi (exp):    Omega_ij = exp(phi_i . G) exp(-phi_j . G) in GL+(K) (det>0).
   omega_direct: Omega_ij = Omega_i Omega_j^{-1} for general GL(K) (det may be <0).
 Belief action: mu -> Omega @ mu, Sigma -> Omega @ Sigma @ Omega^T (sandwich;
-diagonal approximation for speed). Regime II and retractions are separate modules;
+diagonal-covariance fast path plus an exact full-covariance congruence). Regime II and retractions are separate modules;
 gauge-RoPE folds a positional rotation into the transport via :class:`RopeTransport`.
 """
 
@@ -665,15 +665,18 @@ def _factored_full_covariance(
         ep = factored.exp_phi[..., start:end, start:end]               # (..., N, d, d) exp(phi_i)^(h)
         en = factored.exp_neg_phi[..., start:end, start:end]           # (..., N, d, d) exp(-phi_j)^(h)
         omega_h = torch.einsum("...ikl,...jlm->...ijkm", ep, en)       # (..., N, N, d, d)
-        blocks.append((start, end, omega_h))
+        blocks.append((start, end, omega_h.double()))                  # float64 island (M4); cast ONCE per head
         start = end
 
     # (h, h') output block = Omega^(h)_ij Sigma_j^(h,h') (Omega^(h')_ij)^T, in a float64 island (the
-    # congruence squares cond(Omega); audit M4) at the block scale, then cast back.
+    # congruence squares cond(Omega); audit M4) at the block scale, then cast back. The per-head
+    # operators are pre-cast to float64 above (H casts) rather than re-cast inside this H x H loop
+    # (which would be O(H^2) redundant casts of the same oh/oh2); only the distinct per-pair sigma
+    # block is cast here.
     for s1, e1, oh in blocks:
         for s2, e2, oh2 in blocks:
             sig_blk = sigma[..., s1:e1, s2:e2]                          # (..., N, d1, d2) key-side block
             res = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
-                               oh.double(), sig_blk.double(), oh2.double())
+                               oh, sig_blk.double(), oh2)
             out[..., s1:e1, s2:e2] = res.to(sigma.dtype)
     return out

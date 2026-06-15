@@ -2,14 +2,16 @@ r"""Gauge-frame (phi) gradient preconditioner for VFE_3.0 (Gaussian-specialized)
 
 Conditions a Euclidean gradient grad_phi (coordinates in a generator basis) before
 the Lie-algebra retraction. A config-selected registry of metrics:
-  none              identity (the canonical update: no metric correction; the
-                    gradient lives in the Lie algebra g, a vector space).
-  clip              norm-clip baseline grad * min(1, c / ||grad||).
-  killing           Cartan-involution metric g~ = 2K*gram - 2*tr(x)tr(.), center-
-                    regularized then inverted (natural gradient grad @ g~^{-1}).
-  killing_per_block block-diagonal Killing metric (per irrep block).
-  pullback          position-dependent natural gradient via the differential of
-                    the exponential map: G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F.
+  none               identity (the canonical update: no metric correction; the
+                     gradient lives in the Lie algebra g, a vector space).
+  clip               norm-clip baseline grad * min(1, c / ||grad||).
+  killing            Cartan-involution metric g~ = 2K*gram - 2*tr(x)tr(.), center-
+                     regularized then inverted (natural gradient grad @ g~^{-1}).
+  killing_per_block  block-diagonal Killing metric (per irrep block).
+  pullback           position-dependent natural gradient via the differential of
+                     the exponential map: G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F.
+  pullback_per_block per-irrep-block pullback metric (each block's local d_h-dim rep;
+                     feasible at K > max_k where the full pullback raises).
 Coordinates in, coordinates out (..., n_gen) -- same units as retract_phi's
 delta_phi, so the E-step is grad -> precondition -> retract. Pure: takes a
 generator TENSOR, not a GaugeGroup.

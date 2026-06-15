@@ -1,6 +1,9 @@
 r"""Training (M-step) for VFE_3.0: AdamW per-group learning rates + warmup/cosine.
 
-The model has no neural layers; the only parameters are the PriorBank prior tables.
+The model has no neural layers (no nn.Linear/MLP/activation). The trainable parameters are the
+PriorBank prior tables plus the model-owned tables their toggles create -- the default
+``pos_phi='learned'`` positional table, and the default-OFF exceptions (head mixer, regime_ii
+connection, learnable alpha/lambda/T5 bias, linear decode).
 ``loss.backward()`` flows through the unrolled E-step to those tables; AdamW updates
 them. The M-step minimizes the cross-entropy of the decode boundary over the prior
 tables, with the E-step (the differentiable filtering kernel) unrolled into the graph,
@@ -898,7 +901,7 @@ def _banner(
     n_steps:     int,
     train_loader: object = None,
 ) -> str:
-    r"""Compact VFE_2.0-style init banner (no FLOPs counter, no lambda_h: V3 has neither)."""
+    r"""Compact VFE_2.0-style init banner (no FLOPs counter; lambda_h is omitted from the printed lines)."""
     n_params = sum(p.numel() for p in model.parameters())
     bar = "=" * 64
     cov = coverage_lines(train_loader, n_steps, dataset) if train_loader is not None else []
