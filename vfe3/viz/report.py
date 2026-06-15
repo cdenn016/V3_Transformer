@@ -257,8 +257,8 @@ def generate_figures(
                       title=f"Model-coupling attention - head {hi}", path=p),
                   True)
     for ch in ("mu", "sigma"):                                    # model-channel s UMAP (no phi: shares belief gauge)
-        _emit(f"belief_umap_s_{ch}",
-              lambda p, ch=ch: figs.plot_belief_umap(mc_bank, ch, decode=decode, path=p),
+        _emit(f"model_umap_{ch}",
+              lambda p, ch=ch: figs.plot_belief_umap(mc_bank, ch, kind="Model", decode=decode, path=p),
               mc_bank is not None)
 
     logger.info("wrote %d single-run figures to %s", len(written), figdir)
