@@ -187,6 +187,21 @@ class DiagonalGaussian(BeliefParams):
             per_coord = torch.where(raw_blend > 0.0, per_coord, per_coord.new_tensor(float("nan")))
         return safe_kl_clamp(per_coord, kl_max=kl_max)
 
+    def natural_gradient(
+        self,
+        grad_mu:    torch.Tensor,             # (..., K) Euclidean grad wrt mu
+        grad_sigma: torch.Tensor,             # (..., K) Euclidean grad wrt the variance sigma
+
+        *,
+        eps:        float = 1e-6,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Diagonal-Gaussian Fisher preconditioner ``(sigma*grad_mu, 2 sigma^2 grad_sigma)``.
+        Delegates to the pinned geometry kernel so the live numerics stay byte-identical to the
+        golden-tested ``retraction.natural_gradient`` (local import avoids a families<-geometry
+        import edge)."""
+        from vfe3.geometry.retraction import natural_gradient as _gaussian_natural_gradient
+        return _gaussian_natural_gradient(grad_mu, grad_sigma, self.sigma, eps=eps)
+
 
 @register_family("gaussian_full")
 class FullGaussian(BeliefParams):
@@ -247,6 +262,21 @@ class FullGaussian(BeliefParams):
         K = self.mu.shape[-1]
         L, _ = safe_cholesky(self.sigma, rounds=5)     # jittered, never raises on a non-PD Sigma
         return 0.5 * _logdet_chol(L) + 0.5 * K * math.log(2.0 * math.pi * math.e)
+
+    def natural_gradient(
+        self,
+        grad_mu:    torch.Tensor,             # (..., K) Euclidean grad wrt mu
+        grad_sigma: torch.Tensor,             # (..., K, K) Euclidean grad wrt the covariance
+
+        *,
+        eps:        float = 1e-6,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Full-Gaussian Fisher preconditioner ``(Sigma grad_mu, 2 Sigma grad_sigma Sigma)``
+        (symmetrized). Delegates to the pinned geometry kernel, which selects the full-covariance
+        branch by rank (``sigma.dim() == grad_mu.dim() + 1``), so the numerics stay byte-identical
+        to the golden-tested ``retraction.natural_gradient``."""
+        from vfe3.geometry.retraction import natural_gradient as _gaussian_natural_gradient
+        return _gaussian_natural_gradient(grad_mu, grad_sigma, self.sigma, eps=eps)
 
     def renyi_closed_form(
         self,

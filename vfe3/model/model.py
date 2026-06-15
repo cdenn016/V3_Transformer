@@ -1,6 +1,9 @@
 r"""The full VFE_3.0 model: encode -> E-step inference -> decode -> cross-entropy.
 
-No neural layers: the only parameters are the PriorBank's prior tables. The E-step
+No neural layers (no nn.Linear/MLP/activation): on the pure default path the parameters are the
+PriorBank's prior tables, plus the model-owned learned tables their toggles create -- the default
+pos_phi='learned' positional table, and the default-OFF head mixer, CG coupling, regime_ii
+connection, and learnable alpha/lambda/T5-bias scalars. The E-step
 is unrolled into the training graph (the differentiable filtering kernel), so the CE
 loss backpropagates through inference to the encode/phi priors. Batching loops over
 the batch around the (unbatched) E-step; decode and CE are batched.
@@ -327,20 +330,36 @@ class VFEModel(nn.Module):
         # pure path stays param-free (the fixed-table default still runs).
         if cfg.t5_learnable_bias and "t5_relative_bias" in (cfg.beta_attention_prior, cfg.gamma_attention_prior):
             self.t5_bias = nn.Parameter(-torch.log1p(torch.arange(cfg.t5_num_buckets, dtype=torch.float32)))
-            if cfg.effective_e_step_gradient == "detach":
-                # Footgun (mirrors log_alpha / connection_W / pos_phi_free): the attention log-prior is
-                # consumed INSIDE vfe_stack (the E-step), which the 'detach' estimator wraps in no_grad
-                # (model.forward's `run`), so t5_bias would receive NO gradient and stay frozen at its
-                # fixed-table init. Use an 'unroll' (default) or 'straight_through' E-step to train it.
+            if cfg.effective_e_step_gradient in ("detach", "straight_through"):
+                # Footgun (mirrors log_alpha / connection_W / pos_phi_free, warned at config.py:1267):
+                # the attention log-prior is consumed INSIDE the E-step, and BOTH severing estimators
+                # cut t5_bias's only gradient path -- 'detach' wraps the whole E-step in no_grad, and
+                # 'straight_through' detaches the per-iteration belief tangent (e_step.py), the sole
+                # carrier of the attention-prior signal into the belief. Either way t5_bias.grad is
+                # None and the bias stays frozen at its fixed-table init; only the 'unroll' (default)
+                # E-step trains it.
                 import warnings
                 warnings.warn(
-                    "t5_learnable_bias=True with the effective E-step estimator 'detach' freezes "
-                    "t5_bias: the T5 relative-position bias enters the loss only through the attention "
-                    "log-prior consumed inside the no_grad-wrapped E-step, so t5_bias.grad is None and "
-                    "the bias stays at its fixed-table init. Use an 'unroll' E-step "
-                    "(detach_e_step=False, e_step_gradient='unroll') to train it.",
+                    f"t5_learnable_bias=True with the effective E-step estimator "
+                    f"{cfg.effective_e_step_gradient!r} freezes t5_bias: the T5 relative-position bias "
+                    f"enters the loss only through the attention log-prior consumed inside the E-step, "
+                    f"whose gradient both 'detach' (no_grad) and 'straight_through' (detached tangent) "
+                    f"sever, so t5_bias.grad is None and the bias stays at its fixed-table init. Use an "
+                    f"'unroll' E-step (detach_e_step=False, e_step_gradient='unroll') to train it.",
                     stacklevel=2,
                 )
+        elif cfg.t5_learnable_bias:
+            # t5_learnable_bias=True but no 't5_relative_bias' channel is active (neither beta nor
+            # gamma attention prior is 't5_relative_bias'): no t5_bias parameter is created and the
+            # toggle is silently inert. Warn so the dead toggle is not mistaken for a trained bias.
+            import warnings
+            warnings.warn(
+                "t5_learnable_bias=True but no 't5_relative_bias' attention channel is active "
+                "(beta_attention_prior / gamma_attention_prior): no learnable t5_bias is created and "
+                "the toggle is inert. Set beta_attention_prior or gamma_attention_prior to "
+                "'t5_relative_bias' to use the learnable bias.",
+                UserWarning, stacklevel=2,
+            )
 
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":
         r"""Carry the gauge group's generators through ``.to(...)`` / ``.cuda()`` etc.
@@ -536,7 +555,12 @@ class VFEModel(nn.Module):
             # regime_ii -- the learned edge connection is a belief-channel object (delta reads the
             # belief means, not s), and the s E-step runs with phi held fixed. Thread
             # cfg.transport_mode + connection_W here if the s-channel is ever meant to share the
-            # learned connection.
+            # learned connection. RoPE is LIKEWISE not forwarded (no rope/rope_on_cov/rope_on_value):
+            # the s-channel E-step is position-coupled only through gamma attention, never
+            # RoPE-transported, even when the belief channel runs pos_rotation='rope' (the belief
+            # E-step gets rope at model.forward; both s_e_step and rope default OFF, so this is an
+            # inconsistency only under the double opt-in). Thread the rope args here if the model
+            # channel is ever meant to be RoPE-transported too.
             transport_mode="flat",
             e_step_gradient=e_step_gradient,
             oracle_unroll_grad=cfg.oracle_unroll_grad,

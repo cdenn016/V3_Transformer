@@ -249,9 +249,10 @@ def prior_t5_relative_bias(
     head-axis item; this returns the per-bucket 2D bias the current registry contract carries.
 
     CACHE CAVEAT: the model caches the prior on ``(name, n, device, dtype)`` (``model._attention_log_prior``).
-    The default (``bias_values=None``) bias is constant, so the cache is correct. If a LEARNABLE
-    ``bias_values`` is ever threaded through the model, that cache must be bypassed/invalidated per step,
-    or it will serve a stale table as the parameter trains."""
+    The default (``bias_values=None``) bias is constant, so the cache is correct. The learnable
+    ``bias_values`` path (the ``t5_learnable_bias`` toggle) is threaded through the model, and
+    ``_attention_log_prior`` BYPASSES the cache on that path (rebuilds each call) so the live
+    parameter is never served stale as it trains."""
     i = torch.arange(n_query, device=device).unsqueeze(-1)
     j = torch.arange(n_key, device=device).unsqueeze(0)
     bucket = _t5_relative_position_bucket(
