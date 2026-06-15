@@ -66,8 +66,8 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 10,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 1,
+    embed_dim                 = 60,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 6,
     
     max_seq_len               = 128,                 # N, context length
     
