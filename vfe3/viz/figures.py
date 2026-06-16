@@ -18,6 +18,7 @@ matplotlib.use("Agg")                                            # non-interacti
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LogNorm
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 # Wong colourblind-safe qualitative palette (used module-wide, incl. the trajectory defaults).
 _CB = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000"]
@@ -315,6 +316,23 @@ def _rolling_mean(v: np.ndarray, window: int) -> np.ndarray:
     return num / den
 
 
+def _kstep(v, _pos=None) -> str:
+    r"""Compact training-step tick label: 5000 -> '5k', 12500 -> '12.5k' (5-digit step labels
+    overrun into an unreadable smear at the trajectory figure width otherwise)."""
+    v = float(v)
+    if abs(v) >= 1000.0:
+        s = v / 1000.0
+        return f"{s:.0f}k" if abs(s - round(s)) < 1e-9 else f"{s:.1f}k"
+    return f"{v:.0f}"
+
+
+def _step_xaxis(ax) -> None:
+    r"""Uncrowded training-step x-axis: at most ~6 integer ticks rendered via :func:`_kstep`.
+    Applied to every step-indexed trajectory so the default ~9 five-digit labels stop colliding."""
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=6, integer=True))
+    ax.xaxis.set_major_formatter(FuncFormatter(_kstep))
+
+
 def plot_trajectory(
     values,                              # (T,) a scalar series (loss / free energy / diagnostic)
     steps          = None,               # (T,) x-coordinates (real training step); None -> sample index
@@ -363,15 +381,20 @@ def plot_trajectory(
         idx = int(np.argmin(v) if annotate == "min" else np.argmax(v))
         tag = "best" if annotate == "min" else "max"
         ax.scatter([x[idx]], [v[idx]], s=28, color="black", zorder=5)
+        # Offset the callout INTO the plot, away from the edge the extremum sits against: a 'min'
+        # hugs the floor -> label upward, a 'max' hugs the ceiling -> label downward, so the text
+        # never overruns the title (the grad_norm.png 'max'-into-title collision).
+        dy, va = (30, "bottom") if annotate == "min" else (-30, "top")
         ax.annotate(f"{tag} {v[idx]:.1f}\n@ step {int(x[idx]):,}",
-                    xy=(x[idx], v[idx]), xytext=(-12, 30), textcoords="offset points",
-                    fontsize=7.5, ha="right",
+                    xy=(x[idx], v[idx]), xytext=(-12, dy), textcoords="offset points",
+                    fontsize=7.5, ha="right", va=va,
                     arrowprops=dict(arrowstyle="->", lw=0.8, color="black"))
     if annotate_final and v.size:
         ax.annotate(f"{v[-1]:.4g}", xy=(x[-1], v[-1]), xytext=(6, 0), textcoords="offset points",
                     va="center", fontsize=8, fontweight="bold", color=color)
     if steps is not None and v.size:
         ax.set_xlim(float(np.min(x)), float(np.max(x)))
+        _step_xaxis(ax)
     ax.set(title=title, xlabel="training step", ylabel=ylabel)
     fig.tight_layout()
     return _save(fig, path)
@@ -586,21 +609,21 @@ def plot_free_energy_codescent(
     w = max(5, total.size // 80)
     fig, ax = plt.subplots(figsize=(6.6, 3.9))
     ax.plot(step, total, lw=0.7, color=_CB[0], alpha=0.25)
-    ln1, = ax.plot(step, _rolling_mean(total, w), lw=2.0, color=_CB[0], label="F total (left)")
+    # Final values fold into the legend labels; standalone right-edge annotations otherwise land on top
+    # of the opposite (twin) axis tick labels -- the left-axis F tag overlaps the right CE ticks.
+    flab = f"F total (left) = {total[-1]:.1f}" if step.size else "F total (left)"
+    ln1, = ax.plot(step, _rolling_mean(total, w), lw=2.0, color=_CB[0], label=flab)
     ax.set(xlabel="training step", ylabel="free energy F (nats/token)")
     ax.yaxis.label.set_color(_CB[0]); ax.tick_params(axis="y", colors=_CB[0])
     if step.size:
         ax.set_xlim(float(step.min()), float(step.max()))
-        ax.annotate(f"{total[-1]:.1f}", xy=(step[-1], total[-1]), xytext=(6, 0),
-                    textcoords="offset points", va="center", fontsize=8, fontweight="bold", color=_CB[0])
+        _step_xaxis(ax)
     ax2 = ax.twinx()
     ax2.spines["right"].set_visible(True)                         # set_publication_style hides it by default
     ax2.plot(step, ce, lw=0.7, color=_CB[1], alpha=0.25)
-    ln2, = ax2.plot(step, _rolling_mean(ce, w), lw=2.0, color=_CB[1], ls="--", label="val CE (right)")
+    clab = f"val CE (right) = {ce[-1]:.2f}" if step.size else "val CE (right)"
+    ln2, = ax2.plot(step, _rolling_mean(ce, w), lw=2.0, color=_CB[1], ls="--", label=clab)
     ax2.set_ylabel("validation CE (nats/token)", color=_CB[1]); ax2.tick_params(axis="y", colors=_CB[1])
-    if step.size:
-        ax2.annotate(f"{ce[-1]:.2f}", xy=(step[-1], ce[-1]), xytext=(6, 0),
-                     textcoords="offset points", va="center", fontsize=8, fontweight="bold", color=_CB[1])
     if total.size > 2:
         r = float(np.corrcoef(total, ce)[0, 1])
         ax.set_title(rf"Free-energy / data-term co-descent (Pearson $r={r:+.2f}$)")
@@ -709,14 +732,15 @@ def plot_model_channel_terms(
             continue
         plotted = True
         ax.plot(x, vv, lw=0.7, color=color, alpha=0.25)
-        ax.plot(x, _rolling_mean(vv, w), lw=2.0, color=color, label=label)
-        ax.annotate(f"{vv[-1]:.3g}", xy=(x[-1], vv[-1]), xytext=(6, 0), textcoords="offset points",
-                    va="center", fontsize=8, fontweight="bold", color=color)
+        # final value folded into the legend label (a separate right-edge tag collides with the
+        # upper-right legend; the legend is the single, collision-free home for the value).
+        ax.plot(x, _rolling_mean(vv, w), lw=2.0, color=color, label=f"{label}  ={vv[-1]:.3g}")
     if plotted:
         ax.set_yscale("symlog", linthresh=1e-4)                   # non-negative blocks, near-zero at init
         if step.size:
             ax.set_xlim(float(step.min()), float(step.max()))
-        ax.legend(fontsize=8, frameon=False, loc="upper right")
+            _step_xaxis(ax)
+        ax.legend(fontsize=8, frameon=False, loc="best")
     ax.set(xlabel="training step", ylabel="model-channel F block (nats/token)",
            title="Model-channel free-energy blocks (raw)")
     fig.tight_layout()
@@ -725,22 +749,26 @@ def plot_model_channel_terms(
 
 def _grad_norm_decomp_fig(
     history: Dict,
-    spec:    list,                       # [(column_key, latex_label, color), ...]
-    title:   str,
+    spec:    list,                       # [(column_key, latex_label, color, role_name), ...]
+    title:   str,                        # base title; a "(role / role)" suffix is appended from the
+    #                                      components ACTUALLY plotted, so it never promises a role the
+    #                                      figure does not show (e.g. phi when e_phi_lr=0)
     ylabel:  str,
     path:    Optional[str],
 ):
     r"""Shared body for the mu / sigma / phi gradient-norm decomposition figures (M-step and E-step).
 
     Each series is a faint raw line under a rolling-mean trend on a log y (norms are strictly positive
-    and span orders of magnitude), with the final value tagged. A component that is identically zero /
-    absent (a dead or off substep) drops out under the log-y positive mask rather than flatlining at 0.
+    and span orders of magnitude), with its final value folded into the legend label (a separate
+    right-edge tag collides with the upper-right legend). A component that is identically zero / absent
+    (a dead or off substep) drops out under the log-y positive mask rather than flatlining at 0, and its
+    role is omitted from the title suffix.
     """
     step = _np(history["step"]).astype(float)
     fig, ax = plt.subplots(figsize=(6.8, 4.0))
     w = max(5, step.size // 80)
-    plotted = False
-    for key, label, color in spec:
+    roles = []
+    for key, label, color, role in spec:
         if key not in history:
             continue
         v = _np(history[key]).astype(float)
@@ -748,16 +776,16 @@ def _grad_norm_decomp_fig(
         x, vv = step[keep], v[keep]
         if not vv.size:
             continue
-        plotted = True
+        roles.append(role)
         ax.plot(x, vv, lw=0.7, color=color, alpha=0.25)
-        ax.plot(x, _rolling_mean(vv, w), lw=2.0, color=color, label=label)
-        ax.annotate(f"{vv[-1]:.3g}", xy=(x[-1], vv[-1]), xytext=(6, 0), textcoords="offset points",
-                    va="center", fontsize=8, fontweight="bold", color=color)
-    if plotted:
+        ax.plot(x, _rolling_mean(vv, w), lw=2.0, color=color, label=f"{label}  ={vv[-1]:.3g}")
+    if roles:
         ax.set_yscale("log")
         if step.size:
             ax.set_xlim(float(step.min()), float(step.max()))
-        ax.legend(fontsize=8, frameon=False, loc="upper right")
+            _step_xaxis(ax)
+        ax.legend(fontsize=8, frameon=False, loc="best")
+        title = f"{title} ({' / '.join(roles)})"
     ax.set(xlabel="training step", ylabel=ylabel, title=title)
     fig.tight_layout()
     return _save(fig, path)
@@ -781,12 +809,12 @@ def plot_grad_norm_decomposition(
     inference analogue is estep_grad_norm_decomposition.
     """
     spec = [
-        ("grad_norm_mu",    r"$\|\nabla_\mu \mathcal{L}\|_2$",    _CB[0]),
-        ("grad_norm_sigma", r"$\|\nabla_\Sigma \mathcal{L}\|_2$", _CB[1]),
-        ("grad_norm_phi",   r"$\|\nabla_\phi \mathcal{L}\|_2$",   _CB[2]),
+        ("grad_norm_mu",    r"$\|\nabla_\mu \mathcal{L}\|_2$",    _CB[0], "mu"),
+        ("grad_norm_sigma", r"$\|\nabla_\Sigma \mathcal{L}\|_2$", _CB[1], "sigma"),
+        ("grad_norm_phi",   r"$\|\nabla_\phi \mathcal{L}\|_2$",   _CB[2], "phi"),
     ]
     return _grad_norm_decomp_fig(
-        history, spec, "M-step gradient norm decomposition (mu / sigma / phi)",
+        history, spec, "M-step gradient norm decomposition",
         r"pre-clip $\|\nabla_\theta \mathcal{L}\|_2$ (per role)", path)
 
 
@@ -808,12 +836,12 @@ def plot_estep_grad_norm_decomposition(
     (e.g. phi when e_phi_lr=0).
     """
     spec = [
-        ("estep_grad_norm_mu",    r"$\|\nabla_\mu F\|_2$",    _CB[0]),
-        ("estep_grad_norm_sigma", r"$\|\nabla_\Sigma F\|_2$", _CB[1]),
-        ("estep_grad_norm_phi",   r"$\|\nabla_\phi F\|_2$",   _CB[2]),
+        ("estep_grad_norm_mu",    r"$\|\nabla_\mu F\|_2$",    _CB[0], "mu"),
+        ("estep_grad_norm_sigma", r"$\|\nabla_\Sigma F\|_2$", _CB[1], "sigma"),
+        ("estep_grad_norm_phi",   r"$\|\nabla_\phi F\|_2$",   _CB[2], "phi"),
     ]
     return _grad_norm_decomp_fig(
-        history, spec, "E-step gradient norm decomposition (mu / sigma / phi)",
+        history, spec, "E-step gradient norm decomposition",
         r"E-step $\|\nabla F\|_2$ (per component)", path)
 
 

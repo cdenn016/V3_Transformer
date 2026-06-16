@@ -213,9 +213,11 @@ class VFE3Config:
     # population centroid -- meaningful ONLY when s carries an independent data force
     # (prior_source='model_channel' routes the CE gradient into s). With s unanchored the only force on
     # s/r is lambda_h*KL(s||r), whose joint optimum is s_i=r=const (KL->0, the regularizer vanishes);
-    # __post_init__ warns for that regime. The manuscript-pure token-dependent top-down
-    # r_i=Omega_tilde[s^(s+1)] needs the scale-(s+1) meta-agent (not built); learnable_r is the
-    # same-scale empirical-Bayes stand-in.
+    # __post_init__ warns for that regime. The token-dependent top-down r_i=Omega_tilde[s^(s+1)]
+    # (PIFB eq:cross_scale_shadow) needs a GENUINELY EMERGED scale-(s+1) meta-agent and is OUT OF SCOPE for
+    # this single-scale transformer (PIFB lines 554/636 treat single-scale r_i as a PRIMITIVE boundary;
+    # line 2334 assigns the full transport to MAgent_Model) -- NOT a deferred gap. learnable_r is the
+    # same-scale empirical-Bayes stand-in (frozen-vs-learned axis; still token-uniform).
     learnable_r:               bool  = False
 
     # How the un-frozen centroid r is updated (only consulted when learnable_r=True; ignored when r

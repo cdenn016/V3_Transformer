@@ -791,19 +791,31 @@ class VFEModel(nn.Module):
                 coupling = coupling.sum(dim=-1)                # sum_k alpha^(k) D^(k) -> per-token
             sc = coupling.mean()                               # mean over batch and tokens (B, N)
             loss = loss + cfg.mstep_self_coupling_weight * sc
-        # TODO(B): r is frozen by default (learnable_r=False). learnable_r=True + r_update_mode=
-        # 'gradient' trains it as an empirical-Bayes centroid; on the scored s_e_step=False path grad
-        # flows through THIS KL(s||r) term, but under s_e_step=True that term is gated off (see the
-        # TRANSPARENCY note just below) and r instead trains through the unrolled _refine_s E-step,
-        # where it inherits the straight_through/detach/oracle-truncation freeze footguns (config
-        # __post_init__ warns). The empirical-Bayes reading is non-degenerate only when s is
-        # data-anchored (prior_source='model_channel' or s_e_step); else KL(s||r) collapses s->r. The
-        # global r is a stand-in along TWO axes: frozen-vs-learned (this toggle) AND token-UNIFORM
-        # (one (K,) tensor broadcast over all tokens) vs the manuscript-pure token-dependent
-        # CROSS-SCALE shadow r_i=Omega_tilde[s^(s+1)] -- the model-fiber transport of a scale-(s+1)
-        # meta-agent (Participatory_it_from_bit.tex eq:cross_scale_shadow / eq:topdown_priors). The
-        # frozen global r IS the manuscript's sanctioned s_max boundary condition; the token-dependent
-        # r_i still awaits the scale-(s+1) meta-agent (not built).
+        # DESIGN NOTE (cross-scale boundary, audit 2026-06-15): r is frozen by default (learnable_r=False).
+        # learnable_r=True + r_update_mode='gradient' trains it as an empirical-Bayes centroid; on the scored
+        # s_e_step=False path grad flows through THIS KL(s||r) term, but under s_e_step=True that term is
+        # gated off (see the TRANSPARENCY note just below) and r instead trains through the unrolled _refine_s
+        # E-step, where it inherits the straight_through/detach/oracle-truncation freeze footguns (config
+        # __post_init__ warns). The empirical-Bayes reading is non-degenerate only when s is data-anchored
+        # (prior_source='model_channel' or s_e_step); else KL(s||r) collapses s->r. The global r is a
+        # stand-in along TWO axes: frozen-vs-learned (this toggle) AND token-UNIFORM (one (K,) tensor
+        # broadcast over all tokens) vs a token-dependent r_i. NEITHER axis is an unfilled gap. The
+        # manuscript's true token-dependent hyper-prior is the CROSS-SCALE shadow r_i=Omega_tilde[s^(s+1)]
+        # (Participatory_it_from_bit.tex eq:cross_scale_shadow / eq:topdown_priors, line 2300): the
+        # model-fiber transport of a GENUINELY EMERGED scale-(s+1) meta-agent (licensed by the
+        # free-energy-improvement test, PIFB line 2164). No such meta-agent exists in this single-scale
+        # transformer; the manuscript treats single-scale p_i,r_i as PRIMITIVE boundary conditions (PIFB
+        # lines 554, 636) and assigns the full Omega_{i,I} transport + Ouroboros tower to a SEPARATE codebase
+        # (MAgent_Model/gauge_agent/, PIFB line 2334, which disclaims the transformer's cross-layer handoff
+        # as "not the implementation of the present subsection"). So the frozen global r IS the sanctioned
+        # s_max boundary -- the NAMED special case of the self-referential closure
+        # r_i^(top)=sum_j w_j Omega_tilde_ij[s_j] "held at its initial value rather than recomputed from the
+        # active hierarchy" (PIFB line 2332) -- NOT a placeholder awaiting a missing feature. A within-vfe3
+        # token-dependent r_i is buildable ONLY as that self-referential-closure special case (an
+        # interpretive single-scale stand-in, NOT eq:cross_scale_shadow); even then its gauge payoff is
+        # latent (no independent model-fiber frame phi_tilde: Omega_tilde reads the belief frame out.phi, so
+        # transporting r against it is a rho_model != rho_state category error) and transport does not cure
+        # the s->r collapse (orthogonal; only data-anchoring does). Out of scope by design, not deferred.
         # TRANSPARENCY (audit 2026-06-13 L17/L18): both s-channel blocks below are gated on
         # `not s_e_step`. Under s_e_step=True the SAME hyper-prior/gamma objective is realized as the
         # E-step descent direction that refines s (in _refine_s), so scoring it here too would
