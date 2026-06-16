@@ -601,21 +601,32 @@ class VFE3Config:
                 f"use_cg_coupling requires an irrep-labeled tower group ('so_n'/'sp_n'); got "
                 f"gauge_group={self.gauge_group!r}"
             )
-        # Mirror of the use_cg_coupling guard for the mixer (audit 2026-06-09 overnight PP1):
-        # a single-block group has nothing to mix, and HeadMixer would reject it anyway at
-        # VFEModel construction -- fail at CONFIG validation like every other toggle pairing.
-        # block_glk/tied_block_glk mix the n_heads >= 2 head blocks; so_n/sp_n mix per
-        # isotypic component (their block counts were validated above).
-        if self.use_head_mixer and (
-            self.gauge_group in ("glk", "so_k", "sp")
-            or (self.gauge_group in ("block_glk", "tied_block_glk") and self.n_heads < 2)
-        ):
+        # The head mixer needs >= 2 gauge blocks to mix (audit 2026-06-09 overnight PP1). Two
+        # single-block cases, handled differently:
+        #   (1) A head-block group (block_glk/tied_block_glk) with n_heads < 2 is a single-HEAD
+        #       artifact of a head/K sweep -- one block, nothing to mix. AUTO-DISABLE the mixer and
+        #       warn (rather than raise) so use_head_mixer=True can stay set across a sweep without a
+        #       manual toggle-off at n_heads=1.
+        #   (2) A genuinely single-BLOCK group (glk/so_k/sp) cannot mix regardless of head count --
+        #       a static misconfiguration that still RAISES (HeadMixer would reject it at VFEModel
+        #       construction anyway). so_n/sp_n mix per isotypic component (block counts validated above).
+        if (self.use_head_mixer
+                and self.gauge_group in ("block_glk", "tied_block_glk")
+                and self.n_heads < 2):
+            import warnings
+            warnings.warn(
+                f"use_head_mixer=True with gauge_group={self.gauge_group!r} and n_heads={self.n_heads} "
+                f"yields a single gauge block (nothing to mix); auto-disabling use_head_mixer. Set "
+                f"n_heads >= 2 to use the head mixer.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.use_head_mixer = False
+        if self.use_head_mixer and self.gauge_group in ("glk", "so_k", "sp"):
             raise ValueError(
                 f"use_head_mixer=True needs >= 2 gauge blocks to mix, but "
-                f"gauge_group={self.gauge_group!r}"
-                + (f" with n_heads={self.n_heads}" if self.gauge_group in ("block_glk", "tied_block_glk") else "")
-                + " yields a single block. Use block_glk/tied_block_glk with n_heads >= 2, or an "
-                "so_n/sp_n irrep tower."
+                f"gauge_group={self.gauge_group!r} is a single-block group. Use "
+                f"block_glk/tied_block_glk with n_heads >= 2, or an so_n/sp_n irrep tower."
             )
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
         # transport_mode selects the connection REGIME. Validated against the transport REGISTRY
