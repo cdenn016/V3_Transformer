@@ -180,13 +180,28 @@ def test_unroll_with_mixer_does_not_warn_freeze():
 # ---------------------------------------------------------------- config guard (PP1)
 
 def test_config_rejects_head_mixer_on_single_block_groups():
+    # A genuinely single-BLOCK group (glk/so_k/sp) cannot mix regardless of head count and still
+    # raises -- distinct from a single-HEAD block_glk, which auto-disables (see
+    # test_config_auto_disables_head_mixer_on_single_head).
     from vfe3.config import VFE3Config
     with pytest.raises(ValueError, match="use_head_mixer"):
         VFE3Config(vocab_size=8, embed_dim=4, n_heads=1, max_seq_len=4, n_layers=1,
                    gauge_group="glk", use_head_mixer=True)
-    with pytest.raises(ValueError, match="use_head_mixer"):
-        VFE3Config(vocab_size=8, embed_dim=4, n_heads=1, max_seq_len=4, n_layers=1,
-                   gauge_group="block_glk", use_head_mixer=True)
+
+
+def test_config_auto_disables_head_mixer_on_single_head():
+    # A head-block group (block_glk/tied_block_glk) with n_heads=1 is a single-HEAD scan artifact:
+    # one gauge block, nothing to mix. The config auto-disables use_head_mixer and warns (rather
+    # than raising) so a head/K sweep can leave use_head_mixer=True set without a manual toggle-off
+    # at n_heads=1.
+    from vfe3.config import VFE3Config
+    for grp in ("block_glk", "tied_block_glk"):
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            cfg = VFE3Config(vocab_size=8, embed_dim=4, n_heads=1, max_seq_len=4, n_layers=1,
+                             gauge_group=grp, use_head_mixer=True)
+        assert cfg.use_head_mixer is False
+        assert any("use_head_mixer" in str(r.message) for r in rec)
 
 
 def test_config_accepts_head_mixer_on_multi_block_groups():
