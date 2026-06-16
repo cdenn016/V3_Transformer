@@ -105,8 +105,9 @@ def test_finalize_skips_figures_when_disabled(tmp_path):
 
 
 def test_metrics_csv_logs_at_log_cadence(tmp_path):
-    # metrics.csv gets a row every log_interval (denser than eval_interval), with the most recent
-    # validation carried forward (NaN until the first eval).
+    # metrics.csv gets a row every log_interval (denser than eval_interval), but the validation
+    # columns are EVAL-CADENCE: a value only on an eval step, a BLANK cell on the log-interval rows
+    # in between (NOT carried forward) -- matching VFE_2.0's metrics.csv.
     import csv
     import math
     cfg = _cfg()
@@ -116,9 +117,10 @@ def test_metrics_csv_logs_at_log_cadence(tmp_path):
           val_loader=_loader(seed=1), artifacts=art)
     rows = list(csv.DictReader(open(tmp_path / "run" / "metrics.csv")))
     assert [r["step"] for r in rows] == ["2", "4", "6", "8"]          # a row every log_interval
-    assert math.isnan(float(rows[0]["val_ce"]))                       # NaN before the first eval (step 4)
-    assert math.isfinite(float(rows[1]["val_ce"]))                    # fresh val at the eval step
-    assert rows[1]["val_ce"] == rows[2]["val_ce"]                     # carried forward between evals
+    assert rows[0]["val_ce"] == ""                                    # blank before the first eval (step 4)
+    assert math.isfinite(float(rows[1]["val_ce"]))                    # fresh val at the step-4 eval
+    assert rows[2]["val_ce"] == ""                                    # blank between evals (NOT carried forward)
+    assert math.isfinite(float(rows[3]["val_ce"]))                    # fresh again at the step-8 eval
 
 
 def test_s_channel_refinement_extractor_present_iff_s_e_step():
