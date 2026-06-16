@@ -80,14 +80,21 @@ class RunArtifacts:
         r"""Append one metrics row to ``metrics.csv`` (header written on the first call).
 
         The column set is fixed by the first row; later rows must share those keys so the CSV
-        stays rectangular (the training loop emits a homogeneous row each periodic eval)."""
-        self.history.append(dict(row))
+        stays rectangular (the training loop emits a homogeneous row each periodic eval).
+
+        NaN cells are written to the file as BLANK (empty string), so an eval-cadence column
+        (val_*, generalization_gap, the held-out probes) -- NaN on the denser log-interval rows
+        between evals -- shows an empty cell rather than a repeated value or a literal "nan",
+        matching VFE_2.0's metrics.csv. The IN-MEMORY ``self.history`` keeps the raw NaN float so
+        the figure pass (which filters on ``math.isfinite``) is unaffected."""
+        self.history.append(dict(row))                          # raw floats (incl. NaN) for the figure pass
         if self._fieldnames is None:
             self._fieldnames = list(row.keys())
             with open(self.csv_path, "w", newline="") as fh:
                 csv.DictWriter(fh, fieldnames=self._fieldnames).writeheader()
+        csv_row = {k: ("" if isinstance(v, float) and math.isnan(v) else v) for k, v in row.items()}
         with open(self.csv_path, "a", newline="") as fh:
-            csv.DictWriter(fh, fieldnames=self._fieldnames).writerow(row)
+            csv.DictWriter(fh, fieldnames=self._fieldnames).writerow(csv_row)
 
     def maybe_save_best(self, step: int, model: torch.nn.Module, val_ppl: float) -> bool:
         r"""Save ``model.state_dict()`` to ``best_model.pt`` iff ``val_ppl`` is a new minimum."""
