@@ -737,8 +737,12 @@ def train(
 
         # Persistence is opt-in: with no artifacts object do_csv is False, so the silent/in-memory
         # path is unchanged. A metrics.csv row is written every LOG_INTERVAL (and every eval) -- the
-        # dense per-step diagnostics off the graph -- with the most recent validation carried forward
-        # (NaN until the first eval; fresh on a step where the eval above just ran). The four F-stack
+        # dense per-step diagnostics off the graph. The EVAL-CADENCE columns (val_ce/ppl/bpc,
+        # generalization_gap, and the held-out val_*/estep_*/pos_loss_* probes) carry a value ONLY on a
+        # step where the eval above just ran (do_eval); on the denser log-interval rows in between they
+        # are NaN, which log_metrics renders as a BLANK cell -- so each validation appears exactly once
+        # per eval_interval, not carried forward to every log line (matching VFE_2.0's metrics.csv). The
+        # in-memory history keeps the NaN (figures already drop non-finite rows). The four F-stack
         # diagnostics are per-sequence SUMS over seq 0, normalized to PER TOKEN so they are
         # commensurate with val_ce, a token-weighted mean (nats/token; see audit-2026-06-05 Finding 2).
         if do_csv:
@@ -752,9 +756,9 @@ def train(
                 "lr_mu":             float(lrs[0]),           # group 0 = mu_embed          (m_p_mu_lr)
                 "lr_sigma":          float(lrs[1]),           # group 1 = sigma_log+decode  (m_p_sigma_lr)
                 "lr_phi":            float(lrs[2]),           # group 2 = phi_embed         (m_phi_lr)
-                "val_ce":            last_val.get("ce",  float("nan")),
-                "val_ppl":           last_val.get("ppl", float("nan")),
-                "val_bpc":           last_val.get("bpc", float("nan")),
+                "val_ce":            last_val["ce"]  if do_eval else float("nan"),  # eval-cadence: fresh on
+                "val_ppl":           last_val["ppl"] if do_eval else float("nan"),  # an eval step (last_val just
+                "val_bpc":           last_val["bpc"] if do_eval else float("nan"),  # refreshed), blank otherwise
                 "attn_entropy":       d["attn_entropy"],
                 "self_coupling":      d["self_coupling"]     / n_tok,   # alpha-regularized F self-term sum_i[alpha_i D + R(alpha_i)]
                 "self_divergence":    d["self_divergence"]   / n_tok,   # raw sum_i D(q_i||p_i) drift; == self_coupling only at lambda_alpha_mode='constant'
@@ -770,11 +774,12 @@ def train(
             row["peak_mem_mb"]  = peak_mem_mb
             # Generalization gap (Tier-1): val-set CE minus the per-step train CE (positive = overfit,
             # the standard convention). The train side is seq-0 (diagnostics runs on seq 0) while val is
-            # the token-weighted val-set mean, so read it as a TREND, not an absolute. NaN until the
-            # first eval populates last_val. (The complexity-vs-fit comparison is free_energy_total vs
+            # the token-weighted val-set mean, so read it as a TREND, not an absolute. Eval-cadence like
+            # val_ce above: written only on an eval row, blank (NaN) on the log-interval rows in between.
+            # (The complexity-vs-fit comparison is free_energy_total vs
             # val_ce, both already columns; a separate "elbo_ce_gap" would subtract a CE from a
             # complexity-only F -- d["total"] carries no -E_q[log p] data term -- so it is NOT emitted.)
-            row["generalization_gap"] = last_val.get("ce", float("nan")) - ce
+            row["generalization_gap"] = (last_val["ce"] - ce) if do_eval else float("nan")
             # Extended per-eval diagnostics (Tier-1/2): already-reduced gauge / geometry / numerical-
             # health scalars from diagnostics() -- NOT per-token sums, so logged RAW (no /n_tok).
             # Conditional keys (connection_w_norm, head_mixer_drift) appear only with their toggle; the
@@ -805,9 +810,11 @@ def train(
                             "loss_finite", "grad_scale", "grad_accum_tok_spread"):
                     if _gk in step_metrics:
                         row[_gk] = step_metrics[_gk]
-            # Held-out per-eval probes (Tier-2): the full fixed val-diag column set, carried forward
-            # (NaN until the first eval) so the CSV stays rectangular.
-            row.update(last_val_diag)
+            # Held-out per-eval probes (Tier-2): the full fixed val-diag column set. Eval-cadence like
+            # val_ce above -- the fresh probe values on an eval row, NaN (rendered blank) on the
+            # log-interval rows in between, NOT carried forward. The key set is identical in both
+            # branches (_VAL_DIAG_KEYS), so the CSV stays rectangular.
+            row.update(last_val_diag if do_eval else {k: float("nan") for k in _VAL_DIAG_KEYS})
             # Model-channel F blocks (per-token, like the belief blocks above): present iff the
             # s-channel tables exist (diagnostics gates them on STATIC config -- lambda_h / gamma /
             # prior_source / s_e_step), so the column set is fixed per run and the CSV stays
