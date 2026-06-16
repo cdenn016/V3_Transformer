@@ -537,7 +537,8 @@ class VFEModel(nn.Module):
             # IGNORED (alpha_state_dependent reads only b0_h/c0_h); the coupling magnitude is c0_h/(b0_h+KL),
             # and cfg.lambda_h then acts ONLY as the channel-on gate -- it does not scale the s coupling.
             renyi_order=cfg.renyi_order,   value=cfg.lambda_h,          lambda_alpha_mode=cfg.lambda_h_mode,
-            b0=cfg.b0_h, c0=cfg.c0_h, log_alpha=getattr(self, "log_lambda_h", None),
+            b0=_as_coeff(cfg.b0_h, s_mu.device), c0=_as_coeff(cfg.c0_h, s_mu.device),
+            log_alpha=getattr(self, "log_lambda_h", None),
             lambda_beta=cfg.lambda_gamma,
             kl_max=cfg.kl_max,             eps=cfg.eps,
             sigma_max=cfg.sigma_max,       e_sigma_q_trust=cfg.e_sigma_q_trust,
@@ -874,7 +875,8 @@ class VFEModel(nn.Module):
 
         *,
         s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
-    ) -> torch.Tensor:                       # (B, N) KL(s_i || r) per token
+        per_coord: bool = False,             # True -> unsummed per-coordinate KL_k (..,N,K) for the per-coord lambda_h form
+    ) -> torch.Tensor:                       # (B, N) KL(s_i || r); (B, N, K) when per_coord
         r"""Per-token hyper-prior divergence KL(s_i||r), unreduced (the lambda_h block integrand).
 
         s_i is the refined model belief when ``s_belief`` is supplied (the forward's s1 under
@@ -886,17 +888,18 @@ class VFEModel(nn.Module):
         the per-token vector / its sum.
         """
         from vfe3.families.gaussian import DiagonalGaussian
-        from vfe3.free_energy import self_divergence
+        from vfe3.free_energy import self_divergence, self_divergence_per_coord
         cfg = self.cfg
         pb = self.prior_bank
         s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B, N, K)
         r_mu = pb.r_mu                                               # (K,)
         r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps)       # (K,)
-        return self_divergence(
+        div = self_divergence_per_coord if per_coord else self_divergence
+        return div(
             DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family,
-        )                                                            # (B, N)
+        )                                                            # (B, N) summed, or (B, N, K) per-coord
 
     def _hyper_prior_weighted(
         self,
@@ -913,20 +916,24 @@ class VFEModel(nn.Module):
         autograd's product rule cancels to lambda_h*_i dKL by the envelope theorem (R_h must be in F
         for that cancellation); ``learnable`` -> exp(log_lambda_h)*KL (grad flows to log_lambda_h).
         """
-        from vfe3.lambda_h_i import hyper_prior_lambda_h
+        from vfe3.lambda_h_i import hyper_prior_lambda_h, lambda_h_is_per_coord
         cfg = self.cfg
-        kl_s = self._hyper_prior_kl(token_ids, s_belief=s_belief)     # (B, N) KL(s_i||r) (refined s1 under s_e_step)
+        per_coord = lambda_h_is_per_coord(cfg.lambda_h_mode)
+        kl_s = self._hyper_prior_kl(token_ids, s_belief=s_belief, per_coord=per_coord)  # (B,N) or (B,N,K)
         lam, reg = hyper_prior_lambda_h(
             kl_s, mode=cfg.lambda_h_mode, value=cfg.lambda_h,
-            b0_h=cfg.b0_h, c0_h=cfg.c0_h, log_lambda_h=getattr(self, "log_lambda_h", None),
+            b0_h=_as_coeff(cfg.b0_h, kl_s.device), c0_h=_as_coeff(cfg.c0_h, kl_s.device),
+            log_lambda_h=getattr(self, "log_lambda_h", None),
         )
         term = lam * kl_s
-        if cfg.lambda_h_mode == "state_dependent":
-            # Only the state_dependent envelope carries a nonzero R_h (constant/learnable return a zero
+        if cfg.lambda_h_mode in ("state_dependent", "state_dependent_per_coord"):
+            # Only the state-dependent envelopes carry a nonzero R_h (constant/learnable return a zero
             # regularizer); add it UNDETACHED so autograd's product rule cancels to lam*dKL by the
-            # envelope theorem. Gating on 'state_dependent' (not '!= constant') skips the zero-add on the
-            # learnable path.
+            # envelope theorem. Gating on the state-dependent forms (not '!= constant') skips the
+            # zero-add on the learnable path. The per-coord form carries R_h^(k) per coordinate.
             term = term + reg                                         # R_h in F -> envelope cancellation
+        if per_coord:
+            term = term.sum(dim=-1)                                  # (B,N,K) -> (B,N): sum the per-coordinate envelope
         return term                                                  # (B, N)
 
     def _hyper_prior_term(

@@ -242,14 +242,20 @@ class VFE3Config:
     # today's bare scalar) and 'state_dependent' (the closed-form envelope lambda_h*_i =
     # c0_h/(b0_h + KL(s_i||r)), which REQUIRES R_h(lambda_h)=b0_h*lambda_h - c0_h*log lambda_h added to
     # F and the s E-step for the envelope cancellation -- threaded automatically through both paths).
+    # 'state_dependent_per_coord' is the per-coordinate sibling (lambda_h^(k)* = c0_h^(k)/(b0_h^(k)+KL_k),
+    # mirroring lambda_alpha_mode's per-coord form): each model coordinate is shrunk toward r by its own
+    # envelope weight, fed the UNSUMMED per-coordinate KL_k(s||r). It needs a coordinate-decomposable
+    # divergence on the (always-diagonal) s/r tables (renyi/KL/...; __post_init__ rejects full-cov /
+    # squared_hellinger) and accepts (K,) b0_h/c0_h. NB it is NOT a width-robustness lever -- summing the
+    # per-coordinate envelopes over K is linear in K, unlike per-token 'state_dependent' (log in K).
     # NEURAL-NETWORK EXCEPTION: 'learnable' introduces a model-owned scalar nn.Parameter log_lambda_h
     # (lambda_h = exp(log_lambda_h)), a sanctioned default-OFF sibling of lambda_alpha_mode='learnable' /
     # learnable_lambda_beta. At init log_lambda_h=log(cfg.lambda_h) -> lambda_h=cfg.lambda_h, so a
     # learnable model is byte-identical to constant lambda_h at step 0. Non-'constant' modes require
     # lambda_h>0 (the channel-on gate and, for 'learnable', the log-init value); __post_init__ warns.
-    lambda_h_mode:             str   = "constant"   # "constant" | "state_dependent" | "learnable"
-    b0_h:                      float = 1.0          # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
-    c0_h:                      float = 1.0          # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h
+    lambda_h_mode:             str   = "constant"   # "constant" | "state_dependent" | "state_dependent_per_coord" | "learnable"
+    b0_h:                      'float | List[float]' = 1.0   # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r)); list -> (K,) per-coord
+    c0_h:                      'float | List[float]' = 1.0   # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h; list -> (K,) per-coord
 
     # Model-coupling weight lambda_gamma on the model-channel block lambda_gamma * mean_i F_red^s_i,
     # the reduced (envelope) form of sum_ij [ gamma_ij KL(s_i||Omega_ij s_j) + tau_g gamma_ij
@@ -895,6 +901,43 @@ class VFE3Config:
                     UserWarning,
                     stacklevel=2,
                 )
+
+        # lambda_h_mode='state_dependent_per_coord': the model-fiber mirror of the alpha per-coord
+        # guards above, keyed on lambda_h_mode (lambda_h delegates to the shared alpha registry, so
+        # lambda_h_is_per_coord defers to alpha_is_per_coord). The per-coordinate hyper-prior envelope
+        # lambda_h^(k)* = c0_h^(k)/(b0_h^(k) + KL_k(s||r)) needs (a) (K,) b0_h/c0_h shaping each
+        # coordinate's weight, (b) a per-coordinate KL(s||r), which exists only for a coordinate-
+        # decomposable divergence on the (always-diagonal) s/r tables. Reject inconsistent pairs at
+        # construction rather than letting the per-coordinate divergence raise mid-forward.
+        from vfe3.lambda_h_i import lambda_h_is_per_coord
+        for name in ("b0_h", "c0_h"):
+            _v = getattr(self, name)
+            if isinstance(_v, (list, tuple)):
+                if not lambda_h_is_per_coord(self.lambda_h_mode):
+                    raise ValueError(
+                        f"{name} list (per-coordinate) requires a per-coordinate lambda_h form "
+                        f"(lambda_h_mode='state_dependent_per_coord'); got "
+                        f"lambda_h_mode={self.lambda_h_mode!r}"
+                    )
+                if len(_v) != self.embed_dim:
+                    raise ValueError(
+                        f"{name} list must have length embed_dim={self.embed_dim}, got {len(_v)}")
+                if any(x <= 0.0 for x in _v):
+                    raise ValueError(f"{name} entries must be > 0, got {_v}")
+        if lambda_h_is_per_coord(self.lambda_h_mode) and not family_is_diagonal:
+            raise ValueError(
+                f"lambda_h_mode={self.lambda_h_mode!r} needs a per-coordinate hyper-prior divergence, "
+                f"which exists only for a diagonal-covariance family; got family={self.family!r}. Use "
+                f"a diagonal family (e.g. 'gaussian_diagonal') or a per-position lambda_h_mode."
+            )
+        if lambda_h_is_per_coord(self.lambda_h_mode) and not has_per_coord_functional(self.divergence_family):
+            raise ValueError(
+                f"lambda_h_mode={self.lambda_h_mode!r} needs a per-coordinate hyper-prior divergence, "
+                f"implemented only for divergences that decompose coordinate-wise on a diagonal Gaussian "
+                f"({divergence_functionals_per_coord()}); got divergence_family={self.divergence_family!r} "
+                f"(e.g. 'squared_hellinger' does not decompose). Use a decomposable divergence or a "
+                f"per-position lambda_h_mode."
+            )
 
         # attention
         _require(self.beta_attention_prior, tuple(sorted(_PRIORS)), "beta_attention_prior")
