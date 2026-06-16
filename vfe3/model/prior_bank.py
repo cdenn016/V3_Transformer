@@ -196,9 +196,15 @@ class PriorBank(nn.Module):
             # which VFE3Config.__post_init__ warns about.
             self.r_mu              = nn.Parameter(torch.zeros(K), requires_grad=learnable_r)
             self.r_sigma_log       = nn.Parameter(torch.full((K,), sigma_log_init), requires_grad=learnable_r)
-            # TODO(B): the manuscript-pure un-freezing is a token-dependent, top-down hyper-prior
-            # r_i = Omega_tilde[s_I^{(s+1)}] driven by the scale-(s+1) meta-agent (not built);
-            # learnable_r is the same-scale empirical-Bayes stand-in for that.
+            # DESIGN NOTE (audit 2026-06-15): the token-dependent top-down hyper-prior
+            # r_i = Omega_tilde[s_I^{(s+1)}] (PIFB eq:cross_scale_shadow / eq:topdown_priors) is the
+            # model-fiber transport of a GENUINELY EMERGED scale-(s+1) meta-agent, and is OUT OF SCOPE for
+            # this single-scale transformer -- NOT a deferred gap. The manuscript treats single-scale r_i as
+            # a PRIMITIVE boundary condition (PIFB lines 554, 636) and assigns the full transport + Ouroboros
+            # tower to MAgent_Model/gauge_agent/ (PIFB line 2334). The frozen global r above IS the sanctioned
+            # s_max boundary -- the named "held at its initial value rather than recomputed" special case of
+            # the self-referential closure (PIFB line 2332). learnable_r is the same-scale empirical-Bayes
+            # stand-in (a different axis: frozen-vs-learned, still token-uniform).
 
     def encode(
         self,
