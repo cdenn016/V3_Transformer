@@ -117,7 +117,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
-    decode_tau                = 0.1,
+    decode_tau                = 0.008,
+    decode_precision_scaled   = False,               # use_prior_bank=False only: feed the precision-weighted mean
+                                                     # eta=mu/sigma (natural param) to the linear head so Sigma enters
+                                                     # the discriminative readout (diagnostic; OFF = bare-mu linear)
     
  
     #################################
@@ -222,9 +225,15 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     beta_attention_prior      = "causal",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
     gamma_attention_prior     = "causal",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
-    t5_learnable_bias         = False,
+    t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
+
+    precision_weighted_attention = True,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
+                                                 # into the attention prior (diagnostic; OFF = position-only prior)
+    precision_attention_b0       = 1.0,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
+    precision_attention_per_head = False,        # per-key reliability PER HEAD (trace over each block's coords) vs
+                                                 # global (all K); needs precision_weighted_attention=True
     #################################
-    #         Belief E-step 
+    #         Belief E-step
     #         Learning Rates
     #################################
     
@@ -497,39 +506,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
     
     
-    "mass_phi": {
-        "description": "gauge prior weight (mass_phi / 2) ||phi||^2",
-        "param": "mass_phi", "values": [0.0, 1e-5, 1e-4, 5e-4, 5e-3, 1e-2],
+    "precision_attention_b0": {
+        "description": "precision_attention_b0",
+        "param": "precision_attention_b0", "values": [1e-3, 0.025, 1.5, 2, 2.5],
+    },
+    "precision_attention_per_head": {  # per-key reliability per head (block trace) vs global (all K)
+        "description": "precision-weighted attention reliability: global trace vs per-head block trace",
+        "param": "precision_attention_per_head", "values": [False, True],
+        "requires": {"precision_weighted_attention": True},
     },
     
 
 
 
-    # === attention =========================================================
     
-    
-    
-    "beta_attention_prior": {
-        "description": "attention prior pi_ij",
-        "param": "beta_attention_prior", "values": ["causal", "t5_relative_bias", 
-                                               "causal_windowed", "causal_alibi"],
-    },
-    "gamma_attention_prior": {
-        "description": "model-channel attention prior pi^s_ij",
-        "param": "gamma_attention_prior", "values": ["causal", "t5_relative_bias", 
-                                               "causal_windowed", "causal_alibi"],
-        
-    },
-    # === E-step ============================================================
-    
-   
-    "prior_source": {  # model_channel makes the s tables the belief prior p_i
-        "description": "belief-prior source table (token vs model channel)",
-        "configs": [
-            {"label": "token",         "prior_source": "token"},
-            {"label": "model_channel", "prior_source": "model_channel"},
-        ],
-    },
     
     
     
@@ -561,7 +551,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "decode_tau": {
         "description": "KL-to-prior decode temperature",
-        "param": "decode_tau", "values": [0.2, 0.5, 0.75, 1.0, 2.0], "requires": {"use_prior_bank": True},
+        "param": "decode_tau", "values": [0.007, 0.008, 0.009], "requires": {"use_prior_bank": True},
     },
     
     
@@ -579,13 +569,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "lambda_gamma": {
         "description": "model-channel coupling weight (>0 creates s tables)",
-        "param": "lambda_gamma", "values": [0.65, 0.7, 0.8, 0.9],
+        "param": "lambda_gamma", "values": [0, 0.25, 0.5, 0.75, 0.9, 1, 3],
     },
     
     
     "lambda_h": {
         "description": "hyper-prior weight lambda_h * mean_i KL(s_i||r) (>0 creates s/r tables)",
-        "param": "lambda_h", "values": [0.15, 0.2, 0.3, 0.4],
+        "param": "lambda_h", "values": [0, 0.1, 0.2, 0.3, 0.4, 0.5],
     },
     
     
@@ -594,7 +584,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "kappa_gamma": {
         "description": "model-channel temperature tau_gamma = kappa_gamma * sqrt(d_head)",
-        "param": "kappa_gamma", "values": [0.25, 0.5, 0.6, 0.75, 1], 
+        "param": "kappa_gamma", "values": [0.1, 0.25, 0.5, 0.75, 0.9, 1], 
     },
     
     "kappa_beta": {
@@ -666,7 +656,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_p_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_p_sigma_lr", "range": [0.0025, 0.0045, 0.00025],
+        "param": "m_p_sigma_lr", "range": [0.002, 0.005, 0.0005],
     },
     
     "m_phi_lr": {
@@ -720,21 +710,21 @@ SWEEP_ORDER: List[str] = [
   #  "mu_init_std",
   #  "phi_scale",
   #  "sigma_init", 
-  
+  "precision_attention_b0",
   # "decode_tau",
    
    "lambda_gamma",
-   "lambda_h",
+   
    "kappa_gamma",   
-   "e_s_mu_lr",
+  # "e_s_mu_lr",
    
   # "m_phi_lr",
  #   "m_p_mu_lr",
   #  "m_p_sigma_lr",
     
-  #  "weight_decay",
+    "weight_decay",
   #  "lambda_beta",
-  
+   "lambda_h",
   
   #  "kappa_beta",
   ##  "renyi_order",

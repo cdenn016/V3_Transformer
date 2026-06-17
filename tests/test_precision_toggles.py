@@ -155,3 +155,63 @@ def test_precision_weighted_attention_grad_flows():
     loss.backward()
     g = m.prior_bank.mu_embed.grad
     assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
+
+
+# ================================================== feature 2b: per-head reliability
+
+def test_precision_attention_per_head_defaults_off():
+    assert VFE3Config().precision_attention_per_head is False
+
+
+def test_precision_key_bias_per_head_splits_into_blocks():
+    # With irrep_dims the reliability is computed PER gauge block (head): trace over that block's
+    # coords only, shape (B, N, H) instead of the global (B, N).
+    from vfe3.model.model import _precision_key_bias
+    sigma = torch.tensor([[[0.1, 0.1, 0.5, 0.5],          # token 0: block0 tr=0.2, block1 tr=1.0
+                           [0.2, 0.2, 0.2, 0.2]]])         # token 1: both blocks tr=0.4   -> (1,2,4)
+    b = _precision_key_bias(sigma, b0=1.0, irrep_dims=[2, 2])
+    assert b.shape == (1, 2, 2)
+    expect = -torch.log(1.0 + torch.tensor([[[0.2, 1.0], [0.4, 0.4]]]))
+    assert torch.allclose(b, expect, atol=1e-6)
+
+
+def test_precision_attention_per_head_no_effect_at_uniform_sigma():
+    # At init every coord shares sigma_init -> every per-head block trace is equal across heads and
+    # keys -> the bias is constant -> softmax-absorbed -> per-head ON == baseline (no pwa).
+    m_ph = _model(seed=0, precision_weighted_attention=True, precision_attention_per_head=True)
+    m_base = _model(seed=0)
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, l_ph, _ = m_ph(tokens, targets)
+    _, l_base, _ = m_base(tokens, targets)
+    assert torch.allclose(l_ph, l_base, atol=1e-6)
+
+
+def test_precision_attention_per_head_differs_from_global_when_coords_vary():
+    # When sigma varies ACROSS coordinates, the per-head block traces differ across heads, so the
+    # per-head bias is NOT the global bias -> the two produce different attention / forward logits.
+    m_ph = _model(seed=0, precision_weighted_attention=True, precision_attention_per_head=True)
+    m_gl = _model(seed=0, precision_weighted_attention=True, precision_attention_per_head=False)
+    with torch.no_grad():
+        for m in (m_ph, m_gl):
+            m.prior_bank.sigma_log_embed.copy_(torch.randn_like(m.prior_bank.sigma_log_embed))
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, l_ph, _ = m_ph(tokens, targets)
+    _, l_gl, _ = m_gl(tokens, targets)
+    assert not torch.allclose(l_ph, l_gl, atol=1e-4)
+
+
+def test_precision_attention_per_head_inert_warning_without_pwa():
+    with pytest.warns(UserWarning, match="precision_attention_per_head"):
+        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
+                   precision_weighted_attention=False, precision_attention_per_head=True)
+
+
+def test_precision_attention_per_head_grad_flows():
+    m = _model(seed=0, precision_weighted_attention=True, precision_attention_per_head=True)
+    with torch.no_grad():
+        m.prior_bank.sigma_log_embed.copy_(torch.randn_like(m.prior_bank.sigma_log_embed))
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, loss, _ = m(tokens, targets)
+    loss.backward()
+    g = m.prior_bank.mu_embed.grad
+    assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0

@@ -308,7 +308,12 @@ class VFE3Config:
     # -> log_prior stays the sequence-only (N,N)/(H,N,N) bias (byte-identical).
     precision_weighted_attention: bool  = False
     precision_attention_b0:       float = 1.0       # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
-    
+    # precision_weighted_attention only: compute the per-key reliability PER HEAD -- trace over each
+    # gauge block's coords (-log(b0 + tr_h Sigma_j)) -- so each head down-weights keys by its OWN
+    # block uncertainty, better aligned with per-head attention. Default False = global (trace over
+    # all K coords). Inert (warns) when precision_weighted_attention is off.
+    precision_attention_per_head: bool  = False
+
     t5_num_buckets:            int   = 32           # t5_relative_bias: relative-position bucket count
     t5_max_distance:           int   = 128          # t5_relative_bias: log-bucketing horizon (beyond -> last bucket)
     t5_learnable_bias:         bool  = False        # t5_relative_bias: learn the per-bucket bias table b_{i-j}
@@ -1272,6 +1277,14 @@ class VFE3Config:
             raise ValueError(
                 f"precision_attention_b0 must be positive (the b0 in the per-key reliability "
                 f"-log(b0 + tr Sigma_j)), got {self.precision_attention_b0}")
+        # precision_attention_per_head only shapes the bias WHEN precision_weighted_attention is on.
+        if self.precision_attention_per_head and not self.precision_weighted_attention:
+            import warnings
+            warnings.warn(
+                "precision_attention_per_head=True is inert when precision_weighted_attention=False: "
+                "there is no reliability bias to shape per head. Enable precision_weighted_attention.",
+                UserWarning,
+            )
         # use_prior_bank decode is a FIXED alpha=1 KL readout on the hardcoded Gaussian family
         # (prior_bank.reference_decode / the fused kernels call divergence.kl); it does NOT read
         # renyi_order / divergence_family. An opt-in non-KL/non-alpha=1 seam therefore minimizes the

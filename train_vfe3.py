@@ -66,13 +66,13 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 60,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 6,
+    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 2,
     
     max_seq_len               = 128,                 # N, context length
     
     batch_size                = 64,
-    max_steps                 = 45000,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -101,12 +101,15 @@ config = dict(
     #        Encode/Decode          #
     #################################
     decode_bias               = True,     # only if use_prior_bank = False
-    use_head_mixer            = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
     
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
-    decode_tau                = 0.1,
+    decode_tau                = 0.008,
+    decode_precision_scaled   = False,               # use_prior_bank=False only: feed the precision-weighted mean
+                                                     # eta=mu/sigma (natural param) to the linear head so Sigma enters
+                                                     # the discriminative readout (diagnostic; OFF = bare-mu linear)
     
  
     #################################
@@ -212,8 +215,14 @@ config = dict(
     gamma_attention_prior     = "causal",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
     t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
+
+    precision_weighted_attention = True,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
+                                                 # into the attention prior (diagnostic; OFF = position-only prior)
+    precision_attention_b0       = 1.0,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
+    precision_attention_per_head = True,        # per-key reliability PER HEAD (trace over each block's coords) vs
+                                                 # global (all K); needs precision_weighted_attention=True
     #################################
-    #         Belief E-step 
+    #         Belief E-step
     #         Learning Rates
     #################################
     
