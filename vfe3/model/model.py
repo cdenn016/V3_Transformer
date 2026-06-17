@@ -32,20 +32,29 @@ from vfe3.model.stack import vfe_stack
 
 
 def _precision_key_bias(
-    sigma: torch.Tensor,             # (B, N, K) per-key belief variances
+    sigma:      torch.Tensor,        # (B, N, K) per-key belief variances
 
     *,
-    b0:    float = 1.0,
-) -> torch.Tensor:                   # (B, N) per-key log-reliability -log(b0 + tr Sigma_j)
+    b0:         float = 1.0,
+    irrep_dims: 'Optional[Sequence[int]]' = None,   # per-head block sizes (sum == K); None -> global trace
+) -> torch.Tensor:                   # (B, N) global, or (B, N, H) per-head, log-reliability
     r"""Per-key reliability bias for precision-weighted attention: ``-log(b0 + tr Sigma_j)``.
 
-    A more-uncertain key (larger total variance ``tr Sigma_j = sum_k sigma_j^k``) gets a MORE
-    NEGATIVE additive bias, so it is down-weighted in the attention softmax. Folded into the
-    attention ``log_prior`` by the caller (detached there, so the closed-form belief kernel treats
-    it as a fixed prior). A uniform-over-keys ``Sigma`` gives a constant-in-key bias that the
-    softmax absorbs (no effect); only key-to-key variance in ``Sigma`` changes attention.
+    A more-uncertain key (larger variance ``tr Sigma_j``) gets a MORE NEGATIVE additive bias, so it
+    is down-weighted in the attention softmax. Folded into the attention ``log_prior`` by the caller
+    (detached there, so the closed-form belief kernel treats it as a fixed prior). A uniform-over-keys
+    ``Sigma`` gives a constant-in-key bias that the softmax absorbs (no effect); only key-to-key
+    variance in ``Sigma`` changes attention.
+
+    ``irrep_dims=None`` (default): the GLOBAL trace over all K coordinates -> ``(B, N)``. When the
+    per-head gauge-block sizes are given, the trace is taken PER BLOCK (head) -> ``(B, N, H)``, so
+    each head down-weights keys by its OWN block uncertainty.
     """
-    return -torch.log(b0 + sigma.sum(dim=-1))
+    if irrep_dims is None:
+        return -torch.log(b0 + sigma.sum(dim=-1))                          # (B, N) global trace
+    tr = torch.stack([blk.sum(dim=-1)                                      # (B, N, H) per-block traces
+                      for blk in sigma.split(list(irrep_dims), dim=-1)], dim=-1)
+    return -torch.log(b0 + tr)
 
 
 def _positional_arity(builder: Callable) -> int:
@@ -677,10 +686,15 @@ class VFEModel(nn.Module):
             # Uses the belief sigma entering the block (post s-refine); broadcast over query (and head).
             # A new tensor is bound (no mutation of the cached position-only log_prior).
             if self.cfg.precision_weighted_attention:
-                kb = _precision_key_bias(beliefs.sigma, b0=self.cfg.precision_attention_b0).detach()  # (B, N)
-                kb = kb[:, None, None, :]                          # (B, 1, 1, N): broadcast over head & query, per key
-                # adds onto the (N,N)/(H,N,N) position prior -> (B,1,N,N)/(B,H,N,N), broadcasting
-                # against the per-head energy (B, H, N, N) in attention_weights.
+                if self.cfg.precision_attention_per_head:
+                    kb = _precision_key_bias(beliefs.sigma, b0=self.cfg.precision_attention_b0,
+                                             irrep_dims=self.group.irrep_dims).detach()  # (B, N, H)
+                    kb = kb.permute(0, 2, 1).unsqueeze(-2)        # (B, H, 1, N): per-head, query-broadcast, per key
+                else:
+                    kb = _precision_key_bias(beliefs.sigma, b0=self.cfg.precision_attention_b0).detach()  # (B, N)
+                    kb = kb[:, None, None, :]                     # (B, 1, 1, N): head- & query-broadcast, per key
+                # adds onto the (N,N)/(H,N,N) position prior -> (B,*,N,N), broadcasting against the
+                # per-head energy (B, H, N, N) in attention_weights.
                 log_prior = kb if log_prior is None else log_prior + kb
             # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
             # M-step self-coupling term below (manuscript: the self-term reads q*, not the
