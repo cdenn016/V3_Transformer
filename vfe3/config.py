@@ -299,6 +299,15 @@ class VFE3Config:
 
     alibi_slope:               float = 1.0          # base slope for alibi/causal_alibi priors (Press et al. schedule)
     attention_window:          int   = 128          # band half-width for the windowed/causal_windowed priors
+
+    # Precision-weighted attention (diagnostic, default OFF): fold a detached per-key reliability
+    # bias -log(precision_attention_b0 + tr Sigma_j) into the attention log_prior, so attention
+    # down-weights high-variance (unreliable) keys BEFORE the softmax. A uniform-over-keys Sigma is
+    # softmax-absorbed (no effect); only key-to-key variance in Sigma changes attention. Detached ->
+    # the closed-form belief kernel stays exact (the bias enters like any fixed attention prior). OFF
+    # -> log_prior stays the sequence-only (N,N)/(H,N,N) bias (byte-identical).
+    precision_weighted_attention: bool  = False
+    precision_attention_b0:       float = 1.0       # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
     
     t5_num_buckets:            int   = 32           # t5_relative_bias: relative-position bucket count
     t5_max_distance:           int   = 128          # t5_relative_bias: log-bucketing horizon (beyond -> last bucket)
@@ -343,6 +352,13 @@ class VFE3Config:
     # decode / encode
     use_prior_bank:            bool  = False
     decode_bias:               bool  = False  # use_prior_bank=False only: learned per-vocab log-unigram bias on logits=mu_q@W^T+b (zero-init, weight-decay-free). Inert (warns) under use_prior_bank=True.
+    # use_prior_bank=False only (diagnostic, default OFF): feed the precision-weighted mean -- the
+    # diagonal natural parameter eta = Sigma^-1 mu = mu/(sigma+eps) -- to the linear head instead of
+    # the bare mean mu, so the belief covariance Sigma_q enters the DISCRIMINATIVE readout. Tests
+    # whether Sigma carries predictive signal at the decode WITHOUT the generative/capacity confound
+    # of the prior-bank KL decode. OFF -> logits = mu_q @ W^T (byte-identical). Inert (warns) under
+    # use_prior_bank=True (the KL decode already consumes sigma_q).
+    decode_precision_scaled:   bool  = False
     decode_tau:                float = 1.0
     decode_mode:               str   = "diagonal"
     
@@ -1240,6 +1256,22 @@ class VFE3Config:
                 "(linear decode) for the learned bias to take effect.",
                 UserWarning,
             )
+        # decode_precision_scaled feeds the precision-weighted mean (eta=mu/sigma) to the LINEAR head;
+        # on the KL-to-prior path sigma_q already enters the readout, so the toggle is inert there --
+        # warn (mirrors decode_bias).
+        if self.decode_precision_scaled and self.use_prior_bank:
+            import warnings
+            warnings.warn(
+                "decode_precision_scaled=True is inert when use_prior_bank=True: the KL-to-prior "
+                "decode already consumes sigma_q. Set use_prior_bank=False (linear decode) for the "
+                "precision-weighted mean to take effect.",
+                UserWarning,
+            )
+        # precision_weighted_attention's per-key reliability -log(b0 + tr Sigma_j) needs a positive b0.
+        if self.precision_weighted_attention and self.precision_attention_b0 <= 0.0:
+            raise ValueError(
+                f"precision_attention_b0 must be positive (the b0 in the per-key reliability "
+                f"-log(b0 + tr Sigma_j)), got {self.precision_attention_b0}")
         # use_prior_bank decode is a FIXED alpha=1 KL readout on the hardcoded Gaussian family
         # (prior_bank.reference_decode / the fused kernels call divergence.kl); it does NOT read
         # renyi_order / divergence_family. An opt-in non-KL/non-alpha=1 seam therefore minimizes the
