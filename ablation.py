@@ -12,9 +12,10 @@ Two sweep shapes are supported, both declared in the ``SWEEPS`` registry:
     for categorical comparisons whose arms differ in more than one field (e.g. a
     full-covariance arm that flips ``family`` and the per-coordinate alpha form together).
 
-The baseline is IMPORTED from ``train_vfe3.py`` (``from train_vfe3 import config``), so a
-sweep ablates around exactly what a normal ``train_vfe3.py`` run would train -- there is no
-second copy of the operating point to drift out of sync. Each run gets a self-contained
+The baseline is the self-contained ``BASELINE_CONFIG`` dict below -- a full ``VFE3Config`` toggle
+set kept deliberately separate from ``train_vfe3.py`` so an ablation can pin its own (fast)
+operating point. It currently matches train_vfe3.py's K=20 / block_glk point; keep the two in sync
+by hand when the training operating point moves. Each run gets a self-contained
 ``RunArtifacts`` directory (``config.json``, ``metrics.csv``, ``best_model.pt``, figures)
 nested under its sweep, plus an ``ablation_result.json`` headline used for resume and the
 sweep-level leaderboard.
@@ -998,7 +999,7 @@ def run_single(
         if getattr(loader, "generator", None) is not None:
             loader.generator.manual_seed(cfg.seed)
 
-    print(f"    K={cfg.embed_dim} heads={cfg.n_heads} group={cfg.gauge_group} "
+    print(f"    K={cfg.embed_dim} heads={len(model.group.irrep_dims)} group={cfg.gauge_group} "
           f"family={cfg.family} | steps={cfg.max_steps} batch={cfg.batch_size} | {n_params:,} params")
     for _cov in coverage_lines(train_loader, cfg.max_steps, dataset):
         print(f"   {_cov}")

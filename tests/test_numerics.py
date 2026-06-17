@@ -39,6 +39,18 @@ def test_condition_number_known_values():
     assert torch.allclose(condition_number(M), torch.tensor(100.0), atol=1e-3)
 
 
+def test_condition_number_non_pd_returns_inf():
+    # A symmetric matrix with a negative eigenvalue has no condition number: the monitor must surface
+    # +inf, not a large positive value from clamping lambda_min up to eps (which would read as a
+    # merely ill-conditioned SPD matrix). (audit 2026-06-17 id 39)
+    torch.manual_seed(0)
+    K = 3
+    Q, _ = torch.linalg.qr(torch.randn(K, K))
+    M = Q @ torch.diag(torch.tensor([-1.0, 1.0, 3.0])) @ Q.transpose(-1, -2)   # spectrum {-1,1,3}
+    cond = condition_number(M)
+    assert torch.isinf(cond) and cond > 0
+
+
 def test_nan_inf_fraction_counts_nonfinite():
     t = torch.tensor([1.0, float("nan"), float("inf"), 2.0])
     assert abs(nan_inf_fraction(t) - 0.5) < 1e-6

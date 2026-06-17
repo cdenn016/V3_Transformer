@@ -328,7 +328,7 @@ class FullGaussian(BeliefParams):
             # extra jitter, so valid-SPD inputs stay byte-identical to torch.linalg.cholesky.
             sigma_blend = (1.0 - alpha) * sigma_q_reg + alpha * sigma_t_reg
             sigma_blend = 0.5 * (sigma_blend + sigma_blend.transpose(-1, -2))
-            L_blend, ok_blend = safe_cholesky(sigma_blend, eps=eps, rounds=5)
+            L_blend, _ = safe_cholesky(sigma_blend, eps=eps, rounds=5)  # factor for mahal_term only
             L_q, ok_q = safe_cholesky(sigma_q_reg, eps=eps, rounds=5)
             L_t, ok_t = safe_cholesky(sigma_t_reg, eps=eps, rounds=5)
             delta_mu = mu_t - mu_q
@@ -358,6 +358,12 @@ class FullGaussian(BeliefParams):
                     (1.0 - alpha) * logdet_q + alpha * logdet_t - logdet_blend
                 ) / (alpha - 1.0)
             div = 0.5 * (mahal_term + logdet_term)
-            ok = ok_blend & ok_q & ok_t            # any failed factor -> NaN -> kl_max
+            # safe_cholesky's escalating ridge can factor an INDEFINITE blend as PD (its ok mask
+            # True) even though alpha>1 left the convex regime and the Renyi divergence is undefined
+            # there -- the fp64 slogdet then drops the sign and the value collapses to ~0 instead of
+            # kl_max. Gate on the SIGN of the (symmetrized) blend spectrum so a non-PD blend -> NaN
+            # -> kl_max regardless of the ridge (audit 2026-06-17). sigma_q/sigma_t are eps-SPD.
+            blend_pd = torch.linalg.eigvalsh(sigma_blend)[..., 0] > 0   # smallest eigenvalue > 0
+            ok = blend_pd & ok_q & ok_t            # non-PD blend or failed factor -> NaN -> kl_max
             div = torch.where(ok, div, div.new_tensor(float("nan")))
         return safe_kl_clamp(div, kl_max=kl_max)

@@ -88,7 +88,7 @@ class DiagonalLaplace(BeliefParams):
             torch.stack([p.sigma for p in parts], dim=dim),
         )
 
-    def natural(self) -> Tuple[torch.Tensor, ...]:
+    def natural(self) -> NoReturn:
         raise NotImplementedError(
             "DiagonalLaplace is not a natural exponential family when the location varies "
             "(the sufficient statistic |x - mu| depends on the parameter mu), so it has no "
