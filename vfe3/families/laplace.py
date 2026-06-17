@@ -55,7 +55,7 @@ non-permutation gauge. Use under permutation/sign gauge for exactness.
 """
 
 import math
-from typing import List, Tuple
+from typing import List, NoReturn, Tuple
 
 import torch
 
