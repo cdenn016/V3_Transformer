@@ -31,6 +31,23 @@ from vfe3.model.prior_bank import PriorBank
 from vfe3.model.stack import vfe_stack
 
 
+def _precision_key_bias(
+    sigma: torch.Tensor,             # (B, N, K) per-key belief variances
+
+    *,
+    b0:    float = 1.0,
+) -> torch.Tensor:                   # (B, N) per-key log-reliability -log(b0 + tr Sigma_j)
+    r"""Per-key reliability bias for precision-weighted attention: ``-log(b0 + tr Sigma_j)``.
+
+    A more-uncertain key (larger total variance ``tr Sigma_j = sum_k sigma_j^k``) gets a MORE
+    NEGATIVE additive bias, so it is down-weighted in the attention softmax. Folded into the
+    attention ``log_prior`` by the caller (detached there, so the closed-form belief kernel treats
+    it as a fixed prior). A uniform-over-keys ``Sigma`` gives a constant-in-key bias that the
+    softmax absorbs (no effect); only key-to-key variance in ``Sigma`` changes attention.
+    """
+    return -torch.log(b0 + sigma.sum(dim=-1))
+
+
 def _positional_arity(builder: Callable) -> int:
     r"""Count the builder's required positional parameters (the K, n_heads, ... axes)."""
     n = 0
@@ -114,6 +131,7 @@ class VFEModel(nn.Module):
             decode_tau=cfg.decode_tau, eps=cfg.eps,
             diagonal_covariance=cfg.diagonal_covariance,
             use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
+            decode_precision_scaled=cfg.decode_precision_scaled,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             lambda_h=cfg.lambda_h, lambda_gamma=cfg.lambda_gamma,
@@ -653,6 +671,17 @@ class VFEModel(nn.Module):
                 # self-couples to its prior every iteration, so s reaches mu_final even at n_e_steps=1.
                 s_mu1, s_sigma1 = self._refine_s(token_ids, beliefs.phi, e_step_gradient=e_step_gradient)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
+            # Precision-weighted attention (default OFF): fold a DETACHED per-key reliability bias
+            # -log(b0 + tr Sigma_j) into log_prior so attention down-weights high-variance keys before
+            # the softmax. Detached -> the closed-form belief kernel treats it as a fixed prior (exact).
+            # Uses the belief sigma entering the block (post s-refine); broadcast over query (and head).
+            # A new tensor is bound (no mutation of the cached position-only log_prior).
+            if self.cfg.precision_weighted_attention:
+                kb = _precision_key_bias(beliefs.sigma, b0=self.cfg.precision_attention_b0).detach()  # (B, N)
+                kb = kb[:, None, None, :]                          # (B, 1, 1, N): broadcast over head & query, per key
+                # adds onto the (N,N)/(H,N,N) position prior -> (B,1,N,N)/(B,H,N,N), broadcasting
+                # against the per-head energy (B, H, N, N) in attention_weights.
+                log_prior = kb if log_prior is None else log_prior + kb
             # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
             # M-step self-coupling term below (manuscript: the self-term reads q*, not the
             # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.

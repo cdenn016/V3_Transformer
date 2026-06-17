@@ -112,6 +112,7 @@ class PriorBank(nn.Module):
         diagonal_covariance: bool  = True,
         use_prior_bank:      bool  = True,
         decode_bias:         bool  = False,
+        decode_precision_scaled: bool = False,
         encode_mode:         str   = "per_token",
         decode_mode:         str   = "diagonal",
         decode_chunk_size:   int   = 8192,
@@ -129,6 +130,7 @@ class PriorBank(nn.Module):
         self.eps = eps
         self.diagonal_covariance = diagonal_covariance
         self.use_prior_bank = use_prior_bank
+        self.decode_precision_scaled = decode_precision_scaled
         self.encode_mode = encode_mode
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
@@ -794,14 +796,19 @@ def _decode_linear(
     r"""Linear-projection decode (use_prior_bank=False, VFE_2.0 parity): logits = mu_q @ W^T (+ b).
 
     The one authorized neural exception: a single learned (V, K) output weight applied to the
-    converged mean, with NO KL geometry at the decode boundary (sigma and the decode temperature
-    are discarded; only encode + the E-step remain gauge-aware). Realized as a raw nn.Parameter
-    matmul, not an nn.Linear module. With ``decode_bias`` a learned per-vocab log-unigram bias
-    ``b`` (V,) is added (see __init__). The pure KL-readout path is always available under
-    use_prior_bank=True; this is the opt-in ablation the user uses to compare with/without the
-    prior-bank decode.
+    converged mean, with NO KL geometry at the decode boundary (the decode temperature is discarded;
+    only encode + the E-step remain gauge-aware). Realized as a raw nn.Parameter matmul, not an
+    nn.Linear module. With ``decode_bias`` a learned per-vocab log-unigram bias ``b`` (V,) is added
+    (see __init__). The pure KL-readout path is always available under use_prior_bank=True; this is
+    the opt-in ablation the user uses to compare with/without the prior-bank decode.
+
+    ``decode_precision_scaled`` (default OFF): feed the precision-weighted mean -- the diagonal
+    natural parameter eta = Sigma^-1 mu = mu_q/(sigma_q+eps) -- to the head instead of the bare mean,
+    so the belief covariance enters the DISCRIMINATIVE readout. OFF -> the bare mean (sigma_q
+    discarded, byte-identical).
     """
-    logits = mu_q @ pb.output_proj_weight.transpose(-1, -2)             # (B, N, V)
+    x = mu_q if not pb.decode_precision_scaled else mu_q / (sigma_q + pb.eps)   # eta = Sigma^-1 mu when ON
+    logits = x @ pb.output_proj_weight.transpose(-1, -2)               # (B, N, V)
     if pb.output_proj_bias is not None:
         logits = logits + pb.output_proj_bias                           # learned log-unigram prior
     return logits
