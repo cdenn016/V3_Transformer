@@ -1580,7 +1580,7 @@ class VFE3Config:
         return "detach" if self.detach_e_step else self.e_step_gradient
 
 
-def _require(value: Optional[str], valid: tuple, name: str) -> None:
+def _require(value: Optional[str], valid: Tuple[object, ...], name: str) -> None:
     """Raise ValueError unless ``value`` is one of ``valid``."""
     if value not in valid:
         raise ValueError(f"{name} must be one of {valid}, got {value!r}")

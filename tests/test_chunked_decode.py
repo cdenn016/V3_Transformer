@@ -219,6 +219,64 @@ def test_linear_chunked_ce_with_decode_bias():
     assert torch.allclose(b.grad, g_b_dense, atol=1e-5)
 
 
+def test_linear_chunked_ce_honors_decode_precision_scaled():
+    # decode_precision_scaled=True feeds eta = mu/(sigma+eps) to the head. The fused chunked CE must
+    # apply the SAME scaling as the dense _decode_linear path -- value and grads to mu, sigma, W.
+    # (audit 2026-06-17 finding 0/10: the chunked kernel previously used bare mu -> silent
+    # train/inference mismatch while inference scaled.)
+    torch.manual_seed(11)
+    V = 64
+    tokens = torch.randint(0, V, (3, 6))
+    targets = torch.randint(0, V, (3, 6))
+    targets[0, 2] = -100
+    m = _linear_model(vocab_size=V, decode_mode="diagonal_chunked", decode_chunk_size=13,
+                      decode_precision_scaled=True)
+    mu, sigma = _converged(m, tokens)
+    W = m.prior_bank.output_proj_weight
+    eps = m.prior_bank.eps
+
+    mu_a = mu.detach().clone().requires_grad_(True)
+    sig_a = sigma.detach().clone().requires_grad_(True)
+    dense = F.cross_entropy(
+        ((mu_a / (sig_a + eps)) @ W.transpose(-1, -2)).reshape(-1, V),
+        targets.reshape(-1), ignore_index=-100,
+    )
+    dense.backward()
+    g_mu_dense, g_sig_dense, g_w_dense = mu_a.grad.clone(), sig_a.grad.clone(), W.grad.clone()
+
+    for chunk in (13, V, 100):
+        W.grad = None
+        mu_b = mu.detach().clone().requires_grad_(True)
+        sig_b = sigma.detach().clone().requires_grad_(True)
+        ce = m.prior_bank.decode_ce_linear_chunked(mu_b, targets, sigma_q=sig_b, chunk_size=chunk)
+        assert torch.allclose(ce, dense, atol=1e-5), f"chunk={chunk} value"
+        ce.backward()
+        assert torch.allclose(mu_b.grad, g_mu_dense, atol=1e-5), f"chunk={chunk} mu grad"
+        assert torch.allclose(sig_b.grad, g_sig_dense, atol=1e-5), f"chunk={chunk} sigma grad"
+        assert torch.allclose(W.grad, g_w_dense, atol=1e-5), f"chunk={chunk} W grad"
+
+
+def test_linear_chunked_forward_matches_dense_with_precision_scaled():
+    # End-to-end: forward under use_prior_bank=False + diagonal_chunked + decode_precision_scaled
+    # must equal the dense precision-scaled decode -> F.cross_entropy path (call-site passes sigma).
+    torch.manual_seed(12)
+    V = 40
+    tokens = torch.randint(0, V, (3, 6))
+    targets = torch.randint(0, V, (3, 6))
+    base = _linear_model(vocab_size=V, decode_precision_scaled=True)     # dense
+    with torch.no_grad():                                                # make sigma load-bearing
+        base.prior_bank.sigma_log_embed.copy_(torch.randn_like(base.prior_bank.sigma_log_embed))
+    _, loss_full, ce_full = base(tokens, targets)
+
+    ch = _linear_model(vocab_size=V, decode_mode="diagonal_chunked", decode_chunk_size=9,
+                       decode_precision_scaled=True)
+    ch.load_state_dict(base.state_dict())
+    logits_ch, loss_ch, ce_ch = ch(tokens, targets)
+    assert logits_ch is None
+    assert torch.allclose(loss_ch, loss_full, atol=1e-5)
+    assert torch.allclose(ce_ch, ce_full, atol=1e-5)
+
+
 def test_linear_chunked_ce_all_ignore_is_finite_zero():
     torch.manual_seed(8)
     V = 32

@@ -568,19 +568,34 @@ class PriorBank(nn.Module):
         targets: torch.Tensor,           # (B, N) next-token ids (-100 = ignore)
 
         *,
-        chunk_size:   Optional[int]   = None,   # vocab-chunk width; None -> self.decode_chunk_size
-        ignore_index: int             = -100,
+        sigma_q:      Optional[torch.Tensor] = None,  # (B, N, K) variances; required iff decode_precision_scaled
+        chunk_size:   Optional[int]          = None,  # vocab-chunk width; None -> self.decode_chunk_size
+        ignore_index: int                    = -100,
     ) -> torch.Tensor:                   # () scalar mean cross-entropy
         r"""Fused chunked-vocab cross-entropy for the LINEAR decode (``use_prior_bank=False``).
 
-        The ``_decode_linear`` CE -- ``logits = mu_q @ W^T (+ b)`` -> ``F.cross_entropy`` --
-        WITHOUT the (B, N, V) logit tensor (plus cross_entropy's same-size log-softmax copy,
-        both retained for backward on the dense path; the dominant decode VRAM at large B,
-        vram audit 2026-06-10). Same streaming contract as ``decode_ce_diagonal_chunked``:
-        each vocab chunk's logits are born and die inside a gradient-checkpointed reduction
-        that returns only the (B, N) chunk logsumexp and target-logit summaries; recompute is
-        deterministic, so value and gradient (to mu_q, W, and b) match the dense path exactly.
+        The ``_decode_linear`` CE -- ``logits = x @ W^T (+ b)`` -> ``F.cross_entropy`` -- WITHOUT
+        the (B, N, V) logit tensor (plus cross_entropy's same-size log-softmax copy, both retained
+        for backward on the dense path; the dominant decode VRAM at large B, vram audit 2026-06-10).
+        Same streaming contract as ``decode_ce_diagonal_chunked``: each vocab chunk's logits are
+        born and die inside a gradient-checkpointed reduction that returns only the (B, N) chunk
+        logsumexp and target-logit summaries; recompute is deterministic, so value and gradient (to
+        mu_q, sigma_q, W, and b) match the dense path exactly.
+
+        ``decode_precision_scaled`` (default OFF): the head reads ``x = eta = Sigma^-1 mu =
+        mu_q/(sigma_q+eps)`` instead of the bare mean, byte-for-byte the same transform the dense
+        ``_decode_linear`` applies; ``sigma_q`` is then required. OFF -> ``x = mu_q`` (sigma_q
+        unused, byte-identical to the bare-mean path).
         """
+        # Match the dense _decode_linear precision scaling so train (fused/chunked) and inference
+        # (dense) decode the SAME logits; a silent mismatch otherwise (audit 2026-06-17).
+        if self.decode_precision_scaled:
+            if sigma_q is None:
+                raise ValueError(
+                    "decode_ce_linear_chunked requires sigma_q when decode_precision_scaled=True"
+                )
+            mu_q = mu_q / (sigma_q + self.eps)                             # eta = Sigma^-1 mu
+
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
         W = self.output_proj_weight                                        # (V, K)

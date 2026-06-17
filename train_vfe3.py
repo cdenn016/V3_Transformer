@@ -219,7 +219,7 @@ config = dict(
     precision_weighted_attention = True,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
                                                  # into the attention prior (diagnostic; OFF = position-only prior)
     precision_attention_b0       = 1.0,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
-    precision_attention_per_head = True,        # per-key reliability PER HEAD (trace over each block's coords) vs
+    precision_attention_per_head = False,        # per-key reliability PER HEAD (trace over each block's coords) vs
                                                  # global (all K); needs precision_weighted_attention=True
     #################################
     #         Belief E-step

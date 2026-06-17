@@ -158,7 +158,13 @@ def condition_number(
         spec = matrix.float().clamp(min=0.0)
         return (spec.max(dim=-1).values / spec.min(dim=-1).values.clamp(min=eps)).to(matrix.dtype)
     evals = torch.linalg.eigvalsh(_symmetrize(matrix.float()))
-    return (evals[..., -1] / evals[..., 0].clamp(min=eps)).to(matrix.dtype)
+    lam_min = evals[..., 0]
+    cond = evals[..., -1] / lam_min.clamp(min=eps)
+    # A non-PD matrix (lambda_min <= 0) has no condition number; surface +inf rather than the large
+    # positive value clamping a negative lambda_min up to eps would give (which reads as a merely
+    # ill-conditioned SPD matrix and hides the loss of positive-definiteness). (audit 2026-06-17)
+    cond = torch.where(lam_min > 0, cond, cond.new_tensor(float("inf")))
+    return cond.to(matrix.dtype)
 
 
 def nan_inf_fraction(

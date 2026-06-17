@@ -20,7 +20,7 @@ import torch
 def _press_slopes(
     n_heads: int,
     base:    float,
-    device,
+    device:  'torch.device | str | None',
     dtype:   torch.dtype,
 ) -> torch.Tensor:                          # (H,)
     r"""Press et al. geometric per-head ALiBi slopes: slope_h = base * 2^(-8*h / n_heads)."""
@@ -218,7 +218,11 @@ def _t5_relative_position_bucket(
     large = max_exact + (
         torch.log(n_large / max_exact) / math.log(max_distance / max_exact) * (nb - max_exact)
     ).long()
-    large = torch.minimum(large, torch.full_like(large, nb - 1))
+    # Self-protect against a degenerate max_distance <= max_exact, where log(max_distance/max_exact)
+    # is <= 0 and the .long() yields a negative sentinel: clamp into the valid [max_exact, nb-1] band
+    # so the bucket index is in-range independent of the config guard (audit 2026-06-17). A no-op for
+    # valid inputs (large is already >= max_exact there).
+    large = large.clamp(min=max_exact, max=nb - 1)
     return buckets + torch.where(is_small, n, large)
 
 

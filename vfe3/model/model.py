@@ -11,7 +11,7 @@ the batch around the (unbatched) E-step; decode and CE are batched.
 
 import inspect
 from contextlib import nullcontext
-from typing import Callable, Optional, Tuple, Dict
+from typing import Callable, Optional, Sequence, Tuple, Dict
 
 import torch
 import torch.nn.functional as F
@@ -686,15 +686,23 @@ class VFEModel(nn.Module):
             # Uses the belief sigma entering the block (post s-refine); broadcast over query (and head).
             # A new tensor is bound (no mutation of the cached position-only log_prior).
             if self.cfg.precision_weighted_attention:
-                if self.cfg.precision_attention_per_head:
+                if len(self.group.irrep_dims) == 1:
+                    # Single-block gauge group (glk/so_k/sp, or block_glk collapsed to n_heads==1):
+                    # the coupling energy is HEADLESS (B, N, N) (free_energy.py: irrep_dims None or
+                    # len 1), so the bias must fold WITHOUT a head axis. Per-head == global here (the
+                    # one block IS all K coords), so both modes take the global trace.
+                    kb = _precision_key_bias(beliefs.sigma, b0=self.cfg.precision_attention_b0).detach()  # (B, N)
+                    kb = kb[:, None, :]                          # (B, 1, N): query-broadcast, per key, no head axis
+                elif self.cfg.precision_attention_per_head:
                     kb = _precision_key_bias(beliefs.sigma, b0=self.cfg.precision_attention_b0,
                                              irrep_dims=self.group.irrep_dims).detach()  # (B, N, H)
                     kb = kb.permute(0, 2, 1).unsqueeze(-2)        # (B, H, 1, N): per-head, query-broadcast, per key
                 else:
                     kb = _precision_key_bias(beliefs.sigma, b0=self.cfg.precision_attention_b0).detach()  # (B, N)
                     kb = kb[:, None, None, :]                     # (B, 1, 1, N): head- & query-broadcast, per key
-                # adds onto the (N,N)/(H,N,N) position prior -> (B,*,N,N), broadcasting against the
-                # per-head energy (B, H, N, N) in attention_weights.
+                # adds onto the position prior and broadcasts against the coupling energy: the headless
+                # (B, N, N) energy for a single block (bias (B, 1, N)) or the per-head (B, H, N, N)
+                # energy for a multi-block gauge (bias (B, *, 1, N)) in attention_weights.
                 log_prior = kb if log_prior is None else log_prior + kb
             # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
             # M-step self-coupling term below (manuscript: the self-term reads q*, not the
@@ -756,9 +764,14 @@ class VFEModel(nn.Module):
                         mu_final.float(), sigma_final.float(), targets,
                     )
                 else:
-                    # linear ablation discards sigma; the chunked-CE path is rank-agnostic, so a
-                    # '*_chunked' decode_mode (diagonal_chunked or full_chunked) both route here.
-                    ce = self.prior_bank.decode_ce_linear_chunked(mu_final.float(), targets)
+                    # linear decode; the chunked-CE path is rank-agnostic, so a '*_chunked'
+                    # decode_mode (diagonal_chunked or full_chunked) both route here. sigma_q is
+                    # forwarded only when decode_precision_scaled (the head reads mu/(sigma+eps)),
+                    # matching the dense _decode_linear path; None keeps the bare-mean path identical.
+                    ce = self.prior_bank.decode_ce_linear_chunked(
+                        mu_final.float(), targets,
+                        sigma_q=(sigma_final.float() if self.cfg.decode_precision_scaled else None),
+                    )
             logits = None                                        # no (B, N, V) tensor on the fused path
         else:
             with self._amp_off_context(token_ids.device):

@@ -111,6 +111,20 @@ def test_full_kl_survives_non_pd_covariance():
     assert (kl <= 100.0 + 1e-3).all()
 
 
+def test_full_renyi_alpha_gt1_nonpd_blend_clamps_to_kl_max():
+    # alpha>1 leaves the convex regime: the blend (1-alpha)Sigma_q + alpha*Sigma_t can be indefinite,
+    # making the Renyi divergence undefined -> it must clamp to kl_max. A jitter-rescued Cholesky on
+    # the blend would silently report it PD and (with the fp64 logdet dropping the sign) collapse the
+    # divergence to ~0. The mask must gate on the blend's eigenvalue SIGN. (audit 2026-06-17 id 38.)
+    from vfe3.families.gaussian import FullGaussian
+    K = 4
+    q = FullGaussian(torch.zeros(K), torch.eye(K))
+    t = FullGaussian(torch.zeros(K), 1e-4 * torch.eye(K))         # blend ~ -0.0049 I (neg-definite)
+    div = q.renyi_closed_form(t, alpha=1.005, kl_max=100.0, eps=1e-6)
+    assert torch.isfinite(div).all()
+    assert div.item() > 50.0                                       # ~kl_max, NOT the spurious ~0
+
+
 def test_full_entropy_survives_non_pd_covariance():
     # FullGaussian.entropy must use the same safe (jittered, never-raising) Cholesky as the full-cov
     # KL: a raw torch.linalg.cholesky on a numerically non-PD Sigma raises and kills a diagnostics

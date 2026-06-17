@@ -12,9 +12,10 @@ Two sweep shapes are supported, both declared in the ``SWEEPS`` registry:
     for categorical comparisons whose arms differ in more than one field (e.g. a
     full-covariance arm that flips ``family`` and the per-coordinate alpha form together).
 
-The baseline is IMPORTED from ``train_vfe3.py`` (``from train_vfe3 import config``), so a
-sweep ablates around exactly what a normal ``train_vfe3.py`` run would train -- there is no
-second copy of the operating point to drift out of sync. Each run gets a self-contained
+The baseline is the self-contained ``BASELINE_CONFIG`` dict below -- a full ``VFE3Config`` toggle
+set kept deliberately separate from ``train_vfe3.py`` so an ablation can pin its own (fast)
+operating point. It currently matches train_vfe3.py's K=20 / block_glk point; keep the two in sync
+by hand when the training operating point moves. Each run gets a self-contained
 ``RunArtifacts`` directory (``config.json``, ``metrics.csv``, ``best_model.pt``, figures)
 nested under its sweep, plus an ``ablation_result.json`` headline used for resume and the
 sweep-level leaderboard.
@@ -508,7 +509,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "precision_attention_b0": {
         "description": "precision_attention_b0",
-        "param": "precision_attention_b0", "values": [1e-3, 0.025, 1.5, 2, 2.5],
+        "param": "precision_attention_b0", "values": [1.75, 2.25, 5],
     },
     "precision_attention_per_head": {  # per-key reliability per head (block trace) vs global (all K)
         "description": "precision-weighted attention reliability: global trace vs per-head block trace",
@@ -590,6 +591,21 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "kappa_beta": {
        "description": "attention temperature tau = kappa * sqrt(d_head)",
        "param": "kappa_beta", "range": [0.1, 1.3, 0.1],
+    },
+
+    "kappa_beta_per_head": {  # per-head tau_h = kappa_beta[h]*sqrt(d_head); list len MUST == n_heads
+        # Lists assume the baseline n_heads=2 on an equal-block group (block_glk/tied_block_glk);
+        # single-block groups (glk/so_k/sp) reject a list. Mean held at 1.0 so this isolates the
+        # per-head ASYMMETRY from the global-temperature axis the scalar 'kappa_beta' sweep covers;
+        # [1.0, 1.0] is the uniform reference and is byte-identical to the scalar kappa_beta=1 baseline.
+        "description": "per-head belief attention temperature (asymmetry at fixed mean 1.0, n_heads=2)",
+        "configs": [
+            {"label": "uniform_1.0",   "kappa_beta": [1.0, 1.0]},
+            {"label": "split_0.8_1.2", "kappa_beta": [0.8, 1.2]},
+            {"label": "split_1.2_0.8", "kappa_beta": [1.2, 0.8]},
+            {"label": "split_0.6_1.4", "kappa_beta": [0.6, 1.4]},
+            {"label": "split_1.4_0.6", "kappa_beta": [1.4, 0.6]},
+        ],
     },
    
   
@@ -998,7 +1014,7 @@ def run_single(
         if getattr(loader, "generator", None) is not None:
             loader.generator.manual_seed(cfg.seed)
 
-    print(f"    K={cfg.embed_dim} heads={cfg.n_heads} group={cfg.gauge_group} "
+    print(f"    K={cfg.embed_dim} heads={len(model.group.irrep_dims)} group={cfg.gauge_group} "
           f"family={cfg.family} | steps={cfg.max_steps} batch={cfg.batch_size} | {n_params:,} params")
     for _cov in coverage_lines(train_loader, cfg.max_steps, dataset):
         print(f"   {_cov}")

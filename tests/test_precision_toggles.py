@@ -215,3 +215,52 @@ def test_precision_attention_per_head_grad_flows():
     loss.backward()
     g = m.prior_bank.mu_embed.grad
     assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
+
+
+# ============================ feature 2c: single-block gauge groups (headless energy)
+# A single-block group (glk/so_k/sp, or block_glk collapsed to n_heads==1) produces a HEADLESS
+# (B,N,N) coupling energy -- no head axis. The precision bias must therefore be folded WITHOUT a
+# head axis, or the forward broadcasts wrong and raises. (audit 2026-06-17 finding 45/46.)
+
+def _single_block_model(seed: int = 0, **over) -> VFEModel:
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=1, gauge_group="glk", max_seq_len=5,
+                     n_layers=1, n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     mstep_self_coupling_weight=0.0, seed=seed, **over)
+    torch.manual_seed(seed)
+    return VFEModel(cfg)
+
+
+def test_precision_weighted_attention_single_block_forward_runs():
+    # Global pwa on a single-block (glk) group: the energy is headless (B,N,N); the bias must fold
+    # to (B,1,N), not (B,1,1,N). Previously this raised at the forward.
+    m = _single_block_model(seed=0, precision_weighted_attention=True)
+    assert len(m.group.irrep_dims) == 1                       # genuinely single-block
+    with torch.no_grad():
+        m.prior_bank.sigma_log_embed.copy_(torch.randn_like(m.prior_bank.sigma_log_embed))
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, loss, _ = m(tokens, targets)
+    assert torch.isfinite(loss).all()
+
+
+def test_precision_attention_per_head_single_block_forward_runs():
+    # Per-head pwa on a single-block group: one block == global, must also fold headless and run.
+    m = _single_block_model(seed=0, precision_weighted_attention=True,
+                            precision_attention_per_head=True)
+    with torch.no_grad():
+        m.prior_bank.sigma_log_embed.copy_(torch.randn_like(m.prior_bank.sigma_log_embed))
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, loss, _ = m(tokens, targets)
+    assert torch.isfinite(loss).all()
+
+
+def test_precision_weighted_attention_single_block_changes_forward_when_sigma_varies():
+    # And it is not inert: non-uniform key reliability moves the single-block forward too.
+    m_on = _single_block_model(seed=0, precision_weighted_attention=True)
+    m_off = _single_block_model(seed=0, precision_weighted_attention=False)
+    with torch.no_grad():
+        for m in (m_on, m_off):
+            m.prior_bank.sigma_log_embed.copy_(torch.randn_like(m.prior_bank.sigma_log_embed))
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, l_on, _ = m_on(tokens, targets)
+    _, l_off, _ = m_off(tokens, targets)
+    assert not torch.allclose(l_on, l_off, atol=1e-4)

@@ -57,16 +57,18 @@ class MahalanobisNorm:
         sigma: torch.Tensor,             # (..., K) diagonal OR (..., K, K) full covariances
     ) -> torch.Tensor:                   # (..., K) rescaled means
         r"""Rescale ``mu`` by the gauge-invariant Mahalanobis length."""
-        if sigma.dim() == mu.dim():
-            s2 = (mu ** 2 / sigma.clamp(min=self.eps)).sum(dim=-1, keepdim=True)
-        else:
+        if sigma.dim() == mu.dim() + 1:        # full covariance (..., K, K)
             # eps * I regularization (matching divergence._gaussian_full_renyi) so a
             # singular / near-singular Sigma does not raise torch._C._LinAlgError and
-            # crash the forward pass; bounds the conditioning the solve sees.
+            # crash the forward pass; bounds the conditioning the solve sees. Dispatch on the
+            # full-cov rank (mu.dim()+1), mirroring natural_gradient, so a full Sigma can never
+            # fall into the diagonal-only (non-gauge-invariant) formula (audit 2026-06-17).
             eye = torch.eye(self.K, device=sigma.device, dtype=sigma.dtype)        # (K, K)
             sigma_reg = sigma + self.eps * eye                                     # (..., K, K)
             sig_inv_mu = torch.linalg.solve(sigma_reg, mu.unsqueeze(-1)).squeeze(-1)   # Sigma^-1 mu
             s2 = (mu * sig_inv_mu).sum(dim=-1, keepdim=True)                       # mu^T Sigma^-1 mu
+        else:                                   # diagonal variances (..., K)
+            s2 = (mu ** 2 / sigma.clamp(min=self.eps)).sum(dim=-1, keepdim=True)
         return mu * torch.sqrt(self.K / s2.clamp(min=self.eps))
 
 
