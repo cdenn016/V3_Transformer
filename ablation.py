@@ -509,7 +509,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "precision_attention_b0": {
         "description": "precision_attention_b0",
-        "param": "precision_attention_b0", "values": [1e-3, 0.025, 1.5, 2, 2.5],
+        "param": "precision_attention_b0", "values": [1.75, 2.25, 5],
     },
     "precision_attention_per_head": {  # per-key reliability per head (block trace) vs global (all K)
         "description": "precision-weighted attention reliability: global trace vs per-head block trace",
@@ -591,6 +591,21 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "kappa_beta": {
        "description": "attention temperature tau = kappa * sqrt(d_head)",
        "param": "kappa_beta", "range": [0.1, 1.3, 0.1],
+    },
+
+    "kappa_beta_per_head": {  # per-head tau_h = kappa_beta[h]*sqrt(d_head); list len MUST == n_heads
+        # Lists assume the baseline n_heads=2 on an equal-block group (block_glk/tied_block_glk);
+        # single-block groups (glk/so_k/sp) reject a list. Mean held at 1.0 so this isolates the
+        # per-head ASYMMETRY from the global-temperature axis the scalar 'kappa_beta' sweep covers;
+        # [1.0, 1.0] is the uniform reference and is byte-identical to the scalar kappa_beta=1 baseline.
+        "description": "per-head belief attention temperature (asymmetry at fixed mean 1.0, n_heads=2)",
+        "configs": [
+            {"label": "uniform_1.0",   "kappa_beta": [1.0, 1.0]},
+            {"label": "split_0.8_1.2", "kappa_beta": [0.8, 1.2]},
+            {"label": "split_1.2_0.8", "kappa_beta": [1.2, 0.8]},
+            {"label": "split_0.6_1.4", "kappa_beta": [0.6, 1.4]},
+            {"label": "split_1.4_0.6", "kappa_beta": [1.4, 0.6]},
+        ],
     },
    
   
