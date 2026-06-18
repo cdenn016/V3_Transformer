@@ -1214,6 +1214,7 @@ class VFEModel(nn.Module):
             kb = kb.unsqueeze(-2).unsqueeze(-2)                                   # (.., 1, 1, N)
         return kb if log_prior is None else log_prior + kb
 
+    @torch.no_grad()
     def diagnostics(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
