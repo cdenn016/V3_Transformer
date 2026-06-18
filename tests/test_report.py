@@ -64,7 +64,10 @@ def test_generate_figures_drives_live_model(tmp_path):
     robust = {"estep_convergence.png", "belief_trajectories.png", "attention_structure.png",
               "gauge_equivariance.png", "gauge_head_specialization.png", "belief_spectrum.png",
               "spd_ellipses.png", "holonomy_curvature.png", "numerical_trust.png",
-              "belief_category_separation.png"}
+              "belief_category_separation.png",
+              # vocab next-token figures (decoder-free; default use_prior_bank=False -> decode_readout
+              # present; vocab_confusion needs the optional tokenizer so it is excluded like belief_umap).
+              "vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readout.png"}
     missing = robust - written
     assert not missing, f"driver did not produce {missing}"
     assert all((figdir / name).exists() for name in robust)
@@ -90,7 +93,12 @@ def test_finalize_autoruns_figures(tmp_path):
                    val_loader=_loader(seed=1), artifacts=art)
     finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
     figs = list((tmp_path / "run" / "figures").glob("*.png"))
+    names = {f.name for f in figs}
     assert len(figs) >= 6, f"autorun produced too few figures: {[f.name for f in figs]}"
+    # The vocabulary next-token figures are part of the finalize_run autorun (i.e. produced by
+    # train_vfe3.py): default use_prior_bank=False -> decode_readout present; the synthetic-period3
+    # dataset has no tokenizer so vocab_confusion is skipped.
+    assert {"vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readout.png"} <= names
 
 
 def test_finalize_skips_figures_when_disabled(tmp_path):

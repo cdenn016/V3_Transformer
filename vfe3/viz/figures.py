@@ -2070,3 +2070,180 @@ def plot_inference_capacity(
     fig.suptitle(f"{title} ({note})")
     fig.tight_layout()
     return _save(fig, path)
+
+
+# ===========================================================================
+# Vocabulary next-token probability figures. Each takes a LIST of arms -- one
+# arm (the single-run pipeline) renders one column; two arms (the cross-run
+# driver, e.g. K70 vs K120) render side-by-side panels for a collapse contrast.
+# Data come from vfe3.viz.extract.vocab_prediction_stats / decode_readout.
+# ===========================================================================
+
+
+def _tok_label(decode, tid) -> str:
+    r"""A short printable label for vocab id ``tid`` (decoded text, or the id with no decoder)."""
+    if decode is None:
+        return str(int(tid))
+    try:
+        s = decode([int(tid)])
+    except Exception:
+        return str(int(tid))
+    if s == "" or s.isspace():
+        return {" ": "·", "\n": "\\n", "\t": "\\t"}.get(s, "␣")  # show whitespace visibly
+    s = s.replace("\n", "\\n")
+    return s if len(s) <= 12 else s[:11] + "…"
+
+
+@register_figure("vocab_probability_heatmap")
+def plot_vocab_probability_heatmap(
+    arms,                                # list of vocab_prediction_stats dicts (+ "label")
+
+    *,
+    decode: Optional[Callable] = None,
+    cmap:   str = "magma",
+    path:   Optional[str]      = None,
+):
+    r"""Seq x top-k heatmap of ``p(o_{n+1} | o_{<=n})``: rows are the most-probable tokens, columns
+    the sequence positions, a green box marks the true next token. Bright horizontal bands (the same
+    tokens lit at every position regardless of context) are the visual signature of prior collapse;
+    a context-tracking model puts the bright cell on the boxed ground truth. One column per arm."""
+    arms = list(arms)
+    n = max(1, len(arms))
+    R = max((int(_np(a["disp_probs"]).shape[0]) for a in arms), default=1)
+    P = max((int(_np(a["disp_probs"]).shape[1]) for a in arms), default=1)
+    fig, axes = plt.subplots(1, n, figsize=(max(4.5, 0.13 * P) * n, max(3.6, 0.17 * R)), squeeze=False)
+    for ax, arm in zip(axes[0], arms):
+        prob = _np(arm["disp_probs"])                            # (R, P)
+        rows = _np(arm["row_ids"]).astype(int)
+        truth = _np(arm["disp_truth_row"]).astype(int)
+        pos = prob[prob > 0]
+        vmax = float(prob.max()) if prob.size else 1.0
+        vmin = float(pos.min()) if pos.size else vmax * 1e-4
+        vmin = max(vmin, vmax * 1e-4, 1e-12)
+        im = ax.imshow(prob, aspect="auto", cmap=cmap, norm=LogNorm(vmin=vmin, vmax=max(vmax, vmin * 1.1)))
+        ax.set_yticks(range(prob.shape[0]))
+        ax.set_yticklabels([_tok_label(decode, t) for t in rows], fontsize=6)
+        ax.set_xlabel("sequence position")
+        for p in range(min(prob.shape[1], truth.shape[0])):
+            r = int(truth[p])
+            if r >= 0:
+                ax.add_patch(plt.Rectangle((p - 0.5, r - 0.5), 1.0, 1.0, fill=False,
+                                           edgecolor="#00E000", lw=0.7, zorder=5))
+        ax.set_title(str(arm.get("label", "")))
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label="P(token | context)")
+    fig.suptitle("Next-token vocabulary probabilities (rows = top predicted; green box = true next token)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("vocab_calibration")
+def plot_vocab_calibration(
+    arms,                                # list of vocab_prediction_stats dicts (+ "label")
+
+    *,
+    decode: Optional[Callable] = None,   # unused; kept for a uniform arm-figure signature
+    path:   Optional[str]      = None,
+):
+    r"""Per-token mean predicted probability vs empirical next-token unigram frequency (log-log
+    hexbin), with the ``y=x`` marginal-predictor reference. Mass hugging ``y=x`` together with a
+    context-information gain ``H_uni - H_pred`` near zero means the model has collapsed to the
+    marginal and is ignoring context. One column per arm."""
+    arms = list(arms)
+    n = max(1, len(arms))
+    fig, axes = plt.subplots(1, n, figsize=(4.8 * n, 4.3), squeeze=False)
+    for ax, arm in zip(axes[0], arms):
+        uni = _np(arm["unigram"])
+        mp = _np(arm["mean_pred_prob"])
+        m = uni > 0
+        x = np.log10(uni[m])
+        y = np.log10(np.clip(mp[m], 1e-12, None))
+        if x.size:
+            hb = ax.hexbin(x, y, gridsize=40, bins="log", cmap="viridis", mincnt=1)
+            fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.02, label="tokens (log)")
+            lo = float(min(x.min(), y.min()))
+            hi = float(max(x.max(), y.max()))
+            ax.plot([lo, hi], [lo, hi], color=_CB[1], lw=1.2, ls="--", label="y=x (marginal predictor)")
+            ax.legend(fontsize=7, frameon=False, loc="best")
+        hp = float(arm.get("mean_pred_entropy", float("nan")))
+        hu = float(arm.get("unigram_entropy", float("nan")))
+        ax.set_xlabel("log10 empirical next-token freq")
+        ax.set_ylabel("log10 mean predicted prob")
+        ax.set_title(f"{arm.get('label', '')}  Hpred={hp:.2f}  Huni={hu:.2f}  gain={hu - hp:.2f}")
+    fig.suptitle("Vocabulary calibration: predicted prob vs unigram (collapse -> mass on y=x, gain -> 0)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("vocab_confusion")
+def plot_vocab_confusion(
+    arms,                                # list of vocab_prediction_stats dicts (+ "label")
+
+    *,
+    decode:   Optional[Callable] = None,
+    taxonomy: str = "function_content",
+    path:     Optional[str]      = None,
+):
+    r"""Row-normalized next-token category confusion: true category (rows) vs argmax-predicted
+    category (columns), bucketed by ``taxonomy`` (the 50257-token vocab is uncountable as a raw
+    confusion matrix). Mass concentrating in a single predicted column -- everything predicted as
+    one frequent category -- is collapse. Needs a decoder for the category bucketing. One column
+    per arm."""
+    if decode is None:
+        raise ValueError("plot_vocab_confusion needs a token decoder for category bucketing")
+    arms = list(arms)
+    n = max(1, len(arms))
+    fig, axes = plt.subplots(1, n, figsize=(5.0 * n, 4.5), squeeze=False)
+    for ax, arm in zip(axes[0], arms):
+        true_ids = _np(arm["true_ids"]).astype(int)
+        pred_ids = _np(arm["pred_ids"]).astype(int)
+        tcat, names = _token_category_labels(true_ids, decode, taxonomy)
+        pcat, _ = _token_category_labels(pred_ids, decode, taxonomy)
+        C = len(names)
+        M = np.zeros((C, C), dtype=float)
+        np.add.at(M, (tcat.astype(int), pcat.astype(int)), 1.0)
+        Mn = M / np.clip(M.sum(axis=1, keepdims=True), 1.0, None)
+        im = ax.imshow(Mn, cmap="magma", vmin=0.0, vmax=1.0, aspect="auto")
+        ax.set_xticks(range(C)); ax.set_xticklabels(names, rotation=45, ha="right", fontsize=7)
+        ax.set_yticks(range(C)); ax.set_yticklabels(names, fontsize=7)
+        ax.set_xlabel("predicted category"); ax.set_ylabel("true next-token category")
+        ax.set_title(str(arm.get("label", "")))
+        for i in range(C):
+            for j in range(C):
+                ax.text(j, i, f"{Mn[i, j]:.2f}", ha="center", va="center", fontsize=6,
+                        color="white" if Mn[i, j] < 0.6 else "black")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label="P(pred cat | true cat)")
+    fig.suptitle(f"Next-token category confusion ({taxonomy}, row-normalized)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("decode_readout")
+def plot_decode_readout(
+    arms,                                # list of decode_readout dicts (+ "label")
+
+    *,
+    decode: Optional[Callable] = None,
+    path:   Optional[str]      = None,
+):
+    r"""The linear-decode readout matrix ``W`` (``logits = mu_q @ W^T``): the top-norm vocabulary
+    rows over the ``K`` latent dimensions, diverging colormap centered at zero. Structure here is
+    the learned output embedding; a near-flat or low-rank readout under-uses the latent space. One
+    column per arm."""
+    arms = list(arms)
+    n = max(1, len(arms))
+    R = max((int(_np(a["weight"]).shape[0]) for a in arms), default=1)
+    fig, axes = plt.subplots(1, n, figsize=(5.0 * n, max(4.2, 0.06 * R)), squeeze=False)
+    for ax, arm in zip(axes[0], arms):
+        W = _np(arm["weight"])                                   # (R, K)
+        rows = _np(arm["row_ids"]).astype(int)
+        mag = float(np.abs(W).max()) or 1.0
+        im = ax.imshow(W, cmap="coolwarm", vmin=-mag, vmax=mag, aspect="auto")
+        step = max(1, W.shape[0] // 40)
+        ax.set_yticks(range(0, W.shape[0], step))
+        ax.set_yticklabels([_tok_label(decode, rows[i]) for i in range(0, W.shape[0], step)], fontsize=6)
+        ax.set_xlabel("latent dimension k")
+        ax.set_title(str(arm.get("label", "")))
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label="W[v, k]")
+    fig.suptitle("Linear decode readout W (top-norm vocab rows): logits = mu_q @ W^T")
+    fig.tight_layout()
+    return _save(fig, path)

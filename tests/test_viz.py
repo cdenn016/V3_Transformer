@@ -39,9 +39,16 @@ from vfe3.viz.figures import (
     plot_pareto_frontier,
     plot_spd_ellipses,
     plot_trajectory,
+    plot_vocab_calibration,
+    plot_vocab_confusion,
+    plot_vocab_probability_heatmap,
+    plot_decode_readout,
     set_publication_style,
     umap_embed,
 )
+from vfe3.config import VFE3Config
+from vfe3.model.model import VFEModel
+from vfe3.viz import extract
 
 
 def _saved_nonempty(path):
@@ -439,3 +446,74 @@ def test_plot_numerical_trust_saves(tmp_path):
     p = tmp_path / "f13.png"
     fig = plot_numerical_trust(guard, health, causal, path=str(p)); plt.close(fig)
     assert _saved_nonempty(p)
+
+
+# --- vocabulary next-token probability figures (extractors + the four arm-list plotters) ---
+
+def _vocab_model(**kw):
+    base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.05)
+    base.update(kw)
+    torch.manual_seed(0)
+    return VFEModel(VFE3Config(**base))
+
+
+def _vocab_batches(bs=3, n=8, nb=2):
+    g = torch.Generator().manual_seed(0)
+    return [torch.randint(0, 12, (bs, n), generator=g) for _ in range(nb)]
+
+
+def _fake_decode(ids):                                            # leading-space word-ish gpt2-style tokens
+    return " " + "".join(chr(97 + (int(i) % 26)) for i in ids)
+
+
+def test_vocab_prediction_stats_shapes_and_invariants():
+    st = extract.vocab_prediction_stats(_vocab_model(use_prior_bank=False), _vocab_batches(),
+                                        max_rows=6, per_pos_k=2, max_positions=6)
+    R, P = st["disp_probs"].shape
+    assert R <= 6 and R == st["row_ids"].shape[0]
+    assert P == st["disp_truth_row"].shape[0] == st["disp_target_ids"].shape[0]
+    assert st["mean_pred_prob"].shape == (12,) and st["unigram"].shape == (12,)
+    assert torch.isfinite(st["disp_probs"]).all()
+    # mean over per-position softmaxes is a convex combination of distributions -> still sums to 1
+    assert abs(float(st["mean_pred_prob"].sum()) - 1.0) < 1e-4
+    assert abs(float(st["unigram"].sum()) - 1.0) < 1e-4
+    assert st["mean_pred_entropy"] > 0.0 and st["unigram_entropy"] > 0.0
+    assert st["true_ids"].shape == st["pred_ids"].shape
+
+
+def test_decode_readout_present_only_off_prior_bank():
+    assert extract.decode_readout(_vocab_model(use_prior_bank=True)) is None      # KL-to-prior decode -> no W
+    ro = extract.decode_readout(_vocab_model(use_prior_bank=False), max_rows=5)
+    assert ro is not None and ro["weight"].shape == (5, 4) and ro["row_ids"].shape == (5,)
+
+
+def test_vocab_figures_single_and_two_arm_save(tmp_path):
+    model = _vocab_model(use_prior_bank=False)
+    st = extract.vocab_prediction_stats(model, _vocab_batches(), max_rows=6, per_pos_k=2, max_positions=6)
+    ro = extract.decode_readout(model, max_rows=6)
+    one = [{**st, "label": "K4"}]
+    two = [{**st, "label": "A"}, {**st, "label": "B"}]                            # the side-by-side comparison path
+    cases = [
+        ("ph1",  lambda p: plot_vocab_probability_heatmap(one, decode=_fake_decode, path=p)),
+        ("ph2",  lambda p: plot_vocab_probability_heatmap(two, decode=_fake_decode, path=p)),
+        ("cal",  lambda p: plot_vocab_calibration(two, decode=_fake_decode, path=p)),
+        ("conf", lambda p: plot_vocab_confusion(two, decode=_fake_decode, path=p)),
+        ("ro",   lambda p: plot_decode_readout([{**ro, "label": "K4"}], decode=_fake_decode, path=p)),
+    ]
+    for name, fn in cases:
+        p = tmp_path / f"{name}.png"
+        fig = fn(str(p)); plt.close(fig)
+        assert _saved_nonempty(p)
+
+
+def test_vocab_confusion_requires_decoder():
+    st = extract.vocab_prediction_stats(_vocab_model(use_prior_bank=False), _vocab_batches(),
+                                        max_rows=4, per_pos_k=2, max_positions=4)
+    with pytest.raises(ValueError):
+        plot_vocab_confusion([{**st, "label": "x"}], decode=None)
+
+
+def test_vocab_figures_registered():
+    for name in ("vocab_probability_heatmap", "vocab_calibration", "vocab_confusion", "decode_readout"):
+        assert callable(get_figure(name))
