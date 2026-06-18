@@ -287,7 +287,11 @@ config = dict(
     log_interval              = 100,       # console log every N steps (0 = off)
     eval_interval             = 1500,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 25000,     # save a resumable checkpoint every N steps (0 = off)
-               
+
+    use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF = pure
+                                           # path: model is the last SGD iterate). ON: eval/best-save/final
+                                           # model use the running average s <- ema_decay*s + (1-ema_decay)*theta
+    ema_decay                 = 0.999,     # EMA decay in (0,1); only read when use_ema=True
 )
 
 

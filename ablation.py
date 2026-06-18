@@ -299,7 +299,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     log_interval              = 2500,       # console log every N steps (0 = off)
     eval_interval             = 10000,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 25000,     # save a resumable checkpoint every N steps (0 = off)
-    
+
+    use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF)
+    ema_decay                 = 0.999,     # EMA decay in (0,1); only read when use_ema=True
 )
 
 
@@ -696,6 +698,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "phi_weight_decay":{
         "description": "weight decay on phi",
         "param": "phi_weight_decay", "range": [0.01, 0.1, 0.01],
+    },
+
+    "use_ema": {
+        "description": "EMA/Polyak weight averaging off vs on (eval/best-save/final use the average)",
+        "param": "use_ema", "values": [False, True],
+    },
+    "ema_decay": {
+        "description": "EMA decay rate (slower average as decay -> 1); requires use_ema=True",
+        "param": "ema_decay", "values": [0.99, 0.999, 0.9995], "requires": {"use_ema": True},
     },
 }
 

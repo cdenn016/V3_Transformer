@@ -491,6 +491,16 @@ class VFE3Config:
     # LambdaLR at the saved step, then continues from step N to max_steps. An explicit train(resume_from=...)
     # argument takes precedence over this field. None leaves train() byte-identical to the from-scratch loop.
     resume_from:               Optional[str] = None
+
+    # Opt-in EMA / Polyak weight averaging (default OFF = the pure path: no shadow, the trained model
+    # IS the last SGD iterate). When on, train() keeps an exponential moving average of the trainable
+    # tables, s <- ema_decay*s + (1-ema_decay)*theta after each optimizer step, swaps it in for
+    # evaluation/best-save, and copies it into the model at the end. EMA reads params only (no RNG, no
+    # grad/optimizer touch), so the SGD trajectory is byte-identical to the OFF path; only the reported
+    # eval and the final weights change. ema_decay must be in (0, 1) when use_ema is on.
+    use_ema:                   bool  = False
+    ema_decay:                 float = 0.999
+
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
     generate_figures:          bool          = True         # auto-run the single-run publication figures at finalize_run (off the hot path)
     
@@ -1516,6 +1526,9 @@ class VFE3Config:
             )
         if self.eval_max_batches is not None and self.eval_max_batches < 1:
             raise ValueError(f"eval_max_batches must be >= 1 if set, got {self.eval_max_batches}")
+        # EMA decay validated only when the averaging is on (inert otherwise -> the OFF path never reads it).
+        if self.use_ema and not (0.0 < self.ema_decay < 1.0):
+            raise ValueError(f"ema_decay must be in (0, 1) when use_ema=True, got {self.ema_decay}")
         # amp_dtype: None (default, OFF) = pure fp32 / no autocast; 'bf16' / 'fp16' enable autocast.
         # None is a legal member here, so _require rejects 'fp32' and any other garbage. fp16 is
         # accepted for FORWARD/inference; fp16 TRAINING still needs a GradScaler in the M-step
