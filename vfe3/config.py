@@ -1458,12 +1458,19 @@ class VFE3Config:
         # is the flat-transport gradient and drops d Omega/d mu), regardless of the kernel-family
         # predicate below -- so connection_W training requires oracle_unroll_grad=True on every
         # regime_ii config.
-        _routes_to_oracle = self.transport_mode == "regime_ii" or not (
-            self.gradient_mode == "filtering"
-            and self.family == "gaussian_diagonal"
-            and self.divergence_family == "renyi"
-            and self.renyi_order == 1.0
-            and self.include_attention_entropy
+        # The decoupled value gauge (pos_rotation='rope' + rope_on_value=False) also forces the oracle
+        # route -- uses_kernel_route gates on `and not decoupled_value_gauge` (kernels.py) -- so the
+        # freeze warning must include it or it silently misses a frozen E-step param there (r2 id2).
+        _routes_to_oracle = (
+            self.transport_mode == "regime_ii"
+            or (self.pos_rotation == "rope" and not self.rope_on_value)
+            or not (
+                self.gradient_mode == "filtering"
+                and self.family == "gaussian_diagonal"
+                and self.divergence_family == "renyi"
+                and self.renyi_order == 1.0
+                and self.include_attention_entropy
+            )
         )
         if (
             self.e_step_gradient == "unroll"

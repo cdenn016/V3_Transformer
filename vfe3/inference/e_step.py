@@ -167,6 +167,7 @@ def free_energy_value(
     e_sigma_q_trust:           float = 5.0,            # accepted-and-ignored iteration-only knob
     e_mu_q_trust:              Optional[float] = None, # accepted-and-ignored iteration-only knob
     mu_trust_mode:             str  = "box",           # accepted-and-ignored iteration-only knob
+    mass_phi:                  float = 0.0,            # accepted-and-ignored iteration-only knob (phi penalty)
 
     include_attention_entropy: bool = True,
     rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
@@ -283,7 +284,10 @@ def phi_alignment_loss(
     include_attention_entropy: bool  = True,
     transport_mode:            str   = "flat",        # connection-regime registry key (default flat)
     cocycle_relaxation:        float = 1.0,           # regime_ii homotopy alpha; 0 -> flat
+    rope_on_cov:               bool  = False,         # gauge-RoPE: rotate the covariance sandwich too
+    rope_on_value:             bool  = True,          # False -> value aggregation uses the un-rotated base
 
+    rope:         Optional[torch.Tensor] = None,      # (N,K,K) gauge-RoPE rotation (None -> off)
     log_prior:    Optional[torch.Tensor] = None,
     connection_W: Optional[torch.Tensor] = None,      # learned regime_ii connection (held fixed here)
 ) -> torch.Tensor:
@@ -308,7 +312,8 @@ def phi_alignment_loss(
     # phi-gradient is preserved while the per-iteration dense (N,N,K,K) Omega disappears on the
     # flat equal-blocks path.
     omega = build_belief_transport(phi, group, transport_mode=transport_mode, mu=mu,
-                                   connection_W=connection_W, cocycle_relaxation=cocycle_relaxation)
+                                   connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
+                                   rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value)
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma)
     fam = get_family(family)
@@ -509,6 +514,10 @@ def e_step_iteration(
                 mass_phi=mass_phi, lambda_beta=lambda_beta, family=family, divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy, log_prior=log_prior,
                 transport_mode=transport_mode, cocycle_relaxation=cocycle_relaxation,
+                # gauge-RoPE: the phi step must descend the SAME rotated belief-coupling block as the
+                # mu/sigma step, else under pos_rotation='rope' + e_phi_lr>0 phi optimizes a different
+                # free energy than mu/sigma (audit 2026-06-17 round 2 id15). None/off -> byte-identical.
+                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                 # INTENTIONAL asymmetry (audit 2026-06-09 D3): connection_W is detached here, so
                 # the learned Regime-II connection trains ONLY through the mu/sigma belief path,
                 # never through the phi-step autograd island (whose grad is a constant tangent to

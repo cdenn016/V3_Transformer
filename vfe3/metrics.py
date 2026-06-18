@@ -144,10 +144,16 @@ def free_energy_terms(
         self_term = self_term + alpha_reg
     self_coupling = float(self_term.sum())
     belief_coupling = float((beta * energy).sum())
-    pi = torch.softmax(log_prior, dim=-1) if log_prior is not None else torch.full_like(beta, 1.0 / beta.shape[-1])
+    # log pi WITHOUT materializing a full (H,N,N) uniform-pi tensor: with log_prior=None, pi=1/N is
+    # uniform so log(pi)=-log(N) is a scalar (audit 2026-06-17 r2 id9; the scalar new_tensor(1/N) keeps
+    # the value byte-identical to the old full_like alloc). The log_prior branch is unchanged.
+    if log_prior is not None:
+        log_pi = torch.log(torch.softmax(log_prior, dim=-1).clamp(min=eps))
+    else:
+        log_pi = torch.log(beta.new_tensor(1.0 / beta.shape[-1]).clamp(min=eps))
     from vfe3.free_energy import _broadcast_tau          # align a per-head (H,) tau to the head axis
     _tau_e = _broadcast_tau(tau, energy)
-    entropy = float((_tau_e * (beta * (torch.log(beta.clamp(min=eps)) - torch.log(pi.clamp(min=eps))))).sum())
+    entropy = float((_tau_e * (beta * (torch.log(beta.clamp(min=eps)) - log_pi))).sum())
     total = self_coupling + float(lambda_beta) * belief_coupling
     if include_attention_entropy:
         total = total + float(lambda_beta) * entropy

@@ -319,8 +319,16 @@ def numerical_health(
         connection_W=getattr(model, "connection_W", None),
         cocycle_relaxation=cfg.cocycle_relaxation,
     )
-    mu_t = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
-    sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
+    # Wrap in RopeTransport under pos_rotation='rope' so the reported nan/energy/beta fractions
+    # describe the RoPE-rotated belief the model runs, mirroring converged_state/diagnostics (r2 id11).
+    if rope is not None:
+        rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                                   on_value=cfg.rope_on_value)
+        mu_t    = transport_mean(rope_omega, out.mu)
+        sigma_t = transport_covariance(rope_omega, out.sigma)
+    else:
+        mu_t = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
+        sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
     fam = get_family(cfg.family)
     energy = pairwise_energy(fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.renyi_order,
                              kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,

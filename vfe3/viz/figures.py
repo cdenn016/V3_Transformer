@@ -311,9 +311,14 @@ def _rolling_mean(v: np.ndarray, window: int) -> np.ndarray:
         return v
     window = int(min(window, v.size))
     kernel = np.ones(window)
-    num = np.convolve(v, kernel, mode="same")
-    den = np.convolve(np.ones_like(v), kernel, mode="same")     # tap count per position (edge-correct)
-    return num / den
+    # NaN-aware: average only the FINITE taps in each window, so a single non-positive point (NaN'd
+    # for a log-y axis) does not blank a whole window-width segment of the trend (audit r2 id13).
+    # All-finite input -> mask all True -> byte-identical to the plain edge-normalized average.
+    mask = np.isfinite(v)
+    num = np.convolve(np.where(mask, v, 0.0), kernel, mode="same")
+    den = np.convolve(mask.astype(v.dtype), kernel, mode="same")  # finite-tap count per position
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return num / den
 
 
 def _kstep(v, _pos=None) -> str:
@@ -482,8 +487,15 @@ def _belief_channel_features(bank: Dict, channel: str):
         sym = 0.5 * (sig + sig.transpose(-1, -2))               # (M, K, K) full -> vech(log Sigma)
         w, q = torch.linalg.eigh(sym)
         log_sigma = (q * torch.log(w.clamp(min=1e-12)).unsqueeze(-2)) @ q.transpose(-1, -2)
-        iu = torch.triu_indices(log_sigma.shape[-1], log_sigma.shape[-1])
-        return log_sigma[..., iu[0], iu[1]]
+        K = log_sigma.shape[-1]
+        iu = torch.triu_indices(K, K)
+        vech = log_sigma[..., iu[0], iu[1]].clone()
+        # Scale off-diagonals by sqrt(2) so the Euclidean vech metric equals the Frobenius / log-
+        # Euclidean distance the UMAP embedding claims to respect (each off-diagonal appears twice in
+        # the symmetric matrix; the diagonal once) (audit r2 id12).
+        offdiag = iu[0] != iu[1]
+        vech[..., offdiag] = vech[..., offdiag] * (2.0 ** 0.5)
+        return vech
     raise ValueError(f"unknown belief channel {channel!r} (expected mu / sigma / phi)")
 
 

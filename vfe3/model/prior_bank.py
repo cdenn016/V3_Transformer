@@ -720,8 +720,8 @@ def _decode_diagonal(
     # a_v == sum_k(sigma_q/sigma_v + (mc_q-mc_v)^2/sigma_v) + sum_k log sigma_v
     #     == sum_k(sigma_q/sigma_v + (mu_q-mu_v)^2/sigma_v) + sum_k log sigma_v = 2 KL + K + sum_k log sigma_q
     per_pos = pb.K + torch.log(sigma_q.clamp(min=pb.eps)).sum(-1, keepdim=True)   # (B, N, 1) = K + sum_k log sigma_q
-    kl_v = 0.5 * (a_v - per_pos)                                         # (B, N, V)
-    return -kl_v / tau_eff
+    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0)                        # (B, N, V); KL>=0 floor matches
+    return -kl_v / tau_eff                                               # reference_decode's safe_kl_clamp (r2 id17)
 
 
 @register_decode("diagonal_chunked")

@@ -70,7 +70,9 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
         prov = _read_json(run / "provenance.json")
         cell = _read_json(run / "scaling_cell.json")
         test = _read_json(run / "test_results.json")
-        test_ce = sp.get("test_ce", test.get("test_ce"))
+        test_ce = sp.get("test_ce")                          # coalesce: dict.get's default fires only on
+        if test_ce is None:                                  # a MISSING key, not an explicit null, so a
+            test_ce = test.get("test_ce")                    # run with test_ce=null would drop a real value (r2 id14)
         rows.append({
             "run_dir":     str(run),
             "route":       cell.get("route", "(unlabeled)"),
@@ -162,19 +164,24 @@ def bootstrap_exponent_ci(
     points:      List[Dict[str, Any]],
 
     *,
+    weights:     Optional[np.ndarray] = None,
     n_boot:      int = 2000,
     with_offset: bool = False,
 ) -> Tuple[float, float, float]:
     r"""Nested cluster bootstrap of the power-law exponent: each replicate resamples the SIZE points
     with replacement (the lever-arm effect) and, within each kept point, resamples its seed CEs, then
-    refits. Returns (alpha_hat, lo2.5, hi97.5). Needs >= 2 points; degenerate -> NaNs."""
+    refits. Returns (alpha_hat, lo2.5, hi97.5). Needs >= 2 points; degenerate -> NaNs.
+
+    ``weights`` (per-point, same order as ``points``) MUST match the headline fit's weighting so the
+    point estimate and the CI come from ONE estimator -- otherwise a weighted headline alpha can sit
+    outside its own unweighted CI (audit r2 id10). Resampled per replicate as ``weights[idx]``."""
     from vfe3.viz.figures import _fit_power_law
     xs = np.array([p["n_params"] for p in points], dtype=float)
     if xs.size < 2:
         return float("nan"), float("nan"), float("nan")
     seed_arrays = [np.asarray(p["ce_seeds"], dtype=float) for p in points]
     means = np.array([a.mean() for a in seed_arrays])
-    alpha_hat = _fit_power_law(xs, means, with_offset=with_offset)["alpha"]
+    alpha_hat = _fit_power_law(xs, means, weights=weights, with_offset=with_offset)["alpha"]
     rng = np.random.default_rng(0)                           # fixed -> reproducible CI
     boot: List[float] = []
     n = len(points)
@@ -182,7 +189,8 @@ def bootstrap_exponent_ci(
         idx = rng.integers(0, n, n)
         bx = xs[idx]
         by = np.array([float(rng.choice(seed_arrays[i], size=seed_arrays[i].size).mean()) for i in idx])
-        a = _fit_power_law(bx, by, with_offset=with_offset)["alpha"]
+        bw = weights[idx] if weights is not None else None
+        a = _fit_power_law(bx, by, weights=bw, with_offset=with_offset)["alpha"]
         if np.isfinite(a):
             boot.append(a)
     if not boot:
@@ -286,7 +294,7 @@ def analyze() -> None:
         sem = np.array([p["ce_sem"] for p in param_points], dtype=float)
         w = np.where(sem > 0, (ys / np.where(sem > 0, sem, 1.0)) ** 2, 1.0)
         fit = _fit_power_law(xs, ys, weights=w, with_offset=CONFIG["with_offset"])
-        a_hat, lo, hi = bootstrap_exponent_ci(param_points, n_boot=CONFIG["n_bootstrap"],
+        a_hat, lo, hi = bootstrap_exponent_ci(param_points, weights=w, n_boot=CONFIG["n_bootstrap"],
                                               with_offset=CONFIG["with_offset"])
         print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}  "
               f"[95% CI {lo:.4f}, {hi:.4f}]   A = {fit['A']:.4g}   "
