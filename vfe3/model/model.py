@@ -227,6 +227,24 @@ class VFEModel(nn.Module):
                     "stays flat. Set detach_e_step=False to train the Regime-II connection.",
                     stacklevel=2,
                 )
+        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): the LEARNED gauge-COVARIANT (Route B)
+        # Regime-II connection M. delta_ij^a = cocycle_relaxation * sum_f M^a_f I^f_ij, with I^f the
+        # GAUGE-INVARIANT (Mahalanobis, trace, log-det) features of the (query, transported-key)
+        # belief pair (transport._build_regime_ii_covariant). Unlike connection_W (gauge-invariant
+        # ONLY at W=0), the transport stays gauge-covariant (Omega_ij -> g_i Omega_ij g_j^{-1}) for
+        # ANY M. Shape (n_gen, 3); init ZERO -> delta=0 -> flat cocycle at init (fp32; the generic
+        # path keeps d Omega/d M alive). NOT created on the flat / regime_ii paths (param-free).
+        if cfg.transport_mode == "regime_ii_covariant":
+            self.connection_M = nn.Parameter(torch.zeros(n_gen, 3))
+            if cfg.detach_e_step:
+                import warnings
+                warnings.warn(
+                    "transport_mode='regime_ii_covariant' with detach_e_step=True freezes connection_M: "
+                    "the learned edge connection enters the loss only through the E-step, which the "
+                    "detached (no_grad) E-step severs, so connection_M.grad is None and the transport "
+                    "stays flat. Set detach_e_step=False to train the Route-B connection.",
+                    stacklevel=2,
+                )
         if cfg.lambda_alpha_mode == "learnable":
             self.log_alpha = nn.Parameter(torch.zeros(()))
             if cfg.detach_e_step:
@@ -657,6 +675,10 @@ class VFEModel(nn.Module):
         # E-step like log_alpha so the loss backpropagates to it; getattr keeps the flat path's call
         # identical (None forwards a defaulted kwarg the flat builder ignores).
         connection_W = getattr(self, "connection_W", None)
+        # connection_M: the learned gauge-COVARIANT (Route B) Regime-II connection when
+        # transport_mode='regime_ii_covariant', else None (flat / regime_ii pure paths). Threaded
+        # through the E-step like connection_W so the loss backpropagates to it.
+        connection_M = getattr(self, "connection_M", None)
         # E-step backward estimator. The EFFECTIVE mode reconciles the legacy detach_e_step bool
         # with e_step_gradient (cfg.effective_e_step_gradient): 'detach' wraps the whole E-step in
         # no_grad (the legacy detach_e_step=True path); 'unroll' (default) and 'straight_through'
@@ -697,7 +719,8 @@ class VFEModel(nn.Module):
                             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                             log_alpha=log_alpha,
                             lambda_beta=lambda_beta,
-                            connection_W=connection_W, e_step_gradient=e_step_gradient,
+                            connection_W=connection_W, connection_M=connection_M,
+                            e_step_gradient=e_step_gradient,
                             rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
                             rope_on_value=self.cfg.rope_on_value,
                             capture=cap, grad_record=grad_rec)

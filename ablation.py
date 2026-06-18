@@ -84,7 +84,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     max_seq_len               = 128,                 # N, context length
     
     batch_size                = 64,
-    max_steps                 = 15000,
+    max_steps                 = 7500,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -163,9 +163,11 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     ####################################
     # Non-Flat Connection - Regime II
     ####################################
-    transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii"
-                                            # (learned bilinear edge connection; sanctioned NN exception, default-off)
-    cocycle_relaxation        =   1.0,        # regime_ii homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
+    transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii" (learned bilinear edge
+                                            # connection delta=mu^T W mu; gauge-invariant only at W=0; NN exception, default-off)
+                                            # | "regime_ii_covariant" (Route B: gauge-COVARIANT non-flat connection
+                                            # delta=M . invariant-features(q_i, Omega^0 q_j); covariant for any M; NN exception, default-off)
+    cocycle_relaxation        =   1.0,        # regime_ii / regime_ii_covariant homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
     cross_couplings           = None,       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only (None = block-diagonal gauge)
                                                #if enabled and head-mixer = True or causal_alibi it will fail
     close_basis               = False,
@@ -223,14 +225,14 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     kappa_beta                = 1,        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
     kappa_gamma               = 1,        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
         
-    beta_attention_prior      = "causal",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+    beta_attention_prior      = "causal_alibi",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
     gamma_attention_prior     = "causal",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
     t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
 
     precision_weighted_attention = True,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
                                                  # into the attention prior (diagnostic; OFF = position-only prior)
-    precision_attention_b0       = 1.0,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
+    precision_attention_b0       = 2,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
     precision_attention_per_head = False,        # per-key reliability PER HEAD (trace over each block's coords) vs
                                                  # global (all K); needs precision_weighted_attention=True
     #################################
@@ -386,11 +388,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
     
     
-    "transport_mode": {  # regime_ii is the learned bilinear connection (sanctioned NN exception)
-        "description": "connection regime: flat phi-cocycle vs learned non-flat (regime_ii)",
+    "transport_mode": {  # regime_ii / regime_ii_covariant are learned connections (sanctioned NN exceptions)
+        "description": "connection regime: flat phi-cocycle vs learned non-flat (regime_ii bilinear, regime_ii_covariant Route B)",
         "configs": [
-            {"label": "flat",      "transport_mode": "flat"},
-            {"label": "regime_ii", "transport_mode": "regime_ii"},
+            {"label": "flat",                "transport_mode": "flat"},
+            {"label": "regime_ii",           "transport_mode": "regime_ii"},
+            {"label": "regime_ii_covariant", "transport_mode": "regime_ii_covariant"},
         ],
     },
     
@@ -492,11 +495,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "c0", "values": [0.1, 1.0, 5.0], "requires": {"lambda_alpha_mode": "state_dependent"},
     },
     
-    "lambda_alpha": {
-        "description": "constant self-coupling value (lambda_alpha_mode=constant)",
-        "param": "lambda_alpha", "values": [0.0, 0.5, 1, 2.5, 5, 7.5, 10], "requires": {"lambda_alpha_mode": "constant"},
-    },
-    
+   
     
     
     
@@ -565,20 +564,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "lambda_beta": {
         "description": "belief-coupling block weight (1.0 = pure F)",
-        "param": "lambda_beta", "range": [0, 2, 0.25],
+        "param": "lambda_beta", "range": [0, 2, 0.2],
     },
     
     
     
     "lambda_gamma": {
         "description": "model-channel coupling weight (>0 creates s tables)",
-        "param": "lambda_gamma", "values": [0, 0.25, 0.5, 0.75, 0.9, 1, 3],
+        "param": "lambda_gamma", "values": [0, 0.025, 0.15, 0.5, 0.75, 0.85, 1],
     },
     
     
     "lambda_h": {
         "description": "hyper-prior weight lambda_h * mean_i KL(s_i||r) (>0 creates s/r tables)",
-        "param": "lambda_h", "values": [0, 0.1, 0.2, 0.3, 0.4, 0.5],
+        "param": "lambda_h", "values": [0, 0.02, 0.1, 0.25, 0.5, 0.75, 1],
     },
     
     
@@ -587,12 +586,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "kappa_gamma": {
         "description": "model-channel temperature tau_gamma = kappa_gamma * sqrt(d_head)",
-        "param": "kappa_gamma", "values": [0.1, 0.25, 0.5, 0.75, 0.9, 1], 
+        "param": "kappa_gamma", "values": [0.1, 0.25, 0.5, 0.75, 1, 2.5], 
     },
     
     "kappa_beta": {
        "description": "attention temperature tau = kappa * sqrt(d_head)",
-       "param": "kappa_beta", "range": [0.1, 1.3, 0.1],
+       "param": "kappa_beta", "range": [0.1, 1.1, 0.1],
     },
 
     "kappa_beta_per_head": {  # per-head tau_h = kappa_beta[h]*sqrt(d_head); list len MUST == n_heads
@@ -613,6 +612,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
   
     
     
+    "lambda_alpha": {
+        "description": "constant self-coupling value (lambda_alpha_mode=constant)",
+        "param": "lambda_alpha", "values": [0.0, 0.25, 0.5, 0.75, 1, 2.5, 5], "requires": {"lambda_alpha_mode": "constant"},
+    },
     
 
     
@@ -669,7 +672,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
     "m_p_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_p_mu_lr", "values": [0.0075, 0.01, 0.012, 0.014, 0.015, 0.016, 0.0175],
+        "param": "m_p_mu_lr", "values": [0.01, 0.013, 0.015, 0.0165, 0.0175, 0.02],
     },
     
     "m_p_sigma_lr": {
@@ -679,7 +682,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.01, 0.013, 0.015, 0.016, 0.0175],
+        "param": "m_phi_lr", "values": [0.01, 0.013, 0.015, 0.0165, 0.0175, 0.02],
     },
     
     
@@ -734,26 +737,35 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
     
-  #  "mu_init_std",
-  #  "phi_scale",
-  #  "sigma_init", 
-  "precision_attention_b0",
+  
+  
+  #"kappa_beta_per_head",
+  
+  # "precision_attention_b0",
   # "decode_tau",
+  # "lambda_alpha",
    
+   "lambda_h",
+   "lambda_beta",
    "lambda_gamma",
    
+   "kappa_beta",
    "kappa_gamma",   
   # "e_s_mu_lr",
    
-  # "m_phi_lr",
- #   "m_p_mu_lr",
-  #  "m_p_sigma_lr",
+    "m_phi_lr",
+    "m_p_mu_lr",
+    "m_p_sigma_lr",
     
-    "weight_decay",
-  #  "lambda_beta",
-   "lambda_h",
+    "n_e_steps",
+    
+   # "weight_decay",
+    
+     "mu_init_std",
+    "phi_scale",
+    "sigma_init", 
   
-  #  "kappa_beta",
+    
   ##  "renyi_order",
     
     
@@ -761,7 +773,7 @@ SWEEP_ORDER: List[str] = [
   #  "phi_weight_decay",
      
    #"e_q_sigma_lr",
-   # "lambda_alpha",
+    
        
   #  
     

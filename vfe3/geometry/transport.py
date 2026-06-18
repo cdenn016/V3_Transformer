@@ -118,6 +118,53 @@ def get_transport(name: str) -> Callable[..., TransportDict]:
     return _TRANSPORTS[name]
 
 
+def gauge_invariant_edge_features(
+    mu_q:   torch.Tensor,             # (..., K) query means
+    cov_q:  torch.Tensor,             # (..., K, K) query covariances (SPD)
+    mu_kt:  torch.Tensor,             # (..., K) transported key means
+    cov_kt: torch.Tensor,             # (..., K, K) transported key covariances (SPD)
+
+    *,
+    eps:    float = 1e-6,
+) -> torch.Tensor:                    # (..., 3) [Mahalanobis, trace, log-det] edge features
+    r"""Gauge-invariant edge features for the covariant Regime-II (Route B) connection.
+
+    The three components of $D_{KL}(\mathcal N(\mu_q, \Sigma_q) \| \mathcal N(\mu_{kt}, S))$
+    with $S = \Sigma_{kt}$ the transported key covariance:
+
+        Mahalanobis : $(\mu_q - \mu_{kt})^\top S^{-1} (\mu_q - \mu_{kt})$
+        trace       : $\operatorname{tr}(S^{-1} \Sigma_q)$
+        log-det     : $\log\det S - \log\det \Sigma_q$
+
+    Each is invariant under a common $GL(K)$ push-forward ($\mu \mapsto g\mu$,
+    $\Sigma \mapsto g\Sigma g^\top$) of BOTH beliefs: the trace and Mahalanobis terms cancel by
+    congruence and the $(\det g)^2$ Jacobians cancel in the log-det ratio. An edge connection
+    built from these features, $\delta_{ij}^a = \sum_f M^a_f I^f_{ij}$, therefore keeps
+    $\exp(\delta_{ij}\cdot G)$ gauge-invariant and the Regime-II transport
+    $\Omega_{ij} = \exp(\phi_i)\exp(\delta_{ij}\cdot G)\exp(-\phi_j)$ covariant
+    ($\Omega_{ij} \mapsto g_i \Omega_{ij} g_j^\top{}^{-1}$) -- unlike the bilinear ``regime_ii``
+    connection $\delta_{ij} = \mu_i^\top W \mu_j$, gauge-invariant only at $W=0$.
+    """
+    K   = mu_q.shape[-1]
+    eye = torch.eye(K, dtype=cov_kt.dtype, device=cov_kt.device)
+
+    L_s = torch.linalg.cholesky(cov_kt + eps * eye)        # S = cov_kt = L_s L_s^T
+    L_q = torch.linalg.cholesky(cov_q  + eps * eye)
+
+    delta_mu = (mu_q - mu_kt).unsqueeze(-1)                # (..., K, 1) prediction error
+    sol      = torch.cholesky_solve(delta_mu, L_s)         # S^{-1} (mu_q - mu_kt)
+    mahal    = (delta_mu * sol).sum(dim=(-2, -1))          # (...,)  Mahalanobis
+
+    sinv_covq = torch.cholesky_solve(cov_q, L_s)           # S^{-1} Sigma_q  (..., K, K)
+    trace     = torch.diagonal(sinv_covq, dim1=-2, dim2=-1).sum(dim=-1)   # (...,)  tr(S^{-1} Sigma_q)
+
+    logdet_s = 2.0 * torch.log(torch.diagonal(L_s, dim1=-2, dim2=-1)).sum(dim=-1)
+    logdet_q = 2.0 * torch.log(torch.diagonal(L_q, dim1=-2, dim2=-1)).sum(dim=-1)
+    logdet   = logdet_s - logdet_q                         # (...,)  log det S - log det Sigma_q
+
+    return torch.stack((mahal, trace, logdet), dim=-1)     # (..., 3)
+
+
 @register_transport("flat")
 def _build_flat(
     phi:        torch.Tensor,             # (B, N, n_gen) gauge frames
@@ -257,6 +304,108 @@ def _build_regime_ii(
     # so the O(N^2) edge exps of a block-diagonal group run at the block's own precision instead
     # of upcasting the whole (B, N, N, K, K) batch to float64 whenever K >= 20 (audit 2026-06-10
     # F8c; the soft cap above keeps the blocks in the well-conditioned exp regime).
+    block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
+    exp_delta, _ = stable_matrix_exp_pair(
+        delta_mat, skew_symmetric=group.skew_symmetric, only_forward=True, block_dims=block_dims,
+        exp_dim=(max(block_dims) if block_dims is not None else None),
+    )                                                                          # (B, N, N, K, K)
+
+    # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
+    omega = torch.einsum("bikl,bijlm,bjmn->bijkn", exp_phi, exp_delta, exp_neg_phi)
+    return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
+
+
+@register_transport("regime_ii_covariant")
+def _build_regime_ii_covariant(
+    phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
+    group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims
+
+    *,
+    gauge_mode:         str                       = "learned",   # 'learned' (flat vertex factors) | 'trivial'
+    cocycle_relaxation: float                     = 1.0,         # homotopy alpha in [0,1]; 0 -> flat
+    delta_soft_cap:     float                     = 12.0,        # smooth bound on ||delta_ij . G||_F
+    mu:                 Optional[torch.Tensor]    = None,        # (B, N, K) QUERY means
+    sigma:              Optional[torch.Tensor]    = None,        # (B, N, K) diag OR (B, N, K, K) full QUERY covariance
+    connection_M:       Optional[torch.Tensor]    = None,        # (n_gen, 3) learned invariant-feature map (NN exception)
+    mu_key:             Optional[torch.Tensor]    = None,        # (B, N, K) KEY means (None -> mu; oracle detaches)
+    sigma_key:          Optional[torch.Tensor]    = None,        # (B, N, ...) KEY covariance (None -> sigma)
+    **kwargs,                                                    # tolerated (shares the flat builder's call shape)
+) -> TransportDict:
+    r"""Regime-II COVARIANT (Route B): a gauge-COVARIANT non-flat edge-relaxed transport.
+
+    NEURAL-NETWORK EXCEPTION (sanctioned, default-OFF): consumes the LEARNED ``connection_M`` (an
+    nn.Parameter trained by backprop). Unlike the bilinear ``regime_ii`` connection
+    delta_ij = mu_i^T W mu_j (gauge-invariant ONLY at W=0), the edge coefficients here are built
+    from GAUGE-INVARIANT scalar features of the (query, transported-key) belief pair, so the edge
+    factor exp(delta_ij . G) is gauge-invariant and the transport stays COVARIANT
+    (Omega_ij -> g_i Omega_ij g_j^{-1}) under GL(K) frame changes:
+
+        delta_ij^a = cocycle_relaxation * sum_f M^a_f I^f_ij,                a = 1..n_gen,
+        I^f_ij = (Mahalanobis, trace, log-det) of D_KL(q_i || Omega^0_ij q_j)  [flat transport],
+        Omega_ij = exp(phi_i . G) exp(delta_ij . G) exp(-phi_j . G),   i != j (delta_ii := 0).
+
+    The invariants I^f are evaluated under the FLAT vertex cocycle Omega^0 = exp(phi_i)exp(-phi_j)
+    (each a gauge-invariant scalar per edge; see :func:`gauge_invariant_edge_features`); the curved
+    Omega is then assembled with the same vertex factors. At ``connection_M=None`` or
+    ``cocycle_relaxation=0`` the flat dict is returned byte-identically; an all-ZERO M reduces to
+    the flat cocycle to fp32 tolerance (the generic path is kept so autograd to M survives at M=0,
+    exp'(0)=I). A nonzero M gives non-trivial triangle holonomy (curvature > 0).
+
+    TODO(Route A): the principled-on-a-COMPACT-subgroup variant. Restrict the connection to the
+    commutant (intertwiners) of the gauge group on O(K)/U(K), where g^T W^a g = W^a holds by
+    construction (e.g. W proportional to I gives delta_ij = mu_i . mu_j), giving an EXACTLY
+    equivariant non-flat connection AND a bounded Wilson / Yang-Mills action. Route B (here) keeps
+    the full GL(K) group at the cost of seeing the beliefs only through invariant scalar features.
+
+    COST: like ``regime_ii``, O(N^2) per-edge matrix exponentials; additionally materializes the
+    dense flat Omega^0 and does an O(N^2) per-edge K x K covariance congruence + Cholesky solve for
+    the invariants. Opt-in / diagnostic; the default flat transport never reaches this builder.
+
+    Returns the SAME dict shape as the flat builder: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K),
+    'Omega' (B,N,N,K,K).
+    """
+    # Flat fast path (mirrors regime_ii): no connection, alpha=0, or trivial gauge -> flat cocycle.
+    # An all-zero (but grad-requiring) M is NOT short-circuited -- delta=0 reduces to flat to fp32,
+    # but d Omega / d M at M=0 is the generator structure (exp'(0)=I), so the generic path keeps M
+    # in the autograd graph (it would otherwise freeze at init).
+    if connection_M is None or cocycle_relaxation == 0.0 or gauge_mode == "trivial":
+        return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
+
+    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
+    exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
+
+    # Dense FLAT cocycle Omega^0_ij = exp(phi_i) exp(-phi_j); the gauge-invariant edge features are
+    # evaluated on this flat transport (the curved edge factor is inserted afterwards).
+    omega0 = torch.einsum("bikl,bjlm->bijkm", exp_phi, exp_neg_phi)             # (B, N, N, K, K)
+
+    mu_k    = mu_key   if mu_key   is not None else mu
+    sigma_k = sigma_key if sigma_key is not None else sigma
+
+    mu_q  = mu.unsqueeze(2)                                                     # (B, N, 1, K) query mean
+    mu_kt = torch.einsum("bijkl,bjl->bijk", omega0, mu_k)                       # (B, N, N, K) transported key mean
+    if sigma.dim() == mu.dim():                                                 # diagonal variances (B, N, K)
+        cov_q  = torch.diag_embed(sigma).unsqueeze(2)                           # (B, N, 1, K, K)
+        cov_kt = torch.einsum("bijkl,bjl,bijml->bijkm", omega0, sigma_k, omega0)
+    else:                                                                       # full covariance (B, N, K, K)
+        cov_q  = sigma.unsqueeze(2)                                             # (B, N, 1, K, K)
+        cov_kt = torch.einsum("bijkl,bjlm,bijnm->bijkn", omega0, sigma_k, omega0)
+
+    feats = gauge_invariant_edge_features(mu_q, cov_q, mu_kt, cov_kt)           # (B, N, N, 3) gauge-invariant
+    delta = cocycle_relaxation * torch.einsum("bijf,af->bija", feats, connection_M)   # (B, N, N, n_gen)
+
+    # Self-edge exclusion (audit F4 parity): the connection is an EDGE object; Omega_ii stays the
+    # flat identity exp(phi_i)exp(-phi_i) (delta_ii zeroed before the exp).
+    n_tok = delta.shape[1]
+    eye_n = torch.eye(n_tok, dtype=torch.bool, device=delta.device)
+    delta = delta.masked_fill(eye_n.view(1, n_tok, n_tok, 1), 0.0)
+
+    generators = group.generators                                              # (n_gen, K, K)
+    delta_mat  = torch.einsum("bija,akl->bijkl", delta, generators)            # (B, N, N, K, K) Lie-algebra edge
+    # Smooth per-edge Frobenius cap on the embedded operator (same safeguard / squared-norm-no-sqrt
+    # finite-grad-at-zero trick as regime_ii); keeps stable_matrix_exp_pair on the EXACT operator.
+    fro_sq    = delta_mat.pow(2).sum(dim=(-2, -1), keepdim=True)
+    delta_mat = delta_mat * torch.rsqrt(1.0 + fro_sq / (delta_soft_cap * delta_soft_cap))
+
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     exp_delta, _ = stable_matrix_exp_pair(
         delta_mat, skew_symmetric=group.skew_symmetric, only_forward=True, block_dims=block_dims,

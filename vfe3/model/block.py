@@ -38,6 +38,7 @@ def vfe_block(
     log_alpha:       Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
     lambda_beta:     'float | torch.Tensor'    = 1.0,    # belief-coupling weight (cfg.lambda_beta or exp(log_lambda_beta))
     connection_W:    Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
+    connection_M:    Optional[torch.Tensor]    = None,   # learned covariant connection for regime_ii_covariant (Route B; None -> pure path)
     e_step_gradient: str                       = "unroll",  # E-step backward estimator (unroll | straight_through | detach)
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
@@ -70,7 +71,7 @@ def vfe_block(
         lambda_alpha_mode=cfg.lambda_alpha_mode,
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
-        cocycle_relaxation=cfg.cocycle_relaxation, connection_W=connection_W,
+        cocycle_relaxation=cfg.cocycle_relaxation, connection_W=connection_W, connection_M=connection_M,
         e_step_gradient=e_step_gradient, oracle_unroll_grad=cfg.oracle_unroll_grad,
         grad_record=grad_record,
         log_prior=log_prior,

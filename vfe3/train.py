@@ -139,6 +139,11 @@ def build_optimizer(
         if cfg.connection_weight_decay is not None:             # dedicated connection-norm ceiling
             w_group["weight_decay"] = cfg.connection_weight_decay   # (audit 2026-06-10 F9); None ->
         groups.append(w_group)                                  # inherit the global weight_decay
+    if getattr(model, "connection_M", None) is not None:        # transport_mode='regime_ii_covariant' (Route B)
+        m_group = {"params": [model.connection_M], "lr": cfg.m_phi_lr, "role": "phi"}   # connection -> gauge LR
+        if cfg.connection_weight_decay is not None:             # shares the connection-norm ceiling
+            m_group["weight_decay"] = cfg.connection_weight_decay
+        groups.append(m_group)
     if getattr(model, "log_alpha", None) is not None:           # lambda_alpha_mode='learnable' scalar coupling
         groups.append({"params": [model.log_alpha], "lr": cfg.m_p_mu_lr, "role": "mu"})
     if getattr(model, "log_lambda_beta", None) is not None:     # learnable_lambda_beta scalar belief-coupling weight
