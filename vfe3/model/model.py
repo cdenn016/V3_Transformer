@@ -683,27 +683,10 @@ class VFEModel(nn.Module):
             # Precision-weighted attention (default OFF): fold a DETACHED per-key reliability bias
             # -log(b0 + tr Sigma_j) into log_prior so attention down-weights high-variance keys before
             # the softmax. Detached -> the closed-form belief kernel treats it as a fixed prior (exact).
-            # Uses the belief sigma entering the block (post s-refine); broadcast over query (and head).
-            # A new tensor is bound (no mutation of the cached position-only log_prior).
-            if self.cfg.precision_weighted_attention:
-                if len(self.group.irrep_dims) == 1:
-                    # Single-block gauge group (glk/so_k/sp, or block_glk collapsed to n_heads==1):
-                    # the coupling energy is HEADLESS (B, N, N) (free_energy.py: irrep_dims None or
-                    # len 1), so the bias must fold WITHOUT a head axis. Per-head == global here (the
-                    # one block IS all K coords), so both modes take the global trace.
-                    kb = _precision_key_bias(beliefs.sigma, b0=self.cfg.precision_attention_b0).detach()  # (B, N)
-                    kb = kb[:, None, :]                          # (B, 1, N): query-broadcast, per key, no head axis
-                elif self.cfg.precision_attention_per_head:
-                    kb = _precision_key_bias(beliefs.sigma, b0=self.cfg.precision_attention_b0,
-                                             irrep_dims=self.group.irrep_dims).detach()  # (B, N, H)
-                    kb = kb.permute(0, 2, 1).unsqueeze(-2)        # (B, H, 1, N): per-head, query-broadcast, per key
-                else:
-                    kb = _precision_key_bias(beliefs.sigma, b0=self.cfg.precision_attention_b0).detach()  # (B, N)
-                    kb = kb[:, None, None, :]                     # (B, 1, 1, N): head- & query-broadcast, per key
-                # adds onto the position prior and broadcasts against the coupling energy: the headless
-                # (B, N, N) energy for a single block (bias (B, 1, N)) or the per-head (B, H, N, N)
-                # energy for a multi-block gauge (bias (B, *, 1, N)) in attention_weights.
-                log_prior = kb if log_prior is None else log_prior + kb
+            # Uses the belief sigma ENTERING the block (post s-refine): an intentional fixed encode-time
+            # reliability prior held across the E-step, NOT a per-iteration one (r2 id21). The shared
+            # helper folds the SAME prior in diagnostics()/attention_maps() (r2 id22).
+            log_prior = self._fold_precision_bias(log_prior, beliefs.sigma)
             # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
             # M-step self-coupling term below (manuscript: the self-term reads q*, not the
             # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.
@@ -1206,6 +1189,31 @@ class VFEModel(nn.Module):
         return seq
 
     @torch.no_grad()
+    def _fold_precision_bias(
+        self,
+        log_prior: Optional[torch.Tensor],   # (N,N)/(H,N,N) position prior (batched or not), or None
+        sigma:     torch.Tensor,             # (..., N, K) key belief variances (batched or unbatched)
+    ) -> Optional[torch.Tensor]:
+        r"""Fold the detached precision-weighted-attention reliability bias ``-log(b0 + tr Sigma_j)``
+        into ``log_prior``, broadcasting over query (and head). Shared by ``forward`` and the
+        diagnostic replays (``diagnostics``/``attention_maps``) so every belief-channel consumer scores
+        the SAME attention prior the forward E-step descends (audit 2026-06-17 r2 id22). No-op (returns
+        ``log_prior`` unchanged) when ``precision_weighted_attention`` is off. Rank-robust: ``sigma``
+        may be ``(B, N, K)`` (forward) or ``(N, K)`` (diagnostics)."""
+        if not self.cfg.precision_weighted_attention:
+            return log_prior
+        b0 = self.cfg.precision_attention_b0
+        if len(self.group.irrep_dims) == 1:                # headless (.., N, N) energy: NO head axis
+            kb = _precision_key_bias(sigma, b0=b0).detach()                       # (.., N)
+            kb = kb.unsqueeze(-2)                                                 # (.., 1, N)
+        elif self.cfg.precision_attention_per_head:        # per-head (.., H, N, N) energy
+            kb = _precision_key_bias(sigma, b0=b0, irrep_dims=self.group.irrep_dims).detach()  # (.., N, H)
+            kb = kb.transpose(-1, -2).unsqueeze(-2)                               # (.., H, 1, N)
+        else:                                              # global bias, multi-block: head-broadcast
+            kb = _precision_key_bias(sigma, b0=b0).detach()                       # (.., N)
+            kb = kb.unsqueeze(-2).unsqueeze(-2)                                   # (.., 1, 1, N)
+        return kb if log_prior is None else log_prior + kb
+
     def diagnostics(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
@@ -1249,6 +1257,7 @@ class VFEModel(nn.Module):
             belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
+        log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
         _llb = getattr(self, "log_lambda_beta", None)
         rope = self._rope_rotation(n, token_ids.device)               # rope shapes the converged belief (as forward)
         cap: dict = {}                                                # q* capture (F self-term reads it, as forward)
@@ -1504,6 +1513,7 @@ class VFEModel(nn.Module):
             belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
+        log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
         fam = get_family(cfg.family)
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
         mu_p, sigma_p = belief.mu, belief.sigma

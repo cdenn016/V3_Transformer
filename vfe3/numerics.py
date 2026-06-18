@@ -155,8 +155,12 @@ def condition_number(
     works on the default ``gaussian_diagonal`` family instead of raising on the rank mismatch (audit
     2026-06-13 L13). The square-trailing test resolves the two for any (..., N, K) with N != K."""
     if matrix.dim() < 2 or matrix.shape[-1] != matrix.shape[-2]:
-        spec = matrix.float().clamp(min=0.0)
-        return (spec.max(dim=-1).values / spec.min(dim=-1).values.clamp(min=eps)).to(matrix.dtype)
+        spec = matrix.float()
+        lam_min = spec.min(dim=-1).values
+        cond = spec.max(dim=-1).values / lam_min.clamp(min=eps)
+        # non-positive variance -> no condition number; surface +inf, mirroring the full-matrix branch
+        # (audit 2026-06-17 round 2 id1), not a large positive value from clamping a zero/negative up to eps.
+        return torch.where(lam_min > 0, cond, cond.new_tensor(float("inf"))).to(matrix.dtype)
     evals = torch.linalg.eigvalsh(_symmetrize(matrix.float()))
     lam_min = evals[..., 0]
     cond = evals[..., -1] / lam_min.clamp(min=eps)

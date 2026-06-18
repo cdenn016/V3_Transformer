@@ -315,9 +315,10 @@ def train_step(
     # logged this step; None -> the forward skips the capture entirely (zero overhead, byte-identical).
     _egrad = {} if metrics_out is not None else None
     if grad_accum_steps == 1:                                   # default path: byte-identical to the single-step loop
-        _, loss, _ = model(tokens, targets, estep_grad_out=_egrad)
+        _, loss, ce = model(tokens, targets, estep_grad_out=_egrad)
         _scaler.scale(loss).backward()
         step_loss = float(loss.detach())
+        step_ce = float(ce.detach()) if ce is not None else float("nan")   # pre-step CE (matches step_loss)
     else:
         if tokens.shape[0] % grad_accum_steps != 0:            # equal-token microbatches require an even split
             raise ValueError(
@@ -328,10 +329,12 @@ def train_step(
         tok_chunks = torch.chunk(tokens, grad_accum_steps, dim=0)
         tgt_chunks = torch.chunk(targets, grad_accum_steps, dim=0)
         step_loss = 0.0
+        step_ce = 0.0
         for tok_mb, tgt_mb in zip(tok_chunks, tgt_chunks):
-            _, loss_mb, _ = model(tok_mb, tgt_mb, estep_grad_out=_egrad)   # last microbatch wins the E-step grads
+            _, loss_mb, ce_mb = model(tok_mb, tgt_mb, estep_grad_out=_egrad)   # last microbatch wins the E-step grads
             _scaler.scale(loss_mb / grad_accum_steps).backward()   # accumulate the mean-normalized microbatch grad
             step_loss += float(loss_mb.detach()) / grad_accum_steps
+            step_ce += (float(ce_mb.detach()) if ce_mb is not None else float("nan")) / grad_accum_steps
             _mb_tok.append(int((tgt_mb != -100).sum()))            # counted tokens per microbatch (spread = bias)
     # Unscale once when EITHER clipping or metrics capture needs true-unit gradients; GradScaler
     # tracks that unscale_ already ran so the later _scaler.step() does not re-unscale. With a
@@ -374,13 +377,23 @@ def train_step(
             for _name in ("mu", "sigma", "phi"):
                 metrics_out[f"estep_grad_norm_{_name}"] = float(_egrad.get(_name, 0.0))
         metrics_out["loss_finite"] = float(math.isfinite(step_loss))
+        metrics_out["train_ce"] = step_ce            # pre-step CE (matches step_loss; not a post-update re-forward)
         if _mb_tok:                                             # grad_accum_steps>1: token-spread bias check
             metrics_out["grad_accum_tok_spread"] = float(max(_mb_tok) - min(_mb_tok))
         if scaler is not None and scaler.is_enabled():          # fp16: surface the loss-scale (Tier-2 health)
             metrics_out["grad_scale"] = float(scaler.get_scale())
-    if grad_clip is not None and grad_clip > 0:
+    # NaN/Inf skip on the default (disabled-scaler) path: a non-finite loss means non-finite
+    # gradients, and AdamW's moment buffers would be PERMANENTLY poisoned by a single such step with
+    # no recovery. The fp16 GradScaler path already skips internally via found_inf; mirror that here
+    # by dropping the grads and not stepping when the scaler is disabled (audit 2026-06-17 round 2).
+    _scaler_enabled = scaler is not None and scaler.is_enabled()
+    skip_step = (not _scaler_enabled) and (not math.isfinite(step_loss))
+    if grad_clip is not None and grad_clip > 0 and not skip_step:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    _scaler.step(optimizer)
+    if skip_step:
+        optimizer.zero_grad(set_to_none=True)                # drop poisoned grads; do NOT step AdamW
+    else:
+        _scaler.step(optimizer)
     _scaler.update()
     # Closed-form hyper-prior M-step (r_update_mode='barycenter'): after AdamW updates the s tables,
     # set the centroid r to their forward-KL barycenter (the closed-form variational M-step, in place
@@ -670,10 +683,10 @@ def train(
         if ema is not None:
             ema.update(model)                            # blend the post-step weights into the shadow
 
-        if do_log or do_csv:                                 # converged CE + diagnostics (off graph), ONCE
-            with torch.no_grad():
-                _, _, ce_t = model(tokens, targets)          # true CE (nats)
-            ce = float(ce_t)
+        if do_log or do_csv:                                 # diagnostics (off graph), ONCE
+            # train_ce is the PRE-step CE captured inside train_step (matches train_loss); the old
+            # post-step re-forward made train_ce one optimizer step ahead of train_loss (audit r2 id5).
+            ce = step_metrics.get("train_ce", float("nan")) if step_metrics is not None else float("nan")
             d = model.diagnostics(tokens)
             # Throughput + peak memory over the window since the last log/eval, then reset the window.
             # Computed here (not inside do_log) so a CSV row on an eval-only step still carries the rate.

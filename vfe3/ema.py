@@ -44,10 +44,17 @@ class EMA:
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
-        r"""Blend the live parameters into the shadow: ``s <- decay*s + (1-decay)*theta``."""
+        r"""Blend the live parameters into the shadow: ``s <- decay*s + (1-decay)*theta``.
+
+        A non-finite live parameter is SKIPPED (not blended): ``mul_(decay)`` of a NaN stays NaN
+        forever, so a single transient NaN/Inf would permanently poison the running average and the
+        final ``copy_to`` would write it into the evaluated/checkpointed model (audit 2026-06-17 r2 id19).
+        """
         for name, param in model.named_parameters():
             if name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+                p = param.detach()
+                if torch.isfinite(p).all():
+                    self.shadow[name].mul_(self.decay).add_(p, alpha=1.0 - self.decay)
 
     @torch.no_grad()
     def store(self, model: torch.nn.Module) -> None:
