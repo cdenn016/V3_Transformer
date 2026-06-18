@@ -1383,7 +1383,7 @@ class VFE3Config:
         # oracle_unroll_grad=True the double-backward can NaN connection_W.grad). Warn (non-
         # breaking, mirroring the estimator warnings below); prefer the diagonal family or a
         # compact so tower when running regime_ii at fp32 full covariance.
-        if self.transport_mode == "regime_ii" and self.family == "gaussian_full":
+        if self.transport_mode in ("regime_ii", "regime_ii_covariant") and self.family == "gaussian_full":
             import warnings
             warnings.warn(
                 "transport_mode='regime_ii' with family='gaussian_full': the non-orthogonal edge "
@@ -1427,7 +1427,7 @@ class VFE3Config:
         # of this config-level predicate to keep the default config silent here.)
         if self.e_step_gradient in ("straight_through", "detach") and (
             self.lambda_alpha_mode == "learnable"
-            or self.transport_mode == "regime_ii"
+            or self.transport_mode in ("regime_ii", "regime_ii_covariant")
             or self.learnable_lambda_beta
             or (self.lambda_h_mode == "learnable" and self.s_e_step)
             or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
@@ -1461,8 +1461,15 @@ class VFE3Config:
         # The decoupled value gauge (pos_rotation='rope' + rope_on_value=False) also forces the oracle
         # route -- uses_kernel_route gates on `and not decoupled_value_gauge` (kernels.py) -- so the
         # freeze warning must include it or it silently misses a frozen E-step param there (r2 id2).
+        # AUTO-ENABLE the differentiable oracle for the non-flat regimes (2026-06-18): the learned
+        # connection (connection_W / connection_M) enters the loss ONLY through the unrolled E-step,
+        # so it needs oracle_unroll_grad=True to receive a gradient. Enable it here rather than only
+        # warning the user to set it. Inert under e_step_gradient != 'unroll' / detach_e_step (where
+        # the E-step tangent is severed regardless -- those paths keep their own freeze warnings).
+        if self.transport_mode in ("regime_ii", "regime_ii_covariant") and not self.oracle_unroll_grad:
+            self.oracle_unroll_grad = True
         _routes_to_oracle = (
-            self.transport_mode == "regime_ii"
+            self.transport_mode in ("regime_ii", "regime_ii_covariant")
             or (self.pos_rotation == "rope" and not self.rope_on_value)
             or not (
                 self.gradient_mode == "filtering"
@@ -1478,7 +1485,7 @@ class VFE3Config:
             and _routes_to_oracle
             and (
                 self.lambda_alpha_mode == "learnable"
-                or self.transport_mode == "regime_ii"
+                or self.transport_mode in ("regime_ii", "regime_ii_covariant")
                 or self.learnable_lambda_beta
                 or (self.lambda_h_mode == "learnable" and self.s_e_step)
                 or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)

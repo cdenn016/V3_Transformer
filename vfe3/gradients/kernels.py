@@ -200,7 +200,7 @@ def uses_kernel_route(
         and divergence_family == "renyi"
         and abs(renyi_order - 1.0) < 1e-9
         and include_attention_entropy
-        and transport_mode != "regime_ii"
+        and transport_mode not in ("regime_ii", "regime_ii_covariant")
         and not decoupled_value_gauge
         and has_kernel(family)
     )

@@ -39,6 +39,7 @@ def vfe_stack(
     log_alpha:       Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
     lambda_beta:     'float | torch.Tensor'    = 1.0,    # belief-coupling weight (cfg.lambda_beta or exp(log_lambda_beta))
     connection_W:    Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
+    connection_M:    Optional[torch.Tensor]    = None,   # learned covariant connection for regime_ii_covariant (Route B; None -> pure path)
     e_step_gradient: str                       = "unroll",  # E-step backward estimator (unroll | straight_through | detach)
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
@@ -64,7 +65,7 @@ def vfe_stack(
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
                            log_alpha=log_alpha, lambda_beta=lambda_beta,
-                           connection_W=connection_W,
+                           connection_W=connection_W, connection_M=connection_M,
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,
                            rope_on_value=rope_on_value,
                            capture=capture, grad_record=grad_record)   # each block overwrites; last wins

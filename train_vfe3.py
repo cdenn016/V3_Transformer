@@ -66,8 +66,8 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 2,
+    embed_dim                 = 80,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 8,
     
     max_seq_len               = 128,                 # N, context length
     
@@ -110,8 +110,9 @@ config = dict(
     decode_precision_scaled   = False,               # use_prior_bank=False only: feed the precision-weighted mean
                                                      # eta=mu/sigma (natural param) to the linear head so Sigma enters
                                                      # the discriminative readout (diagnostic; OFF = bare-mu linear)
+    decode_mode               = 'diagonal_chunked',
+    oracle_unroll_grad        = False,
     
- 
     #################################
     #          Gauge Group
     #################################
@@ -151,9 +152,11 @@ config = dict(
     ####################################
     # Non-Flat Connection - Regime II
     ####################################
-    transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii"
-                                            # (learned bilinear edge connection; sanctioned NN exception, default-off)
-    cocycle_relaxation        =   1.0,        # regime_ii homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
+    transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii" (learned bilinear edge
+                                            # connection delta=mu^T W mu; gauge-invariant only at W=0; NN exception, default-off)
+                                            # | "regime_ii_covariant" (Route B: gauge-COVARIANT non-flat connection
+                                            # delta=M . invariant-features(q_i, Omega^0 q_j); covariant for any M; NN exception, default-off)
+    cocycle_relaxation        =   1.0,        # regime_ii / regime_ii_covariant homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
     cross_couplings           = None,       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only (None = block-diagonal gauge)
                                                #if enabled and head-mixer = True or causal_alibi it will fail
     close_basis               = False,
@@ -171,13 +174,13 @@ config = dict(
     
     rope_base                 = 100.0,               # rotary frequency base
     rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
-    rope_on_value             = True,
+    rope_on_value             = False,
     
     ######################################
     #                Self Energy:  
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "constant",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "state_dependent",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
     lambda_h_mode              = "constant",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h) | "learnable" (NN exc.)
     
     b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
@@ -208,17 +211,17 @@ config = dict(
     #            & Temperatures
     ########################################
     
-    kappa_beta                = 1,        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
-    kappa_gamma               = 1,        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
+    kappa_beta                = 1, #[1, 0.5],        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa_gamma               = 1, #[1, 0.5],        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
         
-    beta_attention_prior      = "causal",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
-    gamma_attention_prior     = "causal",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+    beta_attention_prior      = "causal_alibi",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+    gamma_attention_prior     = "causal_alibi",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
     t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
 
     precision_weighted_attention = True,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
                                                  # into the attention prior (diagnostic; OFF = position-only prior)
-    precision_attention_b0       = 1.0,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
+    precision_attention_b0       = 2.0,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
     precision_attention_per_head = False,        # per-key reliability PER HEAD (trace over each block's coords) vs
                                                  # global (all K); needs precision_weighted_attention=True
     #################################
@@ -228,7 +231,7 @@ config = dict(
     
     e_q_mu_lr                 = 0.9,
     e_q_sigma_lr              = 0.001,
-    e_phi_lr                  = 0.0,     
+    e_phi_lr                  = 0.00,     
     
     
     ####################################
@@ -291,7 +294,7 @@ config = dict(
     use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF = pure
                                            # path: model is the last SGD iterate). ON: eval/best-save/final
                                            # model use the running average s <- ema_decay*s + (1-ema_decay)*theta
-    ema_decay                 = 0.999,     # EMA decay in (0,1); only read when use_ema=True
+    ema_decay                 = 0.95,     # EMA decay in (0,1); only read when use_ema=True
 )
 
 

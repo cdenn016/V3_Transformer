@@ -43,8 +43,11 @@ def _transport(
     gauge_mode:         str                    = "learned", # 'learned' | 'trivial' (forwarded to the builder)
     cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
     mu:                 Optional[torch.Tensor] = None,      # (N, K) or (B, N, K) means; regime_ii edge connection reads these
+    sigma:              Optional[torch.Tensor] = None,      # variances; regime_ii_covariant features read these
     connection_W:       Optional[torch.Tensor] = None,      # (n_gen, K, K) learned bilinear connection (regime_ii, NN exception)
+    connection_M:       Optional[torch.Tensor] = None,      # (n_gen, 3) learned covariant connection (regime_ii_covariant, NN exception)
     mu_key:             Optional[torch.Tensor] = None,      # regime_ii KEY-slot means (None -> mu; oracle detach split)
+    sigma_key:          Optional[torch.Tensor] = None,      # regime_ii_covariant KEY-slot variances (None -> sigma)
 ) -> torch.Tensor:                            # (N, N, K, K) or (B, N, N, K, K) Omega_ij
     r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
@@ -65,11 +68,15 @@ def _transport(
     if phi.dim() == 2:
         mu_b = mu.unsqueeze(0) if mu is not None else None
         mu_kb = mu_key.unsqueeze(0) if mu_key is not None else None
+        sig_b = sigma.unsqueeze(0) if sigma is not None else None
+        sig_kb = sigma_key.unsqueeze(0) if sigma_key is not None else None
         return build(phi.unsqueeze(0), group, gauge_mode=gauge_mode, mu=mu_b, mu_key=mu_kb,
-                     connection_W=connection_W,
+                     sigma=sig_b, sigma_key=sig_kb,
+                     connection_W=connection_W, connection_M=connection_M,
                      cocycle_relaxation=cocycle_relaxation)["Omega"][0]
     return build(phi, group, gauge_mode=gauge_mode, mu=mu, mu_key=mu_key,
-                 connection_W=connection_W,
+                 sigma=sigma, sigma_key=sigma_key,
+                 connection_W=connection_W, connection_M=connection_M,
                  cocycle_relaxation=cocycle_relaxation)["Omega"]
 
 
@@ -100,8 +107,11 @@ def build_belief_transport(
     rope_on_cov:        bool                   = False,     # rotate the covariance too (full-gauge)
     rope_on_value:      bool                   = True,      # False -> value aggregation uses the un-rotated base
     mu:                 Optional[torch.Tensor] = None,      # regime_ii edge connection reads these
+    sigma:              Optional[torch.Tensor] = None,      # regime_ii_covariant features read these
     connection_W:       Optional[torch.Tensor] = None,      # regime_ii learned bilinear connection
+    connection_M:       Optional[torch.Tensor] = None,      # regime_ii_covariant learned covariant connection (Route B)
     mu_key:             Optional[torch.Tensor] = None,      # regime_ii KEY-slot means (None -> mu)
+    sigma_key:          Optional[torch.Tensor] = None,      # regime_ii_covariant KEY-slot variances (None -> sigma)
     rope:               Optional[torch.Tensor] = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
 ) -> 'torch.Tensor | FactoredTransport | RopeTransport':
     r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
@@ -123,11 +133,14 @@ def build_belief_transport(
     if _can_fuse_flat(transport_mode, group):
         built = build_factored_transport(phi, group, gauge_mode=gauge_mode)
     else:
-        transport_kw = (
-            dict(mu=mu, mu_key=mu_key, connection_W=connection_W,
-                 cocycle_relaxation=cocycle_relaxation)
-            if transport_mode == "regime_ii" else {}
-        )
+        if transport_mode == "regime_ii":
+            transport_kw = dict(mu=mu, mu_key=mu_key, connection_W=connection_W,
+                                cocycle_relaxation=cocycle_relaxation)
+        elif transport_mode == "regime_ii_covariant":
+            transport_kw = dict(mu=mu, mu_key=mu_key, sigma=sigma, sigma_key=sigma_key,
+                                connection_M=connection_M, cocycle_relaxation=cocycle_relaxation)
+        else:
+            transport_kw = {}
         built = _transport(phi, group, transport_mode=transport_mode, gauge_mode=gauge_mode,
                            **transport_kw)
     if rope is None:
@@ -186,6 +199,7 @@ def free_energy_value(
     log_prior:                 Optional[torch.Tensor] = None,
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
     connection_W:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii NN exception)
+    connection_M:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii_covariant, Route B)
     keys:                      Optional[BeliefState]  = None,   # None -> global F; else keys frozen at `keys`
 ) -> torch.Tensor:                   # scalar F
     r"""Scalar free energy of a belief. ``keys=None`` -> global F (keys = the belief);
@@ -218,8 +232,10 @@ def free_energy_value(
         # flat-transport diagnostic, not the regime_ii objective.
         omega = _transport(
             belief.phi, group, transport_mode=transport_mode,
-            mu=(belief.mu if transport_mode == "regime_ii" else None),
-            connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
+            mu=(belief.mu if transport_mode in ("regime_ii", "regime_ii_covariant") else None),
+            sigma=(belief.sigma if transport_mode == "regime_ii_covariant" else None),
+            connection_W=connection_W, connection_M=connection_M,
+            cocycle_relaxation=cocycle_relaxation,
         )
     else:
         # The filtered (mixed current-query / frozen-key frame) transport has no regime_ii form;
@@ -290,6 +306,7 @@ def phi_alignment_loss(
     rope:         Optional[torch.Tensor] = None,      # (N,K,K) gauge-RoPE rotation (None -> off)
     log_prior:    Optional[torch.Tensor] = None,
     connection_W: Optional[torch.Tensor] = None,      # learned regime_ii connection (held fixed here)
+    connection_M: Optional[torch.Tensor] = None,      # learned regime_ii_covariant connection (Route B; held fixed here)
 ) -> torch.Tensor:
     r"""Canonical belief-coupling block as a function of phi (mu, sigma fixed), plus the
     gauge-frame penalty (manuscript Algorithm 1, line for nabla_phi F):
@@ -311,8 +328,9 @@ def phi_alignment_loss(
     # LIVE phi leaf -- the factored container is differentiable in phi, so the envelope
     # phi-gradient is preserved while the per-iteration dense (N,N,K,K) Omega disappears on the
     # flat equal-blocks path.
-    omega = build_belief_transport(phi, group, transport_mode=transport_mode, mu=mu,
-                                   connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
+    omega = build_belief_transport(phi, group, transport_mode=transport_mode, mu=mu, sigma=sigma,
+                                   connection_W=connection_W, connection_M=connection_M,
+                                   cocycle_relaxation=cocycle_relaxation,
                                    rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value)
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma)
@@ -366,6 +384,7 @@ def e_step_iteration(
     log_prior:                 Optional[torch.Tensor] = None,
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
     connection_W:              Optional[torch.Tensor] = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
+    connection_M:              Optional[torch.Tensor] = None,   # learned covariant connection for regime_ii_covariant (Route B; None -> pure path)
     rope:                      Optional[torch.Tensor] = None,   # (N, K, K) gauge-RoPE rotation
     rope_on_cov:               bool                   = False,  # full-gauge: rotate covariance too
     rope_on_value:             bool                   = True,   # False -> value aggregation uses the un-rotated base
@@ -396,13 +415,16 @@ def e_step_iteration(
     # oracle -- the key slot is the oracle's detached key under filtering (query-side coordinate
     # ascent) and the shared live leaf under smoothing (full gradient). Pre-building here as well
     # would only double the most expensive build in the codebase.
-    if transport_mode == "regime_ii":
+    if transport_mode in ("regime_ii", "regime_ii_covariant"):
         omega = None
 
         def _omega_builder(mu_q: torch.Tensor, mu_k: torch.Tensor):
             return build_belief_transport(
                 belief.phi, group, transport_mode=transport_mode,
                 mu=mu_q, mu_key=mu_k, connection_W=connection_W,
+                # regime_ii_covariant: the gauge-invariant features also read the belief variances;
+                # query slot live, key slot detached (mirrors the mu/mu_key coordinate-ascent split).
+                sigma=belief.sigma, sigma_key=belief.sigma.detach(), connection_M=connection_M,
                 cocycle_relaxation=cocycle_relaxation, rope=rope, rope_on_cov=rope_on_cov,
                 rope_on_value=rope_on_value,
             )
@@ -524,6 +546,7 @@ def e_step_iteration(
                 # the outer graph anyway when create_graph=False). Removing the detach would leak
                 # second-order phi-step terms into connection_W's gradient.
                 connection_W=(connection_W.detach() if connection_W is not None else None),
+                connection_M=(connection_M.detach() if connection_M is not None else None),
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]
         if grad_record is not None:                      # RAW phi-gradient norm (pre-precondition)
