@@ -315,6 +315,30 @@ def _build_regime_ii(
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
+# Query-chunk budget for the dense Regime-II covariant builder (OOM fix, 2026-06-18). The builder
+# holds several dense (B, N, N, K, K) transients at once (the flat cocycle Omega^0, the transported-
+# key covariance and its Cholesky factors, the edge Lie-algebra matrix and its exponential); at
+# K=20 / 2-head / B=64 / N=128 each is ~1.68 GB, so the full build OOMs on a 32 GB GPU while the
+# flat K=80 run (factored, no dense Omega) fits. Capping the simultaneous (B, chunk, N, K, K) working
+# set at ~this many fp32 elements bounds peak memory; the build is otherwise unchanged (no
+# cross-query reduction, so chunking is exactly value- and gradient-equivalent to one chunk).
+_REGIME_II_CHUNK_ELEMS = 64_000_000   # ~256 MB fp32 per (B, chunk, N, K, K) working tensor
+
+
+def _regime_ii_query_chunk(
+    b:  int,                          # batch size B
+    n:  int,                          # sequence length N (query and key axes)
+    k:  int,                          # belief dimension K
+
+) -> int:                             # query-chunk size in [1, N]
+    r"""Query-index chunk size bounding the dense (B, chunk, N, K, K) working set to
+    ``_REGIME_II_CHUNK_ELEMS`` fp32 elements. One query row of (B, 1, N, K, K) is ``B*N*K*K``
+    elements; the chunk is the largest count keeping the working tensor under budget, clamped to
+    [1, N]. A single-sequence diagnostic build (B=1) collapses to one chunk (no behavior change)."""
+    per_row = max(1, b * n * k * k)
+    return max(1, min(n, _REGIME_II_CHUNK_ELEMS // per_row))
+
+
 @register_transport("regime_ii_covariant")
 def _build_regime_ii_covariant(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
@@ -374,46 +398,65 @@ def _build_regime_ii_covariant(
     fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
 
-    # Dense FLAT cocycle Omega^0_ij = exp(phi_i) exp(-phi_j); the gauge-invariant edge features are
-    # evaluated on this flat transport (the curved edge factor is inserted afterwards).
-    omega0 = torch.einsum("bikl,bjlm->bijkm", exp_phi, exp_neg_phi)             # (B, N, N, K, K)
-
-    mu_k    = mu_key   if mu_key   is not None else mu
-    sigma_k = sigma_key if sigma_key is not None else sigma
-
-    mu_q  = mu.unsqueeze(2)                                                     # (B, N, 1, K) query mean
-    mu_kt = torch.einsum("bijkl,bjl->bijk", omega0, mu_k)                       # (B, N, N, K) transported key mean
-    if sigma.dim() == mu.dim():                                                 # diagonal variances (B, N, K)
-        cov_q  = torch.diag_embed(sigma).unsqueeze(2)                           # (B, N, 1, K, K)
-        cov_kt = torch.einsum("bijkl,bjl,bijml->bijkm", omega0, sigma_k, omega0)
-    else:                                                                       # full covariance (B, N, K, K)
-        cov_q  = sigma.unsqueeze(2)                                             # (B, N, 1, K, K)
-        cov_kt = torch.einsum("bijkl,bjlm,bijnm->bijkn", omega0, sigma_k, omega0)
-
-    feats = gauge_invariant_edge_features(mu_q, cov_q, mu_kt, cov_kt)           # (B, N, N, 3) gauge-invariant
-    delta = cocycle_relaxation * torch.einsum("bijf,af->bija", feats, connection_M)   # (B, N, N, n_gen)
-
-    # Self-edge exclusion (audit F4 parity): the connection is an EDGE object; Omega_ii stays the
-    # flat identity exp(phi_i)exp(-phi_i) (delta_ii zeroed before the exp).
-    n_tok = delta.shape[1]
-    eye_n = torch.eye(n_tok, dtype=torch.bool, device=delta.device)
-    delta = delta.masked_fill(eye_n.view(1, n_tok, n_tok, 1), 0.0)
+    mu_k     = mu_key   if mu_key   is not None else mu
+    sigma_k  = sigma_key if sigma_key is not None else sigma
+    diagonal = sigma.dim() == mu.dim()                                          # (B,N,K) vs (B,N,K,K)
 
     generators = group.generators                                              # (n_gen, K, K)
-    delta_mat  = torch.einsum("bija,akl->bijkl", delta, generators)            # (B, N, N, K, K) Lie-algebra edge
-    # Smooth per-edge Frobenius cap on the embedded operator (same safeguard / squared-norm-no-sqrt
-    # finite-grad-at-zero trick as regime_ii); keeps stable_matrix_exp_pair on the EXACT operator.
-    fro_sq    = delta_mat.pow(2).sum(dim=(-2, -1), keepdim=True)
-    delta_mat = delta_mat * torch.rsqrt(1.0 + fro_sq / (delta_soft_cap * delta_soft_cap))
-
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
-    exp_delta, _ = stable_matrix_exp_pair(
-        delta_mat, skew_symmetric=group.skew_symmetric, only_forward=True, block_dims=block_dims,
-        exp_dim=(max(block_dims) if block_dims is not None else None),
-    )                                                                          # (B, N, N, K, K)
+    exp_dim    = max(block_dims) if block_dims is not None else None
 
-    # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
-    omega = torch.einsum("bikl,bijlm,bjmn->bijkn", exp_phi, exp_delta, exp_neg_phi)
+    B, N, K = mu.shape[0], mu.shape[1], mu.shape[-1]
+    cols  = torch.arange(N, device=mu.device)                                  # key indices (self-edge mask)
+    chunk = _regime_ii_query_chunk(B, N, K)
+
+    # Build Omega one QUERY-CHUNK at a time so only (B, chunk, N, K, K) of each dense transient is
+    # live at once -- the dense (B, N, N, K, K) flat cocycle / transported-key covariance / Cholesky
+    # factors / edge exp are NEVER materialized whole (the K=20 regime_ii_covariant OOM, 2026-06-18).
+    # There is no cross-query reduction, so each (i, j) operator is identical to a single-chunk build
+    # (chunk >= N collapses to the original code path, bit-for-bit).
+    omega_chunks: List[torch.Tensor] = []
+    for i0 in range(0, N, chunk):
+        i1        = min(i0 + chunk, N)
+        exp_phi_c = exp_phi[:, i0:i1]                                          # (B, C, K, K)
+        # FLAT cocycle for this query chunk Omega^0_[i0:i1],j = exp(phi_i) exp(-phi_j) (B, C, N, K, K);
+        # the gauge-invariant edge features are evaluated on it, the curved edge factor inserted after.
+        omega0_c = torch.einsum("bikl,bjlm->bijkm", exp_phi_c, exp_neg_phi)    # (B, C, N, K, K)
+
+        mu_q_c  = mu[:, i0:i1].unsqueeze(2)                                    # (B, C, 1, K) query mean
+        mu_kt_c = torch.einsum("bijkl,bjl->bijk", omega0_c, mu_k)              # (B, C, N, K) transported key mean
+        if diagonal:                                                          # diagonal variances (B, N, K)
+            cov_q_c  = torch.diag_embed(sigma[:, i0:i1]).unsqueeze(2)          # (B, C, 1, K, K)
+            cov_kt_c = torch.einsum("bijkl,bjl,bijml->bijkm", omega0_c, sigma_k, omega0_c)
+        else:                                                                 # full covariance (B, N, K, K)
+            cov_q_c  = sigma[:, i0:i1].unsqueeze(2)                            # (B, C, 1, K, K)
+            cov_kt_c = torch.einsum("bijkl,bjlm,bijnm->bijkn", omega0_c, sigma_k, omega0_c)
+
+        feats_c = gauge_invariant_edge_features(mu_q_c, cov_q_c, mu_kt_c, cov_kt_c)        # (B, C, N, 3)
+        delta_c = cocycle_relaxation * torch.einsum("bijf,af->bija", feats_c, connection_M)   # (B, C, N, n_gen)
+
+        # Self-edge exclusion (audit F4 parity): the connection is an EDGE object; Omega_ii stays the
+        # flat identity exp(phi_i)exp(-phi_i) (delta_ii zeroed before the exp). The diagonal column for
+        # local row c is the global query index i0 + c.
+        rows      = torch.arange(i0, i1, device=delta_c.device)                # (C,) global query indices
+        self_edge = rows.unsqueeze(-1) == cols.unsqueeze(0)                    # (C, N) bool
+        delta_c   = delta_c.masked_fill(self_edge.view(1, i1 - i0, N, 1), 0.0)
+
+        delta_mat_c = torch.einsum("bija,akl->bijkl", delta_c, generators)     # (B, C, N, K, K) Lie-algebra edge
+        # Smooth per-edge Frobenius cap on the embedded operator (same safeguard / squared-norm-no-sqrt
+        # finite-grad-at-zero trick as regime_ii); keeps stable_matrix_exp_pair on the EXACT operator.
+        fro_sq      = delta_mat_c.pow(2).sum(dim=(-2, -1), keepdim=True)
+        delta_mat_c = delta_mat_c * torch.rsqrt(1.0 + fro_sq / (delta_soft_cap * delta_soft_cap))
+
+        exp_delta_c, _ = stable_matrix_exp_pair(
+            delta_mat_c, skew_symmetric=group.skew_symmetric, only_forward=True,
+            block_dims=block_dims, exp_dim=exp_dim,
+        )                                                                      # (B, C, N, K, K)
+        # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
+        omega_chunks.append(
+            torch.einsum("bikl,bijlm,bjmn->bijkn", exp_phi_c, exp_delta_c, exp_neg_phi))
+
+    omega = torch.cat(omega_chunks, dim=1) if len(omega_chunks) > 1 else omega_chunks[0]
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 

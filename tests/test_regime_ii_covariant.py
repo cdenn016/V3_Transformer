@@ -207,3 +207,78 @@ def test_build_optimizer_groups_connection_m():
     opt = build_optimizer(model, model.cfg)               # raises if connection_M is ungrouped
     grouped = {p for g in opt.param_groups for p in g["params"]}
     assert model.connection_M in grouped
+
+
+# --- OOM fix: query-index chunking of the dense covariant builder (2026-06-18) -------------------
+# The covariant builder materializes several dense (B, N, N, K, K) tensors at once (omega0, cov_kt,
+# its Cholesky factors, delta_mat, exp_delta, omega). At K=20/2-head/B=64/N=128 that is ~1.68 GB
+# EACH, and the K=20 regime_ii_covariant run OOMs while the larger flat K=80 run (factored, no dense
+# Omega) fits. The builder now loops over the query index in chunks so only (B, C, N, K, K) is live
+# at a time. Chunking must be exactly value- and gradient-equivalent to the one-chunk build (no
+# cross-query reduction exists, so each (i, j) operator is byte-identical regardless of chunking).
+
+def test_regime_ii_query_chunk_bounds_working_set():
+    """The chunk-size policy chunks the OOM config (B=64, N=128, K=20) below N, and collapses to a
+    single chunk for a tiny diagnostic build (B=1)."""
+    from vfe3.geometry import transport as T
+    assert 1 <= T._regime_ii_query_chunk(64, 128, 20) < 128       # OOM config must chunk
+    assert T._regime_ii_query_chunk(1, 4, 4) == 4                 # tiny single-sequence build: one chunk
+
+
+def test_regime_ii_covariant_chunked_matches_unchunked():
+    """Forcing a tiny query chunk gives the SAME Omega and the SAME gradient to connection_M as the
+    one-chunk build -- chunking is purely a memory optimization, numerically equivalent."""
+    import pytest
+    from vfe3.geometry import transport as T
+
+    phi, mu, sigma, grp = _phi_mu_sigma(seed=7, B=2, N=6, K=8, n_heads=2)
+    n_gen = grp.generators.shape[0]
+    M0 = 0.2 * torch.randn(n_gen, 3, generator=torch.Generator().manual_seed(3))
+    build = get_transport("regime_ii_covariant")
+
+    def _omega_and_grad(chunk_elems: int):
+        # monkeypatch-free: set/restore the module constant around each build (raises if absent -> RED)
+        saved = T._REGIME_II_CHUNK_ELEMS
+        T._REGIME_II_CHUNK_ELEMS = chunk_elems
+        try:
+            M = M0.clone().requires_grad_(True)
+            omega = build(phi, grp, mu=mu, sigma=sigma, connection_M=M)["Omega"]
+            (omega ** 2).sum().backward()
+            return omega.detach().clone(), M.grad.detach().clone()
+        finally:
+            T._REGIME_II_CHUNK_ELEMS = saved
+
+    omega_one, grad_one = _omega_and_grad(10 ** 12)              # one chunk (size N)
+    omega_chunk, grad_chunk = _omega_and_grad(1)                 # forced size-1 chunks
+    assert torch.allclose(omega_one, omega_chunk, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(grad_one, grad_chunk, atol=1e-5, rtol=1e-5)
+
+
+# --- diagnostics threading: connection_M must reach the holonomy / converged-state transport ------
+def test_diagnostics_holonomy_reflects_connection_m():
+    """model.diagnostics builds its holonomy Omega under the ACTIVE regime; under regime_ii_covariant
+    a nonzero connection_M must produce non-trivial curvature (holonomy_deviation > 0). Before the
+    threading fix the diagnostic Omega fell back to flat (connection_M unpassed) -> holonomy ~0."""
+    torch.manual_seed(0)
+    model = VFEModel(_tiny_cfg(transport_mode="regime_ii_covariant"))
+    with torch.no_grad():
+        model.prior_bank.mu_embed *= 50.0
+        model.connection_M += 0.5 * torch.randn_like(model.connection_M)
+    tokens = torch.randint(0, 15, (1, 4))
+    d = model.diagnostics(tokens)
+    assert d["holonomy_deviation"] > 1e-4
+
+
+def test_converged_state_omega_reflects_connection_m():
+    """viz.extract.converged_state returns the diagnostic Omega; under regime_ii_covariant it must be
+    built with connection_M (the F-trajectory / holonomy panels otherwise read a flat transport)."""
+    from vfe3.viz.extract import converged_state
+    from vfe3.metrics import holonomy_deviation
+    torch.manual_seed(0)
+    model = VFEModel(_tiny_cfg(transport_mode="regime_ii_covariant"))
+    with torch.no_grad():
+        model.prior_bank.mu_embed *= 50.0
+        model.connection_M += 0.5 * torch.randn_like(model.connection_M)
+    tokens = torch.randint(0, 15, (1, 4))
+    st = converged_state(model, tokens)
+    assert float(holonomy_deviation(st["omega"])) > 1e-4
