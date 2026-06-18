@@ -607,3 +607,160 @@ def model_channel_bank(
         "token_ids": torch.cat(tids),
         "seq_idx":   torch.cat(sidx),
     }
+
+
+def _vocab_display_panel(
+    probs:   torch.Tensor,               # (P0, V) per-position softmax for ONE sequence
+    tokens:  torch.Tensor,               # (N,)    that sequence's input token ids
+
+    *,
+    max_rows:      int = 40,
+    per_pos_k:     int = 3,
+    max_positions: int = 64,
+) -> Dict[str, object]:
+    r"""Select a compact ``(R, P)`` probability sub-grid for the Seq x top-k heatmap.
+
+    The full ``p(o_{n+1} | o_{<=n})`` over ``V = 50257`` tokens is illegible, so the y-axis is the
+    union of each shown position's top-``per_pos_k`` predicted token ids together with the true
+    next-token id, ranked by summed probability over the shown positions and capped at
+    ``max_rows``; the x-axis is the first ``max_positions`` positions. ``disp_truth_row`` gives,
+    per position, the row index of the true next token (-1 when it falls outside the shown rows),
+    for the ground-truth overlay.
+    """
+    P = min(int(probs.shape[0]), max_positions)
+    p = probs[:P]                                                # (P, V)
+    context_ids = tokens[:P]                                     # (P,) token AT each shown position
+    target_ids  = tokens[1:P + 1]                               # (P,) the true next token
+    topk = p.topk(min(per_pos_k, p.shape[-1]), dim=-1).indices.reshape(-1)   # (P*k,)
+    cand = torch.cat([topk, target_ids]).unique()               # (C,) candidate row ids
+    mass = p[:, cand].sum(dim=0)                                # (C,) total mass per candidate
+    order = mass.argsort(descending=True)[:max_rows]
+    row_ids = cand[order]                                        # (R,)
+    disp_probs = p[:, row_ids].transpose(0, 1).contiguous()     # (R, P)
+    pos_in = {int(t): i for i, t in enumerate(row_ids.tolist())}
+    truth_row = torch.tensor([pos_in.get(int(t), -1) for t in target_ids.tolist()], dtype=torch.long)
+    return {
+        "disp_context_ids": context_ids.cpu(),
+        "disp_target_ids":  target_ids.cpu(),
+        "row_ids":          row_ids.cpu(),
+        "disp_probs":       disp_probs.cpu(),
+        "disp_truth_row":   truth_row,
+    }
+
+
+@torch.no_grad()
+def vocab_prediction_stats(
+    model,
+    token_batches:  Iterable[torch.Tensor],   # iterable of (B, N) token-id batches
+
+    *,
+    device:         Optional[torch.device] = None,
+    max_rows:       int = 40,
+    per_pos_k:      int = 3,
+    max_positions:  int = 64,
+    max_pairs:      int = 200_000,
+) -> Dict[str, object]:
+    r"""Next-token predictive distributions over the vocabulary, for the vocab-probability figures.
+
+    Runs the inference forward (``model(tokens)`` -> ``(B, N, V)`` logits) and softmaxes to
+    ``p(o_{n+1} | o_{<=n})``. Logit row ``n`` predicts token ``n+1``, so the aggregate uses
+    positions ``0..N-2`` with targets ``tokens[:, 1:]``; the final position's target lies outside
+    the window and is dropped.
+
+    Returns one dict feeding three figures:
+      display (first sequence) -- ``disp_context_ids`` (P,), ``disp_target_ids`` (P,),
+        ``row_ids`` (R,), ``disp_probs`` (R, P), ``disp_truth_row`` (P,);
+      calibration (all positions) -- ``mean_pred_prob`` (V,), ``unigram`` (V,),
+        ``mean_pred_entropy`` (), ``unigram_entropy`` (), ``n_positions`` ();
+      confusion (capped sample of <= ``max_pairs``) -- ``true_ids`` (M,), ``pred_ids`` (M,) argmax.
+    Entropies are in nats: ``mean_pred_entropy`` is the mean conditional ``H(p(.|context))`` and
+    ``unigram_entropy`` is ``H`` of the empirical marginal; their gap is the context information
+    the model uses, which collapses toward zero when predictions degenerate to the marginal.
+    """
+    device = device or _model_device(model)
+    was_training = model.training
+    model.eval()
+    V = int(model.cfg.vocab_size)
+    prob_sum = torch.zeros(V, dtype=torch.float64, device=device)
+    tgt_count = torch.zeros(V, dtype=torch.float64, device=device)
+    ent_sum = torch.zeros((), dtype=torch.float64, device=device)
+    n_pos = 0
+    true_ids: List[torch.Tensor] = []
+    pred_ids: List[torch.Tensor] = []
+    n_pairs = 0
+    disp: Optional[Dict[str, object]] = None
+    try:
+        for batch in token_batches:
+            tokens = batch[0] if isinstance(batch, (tuple, list)) else batch
+            tokens = tokens.to(device)
+            if tokens.dim() == 1:
+                tokens = tokens.unsqueeze(0)
+            b, n = tokens.shape
+            if n < 2:
+                continue
+            logits = model(tokens)[:, :-1].float()                  # (B, N-1, V) drop last (no in-window target)
+            targets = tokens[:, 1:]                                 # (B, N-1) true next token
+            probs = torch.softmax(logits, dim=-1)                   # (B, N-1, V)
+            flatp = probs.reshape(-1, V)                            # (B*(N-1), V)
+            prob_sum += flatp.sum(dim=0).double()
+            ent_sum += -(flatp * flatp.clamp_min(1e-12).log()).sum(dim=-1).sum().double()
+            tgt_flat = targets.reshape(-1)
+            tgt_count += torch.bincount(tgt_flat, minlength=V).double()
+            n_pos += int(tgt_flat.numel())
+            if n_pairs < max_pairs:
+                take = min(max_pairs - n_pairs, int(tgt_flat.numel()))
+                true_ids.append(tgt_flat[:take].cpu())
+                pred_ids.append(flatp[:take].argmax(dim=-1).cpu())
+                n_pairs += take
+            if disp is None:
+                disp = _vocab_display_panel(probs[0], tokens[0], max_rows=max_rows,
+                                            per_pos_k=per_pos_k, max_positions=max_positions)
+    finally:
+        if was_training:
+            model.train()
+    if disp is None:
+        raise ValueError("vocab_prediction_stats: no usable (N>=2) batch in token_batches")
+    denom = max(n_pos, 1)
+    mean_pred_prob = prob_sum / denom
+    unigram = tgt_count / denom
+    uni_ent = float(-(unigram * unigram.clamp_min(1e-12).log()).sum())
+    return {
+        **disp,
+        "mean_pred_prob":    mean_pred_prob.float().cpu(),
+        "unigram":           unigram.float().cpu(),
+        "mean_pred_entropy": float(ent_sum / denom),
+        "unigram_entropy":   uni_ent,
+        "n_positions":       int(n_pos),
+        "true_ids":          torch.cat(true_ids) if true_ids else torch.empty(0, dtype=torch.long),
+        "pred_ids":          torch.cat(pred_ids) if pred_ids else torch.empty(0, dtype=torch.long),
+    }
+
+
+@torch.no_grad()
+def decode_readout(
+    model,
+
+    *,
+    max_rows: int = 96,
+) -> Optional[Dict[str, object]]:
+    r"""The linear-decode readout matrix ``W`` (``logits = mu_q @ W^T``) for the Decode-W heatmap.
+
+    Returns ``None`` on the ``use_prior_bank=True`` KL-to-prior decode (no ``W`` exists there).
+    Otherwise selects the ``max_rows`` highest-L2-norm vocabulary rows -- the output directions the
+    readout most strongly distinguishes -- and returns ``weight`` (R, K), their ``row_ids`` (R,),
+    the per-row ``row_norm`` (R,), and the optional log-unigram ``bias`` (R,).
+    """
+    pb = model.prior_bank
+    W = getattr(pb, "output_proj_weight", None)
+    if W is None:
+        return None
+    W = W.detach().float()
+    norms = W.norm(dim=1)                                        # (V,)
+    row_ids = norms.argsort(descending=True)[:max_rows]
+    bias = getattr(pb, "output_proj_bias", None)
+    return {
+        "weight":   W[row_ids].cpu(),
+        "row_ids":  row_ids.cpu(),
+        "row_norm": norms[row_ids].cpu(),
+        "bias":     (bias.detach().float()[row_ids].cpu() if bias is not None else None),
+    }

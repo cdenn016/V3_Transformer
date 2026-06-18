@@ -8,11 +8,12 @@ publication figure set was never produced from a real run. This module is the mi
 :mod:`vfe3.metrics` measurements they feed, and writes the single-run figure set into
 ``run_dir/figures/``.
 
-This is OPT-IN and OFF the training hot path: it is a separate click-to-run step
-(``make_figures.py``), never invoked by ``train``/``finalize_run``, because the runners are
-expensive (UMAP embedding, E-step replay, holonomy sampling, a belief bank over many
-sequences). Each figure is best-effort -- a plotting / dependency / shape error is logged and
-skipped so one bad figure never aborts the rest -- mirroring ``RunArtifacts._save_figures``.
+This is OFF the training hot path but IS auto-run at the end of training: ``finalize_run`` calls
+it on the reloaded best-val model unless ``cfg.generate_figures=False`` (see ``run_artifacts.py``),
+and ``make_figures.py`` re-runs the same set on demand for an already-trained run. The runners are
+expensive (UMAP embedding, E-step replay, holonomy sampling, a belief bank over many sequences),
+so each figure is best-effort -- a plotting / dependency / shape error is logged and skipped so one
+bad figure never aborts the rest -- mirroring ``RunArtifacts._save_figures``.
 
 The SWEEP-level figures (capacity_scaling, estep_capacity, pareto_frontier, ablation_forest,
 lr_grid_heatmap) need multi-run data and belong to the ablation runner, not a single run; the
@@ -145,6 +146,9 @@ def generate_figures(
     gamma_attn  = _safe(lambda: extract.gamma_attention(model, tok), "gamma_attention")
     mc_bank     = _safe(lambda: extract.model_channel_bank(model, token_batches, max_sequences=max_sequences),
                         "model_channel_bank")
+    vstats      = _safe(lambda: extract.vocab_prediction_stats(model, token_batches), "vocab_prediction_stats")
+    readout     = _safe(lambda: extract.decode_readout(model), "decode_readout")
+    run_label   = f"K{cfg.embed_dim}"
 
     # gpt2/cl100k decoder for the belief-UMAP linguistic-category colouring + token labels (None when
     # tiktoken is absent or the dataset has no real tokenizer -> the UMAP greys out and labels by id).
@@ -260,6 +264,107 @@ def generate_figures(
         _emit(f"model_umap_{ch}",
               lambda p, ch=ch: figs.plot_belief_umap(mc_bank, ch, kind="Model", decode=decode, path=p),
               mc_bank is not None)
+    # Next-token vocabulary-probability figures (single-arm here; the cross-run K70-vs-K120 contrast
+    # is the two-arm vocab_comparison_figures driver). vocab_confusion needs the token decoder for its
+    # category bucketing; decode_readout is None (skipped) on the use_prior_bank=True KL-decode path.
+    _emit("vocab_probability_heatmap",
+          lambda p: figs.plot_vocab_probability_heatmap([{**vstats, "label": run_label}], decode=decode, path=p),
+          vstats is not None)
+    _emit("vocab_calibration",
+          lambda p: figs.plot_vocab_calibration([{**vstats, "label": run_label}], decode=decode, path=p),
+          vstats is not None)
+    _emit("vocab_confusion",
+          lambda p: figs.plot_vocab_confusion([{**vstats, "label": run_label}], decode=decode, path=p),
+          vstats is not None and decode is not None)
+    _emit("decode_readout",
+          lambda p: figs.plot_decode_readout([{**readout, "label": run_label}], decode=decode, path=p),
+          readout is not None)
 
     logger.info("wrote %d single-run figures to %s", len(written), figdir)
+    return written
+
+
+def vocab_comparison_figures(
+    run_dirs:  'list[str | Path]',
+    out_dir:   'str | Path',
+
+    *,
+    labels:        Optional[List[str]]      = None,
+    device:        Optional[torch.device]   = None,
+    split:         str                      = "validation",
+    max_sequences: int                      = 256,
+    taxonomy:      str                      = "function_content",
+    logger:        Optional[logging.Logger] = None,
+) -> List[Path]:
+    r"""Cross-run vocabulary-probability comparison (e.g. K70 vs K120) into ``out_dir``.
+
+    Loads each trained run, runs the single ``vocab_prediction_stats`` pass, and writes the four
+    arm-list figures (probability heatmap / calibration / confusion / decode readout) with one
+    column per run -- the side-by-side collapse contrast the single-run :func:`generate_figures`
+    pipeline cannot make (it sees one model). Each figure is best-effort: a failure is logged and
+    skipped. ``labels`` default to ``K<embed_dim>``; the decoder is taken from the first run's
+    dataset (the confusion figure is skipped when no tokenizer is available).
+    """
+    from vfe3.model.model import VFEModel
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    logger = logger or logging.getLogger(__name__)
+    figs.set_publication_style()
+
+    arms_pred: List[dict] = []
+    arms_readout: List[dict] = []
+    decode = None
+    for i, rd in enumerate(run_dirs):
+        rd = Path(rd)
+        cfg, dataset = _load_config(rd)
+        model = VFEModel(cfg)
+        best = rd / "best_model.pt"
+        if not best.exists():
+            raise FileNotFoundError(f"no best_model.pt in {rd}; train with RunArtifacts first")
+        model.load_state_dict(torch.load(best, map_location=device or "cpu", weights_only=True))
+        dev = device or next(model.parameters()).device
+        model = model.to(dev)
+        model.eval()
+        loader = _build_loader(dataset, cfg, split)
+        n_batches = max(2, -(-max_sequences // max(cfg.batch_size, 1)))
+        token_batches = _collect_token_batches(loader, dev, n_batches)
+        label = labels[i] if labels and i < len(labels) else f"K{cfg.embed_dim}"
+        arms_pred.append({**extract.vocab_prediction_stats(model, token_batches), "label": label})
+        ro = extract.decode_readout(model)
+        if ro is not None:
+            arms_readout.append({**ro, "label": label})
+        if decode is None:
+            try:
+                from vfe3.data.datasets import get_tiktoken_decoder
+                decode = get_tiktoken_decoder(dataset)
+            except Exception as exc:
+                logger.warning("token decoder unavailable (%s); confusion figure skipped", exc)
+
+    written: List[Path] = []
+
+    def _emit(name: str, thunk: Callable[[], object], available: bool) -> None:
+        if not available:
+            logger.info("comparison figure %r skipped (input unavailable)", name)
+            return
+        try:
+            path = out / f"{name}.png"
+            fig = thunk()
+            fig.savefig(str(path))
+            figs.plt.close(fig)
+            written.append(path)
+            logger.info("figure -> %s", path)
+        except Exception as exc:
+            logger.warning("comparison figure %r failed (%s); continuing", name, exc)
+
+    _emit("vocab_probability_heatmap_compare",
+          lambda: figs.plot_vocab_probability_heatmap(arms_pred, decode=decode), bool(arms_pred))
+    _emit("vocab_calibration_compare",
+          lambda: figs.plot_vocab_calibration(arms_pred, decode=decode), bool(arms_pred))
+    _emit("vocab_confusion_compare",
+          lambda: figs.plot_vocab_confusion(arms_pred, decode=decode, taxonomy=taxonomy),
+          bool(arms_pred) and decode is not None)
+    _emit("decode_readout_compare",
+          lambda: figs.plot_decode_readout(arms_readout, decode=decode), bool(arms_readout))
+
+    logger.info("wrote %d comparison figures to %s", len(written), out)
     return written
