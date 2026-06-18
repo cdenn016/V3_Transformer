@@ -31,6 +31,7 @@ except ImportError:                                 # tqdm optional: absent -> n
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader
+from vfe3.ema import EMA
 from vfe3.free_energy import attention_tau
 from vfe3.model.block import _as_coeff
 from vfe3.model.model import VFEModel
@@ -602,10 +603,14 @@ def train(
     # Created BEFORE the resume block so load_checkpoint can restore its scale/growth state
     # (audit 2026-06-09 IE3).
     scaler = torch.amp.GradScaler(device=device.type, enabled=(cfg.amp_dtype == "fp16"))
+    # Opt-in EMA / Polyak averaging (default OFF -> ema is None and every ema-guarded block below is a
+    # no-op, leaving the loop byte-identical to the pure path). Built BEFORE the resume load so a
+    # resumed run restores its shadow from the bundle rather than re-seeding it from the resumed iterate.
+    ema = EMA(model, decay=cfg.ema_decay) if cfg.use_ema else None
     if resume_path is not None:
         from vfe3.run_artifacts import load_checkpoint           # local import avoids any import cycle
         start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
-                                     scaler=scaler, cfg=cfg)
+                                     scaler=scaler, cfg=cfg, ema=ema)
         # LambdaLR with last_epoch != -1 requires 'initial_lr' on every group; set it from the configured
         # base (not the post-load group['lr'], which the restored optimizer state overwrote with base*cos).
         for group, base in zip(optimizer.param_groups, base_lrs):
@@ -662,6 +667,8 @@ def train(
         losses.append(train_step(model, optimizer, scheduler, tokens, targets,
                                   grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
                                   scaler=scaler, metrics_out=step_metrics))
+        if ema is not None:
+            ema.update(model)                            # blend the post-step weights into the shadow
 
         if do_log or do_csv:                                 # converged CE + diagnostics (off graph), ONCE
             with torch.no_grad():
@@ -692,6 +699,9 @@ def train(
             )
 
         if do_eval:
+            if ema is not None:                          # eval / best-save / samples on the averaged weights
+                ema.store(model)
+                ema.copy_to(model)
             m = evaluate(model, val_loader, max_batches=cfg.eval_max_batches,
                          tokens_per_char=tokens_per_char, device=device)
             logger.info(" \n Validation @ step %d:", step + 1)
@@ -734,6 +744,8 @@ def train(
                 # Model-coupling (gamma) heatmaps alongside the belief beta maps, in a distinct colour
                 # (viridis vs magma); gamma_attention_maps returns None when the model channel is off -> no-op.
                 artifacts.save_gamma_attention_maps(step + 1, model.gamma_attention_maps(tokens), logger=logger)
+            if ema is not None:
+                ema.restore(model)                       # live SGD weights back before the next train_step
 
         # Persistence is opt-in: with no artifacts object do_csv is False, so the silent/in-memory
         # path is unchanged. A metrics.csv row is written every LOG_INTERVAL (and every eval) -- the
@@ -839,7 +851,9 @@ def train(
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
         if (artifacts is not None and cfg.checkpoint_interval
                 and (step + 1) % cfg.checkpoint_interval == 0):
-            artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler)
+            artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler, ema=ema)
+    if ema is not None:
+        ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses
 
 

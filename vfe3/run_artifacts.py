@@ -34,6 +34,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from vfe3.config import VFE3Config
+from vfe3.ema import EMA
 
 
 class RunArtifacts:
@@ -203,6 +204,7 @@ class RunArtifacts:
 
         *,
         scaler:    Optional['torch.amp.GradScaler'] = None,
+        ema:       Optional[EMA]                     = None,
     ) -> Path:
         r"""Write a resumable ``checkpoints/step_<N>.pt`` (model + optimizer + RNG + config + step).
 
@@ -227,6 +229,7 @@ class RunArtifacts:
             "config":          asdict(cfg),
             "scaler_state":    (scaler.state_dict()
                                 if scaler is not None and scaler.is_enabled() else None),
+            "ema_state":       (ema.state_dict() if ema is not None else None),
         }, path)
         return path
 
@@ -241,6 +244,7 @@ def load_checkpoint(
     restore_rng:  bool                                   = True,
     scaler:       Optional['torch.amp.GradScaler']       = None,
     cfg:          Optional[VFE3Config]                   = None,
+    ema:          Optional[EMA]                          = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
@@ -271,6 +275,11 @@ def load_checkpoint(
         optimizer.load_state_dict(ckpt["optimizer_state"])
     if scaler is not None and ckpt.get("scaler_state") is not None:
         scaler.load_state_dict(ckpt["scaler_state"])
+    # EMA shadow: restore it so a resumed run continues the SAME running average instead of re-seeding
+    # from the resumed iterate. Bundles written before EMA existed (or from a use_ema=False run) carry
+    # no ema_state, so the shadow stays at its constructed value (the just-loaded weights).
+    if ema is not None and ckpt.get("ema_state") is not None:
+        ema.load_state_dict(ckpt["ema_state"])
     if cfg is not None and ckpt.get("config") is not None:
         saved = ckpt["config"]
         current = asdict(cfg)
