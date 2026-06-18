@@ -74,6 +74,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
         cocycle_relaxation=cfg.cocycle_relaxation, connection_W=getattr(model, "connection_W", None),
+        connection_M=getattr(model, "connection_M", None),
         log_prior=log_prior, log_alpha=getattr(model, "log_alpha", None),
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
@@ -94,6 +95,7 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
         transport_mode=cfg.transport_mode, cocycle_relaxation=cfg.cocycle_relaxation,
         log_prior=log_prior, log_alpha=getattr(model, "log_alpha", None),
         connection_W=getattr(model, "connection_W", None),
+        connection_M=getattr(model, "connection_M", None),
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
 
@@ -188,6 +190,7 @@ def belief_bank(
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained
                 log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),  # model
                 connection_W=getattr(model, "connection_W", None),
+                connection_M=getattr(model, "connection_M", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
             )
             b = tokens.shape[0]
@@ -275,6 +278,7 @@ def across_layer_belief_trace(
             cg_coupling=model.cg_coupling,                       # replay the trained model
             log_alpha=getattr(model, "log_alpha", None),
             lambda_beta=_lambda_beta(model), connection_W=getattr(model, "connection_W", None),
+            connection_M=getattr(model, "connection_M", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
         )
         mus.append(belief.mu)
@@ -315,8 +319,10 @@ def numerical_health(
     # described a flat-transport belief, not the model that trained. Mirrors converged_state.
     omega = _transport(
         out.phi, model.group, transport_mode=cfg.transport_mode,
-        mu=(out.mu if cfg.transport_mode == "regime_ii" else None),
+        mu=(out.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
+        sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
         connection_W=getattr(model, "connection_W", None),
+        connection_M=getattr(model, "connection_M", None),
         cocycle_relaxation=cfg.cocycle_relaxation,
     )
     # Wrap in RopeTransport under pos_rotation='rope' so the reported nan/energy/beta fractions
@@ -388,6 +394,7 @@ def converged_state(
             head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained model
             log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
             connection_W=getattr(model, "connection_W", None),
+            connection_M=getattr(model, "connection_M", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
             capture=cap,
         )
@@ -398,8 +405,10 @@ def converged_state(
             sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
         omega = _transport(                                            # (N, N, K, K) phi-cocycle (pre-rope)
             out.phi, model.group, transport_mode=cfg.transport_mode,
-            mu=(out.mu if cfg.transport_mode == "regime_ii" else None),
+            mu=(out.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
+            sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
             connection_W=getattr(model, "connection_W", None),
+            connection_M=getattr(model, "connection_M", None),
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
         if rope is not None:

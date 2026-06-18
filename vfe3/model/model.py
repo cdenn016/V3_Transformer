@@ -1293,6 +1293,7 @@ class VFEModel(nn.Module):
             log_alpha=getattr(self, "log_alpha", None),               # learned scalar (None on the pure path)
             lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
+            connection_M=getattr(self, "connection_M", None),         # learned covariant (Route B) connection (None unless regime_ii_covariant)
             rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
             rope_on_value=cfg.rope_on_value,
             capture=cap,
@@ -1311,8 +1312,10 @@ class VFEModel(nn.Module):
         # (rope was computed above and now also shaped the converged belief.)
         omega = _transport(                                          # (N, N, K, K)
             out.phi, self.group, transport_mode=cfg.transport_mode,
-            mu=(out.mu if cfg.transport_mode == "regime_ii" else None),
+            mu=(out.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
+            sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
             connection_W=getattr(self, "connection_W", None),
+            connection_M=getattr(self, "connection_M", None),
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
         if rope is not None:
@@ -1492,6 +1495,9 @@ class VFEModel(nn.Module):
         _cW = getattr(self, "connection_W", None)
         if _cW is not None:                                          # transport_mode='regime_ii'
             d["connection_w_norm"] = float(torch.linalg.norm(_cW.detach()))
+        _cM = getattr(self, "connection_M", None)
+        if _cM is not None:                                          # transport_mode='regime_ii_covariant'
+            d["connection_m_norm"] = float(torch.linalg.norm(_cM.detach()))
         _hm = getattr(self, "head_mixer", None)
         if _hm is not None and hasattr(_hm, "mixer_deltas"):        # use_head_mixer=True
             d["head_mixer_drift"] = max(
@@ -1553,6 +1559,7 @@ class VFEModel(nn.Module):
                 log_alpha=getattr(self, "log_alpha", None),            # 2026-06-09 overnight F32)
                 lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
+                connection_M=getattr(self, "connection_M", None),     # learned covariant (Route B) connection
                 cg_coupling=self.cg_coupling,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
                 rope_on_value=cfg.rope_on_value,
@@ -1562,8 +1569,10 @@ class VFEModel(nn.Module):
             # (flat ignores both), and the energy is per-irrep-block (per-head).
             omega = _transport(
                 belief.phi, self.group, transport_mode=cfg.transport_mode,
-                mu=(belief.mu if cfg.transport_mode == "regime_ii" else None),
+                mu=(belief.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
+                sigma=(belief.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
                 connection_W=getattr(self, "connection_W", None),
+                connection_M=getattr(self, "connection_M", None),
                 cocycle_relaxation=cfg.cocycle_relaxation,
             )                                                        # (N, N, K, K)
             if rope is not None:
