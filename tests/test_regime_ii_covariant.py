@@ -282,3 +282,113 @@ def test_converged_state_omega_reflects_connection_m():
     tokens = torch.randint(0, 15, (1, 4))
     st = converged_state(model, tokens)
     assert float(holonomy_deviation(st["omega"])) > 1e-4
+
+
+# --- numerical robustness of the gauge-invariant edge features (audit 2026-06-18) ---------------
+# The transported-key congruence S = Omega^0 Sigma Omega^0^T SQUARES cond(Omega^0) ~ exp(2||phi||)
+# on the non-compact block_glk frame, so the edge-feature Cholesky must (a) run in a float64 island
+# (an fp32 congruence destroys the gauge-invariant features -- >100% rel error at K=70 in the audit)
+# and (b) degrade a non-PD S to NaN via safe_cholesky instead of raising a LinAlgError that aborts
+# the whole forward.
+
+def test_gauge_invariant_edge_features_does_not_raise_on_non_pd():
+    """A non-PD transported covariance must degrade to NaN (-> kl_max downstream), not raise a
+    LinAlgError. Mirrors the safe_cholesky contract used throughout families/gaussian.py."""
+    from vfe3.geometry.transport import gauge_invariant_edge_features
+    K = 4
+    mu_q   = torch.zeros(K)
+    mu_kt  = torch.zeros(K)
+    cov_q  = torch.eye(K)
+    cov_kt = torch.eye(K)
+    cov_kt[0, 0] = -1.0                                   # clearly non-PD (not rescued by +eps)
+    feats = gauge_invariant_edge_features(mu_q, cov_q, mu_kt, cov_kt)   # must NOT raise
+    assert feats.shape == (3,)
+    assert torch.isnan(feats).any()
+
+
+def test_regime_ii_covariant_edge_features_use_float64_congruence():
+    """On the non-compact block_glk frame the transported-key congruence is ill-conditioned, so the
+    builder must evaluate the edge-feature congruence + Cholesky in float64. The builder INPUTS
+    (phi, mu, sigma) are well-conditioned and fp32-exact; the ill-conditioning is born INSIDE the
+    congruence. Isolation test: the connection's contribution to the fp32-vs-float64 Omega gap must
+    be no larger than the flat (M=0) exp_phi baseline -- i.e. the feature path adds no fp32 blow-up."""
+    import dataclasses
+    from vfe3.geometry.transport import get_transport
+    build = get_transport("regime_ii_covariant")
+
+    phi, mu, sigma, grp = _phi_mu_sigma(seed=5, B=1, N=5, K=12, n_heads=2)
+    phi = phi * 4.0                                       # push ||phi|| up -> ill-conditioned Omega^0
+    n_gen = grp.generators.shape[0]
+    M  = 0.3 * torch.randn(n_gen, 3, generator=torch.Generator().manual_seed(9))
+    M0 = torch.zeros(n_gen, 3)
+    grp64 = dataclasses.replace(grp, generators=grp.generators.double())
+
+    def omega(dtype, conn):
+        g = grp if dtype == torch.float32 else grp64
+        return build(phi.to(dtype), g, mu=mu.to(dtype), sigma=sigma.to(dtype),
+                     connection_M=conn.to(dtype))["Omega"].double()
+
+    # fp32 features (the bug) either CRASH (non-PD congruence) or give >100% relative error; with the
+    # float64 congruence the fp32-input curved build tracks its float64 reference to ~fp32 epsilon,
+    # about as tightly as the flat (M=0) exp_phi baseline -- the connection adds no fp32 blow-up.
+    ref_flat   = omega(torch.float64, M0)
+    ref_curved = omega(torch.float64, M)
+    rel_flat   = (omega(torch.float32, M0) - ref_flat).abs().max()   / ref_flat.abs().max()
+    rel_curved = (omega(torch.float32, M)  - ref_curved).abs().max() / ref_curved.abs().max()
+    assert rel_curved < 5e-3, (
+        f"fp32 feature congruence blows up the covariant transport: curved rel err "
+        f"{rel_curved:.3e} (flat baseline {rel_flat:.3e})")
+
+
+def test_regime_ii_covariant_requires_sigma_when_connection_m_set():
+    """connection_M provided but sigma=None must raise a clear ValueError, not an opaque
+    AttributeError on sigma.dim(). Hardens the public builder contract (e_step always passes sigma)."""
+    import pytest
+    phi, mu, _sigma, grp = _phi_mu_sigma(seed=8)
+    n_gen = grp.generators.shape[0]
+    M = 0.2 * torch.randn(n_gen, 3)
+    with pytest.raises(ValueError):
+        get_transport("regime_ii_covariant")(phi, grp, mu=mu, sigma=None, connection_M=M)
+
+
+def test_regime_ii_query_chunk_accounts_for_simultaneous_transients():
+    """The chunk policy must bound the SUM of the several simultaneous dense (B,C,N,K,K) transients
+    the builder holds (omega0, cov_kt, delta_mat, exp_delta, the output chunk), not a single tensor
+    -- else the OOM budget underestimates peak by ~5x (audit 2026-06-18)."""
+    from vfe3.geometry import transport as T
+    B, N, K = 8, 256, 16                                 # N large enough to be budget-limited (chunk < N)
+    chunk = T._regime_ii_query_chunk(B, N, K)
+    per_row = B * N * K * K
+    assert chunk * per_row * T._REGIME_II_LIVE_TRANSIENTS <= T._REGIME_II_CHUNK_ELEMS
+    assert 1 <= chunk < N                                # must actually chunk at this size
+
+
+def test_regime_ii_covariant_omega_transforms_covariantly():
+    """End-to-end gauge-covariance law: the assembled Omega satisfies Omega_ij -> g_i Omega_ij g_j^{-1}
+    under a coherent per-token GL(K) frame change (phi co-transforms: exp(phi'_i) = g_i exp(phi_i)).
+    Pins the wiki C3 claim end-to-end -- previously only edge-feature invariance + non-flatness were
+    tested (audit 2026-06-18 coverage gap). Closed-form correct behavior, so a regression guard."""
+    from vfe3.geometry.transport import get_transport, build_factored_transport
+    build = get_transport("regime_ii_covariant")
+    B, N, K, n_heads = 1, 4, 8, 2
+    grp = get_group("block_glk")(K, n_heads)
+    n_gen = grp.generators.shape[0]
+    gen = torch.Generator().manual_seed(21)
+    mu    = torch.randn(B, N, K, generator=gen)
+    sigma = _spd(B, N, k=K)                               # FULL SPD (g Sigma g^T is non-diagonal)
+    M = 0.3 * torch.randn(n_gen, 3, generator=gen)
+
+    phi0 = torch.zeros(B, N, n_gen)                       # base frame phi=0
+    a    = 0.2 * torch.randn(B, N, n_gen, generator=gen)  # per-token gauge a_i -> g_i = exp(a_i . G)
+    fac  = build_factored_transport(a, grp)
+    g, g_inv = fac.exp_phi, fac.exp_neg_phi               # (B,N,K,K) g_i, g_i^{-1}
+
+    omega_base = build(phi0, grp, mu=mu, sigma=sigma, connection_M=M)["Omega"]
+    mu_t    = torch.einsum("bnkl,bnl->bnk", g, mu)                       # g_i mu_i
+    sigma_t = torch.einsum("bnkl,bnlm,bnpm->bnkp", g, sigma, g)          # g_i Sigma_i g_i^T
+    omega_tr = build(a, grp, mu=mu_t, sigma=sigma_t, connection_M=M)["Omega"]
+
+    expected = torch.einsum("bikl,bijlm,bjmn->bijkn", g, omega_base, g_inv)   # g_i Omega_ij g_j^{-1}
+    assert torch.allclose(omega_tr, expected, atol=1e-4, rtol=1e-4), (
+        f"covariance law violated: max abs diff {(omega_tr - expected).abs().max().item():.3e}")
+    assert float(holonomy_deviation(omega_base[0])) > 1e-2               # genuinely curved (non-flat)

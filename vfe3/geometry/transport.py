@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from vfe3.geometry.groups import GaugeGroup
+from vfe3.numerics import safe_cholesky
 
 TransportDict = Dict[str, torch.Tensor]
 
@@ -145,11 +146,20 @@ def gauge_invariant_edge_features(
     ($\Omega_{ij} \mapsto g_i \Omega_{ij} g_j^\top{}^{-1}$) -- unlike the bilinear ``regime_ii``
     connection $\delta_{ij} = \mu_i^\top W \mu_j$, gauge-invariant only at $W=0$.
     """
-    K   = mu_q.shape[-1]
+    # FLOAT64 ISLAND + safe Cholesky. The transported-key congruence S = Omega^0 Sigma Omega^0^T
+    # SQUARES cond(Omega^0) ~ exp(2||phi||) on the non-compact block_glk frame, so the Cholesky-solve
+    # invariants are evaluated in float64 and cast back -- an fp32 Cholesky here loses the invariants
+    # entirely (audit 2026-06-18: >100% rel error / non-PD at K=70), the same reason
+    # transport_covariance upcasts its M4 sandwich. safe_cholesky degrades a non-PD S to NaN via its
+    # ok mask (-> kl_max downstream) instead of raising a LinAlgError that aborts the whole forward.
+    orig_dtype    = mu_q.dtype
+    K             = mu_q.shape[-1]
+    mu_q,  cov_q  = mu_q.double(),  cov_q.double()
+    mu_kt, cov_kt = mu_kt.double(), cov_kt.double()
     eye = torch.eye(K, dtype=cov_kt.dtype, device=cov_kt.device)
 
-    L_s = torch.linalg.cholesky(cov_kt + eps * eye)        # S = cov_kt = L_s L_s^T
-    L_q = torch.linalg.cholesky(cov_q  + eps * eye)
+    L_s, ok_s = safe_cholesky(cov_kt + eps * eye, rounds=5)   # S = cov_kt = L_s L_s^T
+    L_q, ok_q = safe_cholesky(cov_q  + eps * eye, rounds=5)
 
     delta_mu = (mu_q - mu_kt).unsqueeze(-1)                # (..., K, 1) prediction error
     sol      = torch.cholesky_solve(delta_mu, L_s)         # S^{-1} (mu_q - mu_kt)
@@ -162,7 +172,10 @@ def gauge_invariant_edge_features(
     logdet_q = 2.0 * torch.log(torch.diagonal(L_q, dim1=-2, dim2=-1)).sum(dim=-1)
     logdet   = logdet_s - logdet_q                         # (...,)  log det S - log det Sigma_q
 
-    return torch.stack((mahal, trace, logdet), dim=-1)     # (..., 3)
+    feats = torch.stack((mahal, trace, logdet), dim=-1)    # (..., 3)
+    ok    = (ok_s & ok_q).unsqueeze(-1)                    # (..., 1) PD on both factors
+    feats = torch.where(ok, feats, feats.new_tensor(float("nan")))   # non-PD edge -> NaN -> kl_max
+    return feats.to(orig_dtype)                            # back to the caller's working dtype
 
 
 @register_transport("flat")
@@ -316,13 +329,17 @@ def _build_regime_ii(
 
 
 # Query-chunk budget for the dense Regime-II covariant builder (OOM fix, 2026-06-18). The builder
-# holds several dense (B, N, N, K, K) transients at once (the flat cocycle Omega^0, the transported-
-# key covariance and its Cholesky factors, the edge Lie-algebra matrix and its exponential); at
-# K=20 / 2-head / B=64 / N=128 each is ~1.68 GB, so the full build OOMs on a 32 GB GPU while the
-# flat K=80 run (factored, no dense Omega) fits. Capping the simultaneous (B, chunk, N, K, K) working
-# set at ~this many fp32 elements bounds peak memory; the build is otherwise unchanged (no
-# cross-query reduction, so chunking is exactly value- and gradient-equivalent to one chunk).
-_REGIME_II_CHUNK_ELEMS = 64_000_000   # ~256 MB fp32 per (B, chunk, N, K, K) working tensor
+# holds SEVERAL dense (B, chunk, N, K, K) transients AT ONCE -- the flat cocycle Omega^0, the
+# transported-key covariance, the edge Lie-algebra matrix, its exponential, and the output Omega
+# chunk -- so the peak working set is ~``_REGIME_II_LIVE_TRANSIENTS`` times ONE such tensor (the
+# original budget modelled a single tensor and so underestimated peak by ~5x; audit 2026-06-18). At
+# K=20 / 2-head / B=64 / N=128 one tensor is ~1.68 GB, so the full build OOMs on a 32 GB GPU while
+# the flat K=80 run (factored, no dense Omega) fits. The chunk size bounds the SUM of the
+# simultaneous transients under ``_REGIME_II_CHUNK_ELEMS`` fp32 elements; the build is otherwise
+# unchanged (no cross-query reduction, so chunking is exactly value- and gradient-equivalent to one
+# chunk). The short-lived float64 feature island doubles the bytes of its own share only.
+_REGIME_II_CHUNK_ELEMS     = 64_000_000   # ~256 MB fp32 TOTAL peak working set across the transients
+_REGIME_II_LIVE_TRANSIENTS = 5            # simultaneous dense (B, chunk, N, K, K) tensors held in the loop
 
 
 def _regime_ii_query_chunk(
@@ -331,11 +348,12 @@ def _regime_ii_query_chunk(
     k:  int,                          # belief dimension K
 
 ) -> int:                             # query-chunk size in [1, N]
-    r"""Query-index chunk size bounding the dense (B, chunk, N, K, K) working set to
-    ``_REGIME_II_CHUNK_ELEMS`` fp32 elements. One query row of (B, 1, N, K, K) is ``B*N*K*K``
-    elements; the chunk is the largest count keeping the working tensor under budget, clamped to
-    [1, N]. A single-sequence diagnostic build (B=1) collapses to one chunk (no behavior change)."""
-    per_row = max(1, b * n * k * k)
+    r"""Query-index chunk size bounding the dense working SET to ``_REGIME_II_CHUNK_ELEMS`` fp32
+    elements. One query row holds ``_REGIME_II_LIVE_TRANSIENTS`` simultaneous (B, 1, N, K, K) tensors
+    = ``_REGIME_II_LIVE_TRANSIENTS * B*N*K*K`` elements; the chunk is the largest count keeping that
+    SUM under budget, clamped to [1, N]. A single-sequence diagnostic build (B=1) collapses to one
+    chunk (no behavior change)."""
+    per_row = max(1, _REGIME_II_LIVE_TRANSIENTS * b * n * k * k)
     return max(1, min(n, _REGIME_II_CHUNK_ELEMS // per_row))
 
 
@@ -395,6 +413,15 @@ def _build_regime_ii_covariant(
     if connection_M is None or cocycle_relaxation == 0.0 or gauge_mode == "trivial":
         return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
 
+    # Contract guard (audit 2026-06-18): with a connection the edge features need the query belief
+    # (mu, sigma); a missing one would otherwise raise an opaque AttributeError on `.dim()` below.
+    if mu is None or sigma is None:
+        raise ValueError(
+            "regime_ii_covariant requires query means `mu` and covariance `sigma` when "
+            f"`connection_M` is provided; got mu={'None' if mu is None else 'tensor'}, "
+            f"sigma={'None' if sigma is None else 'tensor'}."
+        )
+
     fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
 
@@ -421,18 +448,26 @@ def _build_regime_ii_covariant(
         exp_phi_c = exp_phi[:, i0:i1]                                          # (B, C, K, K)
         # FLAT cocycle for this query chunk Omega^0_[i0:i1],j = exp(phi_i) exp(-phi_j) (B, C, N, K, K);
         # the gauge-invariant edge features are evaluated on it, the curved edge factor inserted after.
-        omega0_c = torch.einsum("bikl,bjlm->bijkm", exp_phi_c, exp_neg_phi)    # (B, C, N, K, K)
+        # FLOAT64 ISLAND: the transported-key congruence Omega^0 Sigma Omega^0^T squares cond(Omega^0)
+        # ~ exp(2||phi||), so an fp32 congruence destroys the gauge-invariant features on the
+        # non-compact block_glk frame (audit 2026-06-18). The inputs (phi, mu, sigma) are well-
+        # conditioned, so upcasting the congruence here is loss-free; the curved Omega assembly below
+        # stays in the working dtype (it is not squared). feats are cast back before the delta contraction.
+        ep_c64   = exp_phi_c.double()
+        en_c64   = exp_neg_phi.double()
+        omega0_c = torch.einsum("bikl,bjlm->bijkm", ep_c64, en_c64)           # (B, C, N, K, K) f64
 
-        mu_q_c  = mu[:, i0:i1].unsqueeze(2)                                    # (B, C, 1, K) query mean
-        mu_kt_c = torch.einsum("bijkl,bjl->bijk", omega0_c, mu_k)              # (B, C, N, K) transported key mean
+        mu_q_c  = mu[:, i0:i1].unsqueeze(2).double()                          # (B, C, 1, K) query mean
+        mu_kt_c = torch.einsum("bijkl,bjl->bijk", omega0_c, mu_k.double())     # (B, C, N, K) transported key mean
         if diagonal:                                                          # diagonal variances (B, N, K)
-            cov_q_c  = torch.diag_embed(sigma[:, i0:i1]).unsqueeze(2)          # (B, C, 1, K, K)
-            cov_kt_c = torch.einsum("bijkl,bjl,bijml->bijkm", omega0_c, sigma_k, omega0_c)
+            cov_q_c  = torch.diag_embed(sigma[:, i0:i1].double()).unsqueeze(2) # (B, C, 1, K, K)
+            cov_kt_c = torch.einsum("bijkl,bjl,bijml->bijkm", omega0_c, sigma_k.double(), omega0_c)
         else:                                                                 # full covariance (B, N, K, K)
-            cov_q_c  = sigma[:, i0:i1].unsqueeze(2)                            # (B, C, 1, K, K)
-            cov_kt_c = torch.einsum("bijkl,bjlm,bijnm->bijkn", omega0_c, sigma_k, omega0_c)
+            cov_q_c  = sigma[:, i0:i1].unsqueeze(2).double()                  # (B, C, 1, K, K)
+            cov_kt_c = torch.einsum("bijkl,bjlm,bijnm->bijkn", omega0_c, sigma_k.double(), omega0_c)
 
-        feats_c = gauge_invariant_edge_features(mu_q_c, cov_q_c, mu_kt_c, cov_kt_c)        # (B, C, N, 3)
+        feats_c = gauge_invariant_edge_features(mu_q_c, cov_q_c, mu_kt_c, cov_kt_c)        # (B, C, N, 3) f64
+        feats_c = feats_c.to(exp_phi.dtype)                                   # back to the working dtype
         delta_c = cocycle_relaxation * torch.einsum("bijf,af->bija", feats_c, connection_M)   # (B, C, N, n_gen)
 
         # Self-edge exclusion (audit F4 parity): the connection is an EDGE object; Omega_ii stays the
