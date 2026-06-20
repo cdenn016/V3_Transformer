@@ -385,7 +385,7 @@ Local stability of the equilibrium \eqref{eq:sigma_fixed_point_beta} follows fro
 \tfrac{1}{2} \big\|\Sigma_1^{-1/2} H \Sigma_1^{-1/2}\big\|_F^2 \geq 0,
 \end{equation}
 
-with equality iff $H = 0$. The Hessian depends only on $\Sigma_1$ (the $\mathrm{tr}(\Sigma_2^{-1}\Sigma_1)$ term is linear in $\Sigma_1$ and contributes no $\Sigma_2$-dependent second derivative), and is manifestly positive definite for $\Sigma_1 \succ 0$. The $\beta$-fixed Hessian of $\mathcal{F}_i$ is therefore a $\beta$-weighted convex combination of these single-KL Hessians and is positive-definite at the joint $(\beta, \Sigma)$ stationary point. The envelope-theorem identity of Eq.~\eqref{eq:autograd_envelope_gap} (main paper) removes the first-order $\partial\beta/\partial \Sigma$ response from the \emph{gradient} of the reduced free energy, but it does not remove the corresponding term from the \emph{Hessian}: the reduced-free-energy covariance Hessian carries an additional Schur correction $-\tau^{-1}\mathrm{Cov}_\beta(\partial D_{\mathrm{KL}}/\partial \Sigma_i)$ that the envelope does not suppress and that can be indefinite in the alignment-dominated regime ($\alpha, \tau$ small).
+with equality iff $H = 0$. The Hessian depends only on $\Sigma_1$ (the $\mathrm{tr}(\Sigma_2^{-1}\Sigma_1)$ term is linear in $\Sigma_1$ and contributes no $\Sigma_2$-dependent second derivative), and is manifestly positive definite for $\Sigma_1 \succ 0$. The $\beta$-fixed Hessian of $\mathcal{F}_i$ is therefore a $\beta$-weighted convex combination of these single-KL Hessians and is positive-definite at the joint $(\beta, \Sigma)$ stationary point. The envelope-theorem identity of Eq.~\eqref{eq:autograd_envelope_gap} (main paper) removes the first-order $\partial\beta/\partial \Sigma$ response from the \emph{gradient} of the reduced free energy, but it does not remove the corresponding term from the \emph{Hessian}: the reduced-free-energy covariance Hessian carries an additional Schur correction $-\tau^{-1}\mathrm{Cov}_\beta(\partial D_{\mathrm{KL}}/\partial \Sigma_i)$, where $\mathrm{Cov}_\beta(X) \equiv \mathbb{E}_\beta[X \otimes X] - (\mathbb{E}_\beta X)\otimes(\mathbb{E}_\beta X)$ denotes the positive-semidefinite self-covariance operator of the matrix-valued score $X = \partial D_{\mathrm{KL}}/\partial \Sigma_i$ over $\mathrm{Sym}(K)$ (the fourth-order tensor, not a scalar variance). The envelope does not suppress it, and because $\mathrm{Cov}_\beta \succeq 0$ the correction $-\tau^{-1}\mathrm{Cov}_\beta$ is negative-semidefinite and can render the reduced Hessian indefinite in the alignment-dominated regime ($\alpha, \tau$ small).
 
 This establishes that the covariance alignment point is a \emph{stationary} point of the variational dynamics with positive-definite $\beta$-fixed Hessian, under the standing assumptions $\sum_j \beta_{ij}=1$, $\Omega_{ij}$ invertible, and the observation precision $R^{-1}$ negligible relative to the inter-agent coupling (cf.\ Eq.~\eqref{eq:Sigma_gradient_final}). Local attractivity additionally requires the $\beta$-response Schur term to stay dominated by the prior floor, which we do not establish here.
 
@@ -513,9 +513,11 @@ where $\Delta\mu_{ij} = \mu_i - \Omega_{ij}\mu_j$. Let $\tilde{\Sigma}_{ij} \equ
 \begin{equation}
 \frac{\partial}{\partial \phi_i^a}\left[(\mu_i - \tilde{\mu}_{ij})^\top \tilde{\Sigma}_{ij}^{-1}(\mu_i - \tilde{\mu}_{ij})\right]
 = -2(\mu_i - \tilde{\mu}_{ij})^\top \tilde{\Sigma}_{ij}^{-1} \frac{\partial \tilde{\mu}_{ij}}{\partial \phi_i^a}
-+ (\text{terms from } \partial\tilde{\Sigma}_{ij}^{-1}/\partial\phi_i^a).
+- (\mu_i - \tilde{\mu}_{ij})^\top \tilde{\Sigma}_{ij}^{-1} \frac{\partial \tilde{\Sigma}_{ij}}{\partial \phi_i^a} \tilde{\Sigma}_{ij}^{-1} (\mu_i - \tilde{\mu}_{ij}).
 \label{eq:mean_term_phi}
 \end{equation}
+
+The second term uses the inverse-derivative identity $\partial\tilde{\Sigma}_{ij}^{-1}/\partial\phi_i^a = -\tilde{\Sigma}_{ij}^{-1}(\partial\tilde{\Sigma}_{ij}/\partial\phi_i^a)\tilde{\Sigma}_{ij}^{-1}$, with $\partial\tilde{\Sigma}_{ij}/\partial\phi_i^a$ given by Eq.~\eqref{eq:dtilde_Sigma}; it is generally nonzero and vanishes only where the transported covariance is stationary along $\phi_i^a$.
 
 \paragraph{Trace term.} From the precision-covariance product:
 
@@ -647,13 +649,14 @@ where $\tau$ is the step size and the component-wise exponentials $\exp(\tau \la
 Additional safeguards include post-retraction sanitization via
 \texttt{sanitize\_sigma}, which symmetrizes the result, raises on any
 floating-point anomalies (NaNs), and applies a spectral floor to the
-eigenvalues to ensure they remain above a minimum threshold
-$\epsilon_{\mathrm{SPD}} = 10^{-4}$, together with a condition-number cap
-$\kappa_{\max} = 10^{4}$. This spectral regularization is essential for
-preventing numerical collapse of the covariance matrices during prolonged
-gradient descent, particularly in regions where the free-energy landscape
-becomes very flat.
-% TODO(review 2026-06-01): reconcile the quoted eps_SPD=1e-4 and kappa_max=1e4 with the live sanitize_sigma constants; the train_vfe.py audit reported a tighter condition cap (max_condition=10.0). State the values the reported runs actually used.
+eigenvalues to ensure they remain above a spectral floor
+$\epsilon_{\mathrm{SPD}} = 10^{-6}$ and below a ceiling $\sigma_{\max} = 10$ (the
+\texttt{floor\_eigenvalues} and \texttt{sigma\_max} constants used in the reported
+runs). The retraction path imposes no hard condition-number cap; conditioning is
+controlled instead by the trust-region clip on the whitened tangent described above
+and the $|\tau\lambda_B^{(j)}| \le 50$ overflow guard. This spectral regularization
+prevents numerical collapse of the covariance matrices during prolonged gradient
+descent, particularly in regions where the free-energy landscape becomes very flat.
 
 \subsection{Gauge Frame Dynamics on $\mathrm{GL}(K)$}
 For the gauge frame fields $\phi_i$, which live in the Lie algebra $\mathfrak{gl}(K)$ (or its subalgebra $\mathfrak{so}(3)$ in the fundamental representation), a different geometric structure must be respected. These fields parameterize the local gauge frames as $U_i = \exp(\sum_a \phi_i^a T_a)$, where $\{T_a\}$ are the Lie algebra generators, and the transport operators take the form $\Omega_{ij} = \exp(\phi_i)\exp(-\phi_j)$. Gradients of the alignment energy $\beta_{ij} D_{\mathrm{KL}}(q_i \| \Omega_{ij}[q_j])$ with respect to $\phi_i$ are obtained via the chain rule through the transport operator: the KL gradient with respect to $\Omega$ is contracted against the differential $\partial\Omega_{ij}/\partial\phi_i^a$.
@@ -1310,7 +1313,7 @@ C_{ij} \equiv \frac{\partial F_i}{\partial\beta_{ij}}\bigg|_{q_i^*}
 identifying the cost of attention with the information divergence between the agent's updated belief and the neighbor's transported signal.
 
 \subsubsection{Interpretations}
-From the perspective of gauge invariance, the comparison is made between $q_i$ and the transported $\Omega_{ij}q_j$ within the same frame (and similarly for $j \rightarrow i$); gauge covariance fixes what is compared, while variational duality fixes how it is compared. From the perspective of this duality, the forward KL is the only divergence that simultaneously yields a closed-form Boltzmann solution for $q_i$ and a consistent dual cost $C_{ij} = \partial F_i / \partial \beta_{ij}$. From the perspective of information geometry, the forward KL is the Bregman divergence generated by the negative entropy potential, whose Hessian induces the Fisher-Rao metric and yields the mixed/exponential family-projection Pythagorean theorem. These global properties are not shared by generic f-divergences.
+From the perspective of gauge invariance, the comparison is made between $q_i$ and the transported $\Omega_{ij}q_j$ within the same frame (and similarly for $j \rightarrow i$); gauge covariance fixes what is compared, while variational duality fixes how it is compared. From the perspective of this duality, the forward KL is the only divergence that simultaneously yields a closed-form Boltzmann solution for $q_i$ and a consistent dual cost $C_{ij} = \partial F_i / \partial \beta_{ij}$. From the perspective of information geometry, the forward KL is the Bregman divergence generated by the negative entropy potential, whose Hessian induces the Fisher-Rao metric and yields the mixed/exponential family-projection Pythagorean theorem. These global properties are not shared by generic f-divergences. These observations place the result within the classical uniqueness tradition rather than apart from it: \citet{Chentsov1982} established the uniqueness of the Fisher-Rao metric and its associated invariant divergence, \citet{Petz1996} extended the monotone-metric uniqueness to the matrix (quantum) setting, and the characterization of the forward KL as the unique divergence lying in both the Bregman and the $f$-divergence classes is standard \citep{Amari2016}. The contribution here is the route rather than the endpoint: a variational/envelope re-derivation that selects the forward KL from the requirement of a closed-form Gibbs update together with a consistent dual attention cost, without assuming decomposability a priori.
 
 \subsubsection{Summary}
 Under the natural assumptions of locality, linear coupling, and exponential-family closure, the forward KL divergence
