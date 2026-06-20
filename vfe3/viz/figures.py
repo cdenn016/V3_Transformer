@@ -171,26 +171,30 @@ def plot_attention_graph(
 
 
 def _attn_log_bounds(
-    M:    np.ndarray,                    # attention weights (any shape)
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
+    M:     np.ndarray,                   # attention weights (any shape)
+    vmin:  Optional[float] = None,
+    vmax:  Optional[float] = None,
+
+    *,
+    floor: float           = 1e-4,
 ) -> tuple:                              # (vmin, vmax) valid for a LogNorm scale
-    r"""Positive-entry (vmin, vmax) for a log attention scale (dynamic range capped at 3 decades).
+    r"""Positive-entry (vmin, vmax) for a log attention scale (scale bottoms out at ``floor`` = 1e-4).
 
     Causal-masked future positions are exact zeros (softmax over a -inf prior), so only the
-    active (positive) entries set the scale. ``vmin`` is floored three decades below ``vmax`` so a
-    few near-zero weights cannot wash a panel out, and kept strictly below ``vmax`` so a uniform
-    map stays a valid LogNorm. Pass both bounds to share one scale across several panels.
+    active (positive) entries set the scale. ``vmin`` is floored at ``floor`` (default 1e-4) so the
+    log scale resolves attention weights down to 1e-4 while a long causal-softmax tail of near-zero
+    weights cannot wash a panel out, and kept strictly below ``vmax`` so a uniform map stays a valid
+    LogNorm. Pass both bounds to share one scale across several panels.
     """
     if vmax is None:
         pos = M[M > 0]
         vmax = float(pos.max()) if pos.size else 1.0
     if vmin is None:
         pos = M[M > 0]
-        vmin = float(pos.min()) if pos.size else vmax * 1e-3
-    vmin = max(vmin, vmax * 1e-3)                                 # cap dynamic range at 3 decades
+        vmin = float(pos.min()) if pos.size else vmax * floor
+    vmin = max(vmin, floor)                                       # bottom the log scale at 1e-4
     if vmin >= vmax:                                             # degenerate / uniform map
-        vmin = vmax * 1e-3
+        vmin = vmax * floor
     return float(vmin), float(vmax)
 
 
@@ -224,7 +228,7 @@ def plot_attention_heatmap(
     so the default ``log`` scale (matplotlib ``LogNorm`` on beta) resolves the off-diagonal
     structure a linear scale collapses to black; the causal-masked zeros render as the 'bad'
     colour. Pass shared ``vmin``/``vmax`` to make several panels comparable; otherwise the positive
-    entries set the scale (dynamic range capped at three decades). ``cmap``/``symbol`` select the
+    entries set the scale (log floor at 1e-4). ``cmap``/``symbol`` select the
     channel identity: belief beta ('magma', \beta) vs model gamma ('viridis', \gamma).
     """
     B = _np(beta)
