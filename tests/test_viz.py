@@ -36,6 +36,7 @@ from vfe3.viz.figures import (
     plot_ln3_symmetry_breaking,
     plot_lr_grid_heatmap,
     plot_numerical_trust,
+    plot_per_layer_diagnostics,
     plot_pareto_frontier,
     plot_spd_ellipses,
     plot_trajectory,
@@ -383,10 +384,39 @@ def test_plot_gauge_head_specialization_saves(tmp_path):
 
 def test_plot_attention_structure_saves(tmp_path):
     _, N, _, H = _T()
-    beta = torch.softmax(torch.randn(2, H, N, N), dim=-1)         # (L, H, N, N)
+    beta = torch.softmax(torch.randn(2, H, N, N), dim=-1)         # (L=2, H, N, N)
     p = tmp_path / "f8.png"
-    fig = plot_attention_structure(beta, path=str(p)); plt.close(fig)
+    fig = plot_attention_structure(beta, path=str(p))
+    # the (layer, head) axes must KEEP their identity as L{l}H{h} -- NOT be renumbered 0..L*H-1.
+    labs = [t.get_text() for t in fig.axes[0].get_xticklabels()]
+    assert labs == [f"L{l}H{h}" for l in range(2) for h in range(H)]
+    plt.close(fig)
     assert _saved_nonempty(p)
+
+
+def test_plot_attention_structure_single_layer_uses_head_labels(tmp_path):
+    _, N, _, H = _T()
+    beta = torch.softmax(torch.randn(H, N, N), dim=-1)           # (H, N, N) single layer
+    p = tmp_path / "f8s.png"
+    fig = plot_attention_structure(beta, path=str(p))
+    labs = [t.get_text() for t in fig.axes[0].get_xticklabels()]
+    assert labs == [f"h{h}" for h in range(H)]
+    plt.close(fig)
+    assert _saved_nonempty(p)
+
+
+def test_plot_per_layer_diagnostics_saves(tmp_path):
+    L = 3
+    keys = ("self_coupling", "belief_coupling", "attention_entropy", "total", "self_divergence",
+            "holonomy_deviation", "holonomy_wilson", "gauge_trace_spread", "gauge_invariant_spread",
+            "effective_rank", "attn_entropy", "belief_cond_median", "phi_norm_mean")
+    per_layer = {k: [float(v) for v in torch.rand(L)] for k in keys}
+    p = tmp_path / "f8b.png"
+    fig = plot_per_layer_diagnostics(per_layer, path=str(p))
+    assert [t.get_text() for t in fig.axes[0].get_xticklabels()] == [str(l) for l in range(L)]
+    plt.close(fig)
+    assert _saved_nonempty(p)
+    assert get_figure("per_layer_diagnostics") is plot_per_layer_diagnostics
 
 
 def test_plot_belief_spectrum_and_ellipses_save(tmp_path):
@@ -442,9 +472,14 @@ def test_plot_ablation_forest_and_lr_grid_save(tmp_path):
 def test_plot_numerical_trust_saves(tmp_path):
     guard = {"sigma_floor_frac": 0.0, "sigma_ceil_frac": 0.0, "energy_klmax_frac": 0.0, "selfdiv_klmax_frac": 0.0}
     health = {"nan_mu": 0.0, "nan_sigma": 0.0, "nan_phi": 0.0, "nan_energy": 0.0, "nan_beta": 0.0, "max_condition": 12.0}
-    causal = {"future_leakage": torch.zeros(2), "row_sum_error": torch.zeros(2), "active_set_slope": torch.ones(2)}
+    # future_leakage is (L, H) (causal_sanity keeps the leading layer,head axes); the bars must be
+    # labeled by (layer, head), not a flat 0..L*H-1 axis mislabeled "head".
+    causal = {"future_leakage": torch.zeros(3, 2), "row_sum_error": torch.zeros(2), "active_set_slope": torch.ones(2)}
     p = tmp_path / "f13.png"
-    fig = plot_numerical_trust(guard, health, causal, path=str(p)); plt.close(fig)
+    fig = plot_numerical_trust(guard, health, causal, path=str(p))
+    labs = [t.get_text() for t in fig.axes[2].get_xticklabels()]
+    assert labs == [f"L{l}H{h}" for l in range(3) for h in range(2)]
+    plt.close(fig)
     assert _saved_nonempty(p)
 
 

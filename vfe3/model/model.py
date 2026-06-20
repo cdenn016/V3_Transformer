@@ -1596,3 +1596,134 @@ class VFEModel(nn.Module):
             mu_p = (1.0 - rho) * mu_p + rho * belief.mu              # handoff (mirrors vfe_stack)
             sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
         return torch.stack(maps, dim=0)                              # (L, H, N, N)
+
+    @torch.no_grad()
+    def diagnostics_per_layer(
+        self,
+        token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+    ) -> dict:                             # each value a list of length L = cfg.n_layers
+        r"""Per-LAYER (inference-depth) belief-channel diagnostics for sequence 0 (no_grad).
+
+        :meth:`diagnostics` collapses the block stack to the FINAL belief and reports one scalar per
+        metric, so the metrics.csv and the converged-state figures never expose the depth axis. This
+        replays the :func:`vfe_stack` block loop one block at a time -- mirroring its
+        ``mu_p``/``sigma_p`` handoff EXACTLY as :meth:`attention_maps` does -- and at each block's
+        CONVERGED belief recomputes the SAME belief-channel quantities :meth:`diagnostics` uses
+        (transport Omega_ij(phi), pairwise energy E_ij, attention beta_ij, self-divergence
+        D(q_i||p_i) against THAT block's prior, self-coupling alpha_i), then the same
+        :mod:`vfe3.metrics` reductions. Unlike diagnostics' last-block prior reconstruction, the
+        self-term here reads each block's OWN handoff prior, so the per-layer self-coupling is exact.
+
+        The model-channel blocks (hyper-prior, gamma) are a single hierarchical coupling evaluated
+        once at the converged frame, NOT iterated per block, so they are deliberately absent: the
+        per-layer ``total`` is the BELIEF-channel free energy at that depth. OFF the training hot path
+        (no_grad, no graph); intended for periodic figure / per-layer-CSV generation, not every step.
+
+        Returns a dict of L-length lists: ``self_coupling``, ``belief_coupling``,
+        ``attention_entropy``, ``total`` (belief-channel F), ``self_divergence``,
+        ``holonomy_deviation``, ``holonomy_wilson``, ``gauge_trace_spread``,
+        ``gauge_invariant_spread``, ``effective_rank``, ``attn_entropy``, ``belief_cond_median``,
+        ``phi_norm_mean``.
+        """
+        from vfe3.inference.e_step import _transport
+        from vfe3.geometry.transport import (transport_mean, transport_covariance,
+                                             compute_transport_operators)
+        from vfe3.families.base import get_family
+        from vfe3.free_energy import (pairwise_energy, self_divergence_for_alpha,
+                                      attention_weights, attention_tau)
+        from vfe3.alpha_i import self_coupling_alpha
+        from vfe3 import metrics
+
+        cfg = self.cfg
+        enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
+        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
+        if cfg.s_e_step:                                              # anchor q0 + handoff to refined s (as forward)
+            s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
+            belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
+        n = belief.mu.shape[0]
+        log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
+        log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior
+        fam = get_family(cfg.family)
+        _llb = getattr(self, "log_lambda_beta", None)
+        _lb = cfg.lambda_beta if _llb is None else float(_llb.detach().exp())
+        _tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), self.group.irrep_dims)
+        rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
+        mu_p, sigma_p = belief.mu, belief.sigma
+        rope = self._rope_rotation(n, token_ids.device)
+
+        keys = ("self_coupling", "belief_coupling", "attention_entropy", "total", "self_divergence",
+                "holonomy_deviation", "holonomy_wilson", "gauge_trace_spread", "gauge_invariant_spread",
+                "effective_rank", "attn_entropy", "belief_cond_median", "phi_norm_mean")
+        rec: dict = {k: [] for k in keys}
+        for _ in range(cfg.n_layers):
+            cap: dict = {}                                            # pre-transform converged belief (F self-term)
+            belief = vfe_block(                                       # converged belief at this block
+                belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
+                block_norm=self.block_norm, head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
+                log_alpha=getattr(self, "log_alpha", None),
+                lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
+                connection_W=getattr(self, "connection_W", None),
+                connection_M=getattr(self, "connection_M", None),
+                rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                capture=cap,
+            )
+            omega = _transport(                                       # (N, N, K, K) under the ACTIVE regime
+                belief.phi, self.group, transport_mode=cfg.transport_mode,
+                mu=(belief.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
+                sigma=(belief.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
+                connection_W=getattr(self, "connection_W", None),
+                connection_M=getattr(self, "connection_M", None),
+                cocycle_relaxation=cfg.cocycle_relaxation,
+            )
+            if rope is not None:
+                rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                                           on_value=cfg.rope_on_value)
+                mu_t    = transport_mean(rope_omega, belief.mu)
+                sigma_t = transport_covariance(rope_omega, belief.sigma)
+            else:
+                mu_t    = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
+                sigma_t = transport_covariance(omega.unsqueeze(0), belief.sigma.unsqueeze(0))[0]
+            energy = pairwise_energy(                                 # (N, N) or (H, N, N)
+                fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
+                alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
+            )
+            beta = attention_weights(energy, tau=_tau, log_prior=log_prior)
+            _q = cap["converged"]                                    # self-term reads THIS block's prior (per-layer exact)
+            self_div = self_divergence_for_alpha(
+                fam(_q.mu, _q.sigma), fam(mu_p, sigma_p),
+                alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
+            )
+            alpha, alpha_reg = self_coupling_alpha(
+                self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha,
+                b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device),
+                log_alpha=getattr(self, "log_alpha", None),
+            )
+            terms = metrics.free_energy_terms(
+                self_div, energy, beta, alpha, tau=_tau, lambda_beta=_lb, log_prior=log_prior,
+                include_attention_entropy=cfg.include_attention_entropy,
+                alpha_reg=(alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
+            )
+            rec["self_coupling"].append(float(terms["self_coupling"]))
+            rec["belief_coupling"].append(float(terms["belief_coupling"]))
+            rec["attention_entropy"].append(float(terms["attention_entropy"]))
+            rec["total"].append(float(terms["total"]))
+            rec["self_divergence"].append(float(self_div.sum()))
+            rec["holonomy_deviation"].append(float(metrics.holonomy_deviation_sampled(omega)["mean"]))
+            rec["holonomy_wilson"].append(float(metrics.holonomy_wilson_sampled(omega)["deviation_mean"]))
+            rec["gauge_trace_spread"].append(float(metrics.gauge_trace_spread(belief.phi, self.group.generators)))
+            exp_phi = compute_transport_operators(belief.phi.unsqueeze(0), self.group)["exp_phi"][0]
+            rec["gauge_invariant_spread"].append(
+                float(metrics.group_gauge_invariant(exp_phi, self.group).float().std(unbiased=False)))
+            _diag = belief.sigma.dim() == belief.mu.dim()
+            spec = belief.sigma if _diag else torch.linalg.eigvalsh(belief.sigma)
+            rec["effective_rank"].append(float(metrics.effective_rank(spec).mean()))
+            rec["attn_entropy"].append(float(metrics.attention_entropy(beta)))
+            bs = metrics.belief_spectrum(belief.sigma, diagonal=_diag, eps=cfg.eps)
+            rec["belief_cond_median"].append(float(bs["condition"].float().median()))
+            rec["phi_norm_mean"].append(float(torch.linalg.norm(belief.phi, dim=-1).mean()))
+
+            mu_p = (1.0 - rho) * mu_p + rho * belief.mu              # handoff (mirrors vfe_stack)
+            sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
+        return rec

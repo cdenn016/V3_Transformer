@@ -1463,28 +1463,31 @@ def plot_gauge_head_specialization(
     *,
     path:         Optional[str] = None,
 ):
-    r"""F7: per-head gauge specialization and its link to attention structure.
+    r"""F7: per-head gauge specialization and its link to attention structure (FINAL layer).
 
-    Panel A: per-head violins of the group-correct gauge invariant (log-volume). Panel B: per-head
-    violins of the shear/anisotropy, or -- when ``head_entropy`` is given -- a scatter of per-head
-    gauge magnitude vs attention row entropy.
+    The gauge frame here is the converged FINAL-block frame (``cstate["exp_phi"]``), so "head" is the
+    per-irrep-block index of that single layer, not a per-layer head; pair it with the FINAL layer's
+    per-head entropy (see report.py) so both axes describe the same depth. Per-LAYER gauge action is
+    in the ``per_layer_diagnostics`` figure. Panel A: per-head violins of the group-correct gauge
+    invariant (log-volume). Panel B: per-head violins of the shear/anisotropy, or -- when
+    ``head_entropy`` is given -- a scatter of per-head gauge magnitude vs attention row entropy.
     """
-    logdet = _np(per_head["logdet"])                             # (M, H)
+    logdet = _np(per_head["logdet"])                             # (M, H) -- H = irrep blocks of the FINAL frame
     aniso = _np(per_head["anisotropy"])
     h = logdet.shape[1]
     fig, axes = plt.subplots(1, 2, figsize=(9, 3.8))
     axes[0].violinplot([logdet[:, i] for i in range(h)], showmeans=True)
     axes[0].axhline(0.0, color="#888888", ls=":", lw=1)
     axes[0].set(xticks=range(1, h + 1), xticklabels=[f"h{i}" for i in range(h)],
-                ylabel=r"$\log|\det\exp\phi^{(h)}|$", title="Per-head gauge volume")
+                ylabel=r"$\log|\det\exp\phi^{(h)}|$", title="Per-head gauge volume (final layer)")
     if head_entropy is not None:
         axes[1].scatter(np.abs(logdet).mean(0), _np(head_entropy), s=40, color=_CB[0])
         axes[1].set(xlabel="mean |gauge volume|", ylabel="attention row entropy (nats)",
-                    title="Gauge action vs attention")
+                    title="Gauge action vs attention (final layer)")
     else:
         axes[1].violinplot([aniso[:, i] for i in range(h)], showmeans=True)
         axes[1].set(xticks=range(1, h + 1), xticklabels=[f"h{i}" for i in range(h)],
-                    ylabel=r"$s_{\max}/s_{\min}$", title="Per-head shear")
+                    ylabel=r"$s_{\max}/s_{\min}$", title="Per-head shear (final layer)")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -1496,37 +1499,109 @@ def plot_attention_structure(
     *,
     path: Optional[str] = None,
 ):
-    r"""F8: attention structure -- per-head entropy, head redundancy, and distance decay.
+    r"""F8: attention structure -- per-(layer,head) entropy, redundancy, and distance decay.
 
-    Panel A: per-head row-entropy violins vs the uniform log N reference (does attention sharpen).
-    Panel B: head-redundancy Jensen-Shannon heatmap (specialized vs redundant heads). Panel C: the
-    per-head attention-vs-offset profile on a log axis (positional decay).
+    For a multi-layer model the input is (L, H, N, N); the leading (layer, head) axes are flattened
+    to L*H curves but each keeps its identity as ``L{l}H{h}`` (NOT renumbered 0..L*H-1), so depth is
+    legible. Panel A: per-(layer,head) row-entropy violins vs the uniform log N reference (does
+    attention sharpen). Panel B: the (layer,head)x(layer,head) Jensen-Shannon redundancy heatmap
+    (which maps are specialized vs redundant, across layers too). Panel C: the per-(layer,head)
+    attention-vs-offset profile on a log axis (positional decay). A single-layer (H, N, N) input
+    falls back to plain ``h{h}`` labels.
     """
     from vfe3 import metrics
     import torch
     b = beta if hasattr(beta, "dim") else torch.as_tensor(_np(beta))
-    if b.dim() == 4:                                             # (L, H, N, N) -> flatten to heads
+    if b.dim() == 4:                                             # (L, H, N, N) -> (L*H, N, N), KEEP (layer,head)
+        L, H = int(b.shape[0]), int(b.shape[1])                  # identity: labels track the reshape C-order
+        labels = [f"L{l}H{hh}" for l in range(L) for hh in range(H)]   # L0H0, L0H1, L1H0, ... matches reshape(-1)
         b = b.reshape(-1, b.shape[-2], b.shape[-1])
-    rows = _np(metrics.attention_entropy_rows(b))               # (H, N)
+    else:                                                        # (H, N, N) single layer -> plain head labels
+        labels = [f"h{hh}" for hh in range(int(b.shape[0]))]
+    rows = _np(metrics.attention_entropy_rows(b))               # (L*H, N)
     n = b.shape[-1]
     h = b.shape[0]
+    _rot = 90 if h > 3 else 0                                    # rotate crowded (layer,head) ticks
     fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.8))
     axes[0].violinplot([rows[i] for i in range(h)], showmeans=True)
     axes[0].axhline(float(np.log(n)), color="#444444", ls="--", lw=1, label=r"uniform $\log N$")
-    axes[0].set(xticks=range(1, h + 1), xticklabels=[f"h{i}" for i in range(h)],
-                ylabel="row entropy (nats)", title="Per-head attention entropy")
+    axes[0].set(xticks=range(1, h + 1), ylabel="row entropy (nats)", title="Per-(layer,head) attention entropy")
+    axes[0].set_xticklabels(labels, rotation=_rot, fontsize=7)
     axes[0].legend(fontsize=8, frameon=False)
-    js = _np(metrics.head_redundancy_js(b))
+    js = _np(metrics.head_redundancy_js(b))                     # (L*H, L*H) over all (layer,head) maps
     im = axes[1].imshow(js, cmap="magma", aspect="auto")
     fig.colorbar(im, ax=axes[1], shrink=0.8, label="JS divergence (nats)")
-    axes[1].set(xlabel="head", ylabel="head", title="Head redundancy")
+    axes[1].set(xticks=range(h), yticks=range(h), xlabel="layer-head", ylabel="layer-head", title="Head redundancy")
+    axes[1].set_xticklabels(labels, rotation=90, fontsize=6)
+    axes[1].set_yticklabels(labels, fontsize=6)
     dd = metrics.attention_distance_decay(b)
-    prof = _np(dd["profile"])                                    # (H, N)
+    prof = _np(dd["profile"])                                    # (L*H, N)
     off = _np(dd["offsets"])
     for i in range(h):
-        axes[2].plot(off, np.clip(prof[i], 1e-8, None), color=plt.cm.viridis(i / max(h - 1, 1)), lw=1.2)
+        axes[2].plot(off, np.clip(prof[i], 1e-8, None), color=plt.cm.viridis(i / max(h - 1, 1)), lw=1.2, label=labels[i])
     axes[2].set_yscale("log")
     axes[2].set(xlabel="offset |i - j|", ylabel=r"mean $\beta$", title="Attention distance decay")
+    axes[2].legend(fontsize=6, frameon=False, ncol=2)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("per_layer_diagnostics")
+def plot_per_layer_diagnostics(
+    per_layer: Dict,                     # diagnostics_per_layer output: each value an (L,) sequence
+
+    *,
+    path:      Optional[str] = None,
+):
+    r"""F8b: per-LAYER (inference-depth) diagnostics -- the depth axis the stack collapses.
+
+    The aggregate metrics.csv and every converged-state figure show only the FINAL block; this
+    plots ``VFEModel.diagnostics_per_layer`` block-by-block so depth is legible: which layer carries
+    the coupling vs entropy mass, and whether gauge holonomy / curvature and belief rank build up
+    with depth. Panel A: belief-channel free-energy budget (self-coupling, belief-coupling, attention
+    entropy, total) vs layer. Panel B: holonomy / Wilson curvature vs layer (~0 on the flat cocycle).
+    Panel C: gauge action (trace spread, group-invariant spread, mean ``||phi||``) vs layer. Panel D:
+    belief geometry (effective rank, attention entropy; condition number on a twin log axis) vs layer.
+    """
+    g = lambda k: _np(per_layer[k]).reshape(-1)
+    L = g("self_coupling").size if "self_coupling" in per_layer else g(next(iter(per_layer))).size
+    x = np.arange(L)
+    _m = "o-" if L > 1 else "o"                                  # a single layer has no line to draw
+    fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.2))
+    for k, c, lab in (("self_coupling", _CB[0], r"self $\alpha\,$KL$(q\|p)$"),
+                      ("belief_coupling", _CB[1], r"belief $\sum\beta\,$KL"),
+                      ("attention_entropy", _CB[2], "attn entropy term"),
+                      ("total", _CB[7], "total (belief F)")):
+        if k in per_layer:
+            axes[0][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
+    axes[0][0].set(xticks=x, xlabel="layer", ylabel="nats", title="Free-energy budget by layer")
+    axes[0][0].legend(fontsize=8, frameon=False)
+    for k, c, lab in (("holonomy_deviation", _CB[0], r"$\|H-I\|_F$"),
+                      ("holonomy_wilson", _CB[1], r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}\,H/K$")):
+        if k in per_layer:
+            axes[0][1].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
+    axes[0][1].set(xticks=x, xlabel="layer", ylabel="deviation", title="Holonomy / curvature by layer")
+    axes[0][1].legend(fontsize=8, frameon=False)
+    for k, c, lab in (("gauge_trace_spread", _CB[0], "tr spread"),
+                      ("gauge_invariant_spread", _CB[1], "group-invariant spread"),
+                      ("phi_norm_mean", _CB[2], r"mean $\|\phi\|$")):
+        if k in per_layer:
+            axes[1][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
+    axes[1][0].set(xticks=x, xlabel="layer", ylabel="magnitude", title="Gauge action by layer")
+    axes[1][0].legend(fontsize=8, frameon=False)
+    ax = axes[1][1]
+    if "effective_rank" in per_layer:
+        ax.plot(x, g("effective_rank"), _m, color=_CB[0], lw=1.4, label="effective rank")
+    if "attn_entropy" in per_layer:
+        ax.plot(x, g("attn_entropy"), ("s--" if L > 1 else "s"), color=_CB[2], lw=1.2, label="attn entropy (nats)")
+    ax.set(xticks=x, xlabel="layer", ylabel="rank / nats", title="Belief geometry by layer")
+    if "belief_cond_median" in per_layer:
+        axr = ax.twinx()
+        axr.plot(x, g("belief_cond_median"), ("^:" if L > 1 else "^"), color=_CB[1], lw=1.2, label="cond median")
+        axr.set_ylabel("condition number")
+        axr.set_yscale("log")
+        axr.grid(False)
+    ax.legend(fontsize=8, frameon=False, loc="upper left")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -1849,9 +1924,17 @@ def plot_numerical_trust(
     axes[0][1].set(xticks=range(len(hk)), ylabel="non-finite fraction", title="Numerical health")
     axes[0][1].set_xticklabels(hk, rotation=30, ha="right", fontsize=7)
     if causal is not None:
-        leak = _np(causal["future_leakage"]).ravel()
+        leak = _np(causal["future_leakage"])
+        if leak.ndim == 2:                                       # (L, H) -> label each bar by (layer, head)
+            lab = [f"L{l}H{hh}" for l in range(leak.shape[0]) for hh in range(leak.shape[1])]
+            leak = leak.ravel()
+        else:                                                    # (H,) single layer -> plain head labels
+            leak = leak.ravel()
+            lab = [f"h{hh}" for hh in range(leak.size)]
         axes[0][2].bar(range(leak.size), leak, color=_CB[3])
-        axes[0][2].set(xlabel="head", ylabel="max future-attention", title="Causal leakage (expect 0)")
+        axes[0][2].set(xticks=range(leak.size), xlabel="layer-head", ylabel="max future-attention",
+                       title="Causal leakage (expect 0)")
+        axes[0][2].set_xticklabels(lab, rotation=(90 if leak.size > 3 else 0), fontsize=6)
     fig.tight_layout()
     return _save(fig, path)
 
