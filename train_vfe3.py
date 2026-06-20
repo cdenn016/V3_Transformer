@@ -461,6 +461,14 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
             full_corpus_tokens = None
     logger.info(_banner(model, cfg, DATASET, DEVICE, cfg.max_steps,
                         train_loader=train_loader, full_corpus_tokens=full_corpus_tokens))
+    # Reseed AFTER model construction so the train data-shuffle order does NOT depend on the
+    # config-dependent amount of global RNG VFEModel(cfg) consumes at init. make_dataloader builds
+    # the train loader with no explicit generator, so its RandomSampler draws each epoch permutation
+    # from the GLOBAL RNG at the first iter(loader) inside train(); leaving the RNG model-advanced
+    # here would make this entry point train on a DIFFERENT batch order than ablation.py for an
+    # identical config+seed (model init itself is already identical). Mirrors ablation.run_single's
+    # post-build reseed so the two entry points reproduce each other.
+    torch.manual_seed(cfg.seed)
     t0 = time.perf_counter()
     losses = train(
         model, train_loader, cfg,
