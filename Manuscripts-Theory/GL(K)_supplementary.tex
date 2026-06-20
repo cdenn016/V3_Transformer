@@ -626,7 +626,7 @@ The computational cost of each mode scales as: clipping $O(n_{\mathrm{gen}})$, C
 
 
 \subsection{Natural Gradient Descent on the Gaussian Manifold}
-Our implementation uses natural gradient descent for the statistical parameters, which exploits the information-geometric structure of the Gaussian manifold. Rather than treating the covariance matrices $\Sigma_i$ as Euclidean variables, we recognize them as points on the manifold of symmetric positive-definite matrices, equipped with the Fisher-Rao metric \citep{Cencov1982,amari2016information}. The natural gradient at a point $\Sigma$ on this manifold is obtained by applying the inverse Fisher metric to the Euclidean gradient, yielding an intrinsic tangent vector that respects the manifold's curved geometry. Given Euclidean gradients $\nabla_\mu$ and $\nabla_\Sigma$, the natural gradient projections are
+Our implementation uses natural gradient descent for the statistical parameters, which exploits the information-geometric structure of the Gaussian manifold. Rather than treating the covariance matrices $\Sigma_i$ as Euclidean variables, we recognize them as points on the manifold of symmetric positive-definite matrices, equipped with the Fisher-Rao metric \citep{amari1998natural,Cencov1982,amari2016information}. The natural gradient at a point $\Sigma$ on this manifold is obtained by applying the inverse Fisher metric to the Euclidean gradient, yielding an intrinsic tangent vector that respects the manifold's curved geometry. Given Euclidean gradients $\nabla_\mu$ and $\nabla_\Sigma$, the natural gradient projections are
 \begin{equation}
 \delta\mu = -\Sigma \nabla_\mu, \qquad
 \delta\Sigma = -2 \Sigma \mathrm{sym}(\nabla_\Sigma) \Sigma,
@@ -769,10 +769,10 @@ The temperature parameter $\tau$ plays a dual role. Geometrically, it represents
 A central prediction of our gauge-theoretic framework is the emergence of a key-dependent bias term that modulates attention beyond simple query-key compatibility. The full KL-derived attention logit contains a term $-\frac{1}{2\sigma^2}\|\mu_j\|^2$ depending only on the key embedding norm. After absorption into learned projections, this bias term becomes implicit but is observable through its effect on the relationship between key-norms and attention weights. In the pre-absorption form, the attention score is:
 
 \begin{equation}
-\beta_{ij}^{(\text{flat})} = \text{softmax}_j\left( -\frac{\|Q_i - K_j\|^2}{\tau} - \lambda\|K_j\|^2 \right),
+\beta_{ij}^{(\text{flat})} = \text{softmax}_j\left( -\frac{\|Q_i - K_j\|^2}{\tau} - \lambda_K\|K_j\|^2 \right),
 \end{equation}
 
-where $\lambda > 0$ is the residual bias coefficient.
+where $\lambda_K > 0$ is the residual bias coefficient.
 
 Our theory predicts this bias should approximately cancel. High-dimensional concentration implies: for embeddings $\mu_j^{(i)} \sim \mathcal{N}(0, \sigma_0^2)$ in $\mathbb{R}^{d_k}$,
 \begin{equation}
@@ -782,7 +782,7 @@ with relative fluctuations $\mathcal{O}(1/\sqrt{d_k}) \to 0$ as $d_k \to \infty$
 
 The multi-passage analysis confirms this effect. For dot-product attention ($\alpha$), the mean absolute correlation between key-norms $\|K_j\|^2$ and per-token attention weight is $\overline{|\rho|} = 0.139$ across all 144 heads, while for KL-based attention ($\beta$) at $\tau = 19.0$, the corresponding value is $\overline{|\rho|} = 0.256$. Both metrics aggregate across the full 105-passage corpus.
 
-The stronger key-norm effect for $\beta$ at $\tau = 19$ compared to the $\overline{|\rho|} = 0.164$ observed at $\tau = 1$ is itself a theoretical prediction: at higher temperature, the softmax distribution is softer, so the norm-dependent bias term $-\lambda\|K_j\|^2$ contributes a larger relative perturbation to the flattened attention distribution.
+The stronger key-norm effect for $\beta$ at $\tau = 19$ compared to the $\overline{|\rho|} = 0.164$ observed at $\tau = 1$ is itself a theoretical prediction: at higher temperature, the softmax distribution is softer, so the norm-dependent bias term $-\lambda_K\|K_j\|^2$ contributes a larger relative perturbation to the flattened attention distribution.
 
 \begin{figure*}[t]
   \centering
@@ -790,7 +790,7 @@ The stronger key-norm effect for $\beta$ at $\tau = 19$ compared to the $\overli
   \caption{
   \textbf{Key-norm bias analysis across 105 passages.}
   Per-head correlations $\rho(\|K_j\|^2,\text{attention weight})$ for both dot-product attention ($\alpha$) and KL-based attention ($\beta$), aggregated across the full corpus.
-  The predominantly negative correlations for $\beta$ confirm the theoretical prediction that the KL-derived bias term $-\lambda\|K_j\|^2$ suppresses attention to high-norm keys.
+  The predominantly negative correlations for $\beta$ confirm the theoretical prediction that the KL-derived bias term $-\lambda_K\|K_j\|^2$ suppresses attention to high-norm keys.
   }
   \label{fig:key_norm_bias_supp}
 \end{figure*}
@@ -849,7 +849,7 @@ RoBERTa-base & 12L $\times$ 12H & 124.6M & 0.612 & 0.006 \\
 \label{tab:multi_model_supp}
 \end{table}
 
-The correspondence holds across all five architectures ($\bar{r} > 0.6$ in every case), with ALBERT achieving the highest agreement ($\bar{r} = 0.851$). ALBERT's parameter-sharing across layers forces all layers to use the same projection matrices, constraining the gauge transport to be constant across layers and thereby regularizing attention patterns toward the distance-based structure predicted by the gauge theory. RoBERTa's lower correlation ($\bar{r} = 0.612$) is attributable to per-head temperature dispersion as the dominant explanatory variable, as shown in the next subsection.
+The correspondence holds across all five architectures (Table~\ref{tab:multi_model_supp}; $\bar{r} > 0.6$ in every case), with ALBERT achieving the highest agreement ($\bar{r} = 0.851$). ALBERT's parameter-sharing across layers forces all layers to use the same projection matrices, constraining the gauge transport to be constant across layers and thereby regularizing attention patterns toward the distance-based structure predicted by the gauge theory. RoBERTa's lower correlation ($\bar{r} = 0.612$) is attributable to per-head temperature dispersion as the dominant explanatory variable, as shown in the next subsection.
 
 \subsection{Per-Head Temperature Dispersion}
 
@@ -949,7 +949,7 @@ Define a coarse-graining transformation $R_n$ that groups $n$ tokens into a sing
 \Sigma_A = \frac{1}{|A|} \sum_{i \in A} \Sigma_i + \mathrm{Var}_A(\mu),
 \label{eq:meta_agent_beliefs_supp}
 \end{equation}
-where $\mathrm{Var}_A(\mu) = \frac{1}{|A|} \sum_{i \in A} (\mu_i - \mu_A)(\mu_i - \mu_A)^\top$ is the within-cluster mean variance. The meta-agent transport is $\Omega_{AB} = \frac{1}{|A||B|} \sum_{i \in A, j \in B} \Omega_{ij}$.
+where $\mathrm{Var}_A(\mu) = \frac{1}{|A|} \sum_{i \in A} (\mu_i - \mu_A)(\mu_i - \mu_A)^\top$ is the within-cluster mean variance. The meta-agent transport is $\Omega_{AB} = \frac{1}{|A||B|} \sum_{i \in A, j \in B} \Omega_{ij}$. Here $\Sigma_A$ is the second moment of the within-cluster belief mixture (the Euclidean law of total covariance: the mean within-token covariance plus the dispersion of the means), the natural choice for moment-matching the mixture, and is distinct from the affine-invariant SPD (Fr\'echet) mean used for the covariance retraction elsewhere in this appendix.
 
 \subsection{Scaling Dimensions and the RG Universality Conjecture}
 
@@ -1012,7 +1012,7 @@ $y_3$ (action $\|H - I\|^2$) & $-2.005$ & $-2.000$ \\
 \end{center}
 
 \paragraph{Graph-based RG flow.}
-We construct a synthetic gauge VFE system with initial couplings $g_1 = 0.3$, $g_2 \approx 0.20$, $g_3 \approx 0.03$ and apply spectral coarse-graining on the attention graph.
+We construct a synthetic gauge VFE system with initial couplings $g_1 = 0.3$, $g_2 \approx 0.20$, $g_3 \approx 0.03$ and apply spectral coarse-graining on the attention graph (Table~\ref{tab:rg_flow_supp}).
 
 \begin{table}[t]
 \centering
