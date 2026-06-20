@@ -123,8 +123,13 @@ to "learning lifts a gauge degeneracy." Severity low.
 
 ## Minor / unverified (not applied this pass)
 
-These were recorded but not adversarially checked, and no edit was made. Several are good candidates for a future
-copyedit pass.
+These were recorded but not adversarially checked, and no edit was made in the pass-4 commit. Follow-up (same day):
+the actionable subset below was subsequently applied at the user's request (see `docs/edits/2026-06-20-edits.md`):
+the `g3` normalization note, the `sigma_a^2` per-head-temperature softening, the token-count annotation, the two
+supplementary table cross-references, the three-limit `kappa` reconciliation, the `lambda` rename to `lambda_K`, the
+`amari1998natural` citation, and the `Sigma_A` Euclidean-vs-SPD-mean caveat. The RoBERTa median/std/CV triple and the
+K-sweep PPL-versus-CSV item remain deferred because they are blocked on data that cannot be reconciled without
+fabrication, and the items confirmed already-correct were left as no-ops.
 
 - RG coupling `g3` (eq:g3_def) is the only one of the three left un-normalized relative to `g1`/`g2`; either normalize
   it or add one sentence noting it is an absolute rather than relative deviation.
