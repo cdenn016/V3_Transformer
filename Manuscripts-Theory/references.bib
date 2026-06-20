@@ -370,7 +370,7 @@
 
 
 @article{wilson1975renormalization,
-  title={The renormalization group and the ε expansion},
+  title={The renormalization group and the {$\epsilon$} expansion},
   author={Wilson, Kenneth G and Kogut, John},
   journal={Physics Reports},
   volume={12},
@@ -1622,6 +1622,18 @@
 }
 
 
+% Laudan & Leplin - empirical equivalence does not entail underdetermination
+@article{LaudanLeplin1991,
+  author = {Laudan, Larry and Leplin, Jarrett},
+  title = {Empirical Equivalence and Underdetermination},
+  journal = {The Journal of Philosophy},
+  volume = {88},
+  number = {9},
+  pages = {449--472},
+  year = {1991},
+  doi = {10.2307/2026601}
+}
+
 % Quine - Underdetermination
 @article{Quine1975,
   author = {Quine, Willard Van Orman},
@@ -1724,6 +1736,13 @@
   title = {Attention, Transformers, and Backpropagation are Degenerate Limits of the Variational Free Energy Principle},
   note = {Submitted to Journal of Machine Learning Research},
   year = {2025}
+}
+
+@unpublished{Dennis2026metaentropy,
+  author = {Dennis, Robert C.},
+  title = {Configurational Meta-Entropy of a Population of Variational Beliefs: Toward a Thermodynamic Limit for the Gauge-Theoretic Free Energy Transformer},
+  note = {Companion manuscript, in preparation},
+  year = {2026}
 }
 
 @article{Swanson2018,
@@ -3172,64 +3191,6 @@
   archivePrefix = {arXiv}
 }
 
-% Added 2026-06-19 (GL(K) peer review): the most direct gauge-FEP prior art, previously
-% absent from this bib. NB: SenguptaFriston2018 above is a DIFFERENT paper (synchronization).
-@article{sengupta2017gauge,
-  author  = {Sengupta, Biswa and Friston, Karl J.},
-  title   = {Approximate {B}ayesian inference as a gauge theory},
-  journal = {arXiv preprint},
-  year    = {2017},
-  eprint  = {1705.06614},
-  archivePrefix = {arXiv},
-  primaryClass  = {q-bio.NC}
-}
-
-% Added 2026-06-19 (GL(K) deep-review pass): connections previously absent from this bib.
-@inproceedings{dong2021attention,
-  title         = {Attention Is Not All You Need: Pure Attention Loses Rank
-                   Doubly Exponentially with Depth},
-  author        = {Dong, Yihe and Cordonnier, Jean-Baptiste and Loukas, Andreas},
-  booktitle     = {Proceedings of the 38th International Conference on Machine Learning (ICML)},
-  year          = {2021},
-  eprint        = {2103.03404},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.LG}
-}
-
-@article{geshkovski2023mathematical,
-  title         = {A Mathematical Perspective on Transformers},
-  author        = {Geshkovski, Borjan and Letrouit, Cyril and Polyanskiy, Yury and Rigollet, Philippe},
-  journal       = {arXiv preprint},
-  year          = {2023},
-  eprint        = {2312.10794},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.LG}
-}
-
-@article{mehta2014exact,
-  author        = {Mehta, Pankaj and Schwab, David J.},
-  title         = {An exact mapping between the Variational Renormalization Group and Deep Learning},
-  journal       = {arXiv preprint},
-  year          = {2014},
-  eprint        = {1410.3831},
-  archivePrefix = {arXiv},
-  primaryClass  = {stat.ML}
-}
-
-@article{beny2015information,
-  author    = {B\'eny, C\'edric and Osborne, Tobias J.},
-  title     = {Information-geometric approach to the renormalization group},
-  journal   = {Physical Review A},
-  volume    = {92},
-  number    = {2},
-  pages     = {022330},
-  year      = {2015},
-  doi       = {10.1103/PhysRevA.92.022330},
-  eprint    = {1206.7004},
-  archivePrefix = {arXiv},
-  primaryClass  = {quant-ph}
-}
-
 @article{Sakthivadivel2022,
   author  = {Sakthivadivel, Dalton A. R.},
   title   = {Towards a {G}eometry and {A}nalysis for {B}ayesian {M}echanics},
@@ -3412,6 +3373,366 @@
   number  = {2},
   pages   = {298--305},
   year    = {1973}
+}
+
+% ==========================================
+% Peer-review additions (2026-06-19): opinion pooling, FEP critiques,
+% info-geometric RG, collective active inference, QRF no-go, Bayesian
+% mechanics lineage, physics-from-Fisher.
+% ==========================================
+
+@article{bordley1982multiplicative,
+  author  = {Bordley, Robert F.},
+  title   = {A Multiplicative Formula for Aggregating Probability Assessments},
+  journal = {Management Science},
+  volume  = {28},
+  number  = {10},
+  pages   = {1137--1148},
+  year    = {1982},
+  doi     = {10.1287/mnsc.28.10.1137},
+  publisher = {INFORMS}
+}
+
+@incollection{dietrich2016probabilistic,
+  author    = {Dietrich, Franz and List, Christian},
+  title     = {Probabilistic Opinion Pooling},
+  booktitle = {The Oxford Handbook of Probability and Philosophy},
+  editor    = {H{\'a}jek, Alan and Hitchcock, Christopher},
+  publisher = {Oxford University Press},
+  year      = {2016},
+  doi       = {10.1093/oxfordhb/9780199607617.013.37}
+}
+
+@article{bruineberg2022emperor,
+  title   = {The Emperor's New Markov Blankets},
+  author  = {Bruineberg, Jelle and Dolega, Krzysztof and Dewhurst, Joe and Baltieri, Manuel},
+  journal = {Behavioral and Brain Sciences},
+  volume  = {45},
+  pages   = {e183},
+  year    = {2022},
+  doi     = {10.1017/S0140525X21002351},
+  publisher = {Cambridge University Press}
+}
+
+@article{aguilera2022particular,
+  title   = {How particular is the physics of the free energy principle?},
+  author  = {Aguilera, Miguel and Millidge, Beren and Tschantz, Alexander and Buckley, Christopher L.},
+  journal = {Physics of Life Reviews},
+  volume  = {40},
+  pages   = {24--50},
+  year    = {2022},
+  doi     = {10.1016/j.plrev.2021.11.001},
+  eprint  = {2105.11203},
+  archivePrefix = {arXiv}
+}
+
+@article{biehl2021technical,
+  title   = {A technical critique of some parts of the free energy principle},
+  author  = {Biehl, Martin and Pollock, Felix A. and Kanai, Ryota},
+  journal = {Entropy},
+  volume  = {23},
+  number  = {3},
+  pages   = {293},
+  year    = {2021},
+  doi     = {10.3390/e23030293},
+  publisher = {MDPI}
+}
+
+@article{beny2015information,
+  author  = {B\'eny, C\'edric and Osborne, Tobias J.},
+  title   = {Information-geometric approach to the renormalization group},
+  journal = {Physical Review A},
+  volume  = {92},
+  number  = {2},
+  pages   = {022330},
+  year    = {2015},
+  doi     = {10.1103/PhysRevA.92.022330},
+  eprint  = {1206.7004},
+  archivePrefix = {arXiv},
+  primaryClass  = {quant-ph},
+  publisher = {American Physical Society}
+}
+
+@article{mehta2014exact,
+  author  = {Mehta, Pankaj and Schwab, David J.},
+  title   = {An exact mapping between the Variational Renormalization Group and Deep Learning},
+  journal = {arXiv preprint arXiv:1410.3831},
+  year    = {2014},
+  eprint  = {1410.3831},
+  archivePrefix = {arXiv},
+  primaryClass  = {stat.ML}
+}
+
+@article{waade2025asone,
+  author  = {Thestrup Waade, Peter and Lundbak Olesen, Christoffer and Ehrenreich Laursen, Jonathan and Nehrer, Sebastian Werner and Heins, Conor and Friston, Karl and Mathys, Christoph},
+  title   = {As One and Many: Relating Individual and Emergent Group-Level Generative Models in Active Inference},
+  journal = {Entropy},
+  volume  = {27},
+  number  = {2},
+  pages   = {143},
+  year    = {2025},
+  doi     = {10.3390/e27020143},
+  publisher = {MDPI}
+}
+
+@article{friston2024federated,
+  author  = {Friston, Karl J. and Parr, Thomas and Heins, Conor and Constant, Axel and Friedman, Daniel and Isomura, Takuya and Fields, Chris and Verbelen, Tim and Ramstead, Maxwell J. D. and Clippinger, John and Frith, Christopher D.},
+  title   = {Federated inference and belief sharing},
+  journal = {Neuroscience \& Biobehavioral Reviews},
+  volume  = {156},
+  pages   = {105500},
+  year    = {2024},
+  doi     = {10.1016/j.neubiorev.2023.105500},
+  publisher = {Elsevier}
+}
+
+@article{giacomini2019qrf,
+  author  = {Giacomini, Flaminia and Castro-Ruiz, Esteban and Brukner, {\v{C}}aslav},
+  title   = {Quantum mechanics and the covariance of physical laws in quantum reference frames},
+  journal = {Nature Communications},
+  volume  = {10},
+  pages   = {494},
+  year    = {2019},
+  doi     = {10.1038/s41467-018-08155-0},
+  eprint  = {1712.07207},
+  archivePrefix = {arXiv},
+  primaryClass  = {quant-ph}
+}
+
+@article{frauchiger2018quantum,
+  author  = {Frauchiger, Daniela and Renner, Renato},
+  title   = {Quantum theory cannot consistently describe the use of itself},
+  journal = {Nature Communications},
+  volume  = {9},
+  pages   = {3711},
+  year    = {2018},
+  doi     = {10.1038/s41467-018-05739-8},
+  eprint  = {1604.07422},
+  archivePrefix = {arXiv},
+  primaryClass  = {quant-ph}
+}
+
+@article{dacosta2021bayesian,
+  title   = {Bayesian mechanics for stationary processes},
+  author  = {Da Costa, Lancelot and Friston, Karl and Heins, Conor and Pavliotis, Grigorios A.},
+  journal = {Proceedings of the Royal Society A: Mathematical, Physical and Engineering Sciences},
+  volume  = {477},
+  number  = {2256},
+  pages   = {20210518},
+  year    = {2021},
+  doi     = {10.1098/rspa.2021.0518},
+  eprint  = {2106.13830},
+  archivePrefix = {arXiv},
+  publisher = {The Royal Society}
+}
+
+@article{ramstead2023bayesian,
+  title   = {On Bayesian mechanics: a physics of and by beliefs},
+  author  = {Ramstead, Maxwell J. D. and Sakthivadivel, Dalton A. R. and Heins, Conor and Koudahl, Magnus and Millidge, Beren and Da Costa, Lancelot and Klein, Brennan and Friston, Karl J.},
+  journal = {Interface Focus},
+  volume  = {13},
+  number  = {3},
+  pages   = {20220029},
+  year    = {2023},
+  doi     = {10.1098/rsfs.2022.0029},
+  eprint  = {2205.11543},
+  archivePrefix = {arXiv},
+  publisher = {The Royal Society}
+}
+
+@article{friston2019particular,
+  title   = {A free energy principle for a particular physics},
+  author  = {Friston, Karl},
+  journal = {arXiv preprint arXiv:1906.10184},
+  year    = {2019},
+  eprint  = {1906.10184},
+  archivePrefix = {arXiv},
+  primaryClass  = {q-bio.NC}
+}
+
+@article{heins2024collective,
+  author  = {Heins, Conor and Millidge, Beren and Da Costa, Lancelot and Mann, Richard P. and Friston, Karl J. and Couzin, Iain D.},
+  title   = {Collective behavior from surprise minimization},
+  journal = {Proceedings of the National Academy of Sciences},
+  volume  = {121},
+  number  = {17},
+  pages   = {e2320239121},
+  year    = {2024},
+  doi     = {10.1073/pnas.2320239121},
+  eprint  = {2307.14804},
+  archivePrefix = {arXiv},
+  primaryClass  = {q-bio.NC}
+}
+
+@article{albarracin2022epistemic,
+  author  = {Albarracin, Mahault and Demekas, Daphne and Ramstead, Maxwell J. D. and Heins, Conor},
+  title   = {Epistemic Communities under Active Inference},
+  journal = {Entropy},
+  volume  = {24},
+  number  = {4},
+  pages   = {476},
+  year    = {2022},
+  doi     = {10.3390/e24040476},
+  publisher = {MDPI}
+}
+
+@article{reginatto1998derivation,
+  author  = {Reginatto, Marcel},
+  title   = {Derivation of the equations of nonrelativistic quantum mechanics using the principle of minimum Fisher information},
+  journal = {Physical Review A},
+  volume  = {58},
+  number  = {3},
+  pages   = {1775--1778},
+  year    = {1998},
+  publisher = {American Physical Society},
+  doi     = {10.1103/PhysRevA.58.1775}
+}
+
+@book{frieden1998physics,
+  author    = {Frieden, B. Roy},
+  title     = {Physics from Fisher Information: A Unification},
+  publisher = {Cambridge University Press},
+  address   = {Cambridge},
+  year      = {1998},
+  isbn      = {9780521631679},
+  doi       = {10.1017/CBO9780511622670}
+}
+
+@article{lawson2001geometric,
+  author  = {Lawson, Jimmie D. and Lim, Yongdo},
+  title   = {The Geometric Mean, Matrices, Metrics, and More},
+  journal = {The American Mathematical Monthly},
+  volume  = {108},
+  number  = {9},
+  pages   = {797--812},
+  year    = {2001},
+  doi     = {10.1080/00029890.2001.11919815}
+}
+
+@article{nussbaum1988hilbert,
+  author  = {Nussbaum, Roger D.},
+  title   = {Hilbert's Projective Metric and Iterated Nonlinear Maps},
+  journal = {Memoirs of the American Mathematical Society},
+  volume  = {75},
+  number  = {391},
+  year    = {1988},
+  doi     = {10.1090/memo/0391}
+}
+
+% =============================================
+% Merged from V3_Transformer (transformer-manuscript references)
+% =============================================
+
+@inproceedings{dong2021attention,
+  title         = {Attention Is Not All You Need: Pure Attention Loses Rank
+                   Doubly Exponentially with Depth},
+  author        = {Dong, Yihe and Cordonnier, Jean-Baptiste and Loukas, Andreas},
+  booktitle     = {Proceedings of the 38th International Conference on Machine Learning (ICML)},
+  year          = {2021},
+  eprint        = {2103.03404},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+@article{geshkovski2023mathematical,
+  title         = {A Mathematical Perspective on Transformers},
+  author        = {Geshkovski, Borjan and Letrouit, Cyril and Polyanskiy, Yury and Rigollet, Philippe},
+  journal       = {arXiv preprint},
+  year          = {2023},
+  eprint        = {2312.10794},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+@article{sengupta2017gauge,
+  author  = {Sengupta, Biswa and Friston, Karl J.},
+  title   = {Approximate {B}ayesian inference as a gauge theory},
+  journal = {arXiv preprint},
+  year    = {2017},
+  eprint  = {1705.06614},
+  archivePrefix = {arXiv},
+  primaryClass  = {q-bio.NC}
+}
+
+% =============================================
+% belief_inertia.tex references (were cited but undefined in any references.bib)
+% =============================================
+
+@inproceedings{cohen2019gauge,
+  title     = {Gauge Equivariant Convolutional Networks and the Icosahedral {CNN}},
+  author    = {Cohen, Taco S. and Weiler, Maurice and Kicanaoglu, Berkay and Welling, Max},
+  booktitle = {Proceedings of the 36th International Conference on Machine Learning (ICML)},
+  year      = {2019},
+  eprint    = {1902.04615},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+% Key "he2025cask" is a misnomer: the CASK paper is by Nagai, Ohno and Tomiya (no author "He").
+@inproceedings{he2025cask,
+  author    = {Nagai, Yuki and Ohno, Hiroshi and Tomiya, Akio},
+  title     = {{CASK}: A Gauge Covariant Transformer for Lattice Gauge Theory},
+  booktitle = {Proceedings of the 41st International Symposium on Lattice Field Theory (Lattice 2024)},
+  series    = {PoS},
+  year      = {2025},
+  eprint    = {2501.16955},
+  archivePrefix = {arXiv},
+  primaryClass  = {hep-lat}
+}
+
+@article{diakonikolas2021momentum,
+  author  = {Diakonikolas, Jelena and Jordan, Michael I.},
+  title   = {Generalized Momentum-Based Methods: A Hamiltonian Perspective},
+  journal = {SIAM Journal on Optimization},
+  volume  = {31},
+  number  = {1},
+  pages   = {915--944},
+  year    = {2021},
+  doi     = {10.1137/20M1322716}
+}
+
+% Key "daSilva2023confirmation" is a misnomer: actual ref is Pilgrim, Sanborn, Malthouse and Hills (2024).
+@article{daSilva2023confirmation,
+  author  = {Pilgrim, Charlie and Sanborn, Adam and Malthouse, Eugene and Hills, Thomas T.},
+  title   = {Confirmation Bias Emerges from an Approximation to {B}ayesian Reasoning},
+  journal = {Cognition},
+  volume  = {245},
+  pages   = {105693},
+  year    = {2024},
+  doi     = {10.1016/j.cognition.2023.105693}
+}
+
+@article{latane1981psychology,
+  author  = {Latan{\'e}, Bibb},
+  title   = {The Psychology of Social Impact},
+  journal = {American Psychologist},
+  volume  = {36},
+  number  = {4},
+  pages   = {343--356},
+  year    = {1981},
+  doi     = {10.1037/0003-066X.36.4.343}
+}
+
+@book{mezard1987spin,
+  title     = {Spin Glass Theory and Beyond: An Introduction to the Replica Method and Its Applications},
+  author    = {Mezard, Marc and Parisi, Giorgio and Virasoro, Miguel Angel},
+  series    = {World Scientific Lecture Notes in Physics},
+  volume    = {9},
+  publisher = {World Scientific},
+  address   = {Singapore},
+  year      = {1987},
+  isbn      = {978-9971-50-116-7},
+  doi       = {10.1142/0271}
+}
+
+@book{rogers2003diffusion,
+  author    = {Rogers, Everett M.},
+  title     = {Diffusion of Innovations},
+  edition   = {5},
+  publisher = {Free Press},
+  address   = {New York},
+  year      = {2003},
+  isbn      = {9780743222099}
 }
 
 % ==========================================
