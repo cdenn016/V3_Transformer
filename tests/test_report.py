@@ -62,6 +62,7 @@ def test_generate_figures_drives_live_model(tmp_path):
     assert all(p.exists() and p.stat().st_size > 0 for p in paths)
     # The figures that need no optional dependency (UMAP is best-effort, so belief_umap is excluded).
     robust = {"estep_convergence.png", "belief_trajectories.png", "attention_structure.png",
+              "per_layer_diagnostics.png",
               "gauge_equivariance.png", "gauge_head_specialization.png", "belief_spectrum.png",
               "spd_ellipses.png", "holonomy_curvature.png", "numerical_trust.png",
               "belief_category_separation.png",
@@ -71,6 +72,11 @@ def test_generate_figures_drives_live_model(tmp_path):
     missing = robust - written
     assert not missing, f"driver did not produce {missing}"
     assert all((figdir / name).exists() for name in robust)
+    # per-layer metrics CSV: the depth axis the final-block metrics.csv never writes.
+    csv_path = tmp_path / "run" / "metrics_per_layer.csv"
+    assert csv_path.exists() and csv_path.stat().st_size > 0
+    header = csv_path.read_text(encoding="utf-8").splitlines()[0]
+    assert header.startswith("layer,") and "holonomy_deviation" in header and "total" in header
 
 
 def test_generate_figures_reloads_from_run_dir(tmp_path):

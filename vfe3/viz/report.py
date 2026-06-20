@@ -138,6 +138,7 @@ def generate_figures(
     bank        = _safe(lambda: extract.belief_bank(model, token_batches, max_sequences=max_sequences), "belief_bank")
     cstate      = _safe(lambda: extract.converged_state(model, tok), "converged_state")
     amaps       = _safe(lambda: model.attention_maps(tok), "attention_maps")
+    per_layer   = _safe(lambda: model.diagnostics_per_layer(tok), "diagnostics_per_layer")
     health      = _safe(lambda: extract.numerical_health(model, tok), "numerical_health")
     s_channel   = _safe(lambda: extract.s_channel_refinement(model, tok), "s_channel_refinement")
     mc_belief   = _safe(lambda: extract.model_channel_belief(model, tok), "model_channel_belief")
@@ -204,6 +205,9 @@ def generate_figures(
                           bm[li, hi], cmap="magma", symbol=r"\beta",
                           title=f"Belief attention - layer {li} head {hi}", path=p),
                       True)
+    _emit("per_layer_diagnostics",                               # the depth axis the aggregates collapse
+          lambda p: figs.plot_per_layer_diagnostics(per_layer, path=p),
+          per_layer is not None)
     _emit("gauge_equivariance",
           lambda p: figs.plot_gauge_equivariance(metrics.gauge_equivariance_residual(
               cstate["mu"], cstate["sigma"], cstate["omega"], model.group,
@@ -213,7 +217,9 @@ def generate_figures(
     _emit("gauge_head_specialization",
           lambda p: figs.plot_gauge_head_specialization(
               metrics.per_head_gauge_invariants(cstate["exp_phi"], model.group.irrep_dims),
-              head_entropy=(metrics.attention_entropy_rows(amaps).mean(dim=(0, 2)) if amaps is not None else None),
+              # cstate["exp_phi"] is the FINAL block's gauge frame, so pair it with the FINAL layer's
+              # per-head entropy (amaps[-1]) -- NOT the all-layer mean, which mismatched the depths.
+              head_entropy=(metrics.attention_entropy_rows(amaps[-1]).mean(dim=-1) if amaps is not None else None),
               path=p),
           cstate is not None)
     _emit("belief_spectrum",
@@ -279,6 +285,24 @@ def generate_figures(
     _emit("decode_readout",
           lambda p: figs.plot_decode_readout([{**readout, "label": run_label}], decode=decode, path=p),
           readout is not None)
+
+    # Per-layer metrics CSV (rows = inference depth): the metrics.csv is final-block-only, so this is
+    # the only place the per-layer belief-channel free energy / holonomy / gauge / belief geometry is
+    # written to disk. Best-effort, like the figures.
+    if per_layer is not None:
+        try:
+            import csv
+            keys = list(per_layer)
+            n_layers = len(per_layer[keys[0]]) if keys else 0
+            csv_path = run_dir / "metrics_per_layer.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["layer", *keys])
+                for li in range(n_layers):
+                    w.writerow([li, *(float(per_layer[k][li]) for k in keys)])
+            logger.info("wrote per-layer metrics -> %s", csv_path)
+        except Exception as exc:
+            logger.warning("metrics_per_layer.csv failed (%s); continuing", exc)
 
     logger.info("wrote %d single-run figures to %s", len(written), figdir)
     return written

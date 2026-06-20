@@ -280,6 +280,35 @@ def test_attention_maps_last_layer_matches_diagnostics():
     assert abs(ent - model.diagnostics(tokens)["attn_entropy"]) < 1e-6
 
 
+def test_diagnostics_per_layer_shape_and_finite():
+    # Per-layer (inference-depth) belief-channel diagnostics: one finite value per layer for every key,
+    # exposing the depth axis the scalar diagnostics() collapses to the final block.
+    import math
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=3,
+                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, prior_handoff_rho=0.5)
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, 12, (2, 6))
+    pl = model.diagnostics_per_layer(tokens)
+    for k in ("self_coupling", "belief_coupling", "attention_entropy", "total", "holonomy_deviation",
+              "gauge_trace_spread", "effective_rank", "belief_cond_median", "phi_norm_mean"):
+        assert k in pl and len(pl[k]) == 3                          # one value per layer
+        assert all(math.isfinite(v) for v in pl[k])
+
+
+def test_diagnostics_per_layer_attn_entropy_matches_attention_maps():
+    # The per-layer replay must reproduce the SAME attention as attention_maps at EVERY layer (both
+    # replay vfe_stack's block loop identically); guards the per-layer diagnostics against drift.
+    from vfe3 import metrics
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=3,
+                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0, prior_handoff_rho=0.5)
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, 12, (2, 5))
+    pl = model.diagnostics_per_layer(tokens)
+    maps = model.attention_maps(tokens)
+    for li in range(3):
+        assert abs(pl["attn_entropy"][li] - float(metrics.attention_entropy(maps[li]))) < 1e-5
+
+
 def test_attention_maps_single_block_group_has_unit_head_axis():
     # A single-irrep-block group (so_k) yields H=1: the energy is full-K (N,N) and the method
     # inserts a unit head axis, so the result is still (L, 1, N, N) (uniform with the multi-head case).
