@@ -21,7 +21,8 @@ import torch
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup
-from vfe3.model.block import vfe_block
+from vfe3.free_energy import attention_tau
+from vfe3.model.block import _as_coeff, vfe_block
 
 
 def vfe_stack(
@@ -61,13 +62,17 @@ def vfe_stack(
     path); ``rope_on_cov`` enables the full-gauge covariance sandwich rotation."""
     rho = cfg.prior_handoff_rho
     rho_s = cfg.prior_handoff_sigma
+    # Hoist the loop-invariant temperature computation out of the per-layer vfe_block call.
+    # attention_tau depends only on cfg.kappa_beta, group.irrep_dims, and device -- all constant
+    # across layers -- so computing it once here and passing it as tau avoids L redundant calls.
+    tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims)
     for _ in range(cfg.n_layers):
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
                            log_alpha=log_alpha, lambda_beta=lambda_beta,
                            connection_W=connection_W, connection_M=connection_M,
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,
-                           rope_on_value=rope_on_value,
+                           rope_on_value=rope_on_value, tau=tau,
                            capture=capture, grad_record=grad_record)   # each block overwrites; last wins
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma

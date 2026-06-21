@@ -55,7 +55,7 @@ non-permutation gauge. Use under permutation/sign gauge for exactness.
 """
 
 import math
-from typing import List, NoReturn, Tuple
+from typing import List, Tuple
 
 import torch
 
@@ -88,7 +88,7 @@ class DiagonalLaplace(BeliefParams):
             torch.stack([p.sigma for p in parts], dim=dim),
         )
 
-    def natural(self) -> NoReturn:
+    def natural(self) -> Tuple[torch.Tensor, ...]:
         raise NotImplementedError(
             "DiagonalLaplace is not a natural exponential family when the location varies "
             "(the sufficient statistic |x - mu| depends on the parameter mu), so it has no "

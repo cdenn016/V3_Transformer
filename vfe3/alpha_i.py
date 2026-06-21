@@ -57,6 +57,12 @@ def alpha_regularizer(
     return b0 * alpha - c0 * torch.log(alpha.clamp(min=1e-12))
 
 
+# The complete set of named params across ALL registered alpha forms. Each form's
+# **kwargs may validly contain the other forms' params (the dispatcher forwards a
+# single kwargs bag); only keys OUTSIDE this universe are genuine misspellings.
+_KNOWN_ALPHA_KWARGS: frozenset = frozenset({"value", "b0", "c0", "eps", "log_alpha"})
+
+
 @register_alpha("constant")
 def alpha_constant(
     kl:    torch.Tensor,             # (..., N) or (..., N, K) self-divergence (unused)
@@ -66,6 +72,9 @@ def alpha_constant(
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Constant alpha = value, zero regularizer."""
+    unknown = set(kwargs) - _KNOWN_ALPHA_KWARGS
+    if unknown:
+        raise TypeError(f"alpha_constant: unexpected kwargs {sorted(unknown)}")
     return torch.full_like(kl, value), torch.zeros_like(kl)
 
 
@@ -80,6 +89,9 @@ def alpha_state_dependent(
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""State-dependent alpha*_i = c0 / (b0 + D(q_i||p_i)); R(alpha*)."""
+    unknown = set(kwargs) - _KNOWN_ALPHA_KWARGS
+    if unknown:
+        raise TypeError(f"alpha_state_dependent: unexpected kwargs {sorted(unknown)}")
     alpha = c0 / (b0 + kl).clamp(min=eps)
     return alpha, alpha_regularizer(alpha, b0=b0, c0=c0)
 
@@ -112,6 +124,9 @@ def alpha_learnable(
     """
     if log_alpha is None:
         raise ValueError("lambda_alpha_mode='learnable' requires log_alpha (the model's nn.Parameter)")
+    unknown = set(kwargs) - _KNOWN_ALPHA_KWARGS
+    if unknown:
+        raise TypeError(f"alpha_learnable: unexpected kwargs {sorted(unknown)}")
     return torch.exp(log_alpha) * torch.ones_like(kl), torch.zeros_like(kl)
 
 
@@ -133,6 +148,9 @@ def alpha_state_dependent_per_coord(
     (declared ``per_coord=True``). The per-coordinate divergence exists only for the
     diagonal family + Renyi functional, enforced by the router and at config construction.
     """
+    unknown = set(kwargs) - _KNOWN_ALPHA_KWARGS
+    if unknown:
+        raise TypeError(f"alpha_state_dependent_per_coord: unexpected kwargs {sorted(unknown)}")
     alpha = c0 / (b0 + kl).clamp(min=eps)
     return alpha, alpha_regularizer(alpha, b0=b0, c0=c0)
 

@@ -76,14 +76,14 @@ def attention_tau(
     return kappa * sqrt_d
 
 
-_SQRT_D_CACHE: Dict[Tuple[Tuple[int, ...], torch.device, torch.dtype], torch.Tensor] = {}
+_SQRT_D_CACHE: Dict[Tuple[Tuple[int, ...], str, torch.dtype], torch.Tensor] = {}
 
 
 def _sqrt_dims(dims: Tuple[int, ...], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     r"""Cached per-block sqrt(d_h) vector: attention_tau is called every vfe_block invocation,
     and the unequal-dims branch was allocating this loop-invariant tensor each time (audit
     2026-06-09 overnight F7)."""
-    key = (dims, device, dtype)
+    key = (dims, str(device), dtype)
     t = _SQRT_D_CACHE.get(key)
     if t is None:
         t = torch.tensor([float(d) for d in dims], device=device, dtype=dtype).sqrt()

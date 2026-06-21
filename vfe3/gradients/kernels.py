@@ -14,6 +14,7 @@ import torch
 
 from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
 from vfe3.families.base import get_family
+from vfe3.families.gaussian import diag_kl_unclamped, diag_kl_unclamped_per_coord
 from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence_for_alpha
 from vfe3.geometry.transport import RopeTransport, transport_covariance, transport_mean
 from vfe3.gradients.oracle import belief_gradients_autograd
@@ -50,11 +51,7 @@ def _raw_diag_kl(
     mask (the oracle differentiates THROUGH the clamp, whose gradient is 0 once
     D leaves (0, kl_max)).
     """
-    sq = sigma_q.clamp(min=eps); sp = sigma_p.clamp(min=eps)
-    trace  = (sq / sp).sum(dim=-1)
-    mahal  = (((mu_p - mu_q) ** 2) / sp).sum(dim=-1)
-    logdet = (torch.log(sp) - torch.log(sq)).sum(dim=-1)
-    return 0.5 * (trace + mahal - mu_q.shape[-1] + logdet)
+    return diag_kl_unclamped(mu_q, sigma_q, mu_p, sigma_p, eps=eps)
 
 
 def _raw_diag_kl_per_coord(
@@ -73,8 +70,7 @@ def _raw_diag_kl_per_coord(
     safe_kl_clamp, so the kernel builds its saturation mask from this so a saturated
     coordinate is gated independently of the others -- matching the filtering oracle.
     """
-    sq = sigma_q.clamp(min=eps); sp = sigma_p.clamp(min=eps)
-    return 0.5 * (sq / sp + ((mu_p - mu_q) ** 2) / sp - 1.0 + torch.log(sp) - torch.log(sq))
+    return diag_kl_unclamped_per_coord(mu_q, sigma_q, mu_p, sigma_p, eps=eps)
 
 
 @register_kernel("gaussian_diagonal")

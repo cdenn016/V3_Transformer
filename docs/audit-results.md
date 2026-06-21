@@ -43,8 +43,8 @@ All twelve medium-band findings below were **CONFIRMED** by the independent veri
 12. **[low] `attention_tau` recomputed per `vfe_block`** — block.py:62 inside the per-layer loop (stack.py:64); inputs are loop-invariant (the expensive `_sqrt_dims` is already cached, so the residual cost is the call/lookup). *Fix:* hoist `tau` to `vfe_stack` and pass it in.
 
 ### Expert-tier low items (recorded, not on the main list)
-- `FullGaussian.entropy()` discards the `safe_cholesky` ok-mask → a finite wrong value on a non-PD input (gaussian.py:263; no live caller). `_logdet_chol` clamps a failed factor diagonal to `1e-12` instead of propagating NaN (base.py:41).
-- The `pullback`/`killing` φ-preconditioner solve is under-ridged near the `Ψ(ad_φ)` resonance at `ad`-eigenvalue `2πi` (phi_preconditioner.py:271/336/405; opt-in path, reachable only by higher-spin towers). *Fix:* scale the ridge to the metric spectrum.
+- `FullGaussian.entropy()` ok-mask — **RETRACTED as a false positive (not applied)**: the finite output on a non-PD input is *intentional graceful degradation* (safe jittered Cholesky + `_logdet_chol` clamp), pinned by `test_full_covariance.py::test_full_entropy_survives_non_pd_covariance` ("must NOT raise; `isfinite` all"). An ok-mask/NaN change was tried and reverted because it broke that contract; `_logdet_chol`'s `1e-12` clamp is the mechanism of that degradation, not a defect — left as-is.
+- The `pullback`/`killing` φ-preconditioner solve is under-ridged near the `Ψ(ad_φ)` resonance at `ad`-eigenvalue `2πi` (phi_preconditioner.py:271/336/405; opt-in path, reachable only by higher-spin towers). **Not applied:** `test_phi_preconditioner.py` pins the solve as `G + 1e-6·I` verbatim (at φ=0.3 `trace(G)/n ≠ 1`, so a spectrum-relative ridge shifts the pinned value); left as the documented fixed ridge.
 - Diagonal vs full SPD trust-region geometry differ (L∞ box vs Frobenius ball; retraction.py:128 vs 175), so the diagonal family is not the diagonal restriction of the full family once the trust region binds.
 - `_refine_s` (model.py:610) forces flat transport and drops RoPE, so under the double opt-in `s_e_step=True`+`pos_rotation='rope'` the model channel refines under inconsistent positional geometry (self-documented; off the default path).
 
@@ -61,9 +61,11 @@ All 12 main findings: **CONFIRMED** against source (file:line cited per finding 
 ## Test suite
 
 - Command: `python -m pytest tests` (system Python, torch 2.11 CPU, `VFE3_TEST_DEVICE=cpu`)
-- Result: **1142 passed, 1 skipped, 1 xpassed, 0 failed, 0 errors** (1144 total) in 238s
+- Result: **1142 passed, 1 skipped, 1 xpassed, 0 failed, 0 errors** (1144 total). Re-run after the fixes below: identical (1142 passed, 0 failed) — zero regressions.
 - Failures: none
 
-## Disposition
+## Disposition — fixes applied (user authorization: "fix all")
 
-No code was modified — per the deep-audit contract, the verified, challenged punch list is presented for authorization first. None of the surviving items is critical/high; all are engineering/perf/hygiene plus the one bounded SPD-retraction pure-path enhancement (item 4). Recommended order if fixes are authorized: items 3 (diagnostic one-liner) and 1–2 (perf hot-path) first, then 5–12 (low hygiene), with item 4 (the `sigma_max` ceiling) as a deliberate design decision (optional ceiling vs trace/det control) rather than a quick patch.
+All twelve main punch-list items were applied, plus the `DiagonalLaplace.natural` annotation. The `sigma_max` ceiling (item 4) was implemented as a pure-path opt-out: `sigma_max` is now `Optional[float]` and `None` skips the ceiling while keeping the `eps` floor, recovering the affine-exact retraction; the function defaults were aligned to the config value (10.0). The perf fixes (`_rel_gap_eps` on-device tensor, flat-transport hoist, `attention_tau` hoist) are behavior-preserving (the numerics-pinning tests pass unchanged).
+
+Not applied (documented above): the `entropy()` ok-mask was **tried and reverted** — it broke `test_full_entropy_survives_non_pd_covariance`, which pins the finite output as intentional graceful degradation; the φ-preconditioner spectrum-relative ridge would shift a pinned test value; and the `_logdet_chol` clamp and the diagonal/full trust-region geometry difference are deliberate design choices left as-is. The full suite re-ran green after every applied change.

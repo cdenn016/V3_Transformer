@@ -57,7 +57,7 @@ class _EighDamped(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, A: torch.Tensor, gap_eps: float):     # noqa: D401
+    def forward(ctx, A: torch.Tensor, gap_eps):             # gap_eps: float or 0-d tensor  # noqa: D401
         w, V = torch.linalg.eigh(A)
         ctx.save_for_backward(w, V)
         ctx.gap_eps = gap_eps
@@ -79,7 +79,7 @@ class _EighDamped(torch.autograd.Function):
         return gA, None
 
 
-def _eigh_damped(A: torch.Tensor, gap_eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor]:
+def _eigh_damped(A: torch.Tensor, gap_eps) -> Tuple[torch.Tensor, torch.Tensor]:  # gap_eps: float or 0-d tensor
     r"""``(eigenvalues, eigenvectors)`` of symmetric ``A`` with a gap-regularized backward (see
     :class:`_EighDamped`). Drop-in for ``torch.linalg.eigh`` on the full-cov SPD retraction paths so a
     degenerate spectrum (the ``Sigma = I`` default init) yields finite -- not NaN -- gradients on the
@@ -94,15 +94,16 @@ def _rel_gap_eps(
     *,
     rel:   float = 1e-6,
     floor: float = 1e-12,
-) -> float:                                # gap regularizer scaled to A's spectrum
+) -> torch.Tensor:                         # 0-d on-device tensor; no host-sync
     r"""Spectrum-relative ``gap_eps`` for :func:`_eigh_damped` on the SPD retraction paths (audit
     2026-06-13 L11). The fixed ``gap_eps=1e-8`` over-damps the eigh adjoint ``F_ij = 1/(w_j - w_i)``
     for MEANINGFUL gaps near the variance floor -- a resolvable gap of 1e-4 is biased ~50%. Scaling
     to ``(rel * ||A||_max)^2`` -- the squared fp32 noise floor of the spectrum -- damps only gaps
     below fp32 resolution (true degeneracy stays finite, ``F = 0``) and leaves resolvable gaps
-    accurate. ``rel`` is a few machine epsilons; ``floor`` keeps a tiny near-zero spectrum finite."""
-    scale = float(A.detach().abs().max())
-    return max(floor, (rel * scale) ** 2)
+    accurate. ``rel`` is a few machine epsilons; ``floor`` keeps a tiny near-zero spectrum finite.
+    Returns a 0-d tensor on A's device/dtype to avoid a CUDA host-sync (no ``.item()``/``float()``)."""
+    scale = A.detach().abs().amax()        # 0-d tensor, stays on device
+    return (rel * scale).pow(2).clamp(min=floor)
 
 
 def retract_spd_diagonal(
@@ -110,14 +111,15 @@ def retract_spd_diagonal(
     delta_sigma:  torch.Tensor,             # (..., K) diagonal tangent
 
     *,
-    step_size:    float = 1.0,
-    trust_region: float = 5.0,
-    eps:          float = 1e-6,
-    sigma_max:    float = 5.0,
+    step_size:    float          = 1.0,
+    trust_region: float          = 5.0,
+    eps:          float          = 1e-6,
+    sigma_max:    Optional[float] = 10.0,   # matches VFE3Config.sigma_max
 ) -> torch.Tensor:
     r"""Diagonal SPD retraction sigma_new = sigma * exp(tau * clamp(dsigma/sigma)).
 
     Positivity by construction (exp > 0); clamped to [eps, sigma_max].
+    When sigma_max is None the eigenvalue ceiling is skipped (pure-path: eps floor only).
     """
     orig_dtype = sigma_diag.dtype
     with torch.amp.autocast('cuda', enabled=False):
@@ -128,7 +130,8 @@ def retract_spd_diagonal(
             whitened = whitened.clamp(-trust_region, trust_region)
         exp_arg = (step_size * whitened).clamp(-50.0, 50.0)
         sigma_new = sigma_safe * torch.exp(exp_arg)
-    return sigma_new.clamp(min=eps, max=sigma_max).to(orig_dtype)
+    sigma_new = sigma_new.clamp(min=eps) if sigma_max is None else sigma_new.clamp(min=eps, max=sigma_max)
+    return sigma_new.to(orig_dtype)
 
 
 def retract_spd_full(
@@ -136,10 +139,10 @@ def retract_spd_full(
     delta_sigma:  torch.Tensor,             # (..., K, K) symmetric tangent
 
     *,
-    step_size:    float = 1.0,
-    trust_region: float = 2.0,
-    eps:          float = 1e-6,
-    sigma_max:    float = 5.0,
+    step_size:    float          = 1.0,
+    trust_region: float          = 2.0,
+    eps:          float          = 1e-6,
+    sigma_max:    Optional[float] = 10.0,   # matches VFE3Config.sigma_max
 ) -> torch.Tensor:
     r"""Full SPD retraction via the affine-invariant exponential map.
 
@@ -149,6 +152,7 @@ def retract_spd_full(
     diagonal arm applies to sigma). Uses the gap-regularized ``_eigh_damped`` eigendecomposition so
     the unrolled backward stays finite on a degenerate spectrum -- the isotropic ``Sigma = I`` default
     gaussian_full init makes the stock eigh backward 100% NaN; forward values are unchanged.
+    When sigma_max is None the eigenvalue ceiling is skipped (pure-path: eps floor only).
     """
     orig_shape = sigma.shape
     orig_dtype = sigma.dtype
@@ -184,7 +188,7 @@ def retract_spd_full(
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
         eig_new, vec_new = _eigh_damped(sigma_new, _rel_gap_eps(sigma_new))
-        eig_new = eig_new.clamp(min=eps, max=sigma_max)      # eigenvalues ARE variances: ONE ceiling
+        eig_new = eig_new.clamp(min=eps) if sigma_max is None else eig_new.clamp(min=eps, max=sigma_max)
         sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
 
     sigma_new = sigma_new.to(orig_dtype)
@@ -201,10 +205,10 @@ def retract_spd_affine(
     mean_ndim:    int,                      # ndim of the belief mean; full cov iff sigma.dim() == mean_ndim + 1
 
     *,
-    step_size:    float = 1.0,
-    trust_region: float = 5.0,
-    eps:          float = 1e-6,
-    sigma_max:    float = 5.0,
+    step_size:    float          = 1.0,
+    trust_region: float          = 5.0,
+    eps:          float          = 1e-6,
+    sigma_max:    Optional[float] = 10.0,   # matches VFE3Config.sigma_max
 ) -> torch.Tensor:                          # (...) same rank as sigma
     r"""Affine-invariant SPD retraction (the manuscript-canonical default, GL(K)_supplementary.tex:640-645).
 
@@ -231,10 +235,10 @@ def retract_logeuclidean_full(
     delta_log:    torch.Tensor,             # (..., K, K) symmetric tangent (taken in the log chart)
 
     *,
-    step_size:    float = 1.0,
-    trust_region: float = 5.0,
-    eps:          float = 1e-6,
-    sigma_max:    float = 5.0,
+    step_size:    float          = 1.0,
+    trust_region: float          = 5.0,
+    eps:          float          = 1e-6,
+    sigma_max:    Optional[float] = 10.0,   # matches VFE3Config.sigma_max
 ) -> torch.Tensor:
     r"""Full log-Euclidean SPD retraction (Arsigny-Fillard-Pennec-Ayache 2006/2007).
 
@@ -281,7 +285,7 @@ def retract_logeuclidean_full(
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
         eig_new, vec_new = _eigh_damped(sigma_new, _rel_gap_eps(sigma_new))
-        eig_new = eig_new.clamp(min=eps, max=sigma_max)      # eigenvalues ARE variances: ONE ceiling
+        eig_new = eig_new.clamp(min=eps) if sigma_max is None else eig_new.clamp(min=eps, max=sigma_max)
         sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
 
     sigma_new = sigma_new.to(orig_dtype)
@@ -298,10 +302,10 @@ def retract_log_euclidean(
     mean_ndim:    int,                      # ndim of the belief mean; full cov iff sigma.dim() == mean_ndim + 1
 
     *,
-    step_size:    float = 1.0,
-    trust_region: float = 5.0,
-    eps:          float = 1e-6,
-    sigma_max:    float = 5.0,
+    step_size:    float          = 1.0,
+    trust_region: float          = 5.0,
+    eps:          float          = 1e-6,
+    sigma_max:    Optional[float] = 10.0,   # matches VFE3Config.sigma_max
 ) -> torch.Tensor:                          # (...) same rank as sigma
     r"""Log-Euclidean SPD retraction (spec reading 2a; Arsigny et al. 2006/2007).
 
@@ -336,7 +340,8 @@ def retract_log_euclidean(
             delta_sigma = delta_sigma.clamp(-trust_region, trust_region)
         exp_arg   = (step_size * delta_sigma).clamp(-50.0, 50.0)
         sigma_new = sigma_safe * torch.exp(exp_arg)
-    return sigma_new.clamp(min=eps, max=sigma_max).to(orig_dtype)
+    sigma_new = sigma_new.clamp(min=eps) if sigma_max is None else sigma_new.clamp(min=eps, max=sigma_max)
+    return sigma_new.to(orig_dtype)
 
 
 def natural_gradient(
