@@ -43,6 +43,62 @@ def test_config_rejects_nonpositive_kl_max():
         VFE3Config(kl_max=0.0)
 
 
+def test_gauge_transport_default_on_is_noop():
+    """gauge_transport='on' (default) is the pure learned-frame path: it must NOT coerce any of the
+    gauge-frame fields, so a config built with explicit frame settings is byte-identical to omitting
+    the toggle."""
+    cfg = VFE3Config(phi_scale=0.06, pos_phi="learned", e_phi_lr=0.3, m_phi_lr=0.02)
+    assert cfg.gauge_transport == "on"
+    assert cfg.phi_scale == 0.06 and cfg.pos_phi == "learned"
+    assert cfg.e_phi_lr == 0.3 and cfg.m_phi_lr == 0.02
+
+
+def test_gauge_transport_off_forces_identity_frame():
+    """gauge_transport='off' coerces the frame to the identity (Omega_ij=I): phi_scale=0, pos_phi='none',
+    e_phi_lr=0, m_phi_lr=0, with a warning recording the coercion."""
+    with pytest.warns(UserWarning, match="gauge_transport='off'"):
+        cfg = VFE3Config(gauge_transport="off", phi_scale=0.06, pos_phi="learned",
+                         e_phi_lr=0.3, m_phi_lr=0.02)
+    assert cfg.phi_scale == 0.0 and cfg.pos_phi == "none"
+    assert cfg.e_phi_lr == 0.0 and cfg.m_phi_lr == 0.0
+
+
+def test_gauge_transport_off_rejects_rope():
+    """A RoPE rotation folded into the transport makes Omega != I, so it is incompatible with the
+    Omega=I contract of gauge_transport='off'."""
+    with pytest.raises(ValueError, match="pos_rotation"):
+        VFE3Config(gauge_transport="off", pos_rotation="rope")
+
+
+def test_gauge_transport_off_rejects_regime_ii():
+    """A non-flat Regime-II connection edge factor makes Omega != I, so it is incompatible with
+    gauge_transport='off'."""
+    with pytest.raises(ValueError, match="transport_mode"):
+        VFE3Config(gauge_transport="off", transport_mode="regime_ii")
+
+
+def test_gauge_transport_frozen_freezes_lrs_keeps_random_frame():
+    """gauge_transport='frozen' keeps the random frame (phi_scale unchanged, pos_phi unchanged) but
+    freezes its learning (e_phi_lr=0, m_phi_lr=0)."""
+    with pytest.warns(UserWarning, match="gauge_transport='frozen'"):
+        cfg = VFE3Config(gauge_transport="frozen", phi_scale=0.06, pos_phi="learned",
+                         e_phi_lr=0.3, m_phi_lr=0.02)
+    assert cfg.phi_scale == 0.06 and cfg.pos_phi == "learned"
+    assert cfg.e_phi_lr == 0.0 and cfg.m_phi_lr == 0.0
+
+
+def test_gauge_transport_frozen_rejects_zero_phi_scale():
+    """'frozen' is a RANDOM fixed frame; a zero phi_scale would make it the identity, which is the
+    'off' mode -- reject the ambiguous pair."""
+    with pytest.raises(ValueError):
+        VFE3Config(gauge_transport="frozen", phi_scale=0.0)
+
+
+def test_gauge_transport_rejects_unknown():
+    with pytest.raises(ValueError):
+        VFE3Config(gauge_transport="bogus")
+
+
 def test_cross_couplings_accepts_list_pairs_from_json_roundtrip():
     """A config.json reloaded by viz.report._load_config gives LIST pairs (JSON has no tuples);
     VFE3Config(**reloaded) must accept them so a cold-start generate_figures does not crash on the
