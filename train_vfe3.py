@@ -297,6 +297,14 @@ config = dict(
     ema_decay                 = 0.95,     # EMA decay in (0,1); only read when use_ema=True
 )
 
+# kl_max is the numerical safety-net clamp on EVERY divergence (KL(q||p), KL(s||r), pairwise energy),
+# next to eps -- NOT an operating ceiling. Diagonal KL is a sum over K coords (~0.8 nats/coord trained),
+# so the K-INDEPENDENT 100.0 default binds for ~100% of tokens at large K (K* ~ 126), silently zeroing
+# the hyper-prior self-gradient and gradient-freezing learnable r (the kernel self_mask, gradients/
+# kernels.py:129). Scale it with K so it binds only on genuine NaN/inf/Cholesky blowups; F is provably
+# kl_max-independent below the ceiling (safe_kl_clamp is the identity there). See docs/2026-06-21-edits.md.
+config["kl_max"] = 8 * config["embed_dim"]
+
 
 # Where each run's artifacts go: vfe3_runs/<timestamp>_<label>/ while training (config.json,
 # metrics.csv, checkpoints/, best_model.pt, test_results.json, summary.json, *.png), renamed to
