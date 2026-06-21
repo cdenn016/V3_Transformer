@@ -2,8 +2,8 @@
 
 Clean-room rebuild of the gauge-theoretic VFE transformer. No neural networks:
 all capacity comes from iterative VFE minimization over Gaussian belief tuples
-`(mu, Sigma, phi)`. Built bottom-up, every layer numerically pinned to VFE_2.0
-by golden tests. See `docs/superpowers/specs/2026-05-29-vfe3-clean-room-design.md`.
+`(mu, Sigma, phi)`. Built bottom-up, every layer pinned by golden regression
+tests. See `docs/superpowers/specs/2026-05-29-vfe3-clean-room-design.md`.
 
 ## Hard constraints
 - NO neural networks (no nn.Linear, no MLP, no activations).
@@ -38,7 +38,7 @@ Example:
     ) -> torch.Tensor:
 
 ## Testing
-Golden equivalence vs a pinned VFE_2.0 checkout for every ported kernel;
+Golden regression tests pin every kernel to its reference values;
 finite-difference gradient checks against the autograd-of-F oracle (later
 phases); property tests (non-negativity, self-divergence zero, gauge
 equivariance). Tests are device-agnostic (default CPU; set

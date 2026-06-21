@@ -1,4 +1,4 @@
-r"""Schur-commutant head mixer for VFE_3.0 (opt-in; VFE_2.0 ``VFEHeadMixer`` parity).
+r"""Schur-commutant head mixer for VFE_3.0 (opt-in).
 
 Without labels (the legacy equal-dims form) mixes ``n`` equal-size gauge-irrep blocks with one
 learned matrix :math:`A = I + \Delta \in \mathbb{R}^{n \times n}` embedded as

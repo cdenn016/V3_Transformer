@@ -1,5 +1,5 @@
 r"""decode_bias: a learned per-vocab log-unigram bias on the linear decode path
-(use_prior_bank=False), ported from VFE_2.0 (transformer/vfe/model.py output_proj.bias).
+(use_prior_bank=False).
 
 Zero-initialised so the decode is bit-identical to no-bias at construction; routed to a
 weight-decay-free optimizer group (decaying a unigram prior toward zero biases it to a flat

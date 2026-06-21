@@ -3,8 +3,8 @@ r"""phi_weight_decay: a SEPARATE AdamW weight decay for the gauge-frame coordina
 
 Decoupled AdamW decay on phi sets an LR-invariant ceiling on the frame norm
 (|phi*| ~ E[normalized-grad]/wd), pulling the gauge transport exp(phi.G) toward the identity
-independently of the M-step LRs. VFE_2.0 protects its gauge frames at weight_decay=0; this field
-makes that protection a first-class, sweepable knob in V3 (set phi_weight_decay=0 for V2 parity)
+independently of the M-step LRs. The gauge frames are protected at weight_decay=0; this field
+makes that protection a first-class, sweepable knob (set phi_weight_decay=0 for full protection)
 without changing the generic weight_decay on the belief tables. Under m_phi_natural_grad=True phi is
 natural-gradient stepped on the gauge group, so its AdamW decay stays 0 regardless of the field.
 """
@@ -44,7 +44,7 @@ def test_phi_weight_decay_override_protects_phi_only():
     cfg = VFE3Config(**BASE, weight_decay=0.05, phi_weight_decay=0.0)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
-    assert _wd(_group_of(opt, model.prior_bank.phi_embed), opt) == 0.0     # phi protected (V2 parity)
+    assert _wd(_group_of(opt, model.prior_bank.phi_embed), opt) == 0.0     # phi protected (weight_decay=0)
     assert _wd(_group_of(opt, model.prior_bank.mu_embed), opt) == 0.05     # mu untouched
 
 

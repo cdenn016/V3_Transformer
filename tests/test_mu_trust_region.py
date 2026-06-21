@@ -1,9 +1,9 @@
-r"""E-step mu trust-region (VFE_2.0 parity, default OFF).
+r"""E-step mu trust-region (default OFF).
 
-V2 passes every E-step mean update through a per-coordinate whitened box (or Mahalanobis ball)
-trust region (`apply_mu_trust_region`, winning run `e_mu_q_trust=5.0`, `mu_trust_mode='box'`);
-V3's update was unbounded. This adds the same clamp as an opt-in knob whose default
-(`e_mu_q_trust=None`) reproduces the current unbounded behavior bit-for-bit.
+This passes every E-step mean update through a per-coordinate whitened box (or Mahalanobis ball)
+trust region (`apply_mu_trust_region`, winning run `e_mu_q_trust=5.0`, `mu_trust_mode='box'`),
+bounding an otherwise-unbounded update. The opt-in knob's default
+(`e_mu_q_trust=None`) reproduces the unbounded behavior bit-for-bit.
 
 box  : whitened = delta_mu / sqrt(sigma); clamp to +/-trust; un-whiten -> per-coord +/-trust*sigma^.5
 ball : scale the whole whitened vector by min(trust/||whitened||_2, 1) (direction-preserving)

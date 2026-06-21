@@ -143,12 +143,12 @@ class PriorBank(nn.Module):
         self.phi_embed        = nn.Parameter(phi_scale * torch.randn(vocab_size, n_gen))
         self.decode_log_scale = nn.Parameter(torch.zeros(1))
 
-        # use_prior_bank=False (VFE_2.0-parity ablation): decode is a plain linear projection
+        # use_prior_bank=False (linear-decode ablation): decode is a plain linear projection
         # logits = mu_q @ W^T through a learned (V, K) weight, the single authorized neural
         # exception (a lone linear output readout; see CLAUDE.md). Realized as a raw nn.Parameter
         # matmul -- NOT an nn.Linear/MLP -- so no neural-layer class enters the module. Created
         # only on the ablation path so the pure path (use_prior_bank=True) carries no extra weight.
-        # Xavier-uniform init (matches VFE_2.0's nn.Linear default), no bias (a constant shift in
+        # Xavier-uniform init (PyTorch's nn.Linear default), no bias (a constant shift in
         # V that softmax/cross-entropy absorbs). Encode stays the prior-bank lookup either way.
         if use_prior_bank:
             self.output_proj_weight = None
@@ -162,8 +162,7 @@ class PriorBank(nn.Module):
             # spending rank-K mean capacity. Zero-init -> logits bit-identical to decode_bias=False
             # at construction (drawn AFTER the weight, so the weight's RNG is unchanged); the CE
             # gradient drives it toward log p(token). Routed to a weight-decay-free optimizer group
-            # in build_optimizer (decaying a unigram prior toward zero biases it to flat). VFE_2.0
-            # parity: transformer/vfe/model.py output_proj.bias.
+            # in build_optimizer (decaying a unigram prior toward zero biases it to flat).
             self.output_proj_bias = (
                 nn.Parameter(torch.zeros(vocab_size)) if decode_bias else None
             )
@@ -808,7 +807,7 @@ def _decode_linear(
     sigma_q: torch.Tensor,               # (B, N, K) posterior variances (DISCARDED)
     tau_eff: torch.Tensor,               # () effective temperature (DISCARDED)
 ) -> torch.Tensor:                       # (B, N, V) logits = mu_q @ W^T (+ b)
-    r"""Linear-projection decode (use_prior_bank=False, VFE_2.0 parity): logits = mu_q @ W^T (+ b).
+    r"""Linear-projection decode (use_prior_bank=False): logits = mu_q @ W^T (+ b).
 
     The one authorized neural exception: a single learned (V, K) output weight applied to the
     converged mean, with NO KL geometry at the decode boundary (the decode temperature is discarded;

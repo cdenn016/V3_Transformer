@@ -32,7 +32,7 @@ def apply_mu_trust_region(
     is_diagonal: bool  = True,
     eps:         float = 1e-8,
 ) -> torch.Tensor:                       # (..., K) clamped step, same shape/dtype as delta_mu
-    r"""Whitened E-step mean trust region (VFE_2.0 ``apply_mu_trust_region`` parity).
+    r"""Whitened E-step mean trust region.
 
     Bounds the per-iteration mean update in :math:`\sigma`-whitened (Mahalanobis) units so a
     large VFE mean gradient cannot overshoot the belief by more than ``trust`` standard deviations:
@@ -41,7 +41,7 @@ def apply_mu_trust_region(
         box      : clamp(whitened, -trust, +trust) * scale          (per-coordinate)
         ball     : delta_mu * min(trust / ||whitened||_2, 1)        (direction-preserving)
 
-    ``box`` is V2's winning-run mode. This is a step-size guard, OFF by default at the call site
+    ``box`` is the recommended mode. This is a step-size guard, OFF by default at the call site
     (``e_mu_q_trust=None``); when ``trust`` does not bind it is the identity.
     """
     sigma_diag = sigma_q if is_diagonal else sigma_q.diagonal(dim1=-2, dim2=-1)

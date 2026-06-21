@@ -665,7 +665,7 @@ def compute_transport_operators(
     # Per-block exp when the group is genuinely block-diagonal (block_glk without cross-couplings
     # -> irrep_dims [d_head]*H); single-block ([K]: glk, so_k, cross-coupled) takes the full path.
     # exp_dim keys the float64-island decision on the dimension actually exponentiated -- the
-    # per-head block -- mirroring the regime_ii edge exp (audit F8c) and VFE_2.0's always-fp32
+    # per-head block -- mirroring the regime_ii edge exp (audit F8c) and the always-fp32
     # per-block exp at d_head < 20. The conditioning argument lives at the block scale: the
     # retraction bounds ||phi|| (coords) by max_norm=5.0, so each block's Frobenius norm is far
     # inside fp32 matrix_exp's exact regime; without the override every flat run at K >= 20 paid

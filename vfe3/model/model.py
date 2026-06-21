@@ -267,7 +267,7 @@ class VFEModel(nn.Module):
                     stacklevel=2,
                 )
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED belief-coupling weight
-        # lambda_beta (VFE_2.0 'lambda_align' parity). When learnable_lambda_beta=True, create
+        # lambda_beta. When learnable_lambda_beta=True, create
         # log_lambda_beta as a scalar nn.Parameter; the consumed weight is lambda_beta =
         # exp(log_lambda_beta) (always positive). Init 0 -> lambda_beta = exp(0) = 1.0, byte-identical
         # to the constant-1.0 pure path at step 0. For learnable_lambda_beta=False the parameter is
@@ -735,7 +735,7 @@ class VFEModel(nn.Module):
                 _gv = grad_rec.get(_gk) if grad_rec is not None else None
                 estep_grad_out[_gk] = float(_gv) if _gv is not None else 0.0
         mu_final = out.mu                                        # (B, N, K); head mixer (if any) applied PER BLOCK
-        sigma_final = out.sigma                                  # inside vfe_stack now (VFE_2.0 parity), not post-stack
+        sigma_final = out.sigma                                  # inside vfe_stack now, not post-stack
 
         if self.final_norm is not None:                          # config-selected final norm (cached)
             mu_final = self.final_norm(mu_final, sigma_final)
