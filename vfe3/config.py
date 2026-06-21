@@ -61,8 +61,8 @@ class VFE3Config:
 
     # gauge seam
     gauge_group:               str   = "block_glk"
-    gauge_parameterization:    str   = "phi"
-    
+    gauge_parameterization:    str   = "phi"          # RESERVED axis: 'phi' is the sole live value; 'omega_direct' is rejected at validation (~line 682) until implemented.
+
     # Connection REGIME (registry key): the flat Regime-I phi-cocycle ('flat', default = the pure
     # NO-NN path) vs the non-flat Regime II ('regime_ii'). ORTHOGONAL to gauge_parameterization,
     # which picks how a single flat transport is parameterized; this picks whether the connection is

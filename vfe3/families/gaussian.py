@@ -25,6 +25,49 @@ from vfe3.numerics import safe_cholesky
 _RENYI_KL_BAND: float = 1e-2
 
 
+def diag_kl_unclamped(
+    mu_q:    torch.Tensor,             # (..., N, K) query means
+    sigma_q: torch.Tensor,             # (..., N, K) query variances
+    mu_p:    torch.Tensor,             # (..., N, K) prior means
+    sigma_p: torch.Tensor,             # (..., N, K) prior variances
+
+    *,
+    eps:     float = 1e-6,
+) -> torch.Tensor:                     # (..., N) UNCLAMPED KL(q||p)
+    r"""Unclamped diagonal KL(q||p) = 0.5 Sum_k (s_k/t_k + (mu_p - mu_q)^2/t_k - 1 + log(t_k/s_k)).
+
+    Returns the raw divergence scalar (summed over the last coordinate axis) WITHOUT clamping,
+    so callers that need the pre-clamp value for saturation masking (e.g. ``_diag_kl_filtering_kernel``)
+    can inspect it before applying ``safe_kl_clamp``.
+    """
+    sq     = sigma_q.clamp(min=eps)
+    sp     = sigma_p.clamp(min=eps)
+    K      = mu_q.shape[-1]
+    trace  = (sq / sp).sum(dim=-1)
+    mahal  = (((mu_p - mu_q) ** 2) / sp).sum(dim=-1)
+    logdet = (torch.log(sp) - torch.log(sq)).sum(dim=-1)
+    return 0.5 * (trace + mahal - K + logdet)
+
+
+def diag_kl_unclamped_per_coord(
+    mu_q:    torch.Tensor,             # (..., N, K) query means
+    sigma_q: torch.Tensor,             # (..., N, K) query variances
+    mu_p:    torch.Tensor,             # (..., N, K) prior means
+    sigma_p: torch.Tensor,             # (..., N, K) prior variances
+
+    *,
+    eps:     float = 1e-6,
+) -> torch.Tensor:                     # (..., N, K) UNCLAMPED per-coordinate KL D^(k)(q||p)
+    r"""Unclamped per-coordinate diagonal KL D^(k) = 0.5 (s_k/t_k + (mu_p - mu_q)^2/t_k - 1 + log(t_k/s_k)).
+
+    The per-coordinate analog of ``diag_kl_unclamped``: the -K of the summed form becomes -1 per
+    coordinate.  Summing over k recovers ``diag_kl_unclamped`` (no coordinate saturates the clamp).
+    """
+    sq = sigma_q.clamp(min=eps)
+    sp = sigma_p.clamp(min=eps)
+    return 0.5 * (sq / sp + ((mu_p - mu_q) ** 2) / sp - 1.0 + torch.log(sp) - torch.log(sq))
+
+
 @register_family("gaussian_diagonal")
 class DiagonalGaussian(BeliefParams):
     r"""Diagonal Gaussian: mu (..., K), sigma (..., K) variances.
@@ -260,7 +303,7 @@ class FullGaussian(BeliefParams):
 
     def entropy(self) -> torch.Tensor:
         K = self.mu.shape[-1]
-        L, _ = safe_cholesky(self.sigma, rounds=5)     # jittered, never raises on a non-PD Sigma
+        L, _ = safe_cholesky(self.sigma, rounds=5)
         return 0.5 * _logdet_chol(L) + 0.5 * K * math.log(2.0 * math.pi * math.e)
 
     def natural_gradient(
