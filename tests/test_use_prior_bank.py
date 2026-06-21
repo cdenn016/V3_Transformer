@@ -1,9 +1,9 @@
-r"""use_prior_bank=False: the linear-projection decode boundary (VFE_2.0 parity).
+r"""use_prior_bank=False: the linear-projection decode boundary.
 
 The theoretically pure default (use_prior_bank=True) decodes via the KL-to-prior readout
-(logits = -KL(q_i || pi_v)/tau_eff). VFE_2.0 also exposes a use_prior_bank=False ablation
-whose decode is a plain linear output projection mu -> logits (sigma discarded); the user
-gets better results there and wants the with/without comparison in V3 too. The encode and
+(logits = -KL(q_i || pi_v)/tau_eff). A second path, the use_prior_bank=False ablation,
+decodes via a plain linear output projection mu -> logits (sigma discarded); the user gets better
+results there and wants the with/without comparison in V3. The encode and
 the free-energy self-coupling stay on the PriorBank either way -- the toggle controls only
 the decode side. V3 realizes the projection as a raw (V, K) nn.Parameter matmul (no
 nn.Linear module), the single learned linear readout the user authorized as an exception.

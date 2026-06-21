@@ -181,8 +181,8 @@ class VFE3Config:
     kappa_beta:                'float | List[float]' = 1.0   # sharpness; list (len n_heads) -> per-head tau
    
     # lambda_beta weights the ENTIRE belief-coupling block of F -- sum_ij [ beta_ij E_ij +
-    # tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-coupling and the likelihood
-    # (VFE_2.0 'lambda_align' parity). 1.0 = the canonical/pure F (byte-identical). It scales the
+    # tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-coupling and the likelihood.
+    # 1.0 = the canonical/pure F (byte-identical). It scales the
     # POST-softmax block (NOT the energy inside the softmax), so beta = softmax(-E/tau) is unchanged
     # and the analytic kernel stays envelope-consistent with the autograd oracle.
     lambda_beta:               float = 1.0
@@ -339,8 +339,8 @@ class VFE3Config:
     # E-step MEAN trust region (default OFF = current unbounded update). When set to
     # a float, every per-iteration mean step delta_mu = e_q_mu_lr*nat_mu is clamped in sigma-whitened
     # units to at most this many standard deviations (mu_trust_mode='box' per-coord, 'ball' = 2-norm
-    # Mahalanobis ball). None reproduces the bare mu = mu - e_q_mu_lr*nat_mu bit-for-bit. V2's winning
-    # run used e_mu_q_trust=5.0, mu_trust_mode='box'.
+    # Mahalanobis ball). None reproduces the bare mu = mu - e_q_mu_lr*nat_mu bit-for-bit. A strong
+    # setting is e_mu_q_trust=5.0, mu_trust_mode='box'.
     e_mu_q_trust:              Optional[float] = None
     e_sigma_q_trust:           float = 5.0
     
@@ -449,7 +449,7 @@ class VFE3Config:
     # SEPARATE AdamW weight decay for the gauge-frame coordinate tables (phi_embed, learned
     # pos_phi_free), default 0.065. Decoupled decay on phi sets an LR-invariant frame-norm ceiling
     # (|phi*| ~ E[normalized-grad]/wd) that pulls the transport exp(phi.G) toward the identity; this
-    # knob decouples that from the belief-table weight_decay so it can be swept (set 0 for VFE_2.0's
+    # knob decouples that from the belief-table weight_decay so it can be swept (set 0 for full
     # gauge-frame protection). Inert under m_phi_natural_grad=True (phi is natural-gradient stepped,
     # AdamW decay 0 on the gauge groups regardless).
     phi_weight_decay:          float = 0.065
@@ -1262,7 +1262,7 @@ class VFE3Config:
         # decode_bias is a learned per-vocab log-unigram bias on the use_prior_bank=False LINEAR
         # decode (logits = mu_q @ W^T + b). On the prior-bank KL path the per-vocab priors
         # (mu_p, sigma_p) already carry the unigram role, so the bias is never created there; warn
-        # so a True+prior_bank pair is not silently a no-op (mirrors VFE_2.0 config.py).
+        # so a True+prior_bank pair is not silently a no-op.
         if self.decode_bias and self.use_prior_bank:
             import warnings
             warnings.warn(
@@ -1350,7 +1350,7 @@ class VFE3Config:
         _require(self.encode_mode, tuple(sorted(_ENCODERS)), "encode_mode")
         # use_prior_bank is the SINGLE decode gate. True (default, pure path): the KL-to-prior
         # readout logits = -KL(q_i || pi_v)/tau_eff over the gauge-orbit prior bank, with the
-        # covariance structure selected by decode_mode (diagonal | full). False (VFE_2.0-parity
+        # covariance structure selected by decode_mode (diagonal | full). False (the linear-decode
         # ablation): decode is a plain linear projection mu_q -> logits via a learned (V, K)
         # weight (sigma discarded) -- the one authorized neural exception (a single linear output
         # readout; see CLAUDE.md). Encode and the free-energy self-coupling stay on the PriorBank

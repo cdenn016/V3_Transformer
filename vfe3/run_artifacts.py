@@ -85,8 +85,8 @@ class RunArtifacts:
 
         NaN cells are written to the file as BLANK (empty string), so an eval-cadence column
         (val_*, generalization_gap, the held-out probes) -- NaN on the denser log-interval rows
-        between evals -- shows an empty cell rather than a repeated value or a literal "nan",
-        matching VFE_2.0's metrics.csv. The IN-MEMORY ``self.history`` keeps the raw NaN float so
+        between evals -- shows an empty cell rather than a repeated value or a literal "nan".
+        The IN-MEMORY ``self.history`` keeps the raw NaN float so
         the figure pass (which filters on ``math.isfinite``) is unaffected."""
         self.history.append(dict(row))                          # raw floats (incl. NaN) for the figure pass
         if self._fieldnames is None:

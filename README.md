@@ -10,8 +10,8 @@ flows backward through the unrolled belief inference. The theory is developed in
 `Manuscripts-Theory/` (`GL(K)_attention.tex`, `GL(K)_supplementary.tex`,
 `Participatory_it_from_bit.tex`); design and audit notes live under `docs/`.
 
-The codebase is built bottom-up with every kernel numerically pinned to the earlier
-VFE_2.0 reference by golden tests, and every modeling choice sits behind a
+The codebase is built bottom-up with every kernel numerically pinned by its own
+golden regression tests, and every modeling choice sits behind a
 config-selected registry so that variants slot in by registration rather than by editing
 call sites.
 
@@ -239,7 +239,7 @@ not be read as part of the live default model.
 
 The sanctioned neural-network exceptions, each a single learnable parameter rather than a
 network and each byte-identical to the pure path at initialization, are: a linear output
-projection that replaces the KL decode (`use_prior_bank=False`, the VFE_2.0-parity
+projection that replaces the KL decode (`use_prior_bank=False`, the linear-decode
 ablation); a learned Schur-commutant head mixer (`use_head_mixer=True`); a learned bilinear
 edge connection for non-flat Regime-II transport (`transport_mode='regime_ii'`); a learned
 scalar self-coupling (`lambda_alpha_mode='learnable'`); a learned belief-coupling weight
@@ -266,6 +266,6 @@ for variable names (`mu_q`, `sigma_q`, `alpha`, `kappa`, `tau`). It is float32 t
 with CUDA where applicable, and there is no CLI argument parsing: entry points are
 click-to-run, so you edit a config dict and run. Tests are device-agnostic (CPU by
 default; set `VFE3_TEST_DEVICE=cuda` for the GPU) and include golden-equivalence checks
-against the pinned VFE_2.0 reference, finite-difference gradient checks against the
+against their pinned reference values, finite-difference gradient checks against the
 autograd-of-`F` oracle, and property tests for non-negativity, self-divergence-zero, and
 gauge equivariance.

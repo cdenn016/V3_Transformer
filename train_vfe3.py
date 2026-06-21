@@ -1,6 +1,6 @@
 r"""Click-to-run training entry for the VFE_3.0 transformer.
 
-Mirrors VFE_2.0 ``train_vfe.py``: edit the ``config`` dict below, pick a ``DATASET``,
+Edit the ``config`` dict below, pick a ``DATASET``,
 then run ``python train_vfe3.py``. There is no CLI arg parsing.
 
 The ``config`` dict exposes the commonly-tuned ``VFE3Config`` toggles, grouped exactly as
@@ -105,7 +105,7 @@ config = dict(
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
     
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
-                                                     # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
+                                                     # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.008,
     decode_precision_scaled   = False,               # use_prior_bank=False only: feed the precision-weighted mean
                                                      # eta=mu/sigma (natural param) to the linear head so Sigma enters

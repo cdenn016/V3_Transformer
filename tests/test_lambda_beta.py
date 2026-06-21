@@ -1,4 +1,4 @@
-r"""Tests for lambda_beta: the belief-coupling weight (VFE_2.0 'lambda_align' parity).
+r"""Tests for lambda_beta: the belief-coupling weight.
 
 lambda_beta scales the WHOLE belief-coupling block of F -- sum_ij [ beta_ij E_ij +
 tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-term. The correctness

@@ -101,7 +101,7 @@ def build_optimizer(
         groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_p_mu_lr, "role": "mu"})
     if pb.output_proj_bias is not None:                         # decode_bias: learned log-unigram prior
         # weight_decay=0 -- decaying a unigram prior toward zero biases it to a flat distribution
-        # (the same protection phi/Omega carry). VFE_2.0 parity: trainer.py m_decode_nodecay group.
+        # (the same protection phi/Omega carry).
         groups.append({"params": [pb.output_proj_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
     if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
         groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_p_mu_lr, "role": "mu"})
@@ -592,7 +592,7 @@ def train(
     With ``log_interval`` falsy (``None`` or ``0``) and ``eval_interval`` falsy the loop
     is bitwise-identical to the silent path: the two truthiness-guarded blocks
     short-circuit, drawing no RNG, running no extra forward, and printing nothing. When
-    ``log_interval`` is positive a VFE_2.0-style per-step line is emitted every
+    ``log_interval`` is positive a per-step line is emitted every
     ``log_interval`` steps (CE and diagnostics recomputed under ``no_grad`` only at those
     steps, off the training graph), AND -- when ``tqdm`` is installed -- the step loop runs
     under a ``tqdm`` progress bar whose built-in rate readout shows live ``it/s`` every step
@@ -771,7 +771,7 @@ def train(
         # generalization_gap, and the held-out val_*/estep_*/pos_loss_* probes) carry a value ONLY on a
         # step where the eval above just ran (do_eval); on the denser log-interval rows in between they
         # are NaN, which log_metrics renders as a BLANK cell -- so each validation appears exactly once
-        # per eval_interval, not carried forward to every log line (matching VFE_2.0's metrics.csv). The
+        # per eval_interval, not carried forward to every log line. The
         # in-memory history keeps the NaN (figures already drop non-finite rows). The four F-stack
         # diagnostics are per-sequence SUMS over seq 0, normalized to PER TOKEN so they are
         # commensurate with val_ce, a token-weighted mean (nats/token; see audit-2026-06-05 Finding 2).
@@ -940,7 +940,7 @@ def _banner(
     n_steps:     int,
     train_loader: object = None,
 ) -> str:
-    r"""Compact VFE_2.0-style init banner (no FLOPs counter; lambda_h is omitted from the printed lines)."""
+    r"""Compact init banner (no FLOPs counter; lambda_h is omitted from the printed lines)."""
     n_params = sum(p.numel() for p in model.parameters())
     bar = "=" * 64
     cov = coverage_lines(train_loader, n_steps, dataset) if train_loader is not None else []

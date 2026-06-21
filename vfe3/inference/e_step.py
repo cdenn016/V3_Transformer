@@ -316,7 +316,7 @@ def phi_alignment_loss(
     Both roles of phi flow (Omega_ij depends on phi_i and phi_j); autograd gives the envelope
     phi-gradient. ``lambda_beta`` (1.0 = pure) scales the coupling block but NOT the ``mass_phi``
     penalty, so the effective phi step is e_phi_lr * lambda_beta * nabla (lambda_beta and e_phi_lr
-    interact; VFE_2.0 parity). The ``mass_phi`` term makes the phi E-step descend the PENALIZED
+    interact). The ``mass_phi`` term makes the phi E-step descend the PENALIZED
     objective during inference (distinct from the outer M-step ||phi||^2 on the learned prior
     table). The canonical (entropy) branch reuses ``reduced_free_energy``, the -tau log Z envelope
     form.
@@ -506,7 +506,7 @@ def e_step_iteration(
         nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
 
     delta_mu = e_q_mu_lr * nat_mu
-    # E-step MEAN trust region (VFE_2.0 parity, default OFF). When e_mu_q_trust is set, bound the
+    # E-step MEAN trust region (default OFF). When e_mu_q_trust is set, bound the
     # per-iteration mean step in sigma-whitened units before the additive update; None reproduces the
     # bare mu = belief.mu - e_q_mu_lr*nat_mu bit-for-bit. is_diagonal mirrors the SPD-retraction rank
     # rule below (full cov iff sigma.dim() == mu.dim() + 1).

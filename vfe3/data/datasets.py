@@ -110,7 +110,7 @@ def tokens_per_char(
     languages (gpt2 vs cl100k; English vs Japanese/Arabic, where a token spans ~3 codepoints).
     Computed by decoding the split's cached token stream once with its OWN tokenizer (matching the
     cache via :func:`get_tiktoken_decoder`) and counting Unicode codepoints ``len(text)`` -- the
-    SAME denominator VFE_2.0 uses (``n_chars = len(text)``). Returns None when the dataset has no
+    character denominator ``n_chars = len(text)``. Returns None when the dataset has no
     real tokenizer (the synthetic anchor), tiktoken is absent, or the cache is missing; the caller
     then leaves ``tokens_per_char = 1.0`` (honest bits-per-token, labelled as such). Memoized per
     (dataset, split, cache_dir) -- intended for the SMALL val/test splits that are scored, a single
