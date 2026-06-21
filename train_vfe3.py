@@ -116,6 +116,11 @@ config = dict(
     #################################
     #          Gauge Group
     #################################
+    gauge_transport           = "on",         # gauge-frame ABLATION (A1/EXP-2): "on" (pure, learned frame)
+                                              #   | "off" (Omega=I exactly: forces phi_scale=0, pos_phi='none',
+                                              #     e_phi_lr=m_phi_lr=0; needs transport_mode='flat' + pos_rotation='none')
+                                              #   | "frozen" (random fixed frame: e_phi_lr=m_phi_lr=0, phi_scale kept).
+                                              #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
     
     m_phi_natural_grad        = False,        # natural gradient on phi m-step

@@ -22,6 +22,7 @@ _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_PRIOR_SOURCES       = ("token", "model_channel")
 _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
+_VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
 
 
 @dataclass
@@ -62,7 +63,20 @@ class VFE3Config:
     # gauge seam
     gauge_group:               str   = "block_glk"
     gauge_parameterization:    str   = "phi"
-    
+
+    # gauge_transport: ablation meta-toggle over the GL(K) gauge FRAME (the A1 / EXP-2 gauge on/off/
+    # frozen experiment; docs/hypotheses/2026-06-21-hypotheses.md). DISTINCT from transport_mode below
+    # (flat vs the Regime-II connection): transport_mode decides the connection's flatness, this decides
+    # whether the per-token frame exists/learns at all. 'on' (default, PURE PATH): the frame is whatever
+    # phi_scale / e_phi_lr / m_phi_lr / pos_phi specify (learned when m_phi_lr>0) -- byte-identical to
+    # omitting this toggle. 'off': forces Omega_ij = exp(phi_i) exp(-phi_j) = I EXACTLY by coercing
+    # phi_scale=0.0, pos_phi='none', e_phi_lr=0.0, m_phi_lr=0.0 (and REQUIRING pos_rotation='none' +
+    # transport_mode='flat', else Omega != I -- raises). 'frozen': a RANDOM but FIXED frame (keeps the
+    # set phi_scale>0, coerces e_phi_lr=0.0, m_phi_lr=0.0). __post_init__ applies the coercion and warns.
+    # NB the 'off' cell drops the pos_phi_free table (pos_phi='none'), so to match parameter counts
+    # against an 'on' baseline set pos_phi='none' in 'on' too, or compare against the equal-param 'frozen'.
+    gauge_transport:           str   = "on"          # "on" (pure, learned) | "off" (Omega=I) | "frozen" (random fixed)
+
     # Connection REGIME (registry key): the flat Regime-I phi-cocycle ('flat', default = the pure
     # NO-NN path) vs the non-flat Regime II ('regime_ii'). ORTHOGONAL to gauge_parameterization,
     # which picks how a single flat transport is parameterized; this picks whether the connection is
@@ -525,6 +539,48 @@ class VFE3Config:
             raise ValueError(f"eps must be positive, got {self.eps}")
         if self.kl_max <= 0.0:
             raise ValueError(f"kl_max must be positive, got {self.kl_max}")
+
+        # gauge_transport ablation meta-toggle (A1 / EXP-2). Coerce the gauge-frame fields UP FRONT so
+        # every downstream validation and the optimizer/table wiring see the resolved state. 'on' is a
+        # no-op (the pure learned-frame path). 'off' forces Omega_ij = I; 'frozen' freezes a random frame.
+        _require(self.gauge_transport, _VALID_GAUGE_TRANSPORT, "gauge_transport")
+        if self.gauge_transport == "off":
+            # Omega = exp(phi_i) exp(-phi_j) = I needs a ZERO frame AND no other transport modifier, so
+            # the two non-flat transport layers must also be off (else Omega != I and the cell is mislabeled).
+            if self.pos_rotation != "none":
+                raise ValueError(
+                    f"gauge_transport='off' requires Omega=I, but pos_rotation={self.pos_rotation!r} folds "
+                    f"a positional rotation into the transport. Set pos_rotation='none'."
+                )
+            if self.transport_mode != "flat":
+                raise ValueError(
+                    f"gauge_transport='off' requires Omega=I, but transport_mode={self.transport_mode!r} "
+                    f"adds a non-flat connection edge factor. Set transport_mode='flat'."
+                )
+            self.phi_scale = 0.0
+            self.pos_phi   = "none"
+            self.e_phi_lr  = 0.0
+            self.m_phi_lr  = 0.0
+            import warnings
+            warnings.warn(
+                "gauge_transport='off': forcing the gauge frame to the identity (phi_scale=0.0, "
+                "pos_phi='none', e_phi_lr=0.0, m_phi_lr=0.0), so Omega_ij=I for all i,j.",
+                UserWarning, stacklevel=2,
+            )
+        elif self.gauge_transport == "frozen":
+            if self.phi_scale <= 0.0:
+                raise ValueError(
+                    f"gauge_transport='frozen' needs a nonzero random frame (phi_scale>0), got "
+                    f"phi_scale={self.phi_scale}; use gauge_transport='off' for the identity frame."
+                )
+            self.e_phi_lr = 0.0
+            self.m_phi_lr = 0.0
+            import warnings
+            warnings.warn(
+                f"gauge_transport='frozen': freezing the random gauge frame at init "
+                f"(phi_scale={self.phi_scale}, e_phi_lr=0.0, m_phi_lr=0.0); Omega is fixed, not learned.",
+                UserWarning, stacklevel=2,
+            )
 
         # divergence seam: divergence_family is the FUNCTIONAL (f-divergence) registry key
         # (renyi, squared_hellinger, ...), distinct from `family` (the covariance-structure
