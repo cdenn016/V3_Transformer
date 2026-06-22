@@ -7,8 +7,9 @@ iteratively minimizing a variational free energy `F` over a per-token Gaussian b
 tuple `(mu, Sigma, phi)`, and the only learnable objects are the prior tables in the
 `PriorBank`. Backpropagation is still used, but only to learn those priors: the loss
 flows backward through the unrolled belief inference. The theory is developed in
-`Manuscripts-Theory/` (`GL(K)_attention.tex`, `GL(K)_supplementary.tex`,
-`Participatory_it_from_bit.tex`); design and audit notes live under `docs/`.
+`Manuscripts-Theory/` (`GL(K)_attention.tex`, `GL(K)_supplementary.tex`, `PIFB.tex`), which
+mirrors the canonical copies in the shared `Research/manuscripts/` vault. Design and audit
+notes live under `docs/`.
 
 The codebase is built bottom-up with every kernel numerically pinned by its own
 golden regression tests, and every modeling choice sits behind a

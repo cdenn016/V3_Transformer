@@ -91,7 +91,7 @@ F = alpha * KL(q_i || p_i)                                          # self-coupl
              + tau * gamma_ij * log(gamma_ij / pi^(s)_ij) ]         # model coupling + meta entropy
   - E_q[log p(o | x)]                                               # observation likelihood
 ```
-tau = kappa * sqrt(K) is the effective softmax temperature. The tau * beta_ij * log(beta_ij/pi_ij) term is the attention-distribution entropy with uniform prior pi_ij = 1/N; it is required for the softmax β to be a stationary point of F (without it the row-Lagrangian gives a delta, not softmax). The canonical F vs "entropy-suppressed surrogate" sum β KL distinction is made explicitly in Attention/GL(K)_attention.tex  (the surrogate is acknowledged again in Attention/GL(K)_supplementary.tex ) — their gradients differ by -tau^{-1} Cov_β(KL, ∇KL). See participatory_it_from_bit.tex for the FULL GENERAL theory
+tau = kappa * sqrt(K) is the effective softmax temperature. The tau * beta_ij * log(beta_ij/pi_ij) term is the attention-distribution entropy with uniform prior pi_ij = 1/N; it is required for the softmax β to be a stationary point of F (without it the row-Lagrangian gives a delta, not softmax). The canonical F vs "entropy-suppressed surrogate" sum β KL distinction is made explicitly in Manuscripts-Theory/GL(K)_attention.tex  (the surrogate is acknowledged again in Manuscripts-Theory/GL(K)_supplementary.tex ) — their gradients differ by -tau^{-1} Cov_β(KL, ∇KL). See Manuscripts-Theory/PIFB.tex for the FULL GENERAL theory
 
 ## Communication
 
