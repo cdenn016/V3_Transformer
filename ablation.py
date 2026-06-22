@@ -68,7 +68,7 @@ from vfe3.metrics import (
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.train import coverage_lines, evaluate, train
-from vfe3.viz.extract import across_layer_belief_trace, converged_state
+from vfe3.viz.extract import across_layer_belief_trace, attention_entropy_cov_gap, converged_state
 
 logger = logging.getLogger("ablation")
 
@@ -452,11 +452,18 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # oracle route (oracle_unroll_grad=True) -- this isolates the -tau^{-1} Cov_beta term from the
         # kernel-vs-oracle route. __post_init__ does NOT auto-enable the oracle for entropy=False, so
         # the surrogate arm must set it explicitly.
-        "description": "attention-entropy term canonical (on) vs surrogate (off), both on the oracle [C1/EXP-4]",
+        # 2x2 entropy x kappa: the companion low-kappa arm (kappa_beta=0.25) guards against a sharp-
+        # attention null -- Cov_beta scales with attention diffuseness, so a gap that vanishes at the
+        # baseline kappa=1 may still bite at low kappa. cov_gap (the -tau^{-1} Cov_beta magnitude) is
+        # collected per cell. Both arms force oracle_unroll_grad=True (the kernel never computes the
+        # entropy term; __post_init__ does not auto-enable the oracle for entropy=False).
+        "description": "attention-entropy canonical vs surrogate, kappa in {1.0, 0.25}, on the oracle [C1/EXP-4]",
         "collect_diagnostics": True,
         "configs": [
-            {"label": "canon_oracle", "include_attention_entropy": True,  "oracle_unroll_grad": True},
-            {"label": "surrogate",    "include_attention_entropy": False, "oracle_unroll_grad": True},
+            {"label": "canon_k1.0",  "include_attention_entropy": True,  "oracle_unroll_grad": True, "kappa_beta": 1.0},
+            {"label": "surr_k1.0",   "include_attention_entropy": False, "oracle_unroll_grad": True, "kappa_beta": 1.0},
+            {"label": "canon_k0.25", "include_attention_entropy": True,  "oracle_unroll_grad": True, "kappa_beta": 0.25},
+            {"label": "surr_k0.25",  "include_attention_entropy": False, "oracle_unroll_grad": True, "kappa_beta": 0.25},
         ],
     },
 
@@ -777,6 +784,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "split_1.2_0.8", "kappa_beta": [1.2, 0.8]},
             {"label": "split_0.6_1.4", "kappa_beta": [0.6, 1.4]},
             {"label": "split_1.4_0.6", "kappa_beta": [1.4, 0.6]},
+            # geo-mean-tau confound controls (B11-a/EXP-11): tied arms whose scalar kappa equals the
+            # GEOMETRIC mean of a dispersed pair, isolating per-head ASYMMETRY from the geo-mean tau
+            # shift the arithmetic-mean-1.0 dispersed arms carry. sqrt(0.8*1.2)=0.97980,
+            # sqrt(0.6*1.4)=0.91652. They sit at dispersion 0 on the dispersion-vs-PPL figure.
+            {"label": "geomean_0.8_1.2", "kappa_beta": [0.97980, 0.97980]},
+            {"label": "geomean_0.6_1.4", "kappa_beta": [0.91652, 0.91652]},
         ],
     },
    
@@ -1229,6 +1242,13 @@ def _cell_diagnostics(
         out["rank_resid_by_layer"] = [float(x) for x in curve]
     except Exception as exc:
         logger.warning("  [diagnostics: rank_resid_by_layer skipped] %s", exc)
+
+    # -tau^{-1} Cov_beta(E, dE) attention-entropy gradient gap (C1/EXP-4): the magnitude of the
+    # belief gradient the canonical entropy term adds over the surrogate, on the converged belief.
+    # Gated to L=1: the extractor builds the single-block operating point, so it would report a
+    # misleading layer-1 value on the L>1 cells of other sweeps (gauge_transport L2, rho_handoff L4).
+    if cfg.n_layers == 1:
+        _probe("cov_gap", lambda: attention_entropy_cov_gap(model, token_ids)["cov_gap"])
     return out
 
 
@@ -1345,7 +1365,7 @@ _CSV_COLUMNS = [
     "n_params",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
-    "rank_resid",
+    "rank_resid", "cov_gap",
     "wall_time_s", "seed", "error",
 ]
 
@@ -1674,6 +1694,206 @@ def _plot_rank_collapse(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
+def _plot_attention_entropy(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""Write the C1/EXP-4 figures -- the canonical-vs-surrogate PPL gap (grouped by kappa) and the
+    -tau^{-1} Cov_beta gradient-gap magnitude vs kappa -- from the per-cell ``include_attention_entropy``
+    / ``kappa_beta`` overrides and the ``cov_gap`` diagnostic. A no-op unless >= 2 finished cells carry
+    an ``include_attention_entropy`` override, so it is safe to call after every sweep (only the
+    attention_entropy sweep produces these)."""
+    cells_ppl, cells_gap = [], []
+    for r in _collect_sweep_results(sweep_dir):
+        ov = r.get("overrides", {}) or {}
+        if "include_attention_entropy" not in ov or _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        kap = _as_float(ov.get("kappa_beta", BASELINE_CONFIG.get("kappa_beta")))
+        if kap >= float("inf"):                                  # non-scalar kappa (per-head list) -> skip
+            continue
+        ent = bool(ov["include_attention_entropy"])
+        cells_ppl.append({"include_attention_entropy": ent, "kappa": kap,
+                          "ppl": _as_float(r.get("primary_val_ppl"))})
+        if _as_float(r.get("cov_gap")) < float("inf"):
+            cells_gap.append({"include_attention_entropy": ent, "kappa": kap,
+                              "cov_gap": _as_float(r.get("cov_gap"))})
+    if len(cells_ppl) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_cov_gap_vs_kappa, plot_entropy_ppl_gap
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"attention-entropy figures unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_ppl_gap.png"
+    plt.close(plot_entropy_ppl_gap(cells_ppl, path=str(out)))
+    print(f"  figure -> {out}")
+    if len(cells_gap) >= 2:
+        out = fig_dir / f"{sweep_dir.name}_cov_gap.png"
+        plt.close(plot_cov_gap_vs_kappa(cells_gap, path=str(out)))
+        print(f"  figure -> {out}")
+
+
+def _plot_wallclock_convergence(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""Write ``figures/<sweep>_wallclock_convergence.png`` -- the D1/EXP-8 per-wall-clock convergence
+    overlay (val PPL vs cumulative wall time, one line per arm, with steps/wall-to-target annotated) --
+    from each cell's ``metrics.csv`` eval rows (val_ppl + wall_clock_s). A no-op unless >= 2 cells carry
+    >= 2 eval points, so it is safe to call after every sweep (the gauge M-step sweeps populate it)."""
+    arms: List[Dict[str, Any]] = []
+    for cell in sorted(sweep_dir.glob("*/metrics.csv")):
+        steps, ppls, walls = [], [], []
+        try:
+            with open(cell, newline="", encoding="utf-8") as fh:
+                for r in csv.DictReader(fh):
+                    vp, wc = _as_float(r.get("val_ppl")), _as_float(r.get("wall_clock_s"))
+                    if vp < float("inf") and wc < float("inf"):     # eval rows carry both
+                        steps.append(_as_float(r.get("step")))
+                        ppls.append(vp)
+                        walls.append(wc)
+        except Exception:                                           # unreadable metrics.csv -> skip cell
+            continue
+        if len(ppls) >= 2:
+            arms.append({"label": cell.parent.name, "step": steps, "val_ppl": ppls, "wall_clock_s": walls})
+    if len(arms) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_wallclock_convergence
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"wallclock-convergence figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_wallclock_convergence.png"
+    plt.close(plot_wallclock_convergence(arms, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_gauge_transport(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""A1/EXP-2 gauge ON/frozen/OFF(Omega=I) grouped-bar (val PPL by depth, omega_identity_dev
+    annotated) from the gauge_transport cells. No-op unless >= 2 cells label as <mode>_<depth> with
+    mode in {on,off,frozen}."""
+    cells: List[Dict[str, Any]] = []
+    for r in _collect_sweep_results(sweep_dir):
+        parts = str(r.get("label", "")).split("_")
+        if len(parts) != 2 or parts[0] not in ("on", "off", "frozen"):
+            continue
+        if _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        cells.append({"mode": parts[0], "depth": parts[1],
+                      "ppl": _as_float(r.get("primary_val_ppl")),
+                      "omega_dev": _as_float(r.get("omega_identity_dev"))})
+    if len(cells) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_gauge_transport_bars
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"gauge-transport figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_gauge_bars.png"
+    plt.close(plot_gauge_transport_bars(cells, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_cg_coupling(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""A3/EXP-10 combined PPL + median equivariance-residual bar from the cg_coupling cells (gated on
+    the use_cg_coupling override). No-op unless >= 2 such cells finished."""
+    cells: List[Dict[str, Any]] = []
+    for r in _collect_sweep_results(sweep_dir):
+        ov = r.get("overrides", {}) or {}
+        if "use_cg_coupling" not in ov or _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        cells.append({"label": str(r.get("label", "")), "ppl": _as_float(r.get("primary_val_ppl")),
+                      "resid": _as_float(r.get("gauge_resid_in"))})
+    if len(cells) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_ppl_equivariance_bars
+    except Exception as exc:
+        print(f"cg-coupling figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_ppl_equiv.png"
+    plt.close(plot_ppl_equivariance_bars(cells, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_kappa_dispersion(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""H2/EXP-11 PPL vs per-head temperature dispersion std(kappa_beta), read from each cell's
+    kappa_beta LIST override (the scalar-kappa sweeps carry no list -> skipped). No-op unless >= 2
+    list-valued cells finished."""
+    cells: List[Dict[str, Any]] = []
+    for r in _collect_sweep_results(sweep_dir):
+        kb = (r.get("overrides", {}) or {}).get("kappa_beta")
+        if not isinstance(kb, (list, tuple)) or len(kb) < 2:
+            continue
+        if _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        try:
+            vals = [float(x) for x in kb]
+        except (TypeError, ValueError):
+            continue
+        m = sum(vals) / len(vals)
+        disp = (sum((x - m) ** 2 for x in vals) / len(vals)) ** 0.5      # population std of the kappa list
+        cells.append({"label": str(r.get("label", "")), "dispersion": disp,
+                      "ppl": _as_float(r.get("primary_val_ppl"))})
+    if len(cells) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_kappa_dispersion
+    except Exception as exc:
+        print(f"kappa-dispersion figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_kappa_dispersion.png"
+    plt.close(plot_kappa_dispersion(cells, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_gauge_residual_drift(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""A2/EXP-9 builder-break gauge residual vs step (tied vs untied) from each cell's metrics.csv
+    ``val_builder_resid`` eval series. No-op unless >= 2 cells carry >= 2 eval points."""
+    arms: List[Dict[str, Any]] = []
+    for cell in sorted(sweep_dir.glob("*/metrics.csv")):
+        steps, res = [], []
+        try:
+            with open(cell, newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    rv = _as_float(row.get("val_builder_resid"))
+                    if rv < float("inf"):                              # eval rows carry the residual
+                        steps.append(_as_float(row.get("step")))
+                        res.append(rv)
+        except Exception:                                             # unreadable metrics.csv -> skip
+            continue
+        if len(res) >= 2:
+            arms.append({"label": cell.parent.name, "step": steps, "resid": res})
+    if len(arms) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_gauge_residual_drift
+    except Exception as exc:
+        print(f"gauge-residual-drift figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_residual_drift.png"
+    plt.close(plot_gauge_residual_drift(arms, path=str(out)))
+    print(f"  figure -> {out}")
+
+
 def _plot_sensitivity(output_dir: Path, fig_dir: Path) -> None:
     r"""Cross-sweep comparison: a PPL-range (worst - best) bar per sweep, sorted by sensitivity.
 
@@ -1761,6 +1981,12 @@ def main() -> None:
         analyze_sweep(sweep_dir)                             # this sweep's table (accumulated)
         _plot_one_sweep(sweep_dir, fig_dir)                 # this sweep's PPL figure (tacked on)
         _plot_rank_collapse(sweep_dir, fig_dir)            # F2/EXP-7 r(X)-by-depth (no-op if absent)
+        _plot_attention_entropy(sweep_dir, fig_dir)        # C1/EXP-4 PPL-gap + Cov-gap (no-op if absent)
+        _plot_wallclock_convergence(sweep_dir, fig_dir)    # D1/EXP-8 wall-clock convergence (no-op if absent)
+        _plot_gauge_transport(sweep_dir, fig_dir)          # A1/EXP-2 gauge on/off/frozen bars (no-op if absent)
+        _plot_cg_coupling(sweep_dir, fig_dir)              # A3/EXP-10 PPL+equivariance bars (no-op if absent)
+        _plot_kappa_dispersion(sweep_dir, fig_dir)         # H2/EXP-11 kappa dispersion (no-op if absent)
+        _plot_gauge_residual_drift(sweep_dir, fig_dir)     # A2/EXP-9 residual drift (no-op if absent)
 
     # ---- after all sweeps: the cross-sweep comparison ----
     _plot_sensitivity(output_dir, fig_dir)

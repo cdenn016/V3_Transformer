@@ -475,6 +475,7 @@ _VAL_DIAG_KEYS = (
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
     "estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
     "estep_r_phi_last", "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
+    "val_builder_resid",
 )
 
 
@@ -557,6 +558,19 @@ def _val_diagnostics(
             out["pos_loss_first_q"] = float(pos_ce[:q].mean())
             out["pos_loss_last_q"]  = float(pos_ce[-q:].mean())
             out["pos_loss_ratio"]   = float(pos_ce[-q:].mean() / pos_ce[:q].mean().clamp(min=1e-9))
+
+    # Builder-break gauge-equivariance residual per eval (A2/EXP-9): the head-mixer congruence defect
+    # at the converged belief (~eps under the tied gauge; climbs as the untied block_glk mixer drifts
+    # from identity -> the residual-drift-vs-step series). Only with a head mixer; isolated so a replay
+    # fault drops just this scalar (NaN-rectangular), not the whole val-diag row.
+    if model.head_mixer is not None:
+        try:
+            cst = ex.converged_state(model, val_tok)
+            br = M.head_mixer_gauge_residual(cst["mu"], cst["sigma"], model.head_mixer, model.group,
+                                             diagonal=model.cfg.diagonal_covariance)
+            out["val_builder_resid"] = float(torch.cat([br["mu_residual"], br["sigma_residual"]]).median())
+        except Exception:                                          # leave NaN; never fail the eval
+            pass
     return out
 
 
@@ -665,6 +679,7 @@ def train(
 
     it = iter(loader)
     win_t0 = time.perf_counter()
+    train_t0 = win_t0                                 # cumulative wall-clock origin (D1/EXP-8; resets on resume)
     win_i0 = start_step
     last_val: Dict[str, float] = {}                  # most recent validation, carried into each CSV row
     last_val_diag: Dict[str, float] = {k: float("nan") for k in _VAL_DIAG_KEYS}   # held-out probes, carried forward
@@ -682,6 +697,8 @@ def train(
         # Capture pre-clip gradient health only on a step that will log or persist, so the silent
         # hot path stays byte-identical (metrics_out=None -> no extra unscale_, no grad-norm pass).
         step_metrics: Optional[Dict[str, float]] = {} if (do_log or do_csv) else None
+        if hasattr(optimizer, "_collect_gauge_diag"):        # D1/EXP-8: gate the gauge M-step diagnostics
+            optimizer._collect_gauge_diag = bool(do_log or do_csv)   # to log/eval steps (silent path unchanged)
         losses.append(train_step(model, optimizer, scheduler, tokens, targets,
                                   grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
                                   scaler=scaler, metrics_out=step_metrics))
@@ -802,6 +819,9 @@ def train(
             # Throughput + peak memory (Tier-1): tokens/s over the window and CUDA peak MB.
             row["tokens_per_s"] = toks_per_s
             row["peak_mem_mb"]  = peak_mem_mb
+            # Cumulative wall time since training start (D1/EXP-8): the x-axis of the per-wall-clock
+            # convergence curve (val_ppl vs wall_clock_s). 'now' is the window timestamp captured above.
+            row["wall_clock_s"] = now - train_t0
             # Generalization gap (Tier-1): val-set CE minus the per-step train CE (positive = overfit,
             # the standard convention). The train side is seq-0 (diagnostics runs on seq 0) while val is
             # the token-weighted val-set mean, so read it as a TREND, not an absolute. Eval-cadence like
@@ -840,6 +860,19 @@ def train(
                             "loss_finite", "grad_scale", "grad_accum_tok_spread"):
                     if _gk in step_metrics:
                         row[_gk] = step_metrics[_gk]
+            # Gauge M-step geometry diagnostics (D1/EXP-8): cos(nat,grad) and the pullback metric
+            # condition number, stashed by GaugeNaturalGradAdamW on this (log/eval) step. Written with a
+            # FIXED key set per run (NaN default, like the _VAL_DIAG_KEYS block below) so the columns are
+            # defined from the FIRST logged row regardless of active-rows timing -- log_metrics locks
+            # fieldnames on row 0, so a key first appearing later would break the CSV. cos_nat_phi for any
+            # natural-grad gauge run; pullback_cond_* only on the pullback modes (config-fixed per run);
+            # plain AdamW has no _gauge_diag attr, so its columns are absent and that CSV stays rectangular.
+            if hasattr(optimizer, "_gauge_diag"):
+                _gd = optimizer._gauge_diag or {}
+                row["cos_nat_phi"] = _gd.get("cos_nat_phi", float("nan"))
+                if getattr(optimizer, "_precond_mode", "") in ("pullback", "pullback_per_block"):
+                    row["pullback_cond_median"] = _gd.get("pullback_cond_median", float("nan"))
+                    row["pullback_cond_max"]    = _gd.get("pullback_cond_max", float("nan"))
             # Held-out per-eval probes (Tier-2): the full fixed val-diag column set. Eval-cadence like
             # val_ce above -- the fresh probe values on an eval row, NaN (rendered blank) on the
             # log-interval rows in between, NOT carried forward. The key set is identical in both

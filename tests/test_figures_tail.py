@@ -1,0 +1,177 @@
+r"""Tests for the 2026-06-22 figures-tail build-out (EXP-1/2/6/9/10/11 auto-dispatched figures):
+
+  * the six new registered figures render from synthetic inputs;
+  * the EXP-11 kappa_beta_per_head sweep carries the geo-mean-tau confound-control arms;
+  * scaling_analysis.aggregate_points carries embed_dim + test PPL (the EXP-6 muP K axis);
+  * train() logs the EXP-9 builder-break residual per eval (val_builder_resid) under a head mixer;
+  * the EXP-2 / EXP-11 ablation drivers read per-cell JSON and emit a PNG (no-op safe).
+
+Device-agnostic (CPU). Figures use the Agg backend.
+"""
+import csv as _csv
+import json
+import os
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import torch
+
+import ablation
+import scaling_analysis
+from vfe3.config import VFE3Config
+from vfe3.model.model import VFEModel
+from vfe3.run_artifacts import RunArtifacts
+from vfe3.train import train
+from vfe3.viz import figures as figs
+
+DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
+
+
+# --------------------------------------------------------------------------- figure renders
+
+def test_gauge_transport_bars_renders():
+    cells = [{"mode": m, "depth": d, "ppl": 30.0 + i,
+              "omega_dev": (1e-7 if m == "off" else float("nan"))}
+             for i, (m, d) in enumerate([(m, d) for d in ("L1", "L2") for m in ("on", "frozen", "off")])]
+    fig = figs.plot_gauge_transport_bars(cells); assert fig is not None; plt.close(fig)
+
+
+def test_gauge_residual_drift_renders():
+    arms = [{"label": "tied", "step": [10, 20, 30], "resid": [1e-7, 1e-7, 1e-7]},
+            {"label": "untied", "step": [10, 20, 30], "resid": [1e-7, 1e-3, 1e-1]}]
+    fig = figs.plot_gauge_residual_drift(arms); assert fig is not None; plt.close(fig)
+
+
+def test_ppl_equivariance_bars_renders():
+    cells = [{"label": "cg_off", "ppl": 31.0, "resid": 1e-7},
+             {"label": "cg_on", "ppl": 29.5, "resid": 1e-7}]
+    fig = figs.plot_ppl_equivariance_bars(cells); assert fig is not None; plt.close(fig)
+
+
+def test_kappa_dispersion_renders():
+    cells = [{"label": "uniform", "dispersion": 0.0, "ppl": 30.0},
+             {"label": "split", "dispersion": 0.2, "ppl": 30.5}]
+    fig = figs.plot_kappa_dispersion(cells); assert fig is not None; plt.close(fig)
+
+
+def test_kmup_stability_renders():
+    routes = {"grow_K": [{"embed_dim": k, "ppl_mean": 100.0 / k + 5, "ppl_sem": 0.5}
+                         for k in (20, 40, 80, 120)],
+              "grow_K_mup": [{"embed_dim": k, "ppl_mean": 90.0 / k + 5, "ppl_sem": 0.4}
+                            for k in (20, 40, 80, 120)]}
+    fig = figs.plot_kmup_stability(routes); assert fig is not None; plt.close(fig)
+
+
+def test_ppl_noise_band_renders():
+    agg = {"values": [20.1, 20.4, 19.8, 20.2, 20.0], "seeds": [6, 23, 54, 66, 122],
+           "mean": 20.1, "sd": 0.22}
+    fig = figs.plot_ppl_noise_band(agg, grid={"lr=0.01": 20.3, "lr=0.02": 19.9})
+    assert fig is not None; plt.close(fig)
+
+
+# --------------------------------------------------------------------------- EXP-11 arms
+
+def test_kappa_per_head_has_geomean_baseline_arms():
+    runs = dict(ablation.make_run_overrides("kappa_beta_per_head"))
+    assert "geomean_0.8_1.2" in runs and "geomean_0.6_1.4" in runs
+    assert runs["geomean_0.8_1.2"]["kappa_beta"] == [0.97980, 0.97980]
+    for lab in ("geomean_0.8_1.2", "geomean_0.6_1.4"):
+        cfg_dict = ablation._cell_cfg_dict({**runs[lab], "vocab_size": 48, "max_seq_len": 16},
+                                           seed=0, max_steps=1)
+        assert VFEModel(VFE3Config(**cfg_dict)) is not None
+
+
+# --------------------------------------------------------------------------- EXP-6 aggregation
+
+def test_aggregate_points_carries_embed_dim_and_ppl():
+    rows = [{"route": "grow_K", "scale_knob": "embed_dim", "label": "K20", "seed": 0,
+             "n_params": 1000, "embed_dim": 20, "n_gen": 6, "tokens_seen": 1000,
+             "est_flops_6ND": 1.0, "est_flops_analytic": 1.0, "n_e_steps": 1, "n_layers": 1,
+             "test_ce": 3.0, "test_ppl": 20.0}]
+    p = scaling_analysis.aggregate_points(rows)[0]
+    assert p["embed_dim"] == 20.0 and abs(p["ppl_mean"] - 20.0) < 1e-9
+
+
+# --------------------------------------------------------------------------- EXP-9 per-eval residual
+
+def test_val_builder_resid_logged_with_head_mixer(tmp_path):
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=4,
+                     log_interval=2, eval_interval=2, batch_size=2,
+                     gauge_group="block_glk", use_head_mixer=True)
+    model = VFEModel(cfg).to(DEVICE)
+    batches = [(torch.randint(0, 32, (2, 8), device=DEVICE),
+                torch.randint(0, 32, (2, 8), device=DEVICE)) for _ in range(4)]
+    art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic-period3", device=str(DEVICE))
+    train(model, batches, cfg, n_steps=4, log_interval=2, eval_interval=2,
+          val_loader=batches, artifacts=art, device=DEVICE, generate_samples=False)
+    with open(tmp_path / "metrics.csv", newline="", encoding="utf-8") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert rows and "val_builder_resid" in rows[0]
+    finite = [r for r in rows if r["val_builder_resid"] not in ("", "nan", None)]
+    assert finite, "an eval row must carry a finite builder residual under a head mixer"
+
+
+# --------------------------------------------------------------------------- driver smokes
+
+def _write_cell(sweep_dir, label, result):
+    d = sweep_dir / label
+    d.mkdir(parents=True)
+    (d / "ablation_result.json").write_text(json.dumps({"label": label, **result}))
+
+
+def test_plot_gauge_transport_driver(tmp_path):
+    sweep = tmp_path / "gauge_transport"; figdir = tmp_path / "figures"
+    for lab, ppl, dev in [("on_L1", 30.0, 0.4), ("off_L1", 33.0, 1e-7), ("frozen_L1", 31.0, 0.4),
+                          ("on_L2", 28.0, 0.4), ("off_L2", 32.0, 1e-7), ("frozen_L2", 30.0, 0.4)]:
+        _write_cell(sweep, lab, {"primary_val_ppl": ppl, "omega_identity_dev": dev})
+    ablation._plot_gauge_transport(sweep, figdir)
+    assert (figdir / "gauge_transport_gauge_bars.png").exists()
+
+
+def test_plot_kappa_dispersion_driver(tmp_path):
+    sweep = tmp_path / "kappa_beta_per_head"; figdir = tmp_path / "figures"
+    for lab, kb, ppl in [("uniform_1.0", [1.0, 1.0], 30.0), ("split_0.6_1.4", [0.6, 1.4], 30.8),
+                         ("geomean_0.6_1.4", [0.91652, 0.91652], 30.2)]:
+        _write_cell(sweep, lab, {"primary_val_ppl": ppl, "overrides": {"kappa_beta": kb}})
+    ablation._plot_kappa_dispersion(sweep, figdir)
+    assert (figdir / "kappa_beta_per_head_kappa_dispersion.png").exists()
+
+
+def test_plot_cg_coupling_driver(tmp_path):
+    sweep = tmp_path / "cg_coupling"; figdir = tmp_path / "figures"
+    for lab, ppl in [("cg_off", 31.0), ("cg_on", 29.5)]:
+        _write_cell(sweep, lab, {"primary_val_ppl": ppl, "gauge_resid_in": 1e-7,
+                                 "overrides": {"use_cg_coupling": lab == "cg_on"}})
+    ablation._plot_cg_coupling(sweep, figdir)
+    assert (figdir / "cg_coupling_ppl_equiv.png").exists()
+
+
+def test_plot_gauge_residual_drift_driver(tmp_path):
+    sweep = tmp_path / "gauge_equivariance"; figdir = tmp_path / "figures"
+    for lab, climb in [("tied_block_glk", 1e-7), ("untied_block_glk", 1e-2)]:
+        d = sweep / lab; d.mkdir(parents=True)
+        with open(d / "metrics.csv", "w", newline="", encoding="utf-8") as fh:
+            w = _csv.DictWriter(fh, fieldnames=["step", "val_builder_resid"])
+            w.writeheader()
+            for st, r in [(10, 1e-7), (20, climb)]:
+                w.writerow({"step": st, "val_builder_resid": r})
+    ablation._plot_gauge_residual_drift(sweep, figdir)
+    assert (figdir / "gauge_equivariance_residual_drift.png").exists()
+
+
+def test_kmup_series_splits_fixed_and_mup_arms():
+    r"""EXP-6 fix: route_grow_k_mup emits K{k}_fixed and K{k}_mup BOTH under route='grow_K_mup'; the
+    series builder must split them so the figure shows the fixed-vs-muP contrast, not one duplicated-K
+    curve."""
+    pts = []
+    for k in (20, 40, 80):
+        for suf in ("fixed", "mup"):
+            pts.append({"route": "grow_K_mup", "label": f"K{k}_{suf}", "embed_dim": float(k),
+                        "ppl_mean": 100.0 / k + (1.0 if suf == "mup" else 0.0),
+                        "ppl_sem": 0.1, "n_seeds": 2})
+    series = scaling_analysis._kmup_series(pts)
+    assert set(series) == {"grow_K_mup/fixed", "grow_K_mup/mup"}
+    assert all(len(v) == 3 for v in series.values())               # one point per K, no conflation
+    assert [p["embed_dim"] for p in series["grow_K_mup/fixed"]] == [20.0, 40.0, 80.0]

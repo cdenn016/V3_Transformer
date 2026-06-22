@@ -2540,3 +2540,332 @@ def plot_f_ce_decorrelation(
     ax.set_title(rf"E-step F vs CE  (Pearson$(F,CE)$={r_fce:+.3f}, Pearson$(T,F)$={r_nef:+.3f})")
     fig.tight_layout()
     return _save(fig, path)
+
+
+# ===========================================================================
+# C1 / EXP-4  --  canonical-F vs entropy-suppressed surrogate
+# ===========================================================================
+
+@register_figure("entropy_ppl_gap")
+def plot_entropy_ppl_gap(
+    cells,                               # list of {include_attention_entropy(bool), kappa, ppl}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""C1/EXP-4: validation-PPL, canonical (entropy ON) vs surrogate (entropy OFF), grouped by kappa.
+
+    The production kernel descends the SURROGATE gradient, so CANON_ORACLE is the only path that ever
+    exercises the canonical -tau^{-1} Cov_beta correction; a positive (surrogate - canonical) PPL gap
+    means the entropy term is empirically load-bearing. Grouped bars per kappa; the gap is annotated."""
+    cells = list(cells)
+    kappas = sorted({float(c["kappa"]) for c in cells})
+
+    def _ppl(k, ent):
+        v = [float(c["ppl"]) for c in cells
+             if abs(float(c["kappa"]) - k) < 1e-9 and bool(c["include_attention_entropy"]) == ent]
+        return v[0] if v else float("nan")
+    canon = [_ppl(k, True) for k in kappas]
+    surr = [_ppl(k, False) for k in kappas]
+    x = np.arange(len(kappas)); w = 0.38
+    fig, ax = plt.subplots(figsize=(6.2, 4.4))
+    ax.bar(x - w / 2, canon, w, color=_CB[0], label="canonical (entropy ON)")
+    ax.bar(x + w / 2, surr, w, color=_CB[1], label="surrogate (entropy OFF)")
+    for i in range(len(kappas)):
+        if np.isfinite(canon[i]) and np.isfinite(surr[i]):
+            ax.annotate(f"Δ={surr[i] - canon[i]:+.2f}", (x[i], max(canon[i], surr[i])),
+                        textcoords="offset points", xytext=(0, 4), ha="center", fontsize=8)
+    ax.set_xticks(x); ax.set_xticklabels([f"κ={k:g}" for k in kappas])
+    ax.set(ylabel="validation PPL")
+    ax.set_title("Canonical-F vs entropy-suppressed surrogate (PPL gap by κ)")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("cov_gap_vs_kappa")
+def plot_cov_gap_vs_kappa(
+    cells,                               # list of {include_attention_entropy(bool), kappa, cov_gap}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""C1/EXP-4: the -tau^{-1} Cov_beta(E, dE) gradient-gap magnitude vs kappa.
+
+    The belief-gradient contribution the canonical entropy term adds and the surrogate drops. Its
+    kappa-dependence trades the 1/tau = 1/(kappa*sqrt(d)) prefactor against the beta diffuseness in
+    Cov_beta, so the sign of the trend is empirical -- the plot measures it. One series per trained
+    arm (the gap is measured on each arm's converged belief)."""
+    cells = list(cells)
+    fig, ax = plt.subplots(figsize=(6.0, 4.4))
+    for ent, lab, col in ((True, "canonical-trained", _CB[0]), (False, "surrogate-trained", _CB[1])):
+        pts = sorted([(float(c["kappa"]), float(c["cov_gap"])) for c in cells
+                      if bool(c["include_attention_entropy"]) == ent
+                      and np.isfinite(float(c["cov_gap"]))], key=lambda t: t[0])
+        if pts:
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-", color=col, lw=1.8, label=lab)
+    ax.set(xlabel=r"$\kappa$ (softmax temperature scale)",
+           ylabel=r"$\|-\tau^{-1}\mathrm{Cov}_\beta(E,\nabla E)\|$ per token")
+    ax.set_title("Attention-entropy gradient gap vs κ")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+# ===========================================================================
+# D1 / EXP-8  --  pullback natural-gradient gauge M-step convergence
+# ===========================================================================
+
+@register_figure("wallclock_convergence")
+def plot_wallclock_convergence(
+    arms,                                # list of {label, val_ppl:[...], wall_clock_s:[...], step:[...]}
+
+    *,
+    target: Optional[float] = None,      # shared target PPL; None -> the worst arm's best (all reach it)
+    path:   Optional[str]   = None,
+):
+    r"""D1/EXP-8: validation PPL vs cumulative wall time, one line per gauge M-step arm.
+
+    The per-wall-clock convergence curve (the per-token pullback matrix_exp solve is the dominant
+    added cost, so a per-STEP advantage can vanish per second). A shared target PPL (default: the
+    worst arm's best, so every arm reaches it) is drawn; each arm's wall-time and step count TO that
+    target are annotated in the legend -- the steps-to-target / wall-to-target convergence-speed
+    readout. log-y so multiplicative gaps are legible."""
+    arms = [a for a in arms if len(a.get("val_ppl", [])) >= 1 and len(a.get("wall_clock_s", [])) >= 1]
+    if target is None and arms:
+        mins = [min(a["val_ppl"]) for a in arms if a["val_ppl"]]
+        target = max(mins) if mins else None
+    fig, ax = plt.subplots(figsize=(6.8, 4.6))
+    for j, a in enumerate(arms):
+        t = np.asarray(a["wall_clock_s"], float)
+        y = np.asarray(a["val_ppl"], float)
+        s = np.asarray(a.get("step", np.arange(t.size)), float)
+        order = np.argsort(t)
+        t, y, s = t[order], y[order], s[order]
+        lab = str(a.get("label", j))
+        if target is not None:
+            hit = np.where(y <= target)[0]
+            if hit.size:
+                lab += f"  (→ {t[hit[0]]:.0f}s / {int(s[hit[0]])} steps)"
+        ax.plot(t, y, "o-", color=_CB[j % len(_CB)], lw=1.6, ms=4, label=lab)
+    if target is not None and np.isfinite(target):
+        ax.axhline(target, color=_CB[7], ls="--", lw=1.0, alpha=0.6, label=f"target PPL={target:.2f}")
+    ax.set_yscale("log")
+    ax.set(xlabel="cumulative wall time (s)", ylabel="validation PPL (log)")
+    ax.set_title("Gauge M-step convergence: val PPL vs wall-clock")
+    if arms:
+        ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+# ===========================================================================
+# Lower-priority experiment figures (auto-dispatched after their sweep / analysis)
+#   A1/EXP-2 gauge transport · A2/EXP-9 equivariance drift · A3/EXP-10 CG coupling
+#   H2/EXP-11 kappa dispersion · F1/EXP-6 muP K-stability · I1/EXP-1 noise band
+# ===========================================================================
+
+@register_figure("gauge_transport_bars")
+def plot_gauge_transport_bars(
+    cells,                               # list of {mode in {on,frozen,off}, depth, ppl, omega_dev}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""A1/EXP-2: gauge ON vs frozen-random vs OFF(Omega=I) validation PPL, grouped by depth L.
+
+    The program's central causal probe: does trained GL(K) transport beat the exact Omega=I control?
+    The OFF arm's max|Omega-I| (omega_dev) is annotated to certify the frame really collapsed to the
+    identity to float eps. Predict ON < FROZEN <= OFF if transport carries the advantage."""
+    cells = list(cells)
+    modes = [("on", _CB[2]), ("frozen", _CB[4]), ("off", _CB[1])]
+    depths = sorted({str(c["depth"]) for c in cells})
+
+    def _v(mode, depth, key):
+        m = [c for c in cells if c["mode"] == mode and str(c["depth"]) == depth]
+        return float(m[0][key]) if m and m[0].get(key) is not None else float("nan")
+    x = np.arange(len(depths)); w = 0.26
+    fig, ax = plt.subplots(figsize=(7.0, 4.6))
+    for i, (mode, col) in enumerate(modes):
+        ax.bar(x + (i - 1) * w, [_v(mode, d, "ppl") for d in depths], w, color=col, label=mode)
+    for di, d in enumerate(depths):
+        dev = _v("off", d, "omega_dev")
+        if np.isfinite(dev):
+            ax.annotate(rf"$|\Omega-I|$={dev:.0e}", (x[di] + w, _v("off", d, "ppl")),
+                        textcoords="offset points", xytext=(0, 4), ha="center", fontsize=7)
+    ax.set_xticks(x); ax.set_xticklabels(depths)
+    ax.set(xlabel="depth", ylabel="validation PPL")
+    ax.set_title("GL(K) gauge transport: ON vs frozen vs OFF (Ω=I)")
+    ax.legend(fontsize=8, frameon=False, title="gauge")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("gauge_residual_drift")
+def plot_gauge_residual_drift(
+    arms,                                # list of {label, step:[...], resid:[...]}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""A2/EXP-9: builder-break gauge residual vs training step, tied (exact) vs untied (mixer drift).
+
+    Step 0 is byte-identical (~eps) for both arms (identity-init mixer); only the untied block_glk arm
+    climbs as the head mixer drifts from the identity and breaks equivariance. log-y so the climb from
+    float-eps is legible."""
+    arms = [a for a in arms if len(a.get("resid", [])) >= 1]
+    fig, ax = plt.subplots(figsize=(6.6, 4.6))
+    for j, a in enumerate(arms):
+        s = np.asarray(a["step"], float)
+        r = np.clip(np.asarray(a["resid"], float), 1e-12, None)
+        order = np.argsort(s)
+        ax.plot(s[order], r[order], "o-", color=_CB[j % len(_CB)], lw=1.6, ms=4, label=str(a.get("label", j)))
+    ax.set_yscale("log")
+    ax.set(xlabel="training step", ylabel="builder-break gauge residual (log)")
+    ax.set_title("Tied (exact) vs untied (mixer drift) gauge equivariance")
+    if arms:
+        ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("ppl_equivariance_bars")
+def plot_ppl_equivariance_bars(
+    cells,                               # list of {label, ppl, resid}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""A3/EXP-10: per-arm validation PPL with the median gauge equivariance residual on a twin axis.
+
+    The Clebsch-Gordan cross-irrep coupling is exactly equivariant for ANY learned path weights, so the
+    residual stays ~eps on both arms (off/on) and the bar contrast is a clean PPL-delta at matched
+    equivariance -- the capacity the only exactly-equivariant inequivalent-irrep channel buys."""
+    cells = list(cells)
+    labels = [str(c["label"]) for c in cells]
+    x = np.arange(len(cells))
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    ax.bar(x, [float(c["ppl"]) for c in cells], 0.5, color=_CB[0], label="val PPL")
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_ylabel("validation PPL")
+    resid = [float(c["resid"]) if np.isfinite(_as_f(c.get("resid"))) else np.nan for c in cells]
+    if any(np.isfinite(resid)):
+        axr = ax.twinx()
+        axr.plot(x, resid, "s--", color=_CB[1], lw=1.4, label="equivariance residual")
+        axr.set_ylabel("median equivariance residual")
+        axr.set_yscale("log"); axr.grid(False)
+    ax.set_title("Clebsch-Gordan coupling: PPL + equivariance residual")
+    fig.legend(fontsize=8, frameon=False, loc="upper right")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("kappa_dispersion")
+def plot_kappa_dispersion(
+    cells,                               # list of {label, dispersion, ppl}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""H2/EXP-11: validation PPL vs per-head temperature dispersion std(kappa_beta).
+
+    Tied arms (uniform, and the geo-mean-tau confound control) sit at dispersion 0; the dispersed arms
+    hold the arithmetic mean at 1.0 so the x-axis isolates per-head asymmetry. A separation between the
+    tied baselines and the dispersed arms is the per-head-temperature effect (the geo-mean baseline
+    controls for the mean-tau shift the dispersed arms carry)."""
+    cells = list(cells)
+    pts = sorted([(float(c["dispersion"]), float(c["ppl"]), str(c.get("label", ""))) for c in cells],
+                 key=lambda t: t[0])
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-", color=_CB[0], lw=1.6)
+    for d, y, lab in pts:
+        ax.annotate(lab, (d, y), textcoords="offset points", xytext=(4, 4), fontsize=7)
+    ax.set(xlabel=r"per-head temperature dispersion std$(\kappa_\beta)$", ylabel="validation PPL")
+    ax.set_title("Per-head temperature dispersion vs PPL")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("kmup_stability")
+def plot_kmup_stability(
+    routes,                              # dict {route: [{embed_dim, ppl_mean, ppl_sem}...]}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""F1/EXP-6: inverse-K scaling width-fixed (grow_K) vs muP-corrected (grow_K_mup) on a shared
+    K=embed_dim axis.
+
+    test PPL vs K per route with cross-seed 95% CI bars (the small-sample t-quantile, not a fixed 1.96)
+    and an offset power-law fit PPL = A K^{-alpha} + E overlaid; the exponent b = -alpha is annotated
+    per route. The grow_K_mup route is split into its matched /fixed and /mup arms upstream, so
+    |b_fixed - b_muP| -- the width-stability readout -- is read directly off the two muP curves; a large
+    gap means the headline exponent is partly optimization mis-tuning the muP correction removes."""
+    fig, ax = plt.subplots(figsize=(6.8, 4.8))
+    for j, (name, pts) in enumerate(routes.items()):
+        pts = sorted(pts, key=lambda p: float(p["embed_dim"]))
+        K = np.array([float(p["embed_dim"]) for p in pts], float)
+        y = np.array([float(p["ppl_mean"]) for p in pts], float)
+        ci = np.array([_t95(int(p.get("n", 2))) * float(p.get("ppl_sem", 0.0)) for p in pts], float)
+        col = _CB[j % len(_CB)]
+        ax.errorbar(K, y, yerr=ci, fmt="o", color=col, capsize=3, lw=1.4, label=name)
+        if K.size >= 2:
+            fit = _fit_power_law(K, y, with_offset=True)
+            a = fit.get("alpha", float("nan"))
+            if np.isfinite(a):
+                Kf = np.linspace(float(K.min()), float(K.max()), 100)
+                ax.plot(Kf, fit["A"] * Kf ** (-a) + fit.get("E", 0.0), "-", color=col, lw=1.3, alpha=0.7)
+                ax.plot([], [], " ", label=f"   {name}: b={-a:+.3f}")
+    ax.set(xlabel="K (embed_dim)", ylabel="test PPL")
+    ax.set_title("μP width-stability of the inverse-K exponent")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("ppl_noise_band")
+def plot_ppl_noise_band(
+    agg,                                 # aggregate_seed_metric output: {values, seeds, mean, sd}
+
+    *,
+    label: str  = "K=20 baseline",
+    grid:  Optional[Dict] = None,        # optional {ablation label: single-seed ppl} overlay
+    path:  Optional[str]  = None,
+):
+    r"""I1/EXP-1: per-seed test PPL with the across-seed mean ± 1 SD (and ± 2 SD) band -- the seed
+    noise floor every ablation 'win' must clear.
+
+    The band is the init+optimization spread (the per-run reseed shares the data order; a lower bound
+    on deployment variance). An optional ``grid`` overlays single-seed ablation cells so a referee can
+    read directly whether a cell's margin exceeds the band."""
+    vals = np.asarray(agg.get("values", []), float)
+    mean, sd = float(agg.get("mean", float("nan"))), float(agg.get("sd", float("nan")))
+    fig, ax = plt.subplots(figsize=(7.0, 4.4))
+    if np.isfinite(mean):
+        ax.axhline(mean, color=_CB[0], lw=1.6, label=f"mean={mean:.3f}")
+        if np.isfinite(sd):
+            ax.axhspan(mean - 2 * sd, mean + 2 * sd, color=_CB[0], alpha=0.08, label="±2 SD")
+            ax.axhspan(mean - sd, mean + sd, color=_CB[0], alpha=0.18, label="±1 SD")
+    seeds = agg.get("seeds", list(range(vals.size))) or list(range(vals.size))
+    xs = np.arange(vals.size)
+    ax.scatter(xs, vals, color=_CB[1], zorder=3, label="per-seed test PPL")
+    ticks, ticklabels = list(xs), [str(s) for s in seeds[:vals.size]]
+    if grid:
+        gl = list(grid.items())
+        gx = np.arange(vals.size, vals.size + len(gl))
+        ax.scatter(gx, [float(v) for _, v in gl], color=_CB[3], marker="^", zorder=3, label="ablation cells")
+        ticks += list(gx); ticklabels += [str(k) for k, _ in gl]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(ticklabels, rotation=45, ha="right", fontsize=7)
+    ax.set(xlabel="seed / cell", ylabel="test PPL")
+    ax.set_title(f"Multi-seed variance floor ({label})")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def _as_f(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")

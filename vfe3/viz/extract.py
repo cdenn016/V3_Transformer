@@ -526,6 +526,68 @@ def converged_state(
     }
 
 
+def attention_entropy_cov_gap(
+    model,
+    token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+) -> Dict[str, torch.Tensor]:
+    r"""C1/EXP-4: the attention-entropy gradient gap -tau^{-1} Cov_beta(E, dE) on the converged belief.
+
+    The production closed-form kernel CANNOT compute the attention-entropy term, so it descends the
+    SURROGATE belief gradient; only the autograd ORACLE with ``include_attention_entropy=True``
+    realizes the canonical gradient. Differencing the oracle gradient with the entropy term ON vs OFF
+    on the SAME converged-belief snapshot isolates exactly the entropy term's contribution, which by
+    the envelope identity equals ``lambda_beta * (-tau^{-1} Cov_beta(E, dE))`` (= the bare identity on
+    the pure ``lambda_beta=1`` path; the scalar identity is proven in
+    ``tests/test_free_energy.py::test_gradient_gap_canonical_minus_surrogate_is_neg_cov_over_tau``).
+    Returns the per-token gap magnitude ``cov_gap_per_token`` (N,) = ||g_canon - g_surrogate|| over
+    the (mu, sigma) blocks, and the scalar mean ``cov_gap``. The attention prior is folded with the
+    precision bias (``_fold_precision_bias``) exactly as forward does, so beta is the one the trained
+    model uses (load-bearing under ``precision_weighted_attention=True``, the baseline). Built for the
+    single-block (L=1) operating point and the default flat-transport path (regime_ii's mu-dependent
+    Omega would need an omega_builder; neither is the EXP-4 operating point).
+    """
+    from vfe3.gradients.oracle import belief_gradients_autograd
+    from vfe3.geometry.transport import RopeTransport
+    cfg = model.cfg
+    dev = _model_device(model)
+    with torch.no_grad():                                          # snapshot build is grad-free
+        belief, log_prior, rope = _encode_one(model, token_ids)
+        log_prior = model._fold_precision_bias(log_prior, belief.sigma)   # match forward's beta prior
+        ikw = _iter_kwargs(model, log_prior, rope)
+        mu_p, sigma_p = belief.mu, belief.sigma
+        out = belief
+        for _ in range(cfg.n_e_steps):                            # converge to q* (the operating point)
+            out = e_step_iteration(out, mu_p, sigma_p, model.group, **ikw)
+        omega = _transport(
+            out.phi, model.group, transport_mode=cfg.transport_mode,
+            mu=(out.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
+            sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
+            connection_W=getattr(model, "connection_W", None),
+            connection_M=getattr(model, "connection_M", None),
+            cocycle_relaxation=cfg.cocycle_relaxation,
+        )
+        if rope is not None:
+            omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                                  on_value=cfg.rope_on_value)
+    kw = dict(                                                    # the oracle's free-energy knob bag
+        tau=attention_tau(_as_coeff(cfg.kappa_beta, dev), model.group.irrep_dims),
+        renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+        b0=_as_coeff(cfg.b0, dev), c0=_as_coeff(cfg.c0, dev), value=cfg.lambda_alpha,
+        lambda_beta=_lambda_beta(model), gradient_mode=cfg.gradient_mode, family=cfg.family,
+        divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
+        irrep_dims=model.group.irrep_dims, log_prior=log_prior,
+        log_alpha=getattr(model, "log_alpha", None),
+    )                                                             # grad ON here (outside the no_grad block)
+    gc_mu, gc_sig = belief_gradients_autograd(out.mu, out.sigma, mu_p, sigma_p, omega,
+                                              include_attention_entropy=True, **kw)
+    gs_mu, gs_sig = belief_gradients_autograd(out.mu, out.sigma, mu_p, sigma_p, omega,
+                                              include_attention_entropy=False, **kw)
+    n = out.mu.shape[0]
+    per_tok = torch.sqrt((gc_mu - gs_mu).pow(2).reshape(n, -1).sum(dim=-1)
+                         + (gc_sig - gs_sig).pow(2).reshape(n, -1).sum(dim=-1))   # (N,)
+    return {"cov_gap_per_token": per_tok, "cov_gap": per_tok.mean()}
+
+
 @torch.no_grad()
 def s_channel_refinement(model, token_ids: torch.Tensor) -> Optional[dict]:
     r"""Model-channel (s) refinement diagnostics for the ``s_e_step=True`` path (sequence 0).

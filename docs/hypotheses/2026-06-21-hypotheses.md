@@ -22,9 +22,9 @@ This cluster owns the program's central causal claim and the representation-theo
 
 **A1. Gauge ON vs OFF (Ω=I) vs frozen-random.** Merges S1 [gauge] and S2 [ml-engineer], which are the same experiment reached by two lenses: realize gauge-OFF by `phi_scale=0` + `e_phi_lr=0` + `m_phi_lr=0` + `pos_phi='none'` so Ω=exp(0)exp(0)=I exactly, a frozen-random control at `phi_scale=0.06` with the learning rates zeroed, and the trained baseline. S2 contributes the depth arm (L=2/3, since at L=1 rank-collapse cannot manifest) and the parameter-count and `use_head_mixer=False` confound controls. The decision rule is non-overlapping ±1 SD bands at ≥3 seeds, not a speculative ≥5% margin.
 
-**A2. Exact-equivariant tied vs strictly-broken untied gauge.** S16 [gauge] — the residual-vs-step drift of `block_glk`+`use_head_mixer` (broken as the mixer drifts) against `tied_block_glk` (exact), with the PPL cost of strict equivariance as the open empirical question. Requires `family='gaussian_full'` + `use_prior_bank=True` and a per-eval residual hook (the metric currently fires only once at end-of-run).
+**A2. Exact-equivariant tied vs strictly-broken untied gauge.** S16 [gauge] — the residual-vs-step drift of `block_glk`+`use_head_mixer` (broken as the mixer drifts) against `tied_block_glk` (exact), with the PPL cost of strict equivariance as the open empirical question. Requires `family='gaussian_full'` + `use_prior_bank=True` and a per-eval residual hook (the metric currently fires only once at end-of-run). *Built (2026-06-22): the per-eval builder-break residual (`val_builder_resid`) is logged in `_val_diagnostics`, and `gauge_residual_drift` auto-plots the tied-vs-untied drift vs step.*
 
-**A3. Clebsch-Gordan cross-irrep coupling.** S5 [gauge] — `use_cg_coupling` is the only exactly-equivariant inequivalent-irrep channel; a Schur-commutant head mixer is structurally forbidden across irrep types. Test on an SO(3) two-type tower; the equivariance half is near-certain, the capacity (PPL-delta) half is the genuine gamble, capped because CG is means-only.
+**A3. Clebsch-Gordan cross-irrep coupling.** S5 [gauge] — `use_cg_coupling` is the only exactly-equivariant inequivalent-irrep channel; a Schur-commutant head mixer is structurally forbidden across irrep types. Test on an SO(3) two-type tower; the equivariance half is near-certain, the capacity (PPL-delta) half is the genuine gamble, capped because CG is means-only. *Built (2026-06-22): `ppl_equivariance_bars` auto-plots per-arm PPL with the median equivariance residual for the `cg_coupling` sweep.*
 
 **A4. Trained Regime-II connection: holonomy and route covariance.** Merges S26 [gauge], S35 [gauge], and the holonomy half of S34/S36 [statmech-dyn]. The settled half (telescoping, Route-A-vs-B asymmetry) is pinned by existing tests; the open empirical contribution is the trainability-at-scale curve (does CE training drive `connection_W`/`connection_M` to a stable nonzero optimum, and does holonomy track ‖connection‖) plus a new training-time rebuilt-equivariance probe. S26's span/holonomy-locality probe rides on this as a cheap follow-up, conditioned on `pos_rotation='rope'`.
 
@@ -86,7 +86,7 @@ These test the meta_entropy.tex and belief_inertia.tex predictions (open thread 
 
 **H1. Offset-only priors extrapolate; absolute/RoPE do not.** S21 [transformer] — train at `max_seq_len=128`, eval at growing N; ALiBi/T5 (functions of |i−j|) extrapolate, `pos_phi='learned'` and RoPE do not. Fix the two code traps: `pos_phi` truncates (shape error, not IndexError — test with a shorter table) and `t5_max_distance` must be ≥ max eval-N to isolate offset from bucket saturation.
 
-**H2. Per-head temperature dispersion.** S20 [transformer] — a hand-set per-head `kappa_beta` list (zero added params) vs a tied-tau baseline retuned to the geometric-mean tau (the mandatory confound control). The learnable arm is unbuilt; scope to the hand-grid.
+**H2. Per-head temperature dispersion.** S20 [transformer] — a hand-set per-head `kappa_beta` list (zero added params) vs a tied-tau baseline retuned to the geometric-mean tau (the mandatory confound control). The learnable arm is unbuilt; scope to the hand-grid. *Built (2026-06-22): the `kappa_beta_per_head` sweep gained the geo-mean-τ confound-control arms, and `kappa_dispersion` auto-plots PPL vs std(κ_β).*
 
 ### Cluster I — Empirical rigor and ablations
 
@@ -137,6 +137,8 @@ Ranked by impact × feasibility, ties broken by novelty. Stars: ★★★★★ 
 
 The discipline gate for every other ablation: nothing else's "win" is interpretable without it.
 
+**Status (2026-06-22): built.** Across-seed aggregator (`multiseed_analysis.aggregate_seed_metric`), the fixed data-order generator (`DATA_SEED`), and the `ppl_noise_band` figure (per-seed PPL + mean±SD band, auto-emitted by `multiseed_analysis.py`) are in. See `docs/2026-06-22-edits.md`.
+
 - **Config.** Baseline `train_vfe3.py`: `embed_dim=20`, `n_heads=2`, `n_layers=1`, `max_steps=15000`, `gauge_group='block_glk'`, `use_head_mixer=True`, `lambda_h=0.25`. Set `NUM_RUNS=5`, `SEEDS=[6,64,23,3,17]`.
 - **Baseline/control.** The five seeds are the experiment; no separate control.
 - **Primary metric.** Across-seed mean and SD of `test_ppl` from the five `test_results.json`. **Secondary.** Read the existing single-seed `m_p_mu_lr`/`m_phi_lr`/`lambda_h`/`kappa_beta` grids and flag every cell whose between-cell spread < 2 SD.
@@ -149,7 +151,7 @@ The discipline gate for every other ablation: nothing else's "win" is interpreta
 
 The single experiment that converts the program's central causal claim from hedged conjecture to measured result, in either direction.
 
-**Status (2026-06-22): harness built + run.** The `gauge_transport` sweep arm (3 cells × L{1,2}, `collect_diagnostics`) is registered in `ablation.py` (commit 31cdae5 + the readiness build); the user has run the ON/OFF/frozen ablation. Deferred: the grouped-bar + residual-table figure.
+**Status (2026-06-22): built + run.** The `gauge_transport` sweep arm (3 cells × L{1,2}, `collect_diagnostics`) is registered in `ablation.py` (commit 31cdae5 + the readiness build); the user has run the ON/OFF/frozen ablation; the `gauge_transport_bars` grouped-bar figure (val PPL by mode×depth, max|Ω−I| annotated) now auto-emits per sweep. See `docs/2026-06-22-edits.md`.
 
 - **Config.** New `ablation.py` SWEEPS `'gauge_transport'` multi-arm entry, all sharing matched `phi_weight_decay`, `lambda_alpha_mode`, `precision_weighted_attention`, and `use_head_mixer=False`:
   - **ON:** `{use_head_mixer:False}` (baseline `phi_scale=0.06`, `m_phi_lr=0.015`).
@@ -183,6 +185,8 @@ Tests open thread (f) and the manuscript's flagged "uncertainty channel" over-re
 
 The production kernel never computes the entropy term, so CANON_ORACLE is the only path that has ever exercised the canonical gradient — this raises the stakes above a second-order correction.
 
+**Status (2026-06-22): built.** `attention_entropy_cov_gap` (`vfe3/viz/extract.py`) measures the −τ⁻¹Cov_β(E,∇E) gap by differencing the autograd oracle gradient (entropy ON vs OFF) on the converged belief; the `attention_entropy` sweep is the 2×2 entropy×κ grid with a `cov_gap` CSV column; the `entropy_ppl_gap` + `cov_gap_vs_kappa` figures are wired. See `docs/2026-06-22-edits.md`.
+
 - **Config.** `ablation.py` `configs` multi-arm, K=20, 15k steps:
   - **SURROGATE:** `{include_attention_entropy:False, oracle_unroll_grad:True}`.
   - **CANON_ORACLE:** `{include_attention_entropy:True, oracle_unroll_grad:True}` (the clean control; both on the oracle, isolating the entropy term from the kernel-vs-oracle route).
@@ -212,6 +216,8 @@ Pre-built registered sweep; the theory is settled so the value is the unrun PPL-
 
 Decides whether the headline scaling exponent is a capacity law or partly optimization mis-tuning.
 
+**Status (2026-06-22): built.** The `grow_K_mup` route (per-K kl_max + μP LR/init scaling) exists; `scaling_analysis` now carries `embed_dim` + test PPL and auto-emits `kmup_stability` (grow_K vs grow_K_mup on the K axis, offset power-law fit, b annotated). See `docs/2026-06-22-edits.md`.
+
 - **Config.** Add `route_grow_k_mup` to `scaling.py` mirroring `route_grow_k`, anchored at K=20: scale `e_q_mu_lr`, `m_p_mu_lr` ~ (20/K) and `mu_init_std` ~ √(20/K). **Mandatory in BOTH arms:** recompute `kl_max = 8*embed_dim` per cell (the baseline freezes it at 160 from embed_dim=20 — a width confound that zeros the hyper-prior self-gradient near K≈126, i.e. at K=120). K∈{20,40,80,120}, iso-token.
 - **Baseline/control.** Width-fixed `route_grow_k` (with kl_max-per-K corrected) is the control. Secondary: a direct LR grid at K=20 and K=120 to separate "μP rule mis-specified for the preconditioned E-step" from "no width effect."
 - **Primary metric.** Fitted exponent b from PPL=aK^b+c, fit against `embed_dim` (not `n_params`, which is K²-dominated). **Secondary.** per-K test-CE curve flatness at K≥80.
@@ -237,6 +243,8 @@ Tests whether α·KL(q‖p) is the FFN-brake substitute the no-MLP claim relies 
 ### EXP-8. Pullback natural-gradient gauge M-step + LR scaling (D1) — ★★★★
 
 Three lenses (S9/S12/S14) converged here. Confirms or refutes the geometric justification for the `m_phi_natural_grad` lever and tests the natural-gradient LR-mis-scaling pitfall in one panel.
+
+**Status (2026-06-22): built.** The gauge M-step sweeps exist; `GaugeNaturalGradAdamW` now stashes gated (log/eval-only, read-only) `cos_nat_phi` + pullback-metric `pullback_cond_*`, `train.py` logs a cumulative `wall_clock_s`, and `wallclock_convergence` (driven by `_plot_wallclock_convergence`) plots val PPL vs wall time with steps/wall-to-target annotated; the LR bowl falls out of `_plot_one_sweep` on `m_phi_lr_natgrad`. See `docs/2026-06-22-edits.md`.
 
 - **Config.** `block_glk`, K=64, `n_heads=8` (d_head=8 ≤ max_k=12, so `pullback_per_block` builds), `m_gauge_momentum=0.9`, `e_phi_lr=0` (keep the preconditioner off the E-step). Arms: AdamW-on-φ (`m_phi_natural_grad=False`), `pullback_per_block`, and `killing_per_block` (conformal control). **Regime knob: sweep `mass_phi∈{0.0, positive}`** — NOT `phi_weight_decay` (hard-zeroed under natural-grad and pinned by `test_phi_weight_decay.py`). LR sub-experiment: log-spaced `m_phi_lr∈{0.0005,0.0015,0.005,0.015,0.05,0.15}` on the pullback arm (add `requires:{m_phi_natural_grad:True, phi_precond_mode:'pullback_per_block'}` to the SWEEPS entry).
 - **Baseline/control.** AdamW-on-φ; killing is the conformal LR-rescale control (cos(nat,grad)=1, must NOT serve as the geometric arm).
