@@ -265,6 +265,106 @@ def fisher_trace(
     return (0.5 / sigma.clamp(min=eps)).sum(dim=-1)
 
 
+def sigma_trace(
+    sigma:    torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
+
+    *,
+    diagonal: Optional[bool] = None,
+) -> torch.Tensor:                       # (...) per-token tr(Sigma_q) = sum_k Var_k
+    r"""Per-token covariance trace tr(Sigma_q) = sum_k Var_k -- the total belief UNCERTAINTY.
+
+    The complement of ``fisher_trace`` (which returns the PRECISION trace tr(Sigma^{-1})/2): for the
+    Sigma_q-as-calibrated-uncertainty probe (B1/EXP-3) the load-bearing quantity is the variance
+    trace itself, whose across-token spread (see ``cv``) gates whether the channel carries any
+    decode-time signal. Diagonal: sum_k sigma_k. Full: sum_k Sigma_kk.
+    """
+    if _is_full_cov(sigma, diagonal):
+        return torch.diagonal(sigma, dim1=-2, dim2=-1).sum(dim=-1)
+    return sigma.sum(dim=-1)
+
+
+def rank_one_residual(
+    mu:  torch.Tensor,                   # (..., N, K) per-token belief means of ONE layer
+
+    *,
+    eps: float = 1e-12,
+) -> torch.Tensor:                       # (...) relative distance of the token cloud from rank-one
+    r"""Dong rank-one residual r(X) = ||X - 1 xbar^T||_F / ||X||_F over the (N, K) mean matrix.
+
+    Measures how far the per-token mean cloud X (rows = tokens) sits from the rank-one matrix
+    1 xbar^T (every token collapsed to the mean token xbar = mean_n X[n,:]): r -> 0 is total rank
+    collapse (all tokens identical), r near 1 is full spread. This is the anti-rank-collapse /
+    FFN-brake object of F2/EXP-7, computed on the MEAN stream -- DISTINCT from ``effective_rank``,
+    which is the spectral rank of the per-token COVARIANCE Sigma (a different object). Reference:
+    Dong et al. 2021, "Attention is not all you need: pure attention loses rank doubly exponentially".
+    """
+    xbar = mu.mean(dim=-2, keepdim=True)                                  # (..., 1, K) mean token
+    num = torch.linalg.norm((mu - xbar).flatten(-2, -1), dim=-1)          # ||X - 1 xbar^T||_F
+    den = torch.linalg.norm(mu.flatten(-2, -1), dim=-1).clamp(min=eps)    # ||X||_F
+    return num / den
+
+
+def depth_decay_rate(
+    curve: torch.Tensor,                 # (L,) a per-layer scalar (e.g. r(X) by depth)
+
+    *,
+    eps:   float = 1e-12,
+) -> float:                              # log-linear slope d log(curve) / d layer
+    r"""Log-linear decay rate (slope of log(curve) vs layer index) of a per-depth scalar.
+
+    For F2/EXP-7 the per-arm rank-residual curves are compared by their DECAY RATE, not absolute
+    level (the no-anchor control plateaus rather than collapsing to rank-one). Fits
+    log(curve) ~ a + b * layer by least squares and returns b (negative = decaying with depth).
+    """
+    y = torch.log(curve.flatten().clamp(min=eps).to(torch.float64))
+    n = y.shape[0]
+    if n < 2:
+        raise ValueError(f"depth_decay_rate needs >= 2 layers, got {n}")
+    x = torch.arange(n, dtype=torch.float64, device=y.device)
+    xm, ym = x.mean(), y.mean()
+    return float(((x - xm) * (y - ym)).sum() / ((x - xm) ** 2).sum().clamp(min=eps))
+
+
+def spearman_rho(
+    x: torch.Tensor,                     # (M,) sample
+    y: torch.Tensor,                     # (M,) sample
+
+    *,
+    eps: float = 1e-12,
+) -> float:                              # Spearman rank correlation in [-1, 1]
+    r"""Spearman rank correlation: the Pearson correlation of the RANKS of x and y.
+
+    The headline statistic of the Sigma_q-calibration probe (B1/EXP-3): rho(tr Sigma_q, per-token
+    CE). Ranks via double argsort (ties broken by position, adequate for continuous diagnostics).
+    Returns 0.0 for a degenerate zero-variance input rather than NaN.
+    """
+    x, y = x.flatten().to(torch.float64), y.flatten().to(torch.float64)
+    if x.numel() != y.numel():
+        raise ValueError(f"spearman_rho needs equal-length inputs, got {x.numel()} vs {y.numel()}")
+    rx = x.argsort().argsort().to(torch.float64)
+    ry = y.argsort().argsort().to(torch.float64)
+    rx, ry = rx - rx.mean(), ry - ry.mean()
+    return float((rx * ry).sum() / (rx.norm() * ry.norm()).clamp(min=eps))
+
+
+def cv(
+    x: torch.Tensor,                     # (M,) sample
+
+    *,
+    eps: float = 1e-12,
+) -> float:                              # coefficient of variation std / |mean|
+    r"""Coefficient of variation std(x) / |mean(x)| -- the pre-registered spread gate for B1/EXP-3.
+
+    The calibration experiment requires CV(tr Sigma_q) > 0.10: below it the covariance carries no
+    across-token signal and the result is reported "covariance inert", not miscoded as "decode
+    does not matter". Uses the unbiased std (ddof=1).
+    """
+    x = x.flatten().to(torch.float64)
+    if x.numel() < 2:
+        raise ValueError(f"cv needs >= 2 samples, got {x.numel()}")
+    return float(x.std(unbiased=True) / x.mean().abs().clamp(min=eps))
+
+
 def spd_geodesic_distance(
     sigma_a:  torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
     sigma_b:  torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
@@ -961,6 +1061,56 @@ def gauge_equivariance_residual(
         "beta_in_group":    torch.cat(in_b),
         "beta_out_group":   torch.cat(out_b),
     }
+
+
+def head_mixer_gauge_residual(
+    mu:        torch.Tensor,             # (N, K) converged belief means
+    sigma:     torch.Tensor,             # (N, K) diagonal OR (N, K, K) full covariances
+    head_mixer,                          # HeadMixer module (the trained Schur-commutant mixer)
+    group,                               # GaugeGroup (generators, irrep_dims)
+
+    *,
+    n_samples: int            = 8,
+    scale:     float          = 0.5,
+    seed:      int            = 0,
+    eps:       float          = 1e-6,
+    diagonal:  Optional[bool] = None,
+) -> Dict[str, torch.Tensor]:
+    r"""BUILDER-level gauge-equivariance residual of the head mixer (tied vs untied).
+
+    Certifies whether the mixer operation commutes with an IN-group gauge action, i.e.
+    mix(g mu, g Sigma g^T) == g mix(mu, Sigma) g^T for g = exp(sum_a c_a G_a) drawn from the
+    GROUP's OWN generators. The Schur-commutant mixer M = blockdiag_t(A_t kron I_d) commutes
+    with a TIED gauge Omega = kron(I_n, h) (group ``tied_block_glk``, generators kron(I_n, gl(d)))
+    -- residual at float32 eps -- but NOT with the UNTIED per-head gauge of ``block_glk`` (each
+    head its own gl(d)), where the residual grows as A drifts from I during training.
+
+    This is the complement of :func:`gauge_equivariance_residual`, which co-transforms a SUPPLIED
+    Omega (mu, Sigma, Omega together) and is therefore BLIND to a builder-level break: it certifies
+    the converged operator's congruence consistency, not whether the construction is equivariant.
+    Here the operator is REBUILT under g, so the tied-vs-untied distinction is visible -- this is
+    the instrument the A2/EXP-9 ablation needs. Uses the FULL-covariance mixer path (the diagonal
+    closed form sigma'[m] = sum_n A[m,n]^2 sigma[n] is equivariant only under DIAGONAL gauges), so a
+    diagonal sigma is promoted to full via ``diag_embed``. Returns relative residuals for the mean
+    (per token) and the covariance (Frobenius, per token); in-group they cluster at eps for a tied
+    gauge and rise with mixer drift for an untied one.
+    """
+    is_full = _is_full_cov(sigma, diagonal)
+    sigma0 = sigma if is_full else torch.diag_embed(sigma)                    # (N, K, K)
+    mu_m, sig_m = head_mixer(mu, sigma0)                                      # mix(mu, Sigma)
+    gen = torch.Generator(device=mu.device).manual_seed(int(seed))
+    r_mu, r_sig = [], []
+    for _ in range(n_samples):
+        c = scale * torch.randn(group.generators.shape[0], generator=gen, device=mu.device, dtype=mu.dtype)
+        g = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", c, group.generators))   # in-group g
+        mu_g  = mu @ g.transpose(-1, -2)                                      # (N, K)    g mu_i
+        sig_g = torch.einsum("kl,nlm,jm->nkj", g, sigma0, g)                  # (N, K, K) g Sigma g^T
+        mu_L, sig_L = head_mixer(mu_g, sig_g)                                 # mix(g .)
+        mu_R  = mu_m @ g.transpose(-1, -2)                                    # g . mix (mean)
+        sig_R = torch.einsum("kl,nlm,jm->nkj", g, sig_m, g)                   # g . mix (cov)
+        r_mu.append((mu_L - mu_R).norm(dim=-1) / mu_R.norm(dim=-1).clamp(min=eps))
+        r_sig.append((sig_L - sig_R).flatten(1).norm(dim=-1) / sig_R.flatten(1).norm(dim=-1).clamp(min=eps))
+    return {"mu_residual": torch.cat(r_mu), "sigma_residual": torch.cat(r_sig)}
 
 
 # ---------------------------------------------------------------------------

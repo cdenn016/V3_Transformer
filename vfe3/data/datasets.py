@@ -177,6 +177,7 @@ def make_dataloader(
     drop_last:   bool          = True,
     cache_dir:   Optional[Path] = None,
     max_tokens:  Optional[int] = None,   # cap the stream (fast smoke runs)
+    generator:   Optional[torch.Generator] = None,   # fix the shuffle order independent of global RNG
 ) -> DataLoader:
     """Build a DataLoader of causal-LM windows from the cached ``dataset``/``split``.
 
@@ -193,5 +194,9 @@ def make_dataloader(
     # box). With pinned host buffers the per-step .to(device, non_blocking=True) H2D copy in
     # train()/evaluate() can overlap compute; num_workers stays 0 (the dataset is an in-memory
     # tensor slice, so worker IPC would cost more than it saves).
+    # generator=None (default) keeps the RandomSampler drawing each epoch permutation from the GLOBAL
+    # RNG -- byte-identical to the historic behavior. Passing a seeded generator fixes the shuffle
+    # order independent of the global RNG (used by the multi-seed variance floor so the data order is
+    # shared across seeds while model-init RNG still varies; see train_vfe3.DATA_SEED / EXP-1).
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
-                      pin_memory=torch.cuda.is_available())
+                      pin_memory=torch.cuda.is_available(), generator=generator)

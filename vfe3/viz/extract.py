@@ -290,7 +290,9 @@ def across_layer_belief_trace(
     base = sig_stack[0].unsqueeze(0).expand_as(sig_stack)
     d_ai = metrics.spd_geodesic_distance(base, sig_stack).mean(dim=-1)   # (L,) mean over tokens
     eff = metrics.effective_rank_per_token(sig_stack).mean(dim=-1)       # (L,)
-    return {"mu": mu_stack, "sigma": sig_stack, "d_ai": d_ai, "effective_rank": eff}
+    r_one = metrics.rank_one_residual(mu_stack)                          # (L,) Dong r(X) per layer (F2/EXP-7)
+    return {"mu": mu_stack, "sigma": sig_stack, "d_ai": d_ai,
+            "effective_rank": eff, "rank_one_residual": r_one}
 
 
 @torch.no_grad()

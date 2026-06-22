@@ -59,9 +59,11 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader
+from vfe3.metrics import attention_entropy, gauge_equivariance_residual, head_mixer_gauge_residual
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.train import coverage_lines, evaluate, train
+from vfe3.viz.extract import converged_state
 
 logger = logging.getLogger("ablation")
 
@@ -84,7 +86,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     max_seq_len               = 128,                 # N, context length
     
     batch_size                = 64,
-    max_steps                 = 7500,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -122,8 +124,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     decode_precision_scaled   = False,               # use_prior_bank=False only: feed the precision-weighted mean
                                                      # eta=mu/sigma (natural param) to the linear head so Sigma enters
                                                      # the discriminative readout (diagnostic; OFF = bare-mu linear)
+    decode_mode               = 'diagonal_chunked',
+    oracle_unroll_grad        = False,
     
- 
     #################################
     #          Gauge Group
     #################################
@@ -185,13 +188,13 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     rope_base                 = 100.0,               # rotary frequency base
     rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
-    rope_on_value             = True,
+    rope_on_value             = False,
     
     ######################################
     #                Self Energy:  
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "constant",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "state_dependent",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
     lambda_h_mode              = "constant",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h) | "learnable" (NN exc.)
     
     b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
@@ -222,17 +225,17 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #            & Temperatures
     ########################################
     
-    kappa_beta                = 1,        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
-    kappa_gamma               = 1,        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
+    kappa_beta                = 1, #[1, 0.5],        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa_gamma               = 1, #[1, 0.5],        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
         
     beta_attention_prior      = "causal_alibi",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
-    gamma_attention_prior     = "causal",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+    gamma_attention_prior     = "causal_alibi",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
     t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
 
     precision_weighted_attention = True,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
                                                  # into the attention prior (diagnostic; OFF = position-only prior)
-    precision_attention_b0       = 2,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
+    precision_attention_b0       = 2.0,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
     precision_attention_per_head = False,        # per-key reliability PER HEAD (trace over each block's coords) vs
                                                  # global (all K); needs precision_weighted_attention=True
     #################################
@@ -242,9 +245,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     e_q_mu_lr                 = 0.9,
     e_q_sigma_lr              = 0.001,
-    e_phi_lr                  = 0.0,     
+    e_phi_lr                  = 0.00,     
     
-    
+    kl_max = 160,
     ####################################
     #       Model E-step LR's
     #      If s_e_step = True
@@ -291,20 +294,21 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     e_mu_q_trust              = None,
     e_sigma_q_trust           = 10.0,
-    sigma_max                 = 100.0,
+    sigma_max                 = 1000.0,
     
     #################################
     #         Misc/Logging
     #################################     
     amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'
         
-    log_interval              = 2500,       # console log every N steps (0 = off)
-    eval_interval             = 10000,      # periodic validation every N steps (0 = off)
+    log_interval              = 5000,       # console log every N steps (0 = off)
+    eval_interval             = 15000,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 25000,     # save a resumable checkpoint every N steps (0 = off)
 
     use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF)
     ema_decay                 = 0.999,     # EMA decay in (0,1); only read when use_ema=True
 )
+    
 
 
 # =============================================================================
@@ -415,6 +419,132 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "requires": {"use_head_mixer": False},
     },
 
+    # === experiment arms (2026-06-21 readiness build; run by name via CONFIG["sweep"]=...) ====
+    # Each declares ``collect_diagnostics: True`` so run_single does one converged-state replay per
+    # cell and tacks the gauge/entropy/equivariance scalars onto sweep_results.csv (see
+    # _cell_diagnostics). They are registered but kept OUT of SWEEP_ORDER so the default run is
+    # unchanged; select one with CONFIG["sweep"] = "gauge_transport" (etc.).
+
+    "gauge_transport": {  # A1 / EXP-2: the program's central causal claim -- gauge ON vs OFF vs frozen-random.
+        # 'off' coerces the frame to identity (phi_scale=0, e/m_phi_lr=0, pos_phi='none' -> Omega=I);
+        # 'frozen' keeps a nonzero random frame with the LRs zeroed; 'on' is the learned baseline.
+        # use_head_mixer is forced OFF in every arm so the contrast is flat-GL(K)-transport-vs-none
+        # (matched param count). The depth arm L in {1,2} is folded in (rank collapse cannot show at L=1).
+        "description": "GL(K) gauge transport on/off(Omega=I)/frozen-random, at L in {1,2} [A1/EXP-2]",
+        "collect_diagnostics": True,
+        "configs": [
+            {"label": "on_L1",     "gauge_transport": "on",     "use_head_mixer": False, "n_layers": 1},
+            {"label": "off_L1",    "gauge_transport": "off",    "use_head_mixer": False, "n_layers": 1},
+            {"label": "frozen_L1", "gauge_transport": "frozen", "use_head_mixer": False, "n_layers": 1},
+            {"label": "on_L2",     "gauge_transport": "on",     "use_head_mixer": False, "n_layers": 2},
+            {"label": "off_L2",    "gauge_transport": "off",    "use_head_mixer": False, "n_layers": 2},
+            {"label": "frozen_L2", "gauge_transport": "frozen", "use_head_mixer": False, "n_layers": 2},
+        ],
+    },
+
+    "attention_entropy": {  # C1 / EXP-4: canonical F (entropy term ON) vs entropy-suppressed surrogate.
+        # The production kernel never computes the entropy term, so BOTH arms are forced onto the
+        # oracle route (oracle_unroll_grad=True) -- this isolates the -tau^{-1} Cov_beta term from the
+        # kernel-vs-oracle route. __post_init__ does NOT auto-enable the oracle for entropy=False, so
+        # the surrogate arm must set it explicitly.
+        "description": "attention-entropy term canonical (on) vs surrogate (off), both on the oracle [C1/EXP-4]",
+        "collect_diagnostics": True,
+        "configs": [
+            {"label": "canon_oracle", "include_attention_entropy": True,  "oracle_unroll_grad": True},
+            {"label": "surrogate",    "include_attention_entropy": False, "oracle_unroll_grad": True},
+        ],
+    },
+
+    "gauge_equivariance": {  # A2 / EXP-9: exact-equivariant tied gauge vs strictly-broken untied gauge.
+        # Under block_glk the per-head gauge is UNTIED so the head mixer breaks equivariance as A
+        # drifts from I; tied_block_glk restores it exactly. Full covariance + PriorBank so the
+        # builder-break residual (the new head_mixer_gauge_residual, surfaced as builder_resid) is the
+        # full-cov certificate -- ~eps for the tied arm, climbing for the untied one.
+        "description": "tied (exact) vs untied (head-mixer drift) gauge equivariance, full cov [A2/EXP-9]",
+        "collect_diagnostics": True,
+        # s_e_step=False: the live model-channel E-step is diagonal-only (s/r tables are diagonal by
+        # construction) and rejects family='gaussian_full', which EXP-9 requires (the covariance break
+        # only shows under the full-cov mixer; the diagonal closed form is equivariant under diagonal
+        # gauges). Both arms share it, so the tied-vs-untied contrast stays controlled.
+        # decode_mode='full_chunked' pairs the full-covariance family with the KL-to-prior decode so
+        # the converged covariance reaches the logits (the baseline 'diagonal_chunked' is rank-incompatible).
+        # phi_precond_mode='killing' (ambient) on BOTH arms: the tied gauge's shared kron(I_n, gl(d))
+        # generators do not partition per head, so the baseline 'killing_per_block' is undefined there;
+        # the ambient Killing metric works for both groups, leaving gauge_group (tied vs untied) the
+        # only difference between the two arms.
+        "configs": [
+            {"label": "untied_block_glk", "gauge_group": "block_glk", "use_head_mixer": True,
+             "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
+             "phi_precond_mode": "killing", "s_e_step": False},
+            {"label": "tied_block_glk",   "gauge_group": "tied_block_glk", "use_head_mixer": True,
+             "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
+             "phi_precond_mode": "killing", "s_e_step": False},
+        ],
+    },
+
+    "cg_coupling": {  # A3 / EXP-10: the only exactly-equivariant cross-irrep channel, off vs on.
+        # SO(3) l2 x4 isotypic tower (sum of dims = 4*5 = 20 = baseline K); the l2 (x) l2 -> l2 CG
+        # path is admissible so the coupling is non-trivial. means-only, zero-init (byte-identical at
+        # step 0). e_step_gradient='unroll' so the learned path weights actually train (a 'detach'
+        # E-step would freeze them and collapse on==off). Head mixer off to isolate the CG channel.
+        "description": "Clebsch-Gordan cross-irrep coupling off vs on (SO(3) l2 x4 tower) [A3/EXP-10]",
+        "collect_diagnostics": True,
+        # n_heads=4: the tower has 4 irrep blocks (l2 x4), and the baseline ALiBi-family prior builds
+        # an (n_heads, N, N) bias that must align with the block/head axis.
+        "configs": [
+            {"label": "cg_off", "gauge_group": "so_n", "group_n": 3, "irrep_spec": [("l2", 4)],
+             "n_heads": 4, "phi_precond_mode": "killing", "use_head_mixer": False,
+             "use_cg_coupling": False, "e_step_gradient": "unroll"},
+            {"label": "cg_on",  "gauge_group": "so_n", "group_n": 3, "irrep_spec": [("l2", 4)],
+             "n_heads": 4, "phi_precond_mode": "killing", "use_head_mixer": False,
+             "use_cg_coupling": True, "e_step_gradient": "unroll"},
+        ],
+    },
+
+    "n_e_steps_em": {  # C2 / EXP-5: structural non-Neal-Hinton EM -- PPL vs n_e_steps, unroll vs
+        # straight_through. The straight_through arm removes the deepening-graph confound of unrolling
+        # the E-step (its trajectory builds no graph), isolating the inference-iteration effect on PPL.
+        # e_phi_lr=0 keeps the gauge preconditioner off the E-step across the sweep. (The F-vs-CE
+        # decorrelation half additionally needs a persisted final E-step F/token -- a separate infra
+        # gap noted in the readiness doc.)
+        "description": "n_e_steps {1,2,3,5,8} x e_step_gradient {unroll, straight_through}, e_phi_lr=0 [C2/EXP-5]",
+        "configs": [
+            {"label": f"T{t}_{g}", "n_e_steps": t, "e_step_gradient": g, "e_phi_lr": 0.0}
+            for t in (1, 2, 3, 5, 8) for g in ("unroll", "straight_through")
+        ],
+    },
+
+    "gauge_mstep_optim": {  # D1 / EXP-8: gauge M-step optimizer geometry.
+        # AdamW-on-phi vs the pullback natural-grad M-step (the exact exp-map metric, which reshapes
+        # the step DIRECTION) vs killing (conformal: a direction-preserving effective-LR rescale,
+        # cos(nat,grad)=1 -- the control that ISOLATES "reshaped direction" from "rescaled LR").
+        # e_phi_lr=0 keeps the preconditioner off the E-step so this measures the M-step only.
+        "description": "gauge M-step: AdamW vs pullback natural-grad vs killing conformal [D1/EXP-8]",
+        "requires": {"e_phi_lr": 0.0},
+        "configs": [
+            {"label": "adamw",    "m_phi_natural_grad": False},
+            {"label": "pullback", "m_phi_natural_grad": True, "phi_precond_mode": "pullback_per_block"},
+            {"label": "killing",  "m_phi_natural_grad": True, "phi_precond_mode": "killing_per_block"},
+        ],
+    },
+
+    "m_phi_lr_natgrad": {  # D1 / EXP-8: the natural-grad LR-mis-scaling sub-experiment.
+        # GaugeNaturalGradAdamW steps phi manually (bypassing Adam's per-coord normalization), so the
+        # AdamW-tuned m_phi_lr mis-scales; a log-spaced sweep should place the natural-grad optimum
+        # >=2x from the AdamW value. Gated to the pullback natural-grad path.
+        "description": "log-spaced m_phi_lr on the pullback natural-grad M-step [D1/EXP-8]",
+        "param": "m_phi_lr", "values": [0.0005, 0.0015, 0.005, 0.015, 0.05, 0.15],
+        "requires": {"m_phi_natural_grad": True, "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0},
+    },
+
+    "mass_phi": {  # D1 / EXP-8: the regime knob (NOT phi_weight_decay, which is hard-zeroed under
+        # natural-grad). The pullback advantage is predicted to shrink as mass_phi rises (the frame-
+        # norm penalty pulls phi toward 0, where ad_phi -> 0 and the pullback metric -> I).
+        "description": "mass_phi frame-norm penalty -- natural-grad regime knob [D1/EXP-8]",
+        "param": "mass_phi", "values": [0.0, 0.001, 0.01, 0.1],
+        "requires": {"m_phi_natural_grad": True, "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0},
+    },
+
     # === positional encoding ===============================================
     
     "pos_phi": {
@@ -458,6 +588,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
                                     "family": "gaussian_full",
                                     "lambda_alpha_mode": "state_dependent"},
         ],
+    },
+
+    "use_ema": {
+        "description": "EMA/Polyak weight averaging off vs on (eval/best-save/final use the average)",
+        "param": "use_ema", "values": [False, True],
+    },
+    "ema_decay": {
+        "description": "EMA decay rate (slower average as decay -> 1); requires use_ema=True",
+        "param": "ema_decay", "values": [0.99, 0.999, 0.9995], "requires": {"use_ema": True},
     },
 
     # === belief family =====================================================
@@ -510,7 +649,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "precision_attention_b0": {
         "description": "precision_attention_b0",
-        "param": "precision_attention_b0", "values": [1.75, 2.25, 5],
+        "param": "precision_attention_b0", "values": [1, 1.75, 2, 2.25],
     },
     "precision_attention_per_head": {  # per-key reliability per head (block trace) vs global (all K)
         "description": "precision-weighted attention reliability: global trace vs per-head block trace",
@@ -535,17 +674,17 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === belief-table init scales (PriorBank) ===============================
     "mu_init_std": {
         "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
-        "param": "mu_init_std", "values": [0.060, 0.0625, 0.065, 0.0675, 0.070],
+        "param": "mu_init_std", "values": [0.010, 0.04, 0.06, 0.065, 0.070],
     },
     
     "sigma_init": {
         "description": "constant initial coordinate variance of the prior table (>0)",
-        "param": "sigma_init", "values": [3, 3.5, 4, 4.5],
+        "param": "sigma_init", "values": [1, 3.5, 4, 4.5],
     },
     
     "phi_scale": {
         "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
-        "param": "phi_scale", "values": [0.055, 0.06, 0.065],
+        "param": "phi_scale", "values": [0.01, 0.03, 0.05, 0.06, 0.07, 0.09],
     },
     
 
@@ -564,20 +703,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "lambda_beta": {
         "description": "belief-coupling block weight (1.0 = pure F)",
-        "param": "lambda_beta", "range": [0, 2, 0.2],
+        "param": "lambda_beta", "range": [0, 2, 0.1],
     },
     
     
     
     "lambda_gamma": {
         "description": "model-channel coupling weight (>0 creates s tables)",
-        "param": "lambda_gamma", "values": [0, 0.025, 0.15, 0.5, 0.75, 0.85, 1],
+        "param": "lambda_gamma", "values": [0.7, 0.8],
     },
     
     
     "lambda_h": {
         "description": "hyper-prior weight lambda_h * mean_i KL(s_i||r) (>0 creates s/r tables)",
-        "param": "lambda_h", "values": [0, 0.02, 0.1, 0.25, 0.5, 0.75, 1],
+        "param": "lambda_h", "values": [0.245, 0.255],
     },
     
     
@@ -586,16 +725,16 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "kappa_gamma": {
         "description": "model-channel temperature tau_gamma = kappa_gamma * sqrt(d_head)",
-        "param": "kappa_gamma", "values": [0.1, 0.25, 0.5, 0.75, 1, 2.5], 
+        "param": "kappa_gamma", "values": [0.9, 1, 1.1], 
     },
     
     "kappa_beta": {
        "description": "attention temperature tau = kappa * sqrt(d_head)",
-       "param": "kappa_beta", "range": [0.1, 1.1, 0.1],
+       "param": "kappa_beta", "values": [0.9, 1, 1.1],
     },
 
     "kappa_beta_per_head": {  # per-head tau_h = kappa_beta[h]*sqrt(d_head); list len MUST == n_heads
-        # Lists assume the baseline n_heads=2 on an equal-block group (block_glk/tied_block_glk);
+        # Lists assume the baseline n_heads=2 on  equal-block group (block_glk/tied_block_glk);
         # single-block groups (glk/so_k/sp) reject a list. Mean held at 1.0 so this isolates the
         # per-head ASYMMETRY from the global-temperature axis the scalar 'kappa_beta' sweep covers;
         # [1.0, 1.0] is the uniform reference and is byte-identical to the scalar kappa_beta=1 baseline.
@@ -672,7 +811,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
     "m_p_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_p_mu_lr", "values": [0.01, 0.013, 0.015, 0.0165, 0.0175, 0.02],
+        "param": "m_p_mu_lr", "values": [0.0149, 0.0151],
     },
     
     "m_p_sigma_lr": {
@@ -682,7 +821,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.01, 0.013, 0.015, 0.0165, 0.0175, 0.02],
+        "param": "m_phi_lr", "values": [0.0149, 0.0151],
     },
     
     
@@ -703,14 +842,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "phi_weight_decay", "range": [0.01, 0.1, 0.01],
     },
 
-    "use_ema": {
-        "description": "EMA/Polyak weight averaging off vs on (eval/best-save/final use the average)",
-        "param": "use_ema", "values": [False, True],
-    },
-    "ema_decay": {
-        "description": "EMA decay rate (slower average as decay -> 1); requires use_ema=True",
-        "param": "ema_decay", "values": [0.99, 0.999, 0.9995], "requires": {"use_ema": True},
-    },
+    
 }
 
 
@@ -745,25 +877,26 @@ SWEEP_ORDER: List[str] = [
   # "decode_tau",
   # "lambda_alpha",
    
-   "lambda_h",
-   "lambda_beta",
-   "lambda_gamma",
+  # "lambda_h",
+ #  "lambda_beta",
+  # "lambda_gamma",
    
-   "kappa_beta",
-   "kappa_gamma",   
-  # "e_s_mu_lr",
+  # "kappa_beta",
+  # "kappa_gamma",   
+  
+    # "e_s_mu_lr",
    
-    "m_phi_lr",
-    "m_p_mu_lr",
-    "m_p_sigma_lr",
+   # "m_phi_lr",
+   # "m_p_mu_lr",
+   # "m_p_sigma_lr",
     
-    "n_e_steps",
+  #  "n_e_steps",
     
-   # "weight_decay",
+    "weight_decay",
     
-     "mu_init_std",
-    "phi_scale",
-    "sigma_init", 
+  #   "mu_init_std",
+  #  "phi_scale",
+  #  "sigma_init", 
   
     
   ##  "renyi_order",
@@ -987,17 +1120,92 @@ def _cell_cfg_dict(
     return d
 
 
+@torch.no_grad()
+def _cell_diagnostics(
+    model:   VFEModel,
+    cfg:     VFE3Config,
+    loader:  Any,
+    device:  torch.device,
+) -> Dict[str, Any]:
+    r"""Per-cell converged-state diagnostics for the gauge / entropy / equivariance experiments.
+
+    OPT-IN: only runs when a sweep declares ``collect_diagnostics: True``, so the default tuning
+    sweeps pay nothing. One faithful converged-state replay of validation sequence 0
+    (``viz.extract.converged_state``) feeds the scalars the experiments read out of
+    ``sweep_results.csv``:
+
+      * ``attn_entropy``        mean attention-row entropy H(beta)                       [C1/EXP-4]
+      * ``omega_identity_dev``  max |Omega_ij - I| over off-diagonal pairs (confirms     [A1/EXP-2]
+                                gauge_transport='off' gives Omega = I to float eps)
+      * ``builder_resid``       median builder-break gauge residual of the head mixer    [A2/EXP-9]
+                                (eps under the tied gauge, grows under the untied one)
+      * ``gauge_resid_in/out``  median in-/out-of-group congruence residual of the       [A1/EXP-2,
+                                converged attention operator                              A3/EXP-10]
+
+    Each probe is isolated: a failure (e.g. OOM on the O(N^2 K^2) Omega at large K) is logged and
+    drops that scalar, never crashing the cell. The dominant cost is building Omega inside
+    ``converged_state``; the experiment sweeps run at the baseline K=20, where it is cheap.
+    """
+    out: Dict[str, Any] = {}
+    try:
+        batch = next(iter(loader))
+        token_ids = (batch[0] if isinstance(batch, (tuple, list)) else batch).to(device)
+        cstate = converged_state(model, token_ids)
+    except Exception as exc:                                  # converged-state replay failed wholesale
+        logger.warning("  [diagnostics: converged_state failed] %s", exc)
+        return out
+
+    def _probe(name: str, fn) -> None:
+        try:
+            out[name] = float(fn())
+        except Exception as exc:
+            logger.warning("  [diagnostics: %s skipped] %s", name, exc)
+
+    _probe("attn_entropy", lambda: attention_entropy(cstate["beta"]))
+
+    def _omega_identity_dev() -> torch.Tensor:
+        omega = cstate["omega"]                               # (N, N, K, K)
+        n, k = omega.shape[0], omega.shape[-1]
+        off = ~torch.eye(n, dtype=torch.bool, device=omega.device)
+        eye = torch.eye(k, device=omega.device, dtype=omega.dtype)
+        return (omega[off] - eye).abs().max()
+    _probe("omega_identity_dev", _omega_identity_dev)
+
+    # Pass the diagonal/full flag explicitly (cfg.diagonal_covariance) rather than letting the
+    # metrics infer it from shape -- a diagonal sigma is (N, K), which is ambiguous with a full
+    # (N, K, K) whenever the sequence length N happens to equal K.
+    diag = cfg.diagonal_covariance
+    if model.head_mixer is not None:
+        def _builder_resid() -> torch.Tensor:
+            r = head_mixer_gauge_residual(cstate["mu"], cstate["sigma"], model.head_mixer, model.group,
+                                          diagonal=diag)
+            return torch.cat([r["mu_residual"], r["sigma_residual"]]).median()
+        _probe("builder_resid", _builder_resid)
+
+    try:
+        res = gauge_equivariance_residual(
+            cstate["mu"], cstate["sigma"], cstate["omega"], model.group,
+            kappa=cfg.kappa_beta, renyi_order=cfg.renyi_order, kl_max=cfg.kl_max,
+            eps=cfg.eps, divergence_family=cfg.divergence_family, diagonal=diag)
+        out["gauge_resid_in"]  = float(res["energy_in_group"].median())
+        out["gauge_resid_out"] = float(res["energy_out_group"].median())
+    except Exception as exc:
+        logger.warning("  [diagnostics: gauge_resid skipped] %s", exc)
+    return out
+
+
 def run_single(
     label:       str,
     overrides:   Dict[str, Any],
     run_dir:     Path,
 
     *,
-    dataset:     str,
-    device:      torch.device,
-    seed:        int,
-    max_tokens:  Optional[int] = None,
-    max_steps:   Optional[int] = None,
+    dataset:             str,
+    device:              torch.device,
+    seed:                int,
+    collect_diagnostics: bool          = False,
+    max_tokens:          Optional[int] = None,
+    max_steps:           Optional[int] = None,
 ) -> Dict[str, Any]:
     r"""Build a fresh model from baseline+overrides, train it, and score validation.
 
@@ -1061,7 +1269,7 @@ def run_single(
     best = artifacts.best_val_ppl
     primary = min(best, m["ppl"]) if best != float("inf") else m["ppl"]
 
-    return {
+    result = {
         "label":            label,
         "error_kind":       None,
         "primary_val_ppl":  float(primary),
@@ -1074,6 +1282,9 @@ def run_single(
         "seed":             int(cfg.seed),
         "overrides":        _jsonable(overrides),
     }
+    if collect_diagnostics:                                  # opt-in converged-state probes (S2)
+        result.update(_cell_diagnostics(model, cfg, val_loader, device))
+    return result
 
 
 def _jsonable(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -1093,7 +1304,10 @@ def _cleanup() -> None:
 _CSV_COLUMNS = [
     "sweep", "label", "error_kind", "primary_val_ppl", "final_val_ppl",
     "final_val_ce", "final_val_bpc", "best_val_ppl", "final_train_loss",
-    "n_params", "wall_time_s", "seed", "error",
+    "n_params",
+    # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
+    "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
+    "wall_time_s", "seed", "error",
 ]
 
 
@@ -1206,7 +1420,8 @@ def run_sweep(
         t0 = time.perf_counter()
         try:
             result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
-                                 seed=seed, max_tokens=max_tokens, max_steps=max_steps)
+                                 seed=seed, collect_diagnostics=sweep.get("collect_diagnostics", False),
+                                 max_tokens=max_tokens, max_steps=max_steps)
         except Exception as exc:                             # a training crash must not kill the sweep
             logger.exception("sweep %s / %s crashed", sweep_name, label)
             result = {"label": label, "error_kind": "train", "error": str(exc),
