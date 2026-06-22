@@ -36,7 +36,7 @@
   \addr Independent Researcher\\
   \addr Leander, Texas 78641, USA}
 
-\editor{TBD}
+% \editor{TBD}
 
 \maketitle
 
@@ -408,14 +408,14 @@ $\gamma_{ij}$ & $[0,1]$ & Model-fiber coupling weight \\
 $\alpha$ ($\alpha_i$) & $\mathbb{R}^+$ & Prior precision; state-dependent variant (Sec.~\ref{sec:state_dependent_precision}) \\
 $\kappa$ ($\tau$) & $\mathbb{R}^+$ & Attention temperature; $\kappa_a$ a $\sigma$-independent per-head sharpness scalar, $\tau_a = \kappa_a\sqrt{d_{\mathrm{head}}}$ (Sec.~\ref{sec:multihead}) \\
 $\lambda$ & $\mathbb{R}^+$ & Belief alignment coupling strength \\
-$\pi_j$ & $[0,1]$, $\sum_j \pi_j = 1$ & Attention prior (encodes masking, positional bias) \\
+$\pi_{ij}$ & $[0,1]$, $\sum_j \pi_{ij} = 1$ & Per-query-row attention prior (encodes masking, positional bias); row index $i$ suppressed in the derivation where it is held fixed \\
 $\eta_q, \eta_s$ & $\mathbb{R}^+$ & Fast (belief) and slow (model) learning rates; $\eta_s \ll \eta_q$ in the present work \\
 $\hat\alpha$ & $\mathbb{R}^+$ & Trained-from-loss scalar version of $\alpha$ used in Algorithm~\ref{alg:em_loop} \\
 \midrule
 \multicolumn{3}{@{}l}{\textit{Transformer correspondences (flat-bundle, isotropic limit)}} \\
 $Q_i, K_j$ & $\mathbb{R}^{d_k}$ & Query and key vectors ($\to \mu_i, \mu_j$ under reduction) \\
 $V_j$ & $\mathbb{R}^{d_v}$ & Value vector \\
-$W_Q, W_K$ & $\mathbb{R}^{d_k \times d}$ & Projection matrices ($\to$ gauge transformations) \\
+$W_Q, W_K$ & $\mathbb{R}^{d_k \times d}$ & Projection matrices (the product $W_Q W_K^\top = \sigma^{-2}\Omega^{-\top}$ is the transport; not individually gauge transformations) \\
 $d_k$ & $\mathbb{Z}^+$ & Head dimension ($= K$ per irrep block) \\
 \bottomrule
 \end{tabularx}
@@ -471,13 +471,13 @@ By Theorem~\ref{thm:glk_invariance}, KL divergence is invariant under this actio
 \begin{tabularx}{\textwidth}{lXX}
 \hline
 \textbf{Property} &
-\textbf{Full Gauge Theory} &
+\textbf{Flat Vertex-Frame Gauge Theory} &
 \textbf{Standard Transformer} \\
 \hline
 Gauge group $G$ &
 $\mathrm{GL}(K)$ or subgroup &
 $\mathrm{GL}(d_k)$ (implicit) \\
-Gauge transformation &
+Edge transport $\Omega_{ij}$ &
 $\Omega_{ij} = e^{\phi_i} e^{-\phi_j} \in \mathrm{GL}^+(K)$ &
 $W_Q W_K^\top = \sigma^{-2}\Omega^{-\top}$ (learned, constant) \\
 Frame field $\phi_i(c)$ &
@@ -500,7 +500,7 @@ Frame fields $\phi_i$ &
 Global gauge $W_Q, W_K$ \\
 \hline
 \end{tabularx}
-\caption{Comparison between full gauge-theoretic formulation and standard transformers.}
+\caption{Comparison between the flat vertex-frame gauge-theoretic formulation and standard transformers.}
 \label{tab:gauge_vs_transformer}
 \end{table}
 
@@ -554,7 +554,7 @@ Under the pushforward $\Omega_* P = \mathcal{N}(\Omega\mu_P, \Omega\Sigma_P\Omeg
 \log\frac{\det(\Omega\Sigma_Q\Omega^\top)}{\det(\Omega\Sigma_P\Omega^\top)} = \log\frac{(\det\Omega)^2 \det\Sigma_Q}{(\det\Omega)^2 \det\Sigma_P} = \log\frac{\det\Sigma_Q}{\det\Sigma_P}. 
 \end{equation}
 
-The $(\det\Omega)^2$ factors cancel identically. Since all three components are invariant, $\\ D_{\mathrm{KL}}(\Omega_* P \| \Omega_* Q) = D_{\mathrm{KL}}(P \| Q)$.
+The $(\det\Omega)^2$ factors cancel identically. Since all three components are invariant, $D_{\mathrm{KL}}(\Omega_* P \| \Omega_* Q) = D_{\mathrm{KL}}(P \| Q)$.
 \end{proof}
 
 Theorem~\ref{thm:glk_invariance} is a statement about a single common pushforward. The sense in which the per-edge attention term is \emph{gauge}-equivariant---invariant under independent, per-agent changes of frame---is the immediate corollary below.
@@ -699,7 +699,7 @@ The first term regularizes beliefs toward the prior and the second couples belie
 
 We construct the agent-agent interaction terms and their softmax attention weights by positing each agent's local inference problem as an entropy-regularized soft-assignment functional over its gauge-transported neighbors, in the style of \citet{Cuturi2013}. The alignment free energy below is engineered to make the softmax form of $\beta$ its exact KKT stationary point on the probability simplex, following the standard treatment of \citet{Boyd2004}.
 
-\subsubsection{Mixture-of-Sources Generative Model}
+\subsubsection{Mixture-of-Sources Local Generative Model}
 
 Agent $i$ (the query) seeks to update its belief $q_i(k)$ by attending to a set of source agents $j$ (the keys). Agent $i$'s generative model assumes its latent state $k$ was drawn from one of the neighboring agents, selected by a categorical latent variable $z \in \{1, \ldots, N\}$:
 
@@ -727,7 +727,7 @@ where $\beta(z = j) \equiv \beta_{ij} \geq 0$ are variational attention weights 
 
 \subsubsection{Alignment Free Energy}
 
-The free energy for the alignment component is the KL divergence between the variational posterior and the generative model:
+The free energy for the alignment component is the KL divergence between the variational posterior and agent $i$'s local generative model:
 
 \begin{equation}
 \mathcal{F}_{\text{align}} = D_{\mathrm{KL}}[Q(k,z) \| P(k,z)] = \sum_j \beta_{ij} \int dk q_i(k) \log \frac{q_i(k) \beta_{ij}}{P(k \mid z{=}j) \pi_j}.
@@ -781,7 +781,7 @@ For a uniform attention prior $\pi_k = 1/N$, the prior factors cancel, yielding:
 \label{eq:mixture_softmax}
 \end{equation}
 
-Without loss of generality we may include a temperature parameter $\tau > 0$ by rescaling the alignment energy $E_{ik} \to E_{ik}/\tau$. This rescaling, together with multiplication of $\mathcal{F}_{\text{align}}$ by $\tau$, is equivalent to writing the un-minimized alignment free energy in the canonical row-Lagrangian form
+We may introduce a temperature parameter $\tau > 0$ by tempering the alignment row objective, rescaling the alignment energy $E_{ik} \to E_{ik}/\tau$. This is a genuine modeling choice rather than a reparameterization: re-weighting the energy against the entropy moves the row solution from $\operatorname{softmax}(-E_{ik})$ to $\operatorname{softmax}(-E_{ik}/\tau)$, recovering the temperature-$1$ mixture KL of Eq.~\eqref{eq:mixture_energy_entropy} only at $\tau = 1$. This rescaling, together with multiplication of $\mathcal{F}_{\text{align}}$ by $\tau$, is equivalent to writing the un-minimized alignment free energy in the canonical row-Lagrangian form
 \begin{equation}
 \mathcal{F}_{\text{align}}^{(\tau)} = \sum_j \big[\beta_{ij} E_{ij} + \tau \beta_{ij}\log(\beta_{ij}/\pi_j)\big],
 \label{eq:F_align_canonical_tau}
@@ -836,7 +836,7 @@ where $m > 0$ is a slope parameter, contributes an additive bias to the logits. 
 \label{eq:alibi_attention}
 \end{equation}
 
-This is exactly the "Attention with Linear Biases" (ALiBi) mechanism of \citet{press2022train}. The slope $m$ is typically set to a head-dependent constant; \citet{press2022train} use the geometric schedule $m = 2^{-8h/H}$ for head $h$ of $H$ total heads (first term and common ratio both $2^{-8/H}$). In the gauge-theoretic framework, ALiBi arises from a prior belief that nearby sources are exponentially more likely to have generated the agent's state.
+This recovers the same additive linear-bias form as the "Attention with Linear Biases" (ALiBi) mechanism of \citet{press2022train}: on the causal support $j \leq i$ fixed by the autoregressive mask we have $|i-j| = i-j$, so the symmetric prior \eqref{eq:alibi_prior} reduces there to ALiBi's one-sided penalty $-m(i-j)$. The slope $m$ is typically set to a head-dependent constant; \citet{press2022train} use the geometric schedule $m = 2^{-8h/H}$ for head $h$ of $H$ total heads (first term and common ratio both $2^{-8/H}$). In the gauge-theoretic framework, ALiBi arises from a prior belief that nearby sources are exponentially more likely to have generated the agent's state.
 
 \paragraph{Relative Position Biases.}
 More generally, we can make the attention prior a learnable function of relative position,
@@ -1269,7 +1269,7 @@ However, on the gauge theory side, the algebraic origin of this cancellation can
 \label{eq:gl_decomposition}
 \end{equation}
 
-where $\mathfrak{sl}(K)$ consists of traceless matrices (volume-preserving transformations) and $\mathbb{R}$ is the trace component (overall scaling). The key-norm bias $\|\mu_j\|^2$ depends on the magnitude of the embedding vector. Layer normalization, which centers and rescales $\mu_j$ to have constant norm, effectively quotients out the positive scaling degree of freedom from the embedding space, projecting representations onto a sub-manifold of constant norm. This suppresses the key-norm bias at its algebraic origin, up to the residual fluctuation measured in Appendix~E ($\mathrm{CV}(\|K\|^2) \approx 0.24$). Combined with the Mahalanobis metric (which handles the gauge transport's effect on norms through $(\Omega\Omega^\top)^{-1}$), this ensures that attention depends on belief content rather than representation magnitude.
+where $\mathfrak{sl}(K)$ consists of traceless matrices (volume-preserving transformations) and $\mathbb{R}$ is the trace component (overall scaling). The key-norm bias $\|\mu_j\|^2$ depends on the magnitude of the embedding vector. Layer normalization, which centers and rescales $\mu_j$ to have approximately constant norm, plays a role analogous to removing this scaling degree of freedom, regularizing representations toward a sub-manifold of approximately constant norm. This suppresses the key-norm bias at its algebraic origin, up to the residual fluctuation measured in Appendix~E ($\mathrm{CV}(\|K\|^2) \approx 0.24$). Combined with the Mahalanobis metric (which handles the gauge transport's effect on norms through $(\Omega\Omega^\top)^{-1}$), this ensures that attention depends on belief content rather than representation magnitude.
 
 \paragraph{Factorization into Query-Key Dot Product.}
 
@@ -1715,7 +1715,7 @@ The identification $\ell \leftrightarrow$ gradient step makes the notion of ``de
 \hline
 $\beta_{ij} = \softmax(-D_{\KL}/\tau)$ & Exact (Sec.~\ref{sec:mixture_derivation}) & $\softmax(QK^\top / \sqrt{d_k})$ & D \\
 $\Omega_{ij} = e^{\phi_i}e^{-\phi_j} \in \mathrm{GL}^+(K)$ & Constant $\Omega$ (Limit 2) & $W_Q W_K^\top = \sigma^{-2}\Omega^{-\top}$ & D$^\sharp$ \\
-Forward KL uniqueness & Thm.\ (Supp.~App.~H) & Why dot-product attention & D \\
+Forward KL uniqueness & Thm.\ (Supp.~App.~H) & Gibbs/softmax attention form & D \\
 $\hat\mu_i = \sum_j \beta_{ij}\Omega_{ij}\mu_j$ & $\Omega$ absorbed into $W_V$ & $\sum_j \alpha_{ij} V_j$ (value agg.) & D \\
 $\mathrm{GL}(d_{\text{head}})^H \subset \mathrm{GL}(d_k)$ & Irrep decomposition & Multi-head head-space kernel & D$^\sharp$ \\
 Rectangular $U_Q^a, U_K^a, U_V^a$ (subspace embeddings) & Not derived (structural) & Multi-head subspace selection & S \\
@@ -1736,11 +1736,11 @@ $\mathfrak{gl}(K) = \mathfrak{sl}(K) \oplus \mathbb{R}$ & Remove trace component
 \hline
 \multicolumn{4}{|l|}{\textit{Training and Optimization}} \\
 \hline
-$\mathcal{F}[\{q_i\}]$ & Deterministic limit & Loss $\mathcal{L}(\theta)$ & D \\
+$\mathcal{F}[\{q_i\}]$ & Deterministic limit & Loss $\mathcal{L}(\theta)$ & S \\
 $-\mathbb{E}_q[\log p(o|k)]$ & Point evaluation limit & Cross-entropy / MSE loss & D \\
 $\alpha D_{\KL}(q_i \| p_i)$ & $\alpha = $ const, deterministic & L2 weight decay & D \\
 $\alpha_i^* = c_0/(b_0 + D_{\KL})$ & State-dependent precision & Adaptive weight decay & D \\
-$d\mu/dt = -\eta \Sigma\nabla\mathcal{F}$ & Euler discretization & Gradient descent (backprop) & D \\
+$d\mu/dt = -\eta \Sigma\nabla\mathcal{F}$ & Euler discretization & Gradient descent & D \\
 Chain rule through layers & Layered composition & Backpropagation & S \\
 Vacuum (no observations) & Gauge-symmetric minimum & Untrained network & S \\
 Observations break symmetry & Explicit breaking & Training / learning & S \\
@@ -1752,7 +1752,7 @@ $e \cdot \exp(-\|e\|^2/\tau)/Z$ (Eq.~\ref{eq:vfe_glu}) & Boltzmann GLU gate & GE
 VFE inner iterations ($T$, shared weights) & Single-$\mathcal{F}$ fixed-point iteration & Tied-weight recurrence; DEQ at $L = 1$ & D \\
 VFE outer layers ($L$, fresh weights) & Per-layer functional $\mathcal{F}^{(\ell)}$ & Layer stack / depth & S \\
 Prior bank $\{(\mu_p^c, \Sigma_p^c, \phi_c)\}$ & Deterministic limit & Embedding matrix $W_{\text{embed}}$ & S \\
-$p(o|\mu) = \mathrm{Cat}(\softmax(W\mu))$ & Observation model & Output proj.\ $+$ softmax & D \\
+$p(o|\mu) = \mathrm{Cat}(\softmax(W\mu))$ & Observation model & Output proj.\ $+$ softmax & S \\
 Fast subsystem $\mathcal{F}_{\text{fast}}$ & Frozen models & Forward pass (inference) & S \\
 Slow subsystem $\mathcal{F}_{\text{slow}}$ & Between-pass updates & Weight training & S \\
 \hline
@@ -1917,7 +1917,7 @@ where $J = \left(\begin{smallmatrix} 0 & -1 \\ 1 & 0 \end{smallmatrix}\right)$ i
 
 The multi-frequency structure of RoPE ($\theta_n = 10000^{-2n/d_k}$) corresponds to different components of the gauge frame oscillating at different frequencies across positions: low-frequency components ($\theta_n$ small, $n$ large) encode coarse positional structure and remain nearly aligned across distant positions, while high-frequency components ($\theta_n$ large, $n$ small) encode fine-grained local position and de-correlate rapidly. 
 
-\subsubsection{Interpolation Between Flat and Full Gauge.}
+\subsubsection{Interpolation Between Constant and Full Gauge.}
 
 RoPE occupies an intermediate position in the gauge-theoretic framework:
 
@@ -2038,7 +2038,7 @@ and recovers the standard training update:
 
 under the identifications: $\mathcal{F}$ (free energy) $\leftrightarrow$ $\mathcal{L}$ (loss + regularization); attention weights $\beta_{ij}$ $\leftrightarrow$ transformer attention $\alpha_{ij}$; observations $-\log p(o \mid \mu)$ $\leftrightarrow$ loss function; and symmetry breaking $\leftrightarrow$ training.
 
-Beyond the core attention formula, the gauge-theoretic framework provides a unified account of key transformer architectural choices (Table~\ref{tab:fep_nn_correspondence}), each recovered under specific limits or identifications. Causal masking, ALiBi, relative position biases, and sliding window attention all emerge as special cases of the non-uniform attention prior $\pi_k$ in the mixture-of-sources model (Section~\ref{sec:nonuniform_priors}). Rotary position embeddings correspond to position-dependent gauge frames restricted to $\mathrm{SO}(2)^{d_k/2}$, partially relaxing the constant-transport limit (Limit~2) while the transport stays a flat vertex-frame coboundary with trivial discrete holonomy (Section~\ref{sec:rope}). Layer normalization is a projection onto the $\mathfrak{sl}(K)$ subalgebra that suppresses key-norm bias at its algebraic origin (up to the residual fluctuation of Appendix~E). Residual connections are the inherent structure of iterative variational gradient descent (Section~\ref{sec:residual_connections}), with the state-dependent precision $\alpha_i$ generalizing the fixed skip connection to a context-dependent gate. The FFN sublayer corresponds to multiple VFE iterations with recomputed attention weights, and the message-passing term derives a Boltzmann-gated linear unit (Eq.~\ref{eq:vfe_glu}) in the same exponential family as GELU and SiLU (Section~\ref{sec:ffn_nonlinearity}). Weight decay is the prior coupling $\alpha D_{\mathrm{KL}}(q_i \| p_i)$ in the deterministic limit.
+Beyond the core attention formula, the gauge-theoretic framework provides a unified account of key transformer architectural choices (Table~\ref{tab:fep_nn_correspondence}), each recovered under specific limits or identifications. Causal masking, ALiBi, relative position biases, and sliding window attention all emerge as special cases of the non-uniform attention prior $\pi_k$ in the mixture-of-sources model (Section~\ref{sec:nonuniform_priors}). Rotary position embeddings correspond to position-dependent gauge frames restricted to $\mathrm{SO}(2)^{d_k/2}$, partially relaxing the constant-transport limit (Limit~2) while the transport stays a flat vertex-frame coboundary with trivial discrete holonomy (Section~\ref{sec:rope}). Layer normalization acts analogously to a projection toward the $\mathfrak{sl}(K)$ subalgebra, regularizing the key-norm bias toward a token-independent constant that cancels under softmax (up to the residual fluctuation of Appendix~E). Residual connections are the inherent structure of iterative variational gradient descent (Section~\ref{sec:residual_connections}), with the state-dependent precision $\alpha_i$ generalizing the fixed skip connection to a context-dependent gate. The FFN sublayer corresponds to multiple VFE iterations with recomputed attention weights, and the message-passing term derives a Boltzmann-gated linear unit (Eq.~\ref{eq:vfe_glu}) in the same exponential family as GELU and SiLU (Section~\ref{sec:ffn_nonlinearity}). Weight decay is the prior coupling $\alpha D_{\mathrm{KL}}(q_i \| p_i)$ in the deterministic limit.
 
 The $\mathrm{GL}(K)$ gauge invariance theorem (Theorem~\ref{thm:glk_invariance}) is the equivariance statement for the unrestricted framework: the free energy is invariant under simultaneous push-forward of all agent representations by a common $\Omega \in \mathrm{GL}(K)$. After the constant-gauge specialization the per-pair $\Omega_{ij}$ collapse to a single learned element of $\mathrm{GL}(d_k)$, and the SVD identity at Eq.~\eqref{eq:head_space_kernel} places the head-space invertible factor in $\mathrm{GL}(d_{\text{head}})$. The learned projections $W_Q, W_K$ parameterize this head-space factor and thereby realize one orbit representative of the framework's gauge action, explaining why transformers can learn arbitrary (invertible) attention patterns on the head subspace. Each row of Table~\ref{tab:fep_nn_correspondence} represents a degree of freedom that the full gauge-theoretic framework retains and that standard transformers collapse into a simpler form. The framework thus provides not only an explanatory account of existing architectures but a taxonomy of generalizations, indexed by which simplifying limits are relaxed.
 
