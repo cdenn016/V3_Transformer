@@ -161,6 +161,8 @@ tau = kappa * sqrt(dim_h) is the effective softmax temperature per head. The tau
 
 Write in academic prose — flowing paragraphs with clear logical progression, not bullet points. Minimize itemizations and enumerations; if content can be a paragraph, make it one. Use /literature-review, /scientific-writing, /sympy, and other relevant skills.
 
+**American English spelling.** Always use American English spelling, never British/UK spelling, in ALL output — chat replies, code, comments, commit messages, documents, and manuscripts. Examples: "color" not "colour", "behavior" not "behaviour", "normalize"/"optimize"/"factorize" not "normalise"/"optimise"/"factorise", "center" not "centre", "modeling" not "modelling", "fiber" not "fibre". When editing existing text, fix any UK spellings you encounter in the passage you are already touching.
+
 **Scientific writing rules.** Do not use LaTeX spacing macros (`\;`, `\,`, `\!`) — banned in this project's docs. Apply standard equation punctuation (comma/period at end of display equations) in any doc cleanup pass.
 
 **Banned patterns** (Claude-isms, never in manuscripts): horizontal rules (`---` and `--`), "key insight," "crucially," "critically," "notably," "importantly," "it's worth noting,"  "fundamentally,"  "leverages," "underscores."
