@@ -784,6 +784,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "split_1.2_0.8", "kappa_beta": [1.2, 0.8]},
             {"label": "split_0.6_1.4", "kappa_beta": [0.6, 1.4]},
             {"label": "split_1.4_0.6", "kappa_beta": [1.4, 0.6]},
+            # geo-mean-tau confound controls (B11-a/EXP-11): tied arms whose scalar kappa equals the
+            # GEOMETRIC mean of a dispersed pair, isolating per-head ASYMMETRY from the geo-mean tau
+            # shift the arithmetic-mean-1.0 dispersed arms carry. sqrt(0.8*1.2)=0.97980,
+            # sqrt(0.6*1.4)=0.91652. They sit at dispersion 0 on the dispersion-vs-PPL figure.
+            {"label": "geomean_0.8_1.2", "kappa_beta": [0.97980, 0.97980]},
+            {"label": "geomean_0.6_1.4", "kappa_beta": [0.91652, 0.91652]},
         ],
     },
    
@@ -1764,6 +1770,130 @@ def _plot_wallclock_convergence(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
+def _plot_gauge_transport(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""A1/EXP-2 gauge ON/frozen/OFF(Omega=I) grouped-bar (val PPL by depth, omega_identity_dev
+    annotated) from the gauge_transport cells. No-op unless >= 2 cells label as <mode>_<depth> with
+    mode in {on,off,frozen}."""
+    cells: List[Dict[str, Any]] = []
+    for r in _collect_sweep_results(sweep_dir):
+        parts = str(r.get("label", "")).split("_")
+        if len(parts) != 2 or parts[0] not in ("on", "off", "frozen"):
+            continue
+        if _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        cells.append({"mode": parts[0], "depth": parts[1],
+                      "ppl": _as_float(r.get("primary_val_ppl")),
+                      "omega_dev": _as_float(r.get("omega_identity_dev"))})
+    if len(cells) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_gauge_transport_bars
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"gauge-transport figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_gauge_bars.png"
+    plt.close(plot_gauge_transport_bars(cells, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_cg_coupling(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""A3/EXP-10 combined PPL + median equivariance-residual bar from the cg_coupling cells (gated on
+    the use_cg_coupling override). No-op unless >= 2 such cells finished."""
+    cells: List[Dict[str, Any]] = []
+    for r in _collect_sweep_results(sweep_dir):
+        ov = r.get("overrides", {}) or {}
+        if "use_cg_coupling" not in ov or _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        cells.append({"label": str(r.get("label", "")), "ppl": _as_float(r.get("primary_val_ppl")),
+                      "resid": _as_float(r.get("gauge_resid_in"))})
+    if len(cells) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_ppl_equivariance_bars
+    except Exception as exc:
+        print(f"cg-coupling figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_ppl_equiv.png"
+    plt.close(plot_ppl_equivariance_bars(cells, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_kappa_dispersion(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""H2/EXP-11 PPL vs per-head temperature dispersion std(kappa_beta), read from each cell's
+    kappa_beta LIST override (the scalar-kappa sweeps carry no list -> skipped). No-op unless >= 2
+    list-valued cells finished."""
+    cells: List[Dict[str, Any]] = []
+    for r in _collect_sweep_results(sweep_dir):
+        kb = (r.get("overrides", {}) or {}).get("kappa_beta")
+        if not isinstance(kb, (list, tuple)) or len(kb) < 2:
+            continue
+        if _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        try:
+            vals = [float(x) for x in kb]
+        except (TypeError, ValueError):
+            continue
+        m = sum(vals) / len(vals)
+        disp = (sum((x - m) ** 2 for x in vals) / len(vals)) ** 0.5      # population std of the kappa list
+        cells.append({"label": str(r.get("label", "")), "dispersion": disp,
+                      "ppl": _as_float(r.get("primary_val_ppl"))})
+    if len(cells) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_kappa_dispersion
+    except Exception as exc:
+        print(f"kappa-dispersion figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_kappa_dispersion.png"
+    plt.close(plot_kappa_dispersion(cells, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_gauge_residual_drift(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""A2/EXP-9 builder-break gauge residual vs step (tied vs untied) from each cell's metrics.csv
+    ``val_builder_resid`` eval series. No-op unless >= 2 cells carry >= 2 eval points."""
+    arms: List[Dict[str, Any]] = []
+    for cell in sorted(sweep_dir.glob("*/metrics.csv")):
+        steps, res = [], []
+        try:
+            with open(cell, newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    rv = _as_float(row.get("val_builder_resid"))
+                    if rv < float("inf"):                              # eval rows carry the residual
+                        steps.append(_as_float(row.get("step")))
+                        res.append(rv)
+        except Exception:                                             # unreadable metrics.csv -> skip
+            continue
+        if len(res) >= 2:
+            arms.append({"label": cell.parent.name, "step": steps, "resid": res})
+    if len(arms) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_gauge_residual_drift
+    except Exception as exc:
+        print(f"gauge-residual-drift figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_residual_drift.png"
+    plt.close(plot_gauge_residual_drift(arms, path=str(out)))
+    print(f"  figure -> {out}")
+
+
 def _plot_sensitivity(output_dir: Path, fig_dir: Path) -> None:
     r"""Cross-sweep comparison: a PPL-range (worst - best) bar per sweep, sorted by sensitivity.
 
@@ -1853,6 +1983,10 @@ def main() -> None:
         _plot_rank_collapse(sweep_dir, fig_dir)            # F2/EXP-7 r(X)-by-depth (no-op if absent)
         _plot_attention_entropy(sweep_dir, fig_dir)        # C1/EXP-4 PPL-gap + Cov-gap (no-op if absent)
         _plot_wallclock_convergence(sweep_dir, fig_dir)    # D1/EXP-8 wall-clock convergence (no-op if absent)
+        _plot_gauge_transport(sweep_dir, fig_dir)          # A1/EXP-2 gauge on/off/frozen bars (no-op if absent)
+        _plot_cg_coupling(sweep_dir, fig_dir)              # A3/EXP-10 PPL+equivariance bars (no-op if absent)
+        _plot_kappa_dispersion(sweep_dir, fig_dir)         # H2/EXP-11 kappa dispersion (no-op if absent)
+        _plot_gauge_residual_drift(sweep_dir, fig_dir)     # A2/EXP-9 residual drift (no-op if absent)
 
     # ---- after all sweeps: the cross-sweep comparison ----
     _plot_sensitivity(output_dir, fig_dir)

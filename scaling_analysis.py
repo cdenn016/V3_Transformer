@@ -148,9 +148,12 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # C2/EXP-5: per-seed converged final E-step F/token and test BPC (NaN when absent on older runs).
         f_seeds = [c for c in (_as_float(g.get("estep_final_f_per_token")) for g in grp) if np.isfinite(c)]
         bpc = [c for c in (_as_float(g.get("test_bpc")) for g in grp) if np.isfinite(c)]
+        # F1/EXP-6: per-seed test PPL for the muP K-stability figure (CE is the L(N) fit quantity above).
+        ppl = [c for c in (_as_float(g.get("test_ppl")) for g in grp) if np.isfinite(c) and c > 0]
         points.append({
             "route": route, "label": label, "scale_knob": grp[0]["scale_knob"],
             "n_params": float(np.mean(npars)) if npars else float("nan"),
+            "embed_dim": _as_float(grp[0].get("embed_dim")),         # F1/EXP-6 K axis
             "n_gen": _as_float(grp[0].get("n_gen")),
             "tokens_seen": _as_float(grp[0].get("tokens_seen")),
             "est_flops_6ND": _as_float(grp[0].get("est_flops_6ND")),
@@ -163,8 +166,35 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "f_seeds": f_seeds,
             "f_mean": float(np.mean(f_seeds)) if f_seeds else float("nan"),
             "bpc_mean": float(np.mean(bpc)) if bpc else float("nan"),
+            "ppl_mean": float(np.mean(ppl)) if ppl else float("nan"),
+            "ppl_sem": float(np.std(ppl, ddof=1) / np.sqrt(len(ppl))) if len(ppl) > 1 else 0.0,
         })
     return points
+
+
+def _kmup_series(param_points: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    r"""Group the grow_K / grow_K_mup points into the F1/EXP-6 ``kmup_stability`` series.
+
+    SPLITS the muP route's matched ``K{k}_fixed`` / ``K{k}_mup`` arms -- they share
+    ``route='grow_K_mup'`` (so a route-only grouping would collapse both into one duplicated-K curve
+    and destroy the |b_fixed - b_muP| width-stability contrast). Keys: ``grow_K`` (the standalone
+    width-fixed control), ``grow_K_mup/fixed``, ``grow_K_mup/mup`` -- one point per K each."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for p in param_points:
+        if p["route"] not in ("grow_K", "grow_K_mup"):
+            continue
+        if not (np.isfinite(_as_float(p.get("embed_dim"))) and np.isfinite(_as_float(p.get("ppl_mean")))):
+            continue
+        key = p["route"]
+        if p["route"] == "grow_K_mup":
+            lab = str(p.get("label", ""))
+            key = ("grow_K_mup/fixed" if lab.endswith("_fixed")
+                   else "grow_K_mup/mup" if lab.endswith("_mup") else "grow_K_mup")
+        out.setdefault(key, []).append({
+            "embed_dim": _as_float(p["embed_dim"]), "ppl_mean": _as_float(p["ppl_mean"]),
+            "ppl_sem": _as_float(p.get("ppl_sem", 0.0)), "n": int(p.get("n_seeds", 1)),
+        })
+    return out
 
 
 # =============================================================================
@@ -391,6 +421,15 @@ def _make_figures(param_points: List[Dict[str, Any]], infer_points: List[Dict[st
             _try("scaling_ce_vs_tokens.png", lambda: figs.plot_scaling_law(
                 param_points, x_key="tokens_seen", xlabel="tokens seen (data)",
                 title="Scaling vs data", path=str(fig_dir / "scaling_ce_vs_tokens.png")))
+
+    # F1/EXP-6: muP width-stability -- grow_K (width-fixed) vs grow_K_mup's matched _fixed/_mup arms on
+    # the shared K=embed_dim axis (test PPL per K + offset power-law fit, b annotated per arm). The
+    # split is in _kmup_series so the |b_fixed - b_muP| contrast survives. Auto-emits when any arm has
+    # >= 2 K cells.
+    kmup = _kmup_series(param_points)
+    if any(len(v) >= 2 for v in kmup.values()):
+        _try("kmup_stability.png", lambda: figs.plot_kmup_stability(
+            kmup, path=str(fig_dir / "kmup_stability.png")))
 
     if infer_points:
         # group the flat-N inference points by the knob they swept (n_e_steps / n_layers).

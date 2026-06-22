@@ -475,6 +475,7 @@ _VAL_DIAG_KEYS = (
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
     "estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
     "estep_r_phi_last", "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
+    "val_builder_resid",
 )
 
 
@@ -557,6 +558,19 @@ def _val_diagnostics(
             out["pos_loss_first_q"] = float(pos_ce[:q].mean())
             out["pos_loss_last_q"]  = float(pos_ce[-q:].mean())
             out["pos_loss_ratio"]   = float(pos_ce[-q:].mean() / pos_ce[:q].mean().clamp(min=1e-9))
+
+    # Builder-break gauge-equivariance residual per eval (A2/EXP-9): the head-mixer congruence defect
+    # at the converged belief (~eps under the tied gauge; climbs as the untied block_glk mixer drifts
+    # from identity -> the residual-drift-vs-step series). Only with a head mixer; isolated so a replay
+    # fault drops just this scalar (NaN-rectangular), not the whole val-diag row.
+    if model.head_mixer is not None:
+        try:
+            cst = ex.converged_state(model, val_tok)
+            br = M.head_mixer_gauge_residual(cst["mu"], cst["sigma"], model.head_mixer, model.group,
+                                             diagonal=model.cfg.diagonal_covariance)
+            out["val_builder_resid"] = float(torch.cat([br["mu_residual"], br["sigma_residual"]]).median())
+        except Exception:                                          # leave NaN; never fail the eval
+            pass
     return out
 
 

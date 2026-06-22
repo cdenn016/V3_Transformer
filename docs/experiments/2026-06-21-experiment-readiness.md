@@ -297,17 +297,17 @@ user's config WIP intact. Per-experiment how-to-run and what-remains:
 
 | Exp | Status now | Run it | Remaining (deferred) |
 |-----|-----------|--------|----------------------|
-| EXP-1 | RUNNABLE | `train_vfe3.py`: NUM_RUNS>1 + SEEDS + DATA_SEED, then `python multiseed_analysis.py` | noise-band overlay figure |
-| EXP-2 | RUNNABLE | `ablation.py` CONFIG["sweep"]="gauge_transport" | grouped-bar + residual-table figure |
+| EXP-1 | DONE (2026-06-22) | `train_vfe3.py`: NUM_RUNS>1 + SEEDS + DATA_SEED, then `python multiseed_analysis.py` | — (`ppl_noise_band` auto-emits) |
+| EXP-2 | DONE (2026-06-22) | `ablation.py` CONFIG["sweep"]="gauge_transport" | — (`gauge_transport_bars` auto-emits) |
 | EXP-3 | DONE (2026-06-22) | metrics + `belief_ce_bank` join + reliability/stratified/scatter figures + rho/CV in research.json | — (figures auto-emit via `generate_figures`) |
 | EXP-4 | DONE (2026-06-22) | `attention_entropy` 2×2 entropy×κ sweep + `attention_entropy_cov_gap` metric (cov_gap CSV col) + PPL-gap / cov-gap-vs-κ figures | — (per-sweep figures) |
 | EXP-5 | DONE (2026-06-22) | `infer_T` route + persisted `estep_final_f_per_token` + `f_ce_decorrelation`/`estep_capacity` figures + the two Pearsons | — (`scaling_analysis.py` after the `infer_T` run) |
-| EXP-6 | RUNNABLE | `scaling.py` CONFIG["routes"]=["grow_K_mup"] | K-axis power-law fit + bootstrap-CI figure |
+| EXP-6 | DONE (2026-06-22) | `scaling.py` CONFIG["routes"]=["grow_K","grow_K_mup"], then `scaling_analysis.py` | — (`kmup_stability` auto-emits) |
 | EXP-7 | DONE (2026-06-22) | `rho_handoff` sweep + per-cell `rank_resid`/`rank_resid_by_layer` + `rank_residual_by_depth` figure | — (per-sweep `rho_handoff_rank_collapse.png`) |
 | EXP-8 | DONE (2026-06-22) | gauge M-step sweeps + gated `cos_nat_phi`/`pullback_cond_*`/`wall_clock_s` in metrics.csv + `wallclock_convergence` figure (steps/wall-to-target) + LR bowl | — (per-sweep figures) |
-| EXP-9 | RUNNABLE | CONFIG["sweep"]="gauge_equivariance" (builder_resid in CSV) | residual-drift-vs-step figure |
-| EXP-10 | RUNNABLE | CONFIG["sweep"]="cg_coupling" (equiv residual in CSV) | combined equivariance+PPL bar figure |
-| EXP-11 | RUNNABLE | CONFIG["sweep"]="kappa_beta_per_head" | geo-mean-tau baseline arm + dispersion-scalar x-axis figure |
+| EXP-9 | DONE (2026-06-22) | CONFIG["sweep"]="gauge_equivariance" (per-eval val_builder_resid) | — (`gauge_residual_drift` auto-emits) |
+| EXP-10 | DONE (2026-06-22) | CONFIG["sweep"]="cg_coupling" (equiv residual in CSV) | — (`ppl_equivariance_bars` auto-emits) |
+| EXP-11 | DONE (2026-06-22) | CONFIG["sweep"]="kappa_beta_per_head" (geo-mean-τ arms added) | — (`kappa_dispersion` auto-emits) |
 
 The recurring deferred theme is FIGURES (a post-hoc plotting pass over `vfe3/viz/figures.py` once
 the runs produce CSVs) plus three involved infra items that each warrant their own careful pass:
@@ -356,6 +356,13 @@ and the EXP-8 training-time diagnostics — are closed.
   steps/wall-to-target annotated; the LR-vs-PPL bowl falls out of `_plot_one_sweep` on the
   `m_phi_lr_natgrad` numeric sweep.
 
-The whole top-8 experiment harness is now built. Remaining across the suite is the FIGURES tail for
-the lower-priority experiments (EXP-1/2/6/9/10/11 post-hoc plotters). See `docs/2026-06-22-edits.md`
-for detail.
+- **Figures tail (EXP-1/2/6/9/10/11) — DONE.** Six auto-dispatched figures wired to the standard
+  entry points (no manual step): `gauge_transport_bars` (EXP-2), `gauge_residual_drift` (EXP-9, off a
+  new per-eval `val_builder_resid` series), `ppl_equivariance_bars` (EXP-10), `kappa_dispersion`
+  (EXP-11, + geo-mean-τ confound-control arms), `kmup_stability` (EXP-6, via `scaling_analysis`),
+  `ppl_noise_band` (EXP-1, via `multiseed_analysis`). The EXP-2/9/10/11 figures emit per-sweep from
+  `ablation.main()`; EXP-6 from `scaling_analysis`; EXP-1 from `multiseed_analysis`.
+
+The entire EXP-1…EXP-11 experiment harness — config toggles, metrics, sweeps/routes, per-run
+diagnostics, and the auto-generating figure set — is now built and green (1218 passed / 0 failed). See
+`docs/2026-06-22-edits.md` for the per-commit detail.

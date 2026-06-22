@@ -2657,3 +2657,215 @@ def plot_wallclock_convergence(
         ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
+
+
+# ===========================================================================
+# Lower-priority experiment figures (auto-dispatched after their sweep / analysis)
+#   A1/EXP-2 gauge transport · A2/EXP-9 equivariance drift · A3/EXP-10 CG coupling
+#   H2/EXP-11 kappa dispersion · F1/EXP-6 muP K-stability · I1/EXP-1 noise band
+# ===========================================================================
+
+@register_figure("gauge_transport_bars")
+def plot_gauge_transport_bars(
+    cells,                               # list of {mode in {on,frozen,off}, depth, ppl, omega_dev}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""A1/EXP-2: gauge ON vs frozen-random vs OFF(Omega=I) validation PPL, grouped by depth L.
+
+    The program's central causal probe: does trained GL(K) transport beat the exact Omega=I control?
+    The OFF arm's max|Omega-I| (omega_dev) is annotated to certify the frame really collapsed to the
+    identity to float eps. Predict ON < FROZEN <= OFF if transport carries the advantage."""
+    cells = list(cells)
+    modes = [("on", _CB[2]), ("frozen", _CB[4]), ("off", _CB[1])]
+    depths = sorted({str(c["depth"]) for c in cells})
+
+    def _v(mode, depth, key):
+        m = [c for c in cells if c["mode"] == mode and str(c["depth"]) == depth]
+        return float(m[0][key]) if m and m[0].get(key) is not None else float("nan")
+    x = np.arange(len(depths)); w = 0.26
+    fig, ax = plt.subplots(figsize=(7.0, 4.6))
+    for i, (mode, col) in enumerate(modes):
+        ax.bar(x + (i - 1) * w, [_v(mode, d, "ppl") for d in depths], w, color=col, label=mode)
+    for di, d in enumerate(depths):
+        dev = _v("off", d, "omega_dev")
+        if np.isfinite(dev):
+            ax.annotate(rf"$|\Omega-I|$={dev:.0e}", (x[di] + w, _v("off", d, "ppl")),
+                        textcoords="offset points", xytext=(0, 4), ha="center", fontsize=7)
+    ax.set_xticks(x); ax.set_xticklabels(depths)
+    ax.set(xlabel="depth", ylabel="validation PPL")
+    ax.set_title("GL(K) gauge transport: ON vs frozen vs OFF (Ω=I)")
+    ax.legend(fontsize=8, frameon=False, title="gauge")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("gauge_residual_drift")
+def plot_gauge_residual_drift(
+    arms,                                # list of {label, step:[...], resid:[...]}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""A2/EXP-9: builder-break gauge residual vs training step, tied (exact) vs untied (mixer drift).
+
+    Step 0 is byte-identical (~eps) for both arms (identity-init mixer); only the untied block_glk arm
+    climbs as the head mixer drifts from the identity and breaks equivariance. log-y so the climb from
+    float-eps is legible."""
+    arms = [a for a in arms if len(a.get("resid", [])) >= 1]
+    fig, ax = plt.subplots(figsize=(6.6, 4.6))
+    for j, a in enumerate(arms):
+        s = np.asarray(a["step"], float)
+        r = np.clip(np.asarray(a["resid"], float), 1e-12, None)
+        order = np.argsort(s)
+        ax.plot(s[order], r[order], "o-", color=_CB[j % len(_CB)], lw=1.6, ms=4, label=str(a.get("label", j)))
+    ax.set_yscale("log")
+    ax.set(xlabel="training step", ylabel="builder-break gauge residual (log)")
+    ax.set_title("Tied (exact) vs untied (mixer drift) gauge equivariance")
+    if arms:
+        ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("ppl_equivariance_bars")
+def plot_ppl_equivariance_bars(
+    cells,                               # list of {label, ppl, resid}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""A3/EXP-10: per-arm validation PPL with the median gauge equivariance residual on a twin axis.
+
+    The Clebsch-Gordan cross-irrep coupling is exactly equivariant for ANY learned path weights, so the
+    residual stays ~eps on both arms (off/on) and the bar contrast is a clean PPL-delta at matched
+    equivariance -- the capacity the only exactly-equivariant inequivalent-irrep channel buys."""
+    cells = list(cells)
+    labels = [str(c["label"]) for c in cells]
+    x = np.arange(len(cells))
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    ax.bar(x, [float(c["ppl"]) for c in cells], 0.5, color=_CB[0], label="val PPL")
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_ylabel("validation PPL")
+    resid = [float(c["resid"]) if np.isfinite(_as_f(c.get("resid"))) else np.nan for c in cells]
+    if any(np.isfinite(resid)):
+        axr = ax.twinx()
+        axr.plot(x, resid, "s--", color=_CB[1], lw=1.4, label="equivariance residual")
+        axr.set_ylabel("median equivariance residual")
+        axr.set_yscale("log"); axr.grid(False)
+    ax.set_title("Clebsch-Gordan coupling: PPL + equivariance residual")
+    fig.legend(fontsize=8, frameon=False, loc="upper right")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("kappa_dispersion")
+def plot_kappa_dispersion(
+    cells,                               # list of {label, dispersion, ppl}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""H2/EXP-11: validation PPL vs per-head temperature dispersion std(kappa_beta).
+
+    Tied arms (uniform, and the geo-mean-tau confound control) sit at dispersion 0; the dispersed arms
+    hold the arithmetic mean at 1.0 so the x-axis isolates per-head asymmetry. A separation between the
+    tied baselines and the dispersed arms is the per-head-temperature effect (the geo-mean baseline
+    controls for the mean-tau shift the dispersed arms carry)."""
+    cells = list(cells)
+    pts = sorted([(float(c["dispersion"]), float(c["ppl"]), str(c.get("label", ""))) for c in cells],
+                 key=lambda t: t[0])
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-", color=_CB[0], lw=1.6)
+    for d, y, lab in pts:
+        ax.annotate(lab, (d, y), textcoords="offset points", xytext=(4, 4), fontsize=7)
+    ax.set(xlabel=r"per-head temperature dispersion std$(\kappa_\beta)$", ylabel="validation PPL")
+    ax.set_title("Per-head temperature dispersion vs PPL")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("kmup_stability")
+def plot_kmup_stability(
+    routes,                              # dict {route: [{embed_dim, ppl_mean, ppl_sem}...]}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""F1/EXP-6: inverse-K scaling width-fixed (grow_K) vs muP-corrected (grow_K_mup) on a shared
+    K=embed_dim axis.
+
+    test PPL vs K per route with cross-seed 95% CI bars (the small-sample t-quantile, not a fixed 1.96)
+    and an offset power-law fit PPL = A K^{-alpha} + E overlaid; the exponent b = -alpha is annotated
+    per route. The grow_K_mup route is split into its matched /fixed and /mup arms upstream, so
+    |b_fixed - b_muP| -- the width-stability readout -- is read directly off the two muP curves; a large
+    gap means the headline exponent is partly optimization mis-tuning the muP correction removes."""
+    fig, ax = plt.subplots(figsize=(6.8, 4.8))
+    for j, (name, pts) in enumerate(routes.items()):
+        pts = sorted(pts, key=lambda p: float(p["embed_dim"]))
+        K = np.array([float(p["embed_dim"]) for p in pts], float)
+        y = np.array([float(p["ppl_mean"]) for p in pts], float)
+        ci = np.array([_t95(int(p.get("n", 2))) * float(p.get("ppl_sem", 0.0)) for p in pts], float)
+        col = _CB[j % len(_CB)]
+        ax.errorbar(K, y, yerr=ci, fmt="o", color=col, capsize=3, lw=1.4, label=name)
+        if K.size >= 2:
+            fit = _fit_power_law(K, y, with_offset=True)
+            a = fit.get("alpha", float("nan"))
+            if np.isfinite(a):
+                Kf = np.linspace(float(K.min()), float(K.max()), 100)
+                ax.plot(Kf, fit["A"] * Kf ** (-a) + fit.get("E", 0.0), "-", color=col, lw=1.3, alpha=0.7)
+                ax.plot([], [], " ", label=f"   {name}: b={-a:+.3f}")
+    ax.set(xlabel="K (embed_dim)", ylabel="test PPL")
+    ax.set_title("μP width-stability of the inverse-K exponent")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("ppl_noise_band")
+def plot_ppl_noise_band(
+    agg,                                 # aggregate_seed_metric output: {values, seeds, mean, sd}
+
+    *,
+    label: str  = "K=20 baseline",
+    grid:  Optional[Dict] = None,        # optional {ablation label: single-seed ppl} overlay
+    path:  Optional[str]  = None,
+):
+    r"""I1/EXP-1: per-seed test PPL with the across-seed mean ± 1 SD (and ± 2 SD) band -- the seed
+    noise floor every ablation 'win' must clear.
+
+    The band is the init+optimization spread (the per-run reseed shares the data order; a lower bound
+    on deployment variance). An optional ``grid`` overlays single-seed ablation cells so a referee can
+    read directly whether a cell's margin exceeds the band."""
+    vals = np.asarray(agg.get("values", []), float)
+    mean, sd = float(agg.get("mean", float("nan"))), float(agg.get("sd", float("nan")))
+    fig, ax = plt.subplots(figsize=(7.0, 4.4))
+    if np.isfinite(mean):
+        ax.axhline(mean, color=_CB[0], lw=1.6, label=f"mean={mean:.3f}")
+        if np.isfinite(sd):
+            ax.axhspan(mean - 2 * sd, mean + 2 * sd, color=_CB[0], alpha=0.08, label="±2 SD")
+            ax.axhspan(mean - sd, mean + sd, color=_CB[0], alpha=0.18, label="±1 SD")
+    seeds = agg.get("seeds", list(range(vals.size))) or list(range(vals.size))
+    xs = np.arange(vals.size)
+    ax.scatter(xs, vals, color=_CB[1], zorder=3, label="per-seed test PPL")
+    ticks, ticklabels = list(xs), [str(s) for s in seeds[:vals.size]]
+    if grid:
+        gl = list(grid.items())
+        gx = np.arange(vals.size, vals.size + len(gl))
+        ax.scatter(gx, [float(v) for _, v in gl], color=_CB[3], marker="^", zorder=3, label="ablation cells")
+        ticks += list(gx); ticklabels += [str(k) for k, _ in gl]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(ticklabels, rotation=45, ha="right", fontsize=7)
+    ax.set(xlabel="seed / cell", ylabel="test PPL")
+    ax.set_title(f"Multi-seed variance floor ({label})")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def _as_f(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")

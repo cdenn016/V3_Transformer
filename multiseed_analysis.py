@@ -111,6 +111,20 @@ def main() -> None:
     print("  NOTE: data order is shared across seeds (per-run reseed), so this SD is the "
           "init+optimization spread only -- a LOWER BOUND on deployment variance.")
 
+    # I1/EXP-1 noise-band figure: per-seed PPL + the mean +/- SD band, written under run_root/figures.
+    # Best-effort (matplotlib optional / headless), like every other figure pass in the suite.
+    try:
+        from vfe3.viz import figures as figs
+        figs.set_publication_style()
+        fig_dir = Path(CONFIG["run_root"]) / "figures"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        out_png = fig_dir / "ppl_noise_band.png"
+        fig = figs.plot_ppl_noise_band(out, label=str(CONFIG["key"]), path=str(out_png))
+        figs.plt.close(fig)
+        print(f"  figure -> {out_png}")
+    except Exception as exc:                                      # plotting is best-effort, never fatal
+        print(f"  (noise-band figure skipped: {exc})")
+
 
 if __name__ == "__main__":
     main()

@@ -22,9 +22,9 @@ This cluster owns the program's central causal claim and the representation-theo
 
 **A1. Gauge ON vs OFF (Ω=I) vs frozen-random.** Merges S1 [gauge] and S2 [ml-engineer], which are the same experiment reached by two lenses: realize gauge-OFF by `phi_scale=0` + `e_phi_lr=0` + `m_phi_lr=0` + `pos_phi='none'` so Ω=exp(0)exp(0)=I exactly, a frozen-random control at `phi_scale=0.06` with the learning rates zeroed, and the trained baseline. S2 contributes the depth arm (L=2/3, since at L=1 rank-collapse cannot manifest) and the parameter-count and `use_head_mixer=False` confound controls. The decision rule is non-overlapping ±1 SD bands at ≥3 seeds, not a speculative ≥5% margin.
 
-**A2. Exact-equivariant tied vs strictly-broken untied gauge.** S16 [gauge] — the residual-vs-step drift of `block_glk`+`use_head_mixer` (broken as the mixer drifts) against `tied_block_glk` (exact), with the PPL cost of strict equivariance as the open empirical question. Requires `family='gaussian_full'` + `use_prior_bank=True` and a per-eval residual hook (the metric currently fires only once at end-of-run).
+**A2. Exact-equivariant tied vs strictly-broken untied gauge.** S16 [gauge] — the residual-vs-step drift of `block_glk`+`use_head_mixer` (broken as the mixer drifts) against `tied_block_glk` (exact), with the PPL cost of strict equivariance as the open empirical question. Requires `family='gaussian_full'` + `use_prior_bank=True` and a per-eval residual hook (the metric currently fires only once at end-of-run). *Built (2026-06-22): the per-eval builder-break residual (`val_builder_resid`) is logged in `_val_diagnostics`, and `gauge_residual_drift` auto-plots the tied-vs-untied drift vs step.*
 
-**A3. Clebsch-Gordan cross-irrep coupling.** S5 [gauge] — `use_cg_coupling` is the only exactly-equivariant inequivalent-irrep channel; a Schur-commutant head mixer is structurally forbidden across irrep types. Test on an SO(3) two-type tower; the equivariance half is near-certain, the capacity (PPL-delta) half is the genuine gamble, capped because CG is means-only.
+**A3. Clebsch-Gordan cross-irrep coupling.** S5 [gauge] — `use_cg_coupling` is the only exactly-equivariant inequivalent-irrep channel; a Schur-commutant head mixer is structurally forbidden across irrep types. Test on an SO(3) two-type tower; the equivariance half is near-certain, the capacity (PPL-delta) half is the genuine gamble, capped because CG is means-only. *Built (2026-06-22): `ppl_equivariance_bars` auto-plots per-arm PPL with the median equivariance residual for the `cg_coupling` sweep.*
 
 **A4. Trained Regime-II connection: holonomy and route covariance.** Merges S26 [gauge], S35 [gauge], and the holonomy half of S34/S36 [statmech-dyn]. The settled half (telescoping, Route-A-vs-B asymmetry) is pinned by existing tests; the open empirical contribution is the trainability-at-scale curve (does CE training drive `connection_W`/`connection_M` to a stable nonzero optimum, and does holonomy track ‖connection‖) plus a new training-time rebuilt-equivariance probe. S26's span/holonomy-locality probe rides on this as a cheap follow-up, conditioned on `pos_rotation='rope'`.
 
@@ -86,7 +86,7 @@ These test the meta_entropy.tex and belief_inertia.tex predictions (open thread 
 
 **H1. Offset-only priors extrapolate; absolute/RoPE do not.** S21 [transformer] — train at `max_seq_len=128`, eval at growing N; ALiBi/T5 (functions of |i−j|) extrapolate, `pos_phi='learned'` and RoPE do not. Fix the two code traps: `pos_phi` truncates (shape error, not IndexError — test with a shorter table) and `t5_max_distance` must be ≥ max eval-N to isolate offset from bucket saturation.
 
-**H2. Per-head temperature dispersion.** S20 [transformer] — a hand-set per-head `kappa_beta` list (zero added params) vs a tied-tau baseline retuned to the geometric-mean tau (the mandatory confound control). The learnable arm is unbuilt; scope to the hand-grid.
+**H2. Per-head temperature dispersion.** S20 [transformer] — a hand-set per-head `kappa_beta` list (zero added params) vs a tied-tau baseline retuned to the geometric-mean tau (the mandatory confound control). The learnable arm is unbuilt; scope to the hand-grid. *Built (2026-06-22): the `kappa_beta_per_head` sweep gained the geo-mean-τ confound-control arms, and `kappa_dispersion` auto-plots PPL vs std(κ_β).*
 
 ### Cluster I — Empirical rigor and ablations
 
@@ -137,6 +137,8 @@ Ranked by impact × feasibility, ties broken by novelty. Stars: ★★★★★ 
 
 The discipline gate for every other ablation: nothing else's "win" is interpretable without it.
 
+**Status (2026-06-22): built.** Across-seed aggregator (`multiseed_analysis.aggregate_seed_metric`), the fixed data-order generator (`DATA_SEED`), and the `ppl_noise_band` figure (per-seed PPL + mean±SD band, auto-emitted by `multiseed_analysis.py`) are in. See `docs/2026-06-22-edits.md`.
+
 - **Config.** Baseline `train_vfe3.py`: `embed_dim=20`, `n_heads=2`, `n_layers=1`, `max_steps=15000`, `gauge_group='block_glk'`, `use_head_mixer=True`, `lambda_h=0.25`. Set `NUM_RUNS=5`, `SEEDS=[6,64,23,3,17]`.
 - **Baseline/control.** The five seeds are the experiment; no separate control.
 - **Primary metric.** Across-seed mean and SD of `test_ppl` from the five `test_results.json`. **Secondary.** Read the existing single-seed `m_p_mu_lr`/`m_phi_lr`/`lambda_h`/`kappa_beta` grids and flag every cell whose between-cell spread < 2 SD.
@@ -149,7 +151,7 @@ The discipline gate for every other ablation: nothing else's "win" is interpreta
 
 The single experiment that converts the program's central causal claim from hedged conjecture to measured result, in either direction.
 
-**Status (2026-06-22): harness built + run.** The `gauge_transport` sweep arm (3 cells × L{1,2}, `collect_diagnostics`) is registered in `ablation.py` (commit 31cdae5 + the readiness build); the user has run the ON/OFF/frozen ablation. Deferred: the grouped-bar + residual-table figure.
+**Status (2026-06-22): built + run.** The `gauge_transport` sweep arm (3 cells × L{1,2}, `collect_diagnostics`) is registered in `ablation.py` (commit 31cdae5 + the readiness build); the user has run the ON/OFF/frozen ablation; the `gauge_transport_bars` grouped-bar figure (val PPL by mode×depth, max|Ω−I| annotated) now auto-emits per sweep. See `docs/2026-06-22-edits.md`.
 
 - **Config.** New `ablation.py` SWEEPS `'gauge_transport'` multi-arm entry, all sharing matched `phi_weight_decay`, `lambda_alpha_mode`, `precision_weighted_attention`, and `use_head_mixer=False`:
   - **ON:** `{use_head_mixer:False}` (baseline `phi_scale=0.06`, `m_phi_lr=0.015`).
@@ -213,6 +215,8 @@ Pre-built registered sweep; the theory is settled so the value is the unrun PPL-
 ### EXP-6. μP width-stability of the inverse-K exponent (F1) — ★★★★
 
 Decides whether the headline scaling exponent is a capacity law or partly optimization mis-tuning.
+
+**Status (2026-06-22): built.** The `grow_K_mup` route (per-K kl_max + μP LR/init scaling) exists; `scaling_analysis` now carries `embed_dim` + test PPL and auto-emits `kmup_stability` (grow_K vs grow_K_mup on the K axis, offset power-law fit, b annotated). See `docs/2026-06-22-edits.md`.
 
 - **Config.** Add `route_grow_k_mup` to `scaling.py` mirroring `route_grow_k`, anchored at K=20: scale `e_q_mu_lr`, `m_p_mu_lr` ~ (20/K) and `mu_init_std` ~ √(20/K). **Mandatory in BOTH arms:** recompute `kl_max = 8*embed_dim` per cell (the baseline freezes it at 160 from embed_dim=20 — a width confound that zeros the hyper-prior self-gradient near K≈126, i.e. at K=120). K∈{20,40,80,120}, iso-token.
 - **Baseline/control.** Width-fixed `route_grow_k` (with kl_max-per-K corrected) is the control. Secondary: a direct LR grid at K=20 and K=120 to separate "μP rule mis-specified for the preconditioned E-step" from "no width effect."
