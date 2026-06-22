@@ -382,3 +382,15 @@ diagnostics, and the auto-generating figure set — is now built and green (1218
 - **B3 / #14 (Fisher nat-grad E-step μ-arm) — DONE (2026-06-22).** New `e_step_mu_precond='fisher'|'raw'`
   (the mean-arm ablation, σ retraction untouched, byte-identical default); the `fisher_mu_precond`
   sweep (×n_e_steps) auto-plots `mu_precond` (PPL vs n_e_steps, Fisher vs raw).
+- **E1/E2/E3 + A4/A4b (runnable diagnostics) — DONE (2026-06-22).** Sweep entries `amp_dtype` (E2),
+  `spd_retract_mode` + `sigma_max` (E1), `e_mu_q_trust` (E3), `regime_ii` (A4) make these runnable; the
+  readouts are the `_plot_one_sweep` PPL bar plus the already-logged `guard_sigma_ceil_frac` /
+  `nonfinite_frac` columns. A4 adds `holonomy_trainability` (holonomy vs ‖connection_W‖ from the
+  regime_ii metrics.csv); A4b is already covered (`plot_holonomy_curvature` Panel B auto-emits).
+
+This closes the runnable / small-build tier. The remaining hypotheses split into: (a) **medium new
+harnesses** — G1 (χ=1/α field-perturbation response), G2 (Sanov per-token F-density rate), G3
+(symplectic/leapfrog E-step with velocity state), F4 (RG community-depth scaling), F3 VFE-internal
+budget-scaling route — each a focused day of new extractor/integrator code; and (b) **fenced** items
+needing absent infrastructure — J1 (UD/CoNLL-U dependency-parse pipeline), F3 cross-architecture half
+(standard-transformer baseline), G4 (meta-ensemble sampler) — not worth building speculatively.

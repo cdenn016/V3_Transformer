@@ -2962,3 +2962,36 @@ def plot_mu_precond(
     ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
+
+
+@register_figure("holonomy_trainability")
+def plot_holonomy_trainability(
+    arms,                                # list of {label, step, connection_norm, holonomy}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""A4/EXP-15: belief-transport holonomy vs the learned gauge-connection norm over training.
+
+    The trainability curve for the Regime-II connection: as CE training drives ||connection_W|| up
+    from 0, does the holonomy ||H-I||_F track it? Each point is one eval, colored by training step;
+    a monotone climb is the open empirical contribution (the telescoping/Route-asymmetry half is
+    test-pinned)."""
+    arms = [a for a in arms if len(a.get("connection_norm", [])) >= 1]
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    sc = None
+    for j, a in enumerate(arms):
+        x = np.asarray(a["connection_norm"], float)
+        y = np.asarray(a["holonomy"], float)
+        s = np.asarray(a.get("step", np.arange(x.size)), float)
+        sc = ax.scatter(x, y, c=s, cmap="viridis", s=40, edgecolor="k", linewidth=0.3,
+                        label=str(a.get("label", j)))
+    if sc is not None:
+        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label="training step")
+    ax.set(xlabel=r"gauge connection norm $\|connection_W\|$",
+           ylabel=r"holonomy deviation $\|H-I\|_F$")
+    ax.set_title("Regime-II connection trainability: holonomy vs ‖connection‖")
+    if arms:
+        ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)

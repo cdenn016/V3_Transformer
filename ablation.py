@@ -571,6 +571,58 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         ],
     },
 
+    # === lower-priority runnable diagnostics (E1/E2/E3/A4; 2026-06-22 audit tail) ===========
+    "amp_dtype": {  # E2 / EXP-23: bf16 autocast transport-matmul exposure. decode/CE/SPD/transport are
+        # fp32-islanded, so the only genuine bf16 exposure is the upstream transport matmuls; the
+        # predicted null (PPL/entropy within noise) certifies bf16 as a safe throughput default.
+        "description": "autocast dtype: fp32 vs bf16 vs fp16 (transport-matmul exposure) [E2/EXP-23]",
+        "configs": [
+            {"label": "fp32", "amp_dtype": None},
+            {"label": "bf16", "amp_dtype": "bf16"},
+            {"label": "fp16", "amp_dtype": "fp16"},
+        ],
+    },
+
+    "spd_retract_mode": {  # E1 / EXP-20: SPD chart -- spd_affine (whitens by 1/sigma) vs log_euclidean.
+        # sigma_max pinned to the live 10.0 (not the dead BASELINE 1000 that never binds) so the
+        # congruence-break ceiling can bind; guard_sigma_ceil_frac (already logged per eval) reads it.
+        "description": "SPD retraction chart: spd_affine vs log_euclidean (sigma_max=10) [E1/EXP-20]",
+        "configs": [
+            {"label": "spd_affine",    "spd_retract_mode": "spd_affine",    "sigma_max": 10.0},
+            {"label": "log_euclidean", "spd_retract_mode": "log_euclidean", "sigma_max": 10.0},
+        ],
+    },
+
+    "sigma_max": {  # E1 / EXP-20: does the SPD variance ceiling ever bind? (read guard_sigma_ceil_frac)
+        "description": "SPD variance ceiling sigma_max (binding vs slack) [E1/EXP-20]",
+        "param": "sigma_max", "values": [5.0, 10.0, 100.0],
+    },
+
+    "e_mu_q_trust": {  # E3 / EXP-24: mean trust region as a stability guard. The endpoint is the
+        # NaN/loss-spike rate (nonfinite_frac, already logged per eval), NOT PPL -- it is near-inert at
+        # the production embed_dim<=64 / e_q_mu_lr operating point; it binds only at large embed_dim or
+        # raised LR. 'off' (None) is the unbounded baseline.
+        "description": "E-step mean trust-region radius (box mode); endpoint = nonfinite_frac [E3/EXP-24]",
+        "configs": [
+            {"label": "off",     "e_mu_q_trust": None, "mu_trust_mode": "box"},
+            {"label": "trust_5", "e_mu_q_trust": 5.0,  "mu_trust_mode": "box"},
+            {"label": "trust_2", "e_mu_q_trust": 2.0,  "mu_trust_mode": "box"},
+            {"label": "trust_1", "e_mu_q_trust": 1.0,  "mu_trust_mode": "box"},
+        ],
+    },
+
+    "regime_ii": {  # A4 / EXP-15: trained Regime-II connection trainability (flat vs learned connection_W).
+        # transport_mode='regime_ii' auto-enables oracle_unroll_grad and creates the learned bilinear
+        # connection_W; connection_w_norm + holonomy_deviation are logged per eval -> the holonomy-vs-
+        # ||connection|| trainability scatter (_plot_holonomy_trainability). Opt-in, equivariance-
+        # breaking at nonzero W (default OFF; user-accepted -- see CLAUDE.md exception (3)).
+        "description": "Regime-II connection: flat vs learned; holonomy vs ||connection|| trainability [A4/EXP-15]",
+        "configs": [
+            {"label": "flat",      "transport_mode": "flat"},
+            {"label": "regime_ii", "transport_mode": "regime_ii"},
+        ],
+    },
+
     "rho_handoff": {  # F2 / EXP-7: prior-anchoring as the FFN-brake substitute against rank collapse.
         # The Dong rank-one residual r(X) of the per-token mean cloud is read off PER LAYER from one
         # deep model per arm (across_layer_belief_trace -> rank_resid_by_layer in each cell's
@@ -1975,6 +2027,41 @@ def _plot_gauge_residual_drift(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
+def _plot_holonomy_trainability(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""A4/EXP-15 holonomy-vs-||connection|| scatter from each cell's metrics.csv (connection_w_norm +
+    holonomy_deviation per eval). connection_w_norm is logged only on a regime_ii run, so this no-ops
+    unless a cell carries >= 2 such eval rows (the flat arm is correctly excluded)."""
+    arms: List[Dict[str, Any]] = []
+    for cell in sorted(sweep_dir.glob("*/metrics.csv")):
+        steps, cn, hol = [], [], []
+        try:
+            with open(cell, newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    c, h = _as_float(row.get("connection_w_norm")), _as_float(row.get("holonomy_deviation"))
+                    if c < float("inf") and h < float("inf"):       # regime_ii eval rows carry both
+                        steps.append(_as_float(row.get("step")))
+                        cn.append(c)
+                        hol.append(h)
+        except Exception:                                           # unreadable metrics.csv -> skip
+            continue
+        if len(cn) >= 2:
+            arms.append({"label": cell.parent.name, "step": steps, "connection_norm": cn, "holonomy": hol})
+    if not arms:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_holonomy_trainability
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"holonomy-trainability figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_holonomy_trainability.png"
+    plt.close(plot_holonomy_trainability(arms, path=str(out)))
+    print(f"  figure -> {out}")
+
+
 def _plot_mu_precond(sweep_dir: Path, fig_dir: Path) -> None:
     r"""B3/EXP-14 PPL-vs-n_e_steps figure, Fisher vs raw mean preconditioner, from the
     fisher_mu_precond cells (label '<precond>_T<n_e_steps>'). No-op unless >= 2 such cells finished."""
@@ -2161,6 +2248,7 @@ def main() -> None:
         _plot_pos_extrapolation(sweep_dir, fig_dir)        # H1/EXP-13 CE-vs-N extrapolation (no-op if absent)
         _plot_renyi_saturation(sweep_dir, fig_dir)         # B2/EXP-12 entropy+saturation vs alpha (no-op if absent)
         _plot_mu_precond(sweep_dir, fig_dir)               # B3/EXP-14 Fisher-vs-raw mean precond (no-op if absent)
+        _plot_holonomy_trainability(sweep_dir, fig_dir)    # A4/EXP-15 holonomy vs ||connection|| (no-op if absent)
 
     # ---- after all sweeps: the cross-sweep comparison ----
     _plot_sensitivity(output_dir, fig_dir)
