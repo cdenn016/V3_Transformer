@@ -120,3 +120,29 @@ Second batch (B1 through B8):
 - B6 (supplementary 380, 284, 278): weakened the line-380 claim to beta-fixed convexity (not local attractivity, consistent with line 392); qualified the tau to 0 vanishing of the softmax-correction term as pointwise but non-uniform near attention ties (decay O(tau), non-monotone) at lines 284 and 278.
 - B7 (attention 2340, supplementary 954): labeled the arithmetic transport average as a flat coordinate diagnostic, noting GL(K) is non-convex so the mean can be singular; a group-respecting coarse-graining would use a projected, log-Euclidean, or Karcher mean.
 - B8 (supplementary 45, attention 2450): added Appendix I (prior-bank decode) to both appendix summaries.
+
+## Batch 3 (D1-D10) edits applied (2026-06-22)
+
+Verified by a 20-agent workflow (expert investigator + adversarial skeptic per claim; B1/B3-style math rechecked). All ten were CORRECT or PARTIALLY_CORRECT. Static checks after editing: refs resolve, braces balance, `\IF/\ENDIF` matched, no banned `\,` macros, no residual `SE(K)` or `GL(15/10)`.
+
+- D1 (Algorithm 1, att): split the gauge-frame E-step into the reported-canonical schedule (phi held to the M-step, `eta_phi^E = 0`) and an optional in-E-step schedule via `\IF{eta_phi^E > 0}`, and clarified the caption. Matches runtime (`vfe3/config.py` `e_phi_lr` default 0.0, `m_phi_lr` default on).
+- D2 (Algorithm 1, att): the covariance update now reads `Retract_SPD(Sigma, -2 eta Sigma sym(grad) Sigma)` with `sym` defined, matching the supplement's Fisher-Rao step (the printed gradient is already symmetric, so `sym` is the identity here, but the notation now matches).
+- D3 (att): replaced "the transport operators Omega_ij between agents do [exhaust GL+(K)]" with the single-edge-expressivity statement plus the global-cocycle/DOF caveat (Lemma vanishing-holonomy).
+- D4 (att): RoPE relaxes the constant-transport limit, not the flat-bundle condition (it stays a flat vertex-frame coboundary). Fixed the line-1905 and line-2041 prose and the interpolation-equation underbrace ("Standard attention (constant transport)").
+- D5 (att): softened "unreduced theory/framework/forms" / "Full General Model" to "the full gauge model under a diagonal-covariance approximation" (and concise variants) at the abstract, intro, experimental design, section title, and conclusion; left the honest limitation at the diagonal-covariance-RoPE paragraph and the disclosures intact.
+- D6 (att): narrowed "all gradient derivations carry over" (Renyi) to the softmax/attention-weight and product-rule gradients, and explicitly fenced the closed-form geometric-mean belief update, the forward-KL uniqueness theorem (Appendix H), and the covariance fixed-point algebra (Appendix B) as alpha=1 specific.
+- D7 (supp): renamed the traceless symmetric summand `Sym(K) -> Sym_0(K)` in the Cartan decomposition (and its back-reference), reserving `Sym(K)` for all symmetric matrices; reconciled the line-565 "no retraction beyond clipping" claim with the implemented BCH/norm-ceiling/determinant-control retraction.
+- D8 (supp): softened the gauge-frame validation claim (the matrix_exp autodiff check validates the differential convention, not an independent oracle for the assembled phi gradient) and recommended a central-finite-difference-in-phi check of the scalar free energy for parity with mu/Sigma.
+- D9 (att): renamed the line-1582 "Killing-form Lie-group Riemannian gradient on gl(K)" to "implemented Cartan-involution-modified preconditioner," with the non-Ad-invariance note (Killing form degenerate/indefinite on gl(K); Ad-invariant only under O(K)).
+- D10 (att): `SE(K) -> SO(K)` covariance at both the experimental-design (2063) and limitation (2384) occurrences (RoPE acts by rotations only, no translations); left the supplement's `SE` ("standard error") untouched.
+
+## B1 fix checked against the codebase (`vfe3`)
+
+The user asked whether the corrected B1 manuscript matches the implementation. It does, and the fix actually resolved a prior manuscript-vs-code mismatch.
+
+- `vfe3/alpha_i.py` defines the manuscript objects verbatim: `alpha_regularizer` = `R(alpha) = b0*alpha - c0*log(alpha)`, and `alpha_state_dependent` = `alpha* = c0/(b0 + D_KL)`.
+- The belief-gradient kernel uses the ENVELOPE coefficient `alpha*`, not the `(alpha*)^2 b0/c0` surrogate: `vfe3/gradients/kernels.py:285` calls `alpha_gradient_coefficient(...)` (which returns `alpha*`), and line 130 forms `self_mu = alpha_coef * (mu_q - mu_p)/sp`, i.e. `alpha* * dD_KL`. The docstring states "the coefficient is alpha* itself ... no product-rule correction is needed (R must be present in F)."
+- The free energy includes `R(alpha)`: `vfe3/free_energy.py:377-378` adds `alpha_reg` to the self-term. So the envelope cancellation (chain terms through `alpha*` cancel against `dR(alpha*)`) is exactly the precondition the corrected manuscript states, and the autograd oracle differentiating the full F reproduces the same `alpha* dD_KL`.
+- The `(alpha*)^2 b0/c0` surrogate is NOT used in the default path; it is the "differentiate `alpha* D_KL` alone, R omitted" path the manuscript presents as a distinct surrogate.
+
+The old manuscript sentence I removed in the B1 fix ("Our reference implementation evaluates the corrected form (transformer/core/vfe_gradients.py)") had MISDESCRIBED the code: it claimed the implementation evaluates the product-rule `(alpha*)^2 b0/c0` form, whereas the code uses the envelope `alpha*` form ("no product-rule correction is needed"), and it cited a stale pre-rebuild path. The B1 edit therefore brought the manuscript into agreement with the implementation.
