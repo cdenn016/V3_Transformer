@@ -366,3 +366,31 @@ and the EXP-8 training-time diagnostics — are closed.
 The entire EXP-1…EXP-11 experiment harness — config toggles, metrics, sweeps/routes, per-run
 diagnostics, and the auto-generating figure set — is now built and green (1218 passed / 0 failed). See
 `docs/2026-06-22-edits.md` for the per-commit detail.
+
+- **H1 / #13 (offset-only positional extrapolation) — DONE (2026-06-22).** Beyond the top-11: the
+  buildability audit's top remaining pick. The `pos_extrapolation` sweep (alibi/t5/learned/rope) +
+  `_eval_at_growing_n` (CE at N up to 4× max_seq_len) auto-emit the `pos_extrapolation` CE-vs-N figure;
+  both code traps fixed (the `pos_phi='learned'` table now clamps past `max_seq_len`; `t5_max_distance`
+  raised in the T5 arm). The remaining hypotheses (#14-#28) are surveyed in `docs/2026-06-22-edits.md`
+  / the audit: a few small builds (B2 Rényi-saturation, B3 Fisher-NG μ-arm), several runnable-now
+  diagnostics (A4/A4b/E1/E2/E3), and the fenced items needing absent infra (J1 parse pipeline, F3
+  standard-transformer baseline, G4 meta-ensemble sampler).
+
+- **B2 / #12 (Rényi α-attention saturation) — DONE (2026-06-22).** The `renyi_order` sweep spans α
+  both sides of 1 on the oracle + `collect_diagnostics`; `energy_klmax_frac` (kl_max energy-saturation
+  fraction) is a per-cell column; `renyi_saturation` auto-plots H(β)-vs-α + saturation-vs-α.
+- **B3 / #14 (Fisher nat-grad E-step μ-arm) — DONE (2026-06-22).** New `e_step_mu_precond='fisher'|'raw'`
+  (the mean-arm ablation, σ retraction untouched, byte-identical default); the `fisher_mu_precond`
+  sweep (×n_e_steps) auto-plots `mu_precond` (PPL vs n_e_steps, Fisher vs raw).
+- **E1/E2/E3 + A4/A4b (runnable diagnostics) — DONE (2026-06-22).** Sweep entries `amp_dtype` (E2),
+  `spd_retract_mode` + `sigma_max` (E1), `e_mu_q_trust` (E3), `regime_ii` (A4) make these runnable; the
+  readouts are the `_plot_one_sweep` PPL bar plus the already-logged `guard_sigma_ceil_frac` /
+  `nonfinite_frac` columns. A4 adds `holonomy_trainability` (holonomy vs ‖connection_W‖ from the
+  regime_ii metrics.csv); A4b is already covered (`plot_holonomy_curvature` Panel B auto-emits).
+
+This closes the runnable / small-build tier. The remaining hypotheses split into: (a) **medium new
+harnesses** — G1 (χ=1/α field-perturbation response), G2 (Sanov per-token F-density rate), G3
+(symplectic/leapfrog E-step with velocity state), F4 (RG community-depth scaling), F3 VFE-internal
+budget-scaling route — each a focused day of new extractor/integrator code; and (b) **fenced** items
+needing absent infrastructure — J1 (UD/CoNLL-U dependency-parse pipeline), F3 cross-architecture half
+(standard-transformer baseline), G4 (meta-ensemble sampler) — not worth building speculatively.

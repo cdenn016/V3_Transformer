@@ -180,6 +180,7 @@ def free_energy_value(
     e_sigma_q_trust:           float = 5.0,            # accepted-and-ignored iteration-only knob
     e_mu_q_trust:              Optional[float] = None, # accepted-and-ignored iteration-only knob
     mu_trust_mode:             str  = "box",           # accepted-and-ignored iteration-only knob
+    e_step_mu_precond:         str  = "fisher",        # accepted-and-ignored iteration-only knob
     mass_phi:                  float = 0.0,            # accepted-and-ignored iteration-only knob (phi penalty)
 
     include_attention_entropy: bool = True,
@@ -366,6 +367,7 @@ def e_step_iteration(
     e_sigma_q_trust:           float = 5.0,
     e_mu_q_trust:              Optional[float] = None,   # mean trust radius (sigma units); None = unbounded
     mu_trust_mode:             str  = "box",             # "box" | "ball" (only when e_mu_q_trust is not None)
+    e_step_mu_precond:         str  = "fisher",          # "fisher" (nat-grad mean) | "raw" (B3/EXP-14 mu-arm)
     mass_phi:                  float = 0.0,
 
     include_attention_entropy: bool = True,
@@ -505,7 +507,15 @@ def e_step_iteration(
     if e_step_gradient == "straight_through":
         nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
 
-    delta_mu = e_q_mu_lr * nat_mu
+    # B3/EXP-14 mean-arm ablation: descend the Fisher natural gradient nat_mu (= Sigma*grad_mu for a
+    # diagonal Gaussian) by default, or the raw Euclidean grad_mu under e_step_mu_precond='raw'. The
+    # SPD sigma retraction below is unchanged either way, isolating the MEAN preconditioner; grad_mu is
+    # detached under straight_through to match nat_mu's per-iteration tangent severance.
+    if e_step_mu_precond == "raw":
+        mu_grad = grad_mu.detach() if e_step_gradient == "straight_through" else grad_mu
+    else:
+        mu_grad = nat_mu
+    delta_mu = e_q_mu_lr * mu_grad
     # E-step MEAN trust region (default OFF). When e_mu_q_trust is set, bound the
     # per-iteration mean step in sigma-whitened units before the additive update; None reproduces the
     # bare mu = belief.mu - e_q_mu_lr*nat_mu bit-for-bit. is_diagonal mirrors the SPD-retraction rank

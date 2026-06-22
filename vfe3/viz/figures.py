@@ -2869,3 +2869,129 @@ def _as_f(v) -> float:
         return float(v)
     except (TypeError, ValueError):
         return float("nan")
+
+
+@register_figure("pos_extrapolation")
+def plot_pos_extrapolation(
+    arms,                                # dict {label: [{n, ce}...]} OR list of {"label", "curve"}
+
+    *,
+    train_n: Optional[float] = None,
+    path:    Optional[str]   = None,
+):
+    r"""H1/EXP-13: held-out CE vs eval sequence length N, one line per positional scheme.
+
+    Offset attention priors (alibi / t5, functions of |i-j|) stay flat past the trained length; the
+    absolute schemes (learned pos_phi table, RoPE) rise -- the extrapolation contrast. The train
+    length is marked; points beyond it are pure extrapolation."""
+    if isinstance(arms, dict):
+        items = [(str(k), v) for k, v in arms.items()]
+    else:
+        items = [(str(a.get("label", i)), a.get("curve", [])) for i, a in enumerate(arms)]
+    fig, ax = plt.subplots(figsize=(6.6, 4.6))
+    for j, (lab, curve) in enumerate(items):
+        pts = sorted([(float(p["n"]), float(p["ce"])) for p in curve
+                      if np.isfinite(_as_f(p.get("ce")))], key=lambda t: t[0])
+        if pts:
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-",
+                    color=_CB[j % len(_CB)], lw=1.6, ms=4, label=lab)
+    if train_n is not None and np.isfinite(_as_f(train_n)):
+        ax.axvline(float(train_n), color=_CB[7], ls="--", lw=1.0, alpha=0.6, label="train length")
+    ax.set(xlabel="eval sequence length N", ylabel="held-out CE (nats)")
+    ax.set_title("Positional extrapolation: offset vs absolute (CE vs N)")
+    if items:
+        ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("renyi_saturation")
+def plot_renyi_saturation(
+    cells,                               # list of {alpha, attn_entropy, energy_klmax_frac}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""B2/EXP-12: attention entropy H(beta) and the kl_max energy-saturation fraction vs Renyi order.
+
+    alpha<1 is mass-covering, alpha>1 mode-seeking; for alpha>1 the non-PD blend saturates the pairwise
+    energy E_ij to kl_max with zero gradient (rising saturation fraction, right panel), which can drive
+    a NON-MONOTONE H(beta)-vs-alpha tail (left panel) -- the saturation diagnostic explaining the
+    entropy curve. alpha=1 (KL) is marked."""
+    cells = sorted(cells, key=lambda c: float(c["alpha"]))
+    a = [float(c["alpha"]) for c in cells]
+    h = [float(c.get("attn_entropy", float("nan"))) for c in cells]
+    s = [float(c.get("energy_klmax_frac", float("nan"))) for c in cells]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.2, 4.2))
+    ax1.plot(a, h, "o-", color=_CB[0], lw=1.8)
+    ax1.axvline(1.0, color=_CB[7], ls="--", lw=1.0, alpha=0.5, label=r"$\alpha=1$ (KL)")
+    ax1.set(xlabel=r"Rényi order $\alpha$", ylabel=r"attention entropy H($\beta$)")
+    ax1.set_title("Attention diffuseness vs α")
+    ax1.legend(fontsize=8, frameon=False)
+    ax2.plot(a, s, "s-", color=_CB[1], lw=1.8)
+    ax2.axvline(1.0, color=_CB[7], ls="--", lw=1.0, alpha=0.5)
+    ax2.set(xlabel=r"Rényi order $\alpha$", ylabel="energy kl_max saturation fraction")
+    ax2.set_title("Non-PD saturation vs α (the α>1 tail)")
+    fig.suptitle("Rényi α-attention: entropy + saturation diagnostic (B2/EXP-12)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("mu_precond")
+def plot_mu_precond(
+    cells,                               # list of {precond in {fisher,raw}, n_e_steps, ppl}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""B3/EXP-14: validation PPL vs n_e_steps, Fisher natural-gradient vs raw-Euclidean mean step.
+
+    The mu-arm ablation: nat_mu = Sigma*grad_mu (Fisher) vs the raw grad_mu, sigma retraction held
+    fixed. One line per preconditioner; a gap that grows with n_e_steps means the mean-sector Fisher
+    metric is load-bearing for the converged belief."""
+    cells = list(cells)
+    fig, ax = plt.subplots(figsize=(6.2, 4.4))
+    for j, pre in enumerate(("fisher", "raw")):
+        pts = sorted([(float(c["n_e_steps"]), float(c["ppl"])) for c in cells
+                      if str(c["precond"]) == pre], key=lambda t: t[0])
+        if pts:
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-",
+                    color=_CB[j], lw=1.8, label=f"{pre} mean step")
+    ax.set(xlabel="E-step iterations (n_e_steps)", ylabel="validation PPL")
+    ax.set_title("Fisher nat-grad vs raw Euclidean E-step mean")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("holonomy_trainability")
+def plot_holonomy_trainability(
+    arms,                                # list of {label, step, connection_norm, holonomy}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""A4/EXP-15: belief-transport holonomy vs the learned gauge-connection norm over training.
+
+    The trainability curve for the Regime-II connection: as CE training drives ||connection_W|| up
+    from 0, does the holonomy ||H-I||_F track it? Each point is one eval, colored by training step;
+    a monotone climb is the open empirical contribution (the telescoping/Route-asymmetry half is
+    test-pinned)."""
+    arms = [a for a in arms if len(a.get("connection_norm", [])) >= 1]
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    sc = None
+    for j, a in enumerate(arms):
+        x = np.asarray(a["connection_norm"], float)
+        y = np.asarray(a["holonomy"], float)
+        s = np.asarray(a.get("step", np.arange(x.size)), float)
+        sc = ax.scatter(x, y, c=s, cmap="viridis", s=40, edgecolor="k", linewidth=0.3,
+                        label=str(a.get("label", j)))
+    if sc is not None:
+        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label="training step")
+    ax.set(xlabel=r"gauge connection norm $\|connection_W\|$",
+           ylabel=r"holonomy deviation $\|H-I\|_F$")
+    ax.set_title("Regime-II connection trainability: holonomy vs ‖connection‖")
+    if arms:
+        ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)

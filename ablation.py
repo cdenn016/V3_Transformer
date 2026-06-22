@@ -62,6 +62,7 @@ from vfe3.data.datasets import make_dataloader
 from vfe3.metrics import (
     attention_entropy,
     gauge_equivariance_residual,
+    guard_saturation,
     head_mixer_gauge_residual,
     rank_one_residual,
 )
@@ -557,6 +558,71 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "requires": {"m_phi_natural_grad": True, "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0},
     },
 
+    "fisher_mu_precond": {  # B3 / EXP-14: Fisher natural-gradient vs raw-Euclidean E-step MEAN preconditioner.
+        # nat_mu = Sigma*grad_mu (Fisher, the default/pure mean step) vs the raw Euclidean grad_mu; the
+        # SPD sigma retraction is UNCHANGED either way, so this isolates the MEAN arm. e_phi_lr=0 keeps
+        # the gauge preconditioner off the E-step. The sigma-arm is out of scope (the affine retraction
+        # already whitens by 1/sigma, so a 'raw' sigma step needs a different retraction, not this knob).
+        "description": "E-step mean preconditioner: Fisher nat-grad vs raw Euclidean x n_e_steps [B3/EXP-14]",
+        "requires": {"e_phi_lr": 0.0},
+        "configs": [
+            {"label": f"{p}_T{t}", "e_step_mu_precond": p, "n_e_steps": t}
+            for p in ("fisher", "raw") for t in (1, 3, 5)
+        ],
+    },
+
+    # === lower-priority runnable diagnostics (E1/E2/E3/A4; 2026-06-22 audit tail) ===========
+    "amp_dtype": {  # E2 / EXP-23: bf16 autocast transport-matmul exposure. decode/CE/SPD/transport are
+        # fp32-islanded, so the only genuine bf16 exposure is the upstream transport matmuls; the
+        # predicted null (PPL/entropy within noise) certifies bf16 as a safe throughput default.
+        "description": "autocast dtype: fp32 vs bf16 vs fp16 (transport-matmul exposure) [E2/EXP-23]",
+        "configs": [
+            {"label": "fp32", "amp_dtype": None},
+            {"label": "bf16", "amp_dtype": "bf16"},
+            {"label": "fp16", "amp_dtype": "fp16"},
+        ],
+    },
+
+    "spd_retract_mode": {  # E1 / EXP-20: SPD chart -- spd_affine (whitens by 1/sigma) vs log_euclidean.
+        # sigma_max pinned to the live 10.0 (not the dead BASELINE 1000 that never binds) so the
+        # congruence-break ceiling can bind; guard_sigma_ceil_frac (already logged per eval) reads it.
+        "description": "SPD retraction chart: spd_affine vs log_euclidean (sigma_max=10) [E1/EXP-20]",
+        "configs": [
+            {"label": "spd_affine",    "spd_retract_mode": "spd_affine",    "sigma_max": 10.0},
+            {"label": "log_euclidean", "spd_retract_mode": "log_euclidean", "sigma_max": 10.0},
+        ],
+    },
+
+    "sigma_max": {  # E1 / EXP-20: does the SPD variance ceiling ever bind? (read guard_sigma_ceil_frac)
+        "description": "SPD variance ceiling sigma_max (binding vs slack) [E1/EXP-20]",
+        "param": "sigma_max", "values": [5.0, 10.0, 100.0],
+    },
+
+    "e_mu_q_trust": {  # E3 / EXP-24: mean trust region as a stability guard. The endpoint is the
+        # NaN/loss-spike rate (nonfinite_frac, already logged per eval), NOT PPL -- it is near-inert at
+        # the production embed_dim<=64 / e_q_mu_lr operating point; it binds only at large embed_dim or
+        # raised LR. 'off' (None) is the unbounded baseline.
+        "description": "E-step mean trust-region radius (box mode); endpoint = nonfinite_frac [E3/EXP-24]",
+        "configs": [
+            {"label": "off",     "e_mu_q_trust": None, "mu_trust_mode": "box"},
+            {"label": "trust_5", "e_mu_q_trust": 5.0,  "mu_trust_mode": "box"},
+            {"label": "trust_2", "e_mu_q_trust": 2.0,  "mu_trust_mode": "box"},
+            {"label": "trust_1", "e_mu_q_trust": 1.0,  "mu_trust_mode": "box"},
+        ],
+    },
+
+    "regime_ii": {  # A4 / EXP-15: trained Regime-II connection trainability (flat vs learned connection_W).
+        # transport_mode='regime_ii' auto-enables oracle_unroll_grad and creates the learned bilinear
+        # connection_W; connection_w_norm + holonomy_deviation are logged per eval -> the holonomy-vs-
+        # ||connection|| trainability scatter (_plot_holonomy_trainability). Opt-in, equivariance-
+        # breaking at nonzero W (default OFF; user-accepted -- see CLAUDE.md exception (3)).
+        "description": "Regime-II connection: flat vs learned; holonomy vs ||connection|| trainability [A4/EXP-15]",
+        "configs": [
+            {"label": "flat",      "transport_mode": "flat"},
+            {"label": "regime_ii", "transport_mode": "regime_ii"},
+        ],
+    },
+
     "rho_handoff": {  # F2 / EXP-7: prior-anchoring as the FFN-brake substitute against rank collapse.
         # The Dong rank-one residual r(X) of the per-token mean cloud is read off PER LAYER from one
         # deep model per arm (across_layer_belief_trace -> rank_resid_by_layer in each cell's
@@ -581,6 +647,34 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
              "lambda_alpha_mode": "constant", "n_layers": 4, "e_phi_lr": 0.02},
             {"label": "noanchor_ephi",    "lambda_alpha": 1e-3, "prior_handoff_rho": 0.0,
              "lambda_alpha_mode": "constant", "n_layers": 4, "e_phi_lr": 0.02},
+        ],
+    },
+
+    "pos_extrapolation": {  # H1 / EXP-13: offset priors extrapolate, absolute (learned/RoPE) do not.
+        # Train at max_seq_len, then eval the SAME model at growing N (collect_extrapolation -> the
+        # CE-vs-N curve persisted per cell). Offset attention priors (causal_alibi, t5_relative_bias)
+        # are functions of |i-j| and rebuild at runtime N; the absolute schemes (pos_phi='learned'
+        # table, pos_rotation='rope') do not. t5_max_distance is raised to 512 (>= max eval N) so the
+        # T5 arm measures offset extrapolation, not bucket saturation. Each arm isolates ONE positional
+        # mechanism (the others off), sharing the causal mask. requires pins ALL arms onto ONE
+        # belief-gradient route (oracle_unroll_grad=True, the EXP-4 discipline): the rope arm's
+        # decoupled value gauge (rope_on_value=False) routes to the autograd oracle, which would
+        # otherwise return a DETACHED tangent at oracle_unroll_grad=False -- a different training route
+        # than the kernel-route alibi/t5/learned arms, confounding the CE-vs-N contrast. max_seq_len is
+        # pinned to the trained 128 so the eval grows to 4x=512 == t5_max_distance (no T5 bucket
+        # saturation; the figure measures offset extrapolation, not the bucket horizon).
+        "description": "positional extrapolation: offset (alibi/t5) vs absolute (learned/rope), eval @ growing N [H1/EXP-13]",
+        "collect_extrapolation": True,
+        "requires": {"oracle_unroll_grad": True, "max_seq_len": 128},
+        "configs": [
+            {"label": "alibi",   "beta_attention_prior": "causal_alibi",
+             "pos_phi": "none",    "pos_rotation": "none"},
+            {"label": "t5",      "beta_attention_prior": "t5_relative_bias", "t5_max_distance": 512,
+             "pos_phi": "none",    "pos_rotation": "none"},
+            {"label": "learned", "beta_attention_prior": "causal",
+             "pos_phi": "learned", "pos_rotation": "none"},
+            {"label": "rope",    "beta_attention_prior": "causal",
+             "pos_phi": "none",    "pos_rotation": "rope"},
         ],
     },
 
@@ -808,14 +902,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
-    "renyi_order": {
+    "renyi_order": {  # B2 / EXP-12: Renyi alpha-attention sweep + the alpha>1 non-PD saturation diagnostic.
         # oracle_unroll_grad MUST be on for a fair divergence-order comparison: renyi_order != 1 routes
         # the autograd oracle, whose default (detached) gradient truncates the through-inference signal
         # to the priors/gauge-frame tables, while renyi_order == 1 uses the always-live analytic kernel.
         # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
         # spuriously ~2.5x faster AND worse). No-op at renyi_order == 1 (the kernel ignores the toggle).
-        "description": "Renyi divergence order (1.0 -> KL; != 1 routes the non-kernel oracle)",
-        "param": "renyi_order", "range": [0.2, 1, 0.1], "requires": {"oracle_unroll_grad": True},
+        # alpha<1 is mass-covering, alpha>1 mode-seeking; for alpha>1 the non-PD blend saturates to
+        # kl_max with zero gradient (S27), predicting a non-monotone H(beta)-vs-alpha tail.
+        # collect_diagnostics captures attn_entropy (H(beta)) + energy_klmax_frac (the saturation
+        # fraction) per cell -> the renyi_saturation figure.
+        "description": "Renyi divergence order alpha (both sides of 1) + non-PD saturation diagnostic [B2/EXP-12]",
+        "param": "renyi_order", "values": [0.5, 0.8, 1.0, 1.2, 1.5, 2.0],
+        "requires": {"oracle_unroll_grad": True},
+        "collect_diagnostics": True,
     },
     
     
@@ -1249,6 +1349,35 @@ def _cell_diagnostics(
     # misleading layer-1 value on the L>1 cells of other sweeps (gauge_transport L2, rho_handoff L4).
     if cfg.n_layers == 1:
         _probe("cov_gap", lambda: attention_entropy_cov_gap(model, token_ids)["cov_gap"])
+
+    # kl_max saturation fraction of the converged pairwise energy (B2/EXP-12): for Renyi alpha>1 the
+    # non-PD blend pins E_ij at kl_max with zero gradient, so this fraction climbs in the alpha>1 tail
+    # and explains a non-monotone H(beta)-vs-alpha curve.
+    _probe("energy_klmax_frac", lambda: guard_saturation(
+        cstate["sigma"], cstate["energy"], cstate["self_div"], diagonal=diag,
+        eps=cfg.eps, sigma_max=cfg.sigma_max, kl_max=cfg.kl_max)["energy_klmax_frac"])
+    return out
+
+
+@torch.no_grad()
+def _eval_at_growing_n(model: Any, cfg: VFE3Config, dataset: str, device: torch.device) -> List[Dict[str, Any]]:
+    r"""H1/EXP-13: held-out CE at sequence lengths from the trained ``max_seq_len`` outward.
+
+    Re-windows the validation split at each N (anchor ``max_seq_len``, then 1.5/2/3/4x) via
+    ``get_loader`` and scores the SAME trained model. Offset attention priors (alibi / t5, functions
+    of |i-j|) and the causal mask rebuild at runtime N and extrapolate; the absolute schemes
+    (``pos_phi='learned'`` table -- now clamped past the table; RoPE) degrade. Each N is isolated: a
+    too-short split or any failure drops that point, never the cell. Returns ``[{n, ce, ppl}, ...]``."""
+    base = int(cfg.max_seq_len)
+    n_list = sorted({base} | {int(round(base * m)) for m in (1.5, 2.0, 3.0, 4.0)})
+    out: List[Dict[str, Any]] = []
+    for n in n_list:
+        try:
+            loader = get_loader(dataset, n, cfg.batch_size, "validation")
+            m = evaluate(model, loader, device=device)
+            out.append({"n": n, "ce": float(m["ce"]), "ppl": float(m["ppl"])})
+        except Exception as exc:                              # short split / OOM at large N -> drop point
+            logger.warning("  [extrapolation eval N=%d skipped] %s", n, exc)
     return out
 
 
@@ -1261,7 +1390,8 @@ def run_single(
     dataset:             str,
     device:              torch.device,
     seed:                int,
-    collect_diagnostics: bool          = False,
+    collect_diagnostics:   bool        = False,
+    collect_extrapolation: bool        = False,
     max_tokens:          Optional[int] = None,
     max_steps:           Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -1342,6 +1472,8 @@ def run_single(
     }
     if collect_diagnostics:                                  # opt-in converged-state probes (S2)
         result.update(_cell_diagnostics(model, cfg, val_loader, device))
+    if collect_extrapolation:                                # opt-in growing-N eval (H1/EXP-13)
+        result["extrap_ce"] = _eval_at_growing_n(model, cfg, dataset, device)
     return result
 
 
@@ -1365,7 +1497,7 @@ _CSV_COLUMNS = [
     "n_params",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
-    "rank_resid", "cov_gap",
+    "rank_resid", "cov_gap", "energy_klmax_frac",
     "wall_time_s", "seed", "error",
 ]
 
@@ -1480,6 +1612,7 @@ def run_sweep(
         try:
             result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
                                  seed=seed, collect_diagnostics=sweep.get("collect_diagnostics", False),
+                                 collect_extrapolation=sweep.get("collect_extrapolation", False),
                                  max_tokens=max_tokens, max_steps=max_steps)
         except Exception as exc:                             # a training crash must not kill the sweep
             logger.exception("sweep %s / %s crashed", sweep_name, label)
@@ -1894,6 +2027,131 @@ def _plot_gauge_residual_drift(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
+def _plot_holonomy_trainability(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""A4/EXP-15 holonomy-vs-||connection|| scatter from each cell's metrics.csv (connection_w_norm +
+    holonomy_deviation per eval). connection_w_norm is logged only on a regime_ii run, so this no-ops
+    unless a cell carries >= 2 such eval rows (the flat arm is correctly excluded)."""
+    arms: List[Dict[str, Any]] = []
+    for cell in sorted(sweep_dir.glob("*/metrics.csv")):
+        steps, cn, hol = [], [], []
+        try:
+            with open(cell, newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    c, h = _as_float(row.get("connection_w_norm")), _as_float(row.get("holonomy_deviation"))
+                    if c < float("inf") and h < float("inf"):       # regime_ii eval rows carry both
+                        steps.append(_as_float(row.get("step")))
+                        cn.append(c)
+                        hol.append(h)
+        except Exception:                                           # unreadable metrics.csv -> skip
+            continue
+        if len(cn) >= 2:
+            arms.append({"label": cell.parent.name, "step": steps, "connection_norm": cn, "holonomy": hol})
+    if not arms:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_holonomy_trainability
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"holonomy-trainability figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_holonomy_trainability.png"
+    plt.close(plot_holonomy_trainability(arms, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_mu_precond(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""B3/EXP-14 PPL-vs-n_e_steps figure, Fisher vs raw mean preconditioner, from the
+    fisher_mu_precond cells (label '<precond>_T<n_e_steps>'). No-op unless >= 2 such cells finished."""
+    cells: List[Dict[str, Any]] = []
+    for r in _collect_sweep_results(sweep_dir):
+        lab = str(r.get("label", ""))
+        if "_T" not in lab or _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        pre, _, t = lab.partition("_T")
+        if pre not in ("fisher", "raw"):
+            continue
+        try:
+            n_e = int(t)
+        except ValueError:
+            continue
+        cells.append({"precond": pre, "n_e_steps": n_e, "ppl": _as_float(r.get("primary_val_ppl"))})
+    if len(cells) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_mu_precond
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"mu-precond figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_mu_precond.png"
+    plt.close(plot_mu_precond(cells, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_renyi_saturation(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""B2/EXP-12 H(beta)-vs-alpha + kl_max-saturation-vs-alpha figure from the renyi_order cells
+    (label 'renyi_order=<alpha>', with attn_entropy + energy_klmax_frac diagnostics). No-op unless
+    >= 2 such cells finished."""
+    cells: List[Dict[str, Any]] = []
+    for r in _collect_sweep_results(sweep_dir):
+        lab = str(r.get("label", ""))
+        if not lab.startswith("renyi_order=") or _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        try:
+            alpha = float(lab.split("=")[-1])
+        except ValueError:
+            continue
+        cells.append({"alpha": alpha, "attn_entropy": _as_float(r.get("attn_entropy")),
+                      "energy_klmax_frac": _as_float(r.get("energy_klmax_frac"))})
+    if len(cells) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_renyi_saturation
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"renyi-saturation figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_renyi_saturation.png"
+    plt.close(plot_renyi_saturation(cells, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_pos_extrapolation(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""H1/EXP-13 CE-vs-N extrapolation overlay (one line per positional scheme) from each cell's
+    ``extrap_ce`` curve (persisted by run_single under collect_extrapolation). No-op unless >= 2 cells
+    carry a >= 2-point curve. The train length (the smallest evaluated N = max_seq_len) is marked."""
+    arms: Dict[str, Any] = {}
+    all_n: List[float] = []
+    for r in _collect_sweep_results(sweep_dir):
+        curve = r.get("extrap_ce")
+        if isinstance(curve, list) and len(curve) >= 2:
+            arms[str(r.get("label", "?"))] = curve
+            all_n += [float(p["n"]) for p in curve if isinstance(p, dict) and "n" in p]
+    if len(arms) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_pos_extrapolation
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"pos-extrapolation figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_extrapolation.png"
+    plt.close(plot_pos_extrapolation(arms, train_n=(min(all_n) if all_n else None), path=str(out)))
+    print(f"  figure -> {out}")
+
+
 def _plot_sensitivity(output_dir: Path, fig_dir: Path) -> None:
     r"""Cross-sweep comparison: a PPL-range (worst - best) bar per sweep, sorted by sensitivity.
 
@@ -1987,6 +2245,10 @@ def main() -> None:
         _plot_cg_coupling(sweep_dir, fig_dir)              # A3/EXP-10 PPL+equivariance bars (no-op if absent)
         _plot_kappa_dispersion(sweep_dir, fig_dir)         # H2/EXP-11 kappa dispersion (no-op if absent)
         _plot_gauge_residual_drift(sweep_dir, fig_dir)     # A2/EXP-9 residual drift (no-op if absent)
+        _plot_pos_extrapolation(sweep_dir, fig_dir)        # H1/EXP-13 CE-vs-N extrapolation (no-op if absent)
+        _plot_renyi_saturation(sweep_dir, fig_dir)         # B2/EXP-12 entropy+saturation vs alpha (no-op if absent)
+        _plot_mu_precond(sweep_dir, fig_dir)               # B3/EXP-14 Fisher-vs-raw mean precond (no-op if absent)
+        _plot_holonomy_trainability(sweep_dir, fig_dir)    # A4/EXP-15 holonomy vs ||connection|| (no-op if absent)
 
     # ---- after all sweeps: the cross-sweep comparison ----
     _plot_sensitivity(output_dir, fig_dir)

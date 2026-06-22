@@ -69,6 +69,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         lambda_beta=_lambda_beta(model), kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
         e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
+        e_step_mu_precond=cfg.e_step_mu_precond,
         include_attention_entropy=cfg.include_attention_entropy, gradient_mode=cfg.gradient_mode,
         family=cfg.family, divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
