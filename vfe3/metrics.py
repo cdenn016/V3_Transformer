@@ -265,6 +265,106 @@ def fisher_trace(
     return (0.5 / sigma.clamp(min=eps)).sum(dim=-1)
 
 
+def sigma_trace(
+    sigma:    torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
+
+    *,
+    diagonal: Optional[bool] = None,
+) -> torch.Tensor:                       # (...) per-token tr(Sigma_q) = sum_k Var_k
+    r"""Per-token covariance trace tr(Sigma_q) = sum_k Var_k -- the total belief UNCERTAINTY.
+
+    The complement of ``fisher_trace`` (which returns the PRECISION trace tr(Sigma^{-1})/2): for the
+    Sigma_q-as-calibrated-uncertainty probe (B1/EXP-3) the load-bearing quantity is the variance
+    trace itself, whose across-token spread (see ``cv``) gates whether the channel carries any
+    decode-time signal. Diagonal: sum_k sigma_k. Full: sum_k Sigma_kk.
+    """
+    if _is_full_cov(sigma, diagonal):
+        return torch.diagonal(sigma, dim1=-2, dim2=-1).sum(dim=-1)
+    return sigma.sum(dim=-1)
+
+
+def rank_one_residual(
+    mu:  torch.Tensor,                   # (..., N, K) per-token belief means of ONE layer
+
+    *,
+    eps: float = 1e-12,
+) -> torch.Tensor:                       # (...) relative distance of the token cloud from rank-one
+    r"""Dong rank-one residual r(X) = ||X - 1 xbar^T||_F / ||X||_F over the (N, K) mean matrix.
+
+    Measures how far the per-token mean cloud X (rows = tokens) sits from the rank-one matrix
+    1 xbar^T (every token collapsed to the mean token xbar = mean_n X[n,:]): r -> 0 is total rank
+    collapse (all tokens identical), r near 1 is full spread. This is the anti-rank-collapse /
+    FFN-brake object of F2/EXP-7, computed on the MEAN stream -- DISTINCT from ``effective_rank``,
+    which is the spectral rank of the per-token COVARIANCE Sigma (a different object). Reference:
+    Dong et al. 2021, "Attention is not all you need: pure attention loses rank doubly exponentially".
+    """
+    xbar = mu.mean(dim=-2, keepdim=True)                                  # (..., 1, K) mean token
+    num = torch.linalg.norm((mu - xbar).flatten(-2, -1), dim=-1)          # ||X - 1 xbar^T||_F
+    den = torch.linalg.norm(mu.flatten(-2, -1), dim=-1).clamp(min=eps)    # ||X||_F
+    return num / den
+
+
+def depth_decay_rate(
+    curve: torch.Tensor,                 # (L,) a per-layer scalar (e.g. r(X) by depth)
+
+    *,
+    eps:   float = 1e-12,
+) -> float:                              # log-linear slope d log(curve) / d layer
+    r"""Log-linear decay rate (slope of log(curve) vs layer index) of a per-depth scalar.
+
+    For F2/EXP-7 the per-arm rank-residual curves are compared by their DECAY RATE, not absolute
+    level (the no-anchor control plateaus rather than collapsing to rank-one). Fits
+    log(curve) ~ a + b * layer by least squares and returns b (negative = decaying with depth).
+    """
+    y = torch.log(curve.flatten().clamp(min=eps).to(torch.float64))
+    n = y.shape[0]
+    if n < 2:
+        raise ValueError(f"depth_decay_rate needs >= 2 layers, got {n}")
+    x = torch.arange(n, dtype=torch.float64, device=y.device)
+    xm, ym = x.mean(), y.mean()
+    return float(((x - xm) * (y - ym)).sum() / ((x - xm) ** 2).sum().clamp(min=eps))
+
+
+def spearman_rho(
+    x: torch.Tensor,                     # (M,) sample
+    y: torch.Tensor,                     # (M,) sample
+
+    *,
+    eps: float = 1e-12,
+) -> float:                              # Spearman rank correlation in [-1, 1]
+    r"""Spearman rank correlation: the Pearson correlation of the RANKS of x and y.
+
+    The headline statistic of the Sigma_q-calibration probe (B1/EXP-3): rho(tr Sigma_q, per-token
+    CE). Ranks via double argsort (ties broken by position, adequate for continuous diagnostics).
+    Returns 0.0 for a degenerate zero-variance input rather than NaN.
+    """
+    x, y = x.flatten().to(torch.float64), y.flatten().to(torch.float64)
+    if x.numel() != y.numel():
+        raise ValueError(f"spearman_rho needs equal-length inputs, got {x.numel()} vs {y.numel()}")
+    rx = x.argsort().argsort().to(torch.float64)
+    ry = y.argsort().argsort().to(torch.float64)
+    rx, ry = rx - rx.mean(), ry - ry.mean()
+    return float((rx * ry).sum() / (rx.norm() * ry.norm()).clamp(min=eps))
+
+
+def cv(
+    x: torch.Tensor,                     # (M,) sample
+
+    *,
+    eps: float = 1e-12,
+) -> float:                              # coefficient of variation std / |mean|
+    r"""Coefficient of variation std(x) / |mean(x)| -- the pre-registered spread gate for B1/EXP-3.
+
+    The calibration experiment requires CV(tr Sigma_q) > 0.10: below it the covariance carries no
+    across-token signal and the result is reported "covariance inert", not miscoded as "decode
+    does not matter". Uses the unbiased std (ddof=1).
+    """
+    x = x.flatten().to(torch.float64)
+    if x.numel() < 2:
+        raise ValueError(f"cv needs >= 2 samples, got {x.numel()}")
+    return float(x.std(unbiased=True) / x.mean().abs().clamp(min=eps))
+
+
 def spd_geodesic_distance(
     sigma_a:  torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
     sigma_b:  torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
