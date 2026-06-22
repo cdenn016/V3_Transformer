@@ -632,6 +632,22 @@ def finalize_run(
             logger.warning("estep capacity-gain probe failed (%s); skipped", exc)
         finally:
             model.cfg.n_e_steps = _saved_ne
+
+    # EXP-5 (C2): the converged final E-step free energy PER TOKEN -- the E-step's OWN target-blind
+    # functional value (free_energy_value sums F over the N tokens; divide by N). Persisted so a
+    # cross-arm reader (scaling_analysis) can test whether final F DECORRELATES from CE across an
+    # n_e_steps sweep -- the structural non-Neal-Hinton EM prediction (the E-step serves a distinct
+    # functional, not the likelihood). Off-graph, best-effort, on a fixed test batch (sequence 0).
+    if test_loader is not None:
+        try:
+            from vfe3.viz.extract import e_step_belief_trace
+            _b = next(iter(test_loader))
+            _tok = (_b[0] if isinstance(_b, (tuple, list)) else _b).to(device)
+            _tr = e_step_belief_trace(model, _tok)              # n_iter defaults to cfg.n_e_steps
+            results["estep_final_f_per_token"] = float(_tr["free_energy"][-1]) / max(1, int(_tok.shape[1]))
+            logger.info("Converged final E-step F/token: %.4f", results["estep_final_f_per_token"])
+        except Exception as exc:
+            logger.warning("estep final-F probe failed (%s); skipped", exc)
     artifacts.save_json("test_results.json", results)
 
     # Reproducibility provenance (git SHA / data hash / versions) + a scaling-law data point -- the
@@ -664,6 +680,7 @@ def finalize_run(
         "test_bpc":     results.get("test_bpc"),
         "test_ce_no_estep":    results.get("test_ce_no_estep"),
         "estep_capacity_gain": results.get("estep_capacity_gain"),
+        "estep_final_f_per_token": results.get("estep_final_f_per_token"),
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,
         "use_prior_bank":  cfg.use_prior_bank,

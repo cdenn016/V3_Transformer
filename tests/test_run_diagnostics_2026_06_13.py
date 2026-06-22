@@ -318,6 +318,10 @@ def test_finalize_writes_tier3_research_and_provenance() -> None:
         # the n_e_steps=0 capacity-gain falsifier is computed and the budget is restored
         assert "estep_capacity_gain" in res and math.isfinite(res["estep_capacity_gain"])
         assert model.cfg.n_e_steps == cfg.n_e_steps                # restored after the probe
+        # C2/EXP-5: the converged final E-step F/token is persisted (for the F-vs-CE decorrelation)
+        assert "estep_final_f_per_token" in res and math.isfinite(res["estep_final_f_per_token"])
+        summ = json.loads((root / "summary.json").read_text())
+        assert math.isfinite(float(summ["estep_final_f_per_token"]))
         # provenance.json: code/data/env state a config-only record omits
         prov = json.loads((root / "provenance.json").read_text())
         assert {"seed", "torch_version", "git_sha", "git_dirty"} <= set(prov)
