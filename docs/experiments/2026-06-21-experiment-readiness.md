@@ -299,11 +299,11 @@ user's config WIP intact. Per-experiment how-to-run and what-remains:
 |-----|-----------|--------|----------------------|
 | EXP-1 | RUNNABLE | `train_vfe3.py`: NUM_RUNS>1 + SEEDS + DATA_SEED, then `python multiseed_analysis.py` | noise-band overlay figure |
 | EXP-2 | RUNNABLE | `ablation.py` CONFIG["sweep"]="gauge_transport" | grouped-bar + residual-table figure |
-| EXP-3 | PARTIAL | metrics ready (`sigma_trace`/`spearman_rho`/`cv`) | Sigma<->CE join (`belief_ce_bank`) + reliability/scatter plots |
+| EXP-3 | DONE (2026-06-22) | metrics + `belief_ce_bank` join + reliability/stratified/scatter figures + rho/CV in research.json | — (figures auto-emit via `generate_figures`) |
 | EXP-4 | RUNNABLE | CONFIG["sweep"]="attention_entropy" | -tau^-1 Cov_beta diff metric + PPL-gap figure |
-| EXP-5 | RUNNABLE (PPL) | CONFIG["sweep"]="n_e_steps_em" | persisted final E-step F/token for the F-vs-CE decorrelation |
+| EXP-5 | DONE (2026-06-22) | `infer_T` route + persisted `estep_final_f_per_token` + `f_ce_decorrelation`/`estep_capacity` figures + the two Pearsons | — (`scaling_analysis.py` after the `infer_T` run) |
 | EXP-6 | RUNNABLE | `scaling.py` CONFIG["routes"]=["grow_K_mup"] | K-axis power-law fit + bootstrap-CI figure |
-| EXP-7 | PARTIAL | metric + per-layer r(X) curve ready (`across_layer_belief_trace`) | rho-handoff multi-arm sweep + depth-overlay figure |
+| EXP-7 | DONE (2026-06-22) | `rho_handoff` sweep + per-cell `rank_resid`/`rank_resid_by_layer` + `rank_residual_by_depth` figure | — (per-sweep `rho_handoff_rank_collapse.png`) |
 | EXP-8 | RUNNABLE | CONFIG["sweep"] in {gauge_mstep_optim, m_phi_lr_natgrad, mass_phi} | cos(nat,grad)/pullback-cond/steps-to-target/wall-clock diagnostics |
 | EXP-9 | RUNNABLE | CONFIG["sweep"]="gauge_equivariance" (builder_resid in CSV) | residual-drift-vs-step figure |
 | EXP-10 | RUNNABLE | CONFIG["sweep"]="cg_coupling" (equiv residual in CSV) | combined equivariance+PPL bar figure |
@@ -314,3 +314,34 @@ the runs produce CSVs) plus three involved infra items that each warrant their o
 the EXP-3 Sigma<->CE join, the EXP-5 final-F persistence (free_energy_value threading), and the
 EXP-8 training-time diagnostics (train.py metrics hot path). All are catalogued in section 3.
 See `docs/2026-06-21-edits.md` for the per-commit detail.
+
+## 8. Build status update (2026-06-22)
+
+The two PARTIAL experiments and one RUNNABLE-with-deferred-infra experiment from section 7 are now
+fully built (additive only; default path unchanged; full suite green at each step). Two of the three
+"involved infra items" flagged above are closed (only the EXP-8 training-time diagnostics remain).
+
+- **EXP-3 (Sigma_q calibration, B1) — DONE.** `vfe3.viz.extract.belief_ce_bank` is the Sigma_q<->CE
+  join (replays forward's belief path EXACTLY -- including the s-refine anchor and precision-bias fold
+  -- so the traced covariance is the one the decode used). Three registered figures
+  (`reliability_diagram`, `sigma_stratified_error`, `sigma_ce_scatter`) wired into
+  `generate_figures`; `research.json` carries `sigma_ce_spearman`, `sigma_trace_cv`, and the CV>0.10
+  `sigma_trace_cv_gate_pass`. (commit 3acd7ad; the s-refine/precision faithfulness fix was caught by
+  an adversarial review and pinned by a `converged_state` cross-check test.)
+
+- **EXP-7 (prior-anchoring vs rank collapse, F2) — DONE.** `ablation.py` `rho_handoff` 5-arm sweep
+  (lambda_alpha x rho x e_phi_lr, n_layers=4, lambda_alpha_mode='constant'); `_cell_diagnostics`
+  emits `rank_resid` (final-layer Dong r(X), a CSV column) and `rank_resid_by_layer` (per-layer curve
+  in the cell JSON); `rank_residual_by_depth` figure + `_plot_rank_collapse` driver dispatched per
+  sweep (no-op when absent). (commit 3acd7ad.)
+
+- **EXP-5 (structural non-Neal-Hinton EM, C2) — DONE.** `finalize_run` persists
+  `estep_final_f_per_token` (the E-step's converged target-blind functional value) to
+  `test_results.json` + `summary.json`; `scaling_analysis.py` harvests it across the `infer_T`
+  n_e_steps arms and emits `plot_estep_capacity` (was registered but uncalled) + the new
+  `f_ce_decorrelation` figure, printing `Pearson(n_e_steps, F)` and `Pearson(F, CE)` (the structural-EM
+  prediction: the former strongly negative, the latter ~0/positive).
+
+Remaining across the suite is the FIGURES tail (EXP-1/2/6/9/10/11 post-hoc plotters) and the EXP-8
+training-time diagnostics (cos(nat,grad)/pullback-cond/steps-to-target/wall-clock on the train.py hot
+path) plus the EXP-4 -tau^-1 Cov_beta gradient-gap metric. See `docs/2026-06-22-edits.md` for detail.

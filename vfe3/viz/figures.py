@@ -2499,3 +2499,44 @@ def plot_rank_residual_by_depth(
         ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
+
+
+# ===========================================================================
+# C2 / EXP-5  --  structural non-Neal-Hinton EM: F-vs-CE decorrelation
+# ===========================================================================
+
+@register_figure("f_ce_decorrelation")
+def plot_f_ce_decorrelation(
+    arms,                                # list of {n_e_steps, final_f, ce, [label]} (one per n_e_steps cell)
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""C2/EXP-5: converged final E-step free energy per token vs held-out CE, one point per n_e_steps.
+
+    The structural non-Neal-Hinton EM prediction: the E-step descends its OWN target-blind functional
+    F, NOT the likelihood, so across an n_e_steps sweep final F should fall steeply (Pearson(n_e_steps,
+    F) < 0) while staying DECORRELATED from CE (Pearson(F, CE) ~ 0, or even > 0). A strongly NEGATIVE
+    Pearson(F, CE) would instead say F tracks the loss, contradicting the EM separation. Points are
+    ordered and annotated by n_e_steps; both Pearsons are in the title."""
+    pts = sorted(arms, key=lambda a: float(a["n_e_steps"]))
+    ne = np.array([float(a["n_e_steps"]) for a in pts])
+    ff = np.array([float(a["final_f"]) for a in pts])
+    ce = np.array([float(a["ce"]) for a in pts])
+
+    def _pear(a, b):
+        return (float(np.corrcoef(a, b)[0, 1])
+                if a.size >= 2 and a.std() > 0 and b.std() > 0 else float("nan"))
+    r_fce, r_nef = _pear(ff, ce), _pear(ne, ff)
+    fig, ax = plt.subplots(figsize=(6.0, 4.6))
+    if ff.size:
+        ax.plot(ff, ce, "-", color=_CB[7], lw=1.0, alpha=0.5, zorder=1)
+        sc = ax.scatter(ff, ce, c=ne, cmap="viridis", s=90, zorder=3, edgecolor="k", linewidth=0.5)
+        for a in pts:
+            ax.annotate(f"T={int(float(a['n_e_steps']))}", (float(a["final_f"]), float(a["ce"])),
+                        textcoords="offset points", xytext=(6, 4), fontsize=8)
+        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label="n_e_steps")
+    ax.set(xlabel="converged final E-step F / token (nats)", ylabel="held-out CE (nats)")
+    ax.set_title(rf"E-step F vs CE  (Pearson$(F,CE)$={r_fce:+.3f}, Pearson$(T,F)$={r_nef:+.3f})")
+    fig.tight_layout()
+    return _save(fig, path)

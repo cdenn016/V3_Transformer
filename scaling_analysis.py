@@ -41,7 +41,8 @@ CONFIG: Dict[str, Any] = {
 _CSV_COLUMNS = [
     "route", "scale_knob", "label", "seed", "n_params", "n_learnable_params", "embed_dim", "n_heads",
     "n_gen", "gauge_group", "n_layers", "n_e_steps", "family", "tokens_seen", "est_flops_6ND",
-    "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl", "best_val_ppl",
+    "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl", "test_bpc",
+    "estep_final_f_per_token", "best_val_ppl",
     "wall_time_s", "data_sha256", "git_sha",
 ]
 
@@ -94,6 +95,10 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
             "active_params_per_token": sp.get("active_params_per_token"),
             "test_ce":     test_ce,
             "test_ppl":    test.get("test_ppl", sp.get("test_ppl")),
+            "test_bpc":    test.get("test_bpc", summ.get("test_bpc")),
+            "estep_final_f_per_token": (summ.get("estep_final_f_per_token")          # C2/EXP-5 join
+                                        if summ.get("estep_final_f_per_token") is not None
+                                        else test.get("estep_final_f_per_token")),
             "best_val_ppl": (summ.get("best_val_ppl") if summ.get("best_val_ppl") is not None
                              else test.get("best_val_ppl")),
             "wall_time_s": summ.get("wall_time_s", sp.get("wall_time_s")),
@@ -140,6 +145,9 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         npars = [_as_float(g["n_params"]) for g in grp if np.isfinite(_as_float(g["n_params"]))]
         if npars and (max(npars) - min(npars)) > 0:
             logger.warning("n_params varies across seeds for %s/%s (%s); using the mean", route, label, npars)
+        # C2/EXP-5: per-seed converged final E-step F/token and test BPC (NaN when absent on older runs).
+        f_seeds = [c for c in (_as_float(g.get("estep_final_f_per_token")) for g in grp) if np.isfinite(c)]
+        bpc = [c for c in (_as_float(g.get("test_bpc")) for g in grp) if np.isfinite(c)]
         points.append({
             "route": route, "label": label, "scale_knob": grp[0]["scale_knob"],
             "n_params": float(np.mean(npars)) if npars else float("nan"),
@@ -152,6 +160,9 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "ce_seeds": ce, "n_seeds": len(ce),
             "ce_mean": float(np.mean(ce)),
             "ce_sem": float(np.std(ce, ddof=1) / np.sqrt(len(ce))) if len(ce) > 1 else 0.0,
+            "f_seeds": f_seeds,
+            "f_mean": float(np.mean(f_seeds)) if f_seeds else float("nan"),
+            "bpc_mean": float(np.mean(bpc)) if bpc else float("nan"),
         })
     return points
 
@@ -323,6 +334,21 @@ def analyze() -> None:
     else:
         print("\n(only one parameter size present; add more sizes to fit L(N))")
 
+    # ---- C2/EXP-5: structural non-Neal-Hinton EM -- F-vs-CE decorrelation across the n_e_steps arms ----
+    estep_pts = sorted([p for p in infer_points if p["scale_knob"] == "n_e_steps"
+                        and np.isfinite(p.get("f_mean", float("nan")))],
+                       key=lambda q: q["n_e_steps"])
+    if len(estep_pts) >= 2:
+        ne = np.array([p["n_e_steps"] for p in estep_pts])
+        ff = np.array([p["f_mean"] for p in estep_pts])
+        ce = np.array([p["ce_mean"] for p in estep_pts])
+
+        def _pear(a, b):
+            return float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else float("nan")
+        print(f"\nE-step structural-EM check ({len(estep_pts)} n_e_steps arms):"
+              f"\n  Pearson(n_e_steps, final F/token) = {_pear(ne, ff):+.4f}  (expect strongly negative)"
+              f"\n  Pearson(final F/token, test CE)   = {_pear(ff, ce):+.4f}  (expect ~0 / >=0 if F is target-blind)")
+
     # ---- figures (best-effort, never fatal) ----
     _make_figures(param_points, infer_points, fig_dir)
     print(f"\nfigures -> {fig_dir}")
@@ -376,6 +402,25 @@ def _make_figures(param_points: List[Dict[str, Any]], infer_points: List[Dict[st
         n_flat = int(infer_points[0]["n_params"]) if np.isfinite(infer_points[0]["n_params"]) else None
         _try("inference_capacity.png", lambda: figs.plot_inference_capacity(
             series, n_params=n_flat, path=str(fig_dir / "inference_capacity.png")))
+
+        # C2/EXP-5: the n_e_steps arms -> the F-vs-CE decorrelation scatter (needs f_mean + ce_mean)
+        # and E-step-as-capacity (BPC + converged F vs T; additionally needs bpc_mean -- gated
+        # separately so a heterogeneous run set missing test_bpc on some cells still gets the
+        # decorrelation figure rather than a NaN BPC point).
+        estep = sorted([p for p in infer_points if p["scale_knob"] == "n_e_steps"
+                        and np.isfinite(p.get("f_mean", float("nan")))],
+                       key=lambda q: q["n_e_steps"])
+        if len(estep) >= 2:
+            arms = [{"n_e_steps": p["n_e_steps"], "final_f": p["f_mean"], "ce": p["ce_mean"]}
+                    for p in estep]
+            _try("f_ce_decorrelation.png", lambda: figs.plot_f_ce_decorrelation(
+                arms, path=str(fig_dir / "f_ce_decorrelation.png")))
+            cap = [p for p in estep if np.isfinite(p.get("bpc_mean", float("nan")))]
+            if len(cap) >= 2:
+                _try("estep_capacity.png", lambda: figs.plot_estep_capacity(
+                    [p["n_e_steps"] for p in cap], [p["bpc_mean"] for p in cap],
+                    [p["f_mean"] for p in cap], n_params=n_flat,
+                    path=str(fig_dir / "estep_capacity.png")))
 
 
 if __name__ == "__main__":

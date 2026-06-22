@@ -149,6 +149,8 @@ The discipline gate for every other ablation: nothing else's "win" is interpreta
 
 The single experiment that converts the program's central causal claim from hedged conjecture to measured result, in either direction.
 
+**Status (2026-06-22): harness built + run.** The `gauge_transport` sweep arm (3 cells × L{1,2}, `collect_diagnostics`) is registered in `ablation.py` (commit 31cdae5 + the readiness build); the user has run the ON/OFF/frozen ablation. Deferred: the grouped-bar + residual-table figure.
+
 - **Config.** New `ablation.py` SWEEPS `'gauge_transport'` multi-arm entry, all sharing matched `phi_weight_decay`, `lambda_alpha_mode`, `precision_weighted_attention`, and `use_head_mixer=False`:
   - **ON:** `{use_head_mixer:False}` (baseline `phi_scale=0.06`, `m_phi_lr=0.015`).
   - **OFF (Ω=I):** `{phi_scale:0.0, pos_phi:'none', e_phi_lr:0.0, m_phi_lr:0.0, use_head_mixer:False}`.
@@ -165,6 +167,8 @@ The single experiment that converts the program's central causal claim from hedg
 ### EXP-3. Σ_q as calibrated Fisher uncertainty (B1) — ★★★★★
 
 Tests open thread (f) and the manuscript's flagged "uncertainty channel" over-read, nearly for free.
+
+**Status (2026-06-22): built.** `belief_ce_bank` (the Σ↔CE join, replaying forward's belief path incl. the s-refine anchor + precision fold), the reliability / Σ-stratified-error / Σ-CE-scatter figures (wired into `generate_figures`), and `sigma_ce_spearman` / `sigma_trace_cv` / the CV>0.10 gate (in `research.json`) are all in (commit 3acd7ad). See `docs/2026-06-22-edits.md`.
 
 - **Config.** Default trained checkpoint: `family='gaussian_diagonal'`, `n_e_steps=1`, `e_q_sigma_lr=0.015`, `sigma_init=1.0`, `sigma_max=10.0`, `use_prior_bank=False` (clean isolation — σ does not touch decode), `decode_precision_scaled=False`. Rescue arm: retrain at `n_e_steps≥4` and/or `family='gaussian_full'`.
 - **Baseline/control.** Uncalibrated decode-softmax confidence from `run_artifacts._calibration_and_strata`.
@@ -194,6 +198,8 @@ The production kernel never computes the entropy term, so CANON_ORACLE is the on
 
 Pre-built registered sweep; the theory is settled so the value is the unrun PPL-vs-n_e_steps curve and the F-vs-CE decorrelation the manuscript does not itself assert.
 
+**Status (2026-06-22): built.** The converged final E-step F/token is persisted by `finalize_run` (`estep_final_f_per_token`); `scaling_analysis.py` emits the `f_ce_decorrelation` + `estep_capacity` figures over the `infer_T` n_e_steps arms and prints Pearson(n_e_steps, F) and Pearson(F, CE). See `docs/2026-06-22-edits.md`.
+
 - **Config.** K=64, single layer, `e_step_gradient` PINNED to `'unroll'` (and a second arm at `'straight_through'` to remove the deepening-graph confound), `e_phi_lr=0.0`, `gradient_mode='filtering'`. Sweep `n_e_steps∈{1,2,3,5,8}`. `KMP_DUPLICATE_LIB_OK` already set.
 - **Baseline/control.** The `n_e_steps=1` cell is the operating point; the straight_through arm controls trajectory-graph depth.
 - **Primary metric.** test PPL vs n_e_steps (monotonicity test). **Secondary.** Pearson(n_e_steps, final F/token) and Pearson(final F/token, CE) across the sweep, from `return_trajectory=True`.
@@ -217,6 +223,8 @@ Decides whether the headline scaling exponent is a capacity law or partly optimi
 ### EXP-7. Prior-anchoring resists rank collapse (F2) — ★★★★
 
 Tests whether α·KL(q‖p) is the FFN-brake substitute the no-MLP claim relies on; the directional null is already confirmed in a probe.
+
+**Status (2026-06-22): built.** The `rho_handoff` 5-arm sweep (lambda_alpha × rho × e_phi_lr, n_layers=4, lambda_alpha_mode='constant'), the per-cell `rank_resid` / `rank_resid_by_layer` diagnostics, and the `rank_residual_by_depth` depth-overlay figure (`_plot_rank_collapse` driver) are in (commit 3acd7ad). See `docs/2026-06-22-edits.md`.
 
 - **Config.** Trained prior tables. Sweep `n_layers∈{1,2,4,8}`, pure no-MLP path. Arms: (a) anchored `lambda_alpha=1` with both `prior_handoff_rho=1` (previous-layer handoff) and `rho=0` (embedding anchor) sub-arms; (b) no-anchor `lambda_alpha≈1e-3, rho=0`. Run a second pair with `e_phi_lr>0` so transport is genuinely per-layer-independent (default `e_phi_lr=0` freezes Ω across layers). `KMP_DUPLICATE_LIB_OK` for n_e_steps>1.
 - **Baseline/control.** No-anchor arm is the collapse control; the e_phi_lr>0 pair controls fixed-vs-per-layer geometry.
