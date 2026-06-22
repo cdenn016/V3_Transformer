@@ -394,7 +394,9 @@ def plot_trajectory(
         # hugs the floor -> label upward, a 'max' hugs the ceiling -> label downward, so the text
         # never overruns the title (the grad_norm.png 'max'-into-title collision).
         dy, va = (30, "bottom") if annotate == "min" else (-30, "top")
-        ax.annotate(f"{tag} {v[idx]:.1f}\n@ step {int(x[idx]):,}",
+        # ``:.4g`` (matching annotate_final) so a heavy-tailed log series whose extremum is O(1e-4)
+        # -- holonomy.png -- prints its real value instead of rounding to "0.0" under ``:.1f``.
+        ax.annotate(f"{tag} {v[idx]:.4g}\n@ step {int(x[idx]):,}",
                     xy=(x[idx], v[idx]), xytext=(-12, dy), textcoords="offset points",
                     fontsize=7.5, ha="right", va=va,
                     arrowprops=dict(arrowstyle="->", lw=0.8, color="black"))
@@ -1599,13 +1601,20 @@ def plot_per_layer_diagnostics(
     if "attn_entropy" in per_layer:
         ax.plot(x, g("attn_entropy"), ("s--" if L > 1 else "s"), color=_CB[2], lw=1.2, label="attn entropy (nats)")
     ax.set(xticks=x, xlabel="layer", ylabel="rank / nats", title="Belief geometry by layer")
+    handles, labels = ax.get_legend_handles_labels()
     if "belief_cond_median" in per_layer:
         axr = ax.twinx()
-        axr.plot(x, g("belief_cond_median"), ("^:" if L > 1 else "^"), color=_CB[1], lw=1.2, label="cond median")
+        # Name the axis in the label: this marker lives on the right (log) condition-number axis, not
+        # the left rank/nats axis -- without it the lone triangle reads as a second entropy series.
+        axr.plot(x, g("belief_cond_median"), ("^:" if L > 1 else "^"), color=_CB[1], lw=1.2,
+                 label="cond median (right, log)")
         axr.set_ylabel("condition number")
         axr.set_yscale("log")
         axr.grid(False)
-    ax.legend(fontsize=8, frameon=False, loc="upper left")
+        h2, l2 = axr.get_legend_handles_labels()
+        handles += h2
+        labels += l2
+    ax.legend(handles, labels, fontsize=8, frameon=False, loc="upper left")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -1732,9 +1741,12 @@ def plot_holonomy_curvature(
     axb.set_yscale("log")
     axb.set(xlabel="triangle span max|i-j|", ylabel=r"$\|H_{ijk}-I\|_F$", title="Curvature vs separation")
     if curvature is not None:
+        # The field is the transport's own curvature, ~0 for a flat (Regime-I) cocycle and genuinely
+        # spread for regime_ii -- so the title must follow the run, not hard-code "regime II".
+        field_regime = "regime II" if regime is not None else "flat"
         im = axes[0][2].imshow(_np(curvature), cmap="magma", aspect="auto")
         fig.colorbar(im, ax=axes[0][2], shrink=0.8, label=r"$\|H-I\|_F$")
-        axes[0][2].set(xlabel="j", ylabel="i", title="Curvature field (regime II)")
+        axes[0][2].set(xlabel="j", ylabel="i", title=f"Curvature field ({field_regime})")
     fig.tight_layout()
     return _save(fig, path)
 
