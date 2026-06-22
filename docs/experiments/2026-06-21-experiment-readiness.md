@@ -287,3 +287,30 @@ The cheapest path to the most experiments runnable is the S1→S2→S3 shared cl
 arms + per-cell converged-state residual + CSV columns), which unblocks EXP-2, EXP-4, EXP-9, and
 EXP-10 together, followed by S4 (the cross-arm/seed correlation+aggregation reader) for EXP-1,
 EXP-5, and EXP-6.
+
+## 7. Build status update (2026-06-21, overnight)
+
+Seven commits on `feat/gauge-transport-toggle` (3eca386, c0558e1, 487c3f1, 0671215, b79f818,
+eb36ce2, 558d77f) moved the matrix from READY 0 to nine experiments runnable as-is and two PARTIAL.
+Full test suite green throughout (1180 passed / 0 failed); each change is additive and leaves the
+user's config WIP intact. Per-experiment how-to-run and what-remains:
+
+| Exp | Status now | Run it | Remaining (deferred) |
+|-----|-----------|--------|----------------------|
+| EXP-1 | RUNNABLE | `train_vfe3.py`: NUM_RUNS>1 + SEEDS + DATA_SEED, then `python multiseed_analysis.py` | noise-band overlay figure |
+| EXP-2 | RUNNABLE | `ablation.py` CONFIG["sweep"]="gauge_transport" | grouped-bar + residual-table figure |
+| EXP-3 | PARTIAL | metrics ready (`sigma_trace`/`spearman_rho`/`cv`) | Sigma<->CE join (`belief_ce_bank`) + reliability/scatter plots |
+| EXP-4 | RUNNABLE | CONFIG["sweep"]="attention_entropy" | -tau^-1 Cov_beta diff metric + PPL-gap figure |
+| EXP-5 | RUNNABLE (PPL) | CONFIG["sweep"]="n_e_steps_em" | persisted final E-step F/token for the F-vs-CE decorrelation |
+| EXP-6 | RUNNABLE | `scaling.py` CONFIG["routes"]=["grow_K_mup"] | K-axis power-law fit + bootstrap-CI figure |
+| EXP-7 | PARTIAL | metric + per-layer r(X) curve ready (`across_layer_belief_trace`) | rho-handoff multi-arm sweep + depth-overlay figure |
+| EXP-8 | RUNNABLE | CONFIG["sweep"] in {gauge_mstep_optim, m_phi_lr_natgrad, mass_phi} | cos(nat,grad)/pullback-cond/steps-to-target/wall-clock diagnostics |
+| EXP-9 | RUNNABLE | CONFIG["sweep"]="gauge_equivariance" (builder_resid in CSV) | residual-drift-vs-step figure |
+| EXP-10 | RUNNABLE | CONFIG["sweep"]="cg_coupling" (equiv residual in CSV) | combined equivariance+PPL bar figure |
+| EXP-11 | RUNNABLE | CONFIG["sweep"]="kappa_beta_per_head" | geo-mean-tau baseline arm + dispersion-scalar x-axis figure |
+
+The recurring deferred theme is FIGURES (a post-hoc plotting pass over `vfe3/viz/figures.py` once
+the runs produce CSVs) plus three involved infra items that each warrant their own careful pass:
+the EXP-3 Sigma<->CE join, the EXP-5 final-F persistence (free_energy_value threading), and the
+EXP-8 training-time diagnostics (train.py metrics hot path). All are catalogued in section 3.
+See `docs/2026-06-21-edits.md` for the per-commit detail.
