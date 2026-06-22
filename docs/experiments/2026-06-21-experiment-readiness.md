@@ -304,7 +304,7 @@ user's config WIP intact. Per-experiment how-to-run and what-remains:
 | EXP-5 | DONE (2026-06-22) | `infer_T` route + persisted `estep_final_f_per_token` + `f_ce_decorrelation`/`estep_capacity` figures + the two Pearsons | — (`scaling_analysis.py` after the `infer_T` run) |
 | EXP-6 | RUNNABLE | `scaling.py` CONFIG["routes"]=["grow_K_mup"] | K-axis power-law fit + bootstrap-CI figure |
 | EXP-7 | DONE (2026-06-22) | `rho_handoff` sweep + per-cell `rank_resid`/`rank_resid_by_layer` + `rank_residual_by_depth` figure | — (per-sweep `rho_handoff_rank_collapse.png`) |
-| EXP-8 | RUNNABLE | CONFIG["sweep"] in {gauge_mstep_optim, m_phi_lr_natgrad, mass_phi} | cos(nat,grad)/pullback-cond/steps-to-target/wall-clock diagnostics |
+| EXP-8 | DONE (2026-06-22) | gauge M-step sweeps + gated `cos_nat_phi`/`pullback_cond_*`/`wall_clock_s` in metrics.csv + `wallclock_convergence` figure (steps/wall-to-target) + LR bowl | — (per-sweep figures) |
 | EXP-9 | RUNNABLE | CONFIG["sweep"]="gauge_equivariance" (builder_resid in CSV) | residual-drift-vs-step figure |
 | EXP-10 | RUNNABLE | CONFIG["sweep"]="cg_coupling" (equiv residual in CSV) | combined equivariance+PPL bar figure |
 | EXP-11 | RUNNABLE | CONFIG["sweep"]="kappa_beta_per_head" | geo-mean-tau baseline arm + dispersion-scalar x-axis figure |
@@ -317,9 +317,10 @@ See `docs/2026-06-21-edits.md` for the per-commit detail.
 
 ## 8. Build status update (2026-06-22)
 
-The two PARTIAL experiments and one RUNNABLE-with-deferred-infra experiment from section 7 are now
-fully built (additive only; default path unchanged; full suite green at each step). Two of the three
-"involved infra items" flagged above are closed (only the EXP-8 training-time diagnostics remain).
+The PARTIAL and RUNNABLE-with-deferred-infra experiments from section 7 (EXP-3, EXP-4, EXP-5, EXP-7,
+EXP-8) are now fully built (additive only; default path unchanged; full suite green at each step). All
+three "involved infra items" flagged above — the EXP-3 Sigma<->CE join, the EXP-5 final-F persistence,
+and the EXP-8 training-time diagnostics — are closed.
 
 - **EXP-3 (Sigma_q calibration, B1) — DONE.** `vfe3.viz.extract.belief_ce_bank` is the Sigma_q<->CE
   join (replays forward's belief path EXACTLY -- including the s-refine anchor and precision-bias fold
@@ -348,6 +349,13 @@ fully built (additive only; default path unchanged; full suite green at each ste
   it as the `cov_gap` CSV column; the `attention_entropy` sweep is the 2×2 entropy×κ grid; the
   `entropy_ppl_gap` + `cov_gap_vs_kappa` figures are driven by `_plot_attention_entropy`.
 
-Remaining across the suite is the FIGURES tail (EXP-1/2/6/9/10/11 post-hoc plotters) and the EXP-8
-training-time diagnostics (cos(nat,grad)/pullback-cond/steps-to-target/wall-clock on the train.py hot
-path). See `docs/2026-06-22-edits.md` for detail.
+- **EXP-8 (pullback nat-grad gauge M-step + LR, D1) — DONE.** `GaugeNaturalGradAdamW` stashes GATED
+  (log/eval-only, read-only) training-time diagnostics `cos_nat_phi` and the pullback-metric
+  `pullback_cond_*`; `train.py` adds the cumulative `wall_clock_s` column; `wallclock_convergence`
+  (`vfe3/viz/figures.py`, driven by `_plot_wallclock_convergence`) plots val PPL vs wall time with the
+  steps/wall-to-target annotated; the LR-vs-PPL bowl falls out of `_plot_one_sweep` on the
+  `m_phi_lr_natgrad` numeric sweep.
+
+The whole top-8 experiment harness is now built. Remaining across the suite is the FIGURES tail for
+the lower-priority experiments (EXP-1/2/6/9/10/11 post-hoc plotters). See `docs/2026-06-22-edits.md`
+for detail.

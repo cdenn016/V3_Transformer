@@ -2610,3 +2610,50 @@ def plot_cov_gap_vs_kappa(
     ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
+
+
+# ===========================================================================
+# D1 / EXP-8  --  pullback natural-gradient gauge M-step convergence
+# ===========================================================================
+
+@register_figure("wallclock_convergence")
+def plot_wallclock_convergence(
+    arms,                                # list of {label, val_ppl:[...], wall_clock_s:[...], step:[...]}
+
+    *,
+    target: Optional[float] = None,      # shared target PPL; None -> the worst arm's best (all reach it)
+    path:   Optional[str]   = None,
+):
+    r"""D1/EXP-8: validation PPL vs cumulative wall time, one line per gauge M-step arm.
+
+    The per-wall-clock convergence curve (the per-token pullback matrix_exp solve is the dominant
+    added cost, so a per-STEP advantage can vanish per second). A shared target PPL (default: the
+    worst arm's best, so every arm reaches it) is drawn; each arm's wall-time and step count TO that
+    target are annotated in the legend -- the steps-to-target / wall-to-target convergence-speed
+    readout. log-y so multiplicative gaps are legible."""
+    arms = [a for a in arms if len(a.get("val_ppl", [])) >= 1 and len(a.get("wall_clock_s", [])) >= 1]
+    if target is None and arms:
+        mins = [min(a["val_ppl"]) for a in arms if a["val_ppl"]]
+        target = max(mins) if mins else None
+    fig, ax = plt.subplots(figsize=(6.8, 4.6))
+    for j, a in enumerate(arms):
+        t = np.asarray(a["wall_clock_s"], float)
+        y = np.asarray(a["val_ppl"], float)
+        s = np.asarray(a.get("step", np.arange(t.size)), float)
+        order = np.argsort(t)
+        t, y, s = t[order], y[order], s[order]
+        lab = str(a.get("label", j))
+        if target is not None:
+            hit = np.where(y <= target)[0]
+            if hit.size:
+                lab += f"  (→ {t[hit[0]]:.0f}s / {int(s[hit[0]])} steps)"
+        ax.plot(t, y, "o-", color=_CB[j % len(_CB)], lw=1.6, ms=4, label=lab)
+    if target is not None and np.isfinite(target):
+        ax.axhline(target, color=_CB[7], ls="--", lw=1.0, alpha=0.6, label=f"target PPL={target:.2f}")
+    ax.set_yscale("log")
+    ax.set(xlabel="cumulative wall time (s)", ylabel="validation PPL (log)")
+    ax.set_title("Gauge M-step convergence: val PPL vs wall-clock")
+    if arms:
+        ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)

@@ -240,6 +240,8 @@ Tests whether α·KL(q‖p) is the FFN-brake substitute the no-MLP claim relies 
 
 Three lenses (S9/S12/S14) converged here. Confirms or refutes the geometric justification for the `m_phi_natural_grad` lever and tests the natural-gradient LR-mis-scaling pitfall in one panel.
 
+**Status (2026-06-22): built.** The gauge M-step sweeps exist; `GaugeNaturalGradAdamW` now stashes gated (log/eval-only, read-only) `cos_nat_phi` + pullback-metric `pullback_cond_*`, `train.py` logs a cumulative `wall_clock_s`, and `wallclock_convergence` (driven by `_plot_wallclock_convergence`) plots val PPL vs wall time with steps/wall-to-target annotated; the LR bowl falls out of `_plot_one_sweep` on `m_phi_lr_natgrad`. See `docs/2026-06-22-edits.md`.
+
 - **Config.** `block_glk`, K=64, `n_heads=8` (d_head=8 ≤ max_k=12, so `pullback_per_block` builds), `m_gauge_momentum=0.9`, `e_phi_lr=0` (keep the preconditioner off the E-step). Arms: AdamW-on-φ (`m_phi_natural_grad=False`), `pullback_per_block`, and `killing_per_block` (conformal control). **Regime knob: sweep `mass_phi∈{0.0, positive}`** — NOT `phi_weight_decay` (hard-zeroed under natural-grad and pinned by `test_phi_weight_decay.py`). LR sub-experiment: log-spaced `m_phi_lr∈{0.0005,0.0015,0.005,0.015,0.05,0.15}` on the pullback arm (add `requires:{m_phi_natural_grad:True, phi_precond_mode:'pullback_per_block'}` to the SWEEPS entry).
 - **Baseline/control.** AdamW-on-φ; killing is the conformal LR-rescale control (cos(nat,grad)=1, must NOT serve as the geometric arm).
 - **Primary metric.** steps-to-target-val-PPL and final PPL, both per-step and per-wall-clock (the per-token matrix_exp solve is the dominant added cost). **Secondary.** per-token pullback condition number (logged), cos(nat,grad).

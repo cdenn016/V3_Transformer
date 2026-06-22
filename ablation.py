@@ -1728,6 +1728,42 @@ def _plot_attention_entropy(sweep_dir: Path, fig_dir: Path) -> None:
         print(f"  figure -> {out}")
 
 
+def _plot_wallclock_convergence(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""Write ``figures/<sweep>_wallclock_convergence.png`` -- the D1/EXP-8 per-wall-clock convergence
+    overlay (val PPL vs cumulative wall time, one line per arm, with steps/wall-to-target annotated) --
+    from each cell's ``metrics.csv`` eval rows (val_ppl + wall_clock_s). A no-op unless >= 2 cells carry
+    >= 2 eval points, so it is safe to call after every sweep (the gauge M-step sweeps populate it)."""
+    arms: List[Dict[str, Any]] = []
+    for cell in sorted(sweep_dir.glob("*/metrics.csv")):
+        steps, ppls, walls = [], [], []
+        try:
+            with open(cell, newline="", encoding="utf-8") as fh:
+                for r in csv.DictReader(fh):
+                    vp, wc = _as_float(r.get("val_ppl")), _as_float(r.get("wall_clock_s"))
+                    if vp < float("inf") and wc < float("inf"):     # eval rows carry both
+                        steps.append(_as_float(r.get("step")))
+                        ppls.append(vp)
+                        walls.append(wc)
+        except Exception:                                           # unreadable metrics.csv -> skip cell
+            continue
+        if len(ppls) >= 2:
+            arms.append({"label": cell.parent.name, "step": steps, "val_ppl": ppls, "wall_clock_s": walls})
+    if len(arms) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_wallclock_convergence
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"wallclock-convergence figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_wallclock_convergence.png"
+    plt.close(plot_wallclock_convergence(arms, path=str(out)))
+    print(f"  figure -> {out}")
+
+
 def _plot_sensitivity(output_dir: Path, fig_dir: Path) -> None:
     r"""Cross-sweep comparison: a PPL-range (worst - best) bar per sweep, sorted by sensitivity.
 
@@ -1816,6 +1852,7 @@ def main() -> None:
         _plot_one_sweep(sweep_dir, fig_dir)                 # this sweep's PPL figure (tacked on)
         _plot_rank_collapse(sweep_dir, fig_dir)            # F2/EXP-7 r(X)-by-depth (no-op if absent)
         _plot_attention_entropy(sweep_dir, fig_dir)        # C1/EXP-4 PPL-gap + Cov-gap (no-op if absent)
+        _plot_wallclock_convergence(sweep_dir, fig_dir)    # D1/EXP-8 wall-clock convergence (no-op if absent)
 
     # ---- after all sweeps: the cross-sweep comparison ----
     _plot_sensitivity(output_dir, fig_dir)

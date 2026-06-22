@@ -35,7 +35,7 @@ from typing import List
 
 import torch
 
-from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
+from vfe3.geometry.phi_preconditioner import precondition_phi_gradient, pullback_metric_per_block
 
 
 class GaugeNaturalGradAdamW(torch.optim.AdamW):
@@ -74,6 +74,13 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         self._irrep_dims     = irrep_dims
         self._precond_mode   = precond_mode
         self._gauge_momentum = float(gauge_momentum)
+        # D1/EXP-8 training-time diagnostics, GATED: the caller (train.py) sets _collect_gauge_diag
+        # True only on a log/eval step, so the silent hot path computes NOTHING extra. When set, step()
+        # stashes cos(nat, grad) (1.0 for the conformal killing rescale; <1 when pullback reshapes the
+        # direction) and -- on the pullback modes -- the per-token metric condition number into
+        # _gauge_diag, which train.py reads into metrics.csv.
+        self._collect_gauge_diag = False
+        self._gauge_diag: dict   = {}
 
     def __setstate__(self, state) -> None:                             # type: ignore[override]
         r"""Restore generically, running Adam's step migration only where ``"step"`` exists.
@@ -94,6 +101,9 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
 
     @torch.no_grad()
     def step(self, closure=None):                                      # type: ignore[override]
+        collect = self._collect_gauge_diag                             # gated: True only on log/eval steps
+        cos_acc: List[float] = []
+        cond_acc: List[torch.Tensor] = []
         for group in self.param_groups:
             if not group.get("gauge", False):
                 continue
@@ -114,6 +124,15 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                         flat_g[active], flat_phi[active], Gd,
                         mode=self._precond_mode, irrep_dims=self._irrep_dims,
                     )
+                    if collect:                                        # D1/EXP-8 diagnostics (sparse)
+                        cos = torch.nn.functional.cosine_similarity(
+                            nat[active], flat_g[active], dim=-1)        # (active,)
+                        cos_acc.append(float(cos.mean()))
+                        if self._precond_mode in ("pullback", "pullback_per_block"):
+                            from vfe3.numerics import condition_number
+                            Gm = pullback_metric_per_block(flat_phi[active], Gd, self._irrep_dims)
+                            eye = torch.eye(Gm.shape[-1], dtype=Gm.dtype, device=Gm.device)
+                            cond_acc.append(condition_number(Gm + 1e-6 * eye).reshape(-1))
                 nat = nat.reshape_as(g)
 
                 state = self.state[p]
@@ -124,4 +143,12 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 buf.mul_(mom).add_(nat)                                 # heavy-ball: m <- mom*m + nat
                 p.add_(buf, alpha=-lr)                                  # phi <- phi - lr*m
                 p.grad = None                                           # consumed: AdamW no-ops on it
+        if collect:
+            self._gauge_diag = {}
+            if cos_acc:
+                self._gauge_diag["cos_nat_phi"] = sum(cos_acc) / len(cos_acc)
+            if cond_acc:
+                allc = torch.cat(cond_acc)
+                self._gauge_diag["pullback_cond_median"] = float(allc.median())
+                self._gauge_diag["pullback_cond_max"]    = float(allc.max())
         return super().step(closure)
