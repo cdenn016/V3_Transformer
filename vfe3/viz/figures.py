@@ -2540,3 +2540,73 @@ def plot_f_ce_decorrelation(
     ax.set_title(rf"E-step F vs CE  (Pearson$(F,CE)$={r_fce:+.3f}, Pearson$(T,F)$={r_nef:+.3f})")
     fig.tight_layout()
     return _save(fig, path)
+
+
+# ===========================================================================
+# C1 / EXP-4  --  canonical-F vs entropy-suppressed surrogate
+# ===========================================================================
+
+@register_figure("entropy_ppl_gap")
+def plot_entropy_ppl_gap(
+    cells,                               # list of {include_attention_entropy(bool), kappa, ppl}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""C1/EXP-4: validation-PPL, canonical (entropy ON) vs surrogate (entropy OFF), grouped by kappa.
+
+    The production kernel descends the SURROGATE gradient, so CANON_ORACLE is the only path that ever
+    exercises the canonical -tau^{-1} Cov_beta correction; a positive (surrogate - canonical) PPL gap
+    means the entropy term is empirically load-bearing. Grouped bars per kappa; the gap is annotated."""
+    cells = list(cells)
+    kappas = sorted({float(c["kappa"]) for c in cells})
+
+    def _ppl(k, ent):
+        v = [float(c["ppl"]) for c in cells
+             if abs(float(c["kappa"]) - k) < 1e-9 and bool(c["include_attention_entropy"]) == ent]
+        return v[0] if v else float("nan")
+    canon = [_ppl(k, True) for k in kappas]
+    surr = [_ppl(k, False) for k in kappas]
+    x = np.arange(len(kappas)); w = 0.38
+    fig, ax = plt.subplots(figsize=(6.2, 4.4))
+    ax.bar(x - w / 2, canon, w, color=_CB[0], label="canonical (entropy ON)")
+    ax.bar(x + w / 2, surr, w, color=_CB[1], label="surrogate (entropy OFF)")
+    for i in range(len(kappas)):
+        if np.isfinite(canon[i]) and np.isfinite(surr[i]):
+            ax.annotate(f"Δ={surr[i] - canon[i]:+.2f}", (x[i], max(canon[i], surr[i])),
+                        textcoords="offset points", xytext=(0, 4), ha="center", fontsize=8)
+    ax.set_xticks(x); ax.set_xticklabels([f"κ={k:g}" for k in kappas])
+    ax.set(ylabel="validation PPL")
+    ax.set_title("Canonical-F vs entropy-suppressed surrogate (PPL gap by κ)")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("cov_gap_vs_kappa")
+def plot_cov_gap_vs_kappa(
+    cells,                               # list of {include_attention_entropy(bool), kappa, cov_gap}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""C1/EXP-4: the -tau^{-1} Cov_beta(E, dE) gradient-gap magnitude vs kappa.
+
+    The belief-gradient contribution the canonical entropy term adds and the surrogate drops. Its
+    kappa-dependence trades the 1/tau = 1/(kappa*sqrt(d)) prefactor against the beta diffuseness in
+    Cov_beta, so the sign of the trend is empirical -- the plot measures it. One series per trained
+    arm (the gap is measured on each arm's converged belief)."""
+    cells = list(cells)
+    fig, ax = plt.subplots(figsize=(6.0, 4.4))
+    for ent, lab, col in ((True, "canonical-trained", _CB[0]), (False, "surrogate-trained", _CB[1])):
+        pts = sorted([(float(c["kappa"]), float(c["cov_gap"])) for c in cells
+                      if bool(c["include_attention_entropy"]) == ent
+                      and np.isfinite(float(c["cov_gap"]))], key=lambda t: t[0])
+        if pts:
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-", color=col, lw=1.8, label=lab)
+    ax.set(xlabel=r"$\kappa$ (softmax temperature scale)",
+           ylabel=r"$\|-\tau^{-1}\mathrm{Cov}_\beta(E,\nabla E)\|$ per token")
+    ax.set_title("Attention-entropy gradient gap vs κ")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)

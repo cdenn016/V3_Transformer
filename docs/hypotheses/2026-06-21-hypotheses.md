@@ -183,6 +183,8 @@ Tests open thread (f) and the manuscript's flagged "uncertainty channel" over-re
 
 The production kernel never computes the entropy term, so CANON_ORACLE is the only path that has ever exercised the canonical gradient — this raises the stakes above a second-order correction.
 
+**Status (2026-06-22): built.** `attention_entropy_cov_gap` (`vfe3/viz/extract.py`) measures the −τ⁻¹Cov_β(E,∇E) gap by differencing the autograd oracle gradient (entropy ON vs OFF) on the converged belief; the `attention_entropy` sweep is the 2×2 entropy×κ grid with a `cov_gap` CSV column; the `entropy_ppl_gap` + `cov_gap_vs_kappa` figures are wired. See `docs/2026-06-22-edits.md`.
+
 - **Config.** `ablation.py` `configs` multi-arm, K=20, 15k steps:
   - **SURROGATE:** `{include_attention_entropy:False, oracle_unroll_grad:True}`.
   - **CANON_ORACLE:** `{include_attention_entropy:True, oracle_unroll_grad:True}` (the clean control; both on the oracle, isolating the entropy term from the kernel-vs-oracle route).

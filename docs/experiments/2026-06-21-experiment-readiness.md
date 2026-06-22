@@ -300,7 +300,7 @@ user's config WIP intact. Per-experiment how-to-run and what-remains:
 | EXP-1 | RUNNABLE | `train_vfe3.py`: NUM_RUNS>1 + SEEDS + DATA_SEED, then `python multiseed_analysis.py` | noise-band overlay figure |
 | EXP-2 | RUNNABLE | `ablation.py` CONFIG["sweep"]="gauge_transport" | grouped-bar + residual-table figure |
 | EXP-3 | DONE (2026-06-22) | metrics + `belief_ce_bank` join + reliability/stratified/scatter figures + rho/CV in research.json | — (figures auto-emit via `generate_figures`) |
-| EXP-4 | RUNNABLE | CONFIG["sweep"]="attention_entropy" | -tau^-1 Cov_beta diff metric + PPL-gap figure |
+| EXP-4 | DONE (2026-06-22) | `attention_entropy` 2×2 entropy×κ sweep + `attention_entropy_cov_gap` metric (cov_gap CSV col) + PPL-gap / cov-gap-vs-κ figures | — (per-sweep figures) |
 | EXP-5 | DONE (2026-06-22) | `infer_T` route + persisted `estep_final_f_per_token` + `f_ce_decorrelation`/`estep_capacity` figures + the two Pearsons | — (`scaling_analysis.py` after the `infer_T` run) |
 | EXP-6 | RUNNABLE | `scaling.py` CONFIG["routes"]=["grow_K_mup"] | K-axis power-law fit + bootstrap-CI figure |
 | EXP-7 | DONE (2026-06-22) | `rho_handoff` sweep + per-cell `rank_resid`/`rank_resid_by_layer` + `rank_residual_by_depth` figure | — (per-sweep `rho_handoff_rank_collapse.png`) |
@@ -342,6 +342,12 @@ fully built (additive only; default path unchanged; full suite green at each ste
   `f_ce_decorrelation` figure, printing `Pearson(n_e_steps, F)` and `Pearson(F, CE)` (the structural-EM
   prediction: the former strongly negative, the latter ~0/positive).
 
+- **EXP-4 (canonical-F vs entropy-suppressed surrogate, C1) — DONE.** `attention_entropy_cov_gap`
+  (`vfe3/viz/extract.py`) measures the −τ⁻¹Cov_β(E,∇E) attention-entropy gradient gap by differencing
+  the autograd oracle gradient (entropy ON vs OFF) on the converged belief; `_cell_diagnostics` emits
+  it as the `cov_gap` CSV column; the `attention_entropy` sweep is the 2×2 entropy×κ grid; the
+  `entropy_ppl_gap` + `cov_gap_vs_kappa` figures are driven by `_plot_attention_entropy`.
+
 Remaining across the suite is the FIGURES tail (EXP-1/2/6/9/10/11 post-hoc plotters) and the EXP-8
 training-time diagnostics (cos(nat,grad)/pullback-cond/steps-to-target/wall-clock on the train.py hot
-path) plus the EXP-4 -tau^-1 Cov_beta gradient-gap metric. See `docs/2026-06-22-edits.md` for detail.
+path). See `docs/2026-06-22-edits.md` for detail.
