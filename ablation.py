@@ -59,11 +59,16 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader
-from vfe3.metrics import attention_entropy, gauge_equivariance_residual, head_mixer_gauge_residual
+from vfe3.metrics import (
+    attention_entropy,
+    gauge_equivariance_residual,
+    head_mixer_gauge_residual,
+    rank_one_residual,
+)
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.train import coverage_lines, evaluate, train
-from vfe3.viz.extract import converged_state
+from vfe3.viz.extract import across_layer_belief_trace, converged_state
 
 logger = logging.getLogger("ablation")
 
@@ -545,6 +550,33 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "requires": {"m_phi_natural_grad": True, "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0},
     },
 
+    "rho_handoff": {  # F2 / EXP-7: prior-anchoring as the FFN-brake substitute against rank collapse.
+        # The Dong rank-one residual r(X) of the per-token mean cloud is read off PER LAYER from one
+        # deep model per arm (across_layer_belief_trace -> rank_resid_by_layer in each cell's
+        # ablation_result.json), so the depth-overlay figure compares decay RATES, not absolute level
+        # (the no-anchor control plateaus rather than collapsing to rank one). lambda_alpha_mode is
+        # pinned 'constant' on every arm so lambda_alpha is the literal anchor strength (the baseline
+        # state-dependent alpha is off); n_layers=4 gives a 4-point depth curve. The anchored arms
+        # carry both the previous-layer handoff (rho=1) and the embedding anchor (rho=0); the
+        # no-anchor arm zeroes the self-coupling (lambda_alpha=1e-3). The *_ephi pair re-runs with
+        # e_phi_lr>0 so the gauge frame is genuinely per-layer-independent (default e_phi_lr=0 freezes
+        # Omega across depth).
+        "description": "prior-anchoring (lambda_alpha x rho x e_phi_lr) vs rank collapse, r(X) by depth [F2/EXP-7]",
+        "collect_diagnostics": True,
+        "configs": [
+            {"label": "anchor_rho1",      "lambda_alpha": 1.0,  "prior_handoff_rho": 1.0,
+             "lambda_alpha_mode": "constant", "n_layers": 4, "e_phi_lr": 0.0},
+            {"label": "anchor_rho0",      "lambda_alpha": 1.0,  "prior_handoff_rho": 0.0,
+             "lambda_alpha_mode": "constant", "n_layers": 4, "e_phi_lr": 0.0},
+            {"label": "noanchor",         "lambda_alpha": 1e-3, "prior_handoff_rho": 0.0,
+             "lambda_alpha_mode": "constant", "n_layers": 4, "e_phi_lr": 0.0},
+            {"label": "anchor_rho1_ephi", "lambda_alpha": 1.0,  "prior_handoff_rho": 1.0,
+             "lambda_alpha_mode": "constant", "n_layers": 4, "e_phi_lr": 0.02},
+            {"label": "noanchor_ephi",    "lambda_alpha": 1e-3, "prior_handoff_rho": 0.0,
+             "lambda_alpha_mode": "constant", "n_layers": 4, "e_phi_lr": 0.02},
+        ],
+    },
+
     # === positional encoding ===============================================
     
     "pos_phi": {
@@ -892,24 +924,19 @@ SWEEP_ORDER: List[str] = [
     
   #  "n_e_steps",
     
-    "weight_decay",
+  # "weight_decay",
     
   #   "mu_init_std",
   #  "phi_scale",
   #  "sigma_init", 
-  
-    
+   
   ##  "renyi_order",
-    
-    
+  
    # "e_q_mu_lr",
   #  "phi_weight_decay",
      
    #"e_q_sigma_lr",
-    
-       
-  #  
-    
+
   #  "pos_phi_scale",   
   #  "mass_phi",
 #  "mstep_self_coupling_weight",
@@ -1191,6 +1218,17 @@ def _cell_diagnostics(
         out["gauge_resid_out"] = float(res["energy_out_group"].median())
     except Exception as exc:
         logger.warning("  [diagnostics: gauge_resid skipped] %s", exc)
+
+    # Dong rank-one residual r(X) of the converged per-token mean cloud (F2/EXP-7). The final-layer
+    # scalar is a CSV column (a cheap rank-collapse readout for every diagnostics sweep); the full
+    # per-layer curve is one extra deep replay and rides in the cell JSON only (not CSV) for the
+    # rank-residual depth-overlay figure (_plot_rank_collapse).
+    _probe("rank_resid", lambda: rank_one_residual(cstate["mu"]))
+    try:
+        curve = across_layer_belief_trace(model, token_ids)["rank_one_residual"]
+        out["rank_resid_by_layer"] = [float(x) for x in curve]
+    except Exception as exc:
+        logger.warning("  [diagnostics: rank_resid_by_layer skipped] %s", exc)
     return out
 
 
@@ -1307,6 +1345,7 @@ _CSV_COLUMNS = [
     "n_params",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
+    "rank_resid",
     "wall_time_s", "seed", "error",
 ]
 
@@ -1606,6 +1645,35 @@ def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
+def _plot_rank_collapse(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""Write ``figures/<sweep>_rank_collapse.png`` -- the F2/EXP-7 Dong r(X)-vs-depth overlay, one
+    line per arm -- from the per-cell ``rank_resid_by_layer`` curves persisted in each
+    ``ablation_result.json`` (off ``collect_diagnostics``; see ``_cell_diagnostics``). A no-op (writes
+    nothing) unless at least one finished cell carries a >=2-layer rank curve, so it is safe to call
+    after every sweep -- only the deep collect_diagnostics sweeps (rho_handoff) produce the curve."""
+    arms: Dict[str, Any] = {}
+    for r in _collect_sweep_results(sweep_dir):
+        curve = r.get("rank_resid_by_layer")
+        if (isinstance(curve, list) and len(curve) >= 2
+                and _as_float(r.get("primary_val_ppl")) < float("inf")):
+            arms[str(r.get("label", "?"))] = curve
+    if not arms:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_rank_residual_by_depth
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"rank-collapse figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_rank_collapse.png"
+    fig = plot_rank_residual_by_depth(arms, path=str(out))
+    plt.close(fig)
+    print(f"  figure -> {out}")
+
+
 def _plot_sensitivity(output_dir: Path, fig_dir: Path) -> None:
     r"""Cross-sweep comparison: a PPL-range (worst - best) bar per sweep, sorted by sensitivity.
 
@@ -1692,6 +1760,7 @@ def main() -> None:
         sweep_dir = output_dir / name
         analyze_sweep(sweep_dir)                             # this sweep's table (accumulated)
         _plot_one_sweep(sweep_dir, fig_dir)                 # this sweep's PPL figure (tacked on)
+        _plot_rank_collapse(sweep_dir, fig_dir)            # F2/EXP-7 r(X)-by-depth (no-op if absent)
 
     # ---- after all sweeps: the cross-sweep comparison ----
     _plot_sensitivity(output_dir, fig_dir)

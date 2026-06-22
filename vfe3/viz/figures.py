@@ -2334,3 +2334,168 @@ def plot_decode_readout(
     fig.suptitle("Linear decode readout W (top-norm vocab rows): logits = mu_q @ W^T")
     fig.tight_layout()
     return _save(fig, path)
+
+
+# ===========================================================================
+# B1 / EXP-3  --  Sigma_q as calibrated Fisher uncertainty
+# ===========================================================================
+
+def _spearman_np(x: np.ndarray, y: np.ndarray) -> float:
+    r"""Spearman rank correlation of two 1-D arrays (Pearson on ranks); 0.0 if degenerate."""
+    x, y = np.asarray(x, float).ravel(), np.asarray(y, float).ravel()
+    if x.size < 2:
+        return 0.0
+    rx = x.argsort().argsort().astype(float)
+    ry = y.argsort().argsort().astype(float)
+    rx -= rx.mean(); ry -= ry.mean()
+    den = float(np.linalg.norm(rx) * np.linalg.norm(ry))
+    return float((rx * ry).sum() / den) if den > 0 else 0.0
+
+
+@register_figure("reliability_diagram")
+def plot_reliability_diagram(
+    reliability,                         # list of {conf, acc, frac} bins (run_artifacts._calibration_and_strata)
+
+    *,
+    ece:  Optional[float] = None,
+    path: Optional[str]   = None,
+):
+    r"""B1/EXP-3 control: decode-calibration reliability diagram (accuracy vs confidence).
+
+    The uncalibrated decode-softmax confidence baseline the Sigma_q-conditioned recalibration is
+    measured against. Each bar is a confidence bin: height = empirical accuracy, the ``y=x`` diagonal
+    is perfect calibration, and the gap (over/under-confidence) integrated and frac-weighted is the
+    ECE annotated in the title. Consumes the bins ``run_artifacts`` already computes (conf / acc /
+    frac) but never plotted."""
+    rel = list(reliability or [])
+    conf = np.array([b["conf"] for b in rel], float)
+    acc = np.array([b["acc"] for b in rel], float)
+    frac = np.array([b.get("frac", 0.0) for b in rel], float)
+    if ece is None and rel:
+        ece = float((frac * np.abs(acc - conf)).sum())
+    fig, ax = plt.subplots(figsize=(5.2, 5.0))
+    ax.plot([0, 1], [0, 1], color=_CB[7], lw=1.2, ls="--", label="perfect calibration (y=x)")
+    if conf.size:
+        width = 1.0 / max(len(rel), 1)
+        ax.bar(conf, acc, width=0.9 * width, color=_CB[0], alpha=0.55,
+               edgecolor=_CB[0], label="empirical accuracy")
+        ax.scatter(conf, acc, s=8.0 + 240.0 * frac, color=_CB[1], zorder=3,
+                   label="bin (area ~ token frac)")
+    ax.set(xlim=(0, 1), ylim=(0, 1), xlabel="decode confidence (max softmax prob)",
+           ylabel="empirical accuracy")
+    ax.set_title("Decode reliability" + (f"  (ECE={ece:.3f})" if ece is not None else ""))
+    ax.legend(fontsize=8, frameon=False, loc="upper left")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("sigma_stratified_error")
+def plot_sigma_stratified_error(
+    bank: Dict,                          # belief_ce_bank: tr_sigma (M,), ce (M,)
+
+    *,
+    n_bins:  int = 10,
+    n_boot:  int = 400,
+    path:    Optional[str] = None,
+):
+    r"""B1/EXP-3: held-out CE stratified by belief uncertainty tr(Sigma_q) (decile bins).
+
+    The load-bearing calibration figure: if Sigma_q carries decode-time uncertainty, mean CE rises
+    monotonically across increasing-tr(Sigma_q) bins. Tokens are split into ``n_bins`` equal-count
+    quantile bins of tr(Sigma_q); each point is that bin's mean CE with a bootstrap 10-90 band
+    (``n_boot`` resamples, fixed seed -> deterministic). A flat curve means the covariance channel is
+    inert (see the CV>0.10 gate)."""
+    tr = _np(bank["tr_sigma"]).ravel()
+    ce = _np(bank["ce"]).ravel()
+    fig, ax = plt.subplots(figsize=(6.2, 4.4))
+    if tr.size >= n_bins:
+        edges = np.quantile(tr, np.linspace(0.0, 1.0, n_bins + 1))
+        idx = np.clip(np.digitize(tr, edges[1:-1]), 0, n_bins - 1)   # interior edges -> n_bins bins
+        rng = np.random.default_rng(0)
+        xs, ms, los, his = [], [], [], []
+        for b in range(n_bins):
+            cb = ce[idx == b]
+            if cb.size == 0:
+                continue
+            xs.append(float(tr[idx == b].mean()))
+            ms.append(float(cb.mean()))
+            boot = cb[rng.integers(0, cb.size, size=(n_boot, cb.size))].mean(axis=1)
+            los.append(float(np.percentile(boot, 10)))
+            his.append(float(np.percentile(boot, 90)))
+        ax.plot(xs, ms, "o-", color=_CB[0], lw=1.8, label="mean CE per tr(Sigma_q) decile")
+        ax.fill_between(xs, los, his, color=_CB[0], alpha=0.2, label="bootstrap 10-90 band")
+        rho = _spearman_np(tr, ce)
+        ax.set_title(f"CE stratified by belief uncertainty  (Spearman rho={rho:+.3f})")
+    else:
+        ax.set_title("CE stratified by belief uncertainty (insufficient tokens)")
+    ax.set(xlabel=r"belief uncertainty tr$(\Sigma_q)$", ylabel="cross-entropy (nats)")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("sigma_ce_scatter")
+def plot_sigma_ce_scatter(
+    bank: Dict,                          # belief_ce_bank: tr_sigma (M,), ce (M,)
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""B1/EXP-3: per-token tr(Sigma_q) vs CE hexbin with the Spearman rho in the title.
+
+    The raw joint distribution behind the stratified curve -- the headline statistic rho(tr Sigma_q,
+    CE) is the rank correlation; a positive tilt means more-uncertain beliefs are harder tokens
+    (the calibration channel carries signal)."""
+    tr = _np(bank["tr_sigma"]).ravel()
+    ce = _np(bank["ce"]).ravel()
+    fig, ax = plt.subplots(figsize=(6.0, 4.6))
+    if tr.size:
+        hb = ax.hexbin(tr, ce, gridsize=40, bins="log", cmap="viridis", mincnt=1)
+        fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.02, label="tokens (log)")
+    rho = _spearman_np(tr, ce) if tr.size >= 2 else float("nan")
+    ax.set(xlabel=r"belief uncertainty tr$(\Sigma_q)$", ylabel="cross-entropy (nats)")
+    ax.set_title(rf"$\mathrm{{tr}}(\Sigma_q)$ vs CE  (Spearman $\rho$={rho:+.3f}, n={tr.size})")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+# ===========================================================================
+# F2 / EXP-7  --  prior-anchoring resists rank collapse
+# ===========================================================================
+
+@register_figure("rank_residual_by_depth")
+def plot_rank_residual_by_depth(
+    arms,                                # dict {label: (L,) r(X)} OR list of {"label", "rank_one_residual"}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""F2/EXP-7: Dong rank-one residual r(X) vs inference depth, one line per anchoring arm.
+
+    r(X) -> 0 is rank collapse (every token mean identical); a no-anchor arm decays faster per layer
+    than an alpha.KL(q||p)-anchored arm if prior-anchoring is the FFN-brake substitute. Each arm's
+    log-linear decay rate b (slope of log r(X) vs layer) is annotated in the legend -- the per-arm
+    decay-rate comparison the experiment decides on (absolute level is not the endpoint; the
+    no-anchor control plateaus rather than collapsing to rank one)."""
+    if isinstance(arms, dict):
+        items = [(str(k), _np(v).ravel()) for k, v in arms.items()]
+    else:
+        items = [(str(a.get("label", i)), _np(a["rank_one_residual"]).ravel())
+                 for i, a in enumerate(arms)]
+    items = [(lab, r) for lab, r in items if r.size >= 1]
+    fig, ax = plt.subplots(figsize=(6.6, 4.6))
+    for j, (lab, r) in enumerate(items):
+        x = np.arange(1, r.size + 1)
+        slope = ""
+        if r.size >= 2 and float(np.min(r)) > 0:
+            b = float(np.polyfit(np.arange(r.size), np.log(r), 1)[0])
+            slope = f"  (b={b:+.3f})"
+        ax.plot(x, r, "o-" if r.size > 1 else "o", color=_CB[j % len(_CB)], lw=1.6, label=f"{lab}{slope}")
+    ax.set(xlabel="inference depth (layer)",
+           ylabel=r"rank-one residual r(X) = $\|X-\mathbf{1}\bar x^T\|_F/\|X\|_F$")
+    ax.set_title("Prior-anchoring vs rank collapse (Dong r(X) by depth)")
+    if items:
+        ax.set_xticks(np.arange(1, max(r.size for _, r in items) + 1))
+        ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)

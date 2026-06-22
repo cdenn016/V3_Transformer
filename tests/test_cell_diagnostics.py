@@ -74,7 +74,7 @@ def test_builder_residual_zero_for_identity_mixer():
 @pytest.mark.parametrize("sweep_name",
                          ["gauge_transport", "attention_entropy", "gauge_equivariance",
                           "cg_coupling", "n_e_steps_em",
-                          "gauge_mstep_optim", "m_phi_lr_natgrad", "mass_phi"])
+                          "gauge_mstep_optim", "m_phi_lr_natgrad", "mass_phi", "rho_handoff"])
 def test_experiment_arms_validate_and_build(sweep_name):
     r"""Every cell of each new experiment sweep is a real, constructible VFE3Config + VFEModel
     (so a sweep launch will not silently bucket arms as error_kind='config')."""

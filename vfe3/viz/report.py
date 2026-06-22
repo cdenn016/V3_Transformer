@@ -137,6 +137,8 @@ def generate_figures(
     layer_trace = _safe(lambda: extract.across_layer_belief_trace(model, tok), "across_layer_belief_trace")
     bank        = _safe(lambda: extract.belief_bank(model, token_batches, max_sequences=max_sequences), "belief_bank")
     cstate      = _safe(lambda: extract.converged_state(model, tok), "converged_state")
+    ce_bank     = _safe(lambda: extract.belief_ce_bank(model, loader, device=device, max_batches=n_batches),
+                        "belief_ce_bank")    # B1/EXP-3 Sigma_q<->CE join (calibration figures)
     amaps       = _safe(lambda: model.attention_maps(tok), "attention_maps")
     per_layer   = _safe(lambda: model.diagnostics_per_layer(tok), "diagnostics_per_layer")
     health      = _safe(lambda: extract.numerical_health(model, tok), "numerical_health")
@@ -159,6 +161,16 @@ def generate_figures(
         decode = get_tiktoken_decoder(dataset)
     except Exception as exc:
         logger.warning("token decoder unavailable (%s); belief UMAP will grey out", exc)
+
+    # Decode-calibration reliability bins (conf/acc/frac) the run already wrote to research.json
+    # (run_artifacts._calibration_and_strata); the B1/EXP-3 reliability diagram only plots them.
+    reliability = None
+    rj = run_dir / "research.json"
+    if rj.exists():
+        try:
+            reliability = json.loads(rj.read_text()).get("reliability")
+        except Exception as exc:                                  # best-effort, like every figure input
+            logger.warning("research.json reliability unreadable (%s); reliability figure skipped", exc)
 
     written: List[Path] = []
 
@@ -285,6 +297,18 @@ def generate_figures(
     _emit("decode_readout",
           lambda p: figs.plot_decode_readout([{**readout, "label": run_label}], decode=decode, path=p),
           readout is not None)
+
+    # B1/EXP-3 -- Sigma_q-as-calibrated-uncertainty: the decode-reliability control + the two
+    # Sigma_q<->CE figures (stratified error curve, rho scatter) off the belief_ce_bank join.
+    _emit("reliability_diagram",
+          lambda p: figs.plot_reliability_diagram(reliability, path=p),
+          reliability is not None)
+    _emit("sigma_stratified_error",
+          lambda p: figs.plot_sigma_stratified_error(ce_bank, path=p),
+          ce_bank is not None)
+    _emit("sigma_ce_scatter",
+          lambda p: figs.plot_sigma_ce_scatter(ce_bank, path=p),
+          ce_bank is not None)
 
     # Per-layer metrics CSV (rows = inference depth): the metrics.csv is final-block-only, so this is
     # the only place the per-layer belief-channel free energy / holonomy / gauge / belief geometry is
