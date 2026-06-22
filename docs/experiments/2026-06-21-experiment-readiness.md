@@ -375,3 +375,10 @@ diagnostics, and the auto-generating figure set — is now built and green (1218
   / the audit: a few small builds (B2 Rényi-saturation, B3 Fisher-NG μ-arm), several runnable-now
   diagnostics (A4/A4b/E1/E2/E3), and the fenced items needing absent infra (J1 parse pipeline, F3
   standard-transformer baseline, G4 meta-ensemble sampler).
+
+- **B2 / #12 (Rényi α-attention saturation) — DONE (2026-06-22).** The `renyi_order` sweep spans α
+  both sides of 1 on the oracle + `collect_diagnostics`; `energy_klmax_frac` (kl_max energy-saturation
+  fraction) is a per-cell column; `renyi_saturation` auto-plots H(β)-vs-α + saturation-vs-α.
+- **B3 / #14 (Fisher nat-grad E-step μ-arm) — DONE (2026-06-22).** New `e_step_mu_precond='fisher'|'raw'`
+  (the mean-arm ablation, σ retraction untouched, byte-identical default); the `fisher_mu_precond`
+  sweep (×n_e_steps) auto-plots `mu_precond` (PPL vs n_e_steps, Fisher vs raw).

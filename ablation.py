@@ -62,6 +62,7 @@ from vfe3.data.datasets import make_dataloader
 from vfe3.metrics import (
     attention_entropy,
     gauge_equivariance_residual,
+    guard_saturation,
     head_mixer_gauge_residual,
     rank_one_residual,
 )
@@ -557,6 +558,19 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "requires": {"m_phi_natural_grad": True, "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0},
     },
 
+    "fisher_mu_precond": {  # B3 / EXP-14: Fisher natural-gradient vs raw-Euclidean E-step MEAN preconditioner.
+        # nat_mu = Sigma*grad_mu (Fisher, the default/pure mean step) vs the raw Euclidean grad_mu; the
+        # SPD sigma retraction is UNCHANGED either way, so this isolates the MEAN arm. e_phi_lr=0 keeps
+        # the gauge preconditioner off the E-step. The sigma-arm is out of scope (the affine retraction
+        # already whitens by 1/sigma, so a 'raw' sigma step needs a different retraction, not this knob).
+        "description": "E-step mean preconditioner: Fisher nat-grad vs raw Euclidean x n_e_steps [B3/EXP-14]",
+        "requires": {"e_phi_lr": 0.0},
+        "configs": [
+            {"label": f"{p}_T{t}", "e_step_mu_precond": p, "n_e_steps": t}
+            for p in ("fisher", "raw") for t in (1, 3, 5)
+        ],
+    },
+
     "rho_handoff": {  # F2 / EXP-7: prior-anchoring as the FFN-brake substitute against rank collapse.
         # The Dong rank-one residual r(X) of the per-token mean cloud is read off PER LAYER from one
         # deep model per arm (across_layer_belief_trace -> rank_resid_by_layer in each cell's
@@ -836,14 +850,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
-    "renyi_order": {
+    "renyi_order": {  # B2 / EXP-12: Renyi alpha-attention sweep + the alpha>1 non-PD saturation diagnostic.
         # oracle_unroll_grad MUST be on for a fair divergence-order comparison: renyi_order != 1 routes
         # the autograd oracle, whose default (detached) gradient truncates the through-inference signal
         # to the priors/gauge-frame tables, while renyi_order == 1 uses the always-live analytic kernel.
         # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
         # spuriously ~2.5x faster AND worse). No-op at renyi_order == 1 (the kernel ignores the toggle).
-        "description": "Renyi divergence order (1.0 -> KL; != 1 routes the non-kernel oracle)",
-        "param": "renyi_order", "range": [0.2, 1, 0.1], "requires": {"oracle_unroll_grad": True},
+        # alpha<1 is mass-covering, alpha>1 mode-seeking; for alpha>1 the non-PD blend saturates to
+        # kl_max with zero gradient (S27), predicting a non-monotone H(beta)-vs-alpha tail.
+        # collect_diagnostics captures attn_entropy (H(beta)) + energy_klmax_frac (the saturation
+        # fraction) per cell -> the renyi_saturation figure.
+        "description": "Renyi divergence order alpha (both sides of 1) + non-PD saturation diagnostic [B2/EXP-12]",
+        "param": "renyi_order", "values": [0.5, 0.8, 1.0, 1.2, 1.5, 2.0],
+        "requires": {"oracle_unroll_grad": True},
+        "collect_diagnostics": True,
     },
     
     
@@ -1277,6 +1297,13 @@ def _cell_diagnostics(
     # misleading layer-1 value on the L>1 cells of other sweeps (gauge_transport L2, rho_handoff L4).
     if cfg.n_layers == 1:
         _probe("cov_gap", lambda: attention_entropy_cov_gap(model, token_ids)["cov_gap"])
+
+    # kl_max saturation fraction of the converged pairwise energy (B2/EXP-12): for Renyi alpha>1 the
+    # non-PD blend pins E_ij at kl_max with zero gradient, so this fraction climbs in the alpha>1 tail
+    # and explains a non-monotone H(beta)-vs-alpha curve.
+    _probe("energy_klmax_frac", lambda: guard_saturation(
+        cstate["sigma"], cstate["energy"], cstate["self_div"], diagonal=diag,
+        eps=cfg.eps, sigma_max=cfg.sigma_max, kl_max=cfg.kl_max)["energy_klmax_frac"])
     return out
 
 
@@ -1418,7 +1445,7 @@ _CSV_COLUMNS = [
     "n_params",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
-    "rank_resid", "cov_gap",
+    "rank_resid", "cov_gap", "energy_klmax_frac",
     "wall_time_s", "seed", "error",
 ]
 
@@ -1948,6 +1975,69 @@ def _plot_gauge_residual_drift(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
+def _plot_mu_precond(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""B3/EXP-14 PPL-vs-n_e_steps figure, Fisher vs raw mean preconditioner, from the
+    fisher_mu_precond cells (label '<precond>_T<n_e_steps>'). No-op unless >= 2 such cells finished."""
+    cells: List[Dict[str, Any]] = []
+    for r in _collect_sweep_results(sweep_dir):
+        lab = str(r.get("label", ""))
+        if "_T" not in lab or _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        pre, _, t = lab.partition("_T")
+        if pre not in ("fisher", "raw"):
+            continue
+        try:
+            n_e = int(t)
+        except ValueError:
+            continue
+        cells.append({"precond": pre, "n_e_steps": n_e, "ppl": _as_float(r.get("primary_val_ppl"))})
+    if len(cells) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_mu_precond
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"mu-precond figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_mu_precond.png"
+    plt.close(plot_mu_precond(cells, path=str(out)))
+    print(f"  figure -> {out}")
+
+
+def _plot_renyi_saturation(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""B2/EXP-12 H(beta)-vs-alpha + kl_max-saturation-vs-alpha figure from the renyi_order cells
+    (label 'renyi_order=<alpha>', with attn_entropy + energy_klmax_frac diagnostics). No-op unless
+    >= 2 such cells finished."""
+    cells: List[Dict[str, Any]] = []
+    for r in _collect_sweep_results(sweep_dir):
+        lab = str(r.get("label", ""))
+        if not lab.startswith("renyi_order=") or _as_float(r.get("primary_val_ppl")) >= float("inf"):
+            continue
+        try:
+            alpha = float(lab.split("=")[-1])
+        except ValueError:
+            continue
+        cells.append({"alpha": alpha, "attn_entropy": _as_float(r.get("attn_entropy")),
+                      "energy_klmax_frac": _as_float(r.get("energy_klmax_frac"))})
+    if len(cells) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_renyi_saturation
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"renyi-saturation figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_renyi_saturation.png"
+    plt.close(plot_renyi_saturation(cells, path=str(out)))
+    print(f"  figure -> {out}")
+
+
 def _plot_pos_extrapolation(sweep_dir: Path, fig_dir: Path) -> None:
     r"""H1/EXP-13 CE-vs-N extrapolation overlay (one line per positional scheme) from each cell's
     ``extrap_ce`` curve (persisted by run_single under collect_extrapolation). No-op unless >= 2 cells
@@ -2069,6 +2159,8 @@ def main() -> None:
         _plot_kappa_dispersion(sweep_dir, fig_dir)         # H2/EXP-11 kappa dispersion (no-op if absent)
         _plot_gauge_residual_drift(sweep_dir, fig_dir)     # A2/EXP-9 residual drift (no-op if absent)
         _plot_pos_extrapolation(sweep_dir, fig_dir)        # H1/EXP-13 CE-vs-N extrapolation (no-op if absent)
+        _plot_renyi_saturation(sweep_dir, fig_dir)         # B2/EXP-12 entropy+saturation vs alpha (no-op if absent)
+        _plot_mu_precond(sweep_dir, fig_dir)               # B3/EXP-14 Fisher-vs-raw mean precond (no-op if absent)
 
     # ---- after all sweeps: the cross-sweep comparison ----
     _plot_sensitivity(output_dir, fig_dir)

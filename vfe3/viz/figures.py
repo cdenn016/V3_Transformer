@@ -2903,3 +2903,62 @@ def plot_pos_extrapolation(
         ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
+
+
+@register_figure("renyi_saturation")
+def plot_renyi_saturation(
+    cells,                               # list of {alpha, attn_entropy, energy_klmax_frac}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""B2/EXP-12: attention entropy H(beta) and the kl_max energy-saturation fraction vs Renyi order.
+
+    alpha<1 is mass-covering, alpha>1 mode-seeking; for alpha>1 the non-PD blend saturates the pairwise
+    energy E_ij to kl_max with zero gradient (rising saturation fraction, right panel), which can drive
+    a NON-MONOTONE H(beta)-vs-alpha tail (left panel) -- the saturation diagnostic explaining the
+    entropy curve. alpha=1 (KL) is marked."""
+    cells = sorted(cells, key=lambda c: float(c["alpha"]))
+    a = [float(c["alpha"]) for c in cells]
+    h = [float(c.get("attn_entropy", float("nan"))) for c in cells]
+    s = [float(c.get("energy_klmax_frac", float("nan"))) for c in cells]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.2, 4.2))
+    ax1.plot(a, h, "o-", color=_CB[0], lw=1.8)
+    ax1.axvline(1.0, color=_CB[7], ls="--", lw=1.0, alpha=0.5, label=r"$\alpha=1$ (KL)")
+    ax1.set(xlabel=r"Rényi order $\alpha$", ylabel=r"attention entropy H($\beta$)")
+    ax1.set_title("Attention diffuseness vs α")
+    ax1.legend(fontsize=8, frameon=False)
+    ax2.plot(a, s, "s-", color=_CB[1], lw=1.8)
+    ax2.axvline(1.0, color=_CB[7], ls="--", lw=1.0, alpha=0.5)
+    ax2.set(xlabel=r"Rényi order $\alpha$", ylabel="energy kl_max saturation fraction")
+    ax2.set_title("Non-PD saturation vs α (the α>1 tail)")
+    fig.suptitle("Rényi α-attention: entropy + saturation diagnostic (B2/EXP-12)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("mu_precond")
+def plot_mu_precond(
+    cells,                               # list of {precond in {fisher,raw}, n_e_steps, ppl}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""B3/EXP-14: validation PPL vs n_e_steps, Fisher natural-gradient vs raw-Euclidean mean step.
+
+    The mu-arm ablation: nat_mu = Sigma*grad_mu (Fisher) vs the raw grad_mu, sigma retraction held
+    fixed. One line per preconditioner; a gap that grows with n_e_steps means the mean-sector Fisher
+    metric is load-bearing for the converged belief."""
+    cells = list(cells)
+    fig, ax = plt.subplots(figsize=(6.2, 4.4))
+    for j, pre in enumerate(("fisher", "raw")):
+        pts = sorted([(float(c["n_e_steps"]), float(c["ppl"])) for c in cells
+                      if str(c["precond"]) == pre], key=lambda t: t[0])
+        if pts:
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-",
+                    color=_CB[j], lw=1.8, label=f"{pre} mean step")
+    ax.set(xlabel="E-step iterations (n_e_steps)", ylabel="validation PPL")
+    ax.set_title("Fisher nat-grad vs raw Euclidean E-step mean")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)

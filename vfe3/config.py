@@ -359,7 +359,12 @@ class VFE3Config:
     e_sigma_q_trust:           float = 5.0
     
     mu_trust_mode:             str   = "box"          # "box" | "ball" (consulted only when e_mu_q_trust is not None)
-    
+    # E-step MEAN preconditioner (B3/EXP-14 mu-arm ablation). 'fisher' (default, pure) descends the
+    # Fisher natural gradient nat_mu = Sigma*grad_mu (diagonal Gaussian); 'raw' descends the raw
+    # Euclidean grad_mu. The sigma retraction is unchanged either way, so this isolates the MEAN
+    # preconditioner (the sigma sector already whitens by 1/sigma in the affine retraction).
+    e_step_mu_precond:         str   = "fisher"       # "fisher" | "raw"
+
     sigma_max:                 float = 10.0
    
     gradient_mode:             str   = "filtering"
@@ -1568,6 +1573,8 @@ class VFE3Config:
             raise ValueError(f"e_mu_q_trust must be > 0 or None, got {self.e_mu_q_trust}")
         if self.mu_trust_mode not in ("box", "ball"):
             raise ValueError(f"mu_trust_mode must be 'box' or 'ball', got {self.mu_trust_mode!r}")
+        if self.e_step_mu_precond not in ("fisher", "raw"):
+            raise ValueError(f"e_step_mu_precond must be 'fisher' or 'raw', got {self.e_step_mu_precond!r}")
         for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr", "min_lr_frac"):
             v = getattr(self, name)
             if v < 0.0 or v != v:                            # v != v rejects NaN (which passes < 0.0)
