@@ -54,15 +54,15 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # SEEDS[i]. Each run is fully independent (its own model, RNG, and artifacts dir -- the seed is in the
 # run-folder label so they never collide). NUM_RUNS=1 with SEEDS=[] keeps the single-run path on the
 # config `seed` above, unchanged. Example: NUM_RUNS=3, SEEDS=[3, 64, 23] trains all three seeds.
-NUM_RUNS = 1
-SEEDS    = [6]#,23,54,66,122]        # e.g. [3, 64, 23]; must list at least NUM_RUNS seeds when NUM_RUNS > 1
+NUM_RUNS = 5
+SEEDS    = [6,23,54,66,122]        # e.g. [3, 64, 23]; must list at least NUM_RUNS seeds when NUM_RUNS > 1
 
 # DATA_SEED (EXP-1 variance floor): when set to an int, the TRAIN loader's shuffle order is fixed to
 # this seed via an explicit generator, INDEPENDENT of the per-run model seed -- so a multi-seed run
 # shares ONE batch order across seeds and the measured across-seed SD is init+optimization variance,
 # NOT data-order noise. None (default) keeps the legacy behavior (shuffle drawn from the global RNG,
 # which the post-build reseed pins to cfg.seed -- byte-identical to before, reproducible vs ablation.py).
-DATA_SEED = None
+DATA_SEED = 3
 
 
 config = dict(
@@ -73,8 +73,8 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 160,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 8,
+    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 2,
     
     max_seq_len               = 128,                 # N, context length
     
@@ -292,7 +292,7 @@ config = dict(
     
     e_mu_q_trust              = None,
     e_sigma_q_trust           = 10.0,
-    sigma_max                 = 1000.0,
+    sigma_max                 = 100.0,
     
     #################################
     #         Misc/Logging

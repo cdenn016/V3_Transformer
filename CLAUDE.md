@@ -7,6 +7,13 @@ tests. See `docs/superpowers/specs/2026-05-29-vfe3-clean-room-design.md`.
 
 This V3 is a production quality gauge-theoretic VFE transformer that allows clean code, clear math, and future expandability
 
+## Git Workflow
+
+- Before making any changes, create a dedicated fresh branch off `main` (see "ALWAYS BRANCH FRESH FROM MAIN" below) and keep a tidy worktree.
+- NEVER stash, revert, discard, or modify the user's live/WIP (uncommitted) config files or config toggles during git operations. They are intentional working state, not noise to clean up.
+- Treat the remote as the source of truth. Before making any sync claim, run `git fetch` and inspect the ACTUAL remote state — show `git log origin/main` — rather than trusting stale local state.
+- When asked to make the local match `origin/main`: run `git fetch` first, show `git log origin/main`, treat the remote as authoritative — but still do not touch uncommitted config files.
+
 ## Hard constraints
 - NO neural networks (no nn.Linear, no MLP, no activations. backprop is allowed).
   **Documented exceptions (opt-in toggles, both default OFF; the pure no-NN path is the
@@ -104,6 +111,12 @@ VFE3_TEST_DEVICE=cuda for the GPU).
 **DONT LEAVE MESSES!!** ALWAYS CLEAN UP temp FILES FROM ATOMIC EDITS AND SUCH WHEN FINISHED!
 
 
+## Project Conventions
+
+- Do NOT fixate on or re-deliberate config values or regime behavior (e.g. treating Regime I flatness as a defect). Treat the existing config as intentional unless explicitly asked to change it, and respect the user's reverted config edits rather than re-applying them.
+- Audit / large-review output: write all detailed findings to `docs/audit-results.md` and keep chat replies to a brief (~3-line) summary, so we don't hit output-token limits.
+
+
 ## Mathematical Reference
 
 Minimal equations for code review — see manuscripts for full derivations.
@@ -120,7 +133,7 @@ F = alpha * KL(q_i || p_i)                                          # self-coupl
              + tau * gamma_ij * log(gamma_ij / pi^(s)_ij) ]         # model coupling + meta entropy
   - E_q[log p(o | x)]                                               # observation likelihood
 ```
-tau = kappa * sqrt(dim_h) is the effective softmax temperature per head. The tau * beta_ij * log(beta_ij/pi_ij) term is the attention-distribution entropy with uniform prior pi_ij = 1/N; it is required for the softmax β to be a stationary point of F (without it the row-Lagrangian gives a delta, not softmax). The canonical F vs "entropy-suppressed surrogate" sum β KL distinction is made explicitly in Attention/GL(K)_attention.tex  (the surrogate is acknowledged again in Attention/GL(K)_supplementary.tex ) — their gradients differ by -tau^{-1} Cov_β(KL, ∇KL). See participatory_it_from_bit.tex for the FULL GENERAL theory
+tau = kappa * sqrt(dim_h) is the effective softmax temperature per head. The tau * beta_ij * log(beta_ij/pi_ij) term is the attention-distribution entropy with uniform prior pi_ij = 1/N; it is required for the softmax β to be a stationary point of F (without it the row-Lagrangian gives a delta, not softmax). The canonical F vs "entropy-suppressed surrogate" sum β KL distinction is made explicitly in Manuscripts-Theory/GL(K)_attention.tex  (the surrogate is acknowledged again in Manuscripts-Theory/GL(K)_supplementary.tex ) — their gradients differ by -tau^{-1} Cov_β(KL, ∇KL). See Manuscripts-Theory/PIFB.tex for the FULL GENERAL theory
 
 ## Communication
 
@@ -151,3 +164,21 @@ Write in academic prose — flowing paragraphs with clear logical progression, n
 **Scientific writing rules.** Do not use LaTeX spacing macros (`\;`, `\,`, `\!`) — banned in this project's docs. Apply standard equation punctuation (comma/period at end of display equations) in any doc cleanup pass.
 
 **Banned patterns** (Claude-isms, never in manuscripts): horizontal rules (`---` and `--`), "key insight," "crucially," "critically," "notably," "importantly," "it's worth noting,"  "fundamentally,"  "leverages," "underscores."
+
+## Research knowledge base (LLM-wiki)
+
+This repo (the `vfe3` / V3 transformer) is catalogued in the persistent, LLM-maintained
+research wiki at `C:\Users\chris and christine\Desktop\Research` (an Obsidian vault), under
+the project page **[[VFE Transformer Program]]**.
+
+When work here touches the theory, experiments, ablations, or papers: **consult the wiki for
+context** first (read its `index.md` and follow the relevant `[[wikilinks]]` — don't re-derive
+what's already there), and **offer to ingest** notable new results, ablations, or findings into
+it — writing only after the user confirms. The how-to lives in the global `research-wiki` skill;
+the wiki's schema is its own `CLAUDE.md`.
+
+The **most current working copies (WIPs)** of the LaTeX manuscripts live in the vault's
+`manuscripts/` folder — direct manuscript edits, peer-reviews / deep reviews, and TikZ figure work
+there, since it holds the freshest version. These are the latest WIPs, not a canonical "single
+source of truth". The `Manuscripts-Theory/` folder in this repo is an older mirror that drifts
+further behind.
