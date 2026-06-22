@@ -59,10 +59,21 @@ def _pos_phi_learned(
     dtype:        torch.dtype = torch.float32,
     **kwargs,
 ) -> torch.Tensor:
-    r"""Learned absolute positional coords: the first ``n`` rows of the model's table."""
+    r"""Learned absolute positional coords: the first ``n`` rows of the model's table.
+
+    When ``n`` exceeds the trained table length (extrapolation eval beyond ``max_seq_len``; H1/EXP-13)
+    the index is CLAMPED to the last learned row rather than sliced -- a bare ``pos_phi_free[:n]``
+    silently returns the FULL ``max_seq_len`` table (slicing past the end does not error), which then
+    shape-mismatches the ``(n, n_gen)`` frame in ``compose_phi``. Clamping degrades gracefully: unseen
+    positions share the boundary offset and are positionally indistinguishable -- the expected
+    learned-absolute failure-to-extrapolate, measured rather than crashed."""
     if pos_phi_free is None:
         raise ValueError("pos_phi='learned' requires the model-owned pos_phi_free table")
-    return pos_phi_free[:n]
+    t = pos_phi_free.shape[0]
+    if n <= t:
+        return pos_phi_free[:n]                                   # default path: byte-identical
+    idx = torch.arange(n, device=pos_phi_free.device).clamp(max=t - 1)
+    return pos_phi_free[idx]
 
 
 @register_pos_phi("frozen")

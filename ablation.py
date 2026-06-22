@@ -584,6 +584,34 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         ],
     },
 
+    "pos_extrapolation": {  # H1 / EXP-13: offset priors extrapolate, absolute (learned/RoPE) do not.
+        # Train at max_seq_len, then eval the SAME model at growing N (collect_extrapolation -> the
+        # CE-vs-N curve persisted per cell). Offset attention priors (causal_alibi, t5_relative_bias)
+        # are functions of |i-j| and rebuild at runtime N; the absolute schemes (pos_phi='learned'
+        # table, pos_rotation='rope') do not. t5_max_distance is raised to 512 (>= max eval N) so the
+        # T5 arm measures offset extrapolation, not bucket saturation. Each arm isolates ONE positional
+        # mechanism (the others off), sharing the causal mask. requires pins ALL arms onto ONE
+        # belief-gradient route (oracle_unroll_grad=True, the EXP-4 discipline): the rope arm's
+        # decoupled value gauge (rope_on_value=False) routes to the autograd oracle, which would
+        # otherwise return a DETACHED tangent at oracle_unroll_grad=False -- a different training route
+        # than the kernel-route alibi/t5/learned arms, confounding the CE-vs-N contrast. max_seq_len is
+        # pinned to the trained 128 so the eval grows to 4x=512 == t5_max_distance (no T5 bucket
+        # saturation; the figure measures offset extrapolation, not the bucket horizon).
+        "description": "positional extrapolation: offset (alibi/t5) vs absolute (learned/rope), eval @ growing N [H1/EXP-13]",
+        "collect_extrapolation": True,
+        "requires": {"oracle_unroll_grad": True, "max_seq_len": 128},
+        "configs": [
+            {"label": "alibi",   "beta_attention_prior": "causal_alibi",
+             "pos_phi": "none",    "pos_rotation": "none"},
+            {"label": "t5",      "beta_attention_prior": "t5_relative_bias", "t5_max_distance": 512,
+             "pos_phi": "none",    "pos_rotation": "none"},
+            {"label": "learned", "beta_attention_prior": "causal",
+             "pos_phi": "learned", "pos_rotation": "none"},
+            {"label": "rope",    "beta_attention_prior": "causal",
+             "pos_phi": "none",    "pos_rotation": "rope"},
+        ],
+    },
+
     # === positional encoding ===============================================
     
     "pos_phi": {
@@ -1252,6 +1280,28 @@ def _cell_diagnostics(
     return out
 
 
+@torch.no_grad()
+def _eval_at_growing_n(model: Any, cfg: VFE3Config, dataset: str, device: torch.device) -> List[Dict[str, Any]]:
+    r"""H1/EXP-13: held-out CE at sequence lengths from the trained ``max_seq_len`` outward.
+
+    Re-windows the validation split at each N (anchor ``max_seq_len``, then 1.5/2/3/4x) via
+    ``get_loader`` and scores the SAME trained model. Offset attention priors (alibi / t5, functions
+    of |i-j|) and the causal mask rebuild at runtime N and extrapolate; the absolute schemes
+    (``pos_phi='learned'`` table -- now clamped past the table; RoPE) degrade. Each N is isolated: a
+    too-short split or any failure drops that point, never the cell. Returns ``[{n, ce, ppl}, ...]``."""
+    base = int(cfg.max_seq_len)
+    n_list = sorted({base} | {int(round(base * m)) for m in (1.5, 2.0, 3.0, 4.0)})
+    out: List[Dict[str, Any]] = []
+    for n in n_list:
+        try:
+            loader = get_loader(dataset, n, cfg.batch_size, "validation")
+            m = evaluate(model, loader, device=device)
+            out.append({"n": n, "ce": float(m["ce"]), "ppl": float(m["ppl"])})
+        except Exception as exc:                              # short split / OOM at large N -> drop point
+            logger.warning("  [extrapolation eval N=%d skipped] %s", n, exc)
+    return out
+
+
 def run_single(
     label:       str,
     overrides:   Dict[str, Any],
@@ -1261,7 +1311,8 @@ def run_single(
     dataset:             str,
     device:              torch.device,
     seed:                int,
-    collect_diagnostics: bool          = False,
+    collect_diagnostics:   bool        = False,
+    collect_extrapolation: bool        = False,
     max_tokens:          Optional[int] = None,
     max_steps:           Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -1342,6 +1393,8 @@ def run_single(
     }
     if collect_diagnostics:                                  # opt-in converged-state probes (S2)
         result.update(_cell_diagnostics(model, cfg, val_loader, device))
+    if collect_extrapolation:                                # opt-in growing-N eval (H1/EXP-13)
+        result["extrap_ce"] = _eval_at_growing_n(model, cfg, dataset, device)
     return result
 
 
@@ -1480,6 +1533,7 @@ def run_sweep(
         try:
             result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
                                  seed=seed, collect_diagnostics=sweep.get("collect_diagnostics", False),
+                                 collect_extrapolation=sweep.get("collect_extrapolation", False),
                                  max_tokens=max_tokens, max_steps=max_steps)
         except Exception as exc:                             # a training crash must not kill the sweep
             logger.exception("sweep %s / %s crashed", sweep_name, label)
@@ -1894,6 +1948,33 @@ def _plot_gauge_residual_drift(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
+def _plot_pos_extrapolation(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""H1/EXP-13 CE-vs-N extrapolation overlay (one line per positional scheme) from each cell's
+    ``extrap_ce`` curve (persisted by run_single under collect_extrapolation). No-op unless >= 2 cells
+    carry a >= 2-point curve. The train length (the smallest evaluated N = max_seq_len) is marked."""
+    arms: Dict[str, Any] = {}
+    all_n: List[float] = []
+    for r in _collect_sweep_results(sweep_dir):
+        curve = r.get("extrap_ce")
+        if isinstance(curve, list) and len(curve) >= 2:
+            arms[str(r.get("label", "?"))] = curve
+            all_n += [float(p["n"]) for p in curve if isinstance(p, dict) and "n" in p]
+    if len(arms) < 2:
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    try:
+        from vfe3.viz.figures import plot_pos_extrapolation
+    except Exception as exc:                                  # plotting is best-effort, never fatal
+        print(f"pos-extrapolation figure unavailable ({exc}); skipping")
+        return
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_extrapolation.png"
+    plt.close(plot_pos_extrapolation(arms, train_n=(min(all_n) if all_n else None), path=str(out)))
+    print(f"  figure -> {out}")
+
+
 def _plot_sensitivity(output_dir: Path, fig_dir: Path) -> None:
     r"""Cross-sweep comparison: a PPL-range (worst - best) bar per sweep, sorted by sensitivity.
 
@@ -1987,6 +2068,7 @@ def main() -> None:
         _plot_cg_coupling(sweep_dir, fig_dir)              # A3/EXP-10 PPL+equivariance bars (no-op if absent)
         _plot_kappa_dispersion(sweep_dir, fig_dir)         # H2/EXP-11 kappa dispersion (no-op if absent)
         _plot_gauge_residual_drift(sweep_dir, fig_dir)     # A2/EXP-9 residual drift (no-op if absent)
+        _plot_pos_extrapolation(sweep_dir, fig_dir)        # H1/EXP-13 CE-vs-N extrapolation (no-op if absent)
 
     # ---- after all sweeps: the cross-sweep comparison ----
     _plot_sensitivity(output_dir, fig_dir)

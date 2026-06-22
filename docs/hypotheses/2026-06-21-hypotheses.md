@@ -84,7 +84,7 @@ These test the meta_entropy.tex and belief_inertia.tex predictions (open thread 
 
 ### Cluster H — Positional structure and head specialization
 
-**H1. Offset-only priors extrapolate; absolute/RoPE do not.** S21 [transformer] — train at `max_seq_len=128`, eval at growing N; ALiBi/T5 (functions of |i−j|) extrapolate, `pos_phi='learned'` and RoPE do not. Fix the two code traps: `pos_phi` truncates (shape error, not IndexError — test with a shorter table) and `t5_max_distance` must be ≥ max eval-N to isolate offset from bucket saturation.
+**H1. Offset-only priors extrapolate; absolute/RoPE do not.** S21 [transformer] — train at `max_seq_len=128`, eval at growing N; ALiBi/T5 (functions of |i−j|) extrapolate, `pos_phi='learned'` and RoPE do not. Fix the two code traps: `pos_phi` truncates (shape error, not IndexError — test with a shorter table) and `t5_max_distance` must be ≥ max eval-N to isolate offset from bucket saturation. *Built (2026-06-22): the `pos_extrapolation` sweep (alibi/t5/learned/rope) + `_eval_at_growing_n` (CE at N up to 4× max_seq_len) auto-plot `pos_extrapolation` (CE vs N); both traps fixed (learned-table clamp at N>max_seq_len; t5_max_distance=512 in the T5 arm). See `docs/2026-06-22-edits.md`.*
 
 **H2. Per-head temperature dispersion.** S20 [transformer] — a hand-set per-head `kappa_beta` list (zero added params) vs a tied-tau baseline retuned to the geometric-mean tau (the mandatory confound control). The learnable arm is unbuilt; scope to the hand-grid. *Built (2026-06-22): the `kappa_beta_per_head` sweep gained the geo-mean-τ confound-control arms, and `kappa_dispersion` auto-plots PPL vs std(κ_β).*
 

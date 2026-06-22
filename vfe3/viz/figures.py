@@ -2869,3 +2869,37 @@ def _as_f(v) -> float:
         return float(v)
     except (TypeError, ValueError):
         return float("nan")
+
+
+@register_figure("pos_extrapolation")
+def plot_pos_extrapolation(
+    arms,                                # dict {label: [{n, ce}...]} OR list of {"label", "curve"}
+
+    *,
+    train_n: Optional[float] = None,
+    path:    Optional[str]   = None,
+):
+    r"""H1/EXP-13: held-out CE vs eval sequence length N, one line per positional scheme.
+
+    Offset attention priors (alibi / t5, functions of |i-j|) stay flat past the trained length; the
+    absolute schemes (learned pos_phi table, RoPE) rise -- the extrapolation contrast. The train
+    length is marked; points beyond it are pure extrapolation."""
+    if isinstance(arms, dict):
+        items = [(str(k), v) for k, v in arms.items()]
+    else:
+        items = [(str(a.get("label", i)), a.get("curve", [])) for i, a in enumerate(arms)]
+    fig, ax = plt.subplots(figsize=(6.6, 4.6))
+    for j, (lab, curve) in enumerate(items):
+        pts = sorted([(float(p["n"]), float(p["ce"])) for p in curve
+                      if np.isfinite(_as_f(p.get("ce")))], key=lambda t: t[0])
+        if pts:
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-",
+                    color=_CB[j % len(_CB)], lw=1.6, ms=4, label=lab)
+    if train_n is not None and np.isfinite(_as_f(train_n)):
+        ax.axvline(float(train_n), color=_CB[7], ls="--", lw=1.0, alpha=0.6, label="train length")
+    ax.set(xlabel="eval sequence length N", ylabel="held-out CE (nats)")
+    ax.set_title("Positional extrapolation: offset vs absolute (CE vs N)")
+    if items:
+        ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)

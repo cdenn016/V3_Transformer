@@ -366,3 +366,12 @@ and the EXP-8 training-time diagnostics — are closed.
 The entire EXP-1…EXP-11 experiment harness — config toggles, metrics, sweeps/routes, per-run
 diagnostics, and the auto-generating figure set — is now built and green (1218 passed / 0 failed). See
 `docs/2026-06-22-edits.md` for the per-commit detail.
+
+- **H1 / #13 (offset-only positional extrapolation) — DONE (2026-06-22).** Beyond the top-11: the
+  buildability audit's top remaining pick. The `pos_extrapolation` sweep (alibi/t5/learned/rope) +
+  `_eval_at_growing_n` (CE at N up to 4× max_seq_len) auto-emit the `pos_extrapolation` CE-vs-N figure;
+  both code traps fixed (the `pos_phi='learned'` table now clamps past `max_seq_len`; `t5_max_distance`
+  raised in the T5 arm). The remaining hypotheses (#14-#28) are surveyed in `docs/2026-06-22-edits.md`
+  / the audit: a few small builds (B2 Rényi-saturation, B3 Fisher-NG μ-arm), several runnable-now
+  diagnostics (A4/A4b/E1/E2/E3), and the fenced items needing absent infra (J1 parse pipeline, F3
+  standard-transformer baseline, G4 meta-ensemble sampler).
