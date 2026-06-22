@@ -42,7 +42,7 @@
 
 \ShortHeadings{Gauge-Theoretic Attention: Supplementary Material}{Dennis}
 
-This supplement collects derivations, implementation details, and additional empirical analyses that support the main paper but are not essential for following the core argument. Appendix~A reviews standard differential geometry for readers from machine learning backgrounds. Appendix~B derives the covariance gradient and its equilibrium analysis. Appendix~C derives the gauge frame gradients for both $\mathrm{SO}(N)$ and $\mathrm{GL}(K)$, including preconditioning strategies. Appendix~D details the numerical methods used for variational gradient descent on the Gaussian and gauge-frame manifolds. Appendix~E presents the full BERT validation of the degenerate-limit predictions, including the transformer validation protocol, detailed empirical results across 105 passages and five architectures, and Bayesian uncertainty quantification. Appendix~F develops the renormalization group universality conjecture and its numerical validation. Appendix~G reports the symmetry breaking simulations and model-channel formalism. Appendix~H proves the conditional uniqueness of the forward KL divergence via variational duality.
+This supplement collects derivations, implementation details, and additional empirical analyses that support the main paper but are not essential for following the core argument. Appendix~A reviews standard differential geometry for readers from machine learning backgrounds. Appendix~B derives the covariance gradient and its equilibrium analysis. Appendix~C derives the gauge frame gradients for both $\mathrm{SO}(N)$ and $\mathrm{GL}(K)$, including preconditioning strategies. Appendix~D details the numerical methods used for variational gradient descent on the Gaussian and gauge-frame manifolds. Appendix~E presents the full BERT validation of the degenerate-limit predictions, including the transformer validation protocol, detailed empirical results across 105 passages and five architectures, and Bayesian uncertainty quantification. Appendix~F develops the renormalization group universality conjecture and its numerical validation. Appendix~G reports the symmetry breaking simulations and model-channel formalism. Appendix~H proves the conditional uniqueness of the forward KL divergence via variational duality. Appendix~I derives the prior-bank decode logit from canonical primitives, identifying the expected Gaussian log-likelihood under the converged belief with $-D_{\mathrm{KL}}(q_i^{\star} \| \pi_v)$ up to row-only constants, and states the scopes under which the identity is structural rather than dynamical and exact rather than approximate.
 
 \appendix
 
@@ -275,13 +275,13 @@ D_{\mathrm{KL}}(q_i \| \Omega_{ij} q_j).
 \label{eq:Sigma_gradient_final}
 \end{equation}
 
-The first line contains the ``direct'' gradient terms (differentiating each $K_{ij}$ at fixed $\beta_{ij}$). The second line is the attention weight gradient, analogous to the $\partial \beta_{ij}/\partial \mu_i$ term in the mean gradient. This $\partial\beta/\partial\Sigma$ term arises from differentiating the attention-weighted energy $\sum_j \beta_{ij} E_{ij}$ via the product rule; it is absent from the gradient of the reduced free energy $\mathcal{F}_{\mathrm{red}} = -\tau\log Z_i + \cdots$ by the envelope theorem (see main text, Section~3.5). From the softmax structure, $\sum_j \partial \beta_{ij}/\partial \Sigma_i = 0$, so this correction vanishes when the KL divergences are uniform across neighbors, and also in both the $\tau \to 0$ and $\tau \to \infty$ limits.
+The first line contains the ``direct'' gradient terms (differentiating each $K_{ij}$ at fixed $\beta_{ij}$). The second line is the attention weight gradient, analogous to the $\partial \beta_{ij}/\partial \mu_i$ term in the mean gradient. This $\partial\beta/\partial\Sigma$ term arises from differentiating the attention-weighted energy $\sum_j \beta_{ij} E_{ij}$ via the product rule; it is absent from the gradient of the reduced free energy $\mathcal{F}_{\mathrm{red}} = -\tau\log Z_i + \cdots$ by the envelope theorem (see main text, Section~3.5). From the softmax structure, $\sum_j \partial \beta_{ij}/\partial \Sigma_i = 0$, so this correction vanishes when the KL divergences are uniform across neighbors and in the $\tau \to \infty$ limit; in the $\tau \to 0$ limit it also vanishes pointwise, but non-uniformly, with the decay slowing to $O(\tau)$ in a near-tie window where the neighbor gap is comparable to $\tau$.
 
 The coefficient of $\Sigma_i^{-1}$ is $-(1 + \sum_j \beta_{ij}) = -2$, since the entropy of $q_i$ contributes $-\frac{1}{2}\Sigma_i^{-1}$ to both the prior KL (once, with the self-coupling weight $\alpha_i$ on the prior term held at its canonical default $\alpha_i = 1$; see main paper Section~\ref{sec:state_dependent_precision} for the state-dependent generalization) and the attention-weighted alignment KL (once, weighted by $\sum_j \beta_{ij} = 1$).
 
 \subsection{Fixed-Point Equation and Symmetric Solution}
 
-At equilibrium, we set $\partial \mathcal{F}_i / \partial \Sigma_i = 0$. Since $\sum_j \partial \beta_{ij}/\partial \Sigma_i = 0$, the attention weight correction term vanishes whenever the KL divergences $D_{\mathrm{KL}}(q_i \| \Omega_{ij}q_j)$ are approximately uniform across neighbors, and also in both the hard-attention ($\tau \to 0$) and uniform-attention ($\tau \to \infty$) limits. In these regimes, the equilibrium condition reduces to
+At equilibrium, we set $\partial \mathcal{F}_i / \partial \Sigma_i = 0$. Since $\sum_j \partial \beta_{ij}/\partial \Sigma_i = 0$, the attention weight correction term vanishes whenever the KL divergences $D_{\mathrm{KL}}(q_i \| \Omega_{ij}q_j)$ are approximately uniform across neighbors, and in the uniform-attention ($\tau \to \infty$) limit. In the hard-attention ($\tau \to 0$) limit the correction also vanishes pointwise, but non-uniformly across configurations: away from attention ties, where the most aligned neighbor is separated by a KL gap large compared to $\tau$, the decay is super-exponential, whereas in a near-tie window, where the gap is comparable to $\tau$, the decay slows to $O(\tau)$ and can be non-monotone in $\tau$ before collapsing. In these regimes, the equilibrium condition reduces to
 
 \begin{equation}
 \Sigma_i^{-1}
@@ -377,7 +377,7 @@ Finally, consider the gradient flow
 \qquad\eta_\Sigma > 0.
 \end{equation}
 
-Local stability of the equilibrium \eqref{eq:sigma_fixed_point_beta} follows from the positive-definiteness of the Hessian. For the Gaussian KL terms $D_{\mathrm{KL}}(\mathcal{N}(\mu_1,\Sigma_1) \| \mathcal{N}(\mu_2,\Sigma_2))$ viewed as a function of $\Sigma_1$ at fixed $\Sigma_2$, the second-variation acts on symmetric tangent vectors $H \in \mathrm{Sym}(K)$ as
+At fixed attention weights $\beta_{ij}$, the equilibrium \eqref{eq:sigma_fixed_point_beta} is a local minimum of the free energy because the $\beta$-fixed Hessian is positive-definite; this establishes $\beta$-fixed convexity, not local attractivity of the full dynamics, which is treated below once the $\beta$-response term is restored. For the Gaussian KL terms $D_{\mathrm{KL}}(\mathcal{N}(\mu_1,\Sigma_1) \| \mathcal{N}(\mu_2,\Sigma_2))$ viewed as a function of $\Sigma_1$ at fixed $\Sigma_2$, the second-variation acts on symmetric tangent vectors $H \in \mathrm{Sym}(K)$ as
 
 \begin{equation}
 \left.\frac{\partial^2 D_{\mathrm{KL}}}{\partial \Sigma_1 \partial \Sigma_1}\right[H, H]
@@ -620,7 +620,7 @@ where $\mathrm{ad}_\phi(X) = [\phi, X]$ is the adjoint action and $\Psi(z) = (e^
 
 where $\langle X, Y \rangle_F = \operatorname{tr}(X^\top Y)$ is the Frobenius inner product on $\mathrm{Mat}(K)$. At $\phi = 0$, $\exp(\phi)\exp(\phi)^\top = I$ and $\mathcal{G}_{ab}(0) = G_{ab}$ (the Gram matrix). On the compact subalgebra $\mathfrak{so}(K) \subset \mathfrak{gl}(K)$, $\exp(\phi) \in \mathrm{SO}(K)$ so $\exp(\phi)\exp(\phi)^\top = I$ and the metric reduces to $\langle \Psi(\mathrm{ad}_\phi)(T_a), \Psi(\mathrm{ad}_\phi)(T_b)\rangle_F$. For non-compact (symmetric) $\phi$, $\exp(\phi)\exp(\phi)^\top = \exp(2\phi)$ grows exponentially, automatically compensating the exponential amplification of $D\exp$ in the non-compact sector. The natural gradient $\mathcal{G}(\phi)^{-1} \nabla_\phi \mathcal{F}$ is position-dependent and exact (up to series truncation of $\Psi$), requiring the structure constants $f^c_{ab}$ defined by $[T_a, T_b] = \sum_c f^c_{ab} T_c$. The metric $\mathcal{G}(\phi)$ degenerates exactly when $\mathrm{ad}_\phi$ has a nonzero eigenvalue in $2\pi i\mathbb{Z}$, where $\Psi(\mathrm{ad}_\phi)$ is singular and $D_\phi(\exp)$ loses rank; near such resonances the $\mathcal{G}^{-1}$ solve should be regularized as $\mathcal{G} + \epsilon I$, mirroring the $\tilde{g} \to \tilde{g} + \epsilon I$ regularization of the constant Killing form above.
 
-The computational cost of each mode scales as: clipping $O(n_{\mathrm{gen}})$, Cartan $O(n_{\mathrm{gen}}^2)$, Killing $O(n_{\mathrm{gen}}^2)$, pullback $O(n_{\mathrm{gen}}^3)$ (dominated by the linear solve $\mathcal{G}^{-1} g$). For the $\mathrm{GL}(10)$ model ($n_{\mathrm{gen}} = 100$), Killing form preconditioning adds negligible overhead. The pullback metric becomes advantageous when gauge frames develop large norms during training, as the position-dependent compensation prevents the gradient from overshooting in the symmetric directions where $\exp(\phi)$ amplifies exponentially.
+The computational cost of each mode scales as: clipping $O(n_{\mathrm{gen}})$, Cartan $O(n_{\mathrm{gen}}^2)$, Killing $O(n_{\mathrm{gen}}^2)$, pullback $O(n_{\mathrm{gen}}^3)$ (dominated by the linear solve $\mathcal{G}^{-1} g$). For the $\mathrm{GL}^+(10)$ model ($n_{\mathrm{gen}} = 100$), Killing form preconditioning adds negligible overhead. The pullback metric becomes advantageous when gauge frames develop large norms during training, as the position-dependent compensation prevents the gradient from overshooting in the symmetric directions where $\exp(\phi)$ amplifies exponentially.
 
 
 \section{Variational Gradient Descent: Implementation and Numerical Methods}
@@ -951,7 +951,7 @@ Define a coarse-graining transformation $R_n$ that groups $n$ tokens into a sing
 \Sigma_A = \frac{1}{|A|} \sum_{i \in A} \Sigma_i + \mathrm{Var}_A(\mu),
 \label{eq:meta_agent_beliefs_supp}
 \end{equation}
-where $\mathrm{Var}_A(\mu) = \frac{1}{|A|} \sum_{i \in A} (\mu_i - \mu_A)(\mu_i - \mu_A)^\top$ is the within-cluster mean variance. The meta-agent transport is $\Omega_{AB} = \frac{1}{|A||B|} \sum_{i \in A, j \in B} \Omega_{ij}$. Here $\Sigma_A$ is the second moment of the within-cluster belief mixture (the Euclidean law of total covariance: the mean within-token covariance plus the dispersion of the means), the natural choice for moment-matching the mixture, and is distinct from the affine-invariant SPD (Fr\'echet) mean used for the covariance retraction elsewhere in this appendix.
+where $\mathrm{Var}_A(\mu) = \frac{1}{|A|} \sum_{i \in A} (\mu_i - \mu_A)(\mu_i - \mu_A)^\top$ is the within-cluster mean variance. The meta-agent transport is the flat coordinate average $\Omega_{AB} = \frac{1}{|A||B|} \sum_{i \in A, j \in B} \Omega_{ij}$, a diagnostic for the $g_2$ scaling exponent and not a group-valued mean, since $\mathrm{GL}(K)$ is non-convex and an arithmetic mean of invertible matrices may be singular; an intrinsic coarse-graining would use a matrix-manifold mean (projected, log-Euclidean, or Karcher), in the spirit of the affine-invariant SPD mean noted below for the covariance retraction. Here $\Sigma_A$ is the second moment of the within-cluster belief mixture (the Euclidean law of total covariance: the mean within-token covariance plus the dispersion of the means), the natural choice for moment-matching the mixture, and is distinct from the affine-invariant SPD (Fr\'echet) mean used for the covariance retraction elsewhere in this appendix.
 
 \subsection{Scaling Dimensions and the RG Universality Conjecture}
 
@@ -1066,7 +1066,7 @@ With randomly drawn Gaussian observations, symmetry breaks and agents flow towar
   \label{fig:mu_q_center_observed_supp}
 \end{figure*}
 
-These simulations use a different gauge group ($\mathrm{SO}(3)$) and base manifold dimension (2D) than the language modeling experiments ($\mathrm{GL}(10)$, 0D). The purpose is to validate the general theoretical prediction that observations break gauge symmetry, not to directly model the language modeling setting. Whether the specific dynamics of symmetry breaking transfer quantitatively across gauge groups and base manifold dimensions remains an open question.
+These simulations use a different gauge group ($\mathrm{SO}(3)$) and base manifold dimension (2D) than the language modeling experiments ($\mathrm{GL}^+(10)$, 0D). The purpose is to validate the general theoretical prediction that observations break gauge symmetry, not to directly model the language modeling setting. Whether the specific dynamics of symmetry breaking transfer quantitatively across gauge groups and base manifold dimensions remains an open question.
 
 
 \subsection{Model-Channel Formalism}
@@ -1108,7 +1108,7 @@ Within the convex $f$-divergence class made precise below, the forward KL diverg
 
 In what follows we restrict to our ``matched-fiber'' framework, where all agents share the same fiber dimension $K$ and representation $\rho$, so that gauge transport acts within a single vector space. The full generalization follows by applying the appropriate bundle morphisms/intertwiners.
 
-The uniqueness of the term is conditional and follows from the theorem's hypotheses: $\mathcal{D}$ is a convex $f$-divergence with real-analytic generator $f$ satisfying $f(1) = 0$ and, without loss of generality, $f'(1) = 0$, of the local form $\displaystyle \int q_i(c) f \left(\frac{q_i(c)}{\Omega_{ij}(c) q_j(c)}\right) dc$; the coupling is linear in $\beta_{ij}$; and $\sum_j \beta_{ij} = 1$. Exponential-family closure of the resulting $q_i^*$ plays two roles and is not an independent hypothesis: it is a \emph{consequence} of the theorem in the sufficiency direction (Step 2 of the proof produces the log-linear form automatically once $f'(t) = \log t$), and the \emph{selection criterion} in the necessity direction (Step 3), where requiring closure across the realizable ratios singles out $f'(t) = \log t$.
+The uniqueness of the term is conditional and follows from the theorem's hypotheses: $\mathcal{D}$ is a convex $f$-divergence with real-analytic generator $f$ satisfying $f(1) = 0$ and, without loss of generality, $f'(1) = 0$, of the local form $\displaystyle \int \Omega_{ij}(c) q_j(c) f \left(\frac{q_i(c)}{\Omega_{ij}(c) q_j(c)}\right) dc$; the coupling is linear in $\beta_{ij}$; and $\sum_j \beta_{ij} = 1$. Exponential-family closure of the resulting $q_i^*$ plays two roles and is not an independent hypothesis: it is a \emph{consequence} of the theorem in the sufficiency direction (Step 2 of the proof produces the log-linear form automatically once $f'(t) = \log t$), and the \emph{selection criterion} in the necessity direction (Step 3), where requiring closure across the realizable ratios singles out $f'(t) = \log t$.
 
 \subsubsection{The Coupled Variational Problem}
 
@@ -1307,6 +1307,12 @@ f(t) = t\log t - t + 1,
 
 which is the generator of $D_{\mathrm{KL}}(q \| p)$. \hfill $\square$
 
+\paragraph{Remark (general self-coupling weight).} The objective \eqref{eq:F_i_supp} carries unit weight on the prior term $D_{\mathrm{KL}}(q_i \| p_i)$, matching the canonical default $\alpha_i = 1$ of the main paper. For a general self-coupling weight $\alpha_i > 0$, replacing $D_{\mathrm{KL}}(q_i \| p_i)$ by $\alpha_i D_{\mathrm{KL}}(q_i \| p_i)$ (main paper Section~\ref{sec:state_dependent_precision}), the stationarity condition acquires the coefficient $\alpha_i + 1$ on $\log q_i^*$ in place of $2$, so the geometric-mean solution generalizes to
+\begin{equation}
+q_i^*(c) \propto p_i(c)^{\alpha_i/(\alpha_i + 1)} \prod_{j}\bigl[\Omega_{ij}(c) q_j(c)\bigr]^{\beta_{ij}/(\alpha_i + 1)},
+\end{equation}
+which reduces to \eqref{eq:geometric_mean_target_supp} at $\alpha_i = 1$. The uniqueness conclusion is unchanged: $\alpha_i$ rescales only the prior exponent, and the necessity argument of Step~3 isolates $f'(r) - \log r$ from the $\beta_{ij}$-weighted neighbor terms alone, so the forward KL remains the unique $f$-divergence yielding this log-linear form for every $\alpha_i > 0$.
+
 \subsubsection{Dual Cost Identification}
 Having established $D_{\mathrm{KL}}$ is the unique divergence, the envelope theorem applied to the $\beta_{ij}$ optimization confirms that the marginal attention cost is
 
@@ -1328,7 +1334,7 @@ Under the natural assumptions of locality, linear coupling, and exponential-fami
 C_{ij}=D_{\mathrm{KL}}(q_i \| \Omega_{ij} q_j)}
 \]
 
-is a necessary consequence of the variational and geometric structure underlying agent-agent coordination. By the GL($K$) invariance theorem (Theorem~1 in the main paper), the KL divergence is invariant under the full general linear group $\mathrm{GL}(K)$, which includes compact subgroups such as $\mathrm{SO}(N)$ and $\mathrm{SU}(N)$ and more.
+is a necessary consequence of the variational and geometric structure underlying agent-agent coordination. By the GL($K$) invariance theorem (Theorem~1 in the main paper), the KL divergence is invariant under the full real general linear group $\mathrm{GL}(K,\mathbb{R})$ acting on the $\mathbb{R}^K$ belief fiber, which includes the compact orthogonal subgroup $\mathrm{SO}(K)$ and more. The unitary groups $\mathrm{U}(N)$ and $\mathrm{SU}(N)$ enter only after the fiber is complexified to $\mathbb{C}^N$ (equivalently, after realification into $\mathrm{GL}(2N,\mathbb{R})$, $K=2N$), since they are subgroups of the complex general linear group $\mathrm{GL}(N,\mathbb{C})$ rather than of the real $\mathrm{GL}(K,\mathbb{R})$.
 
 
 \section{Derivation of the Prior-Bank Decode from Canonical Primitives}
