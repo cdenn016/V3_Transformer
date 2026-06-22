@@ -72,7 +72,8 @@ def test_builder_residual_zero_for_identity_mixer():
 
 
 @pytest.mark.parametrize("sweep_name",
-                         ["gauge_transport", "attention_entropy", "gauge_equivariance", "cg_coupling"])
+                         ["gauge_transport", "attention_entropy", "gauge_equivariance",
+                          "cg_coupling", "n_e_steps_em"])
 def test_experiment_arms_validate_and_build(sweep_name):
     r"""Every cell of each new experiment sweep is a real, constructible VFE3Config + VFEModel
     (so a sweep launch will not silently bucket arms as error_kind='config')."""
@@ -100,3 +101,24 @@ def test_diagnostic_csv_columns_registered():
     needed = {"attn_entropy", "omega_identity_dev", "builder_resid",
               "gauge_resid_in", "gauge_resid_out"}
     assert needed.issubset(set(ablation._CSV_COLUMNS))
+
+
+def test_n_e_steps_em_arm_crosses_steps_and_gradient():
+    r"""EXP-5: the n_e_steps x e_step_gradient cross has 10 cells (5 steps x {unroll, straight_through})."""
+    runs = dict(ablation.make_run_overrides("n_e_steps_em"))
+    assert len(runs) == 10
+    assert runs["T8_straight_through"]["n_e_steps"] == 8
+    assert runs["T8_straight_through"]["e_step_gradient"] == "straight_through"
+    assert all(ov["e_phi_lr"] == 0.0 for ov in runs.values())
+
+
+def test_across_layer_trace_includes_rank_one_residual():
+    r"""EXP-7: the per-layer belief trace surfaces the Dong rank-one residual r(X) by depth."""
+    from vfe3.viz.extract import across_layer_belief_trace
+    cfg = VFE3Config(vocab_size=64, embed_dim=8, n_heads=2, max_seq_len=12, n_layers=3,
+                     gauge_group="block_glk", use_head_mixer=True)
+    model = VFEModel(cfg).to(DEVICE)
+    tr = across_layer_belief_trace(model, torch.randint(0, 64, (1, 12), device=DEVICE))
+    r = tr["rank_one_residual"]
+    assert r.shape == (3,)
+    assert bool((r >= 0).all()) and bool((r <= 1.0 + 1e-5).all())

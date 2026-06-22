@@ -501,6 +501,19 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         ],
     },
 
+    "n_e_steps_em": {  # C2 / EXP-5: structural non-Neal-Hinton EM -- PPL vs n_e_steps, unroll vs
+        # straight_through. The straight_through arm removes the deepening-graph confound of unrolling
+        # the E-step (its trajectory builds no graph), isolating the inference-iteration effect on PPL.
+        # e_phi_lr=0 keeps the gauge preconditioner off the E-step across the sweep. (The F-vs-CE
+        # decorrelation half additionally needs a persisted final E-step F/token -- a separate infra
+        # gap noted in the readiness doc.)
+        "description": "n_e_steps {1,2,3,5,8} x e_step_gradient {unroll, straight_through}, e_phi_lr=0 [C2/EXP-5]",
+        "configs": [
+            {"label": f"T{t}_{g}", "n_e_steps": t, "e_step_gradient": g, "e_phi_lr": 0.0}
+            for t in (1, 2, 3, 5, 8) for g in ("unroll", "straight_through")
+        ],
+    },
+
     # === positional encoding ===============================================
     
     "pos_phi": {
