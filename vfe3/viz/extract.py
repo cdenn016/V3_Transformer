@@ -152,6 +152,82 @@ def per_unit_eval_nats(
 
 
 @torch.no_grad()
+def belief_ce_bank(
+    model,
+    loader:      Iterable[Tuple[torch.Tensor, torch.Tensor]],   # yields (tokens, targets) batches
+
+    *,
+    device:      Optional[torch.device] = None,
+    max_batches: Optional[int]          = None,
+) -> Dict[str, torch.Tensor]:
+    r"""The Sigma_q <-> CE JOIN for the calibration probe (B1/EXP-3): per-token belief-covariance
+    trace tr(Sigma_q) aligned with the decode cross-entropy that same belief produced.
+
+    For each ``(tokens, targets)`` batch this REPLAYS model.forward's belief path EXACTLY
+    (``prior_bank.encode`` -> pos_phi -> the s-refine anchor under ``s_e_step`` -> the precision-bias
+    fold -> ``vfe_stack`` with the trained head_mixer / cg_coupling / block_norm) for the per-token
+    covariance ``out.sigma``, AND the inference forward ``model(tokens)`` for the decode logits, then
+    reduces the cross-entropy with ``reduction='none'``. The s-refine + precision fold are the two
+    steps belief_bank omits; they are reinstated here (no-ops on the pure default path) so the traced
+    Sigma_q IS the belief whose mean produced the logits -- otherwise tr(Sigma_q) and CE come from
+    different beliefs under the live ``s_e_step=True`` / ``precision_weighted_attention=True`` config
+    and the calibration headline reads off the wrong covariance. The belief at position n is the one
+    whose mean produced the logits predicting target n, so tr(Sigma_q)[n] and CE[n] are aligned
+    position-by-position; only valid targets (``targets != -100``) are kept. Returns the flattened
+    per-token ``tr_sigma`` (M,), ``ce`` (M,) nats, and the predicted-token ``token_ids`` (M,) -- the
+    aligned pairs the Spearman rho / CV gate (``vfe3.metrics.spearman_rho`` / ``cv``) and the
+    Sigma-stratified-error / Sigma-CE-scatter figures consume. ``max_batches`` caps the join.
+    """
+    from vfe3.model.stack import vfe_stack
+    device = device or _model_device(model)
+    cfg = model.cfg
+    was_training = model.training
+    model.eval()
+    tr_sig, ces, tids = [], [], []
+    try:
+        for i, (tokens, targets) in enumerate(loader):
+            tokens = tokens.to(device)
+            targets = targets.to(device)
+            n = tokens.shape[1]
+            logits = model(tokens)                                # (B, N, V) inference path
+            per = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), targets.reshape(-1),
+                                  ignore_index=-100, reduction="none")            # (B*N,)
+            beliefs = model.prior_bank.encode(tokens)             # mirror forward so the traced sigma
+            beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi))   # IS the decode's belief
+            if cfg.s_e_step:                                       # anchor belief to the refined model channel
+                s_mu1, s_sigma1 = model._refine_s(tokens, beliefs.phi)
+                beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
+            log_prior = model._attention_log_prior(n, device)
+            log_prior = model._fold_precision_bias(log_prior, beliefs.sigma)   # no-op unless precision_weighted_attention
+            rope = model._rope_rotation(n, device)
+            out = vfe_stack(
+                beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
+                log_prior=log_prior, block_norm=model.block_norm,
+                head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
+                log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
+                connection_W=getattr(model, "connection_W", None),
+                connection_M=getattr(model, "connection_M", None),
+                rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+            )
+            trs = metrics.sigma_trace(out.sigma, diagonal=cfg.diagonal_covariance).reshape(-1)   # (B*N,)
+            tgt = targets.reshape(-1)
+            valid = tgt != -100
+            tr_sig.append(trs[valid])
+            ces.append(per[valid])
+            tids.append(tgt[valid])
+            if max_batches is not None and i + 1 >= max_batches:
+                break
+    finally:
+        if was_training:
+            model.train()
+    return {
+        "tr_sigma":  torch.cat(tr_sig),
+        "ce":        torch.cat(ces),
+        "token_ids": torch.cat(tids),
+    }
+
+
+@torch.no_grad()
 def belief_bank(
     model,
     token_batches:  Iterable[torch.Tensor],   # iterable of (B, N) token-id batches

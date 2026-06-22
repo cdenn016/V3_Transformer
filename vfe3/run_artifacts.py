@@ -475,6 +475,22 @@ def _write_research_artifacts(
         logger.info("FD gradient-check worst rel error: %.2e", out["fd_gradient_worst_rel_error"])
     except Exception as exc:
         logger.warning("FD gradient-check failed (%s); skipped", exc)
+    # B1/EXP-3 Sigma_q calibration headline: Spearman rho(tr Sigma_q, CE) and the across-token
+    # spread gate CV(tr Sigma_q) > 0.10 (below it the covariance channel is inert -- reported as
+    # such, NOT miscoded as "decode doesn't matter"). Off-graph; capped at a few batches.
+    try:
+        from vfe3.viz.extract import belief_ce_bank
+        from vfe3 import metrics as _cal_metrics
+        bank = belief_ce_bank(model, test_loader, device=device, max_batches=10)
+        tr = bank["tr_sigma"]
+        if tr.numel() >= 2:
+            out["sigma_ce_spearman"] = _cal_metrics.spearman_rho(tr, bank["ce"])
+            out["sigma_trace_cv"] = _cal_metrics.cv(tr)
+            out["sigma_trace_cv_gate_pass"] = bool(out["sigma_trace_cv"] > 0.10)
+            logger.info("Sigma_q calibration: rho(trSigma,CE)=%.3f CV(trSigma)=%.3f (gate>0.10: %s)",
+                        out["sigma_ce_spearman"], out["sigma_trace_cv"], out["sigma_trace_cv_gate_pass"])
+    except Exception as exc:
+        logger.warning("Sigma_q calibration probe failed (%s); skipped", exc)
     if out:
         artifacts.save_json("research.json", out)
 
