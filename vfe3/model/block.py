@@ -43,6 +43,7 @@ def vfe_block(
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
     rope_on_value:   bool                      = True,   # False -> value aggregation uses the un-rotated base
+    tau:             'Optional[float | torch.Tensor]' = None,  # softmax temperature (precomputed by vfe_stack; None -> compute here)
     capture:         Optional[dict]            = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
     grad_record:     Optional[dict]            = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
 ) -> BeliefState:
@@ -56,10 +57,14 @@ def vfe_block(
     transport_mode='regime_ii'; None on the pure (flat) path. ``e_step_gradient`` is the E-step
     backward estimator forwarded to the E-step (unroll | straight_through | detach). ``rope`` is
     the precomputed block-diagonal positional rotation R(theta) (None = off, the pure path);
-    ``rope_on_cov`` enables the full-gauge covariance sandwich rotation."""
+    ``rope_on_cov`` enables the full-gauge covariance sandwich rotation. ``tau`` is the softmax
+    temperature (kappa * sqrt(dim_h)); when None it is computed here from cfg.kappa_beta and
+    group.irrep_dims. Pass a precomputed value from vfe_stack to avoid recomputing each layer."""
+    if tau is None:
+        tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims)
     out = e_step(
         belief, mu_p, sigma_p, group,
-        n_iter=cfg.n_e_steps, tau=attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims),
+        n_iter=cfg.n_e_steps, tau=tau,
         e_q_mu_lr=cfg.e_q_mu_lr, e_q_sigma_lr=cfg.e_q_sigma_lr, e_phi_lr=cfg.e_phi_lr,
         renyi_order=cfg.renyi_order, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device), log_alpha=log_alpha,
         lambda_beta=lambda_beta,
@@ -86,7 +91,7 @@ def vfe_block(
         capture["converged"] = out
     if head_mixer is not None:               # opt-in head mixing: after the E-step, BEFORE the norm
         mu_mixed, sigma_mixed = head_mixer(out.mu, out.sigma)   # so the mixed belief feeds norm + handoff
-        out = BeliefState(mu=mu_mixed, sigma=sigma_mixed, phi=out.phi)   # (VFE_2.0 per-block order)
+        out = BeliefState(mu=mu_mixed, sigma=sigma_mixed, phi=out.phi)   # (per-block apply order)
     if cg_coupling is not None:              # opt-in CG cross-type coupling: after mixing, before norm
         mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)
         out = BeliefState(mu=mu_cg, sigma=sigma_cg, phi=out.phi)

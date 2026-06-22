@@ -176,7 +176,7 @@ def free_energy_value(
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
-    sigma_max:                 float = 5.0,            # accepted-and-ignored iteration-only knob
+    sigma_max:                 float = 10.0,           # matches VFE3Config.sigma_max; accepted-and-ignored iteration-only knob
     e_sigma_q_trust:           float = 5.0,            # accepted-and-ignored iteration-only knob
     e_mu_q_trust:              Optional[float] = None, # accepted-and-ignored iteration-only knob
     mu_trust_mode:             str  = "box",           # accepted-and-ignored iteration-only knob
@@ -316,7 +316,7 @@ def phi_alignment_loss(
     Both roles of phi flow (Omega_ij depends on phi_i and phi_j); autograd gives the envelope
     phi-gradient. ``lambda_beta`` (1.0 = pure) scales the coupling block but NOT the ``mass_phi``
     penalty, so the effective phi step is e_phi_lr * lambda_beta * nabla (lambda_beta and e_phi_lr
-    interact; VFE_2.0 parity). The ``mass_phi`` term makes the phi E-step descend the PENALIZED
+    interact). The ``mass_phi`` term makes the phi E-step descend the PENALIZED
     objective during inference (distinct from the outer M-step ||phi||^2 on the learned prior
     table). The canonical (entropy) branch reuses ``reduced_free_energy``, the -tau log Z envelope
     form.
@@ -362,7 +362,7 @@ def e_step_iteration(
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
-    sigma_max:                 float = 5.0,
+    sigma_max:                 float = 10.0,           # matches VFE3Config.sigma_max
     e_sigma_q_trust:           float = 5.0,
     e_mu_q_trust:              Optional[float] = None,   # mean trust radius (sigma units); None = unbounded
     mu_trust_mode:             str  = "box",             # "box" | "ball" (only when e_mu_q_trust is not None)
@@ -389,6 +389,7 @@ def e_step_iteration(
     rope_on_cov:               bool                   = False,  # full-gauge: rotate covariance too
     rope_on_value:             bool                   = True,   # False -> value aggregation uses the un-rotated base
     grad_record:               Optional[dict]         = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
+    _prebuilt_omega:           'torch.Tensor | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: flat-path cache from e_step (phi-invariant when e_phi_lr==0)
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
     (autograd of the alignment block + preconditioner + Lie retraction).
@@ -430,11 +431,17 @@ def e_step_iteration(
             )
         omega_builder = _omega_builder
     else:
-        omega = build_belief_transport(
-            belief.phi, group, transport_mode=transport_mode,
-            mu=belief.mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
-            rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
-        )
+        # Use the hoisted transport when the caller pre-built it (flat path, e_phi_lr==0 so
+        # belief.phi is iteration-invariant). Fall back to building here for direct calls or
+        # when phi is live (e_phi_lr > 0 means the previous iteration updated phi).
+        if _prebuilt_omega is not None:
+            omega = _prebuilt_omega
+        else:
+            omega = build_belief_transport(
+                belief.phi, group, transport_mode=transport_mode,
+                mu=belief.mu, connection_W=connection_W, cocycle_relaxation=cocycle_relaxation,
+                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+            )
         omega_builder = None
     # Runtime truncation warning (audit 2026-06-09 P8): under the 'unroll' estimator with a LIVE
     # belief, a non-kernel route is served by the autograd oracle, which returns a DETACHED
@@ -499,7 +506,7 @@ def e_step_iteration(
         nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
 
     delta_mu = e_q_mu_lr * nat_mu
-    # E-step MEAN trust region (VFE_2.0 parity, default OFF). When e_mu_q_trust is set, bound the
+    # E-step MEAN trust region (default OFF). When e_mu_q_trust is set, bound the
     # per-iteration mean step in sigma-whitened units before the additive update; None reproduces the
     # bare mu = belief.mu - e_q_mu_lr*nat_mu bit-for-bit. is_diagonal mirrors the SPD-retraction rank
     # rule below (full cov iff sigma.dim() == mu.dim() + 1).
@@ -594,6 +601,23 @@ def e_step(
     'unroll' here (no_grad already severs every gradient)."""
     traj: List[float] = []
 
+    # Hoist the flat transport when phi is frozen across iterations (e_phi_lr==0).  On the flat
+    # path the transport depends only on belief.phi, which the phi sub-step never updates when
+    # e_phi_lr==0, so it is iteration-invariant.  Build ONCE here and pass it into every
+    # e_step_iteration call via _prebuilt_omega, eliminating the redundant per-iteration rebuild.
+    # When e_phi_lr > 0 phi changes each iteration so we leave _prebuilt_omega=None and let
+    # e_step_iteration rebuild as before.  regime_ii is excluded because its Omega is mu-dependent
+    # (mu changes every iteration regardless of e_phi_lr).
+    transport_mode_kw: str = kwargs.get("transport_mode", "flat")
+    _hoisted_omega: 'torch.Tensor | FactoredTransport | RopeTransport | None' = None
+    if e_phi_lr == 0.0 and transport_mode_kw == "flat":
+        _hoisted_omega = build_belief_transport(
+            belief.phi, group,
+            transport_mode="flat",
+            gauge_mode=kwargs.get("gauge_mode", "learned"),
+            rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+        )
+
     def _f_diag(b: BeliefState) -> float:
         # Diagnostic scalar: under no_grad so the logged trajectory never enters the
         # training graph, and .item() instead of float(tensor) makes the host sync explicit.
@@ -616,7 +640,9 @@ def e_step(
             e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, e_phi_lr=e_phi_lr,
             e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
             grad_record=grad_record,                       # last iteration overwrites -> converged-ish grad
-            log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, **kwargs,
+            log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+            _prebuilt_omega=_hoisted_omega,
+            **kwargs,
         )
         if return_trajectory:
             traj.append(_f_diag(belief))

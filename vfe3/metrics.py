@@ -128,7 +128,7 @@ def free_energy_terms(
     ``belief_coupling`` and ``attention_entropy`` are the RAW (unweighted) block energies, so each
     stays individually interpretable; ``total`` is the runtime-realised SCALED free energy
     self_coupling + lambda_beta (belief_coupling + attention_entropy), matching what the E-step
-    actually minimizes (VFE_2.0 parity). At lambda_beta = 1.0 total is byte-identical to the
+    actually minimizes. At lambda_beta = 1.0 total is byte-identical to the
     unscaled sum.
 
     ``alpha_reg`` is the per-position regularizer R(alpha_i) (b0 alpha - c0 log alpha under

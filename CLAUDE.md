@@ -2,17 +2,17 @@
 
 Clean-room rebuild of the gauge-theoretic VFE transformer. No neural networks (backprop is allowed):
 all capacity comes from iterative VFE minimization over Gaussian belief tuples
-`(mu, Sigma, phi)`. Built bottom-up, every layer numerically pinned to VFE_2.0
-by golden tests. See `docs/superpowers/specs/2026-05-29-vfe3-clean-room-design.md`.
+`(mu, Sigma, phi)`. Built bottom-up, every layer pinned by golden regression
+tests. See `docs/superpowers/specs/2026-05-29-vfe3-clean-room-design.md`.
 
-This V3 is intended to be a production quality continuation of the VFE_2.0 transformer that will allow clean code, clear math, and future expandability
+This V3 is a production quality gauge-theoretic VFE transformer that allows clean code, clear math, and future expandability
 
 ## Hard constraints
 - NO neural networks (no nn.Linear, no MLP, no activations. backprop is allowed).
   **Documented exceptions (opt-in toggles, both default OFF; the pure no-NN path is the
   default and always exists):** (1) `use_prior_bank=False` decodes via a single learned
   linear output projection `logits = mu @ W^T` (`W` a raw `(V, K)` nn.Parameter, not an
-  nn.Linear module; sigma discarded) — the VFE_2.0-parity ablation the user compares
+  nn.Linear module; sigma discarded) — the linear-decode ablation the user compares
   against the KL-to-prior decode. Encode and the free-energy self-coupling stay on the
   PriorBank. (2) `use_head_mixer=True` applies a learned Schur-commutant per-irrep-block
   head mixer; under `block_glk`'s untied per-block gauge it breaks strict gauge
@@ -65,7 +65,7 @@ Example:
     ) -> torch.Tensor:
 
 ## Testing
-Golden equivalence vs a pinned VFE_2.0 checkout for every ported kernel;
+Golden regression tests pin every kernel to its reference values;
 finite-difference gradient checks against the autograd-of-F oracle (later
 phases); property tests (non-negativity, self-divergence zero, gauge
 equivariance). Tests are device-agnostic (default CPU; set

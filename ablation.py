@@ -119,7 +119,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
     
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
-                                                     # mu->logits ablation (VFE_2.0 parity; encode stays on the prior bank)
+                                                     # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.008,
     decode_precision_scaled   = False,               # use_prior_bank=False only: feed the precision-weighted mean
                                                      # eta=mu/sigma (natural param) to the linear head so Sigma enters

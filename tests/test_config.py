@@ -169,7 +169,7 @@ def test_config_model_defaults():
     cfg = VFE3Config()
     assert cfg.embed_dim == 64 and cfg.n_heads == 8 and cfg.n_layers == 1
     assert cfg.gauge_group == "block_glk" and cfg.decode_mode == "diagonal"
-    assert cfg.use_prior_bank is False              # default is the linear-decode ablation (VFE_2.0 parity)
+    assert cfg.use_prior_bank is False              # default is the linear-decode ablation
 
 
 def test_tau_is_kappa_sqrt_d_head():
@@ -232,7 +232,7 @@ def test_config_rejects_omega_direct_gauge_parameterization():
 
 
 def test_config_accepts_use_prior_bank_false():
-    """use_prior_bank=False is the live linear-projection decode ablation (VFE_2.0 parity):
+    """use_prior_bank=False is the live linear-projection decode ablation:
     encode/self-coupling stay on the PriorBank, only decode becomes a plain mu->logits
     projection. It must construct cleanly (no NotImplementedError); it is the current default."""
     assert VFE3Config().use_prior_bank is False

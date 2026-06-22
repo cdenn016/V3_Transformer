@@ -1,4 +1,4 @@
-r"""Schur-commutant head mixer (use_head_mixer, VFE_2.0 parity, opt-in).
+r"""Schur-commutant head mixer (use_head_mixer, opt-in).
 
 Mixes the equal-size gauge-irrep blocks (under block_glk: the n_heads heads) with a learned
 per-type matrix A = I + delta embedded as kron(A, I_d), applied symmetrically to mu (M mu) and

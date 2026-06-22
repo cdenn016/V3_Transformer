@@ -121,7 +121,7 @@ def test_finalize_skips_figures_when_disabled(tmp_path):
 def test_metrics_csv_logs_at_log_cadence(tmp_path):
     # metrics.csv gets a row every log_interval (denser than eval_interval), but the validation
     # columns are EVAL-CADENCE: a value only on an eval step, a BLANK cell on the log-interval rows
-    # in between (NOT carried forward) -- matching VFE_2.0's metrics.csv.
+    # in between (NOT carried forward).
     import csv
     import math
     cfg = _cfg()

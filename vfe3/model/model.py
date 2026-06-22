@@ -31,6 +31,12 @@ from vfe3.model.prior_bank import PriorBank
 from vfe3.model.stack import vfe_stack
 
 
+# Transport-mode membership sets (Fix B): centralize the string literals so a new regime
+# registers here and all comparisons update automatically.
+_REGIME_NEEDS_MU    = frozenset({"regime_ii", "regime_ii_covariant"})   # regimes that pass mu to _transport
+_REGIME_NEEDS_SIGMA = frozenset({"regime_ii_covariant"})                # regimes that pass sigma to _transport
+
+
 def _precision_key_bias(
     sigma:      torch.Tensor,        # (B, N, K) per-key belief variances
 
@@ -261,7 +267,7 @@ class VFEModel(nn.Module):
                     stacklevel=2,
                 )
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED belief-coupling weight
-        # lambda_beta (VFE_2.0 'lambda_align' parity). When learnable_lambda_beta=True, create
+        # lambda_beta. When learnable_lambda_beta=True, create
         # log_lambda_beta as a scalar nn.Parameter; the consumed weight is lambda_beta =
         # exp(log_lambda_beta) (always positive). Init 0 -> lambda_beta = exp(0) = 1.0, byte-identical
         # to the constant-1.0 pure path at step 0. For learnable_lambda_beta=False the parameter is
@@ -729,7 +735,7 @@ class VFEModel(nn.Module):
                 _gv = grad_rec.get(_gk) if grad_rec is not None else None
                 estep_grad_out[_gk] = float(_gv) if _gv is not None else 0.0
         mu_final = out.mu                                        # (B, N, K); head mixer (if any) applied PER BLOCK
-        sigma_final = out.sigma                                  # inside vfe_stack now (VFE_2.0 parity), not post-stack
+        sigma_final = out.sigma                                  # inside vfe_stack now, not post-stack
 
         if self.final_norm is not None:                          # config-selected final norm (cached)
             mu_final = self.final_norm(mu_final, sigma_final)
@@ -1134,6 +1140,7 @@ class VFEModel(nn.Module):
             belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)
+        log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward/diagnostics/attention_maps (r2 id22)
         rope = self._rope_rotation(n, token_ids.device)
         _llb = getattr(self, "log_lambda_beta", None)
         out = vfe_stack(                                             # converged belief gauge frame
@@ -1143,6 +1150,7 @@ class VFEModel(nn.Module):
             log_alpha=getattr(self, "log_alpha", None),
             lambda_beta=(self.cfg.lambda_beta if _llb is None else _llb.exp()),
             connection_W=getattr(self, "connection_W", None),
+            connection_M=getattr(self, "connection_M", None),
             rope=rope, rope_on_cov=self.cfg.rope_full_gauge, rope_on_value=self.cfg.rope_on_value,
         )
         e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids[:1], out.phi.unsqueeze(0))
@@ -1312,8 +1320,8 @@ class VFEModel(nn.Module):
         # (rope was computed above and now also shaped the converged belief.)
         omega = _transport(                                          # (N, N, K, K)
             out.phi, self.group, transport_mode=cfg.transport_mode,
-            mu=(out.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
-            sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
+            mu=(out.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
+            sigma=(out.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
             connection_W=getattr(self, "connection_W", None),
             connection_M=getattr(self, "connection_M", None),
             cocycle_relaxation=cfg.cocycle_relaxation,
@@ -1569,8 +1577,8 @@ class VFEModel(nn.Module):
             # (flat ignores both), and the energy is per-irrep-block (per-head).
             omega = _transport(
                 belief.phi, self.group, transport_mode=cfg.transport_mode,
-                mu=(belief.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
-                sigma=(belief.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
+                mu=(belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
+                sigma=(belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),
                 cocycle_relaxation=cfg.cocycle_relaxation,
@@ -1669,8 +1677,8 @@ class VFEModel(nn.Module):
             )
             omega = _transport(                                       # (N, N, K, K) under the ACTIVE regime
                 belief.phi, self.group, transport_mode=cfg.transport_mode,
-                mu=(belief.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
-                sigma=(belief.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
+                mu=(belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
+                sigma=(belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),
                 cocycle_relaxation=cfg.cocycle_relaxation,
