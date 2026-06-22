@@ -437,6 +437,50 @@ def test_plot_holonomy_curvature_saves(tmp_path):
     assert _saved_nonempty(p)
 
 
+def test_holonomy_curvature_title_follows_regime(tmp_path):
+    # A flat (Regime-I) run has no regime_ii data: the curvature-field panel must NOT claim "regime II".
+    flat = {"per_triple": torch.rand(40) * 1e-6, "span": torch.randint(1, 6, (40,)).float()}
+    fig = plot_holonomy_curvature(flat, None, curvature=torch.rand(6, 6), path=str(tmp_path / "cf_flat.png"))
+    titles = [a.get_title() for a in fig.axes]
+    assert "Curvature field (flat)" in titles, titles
+    assert "Curvature field (regime II)" not in titles, titles
+    plt.close(fig)
+    # With regime_ii data present the field is genuine curvature -> the title says regime II.
+    regime = {"per_triple": torch.rand(40) + 0.1, "span": torch.randint(1, 6, (40,)).float()}
+    fig = plot_holonomy_curvature(flat, regime, curvature=torch.rand(6, 6), path=str(tmp_path / "cf_rii.png"))
+    assert "Curvature field (regime II)" in [a.get_title() for a in fig.axes]
+    plt.close(fig)
+
+
+def test_per_layer_belief_geometry_labels_cond_median(tmp_path):
+    # The twin-axis condition-number marker must be named in the legend so it cannot be misread as a
+    # second attention-entropy series on the left rank/nats axis.
+    keys = ("self_coupling", "belief_coupling", "attention_entropy", "total",
+            "holonomy_deviation", "holonomy_wilson", "gauge_trace_spread", "gauge_invariant_spread",
+            "phi_norm_mean", "effective_rank", "attn_entropy", "belief_cond_median")
+    per_layer = {k: [float(v) for v in torch.rand(3)] for k in keys}
+    fig = plot_per_layer_diagnostics(per_layer, path=str(tmp_path / "bg.png"))
+    labels = []
+    for a in fig.axes:
+        leg = a.get_legend()
+        if leg is not None:
+            labels += [t.get_text() for t in leg.get_texts()]
+    assert any("cond median" in lab for lab in labels), labels
+    plt.close(fig)
+
+
+def test_trajectory_max_annotation_keeps_small_values(tmp_path):
+    # Regression: a holonomy-scale (~1e-4) extremum must render its real value in the 'max' callout,
+    # not round to "0.0" the way the old ``:.1f`` format did.
+    vals = [3.0e-5, 2.3e-4, 1.1e-4, 1.7e-4]
+    fig = plot_trajectory(vals, [0, 1500, 3000, 4500], logy=True, annotate="max",
+                          path=str(tmp_path / "holo.png"))
+    texts = [t.get_text() for t in fig.axes[0].texts]
+    assert any(t.startswith("max ") and "0.0002" in t for t in texts), texts
+    assert not any(t.startswith("max 0.0\n") for t in texts), texts
+    plt.close(fig)
+
+
 def test_plot_capacity_scaling_and_estep_capacity_save(tmp_path):
     scaling = {"embed_dim": {"x": np.array([20, 40, 64]), "bpc": np.array([7.5, 7.0, 6.8]),
                              "lo": np.array([7.4, 6.9, 6.7]), "hi": np.array([7.6, 7.1, 6.9])},
