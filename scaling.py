@@ -37,6 +37,7 @@ import json
 import logging
 import time
 from dataclasses import asdict
+from dataclasses import fields as _dc_fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -68,6 +69,41 @@ def route_grow_k(embed_dims: List[int], n_heads: int = 4) -> List[Dict[str, Any]
     return [{"label": f"K{k}", "route": "grow_K", "scale_knob": "embed_dim",
              "overrides": {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk"}}
             for k in embed_dims]
+
+
+_VFE3_DEFAULTS = {f.name: f.default for f in _dc_fields(VFE3Config)}
+
+
+def _baseline_value(key: str) -> float:
+    r"""Operating-point value of a VFE3Config float field: train_vfe3's config dict if it sets it,
+    else the dataclass default. Lets the muP route scale LRs / init relative to the anchor width
+    without hard-coding the operating point."""
+    return float(BASELINE.get(key, _VFE3_DEFAULTS.get(key)))
+
+
+def route_grow_k_mup(embed_dims: List[int], n_heads: int = 4, anchor_k: int = 20) -> List[Dict[str, Any]]:
+    r"""muP width-stability route for the inverse-K exponent (F1/EXP-6). For each K it emits a matched
+    PAIR: a 'fixed' arm at the baseline mean LR/init (the width-fixed control) and a 'mup' arm that
+    scales the E/M-step mean LRs ~ anchor_k/K and the mean-init std ~ sqrt(anchor_k/K) (Tensor-Programs
+    muP for width). BOTH arms recompute kl_max = 8*K per cell -- the baseline freezes kl_max at
+    8*train_K (a width confound that over-relaxes every small-K cell and zeros the hyper-prior self-
+    gradient near K ~ 126; see docs/experiments/2026-06-21-experiment-readiness.md). Anchored at
+    K=anchor_k, where the muP factors are 1 and the two arms coincide. Scoped to this route so the
+    other routes (incl. an active blocksize run) are untouched. The fitted exponent should be compared
+    against embed_dim, not n_params (which is K^2-dominated by phi_embed)."""
+    base_eqmu = _baseline_value("e_q_mu_lr")
+    base_mpmu = _baseline_value("m_p_mu_lr")
+    base_init = _baseline_value("mu_init_std")
+    cells: List[Dict[str, Any]] = []
+    for k in embed_dims:
+        common = {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk", "kl_max": 8 * k}
+        cells.append({"label": f"K{k}_fixed", "route": "grow_K_mup", "scale_knob": "embed_dim",
+                      "overrides": dict(common)})
+        w = anchor_k / k                                     # muP width ratio (1 at the anchor)
+        cells.append({"label": f"K{k}_mup", "route": "grow_K_mup", "scale_knob": "embed_dim",
+                      "overrides": {**common, "e_q_mu_lr": base_eqmu * w,
+                                    "m_p_mu_lr": base_mpmu * w, "mu_init_std": base_init * (w ** 0.5)}})
+    return cells
 
 
 def route_blocksize(embed_dim: int, n_heads_list: List[int]) -> List[Dict[str, Any]]:
@@ -132,7 +168,8 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
 # grids freely -- the predicted n_params is printed per cell before training so a grid can be sized to
 # the GPU first. Geometric (~2x) spacing in N gives even leverage to the log-log fit.
 ROUTES: Dict[str, List[Dict[str, Any]]] = {
-    "grow_K":        route_grow_k([20, 40, 80, 160], n_heads=4),
+    "grow_K":        route_grow_k([20, 40, 60, 80, 100, 120], n_heads=4),
+    "grow_K_mup":    route_grow_k_mup([20, 40, 80, 120], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
     "blocksize":     route_blocksize(64, [8, 4, 2]),
     "group":         route_group(64),
     "model_channel": route_model_channel(),
@@ -146,7 +183,7 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
 # =============================================================================
 CONFIG: Dict[str, Any] = {
     # Which routes to run (keys of ROUTES), in order. A curated subset for a single-GPU session.
-    "routes":     ["grow_K", "blocksize", "group", "model_channel", "infer_T", "infer_L"],
+    "routes":     ["blocksize"], #"blocksize", grow_K, "group", "model_channel", "infer_T", "infer_L"],
 
     # Seeds per cell. Graduated budget is sensible (more seeds at the cheap small end); the simplest
     # honest default is one shared list applied to every cell -- trim/extend per your compute budget.
