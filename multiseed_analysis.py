@@ -327,32 +327,33 @@ SCALAR_KEYS: List[str] = [
     "freq_strata_ce.rare", "freq_strata_ce.mid", "freq_strata_ce.frequent",
 ]
 
-# Per-step curves to draw an across-seed band for: (metrics.csv column, y-label, log-y?).
+# Per-step curves to draw an across-seed band for: (metrics.csv column, log-y?). Axis/title labels
+# are publication-quality math, resolved centrally by vfe3.viz.figures.pub_label (PUB_LABELS).
 CURVE_SPECS: List[tuple] = [
-    ("train_ce",           "train CE",               False),
-    ("val_ppl",            "val PPL",                 False),
-    ("free_energy_total",  "F (total)",               False),
-    ("self_coupling",      "self-coupling KL",        False),
-    ("belief_coupling",    "belief-coupling KL",      False),
-    ("attention_entropy",  "attention-entropy term",  False),
-    ("self_divergence",    "self-divergence",         False),
-    ("hyper_prior",        "hyper-prior KL",          False),
-    ("gamma_coupling",     "gamma (model) coupling",  False),
-    ("grad_norm",          "grad norm",               True),
-    ("holonomy_deviation", "holonomy deviation",      True),
-    ("gauge_trace_spread", "gauge trace spread",      False),
-    ("effective_rank",     "effective rank",          False),
-    ("attn_entropy",       "attn entropy",            False),
-    ("belief_cond_median", "belief cond (median)",    True),
-    ("fisher_trace_mean",  "Fisher trace (mean)",     False),
-    ("generalization_gap", "generalization gap",      False),
+    ("train_ce",           False),
+    ("val_ppl",            False),
+    ("free_energy_total",  False),
+    ("self_coupling",      False),
+    ("belief_coupling",    False),
+    ("attention_entropy",  False),
+    ("self_divergence",    False),
+    ("hyper_prior",        False),
+    ("gamma_coupling",     False),
+    ("grad_norm",          True),
+    ("holonomy_deviation", True),
+    ("gauge_trace_spread", False),
+    ("effective_rank",     False),
+    ("attn_entropy",       False),
+    ("belief_cond_median", True),
+    ("fisher_trace_mean",  False),
+    ("generalization_gap", False),
 ]
 
 GRID_COLS: List[str] = [                                          # overview-grid subset
     "train_ce", "val_ppl", "free_energy_total", "grad_norm", "holonomy_deviation",
     "gauge_trace_spread", "effective_rank", "attn_entropy", "belief_cond_median",
 ]
-_LOGY_COLS = {c for c, _, logy in CURVE_SPECS if logy}
+_LOGY_COLS = {c for c, logy in CURVE_SPECS if logy}
 
 PER_LAYER_METRICS: List[str] = [                                  # per-layer bars to draw
     "self_coupling", "belief_coupling", "attention_entropy", "effective_rank",
@@ -474,13 +475,13 @@ def _emit_figures(root: Path, scalars, curves, per_layer) -> None:
     out = fig_dir / "scalar_cv_summary.png"
     _try(lambda: figs.plot_scalar_cv_summary(scalars, path=str(out)), out)
 
-    for col, ylabel, logy in CURVE_SPECS:
+    for col, logy in CURVE_SPECS:
         d = curves.get(col)
         if d is None or not np.any(np.isfinite(d["mean"])):
             continue
         out = fig_dir / f"curve_band__{_slug(col)}.png"
-        _try(lambda d=d, ylabel=ylabel, logy=logy, col=col, out=out:
-             figs.plot_curve_band(d["steps"], d["mean"], d["sd"], label=col, ylabel=ylabel,
+        _try(lambda d=d, logy=logy, col=col, out=out:
+             figs.plot_curve_band(d["steps"], d["mean"], d["sd"], label=col,
                                   n=d["n"], logy=logy, path=str(out)), out)
 
     grid = [{"steps": curves[c]["steps"], "mean": curves[c]["mean"], "sd": curves[c]["sd"],
