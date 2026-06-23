@@ -1,23 +1,35 @@
-r"""Across-seed aggregation for the EXP-1 multi-seed variance floor (I1).
+r"""Across-seed digest for an identical-config multi-seed run.
 
-``train_vfe3.py`` with ``NUM_RUNS``/``SEEDS`` writes one seed-labelled run dir per seed, each with a
-``summary.json`` (headline ``test_ppl``/``best_val_ppl``) and a ``config.json`` (the ``seed``).
-Nothing aggregated the seeds into a mean +/- SD error bar -- this does, and flags ablation cells whose
-between-cell spread is within the seed-noise band (so a "win" is not read off seed noise).
+``train_vfe3.py`` with ``NUM_RUNS``/``SEEDS`` writes one seed-labelled run dir per seed, each holding a
+``summary.json`` / ``test_results.json`` (headline scalars), ``provenance.json`` (the ``seed``),
+``research.json`` (ECE, frequency-stratified CE, sigma diagnostics), ``metrics.csv`` (the per-step
+training curves) and ``metrics_per_layer.csv`` (final per-layer diagnostics). This module aggregates
+EVERY one of those across seeds and emits the full figure + data set in one pass:
+
+- scalar headline + research metrics -> across-seed mean / SD / CV table, ``scalar_cv_summary`` figure,
+  and a per-metric noise band (the floor every ablation 'win' must clear);
+- per-step curves -> across-seed mean +/-1 SD ribbons (one per curated metric + an overview grid);
+- per-layer diagnostics -> across-seed per-layer bars with SD error bars;
+- machine-readable ``multiseed_summary.json`` / ``.csv`` and a human-readable ``MULTISEED_ANALYSIS.md``.
 
 Click-to-run (project policy: no argparse): edit ``CONFIG`` below, then ``python multiseed_analysis.py``.
+``run_root`` resolves a bare run-folder name under ``vfe3_runs/`` (so ``"K=20_GL(10)"`` just works).
 
-Caveat the printout repeats: the per-run reseed (train_vfe3) currently shares the data-shuffle order
-across seeds, so this SD is the init+optimization spread only -- a LOWER BOUND on deployment variance.
-A fixed data-order generator (so model-init RNG varies while the batch order is held) is the companion
-fix; see docs/experiments/2026-06-21-experiment-readiness.md (S6).
+Caveat carried into every output: the per-run reseed (train_vfe3) currently shares the data-shuffle
+order across seeds, so this SD is the init+optimization spread only -- a LOWER BOUND on deployment
+variance. A fixed data-order generator (model-init RNG varies, batch order held) is the companion fix;
+see docs/experiments/2026-06-21-experiment-readiness.md (S6).
 """
 from __future__ import annotations
 
+import csv
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -46,8 +58,8 @@ def aggregate_seed_metric(
     r"""Scan ``run_root`` for per-seed ``filename``, gather ``key``, return the across-seed summary.
 
     Returns ``{n, mean, sd, two_sd, cv, values, seeds}`` with the UNBIASED (ddof=1) SD; ``sd``/``cv``
-    are NaN for n<2. ``seeds`` reads the sibling ``config.json`` ``seed`` (None if absent). Non-finite
-    or unreadable points are skipped (never crash the aggregation).
+    are NaN for n<2. ``seeds`` reads :func:`_seed_for` (provenance.json -> config.json -> dir name).
+    Non-finite or unreadable points are skipped (never crash the aggregation).
     """
     root = Path(run_root)
     values: List[float] = []
@@ -57,18 +69,228 @@ def aggregate_seed_metric(
         if v is None:
             continue
         values.append(v)
-        s = _read_json(f.parent / seed_file).get("seed")
-        seeds.append(int(s) if isinstance(s, (int, float)) else None)
+        seeds.append(_seed_for(f.parent, config_name=seed_file))
 
+    out = _summarize(values)
+    out["seeds"] = seeds
+    return out
+
+
+def _summarize(values: List[float]) -> Dict[str, Any]:
+    r"""Across-seed ``{n, mean, sd, two_sd, cv, values}`` with the UNBIASED (ddof=1) SD (NaN for n<2)."""
     n = len(values)
     if n == 0:
         return {"n": 0, "mean": math.nan, "sd": math.nan, "two_sd": math.nan,
-                "cv": math.nan, "values": [], "seeds": []}
+                "cv": math.nan, "values": []}
     mean = sum(values) / n
     sd = math.sqrt(sum((v - mean) ** 2 for v in values) / (n - 1)) if n >= 2 else math.nan
     cv = (sd / abs(mean)) if (n >= 2 and mean != 0.0) else math.nan
-    return {"n": n, "mean": mean, "sd": sd, "two_sd": 2.0 * sd, "cv": cv,
-            "values": values, "seeds": seeds}
+    return {"n": n, "mean": mean, "sd": sd, "two_sd": 2.0 * sd, "cv": cv, "values": values}
+
+
+def _resolve_run_root(
+    run_root: Any,
+
+    *,
+    search_dirs: tuple = ("vfe3_runs",),
+) -> Path:
+    r"""Resolve ``run_root`` to a directory: the literal if it exists, else ``<search_dir>/run_root``
+    for the first ``search_dir`` that contains it, else the literal (the caller reports "nothing
+    found"). Lets the bare run name ``"K=20_GL(10)"`` resolve to ``vfe3_runs/K=20_GL(10)``.
+    """
+    p = Path(run_root)
+    if p.exists():
+        return p
+    for s in search_dirs:
+        cand = Path(s) / run_root
+        if cand.exists():
+            return cand
+    return p
+
+
+def _seed_for(
+    run_dir: Any,
+
+    *,
+    config_name: str = "config.json",
+    prov_name:   str = "provenance.json",
+) -> Optional[int]:
+    r"""The seed for one run dir: ``provenance.json["seed"]`` -> ``config.json["seed"]`` -> the
+    ``_s<NN>`` suffix of the dir name. None if every source is absent. (``config.json`` stores
+    ``null`` in current runs; the real seed lives in ``provenance.json``.)
+    """
+    run_dir = Path(run_dir)
+    for fname in (prov_name, config_name):
+        s = _read_json(run_dir / fname).get("seed")
+        if isinstance(s, (int, float)) and not isinstance(s, bool):
+            return int(s)
+    m = re.search(r"_s(\d+)$", run_dir.name)
+    return int(m.group(1)) if m else None
+
+
+def _seed_dirs(root: Path) -> List[Path]:
+    r"""The per-seed run dirs directly under ``root`` (those carrying a run artifact), sorted.
+    Skips siblings like ``figures/`` that hold no run JSON."""
+    root = Path(root)
+    if not root.exists():
+        return []
+    out = []
+    for p in sorted(root.iterdir()):
+        if p.is_dir() and any((p / f).exists()
+                              for f in ("summary.json", "provenance.json", "config.json")):
+            out.append(p)
+    return out
+
+
+def _dig(d: Dict[str, Any], dotted: str) -> Any:
+    r"""Nested lookup by dotted key (``"freq_strata_ce.rare"``); None if any level is missing."""
+    cur: Any = d
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def aggregate_scalar(
+    run_root: Any,
+    key:      str,
+
+    *,
+    sources: tuple = ("summary.json", "test_results.json", "research.json"),
+) -> Dict[str, Any]:
+    r"""Across-seed summary of one (possibly dotted) scalar ``key``, searching ``sources`` in order
+    per seed dir. Same return shape as :func:`aggregate_seed_metric`. Handles ``research.json`` keys
+    (ECE, ``freq_strata_ce.rare``, ...) that never appear in ``summary.json``.
+    """
+    root = _resolve_run_root(run_root)
+    values: List[float] = []
+    seeds: List[Optional[int]] = []
+    for run_dir in _seed_dirs(root):
+        val = None
+        for src in sources:
+            v = _as_finite_float(_dig(_read_json(run_dir / src), key))
+            if v is not None:
+                val = v
+                break
+        if val is None:
+            continue
+        values.append(val)
+        seeds.append(_seed_for(run_dir))
+    out = _summarize(values)
+    out["seeds"] = seeds
+    return out
+
+
+def _read_csv_columns(path: Path) -> Dict[str, List[Optional[float]]]:
+    r"""Read a CSV into ``{column: [float | None]}``; empty / non-numeric / non-finite cells -> None."""
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        cols = list(reader.fieldnames or [])
+        data: Dict[str, List[Optional[float]]] = {c: [] for c in cols}
+        for row in reader:
+            for c in cols:
+                data[c].append(_as_finite_float(row.get(c)))
+    return data
+
+
+def _nan_mean_sd(M: np.ndarray) -> tuple:
+    r"""NaN-aware across-row (axis 0) mean, UNBIASED (ddof=1) SD, and finite count per column.
+    SD is NaN where fewer than 2 seeds reported; mean is NaN where none did."""
+    n = np.sum(np.isfinite(M), axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.where(n > 0, np.nansum(M, axis=0) / n, np.nan)
+        ss = np.nansum((M - mean) ** 2, axis=0)
+        sd = np.where(n >= 2, np.sqrt(ss / np.where(n >= 2, n - 1, 1)), np.nan)
+    return mean, sd, n
+
+
+def aggregate_seed_curves(
+    run_root: Any,
+
+    *,
+    columns:  Optional[List[str]] = None,
+    filename: str = "metrics.csv",
+    x:        str = "step",
+) -> Dict[str, Dict[str, np.ndarray]]:
+    r"""Across-seed per-step curves from each seed's ``metrics.csv``.
+
+    Returns ``{column: {steps, mean, sd, n}}`` on the union ``x`` (step) grid, with the NaN-aware
+    across-seed mean / ddof=1 SD / finite-seed-count per step (sparse columns like ``val_*`` average
+    only the seeds that reported). ``columns=None`` -> every numeric column except ``x``.
+    """
+    root = _resolve_run_root(run_root)
+    per_seed = []                                                # list of (steps[np], {col: vals[np]})
+    all_cols: set = set()
+    for run_dir in _seed_dirs(root):
+        f = run_dir / filename
+        if not f.exists():
+            continue
+        data = _read_csv_columns(f)
+        if x not in data:
+            continue
+        steps = np.array([np.nan if v is None else v for v in data[x]], float)
+        keep = np.isfinite(steps)
+        steps = steps[keep]
+        cols = {}
+        for c, vals in data.items():
+            if c == x:
+                continue
+            cols[c] = np.array([np.nan if v is None else v for v in vals], float)[keep]
+            all_cols.add(c)
+        per_seed.append((steps, cols))
+    if not per_seed:
+        return {}
+    sel = list(columns) if columns is not None else sorted(all_cols)
+    grid = np.unique(np.concatenate([s for s, _ in per_seed]))
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+    for c in sel:
+        stack = []
+        for steps, cols in per_seed:
+            row = np.full(grid.shape, np.nan)
+            if c in cols:
+                row[np.searchsorted(grid, steps)] = cols[c]
+            stack.append(row)
+        mean, sd, n = _nan_mean_sd(np.vstack(stack))
+        out[c] = {"steps": grid, "mean": mean, "sd": sd, "n": n}
+    return out
+
+
+def aggregate_per_layer(
+    run_root: Any,
+
+    *,
+    filename: str = "metrics_per_layer.csv",
+    layer_col: str = "layer",
+) -> Dict[int, Dict[str, Dict[str, Any]]]:
+    r"""Across-seed per-layer diagnostics from each seed's ``metrics_per_layer.csv``.
+    Returns ``{layer: {column: {mean, sd, n, values}}}`` with the ddof=1 SD across seeds.
+    """
+    root = _resolve_run_root(run_root)
+    acc: Dict[int, Dict[str, List[float]]] = {}
+    for run_dir in _seed_dirs(root):
+        f = run_dir / filename
+        if not f.exists():
+            continue
+        data = _read_csv_columns(f)
+        if layer_col not in data:
+            continue
+        for i, lay in enumerate(data[layer_col]):
+            if lay is None:
+                continue
+            L = int(lay)
+            row = acc.setdefault(L, {})
+            for c, vals in data.items():
+                if c == layer_col or vals[i] is None:
+                    continue
+                row.setdefault(c, []).append(vals[i])
+    out: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    for L, cols in acc.items():
+        out[L] = {}
+        for c, vals in cols.items():
+            s = _summarize(vals)
+            out[L][c] = {"mean": s["mean"], "sd": s["sd"], "n": s["n"], "values": vals}
+    return out
 
 
 def flag_noise_dominated(
@@ -92,38 +314,236 @@ def flag_noise_dominated(
 # CLICK-TO-RUN  -- edit, then `python multiseed_analysis.py`.
 # =============================================================================
 CONFIG: Dict[str, Any] = {
-    "run_root": "vfe3_runs",   # dir holding the per-seed run folders (train_vfe3 NUM_RUNS/SEEDS output)
-    "key":      "test_ppl",    # headline metric in summary.json (test_ppl | best_val_ppl | test_ce ...)
+    "run_root": "K=20_GL(10)",   # run folder (bare name resolves under vfe3_runs/) OR a path
+    "key":      "test_ppl",      # headline metric for the per-seed noise band
 }
+
+# Headline scalars to aggregate (searched in summary.json -> test_results.json -> research.json).
+# Dotted keys dig into nested research blocks.
+SCALAR_KEYS: List[str] = [
+    "test_ppl", "best_val_ppl", "test_ce", "test_bpc", "test_ce_no_estep", "estep_capacity_gain",
+    "wall_time_s", "ece", "overall_ce", "sigma_trace_cv", "sigma_ce_spearman",
+    "fd_gradient_worst_rel_error",
+    "freq_strata_ce.rare", "freq_strata_ce.mid", "freq_strata_ce.frequent",
+]
+
+# Per-step curves to draw an across-seed band for: (metrics.csv column, y-label, log-y?).
+CURVE_SPECS: List[tuple] = [
+    ("train_ce",           "train CE",               False),
+    ("val_ppl",            "val PPL",                 False),
+    ("free_energy_total",  "F (total)",               False),
+    ("self_coupling",      "self-coupling KL",        False),
+    ("belief_coupling",    "belief-coupling KL",      False),
+    ("attention_entropy",  "attention-entropy term",  False),
+    ("self_divergence",    "self-divergence",         False),
+    ("hyper_prior",        "hyper-prior KL",          False),
+    ("gamma_coupling",     "gamma (model) coupling",  False),
+    ("grad_norm",          "grad norm",               True),
+    ("holonomy_deviation", "holonomy deviation",      True),
+    ("gauge_trace_spread", "gauge trace spread",      False),
+    ("effective_rank",     "effective rank",          False),
+    ("attn_entropy",       "attn entropy",            False),
+    ("belief_cond_median", "belief cond (median)",    True),
+    ("fisher_trace_mean",  "Fisher trace (mean)",     False),
+    ("generalization_gap", "generalization gap",      False),
+]
+
+GRID_COLS: List[str] = [                                          # overview-grid subset
+    "train_ce", "val_ppl", "free_energy_total", "grad_norm", "holonomy_deviation",
+    "gauge_trace_spread", "effective_rank", "attn_entropy", "belief_cond_median",
+]
+_LOGY_COLS = {c for c, _, logy in CURVE_SPECS if logy}
+
+PER_LAYER_METRICS: List[str] = [                                  # per-layer bars to draw
+    "self_coupling", "belief_coupling", "attention_entropy", "effective_rank",
+    "holonomy_deviation", "gauge_trace_spread", "belief_cond_median",
+]
+
+CAVEAT = ("Per-run reseed shares the data-shuffle order across seeds, so every SD here is the "
+          "init+optimization spread only -- a LOWER BOUND on deployment variance "
+          "(companion fix: docs/experiments/2026-06-21-experiment-readiness.md S6).")
+
+
+def _slug(s: str) -> str:
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", s)
+
+
+def _fnum(x: Any, fmt: str = ".4f") -> str:
+    r"""Format a float for a table, or 'n/a' if None / non-finite."""
+    return format(x, fmt) if isinstance(x, (int, float)) and math.isfinite(x) else "n/a"
+
+
+def _json_clean(obj: Any) -> Any:
+    r"""Recursively make ``obj`` JSON-valid: numpy scalars/arrays -> python; non-finite floats -> None."""
+    if isinstance(obj, dict):
+        return {k: _json_clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_clean(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_json_clean(v) for v in obj.tolist()]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, (np.floating, float)):
+        f = float(obj)
+        return f if math.isfinite(f) else None
+    return obj
+
+
+def _final_finite(d: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    r"""Last-finite-step {step, mean, sd, n} of one aggregated curve (the converged value)."""
+    finite = np.where(np.isfinite(d["mean"]))[0]
+    if finite.size == 0:
+        return {"step": None, "mean": None, "sd": None, "n": 0}
+    i = int(finite[-1])
+    sd = float(d["sd"][i])
+    return {"step": float(d["steps"][i]), "mean": float(d["mean"][i]),
+            "sd": (sd if math.isfinite(sd) else None), "n": int(d["n"][i])}
+
+
+def _write_csv(path: Path, scalars: Dict[str, Any]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["metric", "n", "mean", "sd", "two_sd", "cv"])
+        for k, v in scalars.items():
+            row = [k, v["n"]]
+            for key in ("mean", "sd", "two_sd", "cv"):
+                x = v[key]
+                row.append("" if not (isinstance(x, (int, float)) and math.isfinite(x)) else x)
+            w.writerow(row)
+
+
+def _write_md(path: Path, root: Path, seeds, scalars, per_layer) -> None:
+    L: List[str] = [f"# Multi-seed digest: {root.name}", "",
+                    f"Across {len(seeds)} seeds: {seeds}.", "",
+                    "## Headline scalars (across-seed)", "",
+                    "| metric | n | mean | SD (ddof=1) | 2*SD | CV% |",
+                    "|---|---|---|---|---|---|"]
+    for k, v in scalars.items():
+        cvpct = 100 * v["cv"] if math.isfinite(v["cv"]) else float("nan")
+        L.append(f"| {k} | {v['n']} | {_fnum(v['mean'])} | {_fnum(v['sd'])} | "
+                 f"{_fnum(v['two_sd'])} | {_fnum(cvpct, '.3f')} |")
+    finite = {k: v for k, v in scalars.items() if math.isfinite(v["cv"])}
+    if finite:
+        most = min(finite.items(), key=lambda kv: kv[1]["cv"])
+        least = max(finite.items(), key=lambda kv: kv[1]["cv"])
+        L += ["", "## Key findings", ""]
+        if "test_ppl" in scalars:
+            t = scalars["test_ppl"]
+            vals = [round(x, 3) for x in t["values"]]
+            L.append(f"- test PPL = {_fnum(t['mean'], '.3f')} +/- {_fnum(t['sd'], '.3f')} "
+                     f"(2*SD = {_fnum(t['two_sd'], '.3f')}); per-seed {vals}.")
+        L.append(f"- Most seed-stable: `{most[0]}` (CV {100 * most[1]['cv']:.3f}%).")
+        L.append(f"- Least seed-stable: `{least[0]}` (CV {100 * least[1]['cv']:.3f}%).")
+    if per_layer:
+        L += ["", f"## Per-layer ({len(per_layer)} layer(s))", "",
+              "See `figures/per_layer__*.png` for across-seed per-layer bars."]
+    L += ["", "## Caveat", "", CAVEAT, "",
+          "## Figures", "",
+          "In `figures/`: per-metric `curve_band__*.png` + `curve_band_grid.png` (per-step bands), "
+          "`scalar_cv_summary.png` (seed stability), `per_layer__*.png`, and "
+          f"`noise_band__{_slug(CONFIG['key'])}.png`.", ""]
+    path.write_text("\n".join(L), encoding="utf-8")
+
+
+def _emit_figures(root: Path, scalars, curves, per_layer) -> None:
+    r"""Write the full figure set into ``root/figures``; each figure is best-effort (a plotting /
+    dependency error is logged and skipped), mirroring the rest of the figure suite."""
+    try:
+        from vfe3.viz import figures as figs
+    except Exception as exc:                                      # matplotlib optional / headless
+        print(f"  (figures skipped, plotting unavailable: {exc})")
+        return
+    figs.set_publication_style()
+    fig_dir = root / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    made = 0
+
+    def _try(make, out: Path) -> None:
+        nonlocal made
+        try:
+            figs.plt.close(make())
+            made += 1
+        except Exception as exc:                                  # one bad figure never aborts the rest
+            print(f"  (figure {out.name} skipped: {exc})")
+
+    key = CONFIG["key"]
+    if key in scalars:
+        out = fig_dir / f"noise_band__{_slug(key)}.png"
+        _try(lambda: figs.plot_ppl_noise_band(scalars[key], label=key, path=str(out)), out)
+
+    out = fig_dir / "scalar_cv_summary.png"
+    _try(lambda: figs.plot_scalar_cv_summary(scalars, path=str(out)), out)
+
+    for col, ylabel, logy in CURVE_SPECS:
+        d = curves.get(col)
+        if d is None or not np.any(np.isfinite(d["mean"])):
+            continue
+        out = fig_dir / f"curve_band__{_slug(col)}.png"
+        _try(lambda d=d, ylabel=ylabel, logy=logy, col=col, out=out:
+             figs.plot_curve_band(d["steps"], d["mean"], d["sd"], label=col, ylabel=ylabel,
+                                  n=d["n"], logy=logy, path=str(out)), out)
+
+    grid = [{"steps": curves[c]["steps"], "mean": curves[c]["mean"], "sd": curves[c]["sd"],
+             "title": c, "logy": c in _LOGY_COLS}
+            for c in GRID_COLS if c in curves and np.any(np.isfinite(curves[c]["mean"]))]
+    if grid:
+        out = fig_dir / "curve_band_grid.png"
+        _try(lambda: figs.plot_curve_band_grid(grid, path=str(out)), out)
+
+    for metric in PER_LAYER_METRICS:
+        if per_layer and any(metric in cols for cols in per_layer.values()):
+            out = fig_dir / f"per_layer__{_slug(metric)}.png"
+            _try(lambda metric=metric, out=out:
+                 figs.plot_per_layer_band(per_layer, metric, path=str(out)), out)
+
+    print(f"  figures -> {fig_dir}  ({made} written)")
 
 
 def main() -> None:
-    out = aggregate_seed_metric(CONFIG["run_root"], CONFIG["key"])
-    if out["n"] == 0:
-        print(f"no '{CONFIG['key']}' found under {CONFIG['run_root']!r} (looked for summary.json)")
+    root = _resolve_run_root(CONFIG["run_root"])
+    seed_dirs = _seed_dirs(root)
+    if not seed_dirs:
+        print(f"no per-seed run dirs under {str(root)!r} "
+              f"(looked for summary.json / provenance.json / config.json)")
         return
-    print(f"\nAcross-seed {CONFIG['key']} over {out['n']} run(s)  (seeds: {out['seeds']})")
-    print(f"  mean    = {out['mean']:.4f}")
-    print(f"  SD      = {out['sd']:.4f}  (ddof=1)")
-    print(f"  +/-1 SD = [{out['mean'] - out['sd']:.4f}, {out['mean'] + out['sd']:.4f}]")
-    print(f"  2*SD    = {out['two_sd']:.4f}")
-    print(f"  CV      = {out['cv']:.4f}  ({100 * out['cv']:.2f}% of mean)")
-    print("  NOTE: data order is shared across seeds (per-run reseed), so this SD is the "
-          "init+optimization spread only -- a LOWER BOUND on deployment variance.")
+    seeds = [_seed_for(d) for d in seed_dirs]
+    print(f"\n=== Multi-seed digest: {root}  ({len(seed_dirs)} seeds: {seeds}) ===\n")
 
-    # I1/EXP-1 noise-band figure: per-seed PPL + the mean +/- SD band, written under run_root/figures.
-    # Best-effort (matplotlib optional / headless), like every other figure pass in the suite.
-    try:
-        from vfe3.viz import figures as figs
-        figs.set_publication_style()
-        fig_dir = Path(CONFIG["run_root"]) / "figures"
-        fig_dir.mkdir(parents=True, exist_ok=True)
-        out_png = fig_dir / "ppl_noise_band.png"
-        fig = figs.plot_ppl_noise_band(out, label=str(CONFIG["key"]), path=str(out_png))
-        figs.plt.close(fig)
-        print(f"  figure -> {out_png}")
-    except Exception as exc:                                      # plotting is best-effort, never fatal
-        print(f"  (noise-band figure skipped: {exc})")
+    scalars: Dict[str, Any] = {}
+    print(f"{'metric':<28}{'n':>3}{'mean':>14}{'sd':>13}{'2sd':>12}{'cv%':>9}")
+    print("-" * 79)
+    for k in SCALAR_KEYS:
+        a = aggregate_scalar(root, k)
+        if a["n"] == 0:
+            continue
+        scalars[k] = a
+        cvpct = 100 * a["cv"] if math.isfinite(a["cv"]) else float("nan")
+        print(f"{k:<28}{a['n']:>3}{a['mean']:>14.4f}{_fnum(a['sd']):>13}"
+              f"{_fnum(a['two_sd']):>12}{_fnum(cvpct, '.3f'):>9}")
+    print(f"\nNOTE: {CAVEAT}\n")
+
+    curves = aggregate_seed_curves(root)
+    per_layer = aggregate_per_layer(root)
+
+    manifest = {
+        "run_root": str(root),
+        "n_seeds": len(seed_dirs),
+        "seeds": seeds,
+        "caveat": CAVEAT,
+        "scalars": scalars,
+        "curves_final_step": {c: _final_finite(d) for c, d in curves.items()},
+        "per_layer": {str(L): {c: {"mean": s["mean"], "sd": s["sd"], "n": s["n"]}
+                               for c, s in cols.items()}
+                      for L, cols in per_layer.items()},
+    }
+    (root / "multiseed_summary.json").write_text(
+        json.dumps(_json_clean(manifest), indent=2), encoding="utf-8")
+    _write_csv(root / "multiseed_summary.csv", scalars)
+    _write_md(root / "MULTISEED_ANALYSIS.md", root, seeds, scalars, per_layer)
+    for name in ("multiseed_summary.json", "multiseed_summary.csv", "MULTISEED_ANALYSIS.md"):
+        print(f"  data    -> {root / name}")
+
+    _emit_figures(root, scalars, curves, per_layer)
 
 
 if __name__ == "__main__":
