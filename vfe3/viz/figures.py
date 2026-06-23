@@ -2876,6 +2876,132 @@ def plot_ppl_noise_band(
     return _save(fig, path)
 
 
+def plot_curve_band(
+    steps: np.ndarray,                   # (S,) training-step grid
+    mean:  np.ndarray,                   # (S,) across-seed mean per step
+    sd:    np.ndarray,                   # (S,) across-seed SD (ddof=1; NaN where fewer than 2 seeds)
+
+    *,
+    label:  str  = "metric",
+    ylabel: str  = "value",
+    n:      Optional[np.ndarray] = None, # (S,) seed count per step (for the title)
+    logy:   bool = False,
+    path:   Optional[str] = None,
+):
+    r"""Across-seed mean +/-1 SD (and +/-2 SD) ribbon of one training curve over steps.
+
+    The band is the init+optimization spread (the per-run reseed shares the data order; a lower bound
+    on deployment variance). Steps where only one seed reported (NaN SD, e.g. the sparse ``val_*``
+    columns) draw the mean without a ribbon."""
+    steps = np.asarray(steps, float)
+    mean  = np.asarray(mean, float)
+    sd    = np.asarray(sd, float)
+    fig, ax = plt.subplots(figsize=(7.0, 4.2))
+    finite = np.isfinite(mean)
+    ax.plot(steps[finite], mean[finite], color=_CB[0], lw=1.6, label="mean")
+    band = finite & np.isfinite(sd)
+    if band.any():
+        ax.fill_between(steps[band], (mean - 2 * sd)[band], (mean + 2 * sd)[band],
+                        color=_CB[0], alpha=0.10, label="+/-2 SD")
+        ax.fill_between(steps[band], (mean - sd)[band], (mean + sd)[band],
+                        color=_CB[0], alpha=0.22, label="+/-1 SD")
+    if logy:
+        ax.set_yscale("log")
+    n_seeds = None
+    if n is not None and np.any(np.isfinite(n)):
+        n_seeds = int(np.nanmax(np.asarray(n, float)))
+    title = f"{label} (across seeds)" + (f", n={n_seeds}" if n_seeds else "")
+    ax.set(xlabel="training step", ylabel=ylabel, title=title)
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def plot_curve_band_grid(
+    curves,                              # list of {steps, mean, sd, title, logy?}
+
+    *,
+    ncols: int = 3,
+    path:  Optional[str] = None,
+):
+    r"""Multi-panel overview: one across-seed mean +/-1 SD ribbon per curve, shared step axis."""
+    curves = list(curves)
+    m = len(curves)
+    ncols = max(1, min(ncols, m)) if m else 1
+    nrows = int(np.ceil(m / ncols)) if m else 1
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 3.0 * nrows), squeeze=False)
+    for ax in axes.flat[m:]:
+        ax.axis("off")
+    for ax, c in zip(axes.flat, curves):
+        steps = np.asarray(c["steps"], float)
+        mean  = np.asarray(c["mean"], float)
+        sd    = np.asarray(c["sd"], float)
+        finite = np.isfinite(mean)
+        ax.plot(steps[finite], mean[finite], color=_CB[0], lw=1.4)
+        band = finite & np.isfinite(sd)
+        if band.any():
+            ax.fill_between(steps[band], (mean - sd)[band], (mean + sd)[band], color=_CB[0], alpha=0.22)
+        if c.get("logy"):
+            ax.set_yscale("log")
+        ax.set_title(c.get("title", ""), fontsize=9)
+        ax.tick_params(labelsize=7)
+    fig.supxlabel("training step", fontsize=9)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def plot_scalar_cv_summary(
+    aggs,                                # {name: {mean, sd, cv, values}}
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""Per-scalar across-seed coefficient of variation (SD / |mean|, %) as a sorted horizontal bar,
+    with each seed's absolute normalized deviation (|value/mean - 1|) overlaid -- the seed-stability
+    ranking a referee reads to know which headline numbers are robust and which ride seed noise."""
+    items = [(k, v) for k, v in aggs.items()
+             if v.get("cv") is not None and np.isfinite(float(v.get("cv", np.nan)))]
+    items.sort(key=lambda kv: kv[1]["cv"])
+    names = [k for k, _ in items]
+    cvs   = [100.0 * float(v["cv"]) for _, v in items]
+    fig, ax = plt.subplots(figsize=(7.4, max(2.4, 0.45 * len(names) + 1.0)))
+    ys = np.arange(len(names))
+    ax.barh(ys, cvs, color=_CB[5], alpha=0.7, zorder=2, label="across-seed CV")
+    for y, (_, v) in zip(ys, items):
+        mean = float(v.get("mean", np.nan))
+        if np.isfinite(mean) and mean != 0.0:
+            dev = [abs(100.0 * (float(val) / mean - 1.0)) for val in v.get("values", [])]
+            ax.scatter(dev, [y] * len(dev), color=_CB[1], s=14, zorder=3)
+    ax.set_yticks(ys)
+    ax.set_yticklabels(names, fontsize=8)
+    ax.set(xlabel="across-seed CV (% of mean); dots = |per-seed deviation|",
+           title="Seed stability of headline scalars")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def plot_per_layer_band(
+    per_layer,                           # {layer: {metric: {mean, sd, n, values}}}
+    metric: str,
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""Across-seed per-layer bars (mean) with +/-1 SD error bars for one ``metric``."""
+    layers = sorted(per_layer.keys())
+    means = [float(per_layer[l].get(metric, {}).get("mean", np.nan)) for l in layers]
+    sds   = [float(per_layer[l].get(metric, {}).get("sd", np.nan)) for l in layers]
+    sds   = [0.0 if not np.isfinite(s) else s for s in sds]
+    fig, ax = plt.subplots(figsize=(max(4.0, 1.1 * len(layers) + 2.0), 4.0))
+    xs = np.arange(len(layers))
+    ax.bar(xs, means, yerr=sds, capsize=4, color=_CB[2], alpha=0.85)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([f"layer {l}" for l in layers])
+    ax.set(ylabel=metric, title=f"{metric} per layer (across seeds, +/-1 SD)")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
 def _as_f(v) -> float:
     try:
         return float(v)
