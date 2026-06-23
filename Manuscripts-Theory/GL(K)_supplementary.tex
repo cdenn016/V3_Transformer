@@ -36,7 +36,6 @@
   \addr Independent Researcher\\
   \addr Leander, Texas 78641, USA}
 
-% \editor{TBD}
 
 \maketitle
 
@@ -1020,7 +1019,6 @@ We construct a synthetic gauge VFE system with initial couplings $g_1 = 0.3$, $g
 \centering
 \caption{RG flow of gauge couplings under binary spectral coarse-graining ($K = 90$, $N = 128$). The level-6 ($N = 2$) holonomy entry $g_3 = 0.000$ is a degenerate artifact, since a 3-cycle requires three distinct clusters; it is excluded from the $y_3$ exponent fit. The $g_1^{(\mathrm{tot})}$ column and the fitted scaling exponents ($y_1^{(\mathrm{tot})}, y_2, y_3$) are provisional, pending re-extraction from the finalized coarse-graining data: $g_1^{(\mathrm{tot})}$ should equal $g_1^{(\mathrm{orig})} + g_1^{(\mathrm{emer})}$ by definition (a relation the printed entries do not yet satisfy), and the exact level window will be stated for each exponent on re-extraction.}
 \label{tab:rg_flow_supp}
-% TODO(review 2026-06-01, DATA-PENDING): the g1_tot column violates its own defining identity g1_tot = g1_orig + g1_emer (stated at SUP eq near line 935 and ATT:2295). Row-by-row, g1_orig+g1_emer = 0.300, 2.471, 1.214, 0.798, 1.442, 1.194, 0.674 vs the printed g1_tot 0.300, 42.47, 35.29, 33.15, 47.29, 46.64, 34.74 (a non-constant 17-52x discrepancy, so not a single units typo). Re-extract or recompute the g1_tot column from its definition against the finalized data and verify the additive identity at every level before resubmission; state the norm convention in the caption if g1_tot is measured by a different norm than its components. The qualitative claim (g1_tot does not decay) is independent of the column's absolute scale. ALSO (pass 8, DATA-PENDING): the printed graph-based exponents use inconsistent fit windows: y2=-0.66 matches the full levels 0-6 window, while y3=+0.17 reproduces only from levels 1-5, yet the caption states the y3 fit uses levels 0-5 (which gives ~+0.6 to +0.8 from the printed g3 column). State the exact level window per exponent and make the y2/y3 windows consistent when re-extracting from the finalized CSV.
 \begin{tabular}{rrccccc}
 \toprule
 \textbf{Level} & $N_\ell$ & $g_1^{(\mathrm{tot})}$ & $g_1^{(\mathrm{orig})}$ & $g_1^{(\mathrm{emer})}$ & $g_2$ & $g_3$ \\
@@ -1106,7 +1104,7 @@ These three conditions, each individually nonrestrictive, are jointly restrictiv
 
 Within the convex $f$-divergence class made precise below, the forward KL divergence $D_{\mathrm{KL}}(q_i \| \Omega_{ij} q_j)$ is the only $f$-divergence that yields a closed-form Gibbs-type solution for the belief update and a consistent dual interpretation for the attention weights. Agents locally minimize their agent-specific variational free energy and the system of agents minimize their collective global free energies. This local-global coordination gives rise to the expected forward KL attention term.
 
-In what follows we restrict to our ``matched-fiber'' framework, where all agents share the same fiber dimension $K$ and representation $\rho$, so that gauge transport acts within a single vector space. The full generalization follows by applying the appropriate bundle morphisms/intertwiners.
+In what follows we restrict to our ``matched-fiber'' framework, where all agents share the same fiber dimension $K$ and representation $\rho$, so that gauge transport acts within a single vector space. The full generalization follows by applying the appropriate bundle morphisms/intertwiners. Throughout this appendix $\Omega_{ij} q_j$ denotes the push-forward density $[(\Omega_{ij})_* q_j]$, that is, the density of the Gaussian transported by $\Omega_{ij} \in \mathrm{GL}(K)$ with its change-of-variables Jacobian already included, as defined in Appendix~\ref{app:covariance_dynamics} (the rule $\Omega_{ij} q_j = \mathcal{N}(\Omega_{ij}\mu_j, \Omega_{ij}\Sigma_j\Omega_{ij}^\top)$). Accordingly the local form $\Omega_{ij}(c) q_j(c)$ is shorthand for that push-forward density evaluated at $c$, not the pointwise product of the matrix $\Omega_{ij}(c)$ with the scalar $q_j(c)$.
 
 The uniqueness of the term is conditional and follows from the theorem's hypotheses: $\mathcal{D}$ is a convex $f$-divergence with real-analytic generator $f$ satisfying $f(1) = 0$ and, without loss of generality, $f'(1) = 0$, of the local form $\displaystyle \int \Omega_{ij}(c) q_j(c) f \left(\frac{q_i(c)}{\Omega_{ij}(c) q_j(c)}\right) dc$; the coupling is linear in $\beta_{ij}$; and $\sum_j \beta_{ij} = 1$. Exponential-family closure of the resulting $q_i^*$ plays two roles and is not an independent hypothesis: it is a \emph{consequence} of the theorem in the sufficiency direction (Step 2 of the proof produces the log-linear form automatically once $f'(t) = \log t$), and the \emph{selection criterion} in the necessity direction (Step 3), where requiring closure across the realizable ratios singles out $f'(t) = \log t$.
 
