@@ -2835,6 +2835,66 @@ def plot_kmup_stability(
     return _save(fig, path)
 
 
+# =============================================================================
+# Multi-seed digest: publication labels.
+# Raw metrics.csv column / research scalar key -> publication-quality (mathtext) display label
+# used for the across-seed digest figures (titles, axes, bar ticks). One source of truth so the
+# helpers below render manuscript notation -- KL(q_i||p_i), sum_ij beta_ij KL(q_i||Omega_ij q_j),
+# KL(s_i||h), ... -- instead of the raw column names (gamma_coupling, ...). Math is $...$ mathtext;
+# pub_label() falls back to a humanized name for any key not listed. Notation matches the canonical
+# free energy: q_i belief, p_i prior, s_i model, r model-fiber prior centroid, Omega_ij transport,
+# beta_ij/gamma_ij belief/model attention, pi_ij prior attention, tau softmax temperature,
+# alpha self-coupling weight, Sigma belief covariance (Sigma^{-1} precision / mean-block Fisher).
+PUB_LABELS: Dict[str, str] = {
+    # -- belief-channel free-energy blocks (raw per-token block energies) --
+    "self_coupling":      r"$\sum_i \alpha_i\,\mathrm{KL}(q_i\|p_i)$",
+    "self_divergence":    r"$\sum_i \mathrm{KL}(q_i\|p_i)$",
+    "belief_coupling":    r"$\sum_{ij}\beta_{ij}\,\mathrm{KL}(q_i\|\Omega_{ij}q_j)$",
+    "attention_entropy":  r"$\tau\sum_{ij}\beta_{ij}\log(\beta_{ij}/\pi_{ij})$",
+    "free_energy_total":  r"free energy $F$ (nats/token)",
+    # -- model-channel (s) free-energy blocks (r = model-fiber prior centroid; manuscript symbol) --
+    "hyper_prior":        r"$\mathrm{KL}(s_i\|r)$",
+    "hyper_prior_weighted": r"$\lambda_h\,\mathrm{KL}(s_i\|r)$",
+    "gamma_coupling":     r"$\sum_{ij}\gamma_{ij}\,\mathrm{KL}(s_i\|\Omega_{ij}s_j)$",
+    "gamma_meta_entropy": r"$\tau_g\sum_{ij}\gamma_{ij}\log(\gamma_{ij}/\pi^{s}_{ij})$",
+    # -- attention / gauge / belief-geometry diagnostics --
+    "attn_entropy":       r"attention row entropy $H(\beta)=-\sum_j\beta_{ij}\log\beta_{ij}$",
+    "effective_rank":     r"belief effective rank $\mathrm{erank}(\Sigma)$",
+    "holonomy_deviation": r"holonomy $\langle\|H-I\|_F\rangle$",
+    "gauge_trace_spread": r"gauge spread $\mathrm{std}_i\,\log|\det\Omega_i|$",
+    "belief_cond_median": r"belief conditioning $\mathrm{med}_i\,\kappa(\Sigma_i)$",
+    "fisher_trace_mean":  r"belief precision $\langle\mathrm{tr}\,\Sigma^{-1}\rangle/2$",
+    "grad_norm":          r"gradient norm $\|\nabla\|_2$",
+    # -- losses / headline scalars --
+    "train_ce":           "train cross-entropy (nats)",
+    "val_ppl":            "validation perplexity",
+    "generalization_gap": r"generalization gap $\mathrm{CE}_{\mathrm{val}}-\mathrm{CE}_{\mathrm{train}}$ (nats)",
+    "test_ppl":           "test perplexity",
+    "best_val_ppl":       "best validation perplexity",
+    "test_ce":            "test cross-entropy (nats)",
+    "test_bpc":           "test bits per character",
+    "test_ce_no_estep":   "test CE without E-step (nats)",
+    "estep_capacity_gain": "E-step capacity gain (nats)",
+    "wall_time_s":        "wall-clock time (s)",
+    "ece":                "expected calibration error",
+    "overall_ce":         "overall cross-entropy (nats)",
+    "sigma_trace_cv":     r"$\mathrm{CV}_i[\mathrm{tr}\,\Sigma_i]$",
+    "sigma_ce_spearman":  r"$\rho_s(\mathrm{tr}\,\Sigma,\ \mathrm{CE})$",
+    "fd_gradient_worst_rel_error": "finite-diff worst rel. error",
+    "freq_strata_ce.rare":     r"$\mathrm{CE}_{\mathrm{rare}}$ (nats)",
+    "freq_strata_ce.mid":      r"$\mathrm{CE}_{\mathrm{mid}}$ (nats)",
+    "freq_strata_ce.frequent": r"$\mathrm{CE}_{\mathrm{frequent}}$ (nats)",
+}
+
+
+def pub_label(name: str) -> str:
+    r"""Publication-quality (mathtext) display label for a raw metric / column / scalar key.
+
+    Returns the :data:`PUB_LABELS` entry, else a humanized fallback (underscores and dots -> spaces)
+    so an unlisted column still renders a readable -- if non-mathematical -- axis."""
+    return PUB_LABELS.get(name) or name.replace("_", " ").replace(".", " ")
+
+
 @register_figure("ppl_noise_band")
 def plot_ppl_noise_band(
     agg,                                 # aggregate_seed_metric output: {values, seeds, mean, sd}
@@ -2852,6 +2912,7 @@ def plot_ppl_noise_band(
     read directly whether a cell's margin exceeds the band."""
     vals = np.asarray(agg.get("values", []), float)
     mean, sd = float(agg.get("mean", float("nan"))), float(agg.get("sd", float("nan")))
+    disp = pub_label(label)
     fig, ax = plt.subplots(figsize=(7.0, 4.4))
     if np.isfinite(mean):
         ax.axhline(mean, color=_CB[0], lw=1.6, label=f"mean={mean:.3f}")
@@ -2860,7 +2921,7 @@ def plot_ppl_noise_band(
             ax.axhspan(mean - sd, mean + sd, color=_CB[0], alpha=0.18, label="±1 SD")
     seeds = agg.get("seeds", list(range(vals.size))) or list(range(vals.size))
     xs = np.arange(vals.size)
-    ax.scatter(xs, vals, color=_CB[1], zorder=3, label="per-seed test PPL")
+    ax.scatter(xs, vals, color=_CB[1], zorder=3, label="per-seed value")
     ticks, ticklabels = list(xs), [str(s) for s in seeds[:vals.size]]
     if grid:
         gl = list(grid.items())
@@ -2869,8 +2930,8 @@ def plot_ppl_noise_band(
         ticks += list(gx); ticklabels += [str(k) for k, _ in gl]
     ax.set_xticks(ticks)
     ax.set_xticklabels(ticklabels, rotation=45, ha="right", fontsize=7)
-    ax.set(xlabel="seed / cell", ylabel="test PPL")
-    ax.set_title(f"Multi-seed variance floor ({label})")
+    ax.set(xlabel="seed / cell", ylabel=disp)
+    ax.set_title("Multi-seed variance floor (init + optimization spread)")
     ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
@@ -2883,7 +2944,7 @@ def plot_curve_band(
 
     *,
     label:  str  = "metric",
-    ylabel: str  = "value",
+    ylabel: Optional[str] = None,        # y-axis; default -> pub_label(label) (publication math)
     n:      Optional[np.ndarray] = None, # (S,) seed count per step (for the title)
     logy:   bool = False,
     path:   Optional[str] = None,
@@ -2902,16 +2963,17 @@ def plot_curve_band(
     band = finite & np.isfinite(sd)
     if band.any():
         ax.fill_between(steps[band], (mean - 2 * sd)[band], (mean + 2 * sd)[band],
-                        color=_CB[0], alpha=0.10, label="+/-2 SD")
+                        color=_CB[0], alpha=0.10, label="$\\pm 2$ SD")
         ax.fill_between(steps[band], (mean - sd)[band], (mean + sd)[band],
-                        color=_CB[0], alpha=0.22, label="+/-1 SD")
+                        color=_CB[0], alpha=0.22, label="$\\pm 1$ SD")
     if logy:
         ax.set_yscale("log")
     n_seeds = None
     if n is not None and np.any(np.isfinite(n)):
         n_seeds = int(np.nanmax(np.asarray(n, float)))
-    title = f"{label} (across seeds)" + (f", n={n_seeds}" if n_seeds else "")
-    ax.set(xlabel="training step", ylabel=ylabel, title=title)
+    ylab  = ylabel if ylabel is not None else pub_label(label)
+    title = "across-seed mean $\\pm 1$ SD" + (f" ($n={n_seeds}$)" if n_seeds else "")
+    ax.set(xlabel="training step", ylabel=ylab, title=title)
     ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
@@ -2943,7 +3005,7 @@ def plot_curve_band_grid(
             ax.fill_between(steps[band], (mean - sd)[band], (mean + sd)[band], color=_CB[0], alpha=0.22)
         if c.get("logy"):
             ax.set_yscale("log")
-        ax.set_title(c.get("title", ""), fontsize=9)
+        ax.set_title(pub_label(c.get("title", "")), fontsize=9)
         ax.tick_params(labelsize=7)
     fig.supxlabel("training step", fontsize=9)
     fig.tight_layout()
@@ -2973,7 +3035,7 @@ def plot_scalar_cv_summary(
             dev = [abs(100.0 * (float(val) / mean - 1.0)) for val in v.get("values", [])]
             ax.scatter(dev, [y] * len(dev), color=_CB[1], s=14, zorder=3)
     ax.set_yticks(ys)
-    ax.set_yticklabels(names, fontsize=8)
+    ax.set_yticklabels([pub_label(n) for n in names], fontsize=8)
     ax.set(xlabel="across-seed CV (% of mean); dots = |per-seed deviation|",
            title="Seed stability of headline scalars")
     fig.tight_layout()
@@ -2997,7 +3059,7 @@ def plot_per_layer_band(
     ax.bar(xs, means, yerr=sds, capsize=4, color=_CB[2], alpha=0.85)
     ax.set_xticks(xs)
     ax.set_xticklabels([f"layer {l}" for l in layers])
-    ax.set(ylabel=metric, title=f"{metric} per layer (across seeds, +/-1 SD)")
+    ax.set(ylabel=pub_label(metric), title="per-layer mean across seeds ($\\pm 1$ SD)")
     fig.tight_layout()
     return _save(fig, path)
 
