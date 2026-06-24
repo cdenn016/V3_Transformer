@@ -432,6 +432,21 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # _cell_diagnostics). They are registered but kept OUT of SWEEP_ORDER so the default run is
     # unchanged; select one with CONFIG["sweep"] = "gauge_transport" (etc.).
 
+    "multiseed_floor": {  # I1 / EXP-1: the discipline gate -- across-seed variance floor on the baseline.
+        # One arm = the production operating point (no overrides), replicated across 5 seeds. The across-
+        # seed mean/SD of primary_val_ppl is the noise band every single-seed ablation "win" must clear.
+        # The runner reseeds the data order per cell to a FIXED stream, so this SD is init+optimization
+        # only -- a LOWER bound on deployment variance. Read the band off sweep_results.csv: the 5 rows
+        # share the base label 'baseline' (run dirs baseline__s6 ... baseline__s17), differing in the
+        # seed column; mean/SD over them is the floor (or use multiseed_analysis.py for the figure).
+        "description": "across-seed variance floor on the baseline operating point [I1/EXP-1]",
+        "collect_diagnostics": True,
+        "seeds": [6, 64, 23, 3, 17],
+        "configs": [
+            {"label": "baseline"},
+        ],
+    },
+
     "gauge_transport": {  # A1 / EXP-2: the program's central causal claim -- gauge ON vs OFF vs frozen-random.
         # 'off' coerces the frame to identity (phi_scale=0, e/m_phi_lr=0, pos_phi='none' -> Omega=I);
         # 'frozen' keeps a nonzero random frame with the LRs zeroed; 'on' is the learned baseline.
@@ -439,6 +454,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # (matched param count). The depth arm L in {1,2} is folded in (rank collapse cannot show at L=1).
         "description": "GL(K) gauge transport on/off(Omega=I)/frozen-random, at L in {1,2} [A1/EXP-2]",
         "collect_diagnostics": True,
+        "seeds": [6, 64, 23],                                # I1: across-seed error bar on the headline result
         "configs": [
             {"label": "on_L1",     "gauge_transport": "on",     "use_head_mixer": False, "n_layers": 1},
             {"label": "off_L1",    "gauge_transport": "off",    "use_head_mixer": False, "n_layers": 1},
@@ -461,6 +477,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # entropy term; __post_init__ does not auto-enable the oracle for entropy=False).
         "description": "attention-entropy canonical vs surrogate, kappa in {1.0, 0.25}, on the oracle [C1/EXP-4]",
         "collect_diagnostics": True,
+        "seeds": [6, 64, 23],                                # I1: across-seed error bar (esp. the low-kappa gap)
         "configs": [
             {"label": "canon_k1.0",  "include_attention_entropy": True,  "oracle_unroll_grad": True, "kappa_beta": 1.0},
             {"label": "surr_k1.0",   "include_attention_entropy": False, "oracle_unroll_grad": True, "kappa_beta": 1.0},
@@ -499,6 +516,18 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "tied_block_glk",   "gauge_group": "tied_block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
              "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False},
+            # PARAM-MATCHED CONTROL: the untied arm carries +55.6% params (14.10M vs 9.06M tied) because
+            # the per-head gauge gives the head mixer a larger Schur commutant, so the raw tied-vs-untied
+            # PPL gap is only an UPPER BOUND on the equivariance tax. This arm widens the exact-equivariant
+            # tied model to embed_dim=28 (measured 15.50M params, +10% OVER untied -- a conservative match:
+            # tied is handed MORE capacity), with kl_max=8*28=224 to keep the per-K convention. CAVEAT: the
+            # match is bought with a larger belief width K=28 (vs 20), so this trades the param confound for
+            # a width difference on this arm only; if tied_wide STILL loses to untied, capacity is not the
+            # explanation and the equivariance tax is real.
+            {"label": "tied_block_glk_wide", "gauge_group": "tied_block_glk", "use_head_mixer": True,
+             "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
+             "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False,
+             "embed_dim": 28, "kl_max": 224},
         ],
     },
 
@@ -572,6 +601,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # already whitens by 1/sigma, so a 'raw' sigma step needs a different retraction, not this knob).
         "description": "E-step mean preconditioner: Fisher nat-grad vs raw Euclidean x n_e_steps [B3/EXP-14]",
         "requires": {"e_phi_lr": 0.0},
+        "seeds": [6, 64, 23],                                # I1: reseed to test raw_T5 divergence is generic
         "configs": [
             {"label": f"{p}_T{t}", "e_step_mu_precond": p, "n_e_steps": t}
             for p in ("fisher", "raw") for t in (1, 3, 5)
@@ -1028,8 +1058,10 @@ SWEEP_ORDER: List[str] = [
  # "fisher_mu_precond",
   
  # "n_e_steps_em",
-  "gauge_mstep_optim",
-  "m_phi_lr_natgrad",
+ # "gauge_mstep_optim",
+  
+ #"m_phi_lr_natgrad",   havent run 
+ 
   "pos_extrapolation",
   "rho_handoff",
   
@@ -1185,7 +1217,8 @@ def _sweep_values(sweep: Dict[str, Any]) -> List[Any]:
 
 
 def sweep_n_runs(sweep: Dict[str, Any]) -> int:
-    return len(sweep["configs"]) if "configs" in sweep else len(_sweep_values(sweep))
+    n_cells = len(sweep["configs"]) if "configs" in sweep else len(_sweep_values(sweep))
+    return n_cells * len(sweep.get("seeds") or [None])         # x seeds when the sweep is multi-seeded
 
 
 def make_run_overrides(sweep_name: str) -> List[Tuple[str, Dict[str, Any]]]:
@@ -1608,34 +1641,45 @@ def run_sweep(
     sweep_dir = output_dir / sweep_name
     sweep_dir.mkdir(parents=True, exist_ok=True)
     runs = make_run_overrides(sweep_name)
+    # Multi-seed (I1/EXP-1): a sweep may declare ``seeds`` to replicate every cell across seeds for an
+    # across-seed error bar. Each (cell, seed) gets its own ``{label}__s{seed}`` run dir and result row
+    # (the seed also lives in the existing ``seed`` column), so the across-seed aggregate is a plain
+    # group-by on the base label. A sweep WITHOUT ``seeds`` keeps the single-seed label/run-dir exactly,
+    # so every existing sweep is byte-identical.
+    cell_seeds = [int(s) for s in sweep.get("seeds", [])] or [int(seed)]
+    multiseed = bool(sweep.get("seeds"))
+    cells = [((f"{label}__s{s}" if multiseed else label), overrides, s)
+             for (label, overrides) in runs for s in cell_seeds]
 
-    print(f"\n{'=' * 70}\nSWEEP: {sweep_name} ({len(runs)} runs)\n  {sweep['description']}"
+    print(f"\n{'=' * 70}\nSWEEP: {sweep_name} ({len(cells)} runs"
+          f"{f' = {len(runs)} cells x {len(cell_seeds)} seeds' if multiseed else ''})"
+          f"\n  {sweep['description']}"
           f"\n  Output: {sweep_dir}{'  [resume ON]' if resume else ''}\n{'=' * 70}")
 
     results: List[Dict[str, Any]] = []
-    for i, (label, overrides) in enumerate(runs):
+    for i, (label, overrides, cell_seed) in enumerate(cells):
         run_dir = sweep_dir / _sanitize(label)
         run_dir.mkdir(parents=True, exist_ok=True)
         marker = run_dir / "ablation_result.json"
 
         if resume and marker.exists():
-            if _cell_is_current(run_dir, overrides, seed=seed, max_steps=max_steps, dataset=dataset):
-                print(f"\n--- {i + 1}/{len(runs)}: {label}  [CACHED] ---")
+            if _cell_is_current(run_dir, overrides, seed=cell_seed, max_steps=max_steps, dataset=dataset):
+                print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
                 results.append(json.loads(marker.read_text(encoding="utf-8")))
                 continue
-            print(f"\n--- {i + 1}/{len(runs)}: {label}  [config changed -> re-running] ---")
+            print(f"\n--- {i + 1}/{len(cells)}: {label}  [config changed -> re-running] ---")
         else:
-            print(f"\n--- {i + 1}/{len(runs)}: {label} ---")
+            print(f"\n--- {i + 1}/{len(cells)}: {label} ---")
         t0 = time.perf_counter()
         try:
             result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
-                                 seed=seed, collect_diagnostics=sweep.get("collect_diagnostics", False),
+                                 seed=cell_seed, collect_diagnostics=sweep.get("collect_diagnostics", False),
                                  collect_extrapolation=sweep.get("collect_extrapolation", False),
                                  max_tokens=max_tokens, max_steps=max_steps)
         except Exception as exc:                             # a training crash must not kill the sweep
             logger.exception("sweep %s / %s crashed", sweep_name, label)
             result = {"label": label, "error_kind": "train", "error": str(exc),
-                      "primary_val_ppl": float("inf"), "seed": int(seed),
+                      "primary_val_ppl": float("inf"), "seed": int(cell_seed),
                       "overrides": _jsonable(overrides)}
         finally:
             _cleanup()
@@ -1648,9 +1692,9 @@ def run_sweep(
         ppl = result["primary_val_ppl"]
         tag = f" [{result['error_kind'].upper()}]" if result.get("error_kind") else ""
         print(f"\n\n  -> val PPL {ppl:.3f}{tag}  ({result['wall_time_s']:.0f}s)\n")
-        if i == 0 and len(runs) > 1:
-            est = result["wall_time_s"] * len(runs)
-            print(f"  ** ~{est / 60:.0f} min estimated for the full {len(runs)}-run sweep")
+        if i == 0 and len(cells) > 1:
+            est = result["wall_time_s"] * len(cells)
+            print(f"  ** ~{est / 60:.0f} min estimated for the full {len(cells)}-run sweep")
 
         # Keep the CSV whole AND accumulated after each cell: write the union of every persisted
         # marker (this cell, the rest of this run, and any prior run's cells) so the tacked-on
@@ -1660,9 +1704,9 @@ def run_sweep(
     (sweep_dir / "sweep_meta.json").write_text(json.dumps({
         "sweep_name":  sweep_name,
         "description": sweep["description"],
-        "n_runs":      len(runs),
+        "n_runs":      len(cells),
         "dataset":     dataset,
-        "seed":        seed,
+        "seed":        (cell_seeds if multiseed else seed),
         "timestamp":   time.strftime("%Y-%m-%d %H:%M:%S"),
     }, indent=2), encoding="utf-8")
 
