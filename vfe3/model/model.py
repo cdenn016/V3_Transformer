@@ -1223,17 +1223,21 @@ class VFEModel(nn.Module):
     def _fold_precision_bias(
         self,
         log_prior: Optional[torch.Tensor],   # (N,N)/(H,N,N) position prior (batched or not), or None
-        sigma:     torch.Tensor,             # (..., N, K) key belief variances (batched or unbatched)
+        sigma:     torch.Tensor,             # (..., N, K) diag, or (..., N, K, K) full, key belief cov
     ) -> Optional[torch.Tensor]:
         r"""Fold the detached precision-weighted-attention reliability bias ``-log(b0 + tr Sigma_j)``
         into ``log_prior``, broadcasting over query (and head). Shared by ``forward`` and the
         diagnostic replays (``diagnostics``/``attention_maps``) so every belief-channel consumer scores
         the SAME attention prior the forward E-step descends (audit 2026-06-17 r2 id22). No-op (returns
         ``log_prior`` unchanged) when ``precision_weighted_attention`` is off. Rank-robust: ``sigma``
-        may be ``(B, N, K)`` (forward) or ``(N, K)`` (diagnostics)."""
+        may be ``(B, N, K)`` (forward) or ``(N, K)`` (diagnostics), and under ``family='gaussian_full'``
+        the full covariance ``(.., N, K, K)`` -- reduced to its per-coordinate variances (the diagonal)
+        so ``tr Sigma_j`` is the matrix trace, not a sum over a covariance row."""
         if not self.cfg.precision_weighted_attention:
             return log_prior
         b0 = self.cfg.precision_attention_b0
+        if not self.cfg.diagonal_covariance:               # full cov (.., N, K, K) -> diagonal variances
+            sigma = sigma.diagonal(dim1=-2, dim2=-1)        # (.., N, K): tr is the diagonal sum below
         if len(self.group.irrep_dims) == 1:                # headless (.., N, N) energy: NO head axis
             kb = _precision_key_bias(sigma, b0=b0).detach()                       # (.., N)
             kb = kb.unsqueeze(-2)                                                 # (.., 1, N)
