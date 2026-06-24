@@ -264,3 +264,81 @@ def test_precision_weighted_attention_single_block_changes_forward_when_sigma_va
     _, l_on, _ = m_on(tokens, targets)
     _, l_off, _ = m_off(tokens, targets)
     assert not torch.allclose(l_on, l_off, atol=1e-4)
+
+
+# ============================ feature 2d: full-covariance family (sigma is (.., N, K, K))
+# family='gaussian_full' carries the belief covariance as (.., N, K, K), not the diagonal
+# (.., N, K). The per-key reliability is the TRACE tr Sigma_j (= sum of the diagonal variances),
+# so the bias must reduce the covariance to its diagonal first; the old sigma.sum(-1) summed a
+# covariance ROW, leaving a spurious K axis that broadcast-crashed the log_prior fold. This is the
+# gauge_equivariance / cg_coupling sweep crash (full cov + block_glk + pwa, 2026-06-23).
+
+def _fullcov_model(seed: int = 0, **over) -> VFEModel:
+    # Mirrors the gauge_equivariance sweep arm: full covariance + multi-block block_glk + head
+    # mixer + the KL-to-prior full-chunked decode, with precision-weighted attention ON. Tiny.
+    cfg = VFE3Config(vocab_size=20, embed_dim=8, n_heads=2, gauge_group="block_glk",
+                     max_seq_len=5, n_layers=1, n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0,
+                     mass_phi=0.0, mstep_self_coupling_weight=0.0,
+                     family="gaussian_full", use_head_mixer=True, use_prior_bank=True,
+                     decode_mode="full_chunked", phi_precond_mode="killing", s_e_step=False,
+                     precision_weighted_attention=True, precision_attention_b0=2.0,
+                     seed=seed, **over)
+    torch.manual_seed(seed)
+    return VFEModel(cfg)
+
+
+def test_precision_weighted_attention_full_cov_forward_runs():
+    # Regression: the multi-block (head-axis) global-bias branch must run with a full covariance.
+    m = _fullcov_model(seed=0)
+    assert len(m.group.irrep_dims) > 1                        # genuinely multi-block (crash branch)
+    assert m.cfg.diagonal_covariance is False                 # full cov: sigma is (.., N, K, K)
+    with torch.no_grad():
+        m.prior_bank.sigma_log_embed.copy_(torch.randn_like(m.prior_bank.sigma_log_embed))
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, loss, _ = m(tokens, targets)
+    assert torch.isfinite(loss).all()
+
+
+def test_precision_attention_per_head_full_cov_forward_runs():
+    # Regression: the per-head branch must also run with a full covariance.
+    m = _fullcov_model(seed=0, precision_attention_per_head=True)
+    with torch.no_grad():
+        m.prior_bank.sigma_log_embed.copy_(torch.randn_like(m.prior_bank.sigma_log_embed))
+    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
+    _, loss, _ = m(tokens, targets)
+    assert torch.isfinite(loss).all()
+
+
+def test_precision_bias_full_cov_uses_matrix_trace():
+    # The full-cov global bias must equal -log(b0 + tr Sigma_j): the TRACE (sum of diagonal
+    # variances), invariant to off-diagonal covariance, with NO spurious K axis.
+    m = _fullcov_model(seed=0)
+    k = m.cfg.embed_dim
+    torch.manual_seed(1)
+    diag = torch.rand(2, 4, k) + 0.5                                       # (.., N, K) variances
+    off  = 0.3 * torch.randn(2, 4, k, k)
+    off  = off + off.transpose(-1, -2)                                     # symmetric ...
+    off  = off - torch.diag_embed(off.diagonal(dim1=-2, dim2=-1))          # ... with zero diagonal
+    full = torch.diag_embed(diag) + off                                    # diagonal == diag exactly
+    b_full = m._fold_precision_bias(None, full)                            # (.., 1, 1, N)
+    expect = (-torch.log(2.0 + diag.sum(-1))).unsqueeze(-2).unsqueeze(-2)  # trace, then query/head-broadcast
+    assert b_full.shape == expect.shape
+    assert torch.allclose(b_full, expect, atol=1e-6)
+
+
+def test_precision_bias_per_head_full_cov_uses_block_trace():
+    # The full-cov per-head bias must use each block's diagonal trace, shape (.., H, 1, N).
+    m = _fullcov_model(seed=0, precision_attention_per_head=True)
+    k = m.cfg.embed_dim
+    torch.manual_seed(2)
+    diag = torch.rand(2, 4, k) + 0.5
+    off  = 0.3 * torch.randn(2, 4, k, k)
+    off  = off + off.transpose(-1, -2)
+    off  = off - torch.diag_embed(off.diagonal(dim1=-2, dim2=-1))
+    full = torch.diag_embed(diag) + off
+    b_ph = m._fold_precision_bias(None, full)                              # (.., H, 1, N)
+    dims = list(m.group.irrep_dims)
+    tr   = torch.stack([blk.sum(-1) for blk in diag.split(dims, dim=-1)], dim=-1)  # (.., N, H)
+    expect = (-torch.log(2.0 + tr)).transpose(-1, -2).unsqueeze(-2)        # (.., H, 1, N)
+    assert b_ph.shape == expect.shape
+    assert torch.allclose(b_ph, expect, atol=1e-6)
