@@ -139,6 +139,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
     
     m_phi_natural_grad        = False,        # natural gradient on phi m-step
+    m_gauge_update_rule       = "adam",                # vs "heavy_ball", vs the adamw arm
     
     phi_precond_mode          = "killing_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
@@ -485,13 +486,19 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # generators do not partition per head, so the baseline 'killing_per_block' is undefined there;
         # the ambient Killing metric works for both groups, leaving gauge_group (tied vs untied) the
         # only difference between the two arms.
+        # precision_weighted_attention=False on BOTH arms: the reliability bias -log(b0 + tr Sigma_j)
+        # uses tr Sigma, which is NOT invariant under the GL(K) congruence Sigma->g Sigma g^T, so with
+        # it on even the exact-equivariant tied arm carries a gauge-non-covariant element in its forward
+        # operating point. Off makes the tied arm's whole forward gauge-exact (modulo the head mixer being
+        # studied), so the gauge-equivariance read is clean. (It does not enter the builder_resid /
+        # gauge_resid certificates either way -- those are computed off mu/sigma/omega, not log_prior.)
         "configs": [
             {"label": "untied_block_glk", "gauge_group": "block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
-             "phi_precond_mode": "killing", "s_e_step": False},
+             "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False},
             {"label": "tied_block_glk",   "gauge_group": "tied_block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
-             "phi_precond_mode": "killing", "s_e_step": False},
+             "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False},
         ],
     },
 
@@ -1014,9 +1021,20 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
     
+  #"gauge_transport",
+ # "attention_entropy",
+ # "gauge_equivariance",
+  #"cg_coupling",
+ # "fisher_mu_precond",
+  
+ # "n_e_steps_em",
+  "gauge_mstep_optim",
+  "m_phi_lr_natgrad",
+  "pos_extrapolation",
+  "rho_handoff",
   
   
-  #"kappa_beta_per_head",
+  "kappa_beta_per_head",
   
   # "precision_attention_b0",
   # "decode_tau",
@@ -1043,7 +1061,7 @@ SWEEP_ORDER: List[str] = [
   #  "phi_scale",
   #  "sigma_init", 
    
-  ##  "renyi_order",
+    "renyi_order",
   
    # "e_q_mu_lr",
   #  "phi_weight_decay",

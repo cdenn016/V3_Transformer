@@ -54,8 +54,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # SEEDS[i]. Each run is fully independent (its own model, RNG, and artifacts dir -- the seed is in the
 # run-folder label so they never collide). NUM_RUNS=1 with SEEDS=[] keeps the single-run path on the
 # config `seed` above, unchanged. Example: NUM_RUNS=3, SEEDS=[3, 64, 23] trains all three seeds.
-NUM_RUNS = 5
-SEEDS    = [6,23,54,66,122]        # e.g. [3, 64, 23]; must list at least NUM_RUNS seeds when NUM_RUNS > 1
+NUM_RUNS = 1
+SEEDS    = 122,#[6,23,54,66,122]        # e.g. [3, 64, 23]; must list at least NUM_RUNS seeds when NUM_RUNS > 1
 
 # DATA_SEED (EXP-1 variance floor): when set to an int, the TRAIN loader's shuffle order is fixed to
 # this seed via an explicit generator, INDEPENDENT of the per-run model seed -- so a multi-seed run
@@ -73,13 +73,13 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    embed_dim                 = 10,                  # K, total belief dim (must be divisible by n_heads)
     n_heads                   = 2,
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 32,
-    max_steps                 = 60000,
+    batch_size                = 64,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -130,9 +130,11 @@ config = dict(
                                               #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
     
-    m_phi_natural_grad        = False,        # natural gradient on phi m-step
+    m_phi_natural_grad        = True,        # natural gradient on phi m-step
     
-    phi_precond_mode          = "killing_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
+    m_gauge_update_rule       = "adam",       #'ada' or 'heavy_ball'
+    
+    phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
@@ -200,6 +202,7 @@ config = dict(
        
     lambda_alpha               = 1,          # constant self-coupling value
     lambda_h                   = 0.25,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
+    #lambda h ~0.25/6 = 0.04 for K=160 d=20
     
     b0_h                       = 1.0,        # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
     c0_h                       = 1.0,        # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h
