@@ -966,6 +966,51 @@ def _fmt_tau(cfg: VFE3Config, model: VFEModel) -> str:
     return f"{float(tau):.4f}"
 
 
+def parameter_report(
+    model:  VFEModel,
+
+    *,
+    device: Optional[torch.device] = None,
+    batch:  int = 2,
+    seqlen: int = 16,
+) -> Dict[str, object]:
+    r"""Total params plus the ACTUAL-trained-under-this-config count.
+
+    ``total`` is ``sum(p.numel())``; ``trainable`` filters ``requires_grad`` (catches the frozen
+    hyper-prior centroid r under ``learnable_r=False``). ``live`` is MEASURED, not inferred from
+    toggles: one synthetic forward+backward runs and a parameter counts as live only if it receives
+    a non-None gradient -- so config-dead tables that stay allocated and grouped
+    (``mu_embed``/``sigma_log_embed`` under ``prior_source='model_channel'``, ``decode_log_scale``
+    under ``use_prior_bank=False``, ``phi_embed`` under ``detach_e_step=True``, ...) are counted as
+    dead REGARDLESS of which toggle silenced them, so the report never drifts from the config as the
+    toggles change. The synthetic ids come from a LOCAL generator (the global RNG is untouched) and
+    ``.grad`` is cleared afterward, so the probe is side-effect-free. Best-effort: any failure (e.g. a
+    config whose loss does not require grad) falls back to ``live = trainable`` with ``probed=False``.
+    """
+    named     = list(model.named_parameters())
+    total     = sum(p.numel() for _, p in named)
+    trainable = sum(p.numel() for _, p in named if p.requires_grad)
+    rep: Dict[str, object] = {"total": total, "trainable": trainable, "live": trainable,
+                              "dead": 0, "dead_names": [], "probed": False}
+    try:
+        device = device or next(model.parameters()).device
+        n = max(2, min(int(seqlen), int(model.cfg.max_seq_len)))
+        g = torch.Generator().manual_seed(0)                       # local: global RNG untouched
+        ids = torch.randint(0, int(model.cfg.vocab_size), (int(batch), n), generator=g).to(device)
+        tgt = torch.randint(0, int(model.cfg.vocab_size), (int(batch), n), generator=g).to(device)
+        model.zero_grad(set_to_none=True)
+        out  = model(ids, tgt)                                     # (logits|None, loss, ce) with targets
+        loss = out[1] if isinstance(out, tuple) else out
+        loss.backward()
+        dead_names = [name for name, p in named if p.requires_grad and p.grad is None]
+        live = sum(p.numel() for _, p in named if p.requires_grad and p.grad is not None)
+        model.zero_grad(set_to_none=True)                          # leave no grads for training
+        rep.update(live=live, dead=trainable - live, dead_names=dead_names, probed=True)
+    except Exception:
+        pass                                                       # best-effort diagnostic, never fatal
+    return rep
+
+
 def _banner(
     model:       VFEModel,
     cfg:         VFE3Config,
@@ -975,17 +1020,23 @@ def _banner(
     train_loader: object = None,
 ) -> str:
     r"""Compact init banner (no FLOPs counter; lambda_h is omitted from the printed lines)."""
-    n_params = sum(p.numel() for p in model.parameters())
+    rep = parameter_report(model, device=device)
     bar = "=" * 64
     cov = coverage_lines(train_loader, n_steps, dataset) if train_loader is not None else []
+    live_note = (f" ({rep['live']:,} live, {rep['dead']:,} dead)"
+                 if rep["probed"] and rep["dead"] else "")
+    dead_line = ([" dead under config (no grad): "
+                  + ", ".join(n.replace("prior_bank.", "") for n in rep["dead_names"])]
+                 if rep["probed"] and rep["dead_names"] else [])
     return "\n".join([
         bar,
-        f" Gauge VFE Transformer | {n_params} params | {device}",
+        f" Gauge VFE Transformer | {rep['total']:,} params{live_note} | {device}",
         bar,
         f" K={cfg.embed_dim}  N={cfg.max_seq_len}  L={cfg.n_layers}  heads={len(model.group.irrep_dims)}  "
         f"group={cfg.gauge_group}  family={cfg.family}",
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
+        *dead_line,
         f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  phi={cfg.m_phi_lr}",
         f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
