@@ -485,13 +485,19 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # generators do not partition per head, so the baseline 'killing_per_block' is undefined there;
         # the ambient Killing metric works for both groups, leaving gauge_group (tied vs untied) the
         # only difference between the two arms.
+        # precision_weighted_attention=False on BOTH arms: the reliability bias -log(b0 + tr Sigma_j)
+        # uses tr Sigma, which is NOT invariant under the GL(K) congruence Sigma->g Sigma g^T, so with
+        # it on even the exact-equivariant tied arm carries a gauge-non-covariant element in its forward
+        # operating point. Off makes the tied arm's whole forward gauge-exact (modulo the head mixer being
+        # studied), so the gauge-equivariance read is clean. (It does not enter the builder_resid /
+        # gauge_resid certificates either way -- those are computed off mu/sigma/omega, not log_prior.)
         "configs": [
             {"label": "untied_block_glk", "gauge_group": "block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
-             "phi_precond_mode": "killing", "s_e_step": False},
+             "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False},
             {"label": "tied_block_glk",   "gauge_group": "tied_block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
-             "phi_precond_mode": "killing", "s_e_step": False},
+             "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False},
         ],
     },
 
