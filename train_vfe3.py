@@ -329,20 +329,26 @@ RUN_ROOT = "vfe3_runs"
 
 def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
             train_loader=None, full_corpus_tokens: 'int | None' = None) -> str:
-    from vfe3.train import coverage_lines
-    n_params = sum(p.numel() for p in model.parameters())
+    from vfe3.train import coverage_lines, parameter_report
+    rep = parameter_report(model, device=device)
     bar = "=" * 64
     cov = (coverage_lines(train_loader, n_steps, dataset, full_corpus_tokens=full_corpus_tokens)
            if train_loader is not None else [])
+    live_note = (f" ({rep['live']:,} live, {rep['dead']:,} dead)"
+                 if rep["probed"] and rep["dead"] else "")
+    dead_line = ([" dead under config (no grad): "
+                  + ", ".join(n.replace("prior_bank.", "") for n in rep["dead_names"])]
+                 if rep["probed"] and rep["dead_names"] else [])
     return "\n".join([
         bar,
-        f" Gauge VFE Transformer | {n_params} params | {device}",
+        f" Gauge VFE Transformer | {rep['total']:,} params{live_note} | {device}",
         bar,
         f" K={cfg.embed_dim}  N={cfg.max_seq_len}  L={cfg.n_layers}  "
         f"heads={len(model.group.irrep_dims)}  "  # runtime attention heads = irrep blocks (cross_couplings -> 1)
         f"group={cfg.gauge_group}  family={cfg.family}",
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
+        *dead_line,
         f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  phi={cfg.m_phi_lr}",
         f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
