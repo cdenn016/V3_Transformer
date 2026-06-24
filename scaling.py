@@ -17,9 +17,10 @@ the gauge group / n_heads is a FIRST-CLASS parameter lever; growing ``embed_dim`
 fronts (linear ``2VK`` + quadratic ``V*n_gen``); and ``n_layers`` / ``n_e_steps`` / full-covariance add
 ZERO parameters (they are inference-compute axes at flat ``N``, plotted separately, NEVER on ``L(N)``).
 
-The baseline operating point is IMPORTED from ``train_vfe3.config`` (this script never edits
-``train_vfe3.py``), so a scaling run scales around exactly what a normal ``train_vfe3.py`` run trains.
-Each cell overrides only the scale knob(s). Equal-token budget: ``max_steps`` / ``batch_size`` /
+The baseline operating point is the self-contained ``config`` dict IN THIS FILE (it is NOT imported
+from ``train_vfe3.py`` -- edit ``config`` below to set what every scaling cell trains around). ``BASELINE``
+is bound to it right after the dict is built. Each cell overrides only the scale knob(s). Equal-token
+budget: ``max_steps`` / ``batch_size`` /
 ``max_seq_len`` are held fixed across the parameter routes, so ``tokens_seen`` is constant and the fitted
 exponent is the equal-data exponent. A missing tokenized cache raises ``FileNotFoundError`` (no
 synthetic substitution); build the corpus cache first (see ``vfe3/data``).
@@ -43,7 +44,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from train_vfe3 import config as BASELINE          # the train_vfe3 operating point (import, not edit)
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader, tokens_per_char as _tokens_per_char
 from vfe3.model.model import VFEModel, build_group
@@ -51,6 +51,298 @@ from vfe3.run_artifacts import RunArtifacts, finalize_run
 from vfe3.train import coverage_lines, train
 
 logger = logging.getLogger("scaling")
+
+
+# =============================================================================
+# CLICK-TO-RUN KNOBS  -- edit, then run.
+# =============================================================================
+CONFIG: Dict[str, Any] = {
+    # Which routes to run (keys of ROUTES), in order. See the ROUTE MENU above the ROUTES registry.
+    "routes":     ["grow_K_GL10"], # "grow_K_GL10","blocks_K48",                       
+                   #"blocksize", "grow_K", "group", "model_channel", "infer_T", "infer_L"
+
+    # Seeds per cell. Graduated budget is sensible (more seeds at the cheap small end); the simplest
+    # honest default is one shared list applied to every cell -- trim/extend per your compute budget.
+    "seeds":      [6, 64, 23],
+
+    "device":     "auto",                                   # 'auto' -> CUDA (RTX 5090) else CPU
+
+    # Dataset for every run (NOT a VFE3Config field; the loader seam). Held-out CE is comparable across
+    # sizes only within one tokenizer/corpus.
+    "dataset":    "wikitext-103",                           # "wikitext-103" | "wiki-ja" | "wiki-en" | ...
+
+    # Cap the TRAIN stream for fast scaling passes (validation/test always read in full). None = full.
+    "max_tokens": None,
+
+    # Override every run's max_steps (None = use the local `config` max_steps below). HOLD THIS FIXED across the
+    # parameter routes for an equal-token budget (so tokens_seen is constant and the exponent is clean).
+    "max_steps":  None,
+
+    # Skip cells whose run dir already holds a summary.json built from the SAME config (idempotent
+    # reruns / crash recovery), exactly like ablation.py's resume.
+    "resume":     True,
+
+    "output_dir": "vfe3_scaling_results",
+}
+
+config = dict(
+    
+
+    #################################
+    #            Training
+    #################################
+    vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
+    
+    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 2,
+    
+    max_seq_len               = 128,                 # N, context length
+    
+    batch_size                = 64,
+    max_steps                 = 15000,
+    
+    n_layers                  = 1,                   # L, number of blocks
+    n_e_steps                 = 1 ,                   # T, E-step inner iterations
+    
+    seed                      = 6,
+    warmup_steps              = 100,
+    
+    #################################
+    # f-divergence and e/m family
+    #################################
+    
+    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
+    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
+
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" (single covariance toggle; diagonal_covariance is derived)
+    
+    #################################
+    #        Initialization
+    #################################
+    mu_init_std               = 0.065,     # std of the random mean table mu_embed
+    sigma_init                = 3,         # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale                 = 0.06,      # std
+    
+    
+    #################################
+    #        Encode/Decode          #
+    #################################
+    decode_bias               = True,     # only if use_prior_bank = False
+    use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+                                           # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
+    
+    use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
+                                                     # mu->logits ablation (encode stays on the prior bank)
+    decode_tau                = 0.008,
+    decode_precision_scaled   = False,               # use_prior_bank=False only: feed the precision-weighted mean
+                                                     # eta=mu/sigma (natural param) to the linear head so Sigma enters
+                                                     # the discriminative readout (diagnostic; OFF = bare-mu linear)
+    decode_mode               = 'diagonal_chunked',
+    oracle_unroll_grad        = False,
+    
+    #################################
+    #          Gauge Group
+    #################################
+    gauge_transport           = "on",         # gauge-frame ABLATION (A1/EXP-2): "on" (pure, learned frame)
+                                              #   | "off" (Omega=I exactly: forces phi_scale=0, pos_phi='none',
+                                              #     e_phi_lr=m_phi_lr=0; needs transport_mode='flat' + pos_rotation='none')
+                                              #   | "frozen" (random fixed frame: e_phi_lr=m_phi_lr=0, phi_scale kept).
+                                              #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
+    gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
+    
+    m_phi_natural_grad        = False,        # natural gradient on phi m-step
+    
+    m_gauge_update_rule       = "heavy_ball",       #'adam' or 'heavy_ball'
+    
+    phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
+    phi_retract_mode          = "bch",                # "euclidean" | "bch"
+    spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
+
+    
+    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+                                                     # tied_block_glk: one shared GL(d) frame across heads (kron(I_n, gl(d)))
+
+    # so_n / sp_n irrep towers (heads = irreps). Structure group SO(group_n) / Sp(group_n) with
+    # group_n DECOUPLED from embed_dim; irrep_spec = [(label, mult), ...] blocks laid out in order,
+    # block dims summing to embed_dim. Labels: so_n 'l<p>' = symmetric-traceless rank-p irrep
+    # (group_n=3: spin-p, dim 2p+1); sp_n 'sym<p>' = Sym^p of the defining rep (dim C(2m+p-1, p)).
+    # One shared per-token phi drives EVERY block (TIED gauge; n_gen = dim of the algebra), and
+    # unequal block dims get per-head tau_h = kappa_h*sqrt(d_h). Both REQUIRED for so_n/sp_n,
+    # must stay None for every other group. CONSTRAINTS for these groups: phi_precond_mode must
+    # be "none"/"clip"/"killing" (the per-block modes are rejected -- tied generators do not
+    # partition per block); use_head_mixer mixes per isotypic component (equal-mult towers mix copies; mults-one towers get scalar gains); alibi-family priors need
+    # n_heads == number of blocks.
+    # embed_dim=20 examples:
+    #   so_n: group_n=3, irrep_spec=[("l2", 4)]                            # 4 equal spin-2 heads (mixer OK)
+    #   so_n: group_n=3, irrep_spec=[("l0",1),("l1",1),("l3",1),("l4",1)]  # spins 0,1,3,4 = 1+3+7+9 (unequal: mixer = per-head scalar gains)
+    #   sp_n: group_n=4, irrep_spec=[("sym2", 2)]                          # 2 equal Sym^2(R^4) heads, dim 10 each
+    
+    group_n                   = None,                # so_n/sp_n only: N of SO(N) / 2m of Sp(2m)
+    irrep_spec                = None,                # so_n/sp_n only: [(label, mult), ...]; dims sum == embed_dim
+
+    use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling (bilinear, exactly
+                                                     # equivariant, means-only sigma; zero-init path weights)
+
+    ####################################
+    # Non-Flat Connection - Regime II
+    ####################################
+    transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii" (learned bilinear edge
+                                            # connection delta=mu^T W mu; gauge-invariant only at W=0; NN exception, default-off)
+                                            # | "regime_ii_covariant" (Route B: gauge-COVARIANT non-flat connection
+                                            # delta=M . invariant-features(q_i, Omega^0 q_j); covariant for any M; NN exception, default-off)
+    cocycle_relaxation        =   1.0,        # regime_ii / regime_ii_covariant homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
+    cross_couplings           = None,       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only (None = block-diagonal gauge)
+                                               #if enabled and head-mixer = True or causal_alibi it will fail
+    close_basis               = False,
+    ####################################
+    #       Positional Encoding
+    #    BCH gauge-frame PE (pos_phi)
+    #     gauge-RoPE (pos_rotation)
+    ####################################
+
+    pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
+    pos_rotation              = "none",              # "none" | "rope" (block-diagonal positional rotation folded into transport)
+    pos_phi_compose           = "bch",               # composition chart: "bch" | "euclidean"
+               
+    pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
+    
+    rope_base                 = 100.0,               # rotary frequency base
+    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
+    rope_on_value             = False,
+    
+    ######################################
+    #                Self Energy:  
+    #        Sum_i alpha_i * KL(q_i||p_i)
+    ######################################
+    lambda_alpha_mode          = "state_dependent",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
+    lambda_h_mode              = "constant",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h) | "learnable" (NN exc.)
+    
+    b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
+    c0                         = 1.0,                 # state-dependent alpha shape (numerator)
+       
+    lambda_alpha               = 1,          # constant self-coupling value
+    lambda_h                   = 0.25,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
+    #lambda h ~0.25/6 = 0.04 for K=160 d=20
+    
+    b0_h                       = 1.0,        # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
+    c0_h                       = 1.0,        # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h
+
+    # Further Regularizers
+    mass_phi                   = 0.0,       # (mass_phi/2) ||phi||^2 penalty
+    mstep_self_coupling_weight = 0.0,      # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    
+    
+    ##################################################
+    #              Attention Energy: 
+    # lambda_beta*Sum_i beta_ij * KL(q_i||Omega_ij q_j) 
+    ##################################################
+    
+    lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)    
+    lambda_gamma               = 0.75,       # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
+         
+
+    ########################################
+    #     Attention Belief/Model Settings
+    #            & Temperatures
+    ########################################
+    
+    kappa_beta                = 1, #[1, 0.5],        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa_gamma               = 1, #[1, 0.5],        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
+        
+    beta_attention_prior      = "causal_alibi",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+    gamma_attention_prior     = "causal_alibi",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+
+    t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
+
+    precision_weighted_attention = True,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
+                                                 # into the attention prior (diagnostic; OFF = position-only prior)
+    precision_attention_b0       = 2.0,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
+    precision_attention_per_head = False,        # per-key reliability PER HEAD (trace over each block's coords) vs
+                                                 # global (all K); needs precision_weighted_attention=True
+    #################################
+    #         Belief E-step
+    #         Learning Rates
+    #################################
+    
+    e_q_mu_lr                 = 0.9,
+    e_q_sigma_lr              = 0.001,
+    e_phi_lr                  = 0.00,     
+    
+    
+    ####################################
+    #       Model E-step LR's
+    #      If s_e_step = True
+    # and prior_source = 'model_channel'
+    ####################################
+    
+    r_update_mode             = "gradient",          # "gradient" (AdamW M-step; correct under s_e_step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
+    prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"
+    learnable_r               = True,               # un-freeze hyper-prior centroid r (empirical-Bayes)
+    s_e_step                  = True,
+    
+    e_s_mu_lr                 = 0.85,
+    e_s_sigma_lr              = 0.1,
+    
+    #################################
+    #    Embedding/Priors M-step 
+    #        Learning Rates
+    #################################
+        
+    m_p_mu_lr                 = 0.015,   
+    m_p_sigma_lr              = 0.0035,     
+    m_phi_lr                  = 0.015,   
+    
+    weight_decay              = 0.02,
+    phi_weight_decay          = 0.05,
+    
+    min_lr                    = 0,       # absolute cosine-decay LR floor (0.0 = pure cosine)
+    min_lr_frac               = 0.01,    # proportional LR floor, max(min_lr, frac*base); OFF
+    
+    #################################
+    #     Layer Normalization 
+    #        and Hand-Off
+    #################################
+    
+    norm_type_block           = "none",              # "none" | "mahalanobis"
+    norm_type_final           = "none",              # "none" | "mahalanobis"
+    
+    prior_handoff_rho         = 0,                 # 1.0 = full flow; 0.0 = priors frozen
+    prior_handoff_sigma       = 0,                 # sigma damping in [0,1] (0.0 = frozen at embedding)
+    
+    #################################
+    #        Numerical Safety
+    #################################
+    
+    e_mu_q_trust              = None,
+    e_sigma_q_trust           = 10.0,
+    sigma_max                 = 100.0,
+    
+    #################################
+    #         Misc/Logging
+    #################################     
+    amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
+        
+    log_interval              = 100,       # console log every N steps (0 = off)
+    eval_interval             = 1500,      # periodic validation every N steps (0 = off)
+    checkpoint_interval       = 25000,     # save a resumable checkpoint every N steps (0 = off)
+
+    use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF = pure
+                                           # path: model is the last SGD iterate). ON: eval/best-save/final
+                                           # model use the running average s <- ema_decay*s + (1-ema_decay)*theta
+    ema_decay                 = 0.95,     # EMA decay in (0,1); only read when use_ema=True
+)
+
+# kl_max is the numerical safety-net clamp on EVERY divergence (KL(q||p), KL(s||r), pairwise energy),
+# next to eps -- NOT an operating ceiling. Diagonal KL is a sum over K coords (~0.8 nats/coord trained),
+# so the K-INDEPENDENT 100.0 default binds for ~100% of tokens at large K (K* ~ 126), silently zeroing
+# the hyper-prior self-gradient and gradient-freezing learnable r (the kernel self_mask, gradients/
+# kernels.py:129). Scale it with K so it binds only on genuine NaN/inf/Cholesky blowups; F is provably
+# kl_max-independent below the ceiling (safe_kl_clamp is the identity there). See docs/2026-06-21-edits.md.
+config["kl_max"] = 8 * config["embed_dim"]
+
+# The scaling operating point IS the local ``config`` dict above (self-contained; NOT train_vfe3.py).
+# Edit ``config`` to change what every cell trains around; each ROUTE cell overrides only its scale knob(s).
+BASELINE: Dict[str, Any] = config
 
 
 # =============================================================================
@@ -75,9 +367,9 @@ _VFE3_DEFAULTS = {f.name: f.default for f in _dc_fields(VFE3Config)}
 
 
 def _baseline_value(key: str) -> float:
-    r"""Operating-point value of a VFE3Config float field: train_vfe3's config dict if it sets it,
-    else the dataclass default. Lets the muP route scale LRs / init relative to the anchor width
-    without hard-coding the operating point."""
+    r"""Operating-point value of a VFE3Config float field: the local ``config`` dict (BASELINE) if it
+    sets it, else the dataclass default. Lets the muP route scale LRs / init relative to the anchor
+    width without hard-coding the operating point."""
     return float(BASELINE.get(key, _VFE3_DEFAULTS.get(key)))
 
 
@@ -112,6 +404,48 @@ def route_blocksize(embed_dim: int, n_heads_list: List[int]) -> List[Dict[str, A
     return [{"label": f"K{embed_dim}_h{h}", "route": "blocksize", "scale_knob": "n_heads",
              "overrides": {"embed_dim": embed_dim, "n_heads": h, "gauge_group": "block_glk"}}
             for h in n_heads_list]
+
+
+def route_grow_k_fixed_block(embed_dims: List[int], block: int) -> List[Dict[str, Any]]:
+    r"""Grow N by widening K at a FIXED gauge block size GL(``block``): n_heads = K/block scales WITH K
+    (every head is one GL(block) frame). Because block_glk has n_gen = K^2/n_heads = block*K, phi_embed
+    = V*block*K grows LINEARLY in K here -- contrast ``route_grow_k`` (fixed n_heads, so the block grows
+    and n_gen ~ K^2). kl_max = 8*K per cell (avoids the frozen-kl_max width confound). The single-block
+    K=block cell drops the head mixer (the Schur-commutant mixer needs >=2 equal blocks). K must be a
+    positive multiple of ``block``; non-multiples are skipped with a warning."""
+    cells: List[Dict[str, Any]] = []
+    for k in embed_dims:
+        if k <= 0 or k % block != 0:
+            logger.warning("  [skip] grow_K_GL%d: K=%d is not a positive multiple of block=%d", block, k, block)
+            continue
+        h = k // block
+        ov: Dict[str, Any] = {"embed_dim": k, "n_heads": h, "gauge_group": "block_glk", "kl_max": 8 * k}
+        if h < 2:
+            ov["use_head_mixer"] = False                     # 1 block: nothing for the head mixer to mix
+        cells.append({"label": f"K{k}_GL{block}", "route": f"grow_K_GL{block}",
+                      "scale_knob": "embed_dim", "overrides": ov})
+    return cells
+
+
+def route_vary_block_fixed_k(embed_dim: int, blocks: List[int]) -> List[Dict[str, Any]]:
+    r"""Fixed K, vary the gauge block size GL(``b``): n_heads = K/b, so block_glk n_gen = K^2/n_heads =
+    b*K. FEWER/LARGER blocks (bigger b) = MORE params (n_gen up) -- the opposite sign of a standard
+    transformer, and the parameter axis here. This is the ``route_blocksize`` idea written in GL(b) terms
+    (b=K/n_heads). kl_max = 8*K (constant; K is fixed across the route). The single-block b=K cell (one
+    GL(K) frame) drops the head mixer. Each b must divide K; non-divisors are skipped with a warning."""
+    cells: List[Dict[str, Any]] = []
+    for b in blocks:
+        if b <= 0 or embed_dim % b != 0:
+            logger.warning("  [skip] blocks_K%d: block=%d does not divide K=%d", embed_dim, b, embed_dim)
+            continue
+        h = embed_dim // b
+        ov: Dict[str, Any] = {"embed_dim": embed_dim, "n_heads": h, "gauge_group": "block_glk",
+                              "kl_max": 8 * embed_dim}
+        if h < 2:
+            ov["use_head_mixer"] = False
+        cells.append({"label": f"K{embed_dim}_GL{b}", "route": f"blocks_K{embed_dim}",
+                      "scale_knob": "n_heads", "overrides": ov})
+    return cells
 
 
 def route_group(embed_dim: int) -> List[Dict[str, Any]]:
@@ -164,10 +498,28 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
              "overrides": {"n_layers": n}} for n in n_layers_list]
 
 
-# The full route registry. Each value is a list of cells; CONFIG["routes"] selects which run. Edit the
-# grids freely -- the predicted n_params is printed per cell before training so a grid can be sized to
-# the GPU first. Geometric (~2x) spacing in N gives even leverage to the log-log fit.
+# ============================ ROUTE MENU (how to set up a run) ===============================
+# A ROUTE is one way of moving N (number of params). Pick which ones run in CONFIG["routes"] above;
+# edit each route's grid HERE (the call args). The predicted n_params is printed per cell before any
+# training so you can size a grid to the GPU first. Geometric (~2x) spacing in N gives the cleanest fit.
+#
+#   PARAMETER routes (plotted on the L(N) = test_CE-vs-N power-law curve):
+#     grow_K_GL10   GROW K at a FIXED block GL(10): K=10,20,...; n_heads=K/10; n_gen=10*K (LINEAR in K).
+#     blocks_K48    FIXED K=48, VARY the block GL(b): b=48,24,12,8,6; n_heads=K/b; n_gen=b*K
+#                   (bigger block = FEWER heads = MORE params -- e.g. GL(48) is the largest model here).
+#     grow_K        grow K at FIXED n_heads=4 (so the block grows with K; n_gen ~ K^2/4, quadratic).
+#     grow_K_mup    grow_K + a muP LR/init-rescaled twin per K (F1/EXP-6 width-stability), kl_max=8*K.
+#     blocksize     FIXED K=64, vary n_heads in {8,4,2} (= block GL(8),GL(16),GL(32)); same idea as
+#                   blocks_K48 but parameterized by n_heads instead of GL(b).
+#     group         FIXED K=64, swap the gauge GROUP: tied_block_glk -> block_glk -> so_k (spans n_gen).
+#     model_channel token-prior (no s-tables) vs the full model channel (+2VK params).
+#   INFERENCE routes (FLAT N -- plotted on a SEPARATE inference-capacity figure, NEVER on L(N)):
+#     infer_T       n_e_steps in {1,2,4,8} at constant params.   infer_L  n_layers in {1,2,4,6}.
+#
+# To add your own: call a route builder with a new grid and give it a key; add that key to CONFIG["routes"].
 ROUTES: Dict[str, List[Dict[str, Any]]] = {
+    "grow_K_GL10":   route_grow_k_fixed_block([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120], block=10),
+    "blocks_K48":    route_vary_block_fixed_k(48, [48, 24, 12, 8, 6]),
     "grow_K":        route_grow_k([20, 40, 60, 80, 100, 120], n_heads=4),
     "grow_K_mup":    route_grow_k_mup([20, 40, 80, 120], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
     "blocksize":     route_blocksize(64, [8, 4, 2]),
@@ -178,36 +530,7 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
 }
 
 
-# =============================================================================
-# CLICK-TO-RUN KNOBS  -- edit, then run.
-# =============================================================================
-CONFIG: Dict[str, Any] = {
-    # Which routes to run (keys of ROUTES), in order. A curated subset for a single-GPU session.
-    "routes":     ["blocksize"], #"blocksize", grow_K, "group", "model_channel", "infer_T", "infer_L"],
 
-    # Seeds per cell. Graduated budget is sensible (more seeds at the cheap small end); the simplest
-    # honest default is one shared list applied to every cell -- trim/extend per your compute budget.
-    "seeds":      [6, 64, 23],
-
-    "device":     "auto",                                   # 'auto' -> CUDA (RTX 5090) else CPU
-
-    # Dataset for every run (NOT a VFE3Config field; the loader seam). Held-out CE is comparable across
-    # sizes only within one tokenizer/corpus.
-    "dataset":    "wikitext-103",                           # "wikitext-103" | "wikitext-2" | "wiki-en" | ...
-
-    # Cap the TRAIN stream for fast scaling passes (validation/test always read in full). None = full.
-    "max_tokens": None,
-
-    # Override every run's max_steps (None = use the train_vfe3 baseline). HOLD THIS FIXED across the
-    # parameter routes for an equal-token budget (so tokens_seen is constant and the exponent is clean).
-    "max_steps":  None,
-
-    # Skip cells whose run dir already holds a summary.json built from the SAME config (idempotent
-    # reruns / crash recovery), exactly like ablation.py's resume.
-    "resume":     True,
-
-    "output_dir": "vfe3_scaling_results",
-}
 
 
 # =============================================================================
