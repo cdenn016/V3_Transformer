@@ -41,11 +41,25 @@ from vfe3.geometry.phi_preconditioner import precondition_phi_gradient, pullback
 class GaugeNaturalGradAdamW(torch.optim.AdamW):
     r"""AdamW everywhere, natural-gradient + momentum on the gauge-frame coordinate groups.
 
-    For a group flagged ``gauge=True`` holding coordinates ``phi`` (shape ``(..., n_gen)``)::
+    For a group flagged ``gauge=True`` holding coordinates ``phi`` (shape ``(..., n_gen)``), with
+    ``nat = G(phi)^{-1} grad`` the natural gradient (active rows only), the step depends on
+    ``gauge_update_rule``::
 
-        nat  = G(phi)^{-1} grad          # natural gradient (active rows only)
-        buf  = momentum * buf + nat      # heavy-ball momentum
+        # 'heavy_ball' (default):
+        buf  = momentum * buf + nat
         phi -= lr * buf
+
+        # 'adam':                          # Adam moments ON the natural gradient (betas/eps from the group)
+        m    = beta1 * m + (1 - beta1) * nat
+        v    = beta2 * v + (1 - beta2) * nat^2
+        phi -= lr * (m / (1 - beta1^t)) / (sqrt(v / (1 - beta2^t)) + eps)
+
+    ``'heavy_ball'`` passes the natural gradient through unnormalized: the metric DIRECTION survives
+    but a tiny/badly-scaled phi gradient (and the metric inverse's shrink) barely moves the frame.
+    ``'adam'`` restores per-coordinate ``1/sqrt(v)`` magnitude normalization so phi actually trains,
+    while keeping the metric direction; for the conformal ``killing`` metric it collapses to plain
+    AdamW on phi (the conformal factor cancels in ``m/sqrt(v)``), for ``pullback_per_block`` it is a
+    hybrid that keeps part of the metric direction AND moves phi.
 
     ``G(phi)`` is the metric named by ``precond_mode`` (``pullback_per_block`` for the exact
     exp-map geometry). No weight decay is applied to the gauge frame (decoupled L2 in Euclidean
@@ -65,8 +79,9 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         irrep_dims:     List[int],            # block sizes (sum == K); used by *_per_block metrics
 
         *,
-        precond_mode:   str   = "pullback_per_block",
-        gauge_momentum: float = 0.9,
+        precond_mode:      str   = "pullback_per_block",
+        gauge_momentum:    float = 0.9,
+        gauge_update_rule: str   = "heavy_ball",
         **kwargs,
     ) -> None:
         super().__init__(params, **kwargs)
@@ -74,6 +89,14 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         self._irrep_dims     = irrep_dims
         self._precond_mode   = precond_mode
         self._gauge_momentum = float(gauge_momentum)
+        # Moment rule for the natural-gradient gauge step: 'heavy_ball' (default; momentum only, no
+        # per-coordinate normalization) or 'adam' (Adam m/v/bias-correction ON the natural gradient,
+        # restoring 1/sqrt(v) normalization while keeping the metric direction).
+        if gauge_update_rule not in ("heavy_ball", "adam"):
+            raise ValueError(
+                f"gauge_update_rule must be 'heavy_ball' or 'adam', got {gauge_update_rule!r}"
+            )
+        self._gauge_update_rule = gauge_update_rule
         # D1/EXP-8 training-time diagnostics, GATED: the caller (train.py) sets _collect_gauge_diag
         # True only on a log/eval step, so the silent hot path computes NOTHING extra. When set, step()
         # stashes cos(nat, grad) (1.0 for the conformal killing rescale; <1 when pullback reshapes the
@@ -87,11 +110,13 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
 
         ``Optimizer.load_state_dict`` dispatches to ``__setstate__``; ``Adam.__setstate__`` migrates
         a legacy float ``"step"`` to a tensor and assumes EVERY non-empty per-parameter state carries
-        ``"step"``. A gauge param's state holds ONLY ``"gauge_mom"`` -- AdamW skips it because
-        :meth:`step` consumes its grad to ``None`` -- so Adam's assumption raises ``KeyError: 'step'``
-        and checkpoint RESUME would crash on the geometric M-step. Restore via the base ``Optimizer``
-        (which carries the current-format param-group hyperparameters from our own checkpoints) and
-        run the float->tensor step migration only on states that actually have ``"step"``.
+        ``"step"``. A gauge param's state holds only ``"gauge_mom"`` ('heavy_ball') or
+        ``"gauge_m"``/``"gauge_v"``/``"gauge_step"`` ('adam') -- never ``"step"`` -- because
+        :meth:`step` consumes its grad to ``None`` so base AdamW skips it. Adam's assumption would
+        raise ``KeyError: 'step'`` and checkpoint RESUME would crash on the geometric M-step. Restore
+        via the base ``Optimizer`` (which carries the current-format param-group hyperparameters from
+        our own checkpoints) and run the float->tensor step migration only on states that actually
+        have ``"step"`` (the non-gauge AdamW groups).
         """
         torch.optim.Optimizer.__setstate__(self, state)
         for s in self.state.values():
@@ -136,13 +161,39 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 nat = nat.reshape_as(g)
 
                 state = self.state[p]
-                buf = state.get("gauge_mom")
-                if buf is None:
-                    buf = torch.zeros_like(nat)
-                    state["gauge_mom"] = buf
-                buf.mul_(mom).add_(nat)                                 # heavy-ball: m <- mom*m + nat
-                p.add_(buf, alpha=-lr)                                  # phi <- phi - lr*m
-                p.grad = None                                           # consumed: AdamW no-ops on it
+                if self._gauge_update_rule == "adam":
+                    # Adam moments (m, v, bias-correction) ON the natural gradient nat=G^-1 grad.
+                    # betas/eps come from the AdamW param group (torch fills the group defaults), so
+                    # this is literally AdamW applied to the preconditioned gradient: it restores the
+                    # per-coordinate 1/sqrt(v) normalization that heavy-ball lacks while keeping the
+                    # metric direction. Dense m/v over the whole table with a global step count mirror
+                    # plain AdamW on phi_embed (inactive rows have nat=0: m/v just decay), so under the
+                    # conformal killing metric this reproduces the AdamW arm; under pullback it keeps
+                    # part of the metric direction. State key 'gauge_step' (int, not 'step') so it is
+                    # untouched by Adam's float->tensor 'step' migration in __setstate__.
+                    b1, b2 = group["betas"]
+                    eps    = group["eps"]
+                    m = state.get("gauge_m")
+                    if m is None:
+                        m = torch.zeros_like(nat); state["gauge_m"] = m
+                        state["gauge_v"]    = torch.zeros_like(nat)
+                        state["gauge_step"] = 0
+                    v = state["gauge_v"]
+                    state["gauge_step"] += 1
+                    t = state["gauge_step"]
+                    m.mul_(b1).add_(nat, alpha=1 - b1)                  # m <- b1*m + (1-b1)*nat
+                    v.mul_(b2).addcmul_(nat, nat, value=1 - b2)         # v <- b2*v + (1-b2)*nat^2
+                    mhat = m / (1 - b1 ** t)
+                    vhat = v / (1 - b2 ** t)
+                    p.add_(mhat / (vhat.sqrt() + eps), alpha=-lr)       # phi <- phi - lr*mhat/(sqrt(vhat)+eps)
+                else:
+                    buf = state.get("gauge_mom")
+                    if buf is None:
+                        buf = torch.zeros_like(nat)
+                        state["gauge_mom"] = buf
+                    buf.mul_(mom).add_(nat)                             # heavy-ball: m <- mom*m + nat
+                    p.add_(buf, alpha=-lr)                             # phi <- phi - lr*m
+                p.grad = None                                          # consumed: AdamW no-ops on it
         if collect:
             self._gauge_diag = {}
             if cos_acc:

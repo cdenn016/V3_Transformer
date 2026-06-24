@@ -314,7 +314,7 @@ def flag_noise_dominated(
 # CLICK-TO-RUN  -- edit, then `python multiseed_analysis.py`.
 # =============================================================================
 CONFIG: Dict[str, Any] = {
-    "run_root": "K=20_GL(10)",   # run folder (bare name resolves under vfe3_runs/) OR a path
+    "run_root": "K=60_GL(10)",   # run folder (bare name resolves under vfe3_runs/) OR a path
     "key":      "test_ppl",      # headline metric for the per-seed noise band
 }
 

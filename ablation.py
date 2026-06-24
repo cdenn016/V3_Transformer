@@ -139,6 +139,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
     
     m_phi_natural_grad        = False,        # natural gradient on phi m-step
+    m_gauge_update_rule       = "adam",                # vs "heavy_ball", vs the adamw arm
     
     phi_precond_mode          = "killing_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
@@ -1020,9 +1021,20 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
     
+  #"gauge_transport",
+ # "attention_entropy",
+ # "gauge_equivariance",
+  #"cg_coupling",
+ # "fisher_mu_precond",
+  
+ # "n_e_steps_em",
+  "gauge_mstep_optim",
+  "m_phi_lr_natgrad",
+  "pos_extrapolation",
+  "rho_handoff",
   
   
-  #"kappa_beta_per_head",
+  "kappa_beta_per_head",
   
   # "precision_attention_b0",
   # "decode_tau",
@@ -1049,7 +1061,7 @@ SWEEP_ORDER: List[str] = [
   #  "phi_scale",
   #  "sigma_init", 
    
-  ##  "renyi_order",
+    "renyi_order",
   
    # "e_q_mu_lr",
   #  "phi_weight_decay",
