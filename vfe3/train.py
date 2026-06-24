@@ -191,6 +191,7 @@ def build_optimizer(
         return GaugeNaturalGradAdamW(
             groups, model.group.generators, list(model.group.irrep_dims),
             precond_mode=cfg.phi_precond_mode, gauge_momentum=cfg.m_gauge_momentum,
+            gauge_update_rule=cfg.m_gauge_update_rule,
             weight_decay=cfg.weight_decay,
         )
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is

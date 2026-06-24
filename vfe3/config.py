@@ -359,6 +359,7 @@ class VFE3Config:
     e_sigma_q_trust:           float = 5.0
     
     mu_trust_mode:             str   = "box"          # "box" | "ball" (consulted only when e_mu_q_trust is not None)
+    
     # E-step MEAN preconditioner (B3/EXP-14 mu-arm ablation). 'fisher' (default, pure) descends the
     # Fisher natural gradient nat_mu = Sigma*grad_mu (diagonal Gaussian); 'raw' descends the raw
     # Euclidean grad_mu. The sigma retraction is unchanged either way, so this isolates the MEAN
@@ -376,6 +377,7 @@ class VFE3Config:
     # decode / encode
     use_prior_bank:            bool  = False
     decode_bias:               bool  = False  # use_prior_bank=False only: learned per-vocab log-unigram bias on logits=mu_q@W^T+b (zero-init, weight-decay-free). Inert (warns) under use_prior_bank=True.
+   
     # use_prior_bank=False only (diagnostic, default OFF): feed the precision-weighted mean -- the
     # diagonal natural parameter eta = Sigma^-1 mu = mu/(sigma+eps) -- to the linear head instead of
     # the bare mean mu, so the belief covariance Sigma_q enters the DISCRIMINATIVE readout. Tests
@@ -462,7 +464,19 @@ class VFE3Config:
     # default. Everything except the gauge frame (mu/sigma/decode/...) stays on AdamW.
     m_phi_natural_grad:        bool  = False
     m_gauge_momentum:          float = 0.9   # heavy-ball momentum for the natural-gradient gauge step
-    
+   
+    # Moment rule for the natural-gradient gauge step (only when m_phi_natural_grad=True):
+    #   'heavy_ball' (default): buf = m_gauge_momentum*buf + nat; phi -= lr*buf. NO per-coordinate
+    #     magnitude normalization -- the raw phi gradient scale (and the metric inverse's shrink)
+    #     pass straight through, so a tiny/badly-scaled phi gradient barely moves the frame.
+    #   'adam': run Adam's m, v, bias-correction ON the natural gradient nat = G^{-1} grad (betas/eps
+    #     from the AdamW group). Restores the per-coordinate 1/sqrt(v) normalization that lets phi
+    #     actually train, while keeping the metric DIRECTION. For the conformal killing metric this
+    #     collapses to plain AdamW on phi (the conformal factor cancels in m/sqrt(v)); for the non-
+    #     conformal pullback metric it is a hybrid: part of the metric direction survives AND phi moves.
+    #     Use with phi_precond_mode='pullback_per_block' for a geometric step that is not just AdamW.
+    m_gauge_update_rule:       str   = "heavy_ball"
+
     weight_decay:              float = 0.05
    
     # SEPARATE AdamW weight decay for the gauge-frame coordinate tables (phi_embed, learned
@@ -1175,6 +1189,7 @@ class VFE3Config:
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         from vfe3.geometry.phi_preconditioner import _PRECOND
         _require(self.phi_precond_mode, tuple(sorted(_PRECOND)), "phi_precond_mode")
+        _require(self.m_gauge_update_rule, ("heavy_ball", "adam"), "m_gauge_update_rule")
         # The natural-gradient gauge M-step (m_phi_natural_grad=True) carries a POSITION-DEPENDENT
         # metric only under the pullback family ('pullback' / 'pullback_per_block'). With any other
         # phi_precond_mode it degenerates to plain heavy-ball momentum SGD on phi with NO geometric
