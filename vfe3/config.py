@@ -525,6 +525,14 @@ class VFE3Config:
     # argument takes precedence over this field. None leaves train() byte-identical to the from-scratch loop.
     resume_from:               Optional[str] = None
 
+    # Resume-checkpoint trust gate (default OFF = safe). load_checkpoint reads a resume bundle with
+    # torch.load(weights_only=True), which refuses to execute arbitrary pickle reductions; our bundles
+    # (tensors + an asdict config + RNG tensors) load fine under it. If a (e.g. legacy-format) bundle
+    # fails the safe load, the resume RAISES unless this is True, which permits the legacy
+    # weights_only=False load -- only set it for a checkpoint you trust, since that path can execute
+    # arbitrary code embedded in the pickle.
+    trust_resume_checkpoint:   bool          = False
+
     # Opt-in EMA / Polyak weight averaging (default OFF = the pure path: no shadow, the trained model
     # IS the last SGD iterate). When on, train() keeps an exponential moving average of the trainable
     # tables, s <- ema_decay*s + (1-ema_decay)*theta after each optimizer step, swaps it in for
@@ -1315,7 +1323,7 @@ class VFE3Config:
         # / spd_retract_mode above). Local import avoids a config <- prior_bank cycle. decode_mode must
         # NOT accept 'linear': that kernel is reached only through the use_prior_bank=False second-gate
         # (a learned linear readout), never via decode_mode, so it is excluded from the valid set.
-        from vfe3.model.prior_bank import _DECODERS, _ENCODERS
+        from vfe3.model.prior_bank import _DECODERS, _ENCODERS, _FULL_DECODERS
         _require(self.decode_mode, tuple(sorted(set(_DECODERS) - {"linear"})), "decode_mode")
         # decode_mode sets the RANK of the prior-bank KL-decode kernel: 'diagonal'/'diagonal_chunked'
         # consume a diagonal sigma (B,N,K); 'full'/'full_chunked' consume a full sigma (B,N,K,K). It
@@ -1324,7 +1332,7 @@ class VFE3Config:
         # for exactly one thing: '*_chunked' selects the fused chunked-CE training path over
         # logits = mu @ W^T (vram audit 2026-06-10) -- rank is irrelevant there, so the cross-check
         # stays gated on use_prior_bank.
-        decode_is_full = self.decode_mode in ("full", "full_chunked")
+        decode_is_full = self.decode_mode in _FULL_DECODERS
         if self.use_prior_bank and decode_is_full == family_is_diagonal:
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
@@ -1357,6 +1365,17 @@ class VFE3Config:
                 "decode already consumes sigma_q. Set use_prior_bank=False (linear decode) for the "
                 "precision-weighted mean to take effect.",
                 UserWarning,
+            )
+        # The linear precision-scaled head forms eta = mu / (sigma + eps) ELEMENTWISE -- the DIAGONAL
+        # natural parameter. A full-covariance family supplies a rank-4 (B, N, K, K) sigma, so mu/sigma
+        # is a broadcast shape error at the first decode (and only the degenerate B=N=K case would
+        # silently misbroadcast). Reject the unrunnable combo up front rather than crash mid-forward.
+        if self.decode_precision_scaled and not self.use_prior_bank and not self.diagonal_covariance:
+            raise ValueError(
+                f"decode_precision_scaled=True (linear decode) needs a diagonal-covariance family: it "
+                f"forms the diagonal natural parameter eta = mu / sigma, but family={self.family!r} "
+                f"supplies a full (B, N, K, K) covariance. Use a diagonal family, or set "
+                f"decode_precision_scaled=False."
             )
         # precision_weighted_attention's per-key reliability -log(b0 + tr Sigma_j) needs a positive b0.
         if self.precision_weighted_attention and self.precision_attention_b0 <= 0.0:

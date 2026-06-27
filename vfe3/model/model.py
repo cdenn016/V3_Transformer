@@ -23,18 +23,20 @@ from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.norms import get_norm
 from vfe3.geometry.rope import get_pos_rotation
-from vfe3.geometry.transport import RopeTransport
+from vfe3.geometry.transport import RopeTransport, _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.positional_phi import apply_positional_phi
-from vfe3.model.prior_bank import PriorBank
+from vfe3.model.prior_bank import _CHUNKED_DECODERS, PriorBank
 from vfe3.model.stack import vfe_stack
 
 
-# Transport-mode membership sets (Fix B): centralize the string literals so a new regime
-# registers here and all comparisons update automatically.
-_REGIME_NEEDS_MU    = frozenset({"regime_ii", "regime_ii_covariant"})   # regimes that pass mu to _transport
-_REGIME_NEEDS_SIGMA = frozenset({"regime_ii_covariant"})                # regimes that pass sigma to _transport
+# Transport-mode state-routing sets: which regimes' Omega builders read mu/sigma. Sourced from the
+# transport registry metadata (register_transport(needs_mu=/needs_sigma=)) so a new stateful regime
+# advertises its requirements AT REGISTRATION; the callers below feed mu/sigma by membership here,
+# never by matching literal mode names (the add-by-registering contract).
+_REGIME_NEEDS_MU    = _TRANSPORT_NEEDS_MU
+_REGIME_NEEDS_SIGMA = _TRANSPORT_NEEDS_SIGMA
 
 
 def _precision_key_bias(
@@ -761,7 +763,7 @@ class VFEModel(nn.Module):
         # Inference (targets=None) still routes through decode() below for full logits.
         fused_chunked = (
             targets is not None
-            and self.cfg.decode_mode in ("diagonal_chunked", "full_chunked")
+            and self.cfg.decode_mode in _CHUNKED_DECODERS
         )
         if fused_chunked:
             with self._amp_off_context(token_ids.device):
@@ -794,13 +796,13 @@ class VFEModel(nn.Module):
             with self._amp_off_context(token_ids.device):
                 flat_logits = logits.reshape(-1, self.cfg.vocab_size).float()
                 flat_targets = targets.reshape(-1)
-                if (flat_targets != -100).any():
-                    ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100)
-                else:
-                    # All-ignore microbatch: F.cross_entropy returns 0/0 = NaN (mean over zero
-                    # counted tokens), which poisons logging / NaN-guards / grad-accum means. Emit
-                    # a finite, grad-connected zero instead (a dead-but-clean step).
-                    ce = flat_logits.sum() * 0.0
+                # Branchless masked mean (no host sync to test .any()): sum-reduced CE over the
+                # non-ignored tokens divided by a device-side clamped count. An all-ignore microbatch
+                # gives 0/1 = a finite grad-connected 0; F.cross_entropy's default mean would be
+                # 0/0 = NaN there, poisoning logging / NaN-guards / grad-accum means.
+                n_valid = (flat_targets != -100).sum().clamp_min(1)
+                ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100,
+                                     reduction="sum") / n_valid
         loss = ce
         if self.cfg.mass_phi > 0.0:
             # M-step gauge-frame penalty (manuscript Algorithm 1 M-step loss): regularizes the

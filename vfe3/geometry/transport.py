@@ -102,12 +102,24 @@ def _rope_dense_omega(base: 'torch.Tensor | FactoredTransport', rope: torch.Tens
 # under 'regime_ii' (:func:`_build_regime_ii` below, the sanctioned default-OFF learned-connection
 # exception; spec docs/superpowers/specs/2026-06-01-regime-ii-connection-design.md).
 _TRANSPORTS: Dict[str, Callable[..., TransportDict]] = {}
+_TRANSPORT_NEEDS_MU:    set = set()   # regimes whose Omega builder reads the belief means mu
+_TRANSPORT_NEEDS_SIGMA: set = set()   # regimes whose Omega builder reads the belief covariance sigma
 
 
-def register_transport(name: str) -> Callable:
-    """Decorator registering a transport (connection-regime) builder under ``name``."""
+def register_transport(name: str, *, needs_mu: bool = False, needs_sigma: bool = False) -> Callable:
+    """Decorator registering a transport (connection-regime) builder under ``name``.
+
+    ``needs_mu``/``needs_sigma`` are state-routing metadata: they declare which belief fields the
+    regime's Omega builder consumes, so callers feed mu/sigma by querying the registry rather than
+    matching literal mode names. Declaring them here keeps the add-by-registering contract -- a new
+    stateful regime advertises its requirements at registration, not at every call site.
+    """
     def _wrap(fn: Callable[..., TransportDict]) -> Callable[..., TransportDict]:
         _TRANSPORTS[name] = fn
+        if needs_mu:
+            _TRANSPORT_NEEDS_MU.add(name)
+        if needs_sigma:
+            _TRANSPORT_NEEDS_SIGMA.add(name)
         return fn
     return _wrap
 
@@ -197,7 +209,7 @@ def _build_flat(
     return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
 
 
-@register_transport("regime_ii")
+@register_transport("regime_ii", needs_mu=True)
 def _build_regime_ii(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
     group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims
@@ -357,7 +369,7 @@ def _regime_ii_query_chunk(
     return max(1, min(n, _REGIME_II_CHUNK_ELEMS // per_row))
 
 
-@register_transport("regime_ii_covariant")
+@register_transport("regime_ii_covariant", needs_mu=True, needs_sigma=True)
 def _build_regime_ii_covariant(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
     group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims

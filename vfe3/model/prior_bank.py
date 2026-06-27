@@ -48,6 +48,8 @@ from vfe3.numerics import safe_cholesky
 # ---------------------------------------------------------------------------
 _ENCODERS: Dict[str, Callable] = {}
 _DECODERS: Dict[str, Callable] = {}
+_FULL_DECODERS:    set = set()   # decoders consuming a full (B,N,K,K) covariance (rank metadata)
+_CHUNKED_DECODERS: set = set()   # decoders with a fused chunked-CE training path (no (B,N,V) logits)
 
 
 def register_encode(name: str) -> Callable:
@@ -67,10 +69,21 @@ def get_encode(name: str) -> Callable:
     return _ENCODERS[name]
 
 
-def register_decode(name: str) -> Callable:
-    """Decorator registering a decode kernel under ``name``."""
+def register_decode(name: str, *, is_full: bool = False, chunked: bool = False) -> Callable:
+    """Decorator registering a decode kernel under ``name``.
+
+    ``is_full``/``chunked`` are routing metadata: ``is_full`` flags a decoder that consumes a full
+    ``(B, N, K, K)`` covariance (read by the config rank cross-check), ``chunked`` flags one with a
+    fused chunked-CE training path (read by the model's fused-CE dispatch). Declaring them AT
+    REGISTRATION keeps the add-by-registering contract -- a new decoder advertises its capabilities
+    here instead of being threaded into literal-name tuples at the call sites.
+    """
     def _wrap(fn: Callable) -> Callable:
         _DECODERS[name] = fn
+        if is_full:
+            _FULL_DECODERS.add(name)
+        if chunked:
+            _CHUNKED_DECODERS.add(name)
         return fn
     return _wrap
 
@@ -438,12 +451,10 @@ class PriorBank(nn.Module):
         # (n_chunks, B, N) = B*N*ceil(V/chunk), negligible vs (B, N, V).
         logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
         ce_per_pos = logsumexp_v - target_logit                           # (B, N) = -log-softmax at target
-        n_valid = valid.sum()
-        if n_valid == 0:
-            # All-ignore microbatch: match the full path's finite grad-connected zero (the F.cross_entropy
-            # mean over zero counted tokens is NaN); emit a clean grad-connected 0 instead.
-            return ce_per_pos.sum() * 0.0
-        return (ce_per_pos * valid).sum() / n_valid
+        # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
+        # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
+        # (Matches the full path, whose F.cross_entropy mean over zero counted tokens would be NaN.)
+        return (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
 
     def _full_cov_query_invariants(
         self,
@@ -556,10 +567,9 @@ class PriorBank(nn.Module):
 
         logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
         ce_per_pos = logsumexp_v - target_logit                            # (B, N) = -log-softmax at target
-        n_valid = valid.sum()
-        if n_valid == 0:
-            return ce_per_pos.sum() * 0.0                                  # all-ignore: finite grad-connected zero
-        return (ce_per_pos * valid).sum() / n_valid
+        # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
+        # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
+        return (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
 
     def decode_ce_linear_chunked(
         self,
@@ -634,10 +644,9 @@ class PriorBank(nn.Module):
 
         logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
         ce_per_pos = logsumexp_v - target_logit                           # (B, N) = -log-softmax at target
-        n_valid = valid.sum()
-        if n_valid == 0:
-            return ce_per_pos.sum() * 0.0                                  # all-ignore: finite grad-connected zero
-        return (ce_per_pos * valid).sum() / n_valid
+        # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
+        # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
+        return (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
 
 
 @register_encode("per_token")
@@ -723,7 +732,7 @@ def _decode_diagonal(
     return -kl_v / tau_eff                                               # reference_decode's safe_kl_clamp (r2 id17)
 
 
-@register_decode("diagonal_chunked")
+@register_decode("diagonal_chunked", chunked=True)
 def _decode_diagonal_chunked(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -740,7 +749,7 @@ def _decode_diagonal_chunked(
     return _decode_diagonal(pb, mu_q, sigma_q, tau_eff)
 
 
-@register_decode("full")
+@register_decode("full", is_full=True)
 def _decode_full(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -766,7 +775,7 @@ def _decode_full(
     return -kl_v / tau_eff
 
 
-@register_decode("full_chunked")
+@register_decode("full_chunked", is_full=True, chunked=True)
 def _decode_full_chunked(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means

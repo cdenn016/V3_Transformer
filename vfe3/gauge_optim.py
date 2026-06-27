@@ -126,6 +126,17 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
 
     @torch.no_grad()
     def step(self, closure=None):                                      # type: ignore[override]
+        if closure is not None:
+            # The gauge groups are stepped and their grads consumed (set to None) BELOW, before the
+            # trailing super().step(). A closure that re-evaluates the loss would repopulate those grads
+            # and let base AdamW step the frame a SECOND time. No caller passes a closure (GradScaler.step
+            # and a bare optimizer.step() both call with closure=None), so reject it rather than risk the
+            # double-step.
+            raise NotImplementedError(
+                "GaugeNaturalGradAdamW does not support closure-based steps: the gauge gradient is "
+                "consumed before super().step(), so a closure that re-backpropagates would double-step "
+                "the frame. Call step() with no closure."
+            )
         collect = self._collect_gauge_diag                             # gated: True only on log/eval steps
         cos_acc: List[float] = []
         cond_acc: List[torch.Tensor] = []
@@ -202,4 +213,4 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 allc = torch.cat(cond_acc)
                 self._gauge_diag["pullback_cond_median"] = float(allc.median())
                 self._gauge_diag["pullback_cond_max"]    = float(allc.max())
-        return super().step(closure)
+        return super().step()                                          # closure already rejected above
