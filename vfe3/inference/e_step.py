@@ -23,6 +23,8 @@ from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
 from vfe3.geometry.retraction import get_retraction, retract_phi
 from vfe3.numerics import apply_mu_trust_region
 from vfe3.geometry.transport import (
+    _TRANSPORT_NEEDS_MU,
+    _TRANSPORT_NEEDS_SIGMA,
     FactoredTransport,
     RopeTransport,
     build_factored_transport,
@@ -233,8 +235,8 @@ def free_energy_value(
         # flat-transport diagnostic, not the regime_ii objective.
         omega = _transport(
             belief.phi, group, transport_mode=transport_mode,
-            mu=(belief.mu if transport_mode in ("regime_ii", "regime_ii_covariant") else None),
-            sigma=(belief.sigma if transport_mode == "regime_ii_covariant" else None),
+            mu=(belief.mu if transport_mode in _TRANSPORT_NEEDS_MU else None),
+            sigma=(belief.sigma if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
             connection_W=connection_W, connection_M=connection_M,
             cocycle_relaxation=cocycle_relaxation,
         )
@@ -418,7 +420,7 @@ def e_step_iteration(
     # oracle -- the key slot is the oracle's detached key under filtering (query-side coordinate
     # ascent) and the shared live leaf under smoothing (full gradient). Pre-building here as well
     # would only double the most expensive build in the codebase.
-    if transport_mode in ("regime_ii", "regime_ii_covariant"):
+    if transport_mode in _TRANSPORT_NEEDS_MU:                       # mu-dependent Omega -> autograd oracle
         omega = None
 
         def _omega_builder(mu_q: torch.Tensor, mu_k: torch.Tensor):

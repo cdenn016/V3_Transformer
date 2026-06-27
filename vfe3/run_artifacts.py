@@ -263,13 +263,28 @@ def load_checkpoint(
     shape-changing divergence, but shape-preserving semantic drift (LR schedule, n_e_steps,
     e_*_lr, ...) would otherwise pass silently.
 
-    ``weights_only=False`` is required because the bundle carries the optimizer state and the RNG
-    tensors (not a pure ``state_dict``); the file is a trusted run artifact this process wrote
-    (matching ``test_run_artifacts.py::test_save_checkpoint_is_loadable``).
+    The bundle is loaded with ``weights_only=True`` by default, which refuses to execute arbitrary
+    pickle reductions: our bundle carries only tensors, an ``asdict`` config dict, and RNG tensors
+    (no custom classes), so it loads safely under it (matching
+    ``test_run_artifacts.py::test_save_checkpoint_is_loadable``). A bundle that fails the safe load
+    (e.g. an older format) RAISES unless ``cfg.trust_resume_checkpoint`` is set, which falls back to
+    the legacy ``weights_only=False`` load -- only use that for a checkpoint you trust, since that
+    path can execute arbitrary code embedded in the pickle.
     """
     if map_location is None:
         map_location = next(model.parameters()).device
-    ckpt = torch.load(Path(path), map_location=map_location, weights_only=False)
+    trust = bool(getattr(cfg, "trust_resume_checkpoint", False))
+    try:
+        ckpt = torch.load(Path(path), map_location=map_location, weights_only=True)
+    except Exception as exc:                                    # safe load rejected a non-tensor object
+        if not trust:
+            raise RuntimeError(
+                f"checkpoint {Path(path).name} could not be loaded under the safe weights_only=True "
+                f"path ({type(exc).__name__}: {exc}). If you trust this file, set "
+                f"trust_resume_checkpoint=True to allow the legacy weights_only=False load (which can "
+                f"execute arbitrary code embedded in the pickle)."
+            ) from exc
+        ckpt = torch.load(Path(path), map_location=map_location, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
         optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -286,7 +301,8 @@ def load_checkpoint(
         # resume_from is run bookkeeping (the resumed run necessarily sets it; the saved run
         # rarely did) -- not semantic drift.
         drift = sorted(k for k in (saved.keys() | current.keys())
-                       if k != "resume_from" and saved.get(k) != current.get(k))
+                       if k not in ("resume_from", "trust_resume_checkpoint")
+                       and saved.get(k) != current.get(k))
         if drift:
             import warnings
             warnings.warn(

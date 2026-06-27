@@ -324,7 +324,9 @@ def train_step(
         _, loss, ce = model(tokens, targets, estep_grad_out=_egrad)
         _scaler.scale(loss).backward()
         step_loss = float(loss.detach())
-        step_ce = float(ce.detach()) if ce is not None else float("nan")   # pre-step CE (matches step_loss)
+        # CE is synced to a Python float only when a metrics dict is being filled this step (it feeds
+        # metrics_out['train_ce'] and nothing else); on a silent step the extra D2H copy is skipped.
+        step_ce = (float(ce.detach()) if (ce is not None and metrics_out is not None) else float("nan"))
     else:
         if tokens.shape[0] % grad_accum_steps != 0:            # equal-token microbatches require an even split
             raise ValueError(
@@ -334,14 +336,22 @@ def train_step(
             )
         tok_chunks = torch.chunk(tokens, grad_accum_steps, dim=0)
         tgt_chunks = torch.chunk(targets, grad_accum_steps, dim=0)
+        # Token-weighted accumulation: weight each microbatch's mean loss by its valid-token fraction
+        # n_mb/n_tot so the accumulated gradient equals the full-batch token-mean even under uneven
+        # ignore-padding across the batch axis. Uniform 1/grad_accum_steps is exact only when the
+        # microbatches carry EQUAL counted-token counts (e.g. the default unpadded loader), where
+        # n_mb/n_tot == 1/grad_accum_steps and this is byte-identical to the prior weighting.
+        _mb_tok[:] = [int((tc != -100).sum()) for tc in tgt_chunks]   # counted tokens per microbatch (spread = bias)
+        n_tot = max(sum(_mb_tok), 1)
         step_loss = 0.0
         step_ce = 0.0
-        for tok_mb, tgt_mb in zip(tok_chunks, tgt_chunks):
+        for tok_mb, tgt_mb, n_mb in zip(tok_chunks, tgt_chunks, _mb_tok):
             _, loss_mb, ce_mb = model(tok_mb, tgt_mb, estep_grad_out=_egrad)   # last microbatch wins the E-step grads
-            _scaler.scale(loss_mb / grad_accum_steps).backward()   # accumulate the mean-normalized microbatch grad
-            step_loss += float(loss_mb.detach()) / grad_accum_steps
-            step_ce += (float(ce_mb.detach()) if ce_mb is not None else float("nan")) / grad_accum_steps
-            _mb_tok.append(int((tgt_mb != -100).sum()))            # counted tokens per microbatch (spread = bias)
+            w = n_mb / n_tot                                          # token-mean weight (valid-token fraction)
+            _scaler.scale(loss_mb * w).backward()                     # accumulate the token-weighted microbatch grad
+            step_loss += float(loss_mb.detach()) * w
+            if metrics_out is not None:                               # CE synced only on a logged step (PERF)
+                step_ce += (float(ce_mb.detach()) if ce_mb is not None else float("nan")) * w
     # Unscale once when EITHER clipping or metrics capture needs true-unit gradients; GradScaler
     # tracks that unscale_ already ran so the later _scaler.step() does not re-unscale. With a
     # disabled scaler (the default) unscale_ is a no-op, and with metrics_out=None this is
@@ -1006,8 +1016,8 @@ def parameter_report(
         live = sum(p.numel() for _, p in named if p.requires_grad and p.grad is not None)
         model.zero_grad(set_to_none=True)                          # leave no grads for training
         rep.update(live=live, dead=trainable - live, dead_names=dead_names, probed=True)
-    except Exception:
-        pass                                                       # best-effort diagnostic, never fatal
+    except Exception as exc:
+        rep["probe_error"] = repr(exc)                             # surfaced, not swallowed; live/dead stay unknown
     return rep
 
 
@@ -1025,12 +1035,13 @@ def _banner(
     cov = coverage_lines(train_loader, n_steps, dataset) if train_loader is not None else []
     live_note = (f" ({rep['live']:,} live, {rep['dead']:,} dead)"
                  if rep["probed"] and rep["dead"] else "")
+    probe_note = "" if rep["probed"] else "  [live/dead probe failed]"   # distinguish failure from all-live
     dead_line = ([" dead under config (no grad): "
                   + ", ".join(n.replace("prior_bank.", "") for n in rep["dead_names"])]
                  if rep["probed"] and rep["dead_names"] else [])
     return "\n".join([
         bar,
-        f" Gauge VFE Transformer | {rep['total']:,} params{live_note} | {device}",
+        f" Gauge VFE Transformer | {rep['total']:,} params{live_note}{probe_note} | {device}",
         bar,
         f" K={cfg.embed_dim}  N={cfg.max_seq_len}  L={cfg.n_layers}  heads={len(model.group.irrep_dims)}  "
         f"group={cfg.gauge_group}  family={cfg.family}",
