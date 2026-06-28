@@ -192,32 +192,99 @@ def train_ring_checkpoint(
     return model, adequacy
 
 
+# ---- Phase 2 decoding baselines and lesion checks (spec Sections 4.3, 4.6) -------------------------
+# v1-honest matrix: the matched-compute beam / best-of-N baselines and the length-normalized /
+# argmax-confidence near-competitors reduce to existing arms at the H=1 single-decision horizon (no
+# multi-step search to run; a single emitted token makes length-normalization a no-op; argmax-confidence
+# is the greedy logprob arm), so they are deferred to the horizon phase (Phase 3) rather than run as
+# vacuous duplicates -- see docs/research/active-inference/2026-06-28-phase2-scope-note.md. The
+# genuinely v1-distinct standard decoders are the goal-free sampling strategies over the candidate menu
+# below; none reads the goal preference, so on the ring all collapse to ~chance and are reported (not
+# gated) to show that no standard decoder steers.
+SAMPLING_BASELINES = ("temp_sample", "nucleus", "typical")
+
+
+def closed_loop_causality_holds() -> bool:
+    r"""The v1 closed-loop causality lesion check (spec Section 4.6): the committed action must
+    measurably change the next observation. The deterministic ring transition guarantees it -- from
+    every state the three actions DEC/STAY/INC land on three DISTINCT next states (s-1, s, s+1 mod M
+    are pairwise distinct for M > 2) -- and this confirms it by construction over all M states."""
+    states = state_support()
+    nxt = torch.stack([transition(states, torch.full_like(states, a)) for a in ACTION_TOKENS], dim=1)
+    return bool((nxt[:, 0] != nxt[:, 1]).all() and (nxt[:, 1] != nxt[:, 2]).all()
+                and (nxt[:, 0] != nxt[:, 2]).all())
+
+
+def _decode_menu(
+    menu_logits: torch.Tensor,       # (B, |menu|) base logits over the candidate menu
+
+    mode:        str,                 # 'temp_sample' | 'nucleus' | 'typical'
+
+    *,
+    temperature: float = 1.0,        # temp_sample: softmax(logits / T)
+    top_p:       float = 0.9,        # nucleus / typical: retained probability mass
+    generator:   Optional[torch.Generator] = None,
+) -> torch.Tensor:                   # (B, 1) sampled menu index
+    r"""Goal-free standard decoding strategies over the candidate menu (spec Section 4.3). Temperature
+    sampling, nucleus (top-p), and locally-typical sampling (Meister et al. 2022). The draw is taken on
+    CPU with the optional generator for device-independent reproducibility (mirrors the 'random' arm)."""
+    if mode == "temp_sample":
+        probs = torch.softmax(menu_logits / temperature, dim=-1)
+    elif mode in ("nucleus", "typical"):
+        logp = torch.log_softmax(menu_logits, dim=-1)
+        p = logp.exp()
+        if mode == "nucleus":
+            order = p.sort(dim=-1, descending=True)                       # most probable first
+            sorted_p, sorted_idx = order.values, order.indices
+        else:                                                            # locally-typical
+            H = -(p * logp).sum(dim=-1, keepdim=True)                     # (B,1) entropy
+            shift = (-logp - H).abs()                                     # deviation from expected info
+            order = shift.sort(dim=-1)                                    # most typical (smallest) first
+            sorted_idx = order.indices
+            sorted_p = p.gather(-1, sorted_idx)
+        cum = sorted_p.cumsum(dim=-1)
+        keep = (cum - sorted_p) < top_p                                  # retain up to the mass threshold
+        keep[..., 0] = True                                             # always keep the first
+        kept = torch.where(keep, sorted_p, torch.zeros_like(sorted_p))
+        probs = torch.zeros_like(p).scatter(-1, sorted_idx, kept)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+    else:
+        raise ValueError(f"unknown sampling baseline {mode!r}")
+    idx = torch.multinomial(probs.cpu(), 1, generator=generator)         # CPU draw (generator-safe)
+    return idx.to(menu_logits.device)
+
+
 @torch.no_grad()
 def run_episodes(
     model:      VFEModel,
     goals:      torch.Tensor,        # (B,) goal state ids
     states:     torch.Tensor,        # (B,) initial state ids s_0
 
-    policy_mode: str,                 # 'efe_one_step' | 'logprob_control' | 'random'
+    policy_mode: str,                 # scorer: efe_one_step|logprob_control ; baseline: random|greedy_ref|temp_sample|nucleus|typical
 
     *,
     preference_key: str             = "task",   # p(o|C) registry key for the EFE arm
     score_terms:    Tuple[str, ...] = ("risk", "ambiguity"),
     gamma:          float           = 1.0,
+    temperature:    float           = 1.0,      # temp_sample decoder temperature (Phase 2 baseline)
+    top_p:          float           = 0.9,      # nucleus / typical retained mass (Phase 2 baselines)
     candidate_mode: str             = "actions",  # "actions" (the 3 control actions) | "top_k" (top-Kp tokens)
     top_k:          int             = 8,
     beta_C:         float           = 5.0,
     horizon:        int             = 1,
     budget:         int             = 10,       # T_ep
-    generator:      Optional[torch.Generator] = None,   # for 'random' arm tie-breaking
+    generator:      Optional[torch.Generator] = None,   # for the stochastic arms (random / sampling)
 ) -> Dict[str, torch.Tensor]:
     r"""Run B closed-loop ring episodes in parallel under the given arm and return per-episode
-    outcomes. Each step renders ``GOAL q_g SEP CUR q_s``, forms the top-``top_k`` candidate menu from
-    the base logits (the pre-registered generator E, with the candidate prior = base softmax over the
-    menu), scores the menu through ``policy_mode``, commits the argmax action, and applies the
-    DETERMINISTIC environment transition (never the model's predicted outcome; spec Section 2.2). The
-    'random' arm is the placebo (uniform over the menu). Returns dict with ``correct`` (B,) bool,
-    ``steps_to_goal`` (B,), and ``frac_at_goal`` (B,)."""
+    outcomes. Each step renders ``GOAL q_g SEP CUR q_s``, forms the candidate menu from the base logits
+    (the pre-registered generator E, candidate prior = base softmax over the menu), selects an action
+    through ``policy_mode``, and applies the DETERMINISTIC environment transition (never the model's
+    predicted outcome; spec Section 2.2). Arms: ``efe_one_step``/``logprob_control`` are the scorer arms
+    (argmax of the policy posterior); ``random`` is the uniform placebo; ``greedy_ref`` is the
+    unmodified ``generate`` reference (argmax over the full vocab); ``temp_sample``/``nucleus``/
+    ``typical`` are the goal-free sampling baselines (spec Section 4.3). Returns ``correct`` (B,) bool,
+    ``steps_to_goal`` (B,), ``frac_at_goal`` (B,), and scalar ``mean_risk``/``mean_ambiguity``
+    diagnostics for the scorer arms (0 elsewhere; spec Section 4.4 component attribution)."""
     device = next(model.parameters()).device                          # run on the model's device
     goals = goals.to(device)
     state = states.to(device)
@@ -225,9 +292,20 @@ def run_episodes(
     B = states.shape[0]
     reached = torch.full((B,), budget, dtype=torch.long, device=device)   # step index of first arrival
     at_goal_steps = torch.zeros(B, dtype=torch.long, device=device)
+    risk_sum = torch.zeros((), device=device)                         # scorer-arm component diagnostics
+    amb_sum = torch.zeros((), device=device)
+    n_dec = 0
     for t in range(budget):
         context = render_context(goals, state)                            # (B, 5)
         base_logits = model.forward(context)[:, -1, :]                    # (B, V)
+        if policy_mode == "greedy_ref":
+            action = base_logits.argmax(dim=-1)                           # unmodified generate (full vocab)
+            state = (state + delta_tab[action]) % M
+            now_at = state == goals
+            reached = torch.where(now_at & (reached == budget),
+                                  torch.full_like(reached, t + 1), reached)
+            at_goal_steps = at_goal_steps + now_at.long()
+            continue
         if candidate_mode == "actions":
             # The control-task policy space IS the action set. The top-Kp token generator admits
             # non-action tokens (e.g. CUR) whose diffuse OOD prediction scores LOWER than a genuine
@@ -235,19 +313,22 @@ def run_episodes(
             topk = torch.tensor(ACTION_TOKENS, device=device).unsqueeze(0).expand(B, -1)  # (B, 3)
         else:
             topk = base_logits.topk(top_k, dim=-1).indices               # (B, Kp) top-Kp tokens
-        candidates = topk.unsqueeze(-1)                                   # (B, |menu|, 1)
-        menu_logits = torch.gather(base_logits, 1, topk)
-        log_prior = torch.log_softmax(menu_logits, dim=-1)               # (B, |menu|) candidate prior E
+        menu_logits = torch.gather(base_logits, 1, topk)                  # (B, |menu|)
         if policy_mode == "random":
             kp = topk.shape[1]                                            # actual menu width (not cfg top_k)
             rand = (torch.rand(B, kp, generator=generator) if generator is not None
                     else torch.rand(B, kp))                              # CPU draw (generator-safe)
             idx = rand.to(device).argmax(dim=-1, keepdim=True)           # uniform pick over the menu
+        elif policy_mode in SAMPLING_BASELINES:
+            idx = _decode_menu(menu_logits, policy_mode, temperature=temperature,
+                               top_p=top_p, generator=generator)         # goal-free standard decoders
         else:
+            candidates = topk.unsqueeze(-1)                              # (B, |menu|, 1)
+            log_prior = torch.log_softmax(menu_logits, dim=-1)          # (B, |menu|) candidate prior E
             if preference_key == "task":
                 pref = ring_preference(goals, beta_C=beta_C)              # distance-graded p_task (B, V)
             elif preference_key == "flat":
-                pref = get_preference("flat")(model.prior_bank).to(device)
+                pref = get_preference("flat")(model.prior_bank, device=device)
             elif preference_key == "held_out_predictive":
                 # the ring next-observation marginal is uniform over the M state tokens (the data
                 # distribution): carries no per-episode goal, so it is the control arm (spec 2.3/4.3).
@@ -263,6 +344,9 @@ def run_episodes(
                 log_prior=log_prior, base_logits=base_logits,
             )
             idx = out.policy_posterior.argmax(dim=-1, keepdim=True)       # greedy (deterministic eval)
+            risk_sum = risk_sum + torch.gather(out.risk, 1, idx).sum()    # committed-action diagnostics
+            amb_sum = amb_sum + torch.gather(out.ambiguity, 1, idx).sum()
+            n_dec += B
         action = torch.gather(topk, 1, idx).squeeze(1)                   # (B,) committed action token
         state = (state + delta_tab[action]) % M                          # deterministic environment step
         now_at = state == goals
@@ -274,4 +358,6 @@ def run_episodes(
         "correct": correct,
         "steps_to_goal": reached,
         "frac_at_goal": at_goal_steps.float() / budget,
+        "mean_risk": (risk_sum / n_dec) if n_dec else torch.zeros((), device=device),
+        "mean_ambiguity": (amb_sum / n_dec) if n_dec else torch.zeros((), device=device),
     }

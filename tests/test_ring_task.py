@@ -82,10 +82,35 @@ def test_run_episodes_smoke_shapes_on_untrained_model():
     goals = torch.tensor([2, 7, 11, 0])
     s0 = torch.tensor([5, 7, 3, 8])                        # episode 1 starts at goal already
     out = rt.run_episodes(model, goals, s0, "efe_one_step", gamma=1.0, top_k=8, budget=5)
-    assert set(out) == {"correct", "steps_to_goal", "frac_at_goal"}
+    assert set(out) == {"correct", "steps_to_goal", "frac_at_goal", "mean_risk", "mean_ambiguity"}
     assert out["correct"].shape == (4,) and out["correct"].dtype == torch.bool
     assert out["steps_to_goal"].shape == (4,) and out["frac_at_goal"].shape == (4,)
     assert (out["steps_to_goal"] <= 5).all()
+    assert torch.isfinite(out["mean_risk"]) and torch.isfinite(out["mean_ambiguity"])  # scorer diagnostics
+
+
+def test_run_episodes_phase2_baseline_arms_run_and_stay_valid():
+    # Phase 2 (spec 4.3): greedy reference + goal-free sampling baselines run end-to-end and carry no
+    # scorer diagnostics (they do not score risk/ambiguity).
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=rt.V, embed_dim=12, n_heads=2, max_seq_len=rt.SEQ_LEN,
+                     n_layers=1, n_e_steps=1, use_prior_bank=False)
+    model = VFEModel(cfg)
+    model.eval()
+    goals = torch.tensor([2, 7, 11, 0])
+    s0 = torch.tensor([5, 7, 3, 8])
+    for mode, kw in (("greedy_ref", {}), ("temp_sample", {"temperature": 2.0}),
+                     ("nucleus", {"top_p": 0.9}), ("typical", {"top_p": 0.9})):
+        out = rt.run_episodes(model, goals, s0, mode, budget=5,
+                              generator=torch.Generator().manual_seed(2), **kw)
+        assert out["correct"].shape == (4,) and out["correct"].dtype == torch.bool
+        assert (out["steps_to_goal"] <= 5).all()
+        assert float(out["mean_risk"]) == 0.0 and float(out["mean_ambiguity"]) == 0.0
+
+
+def test_closed_loop_causality_holds_by_construction():
+    # v1 lesion gate (spec 4.6): the committed action measurably changes the next observation.
+    assert rt.closed_loop_causality_holds() is True
 
 
 def test_predictive_adequacy_runs_and_is_a_fraction():
