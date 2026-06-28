@@ -641,21 +641,40 @@ class VFEModel(nn.Module):
         phi0 = self._apply_pos_phi(enc.phi[0]).unsqueeze(0)          # (1, N, n_gen) encoded frame, fixed
         return self._refine_s(token_ids[:1], phi0)                   # (1, N, K) x2
 
-    def forward(
+    def forward_beliefs(
         self,
-        token_ids: torch.Tensor,         # (B, N) integer token ids
-        targets:   Optional[torch.Tensor] = None,   # (B, N) next-token ids (-100 = ignore)
+        token_ids:      torch.Tensor,                    # (B, N) integer token ids
 
         *,
-        estep_grad_out: Optional[dict] = None,   # diag out-param: filled with the E-step belief-grad norms
-    ) -> 'torch.Tensor | Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]':
-        r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given.
+        return_logits:  bool           = False,          # also decode (B, N, V) logits; else logits is None
+        capture:        Optional[dict] = None,           # out-param: M-step intermediates (q*, prior p, raw out)
+        estep_grad_out: Optional[dict] = None,           # diag out-param: E-step belief-grad norms (forwarded)
+    ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
+        r"""Run the belief pipeline and return the converged belief q* (post final_norm), optionally
+        with the decoded logits. This is the single belief-production seam shared by ``forward``,
+        ``generate`` (via the policy layer) and the EFE scorer.
 
-        On the fused-chunked training path logits is None (callers discard it there), hence the
-        Optional first element of the training tuple. When ``estep_grad_out`` (a dict) is passed, it
-        is filled with the LAST-block / LAST-iteration raw E-step belief-gradient norms
-        ``{'mu','sigma','phi'}`` (||grad_mu/sigma/phi|| of F over the belief tuple) -- the E-step
-        analogue of the M-step per-group grad norms; default None is zero-overhead and byte-identical."""
+        Factors the (previously inline) sequence q_i(0) = p_i = encode(token) -> phi <- pos_phi ->
+        (optional s-refine) -> precision-bias fold -> vfe_stack (L blocks of E-step belief descent) ->
+        final_norm, i.e. the map from token ids to the converged Gaussian tuple q* = (mu*, Sigma*, phi*).
+        The returned ``BeliefState`` carries mu = final_norm(mu_final, sigma_final), sigma = sigma_final,
+        and phi = out.phi UNCHANGED (final_norm transforms only the mean), so a caller reads q*.phi for
+        the M-step gauge penalty exactly as forward does. ``return_logits`` decodes p(o | q*_i) via
+        ``prior_bank.decode`` inside the SAME fp32 island forward's inference branch uses, so the logits
+        are byte-identical to the pre-refactor ``forward(targets=None)`` return.
+
+        ``capture`` (an out-param dict, non-None only when ``mstep_self_coupling_weight>0``) is filled
+        with the three pre-transform intermediates the M-step self-coupling term reads and cannot
+        recover from the post-final_norm belief: ``capture['converged']`` (the last block's converged
+        pre-transform q*, written by ``vfe_stack``), ``capture['prior']`` (the encode-time prior p,
+        post s-refine), and ``capture['out']`` (the raw ``vfe_stack`` output, pre final_norm).
+
+        Grad-transparent: it carries the SAME internal ``run = no_grad() if e_step_gradient=='detach'
+        else nullcontext()`` and ``amp`` contexts forward establishes, so a grad-enabled training caller
+        and a no-grad inference caller both get the identical forward value. The no-grad property used by
+        the policy layer comes from the caller's ``@torch.no_grad`` scope (``generate``,
+        ``rollout_beliefs``), not from this method.
+        """
         B, N = token_ids.shape
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
         beliefs = beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))
@@ -718,9 +737,8 @@ class VFEModel(nn.Module):
             # helper folds the SAME prior in diagnostics()/attention_maps() (r2 id22).
             log_prior = self._fold_precision_bias(log_prior, beliefs.sigma)
             # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
-            # M-step self-coupling term below (manuscript: the self-term reads q*, not the
+            # M-step self-coupling term in forward (manuscript: the self-term reads q*, not the
             # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.
-            cap = {} if self.cfg.mstep_self_coupling_weight > 0.0 else None
             grad_rec = {} if estep_grad_out is not None else None   # E-step belief-grad capture (gated, off by default)
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm,
@@ -731,7 +749,7 @@ class VFEModel(nn.Module):
                             e_step_gradient=e_step_gradient,
                             rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
                             rope_on_value=self.cfg.rope_on_value,
-                            capture=cap, grad_record=grad_rec)
+                            capture=capture, grad_record=grad_rec)
         if estep_grad_out is not None:                           # one host sync, only when requested
             for _gk in ("mu", "sigma", "phi"):
                 _gv = grad_rec.get(_gk) if grad_rec is not None else None
@@ -741,6 +759,68 @@ class VFEModel(nn.Module):
 
         if self.final_norm is not None:                          # config-selected final norm (cached)
             mu_final = self.final_norm(mu_final, sigma_final)
+
+        belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi)
+        if capture is not None:
+            # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
+            # encode-time prior p (post s-refine) and the raw pre-final_norm stack output, which the
+            # M-step self-coupling handoff reconstruction needs and cannot recover from `belief`.
+            capture["prior"] = beliefs
+            capture["out"]   = out
+        logits = None
+        if return_logits:
+            with self._amp_off_context(token_ids.device):
+                logits = self.prior_bank.decode(mu_final.float(), sigma_final.float())   # (B, N, V) fp32
+        return belief, logits
+
+    @torch.no_grad()
+    def rollout_beliefs(
+        self,
+        token_ids:     torch.Tensor,                     # (B, N) context ids (the action prefix)  -> D
+
+        *,
+        return_logits: bool          = True,             # continuation scoring needs the decode    -> A
+    ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
+        r"""Public no-grad belief rollout: the active-inference contract's D (initial belief from the
+        current context) and the one-step B (transition rule) building block. A single forward of
+        ``token_ids`` through the shared belief seam under no_grad, returning (q*, logits). Appending a
+        candidate ACTION token to ``token_ids`` and re-calling realizes one transition q*_t -> q*_{t+1};
+        iterating it H times is the fixed-horizon rollout. The environment's response to a committed
+        action is appended by the generation loop AFTER selection, never inside the scored rollout.
+        Returns the SAME tensors ``forward`` would, so it adds no new numerical path.
+        """
+        return self.forward_beliefs(token_ids, return_logits=return_logits)
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,         # (B, N) integer token ids
+        targets:   Optional[torch.Tensor] = None,   # (B, N) next-token ids (-100 = ignore)
+
+        *,
+        estep_grad_out: Optional[dict] = None,   # diag out-param: filled with the E-step belief-grad norms
+    ) -> 'torch.Tensor | Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]':
+        r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given.
+
+        On the fused-chunked training path logits is None (callers discard it there), hence the
+        Optional first element of the training tuple. When ``estep_grad_out`` (a dict) is passed, it
+        is filled with the LAST-block / LAST-iteration raw E-step belief-gradient norms
+        ``{'mu','sigma','phi'}`` (||grad_mu/sigma/phi|| of F over the belief tuple) -- the E-step
+        analogue of the M-step per-group grad norms; default None is zero-overhead and byte-identical.
+
+        Belief production is factored into :meth:`forward_beliefs` (the shared seam); this method is the
+        decode + cross-entropy + M-step assembly on top of it."""
+        if targets is None:
+            # Inference: logits via the shared belief seam. estep_grad_out is forwarded so the
+            # diagnostic still fills on this path (byte-identical to the pre-refactor return).
+            return self.forward_beliefs(token_ids, return_logits=True, estep_grad_out=estep_grad_out)[1]
+        # Training path: produce the converged belief q* (no (B,N,V) logits) via the shared seam, then
+        # run the existing decode + cross-entropy + M-step assembly reading belief.mu / sigma / phi.
+        # cap (non-None only when the M-step self-coupling term is on) is filled by forward_beliefs
+        # with the converged q*, the encode-time prior, and the raw pre-final_norm stack output.
+        cap = {} if self.cfg.mstep_self_coupling_weight > 0.0 else None
+        belief, _ = self.forward_beliefs(token_ids, return_logits=False,
+                                         capture=cap, estep_grad_out=estep_grad_out)
+        mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm; sigma = out.sigma
 
         # Decode + cross-entropy fp32 island. The decode matmul (_decode_diagonal) reconstructs the
         # Mahalanobis term via a catastrophically-cancelling subtraction pinned at atol-1e-3, and CE
@@ -790,9 +870,7 @@ class VFEModel(nn.Module):
         else:
             with self._amp_off_context(token_ids.device):
                 logits = self.prior_bank.decode(mu_final.float(), sigma_final.float())   # (B, N, V) fp32
-            if targets is None:
-                return logits
-
+            # targets is guaranteed not None here (the inference path returned via forward_beliefs above).
             with self._amp_off_context(token_ids.device):
                 flat_logits = logits.reshape(-1, self.cfg.vocab_size).float()
                 flat_targets = targets.reshape(-1)
@@ -810,7 +888,7 @@ class VFEModel(nn.Module):
             # outer-loss role; mass_phi ALSO enters the inner phi E-step objective (e_step:
             # phi_alignment_loss), shaping the inference trajectory. Both roles are in the
             # manuscript algorithm (E-step phi gradient and M-step loss both carry alpha_phi/2||phi||^2).
-            loss = loss + 0.5 * self.cfg.mass_phi * (out.phi ** 2).mean()
+            loss = loss + 0.5 * self.cfg.mass_phi * (belief.phi ** 2).mean()
         if self.cfg.mstep_self_coupling_weight > 0.0:
             # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2111):
             # L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the alpha-weighted self-coupling of the
@@ -842,10 +920,10 @@ class VFEModel(nn.Module):
             from vfe3.alpha_i import self_coupling_alpha, alpha_is_per_coord
             cfg = self.cfg
             rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
-            mu_p, sigma_p = beliefs.mu, beliefs.sigma
+            mu_p, sigma_p = cap["prior"].mu, cap["prior"].sigma  # encode-time prior p (from forward_beliefs)
             for _ in range(cfg.n_layers - 1):
-                mu_p = (1.0 - rho) * mu_p + rho * out.mu
-                sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
+                mu_p = (1.0 - rho) * mu_p + rho * cap["out"].mu      # raw pre-final_norm stack output
+                sigma_p = (1.0 - rho_s) * sigma_p + rho_s * cap["out"].sigma
             fam = get_family(cfg.family)
             q_conv = cap["converged"]                           # q*: pre-transform converged belief
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
@@ -854,7 +932,7 @@ class VFEModel(nn.Module):
                 divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
             )
             alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
-                self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
+                self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, cap["out"].mu.device), c0=_as_coeff(cfg.c0, cap["out"].mu.device),
                 log_alpha=getattr(self, "log_alpha", None),
             )
             coupling = alpha_sc.detach() * self_div            # alpha_i^(k)* D^(k) (envelope: alpha* fixed)
@@ -926,7 +1004,7 @@ class VFEModel(nn.Module):
             # design, NOT this term. Computed once per forward at the loss level (like diagnostics()).
             # The body lives in _gamma_coupling_term so diagnostics logs the SAME term (audit V2).
             loss = loss + self.cfg.lambda_gamma * self._gamma_coupling_term(
-                token_ids, out.phi.detach())
+                token_ids, belief.phi.detach())
         return logits, loss, ce.detach()
 
     @property
@@ -1198,28 +1276,73 @@ class VFEModel(nn.Module):
         seq = token_ids
         for _ in range(max_new_tokens):
             context = seq[:, -self.cfg.max_seq_len:]                 # (B, <=max_seq_len)
-            logits = self.forward(context)                          # (B, n, V)
-            logits = logits[:, -1, :]                               # (B, V) last position
-            if greedy:
-                next_token = logits.argmax(dim=-1, keepdim=True)    # (B, 1)
+            if self.cfg.policy_mode == "none":
+                logits = self.forward(context)                          # (B, n, V)
+                logits = logits[:, -1, :]                               # (B, V) last position
+                if greedy:
+                    next_token = logits.argmax(dim=-1, keepdim=True)    # (B, 1)
+                else:
+                    logits = logits / temperature
+                    if top_k is not None:
+                        kth = logits.topk(top_k, dim=-1).values[:, -1:]  # (B, 1) k-th largest
+                        logits = logits.masked_fill(logits < kth, float("-inf"))
+                    if top_p is not None:
+                        sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+                        sorted_probs = sorted_logits.softmax(dim=-1)       # compute the softmax once
+                        cumprobs = sorted_probs.cumsum(dim=-1)
+                        # Keep the smallest nucleus whose cumprob reaches top_p; the strict
+                        # shift always keeps the top token (its cumprob>=p never removes it).
+                        remove = cumprobs - sorted_probs >= top_p
+                        remove_unsorted = remove.scatter(-1, sorted_idx, remove)
+                        logits = logits.masked_fill(remove_unsorted, float("-inf"))
+                    probs = logits.softmax(dim=-1)                      # (B, V)
+                    next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
             else:
-                logits = logits / temperature
-                if top_k is not None:
-                    kth = logits.topk(top_k, dim=-1).values[:, -1:]  # (B, 1) k-th largest
-                    logits = logits.masked_fill(logits < kth, float("-inf"))
-                if top_p is not None:
-                    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
-                    sorted_probs = sorted_logits.softmax(dim=-1)       # compute the softmax once
-                    cumprobs = sorted_probs.cumsum(dim=-1)
-                    # Keep the smallest nucleus whose cumprob reaches top_p; the strict
-                    # shift always keeps the top token (its cumprob>=p never removes it).
-                    remove = cumprobs - sorted_probs >= top_p
-                    remove_unsorted = remove.scatter(-1, sorted_idx, remove)
-                    logits = logits.masked_fill(remove_unsorted, float("-inf"))
-                probs = logits.softmax(dim=-1)                      # (B, V)
-                next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+                # EFE policy rerank (no_grad). Reached only under a non-default policy_mode toggle, so
+                # default generation (policy_mode='none') is byte-identical (spec Section 3.4).
+                next_token = self._policy_select(context, greedy=greedy)   # (B, 1)
             seq = torch.cat([seq, next_token], dim=-1)
         return seq
+
+    @torch.no_grad()
+    def _policy_select(
+        self,
+        context: torch.Tensor,           # (B, N) current-context ids
+
+        *,
+        greedy:  bool = True,            # True -> argmax the policy posterior; else sample it
+    ) -> torch.Tensor:                   # (B, 1) selected next-token id
+        r"""EFE policy selection over a fixed top-``policy_top_k`` candidate menu (spec Section 3.4).
+
+        Decodes the base last-position logits once (the pre-registered candidate generator E), scores
+        the menu through the configured ``policy_mode`` scorer with the candidate prior E = the base
+        softmax over the menu, and returns the argmax (or a sample) of the policy posterior. The
+        environment response to a committed action is appended by the closed-loop driver, never here
+        (the scored rollout appends the action only; spec Section 2.2).
+
+        Note: ``policy_preference='task'`` / ``'held_out_predictive'`` need per-episode / per-corpus
+        context (the goal, or p_data) that ``generate`` does not supply, so those preferences are
+        driven through the closed-loop experiment harness, which calls the scorer directly; under
+        ``generate`` the meaningful preference is the global ``'flat'``.
+        """
+        from vfe3.inference.policy import get_policy, get_preference
+        base_logits = self.forward(context)[:, -1, :]               # (B, V) base last-position logits
+        Kp = self.cfg.policy_top_k
+        topk = base_logits.topk(Kp, dim=-1).indices                # (B, Kp) candidate token ids (generator E)
+        candidates = topk.unsqueeze(-1)                            # (B, Kp, 1) one-step action tokens
+        menu_logits = torch.gather(base_logits, 1, topk)          # (B, Kp) base logits over the menu
+        log_prior = torch.log_softmax(menu_logits, dim=-1)        # (B, Kp) log E(pi): base softmax over menu
+        preference = get_preference(self.cfg.policy_preference)(self.prior_bank)   # (V,) / (B,V) log p(o|C)
+        out = get_policy(self.cfg.policy_mode)(
+            context, candidates, preference, self,
+            gamma=self.cfg.policy_precision, horizon=self.cfg.policy_horizon,
+            score_terms=self.cfg.policy_score_terms, log_prior=log_prior, base_logits=base_logits,
+        )
+        if greedy:
+            idx = out.policy_posterior.argmax(dim=-1, keepdim=True)         # (B, 1) menu index
+        else:
+            idx = torch.multinomial(out.policy_posterior, num_samples=1)    # (B, 1)
+        return torch.gather(topk, 1, idx)                          # (B, 1) selected token id
 
     @torch.no_grad()
     def _fold_precision_bias(
