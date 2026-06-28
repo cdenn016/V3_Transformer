@@ -51,6 +51,28 @@ def test_ring_preference_is_distance_graded():
     assert float(p[5]) == float(p[3])                      # symmetric in ring distance (dist 1 both sides)
 
 
+def test_ring_preference_keeps_efe_score_finite():
+    # Regression: a -inf preference floor on non-state tokens made forward KL(q || p_task) diverge to
+    # +inf wherever the model's q had off-state mass, collapsing score to inf and the posterior to nan.
+    from vfe3.inference.policy import get_policy
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=rt.V, embed_dim=12, n_heads=2, max_seq_len=rt.SEQ_LEN,
+                     n_layers=1, n_e_steps=1, use_prior_bank=False)
+    model = VFEModel(cfg)
+    model.eval()
+    goals = torch.tensor([3, 9])
+    ctx = rt.render_context(goals, torch.tensor([0, 5]))
+    base = model.forward(ctx)[:, -1, :]
+    topk = base.topk(8, dim=-1).indices
+    pref = rt.ring_preference(goals, beta_C=5.0)
+    with torch.no_grad():
+        out = get_policy("efe_one_step")(ctx, topk.unsqueeze(-1), pref, model, gamma=1.0, base_logits=base)
+    assert torch.isfinite(out.risk).all()
+    assert torch.isfinite(out.score).all()
+    assert torch.isfinite(out.policy_posterior).all()
+    assert torch.allclose(out.policy_posterior.sum(-1), torch.ones(2), atol=1e-5)
+
+
 def test_run_episodes_smoke_shapes_on_untrained_model():
     torch.manual_seed(0)
     cfg = VFE3Config(vocab_size=rt.V, embed_dim=12, n_heads=2, max_seq_len=rt.SEQ_LEN,
