@@ -1744,6 +1744,33 @@ def _as_float(x: Any) -> float:
         return float("inf")
 
 
+def _base_label(label: str) -> str:
+    r"""Strip the ``__s<seed>`` suffix a multi-seed sweep appends, so the seeded cells of one config
+    collapse to one base label (``a2_on__s0`` / ``a2_on__s1`` -> ``a2_on``). A non-seeded label is
+    returned unchanged."""
+    base, _, tail = str(label).rpartition("__s")
+    return base if (base and tail.lstrip("-").isdigit()) else str(label)
+
+
+def _seed_aggregate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    r"""Group finished cells by base label into across-seed statistics: n, and the mean / SD / CV of the
+    primary val PPL. A single-seed base reports n=1, SD=0. Sorted by mean PPL; bases with no finite PPL
+    are dropped. The honest endpoint for reading a sub-3-percent ablation effect against seed noise."""
+    groups: Dict[str, List[float]] = {}
+    for r in rows:
+        ppl = _as_float(r.get("primary_val_ppl"))
+        if ppl < float("inf"):
+            groups.setdefault(_base_label(r.get("label", "")), []).append(ppl)
+    agg: List[Dict[str, Any]] = []
+    for base, vals in groups.items():
+        n = len(vals)
+        mean = sum(vals) / n
+        sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5 if n > 1 else 0.0
+        agg.append({"label": base, "n": n, "mean": mean, "sd": sd,
+                    "cv": (sd / mean) if mean > 0 else float("nan")})
+    return sorted(agg, key=lambda d: d["mean"])
+
+
 def analyze_sweep(sweep_dir: Path) -> None:
     rows = _read_sweep_csv(sweep_dir)
     if not rows:
@@ -1768,6 +1795,17 @@ def analyze_sweep(sweep_dir: Path) -> None:
         print(f"\nrelative to best ({finished[0]['label']}):")
         for r in finished:
             print(f"  {r['label']:<34}{(r['_ppl'] - best) / best * 100:+.1f}%")
+
+    # Across-seed aggregation (only when a base label carries multiple seeds): n / mean / SD / CV of the
+    # val PPL per config, so a sub-3-percent effect is read against the seed noise rather than as a
+    # single-seed point win. Native here rather than left advisory.
+    agg = _seed_aggregate(rows)
+    if any(a["n"] > 1 for a in agg):
+        print(f"\nacross-seed aggregation ({sum(a['n'] for a in agg)} runs -> {len(agg)} cells):")
+        print(f"{'label':<34}{'n':>4}{'mean PPL':>12}{'SD':>10}{'CV%':>8}")
+        print("-" * 68)
+        for a in agg:
+            print(f"{a['label']:<34}{a['n']:>4}{a['mean']:>12.3f}{a['sd']:>10.3f}{a['cv'] * 100:>8.1f}")
 
 
 def summarize_sweeps(output_dir: Path) -> None:
@@ -1855,6 +1893,33 @@ def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
     fig.tight_layout()
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}.png"
+    fig.savefig(out)
+    plt.close(fig)
+    print(f"  figure -> {out}")
+
+
+def _plot_seed_aggregate(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""Write ``figures/<sweep>_seed_aggregate.png`` -- across-seed mean val PPL +/- 1 SD per base label
+    (the seed-grouped error bars the per-row table flattens). A no-op unless some base label has >= 2
+    seeds, so it is safe to call after every sweep; a single-seed sweep draws nothing."""
+    agg = sorted(_seed_aggregate(_read_sweep_csv(sweep_dir)), key=lambda d: d["mean"])
+    if not any(a["n"] > 1 for a in agg):
+        return
+    plt = _plt_or_none()
+    if plt is None:
+        return
+    y = list(range(len(agg)))
+    fig, ax = plt.subplots(figsize=(7, 0.5 * len(agg) + 1.5))
+    ax.errorbar([a["mean"] for a in agg], y, xerr=[a["sd"] for a in agg], fmt="o",
+                color="#0072B2", ecolor="#888888", capsize=3)
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"{a['label']} (n={a['n']})" for a in agg])
+    ax.invert_yaxis()
+    ax.set_xlabel("validation PPL (across-seed mean $\\pm$ 1 SD)")
+    ax.set_title(f"{sweep_dir.name}: seed-grouped aggregation")
+    fig.tight_layout()
+    fig_dir.mkdir(exist_ok=True)
+    out = fig_dir / f"{sweep_dir.name}_seed_aggregate.png"
     fig.savefig(out)
     plt.close(fig)
     print(f"  figure -> {out}")
@@ -2300,6 +2365,7 @@ def main() -> None:
         sweep_dir = output_dir / name
         analyze_sweep(sweep_dir)                             # this sweep's table (accumulated)
         _plot_one_sweep(sweep_dir, fig_dir)                 # this sweep's PPL figure (tacked on)
+        _plot_seed_aggregate(sweep_dir, fig_dir)           # multi-seed mean+/-SD forest (no-op if single-seed)
         _plot_rank_collapse(sweep_dir, fig_dir)            # F2/EXP-7 r(X)-by-depth (no-op if absent)
         _plot_attention_entropy(sweep_dir, fig_dir)        # C1/EXP-4 PPL-gap + Cov-gap (no-op if absent)
         _plot_wallclock_convergence(sweep_dir, fig_dir)    # D1/EXP-8 wall-clock convergence (no-op if absent)

@@ -440,10 +440,9 @@ def get_figure(name: str) -> Callable:
 
 
 # ===========================================================================
-# Publication figures (the claim-linked set; see
-# docs/superpowers/specs/2026-06-04-publication-figures-design.md). Each consumes
-# the new vfe3.metrics measurements / vfe3.viz.extract runner outputs, builds a
-# multi-panel composite, registers by name, and returns the Figure.
+# Publication figures (the claim-linked set). Each consumes the vfe3.metrics
+# measurements / vfe3.viz.extract runner outputs, builds a multi-panel
+# composite, registers by name, and returns the Figure.
 # ===========================================================================
 
 _EPS_F32 = 1.1920929e-7                                           # float32 machine epsilon
@@ -893,6 +892,261 @@ def plot_estep_convergence(
     axes[1].legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
+
+
+# ---------------------------------------------------------------------------
+# History dashboards: small-multiples over metrics.csv columns the training loop
+# already logs but no standard figure surfaced (geometry / E-step / validation /
+# optimizer geometry). Shared helpers below; one registered figure per family.
+# ---------------------------------------------------------------------------
+
+def _series_panel(
+    ax,
+    history: Dict,
+    step:    np.ndarray,
+    specs:   list,                       # [(column_key, label, color), ...]
+
+    *,
+    logy:    bool = False,
+) -> int:
+    r"""Plot each PRESENT, finite series of ``specs`` onto ``ax`` (a faint raw line under a rolling-mean
+    trend for a long series, ``o-`` markers for a short one), masking non-finite samples per series so
+    an eval-cadence column (NaN on non-eval rows) draws only on its eval steps. Returns the series count
+    actually drawn."""
+    drawn = 0
+    for key, label, color in specs:
+        if key not in history:
+            continue
+        v = _np(history[key]).astype(float)
+        keep = np.isfinite(v)
+        if logy:
+            keep = keep & (v > 0)                                # a log axis drops non-positive samples
+        x, vv = step[keep], v[keep]
+        if not vv.size:
+            continue
+        drawn += 1
+        if vv.size > 8:
+            ax.plot(x, vv, lw=0.7, color=color, alpha=0.25)
+            ax.plot(x, _rolling_mean(vv, max(5, vv.size // 80)), lw=2.0, color=color,
+                    label=f"{label} ={vv[-1]:.3g}")
+        else:
+            ax.plot(x, vv, "o-", ms=4, lw=1.6, color=color, label=f"{label} ={vv[-1]:.3g}")
+    if drawn:
+        if logy:
+            ax.set_yscale("log")
+        ax.legend(fontsize=7, frameon=False, loc="best")
+    return drawn
+
+
+def _history_dashboard(
+    history:  Dict,
+    panels:   list,                      # [{title, ylabel, series:[(key,label,color)], [logy]}, ...]
+    suptitle: str,
+    path:     Optional[str],
+
+    *,
+    ncols:    int = 3,
+) -> object:
+    r"""Small-multiples dashboard over training history: one mini-panel per group of commensurate
+    columns. A panel whose every column is absent or all-NaN is dropped (so a run missing a metric
+    family simply shows fewer panels), and the grid self-sizes to the surviving panel count."""
+    step = _np(history["step"]).astype(float)
+    live = []
+    for p in panels:
+        present = [(k, lab, c) for (k, lab, c) in p["series"]
+                   if k in history and bool(np.isfinite(_np(history[k]).astype(float)).any())]
+        if present:
+            live.append({**p, "series": present})
+    if not live:
+        fig, ax = plt.subplots(figsize=(4.0, 3.0))
+        ax.text(0.5, 0.5, "no history columns present", ha="center", va="center")
+        ax.axis("off")
+        return _save(fig, path)
+    nrows = (len(live) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.3 * ncols, 3.1 * nrows), squeeze=False)
+    for i, p in enumerate(live):
+        ax = axes[i // ncols][i % ncols]
+        _series_panel(ax, history, step, p["series"], logy=bool(p.get("logy", False)))
+        ax.set(xlabel="training step", ylabel=p["ylabel"], title=p["title"])
+        if step.size:
+            ax.set_xlim(float(step.min()), float(step.max()))
+            _step_xaxis(ax)
+    for j in range(len(live), nrows * ncols):                    # blank the unused grid cells
+        axes[j // ncols][j % ncols].axis("off")
+    fig.suptitle(suptitle, fontsize=12)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("geometry_health")
+def plot_geometry_health(
+    history: Dict,                       # step + gauge/SPD/Fisher/guard health columns (any subset)
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""Gauge / SPD / Fisher geometry-health dashboard over training.
+
+    Surfaces the converged-state geometry scalars ``diagnostics()`` already logs to ``metrics.csv`` but
+    that no standard figure plotted: holonomy / cocycle flatness, gauge-frame magnitude and spread,
+    belief-covariance conditioning and effective rank, belief Fisher precision, numerical-guard
+    saturation, and attention-entropy collapse. Together they say whether the learned geometry stays
+    meaningful rather than degenerating to a flat cocycle (phi -> 0, an UNGAUGED transformer) or a
+    guard-pinned fixed point. Each panel self-gates on column presence."""
+    panels = [
+        {"title": "Holonomy / cocycle flatness", "ylabel": "curvature", "logy": True, "series": [
+            ("holonomy_wilson", r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$", _CB[0]),
+            ("cocycle_residual", "cocycle residual", _CB[1]),
+            ("holonomy_deviation", r"$\langle\|H-I\|_F\rangle$", _CB[2])]},
+        {"title": "Gauge-frame spread", "ylabel": "spread", "series": [
+            ("gauge_invariant_spread", "gauge invariant", _CB[3]),
+            ("gauge_head_logdet_spread", r"head $\log|\det|$", _CB[4])]},
+        {"title": "Gauge-frame magnitude", "ylabel": r"$\|\phi\|$", "series": [
+            ("phi_norm_mean", r"mean $\|\phi\|$", _CB[0]),
+            ("phi_norm_std", r"std $\|\phi\|$", _CB[5])]},
+        {"title": "Belief conditioning", "ylabel": r"$\kappa(\Sigma)$", "logy": True, "series": [
+            ("belief_cond_p95", "p95", _CB[1]),
+            ("belief_cond_max", "max", _CB[3])]},
+        {"title": "Belief effective rank", "ylabel": r"$\mathrm{erank}(\Sigma)$", "series": [
+            ("eff_rank_p5", "p5", _CB[2]),
+            ("eff_rank_median", "median", _CB[0]),
+            ("eff_rank_p95", "p95", _CB[4])]},
+        {"title": "Belief precision", "ylabel": r"$\langle\mathrm{tr}\,\Sigma^{-1}\rangle/2$",
+         "logy": True, "series": [("fisher_trace_mean", "Fisher trace", _CB[3])]},
+        {"title": "Guard saturation", "ylabel": "fraction", "series": [
+            ("guard_sigma_floor_frac", r"$\sigma$ floor", _CB[0]),
+            ("guard_sigma_ceil_frac", r"$\sigma$ ceil", _CB[1]),
+            ("guard_energy_klmax_frac", "energy klmax", _CB[2]),
+            ("guard_selfdiv_klmax_frac", "selfdiv klmax", _CB[4])]},
+        {"title": "Numerical safety", "ylabel": "fraction", "series": [
+            ("nonfinite_frac", "nonfinite", _CB[1]),
+            ("renyi_band_frac", "Renyi band", _CB[5])]},
+        {"title": "Attention-entropy collapse", "ylabel": "count / nats", "series": [
+            ("attn_entropy_collapsed_heads", "collapsed heads", _CB[0]),
+            ("attn_entropy_min", "min row entropy", _CB[3])]},
+    ]
+    return _history_dashboard(history, panels, "Gauge / SPD / Fisher geometry health", path)
+
+
+@register_figure("estep_quality")
+def plot_estep_quality(
+    history: Dict,                       # step + estep_f_drop / nondecreasing-frac / belief residuals
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""E-step inference-quality dashboard over training.
+
+    Direct evidence for what the inner E-step contributes per eval: the free-energy drop across the
+    inner loop (``estep_f_drop`` < 0 = F descended), the fraction of inner iterations that did NOT
+    decrease F (a descent-quality readout for parallel mean-field -- EXPECTED nonzero, not a failure
+    flag), and the last-iteration belief-change residuals for ``mu`` / ``Sigma`` / ``phi`` (the
+    convergence certificate). Complements the standalone E-step convergence-trend curve."""
+    panels = [
+        {"title": "E-step free-energy drop", "ylabel": r"$F_{\mathrm{end}}-F_{\mathrm{start}}$",
+         "series": [("estep_f_drop", "F drop", _CB[0])]},
+        {"title": "Inner-loop monotonicity", "ylabel": "nondecreasing fraction",
+         "series": [("estep_f_nondecreasing_frac", "nondecreasing frac", _CB[1])]},
+        {"title": "Belief residuals (last iter)", "ylabel": "step length", "logy": True, "series": [
+            ("estep_r_mu_last", r"$r_\mu$", _CB[0]),
+            ("estep_r_sigma_last", r"$r_\Sigma$ (SPD)", _CB[1]),
+            ("estep_r_phi_last", r"$r_\phi$", _CB[2])]},
+    ]
+    return _history_dashboard(history, panels, "E-step inference quality", path, ncols=3)
+
+
+@register_figure("validation_sanity")
+def plot_validation_sanity(
+    history: Dict,                       # step + held-out generalization / positional / attention / geometry columns
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""Held-out validation-sanity dashboard over training.
+
+    The per-eval probes computed on a HELD-OUT batch (``_val_diagnostics``) that otherwise live only in
+    ``metrics.csv``: the generalization gap, within-sequence positional loss and its tail/early ratio,
+    causal-mask sanity (future leakage, row-sum error), positional-vs-content structure, structured-head
+    masses and head redundancy, and the held-out gauge / SPD / Fisher geometry (the more credible
+    counterpart to the train-batch ``geometry_health`` figure). Each panel self-gates on column
+    presence; eval-cadence columns draw only on their eval steps."""
+    panels = [
+        {"title": "Generalization gap", "ylabel": r"$\mathrm{CE}_{\mathrm{val}}-\mathrm{CE}_{\mathrm{train}}$",
+         "series": [("generalization_gap", "gap", _CB[0])]},
+        {"title": "Positional loss", "ylabel": "CE (nats)", "series": [
+            ("pos_loss_first_q", "first quartile", _CB[0]),
+            ("pos_loss_last_q", "last quartile", _CB[1])]},
+        {"title": "Positional loss ratio", "ylabel": "last / first quartile",
+         "series": [("pos_loss_ratio", "ratio", _CB[2])]},
+        {"title": "Causal-mask sanity", "ylabel": "max error", "logy": True, "series": [
+            ("val_future_leakage", "future leakage", _CB[0]),
+            ("val_row_sum_error", "row-sum error", _CB[1])]},
+        {"title": "Positional vs content", "ylabel": r"$R^2$",
+         "series": [("val_pos_content_r2", "pos-content", _CB[3])]},
+        {"title": "Structured heads", "ylabel": "mass / JS", "series": [
+            ("val_prev_token_mass", "prev-token", _CB[0]),
+            ("val_period_match_mass", "period-match", _CB[1]),
+            ("val_head_redundancy_js", "redundancy JS", _CB[2])]},
+        {"title": "Held-out flatness", "ylabel": "curvature", "logy": True, "series": [
+            ("val_holonomy_wilson", "Wilson holonomy", _CB[0]),
+            ("val_cocycle_residual", "cocycle residual", _CB[1])]},
+        {"title": "Held-out gauge spread", "ylabel": "spread",
+         "series": [("val_gauge_invariant_spread", "gauge invariant", _CB[3])]},
+        {"title": "Held-out conditioning", "ylabel": r"$\kappa(\Sigma)$", "logy": True,
+         "series": [("val_belief_cond_p95", "p95", _CB[1])]},
+        {"title": "Held-out precision", "ylabel": r"$\langle\mathrm{tr}\,\Sigma^{-1}\rangle/2$",
+         "logy": True, "series": [("val_fisher_trace_mean", "Fisher trace", _CB[3])]},
+        {"title": "Held-out guard saturation", "ylabel": "fraction", "series": [
+            ("val_guard_sigma_floor_frac", r"$\sigma$ floor", _CB[0]),
+            ("val_guard_sigma_ceil_frac", r"$\sigma$ ceil", _CB[1]),
+            ("val_guard_energy_klmax_frac", "energy klmax", _CB[2])]},
+        {"title": "Held-out frame norm", "ylabel": r"$\|\phi\|$", "series": [
+            ("val_phi_norm_mean", r"mean $\|\phi\|$", _CB[0]),
+            ("val_phi_norm_std", r"std $\|\phi\|$", _CB[5])]},
+    ]
+    return _history_dashboard(history, panels, "Held-out validation sanity", path, ncols=4)
+
+
+@register_figure("optimizer_geometry")
+def plot_optimizer_geometry(
+    history: Dict,                       # step + cos_nat_phi / pullback cond / role weight & grad norms
+
+    *,
+    path:    Optional[str] = None,
+):
+    r"""Information-geometric optimizer dashboard over training.
+
+    Evidence that the gauge M-step is natural-gradient (information-geometric) rather than plain Adam:
+    the cosine between the natural and raw ``phi`` gradients, the pullback-metric condition number, the
+    per-role parameter weight norms, and the gradient-to-weight ratio ``||grad_theta|| / ||theta||`` per
+    role (synthesized from the logged grad and weight norms; multiply by the per-group LR for the true
+    update-to-weight ratio). Each panel self-gates on column presence; the pullback panel appears only
+    on the pullback precond modes, ``cos_nat_phi`` only on a natural-gradient gauge run."""
+    hist = dict(history)
+    for role in ("mu", "sigma", "phi"):                          # synthesize the gradient-to-weight ratio
+        gk, wk = f"grad_norm_{role}", f"weight_norm_{role}"
+        if gk in hist and wk in hist:
+            g = _np(hist[gk]).astype(float)
+            w = _np(hist[wk]).astype(float)
+            hist[f"grad_weight_ratio_{role}"] = np.where(w > 0, g / w, np.nan)
+    panels = [
+        {"title": "Natural-gradient alignment",
+         "ylabel": r"$\cos(\nabla^{\mathrm{nat}}_\phi,\nabla_\phi)$",
+         "series": [("cos_nat_phi", r"$\cos(\mathrm{nat},\mathrm{raw})$", _CB[0])]},
+        {"title": "Pullback conditioning", "ylabel": "condition number", "logy": True, "series": [
+            ("pullback_cond_median", "median", _CB[1]),
+            ("pullback_cond_max", "max", _CB[3])]},
+        {"title": "Role weight norms", "ylabel": r"$\|\theta\|_2$", "logy": True, "series": [
+            ("weight_norm_mu", r"$\mu$", _CB[0]),
+            ("weight_norm_sigma", r"$\Sigma$", _CB[1]),
+            ("weight_norm_phi", r"$\phi$", _CB[2])]},
+        {"title": "Gradient-to-weight ratio", "ylabel": r"$\|\nabla_\theta\|/\|\theta\|$", "logy": True,
+         "series": [
+            ("grad_weight_ratio_mu", r"$\mu$", _CB[0]),
+            ("grad_weight_ratio_sigma", r"$\Sigma$", _CB[1]),
+            ("grad_weight_ratio_phi", r"$\phi$", _CB[2])]},
+    ]
+    return _history_dashboard(hist, panels, "Optimizer information geometry", path, ncols=2)
 
 
 def plot_s_channel_refinement(
@@ -2835,6 +3089,46 @@ def plot_kmup_stability(
     return _save(fig, path)
 
 
+@register_figure("ppl_offset")
+def plot_ppl_offset(
+    points: list,                        # [{embed_dim, ppl_mean, [ppl_sem], [n_seeds]}, ...] pooled param points
+
+    *,
+    path:   Optional[str] = None,
+):
+    r"""Pooled test-PPL offset law against width: PPL = E + A K^{-alpha} (exponent b = -alpha) over ALL
+    parameter points.
+
+    The headline width-scaling figure the June-27 result is cited as (an OFFSET law in PPL vs
+    ``embed_dim``), pooled over every parameter route -- distinct from ``kmup_stability``, which SPLITS
+    the muP arms to read the width-stability contrast. Each point carries the across-seed mean PPL with
+    a small-sample t-quantile CI when seeds are present; the offset fit and its exponent b are overlaid."""
+    pts = sorted([p for p in points
+                  if np.isfinite(float(p.get("embed_dim", float("nan"))))
+                  and np.isfinite(float(p.get("ppl_mean", float("nan")))) and float(p["ppl_mean"]) > 0],
+                 key=lambda p: float(p["embed_dim"]))
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    if not pts:
+        ax.text(0.5, 0.5, "no PPL-vs-embed_dim points", ha="center", va="center")
+        ax.axis("off")
+        return _save(fig, path)
+    K = np.array([float(p["embed_dim"]) for p in pts], float)
+    y = np.array([float(p["ppl_mean"]) for p in pts], float)
+    ci = np.array([_t95(int(p.get("n_seeds", 2))) * float(p.get("ppl_sem", 0.0)) for p in pts], float)
+    ax.errorbar(K, y, yerr=ci, fmt="o", color=_CB[0], capsize=3, lw=1.4, label="test PPL (across-seed)")
+    if K.size >= 2 and float(K.max()) > float(K.min()):
+        fit = _fit_power_law(K, y, with_offset=True)
+        a = fit.get("alpha", float("nan"))
+        if np.isfinite(a):
+            Kf = np.linspace(float(K.min()), float(K.max()), 100)
+            ax.plot(Kf, fit["A"] * Kf ** (-a) + fit.get("E", 0.0), "-", color=_CB[1], lw=1.6,
+                    label=f"offset fit  b={-a:+.3f}  E={fit.get('E', 0.0):.3f}")
+    ax.set(xlabel="K (embed_dim)", ylabel="test PPL", title="Pooled PPL offset law vs width")
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
 # =============================================================================
 # Multi-seed digest: publication labels.
 # Raw metrics.csv column / research scalar key -> publication-quality (mathtext) display label
@@ -2884,6 +3178,33 @@ PUB_LABELS: Dict[str, str] = {
     "freq_strata_ce.rare":     r"$\mathrm{CE}_{\mathrm{rare}}$ (nats)",
     "freq_strata_ce.mid":      r"$\mathrm{CE}_{\mathrm{mid}}$ (nats)",
     "freq_strata_ce.frequent": r"$\mathrm{CE}_{\mathrm{frequent}}$ (nats)",
+    # -- geometry-health dashboard (gauge / SPD / Fisher / guard) --
+    "holonomy_wilson":         r"Wilson holonomy $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$",
+    "cocycle_residual":        "cocycle residual (flatness)",
+    "gauge_invariant_spread":  r"gauge-invariant spread $\mathrm{std}_i\,I(\exp\phi_i)$",
+    "phi_norm_mean":           r"gauge-frame norm $\langle\|\phi_i\|\rangle$",
+    "belief_cond_p95":         r"belief conditioning $\kappa_{95}(\Sigma)$",
+    "eff_rank_median":         r"belief effective rank $\mathrm{med}_i\,\mathrm{erank}(\Sigma_i)$",
+    "fisher_trace_median":     r"belief precision $\mathrm{med}_i\,\mathrm{tr}\,\Sigma_i^{-1}/2$",
+    "nonfinite_frac":          "non-finite fraction",
+    "renyi_band_frac":         "Renyi cancellation-band fraction",
+    "attn_entropy_min":        r"min row entropy $\min_{i,h}H(\beta)$",
+    "attn_entropy_collapsed_heads": "collapsed-head count",
+    # -- E-step inference quality --
+    "estep_f_drop":            r"E-step $F_{\mathrm{end}}-F_{\mathrm{start}}$",
+    "estep_f_nondecreasing_frac": "E-step nondecreasing fraction",
+    "estep_r_mu_last":         r"E-step residual $r_\mu$ (last)",
+    "estep_r_sigma_last":      r"E-step residual $r_\Sigma$ (last, SPD)",
+    "estep_r_phi_last":        r"E-step residual $r_\phi$ (last)",
+    # -- held-out validation sanity --
+    "pos_loss_ratio":          r"positional loss ratio $\mathrm{CE}_{\mathrm{last}}/\mathrm{CE}_{\mathrm{first}}$",
+    "val_future_leakage":      "causal future leakage (max)",
+    "val_row_sum_error":       "attention row-sum error (max)",
+    "val_pos_content_r2":      r"positional-content $R^2$",
+    "val_head_redundancy_js":  "head redundancy (JS)",
+    # -- optimizer information geometry --
+    "cos_nat_phi":             r"$\cos(\nabla^{\mathrm{nat}}_\phi,\nabla_\phi)$",
+    "pullback_cond_median":    r"pullback-metric conditioning $\mathrm{med}\,\kappa$",
 }
 
 

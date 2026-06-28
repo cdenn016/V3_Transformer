@@ -1,0 +1,199 @@
+r"""Tests for the 2026-06-28 reporting build-out (surfacing already-logged diagnostics):
+
+  * the four new registered history-dashboard figures render from synthetic history, drop absent
+    panels, and mask eval-cadence NaN gaps; the pooled PPL offset figure renders;
+  * run_artifacts._save_figures emits the four dashboard PNGs from a synthetic history;
+  * run_artifacts._pure_path_report reports the toggle/stress state and the on-pure-path flag;
+  * train() surfaces the held-out gauge/SPD/Fisher geometry columns into metrics.csv;
+  * ablation._seed_aggregate / _base_label group seeds into n/mean/SD/CV;
+  * scaling_analysis._write_scaling_md renders the console-only fits as a markdown report.
+
+Device-agnostic (CPU). Figures use the Agg backend.
+"""
+import csv as _csv
+import logging
+import os
+import types
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+import ablation
+import scaling_analysis
+from vfe3.config import VFE3Config
+from vfe3.model.model import VFEModel
+from vfe3.run_artifacts import RunArtifacts, _pure_path_report, _save_figures
+from vfe3.train import train
+from vfe3.viz import figures as figs
+
+DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
+
+
+def _hist(keys, n=30, nan_every=0):
+    r"""Synthetic {step, key: [...]} history: positive decreasing series, optionally NaN-masked on
+    non-eval rows (nan_every>0 keeps a finite value every nan_every steps, like an eval-cadence column)."""
+    h = {"step": list(range(n))}
+    base = np.linspace(1.0, 0.1, n) + 0.05
+    for k in keys:
+        col = base.copy()
+        if nan_every:
+            for i in range(n):
+                if i % nan_every:
+                    col[i] = float("nan")
+        h[k] = col.tolist()
+    return h
+
+
+# --------------------------------------------------------------------------- figure renders
+
+def test_geometry_health_renders():
+    h = _hist(("holonomy_wilson", "cocycle_residual", "gauge_invariant_spread", "phi_norm_mean",
+               "phi_norm_std", "belief_cond_p95", "belief_cond_max", "eff_rank_p5", "eff_rank_median",
+               "eff_rank_p95", "fisher_trace_mean", "guard_sigma_floor_frac", "nonfinite_frac",
+               "renyi_band_frac", "attn_entropy_min", "attn_entropy_collapsed_heads"))
+    fig = figs.plot_geometry_health(h); assert fig is not None; plt.close(fig)
+
+
+def test_estep_quality_renders():
+    h = _hist(("estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
+               "estep_r_phi_last"))
+    fig = figs.plot_estep_quality(h); assert fig is not None; plt.close(fig)
+
+
+def test_validation_sanity_renders_with_eval_cadence_gaps():
+    # eval-cadence columns are NaN on non-eval rows; the dashboard must mask per series and still render.
+    h = _hist(("generalization_gap", "pos_loss_ratio", "val_future_leakage", "val_row_sum_error",
+               "val_pos_content_r2", "val_head_redundancy_js", "val_holonomy_wilson",
+               "val_cocycle_residual", "val_belief_cond_p95", "val_fisher_trace_mean",
+               "val_phi_norm_mean"), nan_every=5)
+    fig = figs.plot_validation_sanity(h); assert fig is not None; plt.close(fig)
+
+
+def test_optimizer_geometry_renders_with_ratio_synthesis():
+    h = _hist(("cos_nat_phi", "pullback_cond_median", "pullback_cond_max",
+               "weight_norm_mu", "weight_norm_sigma", "weight_norm_phi",
+               "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"))
+    fig = figs.plot_optimizer_geometry(h); assert fig is not None; plt.close(fig)
+
+
+def test_ppl_offset_renders():
+    pts = [{"embed_dim": k, "ppl_mean": 50.0 / k + 12.0, "ppl_sem": 0.3, "n_seeds": 3}
+           for k in (8, 16, 32, 64)]
+    fig = figs.plot_ppl_offset(pts); assert fig is not None; plt.close(fig)
+
+
+def test_new_figures_registered():
+    for name, fn in (("geometry_health", figs.plot_geometry_health),
+                     ("estep_quality", figs.plot_estep_quality),
+                     ("validation_sanity", figs.plot_validation_sanity),
+                     ("optimizer_geometry", figs.plot_optimizer_geometry),
+                     ("ppl_offset", figs.plot_ppl_offset)):
+        assert figs.get_figure(name) is fn
+
+
+def test_dashboard_drops_absent_and_empty():
+    # only one column present -> one panel, still renders; no columns -> the no-data fallback renders.
+    fig = figs.plot_geometry_health(_hist(("holonomy_wilson",))); assert fig is not None; plt.close(fig)
+    fig = figs.plot_geometry_health({"step": [0, 1, 2]}); assert fig is not None; plt.close(fig)
+
+
+# --------------------------------------------------------------------------- run_artifacts wiring
+
+def test_save_figures_emits_dashboards(tmp_path):
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2)
+    model = VFEModel(cfg).to(DEVICE)
+    art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
+    keys = ("holonomy_wilson", "cocycle_residual", "fisher_trace_mean", "belief_cond_p95",
+            "estep_f_drop", "estep_r_mu_last", "generalization_gap", "val_holonomy_wilson",
+            "cos_nat_phi", "weight_norm_mu", "grad_norm_mu")
+    art.history = [{"step": s, **{k: 1.0 / (s + 1) + 0.1 for k in keys}} for s in range(12)]
+    _save_figures(art, [3.0, 2.5], logging.getLogger("test"))
+    for png in ("geometry_health.png", "estep_quality.png", "validation_sanity.png",
+                "optimizer_geometry.png"):
+        assert (tmp_path / png).exists(), f"{png} not emitted"
+
+
+# --------------------------------------------------------------------------- pure-path certificate
+
+def test_pure_path_report_structure_and_flags():
+    history = [{"step": 0, "nonfinite_frac": 0.0, "cocycle_residual": 1e-7, "holonomy_wilson": 2e-7,
+                "guard_sigma_floor_frac": 0.0}]
+    pure = types.SimpleNamespace(
+        include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
+        learnable_lambda_beta=False, use_prior_bank=True, use_head_mixer=False,
+        lambda_beta=1.0, precision_weighted_attention=False)
+    rep = _pure_path_report(pure, history)
+    assert rep["on_pure_path"] is True
+    assert set(rep) == {"on_pure_path", "pure_flags", "config_toggles", "converged_stress"}
+    assert rep["converged_stress"]["cocycle_residual"] == 1e-7
+    # flipping any defining toggle drops the run off the pure path
+    impure = types.SimpleNamespace(**{**pure.__dict__, "transport_mode": "regime_ii"})
+    rep2 = _pure_path_report(impure, history)
+    assert rep2["on_pure_path"] is False and rep2["pure_flags"]["flat_transport"] is False
+
+
+# --------------------------------------------------------------------------- held-out geometry columns
+
+def test_train_logs_held_out_geometry(tmp_path):
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=4,
+                     log_interval=2, eval_interval=2, batch_size=2)
+    model = VFEModel(cfg).to(DEVICE)
+    batches = [(torch.randint(0, 32, (2, 8), device=DEVICE),
+                torch.randint(0, 32, (2, 8), device=DEVICE)) for _ in range(4)]
+    art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
+    train(model, batches, cfg, n_steps=4, log_interval=2, eval_interval=2,
+          val_loader=batches, artifacts=art, device=DEVICE, generate_samples=False)
+    with open(tmp_path / "metrics.csv", newline="", encoding="utf-8") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert rows and "val_holonomy_wilson" in rows[0]      # rectangular: column defined from row 0
+    finite = [r for r in rows if r["val_holonomy_wilson"] not in ("", "nan", None)]
+    assert finite, "an eval row must carry a finite held-out Wilson holonomy"
+
+
+# --------------------------------------------------------------------------- ablation seed aggregation
+
+def test_base_label_strips_seed_suffix():
+    assert ablation._base_label("a2_on__s0") == "a2_on"
+    assert ablation._base_label("a2_on__s12") == "a2_on"
+    assert ablation._base_label("kappa=2.0") == "kappa=2.0"
+    assert ablation._base_label("plain") == "plain"
+
+
+def test_seed_aggregate_groups_seeds():
+    rows = [{"label": "a__s0", "primary_val_ppl": "30.0"},
+            {"label": "a__s1", "primary_val_ppl": "32.0"},
+            {"label": "b", "primary_val_ppl": "40.0"},
+            {"label": "c__s0", "primary_val_ppl": "inf"}]      # non-finite cell dropped
+    agg = ablation._seed_aggregate(rows)
+    by = {a["label"]: a for a in agg}
+    assert by["a"]["n"] == 2 and abs(by["a"]["mean"] - 31.0) < 1e-9
+    assert abs(by["a"]["sd"] - 2.0 ** 0.5) < 1e-9 and abs(by["a"]["cv"] - (2.0 ** 0.5) / 31.0) < 1e-9
+    assert by["b"]["n"] == 1 and by["b"]["sd"] == 0.0
+    assert "c" not in by                                       # no finite seed -> dropped
+    assert [a["label"] for a in agg] == ["a", "b"]             # sorted by mean PPL
+
+
+# --------------------------------------------------------------------------- scaling summary report
+
+def test_write_scaling_md(tmp_path):
+    summary = {
+        "input_dir": str(tmp_path), "n_runs": 6, "with_offset": True,
+        "n_param_points": 4, "n_inference_points": 2,
+        "pooled_fit": {"form": "E + A N^-alpha", "alpha": 0.12, "alpha_ci": [0.08, 0.16],
+                       "A": 3.4, "E": 2.1, "r2": 0.98, "n_points": 4},
+        "per_route": {"grow_K": {"alpha": 0.11, "r2": 0.97, "n_sizes": 4}},
+        "frontier_collapse": {"testable": True, "collapses": True, "df1": 2, "df2": 8,
+                              "F": 0.5, "p_value": 0.62},
+        "estep_structural": {"n_arms": 3, "pearson_ne_final_f": -0.95, "pearson_final_f_test_ce": 0.1},
+    }
+    out = tmp_path / "SCALING_ANALYSIS.md"
+    scaling_analysis._write_scaling_md(out, summary)
+    text = out.read_text(encoding="utf-8")
+    for section in ("Pooled L(N) power law", "Per-route exponents", "Frontier-collapse F-test",
+                    "E-step structural-EM check"):
+        assert section in text
