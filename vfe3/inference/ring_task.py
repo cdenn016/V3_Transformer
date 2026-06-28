@@ -72,7 +72,12 @@ def ring_preference(
     the sealed beta_C=5.0 is kept (its 0.90 goal-mass figure was the uniform-off-goal reading)."""
     states = state_support().to(goals.device)                        # (M,)
     dist = ring_distance(states.unsqueeze(0), goals.unsqueeze(1))     # (B, M)
-    U = torch.full((goals.shape[0], V), float("-inf"), device=goals.device)
+    # Non-state tokens get a FINITE floor utility one ring-step below the farthest state, so they carry
+    # negligible-but-nonzero mass ("approximately zero", spec Section 4.1). A -inf floor (exactly zero)
+    # makes the forward KL(q || p_task) diverge wherever the model's q has any off-state mass, which
+    # collapses every candidate's score to +inf and the policy posterior to nan.
+    floor = -beta_C * (M / 2 + 1)
+    U = torch.full((goals.shape[0], V), floor, device=goals.device)
     U[:, :M] = -beta_C * dist.float()
     return torch.log_softmax(U, dim=-1)
 
@@ -199,6 +204,7 @@ def run_episodes(
     preference_key: str             = "task",   # p(o|C) registry key for the EFE arm
     score_terms:    Tuple[str, ...] = ("risk", "ambiguity"),
     gamma:          float           = 1.0,
+    candidate_mode: str             = "actions",  # "actions" (the 3 control actions) | "top_k" (top-Kp tokens)
     top_k:          int             = 8,
     beta_C:         float           = 5.0,
     horizon:        int             = 1,
@@ -222,13 +228,20 @@ def run_episodes(
     for t in range(budget):
         context = render_context(goals, state)                            # (B, 5)
         base_logits = model.forward(context)[:, -1, :]                    # (B, V)
-        topk = base_logits.topk(top_k, dim=-1).indices                   # (B, Kp)
-        candidates = topk.unsqueeze(-1)                                   # (B, Kp, 1)
+        if candidate_mode == "actions":
+            # The control-task policy space IS the action set. The top-Kp token generator admits
+            # non-action tokens (e.g. CUR) whose diffuse OOD prediction scores LOWER than a genuine
+            # step toward a far goal, so the policy would pick a junk token that maps to a wasted STAY.
+            topk = torch.tensor(ACTION_TOKENS, device=device).unsqueeze(0).expand(B, -1)  # (B, 3)
+        else:
+            topk = base_logits.topk(top_k, dim=-1).indices               # (B, Kp) top-Kp tokens
+        candidates = topk.unsqueeze(-1)                                   # (B, |menu|, 1)
         menu_logits = torch.gather(base_logits, 1, topk)
-        log_prior = torch.log_softmax(menu_logits, dim=-1)               # (B, Kp) candidate prior E
+        log_prior = torch.log_softmax(menu_logits, dim=-1)               # (B, |menu|) candidate prior E
         if policy_mode == "random":
-            rand = (torch.rand(B, top_k, generator=generator) if generator is not None
-                    else torch.rand(B, top_k))                           # CPU draw (generator-safe)
+            kp = topk.shape[1]                                            # actual menu width (not cfg top_k)
+            rand = (torch.rand(B, kp, generator=generator) if generator is not None
+                    else torch.rand(B, kp))                              # CPU draw (generator-safe)
             idx = rand.to(device).argmax(dim=-1, keepdim=True)           # uniform pick over the menu
         else:
             if preference_key == "task":
@@ -238,7 +251,8 @@ def run_episodes(
             elif preference_key == "held_out_predictive":
                 # the ring next-observation marginal is uniform over the M state tokens (the data
                 # distribution): carries no per-episode goal, so it is the control arm (spec 2.3/4.3).
-                U = torch.full((V,), float("-inf"), device=device)
+                # Finite floor on non-state tokens (not -inf) so the forward KL stays finite.
+                U = torch.full((V,), -30.0, device=device)
                 U[:M] = 0.0
                 pref = torch.log_softmax(U, dim=-1)
             else:

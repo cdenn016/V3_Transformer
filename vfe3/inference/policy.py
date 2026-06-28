@@ -247,6 +247,10 @@ def _efe_terms(
     r"""risk = KL[q(o|pi) || p(o|C)] and the predictive entropy H[q(o|pi)] (spec Section 2.6)."""
     q = q_log.exp()
     logpC = preference.view(1, 1, -1) if preference.dim() == 1 else preference.unsqueeze(1)
+    # Defensive finite floor: a zero-support preference (log p = -inf where q has mass) would make the
+    # forward KL diverge to +inf and the policy posterior collapse to nan. Proper preferences sit well
+    # above -60, so this never bites them; it only caps an otherwise-infinite penalty.
+    logpC = logpC.clamp_min(-60.0)
     risk = (q * (q_log - logpC)).sum(dim=-1)                     # (B, Kp) forward KL
     pred_ent = -(q * q_log).sum(dim=-1)                          # (B, Kp) H[q]
     return risk, pred_ent
