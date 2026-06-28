@@ -44,11 +44,13 @@ CONFIG = dict(
 
 
 def sample_episodes(n, seed, device):
+    # Draw a uniform NONZERO ring offset and add it to s0, so goals are uniform over the M-1 states
+    # g != s0 (spec Section 4.1). The earlier "resample collisions to (s0+1)%M" remapping doubled the
+    # mass on the clockwise neighbor (delta=1) and distorted the directional action prior (audit F2).
     g = torch.Generator().manual_seed(seed)
     s0 = torch.randint(0, rt.M, (n,), generator=g)
-    goals = torch.randint(0, rt.M, (n,), generator=g)
-    clash = goals == s0
-    goals[clash] = (goals[clash] + 1) % rt.M             # enforce g != s0
+    offset = torch.randint(1, rt.M, (n,), generator=g)   # uniform offset in 1..M-1
+    goals = (s0 + offset) % rt.M                          # uniform over g != s0
     return goals.to(device), s0.to(device)
 
 
