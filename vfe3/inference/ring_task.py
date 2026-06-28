@@ -1,0 +1,254 @@
+r"""The controlled closed-loop ring goal-steering ("cursor control") synthetic task for the v1 EFE
+policy experiment (spec docs/superpowers/specs/2026-06-28-active-inference-efe-policy-scorer-spec.md,
+Section 4.1).
+
+A fully observed, deterministic environment whose pragmatic payoff is realizable at a one-step
+horizon. The vocabulary (V = 32) partitions into m = 16 ring state symbols q_0..q_15 (ids 0..15),
+three action tokens DEC / STAY / INC (16/17/18) with deltas -1 / 0 / +1, four control tokens
+GOAL / SEP / CUR / EOS (19..22), and reserved filler (23..31). An episode draws an initial state s_0
+and a goal g != s_0 uniformly on the ring and presents the context ``GOAL q_g SEP CUR q_{s_t}``. The
+agent emits one action; the environment applies s_{t+1} = (s_t + delta(a)) mod m and re-renders. An
+episode is correct iff the state equals the goal at the budget's end (T_ep = 10).
+
+Training renders the exact prefix the experiment scores: ``GOAL q_g SEP CUR q_s a q_{s'}`` (length 7),
+so teacher-forced next-token prediction at the action position learns the transition q_{s'} | (s, a),
+the precondition any model-based planner needs (predictive-adequacy gate, Section 4.5).
+
+This module is pure environment + data + a batched closed-loop runner; the orchestration (three-seed
+training, the arm matrix, paired statistics, go/no-go) lives in the experiment script.
+"""
+from typing import Dict, Optional, Tuple
+
+import torch
+
+from vfe3.config import VFE3Config
+from vfe3.inference.policy import get_policy, get_preference
+from vfe3.model.model import VFEModel
+
+# ---- sealed vocabulary layout (spec Section 4.1) ----
+M       = 16                    # ring size (state symbols q_0..q_{M-1} are token ids 0..M-1)
+V       = 32                    # vocabulary
+DEC, STAY, INC = 16, 17, 18     # action tokens; deltas -1, 0, +1
+GOAL, SEP, CUR, EOS = 19, 20, 21, 22
+SEQ_LEN = 7                     # GOAL q_g SEP CUR q_s a q_s'
+ACTION_TOKENS = (DEC, STAY, INC)
+
+
+def action_delta_table() -> torch.Tensor:
+    """(V,) ring delta per token: -1 for DEC, +1 for INC, 0 otherwise (non-action -> wasted STAY)."""
+    d = torch.zeros(V, dtype=torch.long)
+    d[DEC] = -1
+    d[INC] = 1
+    return d
+
+
+def state_support() -> torch.Tensor:
+    """(M,) the state token ids 0..M-1; the support of the task preference p_task."""
+    return torch.arange(M)
+
+
+def ring_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Cyclic distance min(|a-b|, M-|a-b|) on the ring (token ids in 0..M-1)."""
+    d = (a - b).abs()
+    return torch.minimum(d, M - d)
+
+
+def ring_preference(
+    goals:  torch.Tensor,            # (B,) goal state ids
+
+    *,
+    beta_C: float = 5.0,             # preference precision (sealed constant)
+) -> torch.Tensor:                   # (B, V) log p_task(o)
+    r"""The ring's instantiation of the spec's task preference p(o|C) = softmax(beta_C U_C) with the
+    DISTANCE-GRADED utility U_C(o) = -ring_distance(o, g) on the M state tokens and ~0 mass (-inf
+    utility) on non-state tokens.
+
+    Correction to the spec's literal wording (Section 4.1): a pure peak on the goal symbol (uniform
+    mass over all other states) carries NO one-step gradient at ring-distance > 1 -- both neighboring
+    actions then land on non-goal states with equal preference mass, so greedy H=1 cannot tell which
+    reduces the distance. The spec's own solvability argument ("the reachable state nearest the goal
+    is closest to the goal-peaked preference") requires a distance-graded utility, which this provides;
+    the sealed beta_C=5.0 is kept (its 0.90 goal-mass figure was the uniform-off-goal reading)."""
+    states = state_support().to(goals.device)                        # (M,)
+    dist = ring_distance(states.unsqueeze(0), goals.unsqueeze(1))     # (B, M)
+    U = torch.full((goals.shape[0], V), float("-inf"), device=goals.device)
+    U[:, :M] = -beta_C * dist.float()
+    return torch.log_softmax(U, dim=-1)
+
+
+def transition(states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    """s' = (s + delta(a)) mod M, vectorized. ``actions`` are token ids; non-action tokens give delta 0."""
+    delta = action_delta_table().to(states.device)[actions]
+    return (states + delta) % M
+
+
+def render_context(
+    goals:  torch.Tensor,            # (B,) goal state ids
+    states: torch.Tensor,            # (B,) current state ids
+) -> torch.Tensor:                   # (B, 5) "GOAL q_g SEP CUR q_s"
+    """Render the per-step context the experiment conditions on."""
+    B = goals.shape[0]
+    col = lambda v: torch.full((B,), v, dtype=torch.long, device=goals.device)
+    return torch.stack([col(GOAL), goals, col(SEP), col(CUR), states], dim=1)
+
+
+def sample_batch(
+    batch_size: int,
+
+    *,
+    generator:  Optional[torch.Generator] = None,
+    device:     Optional[torch.device]    = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""A training batch of rendered transitions ``GOAL q_g SEP CUR q_s a q_s'`` (B, 7) with the
+    next-token targets (B, 7) (last position ignored, -100). g, s, a are drawn uniformly and
+    independently, so the model learns the full transition table q_{s'} | (s, a) and learns that g
+    does not affect the transition. The load-bearing target is at the action position (index 5)."""
+    g = torch.randint(0, M, (batch_size,), generator=generator, device=device)
+    s = torch.randint(0, M, (batch_size,), generator=generator, device=device)
+    a_idx = torch.randint(0, 3, (batch_size,), generator=generator, device=device)
+    a = torch.tensor(ACTION_TOKENS, device=device)[a_idx]
+    s_next = transition(s, a)
+    col = lambda v: torch.full((batch_size,), v, dtype=torch.long, device=device)
+    tokens = torch.stack([col(GOAL), g, col(SEP), col(CUR), s, a, s_next], dim=1)  # (B, 7)
+    targets = torch.empty_like(tokens)
+    targets[:, :-1] = tokens[:, 1:]
+    targets[:, -1] = -100                                   # no target after the final state token
+    return tokens, targets
+
+
+@torch.no_grad()
+def predictive_adequacy(
+    model:      VFEModel,
+
+    *,
+    n:          int = 4096,
+    generator:  Optional[torch.Generator] = None,
+) -> float:
+    r"""Teacher-forced next-observation (transition) accuracy on held-out random transitions: the
+    fraction for which argmax p(o | GOAL q_g SEP CUR q_s a) == q_{s'} (spec Section 4.5; gate >= 0.98).
+    Read at the action position (index 5), exactly where the experiment reads q(o|pi)."""
+    device = next(model.parameters()).device
+    tokens, _ = sample_batch(n, generator=generator)        # CPU-reproducible data
+    tokens = tokens.to(device)
+    logits = model(tokens[:, :SEQ_LEN - 1])                 # prefix through the action token (B, 6, V)
+    pred = logits[:, -1, :].argmax(dim=-1)                  # predicted next state at the action position
+    truth = tokens[:, -1]                                   # the true q_{s'}
+    return float((pred == truth).float().mean())
+
+
+def train_ring_checkpoint(
+    *,
+    seed:        int,
+    steps:       int   = 15000,
+    batch_size:  int   = 256,
+    lr:          float = 3e-3,
+    embed_dim:   int   = 20,
+    n_heads:     int   = 2,
+    n_layers:    int   = 2,
+    n_e_steps:   int   = 2,
+    device:      Optional[str] = None,           # None -> cuda if available else cpu (use the 5090)
+    cfg_overrides: Optional[dict] = None,
+) -> Tuple[VFEModel, float]:
+    r"""Train one ring checkpoint at the operating-point architecture (embed_dim=20, linear decode
+    use_prior_bank=False, use_head_mixer=False; spec Section 4.5) for a fixed step budget, returning
+    the model and its final predictive adequacy. Plain AdamW next-token training on rendered
+    transitions; no dev-selection knob (final checkpoint taken). Runs on CUDA when available (the
+    iterative E-step is slow on CPU; train this on the GPU)."""
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(seed)
+    cfg_kw = dict(
+        vocab_size=V, embed_dim=embed_dim, n_heads=n_heads, max_seq_len=SEQ_LEN,
+        n_layers=n_layers, n_e_steps=n_e_steps, e_q_mu_lr=0.05, e_phi_lr=0.02,
+        use_prior_bank=False, use_head_mixer=False,
+    )
+    if cfg_overrides:
+        cfg_kw.update(cfg_overrides)
+    model = VFEModel(VFE3Config(**cfg_kw)).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    gen = torch.Generator().manual_seed(seed + 10_000)      # CPU generator -> device-independent data
+    model.train()
+    for _ in range(steps):
+        tokens, targets = sample_batch(batch_size, generator=gen)
+        _, loss, _ = model(tokens.to(device), targets.to(device))
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    model.eval()
+    adequacy = predictive_adequacy(model, generator=torch.Generator().manual_seed(seed + 20_000))
+    return model, adequacy
+
+
+@torch.no_grad()
+def run_episodes(
+    model:      VFEModel,
+    goals:      torch.Tensor,        # (B,) goal state ids
+    states:     torch.Tensor,        # (B,) initial state ids s_0
+
+    policy_mode: str,                 # 'efe_one_step' | 'logprob_control' | 'random'
+
+    *,
+    preference_key: str             = "task",   # p(o|C) registry key for the EFE arm
+    score_terms:    Tuple[str, ...] = ("risk", "ambiguity"),
+    gamma:          float           = 1.0,
+    top_k:          int             = 8,
+    beta_C:         float           = 5.0,
+    horizon:        int             = 1,
+    budget:         int             = 10,       # T_ep
+    generator:      Optional[torch.Generator] = None,   # for 'random' arm tie-breaking
+) -> Dict[str, torch.Tensor]:
+    r"""Run B closed-loop ring episodes in parallel under the given arm and return per-episode
+    outcomes. Each step renders ``GOAL q_g SEP CUR q_s``, forms the top-``top_k`` candidate menu from
+    the base logits (the pre-registered generator E, with the candidate prior = base softmax over the
+    menu), scores the menu through ``policy_mode``, commits the argmax action, and applies the
+    DETERMINISTIC environment transition (never the model's predicted outcome; spec Section 2.2). The
+    'random' arm is the placebo (uniform over the menu). Returns dict with ``correct`` (B,) bool,
+    ``steps_to_goal`` (B,), and ``frac_at_goal`` (B,)."""
+    device = next(model.parameters()).device                          # run on the model's device
+    goals = goals.to(device)
+    state = states.to(device)
+    delta_tab = action_delta_table().to(device)
+    B = states.shape[0]
+    reached = torch.full((B,), budget, dtype=torch.long, device=device)   # step index of first arrival
+    at_goal_steps = torch.zeros(B, dtype=torch.long, device=device)
+    for t in range(budget):
+        context = render_context(goals, state)                            # (B, 5)
+        base_logits = model.forward(context)[:, -1, :]                    # (B, V)
+        topk = base_logits.topk(top_k, dim=-1).indices                   # (B, Kp)
+        candidates = topk.unsqueeze(-1)                                   # (B, Kp, 1)
+        menu_logits = torch.gather(base_logits, 1, topk)
+        log_prior = torch.log_softmax(menu_logits, dim=-1)               # (B, Kp) candidate prior E
+        if policy_mode == "random":
+            rand = (torch.rand(B, top_k, generator=generator) if generator is not None
+                    else torch.rand(B, top_k))                           # CPU draw (generator-safe)
+            idx = rand.to(device).argmax(dim=-1, keepdim=True)           # uniform pick over the menu
+        else:
+            if preference_key == "task":
+                pref = ring_preference(goals, beta_C=beta_C)              # distance-graded p_task (B, V)
+            elif preference_key == "flat":
+                pref = get_preference("flat")(model.prior_bank).to(device)
+            elif preference_key == "held_out_predictive":
+                # the ring next-observation marginal is uniform over the M state tokens (the data
+                # distribution): carries no per-episode goal, so it is the control arm (spec 2.3/4.3).
+                U = torch.full((V,), float("-inf"), device=device)
+                U[:M] = 0.0
+                pref = torch.log_softmax(U, dim=-1)
+            else:
+                raise ValueError(f"unsupported preference_key for the ring task: {preference_key!r}")
+            out = get_policy(policy_mode)(
+                context, candidates, pref, model,
+                gamma=gamma, horizon=horizon, score_terms=score_terms,
+                log_prior=log_prior, base_logits=base_logits,
+            )
+            idx = out.policy_posterior.argmax(dim=-1, keepdim=True)       # greedy (deterministic eval)
+        action = torch.gather(topk, 1, idx).squeeze(1)                   # (B,) committed action token
+        state = (state + delta_tab[action]) % M                          # deterministic environment step
+        now_at = state == goals
+        reached = torch.where(now_at & (reached == budget),
+                              torch.full_like(reached, t + 1), reached)
+        at_goal_steps = at_goal_steps + now_at.long()
+    correct = state == goals
+    return {
+        "correct": correct,
+        "steps_to_goal": reached,
+        "frac_at_goal": at_goal_steps.float() / budget,
+    }

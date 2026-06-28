@@ -395,6 +395,28 @@ class VFE3Config:
     decode_chunk_size:         int   = 8192
     encode_mode:               str   = "per_token"
 
+    # --- active-inference EFE policy scorer (opt-in, no-grad, default OFF) ---
+    # Reranks candidate token continuations by an Expected-Free-Energy functional inside generate()
+    # (spec docs/superpowers/specs/2026-06-28-active-inference-efe-policy-scorer-spec.md). policy_mode
+    # is the registry dispatch key; 'none' (default) short-circuits generate() to its verbatim
+    # pre-existing body, so forward() and generate() are byte-identical to the no-policy build. The
+    # other five fields below are READ ONLY when policy_mode != 'none', so their defaults are inert on
+    # the pure path. No learned parameter is created; the scorer is tensor scoring over existing
+    # beliefs/priors under @torch.no_grad.
+    policy_mode:               str             = "none"   # registry key: none | logprob_control | efe_one_step | efe_rollout
+    policy_horizon:            int             = 1        # fixed finite rollout depth H (efe_one_step uses 1)
+    policy_top_k:              int             = 8        # candidate menu size Kp (the fixed top-Kp generator)
+    policy_precision:          float           = 1.0      # policy precision gamma in softmax(-gamma G)
+    policy_preference:         str             = "task"   # preference registry key -> p(o | C)
+    policy_score_terms:        Tuple[str, ...] = ("risk", "ambiguity")  # which EFE terms enter G(pi)
+    # sigma-validation gate (spec Sections 2.7, 4.5, Guard 4): may be set True ONLY together with a
+    # policy_sigma_gate_artifact pointing at a PASS sigma-gate record, so V3 sigma cannot be called an
+    # ambiguity/epistemic value before the pre-registered gate passes. The artifact CONTENT check
+    # (PASS stamp + matching spec commit) is enforced by the sigma-measurement step; here the structural
+    # guard is that the flag cannot be flipped without naming an artifact.
+    policy_sigma_ambiguity_validated: bool          = False
+    policy_sigma_gate_artifact:       Optional[str] = None
+
     # cross-block belief handoff (mu_q -> mu_p)
     prior_handoff_rho:         float = 1.0          # 1.0 = full flow; 0.0 = priors frozen
     prior_handoff_sigma:       float = 0.0          # sigma damping (0.0 = frozen at embedding)
@@ -1343,6 +1365,25 @@ class VFE3Config:
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
+        # active-inference EFE policy scorer: validate the registry dispatch key against the policy
+        # registry (add-by-registering, like transport_mode / decode_mode above). 'none' (default) is
+        # registered, so the pure path validates; a not-yet-registered scorer key raises here until the
+        # build phase that registers it lands. Local import avoids a config <- inference.policy cycle.
+        from vfe3.inference.policy import _POLICIES
+        _require(self.policy_mode, tuple(sorted(_POLICIES)), "policy_mode")
+        if self.policy_top_k < 1:
+            raise ValueError(f"policy_top_k must be >= 1, got {self.policy_top_k}")
+        if self.policy_horizon < 1:
+            raise ValueError(f"policy_horizon must be >= 1, got {self.policy_horizon}")
+        if self.policy_precision <= 0.0:
+            raise ValueError(f"policy_precision (gamma) must be > 0, got {self.policy_precision}")
+        # Guard 4 (spec Section 7): the sigma flag cannot be flipped without naming a gate artifact, so
+        # V3 sigma cannot be called an ambiguity/epistemic value before the pre-registered gate passes.
+        if self.policy_sigma_ambiguity_validated and not self.policy_sigma_gate_artifact:
+            raise ValueError(
+                "policy_sigma_ambiguity_validated=True requires policy_sigma_gate_artifact to point at a "
+                "PASS sigma-gate record (spec Sections 2.7, 4.5); the flag cannot be set without one."
+            )
         # decode_bias is a learned per-vocab log-unigram bias on the use_prior_bank=False LINEAR
         # decode (logits = mu_q @ W^T + b). On the prior-bank KL path the per-vocab priors
         # (mu_p, sigma_p) already carry the unigram role, so the bias is never created there; warn
