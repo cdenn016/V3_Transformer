@@ -43,6 +43,13 @@ CONFIG = dict(
 )
 
 
+# ---- Phase 2 baseline pre-registration constants (kept separate from the user-edited CONFIG) ----
+TEMP_GRID     = (0.5, 1.0, 2.0, 4.0, 8.0)  # temp grid for the temp-tuned logprob baseline (matches gamma_grid cardinality)
+NUCLEUS_TOP_P = 0.9                          # nucleus (top-p) sampling baseline mass
+TYPICAL_P     = 0.9                          # locally-typical sampling baseline mass
+FDR_Q         = 0.05                         # Benjamini-Hochberg FDR level over the arm grid (spec 4.6)
+
+
 def sample_episodes(n, seed, device):
     # Draw a uniform NONZERO ring offset and add it to s0, so goals are uniform over the M-1 states
     # g != s0 (spec Section 4.1). The earlier "resample collisions to (s0+1)%M" remapping doubled the
@@ -79,6 +86,17 @@ def bootstrap_diff_ci(correct_a, correct_b, n_boot=2000, alpha=0.05, seed=0):
     return float(a.mean() - b.mean()), float(lo), float(hi)
 
 
+def bh_fdr(pvals, q=0.05):
+    # Benjamini-Hochberg step-up: control FDR at q over the comparisons. Returns {name: (p, significant)}.
+    items = sorted(pvals.items(), key=lambda kv: kv[1])
+    m = len(items)
+    crit = 0
+    for k, (_, p) in enumerate(items, start=1):
+        if p <= k / m * q:
+            crit = k                                         # largest rank meeting the BH threshold
+    return {name: (p, (rank + 1) <= crit) for rank, (name, p) in enumerate(items)}
+
+
 def tune_gamma(model, goals, s0, cfg):
     best_g, best_sr = None, -1.0
     for gamma in cfg["gamma_grid"]:
@@ -93,11 +111,28 @@ def tune_gamma(model, goals, s0, cfg):
     return best_g, best_sr
 
 
+def tune_temperature(model, goals, s0, cfg, seed):
+    # The temperature-tuned logprob baseline: one tuning DOF, the identical selection rule as gamma
+    # (argmax dev success, ties toward T=1.0), over a matched-cardinality grid (spec Section 4.2).
+    best_t, best_sr = None, -1.0
+    for i, temp in enumerate(TEMP_GRID):
+        out = rt.run_episodes(model, goals, s0, "temp_sample", temperature=temp,
+                              candidate_mode=cfg["candidate_mode"], top_k=cfg["top_k"], budget=cfg["budget"],
+                              generator=torch.Generator().manual_seed(seed + 300 + i))
+        sr = float(out["correct"].float().mean())
+        print(f"     tune temp={temp}: dev_success={sr:.3f}", flush=True)
+        if sr > best_sr or (sr == best_sr and temp == 1.0):
+            best_sr, best_t = sr, temp
+    return best_t, best_sr
+
+
 def arm_results(out):
     return dict(
         success=float(out["correct"].float().mean()),
         mean_steps_to_goal=float(out["steps_to_goal"].float().mean()),
         frac_at_goal=float(out["frac_at_goal"].float().mean()),
+        mean_risk=float(out.get("mean_risk", 0.0)),            # scorer-arm component diagnostics (spec 4.4)
+        mean_ambiguity=float(out.get("mean_ambiguity", 0.0)),
     )
 
 
@@ -105,14 +140,15 @@ def run_checkpoint(model, cfg, device, seed):
     print(f"   [seed {seed}] tuning gamma over {cfg['gamma_grid']} on {cfg['n_dev']} dev episodes...", flush=True)
     dev_goals, dev_s0 = sample_episodes(cfg["n_dev"], seed + 100, device)
     gamma, dev_sr = tune_gamma(model, dev_goals, dev_s0, cfg)
-    print(f"   [seed {seed}] gamma*={gamma} (dev_success={dev_sr:.3f}); running the arm matrix on "
-          f"{cfg['n_episodes']} paired test episodes...", flush=True)
+    temp, temp_dev_sr = tune_temperature(model, dev_goals, dev_s0, cfg, seed)
+    print(f"   [seed {seed}] gamma*={gamma} (dev={dev_sr:.3f}); temp*={temp} (dev={temp_dev_sr:.3f}); "
+          f"running the arm matrix on {cfg['n_episodes']} paired test episodes...", flush=True)
     goals, s0 = sample_episodes(cfg["n_episodes"], seed + 200, device)   # paired test set
+    base_kw = dict(candidate_mode=cfg["candidate_mode"], top_k=cfg["top_k"], budget=cfg["budget"])
 
     def efe(pref, terms, g):
         return rt.run_episodes(model, goals, s0, "efe_one_step", preference_key=pref, score_terms=terms,
-                               gamma=g, candidate_mode=cfg["candidate_mode"], top_k=cfg["top_k"],
-                               beta_C=cfg["beta_C"], budget=cfg["budget"])
+                               gamma=g, beta_C=cfg["beta_C"], **base_kw)
 
     def _run(name, fn):
         out = fn()
@@ -120,48 +156,60 @@ def run_checkpoint(model, cfg, device, seed):
         return out
 
     outs = {
-        "full_efe_tuned":   _run("full_efe_tuned",   lambda: efe("task", ("risk", "ambiguity"), gamma)),
-        "full_efe_g1":      _run("full_efe_g1",      lambda: efe("task", ("risk", "ambiguity"), 1.0)),  # sensitivity
-        "risk_only":        _run("risk_only",        lambda: efe("task", ("risk",), gamma)),
-        "ambiguity_only":   _run("ambiguity_only",   lambda: efe("task", ("ambiguity",), gamma)),
-        "flat_pref":        _run("flat_pref",        lambda: efe("flat", ("risk", "ambiguity"), gamma)),  # inert v1
-        "p_data_control":   _run("p_data_control",   lambda: efe("held_out_predictive", ("risk", "ambiguity"), gamma)),
-        "logprob_baseline": _run("logprob_baseline", lambda: rt.run_episodes(model, goals, s0, "logprob_control",
-                                            gamma=1.0, candidate_mode=cfg["candidate_mode"],
-                                            top_k=cfg["top_k"], budget=cfg["budget"])),
-        "random":           _run("random",           lambda: rt.run_episodes(model, goals, s0, "random",
-                                            candidate_mode=cfg["candidate_mode"], top_k=cfg["top_k"],
-                                            budget=cfg["budget"], generator=torch.Generator().manual_seed(seed + 7))),
+        "full_efe_tuned":     _run("full_efe_tuned",     lambda: efe("task", ("risk", "ambiguity"), gamma)),
+        "full_efe_g1":        _run("full_efe_g1",        lambda: efe("task", ("risk", "ambiguity"), 1.0)),  # sensitivity
+        "risk_only":          _run("risk_only",          lambda: efe("task", ("risk",), gamma)),
+        "ambiguity_only":     _run("ambiguity_only",     lambda: efe("task", ("ambiguity",), gamma)),
+        "flat_pref":          _run("flat_pref",          lambda: efe("flat", ("risk", "ambiguity"), gamma)),  # inert v1
+        "p_data_control":     _run("p_data_control",     lambda: efe("held_out_predictive", ("risk", "ambiguity"), gamma)),
+        "temp_tuned_logprob": _run("temp_tuned_logprob", lambda: rt.run_episodes(model, goals, s0, "temp_sample",
+                                            temperature=temp, generator=torch.Generator().manual_seed(seed + 11), **base_kw)),
+        "logprob_baseline":   _run("logprob_baseline",   lambda: rt.run_episodes(model, goals, s0, "logprob_control",
+                                            gamma=1.0, **base_kw)),
+        "nucleus":            _run("nucleus",            lambda: rt.run_episodes(model, goals, s0, "nucleus",
+                                            top_p=NUCLEUS_TOP_P, generator=torch.Generator().manual_seed(seed + 12), **base_kw)),
+        "typical":            _run("typical",            lambda: rt.run_episodes(model, goals, s0, "typical",
+                                            top_p=TYPICAL_P, generator=torch.Generator().manual_seed(seed + 13), **base_kw)),
+        "greedy_ref":         _run("greedy_ref",         lambda: rt.run_episodes(model, goals, s0, "greedy_ref", **base_kw)),
+        "random":             _run("random",             lambda: rt.run_episodes(model, goals, s0, "random",
+                                            generator=torch.Generator().manual_seed(seed + 7), **base_kw)),
     }
     metrics = {k: arm_results(v) for k, v in outs.items()}
 
     efe_correct = outs["full_efe_tuned"]["correct"]
     gates = {}
-    # Holm-Bonferroni over the two distinct primary comparisons (beam / best-of-N reduce to the
-    # logprob baseline at H=1, so they are not separate tests here; the horizon phase adds them).
+    # conjunctive PRIMARY gate, Holm-Bonferroni (spec Section 4.6): full EFE must beat the p_data control
+    # and the temperature-tuned logprob baseline by > delta_min with corrected significance. The
+    # matched-compute beam / best-of-N primaries are deferred to the horizon phase (Phase 3), where they
+    # are not degenerate (see docs/research/active-inference/2026-06-28-phase2-scope-note.md).
     primaries = {}
-    for name in ("p_data_control", "logprob_baseline"):
+    for name in ("p_data_control", "temp_tuned_logprob"):
         nb, nc, chi2, p = mcnemar(efe_correct, outs[name]["correct"])
         diff, lo, hi = bootstrap_diff_ci(efe_correct, outs[name]["correct"], alpha=cfg["alpha"])
-        primaries[name] = dict(mcnemar_b=nb, mcnemar_c=nc, chi2=chi2, p=p,
-                               diff=diff, ci=[lo, hi])
-    # Holm correction
+        primaries[name] = dict(mcnemar_b=nb, mcnemar_c=nc, chi2=chi2, p=p, diff=diff, ci=[lo, hi])
     ordered = sorted(primaries.items(), key=lambda kv: kv[1]["p"])
     m = len(ordered)
     holm_pass = {}
+    holm_rejected = True                                      # Holm step-down: once one p fails, all higher-p fail
     for rank, (name, st) in enumerate(ordered):
         thresh = cfg["alpha"] / (m - rank)
-        holm_pass[name] = bool(st["p"] < thresh and st["diff"] > cfg["delta_min"])
+        holm_rejected = holm_rejected and (st["p"] < thresh)
+        holm_pass[name] = bool(holm_rejected and st["diff"] > cfg["delta_min"])
     gates["primary"] = {k: {**primaries[k], "holm_pass": holm_pass[k]} for k in primaries}
-    # Random lesion (spec Section 4.7: falsified if "random-score is not clearly worst"). The intent is
-    # that a random scorer must NOT match EFE; the operationalization is "full EFE beats random by more
-    # than delta_min". A strict global-argmin test is wrong here because at v1 every goalless arm
-    # (ambiguity_only, flat, p_data, logprob) legitimately collapses to ~random, so they cluster within
-    # noise and any one of them can edge random by a single episode without weakening the lesion.
+    # Benjamini-Hochberg FDR over the broader arm grid (full EFE vs every other arm on the primary
+    # success metric), the multiplicity control for the exploratory matrix (spec Section 4.6, q=0.05).
+    grid_p = {name: mcnemar(efe_correct, outs[name]["correct"])[3] for name in outs if name != "full_efe_tuned"}
+    gates["fdr_grid"] = {name: {"p": p, "significant": sig} for name, (p, sig) in bh_fdr(grid_p, q=FDR_Q).items()}
+    # v1 lesion gates (spec Sections 4.6/4.7). Random must NOT match EFE: "full EFE beats random by more
+    # than delta_min" (a strict global-argmin test is wrong here because every goalless arm legitimately
+    # collapses to ~random and any one can edge random by a single episode without weakening the lesion).
+    # Closed-loop causality: the committed action must measurably change the next observation.
     gates["random_clearly_beaten"] = bool(
         metrics["full_efe_tuned"]["success"] - metrics["random"]["success"] > cfg["delta_min"])
-    gates["go"] = bool(all(holm_pass.values()) and gates["random_clearly_beaten"])
-    return dict(gamma=gamma, dev_success=dev_sr, metrics=metrics, gates=gates)
+    gates["closed_loop_causal"] = rt.closed_loop_causality_holds()
+    gates["go"] = bool(all(holm_pass.values()) and gates["random_clearly_beaten"]
+                       and gates["closed_loop_causal"])
+    return dict(gamma=gamma, temp=temp, dev_success=dev_sr, metrics=metrics, gates=gates)
 
 
 def main():
@@ -189,10 +237,12 @@ def main():
             entry.update(run_checkpoint(model, cfg, device, seed))
             admitted.append(seed)
             g = entry["gates"]
-            print(f"   gamma*={entry['gamma']}  full_efe={entry['metrics']['full_efe_tuned']['success']:.3f}  "
-                  f"logprob={entry['metrics']['logprob_baseline']['success']:.3f}  "
+            print(f"   gamma*={entry['gamma']} temp*={entry['temp']}  "
+                  f"full_efe={entry['metrics']['full_efe_tuned']['success']:.3f}  "
+                  f"temp_lp={entry['metrics']['temp_tuned_logprob']['success']:.3f}  "
                   f"p_data={entry['metrics']['p_data_control']['success']:.3f}  "
-                  f"random={entry['metrics']['random']['success']:.3f}  GO={g['go']}")
+                  f"random={entry['metrics']['random']['success']:.3f}  "
+                  f"causal={g['closed_loop_causal']}  GO={g['go']}")
         results["checkpoints"][str(seed)] = entry
 
     # cross-seed aggregate + overall go/no-go (all admitted seeds must individually pass)

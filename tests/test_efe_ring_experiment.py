@@ -31,3 +31,17 @@ def test_sample_episodes_respects_device():
     goals, s0 = exp.sample_episodes(8, seed=1, device=torch.device("cpu"))
     assert goals.device.type == "cpu" and s0.device.type == "cpu"
     assert goals.shape == (8,) and s0.shape == (8,)
+
+
+def test_bh_fdr_step_up_control():
+    # Phase 2 multiplicity control (spec 4.6): Benjamini-Hochberg over the arm grid.
+    all_sig = exp.bh_fdr({"a": 0.001, "b": 0.002, "c": 0.003}, q=0.05)
+    assert all(sig for _, sig in all_sig.values())            # tiny p-values -> all rejected
+    none_sig = exp.bh_fdr({"a": 0.9, "b": 0.8, "c": 0.95}, q=0.05)
+    assert not any(sig for _, sig in none_sig.values())       # large p-values -> none rejected
+    # step-up: p=[0.01, 0.04, 0.5], m=3, q=0.05 -> only the largest passing rank k=1 ('a') rejected
+    mixed = exp.bh_fdr({"a": 0.01, "b": 0.04, "c": 0.5}, q=0.05)
+    assert mixed["a"][1] is True and mixed["b"][1] is False and mixed["c"][1] is False
+    # step-up property: a later rank passing lifts the earlier ones too
+    lifted = exp.bh_fdr({"a": 0.02, "b": 0.02, "c": 0.02}, q=0.05)
+    assert all(sig for _, sig in lifted.values())             # k=3 passes (0.02 <= 0.05) -> all rejected
