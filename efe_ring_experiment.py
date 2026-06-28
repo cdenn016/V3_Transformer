@@ -28,6 +28,7 @@ CONFIG = dict(
     steps=15000,                     # sealed training budget per seed
     batch_size=256,
     lr=3e-3,
+    log_every=100,                   # print training step/loss/rate/ETA every N steps (0 = silent)
     n_dev=1000,                      # dev episodes for gamma tuning
     n_episodes=5000,                 # sealed test episodes per arm (paired)
     budget=10,                       # T_ep
@@ -81,6 +82,7 @@ def tune_gamma(model, goals, s0, cfg):
         out = rt.run_episodes(model, goals, s0, "efe_one_step", preference_key="task",
                               gamma=gamma, top_k=cfg["top_k"], beta_C=cfg["beta_C"], budget=cfg["budget"])
         sr = float(out["correct"].float().mean())
+        print(f"     tune gamma={gamma}: dev_success={sr:.3f}", flush=True)
         # argmax dev success; ties broken toward gamma = 1.0 (spec Section 4.2)
         if sr > best_sr or (sr == best_sr and gamma == 1.0):
             best_sr, best_g = sr, gamma
@@ -96,25 +98,34 @@ def arm_results(out):
 
 
 def run_checkpoint(model, cfg, device, seed):
+    print(f"   [seed {seed}] tuning gamma over {cfg['gamma_grid']} on {cfg['n_dev']} dev episodes...", flush=True)
     dev_goals, dev_s0 = sample_episodes(cfg["n_dev"], seed + 100, device)
     gamma, dev_sr = tune_gamma(model, dev_goals, dev_s0, cfg)
+    print(f"   [seed {seed}] gamma*={gamma} (dev_success={dev_sr:.3f}); running the arm matrix on "
+          f"{cfg['n_episodes']} paired test episodes...", flush=True)
     goals, s0 = sample_episodes(cfg["n_episodes"], seed + 200, device)   # paired test set
 
     def efe(pref, terms, g):
         return rt.run_episodes(model, goals, s0, "efe_one_step", preference_key=pref, score_terms=terms,
                                gamma=g, top_k=cfg["top_k"], beta_C=cfg["beta_C"], budget=cfg["budget"])
 
+    def _run(name, fn):
+        out = fn()
+        print(f"     arm {name:18s} success={float(out['correct'].float().mean()):.3f}", flush=True)
+        return out
+
     outs = {
-        "full_efe_tuned":  efe("task", ("risk", "ambiguity"), gamma),
-        "full_efe_g1":     efe("task", ("risk", "ambiguity"), 1.0),       # mandatory sensitivity point
-        "risk_only":       efe("task", ("risk",), gamma),
-        "ambiguity_only":  efe("task", ("ambiguity",), gamma),
-        "flat_pref":       efe("flat", ("risk", "ambiguity"), gamma),     # inert at v1 (reported)
-        "p_data_control":  efe("held_out_predictive", ("risk", "ambiguity"), gamma),
-        "logprob_baseline": rt.run_episodes(model, goals, s0, "logprob_control",
-                                            gamma=1.0, top_k=cfg["top_k"], budget=cfg["budget"]),
-        "random":          rt.run_episodes(model, goals, s0, "random", top_k=cfg["top_k"],
-                                           budget=cfg["budget"], generator=torch.Generator().manual_seed(seed + 7)),
+        "full_efe_tuned":   _run("full_efe_tuned",   lambda: efe("task", ("risk", "ambiguity"), gamma)),
+        "full_efe_g1":      _run("full_efe_g1",      lambda: efe("task", ("risk", "ambiguity"), 1.0)),  # sensitivity
+        "risk_only":        _run("risk_only",        lambda: efe("task", ("risk",), gamma)),
+        "ambiguity_only":   _run("ambiguity_only",   lambda: efe("task", ("ambiguity",), gamma)),
+        "flat_pref":        _run("flat_pref",        lambda: efe("flat", ("risk", "ambiguity"), gamma)),  # inert v1
+        "p_data_control":   _run("p_data_control",   lambda: efe("held_out_predictive", ("risk", "ambiguity"), gamma)),
+        "logprob_baseline": _run("logprob_baseline", lambda: rt.run_episodes(model, goals, s0, "logprob_control",
+                                            gamma=1.0, top_k=cfg["top_k"], budget=cfg["budget"])),
+        "random":           _run("random",           lambda: rt.run_episodes(model, goals, s0, "random",
+                                            top_k=cfg["top_k"], budget=cfg["budget"],
+                                            generator=torch.Generator().manual_seed(seed + 7))),
     }
     metrics = {k: arm_results(v) for k, v in outs.items()}
 
@@ -157,10 +168,12 @@ def main():
     admitted = []
     for seed in cfg["seeds"]:
         t0 = time.time()
+        print(f"\n[seed {seed}] training {cfg['steps']} steps (batch {cfg['batch_size']}) on {device}...", flush=True)
         model, adeq = rt.train_ring_checkpoint(
-            seed=seed, steps=cfg["steps"], batch_size=cfg["batch_size"], lr=cfg["lr"], device=device)
+            seed=seed, steps=cfg["steps"], batch_size=cfg["batch_size"], lr=cfg["lr"],
+            log_every=cfg["log_every"], device=device)
         ok = adeq >= cfg["adequacy_threshold"]
-        print(f"seed {seed}: adequacy={adeq:.4f} ({'ADMIT' if ok else 'EXCLUDE'})  [{time.time()-t0:.0f}s]")
+        print(f"[seed {seed}] adequacy={adeq:.4f} ({'ADMIT' if ok else 'EXCLUDE'})  [{time.time()-t0:.0f}s]", flush=True)
         entry = {"adequacy": adeq, "admitted": ok}
         if ok:
             entry.update(run_checkpoint(model, cfg, device, seed))

@@ -17,6 +17,7 @@ the precondition any model-based planner needs (predictive-adequacy gate, Sectio
 This module is pure environment + data + a batched closed-loop runner; the orchestration (three-seed
 training, the arm matrix, paired statistics, go/no-go) lives in the experiment script.
 """
+import time
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -146,6 +147,7 @@ def train_ring_checkpoint(
     n_heads:     int   = 2,
     n_layers:    int   = 2,
     n_e_steps:   int   = 2,
+    log_every:   int   = 0,                      # >0 -> print step/loss/rate/ETA every log_every steps
     device:      Optional[str] = None,           # None -> cuda if available else cpu (use the 5090)
     cfg_overrides: Optional[dict] = None,
 ) -> Tuple[VFEModel, float]:
@@ -167,12 +169,19 @@ def train_ring_checkpoint(
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     gen = torch.Generator().manual_seed(seed + 10_000)      # CPU generator -> device-independent data
     model.train()
-    for _ in range(steps):
+    t_start = time.time()
+    for step in range(steps):
         tokens, targets = sample_batch(batch_size, generator=gen)
         _, loss, _ = model(tokens.to(device), targets.to(device))
         opt.zero_grad()
         loss.backward()
         opt.step()
+        if log_every and (step % log_every == 0 or step == steps - 1):
+            elapsed = max(time.time() - t_start, 1e-9)
+            rate = (step + 1) / elapsed
+            eta = (steps - step - 1) / rate
+            print(f"  [seed {seed}] step {step + 1}/{steps}  loss={float(loss.detach()):.4f}  "
+                  f"{rate:.1f} steps/s  ETA {eta:5.0f}s", flush=True)
     model.eval()
     adequacy = predictive_adequacy(model, generator=torch.Generator().manual_seed(seed + 20_000))
     return model, adequacy
