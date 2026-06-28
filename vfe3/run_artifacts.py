@@ -704,6 +704,15 @@ def finalize_run(
         "scaling_point":   scaling_point,
     })
 
+    # Pure-path certificate: the config toggles for the principal gauge / decode / free-energy purity
+    # axes (flat gauge, canonical F, prior-bank decode, no head mixer, ...), plus the converged-state
+    # stress metrics that say whether the numerical guards stayed inert. A REPORT of where the run sits,
+    # not a judgment that any toggle is wrong (toggles are changed intentionally). Best-effort.
+    try:
+        artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history))
+    except Exception as exc:
+        logger.warning("pure-path report failed (%s); skipped", exc)
+
     # Research artifacts (decode calibration / frequency-stratified loss / FD gradient check) -- the
     # externally-grounded probes that do NOT presuppose the gauge framework. Best-effort, AFTER the
     # test-eval n_e_steps restore so the model is in its trained state. Run before the figure pass.
@@ -722,6 +731,53 @@ def finalize_run(
         except Exception as exc:
             logger.warning("publication figure generation failed (%s); numeric results are saved", exc)
     return results
+
+
+def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
+    r"""Where a run sits relative to the theoretically pure path: the toggle states that define it plus
+    the converged-state stress metrics that say whether the numerical guards stayed inert.
+
+    A REPORT, not a verdict. The pure path must EXIST under appropriate toggles, but the user changes
+    toggles intentionally, so a non-pure run is recorded (``on_pure_path=False`` with the offending
+    flags), never flagged as wrong. ``pure_flags`` covers the principal gauge / decode / free-energy
+    purity axes (canonical attention entropy, flat transport, constant/static coupling weights,
+    prior-bank decode, no head mixer, unweighted attention); it does NOT enumerate every default-OFF
+    learned-scalar toggle (pos_phi, lambda_h_mode, learnable_r, t5_learnable_bias, use_cg_coupling),
+    so ``on_pure_path`` certifies these axes rather than a full no-learned-parameter audit.
+    ``converged_stress`` reads the last finite value of each guard / flatness column (None if absent)."""
+    def _last(key: str) -> Optional[float]:
+        for r in reversed(history):
+            v = r.get(key)
+            if isinstance(v, (int, float)) and math.isfinite(v):
+                return float(v)
+        return None
+    pure_flags = {
+        "canonical_attention_entropy": bool(cfg.include_attention_entropy),
+        "flat_transport":              cfg.transport_mode == "flat",
+        "constant_lambda_alpha":       cfg.lambda_alpha_mode == "constant",
+        "static_lambda_beta":          not cfg.learnable_lambda_beta,
+        "prior_bank_decode":           bool(cfg.use_prior_bank),
+        "no_head_mixer":               not cfg.use_head_mixer,
+        "unweighted_attention":        not cfg.precision_weighted_attention,
+    }
+    return {
+        "on_pure_path": all(pure_flags.values()),
+        "pure_flags":   pure_flags,
+        "config_toggles": {
+            "include_attention_entropy":    bool(cfg.include_attention_entropy),
+            "transport_mode":               cfg.transport_mode,
+            "lambda_alpha_mode":            cfg.lambda_alpha_mode,
+            "lambda_beta":                  float(cfg.lambda_beta),
+            "learnable_lambda_beta":        bool(cfg.learnable_lambda_beta),
+            "use_prior_bank":               bool(cfg.use_prior_bank),
+            "use_head_mixer":               bool(cfg.use_head_mixer),
+            "precision_weighted_attention": bool(cfg.precision_weighted_attention),
+        },
+        "converged_stress": {k: _last(k) for k in (
+            "guard_sigma_floor_frac", "guard_sigma_ceil_frac", "guard_energy_klmax_frac",
+            "guard_selfdiv_klmax_frac", "nonfinite_frac", "renyi_band_frac",
+            "cocycle_residual", "holonomy_wilson", "gauge_invariant_spread")},
+    }
 
 
 def _save_figures(
@@ -743,6 +799,21 @@ def _save_figures(
                     xs.append(r.get("step", i))
                     ys.append(r[key])
             return xs, ys
+
+        def _hist_subset(keys: tuple) -> Optional[Dict]:
+            r"""A ``{step, key: [...]}`` history dict over ``keys`` present (finite on >= 1 row), each a
+            full-length column with NaN where missing so an eval-cadence key keeps its step alignment and
+            the dashboard masks it per series. Returns None when no key is present (caller skips)."""
+            present = [k for k in keys
+                       if any(k in r and isinstance(r[k], (int, float)) and math.isfinite(r[k])
+                              for r in artifacts.history)]
+            if not present:
+                return None
+            cols: Dict = {"step": [r.get("step", i) for i, r in enumerate(artifacts.history)]}
+            for k in present:
+                cols[k] = [float(r[k]) if (k in r and isinstance(r[k], (int, float)) and math.isfinite(r[k]))
+                           else float("nan") for r in artifacts.history]
+            return cols
 
         if losses:
             # losses is one entry per optimizer step, so the 1-based step index IS the x-axis.
@@ -890,5 +961,49 @@ def _save_figures(
                            **{k: [r[k] for r in mc_rows] for k in mc_present}}
                 fig = figs.plot_model_channel_terms(hist_mc, path=str(run / "model_channel_terms.png"))
                 figs.plt.close(fig)
+        # Geometry / SPD / Fisher health dashboard (history-only): the gauge, belief-spectrum, guard,
+        # and numerical-safety scalars diagnostics() logs to metrics.csv but that no standard figure
+        # surfaced. The panels self-gate, so a run missing a column simply drops that panel.
+        hist_geom = _hist_subset((
+            "holonomy_wilson", "cocycle_residual", "holonomy_deviation",
+            "gauge_invariant_spread", "gauge_head_logdet_spread", "phi_norm_mean", "phi_norm_std",
+            "belief_cond_p95", "belief_cond_max", "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
+            "fisher_trace_mean", "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
+            "guard_energy_klmax_frac", "guard_selfdiv_klmax_frac", "nonfinite_frac", "renyi_band_frac",
+            "attn_entropy_min", "attn_entropy_collapsed_heads"))
+        if hist_geom:
+            fig = figs.plot_geometry_health(hist_geom, path=str(run / "geometry_health.png"))
+            figs.plt.close(fig)
+        # E-step inference-quality dashboard: the inner-loop F-drop, the nondecreasing fraction, and the
+        # last-iter belief residuals -- the E-step evidence the single estep_f_drop curve does not show.
+        hist_estep = _hist_subset((
+            "estep_f_drop", "estep_f_nondecreasing_frac",
+            "estep_r_mu_last", "estep_r_sigma_last", "estep_r_phi_last"))
+        if hist_estep:
+            fig = figs.plot_estep_quality(hist_estep, path=str(run / "estep_quality.png"))
+            figs.plt.close(fig)
+        # Held-out validation-sanity dashboard: the per-eval probes (_val_diagnostics) that were CSV-only
+        # -- generalization gap, positional loss, causal/attention sanity, and the held-out geometry.
+        hist_val = _hist_subset((
+            "generalization_gap", "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
+            "val_future_leakage", "val_row_sum_error", "val_pos_content_r2",
+            "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
+            "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
+            "val_belief_cond_p95", "val_fisher_trace_mean", "val_guard_sigma_floor_frac",
+            "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
+            "val_phi_norm_mean", "val_phi_norm_std"))
+        if hist_val:
+            fig = figs.plot_validation_sanity(hist_val, path=str(run / "validation_sanity.png"))
+            figs.plt.close(fig)
+        # Optimizer information-geometry dashboard: natural-gradient alignment, pullback conditioning,
+        # per-role weight norms, and the synthesized update-to-weight ratio. Present only on a gauge
+        # natural-grad run (cos_nat_phi / pullback) and when step_metrics captured the norms.
+        hist_opt = _hist_subset((
+            "cos_nat_phi", "pullback_cond_median", "pullback_cond_max",
+            "weight_norm_mu", "weight_norm_sigma", "weight_norm_phi",
+            "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"))
+        if hist_opt:
+            fig = figs.plot_optimizer_geometry(hist_opt, path=str(run / "optimizer_geometry.png"))
+            figs.plt.close(fig)
     except Exception as exc:                                    # never let a plot kill a finished run
         logger.warning("figure generation failed (%s); numeric results are still saved", exc)

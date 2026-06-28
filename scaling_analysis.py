@@ -327,6 +327,15 @@ def analyze() -> None:
     infer_points = [p for p in points if p["route"] == INFERENCE_ROUTE]
     _print_points_table(points)
 
+    # Accumulate the printed fits / tests into a persisted summary (scaling_summary.json plus the
+    # SCALING_ANALYSIS.md report): the pooled fit, bootstrap CI, per-route exponents, the
+    # frontier-collapse F-test, and the E-step structural-EM correlations were console-only.
+    summary: Dict[str, Any] = {
+        "input_dir": str(input_dir), "n_runs": len(rows), "with_offset": CONFIG["with_offset"],
+        "n_param_points": len(param_points), "n_inference_points": len(infer_points),
+        "pooled_fit": None, "per_route": {}, "frontier_collapse": None, "estep_structural": None,
+    }
+
     # ---- L(N) power law + bootstrap exponent CI (pooled over the parameter routes) ----
     if len(param_points) >= 2:
         from vfe3.viz.figures import _fit_power_law
@@ -341,6 +350,10 @@ def analyze() -> None:
               f"[95% CI {lo:.4f}, {hi:.4f}]   A = {fit['A']:.4g}   "
               + (f"E = {fit['E']:.4f}   " if CONFIG["with_offset"] else "")
               + f"R^2 = {fit['r2']:.4f}   over {fit['n_points']} sizes")
+        summary["pooled_fit"] = {
+            "form": fit["form"], "alpha": fit["alpha"], "alpha_ci": [lo, hi],
+            "A": fit["A"], "E": fit.get("E"), "r2": fit["r2"], "n_points": fit["n_points"],
+        }
         # ---- per-route fits + frontier-collapse F-test ----
         routes = sorted({p["route"] for p in param_points})
         if len(routes) > 1:
@@ -351,9 +364,11 @@ def analyze() -> None:
                     fr = _fit_power_law(np.array([p["n_params"] for p in pr], dtype=float),
                                         np.array([p["ce_mean"] for p in pr], dtype=float))
                     print(f"  {r:<14} alpha={fr['alpha']:.4f}  R^2={fr['r2']:.4f}  ({len(pr)} sizes)")
+                    summary["per_route"][r] = {"alpha": fr["alpha"], "r2": fr["r2"], "n_sizes": len(pr)}
                 else:
                     print(f"  {r:<14} (only {len(pr)} size; need >= 2 to fit)")
             anc = ancova_frontier_collapse(param_points, min_points=CONFIG["min_points"])
+            summary["frontier_collapse"] = anc
             if anc.get("testable"):
                 verdict = ("ONE shared frontier (routes collapse)" if anc["collapses"]
                            else "routes DIVERGE (route-specific slope/intercept)")
@@ -378,10 +393,63 @@ def analyze() -> None:
         print(f"\nE-step structural-EM check ({len(estep_pts)} n_e_steps arms):"
               f"\n  Pearson(n_e_steps, final F/token) = {_pear(ne, ff):+.4f}  (expect strongly negative)"
               f"\n  Pearson(final F/token, test CE)   = {_pear(ff, ce):+.4f}  (expect ~0 / >=0 if F is target-blind)")
+        summary["estep_structural"] = {
+            "n_arms": len(estep_pts), "pearson_ne_final_f": _pear(ne, ff),
+            "pearson_final_f_test_ce": _pear(ff, ce),
+        }
+
+    # ---- persist the analysis summary (json + a human-readable markdown report); best-effort so a
+    # serialization/render error never suppresses the figure pass below ----
+    try:
+        (input_dir / "scaling_summary.json").write_text(
+            json.dumps(summary, indent=2, default=str), encoding="utf-8")
+        _write_scaling_md(input_dir / "SCALING_ANALYSIS.md", summary)
+        print(f"\nsummary -> {input_dir / 'scaling_summary.json'}"
+              f"\n           {input_dir / 'SCALING_ANALYSIS.md'}")
+    except Exception as exc:
+        logger.warning("scaling summary write failed (%s); skipped", exc)
 
     # ---- figures (best-effort, never fatal) ----
     _make_figures(param_points, infer_points, fig_dir)
     print(f"\nfigures -> {fig_dir}")
+
+
+def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
+    r"""Render ``summary`` as a readable SCALING_ANALYSIS.md (the pooled fit, per-route exponents,
+    frontier-collapse F-test, and E-step structural-EM correlations that were console-only)."""
+    L = ["# VFE_3.0 scaling analysis", "",
+         f"- input: `{summary.get('input_dir')}`",
+         f"- runs: {summary.get('n_runs')}  (parameter points: {summary.get('n_param_points')}, "
+         f"inference points: {summary.get('n_inference_points')})",
+         f"- fit form: {'E + A N^-alpha (offset)' if summary.get('with_offset') else 'A N^-alpha'}", ""]
+    pf = summary.get("pooled_fit")
+    if pf:
+        L += ["## Pooled L(N) power law", "",
+              f"- exponent alpha = {pf['alpha']:.4f}  (95% CI [{pf['alpha_ci'][0]:.4f}, {pf['alpha_ci'][1]:.4f}])",
+              f"- A = {pf['A']:.4g}" + (f", E = {pf['E']:.4f}"
+                                        if summary.get("with_offset") and pf.get("E") is not None else ""),
+              f"- R^2 = {pf['r2']:.4f} over {pf['n_points']} sizes", ""]
+    pr = summary.get("per_route") or {}
+    if pr:
+        L += ["## Per-route exponents", "", "| route | alpha | R^2 | sizes |", "|---|---|---|---|"]
+        L += [f"| {r} | {d['alpha']:.4f} | {d['r2']:.4f} | {d['n_sizes']} |" for r, d in pr.items()]
+        L.append("")
+    anc = summary.get("frontier_collapse")
+    if anc and anc.get("testable"):
+        verdict = ("one shared frontier (routes collapse)" if anc.get("collapses")
+                   else "routes diverge (route-specific slope/intercept)")
+        L += ["## Frontier-collapse F-test", "",
+              f"- F({anc['df1']},{anc['df2']}) = {anc['F']:.3f}, p = {anc['p_value']:.4g}",
+              f"- verdict: {verdict}", ""]
+    elif anc:
+        L += ["## Frontier-collapse F-test", "", f"- not testable ({anc.get('reason')})", ""]
+    es = summary.get("estep_structural")
+    if es:
+        L += ["## E-step structural-EM check", "",
+              f"- arms: {es['n_arms']}",
+              f"- Pearson(n_e_steps, final F/token) = {es['pearson_ne_final_f']:+.4f}  (expect strongly negative)",
+              f"- Pearson(final F/token, test CE) = {es['pearson_final_f_test_ce']:+.4f}  (expect ~0 / >=0)", ""]
+    path.write_text("\n".join(L), encoding="utf-8")
 
 
 def _make_figures(param_points: List[Dict[str, Any]], infer_points: List[Dict[str, Any]],
@@ -421,6 +489,13 @@ def _make_figures(param_points: List[Dict[str, Any]], infer_points: List[Dict[st
             _try("scaling_ce_vs_tokens.png", lambda: figs.plot_scaling_law(
                 param_points, x_key="tokens_seen", xlabel="tokens seen (data)",
                 title="Scaling vs data", path=str(fig_dir / "scaling_ce_vs_tokens.png")))
+        # Pooled PPL offset law vs width (the June-27 headline result): PPL = E + A K^{-b} over ALL
+        # parameter points, distinct from the per-arm kmup_stability split below. Uses the per-point
+        # ppl_mean from aggregate_points; gated on >= 2 distinct widths.
+        if len({_as_float(p.get("embed_dim")) for p in param_points
+                if np.isfinite(_as_float(p.get("embed_dim")))}) > 1:
+            _try("ppl_vs_embed_dim_offset.png", lambda: figs.plot_ppl_offset(
+                param_points, path=str(fig_dir / "ppl_vs_embed_dim_offset.png")))
 
     # F1/EXP-6: muP width-stability -- grow_K (width-fixed) vs grow_K_mup's matched _fixed/_mup arms on
     # the shared K=embed_dim axis (test PPL per K + offset power-law fit, b annotated per arm). The

@@ -487,6 +487,11 @@ _VAL_DIAG_KEYS = (
     "estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
     "estep_r_phi_last", "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
     "val_builder_resid",
+    # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
+    "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
+    "val_fisher_trace_mean", "val_belief_cond_p95", "val_phi_norm_mean", "val_phi_norm_std",
+    "val_guard_sigma_floor_frac", "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
+    "val_nonfinite_frac",
 )
 
 
@@ -526,6 +531,20 @@ def _val_diagnostics(
     out["val_effective_rank"]     = vd["effective_rank"]
     out["val_belief_cond_median"] = vd["belief_cond_median"]
     out["val_attn_entropy_min"]   = vd["attn_entropy_min"]
+    # Held-out gauge / SPD / Fisher geometry: vd = model.diagnostics(val_tok) ALREADY computed the full
+    # geometry dict above, so surfacing these is near-free -- the held-out counterpart to the train-batch
+    # geometry-health columns, the more credible evidence for LEARNED geometry vs a train-batch artifact.
+    out["val_holonomy_wilson"]         = vd["holonomy_wilson"]
+    out["val_cocycle_residual"]        = vd["cocycle_residual"]
+    out["val_gauge_invariant_spread"]  = vd["gauge_invariant_spread"]
+    out["val_fisher_trace_mean"]       = vd["fisher_trace_mean"]
+    out["val_belief_cond_p95"]         = vd["belief_cond_p95"]
+    out["val_phi_norm_mean"]           = vd["phi_norm_mean"]
+    out["val_phi_norm_std"]            = vd["phi_norm_std"]
+    out["val_guard_sigma_floor_frac"]  = vd["guard_sigma_floor_frac"]
+    out["val_guard_sigma_ceil_frac"]   = vd["guard_sigma_ceil_frac"]
+    out["val_guard_energy_klmax_frac"] = vd["guard_energy_klmax_frac"]
+    out["val_nonfinite_frac"]          = vd["nonfinite_frac"]
 
     amaps = model.attention_maps(val_tok)                       # (L, H, N, N) all layers/heads
     hmin = M.attention_entropy_rows(amaps).min(dim=-1).values   # (L, H) per-head min row entropy
