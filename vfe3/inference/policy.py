@@ -33,6 +33,15 @@ _POLICIES:    Dict[str, Callable] = {}
 _PREFERENCES: Dict[str, Callable] = {}
 _AMBIGUITIES: Dict[str, Callable] = {}
 
+# Preferences usable in the GENERIC generate() policy path: those needing no per-episode context (no
+# goal, no p_data). The config guard (audit F4) is FAIL-CLOSED against this allow-list, so a
+# context-requiring preference -- 'task' (needs a goal), 'held_out_predictive' (needs p_data), or any
+# future @register_preference whose context arg has no default -- is rejected rather than slipping
+# through to a mid-generate TypeError. Those preferences are driven through a harness that calls the
+# scorer directly (the ring experiment keeps policy_mode='none'). Adding a new context-free preference
+# here is the explicit opt-in.
+_GENERATE_SAFE_PREFERENCES: frozenset = frozenset({"flat"})
+
 
 def register_policy(name: str) -> Callable:
     """Decorator registering a policy scorer under ``name`` (cf. :func:`vfe3.alpha_i.register_alpha`)."""
@@ -121,14 +130,16 @@ def _pref_flat(
     prior_bank: 'object',                            # PriorBank: vocab handle (V)
 
     *,
-    eps: float = 1e-12,
+    eps:    float                       = 1e-12,
+    device: Optional[torch.device]      = None,      # model device (audit F5); None -> CPU (direct-call default)
     **kwargs,
 ) -> torch.Tensor:                                   # (V,) log p(o|C) = -log V (uniform)
     r"""The uniform preference (limit beta_C -> 0). Carries no goal; the pure-epistemic ablation. By
     spec Section 2.3 the full score is G = log V - I, which at the v1 point belief is the constant
-    log V (a uniform policy posterior). Reported, not gated, at v1."""
+    log V (a uniform policy posterior). Reported, not gated, at v1. ``device`` honors the model device
+    so the generic generate() path does not build a CPU preference for CUDA scorer tensors (audit F5)."""
     V = prior_bank.vocab_size
-    return torch.full((V,), -math.log(V))
+    return torch.full((V,), -math.log(V), device=device)
 
 
 @register_preference("task")
@@ -137,28 +148,31 @@ def _pref_task(
 
     *,
     goal:    'int | torch.Tensor',                   # goal token id (scalar) or (B,) per-episode goals
-    beta_C:  float = 5.0,                             # preference precision (spec: 5.0 -> goal mass ~0.90)
+    beta_C:  float                  = 5.0,           # preference precision (spec: 5.0 -> goal mass ~0.90)
     support: Optional[torch.Tensor] = None,          # (S,) allowed (state) token ids; mass ~0 elsewhere
-    eps:     float = 1e-12,
+    eps:     float                  = 1e-12,
+    device:  Optional[torch.device] = None,          # model device (audit F5); None -> CPU (direct-call default)
     **kwargs,
 ) -> torch.Tensor:                                   # (V,) or (B, V) log p(o|C) = log softmax(beta_C U_C)
     r"""The explicit, peaked goal preference p(o|C) = softmax(beta_C U_C): utility beta_C on the goal
     symbol, 0 on other ``support`` (state) symbols, and ~0 mass (-inf utility) on non-support tokens.
     The genuine pragmatic-EFE arm (spec Section 2.3). Per-episode: pass a (B,) ``goal`` for a (B, V)
-    preference whose peak differs per episode."""
+    preference whose peak differs per episode. ``device`` honors the model device (audit F5)."""
     V = prior_bank.vocab_size
-    goal_t = goal if isinstance(goal, torch.Tensor) else torch.tensor(goal)
+    goal_t = goal.to(device) if isinstance(goal, torch.Tensor) else torch.tensor(goal, device=device)
+    if support is not None and device is not None:
+        support = support.to(device)
     if goal_t.dim() == 0:                            # scalar goal -> (V,)
-        U = torch.zeros(V) if support is None else torch.full((V,), float("-inf"))
+        U = torch.zeros(V, device=device) if support is None else torch.full((V,), float("-inf"), device=device)
         if support is not None:
             U[support] = 0.0
         U[goal_t] = beta_C
         return torch.log_softmax(U, dim=-1)
     B = goal_t.shape[0]                              # (B,) goals -> (B, V)
-    U = torch.zeros(B, V) if support is None else torch.full((B, V), float("-inf"))
+    U = torch.zeros(B, V, device=device) if support is None else torch.full((B, V), float("-inf"), device=device)
     if support is not None:
         U[:, support] = 0.0
-    U[torch.arange(B), goal_t] = beta_C
+    U[torch.arange(B, device=device), goal_t] = beta_C
     return torch.log_softmax(U, dim=-1)
 
 

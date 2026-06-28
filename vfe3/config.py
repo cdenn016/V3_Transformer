@@ -1369,7 +1369,7 @@ class VFE3Config:
         # registry (add-by-registering, like transport_mode / decode_mode above). 'none' (default) is
         # registered, so the pure path validates; a not-yet-registered scorer key raises here until the
         # build phase that registers it lands. Local import avoids a config <- inference.policy cycle.
-        from vfe3.inference.policy import _POLICIES
+        from vfe3.inference.policy import _GENERATE_SAFE_PREFERENCES, _POLICIES
         _require(self.policy_mode, tuple(sorted(_POLICIES)), "policy_mode")
         if self.policy_top_k < 1:
             raise ValueError(f"policy_top_k must be >= 1, got {self.policy_top_k}")
@@ -1377,6 +1377,20 @@ class VFE3Config:
             raise ValueError(f"policy_horizon must be >= 1, got {self.policy_horizon}")
         if self.policy_precision <= 0.0:
             raise ValueError(f"policy_precision (gamma) must be > 0, got {self.policy_precision}")
+        # audit F4 (2026-06-28): generate()'s generic policy path cannot supply a per-episode goal or a
+        # per-corpus p_data, so context-requiring preferences are invalid there. FAIL-CLOSED against the
+        # _GENERATE_SAFE_PREFERENCES allow-list (mirrors the policy_mode/_POLICIES check above): reject
+        # at construction (with policy_mode != 'none') rather than failing mid-generate with a
+        # missing-goal TypeError. 'task'/'held_out_predictive' are driven through a harness that calls
+        # the scorer directly (the ring experiment keeps policy_mode='none' and builds the preference).
+        if self.policy_mode != "none" and self.policy_preference not in _GENERATE_SAFE_PREFERENCES:
+            raise ValueError(
+                f"policy_preference={self.policy_preference!r} is not usable in the generic generate() "
+                f"policy path; only {tuple(sorted(_GENERATE_SAFE_PREFERENCES))} carry no per-episode "
+                f"context. 'task' (needs a goal) and 'held_out_predictive' (needs p_data) must be "
+                f"driven through a harness that calls the scorer directly, which keeps "
+                f"policy_mode='none' (spec Section 3.4)."
+            )
         # Guard 4 (spec Section 7): the sigma flag cannot be flipped without naming a gate artifact, so
         # V3 sigma cannot be called an ambiguity/epistemic value before the pre-registered gate passes.
         if self.policy_sigma_ambiguity_validated and not self.policy_sigma_gate_artifact:

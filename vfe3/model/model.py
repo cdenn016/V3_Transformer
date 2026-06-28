@@ -1332,7 +1332,8 @@ class VFEModel(nn.Module):
         candidates = topk.unsqueeze(-1)                            # (B, Kp, 1) one-step action tokens
         menu_logits = torch.gather(base_logits, 1, topk)          # (B, Kp) base logits over the menu
         log_prior = torch.log_softmax(menu_logits, dim=-1)        # (B, Kp) log E(pi): base softmax over menu
-        preference = get_preference(self.cfg.policy_preference)(self.prior_bank)   # (V,) / (B,V) log p(o|C)
+        preference = get_preference(self.cfg.policy_preference)(
+            self.prior_bank, device=base_logits.device)            # (V,)/(B,V) log p(o|C), on the model device (audit F5)
         out = get_policy(self.cfg.policy_mode)(
             context, candidates, preference, self,
             gamma=self.cfg.policy_precision, horizon=self.cfg.policy_horizon,

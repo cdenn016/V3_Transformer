@@ -193,3 +193,18 @@ def test_preference_builders():
     p_data = torch.softmax(torch.randn(V), dim=-1)
     hop = get_preference("held_out_predictive")(m.prior_bank, p_data=p_data)
     assert torch.allclose(hop, p_data.log(), atol=1e-5)
+
+
+def test_preference_builders_are_device_aware():
+    # audit F5 (2026-06-28): the generic builders must honor the requested device, else generate() on
+    # CUDA builds a CPU preference and hits a CPU/CUDA mismatch. Default (device=None) stays on CPU for
+    # direct callers. CUDA-conditional, per the audit's fix note.
+    m = _model()
+    assert get_preference("flat")(m.prior_bank).device.type == "cpu"          # default -> CPU
+    assert get_preference("flat")(m.prior_bank, device=torch.device("cpu")).device.type == "cpu"
+    assert get_preference("task")(m.prior_bank, goal=3, device=torch.device("cpu")).device.type == "cpu"
+    if torch.cuda.is_available():
+        dev = torch.device("cuda")
+        assert get_preference("flat")(m.prior_bank, device=dev).device.type == "cuda"
+        assert get_preference("task")(m.prior_bank, goal=torch.tensor([1, 4]),
+                                      device=dev).device.type == "cuda"

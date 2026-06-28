@@ -68,10 +68,28 @@ def test_phase1_registrations_present():
 
 
 def test_config_accepts_registered_and_rejects_unknown_policy_mode():
+    # non-'none' modes need a context-free preference in the generic config (audit F4 guard); 'flat' is it
     for mode in ("none", "efe_one_step", "logprob_control", "efe_rollout"):
-        VFE3Config(policy_mode=mode)            # all registered keys validate (no dispatch at construct)
+        VFE3Config(policy_mode=mode, policy_preference="flat")   # all registered keys validate
     with pytest.raises(ValueError):
         VFE3Config(policy_mode="not_a_real_policy")
+
+
+def test_generic_policy_rejects_context_requiring_preference():
+    # audit F4 (2026-06-28): generate() cannot feed a per-episode goal / p_data, so 'task' and
+    # 'held_out_predictive' are invalid with policy_mode != 'none'. The DEFAULT preference is 'task',
+    # so simply turning on a scorer must raise at construction, not fail mid-generate with a missing-goal
+    # TypeError. (The default config, policy_mode='none', is unaffected -- the guard only fires once a
+    # scorer is enabled.)
+    for pref in ("task", "held_out_predictive"):
+        with pytest.raises(ValueError):
+            VFE3Config(policy_mode="efe_one_step", policy_preference=pref)
+    # fail-closed: even an unrecognized preference is rejected once a scorer is on (the old deny-list
+    # form would have let it through to a mid-generate failure).
+    with pytest.raises(ValueError):
+        VFE3Config(policy_mode="efe_one_step", policy_preference="some_future_preference")
+    VFE3Config(policy_mode="efe_one_step", policy_preference="flat")   # the context-free preference is OK
+    VFE3Config(policy_preference="task")                               # 'none' default: guard does not fire
 
 
 def test_config_rejects_bad_policy_numerics():
