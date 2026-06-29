@@ -55,7 +55,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # run-folder label so they never collide). NUM_RUNS=1 with SEEDS=[] keeps the single-run path on the
 # config `seed` above, unchanged. Example: NUM_RUNS=3, SEEDS=[3, 64, 23] trains all three seeds.
 NUM_RUNS = 1
-SEEDS    = 122,#[6,23,54,66,122]        # e.g. [3, 64, 23]; must list at least NUM_RUNS seeds when NUM_RUNS > 1
+SEEDS    = 54,#[6,23,54,66,122]        # 54 is best seed so far; must list at least NUM_RUNS seeds when NUM_RUNS > 1
 
 # DATA_SEED (EXP-1 variance floor): when set to an int, the TRAIN loader's shuffle order is fixed to
 # this seed via an explicit generator, INDEPENDENT of the per-run model seed -- so a multi-seed run
@@ -73,7 +73,7 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 10,                  # K, total belief dim (must be divisible by n_heads)
+    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
     n_heads                   = 2,
     
     max_seq_len               = 128,                 # N, context length
@@ -130,9 +130,9 @@ config = dict(
                                               #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
     
-    m_phi_natural_grad        = True,        # natural gradient on phi m-step
+    m_phi_natural_grad        = False,        # natural gradient on phi m-step
     
-    m_gauge_update_rule       = "adam",       #'ada' or 'heavy_ball'
+    m_gauge_update_rule       = "heavy_ball",       #'adam' or 'heavy_ball'
     
     phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
@@ -269,7 +269,7 @@ config = dict(
     #################################
         
     m_p_mu_lr                 = 0.015,   
-    m_p_sigma_lr              = 0.0035,     
+    m_p_sigma_lr              = 0.0045,     
     m_phi_lr                  = 0.015,   
     
     weight_decay              = 0.02,
@@ -304,7 +304,7 @@ config = dict(
         
     log_interval              = 100,       # console log every N steps (0 = off)
     eval_interval             = 1500,      # periodic validation every N steps (0 = off)
-    checkpoint_interval       = 25000,     # save a resumable checkpoint every N steps (0 = off)
+    checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
 
     use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF = pure
                                            # path: model is the last SGD iterate). ON: eval/best-save/final

@@ -24,8 +24,8 @@ from vfe3.inference import ring_task as rt
 
 # ---- pre-registration surface (spec Section 4.7); reduce only for a logged smoke test ----
 CONFIG = dict(
-    seeds=(6,),# 23, 64),               # sealed seed list
-    steps=3000,                     # sealed training budget per seed
+    seeds=(6, 23, 64),               # sealed seed list
+    steps=15000,                     # sealed training budget per seed
     batch_size=256,
     lr=3e-3,
     log_every=100,                   # print training step/loss/rate/ETA every N steps (0 = silent)

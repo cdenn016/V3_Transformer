@@ -28,7 +28,7 @@ from vfe3.model.model import VFEModel
 SPEC = "docs/superpowers/specs/2026-06-28-active-inference-efe-policy-scorer-spec.md"
 
 CONFIG = dict(
-    checkpoint="",                       # REQUIRED: path to the operating-point checkpoint (.pt)
+    checkpoint= r"C:\Users\chris and christine\Desktop\V3_Transformer\vfe3_runs\162.08_wikitext-103_K20_block_glk_s54\checkpoints\step_15000.pt",                       # REQUIRED: path to the operating-point checkpoint (.pt)
     checkpoint_id="wikitext103_ed20_15k",  # artifact filename stem (the hosting checkpoint's id)
     seeds=(6, 23, 64),                   # sealed seed list (recorded in the artifact)
     dataset="wikitext-103",

@@ -12,5 +12,6 @@ pytest_*.txt
 *_out.txt
 vfe3_runs/
 vfe3_ablation_results/
+vfe3_scaling_results/
 .claude/
 .codex/
