@@ -789,19 +789,19 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === free-energy coupling ==============================================
     
     
-    "lambda_alpha_mode": {  # 'learnable' is the NN-exception scalar log_alpha (now optimizer-grouped)
-        "description": "self-coupling alpha form",
-        "param": "lambda_alpha_mode",
+    "lambda_h_mode": {  # 'learnable' is the NN-exception scalar log_lambda_h (now optimizer-grouped)
+        "description": "self-coupling lambda_h form",
+        "param": "lambda_h_mode",
         "values": ["constant", "state_dependent", "state_dependent_per_coord", "learnable"],
     },
     
-    "b0": {
-        "description": "state-dependent alpha shape b0 (alpha* = c0/(b0 + D))",
-        "param": "b0", "values": [0.1, 1, 5.0], "requires": {"lambda_alpha_mode": "state_dependent"},
+    "b0_h": {
+        "description": "state-dependent alpha shape b0_h (lambda_h* = c0_h/(b0_h + D))",
+        "param": "b0_h", "values": [0.1, 1, 5.0], "requires": {"lambda_h_mode": "state_dependent"},
     },
-    "c0": {
-        "description": "state-dependent alpha shape c0 (numerator)",
-        "param": "c0", "values": [0.1, 1.0, 5.0], "requires": {"lambda_alpha_mode": "state_dependent"},
+    "c0_h": {
+        "description": "state-dependent alpha shape c0_h (numerator)",
+        "param": "c0_h", "values": [0.1, 1.0, 5.0], "requires": {"lambda_h_mode": "state_dependent"},
     },
     
    
@@ -1051,6 +1051,9 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
     
+    
+    "b0_h",
+    "c0_h",
   #"gauge_transport",
  # "attention_entropy",
  # "gauge_equivariance",
@@ -1062,11 +1065,11 @@ SWEEP_ORDER: List[str] = [
   
  #"m_phi_lr_natgrad",   havent run 
  
-  "pos_extrapolation",
-  "rho_handoff",
+ # "pos_extrapolation",
+ # "rho_handoff",
   
   
-  "kappa_beta_per_head",
+  #"kappa_beta_per_head",
   
   # "precision_attention_b0",
   # "decode_tau",
@@ -1083,7 +1086,7 @@ SWEEP_ORDER: List[str] = [
    
    # "m_phi_lr",
    # "m_p_mu_lr",
-   # "m_p_sigma_lr",
+   # 
     
   #  "n_e_steps",
     
@@ -1093,11 +1096,11 @@ SWEEP_ORDER: List[str] = [
   #  "phi_scale",
   #  "sigma_init", 
    
-    "renyi_order",
-  
+   # "renyi_order",
+  # "lambda_alpha",
    # "e_q_mu_lr",
   #  "phi_weight_decay",
-     
+  #   "m_p_sigma_lr",
    #"e_q_sigma_lr",
 
   #  "pos_phi_scale",   

@@ -93,13 +93,13 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 2,
+    embed_dim                 = 120,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 12,
     
     max_seq_len               = 128,                 # N, context length
     
     batch_size                = 64,
-    max_steps                 = 15000,
+    max_steps                 = 60000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -289,7 +289,7 @@ config = dict(
     #################################
         
     m_p_mu_lr                 = 0.015,   
-    m_p_sigma_lr              = 0.0035,     
+    m_p_sigma_lr              = 0.0045,     
     m_phi_lr                  = 0.015,   
     
     weight_decay              = 0.02,
@@ -518,7 +518,7 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
 #
 # To add your own: call a route builder with a new grid and give it a key; add that key to CONFIG["routes"].
 ROUTES: Dict[str, List[Dict[str, Any]]] = {
-    "grow_K_GL10":   route_grow_k_fixed_block([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120], block=10),
+    "grow_K_GL10":   route_grow_k_fixed_block([90, 100, 110, 120], block=10),
     "blocks_K48":    route_vary_block_fixed_k(48, [48, 24, 12, 8, 6]),
     "grow_K":        route_grow_k([20, 40, 60, 80, 100, 120], n_heads=4),
     "grow_K_mup":    route_grow_k_mup([20, 40, 80, 120], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
