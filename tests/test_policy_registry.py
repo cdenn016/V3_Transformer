@@ -69,8 +69,9 @@ def test_phase1_registrations_present():
 
 def test_config_accepts_registered_and_rejects_unknown_policy_mode():
     # non-'none' modes need a context-free preference in the generic config (audit F4 guard); 'flat' is it
-    for mode in ("none", "efe_one_step", "logprob_control", "efe_rollout"):
-        VFE3Config(policy_mode=mode, policy_preference="flat")   # all registered keys validate
+    for mode in ("none", "efe_one_step", "logprob_control"):
+        VFE3Config(policy_mode=mode, policy_preference="flat")   # H=1 registered keys validate
+    VFE3Config(policy_mode="efe_rollout", policy_preference="flat", policy_horizon=2)  # H>1 scorer needs horizon>1
     with pytest.raises(ValueError):
         VFE3Config(policy_mode="not_a_real_policy")
 

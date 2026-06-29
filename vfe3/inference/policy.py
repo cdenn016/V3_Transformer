@@ -28,6 +28,8 @@ from typing import Callable, Dict, NamedTuple, Optional, Tuple
 
 import torch
 
+from vfe3.inference.belief_cache import cache_supported, rollout_predictive_cached
+
 
 _POLICIES:    Dict[str, Callable] = {}
 _PREFERENCES: Dict[str, Callable] = {}
@@ -239,6 +241,12 @@ def _rollout_predictive(
     B, N = context.shape
     Kp, L = candidates.shape[1], candidates.shape[2]
     max_len = model.cfg.max_seq_len
+    # Cache fast path (Phase 3a): on the verified causal/filtering/flat/single-block regime, and when
+    # context+candidate fits the built length (no sliding-window eviction, which would invalidate the
+    # prefix), compute only the appended positions' E-step rows against a shared context. Golden-tested
+    # equal to the full recompute below to float tolerance (tests/test_belief_cache.py).
+    if cache_supported(model.cfg) and N + L <= max_len:
+        return rollout_predictive_cached(context, candidates, model, base_logits=base_logits)
     if N + L > max_len:                              # keep context+action within the model's built length
         context = context[:, -(max_len - L):]
         N = context.shape[1]
@@ -282,6 +290,35 @@ def _policy_posterior(
     return torch.softmax(logits, dim=-1)
 
 
+def _efe_score(
+    context:     torch.Tensor,                       # (B, N) context ids
+    candidates:  torch.Tensor,                       # (B, Kp, L) candidate continuations (L = horizon)
+    preference:  torch.Tensor,                       # (V,) or (B, V) log p(o|C)
+
+    model:       'object',                            # VFEModel
+
+    *,
+    gamma:          float,
+    score_terms:    Tuple[str, ...],
+    ambiguity_mode: str,
+    log_prior:      Optional[torch.Tensor],
+    base_logits:    Optional[torch.Tensor],
+) -> 'PolicyScore':
+    r"""Shared EFE scoring body for ``efe_one_step`` (H=1) and ``efe_rollout`` (H>1): roll the
+    candidates forward (the cache fast path engages inside ``_rollout_predictive`` when supported),
+    form risk + ambiguity, and return the policy posterior. The horizon distinction lives entirely in
+    the candidate length L and the per-scorer guards; the scoring algebra is identical because the
+    rollout always reads the LAST appended position's predictive q(o|pi)."""
+    q_log, log_prob = _rollout_predictive(context, candidates, model, base_logits=base_logits)
+    risk, pred_ent = _efe_terms(q_log, preference)
+    ambiguity = get_ambiguity(ambiguity_mode)(q_log, model=model)
+    epistemic = pred_ent - ambiguity                            # MI bridge; ==0 at v1 (likelihood_entropy)
+    terms = {"risk": risk, "ambiguity": ambiguity, "epistemic": -epistemic}
+    score = sum(terms[t] for t in score_terms)
+    post = _policy_posterior(score, gamma, log_prior)
+    return PolicyScore(score, risk, ambiguity, epistemic, log_prob, post)
+
+
 # ---- policy registry: the scorers ------------------------------------------------------------------
 
 @register_policy("efe_one_step")
@@ -310,14 +347,8 @@ def _policy_efe_one_step(
         raise ValueError(
             f"efe_one_step is the H=1 scorer; got horizon={horizon}. Horizon>1 is efe_rollout, which "
             f"is gated on a belief/key-value cache (spec Section 3.5).")
-    q_log, log_prob = _rollout_predictive(context, candidates, model, base_logits=base_logits)
-    risk, pred_ent = _efe_terms(q_log, preference)
-    ambiguity = get_ambiguity(ambiguity_mode)(q_log, model=model)
-    epistemic = pred_ent - ambiguity                            # MI bridge; ==0 at v1 (likelihood_entropy)
-    terms = {"risk": risk, "ambiguity": ambiguity, "epistemic": -epistemic}
-    score = sum(terms[t] for t in score_terms)
-    post = _policy_posterior(score, gamma, log_prior)
-    return PolicyScore(score, risk, ambiguity, epistemic, log_prob, post)
+    return _efe_score(context, candidates, preference, model, gamma=gamma, score_terms=score_terms,
+                      ambiguity_mode=ambiguity_mode, log_prior=log_prior, base_logits=base_logits)
 
 
 @register_policy("logprob_control")
@@ -347,11 +378,45 @@ def _policy_logprob_control(
 
 
 @register_policy("efe_rollout")
-def _policy_efe_rollout(*args, **kwargs):
-    r"""The staged horizon extension (horizon>1). GATED: hard-errors until a belief/key-value cache
-    exists, because without incremental belief reuse the Kp*H recompute makes the compute-matched
-    baselines decisive and the wall-clock honesty check unwinnable (spec Sections 3.5, 4.2)."""
-    raise NotImplementedError(
-        "efe_rollout (horizon>1) is gated on a belief/key-value cache (spec Section 3.5); it is "
-        "deferred to the epistemic-live phase. Use efe_one_step (horizon=1) for v1."
-    )
+def _policy_efe_rollout(
+    context:     torch.Tensor,                       # (B, N) context ids                          -> D
+    candidates:  torch.Tensor,                       # (B, Kp, H) candidate H-action policies      -> E
+    preference:  torch.Tensor,                       # (V,) or (B, V) log p(o|C)                   -> C
+
+    model:       'object',                            # VFEModel: belief seam + prior_bank          -> A,B
+
+    *,
+    gamma:          float               = 1.0,        # policy precision in softmax(-gamma G)
+    horizon:        int                 = 2,          # fixed rollout depth H (> 1; == candidate length)
+    score_terms:    Tuple[str, ...]     = ("risk", "ambiguity"),  # which terms enter G(pi)
+    ambiguity_mode: str                 = "likelihood_entropy",   # ambiguity registry key
+    log_prior:      Optional[torch.Tensor] = None,    # (B, Kp) log candidate prior E; None -> uniform
+    base_logits:    Optional[torch.Tensor] = None,    # (B, V) reused base logits
+    **kwargs,
+) -> 'PolicyScore':
+    r"""The staged horizon extension (H > 1). A policy pi = (a_1, ..., a_H) is the H-action candidate
+    sequence (``candidates`` column, length H); the belief is rolled forward over all H appended action
+    tokens and q(o|pi) = p(o | q*_pi) is read from the LAST position (the environment response is never
+    folded in, spec Section 2.2). Unlocked by the Phase-3a belief-prefix cache: the spec gates H > 1 on
+    a cache so the Kp*H rollout reuses the shared context instead of paying Kp*H full recomputes, which
+    is what makes the matched-compute baselines and the wall-clock honesty check fair (spec Sections
+    3.5, 4.2). It therefore REQUIRES the cache to be active; on a config the cache does not support it
+    raises rather than silently falling back to the dishonest full recompute."""
+    if horizon <= 1:
+        raise ValueError(
+            f"efe_rollout is the H>1 horizon scorer; got horizon={horizon}. Use efe_one_step for H=1.")
+    L = candidates.shape[2]
+    if L != horizon:
+        raise ValueError(
+            f"efe_rollout candidates carry the H-action policy sequence: candidate length L={L} must "
+            f"equal horizon={horizon}.")
+    if not cache_supported(model.cfg):
+        raise NotImplementedError(
+            "efe_rollout (horizon>1) requires the belief-prefix cache, which is exact only for the "
+            "verified config (vfe3/inference/belief_cache.py::cache_supported: single block and E-step "
+            "iteration, causal filtering flat kernel, frozen gauge frame, no model channel / "
+            "precision-bias / gauge-RoPE / head mixer). On this config the rollout would fall back to "
+            "the full per-candidate recompute, making the Kp*H cost dishonest (spec Section 3.5). Use a "
+            "cache-supported config, or efe_one_step (horizon=1).")
+    return _efe_score(context, candidates, preference, model, gamma=gamma, score_terms=score_terms,
+                      ambiguity_mode=ambiguity_mode, log_prior=log_prior, base_logits=base_logits)
