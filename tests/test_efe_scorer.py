@@ -156,8 +156,11 @@ def test_gates_and_horizon_guards_raise():
     pref = get_preference("flat")(m.prior_bank)
     with pytest.raises(ValueError):                          # efe_one_step is H=1 only
         get_policy("efe_one_step")(ctx, cand, pref, m, horizon=2, base_logits=base)
-    with pytest.raises(NotImplementedError):                 # efe_rollout gated on a cache
-        get_policy("efe_rollout")(ctx, cand, pref, m)
+    # efe_rollout (H>1) is unlocked by the Phase-3a cache but REQUIRES it: this _model() (n_layers=2,
+    # n_e_steps=2, e_phi_lr>0) is not cache-supported, so a correctly-shaped H=2 call still raises.
+    cand2 = torch.randint(0, m.cfg.vocab_size, (1, 4, 2))
+    with pytest.raises(NotImplementedError):
+        get_policy("efe_rollout")(ctx, cand2, pref, m, horizon=2)
     with pytest.raises(RuntimeError):                        # sigma_mc gated on the sigma-validation gate
         get_ambiguity("sigma_mc")(torch.log_softmax(torch.randn(1, 4, 16), dim=-1))
 

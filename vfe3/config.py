@@ -1396,6 +1396,10 @@ class VFE3Config:
             raise ValueError(
                 f"policy_mode='efe_one_step' is the H=1 scorer but policy_horizon={self.policy_horizon}; "
                 f"set policy_horizon=1, or use policy_mode='efe_rollout' for H>1 (spec Section 3.5).")
+        if self.policy_mode == "efe_rollout" and self.policy_horizon <= 1:
+            raise ValueError(
+                f"policy_mode='efe_rollout' is the H>1 horizon scorer but policy_horizon={self.policy_horizon}; "
+                f"set policy_horizon>1, or use policy_mode='efe_one_step' for H=1 (spec Section 3.5).")
         # the fixed top-Kp candidate menu cannot be wider than the vocabulary (base_logits.topk(Kp) would
         # raise a cryptic torch index error). Only meaningful once a scorer is on (inert at 'none').
         if self.policy_mode != "none" and self.policy_top_k > self.vocab_size:
