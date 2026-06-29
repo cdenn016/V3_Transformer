@@ -81,3 +81,43 @@ inert value, all sigma-derived arms remain reported-only, and no epistemic activ
 available at this operating point; the honest response is to report the negative result and reconsider
 whether a different regime produces a validated sigma rather than to build an epistemic task that cannot
 show an epistemic effect.
+
+## Result (2026-06-29) — FAIL
+
+The gate was measured at the v1 operating point on a prior-bank (KL-to-prior) decode checkpoint
+(`embed_dim = 20`, 15k steps, `use_head_mixer=False`, `use_prior_bank=True`). This is the decode path on
+which the belief covariance enters the readout, and so the strongest available test rather than a
+favorable one. The outcome is FAIL, and not by a narrow margin: the headline statistic is negative. Over
+40,960 held-out tokens the Spearman correlation between `tr(Sigma_q)` and realized cross-entropy is
+`-0.137` with a bootstrap 95 percent interval of `[-0.147, -0.127]`, against a permutation floor of
+`0.008`. The correlation is significantly different from zero and clears the noise band, but with the
+wrong sign: higher belief uncertainty predicts lower realized surprise. The sigma-stratified
+cross-entropy confirms this, trending downward across strata (`mono_spearman = -0.43`), with the
+highest-sigma decile carrying the lowest mean cross-entropy (3.30 nats) and the lowest-sigma decile the
+highest (5.50 nats). The artifact is `vfe3_policy_results/sigma_gate/wikitext103_ed20_15k.json`, bound to
+spec commit `c05b927`.
+
+Two facts explain the failure. First, the trace barely varies: its coefficient of variation is `0.044`,
+so `tr(Sigma_q)` occupies a tight band (roughly 33.9 to 39.9) across all tokens. The belief covariance
+has effectively collapsed to a near-constant scale and carries little token-discriminative information
+regardless of sign. Second, what little variation exists is anti-aligned with predictive difficulty
+rather than aligned with it. A near-constant, sign-inverted sigma is precisely the condition under which
+the mutual-information bridge `I = H[q(o|pi)] - E_q H[p(o|s)]` has nothing to act on; the structural
+argument that `I` collapses at a sigma-free point belief is realized empirically here as a sigma that is
+informative-free in practice. One clause of the gate does hold in isolation: the sigma-binned expected
+calibration error is `0.019`, below the `0.05` threshold, so the model stays calibrated within each
+uncertainty stratum. Calibration within strata is not predictiveness across them, and the gate as a whole
+fails.
+
+The pre-registered consequence follows without amendment. The information-gain term stays at its inert
+value; the `sigma_mc` ambiguity estimator, the epistemic-only arm, and shuffled-sigma remain
+reported-only; `policy_sigma_ambiguity_validated` cannot be set, and config Guard 4 correctly refuses
+this FAIL artifact. The EFE policy scorer is therefore a validated pragmatic preference reranker built on
+the risk term and the likelihood-entropy ambiguity term, not an exploratory agent with a live epistemic
+value. The conclusion holds across both decode paths examined: the linear decode gave a weakly positive
+but sub-threshold `0.105`, and the prior-bank decode gives the negative result recorded here. No
+epistemic active-inference claim is available at this operating point. In the language of the
+pre-registration, the honest reading is to report the negative result rather than build a masked-retrieval
+epistemic task that could not show an epistemic effect, and to treat whether a different regime (a larger
+latent dimension, longer training, or an alternative uncertainty parameterization) yields a validated
+sigma as an open question for a future, separately pre-registered measurement.
