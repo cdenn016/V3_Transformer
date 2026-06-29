@@ -175,24 +175,28 @@ def belief_ce_bank(
     and the calibration headline reads off the wrong covariance. The belief at position n is the one
     whose mean produced the logits predicting target n, so tr(Sigma_q)[n] and CE[n] are aligned
     position-by-position; only valid targets (``targets != -100``) are kept. Returns the flattened
-    per-token ``tr_sigma`` (M,), ``ce`` (M,) nats, and the predicted-token ``token_ids`` (M,) -- the
-    aligned pairs the Spearman rho / CV gate (``vfe3.metrics.spearman_rho`` / ``cv``) and the
-    Sigma-stratified-error / Sigma-CE-scatter figures consume. ``max_batches`` caps the join.
+    per-token ``tr_sigma`` (M,), ``ce`` (M,) nats, the predicted-token ``token_ids`` (M,), and the
+    per-token ``conf`` (M,) max-softmax probability and ``correct`` (M,) argmax-equals-gold indicator --
+    the aligned pairs the Spearman rho / CV gate (``vfe3.metrics.spearman_rho`` / ``cv``), the
+    sigma-validation gate (``vfe3.inference.sigma_gate``), and the Sigma-stratified-error /
+    Sigma-CE-scatter figures consume. ``max_batches`` caps the join.
     """
     from vfe3.model.stack import vfe_stack
     device = device or _model_device(model)
     cfg = model.cfg
     was_training = model.training
     model.eval()
-    tr_sig, ces, tids = [], [], []
+    tr_sig, ces, tids, confs, corrects = [], [], [], [], []
     try:
         for i, (tokens, targets) in enumerate(loader):
             tokens = tokens.to(device)
             targets = targets.to(device)
             n = tokens.shape[1]
             logits = model(tokens)                                # (B, N, V) inference path
-            per = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), targets.reshape(-1),
+            flat_logits = logits.reshape(-1, logits.shape[-1]).float()           # (B*N, V)
+            per = F.cross_entropy(flat_logits, targets.reshape(-1),
                                   ignore_index=-100, reduction="none")            # (B*N,)
+            conf_flat, pred_flat = flat_logits.softmax(dim=-1).max(dim=-1)        # (B*N,) confidence, argmax
             beliefs = model.prior_bank.encode(tokens)             # mirror forward so the traced sigma
             beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi))   # IS the decode's belief
             if cfg.s_e_step:                                       # anchor belief to the refined model channel
@@ -216,6 +220,8 @@ def belief_ce_bank(
             tr_sig.append(trs[valid])
             ces.append(per[valid])
             tids.append(tgt[valid])
+            confs.append(conf_flat[valid])
+            corrects.append((pred_flat[valid] == tgt[valid]).float())
             if max_batches is not None and i + 1 >= max_batches:
                 break
     finally:
@@ -225,6 +231,8 @@ def belief_ce_bank(
         "tr_sigma":  torch.cat(tr_sig),
         "ce":        torch.cat(ces),
         "token_ids": torch.cat(tids),
+        "conf":      torch.cat(confs),               # per-token max softmax prob (sigma-gate ECE)
+        "correct":   torch.cat(corrects),            # per-token 1.0 if argmax == gold (sigma-gate ECE)
     }
 
 

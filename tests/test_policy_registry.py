@@ -101,10 +101,22 @@ def test_config_rejects_bad_policy_numerics():
         VFE3Config(policy_precision=0.0)
 
 
-def test_sigma_gate_flag_requires_artifact():
+def test_sigma_gate_flag_requires_passing_artifact(tmp_path):
+    import json
+    # no artifact reference -> structural failure
     with pytest.raises(ValueError):
         VFE3Config(policy_sigma_ambiguity_validated=True)
-    # with an artifact reference the structural guard is satisfied (content check is the gate step's job)
-    cfg = VFE3Config(policy_sigma_ambiguity_validated=True,
-                     policy_sigma_gate_artifact="vfe3_policy_results/sigma_gate/ckpt.json")
+    # named but missing file -> content failure (cannot flip the flag without the record)
+    with pytest.raises(ValueError):
+        VFE3Config(policy_sigma_ambiguity_validated=True,
+                   policy_sigma_gate_artifact=str(tmp_path / "absent.json"))
+    # a FAIL record cannot silently validate the flag (Guard 4 content check)
+    fail = tmp_path / "fail.json"
+    fail.write_text(json.dumps({"status": "FAIL", "spec_commit": "x"}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        VFE3Config(policy_sigma_ambiguity_validated=True, policy_sigma_gate_artifact=str(fail))
+    # a PASS record is required for the flag to be set
+    ok = tmp_path / "pass.json"
+    ok.write_text(json.dumps({"status": "PASS", "spec_commit": "x"}), encoding="utf-8")
+    cfg = VFE3Config(policy_sigma_ambiguity_validated=True, policy_sigma_gate_artifact=str(ok))
     assert cfg.policy_sigma_ambiguity_validated is True

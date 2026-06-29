@@ -411,9 +411,11 @@ class VFE3Config:
     policy_score_terms:        Tuple[str, ...] = ("risk", "ambiguity")  # which EFE terms enter G(pi)
     # sigma-validation gate (spec Sections 2.7, 4.5, Guard 4): may be set True ONLY together with a
     # policy_sigma_gate_artifact pointing at a PASS sigma-gate record, so V3 sigma cannot be called an
-    # ambiguity/epistemic value before the pre-registered gate passes. The artifact CONTENT check
-    # (PASS stamp + matching spec commit) is enforced by the sigma-measurement step; here the structural
-    # guard is that the flag cannot be flipped without naming an artifact.
+    # ambiguity/epistemic value before the pre-registered gate passes. __post_init__ enforces BOTH the
+    # structural check (artifact named) AND the content check (the file exists and carries status=='PASS',
+    # via vfe3.inference.sigma_gate.verify_gate_artifact), so a FAIL/missing/unreadable record cannot flip
+    # the flag silently. The spec_commit MATCH is checked by the Phase-3 consumer that unlocks the sigma
+    # arm (it knows the live spec commit).
     policy_sigma_ambiguity_validated: bool          = False
     policy_sigma_gate_artifact:       Optional[str] = None
 
@@ -1391,13 +1393,20 @@ class VFE3Config:
                 f"driven through a harness that calls the scorer directly, which keeps "
                 f"policy_mode='none' (spec Section 3.4)."
             )
-        # Guard 4 (spec Section 7): the sigma flag cannot be flipped without naming a gate artifact, so
-        # V3 sigma cannot be called an ambiguity/epistemic value before the pre-registered gate passes.
-        if self.policy_sigma_ambiguity_validated and not self.policy_sigma_gate_artifact:
-            raise ValueError(
-                "policy_sigma_ambiguity_validated=True requires policy_sigma_gate_artifact to point at a "
-                "PASS sigma-gate record (spec Sections 2.7, 4.5); the flag cannot be set without one."
-            )
+        # Guard 4 (spec Sections 4.5/7): the sigma flag cannot be flipped without a PASSING gate
+        # artifact, so V3 sigma cannot be called an ambiguity/epistemic value before the pre-registered
+        # gate passes. Structural check (artifact named) PLUS content check (file exists + status=='PASS')
+        # so a FAIL/missing/unreadable record cannot silently validate the flag. The spec_commit MATCH is
+        # verified by the Phase-3 consumer that unlocks the sigma arm (it knows the live spec commit;
+        # vfe3.inference.sigma_gate.verify_gate_artifact does that full check there).
+        if self.policy_sigma_ambiguity_validated:
+            if not self.policy_sigma_gate_artifact:
+                raise ValueError(
+                    "policy_sigma_ambiguity_validated=True requires policy_sigma_gate_artifact to point "
+                    "at a PASS sigma-gate record (spec Sections 2.7, 4.5); the flag cannot be set "
+                    "without one.")
+            from vfe3.inference.sigma_gate import verify_gate_artifact
+            verify_gate_artifact(self.policy_sigma_gate_artifact)
         # decode_bias is a learned per-vocab log-unigram bias on the use_prior_bank=False LINEAR
         # decode (logits = mu_q @ W^T + b). On the prior-bank KL path the per-vocab priors
         # (mu_p, sigma_p) already carry the unigram role, so the bias is never created there; warn
