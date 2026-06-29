@@ -14,6 +14,7 @@ The artifact is written to vfe3_policy_results/sigma_gate/<checkpoint_id>.json w
 so the policy_sigma_ambiguity_validated config flag can be bound to a matching PASS record (Guard 4).
 """
 import dataclasses
+import hashlib
 import os
 import subprocess
 
@@ -42,14 +43,31 @@ CONFIG = dict(
 
 
 def spec_commit():
-    for args in (["git", "log", "-1", "--format=%H", "--", SPEC], ["git", "rev-parse", "HEAD"]):
+    r"""Provenance stamp for the governing spec (audit F2, 2026-06-28). Returns the spec's last commit
+    hash when the spec is tracked and clean; otherwise a content-bound stamp, so a gate artifact can
+    never look commit-bound while the governing spec is actually untracked or dirty (the old code fell
+    back to `git rev-parse HEAD`, binding the artifact to the code revision rather than the spec text).
+    Formats:
+      <commit>               tracked and clean
+      <commit>+dirty:<sha12> tracked with uncommitted edits
+      untracked:<sha12>      not in git
+      unknown                git or the spec file is unavailable
+    where <sha12> is the first 12 hex digits of sha256(spec bytes)."""
+    def _git(*a):
         try:
-            out = subprocess.run(args, capture_output=True, text=True, check=True)
-            if out.stdout.strip():
-                return out.stdout.strip()
+            return subprocess.run(["git", *a], capture_output=True, text=True, check=True).stdout.strip()
         except Exception:
-            continue
-    return "unknown"
+            return ""
+    try:
+        with open(SPEC, "rb") as f:
+            sha12 = hashlib.sha256(f.read()).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+    commit = _git("log", "-1", "--format=%H", "--", SPEC)
+    if not commit:
+        return f"untracked:{sha12}"
+    dirty = bool(_git("status", "--porcelain", "--", SPEC))
+    return f"{commit}+dirty:{sha12}" if dirty else commit
 
 
 def load_model_from_checkpoint(path, device):

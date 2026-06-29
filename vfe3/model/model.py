@@ -1273,6 +1273,15 @@ class VFEModel(nn.Module):
         -> E-step -> decode) for every generated token. Incremental belief reuse across
         steps is a future optimization.
         """
+        # audit F9 (2026-06-28): under a policy scorer the next token comes from _policy_select, which
+        # uses policy_top_k / policy_precision from config and does NOT consume the call-time sampler
+        # knobs. Reject them rather than silently ignoring them; 'greedy' IS honored (argmax vs sample
+        # of the policy posterior).
+        if self.cfg.policy_mode != "none" and (temperature != 1.0 or top_k is not None or top_p is not None):
+            raise ValueError(
+                "temperature/top_k/top_p are ignored when policy_mode != 'none' (the EFE policy posterior "
+                "uses policy_top_k and policy_precision); drop them or set policy_mode='none'. 'greedy' is "
+                "honored (argmax vs sample of the policy posterior).")
         seq = token_ids
         for _ in range(max_new_tokens):
             context = seq[:, -self.cfg.max_seq_len:]                 # (B, <=max_seq_len)
