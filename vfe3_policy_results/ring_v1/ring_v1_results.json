@@ -1,0 +1,566 @@
+{
+  "config": {
+    "seeds": [
+      6,
+      23,
+      64
+    ],
+    "steps": 3500,
+    "batch_size": 512,
+    "lr": 0.003,
+    "log_every": 100,
+    "n_dev": 1000,
+    "n_episodes": 5000,
+    "budget": 10,
+    "candidate_mode": "actions",
+    "top_k": 8,
+    "beta_C": 5.0,
+    "gamma_grid": [
+      0.5,
+      1.0,
+      2.0,
+      4.0,
+      8.0
+    ],
+    "adequacy_threshold": 0.98,
+    "delta_min": 0.05,
+    "alpha": 0.05,
+    "out_dir": "vfe3_policy_results/ring_v1"
+  },
+  "device": "cuda",
+  "checkpoints": {
+    "6": {
+      "adequacy": 1.0,
+      "admitted": true,
+      "gamma": 1.0,
+      "temp": 8.0,
+      "dev_success": 1.0,
+      "metrics": {
+        "full_efe_tuned": {
+          "success": 1.0,
+          "mean_steps_to_goal": 4.32859992980957,
+          "frac_at_goal": 0.6671399474143982,
+          "mean_risk": 4.845831871032715,
+          "mean_ambiguity": 0.04348387569189072
+        },
+        "full_efe_g1": {
+          "success": 1.0,
+          "mean_steps_to_goal": 4.32859992980957,
+          "frac_at_goal": 0.6671399474143982,
+          "mean_risk": 4.845831871032715,
+          "mean_ambiguity": 0.04348387569189072
+        },
+        "risk_only": {
+          "success": 1.0,
+          "mean_steps_to_goal": 4.32859992980957,
+          "frac_at_goal": 0.6671399474143982,
+          "mean_risk": 4.845831871032715,
+          "mean_ambiguity": 0.04348387569189072
+        },
+        "ambiguity_only": {
+          "success": 0.00699999975040555,
+          "mean_steps_to_goal": 9.936999320983887,
+          "frac_at_goal": 0.00699999975040555,
+          "mean_risk": 21.602270126342773,
+          "mean_ambiguity": 0.04304485395550728
+        },
+        "flat_pref": {
+          "success": 0.012399999424815178,
+          "mean_steps_to_goal": 9.893799781799316,
+          "frac_at_goal": 0.011859999969601631,
+          "mean_risk": 3.4225120544433594,
+          "mean_ambiguity": 0.04322388395667076
+        },
+        "p_data_control": {
+          "success": 0.012399999424815178,
+          "mean_steps_to_goal": 9.893799781799316,
+          "frac_at_goal": 0.011859999969601631,
+          "mean_risk": 2.729365587234497,
+          "mean_ambiguity": 0.04322388395667076
+        },
+        "temp_tuned_logprob": {
+          "success": 0.06359999626874924,
+          "mean_steps_to_goal": 8.824399948120117,
+          "frac_at_goal": 0.05289999768137932,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "logprob_baseline": {
+          "success": 0.012399999424815178,
+          "mean_steps_to_goal": 9.893799781799316,
+          "frac_at_goal": 0.011859999969601631,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "nucleus": {
+          "success": 0.0543999969959259,
+          "mean_steps_to_goal": 8.87279987335205,
+          "frac_at_goal": 0.0486999973654747,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "typical": {
+          "success": 0.05779999867081642,
+          "mean_steps_to_goal": 8.88599967956543,
+          "frac_at_goal": 0.049720000475645065,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "greedy_ref": {
+          "success": 0.012399999424815178,
+          "mean_steps_to_goal": 9.893799781799316,
+          "frac_at_goal": 0.011859999969601631,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "random": {
+          "success": 0.05739999935030937,
+          "mean_steps_to_goal": 8.849599838256836,
+          "frac_at_goal": 0.049879997968673706,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        }
+      },
+      "gates": {
+        "primary": {
+          "p_data_control": {
+            "mcnemar_b": 4938,
+            "mcnemar_c": 0,
+            "chi2": 4936.000202511138,
+            "p": 0.0,
+            "diff": 0.9876000285148621,
+            "ci": [
+              0.9846000075340271,
+              0.9905999898910522
+            ],
+            "holm_pass": true
+          },
+          "temp_tuned_logprob": {
+            "mcnemar_b": 4682,
+            "mcnemar_c": 0,
+            "chi2": 4680.000213583939,
+            "p": 0.0,
+            "diff": 0.9363999962806702,
+            "ci": [
+              0.9296000003814697,
+              0.9430000185966492
+            ],
+            "holm_pass": true
+          }
+        },
+        "fdr_grid": {
+          "ambiguity_only": {
+            "p": 0.0,
+            "significant": true
+          },
+          "flat_pref": {
+            "p": 0.0,
+            "significant": true
+          },
+          "p_data_control": {
+            "p": 0.0,
+            "significant": true
+          },
+          "temp_tuned_logprob": {
+            "p": 0.0,
+            "significant": true
+          },
+          "logprob_baseline": {
+            "p": 0.0,
+            "significant": true
+          },
+          "nucleus": {
+            "p": 0.0,
+            "significant": true
+          },
+          "typical": {
+            "p": 0.0,
+            "significant": true
+          },
+          "greedy_ref": {
+            "p": 0.0,
+            "significant": true
+          },
+          "random": {
+            "p": 0.0,
+            "significant": true
+          },
+          "full_efe_g1": {
+            "p": 1.0,
+            "significant": false
+          },
+          "risk_only": {
+            "p": 1.0,
+            "significant": false
+          }
+        },
+        "random_clearly_beaten": true,
+        "closed_loop_causal": true,
+        "go": true
+      }
+    },
+    "23": {
+      "adequacy": 1.0,
+      "admitted": true,
+      "gamma": 1.0,
+      "temp": 1.0,
+      "dev_success": 1.0,
+      "metrics": {
+        "full_efe_tuned": {
+          "success": 1.0,
+          "mean_steps_to_goal": 4.229599952697754,
+          "frac_at_goal": 0.6770400404930115,
+          "mean_risk": 4.646419048309326,
+          "mean_ambiguity": 0.045775674283504486
+        },
+        "full_efe_g1": {
+          "success": 1.0,
+          "mean_steps_to_goal": 4.229599952697754,
+          "frac_at_goal": 0.6770400404930115,
+          "mean_risk": 4.646419048309326,
+          "mean_ambiguity": 0.045775674283504486
+        },
+        "risk_only": {
+          "success": 1.0,
+          "mean_steps_to_goal": 4.229599952697754,
+          "frac_at_goal": 0.6770400404930115,
+          "mean_risk": 4.646419048309326,
+          "mean_ambiguity": 0.045775674283504486
+        },
+        "ambiguity_only": {
+          "success": 0.034199997782707214,
+          "mean_steps_to_goal": 9.176599502563477,
+          "frac_at_goal": 0.04567999765276909,
+          "mean_risk": 20.453622817993164,
+          "mean_ambiguity": 0.04799862578511238
+        },
+        "flat_pref": {
+          "success": 0.034199997782707214,
+          "mean_steps_to_goal": 9.14419937133789,
+          "frac_at_goal": 0.04747999832034111,
+          "mean_risk": 3.4166371822357178,
+          "mean_ambiguity": 0.049099262803792953
+        },
+        "p_data_control": {
+          "success": 0.034199997782707214,
+          "mean_steps_to_goal": 9.14419937133789,
+          "frac_at_goal": 0.04747999832034111,
+          "mean_risk": 2.7234904766082764,
+          "mean_ambiguity": 0.049099262803792953
+        },
+        "temp_tuned_logprob": {
+          "success": 0.05920000001788139,
+          "mean_steps_to_goal": 8.824799537658691,
+          "frac_at_goal": 0.0516199991106987,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "logprob_baseline": {
+          "success": 0.034199997782707214,
+          "mean_steps_to_goal": 9.14419937133789,
+          "frac_at_goal": 0.04747999832034111,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "nucleus": {
+          "success": 0.05199999734759331,
+          "mean_steps_to_goal": 8.81820011138916,
+          "frac_at_goal": 0.04871999844908714,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "typical": {
+          "success": 0.053999997675418854,
+          "mean_steps_to_goal": 8.81559944152832,
+          "frac_at_goal": 0.049480002373456955,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "greedy_ref": {
+          "success": 0.034199997782707214,
+          "mean_steps_to_goal": 9.14419937133789,
+          "frac_at_goal": 0.04747999832034111,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "random": {
+          "success": 0.0559999980032444,
+          "mean_steps_to_goal": 8.80359935760498,
+          "frac_at_goal": 0.05154000222682953,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        }
+      },
+      "gates": {
+        "primary": {
+          "p_data_control": {
+            "mcnemar_b": 4829,
+            "mcnemar_c": 0,
+            "chi2": 4827.000207082212,
+            "p": 0.0,
+            "diff": 0.9657999873161316,
+            "ci": [
+              0.9607999920845032,
+              0.9706000089645386
+            ],
+            "holm_pass": true
+          },
+          "temp_tuned_logprob": {
+            "mcnemar_b": 4704,
+            "mcnemar_c": 0,
+            "chi2": 4702.000212585034,
+            "p": 0.0,
+            "diff": 0.9408000111579895,
+            "ci": [
+              0.9337999820709229,
+              0.9472000002861023
+            ],
+            "holm_pass": true
+          }
+        },
+        "fdr_grid": {
+          "ambiguity_only": {
+            "p": 0.0,
+            "significant": true
+          },
+          "flat_pref": {
+            "p": 0.0,
+            "significant": true
+          },
+          "p_data_control": {
+            "p": 0.0,
+            "significant": true
+          },
+          "temp_tuned_logprob": {
+            "p": 0.0,
+            "significant": true
+          },
+          "logprob_baseline": {
+            "p": 0.0,
+            "significant": true
+          },
+          "nucleus": {
+            "p": 0.0,
+            "significant": true
+          },
+          "typical": {
+            "p": 0.0,
+            "significant": true
+          },
+          "greedy_ref": {
+            "p": 0.0,
+            "significant": true
+          },
+          "random": {
+            "p": 0.0,
+            "significant": true
+          },
+          "full_efe_g1": {
+            "p": 1.0,
+            "significant": false
+          },
+          "risk_only": {
+            "p": 1.0,
+            "significant": false
+          }
+        },
+        "random_clearly_beaten": true,
+        "closed_loop_causal": true,
+        "go": true
+      }
+    },
+    "64": {
+      "adequacy": 1.0,
+      "admitted": true,
+      "gamma": 1.0,
+      "temp": 8.0,
+      "dev_success": 1.0,
+      "metrics": {
+        "full_efe_tuned": {
+          "success": 1.0,
+          "mean_steps_to_goal": 4.315000057220459,
+          "frac_at_goal": 0.6685000061988831,
+          "mean_risk": 4.841606616973877,
+          "mean_ambiguity": 0.04468217492103577
+        },
+        "full_efe_g1": {
+          "success": 1.0,
+          "mean_steps_to_goal": 4.315000057220459,
+          "frac_at_goal": 0.6685000061988831,
+          "mean_risk": 4.841606616973877,
+          "mean_ambiguity": 0.04468217492103577
+        },
+        "risk_only": {
+          "success": 1.0,
+          "mean_steps_to_goal": 4.315000057220459,
+          "frac_at_goal": 0.6685000061988831,
+          "mean_risk": 4.841611862182617,
+          "mean_ambiguity": 0.04467305541038513
+        },
+        "ambiguity_only": {
+          "success": 0.0551999993622303,
+          "mean_steps_to_goal": 8.79259967803955,
+          "frac_at_goal": 0.06205999478697777,
+          "mean_risk": 20.27176856994629,
+          "mean_ambiguity": 0.043378639966249466
+        },
+        "flat_pref": {
+          "success": 0.04360000044107437,
+          "mean_steps_to_goal": 8.539199829101562,
+          "frac_at_goal": 0.061719994992017746,
+          "mean_risk": 3.4202027320861816,
+          "mean_ambiguity": 0.04553293436765671
+        },
+        "p_data_control": {
+          "success": 0.04360000044107437,
+          "mean_steps_to_goal": 8.539199829101562,
+          "frac_at_goal": 0.061719994992017746,
+          "mean_risk": 2.727064371109009,
+          "mean_ambiguity": 0.04553293436765671
+        },
+        "temp_tuned_logprob": {
+          "success": 0.052400000393390656,
+          "mean_steps_to_goal": 8.811599731445312,
+          "frac_at_goal": 0.050999999046325684,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "logprob_baseline": {
+          "success": 0.04360000044107437,
+          "mean_steps_to_goal": 8.539199829101562,
+          "frac_at_goal": 0.061719994992017746,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "nucleus": {
+          "success": 0.053599998354911804,
+          "mean_steps_to_goal": 8.811999320983887,
+          "frac_at_goal": 0.05045999959111214,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "typical": {
+          "success": 0.06359999626874924,
+          "mean_steps_to_goal": 8.715999603271484,
+          "frac_at_goal": 0.054919999092817307,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "greedy_ref": {
+          "success": 0.04360000044107437,
+          "mean_steps_to_goal": 8.539199829101562,
+          "frac_at_goal": 0.061719994992017746,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        },
+        "random": {
+          "success": 0.05139999836683273,
+          "mean_steps_to_goal": 8.786799430847168,
+          "frac_at_goal": 0.049880001693964005,
+          "mean_risk": 0.0,
+          "mean_ambiguity": 0.0
+        }
+      },
+      "gates": {
+        "primary": {
+          "p_data_control": {
+            "mcnemar_b": 4782,
+            "mcnemar_c": 0,
+            "chi2": 4780.000209117524,
+            "p": 0.0,
+            "diff": 0.9563999772071838,
+            "ci": [
+              0.9506000280380249,
+              0.9620000123977661
+            ],
+            "holm_pass": true
+          },
+          "temp_tuned_logprob": {
+            "mcnemar_b": 4738,
+            "mcnemar_c": 0,
+            "chi2": 4736.000211059519,
+            "p": 0.0,
+            "diff": 0.9476000070571899,
+            "ci": [
+              0.9416000247001648,
+              0.9535999894142151
+            ],
+            "holm_pass": true
+          }
+        },
+        "fdr_grid": {
+          "ambiguity_only": {
+            "p": 0.0,
+            "significant": true
+          },
+          "flat_pref": {
+            "p": 0.0,
+            "significant": true
+          },
+          "p_data_control": {
+            "p": 0.0,
+            "significant": true
+          },
+          "temp_tuned_logprob": {
+            "p": 0.0,
+            "significant": true
+          },
+          "logprob_baseline": {
+            "p": 0.0,
+            "significant": true
+          },
+          "nucleus": {
+            "p": 0.0,
+            "significant": true
+          },
+          "typical": {
+            "p": 0.0,
+            "significant": true
+          },
+          "greedy_ref": {
+            "p": 0.0,
+            "significant": true
+          },
+          "random": {
+            "p": 0.0,
+            "significant": true
+          },
+          "full_efe_g1": {
+            "p": 1.0,
+            "significant": false
+          },
+          "risk_only": {
+            "p": 1.0,
+            "significant": false
+          }
+        },
+        "random_clearly_beaten": true,
+        "closed_loop_causal": true,
+        "go": true
+      }
+    }
+  },
+  "aggregate": {
+    "admitted_seeds": [
+      6,
+      23,
+      64
+    ],
+    "mean_success": {
+      "full_efe_tuned": 1.0,
+      "full_efe_g1": 1.0,
+      "risk_only": 1.0,
+      "ambiguity_only": 0.03213333229844769,
+      "flat_pref": 0.03006666588286559,
+      "p_data_control": 0.03006666588286559,
+      "temp_tuned_logprob": 0.05839999889334043,
+      "logprob_baseline": 0.03006666588286559,
+      "nucleus": 0.053333330899477005,
+      "typical": 0.058466664204994835,
+      "greedy_ref": 0.03006666588286559,
+      "random": 0.0549333319067955
+    },
+    "all_seeds_go": true
+  },
+  "verdict": "GO: full EFE beats the controls beyond delta_min with the lesion gates"
+}
