@@ -101,6 +101,34 @@ def test_config_rejects_bad_policy_numerics():
         VFE3Config(policy_precision=0.0)
 
 
+def test_config_rejects_invalid_policy_score_terms():
+    # audit F5 (2026-06-28): a typo'd or empty score-term set must fail at construction, not as a cryptic
+    # KeyError deep inside _policy_efe_one_step where G(pi) is summed over the terms.
+    with pytest.raises(ValueError):
+        VFE3Config(policy_score_terms=("nonsense",))
+    with pytest.raises(ValueError):
+        VFE3Config(policy_score_terms=())                         # empty: G has nothing to sum
+    VFE3Config(policy_score_terms=("risk",))                      # any subset of the EFE terms is valid
+    VFE3Config(policy_score_terms=("risk", "ambiguity", "epistemic"))
+
+
+def test_config_rejects_efe_one_step_with_horizon_gt_1():
+    # audit F5: efe_one_step is the H=1 scorer; horizon!=1 raised a ValueError mid-generate before, now
+    # it is rejected at construction.
+    with pytest.raises(ValueError):
+        VFE3Config(policy_mode="efe_one_step", policy_preference="flat", policy_horizon=2)
+    VFE3Config(policy_mode="efe_one_step", policy_preference="flat", policy_horizon=1)   # the H=1 pairing
+
+
+def test_config_rejects_policy_top_k_over_vocab():
+    # audit F5: the candidate menu cannot be wider than the vocabulary (base_logits.topk(Kp) would raise
+    # a cryptic torch index error). Enforced only once a scorer is on; inert on the default 'none' path.
+    with pytest.raises(ValueError):
+        VFE3Config(policy_mode="efe_one_step", policy_preference="flat", vocab_size=32, policy_top_k=64)
+    VFE3Config(policy_mode="efe_one_step", policy_preference="flat", vocab_size=64, policy_top_k=8)
+    VFE3Config(vocab_size=32, policy_top_k=64)                    # 'none' path: top_k>vocab is inert, allowed
+
+
 def test_sigma_gate_flag_requires_passing_artifact(tmp_path):
     import json
     # no artifact reference -> structural failure

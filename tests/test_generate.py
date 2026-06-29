@@ -12,6 +12,7 @@ conditions on a longer sequence and has no relation to forward(prompt). Those
 oracles therefore use max_new_tokens=1.
 """
 
+import pytest
 import torch
 
 from vfe3.config import VFE3Config
@@ -140,3 +141,19 @@ def test_generate_is_training_isolated():
     tokens = torch.randint(0, V, (2, 4)); targets = torch.randint(0, V, (2, 4))
     _, loss, _ = model(tokens, targets)
     assert torch.isfinite(loss)
+
+
+def test_policy_mode_rejects_call_time_sampler_knobs():
+    # audit F9 (2026-06-28): under a policy scorer, generate() routes through _policy_select, which uses
+    # policy_top_k / policy_precision and does NOT consume call-time temperature/top_k/top_p. Those must
+    # be rejected at the call rather than silently dropped; 'greedy' stays honored. ('flat' is the only
+    # generic-safe preference -- see test_generic_policy_rejects_context_requiring_preference.)
+    model = _tiny_model(policy_mode="efe_one_step", policy_preference="flat")
+    V = model.cfg.vocab_size
+    prompt = torch.randint(0, V, (2, 3))
+    for kwargs in ({"temperature": 0.7}, {"top_k": 3}, {"top_p": 0.9}):
+        with pytest.raises(ValueError):
+            model.generate(prompt, max_new_tokens=1, **kwargs)
+    # the call-time defaults (temperature=1.0, no top_k/top_p) are accepted; greedy is honored
+    out = model.generate(prompt, max_new_tokens=2, greedy=True)
+    assert out.shape == (2, 3 + 2) and (out >= 0).all() and (out < V).all()

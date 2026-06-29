@@ -1379,6 +1379,29 @@ class VFE3Config:
             raise ValueError(f"policy_horizon must be >= 1, got {self.policy_horizon}")
         if self.policy_precision <= 0.0:
             raise ValueError(f"policy_precision (gamma) must be > 0, got {self.policy_precision}")
+        # audit F5 (2026-06-28): close the construction gaps where an invalid policy config validated and
+        # only failed deep inside generate(). score_terms must be a nonempty subset of the EFE term names
+        # the scorer assembles (a typo otherwise surfaces as a cryptic KeyError in _policy_efe_one_step).
+        _efe_score_terms = ("risk", "ambiguity", "epistemic")
+        if len(self.policy_score_terms) == 0:
+            raise ValueError("policy_score_terms must be nonempty; G(pi) is a sum over the EFE terms")
+        bad_terms = tuple(t for t in self.policy_score_terms if t not in _efe_score_terms)
+        if bad_terms:
+            raise ValueError(
+                f"policy_score_terms {bad_terms} not in {_efe_score_terms}; G(pi) is a sum over these "
+                f"EFE terms (spec Section 3.2).")
+        # mode/horizon pairing: efe_one_step is the H=1 scorer (H>1 is efe_rollout, gated on a belief
+        # cache). Reject the mismatch at construction rather than mid-generate (policy.py raises there).
+        if self.policy_mode == "efe_one_step" and self.policy_horizon != 1:
+            raise ValueError(
+                f"policy_mode='efe_one_step' is the H=1 scorer but policy_horizon={self.policy_horizon}; "
+                f"set policy_horizon=1, or use policy_mode='efe_rollout' for H>1 (spec Section 3.5).")
+        # the fixed top-Kp candidate menu cannot be wider than the vocabulary (base_logits.topk(Kp) would
+        # raise a cryptic torch index error). Only meaningful once a scorer is on (inert at 'none').
+        if self.policy_mode != "none" and self.policy_top_k > self.vocab_size:
+            raise ValueError(
+                f"policy_top_k={self.policy_top_k} exceeds vocab_size={self.vocab_size}; the candidate "
+                f"menu cannot be wider than the vocabulary.")
         # audit F4 (2026-06-28): generate()'s generic policy path cannot supply a per-episode goal or a
         # per-corpus p_data, so context-requiring preferences are invalid there. FAIL-CLOSED against the
         # _GENERATE_SAFE_PREFERENCES allow-list (mirrors the policy_mode/_POLICIES check above): reject
