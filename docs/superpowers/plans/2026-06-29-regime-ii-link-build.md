@@ -1,4 +1,4 @@
-﻿# Regime II Direct-Link Build Implementation Plan
+# Regime II Direct-Link Build Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -19,6 +19,8 @@ The direct-link flat limit is identity links, not the nonzero Regime I vertex-fr
 The canonical direct-link builder must not register `needs_mu=True` or `needs_sigma=True`, because `connection_L` is model-owned and belief-independent.
 
 The q-channel may use `regime_ii_link`; the s-channel remains `transport_mode="flat"` in v1.
+
+Because the canonical direct link is an edge-owned variable and does not make the loss depend on the vertex-frame `phi`, v1 must reject `transport_mode="regime_ii_link"` with `e_phi_lr > 0.0` unless a later implementation adds an explicit zero-gradient phi substep. Do not hide that incompatibility with `allow_unused=True` in `torch.autograd.grad`.
 
 `gauge_transport="off"` must continue rejecting every non-flat `transport_mode`, including `regime_ii_link`.
 
@@ -100,7 +102,7 @@ Modify: `tests/test_belief_cache.py`
 
 Consumes: existing `get_transport`, `compute_transport_operators`, `build_belief_transport`, `VFE3Config`, `VFEModel`, `build_optimizer`, `free_energy_value`, and `cache_supported`.
 
-Produces: failing tests for `regime_ii_link`, `connection_L`, `link_alpha`, `link_soft_cap`, model wiring, optimizer grouping, gradient flow, kernel eligibility, and cache rejection.
+Produces: failing tests for `regime_ii_link`, `connection_L`, `link_alpha`, `link_soft_cap`, `e_phi_lr` incompatibility, full-covariance noncompact safety, model wiring, optimizer grouping, gradient flow, kernel eligibility, and cache rejection.
 
 - [ ] **Step 1: Add transport-core tests**
 
@@ -167,7 +169,7 @@ Extend the same file with tests for self-edge identity, nonzero loop holonomy, c
 
 - [ ] **Step 3: Add model, optimizer, gradient, config, and cache tests**
 
-Add `_tiny_cfg(...)`, then test that `VFEModel` creates `connection_L` only in direct-link mode, optimizer groups it exactly once, nonzero links change forward loss, `loss.backward()` produces finite `connection_L.grad`, config rejects invalid `link_alpha` and `link_soft_cap`, and `cache_supported` rejects the mode.
+Add `_tiny_cfg(...)`, then test that `VFEModel` creates `connection_L` only in direct-link mode, optimizer groups it exactly once, nonzero links change forward loss, `loss.backward()` produces finite `connection_L.grad`, config rejects invalid `link_alpha` and `link_soft_cap`, config rejects `transport_mode="regime_ii_link"` with `e_phi_lr > 0.0`, full covariance with noncompact direct links warns or rejects until the float64 sandwich and hard non-PD policy exist, and `cache_supported` rejects the mode.
 
 - [ ] **Step 4: Verify expected failures**
 
@@ -218,9 +220,14 @@ Add validation beside the `cocycle_relaxation` guard.
             raise ValueError(f"link_alpha must be in [0,1], got {self.link_alpha}")
         if not (self.link_soft_cap > 0.0 and self.link_soft_cap == self.link_soft_cap):
             raise ValueError(f"link_soft_cap must be positive and finite, got {self.link_soft_cap}")
+        if self.transport_mode == "regime_ii_link" and self.e_phi_lr > 0.0:
+            raise ValueError(
+                "transport_mode='regime_ii_link' is edge-owned and independent of vertex-frame phi; "
+                "set e_phi_lr=0.0 or implement an explicit zero-gradient phi substep."
+            )
 ```
 
-Include `regime_ii_link` in full-covariance and non-flat warning predicates, but leave the auto-oracle rule limited to `("regime_ii", "regime_ii_covariant")`.
+Include `regime_ii_link` in full-covariance and non-flat warning predicates, but leave the auto-oracle rule limited to `("regime_ii", "regime_ii_covariant")`. Add a direct test that `family="gaussian_full"` with a noncompact group such as `block_glk` either emits the warning or raises a clear `ValueError` until the float64 covariance sandwich and hard non-PD policy are implemented.
 
 - [ ] **Step 2: Add the direct-link builder**
 
@@ -249,7 +256,7 @@ def _build_regime_ii_link(
 
     eye_K = torch.eye(K, device=device, dtype=dtype)
     if connection_L is None or link_alpha == 0.0:
-        omega = eye_K.expand(B, N, N, K, K).contiguous()
+        omega = eye_K.expand(B, N, N, K, K)
         return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
     if connection_L.dim() != 3 or connection_L.shape[0] < N or connection_L.shape[1] < N:
@@ -281,7 +288,9 @@ def _build_regime_ii_link(
         block_dims=block_dims,
         exp_dim=(max(block_dims) if block_dims is not None else None),
     )
-    omega = exp_link.to(dtype).unsqueeze(0).expand(B, N, N, K, K).contiguous()
+    omega = exp_link.to(dtype).unsqueeze(0).expand(B, N, N, K, K)
+    # Do not call contiguous here: the batch dimension must remain an expanded view until
+    # a small-case test or a row-chunked downstream energy path explicitly materializes it.
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 ```
 
@@ -356,6 +365,8 @@ Add parameter creation beside the existing Regime II connection parameters.
 ```
 
 Forward `connection_L` through `forward_beliefs`, diagnostics, attention maps, and per-layer diagnostics using `getattr(self, "connection_L", None)`.
+
+Add a `lambda_gamma` / `s_e_step` regression showing that the direct-link mode remains belief-channel only and does not silently switch model-channel gamma transport away from the current flat, out-of-scope path.
 
 - [ ] **Step 4: Add optimizer grouping**
 
@@ -478,7 +489,7 @@ Add `connection_l_norm`, `connection_l_offdiag_norm`, `link_self_residual`, `lin
 
 - [ ] **Step 4: Add diagnostics tests**
 
-Adapt `tests/test_regime_ii_covariant.py::test_diagnostics_holonomy_reflects_connection_m` and `tests/test_run_diagnostics_2026_06_13.py::test_conditional_break_columns_present_only_under_toggle` for `connection_L`.
+Adapt `tests/test_regime_ii_covariant.py::test_diagnostics_holonomy_reflects_connection_m` and `tests/test_run_diagnostics_2026_06_13.py::test_conditional_break_columns_present_only_under_toggle` for `connection_L`. Add an explicit per-layer diagnostics test so the current `diagnostics_per_layer()` API or its live equivalent sees the active direct-link transport rather than replaying only `connection_W` / `connection_M` paths.
 
 - [ ] **Step 5: Run diagnostics tests**
 
@@ -562,7 +573,7 @@ Optional Modify: `tests/test_amp.py`
 
 Consumes: direct-link dense builder.
 
-Produces: explicit supported operating point, full-covariance warning, AMP protection, self-edge post-step protection, and dense-memory guard.
+Produces: explicit supported operating point, full-covariance warning, AMP protection, self-edge post-step protection, and a concrete non-materializing large-shape transport route.
 
 - [ ] **Step 1: Extend full-covariance warning to direct-link mode**
 
@@ -570,11 +581,13 @@ Include `regime_ii_link` in the noncompact full-covariance warning predicate and
 
 - [ ] **Step 2: Add AMP and self-edge tests**
 
-Add a self-edge post-optimizer-step test and a CUDA-only AMP test proving direct-link matrix exponentials stay finite under autocast. Skip the AMP test when CUDA is unavailable.
+Add a self-edge post-optimizer-step test and a CUDA-only AMP test proving direct-link matrix exponentials enter `stable_matrix_exp_pair` or the direct-link exponential helper in fp32 or float64 under autocast. A finite-output smoke test is not enough; use a narrow monkeypatch, debug hook, or captured dtype assertion. Skip the AMP test when CUDA is unavailable.
 
-- [ ] **Step 3: Add dense-memory estimator**
+- [ ] **Step 3: Add dense-memory estimator and CUDA guard**
 
-Add a small helper for the dense `Omega` byte estimate and test the spec example.
+Add a small helper for the dense `Omega` byte estimate and test the spec example. Then implement one concrete large-shape route: either a row-chunked downstream energy path that feeds `transport_mean` / `transport_covariance` without ever materializing full batched `(B,N,N,K,K)`, or a typed transport container with explicit row/block materialization consumed by those functions. The CUDA availability-guarded memory test may record `torch.cuda.max_memory_allocated()` instead of asserting an exact byte count, but it must fail if production direct-link code eagerly materializes an avoidable full batched fp32 transport tensor before chunking or the container takes over.
+
+The small correctness path may still expose an `Omega` object with logical shape `(B,N,N,K,K)`, but batch expansion must remain a view and production-size code must enter the row-chunked or container path before any operation forces the full batched tensor contiguous.
 
 ```python
 def _direct_link_dense_bytes(batch: int, n_tok: int, k: int, dtype: torch.dtype) -> int:
@@ -674,7 +687,13 @@ The s-channel remains flat.
 
 `cache_supported(cfg)` rejects `regime_ii_link`.
 
-Diagnostics and visualization extractors see active direct-link holonomy.
+`transport_mode="regime_ii_link"` rejects `e_phi_lr > 0.0` or explicitly implements a zero-gradient phi substep.
+
+Full covariance with noncompact direct links warns or rejects until the float64 sandwich and hard non-PD policy exist.
+
+Diagnostics, per-layer diagnostics, and visualization extractors see active direct-link holonomy.
+
+The CUDA memory guard shows the large operating point avoids avoidable full batched transport materialization.
 
 No AMP path runs link matrix exponentials in bf16 or fp16.
 
