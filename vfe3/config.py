@@ -1587,6 +1587,21 @@ class VFE3Config:
                 f"phi; set e_phi_lr=0.0 (got {self.e_phi_lr}), or use 'regime_ii_link_charted' whose "
                 f"phi sandwich is phi-dependent."
             )
+        # AMP precision (spec: no link exponential / covariance sandwich in bf16/fp16): the link
+        # matrix exponential is fp32-islanded inside the builder, but the DOWNSTREAM covariance
+        # sandwich (transport_covariance) runs under autocast and can lose precision on an
+        # ill-conditioned link (markedly so under full covariance). Warn (non-breaking; AMP is
+        # opt-in/off-by-default) rather than hard-reject.
+        if self.transport_mode in ("regime_ii_link", "regime_ii_link_charted") and self.amp_dtype in ("bf16", "fp16"):
+            import warnings
+            warnings.warn(
+                f"transport_mode={self.transport_mode!r} with amp_dtype={self.amp_dtype!r}: the direct-link "
+                "matrix exponential is fp32-islanded, but the downstream covariance sandwich runs under "
+                "autocast and can lose precision on an ill-conditioned link. Prefer amp_dtype=None for the "
+                "link modes, or keep family='gaussian_diagonal' with a well-conditioned link.",
+                UserWarning,
+                stacklevel=2,
+            )
         # regime_ii x gaussian_full (audit 2026-06-10 F10): the per-edge factor exp(delta . G) is
         # non-orthogonal for the non-compact groups, and the FULL-covariance sandwich
         # Omega Sigma Omega^T can go indefinite at fp32 -- the full-family KL then masks the NaN

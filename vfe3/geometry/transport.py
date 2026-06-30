@@ -675,6 +675,17 @@ def _build_regime_ii_link_charted(
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
+def _direct_link_dense_bytes(batch: int, n_tok: int, k: int, dtype: torch.dtype) -> int:
+    r"""Bytes of a DENSE batched ``(B, N, N, K, K)`` link transport.
+
+    This is the materialized cost the bare ``regime_ii_link`` AVOIDS: its Omega is batch-independent,
+    so the builder returns it at logical ``(N, N, K, K)`` (a factor ``B`` smaller) and lets
+    ``transport_mean`` / ``transport_covariance`` broadcast across the batch. The charted mode IS
+    genuinely ``(B, N, N, K, K)`` (per-sequence frames), so this is its true footprint."""
+    bytes_per = torch.tensor([], dtype=dtype).element_size()
+    return batch * n_tok * n_tok * k * k * bytes_per
+
+
 def stable_matrix_exp_pair(
     matrix:         torch.Tensor,             # (..., d, d) Lie-algebra matrices
 

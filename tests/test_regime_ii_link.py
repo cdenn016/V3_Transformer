@@ -513,3 +513,43 @@ def test_converged_state_omega_reflects_connection_l():
             model.connection_L += 0.5 * torch.randn_like(model.connection_L)
         st = converged_state(model, torch.randint(0, 15, (1, 4)))
         assert float(holonomy_deviation(st["omega"])) > 1e-4, mode
+
+
+# --- numerical / performance guardrails (D3 memory, AMP) -------------------------------------
+
+def test_regime_ii_link_build_belief_transport_is_batch_collapsed():
+    """The D3 collapse is realized end-to-end: build_belief_transport returns the bare link at
+    logical (N,N,K,K) for a batched phi, NOT a materialized (B,N,N,K,K)."""
+    from vfe3.inference.e_step import build_belief_transport
+    phi, connection_l, grp = _inputs(seed=20, B=8, N=4)
+    K = grp.generators.shape[-1]
+    omega = build_belief_transport(phi, grp, transport_mode="regime_ii_link",
+                                   connection_L=connection_l, link_alpha=1.0)
+    assert omega.shape == (4, 4, K, K)                                   # NOT (8,4,4,K,K)
+
+
+def test_direct_link_dense_bytes_estimator():
+    """The dense (B,N,N,K,K) byte estimate (the cost the bare-link collapse avoids)."""
+    from vfe3.geometry.transport import _direct_link_dense_bytes
+    assert _direct_link_dense_bytes(64, 128, 64, torch.float32) == 64 * 128 * 128 * 64 * 64 * 4
+
+
+def test_config_warns_amp_with_link_modes():
+    """amp_dtype with a link mode warns about the downstream-sandwich precision (spec bf16 ban)."""
+    import warnings
+    for mode in ("regime_ii_link", "regime_ii_link_charted"):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            VFE3Config(transport_mode=mode, amp_dtype="bf16")
+        assert any("amp_dtype" in str(x.message) for x in w), mode
+
+
+def test_regime_ii_link_self_edge_stays_identity_after_perturbing_diagonal():
+    """The self-edge is masked inside the builder, so even a nonzero connection_L[i,i] leaves
+    Omega_ii = I (the diagonal can never inject a spurious self-energy)."""
+    phi, connection_l, grp = _inputs(seed=21, N=4)
+    K = grp.generators.shape[-1]
+    connection_l[torch.arange(4), torch.arange(4)] = 3.0                 # perturb the (would-be) self-edges
+    omega = get_transport("regime_ii_link")(phi, grp, connection_L=connection_l, link_alpha=1.0)["Omega"]
+    idx = torch.arange(4)
+    assert torch.allclose(omega[idx, idx], torch.eye(K).expand(4, K, K), atol=1e-6)
