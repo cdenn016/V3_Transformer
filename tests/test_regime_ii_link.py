@@ -481,3 +481,21 @@ def test_regime_ii_link_kernel_matches_oracle_for_fixed_transport():
                                           gradient_mode="filtering", irrep_dims=grp.irrep_dims)
     assert torch.allclose(g_k, g_o, atol=1e-5, rtol=1e-4)
     assert torch.allclose(gs_k, gs_o, atol=1e-5, rtol=1e-4)
+
+
+# --- diagnostics threading: connection_L must reach the holonomy / norm diagnostics --------------
+
+def test_diagnostics_holonomy_reflects_connection_l():
+    """model.diagnostics builds its holonomy Omega under the ACTIVE regime; a nonzero connection_L
+    must produce non-trivial curvature (holonomy_deviation > 0) and emit connection_l_norm. Before
+    the threading fix the diagnostic Omega fell back to flat/identity (connection_L unpassed)."""
+    for mode in ("regime_ii_link", "regime_ii_link_charted"):
+        torch.manual_seed(0)
+        model = VFEModel(_tiny_cfg(transport_mode=mode))
+        with torch.no_grad():
+            model.prior_bank.mu_embed *= 50.0
+            model.connection_L += 0.5 * torch.randn_like(model.connection_L)
+        d = model.diagnostics(torch.randint(0, 15, (1, 4)))
+        assert d["holonomy_deviation"] > 1e-4, mode
+        assert d["connection_l_norm"] > 0.0, mode
+        assert "connection_l_offdiag_norm" in d, mode

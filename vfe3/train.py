@@ -882,7 +882,8 @@ def train(
                         "cocycle_residual", "vertex_cond_max", "sandwich_absmax", "transport_asymmetry",
                         "energy_abs_asymmetry", "energy_rel_asymmetry",
                         "gauge_head_aniso_mean", "gauge_head_logdet_spread",
-                        "connection_w_norm", "head_mixer_drift"):
+                        "connection_w_norm", "connection_m_norm",
+                        "connection_l_norm", "connection_l_offdiag_norm", "head_mixer_drift"):
                 if _dk in d:
                     row[_dk] = d[_dk]
             # Gradient health (Tier-1/2): global + per-group (mu/sigma/phi) grad AND weight norms (so

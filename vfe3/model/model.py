@@ -1256,6 +1256,7 @@ class VFEModel(nn.Module):
             lambda_beta=(self.cfg.lambda_beta if _llb is None else _llb.exp()),
             connection_W=getattr(self, "connection_W", None),
             connection_M=getattr(self, "connection_M", None),
+            connection_L=getattr(self, "connection_L", None),
             rope=rope, rope_on_cov=self.cfg.rope_full_gauge, rope_on_value=self.cfg.rope_on_value,
         )
         e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids[:1], out.phi.unsqueeze(0))
@@ -1466,6 +1467,7 @@ class VFEModel(nn.Module):
             lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
             connection_M=getattr(self, "connection_M", None),         # learned covariant (Route B) connection (None unless regime_ii_covariant)
+            connection_L=getattr(self, "connection_L", None),         # learned direct link (None unless regime_ii_link*)
             rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
             rope_on_value=cfg.rope_on_value,
             capture=cap,
@@ -1488,6 +1490,8 @@ class VFEModel(nn.Module):
             sigma=(out.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
             connection_W=getattr(self, "connection_W", None),
             connection_M=getattr(self, "connection_M", None),
+            connection_L=getattr(self, "connection_L", None),
+            link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
         if rope is not None:
@@ -1670,6 +1674,11 @@ class VFEModel(nn.Module):
         _cM = getattr(self, "connection_M", None)
         if _cM is not None:                                          # transport_mode='regime_ii_covariant'
             d["connection_m_norm"] = float(torch.linalg.norm(_cM.detach()))
+        _cL = getattr(self, "connection_L", None)
+        if _cL is not None:                                          # transport_mode='regime_ii_link' / '_charted'
+            d["connection_l_norm"]         = float(torch.linalg.norm(_cL.detach()))
+            d["connection_l_offdiag_norm"] = float(torch.linalg.norm(
+                _cL.detach()[~torch.eye(_cL.shape[0], dtype=torch.bool, device=_cL.device)]))
         _hm = getattr(self, "head_mixer", None)
         if _hm is not None and hasattr(_hm, "mixer_deltas"):        # use_head_mixer=True
             d["head_mixer_drift"] = max(
@@ -1732,6 +1741,7 @@ class VFEModel(nn.Module):
                 lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),     # learned covariant (Route B) connection
+                connection_L=getattr(self, "connection_L", None),     # learned direct link
                 cg_coupling=self.cg_coupling,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
                 rope_on_value=cfg.rope_on_value,
@@ -1745,6 +1755,8 @@ class VFEModel(nn.Module):
                 sigma=(belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),
+                connection_L=getattr(self, "connection_L", None),
+                link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 cocycle_relaxation=cfg.cocycle_relaxation,
             )                                                        # (N, N, K, K)
             if rope is not None:
@@ -1836,6 +1848,7 @@ class VFEModel(nn.Module):
                 lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),
+                connection_L=getattr(self, "connection_L", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 capture=cap,
             )
@@ -1845,6 +1858,8 @@ class VFEModel(nn.Module):
                 sigma=(belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),
+                connection_L=getattr(self, "connection_L", None),
+                link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 cocycle_relaxation=cfg.cocycle_relaxation,
             )
             if rope is not None:
