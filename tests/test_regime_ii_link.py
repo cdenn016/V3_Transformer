@@ -285,3 +285,129 @@ def test_link_modes_kernel_eligible_at_canonical_knobs():
                 divergence_family="renyi", include_attention_entropy=True)
     assert uses_kernel_route(**base, transport_mode="regime_ii_link")
     assert uses_kernel_route(**base, transport_mode="regime_ii_link_charted")
+
+
+# --- model wiring: connection_L creation, init, gradient flow, optimizer, cache --------------
+from vfe3.model.model import VFEModel
+
+
+def _tiny_cfg(transport_mode="flat", e_phi_lr=0.0, **kw):
+    return VFE3Config(
+        vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
+        n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=e_phi_lr, transport_mode=transport_mode, **kw,
+    )
+
+
+def test_model_link_modes_create_connection_l_zero_init():
+    """Both link modes create connection_L as a zero-init (max_seq, max_seq, n_gen) Parameter."""
+    for mode in ("regime_ii_link", "regime_ii_link_charted"):
+        model = VFEModel(_tiny_cfg(transport_mode=mode))
+        assert isinstance(model.connection_L, torch.nn.Parameter)
+        n_gen = model.group.generators.shape[0]
+        assert model.connection_L.shape == (4, 4, n_gen)
+        assert torch.equal(model.connection_L, torch.zeros(4, 4, n_gen))
+
+
+def test_model_flat_has_no_connection_l():
+    """The default flat model carries no connection_L (pure path is param-free)."""
+    assert not hasattr(VFEModel(_tiny_cfg(transport_mode="flat")), "connection_L")
+
+
+def test_model_charted_init_equals_flat_forward():
+    """The charted A=0 limit IS the flat cocycle, so at init (connection_L=0) a charted model's
+    forward equals the flat model's. (The BARE link's init is identity links, a different transport,
+    so it has no such equality -- pinned separately below.)"""
+    tokens = torch.randint(0, 15, (2, 4))
+    targets = torch.randint(0, 15, (2, 4))
+    torch.manual_seed(0)
+    logits_flat, loss_flat, _ = VFEModel(_tiny_cfg(transport_mode="flat"))(tokens, targets)
+    torch.manual_seed(0)
+    logits_ch, loss_ch, _ = VFEModel(_tiny_cfg(transport_mode="regime_ii_link_charted"))(tokens, targets)
+    assert torch.allclose(logits_flat, logits_ch, atol=1e-5, rtol=0.0)
+    assert torch.allclose(loss_flat, loss_ch, atol=1e-5, rtol=0.0)
+
+
+def test_model_link_modes_nonzero_changes_forward():
+    """A nonzero connection_L changes the forward loss for both link modes (the link is threaded
+    into the live transport, not ignored)."""
+    tokens = torch.randint(0, 15, (2, 4))
+    targets = torch.randint(0, 15, (2, 4))
+    for mode in ("regime_ii_link", "regime_ii_link_charted"):
+        torch.manual_seed(0)
+        model = VFEModel(_tiny_cfg(transport_mode=mode))
+        with torch.no_grad():
+            model.prior_bank.mu_embed *= 50.0
+        _, loss0, _ = model(tokens, targets)
+        with torch.no_grad():
+            model.connection_L += 0.5 * torch.randn_like(model.connection_L)
+        _, loss1, _ = model(tokens, targets)
+        assert not torch.allclose(loss0, loss1, atol=1e-4), mode
+
+
+def test_model_regime_ii_link_gradient_flows_to_l_on_default_kernel_route():
+    """THE load-bearing test (F6): the bare link is belief-INDEPENDENT, so the closed-form kernel is
+    valid and carries dF/dconnection_L with NO oracle. On the DEFAULT config (oracle_unroll_grad=False,
+    the kernel route) loss.backward() must populate a finite, NONZERO off-diagonal connection_L.grad.
+    (Unlike regime_ii, which needs oracle_unroll_grad=True because its kernel drops dOmega/dmu.)"""
+    torch.manual_seed(0)
+    model = VFEModel(_tiny_cfg(transport_mode="regime_ii_link"))
+    assert model.cfg.oracle_unroll_grad is False                         # canonical kernel route
+    with torch.no_grad():
+        model.prior_bank.mu_embed *= 50.0
+    tokens = torch.randint(0, 15, (2, 4))
+    targets = torch.randint(0, 15, (2, 4))
+    _, loss, _ = model(tokens, targets)
+    loss.backward()
+    g = model.connection_L.grad
+    assert g is not None and torch.isfinite(g).all()
+    N = tokens.shape[1]
+    offdiag = ~torch.eye(N, dtype=torch.bool)
+    assert g[:N, :N][offdiag].abs().sum() > 1e-6                          # off-diagonal link trains
+
+
+def test_model_charted_gradient_flows_to_l_on_default_kernel_route():
+    """The charted link is also belief-independent (phi-dependent but not belief-dependent), so it is
+    kernel-eligible and trains connection_L on the default route."""
+    torch.manual_seed(0)
+    model = VFEModel(_tiny_cfg(transport_mode="regime_ii_link_charted"))
+    assert model.cfg.oracle_unroll_grad is False
+    with torch.no_grad():
+        model.prior_bank.mu_embed *= 50.0
+    tokens = torch.randint(0, 15, (2, 4))
+    targets = torch.randint(0, 15, (2, 4))
+    _, loss, _ = model(tokens, targets)
+    loss.backward()
+    g = model.connection_L.grad
+    assert g is not None and torch.isfinite(g).all()
+    N = tokens.shape[1]
+    offdiag = ~torch.eye(N, dtype=torch.bool)
+    assert g[:N, :N][offdiag].abs().sum() > 1e-6
+
+
+def test_build_optimizer_groups_connection_l_once():
+    """connection_L must land in exactly one optimizer param group (else the coverage guard raises
+    and the link would never train)."""
+    from vfe3.train import build_optimizer
+    for mode in ("regime_ii_link", "regime_ii_link_charted"):
+        model = VFEModel(_tiny_cfg(transport_mode=mode))
+        opt = build_optimizer(model, model.cfg)                          # raises if ungrouped
+        grouped = [p for grp in opt.param_groups for p in grp["params"]]
+        assert sum(p is model.connection_L for p in grouped) == 1, mode
+
+
+def test_charted_model_runs_with_e_phi_lr_positive():
+    """The charted sandwich is phi-dependent, so e_phi_lr>0 (a live phi E-step) is legitimate and the
+    forward runs end-to-end (exercises phi_alignment_loss's link forwarding)."""
+    torch.manual_seed(0)
+    model = VFEModel(_tiny_cfg(transport_mode="regime_ii_link_charted", e_phi_lr=0.05))
+    tokens = torch.randint(0, 15, (2, 4))
+    targets = torch.randint(0, 15, (2, 4))
+    _, loss, _ = model(tokens, targets)
+    assert torch.isfinite(loss)
+
+
+def test_cache_rejects_link_modes():
+    """The prefix belief cache is flat-only; both link modes are rejected (non-flat transport)."""
+    from vfe3.inference.belief_cache import cache_supported
+    for mode in ("regime_ii_link", "regime_ii_link_charted"):
+        assert not cache_supported(_tiny_cfg(transport_mode=mode)), mode

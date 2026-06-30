@@ -268,7 +268,11 @@ def belief_gradients(
 
     mu_k, sigma_k = mu.detach(), sigma.detach()
     mu_t = transport_mean(omega, mu_k)                 # rank-agnostic: (N,N,K) or (B,N,N,K)
-    sigma_t = transport_covariance(omega, sigma_k)
+    # diagonal_out=True: the kernel route is gaussian_diagonal-ONLY (uses_kernel_route gates on it), so
+    # the sandwich is always the diagonal one. Forcing it also makes the batch-collapsed (N,N,K,K)
+    # regime_ii_link omega route correctly (its rank gap vs a batched diagonal sigma would otherwise
+    # misinfer the full sandwich); a batched dense omega is unaffected (it would infer diagonal anyway).
+    sigma_t = transport_covariance(omega, sigma_k, diagonal_out=True)
     fam = get_family(family)
     sd = self_divergence_for_alpha(fam(mu, sigma), fam(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
