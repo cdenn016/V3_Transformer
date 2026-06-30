@@ -104,15 +104,27 @@ def _rope_dense_omega(base: 'torch.Tensor | FactoredTransport', rope: torch.Tens
 _TRANSPORTS: Dict[str, Callable[..., TransportDict]] = {}
 _TRANSPORT_NEEDS_MU:    set = set()   # regimes whose Omega builder reads the belief means mu
 _TRANSPORT_NEEDS_SIGMA: set = set()   # regimes whose Omega builder reads the belief covariance sigma
+_TRANSPORT_BATCH_INDEPENDENT: set = set()   # regimes whose Omega is the SAME for every sequence in the
+#                                             batch (depends only on a model parameter, not phi/mu/sigma),
+#                                             so the builder returns a batch-collapsed (N,N,K,K) Omega that
+#                                             broadcasts downstream instead of a dense (B,N,N,K,K).
 
 
-def register_transport(name: str, *, needs_mu: bool = False, needs_sigma: bool = False) -> Callable:
+def register_transport(
+    name: str, *, needs_mu: bool = False, needs_sigma: bool = False, batch_independent: bool = False,
+) -> Callable:
     """Decorator registering a transport (connection-regime) builder under ``name``.
 
     ``needs_mu``/``needs_sigma`` are state-routing metadata: they declare which belief fields the
     regime's Omega builder consumes, so callers feed mu/sigma by querying the registry rather than
     matching literal mode names. Declaring them here keeps the add-by-registering contract -- a new
     stateful regime advertises its requirements at registration, not at every call site.
+
+    ``batch_independent`` declares that the builder's ``Omega`` does NOT depend on the batch (it is a
+    function of a model parameter only -- the bare direct link ``regime_ii_link``), so the builder
+    returns a batch-collapsed ``(N, N, K, K)`` Omega that ``transport_mean`` / ``transport_covariance``
+    broadcast across the batch (the D3 memory collapse). ``_transport`` reads this flag to skip the
+    per-sequence ``[0]`` strip it applies to ordinary ``(B, N, N, K, K)`` builders.
     """
     def _wrap(fn: Callable[..., TransportDict]) -> Callable[..., TransportDict]:
         _TRANSPORTS[name] = fn
@@ -120,6 +132,8 @@ def register_transport(name: str, *, needs_mu: bool = False, needs_sigma: bool =
             _TRANSPORT_NEEDS_MU.add(name)
         if needs_sigma:
             _TRANSPORT_NEEDS_SIGMA.add(name)
+        if batch_independent:
+            _TRANSPORT_BATCH_INDEPENDENT.add(name)
         return fn
     return _wrap
 
@@ -504,6 +518,160 @@ def _build_regime_ii_covariant(
             torch.einsum("bikl,bijlm,bjmn->bijkn", exp_phi_c, exp_delta_c, exp_neg_phi))
 
     omega = torch.cat(omega_chunks, dim=1) if len(omega_chunks) > 1 else omega_chunks[0]
+    return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
+
+
+def _direct_link_edge_exp(
+    connection_L:  torch.Tensor,             # (>=N, >=N, n_gen) learned direct-link table A
+    group:         GaugeGroup,               # supplies generators, skew flag, irrep_dims
+
+    n_tok:         int,                       # active sequence length N
+
+    *,
+    link_alpha:    float = 1.0,
+    link_soft_cap: float = 6.0,
+    device:        Optional[torch.device] = None,
+    dtype:         Optional[torch.dtype]  = None,
+) -> torch.Tensor:                            # (N, N, K, K) exp(link_alpha * A_ij . G)
+    r"""The per-edge direct-link factor exp(link_alpha * A_ij . G), shared by the bare and charted
+    direct-link builders.
+
+    ``A = connection_L[:N, :N]`` sliced to the active length; the self-edge is masked to 0 (the link
+    is an EDGE object, ``Omega_ii := I``), the EMBEDDED matrix ``A_ij . G = sum_a A_ij^a G_a`` is
+    smooth-capped on its Frobenius norm (``||A . G||_F < link_soft_cap``, so ``stable_matrix_exp_pair``
+    stays on the EXACT operator for every generator basis), and ``exp(.)`` runs in a float32 (or
+    block-scale float64) island -- NEVER bf16/fp16. The squared-norm-no-sqrt cap keeps the gradient
+    finite at ``A_ij . G = 0`` so the autograd ``d Omega / d connection_L`` at ``A=0`` (the generator
+    structure ``exp'(0)=I``) survives, exactly as the ``regime_ii`` W=0 path."""
+    n_gen = group.generators.shape[0]
+    if connection_L.dim() != 3 or connection_L.shape[0] < n_tok or connection_L.shape[1] < n_tok:
+        raise ValueError(
+            "direct-link transport requires connection_L with shape (max_seq_len, max_seq_len, n_gen) "
+            f"covering the active N={n_tok}; got {tuple(connection_L.shape)}."
+        )
+    if connection_L.shape[-1] != n_gen:
+        raise ValueError(
+            f"connection_L last dim must equal n_gen={n_gen}, got {connection_L.shape[-1]}."
+        )
+    device = device if device is not None else connection_L.device
+    dtype = dtype if dtype is not None else connection_L.dtype
+    # FLOAT32 ISLAND: the link exp (and its norm cap) never run in bf16/fp16, regardless of an outer
+    # autocast (spec: no link exponential in low precision). stable_matrix_exp_pair adds its own
+    # float64 island at the block scale when K >= dim_threshold.
+    with torch.amp.autocast("cuda", enabled=False):
+        link_coord = (link_alpha * connection_L[:n_tok, :n_tok, :]).to(device=device, dtype=torch.float32)
+        eye_N = torch.eye(n_tok, dtype=torch.bool, device=device)
+        link_coord = link_coord.masked_fill(eye_N.view(n_tok, n_tok, 1), 0.0)      # self-edge -> I
+        generators = group.generators.to(device=device, dtype=torch.float32)
+        link_mat = torch.einsum("ija,akl->ijkl", link_coord, generators)           # (N,N,K,K) Lie-algebra edge
+        fro_sq = link_mat.pow(2).sum(dim=(-2, -1), keepdim=True)
+        link_mat = link_mat * torch.rsqrt(1.0 + fro_sq / (link_soft_cap * link_soft_cap))
+    block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
+    exp_link, _ = stable_matrix_exp_pair(
+        link_mat, skew_symmetric=group.skew_symmetric, only_forward=True,
+        block_dims=block_dims, exp_dim=(max(block_dims) if block_dims is not None else None),
+    )                                                                              # (N, N, K, K)
+    return exp_link.to(dtype)
+
+
+@register_transport("regime_ii_link", batch_independent=True)
+def _build_regime_ii_link(
+    phi:                torch.Tensor,             # (B, N, n_gen) gauge frames (IGNORED: bare link reads only connection_L)
+    group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims
+
+    *,
+    gauge_mode:         str                    = "learned",
+    link_alpha:         float                  = 1.0,
+    link_soft_cap:      float                  = 6.0,
+    connection_L:       Optional[torch.Tensor] = None,   # (max_seq_len, max_seq_len, n_gen) learned direct link (NN exception)
+    **kwargs,                                            # tolerated (shares the flat builder's call shape)
+) -> TransportDict:
+    r"""Bare direct-link (NON-FLAT) Regime-II transport (spec docs/research/2026-06-29-regime-ii-direct-link-spec.md).
+
+    NEURAL-NETWORK EXCEPTION (sanctioned, default-OFF): consumes the LEARNED ``connection_L`` (an
+    nn.Parameter trained by backprop). The direct group-valued link is the connection itself:
+
+        Omega_ij = exp(link_alpha * A_ij . G),   A = connection_L,   i != j,   Omega_ii := I,
+
+    reading ONLY ``connection_L`` -- no vertex frame ``phi``, no beliefs. Its flat limit (``A=0`` /
+    ``link_alpha=0`` / ``connection_L=None``) is IDENTITY links ``Omega = I``, NOT the Regime-I vertex
+    cocycle ``exp(phi_i)exp(-phi_j)``. Because the link discards the frames it is frame-INDEPENDENT and
+    therefore does NOT satisfy the gauge-covariance law ``Omega_ij -> g_i Omega_ij g_j^{-1}`` -- a
+    DOCUMENTED opt-in equivariance break in the ``connection_W`` / ``connection_M`` / ``regime_ii``
+    family. Unlike ``connection_W`` (exact at ``W=0``, where ``regime_ii`` recovers the covariant flat
+    cocycle), the bare link breaks for ALL ``connection_L``: even the ``A=0`` identity links satisfy
+    ``I != g_i g_j^{-1}``. The EXACTLY covariant member is ``regime_ii_link_charted`` (the frame
+    sandwich). A nonzero ``connection_L`` gives non-trivial triangle holonomy (curvature > 0).
+
+    BATCH-INDEPENDENT: ``Omega`` is a function of ``connection_L`` only, so the builder returns it at
+    logical ``(N, N, K, K)`` (NO batch axis) and ``transport_mean`` / ``transport_covariance`` broadcast
+    it across the batch -- the D3 memory collapse (a dense ``(B, N, N, K, K)`` would OOM at the stated
+    operating point). ``_transport`` reads the ``batch_independent`` registry flag to skip its
+    per-sequence ``[0]`` strip.
+
+    Returns the SAME dict keys as the flat builder: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K) (both
+    UNUSED for the bare link, kept for dict parity), 'Omega' (N,N,K,K).
+    """
+    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
+    exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K), unused
+    N = phi.shape[1]
+    K = group.generators.shape[-1]
+    device, dtype = phi.device, phi.dtype
+    # Flat (identity-link) fast path: no connection or link_alpha=0 -> Omega = I exactly. NOTE we do
+    # NOT short-circuit on an all-ZERO (grad-requiring) connection_L: at A=0 exp(A)=I numerically, but
+    # d Omega / d connection_L there is the generator structure (exp'(0)=I), so the generic path keeps
+    # connection_L in the autograd graph (short-circuiting would freeze it at init).
+    if connection_L is None or link_alpha == 0.0:
+        omega = torch.eye(K, device=device, dtype=dtype).expand(N, N, K, K).contiguous()
+        return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
+    omega = _direct_link_edge_exp(connection_L, group, N, link_alpha=link_alpha,
+                                  link_soft_cap=link_soft_cap, device=device, dtype=dtype)   # (N,N,K,K)
+    return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
+
+
+@register_transport("regime_ii_link_charted")
+def _build_regime_ii_link_charted(
+    phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
+    group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims
+
+    *,
+    gauge_mode:         str                    = "learned",
+    link_alpha:         float                  = 1.0,
+    link_soft_cap:      float                  = 6.0,
+    connection_L:       Optional[torch.Tensor] = None,   # (max_seq_len, max_seq_len, n_gen) learned direct link (NN exception)
+    **kwargs,                                            # tolerated (shares the flat builder's call shape)
+) -> TransportDict:
+    r"""Charted direct-link (NON-FLAT) Regime-II transport: the gauge-EXACT direct-link member.
+
+    NEURAL-NETWORK EXCEPTION (sanctioned, default-OFF): consumes the LEARNED ``connection_L``. The
+    direct link is sandwiched between the co-transforming vertex frames:
+
+        Omega_ij = exp(phi_i . G) exp(link_alpha * A_ij . G) exp(-phi_j . G),   A = connection_L,
+        Omega_ii := I (self-edge masked).
+
+    EXACTLY gauge-covariant for ANY constant ``A``: a frame change ``exp(phi_i) -> g_i exp(phi_i)``
+    sends ``Omega_ij -> g_i Omega_ij g_j^{-1}`` (the co-transforming frames carry the entire
+    conjugation and the constant middle factor reads nothing, so there is nothing to break). This is
+    the OPPOSITE of ``regime_ii``, whose middle factor ``mu_i^T W mu_j`` reads the transforming beliefs
+    through a non-invariant bilinear. Belief-INDEPENDENT (no needs_mu/needs_sigma -> kernel-eligible),
+    but ``phi``-dependent (so it travels the dense, per-sequence path and is the more expensive of the
+    two link modes). Its ``A=0`` limit is the Regime-I flat cocycle ``exp(phi_i)exp(-phi_j)`` (NOT the
+    bare identity-link limit). A nonzero ``connection_L`` gives non-trivial triangle holonomy.
+
+    Returns the flat builder's dict shape: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K), 'Omega'
+    (B,N,N,K,K) (genuinely batched, because exp_phi is per-sequence).
+    """
+    # Flat (cocycle) fast path: no connection / link_alpha=0 / trivial gauge -> exp(phi_i)exp(-phi_j)
+    # byte-identically. A zero (grad-requiring) connection_L is NOT short-circuited (autograd at A=0).
+    if connection_L is None or link_alpha == 0.0 or gauge_mode == "trivial":
+        return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
+    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
+    exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
+    N = phi.shape[1]
+    exp_link = _direct_link_edge_exp(connection_L, group, N, link_alpha=link_alpha,
+                                     link_soft_cap=link_soft_cap, device=phi.device, dtype=phi.dtype)  # (N,N,K,K)
+    # Omega_ij = exp(phi_i) @ exp(link A_ij) @ exp(-phi_j); the batch-independent exp_link broadcasts.
+    omega = torch.einsum("bikl,ijlm,bjmn->bijkn", exp_phi, exp_link, exp_neg_phi)   # (B, N, N, K, K)
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
