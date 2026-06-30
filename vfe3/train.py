@@ -144,6 +144,11 @@ def build_optimizer(
         if cfg.connection_weight_decay is not None:             # shares the connection-norm ceiling
             m_group["weight_decay"] = cfg.connection_weight_decay
         groups.append(m_group)
+    if getattr(model, "connection_L", None) is not None:        # transport_mode='regime_ii_link' / '_charted'
+        l_group = {"params": [model.connection_L], "lr": cfg.m_phi_lr, "role": "phi"}   # direct link -> gauge LR
+        if cfg.connection_weight_decay is not None:             # shares the connection-norm ceiling
+            l_group["weight_decay"] = cfg.connection_weight_decay
+        groups.append(l_group)
     if getattr(model, "log_alpha", None) is not None:           # lambda_alpha_mode='learnable' scalar coupling
         groups.append({"params": [model.log_alpha], "lr": cfg.m_p_mu_lr, "role": "mu"})
     if getattr(model, "log_lambda_beta", None) is not None:     # learnable_lambda_beta scalar belief-coupling weight
@@ -877,7 +882,8 @@ def train(
                         "cocycle_residual", "vertex_cond_max", "sandwich_absmax", "transport_asymmetry",
                         "energy_abs_asymmetry", "energy_rel_asymmetry",
                         "gauge_head_aniso_mean", "gauge_head_logdet_spread",
-                        "connection_w_norm", "head_mixer_drift"):
+                        "connection_w_norm", "connection_m_norm",
+                        "connection_l_norm", "connection_l_offdiag_norm", "head_mixer_drift"):
                 if _dk in d:
                     row[_dk] = d[_dk]
             # Gradient health (Tier-1/2): global + per-group (mu/sigma/phi) grad AND weight norms (so

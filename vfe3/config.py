@@ -6,6 +6,7 @@ encode/decode mode, alpha form, attention prior, norm, gradient mode), so a
 variant swaps without editing call sites.
 """
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -98,7 +99,15 @@ class VFE3Config:
     # (mu_i^T W^a mu_j). 0.0 -> delta=0 -> flat (Regime I); 1.0 -> fully relaxed (Regime II). Ignored
     # by the flat builder.
     cocycle_relaxation:        float = 1.0
-   
+
+    # Direct-link Regime II (regime_ii_link / regime_ii_link_charted): the per-edge link factor
+    # exp(link_alpha * A_ij . G) reads the learned connection_L table directly (A = connection_L).
+    # link_alpha scales the link coordinates (0.0 -> identity links, the bare flat limit); link_soft_cap
+    # bounds the embedded-matrix Frobenius norm ||A_ij . G||_F before the exp (keeps it inside
+    # stable_matrix_exp_pair's exact regime). Ignored by every non-link builder.
+    link_alpha:                float = 1.0
+    link_soft_cap:             float = 6.0
+
     # Cross-head GL(K) coupling: a list of directed (head_a, head_b) index pairs that add off-block
     # generators (and a genuinely larger-than-direct-sum subalgebra under the builder's bracket
     # closure) to the gauge basis. Default None = the current block-diagonal GL(d_head)^H gauge.
@@ -1562,6 +1571,37 @@ class VFE3Config:
         # form also rejects NaN (nan <= 1.0 is False) and +/-inf, unlike a bare `< 0` check.
         if not (0.0 <= self.cocycle_relaxation <= 1.0):
             raise ValueError(f"cocycle_relaxation must be in [0,1], got {self.cocycle_relaxation}")
+        # Direct-link Regime II validation (regime_ii_link / regime_ii_link_charted): link_alpha in
+        # [0,1] (bracketed form also rejects NaN/inf); link_soft_cap positive AND finite -- a +inf cap
+        # makes rsqrt(1 + fro/inf^2) = 1 (no capping at all), so the bare `> 0` check is not enough.
+        if not (0.0 <= self.link_alpha <= 1.0):
+            raise ValueError(f"link_alpha must be in [0,1], got {self.link_alpha}")
+        if not (self.link_soft_cap > 0.0 and math.isfinite(self.link_soft_cap)):
+            raise ValueError(f"link_soft_cap must be positive and finite, got {self.link_soft_cap}")
+        # The BARE direct link is edge-owned and independent of the vertex frame phi, so a phi E-step
+        # (e_phi_lr>0) would optimize an inert frame; reject it. The CHARTED sandwich
+        # exp(phi_i) exp(A) exp(-phi_j) IS phi-dependent, so a nonzero e_phi_lr is legitimate there.
+        if self.transport_mode == "regime_ii_link" and self.e_phi_lr > 0.0:
+            raise ValueError(
+                f"transport_mode='regime_ii_link' is edge-owned and independent of the vertex frame "
+                f"phi; set e_phi_lr=0.0 (got {self.e_phi_lr}), or use 'regime_ii_link_charted' whose "
+                f"phi sandwich is phi-dependent."
+            )
+        # AMP precision (spec: no link exponential / covariance sandwich in bf16/fp16): the link
+        # matrix exponential is fp32-islanded inside the builder, but the DOWNSTREAM covariance
+        # sandwich (transport_covariance) runs under autocast and can lose precision on an
+        # ill-conditioned link (markedly so under full covariance). Warn (non-breaking; AMP is
+        # opt-in/off-by-default) rather than hard-reject.
+        if self.transport_mode in ("regime_ii_link", "regime_ii_link_charted") and self.amp_dtype in ("bf16", "fp16"):
+            import warnings
+            warnings.warn(
+                f"transport_mode={self.transport_mode!r} with amp_dtype={self.amp_dtype!r}: the direct-link "
+                "matrix exponential is fp32-islanded, but the downstream covariance sandwich runs under "
+                "autocast and can lose precision on an ill-conditioned link. Prefer amp_dtype=None for the "
+                "link modes, or keep family='gaussian_diagonal' with a well-conditioned link.",
+                UserWarning,
+                stacklevel=2,
+            )
         # regime_ii x gaussian_full (audit 2026-06-10 F10): the per-edge factor exp(delta . G) is
         # non-orthogonal for the non-compact groups, and the FULL-covariance sandwich
         # Omega Sigma Omega^T can go indefinite at fp32 -- the full-family KL then masks the NaN
@@ -1569,10 +1609,10 @@ class VFE3Config:
         # oracle_unroll_grad=True the double-backward can NaN connection_W.grad). Warn (non-
         # breaking, mirroring the estimator warnings below); prefer the diagonal family or a
         # compact so tower when running regime_ii at fp32 full covariance.
-        if self.transport_mode in ("regime_ii", "regime_ii_covariant") and self.family == "gaussian_full":
+        if self.transport_mode in ("regime_ii", "regime_ii_covariant", "regime_ii_link", "regime_ii_link_charted") and self.family == "gaussian_full":
             import warnings
             warnings.warn(
-                "transport_mode='regime_ii' with family='gaussian_full': the non-orthogonal edge "
+                f"transport_mode={self.transport_mode!r} with family='gaussian_full': the non-orthogonal edge "
                 "factor can drive the transported full covariance indefinite at fp32; the full-"
                 "family KL masks the failed Cholesky to kl_max SILENTLY, and the unrolled oracle's "
                 "double-backward can produce NaN connection_W gradients. Prefer gaussian_diagonal "
@@ -1613,7 +1653,7 @@ class VFE3Config:
         # of this config-level predicate to keep the default config silent here.)
         if self.e_step_gradient in ("straight_through", "detach") and (
             self.lambda_alpha_mode == "learnable"
-            or self.transport_mode in ("regime_ii", "regime_ii_covariant")
+            or self.transport_mode in ("regime_ii", "regime_ii_covariant", "regime_ii_link", "regime_ii_link_charted")
             or self.learnable_lambda_beta
             or (self.lambda_h_mode == "learnable" and self.s_e_step)
             or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
@@ -1665,6 +1705,20 @@ class VFE3Config:
                 and self.include_attention_entropy
             )
         )
+        # Direct-link modes (regime_ii_link / regime_ii_link_charted): belief-independent and
+        # kernel-eligible on the canonical knobs, so the closed-form kernel carries dF/dconnection_L
+        # with no oracle (and oracle_unroll_grad stays False on the default operating point). On a
+        # NON-kernel-eligible config (_routes_to_oracle True: gaussian_full, smoothing, renyi != 1,
+        # non-renyi, entropy off, or the decoupled value gauge) the belief gradient routes to the
+        # DETACHED oracle and connection_L would freeze at identity/flat; auto-enable the differentiable
+        # oracle there. Inert under detach/straight_through (which keep their own freeze warning above).
+        # Kept OUT of the unconditional regime_ii rule so the canonical kernel path is untouched.
+        if (
+            self.transport_mode in ("regime_ii_link", "regime_ii_link_charted")
+            and not self.oracle_unroll_grad
+            and _routes_to_oracle
+        ):
+            self.oracle_unroll_grad = True
         if (
             self.e_step_gradient == "unroll"
             and not self.oracle_unroll_grad

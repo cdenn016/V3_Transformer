@@ -268,7 +268,12 @@ def belief_gradients(
 
     mu_k, sigma_k = mu.detach(), sigma.detach()
     mu_t = transport_mean(omega, mu_k)                 # rank-agnostic: (N,N,K) or (B,N,N,K)
-    sigma_t = transport_covariance(omega, sigma_k)
+    # diagonal_out from the BELIEF shape (diagonal iff sigma has the same rank as mu), not the omega
+    # rank: the batch-collapsed (N,N,K,K) regime_ii_link omega would otherwise misinfer the full
+    # sandwich against a batched diagonal sigma. Family-agnostic (covers every diagonal family); a
+    # batched dense omega is unaffected (it would infer diagonal anyway). The kernel route is
+    # gaussian_diagonal-only, so this is always True here, but the shape check stays robust.
+    sigma_t = transport_covariance(omega, sigma_k, diagonal_out=(sigma_k.dim() == mu_k.dim()))
     fam = get_family(family)
     sd = self_divergence_for_alpha(fam(mu, sigma), fam(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)

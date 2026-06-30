@@ -115,7 +115,11 @@ def belief_gradients_autograd(
         # filtering/smoothing key-role split above).
         omega = omega_builder(mu_q, mu_k)
     mu_t = transport_mean(omega, mu_k)                  # rank-agnostic: (N,N,K) or (B,N,N,K)
-    sigma_t = transport_covariance(omega, sigma_k)
+    # diagonal_out from the BELIEF shape (diagonal iff sigma has the same rank as mu) -- family-agnostic
+    # (covers laplace_diagonal etc., not just gaussian_diagonal), so the batch-collapsed (N,N,K,K)
+    # regime_ii_link omega routes correctly against a batched diagonal sigma (its rank gap vs the omega
+    # would otherwise misinfer the full sandwich); behavior-identical for a batched dense omega.
+    sigma_t = transport_covariance(omega, sigma_k, diagonal_out=(sigma_k.dim() == mu_k.dim()))
 
     fam = get_family(family)
     sd = self_divergence_for_alpha(fam(mu_q, sigma_q), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max, eps=eps,
@@ -130,7 +134,7 @@ def belief_gradients_autograd(
     coupling_energy = None
     if isinstance(omega, RopeTransport) and not omega.on_value:
         mu_tv = transport_mean(omega.base, mu_k)
-        sigma_tv = transport_covariance(omega.base, sigma_k)
+        sigma_tv = transport_covariance(omega.base, sigma_k, diagonal_out=(sigma_k.dim() == mu_k.dim()))
         coupling_energy = pairwise_energy(fam(mu_q, sigma_q), fam(mu_tv, sigma_tv), alpha=renyi_order,
                                           kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                           irrep_dims=irrep_dims)

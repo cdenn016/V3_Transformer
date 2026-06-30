@@ -253,6 +253,27 @@ class VFEModel(nn.Module):
                     "stays flat. Set detach_e_step=False to train the Route-B connection.",
                     stacklevel=2,
                 )
+        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): the LEARNED DIRECT LINK connection_L.
+        # Both direct-link modes -- 'regime_ii_link' (bare: Omega_ij = exp(link_alpha A_ij . G)) and
+        # 'regime_ii_link_charted' (charted: exp(phi_i) exp(A) exp(-phi_j)) -- read the SAME learned
+        # table A = connection_L of shape (max_seq_len, max_seq_len, n_gen). Init ZERO -> the bare link
+        # is identity links and the charted link is the flat cocycle, so a link model is flat-equivalent
+        # at init to fp32 tolerance (the zero table takes the generic exp path to keep
+        # d Omega/d connection_L alive). NOT created on any other transport_mode (the path is param-free).
+        if cfg.transport_mode in ("regime_ii_link", "regime_ii_link_charted"):
+            self.connection_L = nn.Parameter(torch.zeros(cfg.max_seq_len, cfg.max_seq_len, n_gen))
+            if cfg.detach_e_step:
+                # Footgun (mirrors connection_W / connection_M): connection_L enters the loss ONLY
+                # through the E-step belief updates, so the detached (no_grad) E-step freezes it at its
+                # zero init (the flat/identity transport). Set detach_e_step=False to train the link.
+                import warnings
+                warnings.warn(
+                    f"transport_mode={cfg.transport_mode!r} with detach_e_step=True freezes "
+                    "connection_L: the learned direct link enters the loss only through the E-step, "
+                    "which the detached (no_grad) E-step severs, so connection_L.grad is None and the "
+                    "transport stays flat. Set detach_e_step=False to train the direct link.",
+                    stacklevel=2,
+                )
         if cfg.lambda_alpha_mode == "learnable":
             self.log_alpha = nn.Parameter(torch.zeros(()))
             if cfg.detach_e_step:
@@ -706,6 +727,9 @@ class VFEModel(nn.Module):
         # transport_mode='regime_ii_covariant', else None (flat / regime_ii pure paths). Threaded
         # through the E-step like connection_W so the loss backpropagates to it.
         connection_M = getattr(self, "connection_M", None)
+        # connection_L: the learned DIRECT LINK for regime_ii_link / regime_ii_link_charted, else None.
+        # Threaded through the E-step like connection_W (link_alpha/link_soft_cap come from cfg in the block).
+        connection_L = getattr(self, "connection_L", None)
         # E-step backward estimator. The EFFECTIVE mode reconciles the legacy detach_e_step bool
         # with e_step_gradient (cfg.effective_e_step_gradient): 'detach' wraps the whole E-step in
         # no_grad (the legacy detach_e_step=True path); 'unroll' (default) and 'straight_through'
@@ -746,6 +770,7 @@ class VFEModel(nn.Module):
                             log_alpha=log_alpha,
                             lambda_beta=lambda_beta,
                             connection_W=connection_W, connection_M=connection_M,
+                            connection_L=connection_L,
                             e_step_gradient=e_step_gradient,
                             rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
                             rope_on_value=self.cfg.rope_on_value,
@@ -1231,6 +1256,7 @@ class VFEModel(nn.Module):
             lambda_beta=(self.cfg.lambda_beta if _llb is None else _llb.exp()),
             connection_W=getattr(self, "connection_W", None),
             connection_M=getattr(self, "connection_M", None),
+            connection_L=getattr(self, "connection_L", None),
             rope=rope, rope_on_cov=self.cfg.rope_full_gauge, rope_on_value=self.cfg.rope_on_value,
         )
         e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids[:1], out.phi.unsqueeze(0))
@@ -1441,6 +1467,7 @@ class VFEModel(nn.Module):
             lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
             connection_M=getattr(self, "connection_M", None),         # learned covariant (Route B) connection (None unless regime_ii_covariant)
+            connection_L=getattr(self, "connection_L", None),         # learned direct link (None unless regime_ii_link*)
             rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
             rope_on_value=cfg.rope_on_value,
             capture=cap,
@@ -1463,6 +1490,8 @@ class VFEModel(nn.Module):
             sigma=(out.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
             connection_W=getattr(self, "connection_W", None),
             connection_M=getattr(self, "connection_M", None),
+            connection_L=getattr(self, "connection_L", None),
+            link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
         if rope is not None:
@@ -1645,6 +1674,11 @@ class VFEModel(nn.Module):
         _cM = getattr(self, "connection_M", None)
         if _cM is not None:                                          # transport_mode='regime_ii_covariant'
             d["connection_m_norm"] = float(torch.linalg.norm(_cM.detach()))
+        _cL = getattr(self, "connection_L", None)
+        if _cL is not None:                                          # transport_mode='regime_ii_link' / '_charted'
+            d["connection_l_norm"]         = float(torch.linalg.norm(_cL.detach()))
+            d["connection_l_offdiag_norm"] = float(torch.linalg.norm(
+                _cL.detach()[~torch.eye(_cL.shape[0], dtype=torch.bool, device=_cL.device)]))
         _hm = getattr(self, "head_mixer", None)
         if _hm is not None and hasattr(_hm, "mixer_deltas"):        # use_head_mixer=True
             d["head_mixer_drift"] = max(
@@ -1707,6 +1741,7 @@ class VFEModel(nn.Module):
                 lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),     # learned covariant (Route B) connection
+                connection_L=getattr(self, "connection_L", None),     # learned direct link
                 cg_coupling=self.cg_coupling,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
                 rope_on_value=cfg.rope_on_value,
@@ -1720,6 +1755,8 @@ class VFEModel(nn.Module):
                 sigma=(belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),
+                connection_L=getattr(self, "connection_L", None),
+                link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 cocycle_relaxation=cfg.cocycle_relaxation,
             )                                                        # (N, N, K, K)
             if rope is not None:
@@ -1811,6 +1848,7 @@ class VFEModel(nn.Module):
                 lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),
+                connection_L=getattr(self, "connection_L", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 capture=cap,
             )
@@ -1820,6 +1858,8 @@ class VFEModel(nn.Module):
                 sigma=(belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),
+                connection_L=getattr(self, "connection_L", None),
+                link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 cocycle_relaxation=cfg.cocycle_relaxation,
             )
             if rope is not None:
