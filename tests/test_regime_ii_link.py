@@ -411,3 +411,73 @@ def test_cache_rejects_link_modes():
     from vfe3.inference.belief_cache import cache_supported
     for mode in ("regime_ii_link", "regime_ii_link_charted"):
         assert not cache_supported(_tiny_cfg(transport_mode=mode)), mode
+
+
+# --- gradient + kernel verification ----------------------------------------------------------
+from vfe3.belief import BeliefState
+from vfe3.inference.e_step import build_belief_transport, free_energy_value
+
+
+def _grad_setup(seed=0, N=3, K=4):
+    grp = get_group("block_glk")(K, 2)
+    n_gen = grp.generators.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    mu      = 0.5 * torch.randn(N, K, generator=g)
+    sigma   = torch.rand(N, K, generator=g) + 0.5
+    phi     = 0.1 * torch.randn(N, n_gen, generator=g)
+    mu_p    = 0.5 * torch.randn(N, K, generator=g)
+    sigma_p = torch.rand(N, K, generator=g) + 0.5
+    L       = 0.3 * torch.randn(N, N, n_gen, generator=g)
+    return grp, mu, sigma, phi, mu_p, sigma_p, L
+
+
+def test_regime_ii_link_df_dconnection_l_matches_fd():
+    """dF/dconnection_L against central differences -- transport-DIFFERENTIABILITY of F (a necessary
+    building block, NOT the M-step gradient, which flows through the unrolled E-step). Off-diagonal
+    (i != j) entries only; the self-edge is masked, so diagonal entries are zero-gradient by design."""
+    grp, mu, sigma, phi, mu_p, sigma_p, L = _grad_setup(seed=3)
+
+    def F(l):
+        return free_energy_value(BeliefState(mu=mu, sigma=sigma, phi=phi), mu_p, sigma_p, grp,
+                                 transport_mode="regime_ii_link", connection_L=l, link_alpha=1.0)
+
+    L_leaf = L.clone().requires_grad_(True)
+    (g_l,) = torch.autograd.grad(F(L_leaf), L_leaf)
+    assert torch.isfinite(g_l).all()
+    assert g_l.abs().sum() > 1e-6
+    h = 1e-3
+    for (i, j, a) in ((0, 1, 0), (1, 2, 1), (2, 0, 2)):
+        e = torch.zeros_like(L); e[i, j, a] = h
+        fd = (F(L + e) - F(L - e)) / (2.0 * h)
+        assert abs(float(g_l[i, j, a]) - float(fd)) <= 0.05 * abs(float(fd)) + 5e-3
+
+
+def test_regime_ii_link_self_edge_grad_is_zero():
+    """The masked self-edge carries no link, so dF/dconnection_L[i,i,:] = 0 exactly (by design)."""
+    grp, mu, sigma, phi, mu_p, sigma_p, L = _grad_setup(seed=4)
+    L_leaf = L.clone().requires_grad_(True)
+    (g_l,) = torch.autograd.grad(
+        free_energy_value(BeliefState(mu=mu, sigma=sigma, phi=phi), mu_p, sigma_p, grp,
+                          transport_mode="regime_ii_link", connection_L=L_leaf, link_alpha=1.0),
+        L_leaf)
+    idx = torch.arange(L.shape[0])
+    assert torch.equal(g_l[idx, idx], torch.zeros_like(g_l[idx, idx]))
+
+
+def test_regime_ii_link_kernel_matches_oracle_for_fixed_transport():
+    """The bare link is belief-INDEPENDENT (dOmega/dmu = 0), so the closed-form KERNEL (which treats
+    the transported keys as constant in mu -- exactly correct here) matches the autograd ORACLE for
+    the SAME fixed transport. This is the contrast with regime_ii, whose kernel drops dOmega/dmu and
+    is therefore excluded from the kernel route."""
+    from vfe3.gradients.kernels import belief_gradients
+    from vfe3.gradients.oracle import belief_gradients_autograd
+    grp, mu, sigma, phi, mu_p, sigma_p, L = _grad_setup(seed=5)
+    omega = build_belief_transport(phi.unsqueeze(0), grp, transport_mode="regime_ii_link",
+                                   connection_L=L, link_alpha=1.0)            # (N,N,K,K), batch-independent
+    g_k, gs_k = belief_gradients(mu, sigma, mu_p, sigma_p, omega,
+                                 transport_mode="regime_ii_link", gradient_mode="filtering",
+                                 irrep_dims=grp.irrep_dims)
+    g_o, gs_o = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega,
+                                          gradient_mode="filtering", irrep_dims=grp.irrep_dims)
+    assert torch.allclose(g_k, g_o, atol=1e-5, rtol=1e-4)
+    assert torch.allclose(gs_k, gs_o, atol=1e-5, rtol=1e-4)
