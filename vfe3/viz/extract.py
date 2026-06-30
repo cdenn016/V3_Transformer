@@ -76,6 +76,8 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
         cocycle_relaxation=cfg.cocycle_relaxation, connection_W=getattr(model, "connection_W", None),
         connection_M=getattr(model, "connection_M", None),
+        connection_L=getattr(model, "connection_L", None),
+        link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
         log_prior=log_prior, log_alpha=getattr(model, "log_alpha", None),
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
@@ -94,9 +96,11 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
         include_attention_entropy=cfg.include_attention_entropy, family=cfg.family,
         divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
         transport_mode=cfg.transport_mode, cocycle_relaxation=cfg.cocycle_relaxation,
+        link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
         log_prior=log_prior, log_alpha=getattr(model, "log_alpha", None),
         connection_W=getattr(model, "connection_W", None),
         connection_M=getattr(model, "connection_M", None),
+        connection_L=getattr(model, "connection_L", None),
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
 
@@ -212,6 +216,7 @@ def belief_ce_bank(
                 log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
                 connection_W=getattr(model, "connection_W", None),
                 connection_M=getattr(model, "connection_M", None),
+                connection_L=getattr(model, "connection_L", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
             )
             trs = metrics.sigma_trace(out.sigma, diagonal=cfg.diagonal_covariance).reshape(-1)   # (B*N,)
@@ -276,6 +281,7 @@ def belief_bank(
                 log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),  # model
                 connection_W=getattr(model, "connection_W", None),
                 connection_M=getattr(model, "connection_M", None),
+                connection_L=getattr(model, "connection_L", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
             )
             b = tokens.shape[0]
@@ -364,6 +370,7 @@ def across_layer_belief_trace(
             log_alpha=getattr(model, "log_alpha", None),
             lambda_beta=_lambda_beta(model), connection_W=getattr(model, "connection_W", None),
             connection_M=getattr(model, "connection_M", None),
+            connection_L=getattr(model, "connection_L", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
         )
         mus.append(belief.mu)
@@ -410,6 +417,8 @@ def numerical_health(
         sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
         connection_W=getattr(model, "connection_W", None),
         connection_M=getattr(model, "connection_M", None),
+        connection_L=getattr(model, "connection_L", None),
+        link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
         cocycle_relaxation=cfg.cocycle_relaxation,
     )
     # Wrap in RopeTransport under pos_rotation='rope' so the reported nan/energy/beta fractions
@@ -482,6 +491,7 @@ def converged_state(
             log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
             connection_W=getattr(model, "connection_W", None),
             connection_M=getattr(model, "connection_M", None),
+            connection_L=getattr(model, "connection_L", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
             capture=cap,
         )
@@ -496,6 +506,8 @@ def converged_state(
             sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
             connection_W=getattr(model, "connection_W", None),
             connection_M=getattr(model, "connection_M", None),
+            connection_L=getattr(model, "connection_L", None),
+            link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
         if rope is not None:
@@ -573,6 +585,8 @@ def attention_entropy_cov_gap(
             sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
             connection_W=getattr(model, "connection_W", None),
             connection_M=getattr(model, "connection_M", None),
+            connection_L=getattr(model, "connection_L", None),
+            link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
         if rope is not None:

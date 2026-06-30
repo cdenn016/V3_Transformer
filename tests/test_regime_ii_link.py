@@ -499,3 +499,17 @@ def test_diagnostics_holonomy_reflects_connection_l():
         assert d["holonomy_deviation"] > 1e-4, mode
         assert d["connection_l_norm"] > 0.0, mode
         assert "connection_l_offdiag_norm" in d, mode
+
+
+def test_converged_state_omega_reflects_connection_l():
+    """viz.extract.converged_state returns the diagnostic Omega; under a link mode it must be built
+    with connection_L (the holonomy / gauge-equivariance figure panels otherwise read flat)."""
+    from vfe3.viz.extract import converged_state
+    for mode in ("regime_ii_link", "regime_ii_link_charted"):
+        torch.manual_seed(0)
+        model = VFEModel(_tiny_cfg(transport_mode=mode))
+        with torch.no_grad():
+            model.prior_bank.mu_embed *= 50.0
+            model.connection_L += 0.5 * torch.randn_like(model.connection_L)
+        st = converged_state(model, torch.randint(0, 15, (1, 4)))
+        assert float(holonomy_deviation(st["omega"])) > 1e-4, mode
