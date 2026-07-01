@@ -186,6 +186,37 @@ def test_config_grad_accum_steps_validation():
         VFE3Config(grad_accum_steps=-3)
 
 
+def test_uneven_microbatch_token_counts_warns():
+    # C8 (audit 2026-07-01, deferred guard): with grad_accum_steps>1 and UNEVEN counted-token
+    # microbatches, the n_mb/n_tot weight is exact for the token-mean CE but only approximate for
+    # the non-CE regularizers -- train_step must warn loudly in exactly that regime. The equal-token
+    # default stays silent (and byte-identical to the full-batch gradient, pinned by
+    # test_train_step_accum_grad_matches_full_batch above).
+    import warnings
+
+    torch.manual_seed(0)
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, cfg))
+    tokens, targets = _full_batch_no_ignore(B=4, N=8, V=6, seed=0)
+    targets = targets.clone()
+    targets[0, :4] = -100                                      # chunk 0 loses 4 counted tokens -> spread > 0
+    with pytest.warns(RuntimeWarning, match="non-CE regularizers"):
+        train_step(model, opt, sched, tokens, targets, grad_clip=1.0, grad_accum_steps=2)
+
+    # Equal-token microbatches (the default unpadded regime): NO such warning may fire.
+    torch.manual_seed(0)
+    model2 = VFEModel(cfg)
+    opt2 = build_optimizer(model2, cfg)
+    sched2 = torch.optim.lr_scheduler.LambdaLR(opt2, lambda s: lr_lambda(s, cfg))
+    tokens2, targets2 = _full_batch_no_ignore(B=4, N=8, V=6, seed=0)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        train_step(model2, opt2, sched2, tokens2, targets2, grad_clip=1.0, grad_accum_steps=2)
+    assert not [w for w in rec if "non-CE regularizers" in str(w.message)]
+
+
 def test_train_step_indivisible_batch_raises():
     # The equal-token oracle requires B % K == 0. A non-divisible batch would silently
     # give unequal microbatches (torch.chunk(5, 4) -> sizes [2,2,1], only 3 chunks), so

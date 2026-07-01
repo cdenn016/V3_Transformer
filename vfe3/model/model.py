@@ -1273,10 +1273,10 @@ class VFEModel(nn.Module):
         max_new_tokens: int,
 
         *,
-        temperature:    float          = 1.0,    # >0; applied to logits before sampling; ignored if greedy
+        temperature:    float           = 1.0,   # >0; applied to logits before sampling; ignored if greedy
+        greedy:         bool            = False, # True -> argmax; ignores temperature/top_k/top_p
         top_k:          Optional[int]   = None,  # keep the k largest-logit tokens, -inf the rest
         top_p:          Optional[float] = None,  # nucleus: smallest set with softmax cumsum >= p
-        greedy:         bool           = False,  # True -> argmax; ignores temperature/top_k/top_p
     ) -> torch.Tensor:                       # (B, N0 + max_new_tokens) prompt followed by generated ids
         r"""Autoregressively extend each prompt by ``max_new_tokens`` tokens.
 
@@ -1308,6 +1308,42 @@ class VFEModel(nn.Module):
                 "temperature/top_k/top_p are ignored when policy_mode != 'none' (the EFE policy posterior "
                 "uses policy_top_k and policy_precision); drop them or set policy_mode='none'. 'greedy' is "
                 "honored (argmax vs sample of the policy posterior).")
+        # audit C13 (2026-07-01): validate the sampler arguments up front. A negative max_new_tokens
+        # would silently no-op (empty loop, prompt returned unchanged); temperature<=0, out-of-range
+        # top_k, and top_p outside (0, 1] fail late or produce invalid probabilities. Greedy ignores
+        # temperature/top_k/top_p (and the policy path rejects non-defaults above), so those three
+        # are checked only on the sampled policy_mode='none' path.
+        if max_new_tokens < 0:
+            raise ValueError(f"max_new_tokens must be >= 0, got {max_new_tokens}")
+        if not greedy and self.cfg.policy_mode == "none":
+            if not (temperature > 0.0):
+                raise ValueError(f"temperature must be > 0, got {temperature}")
+            if top_k is not None and not (1 <= top_k <= self.cfg.vocab_size):
+                raise ValueError(f"top_k must be in [1, vocab_size={self.cfg.vocab_size}], got {top_k}")
+            if top_p is not None and not (0.0 < top_p <= 1.0):
+                raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+        # audit F10 (2026-07-01), warn-only (mirrors the D3 link-mode memory estimator, f3387b9):
+        # generate() has NO incremental belief/KV cache -- every generated token re-runs the FULL
+        # forward (encode -> E-step -> decode) over the whole <=max_seq_len window. Estimate the
+        # dominant fp32 per-forward transients at the max_seq_len bound -- the (B, H, N, N)
+        # attention/KL maps plus the (B, N, V) logits and (B, N, K) beliefs -- and warn ONCE past
+        # the documented 2 GiB budget; never raise (the pure path stays runnable). Incremental
+        # belief reuse across steps is the deferred optimization (see the docstring above).
+        _B, _N, _K = token_ids.shape[0], self.cfg.max_seq_len, self.cfg.embed_dim
+        _est_bytes = 4 * _B * (self.cfg.n_heads * _N * _N + _N * self.cfg.vocab_size + _N * _K)
+        if _est_bytes > 2 * 1024 ** 3:                           # documented budget: 2 GiB per forward
+            import warnings
+            warnings.warn(
+                f"generate(): estimated per-forward peak ~{_est_bytes / 2 ** 30:.1f} GiB (B={_B}, "
+                f"N={_N}, heads={self.cfg.n_heads}, V={self.cfg.vocab_size}) exceeds the 2 GiB "
+                "budget, and generate() re-runs the FULL forward (encode -> E-step -> decode) for "
+                "EVERY generated token -- there is no incremental belief/KV cache yet (the "
+                "incremental-cache optimization is deferred; see the generate docstring). Expect "
+                "O(max_new_tokens * forward(max_seq_len)) time and this peak per step; reduce the "
+                "batch/context or generate fewer tokens.",
+                UserWarning,
+                stacklevel=2,
+            )
         seq = token_ids
         for _ in range(max_new_tokens):
             context = seq[:, -self.cfg.max_seq_len:]                 # (B, <=max_seq_len)
@@ -1361,6 +1397,17 @@ class VFEModel(nn.Module):
         ``generate`` the meaningful preference is the global ``'flat'``.
         """
         from vfe3.inference.policy import get_policy, get_preference
+        # audit F4 (2026-07-01): the config validates efe_rollout (with horizon>1), but this generic
+        # path can only build a one-step candidate menu, so fail closed HERE -- at the exact point the
+        # missing H-step candidate generator would be needed -- with a clear error instead of the
+        # cryptic mid-scorer candidate-length ValueError.
+        if self.cfg.policy_mode == "efe_rollout":
+            raise NotImplementedError(
+                "policy_mode='efe_rollout' (horizon>1) is not reachable through generate(): the generic "
+                "policy path builds a one-step (B, Kp, 1) candidate menu, but efe_rollout requires an "
+                "H-token (B, Kp, H) policy menu and no H-step candidate generator exists. Drive efe_rollout "
+                "through a harness that builds H-action candidates and calls get_policy('efe_rollout') "
+                "directly, or set policy_mode='efe_one_step' (horizon=1).")
         base_logits = self.forward(context)[:, -1, :]               # (B, V) base last-position logits
         Kp = self.cfg.policy_top_k
         topk = base_logits.topk(Kp, dim=-1).indices                # (B, Kp) candidate token ids (generator E)

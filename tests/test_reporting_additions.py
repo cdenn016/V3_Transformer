@@ -25,7 +25,7 @@ import ablation
 import scaling_analysis
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts, _pure_path_report, _save_figures
+from vfe3.run_artifacts import RunArtifacts, _pure_path_report, _save_figures, finalize_run
 from vfe3.train import train
 from vfe3.viz import figures as figs
 
@@ -119,21 +119,100 @@ def test_save_figures_emits_dashboards(tmp_path):
 
 # --------------------------------------------------------------------------- pure-path certificate
 
+def _pure_ns(**over):
+    r"""SimpleNamespace with every attribute _pure_path_report reads, at the pure values."""
+    base = dict(
+        include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
+        learnable_lambda_beta=False, use_prior_bank=True, use_head_mixer=False,
+        lambda_beta=1.0, precision_weighted_attention=False,
+        gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
+        lambda_gamma=0.0, s_e_step=False)
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
 def test_pure_path_report_structure_and_flags():
     history = [{"step": 0, "nonfinite_frac": 0.0, "cocycle_residual": 1e-7, "holonomy_wilson": 2e-7,
                 "guard_sigma_floor_frac": 0.0}]
-    pure = types.SimpleNamespace(
-        include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
-        learnable_lambda_beta=False, use_prior_bank=True, use_head_mixer=False,
-        lambda_beta=1.0, precision_weighted_attention=False)
+    pure = _pure_ns()
     rep = _pure_path_report(pure, history)
     assert rep["on_pure_path"] is True
-    assert set(rep) == {"on_pure_path", "pure_flags", "config_toggles", "converged_stress"}
+    assert rep["on_gauge_pure_path"] is True
+    assert set(rep) == {"on_pure_path", "pure_flags", "config_toggles", "converged_stress",
+                        "gauge_flags", "on_gauge_pure_path"}
     assert rep["converged_stress"]["cocycle_residual"] == 1e-7
     # flipping any defining toggle drops the run off the pure path
     impure = types.SimpleNamespace(**{**pure.__dict__, "transport_mode": "regime_ii"})
     rep2 = _pure_path_report(impure, history)
     assert rep2["on_pure_path"] is False and rep2["pure_flags"]["flat_transport"] is False
+
+
+def test_gauge_purity_axis_is_independent_of_fe_axis():
+    # F8 (audit 2026-07-01): the gauge / model-channel axis is a SECOND, independent purity axis --
+    # flipping a gauge toggle must drop on_gauge_pure_path while on_pure_path stays True.
+    history = []
+    rep = _pure_path_report(_pure_ns(gauge_transport="off"), history)
+    assert rep["on_pure_path"] is True and rep["on_gauge_pure_path"] is False
+    assert rep["gauge_flags"]["learned_gauge_transport"] is False
+    rep2 = _pure_path_report(_pure_ns(s_e_step=True), history)
+    assert rep2["on_pure_path"] is True and rep2["on_gauge_pure_path"] is False
+    assert rep2["gauge_flags"]["no_model_channel_coupling"] is False
+    # the six gauge/model-channel settings are surfaced in config_toggles for transparency
+    for key in ("gauge_transport", "pos_rotation", "rope_full_gauge", "rope_on_value",
+                "lambda_gamma", "s_e_step"):
+        assert key in rep["config_toggles"]
+
+
+# --------------------------------------------------------------------------- figure memory guard
+
+def _finalize_ns(**over):
+    r"""SimpleNamespace cfg for finalize_run: carries every attribute the numeric path touches, so
+    the F9 tests do not depend on the concurrently-added ``force_large_figures`` config field."""
+    base = dict(
+        # figure memory-guard inputs: 8*V*N*B/1e9 ~ 13.2 GB fp32 logits+probs peak > the 8 GB guard
+        vocab_size=50257, max_seq_len=1024, batch_size=32,
+        generate_figures=True, force_large_figures=False,
+        # numeric-path attrs (summary / provenance / cost model / pure-path report)
+        seed=0, max_steps=2, use_prior_bank=True, use_head_mixer=False,
+        include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
+        learnable_lambda_beta=False, lambda_beta=1.0, precision_weighted_attention=False,
+        gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
+        lambda_gamma=0.0, s_e_step=False,
+        embed_dim=8, n_heads=2, n_layers=1, n_e_steps=1, diagonal_covariance=True,
+        gauge_group="block_glk", lambda_h=0.0, prior_source="prior_bank", amp_dtype="fp32")
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def test_finalize_run_skips_figures_over_memory_guard(tmp_path, monkeypatch, caplog):
+    # F9 (audit 2026-07-01): the figure extractors materialize dense (B, N, V) logits+probs, so
+    # finalize_run must SKIP the figure pass (with a warning) when the estimated full-vocab peak
+    # exceeds the 8 GB guard and force_large_figures is off.
+    torch.manual_seed(0)
+    real_cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2,
+                          batch_size=2)
+    model = VFEModel(real_cfg).to(DEVICE)
+    art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
+    calls = []
+    monkeypatch.setattr("vfe3.viz.report.generate_figures", lambda *a, **k: calls.append(a))
+    with caplog.at_level(logging.WARNING):
+        finalize_run(model, art, _finalize_ns(), test_loader=None)
+    assert calls == []                                          # figure pass skipped by the guard
+    assert any("skipping publication figures" in r.getMessage() for r in caplog.records)
+
+
+def test_finalize_run_force_large_figures_overrides_guard(tmp_path, monkeypatch):
+    # F9 counterpart: force_large_figures=True is the explicit large-run opt-in -- the figure pass
+    # runs despite the over-budget estimate.
+    torch.manual_seed(0)
+    real_cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2,
+                          batch_size=2)
+    model = VFEModel(real_cfg).to(DEVICE)
+    art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
+    calls = []
+    monkeypatch.setattr("vfe3.viz.report.generate_figures", lambda *a, **k: calls.append(a))
+    finalize_run(model, art, _finalize_ns(force_large_figures=True), test_loader=None)
+    assert calls                                                # figure pass attempted despite the estimate
 
 
 # --------------------------------------------------------------------------- held-out geometry columns

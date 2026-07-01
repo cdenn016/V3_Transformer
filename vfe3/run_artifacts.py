@@ -27,6 +27,8 @@ import csv
 import json
 import logging
 import math
+import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -35,6 +37,32 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.ema import EMA
+
+
+def _atomic_replace(
+    final: Path,                         # destination (the artifact name readers load)
+    tmp:   Path,                         # same-directory temp file, already fully written
+
+    *,
+    delay:   float = 0.2,
+    retries: int   = 5,
+) -> None:
+    r"""Atomically publish ``tmp`` over ``final`` via ``os.replace`` (same-volume rename).
+
+    Same-directory temp + ``os.replace`` makes the publish an atomic rename on one volume, so a
+    crash or power loss mid-write can never leave a truncated JSON or corrupt ``.pt`` at the final
+    name (audit 2026-07-01 C11). Retries with backoff on ``PermissionError`` -- Windows can hold a
+    transient open-handle lock on the destination (this host has hit it on ``best_model.pt``) --
+    and re-raises any other error (and the last ``PermissionError``) so a real failure is never
+    swallowed."""
+    for i in range(retries):
+        try:
+            os.replace(tmp, final)
+            return
+        except PermissionError:
+            if i == retries - 1:
+                raise
+            time.sleep(delay)
 
 
 class RunArtifacts:
@@ -72,9 +100,14 @@ class RunArtifacts:
         })
 
     def save_json(self, name: str, obj: dict) -> Path:
-        r"""Write ``obj`` as pretty JSON to ``run_dir/name`` (non-serializable -> str)."""
+        r"""Write ``obj`` as pretty JSON to ``run_dir/name`` (non-serializable -> str).
+
+        Atomic: written to a same-directory ``.tmp`` then published via ``os.replace``, so a crash
+        mid-write can never leave a truncated/partial JSON at the final name."""
         path = self.run_dir / name
-        path.write_text(json.dumps(obj, indent=2, default=str))
+        tmp  = self.run_dir / (name + ".tmp")
+        tmp.write_text(json.dumps(obj, indent=2, default=str))
+        _atomic_replace(path, tmp)
         return path
 
     def log_metrics(self, row: Dict[str, float]) -> None:
@@ -98,11 +131,16 @@ class RunArtifacts:
             csv.DictWriter(fh, fieldnames=self._fieldnames).writerow(csv_row)
 
     def maybe_save_best(self, step: int, model: torch.nn.Module, val_ppl: float) -> bool:
-        r"""Save ``model.state_dict()`` to ``best_model.pt`` iff ``val_ppl`` is a new minimum."""
+        r"""Save ``model.state_dict()`` to ``best_model.pt`` iff ``val_ppl`` is a new minimum.
+
+        Atomic (same-dir tmp + ``os.replace``): a crash or Windows lock mid-save can never leave a
+        corrupt/unreadable ``best_model.pt`` where a good one stood."""
         if val_ppl < self.best_val_ppl:
             self.best_val_ppl = float(val_ppl)
             self.best_step = int(step)
-            torch.save(model.state_dict(), self.best_path)
+            tmp = self.best_path.with_suffix(".pt.tmp")
+            torch.save(model.state_dict(), tmp)
+            _atomic_replace(self.best_path, tmp)
             return True
         return False
 
@@ -215,8 +253,12 @@ class RunArtifacts:
         ``scaler`` (audit 2026-06-09 IE3): an ENABLED fp16 GradScaler's state (current scale +
         growth counters) is bundled so a resumed fp16 run does not restart at the init scale
         65536 and re-converge by skipped steps; a disabled/None scaler stores None.
+        ``best_val_ppl``/``best_step`` (audit 2026-07-01 C2): the model-selection state is bundled
+        so a resumed run reports the run-wide best, not just the continuation's best. The write is
+        atomic (same-dir tmp + ``os.replace``) so a crash never leaves a corrupt ``step_<N>.pt``.
         """
         path = self.ckpt_dir / f"step_{step}.pt"
+        tmp  = path.with_suffix(".pt.tmp")
         rng_state = {
             "cpu":  torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -230,7 +272,10 @@ class RunArtifacts:
             "scaler_state":    (scaler.state_dict()
                                 if scaler is not None and scaler.is_enabled() else None),
             "ema_state":       (ema.state_dict() if ema is not None else None),
-        }, path)
+            "best_val_ppl":    float(self.best_val_ppl),
+            "best_step":       self.best_step,
+        }, tmp)
+        _atomic_replace(path, tmp)
         return path
 
 
@@ -245,6 +290,7 @@ def load_checkpoint(
     scaler:       Optional['torch.amp.GradScaler']       = None,
     cfg:          Optional[VFE3Config]                   = None,
     ema:          Optional[EMA]                          = None,
+    artifacts:    'Optional[RunArtifacts]'               = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
@@ -261,7 +307,9 @@ def load_checkpoint(
     when given, the CURRENT config is compared against the bundle's saved config and any
     differing fields are warned about -- strict ``load_state_dict`` already catches
     shape-changing divergence, but shape-preserving semantic drift (LR schedule, n_e_steps,
-    e_*_lr, ...) would otherwise pass silently.
+    e_*_lr, ...) would otherwise pass silently. ``artifacts`` (audit 2026-07-01 C2): when given,
+    the bundled ``best_val_ppl``/``best_step`` model-selection state is restored into it (bundles
+    without those fields skip the restore).
 
     The bundle is loaded with ``weights_only=True`` by default, which refuses to execute arbitrary
     pickle reductions: our bundle carries only tensors, an ``asdict`` config dict, and RNG tensors
@@ -291,10 +339,23 @@ def load_checkpoint(
     if scaler is not None and ckpt.get("scaler_state") is not None:
         scaler.load_state_dict(ckpt["scaler_state"])
     # EMA shadow: restore it so a resumed run continues the SAME running average instead of re-seeding
-    # from the resumed iterate. Bundles written before EMA existed (or from a use_ema=False run) carry
-    # no ema_state, so the shadow stays at its constructed value (the just-loaded weights).
-    if ema is not None and ckpt.get("ema_state") is not None:
-        ema.load_state_dict(ckpt["ema_state"])
+    # from the resumed iterate. When the bundle carries no ema_state (a use_ema=False or legacy
+    # checkpoint), the shadow was constructed from the PRE-load fresh init (EMA is built before this
+    # load overwrites the model), so reseed it from the just-loaded weights -- otherwise the running
+    # average blends real weights into random-init noise (audit 2026-07-01 C3).
+    if ema is not None:
+        if ckpt.get("ema_state") is not None:
+            ema.load_state_dict(ckpt["ema_state"])
+        else:
+            ema.reset(model)   # no bundled shadow: reseed from the just-loaded weights, not the pre-load init
+    # Best-val model-selection state (audit 2026-07-01 C2): restore best_val_ppl/best_step into the
+    # resumed run's RunArtifacts so a continuation with no post-resume improvement still reports the
+    # run-wide best. Only the scalar metadata is bundled; best_model.pt itself lives in the run_dir
+    # (correct for a same-run_dir resume; a cross-run_dir resume still lacks the weights file).
+    # Bundles written before these fields existed simply skip the restore (backward compatible).
+    if artifacts is not None and ckpt.get("best_val_ppl") is not None:
+        artifacts.best_val_ppl = float(ckpt["best_val_ppl"])
+        artifacts.best_step    = ckpt.get("best_step")
     if cfg is not None and ckpt.get("config") is not None:
         saved = ckpt["config"]
         current = asdict(cfg)
@@ -724,12 +785,22 @@ def finalize_run(
     # (UMAP, E-step replay, holonomy sampling, a belief bank over many sequences), so a failure is
     # logged and never disturbs the saved numeric results. Drives the BEST-val model reloaded above.
     if getattr(cfg, "generate_figures", True):
-        try:
-            from vfe3.viz.report import generate_figures
-            generate_figures(artifacts.run_dir, model=model, loader=test_loader,
-                             device=device, logger=logger)
-        except Exception as exc:
-            logger.warning("publication figure generation failed (%s); numeric results are saved", exc)
+        # Memory-budget guard (audit 2026-07-01 F9): the figure extractors materialize dense
+        # full-vocab (B, N, V) logits + probabilities, which on a large run (e.g. V=50257, N=1024,
+        # B=16) can make finalization the memory peak. Skip the figure pass over an ~8 GB estimate
+        # unless the run opts in via force_large_figures; small runs stay below the threshold, so
+        # the default-on behavior is byte-identical there.
+        approx_gb = 8.0 * int(cfg.vocab_size) * int(cfg.max_seq_len) * int(cfg.batch_size) / 1e9   # fp32 logits+probs (B, N, V) peak
+        if approx_gb > 8.0 and not getattr(cfg, "force_large_figures", False):
+            logger.warning("skipping publication figures: est full-vocab peak ~%.1f GB exceeds "
+                           "8 GB guard; set force_large_figures=True to override", approx_gb)
+        else:
+            try:
+                from vfe3.viz.report import generate_figures
+                generate_figures(artifacts.run_dir, model=model, loader=test_loader,
+                                 device=device, logger=logger)
+            except Exception as exc:
+                logger.warning("publication figure generation failed (%s); numeric results are saved", exc)
     return results
 
 
@@ -744,7 +815,11 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     prior-bank decode, no head mixer, unweighted attention); it does NOT enumerate every default-OFF
     learned-scalar toggle (pos_phi, lambda_h_mode, learnable_r, t5_learnable_bias, use_cg_coupling),
     so ``on_pure_path`` certifies these axes rather than a full no-learned-parameter audit.
-    ``converged_stress`` reads the last finite value of each guard / flatness column (None if absent)."""
+    ``gauge_flags``/``on_gauge_pure_path`` is a SECOND, independent axis (audit 2026-07-01 F8): the
+    gauge / model-channel path (learned gauge transport, no positional rotation, no model-channel
+    coupling) -- a run can be pure on the free-energy/decode axis while a gauge setting alters the
+    executed belief path, and vice versa. ``converged_stress`` reads the last finite value of each
+    guard / flatness column (None if absent)."""
     def _last(key: str) -> Optional[float]:
         for r in reversed(history):
             v = r.get(key)
@@ -760,9 +835,19 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
         "no_head_mixer":               not cfg.use_head_mixer,
         "unweighted_attention":        not cfg.precision_weighted_attention,
     }
+    # Second, INDEPENDENT purity axis (audit 2026-07-01 F8): the gauge / model-channel path. Keyed
+    # on pos_rotation itself rather than the RoPE sub-toggles (rope_full_gauge / rope_on_value),
+    # which are inert while RoPE is off -- those are reported in config_toggles for transparency.
+    gauge_flags = {
+        "learned_gauge_transport":   cfg.gauge_transport == "on",
+        "no_positional_rotation":    cfg.pos_rotation == "none",
+        "no_model_channel_coupling": cfg.lambda_gamma == 0.0 and not cfg.s_e_step,
+    }
     return {
-        "on_pure_path": all(pure_flags.values()),
-        "pure_flags":   pure_flags,
+        "on_pure_path":       all(pure_flags.values()),
+        "pure_flags":         pure_flags,
+        "gauge_flags":        gauge_flags,
+        "on_gauge_pure_path": all(gauge_flags.values()),
         "config_toggles": {
             "include_attention_entropy":    bool(cfg.include_attention_entropy),
             "transport_mode":               cfg.transport_mode,
@@ -772,6 +857,26 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "use_prior_bank":               bool(cfg.use_prior_bank),
             "use_head_mixer":               bool(cfg.use_head_mixer),
             "precision_weighted_attention": bool(cfg.precision_weighted_attention),
+            "gauge_transport":              cfg.gauge_transport,
+            "pos_rotation":                 cfg.pos_rotation,
+            "rope_full_gauge":              bool(cfg.rope_full_gauge),
+            "rope_on_value":                bool(cfg.rope_on_value),
+            "lambda_gamma":                 float(cfg.lambda_gamma),
+            "s_e_step":                     bool(cfg.s_e_step),
+            # regime_ii_covariant under gaussian_diagonal is a CONTROLLED APPROXIMATION (the
+            # diagonal cone is not closed under GL congruence Omega Sigma Omega^T -- audit C5),
+            # so a diagonal covariant run is never reported as exact Route B.
+            "regime_ii_covariant_exact":    (cfg.transport_mode != "regime_ii_covariant")
+                                            or (cfg.family == "gaussian_full"),
+            # Covariance class of the ACTIVE transport (audit C7): plain regime_ii's bilinear edge
+            # delta_ij = mu_i^T W mu_j is gauge-FIXED (invariant only at W=0), never covariant.
+            # .get default: a newly registered mode reports its own name rather than KeyError-ing.
+            "transport_covariance_class":   {"flat":                   "covariant (flat)",
+                                             "regime_ii":              "gauge-fixed (non-covariant)",
+                                             "regime_ii_covariant":    "covariant",
+                                             "regime_ii_link":         "gauge-fixed",
+                                             "regime_ii_link_charted": "covariant",
+                                             }.get(cfg.transport_mode, cfg.transport_mode),
         },
         "converged_stress": {k: _last(k) for k in (
             "guard_sigma_floor_frac", "guard_sigma_ceil_frac", "guard_energy_klmax_frac",
@@ -838,7 +943,7 @@ def _save_figures(
             # so the curvature spikes survive.
             fig = figs.plot_trajectory(
                 hy, hx, ylabel=r"$\langle\|H_{ijk}-I\|_F\rangle$",
-                title="Holonomy deviation (curvature proxy)", color=figs._CB[2],
+                title="Holonomy deviation (frame-dependent Frobenius)", color=figs._CB[2],
                 logy=True, median_line=True, annotate="max",
                 path=str(run / "holonomy.png"))
             figs.plt.close(fig)

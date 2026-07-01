@@ -56,6 +56,29 @@ def test_register_get_roundtrip_does_not_leak():
         assert name not in store
 
 
+def test_register_policy_duplicate_key_fails_closed():
+    # audit F12 (2026-07-01): a second @register_policy under an existing name must fail closed
+    # (KeyError) rather than silently shadowing the first; override=True is the explicit escape.
+    name = "__f12_dup_smoke__"
+    try:
+        @register_policy(name)
+        def _first():
+            return 1
+        with pytest.raises(KeyError):
+            @register_policy(name)
+            def _second():
+                return 2
+        assert get_policy(name)() == 1                      # the first registration survived
+
+        @register_policy(name, override=True)
+        def _third():
+            return 3
+        assert get_policy(name)() == 3                      # explicit override replaces it
+    finally:
+        _POLICIES.pop(name, None)
+    assert name not in _POLICIES
+
+
 def test_phase1_registrations_present():
     # Phase 1 fills the registries; unknown keys still raise.
     assert {"none", "efe_one_step", "logprob_control", "efe_rollout"} <= set(_POLICIES)
@@ -149,3 +172,36 @@ def test_sigma_gate_flag_requires_passing_artifact(tmp_path):
     ok.write_text(json.dumps({"status": "PASS", "spec_commit": "x"}), encoding="utf-8")
     cfg = VFE3Config(policy_sigma_ambiguity_validated=True, policy_sigma_gate_artifact=str(ok))
     assert cfg.policy_sigma_ambiguity_validated is True
+
+
+def test_sigma_gate_flag_has_no_executable_consumer(tmp_path):
+    # audit F5 (2026-07-01): policy_sigma_ambiguity_validated=True (with a PASS artifact) is a
+    # PRECONDITION RECORD ONLY -- no code path routes ambiguity_mode to 'sigma_mc', so the scorer
+    # still uses the default 'likelihood_entropy' and runs fine (no sigma_mc RuntimeError). This
+    # pins that the validated flag does NOT unlock the gated estimator by itself.
+    import json
+    import torch
+    from vfe3.model.model import VFEModel
+    ok = tmp_path / "pass.json"
+    ok.write_text(json.dumps({"status": "PASS", "spec_commit": "x"}), encoding="utf-8")
+    torch.manual_seed(0)
+    m = VFEModel(VFE3Config(
+        vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=16,
+        policy_mode="efe_one_step", policy_preference="flat",
+        policy_sigma_ambiguity_validated=True, policy_sigma_gate_artifact=str(ok)))
+    V = m.cfg.vocab_size
+    ctx = torch.randint(0, V, (1, 5))
+    cand = torch.randint(0, V, (1, 4, 1))
+    pref = get_preference("flat")(m.prior_bank)
+    with torch.no_grad():
+        out = get_policy("efe_one_step")(ctx, cand, pref, m)   # default ambiguity_mode
+    assert torch.isfinite(out.score).all()                     # scored, no sigma_mc dispatch
+    # the ambiguity IS the likelihood_entropy value (== predictive entropy at v1), not a sigma term
+    from vfe3.inference.policy import _rollout_predictive
+    with torch.no_grad():
+        q_log, _ = _rollout_predictive(ctx, cand, m)
+    assert torch.allclose(out.ambiguity, get_ambiguity("likelihood_entropy")(q_log), atol=1e-6)
+    # and the generic generate() path also completes under the validated flag
+    with torch.no_grad():
+        seq = m.generate(ctx, 2, greedy=True)
+    assert seq.shape == (1, 7)

@@ -10,6 +10,8 @@ and silently skips when matplotlib is unavailable), so the discriminating checks
 import json
 from pathlib import Path
 
+import pytest
+
 import ablation
 
 
@@ -120,7 +122,9 @@ def test_get_loader_threads_split_aware_shuffle_drop_last(monkeypatch) -> None:
 def test_cell_is_current_false_on_dataset_change(tmp_path: Path) -> None:
     r"""Resume must not serve a cell trained on a DIFFERENT dataset as current. The cell's
     VFE3Config carries no dataset field (it is a session knob), so _cell_is_current must also
-    compare the persisted top-level config.json 'dataset' against the current session dataset."""
+    compare the persisted top-level config.json 'dataset' against the current session dataset.
+    The marker carries no max_tokens key (a pre-fix cell): a full-data resume (max_tokens=None)
+    must still read it as current (missing key == None, the backward-compat path)."""
     from dataclasses import asdict
     from vfe3.config import VFE3Config
 
@@ -132,6 +136,57 @@ def test_cell_is_current_false_on_dataset_change(tmp_path: Path) -> None:
         "dataset": "wikitext-103",
     }
     (run_dir / "config.json").write_text(json.dumps(saved), encoding="utf-8")
+    (run_dir / "ablation_result.json").write_text(
+        json.dumps({"label": "cell", "primary_val_ppl": 10.0, "seed": 6}), encoding="utf-8")
 
     assert ablation._cell_is_current(run_dir, {}, seed=6, dataset="wikitext-103") is True
     assert ablation._cell_is_current(run_dir, {}, seed=6, dataset="wikitext-2") is False
+
+
+def test_cell_is_current_checks_max_tokens(tmp_path: Path) -> None:
+    r"""max_tokens (the loader train-token cap) is not a VFE3Config field, so config.json alone
+    cannot distinguish a capped smoke cell from a full run: _cell_is_current must also compare
+    the max_tokens persisted in the ablation_result.json marker."""
+    from dataclasses import asdict
+    from vfe3.config import VFE3Config
+
+    run_dir = tmp_path / "cell"
+    run_dir.mkdir()
+    ds = "wikitext-103"
+    cfg_dict = ablation._cell_cfg_dict({}, seed=6, max_steps=1)
+    saved = {
+        "config": json.loads(json.dumps(asdict(VFE3Config(**cfg_dict)), default=str)),
+        "dataset": ds,
+    }
+    (run_dir / "config.json").write_text(json.dumps(saved), encoding="utf-8")
+    (run_dir / "ablation_result.json").write_text(
+        json.dumps({"label": "cell", "primary_val_ppl": 10.0, "seed": 6, "max_tokens": 1000}),
+        encoding="utf-8")
+
+    assert ablation._cell_is_current(run_dir, {}, seed=6, dataset=ds, max_steps=1,
+                                     max_tokens=1000) is True
+    assert ablation._cell_is_current(run_dir, {}, seed=6, dataset=ds, max_steps=1,
+                                     max_tokens=None) is False
+
+
+def test_expand_range_sign_mismatch_raises() -> None:
+    r"""A sign-mismatched [start, stop, step] must raise, not silently expand to zero cells."""
+    with pytest.raises(ValueError):
+        ablation._expand_range([0, 5, -1])
+    with pytest.raises(ValueError):
+        ablation._expand_range([5, 0, 1])
+
+
+def test_expand_range_valid_directions_unchanged() -> None:
+    r"""Ascending, descending, and the degenerate single-point range all still expand."""
+    assert ablation._expand_range([0, 4, 2]) == [0, 2, 4]
+    assert ablation._expand_range([5, 0, -1]) == [5, 4, 3, 2, 1, 0]
+    assert ablation._expand_range([2, 2, 1]) == [2]
+
+
+def test_sanitize_distinct_labels_do_not_collide() -> None:
+    r"""The char-replace map is lossy ('a=b', 'a b', 'a/b' all map to 'a_b'), so the appended
+    raw-label hash must keep distinct labels in distinct run dirs, deterministically."""
+    assert len({ablation._sanitize("a=b"), ablation._sanitize("a b"),
+                ablation._sanitize("a/b")}) == 3
+    assert ablation._sanitize("kappa=2") == ablation._sanitize("kappa=2")

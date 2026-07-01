@@ -45,9 +45,13 @@ _AMBIGUITIES: Dict[str, Callable] = {}
 _GENERATE_SAFE_PREFERENCES: frozenset = frozenset({"flat"})
 
 
-def register_policy(name: str) -> Callable:
-    """Decorator registering a policy scorer under ``name`` (cf. :func:`vfe3.alpha_i.register_alpha`)."""
+def register_policy(name: str, override: bool = False) -> Callable:
+    """Decorator registering a policy scorer under ``name`` (cf. :func:`vfe3.alpha_i.register_alpha`).
+    Duplicate keys fail closed (audit F12): re-registering an existing ``name`` raises ``KeyError``
+    unless ``override=True``, so a second registration cannot silently shadow the first."""
     def _wrap(fn: Callable) -> Callable:
+        if name in _POLICIES and not override:
+            raise KeyError(f"policy mode {name!r} already registered; pass override=True to replace")
         _POLICIES[name] = fn
         return fn
     return _wrap
@@ -217,8 +221,12 @@ def _amb_sigma_mc(
     2.7, 4.5). GATED: it is unlocked only after the pre-registered sigma-validation gate passes; until
     then it must never be dispatched, so a trained nonzero sigma cannot be called an ambiguity value."""
     raise RuntimeError(
-        "ambiguity='sigma_mc' is gated behind the sigma-validation gate (spec Sections 2.7/4.5): set "
-        "policy_sigma_ambiguity_validated=True with a matching PASS artifact before it can be used."
+        "ambiguity='sigma_mc' is gated behind the sigma-validation gate (spec Sections 2.7/4.5) and "
+        "currently has NO executable consumer: setting policy_sigma_ambiguity_validated=True with a "
+        "matching PASS artifact records the precondition but does NOT unlock this estimator by itself "
+        "-- no code path routes ambiguity_mode to 'sigma_mc' (the scorers always use "
+        "'likelihood_entropy'), and a Phase-3 consumer that reads the validated artifact must be "
+        "added before it can be dispatched."
     )
 
 
@@ -308,7 +316,9 @@ def _efe_score(
     candidates forward (the cache fast path engages inside ``_rollout_predictive`` when supported),
     form risk + ambiguity, and return the policy posterior. The horizon distinction lives entirely in
     the candidate length L and the per-scorer guards; the scoring algebra is identical because the
-    rollout always reads the LAST appended position's predictive q(o|pi)."""
+    rollout always reads the LAST appended position's predictive q(o|pi). The ``sum`` below reduces
+    over the enabled ``score_terms`` (risk/ambiguity/epistemic), NOT over timesteps: even at H > 1
+    the terms are evaluated once, on the terminal predictive (audit F3)."""
     q_log, log_prob = _rollout_predictive(context, candidates, model, base_logits=base_logits)
     risk, pred_ent = _efe_terms(q_log, preference)
     ambiguity = get_ambiguity(ambiguity_mode)(q_log, model=model)
@@ -394,14 +404,18 @@ def _policy_efe_rollout(
     base_logits:    Optional[torch.Tensor] = None,    # (B, V) reused base logits
     **kwargs,
 ) -> 'PolicyScore':
-    r"""The staged horizon extension (H > 1). A policy pi = (a_1, ..., a_H) is the H-action candidate
-    sequence (``candidates`` column, length H); the belief is rolled forward over all H appended action
-    tokens and q(o|pi) = p(o | q*_pi) is read from the LAST position (the environment response is never
-    folded in, spec Section 2.2). Unlocked by the Phase-3a belief-prefix cache: the spec gates H > 1 on
-    a cache so the Kp*H rollout reuses the shared context instead of paying Kp*H full recomputes, which
-    is what makes the matched-compute baselines and the wall-clock honesty check fair (spec Sections
-    3.5, 4.2). It therefore REQUIRES the cache to be active; on a config the cache does not support it
-    raises rather than silently falling back to the dishonest full recompute."""
+    r"""The staged horizon extension (H > 1): a TERMINAL-OUTCOME rollout scorer, not a per-step
+    horizon sum. A policy pi = (a_1, ..., a_H) is the H-action candidate sequence (``candidates``
+    column, length H); the belief is rolled forward over all H appended action tokens and G(pi) is
+    evaluated on the SINGLE terminal predictive q(o|pi_H) = p(o | q*_pi) read from the LAST appended
+    position -- NOT the active-inference per-step sum sum_{tau=1..H} G_tau (audit F3). The H-step
+    rollout only advances the belief, so the terminal predictive is conditioned on all H actions (the
+    environment response is never folded in, spec Section 2.2). Unlocked by the Phase-3a belief-prefix
+    cache: the spec gates H > 1 on a cache so the Kp*H rollout reuses the shared context instead of
+    paying Kp*H full recomputes, which is what makes the matched-compute baselines and the wall-clock
+    honesty check fair (spec Sections 3.5, 4.2). It therefore REQUIRES the cache to be active; on a
+    config the cache does not support it raises rather than silently falling back to the dishonest
+    full recompute."""
     if horizon <= 1:
         raise ValueError(
             f"efe_rollout is the H>1 horizon scorer; got horizon={horizon}. Use efe_one_step for H=1.")

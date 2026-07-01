@@ -380,6 +380,34 @@ def test_full_cov_model_first_backward_finite_at_default_init():
     assert all(torch.isfinite(g).all() for g in grads), "non-finite gradient on the full-cov first step"
 
 
+# --- F2 (audit 2026-07-01): invalid sigma_max must raise, not corrupt Sigma ---
+@pytest.mark.parametrize("bad_sigma_max", [1e-9, -1.0, float("nan")])
+@pytest.mark.parametrize("arm", ["diagonal", "full"])
+def test_retract_rejects_invalid_sigma_max(arm, bad_sigma_max):
+    """A sub-eps / negative / NaN sigma_max used to flow straight into torch.clamp and silently
+    yield sub-eps, negative, or NaN variances; the _check_sigma_max guard now raises ValueError."""
+    K = 3
+    with pytest.raises(ValueError):
+        if arm == "diagonal":
+            retract_spd_diagonal(torch.ones(2, K), torch.zeros(2, K), sigma_max=bad_sigma_max)
+        else:
+            retract_spd_full(torch.eye(K).expand(2, K, K).contiguous(),
+                             torch.zeros(2, K, K), sigma_max=bad_sigma_max)
+
+
+@pytest.mark.parametrize("sigma_max", [None, 10.0])
+def test_retract_valid_sigma_max_unaffected(sigma_max):
+    """sigma_max=None (pure path: eps floor only) and the default 10.0 stay accepted and return
+    finite PD output -- the guard does not regress the pure/default path."""
+    K = 3
+    out_d = retract_spd_diagonal(torch.ones(2, K), 0.1 * torch.ones(2, K), sigma_max=sigma_max)
+    assert torch.isfinite(out_d).all() and (out_d > 0).all()
+    out_f = retract_spd_full(torch.eye(K).expand(2, K, K).contiguous(),
+                             0.1 * torch.eye(K).expand(2, K, K).contiguous(), sigma_max=sigma_max)
+    assert torch.isfinite(out_f).all()
+    assert (torch.linalg.eigvalsh(out_f) > 0).all()
+
+
 def test_log_euclidean_e_step_full_cov_runs():
     """A full-covariance E-step under spd_retract_mode='log_euclidean' produces a
     finite SPD covariance and finite grads (forward+backward)."""

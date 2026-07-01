@@ -43,6 +43,19 @@ class EMA:
         self._backup: Dict[str, torch.Tensor] = {}
 
     @torch.no_grad()
+    def reset(self, model: torch.nn.Module) -> None:
+        r"""Reseed the shadow from the model's current params (e.g. after loading resumed weights).
+
+        Used by ``load_checkpoint`` when a bundle carries no ``ema_state`` (a ``use_ema=False`` or
+        legacy checkpoint): the shadow constructed at ``__init__`` clones the PRE-load fresh init,
+        so without this reseed the running average would blend real weights into random-init noise
+        (audit 2026-07-01 C3). Same ``requires_grad`` filter as ``__init__`` so frozen params (e.g.
+        ``r_mu`` under ``learnable_r=False``) stay excluded consistently."""
+        self.shadow = {name: param.detach().clone()
+                       for name, param in model.named_parameters()
+                       if param.requires_grad}
+
+    @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
         r"""Blend the live parameters into the shadow: ``s <- decay*s + (1-decay)*theta``.
 

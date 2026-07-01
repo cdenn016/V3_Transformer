@@ -143,6 +143,57 @@ def test_generate_is_training_isolated():
     assert torch.isfinite(loss)
 
 
+def test_generate_rejects_invalid_sampler_args():
+    # audit C13 (2026-07-01): the normal (policy_mode='none') path validates its sampler knobs up
+    # front. A negative max_new_tokens would silently no-op (empty loop, prompt returned unchanged);
+    # temperature<=0, out-of-range top_k, and top_p outside (0, 1] previously failed late or produced
+    # invalid probabilities.
+    model = _tiny_model()
+    V = model.cfg.vocab_size
+    prompt = torch.randint(0, V, (2, 3))
+    with pytest.raises(ValueError):
+        model.generate(prompt, -1)
+    with pytest.raises(ValueError):
+        model.generate(prompt, 4, temperature=0.0)
+    for bad_k in (0, V + 1):
+        with pytest.raises(ValueError):
+            model.generate(prompt, 4, top_k=bad_k)
+    for bad_p in (0.0, 1.5):
+        with pytest.raises(ValueError):
+            model.generate(prompt, 4, top_p=bad_p)
+    # max_new_tokens=0 stays valid (>= 0): the prompt comes back unchanged
+    assert torch.equal(model.generate(prompt, 0), prompt)
+    # greedy ignores the sampler knobs, so a nonstandard temperature must still run under greedy
+    out = model.generate(prompt, 2, greedy=True, temperature=0.0)
+    assert out.shape == (2, 3 + 2)
+
+
+def test_generate_kwargs_order():
+    # audit C18 (2026-07-01): the keyword-only block was reordered to the mandated convention
+    # (defined float, defined bool, then Optionals); every knob stays keyword-passable in any order.
+    model = _tiny_model()
+    V = model.cfg.vocab_size
+    prompt = torch.randint(0, V, (1, 3))
+    torch.manual_seed(0)
+    out = model.generate(prompt, max_new_tokens=2, greedy=False, top_k=2, top_p=0.9, temperature=0.7)
+    assert out.shape == (1, 3 + 2)
+    assert (out >= 0).all() and (out < V).all()
+
+
+def test_generate_rejects_efe_rollout_policy_mode():
+    # audit F4 (2026-07-01): VFE3Config accepts policy_mode='efe_rollout' (with horizon>1), but the
+    # generic generate() path only builds a one-step (B, Kp, 1) candidate menu and no H-step candidate
+    # generator exists -- generate() must fail closed with a clear NotImplementedError at dispatch,
+    # not the cryptic mid-scorer candidate-length ValueError.
+    model = _tiny_model(policy_mode="efe_rollout", policy_preference="flat", policy_horizon=2)
+    V = model.cfg.vocab_size
+    prompt = torch.randint(0, V, (1, 3))
+    with pytest.raises(NotImplementedError) as e:
+        model.generate(prompt, 1, greedy=True)
+    msg = str(e.value)
+    assert "candidate menu" in msg and "H-token" in msg
+
+
 def test_policy_mode_rejects_call_time_sampler_knobs():
     # audit F9 (2026-06-28): under a policy scorer, generate() routes through _policy_select, which uses
     # policy_top_k / policy_precision and does NOT consume call-time temperature/top_k/top_p. Those must

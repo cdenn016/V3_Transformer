@@ -348,6 +348,21 @@ def train_step(
         # n_mb/n_tot == 1/grad_accum_steps and this is byte-identical to the prior weighting.
         _mb_tok[:] = [int((tc != -100).sum()) for tc in tgt_chunks]   # counted tokens per microbatch (spread = bias)
         n_tot = max(sum(_mb_tok), 1)
+        # Uneven counted-token microbatches (audit 2026-07-01 C8): the n_mb/n_tot weight below is
+        # exact for the token-mean CE but only APPROXIMATE for the non-CE regularizers (mass_phi,
+        # mstep_self_coupling, lambda_h, gamma), which are means over (B, N)/state and do not scale
+        # with target tokens. The default unpadded loader has equal counts (w == 1/K exactly), so
+        # this warning fires only in the regime where the weighting actually diverges.
+        if grad_accum_steps > 1 and _mb_tok and (max(_mb_tok) != min(_mb_tok)):
+            import warnings
+            warnings.warn(
+                "grad_accum_steps>1 with uneven counted-token microbatches: non-CE regularizers "
+                "(mass_phi, mstep_self_coupling, lambda_h, gamma) are token-weighted by n_mb/n_tot "
+                "rather than by their own reduction, so their accumulated gradient is an "
+                "approximation. Use an unpadded/equal-token loader or grad_accum_steps=1 for the "
+                "exact objective.",
+                RuntimeWarning, stacklevel=2,
+            )
         step_loss = 0.0
         step_ce = 0.0
         for tok_mb, tgt_mb, n_mb in zip(tok_chunks, tgt_chunks, _mb_tok):
@@ -364,6 +379,18 @@ def train_step(
     need_unscale = (grad_clip is not None and grad_clip > 0) or (metrics_out is not None)
     if need_unscale:
         _scaler.unscale_(optimizer)
+    # Finite-GRADIENT gate (audit 2026-07-01 F1): a FINITE scalar loss can still carry a NaN/Inf
+    # parameter gradient through the unrolled E-step on a degenerate batch; stepping AdamW on it
+    # would permanently poison the exp_avg/exp_avg_sq moment buffers. Checked on EVERY step on the
+    # disabled-scaler default path (one extra D2H sync); the ENABLED fp16 scaler path already skips
+    # internally via found_inf, so it stays byte-identical and is not re-checked here.
+    _scaler_enabled = scaler is not None and scaler.is_enabled()
+    grad_finite = True
+    if not _scaler_enabled:
+        _flags = [torch.isfinite(p.grad).all()
+                  for g in optimizer.param_groups
+                  for p in g["params"] if p.grad is not None]
+        grad_finite = bool(torch.stack(_flags).all()) if _flags else True
     if metrics_out is not None:
         # Pre-clip gradient health -- the global L2 norm clip_grad_norm_ RETURNS-and-discards, plus
         # per-ROLE norms (mu/sigma/phi from each group's "role" tag in build_optimizer, aggregated in
@@ -403,12 +430,15 @@ def train_step(
             metrics_out["grad_accum_tok_spread"] = float(max(_mb_tok) - min(_mb_tok))
         if scaler is not None and scaler.is_enabled():          # fp16: surface the loss-scale (Tier-2 health)
             metrics_out["grad_scale"] = float(scaler.get_scale())
-    # NaN/Inf skip on the default (disabled-scaler) path: a non-finite loss means non-finite
-    # gradients, and AdamW's moment buffers would be PERMANENTLY poisoned by a single such step with
-    # no recovery. The fp16 GradScaler path already skips internally via found_inf; mirror that here
-    # by dropping the grads and not stepping when the scaler is disabled (audit 2026-06-17 round 2).
-    _scaler_enabled = scaler is not None and scaler.is_enabled()
-    skip_step = (not _scaler_enabled) and (not math.isfinite(step_loss))
+    # NaN/Inf skip on the default (disabled-scaler) path: a non-finite loss OR a non-finite
+    # parameter gradient (grad_finite above -- a finite loss does NOT imply finite grads) would
+    # PERMANENTLY poison AdamW's moment buffers in a single step with no recovery. The fp16
+    # GradScaler path already skips internally via found_inf; mirror that here by dropping the
+    # grads and not stepping when the scaler is disabled (audits 2026-06-17 r2, 2026-07-01 F1).
+    skip_step = (not _scaler_enabled) and ((not math.isfinite(step_loss)) or (not grad_finite))
+    if metrics_out is not None:                              # expose the gate for tests/CSV
+        metrics_out["step_skipped"] = float(skip_step)
+        metrics_out["grad_finite"]  = float(grad_finite)
     if grad_clip is not None and grad_clip > 0 and not skip_step:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     if skip_step:
@@ -421,9 +451,10 @@ def train_step(
     # of an AdamW step on r -- r is ungrouped/frozen-from-the-optimizer under this mode). No-op for the
     # default gradient r (trained inside optimizer.step above) and for frozen r (learnable_r=False).
     _cfg = model.cfg
-    if _cfg.learnable_r and _cfg.r_update_mode == "barycenter":
-        model.prior_bank.barycenter_r_()
-    scheduler.step()
+    if (not skip_step) and _cfg.learnable_r and _cfg.r_update_mode == "barycenter":
+        model.prior_bank.barycenter_r_()   # gated with the optimizer step: never M-step on poisoned grads
+    scheduler.step()                       # UNCONDITIONAL: resume rebuilds LambdaLR at last_epoch=start_step-1
+    #                                        assuming exactly one scheduler.step per loop iteration
     return step_loss
 
 
@@ -677,7 +708,21 @@ def train(
     if resume_path is not None:
         from vfe3.run_artifacts import load_checkpoint           # local import avoids any import cycle
         start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
-                                     scaler=scaler, cfg=cfg, ema=ema)
+                                     scaler=scaler, cfg=cfg, ema=ema, artifacts=artifacts)
+        # Shuffled-loader resume limitation (audit 2026-07-01 C1): weights/optimizer/RNG ARE
+        # restored, but a RandomSampler's in-flight epoch permutation and intra-epoch cursor are
+        # NOT persisted, so a resumed shuffled run draws a DIFFERENT batch sequence than the
+        # uninterrupted run would have from this step. Warn (resume-scoped only: from-scratch runs
+        # and shuffle=False SequentialSampler loaders never reach this).
+        import warnings
+        _samp = getattr(loader, "sampler", None)
+        if _samp is not None and type(_samp).__name__ == "RandomSampler":
+            warnings.warn(
+                "resume: the training DataLoader shuffles; the pre-interruption shuffle "
+                "permutation and cursor are NOT restored, so a resumed shuffled run is not "
+                "batch-identical to an uninterrupted run (RNG/weights/optimizer ARE restored). "
+                "Use shuffle=False or a deterministic step sampler for a sealed resume.",
+                UserWarning, stacklevel=2)
         # LambdaLR with last_epoch != -1 requires 'initial_lr' on every group; set it from the configured
         # base (not the post-load group['lr'], which the restored optimizer state overwrote with base*cos).
         for group, base in zip(optimizer.param_groups, base_lrs):
@@ -801,19 +846,27 @@ def train(
             if artifacts is not None:
                 # Held-out per-eval probes (validation F decomposition, attention-map structure,
                 # E-step convergence certificate, per-position loss). Best-effort: a replay error
-                # leaves the prior values carried forward, so a viz/replay fault never kills training.
+                # RESETS the probes to NaN (blank CSV cells) so a previous eval's values are never
+                # carried forward as if fresh (audit 2026-07-01 F11), and a viz/replay fault never
+                # kills training.
                 try:
                     last_val_diag.update(_val_diagnostics(model, val_loader, device))
                 except Exception as exc:
                     logger.warning("       (validation diagnostics failed: %s); continuing", exc)
+                    last_val_diag.update({k: float("nan") for k in _VAL_DIAG_KEYS})
                 artifacts.maybe_save_best(step + 1, model, m["ppl"])
                 # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0 of
-                # the live batch). Best-effort inside save_attention_maps: a viz error is logged,
-                # never fatal to the run. Kept at EVAL cadence (one grid per eval, not per log).
-                artifacts.save_attention_maps(step + 1, model.attention_maps(tokens), logger=logger)
-                # Model-coupling (gamma) heatmaps alongside the belief beta maps, in a distinct colour
-                # (viridis vs magma); gamma_attention_maps returns None when the model channel is off -> no-op.
-                artifacts.save_gamma_attention_maps(step + 1, model.gamma_attention_maps(tokens), logger=logger)
+                # the live batch), plus the model-coupling (gamma) heatmaps in a distinct color
+                # (viridis vs magma; gamma_attention_maps returns None when the model channel is
+                # off -> no-op). The model REPLAYS (attention_maps / gamma_attention_maps) are
+                # argument expressions evaluated HERE in the caller, OUTSIDE the save helpers'
+                # internal try/except, so guard them too -- a replay error must never kill training
+                # (audit 2026-07-01 F11). Kept at EVAL cadence (one grid per eval, not per log).
+                try:
+                    artifacts.save_attention_maps(step + 1, model.attention_maps(tokens), logger=logger)
+                    artifacts.save_gamma_attention_maps(step + 1, model.gamma_attention_maps(tokens), logger=logger)
+                except Exception as exc:
+                    logger.warning("       (attention-map replay failed: %s); continuing", exc)
             if ema is not None:
                 ema.restore(model)                       # live SGD weights back before the next train_step
 
@@ -893,7 +946,8 @@ def train(
                 for _gk in ("grad_norm", "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi",
                             "weight_norm_mu", "weight_norm_sigma", "weight_norm_phi",
                             "estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi",
-                            "loss_finite", "grad_scale", "grad_accum_tok_spread"):
+                            "loss_finite", "grad_finite", "step_skipped",
+                            "grad_scale", "grad_accum_tok_spread"):
                     if _gk in step_metrics:
                         row[_gk] = step_metrics[_gk]
             # Gauge M-step geometry diagnostics (D1/EXP-8): cos(nat,grad) and the pullback metric

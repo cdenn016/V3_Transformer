@@ -149,6 +149,10 @@ def test_fisher_trace_diag_full_agree():
     assert ft.shape == (5,)
     assert torch.allclose(ft, (0.5 / sigma).sum(-1), atol=1e-5)
     assert torch.allclose(fisher_trace(torch.diag_embed(sigma)), ft, atol=1e-4)
+    # C18: keyword-only args follow the convention order (defined float eps BEFORE the Optional
+    # diagonal); calling by keyword in that order matches the positional-sigma result.
+    assert torch.allclose(fisher_trace(sigma, eps=1e-9, diagonal=True), ft, atol=1e-6)
+    assert torch.allclose(fisher_trace(torch.diag_embed(sigma), eps=1e-9, diagonal=False), ft, atol=1e-4)
 
 
 def test_attention_entropy_rows_reduces_to_global():
@@ -312,6 +316,39 @@ def test_holonomy_wilson_per_head_decomposition_averages_to_full():
     out = holonomy_wilson_sampled(omega, n_heads=2, n_triples=64, seed=0)
     assert out["per_head"].shape == (2,)
     assert abs(float(out["per_head"].mean()) - float(out["wilson_mean"])) < 1e-5
+
+
+def test_wilson_trace_is_conjugation_invariant():
+    """C6: the Wilson deviation 1 - Re Tr(H)/K is invariant under a per-vertex NON-orthogonal
+    GL(K) conjugation Omega_ij -> g_i Omega_ij g_j^{-1} (the holonomy conjugates, H -> g_i H
+    g_i^{-1}, and Tr is a class function), while the Frobenius ||H - I||_F deviation is
+    frame-dependent and CHANGES -- the invariant/frame-dependent split the labels now assert."""
+    g_rng = torch.Generator().manual_seed(0)
+    N, K = 6, 3
+    omega = (torch.eye(K, dtype=torch.float64).expand(N, N, K, K)
+             + 0.3 * torch.randn(N, N, K, K, generator=g_rng, dtype=torch.float64))
+    # invertible, deliberately NON-orthogonal per-vertex frames g_i = I + small random
+    g_i = (torch.eye(K, dtype=torch.float64).expand(N, K, K)
+           + 0.3 * torch.randn(N, K, K, generator=g_rng, dtype=torch.float64))
+    g_inv = torch.linalg.inv(g_i)
+    omega_conj = torch.einsum("ikl,ijlm,jmn->ijkn", g_i, omega, g_inv)
+
+    wil = holonomy_wilson_sampled(omega, n_triples=64, seed=0)
+    wil_c = holonomy_wilson_sampled(omega_conj, n_triples=64, seed=0)
+    assert abs(float(wil["deviation_mean"]) - float(wil_c["deviation_mean"])) < 1e-5
+
+    fro = holonomy_deviation_sampled(omega, n_triples=64, seed=0)
+    fro_c = holonomy_deviation_sampled(omega_conj, n_triples=64, seed=0)
+    assert abs(float(fro["mean"]) - float(fro_c["mean"])) > 1e-3
+
+
+def test_holonomy_frobenius_and_wilson_both_flat_zero():
+    """C6: both the frame-dependent Frobenius deviation and the gauge-invariant Wilson deviation
+    are ~0 on the flat cocycle -- the labeling split changes reporting, not the flatness oracle."""
+    grp = get_group("glk")(3)
+    omega = compute_transport_operators(0.2 * torch.randn(1, 8, grp.generators.shape[0]), grp)["Omega"][0]
+    assert float(holonomy_deviation_sampled(omega, n_triples=64, seed=0)["mean"]) < 1e-3
+    assert float(holonomy_wilson_sampled(omega, n_triples=64, seed=0)["deviation_mean"]) < 1e-3
 
 
 def test_holonomy_wilson_rejects_indivisible_head_count():

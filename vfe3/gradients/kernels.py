@@ -230,7 +230,7 @@ def belief_gradients(
     irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
-    omega_builder:             Optional[Callable]     = None,   # (mu_q, mu_k) -> transport (regime_ii oracle rebuild)
+    omega_builder:             Optional[Callable]     = None,   # (mu_q, sigma_q, mu_k, sigma_k) -> transport (regime_ii oracle rebuild)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Belief gradient: hand kernel for filtering+gaussian_diagonal+KL+canonical+flat, else oracle.
 

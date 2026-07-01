@@ -392,3 +392,69 @@ def test_regime_ii_covariant_omega_transforms_covariantly():
     assert torch.allclose(omega_tr, expected, atol=1e-4, rtol=1e-4), (
         f"covariance law violated: max abs diff {(omega_tr - expected).abs().max().item():.3e}")
     assert float(holonomy_deviation(omega_base[0])) > 1e-2               # genuinely curved (non-flat)
+
+
+# --- audit 2026-07-01 C4: the oracle threads its own sigma leaves into the omega builder ----------
+from vfe3.gradients.oracle import belief_gradients_autograd
+from vfe3.inference.e_step import build_belief_transport
+
+
+def _oracle_fixture(seed=0, B=1, N=4, K=8, n_heads=2):
+    phi, mu, sigma, grp = _phi_mu_sigma(seed=seed, B=B, N=N, K=K, n_heads=n_heads)
+    mu = 3.0 * mu                                        # inflate so the invariant features carry signal
+    g = torch.Generator().manual_seed(seed + 100)
+    mu_p    = torch.randn(B, N, K, generator=g)
+    sigma_p = torch.rand(B, N, K, generator=g) + 0.5
+    n_gen = grp.generators.shape[0]
+    M = 0.3 * torch.randn(n_gen, 3, generator=g)
+    return phi, mu, sigma, mu_p, sigma_p, grp, M
+
+
+def test_covariant_detached_oracle_includes_sigma_grad():
+    """C4: on the DETACHED oracle path (create_graph=False -- eval / diagnostics / no_grad E-step)
+    the omega builder must receive the oracle's OWN sigma leaves, so grad_sigma carries
+    d Omega/d sigma exactly as the live unrolled path does. Before the fix the builder closed
+    over the belief covariance, so the detached path silently dropped it (probe gap ~0.37)."""
+    phi, mu, sigma, mu_p, sigma_p, grp, M = _oracle_fixture(seed=12)
+
+    def builder(mu_q, sigma_q, mu_k, sigma_k):
+        return build_belief_transport(
+            phi, grp, transport_mode="regime_ii_covariant",
+            mu=mu_q, sigma=sigma_q, mu_key=mu_k, sigma_key=sigma_k, connection_M=M,
+        )
+
+    kw = dict(gradient_mode="filtering", irrep_dims=grp.irrep_dims, omega_builder=builder)
+    # detached path: grad-free inputs -> the oracle clones its own leaves (create_graph=False)
+    g_mu_det, g_sig_det = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, None, **kw)
+    # live reference: create_graph=True with grad-carrying beliefs aliases the leaves, so
+    # d Omega/d sigma is included by construction -- the ground truth the detached path must match
+    mu_live = mu.clone().requires_grad_(True)
+    sigma_live = sigma.clone().requires_grad_(True)
+    g_mu_ref, g_sig_ref = belief_gradients_autograd(mu_live, sigma_live, mu_p, sigma_p, None,
+                                                    create_graph=True, **kw)
+    assert torch.allclose(g_sig_det, g_sig_ref.detach(), atol=1e-5, rtol=1e-4)
+    assert torch.allclose(g_mu_det, g_mu_ref.detach(), atol=1e-5, rtol=1e-4)
+
+
+def test_omega_builder_receives_four_tensor_args():
+    """C4 contract pin: the oracle invokes omega_builder with 4 positional tensors
+    (mu_q, sigma_q, mu_k, sigma_k); under filtering the key slots are detached and the query
+    slots are the differentiation leaves."""
+    phi, mu, sigma, mu_p, sigma_p, grp, M = _oracle_fixture(seed=13)
+    calls = []
+
+    def spy(mu_q, sigma_q, mu_k, sigma_k):
+        calls.append((mu_q, sigma_q, mu_k, sigma_k))
+        return build_belief_transport(
+            phi, grp, transport_mode="regime_ii_covariant",
+            mu=mu_q, sigma=sigma_q, mu_key=mu_k, sigma_key=sigma_k, connection_M=M,
+        )
+
+    belief_gradients_autograd(mu, sigma, mu_p, sigma_p, None,
+                              gradient_mode="filtering", irrep_dims=grp.irrep_dims,
+                              omega_builder=spy)
+    assert len(calls) == 1
+    mu_q, sigma_q, mu_k, sigma_k = calls[0]
+    assert all(isinstance(t, torch.Tensor) for t in calls[0])
+    assert mu_q.requires_grad and sigma_q.requires_grad             # differentiation leaves
+    assert not mu_k.requires_grad and not sigma_k.requires_grad     # filtering: key slots frozen

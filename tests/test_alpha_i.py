@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from vfe3.alpha_i import alpha_regularizer, register_alpha, self_coupling_alpha
@@ -101,3 +102,76 @@ def test_alpha_grad_coefficient_state_dependent_is_alpha_star():
     b0, c0 = 0.5, 2.0
     coef = alpha_gradient_coefficient(kl, mode="state_dependent", b0=b0, c0=c0)
     assert torch.allclose(coef, c0 / (b0 + kl), atol=1e-6)
+
+
+# --- audit 2026-07-01 F12-registry: duplicate keys fail closed across the registry decorators ---
+# A second @register under an existing name used to silently shadow the first, so a
+# config-selected seam could dispatch to an unintended implementation. Each decorator now
+# raises KeyError on a duplicate key unless override=True is passed (the deliberate
+# replacement escape hatch). register_alpha lives here; register_prior / register_compose
+# share the guard and are mirrored below.
+
+
+def test_register_alpha_duplicate_raises_and_override_replaces():
+    from vfe3.alpha_i import _ALPHAS, _ALPHA_PER_COORD
+    name = "_test_dup_alpha"
+    try:
+        @register_alpha(name)
+        def _first(kl, **kwargs):
+            return torch.ones_like(kl), torch.zeros_like(kl)
+
+        with pytest.raises(KeyError, match="already registered"):
+            @register_alpha(name)
+            def _second(kl, **kwargs):
+                return kl, torch.zeros_like(kl)
+
+        assert _ALPHAS[name] is _first                    # the first registration survives
+
+        @register_alpha(name, override=True)
+        def _third(kl, **kwargs):
+            return 2.0 * torch.ones_like(kl), torch.zeros_like(kl)
+
+        assert _ALPHAS[name] is _third                    # explicit override replaces
+    finally:
+        _ALPHAS.pop(name, None)
+        _ALPHA_PER_COORD.pop(name, None)
+
+
+def test_register_prior_duplicate_raises_and_override_replaces():
+    from vfe3.attention_prior import _PRIORS, register_prior
+    name = "_test_dup_prior"
+    try:
+        @register_prior(name)
+        def _first(n_query, n_key, **kwargs):
+            return torch.zeros(n_query, n_key)
+
+        with pytest.raises(KeyError, match="already registered"):
+            register_prior(name)(_first)
+
+        @register_prior(name, override=True)
+        def _second(n_query, n_key, **kwargs):
+            return torch.zeros(n_query, n_key)
+
+        assert _PRIORS[name] is _second
+    finally:
+        _PRIORS.pop(name, None)
+
+
+def test_register_compose_duplicate_raises_and_override_replaces():
+    from vfe3.geometry.lie_ops import _COMPOSE, register_compose
+    name = "_test_dup_compose"
+    try:
+        @register_compose(name)
+        def _first(phi1, phi2, generators, **kwargs):
+            return phi1 + phi2
+
+        with pytest.raises(KeyError, match="already registered"):
+            register_compose(name)(_first)
+
+        @register_compose(name, override=True)
+        def _second(phi1, phi2, generators, **kwargs):
+            return phi1 + phi2
+
+        assert _COMPOSE[name] is _second
+    finally:
+        _COMPOSE.pop(name, None)

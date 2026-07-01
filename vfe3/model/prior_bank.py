@@ -471,16 +471,20 @@ class PriorBank(nn.Module):
         regularized with the SAME eps the gaussian_full closed form adds to both covariances
         (families/gaussian.py renyi_closed_form), so the diagonal-prior closed form is value-equal
         to ``_decode_full`` (the per-pair Cholesky seam) without ever forming a (B, N, V, K, K)
-        workspace. ``safe_cholesky`` (jittered, never raises) yields a finite log-det; the SPD
-        retraction keeps Sigma_q PD in training, so the gaussian_full all-rounds-fail NaN mask is
-        not replicated here (a negligible degenerate edge the dense path maps to a -inf logit).
+        workspace. ``safe_cholesky`` (jittered, never raises) yields a finite log-det where its
+        ``ok`` mask is True; a position where every jitter round fails (non-PD Sigma_q) gets
+        logdet_q = -inf, so per_pos = K + logdet_q drives every vocab logit to -inf there --
+        matching the dense ``_decode_full`` path (gaussian_full's ok-gating -> NaN -> kl_max=inf
+        -> -inf logit). The SPD retraction keeps Sigma_q PD in training, so ok is all-True and
+        the -inf branch never engages on the pure path.
         """
         K = sigma_q.shape[-1]
         eye = torch.eye(K, device=sigma_q.device, dtype=sigma_q.dtype)
         sq_reg = sigma_q + self.eps * eye                                  # (B, N, K, K)
         diag_sq_reg = torch.diagonal(sq_reg, dim1=-2, dim2=-1)             # (B, N, K) = diag(Sigma_q)+eps
-        L, _ = safe_cholesky(sq_reg, eps=self.eps, rounds=5)
+        L, ok = safe_cholesky(sq_reg, eps=self.eps, rounds=5)
         logdet_q = _logdet_chol(L)                                         # (B, N)
+        logdet_q = torch.where(ok, logdet_q, logdet_q.new_full((), float("-inf")))
         return diag_sq_reg, logdet_q
 
     def decode_ce_full_chunked(

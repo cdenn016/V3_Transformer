@@ -492,3 +492,112 @@ def test_decode_mode_linear_stays_a_rejected_second_gate():
     OTHER seams."""
     with pytest.raises(ValueError):
         VFE3Config(decode_mode="linear")
+
+
+# --- audit 2026-07-01 fixes (F2-config, F12, F7, C5, F9) ---
+
+
+def test_sigma_max_validated():
+    r"""Audit 2026-07-01 F2: sigma_max caps the covariance in the SPD retractions
+    (clamp max=sigma_max), so a nonfinite or sub-eps cap must be rejected at construction --
+    it would push the clamped covariance below eps / negative / NaN."""
+    with pytest.raises(ValueError):
+        VFE3Config(sigma_max=-1.0)
+    with pytest.raises(ValueError):
+        VFE3Config(sigma_max=float("nan"))
+    with pytest.raises(ValueError):
+        VFE3Config(sigma_max=1e-9)                        # below the default eps=1e-6
+    assert VFE3Config(sigma_max=10.0).sigma_max == 10.0   # the default cap still constructs
+
+
+def test_bool_fields_reject_truthy_non_bools():
+    r"""Audit 2026-07-01 F12: trust_resume_checkpoint / generate_figures / use_ema are consumed
+    by truthiness (load_checkpoint reads bool(cfg.trust_resume_checkpoint), so the string
+    "False" would coerce to True and enable the unsafe weights_only=False fallback). Non-bool
+    values are rejected at construction; real-bool defaults still construct."""
+    with pytest.raises(ValueError):
+        VFE3Config(trust_resume_checkpoint="False")
+    with pytest.raises(ValueError):
+        VFE3Config(generate_figures=1)
+    with pytest.raises(ValueError):
+        VFE3Config(use_ema="0")
+    cfg = VFE3Config()
+    assert cfg.trust_resume_checkpoint is False and cfg.generate_figures is True
+
+
+def test_max_steps_and_warmup_steps_validated():
+    r"""Audit 2026-07-01 F12: max_steps feeds range(start_step, n_steps) (a float TypeErrors
+    late in range(); 0 is an empty training loop) and warmup_steps feeds the scheduler
+    (negative is meaningless; 0 = no warmup stays legal via the scheduler's max(1, ...))."""
+    with pytest.raises(ValueError):
+        VFE3Config(max_steps=0)
+    with pytest.raises(ValueError):
+        VFE3Config(max_steps=4.0)
+    with pytest.raises(ValueError):
+        VFE3Config(warmup_steps=-1)
+    assert VFE3Config(warmup_steps=0).warmup_steps == 0   # no-warmup is a valid config
+    assert VFE3Config().max_steps == 15000                # default still constructs
+
+
+def test_bch_pe_order_zero_rejected_when_bch_compose_active():
+    r"""Audit 2026-07-01 F12: compose_bch adds the Dynkin corrections only at order >= 1, so
+    pos_phi_compose='bch' with bch_pe_order=0 degrades to plain additive composition still
+    labeled BCH -- rejected. Inert under pos_phi='none' (never reaches compose_bch)."""
+    with pytest.raises(ValueError):
+        VFE3Config(pos_phi="learned", pos_phi_compose="bch", bch_pe_order=0)
+    assert VFE3Config().bch_pe_order == 4                 # default (order 4) constructs
+    VFE3Config(pos_phi="none", bch_pe_order=0)            # inert combination -> accepted
+
+
+def test_nonflat_transport_with_active_model_channel_warns():
+    r"""Audit 2026-07-01 F7 (safe variant): the s-channel (_gamma_energy / _refine_s) transports
+    the s tables under the FLAT phi-cocycle only, so a non-flat belief transport plus an active
+    model channel (lambda_gamma>0 or s_e_step=True) runs different connections per channel --
+    the model-channel comparison is not gauge-covariant. Non-breaking UserWarning."""
+    with pytest.warns(UserWarning, match="non-flat"):
+        VFE3Config(transport_mode="regime_ii", lambda_gamma=1.0)
+    with pytest.warns(UserWarning, match="non-flat"):
+        VFE3Config(transport_mode="regime_ii_covariant", s_e_step=True,
+                   prior_source="model_channel", lambda_gamma=1.0)
+
+
+def test_flat_or_inactive_model_channel_no_nonflat_warning():
+    r"""Audit 2026-07-01 F7 negative control: flat transport with an active model channel, and
+    non-flat transport with an INACTIVE model channel (lambda_gamma=0, s_e_step=False), must
+    NOT emit the flat s-cocycle warning."""
+    import warnings
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        VFE3Config(transport_mode="flat", lambda_gamma=1.0, s_e_step=True,
+                   prior_source="model_channel")
+        VFE3Config(transport_mode="regime_ii", lambda_gamma=0.0)
+    assert not [r for r in rec if "FLAT phi-cocycle" in str(r.message)]
+
+
+def test_regime_ii_covariant_diagonal_family_warns_controlled_approximation():
+    r"""Audit 2026-07-01 C5 (safe variant): the diagonal covariance cone is not closed under a
+    general GL(K) congruence Omega Sigma Omega^T, so regime_ii_covariant with
+    family='gaussian_diagonal' is a controlled approximation of the exact covariant transport --
+    non-breaking UserWarning."""
+    with pytest.warns(UserWarning, match="CONTROLLED APPROXIMATION"):
+        VFE3Config(transport_mode="regime_ii_covariant", family="gaussian_diagonal")
+
+
+def test_regime_ii_covariant_full_family_no_approximation_warning():
+    r"""Audit 2026-07-01 C5 negative control: family='gaussian_full' IS closed under the GL(K)
+    congruence, so no approximation warning fires (the complementary gaussian_full fp32
+    numerics warning may still fire; only the approximation label is asserted absent)."""
+    import warnings
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        VFE3Config(transport_mode="regime_ii_covariant", family="gaussian_full",
+                   decode_mode="full")
+    assert not [r for r in rec if "CONTROLLED APPROXIMATION" in str(r.message)]
+
+
+def test_force_large_figures_default_off():
+    r"""Audit 2026-07-01 F9 (safe variant): force_large_figures is the opt-in override for the
+    finalize_run figure-pass memory guard; default False keeps the guard so small-run behavior
+    is unchanged."""
+    assert VFE3Config().force_large_figures is False
+    assert VFE3Config(force_large_figures=True).force_large_figures is True

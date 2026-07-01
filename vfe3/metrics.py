@@ -55,6 +55,10 @@ def holonomy_deviation(
 ) -> torch.Tensor:                       # () mean ||Omega_ij Omega_jk Omega_ki - I||_F
     r"""Curvature proxy: mean Frobenius departure of the triangle holonomy from identity.
 
+    FRAME-DEPENDENT (Frobenius; conjugation-invariant only for orthogonal gauges): under a GL(K)
+    frame change the holonomy conjugates, H -> g H g^{-1}, and ||H - I||_F is preserved only for
+    orthogonal/unitary g -- use :func:`holonomy_wilson_sampled` for gauge-invariant curvature.
+
     For a flat (Regime I) cocycle Omega_ij = exp(phi_i)exp(-phi_j) every triangle closes
     (H_ijk = I) so the deviation is ~0; a non-flat / non-cocycle transport gives > 0.
     """
@@ -245,8 +249,8 @@ def fisher_trace(
     sigma:    torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
 
     *,
-    diagonal: Optional[bool] = None,
     eps:      float = 1e-12,
+    diagonal: Optional[bool] = None,
 ) -> torch.Tensor:                       # (...) per-token Fisher-information trace in the mean block
     r"""Per-token Fisher-information trace of the Gaussian mean block, tr(Sigma^{-1}) / 2.
 

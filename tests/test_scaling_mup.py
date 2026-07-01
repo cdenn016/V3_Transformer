@@ -2,6 +2,9 @@ r"""Tests for the muP width-stability scaling route (F1/EXP-6) added 2026-06-21.
 
 route_grow_k_mup emits a matched fixed-LR vs muP pair per width, each with the per-cell kl_max=8*K
 confound fix, and every cell builds a valid VFE3Config/VFEModel."""
+import json
+from dataclasses import asdict
+
 import pytest
 import torch
 
@@ -39,3 +42,23 @@ def test_grow_k_mup_cells_build():
     for c in scaling.route_grow_k_mup([20, 40], n_heads=4, anchor_k=20):
         d = scaling._cell_cfg_dict({**c["overrides"], "vocab_size": 64}, 0, 1)
         assert VFEModel(VFE3Config(**d)) is not None
+
+
+def test_cell_is_current_checks_max_tokens(tmp_path):
+    r"""max_tokens (the loader train-token cap) is not a VFE3Config field, so config.json alone
+    cannot distinguish a capped smoke cell from a full run: _cell_is_current must also compare
+    the max_tokens persisted in scaling_cell.json."""
+    run_dir = tmp_path / "cell"
+    run_dir.mkdir()
+    ds = "wikitext-103"
+    cfg = VFE3Config(**scaling._cell_cfg_dict({"vocab_size": 64}, 0, 1))
+    (run_dir / "summary.json").write_text("{}", encoding="utf-8")
+    (run_dir / "config.json").write_text(json.dumps({
+        "dataset": ds,
+        "config": json.loads(json.dumps(asdict(cfg), default=str)),
+    }), encoding="utf-8")
+    (run_dir / "scaling_cell.json").write_text(
+        json.dumps({"label": "cell", "max_tokens": 1000}), encoding="utf-8")
+
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is True
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=None) is False
