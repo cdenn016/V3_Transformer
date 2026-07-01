@@ -241,6 +241,10 @@ def _build_regime_ii(
 ) -> TransportDict:
     r"""Regime-II edge-relaxed (NON-FLAT) transport (spec eq:edge_relaxed_omega).
 
+    GAUGE-FIXED / NON-COVARIANT: delta_ij = mu_i^T W mu_j is gauge-invariant only at W=0; a
+    trained nonzero W breaks gauge equivariance. For exact GL-covariant transport use
+    transport_mode='regime_ii_covariant' (Route B).
+
     NEURAL-NETWORK EXCEPTION (sanctioned, default-OFF): this builder consumes the LEARNED
     bilinear connection ``connection_W`` (an nn.Parameter on the model, trained by backprop on
     CE). The no-NN flat builder (:func:`_build_flat`) is the default and the pure path; this is
@@ -306,51 +310,63 @@ def _build_regime_ii(
     fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
 
-    generators = group.generators                                              # (n_gen, K, K)
-    # delta_ij^a = cocycle_relaxation * mu_i^T W^a mu_j  -> (B, N, N, n_gen). ``mu`` fills the
-    # QUERY (i) slot and ``mu_key`` the KEY (j) slot; the VALUES are identical for any detach
-    # combination, but the filtering oracle passes a detached key slot so d delta / d mu flows
-    # query-side only (mean-field coordinate ascent).
     mu_k = mu_key if mu_key is not None else mu
-    delta = cocycle_relaxation * torch.einsum("bik,akl,bjl->bija", mu, connection_W, mu_k)
-    # Self-edge exclusion (audit 2026-06-10 F4): the connection is an EDGE object; the degenerate
-    # i==i "edge" transports along the constant path, so Omega_ii stays exp(phi_i) exp(-phi_i) = I
-    # exactly as on the flat path. Without this, delta_ii = mu_i^T W^a mu_i injects a spurious
-    # nonzero self-energy E_ii into the (unmasked) attention softmax.
-    n_tok = delta.shape[1]
-    eye = torch.eye(n_tok, dtype=torch.bool, device=delta.device)
-    delta = delta.masked_fill(eye.view(1, n_tok, n_tok, 1), 0.0)
-    # delta_ij . G = sum_a delta_ij^a G_a  -> (B, N, N, K, K) Lie-algebra edge matrix
-    delta_mat = torch.einsum("bija,akl->bijkl", delta, generators)
-    # Smooth per-edge cap on the EMBEDDED MATRIX Frobenius norm (audit 2026-06-13 M3, supersedes the
-    # 2026-06-10 F3 coordinate-norm cap). stable_matrix_exp_pair's exactness needs ||delta . G||_F <
-    # max_norm; that equals ||delta||_2 ONLY for orthoNORMAL bases (Gram=I: glk/block_glk). For the
-    # orthogonal-but-not-orthonormal towers (so_n/sp_n: Gram diag up to ~12) the old coordinate cap
-    # left ||delta . G||_F = sqrt(Gram)*||delta||_2 ABOVE the hard clamp, so the edge exp silently
-    # became the clamped surrogate. Capping the embedded operator's Frobenius norm directly bounds it
-    # below max_norm for ANY basis. delta is QUADRATIC in the unconstrained mean scale; the squared
-    # norm (pow(2).sum, NO sqrt) keeps the cap's gradient finite at delta_mat=0 (the W=0 oracle and
-    # d Omega/d W at W=0 are untouched -- the zero-norm NaN-grad trap), the map is the identity to
-    # O(||M||_F^2/cap^2) near zero and STRICTLY monotone in cocycle_relaxation (the homotopy never
-    # saturates). For block_glk (Gram=I) ||delta . G||_F == ||delta||_2, so this is value-equivalent
-    # to the old coordinate cap (analytically equal; ~5e-7 fp32 op-reorder from embed-then-cap), and
-    # regime_ii is opt-in -- the default flat transport never reaches this builder at all.
-    fro_sq = delta_mat.pow(2).sum(dim=(-2, -1), keepdim=True)
-    delta_mat = delta_mat * torch.rsqrt(1.0 + fro_sq / (delta_soft_cap * delta_soft_cap))
-    # Per-edge group element exp(delta_ij . G); reuse the stable block-exp machinery
-    # (only_forward: the edge factor enters Omega once, no exp(-delta) needed). exp_dim keys the
-    # float64-island decision on the dimension actually exponentiated -- the per-head block --
-    # so the O(N^2) edge exps of a block-diagonal group run at the block's own precision instead
-    # of upcasting the whole (B, N, N, K, K) batch to float64 whenever K >= 20 (audit 2026-06-10
-    # F8c; the soft cap above keeps the blocks in the well-conditioned exp regime).
-    block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
-    exp_delta, _ = stable_matrix_exp_pair(
-        delta_mat, skew_symmetric=group.skew_symmetric, only_forward=True, block_dims=block_dims,
-        exp_dim=(max(block_dims) if block_dims is not None else None),
-    )                                                                          # (B, N, N, K, K)
 
-    # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
-    omega = torch.einsum("bikl,bijlm,bjmn->bijkn", exp_phi, exp_delta, exp_neg_phi)
+    generators = group.generators                                              # (n_gen, K, K)
+    block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
+    exp_dim    = max(block_dims) if block_dims is not None else None
+
+    B, N, K = mu.shape[0], mu.shape[1], mu.shape[-1]
+    cols  = torch.arange(N, device=mu.device)                                  # key indices (self-edge mask)
+    chunk = _regime_ii_query_chunk(B, N, K)
+
+    # Build Omega one QUERY-CHUNK at a time (audit 2026-07-01 F10, porting the covariant builder's
+    # chunking): only (B, chunk, N, K, K) of each dense transient -- the edge Lie-algebra matrix,
+    # its exponential, and the output Omega chunk -- is live at once. There is no cross-query
+    # reduction, so each (i, j) operator is identical to a single-chunk build (chunk >= N collapses
+    # to the original single-pass path bit-for-bit; small diagnostic builds stay one chunk).
+    omega_chunks: List[torch.Tensor] = []
+    for i0 in range(0, N, chunk):
+        i1        = min(i0 + chunk, N)
+        exp_phi_c = exp_phi[:, i0:i1]                                          # (B, C, K, K)
+        # delta_ij^a = cocycle_relaxation * mu_i^T W^a mu_j -> (B, C, N, n_gen). ``mu`` fills the
+        # QUERY (i) slot and ``mu_key`` the KEY (j) slot; the VALUES are identical for any detach
+        # combination, but the filtering oracle passes a detached key slot so d delta / d mu flows
+        # query-side only (mean-field coordinate ascent).
+        delta_c   = cocycle_relaxation * torch.einsum(
+            "bik,akl,bjl->bija", mu[:, i0:i1], connection_W, mu_k)             # (B, C, N, n_gen)
+        # Self-edge exclusion (audit 2026-06-10 F4): the connection is an EDGE object; the
+        # degenerate i==i "edge" transports along the constant path, so Omega_ii stays
+        # exp(phi_i) exp(-phi_i) = I exactly as on the flat path (else delta_ii injects a spurious
+        # self-energy into the unmasked softmax). The diagonal column for local row c is the
+        # GLOBAL query index i0 + c (mirrors the covariant builder's masking).
+        rows      = torch.arange(i0, i1, device=delta_c.device)                # (C,) global query indices
+        self_edge = rows.unsqueeze(-1) == cols.unsqueeze(0)                    # (C, N) bool
+        delta_c   = delta_c.masked_fill(self_edge.view(1, i1 - i0, N, 1), 0.0)
+        # delta_ij . G = sum_a delta_ij^a G_a -> (B, C, N, K, K) Lie-algebra edge matrix
+        delta_mat_c = torch.einsum("bija,akl->bijkl", delta_c, generators)
+        # Smooth per-edge cap on the EMBEDDED MATRIX Frobenius norm (audit 2026-06-13 M3,
+        # supersedes the 2026-06-10 F3 coordinate-norm cap): bounds ||delta . G||_F below
+        # stable_matrix_exp_pair's hard clamp for ANY generator basis (the coordinate cap
+        # underbounded the operator on so_n/sp_n towers). The squared norm (pow(2).sum, NO sqrt)
+        # keeps the cap's gradient finite at delta_mat=0 (the W=0 oracle and d Omega/d W at W=0
+        # are untouched -- the zero-norm NaN-grad trap) and the map is STRICTLY monotone in
+        # cocycle_relaxation (the homotopy never saturates).
+        fro_sq      = delta_mat_c.pow(2).sum(dim=(-2, -1), keepdim=True)
+        delta_mat_c = delta_mat_c * torch.rsqrt(1.0 + fro_sq / (delta_soft_cap * delta_soft_cap))
+        # Per-edge group element exp(delta_ij . G); reuse the stable block-exp machinery
+        # (only_forward: the edge factor enters Omega once, no exp(-delta) needed). exp_dim keys
+        # the float64-island decision on the per-head block actually exponentiated (audit
+        # 2026-06-10 F8c; the soft cap above keeps the blocks in the well-conditioned exp regime).
+        exp_delta_c, _ = stable_matrix_exp_pair(
+            delta_mat_c, skew_symmetric=group.skew_symmetric, only_forward=True,
+            block_dims=block_dims, exp_dim=exp_dim,
+        )                                                                      # (B, C, N, K, K)
+        # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
+        omega_chunks.append(
+            torch.einsum("bikl,bijlm,bjmn->bijkn", exp_phi_c, exp_delta_c, exp_neg_phi))
+
+    omega = torch.cat(omega_chunks, dim=1) if len(omega_chunks) > 1 else omega_chunks[0]
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
@@ -694,6 +710,7 @@ def stable_matrix_exp_pair(
     dim_threshold:  int             = 20,
     skew_symmetric: bool            = False,
     only_forward:   bool            = False,
+    clamp_monitor:  bool            = False,   # opt-in: warn when the Frobenius clamp fires (host sync)
     block_dims:     Optional[List[int]] = None,   # per-block sizes (sum==d) for a block-diagonal M
     exp_dim:        Optional[int]       = None,   # dimension for the float64-island decision (None -> d)
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -705,8 +722,10 @@ def stable_matrix_exp_pair(
     ``max_norm``, so the returned factor is ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)`` -- the
     singular values / determinant of the returned operator differ from the true exponential. This
     is a stability clamp on extreme inputs only; keep ||phi|| (and the regime_ii edge delta) below
-    ``max_norm`` to stay exact. A per-call runtime monitor is intentionally omitted: detecting
-    activation needs a tensor reduction (a host sync) on this hot path, which the perf budget avoids.
+    ``max_norm`` to stay exact. The per-call runtime monitor is OFF by default: detecting
+    activation needs a tensor reduction (a host sync) on this hot path, which the perf budget
+    avoids. Pass ``clamp_monitor=True`` (opt-in diagnostic) to accept that sync and emit a
+    RuntimeWarning whenever the clamp fires -- the returned factor is then a surrogate, not exp(M).
 
     ``block_dims`` (audit 4b): when M is block-diagonal with these blocks (e.g. block_glk's
     GL(d_head)^H), exp(M) is exactly block-diagonal with the per-block exponentials, so each
@@ -735,6 +754,15 @@ def stable_matrix_exp_pair(
     with torch.no_grad():
         mat_norm = matrix.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
         scale = (max_norm / mat_norm).clamp(max=1.0)
+        if clamp_monitor:
+            frac = (scale < 1.0).float().mean()
+            if bool(frac > 0):
+                import warnings
+                warnings.warn(
+                    f'stable_matrix_exp_pair: Frobenius clamp active on {float(frac):.1%} of matrices '
+                    f'(max_norm={max_norm}); returned factor is a surrogate, not exp(M).',
+                    RuntimeWarning, stacklevel=2,
+                )
     matrix = matrix * scale
 
     d = matrix.shape[-1]

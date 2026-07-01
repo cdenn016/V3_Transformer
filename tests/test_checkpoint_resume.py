@@ -152,6 +152,86 @@ def test_resume_matches_uninterrupted_run_geometric_mstep(tmp_path):
         torch.testing.assert_close(a, c, atol=1e-6, rtol=1e-5)   # gauge-momentum round-trips correctly
 
 
+def _shuffled_loader(seq_len: int = 8, bs: int = 4, n: int = 480,
+                     data_seed: int = 123, loader_seed: int = 0) -> DataLoader:
+    # NONCONSTANT random stream + shuffle=True (RandomSampler): distinct windows, so the batch
+    # sequence actually depends on the sampler's in-flight epoch permutation.
+    dg = torch.Generator().manual_seed(data_seed)
+    g = torch.Generator().manual_seed(loader_seed)
+    base = torch.randint(0, 6, (n,), generator=dg)
+    ds = TokenWindows(base.to(torch.long), seq_len)
+    return DataLoader(ds, batch_size=bs, shuffle=True, drop_last=True, generator=g)
+
+
+def test_shuffled_resume_warns_and_is_not_batch_equivalent(tmp_path):
+    r"""C1 (audit 2026-07-01, documented limitation): a RandomSampler's epoch permutation and
+    intra-epoch cursor are NOT persisted, so a resumed SHUFFLED run draws a different batch
+    sequence than the uninterrupted run (weights/optimizer/RNG ARE restored). Resume must WARN,
+    and this test PINS the non-equivalence so it cannot silently change."""
+    cfg = _cfg(checkpoint_interval=2)
+
+    torch.manual_seed(0)                                        # Run A: straight through 4 steps
+    model_a = VFEModel(cfg)
+    losses_a = train(model_a, _shuffled_loader(), cfg, n_steps=4)
+
+    torch.manual_seed(0)                                        # Run B: identical first 2 steps + checkpoint
+    model_b = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model_b)
+    train(model_b, _shuffled_loader(), cfg, n_steps=2, artifacts=art)
+    ckpt = tmp_path / "run" / "checkpoints" / "step_2.pt"
+    assert ckpt.exists()
+
+    model_c = VFEModel(cfg)                                     # Run C: resume with a FRESH iterator
+    with pytest.warns(UserWarning, match="not batch-identical"):
+        losses_c = train(model_c, _shuffled_loader(), cfg, n_steps=4, resume_from=ckpt)
+    assert len(losses_c) == 2
+    # The resumed stream restarts the epoch permutation, so steps 2-3 see DIFFERENT batches than
+    # run A's steps 2-3 (same weights at step 2 -> the loss values diverge). Documents the gap.
+    assert losses_c != losses_a[2:]
+
+
+def test_resume_restores_best_val_state(tmp_path):
+    r"""C2 (audit 2026-07-01): best_val_ppl/best_step are bundled by save_checkpoint and restored
+    into the RunArtifacts passed to load_checkpoint, so a resumed continuation with no post-resume
+    improvement still reports the run-wide best."""
+    cfg = _cfg()
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    art = RunArtifacts(tmp_path / "a", cfg, model)
+    assert art.maybe_save_best(3, model, 8.5) is True           # model-selection state to carry over
+    art.save_checkpoint(4, model, opt, cfg)
+
+    fresh = VFEModel(cfg)
+    new_art = RunArtifacts(tmp_path / "b", cfg, fresh)
+    assert new_art.best_val_ppl == float("inf") and new_art.best_step is None
+    load_checkpoint(tmp_path / "a" / "checkpoints" / "step_4.pt", fresh, artifacts=new_art)
+    assert new_art.best_val_ppl == 8.5
+    assert new_art.best_step == 3
+
+
+def test_resume_with_ema_from_non_ema_ckpt_shadow_tracks_loaded_weights(tmp_path):
+    r"""C3 (audit 2026-07-01): resuming a use_ema=True run from a use_ema=False checkpoint (no
+    bundled ema_state) must reseed the shadow from the LOADED weights, not the pre-load fresh
+    init. With zero remaining steps the final ``copy_to`` writes the shadow into the model, so
+    the resumed model must sit exactly at the checkpoint weights."""
+    cfg_a = _cfg(checkpoint_interval=2, use_ema=False)
+    torch.manual_seed(0)
+    model_a = VFEModel(cfg_a)
+    art = RunArtifacts(tmp_path / "run", cfg_a, model_a)
+    train(model_a, _const_loader(), cfg_a, n_steps=2, artifacts=art)
+    saved = _params(model_a)
+    ckpt = tmp_path / "run" / "checkpoints" / "step_2.pt"
+    assert torch.load(ckpt, weights_only=False)["ema_state"] is None   # genuinely a non-EMA bundle
+
+    cfg_b = _cfg(checkpoint_interval=2, use_ema=True, ema_decay=0.9)
+    torch.manual_seed(1)                                        # a DIFFERENT fresh init than the saved weights
+    model_b = VFEModel(cfg_b)
+    train(model_b, _const_loader(), cfg_b, n_steps=2, resume_from=ckpt)   # zero remaining steps
+    for s, b in zip(saved, _params(model_b)):
+        assert torch.equal(s, b)                                # shadow == loaded weights, not fresh init
+
+
 def test_resume_from_cfg_field_is_picked_up(tmp_path):
     r"""cfg.resume_from (click-to-run) is honored when no explicit resume_from arg is passed."""
     cfg = _cfg(checkpoint_interval=2)

@@ -48,6 +48,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each
 import copy
 import csv
 import gc
+import hashlib
 import json
 import logging
 import time
@@ -1199,6 +1200,10 @@ def _expand_range(spec: List[Union[int, float]]) -> List[Union[int, float]]:
     start, stop, step = spec
     if step == 0:
         raise ValueError("'range' step must be non-zero")
+    if start != stop and (stop - start) * step < 0:          # sign-mismatched -> empty sweep otherwise
+        raise ValueError(
+            f"'range' step sign disagrees with [start, stop] direction: {spec!r}"
+        )
     all_int = all(isinstance(v, int) and not isinstance(v, bool) for v in spec)
     values: List[Union[int, float]] = []
     tol = abs(step) * 1e-9
@@ -1208,6 +1213,8 @@ def _expand_range(spec: List[Union[int, float]]) -> List[Union[int, float]]:
         if (step > 0 and v > stop + tol) or (step < 0 and v < stop - tol):
             break
         values.append(v if all_int else round(v, 10))
+    if not values:
+        raise ValueError(f"'range' expanded to no values: {spec!r}")
     return values
 
 
@@ -1523,6 +1530,7 @@ def run_single(
         "n_params":         n_params,
         "seed":             int(cfg.seed),
         "overrides":        _jsonable(overrides),
+        "max_tokens":       (int(max_tokens) if max_tokens is not None else None),
     }
     if collect_diagnostics:                                  # opt-in converged-state probes (S2)
         result.update(_cell_diagnostics(model, cfg, val_loader, device))
@@ -1564,6 +1572,7 @@ def _cell_is_current(
     seed:       int,
     dataset:    str,
     max_steps:  Optional[int] = None,
+    max_tokens: Optional[int] = None,
 ) -> bool:
     r"""True iff a completed cell's persisted config.json matches the config we would build now.
 
@@ -1576,6 +1585,11 @@ def _cell_is_current(
     The session ``dataset`` is NOT a VFE3Config field (it is the loader seam), so it is compared
     separately against the persisted top-level ``config.json["dataset"]`` -- otherwise a rerun on a
     DIFFERENT dataset would serve the wrong-dataset cell as current (the VFE3Config would match).
+
+    ``max_tokens`` (the loader train-split token cap) is likewise a loader seam, not a VFE3Config
+    field, so it never lands in config.json: a smoke cell capped at 10k tokens and a later full run
+    would otherwise compare byte-identical. It is persisted in the ``ablation_result.json`` marker
+    and compared here (a marker missing the key reads as None -> a capped re-run fails closed).
     """
     cj = run_dir / "config.json"
     if not cj.exists():
@@ -1588,15 +1602,29 @@ def _cell_is_current(
         return False
     if saved_obj.get("dataset") != dataset:                  # session dataset changed -> re-run
         return False
-    return saved_obj.get("config") == built
+    if saved_obj.get("config") != built:
+        return False
+    try:
+        marker = json.loads((run_dir / "ablation_result.json").read_text(encoding="utf-8"))
+    except Exception:                                        # no/unreadable marker -> re-run
+        return False
+    cur = int(max_tokens) if max_tokens is not None else None
+    return marker.get("max_tokens", None) == cur
 
 
 def _sanitize(label: str) -> str:
-    r"""A filesystem-safe single path component (no separators, parent tokens, or drive colon)."""
+    r"""A filesystem-safe single path component (no separators, parent tokens, or drive colon).
+
+    The char-replace is lossy ('a=b', 'a b', 'a/b' all map to 'a_b'), so a stable short hash of
+    the RAW label is appended: distinct labels get distinct run dirs, while the map stays
+    deterministic in the label so the resume [CACHED] path finds the same dir on re-run.
+    """
     out = label
     for bad, repl in (("=", "_"), (" ", "_"), ("/", "_"), ("\\", "_"), ("..", "_"), (":", "_")):
         out = out.replace(bad, repl)
-    return out.lstrip("._") or "_"
+    out = out.lstrip("._") or "_"
+    h = hashlib.sha1(label.encode("utf-8")).hexdigest()[:8]
+    return f"{out}__{h}"
 
 
 def _write_sweep_csv(sweep_dir: Path, results: List[Dict[str, Any]]) -> None:
@@ -1666,7 +1694,8 @@ def run_sweep(
         marker = run_dir / "ablation_result.json"
 
         if resume and marker.exists():
-            if _cell_is_current(run_dir, overrides, seed=cell_seed, max_steps=max_steps, dataset=dataset):
+            if _cell_is_current(run_dir, overrides, seed=cell_seed, max_steps=max_steps,
+                                max_tokens=max_tokens, dataset=dataset):
                 print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
                 results.append(json.loads(marker.read_text(encoding="utf-8")))
                 continue

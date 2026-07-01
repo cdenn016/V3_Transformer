@@ -232,3 +232,39 @@ def test_build_factored_transport_does_not_form_dense_omega():
     assert factored.exp_phi.shape == (2, 5, 8, 8)
     assert factored.exp_neg_phi.shape == (2, 5, 8, 8)
     assert factored.irrep_dims == [4, 4]
+
+
+# --- stable_matrix_exp_pair clamp monitor (audit 2026-07-01 C14 safe variant) ---------------------
+
+def test_clamp_monitor_warns_when_active():
+    """clamp_monitor=True surfaces the Frobenius-clamp surrogate: a matrix with ||M||_F >> max_norm
+    warns (the returned factor is exp(max_norm*M/||M||_F), not exp(M)); a small-norm matrix with
+    the flag on does NOT warn (the clamp is inactive, the operator exact)."""
+    import warnings
+    from vfe3.geometry.transport import stable_matrix_exp_pair
+
+    big = torch.zeros(2, 3, 3)
+    big[0, 0, 1] = 100.0                                          # ||M||_F = 100 >> max_norm = 15
+    with pytest.warns(RuntimeWarning, match="Frobenius clamp active"):
+        stable_matrix_exp_pair(big, clamp_monitor=True)
+
+    small = 0.1 * torch.eye(3).expand(2, 3, 3).contiguous()       # ||M||_F well below max_norm
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                            # any warning -> test failure
+        stable_matrix_exp_pair(small, clamp_monitor=True)
+
+
+def test_clamp_monitor_default_off_is_bit_identical():
+    """The default clamp_monitor=False path is bit-identical to an explicit False call and emits
+    no warning even when the clamp is active -- the hot path stays reduction/host-sync free."""
+    import warnings
+    from vfe3.geometry.transport import stable_matrix_exp_pair
+
+    g = torch.Generator().manual_seed(0)
+    m = 30.0 * torch.randn(2, 4, 4, generator=g)                  # clamp active on this input
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                            # any warning -> test failure
+        exp_default, neg_default = stable_matrix_exp_pair(m)      # default flag: silent
+        exp_off, neg_off = stable_matrix_exp_pair(m, clamp_monitor=False)
+    assert torch.equal(exp_default, exp_off)
+    assert torch.equal(neg_default, neg_off)

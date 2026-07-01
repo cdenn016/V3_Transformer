@@ -1,3 +1,5 @@
+import csv
+import logging
 import math
 
 import pytest
@@ -7,7 +9,8 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.train import build_optimizer, evaluate, lr_lambda, train, _floor_lr_lambdas
+from vfe3.run_artifacts import RunArtifacts
+from vfe3.train import build_optimizer, evaluate, lr_lambda, train, train_step, _floor_lr_lambdas
 
 
 def test_optimizer_groups_priors_by_m_lr():
@@ -400,6 +403,90 @@ def test_build_optimizer_groups_pos_phi_free():
     opt = build_optimizer(model, cfg)                      # must NOT raise the coverage AssertionError
     grouped = {p for g in opt.param_groups for p in g["params"]}
     assert model.pos_phi_free in grouped
+
+
+def test_train_step_skips_on_nonfinite_grad_with_finite_loss():
+    r"""F1 (audit 2026-07-01): a FINITE scalar loss can still carry a NaN parameter gradient
+    through the unrolled E-step; the finite-GRADIENT gate must skip the optimizer step so AdamW's
+    exp_avg/exp_avg_sq moment buffers are never poisoned. The scheduler still steps (resume
+    rebuilds LambdaLR assuming exactly one scheduler.step per loop iteration)."""
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
+                     warmup_steps=1, max_steps=4)
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, cfg))
+    g = torch.Generator().manual_seed(0)
+    tokens = torch.randint(0, 6, (2, 8), generator=g)
+    targets = torch.randint(0, 6, (2, 8), generator=g)
+
+    train_step(model, opt, sched, tokens, targets, grad_clip=1.0)   # clean step populates AdamW state
+    assert opt.state                                                # moment buffers exist (non-vacuous)
+    # A hook that poisons ONE parameter's gradient while the forward (and its scalar loss) stays finite.
+    model.prior_bank.mu_embed.register_hook(lambda grad: torch.full_like(grad, float("nan")))
+    metrics = {}
+    loss = train_step(model, opt, sched, tokens, targets, grad_clip=1.0, metrics_out=metrics)
+
+    assert math.isfinite(loss)
+    assert metrics["loss_finite"] == 1.0                            # the scalar loss WAS finite
+    assert metrics["grad_finite"] == 0.0                            # ...but the gradient was not
+    assert metrics["step_skipped"] == 1.0                           # so the optimizer step was skipped
+    assert all(torch.isfinite(p).all() for p in model.parameters())
+    for state in opt.state.values():                                # AdamW moments stay clean
+        for key in ("exp_avg", "exp_avg_sq"):
+            if key in state:
+                assert torch.isfinite(state[key]).all()
+    assert sched.last_epoch == 2                                    # scheduler stepped UNCONDITIONALLY
+
+
+def test_attention_map_replay_failure_does_not_kill_training(tmp_path, monkeypatch, caplog):
+    r"""F11 (audit 2026-07-01): the attention/gamma map replays are argument expressions evaluated
+    in the CALLER, outside the save helpers' internal try/except -- a replay error must be caught
+    by the caller-side guard (warn + continue), never abort training."""
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+
+    def _boom(*a, **k):
+        raise RuntimeError("replay boom")
+
+    monkeypatch.setattr(model, "attention_maps", _boom)
+    art = RunArtifacts(tmp_path / "run", cfg, model)
+    with caplog.at_level(logging.WARNING):
+        losses = train(model, _periodic_loader(seed=0), cfg, n_steps=2, eval_interval=1,
+                       val_loader=_periodic_loader(seed=1), artifacts=art)
+    assert len(losses) == 2                                     # train() completed despite the failure
+    assert any("attention-map replay failed" in r.getMessage() for r in caplog.records)
+
+
+def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
+    r"""F11 (audit 2026-07-01): a _val_diagnostics failure must RESET the held-out probes to NaN
+    (blank CSV cells) instead of carrying the previous eval's values forward as if fresh."""
+    import vfe3.train as vt
+
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    calls = {"n": 0}
+
+    def _flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"val_free_energy_total": 1.23}              # eval 1: a fresh probe value
+        raise RuntimeError("diagnostics boom")                  # eval 2: replay failure
+
+    monkeypatch.setattr(vt, "_val_diagnostics", _flaky)
+    art = RunArtifacts(tmp_path / "run", cfg, model)
+    train(model, _periodic_loader(seed=0), cfg, n_steps=2, eval_interval=1,
+          val_loader=_periodic_loader(seed=1), artifacts=art)
+    with open(tmp_path / "run" / "metrics.csv", newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert calls["n"] == 2                                      # both evals hit the probe
+    assert rows[0]["val_free_energy_total"] == "1.23"           # eval 1 wrote the fresh value
+    assert rows[1]["val_free_energy_total"] == ""               # eval 2 failed -> NaN -> blank, NOT stale 1.23
 
 
 def test_select_loader_is_split_aware(monkeypatch):

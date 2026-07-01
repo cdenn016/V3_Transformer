@@ -98,7 +98,7 @@ def test_cache_supported_guard():
 # ---------- efe_rollout (H>1), unlocked by the cache ----------
 
 def test_efe_rollout_unlocked_on_supported_config():
-    from vfe3.inference.policy import PolicyScore, get_policy, get_preference
+    from vfe3.inference.policy import PolicyScore, _efe_terms, get_policy, get_preference
     m = _model()                                            # cache-supported (defaults)
     B, N, Kp, H, V = 2, 5, 3, 3, m.cfg.vocab_size
     torch.manual_seed(2)
@@ -111,6 +111,18 @@ def test_efe_rollout_unlocked_on_supported_config():
     for t in (out.score, out.risk, out.ambiguity, out.policy_posterior):
         assert t.shape == (B, Kp)
     assert torch.allclose(out.policy_posterior.sum(-1), torch.ones(B), atol=1e-6)
+    # audit F3 (2026-07-01): efe_rollout is a TERMINAL-OUTCOME scorer, NOT a per-step horizon sum.
+    # Independently roll each H-action candidate to convergence and score q(o|pi_H) read from the
+    # LAST appended position only; the scorer's risk must match that terminal-predictive KL (to the
+    # cache-vs-full float tolerance pinned by test_cached_matches_full_rollout above).
+    ctx_exp = ctx.unsqueeze(1).expand(B, Kp, N)              # (B, Kp, N)
+    ext = torch.cat([ctx_exp, cand], dim=2).reshape(B * Kp, N + H)
+    with torch.no_grad():
+        _belief, logits = m.rollout_beliefs(ext, return_logits=True)  # (B*Kp, N+H, V)
+    q_log_terminal = torch.log_softmax(logits[:, -1, :], dim=-1).reshape(B, Kp, -1)
+    risk_terminal, _ = _efe_terms(q_log_terminal, pref)
+    assert torch.allclose(out.risk, risk_terminal, atol=1e-5, rtol=1e-4), \
+        f"max |drisk|={float((out.risk - risk_terminal).abs().max()):.2e}"
 
 
 def test_efe_rollout_guards():

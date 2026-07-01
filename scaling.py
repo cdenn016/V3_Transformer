@@ -611,9 +611,11 @@ def _cell_cfg_dict(overrides: Dict[str, Any], seed: int, max_steps: Optional[int
     return d
 
 
-def _cell_is_current(run_dir: Path, cfg: VFE3Config, dataset: str) -> bool:
+def _cell_is_current(run_dir: Path, cfg: VFE3Config, dataset: str, max_tokens: Optional[int] = None) -> bool:
     r"""True iff the run dir already holds a summary.json AND its config.json equals the config we would
-    build now (guards resume against baseline drift / a changed dataset)."""
+    build now (guards resume against baseline drift / a changed dataset). ``max_tokens`` is a loader
+    seam, not a VFE3Config field, so it never lands in config.json; it is compared against the
+    persisted scaling_cell.json (a missing/old cell meta or key fails closed -> re-run)."""
     if not (run_dir / "summary.json").exists() or not (run_dir / "config.json").exists():
         return False
     try:
@@ -621,7 +623,13 @@ def _cell_is_current(run_dir: Path, cfg: VFE3Config, dataset: str) -> bool:
         built = json.loads(json.dumps(asdict(cfg), default=str))
     except Exception:
         return False
-    return saved.get("dataset") == dataset and saved.get("config") == built
+    if saved.get("dataset") != dataset or saved.get("config") != built:
+        return False
+    try:
+        cellmeta = json.loads((run_dir / "scaling_cell.json").read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return cellmeta.get("max_tokens", None) == (int(max_tokens) if max_tokens is not None else None)
 
 
 def run_cell(
@@ -648,7 +656,7 @@ def run_cell(
                 "error_kind": "config", "error": str(exc), "seed": int(seed),
                 "test_ce": None, "n_params": None}
 
-    if CONFIG["resume"] and _cell_is_current(run_dir, cfg, dataset):
+    if CONFIG["resume"] and _cell_is_current(run_dir, cfg, dataset, max_tokens=max_tokens):
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
         sp = summary.get("scaling_point", {})
         print(f"    [CACHED] {label} s{seed}  test_ce={sp.get('test_ce')}  N={sp.get('n_params')}")
@@ -685,6 +693,7 @@ def run_cell(
         "label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
         "overrides": json.loads(json.dumps(cell["overrides"], default=str)),
         "predicted_n_params": pred_n, "n_gen": n_gen, "seed": int(seed),
+        "max_tokens": (int(max_tokens) if max_tokens is not None else None),
     })
 
     val_tpc = _tokens_per_char(dataset, "validation") or 1.0

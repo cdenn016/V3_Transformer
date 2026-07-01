@@ -413,18 +413,24 @@ class VFE3Config:
     # the pure path. No learned parameter is created; the scorer is tensor scoring over existing
     # beliefs/priors under @torch.no_grad.
     policy_mode:               str             = "none"   # registry key: none | logprob_control | efe_one_step | efe_rollout
-    policy_horizon:            int             = 1        # fixed finite rollout depth H (efe_one_step uses 1)
+    policy_horizon:            int             = 1        # fixed finite rollout depth H (efe_one_step uses 1).
+    #                          NOTE (audit 2026-07-01 F3): H>1 (efe_rollout) deepens only the belief ROLLOUT;
+    #                          the EFE score is still read from the single TERMINAL predictive q(o|pi_H),
+    #                          not the per-step horizon sum sum_{tau=1..H} G_tau.
     policy_top_k:              int             = 8        # candidate menu size Kp (the fixed top-Kp generator)
     policy_precision:          float           = 1.0      # policy precision gamma in softmax(-gamma G)
     policy_preference:         str             = "task"   # preference registry key -> p(o | C)
     policy_score_terms:        Tuple[str, ...] = ("risk", "ambiguity")  # which EFE terms enter G(pi)
-    # sigma-validation gate (spec Sections 2.7, 4.5, Guard 4): may be set True ONLY together with a
-    # policy_sigma_gate_artifact pointing at a PASS sigma-gate record, so V3 sigma cannot be called an
-    # ambiguity/epistemic value before the pre-registered gate passes. __post_init__ enforces BOTH the
-    # structural check (artifact named) AND the content check (the file exists and carries status=='PASS',
-    # via vfe3.inference.sigma_gate.verify_gate_artifact), so a FAIL/missing/unreadable record cannot flip
-    # the flag silently. The spec_commit MATCH is checked by the Phase-3 consumer that unlocks the sigma
-    # arm (it knows the live spec commit).
+    # sigma-validation gate (spec Sections 2.7, 4.5, Guard 4): a PRECONDITION RECORD ONLY (audit
+    # 2026-07-01 F5). Setting it True (with a policy_sigma_gate_artifact pointing at a PASS sigma-gate
+    # record) records that the pre-registered sigma gate passed; it does NOT enable any sigma-derived
+    # ambiguity -- NO code path reads the flag, the EFE ambiguity term is always 'likelihood_entropy',
+    # and get_ambiguity('sigma_mc') still raises (fail-closed). May be set True ONLY together with the
+    # artifact: __post_init__ enforces BOTH the structural check (artifact named) AND the content check
+    # (the file exists and carries status=='PASS', via vfe3.inference.sigma_gate.verify_gate_artifact),
+    # so a FAIL/missing/unreadable record cannot flip the flag silently. A Phase-3 consumer that reads
+    # the validated artifact (and checks the spec_commit MATCH against the live spec commit) must be
+    # added before any sigma arm unlocks.
     policy_sigma_ambiguity_validated: bool          = False
     policy_sigma_gate_artifact:       Optional[str] = None
 
@@ -577,6 +583,12 @@ class VFE3Config:
 
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
     generate_figures:          bool          = True         # auto-run the single-run publication figures at finalize_run (off the hot path)
+
+    # Memory-guard override for the finalize_run figure pass (audit 2026-07-01 F9): the reporting
+    # extractors materialize full (B, N, V) logits/probs, so finalize_run skips the publication
+    # figures when the estimated full-vocab peak exceeds its memory guard. Default False keeps the
+    # guard; True forces the figure pass despite a large estimate (opt-in large-run override).
+    force_large_figures:       bool          = False
     
     # Opt-in mixed precision for CUDA throughput (RTX 5090). None (default) = OFF = the pure fp32
     # path: NO autocast context is entered anywhere in the forward, so the loss/logits are
@@ -599,6 +611,13 @@ class VFE3Config:
             raise ValueError(f"eps must be positive, got {self.eps}")
         if self.kl_max <= 0.0:
             raise ValueError(f"kl_max must be positive, got {self.kl_max}")
+        # sigma_max caps the covariance in the SPD retractions (clamp max=sigma_max); a nonfinite
+        # or sub-eps cap would push the clamped covariance below eps / negative / NaN (audit
+        # 2026-07-01 F2). None stays permissive (no cap).
+        if self.sigma_max is not None and not (math.isfinite(self.sigma_max) and self.sigma_max >= self.eps):
+            raise ValueError(
+                f"sigma_max must be None or finite and >= eps ({self.eps}), got {self.sigma_max}"
+            )
 
         # gauge_transport ablation meta-toggle (A1 / EXP-2). Coerce the gauge-frame fields UP FRONT so
         # every downstream validation and the optimizer/table wiring see the resolved state. 'on' is a
@@ -1254,6 +1273,16 @@ class VFE3Config:
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
         _require(self.pos_phi_compose, tuple(sorted(_COMPOSE)), "pos_phi_compose")
+        # bch_pe_order gates the Dynkin corrections in compose_bch (they apply only at order >= 1);
+        # order 0 leaves Z = X + Y -- plain additive composition still labeled 'bch' (audit
+        # 2026-07-01 F12). Guarded on pos_phi != 'none' because _apply_pos_phi returns early there
+        # and never reaches compose_bch, so bch_pe_order is inert. (phi_retract_mode='bch' does not
+        # thread bch_pe_order; it keeps compose_bch's default order=4 and is unaffected.)
+        if self.pos_phi != "none" and self.pos_phi_compose == "bch" and self.bch_pe_order < 1:
+            raise ValueError(
+                f"pos_phi_compose='bch' needs bch_pe_order >= 1 (order 0 drops all Dynkin "
+                f"corrections and is plain additive, not BCH), got {self.bch_pe_order}"
+            )
         from vfe3.geometry.rope import _POS_ROTATIONS
         _require(self.pos_rotation, tuple(sorted(_POS_ROTATIONS)), "pos_rotation")
         if self.rope_full_gauge and self.diagonal_covariance:
@@ -1620,6 +1649,37 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
+        # C5 (audit 2026-07-01): exactness contract of the covariant transport vs the diagonal
+        # family. GL(K)-covariance is exact only when the transported covariance stays in the
+        # family; the diagonal cone is NOT closed under a general congruence Omega Sigma Omega^T
+        # (the off-diagonal terms are discarded on diagonal readout). Warn (non-breaking; the
+        # diagonal branch is a legitimate, numerically stable approximation and complements the
+        # gaussian_full numerics warning above -- one warning per family).
+        if self.transport_mode == "regime_ii_covariant" and self.family == "gaussian_diagonal":
+            import warnings
+            warnings.warn(
+                "transport_mode='regime_ii_covariant' with family='gaussian_diagonal': the diagonal "
+                "covariance cone is NOT closed under general GL(K) congruence Omega Sigma Omega^T, so the "
+                "diagonal readout is a CONTROLLED APPROXIMATION of the exact GL-covariant transport. Use "
+                "family='gaussian_full' for exact Route B covariance, or an orthogonal/diagonal-preserving "
+                "gauge.",
+                UserWarning, stacklevel=2,
+            )
+        # F7 (audit 2026-07-01): the s-channel (model coupling + s E-step) transports the s tables
+        # under the FLAT phi-cocycle only (_gamma_energy / _refine_s pass transport_mode="flat"),
+        # regardless of cfg.transport_mode. Under a NON-FLAT belief transport the belief and model
+        # channels then run different connections -- the s-fiber has no non-flat transport law yet,
+        # so the model-channel comparison is NOT gauge-covariant. Warn (non-breaking) so a run does
+        # not describe it as sharing the active connection.
+        if self.transport_mode != "flat" and (self.lambda_gamma > 0.0 or self.s_e_step):
+            import warnings
+            warnings.warn(
+                f"transport_mode={self.transport_mode!r} is non-flat, but the model channel "
+                f"(lambda_gamma={self.lambda_gamma}, s_e_step={self.s_e_step}) transports the s tables "
+                "under the FLAT phi-cocycle only; the s-fiber has no non-flat transport law. The "
+                "model-channel coupling is NOT gauge-covariant under this connection.",
+                UserWarning, stacklevel=2,
+            )
 
         # normalization validated against the norm REGISTRY (add-by-registering). Local import
         # avoids a config <- norms cycle.
@@ -1775,6 +1835,24 @@ class VFE3Config:
             raise ValueError(f"eval_interval must be >= 0, got {self.eval_interval}")
         if self.checkpoint_interval < 0:
             raise ValueError(f"checkpoint_interval must be >= 0, got {self.checkpoint_interval}")
+        # max_steps / warmup_steps feed range(start_step, n_steps) and the scheduler (audit
+        # 2026-07-01 F12): a float TypeErrors late in range(), max_steps=0 is an empty training
+        # loop, warmup_steps<0 is meaningless. `type(...) is not int` rejects float AND bool;
+        # warmup_steps=0 stays legal (no warmup -- the scheduler's max(1, ...) handles it).
+        if type(self.max_steps) is not int or self.max_steps < 1:
+            raise ValueError(f"max_steps must be an int >= 1, got {self.max_steps!r}")
+        if type(self.warmup_steps) is not int or self.warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be an int >= 0, got {self.warmup_steps!r}")
+        # Security/behavior-relevant bools must be REAL bools, not truthy coercions (audit
+        # 2026-07-01 F12): load_checkpoint reads bool(cfg.trust_resume_checkpoint), so the string
+        # "False" would coerce to True and enable the unsafe weights_only=False fallback;
+        # generate_figures and use_ema gate code paths by truthiness the same way. `type(x) is not
+        # bool` (not isinstance) rejects the int/str footguns. Deliberately NOT swept across every
+        # bool field (over-validation risk) -- only the audit-called-out three.
+        for _bname in ("trust_resume_checkpoint", "generate_figures", "use_ema"):
+            _bval = getattr(self, _bname)
+            if type(_bval) is not bool:
+                raise ValueError(f"{_bname} must be a bool, got {type(_bval).__name__}: {_bval!r}")
         if self.resume_from is not None and not isinstance(self.resume_from, str):
             raise ValueError(
                 f"resume_from must be None or a path string to a checkpoints/step_<N>.pt, got "

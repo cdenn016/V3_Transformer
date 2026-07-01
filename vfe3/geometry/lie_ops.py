@@ -84,9 +84,15 @@ def lie_bracket_coords(
 _COMPOSE: Dict[str, Callable[..., torch.Tensor]] = {}
 
 
-def register_compose(name: str) -> Callable:
-    """Decorator registering a composition rule phi1,phi2 -> composed coords."""
+def register_compose(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a composition rule phi1,phi2 -> composed coords.
+
+    Duplicate keys fail closed (audit 2026-07-01 F12): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        if name in _COMPOSE and not override:
+            raise KeyError(f"composition rule {name!r} already registered; pass override=True to replace")
         _COMPOSE[name] = fn
         return fn
     return _wrap

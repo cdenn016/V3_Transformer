@@ -16,7 +16,7 @@ _ALPHAS:          Dict[str, Callable] = {}
 _ALPHA_PER_COORD: Dict[str, bool]     = {}
 
 
-def register_alpha(name: str, *, per_coord: bool = False) -> Callable:
+def register_alpha(name: str, *, per_coord: bool = False, override: bool = False) -> Callable:
     """Decorator registering an alpha form D -> (alpha, regularizer).
 
     ``per_coord`` declares whether the form consumes a per-COORDINATE (unsummed) self-
@@ -24,8 +24,14 @@ def register_alpha(name: str, *, per_coord: bool = False) -> Callable:
     routing seam ``free_energy.self_divergence_for_alpha`` reads this flag to supply the
     correctly-shaped divergence, so a per-coordinate form slots in by registration alone --
     no consumer call site is edited.
+
+    Duplicate keys fail closed (audit 2026-07-01 F12): a second registration under an
+    existing name silently shadowed the first, so a config-selected seam could dispatch to
+    an unintended implementation. Pass ``override=True`` to replace deliberately.
     """
     def _wrap(fn: Callable) -> Callable:
+        if name in _ALPHAS and not override:
+            raise KeyError(f"alpha form {name!r} already registered; pass override=True to replace")
         _ALPHAS[name] = fn
         _ALPHA_PER_COORD[name] = per_coord
         return fn

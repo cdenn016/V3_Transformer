@@ -3,6 +3,7 @@ Pure-statistic tests on synthetic per-token data with known properties, plus the
 the artifact writer. No model needed (the orchestrator measure_sigma_gate is exercised by the EFE
 pipeline; here we pin the statistics that decide the binding gate)."""
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -102,6 +103,33 @@ def test_write_sigma_gate_artifact_has_required_fields(tmp_path):
         assert key in payload
     assert payload["checkpoint_id"] == "ckpt_test" and payload["spec_commit"] == "deadbeef"
     assert payload["seeds"] == [6, 23, 64] and payload["status"] in ("PASS", "FAIL")
+
+
+def test_write_artifact_slugs_checkpoint_id(tmp_path):
+    r"""A traversal-shaped checkpoint_id must not escape out_dir: the FILENAME is slugified while
+    the payload keeps the raw id for provenance."""
+    path = write_sigma_gate_artifact({"status": "PASS"}, checkpoint_id="../../evil",
+                                     spec_commit="x", seeds=(6,), out_dir=str(tmp_path))
+    assert Path(path).resolve().parent == tmp_path.resolve()     # written INSIDE out_dir
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    assert payload["checkpoint_id"] == "../../evil"              # raw id preserved in the record
+
+
+def test_write_artifact_separator_id(tmp_path):
+    r"""Separators / drive colons in checkpoint_id map to one flat file directly under out_dir."""
+    path = write_sigma_gate_artifact({"status": "PASS"}, checkpoint_id="a/b:c",
+                                     spec_commit="x", seeds=(6,), out_dir=str(tmp_path))
+    assert Path(path).resolve().parent == tmp_path.resolve()
+    assert Path(path).name == "a_b_c.json"
+    assert not (tmp_path / "a").exists()                         # no nested directory created
+
+
+def test_measure_script_checkpoint_not_hardcoded():
+    r"""Guards against re-introducing a machine-absolute checkpoint default in the click-to-run
+    CONFIG (the empty value fails closed via the guard in sigma_gate_measure.main)."""
+    import sigma_gate_measure
+    assert not sigma_gate_measure.CONFIG["checkpoint"]
 
 
 def test_verify_gate_artifact_accepts_pass_rejects_others(tmp_path):

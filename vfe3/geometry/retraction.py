@@ -19,6 +19,17 @@ from vfe3.geometry.lie_ops import (
     retract_son,
 )
 
+
+def _check_sigma_max(sigma_max: Optional[float], eps: float) -> None:
+    r"""Reject an eigenvalue ceiling that would violate the SPD/eps invariant."""
+    if sigma_max is None:
+        return
+    if not math.isfinite(sigma_max) or sigma_max < eps:
+        raise ValueError(
+            f"sigma_max must be None or finite and >= eps ({eps}); got {sigma_max!r}"
+        )
+
+
 _RETRACTIONS: Dict[str, Callable[..., torch.Tensor]] = {}
 
 
@@ -121,6 +132,7 @@ def retract_spd_diagonal(
     Positivity by construction (exp > 0); clamped to [eps, sigma_max].
     When sigma_max is None the eigenvalue ceiling is skipped (pure-path: eps floor only).
     """
+    _check_sigma_max(sigma_max, eps)
     orig_dtype = sigma_diag.dtype
     with torch.amp.autocast('cuda', enabled=False):
         sigma_safe = sigma_diag.float().clamp(min=eps)
@@ -154,6 +166,7 @@ def retract_spd_full(
     gaussian_full init makes the stock eigh backward 100% NaN; forward values are unchanged.
     When sigma_max is None the eigenvalue ceiling is skipped (pure-path: eps floor only).
     """
+    _check_sigma_max(sigma_max, eps)
     orig_shape = sigma.shape
     orig_dtype = sigma.dtype
     if sigma.dim() == 4:
@@ -254,6 +267,7 @@ def retract_logeuclidean_full(
     projects the output spectrum to [eps, sigma_max] (eigenvalues ARE variances: the same
     physical ceiling the diagonal arm and retract_spd_full apply, matching the code at ~264).
     """
+    _check_sigma_max(sigma_max, eps)
     orig_shape = sigma.shape
     orig_dtype = sigma.dtype
     if sigma.dim() == 4:
@@ -327,6 +341,7 @@ def retract_log_euclidean(
     the full-covariance family, where logm != elementwise log. 2b (the Daleckii-Krein Frechet
     natural gradient) is a deferred sub-flag per the spec, not built here.
     """
+    _check_sigma_max(sigma_max, eps)
     if sigma.dim() == mean_ndim + 1:                     # full covariance (..., K, K)
         return retract_logeuclidean_full(
             sigma, delta_sigma, step_size=step_size, trust_region=trust_region, eps=eps, sigma_max=sigma_max,

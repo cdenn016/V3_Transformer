@@ -444,20 +444,24 @@ def e_step_iteration(
     # kernel is the flat-transport gradient (it drops d Omega/d mu), so regime_ii always routes to
     # the autograd oracle, and the oracle must rebuild the transport from its own differentiation
     # leaves for the gradient VALUE to carry d Omega/d mu in every regime (train, eval, detached
-    # E-step). The builder closure below binds phi/W/rope and receives (mu_query, mu_key) from the
-    # oracle -- the key slot is the oracle's detached key under filtering (query-side coordinate
-    # ascent) and the shared live leaf under smoothing (full gradient). Pre-building here as well
-    # would only double the most expensive build in the codebase.
+    # E-step). The builder closure below binds phi/W/rope and receives (mu_query, sigma_query,
+    # mu_key, sigma_key) from the oracle -- the key slots are the oracle's detached keys under
+    # filtering (query-side coordinate ascent) and the shared live leaves under smoothing (full
+    # gradient). Pre-building here as well would only double the most expensive build in the
+    # codebase.
     if transport_mode in _TRANSPORT_NEEDS_MU:                       # mu-dependent Omega -> autograd oracle
         omega = None
 
-        def _omega_builder(mu_q: torch.Tensor, mu_k: torch.Tensor):
+        def _omega_builder(mu_q: torch.Tensor, sigma_q: torch.Tensor,
+                           mu_k: torch.Tensor, sigma_k: torch.Tensor):
             return build_belief_transport(
                 belief.phi, group, transport_mode=transport_mode,
                 mu=mu_q, mu_key=mu_k, connection_W=connection_W,
                 # regime_ii_covariant: the gauge-invariant features also read the belief variances;
-                # query slot live, key slot detached (mirrors the mu/mu_key coordinate-ascent split).
-                sigma=belief.sigma, sigma_key=belief.sigma.detach(), connection_M=connection_M,
+                # thread the ORACLE's sigma leaves (query slot live, key slot detached under
+                # filtering -- the same coordinate-ascent split as mu/mu_key) so autograd sees
+                # d Omega/d sigma on every path, not only the live unroll (audit 2026-07-01 C4).
+                sigma=sigma_q, sigma_key=sigma_k, connection_M=connection_M,
                 cocycle_relaxation=cocycle_relaxation, rope=rope, rope_on_cov=rope_on_cov,
                 rope_on_value=rope_on_value,
             )

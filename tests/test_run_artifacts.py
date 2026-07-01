@@ -9,6 +9,7 @@ covered by tests/test_train.py::test_silent_and_logging_paths_are_bitwise_identi
 
 import json
 import math
+import types
 
 import pytest
 import torch
@@ -17,7 +18,7 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts, finalize_run
+from vfe3.run_artifacts import RunArtifacts, _pure_path_report, finalize_run
 from vfe3.train import build_optimizer, train
 
 
@@ -87,6 +88,84 @@ def test_save_checkpoint_is_loadable(tmp_path):
     ckpt = torch.load(p, weights_only=False)
     assert ckpt["step"] == 4
     assert "model_state" in ckpt and "optimizer_state" in ckpt
+    # model-selection state is bundled so a resumed run reports the run-wide best (audit 2026-07-01 C2)
+    assert "best_val_ppl" in ckpt and "best_step" in ckpt
+
+
+def test_writes_are_atomic_no_temp_left(tmp_path):
+    # C11 (audit 2026-07-01): every writer publishes via same-dir .tmp + os.replace, so no temp
+    # file survives a successful write and every final artifact loads cleanly.
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    art.save_json("summary.json", {"a": 1})
+    assert art.maybe_save_best(1, model, 5.0) is True
+    p = art.save_checkpoint(2, model, opt, cfg)
+    assert list((tmp_path / "r").rglob("*.tmp")) == []          # run_dir AND ckpt_dir hold no temps
+    assert json.loads((tmp_path / "r" / "summary.json").read_text()) == {"a": 1}
+    best = torch.load(tmp_path / "r" / "best_model.pt", weights_only=True)
+    assert set(best) == set(model.state_dict())
+    ckpt = torch.load(p, weights_only=True)
+    assert ckpt["step"] == 2
+
+
+def test_best_model_overwrite_replaces(tmp_path):
+    # C11: os.replace over an EXISTING best_model.pt succeeds (Windows lock retry path aside),
+    # and the file reloads to the improved (second) state_dict.
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    assert art.maybe_save_best(1, model, 10.0) is True
+    with torch.no_grad():
+        model.prior_bank.mu_embed.add_(1.0)                     # make the second save distinguishable
+    assert art.maybe_save_best(2, model, 8.0) is True           # improved -> replaces the existing file
+    loaded = torch.load(tmp_path / "r" / "best_model.pt", weights_only=True)
+    cur = model.state_dict()
+    assert all(torch.equal(loaded[k], cur[k]) for k in cur)     # the SECOND state won
+
+
+# --------------------------------------------------------------------------- pure-path report labels
+
+def _report_cfg(**over):
+    r"""SimpleNamespace with every attribute _pure_path_report reads (incl. family for the
+    regime_ii_covariant exactness flag)."""
+    base = dict(include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
+                learnable_lambda_beta=False, use_prior_bank=True, use_head_mixer=False,
+                lambda_beta=1.0, precision_weighted_attention=False,
+                gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
+                lambda_gamma=0.0, s_e_step=False, family="gaussian_diagonal")
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def test_pure_path_report_regime_ii_covariant_exact_flag():
+    # C5 (audit 2026-07-01): the diagonal cone is not closed under GL congruence, so a diagonal
+    # regime_ii_covariant run is a CONTROLLED APPROXIMATION -- never reported as exact Route B.
+    diag = _pure_path_report(_report_cfg(transport_mode="regime_ii_covariant",
+                                         family="gaussian_diagonal"), [])
+    assert diag["config_toggles"]["regime_ii_covariant_exact"] is False
+    full = _pure_path_report(_report_cfg(transport_mode="regime_ii_covariant",
+                                         family="gaussian_full"), [])
+    assert full["config_toggles"]["regime_ii_covariant_exact"] is True
+    flat = _pure_path_report(_report_cfg(), [])
+    assert flat["config_toggles"]["regime_ii_covariant_exact"] is True
+
+
+def test_pure_path_report_transport_covariance_class():
+    # C7 (audit 2026-07-01): plain regime_ii's bilinear edge is gauge-FIXED; the report must never
+    # group it with the covariant Route B. Every registered mode maps to a class; an unknown mode
+    # falls through to its own name (no KeyError).
+    expected = {"flat":                   "covariant (flat)",
+                "regime_ii":              "gauge-fixed (non-covariant)",
+                "regime_ii_covariant":    "covariant",
+                "regime_ii_link":         "gauge-fixed",
+                "regime_ii_link_charted": "covariant"}
+    for mode, label in expected.items():
+        rep = _pure_path_report(_report_cfg(transport_mode=mode), [])
+        assert rep["config_toggles"]["transport_covariance_class"] == label, mode
+    rep = _pure_path_report(_report_cfg(transport_mode="future_mode"), [])
+    assert rep["config_toggles"]["transport_covariance_class"] == "future_mode"
 
 
 def test_train_with_artifacts_writes_files(tmp_path):

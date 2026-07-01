@@ -24,6 +24,7 @@ Pure measurement functions take aligned per-token 1-D tensors and are device/gra
 """
 import json
 import os
+import re
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -179,7 +180,10 @@ def write_sigma_gate_artifact(
     reference to a PASS record whose spec commit matches (config.py Guard 4)."""
     os.makedirs(out_dir, exist_ok=True)
     payload = dict(checkpoint_id=checkpoint_id, spec_commit=spec_commit, seeds=list(seeds), **record)
-    path = os.path.join(out_dir, f"{checkpoint_id}.json")
+    # Slugify the FILENAME only (a checkpoint_id carrying os.sep / '..' / a drive colon must not
+    # escape out_dir); the payload above keeps the RAW checkpoint_id for provenance.
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", checkpoint_id).strip("._") or "artifact"
+    path = os.path.join(out_dir, f"{slug}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     return path

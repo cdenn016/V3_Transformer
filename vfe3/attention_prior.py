@@ -31,9 +31,15 @@ def _press_slopes(
 _PRIORS: Dict[str, Callable] = {}
 
 
-def register_prior(name: str) -> Callable:
-    """Decorator registering an attention-prior builder -> log-prior bias (Nq, Nk)."""
+def register_prior(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering an attention-prior builder -> log-prior bias (Nq, Nk).
+
+    Duplicate keys fail closed (audit 2026-07-01 F12): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable) -> Callable:
+        if name in _PRIORS and not override:
+            raise KeyError(f"attention prior {name!r} already registered; pass override=True to replace")
         _PRIORS[name] = fn
         return fn
     return _wrap

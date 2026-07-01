@@ -995,9 +995,9 @@ def plot_geometry_health(
     guard-pinned fixed point. Each panel self-gates on column presence."""
     panels = [
         {"title": "Holonomy / cocycle flatness", "ylabel": "curvature", "logy": True, "series": [
-            ("holonomy_wilson", r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$", _CB[0]),
+            ("holonomy_wilson", r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$ (gauge-invariant)", _CB[0]),
             ("cocycle_residual", "cocycle residual", _CB[1]),
-            ("holonomy_deviation", r"$\langle\|H-I\|_F\rangle$", _CB[2])]},
+            ("holonomy_deviation", r"$\langle\|H-I\|_F\rangle$ (frame-dependent)", _CB[2])]},
         {"title": "Gauge-frame spread", "ylabel": "spread", "series": [
             ("gauge_invariant_spread", "gauge invariant", _CB[3]),
             ("gauge_head_logdet_spread", r"head $\log|\det|$", _CB[4])]},
@@ -1088,7 +1088,7 @@ def plot_validation_sanity(
             ("val_period_match_mass", "period-match", _CB[1]),
             ("val_head_redundancy_js", "redundancy JS", _CB[2])]},
         {"title": "Held-out flatness", "ylabel": "curvature", "logy": True, "series": [
-            ("val_holonomy_wilson", "Wilson holonomy", _CB[0]),
+            ("val_holonomy_wilson", "Wilson holonomy (gauge-invariant)", _CB[0]),
             ("val_cocycle_residual", "cocycle residual", _CB[1])]},
         {"title": "Held-out gauge spread", "ylabel": "spread",
          "series": [("val_gauge_invariant_spread", "gauge invariant", _CB[3])]},
@@ -1836,8 +1836,8 @@ def plot_per_layer_diagnostics(
             axes[0][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
     axes[0][0].set(xticks=x, xlabel="layer", ylabel="nats", title="Free-energy budget by layer")
     axes[0][0].legend(fontsize=8, frameon=False)
-    for k, c, lab in (("holonomy_deviation", _CB[0], r"$\|H-I\|_F$"),
-                      ("holonomy_wilson", _CB[1], r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}\,H/K$")):
+    for k, c, lab in (("holonomy_deviation", _CB[0], r"$\|H-I\|_F$ (frame-dependent)"),
+                      ("holonomy_wilson", _CB[1], r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}\,H/K$ (gauge-invariant)")):
         if k in per_layer:
             axes[0][1].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
     axes[0][1].set(xticks=x, xlabel="layer", ylabel="deviation", title="Holonomy / curvature by layer")
@@ -3154,7 +3154,7 @@ PUB_LABELS: Dict[str, str] = {
     # -- attention / gauge / belief-geometry diagnostics --
     "attn_entropy":       r"attention row entropy $H(\beta)=-\sum_j\beta_{ij}\log\beta_{ij}$",
     "effective_rank":     r"belief effective rank $\mathrm{erank}(\Sigma)$",
-    "holonomy_deviation": r"holonomy $\langle\|H-I\|_F\rangle$",
+    "holonomy_deviation": r"holonomy $\langle\|H-I\|_F\rangle$ (frame-dependent)",
     "gauge_trace_spread": r"gauge spread $\mathrm{std}_i\,\log|\det\Omega_i|$",
     "belief_cond_median": r"belief conditioning $\mathrm{med}_i\,\kappa(\Sigma_i)$",
     "fisher_trace_mean":  r"belief precision $\langle\mathrm{tr}\,\Sigma^{-1}\rangle/2$",
@@ -3179,7 +3179,7 @@ PUB_LABELS: Dict[str, str] = {
     "freq_strata_ce.mid":      r"$\mathrm{CE}_{\mathrm{mid}}$ (nats)",
     "freq_strata_ce.frequent": r"$\mathrm{CE}_{\mathrm{frequent}}$ (nats)",
     # -- geometry-health dashboard (gauge / SPD / Fisher / guard) --
-    "holonomy_wilson":         r"Wilson holonomy $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$",
+    "holonomy_wilson":         r"Wilson holonomy $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$ (gauge-invariant)",
     "cocycle_residual":        "cocycle residual (flatness)",
     "gauge_invariant_spread":  r"gauge-invariant spread $\mathrm{std}_i\,I(\exp\phi_i)$",
     "phi_norm_mean":           r"gauge-frame norm $\langle\|\phi_i\|\rangle$",

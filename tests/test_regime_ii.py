@@ -343,7 +343,7 @@ def test_regime_ii_filtering_gradient_carries_domega_dmu():
     kernel route silently dropped."""
     grp, mu, sigma, phi, mu_p, sigma_p, W = _grad_setup(seed=1)
 
-    def builder(mu_q, mu_k):
+    def builder(mu_q, sigma_q, mu_k, sigma_k):                   # 4-arg oracle contract (audit C4)
         return build_belief_transport(phi, grp, transport_mode="regime_ii", mu=mu_q, mu_key=mu_k,
                                       connection_W=W, cocycle_relaxation=1.0)
 
@@ -369,7 +369,7 @@ def test_regime_ii_smoothing_gradient_matches_autograd_of_global_f():
     def F(m):
         return free_energy_value(BeliefState(mu=m, sigma=sigma, phi=phi), mu_p, sigma_p, grp, **fkw)
 
-    def builder(mu_q, mu_k):
+    def builder(mu_q, sigma_q, mu_k, sigma_k):                   # 4-arg oracle contract (audit C4)
         return build_belief_transport(phi, grp, transport_mode="regime_ii", mu=mu_q, mu_key=mu_k,
                                       connection_W=W, cocycle_relaxation=1.0)
 
@@ -434,3 +434,42 @@ def test_regime_ii_edge_factor_breaks_gauge_invariance_for_nonzero_W():
     devs = [(omega(mu, s * W_base) - omega(mu_g, s * W_base)).norm().item() for s in (0.1, 0.5, 1.0)]
     assert devs[0] > 1e-4                                                # nonzero W breaks invariance
     assert devs[0] < devs[1] < devs[2]                                  # break grows with ||W||
+
+
+# --- audit 2026-07-01 F10: query-chunking of the dense regime_ii build (covariant-builder port) ---
+
+def test_regime_ii_query_chunk_used():
+    """The plain regime_ii builder shares the covariant chunk policy: the OOM-scale config chunks
+    below N; a tiny diagnostic build collapses to a single chunk (bit-for-bit the unchunked path)."""
+    from vfe3.geometry import transport as T
+    assert 1 <= T._regime_ii_query_chunk(64, 128, 20) < 128              # OOM config must chunk
+    assert T._regime_ii_query_chunk(1, 3, 4) == 3                        # tiny build: one chunk
+
+
+def test_regime_ii_chunked_matches_unchunked():
+    """Forcing size-1 query chunks gives the SAME Omega and the SAME gradient to connection_W as
+    the one-chunk build -- chunking is purely a memory optimization (no cross-query reduction),
+    mirroring the covariant builder's equivalence pin."""
+    from vfe3.geometry import transport as T
+
+    phi, mu, grp = _phi_mu(seed=7, B=2, N=5, K=4)
+    K, n_gen = grp.generators.shape[-1], grp.generators.shape[0]
+    W0 = 0.3 * torch.randn(n_gen, K, K, generator=torch.Generator().manual_seed(3))
+    build = get_transport("regime_ii")
+
+    def _omega_and_grad(chunk_elems: int):
+        # monkeypatch-free: set/restore the module constant around each build
+        saved = T._REGIME_II_CHUNK_ELEMS
+        T._REGIME_II_CHUNK_ELEMS = chunk_elems
+        try:
+            W = W0.clone().requires_grad_(True)
+            omega = build(phi, grp, mu=mu, connection_W=W, cocycle_relaxation=1.0)["Omega"]
+            (omega ** 2).sum().backward()
+            return omega.detach().clone(), W.grad.detach().clone()
+        finally:
+            T._REGIME_II_CHUNK_ELEMS = saved
+
+    omega_one, grad_one = _omega_and_grad(10 ** 12)                      # one chunk (size N)
+    omega_chunk, grad_chunk = _omega_and_grad(1)                         # forced size-1 chunks
+    assert torch.allclose(omega_one, omega_chunk, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(grad_one, grad_chunk, atol=1e-5, rtol=1e-5)

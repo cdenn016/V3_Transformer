@@ -88,6 +88,33 @@ def test_ema_store_copy_restore_roundtrip():
         assert torch.equal(restored, original)
 
 
+def test_ema_resets_shadow_after_load_when_no_ema_state(tmp_path):
+    r"""C3 (audit 2026-07-01): loading a checkpoint that carries NO ema_state (a use_ema=False or
+    legacy bundle) must RESEED the shadow from the just-loaded weights -- the shadow built at
+    ``EMA.__init__`` clones the PRE-load fresh init, and blending real weights into random-init
+    noise would corrupt the running average."""
+    cfg = _cfg()
+    torch.manual_seed(0)
+    model_a = VFEModel(cfg)
+    opt = build_optimizer(model_a, cfg)
+    with torch.no_grad():                                # make the saved weights distinguishable
+        model_a.prior_bank.mu_embed.add_(0.5)
+    art = RunArtifacts(tmp_path / "r", cfg, model_a)
+    art.save_checkpoint(2, model_a, opt, cfg)            # ema=None -> bundle stores ema_state=None
+
+    torch.manual_seed(1)                                 # a DIFFERENT fresh init
+    model_b = VFEModel(cfg)
+    ema_b = EMA(model_b, decay=0.9)                      # shadow clones B's PRE-load init
+    pre = {name: t.clone() for name, t in ema_b.shadow.items()}
+    load_checkpoint(tmp_path / "r" / "checkpoints" / "step_2.pt", model_b, ema=ema_b)
+
+    params = dict(model_b.named_parameters())
+    assert set(ema_b.shadow) == {n for n, p in params.items() if p.requires_grad}   # same filter as __init__
+    for name, shadow in ema_b.shadow.items():
+        assert torch.equal(shadow, params[name].detach())        # reseeded from the LOADED weights
+    assert any(not torch.equal(pre[n], ema_b.shadow[n]) for n in pre)   # ...not the pre-load init
+
+
 def test_ema_state_dict_roundtrip():
     toy = _Toy()
     ema = EMA(toy, decay=0.9)

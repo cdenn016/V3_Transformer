@@ -75,7 +75,7 @@ def belief_gradients_autograd(
     irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
     log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
-    omega_builder:             Optional[Callable[[torch.Tensor, torch.Tensor],
+    omega_builder:             Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
                                                  'torch.Tensor | FactoredTransport | RopeTransport']] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:   # (grad_mu, grad_sigma), each (N, K)
     r"""Autograd of canonical F_red w.r.t. (mu, sigma). See module docstring for modes.
@@ -84,13 +84,14 @@ def belief_gradients_autograd(
     autograd then yields the correct per-head belief gradient with no special-casing here.
 
     ``omega_builder`` (audit 2026-06-10 F1/F2; None = unchanged pre-built ``omega``): a callable
-    ``(mu_query, mu_key) -> transport`` for a mu-DEPENDENT connection (regime_ii). The transport is
-    rebuilt here from the DIFFERENTIATION leaves, so the returned gradient VALUE carries the
-    d Omega/d mu term in every regime (train, eval, detached E-step) -- a pre-built omega is
-    constant w.r.t. the local leaves and silently drops it. The key-role semantics carry over
-    exactly: under filtering the builder receives a detached key mean (query-side d delta/d mu_i
-    only -- mean-field coordinate ascent); under smoothing both slots share the live leaf (full
-    gradient, the stationary point of the global F)."""
+    ``(mu_query, sigma_query, mu_key, sigma_key) -> transport`` for a belief-DEPENDENT connection
+    (regime_ii / regime_ii_covariant). The transport is rebuilt here from the DIFFERENTIATION
+    leaves, so the returned gradient VALUE carries the d Omega/d mu (and, for the covariant
+    builder, d Omega/d sigma -- audit 2026-07-01 C4) term in every regime (train, eval, detached
+    E-step) -- a pre-built omega is constant w.r.t. the local leaves and silently drops it. The
+    key-role semantics carry over exactly: under filtering the builder receives detached key
+    slots (query-side d delta/d mu_i only -- mean-field coordinate ascent); under smoothing both
+    slots share the live leaves (full gradient, the stationary point of the global F)."""
     # Live leaves (keep the unrolled chain) only when create_graph is requested AND the belief
     # genuinely carries grad upstream; otherwise a detached clone (autograd.grad needs a grad leaf,
     # and there is no unrolled signal to preserve when the belief is grad-free, e.g. a no_grad caller
@@ -110,10 +111,10 @@ def belief_gradients_autograd(
         raise ValueError(f"gradient_mode must be 'filtering' or 'smoothing', got {gradient_mode!r}")
 
     if omega_builder is not None:
-        # mu-dependent connection (regime_ii): rebuild the transport from the differentiation
-        # leaves so autograd sees d Omega/d mu (query slot live; key slot follows the
-        # filtering/smoothing key-role split above).
-        omega = omega_builder(mu_q, mu_k)
+        # belief-dependent connection (regime_ii / regime_ii_covariant): rebuild the transport
+        # from the differentiation leaves so autograd sees d Omega/d mu AND d Omega/d sigma
+        # (query slots live; key slots follow the filtering/smoothing key-role split above).
+        omega = omega_builder(mu_q, sigma_q, mu_k, sigma_k)
     mu_t = transport_mean(omega, mu_k)                  # rank-agnostic: (N,N,K) or (B,N,N,K)
     # diagonal_out from the BELIEF shape (diagonal iff sigma has the same rank as mu) -- family-agnostic
     # (covers laplace_diagonal etc., not just gaussian_diagonal), so the batch-collapsed (N,N,K,K)

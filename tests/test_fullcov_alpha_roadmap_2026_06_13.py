@@ -319,6 +319,49 @@ def test_full_chunked_ce_grad_reaches_prior_tables():
     assert torch.isfinite(ch.prior_bank.sigma_log_embed.grad).all()
 
 
+def test_full_cov_chunked_matches_dense_on_non_pd():
+    """F6 (audit 2026-07-01): a non-PD Sigma_q position must yield -inf logits on BOTH the dense
+    full decode (gaussian_full ok-gating -> NaN -> kl_max=inf -> -inf) and the chunked closed form
+    (safe_cholesky ok mask -> logdet_q = -inf -> per_pos = -inf); PD positions agree to atol-1e-3.
+    Pre-fix the chunked path dropped the ok mask and returned finite-but-wrong logits there."""
+    from vfe3.model.prior_bank import _decode_full, _decode_full_chunked
+    torch.manual_seed(6)
+    V, B, N, K = 32, 2, 4, 4
+    pb = _full_model(vocab_size=V, decode_mode="full").prior_bank
+    mu_q = torch.randn(B, N, K)
+    A = torch.randn(B, N, K, K)
+    sigma_q = A @ A.transpose(-1, -2) + torch.eye(K)                     # all-PD base
+    sigma_q[0, 1] = torch.diag(torch.tensor([-5.0, 1.0, 1.0, 1.0]))     # eigenvalue -5 << -eps*1e5: all 5 jitter rounds fail
+    tau_eff = pb._tau_eff(None)
+    dense = _decode_full(pb, mu_q, sigma_q, tau_eff)                    # (B, N, V)
+    chunked = _decode_full_chunked(pb, mu_q, sigma_q, tau_eff)          # (B, N, V)
+    assert torch.isneginf(dense[0, 1]).all()
+    assert torch.isneginf(chunked[0, 1]).all()
+    good = torch.ones(B, N, dtype=torch.bool)
+    good[0, 1] = False
+    assert torch.allclose(chunked[good], dense[good], atol=1e-3)
+
+
+def test_full_cov_query_invariants_all_pd_byte_identical():
+    """On an all-PD Sigma_q the ok mask is all-True and torch.where selects logdet_q unchanged:
+    the invariants stay byte-identical to the ungated safe_cholesky log-det, so the all-PD
+    value-equality pins do not move."""
+    from vfe3.families.base import _logdet_chol
+    from vfe3.numerics import safe_cholesky
+    torch.manual_seed(7)
+    V, B, N, K = 32, 2, 4, 4
+    pb = _full_model(vocab_size=V, decode_mode="full").prior_bank
+    A = torch.randn(B, N, K, K)
+    sigma_q = A @ A.transpose(-1, -2) + torch.eye(K)
+    diag_sq_reg, logdet_q = pb._full_cov_query_invariants(sigma_q)
+    sq_reg = sigma_q + pb.eps * torch.eye(K)
+    L, ok = safe_cholesky(sq_reg, eps=pb.eps, rounds=5)
+    assert bool(ok.all())
+    assert torch.equal(logdet_q, _logdet_chol(L))
+    assert torch.isfinite(logdet_q).all()
+    assert torch.equal(diag_sq_reg, torch.diagonal(sq_reg, dim1=-2, dim2=-1))
+
+
 # ---------------------------------------------------------------------------
 # B2: per-head full-covariance transport sandwich. For a block-diagonal gauge (block_glk) the
 # congruence Omega Sigma Omega^T can be assembled block-pair by block-pair from the per-token exp

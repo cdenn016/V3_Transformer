@@ -53,8 +53,9 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
         belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
     n = belief.mu.shape[0]
     log_prior = model._attention_log_prior(n, token_ids.device)
-    rope = model._rope_rotation(n, token_ids.device)
-    return belief, log_prior, rope
+    log_prior = model._fold_precision_bias(log_prior, belief.sigma)   # no-op unless precision_weighted_attention;
+    rope = model._rope_rotation(n, token_ids.device)                  # belief.sigma is post-s_e_step, matching
+    return belief, log_prior, rope                                    # forward's beliefs.sigma (model.py:762)
 
 
 def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -> dict:
@@ -172,8 +173,8 @@ def belief_ce_bank(
     (``prior_bank.encode`` -> pos_phi -> the s-refine anchor under ``s_e_step`` -> the precision-bias
     fold -> ``vfe_stack`` with the trained head_mixer / cg_coupling / block_norm) for the per-token
     covariance ``out.sigma``, AND the inference forward ``model(tokens)`` for the decode logits, then
-    reduces the cross-entropy with ``reduction='none'``. The s-refine + precision fold are the two
-    steps belief_bank omits; they are reinstated here (no-ops on the pure default path) so the traced
+    reduces the cross-entropy with ``reduction='none'``. The s-refine + precision fold are applied
+    here (and, since the C9 fix, in ``belief_bank`` too; no-ops on the pure default path) so the traced
     Sigma_q IS the belief whose mean produced the logits -- otherwise tr(Sigma_q) and CE come from
     different beliefs under the live ``s_e_step=True`` / ``precision_weighted_attention=True`` config
     and the calibration headline reads off the wrong covariance. The belief at position n is the one
@@ -271,8 +272,12 @@ def belief_bank(
             tokens = tokens.to(device)
             beliefs = model.prior_bank.encode(tokens)
             beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi))
+            if cfg.s_e_step:                                       # anchor belief to the refined model channel
+                s_mu1, s_sigma1 = model._refine_s(tokens, beliefs.phi)
+                beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
             n = tokens.shape[1]
             log_prior = model._attention_log_prior(n, device)
+            log_prior = model._fold_precision_bias(log_prior, beliefs.sigma)   # no-op unless precision_weighted_attention
             rope = model._rope_rotation(n, device)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
@@ -572,8 +577,7 @@ def attention_entropy_cov_gap(
     cfg = model.cfg
     dev = _model_device(model)
     with torch.no_grad():                                          # snapshot build is grad-free
-        belief, log_prior, rope = _encode_one(model, token_ids)
-        log_prior = model._fold_precision_bias(log_prior, belief.sigma)   # match forward's beta prior
+        belief, log_prior, rope = _encode_one(model, token_ids)   # _encode_one folds the precision bias
         ikw = _iter_kwargs(model, log_prior, rope)
         mu_p, sigma_p = belief.mu, belief.sigma
         out = belief

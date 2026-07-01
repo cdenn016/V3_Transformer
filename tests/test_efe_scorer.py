@@ -165,6 +165,17 @@ def test_gates_and_horizon_guards_raise():
         get_ambiguity("sigma_mc")(torch.log_softmax(torch.randn(1, 4, 16), dim=-1))
 
 
+def test_sigma_mc_raise_names_flag_has_no_consumer():
+    # audit F5 (2026-07-01): the gate message must state that policy_sigma_ambiguity_validated ALONE
+    # does not unlock sigma_mc -- the flag is a precondition record with no executable consumer until
+    # a Phase-3 consumer that reads the validated artifact is added.
+    with pytest.raises(RuntimeError) as e:
+        get_ambiguity("sigma_mc")(torch.log_softmax(torch.randn(1, 4, 16), dim=-1))
+    msg = str(e.value)
+    assert "policy_sigma_ambiguity_validated" in msg
+    assert "does NOT unlock" in msg and "NO executable consumer" in msg
+
+
 def test_generate_policy_branch_dispatches_and_stays_in_vocab():
     # policy_mode != 'none' routes generate() through _policy_select; flat preference at v1 gives a
     # uniform EFE score, so greedy selection follows the candidate prior E (base menu) -- a valid run.
