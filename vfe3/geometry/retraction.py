@@ -33,9 +33,15 @@ def _check_sigma_max(sigma_max: Optional[float], eps: float) -> None:
 _RETRACTIONS: Dict[str, Callable[..., torch.Tensor]] = {}
 
 
-def register_retraction(name: str) -> Callable:
-    """Decorator registering an SPD covariance retraction sigma -> sigma_new."""
+def register_retraction(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering an SPD covariance retraction sigma -> sigma_new.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        if name in _RETRACTIONS and not override:
+            raise KeyError(f"retraction {name!r} already registered; pass override=True to replace")
         _RETRACTIONS[name] = fn
         return fn
     return _wrap

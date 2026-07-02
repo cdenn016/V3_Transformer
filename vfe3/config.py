@@ -108,6 +108,12 @@ class VFE3Config:
     link_alpha:                float = 1.0
     link_soft_cap:             float = 6.0
 
+    # Opt-in transport diagnostic (audit 2026-07-01 round-3, punch 12c): forward clamp_monitor=True
+    # into every production stable_matrix_exp_pair transport build, emitting a RuntimeWarning when
+    # the hard Frobenius clamp (max_norm=15) fires (the returned factor is then a surrogate, not
+    # exp(M)). Costs a tensor-reduction host sync per build; keep OFF on the training hot path.
+    transport_clamp_monitor:   bool  = False
+
     # Cross-head GL(K) coupling: a list of directed (head_a, head_b) index pairs that add off-block
     # generators (and a genuinely larger-than-direct-sum subalgebra under the builder's bracket
     # closure) to the gauge basis. Default None = the current block-diagonal GL(d_head)^H gauge.

@@ -60,7 +60,7 @@ _POLICY_FIELDS = ("policy_mode", "policy_preference", "policy_score_terms",
 def _load_checkpoint(cfg: dict):
     """Return (config_dict, state_dict) from a step_<N>.pt (has 'config'+'model_state') or a pure
     state_dict (best_model.pt) plus an optional `config_from` step checkpoint for the config."""
-    obj = torch.load(cfg["checkpoint"], map_location="cpu", weights_only=False)  # your own trusted ckpt
+    obj = torch.load(cfg["checkpoint"], map_location="cpu", weights_only=True)
     if isinstance(obj, dict) and "model_state" in obj:                 # resumable step_<N>.pt
         return dict(obj["config"]), obj["model_state"]
     # pure state_dict (best_model.pt): borrow the config from a sibling step checkpoint
@@ -68,7 +68,7 @@ def _load_checkpoint(cfg: dict):
         raise ValueError(
             f"{cfg['checkpoint']} looks like a pure state_dict with no embedded config; set "
             f"CONFIG['config_from'] to a step_<N>.pt from the same run to supply the architecture.")
-    src = torch.load(cfg["config_from"], map_location="cpu", weights_only=False)
+    src = torch.load(cfg["config_from"], map_location="cpu", weights_only=True)
     return dict(src["config"]), obj
 
 

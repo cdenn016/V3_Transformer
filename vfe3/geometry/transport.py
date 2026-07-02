@@ -112,6 +112,7 @@ _TRANSPORT_BATCH_INDEPENDENT: set = set()   # regimes whose Omega is the SAME fo
 
 def register_transport(
     name: str, *, needs_mu: bool = False, needs_sigma: bool = False, batch_independent: bool = False,
+    override: bool = False,
 ) -> Callable:
     """Decorator registering a transport (connection-regime) builder under ``name``.
 
@@ -125,9 +126,20 @@ def register_transport(
     returns a batch-collapsed ``(N, N, K, K)`` Omega that ``transport_mean`` / ``transport_covariance``
     broadcast across the batch (the D3 memory collapse). ``_transport`` reads this flag to skip the
     per-sequence ``[0]`` strip it applies to ordinary ``(B, N, N, K, K)`` builders.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an existing
+    name silently shadowed the first, so a config-selected seam could dispatch to an unintended
+    implementation. Pass ``override=True`` to replace deliberately; the replacement DISCARDS the
+    name from every metadata set first and re-adds per the new flags, so stale membership cannot
+    survive an override.
     """
     def _wrap(fn: Callable[..., TransportDict]) -> Callable[..., TransportDict]:
+        if name in _TRANSPORTS and not override:
+            raise KeyError(f"transport mode {name!r} already registered; pass override=True to replace")
         _TRANSPORTS[name] = fn
+        _TRANSPORT_NEEDS_MU.discard(name)             # override: drop stale metadata before re-adding
+        _TRANSPORT_NEEDS_SIGMA.discard(name)
+        _TRANSPORT_BATCH_INDEPENDENT.discard(name)
         if needs_mu:
             _TRANSPORT_NEEDS_MU.add(name)
         if needs_sigma:
@@ -210,7 +222,8 @@ def _build_flat(
     group:      GaugeGroup,               # supplies generators, skew flag, irrep_dims
 
     *,
-    gauge_mode: str = "learned",          # 'learned' (Regime I flat) or 'trivial'
+    gauge_mode:    str  = "learned",      # 'learned' (Regime I flat) or 'trivial'
+    clamp_monitor: bool = False,          # opt-in: warn when the exp Frobenius clamp fires
     **kwargs,                             # tolerated (a future non-flat builder shares this shape)
 ) -> TransportDict:
     r"""Flat (Regime I) phi-cocycle transport: the registered default.
@@ -220,7 +233,7 @@ def _build_flat(
     keyword args are tolerated and ignored so a future stateful non-flat (Regime II) builder can
     share this call shape without editing the registry call sites.
     """
-    return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
+    return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
 
 
 @register_transport("regime_ii", needs_mu=True)
@@ -232,6 +245,7 @@ def _build_regime_ii(
     gauge_mode:         str                       = "learned",   # 'learned' (flat vertex factors) | 'trivial'
     cocycle_relaxation: float                     = 1.0,         # homotopy alpha in [0,1]; 0 -> flat
     delta_soft_cap:     float                     = 12.0,        # smooth bound on ||delta_ij . G||_F (< exp clamp max_norm=15)
+    clamp_monitor:      bool                      = False,       # opt-in: warn when the exp Frobenius clamp fires
     mu:                 Optional[torch.Tensor]    = None,        # (B, N, K) QUERY-slot means; the bilinear delta reads these
     connection_W:       Optional[torch.Tensor]    = None,        # (n_gen, K, K) learned bilinear connection (NN exception)
     mu_key:             Optional[torch.Tensor]    = None,        # (B, N, K) KEY-slot means (None -> mu); the filtering
@@ -302,12 +316,12 @@ def _build_regime_ii(
     # short-circuiting there would sever the autograd graph and freeze the parameter at init. The full
     # einsum path keeps W in the graph so the loss backpropagates to it.
     if connection_W is None or cocycle_relaxation == 0.0 or gauge_mode == "trivial":
-        return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
+        return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
 
     # Vertex factors exp(phi_i), exp(-phi_j) in FACTORED form (audit 2026-06-10 F8a): the same
     # stable exp machinery as the flat builder, WITHOUT materializing the dense (B, N, N, K, K)
     # flat Omega this path would immediately discard.
-    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
+    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
 
     mu_k = mu_key if mu_key is not None else mu
@@ -360,7 +374,7 @@ def _build_regime_ii(
         # 2026-06-10 F8c; the soft cap above keeps the blocks in the well-conditioned exp regime).
         exp_delta_c, _ = stable_matrix_exp_pair(
             delta_mat_c, skew_symmetric=group.skew_symmetric, only_forward=True,
-            block_dims=block_dims, exp_dim=exp_dim,
+            block_dims=block_dims, exp_dim=exp_dim, clamp_monitor=clamp_monitor,
         )                                                                      # (B, C, N, K, K)
         # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
         omega_chunks.append(
@@ -408,6 +422,7 @@ def _build_regime_ii_covariant(
     gauge_mode:         str                       = "learned",   # 'learned' (flat vertex factors) | 'trivial'
     cocycle_relaxation: float                     = 1.0,         # homotopy alpha in [0,1]; 0 -> flat
     delta_soft_cap:     float                     = 12.0,        # smooth bound on ||delta_ij . G||_F
+    clamp_monitor:      bool                      = False,       # opt-in: warn when the exp Frobenius clamp fires
     mu:                 Optional[torch.Tensor]    = None,        # (B, N, K) QUERY means
     sigma:              Optional[torch.Tensor]    = None,        # (B, N, K) diag OR (B, N, K, K) full QUERY covariance
     connection_M:       Optional[torch.Tensor]    = None,        # (n_gen, 3) learned invariant-feature map (NN exception)
@@ -453,7 +468,7 @@ def _build_regime_ii_covariant(
     # but d Omega / d M at M=0 is the generator structure (exp'(0)=I), so the generic path keeps M
     # in the autograd graph (it would otherwise freeze at init).
     if connection_M is None or cocycle_relaxation == 0.0 or gauge_mode == "trivial":
-        return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
+        return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
 
     # Contract guard (audit 2026-06-18): with a connection the edge features need the query belief
     # (mu, sigma); a missing one would otherwise raise an opaque AttributeError on `.dim()` below.
@@ -464,7 +479,7 @@ def _build_regime_ii_covariant(
             f"sigma={'None' if sigma is None else 'tensor'}."
         )
 
-    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
+    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
 
     mu_k     = mu_key   if mu_key   is not None else mu
@@ -527,7 +542,7 @@ def _build_regime_ii_covariant(
 
         exp_delta_c, _ = stable_matrix_exp_pair(
             delta_mat_c, skew_symmetric=group.skew_symmetric, only_forward=True,
-            block_dims=block_dims, exp_dim=exp_dim,
+            block_dims=block_dims, exp_dim=exp_dim, clamp_monitor=clamp_monitor,
         )                                                                      # (B, C, N, K, K)
         # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
         omega_chunks.append(
@@ -546,6 +561,7 @@ def _direct_link_edge_exp(
     *,
     link_alpha:    float = 1.0,
     link_soft_cap: float = 6.0,
+    clamp_monitor: bool  = False,             # opt-in: warn when the exp Frobenius clamp fires
     device:        Optional[torch.device] = None,
     dtype:         Optional[torch.dtype]  = None,
 ) -> torch.Tensor:                            # (N, N, K, K) exp(link_alpha * A_ij . G)
@@ -586,6 +602,7 @@ def _direct_link_edge_exp(
     exp_link, _ = stable_matrix_exp_pair(
         link_mat, skew_symmetric=group.skew_symmetric, only_forward=True,
         block_dims=block_dims, exp_dim=(max(block_dims) if block_dims is not None else None),
+        clamp_monitor=clamp_monitor,
     )                                                                              # (N, N, K, K)
     return exp_link.to(dtype)
 
@@ -599,6 +616,7 @@ def _build_regime_ii_link(
     gauge_mode:         str                    = "learned",
     link_alpha:         float                  = 1.0,
     link_soft_cap:      float                  = 6.0,
+    clamp_monitor:      bool                   = False,  # opt-in: warn when the exp Frobenius clamp fires
     connection_L:       Optional[torch.Tensor] = None,   # (max_seq_len, max_seq_len, n_gen) learned direct link (NN exception)
     **kwargs,                                            # tolerated (shares the flat builder's call shape)
 ) -> TransportDict:
@@ -628,7 +646,7 @@ def _build_regime_ii_link(
     Returns the SAME dict keys as the flat builder: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K) (both
     UNUSED for the bare link, kept for dict parity), 'Omega' (N,N,K,K).
     """
-    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
+    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K), unused
     N = phi.shape[1]
     K = group.generators.shape[-1]
@@ -641,7 +659,8 @@ def _build_regime_ii_link(
         omega = torch.eye(K, device=device, dtype=dtype).expand(N, N, K, K).contiguous()
         return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
     omega = _direct_link_edge_exp(connection_L, group, N, link_alpha=link_alpha,
-                                  link_soft_cap=link_soft_cap, device=device, dtype=dtype)   # (N,N,K,K)
+                                  link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
+                                  device=device, dtype=dtype)                                # (N,N,K,K)
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
@@ -654,6 +673,7 @@ def _build_regime_ii_link_charted(
     gauge_mode:         str                    = "learned",
     link_alpha:         float                  = 1.0,
     link_soft_cap:      float                  = 6.0,
+    clamp_monitor:      bool                   = False,  # opt-in: warn when the exp Frobenius clamp fires
     connection_L:       Optional[torch.Tensor] = None,   # (max_seq_len, max_seq_len, n_gen) learned direct link (NN exception)
     **kwargs,                                            # tolerated (shares the flat builder's call shape)
 ) -> TransportDict:
@@ -680,12 +700,13 @@ def _build_regime_ii_link_charted(
     # Flat (cocycle) fast path: no connection / link_alpha=0 / trivial gauge -> exp(phi_i)exp(-phi_j)
     # byte-identically. A zero (grad-requiring) connection_L is NOT short-circuited (autograd at A=0).
     if connection_L is None or link_alpha == 0.0 or gauge_mode == "trivial":
-        return compute_transport_operators(phi, group, gauge_mode=gauge_mode)
-    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode)
+        return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
+    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
     N = phi.shape[1]
     exp_link = _direct_link_edge_exp(connection_L, group, N, link_alpha=link_alpha,
-                                     link_soft_cap=link_soft_cap, device=phi.device, dtype=phi.dtype)  # (N,N,K,K)
+                                     link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
+                                     device=phi.device, dtype=phi.dtype)                     # (N,N,K,K)
     # Omega_ij = exp(phi_i) @ exp(link A_ij) @ exp(-phi_j); the batch-independent exp_link broadcasts.
     omega = torch.einsum("bikl,ijlm,bjmn->bijkn", exp_phi, exp_link, exp_neg_phi)   # (B, N, N, K, K)
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
@@ -844,7 +865,8 @@ def compute_transport_operators(
     group:      GaugeGroup,               # supplies generators, skew flag, irrep_dims
 
     *,
-    gauge_mode: str = "learned",          # 'learned' (Regime I flat) or 'trivial'
+    gauge_mode:    str  = "learned",      # 'learned' (Regime I flat) or 'trivial'
+    clamp_monitor: bool = False,          # opt-in: warn when the exp Frobenius clamp fires
 ) -> TransportDict:
     r"""phi/exp transport Omega_ij = exp(phi_i) @ exp(-phi_j) in GL+(K).
 
@@ -894,6 +916,7 @@ def compute_transport_operators(
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
         phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims,
         exp_dim=(max(block_dims) if block_dims is not None else None),
+        clamp_monitor=clamp_monitor,
     )
     omega = torch.einsum("bikl,bjlm->bijkm", exp_phi, exp_neg_phi)
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
@@ -904,7 +927,8 @@ def build_factored_transport(
     group:      GaugeGroup,               # block-diagonal with equal blocks (len(irrep_dims) > 1)
 
     *,
-    gauge_mode: str = "learned",          # 'learned' (Regime I flat) or 'trivial'
+    gauge_mode:    str  = "learned",      # 'learned' (Regime I flat) or 'trivial'
+    clamp_monitor: bool = False,          # opt-in: warn when the exp Frobenius clamp fires
 ) -> FactoredTransport:
     r"""Flat phi-cocycle transport in FACTORED form, skipping the dense (..., N, N, K, K) Omega.
 
@@ -933,6 +957,7 @@ def build_factored_transport(
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
         phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims,
         exp_dim=(max(block_dims) if block_dims is not None else None),
+        clamp_monitor=clamp_monitor,
     )
     return FactoredTransport(exp_phi=exp_phi, exp_neg_phi=exp_neg_phi, irrep_dims=list(group.irrep_dims))
 

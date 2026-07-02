@@ -84,9 +84,15 @@ class GaugeGroup:
 _GROUPS: Dict[str, Callable[..., GaugeGroup]] = {}
 
 
-def register_group(name: str) -> Callable:
-    """Decorator registering a GaugeGroup builder under ``name``."""
+def register_group(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a GaugeGroup builder under ``name``.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable[..., GaugeGroup]) -> Callable[..., GaugeGroup]:
+        if name in _GROUPS and not override:
+            raise KeyError(f"gauge group {name!r} already registered; pass override=True to replace")
         _GROUPS[name] = fn
         return fn
     return _wrap

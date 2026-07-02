@@ -45,7 +45,7 @@ _AMBIGUITIES: Dict[str, Callable] = {}
 _GENERATE_SAFE_PREFERENCES: frozenset = frozenset({"flat"})
 
 
-def register_policy(name: str, override: bool = False) -> Callable:
+def register_policy(name: str, *, override: bool = False) -> Callable:
     """Decorator registering a policy scorer under ``name`` (cf. :func:`vfe3.alpha_i.register_alpha`).
     Duplicate keys fail closed (audit F12): re-registering an existing ``name`` raises ``KeyError``
     unless ``override=True``, so a second registration cannot silently shadow the first."""
@@ -64,9 +64,15 @@ def get_policy(name: str) -> Callable:
     return _POLICIES[name]
 
 
-def register_preference(name: str) -> Callable:
-    """Decorator registering a preference p(o | C) builder under ``name``."""
+def register_preference(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a preference p(o | C) builder under ``name``.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable) -> Callable:
+        if name in _PREFERENCES and not override:
+            raise KeyError(f"preference {name!r} already registered; pass override=True to replace")
         _PREFERENCES[name] = fn
         return fn
     return _wrap
@@ -79,9 +85,15 @@ def get_preference(name: str) -> Callable:
     return _PREFERENCES[name]
 
 
-def register_ambiguity(name: str) -> Callable:
-    """Decorator registering an ambiguity / epistemic estimator under ``name``."""
+def register_ambiguity(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering an ambiguity / epistemic estimator under ``name``.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable) -> Callable:
+        if name in _AMBIGUITIES and not override:
+            raise KeyError(f"ambiguity {name!r} already registered; pass override=True to replace")
         _AMBIGUITIES[name] = fn
         return fn
     return _wrap

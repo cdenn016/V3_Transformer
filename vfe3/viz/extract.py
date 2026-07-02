@@ -25,7 +25,9 @@ from vfe3.free_energy import (
     self_divergence_for_alpha,
 )
 from vfe3.inference.e_step import _transport, e_step_iteration, free_energy_value
-from vfe3.geometry.transport import transport_covariance, transport_mean
+# Transport-mode state-routing sets (registry metadata, as model.py): the extractors below feed
+# mu/sigma to _transport by membership here, never by matching literal mode names.
+from vfe3.geometry.transport import _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA, transport_covariance, transport_mean
 from vfe3.model.block import vfe_block
 
 
@@ -418,8 +420,8 @@ def numerical_health(
     # described a flat-transport belief, not the model that trained. Mirrors converged_state.
     omega = _transport(
         out.phi, model.group, transport_mode=cfg.transport_mode,
-        mu=(out.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
-        sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
+        mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
+        sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
         connection_W=getattr(model, "connection_W", None),
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
@@ -507,8 +509,8 @@ def converged_state(
             sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
         omega = _transport(                                            # (N, N, K, K) phi-cocycle (pre-rope)
             out.phi, model.group, transport_mode=cfg.transport_mode,
-            mu=(out.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
-            sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
+            mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
+            sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
             connection_W=getattr(model, "connection_W", None),
             connection_M=getattr(model, "connection_M", None),
             connection_L=getattr(model, "connection_L", None),
@@ -585,8 +587,8 @@ def attention_entropy_cov_gap(
             out = e_step_iteration(out, mu_p, sigma_p, model.group, **ikw)
         omega = _transport(
             out.phi, model.group, transport_mode=cfg.transport_mode,
-            mu=(out.mu if cfg.transport_mode in ("regime_ii", "regime_ii_covariant") else None),
-            sigma=(out.sigma if cfg.transport_mode == "regime_ii_covariant" else None),
+            mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
+            sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
             connection_W=getattr(model, "connection_W", None),
             connection_M=getattr(model, "connection_M", None),
             connection_L=getattr(model, "connection_L", None),

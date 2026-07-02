@@ -742,10 +742,11 @@ def holonomy_wilson_sampled(
     omega:      torch.Tensor,            # (N, N, K, K) pairwise transport Omega_ij
 
     *,
-    n_heads:    int  = 1,
-    n_triples:  int  = 512,
-    n_boot:     int  = 200,
-    seed:       int  = 0,
+    n_heads:    int                 = 1,
+    n_triples:  int                 = 512,
+    n_boot:     int                 = 200,
+    seed:       int                 = 0,
+    irrep_dims: Optional[List[int]] = None,   # per-block dims d_b of an unequal irrep tower (sum d_b = K)
 ) -> Dict[str, torch.Tensor]:
     r"""Wilson holonomy observable W_ijk = Re Tr(H_ijk) over random distinct triples.
 
@@ -755,14 +756,25 @@ def holonomy_wilson_sampled(
     ``holonomy_deviation_sampled``'s Frobenius ||H - I||_F. When ``n_heads > 1`` the gauge is
     block-diagonal H = oplus_h H^(h), so Tr(H) = sum_h Tr(H^(h)) and the per-head observable is
     W^(h)/d_k with d_k = K / n_heads; the per-head normalized values average back to the full W/K.
+    That equal-chunk reshape assumes n_heads EQUAL contiguous blocks; for an UNEQUAL irrep tower
+    (so_n/sp_n direct sums with per-block dims like [3, 5]) pass ``irrep_dims`` (audit 2026-07-01
+    round-3): the diagonal is split per block and each block b reports W^(b)/d_b = Re Tr(H^(b))/d_b,
+    so the d_b-weighted mean sum_b (d_b/K) W^(b)/d_b recovers the full W/K; ``irrep_dims=None``
+    keeps the equal-chunk decomposition byte-identical.
     The real part is exact (= Tr) for the real groups built today; it would need ``.real`` only for
     a complex GL(K, C) gauge. On the flat phi-cocycle every triangle closes so W/K = 1 (deviation 0);
     genuine holonomy appears only under the opt-in regime_ii connection. Seeded random triples match
     ``holonomy_deviation_sampled`` so the two observables are directly comparable.
     """
     n, k = omega.shape[0], omega.shape[-1]
-    if n_heads > 1 and k % n_heads != 0:
+    if irrep_dims is not None:
+        if sum(irrep_dims) != k:
+            raise ValueError(f"sum(irrep_dims)={sum(irrep_dims)} must equal K={k}")
+        if n_heads > 1 and len(irrep_dims) != n_heads:
+            raise ValueError(f"len(irrep_dims)={len(irrep_dims)} must match n_heads={n_heads}")
+    elif n_heads > 1 and k % n_heads != 0:
         raise ValueError(f"n_heads={n_heads} must divide K={k} for the per-head Wilson decomposition")
+    n_blocks = n_heads if irrep_dims is None else len(irrep_dims)
     gen = torch.Generator(device=omega.device).manual_seed(int(seed))
     draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=omega.device)
     keep = (draw[:, 0] != draw[:, 1]) & (draw[:, 1] != draw[:, 2]) & (draw[:, 0] != draw[:, 2])
@@ -771,7 +783,7 @@ def holonomy_wilson_sampled(
         z = omega.new_zeros(())
         return {"wilson_mean": omega.new_ones(()), "deviation_mean": z, "ci_lo": z, "ci_hi": z,
                 "per_triple": omega.new_zeros(0), "span": omega.new_zeros(0),
-                "per_head": omega.new_ones(n_heads)}
+                "per_head": omega.new_ones(n_blocks)}
     h = omega[idx[:, 0], idx[:, 1]] @ omega[idx[:, 1], idx[:, 2]] @ omega[idx[:, 2], idx[:, 0]]   # (T, K, K)
     diag = torch.diagonal(h, dim1=-2, dim2=-1)                   # (T, K) Re diagonal of H
     per = diag.sum(dim=-1) / k                                   # (T,) W_ijk / K
@@ -779,8 +791,12 @@ def holonomy_wilson_sampled(
     dev = 1.0 - per                                              # (T,) Wilson-action density 1 - W/K
     ridx = torch.randint(0, dev.shape[0], (n_boot, dev.shape[0]), generator=gen, device=omega.device)
     boot = dev[ridx].mean(dim=1)
-    d_k = k // n_heads
-    per_head = diag.reshape(diag.shape[0], n_heads, d_k).sum(dim=-1).mean(dim=0) / d_k   # (n_heads,) W^(h)/d_k
+    if irrep_dims is not None:
+        blocks   = torch.split(diag, irrep_dims, dim=-1)             # B chunks, each (T, d_b)
+        per_head = torch.stack([b.sum(dim=-1).mean(dim=0) / b.shape[-1] for b in blocks])   # (B,) W^(b)/d_b
+    else:
+        d_k = k // n_heads
+        per_head = diag.reshape(diag.shape[0], n_heads, d_k).sum(dim=-1).mean(dim=0) / d_k   # (n_heads,) W^(h)/d_k
     return {
         "wilson_mean":    per.mean(),
         "deviation_mean": dev.mean(),
@@ -1123,9 +1139,16 @@ def head_mixer_gauge_residual(
 _METRICS: Dict[str, Callable] = {}
 
 
-def register_metric(name: str) -> Callable:
-    """Decorator registering a metric that reads its inputs from the context kwargs."""
+def register_metric(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a metric that reads its inputs from the context kwargs.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first, so a config-selected probe could dispatch to
+    an unintended implementation. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable) -> Callable:
+        if name in _METRICS and not override:
+            raise KeyError(f"metric {name!r} already registered; pass override=True to replace")
         _METRICS[name] = fn
         return fn
     return _wrap

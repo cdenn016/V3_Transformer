@@ -179,6 +179,7 @@ def generate_figures(
         if not available:
             logger.info("figure %r skipped (input unavailable)", name)
             return
+        _before = set(figs.plt.get_fignums())            # registry snapshot for the leak sweep below
         try:
             path = figdir / f"{name}.png"
             fig = thunk(str(path))
@@ -186,6 +187,10 @@ def generate_figures(
             written.append(path)
             logger.info("figure -> %s", path)
         except Exception as exc:
+            # The thunk can register a pyplot figure and then raise (tight_layout/savefig) before
+            # _emit ever receives it; close what it registered (audit 2026-07-01 round-3).
+            for num in set(figs.plt.get_fignums()) - _before:
+                figs.plt.close(num)
             logger.warning("figure %r failed (%s); continuing", name, exc)
 
     _emit("estep_convergence",

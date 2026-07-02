@@ -121,7 +121,8 @@ def test_write_artifact_separator_id(tmp_path):
     path = write_sigma_gate_artifact({"status": "PASS"}, checkpoint_id="a/b:c",
                                      spec_commit="x", seeds=(6,), out_dir=str(tmp_path))
     assert Path(path).resolve().parent == tmp_path.resolve()
-    assert Path(path).name == "a_b_c.json"
+    # slug + stable 8-hex hash of the RAW id (collision disambiguator, audit 2026-07-01 round-3)
+    assert Path(path).name.startswith("a_b_c__") and Path(path).name.endswith(".json")
     assert not (tmp_path / "a").exists()                         # no nested directory created
 
 

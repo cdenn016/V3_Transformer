@@ -1539,6 +1539,7 @@ class VFEModel(nn.Module):
             connection_M=getattr(self, "connection_M", None),
             connection_L=getattr(self, "connection_L", None),
             link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+            clamp_monitor=cfg.transport_clamp_monitor,
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
         if rope is not None:
@@ -1804,6 +1805,7 @@ class VFEModel(nn.Module):
                 connection_M=getattr(self, "connection_M", None),
                 connection_L=getattr(self, "connection_L", None),
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+                clamp_monitor=cfg.transport_clamp_monitor,
                 cocycle_relaxation=cfg.cocycle_relaxation,
             )                                                        # (N, N, K, K)
             if rope is not None:
@@ -1907,6 +1909,7 @@ class VFEModel(nn.Module):
                 connection_M=getattr(self, "connection_M", None),
                 connection_L=getattr(self, "connection_L", None),
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+                clamp_monitor=cfg.transport_clamp_monitor,
                 cocycle_relaxation=cfg.cocycle_relaxation,
             )
             if rope is not None:

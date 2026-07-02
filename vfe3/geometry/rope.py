@@ -20,9 +20,15 @@ import torch
 _POS_ROTATIONS: Dict[str, Callable[..., Optional[torch.Tensor]]] = {}
 
 
-def register_pos_rotation(name: str) -> Callable:
-    """Decorator registering a positional-rotation builder -> (N, K, K) rotation or None."""
+def register_pos_rotation(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a positional-rotation builder -> (N, K, K) rotation or None.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable[..., Optional[torch.Tensor]]) -> Callable[..., Optional[torch.Tensor]]:
+        if name in _POS_ROTATIONS and not override:
+            raise KeyError(f"positional rotation {name!r} already registered; pass override=True to replace")
         _POS_ROTATIONS[name] = fn
         return fn
     return _wrap

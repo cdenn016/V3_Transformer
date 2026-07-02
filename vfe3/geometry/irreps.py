@@ -47,8 +47,17 @@ def register_irrep(
     key:      str,                                          # 'algebra:prefix', e.g. 'so:l'
     dim_fn:   Callable[[int, int], int],                    # (N, rank) -> block dimension
     build_fn: Callable[[torch.Tensor, int], torch.Tensor],  # (G_def, rank) -> (n_gen, d, d)
+
+    *,
+    override: bool = False,
 ) -> None:
-    """Register an irrep family under ``key`` (label grammar: '<prefix><rank>')."""
+    """Register an irrep family under ``key`` (label grammar: '<prefix><rank>').
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing key silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
+    if key in _IRREPS and not override:
+        raise KeyError(f"irrep family {key!r} already registered; pass override=True to replace")
     _IRREPS[key] = (dim_fn, build_fn)
 
 

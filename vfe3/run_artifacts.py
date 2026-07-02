@@ -54,15 +54,25 @@ def _atomic_replace(
     name (audit 2026-07-01 C11). Retries with backoff on ``PermissionError`` -- Windows can hold a
     transient open-handle lock on the destination (this host has hit it on ``best_model.pt``) --
     and re-raises any other error (and the last ``PermissionError``) so a real failure is never
-    swallowed."""
+    swallowed. On the raising paths the orphaned ``tmp`` is best-effort deleted first (audit
+    2026-07-01 round-3); between retries it must survive (it is the source of the next replace)."""
+    def _cleanup_tmp() -> None:
+        try:                                             # cleanup failure must not mask the original error
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
     for i in range(retries):
         try:
             os.replace(tmp, final)
             return
         except PermissionError:
             if i == retries - 1:
+                _cleanup_tmp()
                 raise
             time.sleep(delay)
+        except Exception:
+            _cleanup_tmp()
+            raise
 
 
 class RunArtifacts:

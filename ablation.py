@@ -14,8 +14,10 @@ Two sweep shapes are supported, both declared in the ``SWEEPS`` registry:
 
 The baseline is the self-contained ``BASELINE_CONFIG`` dict below -- a full ``VFE3Config`` toggle
 set kept deliberately separate from ``train_vfe3.py`` so an ablation can pin its own (fast)
-operating point. It currently matches train_vfe3.py's K=20 / block_glk point; keep the two in sync
-by hand when the training operating point moves. Each run gets a self-contained
+operating point. It tracks train_vfe3.py's K=20 / block_glk point except for three intentional
+deltas: ``m_gauge_update_rule`` ("adam" here vs "heavy_ball" there), ``phi_precond_mode``
+("killing_per_block" vs "pullback_per_block"), and ``m_p_sigma_lr`` (0.0035 vs 0.0045); keep the
+two in sync by hand when the training operating point moves. Each run gets a self-contained
 ``RunArtifacts`` directory (``config.json``, ``metrics.csv``, ``best_model.pt``, figures)
 nested under its sweep, plus an ``ablation_result.json`` headline used for resume and the
 sweep-level leaderboard.

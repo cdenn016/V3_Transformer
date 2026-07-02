@@ -205,9 +205,15 @@ def check_finite(
 _MONITORS: Dict[str, Callable[[torch.Tensor], float]] = {}
 
 
-def register_monitor(name: str) -> Callable:
-    """Decorator registering a scalar numerical monitor under ``name``."""
+def register_monitor(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a scalar numerical monitor under ``name``.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable[[torch.Tensor], float]) -> Callable[[torch.Tensor], float]:
+        if name in _MONITORS and not override:
+            raise KeyError(f"monitor {name!r} already registered; pass override=True to replace")
         _MONITORS[name] = fn
         return fn
     return _wrap
