@@ -22,9 +22,15 @@ from vfe3.gradients.oracle import belief_gradients_autograd
 _KERNELS: Dict[str, Callable] = {}
 
 
-def register_kernel(name: str) -> Callable:
-    """Decorator registering a query-side belief-gradient kernel under family ``name``."""
+def register_kernel(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a query-side belief-gradient kernel under family ``name``.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable) -> Callable:
+        if name in _KERNELS and not override:
+            raise KeyError(f"kernel {name!r} already registered; pass override=True to replace")
         _KERNELS[name] = fn
         return fn
     return _wrap

@@ -80,6 +80,7 @@ def vfe_block(
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
         cocycle_relaxation=cfg.cocycle_relaxation, connection_W=connection_W, connection_M=connection_M,
         connection_L=connection_L, link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+        clamp_monitor=cfg.transport_clamp_monitor,
         e_step_gradient=e_step_gradient, oracle_unroll_grad=cfg.oracle_unroll_grad,
         grad_record=grad_record,
         log_prior=log_prior,

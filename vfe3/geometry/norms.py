@@ -13,9 +13,15 @@ import torch
 _NORMS: Dict[str, Callable] = {}
 
 
-def register_norm(name: str) -> Callable:
-    """Decorator registering a norm builder under ``name``."""
+def register_norm(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a norm builder under ``name``.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable) -> Callable:
+        if name in _NORMS and not override:
+            raise KeyError(f"norm {name!r} already registered; pass override=True to replace")
         _NORMS[name] = fn
         return fn
     return _wrap

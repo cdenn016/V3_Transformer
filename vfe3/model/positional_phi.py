@@ -19,9 +19,15 @@ from vfe3.geometry.lie_ops import compose_phi, project_phi_to_slk
 _POS_PHI: Dict[str, Callable[..., Optional[torch.Tensor]]] = {}
 
 
-def register_pos_phi(name: str) -> Callable:
-    """Decorator registering a pos-phi coordinate builder -> (N, n_gen) coords or None."""
+def register_pos_phi(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a pos-phi coordinate builder -> (N, n_gen) coords or None.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable[..., Optional[torch.Tensor]]) -> Callable[..., Optional[torch.Tensor]]:
+        if name in _POS_PHI and not override:
+            raise KeyError(f"positional phi {name!r} already registered; pass override=True to replace")
         _POS_PHI[name] = fn
         return fn
     return _wrap

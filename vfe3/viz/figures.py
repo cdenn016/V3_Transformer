@@ -424,9 +424,15 @@ _FIGURES: Dict[str, Callable] = {
 }
 
 
-def register_figure(name: str) -> Callable:
-    """Decorator registering a figure generator under ``name``."""
+def register_figure(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a figure generator under ``name``.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable) -> Callable:
+        if name in _FIGURES and not override:
+            raise KeyError(f"figure {name!r} already registered; pass override=True to replace")
         _FIGURES[name] = fn
         return fn
     return _wrap
@@ -990,9 +996,11 @@ def plot_geometry_health(
     Surfaces the converged-state geometry scalars ``diagnostics()`` already logs to ``metrics.csv`` but
     that no standard figure plotted: holonomy / cocycle flatness, gauge-frame magnitude and spread,
     belief-covariance conditioning and effective rank, belief Fisher precision, numerical-guard
-    saturation, and attention-entropy collapse. Together they say whether the learned geometry stays
-    meaningful rather than degenerating to a flat cocycle (phi -> 0, an UNGAUGED transformer) or a
-    guard-pinned fixed point. Each panel self-gates on column presence."""
+    saturation, attention-entropy collapse, and learned-connection / head-mixer trainability
+    (norms of the opt-in ``connection_W`` / ``connection_M`` / ``connection_L`` and the head-mixer
+    drift from identity -- audit 2026-07-01 round-3). Together they say whether the learned geometry
+    stays meaningful rather than degenerating to a flat cocycle (phi -> 0, an UNGAUGED transformer) or
+    a guard-pinned fixed point. Each panel self-gates on column presence."""
     panels = [
         {"title": "Holonomy / cocycle flatness", "ylabel": "curvature", "logy": True, "series": [
             ("holonomy_wilson", r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$ (gauge-invariant)", _CB[0]),
@@ -1024,6 +1032,12 @@ def plot_geometry_health(
         {"title": "Attention-entropy collapse", "ylabel": "count / nats", "series": [
             ("attn_entropy_collapsed_heads", "collapsed heads", _CB[0]),
             ("attn_entropy_min", "min row entropy", _CB[3])]},
+        {"title": "Learned-connection trainability", "ylabel": "norm / drift", "logy": True, "series": [
+            ("connection_w_norm", r"$\|W\|_F$ (regime II)", _CB[0]),
+            ("connection_m_norm", r"$\|M\|_F$ (covariant)", _CB[1]),
+            ("connection_l_norm", r"$\|L\|_F$ (direct link)", _CB[2]),
+            ("connection_l_offdiag_norm", r"$\|L\|_F$ off-diag", _CB[4]),
+            ("head_mixer_drift", "head-mixer drift", _CB[5])]},
     ]
     return _history_dashboard(history, panels, "Gauge / SPD / Fisher geometry health", path)
 
@@ -1428,38 +1442,6 @@ def _token_category_labels(
     ids = _np(token_ids).astype(int)
     cat = {int(t): fn(decode([int(t)])) for t in np.unique(ids)}
     return np.array([cat[int(t)] for t in ids]), names
-
-
-def _scatter_by_category(ax, coords: np.ndarray, labels, names) -> None:
-    r"""Scatter ``coords`` coloured by integer ``labels`` with a per-category legend (count shown).
-
-    ``labels is None`` (no decoder available) degrades to a single-colour scatter and no legend."""
-    if labels is None:
-        ax.scatter(coords[:, 0], coords[:, 1], s=10, alpha=0.5, color="#999999", linewidths=0)
-        return
-    for idx, name in enumerate(names):
-        m = labels == idx
-        if not m.any():
-            continue
-        ax.scatter(coords[m, 0], coords[m, 1], s=12, alpha=0.6, linewidths=0,
-                   color=_CB[idx % len(_CB)], label=f"{name} ({int(m.sum())})")
-    ax.legend(fontsize=6.5, frameon=False, markerscale=1.6, loc="best")
-
-
-def _annotate_frequent_tokens(ax, coords: np.ndarray, token_ids: np.ndarray, decode, n_label: int) -> None:
-    r"""Mark + label the ``n_label`` most frequent tokens at the CENTROID of their occurrences."""
-    if n_label <= 0:
-        return
-    uniq, counts = np.unique(token_ids, return_counts=True)
-    for t in uniq[np.argsort(counts)[::-1][:n_label]]:
-        m = token_ids == t
-        cx, cy = float(coords[m, 0].mean()), float(coords[m, 1].mean())
-        txt = (decode([int(t)]).strip() if decode is not None else str(int(t))) or "·"
-        ax.scatter([cx], [cy], s=45, marker="*", facecolor="white", edgecolor="black",
-                   linewidths=0.8, zorder=5)
-        ax.annotate(txt, (cx, cy), fontsize=8, fontweight="bold", zorder=6,
-                    xytext=(3, 3), textcoords="offset points",
-                    bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.7))
 
 
 def _cluster_embedding(

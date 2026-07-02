@@ -328,7 +328,8 @@ def train_step(
     if grad_accum_steps == 1:                                   # default path: byte-identical to the single-step loop
         _, loss, ce = model(tokens, targets, estep_grad_out=_egrad)
         _scaler.scale(loss).backward()
-        step_loss = float(loss.detach())
+        _loss_det = loss.detach()                               # host read DEFERRED: fused with the grad-finite
+        step_loss = None                                        # flag at the gate below (audit 2026-07-01 round-3)
         # CE is synced to a Python float only when a metrics dict is being filled this step (it feeds
         # metrics_out['train_ce'] and nothing else); on a silent step the extra D2H copy is skipped.
         step_ce = (float(ce.detach()) if (ce is not None and metrics_out is not None) else float("nan"))
@@ -382,15 +383,24 @@ def train_step(
     # Finite-GRADIENT gate (audit 2026-07-01 F1): a FINITE scalar loss can still carry a NaN/Inf
     # parameter gradient through the unrolled E-step on a degenerate batch; stepping AdamW on it
     # would permanently poison the exp_avg/exp_avg_sq moment buffers. Checked on EVERY step on the
-    # disabled-scaler default path (one extra D2H sync); the ENABLED fp16 scaler path already skips
-    # internally via found_inf, so it stays byte-identical and is not re-checked here.
+    # disabled-scaler default path; the deferred step-loss value and the grad-finite flag ride ONE
+    # fused D2H transfer, so the default path keeps exactly one unconditional sync per step
+    # (audit 2026-07-01 round-3). The ENABLED fp16 scaler path already skips internally via
+    # found_inf, so it stays byte-identical and is not re-checked here.
     _scaler_enabled = scaler is not None and scaler.is_enabled()
     grad_finite = True
     if not _scaler_enabled:
         _flags = [torch.isfinite(p.grad).all()
                   for g in optimizer.param_groups
                   for p in g["params"] if p.grad is not None]
-        grad_finite = bool(torch.stack(_flags).all()) if _flags else True
+        if _flags and step_loss is None:                        # fuse the deferred loss read with the flag
+            _pair = torch.stack((_loss_det.float(), torch.stack(_flags).all().float())).tolist()
+            step_loss   = _pair[0]
+            grad_finite = bool(_pair[1])
+        elif _flags:                                            # accum path: step_loss already a Python float
+            grad_finite = bool(torch.stack(_flags).all())
+    if step_loss is None:                                       # fp16 / no-grads fallback: one plain loss sync
+        step_loss = float(_loss_det)
     if metrics_out is not None:
         # Pre-clip gradient health -- the global L2 norm clip_grad_norm_ RETURNS-and-discards, plus
         # per-ROLE norms (mu/sigma/phi from each group's "role" tag in build_optimizer, aggregated in

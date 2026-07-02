@@ -22,6 +22,7 @@ the ECE) are recorded in the pre-registration note.
 Pure measurement functions take aligned per-token 1-D tensors and are device/grad agnostic; the
 ``measure_sigma_gate`` orchestrator pulls those tensors from ``belief_ce_bank`` and writes the artifact.
 """
+import hashlib
 import json
 import os
 import re
@@ -181,9 +182,13 @@ def write_sigma_gate_artifact(
     os.makedirs(out_dir, exist_ok=True)
     payload = dict(checkpoint_id=checkpoint_id, spec_commit=spec_commit, seeds=list(seeds), **record)
     # Slugify the FILENAME only (a checkpoint_id carrying os.sep / '..' / a drive colon must not
-    # escape out_dir); the payload above keeps the RAW checkpoint_id for provenance.
+    # escape out_dir); the payload above keeps the RAW checkpoint_id for provenance. The slug is
+    # lossy ('ckpt a' / 'ckpt:a' / 'ckpt/a' all map to 'ckpt_a'), so a stable short hash of the
+    # RAW id disambiguates: distinct checkpoint_ids never overwrite each other's PASS/FAIL record
+    # (mirrors the ablation.py _sanitize C15 fix; audit 2026-07-01 round-3).
     slug = re.sub(r"[^A-Za-z0-9._-]", "_", checkpoint_id).strip("._") or "artifact"
-    path = os.path.join(out_dir, f"{slug}.json")
+    h    = hashlib.sha1(checkpoint_id.encode("utf-8")).hexdigest()[:8]
+    path = os.path.join(out_dir, f"{slug}__{h}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     return path

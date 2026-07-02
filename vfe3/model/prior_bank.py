@@ -52,9 +52,15 @@ _FULL_DECODERS:    set = set()   # decoders consuming a full (B,N,K,K) covarianc
 _CHUNKED_DECODERS: set = set()   # decoders with a fused chunked-CE training path (no (B,N,V) logits)
 
 
-def register_encode(name: str) -> Callable:
-    """Decorator registering an encode kernel under ``name``."""
+def register_encode(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering an encode kernel under ``name``.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable) -> Callable:
+        if name in _ENCODERS and not override:
+            raise KeyError(f"encode mode {name!r} already registered; pass override=True to replace")
         _ENCODERS[name] = fn
         return fn
     return _wrap
@@ -69,7 +75,7 @@ def get_encode(name: str) -> Callable:
     return _ENCODERS[name]
 
 
-def register_decode(name: str, *, is_full: bool = False, chunked: bool = False) -> Callable:
+def register_decode(name: str, *, is_full: bool = False, chunked: bool = False, override: bool = False) -> Callable:
     """Decorator registering a decode kernel under ``name``.
 
     ``is_full``/``chunked`` are routing metadata: ``is_full`` flags a decoder that consumes a full
@@ -77,8 +83,13 @@ def register_decode(name: str, *, is_full: bool = False, chunked: bool = False) 
     fused chunked-CE training path (read by the model's fused-CE dispatch). Declaring them AT
     REGISTRATION keeps the add-by-registering contract -- a new decoder advertises its capabilities
     here instead of being threaded into literal-name tuples at the call sites.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
     """
     def _wrap(fn: Callable) -> Callable:
+        if name in _DECODERS and not override:
+            raise KeyError(f"decode mode {name!r} already registered; pass override=True to replace")
         _DECODERS[name] = fn
         if is_full:
             _FULL_DECODERS.add(name)

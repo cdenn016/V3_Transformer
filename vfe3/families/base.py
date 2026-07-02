@@ -141,9 +141,15 @@ class BeliefParams(ABC):
 _FAMILIES: Dict[str, Type[BeliefParams]] = {}
 
 
-def register_family(name: str) -> Callable[[Type[BeliefParams]], Type[BeliefParams]]:
-    r"""Register a ``BeliefParams`` subclass under ``name`` (the config ``family`` value)."""
+def register_family(name: str, *, override: bool = False) -> Callable[[Type[BeliefParams]], Type[BeliefParams]]:
+    r"""Register a ``BeliefParams`` subclass under ``name`` (the config ``family`` value).
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(cls: Type[BeliefParams]) -> Type[BeliefParams]:
+        if name in _FAMILIES and not override:
+            raise KeyError(f"family {name!r} already registered; pass override=True to replace")
         _FAMILIES[name] = cls
         return cls
     return _wrap
@@ -169,9 +175,15 @@ def divergence_families() -> Tuple[str, ...]:
 _FUNCTIONALS: Dict[str, Callable[..., torch.Tensor]] = {}
 
 
-def register_functional(name: str) -> Callable[[Callable[..., torch.Tensor]], Callable[..., torch.Tensor]]:
-    r"""Register a divergence functional (renyi, ...) under ``name`` (the ``divergence_family``)."""
+def register_functional(name: str, *, override: bool = False) -> Callable[[Callable[..., torch.Tensor]], Callable[..., torch.Tensor]]:
+    r"""Register a divergence functional (renyi, ...) under ``name`` (the ``divergence_family``).
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        if name in _FUNCTIONALS and not override:
+            raise KeyError(f"divergence functional {name!r} already registered; pass override=True to replace")
         _FUNCTIONALS[name] = fn
         return fn
     return _wrap
@@ -199,9 +211,15 @@ def divergence_functionals() -> Tuple[str, ...]:
 _FUNCTIONALS_PER_COORD: Dict[str, Callable[..., torch.Tensor]] = {}
 
 
-def register_functional_per_coord(name: str) -> Callable[[Callable[..., torch.Tensor]], Callable[..., torch.Tensor]]:
-    r"""Register a PER-COORDINATE divergence functional under ``name`` (the ``divergence_family``)."""
+def register_functional_per_coord(name: str, *, override: bool = False) -> Callable[[Callable[..., torch.Tensor]], Callable[..., torch.Tensor]]:
+    r"""Register a PER-COORDINATE divergence functional under ``name`` (the ``divergence_family``).
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        if name in _FUNCTIONALS_PER_COORD and not override:
+            raise KeyError(f"per-coordinate divergence functional {name!r} already registered; pass override=True to replace")
         _FUNCTIONALS_PER_COORD[name] = fn
         return fn
     return _wrap

@@ -35,9 +35,15 @@ from vfe3.geometry.lie_ops import gram_pinv, warn_if_basis_not_closed
 _PRECOND: Dict[str, Callable[..., torch.Tensor]] = {}
 
 
-def register_precond(name: str) -> Callable:
-    """Decorator registering a preconditioning rule grad_phi -> preconditioned grad."""
+def register_precond(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a preconditioning rule grad_phi -> preconditioned grad.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
     def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        if name in _PRECOND and not override:
+            raise KeyError(f"phi preconditioner {name!r} already registered; pass override=True to replace")
         _PRECOND[name] = fn
         return fn
     return _wrap
