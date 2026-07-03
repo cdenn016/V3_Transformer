@@ -1454,6 +1454,62 @@ The derivation establishes that \eqref{eq:supp_decode_canonical} is the composit
 Three scopes are worth stating explicitly. First, the derivation justifies the form of the readout, not its training objective: the M-step in the prior-bank implementation minimizes cross-entropy against the per-position target token, not the full free energy $\mathcal{F}$ summed over $i$ and $v$, so the variational interpretation is structural (the readout is the accuracy term) rather than dynamical (training does not descend $\mathcal{F}$ directly). Second, the derivation is exact only when $q_i^{\star}$ and the $\{\pi_v\}$ lie on the same statistical submanifold; under the diagonal-covariance specialization the diagonal Gaussian submanifold is closed under the operations involved, but the full-covariance branch's diagonal projection at decode is an approximation rather than a strict instance of the identity. Third, the temperature $\tau$ in \eqref{eq:supp_decode_canonical} is parameterized in the implementation as $\tau = \tau_{\mathrm{cfg}} \cdot e^{-s}$ with a learnable scalar $s$, mirroring the learnable attention temperature $\tau_{\mathrm{attn}} = \kappa\sqrt{K}$ of the main paper; this learnable component is a single scalar on top of the canonical scaling and does not alter the derivation, but it should be reported when the formula is quoted as a comparison baseline.
 
 
+
+\section{Empirical Ablations of the Gauge VFE Language Model}
+\label{app:vfe3_ablations}
+
+The ablations collected here use the released V3 reference implementation on WikiText-103 and isolate individual mechanisms of the gauge VFE language model. Except where noted, each runs a single layer at embedding dimension $K = 20$ for $15{,}000$ updates at a single seed, an operating point near test perplexity $144$; the resulting perplexities are within-configuration contrasts and are not commensurable with the $K = 90$ results of the main paper. The embedding-dimension scaling sweep below is the exception, run at three seeds for $60{,}000$ updates at each of twelve widths $K = 10,\ldots,120$ with a fixed budget of $491{,}520{,}000$ tokens per run. Across that sweep, the per-width perplexity coefficient of variation ranges from $0.38\%$ to $1.08\%$ and the maximum-to-minimum seed spread ranges from $0.75\%$ to $2.13\%$, so a single-seed difference smaller than roughly $2\%$ is not interpretable.
+
+\subsection{Embedding-Dimension Scaling}
+\label{app:vfe3_scaling}
+Holding the gauge-block size fixed at $d_{\text{head}} = 10$ and growing the embedding dimension, the test perplexity of the gauge VFE model decreases smoothly with $K$ (Table~\ref{tab:vfe3_scaling}; Fig.~\ref{fig:vfe3_gl10_scaling}). The pooled cross-entropy fit over parameter count follows $L(N) = A N^{-\alpha}$ with $\alpha = 0.0873$ (95\% CI $[0.0627, 0.0957]$) and $R^2 = 0.9679$ across twelve sizes. Descriptively, a three-parameter offset law $\mathrm{PPL}(K) = a K^{b} + c$ fits the perplexity curve with $b = -1.05$, an apparent floor $c = 64.0$, and $R^2 = 0.999$; a pure power law without the offset fits worse ($R^2 = 0.958$), so the curve decelerates rather than remaining scale-free over this range. This is the gauge VFE side of the sample-efficiency prediction of Appendix~\ref{app:rg_universality} (Testable Predictions). Because no standard-transformer baseline was trained in this sweep, it measures the VFE scaling curve itself, not the cross-architecture ratio $R(K)$ that the prediction concerns.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrc}
+\hline
+$K = d_{\text{model}}$ & Params & Test PPL (mean $\pm$ std) \\
+\hline
+10 & 7.6M & $219.0 \pm 1.3$ \\
+20 & 15.2M & $135.7 \pm 1.1$ \\
+30 & 22.7M & $113.1 \pm 0.6$ \\
+40 & 30.3M & $101.4 \pm 1.1$ \\
+50 & 37.8M & $94.1 \pm 1.0$ \\
+60 & 45.4M & $88.9 \pm 0.5$ \\
+70 & 52.9M & $84.5 \pm 0.7$ \\
+80 & 60.5M & $81.4 \pm 0.3$ \\
+90 & 68.0M & $79.3 \pm 0.3$ \\
+100 & 75.6M & $77.1 \pm 0.4$ \\
+110 & 83.1M & $75.6 \pm 0.6$ \\
+120 & 90.7M & $74.1 \pm 0.3$ \\
+\hline
+\end{tabular}
+\caption{Embedding-dimension scaling of the gauge VFE model on WikiText-103 at fixed gauge-block size $d_{\text{head}} = 10$. All rows report three seeds ($6$, $23$, $64$) at a fixed budget of $491.5$M training tokens per run. The sweep spans 10 source commits, so it is labeled as development-provenance evidence for the scaling trend rather than a frozen-commit benchmark.}
+\label{tab:vfe3_scaling}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\begin{minipage}{0.48\textwidth}
+\centering
+\includegraphics[width=\linewidth]{attention/figs/vfe3_gl10_scaling_ce_vs_params.png}
+\end{minipage}
+\hfill
+\begin{minipage}{0.48\textwidth}
+\centering
+\includegraphics[width=\linewidth]{attention/figs/vfe3_gl10_ppl_vs_embed_dim_offset.png}
+\end{minipage}
+\caption{Corrected scaling figures for the fixed-$\mathrm{GL}^+(10)$ sweep. Left: test cross-entropy versus parameter count with the pooled power-law fit. Right: mean test perplexity versus embedding dimension with the offset-law fit.}
+\label{fig:vfe3_gl10_scaling}
+\end{figure}
+
+\subsection{Divergence Order}
+The attention divergence is the forward Kullback-Leibler member ($\alpha = 1$) of the Rényi family. Sweeping the order $\alpha$ while holding all else fixed, the test perplexity is minimized at $\alpha = 1$: it reads $147.5$, $145.4$, $144.5$, $148.7$, $222.1$, and $267.2$ at $\alpha = 0.5, 0.8, 1.0, 1.2, 1.5, 2.0$. The orders below and just above unity are flat to within the noise floor, while $\alpha \geq 1.5$ degrades sharply, in part because the non-positive-definite covariance blend at $\alpha > 1$ drives the divergence toward its numerical clamp, whose saturation fraction rises with $\alpha$. This empirical optimum at $\alpha = 1$ is consistent with the conditional-uniqueness result of Appendix~\ref{sec:supp_conditional_uniqueness}, which selects the forward KL as the unique convex $f$-divergence yielding the closed-form Gibbs update. The Rényi order is itself a monotone transform of the $\alpha$-divergence rather than an $f$-divergence, so the sweep corroborates the spirit of that result rather than testing its hypotheses directly.
+
+\subsection{Positional-Prior Extrapolation}
+The attention priors of the main paper (Section~\ref{sec:nonuniform_priors}) include both absolute and offset/relative forms. Training at context length $N = 128$ and evaluating at lengths up to $N = 512$ separates the two: the absolute learned prior degrades by $11.4\%$ in cross-entropy ($4.99 \to 5.56$ nats), whereas the offset and relative priors hold, with ALiBi improving slightly ($-0.4\%$), the T5 relative bias near-flat ($+0.8\%$), and RoPE flat ($-0.02\%$). The in-distribution ranking is the reverse of extrapolation robustness: the learned absolute prior is best at the training length ($146.6$ test perplexity at $N = 128$) yet the worst extrapolator, while RoPE is weakest in distribution ($172.2$) but stable out of distribution. Length generalization in this framework therefore tracks whether the positional prior is a function of position offset rather than of absolute position, as expected from the offset structure of the ALiBi and relative-bias priors.
+
+
 % bibliographystyle is set by jmlr2e
 \bibliography{references}
 
