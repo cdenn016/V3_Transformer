@@ -1,0 +1,22 @@
+{
+  "input_dir": "vfe3_scaling_results\\grow_K_GL10",
+  "n_runs": 36,
+  "with_offset": false,
+  "n_param_points": 12,
+  "n_inference_points": 0,
+  "pooled_fit": {
+    "form": "power_law",
+    "alpha": 0.08734779837678835,
+    "alpha_ci": [
+      0.06270985234115303,
+      0.09570429212417231
+    ],
+    "A": 21.11536918882996,
+    "E": 0.0,
+    "r2": 0.967943432337392,
+    "n_points": 12
+  },
+  "per_route": {},
+  "frontier_collapse": null,
+  "estep_structural": null
+}

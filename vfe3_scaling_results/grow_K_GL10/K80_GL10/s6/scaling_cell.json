@@ -1,0 +1,14 @@
+{
+  "label": "K80_GL10",
+  "route": "grow_K_GL10",
+  "scale_knob": "embed_dim",
+  "overrides": {
+    "embed_dim": 80,
+    "n_heads": 8,
+    "gauge_group": "block_glk",
+    "kl_max": 640
+  },
+  "predicted_n_params": 60461218,
+  "n_gen": 800,
+  "seed": 6
+}
