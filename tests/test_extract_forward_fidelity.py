@@ -49,7 +49,7 @@ def _stack(model, belief, log_prior, rope):
         belief, belief.mu, belief.sigma, model.group, cfg,
         log_prior=log_prior, block_norm=model.block_norm,
         head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
-        log_alpha=getattr(model, "log_alpha", None), lambda_beta=cfg.lambda_beta,
+        lambda_beta=cfg.lambda_beta,
         connection_W=getattr(model, "connection_W", None),
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),

@@ -295,7 +295,7 @@ def test_learnable_r_grouped_under_natural_grad_optimizer():
 
 # ---------------------------------------------------------------------------
 # lambda_h_mode: the model-fiber analogue of lambda_alpha_mode (constant / state_dependent
-# envelope / learnable), and r_update_mode='barycenter': the closed-form forward-KL
+# envelope), and r_update_mode='barycenter': the closed-form forward-KL
 # barycenter M-step for r. Spec: docs/.../2026-06-13-lambda-h-mode-and-r-update-mechanism.md.
 # lambda_h weights KL(s_i||r) the way lambda_alpha weights KL(q_i||p_i); the manuscript names the
 # state-dependent lambda_h "a parallel extension not developed here" (Participatory ~3766).
@@ -355,34 +355,6 @@ def test_state_dependent_lambda_h_grad_flows_to_s():
     loss.backward()
     g = m.prior_bank.s_mu_embed.grad
     assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
-
-
-def test_learnable_lambda_h_param_grad_and_grouping():
-    # lambda_h_mode='learnable' creates log_lambda_h init log(cfg.lambda_h); it trains and is grouped.
-    from vfe3.train import build_optimizer
-    import math
-    m = _scored_model(0.5, lambda_h_mode="learnable")
-    assert hasattr(m, "log_lambda_h")
-    assert torch.allclose(m.log_lambda_h.detach(), torch.tensor(math.log(0.5)), atol=1e-6)
-    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
-    _, loss, _ = m(tokens, targets)
-    loss.backward()
-    gh = m.log_lambda_h.grad
-    assert gh is not None and torch.isfinite(gh).all() and gh.abs().sum() > 0
-    opt = build_optimizer(m, m.cfg)              # must NOT trip the coverage guard
-    assert id(m.log_lambda_h) in {id(p) for g in opt.param_groups for p in g["params"]}
-
-
-def test_learnable_lambda_h_byte_identical_to_constant_at_init():
-    # Init log_lambda_h=log(cfg.lambda_h) -> lambda_h=cfg.lambda_h, so the forward loss at step 0 is
-    # identical to constant lambda_h (creating the scalar param draws no RNG).
-    mc = _scored_model(0.5, lambda_h_mode="constant", seed=0)
-    ml = _scored_model(0.5, lambda_h_mode="learnable", seed=0)
-    assert torch.equal(mc.prior_bank.s_mu_embed, ml.prior_bank.s_mu_embed)
-    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
-    _, lc, _ = mc(tokens, targets)
-    _, ll, _ = ml(tokens, targets)
-    assert torch.allclose(lc, ll, atol=1e-6)
 
 
 def test_state_dependent_lambda_h_in_s_e_step_trains_s():

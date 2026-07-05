@@ -8,7 +8,7 @@ A config-selected registry of forms:
 Pure: a function of the (per-position or per-coordinate) self-divergence D.
 """
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Tuple
 
 import torch
 
@@ -66,7 +66,7 @@ def alpha_regularizer(
 # The complete set of named params across ALL registered alpha forms. Each form's
 # **kwargs may validly contain the other forms' params (the dispatcher forwards a
 # single kwargs bag); only keys OUTSIDE this universe are genuine misspellings.
-_KNOWN_ALPHA_KWARGS: frozenset = frozenset({"value", "b0", "c0", "eps", "log_alpha"})
+_KNOWN_ALPHA_KWARGS: frozenset = frozenset({"value", "b0", "c0", "eps"})
 
 
 @register_alpha("constant")
@@ -102,40 +102,6 @@ def alpha_state_dependent(
     return alpha, alpha_regularizer(alpha, b0=b0, c0=c0)
 
 
-@register_alpha("learnable")
-def alpha_learnable(
-    kl:        torch.Tensor,             # (..., N) or (..., N, K) self-divergence (unused: alpha is free)
-
-    *,
-    log_alpha: Optional[torch.Tensor] = None,   # scalar nn.Parameter; REQUIRED at call time (Optional
-                                                # only for the registry's uniform kwargs bag -- every
-                                                # alpha form shares one signature; None raises below)
-    **kwargs,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED scalar self-coupling
-    alpha = exp(log_alpha), where ``log_alpha`` is a model-owned ``nn.Parameter`` trained by
-    backprop (cf. ``use_head_mixer`` / ``use_prior_bank``). The pure no-NN default path is the
-    ``constant`` / ``state_dependent`` / ``state_dependent_per_coord`` forms above, unchanged.
-
-    alpha = exp(log_alpha) is a FREE parameter, NOT a precision posterior summary, so the
-    alpha-envelope cancellation that ``state_dependent`` relies on (an explicit R(alpha) in F
-    whose product-rule path cancels at the stationary alpha*) does NOT apply here: there is no
-    Gamma prior and no regularizer. The returned regularizer is zero, so F carries the plain
-    self-term alpha*D and the belief gradient is the plain alpha*dD (matching the ``constant``
-    form's contract). The scalar exp(log_alpha) is broadcast to ``kl``'s shape so the gradient
-    flows back to ``log_alpha`` through both the E-step belief updates and the F/loss.
-
-    log_alpha = 0 -> alpha = exp(0) = 1.0, exactly reproducing ``constant`` alpha=1.0 at init;
-    exp keeps alpha strictly positive for any real log_alpha.
-    """
-    if log_alpha is None:
-        raise ValueError("lambda_alpha_mode='learnable' requires log_alpha (the model's nn.Parameter)")
-    unknown = set(kwargs) - _KNOWN_ALPHA_KWARGS
-    if unknown:
-        raise TypeError(f"alpha_learnable: unexpected kwargs {sorted(unknown)}")
-    return torch.exp(log_alpha) * torch.ones_like(kl), torch.zeros_like(kl)
-
-
 @register_alpha("state_dependent_per_coord", per_coord=True)
 def alpha_state_dependent_per_coord(
     kl:    torch.Tensor,             # (..., N, K) per-coordinate self-divergence D^(k)
@@ -169,7 +135,6 @@ def alpha_gradient_coefficient(
     b0:        'float | torch.Tensor' = 1.0,
     c0:        'float | torch.Tensor' = 1.0,
     mode:      str = "constant",
-    log_alpha: Optional[torch.Tensor] = None,   # learned scalar (alpha=exp(log_alpha)); only 'learnable' reads it
 ) -> torch.Tensor:
     r"""Effective coefficient a_i multiplying d D(q_i||p_i) in the belief gradient.
 
@@ -181,12 +146,11 @@ def alpha_gradient_coefficient(
 
     The coefficient is the alpha leg of the SAME registered form used by the
     oracle (``self_coupling_alpha``), not a re-derived copy: constant -> value,
-    state-dependent -> alpha* = c0/(b0 + D), learnable -> exp(log_alpha) (the
-    learnable form has zero R, so its coefficient is just alpha). Sharing the one
+    state-dependent -> alpha* = c0/(b0 + D). Sharing the one
     formula makes the envelope-cancellation (kernel coefficient == oracle alpha) a
     structural identity rather than a maintained coincidence.
     """
-    return self_coupling_alpha(kl, mode=mode, value=value, b0=b0, c0=c0, log_alpha=log_alpha)[0]
+    return self_coupling_alpha(kl, mode=mode, value=value, b0=b0, c0=c0)[0]
 
 
 def self_coupling_alpha(

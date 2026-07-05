@@ -85,7 +85,7 @@ class VFE3Config:
     # NEURAL-NETWORK EXCEPTION (sanctioned, default-OFF): 'regime_ii' introduces a LEARNED bilinear
     # edge connection delta_ij^a = mu_i^T W^a mu_j, with W a model-owned nn.Parameter (shape
     # (n_gen, K, K)) trained by backprop on CE -- a documented learned-parameter exception in the
-    # spirit of use_head_mixer / lambda_alpha_mode='learnable' (see VFEModel.__init__'s connection_W and
+    # spirit of use_head_mixer (see VFEModel.__init__'s connection_W and
     # transport._build_regime_ii). At cocycle_relaxation=0 the flat builder's dict is returned
     # byte-identically; at W=0 (the zero-tensor init) the generic path reduces to the flat cocycle
     # to fp32 tolerance (atol 1e-6, pinned -- not bit-exact: the exp(0)=I einsum reorders fp32 ops;
@@ -198,11 +198,7 @@ class VFE3Config:
     
     # lambda_alpha_mode selects the self-coupling form (registry key). The default-and-pure no-NN forms
     # are 'constant', 'state_dependent', 'state_dependent_per_coord' (closed-form functions of the
-    # self-divergence D, no learned parameters) and are unchanged. NEURAL-NETWORK EXCEPTION:
-    # 'learnable' introduces a model-owned scalar nn.Parameter log_alpha (alpha = exp(log_alpha))
-    # trained by backprop -- a sanctioned, default-OFF learned-parameter exception in the spirit of
-    # use_head_mixer / use_prior_bank (see VFEModel.__init__ and alpha_i.alpha_learnable). At init
-    # log_alpha=0 -> alpha=1.0, byte-identical to constant alpha=1.0.
+    # self-divergence D, no learned parameters).
     lambda_alpha_mode:         str   = "constant"
     
     b0:                        'float | List[float]' = 1.0   # state-dependent alpha shape: alpha* = c0/(b0 + D); list -> (K,) per-coord
@@ -215,13 +211,6 @@ class VFE3Config:
     # POST-softmax block (NOT the energy inside the softmax), so beta = softmax(-E/tau) is unchanged
     # and the analytic kernel stays envelope-consistent with the autograd oracle.
     lambda_beta:               float = 1.0
-    
-    # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED lambda_beta. When True the model
-    # creates a scalar nn.Parameter log_lambda_beta (lambda_beta = exp(log_lambda_beta)) trained by
-    # backprop through the unrolled E-step -- the spirit of lambda_alpha_mode='learnable'. Init 0 ->
-    # lambda_beta = 1.0, byte-identical to the constant-1.0 pure path at step 0. Default False keeps
-    # the path param-free.
-    learnable_lambda_beta:      bool  = False
     
     mass_phi:                   float = 0.0          # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight: float = 0.0         # alpha_hat: overall scale on M-step sum_i alpha_i D(q_i*||p_i) (0 = OFF; alpha_i = the E-step self-coupling form)
@@ -277,12 +266,8 @@ class VFE3Config:
     # divergence on the (always-diagonal) s/r tables (renyi/KL/...; __post_init__ rejects full-cov /
     # squared_hellinger) and accepts (K,) b0_h/c0_h. NB it is NOT a width-robustness lever -- summing the
     # per-coordinate envelopes over K is linear in K, unlike per-token 'state_dependent' (log in K).
-    # NEURAL-NETWORK EXCEPTION: 'learnable' introduces a model-owned scalar nn.Parameter log_lambda_h
-    # (lambda_h = exp(log_lambda_h)), a sanctioned default-OFF sibling of lambda_alpha_mode='learnable' /
-    # learnable_lambda_beta. At init log_lambda_h=log(cfg.lambda_h) -> lambda_h=cfg.lambda_h, so a
-    # learnable model is byte-identical to constant lambda_h at step 0. Non-'constant' modes require
-    # lambda_h>0 (the channel-on gate and, for 'learnable', the log-init value); __post_init__ warns.
-    lambda_h_mode:             str   = "constant"   # "constant" | "state_dependent" | "state_dependent_per_coord" | "learnable"
+    # Non-'constant' modes require lambda_h>0 (the channel-on gate); __post_init__ warns.
+    lambda_h_mode:             str   = "constant"   # "constant" | "state_dependent" | "state_dependent_per_coord"
     b0_h:                      'float | List[float]' = 1.0   # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r)); list -> (K,) per-coord
     c0_h:                      'float | List[float]' = 1.0   # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h; list -> (K,) per-coord
 
@@ -393,13 +378,6 @@ class VFE3Config:
     use_prior_bank:            bool  = False
     decode_bias:               bool  = False  # use_prior_bank=False only: learned per-vocab log-unigram bias on logits=mu_q@W^T+b (zero-init, weight-decay-free). Inert (warns) under use_prior_bank=True.
    
-    # use_prior_bank=False only (diagnostic, default OFF): feed the precision-weighted mean -- the
-    # diagonal natural parameter eta = Sigma^-1 mu = mu/(sigma+eps) -- to the linear head instead of
-    # the bare mean mu, so the belief covariance Sigma_q enters the DISCRIMINATIVE readout. Tests
-    # whether Sigma carries predictive signal at the decode WITHOUT the generative/capacity confound
-    # of the prior-bank KL decode. OFF -> logits = mu_q @ W^T (byte-identical). Inert (warns) under
-    # use_prior_bank=True (the KL decode already consumes sigma_q).
-    decode_precision_scaled:   bool  = False
     decode_tau:                float = 1.0
     decode_mode:               str   = "diagonal"
     
@@ -1207,15 +1185,14 @@ class VFE3Config:
                     "prior_source='model_channel', or keep r frozen (learnable_r=False).",
                     UserWarning, stacklevel=2,
                 )
-        # lambda_h_mode inert guard: a non-'constant' mode (state_dependent envelope / learnable
-        # log_lambda_h) only takes effect when the hyper-prior channel is live (lambda_h>0 creates
-        # r and gates the forward term; learnable additionally needs lambda_h>0 for its log-init).
+        # lambda_h_mode inert guard: a non-'constant' mode (the state_dependent envelope) only takes
+        # effect when the hyper-prior channel is live (lambda_h>0 creates r and gates the forward term).
         if self.lambda_h_mode != "constant" and self.lambda_h == 0.0:
             import warnings
             warnings.warn(
                 f"lambda_h_mode={self.lambda_h_mode!r} has no effect with lambda_h=0: the hyper-prior "
                 "channel (and its centroid r) is created only when lambda_h>0 or s_e_step=True, and the "
-                "weight defaults to lambda_h. Set lambda_h>0 to activate the state-dependent/learnable "
+                "weight defaults to lambda_h. Set lambda_h>0 to activate the state-dependent "
                 "hyper-prior precision.",
                 UserWarning, stacklevel=2,
             )
@@ -1523,28 +1500,6 @@ class VFE3Config:
                 "(linear decode) for the learned bias to take effect.",
                 UserWarning,
             )
-        # decode_precision_scaled feeds the precision-weighted mean (eta=mu/sigma) to the LINEAR head;
-        # on the KL-to-prior path sigma_q already enters the readout, so the toggle is inert there --
-        # warn (mirrors decode_bias).
-        if self.decode_precision_scaled and self.use_prior_bank:
-            import warnings
-            warnings.warn(
-                "decode_precision_scaled=True is inert when use_prior_bank=True: the KL-to-prior "
-                "decode already consumes sigma_q. Set use_prior_bank=False (linear decode) for the "
-                "precision-weighted mean to take effect.",
-                UserWarning,
-            )
-        # The linear precision-scaled head forms eta = mu / (sigma + eps) ELEMENTWISE -- the DIAGONAL
-        # natural parameter. A full-covariance family supplies a rank-4 (B, N, K, K) sigma, so mu/sigma
-        # is a broadcast shape error at the first decode (and only the degenerate B=N=K case would
-        # silently misbroadcast). Reject the unrunnable combo up front rather than crash mid-forward.
-        if self.decode_precision_scaled and not self.use_prior_bank and not self.diagonal_covariance:
-            raise ValueError(
-                f"decode_precision_scaled=True (linear decode) needs a diagonal-covariance family: it "
-                f"forms the diagonal natural parameter eta = mu / sigma, but family={self.family!r} "
-                f"supplies a full (B, N, K, K) covariance. Use a diagonal family, or set "
-                f"decode_precision_scaled=False."
-            )
         # precision_weighted_attention's per-key reliability -log(b0 + tr Sigma_j) needs a positive b0.
         if self.precision_weighted_attention and self.precision_attention_b0 <= 0.0:
             raise ValueError(
@@ -1751,19 +1706,15 @@ class VFE3Config:
         # at the MODEL level -- VFEModel.__init__, keyed on the EFFECTIVE estimator -- so it is left out
         # of this config-level predicate to keep the default config silent here.)
         if self.e_step_gradient in ("straight_through", "detach") and (
-            self.lambda_alpha_mode == "learnable"
-            or self.transport_mode in ("regime_ii", "regime_ii_covariant", "regime_ii_link", "regime_ii_link_charted")
-            or self.learnable_lambda_beta
-            or (self.lambda_h_mode == "learnable" and self.s_e_step)
+            self.transport_mode in ("regime_ii", "regime_ii_covariant", "regime_ii_link", "regime_ii_link_charted")
             or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
         ):
             import warnings
             warnings.warn(
                 f"e_step_gradient={self.e_step_gradient!r} severs the per-iteration E-step tangent, so a "
-                "learnable parameter that enters the loss only through it (log_alpha under "
-                "lambda_alpha_mode='learnable', connection_W under transport_mode='regime_ii', log_lambda_beta "
-                "under learnable_lambda_beta, log_lambda_h under lambda_h_mode='learnable'+s_e_step, "
-                "r_mu/r_sigma_log under learnable_r+r_update_mode='gradient'+s_e_step) "
+                "learnable parameter that enters the loss only through it (connection_W under "
+                "transport_mode='regime_ii', r_mu/r_sigma_log under "
+                "learnable_r+r_update_mode='gradient'+s_e_step) "
                 "receives NO gradient and stays frozen. Use e_step_gradient='unroll' (the default) to "
                 "train these.",
                 UserWarning,
@@ -1776,8 +1727,8 @@ class VFE3Config:
         # gradient_mode=='filtering' AND family=='gaussian_diagonal' AND divergence_family=='renyi' AND
         # renyi_order==1.0 AND include_attention_entropy (verified against gradients.kernels.use_kernel);
         # any other combination routes to the oracle. When it does and an E-step-only learnable param is
-        # active (lambda_alpha_mode='learnable' / transport_mode='regime_ii' / learnable_lambda_beta /
-        # pos_phi='learned'), that param receives NO gradient through the detached oracle. Warn
+        # active (transport_mode='regime_ii' / pos_phi='learned'), that param receives NO gradient
+        # through the detached oracle. Warn
         # (non-breaking); oracle_unroll_grad=True restores the differentiable oracle gradient.
         # transport_mode='regime_ii' ALWAYS routes to the oracle (audit 2026-06-10 F1: the kernel
         # is the flat-transport gradient and drops d Omega/d mu), regardless of the kernel-family
@@ -1844,10 +1795,7 @@ class VFE3Config:
             and not self.oracle_unroll_grad
             and _routes_to_oracle
             and (
-                self.lambda_alpha_mode == "learnable"
-                or self.transport_mode in ("regime_ii", "regime_ii_covariant")
-                or self.learnable_lambda_beta
-                or (self.lambda_h_mode == "learnable" and self.s_e_step)
+                self.transport_mode in ("regime_ii", "regime_ii_covariant")
                 or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
                 or self.pos_phi == "learned"
                 # t5_bias's only gradient path is likewise the E-step tangent (audit 2026-07-05 m9);
@@ -1864,9 +1812,7 @@ class VFE3Config:
                 "gradient_mode='filtering' + family='gaussian_diagonal' + divergence_family='renyi' + "
                 "renyi_order=1.0 + include_attention_entropy=True), which returns a DETACHED tangent while "
                 "oracle_unroll_grad=False. A learnable parameter that enters the loss only through the "
-                "E-step tangent (log_alpha under lambda_alpha_mode='learnable', connection_W under "
-                "transport_mode='regime_ii', log_lambda_beta under learnable_lambda_beta, log_lambda_h "
-                "under lambda_h_mode='learnable'+s_e_step, r_mu/r_sigma_log under "
+                "E-step tangent (connection_W under transport_mode='regime_ii', r_mu/r_sigma_log under "
                 "learnable_r+r_update_mode='gradient'+s_e_step, pos_phi_free under pos_phi='learned', "
                 "t5_bias under t5_learnable_bias with an active t5_relative_bias channel) "
                 "therefore receives NO gradient and stays frozen. Set "

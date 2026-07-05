@@ -37,8 +37,7 @@ def vfe_stack(
     block_norm:      Optional[Callable[..., torch.Tensor]] = None,   # cached norm instance (None -> off)
     head_mixer:      Optional[Callable[..., 'tuple']]      = None,   # opt-in Schur head mixer (None -> off)
     cg_coupling:     Optional[Callable[..., 'tuple']]      = None,   # opt-in CG cross-type coupling (None -> off)
-    log_alpha:       Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
-    lambda_beta:     'float | torch.Tensor'    = 1.0,    # belief-coupling weight (cfg.lambda_beta or exp(log_lambda_beta))
+    lambda_beta:     'float | torch.Tensor'    = 1.0,    # belief-coupling weight (cfg.lambda_beta)
     connection_W:    Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
     connection_M:    Optional[torch.Tensor]    = None,   # learned covariant connection for regime_ii_covariant (Route B; None -> pure path)
     connection_L:    Optional[torch.Tensor]    = None,   # learned direct link for regime_ii_link* (NN exception; None -> pure path)
@@ -51,10 +50,7 @@ def vfe_stack(
 ) -> BeliefState:
     r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior.
 
-    ``log_alpha`` is the model's learned scalar self-coupling parameter under
-    lambda_alpha_mode='learnable' (a sanctioned nn.Parameter NN exception; alpha = exp(log_alpha)),
-    forwarded to the E-step; None on every pure no-NN lambda_alpha_mode (the default path). ``connection_W``
-    is the model's learned bilinear Regime-II connection (a sanctioned NN exception) forwarded under
+    ``connection_W`` is the model's learned bilinear Regime-II connection (a sanctioned NN exception) forwarded under
     transport_mode='regime_ii'; None on the pure (flat) path. ``e_step_gradient`` is the E-step
     backward estimator forwarded to the E-step ('unroll' default keeps the second-order trajectory
     gradient, 'straight_through' detaches the per-iteration tangent; both share the forward value).
@@ -70,7 +66,7 @@ def vfe_stack(
     for _ in range(cfg.n_layers):
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
-                           log_alpha=log_alpha, lambda_beta=lambda_beta,
+                           lambda_beta=lambda_beta,
                            connection_W=connection_W, connection_M=connection_M,
                            connection_L=connection_L,
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,

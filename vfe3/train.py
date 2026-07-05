@@ -3,7 +3,7 @@ r"""Training (M-step) for VFE_3.0: AdamW per-group learning rates + warmup/cosin
 The model has no neural layers (no nn.Linear/MLP/activation). The trainable parameters are the
 PriorBank prior tables plus the model-owned tables their toggles create -- the default
 ``pos_phi='learned'`` positional table, and the default-OFF exceptions (head mixer, regime_ii
-connection, learnable alpha/lambda/T5 bias, linear decode).
+connection, learnable T5 bias, linear decode).
 ``loss.backward()`` flows through the unrolled E-step to those tables; AdamW updates
 them. The M-step minimizes the cross-entropy of the decode boundary over the prior
 tables, with the E-step (the differentiable filtering kernel) unrolled into the graph,
@@ -45,7 +45,7 @@ _PHI_CLAMP_WARNED: bool = False
 def _warn_phi_transport_clamp(
     model:    VFEModel,
 
-    max_norm: float = 15.0,   # stable_matrix_exp_pair's default Frobenius clamp
+    max_norm: float = 20.0,   # stable_matrix_exp_pair's default Frobenius clamp
 ) -> None:
     r"""Warn ONCE when a gauge-frame table's embedded Frobenius norm exceeds the transport clamp.
 
@@ -113,8 +113,7 @@ def build_optimizer(
     like the s tables) so it trains as an empirical-Bayes centroid.
     The learned MODEL-level parameters are grouped likewise when their toggle is on: the Regime-II
     edge connection ``connection_W`` (transport_mode='regime_ii') at ``m_phi_lr`` (a gauge-connection
-    scale) and the learnable self-coupling ``log_alpha`` (lambda_alpha_mode='learnable') at ``m_p_mu_lr`` -- so
-    those sanctioned-NN-exception toggles train rather than tripping the coverage guard.
+    scale) -- so those sanctioned-NN-exception toggles train rather than tripping the coverage guard.
     """
     pb = model.prior_bank
     # Geometric gauge M-step (opt-in, cfg.m_phi_natural_grad): the gauge-frame coordinate groups
@@ -195,18 +194,12 @@ def build_optimizer(
         if cfg.connection_weight_decay is not None:             # shares the connection-norm ceiling
             l_group["weight_decay"] = cfg.connection_weight_decay
         groups.append(l_group)
-    if getattr(model, "log_alpha", None) is not None:           # lambda_alpha_mode='learnable' scalar coupling
-        groups.append({"params": [model.log_alpha], "lr": cfg.m_p_mu_lr, "role": "mu"})
-    if getattr(model, "log_lambda_beta", None) is not None:     # learnable_lambda_beta scalar belief-coupling weight
-        groups.append({"params": [model.log_lambda_beta], "lr": cfg.m_phi_lr, "role": "phi"})  # a coupling/gauge-scale LR
-    if getattr(model, "log_lambda_h", None) is not None:        # lambda_h_mode='learnable' scalar hyper-prior weight
-        groups.append({"params": [model.log_lambda_h], "lr": cfg.m_p_mu_lr, "role": "mu"})  # a precision-coupling scale (like log_alpha)
     if getattr(model, "t5_bias", None) is not None:             # t5_learnable_bias=True relative-position bias
         # weight_decay=0: the per-bucket T5 bias b_{i-j} is a relative-position PRIOR shaping the
         # attention pi, not capacity; L2-decaying it toward zero biases the prior toward a flat/uniform
         # relative-position distribution (the same exemption output_proj_bias / r / the gauge frame
-        # carry). role='mu' is the catch-all for learned non-variance/non-gauge tables (log_alpha,
-        # head_mixer, ...); the bias is not a gauge frame, so it steps under the mean LR, not m_phi_lr.
+        # carry). role='mu' is the catch-all for learned non-variance/non-gauge tables (head_mixer,
+        # ...); the bias is not a gauge frame, so it steps under the mean LR, not m_phi_lr.
         groups.append({"params": [model.t5_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
 
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
@@ -1033,18 +1026,12 @@ def train(
             # (diagnostics folds it into d["total"] at the same per-sequence-sum scale, so the
             # uniform /n_tok normalizes every block consistently -- audit obs 18497). The raw blocks
             # are stored for the model_channel_terms figure; hyper_prior_weighted is the EXACT weighted
-            # contribution folded into total (state_dependent/learnable lambda_h != cfg.lambda_h*raw,
+            # contribution folded into total (state_dependent lambda_h != cfg.lambda_h*raw,
             # so the F-decomposition figure reads this directly), while the gamma block is scaled by
             # cfg.lambda_gamma in that figure, exactly as the belief block is scaled by lambda_beta.
             for _mck in ("hyper_prior", "hyper_prior_weighted", "gamma_coupling", "gamma_meta_entropy"):
                 if _mck in d:
                     row[_mck] = d[_mck] / n_tok
-            # Learnable belief-coupling weight: record lambda_beta = exp(log_lambda_beta) so its
-            # trajectory lands in metrics.csv (and the figure). The column exists only on a learnable
-            # run (config is fixed per run, so the CSV stays rectangular).
-            _llb = getattr(model, "log_lambda_beta", None)
-            if _llb is not None:
-                row["lambda_beta"] = float(_llb.detach().exp())
             artifacts.log_metrics(row)
 
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).

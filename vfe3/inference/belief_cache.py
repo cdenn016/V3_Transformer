@@ -121,15 +121,13 @@ def _appended_belief_step(
     beta      = attention_weights(energy, tau=tau, log_prior=log_prior_app)              # (B', L, M)
     pair_mask = ((energy > 0.0) & (energy < kl_max)).to(beta.dtype)
 
-    log_alpha = getattr(model, "log_alpha", None)
     coef = alpha_gradient_coefficient(
         sd, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, mu_q.device), c0=_as_coeff(cfg.c0, mu_q.device),
-        mode=cfg.lambda_alpha_mode, log_alpha=log_alpha,
+        mode=cfg.lambda_alpha_mode,
     )
     if not alpha_is_per_coord(cfg.lambda_alpha_mode):
         coef = coef.unsqueeze(-1)
-    _llb        = getattr(model, "log_lambda_beta", None)
-    lambda_beta = cfg.lambda_beta if _llb is None else _llb.exp()
+    lambda_beta = cfg.lambda_beta
 
     grad_mu, grad_sigma = get_kernel(cfg.family)(
         mu_q, sig_q, mu_p, sig_p, mu_t, sig_t, beta * pair_mask, coef,

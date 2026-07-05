@@ -1,18 +1,13 @@
-r"""Two default-OFF diagnostic toggles probing whether the belief covariance Sigma carries
+r"""A default-OFF diagnostic toggle probing whether the belief covariance Sigma carries
 predictive signal, while keeping the discriminative linear decode (no NN added beyond the existing
-linear-decode exception; both pure paths preserved when off).
+linear-decode exception; the pure path preserved when off).
 
-(1) decode_precision_scaled (use_prior_bank=False only): feed the precision-weighted mean -- the
-    diagonal natural parameter eta = Sigma^-1 mu = mu/sigma -- to the linear head instead of mu, so
-    Sigma_q enters the DISCRIMINATIVE readout. Isolates "does Sigma help at the readout" from the
-    generative/capacity confound of the prior-bank KL decode (which the user finds underperforms).
-
-(2) precision_weighted_attention: fold a detached per-key reliability bias -log(b0 + tr Sigma_j)
+(1) precision_weighted_attention: fold a detached per-key reliability bias -log(b0 + tr Sigma_j)
     into the attention log_prior, so attention down-weights high-variance (unreliable) keys before
     the softmax. A uniform-over-keys Sigma is softmax-absorbed (no effect); only key-to-key variance
     in Sigma changes attention. Detached -> the closed-form belief kernel stays exact.
 
-Both default OFF and byte-identical to the current path when off.
+Defaults OFF and byte-identical to the current path when off.
 """
 
 import warnings
@@ -30,59 +25,6 @@ def _model(seed: int = 0, **over) -> VFEModel:
                      mstep_self_coupling_weight=0.0, seed=seed, **over)
     torch.manual_seed(seed)
     return VFEModel(cfg)
-
-
-# =========================================================================== feature 1: decode
-
-def test_decode_precision_scaled_defaults_off():
-    assert VFE3Config().decode_precision_scaled is False
-
-
-def test_decode_precision_scaled_off_is_plain_linear():
-    # OFF (default): linear decode is exactly mu_q @ W^T (+ b), sigma_q ignored.
-    m = _model(use_prior_bank=False)
-    pb = m.prior_bank
-    mu = torch.randn(3, 5, 4)
-    sigma = torch.rand(3, 5, 4) + 0.5
-    logits = pb.decode(mu, sigma)
-    expect = mu @ pb.output_proj_weight.transpose(-1, -2)
-    if pb.output_proj_bias is not None:
-        expect = expect + pb.output_proj_bias
-    assert torch.allclose(logits, expect, atol=1e-6)
-
-
-def test_decode_precision_scaled_on_uses_natural_parameter():
-    # ON: the linear head reads eta = mu / (sigma + eps) instead of mu.
-    m = _model(use_prior_bank=False, decode_precision_scaled=True)
-    pb = m.prior_bank
-    mu = torch.randn(3, 5, 4)
-    sigma = torch.rand(3, 5, 4) + 0.5
-    logits = pb.decode(mu, sigma)
-    eta = mu / (sigma + pb.eps)
-    expect = eta @ pb.output_proj_weight.transpose(-1, -2)
-    if pb.output_proj_bias is not None:
-        expect = expect + pb.output_proj_bias
-    assert torch.allclose(logits, expect, atol=1e-6)
-    # and it genuinely differs from the mu-only readout (sigma is not constant here)
-    assert not torch.allclose(logits, mu @ pb.output_proj_weight.transpose(-1, -2)
-                              + (pb.output_proj_bias if pb.output_proj_bias is not None else 0.0),
-                              atol=1e-4)
-
-
-def test_decode_precision_scaled_warns_inert_under_prior_bank():
-    # Like decode_bias: meaningful only on the linear path; warn when use_prior_bank=True.
-    with pytest.warns(UserWarning, match="decode_precision_scaled"):
-        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5,
-                   use_prior_bank=True, decode_precision_scaled=True)
-
-
-def test_decode_precision_scaled_grad_flows():
-    m = _model(use_prior_bank=False, decode_precision_scaled=True)
-    tokens = torch.randint(0, 20, (3, 5)); targets = torch.randint(0, 20, (3, 5))
-    _, loss, _ = m(tokens, targets)
-    loss.backward()
-    g = m.prior_bank.output_proj_weight.grad
-    assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
 
 
 # =========================================================================== feature 2: attention

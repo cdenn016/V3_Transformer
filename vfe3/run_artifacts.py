@@ -823,7 +823,7 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     flags), never flagged as wrong. ``pure_flags`` covers the principal gauge / decode / free-energy
     purity axes (canonical attention entropy, flat transport, constant/static coupling weights,
     prior-bank decode, no head mixer, unweighted attention); it does NOT enumerate every default-OFF
-    learned-scalar toggle (pos_phi, lambda_h_mode, learnable_r, t5_learnable_bias, use_cg_coupling),
+    learned-scalar toggle (pos_phi, learnable_r, t5_learnable_bias, use_cg_coupling),
     so ``on_pure_path`` certifies these axes rather than a full no-learned-parameter audit.
     ``gauge_flags``/``on_gauge_pure_path`` is a SECOND, independent axis (audit 2026-07-01 F8): the
     gauge / model-channel path (learned gauge transport, no positional rotation, no model-channel
@@ -840,7 +840,6 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
         "canonical_attention_entropy": bool(cfg.include_attention_entropy),
         "flat_transport":              cfg.transport_mode == "flat",
         "constant_lambda_alpha":       cfg.lambda_alpha_mode == "constant",
-        "static_lambda_beta":          not cfg.learnable_lambda_beta,
         "prior_bank_decode":           bool(cfg.use_prior_bank),
         "no_head_mixer":               not cfg.use_head_mixer,
         "unweighted_attention":        not cfg.precision_weighted_attention,
@@ -863,7 +862,6 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "transport_mode":               cfg.transport_mode,
             "lambda_alpha_mode":            cfg.lambda_alpha_mode,
             "lambda_beta":                  float(cfg.lambda_beta),
-            "learnable_lambda_beta":        bool(cfg.learnable_lambda_beta),
             "use_prior_bank":               bool(cfg.use_prior_bank),
             "use_head_mixer":               bool(cfg.use_head_mixer),
             "precision_weighted_attention": bool(cfg.precision_weighted_attention),
@@ -1020,15 +1018,6 @@ def _save_figures(
                 title="E-step free-energy descent", color=figs._CB[2 % len(figs._CB)],
                 median_line=True, path=str(run / "estep_convergence_trend.png"))
             figs.plt.close(fig)
-        # Learnable belief-coupling weight: present in history only on a learnable_lambda_beta run.
-        lx, ly = _aligned("lambda_beta")
-        if ly:
-            fig = figs.plot_trajectory(
-                ly, lx, ylabel=r"$\lambda_\beta = e^{\log\lambda_\beta}$",
-                title="Learned belief-coupling weight", color=figs._CB[4],
-                smooth=max(5, len(ly) // 60), annotate_final=True,
-                path=str(run / "lambda_beta.png"))
-            figs.plt.close(fig)
         # Free-energy figures: the per-token budget DECOMPOSITION (snapshot + early/mid/late evolution)
         # and, as a SEPARATE figure, the F-vs-CE CO-DESCENT over training. Both need every plotted term
         # finite, so rows before the first eval (NaN val_*) are dropped.
@@ -1039,17 +1028,15 @@ def _save_figures(
             cfg = getattr(artifacts, "cfg", None)
             # Model-channel F components fold into the complexity-F total when the channel is live;
             # included only when present on EVERY plotted row (model-channel run). hyper_prior_weighted
-            # is the EXACT weighted hyper-prior (state_dependent/learnable lambda_h != cfg.lambda_h*raw,
+            # is the EXACT weighted hyper-prior (state_dependent lambda_h != cfg.lambda_h*raw,
             # so it is read directly); the gamma blocks are scaled by cfg.lambda_gamma in the figure,
             # exactly as the belief block is scaled by lambda_beta.
             mc_fe_keys = [k for k in ("hyper_prior_weighted", "gamma_coupling", "gamma_meta_entropy")
                           if all(k in r and math.isfinite(r[k]) for r in fe_rows)]
             hist = {"step": [r.get("step", i) for i, r in enumerate(fe_rows)],
                     **{k: [r[k] for r in fe_rows] for k in (*fe_keys, *mc_fe_keys)}}
-            # Scale the coupling terms by the LEARNED lambda_beta trajectory when every row carries it
-            # (a learnable_lambda_beta run); else the static config scalar.
-            lam = ([r["lambda_beta"] for r in fe_rows] if all("lambda_beta" in r for r in fe_rows)
-                   else getattr(cfg, "lambda_beta", 1.0))
+            # Scale the coupling terms by the static config lambda_beta scalar.
+            lam = getattr(cfg, "lambda_beta", 1.0)
             gam = getattr(cfg, "lambda_gamma", 0.0)
             iae = getattr(cfg, "include_attention_entropy", True)
             fig = figs.plot_free_energy_decomposition(

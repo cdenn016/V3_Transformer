@@ -20,14 +20,6 @@ import pytest
 from vfe3.config import VFE3Config
 
 
-def test_learnable_alpha_warns_under_straight_through() -> None:
-    """A config-level E-step-only learnable param (lambda_alpha_mode='learnable') + straight_through
-    warns that it freezes. (pos_phi='learned' is the default and is warned at the MODEL level,
-    not here, so the default config stays silent at config construction.)"""
-    with pytest.warns(UserWarning, match="frozen"):
-        VFE3Config(lambda_alpha_mode="learnable", e_step_gradient="straight_through")
-
-
 def test_amp_dtype_fp16_accepted_for_forward() -> None:
     """amp_dtype='fp16' is accepted (forward/inference path). fp16 TRAINING needs a GradScaler
     in the M-step -- a documented buildout -- so it is NOT enforced-rejected at config time

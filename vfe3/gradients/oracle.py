@@ -74,7 +74,6 @@ def belief_gradients_autograd(
 
     irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
-    log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
     omega_builder:             Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
                                                  'torch.Tensor | FactoredTransport | RopeTransport']] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:   # (grad_mu, grad_sigma), each (N, K)
@@ -125,7 +124,7 @@ def belief_gradients_autograd(
     fam = get_family(family)
     sd = self_divergence_for_alpha(fam(mu_q, sigma_q), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
-    alpha, reg = self_coupling_alpha(sd, mode=lambda_alpha_mode, value=value, b0=b0, c0=c0, log_alpha=log_alpha)
+    alpha, reg = self_coupling_alpha(sd, mode=lambda_alpha_mode, value=value, b0=b0, c0=c0)
     energy = pairwise_energy(fam(mu_q, sigma_q), fam(mu_t, sigma_t), alpha=renyi_order, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=irrep_dims)
     # Value-gauge decoupling (RopeTransport.on_value=False): beta comes from the rotated SCORE energy

@@ -235,7 +235,6 @@ def belief_gradients(
 
     irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
-    log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
     omega_builder:             Optional[Callable]     = None,   # (mu_q, sigma_q, mu_k, sigma_k) -> transport (regime_ii oracle rebuild)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Belief gradient: hand kernel for filtering+gaussian_diagonal+KL+canonical+flat, else oracle.
@@ -268,7 +267,7 @@ def belief_gradients(
             kl_max=kl_max, eps=eps, b0=b0, c0=c0, value=value, lambda_beta=lambda_beta,
             include_attention_entropy=include_attention_entropy, create_graph=create_graph,
             gradient_mode=gradient_mode, family=family, divergence_family=divergence_family,
-            lambda_alpha_mode=lambda_alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
+            lambda_alpha_mode=lambda_alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior,
             omega_builder=omega_builder,
         )
 
@@ -293,7 +292,7 @@ def belief_gradients(
     # the kernel's transported pair term deviates from autograd-of-F by orders of magnitude.
     # Mirrors the self-term mask inside the kernel body; beta itself (the weights) is unchanged.
     pair_mask = ((energy > 0.0) & (energy < kl_max)).to(beta.dtype)
-    coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=lambda_alpha_mode, log_alpha=log_alpha)
+    coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=lambda_alpha_mode)
     if not alpha_is_per_coord(lambda_alpha_mode):
         coef = coef.unsqueeze(-1)                 # (N,) -> (N,1) per-position broadcast; per-coord sd is already (N,K)
     # The masked beta stays in its COMPACT per-head form; the kernel's _pair_contract realizes

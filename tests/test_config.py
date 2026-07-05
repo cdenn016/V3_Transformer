@@ -137,14 +137,12 @@ def test_config_rejects_nan_min_lr_frac():
 
 
 @pytest.mark.parametrize("overrides", [
-    {"lambda_alpha_mode": "learnable"},
     {"transport_mode": "regime_ii"},
-    {"learnable_lambda_beta": True},
 ])
 def test_straight_through_with_each_learnable_trigger_warns(overrides):
     """straight_through severs the per-iteration E-step tangent, so a learnable param that enters the
-    loss ONLY through it (log_alpha / connection_W / log_lambda_beta) gets no gradient. All three
-    triggers must warn (non-breaking: 'unroll' is the default that trains them)."""
+    loss ONLY through it (connection_W) gets no gradient. The regime_ii trigger must warn
+    (non-breaking: 'unroll' is the default that trains it)."""
     with pytest.warns(UserWarning, match="frozen"):
         VFE3Config(e_step_gradient="straight_through", **overrides)
 
@@ -153,7 +151,7 @@ def test_detach_with_learnable_trigger_warns():
     """The 'detach' sibling severs the same tangent and must warn too (the un-warned route:
     detach_e_step=True is forced to 'unroll' here and is warned at the model level instead)."""
     with pytest.warns(UserWarning, match="frozen"):
-        VFE3Config(e_step_gradient="detach", lambda_alpha_mode="learnable")
+        VFE3Config(e_step_gradient="detach", transport_mode="regime_ii")
 
 
 def test_straight_through_without_learnable_does_not_warn():

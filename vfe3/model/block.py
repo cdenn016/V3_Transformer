@@ -2,7 +2,7 @@ r"""A single VFE block for VFE_3.0: E-step belief inference + optional norm.
 
 Parameter-free (the block owns no nn.Parameters): on the pure default path the learnable capacity
 is the PriorBank's prior tables, but the block also receives the opt-in learned exceptions
-(head mixer, CG coupling, log_alpha, lambda_beta, connection_W) as arguments and applies them; the block
+(head mixer, CG coupling, connection_W) as arguments and applies them; the block
 runs the iterative E-step (Phase 6) and an optional gauge-equivariant norm on the
 mean. The belief handoff across blocks lives in stack.py.
 """
@@ -35,8 +35,7 @@ def vfe_block(
     block_norm:      Optional[Callable[..., torch.Tensor]] = None,   # cached norm instance (None -> off)
     head_mixer:      Optional[Callable[..., 'tuple']]      = None,   # opt-in Schur head mixer (None -> off)
     cg_coupling:     Optional[Callable[..., 'tuple']]      = None,   # opt-in CG cross-type coupling (None -> off)
-    log_alpha:       Optional[torch.Tensor]    = None,   # learned scalar self-coupling (None -> pure path)
-    lambda_beta:     'float | torch.Tensor'    = 1.0,    # belief-coupling weight (cfg.lambda_beta or exp(log_lambda_beta))
+    lambda_beta:     'float | torch.Tensor'    = 1.0,    # belief-coupling weight (cfg.lambda_beta)
     connection_W:    Optional[torch.Tensor]    = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
     connection_M:    Optional[torch.Tensor]    = None,   # learned covariant connection for regime_ii_covariant (Route B; None -> pure path)
     connection_L:    Optional[torch.Tensor]    = None,   # learned direct link for regime_ii_link* (NN exception; None -> pure path)
@@ -50,10 +49,8 @@ def vfe_block(
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
-    ``log_alpha`` is the model's learned self-coupling nn.Parameter (alpha = exp(log_alpha))
-    under lambda_alpha_mode='learnable', forwarded to the E-step; None on the pure path. ``lambda_beta``
-    is the belief-coupling weight (the constant cfg.lambda_beta, or the live exp(log_lambda_beta)
-    when learnable_lambda_beta=True); 1.0 is the pure F. ``connection_W`` is the model's learned
+    ``lambda_beta`` is the belief-coupling weight (the constant cfg.lambda_beta); 1.0 is the pure F.
+    ``connection_W`` is the model's learned
     bilinear Regime-II connection (a sanctioned NN exception) forwarded under
     transport_mode='regime_ii'; None on the pure (flat) path. ``e_step_gradient`` is the E-step
     backward estimator forwarded to the E-step (unroll | straight_through | detach). ``rope`` is
@@ -67,7 +64,7 @@ def vfe_block(
         belief, mu_p, sigma_p, group,
         n_iter=cfg.n_e_steps, tau=tau,
         e_q_mu_lr=cfg.e_q_mu_lr, e_q_sigma_lr=cfg.e_q_sigma_lr, e_phi_lr=cfg.e_phi_lr,
-        renyi_order=cfg.renyi_order, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device), log_alpha=log_alpha,
+        renyi_order=cfg.renyi_order, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device),
         lambda_beta=lambda_beta,
         kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,

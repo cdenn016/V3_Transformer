@@ -5,12 +5,8 @@ tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-term. The correct
 invariant: it scales coupling AND entropy by the same factor and leaves beta = softmax(-E/tau)
 alone, so (a) the gradient is AFFINE in lambda_beta (a lambda-into-softmax leak would make it
 nonlinear) and (b) the analytic kernel (which scales only its pair term) agrees with the autograd
-oracle (which differentiates lambda_beta*F_red). learnable_lambda_beta adds a scalar nn.Parameter
-log_lambda_beta (lambda_beta = exp(log_lambda_beta), init 0 -> 1.0) trained through the unrolled
-E-step, mirroring log_alpha.
+oracle (which differentiates lambda_beta*F_red).
 """
-
-import math
 
 import pytest
 import torch
@@ -22,7 +18,6 @@ from vfe3.geometry.groups import get_group
 from vfe3.geometry.transport import compute_transport_operators, transport_covariance, transport_mean
 from vfe3.gradients.kernels import belief_gradients
 from vfe3.gradients.oracle import belief_gradients_autograd
-from vfe3.model.model import VFEModel
 
 
 def _setup(N=3, K=2, seed=0):
@@ -139,86 +134,3 @@ def test_free_energy_scales_block_by_lambda_beta():
 def test_config_rejects_negative_lambda_beta():
     with pytest.raises(ValueError, match="lambda_beta must be >= 0"):
         VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, lambda_beta=-0.5)
-
-
-# ---- learnable lambda_beta (mirrors log_alpha) -------------------------------
-
-def _cfg(**over):
-    base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                n_e_steps=4, e_q_mu_lr=0.3, e_q_sigma_lr=0.1, e_phi_lr=0.0)
-    base.update(over)
-    return VFE3Config(**base)
-
-
-def test_default_off_no_log_lambda_beta_attribute():
-    model = VFEModel(_cfg())                         # learnable_lambda_beta defaults to False
-    assert not hasattr(model, "log_lambda_beta")
-
-
-def test_learnable_creates_scalar_param_init_one():
-    import torch.nn as nn
-    model = VFEModel(_cfg(learnable_lambda_beta=True))
-    assert isinstance(model.log_lambda_beta, nn.Parameter)
-    assert model.log_lambda_beta.shape == ()
-    assert float(model.log_lambda_beta.detach()) == 0.0      # exp(0) = lambda_beta = 1.0
-
-
-def test_learnable_init_equals_constant_one():
-    # learnable-at-init (log_lambda_beta=0 -> 1.0) must match the constant lambda_beta=1.0 path.
-    tok = torch.randint(0, 20, (3, 5)); tgt = torch.randint(0, 20, (3, 5))
-    torch.manual_seed(0); m_const = VFEModel(_cfg(lambda_beta=1.0))
-    torch.manual_seed(0); m_learn = VFEModel(_cfg(learnable_lambda_beta=True))
-    lc, loss_c, _ = m_const(tok, tgt)
-    ll, loss_l, _ = m_learn(tok, tgt)
-    assert torch.equal(lc, ll)
-    assert torch.equal(loss_c, loss_l)
-
-
-def test_learnable_log_lambda_beta_grad_populated():
-    # The learned weight trains: log_lambda_beta.grad is finite and nonzero after backward
-    # (the coupling block reaches the loss through the unrolled E-step).
-    model = VFEModel(_cfg(learnable_lambda_beta=True))
-    tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
-    _, loss, _ = model(tok, tgt)
-    loss.backward()
-    assert model.log_lambda_beta.grad is not None
-    assert torch.isfinite(model.log_lambda_beta.grad)
-    assert model.log_lambda_beta.grad.abs() > 0
-
-
-def test_learnable_with_detach_warns_and_freezes():
-    with pytest.warns(UserWarning, match="freezes log_lambda_beta"):
-        model = VFEModel(_cfg(learnable_lambda_beta=True, detach_e_step=True))
-    tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
-    _, loss, _ = model(tok, tgt)
-    loss.backward()
-    assert model.log_lambda_beta.grad is None        # frozen under the detached E-step
-
-
-def test_learnable_lambda_beta_in_optimizer_coverage():
-    # build_optimizer's exact-coverage guard must include log_lambda_beta (else it would never
-    # train and the guard would raise).
-    from vfe3.train import build_optimizer
-    model = VFEModel(_cfg(learnable_lambda_beta=True))
-    opt = build_optimizer(model, model.cfg)
-    grouped = {p for grp in opt.param_groups for p in grp["params"]}
-    assert model.log_lambda_beta in grouped
-
-
-def test_learnable_changes_forward_when_lambda_beta_moves():
-    # Moving log_lambda_beta away from 0 must change the converged belief / loss (genuinely consumed).
-    tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
-    torch.manual_seed(0)
-    model = VFEModel(_cfg(learnable_lambda_beta=True, pos_phi="none"))
-    _, loss0, _ = model(tok, tgt)
-    with torch.no_grad():
-        model.log_lambda_beta.copy_(torch.log(torch.tensor(3.0)))    # lambda_beta = 3.0
-    _, loss1, _ = model(tok, tgt)
-    assert not torch.allclose(loss0, loss1, atol=1e-6)
-
-
-def test_learnable_diagnostics_runs():
-    model = VFEModel(_cfg(learnable_lambda_beta=True))
-    tok = torch.randint(0, 20, (2, 5))
-    d = model.diagnostics(tok)
-    assert math.isfinite(d["self_coupling"]) and math.isfinite(d["belief_coupling"])

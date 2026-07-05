@@ -136,7 +136,6 @@ class PriorBank(nn.Module):
         diagonal_covariance: bool  = True,
         use_prior_bank:      bool  = True,
         decode_bias:         bool  = False,
-        decode_precision_scaled: bool = False,
         encode_mode:         str   = "per_token",
         decode_mode:         str   = "diagonal",
         decode_chunk_size:   int   = 8192,
@@ -154,7 +153,6 @@ class PriorBank(nn.Module):
         self.eps = eps
         self.diagonal_covariance = diagonal_covariance
         self.use_prior_bank = use_prior_bank
-        self.decode_precision_scaled = decode_precision_scaled
         self.encode_mode = encode_mode
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
@@ -592,7 +590,6 @@ class PriorBank(nn.Module):
         targets: torch.Tensor,           # (B, N) next-token ids (-100 = ignore)
 
         *,
-        sigma_q:      Optional[torch.Tensor] = None,  # (B, N, K) variances; required iff decode_precision_scaled
         chunk_size:   Optional[int]          = None,  # vocab-chunk width; None -> self.decode_chunk_size
         ignore_index: int                    = -100,
     ) -> torch.Tensor:                   # () scalar mean cross-entropy
@@ -604,22 +601,8 @@ class PriorBank(nn.Module):
         Same streaming contract as ``decode_ce_diagonal_chunked``: each vocab chunk's logits are
         born and die inside a gradient-checkpointed reduction that returns only the (B, N) chunk
         logsumexp and target-logit summaries; recompute is deterministic, so value and gradient (to
-        mu_q, sigma_q, W, and b) match the dense path exactly.
-
-        ``decode_precision_scaled`` (default OFF): the head reads ``x = eta = Sigma^-1 mu =
-        mu_q/(sigma_q+eps)`` instead of the bare mean, byte-for-byte the same transform the dense
-        ``_decode_linear`` applies; ``sigma_q`` is then required. OFF -> ``x = mu_q`` (sigma_q
-        unused, byte-identical to the bare-mean path).
+        mu_q, W, and b) match the dense path exactly.
         """
-        # Match the dense _decode_linear precision scaling so train (fused/chunked) and inference
-        # (dense) decode the SAME logits; a silent mismatch otherwise (audit 2026-06-17).
-        if self.decode_precision_scaled:
-            if sigma_q is None:
-                raise ValueError(
-                    "decode_ce_linear_chunked requires sigma_q when decode_precision_scaled=True"
-                )
-            mu_q = mu_q / (sigma_q + self.eps)                             # eta = Sigma^-1 mu
-
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
         W = self.output_proj_weight                                        # (V, K)
@@ -839,13 +822,8 @@ def _decode_linear(
     nn.Linear module. With ``decode_bias`` a learned per-vocab log-unigram bias ``b`` (V,) is added
     (see __init__). The pure KL-readout path is always available under use_prior_bank=True; this is
     the opt-in ablation the user uses to compare with/without the prior-bank decode.
-
-    ``decode_precision_scaled`` (default OFF): feed the precision-weighted mean -- the diagonal
-    natural parameter eta = Sigma^-1 mu = mu_q/(sigma_q+eps) -- to the head instead of the bare mean,
-    so the belief covariance enters the DISCRIMINATIVE readout. OFF -> the bare mean (sigma_q
-    discarded, byte-identical).
     """
-    x = mu_q if not pb.decode_precision_scaled else mu_q / (sigma_q + pb.eps)   # eta = Sigma^-1 mu when ON
+    x = mu_q                                                           # bare converged mean
     logits = x @ pb.output_proj_weight.transpose(-1, -2)               # (B, N, V)
     if pb.output_proj_bias is not None:
         logits = logits + pb.output_proj_bias                           # learned log-unigram prior

@@ -3,7 +3,7 @@ r"""The full VFE_3.0 model: encode -> E-step inference -> decode -> cross-entrop
 No neural layers (no nn.Linear/MLP/activation): on the pure default path the parameters are the
 PriorBank's prior tables, plus the model-owned learned tables their toggles create -- the default
 pos_phi='learned' positional table, and the default-OFF head mixer, CG coupling, regime_ii
-connection, and learnable alpha/lambda/T5-bias scalars. The E-step
+connection, and learnable T5-bias scalar. The E-step
 is unrolled into the training graph (the differentiable filtering kernel), so the CE
 loss backpropagates through inference to the encode/phi priors. Batching loops over
 the batch around the (unbatched) E-step; decode and CE are batched.
@@ -148,7 +148,6 @@ class VFEModel(nn.Module):
             decode_tau=cfg.decode_tau, eps=cfg.eps,
             diagonal_covariance=cfg.diagonal_covariance,
             use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
-            decode_precision_scaled=cfg.decode_precision_scaled,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             lambda_h=cfg.lambda_h, lambda_gamma=cfg.lambda_gamma,
@@ -186,7 +185,7 @@ class VFEModel(nn.Module):
             self.cg_coupling = None
         if (cfg.use_head_mixer or cfg.use_cg_coupling) \
                 and cfg.effective_e_step_gradient == "detach":
-            # Footgun (mirrors connection_W / log_alpha / pos_phi_free above and below): the
+            # Footgun (mirrors connection_W / pos_phi_free above and below): the
             # mixer and the CG coupling are applied INSIDE the vfe_stack call, which the
             # 'detach' estimator wraps wholesale in no_grad (block.py:73-78 under
             # model.forward's `run`), so mixer_deltas / path_weights build no graph, receive
@@ -205,12 +204,6 @@ class VFEModel(nn.Module):
                 "e_step_gradient='unroll') or 'straight_through' to train them.",
                 stacklevel=2,
             )
-        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED scalar self-coupling alpha.
-        # When lambda_alpha_mode='learnable', create log_alpha as a trainable nn.Parameter; the consumed
-        # coupling is alpha = exp(log_alpha) (always positive). Init 0 -> alpha = exp(0) = 1.0, so a
-        # learnable model is byte-identical to the constant alpha=1.0 pure path at step 0. For every
-        # other (pure no-NN) lambda_alpha_mode the parameter is NOT created at all (no log_alpha attribute),
-        # so the default path is param-free.
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): the LEARNED bilinear edge connection
         # W for Regime-II (non-flat) transport. When transport_mode='regime_ii', create connection_W
         # as a trainable nn.Parameter of shape (n_gen, K, K); the edge connection is
@@ -223,7 +216,7 @@ class VFEModel(nn.Module):
         if cfg.transport_mode == "regime_ii":
             self.connection_W = nn.Parameter(torch.zeros(n_gen, cfg.embed_dim, cfg.embed_dim))
             if cfg.detach_e_step:
-                # Footgun (mirrors log_alpha / use_prior_bank): connection_W enters the loss ONLY
+                # Footgun (mirrors use_prior_bank): connection_W enters the loss ONLY
                 # through the E-step belief updates, but detach_e_step wraps the E-step in no_grad,
                 # so connection_W receives NO gradient and stays frozen at its zero init (the flat
                 # cocycle). Set detach_e_step=False to train the learned connection.
@@ -274,73 +267,6 @@ class VFEModel(nn.Module):
                     "transport stays flat. Set detach_e_step=False to train the direct link.",
                     stacklevel=2,
                 )
-        if cfg.lambda_alpha_mode == "learnable":
-            self.log_alpha = nn.Parameter(torch.zeros(()))
-            if cfg.detach_e_step:
-                # Footgun (mirrors the use_prior_bank+detach warning below): log_alpha enters the
-                # loss ONLY through the E-step belief updates, but detach_e_step wraps the whole
-                # E-step in no_grad, so log_alpha receives NO gradient and stays frozen at its init
-                # (alpha = 1.0). Set detach_e_step=False to train the learned alpha.
-                import warnings
-                warnings.warn(
-                    "lambda_alpha_mode='learnable' with detach_e_step=True freezes log_alpha: the learned "
-                    "self-coupling alpha enters the loss only through the E-step, which the detached "
-                    "(no_grad) E-step severs, so log_alpha.grad is None and alpha stays at its init "
-                    "1.0. Set detach_e_step=False to train the learnable alpha.",
-                    stacklevel=2,
-                )
-        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED belief-coupling weight
-        # lambda_beta. When learnable_lambda_beta=True, create
-        # log_lambda_beta as a scalar nn.Parameter; the consumed weight is lambda_beta =
-        # exp(log_lambda_beta) (always positive). Init 0 -> lambda_beta = exp(0) = 1.0, byte-identical
-        # to the constant-1.0 pure path at step 0. For learnable_lambda_beta=False the parameter is
-        # NOT created (no log_lambda_beta attribute), so the default path is param-free.
-        if cfg.learnable_lambda_beta:
-            self.log_lambda_beta = nn.Parameter(torch.zeros(()))
-            if cfg.detach_e_step:
-                # Footgun (mirrors log_alpha): log_lambda_beta enters the loss ONLY through the E-step
-                # belief updates, but detach_e_step wraps the whole E-step in no_grad, so it receives
-                # NO gradient and stays frozen at its init (lambda_beta = 1.0).
-                import warnings
-                warnings.warn(
-                    "learnable_lambda_beta=True with detach_e_step=True freezes log_lambda_beta: the "
-                    "learned belief-coupling weight enters the loss only through the E-step, which the "
-                    "detached (no_grad) E-step severs, so log_lambda_beta.grad is None and lambda_beta "
-                    "stays at its init 1.0. Set detach_e_step=False to train the learnable lambda_beta.",
-                    stacklevel=2,
-                )
-        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED hyper-prior weight lambda_h
-        # (the model-fiber analogue of lambda_alpha_mode='learnable'). When lambda_h_mode='learnable', create
-        # log_lambda_h as a scalar nn.Parameter; the consumed weight is lambda_h = exp(log_lambda_h)
-        # (always positive). Init log(cfg.lambda_h) -> lambda_h = cfg.lambda_h, byte-identical to the
-        # constant lambda_h at step 0 (unlike log_alpha/log_lambda_beta, whose constant default is 1.0
-        # so they init at 0). For every other lambda_h_mode the parameter is NOT created, so those paths
-        # are param-free. Trains through the scored forward term (s_e_step=False) or the unrolled s
-        # E-step (_refine_s, s_e_step=True) -- the latter is the E-step-tangent route the detach/oracle
-        # config warnings cover.
-        # Create log_lambda_h only on the active-channel path (lambda_h>0 or s_e_step), matching the
-        # r-table gate (prior_bank.py): with lambda_h=0 and not s_e_step the hyper-prior channel is
-        # inert (no r table, scored term gated off) and config warns, so creating the parameter would
-        # only orphan it. getattr(...,"log_lambda_h",None) at every consumer keeps this None-safe.
-        if cfg.lambda_h_mode == "learnable" and (cfg.lambda_h > 0.0 or cfg.s_e_step):
-            self.log_lambda_h = nn.Parameter(torch.tensor(max(float(cfg.lambda_h), cfg.eps)).log())
-            if cfg.detach_e_step and cfg.s_e_step:
-                # Footgun (mirrors log_alpha / log_lambda_beta): under s_e_step the learned lambda_h
-                # enters the loss ONLY through the s E-step (_refine_s), which detach_e_step wraps in
-                # no_grad, so log_lambda_h receives NO gradient and stays frozen at its init. This guard
-                # deliberately keys on the LEGACY detach_e_step bool; the e_step_gradient='detach' /
-                # 'straight_through' route (with detach_e_step=False) is the complementary CONFIG-level
-                # warning's job (config.py, keyed on the e_step_gradient literal), so the two cover both
-                # freeze routes with no double-warn -- do NOT broaden this to effective_e_step_gradient.
-                import warnings
-                warnings.warn(
-                    "lambda_h_mode='learnable' with detach_e_step=True and s_e_step=True freezes "
-                    "log_lambda_h: under s_e_step the learned hyper-prior weight enters the loss only "
-                    "through the s E-step, which the detached (no_grad) E-step severs, so "
-                    "log_lambda_h.grad is None and lambda_h stays at its init. Set detach_e_step=False "
-                    "to train it.",
-                    stacklevel=2,
-                )
         if (not cfg.use_prior_bank) and cfg.detach_e_step:
             # Joint-toggle footgun (audit 2026-05-31): the detached E-step severs the encode prior
             # tables (mu/sigma/phi_embed) from the loss, and the linear decode reads only mu_final,
@@ -362,7 +288,7 @@ class VFEModel(nn.Module):
         self._rope_cache: dict = {}
         # BCH positional encoding (default-off): a learned per-position Lie-algebra element table
         # composed into the gauge frame before transport. Created ONLY for pos_phi='learned' (a raw
-        # nn.Parameter like log_alpha/connection_W, not a network); the "none"/"frozen" paths add no
+        # nn.Parameter like connection_W, not a network); the "none"/"frozen" paths add no
         # parameter, so the pure path stays param-free. Init scaled by pos_phi_scale.
         if cfg.pos_phi == "learned":
             # Seed pos_phi_free from a DEDICATED generator (cfg.seed), independent of the global RNG
@@ -375,7 +301,7 @@ class VFEModel(nn.Module):
             self.pos_phi_free = nn.Parameter(
                 torch.randn(cfg.max_seq_len, n_gen, generator=_g) * cfg.pos_phi_scale)
             if cfg.effective_e_step_gradient in ("detach", "straight_through"):
-                # Footgun (mirrors log_alpha / connection_W): pos_phi_free enters the loss ONLY
+                # Footgun (mirrors connection_W): pos_phi_free enters the loss ONLY
                 # through the E-step belief transport. The 'detach' and 'straight_through' estimators
                 # both sever that path (no_grad / a detached tangent), so the positional table
                 # receives no gradient and stays frozen at init. Gate on the EFFECTIVE estimator
@@ -399,13 +325,13 @@ class VFEModel(nn.Module):
         # default -log1p(bucket) so a learnable model is byte-identical to the fixed t5_relative_bias
         # prior at step 0, then trains. Unlike the gauge/value exceptions this bias is a scalar
         # function of position OFFSET only and touches NO gauge transport, so it does NOT break gauge
-        # equivariance. Created ONLY when t5_relative_bias is an active channel (mirrors the log_lambda_h
-        # active-channel gate so the parameter is never orphaned); else no t5_bias attribute and the
+        # equivariance. Created ONLY when t5_relative_bias is an active channel (so the parameter is
+        # never orphaned); else no t5_bias attribute and the
         # pure path stays param-free (the fixed-table default still runs).
         if cfg.t5_learnable_bias and "t5_relative_bias" in (cfg.beta_attention_prior, cfg.gamma_attention_prior):
             self.t5_bias = nn.Parameter(-torch.log1p(torch.arange(cfg.t5_num_buckets, dtype=torch.float32)))
             if cfg.effective_e_step_gradient in ("detach", "straight_through"):
-                # Footgun (mirrors log_alpha / connection_W / pos_phi_free, warned at config.py:1267):
+                # Footgun (mirrors connection_W / pos_phi_free, warned at config.py:1267):
                 # the attention log-prior is consumed INSIDE the E-step, and BOTH severing estimators
                 # cut t5_bias's only gradient path -- 'detach' wraps the whole E-step in no_grad, and
                 # 'straight_through' detaches the per-iteration belief tangent (e_step.py), the sole
@@ -600,19 +526,18 @@ class VFEModel(nn.Module):
             e_q_mu_lr=cfg.e_s_mu_lr,      e_q_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
             # The s-channel self-coupling weight IS lambda_h (the hyper-prior precision): route it
             # through the lambda_h_mode registry, not a hardcoded constant. e_step's self_coupling_alpha
-            # consumes (value, lambda_alpha_mode, b0, c0, log_alpha) exactly as lambda_h_i.hyper_prior_lambda_h
+            # consumes (value, lambda_alpha_mode, b0, c0) exactly as lambda_h_i.hyper_prior_lambda_h
             # does. ENVELOPE CANCELLATION (audit 2026-06-13): under state_dependent the s E-step gets the
             # correct lam*(KL)*dKL gradient by the envelope theorem -- on the LIVE kernel route the
             # belief-gradient kernel multiplies dKL by the envelope COEFFICIENT alpha*=c0_h/(b0_h+KL) and
             # never literally adds R_h (R_h's d/dbelief is 0, so omitting it is exact); only the autograd
             # ORACLE route's free_energy_value materializes alpha_reg=R_h. Either way the descent
-            # direction is correct. learnable feeds log_lambda_h. b0_h/c0_h are the hyper-prior's own
+            # direction is correct. b0_h/c0_h are the hyper-prior's own
             # precision shape (NOT alpha's b0/c0). NOTE: under state_dependent, value=cfg.lambda_h is
             # IGNORED (alpha_state_dependent reads only b0_h/c0_h); the coupling magnitude is c0_h/(b0_h+KL),
             # and cfg.lambda_h then acts ONLY as the channel-on gate -- it does not scale the s coupling.
             renyi_order=cfg.renyi_order,   value=cfg.lambda_h,          lambda_alpha_mode=cfg.lambda_h_mode,
             b0=_as_coeff(cfg.b0_h, s_mu.device), c0=_as_coeff(cfg.c0_h, s_mu.device),
-            log_alpha=getattr(self, "log_lambda_h", None),
             lambda_beta=cfg.lambda_gamma,
             kl_max=cfg.kl_max,             eps=cfg.eps,
             sigma_max=cfg.sigma_max,       e_sigma_q_trust=cfg.e_sigma_q_trust,
@@ -711,20 +636,11 @@ class VFEModel(nn.Module):
         # of a serial per-sequence Python loop. Sequences are independent (each reads only its own
         # belief and the shared, sequence-independent log_prior), so the batched result equals the
         # per-sample result (pinned by tests/test_perf_equivalence.py::test_batched_forward_equals_per_sample).
-        # log_alpha: the learned scalar self-coupling parameter (alpha = exp(log_alpha)) when
-        # lambda_alpha_mode='learnable', else None (the param-free pure path). Threaded through the
-        # E-step so the loss backpropagates to log_alpha. getattr keeps the default path's call
-        # identical: None forwards a defaulted-None keyword that every alpha form ignores.
-        log_alpha = getattr(self, "log_alpha", None)
-        # lambda_beta: the belief-coupling weight. The learned exp(log_lambda_beta) when
-        # learnable_lambda_beta=True (a live tensor, so the loss backpropagates to log_lambda_beta
-        # through the unrolled E-step, exactly like log_alpha), else the constant cfg.lambda_beta.
-        # A single value is threaded (not the raw param), so consumers just multiply by it.
-        _llb = getattr(self, "log_lambda_beta", None)
-        lambda_beta = self.cfg.lambda_beta if _llb is None else _llb.exp()
+        # lambda_beta: the belief-coupling weight (the constant cfg.lambda_beta).
+        lambda_beta = self.cfg.lambda_beta
         # connection_W: the learned bilinear Regime-II edge connection (a sanctioned NN exception)
         # when transport_mode='regime_ii', else None (the flat pure path). Threaded through the
-        # E-step like log_alpha so the loss backpropagates to it; getattr keeps the flat path's call
+        # E-step so the loss backpropagates to it; getattr keeps the flat path's call
         # identical (None forwards a defaulted kwarg the flat builder ignores).
         connection_W = getattr(self, "connection_W", None)
         # connection_M: the learned gauge-COVARIANT (Route B) Regime-II connection when
@@ -771,7 +687,6 @@ class VFEModel(nn.Module):
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm,
                             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
-                            log_alpha=log_alpha,
                             lambda_beta=lambda_beta,
                             connection_W=connection_W, connection_M=connection_M,
                             connection_L=connection_L,
@@ -888,12 +803,9 @@ class VFEModel(nn.Module):
                     )
                 else:
                     # linear decode; the chunked-CE path is rank-agnostic, so a '*_chunked'
-                    # decode_mode (diagonal_chunked or full_chunked) both route here. sigma_q is
-                    # forwarded only when decode_precision_scaled (the head reads mu/(sigma+eps)),
-                    # matching the dense _decode_linear path; None keeps the bare-mean path identical.
+                    # decode_mode (diagonal_chunked or full_chunked) both route here.
                     ce = self.prior_bank.decode_ce_linear_chunked(
                         mu_final.float(), targets,
-                        sigma_q=(sigma_final.float() if self.cfg.decode_precision_scaled else None),
                     )
             logits = None                                        # no (B, N, V) tensor on the fused path
         else:
@@ -937,8 +849,7 @@ class VFEModel(nn.Module):
             # is DETACHED: by the alpha-envelope (alpha* is the stationary point of alpha*D + R(alpha),
             # so d/dalpha[alpha*D + R] = 0 there), the M-step gradient of the F self-term w.r.t. the
             # priors is alpha_i* dD/dtheta with alpha_i* held fixed -- detaching it (and dropping R)
-            # is exact for the closed-form forms (constant/state_dependent/state_dependent_per_coord);
-            # for the learnable NN-exception alpha, log_alpha still trains through the E-step path.
+            # is exact for the closed-form forms (constant/state_dependent/state_dependent_per_coord).
             # At constant alpha=1.0 (the default) alpha_i==1, byte-identical to the prior mean-D form.
             # Grad-connected through D (no detach on D), so it backprops to the learned prior tables,
             # like mass_phi. The last-block prior is rebuilt by mirroring vfe_stack's prior_handoff
@@ -962,7 +873,6 @@ class VFEModel(nn.Module):
             )
             alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
                 self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, cap["out"].mu.device), c0=_as_coeff(cfg.c0, cap["out"].mu.device),
-                log_alpha=getattr(self, "log_alpha", None),
             )
             coupling = alpha_sc.detach() * self_div            # alpha_i^(k)* D^(k) (envelope: alpha* fixed)
             if alpha_is_per_coord(cfg.lambda_alpha_mode):
@@ -1011,7 +921,7 @@ class VFEModel(nn.Module):
             # converged s/r tables OUTSIDE the E-step (s_i does not couple into q this increment).
             # The h->s->p->q coupling and the s-channel E-step update remain DEFERRED. The weight is
             # now applied INSIDE _hyper_prior_term via the lambda_h_mode registry (constant: cfg.lambda_h;
-            # state_dependent: the envelope lambda_h*_i=c0_h/(b0_h+KL) + R_h; learnable: exp(log_lambda_h)),
+            # state_dependent: the envelope lambda_h*_i=c0_h/(b0_h+KL) + R_h),
             # so the term is added directly with NO external lambda_h factor (byte-identical for constant).
             loss = loss + self._hyper_prior_term(token_ids)
         if self.cfg.lambda_gamma > 0.0 and not self.cfg.s_e_step:
@@ -1091,7 +1001,7 @@ class VFEModel(nn.Module):
         -> cfg.lambda_h*KL with R_h=0 (byte-identical to the pre-registry cfg.lambda_h weighting);
         ``state_dependent`` -> the envelope lambda_h*_i = c0_h/(b0_h+KL) PLUS R_h, left UNDETACHED so
         autograd's product rule cancels to lambda_h*_i dKL by the envelope theorem (R_h must be in F
-        for that cancellation); ``learnable`` -> exp(log_lambda_h)*KL (grad flows to log_lambda_h).
+        for that cancellation).
         """
         from vfe3.lambda_h_i import hyper_prior_lambda_h, lambda_h_is_per_coord
         cfg = self.cfg
@@ -1100,14 +1010,13 @@ class VFEModel(nn.Module):
         lam, reg = hyper_prior_lambda_h(
             kl_s, mode=cfg.lambda_h_mode, value=cfg.lambda_h,
             b0_h=_as_coeff(cfg.b0_h, kl_s.device), c0_h=_as_coeff(cfg.c0_h, kl_s.device),
-            log_lambda_h=getattr(self, "log_lambda_h", None),
         )
         term = lam * kl_s
         if cfg.lambda_h_mode in ("state_dependent", "state_dependent_per_coord"):
-            # Only the state-dependent envelopes carry a nonzero R_h (constant/learnable return a zero
+            # Only the state-dependent envelopes carry a nonzero R_h (constant returns a zero
             # regularizer); add it UNDETACHED so autograd's product rule cancels to lam*dKL by the
             # envelope theorem. Gating on the state-dependent forms (not '!= constant') skips the
-            # zero-add on the learnable path. The per-coord form carries R_h^(k) per coordinate.
+            # zero-add on the constant path. The per-coord form carries R_h^(k) per coordinate.
             term = term + reg                                         # R_h in F -> envelope cancellation
         if per_coord:
             term = term.sum(dim=-1)                                  # (B,N,K) -> (B,N): sum the per-coordinate envelope
@@ -1251,13 +1160,11 @@ class VFEModel(nn.Module):
         log_prior = self._attention_log_prior(n, token_ids.device)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward/diagnostics/attention_maps (r2 id22)
         rope = self._rope_rotation(n, token_ids.device)
-        _llb = getattr(self, "log_lambda_beta", None)
         out = vfe_stack(                                             # converged belief gauge frame
             belief, belief.mu, belief.sigma, self.group, self.cfg,
             log_prior=log_prior, block_norm=self.block_norm,
             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
-            log_alpha=getattr(self, "log_alpha", None),
-            lambda_beta=(self.cfg.lambda_beta if _llb is None else _llb.exp()),
+            lambda_beta=self.cfg.lambda_beta,
             connection_W=getattr(self, "connection_W", None),
             connection_M=getattr(self, "connection_M", None),
             connection_L=getattr(self, "connection_L", None),
@@ -1512,7 +1419,6 @@ class VFEModel(nn.Module):
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
-        _llb = getattr(self, "log_lambda_beta", None)
         rope = self._rope_rotation(n, token_ids.device)               # rope shapes the converged belief (as forward)
         cap: dict = {}                                                # q* capture (F self-term reads it, as forward)
         out = vfe_stack(                                              # converged belief
@@ -1520,8 +1426,7 @@ class VFEModel(nn.Module):
             log_prior=log_prior, block_norm=self.block_norm,
             head_mixer=self.head_mixer,                               # per-block mixing -> diagnostics' final belief matches forward
             cg_coupling=self.cg_coupling,
-            log_alpha=getattr(self, "log_alpha", None),               # learned scalar (None on the pure path)
-            lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),   # learned/constant coupling weight
+            lambda_beta=cfg.lambda_beta,                              # constant coupling weight
             connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
             connection_M=getattr(self, "connection_M", None),         # learned covariant (Route B) connection (None unless regime_ii_covariant)
             connection_L=getattr(self, "connection_L", None),         # learned direct link (None unless regime_ii_link*)
@@ -1576,11 +1481,10 @@ class VFEModel(nn.Module):
         )
         alpha, alpha_reg = self_coupling_alpha(
             self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
-            log_alpha=getattr(self, "log_alpha", None),     # learned scalar (None on the pure path)
         )
 
         d = {"attn_entropy": float(metrics.attention_entropy(beta))}
-        _lb = cfg.lambda_beta if _llb is None else float(_llb.detach().exp())   # scaled-F total reflects lambda_beta
+        _lb = cfg.lambda_beta   # scaled-F total reflects lambda_beta
         terms = metrics.free_energy_terms(self_div, energy, beta, alpha,
                                           tau=attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), self.group.irrep_dims),
                                           lambda_beta=_lb, log_prior=log_prior,
@@ -1606,7 +1510,7 @@ class VFEModel(nn.Module):
         if cfg.lambda_h > 0.0 or cfg.s_e_step:                       # r table exists on this path
             d["hyper_prior"] = float(self._hyper_prior_kl(token_ids[:1], s_belief=s_belief).sum())   # sum_i KL(s_i||r) (refined s1 under s_e_step)
             _hp_weighted = float(self._hyper_prior_weighted(token_ids[:1], s_belief=s_belief).sum())  # WEIGHTED (lambda_h_mode); == cfg.lambda_h*hyper_prior for 'constant'
-            d["hyper_prior_weighted"] = _hp_weighted                                      # EXACT contribution folded into total (state_dependent/learnable != cfg.lambda_h*raw); the F-decomposition figure reads this
+            d["hyper_prior_weighted"] = _hp_weighted                                      # EXACT contribution folded into total (state_dependent != cfg.lambda_h*raw); the F-decomposition figure reads this
             d["total"] += _hp_weighted
         if cfg.lambda_gamma > 0.0 or cfg.s_e_step:                  # gamma block evaluated at out.phi
             g = self._gamma_coupling_terms(token_ids[:1], out.phi.unsqueeze(0), s_belief=s_belief)
@@ -1790,13 +1694,11 @@ class VFEModel(nn.Module):
         rope = self._rope_rotation(n, token_ids.device)
         maps = []
         for _ in range(cfg.n_layers):
-            _llb = getattr(self, "log_lambda_beta", None)
             belief = vfe_block(                                       # converged belief at this block
                 belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                 block_norm=self.block_norm,
-                head_mixer=self.head_mixer,                            # replay the mixer too (audit
-                log_alpha=getattr(self, "log_alpha", None),            # 2026-06-09 overnight F32)
-                lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
+                head_mixer=self.head_mixer,                            # replay the mixer too (audit 2026-06-09 overnight F32)
+                lambda_beta=cfg.lambda_beta,
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),     # learned covariant (Route B) connection
                 connection_L=getattr(self, "connection_L", None),     # learned direct link
@@ -1887,8 +1789,7 @@ class VFEModel(nn.Module):
         log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior
         fam = get_family(cfg.family)
-        _llb = getattr(self, "log_lambda_beta", None)
-        _lb = cfg.lambda_beta if _llb is None else float(_llb.detach().exp())
+        _lb = cfg.lambda_beta
         _tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), self.group.irrep_dims)
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
         mu_p, sigma_p = belief.mu, belief.sigma
@@ -1903,8 +1804,7 @@ class VFEModel(nn.Module):
             belief = vfe_block(                                       # converged belief at this block
                 belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                 block_norm=self.block_norm, head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
-                log_alpha=getattr(self, "log_alpha", None),
-                lambda_beta=(cfg.lambda_beta if _llb is None else _llb.exp()),
+                lambda_beta=cfg.lambda_beta,
                 connection_W=getattr(self, "connection_W", None),
                 connection_M=getattr(self, "connection_M", None),
                 connection_L=getattr(self, "connection_L", None),
@@ -1945,7 +1845,6 @@ class VFEModel(nn.Module):
             alpha, alpha_reg = self_coupling_alpha(
                 self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha,
                 b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device),
-                log_alpha=getattr(self, "log_alpha", None),
             )
             terms = metrics.free_energy_terms(
                 self_div, energy, beta, alpha, tau=_tau, lambda_beta=_lb, log_prior=log_prior,

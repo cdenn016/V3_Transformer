@@ -37,7 +37,6 @@ This V3 is a production quality gauge-theoretic VFE transformer that allows clea
   step 0 is byte-identical). Unlike (2)/(3) this bias is a scalar function of position OFFSET only and
   touches no gauge transport, so it does NOT break gauge equivariance — the cleanest exception. Like
   the E-step-coupled params above it carries a `detach_e_step` freeze footgun. (`learnable_r`,
-  `lambda_alpha_mode='learnable'`, `learnable_lambda_beta`, `lambda_h_mode='learnable'`,
   `pos_phi='learned'` are the other default-OFF learned-scalar/table toggles in the same family.)
 - NO CLI arg parsing; entry points are click-to-run (edit config dicts, then run).
 - float32 throughout; CUDA where applicable (user has an RTX 5090).

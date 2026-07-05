@@ -35,12 +35,6 @@ def _model_device(model) -> torch.device:
     return model.prior_bank.mu_embed.device
 
 
-def _lambda_beta(model) -> 'float | torch.Tensor':
-    r"""The live belief-coupling weight (constant cfg.lambda_beta, or exp(log_lambda_beta))."""
-    llb = getattr(model, "log_lambda_beta", None)
-    return model.cfg.lambda_beta if llb is None else llb.exp()
-
-
 def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tensor, Optional[torch.Tensor]]:
     r"""Encode sequence 0 to the initial belief (pos_phi applied), with its log-prior and RoPE.
 
@@ -69,7 +63,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
         b0=_as_coeff(cfg.b0, model.prior_bank.mu_embed.device),
         c0=_as_coeff(cfg.c0, model.prior_bank.mu_embed.device),
-        lambda_beta=_lambda_beta(model), kl_max=cfg.kl_max, eps=cfg.eps,
+        lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
         e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
         e_step_mu_precond=cfg.e_step_mu_precond,
@@ -81,7 +75,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
         link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-        log_prior=log_prior, log_alpha=getattr(model, "log_alpha", None),
+        log_prior=log_prior,
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
 
@@ -95,12 +89,12 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
         renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
         b0=_as_coeff(cfg.b0, model.prior_bank.mu_embed.device),
         c0=_as_coeff(cfg.c0, model.prior_bank.mu_embed.device),
-        lambda_beta=_lambda_beta(model), kl_max=cfg.kl_max, eps=cfg.eps,
+        lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
         include_attention_entropy=cfg.include_attention_entropy, family=cfg.family,
         divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
         transport_mode=cfg.transport_mode, cocycle_relaxation=cfg.cocycle_relaxation,
         link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-        log_prior=log_prior, log_alpha=getattr(model, "log_alpha", None),
+        log_prior=log_prior,
         connection_W=getattr(model, "connection_W", None),
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
@@ -216,7 +210,7 @@ def belief_ce_bank(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
                 log_prior=log_prior, block_norm=model.block_norm,
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
-                log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
+                lambda_beta=cfg.lambda_beta,
                 connection_W=getattr(model, "connection_W", None),
                 connection_M=getattr(model, "connection_M", None),
                 connection_L=getattr(model, "connection_L", None),
@@ -285,7 +279,7 @@ def belief_bank(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
                 log_prior=log_prior, block_norm=model.block_norm,
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained
-                log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),  # model
+                lambda_beta=cfg.lambda_beta,  # model
                 connection_W=getattr(model, "connection_W", None),
                 connection_M=getattr(model, "connection_M", None),
                 connection_L=getattr(model, "connection_L", None),
@@ -374,8 +368,7 @@ def across_layer_belief_trace(
             belief, mu_p, sigma_p, model.group, cfg, log_prior=log_prior,
             block_norm=model.block_norm, head_mixer=model.head_mixer,
             cg_coupling=model.cg_coupling,                       # replay the trained model
-            log_alpha=getattr(model, "log_alpha", None),
-            lambda_beta=_lambda_beta(model), connection_W=getattr(model, "connection_W", None),
+            lambda_beta=cfg.lambda_beta, connection_W=getattr(model, "connection_W", None),
             connection_M=getattr(model, "connection_M", None),
             connection_L=getattr(model, "connection_L", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
@@ -495,7 +488,7 @@ def converged_state(
             belief, belief.mu, belief.sigma, model.group, cfg,
             log_prior=log_prior, block_norm=model.block_norm,
             head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained model
-            log_alpha=getattr(model, "log_alpha", None), lambda_beta=_lambda_beta(model),
+            lambda_beta=cfg.lambda_beta,
             connection_W=getattr(model, "connection_W", None),
             connection_M=getattr(model, "connection_M", None),
             connection_L=getattr(model, "connection_L", None),
@@ -602,10 +595,9 @@ def attention_entropy_cov_gap(
         tau=attention_tau(_as_coeff(cfg.kappa_beta, dev), model.group.irrep_dims),
         renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
         b0=_as_coeff(cfg.b0, dev), c0=_as_coeff(cfg.c0, dev), value=cfg.lambda_alpha,
-        lambda_beta=_lambda_beta(model), gradient_mode=cfg.gradient_mode, family=cfg.family,
+        lambda_beta=cfg.lambda_beta, gradient_mode=cfg.gradient_mode, family=cfg.family,
         divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
         irrep_dims=model.group.irrep_dims, log_prior=log_prior,
-        log_alpha=getattr(model, "log_alpha", None),
     )                                                             # grad ON here (outside the no_grad block)
     gc_mu, gc_sig = belief_gradients_autograd(out.mu, out.sigma, mu_p, sigma_p, omega,
                                               include_attention_entropy=True, **kw)

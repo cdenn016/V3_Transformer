@@ -39,7 +39,7 @@ def test_b0_c0_list_entries_must_be_positive():
 def test_b0_c0_list_requires_per_coord_alpha_mode():
     # audit 2026-06-09 P2: a (K,) b0/c0 against a per-position scalar D crashes at the first
     # forward (or silently mis-broadcasts when K == N); the pair is rejected at construction.
-    for mode in ("constant", "state_dependent", "learnable"):
+    for mode in ("constant", "state_dependent"):
         with pytest.raises(ValueError, match="per-coordinate alpha form"):
             _tiny_cfg(b0=[1.0, 2.0, 3.0, 4.0], lambda_alpha_mode=mode)
         with pytest.raises(ValueError, match="per-coordinate alpha form"):

@@ -228,7 +228,7 @@ def _F_laplace_filtering(mu_q, sigma_q, mu_p, sigma_p, mu_t, sigma_t, tau, order
     sd = self_divergence_for_alpha(DiagonalLaplace(mu_q, sigma_q), DiagonalLaplace(mu_p, sigma_p),
                                    alpha=order, kl_max=100.0, eps=1e-6,
                                    divergence_family="renyi", lambda_alpha_mode="constant")
-    alpha, _reg = self_coupling_alpha(sd, mode="constant", value=1.0, b0=1.0, c0=1.0, log_alpha=None)
+    alpha, _reg = self_coupling_alpha(sd, mode="constant", value=1.0, b0=1.0, c0=1.0)
     energy = pairwise_energy(DiagonalLaplace(mu_q, sigma_q), DiagonalLaplace(mu_t, sigma_t),
                              alpha=order, kl_max=100.0, eps=1e-6, divergence_family="renyi", irrep_dims=None)
     return free_energy(sd, energy, alpha, tau=tau, lambda_beta=1.0,

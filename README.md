@@ -242,9 +242,8 @@ The sanctioned neural-network exceptions, each a single learnable parameter rath
 network and each byte-identical to the pure path at initialization, are: a linear output
 projection that replaces the KL decode (`use_prior_bank=False`, the linear-decode
 ablation); a learned Schur-commutant head mixer (`use_head_mixer=True`); a learned bilinear
-edge connection for non-flat Regime-II transport (`transport_mode='regime_ii'`); a learned
-scalar self-coupling (`lambda_alpha_mode='learnable'`); a learned belief-coupling weight
-(`learnable_lambda_beta=True`); and a learned per-bucket T5 relative-position attention bias
+edge connection for non-flat Regime-II transport (`transport_mode='regime_ii'`); and a
+learned per-bucket T5 relative-position attention bias
 (`t5_learnable_bias=True`). The Regime-II connection and the head mixer break strict gauge
 equivariance away from their zero/identity initialization, which is documented and
 user-accepted; the T5 bias, a scalar function of position offset that touches no gauge

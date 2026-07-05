@@ -134,9 +134,6 @@ config = dict(
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.008,
-    decode_precision_scaled   = False,               # use_prior_bank=False only: feed the precision-weighted mean
-                                                     # eta=mu/sigma (natural param) to the linear head so Sigma enters
-                                                     # the discriminative readout (diagnostic; OFF = bare-mu linear)
     decode_mode               = 'diagonal_chunked',
     oracle_unroll_grad        = False,
     
@@ -214,8 +211,8 @@ config = dict(
     #                Self Energy:  
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "state_dependent",  # "constant" | "learnable" | "state_dependent" | "state_dependent_per_coord"
-    lambda_h_mode              = "constant",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h) | "learnable" (NN exc.)
+    lambda_alpha_mode          = "state_dependent",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_h_mode              = "constant",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h)
     
     b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0                         = 1.0,                 # state-dependent alpha shape (numerator)

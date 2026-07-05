@@ -131,7 +131,7 @@ def _report_cfg(**over):
     r"""SimpleNamespace with every attribute _pure_path_report reads (incl. family for the
     regime_ii_covariant exactness flag)."""
     base = dict(include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
-                learnable_lambda_beta=False, use_prior_bank=True, use_head_mixer=False,
+                use_prior_bank=True, use_head_mixer=False,
                 lambda_beta=1.0, precision_weighted_attention=False,
                 gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
                 lambda_gamma=0.0, s_e_step=False, family="gaussian_diagonal")

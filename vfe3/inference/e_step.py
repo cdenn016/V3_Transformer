@@ -221,7 +221,6 @@ def free_energy_value(
 
     rope:                      Optional[torch.Tensor] = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     log_prior:                 Optional[torch.Tensor] = None,
-    log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
     connection_W:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii NN exception)
     connection_M:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii_covariant, Route B)
     connection_L:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii_link*)
@@ -241,8 +240,7 @@ def free_energy_value(
     ``TypeError`` here instead of being silently swallowed. ``transport_mode`` / ``connection_W`` /
     ``cocycle_relaxation`` ARE honored for the global (``keys=None``) F so the logged trajectory matches
     the objective the beliefs descend under regime_ii; the filtered (frozen-keys) F has no non-flat
-    transport form and raises under a non-flat ``transport_mode``. ``log_alpha`` is also honored (it
-    flows into ``self_coupling_alpha`` below). ``rope``/``rope_on_cov`` are honored too (audit
+    transport form and raises under a non-flat ``transport_mode``. ``rope``/``rope_on_cov`` are honored too (audit
     2026-06-09 PP6): the built transport is wrapped in :class:`RopeTransport` exactly as on the
     model path, so under gauge-RoPE the logged F is the F being descended, not the un-rotated one.
     """
@@ -291,7 +289,7 @@ def free_energy_value(
     fam = get_family(family)
     sd = self_divergence_for_alpha(fam(belief.mu, belief.sigma), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max,
                                    eps=eps, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
-    alpha, reg = self_coupling_alpha(sd, value=value, mode=lambda_alpha_mode, b0=b0, c0=c0, log_alpha=log_alpha)
+    alpha, reg = self_coupling_alpha(sd, value=value, mode=lambda_alpha_mode, b0=b0, c0=c0)
     energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_t, sigma_t), alpha=renyi_order, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     coupling_energy = None
@@ -418,7 +416,6 @@ def e_step_iteration(
     clamp_monitor:             bool = False,                   # opt-in: warn when the exp Frobenius clamp fires (host sync)
 
     log_prior:                 Optional[torch.Tensor] = None,
-    log_alpha:                 Optional[torch.Tensor] = None,   # learned scalar self-coupling (None -> pure path)
     connection_W:              Optional[torch.Tensor] = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
     connection_M:              Optional[torch.Tensor] = None,   # learned covariant connection for regime_ii_covariant (Route B; None -> pure path)
     connection_L:              Optional[torch.Tensor] = None,   # learned direct link for regime_ii_link* (NN exception; None -> pure path)
@@ -435,11 +432,9 @@ def e_step_iteration(
     (``transport_mode``); the default 'flat' is the Regime-I phi-cocycle (byte-identical).
     'regime_ii' is the non-flat edge-relaxed cocycle and consumes the CURRENT belief means and the
     learned ``connection_W`` (a sanctioned NN exception); because that Omega depends on mu it is
-    rebuilt from ``belief.mu`` every iteration here (flat is mu-independent). ``log_alpha`` is the
-    learned self-coupling nn.Parameter (alpha = exp(log_alpha)) under lambda_alpha_mode='learnable' (None on
-    the pure path); it flows into the belief gradient so the loss backpropagates to it through the
-    unrolled E-step. ``connection_W`` likewise flows in only through these belief updates, so the
-    loss backpropagates to it (and a detached E-step would freeze it, mirroring log_alpha)."""
+    rebuilt from ``belief.mu`` every iteration here (flat is mu-independent). ``connection_W`` flows
+    in only through these belief updates, so the loss backpropagates to it (and a detached E-step
+    would freeze it)."""
     # Build the forward belief-transport (P0 #2): on the flat + block-diagonal-with-equal-blocks
     # path this is a FactoredTransport (the per-token exps only, NO dense (B,N,N,K,K) Omega), which
     # the belief-gradient kernel / oracle consume opaquely through transport_mean / covariance;
@@ -515,7 +510,7 @@ def e_step_iteration(
         include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
         family=family, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode,
         transport_mode=transport_mode, omega_builder=omega_builder,
-        irrep_dims=group.irrep_dims, log_prior=log_prior, log_alpha=log_alpha,
+        irrep_dims=group.irrep_dims, log_prior=log_prior,
         # Opt-in unrolled-oracle: make the autograd oracle (non-kernel families) return a
         # differentiable belief gradient so the through-inference signal reaches the prior, matching
         # the hand kernel. Gated on the explicit oracle_unroll_grad toggle (default OFF preserves the
