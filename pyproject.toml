@@ -7,7 +7,15 @@ name = "vfe3"
 version = "0.0.1"
 description = "Gauge-theoretic VFE transformer, clean-room rebuild (V3)"
 requires-python = ">=3.10"
-dependencies = ["torch"]
+# numpy/matplotlib are HARD deps (audit 2026-07-05 m16): vfe3/viz/figures.py imports both
+# unconditionally and finalize-time figure generation is ON by default (generate_figures=True),
+# so a torch-only install would complete a full training run and then crash at finalize.
+dependencies = ["torch", "numpy", "matplotlib"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+data = ["tiktoken"]          # tokenizer for dataset cache builds (tests importorskip it)
+viz = ["umap-learn"]         # optional UMAP figures (tests skip when absent)
 
 [tool.setuptools.packages.find]
 include = ["vfe3*"]

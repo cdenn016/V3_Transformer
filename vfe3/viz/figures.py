@@ -58,6 +58,22 @@ def _save(fig, path: Optional[str]):
     return fig
 
 
+# Worker source for the ISOLATED umap embedding subprocess (see umap_embed).
+# init="pca" skips UMAP's spectral eigensolver, which on disconnected / near-degenerate belief
+# clouds fails to converge (tiny eigengap) and silently falls back to uniform-random init; PCA is
+# deterministic and data-aware. n_jobs=1 matches what random_state already forces, so it also
+# silences UMAP's "n_jobs overridden" warning. Same compute, no warning cascade.
+_UMAP_WORKER_SRC = (
+    "import sys\n"
+    "import numpy as np\n"
+    "import umap\n"
+    "X = np.load(sys.argv[1])\n"
+    "reducer = umap.UMAP(n_neighbors=int(sys.argv[3]), min_dist=float(sys.argv[4]),\n"
+    "                    n_components=2, init='pca', random_state=int(sys.argv[5]), n_jobs=1)\n"
+    "np.save(sys.argv[2], reducer.fit_transform(X))\n"
+)
+
+
 def umap_embed(
     features,                            # (N, D) tensor/array
 
@@ -66,11 +82,16 @@ def umap_embed(
     min_dist:    float = 0.1,
     seed:        int = 0,
 ):
-    """2-D UMAP embedding of ``features`` ((N, D) -> (N, 2)). Lazy-imports umap-learn."""
-    try:
-        import umap
-    except ImportError as exc:           # pragma: no cover
-        raise ImportError("umap_embed needs umap-learn (pip install umap-learn)") from exc
+    r"""2-D UMAP embedding of ``features`` ((N, D) -> (N, 2)), run in an ISOLATED subprocess.
+
+    umap-learn's numba/llvmlite native layer can die with a Windows ACCESS VIOLATION when it
+    initializes inside a long-running, heavily loaded process (observed on Python 3.14 after
+    hundreds of tests: llvmlite ``check_jit_execution`` faults; a fresh process imports numba
+    fine) -- a process-killing crash no in-process try/except can catch, taking the whole
+    training finalize / test session down with it. Running the embedding in a fresh subprocess
+    fully isolates the native layer: same computation, same seeded result. A failing subprocess
+    (numba genuinely unsupported, umap-learn absent) raises the OSError/ImportError the umap
+    consumers were already written to handle (audit 2026-07-05 verification fix)."""
     X = _np(features)
     # A fully collapsed channel (every point identical -> zero variance) has no embedding, and PCA
     # init would divide by total variance 0 and yield NaN. Return a trivial finite layout so the
@@ -78,13 +99,29 @@ def umap_embed(
     if X.shape[0] < 3 or float(np.ptp(X, axis=0).max()) <= 0.0:
         return np.zeros((X.shape[0], 2), dtype=float)
     n_neighbors = min(n_neighbors, max(2, X.shape[0] - 1))
-    # init="pca" skips UMAP's spectral eigensolver, which on disconnected / near-degenerate belief
-    # clouds fails to converge (tiny eigengap) and silently falls back to uniform-random init; PCA is
-    # deterministic and data-aware. n_jobs=1 matches what random_state already forces, so it also
-    # silences UMAP's "n_jobs overridden" warning. Same compute, no warning cascade.
-    reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=min_dist, n_components=2,
-                        init="pca", random_state=seed, n_jobs=1)
-    return reducer.fit_transform(X)
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
+    try:
+        fin  = os.path.join(workdir, "in.npy")
+        fout = os.path.join(workdir, "out.npy")
+        np.save(fin, X)
+        proc = subprocess.run(
+            [sys.executable, "-c", _UMAP_WORKER_SRC,
+             fin, fout, str(n_neighbors), str(min_dist), str(seed)],
+            capture_output=True, timeout=600,
+        )
+        if proc.returncode != 0:
+            tail = proc.stderr.decode(errors="replace")[-500:]
+            if "ModuleNotFoundError" in tail and "umap" in tail:
+                raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
+            raise OSError(f"umap embedding subprocess failed (rc={proc.returncode}): {tail}")
+        return np.load(fout)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def plot_embedding(

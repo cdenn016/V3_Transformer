@@ -820,8 +820,8 @@ def _decode_full_chunked(
     a_v = lhs @ rhs.transpose(-1, -2)                                    # (B, N, V): trace + mahalanobis core
     a_v = a_v + (mc_v ** 2 * inv_v).sum(-1) + torch.log(sigma_v + pb.eps).sum(-1)  # + sum_k(mc_v^2/sigma_v_reg + log sigma_v_reg)
     per_pos = pb.K + logdet_q.unsqueeze(-1)                              # (B, N, 1) = K + log|Sigma_q|
-    kl_v = 0.5 * (a_v - per_pos)                                         # (B, N, V)
-    return -kl_v / tau_eff
+    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0)                        # (B, N, V); KL>=0 floor matches
+    return -kl_v / tau_eff                                               # _decode_diagonal (audit 2026-07-05 m5)
 
 
 @register_decode("linear")

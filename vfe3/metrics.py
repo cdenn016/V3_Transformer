@@ -1200,14 +1200,23 @@ def _m_gauge_spread(*, phi: torch.Tensor, generators: torch.Tensor, **kw) -> flo
 
 @register_metric("free_energy_terms")
 def _m_free_energy_terms(*, self_div=None, energy=None, beta=None, alpha=None,
-                         tau, log_prior=None, **kw) -> Dict[str, float]:
+                         tau, log_prior=None, lambda_beta=1.0,
+                         include_attention_entropy=True, alpha_reg=None, **kw) -> Dict[str, float]:
     """Per-term free-energy decomposition (self-coupling, belief-coupling, attention entropy).
 
     ``tau`` is REQUIRED (no default): the wrapper has no way to recover the group-aware softmax
     temperature tau = kappa*sqrt(d_head), and a silent tau=1.0 makes the attention-entropy term (and
     so ``total``) wrong for any K>1 (audit 2026-06-13 L16). Callers pass ``attention_tau(...)`` -- as
-    the live diagnostics path already does -- matching this module's required-context-key convention."""
-    return free_energy_terms(self_div, energy, beta, alpha, tau=tau, log_prior=log_prior)
+    the live diagnostics path already does -- matching this module's required-context-key convention.
+
+    ``lambda_beta`` / ``include_attention_entropy`` / ``alpha_reg`` are forwarded (audit 2026-07-05
+    m4): the wrapper previously dropped all three, so a registry-driven ``total`` matched the runtime
+    F only at lambda_beta=1 / entropy-ON / constant-alpha. Defaults reproduce the old behavior when
+    a context omits them (pure F), so existing callers are byte-identical."""
+    return free_energy_terms(self_div, energy, beta, alpha, tau=tau, log_prior=log_prior,
+                             lambda_beta=lambda_beta,
+                             include_attention_entropy=include_attention_entropy,
+                             alpha_reg=alpha_reg)
 
 
 def compute_metrics(

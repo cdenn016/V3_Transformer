@@ -127,7 +127,7 @@ class DiagonalLaplace(BeliefParams):
         stationary point of F preserved). ``eps`` floors ``b`` (the belief sigma floor, ``cfg.eps``)
         exactly as the divergence does."""
         orig_dtype = self.sigma.dtype
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.amp.autocast(self.sigma.device.type, enabled=False):  # tensor-keyed (audit 2026-07-05 m10)
             b2        = self.sigma.float().clamp(min=eps).square()      # (..., K) b^2 = I^{-1}
             nat_mu    = b2 * grad_mu.float()
             nat_sigma = b2 * grad_sigma.float()

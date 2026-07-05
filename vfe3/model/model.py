@@ -619,6 +619,10 @@ class VFEModel(nn.Module):
             e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
             include_attention_entropy=cfg.include_attention_entropy,
             gradient_mode=cfg.gradient_mode,
+            # Thread the mean-arm preconditioner selection (audit 2026-07-05 m11): without this the
+            # s-refine silently ran the default 'fisher' even under e_step_mu_precond='raw',
+            # contaminating the B3/EXP-14 mean-arm ablation (raw belief channel, Fisher s channel).
+            e_step_mu_precond=cfg.e_step_mu_precond,
             family="gaussian_diagonal",
             divergence_family=cfg.divergence_family,
             phi_precond_mode=cfg.phi_precond_mode,
@@ -1427,7 +1431,6 @@ class VFEModel(nn.Module):
             idx = torch.multinomial(out.policy_posterior, num_samples=1)    # (B, 1)
         return torch.gather(topk, 1, idx)                          # (B, 1) selected token id
 
-    @torch.no_grad()
     def _fold_precision_bias(
         self,
         log_prior: Optional[torch.Tensor],   # (N,N)/(H,N,N) position prior (batched or not), or None
@@ -1440,7 +1443,14 @@ class VFEModel(nn.Module):
         ``log_prior`` unchanged) when ``precision_weighted_attention`` is off. Rank-robust: ``sigma``
         may be ``(B, N, K)`` (forward) or ``(N, K)`` (diagnostics), and under ``family='gaussian_full'``
         the full covariance ``(.., N, K, K)`` -- reduced to its per-coordinate variances (the diagonal)
-        so ``tr Sigma_j`` is the matrix trace, not a sum over a covariance row."""
+        so ``tr Sigma_j`` is the matrix trace, not a sum over a covariance row.
+
+        NOT ``@torch.no_grad()`` (audit 2026-07-05 M1): only the reliability bias ``kb`` is meant to
+        be detached (each branch calls ``.detach()`` explicitly below); a ``no_grad`` wrapper would
+        additionally sever the graph of the ``log_prior`` it is added to -- the ONLY gradient path of
+        the learnable T5 bias -- silently freezing ``t5_bias`` under
+        ``precision_weighted_attention=True`` + ``t5_learnable_bias=True``. Values are identical
+        either way; only the autograd graph of the returned sum differs."""
         if not self.cfg.precision_weighted_attention:
             return log_prior
         b0 = self.cfg.precision_attention_b0

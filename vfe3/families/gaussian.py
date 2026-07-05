@@ -333,14 +333,17 @@ class FullGaussian(BeliefParams):
         r"""Closed-form full-covariance Gaussian Renyi/KL (ported verbatim from
         ``divergence._gaussian_full_renyi``; mu_q=self, mu_t=other)."""
         K = self.mu.shape[-1]
-        device = self.mu.device
         mu_q = self.mu.float()
         sigma_q = self.sigma.float()
         mu_t = other.mu.float()
         sigma_t = other.sigma.float()
-        eye = torch.eye(K, device=device, dtype=torch.float32)
-        sigma_q_reg = sigma_q + eps * eye
-        sigma_t_reg = sigma_t + eps * eye
+        # NO unconditional eps ridge (audit 2026-07-05 m1): the old ``sigma + eps*eye`` scored
+        # N(mu, Sigma + eps I) ALWAYS -- a standing 1e-6 bias in values and gradients on the pure
+        # full-covariance path, unlike the diagonal path's clamp (inert whenever the SPD retraction
+        # keeps sigma >= eps). Robustness against a numerically non-PD covariance is owned by
+        # safe_cholesky below: round 0 adds ZERO jitter (valid-SPD inputs are byte-identical to
+        # torch.linalg.cholesky), failures get an escalating eps ridge, and a pair failing every
+        # round -> NaN -> safe_kl_clamp -> kl_max.
         if abs(alpha - 1.0) < 1e-6:
             # safe_cholesky (jittered cholesky_ex, never raises) hardens the KL against a
             # numerically non-PD prior/posterior covariance -- reachable once training shifts the
@@ -348,9 +351,9 @@ class FullGaussian(BeliefParams):
             # This matches the robustness the alpha != 1 branch already has. Round 0 adds zero
             # jitter, so valid-SPD inputs stay byte-identical to torch.linalg.cholesky; an element
             # that fails every round -> NaN -> safe_kl_clamp -> kl_max (mirroring that branch).
-            L_p, ok_p = safe_cholesky(sigma_t_reg, eps=eps, rounds=5)
-            L_q, ok_q = safe_cholesky(sigma_q_reg, eps=eps, rounds=5)
-            Y = torch.linalg.solve_triangular(L_p, sigma_q_reg, upper=False)
+            L_p, ok_p = safe_cholesky(sigma_t, eps=eps, rounds=5)
+            L_q, ok_q = safe_cholesky(sigma_q, eps=eps, rounds=5)
+            Y = torch.linalg.solve_triangular(L_p, sigma_q, upper=False)
             Z = torch.linalg.solve_triangular(L_p.transpose(-1, -2), Y, upper=True)
             trace_term = torch.diagonal(Z, dim1=-2, dim2=-1).sum(dim=-1)
             delta_mu = mu_t - mu_q
@@ -369,11 +372,11 @@ class FullGaussian(BeliefParams):
             # that fails ALL rounds is set to NaN so safe_kl_clamp maps it to kl_max while
             # good pairs in the same batch keep their finite divergence. Round 0 adds zero
             # extra jitter, so valid-SPD inputs stay byte-identical to torch.linalg.cholesky.
-            sigma_blend = (1.0 - alpha) * sigma_q_reg + alpha * sigma_t_reg
+            sigma_blend = (1.0 - alpha) * sigma_q + alpha * sigma_t
             sigma_blend = 0.5 * (sigma_blend + sigma_blend.transpose(-1, -2))
             L_blend, _ = safe_cholesky(sigma_blend, eps=eps, rounds=5)  # factor for mahal_term only
-            L_q, ok_q = safe_cholesky(sigma_q_reg, eps=eps, rounds=5)
-            L_t, ok_t = safe_cholesky(sigma_t_reg, eps=eps, rounds=5)
+            L_q, ok_q = safe_cholesky(sigma_q, eps=eps, rounds=5)
+            L_t, ok_t = safe_cholesky(sigma_t, eps=eps, rounds=5)
             delta_mu = mu_t - mu_q
             v = torch.linalg.solve_triangular(
                 L_blend, delta_mu.unsqueeze(-1), upper=False
@@ -383,8 +386,8 @@ class FullGaussian(BeliefParams):
                 # fp32 cancellation band: the three logdets nearly cancel before the /(alpha-1).
                 # Recompute them in float64 via slogdet on the f64 regularized covariances; the
                 # fp32 cholesky factors above still drive mahal_term and the ok mask.
-                sq64 = sigma_q_reg.double()
-                st64 = sigma_t_reg.double()
+                sq64 = sigma_q.double()
+                st64 = sigma_t.double()
                 sb64 = (1.0 - alpha) * sq64 + alpha * st64
                 sb64 = 0.5 * (sb64 + sb64.transpose(-1, -2))
                 logdet_term = (
@@ -405,7 +408,8 @@ class FullGaussian(BeliefParams):
             # True) even though alpha>1 left the convex regime and the Renyi divergence is undefined
             # there -- the fp64 slogdet then drops the sign and the value collapses to ~0 instead of
             # kl_max. Gate on the SIGN of the (symmetrized) blend spectrum so a non-PD blend -> NaN
-            # -> kl_max regardless of the ridge (audit 2026-06-17). sigma_q/sigma_t are eps-SPD.
+            # -> kl_max regardless of the ridge (audit 2026-06-17). sigma_q/sigma_t are SPD on the
+            # live pipeline (SPD retraction); safe_cholesky owns the off-pipeline non-PD handling.
             blend_pd = torch.linalg.eigvalsh(sigma_blend)[..., 0] > 0   # smallest eigenvalue > 0
             ok = blend_pd & ok_q & ok_t            # non-PD blend or failed factor -> NaN -> kl_max
             div = torch.where(ok, div, div.new_tensor(float("nan")))

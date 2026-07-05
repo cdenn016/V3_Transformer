@@ -1163,6 +1163,21 @@ class VFE3Config:
                     "so s1==s0 and the channel reduces to the static prior_source='model_channel' tie.",
                     UserWarning, stacklevel=2,
                 )
+        # Under lambda_h_mode='state_dependent' the hyper-prior coupling magnitude is the envelope
+        # c0_h/(b0_h + KL); alpha_state_dependent drops `value` into accepted-but-unused kwargs, so
+        # cfg.lambda_h acts ONLY as the channel-on gate (lambda_h > 0 enables the term) and does NOT
+        # scale the coupling. Previously documented only in a model.py comment (audit 2026-07-05
+        # m12); warn on a non-trivial weight (not 0=off, not 1=bare gate) that will be ignored.
+        if self.lambda_h_mode == "state_dependent" and self.lambda_h not in (0.0, 1.0):
+            import warnings
+            warnings.warn(
+                f"lambda_h_mode='state_dependent' ignores the lambda_h VALUE ({self.lambda_h}) "
+                f"except as the channel-on gate: the coupling magnitude is the envelope "
+                f"c0_h/(b0_h + KL), so lambda_h={self.lambda_h} does not scale the hyper-prior/s "
+                f"coupling. Set lambda_h=1.0 (gate on) to silence, or lambda_h_mode='constant' to "
+                f"use lambda_h as a literal weight.",
+                UserWarning, stacklevel=2,
+            )
         # learnable_r diagnostics. The centroid r is created only under lambda_h>0 or s_e_step
         # (prior_bank.py), and the forward hyper-prior term that governs it runs only when lambda_h>0
         # and not s_e_step. (s_e_step is excluded here: it structurally requires model_channel, so r is
@@ -1291,6 +1306,24 @@ class VFE3Config:
             )
         from vfe3.geometry.rope import _POS_ROTATIONS
         _require(self.pos_rotation, tuple(sorted(_POS_ROTATIONS)), "pos_rotation")
+        # Gauge-RoPE breaks GLOBAL gauge equivariance for EVERY group (audit 2026-07-05 m6): the
+        # position-fixed R(theta_i) do not commute with a global gauge element g (executable probe,
+        # audit 2026-06-09 G1: beta residual 0.44-0.61 under rope vs 7e-6 without), including
+        # rope_full_gauge=True. The group-specific warnings below only cover the sp/so_n/sp_n
+        # structure-group departures and the means-only incoherence, so a block_glk/glk/so_k run
+        # was previously silent. Warn unconditionally on any rope run; the equivariant positional
+        # path is pos_phi (a gauge element composed into phi) or pos_rotation='none'.
+        if self.pos_rotation == "rope":
+            import warnings
+            warnings.warn(
+                "pos_rotation='rope' is a deliberate residual gauge-FIXING layer: the position-fixed "
+                "rotations R(theta_i) do not commute with a global gauge element, so gauge-RoPE "
+                "breaks the global gauge equivariance of F/beta for every group (probe: beta "
+                "residual 0.44-0.61 under rope vs 7e-6 without). The equivariant positional paths "
+                "are pos_phi='sinusoidal'/'learned' (composed into phi) or pos_rotation='none'.",
+                UserWarning,
+                stacklevel=2,
+            )
         if self.rope_full_gauge and self.diagonal_covariance:
             raise ValueError(
                 "rope_full_gauge=True rotates the covariance sandwich (R Sigma R^T), which the "
@@ -1760,6 +1793,18 @@ class VFE3Config:
         # the E-step tangent is severed regardless -- those paths keep their own freeze warnings).
         if self.transport_mode in ("regime_ii", "regime_ii_covariant") and not self.oracle_unroll_grad:
             self.oracle_unroll_grad = True
+            # Warn on the coercion (audit 2026-07-05 m13): this was the only __post_init__ coercion
+            # that did not announce itself (gauge_transport and use_head_mixer coercions both warn),
+            # so a user diffing their file against the saved config.json saw an unexplained flip.
+            import warnings
+            warnings.warn(
+                f"transport_mode={self.transport_mode!r}: oracle_unroll_grad auto-enabled (False -> "
+                f"True). The learned connection enters the loss only through the unrolled E-step, so "
+                f"the detached oracle would silently freeze it; set oracle_unroll_grad=True in your "
+                f"config to acknowledge (and silence this warning).",
+                UserWarning,
+                stacklevel=2,
+            )
         _routes_to_oracle = (
             self.transport_mode in ("regime_ii", "regime_ii_covariant")
             or (self.pos_rotation == "rope" and not self.rope_on_value)
@@ -1785,6 +1830,15 @@ class VFE3Config:
             and _routes_to_oracle
         ):
             self.oracle_unroll_grad = True
+            import warnings
+            warnings.warn(                                   # announce the coercion (audit 2026-07-05 m13)
+                f"transport_mode={self.transport_mode!r} on a non-kernel-eligible config: "
+                f"oracle_unroll_grad auto-enabled (False -> True) so connection_L does not freeze "
+                f"through the detached oracle; set oracle_unroll_grad=True in your config to "
+                f"acknowledge (and silence this warning).",
+                UserWarning,
+                stacklevel=2,
+            )
         if (
             self.e_step_gradient == "unroll"
             and not self.oracle_unroll_grad
@@ -1796,6 +1850,11 @@ class VFE3Config:
                 or (self.lambda_h_mode == "learnable" and self.s_e_step)
                 or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
                 or self.pos_phi == "learned"
+                # t5_bias's only gradient path is likewise the E-step tangent (audit 2026-07-05 m9);
+                # the predicate mirrors the model's parameter-creation gate (model.py: created only
+                # when a t5_relative_bias channel is active).
+                or (self.t5_learnable_bias
+                    and "t5_relative_bias" in (self.beta_attention_prior, self.gamma_attention_prior))
             )
         ):
             import warnings
@@ -1808,7 +1867,8 @@ class VFE3Config:
                 "E-step tangent (log_alpha under lambda_alpha_mode='learnable', connection_W under "
                 "transport_mode='regime_ii', log_lambda_beta under learnable_lambda_beta, log_lambda_h "
                 "under lambda_h_mode='learnable'+s_e_step, r_mu/r_sigma_log under "
-                "learnable_r+r_update_mode='gradient'+s_e_step, pos_phi_free under pos_phi='learned') "
+                "learnable_r+r_update_mode='gradient'+s_e_step, pos_phi_free under pos_phi='learned', "
+                "t5_bias under t5_learnable_bias with an active t5_relative_bias channel) "
                 "therefore receives NO gradient and stays frozen. Set "
                 "oracle_unroll_grad=True to make the oracle return a differentiable (unrolled) gradient.",
                 UserWarning,

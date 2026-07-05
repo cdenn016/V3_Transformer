@@ -39,6 +39,52 @@ from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artif
 #                                                      lazily (function-local), so there is no cycle
 
 
+_PHI_CLAMP_WARNED: bool = False
+
+
+def _warn_phi_transport_clamp(
+    model:    VFEModel,
+
+    max_norm: float = 15.0,   # stable_matrix_exp_pair's default Frobenius clamp
+) -> None:
+    r"""Warn ONCE when a gauge-frame table's embedded Frobenius norm exceeds the transport clamp.
+
+    ``stable_matrix_exp_pair`` rescales any ``||M||_F > max_norm`` (default 15) and returns the
+    surrogate ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)``; its per-call monitor is opt-in because
+    it costs a host sync on the E-step hot path. The M-step, however, steps ``phi_embed`` /
+    ``pos_phi_free`` with NO trust region (``GaugeNaturalGradAdamW`` / plain AdamW), so a drifting
+    row silently enters the surrogate regime (audit 2026-07-05 m8). This check runs only on
+    log/eval-cadence steps (off the hot path) and uses the Gram form
+    ``||sum_a phi^a G_a||_F^2 = phi^T Gram phi``, ``Gram_ab = tr(G_a^T G_b)`` -- one (rows, n_gen)
+    matmul, never materializing the (rows, K, K) embedding.
+    """
+    global _PHI_CLAMP_WARNED
+    if _PHI_CLAMP_WARNED:
+        return
+    gen = model.group.generators                       # (n_gen, K, K)
+    tables = [("phi_embed", getattr(model.prior_bank, "phi_embed", None)),
+              ("pos_phi_free", getattr(model, "pos_phi_free", None))]
+    with torch.no_grad():
+        gram = torch.einsum("aij,bij->ab", gen, gen)   # (n_gen, n_gen) = tr(G_a^T G_b)
+        for name, tab in tables:
+            if tab is None:
+                continue
+            phi = tab.reshape(-1, tab.shape[-1]).to(gram.dtype)
+            frob2_max = ((phi @ gram) * phi).sum(-1).max()
+            if bool(frob2_max > max_norm ** 2):        # host sync: log-cadence only
+                import warnings
+                warnings.warn(
+                    f"{name}: embedded gauge-frame Frobenius norm "
+                    f"{float(frob2_max.clamp(min=0.0).sqrt()):.2f} exceeds the transport clamp "
+                    f"max_norm={max_norm}; stable_matrix_exp_pair now returns the clamped surrogate "
+                    f"exp(max_norm*M/||M||), not exp(M). Bound the frame (mass_phi, lower m_phi_lr) "
+                    f"or accept the surrogate transport. Warned once; further drift is not re-reported.",
+                    RuntimeWarning, stacklevel=2,
+                )
+                _PHI_CLAMP_WARNED = True
+                return
+
+
 def build_optimizer(
     model: VFEModel,
     cfg:   VFE3Config,
@@ -789,6 +835,8 @@ def train(
         step_metrics: Optional[Dict[str, float]] = {} if (do_log or do_csv) else None
         if hasattr(optimizer, "_collect_gauge_diag"):        # D1/EXP-8: gate the gauge M-step diagnostics
             optimizer._collect_gauge_diag = bool(do_log or do_csv)   # to log/eval steps (silent path unchanged)
+        if do_log or do_csv:                                 # off the hot path (audit 2026-07-05 m8)
+            _warn_phi_transport_clamp(model)
         losses.append(train_step(model, optimizer, scheduler, tokens, targets,
                                   grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
                                   scaler=scaler, metrics_out=step_metrics))

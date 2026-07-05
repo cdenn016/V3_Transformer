@@ -590,7 +590,7 @@ def _direct_link_edge_exp(
     # FLOAT32 ISLAND: the link exp (and its norm cap) never run in bf16/fp16, regardless of an outer
     # autocast (spec: no link exponential in low precision). stable_matrix_exp_pair adds its own
     # float64 island at the block scale when K >= dim_threshold.
-    with torch.amp.autocast("cuda", enabled=False):
+    with torch.amp.autocast(connection_L.device.type, enabled=False):   # tensor-keyed (audit 2026-07-05 m10)
         link_coord = (link_alpha * connection_L[:n_tok, :n_tok, :]).to(device=device, dtype=torch.float32)
         eye_N = torch.eye(n_tok, dtype=torch.bool, device=device)
         link_coord = link_coord.masked_fill(eye_N.view(n_tok, n_tok, 1), 0.0)      # self-edge -> I
@@ -794,7 +794,10 @@ def stable_matrix_exp_pair(
     d_eff = exp_dim if exp_dim is not None else d
     up_dtype = torch.float64 if d_eff >= dim_threshold else torch.float32
 
-    with torch.amp.autocast('cuda', enabled=False):
+    # Keyed to the TENSOR's device (audit 2026-07-05 m10): the old 'cuda' literal left the island
+    # open under a CPU autocast context (torch.amp.autocast('cpu', bf16)), which _amp_context
+    # deliberately supports -- matrix_exp would then run in bf16 on CPU-AMP runs.
+    with torch.amp.autocast(matrix.device.type, enabled=False):
         matrix_up = matrix.to(up_dtype).contiguous()
 
         if block_dims is not None and len(block_dims) > 1:
@@ -1039,6 +1042,24 @@ def transport_covariance(
     is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
     if is_diag:
         return torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega, omega, sigma)
+    # Rank-gap dispatch hardening (audit 2026-07-05 m7): a batch-INDEPENDENT (N, N, K, K) omega with
+    # a BATCHED diagonal (B, N, K) sigma satisfies sigma.dim() == omega.dim() - 1 and previously fell
+    # through to the full-covariance einsum -- a shape error at best, a silent mis-broadcast when
+    # B == N. A genuine full sigma is (..., N, K, K): trailing SQUARE pair matching omega's K and
+    # exactly one rank below omega. Validate before contracting; ambiguous callers must pass
+    # ``diagonal_out`` explicitly (as the kernel/oracle call sites already do).
+    if diagonal_out is None and (
+        sigma.dim() != omega.dim() - 1
+        or sigma.shape[-1] != sigma.shape[-2]
+        or sigma.shape[-1] != omega.shape[-1]
+    ):
+        raise ValueError(
+            f"transport_covariance: sigma shape {tuple(sigma.shape)} is neither a diagonal "
+            f"(..., N, K) (rank omega.dim()-2) nor a full (..., N, K, K) (rank omega.dim()-1, "
+            f"trailing square K={omega.shape[-1]}) match for omega shape {tuple(omega.shape)}. "
+            f"Pass diagonal_out=True/False explicitly to disambiguate (e.g. a batched diagonal "
+            f"sigma against a batch-independent omega)."
+        )
     # Full-covariance congruence sandwich Omega Sigma Omega^T SQUARES cond(Omega) (audit 2026-06-13
     # M4). Evaluate the contraction in a float64 island (like the matrix-exp upcast) then cast back:
     # this CORRECTLY-ROUNDS the sandwich (removes the fp32 sum-over-l,m accumulation error), so the

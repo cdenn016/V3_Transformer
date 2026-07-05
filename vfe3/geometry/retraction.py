@@ -140,7 +140,7 @@ def retract_spd_diagonal(
     """
     _check_sigma_max(sigma_max, eps)
     orig_dtype = sigma_diag.dtype
-    with torch.amp.autocast('cuda', enabled=False):
+    with torch.amp.autocast(sigma_diag.device.type, enabled=False):     # tensor-keyed (audit 2026-07-05 m10)
         sigma_safe = sigma_diag.float().clamp(min=eps)
         delta_sigma = delta_sigma.float()
         whitened = delta_sigma / sigma_safe
@@ -180,7 +180,7 @@ def retract_spd_full(
         sigma = sigma.reshape(B * N, K, K)
         delta_sigma = delta_sigma.reshape(B * N, K, K)
 
-    with torch.amp.autocast('cuda', enabled=False):
+    with torch.amp.autocast(sigma.device.type, enabled=False):          # tensor-keyed (audit 2026-07-05 m10)
         sigma = sigma.float()
         delta_sigma = delta_sigma.float()
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
@@ -281,7 +281,7 @@ def retract_logeuclidean_full(
         sigma = sigma.reshape(B * N, K, K)
         delta_log = delta_log.reshape(B * N, K, K)
 
-    with torch.amp.autocast('cuda', enabled=False):
+    with torch.amp.autocast(sigma.device.type, enabled=False):          # tensor-keyed (audit 2026-07-05 m10)
         sigma     = sigma.float()
         delta_log = delta_log.float()
         sigma     = 0.5 * (sigma + sigma.transpose(-1, -2))
@@ -354,7 +354,7 @@ def retract_log_euclidean(
         )
     # diagonal: logm/expm are elementwise; sigma_new = sigma * exp(step_size * delta_sigma)
     orig_dtype = sigma.dtype
-    with torch.amp.autocast('cuda', enabled=False):
+    with torch.amp.autocast(sigma.device.type, enabled=False):          # tensor-keyed (audit 2026-07-05 m10)
         sigma_safe  = sigma.float().clamp(min=eps)
         delta_sigma = delta_sigma.float()
         if trust_region is not None and trust_region > 0:
@@ -387,7 +387,7 @@ def natural_gradient(
     """
     is_diagonal = sigma_q.dim() == grad_mu.dim()
     orig_dtype = sigma_q.dtype
-    with torch.amp.autocast('cuda', enabled=False):
+    with torch.amp.autocast(sigma_q.device.type, enabled=False):        # tensor-keyed (audit 2026-07-05 m10)
         sigma_q    = sigma_q.float()
         grad_mu    = grad_mu.float()
         grad_sigma = grad_sigma.float()
