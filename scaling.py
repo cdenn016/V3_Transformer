@@ -429,8 +429,9 @@ def route_vary_block_fixed_k(
     blocks:      List[int],
 
     *,
-    gauge_group: str           = "block_glk",
-    tag:         Optional[str] = None,
+    gauge_group:     str                     = "block_glk",
+    tag:             Optional[str]           = None,
+    extra_overrides: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     r"""Fixed K, vary the gauge block size GL(``b``): n_heads = K/b, so block_glk n_gen = K^2/n_heads =
     b*K. FEWER/LARGER blocks (bigger b) = MORE params (n_gen up) -- the opposite sign of a standard
@@ -453,6 +454,8 @@ def route_vary_block_fixed_k(
                               "kl_max": 8 * embed_dim}
         if h < 2:
             ov["use_head_mixer"] = False
+        if extra_overrides:
+            ov.update(extra_overrides)
         cells.append({"label": f"K{embed_dim}_GL{b}", "route": tag or f"blocks_K{embed_dim}",
                       "scale_knob": "n_heads", "overrides": ov})
     return cells
@@ -539,6 +542,13 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
     # gauge the head mixer stays exactly equivariant, so this is also the equivariance-clean arm.
     "blocks_K48_tied_2x": route_vary_block_fixed_k(48, [3, 6, 8, 12, 24],
                                                    gauge_group="tied_block_glk", tag="blocks_K48_tied_2x"),
+    # Arm 2a: the non-gauge capacity control. Keep block_glk so n_gen (= 48*b) matches each gauge cell,
+    # but encode NON-structurally (encode_mode='per_token_additive' + pos_phi='none'): the learned
+    # (V, n_gen) phi table drives an additive mean shift through a frozen readout, and Omega = I. Tests
+    # whether raw phi-table capacity, minus the gl(g) structure, reproduces the S1 curve.
+    "blocks_K48_ctrl_2x": route_vary_block_fixed_k(
+        48, [3, 6, 8, 12, 24], tag="blocks_K48_ctrl_2x",
+        extra_overrides={"encode_mode": "per_token_additive", "pos_phi": "none"}),
     "grow_K":        route_grow_k([20, 40, 60, 80, 100, 120], n_heads=4),
     "grow_K_mup":    route_grow_k_mup([20, 40, 80, 120], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
     "blocksize":     route_blocksize(64, [8, 4, 2]),

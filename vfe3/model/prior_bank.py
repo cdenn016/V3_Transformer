@@ -165,6 +165,20 @@ class PriorBank(nn.Module):
         self.phi_embed        = nn.Parameter(phi_scale * torch.randn(vocab_size, n_gen))
         self.decode_log_scale = nn.Parameter(torch.zeros(1))
 
+        # Arm-2 control (encode_mode='per_token_additive'): a NON-structural use of the SAME learned
+        # (V, n_gen) phi table. A FROZEN random readout R (K, n_gen) maps each token's n_gen-dim code
+        # to an additive K-dim mean shift, and encode returns phi=0 so Omega = exp(phi.G) = I (no gl(g)
+        # transport). Isolates raw phi-table CAPACITY (V*n_gen learned params, matched to the gauge
+        # cell) from the gl(g) generator STRUCTURE. R is a buffer (not a Parameter, so learned-param
+        # count is unchanged), seeded for reproducibility, scaled 1/sqrt(n_gen) so the per-dim shift
+        # std matches phi_scale at init. Deliberately breaks gauge equivariance -- that IS the control.
+        if encode_mode == "per_token_additive":
+            _r_gen = torch.Generator().manual_seed(0)
+            self.register_buffer(
+                "additive_R",
+                torch.randn(K, n_gen, generator=_r_gen) / (float(n_gen) ** 0.5),
+            )
+
         # use_prior_bank=False (linear-decode ablation): decode is a plain linear projection
         # logits = mu_q @ W^T through a learned (V, K) weight, the single authorized neural
         # exception (a lone linear output readout; see CLAUDE.md). Realized as a raw nn.Parameter
@@ -663,6 +677,30 @@ def _encode_per_token(
     mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
     sigma_diag = torch.exp(pb._prior_sigma_log_table()[token_ids]).clamp(min=pb.eps)  # (B, N, K), sigma > 0
     phi = pb.phi_embed[token_ids]                                            # (B, N, n_gen)
+    sigma = sigma_diag if pb.diagonal_covariance else torch.diag_embed(sigma_diag)
+    return BeliefState(mu=mu, sigma=sigma, phi=phi)
+
+
+@register_encode("per_token_additive")
+def _encode_per_token_additive(
+    pb:        PriorBank,
+    token_ids: torch.Tensor,             # (B, N) integer token ids
+) -> BeliefState:
+    r"""Arm-2 control: the SAME learned (V, n_gen) phi table used NON-structurally.
+
+    Each token's phi code is mapped by the FROZEN readout ``pb.additive_R`` (K, n_gen) to an additive
+    mean shift ``mu += phi @ R^T``, and the returned phi is ZERO so the transport
+    ``Omega = exp(phi.G) exp(-phi.G) = I`` (no gl(g) congruence). The learned parameter count is the
+    gauge cell's (``V*n_gen`` in ``phi_embed``; ``R`` is a frozen buffer), so this isolates raw phi-table
+    CAPACITY from the gl(g) generator STRUCTURE -- the capacity-vs-structure control for the blocks_K48
+    REMAND (docs/2026-07-05-blocks-k48-followup-experiment-spec.md, Arm 2a). Deliberately NOT gauge
+    equivariant; use with ``transport_mode='flat'`` and ``pos_phi='none'`` so no other channel transports.
+    """
+    mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
+    sigma_diag = torch.exp(pb._prior_sigma_log_table()[token_ids]).clamp(min=pb.eps)  # (B, N, K)
+    phi_code = pb.phi_embed[token_ids]                                       # (B, N, n_gen) learned table
+    mu = mu + phi_code @ pb.additive_R.t()                                   # (B, N, K) structure-free shift
+    phi = torch.zeros_like(phi_code)                                         # Omega = I: no gl(g) transport
     sigma = sigma_diag if pb.diagonal_covariance else torch.diag_embed(sigma_diag)
     return BeliefState(mu=mu, sigma=sigma, phi=phi)
 

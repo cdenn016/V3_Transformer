@@ -99,9 +99,16 @@ either. A clean control therefore needs a **non-transport table path** — a gen
    are off-block GAUGE, so it isolates "n_gen count at fixed base block" — a weaker question than
    "gauge vs non-gauge."
 
-Arms 1 and 3 are implemented and tested (`tests/test_blocks_k48_followup_routes.py`). Arm 2 is **deferred
-pending the choice above** — shipping the wrong control wastes a multi-day GPU run. Whichever is chosen,
-set `m = n_gen_target` (144/288/384/576/1152) at fixed head geometry; everything else matches Arm 1.
+**Chosen and implemented: option (2a).** The control is `encode_mode='per_token_additive'` (`prior_bank.py`):
+the SAME learned `(V, n_gen)` `phi_embed` table is read, mapped by a FROZEN seeded readout `additive_R`
+`(K, n_gen)` (a buffer, not a parameter — learned params stay `V·n_gen`, matched to the gauge cell) to an
+additive mean shift `mu += phi @ R^T`, and encode returns `phi = 0` so `Omega = exp(phi·G) = I` (no gl(g)
+transport). `n_gen` stays the gauge cell's `48·b` (block_glk), so the table width matches automatically.
+Route `blocks_K48_ctrl_2x` (block_glk + `encode_mode='per_token_additive'` + `pos_phi='none'`, S1 window,
+491.52M budget). Pinned by `tests/test_additive_table_control.py` (6 tests) and verified end-to-end
+(model builds, loss finite, `phi_embed` learns via the additive path, `additive_R` is a non-parameter
+buffer). Deliberately NOT gauge-equivariant — that is the control. **Decision:** if this structure-free
+table reproduces the GL24 gain, the improvement is raw capacity; if not, the gl(g) structure earns it.
 
 **Decision use:** if the plain `V × m` table reproduces the GL24 gain, the improvement is raw table
 capacity, not gauge structure (S1 stays a curve). If it does NOT, the `gl(g)` structure is doing the
@@ -146,7 +153,11 @@ Spawned follow-up debates (see `05_action.md`): **S2** causal (Arms 2+3), **S3**
 compute frontier), **S4** cross-sweep exponent (needs Arm 1 + an axis-invariant exponent, CI width < 2×).
 
 ## Order of operations
-1. Wait for the toggle-cleanup to land; re-verify every symbol above.
-2. Arm 1 (config-only) and Arm 3 (config-only) can run immediately after (a) restoring
-   `use_head_mixer=True` and (b) the new registry keys.
-3. Arm 2 needs the `trivial_table` group registered + a golden test first; then run.
+All three arms are implemented on branch `arms/blocks-k48-followup` (routes `blocks_K48_2x`,
+`blocks_K48_tied_2x`, `blocks_K48_ctrl_2x`) and pinned by tests (14 route/geometry + 6 encode). On
+`origin/main` (284b6a6) `BASELINE.use_head_mixer=True` and `batch_size=64` already hold, so after merging
+the branch each arm runs by setting `CONFIG['routes']` and running `scaling.py`, then `scaling_analysis.py`
+on the matching `vfe3_scaling_results/<route>` dir. Re-verify the symbols against `main` at run time.
+1. Run Arm 1 (`blocks_K48_2x`) — matched-budget curve vs the persisted 245.76M run and vs grow_K_GL10.
+2. Run Arm 2a (`blocks_K48_ctrl_2x`) and Arm 3 (`blocks_K48_tied_2x`) to decompose capacity vs structure.
+3. Adjudicate efficiency (if at all) on wall-clock / transport-inclusive FLOPs, never `active_params_per_token`.
