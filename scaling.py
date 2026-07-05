@@ -424,23 +424,36 @@ def route_grow_k_fixed_block(embed_dims: List[int], block: int) -> List[Dict[str
     return cells
 
 
-def route_vary_block_fixed_k(embed_dim: int, blocks: List[int]) -> List[Dict[str, Any]]:
+def route_vary_block_fixed_k(
+    embed_dim:   int,
+    blocks:      List[int],
+
+    *,
+    gauge_group: str           = "block_glk",
+    tag:         Optional[str] = None,
+) -> List[Dict[str, Any]]:
     r"""Fixed K, vary the gauge block size GL(``b``): n_heads = K/b, so block_glk n_gen = K^2/n_heads =
     b*K. FEWER/LARGER blocks (bigger b) = MORE params (n_gen up) -- the opposite sign of a standard
     transformer, and the parameter axis here. This is the ``route_blocksize`` idea written in GL(b) terms
     (b=K/n_heads). kl_max = 8*K (constant; K is fixed across the route). The single-block b=K cell (one
-    GL(K) frame) drops the head mixer. Each b must divide K; non-divisors are skipped with a warning."""
+    GL(K) frame) drops the head mixer. Each b must divide K; non-divisors are skipped with a warning.
+
+    ``gauge_group`` selects the structure group per cell (default ``block_glk``, the untied per-head
+    GL(d_head); pass ``tied_block_glk`` for the tied gauge, n_gen = d_head^2 instead of b*K, under which
+    the Schur-commutant head mixer stays exactly equivariant). ``tag`` overrides the internal cell route
+    tag (default ``f'blocks_K{embed_dim}'``); give a distinct tag to a variant route (different budget or
+    group) so ``scaling_analysis`` keeps its points separate from the base ``blocks_K48`` run."""
     cells: List[Dict[str, Any]] = []
     for b in blocks:
         if b <= 0 or embed_dim % b != 0:
             logger.warning("  [skip] blocks_K%d: block=%d does not divide K=%d", embed_dim, b, embed_dim)
             continue
         h = embed_dim // b
-        ov: Dict[str, Any] = {"embed_dim": embed_dim, "n_heads": h, "gauge_group": "block_glk",
+        ov: Dict[str, Any] = {"embed_dim": embed_dim, "n_heads": h, "gauge_group": gauge_group,
                               "kl_max": 8 * embed_dim}
         if h < 2:
             ov["use_head_mixer"] = False
-        cells.append({"label": f"K{embed_dim}_GL{b}", "route": f"blocks_K{embed_dim}",
+        cells.append({"label": f"K{embed_dim}_GL{b}", "route": tag or f"blocks_K{embed_dim}",
                       "scale_knob": "n_heads", "overrides": ov})
     return cells
 
@@ -517,6 +530,15 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
 ROUTES: Dict[str, List[Dict[str, Any]]] = {
     "grow_K_GL10":   route_grow_k_fixed_block([90, 100, 110, 120], block=10),
     "blocks_K48":    route_vary_block_fixed_k(48, [48, 24, 12, 8, 6]),
+    # blocks_K48 follow-up (S1 window GL(3)..GL(24)) at the current BASELINE batch_size=64 => 491.52M
+    # tokens/run, the MATCHED budget that removes the 2x Chinchilla D-slice confound vs grow_K_GL10.
+    # Distinct keys/tags so scaling_analysis keeps these points separate from the 245.76M blocks_K48 run.
+    "blocks_K48_2x":      route_vary_block_fixed_k(48, [3, 6, 8, 12, 24], tag="blocks_K48_2x"),
+    # Arm 3: tied gauge (n_gen = d_head^2 instead of 48*b) at matched budget -- does per-block UNTIED
+    # richness drive the S1 curve, or does the tied variant match it at far fewer params? Under the tied
+    # gauge the head mixer stays exactly equivariant, so this is also the equivariance-clean arm.
+    "blocks_K48_tied_2x": route_vary_block_fixed_k(48, [3, 6, 8, 12, 24],
+                                                   gauge_group="tied_block_glk", tag="blocks_K48_tied_2x"),
     "grow_K":        route_grow_k([20, 40, 60, 80, 100, 120], n_heads=4),
     "grow_K_mup":    route_grow_k_mup([20, 40, 80, 120], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
     "blocksize":     route_blocksize(64, [8, 4, 2]),
