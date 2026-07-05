@@ -31,22 +31,22 @@ from vfe3.model.model import VFEModel
 # ---------------------------------- edit me ----------------------------------
 CONFIG = dict(
     # --- checkpoint (a resumable step_<N>.pt embeds its config and is self-contained) ---
-    checkpoint   = "vfe3_runs/162.08_wikitext-103_K20_block_glk_s54/checkpoints/step_15000.pt",
+    checkpoint   = "vfe3_runs/145.49_wikitext-103_K20_block_glk_linear_mix_s54/checkpoints/step_15000.pt",
     config_from  = None,        # if `checkpoint` is a pure state_dict (best_model.pt), point this at a
                                 # sibling step_<N>.pt to borrow its config; else leave None
     dataset      = "wikitext-103",   # selects the tokenizer (gpt2); used to decode ids -> text
 
     # --- prompt + generation ---
-    prompt          = "The history of the city",
+    prompt          = "A man sat",
     max_new_tokens  = 60,
-    greedy          = True,     # True -> argmax / argmax-of-policy-posterior; deterministic
+    greedy          = False,     # True -> argmax / argmax-of-policy-posterior; deterministic
 
     # --- EFE policy scorer (the "active inference" knobs) ---
     policy_mode        = "efe_one_step",        # none | efe_one_step | logprob_control
     policy_preference  = "flat",                # generate() allows only 'flat'
     policy_score_terms = ("ambiguity",),        # ('risk','ambiguity') = no-op on LM; ('ambiguity',) = confidence reranker
     policy_top_k       = 8,                     # candidate menu width Kp
-    policy_precision   = 1.0,                   # gamma in softmax(-gamma * G)
+    policy_precision   = 1,                   # gamma in softmax(-gamma * G)
     policy_horizon     = 1,                     # must be 1 for efe_one_step in generate()
 
     device       = None,        # None -> cuda if available else cpu

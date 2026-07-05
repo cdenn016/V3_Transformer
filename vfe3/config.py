@@ -110,7 +110,7 @@ class VFE3Config:
 
     # Opt-in transport diagnostic (audit 2026-07-01 round-3, punch 12c): forward clamp_monitor=True
     # into every production stable_matrix_exp_pair transport build, emitting a RuntimeWarning when
-    # the hard Frobenius clamp (max_norm=15) fires (the returned factor is then a surrogate, not
+    # the hard Frobenius clamp (max_norm=20) fires (the returned factor is then a surrogate, not
     # exp(M)). Costs a tensor-reduction host sync per build; keep OFF on the training hot path.
     transport_clamp_monitor:   bool  = False
 
@@ -178,6 +178,7 @@ class VFE3Config:
     pos_rotation:              str   = "none"      # "none" | "rope" (the positional-rotation registry)
     rope_base:                 float = 100.0       # rotary frequency base
     rope_full_gauge:           bool  = False       # rotate covariance too (needs family="gaussian_full")
+    
     # rope_on_value=True (default) is the coherent single-gauge path: the gauge-RoPE rotation feeds
     # BOTH the attention score and the value aggregation. =False factors the transport into an
     # attention gauge and a value gauge (GL(K)_attention.tex:1909): the score keeps the rotation but

@@ -32,8 +32,8 @@ logger = logging.getLogger("scaling_analysis")
 INFERENCE_ROUTE = "inference"                                # flat-N routes, plotted separately from L(N)
 
 CONFIG: Dict[str, Any] = {
-    "input_dir":   "vfe3_scaling_results",                  # where scaling.py wrote the run dirs
-    "with_offset": False,                                   # headline fit: False -> A*N^-alpha; True -> E + A*N^-alpha
+    "input_dir":   "vfe3_scaling_results/grow_K",                  # where scaling.py wrote the run dirs
+    "with_offset": True,                                   # headline fit: False -> A*N^-alpha; True -> E + A*N^-alpha
     "n_bootstrap": 2000,                                    # nested (points x seeds) bootstrap for the exponent CI
     "min_points":  2,                                       # a route needs this many sizes to get its own fit
 }

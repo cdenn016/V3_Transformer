@@ -73,8 +73,8 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 2,
+    embed_dim                 = 100,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 4,
     
     max_seq_len               = 128,                 # N, context length
     
@@ -163,7 +163,7 @@ config = dict(
     ####################################
     # Non-Flat Connection - Regime II
     ####################################
-    transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii" (learned bilinear edge
+     transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii" (learned bilinear edge
                                             # connection delta=mu^T W mu; gauge-invariant only at W=0; NN exception, default-off)
                                             # | "regime_ii_covariant" (Route B: gauge-COVARIANT non-flat connection
                                             # delta=M . invariant-features(q_i, Omega^0 q_j); covariant for any M; NN exception, default-off)

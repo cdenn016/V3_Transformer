@@ -58,7 +58,7 @@ logger = logging.getLogger("scaling")
 # =============================================================================
 CONFIG: Dict[str, Any] = {
     # Which routes to run (keys of ROUTES), in order. See the ROUTE MENU above the ROUTES registry.
-    "routes":     ["grow_K_GL10"], # "grow_K_GL10","blocks_K48",                       
+    "routes":     ["grow_K"], # "grow_K_GL10","blocks_K48", "grow_K_mup" (seems to be identical)                      
                    #"blocksize", "grow_K", "group", "model_channel", "infer_T", "infer_L"
 
     # Seeds per cell. Graduated budget is sensible (more seeds at the cheap small end); the simplest
@@ -69,7 +69,7 @@ CONFIG: Dict[str, Any] = {
 
     # Dataset for every run (NOT a VFE3Config field; the loader seam). Held-out CE is comparable across
     # sizes only within one tokenizer/corpus.
-    "dataset":    "wikitext-103",                           # "wikitext-103" | "wiki-ja" | "wiki-en" | ...
+    "dataset":    "wikitext-103",              # "wikitext-103" | "wiki-ja" | "wiki-en" | "wiki-ar"
 
     # Cap the TRAIN stream for fast scaling passes (validation/test always read in full). None = full.
     "max_tokens": None,
@@ -93,8 +93,8 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 120,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 12,
+    embed_dim                 = 80,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 8,
     
     max_seq_len               = 128,                 # N, context length
     
@@ -128,7 +128,7 @@ config = dict(
     #        Encode/Decode          #
     #################################
     decode_bias               = True,     # only if use_prior_bank = False
-    use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer            = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
     
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
@@ -489,11 +489,13 @@ def route_model_channel() -> List[Dict[str, Any]]:
     s_e_step/lambda_h/lambda_gamma off), the 'model_channel' arm keeps the baseline channel. Only the
     s-table mass counts as real added capacity when gamma/lambda_h shape s beyond CE."""
     return [
+        {"label": "model_channel", "route": "model_channel", "scale_knob": "model_channel",
+         "overrides": {}},   
+        
         {"label": "token_prior", "route": "model_channel", "scale_knob": "model_channel",
          "overrides": {"prior_source": "token", "s_e_step": False, "learnable_r": False,
                        "lambda_h": 0.0, "lambda_gamma": 0.0}},
-        {"label": "model_channel", "route": "model_channel", "scale_knob": "model_channel",
-         "overrides": {}},                                   # baseline already runs the channel
+                                        # baseline already runs the channel
     ]
 
 
@@ -531,8 +533,8 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
 #
 # To add your own: call a route builder with a new grid and give it a key; add that key to CONFIG["routes"].
 ROUTES: Dict[str, List[Dict[str, Any]]] = {
-    "grow_K_GL10":   route_grow_k_fixed_block([90, 100, 110, 120], block=10),
-    "blocks_K48":    route_vary_block_fixed_k(48, [48, 24, 12, 8, 6]),
+    "grow_K_GL10":   route_grow_k_fixed_block([20, 40, 60, 80, 100], block=10),
+    "blocks_K48":    route_vary_block_fixed_k(48, [48]),
     # blocks_K48 follow-up (S1 window GL(3)..GL(24)) at the current BASELINE batch_size=64 => 491.52M
     # tokens/run, the MATCHED budget that removes the 2x Chinchilla D-slice confound vs grow_K_GL10.
     # Distinct keys/tags so scaling_analysis keeps these points separate from the 245.76M blocks_K48 run.
@@ -549,8 +551,8 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
     "blocks_K48_ctrl_2x": route_vary_block_fixed_k(
         48, [3, 6, 8, 12, 24], tag="blocks_K48_ctrl_2x",
         extra_overrides={"encode_mode": "per_token_additive", "pos_phi": "none"}),
-    "grow_K":        route_grow_k([20, 40, 60, 80, 100, 120], n_heads=4),
-    "grow_K_mup":    route_grow_k_mup([20, 40, 80, 120], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
+    "grow_K":        route_grow_k([20, 40, 60, 80, 100], n_heads=4),
+    "grow_K_mup":    route_grow_k_mup([20, 40, 80, 100], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
     "blocksize":     route_blocksize(64, [8, 4, 2]),
     "group":         route_group(64),
     "model_channel": route_model_channel(),

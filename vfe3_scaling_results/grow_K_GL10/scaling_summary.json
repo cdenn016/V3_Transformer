@@ -1,19 +1,19 @@
 {
   "input_dir": "vfe3_scaling_results\\grow_K_GL10",
   "n_runs": 36,
-  "with_offset": false,
+  "with_offset": true,
   "n_param_points": 12,
   "n_inference_points": 0,
   "pooled_fit": {
-    "form": "power_law",
-    "alpha": 0.08734779837678835,
+    "form": "offset_power_law",
+    "alpha": 0.558386034135071,
     "alpha_ci": [
-      0.06270985234115303,
-      0.09570429212417231
+      0.38989387858015495,
+      0.6030902140519345
     ],
-    "A": 21.11536918882996,
-    "E": 0.0,
-    "r2": 0.967943432337392,
+    "A": 9968.93379139015,
+    "E": 3.950607198514091,
+    "r2": 0.9995587201533513,
     "n_points": 12
   },
   "per_route": {},
