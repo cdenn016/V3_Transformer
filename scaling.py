@@ -534,11 +534,13 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
 # To add your own: call a route builder with a new grid and give it a key; add that key to CONFIG["routes"].
 ROUTES: Dict[str, List[Dict[str, Any]]] = {
     "grow_K_GL10":   route_grow_k_fixed_block([20, 40, 60, 80, 100], block=10),
+    
     "blocks_K48":    route_vary_block_fixed_k(48, [48]),
     # blocks_K48 follow-up (S1 window GL(3)..GL(24)) at the current BASELINE batch_size=64 => 491.52M
     # tokens/run, the MATCHED budget that removes the 2x Chinchilla D-slice confound vs grow_K_GL10.
     # Distinct keys/tags so scaling_analysis keeps these points separate from the 245.76M blocks_K48 run.
     "blocks_K48_2x":      route_vary_block_fixed_k(48, [3, 6, 8, 12, 24], tag="blocks_K48_2x"),
+    
     # Arm 3: tied gauge (n_gen = d_head^2 instead of 48*b) at matched budget -- does per-block UNTIED
     # richness drive the S1 curve, or does the tied variant match it at far fewer params? Under the tied
     # gauge the head mixer stays exactly equivariant, so this is also the equivariance-clean arm.
@@ -551,6 +553,7 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
     "blocks_K48_ctrl_2x": route_vary_block_fixed_k(
         48, [3, 6, 8, 12, 24], tag="blocks_K48_ctrl_2x",
         extra_overrides={"encode_mode": "per_token_additive", "pos_phi": "none"}),
+    
     "grow_K":        route_grow_k([20, 40, 60, 80, 100], n_heads=4),
     "grow_K_mup":    route_grow_k_mup([20, 40, 80, 100], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
     "blocksize":     route_blocksize(64, [8, 4, 2]),
