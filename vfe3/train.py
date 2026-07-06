@@ -214,6 +214,15 @@ def build_optimizer(
         # carry). role='mu' is the catch-all for learned non-variance/non-gauge tables (head_mixer,
         # ...); the bias is not a gauge frame, so it steps under the mean LR, not m_phi_lr.
         groups.append({"params": [model.t5_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
+    if getattr(model, "log_kappa_beta", None) is not None:      # learnable_kappa_beta=True per-block temperature
+        # weight_decay=0: decaying log_kappa toward 0 pulls tau back to the fixed Vaswani
+        # calibration (a prior, not capacity) -- the same exemption t5_bias/output_proj_bias/r
+        # carry. role='mu' is the catch-all for learned non-variance/non-gauge tables; NO gauge
+        # flag (the temperature touches no gauge transport), so the group rides as plain AdamW
+        # even under GaugeNaturalGradAdamW.
+        groups.append({"params": [model.log_kappa_beta],  "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
+    if getattr(model, "log_kappa_gamma", None) is not None:     # learnable_kappa_gamma=True (model channel)
+        groups.append({"params": [model.log_kappa_gamma], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
 
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
     # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the

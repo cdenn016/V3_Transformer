@@ -205,7 +205,9 @@ class VFE3Config:
     b0:                        'float | List[float]' = 1.0   # state-dependent alpha shape: alpha* = c0/(b0 + D); list -> (K,) per-coord
     c0:                        'float | List[float]' = 1.0   # state-dependent alpha shape (numerator); list -> (K,) per-coord
     kappa_beta:                'float | List[float]' = 1.0   # sharpness; list (len n_heads) -> per-head tau
-   
+    learnable_kappa_beta:      bool  = False        # learn per-irrep-block kappa_beta = exp(log_kappa_beta)
+                                                    #   (sanctioned learned-scalar exception, t5 family; default OFF)
+
     # lambda_beta weights the ENTIRE belief-coupling block of F -- sum_ij [ beta_ij E_ij +
     # tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-coupling and the likelihood.
     # 1.0 = the canonical/pure F (byte-identical). It scales the
@@ -286,6 +288,8 @@ class VFE3Config:
     # free coupling.
     lambda_gamma:              float = 0.0
     kappa_gamma:               'float | List[float]' = 1.0   # model-channel sharpness; list -> per-head tau_gamma
+    learnable_kappa_gamma:     bool  = False        # learn per-irrep-block kappa_gamma = exp(log_kappa_gamma)
+                                                    #   (sanctioned learned-scalar exception, t5 family; default OFF)
     gamma_attention_prior:     str   = "causal"     # pi^s_ij seam for the model channel (its own prior)
 
     # s->q coupling: REPLACE the belief prior with the model channel, p_i = s_i. This realizes the
@@ -1027,6 +1031,28 @@ class VFE3Config:
             else:
                 if _v <= 0.0:
                     raise ValueError(f"{_name} must be positive, got {_v}")
+        # learnable_kappa_*: per-irrep-block learned temperatures (t5-exception family). On a
+        # single-irrep-block group the per-head axis is vacuous (one scalar temperature is learned)
+        # -- harmless and still valid, so warn rather than reject. The block count mirrors
+        # attention_tau's length validation: n_heads for block_glk/tied_block_glk (collapsing to a
+        # single [K] block under cross_couplings), the tower block count for so_n/sp_n, and 1 for
+        # every single-block group (glk/so_k/...).
+        if self.learnable_kappa_beta or self.learnable_kappa_gamma:
+            if self.gauge_group in ("so_n", "sp_n"):
+                _n_blocks = sum(m for _, m in self.irrep_spec)
+            elif (self.gauge_group in ("block_glk", "tied_block_glk")
+                    and self.cross_couplings is None):
+                _n_blocks = self.n_heads
+            else:
+                _n_blocks = 1
+            if _n_blocks == 1:
+                import warnings
+                warnings.warn(
+                    "learnable_kappa_beta/learnable_kappa_gamma with a single irrep block: "
+                    "per-head temperature learning is vacuous (one scalar kappa is learned). "
+                    "Valid, but equivalent to a single learnable scalar temperature.",
+                    UserWarning, stacklevel=2,
+                )
         if self.mass_phi < 0.0:
             raise ValueError(f"mass_phi must be >= 0, got {self.mass_phi}")
         if self.mstep_self_coupling_weight < 0.0:
@@ -1905,6 +1931,12 @@ class VFE3Config:
                 # when a t5_relative_bias channel is active).
                 or (self.t5_learnable_bias
                     and "t5_relative_bias" in (self.beta_attention_prior, self.gamma_attention_prior))
+                # The learnable temperatures are likewise E-step-tangent-only: kappa_beta always
+                # (tau's sole loss path is the belief E-step softmax); kappa_gamma only under
+                # s_e_step (the scored gamma block is assembled at the loss level, outside the
+                # E-step, so it trains through any estimator when lambda_gamma > 0).
+                or self.learnable_kappa_beta
+                or (self.learnable_kappa_gamma and self.s_e_step)
             )
         ):
             import warnings
@@ -1916,7 +1948,9 @@ class VFE3Config:
                 "oracle_unroll_grad=False. A learnable parameter that enters the loss only through the "
                 "E-step tangent (connection_W under transport_mode='regime_ii', r_mu/r_sigma_log under "
                 "learnable_r+r_update_mode='gradient'+s_e_step, pos_phi_free under pos_phi='learned', "
-                "t5_bias under t5_learnable_bias with an active t5_relative_bias channel) "
+                "t5_bias under t5_learnable_bias with an active t5_relative_bias channel, "
+                "log_kappa_beta under learnable_kappa_beta, log_kappa_gamma under "
+                "learnable_kappa_gamma+s_e_step) "
                 "therefore receives NO gradient and stays frozen. Set "
                 "oracle_unroll_grad=True to make the oracle return a differentiable (unrolled) gradient.",
                 UserWarning,

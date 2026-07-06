@@ -364,6 +364,69 @@ class VFEModel(nn.Module):
                 "'t5_relative_bias' to use the learnable bias.",
                 UserWarning, stacklevel=2,
             )
+        # SANCTIONED LEARNED-SCALAR EXCEPTION (t5-exception family, default OFF): learnable
+        # per-irrep-block softmax temperatures, kappa = exp(log_kappa). Log-space keeps tau
+        # strictly positive for ANY parameter value (tau divides the softmax logits), and
+        # log(1.0) = 0 / exp(0) = 1.0 are exact, so a learnable model is byte-identical to the
+        # config-scalar path at construction. Shape (len(irrep_dims),) -- exactly the length
+        # attention_tau validates (n_heads for block_glk/tied_block_glk, the tower block count
+        # for so_n/sp_n, 1 under cross_couplings). Init reads cfg.kappa_* (a scalar broadcasts;
+        # a per-head list, already length-validated by __post_init__, seeds elementwise) and
+        # draws zero RNG. A per-block scalar temperature multiplies the already-gauge-invariant
+        # per-block energy inside the softmax and touches NO gauge transport, so it does NOT
+        # break gauge equivariance (the cleanest exception class, like t5_bias).
+        if cfg.learnable_kappa_beta:
+            k0 = cfg.kappa_beta
+            k0_vec = (torch.tensor(list(k0), dtype=torch.float32) if isinstance(k0, (list, tuple))
+                      else torch.full((len(self.group.irrep_dims),), float(k0)))
+            self.log_kappa_beta = nn.Parameter(torch.log(k0_vec))
+            if cfg.effective_e_step_gradient in ("detach", "straight_through"):
+                # Footgun (mirrors t5_bias above): kappa_beta enters the loss ONLY through the
+                # E-step softmax temperature tau = kappa * sqrt(d_block); both severing estimators
+                # cut that path ('detach' wraps the E-step in no_grad, 'straight_through' detaches
+                # the per-iteration belief tangent), so log_kappa_beta.grad is None and the
+                # temperature stays at its config init.
+                import warnings
+                warnings.warn(
+                    f"learnable_kappa_beta=True with the effective E-step estimator "
+                    f"{cfg.effective_e_step_gradient!r} freezes log_kappa_beta: the belief-channel "
+                    f"temperature enters the loss only through the E-step softmax, which this "
+                    f"estimator severs. Use an 'unroll' E-step (detach_e_step=False, "
+                    f"e_step_gradient='unroll') to train it.",
+                    stacklevel=2,
+                )
+        if cfg.learnable_kappa_gamma:
+            k0 = cfg.kappa_gamma
+            k0_vec = (torch.tensor(list(k0), dtype=torch.float32) if isinstance(k0, (list, tuple))
+                      else torch.full((len(self.group.irrep_dims),), float(k0)))
+            self.log_kappa_gamma = nn.Parameter(torch.log(k0_vec))
+            if (not cfg.s_e_step) and cfg.lambda_gamma == 0.0:
+                # No gamma loss path at all (the scored gamma block needs lambda_gamma > 0; the
+                # s-refine E-step needs s_e_step=True): the toggle is inert. Warn (mirrors the
+                # t5 inert warning above) so a dead toggle is not mistaken for a trained
+                # temperature.
+                import warnings
+                warnings.warn(
+                    "learnable_kappa_gamma=True but no gamma loss path is active (lambda_gamma == 0 "
+                    "and s_e_step=False): log_kappa_gamma receives no gradient and the toggle is "
+                    "inert. Set lambda_gamma > 0 (scored gamma block) or s_e_step=True to use it.",
+                    UserWarning, stacklevel=2,
+                )
+            elif cfg.s_e_step and cfg.effective_e_step_gradient in ("detach", "straight_through"):
+                # Under s_e_step the scored gamma block is skipped and kappa_gamma is consumed
+                # only inside _refine_s's E-step, which these estimators sever (the same footgun
+                # as log_kappa_beta). NB under s_e_step=False + lambda_gamma > 0 the gamma block
+                # is assembled at the LOSS level (outside the E-step wrapper), so log_kappa_gamma
+                # trains under ANY estimator and no warning fires.
+                import warnings
+                warnings.warn(
+                    f"learnable_kappa_gamma=True with s_e_step=True and the effective E-step "
+                    f"estimator {cfg.effective_e_step_gradient!r} freezes log_kappa_gamma: under "
+                    f"s_e_step the model-channel temperature enters the loss only through "
+                    f"_refine_s's E-step, which this estimator severs. Use an 'unroll' E-step "
+                    f"(detach_e_step=False, e_step_gradient='unroll') to train it.",
+                    stacklevel=2,
+                )
 
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":
         r"""Carry the gauge group's generators through ``.to(...)`` / ``.cuda()`` etc.
@@ -501,6 +564,19 @@ class VFEModel(nn.Module):
             pos_phi_free=getattr(self, "pos_phi_free", None),
         )
 
+    def effective_kappa_beta(self, device: torch.device) -> 'float | torch.Tensor':
+        r"""The belief-channel kappa actually in force: exp(log_kappa_beta) (live, differentiable)
+        under learnable_kappa_beta, else the config constant via _as_coeff (a scalar float, or an
+        (H,) tensor for a per-head list) -- value-identical to the learnable init."""
+        p = getattr(self, "log_kappa_beta", None)
+        return torch.exp(p).to(device) if p is not None else _as_coeff(self.cfg.kappa_beta, device)
+
+    def effective_kappa_gamma(self, device: torch.device) -> 'float | torch.Tensor':
+        r"""The model-channel kappa actually in force (the kappa_gamma analogue of
+        :meth:`effective_kappa_beta`)."""
+        p = getattr(self, "log_kappa_gamma", None)
+        return torch.exp(p).to(device) if p is not None else _as_coeff(self.cfg.kappa_gamma, device)
+
     def _refine_s(
         self,
         token_ids:       torch.Tensor,   # (B, N) integer token ids
@@ -521,7 +597,7 @@ class VFEModel(nn.Module):
         s_mu, s_sigma = pb.encode_s(token_ids)                         # (B, N, K)
         r_mu    = pb.r_mu.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
         r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s_sigma)
-        gamma_tau       = attention_tau(_as_coeff(cfg.kappa_gamma, s_mu.device), grp.irrep_dims)
+        gamma_tau       = attention_tau(self.effective_kappa_gamma(s_mu.device), grp.irrep_dims)
         gamma_log_prior = self._attention_log_prior(
             token_ids.shape[1], token_ids.device, prior=cfg.gamma_attention_prior,
         )
@@ -737,7 +813,8 @@ class VFEModel(nn.Module):
                             rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
                             rope_on_value=self.cfg.rope_on_value,
                             capture=capture, grad_record=grad_rec,
-                            prebuilt_transport=shared_omega)
+                            prebuilt_transport=shared_omega,
+                            kappa_beta_override=self.effective_kappa_beta(token_ids.device))
         if estep_grad_out is not None:                           # one host sync, only when requested
             for _gk in ("mu", "sigma", "phi"):
                 _gv = grad_rec.get(_gk) if grad_rec is not None else None
@@ -1130,7 +1207,7 @@ class VFEModel(nn.Module):
         # Group-aware temperature: tau spans the dimension the energy accumulates over (the
         # gauge-irrep block size), exactly as the belief beta channel does. kappa_gamma is
         # gamma's own sharpness handle (not cfg.kappa_beta).
-        gamma_tau = attention_tau(_as_coeff(cfg.kappa_gamma, e_s.device), self.group.irrep_dims)
+        gamma_tau = attention_tau(self.effective_kappa_gamma(e_s.device), self.group.irrep_dims)
         return e_s, gamma_tau, gamma_log_prior
 
     def _gamma_coupling_term(
@@ -1225,6 +1302,7 @@ class VFEModel(nn.Module):
             connection_M=getattr(self, "connection_M", None),
             connection_L=getattr(self, "connection_L", None),
             rope=rope, rope_on_cov=self.cfg.rope_full_gauge, rope_on_value=self.cfg.rope_on_value,
+            kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
         )
         e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids[:1], out.phi.unsqueeze(0))
         gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)[0]   # drop batch
@@ -1549,6 +1627,7 @@ class VFEModel(nn.Module):
             rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
             rope_on_value=cfg.rope_on_value,
             capture=cap,
+            kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
         )
 
         rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
@@ -1591,7 +1670,7 @@ class VFEModel(nn.Module):
         # query_adaptive_tau (default OFF): _beta_tau returns the base tau unchanged, else the
         # per-query tau from the CONVERGED belief sigma (the state this diagnostic scores).
         _tau_b = self._beta_tau(out.sigma, out.mu,
-                                attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), self.group.irrep_dims))
+                                attention_tau(self.effective_kappa_beta(out.mu.device), self.group.irrep_dims))
         beta = attention_weights(energy, tau=_tau_b, log_prior=log_prior)
         _q_conv = cap["converged"]                                   # q*: the F self-term reads the
         self_div = self_divergence_for_alpha(                        # pre-transform converged belief
@@ -1812,7 +1891,7 @@ class VFEModel(nn.Module):
         mu_p, sigma_p = belief.mu, belief.sigma
 
         rope = self._rope_rotation(n, token_ids.device)
-        _base_tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), self.group.irrep_dims)
+        _base_tau = attention_tau(self.effective_kappa_beta(belief.mu.device), self.group.irrep_dims)
         maps = []
         for _ in range(cfg.n_layers):
             belief = vfe_block(                                       # converged belief at this block
@@ -1916,7 +1995,7 @@ class VFEModel(nn.Module):
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior
         fam = get_family(cfg.family)
         _lb = cfg.lambda_beta
-        _tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), self.group.irrep_dims)
+        _tau = attention_tau(self.effective_kappa_beta(belief.mu.device), self.group.irrep_dims)
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
         mu_p, sigma_p = belief.mu, belief.sigma
         rope = self._rope_rotation(n, token_ids.device)

@@ -48,6 +48,7 @@ def vfe_stack(
     capture:         Optional[dict]            = None,   # out-param: LAST block's converged (pre-transform) belief under 'converged'
     grad_record:     Optional[dict]            = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: one flat transport shared across blocks (valid: e_phi_lr==0 + flat, phi loop-invariant)
+    kappa_beta_override: 'Optional[float | torch.Tensor]' = None,   # learnable_kappa_beta: live exp(log_kappa_beta) (t5-exception family); None -> cfg.kappa_beta
 ) -> BeliefState:
     r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior.
 
@@ -61,9 +62,15 @@ def vfe_stack(
     rho = cfg.prior_handoff_rho
     rho_s = cfg.prior_handoff_sigma
     # Hoist the loop-invariant temperature computation out of the per-layer vfe_block call.
-    # attention_tau depends only on cfg.kappa_beta, group.irrep_dims, and device -- all constant
-    # across layers -- so computing it once here and passing it as tau avoids L redundant calls.
-    tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims)
+    # attention_tau depends only on the kappa, group.irrep_dims, and device -- all constant across
+    # layers -- so computing it once here and passing it as tau avoids L redundant calls.
+    # kappa_beta_override carries the model's LEARNED exp(log_kappa_beta) under
+    # learnable_kappa_beta (un-detached, so the loss backpropagates to it); None is the pure
+    # config path, byte-identical to before.
+    tau = attention_tau(
+        kappa_beta_override if kappa_beta_override is not None
+        else _as_coeff(cfg.kappa_beta, belief.mu.device),
+        group.irrep_dims)
     for _ in range(cfg.n_layers):
         # Per-query adaptive temperature (cfg.query_adaptive_tau, default OFF): rescale the hoisted
         # per-head tau by the DETACHED uncertainty trace of the belief ENTERING this block,
