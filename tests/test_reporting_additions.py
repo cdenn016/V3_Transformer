@@ -78,6 +78,12 @@ def test_optimizer_geometry_renders_with_ratio_synthesis():
                "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"))
     fig = figs.plot_optimizer_geometry(h); assert fig is not None; plt.close(fig)
 
+def test_kappa_history_renders_with_variance_band():
+    h = {"step": [1, 2, 3],
+         "kappa_beta_mean": [1.0, 1.2, 1.4],
+         "kappa_beta_var": [0.0, 0.01, 0.04]}
+    fig = figs.plot_kappa_history(h, channel="beta"); assert fig is not None; plt.close(fig)
+
 
 def test_ppl_offset_renders():
     pts = [{"embed_dim": k, "ppl_mean": 50.0 / k + 12.0, "ppl_sem": 0.3, "n_seeds": 3}
@@ -116,6 +122,23 @@ def test_save_figures_emits_dashboards(tmp_path):
                 "optimizer_geometry.png"):
         assert (tmp_path / png).exists(), f"{png} not emitted"
 
+
+
+def test_save_figures_emits_kappa_histories(tmp_path):
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2,
+                     learnable_kappa_beta=True, learnable_kappa_gamma=True, lambda_gamma=0.1)
+    model = VFEModel(cfg).to(DEVICE)
+    art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
+    art.history = [
+        {"step": s,
+         "kappa_beta_mean": 1.0 + 0.05 * s, "kappa_beta_var": 0.01 * s,
+         "kappa_gamma_mean": 1.2 + 0.04 * s, "kappa_gamma_var": 0.02 * s}
+        for s in range(1, 5)
+    ]
+    _save_figures(art, None, logging.getLogger("test"))
+    for png in ("kappa_beta_history.png", "kappa_gamma_history.png"):
+        assert (tmp_path / png).exists(), f"{png} not emitted"
 
 # --------------------------------------------------------------------------- pure-path certificate
 

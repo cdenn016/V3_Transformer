@@ -1317,6 +1317,57 @@ def plot_hyper_prior_coupling(
     return _save(fig, path)
 
 
+@register_figure("kappa_history")
+def plot_kappa_history(
+    history: Dict,                       # step + kappa_{beta,gamma}_{mean,var}
+
+    *,
+    channel: str           = "beta",     # "beta" or "gamma"
+    path:    Optional[str] = None,
+):
+    r"""Learned softmax-temperature trajectory over training.
+
+    ``train`` logs ``kappa_<channel>_mean`` and ``kappa_<channel>_var`` for each metrics row when
+    the corresponding learnable-kappa toggle is active. The mean is across irrep blocks/heads; the
+    shaded band is mean +/- sqrt(population variance), clipped at 0 because kappa is strictly
+    positive by construction (``kappa = exp(log_kappa)``).
+    """
+    prefix = f"kappa_{channel}"
+    mean_key = f"{prefix}_mean"
+    var_key  = f"{prefix}_var"
+    mean = _np(history.get(mean_key, [])).reshape(-1).astype(float)
+    if mean.size == 0:
+        fig, ax = plt.subplots(figsize=(4.0, 3.0))
+        ax.text(0.5, 0.5, f"no {prefix} history", ha="center", va="center")
+        ax.axis("off")
+        return _save(fig, path)
+    step = _np(history.get("step", np.arange(mean.size))).reshape(-1).astype(float)
+    if step.size != mean.size:
+        step = np.arange(mean.size, dtype=float)
+    var = _np(history.get(var_key, np.full(mean.shape, np.nan))).reshape(-1).astype(float)
+    if var.size != mean.size:
+        var = np.full(mean.shape, np.nan)
+    keep = np.isfinite(step) & np.isfinite(mean)
+    std = np.sqrt(np.maximum(var, 0.0))
+    band = keep & np.isfinite(std)
+    symbol = r"\beta" if channel == "beta" else r"\gamma"
+    fig, ax = plt.subplots(figsize=(5.6, 3.5))
+    if band.any():
+        lower = np.maximum(mean - std, 0.0)
+        upper = mean + std
+        ax.fill_between(step, lower, upper, where=band, color=_CB[5], alpha=0.20,
+                        label=r"$\pm\sqrt{\mathrm{var}}$ across blocks")
+    if keep.any():
+        ax.plot(step[keep], mean[keep], "o-", color=_CB[0], lw=1.7, ms=3,
+                label=rf"mean $\kappa_{{{symbol}}}$")
+        ax.set_xlim(float(step[keep].min()), float(step[keep].max()))
+        _step_xaxis(ax)
+    ax.set(xlabel="training step", ylabel=rf"$\kappa_{{{symbol}}}$",
+           title=f"Learned {channel} kappa over training")
+    ax.legend(fontsize=8, frameon=False, loc="best")
+    fig.tight_layout()
+    return _save(fig, path)
+
 @register_figure("ln3_symmetry_breaking")
 def plot_ln3_symmetry_breaking(
     frozen:  Dict,                       # {step, val_ce, omega (N,N,K,K), beta (H,N,N)}

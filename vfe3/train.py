@@ -1009,6 +1009,15 @@ def train(
             # Throughput + peak memory (Tier-1): tokens/s over the window and CUDA peak MB.
             row["tokens_per_s"] = toks_per_s
             row["peak_mem_mb"]  = peak_mem_mb
+            # Learnable softmax temperatures (default-off): log the live kappa values once per
+            # metrics row so finalize_run can plot their training trajectory. The variance is the
+            # population variance across irrep blocks/heads at that step (0 for a single block).
+            for _kp, _param in (("kappa_beta", getattr(model, "log_kappa_beta", None)),
+                                ("kappa_gamma", getattr(model, "log_kappa_gamma", None))):
+                if _param is not None:
+                    _kv = torch.exp(_param.detach()).float().reshape(-1)
+                    row[f"{_kp}_mean"] = float(_kv.mean())
+                    row[f"{_kp}_var"]  = float(_kv.var(unbiased=False))
             # Cumulative wall time since training start (D1/EXP-8): the x-axis of the per-wall-clock
             # convergence curve (val_ppl vs wall_clock_s). 'now' is the window timestamp captured above.
             row["wall_clock_s"] = now - train_t0

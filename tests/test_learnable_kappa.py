@@ -11,6 +11,7 @@ gauge transport, so equivariance is preserved.
 All models here are tiny (K = 4, single-digit dims) and CPU-bound per the project testing rules.
 """
 
+import csv
 import warnings
 
 import pytest
@@ -195,6 +196,24 @@ def test_list_init_used_elementwise():
     m = VFEModel(_cfg(learnable_kappa_beta=True, kappa_beta=[1.0, 2.0]))
     assert torch.equal(m.log_kappa_beta.detach(), torch.log(torch.tensor([1.0, 2.0])))
 
+
+def test_training_logs_learned_kappa_stats(tmp_path):
+    from vfe3.run_artifacts import RunArtifacts
+    from vfe3.train import train
+
+    torch.manual_seed(0)
+    cfg = _cfg(learnable_kappa_beta=True, learnable_kappa_gamma=True, lambda_gamma=0.1,
+               max_steps=2, log_interval=1)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic", device="cpu")
+    train(model, [_batch(1), _batch(2)], cfg, n_steps=2, log_interval=1, eval_interval=0,
+          artifacts=art, generate_samples=False)
+    with open(tmp_path / "run" / "metrics.csv", newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows
+    for key in ("kappa_beta_mean", "kappa_beta_var", "kappa_gamma_mean", "kappa_gamma_var"):
+        assert key in rows[0]
+        assert rows[0][key] not in ("", "nan", None)
 
 # --- optimizer wiring ----------------------------------------------------------
 

@@ -962,6 +962,14 @@ def _save_figures(
                 color=figs._CB[3], smooth=max(5, len(gy) // 60), annotate_final=True,
                 path=str(run / "gauge_trace_spread.png"))
             figs.plt.close(fig)
+        # Learnable softmax-temperature trajectories: present exactly when train() logged the live
+        # per-block kappa statistics for the default-off learnable_kappa_beta/gamma toggles.
+        for _ch in ("beta", "gamma"):
+            _hist_kappa = _hist_subset((f"kappa_{_ch}_mean", f"kappa_{_ch}_var"))
+            if _hist_kappa and f"kappa_{_ch}_mean" in _hist_kappa:
+                fig = figs.plot_kappa_history(
+                    _hist_kappa, channel=_ch, path=str(run / f"kappa_{_ch}_history.png"))
+                figs.plt.close(fig)
         # Optimization + convergence trends (history-only; no model re-run): the pre-clip gradient
         # norm (THE optimization-health curve, previously discarded), the belief-covariance
         # conditioning, and the per-eval E-step F-descent (negative = the inner loop reduced F).
