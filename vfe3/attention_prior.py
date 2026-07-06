@@ -7,6 +7,8 @@ and the normalized prior used in the attention-entropy term is pi = softmax_j(B)
   causal   B = 0 (j<=i), -inf (j>i)   -> uniform over the causal active set.
   alibi    B_ij = -slope*|i-j|        -> linear distance bias (Press et al.).
   causal_alibi  B_ij = -slope*(i-j) (j<=i), -inf (j>i) -> causal + ALiBi (Press et al.).
+  causal_noself / causal_alibi_noself -> the same with the self key j=i also masked
+    (except (0,0); see prior_causal_noself for the attention-sink rationale).
 Config-selected so a new prior (learned bias, windowed, ...) slots in by
 register_prior without editing the free-energy call site.
 """
@@ -84,6 +86,30 @@ def prior_causal(
     return B.masked_fill(~allowed, float("-inf"))
 
 
+@register_prior("causal_noself")
+def prior_causal_noself(
+    n_query: int,
+    n_key:   int,
+
+    *,
+    device:  'torch.device | str | None' = None,
+    dtype:   torch.dtype                  = torch.float32,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Causal prior with the SELF key masked: 0 for j < i, -inf for j > i AND for j == i > 0.
+
+    Rationale: the flat cocycle gives Omega_ii = I, so the self energy E_ii = D(q_i || q_i) ~ 0
+    permanently -- the diagonal is a STRUCTURAL attention sink the softmax can never unlearn.
+    Masking j == i removes it. Entry (0, 0) stays allowed by construction: row 0 has no other
+    causal key, and an all--inf logits row makes the softmax NaN. Equals `causal` off-diagonal.
+    """
+    i = torch.arange(n_query, device=device).unsqueeze(-1)
+    j = torch.arange(n_key, device=device).unsqueeze(0)
+    allowed = (j < i) | ((i == 0) & (j == 0))
+    B = torch.zeros(n_query, n_key, device=device, dtype=dtype)
+    return B.masked_fill(~allowed, float("-inf"))
+
+
 @register_prior("alibi")
 def prior_alibi(
     n_query:     int,
@@ -137,6 +163,35 @@ def prior_causal_alibi(
     slopes  = _press_slopes(n_heads, alibi_slope, device, dtype)    # (H,)
     B       = (-slopes.view(n_heads, 1, 1) * dist)                  # (H, N_q, N_k)
     allowed = (j <= i)                                              # (N_q, N_k)
+    return B.masked_fill(~allowed.unsqueeze(0), float("-inf"))      # (H, N_q, N_k)
+
+
+@register_prior("causal_alibi_noself")
+def prior_causal_alibi_noself(
+    n_query:     int,
+    n_key:       int,
+
+    *,
+    n_heads:     int                          = 1,
+    alibi_slope: float                        = 0.5,
+    device:      'torch.device | str | None'  = None,
+    dtype:       torch.dtype                  = torch.float32,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Causal + ALiBi prior (per-head Press et al. slopes) with the SELF key masked.
+
+    Identical to ``causal_alibi`` -- ``B_hij = -slope_h * (i - j)`` on the allowed set, -inf on the
+    causal complement -- except the diagonal j == i is ALSO masked to -inf (see ``causal_noself``:
+    the flat cocycle's Omega_ii = I makes E_ii ~ 0, a structural attention sink). Entry (0, 0)
+    stays allowed since row 0 has no other causal key (an all--inf logits row NaNs the softmax);
+    its ALiBi bias there is -slope_h * 0 = 0. Returns ``(H, N_q, N_k)``, ``H = n_heads``.
+    """
+    i       = torch.arange(n_query, device=device).unsqueeze(-1)
+    j       = torch.arange(n_key,   device=device).unsqueeze(0)
+    dist    = (i - j).abs().to(dtype)                               # (N_q, N_k)
+    slopes  = _press_slopes(n_heads, alibi_slope, device, dtype)    # (H,)
+    B       = (-slopes.view(n_heads, 1, 1) * dist)                  # (H, N_q, N_k)
+    allowed = (j < i) | ((i == 0) & (j == 0))                       # diagonal dropped (except (0,0))
     return B.masked_fill(~allowed.unsqueeze(0), float("-inf"))      # (H, N_q, N_k)
 
 

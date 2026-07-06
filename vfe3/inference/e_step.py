@@ -17,6 +17,7 @@ import torch
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
 from vfe3.families.base import get_family
+from vfe3.families.gaussian import diag_kl_unclamped
 from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
@@ -34,7 +35,7 @@ from vfe3.geometry.transport import (
     transport_covariance,
     transport_mean,
 )
-from vfe3.gradients.kernels import belief_gradients, uses_kernel_route
+from vfe3.gradients.kernels import belief_gradients, mm_exact_update, uses_kernel_route
 
 
 def _transport(
@@ -49,6 +50,8 @@ def _transport(
     sigma:              Optional[torch.Tensor] = None,      # variances; regime_ii_covariant features read these
     link_alpha:         float                  = 1.0,       # direct-link scale (regime_ii_link / _charted)
     link_soft_cap:      float                  = 6.0,       # direct-link embedded-Frobenius soft cap
+    exp_fp64_mode:           str   = "dim",                 # stable_matrix_exp_pair island keying (flat builder; 'dim' | 'norm')
+    exp_fp64_norm_threshold: float = 5.0,                   # 'norm': max clamped block ||M||_F upcast threshold
     clamp_monitor:      bool                   = False,     # opt-in: warn when the exp Frobenius clamp fires (host sync)
     connection_W:       Optional[torch.Tensor] = None,      # (n_gen, K, K) learned bilinear connection (regime_ii, NN exception)
     connection_M:       Optional[torch.Tensor] = None,      # (n_gen, 3) learned covariant connection (regime_ii_covariant, NN exception)
@@ -82,6 +85,7 @@ def _transport(
                       sigma=sig_b, sigma_key=sig_kb,
                       connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                       link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
+                      exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                       cocycle_relaxation=cocycle_relaxation)["Omega"]
         # A batch-independent builder (regime_ii_link) already returns (N,N,K,K); ordinary builders
         # return (1,N,N,K,K) on the unbatched diagnostics path -> strip the batch-of-one.
@@ -90,6 +94,7 @@ def _transport(
                  sigma=sigma, sigma_key=sigma_key,
                  connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                  link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
+                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                  cocycle_relaxation=cocycle_relaxation)["Omega"]
 
 
@@ -122,6 +127,11 @@ def build_belief_transport(
     clamp_monitor:      bool                   = False,     # opt-in: warn when the exp Frobenius clamp fires (host sync)
     rope_on_cov:        bool                   = False,     # rotate the covariance too (full-gauge)
     rope_on_value:      bool                   = True,      # False -> value aggregation uses the un-rotated base
+    # Tier-1 transport perf toggles (2026-07-05; default OFF = byte-identical: the dense einsum and
+    # the 'dim' island rule stay the default code paths).
+    exp_fp64_mode:           str   = "dim",                 # stable_matrix_exp_pair island keying (flat builders; 'dim' | 'norm')
+    exp_fp64_norm_threshold: float = 5.0,                   # 'norm': upcast only when max clamped block ||M||_F >= this
+    transport_mean_per_head: bool  = False,                 # factored transport_mean contracts per gauge block (fused path only)
     mu:                 Optional[torch.Tensor] = None,      # regime_ii edge connection reads these
     sigma:              Optional[torch.Tensor] = None,      # regime_ii_covariant features read these
     connection_W:       Optional[torch.Tensor] = None,      # regime_ii learned bilinear connection
@@ -148,9 +158,20 @@ def build_belief_transport(
     When ``rope`` is given the built transport is wrapped in a :class:`RopeTransport` before being
     returned; ``transport_mean`` / ``transport_covariance`` consume it opaquely, so no downstream
     changes are needed.
+
+    Tier-1 perf toggles (default OFF, byte-identical): ``transport_mean_per_head`` marks the
+    factored container so ``transport_mean`` contracts per gauge block (fp32 reassociation only;
+    inert on the dense fallback, whose mean has no factored form -- the RoPE wrapper recurses into
+    the container, so the fused RoPE path is covered). ``exp_fp64_mode`` /
+    ``exp_fp64_norm_threshold`` re-key ``stable_matrix_exp_pair``'s float64 island from the
+    dimension rule to the max clamped block norm; forwarded to the FLAT builders on both the fused
+    and dense routes (the non-flat regime builders keep their own keying and swallow them).
     """
     if _can_fuse_flat(transport_mode, group):
-        built = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
+        built = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
+                                         exp_fp64_mode=exp_fp64_mode,
+                                         exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                                         mean_per_head=transport_mean_per_head)
     else:
         # Registry-driven routing (audit 2026-07-01 round-3, punch 12b): forward ALL state kwargs
         # once, gating the belief tensors on the registry's needs-sets (the add-by-registering
@@ -162,6 +183,7 @@ def build_belief_transport(
                            sigma_key=(sigma_key if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
                            connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                            link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
+                           exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                            cocycle_relaxation=cocycle_relaxation)
     if rope is None:
         return built
@@ -196,20 +218,28 @@ def free_energy_value(
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
+    lambda_twohop:             float = 0.0,            # HONORED: adds the detached two-hop coupling block to F
     sigma_max:                 float = 10.0,           # matches VFE3Config.sigma_max; accepted-and-ignored iteration-only knob
     e_sigma_q_trust:           float = 5.0,            # accepted-and-ignored iteration-only knob
     e_mu_q_trust:              Optional[float] = None, # accepted-and-ignored iteration-only knob
     mu_trust_mode:             str  = "box",           # accepted-and-ignored iteration-only knob
     e_step_mu_precond:         str  = "fisher",        # accepted-and-ignored iteration-only knob
+    e_step_update:             str  = "gradient",      # accepted-and-ignored iteration-only knob
     mass_phi:                  float = 0.0,            # accepted-and-ignored iteration-only knob (phi penalty)
+    mm_damping:                float = 1.0,            # accepted-and-ignored iteration-only knob
+    exp_fp64_norm_threshold:   float = 5.0,            # accepted-and-ignored Tier-1 transport-numerics knob
 
     include_attention_entropy: bool = True,
+    skip_belief_sigma_update:  bool = False,           # accepted-and-ignored iteration-only knob
+    compile_pair_kernel:       bool = False,           # accepted-and-ignored iteration-only knob
+    transport_mean_per_head:   bool = False,           # accepted-and-ignored Tier-1 transport-numerics knob
     rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
     rope_on_value:             bool = True,            # False -> value aggregation uses the un-rotated base
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
     gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
+    exp_fp64_mode:             str  = "dim",           # accepted-and-ignored Tier-1 transport-numerics knob
     phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
     spd_retract_mode:          str  = "spd_affine",    # accepted-and-ignored iteration-only knob
@@ -243,6 +273,11 @@ def free_energy_value(
     transport form and raises under a non-flat ``transport_mode``. ``rope``/``rope_on_cov`` are honored too (audit
     2026-06-09 PP6): the built transport is wrapped in :class:`RopeTransport` exactly as on the
     model path, so under gauge-RoPE the logged F is the F being descended, not the un-rotated one.
+    ``lambda_twohop`` is likewise HONORED (detached beta@beta hop weights against the same energy
+    grid, no entropy term), so the logged F carries the two-hop block the kernel descends.
+    The Tier-1 transport perf toggles (``transport_mean_per_head``, ``exp_fp64_mode``,
+    ``exp_fp64_norm_threshold``) are accepted-and-ignored: they change transport numerics at
+    round-off only, so the diagnostic F keeps the default (dense-mean, dim-keyed) build.
     """
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
     # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
@@ -297,12 +332,20 @@ def free_energy_value(
         coupling_energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_tv, sigma_tv), alpha=renyi_order,
                                           kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                           irrep_dims=group.irrep_dims)
-    return free_energy(
+    F = free_energy(
         sd, energy, alpha, tau=tau, lambda_beta=lambda_beta,
         include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if lambda_alpha_mode != "constant" else None),
         coupling_energy=coupling_energy,
     )
+    if lambda_twohop > 0.0:
+        # Two-hop coupling block (fixed cross-workstream convention): DETACHED hop weights
+        # W2 = beta @ beta (per head), the SAME pairwise energy grid, no entropy term. Under the
+        # decoupled value gauge the summed grid is the value energy, mirroring the coupling sum.
+        beta2 = attention_weights(energy, tau=tau, log_prior=log_prior).detach()
+        F = F + lambda_twohop * (torch.matmul(beta2, beta2)
+                                 * (energy if coupling_energy is None else coupling_energy)).sum()
+    return F
 
 
 def phi_alignment_loss(
@@ -397,9 +440,14 @@ def e_step_iteration(
     e_mu_q_trust:              Optional[float] = None,   # mean trust radius (sigma units); None = unbounded
     mu_trust_mode:             str  = "box",             # "box" | "ball" (only when e_mu_q_trust is not None)
     e_step_mu_precond:         str  = "fisher",          # "fisher" (nat-grad mean) | "raw" (B3/EXP-14 mu-arm)
+    e_step_update:             str  = "gradient",        # "gradient" (pure) | "mm_exact" (closed-form MM fusion)
     mass_phi:                  float = 0.0,
+    mm_damping:                float = 1.0,              # mm_exact: natural-coordinate damping eta (1 = exact minimizer)
+    lambda_twohop:             float = 0.0,              # weight on the detached two-hop pair term (kernel route)
 
     include_attention_entropy: bool = True,
+    skip_belief_sigma_update:  bool = False,             # freeze the belief sigma through this iteration (no grad, no retraction)
+    compile_pair_kernel:       bool = False,             # torch.compile the closed-form pair kernel (lazy cache)
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
@@ -414,6 +462,9 @@ def e_step_iteration(
     link_alpha:                float = 1.0,                    # direct-link scale (regime_ii_link / _charted)
     link_soft_cap:             float = 6.0,                    # direct-link embedded-Frobenius soft cap
     clamp_monitor:             bool = False,                   # opt-in: warn when the exp Frobenius clamp fires (host sync)
+    exp_fp64_mode:             str   = "dim",                  # Tier-1: flat-builder float64-island keying ('dim' | 'norm')
+    exp_fp64_norm_threshold:   float = 5.0,                    # Tier-1 'norm': max clamped block ||M||_F upcast threshold
+    transport_mean_per_head:   bool  = False,                  # Tier-1: factored transport_mean contracts per gauge block
 
     log_prior:                 Optional[torch.Tensor] = None,
     connection_W:              Optional[torch.Tensor] = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
@@ -434,7 +485,11 @@ def e_step_iteration(
     learned ``connection_W`` (a sanctioned NN exception); because that Omega depends on mu it is
     rebuilt from ``belief.mu`` every iteration here (flat is mu-independent). ``connection_W`` flows
     in only through these belief updates, so the loss backpropagates to it (and a detached E-step
-    would freeze it)."""
+    would freeze it).
+
+    ``e_step_update='mm_exact'`` (kernel route only) replaces the mu/sigma gradient + retraction
+    with the closed-form precision fusion at frozen beta (``mm_exact_update``), damped by
+    ``mm_damping`` in natural coordinates; the phi sub-step is untouched either way."""
     # Build the forward belief-transport (P0 #2): on the flat + block-diagonal-with-equal-blocks
     # path this is a FactoredTransport (the per-token exps only, NO dense (B,N,N,K,K) Omega), which
     # the belief-gradient kernel / oracle consume opaquely through transport_mean / covariance;
@@ -479,6 +534,8 @@ def e_step_iteration(
                 mu=belief.mu, connection_W=connection_W, connection_L=connection_L,
                 link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                 cocycle_relaxation=cocycle_relaxation,
+                exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                transport_mean_per_head=transport_mean_per_head,
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
             )
         omega_builder = None
@@ -503,72 +560,138 @@ def e_step_iteration(
             UserWarning,
             stacklevel=2,
         )
-    grad_mu, grad_sigma = belief_gradients(
-        belief.mu, belief.sigma, mu_p, sigma_p, omega,
-        tau=tau, renyi_order=renyi_order, value=value, b0=b0, c0=c0, lambda_beta=lambda_beta,
-        kl_max=kl_max, eps=eps,
-        include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
-        family=family, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode,
-        transport_mode=transport_mode, omega_builder=omega_builder,
-        irrep_dims=group.irrep_dims, log_prior=log_prior,
-        # Opt-in unrolled-oracle: make the autograd oracle (non-kernel families) return a
-        # differentiable belief gradient so the through-inference signal reaches the prior, matching
-        # the hand kernel. Gated on the explicit oracle_unroll_grad toggle (default OFF preserves the
-        # detached oracle); only meaningful under the 'unroll' estimator (straight_through detaches
-        # downstream, detach runs under no_grad).
-        create_graph=(oracle_unroll_grad and e_step_gradient == "unroll"),
-    )
-    if grad_record is not None:
-        # Diagnostic: the RAW belief-gradient L2 norms ||grad_mu||, ||grad_sigma|| (pre-natural-grade,
-        # the E-step analogue of the M-step's raw per-group grad_norm). Detached 0-dim tensors (no host
-        # sync here, no graph retained); phi defaults to 0 and is overwritten below iff phi steps.
-        grad_record["mu"]    = grad_mu.detach().pow(2).sum().sqrt()
-        grad_record["sigma"] = grad_sigma.detach().pow(2).sum().sqrt()
-        grad_record["phi"]   = grad_mu.new_zeros(())
-    # Fisher preconditioner is FAMILY-KEYED (add-by-registering): each BeliefParams owns its Fisher
-    # metric, so a non-Gaussian family (e.g. laplace_diagonal, I_mu=I_b=1/b^2) is descended in its
-    # own geometry instead of the hardcoded Gaussian Fisher. The Gaussian families delegate to the
-    # pinned geometry kernel (byte-identical); 'family' is the same key passed to belief_gradients.
-    nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
-        grad_mu, grad_sigma, eps=eps)
-
-    # STRAIGHT-THROUGH (manuscript Algorithm 1, GL(K)_attention.tex:2050): detach the per-iteration
-    # tangent so only the ADDITIVE chain stays live -- the belief is rebuilt as mu_prev + delta and
-    # retract(sigma_prev, delta) below, giving d belief_next/d belief_prev = I WITHOUT the
-    # second-order d delta/d belief_prev term the unrolled path keeps. The tangent is detached AFTER
-    # natural_gradient (which reintroduces a live belief.sigma dependence), not at grad_mu/grad_sigma,
-    # so no second-order term leaks through the Fisher metric. 'unroll' (and the no_grad-wrapped
-    # 'detach') leave nat_mu/nat_sigma untouched, so those lines are byte-identical to before and the
-    # forward VALUE is unchanged (detach never alters a number). This mirrors the phi step, which is
-    # already straight-through (fresh detached leaf, create_graph=False).
-    if e_step_gradient == "straight_through":
-        nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
-
-    # B3/EXP-14 mean-arm ablation: descend the Fisher natural gradient nat_mu (= Sigma*grad_mu for a
-    # diagonal Gaussian) by default, or the raw Euclidean grad_mu under e_step_mu_precond='raw'. The
-    # SPD sigma retraction below is unchanged either way, isolating the MEAN preconditioner; grad_mu is
-    # detached under straight_through to match nat_mu's per-iteration tangent severance.
-    if e_step_mu_precond == "raw":
-        mu_grad = grad_mu.detach() if e_step_gradient == "straight_through" else grad_mu
-    else:
-        mu_grad = nat_mu
-    delta_mu = e_q_mu_lr * mu_grad
-    # E-step MEAN trust region (default OFF). When e_mu_q_trust is set, bound the
-    # per-iteration mean step in sigma-whitened units before the additive update; None reproduces the
-    # bare mu = belief.mu - e_q_mu_lr*nat_mu bit-for-bit. is_diagonal mirrors the SPD-retraction rank
-    # rule below (full cov iff sigma.dim() == mu.dim() + 1).
-    if e_mu_q_trust is not None:
-        delta_mu = apply_mu_trust_region(
-            delta_mu, belief.sigma, trust=e_mu_q_trust, mode=mu_trust_mode,
-            is_diagonal=(belief.sigma.dim() == belief.mu.dim()), eps=eps,
+    if e_step_update == "mm_exact":
+        # Closed-form MM/coordinate-exact update: precision fusion at frozen beta (kernels.py,
+        # ``mm_exact_update``). Derived from the diagonal-KL filtering kernel, so it is
+        # kernel-route ONLY; config __post_init__ rejects oracle-routed configs, and direct
+        # callers get the same rejection here.
+        if not uses_kernel_route(
+                renyi_order=renyi_order, gradient_mode=gradient_mode, family=family,
+                divergence_family=divergence_family,
+                include_attention_entropy=include_attention_entropy,
+                transport_mode=transport_mode,
+                decoupled_value_gauge=(rope is not None and not rope_on_value)):
+            raise ValueError(
+                "e_step_update='mm_exact' requires the closed-form kernel route (filtering + "
+                "gaussian_diagonal + renyi order 1 + attention entropy, flat transport, coupled "
+                "value gauge); this call routes the belief gradient to the autograd oracle."
+            )
+        mu_star, sigma_star = mm_exact_update(
+            belief.mu, belief.sigma, mu_p, sigma_p, omega,
+            tau=tau, b0=b0, c0=c0, lambda_beta=lambda_beta,
+            kl_max=kl_max, eps=eps, lambda_twohop=lambda_twohop, value=value,
+            lambda_alpha_mode=lambda_alpha_mode, family=family, divergence_family=divergence_family,
+            irrep_dims=group.irrep_dims, log_prior=log_prior,
         )
-    mu = belief.mu - delta_mu
-    # The registered SPD retraction owns the diagonal-vs-full rank decision internally (full cov iff
-    # sigma.dim() == mu.dim() + 1); the E-step no longer branches on rank to select the retraction.
-    sigma = get_retraction(spd_retract_mode)(
-        belief.sigma, -e_q_sigma_lr * nat_sigma, belief.mu.dim(),
-        trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
-    )
+        # Backward estimator, mirroring the gradient path: 'unroll' keeps the analytic graph
+        # through (mu*, sigma*); 'straight_through' detaches the TARGETS so only the additive
+        # blend through the previous belief stays live (the mm analog of detaching nat_mu /
+        # nat_sigma); 'detach' is realized by the caller's no_grad wrapper.
+        if e_step_gradient == "straight_through":
+            mu_star, sigma_star = mu_star.detach(), sigma_star.detach()
+        if grad_record is not None:
+            # mm has no raw gradient; record the DISPLACEMENT norms ||theta* - theta|| instead
+            # (same keys, detached 0-dim tensors; phi overwritten below iff phi steps).
+            grad_record["mu"]    = (mu_star - belief.mu).detach().pow(2).sum().sqrt()
+            grad_record["sigma"] = (sigma_star - belief.sigma).detach().pow(2).sum().sqrt()
+            grad_record["phi"]   = belief.mu.new_zeros(())
+        # Damped step in NATURAL coordinates (mirror descent on the Gaussian natural parameters):
+        #   Lambda <- (1-eta) Lambda + eta Lambda*,  (Lambda mu) <- (1-eta) Lambda mu + eta Lambda* mu*,
+        # eta = mm_damping (eta=1 -> the exact coordinate minimizer in one step).
+        eta = mm_damping
+        if skip_belief_sigma_update:
+            # sigma frozen: the natural-parameter blend is undefined with Lambda held fixed, so
+            # damp the mean in MEAN coordinates instead (eta=1 still lands exactly on mu*).
+            mu    = (1.0 - eta) * belief.mu + eta * mu_star
+            sigma = belief.sigma
+        else:
+            lam_old = 1.0 / belief.sigma.clamp(min=eps)
+            lam_new = (1.0 - eta) * lam_old + eta / sigma_star           # sigma_star >= eps (kernel floor)
+            mu      = ((1.0 - eta) * lam_old * belief.mu + eta * mu_star / sigma_star) / lam_new
+            sigma   = 1.0 / lam_new
+            # the existing SPD bounds, applied AFTER the blend (mirrors the retraction's clamps)
+            sigma   = sigma.clamp(min=eps) if sigma_max is None else sigma.clamp(min=eps, max=sigma_max)
+    else:
+        grad_mu, grad_sigma = belief_gradients(
+            belief.mu, belief.sigma, mu_p, sigma_p, omega,
+            tau=tau, renyi_order=renyi_order, value=value, b0=b0, c0=c0, lambda_beta=lambda_beta,
+            lambda_twohop=lambda_twohop,
+            kl_max=kl_max, eps=eps,
+            include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
+            family=family, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode,
+            transport_mode=transport_mode, omega_builder=omega_builder,
+            irrep_dims=group.irrep_dims, log_prior=log_prior,
+            # skip_belief_sigma_update: the kernel skips the (B,N,N,K) sigma pair contraction
+            # entirely and returns grad_sigma=None (the oracle fallback still computes it; the
+            # sigma update below is skipped either way).
+            need_sigma_grad=(not skip_belief_sigma_update),
+            compile_pair_kernel=compile_pair_kernel,
+            # Opt-in unrolled-oracle: make the autograd oracle (non-kernel families) return a
+            # differentiable belief gradient so the through-inference signal reaches the prior, matching
+            # the hand kernel. Gated on the explicit oracle_unroll_grad toggle (default OFF preserves the
+            # detached oracle); only meaningful under the 'unroll' estimator (straight_through detaches
+            # downstream, detach runs under no_grad).
+            create_graph=(oracle_unroll_grad and e_step_gradient == "unroll"),
+        )
+        if grad_record is not None:
+            # Diagnostic: the RAW belief-gradient L2 norms ||grad_mu||, ||grad_sigma|| (pre-natural-grade,
+            # the E-step analogue of the M-step's raw per-group grad_norm). Detached 0-dim tensors (no host
+            # sync here, no graph retained); phi defaults to 0 and is overwritten below iff phi steps.
+            grad_record["mu"]    = grad_mu.detach().pow(2).sum().sqrt()
+            grad_record["sigma"] = (grad_sigma.detach().pow(2).sum().sqrt()
+                                    if grad_sigma is not None else grad_mu.new_zeros(()))
+            grad_record["phi"]   = grad_mu.new_zeros(())
+        # Fisher preconditioner is FAMILY-KEYED (add-by-registering): each BeliefParams owns its Fisher
+        # metric, so a non-Gaussian family (e.g. laplace_diagonal, I_mu=I_b=1/b^2) is descended in its
+        # own geometry instead of the hardcoded Gaussian Fisher. The Gaussian families delegate to the
+        # pinned geometry kernel (byte-identical); 'family' is the same key passed to belief_gradients.
+        # (grad_sigma is None only under skip_belief_sigma_update, whose sigma update is skipped below;
+        # a zero tangent keeps the family seam's signature intact.)
+        gs_precond = grad_sigma if grad_sigma is not None else torch.zeros_like(belief.sigma)
+        nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
+            grad_mu, gs_precond, eps=eps)
+
+        # STRAIGHT-THROUGH (manuscript Algorithm 1, GL(K)_attention.tex:2050): detach the per-iteration
+        # tangent so only the ADDITIVE chain stays live -- the belief is rebuilt as mu_prev + delta and
+        # retract(sigma_prev, delta) below, giving d belief_next/d belief_prev = I WITHOUT the
+        # second-order d delta/d belief_prev term the unrolled path keeps. The tangent is detached AFTER
+        # natural_gradient (which reintroduces a live belief.sigma dependence), not at grad_mu/grad_sigma,
+        # so no second-order term leaks through the Fisher metric. 'unroll' (and the no_grad-wrapped
+        # 'detach') leave nat_mu/nat_sigma untouched, so those lines are byte-identical to before and the
+        # forward VALUE is unchanged (detach never alters a number). This mirrors the phi step, which is
+        # already straight-through (fresh detached leaf, create_graph=False).
+        if e_step_gradient == "straight_through":
+            nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
+
+        # B3/EXP-14 mean-arm ablation: descend the Fisher natural gradient nat_mu (= Sigma*grad_mu for a
+        # diagonal Gaussian) by default, or the raw Euclidean grad_mu under e_step_mu_precond='raw'. The
+        # SPD sigma retraction below is unchanged either way, isolating the MEAN preconditioner; grad_mu is
+        # detached under straight_through to match nat_mu's per-iteration tangent severance.
+        if e_step_mu_precond == "raw":
+            mu_grad = grad_mu.detach() if e_step_gradient == "straight_through" else grad_mu
+        else:
+            mu_grad = nat_mu
+        delta_mu = e_q_mu_lr * mu_grad
+        # E-step MEAN trust region (default OFF). When e_mu_q_trust is set, bound the
+        # per-iteration mean step in sigma-whitened units before the additive update; None reproduces the
+        # bare mu = belief.mu - e_q_mu_lr*nat_mu bit-for-bit. is_diagonal mirrors the SPD-retraction rank
+        # rule below (full cov iff sigma.dim() == mu.dim() + 1).
+        if e_mu_q_trust is not None:
+            delta_mu = apply_mu_trust_region(
+                delta_mu, belief.sigma, trust=e_mu_q_trust, mode=mu_trust_mode,
+                is_diagonal=(belief.sigma.dim() == belief.mu.dim()), eps=eps,
+            )
+        mu = belief.mu - delta_mu
+        if skip_belief_sigma_update:
+            # skip_belief_sigma_update: sigma passes through UNCHANGED (no retraction, no clamp).
+            sigma = belief.sigma
+        else:
+            # The registered SPD retraction owns the diagonal-vs-full rank decision internally (full cov iff
+            # sigma.dim() == mu.dim() + 1); the E-step no longer branches on rank to select the retraction.
+            sigma = get_retraction(spd_retract_mode)(
+                belief.sigma, -e_q_sigma_lr * nat_sigma, belief.mu.dim(),
+                trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
+            )
 
     phi = belief.phi
     if e_phi_lr > 0.0:
@@ -630,12 +753,24 @@ def e_step(
     return_trajectory: bool  = False,
     e_step_gradient:   str   = "unroll",
     oracle_unroll_grad: bool = False,            # explicit (not in kwargs): keep it off the F_diag bag
+    # Tier-1 loop control (2026-07-05; explicit, off the F_diag bag). All default OFF/byte-identical.
+    e_steps_min:           int  = 1,             # randomize_e_steps: T ~ Uniform{e_steps_min..e_steps_max}
+    e_steps_max:           int  = 4,
+    e_steps_backprop_last: int  = 0,             # truncated backprop: no_grad prefix, detach at the boundary (0 = OFF)
+    randomize_e_steps:     bool = False,         # training forwards sample T; eval keeps n_iter
+    e_step_halt_tol:       Optional[float] = None,       # eval halting: break when mean KL(q^t||q^{t-1}) < tol
+    # Tier-1 transport perf toggles (2026-07-05; explicit, off the F_diag bag -- the diagnostic
+    # free_energy_value accepts-and-ignores them anyway). All default OFF/byte-identical.
+    exp_fp64_mode:           str   = "dim",      # flat-builder float64-island keying ('dim' | 'norm')
+    exp_fp64_norm_threshold: float = 5.0,        # 'norm': max clamped block ||M||_F upcast threshold
+    transport_mean_per_head: bool  = False,      # factored transport_mean contracts per gauge block
     grad_record:       Optional[dict]         = None,   # diag out-param (explicit): LAST iteration's belief-grad norms
     rope:              Optional[torch.Tensor] = None,
     rope_on_cov:       bool                   = False,
     rope_on_value:     bool                   = True,
 
     log_prior:         Optional[torch.Tensor] = None,
+    prebuilt_transport: 'torch.Tensor | FactoredTransport | RopeTransport | None' = None,   # share_refine_s_transport: caller-built flat transport (consumed only when the internal hoist would fire)
     **kwargs,
 ) -> 'BeliefState | Tuple[BeliefState, List[float]]':
     r"""Iterate ``e_step_iteration`` ``n_iter`` times (parallel mean-field). Optionally
@@ -647,7 +782,13 @@ def e_step(
     additive chain live). It is an EXPLICIT keyword (not in ``**kwargs``) so it binds here and does
     NOT ride the forwarded knob bag into the diagnostic ``free_energy_value`` (which rejects unknown
     kwargs). 'detach' is realized by the caller wrapping this in no_grad, so it is treated as
-    'unroll' here (no_grad already severs every gradient)."""
+    'unroll' here (no_grad already severs every gradient).
+
+    Tier-1 loop control (all default OFF): ``randomize_e_steps`` samples the depth
+    T ~ Uniform{e_steps_min..e_steps_max} on grad-enabled (training) forwards, from the GLOBAL
+    torch RNG; ``e_steps_backprop_last=k`` runs all but the last k iterations under no_grad and
+    detaches the belief at the boundary (truncated backprop); ``e_step_halt_tol`` breaks the eval
+    (no_grad) loop when the mean diagonal-Gaussian KL(q^t || q^{t-1}) drops below tol."""
     traj: List[float] = []
 
     # Hoist the flat transport when phi is frozen across iterations (e_phi_lr==0).  On the flat
@@ -660,13 +801,23 @@ def e_step(
     transport_mode_kw: str = kwargs.get("transport_mode", "flat")
     _hoisted_omega: 'torch.Tensor | FactoredTransport | RopeTransport | None' = None
     if e_phi_lr == 0.0 and transport_mode_kw == "flat":
-        _hoisted_omega = build_belief_transport(
-            belief.phi, group,
-            transport_mode="flat",
-            gauge_mode=kwargs.get("gauge_mode", "learned"),
-            clamp_monitor=kwargs.get("clamp_monitor", False),
-            rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
-        )
+        if prebuilt_transport is not None:
+            # share_refine_s_transport (default OFF): the caller built the flat transport ONCE from
+            # the SAME phi (both channels hold it fixed at e_phi_lr=0) and shares it across e_step
+            # calls, skipping this redundant per-call matrix-exp build. Consumed ONLY inside the
+            # hoist guard above (e_phi_lr==0 + flat): on any other route the kwarg is ignored and
+            # the per-iteration rebuild stays authoritative.
+            _hoisted_omega = prebuilt_transport
+        else:
+            _hoisted_omega = build_belief_transport(
+                belief.phi, group,
+                transport_mode="flat",
+                gauge_mode=kwargs.get("gauge_mode", "learned"),
+                clamp_monitor=kwargs.get("clamp_monitor", False),
+                exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                transport_mean_per_head=transport_mean_per_head,
+                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+            )
 
     def _f_diag(b: BeliefState) -> float:
         # Diagnostic scalar: under no_grad so the logged trajectory never enters the
@@ -682,18 +833,67 @@ def e_step(
                                      rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                                      **kwargs).item()
 
+    # Tier-1 loop control (all default OFF -> the pure fixed-depth loop below, byte-identical).
+    # grad-enabled == a TRAINING forward (the eval/generate paths run under no_grad): the
+    # discriminator for both the randomized depth and the truncated-backprop prefix, while the
+    # halting rule is the eval-side complement.
+    grad_on = torch.is_grad_enabled()
+    n_total = n_iter
+    if randomize_e_steps and grad_on:
+        # Sample T ~ Uniform{e_steps_min..e_steps_max} from the GLOBAL torch RNG (this toggle
+        # consumes global RNG state); eval keeps the deterministic n_iter.
+        n_total = int(torch.randint(e_steps_min, e_steps_max + 1, (1,)).item())
+    # Truncated backprop through the inner loop: the first (n_total - k) iterations run under
+    # no_grad and the belief is detached at the boundary; the last k iterations keep the
+    # configured e_step_gradient behavior. 0 = OFF (full path).
+    no_grad_prefix = 0
+    if e_steps_backprop_last > 0 and grad_on:
+        no_grad_prefix = max(n_total - e_steps_backprop_last, 0)
+    halt_eps: float = kwargs.get("eps", 1e-6)
+
     if return_trajectory:
         traj.append(_f_diag(belief))
-    for _ in range(n_iter):
-        belief = e_step_iteration(
-            belief, mu_p, sigma_p, group, tau=tau,
-            e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, e_phi_lr=e_phi_lr,
-            e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
-            grad_record=grad_record,                       # last iteration overwrites -> converged-ish grad
-            log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
-            _prebuilt_omega=_hoisted_omega,
-            **kwargs,
-        )
+    for t in range(n_total):
+        if e_step_halt_tol is not None and not grad_on:
+            prev_mu, prev_sigma = belief.mu, belief.sigma
+        if t < no_grad_prefix:
+            with torch.no_grad():
+                belief = e_step_iteration(
+                    belief, mu_p, sigma_p, group, tau=tau,
+                    e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, e_phi_lr=e_phi_lr,
+                    e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
+                    exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                    transport_mean_per_head=transport_mean_per_head,
+                    grad_record=grad_record,
+                    log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                    _prebuilt_omega=_hoisted_omega,
+                    **kwargs,
+                )
+            if t == no_grad_prefix - 1:
+                # Truncation boundary: fresh detached leaves so the last-k graph starts here.
+                belief = BeliefState(mu=belief.mu.detach(), sigma=belief.sigma.detach(),
+                                     phi=belief.phi.detach())
+        else:
+            belief = e_step_iteration(
+                belief, mu_p, sigma_p, group, tau=tau,
+                e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, e_phi_lr=e_phi_lr,
+                e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
+                exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                transport_mean_per_head=transport_mean_per_head,
+                grad_record=grad_record,                       # last iteration overwrites -> converged-ish grad
+                log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                _prebuilt_omega=_hoisted_omega,
+                **kwargs,
+            )
         if return_trajectory:
             traj.append(_f_diag(belief))
+        if e_step_halt_tol is not None and not grad_on and t + 1 < n_total:
+            # Eval-time halting: mean over tokens of the closed-form diagonal-Gaussian
+            # KL(q^t || q^{t-1}) (the per-iteration belief move); break when < tol. The guard on
+            # t+1 < n_total skips a wasted check after the final iteration.
+            with torch.no_grad():
+                move = diag_kl_unclamped(belief.mu, belief.sigma, prev_mu, prev_sigma,
+                                         eps=halt_eps).mean()
+            if move.item() < e_step_halt_tol:
+                break
     return (belief, traj) if return_trajectory else belief

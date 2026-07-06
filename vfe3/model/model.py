@@ -132,7 +132,7 @@ class VFEModel(nn.Module):
         # n_heads=1 (the (1, N, N) prior is squeezed to the (N, N) convention in
         # _attention_log_prior below).
         for _pname in ("beta_attention_prior", "gamma_attention_prior"):
-            if (getattr(cfg, _pname) in ("alibi", "causal_alibi")
+            if (getattr(cfg, _pname) in ("alibi", "causal_alibi", "causal_alibi_noself")
                     and cfg.n_heads != len(self.group.irrep_dims)):
                 raise ValueError(
                     f"{_pname}={getattr(cfg, _pname)!r} builds an (n_heads, N, N) prior but the "
@@ -156,6 +156,10 @@ class VFEModel(nn.Module):
             # set in-place each M-step by the closed-form barycenter (PriorBank.barycenter_r_,
             # driven from train_step) and so must stay ungrouped/requires_grad=False.
             learnable_r=cfg.learnable_r and cfg.r_update_mode == "gradient",
+            # Tier-1/Tier-2 decode toggles (2026-07-05; all default OFF, byte-identical):
+            unigram_kappa=cfg.unigram_kappa,
+            decode_unigram_prior=cfg.decode_unigram_prior,
+            untie_decode_bank=cfg.untie_decode_bank and cfg.use_prior_bank,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.
@@ -504,6 +508,7 @@ class VFEModel(nn.Module):
 
         *,
         e_step_gradient: str = "unroll",
+        prebuilt_transport: Optional[object] = None,   # share_refine_s_transport: shared flat transport from phi0
     ) -> 'tuple[torch.Tensor, torch.Tensor]':
         r"""Refine the model channel s by its own E-step toward the frozen hyper-prior r plus the
         gamma model-consensus, with the shared gauge frame phi0 held fixed (e_phi_lr=0). Returns the
@@ -568,7 +573,13 @@ class VFEModel(nn.Module):
             transport_mode="flat",
             e_step_gradient=e_step_gradient,
             oracle_unroll_grad=cfg.oracle_unroll_grad,
+            # Tier-1 transport perf toggles: the s-channel E-step shares the flat transport
+            # numerics with the belief channel (all default OFF/byte-identical).
+            transport_mean_per_head=cfg.transport_mean_per_head,
+            exp_fp64_mode=cfg.exp_fp64_mode,
+            exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
             log_prior=gamma_log_prior,
+            prebuilt_transport=prebuilt_transport,
         )
         return out.mu, out.sigma
 
@@ -667,11 +678,36 @@ class VFEModel(nn.Module):
         # below are protected separately (their inputs are .float()-ed; see _amp_off_context).
         amp = self._amp_context(token_ids.device)
         with run, amp:
+            shared_omega = None
+            if (self.cfg.share_refine_s_transport
+                    and self.cfg.transport_mode == "flat"
+                    and self.cfg.e_phi_lr == 0.0
+                    and rope is None):
+                # share_refine_s_transport (default OFF): the flat transport built inside _refine_s's
+                # E-step and the one built inside the belief E-step below consume the IDENTICAL phi
+                # (both hold it fixed at e_phi_lr=0), so ONE build serves both -- skipping a redundant
+                # matrix-exp pair (+ its backward) per forward, and per LAYER at n_layers > 1 (phi is
+                # loop-invariant when e_phi_lr==0). The rope gate matters: the belief channel folds
+                # gauge-RoPE into its own hoist while the s channel is deliberately un-rotated, so the
+                # two transports differ under pos_rotation='rope' and must not be shared. Outside the
+                # guard (non-flat / e_phi_lr>0 / rope) each e_step keeps its own authoritative build.
+                from vfe3.inference.e_step import build_belief_transport
+                shared_omega = build_belief_transport(
+                    beliefs.phi, self.group,
+                    transport_mode="flat",
+                    clamp_monitor=self.cfg.transport_clamp_monitor,
+                    # Tier-1 transport perf toggles: the shared build must carry the same island
+                    # keying / per-head mean flag the per-e_step hoists would have used.
+                    transport_mean_per_head=self.cfg.transport_mean_per_head,
+                    exp_fp64_mode=self.cfg.exp_fp64_mode,
+                    exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
+                )
             if self.cfg.s_e_step:
                 # Live model channel: refine s (phi0 fixed), then anchor the belief to it -- q0 and
                 # the belief prior (mu_p, sigma_p) both become the refined s1. The belief E-step
                 # self-couples to its prior every iteration, so s reaches mu_final even at n_e_steps=1.
-                s_mu1, s_sigma1 = self._refine_s(token_ids, beliefs.phi, e_step_gradient=e_step_gradient)
+                s_mu1, s_sigma1 = self._refine_s(token_ids, beliefs.phi, e_step_gradient=e_step_gradient,
+                                                 prebuilt_transport=shared_omega)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
             # Precision-weighted attention (default OFF): fold a DETACHED per-key reliability bias
             # -log(b0 + tr Sigma_j) into log_prior so attention down-weights high-variance keys before
@@ -680,6 +716,13 @@ class VFEModel(nn.Module):
             # reliability prior held across the E-step, NOT a per-iteration one (r2 id21). The shared
             # helper folds the SAME prior in diagnostics()/attention_maps() (r2 id22).
             log_prior = self._fold_precision_bias(log_prior, beliefs.sigma)
+            if self.cfg.gamma_as_beta_prior:
+                # Hierarchical attention prior (default OFF): fold the model channel's DETACHED
+                # posterior gamma_ij into the belief prior in PROBABILITY space,
+                # pi <- (1-w) softmax(B) + w gamma (h->s->p->q: models tell beliefs where to attend).
+                # Detached like the precision bias above, so the closed-form belief kernel stays
+                # exact; the forward's diagnostic replays do NOT refold this (forward-path only).
+                log_prior = self._fold_gamma_prior(log_prior, token_ids, beliefs.phi)
             # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
             # M-step self-coupling term in forward (manuscript: the self-term reads q*, not the
             # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.
@@ -693,7 +736,8 @@ class VFEModel(nn.Module):
                             e_step_gradient=e_step_gradient,
                             rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
                             rope_on_value=self.cfg.rope_on_value,
-                            capture=capture, grad_record=grad_rec)
+                            capture=capture, grad_record=grad_rec,
+                            prebuilt_transport=shared_omega)
         if estep_grad_out is not None:                           # one host sync, only when requested
             for _gk in ("mu", "sigma", "phi"):
                 _gv = grad_rec.get(_gk) if grad_rec is not None else None
@@ -796,16 +840,28 @@ class VFEModel(nn.Module):
                     # AND no (B,N,V,K,K) per-pair Cholesky workspace (decode_ce_full_chunked).
                     ce = self.prior_bank.decode_ce_full_chunked(
                         mu_final.float(), sigma_final.float(), targets,
+                        z_loss_weight=self.cfg.z_loss_weight,
+                    )
+                elif self.cfg.use_prior_bank and self.cfg.decode_mode == "expected_likelihood_chunked":
+                    # Expected-likelihood (Gaussian-convolution) readout: the fused CE twin of the
+                    # 'expected_likelihood_chunked' decode kernel (variances ADD, log N(mu_q; mu_v,
+                    # Sigma_q + Sigma_v)); routed explicitly since the generic bank branch below
+                    # assumes the diagonal-KL kernel.
+                    ce = self.prior_bank.decode_ce_expected_likelihood_chunked(
+                        mu_final.float(), sigma_final.float(), targets,
+                        z_loss_weight=self.cfg.z_loss_weight,
                     )
                 elif self.cfg.use_prior_bank:
                     ce = self.prior_bank.decode_ce_diagonal_chunked(
                         mu_final.float(), sigma_final.float(), targets,
+                        z_loss_weight=self.cfg.z_loss_weight,
                     )
                 else:
                     # linear decode; the chunked-CE path is rank-agnostic, so a '*_chunked'
                     # decode_mode (diagonal_chunked or full_chunked) both route here.
                     ce = self.prior_bank.decode_ce_linear_chunked(
                         mu_final.float(), targets,
+                        z_loss_weight=self.cfg.z_loss_weight,
                     )
             logits = None                                        # no (B, N, V) tensor on the fused path
         else:
@@ -1060,7 +1116,7 @@ class VFEModel(nn.Module):
         pb = self.prior_bank
         s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B, N, K)
         n_pos = token_ids.shape[1]
-        omega = build_belief_transport(phi, self.group, transport_mode="flat")
+        omega = build_belief_transport(phi, self.group, transport_mode="flat")   # Tier-1 transport toggles left at defaults: diagnostics exactness unaffected (values identical to round-off)
         s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
         s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
         e_s = pairwise_energy(
@@ -1374,6 +1430,66 @@ class VFEModel(nn.Module):
             kb = kb.unsqueeze(-2).unsqueeze(-2)                                   # (.., 1, 1, N)
         return kb if log_prior is None else log_prior + kb
 
+    def _fold_gamma_prior(
+        self,
+        log_prior: Optional[torch.Tensor],   # (N,N)/(H,N,N) belief log-prior (precision bias already folded), or None
+        token_ids: torch.Tensor,             # (B, N) integer token ids
+        phi:       torch.Tensor,             # (B, N, n_gen) gauge frame for the gamma TIED flat transport
+
+        *,
+        log_eps:   float = 1e-12,            # floor for log(pi) on the allowed support (free_energy's pattern)
+    ) -> torch.Tensor:                       # (B, [H,] N, N) mixed log-prior
+        r"""Hierarchical attention prior (cfg.gamma_as_beta_prior): fold the model channel's DETACHED
+        posterior gamma into the belief channel's attention prior in PROBABILITY space,
+
+            pi_ij = (1 - w) * softmax_j(B_ij) + w * gamma_ij,      w = cfg.gamma_prior_weight,
+            gamma_ij = softmax_j(B^s_ij - E^s_ij / tau_gamma)      (the _gamma_energy machinery),
+
+        and return log(pi). Rows renormalize by construction (a convex mixture of two row-normalized
+        distributions; the explicit renormalization below is an fp32 guard). Both channels share the
+        causal support (config validation pins lambda_gamma > 0 so the s tables exist), so pi is
+        EXACTLY 0 where the belief prior forbids; those entries are re-pinned to -inf rather than the
+        log_eps floor. gamma is computed under ``torch.no_grad`` (the detached-fixed-prior footprint
+        of ``_fold_precision_bias``): no gradient reaches the s tables through the belief prior, and
+        the closed-form belief kernel treats the fold as a fixed prior (exact). The mixture itself is
+        composed OUTSIDE the no_grad so ``log_prior``'s own graph (the learnable T5 bias) stays live.
+        An UNDETACHED variant -- training s through the belief attention -- is deliberately deferred.
+        """
+        from vfe3.free_energy import attention_weights
+        w = self.cfg.gamma_prior_weight
+        with torch.no_grad():
+            e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi)
+            gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)  # (B, [H,] N, N)
+        if log_prior is None:
+            pi_b    = torch.full_like(gamma, 1.0 / gamma.shape[-1])   # uniform prior over keys
+            support = None
+        else:
+            pi_b    = torch.softmax(log_prior, dim=-1)                # rows normalized on the causal support
+            support = torch.isfinite(log_prior)                       # shared causal mask (both channels)
+        pi  = (1.0 - w) * pi_b + w * gamma                            # probability-space mixture (rows sum to 1)
+        pi  = pi / pi.sum(dim=-1, keepdim=True).clamp(min=log_eps)    # renormalize (fp32 guard; already ~1)
+        out = torch.log(pi.clamp(min=log_eps))                        # (B, [H,] N, N)
+        if support is not None:
+            out = out.masked_fill(~support, float("-inf"))            # keep the EXACT -inf causal structure
+        return out
+
+    def _beta_tau(
+        self,
+        sigma: torch.Tensor,                 # (..., N, K) diag or (..., N, K, K) full belief covariance
+        mu:    torch.Tensor,                 # (..., N, K) belief means (rank reference: full iff sigma rank = mu rank + 1)
+        tau:   'float | torch.Tensor',       # base attention_tau (scalar or (H,))
+    ) -> 'float | torch.Tensor':
+        r"""The belief channel's effective softmax temperature for the diagnostic replays: the base
+        ``tau`` unchanged (cfg.query_adaptive_tau off -- byte-identical), or the per-query adaptive
+        tau_{i,h} = tau_h (1 + c tr_h(Sigma_i)/d_h) (``query_adaptive_tau``; DETACHED, from the
+        CURRENT belief sigma), matching what vfe_stack passes the forward E-step. The gamma model
+        channel keeps its scalar tau_gamma."""
+        if not self.cfg.query_adaptive_tau:
+            return tau
+        from vfe3.free_energy import query_adaptive_tau
+        sig = sigma if sigma.dim() == mu.dim() else sigma.diagonal(dim1=-2, dim2=-1)
+        return query_adaptive_tau(sig, tau, self.group.irrep_dims, c=self.cfg.query_tau_c)
+
     @torch.no_grad()
     def diagnostics(
         self,
@@ -1472,7 +1588,11 @@ class VFEModel(nn.Module):
             divergence_family=cfg.divergence_family,
             irrep_dims=self.group.irrep_dims,
         )
-        beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), self.group.irrep_dims), log_prior=log_prior)
+        # query_adaptive_tau (default OFF): _beta_tau returns the base tau unchanged, else the
+        # per-query tau from the CONVERGED belief sigma (the state this diagnostic scores).
+        _tau_b = self._beta_tau(out.sigma, out.mu,
+                                attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), self.group.irrep_dims))
+        beta = attention_weights(energy, tau=_tau_b, log_prior=log_prior)
         _q_conv = cap["converged"]                                   # q*: the F self-term reads the
         self_div = self_divergence_for_alpha(                        # pre-transform converged belief
             fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p),      # (matches the M-step term; F19)
@@ -1486,7 +1606,7 @@ class VFEModel(nn.Module):
         d = {"attn_entropy": float(metrics.attention_entropy(beta))}
         _lb = cfg.lambda_beta   # scaled-F total reflects lambda_beta
         terms = metrics.free_energy_terms(self_div, energy, beta, alpha,
-                                          tau=attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), self.group.irrep_dims),
+                                          tau=_tau_b,
                                           lambda_beta=_lb, log_prior=log_prior,
                                           include_attention_entropy=cfg.include_attention_entropy,
                                           alpha_reg=(alpha_reg if cfg.lambda_alpha_mode != "constant" else None))
@@ -1692,6 +1812,7 @@ class VFEModel(nn.Module):
         mu_p, sigma_p = belief.mu, belief.sigma
 
         rope = self._rope_rotation(n, token_ids.device)
+        _base_tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), self.group.irrep_dims)
         maps = []
         for _ in range(cfg.n_layers):
             belief = vfe_block(                                       # converged belief at this block
@@ -1705,6 +1826,10 @@ class VFEModel(nn.Module):
                 cg_coupling=self.cg_coupling,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
                 rope_on_value=cfg.rope_on_value,
+                # query_adaptive_tau replay fidelity: the ENTERING belief's per-query tau, exactly as
+                # vfe_stack passes the forward E-step; OFF path returns _base_tau (value-identical to
+                # the tau vfe_block would compute itself).
+                tau=self._beta_tau(belief.sigma, belief.mu, _base_tau),
             )
             # Attention at the converged belief, recomputed exactly as diagnostics does: the
             # transport regime is matched so regime_ii reads the means + learned connection_W
@@ -1733,7 +1858,8 @@ class VFEModel(nn.Module):
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
-            beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), self.group.irrep_dims), log_prior=log_prior)
+            beta = attention_weights(energy, tau=self._beta_tau(belief.sigma, belief.mu, _base_tau),
+                                     log_prior=log_prior)            # converged-belief tau (as diagnostics)
             if beta.dim() == 2:                                      # single-block group -> add an H=1 axis
                 beta = beta.unsqueeze(0)
             maps.append(beta)                                        # (H, N, N)
@@ -1809,8 +1935,12 @@ class VFEModel(nn.Module):
                 connection_M=getattr(self, "connection_M", None),
                 connection_L=getattr(self, "connection_L", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                # query_adaptive_tau replay fidelity: the ENTERING belief's per-query tau, exactly as
+                # vfe_stack passes the forward E-step; OFF path returns _tau (value-identical).
+                tau=self._beta_tau(belief.sigma, belief.mu, _tau),
                 capture=cap,
             )
+            _tau_c = self._beta_tau(belief.sigma, belief.mu, _tau)   # converged-belief tau (as diagnostics)
             omega = _transport(                                       # (N, N, K, K) under the ACTIVE regime
                 belief.phi, self.group, transport_mode=cfg.transport_mode,
                 mu=(belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
@@ -1835,7 +1965,7 @@ class VFEModel(nn.Module):
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
-            beta = attention_weights(energy, tau=_tau, log_prior=log_prior)
+            beta = attention_weights(energy, tau=_tau_c, log_prior=log_prior)
             _q = cap["converged"]                                    # self-term reads THIS block's prior (per-layer exact)
             self_div = self_divergence_for_alpha(
                 fam(_q.mu, _q.sigma), fam(mu_p, sigma_p),
@@ -1847,7 +1977,7 @@ class VFEModel(nn.Module):
                 b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device),
             )
             terms = metrics.free_energy_terms(
-                self_div, energy, beta, alpha, tau=_tau, lambda_beta=_lb, log_prior=log_prior,
+                self_div, energy, beta, alpha, tau=_tau_c, lambda_beta=_lb, log_prior=log_prior,
                 include_attention_entropy=cfg.include_attention_entropy,
                 alpha_reg=(alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
             )

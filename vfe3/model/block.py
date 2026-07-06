@@ -46,6 +46,7 @@ def vfe_block(
     tau:             'Optional[float | torch.Tensor]' = None,  # softmax temperature (precomputed by vfe_stack; None -> compute here)
     capture:         Optional[dict]            = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
     grad_record:     Optional[dict]            = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
+    prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: caller-built flat transport (None -> e_step builds its own)
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
@@ -82,6 +83,25 @@ def vfe_block(
         grad_record=grad_record,
         log_prior=log_prior,
         rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+        # Tier-1/Tier-2 toggles (2026-07-05; all default OFF/byte-identical). The iteration-only
+        # knobs (e_step_update/mm_damping/lambda_twohop/skip_belief_sigma_update/
+        # compile_pair_kernel) ride e_step's **kwargs into e_step_iteration AND the diagnostic
+        # free_energy_value (which accepts-and-ignores the iteration-only ones, and HONORS
+        # lambda_twohop in the logged F); the loop-control knobs bind explicitly on e_step.
+        # skip_belief_sigma_update is a BELIEF-channel toggle: _refine_s never passes it, so the
+        # s-channel sigma update is untouched.
+        e_step_update=cfg.e_step_update, mm_damping=cfg.mm_damping,
+        lambda_twohop=cfg.lambda_twohop,
+        skip_belief_sigma_update=cfg.skip_belief_sigma_update,
+        compile_pair_kernel=cfg.compile_pair_kernel,
+        transport_mean_per_head=cfg.transport_mean_per_head,
+        exp_fp64_mode=cfg.exp_fp64_mode,
+        exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+        randomize_e_steps=cfg.randomize_e_steps,
+        e_steps_min=cfg.e_steps_min, e_steps_max=cfg.e_steps_max,
+        e_steps_backprop_last=cfg.e_steps_backprop_last,
+        e_step_halt_tol=cfg.e_step_halt_tol,
+        prebuilt_transport=prebuilt_transport,
     )
     if capture is not None:
         # The CONVERGED variational belief q* -- what the E-step's F was minimized over,

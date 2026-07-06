@@ -33,11 +33,17 @@ class FactoredTransport:
     (byte-identical to ``compute_transport_operators``), so the unfused sandwich is unchanged.
 
     ``irrep_dims`` (equal blocks, length > 1) drives the per-head slicing of the diagonal cov.
+
+    ``mean_per_head`` (Tier-1 perf toggle, default False = byte-identical): when set,
+    ``transport_mean`` contracts each gauge block separately (``_factored_per_head_mean``, the
+    mean twin of the per-head diagonal cov) instead of the dense full-K einsum -- the same sum
+    with the exactly-zero off-block terms dropped, equal to fp32 reassociation.
     """
 
-    exp_phi:     torch.Tensor             # (..., N, K, K) exp(phi_i . G)
-    exp_neg_phi: torch.Tensor             # (..., N, K, K) exp(-phi_j . G)
-    irrep_dims:  List[int]                # equal block sizes; sum == K, len > 1
+    exp_phi:       torch.Tensor           # (..., N, K, K) exp(phi_i . G)
+    exp_neg_phi:   torch.Tensor           # (..., N, K, K) exp(-phi_j . G)
+    irrep_dims:    List[int]              # equal block sizes; sum == K, len > 1
+    mean_per_head: bool = False           # transport_mean contracts per gauge block (fp32 reassociation only)
 
     def to_dense_omega(self) -> torch.Tensor:
         r"""Rebuild the dense Omega_ij = exp(phi_i) exp(-phi_j) (..., N, N, K, K).
@@ -222,8 +228,10 @@ def _build_flat(
     group:      GaugeGroup,               # supplies generators, skew flag, irrep_dims
 
     *,
-    gauge_mode:    str  = "learned",      # 'learned' (Regime I flat) or 'trivial'
-    clamp_monitor: bool = False,          # opt-in: warn when the exp Frobenius clamp fires
+    gauge_mode:              str   = "learned",   # 'learned' (Regime I flat) or 'trivial'
+    exp_fp64_mode:           str   = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
+    exp_fp64_norm_threshold: float = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
+    clamp_monitor:           bool  = False,       # opt-in: warn when the exp Frobenius clamp fires
     **kwargs,                             # tolerated (a future non-flat builder shares this shape)
 ) -> TransportDict:
     r"""Flat (Regime I) phi-cocycle transport: the registered default.
@@ -233,7 +241,10 @@ def _build_flat(
     keyword args are tolerated and ignored so a future stateful non-flat (Regime II) builder can
     share this call shape without editing the registry call sites.
     """
-    return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
+    return compute_transport_operators(phi, group, gauge_mode=gauge_mode,
+                                       exp_fp64_mode=exp_fp64_mode,
+                                       exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                                       clamp_monitor=clamp_monitor)
 
 
 @register_transport("regime_ii", needs_mu=True)
@@ -724,16 +735,18 @@ def _direct_link_dense_bytes(batch: int, n_tok: int, k: int, dtype: torch.dtype)
 
 
 def stable_matrix_exp_pair(
-    matrix:         torch.Tensor,             # (..., d, d) Lie-algebra matrices
+    matrix:                  torch.Tensor,       # (..., d, d) Lie-algebra matrices
 
     *,
-    max_norm:       float           = 15.0,
-    dim_threshold:  int             = 20,
-    skew_symmetric: bool            = False,
-    only_forward:   bool            = False,
-    clamp_monitor:  bool            = False,   # opt-in: warn when the Frobenius clamp fires (host sync)
-    block_dims:     Optional[List[int]] = None,   # per-block sizes (sum==d) for a block-diagonal M
-    exp_dim:        Optional[int]       = None,   # dimension for the float64-island decision (None -> d)
+    exp_fp64_mode:           str                 = "dim",    # float64-island keying: 'dim' (dimension rule) | 'norm'
+    max_norm:                float               = 15.0,
+    exp_fp64_norm_threshold: float               = 5.0,      # 'norm' mode: upcast when max clamped block ||M||_F >= this
+    dim_threshold:           int                 = 20,
+    skew_symmetric:          bool                = False,
+    only_forward:            bool                = False,
+    clamp_monitor:           bool                = False,    # opt-in: warn when the Frobenius clamp fires (host sync)
+    block_dims:              Optional[List[int]] = None,     # per-block sizes (sum==d) for a block-diagonal M
+    exp_dim:                 Optional[int]       = None,     # dimension for the float64-island decision (None -> d)
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""exp(M) and optionally exp(-M) with Frobenius-norm clamp + float64 upcast.
 
@@ -762,6 +775,14 @@ def stable_matrix_exp_pair(
     whose conditioning argument lives at the BLOCK scale -- the regime_ii per-edge factor, whose
     delta is norm-capped upstream -- may pass ``exp_dim=max(block_dims)`` to run small blocks in
     fp32 instead of upcasting the whole batch to float64 at K >= dim_threshold.
+
+    ``exp_fp64_mode`` (Tier-1 toggle; default 'dim' = the long-standing dimension rule above,
+    untouched): 'norm' keys the float64 island on the max CLAMPED block Frobenius norm instead of
+    the dimension -- the conditioning argument for matrix_exp is a NORM argument (fp32 matrix_exp
+    is ~1e-7 accurate at the small block norms the phi retraction guarantees, at any block dim),
+    so small-norm blocks stay fp32 while the fp64 island stays REACHABLE for genuinely large
+    norms (upcast when max ||M_block||_F >= ``exp_fp64_norm_threshold``). Costs one host sync (a
+    scalar norm compare) per call; the clamp / monitor behavior above is identical in both modes.
     """
     # Global Frobenius clamp on the FULL matrix (one scale for all blocks) -- identical to the
     # un-blocked path, so block slicing below cannot change the operator. The norm/scale is kept
@@ -788,11 +809,33 @@ def stable_matrix_exp_pair(
 
     d = matrix.shape[-1]
     orig_dtype = matrix.dtype
-    # The full-K path's dtype choice; the per-block path forces the SAME dtype so a small block
-    # (d_head < dim_threshold) does not silently drop to float32 and drift from the full exp.
-    # exp_dim (when given) overrides the keying dimension -- see the docstring.
-    d_eff = exp_dim if exp_dim is not None else d
-    up_dtype = torch.float64 if d_eff >= dim_threshold else torch.float32
+    if exp_fp64_mode == "norm":
+        # Norm-keyed float64 island (Tier-1 toggle): upcast ONLY when the max CLAMPED block
+        # Frobenius norm reaches the threshold. Computed from the already-clamped matrices (the
+        # clamp above ran first), so the keying norm is the norm actually exponentiated; the
+        # island stays reachable for genuinely large norms. One host sync (the bool compare),
+        # opt-in by mode.
+        with torch.no_grad():
+            if block_dims is not None and len(block_dims) > 1:
+                start = 0
+                key_norm = matrix.new_zeros(())
+                for blk in block_dims:
+                    end = start + blk
+                    key_norm = torch.maximum(
+                        key_norm, matrix[..., start:end, start:end].norm(dim=(-2, -1)).max())
+                    start = end
+            else:
+                key_norm = (mat_norm * scale).max()      # clamped full-matrix norm (single block)
+        up_dtype = torch.float64 if bool(key_norm >= exp_fp64_norm_threshold) else torch.float32
+    elif exp_fp64_mode == "dim":
+        # 'dim': the long-standing dimension rule. The full-K path's dtype choice; the per-block
+        # path forces the SAME dtype so a small block (d_head < dim_threshold) does not silently
+        # drop to float32 and drift from the full exp. exp_dim (when given) overrides the keying
+        # dimension -- see the docstring.
+        d_eff = exp_dim if exp_dim is not None else d
+        up_dtype = torch.float64 if d_eff >= dim_threshold else torch.float32
+    else:
+        raise ValueError(f"exp_fp64_mode must be 'dim' or 'norm', got {exp_fp64_mode!r}")
 
     # Keyed to the TENSOR's device (audit 2026-07-05 m10): the old 'cuda' literal left the island
     # open under a CPU autocast context (torch.amp.autocast('cpu', bf16)), which _amp_context
@@ -868,8 +911,10 @@ def compute_transport_operators(
     group:      GaugeGroup,               # supplies generators, skew flag, irrep_dims
 
     *,
-    gauge_mode:    str  = "learned",      # 'learned' (Regime I flat) or 'trivial'
-    clamp_monitor: bool = False,          # opt-in: warn when the exp Frobenius clamp fires
+    gauge_mode:              str   = "learned",   # 'learned' (Regime I flat) or 'trivial'
+    exp_fp64_mode:           str   = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
+    exp_fp64_norm_threshold: float = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
+    clamp_monitor:           bool  = False,       # opt-in: warn when the exp Frobenius clamp fires
 ) -> TransportDict:
     r"""phi/exp transport Omega_ij = exp(phi_i) @ exp(-phi_j) in GL+(K).
 
@@ -919,6 +964,7 @@ def compute_transport_operators(
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
         phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims,
         exp_dim=(max(block_dims) if block_dims is not None else None),
+        exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
         clamp_monitor=clamp_monitor,
     )
     omega = torch.einsum("bikl,bjlm->bijkm", exp_phi, exp_neg_phi)
@@ -930,8 +976,11 @@ def build_factored_transport(
     group:      GaugeGroup,               # block-diagonal with equal blocks (len(irrep_dims) > 1)
 
     *,
-    gauge_mode:    str  = "learned",      # 'learned' (Regime I flat) or 'trivial'
-    clamp_monitor: bool = False,          # opt-in: warn when the exp Frobenius clamp fires
+    gauge_mode:              str   = "learned",   # 'learned' (Regime I flat) or 'trivial'
+    exp_fp64_mode:           str   = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
+    exp_fp64_norm_threshold: float = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
+    clamp_monitor:           bool  = False,       # opt-in: warn when the exp Frobenius clamp fires
+    mean_per_head:           bool  = False,       # container flag: transport_mean contracts per gauge block
 ) -> FactoredTransport:
     r"""Flat phi-cocycle transport in FACTORED form, skipping the dense (..., N, N, K, K) Omega.
 
@@ -949,7 +998,8 @@ def build_factored_transport(
         K = group.generators.shape[-1]
         eye_K = torch.eye(K, device=phi.device, dtype=phi.dtype)
         eye = eye_K.expand(*phi.shape[:-1], K, K).contiguous()
-        return FactoredTransport(exp_phi=eye, exp_neg_phi=eye, irrep_dims=list(group.irrep_dims))
+        return FactoredTransport(exp_phi=eye, exp_neg_phi=eye, irrep_dims=list(group.irrep_dims),
+                                 mean_per_head=mean_per_head)
     if gauge_mode != "learned":
         raise ValueError(f"gauge_mode must be 'learned' or 'trivial', got {gauge_mode!r}")
 
@@ -960,9 +1010,11 @@ def build_factored_transport(
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
         phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims,
         exp_dim=(max(block_dims) if block_dims is not None else None),
+        exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
         clamp_monitor=clamp_monitor,
     )
-    return FactoredTransport(exp_phi=exp_phi, exp_neg_phi=exp_neg_phi, irrep_dims=list(group.irrep_dims))
+    return FactoredTransport(exp_phi=exp_phi, exp_neg_phi=exp_neg_phi, irrep_dims=list(group.irrep_dims),
+                             mean_per_head=mean_per_head)
 
 
 def transport_mean(
@@ -979,7 +1031,10 @@ def transport_mean(
     are fused into the contraction -- compute m_j = exp(-phi_j) @ mu_j ONCE (B,N,K), then
     mu_t[i,j] = exp(phi_i) @ m_j -- an EXACT reassociation of the dense einsum (round-off level),
     never forming (B,N,N,K,K). Autograd-safe (differentiates through the live exps), so it survives
-    the smoothing-mode oracle if a container ever reaches it.
+    the smoothing-mode oracle if a container ever reaches it. When the container carries
+    ``mean_per_head=True`` (Tier-1 toggle, default False) the contraction runs per gauge block
+    instead (:func:`_factored_per_head_mean`, fp32 reassociation only); a RoPE-wrapped factored
+    base recurses through this same dispatch, so the toggle covers it too.
 
     ROPETRANSPORT path (``omega`` is a :class:`RopeTransport`): the gauge-RoPE rotation R(theta) is
     applied as R_i Omega_ij R_j^T mu_j -- pre-rotate the key mean by R_j^T, transport on the
@@ -992,6 +1047,8 @@ def transport_mean(
         t = transport_mean(omega.base, m)                             # (..., N, N, K)
         return torch.einsum("...ikl,...ijl->...ijk", omega.rope, t)   # post-rotate by R_i
     if isinstance(omega, FactoredTransport):
+        if omega.mean_per_head:
+            return _factored_per_head_mean(omega, mu)
         m = torch.einsum("...jlp,...jp->...jl", omega.exp_neg_phi, mu)  # (..., N, K): exp(-phi_j) @ mu_j
         return torch.einsum("...ikl,...jl->...ijk", omega.exp_phi, m)   # (..., N, N, K): exp(phi_i) @ m_j
     return torch.einsum("...ijkl,...jl->...ijk", omega, mu)
@@ -1073,6 +1130,36 @@ def transport_covariance(
     out = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
                        omega.double(), sigma.double(), omega.double())
     return out.to(sigma.dtype)
+
+
+def _factored_per_head_mean(
+    factored: FactoredTransport,
+    mu:       torch.Tensor,               # (..., N, K) source (key, index j) means
+) -> torch.Tensor:                        # (..., N, N, K) transported means
+    r"""Per-head mean transport from the factored exps (the mean twin of
+    ``_factored_diagonal_covariance``; cfg.transport_mean_per_head, Tier-1 perf toggle).
+
+    For each head h on coordinates [start:end] the block Omega^(h)_ij = exp(phi_i)^(h) exp(-phi_j)^(h)
+    is the only nonzero part of Omega on head h's rows (the off-block entries are exactly 0.0), so
+
+        mu_t[i,j]^(h) = exp(phi_i)^(h) ( exp(-phi_j)^(h) mu_j^(h) ),
+
+    and the full-K contraction equals the concatenation of the per-head (d, d) contractions -- the
+    same sum with the exactly-zero off-block terms dropped, ~H x fewer FLOPs on the dominant pair
+    GEMM. Equal to the dense-K einsum up to fp32 reassociation (pinned allclose atol 1e-6 by
+    tests/test_tier12_transport.py). Rank-agnostic via the leading ellipsis.
+    """
+    parts: List[torch.Tensor] = []
+    start = 0
+    for d in factored.irrep_dims:
+        end    = start + d
+        ep     = factored.exp_phi[..., start:end, start:end]       # (..., N, d, d) exp(phi_i)^(h)
+        en     = factored.exp_neg_phi[..., start:end, start:end]   # (..., N, d, d) exp(-phi_j)^(h)
+        mu_blk = mu[..., start:end]                                # (..., N, d)
+        m = torch.einsum("...jlp,...jp->...jl", en, mu_blk)        # (..., N, d): exp(-phi_j)^(h) mu_j^(h)
+        parts.append(torch.einsum("...ikl,...jl->...ijk", ep, m))  # (..., N, N, d): exp(phi_i)^(h) m_j
+        start = end
+    return torch.cat(parts, dim=-1)                                # (..., N, N, K)
 
 
 def _factored_diagonal_covariance(

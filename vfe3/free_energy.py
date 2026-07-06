@@ -31,7 +31,9 @@ def _broadcast_tau(tau: 'float | torch.Tensor', energy: torch.Tensor) -> 'float 
     (H, N, N) and batched (B, H, N, N) layouts. The reshape also moves tau onto the
     energy's device (no-op when already there): attention_tau builds a CPU (H,) tau
     when a SCALAR kappa meets unequal irrep dims, and this is the one funnel every
-    tau-consuming division passes through.
+    tau-consuming division passes through. A >= 2-d PER-QUERY tau (..., [H,] N, 1)
+    (``query_adaptive_tau``) also passes through unchanged: its trailing singleton key
+    axis already right-aligns against the (..., [H,] N, N) energy.
     """
     if isinstance(tau, torch.Tensor) and tau.dim() == 1:
         return tau.to(device=energy.device).reshape(tau.shape[0], 1, 1)
@@ -74,6 +76,41 @@ def attention_tau(
         kappa.dtype if isinstance(kappa, torch.Tensor) else torch.float32,
     )
     return kappa * sqrt_d
+
+
+def query_adaptive_tau(
+    sigma:      torch.Tensor,             # (..., N, K) DIAGONAL query-belief variances (detached here)
+    tau:        'float | torch.Tensor',   # base temperature: scalar or per-head (H,) (attention_tau)
+    irrep_dims: List[int],                # gauge-irrep block sizes; sum == K
+
+    *,
+    c:          float = 1.0,              # strength (cfg.query_tau_c); 0 -> the base tau on every row
+) -> torch.Tensor:                        # (..., N, 1) single-block or (..., H, N, 1) per-head tau_i
+    r"""Per-query adaptive softmax temperature (cfg.query_adaptive_tau):
+
+        tau_{i,h} = tau_h * (1 + c * tr_h(Sigma_i) / d_h),
+
+    tr_h the trace of query i's covariance over irrep block h (d_h = block size): an uncertain
+    query (large tr Sigma) runs a HOTTER softmax and hedges over keys; a confident one commits.
+    DETACHED state function of the CURRENT belief (``sigma`` is detached here), so no gradient
+    flows into the belief through the temperature and the closed-form belief kernel -- which
+    consumes tau only through beta = softmax_j(B - E/tau) -- stays exact. The returned per-row
+    tau carries a trailing singleton key axis so it broadcasts against the (..., [H,] N, N)
+    energy in ``attention_weights``/``log_partition``; ``reduced_free_energy`` squeezes that axis
+    against the (..., [H,] N) log-partition. Monotone increasing in tr Sigma for c > 0; at c = 0
+    it equals the base tau on every row (value-identical to the scalar path).
+    """
+    sig = sigma.detach()
+    if len(irrep_dims) == 1:
+        scale = 1.0 + c * sig.sum(dim=-1, keepdim=True) / float(irrep_dims[0])   # (..., N, 1)
+        return tau * scale
+    tr  = torch.stack([blk.sum(dim=-1)                                           # (..., H, N) per-block traces
+                       for blk in sig.split(list(irrep_dims), dim=-1)], dim=-2)
+    d_h = torch.tensor([float(d) for d in irrep_dims], device=sig.device, dtype=sig.dtype)
+    scale = (1.0 + c * tr / d_h.view(-1, 1)).unsqueeze(-1)                       # (..., H, N, 1)
+    if isinstance(tau, torch.Tensor) and tau.dim() == 1:                         # per-head (H,) base tau
+        return tau.to(device=sig.device).view(-1, 1, 1) * scale
+    return tau * scale
 
 
 _SQRT_D_CACHE: Dict[Tuple[Tuple[int, ...], str, torch.dtype], torch.Tensor] = {}
@@ -318,9 +355,14 @@ def reduced_free_energy(
     # Per-head (H,) tau must broadcast against lz (..., H, N): reshape to (H, 1) so it aligns
     # with the head axis at -2 of lz. (H,1) right-aligns correctly for both (H,N) and (B,H,N).
     # Scalar tau passes through unchanged. The .to() mirrors _broadcast_tau's device hop (a
-    # scalar-kappa x unequal-irrep-dims tau is born on CPU).
-    _tau = tau.to(device=lz.device).reshape(tau.shape[0], 1) \
-        if isinstance(tau, torch.Tensor) and tau.dim() == 1 else tau
+    # scalar-kappa x unequal-irrep-dims tau is born on CPU). A >= 2-d PER-QUERY tau
+    # (..., [H,] N, 1) (query_adaptive_tau) drops its singleton key axis to align with lz's rows.
+    if isinstance(tau, torch.Tensor) and tau.dim() == 1:
+        _tau = tau.to(device=lz.device).reshape(tau.shape[0], 1)
+    elif isinstance(tau, torch.Tensor) and tau.dim() >= 2:
+        _tau = tau.squeeze(-1)
+    else:
+        _tau = tau
     return -_tau * lz
 
 
@@ -333,6 +375,7 @@ def free_energy(
     tau:                       'float | torch.Tensor' = 1.0,
     lambda_beta:               'float | torch.Tensor' = 1.0,    # weight on the WHOLE belief-coupling block
     log_eps:                   float = 1e-12,                   # floor for log(beta)/log(pi) in the entropy term
+    lambda_twohop:             float = 0.0,                     # weight on the two-hop coupling block (0 = pure F)
     include_attention_entropy: bool  = True,
 
     log_prior:                 Optional[torch.Tensor] = None,   # (..., N, N) attention log-prior
@@ -351,7 +394,9 @@ def free_energy(
     untouched (no lambda inside the softmax), so beta = softmax(-E/tau) stays the stationary point of
     the scaled block and the envelope identity d/dtheta[lambda_beta (coupling+entropy)] =
     lambda_beta sum_j beta* dE/dtheta still holds -- keeping the analytic kernel (which scales its
-    pair term by lambda_beta) in agreement with autograd of this F. The hyper-prior lambda_h
+    pair term by lambda_beta) in agreement with autograd of this F. ``lambda_twohop`` (0.0 = pure)
+    adds the two-hop coupling block F_2 = lambda_2 sum_ik (beta beta)_ik E_ik with DETACHED hop
+    weights and no entropy term (see the guarded block below). The hyper-prior lambda_h
     KL(s||h) and model-coupling gamma KL(s_i||Omega s_j) are extension points, absent from this
     default path.
 
@@ -398,6 +443,17 @@ def free_energy(
         _tau_e = _broadcast_tau(tau, energy)          # (H,1,1) for per-head, scalar otherwise
         entropy = (_tau_e * (beta * (torch.log(beta.clamp(min=log_eps)) - log_pi))).sum()
         F = F + lambda_beta * entropy
+    if lambda_twohop != 0.0:
+        # Two-hop coupling block (cfg.lambda_twohop; 0.0 = OFF, pure canonical F):
+        #     F_2 = lambda_2 * sum_{i,k} W2_ik E_ik,   W2 = beta beta (per head, over the key axis),
+        # the beta-weighted two-step relaxation on the SAME pairwise energy grid (the flat cocycle
+        # composes exactly, Omega_ij Omega_jk = Omega_ik, so the existing (i,k) transported energies
+        # serve verbatim). W2 is DETACHED on both factors (the fixed hop-weight convention shared
+        # with the analytic kernel's pair term) and carries NO entropy term (W2 is a derived weight,
+        # not a variational row distribution with its own prior). The energy summed follows the
+        # coupling term's value-gauge selection above (identical on the coherent default path).
+        w2 = beta.detach() @ beta.detach()            # (..., [H,] N, N) hop weights W2_ik = sum_j b_ij b_jk
+        F = F + lambda_twohop * (w2 * (energy if coupling_energy is None else coupling_energy)).sum()
     if log_likelihood is not None:                              # observation/data term -E_q[log p(o|k)] (gated stub; no live caller)
         F = F - log_likelihood.sum()
     return F

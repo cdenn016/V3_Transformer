@@ -73,8 +73,8 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 100,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 4,
+    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 2,
     
     max_seq_len               = 128,                 # N, context length
     
@@ -114,7 +114,7 @@ config = dict(
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.008,
-    decode_mode               = 'diagonal_chunked',
+    decode_mode               = 'diagonal_chunked',   #"expected_likelihood_chunked"
     oracle_unroll_grad        = False,
     
     #################################
@@ -307,6 +307,62 @@ config = dict(
                                            # path: model is the last SGD iterate). ON: eval/best-save/final
                                            # model use the running average s <- ema_decay*s + (1-ema_decay)*theta
     ema_decay                 = 0.95,     # EMA decay in (0,1); only read when use_ema=True
+
+    ############################################################
+    #   Tier-1/Tier-2 improvement toggles (2026-07-05)
+    #   docs/2026-07-05-improvement-ideas.md -- ALL default OFF
+    #   (byte-identical to the pre-toggle build when left as-is)
+    ############################################################
+
+    # --- E-step update rule ---
+    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
+                                             # coordinate minimizer at frozen beta: precision fusion in ONE
+                                             # iteration, same cost; kernel route only)
+    mm_damping                = 1.0,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
+
+    # --- randomized-depth E-step (recurrent-depth recipe) ---
+    randomize_e_steps         = False,       # training forwards sample T ~ Uniform{e_steps_min..e_steps_max}
+    e_steps_min               = 1,
+    e_steps_max               = 4,
+    e_steps_backprop_last     = 0,           # truncated backprop: no_grad all but the last k iterations (0 = OFF)
+    e_step_halt_tol           = None,        # eval halting: break when mean KL(q^t||q^{t-1}) < tol (None = OFF)
+
+    # --- decode / objective ---
+    decode_unigram_prior      = False,       # add kappa*log pi_v (corpus unigram, data statistic) to decode logits
+    unigram_kappa             = 1.0,         # tempering on log pi_v (1.0 = exact Bayes class prior)
+    # decode_mode "expected_likelihood_chunked" is also new: sigma-aware Gaussian-convolution readout
+    # log N(mu_q; mu_v, Sigma_q + Sigma_v) -- select it above under use_prior_bank=True.
+    untie_decode_bank         = False,       # use_prior_bank=True only: decode reads its OWN cloned (V,K) tables
+    z_loss_weight             = 0.0,         # z-loss on the decode partition: w * mean(logsumexp^2) (0 = OFF)
+    sigma_weight_decay        = None,        # AdamW decay for log-variance tables (None = inherit weight_decay;
+                                             # 0.0 exempts sigma from the unintended log-sigma->0 pull)
+
+    # --- attention / coupling ---
+    gamma_as_beta_prior       = False,       # fold DETACHED gamma posterior into beta's prior (h->s->p->q);
+                                             # needs lambda_gamma > 0
+    gamma_prior_weight        = 0.5,         # mixture weight w in [0,1]: pi = (1-w) softmax(B) + w gamma
+    lambda_twohop             = 0.0,         # two-hop coupling F2 = lam2 sum_ik (beta@beta)_ik KL_ik (0 = OFF;
+                                             # exact composed transport, effective depth 2 at L=1)
+    query_adaptive_tau        = False,       # per-query tau_i = tau_h (1 + c tr_h Sigma_i / d_h), detached
+    query_tau_c               = 1.0,         # strength c >= 0 (read only when query_adaptive_tau=True)
+    # New attention priors (select above): "causal_noself" / "causal_alibi_noself" mask the E_ii ~ 0
+    # self-edge attention sink (diagonal -inf except (0,0)).
+
+    # --- training mechanics ---
+    grad_clip_per_role        = False,       # clip grads per role (mu/sigma/phi) instead of one global norm
+                                             # (global is phi-dominated and silently rescales other roles)
+    skip_belief_sigma_update  = False,       # skip the belief-channel sigma E-step update (dead-compute ablation
+                                             # for linear-decode configs; user asserts sigma has no consumer)
+
+    # --- compute reclamation (exactness-preserving perf; default OFF) ---
+    transport_mean_per_head   = False,       # per-head transport_mean einsum (~n_heads x fewer FLOPs, allclose 1e-6)
+    exp_fp64_mode             = "dim",       # "dim" (long-standing: fp64 when block dim >= 20) | "norm" (fp64 only
+                                             # when clamped ||M||_F >= exp_fp64_norm_threshold; d_head=25 blocks
+                                             # currently run fp64 PERMANENTLY under "dim")
+    exp_fp64_norm_threshold   = 5.0,         # "norm" mode threshold
+    share_refine_s_transport  = False,       # build the flat transport ONCE per forward, share s-refine + belief
+                                             # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
+    compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
 )
 
 # kl_max is the numerical safety-net clamp on EVERY divergence (KL(q||p), KL(s||r), pairwise energy),

@@ -590,6 +590,107 @@ class VFE3Config:
     # scope).
     amp_dtype:                 Optional[str] = None
 
+    # ------------------------------------------------------------------
+    # Tier-1/Tier-2 improvement toggles (2026-07-05 ideas doc; docs/2026-07-05-improvement-ideas.md).
+    # EVERY toggle below defaults OFF / byte-identical to the pre-toggle build; the pure path is
+    # the default. See the ideas doc for the math and the mechanism behind each.
+    # ------------------------------------------------------------------
+
+    # E-step update rule. 'gradient' (default, pure current path): one natural-gradient step per
+    # inner iteration. 'mm_exact': the closed-form MM/coordinate-exact minimizer of the beta-frozen
+    # majorizer F_hat = sum_i a_i KL(q_i||p_i) + lambda_beta sum_ij beta0_ij KL(q_i||Omega_ij q_j)
+    # -- precisions add, means fuse precision-weighted (harmonic-barycenter sigma*), a monotone
+    # F descent exact in ONE iteration at the same O(N^2 K) cost. KERNEL-ROUTE ONLY (filtering +
+    # gaussian_diagonal + renyi order 1 + attention entropy); rejected otherwise in __post_init__.
+    e_step_update:             str   = "gradient"     # "gradient" | "mm_exact"
+    # Damped mm_exact step theta <- (1-eta) theta + eta theta* (natural-coordinate mirror descent);
+    # 1.0 = the full exact coordinate minimizer. Read only under e_step_update='mm_exact'.
+    mm_damping:                float = 1.0
+
+    # Unigram log-prior decode (Bayes-correct class prior): add kappa*log pi_v to the decode logits,
+    # pi_v the corpus unigram frequency (a fixed DATA statistic, not a learned parameter -- pure).
+    # The table is set by train() from the training stream via PriorBank.set_unigram_log_prior();
+    # unset (all-zeros) it is a warned no-op. Applies to every decode path (bank KL and linear).
+    decode_unigram_prior:      bool  = False
+    unigram_kappa:             float = 1.0            # tempering on log pi_v (1.0 = exact Bayes rule)
+
+    # --- compute-reclamation package (exactness-preserving perf toggles, default OFF) ---
+    # Per-head (block-diagonal) transport_mean: contract each gauge block separately instead of the
+    # dense K-axis einsum (the off-blocks are exactly zero). Same sum, ~n_heads x fewer FLOPs on the
+    # dominant pair GEMM. Numerics: fp32 reassociation only (pinned allclose 1e-6).
+    transport_mean_per_head:   bool  = False
+    # fp64 island keying for stable_matrix_exp_pair. 'dim' (default): upcast when the block dim
+    # >= its dim_threshold (the long-standing rule). 'norm': upcast only when the clamped block
+    # Frobenius norm exceeds exp_fp64_norm_threshold -- the conditioning argument is a norm
+    # argument, not a dimension argument; small-norm blocks are fp32-accurate at any dim.
+    exp_fp64_mode:             str   = "dim"          # "dim" | "norm"
+    exp_fp64_norm_threshold:   float = 5.0            # 'norm' mode: upcast when max ||M||_F >= this
+    # Build the flat FactoredTransport ONCE per forward and share it between _refine_s and the
+    # belief E-step (both consume the identical phi); skips a redundant matrix-exp pair + backward.
+    share_refine_s_transport:  bool  = False
+    # Regional torch.compile on the closed-form pair kernel (static shapes; matrix_exp/eigh stay
+    # outside). Falls back to eager with a warning when the backend is unavailable (e.g. no triton).
+    compile_pair_kernel:       bool  = False
+
+    # --- randomized-depth E-step (train with stochastic T, eval with elastic T; default OFF) ---
+    # When True, each TRAINING forward samples T ~ Uniform{e_steps_min..e_steps_max} inner
+    # iterations (eval keeps the deterministic n_e_steps). Trains path independence so extra
+    # eval iterations help rather than diverge (recurrent-depth recipe, arXiv:2502.05171).
+    randomize_e_steps:         bool  = False
+    e_steps_min:               int   = 1
+    e_steps_max:               int   = 4
+    # Truncated backprop through the inner loop: run all but the last k iterations under no_grad
+    # (0 = OFF, full path per e_step_gradient). Applies to training forwards only.
+    e_steps_backprop_last:     int   = 0
+    # Eval-time halting: stop iterating when mean_i KL(q_i^t || q_i^{t-1}) < tol (closed form for
+    # the Gaussian family). None = OFF. Read only under torch.no_grad eval forwards.
+    e_step_halt_tol:           Optional[float] = None
+
+    # --- Tier-2 attention/coupling toggles ---
+    # Hierarchical attention prior: fold the model channel's DETACHED posterior gamma_ij into the
+    # belief channel's attention prior, pi_ij <- (1-w) softmax(B) + w gamma_ij (renormalized in
+    # probability space; w = gamma_prior_weight). Models tell beliefs where to attend (h->s->p->q).
+    # Requires lambda_gamma > 0 (the s tables and gamma energy must exist). Detached -> the
+    # closed-form kernel stays exact (same footprint as the precision bias).
+    gamma_as_beta_prior:       bool  = False
+    gamma_prior_weight:        float = 0.5            # mixture weight w in [0, 1]
+    # Two-hop coupling F_2 = lambda_twohop * sum_ik (beta beta)_ik KL(q_i||Omega_ik q_k) with
+    # DETACHED hop weights (beta@beta per head; exact composed transport under the flat cocycle,
+    # so the existing (i,k) transported moments serve verbatim). Effective depth 2 at L=1.
+    # 0.0 = OFF (pure canonical F).
+    lambda_twohop:             float = 0.0
+    # Per-query adaptive temperature tau_i = tau_h * (1 + query_tau_c * tr_h Sigma_i / d_h)
+    # (DETACHED state function): uncertain queries hedge, confident queries commit. The query-side
+    # dual of precision_weighted_attention (same detached footprint, same tr-Sigma gauge caveat
+    # under full GL).
+    query_adaptive_tau:        bool  = False
+    query_tau_c:               float = 1.0            # strength c >= 0 (0 = inert)
+
+    # --- Tier-2 decode/recipe toggles ---
+    # z-loss on the decode partition function: loss += z_loss_weight * mean_i (logsumexp_v logit)^2.
+    # Calibrates log Z ~ 0 so the decode is a normalized observation model (what -E_q[log p(o|x)]
+    # formally requires). The logsumexp is already materialized in every fused CE path. 0.0 = OFF.
+    z_loss_weight:             float = 0.0
+    # SEPARATE AdamW weight decay for the log-variance tables (sigma_log_embed, s_sigma_log,
+    # decode_log_scale). None = inherit the global weight_decay (the long-standing behavior --
+    # which decays log sigma toward 0, i.e. an unintended lognormal prior pinning sigma to 1
+    # against the configured sigma_init). Set 0.0 to exempt the sigma sector. Mirrors
+    # connection_weight_decay.
+    sigma_weight_decay:        Optional[float] = None
+    # Untied decode bank (use_prior_bank=True only): decode reads its OWN (V,K) mu/sigma tables,
+    # cloned from the encode tables at init (step-0 byte-identical) and trained separately. Isolates
+    # the tied-vs-untied confound in the linear-vs-bank comparison; still a KL-to-priors decode.
+    untie_decode_bank:         bool  = False
+    # Per-role gradient clipping: clip each optimizer role group (mu / sigma / phi / ...) to
+    # grad_clip separately instead of one GLOBAL norm over all parameters (which is dominated by
+    # phi_embed and silently rescales every other group when it binds). False = the pure
+    # long-standing global clip.
+    grad_clip_per_role:        bool  = False
+    # Skip the belief-channel sigma E-step update (gradient + retraction) entirely. OPT-IN
+    # dead-compute ablation for configs where q's sigma has no consumer (linear decode, no norms,
+    # no precision-weighted attention); NOT coerced from the config -- the user asserts deadness.
+    skip_belief_sigma_update:  bool  = False
+
     def __post_init__(self) -> None:
         # numerics
         if self.eps <= 0.0:
@@ -740,7 +841,7 @@ class VFE3Config:
             # the energy head axis is the number of irrep blocks; require they agree so the
             # (H, N, N) prior aligns with the (..., H, N, N) energy.
             for _pname in ("beta_attention_prior", "gamma_attention_prior"):
-                if (getattr(self, _pname) in ("alibi", "causal_alibi")
+                if (getattr(self, _pname) in ("alibi", "causal_alibi", "causal_alibi_noself")
                         and self.n_heads != len(_block_dims)):
                     raise ValueError(
                         f"{_pname}={getattr(self, _pname)!r} builds an (n_heads, N, N) prior but "
@@ -852,7 +953,7 @@ class VFE3Config:
             # single-block cross-coupled gauge itself still runs.
             import warnings
             for _pname in ("beta_attention_prior", "gamma_attention_prior"):
-                if getattr(self, _pname) in ("alibi", "causal_alibi"):
+                if getattr(self, _pname) in ("alibi", "causal_alibi", "causal_alibi_noself"):
                     raise ValueError(
                         f"{_pname}={getattr(self, _pname)!r} is incompatible with cross_couplings: an "
                         f"alibi prior builds an (n_heads, N, N) per-head bias, but cross-coupled "
@@ -1882,6 +1983,82 @@ class VFE3Config:
         # (train.py) -- a documented buildout -- so it is not enforced-rejected here (that would also
         # block the legitimate fp16 inference path that tests/test_amp.py pins).
         _require(self.amp_dtype, (None, "bf16", "fp16"), "amp_dtype")
+
+        # --- Tier-1/Tier-2 improvement toggles (2026-07-05) ---
+        _require(self.e_step_update, ("gradient", "mm_exact"), "e_step_update")
+        if self.e_step_update == "mm_exact":
+            # The closed-form MM minimizer is derived from the diagonal-Gaussian KL filtering
+            # kernel; every other route lacks the closed form (the same eligibility predicate as
+            # uses_kernel_route).
+            if _routes_to_oracle:
+                raise ValueError(
+                    "e_step_update='mm_exact' is kernel-route only (gradient_mode='filtering' + "
+                    "family='gaussian_diagonal' + divergence_family='renyi' + renyi_order=1.0 + "
+                    "include_attention_entropy=True, flat transport, coupled value gauge); this "
+                    "config routes the belief gradient to the autograd oracle."
+                )
+            if not (0.0 < self.mm_damping <= 1.0):
+                raise ValueError(f"mm_damping must be in (0, 1], got {self.mm_damping}")
+        if self.unigram_kappa < 0.0:
+            raise ValueError(f"unigram_kappa must be >= 0, got {self.unigram_kappa}")
+        _require(self.exp_fp64_mode, ("dim", "norm"), "exp_fp64_mode")
+        if self.exp_fp64_norm_threshold <= 0.0:
+            raise ValueError(
+                f"exp_fp64_norm_threshold must be > 0, got {self.exp_fp64_norm_threshold}"
+            )
+        if self.randomize_e_steps:
+            if not (1 <= self.e_steps_min <= self.e_steps_max):
+                raise ValueError(
+                    f"randomize_e_steps needs 1 <= e_steps_min <= e_steps_max, got "
+                    f"e_steps_min={self.e_steps_min}, e_steps_max={self.e_steps_max}"
+                )
+        if self.e_steps_backprop_last < 0:
+            raise ValueError(
+                f"e_steps_backprop_last must be >= 0 (0 = OFF), got {self.e_steps_backprop_last}"
+            )
+        if self.e_step_halt_tol is not None and self.e_step_halt_tol <= 0.0:
+            raise ValueError(
+                f"e_step_halt_tol must be > 0 or None, got {self.e_step_halt_tol}"
+            )
+        if self.gamma_as_beta_prior:
+            if self.lambda_gamma <= 0.0:
+                raise ValueError(
+                    "gamma_as_beta_prior=True requires lambda_gamma > 0 (the model-channel s "
+                    f"tables and gamma energy must exist), got lambda_gamma={self.lambda_gamma}"
+                )
+            if not (0.0 <= self.gamma_prior_weight <= 1.0):
+                raise ValueError(
+                    f"gamma_prior_weight must be in [0, 1], got {self.gamma_prior_weight}"
+                )
+        if self.lambda_twohop < 0.0:
+            raise ValueError(f"lambda_twohop must be >= 0, got {self.lambda_twohop}")
+        if self.query_tau_c < 0.0:
+            raise ValueError(f"query_tau_c must be >= 0, got {self.query_tau_c}")
+        if self.z_loss_weight < 0.0:
+            raise ValueError(f"z_loss_weight must be >= 0, got {self.z_loss_weight}")
+        if self.sigma_weight_decay is not None and (
+                self.sigma_weight_decay < 0.0
+                or self.sigma_weight_decay != self.sigma_weight_decay):
+            raise ValueError(
+                f"sigma_weight_decay must be >= 0 (and not NaN) or None, "
+                f"got {self.sigma_weight_decay}"
+            )
+        if self.untie_decode_bank and not self.use_prior_bank:
+            import warnings
+            warnings.warn(
+                "untie_decode_bank=True is inert under use_prior_bank=False (the linear decode is "
+                "already untied by construction); the toggle is read only by the KL-to-bank decode.",
+                UserWarning, stacklevel=2,
+            )
+        if self.skip_belief_sigma_update and self.use_prior_bank:
+            import warnings
+            warnings.warn(
+                "skip_belief_sigma_update=True with use_prior_bank=True: the KL decode READS "
+                "sigma_q, so skipping the belief sigma update changes predictions (sigma stays at "
+                "encode). This toggle is meant for configs where q's sigma is dead (linear decode, "
+                "no norms).",
+                UserWarning, stacklevel=2,
+            )
 
     @property
     def tau(self) -> float:

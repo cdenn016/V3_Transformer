@@ -137,11 +137,24 @@ def build_optimizer(
     if nat:
         phi_group["gauge"] = True
         phi_group["weight_decay"] = 0.0
+    # sigma_weight_decay (default None = inherit the global weight_decay, the long-standing
+    # behavior): a dedicated AdamW decay for the log-variance tables. The global decay pulls
+    # log sigma toward 0 (sigma toward 1) -- an unintended lognormal prior fighting the configured
+    # sigma_init on the KL-decode path; sigma_weight_decay=0.0 exempts the sigma sector. Applied to
+    # every sigma-role CAPACITY table (belief, s-channel, untied decode); the centroid r_sigma_log
+    # keeps its existing hard 0.0 exemption.
+    sigma_wd = {} if cfg.sigma_weight_decay is None else {"weight_decay": cfg.sigma_weight_decay}
     groups = [
         {"params": [pb.mu_embed],                              "lr": cfg.m_p_mu_lr,    "role": "mu"},
-        {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_p_sigma_lr, "role": "sigma"},
+        {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd},
         phi_group,
     ]
+    if getattr(pb, "decode_mu_embed", None) is not None:        # untie_decode_bank=True decode tables
+        # Cloned from the encode tables at init (step-0 byte-identical decode), trained separately so
+        # the decode direction can decouple from the E-step prior/self-coupling target; grouped like
+        # the tables they were cloned from (mean@m_p_mu_lr, log-scale@m_p_sigma_lr).
+        groups.append({"params": [pb.decode_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu"})
+        groups.append({"params": [pb.decode_sigma_log_embed], "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd})
     if pb.output_proj_weight is not None:                       # use_prior_bank=False linear decode
         groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_p_mu_lr, "role": "mu"})
     if pb.output_proj_bias is not None:                         # decode_bias: learned log-unigram prior
@@ -166,7 +179,7 @@ def build_optimizer(
         groups.append(pos_group)
     if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (lambda_gamma>0 or
         groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu"})    # prior_source=model_channel):
-        groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_p_sigma_lr, "role": "sigma"})  # mean@m_p_mu_lr, log-scale@
+        groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd})  # mean@m_p_mu_lr, log-scale@
         # m_p_sigma_lr, mirroring the belief tables. s is the model channel / (under model_channel) the
         # live belief prior, so it must train. The hyper-prior CENTROID r is grouped only when
         # learnable_r un-freezes it (next block); FROZEN-by-default r (requires_grad=False, prior_bank.py)
@@ -489,7 +502,19 @@ def train_step(
         metrics_out["step_skipped"] = float(skip_step)
         metrics_out["grad_finite"]  = float(grad_finite)
     if grad_clip is not None and grad_clip > 0 and not skip_step:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if getattr(model.cfg, "grad_clip_per_role", False):
+            # Per-role clipping (default OFF): the global L2 norm below is dominated by phi_embed
+            # (V x n_gen, the bulk of all parameters), so when it binds it silently rescales every
+            # OTHER role's effective LR by a phi-noise-coupled factor -- the kl_max silent-bind
+            # pattern. Clip each role's parameter set to grad_clip separately instead (the roles
+            # partition the optimizer groups; see build_optimizer).
+            role_params: dict = {}
+            for _g in optimizer.param_groups:
+                role_params.setdefault(_g.get("role", "other"), []).extend(_g["params"])
+            for _ps in role_params.values():
+                torch.nn.utils.clip_grad_norm_(_ps, grad_clip)
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     if skip_step:
         optimizer.zero_grad(set_to_none=True)                # drop poisoned grads; do NOT step AdamW
     else:
@@ -780,6 +805,23 @@ def train(
             optimizer, _floor_lr_lambdas(base_lrs, cfg), last_epoch=start_step - 1)
     else:
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _floor_lr_lambdas(base_lrs, cfg))
+    # Unigram log-prior decode (cfg.decode_unigram_prior, default OFF): fill the PriorBank's
+    # unigram table from the TRAINING stream once, before the loop -- a fixed data statistic
+    # (add-one-smoothed log frequencies), not a learned parameter. The counts come from the
+    # loader's TokenWindows dataset (its flat token stream); a loader without one warns and
+    # leaves the table unset (the decode then warns once and is a value no-op).
+    if cfg.decode_unigram_prior:
+        _tok = getattr(getattr(loader, "dataset", None), "tokens", None)
+        if _tok is not None:
+            _counts = torch.bincount(_tok.reshape(-1), minlength=cfg.vocab_size).to(torch.float32)
+            model.prior_bank.set_unigram_log_prior(_counts.to(device))
+        else:
+            import warnings
+            warnings.warn(
+                "decode_unigram_prior=True but the training loader exposes no flat token stream "
+                "(loader.dataset.tokens); the unigram table stays unset (decode warns, value "
+                "no-op). Call model.prior_bank.set_unigram_log_prior(counts) manually.",
+                UserWarning, stacklevel=2)
     losses: List[float] = []
     model.train()
     logger = logger or logging.getLogger(__name__)

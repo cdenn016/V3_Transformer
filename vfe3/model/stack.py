@@ -21,7 +21,7 @@ import torch
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup
-from vfe3.free_energy import attention_tau
+from vfe3.free_energy import attention_tau, query_adaptive_tau
 from vfe3.model.block import _as_coeff, vfe_block
 
 
@@ -47,6 +47,7 @@ def vfe_stack(
     rope_on_value:   bool                      = True,   # False -> value aggregation uses the un-rotated base
     capture:         Optional[dict]            = None,   # out-param: LAST block's converged (pre-transform) belief under 'converged'
     grad_record:     Optional[dict]            = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
+    prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: one flat transport shared across blocks (valid: e_phi_lr==0 + flat, phi loop-invariant)
 ) -> BeliefState:
     r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior.
 
@@ -64,14 +65,27 @@ def vfe_stack(
     # across layers -- so computing it once here and passing it as tau avoids L redundant calls.
     tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims)
     for _ in range(cfg.n_layers):
+        # Per-query adaptive temperature (cfg.query_adaptive_tau, default OFF): rescale the hoisted
+        # per-head tau by the DETACHED uncertainty trace of the belief ENTERING this block,
+        # tau_i,h = tau_h (1 + c tr_h(Sigma_i)/d_h) -- the query-side dual of the detached precision
+        # key bias, and like that bias it is held fixed across the block's inner E-step iterations
+        # (recomputed per BLOCK from the current belief, not per inner iteration). OFF path: tau_b
+        # IS the hoisted scalar/(H,) tau, byte-identical.
+        if cfg.query_adaptive_tau:
+            sig   = belief.sigma if belief.sigma.dim() == belief.mu.dim() \
+                else belief.sigma.diagonal(dim1=-2, dim2=-1)     # full cov -> per-coordinate variances
+            tau_b = query_adaptive_tau(sig, tau, group.irrep_dims, c=cfg.query_tau_c)
+        else:
+            tau_b = tau
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
                            lambda_beta=lambda_beta,
                            connection_W=connection_W, connection_M=connection_M,
                            connection_L=connection_L,
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,
-                           rope_on_value=rope_on_value, tau=tau,
-                           capture=capture, grad_record=grad_record)   # each block overwrites; last wins
+                           rope_on_value=rope_on_value, tau=tau_b,
+                           capture=capture, grad_record=grad_record,   # each block overwrites; last wins
+                           prebuilt_transport=prebuilt_transport)      # phi is loop-invariant when e_phi_lr==0
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
     return belief
