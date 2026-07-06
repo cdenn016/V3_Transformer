@@ -225,7 +225,12 @@ config = dict(
     
     kappa_beta                = 1, #[1, 0.5],        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
     kappa_gamma               = 1, #[1, 0.5],        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
-        
+
+    learnable_kappa_beta      = False,       # learn per-head kappa_beta = exp(log_kappa_beta), init from kappa_beta above
+                                             # (t5-exception family; freezes under detach/straight_through E-step)
+    learnable_kappa_gamma     = False,       # learn per-head kappa_gamma (trains under any estimator on the scored
+                                             # lambda_gamma>0 path; under s_e_step needs an 'unroll' E-step)
+
     beta_attention_prior      = "causal_alibi_noself",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
     gamma_attention_prior     = "causal_alibi_noself",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
@@ -338,7 +343,7 @@ config = dict(
                                              # 0.0 exempts sigma from the unintended log-sigma->0 pull)
 
     # --- attention / coupling ---
-    gamma_as_beta_prior       = False,       # fold DETACHED gamma posterior into beta's prior (h->s->p->q);
+    gamma_as_beta_prior       = True,       # fold DETACHED gamma posterior into beta's prior (h->s->p->q);
                                              # needs lambda_gamma > 0
     gamma_prior_weight        = 0.5,         # mixture weight w in [0,1]: pi = (1-w) softmax(B) + w gamma
     lambda_twohop             = 0.0,         # two-hop coupling F2 = lam2 sum_ik (beta@beta)_ik KL_ik (0 = OFF;
@@ -351,7 +356,7 @@ config = dict(
     # --- training mechanics ---
     grad_clip_per_role        = False,       # clip grads per role (mu/sigma/phi) instead of one global norm
                                              # (global is phi-dominated and silently rescales other roles)
-    skip_belief_sigma_update  = False,       # skip the belief-channel sigma E-step update (dead-compute ablation
+    skip_belief_sigma_update  = True,       # skip the belief-channel sigma E-step update (dead-compute ablation
                                              # for linear-decode configs; user asserts sigma has no consumer)
 
     # --- compute reclamation (exactness-preserving perf; default OFF) ---
@@ -359,8 +364,8 @@ config = dict(
     exp_fp64_mode             = "dim",       # "dim" (long-standing: fp64 when block dim >= 20) | "norm" (fp64 only
                                              # when clamped ||M||_F >= exp_fp64_norm_threshold; d_head=25 blocks
                                              # currently run fp64 PERMANENTLY under "dim")
-    exp_fp64_norm_threshold   = 5.0,         # "norm" mode threshold
-    share_refine_s_transport  = False,       # build the flat transport ONCE per forward, share s-refine + belief
+    exp_fp64_norm_threshold   = 15.0,         # "norm" mode threshold
+    share_refine_s_transport  = True,       # build the flat transport ONCE per forward, share s-refine + belief
                                              # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
     compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
 )
