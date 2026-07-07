@@ -812,7 +812,7 @@ def e_step(
             _hoisted_omega = build_belief_transport(
                 belief.phi, group,
                 transport_mode="flat",
-                gauge_mode=kwargs.get("gauge_mode", "learned"),
+                gauge_mode="learned",   # not an e_step kwarg (no **kwargs sink downstream); literal, not a dead kwargs read (m14)
                 clamp_monitor=kwargs.get("clamp_monitor", False),
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,

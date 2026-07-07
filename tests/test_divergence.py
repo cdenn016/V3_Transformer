@@ -647,4 +647,4 @@ def test_model_forward_under_new_divergence(name):
     _, loss, _ = model(tokens, targets)
     assert loss.shape == () and torch.isfinite(loss)
     loss.backward()
-    assert model.prior_bank.mu_embed.grad is not None or model.prior_bank.output_proj_weight.grad is not None
+    assert model.prior_bank.mu_embed.grad is not None   # belief/prior table must get gradient (t7: was a weak OR)

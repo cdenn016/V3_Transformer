@@ -43,6 +43,16 @@ def test_belief_bank_collects_all_components():
     assert torch.equal(bank["token_ids"], tokens.reshape(-1))
 
 
+def test_numerical_health_under_rope_does_not_raise():
+    # m5: numerical_health used RopeTransport without importing it -> NameError under pos_rotation='rope',
+    # which report.py's _safe silently swallowed (blank health panel). Assert it returns the dict instead.
+    model = _model(n_layers=1, pos_rotation="rope")
+    tok = torch.randint(0, 20, (1, 5))
+    health = numerical_health(model, tok)
+    for k in ("nan_mu", "nan_sigma", "nan_phi", "nan_energy", "nan_beta", "max_condition"):
+        assert k in health
+
+
 def test_e_step_belief_trace_captures_trajectory():
     model = _model()
     tokens = torch.randint(0, 20, (1, 5))

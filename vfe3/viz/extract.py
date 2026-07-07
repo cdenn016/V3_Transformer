@@ -404,6 +404,7 @@ def numerical_health(
     left to a future pass.)
     """
     from vfe3.numerics import condition_number, nan_inf_fraction
+    from vfe3.geometry.transport import RopeTransport   # m5: used below under pos_rotation='rope' (was NameError)
     cfg = model.cfg
     belief, log_prior, rope = _encode_one(model, token_ids)
     ikw = _iter_kwargs(model, log_prior, rope)

@@ -1937,6 +1937,7 @@ def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
         order = sorted(range(len(numeric)), key=lambda k: numeric[k])
         ax.plot([numeric[k] for k in order], [ppls[k] for k in order], "o-", lw=2, ms=7)
         ax.set_xlabel(sweep_dir.name)
+        ax.set_ylabel("validation PPL")            # numeric line plot: PPL on the y-axis
     else:
         order = sorted(range(len(ppls)), key=lambda k: ppls[k])
         ax.barh(range(len(order)), [ppls[k] for k in order],
@@ -1944,7 +1945,7 @@ def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
         ax.set_yticks(range(len(order)))
         ax.set_yticklabels([labels[k] for k in order])
         ax.invert_yaxis()
-    ax.set_ylabel("validation PPL")
+        ax.set_xlabel("validation PPL")            # horizontal bars: PPL on the x-axis (m30)
     ax.set_title(sweep_dir.name)
     fig.tight_layout()
     fig_dir.mkdir(exist_ok=True)

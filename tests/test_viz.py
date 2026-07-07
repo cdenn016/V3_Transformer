@@ -62,6 +62,7 @@ def test_set_publication_style_runs():
 
 
 def test_clustering_metrics_separated_blobs():
+    pytest.importorskip("sklearn")   # t4: optional dep -> skip (not hard-fail) when absent
     g = torch.Generator().manual_seed(0)
     a = torch.randn(30, 4, generator=g)
     b = torch.randn(30, 4, generator=g) + 8.0                  # well separated
@@ -325,6 +326,7 @@ def test_plot_belief_umap_fallback_no_decode(tmp_path):
 
 
 def test_plot_belief_category_separation_saves(tmp_path):
+    pytest.importorskip("sklearn")   # t4: optional dep -> skip (not hard-fail) when absent
     bank, decode = _category_bank()
     p = tmp_path / "f5c.png"
     fig = plot_belief_category_separation(bank, decode=decode, sil_sample=50, path=str(p)); plt.close(fig)
@@ -346,6 +348,7 @@ def test_token_category_helpers():
 
 
 def test_cluster_embedding_and_lift_labels():
+    pytest.importorskip("sklearn")   # t4: optional dep -> skip (not hard-fail) when absent
     # the belief-UMAP redesign clusters the embedding and labels each cluster by DISTINCTIVE (lift)
     # tokens, not raw frequency: a global stopword present in every cluster must not dominate the labels.
     import numpy as np

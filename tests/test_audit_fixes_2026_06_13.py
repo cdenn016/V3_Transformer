@@ -20,7 +20,7 @@ from vfe3.geometry.lie_ops import embed_phi, extract_phi, gram_pinv
 
 # ----------------------------------------------------------------------------- DA-P2a
 def test_gram_pinv_is_cached_and_value_identical():
-    g = get_group("block_glk")(140, 7)                       # active-config shape (K=140, d_head=20)
+    g = get_group("block_glk")(4, 2)                         # tiny CPU shape (K=4, d_head=2); Gram=I holds at any K
     a = g.gram_pinv()
     b = g.gram_pinv()
     assert a is b                                            # cached: same object on repeat
