@@ -224,6 +224,7 @@ def test_finalize_run_writes_test_results_and_figures(tmp_path):
     assert (tmp_path / "run" / "val_ppl.png").exists()
     summary = json.loads((tmp_path / "run" / "summary.json").read_text())
     assert "test_ppl" in summary and "best_val_ppl" in summary
+    assert "reloaded_best" in summary   # m26: surface whether best_model.pt was reloaded (cross-dir resume honesty)
 
 
 def test_metrics_csv_includes_gauge_geometry_columns(tmp_path):

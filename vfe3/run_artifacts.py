@@ -767,6 +767,7 @@ def finalize_run(
         "n_params":     n_params,
         "best_val_ppl": best_val_ppl,
         "best_step":    artifacts.best_step,
+        "reloaded_best": results.get("reloaded_best"),   # m26: False on a cross-run-dir resume whose best_model.pt is elsewhere
         "test_ppl":     results.get("test_ppl"),
         "test_ce":      results.get("test_ce"),
         "test_bpc":     results.get("test_bpc"),
