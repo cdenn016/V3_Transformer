@@ -955,6 +955,14 @@ class VFEModel(nn.Module):
                 n_valid = (flat_targets != -100).sum().clamp_min(1)
                 ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100,
                                      reduction="sum") / n_valid
+                # z-loss (m20): the four fused chunked kernels add w * mean(logsumexp^2); the dense
+                # branch dropped it, so z_loss_weight>0 was silently inert on the default diagonal/full
+                # decode. Mirror the chunked formula with the same clamped n_valid; the >0 guard keeps
+                # the default (0.0) byte-identical.
+                if self.cfg.z_loss_weight > 0.0:
+                    valid = (flat_targets != -100).to(flat_logits.dtype)
+                    lse = torch.logsumexp(flat_logits, dim=-1)
+                    ce = ce + self.cfg.z_loss_weight * (lse ** 2 * valid).sum() / n_valid
         loss = ce
         if self.cfg.mass_phi > 0.0:
             # M-step gauge-frame penalty (manuscript Algorithm 1 M-step loss): regularizes the

@@ -276,3 +276,26 @@ def test_z_loss_expected_likelihood_matches_dense_lse():
                                                    z_loss_weight=w)
     lse = pb.decode(mu_q, sigma_q).logsumexp(-1)
     assert torch.allclose(cew, ce0 + w * (lse ** 2).mean(), atol=1e-5)
+
+
+def test_z_loss_applied_on_dense_decode():
+    # m20: z_loss must add the logsumexp^2 penalty on the DENSE (non-chunked) decode path too, not
+    # only the four fused chunked kernels. decode_mode="diagonal" routes through VFEModel's dense branch.
+    from vfe3.model.model import VFEModel
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1,
+                     decode_mode="diagonal", use_prior_bank=True, mass_phi=0.0, z_loss_weight=0.0)
+    model = VFEModel(cfg).to(DEVICE)
+    x = torch.randint(0, 12, (2, 6), device=DEVICE)
+    y = torch.randint(0, 12, (2, 6), device=DEVICE)
+    logits, loss0, _ = model(x, y)
+    assert logits is not None                                    # dense path returns (B, N, V) logits
+    V = cfg.vocab_size
+    lse = torch.logsumexp(logits.reshape(-1, V).float(), dim=-1)
+    valid = (y.reshape(-1) != -100).to(lse.dtype)
+    w = 0.5
+    expected = w * (lse ** 2 * valid).sum() / valid.sum().clamp(min=1)
+    model.cfg.z_loss_weight = w
+    _, loss_w, _ = model(x, y)
+    assert loss_w > loss0                                        # RED pre-fix: dense branch ignored z-loss
+    assert torch.allclose(loss_w - loss0, expected, atol=1e-5)
