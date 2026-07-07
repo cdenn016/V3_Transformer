@@ -252,6 +252,36 @@ def test_converged_state_beta_tracks_learned_kappa():
     assert not torch.allclose(beta_learned, beta_init)
 
 
+def test_training_logs_per_block_kappa_and_tau(tmp_path):
+    # Per-block companion to the aggregate mean/var above: one kappa_<ch>_b<i> and one
+    # tau_<ch>_b<i> = kappa_b * sqrt(d_b) column per irrep block, so finalize_run can draw a
+    # line per block in each of the kappa/tau panels.
+    from vfe3.run_artifacts import RunArtifacts
+    from vfe3.train import train
+
+    torch.manual_seed(0)
+    cfg = _cfg(learnable_kappa_beta=True, learnable_kappa_gamma=True, lambda_gamma=0.1,
+               max_steps=2, log_interval=1)              # block_glk, n_heads=2 -> 2 irrep blocks
+    model = VFEModel(cfg)
+    assert model.log_kappa_beta.shape == (2,)            # multi-block precondition for this test
+    dims = model.group.irrep_dims
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic", device="cpu")
+    train(model, [_batch(1), _batch(2)], cfg, n_steps=2, log_interval=1, eval_interval=0,
+          artifacts=art, generate_samples=False)
+    with open(tmp_path / "run" / "metrics.csv", newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows
+    for ch in ("beta", "gamma"):
+        for bi in range(2):
+            for key in (f"kappa_{ch}_b{bi}", f"tau_{ch}_b{bi}"):
+                assert key in rows[0], f"{key} missing from metrics.csv"
+                assert rows[0][key] not in ("", "nan", None)
+    for bi in range(2):                                  # tau_b == kappa_b * sqrt(d_b)
+        kb = float(rows[0][f"kappa_beta_b{bi}"])
+        tb = float(rows[0][f"tau_beta_b{bi}"])
+        assert tb == pytest.approx(kb * float(dims[bi]) ** 0.5, rel=1e-5)
+
+
 # --- optimizer wiring ----------------------------------------------------------
 
 def test_optimizer_grouping():

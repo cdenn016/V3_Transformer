@@ -85,6 +85,16 @@ def test_kappa_history_renders_with_variance_band():
     fig = figs.plot_kappa_history(h, channel="beta"); assert fig is not None; plt.close(fig)
 
 
+def test_kappa_block_trajectory_renders_per_block_kappa_and_tau():
+    # Per-block 2x2 grid (kappa/tau x beta/gamma), one line per irrep block.
+    h = {"step": [1, 2, 3],
+         "kappa_beta_b0": [1.0, 1.1, 1.2], "kappa_beta_b1": [1.0, 0.9, 0.8],
+         "tau_beta_b0":   [1.4, 1.5, 1.7], "tau_beta_b1":   [1.4, 1.3, 1.1],
+         "kappa_gamma_b0": [1.0, 1.05, 1.1], "kappa_gamma_b1": [1.0, 0.95, 0.9],
+         "tau_gamma_b0":   [1.4, 1.5, 1.6], "tau_gamma_b1":   [1.4, 1.35, 1.25]}
+    fig = figs.plot_kappa_block_trajectory(h); assert fig is not None; plt.close(fig)
+
+
 def test_ppl_offset_renders():
     pts = [{"embed_dim": k, "ppl_mean": 50.0 / k + 12.0, "ppl_sem": 0.3, "n_seeds": 3}
            for k in (8, 16, 32, 64)]
@@ -227,6 +237,23 @@ def test_offset_power_law_honors_weights():
     assert fit_uniform["form"] == "offset_power_law" and fit_downwt["form"] == "offset_power_law"
     assert abs(fit_uniform["alpha"] - fit_downwt["alpha"]) > 1e-4   # weights must change the fit
 
+
+def test_save_figures_emits_kappa_block_trajectory(tmp_path):
+    torch.manual_seed(0)
+    cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2,
+                     learnable_kappa_beta=True, learnable_kappa_gamma=True, lambda_gamma=0.1)
+    model = VFEModel(cfg).to(DEVICE)
+    art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
+    art.history = [
+        {"step": s,
+         "kappa_beta_b0": 1.0 + 0.05 * s, "kappa_beta_b1": 1.0 - 0.02 * s,
+         "tau_beta_b0":   1.4 + 0.05 * s, "tau_beta_b1":   1.4 - 0.02 * s,
+         "kappa_gamma_b0": 1.2 + 0.04 * s, "kappa_gamma_b1": 1.2 - 0.01 * s,
+         "tau_gamma_b0":   1.6 + 0.04 * s, "tau_gamma_b1":   1.6 - 0.01 * s}
+        for s in range(1, 5)
+    ]
+    _save_figures(art, None, logging.getLogger("test"))
+    assert (tmp_path / "kappa_block_trajectory.png").exists()
 
 # --------------------------------------------------------------------------- pure-path certificate
 
