@@ -161,6 +161,27 @@ def test_gamma_fold_changes_forward():
     assert not torch.allclose(l_off, l_on)                   # the folded prior is load-bearing
 
 
+def test_gamma_prior_folded_in_diagnostic_replays():
+    # m4: under gamma_as_beta_prior the forward folds the model-channel gamma into the belief prior, but
+    # the diagnostic/figure replays folded only the precision bias -> they scored a DIFFERENT prior than
+    # the forward. Assert every replay now invokes the gamma fold (off-path stays byte-identical).
+    model = VFEModel(_cfg(n_layers=1, lambda_gamma=0.5, gamma_as_beta_prior=True,
+                          gamma_prior_weight=0.3)).to(DEVICE)
+    tok = torch.randint(0, 32, (1, 5), device=DEVICE)
+    orig = model._fold_gamma_prior
+    for name in ("diagnostics", "attention_maps", "gamma_attention_maps", "diagnostics_per_layer"):
+        calls = {"n": 0}
+        def spy(*a, _orig=orig, _c=calls, **k):
+            _c["n"] += 1
+            return _orig(*a, **k)
+        model._fold_gamma_prior = spy
+        try:
+            getattr(model, name)(tok)
+        finally:
+            model._fold_gamma_prior = orig
+        assert calls["n"] > 0, f"{name} did not fold the gamma prior under gamma_as_beta_prior"
+
+
 # ------------------------------------------------------------ (d) two-hop F-term
 
 def test_twohop_term_matches_hand_computation():

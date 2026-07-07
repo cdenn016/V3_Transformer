@@ -1300,6 +1300,8 @@ class VFEModel(nn.Module):
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward/diagnostics/attention_maps (r2 id22)
+        if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
+            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0))[0]
         rope = self._rope_rotation(n, token_ids.device)
         out = vfe_stack(                                             # converged belief gauge frame
             belief, belief.mu, belief.sigma, self.group, self.cfg,
@@ -1621,6 +1623,8 @@ class VFEModel(nn.Module):
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
+        if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
+            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0))[0]
         rope = self._rope_rotation(n, token_ids.device)               # rope shapes the converged belief (as forward)
         cap: dict = {}                                                # q* capture (F self-term reads it, as forward)
         out = vfe_stack(                                              # converged belief
@@ -1894,6 +1898,8 @@ class VFEModel(nn.Module):
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
+        if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
+            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0))[0]
         fam = get_family(cfg.family)
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
         mu_p, sigma_p = belief.mu, belief.sigma
@@ -2001,6 +2007,8 @@ class VFEModel(nn.Module):
         n = belief.mu.shape[0]
         log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior
+        if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
+            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0))[0]
         fam = get_family(cfg.family)
         _lb = cfg.lambda_beta
         _tau = attention_tau(self.effective_kappa_beta(belief.mu.device), self.group.irrep_dims)

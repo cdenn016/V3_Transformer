@@ -50,6 +50,8 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
     n = belief.mu.shape[0]
     log_prior = model._attention_log_prior(n, token_ids.device)
     log_prior = model._fold_precision_bias(log_prior, belief.sigma)   # no-op unless precision_weighted_attention;
+    if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
+        log_prior = model._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0))[0]
     rope = model._rope_rotation(n, token_ids.device)                  # belief.sigma is post-s_e_step, matching
     return belief, log_prior, rope                                    # forward's beliefs.sigma (model.py:762)
 
@@ -205,6 +207,8 @@ def belief_ce_bank(
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
             log_prior = model._attention_log_prior(n, device)
             log_prior = model._fold_precision_bias(log_prior, beliefs.sigma)   # no-op unless precision_weighted_attention
+            if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
+                log_prior = model._fold_gamma_prior(log_prior, tokens, beliefs.phi)
             rope = model._rope_rotation(n, device)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
@@ -275,6 +279,8 @@ def belief_bank(
             n = tokens.shape[1]
             log_prior = model._attention_log_prior(n, device)
             log_prior = model._fold_precision_bias(log_prior, beliefs.sigma)   # no-op unless precision_weighted_attention
+            if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
+                log_prior = model._fold_gamma_prior(log_prior, tokens, beliefs.phi)
             rope = model._rope_rotation(n, device)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
