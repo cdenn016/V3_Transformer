@@ -882,6 +882,11 @@ def train(
             optimizer._collect_gauge_diag = bool(do_log or do_csv)   # to log/eval steps (silent path unchanged)
         if do_log or do_csv:                                 # off the hot path (audit 2026-07-05 m8)
             _warn_phi_transport_clamp(model)
+            # m7: diagnostics on the PRE-step weights so the logged F-decomposition shares the pre-step
+            # provenance of train_loss/train_ce (train_ce is captured pre-step inside train_step). Under
+            # no_grad, so no weight change and no global-RNG draw (randomize_e_steps is gated on grad_on),
+            # leaving the train_step RNG stream and weights byte-identical.
+            d = model.diagnostics(tokens)
         losses.append(train_step(model, optimizer, scheduler, tokens, targets,
                                   grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
                                   scaler=scaler, metrics_out=step_metrics))
@@ -892,7 +897,7 @@ def train(
             # train_ce is the PRE-step CE captured inside train_step (matches train_loss); the old
             # post-step re-forward made train_ce one optimizer step ahead of train_loss (audit r2 id5).
             ce = step_metrics.get("train_ce", float("nan")) if step_metrics is not None else float("nan")
-            d = model.diagnostics(tokens)
+            # d (the F-decomposition) is computed PRE-step above so it shares train_ce's provenance (m7).
             # Throughput + peak memory over the window since the last log/eval, then reset the window.
             # Computed here (not inside do_log) so a CSV row on an eval-only step still carries the rate.
             now = time.perf_counter()
