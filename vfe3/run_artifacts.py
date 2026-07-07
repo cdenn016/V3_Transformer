@@ -76,7 +76,12 @@ def _atomic_replace(
 
 
 class RunArtifacts:
-    r"""Owns a run directory and the incremental writes (CSV rows, checkpoints, best model)."""
+    r"""Owns a run directory and the incremental writes (CSV rows, checkpoints, best model).
+
+    Contract (m25): each instance owns a FRESH run_dir. ``__init__`` (re)writes config.json and the
+    first ``log_metrics`` opens metrics.csv with ``"w"`` (truncate), so aiming a new instance at a
+    populated dir would clobber it -- but no path does: resume builds a new timestamped run_dir and
+    restores state from a checkpoint FILE via ``load_checkpoint``, never reusing a dir in place."""
 
     def __init__(
         self,

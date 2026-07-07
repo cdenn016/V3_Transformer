@@ -26,6 +26,7 @@ position-dependent alternative for the non-compact regime.
 """
 
 import math
+import warnings
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -105,7 +106,8 @@ def killing_metric(
 # eigh per iteration when a killing preconditioner is active (audit 4d). Keying on data_ptr is
 # staleness-safe: a .to(device/dtype) move produces a NEW tensor (new ptr) -> cache miss ->
 # recompute, so a moved model never reuses a stale-device inverse.
-_KILLING_INV_CACHE: Dict[tuple, torch.Tensor] = {}
+_KILLING_INV_CACHE: Dict[tuple, tuple] = {}     # key -> (generators_ref, inv); retain generators (m17)
+_PULLBACK_SERIES_WARNED: bool = False           # warn-once guard for Psi-series non-convergence (m19)
 
 
 def build_killing_preconditioner(
@@ -133,7 +135,7 @@ def build_killing_preconditioner(
            generators.device, center_reg, tol)
     cached = _KILLING_INV_CACHE.get(key)
     if cached is not None:
-        return cached
+        return cached[1]                                 # (generators_ref, inv) -> inv
 
     K = generators.shape[-1]
     reg = float(2 * K) if center_reg is None else float(center_reg)
@@ -144,7 +146,7 @@ def build_killing_preconditioner(
     evals = torch.where(evals.abs() < tol, torch.full_like(evals, reg), evals)
     inv = (evecs * (1.0 / evals).unsqueeze(-2)) @ evecs.transpose(-1, -2)
     inv = inv.to(orig_dtype)
-    _KILLING_INV_CACHE[key] = inv
+    _KILLING_INV_CACHE[key] = (generators, inv)          # retain generators so its data_ptr key can't recycle (m17)
     return inv
 
 
@@ -309,12 +311,25 @@ def pullback_metric(
     eye    = torch.eye(n_gen, dtype=ad.dtype, device=ad.device).expand_as(ad).clone()
     psi    = eye.clone()
     ad_pow = eye.clone()
+    converged = False
+    last_term = 0.0
     for k in range(1, series_order):
         ad_pow = torch.einsum("...ij,...jk->...ik", ad_pow, ad)
         term   = ad_pow * (1.0 / float(math.factorial(k + 1)))   # float coeff: int overflows >~20
         psi    = psi + term
-        if float(term.abs().max()) < series_tol:           # converged: higher terms negligible
+        last_term = float(term.abs().max())
+        if last_term < series_tol:                         # converged: higher terms negligible
+            converged = True
             break
+    global _PULLBACK_SERIES_WARNED
+    if not converged and series_order > 1 and not _PULLBACK_SERIES_WARNED:
+        _PULLBACK_SERIES_WARNED = True
+        warnings.warn(                                     # m19: exhausting series_order silently returned a truncated metric
+            f"pullback_metric: Psi(ad_phi) series did not converge in series_order={series_order} "
+            f"(last term {last_term:.2e} >= series_tol={series_tol:.1e}); the pullback preconditioner "
+            f"metric may be inaccurate. Raise series_order or reduce ||phi||. Warned once per process.",
+            RuntimeWarning, stacklevel=2,
+        )
 
     # d exp_phi(e_a) coords = psi @ e_a = column a of psi -> embed -> times exp(phi)
     W       = torch.einsum("...ca,cij->...aij", psi, G)    # (...,n_gen,K,K) Psi(ad_phi)(T_a)

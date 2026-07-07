@@ -20,6 +20,39 @@ def test_clip_scales_large_gradient_to_c():
     assert torch.allclose(out.norm(dim=-1), torch.full((2,), 10.0), atol=1e-3)
 
 
+def test_killing_cache_retains_generators_reference():
+    # m17: the killing-inverse cache keys on generators.data_ptr() but must RETAIN the generators
+    # tensor, else a freed-and-realloc'd same-shape basis at the same address returns a stale inverse.
+    import gc
+    import weakref
+    from vfe3.geometry.phi_preconditioner import build_killing_preconditioner
+    G = generate_son(3).clone()                     # fresh storage (not held by any generator factory cache)
+    build_killing_preconditioner(G)
+    ref = weakref.ref(G)
+    del G
+    gc.collect()
+    assert ref() is not None, "killing cache dropped the generators tensor (its data_ptr can be recycled)"
+
+
+def test_pullback_series_warns_on_non_convergence():
+    # m19: pullback_metric's Psi series must WARN (not silently) when it exhausts series_order without
+    # meeting the tolerance.
+    import warnings as _w
+    import vfe3.geometry.phi_preconditioner as pp
+    G = generate_son(3)
+    phi = torch.full((G.shape[0],), 3.0)            # large ||phi||: the order-2 term stays above tol
+    pp._PULLBACK_SERIES_WARNED = False
+    with _w.catch_warnings(record=True) as rec:
+        _w.simplefilter("always")
+        pp.pullback_metric(phi, G, series_tol=1e-12, series_order=3)
+    assert any("did not converge" in str(x.message) for x in rec)
+    pp._PULLBACK_SERIES_WARNED = False              # converged case (zero phi) must NOT warn
+    with _w.catch_warnings(record=True) as rec2:
+        _w.simplefilter("always")
+        pp.pullback_metric(torch.zeros(G.shape[0]), G, series_tol=1e-12, series_order=40)
+    assert not any("did not converge" in str(x.message) for x in rec2)
+
+
 def test_clip_leaves_small_gradient_unchanged():
     G = generate_glk(3)
     grad = 0.01 * torch.ones(2, 9)                        # norm << c
