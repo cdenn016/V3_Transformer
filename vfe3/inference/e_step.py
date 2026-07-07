@@ -677,8 +677,12 @@ def e_step_iteration(
         # bare mu = belief.mu - e_q_mu_lr*nat_mu bit-for-bit. is_diagonal mirrors the SPD-retraction rank
         # rule below (full cov iff sigma.dim() == mu.dim() + 1).
         if e_mu_q_trust is not None:
+            # m11: under straight_through the whitening sigma must be detached, else where the box/ball
+            # clamp binds the output +-trust*sqrt(sigma) leaks a live d/d(belief.sigma) gradient into mu
+            # -- the per-iteration tangent the ST estimator severs everywhere else. Values unchanged.
+            trust_sigma = belief.sigma.detach() if e_step_gradient == "straight_through" else belief.sigma
             delta_mu = apply_mu_trust_region(
-                delta_mu, belief.sigma, trust=e_mu_q_trust, mode=mu_trust_mode,
+                delta_mu, trust_sigma, trust=e_mu_q_trust, mode=mu_trust_mode,
                 is_diagonal=(belief.sigma.dim() == belief.mu.dim()), eps=eps,
             )
         mu = belief.mu - delta_mu
@@ -873,6 +877,21 @@ def e_step(
                 # Truncation boundary: fresh detached leaves so the last-k graph starts here.
                 belief = BeliefState(mu=belief.mu.detach(), sigma=belief.sigma.detach(),
                                      phi=belief.phi.detach())
+                # m10: the hoisted flat transport was built from the PRE-boundary phi under grad, so the
+                # last-k iterations (which consume it via _prebuilt_omega) would leak transport gradient
+                # through the boundary to the encode/pos-phi tables. Rebuild it from the now-detached phi
+                # (values unchanged at e_phi_lr==0, so the forward is byte-identical -- only the leaked
+                # graph is severed). A caller-shared prebuilt_transport is already detached, so leave it.
+                if _hoisted_omega is not None and prebuilt_transport is None:
+                    _hoisted_omega = build_belief_transport(
+                        belief.phi, group,
+                        transport_mode="flat",
+                        gauge_mode="learned",
+                        clamp_monitor=kwargs.get("clamp_monitor", False),
+                        exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                        transport_mean_per_head=transport_mean_per_head,
+                        rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                    )
         else:
             belief = e_step_iteration(
                 belief, mu_p, sigma_p, group, tau=tau,

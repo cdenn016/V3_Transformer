@@ -192,6 +192,50 @@ def test_backprop_last_truncates_but_signal_flows(device):
     assert mu_p.grad.abs().sum() > 0                   # the last-k window still reaches the prior
 
 
+def test_backprop_last_truncates_transport_gradient_to_phi(device):
+    # m10: on the flat/e_phi_lr==0 hoist route the truncation boundary detached phi but NOT the hoisted
+    # Omega (built from the pre-boundary phi), leaking transport gradient into phi below the window.
+    b0, mu_p, sigma_p, grp = _belief_and_prior(device)
+    mu_p = mu_p.clone().requires_grad_(True)                  # a live prior so out.mu carries SOME gradient
+    phi_leaf = b0.phi.detach().clone().requires_grad_(True)
+    belief = b0._replace(phi=phi_leaf)
+    out = e_step(belief, mu_p, sigma_p, grp, n_iter=3, tau=1.5, e_phi_lr=0.0,
+                 e_steps_backprop_last=1)
+    out.mu.sum().backward()
+    assert mu_p.grad is not None and mu_p.grad.abs().sum() > 0              # the last-k window still reaches the prior
+    assert phi_leaf.grad is None or float(phi_leaf.grad.abs().sum()) == 0.0   # transport leak through the hoist severed
+
+
+def test_straight_through_mean_trust_region_no_sigma_leak(device):
+    # m11: under straight_through the mean trust region whitens by sqrt(belief.sigma); where the clamp
+    # binds, +-trust*sqrt(sigma) leaks a live d/d(sigma) gradient into mu (the tangent ST severs). After
+    # the fix out.mu no longer connects to belief.sigma via the trust region.
+    from vfe3.inference.e_step import e_step_iteration
+    b0, mu_p, sigma_p, grp = _belief_and_prior(device)
+    sigma_leaf = b0.sigma.detach().clone().requires_grad_(True)
+    belief = b0._replace(sigma=sigma_leaf)
+    out = e_step_iteration(belief, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=5.0, e_phi_lr=0.0,
+                           e_step_gradient="straight_through", e_mu_q_trust=1e-3, mu_trust_mode="box")
+    if out.mu.requires_grad:                                  # pre-fix: the sigma whitening reconnects mu
+        out.mu.sum().backward()
+    assert sigma_leaf.grad is None or float(sigma_leaf.grad.abs().sum()) == 0.0
+
+
+def test_mm_exact_update_stays_put_on_saturated_row():
+    # m12: on a fully saturated row (all self/pair KLs == 0 -> a==0, w==0) the fused precision floors
+    # to eps and the OLD code snapped the belief to (0, eps); it must instead stay put, matching the
+    # gradient route (grad == 0 there).
+    from vfe3.gradients.kernels import mm_exact_update
+    N, K = 3, 2
+    mu    = torch.full((N, K), 0.7)
+    sigma = torch.full((N, K), 1.3)
+    mu_p, sigma_p = mu.clone(), sigma.clone()             # prior == belief -> self KL == 0
+    omega = torch.eye(K).expand(N, N, K, K).contiguous()  # identity transport -> pair KL == 0
+    mu_star, sigma_star = mm_exact_update(mu, sigma, mu_p, sigma_p, omega, tau=1.0)
+    assert torch.allclose(mu_star, mu), mu_star
+    assert torch.allclose(sigma_star, sigma), sigma_star
+
+
 # --- (e) skip_belief_sigma_update ---------------------------------------------
 
 def test_skip_sigma_kernel_returns_none_and_mu_unchanged(device):
