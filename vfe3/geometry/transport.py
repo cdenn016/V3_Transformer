@@ -972,6 +972,11 @@ def compute_transport_operators(
         phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims,
         exp_dim=(max(block_dims) if block_dims is not None else None),
         exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+        # m16: matrix_exp of a skew matrix is exactly orthogonal at ANY norm, so the Frobenius clamp
+        # only gratuitously shortens the rotation on the pure so_n/so_k tower path (whose retraction
+        # caps ||phi|| in COORDINATES, under-bounding the embedded norm). Disable it for skew; the
+        # non-compact groups (glk/block_glk/sp_n) keep the clamp as a genuine exp-overflow safeguard.
+        max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
         clamp_monitor=clamp_monitor,
     )
     omega = torch.einsum("bikl,bjlm->bijkm", exp_phi, exp_neg_phi)
@@ -1018,6 +1023,11 @@ def build_factored_transport(
         phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims,
         exp_dim=(max(block_dims) if block_dims is not None else None),
         exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+        # m16: matrix_exp of a skew matrix is exactly orthogonal at ANY norm, so the Frobenius clamp
+        # only gratuitously shortens the rotation on the pure so_n/so_k tower path (whose retraction
+        # caps ||phi|| in COORDINATES, under-bounding the embedded norm). Disable it for skew; the
+        # non-compact groups (glk/block_glk/sp_n) keep the clamp as a genuine exp-overflow safeguard.
+        max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
         clamp_monitor=clamp_monitor,
     )
     return FactoredTransport(exp_phi=exp_phi, exp_neg_phi=exp_neg_phi, irrep_dims=list(group.irrep_dims),

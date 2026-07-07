@@ -268,3 +268,20 @@ def test_clamp_monitor_default_off_is_bit_identical():
         exp_off, neg_off = stable_matrix_exp_pair(m, clamp_monitor=False)
     assert torch.equal(exp_default, exp_off)
     assert torch.equal(neg_default, neg_off)
+
+
+def test_skew_transport_exp_not_clamped_for_large_phi():
+    # m16: matrix_exp of a SKEW matrix is orthogonal at ANY norm, so the flat transport builder must
+    # NOT apply the Frobenius clamp for skew (so_n/so_k) groups -- else a large ||embed(phi)|| silently
+    # returns exp of the RESCALED matrix (a shorter rotation), not exp(embed(phi)), on the pure path.
+    from vfe3.geometry.transport import compute_transport_operators
+    grp = get_group("so_k")(5)
+    assert grp.skew_symmetric
+    phi = torch.zeros(1, 1, grp.generators.shape[0])
+    phi[0, 0, 0] = 30.0                                          # ||embed(phi)||_F >> 15 (the clamp threshold)
+    out = compute_transport_operators(phi, grp)
+    phi_mat = torch.einsum("bna,aij->bnij", phi, grp.generators)
+    true_exp = torch.linalg.matrix_exp(phi_mat)
+    assert torch.allclose(out["exp_phi"], true_exp, atol=1e-4)   # RED pre-fix: clamped to a shorter rotation
+    eye = torch.eye(5).expand(1, 1, 5, 5)
+    assert torch.allclose(torch.matmul(out["exp_phi"], out["exp_phi"].transpose(-1, -2)), eye, atol=1e-4)
