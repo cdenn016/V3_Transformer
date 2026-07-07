@@ -437,7 +437,12 @@ def free_energy(
         # tensor is materialized (audit 2026-06-09 overnight F8 / morning PE7). The max()
         # mirrors the tensor branch's clamp exactly (inert for any real N < 1/log_eps).
         if log_prior is not None:
-            log_pi = torch.log(torch.softmax(log_prior, dim=-1).clamp(min=log_eps))
+            # Exact log-prior (m8): the old torch.log(softmax(...).clamp(min=log_eps)) floored a finite
+            # deep-tail entry at ~-27.6 nats, so a strong finite prior made F and the autograd oracle
+            # deviate from -tau logZ. log_softmax is exact; isfinite neutralizes hard-mask (-inf) entries
+            # (beta==0 there, so 0*(.-log_pi) stays the correct 0 with no 0*(-inf)=NaN).
+            log_pi = torch.log_softmax(log_prior, dim=-1)
+            log_pi = torch.where(torch.isfinite(log_pi), log_pi, torch.zeros_like(log_pi))
         else:
             log_pi = math.log(max(1.0 / beta.shape[-1], log_eps))
         _tau_e = _broadcast_tau(tau, energy)          # (H,1,1) for per-head, scalar otherwise

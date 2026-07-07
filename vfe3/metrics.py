@@ -152,7 +152,8 @@ def free_energy_terms(
     # uniform so log(pi)=-log(N) is a scalar (audit 2026-06-17 r2 id9; the scalar new_tensor(1/N) keeps
     # the value byte-identical to the old full_like alloc). The log_prior branch is unchanged.
     if log_prior is not None:
-        log_pi = torch.log(torch.softmax(log_prior, dim=-1).clamp(min=eps))
+        log_pi = torch.log_softmax(log_prior, dim=-1)                       # exact log-prior (m8; was clamped ~-27.6 nats)
+        log_pi = torch.where(torch.isfinite(log_pi), log_pi, torch.zeros_like(log_pi))
     else:
         log_pi = torch.log(beta.new_tensor(1.0 / beta.shape[-1]).clamp(min=eps))
     from vfe3.free_energy import _broadcast_tau          # align a per-head (H,) tau to the head axis

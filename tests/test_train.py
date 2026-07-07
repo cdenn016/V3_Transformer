@@ -408,10 +408,15 @@ def test_auto_default_sample_decoder_emits_at_gpt2_vocab(caplog):
 
 
 def test_train_vfe3_clickrun_importable_and_runs_one_step():
+    from dataclasses import replace
+
     from train_vfe3 import config as cr_config
 
-    cfg = VFE3Config(**cr_config)
-    # grow the stream so the click-run dims (seq_len=128, batch_size=64) yield >=1 batch under drop_last
+    cfg_full = VFE3Config(**cr_config)         # importability: the LIVE click-run config must construct
+    # t2: run the train STEP on a dim-shrunk copy so this CPU test's cost cannot balloon with the user's
+    # live WIP toggles (seq_len=128, batch_size=64, more layers). The gauge/family/decode structural
+    # toggles are preserved -- only the size dims shrink -- so the click-run code path is still exercised.
+    cfg = replace(cfg_full, max_seq_len=16, batch_size=2, n_layers=1)
     loader = _periodic_loader(n=cfg.max_seq_len * cfg.batch_size * 4,
                               seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
     batch = next(iter(loader))

@@ -25,7 +25,9 @@ def _inputs():
 
 
 def test_defaults_byte_identical_to_pre_fix():
-    r"""(1) alpha_reg=None, include_attention_entropy=True reproduces the pre-fix dict exactly."""
+    r"""(1) alpha_reg=None, include_attention_entropy=True reproduces the inline free-energy-terms
+    recomputation exactly. The entropy log-prior uses the exact ``log_softmax`` (audit m8; formerly
+    ``log(softmax(.).clamp)``, which floored a finite deep-tail prior at ~-27.6 nats)."""
     self_div, energy, alpha, _, log_prior = _inputs()
     tau, lambda_beta, eps = 1.3, 0.9, 1e-12
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)
@@ -35,11 +37,13 @@ def test_defaults_byte_identical_to_pre_fix():
         tau=tau, lambda_beta=lambda_beta, log_prior=log_prior,
     )
 
-    # Recompute the EXACT pre-fix expressions inline (identical ops -> identical float32->float).
+    # Recompute the EXACT expressions inline (identical ops -> identical float32->float).
     exp_self = float((alpha * self_div).sum())
     exp_belief = float((beta * energy).sum())
-    pi = torch.softmax(log_prior, dim=-1)
-    exp_entropy = float(tau * (beta * (torch.log(beta.clamp(min=eps)) - torch.log(pi.clamp(min=eps)))).sum())
+    from vfe3.free_energy import _broadcast_tau
+    log_pi = torch.log_softmax(log_prior, dim=-1)   # m8: exact log-prior (was torch.log(softmax(.).clamp))
+    _tau_e = _broadcast_tau(tau, energy)            # mirror metrics' exact op order (tau inside the sum)
+    exp_entropy = float((_tau_e * (beta * (torch.log(beta.clamp(min=eps)) - log_pi))).sum())
     exp_total = exp_self + float(lambda_beta) * (exp_belief + exp_entropy)
 
     assert out["self_coupling"] == exp_self
