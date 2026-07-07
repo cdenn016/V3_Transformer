@@ -970,6 +970,18 @@ def _save_figures(
                 fig = figs.plot_kappa_history(
                     _hist_kappa, channel=_ch, path=str(run / f"kappa_{_ch}_history.png"))
                 figs.plt.close(fig)
+        # Per-irrep-block companion to the aggregate kappa_<ch>_history above: one line per block for
+        # kappa AND the effective temperature tau, across the beta/gamma channels (a 2x2 grid when
+        # both toggles are on). Present exactly when train() logged the per-block kappa_*/tau_* columns.
+        _kb_keys = tuple(sorted({k for r in artifacts.history for k in r
+                                 if k.startswith(("kappa_beta_b", "kappa_gamma_b",
+                                                  "tau_beta_b", "tau_gamma_b"))}))
+        if _kb_keys:
+            _hist_kb = _hist_subset(_kb_keys)
+            if _hist_kb:
+                fig = figs.plot_kappa_block_trajectory(
+                    _hist_kb, path=str(run / "kappa_block_trajectory.png"))
+                figs.plt.close(fig)
         # Optimization + convergence trends (history-only; no model re-run): the pre-clip gradient
         # norm (THE optimization-health curve, previously discarded), the belief-covariance
         # conditioning, and the per-eval E-step F-descent (negative = the inner loop reduced F).

@@ -1368,6 +1368,60 @@ def plot_kappa_history(
     fig.tight_layout()
     return _save(fig, path)
 
+
+@register_figure("kappa_block_trajectory")
+def plot_kappa_block_trajectory(
+    history: Dict,                       # step + kappa_<ch>_b<i> + tau_<ch>_b<i>
+
+    *,
+    path: Optional[str] = None,
+):
+    r"""Per-irrep-block learned softmax-temperature trajectories over training.
+
+    ``train`` logs ``kappa_<ch>_b<i>`` and the effective temperature ``tau_<ch>_b<i> = kappa_b *
+    sqrt(d_block)`` for every irrep block whenever the corresponding learnable-kappa toggle is on.
+    Rows are the channels present in the history (belief ``beta`` and model ``gamma``); the two
+    columns are kappa (left) and tau (right); each panel draws one line per block. Both toggles on
+    -> a 2x2 grid, one toggle -> a 1x2 row. History-only (no model re-run), so the lines are the
+    values actually logged during training, not a re-inferred temperature.
+    """
+    step = _np(history.get("step", [])).reshape(-1).astype(float)
+    channels = [ch for ch in ("beta", "gamma")
+                if any(k.startswith(f"kappa_{ch}_b") for k in history)]
+    if not channels or step.size == 0:
+        fig, ax = plt.subplots(figsize=(4.0, 3.0))
+        ax.text(0.5, 0.5, "no per-block kappa history", ha="center", va="center")
+        ax.axis("off")
+        return _save(fig, path)
+    fig, axes = plt.subplots(len(channels), 2, figsize=(9.0, 3.4 * len(channels)), squeeze=False)
+    for ri, ch in enumerate(channels):
+        symbol = r"\beta" if ch == "beta" else r"\gamma"
+        pre = f"kappa_{ch}_b"
+        blocks = sorted(int(k[len(pre):]) for k in history
+                        if k.startswith(pre) and k[len(pre):].isdigit())
+        for ci, (quant, qsym) in enumerate((("kappa", rf"$\kappa_{{{symbol}}}$"),
+                                            ("tau",   rf"$\tau_{{{symbol}}}$"))):
+            ax = axes[ri][ci]
+            for bi in blocks:
+                y = _np(history.get(f"{quant}_{ch}_b{bi}", [])).reshape(-1).astype(float)
+                if y.size != step.size:
+                    continue
+                keep = np.isfinite(step) & np.isfinite(y)
+                if keep.any():
+                    ax.plot(step[keep], y[keep], "o-", ms=2.5, lw=1.4,
+                            color=_CB[bi % len(_CB)], label=f"b{bi}")
+            _sf = step[np.isfinite(step)]
+            if _sf.size:
+                ax.set_xlim(float(_sf.min()), float(_sf.max()))
+                _step_xaxis(ax)
+            ax.set(xlabel="training step", ylabel=qsym,
+                   title=f"{ch} {quant} per irrep block")
+            if blocks:
+                ax.legend(fontsize=7, frameon=False, ncol=max(1, (len(blocks) + 5) // 6))
+    fig.tight_layout()
+    return _save(fig, path)
+
+
 @register_figure("ln3_symmetry_breaking")
 def plot_ln3_symmetry_breaking(
     frozen:  Dict,                       # {step, val_ce, omega (N,N,K,K), beta (H,N,N)}

@@ -1018,6 +1018,16 @@ def train(
                     _kv = torch.exp(_param.detach()).float().reshape(-1)
                     row[f"{_kp}_mean"] = float(_kv.mean())
                     row[f"{_kp}_var"]  = float(_kv.var(unbiased=False))
+                    # Per-block companion to the aggregate mean/var: one column per irrep block for
+                    # kappa_b and the effective softmax temperature tau_b = kappa_b * sqrt(d_b) (d_b
+                    # the gauge-irrep block size), so finalize_run can draw a line per block in the
+                    # kappa/tau panels. n_blocks is static per run -> the CSV stays rectangular.
+                    _ch   = _kp.split("_", 1)[1]                   # "beta" | "gamma"
+                    _dims = model.group.irrep_dims
+                    for _bi in range(_kv.numel()):
+                        _kb = float(_kv[_bi])
+                        row[f"kappa_{_ch}_b{_bi}"] = _kb
+                        row[f"tau_{_ch}_b{_bi}"]   = _kb * float(_dims[_bi]) ** 0.5
             # Cumulative wall time since training start (D1/EXP-8): the x-axis of the per-wall-clock
             # convergence curve (val_ppl vs wall_clock_s). 'now' is the window timestamp captured above.
             row["wall_clock_s"] = now - train_t0
