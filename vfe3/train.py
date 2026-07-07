@@ -1194,9 +1194,13 @@ def parameter_report(
         ids = torch.randint(0, int(model.cfg.vocab_size), (int(batch), n), generator=g).to(device)
         tgt = torch.randint(0, int(model.cfg.vocab_size), (int(batch), n), generator=g).to(device)
         model.zero_grad(set_to_none=True)
-        out  = model(ids, tgt)                                     # (logits|None, loss, ce) with targets
-        loss = out[1] if isinstance(out, tuple) else out
-        loss.backward()
+        rng_state = torch.get_rng_state()                          # m31: the probe forward may draw the
+        try:                                                       # global RNG (randomize_e_steps); restore it
+            out  = model(ids, tgt)                                 # (logits|None, loss, ce) with targets
+            loss = out[1] if isinstance(out, tuple) else out
+            loss.backward()
+        finally:
+            torch.set_rng_state(rng_state)                         # global stream untouched, per the docstring
         dead_names = [name for name, p in named if p.requires_grad and p.grad is None]
         live = sum(p.numel() for _, p in named if p.requires_grad and p.grad is not None)
         model.zero_grad(set_to_none=True)                          # leave no grads for training

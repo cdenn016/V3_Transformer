@@ -2314,7 +2314,9 @@ def _fit_power_law(
         try:
             from scipy.optimize import curve_fit
             p0 = [max(0.0, float(L.min()) * 0.5), float(np.exp(np.mean(y))), 0.3]
+            sig = None if w is None else (L / np.sqrt(np.clip(w, 1e-300, None)))   # m29: WLS (SEM=L/sqrt(w)); ignored when None
             popt, _ = curve_fit(lambda n, E, A, al: E + A * np.power(n, -al), N, L, p0=p0,
+                                sigma=sig, absolute_sigma=False,
                                 bounds=([0.0, 1e-12, 1e-3], [float(L.min()), np.inf, 3.0]),
                                 maxfev=20000)
             E, A, al = (float(v) for v in popt)

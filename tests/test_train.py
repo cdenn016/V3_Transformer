@@ -42,6 +42,20 @@ def test_phi_clamp_monitor_threshold_matches_transport_clamp():
     assert monitor_thr == clamp_thr, f"monitor trips at {monitor_thr}, clamp fires at {clamp_thr}"
 
 
+def test_parameter_report_leaves_global_rng_untouched():
+    # m31: parameter_report's probe forward draws the GLOBAL RNG under randomize_e_steps=True (the
+    # E-step count randint), so it must snapshot/restore around the probe -- its docstring promises the
+    # global stream is untouched (the deprecated run_training entry's batch order depends on it).
+    from vfe3.train import parameter_report
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1, n_e_steps=2,
+                     randomize_e_steps=True, e_steps_min=1, e_steps_max=4)
+    model = VFEModel(cfg)
+    torch.manual_seed(123)
+    before = torch.get_rng_state()
+    parameter_report(model)
+    assert torch.equal(before, torch.get_rng_state()), "parameter_report advanced the global RNG"
+
+
 def test_optimizer_groups_regime_ii_connection():
     # connection_W (transport_mode='regime_ii') is a trainable model-level nn.Parameter;
     # build_optimizer must group it so it actually trains and so its exact-coverage guard does not

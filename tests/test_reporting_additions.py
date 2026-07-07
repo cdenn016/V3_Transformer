@@ -213,6 +213,21 @@ def test_attention_entropy_figure_aggregates_seeds(monkeypatch, tmp_path):
     assert abs(by[False]["ppl"] - 15.0) < 1e-9            # (14 + 16) / 2
 
 
+def test_offset_power_law_honors_weights():
+    # m29: the with_offset (Chinchilla) fit must honor the WLS weights callers pass, not silently
+    # run unweighted OLS. Down-weighting a corrupted point must move the fitted exponent.
+    import pytest
+    pytest.importorskip("scipy")   # the offset branch needs scipy.optimize.curve_fit (else falls back to log-log)
+    from vfe3.viz.figures import _fit_power_law
+    N = np.array([1e2, 1e3, 1e4, 1e5])
+    L = (2.0 + 5.0 * N ** -0.3).copy()
+    L[0] += 0.5                                            # corrupt the low-N point
+    fit_uniform = _fit_power_law(N, L, weights=np.ones_like(N), with_offset=True)
+    fit_downwt  = _fit_power_law(N, L, weights=np.array([1e-3, 1.0, 1.0, 1.0]), with_offset=True)
+    assert fit_uniform["form"] == "offset_power_law" and fit_downwt["form"] == "offset_power_law"
+    assert abs(fit_uniform["alpha"] - fit_downwt["alpha"]) > 1e-4   # weights must change the fit
+
+
 # --------------------------------------------------------------------------- pure-path certificate
 
 def _pure_ns(**over):
