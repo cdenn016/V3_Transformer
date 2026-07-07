@@ -31,6 +31,10 @@ def _supported_ns(**over):
         transport_mode="flat", e_phi_lr=0.0, beta_attention_prior="causal", s_e_step=False,
         precision_weighted_attention=False, pos_rotation="none", use_head_mixer=False,
         use_cg_coupling=False, e_step_mu_precond="fisher", e_mu_q_trust=None,
+        # M3 (audit 2026-07-06): result-changing toggles the cache does not replicate, at their
+        # cache-eligible defaults so _supported_ns() stays supported.
+        lambda_twohop=0.0, e_step_update="gradient", skip_belief_sigma_update=False,
+        query_adaptive_tau=False, gamma_as_beta_prior=False, learnable_kappa_beta=False,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -91,6 +95,23 @@ def test_cache_supported_guard():
         dict(family="laplace_diagonal"),
         dict(divergence_family="alpha"),
         dict(renyi_order=0.5),
+    ):
+        assert not cache_supported(_supported_ns(**kw)), kw
+
+
+def test_cache_supported_gates_result_changing_toggles():
+    # M3 (audit 2026-07-06): six result-changing toggles the cached kernel does NOT replicate must
+    # disable the fast path, else rollout_predictive_cached silently diverges from the full recompute
+    # it is golden-pinned to equal (two-hop coupling, the exact-minimizer E-step, the sigma-freeze,
+    # query-adaptive tau, the gamma prior fold, and the learned per-block kappa).
+    assert cache_supported(_supported_ns())                       # baseline: supported
+    for kw in (
+        dict(lambda_twohop=0.5),
+        dict(e_step_update="mm_exact"),
+        dict(skip_belief_sigma_update=True),
+        dict(query_adaptive_tau=True),
+        dict(gamma_as_beta_prior=True),
+        dict(learnable_kappa_beta=True),
     ):
         assert not cache_supported(_supported_ns(**kw)), kw
 

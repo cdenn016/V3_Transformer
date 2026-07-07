@@ -215,6 +215,43 @@ def test_training_logs_learned_kappa_stats(tmp_path):
         assert key in rows[0]
         assert rows[0][key] not in ("", "nan", None)
 
+
+# --- M1 (audit 2026-07-06): viz extractors must use the LEARNED kappa -----------
+
+def test_extractors_use_learned_kappa_in_iter_and_fe_kwargs():
+    # The two bottleneck knob-bag builders must build tau from effective_kappa_beta (the live
+    # exp(log_kappa_beta)), not the static cfg.kappa_beta init.
+    from vfe3.viz import extract
+    from vfe3.free_energy import attention_tau
+
+    m = VFEModel(_cfg(learnable_kappa_beta=True))            # block_glk, n_heads=2 -> 2 irrep blocks
+    with torch.no_grad():
+        m.log_kappa_beta.copy_(torch.log(torch.tensor([3.0, 3.0])))
+    dev  = m.prior_bank.mu_embed.device
+    want = torch.as_tensor(attention_tau(m.effective_kappa_beta(dev), m.group.irrep_dims)).float()
+    lp   = m._attention_log_prior(4, dev)
+    got_iter = torch.as_tensor(extract._iter_kwargs(m, lp, None)["tau"]).float()
+    got_fe   = torch.as_tensor(extract._fe_kwargs(m, lp, None)["tau"]).float()
+    assert torch.allclose(got_iter, want)
+    assert torch.allclose(got_fe, want)
+
+
+def test_converged_state_beta_tracks_learned_kappa():
+    # converged_state's vfe_stack (belief convergence) and direct attention-beta site must both
+    # honor the learned temperature: the beta at kappa=5 must differ from the beta at kappa=1.
+    from vfe3.viz import extract
+
+    x, _ = _batch()
+    m = VFEModel(_cfg(learnable_kappa_beta=True))
+    with torch.no_grad():
+        m.log_kappa_beta.copy_(torch.log(torch.tensor([5.0, 5.0])))
+    beta_learned = extract.converged_state(m, x)["beta"].clone()
+    with torch.no_grad():
+        m.log_kappa_beta.zero_()                            # kappa = exp(0) = 1 (the init)
+    beta_init = extract.converged_state(m, x)["beta"].clone()
+    assert not torch.allclose(beta_learned, beta_init)
+
+
 # --- optimizer wiring ----------------------------------------------------------
 
 def test_optimizer_grouping():

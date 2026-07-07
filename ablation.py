@@ -1802,6 +1802,31 @@ def _seed_aggregate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(agg, key=lambda d: d["mean"])
 
 
+def _aggregate_cells(
+    cells:      List[Dict[str, Any]],
+    key_fields: 'tuple | list',
+    avg_fields: 'tuple | list',
+) -> List[Dict[str, Any]]:
+    r"""Collapse per-seed cells that share the same ``key_fields`` into one cell whose ``avg_fields`` are
+    the across-seed means (non-finite values dropped; empty -> nan); non-averaged fields inherit the first
+    member. Used so a multi-seed sweep's ``__s<seed>`` cells aggregate into one point/bar before the
+    headline ablation figures plot them, instead of being skipped or read off one arbitrary seed
+    (audit 2026-07-06 M4)."""
+    groups: Dict[tuple, List[Dict[str, Any]]] = {}
+    for c in cells:
+        groups.setdefault(tuple(c.get(k) for k in key_fields), []).append(c)
+    out: List[Dict[str, Any]] = []
+    for members in groups.values():
+        agg = dict(members[0])
+        for f in avg_fields:
+            vals = [float(m[f]) for m in members
+                    if isinstance(m.get(f), (int, float))
+                    and float(m[f]) == float(m[f]) and abs(float(m[f])) != float("inf")]
+            agg[f] = (sum(vals) / len(vals)) if vals else float("nan")
+        out.append(agg)
+    return out
+
+
 def analyze_sweep(sweep_dir: Path) -> None:
     rows = _read_sweep_csv(sweep_dir)
     if not rows:
@@ -2005,6 +2030,8 @@ def _plot_attention_entropy(sweep_dir: Path, fig_dir: Path) -> None:
         if _as_float(r.get("cov_gap")) < float("inf"):
             cells_gap.append({"include_attention_entropy": ent, "kappa": kap,
                               "cov_gap": _as_float(r.get("cov_gap"))})
+    cells_ppl = _aggregate_cells(cells_ppl, ("include_attention_entropy", "kappa"), ("ppl",))   # M4
+    cells_gap = _aggregate_cells(cells_gap, ("include_attention_entropy", "kappa"), ("cov_gap",))
     if len(cells_ppl) < 2:
         return
     plt = _plt_or_none()
@@ -2067,7 +2094,7 @@ def _plot_gauge_transport(sweep_dir: Path, fig_dir: Path) -> None:
     mode in {on,off,frozen}."""
     cells: List[Dict[str, Any]] = []
     for r in _collect_sweep_results(sweep_dir):
-        parts = str(r.get("label", "")).split("_")
+        parts = _base_label(str(r.get("label", ""))).split("_")   # strip __s<seed> before parsing (M4)
         if len(parts) != 2 or parts[0] not in ("on", "off", "frozen"):
             continue
         if _as_float(r.get("primary_val_ppl")) >= float("inf"):
@@ -2075,6 +2102,7 @@ def _plot_gauge_transport(sweep_dir: Path, fig_dir: Path) -> None:
         cells.append({"mode": parts[0], "depth": parts[1],
                       "ppl": _as_float(r.get("primary_val_ppl")),
                       "omega_dev": _as_float(r.get("omega_identity_dev"))})
+    cells = _aggregate_cells(cells, ("mode", "depth"), ("ppl", "omega_dev"))   # collapse seeds (M4)
     if len(cells) < 2:
         return
     plt = _plt_or_none()
@@ -2225,7 +2253,7 @@ def _plot_mu_precond(sweep_dir: Path, fig_dir: Path) -> None:
     fisher_mu_precond cells (label '<precond>_T<n_e_steps>'). No-op unless >= 2 such cells finished."""
     cells: List[Dict[str, Any]] = []
     for r in _collect_sweep_results(sweep_dir):
-        lab = str(r.get("label", ""))
+        lab = _base_label(str(r.get("label", "")))   # strip __s<seed> before parsing (M4)
         if "_T" not in lab or _as_float(r.get("primary_val_ppl")) >= float("inf"):
             continue
         pre, _, t = lab.partition("_T")
@@ -2236,6 +2264,7 @@ def _plot_mu_precond(sweep_dir: Path, fig_dir: Path) -> None:
         except ValueError:
             continue
         cells.append({"precond": pre, "n_e_steps": n_e, "ppl": _as_float(r.get("primary_val_ppl"))})
+    cells = _aggregate_cells(cells, ("precond", "n_e_steps"), ("ppl",))   # collapse seeds (M4)
     if len(cells) < 2:
         return
     plt = _plt_or_none()

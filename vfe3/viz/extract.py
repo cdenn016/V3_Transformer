@@ -58,7 +58,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
     r"""The full ``e_step_iteration`` knob bag assembled from the model config (mirrors vfe_block)."""
     cfg = model.cfg
     return dict(
-        tau=attention_tau(_as_coeff(cfg.kappa_beta, model.prior_bank.mu_embed.device), model.group.irrep_dims),
+        tau=attention_tau(model.effective_kappa_beta(model.prior_bank.mu_embed.device), model.group.irrep_dims),
         e_q_mu_lr=cfg.e_q_mu_lr, e_q_sigma_lr=cfg.e_q_sigma_lr, e_phi_lr=cfg.e_phi_lr,
         renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
         b0=_as_coeff(cfg.b0, model.prior_bank.mu_embed.device),
@@ -85,7 +85,7 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
     ``rope`` is honored (audit PP6): the logged F carries the RoPE-wrapped transport."""
     cfg = model.cfg
     return dict(
-        tau=attention_tau(_as_coeff(cfg.kappa_beta, model.prior_bank.mu_embed.device), model.group.irrep_dims),
+        tau=attention_tau(model.effective_kappa_beta(model.prior_bank.mu_embed.device), model.group.irrep_dims),
         renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
         b0=_as_coeff(cfg.b0, model.prior_bank.mu_embed.device),
         c0=_as_coeff(cfg.c0, model.prior_bank.mu_embed.device),
@@ -211,6 +211,7 @@ def belief_ce_bank(
                 log_prior=log_prior, block_norm=model.block_norm,
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
                 lambda_beta=cfg.lambda_beta,
+                kappa_beta_override=model.effective_kappa_beta(device),   # learned tau, not init (audit M1)
                 connection_W=getattr(model, "connection_W", None),
                 connection_M=getattr(model, "connection_M", None),
                 connection_L=getattr(model, "connection_L", None),
@@ -280,6 +281,7 @@ def belief_bank(
                 log_prior=log_prior, block_norm=model.block_norm,
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained
                 lambda_beta=cfg.lambda_beta,  # model
+                kappa_beta_override=model.effective_kappa_beta(device),   # learned tau, not init (audit M1)
                 connection_W=getattr(model, "connection_W", None),
                 connection_M=getattr(model, "connection_M", None),
                 connection_L=getattr(model, "connection_L", None),
@@ -435,7 +437,7 @@ def numerical_health(
     energy = pairwise_energy(fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.renyi_order,
                              kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
                              irrep_dims=model.group.irrep_dims)
-    beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), model.group.irrep_dims), log_prior=log_prior)
+    beta = attention_weights(energy, tau=attention_tau(model.effective_kappa_beta(out.mu.device), model.group.irrep_dims), log_prior=log_prior)
     spec = out.sigma if out.sigma.dim() == out.mu.dim() else condition_number(out.sigma)
     cond = float(condition_number(out.sigma).max()) if out.sigma.dim() > out.mu.dim() else \
         float((spec.amax(dim=-1) / spec.amin(dim=-1).clamp(min=1e-12)).max())
@@ -489,6 +491,7 @@ def converged_state(
             log_prior=log_prior, block_norm=model.block_norm,
             head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained model
             lambda_beta=cfg.lambda_beta,
+            kappa_beta_override=model.effective_kappa_beta(belief.mu.device),   # learned tau, not init (audit M1)
             connection_W=getattr(model, "connection_W", None),
             connection_M=getattr(model, "connection_M", None),
             connection_L=getattr(model, "connection_L", None),
@@ -524,7 +527,7 @@ def converged_state(
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
             irrep_dims=model.group.irrep_dims,
         )
-        beta = attention_weights(energy, tau=attention_tau(_as_coeff(cfg.kappa_beta, out.mu.device), model.group.irrep_dims), log_prior=log_prior)
+        beta = attention_weights(energy, tau=attention_tau(model.effective_kappa_beta(out.mu.device), model.group.irrep_dims), log_prior=log_prior)
         _q_conv = cap["converged"]                           # q*: the F self-term reads the pre-
         self_div = self_divergence_for_alpha(                # transform converged belief (F19,
             fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p), alpha=cfg.renyi_order,   # as diagnostics)
@@ -592,7 +595,7 @@ def attention_entropy_cov_gap(
             omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                                   on_value=cfg.rope_on_value)
     kw = dict(                                                    # the oracle's free-energy knob bag
-        tau=attention_tau(_as_coeff(cfg.kappa_beta, dev), model.group.irrep_dims),
+        tau=attention_tau(model.effective_kappa_beta(dev), model.group.irrep_dims),
         renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
         b0=_as_coeff(cfg.b0, dev), c0=_as_coeff(cfg.c0, dev), value=cfg.lambda_alpha,
         lambda_beta=cfg.lambda_beta, gradient_mode=cfg.gradient_mode, family=cfg.family,

@@ -140,6 +140,79 @@ def test_save_figures_emits_kappa_histories(tmp_path):
     for png in ("kappa_beta_history.png", "kappa_gamma_history.png"):
         assert (tmp_path / png).exists(), f"{png} not emitted"
 
+
+# ------------------------------------------------------ M4 (audit 2026-07-06): multiseed ablation figures
+
+def _capture_ablation_figure(monkeypatch, fn_name):
+    r"""Patch vfe3.viz.figures.<fn_name> (imported call-time inside the ablation collectors) to capture
+    the cells it is called with instead of rendering."""
+    cap = {}
+    def fake(cells, path=None):
+        cap["cells"] = list(cells)
+        return plt.figure()
+    monkeypatch.setattr(f"vfe3.viz.figures.{fn_name}", fake)
+    return cap
+
+
+def test_gauge_transport_figure_aggregates_seeds(monkeypatch, tmp_path):
+    # M4(a): on_L1__s6 must parse (not split into 4 parts and skip); the seed cells aggregate to one
+    # bar per (mode, depth) at the across-seed mean PPL.
+    rows = [
+        {"label": "on_L1__s6",  "primary_val_ppl": "10.0", "omega_identity_dev": "0.0"},
+        {"label": "on_L1__s7",  "primary_val_ppl": "12.0", "omega_identity_dev": "0.0"},
+        {"label": "off_L1__s6", "primary_val_ppl": "20.0", "omega_identity_dev": "1e-7"},
+        {"label": "off_L1__s7", "primary_val_ppl": "22.0", "omega_identity_dev": "3e-7"},
+    ]
+    monkeypatch.setattr(ablation, "_collect_sweep_results", lambda d: rows)
+    cap = _capture_ablation_figure(monkeypatch, "plot_gauge_transport_bars")
+    ablation._plot_gauge_transport(tmp_path, tmp_path)
+    assert "cells" in cap, "figure skipped: seeded on_L1__s* labels not parsed"
+    assert len(cap["cells"]) == 2
+    by = {(c["mode"], c["depth"]): c for c in cap["cells"]}
+    assert set(by) == {("on", "L1"), ("off", "L1")}
+    assert abs(by[("on", "L1")]["ppl"] - 11.0) < 1e-9      # (10 + 12) / 2
+    assert abs(by[("off", "L1")]["ppl"] - 21.0) < 1e-9     # (20 + 22) / 2
+
+
+def test_mu_precond_figure_aggregates_seeds(monkeypatch, tmp_path):
+    # M4(b): fisher_T2__s6 must parse (int('2__s6') would ValueError and skip); aggregate to one point
+    # per (precond, n_e_steps).
+    rows = [
+        {"label": "fisher_T2__s6", "primary_val_ppl": "30.0"},
+        {"label": "fisher_T2__s7", "primary_val_ppl": "32.0"},
+        {"label": "raw_T2__s6",    "primary_val_ppl": "40.0"},
+        {"label": "raw_T2__s7",    "primary_val_ppl": "42.0"},
+    ]
+    monkeypatch.setattr(ablation, "_collect_sweep_results", lambda d: rows)
+    cap = _capture_ablation_figure(monkeypatch, "plot_mu_precond")
+    ablation._plot_mu_precond(tmp_path, tmp_path)
+    assert "cells" in cap, "figure skipped: int('2__s6') ValueError on seeded labels"
+    assert len(cap["cells"]) == 2
+    by = {(c["precond"], c["n_e_steps"]): c for c in cap["cells"]}
+    assert set(by) == {("fisher", 2), ("raw", 2)}
+    assert abs(by[("fisher", 2)]["ppl"] - 31.0) < 1e-9
+    assert abs(by[("raw", 2)]["ppl"] - 41.0) < 1e-9
+
+
+def test_attention_entropy_figure_aggregates_seeds(monkeypatch, tmp_path):
+    # M4(c): the seed cells sharing (include_attention_entropy, kappa) must collapse to one cell at the
+    # mean PPL, not be passed as N per-seed cells (the figure would then plot one arbitrary seed).
+    rows = [
+        {"label": f"ent{e}__s{s}", "primary_val_ppl": str(p), "cov_gap": "inf",
+         "overrides": {"include_attention_entropy": e, "kappa_beta": 1.0}}
+        for (e, base) in ((True, 10.0), (False, 14.0)) for (s, p) in ((6, base), (7, base + 2.0))
+    ]
+    monkeypatch.setattr(ablation, "_collect_sweep_results", lambda d: rows)
+    cap = _capture_ablation_figure(monkeypatch, "plot_entropy_ppl_gap")
+    ablation._plot_attention_entropy(tmp_path, tmp_path)
+    assert "cells" in cap
+    assert len(cap["cells"]) == 2                           # one per include_attention_entropy at kappa=1
+    by = {bool(c["include_attention_entropy"]): c for c in cap["cells"]}
+    assert set(by) == {True, False}
+    assert abs(by[True]["ppl"] - 11.0) < 1e-9              # (10 + 12) / 2
+    assert abs(by[False]["ppl"] - 15.0) < 1e-9            # (14 + 16) / 2
+
+
 # --------------------------------------------------------------------------- pure-path certificate
 
 def _pure_ns(**over):

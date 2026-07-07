@@ -29,6 +29,19 @@ def test_optimizer_groups_priors_by_m_lr():
     assert n_params == len(list(model.parameters()))
 
 
+def test_phi_clamp_monitor_threshold_matches_transport_clamp():
+    # M2 (audit 2026-07-06): the M-step drift monitor must trip at the SAME Frobenius norm the
+    # transport clamp actually fires at -- else a phi whose embedded norm lands in (clamp, monitor]
+    # silently receives the surrogate exp(max_norm*M/||M||) transport with no warning. Pin the two
+    # defaults equal so they cannot drift apart again.
+    import inspect
+    from vfe3.train import _warn_phi_transport_clamp
+    from vfe3.geometry.transport import stable_matrix_exp_pair
+    monitor_thr = inspect.signature(_warn_phi_transport_clamp).parameters["max_norm"].default
+    clamp_thr   = inspect.signature(stable_matrix_exp_pair).parameters["max_norm"].default
+    assert monitor_thr == clamp_thr, f"monitor trips at {monitor_thr}, clamp fires at {clamp_thr}"
+
+
 def test_optimizer_groups_regime_ii_connection():
     # connection_W (transport_mode='regime_ii') is a trainable model-level nn.Parameter;
     # build_optimizer must group it so it actually trains and so its exact-coverage guard does not

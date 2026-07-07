@@ -734,12 +734,19 @@ def _direct_link_dense_bytes(batch: int, n_tok: int, k: int, dtype: torch.dtype)
     return batch * n_tok * n_tok * k * k * bytes_per
 
 
+# Frobenius-norm clamp for stable_matrix_exp_pair: above this the returned factor is the surrogate
+# exp(max_norm*M/||M||_F), NOT exp(M). Exported so the M-step drift monitor
+# (train._warn_phi_transport_clamp) trips at the SAME norm the clamp fires at -- the two cannot
+# diverge (audit 2026-07-06 M2).
+TRANSPORT_CLAMP_MAX_NORM: float = 15.0
+
+
 def stable_matrix_exp_pair(
     matrix:                  torch.Tensor,       # (..., d, d) Lie-algebra matrices
 
     *,
     exp_fp64_mode:           str                 = "dim",    # float64-island keying: 'dim' (dimension rule) | 'norm'
-    max_norm:                float               = 15.0,
+    max_norm:                float               = TRANSPORT_CLAMP_MAX_NORM,
     exp_fp64_norm_threshold: float               = 5.0,      # 'norm' mode: upcast when max clamped block ||M||_F >= this
     dim_threshold:           int                 = 20,
     skew_symmetric:          bool                = False,

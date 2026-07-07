@@ -76,6 +76,14 @@ def cache_supported(cfg: 'object') -> bool:
         and not cfg.use_cg_coupling
         and cfg.e_step_mu_precond == "fisher"
         and cfg.e_mu_q_trust is None
+        # M3 (audit 2026-07-06): result-changing toggles the cached kernel does NOT replicate, so
+        # caching under any of them would silently disagree with the full recompute it is pinned to.
+        and cfg.lambda_twohop == 0.0            # the cached kernel forwards no two-hop coupling block
+        and cfg.e_step_update != "mm_exact"     # the cache always does the gradient step + retraction
+        and not cfg.skip_belief_sigma_update    # the cache always retracts sigma
+        and not cfg.query_adaptive_tau          # the cache uses a static (non-query-adaptive) tau
+        and not cfg.gamma_as_beta_prior         # the cache folds no gamma-as-beta prior
+        and not cfg.learnable_kappa_beta        # the cache reads static cfg.kappa_beta, not the learned value
     )
 
 

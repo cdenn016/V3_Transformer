@@ -37,6 +37,7 @@ from vfe3.model.block import _as_coeff
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
 #                                                      lazily (function-local), so there is no cycle
+from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source for the phi-clamp threshold (M2)
 
 
 _PHI_CLAMP_WARNED: bool = False
@@ -45,7 +46,7 @@ _PHI_CLAMP_WARNED: bool = False
 def _warn_phi_transport_clamp(
     model:    VFEModel,
 
-    max_norm: float = 20.0,   # stable_matrix_exp_pair's default Frobenius clamp
+    max_norm: float = TRANSPORT_CLAMP_MAX_NORM,   # single source: stable_matrix_exp_pair's Frobenius clamp
 ) -> None:
     r"""Warn ONCE when a gauge-frame table's embedded Frobenius norm exceeds the transport clamp.
 
