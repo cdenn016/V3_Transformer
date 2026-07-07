@@ -6,6 +6,6 @@
 
 ## Pooled L(N) power law
 
-- exponent alpha = 0.5584  (95% CI [0.3899, 0.6031])
-- A = 9969, E = 3.9506
-- R^2 = 0.9996 over 12 sizes
+- exponent alpha = 0.5561  (95% CI [0.3998, 0.5997])
+- A = 9666, E = 3.9453
+- R^2 = 0.9995 over 12 sizes
