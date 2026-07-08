@@ -136,7 +136,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
     #          Gauge Group
     #################################
-    gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
+    gauge_parameterization    = "phi",        # "phi" | "omega_direct" (stored GL(K) element; glk/block_glk, flat)
     
     m_phi_natural_grad        = False,        # natural gradient on phi m-step
     m_gauge_update_rule       = "adam",                # vs "heavy_ball", vs the adamw arm
@@ -397,8 +397,19 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
              "irrep_spec": [("sym2", 2)],                     "phi_precond_mode": "killing"},
         ],
     },
-    
-    
+
+
+    "gauge_parameterization": {
+        "description": "gauge frame chart: phi (exp coords) vs omega_direct (stored GL(K) element)",
+        "configs": [
+            {"label": "phi",          "gauge_parameterization": "phi"},
+            {"label": "omega_direct", "gauge_parameterization": "omega_direct", "gauge_group": "glk",
+             "use_head_mixer": False},
+        ],
+        "requires": {"transport_mode": "flat"},
+    },
+
+
     "transport_mode": {  # regime_ii / regime_ii_covariant are learned connections (sanctioned NN exceptions)
         "description": "connection regime: flat phi-cocycle vs learned non-flat (regime_ii bilinear, regime_ii_covariant Route B)",
         "configs": [
@@ -1030,7 +1041,6 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
 # Fields deliberately NOT swept, with the reason:
 #   vocab_size             fixed by the dataset
-#   gauge_parameterization only 'phi' is live ('omega_direct' is config-rejected)
 #   encode_mode            only 'per_token' is live ('gauge_fixed' is a rejected stub)
 #   divergence_family      only 'renyi' is registered (renyi_order is its live knob)
 #   seed                   set per run from CONFIG['seed'] (the runner reseeds each cell)
@@ -1039,8 +1049,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 # (decode_mode='full' is a valid value left OUT of the decode_mode sweep: on the prior-bank path it
 #  drives the full-covariance SPD retraction's eigh to non-convergence -- a deferred robust-eigh
 #  issue, separate from the now-fixed full-cov KL Cholesky.)
+# (gauge_parameterization is swept via the "gauge_parameterization" arm in SWEEPS, not here.)
 NON_SWEPT_FIELDS = (
-    "vocab_size", "gauge_parameterization", "encode_mode", "divergence_family", "seed",
+    "vocab_size", "encode_mode", "divergence_family", "seed",
     "max_steps", "log_interval", "eval_interval", "checkpoint_interval", "eval_max_batches",
 )
 

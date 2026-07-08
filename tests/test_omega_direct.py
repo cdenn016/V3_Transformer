@@ -383,3 +383,8 @@ def test_appended_belief_step_omega_direct_uses_stored_frame():
     out1 = _appended_belief_step(b1, log_prior_app, model_ns, N, 1.0)
     out2 = _appended_belief_step(b2, log_prior_app, model_ns, N, 1.0)
     assert not torch.allclose(out1.mu, out2.mu, atol=1e-6)         # the stored frame must feed the rebuild
+
+
+def test_ablation_omega_direct_arm_builds():
+    cfg = _cfg(gauge_parameterization="omega_direct", gauge_group="glk", use_head_mixer=False)
+    assert cfg.gauge_parameterization == "omega_direct"
