@@ -25,7 +25,7 @@ _VALID_PRIOR_SOURCES       = ("token", "model_channel")
 _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
 _VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
 _VALID_OMEGA_RETRACT       = ("lie_exp", "cayley")
-_VALID_OMEGA_REFLECTION    = ("off", "init_seed")
+_VALID_OMEGA_REFLECTION    = ("off", "init_seed", "metropolis")
 
 
 @dataclass
@@ -381,7 +381,9 @@ class VFE3Config:
     phi_retract_mode:          str   = "bch"  # Lie-algebra step chart: euclidean (sum) or bch
     spd_retract_mode:          str   = "spd_affine" # SPD covariance retraction geometry (registry key)
     omega_retract_mode:        str   = "lie_exp"  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
-    omega_reflection:          str   = "off"      # omega_direct det<0 seeding: 'off' (det>0 only) | 'init_seed'
+    omega_reflection:          str   = "off"      # omega_direct det<0 seeding: 'off' (det>0 only) | 'init_seed' | 'metropolis'
+    omega_metropolis_temperature: float = 1.0    # T in the metropolis det-sign accept min(1, exp(-dF/T)); >0
+    omega_metropolis_every:       int   = 1       # cadence in optimizer steps for the metropolis det-sign sweep; >=1
     omega_compact_storage:     bool  = False     # opt-in compact (V,H,d,d)/(V,d,d) block storage (equal-block groups)
     omega_reorth_every:        int   = 0         # SO-group re-orthogonalization cadence in M-steps (0 = off)
 
@@ -905,6 +907,11 @@ class VFE3Config:
         from vfe3.geometry.transport import _TRANSPORTS
         _require(self.transport_mode, tuple(sorted(_TRANSPORTS)), "transport_mode")
         _require(self.omega_retract_mode, _VALID_OMEGA_RETRACT, "omega_retract_mode")
+        if self.omega_reflection == "ste":
+            raise NotImplementedError(
+                "omega_reflection='ste' (straight-through det-sign) is not implemented; use "
+                "'metropolis' for the learnable det-sign or 'init_seed' for a fixed one"
+            )
         _require(self.omega_reflection, _VALID_OMEGA_REFLECTION, "omega_reflection")
         # 'omega_direct' stores the per-token frame as a structure-group element U_i (belief.omega),
         # sourced from prior_bank.omega_embed, transport Omega_ij = U_i U_j^{-1}. Phase 2 scope:
@@ -917,10 +924,11 @@ class VFE3Config:
                     f"gauge_parameterization='omega_direct' supports gauge_group in {_OMEGA_GROUPS}; "
                     f"got {self.gauge_group!r}."
                 )
+            # det<0 seeding is group-specific; reject where the ambient diag(-1,1,...) seed is not a
+            # valid, tie-respecting, det<0 element of the structure group (deferred cases -> Phase 2b).
+            # Shared by both the 'init_seed' and 'metropolis' branches below.
+            _REFLECT_OK = ("glk", "block_glk", "so_k")   # so_k: valid O(K) seed; gl: ambient seed valid
             if self.omega_reflection == "init_seed":
-                # det<0 seeding is group-specific; reject where the ambient diag(-1,1,...) seed is not a
-                # valid, tie-respecting, det<0 element of the structure group (deferred cases -> Phase 2b).
-                _REFLECT_OK = ("glk", "block_glk", "so_k")   # so_k: valid O(K) seed; gl: ambient seed valid
                 if self.gauge_group not in _REFLECT_OK:
                     raise ValueError(
                         f"omega_reflection='init_seed' is not available for gauge_group="
@@ -928,6 +936,19 @@ class VFE3Config:
                         f"rho(O(N)) image seed, and tied_block_glk needs a tied replicated seed (all deferred). "
                         f"Use omega_reflection='off', or gauge_group in {_REFLECT_OK}."
                     )
+            if self.omega_reflection == "metropolis":
+                if self.gauge_group not in _REFLECT_OK:
+                    vacuous = self.gauge_group in ("sp", "sp_n")
+                    why = ("has det == +1 (connected, no reflection component), so a det-sign flip is vacuous"
+                           if vacuous else
+                           "needs a group-specific reflection seed (rho(O(N)) image / tied replicated) that is deferred")
+                    raise ValueError(
+                        f"omega_reflection='metropolis' is not available for gauge_group={self.gauge_group!r}: "
+                        f"it {why}. Use gauge_group in {_REFLECT_OK}, or omega_reflection='off'.")
+                if self.omega_metropolis_temperature <= 0.0:
+                    raise ValueError(f"omega_metropolis_temperature must be > 0, got {self.omega_metropolis_temperature}")
+                if self.omega_metropolis_every < 1:
+                    raise ValueError(f"omega_metropolis_every must be >= 1, got {self.omega_metropolis_every}")
             if self.transport_mode != "flat":
                 raise ValueError(
                     f"gauge_parameterization='omega_direct' requires transport_mode='flat'; "
