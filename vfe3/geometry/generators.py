@@ -277,3 +277,24 @@ def generate_son(
             idx += 1
 
     return G.to(dtype).to(device)
+
+
+def reflection_element(
+    K:      int,
+
+    *,
+    dtype:  torch.dtype                     = torch.float32,
+    device: 'torch.device | str | None'     = None,
+) -> torch.Tensor:                          # (K, K) det<0 reflection
+    r"""Canonical orientation-reversing reflection diag(-1, 1, ..., 1) in O(K) <= GL(K).
+
+    The single -1 gives det R = -1, so R lies in the det<0 component of GL(K) that no matrix
+    exponential (det exp = e^{tr} > 0) can reach. R is orthogonal and involutory (R = R^{-1} = R^T),
+    and diagonal, hence block-diagonal for any irrep_dims -- it is a valid element of GL(d_0) x ...
+    (the -1 sits in block 0). Used to seed the det<0 component at init for gauge_parameterization=
+    'omega_direct' (the discrete component cannot be reached by the continuous VFE minimization; see
+    docs/superpowers/specs/2026-07-07-omega-direct-gauge-parameterization-design.md sec 3.4).
+    """
+    diag = torch.ones(K, dtype=torch.float64)
+    diag[0] = -1.0
+    return torch.diag(diag).to(dtype).to(device)
