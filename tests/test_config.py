@@ -221,12 +221,31 @@ def test_config_rejects_negative_learning_rate_and_bad_rho():
 
 
 # --- Audit 2026-05-31: dead / trapping toggles are live + rejected, not silent ----
-def test_config_rejects_omega_direct_gauge_parameterization():
-    """omega_direct needs a per-token GL(K) matrix the no-NN belief (phi only) cannot supply,
-    so it is rejected at construction rather than silently aliased to the 'phi' path."""
-    with pytest.raises(NotImplementedError):
-        VFE3Config(gauge_parameterization="omega_direct")
+def test_config_accepts_omega_direct_on_gl_groups():
+    """omega_direct is now a live element-valued chart on the GL groups (glk, block_glk)."""
+    for grp, over in (("glk", {}), ("block_glk", {"n_heads": 2})):
+        cfg = VFE3Config(gauge_parameterization="omega_direct", gauge_group=grp,
+                         embed_dim=4, n_heads=over.get("n_heads", 1), transport_mode="flat", e_phi_lr=0.0)
+        assert cfg.gauge_parameterization == "omega_direct"
     assert VFE3Config(gauge_parameterization="phi").gauge_parameterization == "phi"
+
+
+def test_config_rejects_omega_direct_off_scope():
+    with pytest.raises(ValueError):                       # so_k has no det<0 element-store scope in Phase 1
+        VFE3Config(gauge_parameterization="omega_direct", gauge_group="so_k", embed_dim=4, n_heads=1)
+    with pytest.raises(ValueError):                       # E-step frame refinement not supported yet
+        VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1, e_phi_lr=0.1)
+    with pytest.raises(ValueError):                       # only the flat regime in Phase 1
+        VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1,
+                   transport_mode="regime_ii")
+
+
+def test_config_omega_retract_and_reflection_validated():
+    with pytest.raises(ValueError):
+        VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1,
+                   omega_retract_mode="bogus")
+    assert VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1,
+                      omega_retract_mode="cayley").omega_retract_mode == "cayley"
 
 
 def test_config_accepts_use_prior_bank_false():

@@ -24,6 +24,8 @@ _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_PRIOR_SOURCES       = ("token", "model_channel")
 _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
 _VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
+_VALID_OMEGA_RETRACT       = ("lie_exp", "cayley")
+_VALID_OMEGA_REFLECTION    = ("off", "init_seed")
 
 
 @dataclass
@@ -63,7 +65,7 @@ class VFE3Config:
 
     # gauge seam
     gauge_group:               str   = "block_glk"
-    gauge_parameterization:    str   = "phi"          # RESERVED axis: 'phi' is the sole live value; 'omega_direct' is rejected at validation (~line 682) until implemented.
+    gauge_parameterization:    str   = "phi"          # 'phi' (exp(phi.G), the pure default) | 'omega_direct' (store U in GL(K); glk/block_glk, transport_mode='flat', e_phi_lr=0)
 
     # gauge_transport: ablation meta-toggle over the GL(K) gauge FRAME (the A1 / EXP-2 gauge on/off/
     # frozen experiment; docs/hypotheses/2026-06-21-hypotheses.md). DISTINCT from transport_mode below
@@ -378,6 +380,8 @@ class VFE3Config:
     phi_precond_mode:          str   = "none"
     phi_retract_mode:          str   = "bch"  # Lie-algebra step chart: euclidean (sum) or bch
     spd_retract_mode:          str   = "spd_affine" # SPD covariance retraction geometry (registry key)
+    omega_retract_mode:        str   = "lie_exp"  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
+    omega_reflection:          str   = "off"      # omega_direct det<0 seeding: 'off' (det>0 only) | 'init_seed'
 
     # decode / encode
     use_prior_bank:            bool  = False
@@ -898,18 +902,29 @@ class VFE3Config:
         # config <- transport <- groups import cycle (matching the retraction pattern below).
         from vfe3.geometry.transport import _TRANSPORTS
         _require(self.transport_mode, tuple(sorted(_TRANSPORTS)), "transport_mode")
-        # 'omega_direct' (Omega_ij = Omega_i Omega_j^{-1} for general GL(K), det possibly < 0)
-        # needs a per-token K x K group element Omega_i. The no-NN belief carries only phi
-        # (n_gen Lie-algebra coords), from which the only constructible Omega_i is exp(embed(phi_i))
-        # -- making Omega_ij = exp(phi_i) exp(-phi_j), identical to the 'phi' path. There is no
-        # source for a non-exponential / det<0 GL(K) element in the belief, so the mode is rejected
-        # (live + enforced) rather than silently aliased to 'phi'.
+        # 'omega_direct' stores the per-token frame as a GL(K) group element U_i (belief.omega),
+        # sourced from prior_bank.omega_embed, transport Omega_ij = U_i U_j^{-1}. Phase 1 scope:
+        # the non-compact GL groups (glk, block_glk), the flat regime, and no E-step frame
+        # refinement. Everything outside that scope is rejected with a clear message.
         if self.gauge_parameterization == "omega_direct":
-            raise NotImplementedError(
-                "gauge_parameterization='omega_direct' needs a per-token GL(K) matrix Omega_i, "
-                "but the no-NN belief carries only phi (Lie-algebra coords); exp(phi) reduces it to "
-                "the 'phi' path. Use 'phi'."
-            )
+            if self.gauge_group not in ("glk", "block_glk"):
+                raise ValueError(
+                    f"gauge_parameterization='omega_direct' is Phase-1-scoped to gauge_group in "
+                    f"('glk', 'block_glk') (the non-compact GL groups where det<0 reach is meaningful); "
+                    f"got gauge_group={self.gauge_group!r}."
+                )
+            if self.transport_mode != "flat":
+                raise ValueError(
+                    f"gauge_parameterization='omega_direct' requires transport_mode='flat' in Phase 1; "
+                    f"got transport_mode={self.transport_mode!r}."
+                )
+            if self.e_phi_lr != 0.0:
+                raise ValueError(
+                    f"gauge_parameterization='omega_direct' does not support E-step frame refinement "
+                    f"(e_phi_lr>0) in Phase 1; got e_phi_lr={self.e_phi_lr}. Set e_phi_lr=0.0."
+                )
+        _require(self.omega_retract_mode, _VALID_OMEGA_RETRACT, "omega_retract_mode")
+        _require(self.omega_reflection, _VALID_OMEGA_REFLECTION, "omega_reflection")
         # cross_couplings (off-block GL(K) head coupling) is supported only by a group builder that
         # accepts the kwarg (block_glk). Reject otherwise (glk / so_k / tied_block_glk) by inspecting
         # the registered builder's signature, not a hardcoded name list, so support tracks the
