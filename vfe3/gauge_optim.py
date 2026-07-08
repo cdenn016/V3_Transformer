@@ -79,16 +79,20 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         irrep_dims:     List[int],            # block sizes (sum == K); used by *_per_block metrics
 
         *,
-        precond_mode:      str   = "pullback_per_block",
-        gauge_momentum:    float = 0.9,
-        gauge_update_rule: str   = "heavy_ball",
+        precond_mode:       str   = "pullback_per_block",
+        gauge_momentum:     float = 0.9,
+        gauge_update_rule:  str   = "heavy_ball",
+        omega_retract_mode: str   = "lie_exp",
         **kwargs,
     ) -> None:
         super().__init__(params, **kwargs)
-        self._generators     = generators
-        self._irrep_dims     = irrep_dims
-        self._precond_mode   = precond_mode
-        self._gauge_momentum = float(gauge_momentum)
+        self._generators        = generators
+        self._irrep_dims        = irrep_dims
+        self._precond_mode      = precond_mode
+        self._gauge_momentum    = float(gauge_momentum)
+        # Group-manifold retraction for the omega_direct group (params flagged omega=True): 'lie_exp'
+        # (matrix_exp; follows the one-parameter subgroup) or 'cayley' (exp-free (I-A/2)^{-1}(I+A/2)).
+        self._omega_retract_mode = omega_retract_mode
         # Moment rule for the natural-gradient gauge step: 'heavy_ball' (default; momentum only, no
         # per-coordinate normalization) or 'adam' (Adam m/v/bias-correction ON the natural gradient,
         # restoring 1/sqrt(v) normalization while keeping the metric direction).
@@ -141,6 +145,32 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         cos_acc: List[float] = []
         cond_acc: List[torch.Tensor] = []
         for group in self.param_groups:
+            if group.get("omega", False):
+                # omega_direct group: the params ARE stored GL(K) group elements U (shape (V, K, K)),
+                # not algebra coordinates. Step by a group-manifold retraction of the natural-gradient
+                # tangent xi = Gram^{-1} proj_g(U^T E) (extract_phi computes exactly this): U <- U retr(-lr xi),
+                # active (nonzero-grad) rows only, then consume the grad so base AdamW no-ops on it.
+                lr   = group["lr"]
+                p0   = group["params"][0]
+                Gd   = self._generators.to(device=p0.device, dtype=p0.dtype)
+                mode = getattr(self, "_omega_retract_mode", "lie_exp")
+                from vfe3.geometry.lie_ops import extract_phi, gram_pinv, retract_omega
+                gp = gram_pinv(Gd)                                     # (n_gen, n_gen) cached per step
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    E   = p.grad                                       # (V, K, K) dF/dU
+                    U   = p.data                                       # (V, K, K) stored group elements
+                    act = E.reshape(E.shape[0], -1).abs().sum(dim=-1) > 0   # (V,) rows with gradient
+                    if not bool(act.any()):
+                        p.grad = None
+                        continue
+                    Ua, Ea = U[act], E[act]                            # (A, K, K) each
+                    # natural-gradient tangent xi = Gram^{-1} proj_g(U^T E); (U^T E)_{km} = sum_l U_{lk} E_{lm}
+                    xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua, Ea), Gd, gram_pinv_=gp)
+                    U[act] = retract_omega(Ua, -lr * xi, Gd, mode=mode)   # (A, K, K) U <- U retr(-lr xi)
+                    p.grad = None                                      # consumed: AdamW no-ops on it
+                continue
             if not group.get("gauge", False):
                 continue
             lr  = group["lr"]

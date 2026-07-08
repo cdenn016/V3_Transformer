@@ -123,6 +123,10 @@ def build_optimizer(
     # those groups (Euclidean L2 on phi is non-geometric -- mass_phi shrinks the frame in the loss).
     # Default OFF: the flag is absent and every group is plain AdamW, byte-identical to before.
     nat = cfg.m_phi_natural_grad
+    # omega_direct (cfg.gauge_parameterization='omega_direct'): omega_embed holds GL(K) group elements
+    # U directly (not phi coordinates), so it is grouped {"omega": True} and stepped by the group-
+    # manifold retraction in GaugeNaturalGradAdamW. Default ('phi') leaves this False and the branch dead.
+    omega_direct = cfg.gauge_parameterization == "omega_direct"
     n_gen = model.group.generators.shape[0]
     # Each group carries an explicit "role" in {mu, sigma, phi} -- the belief-component family it
     # steps (mean-LR / scale-LR / gauge-LR). The grad-norm decomposition (train_step) aggregates the
@@ -150,6 +154,11 @@ def build_optimizer(
         {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd},
         phi_group,
     ]
+    if omega_direct:                                           # omega_embed holds GL(K) elements U directly
+        # Stepped by the group-manifold retraction (weight_decay=0: Euclidean L2 on a group element is
+        # non-geometric, the same exemption the gauge frame carries). role='phi' -> gauge-LR + phi grad-norm.
+        groups.append({"params": [pb.omega_embed], "lr": cfg.m_phi_lr,
+                       "weight_decay": 0.0, "role": "phi", "omega": True})
     if getattr(pb, "decode_mu_embed", None) is not None:        # untie_decode_bank=True decode tables
         # Cloned from the encode tables at init (step-0 byte-identical decode), trained separately so
         # the decode direction can decouple from the E-step prior/self-coupling target; grouped like
@@ -247,18 +256,21 @@ def build_optimizer(
             f"train. Add them to a param group."
         )
 
-    if nat:
+    if nat or omega_direct:
         # Geometrically-correct gauge frame: natural-gradient + momentum on the gauge groups under
         # cfg.phi_precond_mode (set it to 'pullback_per_block' for the exact exp-map metric -- killing
         # is conformal, so under this manual natural-grad step (which AdamW never normalizes) it is a
         # direction-preserving effective-LR rescale by the conformal factor, NOT a no-op; only the
         # non-conformal pullback metric reshapes the step direction), AdamW on every other group.
+        # Under omega_direct the {"omega": True} group is stepped by the group-manifold retraction
+        # (cfg.omega_retract_mode) instead; both custom steps live in GaugeNaturalGradAdamW.
         # fused is off: the custom gauge step bypasses the fused kernel, and the non-gauge groups are few.
         from vfe3.gauge_optim import GaugeNaturalGradAdamW
         return GaugeNaturalGradAdamW(
             groups, model.group.generators, list(model.group.irrep_dims),
             precond_mode=cfg.phi_precond_mode, gauge_momentum=cfg.m_gauge_momentum,
             gauge_update_rule=cfg.m_gauge_update_rule,
+            omega_retract_mode=cfg.omega_retract_mode,
             weight_decay=cfg.weight_decay,
         )
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is

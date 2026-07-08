@@ -484,3 +484,38 @@ def clamp_phi_trace(
     s_clamped = s.clamp(min=-trace_max, max=trace_max)
     delta = (s_clamped - s) @ gram_pinv                   # (..., H) joint solve, not per-block
     return phi + torch.einsum("...h,hg->...g", delta, V)
+
+
+def retract_omega(
+    U:          torch.Tensor,             # (..., K, K) current group element
+    xi:         torch.Tensor,             # (..., n_gen) descent step in algebra coords (already -lr scaled)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    mode:       str = "lie_exp",
+) -> torch.Tensor:                        # (..., K, K) retracted element U @ retr(xi . G)
+    r"""Group-manifold retraction of a stored GL(K) element: :math:`U_{new} = U\,\mathrm{retr}(\xi^a G_a)`.
+
+    ``'lie_exp'`` (default, principled): :math:`\mathrm{retr} = \exp`, following the one-parameter
+    subgroup :math:`t \mapsto U\exp(t\,\xi^a G_a)`. The exponential of the small near-identity step
+    :math:`\xi^a G_a` is well conditioned and stays in :math:`U`'s determinant component, since
+    :math:`\det\exp(A) = e^{\mathrm{tr}(A)} > 0`.
+
+    ``'cayley'`` (exp-free): :math:`\mathrm{retr}(A) = (I - A/2)^{-1}(I + A/2)`, a second-order
+    retraction that is also determinant-component preserving (for a small step both factors have
+    positive determinant, so their ratio does too).
+
+    Because :math:`\xi` is valued in the algebra span :math:`\{G_a\}` (block-diagonal for the
+    ``block_glk`` untied gauge), :math:`\mathrm{retr}(\xi^a G_a)` is block-diagonal and
+    :math:`U\,\mathrm{retr}(\xi^a G_a)` keeps :math:`U`'s block structure exactly.
+    """
+    A = embed_phi(xi, generators)                             # (..., K, K) algebra matrix sum_a xi^a G_a
+    if mode == "lie_exp":
+        step = torch.linalg.matrix_exp(A)                     # (..., K, K) exp of the step
+    elif mode == "cayley":
+        K   = A.shape[-1]
+        eye = torch.eye(K, dtype=A.dtype, device=A.device)
+        step = torch.linalg.solve(eye - 0.5 * A, eye + 0.5 * A)   # (I - A/2)^{-1}(I + A/2)
+    else:
+        raise ValueError(f"omega retract mode must be 'lie_exp' or 'cayley', got {mode!r}")
+    return U @ step

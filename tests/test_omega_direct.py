@@ -3,8 +3,9 @@ import torch
 
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
-from vfe3.geometry.generators import reflection_element
+from vfe3.geometry.generators import generate_glk, reflection_element
 from vfe3.geometry.groups import get_group
+from vfe3.geometry.lie_ops import retract_omega
 from vfe3.geometry.transport import (build_transport_from_element, compute_transport_operators,
                                       transport_mean, FactoredTransport)
 from vfe3.inference.e_step import build_belief_transport, e_step, e_step_iteration, free_energy_value
@@ -194,3 +195,31 @@ def test_omega_direct_reflection_changes_logits():
     with torch.no_grad():
         d = (m0(tok)[0] - m1(tok)[0]).abs().max()
     assert d > 1e-4                                          # the stored det<0 frame actually feeds the forward
+
+
+def test_retract_omega_stays_in_component_and_group():
+    G = generate_glk(3)                                       # (9,3,3)
+    U = torch.eye(3).expand(4, 3, 3).contiguous()
+    xi = 0.05 * torch.randn(4, 9, generator=torch.Generator().manual_seed(0))
+    for mode in ("lie_exp", "cayley"):
+        Un = retract_omega(U, xi, G, mode=mode)
+        assert Un.shape == (4, 3, 3)
+        assert (torch.det(Un) > 0).all()                     # retraction preserves the det>0 component
+        # a det<0 base stays det<0 (component preserved)
+        Rneg = U.clone(); Rneg[:, 0, 0] = -1.0
+        assert (torch.det(retract_omega(Rneg, xi, G, mode=mode)) < 0).all()
+
+
+def test_gauge_optim_omega_step_moves_active_rows_only():
+    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    G = generate_glk(3)
+    U = torch.nn.Parameter(torch.eye(3).expand(5, 3, 3).contiguous())
+    opt = GaugeNaturalGradAdamW([{"params": [U], "lr": 0.1, "omega": True, "weight_decay": 0.0}],
+                                G, [3], gauge_momentum=0.0)
+    U.grad = torch.zeros_like(U)
+    U.grad[2] = torch.randn(3, 3, generator=torch.Generator().manual_seed(1))   # only row 2 active
+    before = U.data.clone()
+    opt.step()
+    assert torch.allclose(U.data[0], before[0])              # inactive rows untouched
+    assert not torch.allclose(U.data[2], before[2])          # active row moved
+    assert torch.det(U.data[2]) > 0                           # still in GL+(3)
