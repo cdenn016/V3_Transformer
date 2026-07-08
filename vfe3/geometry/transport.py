@@ -1001,8 +1001,11 @@ def build_transport_from_element(
     for a single block (glk) the dense {'exp_phi','exp_neg_phi','Omega'} dict is returned (matching
     compute_transport_operators' return shape).
     """
-    with torch.amp.autocast(omega.device.type, enabled=False):    # inverse never in bf16/fp16
-        u_inv = torch.linalg.inv(omega.double()).to(omega.dtype)  # (B, N, K, K)
+    if group.skew_symmetric:
+        u_inv = omega.transpose(-1, -2)                           # U^{-1} = U^T exactly (orthogonal group), free
+    else:
+        with torch.amp.autocast(omega.device.type, enabled=False):   # fp64 island (non-compact inverse)
+            u_inv = torch.linalg.inv(omega.double()).to(omega.dtype)  # (B, N, K, K)
     block_dims = group.irrep_dims
     if len(block_dims) > 1 and len(set(block_dims)) == 1:
         return FactoredTransport(exp_phi=omega, exp_neg_phi=u_inv, irrep_dims=list(block_dims))

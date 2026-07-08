@@ -385,6 +385,31 @@ def test_appended_belief_step_omega_direct_uses_stored_frame():
     assert not torch.allclose(out1.mu, out2.mu, atol=1e-6)         # the stored frame must feed the rebuild
 
 
+def test_element_transport_skew_group_uses_transpose_inverse():
+    grp = get_group("so_k")(K=4)                              # skew_symmetric=True -> U in O(4)
+    g = torch.Generator().manual_seed(11)
+    xi = 0.2 * torch.randn(1, 3, grp.generators.shape[0], generator=g)
+    U = retract_omega(torch.eye(4).expand(1, 3, 4, 4).contiguous(), xi, grp.generators)  # in SO(4)
+    built = build_transport_from_element(U, grp)              # single block -> dict
+    # atol=0 alone is NOT bit-exact (default rtol=1e-5 masks the ~5e-7 inv-vs-transpose gap);
+    # rtol=0 too makes this a true bitwise check that only the transpose branch satisfies.
+    assert torch.allclose(built["exp_neg_phi"], U.transpose(-1, -2), atol=0, rtol=0)   # EXACT transpose, no inv
+    # cocycle telescopes
+    om = built["Omega"]
+    assert torch.allclose(om[0, 0, 1] @ om[0, 1, 2], om[0, 0, 2], atol=1e-5)
+    # Omega is exactly orthogonal (isometry)
+    eye = torch.eye(4).expand(1, 3, 3, 4, 4)
+    assert torch.allclose(torch.einsum("...kl,...ml->...km", om, om), eye, atol=1e-4)
+
+
+def test_element_transport_nonskew_still_uses_inv_byte_identical():
+    grp = get_group("glk")(K=3)                               # skew_symmetric=False -> unchanged inv path
+    U = (torch.eye(3) + 0.1 * torch.randn(1, 2, 3, 3, generator=torch.Generator().manual_seed(1)))
+    built = build_transport_from_element(U, grp)
+    ref_inv = torch.linalg.inv(U.double()).to(U.dtype)
+    assert torch.allclose(built["exp_neg_phi"], ref_inv, atol=0)   # exact same fp64-inv path as shipped
+
+
 def test_ablation_omega_direct_arm_builds():
     # Build every cell of the "gauge_parameterization" sweep the way the runner does -- baseline
     # (BASELINE_CONFIG, which sets lambda_gamma=0.75 and s_e_step=True) merged with the arm
