@@ -3,7 +3,7 @@ import torch
 
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
-from vfe3.geometry.generators import generate_glk, reflection_element
+from vfe3.geometry.generators import generate_glk, generate_son, reflection_element
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.lie_ops import retract_omega
 from vfe3.geometry.transport import (build_transport_from_element, compute_transport_operators,
@@ -234,3 +234,61 @@ def test_gauge_optim_omega_step_moves_active_rows_only():
     assert torch.allclose(U.data[0], before[0])              # inactive rows untouched
     assert not torch.allclose(U.data[2], before[2])          # active row moved
     assert torch.det(U.data[2]) > 0                           # still in GL+(3)
+
+
+def test_omega_direct_full_model_gauge_invariance():
+    """A global gauge transform of the tied prior tables leaves omega_direct decode logits invariant
+    (fp64), and the linear-decode arm has bite (fp32) -- the same t8 contract as the phi path."""
+    # The model's gauge group is glk (omega_direct is glk-scoped), but the END-TO-END decode
+    # invariance needs an ORTHOGONAL g: the decode/self-coupling prior covariance is the diagonal
+    # (V,K) sigma_log_embed table, so only g with g Sigma g^T representable in it are invariant.
+    # We therefore draw g from the SKEW so(4) generators (matrix_exp of skew is orthogonal) --
+    # exactly t8's reason for so_k (test_gauge_groups.py:188). The full GL(K) covariance law is
+    # pinned separately by the transport-level test below (no decode/sigma limitation).
+    def delta(dbl, **over):
+        torch.manual_seed(0); m = VFEModel(_cfg(gauge_parameterization="omega_direct", **over))
+        with torch.no_grad():
+            m.prior_bank.omega_embed.copy_(torch.eye(4).expand(6, 4, 4))       # frames -> identity
+            m.prior_bank.sigma_log_embed.zero_()                              # Sigma = I
+            if hasattr(m, "pos_phi_free"):
+                m.pos_phi_free.zero_()
+        if dbl: m = m.double()
+        m.eval()
+        # orthogonal g so the diagonal Sigma=I readout stays representable (g I g^T = I); the
+        # full-GL(K) covariance is pinned separately by the transport-level test below.
+        gen_so = generate_son(4).to(torch.float64 if dbl else torch.float32)   # skew -> matrix_exp is orthogonal
+        c = 0.3 * torch.randn(gen_so.shape[0], generator=torch.Generator().manual_seed(1)).to(gen_so.dtype)
+        g = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", c, gen_so))      # g in O(4): g g^T = I
+        eye = torch.eye(4, dtype=g.dtype)
+        assert torch.allclose(g @ g.transpose(-1, -2), eye, atol=1e-6)         # so(4) => g orthogonal
+        tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
+        with torch.no_grad():
+            l0 = m(tok)[0].clone()
+            m.prior_bank.mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.mu_embed))
+            # co-transform the stored frame: U -> g U (the cocycle U_i U_j^{-1} is g-invariant)
+            m.prior_bank.omega_embed.copy_(torch.einsum("kl,vlm->vkm", g, m.prior_bank.omega_embed))
+            l1 = m(tok)[0].clone()
+        return float((l0 - l1).abs().max())
+    assert delta(dbl=True) < 1e-5
+    assert delta(dbl=False, use_prior_bank=False) > 1e-4       # linear decode does not co-transform -> bite
+
+
+def test_omega_direct_transport_covariance_law():
+    """The omega_direct cocycle transports covariantly under a PER-TOKEN general GL(K) gauge:
+    Omega_ij -> g_i Omega_ij g_j^{-1}. Pins the full GL(K) property directly at the transport
+    level (fp64), with no decode/diagonal-sigma limitation -- the general-g claim the end-to-end
+    decode test cannot make (its diagonal Sigma readout forces g orthogonal)."""
+    from vfe3.geometry.groups import get_group
+    from vfe3.geometry.transport import build_transport_from_element
+    grp = get_group("glk")(K=3)
+    gen = torch.Generator().manual_seed(5)
+    N = 4
+    U = (torch.eye(3) + 0.15 * torch.randn(1, N, 3, 3, generator=gen)).double()      # invertible frames
+    g = (torch.eye(3) + 0.2 * torch.randn(N, 3, 3, generator=gen)).double()          # per-token general GL(3)
+    ginv = torch.linalg.inv(g)
+    om  = build_transport_from_element(U, grp)["Omega"]                               # (1,N,N,3,3)
+    Ug  = torch.einsum("nkl,bnlm->bnkm", g, U)                                        # U'_i = g_i U_i
+    omg = build_transport_from_element(Ug, grp)["Omega"]
+    # expected: Omega'_ij = g_i Omega_ij g_j^{-1}
+    exp = torch.einsum("ikl,bijlm,jmn->bijkn", g, om, ginv)
+    assert torch.allclose(omg, exp, atol=1e-9)
