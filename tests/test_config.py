@@ -618,3 +618,25 @@ def test_force_large_figures_default_off():
     is unchanged."""
     assert VFE3Config().force_large_figures is False
     assert VFE3Config(force_large_figures=True).force_large_figures is True
+
+
+@pytest.mark.parametrize("gamma_toggle", [
+    dict(lambda_gamma=0.1),                                   # gamma model-coupling loss term
+    dict(s_e_step=True),                                      # _refine_s s-channel E-step
+    dict(gamma_as_beta_prior=True, lambda_gamma=0.1),        # hierarchical gamma-in-belief-prior fold
+])
+def test_omega_direct_rejects_active_gamma_channel(gamma_toggle):
+    r"""Phase-1 omega_direct rejects the gamma / model-coupling channel: _gamma_energy (lambda_gamma>0
+    / gamma_as_beta_prior) and _refine_s (s_e_step) build their transport from the phi cocycle and do
+    NOT read the belief's omega frame, so under omega_direct they would silently transport the s tables
+    by exp(phi) instead of the stored U. Rejected until Phase 2 gives the s channel frame fidelity."""
+    with pytest.raises(ValueError, match="does not yet support the gamma"):
+        VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk",
+                   embed_dim=4, n_heads=1, **gamma_toggle)
+
+
+def test_omega_direct_pure_channel_off_constructs():
+    r"""The default (gamma-off) omega_direct config is accepted: lambda_gamma=0, s_e_step=False,
+    gamma_as_beta_prior=False leave no s-channel transport to mis-frame."""
+    cfg = VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1)
+    assert cfg.gauge_parameterization == "omega_direct"

@@ -830,7 +830,7 @@ class VFEModel(nn.Module):
         if self.final_norm is not None:                          # config-selected final norm (cached)
             mu_final = self.final_norm(mu_final, sigma_final)
 
-        belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi)
+        belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi, omega=out.omega)   # carry the GL(K) frame under omega_direct (None on the phi path)
         if capture is not None:
             # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
             # encode-time prior p (post s-refine) and the raw pre-final_norm stack output, which the
