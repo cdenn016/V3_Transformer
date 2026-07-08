@@ -6,7 +6,7 @@ from vfe3.geometry.generators import reflection_element
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.transport import (build_transport_from_element, compute_transport_operators,
                                       transport_mean, FactoredTransport)
-from vfe3.inference.e_step import build_belief_transport
+from vfe3.inference.e_step import build_belief_transport, e_step, e_step_iteration, free_energy_value
 
 
 def test_beliefstate_omega_field_optional_and_addressable():
@@ -77,8 +77,61 @@ def test_build_belief_transport_omega_direct_branch():
     U = torch.eye(3) + 0.1 * torch.randn(1, 3, 3, 3, generator=torch.Generator().manual_seed(1))
     built = build_belief_transport(phi, grp, gauge_parameterization="omega_direct", omega=U)
     ref = build_transport_from_element(U, grp)["Omega"]
-    assert torch.allclose(built["Omega"], ref, atol=1e-6)
+    # glk single-block: build_belief_transport normalizes the builder dict to a dense (B,N,N,K,K)
+    # Omega, matching the phi path (so the forward consumers get a tensor, never a raw dict).
+    assert torch.allclose(built, ref, atol=1e-6)
     # default axis unchanged: phi path returns its usual object
     phi_out = build_belief_transport(phi, grp)                # default 'phi' path, phi=0 -> Omega = I
     eye = torch.eye(3).expand(1, 3, 3, 3, 3)
     assert torch.allclose(phi_out, eye, atol=1e-6)            # glk single-block returns a dense Omega tensor
+
+
+def test_e_step_preserves_omega_across_belief_rebuilds():
+    # Regression for the belief-reconstruction omega drop: e_step_iteration returns a rebuilt
+    # BeliefState, and if it drops the constant omega frame then the NEXT iteration's transport
+    # build reads belief.omega == None and build_transport_from_element(None, ...) crashes. Chaining
+    # two iterations at e_phi_lr>0 (so the per-iteration rebuild path fires, not the e_phi_lr==0
+    # hoist) exercises exactly that: iter 2 reads iter 1's returned omega.
+    K, N = 4, 3
+    grp = get_group("glk")(K=K)
+    n_gen = grp.generators.shape[0]
+    g = torch.Generator().manual_seed(2)
+    mu = 0.1 * torch.randn(1, N, K, generator=g)
+    sigma = torch.ones(1, N, K)
+    phi = torch.zeros(1, N, n_gen)
+    U = torch.eye(K) + 0.05 * torch.randn(1, N, K, K, generator=g)   # invertible near-identity frames
+    belief = BeliefState(mu=mu, sigma=sigma, phi=phi, omega=U)
+    mu_p = torch.zeros(1, N, K)
+    sigma_p = torch.ones(1, N, K)
+
+    # (1) two chained iterations (iter 2 reads iter 1's rebuilt belief.omega): no crash + omega kept.
+    b1 = e_step_iteration(belief, mu_p, sigma_p, grp, e_phi_lr=0.1,
+                          gauge_parameterization="omega_direct")
+    assert b1.omega is not None                               # FIX 1: rebuild must carry omega through
+    b2 = e_step_iteration(b1, mu_p, sigma_p, grp, e_phi_lr=0.1,
+                          gauge_parameterization="omega_direct")
+    assert b2.omega is not None
+    assert torch.equal(b2.omega, U)                           # constant frame, unchanged by the E-step
+
+    # (2) end-to-end e_step (n_iter=2) also returns a belief that still carries omega.
+    out = e_step(belief, mu_p, sigma_p, grp, n_iter=2, e_phi_lr=0.1,
+                 gauge_parameterization="omega_direct")
+    assert out.omega is not None
+
+
+def test_free_energy_value_filtered_keys_rejects_omega_direct():
+    # FIX 3: the filtered (frozen-keys) free energy hand-builds Omega from phi frames, so it would
+    # silently use the WRONG frame under omega_direct. It must reject rather than degrade.
+    K, N = 4, 3
+    grp = get_group("glk")(K=K)
+    n_gen = grp.generators.shape[0]
+    mu = 0.1 * torch.randn(1, N, K)
+    sigma = torch.ones(1, N, K)
+    phi = torch.zeros(1, N, n_gen)
+    U = torch.eye(K).expand(1, N, K, K).contiguous()
+    belief = BeliefState(mu=mu, sigma=sigma, phi=phi, omega=U)
+    mu_p = torch.zeros(1, N, K)
+    sigma_p = torch.ones(1, N, K)
+    with pytest.raises(NotImplementedError):
+        free_energy_value(belief, mu_p, sigma_p, grp,
+                          gauge_parameterization="omega_direct", keys=belief)

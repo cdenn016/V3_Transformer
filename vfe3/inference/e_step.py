@@ -176,7 +176,15 @@ def build_belief_transport(
     and dense routes (the non-flat regime builders keep their own keying and swallow them).
     """
     if gauge_parameterization == "omega_direct":
+        # build_transport_from_element returns a FactoredTransport for the equal-block groups
+        # (block_glk) and a {'exp_phi','exp_neg_phi','Omega'} DICT for a single block (glk). The
+        # forward consumers (transport_mean / transport_covariance) accept a dense tensor,
+        # FactoredTransport, or RopeTransport -- NOT a dict -- so normalize the single-block dict to
+        # its dense Omega, matching the phi path (which returns a dense (B,N,N,K,K) Omega for glk via
+        # _transport). block_glk keeps the FactoredTransport fast path untouched.
         built = build_transport_from_element(omega, group)
+        if isinstance(built, dict):
+            built = built["Omega"]
     elif _can_fuse_flat(transport_mode, group):
         built = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
                                          exp_fp64_mode=exp_fp64_mode,
@@ -315,6 +323,13 @@ def free_energy_value(
             raise NotImplementedError(
                 f"free_energy_value with frozen keys is flat-only; got transport_mode="
                 f"{transport_mode!r} (the filtered diagnostic has no non-flat transport form)"
+            )
+        # _transport_qk hand-builds Omega_ij = exp(phi_i^q) exp(-phi_j^k) from the phi frames, so under
+        # gauge_parameterization='omega_direct' (frame stored as the element, phi ignored) it would
+        # silently use the WRONG frame. Reject rather than silently degrade (sibling of the guard above).
+        if gauge_parameterization == "omega_direct":
+            raise NotImplementedError(
+                "filtered-keys free energy does not support gauge_parameterization='omega_direct' yet"
             )
         omega = _transport_qk(belief.phi, keys.phi, group)
     mu_tv = sigma_tv = None
@@ -754,7 +769,13 @@ def e_step_iteration(
         )
         phi = retract_phi(belief.phi, -grad_phi, group, step_size=e_phi_lr, mode=phi_retract_mode)
 
-    return BeliefState(mu=mu, sigma=sigma, phi=phi)
+    # _replace (not a fresh BeliefState): carry the untouched channels (omega frame, s/r) through the
+    # rebuild. omega is the CONSTANT GL(K) frame under gauge_parameterization='omega_direct' -- the
+    # E-step never updates it, but every next-iteration transport build reads belief.omega, so a fresh
+    # BeliefState(mu,sigma,phi) would drop it to None and crash build_transport_from_element on the
+    # NEXT iteration when e_phi_lr>0 (the outer hoist guard does not fire, so each iteration rebuilds).
+    # NOT detached: omega's gradient must keep flowing to prior_bank.omega_embed (the M-step learns it).
+    return belief._replace(mu=mu, sigma=sigma, phi=phi)
 
 
 def e_step(
@@ -896,9 +917,14 @@ def e_step(
                     **kwargs,
                 )
             if t == no_grad_prefix - 1:
-                # Truncation boundary: fresh detached leaves so the last-k graph starts here.
-                belief = BeliefState(mu=belief.mu.detach(), sigma=belief.sigma.detach(),
-                                     phi=belief.phi.detach())
+                # Truncation boundary: fresh detached mu/sigma/phi leaves so the last-k graph starts
+                # here. _replace carries the omega frame (and s/r) through; omega is left ATTACHED
+                # (undetached) on purpose -- it is CONSTANT across E-step iterations, so it is not part
+                # of the truncated mu/sigma/phi unroll and does not reintroduce graph depth, and keeping
+                # it attached preserves the M-step gradient to omega_embed for the post-boundary
+                # iterations. Detaching it here would wrongly sever that gradient.
+                belief = belief._replace(mu=belief.mu.detach(), sigma=belief.sigma.detach(),
+                                         phi=belief.phi.detach())
                 # m10: the hoisted flat transport was built from the PRE-boundary phi under grad, so the
                 # last-k iterations (which consume it via _prebuilt_omega) would leak transport gradient
                 # through the boundary to the encode/pos-phi tables. Rebuild it from the now-detached phi
