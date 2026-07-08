@@ -43,7 +43,8 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
     ``diagnostics`` do -- the callers' ``mu_p = belief.mu`` handoff then anchors to the refined s,
     so every extracted trajectory/figure describes the model that actually trained."""
     enc = model.prior_bank.encode(token_ids[:1])                  # (1, N, ...)
-    belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=model._apply_pos_phi(enc.phi[0]))
+    belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=model._apply_pos_phi(enc.phi[0]),
+                         omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
     if model.cfg.s_e_step:
         s_mu1, s_sigma1 = model._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
         belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
@@ -51,7 +52,8 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
     log_prior = model._attention_log_prior(n, token_ids.device)
     log_prior = model._fold_precision_bias(log_prior, belief.sigma)   # no-op unless precision_weighted_attention;
     if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
-        log_prior = model._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0))[0]
+        log_prior = model._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
+                                            omega=belief.omega.unsqueeze(0) if belief.omega is not None else None)[0]
     rope = model._rope_rotation(n, token_ids.device)                  # belief.sigma is post-s_e_step, matching
     return belief, log_prior, rope                                    # forward's beliefs.sigma (model.py:762)
 
@@ -208,7 +210,8 @@ def belief_ce_bank(
             log_prior = model._attention_log_prior(n, device)
             log_prior = model._fold_precision_bias(log_prior, beliefs.sigma)   # no-op unless precision_weighted_attention
             if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
-                log_prior = model._fold_gamma_prior(log_prior, tokens, beliefs.phi)
+                log_prior = model._fold_gamma_prior(log_prior, tokens, beliefs.phi,
+                                                    omega=beliefs.omega if beliefs.omega is not None else None)
             rope = model._rope_rotation(n, device)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
@@ -280,7 +283,8 @@ def belief_bank(
             log_prior = model._attention_log_prior(n, device)
             log_prior = model._fold_precision_bias(log_prior, beliefs.sigma)   # no-op unless precision_weighted_attention
             if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
-                log_prior = model._fold_gamma_prior(log_prior, tokens, beliefs.phi)
+                log_prior = model._fold_gamma_prior(log_prior, tokens, beliefs.phi,
+                                                    omega=beliefs.omega if beliefs.omega is not None else None)
             rope = model._rope_rotation(n, device)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
