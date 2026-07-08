@@ -30,6 +30,7 @@ from vfe3.geometry.transport import (
     FactoredTransport,
     RopeTransport,
     build_factored_transport,
+    build_transport_from_element,
     compute_transport_operators,
     get_transport,
     transport_covariance,
@@ -58,6 +59,8 @@ def _transport(
     connection_L:       Optional[torch.Tensor] = None,      # (max_seq, max_seq, n_gen) learned direct link (regime_ii_link*, NN exception)
     mu_key:             Optional[torch.Tensor] = None,      # regime_ii KEY-slot means (None -> mu; oracle detach split)
     sigma_key:          Optional[torch.Tensor] = None,      # regime_ii_covariant KEY-slot variances (None -> sigma)
+    gauge_parameterization: str                    = "phi",   # 'phi' (exp path) | 'omega_direct' (stored element)
+    omega:              Optional[torch.Tensor] = None,      # (B, N, K, K) per-token U_i (omega_direct only)
 ) -> torch.Tensor:                            # (N, N, K, K) or (B, N, N, K, K) Omega_ij
     r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
@@ -74,6 +77,9 @@ def _transport(
     as a batch of one and stripped back to (N, N, K, K); a 3-D (B, N, n_gen) frame (the batched
     forward) flows straight through. ``mu``/``mu_key`` are unsqueezed to match so the builder always
     sees batched (B, N, K) means."""
+    if gauge_parameterization == "omega_direct":
+        built = build_transport_from_element(omega, group)
+        return built["Omega"] if isinstance(built, dict) else built.to_dense_omega()
     build = get_transport(transport_mode)
     batch_independent = transport_mode in _TRANSPORT_BATCH_INDEPENDENT
     if phi.dim() == 2:
@@ -120,6 +126,8 @@ def build_belief_transport(
 
     *,
     transport_mode:     str                    = "flat",   # connection-regime registry key
+    gauge_parameterization: str                = "phi",    # 'phi' (exp path) | 'omega_direct' (stored element)
+    omega:              Optional[torch.Tensor] = None,      # (B, N, K, K) per-token U_i (omega_direct only)
     gauge_mode:         str                    = "learned", # 'learned' | 'trivial' (forwarded to the builder)
     cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
     link_alpha:         float                  = 1.0,       # direct-link scale (regime_ii_link / _charted)
@@ -167,7 +175,9 @@ def build_belief_transport(
     dimension rule to the max clamped block norm; forwarded to the FLAT builders on both the fused
     and dense routes (the non-flat regime builders keep their own keying and swallow them).
     """
-    if _can_fuse_flat(transport_mode, group):
+    if gauge_parameterization == "omega_direct":
+        built = build_transport_from_element(omega, group)
+    elif _can_fuse_flat(transport_mode, group):
         built = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
                                          exp_fp64_mode=exp_fp64_mode,
                                          exp_fp64_norm_threshold=exp_fp64_norm_threshold,
@@ -244,6 +254,7 @@ def free_energy_value(
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
     spd_retract_mode:          str  = "spd_affine",    # accepted-and-ignored iteration-only knob
     transport_mode:            str  = "flat",          # HONORED for global F; raises for frozen keys
+    gauge_parameterization:    str  = "phi",           # HONORED for global F: 'phi' (exp path) | 'omega_direct' (stored element)
     cocycle_relaxation:        float = 1.0,            # HONORED for the global-F transport build (regime_ii)
     link_alpha:                float = 1.0,            # HONORED for the global-F direct-link build (regime_ii_link*)
     link_soft_cap:             float = 6.0,            # HONORED for the global-F direct-link build (regime_ii_link*)
@@ -290,6 +301,7 @@ def free_energy_value(
         # flat-transport diagnostic, not the regime_ii objective.
         omega = _transport(
             belief.phi, group, transport_mode=transport_mode,
+            gauge_parameterization=gauge_parameterization, omega=belief.omega,
             mu=(belief.mu if transport_mode in _TRANSPORT_NEEDS_MU else None),
             sigma=(belief.sigma if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
             connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
@@ -456,6 +468,7 @@ def e_step_iteration(
     phi_retract_mode:          str  = "euclidean",
     spd_retract_mode:          str  = "spd_affine",
     transport_mode:            str  = "flat",
+    gauge_parameterization:    str  = "phi",                  # 'phi' (exp path) | 'omega_direct' (stored element)
     e_step_gradient:           str  = "unroll",               # backward estimator: unroll | straight_through | detach
     oracle_unroll_grad:        bool = False,                  # opt-in: oracle returns a differentiable grad (unroll)
     cocycle_relaxation:        float = 1.0,                    # regime_ii homotopy alpha; 0 -> flat (ignored by flat)
@@ -511,6 +524,7 @@ def e_step_iteration(
                            mu_k: torch.Tensor, sigma_k: torch.Tensor):
             return build_belief_transport(
                 belief.phi, group, transport_mode=transport_mode,
+                gauge_parameterization=gauge_parameterization, omega=belief.omega,
                 mu=mu_q, mu_key=mu_k, connection_W=connection_W,
                 # regime_ii_covariant: the gauge-invariant features also read the belief variances;
                 # thread the ORACLE's sigma leaves (query slot live, key slot detached under
@@ -531,6 +545,7 @@ def e_step_iteration(
         else:
             omega = build_belief_transport(
                 belief.phi, group, transport_mode=transport_mode,
+                gauge_parameterization=gauge_parameterization, omega=belief.omega,
                 mu=belief.mu, connection_W=connection_W, connection_L=connection_L,
                 link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                 cocycle_relaxation=cocycle_relaxation,
@@ -803,6 +818,10 @@ def e_step(
     # e_step_iteration rebuild as before.  regime_ii is excluded because its Omega is mu-dependent
     # (mu changes every iteration regardless of e_phi_lr).
     transport_mode_kw: str = kwargs.get("transport_mode", "flat")
+    # popped (not .get, unlike transport_mode_kw): gauge_parameterization is forwarded EXPLICITLY
+    # into each e_step_iteration call below (alongside the **kwargs spread), so it must be removed
+    # from the kwargs bag first or the explicit kwarg + spread would collide (duplicate keyword).
+    gauge_param_kw:     str = kwargs.pop("gauge_parameterization", "phi")
     _hoisted_omega: 'torch.Tensor | FactoredTransport | RopeTransport | None' = None
     if e_phi_lr == 0.0 and transport_mode_kw == "flat":
         if prebuilt_transport is not None:
@@ -816,6 +835,7 @@ def e_step(
             _hoisted_omega = build_belief_transport(
                 belief.phi, group,
                 transport_mode="flat",
+                gauge_parameterization=gauge_param_kw, omega=belief.omega,
                 gauge_mode="learned",   # not an e_step kwarg (no **kwargs sink downstream); literal, not a dead kwargs read (m14)
                 clamp_monitor=kwargs.get("clamp_monitor", False),
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
@@ -835,6 +855,7 @@ def e_step(
         with torch.no_grad():
             return free_energy_value(b, mu_p, sigma_p, group, tau=tau, log_prior=log_prior,
                                      rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                                     gauge_parameterization=gauge_param_kw,
                                      **kwargs).item()
 
     # Tier-1 loop control (all default OFF -> the pure fixed-depth loop below, byte-identical).
@@ -869,6 +890,7 @@ def e_step(
                     exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                     transport_mean_per_head=transport_mean_per_head,
                     grad_record=grad_record,
+                    gauge_parameterization=gauge_param_kw,
                     log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                     _prebuilt_omega=_hoisted_omega,
                     **kwargs,
@@ -886,6 +908,7 @@ def e_step(
                     _hoisted_omega = build_belief_transport(
                         belief.phi, group,
                         transport_mode="flat",
+                        gauge_parameterization=gauge_param_kw, omega=belief.omega,
                         gauge_mode="learned",
                         clamp_monitor=kwargs.get("clamp_monitor", False),
                         exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
@@ -900,6 +923,7 @@ def e_step(
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
                 grad_record=grad_record,                       # last iteration overwrites -> converged-ish grad
+                gauge_parameterization=gauge_param_kw,
                 log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                 _prebuilt_omega=_hoisted_omega,
                 **kwargs,
