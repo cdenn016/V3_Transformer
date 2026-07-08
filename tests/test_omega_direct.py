@@ -619,16 +619,31 @@ def test_omega_compact_flag_is_noop_for_equal_dim_towers():
 def test_ablation_omega_direct_arm_builds():
     # Build every cell of the "gauge_parameterization" sweep the way the runner does -- baseline
     # (BASELINE_CONFIG, which sets lambda_gamma=0.75 and s_e_step=True) merged with the arm
-    # overrides -- so this exercises the real BASELINE_CONFIG interaction. The omega_direct arm
-    # MUST override lambda_gamma=0.0 / s_e_step=False, or its Phase-1 gamma-channel gate rejects it.
+    # overrides -- so this exercises the real BASELINE_CONFIG interaction. The arm fans out one
+    # phi baseline plus one omega_direct cell per gauge_group in vfe3.config's omega-eligible set
+    # (glk, block_glk, tied_block_glk, so_k, sp, so_n, sp_n); every omega_direct cell MUST override
+    # lambda_gamma=0.0 / s_e_step=False, or its Phase-1 gamma-channel gate rejects it.
     import ablation
 
     runs = ablation.make_run_overrides("gauge_parameterization")
-    labels = {label for label, _ in runs}
-    assert labels == {"phi", "omega_direct"}
+    labels = [label for label, _ in runs]
+    assert len(labels) == len(set(labels))                     # no duplicate cell labels
+    assert "phi" in labels
+    omega_labels = [label for label in labels if label != "phi"]
+    assert len(omega_labels) == 7                              # one per _OMEGA_GROUPS entry
+    assert all(label.startswith("omega_direct_") for label in omega_labels)
+
     built = {}
     for label, overrides in runs:
         cfg_dict = ablation._cell_cfg_dict(overrides, seed=0, max_steps=1)
-        built[label] = VFE3Config(**cfg_dict)                 # must not raise for either cell
-    assert built["omega_direct"].gauge_parameterization == "omega_direct"
-    assert built["omega_direct"].lambda_gamma == 0.0 and built["omega_direct"].s_e_step is False
+        built[label] = VFE3Config(**cfg_dict)                  # must not raise for ANY cell
+
+    assert built["phi"].gauge_parameterization == "phi"
+    seen_groups = set()
+    for label in omega_labels:
+        cfg = built[label]
+        assert cfg.gauge_parameterization == "omega_direct"
+        assert cfg.lambda_gamma == 0.0
+        assert cfg.s_e_step is False
+        seen_groups.add(cfg.gauge_group)
+    assert seen_groups == {"glk", "block_glk", "tied_block_glk", "so_k", "sp", "so_n", "sp_n"}

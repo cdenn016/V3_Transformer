@@ -400,15 +400,57 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
 
     # omega_direct is Phase-1-gated against the gamma / model-coupling (s) channel (its s-transport
-    # would use exp(phi), not the stored U), so BOTH arms disable it (lambda_gamma=0, s_e_step=False)
-    # to keep the phi-vs-omega_direct comparison fair and let both cells build off BASELINE_CONFIG.
+    # would use exp(phi), not the stored U), so EVERY arm disables it (lambda_gamma=0, s_e_step=False)
+    # to keep the phi-vs-omega_direct comparison fair and let every cell build off BASELINE_CONFIG.
+    # One phi baseline plus one omega_direct cell per gauge_group in vfe3.config._OMEGA_GROUPS, reusing
+    # the group_n/irrep_spec/phi_precond_mode payloads from the gauge_group arm above (~383-398):
+    #   - glk/so_k/sp are single-block groups -> use_head_mixer=False (same as the gauge_group arm).
+    #   - block_glk/tied_block_glk keep the baseline's use_head_mixer=True (n_heads=2 is >= 2 equal
+    #     blocks); tied_block_glk additionally overrides phi_precond_mode='killing' because the
+    #     baseline's 'killing_per_block' generators do not partition per head under the tied gauge
+    #     (same override the cache_supported tied_block_glk arm at ~528-533 uses).
+    #   - so_n/sp_n towers keep phi_precond_mode='killing' (ambient; the shared generators do not
+    #     partition per irrep block either). The so3_spin2x4 tower additionally overrides n_heads=4:
+    #     BASELINE_CONFIG's causal_alibi priors build an (n_heads, N, N) bias that must equal the
+    #     4-block irrep count (same override the cg_coupling arm at ~556-557 uses for this tower) --
+    #     the plain gauge_group arm's so3_spin2x4 cell (~391-392) lacks this override and currently
+    #     fails to construct against BASELINE_CONFIG's alibi priors, a pre-existing issue out of scope
+    #     here. sp4_sym2x2's 2 blocks already equal n_heads=2, so no override is needed there.
     "gauge_parameterization": {
-        "description": "gauge frame chart: phi (exp coords) vs omega_direct (stored GL(K) element)",
+        "description": "gauge frame chart: phi (exp coords) vs omega_direct (stored GL(K) element), per gauge_group",
         "configs": [
-            {"label": "phi",          "gauge_parameterization": "phi",
+            {"label": "phi",                         "gauge_parameterization": "phi",
              "lambda_gamma": 0.0, "s_e_step": False},
-            {"label": "omega_direct", "gauge_parameterization": "omega_direct", "gauge_group": "glk",
-             "use_head_mixer": False, "lambda_gamma": 0.0, "s_e_step": False},
+
+            {"label": "omega_direct_glk",             "gauge_parameterization": "omega_direct",
+             "gauge_group": "glk",                    "use_head_mixer": False,
+             "lambda_gamma": 0.0, "s_e_step": False},
+
+            {"label": "omega_direct_block_glk",       "gauge_parameterization": "omega_direct",
+             "gauge_group": "block_glk",               "n_heads": 2,
+             "lambda_gamma": 0.0, "s_e_step": False},
+
+            {"label": "omega_direct_tied_block_glk",  "gauge_parameterization": "omega_direct",
+             "gauge_group": "tied_block_glk",          "n_heads": 2, "phi_precond_mode": "killing",
+             "lambda_gamma": 0.0, "s_e_step": False},
+
+            {"label": "omega_direct_so_k",            "gauge_parameterization": "omega_direct",
+             "gauge_group": "so_k",                    "use_head_mixer": False,
+             "lambda_gamma": 0.0, "s_e_step": False},
+
+            {"label": "omega_direct_sp",               "gauge_parameterization": "omega_direct",
+             "gauge_group": "sp",                       "use_head_mixer": False,
+             "lambda_gamma": 0.0, "s_e_step": False},
+
+            {"label": "omega_direct_so3_spin2x4",     "gauge_parameterization": "omega_direct",
+             "gauge_group": "so_n", "group_n": 3, "irrep_spec": [("l2", 4)],
+             "phi_precond_mode": "killing", "n_heads": 4,
+             "lambda_gamma": 0.0, "s_e_step": False},
+
+            {"label": "omega_direct_sp4_sym2x2",      "gauge_parameterization": "omega_direct",
+             "gauge_group": "sp_n", "group_n": 4, "irrep_spec": [("sym2", 2)],
+             "phi_precond_mode": "killing",
+             "lambda_gamma": 0.0, "s_e_step": False},
         ],
         "requires": {"transport_mode": "flat"},
     },
