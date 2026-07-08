@@ -444,6 +444,27 @@ def test_omega_direct_full_model_forward_sp_spn_tied():
         assert torch.isfinite(logits).all()
 
 
+def test_omega_direct_so_k_orthogonal_and_reflection_reach():
+    grp = get_group("so_k")(K=4)
+    U = retract_omega(torch.eye(4).expand(1, 3, 4, 4).contiguous(),
+                      0.2 * torch.randn(1, 3, grp.generators.shape[0], generator=torch.Generator().manual_seed(4)),
+                      grp.generators)
+    assert torch.allclose(U @ U.transpose(-1, -2), torch.eye(4).expand_as(U @ U.transpose(-1, -2)), atol=1e-4)
+    assert (torch.det(U) > 0).all()                            # retraction stays in SO(4)
+    # init_seed reaches det<0 (O(4)\SO(4)) via reflection_element
+    R = reflection_element(4)
+    assert torch.det(R @ U[0, 0]) < 0
+
+
+def test_omega_reorth_projects_drifted_element_back_to_O_K():
+    # a slightly non-orthogonal element (fp32-drift analog) is re-orthogonalized by the helper/optimizer path
+    U = torch.eye(4) + 0.05 * torch.randn(4, 4, generator=torch.Generator().manual_seed(5))
+    # polar factor: U = Q P, Q orthogonal
+    from vfe3.gauge_optim import _polar_orthogonalize
+    Q = _polar_orthogonalize(U.unsqueeze(0))[0]
+    assert torch.allclose(Q @ Q.transpose(-1, -2), torch.eye(4), atol=1e-5)
+
+
 def test_ablation_omega_direct_arm_builds():
     # Build every cell of the "gauge_parameterization" sweep the way the runner does -- baseline
     # (BASELINE_CONFIG, which sets lambda_gamma=0.75 and s_e_step=True) merged with the arm

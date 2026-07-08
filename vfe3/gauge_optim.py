@@ -38,6 +38,22 @@ import torch
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient, pullback_metric_per_block
 
 
+def _polar_orthogonalize(
+    U: torch.Tensor,                      # (..., K, K) possibly drifted-off-O(K) element
+) -> torch.Tensor:                        # (..., K, K) nearest orthogonal matrix
+    r"""Nearest orthogonal matrix to ``U`` via the polar decomposition :math:`Q = U (U^T U)^{-1/2}`.
+
+    Uses the SVD polar factor :math:`Q = W V^T` (:math:`U = W S V^T`), the exact Frobenius-norm
+    minimizer of :math:`\lVert U - Q \rVert_F` over :math:`O(K)`. Runs in a float64 island
+    (autocast disabled) so the drift correction itself does not introduce fresh fp32 rounding;
+    keeps a drifted skew-group frame exactly on :math:`O(K)` so ``U^T`` stays the exact inverse
+    (the transpose fast path :func:`build_transport_from_element` relies on for skew groups).
+    """
+    with torch.amp.autocast(U.device.type, enabled=False):
+        W, _, Vh = torch.linalg.svd(U.double(), full_matrices=False)
+        return (W @ Vh).to(U.dtype)
+
+
 class GaugeNaturalGradAdamW(torch.optim.AdamW):
     r"""AdamW everywhere, natural-gradient + momentum on the gauge-frame coordinate groups.
 
@@ -83,6 +99,8 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         gauge_momentum:     float = 0.9,
         gauge_update_rule:  str   = "heavy_ball",
         omega_retract_mode: str   = "lie_exp",
+        skew_symmetric:     bool  = False,
+        omega_reorth_every: int   = 0,
         **kwargs,
     ) -> None:
         super().__init__(params, **kwargs)
@@ -93,6 +111,15 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         # Group-manifold retraction for the omega_direct group (params flagged omega=True): 'lie_exp'
         # (matrix_exp; follows the one-parameter subgroup) or 'cayley' (exp-free (I-A/2)^{-1}(I+A/2)).
         self._omega_retract_mode = omega_retract_mode
+        # Orthogonality-drift control for a SKEW (orthogonal, e.g. so_k/so_n) omega_direct group:
+        # fp32 accumulation of exp(skew) retraction products walks the stored U off O(K) over many
+        # M-steps, after which U^T stops being the exact inverse (the transpose fast path
+        # build_transport_from_element relies on for skew groups). skew_symmetric mirrors
+        # model.group.skew_symmetric (threaded from build_optimizer); omega_reorth_every>0 turns on a
+        # periodic polar re-orthogonalization every that many M-steps. Default 0 = off = byte-identical.
+        self._skew_symmetric     = bool(skew_symmetric)
+        self._omega_reorth_every = int(omega_reorth_every)
+        self._omega_step         = 0                     # M-step counter for the reorth cadence
         # Moment rule for the natural-gradient gauge step: 'heavy_ball' (default; momentum only, no
         # per-coordinate normalization) or 'adam' (Adam m/v/bias-correction ON the natural gradient,
         # restoring 1/sqrt(v) normalization while keeping the metric direction).
@@ -170,6 +197,16 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                     xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua, Ea), Gd, gram_pinv_=gp)
                     U[act] = retract_omega(Ua, -lr * xi, Gd, mode=mode)   # (A, K, K) U <- U retr(-lr xi)
                     p.grad = None                                      # consumed: AdamW no-ops on it
+                # Orthogonality-drift control (default OFF: omega_reorth_every=0 -> byte-identical).
+                # Only meaningful for a SKEW (orthogonal, e.g. so_k/so_n) group -- a non-skew element
+                # (glk/sp/...) has no O(K) to drift back onto. Cadence is counted in M-steps (this
+                # branch runs once per optimizer.step() call), not in active-row updates, so drift
+                # accumulated over past steps is corrected on schedule even on a step with no gradient.
+                if self._skew_symmetric and self._omega_reorth_every > 0:
+                    self._omega_step += 1
+                    if self._omega_step % self._omega_reorth_every == 0:
+                        for p in group["params"]:
+                            p.data.copy_(_polar_orthogonalize(p.data))
                 continue
             if not group.get("gauge", False):
                 continue

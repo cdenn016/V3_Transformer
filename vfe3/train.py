@@ -271,6 +271,8 @@ def build_optimizer(
             precond_mode=cfg.phi_precond_mode, gauge_momentum=cfg.m_gauge_momentum,
             gauge_update_rule=cfg.m_gauge_update_rule,
             omega_retract_mode=cfg.omega_retract_mode,
+            skew_symmetric=model.group.skew_symmetric,
+            omega_reorth_every=cfg.omega_reorth_every,
             weight_decay=cfg.weight_decay,
         )
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
