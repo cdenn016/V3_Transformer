@@ -410,6 +410,40 @@ def test_element_transport_nonskew_still_uses_inv_byte_identical():
     assert torch.allclose(built["exp_neg_phi"], ref_inv, atol=0)   # exact same fp64-inv path as shipped
 
 
+def test_omega_direct_sp_symplectic_membership_and_cocycle():
+    # Phase 2 Task 3: sp is skew_symmetric=False (real value of the non-exp-interior omega_direct
+    # reach), reusing the existing (V,K,K) table + fp64-inv transport + group-agnostic optimizer --
+    # no source change. This pins the group-membership invariant: a retracted frame stays IN Sp(4,R)
+    # (preserves the symplectic form J), and the assembled cocycle still telescopes.
+    grp = get_group("sp")(K=4)                                 # Sp(4,R); n_gen = m(2m+1) = 2*5 = 10
+    assert grp.generators.shape[0] == 10
+    g = torch.Generator().manual_seed(3)
+    xi = 0.15 * torch.randn(1, 3, grp.generators.shape[0], generator=g)
+    U = retract_omega(torch.eye(4).expand(1, 3, 4, 4).contiguous(), xi, grp.generators)  # in Sp(4,R)
+    # symplectic form J = [[0,I],[-I,0]] preserved: U^T J U = J
+    m = 2; J = torch.zeros(4, 4); J[:m, m:] = torch.eye(m); J[m:, :m] = -torch.eye(m)
+    UtJU = U.transpose(-1, -2) @ J @ U
+    assert torch.allclose(UtJU, J.expand_as(UtJU), atol=1e-4)
+    om = build_transport_from_element(U, grp)["Omega"]         # single block (irrep_dims=[4]) -> dict
+    assert torch.allclose(om[0, 0, 1] @ om[0, 1, 2], om[0, 0, 2], atol=1e-4)   # cocycle
+
+
+def test_omega_direct_full_model_forward_sp_spn_tied():
+    # Phase 2 Task 3: full-model forward smoke for the three skew_symmetric=False groups whose
+    # omega_direct reach is REAL and live via the ordinary M-step optimizer (Task 2 opened the
+    # config gate; this proves each group actually builds and runs end-to-end under omega_direct).
+    tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
+    for over in (dict(gauge_group="sp", embed_dim=4, n_heads=1),
+                 dict(gauge_group="sp_n", embed_dim=5, n_heads=1, group_n=4,
+                      irrep_spec=[("sym0", 1), ("sym1", 1)]),          # dims [1,4] sum to embed_dim=5
+                 dict(gauge_group="tied_block_glk", embed_dim=4, n_heads=2)):
+        torch.manual_seed(0)
+        m = VFEModel(_cfg(gauge_parameterization="omega_direct", use_head_mixer=False, **over))
+        with torch.no_grad():
+            logits = m(tok)[0]
+        assert torch.isfinite(logits).all()
+
+
 def test_ablation_omega_direct_arm_builds():
     # Build every cell of the "gauge_parameterization" sweep the way the runner does -- baseline
     # (BASELINE_CONFIG, which sets lambda_gamma=0.75 and s_e_step=True) merged with the arm
