@@ -813,7 +813,7 @@ class VFEModel(nn.Module):
                 # pi <- (1-w) softmax(B) + w gamma (h->s->p->q: models tell beliefs where to attend).
                 # Detached like the precision bias above, so the closed-form belief kernel stays
                 # exact; the forward's diagnostic replays do NOT refold this (forward-path only).
-                log_prior = self._fold_gamma_prior(log_prior, token_ids, beliefs.phi)
+                log_prior = self._fold_gamma_prior(log_prior, token_ids, beliefs.phi, omega=beliefs.omega)
             # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
             # M-step self-coupling term in forward (manuscript: the self-term reads q*, not the
             # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.
@@ -1331,7 +1331,8 @@ class VFEModel(nn.Module):
         log_prior = self._attention_log_prior(n, token_ids.device)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward/diagnostics/attention_maps (r2 id22)
         if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
-            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0))[0]
+            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
+                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None)[0]
         rope = self._rope_rotation(n, token_ids.device)
         out = vfe_stack(                                             # converged belief gauge frame
             belief, belief.mu, belief.sigma, self.group, self.cfg,
@@ -1558,6 +1559,7 @@ class VFEModel(nn.Module):
         phi:       torch.Tensor,             # (B, N, n_gen) gauge frame for the gamma TIED flat transport
 
         *,
+        omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
         log_eps:   float = 1e-12,            # floor for log(pi) on the allowed support (free_energy's pattern)
     ) -> torch.Tensor:                       # (B, [H,] N, N) mixed log-prior
         r"""Hierarchical attention prior (cfg.gamma_as_beta_prior): fold the model channel's DETACHED
@@ -1579,7 +1581,7 @@ class VFEModel(nn.Module):
         from vfe3.free_energy import attention_weights
         w = self.cfg.gamma_prior_weight
         with torch.no_grad():
-            e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi)
+            e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega)
             gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)  # (B, [H,] N, N)
         if log_prior is None:
             pi_b    = torch.full_like(gamma, 1.0 / gamma.shape[-1])   # uniform prior over keys
@@ -1658,7 +1660,8 @@ class VFEModel(nn.Module):
         log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
         if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
-            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0))[0]
+            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
+                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None)[0]
         rope = self._rope_rotation(n, token_ids.device)               # rope shapes the converged belief (as forward)
         cap: dict = {}                                                # q* capture (F self-term reads it, as forward)
         out = vfe_stack(                                              # converged belief
@@ -1939,7 +1942,8 @@ class VFEModel(nn.Module):
         log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
         if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
-            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0))[0]
+            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
+                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None)[0]
         fam = get_family(cfg.family)
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
         mu_p, sigma_p = belief.mu, belief.sigma
@@ -2052,7 +2056,8 @@ class VFEModel(nn.Module):
         log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior
         if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
-            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0))[0]
+            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
+                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None)[0]
         fam = get_family(cfg.family)
         _lb = cfg.lambda_beta
         _tau = attention_tau(self.effective_kappa_beta(belief.mu.device), self.group.irrep_dims)
