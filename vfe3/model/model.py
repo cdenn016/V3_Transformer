@@ -1100,7 +1100,8 @@ class VFEModel(nn.Module):
             # design, NOT this term. Computed once per forward at the loss level (like diagnostics()).
             # The body lives in _gamma_coupling_term so diagnostics logs the SAME term (audit V2).
             loss = loss + self.cfg.lambda_gamma * self._gamma_coupling_term(
-                token_ids, belief.phi.detach())
+                token_ids, belief.phi.detach(),
+                omega=belief.omega.detach() if belief.omega is not None else None)
         return logits, loss, ce.detach()
 
     @property
@@ -1245,17 +1246,21 @@ class VFEModel(nn.Module):
         self,
         token_ids: torch.Tensor,             # (B, N) integer token ids
         phi:       torch.Tensor,             # (B, N, n_gen) converged gauge frame (detached by caller)
+
+        *,
+        omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
     ) -> torch.Tensor:                       # () model-coupling block (UNWEIGHTED)
         r"""The gamma model-coupling block at the given gauge frame (UNWEIGHTED).
 
         gamma = softmax_j(log pi^s - E^s/tau_g) over the :meth:`_gamma_energy` energy, reduced to
         either the canonical envelope -tau_g log Z^s (include_attention_entropy=True) or the
         surrogate sum_j gamma_ij E^s_ij (False; audit P6 -- one toggle, both channels). Shared by
-        ``forward`` (grad to the s tables; caller detaches phi) and :meth:`diagnostics` (audit V2).
-        :meth:`_gamma_coupling_terms` is the SPLIT (coupling vs meta-entropy) diagnostic sibling.
+        ``forward`` (grad to the s tables; caller detaches phi/omega) and :meth:`diagnostics`
+        (audit V2). :meth:`_gamma_coupling_terms` is the SPLIT (coupling vs meta-entropy)
+        diagnostic sibling.
         """
         from vfe3.free_energy import attention_weights, reduced_free_energy
-        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi)
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega)
         if self.cfg.include_attention_entropy:
             # canonical: the envelope -tau_g log Z^s equals coupling + entropy at gamma*
             return reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior).mean()
@@ -1271,6 +1276,7 @@ class VFEModel(nn.Module):
 
         *,
         eps:       float = 1e-12,
+        omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
         s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
     ) -> 'Dict[str, torch.Tensor]':          # SUM-scale {coupling, meta_entropy, total}
         r"""Split the gamma model-coupling block into its coupling and meta-entropy parts (UNWEIGHTED,
@@ -1287,7 +1293,7 @@ class VFEModel(nn.Module):
         per head exactly as the belief entropy term does.
         """
         from vfe3.free_energy import _broadcast_tau, attention_weights, reduced_free_energy
-        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, s_belief=s_belief)
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega, s_belief=s_belief)
         gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
         pi_s = (torch.softmax(gamma_log_prior, dim=-1) if gamma_log_prior is not None
                 else torch.full_like(gamma_w, 1.0 / gamma_w.shape[-1]))
@@ -1755,7 +1761,9 @@ class VFEModel(nn.Module):
             d["hyper_prior_weighted"] = _hp_weighted                                      # EXACT contribution folded into total (state_dependent != cfg.lambda_h*raw); the F-decomposition figure reads this
             d["total"] += _hp_weighted
         if cfg.lambda_gamma > 0.0 or cfg.s_e_step:                  # gamma block evaluated at out.phi
-            g = self._gamma_coupling_terms(token_ids[:1], out.phi.unsqueeze(0), s_belief=s_belief)
+            g = self._gamma_coupling_terms(
+                token_ids[:1], out.phi.unsqueeze(0),
+                omega=out.omega.unsqueeze(0) if out.omega is not None else None, s_belief=s_belief)
             d["gamma_coupling"]     = float(g["coupling"])           # raw sum_{h,i,j} gamma E^s
             d["gamma_meta_entropy"] = float(g["meta_entropy"])       # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
             d["total"] += cfg.lambda_gamma * (d["gamma_coupling"] + d["gamma_meta_entropy"])

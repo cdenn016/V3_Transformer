@@ -740,3 +740,54 @@ def test_ablation_omega_direct_arm_builds():
         assert cfg.s_e_step is False
         seen_groups.add(cfg.gauge_group)
     assert seen_groups == {"glk", "block_glk", "tied_block_glk", "so_k", "sp", "so_n", "sp_n"}
+
+
+def test_gamma_coupling_term_uses_stored_frame_not_phi_cocycle():
+    # Phase 3 Task 1: _gamma_coupling_term (the forward gamma loss body, via _gamma_energy) must
+    # transport the s-channel by the STORED belief frame U (belief.omega) under omega_direct, not
+    # the flat phi-cocycle exp(phi_i)exp(-phi_j). The config gate (config.py:946) still blocks
+    # omega_direct + active gamma, so the model is built with the gamma channel OFF
+    # (lambda_gamma=0, s_e_step=False, gamma_as_beta_prior=False -- _cfg's defaults) but with the s
+    # tables present via prior_source='model_channel' (which does not trip the gate), then
+    # _gamma_coupling_term is called DIRECTLY -- it does not re-check cfg. phi is held at zero
+    # (exp(phi)=I identically), so a phi-based rebuild is blind to omega and returns the IDENTICAL
+    # energy for any U (pre-fix bug); post-fix, two different frames U1=I, U2 must give DIFFERENT
+    # energies.
+    K, N = 4, 3
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(gauge_parameterization="omega_direct", prior_source="model_channel",
+                      family="gaussian_diagonal", decode_mode="diagonal"))
+    grp = m.group
+    n_gen = grp.generators.shape[0]
+    tok = torch.randint(0, 6, (1, N), generator=torch.Generator().manual_seed(1))
+    phi = torch.zeros(1, N, n_gen)                               # exp(phi)=I: phi-cocycle is frame-blind
+    U1 = torch.eye(K).expand(1, N, K, K).contiguous()            # identity frame
+    xi = 0.3 * torch.randn(1, N, n_gen, generator=torch.Generator().manual_seed(2))
+    U2 = retract_omega(U1, xi, grp.generators)                   # a DIFFERENT, non-identity frame
+    assert not torch.allclose(U2, U1, atol=1e-4)
+
+    e1 = m._gamma_coupling_term(tok, phi, omega=U1)
+    e2 = m._gamma_coupling_term(tok, phi, omega=U2)
+    assert not torch.allclose(e1, e2, atol=1e-6), \
+        "gamma coupling term is blind to the stored omega frame (still using the phi cocycle)"
+
+
+def test_gamma_coupling_terms_split_uses_stored_frame_not_phi_cocycle():
+    # Same defect, the diagnostic split sibling _gamma_coupling_terms (feeds model.py:1758's
+    # d["gamma_coupling"]/d["gamma_meta_entropy"]). Mirrors the test above.
+    K, N = 4, 3
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(gauge_parameterization="omega_direct", prior_source="model_channel",
+                      family="gaussian_diagonal", decode_mode="diagonal"))
+    grp = m.group
+    n_gen = grp.generators.shape[0]
+    tok = torch.randint(0, 6, (1, N), generator=torch.Generator().manual_seed(1))
+    phi = torch.zeros(1, N, n_gen)
+    U1 = torch.eye(K).expand(1, N, K, K).contiguous()
+    xi = 0.3 * torch.randn(1, N, n_gen, generator=torch.Generator().manual_seed(2))
+    U2 = retract_omega(U1, xi, grp.generators)
+
+    g1 = m._gamma_coupling_terms(tok, phi, omega=U1)
+    g2 = m._gamma_coupling_terms(tok, phi, omega=U2)
+    assert not torch.allclose(g1["total"], g2["total"], atol=1e-6), \
+        "gamma coupling split is blind to the stored omega frame (still using the phi cocycle)"
