@@ -502,8 +502,18 @@ def retract_omega(
     :math:`\det\exp(A) = e^{\mathrm{tr}(A)} > 0`.
 
     ``'cayley'`` (exp-free): :math:`\mathrm{retr}(A) = (I - A/2)^{-1}(I + A/2)`, a second-order
-    retraction that is also determinant-component preserving (for a small step both factors have
-    positive determinant, so their ratio does too).
+    retraction. It is determinant-component preserving ONLY while :math:`A` stays in Cayley's valid
+    domain: an eigenvalue :math:`\lambda_i(A)` crossing :math:`\pm 2` makes :math:`I - A/2` singular
+    and then sign-flips :math:`\det(I - A/2)`, flipping the component (e.g. :math:`A=\mathrm{diag}(3,0,0)`
+    gives :math:`\det(\mathrm{cayley}(A)) = 2.5 / -0.5 = -5 < 0`). Because
+    :math:`|\lambda_i(A)| \le \lVert A\rVert_2 \le \lVert A\rVert_F`, requiring
+    :math:`\lVert A\rVert_F < 2` guarantees every :math:`|\lambda_i| < 2`, so :math:`I - A/2` is
+    invertible with :math:`\det(I \pm A/2) > 0`, hence
+    :math:`\det(\mathrm{cayley}(A)) = \det(I + A/2)/\det(I - A/2) > 0` and :math:`U\,\mathrm{cayley}(A)`
+    stays in :math:`U`'s component. A trust-region scale clamps :math:`A` to that domain: it is the
+    IDENTITY for :math:`\lVert A\rVert_F \le 1.9` (so :math:`R(0)=U` and the tangent :math:`U A` are
+    preserved for ordinary small steps) and only scales down large :math:`A`. ``'lie_exp'`` needs no
+    clamp (:math:`\det\exp = e^{\mathrm{tr}} > 0` unconditionally).
 
     Because :math:`\xi` is valued in the algebra span :math:`\{G_a\}` (block-diagonal for the
     ``block_glk`` untied gauge), :math:`\mathrm{retr}(\xi^a G_a)` is block-diagonal and
@@ -515,6 +525,10 @@ def retract_omega(
     elif mode == "cayley":
         K   = A.shape[-1]
         eye = torch.eye(K, dtype=A.dtype, device=A.device)
+        # Clamp A to Cayley's valid domain ||A||_F < 2 (keeps I - A/2 invertible, det>0 -> in-component).
+        max_fro = 1.9
+        fro = A.norm(dim=(-2, -1), keepdim=True)                  # (..., 1, 1) per-element Frobenius norm
+        A   = A * (max_fro / fro.clamp(min=max_fro))             # identity when ||A||_F <= max_fro, else scale down
         step = torch.linalg.solve(eye - 0.5 * A, eye + 0.5 * A)   # (I - A/2)^{-1}(I + A/2)
     else:
         raise ValueError(f"omega retract mode must be 'lie_exp' or 'cayley', got {mode!r}")

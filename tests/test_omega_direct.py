@@ -210,6 +210,17 @@ def test_retract_omega_stays_in_component_and_group():
         assert (torch.det(retract_omega(Rneg, xi, G, mode=mode)) < 0).all()
 
 
+def test_retract_omega_cayley_large_step_stays_in_component():
+    # Regression: without the ||A||_F<2 trust-region clamp, cayley flips the component for a large
+    # step -- A=diag(3,0,0) gives det(cayley(A)) = 2.5/-0.5 = -5 < 0. The clamp keeps it in-component.
+    G = generate_glk(3)                                       # (9,3,3); generator 0 = E_00 = diag(1,0,0)
+    U = torch.eye(3).expand(4, 3, 3).contiguous()
+    xi = torch.zeros(4, 9); xi[:, 0] = 3.0                    # A = diag(3,0,0): the previously-flipping case
+    assert (torch.det(retract_omega(U, xi, G, mode="cayley")) > 0).all()   # det>0 base stays det>0
+    Rneg = U.clone(); Rneg[:, 0, 0] = -1.0
+    assert (torch.det(retract_omega(Rneg, xi, G, mode="cayley")) < 0).all()  # det<0 base stays det<0
+
+
 def test_gauge_optim_omega_step_moves_active_rows_only():
     from vfe3.gauge_optim import GaugeNaturalGradAdamW
     G = generate_glk(3)
