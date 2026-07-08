@@ -163,10 +163,16 @@ class VFEModel(nn.Module):
             gauge_parameterization=cfg.gauge_parameterization,
             irrep_dims=list(self.group.irrep_dims),
             omega_reflection=cfg.omega_reflection,
-            # Compact block storage is opt-in (default OFF). The bank does not hold the GaugeGroup, so
-            # the tied-vs-untied signal is threaded here: only tied_block_glk shares one block (V,d,d);
-            # untied block_glk stores H blocks (V,H,d,d). Every other group ignores the flag.
-            omega_compact_storage=cfg.omega_compact_storage,
+            # Compact block storage is opt-in (default OFF), and eligibility is a GROUP property decided
+            # HERE where the group is known (the bank does not hold the GaugeGroup): only the equal-block
+            # GL groups have independent per-head blocks -- untied block_glk stores H blocks (V,H,d,d),
+            # tied tied_block_glk shares one block (V,d,d). The irrep towers so_n/sp_n can ALSO have
+            # equal irrep_dims (e.g. [3,3]) but are irrep IMAGES of one element, NOT independent blocks;
+            # compacting them would break the tower gauge, void param parity, and (so_n) void the
+            # transpose inverse. So the flag is passed through ONLY for block_glk/tied_block_glk; every
+            # other group keeps the full (V,K,K) table (the flag is a no-op for them).
+            omega_compact_storage=(cfg.omega_compact_storage
+                                   and cfg.gauge_group in ("block_glk", "tied_block_glk")),
             gauge_group_is_tied=(cfg.gauge_group == "tied_block_glk"),
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure

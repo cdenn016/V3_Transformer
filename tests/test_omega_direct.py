@@ -531,6 +531,57 @@ def test_omega_compact_optimizer_step_equals_full_step_on_blocks():
     assert torch.allclose(pb_cmp.omega_embed.data[3], blocks[3], atol=1e-6)   # inactive row untouched
 
 
+def test_omega_compact_tied_optimizer_step_moves_shared_block():
+    """A tied (V,d,d) compact table (dim 3) must NOT fall through to the full (V,K,K) path -- it
+    steps directly on the shared gl(d) block. Regression for the einsum size-mismatch crash the
+    dim-only detection caused (RuntimeError: einsum ... size 2 ... does not broadcast ... size 4)."""
+    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    from vfe3.geometry.generators import generate_glk_multihead_tied
+    V, H, d, K = 6, 2, 2, 4
+    G_full = generate_glk_multihead_tied(K, H)               # (4, 4, 4) tied basis; last dim == K
+    pb = PriorBank(V, K, d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H,
+                   omega_compact_storage=True, gauge_group_is_tied=True)
+    assert pb.omega_embed.shape == (V, d, d)                 # (V,d,d), dim 3
+    g = torch.Generator().manual_seed(7)
+    grad = torch.randn(V, d, d, generator=g)
+    grad[3] = 0.0                                            # one inactive row
+    pb.omega_embed.grad = grad.clone()
+    before = pb.omega_embed.data.clone()
+    opt = GaugeNaturalGradAdamW([{"params": [pb.omega_embed], "lr": 0.1, "omega": True,
+                                  "weight_decay": 0.0}], G_full, [d] * H, gauge_momentum=0.0)
+    opt.step()                                               # MUST NOT crash
+    U = pb.omega_embed.data
+    assert not torch.allclose(U[0], before[0])               # active shared block moved
+    assert torch.allclose(U[3], before[3], atol=1e-6)        # inactive row untouched
+    assert torch.det(U[0]) > 0                               # stays in GL+(d)
+    # the assembled frame still shares the ONE stepped block across both heads, off-blocks zero
+    om = pb.encode(torch.zeros(1, 1, dtype=torch.long)).omega[0, 0]
+    assert torch.allclose(om[:2, :2], om[2:, 2:], atol=1e-7)
+    assert torch.allclose(om[:2, 2:], torch.zeros(2, 2)) and torch.allclose(om[2:, :2], torch.zeros(2, 2))
+
+
+def test_omega_compact_flag_is_noop_for_equal_dim_towers():
+    """so_n/sp_n equal-dim irrep towers (e.g. irrep_dims=[3,3]) match the block STRUCTURE but are
+    irrep IMAGES of one element, not independent blocks -- omega_compact_storage must be a NO-OP for
+    them (full (V,K,K) table), decided by the group gate in model.py. A compacted (V,H,d,d) tower
+    would break the tower gauge and void param parity (V*H*d^2 != V*n_gen)."""
+    def _tower_cfg(**over):
+        base = dict(vocab_size=6, n_heads=1, max_seq_len=4, n_layers=1, n_e_steps=2,
+                    gauge_parameterization="omega_direct", family="gaussian_full", transport_mode="flat",
+                    pos_rotation="none", use_head_mixer=False, use_prior_bank=True, decode_mode="full",
+                    e_phi_lr=0.0)
+        base.update(over)
+        return VFE3Config(**base)
+    over = dict(gauge_group="so_n", embed_dim=6, group_n=3, irrep_spec=[("l1", 2)])   # SO(3) l1 x2 -> [3,3]
+    m_off = VFEModel(_tower_cfg(omega_compact_storage=False, **over))
+    m_on  = VFEModel(_tower_cfg(omega_compact_storage=True,  **over))
+    assert list(m_on.group.irrep_dims) == [3, 3]             # equal-dim tower: matches the block structure
+    assert m_on.prior_bank._omega_compact is False           # flag suppressed for the tower
+    assert m_on.prior_bank.omega_embed.shape == (6, 6, 6)    # full (V,K,K), NOT compacted to (6,2,3,3)
+    # param count unaffected by the flag (both full (V,K,K))
+    assert m_on.prior_bank.omega_embed.numel() == m_off.prior_bank.omega_embed.numel()
+
+
 def test_ablation_omega_direct_arm_builds():
     # Build every cell of the "gauge_parameterization" sweep the way the runner does -- baseline
     # (BASELINE_CONFIG, which sets lambda_gamma=0.75 and s_e_step=True) merged with the arm

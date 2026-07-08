@@ -160,23 +160,27 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         d:      int,                          # block dimension
         device: torch.device,
         dtype:  torch.dtype,
-    ) -> torch.Tensor:                        # (d*d, d, d) gl(d) elementary basis
-        r"""The reduced ``gl(d)`` generator basis for the per-block compact retraction, built ONCE.
+    ) -> 'tuple[torch.Tensor, torch.Tensor]':  # (d*d, d, d) gl(d) basis, (d*d, d*d) its gram_pinv
+        r"""The reduced ``gl(d)`` generator basis + Gram pseudo-inverse for the per-block compact
+        retraction, built and cached ONCE (per d, device, dtype).
 
-        A compact ``omega_direct`` table is (V, H, d, d) equal blocks; each block steps on GL(d) under
-        the full ``gl(d)`` elementary basis E_ij (``generate_glk(d)``, an orthonormal (d*d, d, d) set).
-        This is the block-restriction of the full block-diagonal ``gl(K)`` basis, so the per-block step
-        equals the full K x K step on the blocks. Cached per (d, device, dtype).
+        A compact ``omega_direct`` table is (V, H, d, d) / (V, d, d) blocks; each block steps on GL(d)
+        under the full ``gl(d)`` elementary basis E_ij (``generate_glk(d)``, an orthonormal (d*d, d, d)
+        set). This is the block-restriction of the full block-diagonal ``gl(K)`` basis, so the per-block
+        step equals the full K x K step on the blocks. The Gram pseudo-inverse is cached alongside so
+        ``extract_phi`` never recomputes it per step or per param (FIX 3).
         """
         cache = getattr(self, "_gld_cache", None)
         if cache is None:
             cache = self._gld_cache = {}
         key = (d, device, dtype)
-        G = cache.get(key)
-        if G is None:
+        entry = cache.get(key)
+        if entry is None:
             from vfe3.geometry.generators import generate_glk
-            G = cache[key] = generate_glk(d, device=device, dtype=dtype)
-        return G
+            from vfe3.geometry.lie_ops import gram_pinv
+            G = generate_glk(d, device=device, dtype=dtype)
+            entry = cache[key] = (G, gram_pinv(G))
+        return entry
 
     @torch.no_grad()
     def step(self, closure=None):                                      # type: ignore[override]
@@ -200,35 +204,43 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 # not algebra coordinates. Step by a group-manifold retraction of the natural-gradient
                 # tangent xi = Gram^{-1} proj_g(U^T E) (extract_phi computes exactly this): U <- U retr(-lr xi),
                 # active (nonzero-grad) rows only, then consume the grad so base AdamW no-ops on it.
-                # Compact storage (omega_compact_storage=True): the table is (V, H, d, d) block stacks,
-                # so p.data.dim()==4 -- step each block by the reduced gl(d) basis (a K x K solve/exp
-                # per block collapses to H small d x d ones), which equals the full block-diagonal
-                # gl(K) step restricted to the blocks (the gl(K) generators have disjoint block support).
-                lr   = group["lr"]
-                mode = getattr(self, "_omega_retract_mode", "lie_exp")
+                # Compact storage (omega_compact_storage=True): the table is per-block stacks -- untied
+                # (V, H, d, d) has dim 4, tied (V, d, d) has dim 3 with block dim d < K (a full table is
+                # (V, K, K), dim 3 with last dim == K). Both step each block by the reduced gl(d) basis
+                # (a K x K solve/exp per block collapses to small d x d ones), which equals the full
+                # block-diagonal gl(K) step restricted to the blocks (the gl(K) generators have disjoint
+                # block support). Detecting tied by dim ALONE mis-routes (V,d,d) to the full path and
+                # crashes extract_phi with an einsum size mismatch -- hence the d < K test.
+                lr     = group["lr"]
+                mode   = getattr(self, "_omega_retract_mode", "lie_exp")
+                K_full = self._generators.shape[-1]                    # full frame dim K
                 from vfe3.geometry.lie_ops import extract_phi, gram_pinv, retract_omega
                 full_gp = None                                         # gram_pinv(full basis), built once per step
                 for p in group["params"]:
                     if p.grad is None:
                         continue
-                    E   = p.grad                                       # (V,K,K) or compact (V,H,d,d) dF/dU
+                    E   = p.grad                                       # (V,K,K) full or (V,H,d,d)/(V,d,d) compact
                     U   = p.data                                       # matching stored group elements
-                    compact = U.dim() == 4                             # (V,H,d,d) compact block storage
+                    untied_compact = U.dim() == 4                      # (V,H,d,d)
+                    tied_compact   = U.dim() == 3 and U.shape[-1] < K_full  # (V,d,d), d < K
                     act = E.reshape(E.shape[0], -1).abs().sum(dim=-1) > 0   # (V,) rows with gradient
                     if not bool(act.any()):
                         p.grad = None
                         continue
-                    Ua, Ea = U[act], E[act]                            # (A,K,K) or (A,H,d,d)
-                    if compact:
-                        d  = Ua.shape[-1]
-                        Gd = self._compact_gld_basis(d, U.device, U.dtype)   # (d*d, d, d) reduced gl(d) basis
-                        gp = gram_pinv(Gd)
-                        Ua_r = Ua.reshape(-1, d, d)                    # (A*H, d, d) flatten the block axis
-                        Ea_r = Ea.reshape(-1, d, d)                    # (A*H, d, d)
+                    Ua, Ea = U[act], E[act]                            # (A,K,K) / (A,H,d,d) / (A,d,d)
+                    if untied_compact or tied_compact:
+                        d      = Ua.shape[-1]
+                        Gd, gp = self._compact_gld_basis(d, U.device, U.dtype)   # gl(d) basis + cached gram_pinv
+                        # Untied: flatten the H block axis into the row axis so each of the A*H blocks
+                        # retracts independently. Tied: the active rows ARE the single (A,d,d) shared
+                        # blocks (encode's broadcast adjoint already SUMMED the H per-slot grads onto
+                        # them), so reshape(-1,d,d) is a no-op and each shared block retracts directly.
+                        Ua_r = Ua.reshape(-1, d, d)                    # (A*H,d,d) untied / (A,d,d) tied
+                        Ea_r = Ea.reshape(-1, d, d)
                         # per-block natural-gradient tangent xi = Gram^{-1} proj_gl(d)(U_h^T E_h)
                         xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua_r, Ea_r), Gd, gram_pinv_=gp)
-                        Ur = retract_omega(Ua_r, -lr * xi, Gd, mode=mode)    # (A*H, d, d)
-                        U[act] = Ur.reshape(Ua.shape)                  # (A, H, d, d)
+                        Ur = retract_omega(Ua_r, -lr * xi, Gd, mode=mode)
+                        U[act] = Ur.reshape(Ua.shape)                  # back to (A,H,d,d) / (A,d,d)
                     else:
                         Gd = self._generators.to(device=U.device, dtype=U.dtype)
                         if full_gp is None:
