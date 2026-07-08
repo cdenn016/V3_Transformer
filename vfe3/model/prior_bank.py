@@ -159,6 +159,8 @@ class PriorBank(nn.Module):
         gauge_parameterization: str                 = "phi",
         irrep_dims:             Optional[List[int]] = None,
         omega_reflection:       str                 = "off",
+        omega_compact_storage:  bool                = False,
+        gauge_group_is_tied:    bool                = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -288,14 +290,51 @@ class PriorBank(nn.Module):
         # omega_direct: a per-token GL(K) group element table (identity init -> step-0 == trivial gauge).
         # Created ONLY on the omega_direct path so the default state_dict is byte-identical. Block-
         # diagonal by construction for block_glk (identity is diagonal; the group retraction keeps it so).
+        #
+        # omega_compact_storage (opt-in, default OFF): for an EQUAL-block group (untied block_glk /
+        # tied tied_block_glk; irrep_dims = [d]*H, H>1) the full (V,K,K) table wastes ~H x (off-blocks
+        # frozen zero). Store the H distinct blocks (V,H,d,d) untied, or the ONE shared block (V,d,d)
+        # tied -- both matching phi_embed's V*n_gen param count exactly (V*H*d^2 / V*d^2 = V*n_gen).
+        # encode assembles the transport-ready block-diagonal (B,N,K,K) so the downstream stack is
+        # untouched. Compaction changes the table SHAPE (would break a Phase-1 (V,K,K) checkpoint), so
+        # the opt-in flag is the state-dict safety: default OFF keeps the shipped (V,K,K) path
+        # byte-identical. Single-block groups (glk/so_k/sp) and the irrep towers (so_n/sp_n) keep
+        # (V,K,K) this phase (nothing to compact / element-vs-coordinate tension deferred).
+        self._omega_compact = False
+        self._omega_tied    = bool(gauge_group_is_tied)
         if gauge_parameterization == "omega_direct":
-            eye_K = torch.eye(K)
-            self.omega_embed = nn.Parameter(eye_K.expand(vocab_size, K, K).clone())
-            if omega_reflection == "init_seed":
-                from vfe3.geometry.generators import reflection_element
-                R = reflection_element(K)
-                with torch.no_grad():                        # seed every OTHER token into the det<0 sheet
-                    self.omega_embed[1::2] = R
+            dims = irrep_dims
+            compact = (
+                omega_compact_storage
+                and dims is not None
+                and len(dims) > 1
+                and len(set(dims)) == 1
+            )
+            self._omega_compact = compact
+            if compact:
+                H, d = len(dims), dims[0]
+                eye_d = torch.eye(d)
+                if gauge_group_is_tied:                       # (V,d,d): one block shared across H heads
+                    self.omega_embed = nn.Parameter(eye_d.expand(vocab_size, d, d).clone())
+                else:                                         # (V,H,d,d): H independent blocks
+                    self.omega_embed = nn.Parameter(eye_d.expand(vocab_size, H, d, d).clone())
+                    if omega_reflection == "init_seed":
+                        # reflection_element(K) = diag(-1,1,...,1) is block 0 = reflection_element(d),
+                        # blocks 1..H-1 = I_d, so seeding block 0 of every OTHER token assembles to the
+                        # identical det<0 element the full (V,K,K) path seeds. (tied rejects init_seed at
+                        # config, so the (V,d,d) branch needs no seed.)
+                        from vfe3.geometry.generators import reflection_element
+                        Rd = reflection_element(d)
+                        with torch.no_grad():
+                            self.omega_embed[1::2, 0] = Rd
+            else:
+                eye_K = torch.eye(K)
+                self.omega_embed = nn.Parameter(eye_K.expand(vocab_size, K, K).clone())
+                if omega_reflection == "init_seed":
+                    from vfe3.geometry.generators import reflection_element
+                    R = reflection_element(K)
+                    with torch.no_grad():                    # seed every OTHER token into the det<0 sheet
+                        self.omega_embed[1::2] = R
 
     def encode(
         self,
@@ -303,6 +342,33 @@ class PriorBank(nn.Module):
     ) -> BeliefState:
         r"""Look up the per-token Gaussian prior as the initial belief (q = p)."""
         return get_encode(self.encode_mode)(self, token_ids)
+
+    def _omega_lookup(
+        self,
+        token_ids: torch.Tensor,         # (B, N) integer token ids
+    ) -> torch.Tensor:                   # (B, N, K, K) transport-ready block-diagonal frame
+        r"""Look up the per-token gauge frame U_i as a full (B, N, K, K) element.
+
+        Non-compact (default): a plain (V, K, K) table lookup. Compact
+        (``_omega_compact``): the compact (V, H, d, d) / (V, d, d) block table is looked up and
+        assembled into the block-diagonal (B, N, K, K) via the differentiable scatter
+        ``lie_ops._from_equal_diag_blocks`` -- off-blocks stay EXACTLY zero and autograd routes the
+        dense-frame gradient back onto the compact table with no manual adjoint. For the TIED table
+        the single block broadcasts into all H diagonal slots; the broadcast's autograd adjoint SUMS
+        the H per-block gradients onto the shared block (exactly the tied update). The assembled
+        (B, N, K, K) is what ``belief.omega`` carries, so the entire downstream transport stack is
+        unchanged whether or not the storage is compact.
+        """
+        g = self.omega_embed[token_ids]                                      # (B,N,K,K) or (B,N,H,d,d)/(B,N,d,d)
+        if not self._omega_compact:
+            return g
+        from vfe3.geometry.lie_ops import _from_equal_diag_blocks
+        H, d = len(self.irrep_dims), self.irrep_dims[0]
+        if self._omega_tied:                                                 # (B,N,d,d) -> broadcast into H slots
+            blocks = g.unsqueeze(-3).expand(*g.shape[:-2], H, d, d)          # (B,N,H,d,d) view (shared storage)
+        else:
+            blocks = g                                                       # (B,N,H,d,d) already
+        return _from_equal_diag_blocks(blocks, self.K)                       # (B,N,K,K) block-diagonal
 
     def encode_s(
         self,
@@ -925,7 +991,7 @@ def _encode_per_token(
     mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
     sigma_diag = torch.exp(pb._prior_sigma_log_table()[token_ids]).clamp(min=pb.eps)  # (B, N, K), sigma > 0
     phi = pb.phi_embed[token_ids]                                            # (B, N, n_gen)
-    omega = pb.omega_embed[token_ids] if getattr(pb, "gauge_parameterization", "phi") == "omega_direct" else None
+    omega = pb._omega_lookup(token_ids) if getattr(pb, "gauge_parameterization", "phi") == "omega_direct" else None
     sigma = sigma_diag if pb.diagonal_covariance else torch.diag_embed(sigma_diag)
     return BeliefState(mu=mu, sigma=sigma, phi=phi, omega=omega)
 

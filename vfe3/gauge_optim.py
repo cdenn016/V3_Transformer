@@ -155,6 +155,29 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
             if step is not None and not torch.is_tensor(step):
                 s["step"] = torch.tensor(float(step))
 
+    def _compact_gld_basis(
+        self,
+        d:      int,                          # block dimension
+        device: torch.device,
+        dtype:  torch.dtype,
+    ) -> torch.Tensor:                        # (d*d, d, d) gl(d) elementary basis
+        r"""The reduced ``gl(d)`` generator basis for the per-block compact retraction, built ONCE.
+
+        A compact ``omega_direct`` table is (V, H, d, d) equal blocks; each block steps on GL(d) under
+        the full ``gl(d)`` elementary basis E_ij (``generate_glk(d)``, an orthonormal (d*d, d, d) set).
+        This is the block-restriction of the full block-diagonal ``gl(K)`` basis, so the per-block step
+        equals the full K x K step on the blocks. Cached per (d, device, dtype).
+        """
+        cache = getattr(self, "_gld_cache", None)
+        if cache is None:
+            cache = self._gld_cache = {}
+        key = (d, device, dtype)
+        G = cache.get(key)
+        if G is None:
+            from vfe3.geometry.generators import generate_glk
+            G = cache[key] = generate_glk(d, device=device, dtype=dtype)
+        return G
+
     @torch.no_grad()
     def step(self, closure=None):                                      # type: ignore[override]
         if closure is not None:
@@ -177,31 +200,51 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 # not algebra coordinates. Step by a group-manifold retraction of the natural-gradient
                 # tangent xi = Gram^{-1} proj_g(U^T E) (extract_phi computes exactly this): U <- U retr(-lr xi),
                 # active (nonzero-grad) rows only, then consume the grad so base AdamW no-ops on it.
+                # Compact storage (omega_compact_storage=True): the table is (V, H, d, d) block stacks,
+                # so p.data.dim()==4 -- step each block by the reduced gl(d) basis (a K x K solve/exp
+                # per block collapses to H small d x d ones), which equals the full block-diagonal
+                # gl(K) step restricted to the blocks (the gl(K) generators have disjoint block support).
                 lr   = group["lr"]
-                p0   = group["params"][0]
-                Gd   = self._generators.to(device=p0.device, dtype=p0.dtype)
                 mode = getattr(self, "_omega_retract_mode", "lie_exp")
                 from vfe3.geometry.lie_ops import extract_phi, gram_pinv, retract_omega
-                gp = gram_pinv(Gd)                                     # (n_gen, n_gen) cached per step
+                full_gp = None                                         # gram_pinv(full basis), built once per step
                 for p in group["params"]:
                     if p.grad is None:
                         continue
-                    E   = p.grad                                       # (V, K, K) dF/dU
-                    U   = p.data                                       # (V, K, K) stored group elements
+                    E   = p.grad                                       # (V,K,K) or compact (V,H,d,d) dF/dU
+                    U   = p.data                                       # matching stored group elements
+                    compact = U.dim() == 4                             # (V,H,d,d) compact block storage
                     act = E.reshape(E.shape[0], -1).abs().sum(dim=-1) > 0   # (V,) rows with gradient
                     if not bool(act.any()):
                         p.grad = None
                         continue
-                    Ua, Ea = U[act], E[act]                            # (A, K, K) each
-                    # natural-gradient tangent xi = Gram^{-1} proj_g(U^T E); (U^T E)_{km} = sum_l U_{lk} E_{lm}
-                    xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua, Ea), Gd, gram_pinv_=gp)
-                    U[act] = retract_omega(Ua, -lr * xi, Gd, mode=mode)   # (A, K, K) U <- U retr(-lr xi)
+                    Ua, Ea = U[act], E[act]                            # (A,K,K) or (A,H,d,d)
+                    if compact:
+                        d  = Ua.shape[-1]
+                        Gd = self._compact_gld_basis(d, U.device, U.dtype)   # (d*d, d, d) reduced gl(d) basis
+                        gp = gram_pinv(Gd)
+                        Ua_r = Ua.reshape(-1, d, d)                    # (A*H, d, d) flatten the block axis
+                        Ea_r = Ea.reshape(-1, d, d)                    # (A*H, d, d)
+                        # per-block natural-gradient tangent xi = Gram^{-1} proj_gl(d)(U_h^T E_h)
+                        xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua_r, Ea_r), Gd, gram_pinv_=gp)
+                        Ur = retract_omega(Ua_r, -lr * xi, Gd, mode=mode)    # (A*H, d, d)
+                        U[act] = Ur.reshape(Ua.shape)                  # (A, H, d, d)
+                    else:
+                        Gd = self._generators.to(device=U.device, dtype=U.dtype)
+                        if full_gp is None:
+                            full_gp = gram_pinv(Gd)                    # (n_gen, n_gen) cached per step
+                        # natural-gradient tangent xi = Gram^{-1} proj_g(U^T E); (U^T E)_{km} = sum_l U_{lk} E_{lm}
+                        xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua, Ea), Gd, gram_pinv_=full_gp)
+                        U[act] = retract_omega(Ua, -lr * xi, Gd, mode=mode)   # (A, K, K) U <- U retr(-lr xi)
                     p.grad = None                                      # consumed: AdamW no-ops on it
                 # Orthogonality-drift control (default OFF: omega_reorth_every=0 -> byte-identical).
                 # Only meaningful for a SKEW (orthogonal, e.g. so_k/so_n) group -- a non-skew element
                 # (glk/sp/...) has no O(K) to drift back onto. Cadence is counted in M-steps (this
                 # branch runs once per optimizer.step() call), not in active-row updates, so drift
                 # accumulated over past steps is corrected on schedule even on a step with no gradient.
+                # The compact block groups (block_glk/tied_block_glk) are non-skew, so this never fires
+                # for a (V,H,d,d)/(V,d,d) table; were it to, _polar_orthogonalize batches over any
+                # leading dims and would re-orthogonalize per block without crashing.
                 if self._skew_symmetric and self._omega_reorth_every > 0:
                     self._omega_step += 1
                     if self._omega_step % self._omega_reorth_every == 0:

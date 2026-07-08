@@ -465,6 +465,72 @@ def test_omega_reorth_projects_drifted_element_back_to_O_K():
     assert torch.allclose(Q @ Q.transpose(-1, -2), torch.eye(4), atol=1e-5)
 
 
+def test_omega_compact_storage_param_parity_and_assembly():
+    pb_full = PriorBank(vocab_size=6, K=4, n_gen=8, gauge_parameterization="omega_direct", irrep_dims=[2, 2])
+    pb_cmp  = PriorBank(vocab_size=6, K=4, n_gen=8, gauge_parameterization="omega_direct", irrep_dims=[2, 2],
+                        omega_compact_storage=True)
+    assert pb_full.omega_embed.shape == (6, 4, 4)             # full (V,K,K)
+    assert pb_cmp.omega_embed.shape == (6, 2, 2, 2)           # compact (V,H,d,d)
+    assert pb_cmp.omega_embed.numel() == 6 * 8                # == V * n_gen (matches phi_embed)
+    # identity init assembles to the block-diagonal identity element
+    tok = torch.zeros(1, 3, dtype=torch.long)
+    om = pb_cmp.encode(tok).omega
+    assert om.shape == (1, 3, 4, 4)
+    assert torch.allclose(om, torch.eye(4).expand(1, 3, 4, 4), atol=1e-7)
+    # off-blocks are exactly zero for a non-identity compact frame
+    with torch.no_grad():
+        pb_cmp.omega_embed[0, 0] = torch.tensor([[1.2, 0.3], [0.0, 0.9]])
+    om2 = pb_cmp.encode(torch.zeros(1, 1, dtype=torch.long)).omega[0, 0]
+    assert torch.allclose(om2[:2, 2:], torch.zeros(2, 2)) and torch.allclose(om2[2:, :2], torch.zeros(2, 2))
+    # block 0 carries the edited compact block; block 1 stays identity (independent heads)
+    assert torch.allclose(om2[:2, :2], torch.tensor([[1.2, 0.3], [0.0, 0.9]]), atol=1e-7)
+    assert torch.allclose(om2[2:, 2:], torch.eye(2), atol=1e-7)
+
+
+def test_omega_compact_tied_shares_one_block():
+    pb = PriorBank(vocab_size=6, K=4, n_gen=4, gauge_parameterization="omega_direct", irrep_dims=[2, 2],
+                   omega_compact_storage=True, gauge_group_is_tied=True)   # tied flag threaded from model.py
+    assert pb.omega_embed.shape == (6, 2, 2)                  # (V,d,d) one shared block
+    with torch.no_grad():                                     # a non-identity shared block
+        pb.omega_embed[0] = torch.tensor([[1.3, 0.2], [0.0, 0.8]])
+    om = pb.encode(torch.zeros(1, 1, dtype=torch.long)).omega[0, 0]
+    assert torch.allclose(om[:2, :2], om[2:, 2:], atol=1e-7)  # same block in both heads
+    assert torch.allclose(om[:2, 2:], torch.zeros(2, 2)) and torch.allclose(om[2:, :2], torch.zeros(2, 2))
+
+
+def test_omega_compact_optimizer_step_equals_full_step_on_blocks():
+    """One optimizer step on the compact (V,H,d,d) table equals the full (V,K,K) step restricted
+    to the blocks (fp): the per-block gl(d) retraction is the block-diagonal gl(K) retraction."""
+    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    from vfe3.geometry.generators import generate_glk_multihead
+    from vfe3.geometry.lie_ops import _from_equal_diag_blocks
+    V, H, d, K = 6, 2, 2, 4
+    G_full = generate_glk_multihead(K, H)                     # (8, 4, 4) block_glk basis
+    g = torch.Generator().manual_seed(11)
+    blocks = torch.eye(d).expand(V, H, d, d).clone() + 0.1 * torch.randn(V, H, d, d, generator=g)  # (V,H,d,d)
+    Eb = torch.randn(V, H, d, d, generator=g)                 # per-block gradient
+    Eb[3] = 0.0                                               # one inactive row (exercises the active mask)
+
+    pb_cmp  = PriorBank(V, K, H * d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H,
+                        omega_compact_storage=True)
+    pb_full = PriorBank(V, K, H * d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H)
+    with torch.no_grad():
+        pb_cmp.omega_embed.copy_(blocks)
+        pb_full.omega_embed.copy_(_from_equal_diag_blocks(blocks, K))     # same element, dense
+    pb_cmp.omega_embed.grad  = Eb.clone()
+    pb_full.omega_embed.grad = _from_equal_diag_blocks(Eb, K)             # same grad, off-blocks zero
+
+    def _opt(pb):
+        return GaugeNaturalGradAdamW([{"params": [pb.omega_embed], "lr": 0.1, "omega": True,
+                                       "weight_decay": 0.0}], G_full, [d] * H, gauge_momentum=0.0)
+    _opt(pb_cmp).step()
+    _opt(pb_full).step()
+
+    assembled = _from_equal_diag_blocks(pb_cmp.omega_embed.data, K)       # (V,K,K)
+    assert torch.allclose(assembled, pb_full.omega_embed.data, atol=1e-5)
+    assert torch.allclose(pb_cmp.omega_embed.data[3], blocks[3], atol=1e-6)   # inactive row untouched
+
+
 def test_ablation_omega_direct_arm_builds():
     # Build every cell of the "gauge_parameterization" sweep the way the runner does -- baseline
     # (BASELINE_CONFIG, which sets lambda_gamma=0.75 and s_e_step=True) merged with the arm

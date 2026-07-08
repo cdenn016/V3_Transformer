@@ -163,6 +163,11 @@ class VFEModel(nn.Module):
             gauge_parameterization=cfg.gauge_parameterization,
             irrep_dims=list(self.group.irrep_dims),
             omega_reflection=cfg.omega_reflection,
+            # Compact block storage is opt-in (default OFF). The bank does not hold the GaugeGroup, so
+            # the tied-vs-untied signal is threaded here: only tied_block_glk shares one block (V,d,d);
+            # untied block_glk stores H blocks (V,H,d,d). Every other group ignores the flag.
+            omega_compact_storage=cfg.omega_compact_storage,
+            gauge_group_is_tied=(cfg.gauge_group == "tied_block_glk"),
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.
