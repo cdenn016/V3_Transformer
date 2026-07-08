@@ -556,6 +556,27 @@ def train_step(
     return step_loss
 
 
+def _maybe_metropolis_omega(
+    model:     VFEModel,
+    token_ids: torch.Tensor,             # (B, N) input token ids (the SAME batch fed to train_step)
+
+    *,
+    step:      int,
+    generator: torch.Generator,          # persistent seeded RNG, threaded across steps
+) -> None:
+    r"""Gated + cadence-checked call to the omega_direct Metropolis det-sign sweep.
+
+    No-op unless ``cfg.omega_reflection == 'metropolis'``, and even then fires only every
+    ``cfg.omega_metropolis_every`` optimizer steps. Factored out of the training loop so the
+    seam is a single guarded line there (see design spec Sec.4); ``model.metropolis_omega_step``
+    is itself a no-op under any other ``omega_reflection`` mode, so this gate is a fast-path
+    short-circuit, not the sole safety net.
+    """
+    cfg = model.cfg
+    if cfg.omega_reflection == "metropolis" and (step % cfg.omega_metropolis_every == 0):
+        model.metropolis_omega_step(token_ids, generator=generator)
+
+
 @torch.no_grad()
 def evaluate(
     model:  VFEModel,
@@ -849,6 +870,13 @@ def train(
     losses: List[float] = []
     model.train()
     logger = logger or logging.getLogger(__name__)
+    # Metropolis det-sign sweep (opt-in, default OFF): a single persistent CPU generator, seeded
+    # once from cfg.seed, threaded across every step so the accept/reject sequence is reproducible
+    # (design spec Sec.6). A fresh generator drawn INSIDE the loop would redraw the same value every
+    # step, so it MUST be constructed here and reused. Constructing/seeding a LOCAL torch.Generator
+    # never touches the global RNG stream, so this stays inert when cfg.omega_reflection != 'metropolis'
+    # (_maybe_metropolis_omega gates the actual draw below).
+    metro_gen = torch.Generator().manual_seed(int(cfg.seed))
     # Live per-step it/s: iterate the step loop through a tqdm bar whose built-in rate readout
     # refreshes every step. Gated on log_interval so the documented silent path (log_interval
     # falsy) stays bitwise-identical -- no bar, no redirect, nothing printed. The generator holds
@@ -904,6 +932,10 @@ def train(
         losses.append(train_step(model, optimizer, scheduler, tokens, targets,
                                   grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
                                   scaler=scaler, metrics_out=step_metrics))
+        # Metropolis det-sign sweep (opt-in, default OFF): runs on the POST-optimizer-step model,
+        # gated + cadence-checked by the helper; inert (no call, no generator draw) unless
+        # cfg.omega_reflection == 'metropolis'. tokens is the SAME input batch just fed to train_step.
+        _maybe_metropolis_omega(model, tokens, step=step, generator=metro_gen)
         if ema is not None:
             ema.update(model)                            # blend the post-step weights into the shadow
 

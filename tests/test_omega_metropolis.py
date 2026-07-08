@@ -174,3 +174,27 @@ def test_seeded_reproducible():
     s2 = m2.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(7))
     assert s1 == s2
     assert torch.equal(m1.prior_bank.omega_embed, m2.prior_bank.omega_embed)
+
+
+# --------------------------------------------------------------------------------------------------
+# Task 3: train-loop seam -- _maybe_metropolis_omega (gated + cadence-checked call site)
+# --------------------------------------------------------------------------------------------------
+
+
+def test_train_seam_gated_and_cadence(monkeypatch):
+    m = _model()
+    calls = {"n": 0}
+    def _spy(token_ids, *, generator):
+        calls["n"] += 1; return {}
+    monkeypatch.setattr(m, "metropolis_omega_step", _spy)
+    from vfe3.train import _maybe_metropolis_omega    # small guarded helper Task 3 factors out
+    gen = torch.Generator().manual_seed(0)
+    tok = torch.tensor([[0, 1, 2]])
+    # every=2: fires on steps 0 and 2, not 1
+    m.cfg.omega_metropolis_every = 2
+    _maybe_metropolis_omega(m, tok, step=0, generator=gen); assert calls["n"] == 1
+    _maybe_metropolis_omega(m, tok, step=1, generator=gen); assert calls["n"] == 1
+    _maybe_metropolis_omega(m, tok, step=2, generator=gen); assert calls["n"] == 2
+    # off -> never
+    m.cfg.omega_reflection = "off"
+    _maybe_metropolis_omega(m, tok, step=0, generator=gen); assert calls["n"] == 2
