@@ -399,12 +399,16 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
 
+    # omega_direct is Phase-1-gated against the gamma / model-coupling (s) channel (its s-transport
+    # would use exp(phi), not the stored U), so BOTH arms disable it (lambda_gamma=0, s_e_step=False)
+    # to keep the phi-vs-omega_direct comparison fair and let both cells build off BASELINE_CONFIG.
     "gauge_parameterization": {
         "description": "gauge frame chart: phi (exp coords) vs omega_direct (stored GL(K) element)",
         "configs": [
-            {"label": "phi",          "gauge_parameterization": "phi"},
+            {"label": "phi",          "gauge_parameterization": "phi",
+             "lambda_gamma": 0.0, "s_e_step": False},
             {"label": "omega_direct", "gauge_parameterization": "omega_direct", "gauge_group": "glk",
-             "use_head_mixer": False},
+             "use_head_mixer": False, "lambda_gamma": 0.0, "s_e_step": False},
         ],
         "requires": {"transport_mode": "flat"},
     },

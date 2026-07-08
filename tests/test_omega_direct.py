@@ -386,5 +386,18 @@ def test_appended_belief_step_omega_direct_uses_stored_frame():
 
 
 def test_ablation_omega_direct_arm_builds():
-    cfg = _cfg(gauge_parameterization="omega_direct", gauge_group="glk", use_head_mixer=False)
-    assert cfg.gauge_parameterization == "omega_direct"
+    # Build every cell of the "gauge_parameterization" sweep the way the runner does -- baseline
+    # (BASELINE_CONFIG, which sets lambda_gamma=0.75 and s_e_step=True) merged with the arm
+    # overrides -- so this exercises the real BASELINE_CONFIG interaction. The omega_direct arm
+    # MUST override lambda_gamma=0.0 / s_e_step=False, or its Phase-1 gamma-channel gate rejects it.
+    import ablation
+
+    runs = ablation.make_run_overrides("gauge_parameterization")
+    labels = {label for label, _ in runs}
+    assert labels == {"phi", "omega_direct"}
+    built = {}
+    for label, overrides in runs:
+        cfg_dict = ablation._cell_cfg_dict(overrides, seed=0, max_steps=1)
+        built[label] = VFE3Config(**cfg_dict)                 # must not raise for either cell
+    assert built["omega_direct"].gauge_parameterization == "omega_direct"
+    assert built["omega_direct"].lambda_gamma == 0.0 and built["omega_direct"].s_e_step is False
