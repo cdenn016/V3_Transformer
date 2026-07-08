@@ -902,7 +902,16 @@ class VFEModel(nn.Module):
         single-sequence (it adds a dummy batch axis), so F is evaluated per (N, K) sequence and
         summed. The current and trial evaluations call this with IDENTICAL kwargs and differ only in
         ``belief.omega``, so the Metropolis DeltaF is exact and self-consistent (the absolute F need
-        not equal the training loss)."""
+        not equal the training loss).
+
+        Caveat: ``log_prior`` here is the RAW ``_attention_log_prior`` -- it does NOT replay
+        ``_fold_precision_bias`` (``cfg.precision_weighted_attention``) or ``_fold_gamma_prior``
+        (``cfg.gamma_as_beta_prior``), both default OFF, which ``forward_beliefs`` may have folded into
+        the prior the belief actually converged under. ``lambda_twohop`` (default 0.0) is likewise not
+        forwarded to ``free_energy_value``. Under either opt-in fold, or nonzero ``lambda_twohop``,
+        DeltaF is therefore a close approximation to the fold-consistent value rather than exact --
+        current and trial are still scored against the IDENTICAL (raw) prior, so accept/reject remains
+        well-defined and self-consistent, just not against the same prior the E-step used."""
         from vfe3.free_energy import attention_tau
         from vfe3.inference.e_step import free_energy_value
         cfg, grp = self.cfg, self.group
@@ -983,6 +992,14 @@ class VFEModel(nn.Module):
         pb = self.prior_bank
         with torch.no_grad():
             if getattr(pb, "_omega_compact", False):
+                # [token_id, 0] indexes block 0 of the untied (V, H, d, d) table -- correct only for
+                # that layout. A TIED (V, d, d) table has no block axis, so [token_id, 0] would index
+                # row 0 of the shared block and silently corrupt the frame instead of flipping it.
+                # Currently unreachable: tied groups (tied_block_glk) are rejected at config for
+                # omega_reflection='metropolis' (same _REFLECT_OK gate as init_seed). Assert loud
+                # rather than let a future widening of that gate corrupt silently.
+                assert pb.omega_embed.dim() == 4, (
+                    "compact det-sign flip assumes untied (V,H,d,d); tied (V,d,d) is gated out at config")
                 d = pb.omega_embed.shape[-1]                            # compact block size
                 pb.omega_embed[token_id, 0] = R[:d, :d] @ pb.omega_embed[token_id, 0]
             else:
@@ -1005,6 +1022,13 @@ class VFEModel(nn.Module):
         token's DeltaF is measured against the post-accept state (a correct MCMC chain). Everything
         runs under no_grad. Returns a small stats dict (proposed/accepted counts, mean DeltaF) for
         logging. See docs/superpowers/specs/2026-07-08-omega-direct-metropolis-detsign-design.md.
+
+        Caveat (see :meth:`_metropolis_free_energy`): under ``cfg.precision_weighted_attention`` or
+        ``cfg.gamma_as_beta_prior`` (both default OFF) DeltaF is scored against the raw attention
+        log-prior rather than the folded prior the belief converged under, so it is a close
+        approximation there rather than exact; ``cfg.lambda_twohop`` (default 0.0) is likewise not
+        forwarded. Accept/reject stays well-defined either way since current and trial are always
+        scored against the identical prior.
 
         # TODO(STE): straight-through-gradient variant of the learnable det-sign -- propose per-token
         # sign flips accepted through a straight-through estimator (biased but differentiable) instead

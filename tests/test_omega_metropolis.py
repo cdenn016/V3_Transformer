@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 from vfe3.config import VFE3Config
@@ -88,6 +90,46 @@ def test_downhill_flip_accepted_and_toggles_det_sign():
     assert stats["proposed"] >= 1
     if stats["accepted"] >= 1:                                          # accepted -> det sign toggles
         assert det_before * det_after < 0
+
+
+def test_uphill_flip_gated_by_metropolis_acceptance():
+    # Spec 8.3: pin the STOCHASTIC accept branch (dF>0, gated by u < exp(-dF/T)), which the downhill
+    # test above never reaches (a repeated-token batch gives Omega_ij == I and dF === 0). Distinct
+    # tokens here make the belief-coupling transport Omega_ij != I so flipping a token's frame away
+    # from its (identity-init) sheet genuinely changes F; at this model seed it STRICTLY INCREASES F
+    # for token 0 -- a real uphill proposal.
+    torch.manual_seed(1)
+    m = _model(vocab_size=4)
+    tok = torch.tensor([[0, 1, 2, 3]])                                   # distinct tokens -> Omega_ij != I
+    belief, mu_p, sigma_p = m._metropolis_prepare(tok)
+    dF0 = m._metropolis_delta_f(belief, mu_p, sigma_p, tok, 0)
+    assert dF0 > 0.0                                                     # genuinely uphill at this seed
+
+    # (1) Tiny temperature: dF0/T is so negative that exp(-dF0/T) underflows to exactly 0.0 (fp64), so
+    # the stochastic accept is deterministically False -- the sweep accepts nothing (0 for ALL 4
+    # tokens here, all of which happen to be uphill at this seed).
+    m.cfg.omega_metropolis_temperature = 1e-6
+    stats = m.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(0))
+    assert stats["accepted"] == 0
+    assert torch.det(m.prior_bank.omega_embed[0]).item() > 0.0           # unmutated, still det>0 sheet
+
+    # (2) Exact-rule pin: torch.unique sorts ascending, so token 0 is the FIRST proposal the sweep
+    # scores -- against the untouched _metropolis_prepare belief, i.e. the SAME dF0 computed above.
+    # Reproduce the sweep's first `torch.rand(generator=...)` draw independently and assert the move's
+    # own accept/reject decision equals the documented formula dF<=0 or u<exp(-dF/T). This seed lands
+    # in the u<exp(-dF/T) branch (True), so both directions of the stochastic gate are exercised across
+    # the two sub-cases of this test.
+    m.cfg.omega_metropolis_temperature = 1e-3                           # moderate T: a genuine 0<p<1 draw
+    T = m.cfg.omega_metropolis_temperature
+    seed = 3
+    u0 = torch.rand((), generator=torch.Generator().manual_seed(seed)).item()
+    expect_accept0 = (dF0 <= 0.0) or (u0 < math.exp(-dF0 / T))
+    assert expect_accept0                                                # this seed's draw clears the threshold
+    det_before = torch.det(m.prior_bank.omega_embed[0]).item()
+    m.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(seed))
+    det_after = torch.det(m.prior_bank.omega_embed[0]).item()
+    accepted0 = det_before * det_after < 0.0                             # det sign toggles iff token 0 was flipped
+    assert accepted0 == expect_accept0
 
 
 def test_exact_delta_f_matches_independent_recompute():
