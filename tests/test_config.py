@@ -622,18 +622,20 @@ def test_force_large_figures_default_off():
 
 
 @pytest.mark.parametrize("gamma_toggle", [
-    dict(lambda_gamma=0.1),                                   # gamma model-coupling loss term
-    dict(s_e_step=True),                                      # _refine_s s-channel E-step
-    dict(gamma_as_beta_prior=True, lambda_gamma=0.1),        # hierarchical gamma-in-belief-prior fold
+    dict(lambda_gamma=0.1),                                        # gamma model-coupling loss term
+    dict(s_e_step=True, prior_source="model_channel"),            # _refine_s s-channel E-step
+    dict(gamma_as_beta_prior=True, lambda_gamma=0.1),             # hierarchical gamma-in-belief-prior fold
 ])
-def test_omega_direct_rejects_active_gamma_channel(gamma_toggle):
-    r"""Phase-1 omega_direct rejects the gamma / model-coupling channel: _gamma_energy (lambda_gamma>0
-    / gamma_as_beta_prior) and _refine_s (s_e_step) build their transport from the phi cocycle and do
-    NOT read the belief's omega frame, so under omega_direct they would silently transport the s tables
-    by exp(phi) instead of the stored U. Rejected until Phase 2 gives the s channel frame fidelity."""
-    with pytest.raises(ValueError, match="does not yet support the gamma"):
-        VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk",
-                   embed_dim=4, n_heads=1, **gamma_toggle)
+def test_omega_direct_accepts_active_gamma_channel(gamma_toggle):
+    r"""Phase-3 gave the gamma / model-coupling (s) channel omega frame-fidelity: _gamma_energy
+    (lambda_gamma>0 / gamma_as_beta_prior), _fold_gamma_prior, and _refine_s (s_e_step) now transport
+    the s tables by the stored frame U_i U_j^{-1} under omega_direct -- exactly like the belief channel
+    -- so the config gate that used to reject the combination is gone. Each active-gamma toggle now
+    CONSTRUCTS. (s_e_step alone -- no lambda_gamma -- also constructs; it only carries the orthogonal
+    prior_source='model_channel' requirement, which has nothing to do with the omega frame.)"""
+    cfg = VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk",
+                     embed_dim=4, n_heads=1, **gamma_toggle)
+    assert cfg.gauge_parameterization == "omega_direct"
 
 
 def test_omega_direct_pure_channel_off_constructs():

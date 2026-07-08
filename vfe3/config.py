@@ -938,21 +938,6 @@ class VFE3Config:
                     f"gauge_parameterization='omega_direct' does not support E-step frame refinement "
                     f"(e_phi_lr>0) yet; got e_phi_lr={self.e_phi_lr}. Set e_phi_lr=0.0."
                 )
-            # The gamma / model-coupling (s) channel builds its OWN transport from the phi cocycle
-            # (_gamma_energy under lambda_gamma>0 / gamma_as_beta_prior; _refine_s under s_e_step) and
-            # does NOT yet read the belief's omega frame -- so under omega_direct it would silently
-            # transport the s tables by exp(phi) rather than the stored U. Reject the combo (frame
-            # fidelity for the s channel is deferred to Phase 2) rather than run the wrong transport.
-            if self.lambda_gamma > 0.0 or self.s_e_step or self.gamma_as_beta_prior:
-                raise ValueError(
-                    "gauge_parameterization='omega_direct' does not yet support the gamma / "
-                    "model-coupling channel (s-channel transport frame-fidelity is not yet "
-                    "implemented); got "
-                    f"lambda_gamma={self.lambda_gamma}, s_e_step={self.s_e_step}, "
-                    f"gamma_as_beta_prior={self.gamma_as_beta_prior}. Set lambda_gamma=0.0, "
-                    "s_e_step=False, and gamma_as_beta_prior=False, or use "
-                    "gauge_parameterization='phi'."
-                )
         # cross_couplings (off-block GL(K) head coupling) is supported only by a group builder that
         # accepts the kwarg (block_glk). Reject otherwise (glk / so_k / tied_block_glk) by inspecting
         # the registered builder's signature, not a hardcoded name list, so support tracks the

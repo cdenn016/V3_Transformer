@@ -274,6 +274,68 @@ def test_omega_direct_full_model_gauge_invariance():
     assert delta(dbl=False, use_prior_bank=False) > 1e-4       # linear decode does not co-transform -> bite
 
 
+def test_omega_direct_user_target_config_finite_forward():
+    """CAPSTONE: the user's training config -- omega_direct with the FULL gamma / model-coupling (s)
+    channel ON (lambda_gamma>0, s_e_step, gamma_as_beta_prior, prior_source='model_channel') --
+    constructs and runs to a FINITE forward. Phase-3 removed the config gate that used to reject this
+    combination; if this raises or returns non-finite, the s-channel frame threading (Tasks 1-4) left
+    an integration gap. Tiny dims (K=4, N=4, vocab=6); gaussian_diagonal because the live s E-step
+    refines the model channel as a diagonal Gaussian."""
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(gauge_parameterization="omega_direct", gauge_group="glk",
+                      lambda_gamma=0.75, s_e_step=True, gamma_as_beta_prior=True,
+                      prior_source="model_channel", family="gaussian_diagonal",
+                      decode_mode="diagonal"))
+    m.eval()
+    tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
+    assert torch.isfinite(m(tok)[0]).all()
+
+
+def test_omega_direct_full_model_gauge_invariance_gamma_on():
+    """Sibling of test_omega_direct_full_model_gauge_invariance with the gamma / model-coupling (s)
+    channel ON: a global gauge transform of ALL tied tables -- belief means mu, model-channel means
+    s_mu, hyper-prior r_mu, and the stored frames omega (U -> gU) -- leaves the omega_direct decode
+    logits invariant to fp64. This is the end-to-end frame-fidelity certificate: Phase-3 Tasks 1-3
+    threaded the SAME stored frame U through the gamma energy, the gamma-in-belief-prior fold, and the
+    s-channel E-step, so the whole model shares ONE gauge -- co-transforming omega now propagates into
+    the s channel (it did not before Task 3). An orthogonal g keeps the diagonal Sigma=I readout
+    representable (g I g^T = I), exactly as the gamma-off sibling; every sigma table is zeroed so
+    Sigma=I wherever the co-transform lands. s_e_step forces the diagonal family, so this uses
+    gaussian_diagonal (the sibling uses _cfg's full). r_mu is set nonzero and co-transformed for a
+    complete gauge; it is consumed only under lambda_h>0 (inert here, harmless)."""
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(gauge_parameterization="omega_direct", gauge_group="glk",
+                      lambda_gamma=0.75, s_e_step=True, gamma_as_beta_prior=True,
+                      prior_source="model_channel", family="gaussian_diagonal",
+                      decode_mode="diagonal"))
+    with torch.no_grad():
+        m.prior_bank.omega_embed.copy_(torch.eye(4).expand(6, 4, 4))       # frames -> identity
+        m.prior_bank.sigma_log_embed.zero_()                              # belief Sigma = I
+        m.prior_bank.s_sigma_log_embed.zero_()                            # model-channel Sigma = I
+        m.prior_bank.r_sigma_log.zero_()                                  # hyper-prior Sigma = I
+        m.prior_bank.r_mu.copy_(torch.tensor([0.1, -0.2, 0.15, -0.05]))   # nonzero r_mu so its co-transform is not vacuous
+        if hasattr(m, "pos_phi_free"):
+            m.pos_phi_free.zero_()
+    m = m.double()
+    m.eval()
+    # orthogonal g so the diagonal Sigma=I readout stays representable (g I g^T = I).
+    gen_so = generate_son(4).to(torch.float64)                            # skew -> matrix_exp is orthogonal
+    c = 0.3 * torch.randn(gen_so.shape[0], generator=torch.Generator().manual_seed(1)).to(gen_so.dtype)
+    g = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", c, gen_so))     # g in O(4): g g^T = I
+    eye = torch.eye(4, dtype=g.dtype)
+    assert torch.allclose(g @ g.transpose(-1, -2), eye, atol=1e-6)        # so(4) => g orthogonal
+    tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
+    with torch.no_grad():
+        l0 = m(tok)[0].clone()
+        m.prior_bank.mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.mu_embed))
+        m.prior_bank.s_mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.s_mu_embed))   # s means -> g s
+        m.prior_bank.r_mu.copy_(g @ m.prior_bank.r_mu)                                          # hyper-prior mean -> g r
+        # co-transform the stored frame: U -> g U (the cocycle U_i U_j^{-1} is g-invariant)
+        m.prior_bank.omega_embed.copy_(torch.einsum("kl,vlm->vkm", g, m.prior_bank.omega_embed))
+        l1 = m(tok)[0].clone()
+    assert float((l0 - l1).abs().max()) < 1e-5
+
+
 def test_omega_direct_transport_covariance_law():
     """The omega_direct cocycle transports covariantly under a PER-TOKEN general GL(K) gauge:
     Omega_ij -> g_i Omega_ij g_j^{-1}. Pins the full GL(K) property directly at the transport
