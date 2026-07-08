@@ -553,6 +553,10 @@ class VFE3Config:
     #                          the pure half-cosine-to-zero path.
     
     seed:                      int   = 0
+    deterministic:             bool  = False         # opt-in full run-to-run determinism (esp. GPU): _seed_everything
+                                                     # adds torch.use_deterministic_algorithms(warn_only) + cudnn.deterministic
+                                                     # + CUBLAS_WORKSPACE_CONFIG (env var takes full effect only if set
+                                                     # before the first CUDA op). Default False = today's byte-identical path.
     log_interval:              int   = 100           # console log every N steps (0 = off)
     eval_interval:             int   = 2000            # periodic validation every N steps (0 = off)
     checkpoint_interval:       int   = 0            # save a resumable checkpoint every N steps (0 = off)
