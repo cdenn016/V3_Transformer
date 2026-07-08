@@ -231,8 +231,9 @@ def test_config_accepts_omega_direct_on_gl_groups():
 
 
 def test_config_rejects_omega_direct_off_scope():
-    with pytest.raises(ValueError):                       # so_k has no det<0 element-store scope in Phase 1
-        VFE3Config(gauge_parameterization="omega_direct", gauge_group="so_k", embed_dim=4, n_heads=1)
+    r"""Phase 2 widened the gauge_group whitelist to all seven omega-eligible groups (so_k is now
+    accepted -- see test_omega_direct_accepts_all_eligible_groups), so only the still-live scope
+    rejections (E-step frame refinement, non-flat transport) remain here."""
     with pytest.raises(ValueError):                       # E-step frame refinement not supported yet
         VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1, e_phi_lr=0.1)
     with pytest.raises(ValueError):                       # only the flat regime in Phase 1
@@ -640,3 +641,32 @@ def test_omega_direct_pure_channel_off_constructs():
     gamma_as_beta_prior=False leave no s-channel transport to mis-frame."""
     cfg = VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1)
     assert cfg.gauge_parameterization == "omega_direct"
+
+
+def test_omega_direct_accepts_all_eligible_groups():
+    common = dict(gauge_parameterization="omega_direct", transport_mode="flat", e_phi_lr=0.0,
+                  lambda_gamma=0.0, s_e_step=False)
+    for grp, over in (("glk", {}), ("block_glk", {"n_heads": 2}), ("tied_block_glk", {"n_heads": 2}),
+                      ("sp", {}), ("so_k", {}),
+                      ("so_n", {"group_n": 3, "irrep_spec": [("l0", 1), ("l1", 1)]}),
+                      ("sp_n", {"embed_dim": 5, "group_n": 4, "irrep_spec": [("sym0", 1), ("sym1", 1)]})):
+        kw = dict(embed_dim=over.pop("embed_dim", 4), n_heads=over.pop("n_heads", 1),
+                  gauge_group=grp, use_head_mixer=False, **over, **common)
+        assert VFE3Config(**kw).gauge_parameterization == "omega_direct"
+
+
+def test_omega_direct_reflection_cross_check_fail_closed():
+    import pytest
+    base = dict(gauge_parameterization="omega_direct", transport_mode="flat", e_phi_lr=0.0,
+                lambda_gamma=0.0, s_e_step=False, omega_reflection="init_seed", use_head_mixer=False)
+    # reject init_seed where it is vacuous / group-incorrect
+    with pytest.raises(ValueError):    # sp: no det<0 component
+        VFE3Config(embed_dim=4, n_heads=1, gauge_group="sp", **base)
+    with pytest.raises(ValueError):    # so_n: needs rho(O(N)) image, deferred
+        VFE3Config(embed_dim=4, n_heads=1, gauge_group="so_n", group_n=3,
+                   irrep_spec=[("l0", 1), ("l1", 1)], **base)
+    with pytest.raises(ValueError):    # tied_block_glk: ambient seed breaks the tie, deferred
+        VFE3Config(embed_dim=4, n_heads=2, gauge_group="tied_block_glk", **base)
+    # accept init_seed where it is group-correct
+    assert VFE3Config(embed_dim=4, n_heads=1, gauge_group="so_k", **base).omega_reflection == "init_seed"
+    assert VFE3Config(embed_dim=4, n_heads=1, gauge_group="glk", **base).omega_reflection == "init_seed"

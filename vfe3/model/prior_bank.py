@@ -176,6 +176,7 @@ class PriorBank(nn.Module):
         self.unigram_kappa = unigram_kappa
         self.decode_unigram_prior = decode_unigram_prior
         self.gauge_parameterization = gauge_parameterization
+        self.irrep_dims = irrep_dims
         # untie applies to the KL-to-bank decode only (the linear ablation is already untied by
         # construction), so the flag is resolved against use_prior_bank once, here.
         self.untie_decode_bank = untie_decode_bank and use_prior_bank

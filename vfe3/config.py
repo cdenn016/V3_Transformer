@@ -382,6 +382,8 @@ class VFE3Config:
     spd_retract_mode:          str   = "spd_affine" # SPD covariance retraction geometry (registry key)
     omega_retract_mode:        str   = "lie_exp"  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
     omega_reflection:          str   = "off"      # omega_direct det<0 seeding: 'off' (det>0 only) | 'init_seed'
+    omega_compact_storage:     bool  = False     # opt-in compact (V,H,d,d)/(V,d,d) block storage (equal-block groups)
+    omega_reorth_every:        int   = 0         # SO-group re-orthogonalization cadence in M-steps (0 = off)
 
     # decode / encode
     use_prior_bank:            bool  = False
@@ -902,17 +904,30 @@ class VFE3Config:
         # config <- transport <- groups import cycle (matching the retraction pattern below).
         from vfe3.geometry.transport import _TRANSPORTS
         _require(self.transport_mode, tuple(sorted(_TRANSPORTS)), "transport_mode")
-        # 'omega_direct' stores the per-token frame as a GL(K) group element U_i (belief.omega),
-        # sourced from prior_bank.omega_embed, transport Omega_ij = U_i U_j^{-1}. Phase 1 scope:
-        # the non-compact GL groups (glk, block_glk), the flat regime, and no E-step frame
-        # refinement. Everything outside that scope is rejected with a clear message.
+        _require(self.omega_retract_mode, _VALID_OMEGA_RETRACT, "omega_retract_mode")
+        _require(self.omega_reflection, _VALID_OMEGA_REFLECTION, "omega_reflection")
+        # 'omega_direct' stores the per-token frame as a structure-group element U_i (belief.omega),
+        # sourced from prior_bank.omega_embed, transport Omega_ij = U_i U_j^{-1}. Phase 2 scope:
+        # all seven omega-eligible groups (_OMEGA_GROUPS below), the flat regime, and no E-step
+        # frame refinement. Everything outside that scope is rejected with a clear message.
         if self.gauge_parameterization == "omega_direct":
-            if self.gauge_group not in ("glk", "block_glk"):
+            _OMEGA_GROUPS = ("glk", "block_glk", "tied_block_glk", "so_k", "so_n", "sp", "sp_n")
+            if self.gauge_group not in _OMEGA_GROUPS:
                 raise ValueError(
-                    f"gauge_parameterization='omega_direct' is Phase-1-scoped to gauge_group in "
-                    f"('glk', 'block_glk') (the non-compact GL groups where det<0 reach is meaningful); "
-                    f"got gauge_group={self.gauge_group!r}."
+                    f"gauge_parameterization='omega_direct' supports gauge_group in {_OMEGA_GROUPS}; "
+                    f"got {self.gauge_group!r}."
                 )
+            if self.omega_reflection == "init_seed":
+                # det<0 seeding is group-specific; reject where the ambient diag(-1,1,...) seed is not a
+                # valid, tie-respecting, det<0 element of the structure group (deferred cases -> Phase 2b).
+                _REFLECT_OK = ("glk", "block_glk", "so_k")   # so_k: valid O(K) seed; gl: ambient seed valid
+                if self.gauge_group not in _REFLECT_OK:
+                    raise ValueError(
+                        f"omega_reflection='init_seed' is not available for gauge_group="
+                        f"{self.gauge_group!r} in Phase 2: sp/sp_n have no det<0 component, so_n needs the "
+                        f"rho(O(N)) image seed, and tied_block_glk needs a tied replicated seed (all deferred). "
+                        f"Use omega_reflection='off', or gauge_group in {_REFLECT_OK}."
+                    )
             if self.transport_mode != "flat":
                 raise ValueError(
                     f"gauge_parameterization='omega_direct' requires transport_mode='flat' in Phase 1; "
@@ -938,8 +953,6 @@ class VFE3Config:
                     "s_e_step=False, and gamma_as_beta_prior=False, or use "
                     "gauge_parameterization='phi'."
                 )
-        _require(self.omega_retract_mode, _VALID_OMEGA_RETRACT, "omega_retract_mode")
-        _require(self.omega_reflection, _VALID_OMEGA_REFLECTION, "omega_reflection")
         # cross_couplings (off-block GL(K) head coupling) is supported only by a group builder that
         # accepts the kwarg (block_glk). Reject otherwise (glk / so_k / tied_block_glk) by inspecting
         # the registered builder's signature, not a hardcoded name list, so support tracks the
