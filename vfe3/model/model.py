@@ -609,6 +609,12 @@ class VFEModel(nn.Module):
 
         cfg, pb, grp = self.cfg, self.prior_bank, self.group
         s_mu, s_sigma = pb.encode_s(token_ids)                         # (B, N, K)
+        # omega_direct frame fidelity (Phase 3 Task 3): re-derive the stored belief frame U_i so the
+        # s-channel E-step transports the gamma coupling by U_i U_j^{-1} (via e_step's internal
+        # build_belief_transport), not the flat exp(phi0) cocycle phi0 is held at. ATTACHED (no
+        # detach): the s-refine trains omega_embed through the unrolled trajectory exactly as it
+        # trains phi_embed.
+        omega_s = pb._omega_lookup(token_ids) if cfg.gauge_parameterization == "omega_direct" else None
         r_mu    = pb.r_mu.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
         r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s_sigma)
         gamma_tau       = attention_tau(self.effective_kappa_gamma(s_mu.device), grp.irrep_dims)
@@ -616,7 +622,7 @@ class VFEModel(nn.Module):
             token_ids.shape[1], token_ids.device, prior=cfg.gamma_attention_prior,
         )
         out = e_step(
-            BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0), r_mu, r_sigma, grp,
+            BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0, omega=omega_s), r_mu, r_sigma, grp,
             n_iter=cfg.n_e_steps,         tau=gamma_tau,
             e_q_mu_lr=cfg.e_s_mu_lr,      e_q_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
             # The s-channel self-coupling weight IS lambda_h (the hyper-prior precision): route it
@@ -661,6 +667,7 @@ class VFEModel(nn.Module):
             # inconsistency only under the double opt-in). Thread the rope args here if the model
             # channel is ever meant to be RoPE-transported too.
             transport_mode="flat",
+            gauge_parameterization=cfg.gauge_parameterization,
             e_step_gradient=e_step_gradient,
             oracle_unroll_grad=cfg.oracle_unroll_grad,
             # Tier-1 transport perf toggles: the s-channel E-step shares the flat transport

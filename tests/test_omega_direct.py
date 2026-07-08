@@ -822,3 +822,78 @@ def test_fold_gamma_prior_uses_stored_frame_not_phi_cocycle():
     lp2 = m._fold_gamma_prior(None, tok, phi, omega=U2)
     assert not torch.allclose(lp1, lp2, atol=1e-6), \
         "fold_gamma_prior is blind to the stored omega frame (still using the phi cocycle)"
+
+
+def test_refine_s_uses_stored_frame_not_phi_cocycle():
+    # Phase 3 Task 3: _refine_s (the s_e_step E-step) must transport the model-coupling (gamma)
+    # term by the STORED belief frame U (pb.omega_embed) under omega_direct, not the flat
+    # phi-cocycle exp(phi_i)exp(-phi_j). The config gate (config.py:946) still blocks omega_direct +
+    # active gamma at CONSTRUCTION time, so the model is built with the gamma channel OFF
+    # (lambda_gamma=0, s_e_step=False, gamma_as_beta_prior=False -- _cfg's defaults) plus
+    # lambda_h=1.0 (lambda_h is NOT in the gate's reject list, and lambda_h>0 alone -- independent of
+    # lambda_gamma/s_e_step -- is what builds the r table _refine_s reads) and
+    # prior_source='model_channel' so the s tables exist. cfg.lambda_gamma is then bumped to a
+    # nonzero value AFTER construction (the same "method reads cfg live at call time" maneuver the
+    # brief uses for the gauge_parameterization gate) so the omega-transported coupling term has
+    # nonzero weight: at lambda_gamma=0 the pair/coupling contribution is multiplied by exactly zero
+    # (kernels.py: grad_mu = self_mu + lambda_beta*pair_mu, lambda_beta=cfg.lambda_gamma), so the
+    # refined s would be independent of omega regardless of the fix -- a vacuous test. phi is held at
+    # zero (exp(phi)=I identically), so a phi-based rebuild is blind to omega and returns IDENTICAL
+    # refined s for any U (pre-fix bug); post-fix, two different frames U1=I, U2 must give DIFFERENT
+    # refined s.
+    K, N, V = 4, 3, 6
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(gauge_parameterization="omega_direct", prior_source="model_channel",
+                      family="gaussian_diagonal", decode_mode="diagonal",
+                      lambda_h=1.0, lambda_h_mode="constant"))
+    m.cfg.lambda_gamma = 0.75                        # bumped post-construction, bypassing the
+                                                      # construction-time omega_direct gate
+    grp = m.group
+    n_gen = grp.generators.shape[0]
+    tok = torch.randint(0, V, (1, N), generator=torch.Generator().manual_seed(1))
+    phi0 = torch.zeros(1, N, n_gen)                  # exp(phi0)=I: phi-cocycle is frame-blind
+
+    U1 = torch.eye(K).expand(V, K, K).contiguous()   # identity frame for the whole vocab table
+    xi = 0.3 * torch.randn(V, n_gen, generator=torch.Generator().manual_seed(2))
+    U2 = retract_omega(U1, xi, grp.generators)       # a DIFFERENT, non-identity frame
+    assert not torch.allclose(U2, U1, atol=1e-4)
+
+    with torch.no_grad():
+        m.prior_bank.omega_embed.copy_(U1)
+    s_mu1, s_sigma1 = m._refine_s(tok, phi0)
+    with torch.no_grad():
+        m.prior_bank.omega_embed.copy_(U2)
+    s_mu2, s_sigma2 = m._refine_s(tok, phi0)
+    assert not torch.allclose(s_mu1, s_mu2, atol=1e-6), \
+        "_refine_s is blind to the stored omega frame (still using the phi cocycle)"
+
+    # Load-bearing gradient-flow pin: omega_s must stay ATTACHED (no .detach()) inside _refine_s so
+    # the s E-step trains omega_embed through the unrolled trajectory, exactly as it trains
+    # phi_embed. A detached lookup would silently freeze the frame's gradient.
+    grad, = torch.autograd.grad(s_mu2.sum(), m.prior_bank.omega_embed)
+    assert grad is not None and torch.count_nonzero(grad) > 0
+
+
+def test_refine_s_phi_path_unaffected():
+    # Byte-identity guard (Phase 3 Task 3): under gauge_parameterization='phi', _refine_s must be
+    # untouched by the omega threading -- omega_s resolves to None and gauge_parameterization='phi'
+    # is passed through, so e_step falls to its pre-existing phi branch. Same construction/mutation
+    # recipe as the omega_direct test above (lambda_h=1.0 builds the r table; lambda_gamma bumped
+    # post-construction so the coupling term is non-vacuous), but gauge_parameterization='phi' this
+    # time -- refined s must be IDENTICAL regardless of what is stashed in omega_embed (indeed no
+    # omega_embed table is even created off the omega_direct path).
+    K, N, V = 4, 3, 6
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(gauge_parameterization="phi", prior_source="model_channel",
+                      family="gaussian_diagonal", decode_mode="diagonal",
+                      lambda_h=1.0, lambda_h_mode="constant"))
+    assert not hasattr(m.prior_bank, "omega_embed")   # phi path: no omega table at all
+    m.cfg.lambda_gamma = 0.75
+    grp = m.group
+    n_gen = grp.generators.shape[0]
+    tok = torch.randint(0, V, (1, N), generator=torch.Generator().manual_seed(1))
+    phi0 = 0.2 * torch.randn(1, N, n_gen, generator=torch.Generator().manual_seed(3))
+
+    s_mu1, s_sigma1 = m._refine_s(tok, phi0)
+    s_mu2, s_sigma2 = m._refine_s(tok, phi0)
+    assert torch.equal(s_mu1, s_mu2) and torch.equal(s_sigma1, s_sigma2)   # byte-identical, deterministic
