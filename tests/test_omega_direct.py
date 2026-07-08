@@ -292,17 +292,34 @@ def test_omega_direct_user_target_config_finite_forward():
 
 
 def test_omega_direct_full_model_gauge_invariance_gamma_on():
-    """Sibling of test_omega_direct_full_model_gauge_invariance with the gamma / model-coupling (s)
-    channel ON: a global gauge transform of ALL tied tables -- belief means mu, model-channel means
-    s_mu, hyper-prior r_mu, and the stored frames omega (U -> gU) -- leaves the omega_direct decode
-    logits invariant to fp64. This is the end-to-end frame-fidelity certificate: Phase-3 Tasks 1-3
-    threaded the SAME stored frame U through the gamma energy, the gamma-in-belief-prior fold, and the
-    s-channel E-step, so the whole model shares ONE gauge -- co-transforming omega now propagates into
-    the s channel (it did not before Task 3). An orthogonal g keeps the diagonal Sigma=I readout
-    representable (g I g^T = I), exactly as the gamma-off sibling; every sigma table is zeroed so
-    Sigma=I wherever the co-transform lands. s_e_step forces the diagonal family, so this uses
-    gaussian_diagonal (the sibling uses _cfg's full). r_mu is set nonzero and co-transformed for a
-    complete gauge; it is consumed only under lambda_h>0 (inert here, harmless)."""
+    """Gauge-COVARIANCE regression guard, sibling of test_omega_direct_full_model_gauge_invariance
+    with the gamma / model-coupling (s) channel ON: a global ORTHOGONAL gauge transform g of ALL tied
+    prior tables -- belief means mu, model-channel means s_mu, hyper-prior r_mu, and the stored frames
+    omega (U -> gU) -- leaves the omega_direct decode logits invariant to fp64 with the full gamma / s
+    wiring active. What this certifies is narrow but real: the Phase-3 gamma+s pipeline introduces NO
+    gauge-BREAKING term -- a future edit that added one (a term not equivariant under a global g) would
+    make this test fail.
+
+    What it does NOT certify: it does NOT distinguish the U-transport from an exp(phi) transport. Both
+    are gauge-COVARIANT, so both pass a gauge-INVARIANCE test identically. Concretely, with every base
+    frame set to identity a global g maps every token frame to the same g, so the relative s-channel
+    cocycle Omega_ij = U_i U_j^{-1} = g g^{-1} = I for all pairs -- exactly what a frame-blind exp(phi)=I
+    s-channel builds -- and under gamma_as_beta_prior the gamma channel reaches the decode only through
+    gauge-invariant scalar attention weights while under prior_source='model_channel' the s_mu rotation
+    self-cancels between prior and belief. Reverting Task 3 would NOT change this test's result.
+
+    The s-channel frame-USE (that it transports by the stored U, not exp(phi)) is certified elsewhere,
+    by the per-task frame-fidelity unit tests that directly VARY the frame at zero phi and assert the
+    output changes: test_refine_s_uses_stored_frame_not_phi_cocycle (Task 3, the s E-step) and the
+    Task 1/2 gamma-coupling tests test_gamma_coupling_term_uses_stored_frame_not_phi_cocycle,
+    test_gamma_coupling_terms_split_uses_stored_frame_not_phi_cocycle, and
+    test_fold_gamma_prior_uses_stored_frame_not_phi_cocycle.
+
+    Setup notes: an orthogonal g keeps the diagonal Sigma=I readout representable (g I g^T = I), exactly
+    as the gamma-off sibling; every sigma table is zeroed so Sigma=I wherever the co-transform lands.
+    s_e_step forces the diagonal family, so this uses gaussian_diagonal (the sibling uses _cfg's full).
+    r_mu is set nonzero and co-transformed for a complete gauge; it is consumed only under lambda_h>0
+    (inert here, harmless)."""
     torch.manual_seed(0)
     m = VFEModel(_cfg(gauge_parameterization="omega_direct", gauge_group="glk",
                       lambda_gamma=0.75, s_e_step=True, gamma_as_beta_prior=True,
@@ -325,12 +342,20 @@ def test_omega_direct_full_model_gauge_invariance_gamma_on():
     eye = torch.eye(4, dtype=g.dtype)
     assert torch.allclose(g @ g.transpose(-1, -2), eye, atol=1e-6)        # so(4) => g orthogonal
     tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
+    # Co-transform EVERY table by g so the gauge transform is complete (gauge-covariance completeness).
+    # Note these s/frame co-transforms are empirically INERT for the decode under this config, not
+    # load-bearing: with identity base frames the frame co-transform U -> gU is a no-op on the relative
+    # cocycle (g g^{-1} = I), the s_mu rotation self-cancels between prior and belief under
+    # prior_source='model_channel', and the gamma channel reaches the decode only through
+    # gauge-invariant scalar attention weights under gamma_as_beta_prior. They are applied for a
+    # consistent global gauge; the frame-USE they might seem to exercise is pinned by the per-task
+    # frame-fidelity tests named in the docstring, NOT here.
     with torch.no_grad():
         l0 = m(tok)[0].clone()
         m.prior_bank.mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.mu_embed))
-        m.prior_bank.s_mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.s_mu_embed))   # s means -> g s
-        m.prior_bank.r_mu.copy_(g @ m.prior_bank.r_mu)                                          # hyper-prior mean -> g r
-        # co-transform the stored frame: U -> g U (the cocycle U_i U_j^{-1} is g-invariant)
+        m.prior_bank.s_mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.s_mu_embed))   # s means -> g s (inert here)
+        m.prior_bank.r_mu.copy_(g @ m.prior_bank.r_mu)                                          # hyper-prior mean -> g r (inert; lambda_h=0)
+        # co-transform the stored frame: U -> g U (cocycle U_i U_j^{-1} g-invariant; a no-op on the decode here)
         m.prior_bank.omega_embed.copy_(torch.einsum("kl,vlm->vkm", g, m.prior_bank.omega_embed))
         l1 = m(tok)[0].clone()
     assert float((l0 - l1).abs().max()) < 1e-5
