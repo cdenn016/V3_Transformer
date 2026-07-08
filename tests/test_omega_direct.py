@@ -801,8 +801,9 @@ def test_ablation_omega_direct_arm_builds():
     # (BASELINE_CONFIG, which sets lambda_gamma=0.75 and s_e_step=True) merged with the arm
     # overrides -- so this exercises the real BASELINE_CONFIG interaction. The arm fans out one
     # phi baseline plus one omega_direct cell per gauge_group in vfe3.config's omega-eligible set
-    # (glk, block_glk, tied_block_glk, so_k, sp, so_n, sp_n); every omega_direct cell MUST override
-    # lambda_gamma=0.0 / s_e_step=False, or its Phase-1 gamma-channel gate rejects it.
+    # (glk, block_glk, tied_block_glk, so_k, sp, so_n, sp_n). Phase 3 gave omega_direct s-channel
+    # frame-fidelity, so every cell now INHERITS BASELINE_CONFIG's gamma-on settings (no per-cell
+    # lambda_gamma/s_e_step override) -- an apples-to-apples gamma-on comparison across gauge charts.
     import ablation
 
     runs = ablation.make_run_overrides("gauge_parameterization")
@@ -823,8 +824,8 @@ def test_ablation_omega_direct_arm_builds():
     for label in omega_labels:
         cfg = built[label]
         assert cfg.gauge_parameterization == "omega_direct"
-        assert cfg.lambda_gamma == 0.0
-        assert cfg.s_e_step is False
+        assert cfg.lambda_gamma == built["phi"].lambda_gamma > 0.0   # inherits BASELINE gamma-on (no per-cell override), apples-to-apples with phi
+        assert cfg.s_e_step == built["phi"].s_e_step                 # ditto for the s-channel E-step
         seen_groups.add(cfg.gauge_group)
     assert seen_groups == {"glk", "block_glk", "tied_block_glk", "so_k", "sp", "so_n", "sp_n"}
 

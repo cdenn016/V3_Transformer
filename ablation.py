@@ -399,9 +399,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
 
-    # omega_direct is Phase-1-gated against the gamma / model-coupling (s) channel (its s-transport
-    # would use exp(phi), not the stored U), so EVERY arm disables it (lambda_gamma=0, s_e_step=False)
-    # to keep the phi-vs-omega_direct comparison fair and let every cell build off BASELINE_CONFIG.
+    # Phase 3 gave omega_direct s-channel frame-fidelity (the gamma / model-coupling channel now
+    # transports the s tables by the stored U, not exp(phi)), so every cell INHERITS BASELINE_CONFIG's
+    # gamma-on settings (lambda_gamma / s_e_step / gamma_as_beta_prior) -- an apples-to-apples gamma-on
+    # comparison across gauge charts, phi vs omega_direct per gauge_group.
     # One phi baseline plus one omega_direct cell per gauge_group in vfe3.config._OMEGA_GROUPS, reusing
     # the group_n/irrep_spec/phi_precond_mode payloads from the gauge_group arm above (~383-398):
     #   - glk/so_k/sp are single-block groups -> use_head_mixer=False (same as the gauge_group arm).
@@ -419,38 +420,30 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "gauge_parameterization": {
         "description": "gauge frame chart: phi (exp coords) vs omega_direct (stored GL(K) element), per gauge_group",
         "configs": [
-            {"label": "phi",                         "gauge_parameterization": "phi",
-             "lambda_gamma": 0.0, "s_e_step": False},
+            {"label": "phi",                         "gauge_parameterization": "phi"},
 
             {"label": "omega_direct_glk",             "gauge_parameterization": "omega_direct",
-             "gauge_group": "glk",                    "use_head_mixer": False,
-             "lambda_gamma": 0.0, "s_e_step": False},
+             "gauge_group": "glk",                    "use_head_mixer": False},
 
             {"label": "omega_direct_block_glk",       "gauge_parameterization": "omega_direct",
-             "gauge_group": "block_glk",               "n_heads": 2,
-             "lambda_gamma": 0.0, "s_e_step": False},
+             "gauge_group": "block_glk",               "n_heads": 2},
 
             {"label": "omega_direct_tied_block_glk",  "gauge_parameterization": "omega_direct",
-             "gauge_group": "tied_block_glk",          "n_heads": 2, "phi_precond_mode": "killing",
-             "lambda_gamma": 0.0, "s_e_step": False},
+             "gauge_group": "tied_block_glk",          "n_heads": 2, "phi_precond_mode": "killing"},
 
             {"label": "omega_direct_so_k",            "gauge_parameterization": "omega_direct",
-             "gauge_group": "so_k",                    "use_head_mixer": False,
-             "lambda_gamma": 0.0, "s_e_step": False},
+             "gauge_group": "so_k",                    "use_head_mixer": False},
 
             {"label": "omega_direct_sp",               "gauge_parameterization": "omega_direct",
-             "gauge_group": "sp",                       "use_head_mixer": False,
-             "lambda_gamma": 0.0, "s_e_step": False},
+             "gauge_group": "sp",                       "use_head_mixer": False},
 
             {"label": "omega_direct_so3_spin2x4",     "gauge_parameterization": "omega_direct",
              "gauge_group": "so_n", "group_n": 3, "irrep_spec": [("l2", 4)],
-             "phi_precond_mode": "killing", "n_heads": 4,
-             "lambda_gamma": 0.0, "s_e_step": False},
+             "phi_precond_mode": "killing", "n_heads": 4},
 
             {"label": "omega_direct_sp4_sym2x2",      "gauge_parameterization": "omega_direct",
              "gauge_group": "sp_n", "group_n": 4, "irrep_spec": [("sym2", 2)],
-             "phi_precond_mode": "killing",
-             "lambda_gamma": 0.0, "s_e_step": False},
+             "phi_precond_mode": "killing"},
         ],
         "requires": {"transport_mode": "flat"},
     },
