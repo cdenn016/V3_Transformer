@@ -19,11 +19,13 @@ so the frame now reaches **both** orientation components while `exp(φ)` keeps c
 
 **Efficacy caveat (same as `omega_direct`).** Under a diagonal covariance family `R=diag(−1,1,…)` leaves the (squared) diagonal congruence exactly invariant, so the reflection bites only through the mean (sign of component 0), not the covariance. Real covariance information only with a full/off-diagonal family or a low temperature. Warned at construction (mirrors `omega_direct`).
 
-## 2. Scope (MVP) and deferrals
+## 2. Scope (full) and deferrals
 
-**MVP = the belief channel.** The reflection folds into the belief transport (`build_belief_transport`, phi branch), so it flows to the belief E-step and the decode automatically. Learnable via `phi_reflection="metropolis"`; default `"off"` is byte-identical.
+**Full channel coverage** (user-selected). The reflection folds into the belief transport (`build_belief_transport`, phi branch) — covering the belief E-step and the decode — AND is threaded through the gamma / model-coupling (s) channel (the forward gamma loss `_gamma_coupling_term`, the `gamma_as_beta_prior` fold `_fold_gamma_prior`, and the `s_e_step` E-step `_refine_s`), exactly as Phase 3 threaded `omega` for `omega_direct`. So `phi_reflection` is usable together with an active gamma channel; there is NO gamma gate. Learnable via `phi_reflection="metropolis"`; default `"off"` is byte-identical.
 
-**Deferred (phase 2, mirroring `omega_direct`'s phasing):** threading the reflection through the gamma / model-coupling (s) channel. So for the MVP the gamma channel is **gated off** when `phi_reflection` is active (reject `phi_reflection!="off"` together with `lambda_gamma>0` / `s_e_step` / `gamma_as_beta_prior`), exactly as `omega_direct` Phase 1 did — a later phase threads the reflection through the s-channel and lifts the gate. Also deferred: RoPE / regime_ii interactions (the MVP targets `transport_mode="flat"`, `pos_rotation="none"`), and the STE variant (`# TODO(STE)`).
+The mechanism is uniform: everywhere the phi-path transport is built from `belief.phi`, the per-position `belief.reflection` is passed alongside so the §3 fold applies. Because the fold lives in `build_belief_transport`, each channel's ΔF and forward value automatically see the reflected transport.
+
+**Deferred:** RoPE / regime_ii interactions (target `transport_mode="flat"`, `pos_rotation="none"`; reflection + RoPE composition is a later concern), and the STE variant (`# TODO(STE)`).
 
 ## 3. The reflection fold (group-agnostic)
 
@@ -39,7 +41,7 @@ Then `Ω = exp_phi @ exp_neg_phi = Rᵢ exp(φᵢ)exp(−φⱼ)Rⱼ`, and every 
 - **`prior_bank.reflection_sign`** — a registered buffer of shape `(V,)`, values in `{+1,−1}` (NOT an `nn.Parameter`; it is discrete state updated by the Metropolis move, not gradient), created only when `gauge_parameterization=="phi"` and `phi_reflection!="off"` (idiom of the gated `omega_embed`). Default all `+1` (identity, `det>0`). `"init_seed"` seeds every other token to `−1`.
 - **`BeliefState.reflection`** — a new trailing `Optional[torch.Tensor] = None` field (per-position `(…,N)` sign, `+1`/`−1`), populated at `encode` from `reflection_sign[token_ids]` when the buffer exists; `None` on the pure path. Mirrors the `omega` field addition.
 - **`build_belief_transport(phi, group, *, reflection=None, …)`** — new keyword; when `reflection` is not None and `gauge_parameterization=="phi"`, apply the §3 fold to the built factors. `None` (default) is byte-identical.
-- Belief-channel call sites pass `reflection=belief.reflection` alongside `phi` (the belief E-step's `build_belief_transport`; the decode transport). The MVP touches only the belief-channel builds; the gamma/s-channel builds are gated off (§2).
+- ALL phi-path transport call sites pass `reflection=belief.reflection` (guarded `... if belief.reflection is not None else None`) alongside `phi`: the belief E-step, the decode transport, AND the gamma/s-channel — `_gamma_coupling_term`/`_gamma_energy` (forward gamma loss + diagnostics), `_fold_gamma_prior` (the `gamma_as_beta_prior` fold), and `_refine_s` (the `s_e_step` E-step). This mirrors the Phase 3 `omega` threading map one-for-one (same call sites), with the same detach/no_grad/attached gradient discipline per channel (gamma loss detaches the sign is moot — the sign is a non-differentiable buffer, so no gradient flows through `reflection` on any path; it is updated only by the Metropolis move).
 
 ## 5. The Metropolis move (shared with `omega_direct`)
 
@@ -54,14 +56,15 @@ Factor the common sweep (unique-token loop, carried `F_cur`, seeded accept) so b
 
 - `phi_reflection: "off" | "init_seed" | "metropolis"` (mirrors `omega_reflection`; default `"off"`). Validation, inside a `gauge_parameterization=="phi"` guard:
   - requires `gauge_group in _REFLECT_OK = ("glk","block_glk","so_k")` (reject `sp`/`sp_n` vacuous `det≡+1`; `so_n`/`tied_block_glk` deferred reflection seed — same reasons and messages as `omega_reflection`).
-  - **MVP gamma gate:** reject `phi_reflection!="off"` together with `lambda_gamma>0` / `s_e_step` / `gamma_as_beta_prior` (deferred, §2).
+  - (no gamma gate — the reflection is threaded through the gamma/s-channel, §2/§4.)
   - a `UserWarning` for a diagonal covariance family (§1 efficacy caveat).
   - reject `phi_reflection="ste"` (`NotImplementedError`, `# TODO(STE)`), mirroring `omega_reflection`.
 - The two `omega_metropolis_*` knobs are reused (they name the move, not the storage). Default `"off"` ⇒ no buffer, no move, no RNG, `state_dict` byte-identical.
 
 ## 7. Testing (TDD, CPU-bound, K<6)
 
-1. `phi_reflection` config: constructs for `glk`/`block_glk`/`so_k`; rejects `sp`/`sp_n`/`so_n`/`tied`; rejects the gamma combo (MVP gate); rejects `"ste"`; requires the phi path.
+1. `phi_reflection` config: constructs for `glk`/`block_glk`/`so_k` (including with an active gamma channel); rejects `sp`/`sp_n`/`so_n`/`tied`; rejects `"ste"`; requires the phi path.
+7. Gamma/s-channel frame-fidelity: with `phi_reflection` on and a non-`+1` sign, the gamma-coupling energy and the `_refine_s` refined `s` differ from the all-`+1` frame (the reflection is USED in each channel), mirroring the Phase 3 `omega` frame-fidelity tests; and a gauge-invariance check with the reflection co-transformed stays invariant.
 2. Reflection fold correctness: for a fixed φ and a `−1` sign on token i, the built `Ωᵢⱼ` equals `R @ exp(φᵢ)exp(−φⱼ) @ R` computed independently (fp5), and `det Ωᵢⱼ < 0` for `sᵢ≠sⱼ`.
 3. Frame reaches `det<0`: with `phi_reflection="init_seed"`, `det(gᵢ) < 0` for seeded tokens and the decode differs from the all-`+1` frame (the reflection is USED).
 4. Metropolis on the sign: exact-ΔF anchor (masked-flip ΔF == independent `reflection_sign`-flip recompute); off-is-noop (no buffer, no RNG, `state_dict` identical); downhill accepted flips the sign; uphill gated; seeded-reproducible.
@@ -73,8 +76,8 @@ Factor the common sweep (unique-token loop, carried `F_cur`, seeded accept) so b
 1. `vfe3/config.py` — `phi_reflection` field + validation (§6).
 2. `vfe3/belief.py` — the trailing `reflection` field on `BeliefState`.
 3. `vfe3/model/prior_bank.py` — the gated `reflection_sign` buffer + `encode` populating `belief.reflection`.
-4. `vfe3/geometry/transport.py` / `vfe3/inference/e_step.py` — `reflection` kwarg on `build_belief_transport` (phi branch) applying the §3 fold; belief-channel call sites pass `belief.reflection`.
-5. `vfe3/model/model.py` — generalize the Metropolis move to the phi-reflection mode (shared sweep, mode-specific flip + trial frame); the `# TODO(STE)` marker.
+4. `vfe3/geometry/transport.py` / `vfe3/inference/e_step.py` — `reflection` kwarg on `build_belief_transport` (phi branch) applying the §3 fold; ALL phi-path transport call sites (belief E-step, decode) pass `belief.reflection`.
+5. `vfe3/model/model.py` — thread `belief.reflection` through the gamma/s-channel call sites (the Phase 3 `omega` map: `_gamma_coupling_term`/`_gamma_energy`, `_fold_gamma_prior`, `_refine_s` + their callers/diagnostics); generalize the Metropolis move to the phi-reflection mode (shared sweep, mode-specific flip + trial frame); the `# TODO(STE)` marker.
 6. `vfe3/train.py` — the seam already fires on `"metropolis"`; extend its gate to include `phi_reflection`.
 7. `tests/test_phi_reflection.py` — §7.
 
