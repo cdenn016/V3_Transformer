@@ -440,8 +440,9 @@ def test_build_belief_transport_omega_direct_branch():
     ref = build_transport_from_element(U, grp)["Omega"]
     assert torch.allclose(built["Omega"], ref, atol=1e-6)
     # default axis unchanged: phi path returns its usual object
-    phi_out = build_belief_transport(phi, grp)                # gauge_parameterization defaults to 'phi'
-    assert isinstance(phi_out, dict) or hasattr(phi_out, "exp_phi") or phi_out.shape[-1] == 3
+    phi_out = build_belief_transport(phi, grp)                # default 'phi' path, phi=0 -> Omega = I
+    eye = torch.eye(3).expand(1, 3, 3, 3, 3)
+    assert torch.allclose(phi_out, eye, atol=1e-6)            # glk single-block returns a dense Omega tensor
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -832,10 +833,8 @@ git commit -m "feat(omega_direct): group-manifold natural-gradient optimizer (li
 def test_omega_direct_full_model_gauge_invariance():
     """A global gauge transform of the tied prior tables leaves omega_direct decode logits invariant
     (fp64), and the linear-decode arm has bite (fp32) -- the same t8 contract as the phi path."""
-    def cfg(**over):
-        return _cfg(gauge_group="so_k", gauge_parameterization="phi", **over)   # so_k for orthogonal g
-    # NOTE: omega_direct is glk/block_glk-scoped; equivariance of the cocycle U_i U_j^{-1} is proven
-    # in Task 4/8. Here we pin it on glk with an orthogonal seed so diagonal sigma stays representable.
+    # omega_direct is glk-scoped here; family=gaussian_full + decode_mode=full represent the general
+    # g in GL(4), and Sigma=I makes the congruence g Sigma g^T representable. Mirrors t8 (test_gauge_groups.py:188).
     def delta(dbl, **over):
         torch.manual_seed(0); m = VFEModel(_cfg(gauge_parameterization="omega_direct", **over))
         with torch.no_grad():
@@ -931,8 +930,9 @@ git commit -m "feat(omega_direct): element-frame KV-cache rebuild + cache_suppor
 ### Task 11: Ablation surface + stale entry-point comments
 
 **Files:**
-- Modify: `ablation.py:1031-1045` (remove from `NON_SWEPT_FIELDS`, fix comment), `:375-399` region (add sweep arm), `:139`; `train_vfe3.py:128`; `scaling.py:148`
+- Modify: `ablation.py:1031-1045` (remove from `NON_SWEPT_FIELDS`, fix comment), `:375-399` region (add sweep arm), `:139`
 - Test: `tests/test_omega_direct.py` (a light config-build check)
+- NOTE: `train_vfe3.py:128` and `scaling.py:148` carry the same stale comment but have the user's uncommitted WIP; per CLAUDE.md do NOT touch/commit WIP files — their comment refresh is deferred to a later, WIP-clear session.
 
 **Interfaces:** makes `gauge_parameterization` a sweepable ablation axis.
 
@@ -952,11 +952,13 @@ git commit -m "feat(omega_direct): element-frame KV-cache rebuild + cache_suppor
     },
 ```
 
-- [ ] **Step 3: Refresh the three stale entry-point comments** — `ablation.py:139`, `train_vfe3.py:128`, `scaling.py:148` currently read `# "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)`. Replace with:
+- [ ] **Step 3: Refresh the stale entry-point comment** — `ablation.py:139` currently reads `# "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)`. Replace with:
 
 ```python
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (stored GL(K) element; glk/block_glk, flat)
 ```
+
+(Do NOT edit `train_vfe3.py:128` / `scaling.py:148` — they carry uncommitted WIP; deferred.)
 
 - [ ] **Step 4: Light check** (the sweep config builds)
 
@@ -977,8 +979,8 @@ Expected: `tests/test_omega_direct.py` fully green; no regressions in the existi
 Append the Phase-1 summary to `docs/2026-07-07-edits.md` (create if absent, one doc per day), then:
 
 ```bash
-git add ablation.py train_vfe3.py scaling.py tests/test_omega_direct.py docs/2026-07-07-edits.md
-git commit -m "feat(omega_direct): sweepable ablation axis + refresh stale entry-point comments"
+git add ablation.py tests/test_omega_direct.py docs/2026-07-07-edits.md
+git commit -m "feat(omega_direct): sweepable ablation axis + refresh stale entry-point comment"
 ```
 
 ---
