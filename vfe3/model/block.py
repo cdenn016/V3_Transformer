@@ -47,6 +47,7 @@ def vfe_block(
     capture:         Optional[dict]            = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
     grad_record:     Optional[dict]            = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: caller-built flat transport (None -> e_step builds its own)
+    gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
@@ -102,6 +103,7 @@ def vfe_block(
         e_steps_backprop_last=cfg.e_steps_backprop_last,
         e_step_halt_tol=cfg.e_step_halt_tol,
         prebuilt_transport=prebuilt_transport,
+        gauge_parameterization=gauge_parameterization,
     )
     if capture is not None:
         # The CONVERGED variational belief q* -- what the E-step's F was minimized over,

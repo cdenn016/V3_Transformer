@@ -2,12 +2,23 @@ import pytest
 import torch
 
 from vfe3.belief import BeliefState
+from vfe3.config import VFE3Config
 from vfe3.geometry.generators import reflection_element
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.transport import (build_transport_from_element, compute_transport_operators,
                                       transport_mean, FactoredTransport)
 from vfe3.inference.e_step import build_belief_transport, e_step, e_step_iteration, free_energy_value
+from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import PriorBank
+
+
+def _cfg(**over):
+    base = dict(vocab_size=6, embed_dim=4, n_heads=1, max_seq_len=4, n_layers=1, n_e_steps=2,
+                gauge_group="glk", family="gaussian_full", transport_mode="flat",
+                pos_rotation="none", use_head_mixer=False, use_prior_bank=True, decode_mode="full",
+                e_phi_lr=0.0)
+    base.update(over)
+    return VFE3Config(**base)
 
 
 def test_beliefstate_omega_field_optional_and_addressable():
@@ -157,3 +168,29 @@ def test_prior_bank_omega_reflection_seeds_det_negative():
                    irrep_dims=[4], omega_reflection="init_seed")
     dets = torch.det(pb.omega_embed)
     assert (dets < 0).any()                                  # some tokens seeded into det<0
+
+
+def test_full_model_forward_omega_direct_finite_and_matches_identity_gauge():
+    tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
+    torch.manual_seed(0); m_od = VFEModel(_cfg(gauge_parameterization="omega_direct"))
+    with torch.no_grad():
+        logits_od = m_od(tok)[0]
+    assert torch.isfinite(logits_od).all()
+    # identity-init omega_direct == phi path with frames zeroed (both give Omega = I)
+    torch.manual_seed(0); m_phi = VFEModel(_cfg(gauge_parameterization="phi"))
+    with torch.no_grad():
+        m_phi.prior_bank.phi_embed.zero_()
+        if hasattr(m_phi, "pos_phi_free"):
+            m_phi.pos_phi_free.zero_()
+        logits_phi = m_phi(tok)[0]
+    assert torch.allclose(logits_od, logits_phi, atol=1e-5)
+
+
+def test_omega_direct_reflection_changes_logits():
+    tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
+    torch.manual_seed(0); m0 = VFEModel(_cfg(gauge_parameterization="omega_direct"))
+    torch.manual_seed(0); m1 = VFEModel(_cfg(gauge_parameterization="omega_direct",
+                                             omega_reflection="init_seed"))
+    with torch.no_grad():
+        d = (m0(tok)[0] - m1(tok)[0]).abs().max()
+    assert d > 1e-4                                          # the stored det<0 frame actually feeds the forward

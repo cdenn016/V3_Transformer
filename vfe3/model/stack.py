@@ -48,6 +48,7 @@ def vfe_stack(
     capture:         Optional[dict]            = None,   # out-param: LAST block's converged (pre-transform) belief under 'converged'
     grad_record:     Optional[dict]            = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: one flat transport shared across blocks (valid: e_phi_lr==0 + flat, phi loop-invariant)
+    gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
     kappa_beta_override: 'Optional[float | torch.Tensor]' = None,   # learnable_kappa_beta: live exp(log_kappa_beta) (t5-exception family); None -> cfg.kappa_beta
 ) -> BeliefState:
     r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior.
@@ -92,7 +93,8 @@ def vfe_stack(
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,
                            rope_on_value=rope_on_value, tau=tau_b,
                            capture=capture, grad_record=grad_record,   # each block overwrites; last wins
-                           prebuilt_transport=prebuilt_transport)      # phi is loop-invariant when e_phi_lr==0
+                           prebuilt_transport=prebuilt_transport,      # phi is loop-invariant when e_phi_lr==0
+                           gauge_parameterization=gauge_parameterization)
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
     return belief

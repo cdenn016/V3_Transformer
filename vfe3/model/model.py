@@ -774,6 +774,7 @@ class VFEModel(nn.Module):
                 shared_omega = build_belief_transport(
                     beliefs.phi, self.group,
                     transport_mode="flat",
+                    gauge_parameterization=self.cfg.gauge_parameterization, omega=beliefs.omega,
                     clamp_monitor=self.cfg.transport_clamp_monitor,
                     # Tier-1 transport perf toggles: the shared build must carry the same island
                     # keying / per-head mean flag the per-e_step hoists would have used.
@@ -817,6 +818,7 @@ class VFEModel(nn.Module):
                             rope_on_value=self.cfg.rope_on_value,
                             capture=capture, grad_record=grad_rec,
                             prebuilt_transport=shared_omega,
+                            gauge_parameterization=self.cfg.gauge_parameterization,
                             kappa_beta_override=self.effective_kappa_beta(token_ids.device))
         if estep_grad_out is not None:                           # one host sync, only when requested
             for _gk in ("mu", "sigma", "phi"):
@@ -1184,6 +1186,7 @@ class VFEModel(nn.Module):
         phi:       torch.Tensor,             # (B, N, n_gen) gauge frame (TIED flat transport)
 
         *,
+        omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
         s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
     ) -> 'tuple[torch.Tensor, float | torch.Tensor, Optional[torch.Tensor]]':
         r"""Shared model-coupling setup: the s-channel pairwise energy E^s_ij, the gamma softmax
@@ -1204,7 +1207,13 @@ class VFEModel(nn.Module):
         pb = self.prior_bank
         s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B, N, K)
         n_pos = token_ids.shape[1]
-        omega = build_belief_transport(phi, self.group, transport_mode="flat")   # Tier-1 transport toggles left at defaults: diagnostics exactness unaffected (values identical to round-off)
+        # omega_direct only when the caller actually supplies the belief frame (omega is not None);
+        # callers with no frame in scope pass omega=None and the s-channel falls back to the flat phi
+        # cocycle (a documented s-channel simplification -- the gamma block is DETACHED and predictively
+        # inert). Under the default 'phi' parameterization omega is always None, so this is byte-identical.
+        gp = cfg.gauge_parameterization if omega is not None else "phi"
+        omega = build_belief_transport(phi, self.group, transport_mode="flat",
+                                       gauge_parameterization=gp, omega=omega)   # Tier-1 transport toggles left at defaults: diagnostics exactness unaffected (values identical to round-off)
         s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
         s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
         e_s = pairwise_energy(
@@ -1296,7 +1305,8 @@ class VFEModel(nn.Module):
             return None
         from vfe3.free_energy import attention_weights
         enc = self.prior_bank.encode(token_ids[:1])
-        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
+        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
+                             omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
         s_belief = self._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
         if s_belief is not None:
             belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
@@ -1315,9 +1325,12 @@ class VFEModel(nn.Module):
             connection_M=getattr(self, "connection_M", None),
             connection_L=getattr(self, "connection_L", None),
             rope=rope, rope_on_cov=self.cfg.rope_full_gauge, rope_on_value=self.cfg.rope_on_value,
+            gauge_parameterization=self.cfg.gauge_parameterization,
             kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
         )
-        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids[:1], out.phi.unsqueeze(0))
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(
+            token_ids[:1], out.phi.unsqueeze(0),
+            omega=out.omega.unsqueeze(0) if out.omega is not None else None)
         gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)[0]   # drop batch
         if gamma.dim() == 2:                                        # single-block group -> add an H=1 axis
             gamma = gamma.unsqueeze(0)
@@ -1619,7 +1632,8 @@ class VFEModel(nn.Module):
 
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
-        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
+        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
+                             omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
         s_belief = self._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
         if s_belief is not None:
             belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
@@ -1642,6 +1656,7 @@ class VFEModel(nn.Module):
             rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
             rope_on_value=cfg.rope_on_value,
             capture=cap,
+            gauge_parameterization=cfg.gauge_parameterization,
             kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
         )
 
@@ -1666,6 +1681,8 @@ class VFEModel(nn.Module):
             link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             clamp_monitor=cfg.transport_clamp_monitor,
             cocycle_relaxation=cfg.cocycle_relaxation,
+            gauge_parameterization=(cfg.gauge_parameterization if out.omega is not None else "phi"),
+            omega=out.omega,                                          # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
         )
         if rope is not None:
             rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
@@ -1891,7 +1908,8 @@ class VFEModel(nn.Module):
 
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
-        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
+        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
+                             omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
         if cfg.s_e_step:
             # Live model channel (audit 2026-06-09 IE1): refine s and anchor the replayed belief
             # (q0 AND the handoff prior below) to it, exactly as forward/diagnostics do, so the
@@ -1922,6 +1940,7 @@ class VFEModel(nn.Module):
                 cg_coupling=self.cg_coupling,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
                 rope_on_value=cfg.rope_on_value,
+                gauge_parameterization=cfg.gauge_parameterization,
                 # query_adaptive_tau replay fidelity: the ENTERING belief's per-query tau, exactly as
                 # vfe_stack passes the forward E-step; OFF path returns _base_tau (value-identical to
                 # the tau vfe_block would compute itself).
@@ -1940,6 +1959,8 @@ class VFEModel(nn.Module):
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 clamp_monitor=cfg.transport_clamp_monitor,
                 cocycle_relaxation=cfg.cocycle_relaxation,
+                gauge_parameterization=(cfg.gauge_parameterization if belief.omega is not None else "phi"),
+                omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
             )                                                        # (N, N, K, K)
             if rope is not None:
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
@@ -2003,7 +2024,8 @@ class VFEModel(nn.Module):
 
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
-        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]))
+        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
+                             omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
         if cfg.s_e_step:                                              # anchor q0 + handoff to refined s (as forward)
             s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
             belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
@@ -2033,6 +2055,7 @@ class VFEModel(nn.Module):
                 connection_M=getattr(self, "connection_M", None),
                 connection_L=getattr(self, "connection_L", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                gauge_parameterization=cfg.gauge_parameterization,
                 # query_adaptive_tau replay fidelity: the ENTERING belief's per-query tau, exactly as
                 # vfe_stack passes the forward E-step; OFF path returns _tau (value-identical).
                 tau=self._beta_tau(belief.sigma, belief.mu, _tau),
@@ -2049,6 +2072,8 @@ class VFEModel(nn.Module):
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 clamp_monitor=cfg.transport_clamp_monitor,
                 cocycle_relaxation=cfg.cocycle_relaxation,
+                gauge_parameterization=(cfg.gauge_parameterization if belief.omega is not None else "phi"),
+                omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
             )
             if rope is not None:
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
