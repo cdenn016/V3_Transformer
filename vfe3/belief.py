@@ -28,3 +28,4 @@ class BeliefState(NamedTuple):
 
     s:     Optional[torch.Tensor] = None      # optional future hyper-prior channel s_i (None by default)
     r:     Optional[torch.Tensor] = None      # optional future hyper-prior channel r_i (None by default)
+    omega: Optional[torch.Tensor] = None      # optional GL(K) frame U_i (..., N, K, K); set only on gauge_parameterization='omega_direct'
