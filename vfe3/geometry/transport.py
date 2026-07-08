@@ -983,6 +983,33 @@ def compute_transport_operators(
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
+def build_transport_from_element(
+    omega:  torch.Tensor,             # (B, N, K, K) per-token GL(K) element U_i (block-diagonal for block_glk)
+    group:  GaugeGroup,
+) -> 'FactoredTransport | TransportDict':
+    r"""Exp-free flat cocycle from a stored group element: Omega_ij = U_i U_j^{-1}.
+
+    The 'omega_direct' parameterization stores the frame as the element U_i itself rather than the
+    Lie-algebra coordinate phi_i, so the transport is assembled WITHOUT any matrix exponential --
+    only the inverse U_j^{-1}. The FactoredTransport / builder-dict slots exp_phi / exp_neg_phi are
+    filled with U_i and U_j^{-1} directly; every downstream consumer (transport_mean,
+    transport_covariance, RoPE) reads only those two slots, so nothing else changes.
+
+    U_j^{-1} is computed in a float64 island (the congruence Omega Sigma Omega^T squares cond(U); the
+    inverse degrades as det U -> 0, which the free-energy barrier keeps a trained U away from). For
+    the equal-block groups (block_glk) a FactoredTransport is returned so the per-head fast paths run;
+    for a single block (glk) the dense {'exp_phi','exp_neg_phi','Omega'} dict is returned (matching
+    compute_transport_operators' return shape).
+    """
+    with torch.amp.autocast(omega.device.type, enabled=False):    # inverse never in bf16/fp16
+        u_inv = torch.linalg.inv(omega.double()).to(omega.dtype)  # (B, N, K, K)
+    block_dims = group.irrep_dims
+    if len(block_dims) > 1 and len(set(block_dims)) == 1:
+        return FactoredTransport(exp_phi=omega, exp_neg_phi=u_inv, irrep_dims=list(block_dims))
+    Omega = torch.einsum("...ikl,...jlm->...ijkm", omega, u_inv)   # (B, N, N, K, K)
+    return {"exp_phi": omega, "exp_neg_phi": u_inv, "Omega": Omega}
+
+
 def build_factored_transport(
     phi:        torch.Tensor,             # (..., N, n_gen) gauge frames (optional leading batch axis)
     group:      GaugeGroup,               # block-diagonal with equal blocks (len(irrep_dims) > 1)
