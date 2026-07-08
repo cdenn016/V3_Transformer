@@ -111,10 +111,19 @@ def _appended_belief_step(
     phi_k                = beliefs.phi                                                   # (B', M, n_gen)
     mu_p,  sig_p         = mu_q, sig_q                                                   # layer-0 prior = encode (q0==p0)
 
-    # Transported keys for the appended query rows: flat Omega_ij = exp(phi_i^q) exp(-phi_j^k).
-    exp_q     = compute_transport_operators(phi_q, group)["exp_phi"]                     # (B', L, K, K)
-    exp_neg_k = compute_transport_operators(phi_k, group)["exp_neg_phi"]                 # (B', M, K, K)
-    omega     = torch.einsum("bikl,bjlm->bijkm", exp_q, exp_neg_k)                       # (B', L, M, K, K)
+    # Transported keys for the appended query rows: flat Omega_ij = exp(phi_i^q) exp(-phi_j^k) (phi
+    # path) or U_i U_j^{-1} from the stored element (omega_direct path; Task 10). Both branches build
+    # the SAME mixed-frame (query frame i x frozen key frame j) transport; only the frame source
+    # differs. The default (phi) branch is untouched.
+    if cfg.gauge_parameterization == "omega_direct":
+        U_q = beliefs.omega[:, N:]                                                       # (B', L, K, K) query frames
+        with torch.amp.autocast(U_q.device.type, enabled=False):
+            U_k_inv = torch.linalg.inv(beliefs.omega.double()).to(U_q.dtype)             # (B', M, K, K)
+        omega = torch.einsum("bikl,bjlm->bijkm", U_q, U_k_inv)                           # (B', L, M, K, K)
+    else:
+        exp_q     = compute_transport_operators(phi_q, group)["exp_phi"]                 # (B', L, K, K)
+        exp_neg_k = compute_transport_operators(phi_k, group)["exp_neg_phi"]             # (B', M, K, K)
+        omega     = torch.einsum("bikl,bjlm->bijkm", exp_q, exp_neg_k)                   # (B', L, M, K, K)
     mu_t      = transport_mean(omega, mu_k)                                              # (B', L, M, K)
     sig_t     = transport_covariance(omega, sig_k)                                       # (B', L, M, K)
 

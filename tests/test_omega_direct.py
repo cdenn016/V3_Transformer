@@ -8,6 +8,7 @@ from vfe3.geometry.groups import get_group
 from vfe3.geometry.lie_ops import retract_omega
 from vfe3.geometry.transport import (build_transport_from_element, compute_transport_operators,
                                       transport_mean, FactoredTransport)
+from vfe3.inference.belief_cache import cache_supported, rollout_predictive_cached
 from vfe3.inference.e_step import build_belief_transport, e_step, e_step_iteration, free_energy_value
 from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import PriorBank
@@ -292,3 +293,93 @@ def test_omega_direct_transport_covariance_law():
     # expected: Omega'_ij = g_i Omega_ij g_j^{-1}
     exp = torch.einsum("ikl,bijlm,jmn->bijkn", g, om, ginv)
     assert torch.allclose(omg, exp, atol=1e-9)
+
+
+def test_cache_supported_admits_omega_direct_flat():
+    # cache_supported (belief_cache.py:56-87) keys only on the closed-form-filtering / flat-transport
+    # / single-block regime -- it does not branch on gauge_parameterization at all, so a config that
+    # is otherwise cache-eligible is admitted under omega_direct exactly as under phi. _cfg's base
+    # (family='gaussian_full', n_e_steps=2) is outside the cache-eligible regime for reasons unrelated
+    # to gauge_parameterization, so both branches override back to the cache-eligible values here.
+    assert cache_supported(_cfg(gauge_parameterization="omega_direct", family="gaussian_diagonal",
+                                decode_mode="diagonal", n_e_steps=1)) is True
+    assert cache_supported(_cfg(gauge_parameterization="phi", family="gaussian_diagonal",
+                                decode_mode="diagonal", n_e_steps=1)) is True
+
+
+def test_omega_direct_cache_rebuild_matches_full_rollout():
+    # Task 10: the KV-cache rebuild branch (belief_cache.py::_appended_belief_step) must, under
+    # omega_direct, transport with the STORED element (U_q, inv(U_k)) rather than exp(phi_q)/
+    # exp(-phi_k) -- phi_embed is still a small nonzero random table under omega_direct (unused by
+    # the live forward/e_step path but NOT automatically zero), so the pre-fix phi-based rebuild is
+    # silently wrong once the stored omega frame is perturbed away from identity.
+    # policy._rollout_predictive short-circuits to rollout_predictive_cached once cache_supported is
+    # True, so it cannot serve as an independent "full recompute" oracle here; instead this builds the
+    # full recompute directly via model.rollout_beliefs, exactly as _rollout_predictive's own
+    # non-cached branch does.
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(gauge_parameterization="omega_direct", family="gaussian_diagonal",
+                      decode_mode="diagonal", n_e_steps=1))
+    assert cache_supported(m.cfg)
+    with torch.no_grad():
+        g = torch.Generator().manual_seed(3)
+        m.prior_bank.omega_embed.copy_(
+            torch.eye(4).expand(6, 4, 4) + 0.2 * torch.randn(6, 4, 4, generator=g))
+
+    B, N, Kp, L, V = 2, 2, 2, 1, m.cfg.vocab_size
+    torch.manual_seed(1)
+    context    = torch.randint(0, V, (B, N))
+    candidates = torch.randint(0, V, (B, Kp, L))
+
+    with torch.no_grad():
+        base_logits = m.forward(context)[:, -1, :]
+
+        ctx_exp = context.unsqueeze(1).expand(B, Kp, N)
+        ext = torch.cat([ctx_exp, candidates], dim=2).reshape(B * Kp, N + L)
+        _belief, logits = m.rollout_beliefs(ext, return_logits=True)
+        q_full = torch.log_softmax(logits[:, -1, :], dim=-1).reshape(B, Kp, -1)
+
+        q_cache, lp_cache = rollout_predictive_cached(context, candidates, m, base_logits=base_logits)
+
+    base_logp = torch.log_softmax(base_logits, dim=-1)
+    lp_full = torch.gather(base_logp, 1, candidates[:, :, 0])
+    assert torch.allclose(lp_cache, lp_full, atol=1e-6)
+    # Tight tolerance (no rtol slack): a phi-based rebuild that ignores the perturbed omega frame
+    # measurably diverges here (~7e-5 max abs diff observed pre-fix), which the loose 1e-4 rtol used
+    # by test_belief_cache.py's phi-path golden test would mask against these O(1) log-prob magnitudes.
+    assert torch.allclose(q_cache, q_full, atol=2e-5), \
+        f"max |dq|={float((q_cache - q_full).abs().max()):.2e}"
+
+
+def test_appended_belief_step_omega_direct_uses_stored_frame():
+    # Direct unit-level regression for the rebuild branch itself (Step 3): with the SAME (small,
+    # near-zero) phi field but a DIFFERENT stored omega frame, the omega_direct rebuild must produce
+    # a DIFFERENT appended belief. A phi-based rebuild is blind to omega and would return the exact
+    # SAME output regardless of U -- a crisp, deterministic pre-fix/post-fix signal that sidesteps the
+    # near-cancellation numerical noise a realistic end-to-end rollout can hide behind (see the tight-
+    # tolerance rationale above).
+    from types import SimpleNamespace
+
+    from vfe3.inference.belief_cache import _appended_belief_step
+
+    K, N, L = 4, 2, 1
+    M = N + L
+    grp = get_group("glk")(K=K)
+    n_gen = grp.generators.shape[0]
+    model_ns = SimpleNamespace(
+        cfg=_cfg(gauge_parameterization="omega_direct", family="gaussian_diagonal", decode_mode="diagonal"),
+        group=grp,
+    )
+    g     = torch.Generator().manual_seed(9)
+    mu    = torch.randn(1, M, K, generator=g)
+    sigma = torch.ones(1, M, K)
+    phi   = 0.01 * torch.randn(1, M, n_gen, generator=g)          # small, mimics phi_embed's default scale
+    U1 = torch.eye(K).expand(1, M, K, K).contiguous()             # identity frames
+    U2 = torch.eye(K) + 0.4 * torch.randn(1, M, K, K, generator=g)  # substantially different frames
+    log_prior_app = torch.zeros(1, L, M)                          # uniform prior over all M keys
+
+    b1 = BeliefState(mu=mu, sigma=sigma, phi=phi, omega=U1)
+    b2 = BeliefState(mu=mu, sigma=sigma, phi=phi, omega=U2)
+    out1 = _appended_belief_step(b1, log_prior_app, model_ns, N, 1.0)
+    out2 = _appended_belief_step(b2, log_prior_app, model_ns, N, 1.0)
+    assert not torch.allclose(out1.mu, out2.mu, atol=1e-6)         # the stored frame must feed the rebuild
