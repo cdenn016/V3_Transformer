@@ -560,6 +560,40 @@ def test_omega_compact_tied_optimizer_step_moves_shared_block():
     assert torch.allclose(om[:2, 2:], torch.zeros(2, 2)) and torch.allclose(om[2:, :2], torch.zeros(2, 2))
 
 
+def test_omega_compact_tied_step_magnitude_equals_full_tied_step():
+    """The compact-tied step must MATCH the full-tied step, not just move. The full tied generators
+    kron(I_H, E_ij) have Frobenius Gram = H*I, so the full-tied natural gradient carries a 1/H the
+    intrinsic gl(d) basis (Gram = I) omits; without the 1/H rescale the compact-tied step is H x too
+    large. Asserts assemble(compact_stepped) == full_stepped, tight tol (the H x bug would fail this)."""
+    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    from vfe3.geometry.generators import generate_glk_multihead_tied
+    from vfe3.geometry.lie_ops import _from_equal_diag_blocks
+    V, H, d, K = 6, 2, 2, 4
+    G_tied = generate_glk_multihead_tied(K, H)               # (4,4,4) tied basis; Frobenius Gram = H*I
+    # sanity: the tied Gram really is H*I (the load-bearing fact behind the 1/H)
+    assert torch.allclose(torch.einsum("aij,bij->ab", G_tied, G_tied),
+                          float(H) * torch.eye(d * d), atol=1e-6)
+    gen = torch.Generator().manual_seed(13)
+    per_slot = torch.randn(V, H, d, d, generator=gen)        # H distinct per-slot block grads
+    E_full = _from_equal_diag_blocks(per_slot, K)            # (V,K,K) block-diagonal dense grad
+    E_cmp  = per_slot.sum(dim=1)                             # (V,d,d) broadcast adjoint = sum over slots
+
+    pb_full = PriorBank(V, K, d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H)  # (V,K,K) I init
+    pb_cmp  = PriorBank(V, K, d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H,
+                        omega_compact_storage=True, gauge_group_is_tied=True)                     # (V,d,d) I init
+    pb_full.omega_embed.grad = E_full.clone()
+    pb_cmp.omega_embed.grad  = E_cmp.clone()
+
+    def _opt(pb):
+        return GaugeNaturalGradAdamW([{"params": [pb.omega_embed], "lr": 0.1, "omega": True,
+                                       "weight_decay": 0.0}], G_tied, [d] * H, gauge_momentum=0.0)
+    _opt(pb_full).step()
+    _opt(pb_cmp).step()
+
+    assembled = pb_cmp._omega_lookup(torch.arange(V).unsqueeze(0))[0]     # (V,K,K) broadcast+assemble
+    assert torch.allclose(assembled, pb_full.omega_embed.data, atol=1e-5)
+
+
 def test_omega_compact_flag_is_noop_for_equal_dim_towers():
     """so_n/sp_n equal-dim irrep towers (e.g. irrep_dims=[3,3]) match the block STRUCTURE but are
     irrep IMAGES of one element, not independent blocks -- omega_compact_storage must be a NO-OP for

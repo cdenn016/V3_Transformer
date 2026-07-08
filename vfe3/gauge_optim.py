@@ -239,6 +239,15 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                         Ea_r = Ea.reshape(-1, d, d)
                         # per-block natural-gradient tangent xi = Gram^{-1} proj_gl(d)(U_h^T E_h)
                         xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua_r, Ea_r), Gd, gram_pinv_=gp)
+                        if tied_compact:
+                            # The full tied generators kron(I_H, E_ij) are nonzero in ALL H blocks, so
+                            # their Frobenius Gram is H*I and the full-tied natural gradient carries a
+                            # 1/H factor. The reduced gl(d) basis has Gram = I (no 1/H), and encode's
+                            # broadcast adjoint already SUMMED the H per-slot grads onto the shared block,
+                            # so WITHOUT this rescale the compact-tied step is H x too large. Divide by
+                            # H = K/d so the compact-tied retraction MATCHES the full-tied step exactly.
+                            # (The untied gl(d)^H generators are Gram = I, already correct -- do NOT scale.)
+                            xi = xi / (K_full // d)
                         Ur = retract_omega(Ua_r, -lr * xi, Gd, mode=mode)
                         U[act] = Ur.reshape(Ua.shape)                  # back to (A,H,d,d) / (A,d,d)
                     else:
