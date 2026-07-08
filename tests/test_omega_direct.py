@@ -465,6 +465,67 @@ def test_omega_reorth_projects_drifted_element_back_to_O_K():
     assert torch.allclose(Q @ Q.transpose(-1, -2), torch.eye(4), atol=1e-5)
 
 
+def test_gauge_optim_omega_reorth_fires_on_cadence_for_single_block_skew(monkeypatch):
+    """Integration test: STEPS the optimizer (not just the _polar_orthogonalize helper) for a
+    single-block skew group (so_k, irrep_dims=[4]) with omega_reorth_every=2, and confirms polar
+    reorth fires exactly on the cadence step, not before -- the ONLY case where reorth is correct
+    (rho(SO(K)) = SO(K), so O(K) equals the structure group up to the reflection component)."""
+    import vfe3.gauge_optim as gauge_optim_mod
+    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    grp = get_group("so_k")(K=4)
+    assert grp.irrep_dims == [4]                              # single block
+    calls = []
+    orig_polar = gauge_optim_mod._polar_orthogonalize
+    def _spy(U):
+        calls.append(1)
+        return orig_polar(U)
+    monkeypatch.setattr(gauge_optim_mod, "_polar_orthogonalize", _spy)
+
+    U = torch.nn.Parameter(torch.eye(4).expand(3, 4, 4).contiguous())
+    opt = GaugeNaturalGradAdamW([{"params": [U], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
+                                grp.generators, grp.irrep_dims, gauge_momentum=0.0,
+                                skew_symmetric=True, omega_reorth_every=2)
+    gen = torch.Generator().manual_seed(3)
+    U.grad = torch.zeros_like(U)
+    U.grad[0] = 0.3 * torch.randn(4, 4, generator=gen)        # drifting grad, step 1
+    opt.step()                                                 # M-step 1: cadence not hit (1 % 2 != 0)
+    assert len(calls) == 0
+    U.grad = torch.zeros_like(U)
+    U.grad[1] = 0.3 * torch.randn(4, 4, generator=gen)        # drifting grad, step 2
+    opt.step()                                                 # M-step 2: cadence hit (2 % 2 == 0)
+    assert len(calls) == 1
+    eye = torch.eye(4).expand(3, 4, 4)
+    assert torch.allclose(U.data @ U.data.transpose(-1, -2), eye, atol=1e-5)   # snapped back onto O(4)
+
+
+def test_gauge_optim_omega_reorth_is_noop_for_irrep_tower():
+    """FIX (whole-branch review): for an irrep TOWER (so_n, len(irrep_dims) > 1) the stored
+    omega_embed is a faithful rho(SO(N)) image -- a proper submanifold of O(K) -- so
+    _polar_orthogonalize's nearest-O(K) projection is NOT guaranteed to stay in that image. The
+    reorth block must gate off (len(irrep_dims) == 1) and be a no-op here, even though
+    skew_symmetric=True (a skew-only gate would have fired and silently relaxed the structure
+    group)."""
+    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    grp = get_group("so_n")(K=6, group_n=3, irrep_spec=[("l1", 2)])   # SO(3) l1 x2 -> dims [3,3]
+    assert grp.irrep_dims == [3, 3]                            # multi-block tower
+    assert grp.skew_symmetric is True
+
+    U = torch.nn.Parameter(torch.eye(6).expand(2, 6, 6).contiguous())
+    opt = GaugeNaturalGradAdamW([{"params": [U], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
+                                grp.generators, grp.irrep_dims, gauge_momentum=0.0,
+                                skew_symmetric=True, omega_reorth_every=1)
+    with torch.no_grad():
+        U.data[0, :3, :3] = 1.2 * torch.eye(3)                # deliberately non-orthogonal, inactive row
+    non_orth_before = U.data[0].clone()
+    U.grad = torch.zeros_like(U)
+    U.grad[1] = 0.1 * torch.randn(6, 6, generator=torch.Generator().manual_seed(2))  # only row 1 active
+    opt.step()                                                 # reorth_every=1: cadence hit every step
+    # row 0 (inactive, deliberately off O(6)) must be left EXACTLY as found -- NOT snapped to the
+    # nearest O(6) matrix -- because len(irrep_dims) > 1 gates the reorth off entirely.
+    assert torch.equal(U.data[0], non_orth_before)
+    assert not torch.allclose(U.data[0] @ U.data[0].transpose(-1, -2), torch.eye(6), atol=1e-3)
+
+
 def test_omega_compact_storage_param_parity_and_assembly():
     pb_full = PriorBank(vocab_size=6, K=4, n_gen=8, gauge_parameterization="omega_direct", irrep_dims=[2, 2])
     pb_cmp  = PriorBank(vocab_size=6, K=4, n_gen=8, gauge_parameterization="omega_direct", irrep_dims=[2, 2],
@@ -614,6 +675,38 @@ def test_omega_compact_flag_is_noop_for_equal_dim_towers():
     assert m_on.prior_bank.omega_embed.shape == (6, 6, 6)    # full (V,K,K), NOT compacted to (6,2,3,3)
     # param count unaffected by the flag (both full (V,K,K))
     assert m_on.prior_bank.omega_embed.numel() == m_off.prior_bank.omega_embed.numel()
+
+
+def test_omega_compact_tied_backward_sums_head_slot_gradients():
+    """End-to-end autograd through _from_equal_diag_blocks/expand: every other compact-storage
+    test sets p.grad manually; none does a real loss.backward() through the assembled belief.omega.
+    Encodes a token batch, forms a scalar loss on the ASSEMBLED (B,N,K,K) belief.omega, and checks
+    omega_embed.grad has the right shape AND -- for the TIED shared (V,d,d) block -- equals the SUM
+    over the H head-slots of the assembled element's own gradient (the broadcast adjoint the
+    _omega_lookup docstring claims). Weights the loss with random per-entry coefficients (not a
+    plain .sum()) so a bug that averaged instead of summed over H, or dropped a head slot, would not
+    be masked by an all-ones gradient."""
+    V, H, d, K = 6, 2, 2, 4
+    pb = PriorBank(V, K, d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H,
+                   omega_compact_storage=True, gauge_group_is_tied=True)
+    assert pb.omega_embed.shape == (V, d, d)                  # (V,d,d): one shared block
+
+    tok = torch.tensor([[0, 1, 2]])                            # (1,3), distinct tokens -> clean per-token check
+    belief = pb.encode(tok)
+    assert belief.omega.shape == (1, 3, K, K)
+
+    w = torch.randn(1, 3, K, K, generator=torch.Generator().manual_seed(0))  # random per-entry weights
+    loss = (belief.omega * w).sum()
+    loss.backward()
+
+    assert pb.omega_embed.grad is not None
+    assert pb.omega_embed.grad.shape == (V, d, d)             # correct shape: broadcast adjoint onto the compact table
+    for n, v in enumerate(tok[0].tolist()):
+        # broadcast adjoint: dL/d(shared block) = SUM over the H diagonal head-slots of w's own block
+        expected = sum(w[0, n, h * d:(h + 1) * d, h * d:(h + 1) * d] for h in range(H))
+        assert torch.allclose(pb.omega_embed.grad[v], expected, atol=1e-6)
+    untouched = [v for v in range(V) if v not in tok[0].tolist()][0]
+    assert torch.allclose(pb.omega_embed.grad[untouched], torch.zeros(d, d))  # no gradient for unseen tokens
 
 
 def test_ablation_omega_direct_arm_builds():

@@ -930,13 +930,13 @@ class VFE3Config:
                     )
             if self.transport_mode != "flat":
                 raise ValueError(
-                    f"gauge_parameterization='omega_direct' requires transport_mode='flat' in Phase 1; "
+                    f"gauge_parameterization='omega_direct' requires transport_mode='flat'; "
                     f"got transport_mode={self.transport_mode!r}."
                 )
             if self.e_phi_lr != 0.0:
                 raise ValueError(
                     f"gauge_parameterization='omega_direct' does not support E-step frame refinement "
-                    f"(e_phi_lr>0) in Phase 1; got e_phi_lr={self.e_phi_lr}. Set e_phi_lr=0.0."
+                    f"(e_phi_lr>0) yet; got e_phi_lr={self.e_phi_lr}. Set e_phi_lr=0.0."
                 )
             # The gamma / model-coupling (s) channel builds its OWN transport from the phi cocycle
             # (_gamma_energy under lambda_gamma>0 / gamma_as_beta_prior; _refine_s under s_e_step) and
@@ -946,8 +946,8 @@ class VFE3Config:
             if self.lambda_gamma > 0.0 or self.s_e_step or self.gamma_as_beta_prior:
                 raise ValueError(
                     "gauge_parameterization='omega_direct' does not yet support the gamma / "
-                    "model-coupling channel (s-channel transport frame-fidelity is deferred to "
-                    "Phase 2); got "
+                    "model-coupling channel (s-channel transport frame-fidelity is not yet "
+                    "implemented); got "
                     f"lambda_gamma={self.lambda_gamma}, s_e_step={self.s_e_step}, "
                     f"gamma_as_beta_prior={self.gamma_as_beta_prior}. Set lambda_gamma=0.0, "
                     "s_e_step=False, and gamma_as_beta_prior=False, or use "

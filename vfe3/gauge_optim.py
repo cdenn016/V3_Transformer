@@ -259,14 +259,21 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                         U[act] = retract_omega(Ua, -lr * xi, Gd, mode=mode)   # (A, K, K) U <- U retr(-lr xi)
                     p.grad = None                                      # consumed: AdamW no-ops on it
                 # Orthogonality-drift control (default OFF: omega_reorth_every=0 -> byte-identical).
-                # Only meaningful for a SKEW (orthogonal, e.g. so_k/so_n) group -- a non-skew element
-                # (glk/sp/...) has no O(K) to drift back onto. Cadence is counted in M-steps (this
-                # branch runs once per optimizer.step() call), not in active-row updates, so drift
-                # accumulated over past steps is corrected on schedule even on a step with no gradient.
-                # The compact block groups (block_glk/tied_block_glk) are non-skew, so this never fires
-                # for a (V,H,d,d)/(V,d,d) table; were it to, _polar_orthogonalize batches over any
-                # leading dims and would re-orthogonalize per block without crashing.
-                if self._skew_symmetric and self._omega_reorth_every > 0:
+                # Polar reorth guarantees O(K) membership, which equals the structure group ONLY for
+                # the single-block defining rep (so_k: rho(SO(K)) = SO(K), so the nearest-O(K) matrix
+                # _polar_orthogonalize returns is exactly the correct projection). For an irrep TOWER
+                # (so_n/sp_n, len(irrep_dims) > 1) the stored omega_embed is a faithful rho(SO(N))
+                # IMAGE -- a proper submanifold of O(K) -- so the nearest-O(K) matrix is NOT guaranteed
+                # to stay in that image; firing reorth there would silently relax the structure group.
+                # Towers are therefore excluded and left a no-op: their bounded drift is left to the
+                # retraction's own second-order stability (a faithful rho-image projection is
+                # deferred). Cadence is counted in M-steps (this branch runs once per optimizer.step()
+                # call), not in active-row updates, so drift accumulated over past steps is corrected
+                # on schedule even on a step with no gradient. The compact block groups
+                # (block_glk/tied_block_glk) are non-skew, so this never fires for a (V,H,d,d)/(V,d,d)
+                # table regardless of the block-count gate below.
+                if (self._skew_symmetric and self._omega_reorth_every > 0
+                        and len(self._irrep_dims) == 1):
                     self._omega_step += 1
                     if self._omega_step % self._omega_reorth_every == 0:
                         for p in group["params"]:
