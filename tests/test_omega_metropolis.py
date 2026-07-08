@@ -41,6 +41,14 @@ def test_metropolis_temperature_and_cadence_validated():
         _omega_cfg(omega_reflection="metropolis", gauge_group="glk", omega_metropolis_every=0)
 
 
+def test_metropolis_rejected_under_phi_parameterization():
+    # Final-review Fix A: metropolis requires an omega_direct frame (belief.omega); under the
+    # default 'phi' parameterization no such frame exists, so metropolis must be rejected at
+    # config construction rather than crashing mid-training on belief.omega.shape[-1] (None).
+    with pytest.raises(ValueError, match="omega_direct"):
+        _omega_cfg(gauge_parameterization="phi", omega_reflection="metropolis", gauge_group="glk")
+
+
 def test_off_and_init_seed_unchanged():
     assert _omega_cfg(gauge_group="glk").omega_reflection == "off"
     assert _omega_cfg(omega_reflection="init_seed", gauge_group="glk").omega_reflection == "init_seed"

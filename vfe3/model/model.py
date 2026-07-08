@@ -988,7 +988,10 @@ class VFEModel(nn.Module):
         r"""Left-multiply the stored frame of ``token_id`` by the reflection R IN PLACE, toggling its
         det-sign. Respects the storage layout (mirrors the init_seed seeding in prior_bank): full
         (V, K, K) -> R @ row; compact (V, H, d, d) -> R's top-left d-block applied to block 0 only
-        (blocks 1..H-1 are identity under reflection_element(K))."""
+        (blocks 1..H-1 are identity under reflection_element(K)).
+
+        This in-place write happens after optimizer.step() and does not touch AdamW's exp_avg/
+        exp_avg_sq buffers for this row -- the moment staleness caveat, see :meth:`metropolis_omega_step`."""
         pb = self.prior_bank
         with torch.no_grad():
             if getattr(pb, "_omega_compact", False):
@@ -1029,6 +1032,11 @@ class VFEModel(nn.Module):
         approximation there rather than exact; ``cfg.lambda_twohop`` (default 0.0) is likewise not
         forwarded. Accept/reject stays well-defined either way since current and trial are always
         scored against the identical prior.
+
+        Caveat (optimizer-moment staleness, final-review Fix C): ``omega_embed`` is mutated in place
+        AFTER ``optimizer.step()`` for the iteration, so AdamW's ``exp_avg``/``exp_avg_sq`` moment
+        buffers for a flipped row are not reflected and stay stale for one step (bounded, self-
+        correcting in the near-inert flip regime; see spec Sec.7).
 
         # TODO(STE): straight-through-gradient variant of the learnable det-sign -- propose per-token
         # sign flips accepted through a straight-through estimator (biased but differentiable) instead

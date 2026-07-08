@@ -384,6 +384,9 @@ class VFE3Config:
     omega_reflection:          str   = "off"      # omega_direct det<0 seeding: 'off' (det>0 only) | 'init_seed' | 'metropolis'
     omega_metropolis_temperature: float = 1.0    # T in the metropolis det-sign accept min(1, exp(-dF/T)); >0
     omega_metropolis_every:       int   = 1       # cadence in optimizer steps for the metropolis det-sign sweep; >=1
+    # (counts train-loop iterations, 1:1 with optimizer steps INCLUDING under grad_accum_steps>1,
+    # which chunks intra-step -- see vfe3/train.py::train_step docstring; diverges only when a step's
+    # update is dropped by the NaN/Inf skip_step guard, see spec Sec.4)
     omega_compact_storage:     bool  = False     # opt-in compact (V,H,d,d)/(V,d,d) block storage (equal-block groups)
     omega_reorth_every:        int   = 0         # SO-group re-orthogonalization cadence in M-steps (0 = off)
 
@@ -913,6 +916,19 @@ class VFE3Config:
                 "'metropolis' for the learnable det-sign or 'init_seed' for a fixed one"
             )
         _require(self.omega_reflection, _VALID_OMEGA_REFLECTION, "omega_reflection")
+        # Final-review Fix A (2026-07-08): 'metropolis' proposes flips of belief.omega, which only
+        # exists on the omega_direct path (the 'phi' path has no stored frame). Without this
+        # TOP-LEVEL guard, VFE3Config(gauge_parameterization='phi', omega_reflection='metropolis')
+        # constructs cleanly (the metropolis validation below lives INSIDE the
+        # `gauge_parameterization == 'omega_direct'` block, so it never fires under phi), and the
+        # crash only surfaces later at `belief.omega.shape[-1]` (belief.omega is None) mid-training.
+        # Fail loud at construction instead, mirroring the global 'ste' rejection above.
+        if self.omega_reflection == "metropolis" and self.gauge_parameterization != "omega_direct":
+            raise ValueError(
+                "omega_reflection='metropolis' requires gauge_parameterization='omega_direct' "
+                "(no belief.omega frame exists on the phi path); got "
+                f"gauge_parameterization={self.gauge_parameterization!r}."
+            )
         # 'omega_direct' stores the per-token frame as a structure-group element U_i (belief.omega),
         # sourced from prior_bank.omega_embed, transport Omega_ij = U_i U_j^{-1}. Phase 2 scope:
         # all seven omega-eligible groups (_OMEGA_GROUPS below), the flat regime, and no E-step
@@ -949,6 +965,22 @@ class VFE3Config:
                     raise ValueError(f"omega_metropolis_temperature must be > 0, got {self.omega_metropolis_temperature}")
                 if self.omega_metropolis_every < 1:
                     raise ValueError(f"omega_metropolis_every must be >= 1, got {self.omega_metropolis_every}")
+                # Final-review Fix B (2026-07-08): efficacy guardrail, not a correctness gate. Under a
+                # diagonal covariance family the canonical reflection R=diag(-1,1,...,1) leaves the
+                # diagonal covariance invariant under the congruence Omega Sigma Omega^T (transport
+                # SQUARES Omega, so the sign flip cancels), so DeltaF ~= 0, acceptance ~= 100%, and the
+                # det-sign random-walks every step without ever selecting a sheet. Non-breaking: warn,
+                # don't reject -- the move is still well-defined under family='gaussian_full' too.
+                if self.family == "gaussian_diagonal":
+                    import warnings
+                    warnings.warn(
+                        "omega_reflection='metropolis' with a diagonal covariance family (family="
+                        "'gaussian_diagonal') does near-no sheet selection: the reflection R=diag(-1,1,...) "
+                        "leaves the diagonal covariance invariant under transport (Omega is squared), so "
+                        "DeltaF is ~0 and the det-sign random-walks. Use a full/off-diagonal covariance "
+                        "family or a low omega_metropolis_temperature for the move to bite.",
+                        UserWarning, stacklevel=2,
+                    )
             if self.transport_mode != "flat":
                 raise ValueError(
                     f"gauge_parameterization='omega_direct' requires transport_mode='flat'; "
