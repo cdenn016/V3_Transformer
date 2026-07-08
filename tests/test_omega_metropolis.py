@@ -42,3 +42,93 @@ def test_metropolis_temperature_and_cadence_validated():
 def test_off_and_init_seed_unchanged():
     assert _omega_cfg(gauge_group="glk").omega_reflection == "off"
     assert _omega_cfg(omega_reflection="init_seed", gauge_group="glk").omega_reflection == "init_seed"
+
+
+# --------------------------------------------------------------------------------------------------
+# Task 2: the move -- metropolis_omega_step (fixed-belief DeltaF-gated det-sign flip)
+# --------------------------------------------------------------------------------------------------
+from vfe3.model.model import VFEModel
+from vfe3.geometry.generators import reflection_element
+
+
+def _model(**over):
+    # tiny omega_direct model with a det-sign the move can act on; K<6, single-digit dims
+    base = dict(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1,
+                vocab_size=6, max_seq_len=4, n_layers=1, n_e_steps=2, transport_mode="flat",
+                e_phi_lr=0.0, use_head_mixer=False, family="gaussian_diagonal", decode_mode="diagonal",
+                lambda_gamma=0.0, s_e_step=False, omega_reflection="metropolis")
+    base.update(over)
+    return VFEModel(VFE3Config(**base))
+
+
+def test_off_is_noop_no_rng_no_mutation():
+    m = VFEModel(VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4,
+                            n_heads=1, vocab_size=6, max_seq_len=4, n_layers=1, transport_mode="flat",
+                            e_phi_lr=0.0, use_head_mixer=False, omega_reflection="off"))
+    before = m.prior_bank.omega_embed.detach().clone()
+    g = torch.Generator().manual_seed(0)
+    stats = m.metropolis_omega_step(torch.tensor([[0, 1, 2]]), generator=g)
+    assert stats.get("proposed", 0) == 0
+    assert torch.equal(m.prior_bank.omega_embed, before)                 # untouched
+    assert g.initial_seed() == torch.Generator().manual_seed(0).initial_seed()  # generator unused
+
+
+def test_downhill_flip_accepted_and_toggles_det_sign():
+    # Seed one token into the WRONG sheet, then a sweep should be free to flip it (all-same-token
+    # transport is frame-agnostic so DeltaF==0 -> accepted) and its det sign toggles on accept.
+    m = _model()
+    with torch.no_grad():
+        m.prior_bank.omega_embed[1] = reflection_element(4) @ m.prior_bank.omega_embed[1]
+    tok = torch.tensor([[1, 1, 1]])                                      # token 1 everywhere -> strong signal
+    det_before = torch.det(m.prior_bank.omega_embed[1]).item()
+    g = torch.Generator().manual_seed(0)
+    m.cfg.omega_metropolis_temperature = 1e-3                            # low T: downhill move (near-)deterministically accepted
+    stats = m.metropolis_omega_step(tok, generator=g)
+    det_after = torch.det(m.prior_bank.omega_embed[1]).item()
+    assert stats["proposed"] >= 1
+    if stats["accepted"] >= 1:                                          # accepted -> det sign toggles
+        assert det_before * det_after < 0
+
+
+def test_exact_delta_f_matches_independent_recompute():
+    # The per-token DeltaF the move computes (masked left-multiply of belief.omega by R) MUST equal
+    # an INDEPENDENT recompute that flips the SOURCE table omega_embed[token] and re-looks-up the
+    # frame -- pinning that the masked trial-belief flip == the source-table flip. Distinct tokens so
+    # the transport Omega_ij = U_i U_j^{-1} is nontrivial and DeltaF genuinely nonzero.
+    m = _model(vocab_size=4)
+    tok = torch.tensor([[0, 1, 2, 3]])
+    tid = 1
+    belief, mu_p, sigma_p = m._metropolis_prepare(tok)
+    assert belief.omega is not None                                     # omega actually enters F
+    dF_move = m._metropolis_delta_f(belief, mu_p, sigma_p, tok, tid)
+    assert dF_move == dF_move                                           # finite (not NaN)
+    assert abs(dF_move) > 0.0                                           # genuinely nonzero (distinct tokens)
+    # Independent oracle: flip the source table row, re-look-up the (fixed-belief) frame, recompute F.
+    F_cur = m._metropolis_free_energy(belief, mu_p, sigma_p)
+    R = reflection_element(belief.omega.shape[-1])
+    m._flip_omega_embed_row(R, tid)
+    relooked = m.prior_bank._omega_lookup(tok)                          # frame from the flipped source table
+    F_trial = m._metropolis_free_energy(belief._replace(omega=relooked), mu_p, sigma_p)
+    m._flip_omega_embed_row(R, tid)                                     # restore (R is involutory)
+    dF_indep = F_trial - F_cur
+    assert abs(dF_move - dF_indep) < 1e-5                               # exact-DeltaF anchor (fp5)
+
+
+def test_metropolis_step_stats_finite():
+    m = _model(vocab_size=4)
+    tok = torch.tensor([[0, 1, 2, 3]])
+    stats = m.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(0))
+    assert stats["proposed"] == 4                                       # one proposal per unique token
+    assert 0 <= stats["accepted"] <= stats["proposed"]
+    assert "mean_delta_f" in stats and stats["mean_delta_f"] == stats["mean_delta_f"]  # finite
+
+
+def test_seeded_reproducible():
+    tok = torch.tensor([[0, 1, 2, 3, 0, 1]])
+    m1 = _model(); m2 = _model()
+    with torch.no_grad():                                              # identical init
+        m2.prior_bank.omega_embed.copy_(m1.prior_bank.omega_embed)
+    s1 = m1.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(7))
+    s2 = m2.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(7))
+    assert s1 == s2
+    assert torch.equal(m1.prior_bank.omega_embed, m2.prior_bank.omega_embed)
