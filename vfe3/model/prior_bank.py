@@ -31,7 +31,7 @@ kernel is pinned to EXACTLY (and under ``log_softmax``); both are alpha=1 KL.
 """
 
 import warnings
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.utils.checkpoint as _checkpoint
@@ -155,6 +155,10 @@ class PriorBank(nn.Module):
         unigram_kappa:        float = 1.0,
         decode_unigram_prior: bool  = False,
         untie_decode_bank:    bool  = False,
+
+        gauge_parameterization: str                 = "phi",
+        irrep_dims:             Optional[List[int]] = None,
+        omega_reflection:       str                 = "off",
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -171,6 +175,7 @@ class PriorBank(nn.Module):
         self.s_e_step = s_e_step
         self.unigram_kappa = unigram_kappa
         self.decode_unigram_prior = decode_unigram_prior
+        self.gauge_parameterization = gauge_parameterization
         # untie applies to the KL-to-bank decode only (the linear ablation is already untied by
         # construction), so the flag is resolved against use_prior_bank once, here.
         self.untie_decode_bank = untie_decode_bank and use_prior_bank
@@ -278,6 +283,18 @@ class PriorBank(nn.Module):
         if self.untie_decode_bank:
             self.decode_mu_embed        = nn.Parameter(self._prior_mu_table().clone().detach())
             self.decode_sigma_log_embed = nn.Parameter(self._prior_sigma_log_table().clone().detach())
+
+        # omega_direct: a per-token GL(K) group element table (identity init -> step-0 == trivial gauge).
+        # Created ONLY on the omega_direct path so the default state_dict is byte-identical. Block-
+        # diagonal by construction for block_glk (identity is diagonal; the group retraction keeps it so).
+        if gauge_parameterization == "omega_direct":
+            eye_K = torch.eye(K)
+            self.omega_embed = nn.Parameter(eye_K.expand(vocab_size, K, K).clone())
+            if omega_reflection == "init_seed":
+                from vfe3.geometry.generators import reflection_element
+                R = reflection_element(K)
+                with torch.no_grad():                        # seed every OTHER token into the det<0 sheet
+                    self.omega_embed[1::2] = R
 
     def encode(
         self,
@@ -907,8 +924,9 @@ def _encode_per_token(
     mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
     sigma_diag = torch.exp(pb._prior_sigma_log_table()[token_ids]).clamp(min=pb.eps)  # (B, N, K), sigma > 0
     phi = pb.phi_embed[token_ids]                                            # (B, N, n_gen)
+    omega = pb.omega_embed[token_ids] if getattr(pb, "gauge_parameterization", "phi") == "omega_direct" else None
     sigma = sigma_diag if pb.diagonal_covariance else torch.diag_embed(sigma_diag)
-    return BeliefState(mu=mu, sigma=sigma, phi=phi)
+    return BeliefState(mu=mu, sigma=sigma, phi=phi, omega=omega)
 
 
 @register_encode("per_token_additive")

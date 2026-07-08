@@ -160,6 +160,9 @@ class VFEModel(nn.Module):
             unigram_kappa=cfg.unigram_kappa,
             decode_unigram_prior=cfg.decode_unigram_prior,
             untie_decode_bank=cfg.untie_decode_bank and cfg.use_prior_bank,
+            gauge_parameterization=cfg.gauge_parameterization,
+            irrep_dims=list(self.group.irrep_dims),
+            omega_reflection=cfg.omega_reflection,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.

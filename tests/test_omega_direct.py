@@ -7,6 +7,7 @@ from vfe3.geometry.groups import get_group
 from vfe3.geometry.transport import (build_transport_from_element, compute_transport_operators,
                                       transport_mean, FactoredTransport)
 from vfe3.inference.e_step import build_belief_transport, e_step, e_step_iteration, free_energy_value
+from vfe3.model.prior_bank import PriorBank
 
 
 def test_beliefstate_omega_field_optional_and_addressable():
@@ -135,3 +136,24 @@ def test_free_energy_value_filtered_keys_rejects_omega_direct():
     with pytest.raises(NotImplementedError):
         free_energy_value(belief, mu_p, sigma_p, grp,
                           gauge_parameterization="omega_direct", keys=belief)
+
+
+def test_prior_bank_omega_table_gated_and_encodes_identity():
+    # default (phi) path: no omega table, no omega on the belief
+    pb_phi = PriorBank(vocab_size=6, K=4, n_gen=16)
+    assert not hasattr(pb_phi, "omega_embed")
+    assert pb_phi.encode(torch.zeros(1, 3, dtype=torch.long)).omega is None
+    # omega_direct path: table exists, identity init, belief carries (B,N,K,K)
+    pb = PriorBank(vocab_size=6, K=4, n_gen=16, gauge_parameterization="omega_direct", irrep_dims=[4])
+    assert pb.omega_embed.shape == (6, 4, 4)
+    assert torch.allclose(pb.omega_embed, torch.eye(4).expand(6, 4, 4), atol=1e-7)
+    b = pb.encode(torch.zeros(1, 3, dtype=torch.long))
+    assert b.omega.shape == (1, 3, 4, 4)
+    assert torch.allclose(b.omega, torch.eye(4).expand(1, 3, 4, 4), atol=1e-7)
+
+
+def test_prior_bank_omega_reflection_seeds_det_negative():
+    pb = PriorBank(vocab_size=6, K=4, n_gen=16, gauge_parameterization="omega_direct",
+                   irrep_dims=[4], omega_reflection="init_seed")
+    dets = torch.det(pb.omega_embed)
+    assert (dets < 0).any()                                  # some tokens seeded into det<0
