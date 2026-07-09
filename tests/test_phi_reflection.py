@@ -182,6 +182,39 @@ def test_free_energy_value_reflects():
     assert torch.allclose(F_a, F_none, atol=1e-7)
 
 
+def test_free_energy_value_reflects_filtered_keys():
+    # Coverage for the FILTERED (keys != None) transport fold in free_energy_value: that branch builds
+    # omega via _transport_qk(query.phi, keys.phi) then applies the KEY-ASYMMETRIC reflection
+    # (_apply_reflection with an independent key_reflection). The global-path test above never drives
+    # this branch (keys defaults to the query belief), so pin it here: with the query sign held at +1
+    # (query fold is a no-op), flipping a KEY-slot sign must change the frozen-keys F, and an all-+1
+    # keys reflection must equal keys.reflection=None (pure fold). Diagnostic-only path; bites through
+    # the transported key mean's component-0 sign (diagonal sigma leaves the covariance invariant).
+    from vfe3.geometry.groups import get_group
+    from vfe3.inference.e_step import free_energy_value
+    from vfe3.belief import BeliefState
+    K, N = 4, 3
+    grp = get_group("glk")(K=K)
+    n_gen = grp.generators.shape[0]
+    g = torch.Generator().manual_seed(1)
+    mu      = torch.randn(N, K, generator=g)
+    sigma   = torch.rand(N, K, generator=g) + 0.5
+    phi     = 0.3 * torch.randn(N, n_gen, generator=g)          # NONZERO -> Omega_ij != I for i != j
+    mu_p    = torch.randn(N, K, generator=g)
+    sigma_p = torch.rand(N, K, generator=g) + 0.5
+    q       = BeliefState(mu=mu, sigma=sigma, phi=phi, reflection=torch.ones(N))   # query fixed at +1
+    keys_a  = BeliefState(mu=mu, sigma=sigma, phi=phi, reflection=torch.tensor([1.0,  1.0, 1.0]))
+    keys_b  = BeliefState(mu=mu, sigma=sigma, phi=phi, reflection=torch.tensor([1.0, -1.0, 1.0]))
+    F_a = free_energy_value(q, mu_p, sigma_p, grp, tau=1.5, keys=keys_a)
+    F_b = free_energy_value(q, mu_p, sigma_p, grp, tau=1.5, keys=keys_b)
+    assert torch.isfinite(F_a) and torch.isfinite(F_b)
+    assert not torch.allclose(F_a, F_b, atol=1e-6), \
+        "free_energy_value's filtered (keys!=None) branch ignores the key reflection"
+    keys_none = BeliefState(mu=mu, sigma=sigma, phi=phi, reflection=None)
+    F_none = free_energy_value(q, mu_p, sigma_p, grp, tau=1.5, keys=keys_none)
+    assert torch.allclose(F_a, F_none, atol=1e-7)               # all-+1 keys == keys reflection=None
+
+
 def test_block_preserves_reflection_end_to_end():
     # 3C: block.py's post-E-step transforms (block_norm / head_mixer / cg_coupling) must PRESERVE
     # belief.reflection. With block_norm active + n_layers>1 + phi_reflection on, the reflection must
