@@ -95,9 +95,9 @@ def belief_gradients_autograd(
     slots (query-side d delta/d mu_i only -- mean-field coordinate ascent); under smoothing both
     slots share the live leaves (full gradient, the stationary point of the global F)."""
     # Live leaves (keep the unrolled chain) only when create_graph is requested AND the belief
-    # genuinely carries grad upstream; otherwise a detached clone (autograd.grad needs a grad leaf,
-    # and there is no unrolled signal to preserve when the belief is grad-free, e.g. a no_grad caller
-    # or a direct unit-test call).
+    # genuinely carries grad upstream. The truncated E-step establishes that contract by creating
+    # fresh attached leaves at the last-k boundary. Otherwise use a detached clone (autograd.grad
+    # needs a grad leaf, and there is no unrolled signal to preserve for a no_grad caller).
     use_live = create_graph and mu.requires_grad and sigma.requires_grad
     if use_live:
         mu_q, sigma_q = mu, sigma

@@ -1010,20 +1010,24 @@ def e_step(
                     **kwargs,
                 )
             if t == no_grad_prefix - 1:
-                # Truncation boundary: fresh detached mu/sigma/phi leaves so the last-k graph starts
+                # Truncation boundary: fresh attached mu/sigma/phi leaves so the last-k graph starts
                 # here. _replace carries the omega frame (and s/r) through; omega is left ATTACHED
                 # (undetached) on purpose -- it is CONSTANT across E-step iterations, so it is not part
                 # of the truncated mu/sigma/phi unroll and does not reintroduce graph depth, and keeping
                 # it attached preserves the M-step gradient to omega_embed for the post-boundary
                 # iterations. Detaching it here would wrongly sever that gradient.
-                belief = belief._replace(mu=belief.mu.detach(), sigma=belief.sigma.detach(),
-                                         phi=belief.phi.detach())
+                belief = belief._replace(
+                    mu=belief.mu.detach().requires_grad_(True),
+                    sigma=belief.sigma.detach().requires_grad_(True),
+                    phi=belief.phi.detach().requires_grad_(True),
+                )
                 # m10: the hoisted flat transport was built from the PRE-boundary phi under grad, so the
                 # last-k iterations (which consume it via _prebuilt_omega) would leak transport gradient
-                # through the boundary to the encode/pos-phi tables. Rebuild it from the now-detached phi
+                # through the boundary to the encode/pos-phi tables. Rebuild it from the boundary phi
                 # (values unchanged at e_phi_lr==0, so the forward is byte-identical -- only the leaked
-                # graph is severed). A caller-shared prebuilt_transport is already detached, so leave it.
-                if _hoisted_omega is not None and prebuilt_transport is None:
+                # graph is severed). Caller-shared transports are attached on unrolled paths and require
+                # the same rebuild as internally hoisted transports.
+                if _hoisted_omega is not None:
                     _hoisted_omega = build_belief_transport(
                         belief.phi, group,
                         transport_mode="flat",
