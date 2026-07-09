@@ -115,10 +115,13 @@ def free_energy_terms(
     tau:                       'float | torch.Tensor' = 1.0,
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure F)
     eps:                       float = 1e-12,
+    lambda_twohop:             float = 0.0,                     # weight on detached two-hop coupling (0.0 = pure F)
     include_attention_entropy: bool  = True,                   # gate the entropy term in ``total``
 
     log_prior:                 Optional[torch.Tensor] = None,  # (..., N, N) attention log-prior
     alpha_reg:                 Optional[torch.Tensor] = None,  # (..., N[,K]) R(alpha_i) if state-dependent
+    coupling_energy:           Optional[torch.Tensor] = None,  # (..., N, N) VALUE-gauge coupling energy
+    log_likelihood:            Optional[torch.Tensor] = None,  # (..., N) E_q[log p(o|k)] observation term
 ) -> Dict[str, float]:
     r"""Per-term free-energy decomposition: self-coupling, belief-coupling, attention entropy.
 
@@ -127,10 +130,13 @@ def free_energy_terms(
 
         F = sum_i [ alpha_i D(q_i||p_i) + R(alpha_i)
                   + lambda_beta ( sum_j beta_ij E_ij
-                                  + tau sum_j beta_ij log(beta_ij/pi_ij) ) ]   (entropy: canonical only)
+                                  + tau sum_j beta_ij log(beta_ij/pi_ij) )
+                  + lambda_twohop sum_k (beta beta)_ik E_ik
+                  - ell_i ]   (entropy: canonical only)
 
-    ``belief_coupling`` and ``attention_entropy`` are the RAW (unweighted) block energies, so each
-    stays individually interpretable; ``total`` is the runtime-realised SCALED free energy
+    ``belief_coupling``, ``attention_entropy``, and the conditionally present
+    ``twohop_coupling`` / ``observation_likelihood`` are RAW (unweighted) block values, so each
+    stays individually interpretable; ``total`` is the runtime-realized SCALED free energy
     self_coupling + lambda_beta (belief_coupling + attention_entropy), matching what the E-step
     actually minimizes. At lambda_beta = 1.0 total is byte-identical to the
     unscaled sum.
@@ -142,12 +148,19 @@ def free_energy_terms(
     contribution to ``total`` exactly as ``free_energy`` does -- when False the surrogate objective
     the E-step descends omits the entropy term, but its value is still reported under
     ``attention_entropy`` for diagnostics.
+
+    ``coupling_energy`` selects the VALUE-gauge energy for both the one-hop and two-hop coupling
+    sums while ``energy`` remains the score energy that produced ``beta``. ``lambda_twohop`` uses
+    raw detached ``beta @ beta`` weights, matching the scalar objective, and ``log_likelihood`` is
+    subtracted from ``total`` when the gated observation seam supplies it. Their defaults preserve
+    the original four-term result exactly.
     """
     self_term = alpha * self_div
     if alpha_reg is not None:
         self_term = self_term + alpha_reg
     self_coupling = float(self_term.sum())
-    belief_coupling = float((beta * energy).sum())
+    value_energy = energy if coupling_energy is None else coupling_energy
+    belief_coupling = float((beta * value_energy).sum())
     # log pi WITHOUT materializing a full (H,N,N) uniform-pi tensor: with log_prior=None, pi=1/N is
     # uniform so log(pi)=-log(N) is a scalar (audit 2026-06-17 r2 id9; the scalar new_tensor(1/N) keeps
     # the value byte-identical to the old full_like alloc). The log_prior branch is unchanged.
@@ -162,12 +175,26 @@ def free_energy_terms(
     total = self_coupling + float(lambda_beta) * belief_coupling
     if include_attention_entropy:
         total = total + float(lambda_beta) * entropy
-    return {
+    twohop_coupling = None
+    if lambda_twohop != 0.0:
+        w2 = beta.detach() @ beta.detach()
+        twohop_coupling = float((w2 * value_energy).sum())
+        total = total + lambda_twohop * twohop_coupling
+    observation_likelihood = None
+    if log_likelihood is not None:
+        observation_likelihood = float(log_likelihood.sum())
+        total = total - observation_likelihood
+    terms = {
         "self_coupling":   self_coupling,
         "belief_coupling": belief_coupling,
         "attention_entropy": entropy,
         "total":           total,
     }
+    if twohop_coupling is not None:
+        terms["twohop_coupling"] = twohop_coupling
+    if observation_likelihood is not None:
+        terms["observation_likelihood"] = observation_likelihood
+    return terms
 
 
 # ===========================================================================
@@ -1200,9 +1227,22 @@ def _m_gauge_spread(*, phi: torch.Tensor, generators: torch.Tensor, **kw) -> flo
 
 
 @register_metric("free_energy_terms")
-def _m_free_energy_terms(*, self_div=None, energy=None, beta=None, alpha=None,
-                         tau, log_prior=None, lambda_beta=1.0,
-                         include_attention_entropy=True, alpha_reg=None, **kw) -> Dict[str, float]:
+def _m_free_energy_terms(
+    *,
+    self_div=None,
+    energy=None,
+    beta=None,
+    alpha=None,
+    tau,
+    lambda_beta=1.0,
+    lambda_twohop=0.0,
+    include_attention_entropy=True,
+    log_prior=None,
+    alpha_reg=None,
+    coupling_energy=None,
+    log_likelihood=None,
+    **kw,
+) -> Dict[str, float]:
     """Per-term free-energy decomposition (self-coupling, belief-coupling, attention entropy).
 
     ``tau`` is REQUIRED (no default): the wrapper has no way to recover the group-aware softmax
@@ -1210,14 +1250,13 @@ def _m_free_energy_terms(*, self_div=None, energy=None, beta=None, alpha=None,
     so ``total``) wrong for any K>1 (audit 2026-06-13 L16). Callers pass ``attention_tau(...)`` -- as
     the live diagnostics path already does -- matching this module's required-context-key convention.
 
-    ``lambda_beta`` / ``include_attention_entropy`` / ``alpha_reg`` are forwarded (audit 2026-07-05
-    m4): the wrapper previously dropped all three, so a registry-driven ``total`` matched the runtime
-    F only at lambda_beta=1 / entropy-ON / constant-alpha. Defaults reproduce the old behavior when
-    a context omits them (pure F), so existing callers are byte-identical."""
+    Every scalar-objective seam is forwarded. Defaults reproduce the old behavior when a context
+    omits the opt-in terms, so existing registry callers remain byte-identical."""
     return free_energy_terms(self_div, energy, beta, alpha, tau=tau, log_prior=log_prior,
-                             lambda_beta=lambda_beta,
+                             lambda_beta=lambda_beta, lambda_twohop=lambda_twohop,
                              include_attention_entropy=include_attention_entropy,
-                             alpha_reg=alpha_reg)
+                             alpha_reg=alpha_reg, coupling_energy=coupling_energy,
+                             log_likelihood=log_likelihood)
 
 
 def compute_metrics(

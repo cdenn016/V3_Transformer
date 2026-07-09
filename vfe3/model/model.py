@@ -1921,6 +1921,9 @@ class VFEModel(nn.Module):
     def diagnostics(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+
+        *,
+        log_likelihood: Optional[torch.Tensor] = None,  # (N,) optional E_q[log p(o|k)] diagnostic seam
     ) -> dict:
         r"""Faithful per-step VFE diagnostics at the converged belief (no_grad).
 
@@ -1942,7 +1945,8 @@ class VFEModel(nn.Module):
         converged belief stands in for the per-block intermediates).
 
         Returns ``{attn_entropy, self_coupling, belief_coupling, attention_entropy,
-        total, effective_rank}`` (nats; ``effective_rank`` is the per-token
+        total, effective_rank}`` plus conditional ``twohop_coupling`` and
+        ``observation_likelihood`` fields (nats; ``effective_rank`` is the per-token
         belief-variance spectrum effective rank, not an attention rank).
         """
         from vfe3.inference.e_step import _transport
@@ -2010,11 +2014,15 @@ class VFEModel(nn.Module):
             gauge_parameterization=(cfg.gauge_parameterization if out.omega is not None else "phi"),
             omega=out.omega,                                          # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
         )
+        mu_tv = sigma_tv = None
         if rope is not None:
             rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                                        on_value=cfg.rope_on_value)
             mu_t    = transport_mean(rope_omega, out.mu)             # (N, N, K)
             sigma_t = transport_covariance(rope_omega, out.sigma)    # (N, N, K)
+            if not cfg.rope_on_value:
+                mu_tv    = transport_mean(omega, out.mu)
+                sigma_tv = transport_covariance(omega, out.sigma)
         else:
             mu_t    = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
             sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
@@ -2025,6 +2033,14 @@ class VFEModel(nn.Module):
             divergence_family=cfg.divergence_family,
             irrep_dims=self.group.irrep_dims,
         )
+        coupling_energy = None
+        if mu_tv is not None:
+            coupling_energy = pairwise_energy(
+                fam(out.mu, out.sigma), fam(mu_tv, sigma_tv),
+                alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family,
+                irrep_dims=self.group.irrep_dims,
+            )
         # query_adaptive_tau (default OFF): _beta_tau returns the base tau unchanged, else the
         # per-query tau from the CONVERGED belief sigma (the state this diagnostic scores).
         _tau_b = self._beta_tau(out.sigma, out.mu,
@@ -2045,8 +2061,11 @@ class VFEModel(nn.Module):
         terms = metrics.free_energy_terms(self_div, energy, beta, alpha,
                                           tau=_tau_b,
                                           lambda_beta=_lb, log_prior=log_prior,
+                                          lambda_twohop=cfg.lambda_twohop,
                                           include_attention_entropy=cfg.include_attention_entropy,
-                                          alpha_reg=(alpha_reg if cfg.lambda_alpha_mode != "constant" else None))
+                                          alpha_reg=(alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
+                                          coupling_energy=coupling_energy,
+                                          log_likelihood=log_likelihood)
         d.update({k: float(v) for k, v in terms.items()})
         # Raw (un-regularized) belief->prior drift sum_i D(q_i||p_i): the divergence WITHOUT the
         # alpha_i coefficient OR the R(alpha_i) regularizer that free_energy_terms folds into
@@ -2321,6 +2340,9 @@ class VFEModel(nn.Module):
     def diagnostics_per_layer(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+
+        *,
+        log_likelihood: Optional[torch.Tensor] = None,  # (N,) optional E_q[log p(o|k)] diagnostic seam
     ) -> dict:                             # each value a list of length L = cfg.n_layers
         r"""Per-LAYER (inference-depth) belief-channel diagnostics for sequence 0 (no_grad).
 
@@ -2376,9 +2398,13 @@ class VFEModel(nn.Module):
         mu_p, sigma_p = belief.mu, belief.sigma
         rope = self._rope_rotation(n, token_ids.device)
 
-        keys = ("self_coupling", "belief_coupling", "attention_entropy", "total", "self_divergence",
+        keys = ["self_coupling", "belief_coupling", "attention_entropy", "total", "self_divergence",
                 "holonomy_deviation", "holonomy_wilson", "gauge_trace_spread", "gauge_invariant_spread",
-                "effective_rank", "attn_entropy", "belief_cond_median", "phi_norm_mean")
+                "effective_rank", "attn_entropy", "belief_cond_median", "phi_norm_mean"]
+        if cfg.lambda_twohop != 0.0:
+            keys.append("twohop_coupling")
+        if log_likelihood is not None:
+            keys.append("observation_likelihood")
         rec: dict = {k: [] for k in keys}
         for _ in range(cfg.n_layers):
             cap: dict = {}                                            # pre-transform converged belief (F self-term)
@@ -2410,11 +2436,15 @@ class VFEModel(nn.Module):
                 gauge_parameterization=(cfg.gauge_parameterization if belief.omega is not None else "phi"),
                 omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
             )
+            mu_tv = sigma_tv = None
             if rope is not None:
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                                            on_value=cfg.rope_on_value)
                 mu_t    = transport_mean(rope_omega, belief.mu)
                 sigma_t = transport_covariance(rope_omega, belief.sigma)
+                if not cfg.rope_on_value:
+                    mu_tv    = transport_mean(omega, belief.mu)
+                    sigma_tv = transport_covariance(omega, belief.sigma)
             else:
                 mu_t    = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
                 sigma_t = transport_covariance(omega.unsqueeze(0), belief.sigma.unsqueeze(0))[0]
@@ -2423,6 +2453,14 @@ class VFEModel(nn.Module):
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
+            coupling_energy = None
+            if mu_tv is not None:
+                coupling_energy = pairwise_energy(
+                    fam(belief.mu, belief.sigma), fam(mu_tv, sigma_tv),
+                    alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                    divergence_family=cfg.divergence_family,
+                    irrep_dims=self.group.irrep_dims,
+                )
             beta = attention_weights(energy, tau=_tau_c, log_prior=log_prior)
             _q = cap["converged"]                                    # self-term reads THIS block's prior (per-layer exact)
             self_div = self_divergence_for_alpha(
@@ -2436,13 +2474,20 @@ class VFEModel(nn.Module):
             )
             terms = metrics.free_energy_terms(
                 self_div, energy, beta, alpha, tau=_tau_c, lambda_beta=_lb, log_prior=log_prior,
+                lambda_twohop=cfg.lambda_twohop,
                 include_attention_entropy=cfg.include_attention_entropy,
                 alpha_reg=(alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
+                coupling_energy=coupling_energy,
+                log_likelihood=log_likelihood,
             )
             rec["self_coupling"].append(float(terms["self_coupling"]))
             rec["belief_coupling"].append(float(terms["belief_coupling"]))
             rec["attention_entropy"].append(float(terms["attention_entropy"]))
             rec["total"].append(float(terms["total"]))
+            if "twohop_coupling" in terms:
+                rec["twohop_coupling"].append(float(terms["twohop_coupling"]))
+            if "observation_likelihood" in terms:
+                rec["observation_likelihood"].append(float(terms["observation_likelihood"]))
             rec["self_divergence"].append(float(self_div.sum()))
             rec["holonomy_deviation"].append(float(metrics.holonomy_deviation_sampled(omega)["mean"]))
             rec["holonomy_wilson"].append(float(metrics.holonomy_wilson_sampled(omega)["deviation_mean"]))
