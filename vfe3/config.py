@@ -334,6 +334,8 @@ class VFE3Config:
     # -> log_prior stays the sequence-only (N,N)/(H,N,N) bias (byte-identical).
     precision_weighted_attention: bool  = False
     precision_attention_b0:       float = 1.0       # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
+    
+    
     # precision_weighted_attention only: compute the per-key reliability PER HEAD -- trace over each
     # gauge block's coords (-log(b0 + tr_h Sigma_j)) -- so each head down-weights keys by its OWN
     # block uncertainty, better aligned with per-head attention. Default False = global (trace over
@@ -380,15 +382,18 @@ class VFE3Config:
 
     sigma_max:                 float = 10.0
    
-    gradient_mode:             str   = "filtering"
+    gradient_mode:             str   = "filtering"   #"smoothing"
     
     phi_precond_mode:          str   = "none"
     phi_retract_mode:          str   = "bch"  # Lie-algebra step chart: euclidean (sum) or bch
     spd_retract_mode:          str   = "spd_affine" # SPD covariance retraction geometry (registry key)
+                                                      #"log_euclidean"
+    
     omega_retract_mode:        str   = "lie_exp"  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
     omega_reflection:          str   = "off"      # omega_direct det<0 seeding: 'off' (det>0 only) | 'init_seed' | 'metropolis'
     omega_metropolis_temperature: float = 1.0    # T in the metropolis det-sign accept min(1, exp(-dF/T)); >0
     omega_metropolis_every:       int   = 1       # cadence in optimizer steps for the metropolis det-sign sweep; >=1
+   
     # (counts train-loop iterations, 1:1 with optimizer steps INCLUDING under grad_accum_steps>1,
     # which chunks intra-step -- see vfe3/train.py::train_step docstring; diverges only when a step's
     # update is dropped by the NaN/Inf skip_step guard, see spec Sec.4)
@@ -401,14 +406,14 @@ class VFE3Config:
     decode_bias:               bool  = False  # use_prior_bank=False only: learned per-vocab log-unigram bias on logits=mu_q@W^T+b (zero-init, weight-decay-free). Inert (warns) under use_prior_bank=True.
    
     decode_tau:                float = 1.0
-    decode_mode:               str   = "diagonal"
+    decode_mode:               str   = "diagonal"    #"full_chunked", "diagonal_chunked", "expected_liklihood_chunked", "diagonal_untied", "full"
     
     # decode_chunk_size: vocabulary-chunk width V is iterated over by the fused
     # decode_mode='diagonal_chunked' CE path (the training-path memory win that never
     # materializes the (B,N,V) logit tensor). Ignored by every other decode_mode. Default
     # 8192; validated positive.
     decode_chunk_size:         int   = 8192
-    encode_mode:               str   = "per_token"
+    encode_mode:               str   = "per_token"   #"per_token_additive"
 
     # --- active-inference EFE policy scorer (opt-in, no-grad, default OFF) ---
     # Reranks candidate token continuations by an Expected-Free-Energy functional inside generate()
@@ -558,14 +563,14 @@ class VFE3Config:
     #                          with min_lr as max(min_lr, min_lr_frac*base). 0.0 (with min_lr=0) is
     #                          the pure half-cosine-to-zero path.
     
-    seed:                      int   = 0
-    deterministic:             bool  = False         # opt-in full run-to-run determinism (esp. GPU): _seed_everything
+    seed:                      int   = 6
+    deterministic:             bool  = True         # opt-in full run-to-run determinism (esp. GPU): _seed_everything
                                                      # adds torch.use_deterministic_algorithms(warn_only) + cudnn.deterministic
                                                      # + CUBLAS_WORKSPACE_CONFIG (env var takes full effect only if set
                                                      # before the first CUDA op). Default False = today's byte-identical path.
     log_interval:              int   = 100           # console log every N steps (0 = off)
     eval_interval:             int   = 2000            # periodic validation every N steps (0 = off)
-    checkpoint_interval:       int   = 0            # save a resumable checkpoint every N steps (0 = off)
+    checkpoint_interval:       int   = 25000            # save a resumable checkpoint every N steps (0 = off)
     
     # Opt-in training RESUME (default None = OFF = the pure from-scratch path): a path to a
     # checkpoints/step_<N>.pt written by checkpoint_interval. When set, train() restores the model
@@ -628,6 +633,7 @@ class VFE3Config:
     # F descent exact in ONE iteration at the same O(N^2 K) cost. KERNEL-ROUTE ONLY (filtering +
     # gaussian_diagonal + renyi order 1 + attention entropy); rejected otherwise in __post_init__.
     e_step_update:             str   = "gradient"     # "gradient" | "mm_exact"
+    
     # Damped mm_exact step theta <- (1-eta) theta + eta theta* (natural-coordinate mirror descent);
     # 1.0 = the full exact coordinate minimizer. Read only under e_step_update='mm_exact'.
     mm_damping:                float = 1.0
@@ -644,15 +650,18 @@ class VFE3Config:
     # dense K-axis einsum (the off-blocks are exactly zero). Same sum, ~n_heads x fewer FLOPs on the
     # dominant pair GEMM. Numerics: fp32 reassociation only (pinned allclose 1e-6).
     transport_mean_per_head:   bool  = False
+    
     # fp64 island keying for stable_matrix_exp_pair. 'dim' (default): upcast when the block dim
     # >= its dim_threshold (the long-standing rule). 'norm': upcast only when the clamped block
     # Frobenius norm exceeds exp_fp64_norm_threshold -- the conditioning argument is a norm
     # argument, not a dimension argument; small-norm blocks are fp32-accurate at any dim.
     exp_fp64_mode:             str   = "dim"          # "dim" | "norm"
     exp_fp64_norm_threshold:   float = 5.0            # 'norm' mode: upcast when max ||M||_F >= this
+    
     # Build the flat FactoredTransport ONCE per forward and share it between _refine_s and the
     # belief E-step (both consume the identical phi); skips a redundant matrix-exp pair + backward.
     share_refine_s_transport:  bool  = False
+    
     # Regional torch.compile on the closed-form pair kernel (static shapes; matrix_exp/eigh stay
     # outside). Falls back to eager with a warning when the backend is unavailable (e.g. no triton).
     compile_pair_kernel:       bool  = False
@@ -664,9 +673,11 @@ class VFE3Config:
     randomize_e_steps:         bool  = False
     e_steps_min:               int   = 1
     e_steps_max:               int   = 4
+   
     # Truncated backprop through the inner loop: run all but the last k iterations under no_grad
     # (0 = OFF, full path per e_step_gradient). Applies to training forwards only.
     e_steps_backprop_last:     int   = 0
+    
     # Eval-time halting: stop iterating when mean_i KL(q_i^t || q_i^{t-1}) < tol (closed form for
     # the Gaussian family). None = OFF. Read only under torch.no_grad eval forwards.
     e_step_halt_tol:           Optional[float] = None
@@ -679,11 +690,13 @@ class VFE3Config:
     # closed-form kernel stays exact (same footprint as the precision bias).
     gamma_as_beta_prior:       bool  = False
     gamma_prior_weight:        float = 0.5            # mixture weight w in [0, 1]
+    
     # Two-hop coupling F_2 = lambda_twohop * sum_ik (beta beta)_ik KL(q_i||Omega_ik q_k) with
     # DETACHED hop weights (beta@beta per head; exact composed transport under the flat cocycle,
     # so the existing (i,k) transported moments serve verbatim). Effective depth 2 at L=1.
     # 0.0 = OFF (pure canonical F).
     lambda_twohop:             float = 0.0
+    
     # Per-query adaptive temperature tau_i = tau_h * (1 + query_tau_c * tr_h Sigma_i / d_h)
     # (DETACHED state function): uncertain queries hedge, confident queries commit. The query-side
     # dual of precision_weighted_attention (same detached footprint, same tr-Sigma gauge caveat
@@ -696,21 +709,25 @@ class VFE3Config:
     # Calibrates log Z ~ 0 so the decode is a normalized observation model (what -E_q[log p(o|x)]
     # formally requires). The logsumexp is already materialized in every fused CE path. 0.0 = OFF.
     z_loss_weight:             float = 0.0
+    
     # SEPARATE AdamW weight decay for the log-variance tables (sigma_log_embed, s_sigma_log,
     # decode_log_scale). None = inherit the global weight_decay (the long-standing behavior --
     # which decays log sigma toward 0, i.e. an unintended lognormal prior pinning sigma to 1
     # against the configured sigma_init). Set 0.0 to exempt the sigma sector. Mirrors
     # connection_weight_decay.
     sigma_weight_decay:        Optional[float] = None
+    
     # Untied decode bank (use_prior_bank=True only): decode reads its OWN (V,K) mu/sigma tables,
     # cloned from the encode tables at init (step-0 byte-identical) and trained separately. Isolates
     # the tied-vs-untied confound in the linear-vs-bank comparison; still a KL-to-priors decode.
     untie_decode_bank:         bool  = False
+    
     # Per-role gradient clipping: clip each optimizer role group (mu / sigma / phi / ...) to
     # grad_clip separately instead of one GLOBAL norm over all parameters (which is dominated by
     # phi_embed and silently rescales every other group when it binds). False = the pure
     # long-standing global clip.
     grad_clip_per_role:        bool  = False
+   
     # Skip the belief-channel sigma E-step update (gradient + retraction) entirely. OPT-IN
     # dead-compute ablation for configs where q's sigma has no consumer (linear decode, no norms,
     # no precision-weighted attention); NOT coerced from the config -- the user asserts deadness.

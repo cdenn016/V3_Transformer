@@ -265,6 +265,8 @@ config = dict(
     e_q_sigma_lr              = 0.001,
     e_phi_lr                  = 0.00,     
     
+    skip_belief_sigma_update  = True,
+    share_refine_s_transport  = True,
     
     ####################################
     #       Model E-step LR's
@@ -554,7 +556,7 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
         48, [3, 6, 8, 12, 24], tag="blocks_K48_ctrl_2x",
         extra_overrides={"encode_mode": "per_token_additive", "pos_phi": "none"}),
     
-    "grow_K":        route_grow_k([20, 40, 60, 80, 100], n_heads=4),
+    "grow_K":        route_grow_k([60, 80, 100], n_heads=4),
     "grow_K_mup":    route_grow_k_mup([20, 40, 80, 100], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
     "blocksize":     route_blocksize(64, [8, 4, 2]),
     "group":         route_group(64),

@@ -55,7 +55,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # run-folder label so they never collide). NUM_RUNS=1 with SEEDS=[] keeps the single-run path on the
 # config `seed` above, unchanged. Example: NUM_RUNS=3, SEEDS=[3, 64, 23] trains all three seeds.
 NUM_RUNS = 1
-SEEDS    = 54,#[6,23,54,66,122]        # 54 is best seed so far; must list at least NUM_RUNS seeds when NUM_RUNS > 1
+SEEDS    = 6,#[6,23,54,66,122]        # 54 is best seed so far; must list at least NUM_RUNS seeds when NUM_RUNS > 1
 
 # DATA_SEED (EXP-1 variance floor): when set to an int, the TRAIN loader's shuffle order is fixed to
 # this seed via an explicit generator, INDEPENDENT of the per-run model seed -- so a multi-seed run
@@ -114,7 +114,10 @@ config = dict(
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.008,
-    decode_mode               = 'diagonal_chunked',   #"expected_likelihood_chunked"
+    decode_mode               = 'diagonal_chunked',  #"full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "diagonal_untied", "full"
+    encode_mode               = "per_token",   #"per_token_additive"
+    
+    
     oracle_unroll_grad        = False,
     
     #################################
@@ -126,6 +129,22 @@ config = dict(
                                               #   | "frozen" (random fixed frame: e_phi_lr=m_phi_lr=0, phi_scale kept).
                                               #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
+    
+    
+    omega_retract_mode        = "lie_exp",  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
+    omega_reflection           = "off",      # omega_direct det<0 seeding: 'off' (det>0 only) | 'init_seed' | 'metropolis'
+    omega_metropolis_temperature  = 1.0 ,   # T in the metropolis det-sign accept min(1, exp(-dF/T)); >0
+    omega_metropolis_every        = 100,       # cadence in optimizer steps for the metropolis det-sign sweep; >=1
+   
+    # (counts train-loop iterations, 1:1 with optimizer steps INCLUDING under grad_accum_steps>1,
+    # which chunks intra-step -- see vfe3/train.py::train_step docstring; diverges only when a step's
+    # update is dropped by the NaN/Inf skip_step guard, see spec Sec.4)
+    omega_compact_storage        = False,     # opt-in compact (V,H,d,d)/(V,d,d) block storage (equal-block groups)
+    omega_reorth_every            = 0 ,        # SO-group re-orthogonalization cadence in M-steps (0 = off)
+    phi_reflection               = "off",      # phi-path det<0 via R*exp(phi): 'off' (default) | 'init_seed' | 'metropolis'; reuses omega_metropolis_temperature/every
+    
+    
+    
     
     m_phi_natural_grad        = False,        # natural gradient on phi m-step
     
@@ -270,9 +289,9 @@ config = dict(
     #        Learning Rates
     #################################
         
-    m_p_mu_lr                 = 0.015,   
-    m_p_sigma_lr              = 0.0045,     
-    m_phi_lr                  = 0.015,   
+    m_p_mu_lr                 = 0.0125,   
+    m_p_sigma_lr              = 0.003,     
+    m_phi_lr                  = 0.016,   
     
     weight_decay              = 0.02,
     phi_weight_decay          = 0.05,
@@ -328,22 +347,23 @@ config = dict(
     # --- randomized-depth E-step (recurrent-depth recipe) ---
     randomize_e_steps         = False,       # training forwards sample T ~ Uniform{e_steps_min..e_steps_max}
     e_steps_min               = 1,
-    e_steps_max               = 4,
+    e_steps_max               = 3,
     e_steps_backprop_last     = 0,           # truncated backprop: no_grad all but the last k iterations (0 = OFF)
     e_step_halt_tol           = None,        # eval halting: break when mean KL(q^t||q^{t-1}) < tol (None = OFF)
 
     # --- decode / objective ---
     decode_unigram_prior      = False,       # add kappa*log pi_v (corpus unigram, data statistic) to decode logits
     unigram_kappa             = 1.0,         # tempering on log pi_v (1.0 = exact Bayes class prior)
+    
     # decode_mode "expected_likelihood_chunked" is also new: sigma-aware Gaussian-convolution readout
-    # log N(mu_q; mu_v, Sigma_q + Sigma_v) -- select it above under use_prior_bank=True.
+    # log N(mu_q; mu_v, Sigma_q + Sigma_v) - select it above under use_prior_bank=True.
     untie_decode_bank         = False,       # use_prior_bank=True only: decode reads its OWN cloned (V,K) tables
-    z_loss_weight             = 0.0,         # z-loss on the decode partition: w * mean(logsumexp^2) (0 = OFF)
+    z_loss_weight             = 0,           # z-loss on the decode partition: w * mean(logsumexp^2) (0 = OFF)
     sigma_weight_decay        = None,        # AdamW decay for log-variance tables (None = inherit weight_decay;
                                              # 0.0 exempts sigma from the unintended log-sigma->0 pull)
 
     # --- attention / coupling ---
-    gamma_as_beta_prior       = True,       # fold DETACHED gamma posterior into beta's prior (h->s->p->q);
+    gamma_as_beta_prior       = True,        # fold DETACHED gamma posterior into beta's prior (h->s->p->q);
                                              # needs lambda_gamma > 0
     gamma_prior_weight        = 0.5,         # mixture weight w in [0,1]: pi = (1-w) softmax(B) + w gamma
     lambda_twohop             = 0.0,         # two-hop coupling F2 = lam2 sum_ik (beta@beta)_ik KL_ik (0 = OFF;
@@ -354,9 +374,9 @@ config = dict(
     # self-edge attention sink (diagonal -inf except (0,0)).
 
     # --- training mechanics ---
-    grad_clip_per_role        = False,       # clip grads per role (mu/sigma/phi) instead of one global norm
+    grad_clip_per_role        = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
                                              # (global is phi-dominated and silently rescales other roles)
-    skip_belief_sigma_update  = True,       # skip the belief-channel sigma E-step update (dead-compute ablation
+    skip_belief_sigma_update  = True,        # skip the belief-channel sigma E-step update (dead-compute ablation
                                              # for linear-decode configs; user asserts sigma has no consumer)
 
     # --- compute reclamation (exactness-preserving perf; default OFF) ---
@@ -364,8 +384,8 @@ config = dict(
     exp_fp64_mode             = "dim",       # "dim" (long-standing: fp64 when block dim >= 20) | "norm" (fp64 only
                                              # when clamped ||M||_F >= exp_fp64_norm_threshold; d_head=25 blocks
                                              # currently run fp64 PERMANENTLY under "dim")
-    exp_fp64_norm_threshold   = 15.0,         # "norm" mode threshold
-    share_refine_s_transport  = True,       # build the flat transport ONCE per forward, share s-refine + belief
+    exp_fp64_norm_threshold   = 15.0,        # "norm" mode threshold
+    share_refine_s_transport  = True,        # build the flat transport ONCE per forward, share s-refine + belief
                                              # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
     compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
 )

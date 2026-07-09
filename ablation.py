@@ -130,18 +130,39 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.008,
-    decode_mode               = 'diagonal_chunked',
+    decode_mode               = 'diagonal_chunked',   #"expected_likelihood_chunked" diagonal_chunked
+    encode_mode               = "per_token",   #"per_token_additive"
+    
     oracle_unroll_grad        = False,
     
     #################################
     #          Gauge Group
     #################################
-    gauge_parameterization    = "phi",        # "phi" | "omega_direct" (stored GL(K) element; glk/block_glk, flat)
+    gauge_transport           = "on",         # gauge-frame ABLATION (A1/EXP-2): "on" (pure, learned frame)
+                                              #   | "off" (Omega=I exactly: forces phi_scale=0, pos_phi='none',
+                                              #     e_phi_lr=m_phi_lr=0; needs transport_mode='flat' + pos_rotation='none')
+                                              #   | "frozen" (random fixed frame: e_phi_lr=m_phi_lr=0, phi_scale kept).
+                                              #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
+    gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
+    
+    
+    omega_retract_mode        = "lie_exp",  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
+    omega_reflection           = "off",      # omega_direct det<0 seeding: 'off' (det>0 only) | 'init_seed' | 'metropolis'
+    omega_metropolis_temperature  = 1.0 ,   # T in the metropolis det-sign accept min(1, exp(-dF/T)); >0
+    omega_metropolis_every        = 1,       # cadence in optimizer steps for the metropolis det-sign sweep; >=1
+    # (counts train-loop iterations, 1:1 with optimizer steps INCLUDING under grad_accum_steps>1,
+    # which chunks intra-step -- see vfe3/train.py::train_step docstring; diverges only when a step's
+    # update is dropped by the NaN/Inf skip_step guard, see spec Sec.4)
+    omega_compact_storage        = False,     # opt-in compact (V,H,d,d)/(V,d,d) block storage (equal-block groups)
+    omega_reorth_every            = 0 ,        # SO-group re-orthogonalization cadence in M-steps (0 = off)
+    phi_reflection               = "off",      # phi-path det<0 via R*exp(phi): 'off' (default) | 'init_seed' | 'metropolis'; reuses omega_metropolis_temperature/every
+    
     
     m_phi_natural_grad        = False,        # natural gradient on phi m-step
-    m_gauge_update_rule       = "adam",                # vs "heavy_ball", vs the adamw arm
     
-    phi_precond_mode          = "killing_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
+    m_gauge_update_rule       = "heavy_ball",       #'adam' or 'heavy_ball'
+    
+    phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
@@ -173,7 +194,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     ####################################
     # Non-Flat Connection - Regime II
     ####################################
-    transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii" (learned bilinear edge
+     transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii" (learned bilinear edge
                                             # connection delta=mu^T W mu; gauge-invariant only at W=0; NN exception, default-off)
                                             # | "regime_ii_covariant" (Route B: gauge-COVARIANT non-flat connection
                                             # delta=M . invariant-features(q_i, Omega^0 q_j); covariant for any M; NN exception, default-off)
@@ -209,6 +230,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
        
     lambda_alpha               = 1,          # constant self-coupling value
     lambda_h                   = 0.25,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
+    #lambda h ~0.25/6 = 0.04 for K=160 d=20
     
     b0_h                       = 1.0,        # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
     c0_h                       = 1.0,        # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h
@@ -234,9 +256,14 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     kappa_beta                = 1, #[1, 0.5],        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
     kappa_gamma               = 1, #[1, 0.5],        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
-        
-    beta_attention_prior      = "causal_alibi",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
-    gamma_attention_prior     = "causal_alibi",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+
+    learnable_kappa_beta      = False,       # learn per-head kappa_beta = exp(log_kappa_beta), init from kappa_beta above
+                                             # (t5-exception family; freezes under detach/straight_through E-step)
+    learnable_kappa_gamma     = False,       # learn per-head kappa_gamma (trains under any estimator on the scored
+                                             # lambda_gamma>0 path; under s_e_step needs an 'unroll' E-step)
+
+    beta_attention_prior      = "causal_alibi_noself",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+    gamma_attention_prior     = "causal_alibi_noself",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
     t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
 
@@ -254,14 +281,14 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     e_q_sigma_lr              = 0.001,
     e_phi_lr                  = 0.00,     
     
-    kl_max = 160,
+    
     ####################################
     #       Model E-step LR's
     #      If s_e_step = True
     # and prior_source = 'model_channel'
     ####################################
     
-    r_update_mode             = "gradient",          # "gradient" (AdamW M-step; correct under s_e_step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
+    r_update_mode             = "gradient",         # "gradient" (AdamW M-step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
     prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"
     learnable_r               = True,               # un-freeze hyper-prior centroid r (empirical-Bayes)
     s_e_step                  = True,
@@ -274,9 +301,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        Learning Rates
     #################################
         
-    m_p_mu_lr                 = 0.015,   
-    m_p_sigma_lr              = 0.0035,     
-    m_phi_lr                  = 0.015,   
+    m_p_mu_lr                 = 0.0125,   
+    m_p_sigma_lr              = 0.003,     
+    m_phi_lr                  = 0.016,   
     
     weight_decay              = 0.02,
     phi_weight_decay          = 0.05,
@@ -301,19 +328,79 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     e_mu_q_trust              = None,
     e_sigma_q_trust           = 10.0,
-    sigma_max                 = 1000.0,
+    sigma_max                 = 100.0,
     
     #################################
     #         Misc/Logging
     #################################     
-    amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'
+    amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
         
-    log_interval              = 5000,       # console log every N steps (0 = off)
-    eval_interval             = 15000,      # periodic validation every N steps (0 = off)
-    checkpoint_interval       = 25000,     # save a resumable checkpoint every N steps (0 = off)
+    log_interval              = 50000,       # console log every N steps (0 = off)
+    eval_interval             = 5000,      # periodic validation every N steps (0 = off)
+    checkpoint_interval       = 15001,     # save a resumable checkpoint every N steps (0 = off)
 
-    use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF)
-    ema_decay                 = 0.999,     # EMA decay in (0,1); only read when use_ema=True
+    use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF = pure
+                                           # path: model is the last SGD iterate). ON: eval/best-save/final
+                                           # model use the running average s <- ema_decay*s + (1-ema_decay)*theta
+    ema_decay                 = 0.95,     # EMA decay in (0,1); only read when use_ema=True
+
+    ############################################################
+    #   Tier-1/Tier-2 improvement toggles (2026-07-05)
+    #   docs/2026-07-05-improvement-ideas.md -- ALL default OFF
+    #   (byte-identical to the pre-toggle build when left as-is)
+    ############################################################
+
+    # --- E-step update rule ---
+    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
+                                             # coordinate minimizer at frozen beta: precision fusion in ONE
+                                             # iteration, same cost; kernel route only)
+    mm_damping                = 1.0,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
+
+    # --- randomized-depth E-step (recurrent-depth recipe) ---
+    randomize_e_steps         = False,       # training forwards sample T ~ Uniform{e_steps_min..e_steps_max}
+    e_steps_min               = 1,
+    e_steps_max               = 3,
+    e_steps_backprop_last     = 0,           # truncated backprop: no_grad all but the last k iterations (0 = OFF)
+    e_step_halt_tol           = None,        # eval halting: break when mean KL(q^t||q^{t-1}) < tol (None = OFF)
+
+    # --- decode / objective ---
+    decode_unigram_prior      = False,       # add kappa*log pi_v (corpus unigram, data statistic) to decode logits
+    unigram_kappa             = 1.0,         # tempering on log pi_v (1.0 = exact Bayes class prior)
+    
+    # decode_mode "expected_likelihood_chunked" is also new: sigma-aware Gaussian-convolution readout
+    # log N(mu_q; mu_v, Sigma_q + Sigma_v) - select it above under use_prior_bank=True.
+    untie_decode_bank         = False,       # use_prior_bank=True only: decode reads its OWN cloned (V,K) tables
+    z_loss_weight             = 0,           # z-loss on the decode partition: w * mean(logsumexp^2) (0 = OFF)
+    sigma_weight_decay        = None,        # AdamW decay for log-variance tables (None = inherit weight_decay;
+                                             # 0.0 exempts sigma from the unintended log-sigma->0 pull)
+
+    # --- attention / coupling ---
+    gamma_as_beta_prior       = True,        # fold DETACHED gamma posterior into beta's prior (h->s->p->q);
+                                             # needs lambda_gamma > 0
+    gamma_prior_weight        = 0.5,         # mixture weight w in [0,1]: pi = (1-w) softmax(B) + w gamma
+    lambda_twohop             = 0.0,         # two-hop coupling F2 = lam2 sum_ik (beta@beta)_ik KL_ik (0 = OFF;
+                                             # exact composed transport, effective depth 2 at L=1)
+    query_adaptive_tau        = False,       # per-query tau_i = tau_h (1 + c tr_h Sigma_i / d_h), detached
+    query_tau_c               = 1.0,         # strength c >= 0 (read only when query_adaptive_tau=True)
+    # New attention priors (select above): "causal_noself" / "causal_alibi_noself" mask the E_ii ~ 0
+    # self-edge attention sink (diagonal -inf except (0,0)).
+
+    # --- training mechanics ---
+    grad_clip_per_role        = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
+                                             # (global is phi-dominated and silently rescales other roles)
+    skip_belief_sigma_update  = True,        # skip the belief-channel sigma E-step update (dead-compute ablation
+                                             # for linear-decode configs; user asserts sigma has no consumer)
+
+    # --- compute reclamation (exactness-preserving perf; default OFF) ---
+    transport_mean_per_head   = False,       # per-head transport_mean einsum (~n_heads x fewer FLOPs, allclose 1e-6)
+    exp_fp64_mode             = "dim",       # "dim" (long-standing: fp64 when block dim >= 20) | "norm" (fp64 only
+                                             # when clamped ||M||_F >= exp_fp64_norm_threshold; d_head=25 blocks
+                                             # currently run fp64 PERMANENTLY under "dim")
+    exp_fp64_norm_threshold   = 15.0,        # "norm" mode threshold
+    share_refine_s_transport  = True,        # build the flat transport ONCE per forward, share s-refine + belief
+                                             # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
+    compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
+
 )
     
 
@@ -680,10 +767,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         ],
     },
 
-    "sigma_max": {  # E1 / EXP-20: does the SPD variance ceiling ever bind? (read guard_sigma_ceil_frac)
-        "description": "SPD variance ceiling sigma_max (binding vs slack) [E1/EXP-20]",
-        "param": "sigma_max", "values": [5.0, 10.0, 100.0],
-    },
+    
 
     "e_mu_q_trust": {  # E3 / EXP-24: mean trust region as a stability guard. The endpoint is the
         # NaN/loss-spike rate (nonfinite_frac, already logged per eval), NOT PPL -- it is near-inert at
@@ -894,17 +978,17 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === belief-table init scales (PriorBank) ===============================
     "mu_init_std": {
         "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
-        "param": "mu_init_std", "values": [0.010, 0.04, 0.06, 0.065, 0.070],
+        "param": "mu_init_std", "values": [0.010, 0.04, 0.06, 0.075, 0.1],
     },
     
     "sigma_init": {
         "description": "constant initial coordinate variance of the prior table (>0)",
-        "param": "sigma_init", "values": [1, 3.5, 4, 4.5],
+        "param": "sigma_init", "values": [0.5, 1, 2, 3, 4],
     },
     
     "phi_scale": {
         "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
-        "param": "phi_scale", "values": [0.01, 0.03, 0.05, 0.06, 0.07, 0.09],
+        "param": "phi_scale", "values": [0.01, 0.03, 0.05, 0.07, 0.09, 0.125],
     },
     
 
@@ -923,20 +1007,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "lambda_beta": {
         "description": "belief-coupling block weight (1.0 = pure F)",
-        "param": "lambda_beta", "range": [0, 2, 0.1],
+        "param": "lambda_beta", "values": [0, 0.25, 0.5, 0.75, 1, 2],
     },
     
     
     
     "lambda_gamma": {
         "description": "model-channel coupling weight (>0 creates s tables)",
-        "param": "lambda_gamma", "values": [0.7, 0.8],
+        "param": "lambda_gamma", "values": [0, 0.25, 0.5, 0.75, 0.85],
     },
     
     
     "lambda_h": {
         "description": "hyper-prior weight lambda_h * mean_i KL(s_i||r) (>0 creates s/r tables)",
-        "param": "lambda_h", "values": [0.245, 0.255],
+        "param": "lambda_h", "values": [0.0, 0.2, 0.25, 0.4, 0.75, 1],
     },
     
     
@@ -1022,7 +1106,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "e_q_mu_lr": {
        "description": "E-step natural-gradient step size for mu_q",
-       "param": "e_q_mu_lr", "values": [0.7, 0.9],
+       "param": "e_q_mu_lr", "values": [0.5, 0.7, 0.9, 1],
     },
    
     "e_q_sigma_lr": {
@@ -1043,35 +1127,38 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
     "m_p_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_p_mu_lr", "values": [0.0149, 0.0151],
+        "param": "m_p_mu_lr", "values": [0.005, 0.015, 0.016, 0.017, 0.025],
     },
     
     "m_p_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_p_sigma_lr", "range": [0.002, 0.005, 0.0005],
+        "param": "m_p_sigma_lr", "values": [0.002, 0.003, 0.0035, 0.004, 0.01],
     },
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.0149, 0.0151],
+        "param": "m_phi_lr", "values": [0.0025, 0.01, 0.0125, 0.013, 0.015, 0.025],
     },
     
     
     
     
-    
+    "sigma_max": {  # E1 / EXP-20: does the SPD variance ceiling ever bind? (read guard_sigma_ceil_frac)
+        "description": "SPD variance ceiling sigma_max (binding vs slack) [E1/EXP-20]",
+        "param": "sigma_max", "values": [20, 30, 40],
+    },
     
     
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "values": [0.01, 0.015, 0.02, 0.025, 0.03],
+        "param": "weight_decay", "values": [0.005, 0.015, 0.035, 0.05, 0.075],
     }, 
    
     
     
     "phi_weight_decay":{
         "description": "weight decay on phi",
-        "param": "phi_weight_decay", "range": [0.01, 0.1, 0.01],
+        "param": "phi_weight_decay", "values": [0.005, 0.015, 0.035, 0.05, 0.075, 0.1],
     },
 
     
@@ -1101,9 +1188,7 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
     
-    
-    "b0_h",
-    "c0_h",
+   
   #"gauge_transport",
  # "attention_entropy",
  # "gauge_equivariance",
@@ -1113,49 +1198,48 @@ SWEEP_ORDER: List[str] = [
  # "n_e_steps_em",
  # "gauge_mstep_optim",
   
- #"m_phi_lr_natgrad",   havent run 
+  #"m_phi_lr_natgrad",   havent run 
  
  # "pos_extrapolation",
  # "rho_handoff",
-  
-  
+   
   #"kappa_beta_per_head",
   
   # "precision_attention_b0",
   # "decode_tau",
   # "lambda_alpha",
+  
+ # "sigma_max",
+  "weight_decay",
+  "phi_weight_decay",
+    
+    "mu_init_std",
+    "phi_scale",
+    "sigma_init", 
    
-  # "lambda_h",
- #  "lambda_beta",
-  # "lambda_gamma",
+    "lambda_beta",
+    "lambda_gamma",
+   "lambda_h",
+   # "renyi_order",
+   # "lambda_alpha",
+   "e_mu_q_trust",
+   
+   "e_s_mu_lr",
+   "e_q_mu_lr",
+    
+   #"e_q_sigma_lr",
+
+    #"pos_phi_scale",  
+   
+   "m_phi_lr",
+   "m_p_mu_lr",
+   "m_p_sigma_lr",
    
   # "kappa_beta",
   # "kappa_gamma",   
-  
-    # "e_s_mu_lr",
-   
-   # "m_phi_lr",
-   # "m_p_mu_lr",
-   # 
     
-  #  "n_e_steps",
-    
-  # "weight_decay",
-    
-  #   "mu_init_std",
-  #  "phi_scale",
-  #  "sigma_init", 
-   
-   # "renyi_order",
-  # "lambda_alpha",
-   # "e_q_mu_lr",
-  #  "phi_weight_decay",
-  #   "m_p_sigma_lr",
-   #"e_q_sigma_lr",
-
-  #  "pos_phi_scale",   
-  #  "mass_phi",
-#  "mstep_self_coupling_weight",
+   # "mass_phi",
+   # "mstep_self_coupling_weight",
     
     
 ]
@@ -1343,7 +1427,7 @@ def get_loader(
 # SINGLE-RUN EXECUTOR
 # =============================================================================
 
-def _seed_everything(seed: int, deterministic: bool = False) -> None:
+def _seed_everything(seed: int, deterministic: bool = True) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)

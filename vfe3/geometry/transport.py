@@ -738,7 +738,7 @@ def _direct_link_dense_bytes(batch: int, n_tok: int, k: int, dtype: torch.dtype)
 # exp(max_norm*M/||M||_F), NOT exp(M). Exported so the M-step drift monitor
 # (train._warn_phi_transport_clamp) trips at the SAME norm the clamp fires at -- the two cannot
 # diverge (audit 2026-07-06 M2).
-TRANSPORT_CLAMP_MAX_NORM: float = 15.0
+TRANSPORT_CLAMP_MAX_NORM: float = 20.0
 
 
 def stable_matrix_exp_pair(

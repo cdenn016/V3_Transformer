@@ -386,7 +386,7 @@ def retract_glk(
     *,
     step_size:    float = 1.0,
     trust_region: float = 0.1,            # tighter than SO(N): GL(K) is non-compact
-    max_norm:     float = 5.0,            # bounds singular values to ~[e^-5, e^5]
+    max_norm:     float = 10.0,            # bounds singular values to ~[e^-5, e^5]
     eps:          float = 1e-6,
     order:        int   = 4,
     mode:         str   = "euclidean",

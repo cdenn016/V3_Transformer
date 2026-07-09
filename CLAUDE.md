@@ -36,7 +36,14 @@ This V3 is a production quality gauge-theoretic VFE transformer that allows clea
   default OFF, created only when a T5 channel is active, init to the fixed `-log1p(bucket)` table so
   step 0 is byte-identical). Unlike (2)/(3) this bias is a scalar function of position OFFSET only and
   touches no gauge transport, so it does NOT break gauge equivariance — the cleanest exception. Like
-  the E-step-coupled params above it carries a `detach_e_step` freeze footgun. (`learnable_r`,
+  the E-step-coupled params above it carries a `detach_e_step` freeze footgun. (5)
+  `learnable_kappa_beta=True` / `learnable_kappa_gamma=True` learn the per-irrep-block softmax
+  temperatures as `kappa = exp(log_kappa_beta/gamma)` (raw `(len(irrep_dims),)` nn.Parameters, init
+  `log(cfg.kappa_*)` so step 0 is byte-identical; `exp` keeps tau > 0). Like (4) a per-block scalar
+  temperature multiplies the gauge-invariant per-block energy and touches no gauge transport, so
+  equivariance is preserved; `log_kappa_beta` (and `log_kappa_gamma` under `s_e_step`) carries the
+  same `detach_e_step`/`straight_through` freeze footgun (`kappa_gamma` on the scored
+  `lambda_gamma>0` path trains under any estimator). (`learnable_r`,
   `pos_phi='learned'` are the other default-OFF learned-scalar/table toggles in the same family.)
 - NO CLI arg parsing; entry points are click-to-run (edit config dicts, then run).
 - float32 throughout; CUDA where applicable (user has an RTX 5090).
@@ -76,6 +83,23 @@ finite-difference gradient checks against the autograd-of-F oracle (later
 phases); property tests (non-negativity, self-divergence zero, gauge
 equivariance). Tests are device-agnostic (default CPU; set
 VFE3_TEST_DEVICE=cuda for the GPU).
+
+### Tests are CPU-bound and MUST be SMALL — use K < 6 (MANDATORY)
+- **Every test runs CPU-bound by default.** Tests instantiate TINY models. Cost scales
+  steeply in the belief dimension `K` (dense `(K,K)` transports, `K x K` gauge generators,
+  SPD `Sigma` ops), so a large-`K` model that trains fine on the RTX 5090 will HANG a
+  CPU test run for effectively forever.
+- **ALWAYS use small `K < 6` for CPU-bound tests** (`K = 2`, `3`, or `4` is the norm; the
+  golden kernels are pinned at these sizes). Keep every other dim tiny too: sequence length,
+  batch, `n_heads`, `n_layers`, `n_gen`, vocab — all single digits. A unit test should
+  finish in well under a second.
+- **NEVER run a production-scale model inside a test.** A `K = 200` (or any K in the tens or
+  hundreds) model under a CPU test does NOT "run slowly" — it will take millions of years and
+  never return. Production/scaling configs (`train_vfe3.py`, `scaling.py`) belong on the GPU,
+  NOT in the test suite. If you need to exercise a big-`K` path, do it as an explicit GPU run,
+  never as a pytest.
+- **Before running any test that builds a model, check the `K` (and every other dim) in its
+  config.** If `K >= 6`, it is not a CPU test — shrink it or move it to the GPU.
 
 ### Tooling & verification discipline (MANDATORY)
 - **Pass counts come from a machine-readable source, never from memory.** `pyproject.toml`
