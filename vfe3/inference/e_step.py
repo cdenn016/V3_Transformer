@@ -471,6 +471,7 @@ def phi_alignment_loss(
     rope_on_value:             bool  = True,          # False -> value aggregation uses the un-rotated base
 
     rope:         Optional[torch.Tensor] = None,      # (N,K,K) gauge-RoPE rotation (None -> off)
+    reflection:   Optional[torch.Tensor] = None,      # (N,) per-token sign s_i; None -> connected component
     log_prior:    Optional[torch.Tensor] = None,
     connection_W: Optional[torch.Tensor] = None,      # learned regime_ii connection (held fixed here)
     connection_M: Optional[torch.Tensor] = None,      # learned regime_ii_covariant connection (Route B; held fixed here)
@@ -486,8 +487,11 @@ def phi_alignment_loss(
     penalty, so the effective phi step is e_phi_lr * lambda_beta * nabla (lambda_beta and e_phi_lr
     interact). The ``mass_phi`` term makes the phi E-step descend the PENALIZED
     objective during inference (distinct from the outer M-step ||phi||^2 on the learned prior
-    table). The canonical (entropy) branch reuses ``reduced_free_energy``, the -tau log Z envelope
-    form.
+    table). The coherent canonical branch reuses ``reduced_free_energy``, the -tau log Z envelope
+    form. When RoPE is present with ``on_value=False``, beta instead comes from the rotated score
+    energy while the coupling sum uses the unrotated base-transport value energy; beta remains live
+    because it is not stationary for that decoupled block. ``reflection`` folds the belief's
+    discrete sheet into either transport before its energy is evaluated.
     """
     # Build Omega under the ACTIVE connection regime so the phi step descends the SAME objective as
     # the mu/sigma step. regime_ii reads the (fixed) belief means mu and the learned connection_W;
@@ -497,6 +501,7 @@ def phi_alignment_loss(
     # phi-gradient is preserved while the per-iteration dense (N,N,K,K) Omega disappears on the
     # flat equal-blocks path.
     omega = build_belief_transport(phi, group, transport_mode=transport_mode, mu=mu, sigma=sigma,
+                                   reflection=reflection,
                                    connection_W=connection_W, connection_M=connection_M,
                                    connection_L=connection_L, link_alpha=link_alpha,
                                    link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
@@ -505,13 +510,27 @@ def phi_alignment_loss(
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma)
     fam = get_family(family)
-    energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=renyi_order, kl_max=kl_max, eps=eps,
-                             divergence_family=divergence_family, irrep_dims=group.irrep_dims)
+    score_energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=renyi_order,
+                                   kl_max=kl_max, eps=eps, divergence_family=divergence_family,
+                                   irrep_dims=group.irrep_dims)
     mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0
+    if isinstance(omega, RopeTransport) and not omega.on_value:
+        mu_tv = transport_mean(omega.base, mu)
+        sigma_tv = transport_covariance(omega.base, sigma)
+        value_energy = pairwise_energy(fam(mu, sigma), fam(mu_tv, sigma_tv), alpha=renyi_order,
+                                       kl_max=kl_max, eps=eps, divergence_family=divergence_family,
+                                       irrep_dims=group.irrep_dims)
+        zero = score_energy.new_zeros(score_energy.shape[:-1])
+        return free_energy(
+            zero, score_energy, zero,
+            tau=tau, lambda_beta=lambda_beta,
+            include_attention_entropy=include_attention_entropy,
+            log_prior=log_prior, coupling_energy=value_energy,
+        ) + mass
     if include_attention_entropy:
-        return lambda_beta * reduced_free_energy(energy, tau=tau, log_prior=log_prior).sum() + mass
-    beta = attention_weights(energy, tau=tau, log_prior=log_prior)
-    return lambda_beta * (beta * energy).sum() + mass
+        return lambda_beta * reduced_free_energy(score_energy, tau=tau, log_prior=log_prior).sum() + mass
+    beta = attention_weights(score_energy, tau=tau, log_prior=log_prior)
+    return lambda_beta * (beta * score_energy).sum() + mass
 
 
 def e_step_iteration(
@@ -616,6 +635,7 @@ def e_step_iteration(
                 # filtering -- the same coordinate-ascent split as mu/mu_key) so autograd sees
                 # d Omega/d sigma on every path, not only the live unroll (audit 2026-07-01 C4).
                 sigma=sigma_q, sigma_key=sigma_k, connection_M=connection_M,
+                reflection=belief.reflection,
                 cocycle_relaxation=cocycle_relaxation, clamp_monitor=clamp_monitor,
                 rope=rope, rope_on_cov=rope_on_cov,
                 rope_on_value=rope_on_value,
@@ -822,6 +842,7 @@ def e_step_iteration(
                 # mu/sigma step, else under pos_rotation='rope' + e_phi_lr>0 phi optimizes a different
                 # free energy than mu/sigma (audit 2026-06-17 round 2 id15). None/off -> byte-identical.
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                reflection=belief.reflection,
                 # INTENTIONAL asymmetry (audit 2026-06-09 D3): connection_W is detached here, so
                 # the learned Regime-II connection trains ONLY through the mu/sigma belief path,
                 # never through the phi-step autograd island (whose grad is a constant tangent to

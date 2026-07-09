@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 import torch
 
+from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.families.gaussian import DiagonalGaussian
 from vfe3.free_energy import (
@@ -12,9 +13,12 @@ from vfe3.free_energy import (
     pairwise_energy,
     self_divergence_for_alpha,
 )
+from vfe3.geometry.groups import get_group
+from vfe3.geometry.rope import build_rope_rotation
 from vfe3.geometry.transport import transport_covariance, transport_mean
 from vfe3.gradients.kernels import belief_gradients, mm_exact_update
 from vfe3.gradients.oracle import belief_gradients_autograd
+from vfe3.inference.e_step import free_energy_value, phi_alignment_loss
 from vfe3.metrics import compute_metrics, free_energy_terms
 from vfe3.model.model import VFEModel
 
@@ -275,3 +279,78 @@ def test_diagnostics_threads_all_active_objective_terms(monkeypatch: pytest.Monk
     assert diagnostics["observation_likelihood"] == seen[0]["terms"]["observation_likelihood"]
     assert per_layer["twohop_coupling"][0] == seen[1]["terms"]["twohop_coupling"]
     assert per_layer["observation_likelihood"][0] == seen[1]["terms"]["observation_likelihood"]
+
+
+def test_phi_gradient_matches_scalar_f_under_decoupled_rope() -> None:
+    torch.manual_seed(29)
+    n, k = 3, 4
+    group = get_group("glk")(k)
+    mu = torch.randn(n, k, dtype=torch.float32)
+    sigma = torch.rand(n, k, dtype=torch.float32) + 0.6
+    mu_p = torch.randn(n, k, dtype=torch.float32)
+    sigma_p = torch.rand(n, k, dtype=torch.float32) + 0.6
+    phi = 0.2 * torch.randn(n, group.generators.shape[0], dtype=torch.float32)
+    rope = build_rope_rotation(
+        torch.arange(n), group.irrep_dims, base=10.0,
+        device=phi.device, dtype=phi.dtype,
+    )
+    log_prior = torch.randn(n, n, dtype=torch.float32)
+    tau = 1.3
+    lambda_beta = 0.7
+
+    phi_loss = phi.clone().requires_grad_(True)
+    loss = phi_alignment_loss(
+        mu, sigma, phi_loss, group,
+        tau=tau, lambda_beta=lambda_beta, log_prior=log_prior,
+        rope=rope, rope_on_value=False,
+    )
+    grad_loss, = torch.autograd.grad(loss, phi_loss)
+
+    phi_scalar = phi.clone().requires_grad_(True)
+    scalar = free_energy_value(
+        BeliefState(mu=mu, sigma=sigma, phi=phi_scalar),
+        mu_p, sigma_p, group,
+        tau=tau, lambda_beta=lambda_beta, log_prior=log_prior,
+        rope=rope, rope_on_value=False,
+    )
+    grad_scalar, = torch.autograd.grad(scalar, phi_scalar)
+
+    torch.testing.assert_close(grad_loss, grad_scalar, atol=2e-5, rtol=2e-5)
+
+
+def test_phi_gradient_matches_scalar_f_with_mixed_reflection() -> None:
+    torch.manual_seed(31)
+    n, k = 3, 4
+    group = get_group("glk")(k)
+    mu = torch.randn(n, k, dtype=torch.float32)
+    sigma = torch.rand(n, k, dtype=torch.float32) + 0.6
+    mu_p = torch.randn(n, k, dtype=torch.float32)
+    sigma_p = torch.rand(n, k, dtype=torch.float32) + 0.6
+    phi = 0.2 * torch.randn(n, group.generators.shape[0], dtype=torch.float32)
+    reflection = torch.tensor([1.0, -1.0, 1.0], dtype=torch.float32)
+    rope = build_rope_rotation(
+        torch.arange(n), group.irrep_dims, base=10.0,
+        device=phi.device, dtype=phi.dtype,
+    )
+    log_prior = torch.randn(n, n, dtype=torch.float32)
+    tau = 1.1
+    lambda_beta = 0.8
+
+    phi_loss = phi.clone().requires_grad_(True)
+    loss = phi_alignment_loss(
+        mu, sigma, phi_loss, group,
+        tau=tau, lambda_beta=lambda_beta, log_prior=log_prior,
+        rope=rope, rope_on_value=False, reflection=reflection,
+    )
+    grad_loss, = torch.autograd.grad(loss, phi_loss)
+
+    phi_scalar = phi.clone().requires_grad_(True)
+    scalar = free_energy_value(
+        BeliefState(mu=mu, sigma=sigma, phi=phi_scalar, reflection=reflection),
+        mu_p, sigma_p, group,
+        tau=tau, lambda_beta=lambda_beta, log_prior=log_prior,
+        rope=rope, rope_on_value=False,
+    )
+    grad_scalar, = torch.autograd.grad(scalar, phi_scalar)
+
+    torch.testing.assert_close(grad_loss, grad_scalar, atol=2e-5, rtol=2e-5)
