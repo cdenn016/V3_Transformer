@@ -346,3 +346,130 @@ def test_phi_train_seam_gated_and_cadence(monkeypatch):
     _maybe_metropolis_omega(m, tok, step=2, generator=gen); assert calls["n"] == 2
     m.cfg.phi_reflection = "off"                                      # off -> never
     _maybe_metropolis_omega(m, tok, step=0, generator=gen); assert calls["n"] == 2
+
+
+# --------------------------------------------------------------------------------------------------
+# Task 5: end-to-end capstone -- full-scope gamma-on finite forward, det<0 reachability + use, and
+# gauge invariance with phi_reflection configured. Mirrors the omega_direct Phase-3 capstone in
+# tests/test_omega_direct.py: test_omega_direct_user_target_config_finite_forward and
+# test_omega_direct_full_model_gauge_invariance_gamma_on. TEST-ONLY: no source changes.
+# --------------------------------------------------------------------------------------------------
+
+def test_phi_reflection_gamma_on_full_scope_finite_forward():
+    """CAPSTONE: gauge_parameterization='phi' + phi_reflection='metropolis' with the FULL gamma /
+    model-coupling (s) channel ON (lambda_gamma>0, s_e_step=True, gamma_as_beta_prior=True,
+    prior_source='model_channel') constructs and runs to a FINITE forward -- proving the reflection is
+    threaded through EVERY channel (belief E-step, decode, gamma coupling, s E-step) with NO gate, the
+    phi-path analogue of omega_direct's test_omega_direct_user_target_config_finite_forward.
+
+    Deviation from the literal brief: the brief specified family='gaussian_full'/decode_mode='full',
+    but s_e_step=True unconditionally requires a DIAGONAL family regardless of gauge_parameterization
+    or phi_reflection -- config.py raises "s_e_step=True refines the model channel as a DIAGONAL
+    Gaussian (the s/r tables are diagonal by construction), incompatible with family='gaussian_full'"
+    at construction (verified empirically: it raises before phi_reflection is ever exercised). This is
+    the SAME pre-existing, orthogonal constraint that forces omega_direct's own capstone onto
+    gaussian_diagonal; using it here too isolates the phi_reflection integration question this test is
+    actually meant to answer. use_prior_bank=True routes decode through the KL-to-prior kernel (the
+    pure path this feature targets -- the raw dataclass default is False, the linear-decode ablation,
+    under which decode_mode is silently ignored and the converged covariance never reaches the logits)."""
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(phi_reflection="metropolis", lambda_gamma=0.75, s_e_step=True,
+                      gamma_as_beta_prior=True, prior_source="model_channel",
+                      family="gaussian_diagonal", decode_mode="diagonal", use_prior_bank=True,
+                      vocab_size=6, max_seq_len=4, n_layers=1))
+    m.eval()
+    tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
+    assert torch.isfinite(m(tok)[0]).all()
+
+
+def test_phi_reflection_det_negative_reachable_and_used_end_to_end():
+    """det<0 reachable + USED end-to-end. family='gaussian_full' (+ use_prior_bank=True,
+    decode_mode='full', the KL-to-prior decode) so the reflection bites the COVARIANCE, not just the
+    mean -- under gaussian_diagonal the fold leaves the (squared) diagonal congruence exactly
+    invariant (spec sec 1 efficacy caveat: "the reflection bites only through the mean, sign of
+    component 0, not the covariance"), which would make this test near-vacuous.
+
+    Flipping reflection_sign for a subset of tokens changes the decode logits (the reflection is used
+    through the FULL forward: encode -> belief E-step -> decode), and the effective per-token frame
+    R_i . exp(phi_i) -- built independently from the model's own phi table and group generators, NOT
+    via build_belief_transport -- has det<0 for a reflected token."""
+    from vfe3.geometry.generators import reflection_element
+    K, V, N = 4, 6, 4
+    m = VFEModel(_cfg(phi_reflection="metropolis", family="gaussian_full", decode_mode="full",
+                      use_prior_bank=True, vocab_size=V, max_seq_len=N, n_layers=1))
+    m.eval()
+    tok = torch.randint(0, V, (1, N), generator=torch.Generator().manual_seed(2))
+
+    with torch.no_grad():
+        m.prior_bank.reflection_sign.fill_(1.0)                         # identity sheet everywhere
+        logits_a = m(tok)[0].clone()
+        m.prior_bank.reflection_sign[tok[0, 1].item()] = -1.0           # reflect a subset of tokens
+        m.prior_bank.reflection_sign[tok[0, 2].item()] = -1.0
+        logits_b = m(tok)[0].clone()
+    assert not torch.allclose(logits_a, logits_b, atol=1e-6), \
+        "reflection sign flip left the decode logits unchanged -- reflection not used end-to-end"
+
+    # The effective frame R_i . exp(phi_i) has det<0 for the reflected token at position 1, built
+    # directly (independent of build_belief_transport) from the model's own phi table and generators.
+    enc     = m.prior_bank.encode(tok)                                  # raw (unreflected) phi lookup
+    R       = reflection_element(K)
+    phi_i   = enc.phi[0, 1]
+    exp_phi = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", phi_i, m.group.generators))
+    assert torch.det(R @ exp_phi) < 0.0
+
+
+def test_phi_reflection_full_model_gauge_invariance_gamma_on():
+    """Gauge-COVARIANCE regression guard, the phi-path analogue of omega_direct's
+    test_omega_direct_full_model_gauge_invariance_gamma_on: with the gamma / model-coupling (s)
+    channel ON (lambda_gamma>0, s_e_step=True, gamma_as_beta_prior=True,
+    prior_source='model_channel') and phi_reflection='metropolis' configured, a global ORTHOGONAL
+    gauge transform g of the tied prior tables (mu_embed, s_mu_embed, r_mu) leaves the decode logits
+    invariant to fp64.
+
+    HONEST FRAMING (mandatory): a gauge-INVARIANCE test certifies COVARIANCE -- that no
+    gauge-breaking term was introduced by threading phi_reflection through the gamma/s channel -- it
+    does NOT by itself certify the reflection is USED. Frame-use is pinned separately by the Task 2/3/4
+    tests: test_gamma_coupling_term_uses_reflection, test_refine_s_uses_reflection,
+    test_free_energy_value_reflects, and the Metropolis exact-DeltaF anchor
+    test_phi_exact_delta_f_matches_independent_recompute.
+
+    The reflection co-transform is EMPIRICALLY INERT here, exactly as it was for omega_direct's
+    diagonal-family gamma-on sibling: phi_embed is zeroed (Omega_ij = I for every pair, frame-blind),
+    and reflection_sign is left at its construction-time default (all +1 -- 'metropolis' seeds no
+    tokens, unlike 'init_seed'), so R_i = I for every token and the fold R_i Omega_ij R_j collapses to
+    the identity transport regardless of g. Unlike omega_direct's omega_embed (a genuine per-token
+    GL(K) frame table that CAN be co-transformed, U -> gU), reflection_sign is a DISCRETE +/-1 buffer:
+    there is no continuous action of g on it to co-transform in the first place, so this test does not
+    (and structurally cannot, for a generic continuous g) exercise a nontrivial reflection pattern -- it
+    is left at the default identity sheet and simply not touched. This test therefore certifies only
+    that phi_reflection's presence in the config does not break the gamma+s pipeline's gauge
+    covariance; it says nothing about whether the reflection bites."""
+    from vfe3.geometry.generators import generate_son
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(phi_reflection="metropolis", lambda_gamma=0.75, s_e_step=True,
+                      gamma_as_beta_prior=True, prior_source="model_channel",
+                      family="gaussian_diagonal", decode_mode="diagonal", use_prior_bank=True,
+                      vocab_size=6, max_seq_len=4, n_layers=1))
+    with torch.no_grad():
+        m.prior_bank.phi_embed.zero_()                                   # frames -> identity (Omega = I)
+        m.prior_bank.sigma_log_embed.zero_()                             # belief Sigma = I
+        m.prior_bank.s_sigma_log_embed.zero_()                           # model-channel Sigma = I
+        m.prior_bank.r_sigma_log.zero_()                                 # hyper-prior Sigma = I
+        m.prior_bank.r_mu.copy_(torch.tensor([0.1, -0.2, 0.15, -0.05]))  # nonzero r_mu, co-transform not vacuous
+        if hasattr(m, "pos_phi_free"):
+            m.pos_phi_free.zero_()
+    m = m.double()
+    m.eval()
+    gen_so = generate_son(4).to(torch.float64)                          # skew -> matrix_exp is orthogonal
+    c = 0.3 * torch.randn(gen_so.shape[0], generator=torch.Generator().manual_seed(1)).to(gen_so.dtype)
+    g = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", c, gen_so))   # g in O(4): g g^T = I
+    eye = torch.eye(4, dtype=g.dtype)
+    assert torch.allclose(g @ g.transpose(-1, -2), eye, atol=1e-6)      # so(4) => g orthogonal
+    tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
+    with torch.no_grad():
+        l0 = m(tok)[0].clone()
+        m.prior_bank.mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.mu_embed))
+        m.prior_bank.s_mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.s_mu_embed))
+        m.prior_bank.r_mu.copy_(g @ m.prior_bank.r_mu)
+        l1 = m(tok)[0].clone()
+    assert float((l0 - l1).abs().max()) < 1e-5
