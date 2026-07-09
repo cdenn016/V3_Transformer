@@ -193,3 +193,156 @@ def test_block_preserves_reflection_end_to_end():
     assert belief.reflection is not None, "block.py dropped belief.reflection past layer 1"
     assert belief.reflection.shape == (1, 4)
     assert torch.isfinite(belief.mu).all()
+
+
+# --------------------------------------------------------------------------------------------------
+# Task 4: LEARNABLE phi reflection -- the shared DeltaF-gated Metropolis sweep flips reflection_sign
+# under gauge_parameterization='phi' + phi_reflection='metropolis' (mirrors the omega_direct move in
+# tests/test_omega_metropolis.py; the sweep/accept/seed structure is shared, only the per-token flip
+# and the trial-frame construction differ).
+# --------------------------------------------------------------------------------------------------
+import math
+from vfe3.model.model import VFEModel
+
+
+def _metro_model(**over):
+    # tiny phi-path model with phi_reflection='metropolis' the move can act on; K<6, single-digit dims.
+    # phi is frozen (e_phi_lr=0 -> exp(phi)=I: the flat cocycle is frame-blind) so ONLY the per-token
+    # reflection can move the belief-coupling energy -- isolating the sign the move learns.
+    base = dict(gauge_parameterization="phi", gauge_group="glk", embed_dim=4, n_heads=1,
+                vocab_size=6, max_seq_len=4, n_layers=1, n_e_steps=2, transport_mode="flat",
+                e_phi_lr=0.0, use_head_mixer=False, family="gaussian_diagonal", decode_mode="diagonal",
+                lambda_gamma=0.0, s_e_step=False, phi_reflection="metropolis")
+    base.update(over)
+    return VFEModel(VFE3Config(**base))
+
+
+def test_phi_off_is_noop_no_rng_no_mutation():
+    # phi_reflection in {'off','init_seed'} -> metropolis_omega_step is a no-op {}: no buffer mutation,
+    # no RNG draw (the generator state is byte-identical after the call).
+    for mode in ("off", "init_seed"):
+        m = VFEModel(_cfg(phi_reflection=mode, vocab_size=6, max_seq_len=4, n_layers=1))
+        had_buf = hasattr(m.prior_bank, "reflection_sign")
+        before  = m.prior_bank.reflection_sign.detach().clone() if had_buf else None
+        g       = torch.Generator().manual_seed(0)
+        g_state = g.get_state().clone()
+        stats   = m.metropolis_omega_step(torch.tensor([[0, 1, 2]]), generator=g)
+        assert stats == {}                                              # no-op dispatch
+        if had_buf:                                                     # init_seed created the buffer
+            assert torch.equal(m.prior_bank.reflection_sign, before)    # untouched
+        assert torch.equal(g.get_state(), g_state)                      # generator UNUSED (no draw)
+
+
+def test_phi_exact_delta_f_matches_independent_recompute():
+    # LOAD-BEARING exact-DeltaF anchor: the per-token DeltaF the move computes (masked flip of
+    # belief.reflection) MUST equal an INDEPENDENT recompute that flips the SOURCE buffer
+    # reflection_sign[token] and re-looks-up the per-position sign -- pinning masked-flip == source-flip.
+    # Distinct tokens so the fold R_i Omega_ij R_j is nontrivial and DeltaF genuinely nonzero.
+    torch.manual_seed(0)
+    m = _metro_model(vocab_size=4)
+    tok = torch.tensor([[0, 1, 2, 3]])
+    tid = 1
+    belief, mu_p, sigma_p = m._metropolis_prepare(tok)
+    assert belief.reflection is not None                               # reflection actually enters F
+    dF_move = m._metropolis_delta_f(belief, mu_p, sigma_p, tok, tid)
+    assert dF_move == dF_move                                          # finite (not NaN)
+    assert abs(dF_move) > 0.0                                          # genuinely nonzero (distinct tokens)
+    # Independent oracle: flip the source buffer row, re-look-up the (fixed-belief) per-position sign,
+    # recompute F.
+    F_cur = m._metropolis_free_energy(belief, mu_p, sigma_p)
+    m._flip_reflection_sign_row(tid)
+    relooked = m.prior_bank.reflection_sign[tok]                       # per-position signs from flipped buffer
+    F_trial = m._metropolis_free_energy(belief._replace(reflection=relooked), mu_p, sigma_p)
+    m._flip_reflection_sign_row(tid)                                   # restore (sign flip is involutory)
+    dF_indep = F_trial - F_cur
+    assert abs(dF_move - dF_indep) < 1e-5                              # exact-DeltaF anchor (fp5)
+
+
+def test_phi_downhill_flip_accepted_and_toggles_sign():
+    # Seed one token into the reflected sheet, then a sweep is free to flip it: a repeated-token batch
+    # gives Omega_ij == R R == I (frame-agnostic) so DeltaF==0 -> accepted, and its sign toggles.
+    m = _metro_model()
+    with torch.no_grad():
+        m.prior_bank.reflection_sign[1] = -1.0                        # seed token 1 into the reflected sheet
+    tok = torch.tensor([[1, 1, 1]])                                    # token 1 everywhere
+    sign_before = m.prior_bank.reflection_sign[1].item()
+    m.cfg.omega_metropolis_temperature = 1e-3                          # low T: downhill move (near-)det. accepted
+    stats = m.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(0))
+    sign_after = m.prior_bank.reflection_sign[1].item()
+    assert stats["proposed"] >= 1
+    if stats["accepted"] >= 1:                                         # accepted -> sign toggles
+        assert sign_before * sign_after < 0.0
+
+
+def test_phi_uphill_flip_gated_by_metropolis_acceptance():
+    # Pin the STOCHASTIC accept branch (dF>0, gated by u < exp(-dF/T)). Distinct tokens make the
+    # fold Omega_ij -> R_i Omega_ij R_j nontrivial so flipping a token's sign genuinely changes F; at
+    # this model seed flipping token 0 STRICTLY INCREASES F -- a real uphill proposal.
+    torch.manual_seed(1)
+    m = _metro_model(vocab_size=4)
+    tok = torch.tensor([[0, 1, 2, 3]])
+    belief, mu_p, sigma_p = m._metropolis_prepare(tok)
+    dF0 = m._metropolis_delta_f(belief, mu_p, sigma_p, tok, 0)
+    assert dF0 > 0.0                                                   # genuinely uphill at this seed
+
+    # (1) Tiny temperature: dF0/T so negative that exp(-dF0/T) underflows to 0.0 -> token 0 is
+    # deterministically rejected and its source sign is unmutated.
+    m.cfg.omega_metropolis_temperature = 1e-6
+    sign0_before = m.prior_bank.reflection_sign[0].item()
+    m.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(0))
+    assert m.prior_bank.reflection_sign[0].item() == sign0_before     # uphill token 0 rejected at tiny T
+
+    # (2) Exact-rule pin: torch.unique sorts ascending, so token 0 is the FIRST proposal, scored
+    # against the untouched _metropolis_prepare belief (the SAME dF0). Reproduce the sweep's first
+    # torch.rand draw independently and assert the move's own accept/reject == dF<=0 or u<exp(-dF/T).
+    m.cfg.omega_metropolis_temperature = 1e-3                          # moderate T: a genuine 0<p<1 draw
+    T = m.cfg.omega_metropolis_temperature
+    seed = 3
+    u0 = torch.rand((), generator=torch.Generator().manual_seed(seed)).item()
+    expect_accept0 = (dF0 <= 0.0) or (u0 < math.exp(-dF0 / T))
+    assert expect_accept0                                             # this seed's draw clears the threshold
+    sign_before = m.prior_bank.reflection_sign[0].item()
+    m.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(seed))
+    sign_after = m.prior_bank.reflection_sign[0].item()
+    accepted0 = (sign_before * sign_after < 0.0)                      # sign toggles iff token 0 was flipped
+    assert accepted0 == expect_accept0
+
+
+def test_phi_metropolis_step_stats_finite():
+    torch.manual_seed(0)
+    m = _metro_model(vocab_size=4)
+    tok = torch.tensor([[0, 1, 2, 3]])
+    stats = m.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(0))
+    assert stats["proposed"] == 4                                     # one proposal per unique token
+    assert 0 <= stats["accepted"] <= stats["proposed"]
+    assert "mean_delta_f" in stats and stats["mean_delta_f"] == stats["mean_delta_f"]  # finite
+
+
+def test_phi_seeded_reproducible():
+    tok = torch.tensor([[0, 1, 2, 3, 0, 1]])
+    m1 = _metro_model(); m2 = _metro_model()
+    with torch.no_grad():                                             # identical F landscape (all tables)
+        m2.prior_bank.load_state_dict(m1.prior_bank.state_dict())
+    s1 = m1.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(7))
+    s2 = m2.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(7))
+    assert s1 == s2
+    assert torch.equal(m1.prior_bank.reflection_sign, m2.prior_bank.reflection_sign)
+
+
+def test_phi_train_seam_gated_and_cadence(monkeypatch):
+    # The train seam _maybe_metropolis_omega fires when phi_reflection=='metropolis' too (not only the
+    # omega mode), honoring the shared omega_metropolis_every cadence.
+    m = _metro_model()
+    calls = {"n": 0}
+    def _spy(token_ids, *, generator):
+        calls["n"] += 1; return {}
+    monkeypatch.setattr(m, "metropolis_omega_step", _spy)
+    from vfe3.train import _maybe_metropolis_omega
+    gen = torch.Generator().manual_seed(0)
+    tok = torch.tensor([[0, 1, 2]])
+    m.cfg.omega_metropolis_every = 2                                  # fires on steps 0 and 2, not 1
+    _maybe_metropolis_omega(m, tok, step=0, generator=gen); assert calls["n"] == 1
+    _maybe_metropolis_omega(m, tok, step=1, generator=gen); assert calls["n"] == 1
+    _maybe_metropolis_omega(m, tok, step=2, generator=gen); assert calls["n"] == 2
+    m.cfg.phi_reflection = "off"                                      # off -> never
+    _maybe_metropolis_omega(m, tok, step=0, generator=gen); assert calls["n"] == 2

@@ -564,16 +564,19 @@ def _maybe_metropolis_omega(
     step:      int,
     generator: torch.Generator,          # persistent seeded RNG, threaded across steps
 ) -> None:
-    r"""Gated + cadence-checked call to the omega_direct Metropolis det-sign sweep.
+    r"""Gated + cadence-checked call to the learnable-reflection Metropolis det-sign sweep.
 
-    No-op unless ``cfg.omega_reflection == 'metropolis'``, and even then fires only every
-    ``cfg.omega_metropolis_every`` optimizer steps. Factored out of the training loop so the
-    seam is a single guarded line there (see design spec Sec.4); ``model.metropolis_omega_step``
-    is itself a no-op under any other ``omega_reflection`` mode, so this gate is a fast-path
+    No-op unless a learnable-reflection mode is active -- ``cfg.omega_reflection == 'metropolis'``
+    (omega_direct frame) OR ``cfg.phi_reflection == 'metropolis'`` (phi reflection_sign) -- and even
+    then fires only every ``cfg.omega_metropolis_every`` optimizer steps (the two ``omega_metropolis_*``
+    knobs name the shared move, not the storage, so they govern both modes). Factored out of the
+    training loop so the seam is a single guarded line there (see design spec Sec.4);
+    ``model.metropolis_omega_step`` is itself a no-op under any other mode, so this gate is a fast-path
     short-circuit, not the sole safety net.
     """
     cfg = model.cfg
-    if cfg.omega_reflection == "metropolis" and (step % cfg.omega_metropolis_every == 0):
+    if ((cfg.omega_reflection == "metropolis" or cfg.phi_reflection == "metropolis")
+            and (step % cfg.omega_metropolis_every == 0)):
         model.metropolis_omega_step(token_ids, generator=generator)
 
 

@@ -872,36 +872,65 @@ class VFEModel(nn.Module):
         return belief, logits
 
     # ----------------------------------------------------------------------------------------------
-    # omega_direct learnable det-sign: DeltaF-gated Metropolis flip (fixed-belief block move).
-    # See docs/superpowers/specs/2026-07-08-omega-direct-metropolis-detsign-design.md.
+    # Learnable discrete reflection: DeltaF-gated Metropolis flip (fixed-belief block move). The SAME
+    # sweep learns the det-sign under BOTH parameterizations -- it flips omega_embed under
+    # gauge_parameterization='omega_direct' + omega_reflection='metropolis', or the per-token
+    # reflection_sign buffer under gauge_parameterization='phi' + phi_reflection='metropolis'. Only the
+    # per-token flip and the trial-frame construction differ; the sweep/accept/seed structure is shared.
+    # See docs/superpowers/specs/2026-07-08-omega-direct-metropolis-detsign-design.md (omega) and
+    # docs/superpowers/specs/2026-07-08-phi-reflection-design.md Sec.5 (phi).
     # ----------------------------------------------------------------------------------------------
+    def _reflection_metropolis_mode(self) -> str:
+        r"""Resolve the active learnable-reflection Metropolis mode: ``'omega'`` iff
+        (``gauge_parameterization=='omega_direct'`` and ``omega_reflection=='metropolis'``), ``'phi'``
+        iff (``gauge_parameterization=='phi'`` and ``phi_reflection=='metropolis'``), else ``''`` (no-op).
+
+        The two are mutually exclusive by construction: omega_direct has no ``reflection_sign`` buffer,
+        phi has no ``omega_embed`` frame, and config validation rejects ``omega_reflection=='metropolis'``
+        under phi (so the omega branch here fires exactly when the pre-generalization guard
+        ``omega_reflection=='metropolis'`` did -- byte-identical dispatch on the omega path)."""
+        cfg = self.cfg
+        if cfg.gauge_parameterization == "omega_direct" and cfg.omega_reflection == "metropolis":
+            return "omega"
+        if cfg.gauge_parameterization == "phi" and cfg.phi_reflection == "metropolis":
+            return "phi"
+        return ""
+
     def _metropolis_prepare(
         self,
         token_ids: torch.Tensor,             # (B, N) integer token ids
 
+        *,
+        mode:      Optional[str] = None,     # 'omega' | 'phi'; None -> resolve from cfg
     ) -> 'Tuple[BeliefState, torch.Tensor, torch.Tensor]':
         r"""Converged belief + belief prior for the (fixed-belief) Metropolis det-sign F-eval.
 
-        Runs the belief pipeline once under no_grad and returns the belief carrying the GL(K) frame
-        ``.omega`` the E-step actually minimized (``capture['converged']``, the pre-final_norm
-        converged q*; falls back to the returned post-norm belief if that lacks ``.omega``) together
-        with the encode-time prior means/variances (``capture['prior']``). These are held FIXED across
-        the sweep -- only ``belief.omega`` is flipped -- so the Metropolis DeltaF is the exact change
-        in the joint F(q, U) under the block move."""
+        Runs the belief pipeline once under no_grad and returns the belief carrying the frame the
+        E-step actually minimized (``capture['converged']``, the pre-final_norm converged q*; falls
+        back to the returned post-norm belief if that lacks the mode's frame field) together with the
+        encode-time prior means/variances (``capture['prior']``). These are held FIXED across the sweep
+        -- only the frame is flipped (``belief.omega`` under 'omega', ``belief.reflection`` under 'phi')
+        -- so the Metropolis DeltaF is the exact change in the joint F under the block move."""
+        mode = mode or self._reflection_metropolis_mode()
         with torch.no_grad():
             cap: Dict = {}
             belief, _ = self.forward_beliefs(token_ids, capture=cap)
             conv      = cap.get("converged")
-            belief_f  = conv if (conv is not None and conv.omega is not None) else belief
+            if mode == "omega":
+                belief_f = conv if (conv is not None and conv.omega is not None) else belief
+            else:                                     # phi: prefer the converged frame carrying the sign
+                belief_f = conv if (conv is not None and conv.reflection is not None) else belief
             prior     = cap["prior"]                  # encode-time prior BeliefState (post s-refine)
         return belief_f, prior.mu, prior.sigma
 
     def _metropolis_free_energy(
         self,
-        belief:  BeliefState,                # fixed belief carrying .omega (B, N, K, K)
+        belief:  BeliefState,                # fixed belief carrying .omega (B, N, K, K) or .reflection (B, N)
         mu_p:    torch.Tensor,               # (B, N, K) prior means
         sigma_p: torch.Tensor,               # (B, N, K) prior variances
 
+        *,
+        mode:    Optional[str] = None,       # 'omega' | 'phi'; None -> resolve from cfg
     ) -> float:
         r"""Scalar free energy of a FIXED belief, summed over the batch (sequences are independent).
 
@@ -924,6 +953,8 @@ class VFEModel(nn.Module):
         from vfe3.free_energy import attention_tau
         from vfe3.inference.e_step import free_energy_value
         cfg, grp = self.cfg, self.group
+        mode      = mode or self._reflection_metropolis_mode()
+        gp        = "omega_direct" if mode == "omega" else "phi"
         dev       = belief.mu.device
         tau       = attention_tau(self.effective_kappa_beta(dev), grp.irrep_dims)
         b0        = _as_coeff(cfg.b0, dev)
@@ -936,7 +967,8 @@ class VFEModel(nn.Module):
                 bel = BeliefState(
                     mu=belief.mu[b], sigma=belief.sigma[b],
                     phi=(belief.phi[b] if belief.phi is not None else None),
-                    omega=(belief.omega[b] if belief.omega is not None else None))
+                    omega=(belief.omega[b] if belief.omega is not None else None),
+                    reflection=(belief.reflection[b] if belief.reflection is not None else None))
                 total += free_energy_value(
                     bel, mu_p[b], sigma_p[b], grp,
                     tau=tau, renyi_order=cfg.renyi_order, value=cfg.lambda_alpha, b0=b0, c0=c0,
@@ -944,49 +976,63 @@ class VFEModel(nn.Module):
                     include_attention_entropy=cfg.include_attention_entropy,
                     family=cfg.family, divergence_family=cfg.divergence_family,
                     lambda_alpha_mode=cfg.lambda_alpha_mode,
-                    gauge_parameterization="omega_direct", log_prior=log_prior,
+                    gauge_parameterization=gp, log_prior=log_prior,
                 ).item()
         return total
 
     def _metropolis_trial_belief(
         self,
-        belief:    BeliefState,              # fixed belief carrying .omega (B, N, K, K)
+        belief:    BeliefState,              # fixed belief carrying .omega (B, N, K, K) or .reflection (B, N)
         token_ids: torch.Tensor,             # (B, N) integer token ids
 
         token_id:  int,                      # the token whose det-sign is flipped
+        *,
+        mode:      Optional[str] = None,     # 'omega' | 'phi'; None -> resolve from cfg
     ) -> BeliefState:
-        r"""Trial belief with the frame at every ``token_ids == token_id`` position left-multiplied by
-        the canonical reflection R = reflection_element(K) (det R = -1), all other positions and the
-        beliefs (mu, sigma) held FIXED. R is applied to the FULL assembled (K, K) frame; for compact
-        block-diagonal storage this flips block 0 only (reflection_element(K)'s top-left d-block is
-        reflection_element(d), the rest identity), matching the source-table flip in
-        :meth:`_flip_omega_embed_row`."""
-        from vfe3.geometry.generators import reflection_element
-        k    = belief.omega.shape[-1]
-        r    = reflection_element(k, dtype=belief.omega.dtype, device=belief.omega.device)   # (K, K)
+        r"""Trial belief with the frame at every ``token_ids == token_id`` position reflected, all other
+        positions and the beliefs (mu, sigma) held FIXED.
+
+        Under ``'omega'`` mode the frame is left-multiplied by the canonical reflection
+        R = reflection_element(K) (det R = -1): R is applied to the FULL assembled (K, K) frame; for
+        compact block-diagonal storage this flips block 0 only (reflection_element(K)'s top-left d-block
+        is reflection_element(d), the rest identity), matching the source-table flip in
+        :meth:`_flip_omega_embed_row`. Under ``'phi'`` mode the per-token reflection sign is negated
+        (s -> -s) at the masked positions; the §3 fold in ``build_belief_transport`` then applies
+        R_i Omega_ij R_j at F-eval, matching the source-buffer flip in :meth:`_flip_reflection_sign_row`."""
+        mode = mode or self._reflection_metropolis_mode()
         mask = (token_ids == token_id)                                                       # (B, N)
-        trial_omega = belief.omega.clone()
-        trial_omega[mask] = torch.einsum("kl,...lm->...km", r, trial_omega[mask])            # R @ U at masked
-        return belief._replace(omega=trial_omega)
+        if mode == "omega":
+            from vfe3.geometry.generators import reflection_element
+            k    = belief.omega.shape[-1]
+            r    = reflection_element(k, dtype=belief.omega.dtype, device=belief.omega.device)   # (K, K)
+            trial_omega = belief.omega.clone()
+            trial_omega[mask] = torch.einsum("kl,...lm->...km", r, trial_omega[mask])        # R @ U at masked
+            return belief._replace(omega=trial_omega)
+        trial_reflection = belief.reflection.clone()                                         # phi: s -> -s at masked
+        trial_reflection[mask] *= -1.0
+        return belief._replace(reflection=trial_reflection)
 
     def _metropolis_delta_f(
         self,
-        belief:    BeliefState,              # fixed belief carrying .omega
+        belief:    BeliefState,              # fixed belief carrying .omega or .reflection
         mu_p:      torch.Tensor,             # (B, N, K) prior means
         sigma_p:   torch.Tensor,             # (B, N, K) prior variances
         token_ids: torch.Tensor,             # (B, N) integer token ids
 
         token_id:  int,                      # token whose det-sign flip is scored
+        *,
+        mode:      Optional[str] = None,     # 'omega' | 'phi'; None -> resolve from cfg
     ) -> float:
         r"""Exact fixed-belief DeltaF = F(trial) - F(current) for flipping ``token_id``'s det-sign.
 
         The sweep in :meth:`metropolis_omega_step` carries F_cur forward for efficiency; this helper
-        recomputes both terms so the exact-DeltaF regression test can compare it against an
-        independent source-table flip (pinning the masked trial-belief flip == the source-table
+        recomputes both terms so the exact-DeltaF regression test can compare it against an independent
+        source-flip (pinning the masked trial-belief flip == the source ``omega_embed`` / ``reflection_sign``
         flip)."""
-        trial = self._metropolis_trial_belief(belief, token_ids, token_id)
-        return (self._metropolis_free_energy(trial, mu_p, sigma_p)
-                - self._metropolis_free_energy(belief, mu_p, sigma_p))
+        mode  = mode or self._reflection_metropolis_mode()
+        trial = self._metropolis_trial_belief(belief, token_ids, token_id, mode=mode)
+        return (self._metropolis_free_energy(trial, mu_p, sigma_p, mode=mode)
+                - self._metropolis_free_energy(belief, mu_p, sigma_p, mode=mode))
 
     def _flip_omega_embed_row(
         self,
@@ -1017,6 +1063,20 @@ class VFEModel(nn.Module):
             else:
                 pb.omega_embed[token_id] = R @ pb.omega_embed[token_id]
 
+    def _flip_reflection_sign_row(
+        self,
+        token_id: int,                       # source-buffer row (token id) whose reflection sign is flipped
+    ) -> None:
+        r"""Negate the stored per-token reflection sign of ``token_id`` IN PLACE (s -> -s), toggling its
+        det-sign on the phi path. The phi-mode parallel of :meth:`_flip_omega_embed_row`: the sign lives
+        in the (V,) ``reflection_sign`` buffer (block 0's diag(-1,1,...) at the K level, per the §3
+        reflection fold). It is a non-differentiable discrete buffer flipped ONLY by the Metropolis
+        move, so the optimizer-moment-staleness caveat of :meth:`_flip_omega_embed_row` does NOT apply
+        (a buffer carries no AdamW exp_avg/exp_avg_sq)."""
+        pb = self.prior_bank
+        with torch.no_grad():
+            pb.reflection_sign[token_id] *= -1.0
+
     def metropolis_omega_step(
         self,
         token_ids: torch.Tensor,             # (B, N) integer token ids
@@ -1025,15 +1085,20 @@ class VFEModel(nn.Module):
         generator: torch.Generator,          # seeded RNG for the accept draws (reproducibility)
     ) -> dict:
         r"""One DeltaF-gated Metropolis sweep over the discrete det-sign of the stored frames of the
-        unique tokens in ``token_ids``. No-op (returns ``{}``) unless ``cfg.omega_reflection ==
-        'metropolis'``. The beliefs are held FIXED (a Metropolis-within-Gibbs block move on the joint
-        F): each proposed flip U_i -> R U_i (R = reflection_element(K), an orthogonal involution with
-        det R = -1, so the proposal is symmetric and the Hastings ratio reduces to the plain
-        Metropolis accept) is accepted with min(1, exp(-DeltaF / T)). On accept the source table
-        ``omega_embed`` is mutated in place and the flipped belief is carried forward, so the next
-        token's DeltaF is measured against the post-accept state (a correct MCMC chain). Everything
-        runs under no_grad. Returns a small stats dict (proposed/accepted counts, mean DeltaF) for
-        logging. See docs/superpowers/specs/2026-07-08-omega-direct-metropolis-detsign-design.md.
+        unique tokens in ``token_ids``. Dispatches on :meth:`_reflection_metropolis_mode`: no-op
+        (returns ``{}``) unless a learnable-reflection mode is active -- ``'omega'`` flips the stored
+        GL(K) frame ``omega_embed`` (gauge_parameterization='omega_direct' + omega_reflection=
+        'metropolis'), ``'phi'`` flips the per-token ``reflection_sign`` buffer (gauge_parameterization=
+        'phi' + phi_reflection='metropolis'). Both share this sweep; only the per-token flip and the
+        trial-frame construction differ. The beliefs are held FIXED (a Metropolis-within-Gibbs block
+        move on the joint F): each proposed sign flip (an orthogonal involution R = reflection_element(K),
+        det R = -1, so the proposal is symmetric and the Hastings ratio reduces to the plain Metropolis
+        accept) is accepted with min(1, exp(-DeltaF / T)). On accept the source table
+        (``omega_embed`` / ``reflection_sign``) is mutated in place and the flipped belief is carried
+        forward, so the next token's DeltaF is measured against the post-accept state (a correct MCMC
+        chain). Everything runs under no_grad. Returns a small stats dict (proposed/accepted counts,
+        mean DeltaF) for logging. See docs/superpowers/specs/2026-07-08-omega-direct-metropolis-detsign-
+        design.md (omega) and docs/superpowers/specs/2026-07-08-phi-reflection-design.md Sec.5 (phi).
 
         Caveat (see :meth:`_metropolis_free_energy`): under ``cfg.precision_weighted_attention`` or
         ``cfg.gamma_as_beta_prior`` (both default OFF) DeltaF is scored against the raw attention
@@ -1052,20 +1117,23 @@ class VFEModel(nn.Module):
         # of this DeltaF-gated Metropolis accept/reject. See GL(K)_attention.tex eq:ok_transport.
         """
         cfg = self.cfg
-        if cfg.omega_reflection != "metropolis":
+        mode = self._reflection_metropolis_mode()
+        if not mode:
             return {}
-        from vfe3.geometry.generators import reflection_element
         temp = float(cfg.omega_metropolis_temperature)
         with torch.no_grad():
-            belief, mu_p, sigma_p = self._metropolis_prepare(token_ids)
-            k = belief.omega.shape[-1]
-            R = reflection_element(k, dtype=belief.omega.dtype, device=belief.omega.device)   # (K, K)
-            f_cur = self._metropolis_free_energy(belief, mu_p, sigma_p)
+            belief, mu_p, sigma_p = self._metropolis_prepare(token_ids, mode=mode)
+            R = None
+            if mode == "omega":                                         # phi flips a scalar sign, no R needed
+                from vfe3.geometry.generators import reflection_element
+                k = belief.omega.shape[-1]
+                R = reflection_element(k, dtype=belief.omega.dtype, device=belief.omega.device)   # (K, K)
+            f_cur = self._metropolis_free_energy(belief, mu_p, sigma_p, mode=mode)
             proposed = accepted = 0
             dfs: list = []
             for tid in torch.unique(token_ids).tolist():
-                trial   = self._metropolis_trial_belief(belief, token_ids, tid)
-                f_trial = self._metropolis_free_energy(trial, mu_p, sigma_p)
+                trial   = self._metropolis_trial_belief(belief, token_ids, tid, mode=mode)
+                f_trial = self._metropolis_free_energy(trial, mu_p, sigma_p, mode=mode)
                 df      = f_trial - f_cur
                 dfs.append(df)
                 proposed += 1
@@ -1074,7 +1142,10 @@ class VFEModel(nn.Module):
                     accepted += 1
                     f_cur  = f_trial
                     belief = trial                                      # carry the flipped belief forward
-                    self._flip_omega_embed_row(R, int(tid))             # mutate the source table in place
+                    if mode == "omega":
+                        self._flip_omega_embed_row(R, int(tid))         # mutate the source table in place
+                    else:
+                        self._flip_reflection_sign_row(int(tid))        # mutate the source buffer in place
             return {"proposed": proposed, "accepted": accepted,
                     "mean_delta_f": (sum(dfs) / len(dfs)) if dfs else 0.0}
 
