@@ -164,6 +164,7 @@ class VFEModel(nn.Module):
             gauge_parameterization=cfg.gauge_parameterization,
             irrep_dims=list(self.group.irrep_dims),
             omega_reflection=cfg.omega_reflection,
+            phi_reflection=cfg.phi_reflection,
             # Compact block storage is opt-in (default OFF), and eligibility is a GROUP property decided
             # HERE where the group is known (the bank does not hold the GaugeGroup): only the equal-block
             # GL groups have independent per-head blocks -- untied block_glk stores H blocks (V,H,d,d),

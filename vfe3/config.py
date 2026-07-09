@@ -26,6 +26,11 @@ _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
 _VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
 _VALID_OMEGA_RETRACT       = ("lie_exp", "cayley")
 _VALID_OMEGA_REFLECTION    = ("off", "init_seed", "metropolis")
+# det<0 seeding is group-specific; reject where the ambient diag(-1,1,...) seed is not a valid,
+# tie-respecting, det<0 element of the structure group (deferred cases -> Phase 2b). Shared by
+# omega_reflection ('init_seed'/'metropolis' on the omega_direct path) and phi_reflection ('init_seed'/
+# 'metropolis' on the phi path, R*exp(phi)) -- both reflection features gate on the same group set.
+_REFLECT_OK                = ("glk", "block_glk", "so_k")   # so_k: valid O(K) seed; gl: ambient seed valid
 
 
 @dataclass
@@ -389,6 +394,7 @@ class VFE3Config:
     # update is dropped by the NaN/Inf skip_step guard, see spec Sec.4)
     omega_compact_storage:     bool  = False     # opt-in compact (V,H,d,d)/(V,d,d) block storage (equal-block groups)
     omega_reorth_every:        int   = 0         # SO-group re-orthogonalization cadence in M-steps (0 = off)
+    phi_reflection:            str   = "off"      # phi-path det<0 via R*exp(phi): 'off' (default) | 'init_seed' | 'metropolis'; reuses omega_metropolis_temperature/every
 
     # decode / encode
     use_prior_bank:            bool  = False
@@ -933,6 +939,49 @@ class VFE3Config:
                 "(no belief.omega frame exists on the phi path); got "
                 f"gauge_parameterization={self.gauge_parameterization!r}."
             )
+        # phi_reflection is the phi-path sibling of omega_reflection: it prepends a per-token
+        # discrete reflection R (det<0) to exp(phi), g_i = R_i exp(phi_i), so the phi frame reaches
+        # both orientation components. TOP-LEVEL (not nested in the omega_direct block below) because
+        # it validates the 'phi' path, not 'omega_direct'.
+        if self.phi_reflection == "ste":
+            raise NotImplementedError(
+                "phi_reflection='ste' (straight-through reflection sign) is not implemented; use "
+                "'metropolis' for the learnable reflection or 'init_seed' for a fixed one"
+                # TODO(STE)
+            )
+        _require(self.phi_reflection, ("off", "init_seed", "metropolis"), "phi_reflection")
+        if self.phi_reflection != "off":
+            if self.gauge_parameterization != "phi":
+                raise ValueError(
+                    "phi_reflection != 'off' requires gauge_parameterization='phi' (the reflection "
+                    "acts on the phi frame g_i = R_i exp(phi_i); no exp(phi) frame exists under "
+                    f"gauge_parameterization={self.gauge_parameterization!r})."
+                )
+            if self.gauge_group not in _REFLECT_OK:
+                vacuous = self.gauge_group in ("sp", "sp_n")
+                why = ("has det == +1 (connected, no reflection component), so a reflection is vacuous"
+                       if vacuous else
+                       "needs a group-specific reflection seed (rho(O(N)) image / tied replicated) that is deferred")
+                raise ValueError(
+                    f"phi_reflection={self.phi_reflection!r} is not available for gauge_group="
+                    f"{self.gauge_group!r}: it {why}. Use gauge_group in {_REFLECT_OK}, or "
+                    f"phi_reflection='off'."
+                )
+            # Efficacy guardrail, not a correctness gate (mirrors the omega_reflection diagonal-family
+            # warning): under a diagonal covariance family the canonical reflection R=diag(-1,1,...,1)
+            # leaves the diagonal covariance invariant under the congruence Omega Sigma Omega^T
+            # (transport SQUARES Omega, so the sign flip cancels), so the reflection bites only through
+            # the mean, not the covariance.
+            if self.family == "gaussian_diagonal":
+                import warnings
+                warnings.warn(
+                    f"phi_reflection={self.phi_reflection!r} with a diagonal covariance family (family="
+                    "'gaussian_diagonal') does near-no sheet selection: the reflection R=diag(-1,1,...) "
+                    "leaves the diagonal covariance invariant under transport (Omega is squared), so "
+                    "the reflection bites only through the mean, not the covariance. Use a full/off-"
+                    "diagonal covariance family for the reflection to carry covariance information.",
+                    UserWarning, stacklevel=2,
+                )
         # 'omega_direct' stores the per-token frame as a structure-group element U_i (belief.omega),
         # sourced from prior_bank.omega_embed, transport Omega_ij = U_i U_j^{-1}. Phase 2 scope:
         # all seven omega-eligible groups (_OMEGA_GROUPS below), the flat regime, and no E-step
@@ -946,8 +995,9 @@ class VFE3Config:
                 )
             # det<0 seeding is group-specific; reject where the ambient diag(-1,1,...) seed is not a
             # valid, tie-respecting, det<0 element of the structure group (deferred cases -> Phase 2b).
-            # Shared by both the 'init_seed' and 'metropolis' branches below.
-            _REFLECT_OK = ("glk", "block_glk", "so_k")   # so_k: valid O(K) seed; gl: ambient seed valid
+            # Shared by both the 'init_seed' and 'metropolis' branches below. _REFLECT_OK is hoisted to
+            # MODULE LEVEL (near _VALID_OMEGA_REFLECTION) so phi_reflection's validation (below, outside
+            # this omega_direct block) can share the same definition.
             if self.omega_reflection == "init_seed":
                 if self.gauge_group not in _REFLECT_OK:
                     raise ValueError(

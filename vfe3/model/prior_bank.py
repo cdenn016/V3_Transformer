@@ -159,6 +159,7 @@ class PriorBank(nn.Module):
         gauge_parameterization: str                 = "phi",
         irrep_dims:             Optional[List[int]] = None,
         omega_reflection:       str                 = "off",
+        phi_reflection:         str                 = "off",
         omega_compact_storage:  bool                = False,
         gauge_group_is_tied:    bool                = False,
     ) -> None:
@@ -336,12 +337,27 @@ class PriorBank(nn.Module):
                     with torch.no_grad():                    # seed every OTHER token into the det<0 sheet
                         self.omega_embed[1::2] = R
 
+        # phi_reflection: a per-token discrete reflection sign R_i (det<0 iff sign==-1), prepended to
+        # exp(phi_i) as g_i = R_i exp(phi_i) (see docs/superpowers/specs/2026-07-08-phi-reflection-
+        # design.md). A register_buffer, NOT nn.Parameter: discrete state flipped by the Metropolis
+        # move, not gradient. Created ONLY on the phi path when phi_reflection != 'off' so the default
+        # state_dict is byte-identical. Default all +1 (identity, det>0); 'init_seed' seeds every OTHER
+        # token to -1, mirroring omega_embed's [1::2] init_seed above.
+        if gauge_parameterization == "phi" and phi_reflection != "off":
+            self.register_buffer("reflection_sign", torch.ones(vocab_size))
+            if phi_reflection == "init_seed":
+                with torch.no_grad():
+                    self.reflection_sign[1::2] = -1.0
+
     def encode(
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
     ) -> BeliefState:
         r"""Look up the per-token Gaussian prior as the initial belief (q = p)."""
-        return get_encode(self.encode_mode)(self, token_ids)
+        belief = get_encode(self.encode_mode)(self, token_ids)
+        if hasattr(self, "reflection_sign"):
+            belief = belief._replace(reflection=self.reflection_sign[token_ids])
+        return belief
 
     def _omega_lookup(
         self,
