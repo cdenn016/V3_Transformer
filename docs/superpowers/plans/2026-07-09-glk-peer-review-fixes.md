@@ -92,7 +92,7 @@ Annotate rather than delete superseded ledger entries, then add `## 5. 2026-07-0
 
 Update the central pages for GL(K) attention and group structure, renormalization, holonomy, Killing/Frobenius metrics, the VFE Transformer program, attention precursors, geometric deep learning, and opinion pooling. Use an `rg` sweep to find repeated stale language elsewhere, but edit only actual contradictions. Preserve belief-side Fisher natural-gradient statements. Add the new source to `index.md`, update the manuscript-source count, append an `INGEST` entry to `log.md`, and append a `LINT` entry only after an actual clean lint run.
 
-Verify the old source hash is unchanged, all changed claims backlink to the new source, and `python docs/_lint.py` reports zero broken wikilinks, grey graph nodes, empty files, case collisions, and identity collisions.
+Verify the old source hash is unchanged, all changed claims backlink to the new source, and `python docs/_lint.py` reports zero broken wikilinks, gray graph nodes, empty files, case collisions, and identity collisions.
 
 ## Task 6: Build, cross-check, and adversarially review the integrated revision
 
