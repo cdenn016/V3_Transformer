@@ -10,6 +10,7 @@ guaranteed monotone per iteration; F-descent holds as a DIRECTION property
 (filtering descends F_filt; smoothing and the phi step descend global F).
 """
 
+import dataclasses
 from typing import List, Optional, Tuple
 
 import torch
@@ -120,6 +121,43 @@ def _can_fuse_flat(transport_mode: str, group: GaugeGroup) -> bool:
     )
 
 
+def _apply_reflection(
+    built:      'torch.Tensor | FactoredTransport',
+    reflection: torch.Tensor,                     # (..., N) per-token sign s_i in {+1, -1}
+) -> 'torch.Tensor | FactoredTransport':
+    r"""Fold the per-token reflection R_i = diag(s_i, 1, ..., 1) into the flat phi-cocycle transport:
+    Omega_ij -> R_i Omega_ij R_j (phi-reflection design sec 3).
+
+    R = ``reflection_element(K)`` = diag(-1, 1, ..., 1) and R^{-1} = R, so the LEFT action R_i (.)
+    negates ROW 0 of the query factor by s_i and the RIGHT action (.) R_j negates COLUMN 0 of the
+    key factor by s_j. Group-agnostic (block 0's diag(-1,1,...) for block_glk; the O(K)\SO(K)
+    reflection for so_k). ``reflection`` is a discrete buffer carrying NO gradient, so this is a
+    value-only rescale; the pre-fold factors are cloned so the phi autograd graph is untouched.
+    Dispatches on the two forward-transport representations:
+
+      - :class:`FactoredTransport` (flat equal-block fast path, e.g. block_glk): negate row 0 of
+        ``exp_phi[..., 0, :]`` by s_i and column 0 of ``exp_neg_phi[..., :, 0]`` by s_j, so the
+        fused Omega = exp_phi @ exp_neg_phi = R_i exp(phi_i) exp(-phi_j) R_j. Other fields
+        (``irrep_dims``, ``mean_per_head``) are preserved.
+      - dense Omega ``(..., i, j, K, K)`` (single-block / cross-coupled, e.g. glk): negate row 0 by
+        the QUERY sign s_i (dim -4, broadcasts over j) and column 0 by the KEY sign s_j (dim -3,
+        broadcasts over i). The (0, 0) entry picks up BOTH signs (s_i s_j), exactly R_i Omega R_j.
+
+    Every downstream mean transport (Omega mu) and covariance sandwich (Omega Sigma Omega^T) is then
+    correct with no further change.
+    """
+    if isinstance(built, FactoredTransport):
+        exp_phi     = built.exp_phi.clone()                                    # (..., N, K, K)
+        exp_neg_phi = built.exp_neg_phi.clone()                                # (..., N, K, K)
+        exp_phi[..., 0, :]     *= reflection[..., :, None]                     # R_i: negate row 0 by s_i
+        exp_neg_phi[..., :, 0] *= reflection[..., :, None]                     # (.) R_j: negate col 0 by s_j
+        return dataclasses.replace(built, exp_phi=exp_phi, exp_neg_phi=exp_neg_phi)
+    omega = built.clone()                                                      # (..., i, j, K, K) dense
+    omega[..., 0, :] *= reflection[..., :, None, None]                         # R_i: row 0 by s_i (over j)
+    omega[..., :, 0] *= reflection[..., None, :, None]                         # (.) R_j: col 0 by s_j (over i)
+    return omega
+
+
 def build_belief_transport(
     phi:                torch.Tensor,             # (B, N, n_gen) batched gauge frames
     group:              GaugeGroup,
@@ -148,6 +186,7 @@ def build_belief_transport(
     mu_key:             Optional[torch.Tensor] = None,      # regime_ii KEY-slot means (None -> mu)
     sigma_key:          Optional[torch.Tensor] = None,      # regime_ii_covariant KEY-slot variances (None -> sigma)
     rope:               Optional[torch.Tensor] = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
+    reflection:         Optional[torch.Tensor] = None,      # (B, N) per-token sign s_i in {+1,-1}; phi-path fold (None -> off)
 ) -> 'torch.Tensor | FactoredTransport | RopeTransport':
     r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
 
@@ -203,6 +242,12 @@ def build_belief_transport(
                            link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                            exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                            cocycle_relaxation=cocycle_relaxation)
+    # Reflection fold (phi-reflection design sec 3): fold R_i = diag(s_i, 1, ...) into the built
+    # transport, Omega_ij -> R_i Omega_ij R_j, BEFORE the RoPE wrap (RoPE composes on the reflected
+    # base). phi-path ONLY -- omega_direct carries its own omega_reflection det-sign and ignores this.
+    # reflection is None (default) -> byte-identical.
+    if reflection is not None and gauge_parameterization != "omega_direct":
+        built = _apply_reflection(built, reflection)
     if rope is None:
         return built
     return RopeTransport(base=built, rope=rope, on_cov=rope_on_cov, on_value=rope_on_value)
@@ -561,6 +606,7 @@ def e_step_iteration(
             omega = build_belief_transport(
                 belief.phi, group, transport_mode=transport_mode,
                 gauge_parameterization=gauge_parameterization, omega=belief.omega,
+                reflection=belief.reflection,   # phi-path reflection fold (None on the pure path -> byte-identical)
                 mu=belief.mu, connection_W=connection_W, connection_L=connection_L,
                 link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                 cocycle_relaxation=cocycle_relaxation,
@@ -857,6 +903,7 @@ def e_step(
                 belief.phi, group,
                 transport_mode="flat",
                 gauge_parameterization=gauge_param_kw, omega=belief.omega,
+                reflection=belief.reflection,   # phi-path reflection fold (None on the pure path -> byte-identical)
                 gauge_mode="learned",   # not an e_step kwarg (no **kwargs sink downstream); literal, not a dead kwargs read (m14)
                 clamp_monitor=kwargs.get("clamp_monitor", False),
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
@@ -935,6 +982,7 @@ def e_step(
                         belief.phi, group,
                         transport_mode="flat",
                         gauge_parameterization=gauge_param_kw, omega=belief.omega,
+                        reflection=belief.reflection,   # phi-path reflection fold (None on the pure path -> byte-identical)
                         gauge_mode="learned",
                         clamp_monitor=kwargs.get("clamp_monitor", False),
                         exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
