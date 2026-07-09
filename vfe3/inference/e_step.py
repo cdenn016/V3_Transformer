@@ -62,6 +62,7 @@ def _transport(
     sigma_key:          Optional[torch.Tensor] = None,      # regime_ii_covariant KEY-slot variances (None -> sigma)
     gauge_parameterization: str                    = "phi",   # 'phi' (exp path) | 'omega_direct' (stored element)
     omega:              Optional[torch.Tensor] = None,      # (B, N, K, K) per-token U_i (omega_direct only)
+    reflection:         Optional[torch.Tensor] = None,      # (N,) or (B, N) per-token sign s_i; phi-path fold (None -> off)
 ) -> torch.Tensor:                            # (N, N, K, K) or (B, N, N, K, K) Omega_ij
     r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
@@ -96,13 +97,21 @@ def _transport(
                       cocycle_relaxation=cocycle_relaxation)["Omega"]
         # A batch-independent builder (regime_ii_link) already returns (N,N,K,K); ordinary builders
         # return (1,N,N,K,K) on the unbatched diagnostics path -> strip the batch-of-one.
-        return omega if batch_independent else omega[0]
-    return build(phi, group, gauge_mode=gauge_mode, mu=mu, mu_key=mu_key,
-                 sigma=sigma, sigma_key=sigma_key,
-                 connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
-                 link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
-                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                 cocycle_relaxation=cocycle_relaxation)["Omega"]
+        built = omega if batch_independent else omega[0]
+    else:
+        built = build(phi, group, gauge_mode=gauge_mode, mu=mu, mu_key=mu_key,
+                      sigma=sigma, sigma_key=sigma_key,
+                      connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
+                      link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
+                      exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                      cocycle_relaxation=cocycle_relaxation)["Omega"]
+    # Reflection fold (phi-reflection design sec 3): R_i Omega_ij R_j on the dense phi-cocycle Omega
+    # (omega_direct returned early above, so this is the phi path only). None (default) is
+    # byte-identical. free_energy_value's global-F build routes belief.reflection through here so the
+    # logged / Metropolis-DeltaF F is reflection-dependent.
+    if reflection is not None:
+        built = _apply_reflection(built, reflection)
+    return built
 
 
 def _can_fuse_flat(transport_mode: str, group: GaugeGroup) -> bool:
@@ -122,8 +131,11 @@ def _can_fuse_flat(transport_mode: str, group: GaugeGroup) -> bool:
 
 
 def _apply_reflection(
-    built:      'torch.Tensor | FactoredTransport',
-    reflection: torch.Tensor,                     # (..., N) per-token sign s_i in {+1, -1}
+    built:          'torch.Tensor | FactoredTransport',
+    reflection:     torch.Tensor,                     # (..., N) QUERY per-token sign s_i in {+1, -1}
+
+    *,
+    key_reflection: Optional[torch.Tensor] = None,    # (..., N) KEY sign s_j; None -> reflection (global, query==key)
 ) -> 'torch.Tensor | FactoredTransport':
     r"""Fold the per-token reflection R_i = diag(s_i, 1, ..., 1) into the flat phi-cocycle transport:
     Omega_ij -> R_i Omega_ij R_j (phi-reflection design sec 3).
@@ -133,6 +145,9 @@ def _apply_reflection(
     key factor by s_j. Group-agnostic (block 0's diag(-1,1,...) for block_glk; the O(K)\SO(K)
     reflection for so_k). ``reflection`` is a discrete buffer carrying NO gradient, so this is a
     value-only rescale; the pre-fold factors are cloned so the phi autograd graph is untouched.
+    ``key_reflection`` defaults to ``reflection`` (the global query==key case); it is the KEY-slot
+    sign s_j for the FILTERED transport (``_transport_qk``), where the query frame is the belief and
+    the key frame is the frozen keys, so the two slots carry independent per-token signs.
     Dispatches on the two forward-transport representations:
 
       - :class:`FactoredTransport` (flat equal-block fast path, e.g. block_glk): negate row 0 of
@@ -146,15 +161,16 @@ def _apply_reflection(
     Every downstream mean transport (Omega mu) and covariance sandwich (Omega Sigma Omega^T) is then
     correct with no further change.
     """
+    key_reflection = reflection if key_reflection is None else key_reflection
     if isinstance(built, FactoredTransport):
         exp_phi     = built.exp_phi.clone()                                    # (..., N, K, K)
         exp_neg_phi = built.exp_neg_phi.clone()                                # (..., N, K, K)
         exp_phi[..., 0, :]     *= reflection[..., :, None]                     # R_i: negate row 0 by s_i
-        exp_neg_phi[..., :, 0] *= reflection[..., :, None]                     # (.) R_j: negate col 0 by s_j
+        exp_neg_phi[..., :, 0] *= key_reflection[..., :, None]                 # (.) R_j: negate col 0 by s_j
         return dataclasses.replace(built, exp_phi=exp_phi, exp_neg_phi=exp_neg_phi)
     omega = built.clone()                                                      # (..., i, j, K, K) dense
     omega[..., 0, :] *= reflection[..., :, None, None]                         # R_i: row 0 by s_i (over j)
-    omega[..., :, 0] *= reflection[..., None, :, None]                         # (.) R_j: col 0 by s_j (over i)
+    omega[..., :, 0] *= key_reflection[..., None, :, None]                     # (.) R_j: col 0 by s_j (over i)
     return omega
 
 
@@ -355,6 +371,7 @@ def free_energy_value(
         omega = _transport(
             belief.phi, group, transport_mode=transport_mode,
             gauge_parameterization=gauge_parameterization, omega=belief.omega,
+            reflection=belief.reflection,   # phi-path R_i Omega_ij R_j fold (None on the pure path -> byte-identical)
             mu=(belief.mu if transport_mode in _TRANSPORT_NEEDS_MU else None),
             sigma=(belief.sigma if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
             connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
@@ -377,6 +394,14 @@ def free_energy_value(
                 "filtered-keys free energy does not support gauge_parameterization='omega_direct' yet"
             )
         omega = _transport_qk(belief.phi, keys.phi, group)
+        # Filtered-transport reflection fold (phi path): the query slot carries the belief's sign s_i
+        # and the KEY slot the frozen keys' sign s_j, so Omega_ij -> R_i Omega_ij R_j with independent
+        # per-slot signs. In practice both beliefs come from the same reflection-bearing model, so both
+        # are present-or-both-None; when both are None this is byte-identical (fold skipped).
+        if belief.reflection is not None or key_belief.reflection is not None:
+            q_sign = belief.reflection if belief.reflection is not None else torch.ones_like(belief.phi[..., 0])
+            k_sign = key_belief.reflection if key_belief.reflection is not None else torch.ones_like(keys.phi[..., 0])
+            omega = _apply_reflection(omega, q_sign, key_reflection=k_sign)
     mu_tv = sigma_tv = None
     if rope is not None:
         # Mirror the model path: R_i Omega_ij R_j^T on the means (and the covariance sandwich

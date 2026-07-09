@@ -93,3 +93,103 @@ def test_reflection_fold_matches_R_Omega_R_and_flips_det(group_name, group_kw):
     none = build_belief_transport(phi, grp, transport_mode="flat", gauge_parameterization="phi",
                                   reflection=None)
     assert torch.equal(_dense_omega(none), Om_base)
+
+
+# --- Task 3: reflection reaches the gamma / s-channel and the F-eval --------------------------
+
+def _model(**over):
+    """A tiny phi-path model with the model (s) channel present (prior_source='model_channel')."""
+    from vfe3.model.model import VFEModel
+    base = dict(prior_source="model_channel", family="gaussian_diagonal", decode_mode="diagonal",
+                vocab_size=6, max_seq_len=4, n_layers=1)
+    base.update(over)
+    return VFEModel(_cfg(**base))
+
+
+def test_gamma_coupling_term_uses_reflection():
+    # 3A frame-fidelity (mirrors test_gamma_coupling_term_uses_stored_frame_not_phi_cocycle): with
+    # two different reflection signs the forward gamma-coupling energy must DIFFER -- the reflection
+    # R_i is folded into the s-channel transport Omega_ij -> R_i Omega_ij R_j. phi is held at zero
+    # (exp(phi)=I: the flat cocycle is frame-blind), so ONLY the reflection can move the energy.
+    K, N = 4, 3
+    m = _model()
+    n_gen = m.group.generators.shape[0]
+    tok = torch.randint(0, 6, (1, N), generator=torch.Generator().manual_seed(1))
+    phi = torch.zeros(1, N, n_gen)
+    sign_a = torch.tensor([[1.0,  1.0, 1.0]])                    # all +1 == identity reflection
+    sign_b = torch.tensor([[1.0, -1.0, 1.0]])                    # token 1 reflected
+    e_a = m._gamma_coupling_term(tok, phi, reflection=sign_a)
+    e_b = m._gamma_coupling_term(tok, phi, reflection=sign_b)
+    assert not torch.allclose(e_a, e_b, atol=1e-6), \
+        "gamma coupling term is blind to the reflection sign (fold not threaded)"
+    # all-+1 reflection is byte-identical to reflection=None (pure fold).
+    e_none = m._gamma_coupling_term(tok, phi, reflection=None)
+    assert torch.allclose(e_a, e_none, atol=1e-7)
+
+
+def test_refine_s_uses_reflection():
+    # 3A frame-fidelity (mirrors test_refine_s_uses_stored_frame_not_phi_cocycle): the s_e_step
+    # E-step (_refine_s) must transport the gamma model-coupling by the reflected frame. phi0 is held
+    # at zero, lambda_gamma is bumped post-construction so the coupling term has nonzero weight, and
+    # the reflection_sign buffer is flipped between two calls -> the refined s must DIFFER.
+    K, N, V = 4, 3, 6
+    m = _model(lambda_h=1.0, lambda_h_mode="constant", phi_reflection="init_seed", vocab_size=V)
+    m.cfg.lambda_gamma = 0.75                                    # nonzero s-coupling weight (post-ctor bump)
+    n_gen = m.group.generators.shape[0]
+    tok = torch.randint(0, V, (1, N), generator=torch.Generator().manual_seed(1))
+    phi0 = torch.zeros(1, N, n_gen)                              # exp(phi0)=I: the flat cocycle is frame-blind
+
+    with torch.no_grad():
+        m.prior_bank.reflection_sign.fill_(1.0)                 # all +1
+    s_mu1, _ = m._refine_s(tok, phi0)
+    with torch.no_grad():
+        m.prior_bank.reflection_sign.fill_(1.0)
+        m.prior_bank.reflection_sign[tok[0, 1].item()] = -1.0   # flip one token
+    s_mu2, _ = m._refine_s(tok, phi0)
+    assert not torch.allclose(s_mu1, s_mu2, atol=1e-6), \
+        "_refine_s is blind to the reflection sign (not populated / not threaded through e_step)"
+
+
+def test_free_energy_value_reflects():
+    # 3B LOAD-BEARING (Task 4's Metropolis computes DeltaF = F(flipped reflection) - F(reflection),
+    # so free_energy_value MUST be reflection-dependent or the whole learnable move is inert). Two
+    # beliefs identical but for belief.reflection must give DIFFERENT global F. phi is nonzero so the
+    # transport Omega_ij != I and the reflected mean bites.
+    from vfe3.geometry.groups import get_group
+    from vfe3.inference.e_step import free_energy_value
+    from vfe3.belief import BeliefState
+    K, N = 4, 3
+    grp = get_group("glk")(K=K)
+    n_gen = grp.generators.shape[0]
+    g = torch.Generator().manual_seed(0)
+    mu      = torch.randn(N, K, generator=g)
+    sigma   = torch.rand(N, K, generator=g) + 0.5
+    phi     = 0.3 * torch.randn(N, n_gen, generator=g)          # NONZERO -> Omega_ij != I for i != j
+    mu_p    = torch.randn(N, K, generator=g)
+    sigma_p = torch.rand(N, K, generator=g) + 0.5
+    sign_a = torch.tensor([1.0,  1.0, 1.0])
+    sign_b = torch.tensor([1.0, -1.0, 1.0])
+    b_a = BeliefState(mu=mu, sigma=sigma, phi=phi, reflection=sign_a)
+    b_b = BeliefState(mu=mu, sigma=sigma, phi=phi, reflection=sign_b)
+    F_a = free_energy_value(b_a, mu_p, sigma_p, grp, tau=1.5)
+    F_b = free_energy_value(b_b, mu_p, sigma_p, grp, tau=1.5)
+    assert torch.isfinite(F_a) and torch.isfinite(F_b)
+    assert not torch.allclose(F_a, F_b, atol=1e-6), \
+        "free_energy_value ignores belief.reflection -- Task 4 Metropolis DeltaF would be inert"
+    # all-+1 reflection is byte-identical to reflection=None (pure fold).
+    b_none = BeliefState(mu=mu, sigma=sigma, phi=phi, reflection=None)
+    F_none = free_energy_value(b_none, mu_p, sigma_p, grp, tau=1.5)
+    assert torch.allclose(F_a, F_none, atol=1e-7)
+
+
+def test_block_preserves_reflection_end_to_end():
+    # 3C: block.py's post-E-step transforms (block_norm / head_mixer / cg_coupling) must PRESERVE
+    # belief.reflection. With block_norm active + n_layers>1 + phi_reflection on, the reflection must
+    # survive to the returned belief -- the bare BeliefState(mu,sigma,phi) reconstruction dropped it,
+    # so layer 2 lost the frame (and omega, for omega_direct). The forward must also run finite.
+    m = _model(phi_reflection="init_seed", norm_type_block="mahalanobis", n_layers=2)
+    tok = torch.tensor([[0, 1, 2, 3]])
+    belief, _ = m.forward_beliefs(tok)
+    assert belief.reflection is not None, "block.py dropped belief.reflection past layer 1"
+    assert belief.reflection.shape == (1, 4)
+    assert torch.isfinite(belief.mu).all()

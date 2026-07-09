@@ -617,6 +617,11 @@ class VFEModel(nn.Module):
         # detach): the s-refine trains omega_embed through the unrolled trajectory exactly as it
         # trains phi_embed.
         omega_s = pb._omega_lookup(token_ids) if cfg.gauge_parameterization == "omega_direct" else None
+        # phi-reflection frame fidelity: re-derive the per-token sign R_i so the s-channel E-step
+        # transports the gamma coupling by R_i exp(phi0_i) exp(-phi0_j) R_j (via e_step's internal
+        # build_belief_transport), matching the belief channel. A BUFFER lookup (non-differentiable),
+        # so -- unlike omega_s -- there is NO detach/attach concern; None on the pure path.
+        reflection_s = pb.reflection_sign[token_ids] if cfg.phi_reflection != "off" else None
         r_mu    = pb.r_mu.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
         r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s_sigma)
         gamma_tau       = attention_tau(self.effective_kappa_gamma(s_mu.device), grp.irrep_dims)
@@ -624,7 +629,7 @@ class VFEModel(nn.Module):
             token_ids.shape[1], token_ids.device, prior=cfg.gamma_attention_prior,
         )
         out = e_step(
-            BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0, omega=omega_s), r_mu, r_sigma, grp,
+            BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0, omega=omega_s, reflection=reflection_s), r_mu, r_sigma, grp,
             n_iter=cfg.n_e_steps,         tau=gamma_tau,
             e_q_mu_lr=cfg.e_s_mu_lr,      e_q_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
             # The s-channel self-coupling weight IS lambda_h (the hyper-prior precision): route it
@@ -795,6 +800,7 @@ class VFEModel(nn.Module):
                     beliefs.phi, self.group,
                     transport_mode="flat",
                     gauge_parameterization=self.cfg.gauge_parameterization, omega=beliefs.omega,
+                    reflection=beliefs.reflection if beliefs.reflection is not None else None,   # phi-path reflection fold (None -> byte-identical)
                     clamp_monitor=self.cfg.transport_clamp_monitor,
                     # Tier-1 transport perf toggles: the shared build must carry the same island
                     # keying / per-head mean flag the per-e_step hoists would have used.
@@ -822,7 +828,8 @@ class VFEModel(nn.Module):
                 # pi <- (1-w) softmax(B) + w gamma (h->s->p->q: models tell beliefs where to attend).
                 # Detached like the precision bias above, so the closed-form belief kernel stays
                 # exact; the forward's diagnostic replays do NOT refold this (forward-path only).
-                log_prior = self._fold_gamma_prior(log_prior, token_ids, beliefs.phi, omega=beliefs.omega)
+                log_prior = self._fold_gamma_prior(log_prior, token_ids, beliefs.phi, omega=beliefs.omega,
+                                                   reflection=beliefs.reflection if beliefs.reflection is not None else None)
             # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
             # M-step self-coupling term in forward (manuscript: the self-term reads q*, not the
             # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.
@@ -850,7 +857,8 @@ class VFEModel(nn.Module):
         if self.final_norm is not None:                          # config-selected final norm (cached)
             mu_final = self.final_norm(mu_final, sigma_final)
 
-        belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi, omega=out.omega)   # carry the GL(K) frame under omega_direct (None on the phi path)
+        belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi, omega=out.omega,   # carry the GL(K) frame under omega_direct (None on the phi path)
+                             reflection=out.reflection)                                     # carry the phi-path per-token reflection sign (None on the pure path)
         if capture is not None:
             # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
             # encode-time prior p (post s-refine) and the raw pre-final_norm stack output, which the
@@ -1317,7 +1325,8 @@ class VFEModel(nn.Module):
             # The body lives in _gamma_coupling_term so diagnostics logs the SAME term (audit V2).
             loss = loss + self.cfg.lambda_gamma * self._gamma_coupling_term(
                 token_ids, belief.phi.detach(),
-                omega=belief.omega.detach() if belief.omega is not None else None)
+                omega=belief.omega.detach() if belief.omega is not None else None,
+                reflection=belief.reflection if belief.reflection is not None else None)   # non-diff buffer -> no detach
         return logits, loss, ce.detach()
 
     @property
@@ -1415,6 +1424,7 @@ class VFEModel(nn.Module):
 
         *,
         omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
+        reflection: Optional[torch.Tensor] = None,  # (B, N) per-token sign s_i; phi-path R_i Omega_ij R_j fold; None -> off
         s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
     ) -> 'tuple[torch.Tensor, float | torch.Tensor, Optional[torch.Tensor]]':
         r"""Shared model-coupling setup: the s-channel pairwise energy E^s_ij, the gamma softmax
@@ -1441,7 +1451,8 @@ class VFEModel(nn.Module):
         # inert). Under the default 'phi' parameterization omega is always None, so this is byte-identical.
         gp = cfg.gauge_parameterization if omega is not None else "phi"
         omega = build_belief_transport(phi, self.group, transport_mode="flat",
-                                       gauge_parameterization=gp, omega=omega)   # Tier-1 transport toggles left at defaults: diagnostics exactness unaffected (values identical to round-off)
+                                       gauge_parameterization=gp, omega=omega,
+                                       reflection=reflection)   # phi-path reflection fold (None -> byte-identical); Tier-1 transport toggles left at defaults: diagnostics exactness unaffected (values identical to round-off)
         s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
         s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
         e_s = pairwise_energy(
@@ -1465,6 +1476,7 @@ class VFEModel(nn.Module):
 
         *,
         omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
+        reflection: Optional[torch.Tensor] = None,  # (B, N) per-token sign s_i; phi-path R_i Omega_ij R_j fold; None -> off
     ) -> torch.Tensor:                       # () model-coupling block (UNWEIGHTED)
         r"""The gamma model-coupling block at the given gauge frame (UNWEIGHTED).
 
@@ -1476,7 +1488,7 @@ class VFEModel(nn.Module):
         diagnostic sibling.
         """
         from vfe3.free_energy import attention_weights, reduced_free_energy
-        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega)
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega, reflection=reflection)
         if self.cfg.include_attention_entropy:
             # canonical: the envelope -tau_g log Z^s equals coupling + entropy at gamma*
             return reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior).mean()
@@ -1493,6 +1505,7 @@ class VFEModel(nn.Module):
         *,
         eps:       float = 1e-12,
         omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
+        reflection: Optional[torch.Tensor] = None,  # (B, N) per-token sign s_i; phi-path R_i Omega_ij R_j fold; None -> off
         s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
     ) -> 'Dict[str, torch.Tensor]':          # SUM-scale {coupling, meta_entropy, total}
         r"""Split the gamma model-coupling block into its coupling and meta-entropy parts (UNWEIGHTED,
@@ -1509,7 +1522,7 @@ class VFEModel(nn.Module):
         per head exactly as the belief entropy term does.
         """
         from vfe3.free_energy import _broadcast_tau, attention_weights, reduced_free_energy
-        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega, s_belief=s_belief)
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega, reflection=reflection, s_belief=s_belief)
         gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
         pi_s = (torch.softmax(gamma_log_prior, dim=-1) if gamma_log_prior is not None
                 else torch.full_like(gamma_w, 1.0 / gamma_w.shape[-1]))
@@ -1539,7 +1552,8 @@ class VFEModel(nn.Module):
         from vfe3.free_energy import attention_weights
         enc = self.prior_bank.encode(token_ids[:1])
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
-                             omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
+                             omega=enc.omega[0] if enc.omega is not None else None,   # carry the GL(K) frame under omega_direct
+                             reflection=enc.reflection[0] if enc.reflection is not None else None)   # carry the phi-path reflection sign
         s_belief = self._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
         if s_belief is not None:
             belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
@@ -1548,7 +1562,8 @@ class VFEModel(nn.Module):
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward/diagnostics/attention_maps (r2 id22)
         if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
             log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None)[0]
+                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
+                                               reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None)[0]
         rope = self._rope_rotation(n, token_ids.device)
         out = vfe_stack(                                             # converged belief gauge frame
             belief, belief.mu, belief.sigma, self.group, self.cfg,
@@ -1564,7 +1579,8 @@ class VFEModel(nn.Module):
         )
         e_s, gamma_tau, gamma_log_prior = self._gamma_energy(
             token_ids[:1], out.phi.unsqueeze(0),
-            omega=out.omega.unsqueeze(0) if out.omega is not None else None)
+            omega=out.omega.unsqueeze(0) if out.omega is not None else None,
+            reflection=out.reflection.unsqueeze(0) if out.reflection is not None else None)
         gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)[0]   # drop batch
         if gamma.dim() == 2:                                        # single-block group -> add an H=1 axis
             gamma = gamma.unsqueeze(0)
@@ -1776,6 +1792,7 @@ class VFEModel(nn.Module):
 
         *,
         omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
+        reflection: Optional[torch.Tensor] = None,  # (B, N) per-token sign s_i; phi-path R_i Omega_ij R_j fold; None -> off
         log_eps:   float = 1e-12,            # floor for log(pi) on the allowed support (free_energy's pattern)
     ) -> torch.Tensor:                       # (B, [H,] N, N) mixed log-prior
         r"""Hierarchical attention prior (cfg.gamma_as_beta_prior): fold the model channel's DETACHED
@@ -1797,7 +1814,7 @@ class VFEModel(nn.Module):
         from vfe3.free_energy import attention_weights
         w = self.cfg.gamma_prior_weight
         with torch.no_grad():
-            e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega)
+            e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega, reflection=reflection)
             gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)  # (B, [H,] N, N)
         if log_prior is None:
             pi_b    = torch.full_like(gamma, 1.0 / gamma.shape[-1])   # uniform prior over keys
@@ -1868,7 +1885,8 @@ class VFEModel(nn.Module):
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
-                             omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
+                             omega=enc.omega[0] if enc.omega is not None else None,   # carry the GL(K) frame under omega_direct
+                             reflection=enc.reflection[0] if enc.reflection is not None else None)   # carry the phi-path reflection sign
         s_belief = self._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
         if s_belief is not None:
             belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
@@ -1877,7 +1895,8 @@ class VFEModel(nn.Module):
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
         if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
             log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None)[0]
+                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
+                                               reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None)[0]
         rope = self._rope_rotation(n, token_ids.device)               # rope shapes the converged belief (as forward)
         cap: dict = {}                                                # q* capture (F self-term reads it, as forward)
         out = vfe_stack(                                              # converged belief
@@ -1982,7 +2001,8 @@ class VFEModel(nn.Module):
         if cfg.lambda_gamma > 0.0 or cfg.s_e_step:                  # gamma block evaluated at out.phi
             g = self._gamma_coupling_terms(
                 token_ids[:1], out.phi.unsqueeze(0),
-                omega=out.omega.unsqueeze(0) if out.omega is not None else None, s_belief=s_belief)
+                omega=out.omega.unsqueeze(0) if out.omega is not None else None,
+                reflection=out.reflection.unsqueeze(0) if out.reflection is not None else None, s_belief=s_belief)
             d["gamma_coupling"]     = float(g["coupling"])           # raw sum_{h,i,j} gamma E^s
             d["gamma_meta_entropy"] = float(g["meta_entropy"])       # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
             d["total"] += cfg.lambda_gamma * (d["gamma_coupling"] + d["gamma_meta_entropy"])
@@ -2147,7 +2167,8 @@ class VFEModel(nn.Module):
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
-                             omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
+                             omega=enc.omega[0] if enc.omega is not None else None,   # carry the GL(K) frame under omega_direct
+                             reflection=enc.reflection[0] if enc.reflection is not None else None)   # carry the phi-path reflection sign
         if cfg.s_e_step:
             # Live model channel (audit 2026-06-09 IE1): refine s and anchor the replayed belief
             # (q0 AND the handoff prior below) to it, exactly as forward/diagnostics do, so the
@@ -2159,7 +2180,8 @@ class VFEModel(nn.Module):
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
         if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
             log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None)[0]
+                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
+                                               reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None)[0]
         fam = get_family(cfg.family)
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
         mu_p, sigma_p = belief.mu, belief.sigma
@@ -2264,7 +2286,8 @@ class VFEModel(nn.Module):
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
-                             omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
+                             omega=enc.omega[0] if enc.omega is not None else None,   # carry the GL(K) frame under omega_direct
+                             reflection=enc.reflection[0] if enc.reflection is not None else None)   # carry the phi-path reflection sign
         if cfg.s_e_step:                                              # anchor q0 + handoff to refined s (as forward)
             s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
             belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
@@ -2273,7 +2296,8 @@ class VFEModel(nn.Module):
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior
         if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
             log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None)[0]
+                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
+                                               reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None)[0]
         fam = get_family(cfg.family)
         _lb = cfg.lambda_beta
         _tau = attention_tau(self.effective_kappa_beta(belief.mu.device), self.group.irrep_dims)

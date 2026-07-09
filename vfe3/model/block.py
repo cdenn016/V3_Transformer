@@ -114,10 +114,10 @@ def vfe_block(
         capture["converged"] = out
     if head_mixer is not None:               # opt-in head mixing: after the E-step, BEFORE the norm
         mu_mixed, sigma_mixed = head_mixer(out.mu, out.sigma)   # so the mixed belief feeds norm + handoff
-        out = BeliefState(mu=mu_mixed, sigma=sigma_mixed, phi=out.phi)   # (per-block apply order)
+        out = out._replace(mu=mu_mixed, sigma=sigma_mixed)   # (per-block apply order); _replace preserves phi/omega/reflection
     if cg_coupling is not None:              # opt-in CG cross-type coupling: after mixing, before norm
         mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)
-        out = BeliefState(mu=mu_cg, sigma=sigma_cg, phi=out.phi)
+        out = out._replace(mu=mu_cg, sigma=sigma_cg)   # _replace preserves phi/omega/reflection
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
-        out = BeliefState(mu=block_norm(out.mu, out.sigma), sigma=out.sigma, phi=out.phi)
+        out = out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/omega/reflection
     return out
