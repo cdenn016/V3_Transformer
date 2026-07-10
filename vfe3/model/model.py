@@ -1468,10 +1468,14 @@ class VFEModel(nn.Module):
         -> cfg.lambda_h*KL with R_h=0 (byte-identical to the pre-registry cfg.lambda_h weighting);
         ``state_dependent`` -> the envelope lambda_h*_i = c0_h/(b0_h+KL) PLUS R_h, left UNDETACHED so
         autograd's product rule cancels to lambda_h*_i dKL by the envelope theorem (R_h must be in F
-        for that cancellation).
+        for that cancellation). ``cfg.lambda_h == 0.0`` is an absolute gate evaluated before mode
+        dispatch, including for state-dependent forms whose registry implementation ignores ``value``.
         """
-        from vfe3.lambda_h_i import hyper_prior_lambda_h, lambda_h_is_per_coord
         cfg = self.cfg
+        if cfg.lambda_h == 0.0:
+            kl_s = self._hyper_prior_kl(token_ids, s_belief=s_belief)
+            return torch.zeros_like(kl_s)
+        from vfe3.lambda_h_i import hyper_prior_lambda_h, lambda_h_is_per_coord
         per_coord = lambda_h_is_per_coord(cfg.lambda_h_mode)
         kl_s = self._hyper_prior_kl(token_ids, s_belief=s_belief, per_coord=per_coord)  # (B,N) or (B,N,K)
         lam, reg = hyper_prior_lambda_h(
