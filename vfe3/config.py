@@ -2198,8 +2198,10 @@ class VFE3Config:
                 import warnings
                 warnings.warn(
                     f"e_step_update='mm_exact' with lambda_alpha_mode={self.lambda_alpha_mode!r} "
-                    "exactly minimizes a frozen state-dependent-alpha majorizer per iteration; "
-                    "it is not one-step exact for the profiled state-dependent-alpha objective.",
+                    "computes the frozen state-dependent-alpha majorizer minimizer; the iteration "
+                    f"takes a step toward it using mm_damping={self.mm_damping} (a damped step for "
+                    "values below 1.0, the full step at 1.0). It is not one-step exact for the "
+                    "profiled state-dependent-alpha objective.",
                     UserWarning,
                     stacklevel=2,
                 )

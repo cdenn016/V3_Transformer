@@ -66,6 +66,23 @@ def test_state_dependent_alpha_mm_warning_says_majorizer_not_one_step_exact() ->
     assert "not one-step exact" in messages
 
 
+def test_state_dependent_alpha_mm_damped_warning_separates_target_and_step() -> None:
+    with pytest.warns(UserWarning) as records:
+        VFE3Config(
+            embed_dim=4,
+            n_heads=2,
+            e_step_update="mm_exact",
+            mm_damping=0.5,
+            lambda_alpha_mode="state_dependent",
+        )
+
+    messages = _warning_messages(records)
+    assert "computes the frozen state-dependent-alpha majorizer minimizer" in messages
+    assert "a damped step for values below 1.0" in messages
+    assert "the full step at 1.0" in messages
+    assert "exactly minimizes" not in messages
+
+
 def test_skip_sigma_oracle_never_requests_sigma_autograd(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
