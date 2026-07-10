@@ -3301,9 +3301,9 @@ PUB_LABELS: Dict[str, str] = {
     "sigma_trace_cv":     r"$\mathrm{CV}_i[\mathrm{tr}\,\Sigma_i]$",
     "sigma_ce_spearman":  r"$\rho_s(\mathrm{tr}\,\Sigma,\ \mathrm{CE})$",
     "fd_gradient_worst_rel_error": "finite-diff worst rel. error",
-    "freq_strata_ce.rare":     r"$\mathrm{CE}_{\mathrm{rare}}$ (nats)",
-    "freq_strata_ce.mid":      r"$\mathrm{CE}_{\mathrm{mid}}$ (nats)",
-    "freq_strata_ce.frequent": r"$\mathrm{CE}_{\mathrm{frequent}}$ (nats)",
+    "corpus_freq_strata_ce.rare":     r"$\mathrm{CE}_{\mathrm{rare}}$ (nats)",
+    "corpus_freq_strata_ce.mid":      r"$\mathrm{CE}_{\mathrm{mid}}$ (nats)",
+    "corpus_freq_strata_ce.frequent": r"$\mathrm{CE}_{\mathrm{frequent}}$ (nats)",
     # -- geometry-health dashboard (gauge / SPD / Fisher / guard) --
     "holonomy_wilson":         r"Wilson holonomy $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$ (gauge-invariant)",
     "cocycle_residual":        "cocycle residual (flatness)",

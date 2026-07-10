@@ -584,19 +584,22 @@ def _write_provenance(
 
 @torch.no_grad()
 def _calibration_and_strata(
-    model:       torch.nn.Module,
-    test_loader: Iterable,
-    device:      torch.device,
+    corpus_counts: torch.Tensor,             # (V,) training-corpus unigram counts
+
+    model:         torch.nn.Module,
+    test_loader:   Iterable,
+    device:        torch.device,
 
     *,
     max_batches: int = 20,
     n_bins:      int = 15,
 ) -> Dict[str, object]:
-    r"""Decode calibration (ECE + reliability curve) and token-frequency-stratified CE over the test
+    r"""Decode calibration (ECE + reliability curve) and corpus-frequency-stratified CE over the test
     split. The decode is non-standard (KL-to-prior Mahalanobis or mu @ W^T with Sigma feeding the
     logit scale), so a mis-scaled ``decode_log_scale`` can leave PPL acceptable while the probability
-    mass is wrong -- PPL alone cannot catch it. The frequency strata expose prior-table tail
-    stagnation (rare-token rows may be undertrained). Off-graph; capped at ``max_batches``."""
+    mass is wrong -- PPL alone cannot catch it. Bucket membership comes from training-corpus unigram
+    counts while the aggregated CE remains the sampled held-out CE. The strata expose prior-table
+    tail stagnation (rare-token rows may be undertrained). Off-graph; capped at ``max_batches``."""
     import torch.nn.functional as F
 
     confs, corrects, nats, tgts = [], [], [], []
@@ -628,15 +631,20 @@ def _calibration_and_strata(
             acc, cf, w = corr[m].mean(), conf[m].mean(), m.float().mean()
             ece += float(w * (acc - cf).abs())
             rel.append({"conf": float(cf), "acc": float(acc), "frac": float(w)})
-    counts = torch.bincount(tg, minlength=int(tg.max()) + 1).float()
-    tok_count = counts[tg]                                      # unigram count of each token's target
+    if corpus_counts.ndim != 1:
+        raise ValueError("corpus_counts must be a one-dimensional training-corpus bincount")
+    counts = corpus_counts.to(device=tg.device)
+    if int(tg.max()) >= counts.numel():
+        raise ValueError("corpus_counts does not cover every sampled evaluation target")
+    tok_count = counts[tg].float()                              # training-corpus count of each target
     q1, q2 = torch.quantile(tok_count, torch.tensor([1 / 3, 2 / 3], device=tok_count.device)).tolist()
     strata = {}
     for name, mask in (("rare", tok_count <= q1),
                        ("mid", (tok_count > q1) & (tok_count <= q2)),
                        ("frequent", tok_count > q2)):
         strata[name] = float(nat[mask].mean()) if mask.any() else float("nan")
-    return {"ece": ece, "reliability": rel, "overall_ce": float(nat.mean()), "freq_strata_ce": strata}
+    return {"ece": ece, "reliability": rel, "overall_ce": float(nat.mean()),
+            "corpus_freq_strata_ce": strata}
 
 
 def _fd_gradient_check(
@@ -691,6 +699,7 @@ def _write_research_artifacts(
     model:       torch.nn.Module,
     artifacts:   RunArtifacts,
     cfg:         VFE3Config,
+    train_loader: Optional[Iterable],
     test_loader: Optional[Iterable],
     device:      torch.device,
     logger:      logging.Logger,
@@ -702,7 +711,15 @@ def _write_research_artifacts(
         return
     out: Dict[str, object] = {}
     try:
-        out.update(_calibration_and_strata(model, test_loader, device))
+        train_dataset = getattr(train_loader, "dataset", None)
+        train_tokens = getattr(train_dataset, "tokens", None)
+        if train_tokens is None:
+            raise ValueError("training loader dataset does not expose corpus tokens")
+        corpus_counts = torch.bincount(
+            train_tokens.detach().reshape(-1).to(device="cpu", dtype=torch.long),
+            minlength=int(cfg.vocab_size),
+        )
+        out.update(_calibration_and_strata(corpus_counts, model, test_loader, device))
     except Exception as exc:
         logger.warning("calibration/strata probe failed (%s); skipped", exc)
     try:
@@ -949,10 +966,10 @@ def finalize_run(
     except Exception as exc:
         logger.warning("pure-path report failed (%s); skipped", exc)
 
-    # Research artifacts (decode calibration / frequency-stratified loss / FD gradient check) -- the
+    # Research artifacts (decode calibration / corpus-frequency-stratified loss / FD gradient check) --
     # externally-grounded probes that do NOT presuppose the gauge framework. Best-effort, AFTER the
     # test-eval n_e_steps restore so the model is in its trained state. Run before the figure pass.
-    _write_research_artifacts(model, artifacts, cfg, test_loader, device, logger)
+    _write_research_artifacts(model, artifacts, cfg, train_loader, test_loader, device, logger)
 
     _save_figures(artifacts, losses, logger)
     # Single-run publication figure set (model-replay), auto-run at the end of training unless

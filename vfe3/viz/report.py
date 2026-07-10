@@ -354,11 +354,25 @@ def vocab_comparison_figures(
     Loads each trained run, runs the single ``vocab_prediction_stats`` pass, and writes the four
     arm-list figures (probability heatmap / calibration / confusion / decode readout) with one
     column per run -- the side-by-side collapse contrast the single-run :func:`generate_figures`
-    pipeline cannot make (it sees one model). Each figure is best-effort: a failure is logged and
-    skipped. ``labels`` default to ``K<embed_dim>``; the decoder is taken from the first run's
-    dataset (the confusion figure is skipped when no tokenizer is available).
+    pipeline cannot make (it sees one model). Every arm must use the same tokenizer tag; mixed
+    tokenizers are rejected before any model load or plotting because one shared decoder cannot
+    label them honestly. Each figure is best-effort: a failure is logged and skipped. ``labels``
+    default to ``K<embed_dim>``; the decoder is taken from the first run's dataset after that identity
+    check (the confusion figure is skipped when no tokenizer is available).
     """
+    from vfe3.data.datasets import _tokenizer_tag
     from vfe3.model.model import VFEModel
+
+    prepared = []
+    for rd in run_dirs:
+        run_dir = Path(rd)
+        cfg, dataset = _load_config(run_dir)
+        prepared.append((run_dir, cfg, dataset, _tokenizer_tag(dataset)))
+    tokenizer_tags = {arm[3] for arm in prepared}
+    if len(tokenizer_tags) > 1:
+        details = ", ".join(f"{run_dir}: {tag}" for run_dir, _, _, tag in prepared)
+        raise ValueError(f"mixed tokenizer tags in vocabulary comparison: {details}")
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     logger = logger or logging.getLogger(__name__)
@@ -367,9 +381,7 @@ def vocab_comparison_figures(
     arms_pred: List[dict] = []
     arms_readout: List[dict] = []
     decode = None
-    for i, rd in enumerate(run_dirs):
-        rd = Path(rd)
-        cfg, dataset = _load_config(rd)
+    for i, (rd, cfg, dataset, _) in enumerate(prepared):
         model = VFEModel(cfg)
         best = rd / "best_model.pt"
         if not best.exists():

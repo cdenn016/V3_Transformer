@@ -23,7 +23,7 @@ from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
 from vfe3 import run_artifacts
-from vfe3.run_artifacts import RunArtifacts, _pure_path_report, finalize_run
+from vfe3.run_artifacts import RunArtifacts, _calibration_and_strata, _pure_path_report, finalize_run
 from vfe3.train import build_optimizer, train
 
 
@@ -230,6 +230,41 @@ def test_finalize_run_writes_test_results_and_figures(tmp_path):
     summary = json.loads((tmp_path / "run" / "summary.json").read_text())
     assert "test_ppl" in summary and "best_val_ppl" in summary
     assert "reloaded_best" in summary   # m26: surface whether best_model.pt was reloaded (cross-dir resume honesty)
+
+
+def test_frequency_strata_use_training_corpus_counts():
+    class _FixedLogits(torch.nn.Module):
+        def __init__(self, logits: torch.Tensor) -> None:
+            super().__init__()
+            self.register_buffer("logits", logits)
+
+        def forward(self, _tokens: torch.Tensor) -> torch.Tensor:
+            return self.logits
+
+    targets = torch.tensor([[0, 0, 1, 1, 2, 2]])
+    tokens = torch.zeros_like(targets)
+    logits = torch.tensor([[[4.0, 0.0, 0.0], [2.0, 0.0, 0.0],
+                            [0.0, 3.0, 0.0], [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 2.0], [0.0, 0.0, 0.5]]])
+    corpus_counts = torch.tensor([1, 10, 100])
+
+    out = _calibration_and_strata(
+        corpus_counts,
+        _FixedLogits(logits),
+        [(tokens, targets)],
+        torch.device("cpu"),
+    )
+
+    ce = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        targets.reshape(-1),
+        reduction="none",
+    )
+    strata = out["corpus_freq_strata_ce"]
+    assert strata["rare"] == pytest.approx(float(ce[:2].mean()))
+    assert strata["mid"] == pytest.approx(float(ce[2:4].mean()))
+    assert strata["frequent"] == pytest.approx(float(ce[4:].mean()))
+    assert "freq_strata_ce" not in out
 
 
 def test_provenance_records_all_split_hashes_and_data_knobs(tmp_path):

@@ -315,7 +315,15 @@ def test_finalize_writes_tier3_research_and_provenance() -> None:
         art = RunArtifacts(tmp, cfg, model, dataset="synthetic-period3", device=str(DEVICE))
         losses = train(model, loader, cfg, n_steps=24, log_interval=6, eval_interval=12,
                        val_loader=loader, artifacts=art, device=DEVICE, generate_samples=False)
-        res = finalize_run(model, art, cfg, test_loader=loader, losses=losses, device=DEVICE)
+        res = finalize_run(
+            model,
+            art,
+            cfg,
+            train_loader=loader,
+            test_loader=loader,
+            losses=losses,
+            device=DEVICE,
+        )
         root = Path(tmp)
         # the n_e_steps=0 capacity-gain falsifier is computed and the budget is restored
         assert "estep_capacity_gain" in res and math.isfinite(res["estep_capacity_gain"])
@@ -339,7 +347,7 @@ def test_finalize_writes_tier3_research_and_provenance() -> None:
         assert summ["scaling_point"]["tokens_seen"] == cfg.max_steps * cfg.batch_size * cfg.max_seq_len
         # research.json: calibration + frequency strata + FD gradient check
         rj = json.loads((root / "research.json").read_text())
-        assert math.isfinite(rj["ece"]) and "freq_strata_ce" in rj
+        assert math.isfinite(rj["ece"]) and "corpus_freq_strata_ce" in rj
         assert math.isfinite(rj["fd_gradient_worst_rel_error"]) and rj["fd_gradient_worst_rel_error"] >= 0.0
         # history-only trend figures
         for fig in ("grad_norm.png", "belief_condition.png", "estep_convergence_trend.png"):

@@ -23,6 +23,7 @@ see docs/experiments/2026-06-21-experiment-readiness.md (S6).
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import re
@@ -37,6 +38,59 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _strip_seed_keys(value: Any) -> Any:
+    """Recursively remove exact ``seed`` keys while preserving every other serialized value."""
+    if isinstance(value, dict):
+        return {key: _strip_seed_keys(item) for key, item in value.items() if key != "seed"}
+    if isinstance(value, list):
+        return [_strip_seed_keys(item) for item in value]
+    return value
+
+
+def _semantic_config(config_path: Path) -> Dict[str, Any]:
+    """Load one current nested or legacy flat config artifact and remove only exact seed keys."""
+    try:
+        serialized = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"cannot aggregate {config_path.parent}: expected a readable config.json at {config_path}"
+        ) from exc
+    if not isinstance(serialized, dict):
+        raise ValueError(f"cannot aggregate {config_path.parent}: config.json must contain an object")
+    semantic = serialized.get("config", serialized)
+    if not isinstance(semantic, dict):
+        raise ValueError(
+            f"cannot aggregate {config_path.parent}: config.json['config'] must contain an object"
+        )
+    return _strip_seed_keys(semantic)
+
+
+def _config_fingerprint(config_path: Path) -> str:
+    """Deterministic SHA-256 identity of one seed-normalized semantic config."""
+    normalized = json.dumps(
+        _semantic_config(config_path),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(normalized).hexdigest()
+
+
+def _assert_homogeneous_configs(run_dirs: List[Path]) -> Optional[str]:
+    """Return the shared semantic fingerprint or abort with each distinct fingerprint and path."""
+    groups: Dict[str, List[Path]] = {}
+    for run_dir in run_dirs:
+        config_path = run_dir / "config.json"
+        fingerprint = _config_fingerprint(config_path)
+        groups.setdefault(fingerprint, []).append(config_path)
+    if len(groups) > 1:
+        detail = ["mixed semantic config fingerprints; refusing across-seed aggregation:"]
+        for fingerprint, paths in sorted(groups.items()):
+            detail.extend(f"  {fingerprint}  {path}" for path in paths)
+        raise ValueError("\n".join(detail))
+    return next(iter(groups), None)
 
 
 def _as_finite_float(v: Any) -> Optional[float]:
@@ -62,14 +116,17 @@ def aggregate_seed_metric(
     Non-finite or unreadable points are skipped (never crash the aggregation).
     """
     root = Path(run_root)
+    run_dirs = sorted({path.parent for path in root.rglob(filename)})
+    _assert_homogeneous_configs(run_dirs)
     values: List[float] = []
     seeds: List[Optional[int]] = []
-    for f in sorted(root.rglob(filename)):
+    for run_dir in run_dirs:
+        f = run_dir / filename
         v = _as_finite_float(_read_json(f).get(key))
         if v is None:
             continue
         values.append(v)
-        seeds.append(_seed_for(f.parent, config_name=seed_file))
+        seeds.append(_seed_for(run_dir, config_name=seed_file))
 
     out = _summarize(values)
     out["seeds"] = seeds
@@ -139,11 +196,12 @@ def _seed_dirs(root: Path) -> List[Path]:
         if p.is_dir() and any((p / f).exists()
                               for f in ("summary.json", "provenance.json", "config.json")):
             out.append(p)
+    _assert_homogeneous_configs(out)
     return out
 
 
 def _dig(d: Dict[str, Any], dotted: str) -> Any:
-    r"""Nested lookup by dotted key (``"freq_strata_ce.rare"``); None if any level is missing."""
+    r"""Nested lookup by dotted key (``"corpus_freq_strata_ce.rare"``); None if missing."""
     cur: Any = d
     for part in dotted.split("."):
         if not isinstance(cur, dict) or part not in cur:
@@ -161,7 +219,7 @@ def aggregate_scalar(
 ) -> Dict[str, Any]:
     r"""Across-seed summary of one (possibly dotted) scalar ``key``, searching ``sources`` in order
     per seed dir. Same return shape as :func:`aggregate_seed_metric`. Handles ``research.json`` keys
-    (ECE, ``freq_strata_ce.rare``, ...) that never appear in ``summary.json``.
+    (ECE, ``corpus_freq_strata_ce.rare``, ...) that never appear in ``summary.json``.
     """
     root = _resolve_run_root(run_root)
     values: List[float] = []
@@ -324,7 +382,7 @@ SCALAR_KEYS: List[str] = [
     "test_ppl", "best_val_ppl", "test_ce", "test_bpc", "test_ce_no_estep", "estep_capacity_gain",
     "wall_time_s", "ece", "overall_ce", "sigma_trace_cv", "sigma_ce_spearman",
     "fd_gradient_worst_rel_error",
-    "freq_strata_ce.rare", "freq_strata_ce.mid", "freq_strata_ce.frequent",
+    "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
 ]
 
 # Per-step curves to draw an across-seed band for: (metrics.csv column, log-y?). Axis/title labels
@@ -528,6 +586,7 @@ def main() -> None:
 
     manifest = {
         "run_root": str(root),
+        "config_fingerprint": _config_fingerprint(seed_dirs[0] / "config.json"),
         "n_seeds": len(seed_dirs),
         "seeds": seeds,
         "caveat": CAVEAT,
