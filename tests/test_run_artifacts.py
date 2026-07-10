@@ -115,6 +115,28 @@ def test_writes_are_atomic_no_temp_left(tmp_path):
     assert ckpt["step"] == 2
 
 
+@pytest.mark.parametrize("name", [".", "..", "a/b", r"a\b", "C:evil"])
+def test_save_json_rejects_non_bare_filename(tmp_path, name):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+
+    with pytest.raises(ValueError, match="bare filename"):
+        art.save_json(name, {"unsafe": True})
+
+
+def test_save_json_rejects_absolute_filename(tmp_path):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    outside = tmp_path / "outside.json"
+
+    with pytest.raises(ValueError, match="bare filename"):
+        art.save_json(str(outside), {"unsafe": True})
+
+    assert not outside.exists()
+
+
 def test_best_model_overwrite_replaces(tmp_path):
     # C11: os.replace over an EXISTING best_model.pt succeeds (Windows lock retry path aside),
     # and the file reloads to the improved (second) state_dict.

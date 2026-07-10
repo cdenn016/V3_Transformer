@@ -53,6 +53,7 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import time
 from dataclasses import asdict, fields as dataclass_fields
 from pathlib import Path
@@ -1695,16 +1696,23 @@ _CSV_COLUMNS = [
     "wall_time_s", "seed", "error",
 ]
 
+_DIAGNOSTIC_RESULT_KEYS = {
+    "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
+    "rank_resid", "rank_resid_by_layer", "cov_gap", "energy_klmax_frac",
+}
+
 
 def _cell_is_current(
     run_dir:    Path,
     overrides:  Dict[str, Any],
 
     *,
-    seed:       int,
-    dataset:    str,
-    max_steps:  Optional[int] = None,
-    max_tokens: Optional[int] = None,
+    seed:                  int,
+    dataset:               str,
+    collect_diagnostics:   bool = False,
+    collect_extrapolation: bool = False,
+    max_steps:             Optional[int] = None,
+    max_tokens:            Optional[int] = None,
 ) -> bool:
     r"""True iff a completed cell's persisted config.json matches the config we would build now.
 
@@ -1722,6 +1730,11 @@ def _cell_is_current(
     field, so it never lands in config.json: a smoke cell capped at 10k tokens and a later full run
     would otherwise compare byte-identical. It is persisted in the ``ablation_result.json`` marker
     and compared here (a marker missing the key reads as None -> a capped re-run fails closed).
+
+    A current marker must also record successful completion with a finite terminal validation PPL.
+    Requested diagnostic and extrapolation collections are cache requirements: the marker must record
+    the corresponding request flag and contain its output, so enabling either collection cannot reuse
+    a headline-only cell.
     """
     cj = run_dir / "config.json"
     if not cj.exists():
@@ -1740,8 +1753,30 @@ def _cell_is_current(
         marker = json.loads((run_dir / "ablation_result.json").read_text(encoding="utf-8"))
     except Exception:                                        # no/unreadable marker -> re-run
         return False
+    if not isinstance(marker, dict):                         # parseable but incomplete marker -> re-run
+        return False
     cur = int(max_tokens) if max_tokens is not None else None
-    return marker.get("max_tokens", None) == cur
+    if marker.get("max_tokens", None) != cur:
+        return False
+    if marker.get("status") != "success" or marker.get("error_kind") is not None:
+        return False
+    try:
+        terminal_ppl = float(marker["final_val_ppl"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not math.isfinite(terminal_ppl):
+        return False
+    if collect_diagnostics:
+        if marker.get("collect_diagnostics") is not True:
+            return False
+        if not any(key in marker for key in _DIAGNOSTIC_RESULT_KEYS):
+            return False
+    if collect_extrapolation:
+        if marker.get("collect_extrapolation") is not True:
+            return False
+        if not isinstance(marker.get("extrap_ce"), list):
+            return False
+    return True
 
 
 def _sanitize(label: str) -> str:
@@ -1804,6 +1839,8 @@ def run_sweep(
     sweep_dir = output_dir / sweep_name
     sweep_dir.mkdir(parents=True, exist_ok=True)
     runs = make_run_overrides(sweep_name)
+    collect_diagnostics   = bool(sweep.get("collect_diagnostics", False))
+    collect_extrapolation = bool(sweep.get("collect_extrapolation", False))
     # Multi-seed (I1/EXP-1): a sweep may declare ``seeds`` to replicate every cell across seeds for an
     # across-seed error bar. Each (cell, seed) gets its own ``{label}__s{seed}`` run dir and result row
     # (the seed also lives in the existing ``seed`` column), so the across-seed aggregate is a plain
@@ -1827,7 +1864,9 @@ def run_sweep(
 
         if resume and marker.exists():
             if _cell_is_current(run_dir, overrides, seed=cell_seed, max_steps=max_steps,
-                                max_tokens=max_tokens, dataset=dataset):
+                                max_tokens=max_tokens, dataset=dataset,
+                                collect_diagnostics=collect_diagnostics,
+                                collect_extrapolation=collect_extrapolation):
                 print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
                 results.append(json.loads(marker.read_text(encoding="utf-8")))
                 continue
@@ -1837,8 +1876,8 @@ def run_sweep(
         t0 = time.perf_counter()
         try:
             result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
-                                 seed=cell_seed, collect_diagnostics=sweep.get("collect_diagnostics", False),
-                                 collect_extrapolation=sweep.get("collect_extrapolation", False),
+                                 seed=cell_seed, collect_diagnostics=collect_diagnostics,
+                                 collect_extrapolation=collect_extrapolation,
                                  max_tokens=max_tokens, max_steps=max_steps)
         except Exception as exc:                             # a training crash must not kill the sweep
             logger.exception("sweep %s / %s crashed", sweep_name, label)
@@ -1848,6 +1887,15 @@ def run_sweep(
         finally:
             _cleanup()
 
+        result.setdefault("error_kind", None)
+        result["collect_diagnostics"]   = collect_diagnostics
+        result["collect_extrapolation"] = collect_extrapolation
+        try:
+            terminal_ppl = float(result["final_val_ppl"])
+        except (KeyError, TypeError, ValueError):
+            terminal_ppl = float("nan")
+        successful = result["error_kind"] is None and math.isfinite(terminal_ppl)
+        result["status"] = "success" if successful else "failed"
         result["sweep"] = sweep_name
         result["wall_time_s"] = time.perf_counter() - t0
         marker.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")

@@ -130,6 +130,9 @@ class RunArtifacts:
 
         Atomic: written to a same-directory ``.tmp`` then published via ``os.replace``, so a crash
         mid-write can never leave a truncated/partial JSON at the final name."""
+        candidate = Path(name)
+        if candidate.name != name or candidate.is_absolute() or name in {".", ".."}:
+            raise ValueError(f"artifact name must be a regular bare filename, got {name!r}")
         path = self.run_dir / name
         tmp  = self.run_dir / (name + ".tmp")
         tmp.write_text(json.dumps(obj, indent=2, default=str))

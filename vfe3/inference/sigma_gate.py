@@ -189,8 +189,18 @@ def write_sigma_gate_artifact(
     slug = re.sub(r"[^A-Za-z0-9._-]", "_", checkpoint_id).strip("._") or "artifact"
     h    = hashlib.sha1(checkpoint_id.encode("utf-8")).hexdigest()[:8]
     path = os.path.join(out_dir, f"{slug}__{h}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    tmp  = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
     return path
 
 
