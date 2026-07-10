@@ -7,7 +7,7 @@ A training run produces a self-contained directory::
       metrics.csv        one row per periodic eval (step, train_loss, lr, val_ce/ppl/bpc, diagnostics)
       checkpoints/
         step_<N>.pt      resumable {step, model_state, optimizer_state, config}
-      best_model.pt      model.state_dict() at the lowest validation PPL seen so far
+      best_model.pt      {model_state, config, config_fingerprint} at the lowest validation PPL
       test_results.json  end-of-run TEST-split eval on the reloaded best checkpoint
       summary.json       headline numbers (best_val_ppl, test_ppl, wall_time, ...)
       loss_curve.png     training cross-entropy trajectory
@@ -34,7 +34,7 @@ import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path, PureWindowsPath
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import torch
 
@@ -48,6 +48,14 @@ def _require_nonnegative_int(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"data_state {field} must be a non-negative integer")
     return value
+
+
+def semantic_config_fingerprint(
+    config: Mapping[str, Any],
+) -> str:
+    """Return the stable SHA-256 fingerprint of a normalized semantic config mapping."""
+    normalized = json.dumps(dict(config), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _atomic_replace(
@@ -162,15 +170,21 @@ class RunArtifacts:
             csv.DictWriter(fh, fieldnames=self._fieldnames).writerow(csv_row)
 
     def maybe_save_best(self, step: int, model: torch.nn.Module, val_ppl: float) -> bool:
-        r"""Save ``model.state_dict()`` to ``best_model.pt`` iff ``val_ppl`` is a new minimum.
+        r"""Save weights bound to their semantic config iff ``val_ppl`` is a new minimum.
 
         Atomic (same-dir tmp + ``os.replace``): a crash or Windows lock mid-save can never leave a
         corrupt/unreadable ``best_model.pt`` where a good one stood."""
         if val_ppl < self.best_val_ppl:
             self.best_val_ppl = float(val_ppl)
             self.best_step = int(step)
+            config = asdict(self.cfg)
+            bundle = {
+                "model_state":        model.state_dict(),
+                "config":             config,
+                "config_fingerprint": semantic_config_fingerprint(config),
+            }
             tmp = self.best_path.with_suffix(".pt.tmp")
-            torch.save(model.state_dict(), tmp)
+            torch.save(bundle, tmp)
             _atomic_replace(self.best_path, tmp)
             return True
         return False
@@ -864,10 +878,23 @@ def finalize_run(
 
     reloaded_best = False
     if artifacts.best_path.exists():
-        # best_model.pt is a pure state_dict (torch.save(model.state_dict(), ...)), so weights_only=True
-        # loads it identically while refusing arbitrary pickle execution on a tampered checkpoint
-        # (matches the datasets.py precedent).
-        model.load_state_dict(torch.load(artifacts.best_path, map_location=device, weights_only=True))
+        bundle = torch.load(artifacts.best_path, map_location=device, weights_only=True)
+        if not isinstance(bundle, Mapping) or not {
+                "model_state", "config", "config_fingerprint"}.issubset(bundle):
+            raise ValueError(
+                f"best checkpoint {artifacts.best_path} is not a semantic best-model bundle")
+        saved_config = bundle["config"]
+        if not isinstance(saved_config, Mapping):
+            raise ValueError(
+                f"best checkpoint {artifacts.best_path} has a non-mapping config")
+        saved_fingerprint = semantic_config_fingerprint(saved_config)
+        if bundle["config_fingerprint"] != saved_fingerprint:
+            raise ValueError(
+                f"best checkpoint {artifacts.best_path} has a config fingerprint mismatch")
+        if saved_fingerprint != semantic_config_fingerprint(asdict(cfg)):
+            raise ValueError(
+                f"best checkpoint {artifacts.best_path} does not match the active config")
+        model.load_state_dict(bundle["model_state"])
         reloaded_best = True
         logger.info("Reloaded best-val checkpoint (step %s, val PPL %.3f) for test eval",
                     artifacts.best_step, artifacts.best_val_ppl)

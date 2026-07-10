@@ -15,6 +15,7 @@ oracles therefore use max_new_tokens=1.
 import pytest
 import torch
 
+import generate_efe
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
@@ -208,3 +209,61 @@ def test_policy_mode_rejects_call_time_sampler_knobs():
     # the call-time defaults (temperature=1.0, no top_k/top_p) are accepted; greedy is honored
     out = model.generate(prompt, max_new_tokens=2, greedy=True)
     assert out.shape == (2, 3 + 2) and (out >= 0).all() and (out < V).all()
+
+
+def test_generate_efe_builds_both_arms_before_pairing_cpu_and_cuda_rng(monkeypatch):
+    events = []
+    cpu_states = []
+    cuda_states = []
+    cuda_current = [torch.tensor([11], dtype=torch.uint8)]
+
+    def fake_build(config_dict, state_dict, *, policy_overrides, device):
+        events.append(("build", policy_overrides["policy_mode"]))
+        torch.rand(1)                                             # construction may consume global RNG
+        return policy_overrides["policy_mode"]
+
+    def fake_generate(prompt_ids, model, cfg):
+        events.append(("generate", model))
+        cpu_states.append(torch.random.get_rng_state().clone())
+        cuda_states.append([state.clone() for state in cuda_current])
+        torch.rand(3)                                             # stand in for stochastic token sampling
+        cuda_current[0] = torch.tensor([99], dtype=torch.uint8)
+        return torch.tensor([[0]], dtype=torch.long)
+
+    def fake_cuda_get_rng_state_all():
+        return [state.clone() for state in cuda_current]
+
+    def fake_cuda_set_rng_state_all(states):
+        cuda_current[:] = [state.clone() for state in states]
+
+    monkeypatch.setattr(generate_efe, "_build_model", fake_build)
+    monkeypatch.setattr(generate_efe, "_generate", fake_generate)
+    monkeypatch.setattr(generate_efe.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(generate_efe.torch.cuda, "get_rng_state_all", fake_cuda_get_rng_state_all)
+    monkeypatch.setattr(generate_efe.torch.cuda, "set_rng_state_all", fake_cuda_set_rng_state_all)
+    cfg = {
+        "policy_mode":        "efe_one_step",
+        "policy_preference":  "flat",
+        "policy_score_terms": ("ambiguity",),
+        "policy_top_k":       8,
+        "policy_precision":   1.0,
+        "policy_horizon":     1,
+        "max_new_tokens":     1,
+        "greedy":             False,
+    }
+
+    torch.manual_seed(7)
+    base_out, policy_out = generate_efe._run_generation_arms(
+        torch.tensor([[1]], dtype=torch.long), {}, {}, cfg, device="cpu",
+    )
+
+    assert events == [
+        ("build", "none"),
+        ("build", "efe_one_step"),
+        ("generate", "none"),
+        ("generate", "efe_one_step"),
+    ]
+    assert torch.equal(cpu_states[0], cpu_states[1])
+    assert torch.equal(cuda_states[0][0], cuda_states[1][0])
+    assert base_out.tolist() == [[0]]
+    assert policy_out.tolist() == [[0]]

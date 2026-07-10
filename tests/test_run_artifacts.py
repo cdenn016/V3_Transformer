@@ -14,6 +14,7 @@ import math
 import os
 import subprocess
 import types
+from dataclasses import asdict
 
 import pytest
 import torch
@@ -23,7 +24,13 @@ from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
 from vfe3 import run_artifacts
-from vfe3.run_artifacts import RunArtifacts, _calibration_and_strata, _pure_path_report, finalize_run
+from vfe3.run_artifacts import (
+    RunArtifacts,
+    _calibration_and_strata,
+    _pure_path_report,
+    finalize_run,
+    semantic_config_fingerprint,
+)
 from vfe3.train import build_optimizer, train
 
 
@@ -83,6 +90,25 @@ def test_maybe_save_best_only_on_improvement(tmp_path):
     assert art.best_val_ppl == 8.0 and art.best_step == 3
 
 
+def test_best_model_bundle_embeds_semantic_config_fingerprint(tmp_path):
+    cfg = _cfg(n_e_steps=3)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+
+    assert art.maybe_save_best(1, model, 5.0) is True
+    bundle = torch.load(art.best_path, weights_only=True)
+
+    assert set(bundle) == {"model_state", "config", "config_fingerprint"}
+    assert bundle["config"] == asdict(cfg)
+    expected = hashlib.sha256(json.dumps(
+        bundle["config"], sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    assert bundle["config_fingerprint"] == expected
+    assert bundle["config_fingerprint"] == semantic_config_fingerprint(bundle["config"])
+    reordered = dict(reversed(list(bundle["config"].items())))
+    assert semantic_config_fingerprint(reordered) == bundle["config_fingerprint"]
+
+
 def test_save_checkpoint_is_loadable(tmp_path):
     cfg = _cfg()
     model = VFEModel(cfg)
@@ -110,7 +136,7 @@ def test_writes_are_atomic_no_temp_left(tmp_path):
     assert list((tmp_path / "r").rglob("*.tmp")) == []          # run_dir AND ckpt_dir hold no temps
     assert json.loads((tmp_path / "r" / "summary.json").read_text()) == {"a": 1}
     best = torch.load(tmp_path / "r" / "best_model.pt", weights_only=True)
-    assert set(best) == set(model.state_dict())
+    assert set(best["model_state"]) == set(model.state_dict())
     ckpt = torch.load(p, weights_only=True)
     assert ckpt["step"] == 2
 
@@ -149,7 +175,7 @@ def test_best_model_overwrite_replaces(tmp_path):
     with torch.no_grad():
         model.prior_bank.mu_embed.add_(1.0)                     # make the second save distinguishable
     assert art.maybe_save_best(2, model, 8.0) is True           # improved -> replaces the existing file
-    loaded = torch.load(tmp_path / "r" / "best_model.pt", weights_only=True)
+    loaded = torch.load(tmp_path / "r" / "best_model.pt", weights_only=True)["model_state"]
     cur = model.state_dict()
     assert all(torch.equal(loaded[k], cur[k]) for k in cur)     # the SECOND state won
 
