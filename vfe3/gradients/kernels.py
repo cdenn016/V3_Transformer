@@ -439,7 +439,8 @@ def mm_exact_update(
         sigma*_ik = ( m_i a_i + Sum_j w_ij^(h(k)) ) / P_ik,
         P_ik      =   m_i a_i / sigma_p,ik + Sum_j w_ij^(h(k)) / sigma_t,ijk,
 
-    with m_i the kernel's self-term saturation mask and a_i the same alpha coefficient the kernel
+    with m_i the self-term saturation mask (UPPER gate only, 1[D < kl_max]; 2026-07-10 fix --
+    see the comment at the mask) and a_i the same alpha coefficient the kernel
     uses at the CURRENT point (state-dependent envelope frozen). mu* is sigma_q-independent (the
     kernel's grad_mu carries no sigma_q), so the pair is jointly exact in one evaluation. beta and
     the transported moments are the SAME intermediates ``belief_gradients`` builds (same pair
@@ -462,12 +463,21 @@ def mm_exact_update(
     if not alpha_is_per_coord(lambda_alpha_mode):
         coef = coef.unsqueeze(-1)                                    # (N,) -> (N,1)
 
+    # Self-term mask: UPPER gate ONLY (2026-07-10 fix). The gradient kernel keeps the lower
+    # gate (raw_self > 0) because it mirrors the clamp's zero derivative and dD = 0 at q == p
+    # anyway; here the mask is reused as the prior PRECISION WEIGHT in the fusion, and the
+    # model enters the E-step with q0 == p EXACTLY (forward_beliefs anchors the belief to the
+    # prior), so raw_self == 0 for every token: a lower gate zeroes the prior anchor and snaps
+    # mu* to the self-excluded neighbor consensus on the first (often only) inner iteration.
+    # The correct MM weight at D = 0 is the envelope alpha* = c0/(b0+0). The upper gate stays:
+    # the kl_max clamp flattens the objective in a neighborhood there.
+    # docs/2026-07-10-mm-exact-prior-anchor-fix.md
     if coef.shape[-1] == 1:                                          # per-position alpha
         raw_self  = _raw_diag_kl(mu, sigma, mu_p, sigma_p, eps=eps)
-        self_mask = ((raw_self > 0.0) & (raw_self < kl_max)).to(mu.dtype).unsqueeze(-1)
+        self_mask = (raw_self < kl_max).to(mu.dtype).unsqueeze(-1)   # UPPER gate only (see comment above)
     else:                                                            # per-coordinate alpha
         raw_self  = _raw_diag_kl_per_coord(mu, sigma, mu_p, sigma_p, eps=eps)
-        self_mask = ((raw_self > 0.0) & (raw_self < kl_max)).to(mu.dtype)
+        self_mask = (raw_self < kl_max).to(mu.dtype)                 # UPPER gate only (see comment above)
     a = self_mask * coef                                             # m_i a_i, (..., N, 1) or (..., N, K)
 
     w = lambda_beta * (beta * pair_mask)
