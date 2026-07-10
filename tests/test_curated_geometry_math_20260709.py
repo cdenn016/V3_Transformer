@@ -1,10 +1,12 @@
 r"""Focused regressions for family-aware full-covariance inference geometry."""
 
+import ast
 import gc
 import inspect
 import math
 import warnings
 import weakref
+from collections import Counter
 
 import pytest
 import torch
@@ -14,8 +16,11 @@ import vfe3.geometry.retraction as retraction_module
 import vfe3.model.model as model_module
 import vfe3.model.prior_bank as prior_bank_module
 import vfe3.numerics as numerics_module
+import vfe3.viz.extract as extract_module
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
+from vfe3.divergence import get_functional
+from vfe3.families.gaussian import DiagonalGaussian
 from vfe3.families.laplace import DiagonalLaplace
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.phi_preconditioner import (
@@ -76,21 +81,166 @@ def test_bounded_log_variance_is_identity_in_normal_range() -> None:
 
 
 def test_prior_model_and_decode_variance_reads_share_guard() -> None:
-    prior_source = inspect.getsource(prior_bank_module)
-    model_source = inspect.getsource(model_module)
+    production_modules = {
+        "model":      model_module,
+        "prior_bank": prior_bank_module,
+        "extract":    extract_module,
+    }
     retraction_source = inspect.getsource(retraction_module)
+    known_trainable_log_variances = (
+        "sigma_log_embed",
+        "s_sigma_log_embed",
+        "decode_sigma_log_embed",
+        "r_sigma_log",
+        "_prior_sigma_log_table",
+        "_decode_sigma_log_table",
+    )
+    expected_guarded_reads = {
+        "model": Counter({"pb.r_sigma_log": 2}),
+        "prior_bank": Counter(
+            {
+                "self.s_sigma_log_embed[token_ids]": 1,
+                "self.s_sigma_log_embed": 1,
+                "self._decode_sigma_log_table()": 4,
+                "pb._prior_sigma_log_table()[token_ids]": 2,
+                "pb._decode_sigma_log_table()": 4,
+            }
+        ),
+        "extract": Counter({"pb.r_sigma_log": 2}),
+    }
 
-    direct_table_exponentiations = [
-        line.strip()
-        for source in (prior_source, model_source)
-        for line in source.splitlines()
-        if "torch.exp(" in line and "sigma_log" in line
+    direct_table_exponentiations = []
+    guarded_reads = {}
+    for module_name, module in production_modules.items():
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
+        module_guarded_reads = Counter()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id == "bounded_variance_from_log":
+                argument = ast.unparse(node.args[0])
+                if any(name in argument for name in known_trainable_log_variances):
+                    module_guarded_reads[argument] += 1
+                continue
+            is_torch_exp = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "exp"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "torch"
+            )
+            is_tensor_exp = isinstance(node.func, ast.Attribute) and node.func.attr == "exp"
+            if is_torch_exp and node.args:
+                exponent = ast.unparse(node.args[0])
+            elif is_tensor_exp:
+                exponent = ast.unparse(node.func.value)
+            else:
+                continue
+            if any(name in exponent for name in known_trainable_log_variances):
+                direct_table_exponentiations.append(
+                    f"{module_name}:{node.lineno}:{ast.unparse(node)}"
+                )
+        guarded_reads[module_name] = module_guarded_reads
+
+    retraction_tree = ast.parse(retraction_source)
+    retraction_guard_calls = [
+        node.lineno
+        for node in ast.walk(retraction_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "bounded_variance_from_log"
     ]
 
     assert direct_table_exponentiations == []
-    assert prior_source.count("bounded_variance_from_log(") >= 3
-    assert model_source.count("bounded_variance_from_log(") >= 1
-    assert "bounded_variance_from_log" not in retraction_source
+    assert guarded_reads == expected_guarded_reads
+    assert retraction_guard_calls == []
+
+
+def _trainable_r_extractor_model() -> VFEModel:
+    cfg = VFE3Config(
+        vocab_size=6,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        prior_source="model_channel",
+        s_e_step=True,
+        lambda_h=1.0,
+        learnable_r=True,
+        pos_phi="none",
+    )
+    return VFEModel(cfg)
+
+
+def test_s_channel_refinement_bounds_large_trainable_centroid_variance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _trainable_r_extractor_model()
+    pb = model.prior_bank
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+
+    def _identity_refine(
+        tokens: torch.Tensor,
+        phi:    torch.Tensor,
+
+        *,
+        rope: 'torch.Tensor | None' = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del phi, rope
+        return pb.encode_s(tokens)
+
+    monkeypatch.setattr(model, "_refine_s", _identity_refine)
+    with torch.no_grad():
+        pb.r_sigma_log.fill_(0.25)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        normal = extract_module.s_channel_refinement(model, token_ids)
+    assert normal is not None
+
+    s_mu, s_sigma = (tensor[0] for tensor in pb.encode_s(token_ids))
+    r_mu = pb.r_mu.expand_as(s_mu)
+    r_sigma = torch.exp(pb.r_sigma_log).expand_as(s_sigma)
+    expected = get_functional("renyi")(
+        DiagonalGaussian(s_mu, s_sigma),
+        DiagonalGaussian(r_mu, r_sigma),
+        alpha=1.0,
+        kl_max=model.cfg.kl_max,
+        eps=model.cfg.eps,
+    ).cpu()
+    assert torch.equal(normal["kl_s0_r"], expected)
+    assert torch.equal(normal["kl_s1_r"], expected)
+
+    with torch.no_grad():
+        pb.r_sigma_log.fill_(100.0)
+    with pytest.warns(RuntimeWarning, match="trainable log-variance"):
+        bounded = extract_module.s_channel_refinement(model, token_ids)
+
+    assert bounded is not None
+    assert all(torch.isfinite(value).all() for value in bounded.values())
+
+
+def test_hyper_prior_centroid_bounds_large_trainable_centroid_variance() -> None:
+    model = _trainable_r_extractor_model()
+    pb = model.prior_bank
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+
+    with torch.no_grad():
+        pb.r_sigma_log.fill_(0.25)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        normal = extract_module.hyper_prior_centroid(model, token_ids)
+    assert normal is not None
+    assert torch.equal(normal["r_sigma"], torch.exp(pb.r_sigma_log).detach().cpu())
+
+    with torch.no_grad():
+        pb.r_sigma_log.fill_(100.0)
+    with pytest.warns(RuntimeWarning, match="trainable log-variance"):
+        bounded = extract_module.hyper_prior_centroid(model, token_ids)
+
+    assert bounded is not None
+    assert torch.isfinite(bounded["r_sigma"]).all()
 
 
 def _matrix_exp_jacobian_pullback_metric(

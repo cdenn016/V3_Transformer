@@ -29,6 +29,7 @@ from vfe3.inference.e_step import _transport, e_step_iteration, free_energy_valu
 # mu/sigma to _transport by membership here, never by matching literal mode names.
 from vfe3.geometry.transport import _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA, transport_covariance, transport_mean
 from vfe3.model.block import vfe_block
+from vfe3.numerics import bounded_variance_from_log
 
 
 def _model_device(model) -> torch.device:
@@ -660,7 +661,7 @@ def s_channel_refinement(model, token_ids: torch.Tensor) -> Optional[dict]:
     s0_mu, s0_sigma = (t[0] for t in pb.encode_s(token_ids[:1]))   # (N, K) static model channel
     s1_mu, s1_sigma = (t[0] for t in model._refine_s(token_ids[:1], phi0, rope=rope))  # (N, K) refined
     r_mu    = pb.r_mu.expand_as(s1_mu)                             # (N, K) frozen hyper-prior centroid
-    r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s1_sigma)
+    r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps).expand_as(s1_sigma)
     kl = get_functional("renyi")                                  # KL = renyi at alpha=1
     r  = DiagonalGaussian(r_mu, r_sigma)
     kl_s0_r = kl(DiagonalGaussian(s0_mu, s0_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
@@ -711,9 +712,10 @@ def hyper_prior_centroid(model, token_ids: torch.Tensor) -> Optional[dict]:
     if getattr(pb, "r_mu", None) is None:
         return None
     s_mu, s_sigma = (t[0] for t in pb.encode_s(token_ids[:1]))     # (N, K)
+    r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps).detach().cpu()  # (K,)
     return {
         "r_mu":         pb.r_mu.detach().cpu(),                                      # (K,)
-        "r_sigma":      torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).detach().cpu(), # (K,)
+        "r_sigma":      r_sigma,                                                      # (K,)
         "s_mu_mean":    s_mu.mean(dim=0).cpu(),                                      # (K,)
         "s_mu_std":     s_mu.std(dim=0).cpu(),                                       # (K,)
         "s_sigma_mean": s_sigma.mean(dim=0).cpu(),                                   # (K,)
