@@ -38,7 +38,7 @@ def _cfg(**kw):
 
 
 def test_config_checkpoint_interval_default_and_validated():
-    assert VFE3Config().checkpoint_interval == 0               # off by default (pure path)
+    assert VFE3Config().checkpoint_interval == 25000
     assert VFE3Config(checkpoint_interval=1000).checkpoint_interval == 1000
     with pytest.raises(ValueError):
         VFE3Config(checkpoint_interval=-1)
