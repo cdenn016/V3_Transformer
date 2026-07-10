@@ -111,16 +111,59 @@ def _rel_gap_eps(
     *,
     rel:   float = 1e-6,
     floor: float = 1e-12,
-) -> torch.Tensor:                         # 0-d on-device tensor; no host-sync
+) -> torch.Tensor:                         # (..., 1, 1) on-device tensor; no host-sync
     r"""Spectrum-relative ``gap_eps`` for :func:`_eigh_damped` on the SPD retraction paths (audit
     2026-06-13 L11). The fixed ``gap_eps=1e-8`` over-damps the eigh adjoint ``F_ij = 1/(w_j - w_i)``
     for MEANINGFUL gaps near the variance floor -- a resolvable gap of 1e-4 is biased ~50%. Scaling
     to ``(rel * ||A||_max)^2`` -- the squared fp32 noise floor of the spectrum -- damps only gaps
     below fp32 resolution (true degeneracy stays finite, ``F = 0``) and leaves resolvable gaps
     accurate. ``rel`` is a few machine epsilons; ``floor`` keeps a tiny near-zero spectrum finite.
-    Returns a 0-d tensor on A's device/dtype to avoid a CUDA host-sync (no ``.item()``/``float()``)."""
-    scale = A.detach().abs().amax()        # 0-d tensor, stays on device
+    Each matrix receives its own scale so unrelated batch elements cannot change its eigendecomposition
+    adjoint. Returns ``(..., 1, 1)`` on A's device/dtype to avoid a CUDA host-sync."""
+    scale = A.detach().abs().amax(dim=(-2, -1), keepdim=True)
     return (rel * scale).pow(2).clamp(min=floor)
+
+
+def _frechet_log_spd(
+    sigma:   torch.Tensor,                  # (..., K, K) SPD base point
+    tangent: torch.Tensor,                  # (..., K, K) symmetric ambient tangent
+
+    *,
+    eps:     float = 1e-6,
+) -> torch.Tensor:
+    r"""Fréchet derivative of the matrix logarithm at ``sigma`` applied to ``tangent``.
+
+    In the eigenbasis ``sigma = V diag(lambda) V^T``,
+
+        D log_sigma[H] = V (L odot (V^T H V)) V^T,
+
+    where ``L_ii = 1 / lambda_i`` and
+    ``L_ij = (log(lambda_i) - log(lambda_j)) / (lambda_i - lambda_j)``.
+    The repeated-eigenvalue branch uses the continuous reciprocal-mean limit.
+    """
+    sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
+    tangent = 0.5 * (tangent + tangent.transpose(-1, -2))
+
+    eigenvalues, eigenvectors = _eigh_damped(sigma, _rel_gap_eps(sigma))
+    eigenvalues = eigenvalues.clamp(min=eps)
+    log_eigenvalues = torch.log(eigenvalues)
+
+    lambda_i = eigenvalues.unsqueeze(-1)
+    lambda_j = eigenvalues.unsqueeze(-2)
+    gap = lambda_i - lambda_j
+    gap_scale = torch.maximum(lambda_i, lambda_j)
+    near_repeated = gap.abs() <= math.sqrt(torch.finfo(eigenvalues.dtype).eps) * gap_scale
+    safe_gap = torch.where(near_repeated, torch.ones_like(gap), gap)
+    divided_difference = (
+        log_eigenvalues.unsqueeze(-1) - log_eigenvalues.unsqueeze(-2)
+    ) / safe_gap
+    repeated_limit = 2.0 / (lambda_i + lambda_j)
+    divided_difference = torch.where(near_repeated, repeated_limit, divided_difference)
+
+    eigenvectors_t = eigenvectors.transpose(-1, -2)
+    tangent_eigenbasis = eigenvectors_t @ tangent @ eigenvectors
+    chart_tangent = eigenvectors @ (divided_difference * tangent_eigenbasis) @ eigenvectors_t
+    return 0.5 * (chart_tangent + chart_tangent.transpose(-1, -2))
 
 
 def retract_spd_diagonal(
@@ -251,7 +294,7 @@ def retract_spd_affine(
 
 def retract_logeuclidean_full(
     sigma:        torch.Tensor,             # (..., K, K) SPD covariances
-    delta_log:    torch.Tensor,             # (..., K, K) symmetric tangent (taken in the log chart)
+    delta_sigma:  torch.Tensor,             # (..., K, K) symmetric ambient tangent
 
     *,
     step_size:    float          = 1.0,
@@ -261,17 +304,15 @@ def retract_logeuclidean_full(
 ) -> torch.Tensor:
     r"""Full log-Euclidean SPD retraction (Arsigny-Fillard-Pennec-Ayache 2006/2007).
 
-        Sigma_new = expm( logm(Sigma) + step_size * sym(delta_log) ),
+        Sigma_new = expm( logm(Sigma) + step_size * Dlog_Sigma[delta_sigma] ),
     where logm/expm are the matrix log/exp in the eigenbasis (logm(Sigma) =
     V diag(log lambda_j) V^T; expm(M) = U diag(exp mu_j) U^T). Because logm(Sigma)
     is symmetric and expm of a symmetric matrix is SPD, this is SPD-preserving for
     ANY magnitude of the tangent (no trust region needed for positivity; the trust
-    region is a Frobenius stability knob only). The tangent is taken directly in the
-    matrix-log chart (spec reading 2a, the pure retraction). Uses torch.linalg.eigh
-    twice (one for logm(Sigma), one for the expm of the log-sum), the same two-eigh
-    structure as retract_spd_full; floors the input eigenvalues at eps before log and
-    projects the output spectrum to [eps, sigma_max] (eigenvalues ARE variances: the same
-    physical ceiling the diagonal arm and retract_spd_full apply, matching the code at ~264).
+    region is a Frobenius stability knob only). ``Dlog_Sigma`` converts the ambient
+    covariance tangent into the Log-Euclidean chart, making the retraction's first
+    derivative the identity. Input eigenvalues are floored at eps before log and the
+    output spectrum is projected to [eps, sigma_max].
     """
     _check_sigma_max(sigma_max, eps)
     orig_shape = sigma.shape
@@ -279,20 +320,21 @@ def retract_logeuclidean_full(
     if sigma.dim() == 4:
         B, N, K, _ = sigma.shape
         sigma = sigma.reshape(B * N, K, K)
-        delta_log = delta_log.reshape(B * N, K, K)
+        delta_sigma = delta_sigma.reshape(B * N, K, K)
 
     with torch.amp.autocast(sigma.device.type, enabled=False):          # tensor-keyed (audit 2026-07-05 m10)
-        sigma     = sigma.float()
-        delta_log = delta_log.float()
-        sigma     = 0.5 * (sigma + sigma.transpose(-1, -2))
-        delta_log = 0.5 * (delta_log + delta_log.transpose(-1, -2))
+        compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
+        sigma = sigma.to(compute_dtype)
+        delta_sigma = delta_sigma.to(compute_dtype)
+        sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
+        delta_sigma = 0.5 * (delta_sigma + delta_sigma.transpose(-1, -2))
 
         eigenvalues, eigenvectors = _eigh_damped(sigma, _rel_gap_eps(sigma))
         eigenvalues = eigenvalues.clamp(min=eps)
         log_eig = torch.log(eigenvalues)
         log_sigma = eigenvectors * log_eig.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
 
-        tangent = step_size * delta_log
+        tangent = step_size * _frechet_log_spd(sigma, delta_sigma, eps=eps)
         if trust_region is not None and trust_region > 0:                # clamp the TANGENT, not the
             t_norm  = torch.linalg.norm(tangent, ord='fro', dim=(-2, -1), keepdim=True)   # base point,
             tangent = tangent * torch.clamp(trust_region / (t_norm + eps), max=1.0)       # so R(S,0)=S.
@@ -317,7 +359,7 @@ def retract_logeuclidean_full(
 @register_retraction("log_euclidean")
 def retract_log_euclidean(
     sigma:        torch.Tensor,             # (..., K) diagonal OR (..., K, K) full covariance
-    delta_sigma:  torch.Tensor,             # matching rank: the tangent step, taken in the log chart
+    delta_sigma:  torch.Tensor,             # matching-rank ambient covariance tangent
 
     mean_ndim:    int,                      # ndim of the belief mean; full cov iff sigma.dim() == mean_ndim + 1
 
@@ -329,34 +371,28 @@ def retract_log_euclidean(
 ) -> torch.Tensor:                          # (...) same rank as sigma
     r"""Log-Euclidean SPD retraction (spec reading 2a; Arsigny et al. 2006/2007).
 
-    The pure log-Euclidean retraction: the tangent ``delta_sigma`` is interpreted directly
-    in the matrix-log chart and the update closes in the SPD vector-space structure,
-        Sigma_new = expm( logm(Sigma) + step_size * sym(delta_sigma) ).
+    The ambient tangent ``delta_sigma`` is mapped into the matrix-log chart before the
+    update closes in the SPD vector-space structure,
+        Sigma_new = expm( logm(Sigma) + step_size * Dlog_Sigma[delta_sigma] ).
     SPD-preserving for ANY step magnitude (expm of a symmetric matrix is SPD), unlike a
     naive Euclidean step; the trust region is a stability knob, not a positivity guard.
 
     Full covariance (sigma.dim() == mean_ndim + 1) uses the two-eigh logm/expm in
-    ``retract_logeuclidean_full``. The diagonal case is the elementwise reduction
-        sigma_new = sigma * exp(step_size * delta_sigma),
-    applying the tangent in the log chart WITHOUT the affine 1/sigma whitening. NOTE: under
-    this seam's pre-whitened tangent convention (the E-step hands the retraction the affine
-    Fisher natural gradient 2 Sigma G Sigma, retraction.py natural_gradient), the diagonal LE
-    step does NOT coincide with ``spd_affine`` -- affine whitens by 1/sigma (sigma_new =
-    sigma exp(step delta/sigma)), LE does not -- so on a diagonal family LE is a non-canonical
-    log-chart step, not the manuscript-pinned geometry. LE is a genuinely new variant only for
-    the full-covariance family, where logm != elementwise log. 2b (the Daleckii-Krein Frechet
-    natural gradient) is a deferred sub-flag per the spec, not built here.
+    ``retract_logeuclidean_full``. The diagonal reduction uses
+        Dlog_sigma[delta_sigma] = delta_sigma / sigma,
+    so ``sigma_new = sigma * exp(step_size * delta_sigma / sigma)`` and the first
+    derivative with respect to the ambient tangent is the identity.
     """
     _check_sigma_max(sigma_max, eps)
     if sigma.dim() == mean_ndim + 1:                     # full covariance (..., K, K)
         return retract_logeuclidean_full(
             sigma, delta_sigma, step_size=step_size, trust_region=trust_region, eps=eps, sigma_max=sigma_max,
         )
-    # diagonal: logm/expm are elementwise; sigma_new = sigma * exp(step_size * delta_sigma)
+    # diagonal: Dlog_sigma[delta_sigma] = delta_sigma / sigma
     orig_dtype = sigma.dtype
     with torch.amp.autocast(sigma.device.type, enabled=False):          # tensor-keyed (audit 2026-07-05 m10)
         sigma_safe  = sigma.float().clamp(min=eps)
-        delta_sigma = delta_sigma.float()
+        delta_sigma = delta_sigma.float() / sigma_safe
         if trust_region is not None and trust_region > 0:
             delta_sigma = delta_sigma.clamp(-trust_region, trust_region)
         exp_arg   = (step_size * delta_sigma).clamp(-50.0, 50.0)

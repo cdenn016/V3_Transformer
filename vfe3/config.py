@@ -1642,20 +1642,18 @@ class VFE3Config:
         # manuscript-canonical affine-invariant exponential map (the pure path always exists).
         from vfe3.geometry.retraction import _RETRACTIONS
         _require(self.spd_retract_mode, tuple(sorted(_RETRACTIONS)), "spd_retract_mode")
-        # log_euclidean is a genuinely new variant only for the full-covariance family. On a
-        # diagonal family it applies the tangent in the matrix-log chart WITHOUT the affine
-        # 1/sigma Fisher whitening, so under this seam's pre-whitened tangent convention it does
-        # NOT coincide with the manuscript-canonical 'spd_affine' there -- it is a non-canonical
-        # log-chart step. Warn (not error) so the harmless-but-non-canonical pairing surfaces; the
-        # user toggles families and retraction modes independently.
+        # log_euclidean is a distinct variant only for the full-covariance family. On a diagonal
+        # family, Dlog_sigma[H] = H / sigma, so its ambient-tangent retraction coincides with the
+        # manuscript-canonical 'spd_affine' path. Warn (not error) because the pairing is valid but
+        # does not select a distinct geometry; the user toggles families and modes independently.
         if self.spd_retract_mode == "log_euclidean" and family_is_diagonal:
             import warnings
             warnings.warn(
-                "spd_retract_mode='log_euclidean' with a diagonal-covariance family applies the "
-                "tangent in the log chart without the affine 1/sigma Fisher whitening, so it does "
-                "NOT reduce to the canonical 'spd_affine' here (it is a non-canonical log-chart "
-                "step). log_euclidean is a genuinely new variant only for a full-covariance "
-                "family; prefer 'spd_affine' on the diagonal family, or use 'gaussian_full'.",
+                "spd_retract_mode='log_euclidean' with a diagonal-covariance family maps the "
+                "ambient covariance tangent through the Log-Euclidean chart using H / sigma, "
+                "which coincides with the canonical 'spd_affine' retraction on commuting diagonal "
+                "covariances. The pairing is valid but selects a distinct geometry only for a "
+                "full-covariance family.",
                 UserWarning,
                 stacklevel=2,
             )

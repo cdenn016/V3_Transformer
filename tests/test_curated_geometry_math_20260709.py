@@ -9,6 +9,12 @@ import torch.nn.functional as F
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import get_group
+from vfe3.geometry.retraction import (
+    _eigh_damped,
+    _rel_gap_eps,
+    get_retraction,
+    retract_logeuclidean_full,
+)
 from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import PriorBank
 from vfe3.numerics import apply_mu_trust_region
@@ -177,3 +183,88 @@ def test_full_cov_failed_cholesky_falls_back_per_element() -> None:
 
     assert torch.allclose(out[:1], expected_good, atol=1e-6)
     assert torch.allclose(out[1:], expected_bad, atol=1e-6)
+
+
+def test_rel_gap_eps_is_per_matrix() -> None:
+    matrices = torch.tensor(
+        [
+            [[2.0, -0.5], [-0.5, 1.0]],
+            [[2.0e6, -5.0e5], [-5.0e5, 1.0e6]],
+        ],
+        dtype=torch.float64,
+    )
+
+    gap_eps = _rel_gap_eps(matrices, rel=1e-6, floor=0.0)
+    expected = (1e-6 * matrices.abs().amax(dim=(-2, -1), keepdim=True)).pow(2)
+
+    assert gap_eps.shape == (2, 1, 1)
+    assert torch.equal(gap_eps, expected)
+
+
+def test_eigh_damped_gradient_is_batch_separable_across_scales() -> None:
+    small = torch.tensor([[2.0, 0.3], [0.3, 1.0]], dtype=torch.float64)
+    large = 1.0e8 * torch.tensor([[1.5, -0.2], [-0.2, 0.8]], dtype=torch.float64)
+    weight = torch.tensor([[1.0, 0.4], [0.4, -0.7]], dtype=torch.float64)
+
+    single = small.clone().requires_grad_(True)
+    single_eig, single_vec = _eigh_damped(single, _rel_gap_eps(single, floor=0.0))
+    single_sqrt = (
+        single_vec * single_eig.sqrt().unsqueeze(-2)
+    ) @ single_vec.transpose(-1, -2)
+    single_grad = torch.autograd.grad((single_sqrt * weight).sum(), single)[0]
+
+    batch = torch.stack((small, large)).requires_grad_(True)
+    batch_eig, batch_vec = _eigh_damped(batch, _rel_gap_eps(batch, floor=0.0))
+    batch_sqrt = (
+        batch_vec * batch_eig.sqrt().unsqueeze(-2)
+    ) @ batch_vec.transpose(-1, -2)
+    batch_grad = torch.autograd.grad((batch_sqrt[0] * weight).sum(), batch)[0][0]
+
+    assert torch.allclose(batch_grad, single_grad, rtol=1e-10, atol=1e-12)
+
+
+def test_log_euclidean_full_retraction_has_identity_first_derivative() -> None:
+    sigma = torch.tensor(
+        [[2.0, 0.3], [0.3, 0.8]],
+        dtype=torch.float64,
+    )
+    tangent = torch.tensor(
+        [[0.2, -0.1], [-0.1, 0.05]],
+        dtype=torch.float64,
+    )
+    fd_step = 1e-6
+
+    out_plus = retract_logeuclidean_full(
+        sigma,
+        fd_step * tangent,
+        trust_region=0.0,
+        eps=1e-12,
+        sigma_max=None,
+    )
+    out_minus = retract_logeuclidean_full(
+        sigma,
+        -fd_step * tangent,
+        trust_region=0.0,
+        eps=1e-12,
+        sigma_max=None,
+    )
+    derivative = (out_plus - out_minus) / (2.0 * fd_step)
+
+    assert torch.allclose(derivative, tangent, rtol=2e-6, atol=2e-7)
+
+
+def test_log_euclidean_scalar_uses_h_over_sigma_chart_tangent() -> None:
+    sigma = torch.tensor([[2.0]])
+    tangent = torch.tensor([[0.6]])
+
+    out = get_retraction("log_euclidean")(
+        sigma,
+        tangent,
+        mean_ndim=2,
+        trust_region=0.0,
+        eps=1e-6,
+        sigma_max=None,
+    )
+    expected = sigma * torch.exp(tangent / sigma)
+
+    assert torch.allclose(out, expected, rtol=1e-6, atol=1e-6)
