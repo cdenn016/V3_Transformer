@@ -40,6 +40,13 @@ from vfe3.ema import EMA
 from vfe3.runtime import deterministic_state
 
 
+def _require_nonnegative_int(value: object, field: str) -> int:
+    """Return an exact nonnegative integer cursor; reject coercible lookalikes."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"data_state {field} must be a non-negative integer")
+    return value
+
+
 def _atomic_replace(
     final: Path,                         # destination (the artifact name readers load)
     tmp:   Path,                         # same-directory temp file, already fully written
@@ -287,10 +294,13 @@ class RunArtifacts:
         }
         saved_data_state = None
         if data_state is not None:
+            batches_consumed = _require_nonnegative_int(
+                data_state["batches_consumed"], "batches_consumed")
+            epoch = _require_nonnegative_int(data_state["epoch"], "epoch")
             saved_data_state = {
                 "epoch_start_generator_state": data_state["epoch_start_generator_state"].clone(),
-                "batches_consumed":            int(data_state["batches_consumed"]),
-                "epoch":                       int(data_state["epoch"]),
+                "batches_consumed":            batches_consumed,
+                "epoch":                       epoch,
             }
         torch.save({
             "step":            int(step),
@@ -373,6 +383,11 @@ def load_checkpoint(
                 f"execute arbitrary code embedded in the pickle)."
             ) from exc
         ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    saved_data_state = ckpt.get("data_state")
+    if saved_data_state is not None:
+        saved_batches_consumed = _require_nonnegative_int(
+            saved_data_state["batches_consumed"], "batches_consumed")
+        saved_epoch = _require_nonnegative_int(saved_data_state["epoch"], "epoch")
     model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
         fresh = [{k: v for k, v in group.items() if k != "params"}
@@ -433,12 +448,11 @@ def load_checkpoint(
             metro_state.cpu() if hasattr(metro_state, "cpu") else metro_state)
     if data_state is not None:
         data_state.clear()
-        if ckpt.get("data_state") is not None:
-            saved_data_state = ckpt["data_state"]
+        if saved_data_state is not None:
             data_state.update({
                 "epoch_start_generator_state": saved_data_state["epoch_start_generator_state"],
-                "batches_consumed":            int(saved_data_state["batches_consumed"]),
-                "epoch":                       int(saved_data_state["epoch"]),
+                "batches_consumed":            saved_batches_consumed,
+                "epoch":                       saved_epoch,
             })
     return int(ckpt["step"])
 

@@ -251,6 +251,57 @@ def test_exact_shuffled_resume_requires_loader_generator(tmp_path):
               resume_from=tmp_path / "run" / "checkpoints" / "step_1.pt")
 
 
+@pytest.mark.parametrize(("field", "bad_value"), [
+    ("batches_consumed", 1.5),
+    ("batches_consumed", True),
+    ("batches_consumed", -1),
+    ("epoch", 1.5),
+    ("epoch", True),
+    ("epoch", -1),
+])
+def test_save_checkpoint_rejects_malformed_data_cursor(tmp_path, field, bad_value):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model)
+    data_state = {
+        "epoch_start_generator_state": torch.Generator().manual_seed(0).get_state(),
+        "batches_consumed":            0,
+        "epoch":                       0,
+    }
+    data_state[field] = bad_value
+
+    with pytest.raises(ValueError, match=rf"{field}.*non-negative integer"):
+        art.save_checkpoint(1, model, build_optimizer(model, cfg), cfg, data_state=data_state)
+
+
+@pytest.mark.parametrize(("field", "bad_value"), [
+    ("batches_consumed", 1.5),
+    ("batches_consumed", True),
+    ("batches_consumed", -1),
+    ("epoch", 1.5),
+    ("epoch", True),
+    ("epoch", -1),
+])
+def test_load_checkpoint_rejects_malformed_data_cursor(tmp_path, field, bad_value):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model)
+    valid_data_state = {
+        "epoch_start_generator_state": torch.Generator().manual_seed(0).get_state(),
+        "batches_consumed":            0,
+        "epoch":                       0,
+    }
+    checkpoint = art.save_checkpoint(
+        1, model, build_optimizer(model, cfg), cfg, data_state=valid_data_state)
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["data_state"][field] = bad_value
+    malformed_checkpoint = tmp_path / f"malformed-{field}.pt"
+    torch.save(bundle, malformed_checkpoint)
+
+    with pytest.raises(ValueError, match=rf"{field}.*non-negative integer"):
+        load_checkpoint(malformed_checkpoint, VFEModel(cfg), data_state={})
+
+
 def test_resume_restores_best_val_state(tmp_path):
     r"""C2 (audit 2026-07-01): best_val_ppl/best_step are bundled by save_checkpoint and restored
     into the RunArtifacts passed to load_checkpoint, so a resumed continuation with no post-resume

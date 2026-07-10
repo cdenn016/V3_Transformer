@@ -917,10 +917,8 @@ def train(
         saved_generator_state = resume_data_state["epoch_start_generator_state"]
         if not isinstance(saved_generator_state, torch.Tensor):
             raise RuntimeError("checkpoint data_state epoch_start_generator_state must be a tensor")
-        epoch = int(resume_data_state["epoch"])
-        saved_batches_consumed = int(resume_data_state["batches_consumed"])
-        if epoch < 0 or saved_batches_consumed < 0:
-            raise RuntimeError("checkpoint data_state epoch and batches_consumed must be non-negative")
+        epoch = resume_data_state["epoch"]
+        saved_batches_consumed = resume_data_state["batches_consumed"]
         epoch_start_generator_state = saved_generator_state.cpu().clone()
         loader_generator.set_state(epoch_start_generator_state)
     else:
