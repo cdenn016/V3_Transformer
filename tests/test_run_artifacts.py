@@ -267,6 +267,48 @@ def test_frequency_strata_use_training_corpus_counts():
     assert "freq_strata_ce" not in out
 
 
+def test_frequency_strata_cutoffs_ignore_imbalanced_evaluation_duplicates():
+    class _FixedLogits(torch.nn.Module):
+        def __init__(self, logits: torch.Tensor) -> None:
+            super().__init__()
+            self.register_buffer("logits", logits)
+
+        def forward(self, _tokens: torch.Tensor) -> torch.Tensor:
+            return self.logits
+
+    targets = torch.tensor([[1, 1, 1, 1, 1, 3, 4, 0]])
+    tokens = torch.zeros_like(targets)
+    logits = torch.tensor([[
+        [0.0, 0.5, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.5, 0.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0, 0.0, 0.0],
+        [0.0, 2.5, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 3.0],
+        [0.25, 0.0, 0.0, 0.0, 0.0],
+    ]])
+    corpus_counts = torch.tensor([0, 1, 10, 100, 1000])
+
+    out = _calibration_and_strata(
+        corpus_counts,
+        _FixedLogits(logits),
+        [(tokens, targets)],
+        torch.device("cpu"),
+    )
+
+    ce = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        targets.reshape(-1),
+        reduction="none",
+    )
+    strata = out["corpus_freq_strata_ce"]
+    expected_rare = torch.cat((ce[:5], ce[7:])).mean()
+    assert strata["rare"] == pytest.approx(float(expected_rare))
+    assert strata["mid"] == pytest.approx(float(ce[5]))
+    assert strata["frequent"] == pytest.approx(float(ce[6]))
+
+
 def test_provenance_records_all_split_hashes_and_data_knobs(tmp_path):
     cfg = _cfg(generate_figures=False)
     model = VFEModel(cfg)

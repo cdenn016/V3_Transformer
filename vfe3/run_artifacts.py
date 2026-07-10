@@ -597,9 +597,10 @@ def _calibration_and_strata(
     r"""Decode calibration (ECE + reliability curve) and corpus-frequency-stratified CE over the test
     split. The decode is non-standard (KL-to-prior Mahalanobis or mu @ W^T with Sigma feeding the
     logit scale), so a mis-scaled ``decode_log_scale`` can leave PPL acceptable while the probability
-    mass is wrong -- PPL alone cannot catch it. Bucket membership comes from training-corpus unigram
-    counts while the aggregated CE remains the sampled held-out CE. The strata expose prior-table
-    tail stagnation (rare-token rows may be undertrained). Off-graph; capped at ``max_batches``."""
+    mass is wrong -- PPL alone cannot catch it. Bucket cutoffs are quantiles over the positive-count
+    token types in the complete training corpus; sampled target duplication cannot move them, and
+    evaluation targets unseen in training are rare. The aggregated values remain sampled held-out CE.
+    The strata expose prior-table tail stagnation. Off-graph; capped at ``max_batches``."""
     import torch.nn.functional as F
 
     confs, corrects, nats, tgts = [], [], [], []
@@ -636,12 +637,18 @@ def _calibration_and_strata(
     counts = corpus_counts.to(device=tg.device)
     if int(tg.max()) >= counts.numel():
         raise ValueError("corpus_counts does not cover every sampled evaluation target")
+    positive_counts = counts[counts > 0].float()
+    if positive_counts.numel() == 0:
+        q1, q2 = 0.0, 0.0
+    else:
+        quantiles = positive_counts.new_tensor([1 / 3, 2 / 3])
+        q1, q2 = torch.quantile(positive_counts, quantiles).tolist()
     tok_count = counts[tg].float()                              # training-corpus count of each target
-    q1, q2 = torch.quantile(tok_count, torch.tensor([1 / 3, 2 / 3], device=tok_count.device)).tolist()
+    seen = tok_count > 0
     strata = {}
-    for name, mask in (("rare", tok_count <= q1),
-                       ("mid", (tok_count > q1) & (tok_count <= q2)),
-                       ("frequent", tok_count > q2)):
+    for name, mask in (("rare", (~seen) | (tok_count <= q1)),
+                       ("mid", seen & (tok_count > q1) & (tok_count <= q2)),
+                       ("frequent", seen & (tok_count > q2))):
         strata[name] = float(nat[mask].mean()) if mask.any() else float("nan")
     return {"ece": ece, "reliability": rel, "overall_ce": float(nat.mean()),
             "corpus_freq_strata_ce": strata}
