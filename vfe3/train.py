@@ -819,6 +819,12 @@ def train(
     start_step = 0
     if device is None:
         device = model.prior_bank.mu_embed.device
+    # Metropolis det-sign sweep (opt-in, default OFF): a single persistent CPU generator, seeded
+    # once from cfg.seed, threaded across every step so the accept/reject sequence is reproducible
+    # (design spec Sec.6). It is constructed before resume so load_checkpoint can restore its private
+    # state. Constructing/seeding a LOCAL torch.Generator never touches the global RNG stream, so this
+    # stays inert when neither learnable-reflection mode is active.
+    metro_gen = torch.Generator().manual_seed(int(cfg.seed))
     # fp16 training needs loss scaling (gradients underflow through the unrolled E-step); bf16/fp32
     # do not. enabled=False is a no-op, so non-fp16 amp_dtype keeps this loop byte-identical.
     # Created BEFORE the resume block so load_checkpoint can restore its scale/growth state
@@ -831,7 +837,8 @@ def train(
     if resume_path is not None:
         from vfe3.run_artifacts import load_checkpoint           # local import avoids any import cycle
         start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
-                                     scaler=scaler, cfg=cfg, ema=ema, artifacts=artifacts)
+                                     scaler=scaler, cfg=cfg, ema=ema, artifacts=artifacts,
+                                     metropolis_generator=metro_gen)
         # Shuffled-loader resume limitation (audit 2026-07-01 C1): weights/optimizer/RNG ARE
         # restored, but a RandomSampler's in-flight epoch permutation and intra-epoch cursor are
         # NOT persisted, so a resumed shuffled run draws a DIFFERENT batch sequence than the
@@ -874,13 +881,6 @@ def train(
     losses: List[float] = []
     model.train()
     logger = logger or logging.getLogger(__name__)
-    # Metropolis det-sign sweep (opt-in, default OFF): a single persistent CPU generator, seeded
-    # once from cfg.seed, threaded across every step so the accept/reject sequence is reproducible
-    # (design spec Sec.6). A fresh generator drawn INSIDE the loop would redraw the same value every
-    # step, so it MUST be constructed here and reused. Constructing/seeding a LOCAL torch.Generator
-    # never touches the global RNG stream, so this stays inert when cfg.omega_reflection != 'metropolis'
-    # (_maybe_metropolis_omega gates the actual draw below).
-    metro_gen = torch.Generator().manual_seed(int(cfg.seed))
     # Live per-step it/s: iterate the step loop through a tqdm bar whose built-in rate readout
     # refreshes every step. Gated on log_interval so the documented silent path (log_interval
     # falsy) stays bitwise-identical -- no bar, no redirect, nothing printed. The generator holds
@@ -1163,7 +1163,8 @@ def train(
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
         if (artifacts is not None and cfg.checkpoint_interval
                 and (step + 1) % cfg.checkpoint_interval == 0):
-            artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler, ema=ema)
+            artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler, ema=ema,
+                                      metropolis_generator=metro_gen)
     if ema is not None:
         ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses

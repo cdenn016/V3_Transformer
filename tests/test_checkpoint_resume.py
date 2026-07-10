@@ -91,6 +91,36 @@ def test_load_checkpoint_restores_optimizer_state(tmp_path):
     assert int(any_state["step"]) == 3
 
 
+def test_load_checkpoint_restamps_current_optimizer_group_metadata(tmp_path):
+    saved_cfg = _cfg(m_p_mu_lr=0.03, m_p_sigma_lr=0.02, m_phi_lr=0.01,
+                     weight_decay=0.2)
+    saved_model = VFEModel(saved_cfg)
+    saved_opt = build_optimizer(saved_model, saved_cfg)
+    art = RunArtifacts(tmp_path / "saved", saved_cfg, saved_model)
+    ckpt = art.save_checkpoint(1, saved_model, saved_opt, saved_cfg)
+
+    current_cfg = _cfg(m_p_mu_lr=0.003, m_p_sigma_lr=0.002, m_phi_lr=0.001,
+                       weight_decay=0.0)
+    current_model = VFEModel(current_cfg)
+    current_opt = build_optimizer(current_model, current_cfg)
+    current_metadata = [{k: v for k, v in group.items() if k != "params"}
+                        for group in current_opt.param_groups]
+    current_params = [list(group["params"]) for group in current_opt.param_groups]
+
+    load_checkpoint(ckpt, current_model, current_opt)
+
+    for group, metadata, params in zip(current_opt.param_groups, current_metadata, current_params):
+        assert {k: v for k, v in group.items() if k != "params"} == metadata
+        assert len(group["params"]) == len(params)
+        assert all(loaded is current for loaded, current in zip(group["params"], params))
+
+
+def test_missing_checkpoint_preserves_file_not_found(tmp_path):
+    model = VFEModel(_cfg())
+    with pytest.raises(FileNotFoundError):
+        load_checkpoint(tmp_path / "missing.pt", model)
+
+
 def test_resume_matches_uninterrupted_run(tmp_path):
     r"""The end-to-end equivalence: straight 4-step run == (2 steps -> checkpoint -> resume to 4).
 

@@ -257,8 +257,9 @@ class RunArtifacts:
         cfg:       VFE3Config,
 
         *,
-        scaler:    Optional['torch.amp.GradScaler'] = None,
-        ema:       Optional[EMA]                     = None,
+        scaler:               Optional['torch.amp.GradScaler'] = None,
+        ema:                  Optional[EMA]                     = None,
+        metropolis_generator: Optional[torch.Generator]         = None,
     ) -> Path:
         r"""Write a resumable ``checkpoints/step_<N>.pt`` (model + optimizer + RNG + config + step).
 
@@ -272,6 +273,8 @@ class RunArtifacts:
         ``best_val_ppl``/``best_step`` (audit 2026-07-01 C2): the model-selection state is bundled
         so a resumed run reports the run-wide best, not just the continuation's best. The write is
         atomic (same-dir tmp + ``os.replace``) so a crash never leaves a corrupt ``step_<N>.pt``.
+        ``metropolis_generator`` carries the private accept/reject stream independently of the
+        global CPU/CUDA RNG so a resumed discrete-reflection sweep continues at the next draw.
         """
         path = self.ckpt_dir / f"step_{step}.pt"
         tmp  = path.with_suffix(".pt.tmp")
@@ -284,6 +287,8 @@ class RunArtifacts:
             "model_state":     model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "rng_state":       rng_state,
+            "metropolis_rng_state": (metropolis_generator.get_state()
+                                      if metropolis_generator is not None else None),
             "config":          asdict(cfg),
             "scaler_state":    (scaler.state_dict()
                                 if scaler is not None and scaler.is_enabled() else None),
@@ -301,21 +306,24 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
 
     *,
-    map_location: 'Optional[str | torch.device]'        = None,
-    restore_rng:  bool                                   = True,
-    scaler:       Optional['torch.amp.GradScaler']       = None,
-    cfg:          Optional[VFE3Config]                   = None,
-    ema:          Optional[EMA]                          = None,
-    artifacts:    'Optional[RunArtifacts]'               = None,
+    map_location:         'Optional[str | torch.device]'   = None,
+    restore_rng:          bool                             = True,
+    scaler:               Optional['torch.amp.GradScaler'] = None,
+    cfg:                  Optional[VFE3Config]             = None,
+    ema:                  Optional[EMA]                    = None,
+    artifacts:            'Optional[RunArtifacts]'         = None,
+    metropolis_generator: Optional[torch.Generator]        = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
     This is the LOAD half of the resumable checkpoint. It always restores the model weights;
     it restores the AdamW optimizer state (momentum buffers + per-parameter step counts) when an
-    ``optimizer`` is supplied, and the CPU/CUDA RNG when ``restore_rng`` is set and the bundle
-    carries it (checkpoints written before RNG was persisted simply skip that step). The returned
-    integer is the number of completed M-steps; ``train(resume_from=...)`` uses it to rebuild the
-    cosine ``LambdaLR`` at the saved step and to start the loop from there.
+    ``optimizer`` is supplied, then reapplies that optimizer's current non-parameter group metadata
+    so the current config remains authoritative. The CPU/CUDA RNG and the optional private
+    ``metropolis_generator`` are restored when ``restore_rng`` is set and the bundle carries their
+    states (older checkpoints simply skip absent RNG fields). The returned integer is the number of
+    completed M-steps; ``train(resume_from=...)`` uses it to rebuild the cosine ``LambdaLR`` at the
+    saved step and to start the loop from there.
 
     ``scaler`` (audit 2026-06-09 IE3): when given AND the bundle carries a saved scaler state,
     the fp16 GradScaler's scale/growth counters are restored (bundles written before the scaler
@@ -335,11 +343,14 @@ def load_checkpoint(
     the legacy ``weights_only=False`` load -- only use that for a checkpoint you trust, since that
     path can execute arbitrary code embedded in the pickle.
     """
+    checkpoint_path = Path(path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"checkpoint file not found: {checkpoint_path}")
     if map_location is None:
         map_location = next(model.parameters()).device
     trust = bool(getattr(cfg, "trust_resume_checkpoint", False))
     try:
-        ckpt = torch.load(Path(path), map_location=map_location, weights_only=True)
+        ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
     except Exception as exc:                                    # safe load rejected a non-tensor object
         if not trust:
             raise RuntimeError(
@@ -348,10 +359,17 @@ def load_checkpoint(
                 f"trust_resume_checkpoint=True to allow the legacy weights_only=False load (which can "
                 f"execute arbitrary code embedded in the pickle)."
             ) from exc
-        ckpt = torch.load(Path(path), map_location=map_location, weights_only=False)
+        ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
+        fresh = [{k: v for k, v in group.items() if k != "params"}
+                 for group in optimizer.param_groups]
         optimizer.load_state_dict(ckpt["optimizer_state"])
+        for group, metadata in zip(optimizer.param_groups, fresh):
+            params = group["params"]
+            group.clear()
+            group.update(metadata)
+            group["params"] = params
     if scaler is not None and ckpt.get("scaler_state") is not None:
         scaler.load_state_dict(ckpt["scaler_state"])
     # EMA shadow: restore it so a resumed run continues the SAME running average instead of re-seeding
@@ -396,6 +414,10 @@ def load_checkpoint(
         torch.set_rng_state(rng["cpu"].cpu() if hasattr(rng["cpu"], "cpu") else rng["cpu"])
         if rng.get("cuda") is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
+    if restore_rng and metropolis_generator is not None and ckpt.get("metropolis_rng_state") is not None:
+        metro_state = ckpt["metropolis_rng_state"]
+        metropolis_generator.set_state(
+            metro_state.cpu() if hasattr(metro_state, "cpu") else metro_state)
     return int(ckpt["step"])
 
 

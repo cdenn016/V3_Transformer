@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -133,3 +134,46 @@ def test_adam_rule_normalizes_tiny_gradient_unlike_heavy_ball():
     moved_hb   = run("heavy_ball")
     moved_adam = run("adam")
     assert moved_adam > 20 * moved_hb                         # adam normalizes; heavy-ball crawls
+
+
+def test_state_dict_roundtrips_omega_reorth_cadence(monkeypatch):
+    import vfe3.gauge_optim as gauge_optim_mod
+    from vfe3.geometry.groups import get_group
+
+    group = get_group("so_k")(K=4)
+
+    def _optimizer(U):
+        return GaugeNaturalGradAdamW(
+            [{"params": [U], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
+            group.generators, group.irrep_dims, gauge_momentum=0.0,
+            skew_symmetric=True, omega_reorth_every=3,
+        )
+
+    source_U = nn.Parameter(torch.eye(4).expand(2, 4, 4).contiguous())
+    source_opt = _optimizer(source_U)
+    source_opt.step()
+    source_opt.step()
+    state = source_opt.state_dict()
+    assert state["optimizer_extra"]["omega_step"] == 2
+
+    calls = []
+    original_polar = gauge_optim_mod._polar_orthogonalize
+
+    def _spy(U):
+        calls.append(1)
+        return original_polar(U)
+
+    monkeypatch.setattr(gauge_optim_mod, "_polar_orthogonalize", _spy)
+    resumed_U = nn.Parameter(torch.eye(4).expand(2, 4, 4).contiguous())
+    resumed_opt = _optimizer(resumed_U)
+    resumed_opt.load_state_dict(state)
+    resumed_opt.step()
+    assert resumed_opt._omega_step == 3
+    assert calls == [1]
+
+    legacy = {k: v for k, v in state.items() if k != "optimizer_extra"}
+    legacy_U = nn.Parameter(torch.eye(4).expand(2, 4, 4).contiguous())
+    legacy_opt = _optimizer(legacy_U)
+    with pytest.warns(UserWarning, match="non-exact resume"):
+        legacy_opt.load_state_dict(legacy)
+    assert legacy_opt._omega_step == 0

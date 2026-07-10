@@ -206,3 +206,47 @@ def test_train_seam_gated_and_cadence(monkeypatch):
     # off -> never
     m.cfg.omega_reflection = "off"
     _maybe_metropolis_omega(m, tok, step=0, generator=gen); assert calls["n"] == 2
+
+
+def test_metropolis_generator_state_roundtrips(tmp_path, monkeypatch):
+    from vfe3.run_artifacts import RunArtifacts
+    from vfe3.train import train
+
+    with pytest.warns(UserWarning, match="near-no sheet selection"):
+        model = _model(checkpoint_interval=2, max_steps=3, seed=17,
+                       n_e_steps=1, m_phi_lr=0.0)
+    cfg = model.cfg
+    tokens = torch.tensor([[0, 1, 2, 3]])
+    targets = torch.tensor([[1, 2, 3, 4]])
+    loader = [(tokens, targets)]
+    source_draws = []
+
+    def _record_source(token_ids, *, generator):
+        source_draws.append(float(torch.rand((), generator=generator)))
+        return {}
+
+    monkeypatch.setattr(model, "metropolis_omega_step", _record_source)
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model)
+    train(model, loader, cfg, n_steps=2, artifacts=artifacts)
+    checkpoint_path = tmp_path / "run" / "checkpoints" / "step_2.pt"
+
+    expected_generator = torch.Generator().manual_seed(int(cfg.seed))
+    expected_source = [float(torch.rand((), generator=expected_generator)) for _ in range(2)]
+    expected_state = expected_generator.get_state()
+    expected_resumed = float(torch.rand((), generator=expected_generator))
+    assert source_draws == expected_source
+    bundle = torch.load(checkpoint_path, weights_only=True)
+    assert torch.equal(bundle["metropolis_rng_state"], expected_state)
+
+    with pytest.warns(UserWarning, match="near-no sheet selection"):
+        resumed_model = _model(checkpoint_interval=2, max_steps=3, seed=17,
+                               n_e_steps=1, m_phi_lr=0.0)
+    resumed_draws = []
+
+    def _record_resumed(token_ids, *, generator):
+        resumed_draws.append(float(torch.rand((), generator=generator)))
+        return {}
+
+    monkeypatch.setattr(resumed_model, "metropolis_omega_step", _record_resumed)
+    train(resumed_model, loader, resumed_model.cfg, n_steps=3, resume_from=checkpoint_path)
+    assert resumed_draws == [expected_resumed]
