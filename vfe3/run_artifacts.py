@@ -877,6 +877,16 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "rope_on_value":                bool(cfg.rope_on_value),
             "lambda_gamma":                 float(cfg.lambda_gamma),
             "s_e_step":                     bool(cfg.s_e_step),
+            # Truthful fixed-surrogate ledger (C6): these derived booleans expose when the run
+            # intentionally freezes a state-dependent quantity rather than following its full
+            # joint objective. Defaults are False, preserving the pure path.
+            "fixed_covariance_surrogate":   bool(getattr(cfg, "skip_belief_sigma_update", False)),
+            "detached_precision_prior":     bool(cfg.precision_weighted_attention),
+            "detached_query_adaptive_tau":  bool(getattr(cfg, "query_adaptive_tau", False)),
+            "state_dependent_alpha_majorizer": (
+                getattr(cfg, "e_step_update", "gradient") == "mm_exact"
+                and cfg.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord")
+            ),
             # regime_ii_covariant under gaussian_diagonal is a CONTROLLED APPROXIMATION (the
             # diagonal cone is not closed under GL congruence Omega Sigma Omega^T -- audit C5),
             # so a diagonal covariant run is never reported as exact Route B.

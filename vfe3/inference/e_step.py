@@ -702,6 +702,7 @@ def e_step_iteration(
             tau=tau, b0=b0, c0=c0, lambda_beta=lambda_beta,
             kl_max=kl_max, eps=eps, lambda_twohop=lambda_twohop, value=value,
             lambda_alpha_mode=lambda_alpha_mode, family=family, divergence_family=divergence_family,
+            need_sigma_update=(not skip_belief_sigma_update),
             irrep_dims=group.irrep_dims, log_prior=log_prior,
         )
         # Backward estimator, mirroring the gradient path: 'unroll' keeps the analytic graph
@@ -766,11 +767,14 @@ def e_step_iteration(
         # metric, so a non-Gaussian family (e.g. laplace_diagonal, I_mu=I_b=1/b^2) is descended in its
         # own geometry instead of the hardcoded Gaussian Fisher. The Gaussian families delegate to the
         # pinned geometry kernel (byte-identical); 'family' is the same key passed to belief_gradients.
-        # (grad_sigma is None only under skip_belief_sigma_update, whose sigma update is skipped below;
-        # a zero tangent keeps the family seam's signature intact.)
-        gs_precond = grad_sigma if grad_sigma is not None else torch.zeros_like(belief.sigma)
-        nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
-            grad_mu, gs_precond, eps=eps)
+        # When both sigma is frozen and the mean uses the raw Euclidean arm, no natural-gradient
+        # component is consumed. Bypass the family preconditioner entirely instead of computing and
+        # discarding its sigma arm. The natural-mean route still delegates to the family metric.
+        if grad_sigma is None and e_step_mu_precond == "raw":
+            nat_mu, nat_sigma = grad_mu, None
+        else:
+            nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
+                grad_mu, grad_sigma, eps=eps)
 
         # STRAIGHT-THROUGH (manuscript Algorithm 1, GL(K)_attention.tex:2050): detach the per-iteration
         # tangent so only the ADDITIVE chain stays live -- the belief is rebuilt as mu_prev + delta and
@@ -782,7 +786,9 @@ def e_step_iteration(
         # forward VALUE is unchanged (detach never alters a number). This mirrors the phi step, which is
         # already straight-through (fresh detached leaf, create_graph=False).
         if e_step_gradient == "straight_through":
-            nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
+            nat_mu = nat_mu.detach()
+            if nat_sigma is not None:
+                nat_sigma = nat_sigma.detach()
 
         # B3/EXP-14 mean-arm ablation: descend the Fisher natural gradient nat_mu (= Sigma*grad_mu for a
         # diagonal Gaussian) by default, or the raw Euclidean grad_mu under e_step_mu_precond='raw'. The

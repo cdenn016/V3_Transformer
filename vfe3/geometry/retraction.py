@@ -366,13 +366,13 @@ def retract_log_euclidean(
 
 
 def natural_gradient(
-    grad_mu:    torch.Tensor,             # (..., K) Euclidean grad wrt mu
-    grad_sigma: torch.Tensor,             # (..., K) or (..., K, K) Euclidean grad wrt sigma
-    sigma_q:    torch.Tensor,             # (..., K) diagonal OR (..., K, K) full covariance
+    grad_mu:    torch.Tensor,                    # (..., K) Euclidean grad wrt mu
+    grad_sigma: Optional[torch.Tensor],          # None freezes sigma; else Euclidean grad wrt sigma
+    sigma_q:    torch.Tensor,                    # (..., K) diagonal OR (..., K, K) full covariance
 
     *,
     eps:        float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Fisher preconditioner: Euclidean -> natural gradient for a Gaussian.
 
         nat_mu    = Sigma grad_mu
@@ -390,16 +390,21 @@ def natural_gradient(
     with torch.amp.autocast(sigma_q.device.type, enabled=False):        # tensor-keyed (audit 2026-07-05 m10)
         sigma_q    = sigma_q.float()
         grad_mu    = grad_mu.float()
-        grad_sigma = grad_sigma.float()
+        grad_sigma = None if grad_sigma is None else grad_sigma.float()
         if is_diagonal:
             sigma_safe     = sigma_q.clamp(min=eps)
             nat_grad_mu    = sigma_safe * grad_mu
-            nat_grad_sigma = 2.0 * sigma_safe * sigma_safe * grad_sigma
+            nat_grad_sigma = (None if grad_sigma is None
+                              else 2.0 * sigma_safe * sigma_safe * grad_sigma)
         else:
             nat_grad_mu    = torch.einsum('...ij,...j->...i', sigma_q, grad_mu)
-            nat_grad_sigma = 2.0 * torch.einsum('...ij,...jk,...kl->...il', sigma_q, grad_sigma, sigma_q)
-            nat_grad_sigma = 0.5 * (nat_grad_sigma + nat_grad_sigma.transpose(-1, -2))
-    return nat_grad_mu.to(orig_dtype), nat_grad_sigma.to(orig_dtype)
+            if grad_sigma is None:
+                nat_grad_sigma = None
+            else:
+                nat_grad_sigma = 2.0 * torch.einsum('...ij,...jk,...kl->...il', sigma_q, grad_sigma, sigma_q)
+                nat_grad_sigma = 0.5 * (nat_grad_sigma + nat_grad_sigma.transpose(-1, -2))
+    return nat_grad_mu.to(orig_dtype), (None if nat_grad_sigma is None
+                                        else nat_grad_sigma.to(orig_dtype))
 
 
 def retract_phi(

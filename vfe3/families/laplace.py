@@ -55,7 +55,7 @@ non-permutation gauge. Use under permutation/sign gauge for exactness.
 """
 
 import math
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -111,12 +111,12 @@ class DiagonalLaplace(BeliefParams):
 
     def natural_gradient(
         self,
-        grad_mu:    torch.Tensor,             # (..., K) Euclidean grad wrt mu (location)
-        grad_sigma: torch.Tensor,             # (..., K) Euclidean grad wrt the scale b
+        grad_mu:    torch.Tensor,                    # (..., K) Euclidean grad wrt mu (location)
+        grad_sigma: Optional[torch.Tensor],          # None freezes sigma; else grad wrt scale b
 
         *,
         eps:        float = 1e-6,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:   # (nat_mu, nat_b) = Fisher^{-1} grad
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:   # (nat_mu, nat_b) = Fisher^{-1} grad
         r"""Diagonal-Laplace Fisher preconditioner. The Laplace(mu, b) Fisher information is
         DIAGONAL and EQUAL on both coordinates, ``I_mu = I_b = 1 / b^2`` (a location-scale family;
         verified symbolically), so the natural gradient is ``b^2 * grad`` on BOTH the location and
@@ -130,8 +130,8 @@ class DiagonalLaplace(BeliefParams):
         with torch.amp.autocast(self.sigma.device.type, enabled=False):  # tensor-keyed (audit 2026-07-05 m10)
             b2        = self.sigma.float().clamp(min=eps).square()      # (..., K) b^2 = I^{-1}
             nat_mu    = b2 * grad_mu.float()
-            nat_sigma = b2 * grad_sigma.float()
-        return nat_mu.to(orig_dtype), nat_sigma.to(orig_dtype)
+            nat_sigma = None if grad_sigma is None else b2 * grad_sigma.float()
+        return nat_mu.to(orig_dtype), None if nat_sigma is None else nat_sigma.to(orig_dtype)
 
     def _renyi_terms(
         self,

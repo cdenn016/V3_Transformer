@@ -1785,6 +1785,15 @@ class VFE3Config:
             raise ValueError(
                 f"precision_attention_b0 must be positive (the b0 in the per-key reliability "
                 f"-log(b0 + tr Sigma_j)), got {self.precision_attention_b0}")
+        if self.precision_weighted_attention:
+            import warnings
+            warnings.warn(
+                "precision_weighted_attention=True uses a detached precision prior evaluated at "
+                "the fixed covariance entering each block. It is a fixed-covariance surrogate, "
+                "not a jointly optimized covariance-dependent attention objective.",
+                UserWarning,
+                stacklevel=2,
+            )
         # precision_attention_per_head only shapes the bias WHEN precision_weighted_attention is on.
         if self.precision_attention_per_head and not self.precision_weighted_attention:
             import warnings
@@ -2185,6 +2194,15 @@ class VFE3Config:
                 )
             if not (0.0 < self.mm_damping <= 1.0):
                 raise ValueError(f"mm_damping must be in (0, 1], got {self.mm_damping}")
+            if self.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord"):
+                import warnings
+                warnings.warn(
+                    f"e_step_update='mm_exact' with lambda_alpha_mode={self.lambda_alpha_mode!r} "
+                    "exactly minimizes a frozen state-dependent-alpha majorizer per iteration; "
+                    "it is not one-step exact for the profiled state-dependent-alpha objective.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         if self.unigram_kappa < 0.0:
             raise ValueError(f"unigram_kappa must be >= 0, got {self.unigram_kappa}")
         _require(self.exp_fp64_mode, ("dim", "norm"), "exp_fp64_mode")

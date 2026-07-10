@@ -422,6 +422,8 @@ def mm_exact_update(
     family:            str = "gaussian_diagonal",
     divergence_family: str = "renyi",
 
+    need_sigma_update: bool = True,             # False -> omit sigma fusion and return the input sigma exactly
+
     irrep_dims:    Optional[List[int]]    = None,
     log_prior:     Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:          # (mu_star, sigma_star), each (..., N, K)
@@ -485,16 +487,19 @@ def mm_exact_update(
     prior_prec = a / sp                                              # (..., N, K) m a / sigma_p
     pair_prec  = _pair_contract(w, 1.0 / st, irrep_dims)             # (..., N, K) Sum_j w / sigma_t
     pair_mean  = _pair_contract(w, mu_t / st, irrep_dims)            # (..., N, K) Sum_j w mu_t / sigma_t
-    pair_mass  = _pair_mass(w, irrep_dims, K)                        # (..., N, K) Sum_j w
     prec = prior_prec + pair_prec                                   # pre-clamp fused precision
     P = prec.clamp(min=eps)                                         # eps guards the all-saturated row
-    mu_star    = (a * mu_p / sp + pair_mean) / P
-    sigma_star = ((a + pair_mass) / P).clamp(min=eps)
+    mu_star = (a * mu_p / sp + pair_mean) / P
     # m12: on a fully saturated row (a==0 and all w==0) prec floors to 0; dividing the zero numerator by
     # eps snapped the belief to (0, eps), the OPPOSITE of the gradient route (which stays put). Keep the
     # live belief where prec floors, matching the gradient route and preserving graph liveness.
     degenerate = prec <= eps
-    mu_star    = torch.where(degenerate, mu, mu_star)
+    mu_star = torch.where(degenerate, mu, mu_star)
+    if not need_sigma_update:
+        return mu_star, sigma
+
+    pair_mass  = _pair_mass(w, irrep_dims, K)                        # (..., N, K) Sum_j w
+    sigma_star = ((a + pair_mass) / P).clamp(min=eps)
     sigma_star = torch.where(degenerate, sigma, sigma_star)
     return mu_star, sigma_star
 
