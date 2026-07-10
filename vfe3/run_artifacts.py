@@ -24,10 +24,13 @@ survive a viz problem.
 """
 
 import csv
+import hashlib
 import json
 import logging
 import math
 import os
+import shutil
+import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -457,19 +460,95 @@ def load_checkpoint(
     return int(ckpt["step"])
 
 
+def _git_environment(
+    git_executable: str,
+) -> Dict[str, str]:
+    r"""Minimal noninteractive environment for bounded Git provenance probes."""
+    env = {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": str(Path(git_executable).resolve().parent),
+    }
+    for name in ("COMSPEC", "PATHEXT", "SYSTEMROOT", "WINDIR"):
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
+    return env
+
+
+def _git_code_identity(
+    root: Optional[Path] = None,
+) -> Dict[str, object]:
+    r"""Return HEAD plus an exact dirty-tree fingerprint, or a persisted probe error."""
+    repo = Path(__file__).resolve().parent.parent if root is None else Path(root).resolve()
+    identity: Dict[str, object] = {
+        "git_sha":               None,
+        "git_dirty":             None,
+        "git_dirty_fingerprint": None,
+    }
+    try:
+        git_executable = shutil.which("git")
+        if git_executable is None:
+            raise FileNotFoundError("git executable was not found on PATH")
+        env = _git_environment(git_executable)
+
+        def _git(*args: str) -> bytes:
+            return subprocess.check_output(
+                [git_executable,
+                 "-c", "core.fsmonitor=false",
+                 "-c", f"safe.directory={repo.as_posix()}",
+                 *args],
+                cwd=str(repo),
+                env=env,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+
+        identity["git_sha"] = _git("rev-parse", "HEAD").decode("ascii").strip()
+        status = _git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        identity["git_dirty"] = bool(status)
+        if status:
+            diff = _git("diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--")
+            untracked = _git("ls-files", "--others", "--exclude-standard", "-z")
+            digest = hashlib.sha256()
+            digest.update(b"status\0")
+            digest.update(status)
+            digest.update(b"\0diff\0")
+            digest.update(diff)
+            digest.update(b"\0untracked\0")
+            for raw_name in (name for name in untracked.split(b"\0") if name):
+                path = repo / os.fsdecode(raw_name)
+                digest.update(raw_name)
+                digest.update(b"\0")
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+            identity["git_dirty_fingerprint"] = digest.hexdigest()
+    except Exception as exc:
+        identity["git_sha"] = None
+        identity["git_dirty"] = None
+        identity["git_dirty_fingerprint"] = None
+        identity["git_error"] = repr(exc)
+    return identity
+
+
 def _write_provenance(
-    artifacts:   RunArtifacts,
-    cfg:         VFE3Config,
-    model:       torch.nn.Module,
-    test_loader: Optional[Iterable],
-    logger:      logging.Logger,
+    artifacts: RunArtifacts,
+    cfg:       VFE3Config,
+    model:     torch.nn.Module,
+    logger:    logging.Logger,
+
+    *,
+    train_loader:  Optional[Iterable] = None,
+    val_loader:    Optional[Iterable] = None,
+    test_loader:   Optional[Iterable] = None,
+    data_seed:     Optional[int]      = None,
+    max_tokens:    Optional[int]      = None,
+    tokenizer_tag: Optional[str]      = None,
 ) -> None:
-    r"""Best-effort ``provenance.json``: git SHA + dirty flag, library/CUDA versions, the data hash,
-    and the seed -- so two runs with an identical ``config.json`` are still distinguishable by CODE
-    and DATA state (the reproducibility gap a config-only record leaves open). Every probe is
-    guarded; a missing git binary or uncacheable loader simply records ``None``."""
-    import hashlib
-    import subprocess
+    r"""Write code, environment, per-split data, and data-order provenance best-effort."""
 
     prov: Dict[str, object] = {
         "seed":                cfg.seed,
@@ -478,23 +557,27 @@ def _write_provenance(
         "torch_version":       torch.__version__,
         "cuda_version":        torch.version.cuda,
         "device_name":         (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
+        "data_seed":           (int(data_seed) if data_seed is not None else None),
+        "max_tokens":          (int(max_tokens) if max_tokens is not None else None),
+        "tokenizer_tag":       tokenizer_tag,
     }
-    try:
-        root = Path(__file__).resolve().parent.parent
-        prov["git_sha"] = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=str(root), stderr=subprocess.DEVNULL).decode().strip()
-        prov["git_dirty"] = bool(subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=str(root), stderr=subprocess.DEVNULL).decode().strip())
-    except Exception:
-        prov["git_sha"], prov["git_dirty"] = None, None
-    try:                                                        # content hash of the token stream
-        ds = getattr(test_loader, "dataset", None)
-        toks = getattr(ds, "tokens", None)
-        if toks is not None:
-            prov["data_sha256"]   = hashlib.sha256(toks.detach().cpu().numpy().tobytes()).hexdigest()
-            prov["data_n_tokens"] = int(toks.numel())
-    except Exception:
-        pass
+    prov.update(_git_code_identity())
+    for split, loader in (("train", train_loader), ("val", val_loader), ("test", test_loader)):
+        sha_key = f"{split}_data_sha256"
+        n_key = f"{split}_data_n_tokens"
+        prov[sha_key], prov[n_key] = None, None
+        try:
+            dataset = getattr(loader, "dataset", None)
+            tokens = getattr(dataset, "tokens", None)
+            if tokens is not None:
+                raw = tokens.detach().cpu().numpy().tobytes()
+                prov[sha_key] = hashlib.sha256(raw).hexdigest()
+                prov[n_key] = int(tokens.numel())
+        except Exception:
+            pass
+    # Backward-compatible held-out aliases consumed by existing scaling-analysis artifacts.
+    prov["data_sha256"] = prov["test_data_sha256"]
+    prov["data_n_tokens"] = prov["test_data_n_tokens"]
     artifacts.save_json("provenance.json", prov)
     logger.info("wrote provenance.json (git_sha=%s dirty=%s)", prov.get("git_sha"), prov.get("git_dirty"))
 
@@ -725,11 +808,16 @@ def finalize_run(
     cfg:         VFE3Config,
 
     *,
-    test_loader:     Optional[Iterable] = None,
-    losses:          Optional[List[float]] = None,
-    tokens_per_char: float = 1.0,           # test BPC char-correction (1.0 = bits/token)
-    device:          Optional[torch.device] = None,
-    wall_time:       Optional[float] = None,
+    tokens_per_char: float                    = 1.0,   # test BPC char-correction (1.0 = bits/token)
+    train_loader:    Optional[Iterable]       = None,
+    val_loader:      Optional[Iterable]       = None,
+    test_loader:     Optional[Iterable]       = None,
+    losses:          Optional[List[float]]    = None,
+    data_seed:       Optional[int]            = None,
+    max_tokens:      Optional[int]            = None,
+    tokenizer_tag:   Optional[str]            = None,
+    device:          Optional[torch.device]   = None,
+    wall_time:       Optional[float]          = None,
     logger:          Optional[logging.Logger] = None,
 ) -> Dict[str, object]:
     r"""Reload the best-val checkpoint, score the TEST split, and write summary + figures.
@@ -805,7 +893,18 @@ def finalize_run(
     # Reproducibility provenance (git SHA / data hash / versions) + a scaling-law data point -- the
     # externally-grounded records a config-only artifact omits (identical config.json can come from
     # different code and data, and a single run carries no (N, tokens, FLOPs, loss) frontier point).
-    _write_provenance(artifacts, cfg, model, test_loader, logger)
+    _write_provenance(
+        artifacts,
+        cfg,
+        model,
+        logger,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        data_seed=data_seed,
+        max_tokens=max_tokens,
+        tokenizer_tag=tokenizer_tag,
+    )
     n_params = int(sum(p.numel() for p in model.parameters()))
     tokens_seen = int(cfg.max_steps) * int(cfg.batch_size) * int(cfg.max_seq_len)
     # scaling-law data point: the 6ND FLOP proxy is LOOSE for a no-NN E-step model, so record the

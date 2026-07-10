@@ -7,8 +7,12 @@ silent path (no artifacts object) must write nothing and stay bitwise-identical 
 covered by tests/test_train.py::test_silent_and_logging_paths_are_bitwise_identical).
 """
 
+import hashlib
 import json
+import logging
 import math
+import os
+import subprocess
 import types
 
 import pytest
@@ -18,6 +22,7 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
+from vfe3 import run_artifacts
 from vfe3.run_artifacts import RunArtifacts, _pure_path_report, finalize_run
 from vfe3.train import build_optimizer, train
 
@@ -225,6 +230,78 @@ def test_finalize_run_writes_test_results_and_figures(tmp_path):
     summary = json.loads((tmp_path / "run" / "summary.json").read_text())
     assert "test_ppl" in summary and "best_val_ppl" in summary
     assert "reloaded_best" in summary   # m26: surface whether best_model.pt was reloaded (cross-dir resume honesty)
+
+
+def test_provenance_records_all_split_hashes_and_data_knobs(tmp_path):
+    cfg = _cfg(generate_figures=False)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    train_loader = _loader(seed=1, n=300)
+    val_loader = _loader(seed=2, n=360)
+    test_loader = _loader(seed=3, n=420)
+
+    finalize_run(
+        model,
+        art,
+        cfg,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        data_seed=17,
+        max_tokens=300,
+        tokenizer_tag="synthetic-v1",
+    )
+
+    prov = json.loads((tmp_path / "run" / "provenance.json").read_text(encoding="utf-8"))
+    for split, loader in (("train", train_loader), ("val", val_loader), ("test", test_loader)):
+        tokens = loader.dataset.tokens
+        expected = hashlib.sha256(tokens.detach().cpu().numpy().tobytes()).hexdigest()
+        assert prov[f"{split}_data_sha256"] == expected
+        assert prov[f"{split}_data_n_tokens"] == int(tokens.numel())
+    assert prov["data_seed"] == 17
+    assert prov["max_tokens"] == 300
+    assert prov["tokenizer_tag"] == "synthetic-v1"
+    assert prov["data_sha256"] == prov["test_data_sha256"]
+    assert prov["data_n_tokens"] == prov["test_data_n_tokens"]
+
+
+def test_provenance_git_probe_timeout_records_error(tmp_path, monkeypatch):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    timeout = subprocess.TimeoutExpired(["git", "rev-parse", "HEAD"], 5)
+    def _which(name):
+        assert name == "git"
+        return "C:/trusted/git.exe"
+
+    monkeypatch.setattr(run_artifacts.shutil, "which", _which)
+
+    def _time_out(*args, **kwargs):
+        assert kwargs["timeout"] == 5
+        assert kwargs["env"] is not os.environ
+        assert kwargs["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+        raise timeout
+
+    monkeypatch.setattr(run_artifacts.subprocess, "check_output", _time_out)
+    run_artifacts._write_provenance(
+        art,
+        cfg,
+        model,
+        train_loader=None,
+        val_loader=None,
+        test_loader=None,
+        data_seed=None,
+        max_tokens=None,
+        tokenizer_tag=None,
+        logger=logging.getLogger("test-provenance"),
+    )
+
+    prov = json.loads((tmp_path / "run" / "provenance.json").read_text(encoding="utf-8"))
+    assert prov["git_sha"] is None
+    assert prov["git_dirty"] is None
+    assert prov["git_dirty_fingerprint"] is None
+    assert prov["git_error"] == repr(timeout)
 
 
 def test_metrics_csv_includes_gauge_geometry_columns(tmp_path):

@@ -45,9 +45,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from vfe3.config import VFE3Config
-from vfe3.data.datasets import make_dataloader, tokens_per_char as _tokens_per_char
+from vfe3.data.datasets import _tokenizer_tag, make_dataloader, tokens_per_char as _tokens_per_char
 from vfe3.model.model import VFEModel, build_group
-from vfe3.run_artifacts import RunArtifacts, finalize_run
+from vfe3.run_artifacts import RunArtifacts, _git_code_identity, finalize_run
 from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, train
 
@@ -644,11 +644,18 @@ def _cell_cfg_dict(overrides: Dict[str, Any], seed: int, max_steps: Optional[int
     return d
 
 
+def _current_code_identity() -> Dict[str, object]:
+    """Current repository code identity used to validate a persisted scaling cell."""
+    return _git_code_identity(Path(__file__).resolve().parent)
+
+
 def _cell_is_current(run_dir: Path, cfg: VFE3Config, dataset: str, max_tokens: Optional[int] = None) -> bool:
     r"""True iff the run dir already holds a summary.json AND its config.json equals the config we would
     build now (guards resume against baseline drift / a changed dataset). ``max_tokens`` is a loader
     seam, not a VFE3Config field, so it never lands in config.json; it is compared against the
-    persisted scaling_cell.json (a missing/old cell meta or key fails closed -> re-run)."""
+    persisted scaling_cell.json (a missing/old cell meta or key fails closed -> re-run). The saved
+    code identity must match the current HEAD; dirty reuse additionally requires equal nonempty
+    dirty-tree fingerprints."""
     if not (run_dir / "summary.json").exists() or not (run_dir / "config.json").exists():
         return False
     try:
@@ -660,9 +667,26 @@ def _cell_is_current(run_dir: Path, cfg: VFE3Config, dataset: str, max_tokens: O
         return False
     try:
         cellmeta = json.loads((run_dir / "scaling_cell.json").read_text(encoding="utf-8"))
+        provenance = json.loads((run_dir / "provenance.json").read_text(encoding="utf-8"))
     except Exception:
         return False
-    return cellmeta.get("max_tokens", None) == (int(max_tokens) if max_tokens is not None else None)
+    if cellmeta.get("max_tokens", None) != (int(max_tokens) if max_tokens is not None else None):
+        return False
+    current = _current_code_identity()
+    saved_sha = provenance.get("git_sha")
+    current_sha = current.get("git_sha")
+    if not isinstance(saved_sha, str) or not saved_sha or saved_sha != current_sha:
+        return False
+    saved_dirty = provenance.get("git_dirty")
+    current_dirty = current.get("git_dirty")
+    if saved_dirty is False and current_dirty is False:
+        return True
+    if saved_dirty is not True or current_dirty is not True:
+        return False
+    saved_fingerprint = provenance.get("git_dirty_fingerprint")
+    current_fingerprint = current.get("git_dirty_fingerprint")
+    return (isinstance(saved_fingerprint, str) and bool(saved_fingerprint)
+            and saved_fingerprint == current_fingerprint)
 
 
 def run_cell(
@@ -740,8 +764,22 @@ def run_cell(
                    val_loader=val_loader, tokens_per_char=val_tpc, device=device,
                    logger=logger, artifacts=artifacts, generate_samples=False)
     wall = time.perf_counter() - t0
-    results = finalize_run(model, artifacts, cfg, test_loader=test_loader, losses=losses,
-                           tokens_per_char=test_tpc, device=device, wall_time=wall, logger=logger)
+    results = finalize_run(
+        model,
+        artifacts,
+        cfg,
+        tokens_per_char=test_tpc,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        losses=losses,
+        data_seed=cfg.seed,
+        max_tokens=max_tokens,
+        tokenizer_tag=_tokenizer_tag(dataset),
+        device=device,
+        wall_time=wall,
+        logger=logger,
+    )
     return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
             "error_kind": None, "seed": int(cfg.seed), "cached": False,
             "test_ce": results.get("test_ce"), "test_ppl": results.get("test_ppl"),

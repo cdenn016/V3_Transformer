@@ -34,6 +34,7 @@ from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import (
+    _tokenizer_tag,
     _validate_path_component,
     cached_token_count,
     make_dataloader,
@@ -612,8 +613,22 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     if artifacts is not None:
         test_loader = _select_loader(DATASET, cfg, split="test")
         test_tpc = _tokens_per_char(DATASET, "test") or 1.0
-        results = finalize_run(model, artifacts, cfg, test_loader=test_loader, losses=losses,
-                               tokens_per_char=test_tpc, device=torch.device(DEVICE), wall_time=wall, logger=logger)
+        results = finalize_run(
+            model,
+            artifacts,
+            cfg,
+            tokens_per_char=test_tpc,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            losses=losses,
+            data_seed=DATA_SEED,
+            max_tokens=MAX_TOKENS,
+            tokenizer_tag=_tokenizer_tag(DATASET),
+            device=torch.device(DEVICE),
+            wall_time=wall,
+            logger=logger,
+        )
         run_dir = _rename_run_by_ppl(run_dir, _run_label(cfg, DATASET), results.get("test_ppl"), logger)
         logger.info("Artifacts written to %s", run_dir)
 
