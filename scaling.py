@@ -48,6 +48,7 @@ from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader, tokens_per_char as _tokens_per_char
 from vfe3.model.model import VFEModel, build_group
 from vfe3.run_artifacts import RunArtifacts, finalize_run
+from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, train
 
 logger = logging.getLogger("scaling")
@@ -628,12 +629,6 @@ def get_loader(
 # SINGLE-CELL EXECUTOR  -- one independent (size, seed) run (replicates _run_once's body).
 # =============================================================================
 
-def _seed_everything(seed: int) -> None:
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 def _cell_cfg_dict(overrides: Dict[str, Any], seed: int, max_steps: Optional[int]) -> Dict[str, Any]:
     r"""The exact kwargs a cell's VFE3Config is built from: baseline + overrides + run knobs. Single
     source of truth, shared by ``run_cell`` and the resume staleness check."""
@@ -701,7 +696,7 @@ def run_cell(
                 "test_ce": sp.get("test_ce"), "n_params": sp.get("n_params")}
 
     pred_n, n_gen = predict_n_params(cfg)
-    _seed_everything(cfg.seed)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(device)
     actual_n = int(sum(p.numel() for p in model.parameters()))
     gap = "" if actual_n == pred_n else f"  (predicted {pred_n:,}; +{actual_n - pred_n:,} small modules)"
@@ -715,7 +710,7 @@ def run_cell(
     # Order-INDEPENDENT data stream: model build consumed config-dependent RNG, so reseed AFTER it and
     # re-seed each loader's generator so every cell sees the same batch sequence regardless of grid
     # position (per-seed variance is then init/optimization variance, not a data-order artifact).
-    _seed_everything(cfg.seed)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     for loader in (train_loader, val_loader, test_loader):
         if getattr(loader, "generator", None) is not None:
             loader.generator.manual_seed(cfg.seed)

@@ -37,6 +37,7 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.ema import EMA
+from vfe3.runtime import deterministic_state
 
 
 def _atomic_replace(
@@ -413,11 +414,12 @@ def _write_provenance(
     import subprocess
 
     prov: Dict[str, object] = {
-        "seed":          cfg.seed,
-        "n_params":      int(sum(p.numel() for p in model.parameters())),
-        "torch_version": torch.__version__,
-        "cuda_version":  torch.version.cuda,
-        "device_name":   (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
+        "seed":                cfg.seed,
+        "deterministic_state": deterministic_state(),
+        "n_params":            int(sum(p.numel() for p in model.parameters())),
+        "torch_version":       torch.__version__,
+        "cuda_version":        torch.version.cuda,
+        "device_name":         (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
     }
     try:
         root = Path(__file__).resolve().parent.parent

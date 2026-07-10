@@ -71,6 +71,7 @@ from vfe3.metrics import (
 )
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
+from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, evaluate, train
 from vfe3.viz.extract import across_layer_belief_trace, attention_entropy_cov_gap, converged_state
 
@@ -1427,22 +1428,6 @@ def get_loader(
 # SINGLE-RUN EXECUTOR
 # =============================================================================
 
-def _seed_everything(seed: int, deterministic: bool = True) -> None:
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if deterministic:
-        # Full run-to-run reproducibility (esp. on the GPU, whose default kernels use
-        # nondeterministic atomics / cuBLAS autotuning). CUBLAS_WORKSPACE_CONFIG must be set BEFORE
-        # the first CUDA op to fully take effect; setdefault here is best-effort (works when
-        # _seed_everything runs before model/CUDA init) -- for a hard guarantee also export it at
-        # process launch. warn_only=True keeps the run alive if an op lacks a deterministic kernel.
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-
 def _cell_cfg_dict(
     overrides:  Dict[str, Any],
 
@@ -1615,7 +1600,7 @@ def run_single(
                 "primary_val_ppl": float("inf"), "seed": int(seed),
                 "overrides": _jsonable(overrides)}
 
-    _seed_everything(cfg.seed, deterministic=cfg.deterministic)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(device)
     n_params = int(sum(p.numel() for p in model.parameters()))
 
@@ -1632,7 +1617,7 @@ def run_single(
     # the same config would see different batches depending on its position in the sweep, and
     # the comparison would be confounded by data order. Reseeding here, after the model is built,
     # pins every cell to the same batch sequence regardless of order.
-    _seed_everything(cfg.seed, deterministic=cfg.deterministic)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     for loader in (train_loader, val_loader):                # synthetic loaders carry their own generator
         if getattr(loader, "generator", None) is not None:
             loader.generator.manual_seed(cfg.seed)

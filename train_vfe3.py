@@ -27,12 +27,14 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each
 #   override by exporting KMP_DUPLICATE_LIB_OK yourself. See docs/edits/2026-06-05.
 
 import logging
+from typing import Dict, List, Sequence
 
 import torch
 from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader
+from vfe3.runtime import seed_everything
 from vfe3.train import _fmt_tau, evaluate, train
 
 
@@ -538,7 +540,7 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     from vfe3.run_artifacts import RunArtifacts, finalize_run
 
     cfg = VFE3Config(**{**config, "seed": seed})         # per-run seed override (config `seed` is the default)
-    torch.manual_seed(cfg.seed)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(DEVICE)
     train_loader = _select_loader(DATASET, cfg, split="train")
     val_loader = _select_loader(DATASET, cfg, split="validation")
@@ -578,7 +580,7 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     # here would make this entry point train on a DIFFERENT batch order than ablation.py for an
     # identical config+seed (model init itself is already identical). Mirrors ablation.run_single's
     # post-build reseed so the two entry points reproduce each other.
-    torch.manual_seed(cfg.seed)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     t0 = time.perf_counter()
     losses = train(
         model, train_loader, cfg,
@@ -611,6 +613,29 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
         logger.info("Artifacts written to %s", run_dir)
 
 
+def _resolve_seeds(
+    run_config: Dict[str, object],
+    seeds:      Sequence[int],
+    num_runs:   int,
+) -> List[int]:
+    """Resolve click-to-run seeds without silently overriding a one-run config seed."""
+    if seeds:
+        if len(seeds) < num_runs:
+            raise ValueError(
+                f"SEEDS lists {len(seeds)} seed(s) but NUM_RUNS={num_runs}; "
+                "provide at least NUM_RUNS seeds"
+            )
+        if num_runs == 1 and int(seeds[0]) != int(run_config["seed"]):
+            raise ValueError(
+                f"SEEDS[0]={int(seeds[0])} conflicts with config seed={int(run_config['seed'])}; "
+                "make the one-run seed values agree"
+            )
+        return [int(seed) for seed in seeds[:num_runs]]
+    if num_runs != 1:
+        raise ValueError(f"NUM_RUNS={num_runs} > 1 but SEEDS is empty; list one seed per run in SEEDS")
+    return [int(run_config["seed"])]
+
+
 def main() -> None:
     r"""Click-to-run entry: train ``NUM_RUNS`` independent seeds back-to-back (default: one run on the
     config ``seed``). Run i uses ``SEEDS[i]``; each run is fully independent with its own seed-labelled
@@ -618,15 +643,7 @@ def main() -> None:
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger = logging.getLogger("train_vfe3")
-    if SEEDS:
-        if len(SEEDS) < NUM_RUNS:
-            raise ValueError(
-                f"SEEDS lists {len(SEEDS)} seed(s) but NUM_RUNS={NUM_RUNS}; provide at least NUM_RUNS seeds")
-        seeds = list(SEEDS[:NUM_RUNS])
-    elif NUM_RUNS != 1:
-        raise ValueError(f"NUM_RUNS={NUM_RUNS} > 1 but SEEDS is empty; list one seed per run in SEEDS")
-    else:
-        seeds = [config["seed"]]                          # single run on the config seed (unchanged path)
+    seeds = _resolve_seeds(config, seeds=SEEDS, num_runs=NUM_RUNS)
     for i, s in enumerate(seeds):
         if len(seeds) > 1:
             logger.info("\n%s\n# Run %d/%d  (seed=%d)\n%s", "#" * 64, i + 1, len(seeds), int(s), "#" * 64)

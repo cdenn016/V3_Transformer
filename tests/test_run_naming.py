@@ -4,6 +4,8 @@ timestamp) the user organizes runs by. Pure filesystem/string logic -- no model 
 import logging
 import math
 
+import pytest
+
 import train_vfe3
 from vfe3.config import VFE3Config
 
@@ -74,3 +76,8 @@ def test_rename_skips_when_ppl_missing_or_nonfinite(tmp_path):
 def test_rename_skips_when_dir_absent(tmp_path):
     missing = str(tmp_path / "20260607-124645_nope")
     assert train_vfe3._rename_run_by_ppl(missing, "nope", 100.0, _LOG) == missing
+
+
+def test_single_run_rejects_seed_precedence_mismatch():
+    with pytest.raises(ValueError, match="SEEDS.*config.*seed"):
+        train_vfe3._resolve_seeds({"seed": 6}, seeds=(54,), num_runs=1)
