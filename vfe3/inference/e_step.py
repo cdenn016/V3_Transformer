@@ -17,8 +17,7 @@ import torch
 
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
-from vfe3.families.base import get_family
-from vfe3.families.gaussian import diag_kl_unclamped
+from vfe3.families.base import get_family, kl
 from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
@@ -926,7 +925,7 @@ def e_step(
     T ~ Uniform{e_steps_min..e_steps_max} on grad-enabled (training) forwards, from the GLOBAL
     torch RNG; ``e_steps_backprop_last=k`` runs all but the last k iterations under no_grad and
     detaches the belief at the boundary (truncated backprop); ``e_step_halt_tol`` breaks the eval
-    (no_grad) loop when the mean diagonal-Gaussian KL(q^t || q^{t-1}) drops below tol."""
+    (no_grad) loop when the mean configured-family KL(q^t || q^{t-1}) drops below tol."""
     traj: List[float] = []
 
     # Hoist the flat transport when phi is frozen across iterations (e_phi_lr==0).  On the flat
@@ -995,6 +994,7 @@ def e_step(
     if e_steps_backprop_last > 0 and grad_on:
         no_grad_prefix = max(n_total - e_steps_backprop_last, 0)
     halt_eps: float = kwargs.get("eps", 1e-6)
+    halt_family = get_family(kwargs.get("family", "gaussian_diagonal")) if e_step_halt_tol is not None else None
 
     if return_trajectory:
         traj.append(_f_diag(belief))
@@ -1061,12 +1061,16 @@ def e_step(
         if return_trajectory:
             traj.append(_f_diag(belief))
         if e_step_halt_tol is not None and not grad_on and t + 1 < n_total:
-            # Eval-time halting: mean over tokens of the closed-form diagonal-Gaussian
-            # KL(q^t || q^{t-1}) (the per-iteration belief move); break when < tol. The guard on
-            # t+1 < n_total skips a wasted check after the final iteration.
+            # Eval-time halting: mean over tokens of the configured-family KL(q^t || q^{t-1})
+            # (the per-iteration belief move); break when < tol. The guard on t+1 < n_total skips
+            # a wasted check after the final iteration.
             with torch.no_grad():
-                move = diag_kl_unclamped(belief.mu, belief.sigma, prev_mu, prev_sigma,
-                                         eps=halt_eps).mean()
+                move = kl(
+                    halt_family(belief.mu, belief.sigma),
+                    halt_family(prev_mu, prev_sigma),
+                    kl_max=float("inf"),
+                    eps=halt_eps,
+                ).mean()
             if move.item() < e_step_halt_tol:
                 break
     return (belief, traj) if return_trajectory else belief

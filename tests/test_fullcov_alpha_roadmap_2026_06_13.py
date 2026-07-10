@@ -344,8 +344,7 @@ def test_full_cov_chunked_matches_dense_on_non_pd():
 
 def test_full_cov_query_invariants_all_pd_byte_identical():
     """On an all-PD Sigma_q the ok mask is all-True and torch.where selects logdet_q unchanged:
-    the invariants stay byte-identical to the ungated safe_cholesky log-det, so the all-PD
-    value-equality pins do not move."""
+    the invariants stay byte-identical to the raw round-zero safe_cholesky log-det."""
     from vfe3.families.base import _logdet_chol
     from vfe3.numerics import safe_cholesky
     torch.manual_seed(7)
@@ -353,13 +352,12 @@ def test_full_cov_query_invariants_all_pd_byte_identical():
     pb = _full_model(vocab_size=V, decode_mode="full").prior_bank
     A = torch.randn(B, N, K, K)
     sigma_q = A @ A.transpose(-1, -2) + torch.eye(K)
-    diag_sq_reg, logdet_q = pb._full_cov_query_invariants(sigma_q)
-    sq_reg = sigma_q + pb.eps * torch.eye(K)
-    L, ok = safe_cholesky(sq_reg, eps=pb.eps, rounds=5)
+    diag_sq, logdet_q = pb._full_cov_query_invariants(sigma_q)
+    L, ok = safe_cholesky(sigma_q, eps=pb.eps, rounds=5)
     assert bool(ok.all())
     assert torch.equal(logdet_q, _logdet_chol(L))
     assert torch.isfinite(logdet_q).all()
-    assert torch.equal(diag_sq_reg, torch.diagonal(sq_reg, dim1=-2, dim2=-1))
+    assert torch.equal(diag_sq, torch.diagonal(sigma_q, dim1=-2, dim2=-1))
 
 
 # ---------------------------------------------------------------------------
