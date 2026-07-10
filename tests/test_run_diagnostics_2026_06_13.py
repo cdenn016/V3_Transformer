@@ -76,8 +76,11 @@ def test_train_step_metrics_out_captures_grad_norm() -> None:
     tok = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.max_seq_len), device=DEVICE)
     tgt = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.max_seq_len), device=DEVICE)
     out: dict = {}
-    loss = train_step(model, opt, sched, tok, tgt, grad_clip=1.0, metrics_out=out)
+    status: dict = {}
+    loss = train_step(model, opt, sched, tok, tgt, grad_clip=1.0,
+                      metrics_out=out, status_out=status)
     assert isinstance(loss, float) and math.isfinite(loss)         # bare-float return preserved
+    assert status == {"did_step": True}
     assert math.isfinite(out["grad_norm"]) and out["grad_norm"] >= 0.0
     for k in ("grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"):
         assert k in out and math.isfinite(out[k])

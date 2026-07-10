@@ -106,6 +106,39 @@ def test_train_step_accum_grad_matches_full_batch(K):
         assert torch.allclose(accum[name], full[name], atol=1e-5, rtol=1e-4), name
 
 
+def test_estep_grad_metrics_are_microbatch_mean_not_last():
+    class _ScriptedEstepGrad(torch.nn.Module):
+        def __init__(self, inner: VFEModel) -> None:
+            super().__init__()
+            self.inner = inner
+            self.cfg = inner.cfg
+            self.records = [
+                {"mu": 1.0, "sigma": 10.0},
+                {"mu": 3.0},
+            ]
+
+        def forward(self, tokens, targets=None, *, estep_grad_out=None):
+            assert estep_grad_out == {}
+            estep_grad_out.update(self.records.pop(0))
+            return self.inner(tokens, targets)
+
+    torch.manual_seed(0)
+    cfg = _cfg()
+    inner = VFEModel(cfg)
+    model = _ScriptedEstepGrad(inner)
+    optimizer = build_optimizer(inner, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda step: lr_lambda(step, cfg))
+    tokens, targets = _full_batch_no_ignore(B=4, N=8, V=6, seed=0)
+    metrics = {}
+
+    train_step(model, optimizer, scheduler, tokens, targets, grad_clip=1.0,
+               grad_accum_steps=2, metrics_out=metrics)
+
+    assert metrics["estep_grad_norm_mu_microbatch_mean"] == pytest.approx(2.0)
+    assert metrics["estep_grad_norm_sigma_microbatch_mean"] == pytest.approx(10.0)
+
+
 def test_train_step_k1_byte_identical_to_single_step_path():
     # grad_accum_steps=1 must reproduce the current train_step EXACTLY: same grads, same
     # optimizer/scheduler step, same returned loss. Two identically-seeded models, one

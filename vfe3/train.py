@@ -15,6 +15,7 @@ import contextlib
 import logging
 import math
 import time
+from numbers import Real
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -363,6 +364,7 @@ def train_step(
     grad_accum_steps: int                                = 1,
     scaler:           Optional['torch.amp.GradScaler']  = None,
     metrics_out:      Optional[dict]                     = None,
+    status_out:       Optional[dict]                     = None,
 ) -> float:
     r"""One M-step (one optimizer step) on the cross-entropy of a batch; returns the loss.
 
@@ -390,6 +392,10 @@ def train_step(
     is a documented no-op: ``scale`` is identity, ``unscale_`` is a no-op, and ``step``
     calls ``optimizer.step()`` directly — so passing ``scaler=None`` (or an
     ``enabled=False`` instance) keeps this function byte-identical to the unscaled path.
+
+    When ``status_out`` is provided, ``status_out["did_step"]`` records whether the optimizer
+    accepted the update. It is false for the explicit nonfinite gate and when an enabled
+    GradScaler decreases its scale after ``update()``, which signals an overflow-skipped step.
     """
     # A disabled scaler is a documented no-op (scale -> identity, unscale_ -> nothing,
     # step -> optimizer.step()), so scaler=None keeps this path byte-identical to the unscaled loop.
@@ -401,7 +407,9 @@ def train_step(
     # E-step belief-gradient capture: a dict the forward fills with the raw ||grad_mu/sigma/phi|| of F
     # (the inference analogue of the M-step per-role grad norms). Created ONLY when metrics are being
     # logged this step; None -> the forward skips the capture entirely (zero overhead, byte-identical).
-    _egrad = {} if metrics_out is not None else None
+    _egrad = {} if metrics_out is not None and grad_accum_steps == 1 else None
+    _egrad_sums: Dict[str, float] = {}
+    _egrad_counts: Dict[str, int] = {}
     if grad_accum_steps == 1:                                   # default path: byte-identical to the single-step loop
         _, loss, ce = model(tokens, targets, estep_grad_out=_egrad)
         _scaler.scale(loss).backward()
@@ -444,7 +452,13 @@ def train_step(
         step_loss = 0.0
         step_ce = 0.0
         for tok_mb, tgt_mb, n_mb in zip(tok_chunks, tgt_chunks, _mb_tok):
-            _, loss_mb, ce_mb = model(tok_mb, tgt_mb, estep_grad_out=_egrad)   # last microbatch wins the E-step grads
+            _egrad_mb = {} if metrics_out is not None else None
+            _, loss_mb, ce_mb = model(tok_mb, tgt_mb, estep_grad_out=_egrad_mb)
+            if _egrad_mb is not None:
+                for _name, _value in _egrad_mb.items():
+                    if isinstance(_value, Real):
+                        _egrad_sums[_name] = _egrad_sums.get(_name, 0.0) + float(_value)
+                        _egrad_counts[_name] = _egrad_counts.get(_name, 0) + 1
             w = n_mb / n_tot                                          # token-mean weight (valid-token fraction)
             _scaler.scale(loss_mb * w).backward()                     # accumulate the token-weighted microbatch grad
             step_loss += float(loss_mb.detach()) * w
@@ -506,11 +520,14 @@ def train_step(
             metrics_out[f"weight_norm_{_name}"] = role_w_sq[_name] ** 0.5
         # E-step belief-gradient norms: the raw ||grad_mu/sigma/phi|| of F captured inside the last
         # E-step iteration (model.forward estep_grad_out) -- the INFERENCE analogue of the M-step
-        # per-role grads above (parameter learning). 0.0 for a component whose substep is off (e.g.
-        # phi when e_phi_lr=0); the figure masks non-positive points.
+        # per-role grads above (parameter learning). Under accumulation, each contributing
+        # microbatch is captured independently and the arithmetic mean is named explicitly.
         if _egrad is not None:
             for _name in ("mu", "sigma", "phi"):
                 metrics_out[f"estep_grad_norm_{_name}"] = float(_egrad.get(_name, 0.0))
+        for _name, _total in _egrad_sums.items():
+            metrics_out[f"estep_grad_norm_{_name}_microbatch_mean"] = (
+                _total / _egrad_counts[_name])
         metrics_out["loss_finite"] = float(math.isfinite(step_loss))
         metrics_out["train_ce"] = step_ce            # pre-step CE (matches step_loss; not a post-update re-forward)
         if _mb_tok:                                             # grad_accum_steps>1: token-spread bias check
@@ -523,9 +540,8 @@ def train_step(
     # GradScaler path already skips internally via found_inf; mirror that here by dropping the
     # grads and not stepping when the scaler is disabled (audits 2026-06-17 r2, 2026-07-01 F1).
     skip_step = (not _scaler_enabled) and ((not math.isfinite(step_loss)) or (not grad_finite))
-    if metrics_out is not None:                              # expose the gate for tests/CSV
-        metrics_out["step_skipped"] = float(skip_step)
-        metrics_out["grad_finite"]  = float(grad_finite)
+    if metrics_out is not None:
+        metrics_out["grad_finite"] = float(grad_finite)
     if grad_clip is not None and grad_clip > 0 and not skip_step:
         if getattr(model.cfg, "grad_clip_per_role", False):
             # Per-role clipping (default OFF): the global L2 norm below is dominated by phi_embed
@@ -540,17 +556,25 @@ def train_step(
                 torch.nn.utils.clip_grad_norm_(_ps, grad_clip)
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    scale_before = float(_scaler.get_scale()) if _scaler_enabled else None
     if skip_step:
         optimizer.zero_grad(set_to_none=True)                # drop poisoned grads; do NOT step AdamW
     else:
         _scaler.step(optimizer)
     _scaler.update()
+    did_step = not skip_step
+    if scale_before is not None and float(_scaler.get_scale()) < scale_before:
+        did_step = False
+    if status_out is not None:
+        status_out["did_step"] = did_step
+    if metrics_out is not None:
+        metrics_out["step_skipped"] = float(not did_step)
     # Closed-form hyper-prior M-step (r_update_mode='barycenter'): after AdamW updates the s tables,
     # set the centroid r to their forward-KL barycenter (the closed-form variational M-step, in place
     # of an AdamW step on r -- r is ungrouped/frozen-from-the-optimizer under this mode). No-op for the
     # default gradient r (trained inside optimizer.step above) and for frozen r (learnable_r=False).
     _cfg = model.cfg
-    if (not skip_step) and _cfg.learnable_r and _cfg.r_update_mode == "barycenter":
+    if did_step and _cfg.learnable_r and _cfg.r_update_mode == "barycenter":
         model.prior_bank.barycenter_r_()   # gated with the optimizer step: never M-step on poisoned grads
     scheduler.step()                       # UNCONDITIONAL: resume rebuilds LambdaLR at last_epoch=start_step-1
     #                                        assuming exactly one scheduler.step per loop iteration
@@ -967,14 +991,15 @@ def train(
             # no_grad, so no weight change and no global-RNG draw (randomize_e_steps is gated on grad_on),
             # leaving the train_step RNG stream and weights byte-identical.
             d = model.diagnostics(tokens)
+        step_status: Dict[str, bool] = {}
         losses.append(train_step(model, optimizer, scheduler, tokens, targets,
                                   grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
-                                  scaler=scaler, metrics_out=step_metrics))
+                                  scaler=scaler, metrics_out=step_metrics, status_out=step_status))
         # Metropolis det-sign sweep (opt-in, default OFF): runs on the POST-optimizer-step model,
         # gated + cadence-checked by the helper; inert (no call, no generator draw) unless
         # cfg.omega_reflection == 'metropolis'. tokens is the SAME input batch just fed to train_step.
         _maybe_metropolis_omega(model, tokens, step=step, generator=metro_gen)
-        if ema is not None:
+        if ema is not None and step_status["did_step"]:
             ema.update(model)                            # blend the post-step weights into the shadow
 
         if do_log or do_csv:                                 # diagnostics (off graph), ONCE
@@ -1157,6 +1182,9 @@ def train(
                 for _gk in ("grad_norm", "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi",
                             "weight_norm_mu", "weight_norm_sigma", "weight_norm_phi",
                             "estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi",
+                            "estep_grad_norm_mu_microbatch_mean",
+                            "estep_grad_norm_sigma_microbatch_mean",
+                            "estep_grad_norm_phi_microbatch_mean",
                             "loss_finite", "grad_finite", "step_skipped",
                             "grad_scale", "grad_accum_tok_spread"):
                     if _gk in step_metrics:

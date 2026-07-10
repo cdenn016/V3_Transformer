@@ -1241,9 +1241,17 @@ def _save_figures(
                 figs.plt.close(fig)
         # E-step belief-gradient decomposition (mu / sigma / phi): the INFERENCE analogue of the M-step
         # figure above -- ||grad F|| over the belief tuple per inner-loop component, logged by train_step
-        # from model.forward's estep_grad_out. Same presence gate; independent of the M-step columns (a
-        # component may be present in one and absent in the other), so build its own row set.
-        eg_keys = ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi")
+        # from model.forward's estep_grad_out. Accumulated runs prefer the explicitly named arithmetic
+        # microbatch means; single-batch runs retain the historical column names. Same presence gate;
+        # independent of the M-step columns, so build its own row set.
+        eg_mean_keys = (
+            "estep_grad_norm_mu_microbatch_mean",
+            "estep_grad_norm_sigma_microbatch_mean",
+            "estep_grad_norm_phi_microbatch_mean",
+        )
+        eg_keys = (eg_mean_keys if any(any(k in r for k in eg_mean_keys)
+                                      for r in artifacts.history)
+                   else ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi"))
         eg_present = [k for k in eg_keys
                       if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
         if eg_present:
