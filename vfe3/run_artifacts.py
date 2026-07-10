@@ -260,6 +260,7 @@ class RunArtifacts:
         scaler:               Optional['torch.amp.GradScaler'] = None,
         ema:                  Optional[EMA]                     = None,
         metropolis_generator: Optional[torch.Generator]         = None,
+        data_state:            Optional[Dict[str, object]]       = None,
     ) -> Path:
         r"""Write a resumable ``checkpoints/step_<N>.pt`` (model + optimizer + RNG + config + step).
 
@@ -275,6 +276,8 @@ class RunArtifacts:
         atomic (same-dir tmp + ``os.replace``) so a crash never leaves a corrupt ``step_<N>.pt``.
         ``metropolis_generator`` carries the private accept/reject stream independently of the
         global CPU/CUDA RNG so a resumed discrete-reflection sweep continues at the next draw.
+        ``data_state`` records the current epoch's starting loader-generator state and cursor;
+        the state tensor is cloned into the bundle so later generator advances cannot mutate it.
         """
         path = self.ckpt_dir / f"step_{step}.pt"
         tmp  = path.with_suffix(".pt.tmp")
@@ -282,6 +285,13 @@ class RunArtifacts:
             "cpu":  torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
+        saved_data_state = None
+        if data_state is not None:
+            saved_data_state = {
+                "epoch_start_generator_state": data_state["epoch_start_generator_state"].clone(),
+                "batches_consumed":            int(data_state["batches_consumed"]),
+                "epoch":                       int(data_state["epoch"]),
+            }
         torch.save({
             "step":            int(step),
             "model_state":     model.state_dict(),
@@ -295,6 +305,7 @@ class RunArtifacts:
             "ema_state":       (ema.state_dict() if ema is not None else None),
             "best_val_ppl":    float(self.best_val_ppl),
             "best_step":       self.best_step,
+            "data_state":      saved_data_state,
         }, tmp)
         _atomic_replace(path, tmp)
         return path
@@ -313,6 +324,7 @@ def load_checkpoint(
     ema:                  Optional[EMA]                    = None,
     artifacts:            'Optional[RunArtifacts]'         = None,
     metropolis_generator: Optional[torch.Generator]        = None,
+    data_state:            Optional[Dict[str, object]]      = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
@@ -333,7 +345,8 @@ def load_checkpoint(
     shape-changing divergence, but shape-preserving semantic drift (LR schedule, n_e_steps,
     e_*_lr, ...) would otherwise pass silently. ``artifacts`` (audit 2026-07-01 C2): when given,
     the bundled ``best_val_ppl``/``best_step`` model-selection state is restored into it (bundles
-    without those fields skip the restore).
+    without those fields skip the restore). When a mutable ``data_state`` mapping is supplied, it
+    is filled from the bundled iterator cursor; older checkpoints leave it empty.
 
     The bundle is loaded with ``weights_only=True`` by default, which refuses to execute arbitrary
     pickle reductions: our bundle carries only tensors, an ``asdict`` config dict, and RNG tensors
@@ -418,6 +431,15 @@ def load_checkpoint(
         metro_state = ckpt["metropolis_rng_state"]
         metropolis_generator.set_state(
             metro_state.cpu() if hasattr(metro_state, "cpu") else metro_state)
+    if data_state is not None:
+        data_state.clear()
+        if ckpt.get("data_state") is not None:
+            saved_data_state = ckpt["data_state"]
+            data_state.update({
+                "epoch_start_generator_state": saved_data_state["epoch_start_generator_state"],
+                "batches_consumed":            int(saved_data_state["batches_consumed"]),
+                "epoch":                       int(saved_data_state["epoch"]),
+            })
     return int(ckpt["step"])
 
 

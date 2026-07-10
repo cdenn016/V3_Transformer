@@ -819,6 +819,14 @@ def train(
     start_step = 0
     if device is None:
         device = model.prior_bank.mu_embed.device
+    loader_sampler = getattr(loader, "sampler", None)
+    shuffled_loader = isinstance(loader_sampler, torch.utils.data.RandomSampler)
+    loader_generator = getattr(loader, "generator", None)
+    resume_data_state: Dict[str, object] = {}
+    if (resume_path is not None and shuffled_loader
+            and not isinstance(loader_generator, torch.Generator)):
+        raise RuntimeError(
+            "exact shuffled resume requires loader.generator to expose a torch.Generator")
     # Metropolis det-sign sweep (opt-in, default OFF): a single persistent CPU generator, seeded
     # once from cfg.seed, threaded across every step so the accept/reject sequence is reproducible
     # (design spec Sec.6). It is constructed before resume so load_checkpoint can restore its private
@@ -838,21 +846,12 @@ def train(
         from vfe3.run_artifacts import load_checkpoint           # local import avoids any import cycle
         start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
                                      scaler=scaler, cfg=cfg, ema=ema, artifacts=artifacts,
-                                     metropolis_generator=metro_gen)
-        # Shuffled-loader resume limitation (audit 2026-07-01 C1): weights/optimizer/RNG ARE
-        # restored, but a RandomSampler's in-flight epoch permutation and intra-epoch cursor are
-        # NOT persisted, so a resumed shuffled run draws a DIFFERENT batch sequence than the
-        # uninterrupted run would have from this step. Warn (resume-scoped only: from-scratch runs
-        # and shuffle=False SequentialSampler loaders never reach this).
-        import warnings
-        _samp = getattr(loader, "sampler", None)
-        if _samp is not None and type(_samp).__name__ == "RandomSampler":
-            warnings.warn(
-                "resume: the training DataLoader shuffles; the pre-interruption shuffle "
-                "permutation and cursor are NOT restored, so a resumed shuffled run is not "
-                "batch-identical to an uninterrupted run (RNG/weights/optimizer ARE restored). "
-                "Use shuffle=False or a deterministic step sampler for a sealed resume.",
-                UserWarning, stacklevel=2)
+                                     metropolis_generator=metro_gen,
+                                     data_state=resume_data_state)
+        if shuffled_loader and not resume_data_state:
+            raise RuntimeError(
+                "exact shuffled resume requires checkpoint data_state; this checkpoint predates "
+                "shuffled iterator persistence")
         # LambdaLR with last_epoch != -1 requires 'initial_lr' on every group; set it from the configured
         # base (not the post-load group['lr'], which the restored optimizer state overwrote with base*cos).
         for group, base in zip(optimizer.param_groups, base_lrs):
@@ -904,7 +903,39 @@ def train(
             finally:
                 bar.close()
 
+    epoch = 0
+    batches_consumed = 0
+    if resume_data_state:
+        required_data_state = {"epoch_start_generator_state", "batches_consumed", "epoch"}
+        missing_data_state = required_data_state - resume_data_state.keys()
+        if missing_data_state:
+            raise RuntimeError(
+                f"checkpoint data_state is missing required field(s) {sorted(missing_data_state)}")
+        if not isinstance(loader_generator, torch.Generator):
+            raise RuntimeError(
+                "exact data resume requires loader.generator to expose a torch.Generator")
+        saved_generator_state = resume_data_state["epoch_start_generator_state"]
+        if not isinstance(saved_generator_state, torch.Tensor):
+            raise RuntimeError("checkpoint data_state epoch_start_generator_state must be a tensor")
+        epoch = int(resume_data_state["epoch"])
+        saved_batches_consumed = int(resume_data_state["batches_consumed"])
+        if epoch < 0 or saved_batches_consumed < 0:
+            raise RuntimeError("checkpoint data_state epoch and batches_consumed must be non-negative")
+        epoch_start_generator_state = saved_generator_state.cpu().clone()
+        loader_generator.set_state(epoch_start_generator_state)
+    else:
+        saved_batches_consumed = 0
+        epoch_start_generator_state = (loader_generator.get_state().clone()
+                                       if isinstance(loader_generator, torch.Generator) else None)
     it = iter(loader)
+    for _ in range(saved_batches_consumed):
+        try:
+            next(it)
+        except StopIteration as exc:
+            raise RuntimeError(
+                "checkpoint data_state cannot be replayed by the current loader: "
+                "batches_consumed exceeds the saved epoch") from exc
+        batches_consumed += 1
     win_t0 = time.perf_counter()
     train_t0 = win_t0                                 # cumulative wall-clock origin (D1/EXP-8; resets on resume)
     win_i0 = start_step
@@ -914,8 +945,13 @@ def train(
         try:
             tokens, targets = next(it)
         except StopIteration:
+            epoch += 1
+            batches_consumed = 0
+            epoch_start_generator_state = (loader_generator.get_state().clone()
+                                           if isinstance(loader_generator, torch.Generator) else None)
             it = iter(loader)
             tokens, targets = next(it)
+        batches_consumed += 1
         tokens = tokens.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         do_log  = bool(log_interval) and (step + 1) % log_interval == 0
@@ -1163,8 +1199,14 @@ def train(
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
         if (artifacts is not None and cfg.checkpoint_interval
                 and (step + 1) % cfg.checkpoint_interval == 0):
+            checkpoint_data_state = ({
+                "epoch_start_generator_state": epoch_start_generator_state,
+                "batches_consumed":            batches_consumed,
+                "epoch":                       epoch,
+            } if epoch_start_generator_state is not None else None)
             artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler, ema=ema,
-                                      metropolis_generator=metro_gen)
+                                      metropolis_generator=metro_gen,
+                                      data_state=checkpoint_data_state)
     if ema is not None:
         ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses
