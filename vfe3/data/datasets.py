@@ -10,6 +10,7 @@ The cache holds 1-D token-id streams under
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
@@ -30,6 +31,29 @@ def _tokenizer_tag(dataset: str) -> str:
     return "tiktoken_cl100k" if dataset in _CL100K_DATASETS else "tiktoken"
 
 
+_TOKENIZER_VOCAB_SIZE = {"tiktoken": 50257, "tiktoken_cl100k": 100277}
+
+
+def tokenizer_vocab_size(dataset: str) -> int:
+    """Return the vocabulary bound for the tokenizer used by ``dataset``'s cache."""
+    return _TOKENIZER_VOCAB_SIZE[_tokenizer_tag(dataset)]
+
+
+_SAFE_COMPONENT_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _validate_path_component(
+    name: str,
+    role: str,
+) -> None:
+    """Reject names that are not safe, non-special single path components."""
+    if name in (".", "..") or _SAFE_COMPONENT_RE.fullmatch(name) is None:
+        raise ValueError(
+            f"{role} {name!r} is not a safe path component: use only letters, digits, "
+            f"'.', '_', '-' (no path separators, drive prefixes, or special dot names)"
+        )
+
+
 def cache_path(
     dataset:    str,
     split:      str,
@@ -39,6 +63,8 @@ def cache_path(
     cache_dir:  Optional[Path] = None,
 ) -> Path:
     """Build the cache file path for ``dataset``/``split`` with extension ``suffix``."""
+    _validate_path_component(dataset, "dataset")
+    _validate_path_component(split,   "split")
     root = default_cache_dir() if cache_dir is None else Path(cache_dir)
     return root / f"{dataset}_{split}_{_tokenizer_tag(dataset)}_tokens.{suffix}"
 
@@ -49,16 +75,20 @@ def load_cached_tokens(
 
     *,
     cache_dir:  Optional[Path] = None,
+    limit:      Optional[int]  = None,
 ) -> torch.Tensor:
     """Load the 1-D token-id stream for ``dataset``/``split`` as an int64 tensor.
 
     Tries the ``.pt`` (torch.load) cache, then the ``.bin`` int32 memmap (size from the
-    ``.meta.json`` sidecar). Raises FileNotFoundError if neither is present.
+    ``.meta.json`` sidecar). ``limit`` is applied before int64 materialization. Raises
+    FileNotFoundError if neither is present.
     """
     pt = cache_path(dataset, split, suffix="pt", cache_dir=cache_dir)
     if pt.exists():
-        tokens = torch.load(pt, weights_only=True)
-        return tokens.to(torch.long).reshape(-1)
+        tokens = torch.load(pt, weights_only=True, mmap=(limit is not None)).reshape(-1)
+        if limit is not None:
+            tokens = tokens[:limit].clone()
+        return tokens.to(torch.long)
 
     binp = cache_path(dataset, split, suffix="bin", cache_dir=cache_dir)
     if binp.exists():
@@ -66,11 +96,55 @@ def load_cached_tokens(
         n = int(meta["n_tokens"])
         dtype = np.dtype(meta.get("dtype", "int32"))
         mm = np.memmap(binp, dtype=dtype, mode="r", shape=(n,))
+        if limit is not None:
+            mm = mm[:limit]
         return torch.from_numpy(np.asarray(mm)).to(torch.long)
 
     raise FileNotFoundError(
         f"no tokenized cache for {dataset!r}/{split!r}: tried {pt} and {binp}"
     )
+
+
+def cached_token_count(
+    dataset:    str,
+    split:      str            = "validation",
+
+    *,
+    cache_dir:  Optional[Path] = None,
+) -> int:
+    """Return the cached token count without materializing the token stream."""
+    pt = cache_path(dataset, split, suffix="pt", cache_dir=cache_dir)
+    if pt.exists():
+        return int(torch.load(pt, weights_only=True, mmap=True).numel())
+
+    binp = cache_path(dataset, split, suffix="bin", cache_dir=cache_dir)
+    if binp.exists():
+        meta = json.loads(Path(str(binp) + ".meta.json").read_text())
+        return int(meta["n_tokens"])
+
+    raise FileNotFoundError(
+        f"no tokenized cache for {dataset!r}/{split!r}: tried {pt} and {binp}"
+    )
+
+
+def validate_token_range(
+    tokens:     torch.Tensor,        # (T,) 1-D token-id stream
+
+    vocab_size: int,
+
+    *,
+    dataset:    str,
+) -> None:
+    """Raise ValueError unless every token id satisfies ``0 <= id < vocab_size``."""
+    if tokens.numel() == 0:
+        return
+    lo, hi = int(tokens.min()), int(tokens.max())
+    if lo < 0 or hi >= vocab_size:
+        required_vocab_size = max(hi + 1, tokenizer_vocab_size(dataset))
+        raise ValueError(
+            f"dataset {dataset!r} (tokenizer {_tokenizer_tag(dataset)!r}) has token ids in "
+            f"[{lo}, {hi}] but vocab_size={vocab_size}: set vocab_size >= {required_vocab_size}"
+        )
 
 
 def get_tiktoken_decoder(
@@ -177,6 +251,7 @@ def make_dataloader(
     drop_last:   bool          = True,
     cache_dir:   Optional[Path] = None,
     max_tokens:  Optional[int] = None,   # cap the stream (fast smoke runs)
+    vocab_size:  Optional[int] = None,   # check token ids fit cfg.vocab_size-sized tables
     generator:   Optional[torch.Generator] = None,   # fix the shuffle order independent of global RNG
 ) -> DataLoader:
     """Build a DataLoader of causal-LM windows from the cached ``dataset``/``split``.
@@ -185,10 +260,11 @@ def make_dataloader(
     last batch). Evaluation must pass ``shuffle=False, drop_last=False`` so validation/test are a
     stable corpus measurement that reads the WHOLE split (the token-weighted CE in
     ``train.evaluate`` is order-independent, but a dropped tail and a randomly-varying drawn subset
-    are not -- see _select_loader)."""
-    tokens = load_cached_tokens(dataset, split, cache_dir=cache_dir)
-    if max_tokens is not None:
-        tokens = tokens[:max_tokens]
+    are not -- see _select_loader). ``max_tokens`` is applied while loading; when supplied,
+    ``vocab_size`` rejects cached ids that cannot index the model's vocabulary-sized tables."""
+    tokens = load_cached_tokens(dataset, split, cache_dir=cache_dir, limit=max_tokens)
+    if vocab_size is not None:
+        validate_token_range(tokens, vocab_size, dataset=dataset)
     ds = TokenWindows(tokens, seq_len, stride=stride)
     # pin_memory only when a CUDA device exists (it would pin host pages uselessly on a CPU-only
     # box). With pinned host buffers the per-step .to(device, non_blocking=True) H2D copy in

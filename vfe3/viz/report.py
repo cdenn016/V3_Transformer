@@ -51,7 +51,7 @@ def _build_loader(dataset: str, cfg: VFE3Config, split: str):
     :func:`generate_figures` to drive a custom stream instead."""
     from vfe3.data.datasets import make_dataloader
     return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
-                           shuffle=False, drop_last=False)
+                           shuffle=False, drop_last=False, vocab_size=cfg.vocab_size)
 
 
 def _collect_token_batches(

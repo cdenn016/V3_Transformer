@@ -609,19 +609,21 @@ def get_loader(
 
     *,
     max_tokens: Optional[int] = None,
+    vocab_size: Optional[int] = None,
 ) -> Any:
     r"""Split-aware DataLoader for ``dataset``/``split`` (a missing cache raises ``FileNotFoundError``).
 
-    Memoised on ``(dataset, seq_len, batch_size, split, cap)`` so the corpus loads once across the grid.
+    Memoised on ``(dataset, seq_len, batch_size, split, cap, vocab_size)`` so the corpus loads once
+    across cells with the same data contract.
     Only the train stream shuffles / drops the partial last batch; validation/test read the whole split
     in a stable order so the held-out metric is a full-corpus measurement. ``max_tokens`` caps the train
     split only. No synthetic substitution for a missing real corpus."""
     cap = max_tokens if split == "train" else None
-    key = (dataset, seq_len, batch_size, split, cap)
+    key = (dataset, seq_len, batch_size, split, cap, vocab_size)
     if key not in _LOADER_CACHE:
         _LOADER_CACHE[key] = make_dataloader(dataset, split, seq_len, batch_size,
                                              shuffle=(split == "train"), drop_last=(split == "train"),
-                                             max_tokens=cap)
+                                             max_tokens=cap, vocab_size=vocab_size)
     return _LOADER_CACHE[key]
 
 
@@ -703,9 +705,12 @@ def run_cell(
     print(f"    {label} s{seed} | K={cfg.embed_dim} h={cfg.n_heads} {cfg.gauge_group} "
           f"n_gen={n_gen} | N={actual_n:,}{gap} | steps={cfg.max_steps}")
 
-    train_loader = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "train", max_tokens=max_tokens)
-    val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation")
-    test_loader  = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "test")
+    train_loader = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "train",
+                              max_tokens=max_tokens, vocab_size=cfg.vocab_size)
+    val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation",
+                              vocab_size=cfg.vocab_size)
+    test_loader  = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "test",
+                              vocab_size=cfg.vocab_size)
 
     # Order-INDEPENDENT data stream: model build consumed config-dependent RNG, so reseed AFTER it and
     # re-seed each loader's generator so every cell sees the same batch sequence regardless of grid

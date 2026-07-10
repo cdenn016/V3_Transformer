@@ -35,6 +35,15 @@ def test_run_label_seed_suffix_distinguishes_seeds():
     assert train_vfe3._run_label(_cfg(seed=64), "wikitext-103").endswith("_s64")
 
 
+@pytest.mark.parametrize(
+    "dataset",
+    ["", ".", "..", "a/b", "a\\b", "../evil", "C:evil", "bad name"],
+)
+def test_run_label_rejects_unsafe_dataset(dataset):
+    with pytest.raises(ValueError):
+        train_vfe3._run_label(_cfg(), dataset)
+
+
 def test_run_dir_prefixes_label_with_timestamp():
     rd = train_vfe3._run_dir(_cfg(), "wikitext-103")
     name = rd.replace("\\", "/").split("/")[-1]

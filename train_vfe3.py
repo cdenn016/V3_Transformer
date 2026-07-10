@@ -33,7 +33,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
-from vfe3.data.datasets import make_dataloader
+from vfe3.data.datasets import (
+    _validate_path_component,
+    cached_token_count,
+    make_dataloader,
+)
 from vfe3.runtime import seed_everything
 from vfe3.train import _fmt_tau, evaluate, train
 
@@ -460,7 +464,8 @@ def _select_loader(
     # -> legacy global-RNG shuffle (byte-identical). Val/test do not shuffle, so a generator is moot there.
     gen = torch.Generator().manual_seed(int(DATA_SEED)) if (is_train and DATA_SEED is not None) else None
     return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
-                           shuffle=is_train, drop_last=is_train, max_tokens=cap, generator=gen)
+                           shuffle=is_train, drop_last=is_train, max_tokens=cap,
+                           vocab_size=cfg.vocab_size, generator=gen)
 
 
 def _run_label(cfg: VFE3Config, dataset: str) -> str:
@@ -471,6 +476,7 @@ def _run_label(cfg: VFE3Config, dataset: str) -> str:
     in progress, and ``_rename_run_by_ppl`` swaps that prefix for the test perplexity at finalize. The
     ``_s<seed>`` suffix keeps a multi-seed launch's run folders distinct (and identifiable by seed).
     """
+    _validate_path_component(dataset, "dataset")
     tags = (("_linear" if not cfg.use_prior_bank else "")
             + ("_mix" if cfg.use_head_mixer else "")
             + ("_cross" if cfg.cross_couplings else ""))
@@ -566,9 +572,8 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     # MAX_TOKENS actually caps the train stream (the default None loads the whole corpus, so no cap line).
     full_corpus_tokens = None
     if MAX_TOKENS is not None:
-        from vfe3.data.datasets import load_cached_tokens
         try:
-            full_corpus_tokens = int(load_cached_tokens(DATASET, "train").numel())
+            full_corpus_tokens = cached_token_count(DATASET, "train")
         except FileNotFoundError:
             full_corpus_tokens = None
     logger.info(_banner(model, cfg, DATASET, DEVICE, cfg.max_steps,

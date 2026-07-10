@@ -1376,7 +1376,8 @@ def run_training(
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = VFEModel(cfg).to(device)         # move to CUDA where available (mirrors train_vfe3.main)
-    loader = make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size, max_tokens=max_tokens)
+    loader = make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
+                             max_tokens=max_tokens, vocab_size=cfg.vocab_size)
     logger = logging.getLogger(__name__)
     logger.info(_banner(model, cfg, dataset, device, n_steps, train_loader=loader))
     losses = train(

@@ -1400,17 +1400,19 @@ def get_loader(
 
     *,
     max_tokens:  Optional[int] = None,
+    vocab_size:  Optional[int] = None,
 ) -> Any:
     r"""DataLoader for ``dataset``/``split``. A missing cache raises ``FileNotFoundError``.
 
-    Memoised on ``(dataset, seq_len, batch_size, split, cap)`` so runs that do not change
+    Memoised on ``(dataset, seq_len, batch_size, split, cap, vocab_size)`` so runs that do not change
     those reuse one cached loader (the corpus cache loads once), while a sweep over
-    ``batch_size`` / ``max_seq_len`` correctly builds a distinct, matching loader. ``max_tokens``
-    caps only the train split (validation is always full). The loader never substitutes synthetic
-    data for a missing real corpus -- that would mislabel synthetic numbers as a corpus measurement.
+    ``batch_size`` / ``max_seq_len`` / ``vocab_size`` correctly builds a distinct, matching loader.
+    ``max_tokens`` caps only the train split (validation is always full). The loader never
+    substitutes synthetic data for a missing real corpus -- that would mislabel synthetic numbers
+    as a corpus measurement.
     """
     cap = max_tokens if split == "train" else None
-    key = (dataset, seq_len, batch_size, split, cap)
+    key = (dataset, seq_len, batch_size, split, cap, vocab_size)
     if key in _LOADER_CACHE:
         return _LOADER_CACHE[key]
     # Split-aware loader semantics, mirroring train_vfe3._select_loader: only the train stream is
@@ -1419,7 +1421,7 @@ def get_loader(
     # the eval flags must be passed explicitly here).
     loader = make_dataloader(dataset, split, seq_len, batch_size,
                              shuffle=(split == "train"), drop_last=(split == "train"),
-                             max_tokens=cap)
+                             max_tokens=cap, vocab_size=vocab_size)
     _LOADER_CACHE[key] = loader
     return loader
 
@@ -1562,7 +1564,8 @@ def _eval_at_growing_n(model: Any, cfg: VFE3Config, dataset: str, device: torch.
     out: List[Dict[str, Any]] = []
     for n in n_list:
         try:
-            loader = get_loader(dataset, n, cfg.batch_size, "validation")
+            loader = get_loader(dataset, n, cfg.batch_size, "validation",
+                                vocab_size=cfg.vocab_size)
             m = evaluate(model, loader, device=device)
             out.append({"n": n, "ce": float(m["ce"]), "ppl": float(m["ppl"])})
         except Exception as exc:                              # short split / OOM at large N -> drop point
@@ -1605,8 +1608,9 @@ def run_single(
     n_params = int(sum(p.numel() for p in model.parameters()))
 
     train_loader = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "train",
-                              max_tokens=max_tokens)
-    val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation")
+                              max_tokens=max_tokens, vocab_size=cfg.vocab_size)
+    val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation",
+                              vocab_size=cfg.vocab_size)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts = RunArtifacts(run_dir, cfg, model, dataset=dataset, device=device)
