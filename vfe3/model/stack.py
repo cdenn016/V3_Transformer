@@ -10,8 +10,9 @@ handed off above is the POST-transform belief — at n_layers > 1 the transforms
 into every subsequent block's prior. The manuscript places the mixer in the single
 W_O-readout slot (Manuscripts-Theory/GL(K)_attention.tex) and concedes genuine
 cross-head capacity at depth > 1, but does not state this per-block prior-handoff
-recursion; the pre-transform converged belief stays available via the ``capture``
-out-param (the M-step self-coupling reads it from there).
+recursion; the pre-transform converged belief and the live prior entering the final
+block stay available via the ``capture`` out-param (the M-step self-coupling reads
+them from there).
 """
 
 from typing import Callable, Optional
@@ -45,7 +46,7 @@ def vfe_stack(
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
     rope_on_value:   bool                      = True,   # False -> value aggregation uses the un-rotated base
-    capture:         Optional[dict]            = None,   # out-param: LAST block's converged (pre-transform) belief under 'converged'
+    capture:         Optional[dict]            = None,   # out-param: LAST block's converged belief + live prior
     grad_record:     Optional[dict]            = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: one flat transport shared across blocks (valid: e_phi_lr==0 + flat, phi loop-invariant)
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
@@ -72,7 +73,7 @@ def vfe_stack(
         kappa_beta_override if kappa_beta_override is not None
         else _as_coeff(cfg.kappa_beta, belief.mu.device),
         group.irrep_dims)
-    for _ in range(cfg.n_layers):
+    for layer_index in range(cfg.n_layers):
         # Per-query adaptive temperature (cfg.query_adaptive_tau, default OFF): rescale the hoisted
         # per-head tau by the DETACHED uncertainty trace of the belief ENTERING this block,
         # tau_i,h = tau_h (1 + c tr_h(Sigma_i)/d_h) -- the query-side dual of the detached precision
@@ -85,6 +86,8 @@ def vfe_stack(
             tau_b = query_adaptive_tau(sig, tau, group.irrep_dims, c=cfg.query_tau_c)
         else:
             tau_b = tau
+        if capture is not None and layer_index == cfg.n_layers - 1:
+            capture["final_block_prior"] = (mu_p.clone(), sigma_p.clone())
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
                            lambda_beta=lambda_beta,

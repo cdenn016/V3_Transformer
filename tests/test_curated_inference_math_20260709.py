@@ -7,13 +7,17 @@ import torch
 
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
-from vfe3.free_energy import attention_weights
+from vfe3.families import get_family
+from vfe3.free_energy import attention_weights, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.inference.e_step import build_belief_transport, e_step
+from vfe3.model.block import vfe_block
 from vfe3.model.model import VFEModel
+from vfe3.model.stack import vfe_stack
 
 
 e_step_module = importlib.import_module("vfe3.inference.e_step")
+stack_module = importlib.import_module("vfe3.model.stack")
 
 
 def _truncation_case(
@@ -324,3 +328,189 @@ def test_q_and_s_randomized_depth_draw_independently(
     assert runs[0] == runs[1]
     assert len(runs[0]) == 2
     assert runs[0][0] != runs[0][1]
+
+
+def _mstep_prior_case(
+    n_layers: int,
+) -> tuple[VFEModel, torch.Tensor, torch.Tensor]:
+    torch.manual_seed(53)
+    model = VFEModel(VFE3Config(
+        vocab_size=11,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=n_layers,
+        n_e_steps=2,
+        e_q_mu_lr=0.2,
+        e_q_sigma_lr=0.08,
+        e_phi_lr=0.0,
+        prior_handoff_rho=0.65,
+        prior_handoff_sigma=0.4,
+        mass_phi=0.0,
+        mstep_self_coupling_weight=0.7,
+        seed=53,
+    ))
+    token_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.long)
+    targets = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.long)
+    return model, token_ids, targets
+
+
+def _manual_final_block_recurrence(
+    token_ids: torch.Tensor,
+    model:     VFEModel,
+) -> tuple[BeliefState, BeliefState, tuple[torch.Tensor, torch.Tensor], BeliefState]:
+    r"""Run the stack recurrence directly, retaining the live prior entering its last block."""
+    cfg = model.cfg
+    initial = model.prior_bank.encode(token_ids)
+    initial = initial._replace(phi=model._apply_pos_phi(initial.phi))
+    log_prior = model._attention_log_prior(token_ids.shape[1], token_ids.device)
+    log_prior = model._fold_precision_bias(log_prior, initial.sigma)
+    belief = initial
+    mu_p, sigma_p = initial.mu, initial.sigma
+    final_capture: dict[str, BeliefState] = {}
+    final_prior: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    for layer_index in range(cfg.n_layers):
+        is_final = layer_index == cfg.n_layers - 1
+        if is_final:
+            final_prior = (mu_p.clone(), sigma_p.clone())
+        belief = vfe_block(
+            belief,
+            mu_p,
+            sigma_p,
+            model.group,
+            cfg,
+            log_prior=log_prior,
+            block_norm=model.block_norm,
+            lambda_beta=cfg.lambda_beta,
+            capture=final_capture if is_final else None,
+        )
+        mu_p = (1.0 - cfg.prior_handoff_rho) * mu_p + cfg.prior_handoff_rho * belief.mu
+        sigma_p = (
+            (1.0 - cfg.prior_handoff_sigma) * sigma_p
+            + cfg.prior_handoff_sigma * belief.sigma
+        )
+
+    assert final_prior is not None
+    return belief, final_capture["converged"], final_prior, initial
+
+
+def _constant_self_divergence(
+    mu_q:    torch.Tensor,
+    sigma_q: torch.Tensor,
+    mu_p:    torch.Tensor,
+    sigma_p: torch.Tensor,
+    model:   VFEModel,
+) -> torch.Tensor:
+    cfg = model.cfg
+    family = get_family(cfg.family)
+    return self_divergence_for_alpha(
+        family(mu_q, sigma_q),
+        family(mu_p, sigma_p),
+        alpha=cfg.renyi_order,
+        kl_max=cfg.kl_max,
+        eps=cfg.eps,
+        divergence_family=cfg.divergence_family,
+        lambda_alpha_mode=cfg.lambda_alpha_mode,
+    ).mean()
+
+
+def test_multilayer_capture_records_actual_final_block_prior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, token_ids, _ = _mstep_prior_case(n_layers=3)
+    manual_out, _, expected_prior, initial = _manual_final_block_recurrence(token_ids, model)
+    observed_priors: list[tuple[torch.Tensor, torch.Tensor]] = []
+    original_vfe_block = stack_module.vfe_block
+
+    def record_and_run(
+        belief:  BeliefState,
+        mu_p:    torch.Tensor,
+        sigma_p: torch.Tensor,
+        *args:   object,
+        **kwargs: object,
+    ) -> BeliefState:
+        observed_priors.append((mu_p, sigma_p))
+        return original_vfe_block(belief, mu_p, sigma_p, *args, **kwargs)
+
+    monkeypatch.setattr(stack_module, "vfe_block", record_and_run)
+    capture: dict[str, object] = {}
+    out = vfe_stack(
+        initial,
+        initial.mu,
+        initial.sigma,
+        model.group,
+        model.cfg,
+        log_prior=model._attention_log_prior(token_ids.shape[1], token_ids.device),
+        block_norm=model.block_norm,
+        capture=capture,
+    )
+
+    assert torch.equal(out.mu, manual_out.mu)
+    assert torch.equal(out.sigma, manual_out.sigma)
+    captured_mu, captured_sigma = capture["final_block_prior"]
+    expected_mu, expected_sigma = expected_prior
+    actual_mu, actual_sigma = observed_priors[-1]
+    assert torch.equal(captured_mu, expected_mu)
+    assert torch.equal(captured_sigma, expected_sigma)
+    assert torch.equal(captured_mu, actual_mu)
+    assert torch.equal(captured_sigma, actual_sigma)
+    assert captured_mu.data_ptr() != actual_mu.data_ptr()
+    assert captured_sigma.data_ptr() != actual_sigma.data_ptr()
+
+
+def test_multilayer_mstep_self_coupling_matches_manual_recurrence() -> None:
+    model, token_ids, targets = _mstep_prior_case(n_layers=3)
+    _, loss, ce = model(token_ids, targets)
+    manual_out, q_converged, final_prior, initial = _manual_final_block_recurrence(
+        token_ids,
+        model,
+    )
+    mu_p, sigma_p = final_prior
+    expected_sc = _constant_self_divergence(
+        q_converged.mu,
+        q_converged.sigma,
+        mu_p,
+        sigma_p,
+        model,
+    )
+
+    pseudo_mu_p, pseudo_sigma_p = initial.mu, initial.sigma
+    for _ in range(model.cfg.n_layers - 1):
+        pseudo_mu_p = (
+            (1.0 - model.cfg.prior_handoff_rho) * pseudo_mu_p
+            + model.cfg.prior_handoff_rho * manual_out.mu
+        )
+        pseudo_sigma_p = (
+            (1.0 - model.cfg.prior_handoff_sigma) * pseudo_sigma_p
+            + model.cfg.prior_handoff_sigma * manual_out.sigma
+        )
+    pseudo_sc = _constant_self_divergence(
+        q_converged.mu,
+        q_converged.sigma,
+        pseudo_mu_p,
+        pseudo_sigma_p,
+        model,
+    )
+
+    assert expected_sc > 1e-6
+    assert not torch.allclose(expected_sc, pseudo_sc, atol=1e-7, rtol=1e-6)
+    expected_loss = ce + model.cfg.mstep_self_coupling_weight * expected_sc
+    assert torch.allclose(loss, expected_loss, atol=1e-6, rtol=1e-6)
+
+
+def test_single_layer_mstep_self_coupling_is_unchanged() -> None:
+    model, token_ids, targets = _mstep_prior_case(n_layers=1)
+    _, loss, ce = model(token_ids, targets)
+    _, q_converged, final_prior, _ = _manual_final_block_recurrence(token_ids, model)
+    mu_p, sigma_p = final_prior
+    expected_sc = _constant_self_divergence(
+        q_converged.mu,
+        q_converged.sigma,
+        mu_p,
+        sigma_p,
+        model,
+    )
+
+    expected_loss = ce + model.cfg.mstep_self_coupling_weight * expected_sc
+    assert torch.allclose(loss, expected_loss, atol=1e-6, rtol=1e-6)

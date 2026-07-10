@@ -722,7 +722,7 @@ class VFEModel(nn.Module):
 
         *,
         return_logits:  bool           = False,          # also decode (B, N, V) logits; else logits is None
-        capture:        Optional[dict] = None,           # out-param: M-step intermediates (q*, prior p, raw out)
+        capture:        Optional[dict] = None,           # out-param: M-step intermediates (q*, final-block prior, raw out)
         estep_grad_out: Optional[dict] = None,           # diag out-param: E-step belief-grad norms (forwarded)
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
         r"""Run the belief pipeline and return the converged belief q* (post final_norm), optionally
@@ -739,10 +739,11 @@ class VFEModel(nn.Module):
         are byte-identical to the pre-refactor ``forward(targets=None)`` return.
 
         ``capture`` (an out-param dict, non-None only when ``mstep_self_coupling_weight>0``) is filled
-        with the three pre-transform intermediates the M-step self-coupling term reads and cannot
-        recover from the post-final_norm belief: ``capture['converged']`` (the last block's converged
-        pre-transform q*, written by ``vfe_stack``), ``capture['prior']`` (the encode-time prior p,
-        post s-refine), and ``capture['out']`` (the raw ``vfe_stack`` output, pre final_norm).
+        with the pre-transform intermediates the M-step self-coupling term reads and cannot recover
+        from the post-final_norm belief: ``capture['converged']`` (the last block's converged
+        pre-transform q*) and ``capture['final_block_prior']`` (the live ``(mu_p, sigma_p)`` entering
+        that block), both written by ``vfe_stack``. ``capture['prior']`` retains the encode-time prior
+        (post s-refine), and ``capture['out']`` retains the raw stack output (pre final_norm).
 
         Grad-transparent: it carries the SAME internal ``run = no_grad() if e_step_gradient=='detach'
         else nullcontext()`` and ``amp`` contexts forward establishes, so a grad-enabled training caller
@@ -874,8 +875,8 @@ class VFEModel(nn.Module):
                              reflection=out.reflection)                                     # carry the phi-path per-token reflection sign (None on the pure path)
         if capture is not None:
             # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
-            # encode-time prior p (post s-refine) and the raw pre-final_norm stack output, which the
-            # M-step self-coupling handoff reconstruction needs and cannot recover from `belief`.
+            # encode-time prior p (post s-refine) and the raw pre-final_norm stack output for callers
+            # that need the complete pre-normalization pipeline state.
             capture["prior"] = beliefs
             capture["out"]   = out
         logits = None
@@ -1205,7 +1206,8 @@ class VFEModel(nn.Module):
         # Training path: produce the converged belief q* (no (B,N,V) logits) via the shared seam, then
         # run the existing decode + cross-entropy + M-step assembly reading belief.mu / sigma / phi.
         # cap (non-None only when the M-step self-coupling term is on) is filled by forward_beliefs
-        # with the converged q*, the encode-time prior, and the raw pre-final_norm stack output.
+        # with the converged q*, the live final-block prior, the encode-time prior, and the raw
+        # pre-final_norm stack output.
         cap = {} if self.cfg.mstep_self_coupling_weight > 0.0 else None
         belief, _ = self.forward_beliefs(token_ids, return_logits=False,
                                          capture=cap, estep_grad_out=estep_grad_out)
@@ -1300,9 +1302,8 @@ class VFEModel(nn.Module):
             # L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the alpha-weighted self-coupling of the
             # CONVERGED variational belief q* (captured by vfe_block BEFORE head_mixer /
             # cg_coupling / block_norm -- the belief the E-step's F was actually minimized over,
-            # which the manuscript pins the self-term to) against the per-block prior. The prior
-            # fold below mirrors vfe_stack's handoff with the TRANSFORMED outputs (out.mu), since
-            # that is what the real stack hands the next block. With the three transform toggles
+            # which the manuscript pins the self-term to) against the live prior captured immediately
+            # before the final block. With the three transform toggles
             # at their defaults q* IS the returned `out` (same object), so the pure path is
             # unchanged; under the toggles the term now reads q* rather than the transformed
             # handoff T(q*) it accidentally read before (audit 2026-06-09 overnight F19,
@@ -1313,22 +1314,17 @@ class VFEModel(nn.Module):
             # flat scalar; cfg.mstep_self_coupling_weight (= alpha_hat) is the overall scale. alpha_i
             # is DETACHED: by the alpha-envelope (alpha* is the stationary point of alpha*D + R(alpha),
             # so d/dalpha[alpha*D + R] = 0 there), the M-step gradient of the F self-term w.r.t. the
-            # priors is alpha_i* dD/dtheta with alpha_i* held fixed -- detaching it (and dropping R)
+            # prior is alpha_i* dD/dtheta with alpha_i* held fixed -- detaching it (and dropping R)
             # is exact for the closed-form forms (constant/state_dependent/state_dependent_per_coord).
             # At constant alpha=1.0 (the default) alpha_i==1, byte-identical to the prior mean-D form.
             # Grad-connected through D (no detach on D), so it backprops to the learned prior tables,
-            # like mass_phi. The last-block prior is rebuilt by mirroring vfe_stack's prior_handoff
-            # fold; EXACT at n_layers=1 (loop empty -> p = encode belief), an approximation otherwise
-            # (one converged belief stands in for the per-block intermediates), matching diagnostics().
+            # like mass_phi. Capturing the final-block input preserves the exact stack recurrence at
+            # every depth; at n_layers=1 it is the encode-time prior, preserving the existing path.
             from vfe3.families import get_family
             from vfe3.free_energy import self_divergence_for_alpha
             from vfe3.alpha_i import self_coupling_alpha, alpha_is_per_coord
             cfg = self.cfg
-            rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
-            mu_p, sigma_p = cap["prior"].mu, cap["prior"].sigma  # encode-time prior p (from forward_beliefs)
-            for _ in range(cfg.n_layers - 1):
-                mu_p = (1.0 - rho) * mu_p + rho * cap["out"].mu      # raw pre-final_norm stack output
-                sigma_p = (1.0 - rho_s) * sigma_p + rho_s * cap["out"].sigma
+            mu_p, sigma_p = cap["final_block_prior"]            # live prior entering the final block
             fam = get_family(cfg.family)
             q_conv = cap["converged"]                           # q*: pre-transform converged belief
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
