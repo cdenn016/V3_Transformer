@@ -124,27 +124,61 @@ def test_write_sigma_gate_artifact_publishes_with_same_directory_replace(tmp_pat
     tmp, final = replace_calls[0]
     assert final == path
     assert tmp.parent == final.parent == tmp_path
-    assert tmp.name == final.name + ".tmp"
+    assert tmp.name.startswith(final.name + ".")
+    assert tmp.suffix == ".tmp"
     assert path.is_file()
     assert not tmp.exists()
 
 
+def test_write_sigma_gate_artifact_uses_unique_temps_for_same_final(tmp_path, monkeypatch):
+    replace_sources = []
+    real_replace = sigma_gate_module.os.replace
+
+    def _record_replace(src, dst):
+        replace_sources.append(Path(src))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(sigma_gate_module.os, "replace", _record_replace)
+    for status in ("PASS", "FAIL"):
+        write_sigma_gate_artifact(
+            {"status": status}, checkpoint_id="shared_final", spec_commit="x", seeds=(6,),
+            out_dir=str(tmp_path),
+        )
+
+    assert len(replace_sources) == 2
+    assert replace_sources[0] != replace_sources[1]
+    assert all(path.parent == tmp_path and path.suffix == ".tmp" for path in replace_sources)
+    assert all(not path.exists() for path in replace_sources)
+
+
 def test_write_sigma_gate_artifact_cleans_temp_when_replace_fails(tmp_path, monkeypatch):
+    path = Path(write_sigma_gate_artifact(
+        {"status": "PASS"}, checkpoint_id="replace_failure", spec_commit="x", seeds=(6,),
+        out_dir=str(tmp_path),
+    ))
+    original = path.read_bytes()
+
     def _fail_replace(_src, _dst):
         raise OSError("publish failed")
 
     monkeypatch.setattr(sigma_gate_module.os, "replace", _fail_replace)
     with pytest.raises(OSError, match="publish failed"):
         write_sigma_gate_artifact(
-            {"status": "PASS"}, checkpoint_id="replace_failure", spec_commit="x", seeds=(6,),
+            {"status": "FAIL"}, checkpoint_id="replace_failure", spec_commit="x", seeds=(6,),
             out_dir=str(tmp_path),
         )
 
     assert list(tmp_path.glob("*.tmp")) == []
-    assert list(tmp_path.glob("*.json")) == []
+    assert path.read_bytes() == original
 
 
 def test_write_sigma_gate_artifact_cleans_temp_when_serialization_fails(tmp_path):
+    path = Path(write_sigma_gate_artifact(
+        {"status": "PASS"}, checkpoint_id="json_failure", spec_commit="x", seeds=(6,),
+        out_dir=str(tmp_path),
+    ))
+    original = path.read_bytes()
+
     with pytest.raises(TypeError):
         write_sigma_gate_artifact(
             {"status": "PASS", "not_json": object()}, checkpoint_id="json_failure",
@@ -152,7 +186,7 @@ def test_write_sigma_gate_artifact_cleans_temp_when_serialization_fails(tmp_path
         )
 
     assert list(tmp_path.glob("*.tmp")) == []
-    assert list(tmp_path.glob("*.json")) == []
+    assert path.read_bytes() == original
 
 
 def test_write_artifact_slugs_checkpoint_id(tmp_path):

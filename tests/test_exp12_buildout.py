@@ -55,6 +55,7 @@ def test_plot_renyi_saturation_driver(tmp_path):
         d = sweep / f"renyi_{a}"; d.mkdir(parents=True)
         (d / "ablation_result.json").write_text(json.dumps(
             {"label": f"renyi_order={a}", "primary_val_ppl": 20.0,
+             "final_val_ppl": 20.0, "status": "success", "error_kind": None,
              "attn_entropy": 1.5, "energy_klmax_frac": 0.1 * a}))
     ablation._plot_renyi_saturation(sweep, figdir)
     assert (figdir / "renyi_order_renyi_saturation.png").exists()

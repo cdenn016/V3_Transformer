@@ -55,6 +55,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1766,14 +1767,16 @@ def _cell_is_current(
         return False
     if not math.isfinite(terminal_ppl):
         return False
+    saved_diagnostics   = marker.get("collect_diagnostics")
+    saved_extrapolation = marker.get("collect_extrapolation")
+    if type(saved_diagnostics) is not bool or saved_diagnostics != collect_diagnostics:
+        return False
+    if type(saved_extrapolation) is not bool or saved_extrapolation != collect_extrapolation:
+        return False
     if collect_diagnostics:
-        if marker.get("collect_diagnostics") is not True:
-            return False
         if not any(key in marker for key in _DIAGNOSTIC_RESULT_KEYS):
             return False
     if collect_extrapolation:
-        if marker.get("collect_extrapolation") is not True:
-            return False
         if not isinstance(marker.get("extrap_ce"), list):
             return False
     return True
@@ -1811,14 +1814,26 @@ def _collect_sweep_results(sweep_dir: Path) -> List[Dict[str, Any]]:
     new cell dirs alongside the old ones, and this union picks up all of them. Re-running the SAME
     label overwrites that one marker while the others persist, so the union is additive and never
     subtracts (to drop a point, delete its cell directory). ``sorted`` keeps CSV row order
-    deterministic; unreadable/partial markers are skipped rather than aborting the read.
+    deterministic. Unreadable, non-object, failed, errored, and nonfinite-terminal markers are
+    skipped rather than entering the analysis frame.
     """
     results: List[Dict[str, Any]] = []
     for marker in sorted(sweep_dir.glob("*/ablation_result.json")):
         try:
-            results.append(json.loads(marker.read_text(encoding="utf-8")))
-        except Exception:                                       # unreadable/partial marker -> skip
+            result = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:                                       # unreadable marker -> skip
             continue
+        if not isinstance(result, Mapping):
+            continue
+        if result.get("status") != "success" or result.get("error_kind") is not None:
+            continue
+        try:
+            terminal_ppl = float(result["final_val_ppl"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(terminal_ppl):
+            continue
+        results.append(dict(result))
     return results
 
 
@@ -1893,7 +1908,8 @@ def run_sweep(
         try:
             terminal_ppl = float(result["final_val_ppl"])
         except (KeyError, TypeError, ValueError):
-            terminal_ppl = float("nan")
+            terminal_ppl = float("inf")
+        result["final_val_ppl"] = terminal_ppl
         successful = result["error_kind"] is None and math.isfinite(terminal_ppl)
         result["status"] = "success" if successful else "failed"
         result["sweep"] = sweep_name

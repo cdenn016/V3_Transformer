@@ -115,7 +115,9 @@ def test_writes_are_atomic_no_temp_left(tmp_path):
     assert ckpt["step"] == 2
 
 
-@pytest.mark.parametrize("name", [".", "..", "a/b", r"a\b", "C:evil"])
+@pytest.mark.parametrize("name", [
+    "", ".", "..", "a/b", r"a\b", "C:evil", "C:/evil", r"C:\evil",
+])
 def test_save_json_rejects_non_bare_filename(tmp_path, name):
     cfg = _cfg()
     model = VFEModel(cfg)

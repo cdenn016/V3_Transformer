@@ -23,7 +23,9 @@ def _write_marker(sweep_dir: Path, label: str, ppl: float) -> None:
     (cell / "ablation_result.json").write_text(
         json.dumps({
             "sweep": sweep_dir.name, "label": label, "error_kind": None,
-            "primary_val_ppl": ppl, "n_params": 1000, "seed": 6,
+            "status": "success", "primary_val_ppl": ppl, "final_val_ppl": ppl,
+            "n_params": 1000, "seed": 6,
+            "collect_diagnostics": False, "collect_extrapolation": False,
         }),
         encoding="utf-8",
     )
@@ -121,6 +123,27 @@ def test_unreadable_marker_is_skipped(tmp_path: Path) -> None:
     union = ablation._collect_sweep_results(sweep_dir)
     assert len(union) == 1
     assert union[0]["label"] == "kappa=1"
+
+
+def test_collect_sweep_results_rejects_malformed_failed_and_nonfinite_markers(tmp_path: Path) -> None:
+    sweep_dir = tmp_path / "kappa"
+    sweep_dir.mkdir()
+    _write_marker(sweep_dir, "valid", ppl=11.0)
+    invalid = [
+        [],
+        {"label": "failed", "status": "failed", "error_kind": "train", "final_val_ppl": 11.0},
+        {"label": "errored", "status": "success", "error_kind": "train", "final_val_ppl": 11.0},
+        {"label": "infinite", "status": "success", "error_kind": None,
+         "final_val_ppl": float("inf")},
+        {"label": "missing", "status": "success", "error_kind": None},
+    ]
+    for i, marker in enumerate(invalid):
+        cell = sweep_dir / f"invalid_{i}"
+        cell.mkdir()
+        (cell / "ablation_result.json").write_text(json.dumps(marker), encoding="utf-8")
+
+    union = ablation._collect_sweep_results(sweep_dir)
+    assert [marker["label"] for marker in union] == ["valid"]
 
 
 def test_plot_one_sweep_does_not_raise(tmp_path: Path) -> None:
@@ -249,6 +272,30 @@ def test_cell_is_current_requires_requested_extrapolation_output(tmp_path: Path)
     ) is True
 
 
+def test_cell_is_current_requires_exact_boolean_request_flags(tmp_path: Path) -> None:
+    markers = []
+    missing_diagnostics = _successful_marker()
+    missing_diagnostics.pop("collect_diagnostics")
+    markers.append(missing_diagnostics)
+    missing_extrapolation = _successful_marker()
+    missing_extrapolation.pop("collect_extrapolation")
+    markers.append(missing_extrapolation)
+    markers.extend([
+        _successful_marker(collect_diagnostics=True, attn_entropy=1.0),
+        _successful_marker(collect_extrapolation=True, extrap_ce=[]),
+        _successful_marker(collect_diagnostics=1),
+        _successful_marker(collect_extrapolation=0),
+    ])
+
+    for i, marker in enumerate(markers):
+        run_dir = tmp_path / f"flag_{i}"
+        _write_resume_cell(run_dir, marker)
+        assert ablation._cell_is_current(
+            run_dir, {}, seed=6, dataset="wikitext-103",
+            collect_diagnostics=False, collect_extrapolation=False,
+        ) is False
+
+
 def test_run_sweep_markers_persist_requests_and_terminal_state(tmp_path: Path, monkeypatch) -> None:
     sweep_name = "marker_contract"
     monkeypatch.setitem(ablation.SWEEPS, sweep_name, {
@@ -298,6 +345,8 @@ def test_run_sweep_markers_persist_requests_and_terminal_state(tmp_path: Path, m
     assert math.isfinite(markers["success"]["final_val_ppl"])
     assert markers["failure"]["status"] == "failed"
     assert markers["failure"]["error_kind"] == "train"
+    assert "final_val_ppl" in markers["failure"]
+    assert not math.isfinite(markers["failure"]["final_val_ppl"])
 
 
 def test_expand_range_sign_mismatch_raises() -> None:
