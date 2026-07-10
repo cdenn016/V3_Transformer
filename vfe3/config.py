@@ -1101,6 +1101,22 @@ class VFE3Config:
                     raise ValueError(
                         f"cross_couplings head indices ({a},{b}) out of range [0, {self.n_heads})"
                     )
+            coupled_heads = {head for pair in self.cross_couplings for head in pair}
+            phi_bch_active = self.phi_retract_mode == "bch"
+            positional_bch_active = self.pos_phi != "none" and self.pos_phi_compose == "bch"
+            if (self.close_basis is False and len(coupled_heads) >= 3
+                    and (phi_bch_active or positional_bch_active)):
+                active_routes = []
+                if phi_bch_active:
+                    active_routes.append("phi_retract_mode='bch'")
+                if positional_bch_active:
+                    active_routes.append("active pos_phi with pos_phi_compose='bch'")
+                raise ValueError(
+                    "close_basis=False is invalid for cross_couplings spanning 3 or more heads "
+                    f"when BCH is active through {', '.join(active_routes)}: the raw basis is not "
+                    "closed under Lie brackets and BCH would truncate out-of-span terms. Set "
+                    "close_basis=True or disable every BCH route."
+                )
             # Cross-coupling's off-block generators destroy the per-head direct sum, so the group
             # builder reports a SINGLE irrep block [K]: n_heads no longer sets the runtime
             # attention-head count and the energy is one full-K block. Fail FAST here on the

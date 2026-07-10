@@ -1,6 +1,9 @@
 r"""Focused regressions for family-aware full-covariance inference geometry."""
 
+import gc
 import math
+import warnings
+import weakref
 
 import pytest
 import torch
@@ -10,6 +13,11 @@ from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.families.laplace import DiagonalLaplace
 from vfe3.geometry.groups import get_group
+from vfe3.geometry.phi_preconditioner import (
+    precondition_phi_gradient,
+    pullback_metric,
+    pullback_metric_per_block,
+)
 from vfe3.geometry.retraction import (
     _eigh_damped,
     _rel_gap_eps,
@@ -441,3 +449,152 @@ def test_laplace_renyi_divergent_blend_clamps_without_poisoning_gradients() -> N
     assert torch.equal(got[:, 1:], torch.full_like(got[:, 1:], kl_max))
     assert mu_q.grad is not None and torch.isfinite(mu_q.grad).all()
     assert b_q.grad is not None and torch.isfinite(b_q.grad).all()
+
+
+def test_pullback_preconditioner_matches_float64_ill_conditioned_reference() -> None:
+    group = get_group("glk")(2)
+    phi = torch.tensor([4.4922614, -0.8553943, -6.3515353, 1.6570722])
+    grad_phi = torch.tensor([-1.0845224, -1.3985955, 0.40334684, 0.83802634])
+
+    got = precondition_phi_gradient(
+        grad_phi,
+        phi,
+        group.generators,
+        mode="pullback",
+    )
+    metric_64 = pullback_metric(phi.double(), group.generators.double())
+    eye_64 = torch.eye(metric_64.shape[-1], dtype=torch.float64)
+    reference_64 = torch.linalg.solve(
+        metric_64 + 1e-6 * eye_64,
+        grad_phi.double().unsqueeze(-1),
+    ).squeeze(-1)
+
+    assert pullback_metric(phi, group.generators).dtype == torch.float64
+    assert got.dtype == grad_phi.dtype
+    assert torch.allclose(got.double(), reference_64, rtol=1e-5, atol=1e-6)
+
+
+def test_pullback_per_block_solve_stays_float64_until_final_cast() -> None:
+    group = get_group("block_glk")(4, 2)
+    irrep_dims = [2, 2]
+    phi_block = torch.tensor([4.4922614, -0.8553943, -6.3515353, 1.6570722])
+    grad_block = torch.tensor([-1.0845224, -1.3985955, 0.40334684, 0.83802634])
+    phi = phi_block.repeat(2)
+    grad_phi = grad_block.repeat(2)
+
+    got = precondition_phi_gradient(
+        grad_phi,
+        phi,
+        group.generators,
+        mode="pullback_per_block",
+        irrep_dims=irrep_dims,
+    )
+    metric_64 = pullback_metric_per_block(
+        phi.double(),
+        group.generators.double(),
+        irrep_dims,
+    )
+    eye_64 = torch.eye(metric_64.shape[-1], dtype=torch.float64)
+    reference_64 = torch.linalg.solve(
+        metric_64 + 1e-6 * eye_64,
+        grad_phi.double().unsqueeze(-1),
+    ).squeeze(-1)
+
+    assert pullback_metric_per_block(phi, group.generators, irrep_dims).dtype == torch.float64
+    assert got.dtype == grad_phi.dtype
+    assert torch.allclose(got.double(), reference_64, rtol=1e-5, atol=1e-6)
+
+
+def test_pullback_closure_cache_is_bounded_and_releases_cuda_basis() -> None:
+    import vfe3.geometry.lie_ops as lie_ops
+
+    cache_max = getattr(lie_ops, "_BRACKET_CLOSURE_CACHE_MAXSIZE", 32)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lie_ops._BRACKET_CLOSURE_RES.clear()
+    lie_ops._BRACKET_CLOSURE_WARNED.clear()
+    try:
+        basis = torch.tensor([[[1.0]]], device=device)
+        basis_ref = weakref.ref(basis)
+        lie_ops.warn_if_basis_not_closed(basis, where="curated-cache-release")
+        lie_ops.warn_if_basis_not_closed(basis.clone(), where="curated-cache-release")
+
+        assert len(lie_ops._BRACKET_CLOSURE_RES) == 1
+        first_key = next(iter(lie_ops._BRACKET_CLOSURE_RES))
+        second_basis = torch.tensor([[[2.0]]], device=device)
+        lie_ops.warn_if_basis_not_closed(second_basis, where="curated-cache-bound")
+        second_key = next(reversed(lie_ops._BRACKET_CLOSURE_RES))
+        lie_ops.warn_if_basis_not_closed(basis, where="curated-cache-release")
+        del basis
+        del second_basis
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        assert basis_ref() is None
+
+        for value in range(3, cache_max + 2):
+            candidate = torch.tensor([[[float(value)]]], device=device)
+            lie_ops.warn_if_basis_not_closed(candidate, where="curated-cache-bound")
+
+        assert len(lie_ops._BRACKET_CLOSURE_RES) == cache_max
+        assert first_key in lie_ops._BRACKET_CLOSURE_RES
+        assert second_key not in lie_ops._BRACKET_CLOSURE_RES
+        assert all(
+            not isinstance(entry, torch.Tensor)
+            for entry in lie_ops._BRACKET_CLOSURE_RES.values()
+        )
+    finally:
+        lie_ops._BRACKET_CLOSURE_RES.clear()
+        lie_ops._BRACKET_CLOSURE_WARNED.clear()
+
+
+def test_config_rejects_nonclosed_cross_couplings_for_phi_bch() -> None:
+    with pytest.raises(ValueError, match="close_basis=True"):
+        VFE3Config(
+            embed_dim=6,
+            n_heads=3,
+            gauge_group="block_glk",
+            cross_couplings=[(0, 1), (1, 2)],
+            close_basis=False,
+            family="gaussian_full",
+            beta_attention_prior="uniform",
+            gamma_attention_prior="uniform",
+            phi_retract_mode="bch",
+            pos_phi="none",
+        )
+
+
+def test_config_rejects_nonclosed_cross_couplings_for_positional_bch() -> None:
+    with pytest.raises(ValueError, match="close_basis=True"):
+        VFE3Config(
+            embed_dim=6,
+            n_heads=3,
+            gauge_group="block_glk",
+            cross_couplings=[(0, 1), (1, 2)],
+            close_basis=False,
+            family="gaussian_full",
+            beta_attention_prior="uniform",
+            gamma_attention_prior="uniform",
+            phi_retract_mode="euclidean",
+            pos_phi="learned",
+            pos_phi_compose="bch",
+        )
+
+
+def test_config_allows_nonclosed_basis_when_bch_inactive() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = VFE3Config(
+            embed_dim=6,
+            n_heads=3,
+            gauge_group="block_glk",
+            cross_couplings=[(0, 1), (1, 2)],
+            close_basis=False,
+            family="gaussian_full",
+            beta_attention_prior="uniform",
+            gamma_attention_prior="uniform",
+            phi_retract_mode="euclidean",
+            pos_phi="none",
+            pos_phi_compose="bch",
+        )
+
+    assert cfg.close_basis is False

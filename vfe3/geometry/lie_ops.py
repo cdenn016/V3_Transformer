@@ -8,8 +8,10 @@ supplies: coordinate<->matrix maps, the Lie bracket, a composition registry
 determinant control. Pure: operates on a generator TENSOR, not a GaugeGroup.
 """
 
+import hashlib
 import math
 import warnings
+from collections import OrderedDict
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -124,14 +126,34 @@ def compose_euclidean(
     return phi1 + phi2
 
 
-# Bracket-closure of a generator basis is a property of the FIXED generators, not of any
-# belief phi, so it is measured ONCE per basis and cached -- never per compose/precondition
-# call. Keyed by object id; the basis tensor is retained in the cache so its id cannot be
-# reused (a stale-id false positive). The residual is computed under no_grad off the autograd
-# graph; the old per-call float(Z) on a grad-carrying Z both host-synced the hot E-step and
-# raised the "requires_grad to scalar" warning.
-_BRACKET_CLOSURE_RES:    Dict[int, list] = {}      # id(generators) -> [generators_ref, max_rel_residual]
-_BRACKET_CLOSURE_WARNED: set             = set()    # (id(generators), where) already-warned call sites
+# Bracket closure depends only on basis values. Cache scalar diagnostics by a stable CPU
+# signature so equal-value copies share work and no caller tensor (especially CUDA storage)
+# remains owned by the cache. Both LRU tables are bounded because diagnostics may see many
+# transient bases in sweeps and tests.
+_BRACKET_CLOSURE_CACHE_MAXSIZE: int = 32
+_BRACKET_CLOSURE_RES: OrderedDict = OrderedDict()       # value signature -> max residual
+_BRACKET_CLOSURE_WARNED: OrderedDict = OrderedDict()    # (value signature, where) -> None
+
+
+def _basis_value_signature(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+) -> tuple:
+    """Stable ``(shape, dtype, CPU value hash)`` signature without retaining the basis."""
+    basis_cpu = generators.detach().contiguous().cpu()
+    value_hash = hashlib.sha256(basis_cpu.view(torch.uint8).numpy().tobytes()).digest()
+    return tuple(generators.shape), generators.dtype, value_hash
+
+
+def _bounded_lru_store(
+    cache: OrderedDict,
+    key:   tuple,
+    value: object,
+) -> None:
+    """Insert one diagnostic entry and evict the least-recently-used overflow."""
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _BRACKET_CLOSURE_CACHE_MAXSIZE:
+        cache.popitem(last=False)
 
 
 def warn_if_basis_not_closed(
@@ -151,7 +173,8 @@ def warn_if_basis_not_closed(
     (\lVert [G_a,G_b]\rVert_F + \epsilon)`. On a closed (default direct-sum) basis this is ~0 and
     nothing is warned; on a non-closed 3+-head ``cross_couplings`` chain it is O(1) and the span
     projection in BCH composition / structure-constants silently truncates the out-of-span part.
-    The result depends only on the generators, so it is cached and the hot path pays a dict lookup.
+    The result depends only on generator values, so a bounded value-signature cache avoids repeating
+    the bracket scan without retaining the caller's tensor storage.
 
     The bracket scan materializes an ``(n_gen, n_gen, K, K)`` tensor; for large bases (e.g.
     block_glk at K=140: n_gen=2800 -> ~1.5e11 elements) this would OOM. Such large bases here are the
@@ -169,12 +192,12 @@ def warn_if_basis_not_closed(
     path is to build cross-coupled towers with ``close_basis=True`` (close_under_brackets), which
     yields a bracket-closed algebra rather than relying on this size-gated diagnostic.
     """
-    key = id(generators)
-    entry = _BRACKET_CLOSURE_RES.get(key)
-    if entry is None:
+    key = _basis_value_signature(generators)
+    max_res = _BRACKET_CLOSURE_RES.get(key)
+    if max_res is None:
         n_gen, K = generators.shape[0], generators.shape[-1]
         if n_gen * n_gen * K * K > max_elements:                  # too large to scan; closed by construction
-            _BRACKET_CLOSURE_RES[key] = [generators, 0.0]
+            _bounded_lru_store(_BRACKET_CLOSURE_RES, key, 0.0)
             return
         with torch.no_grad():
             G    = generators                                                   # (n_gen, K, K)
@@ -183,11 +206,12 @@ def warn_if_basis_not_closed(
             res  = (brak - proj).norm(dim=(-2, -1))                             # (n_gen, n_gen)
             den  = brak.norm(dim=(-2, -1)) + eps                                # (n_gen, n_gen)
             max_res = float((res / den).max())
-        entry = _BRACKET_CLOSURE_RES[key] = [generators, max_res]               # retain the basis -> stable id
-    max_res = entry[1]
+        _bounded_lru_store(_BRACKET_CLOSURE_RES, key, max_res)
+    else:
+        _BRACKET_CLOSURE_RES.move_to_end(key)
     wkey = (key, where)
     if max_res > closure_tol and wkey not in _BRACKET_CLOSURE_WARNED:
-        _BRACKET_CLOSURE_WARNED.add(wkey)
+        _bounded_lru_store(_BRACKET_CLOSURE_WARNED, wkey, None)
         warnings.warn(
             f"{where}: gauge generator basis is not closed under the Lie bracket (max relative "
             f"out-of-span residual {max_res:.3e} > {closure_tol:.1e}); BCH composition / structure "
@@ -320,8 +344,8 @@ def compose_bch(
 
     # Diagnostic (cached, phi-independent): warn once if the generator basis is not bracket-closed,
     # in which case the Dynkin commutators leave span{G_a} and the extract_phi projection above drops
-    # that part. Closure depends only on the fixed generators, so this never host-syncs the hot E-step
-    # nor touches Z's autograd graph (the old per-call float(Z) did both -> the requires_grad warning).
+    # that part. Closure depends only on the fixed generators and never touches Z's autograd graph;
+    # the bounded cache owns only a CPU value signature and scalar residual, not the caller's basis.
     # The scan is size-gated (max_elements): large direct-sum bases (e.g. block_glk K=140, the prior
     # O(K^4) OOM) are skipped as closed-by-construction; small non-closed cross_couplings chains scan.
     warn_if_basis_not_closed(generators, where="compose_bch",

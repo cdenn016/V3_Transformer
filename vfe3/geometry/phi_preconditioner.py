@@ -289,10 +289,10 @@ def pullback_metric(
 
     d exp_phi(T) = Psi(ad_phi)(T) exp(phi), Psi(z) = (e^z - 1)/z = sum_k z^k/(k+1)!.
     ad_phi acts on coordinates: (ad_phi)_{cb} = sum_a phi^a f[a,b,c]. The Psi series is
-    summed adaptively: terms accumulate until the new term's max |entry| < series_tol,
-    capped at series_order. Truncation error of Psi(ad_phi) grows with ||phi||, so a
-    fixed low order is inaccurate in the non-compact (large-norm) regime the pullback
-    metric exists for; the adaptive cutoff keeps it accurate up to retract_phi's max_norm.
+    summed through ``series_order`` and its final term is checked against ``series_tol``
+    once after the loop. Truncation error of Psi(ad_phi) grows with ||phi||, so a fixed
+    low order is inaccurate in the non-compact (large-norm) regime the pullback metric
+    exists for; the default order keeps it accurate up to retract_phi's max_norm.
     The 1/(k+1)! coefficient is a float (an int divisor overflows past order ~20). The
     structure-constants tensor is O(n_gen^2 K^2); guarded for K > max_k (infeasible for
     large K). The finite-difference of exp is the correctness arbiter for this kernel.
@@ -301,7 +301,6 @@ def pullback_metric(
     if K > max_k:
         raise ValueError(f"pullback_metric: K={K} exceeds max_k={max_k} (structure-constants OOM)")
     n_gen      = generators.shape[0]
-    orig_dtype = phi.dtype
     G          = generators.double()
     phi        = phi.double()
 
@@ -311,16 +310,14 @@ def pullback_metric(
     eye    = torch.eye(n_gen, dtype=ad.dtype, device=ad.device).expand_as(ad).clone()
     psi    = eye.clone()
     ad_pow = eye.clone()
-    converged = False
-    last_term = 0.0
+    last_term_tensor = torch.zeros((), dtype=ad.dtype, device=ad.device)
     for k in range(1, series_order):
         ad_pow = torch.einsum("...ij,...jk->...ik", ad_pow, ad)
         term   = ad_pow * (1.0 / float(math.factorial(k + 1)))   # float coeff: int overflows >~20
         psi    = psi + term
-        last_term = float(term.abs().max())
-        if last_term < series_tol:                         # converged: higher terms negligible
-            converged = True
-            break
+        last_term_tensor = term.detach().abs().max()
+    last_term = float(last_term_tensor)
+    converged = last_term < series_tol
     global _PULLBACK_SERIES_WARNED
     if not converged and series_order > 1 and not _PULLBACK_SERIES_WARNED:
         _PULLBACK_SERIES_WARNED = True
@@ -336,7 +333,7 @@ def pullback_metric(
     exp_phi = torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi, G))
     dexp    = torch.einsum("...aij,...jk->...aik", W, exp_phi)
     metric  = torch.einsum("...aij,...bij->...ab", dexp, dexp)
-    return metric.to(orig_dtype)
+    return metric
 
 
 @register_precond("pullback")
@@ -352,10 +349,11 @@ def _precond_pullback(
     **kwargs,
 ) -> torch.Tensor:
     r"""Position-dependent natural gradient: solve G(phi) nat = grad_phi."""
+    orig_dtype = grad_phi.dtype
     G_metric = pullback_metric(phi, generators, series_tol=series_tol, series_order=series_order)
     eye = torch.eye(G_metric.shape[-1], dtype=G_metric.dtype, device=G_metric.device)
-    sol = torch.linalg.solve(G_metric + eps * eye, grad_phi.unsqueeze(-1))
-    return sol.squeeze(-1)
+    sol = torch.linalg.solve(G_metric + eps * eye, grad_phi.double().unsqueeze(-1))
+    return sol.squeeze(-1).to(orig_dtype)
 
 
 def pullback_metric_per_block(
@@ -387,7 +385,7 @@ def pullback_metric_per_block(
     block_of = _generator_block_index(generators, irrep_dims)
     n_gen = generators.shape[0]
     batch = phi.shape[:-1]
-    G_metric = torch.zeros(*batch, n_gen, n_gen, dtype=phi.dtype, device=phi.device)
+    G_metric = torch.zeros(*batch, n_gen, n_gen, dtype=torch.float64, device=phi.device)
     start = 0
     for h, d in enumerate(irrep_dims):
         idx     = (block_of == h).nonzero(as_tuple=True)[0]
@@ -420,11 +418,12 @@ def _precond_pullback_per_block(
     metric is built on its local d_h <= max_k representation."""
     if irrep_dims is None:
         raise ValueError("pullback_per_block requires irrep_dims")
+    orig_dtype = grad_phi.dtype
     G_metric = pullback_metric_per_block(phi, generators, irrep_dims,
                                          series_tol=series_tol, series_order=series_order)
     eye = torch.eye(G_metric.shape[-1], dtype=G_metric.dtype, device=G_metric.device)
-    sol = torch.linalg.solve(G_metric + eps * eye, grad_phi.unsqueeze(-1))
-    return sol.squeeze(-1)
+    sol = torch.linalg.solve(G_metric + eps * eye, grad_phi.double().unsqueeze(-1))
+    return sol.squeeze(-1).to(orig_dtype)
 
 
 def precondition_phi_gradient(

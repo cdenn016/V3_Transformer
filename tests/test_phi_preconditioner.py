@@ -160,7 +160,8 @@ def test_pullback_at_zero_is_frobenius_gram():
     # Psi(0) = I, exp(0) = I -> G_ab = tr(G_a^T G_b) = Frobenius Gram.
     G = generate_glk(2)
     Gmetric = pullback_metric(torch.zeros(4), G)
-    gram = torch.einsum("aij,bij->ab", G, G)
+    gram = torch.einsum("aij,bij->ab", G.double(), G.double())
+    assert Gmetric.dtype == torch.float64
     assert torch.allclose(Gmetric, gram, atol=1e-5)
 
 
