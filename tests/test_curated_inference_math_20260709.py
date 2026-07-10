@@ -332,9 +332,10 @@ def test_q_and_s_randomized_depth_draw_independently(
 
 def _mstep_prior_case(
     n_layers: int,
+    **overrides: object,
 ) -> tuple[VFEModel, torch.Tensor, torch.Tensor]:
     torch.manual_seed(53)
-    model = VFEModel(VFE3Config(
+    values = dict(
         vocab_size=11,
         embed_dim=4,
         n_heads=2,
@@ -349,7 +350,9 @@ def _mstep_prior_case(
         mass_phi=0.0,
         mstep_self_coupling_weight=0.7,
         seed=53,
-    ))
+    )
+    values.update(overrides)
+    model = VFEModel(VFE3Config(**values))
     token_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.long)
     targets = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.long)
     return model, token_ids, targets
@@ -514,3 +517,190 @@ def test_single_layer_mstep_self_coupling_is_unchanged() -> None:
 
     expected_loss = ce + model.cfg.mstep_self_coupling_weight * expected_sc
     assert torch.allclose(loss, expected_loss, atol=1e-6, rtol=1e-6)
+
+
+def test_detach_single_layer_capture_preserves_prior_gradient() -> None:
+    belief, mu_p_value, sigma_p_value, group = _truncation_case(seed=61)
+    mu_p = mu_p_value.detach().clone().requires_grad_(True)
+    sigma_p = sigma_p_value.detach().clone().requires_grad_(True)
+    cfg = VFE3Config(
+        vocab_size=7,
+        embed_dim=2,
+        n_heads=1,
+        max_seq_len=3,
+        n_layers=1,
+        n_e_steps=2,
+        e_q_mu_lr=0.2,
+        e_q_sigma_lr=0.08,
+        e_phi_lr=0.0,
+        e_step_gradient="detach",
+        mass_phi=0.0,
+        mstep_self_coupling_weight=0.7,
+        seed=61,
+    )
+    capture: dict[str, object] = {}
+
+    with torch.no_grad():
+        vfe_stack(
+            belief,
+            mu_p,
+            sigma_p,
+            group,
+            cfg,
+            e_step_gradient="detach",
+            capture=capture,
+        )
+
+    captured_mu, captured_sigma = capture["final_block_prior"]
+    q_converged = capture["converged"]
+    assert torch.equal(captured_mu, mu_p)
+    assert torch.equal(captured_sigma, sigma_p)
+    assert captured_mu.data_ptr() != mu_p.data_ptr()
+    assert captured_sigma.data_ptr() != sigma_p.data_ptr()
+    assert captured_mu.requires_grad
+    assert captured_sigma.requires_grad
+
+    family = get_family(cfg.family)
+    captured_sc = self_divergence_for_alpha(
+        family(q_converged.mu.detach(), q_converged.sigma.detach()),
+        family(captured_mu, captured_sigma),
+        alpha=cfg.renyi_order,
+        kl_max=cfg.kl_max,
+        eps=cfg.eps,
+        divergence_family=cfg.divergence_family,
+        lambda_alpha_mode=cfg.lambda_alpha_mode,
+    ).mean()
+    reference_sc = self_divergence_for_alpha(
+        family(q_converged.mu.detach(), q_converged.sigma.detach()),
+        family(mu_p, sigma_p),
+        alpha=cfg.renyi_order,
+        kl_max=cfg.kl_max,
+        eps=cfg.eps,
+        divergence_family=cfg.divergence_family,
+        lambda_alpha_mode=cfg.lambda_alpha_mode,
+    ).mean()
+    captured_grads = torch.autograd.grad(
+        captured_sc,
+        (mu_p, sigma_p),
+        retain_graph=True,
+    )
+    reference_grads = torch.autograd.grad(reference_sc, (mu_p, sigma_p))
+
+    for captured_grad, reference_grad in zip(captured_grads, reference_grads):
+        assert torch.count_nonzero(reference_grad) > 0
+        assert torch.equal(captured_grad, reference_grad)
+
+
+def _manual_detach_final_prior(
+    token_ids: torch.Tensor,
+    model:     VFEModel,
+) -> tuple[BeliefState, tuple[torch.Tensor, torch.Tensor], BeliefState]:
+    r"""Run the live no-grad blocks while retaining the exact detached-state prior recurrence."""
+    cfg = model.cfg
+    initial = model.prior_bank.encode(token_ids)
+    initial = initial._replace(phi=model._apply_pos_phi(initial.phi))
+    log_prior = model._attention_log_prior(token_ids.shape[1], token_ids.device)
+    log_prior = model._fold_precision_bias(log_prior, initial.sigma)
+    live_belief = initial
+    live_mu_p, live_sigma_p = initial.mu, initial.sigma
+    reference_mu_p, reference_sigma_p = initial.mu, initial.sigma
+    final_prior: tuple[torch.Tensor, torch.Tensor] | None = None
+    final_capture: dict[str, BeliefState] = {}
+
+    for layer_index in range(cfg.n_layers):
+        is_final = layer_index == cfg.n_layers - 1
+        if is_final:
+            final_prior = (reference_mu_p, reference_sigma_p)
+        with torch.no_grad():
+            live_belief = vfe_block(
+                live_belief,
+                live_mu_p,
+                live_sigma_p,
+                model.group,
+                cfg,
+                log_prior=log_prior,
+                block_norm=model.block_norm,
+                lambda_beta=cfg.lambda_beta,
+                e_step_gradient="detach",
+                capture=final_capture if is_final else None,
+            )
+            live_mu_p = (
+                (1.0 - cfg.prior_handoff_rho) * live_mu_p
+                + cfg.prior_handoff_rho * live_belief.mu
+            )
+            live_sigma_p = (
+                (1.0 - cfg.prior_handoff_sigma) * live_sigma_p
+                + cfg.prior_handoff_sigma * live_belief.sigma
+            )
+        if not is_final:
+            reference_mu_p = (
+                (1.0 - cfg.prior_handoff_rho) * reference_mu_p
+                + cfg.prior_handoff_rho * live_belief.mu.detach()
+            )
+            reference_sigma_p = (
+                (1.0 - cfg.prior_handoff_sigma) * reference_sigma_p
+                + cfg.prior_handoff_sigma * live_belief.sigma.detach()
+            )
+
+    assert final_prior is not None
+    return final_capture["converged"], final_prior, initial
+
+
+def test_detach_multilayer_mstep_gradient_matches_exact_recurrence() -> None:
+    model, token_ids, _ = _mstep_prior_case(
+        n_layers=3,
+        e_step_gradient="detach",
+        pos_phi="none",
+    )
+    targets = torch.full_like(token_ids, -100)
+    q_converged, final_prior, initial = _manual_detach_final_prior(token_ids, model)
+    expected_mu_p, expected_sigma_p = final_prior
+    capture: dict[str, object] = {}
+
+    model.forward_beliefs(token_ids, capture=capture)
+    captured_mu, captured_sigma = capture["final_block_prior"]
+    assert torch.equal(capture["converged"].mu, q_converged.mu)
+    assert torch.equal(capture["converged"].sigma, q_converged.sigma)
+    assert torch.equal(captured_mu, expected_mu_p)
+    assert torch.equal(captured_sigma, expected_sigma_p)
+
+    expected_sc = _constant_self_divergence(
+        q_converged.mu.detach(),
+        q_converged.sigma.detach(),
+        expected_mu_p,
+        expected_sigma_p,
+        model,
+    )
+    expected_term = model.cfg.mstep_self_coupling_weight * expected_sc
+
+    pseudo_mu_p, pseudo_sigma_p = initial.mu, initial.sigma
+    for _ in range(model.cfg.n_layers - 1):
+        pseudo_mu_p = (
+            (1.0 - model.cfg.prior_handoff_rho) * pseudo_mu_p
+            + model.cfg.prior_handoff_rho * q_converged.mu.detach()
+        )
+        pseudo_sigma_p = (
+            (1.0 - model.cfg.prior_handoff_sigma) * pseudo_sigma_p
+            + model.cfg.prior_handoff_sigma * q_converged.sigma.detach()
+        )
+    pseudo_sc = _constant_self_divergence(
+        q_converged.mu.detach(),
+        q_converged.sigma.detach(),
+        pseudo_mu_p,
+        pseudo_sigma_p,
+        model,
+    )
+    pseudo_term = model.cfg.mstep_self_coupling_weight * pseudo_sc
+
+    prior_parameter = model.prior_bank.mu_embed
+    expected_grad, = torch.autograd.grad(expected_term, prior_parameter, retain_graph=True)
+    pseudo_grad, = torch.autograd.grad(pseudo_term, prior_parameter)
+
+    _, actual_loss, ce = model(token_ids, targets)
+    actual_grad, = torch.autograd.grad(actual_loss, prior_parameter)
+
+    assert torch.equal(ce, torch.zeros_like(ce))
+    assert torch.allclose(actual_loss, expected_term.detach(), atol=1e-6, rtol=1e-6)
+    assert torch.count_nonzero(expected_grad) > 0
+    assert not torch.allclose(expected_grad, pseudo_grad, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(actual_grad, expected_grad, atol=1e-6, rtol=1e-6)

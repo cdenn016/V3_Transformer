@@ -63,6 +63,11 @@ def vfe_stack(
     path); ``rope_on_cov`` enables the full-gauge covariance sandwich rotation."""
     rho = cfg.prior_handoff_rho
     rho_s = cfg.prior_handoff_sigma
+    # The model runs the detach estimator under torch.no_grad(), but the outer M-step still learns
+    # the prior. Track the same handoff values in a narrow grad-enabled recurrence: the real stack
+    # input stays connected, while every E-step output is fixed state for the M-step contract.
+    detach_capture = capture is not None and e_step_gradient == "detach"
+    capture_mu_p, capture_sigma_p = mu_p, sigma_p
     # Hoist the loop-invariant temperature computation out of the per-layer vfe_block call.
     # attention_tau depends only on the kappa, group.irrep_dims, and device -- all constant across
     # layers -- so computing it once here and passing it as tau avoids L redundant calls.
@@ -87,7 +92,14 @@ def vfe_stack(
         else:
             tau_b = tau
         if capture is not None and layer_index == cfg.n_layers - 1:
-            capture["final_block_prior"] = (mu_p.clone(), sigma_p.clone())
+            if detach_capture:
+                with torch.enable_grad():
+                    capture["final_block_prior"] = (
+                        capture_mu_p.clone(),
+                        capture_sigma_p.clone(),
+                    )
+            else:
+                capture["final_block_prior"] = (mu_p.clone(), sigma_p.clone())
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
                            lambda_beta=lambda_beta,
@@ -100,4 +112,13 @@ def vfe_stack(
                            gauge_parameterization=gauge_parameterization)
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
+        if detach_capture and layer_index < cfg.n_layers - 1:
+            with torch.enable_grad():
+                # Values equal the live recurrence; detaching the inferred state prevents this
+                # capture path from backpropagating through the no-grad E-step prefix.
+                capture_mu_p = (1.0 - rho) * capture_mu_p + rho * belief.mu.detach()
+                capture_sigma_p = (
+                    (1.0 - rho_s) * capture_sigma_p
+                    + rho_s * belief.sigma.detach()
+                )
     return belief
