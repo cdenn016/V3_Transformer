@@ -124,3 +124,50 @@ def test_cell_is_current_rejects_missing_or_mismatched_code_identity(tmp_path, m
         "git_dirty_fingerprint": "current-dirty",
     }), encoding="utf-8")
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is True
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [None, [], "not-an-object", 7],
+    ids=["null", "list", "string", "number"],
+)
+def test_cell_is_current_rejects_non_object_provenance(tmp_path, malformed):
+    run_dir = tmp_path / "cell"
+    run_dir.mkdir()
+    ds = "wikitext-103"
+    cfg = VFE3Config(**scaling._cell_cfg_dict({"vocab_size": 64}, 0, 1))
+    (run_dir / "summary.json").write_text("{}", encoding="utf-8")
+    (run_dir / "config.json").write_text(json.dumps({
+        "dataset": ds,
+        "config": json.loads(json.dumps(asdict(cfg), default=str)),
+    }), encoding="utf-8")
+    (run_dir / "scaling_cell.json").write_text(
+        json.dumps({"label": "cell", "max_tokens": 1000}), encoding="utf-8")
+    (run_dir / "provenance.json").write_text(json.dumps(malformed), encoding="utf-8")
+
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [None, [], "not-an-object", 7],
+    ids=["null", "list", "string", "number"],
+)
+def test_cell_is_current_rejects_non_object_cell_metadata(tmp_path, malformed):
+    run_dir = tmp_path / "cell"
+    run_dir.mkdir()
+    ds = "wikitext-103"
+    cfg = VFE3Config(**scaling._cell_cfg_dict({"vocab_size": 64}, 0, 1))
+    (run_dir / "summary.json").write_text("{}", encoding="utf-8")
+    (run_dir / "config.json").write_text(json.dumps({
+        "dataset": ds,
+        "config": json.loads(json.dumps(asdict(cfg), default=str)),
+    }), encoding="utf-8")
+    (run_dir / "scaling_cell.json").write_text(json.dumps(malformed), encoding="utf-8")
+    (run_dir / "provenance.json").write_text(json.dumps({
+        "git_sha": "current-head",
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }), encoding="utf-8")
+
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False

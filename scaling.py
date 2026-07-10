@@ -37,6 +37,7 @@ import gc
 import json
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import asdict
 from dataclasses import fields as _dc_fields
 from pathlib import Path
@@ -668,6 +669,8 @@ def _cell_is_current(run_dir: Path, cfg: VFE3Config, dataset: str, max_tokens: O
     try:
         cellmeta = json.loads((run_dir / "scaling_cell.json").read_text(encoding="utf-8"))
         provenance = json.loads((run_dir / "provenance.json").read_text(encoding="utf-8"))
+        if not isinstance(cellmeta, Mapping) or not isinstance(provenance, Mapping):
+            return False
     except Exception:
         return False
     if cellmeta.get("max_tokens", None) != (int(max_tokens) if max_tokens is not None else None):
