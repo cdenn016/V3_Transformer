@@ -1,7 +1,9 @@
 # Peer Review of the `GL(K)_*.tex` Manuscript
 
-**Review date:** July 9, 2026  
-**Recommendation:** Major revision  
+**Review date:** July 9, 2026
+
+**Recommendation:** Major revision
+
 **Review scope:** mathematical validity, theoretical positioning, empirical support, statistical analysis, reproducibility, source integrity, and literature coverage
 
 ## Materials reviewed
