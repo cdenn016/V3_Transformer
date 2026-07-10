@@ -1,6 +1,7 @@
 r"""Focused regressions for family-aware full-covariance inference geometry."""
 
 import gc
+import inspect
 import math
 import warnings
 import weakref
@@ -9,6 +10,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import vfe3.geometry.retraction as retraction_module
+import vfe3.model.model as model_module
+import vfe3.model.prior_bank as prior_bank_module
+import vfe3.numerics as numerics_module
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.families.laplace import DiagonalLaplace
@@ -46,6 +51,46 @@ def _full_prior_bank(*, eps: float = 1e-3) -> PriorBank:
         eps=eps,
     )
     return VFEModel(cfg).prior_bank
+
+
+def test_bounded_log_variance_exp_is_finite_with_finite_gradient() -> None:
+    log_sigma = torch.tensor([100.0], requires_grad=True)
+
+    with pytest.warns(RuntimeWarning, match="trainable log-variance"):
+        sigma = numerics_module.bounded_variance_from_log(log_sigma)
+    sigma.sum().backward()
+
+    assert torch.isfinite(sigma).all()
+    assert log_sigma.grad is not None
+    assert torch.isfinite(log_sigma.grad).all()
+
+
+def test_bounded_log_variance_is_identity_in_normal_range() -> None:
+    log_sigma = torch.tensor([-5.0, 0.0, 5.0])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sigma = numerics_module.bounded_variance_from_log(log_sigma)
+
+    assert torch.equal(sigma, torch.exp(log_sigma))
+
+
+def test_prior_model_and_decode_variance_reads_share_guard() -> None:
+    prior_source = inspect.getsource(prior_bank_module)
+    model_source = inspect.getsource(model_module)
+    retraction_source = inspect.getsource(retraction_module)
+
+    direct_table_exponentiations = [
+        line.strip()
+        for source in (prior_source, model_source)
+        for line in source.splitlines()
+        if "torch.exp(" in line and "sigma_log" in line
+    ]
+
+    assert direct_table_exponentiations == []
+    assert prior_source.count("bounded_variance_from_log(") >= 3
+    assert model_source.count("bounded_variance_from_log(") >= 1
+    assert "bounded_variance_from_log" not in retraction_source
 
 
 def _matrix_exp_jacobian_pullback_metric(

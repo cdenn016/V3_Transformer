@@ -22,6 +22,29 @@ def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
     return 0.5 * (matrix + matrix.transpose(-1, -2))
 
 
+def bounded_variance_from_log(
+    log_sigma: torch.Tensor,
+
+    *,
+    eps:     float = 1e-6,
+    max_log: float = 80.0,
+) -> torch.Tensor:
+    r"""Exponentiate a trainable log-variance without overflowing float32.
+
+    Values in the normal ``[log(eps), max_log]`` range retain the ordinary ``exp`` map. Larger
+    detached parameter values emit the numerical warning and are capped only for exponentiation;
+    ``sigma_max`` is a separate belief-state retraction policy and is deliberately not used here.
+    """
+    if bool((log_sigma.detach() > max_log).any()):
+        import warnings
+        warnings.warn(
+            f"trainable log-variance exceeds max_log={max_log:g}; clamping before exponentiation",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return torch.exp(log_sigma.clamp(max=max_log)).clamp(min=eps)
+
+
 def apply_mu_trust_region(
     delta_mu: torch.Tensor,              # (..., K) proposed mean step (e_q_mu_lr * nat_grad_mu)
     sigma_q:  torch.Tensor,              # (..., K) diagonal variances OR (..., K, K) covariance

@@ -30,6 +30,7 @@ from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.positional_phi import apply_positional_phi
 from vfe3.model.prior_bank import _CHUNKED_DECODERS, PriorBank
 from vfe3.model.stack import vfe_stack
+from vfe3.numerics import bounded_variance_from_log
 
 
 # Transport-mode state-routing sets: which regimes' Omega builders read mu/sigma. Sourced from the
@@ -624,7 +625,7 @@ class VFEModel(nn.Module):
         # so -- unlike omega_s -- there is NO detach/attach concern; None on the pure path.
         reflection_s = pb.reflection_sign[token_ids] if cfg.phi_reflection != "off" else None
         r_mu    = pb.r_mu.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
-        r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s_sigma)
+        r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps).expand_as(s_sigma)
         gamma_tau       = attention_tau(self.effective_kappa_gamma(s_mu.device), grp.irrep_dims)
         gamma_log_prior = self._attention_log_prior(
             token_ids.shape[1], token_ids.device, prior=cfg.gamma_attention_prior,
@@ -1443,7 +1444,7 @@ class VFEModel(nn.Module):
         pb = self.prior_bank
         s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B, N, K)
         r_mu = pb.r_mu                                               # (K,)
-        r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps)       # (K,)
+        r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps)  # (K,)
         div = self_divergence_per_coord if per_coord else self_divergence
         return div(
             DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),

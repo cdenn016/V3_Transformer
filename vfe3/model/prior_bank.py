@@ -40,7 +40,7 @@ from torch import nn
 from vfe3.belief import BeliefState
 from vfe3.divergence import get_family, kl
 from vfe3.families.base import _logdet_chol
-from vfe3.numerics import safe_cholesky
+from vfe3.numerics import bounded_variance_from_log, safe_cholesky
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +402,9 @@ class PriorBank(nn.Module):
         via _prior_mu_table/_prior_sigma_log_table (encode/self-coupling/decode), making s the prior.
         """
         s_mu = self.s_mu_embed[token_ids]                                       # (B, N, K)
-        s_sigma = torch.exp(self.s_sigma_log_embed[token_ids]).clamp(min=self.eps)  # (B, N, K)
+        s_sigma = bounded_variance_from_log(
+            self.s_sigma_log_embed[token_ids], eps=self.eps,
+        )                                                                         # (B, N, K)
         return s_mu, s_sigma
 
     @torch.no_grad()
@@ -439,7 +441,7 @@ class PriorBank(nn.Module):
         UNTRANSPORTED, uniform-weight centroid -- not the cross-scale shadow r_i=Omega_tilde[s^(s+1)].
         """
         s_mu = self.s_mu_embed                                                   # (V, K)
-        s_sigma = torch.exp(self.s_sigma_log_embed).clamp(min=self.eps)          # (V, K)
+        s_sigma = bounded_variance_from_log(self.s_sigma_log_embed, eps=self.eps)  # (V, K)
         r_mu = s_mu.mean(dim=0)                                                  # (K,)
         r_var = (s_sigma + (s_mu - r_mu) ** 2).mean(dim=0)                       # (K,) within + between
         self.r_mu.copy_(r_mu)
@@ -580,7 +582,9 @@ class PriorBank(nn.Module):
         """
         tau_eff = self._tau_eff(tau)
         mu_v = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
-        sigma_v = torch.exp(self._decode_sigma_log_table()).clamp(min=self.eps)   # (V, K)
+        sigma_v = bounded_variance_from_log(
+            self._decode_sigma_log_table(), eps=self.eps,
+        )                                                                         # (V, K)
         mu_q_b = mu_q.unsqueeze(-2)                                      # (B, N, 1, K)
         sigma_q_b = sigma_q.unsqueeze(-2)                               # (B, N, 1, K)
         diag = get_family("gaussian_diagonal")
@@ -631,7 +635,9 @@ class PriorBank(nn.Module):
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
 
-        sigma_v_all = torch.exp(self._decode_sigma_log_table()).clamp(min=self.eps)   # (V, K)
+        sigma_v_all = bounded_variance_from_log(
+            self._decode_sigma_log_table(), eps=self.eps,
+        )                                                                             # (V, K)
         mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
         c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
@@ -765,7 +771,9 @@ class PriorBank(nn.Module):
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
 
-        sigma_v_all = torch.exp(self._decode_sigma_log_table()).clamp(min=self.eps)   # (V, K)
+        sigma_v_all = bounded_variance_from_log(
+            self._decode_sigma_log_table(), eps=self.eps,
+        )                                                                             # (V, K)
         mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
         c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
@@ -935,7 +943,9 @@ class PriorBank(nn.Module):
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
 
-        sigma_v_all = torch.exp(self._decode_sigma_log_table()).clamp(min=self.eps)   # (V, K)
+        sigma_v_all = bounded_variance_from_log(
+            self._decode_sigma_log_table(), eps=self.eps,
+        )                                                                             # (V, K)
         mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
 
@@ -1002,7 +1012,9 @@ def _encode_per_token(
     off-diagonal mass into. The mean / gauge tables are shared across families.
     """
     mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
-    sigma_diag = torch.exp(pb._prior_sigma_log_table()[token_ids]).clamp(min=pb.eps)  # (B, N, K), sigma > 0
+    sigma_diag = bounded_variance_from_log(
+        pb._prior_sigma_log_table()[token_ids], eps=pb.eps,
+    )                                                                                 # (B, N, K), sigma > 0
     phi = pb.phi_embed[token_ids]                                            # (B, N, n_gen)
     omega = pb._omega_lookup(token_ids) if getattr(pb, "gauge_parameterization", "phi") == "omega_direct" else None
     sigma = sigma_diag if pb.diagonal_covariance else torch.diag_embed(sigma_diag)
@@ -1025,7 +1037,9 @@ def _encode_per_token_additive(
     equivariant; use with ``transport_mode='flat'`` and ``pos_phi='none'`` so no other channel transports.
     """
     mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
-    sigma_diag = torch.exp(pb._prior_sigma_log_table()[token_ids]).clamp(min=pb.eps)  # (B, N, K)
+    sigma_diag = bounded_variance_from_log(
+        pb._prior_sigma_log_table()[token_ids], eps=pb.eps,
+    )                                                                                 # (B, N, K)
     phi_code = pb.phi_embed[token_ids]                                       # (B, N, n_gen) learned table
     mu = mu + phi_code @ pb.additive_R.t()                                   # (B, N, K) structure-free shift
     phi = torch.zeros_like(phi_code)                                         # Omega = I: no gl(g) transport
@@ -1077,7 +1091,7 @@ def _decode_diagonal(
     ``(mu_q - c) - (mu_v - c) == mu_q - mu_v`` the closed form is unchanged exactly while
     the cancelled magnitude collapses to the residual spread of the means.
     """
-    sigma_v = torch.exp(pb._decode_sigma_log_table()).clamp(min=pb.eps)  # (V, K)
+    sigma_v = bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps)  # (V, K)
     mu_v = pb._decode_mu_table()                                        # (V, K) decode table (untied if set)
     inv_v = 1.0 / sigma_v                                               # (V, K) = 1/sigma_v
 
@@ -1131,7 +1145,9 @@ def _decode_full(
     the theoretically pure full-covariance path, not the fast diagonal kernel.
     """
     mu_v = pb._decode_mu_table()                                         # (V, K) decode table (untied if set)
-    sigma_v = torch.diag_embed(torch.exp(pb._decode_sigma_log_table()).clamp(min=pb.eps))  # (V, K, K) diagonal-as-full
+    sigma_v = torch.diag_embed(
+        bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps)
+    )                                                                                       # (V, K, K) diagonal-as-full
     mu_q_b = mu_q.unsqueeze(-2)                                          # (B, N, 1, K)
     sigma_q_b = sigma_q.unsqueeze(-3)                                    # (B, N, 1, K, K)
     full = get_family("gaussian_full")
@@ -1160,7 +1176,7 @@ def _decode_full_chunked(
     that ``_decode_full`` builds, by exploiting the diagonal prior (see ``_full_cov_query_invariants``).
     Value-equal to ``decode_mode='full'`` to atol-1e-3 (tests/test_fullcov_alpha_roadmap_2026_06_13.py).
     """
-    sigma_v = torch.exp(pb._decode_sigma_log_table()).clamp(min=pb.eps)  # (V, K) diagonal decode variances
+    sigma_v = bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps)  # (V, K) diagonal decode variances
     mu_v = pb._decode_mu_table()                                         # (V, K) decode table (untied if set)
     inv_v = 1.0 / sigma_v                                                # (V, K) = 1/sigma_v
 
@@ -1205,7 +1221,9 @@ def _decode_expected_likelihood_chunked(
     is inherent to producing every logit (the training memory win is the fused CE twin
     ``decode_ce_expected_likelihood_chunked``).
     """
-    sigma_v_all = torch.exp(pb._decode_sigma_log_table()).clamp(min=pb.eps)   # (V, K)
+    sigma_v_all = bounded_variance_from_log(
+        pb._decode_sigma_log_table(), eps=pb.eps,
+    )                                                                         # (V, K)
     mu_v_all = pb._decode_mu_table()                                     # (V, K) decode table (untied if set)
     chunk = pb.decode_chunk_size
     V = pb.vocab_size
