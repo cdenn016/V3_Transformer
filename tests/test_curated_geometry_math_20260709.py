@@ -48,6 +48,27 @@ def _full_prior_bank(*, eps: float = 1e-3) -> PriorBank:
     return VFEModel(cfg).prior_bank
 
 
+def _matrix_exp_jacobian_pullback_metric(
+    phi:        torch.Tensor,             # (n_gen,) frame coordinates
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+) -> torch.Tensor:                        # (n_gen, n_gen) float64 pullback metric
+    """Independent float64 pullback metric from the Jacobian of ``matrix_exp``."""
+    phi_64 = phi.double().requires_grad_(True)
+    generators_64 = generators.double()
+
+    def _exp_from_coordinates(coordinates: torch.Tensor) -> torch.Tensor:
+        algebra = torch.einsum("a,aij->ij", coordinates, generators_64)
+        return torch.linalg.matrix_exp(algebra)
+
+    jacobian = torch.autograd.functional.jacobian(
+        _exp_from_coordinates,
+        phi_64,
+        create_graph=False,
+    )
+    dexp = jacobian.movedim(-1, 0)
+    return torch.einsum("aij,bij->ab", dexp, dexp)
+
+
 def test_halt_tol_full_covariance_uses_full_gaussian_kl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -462,7 +483,7 @@ def test_pullback_preconditioner_matches_float64_ill_conditioned_reference() -> 
         group.generators,
         mode="pullback",
     )
-    metric_64 = pullback_metric(phi.double(), group.generators.double())
+    metric_64 = _matrix_exp_jacobian_pullback_metric(phi, group.generators)
     eye_64 = torch.eye(metric_64.shape[-1], dtype=torch.float64)
     reference_64 = torch.linalg.solve(
         metric_64 + 1e-6 * eye_64,
@@ -489,11 +510,7 @@ def test_pullback_per_block_solve_stays_float64_until_final_cast() -> None:
         mode="pullback_per_block",
         irrep_dims=irrep_dims,
     )
-    metric_64 = pullback_metric_per_block(
-        phi.double(),
-        group.generators.double(),
-        irrep_dims,
-    )
+    metric_64 = _matrix_exp_jacobian_pullback_metric(phi, group.generators)
     eye_64 = torch.eye(metric_64.shape[-1], dtype=torch.float64)
     reference_64 = torch.linalg.solve(
         metric_64 + 1e-6 * eye_64,
@@ -558,6 +575,7 @@ def test_config_rejects_nonclosed_cross_couplings_for_phi_bch() -> None:
             family="gaussian_full",
             beta_attention_prior="uniform",
             gamma_attention_prior="uniform",
+            e_phi_lr=0.1,
             phi_retract_mode="bch",
             pos_phi="none",
         )
@@ -598,3 +616,83 @@ def test_config_allows_nonclosed_basis_when_bch_inactive() -> None:
         )
 
     assert cfg.close_basis is False
+
+
+def test_config_allows_bracket_closed_disjoint_cross_couplings_with_bch() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = VFE3Config(
+            embed_dim=8,
+            n_heads=4,
+            gauge_group="block_glk",
+            cross_couplings=[(0, 1), (2, 3)],
+            close_basis=False,
+            family="gaussian_full",
+            beta_attention_prior="uniform",
+            gamma_attention_prior="uniform",
+            e_phi_lr=0.1,
+            phi_retract_mode="bch",
+            pos_phi="none",
+        )
+
+    assert cfg.close_basis is False
+
+
+def test_config_allows_bracket_closed_fanout_cross_couplings_with_bch() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = VFE3Config(
+            embed_dim=6,
+            n_heads=3,
+            gauge_group="block_glk",
+            cross_couplings=[(0, 1), (0, 2)],
+            close_basis=False,
+            family="gaussian_full",
+            beta_attention_prior="uniform",
+            gamma_attention_prior="uniform",
+            e_phi_lr=0.1,
+            phi_retract_mode="bch",
+            pos_phi="none",
+        )
+
+    assert cfg.close_basis is False
+
+
+def test_config_allows_bracket_closed_transitive_cross_couplings_with_bch() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = VFE3Config(
+            embed_dim=6,
+            n_heads=3,
+            gauge_group="block_glk",
+            cross_couplings=[(0, 1), (1, 2), (0, 2)],
+            close_basis=False,
+            family="gaussian_full",
+            beta_attention_prior="uniform",
+            gamma_attention_prior="uniform",
+            e_phi_lr=0.1,
+            phi_retract_mode="bch",
+            pos_phi="none",
+        )
+
+    assert cfg.close_basis is False
+
+
+def test_config_allows_phi_bch_when_e_phi_route_inactive() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = VFE3Config(
+            embed_dim=6,
+            n_heads=3,
+            gauge_group="block_glk",
+            cross_couplings=[(0, 1), (1, 2)],
+            close_basis=False,
+            family="gaussian_full",
+            beta_attention_prior="uniform",
+            gamma_attention_prior="uniform",
+            e_phi_lr=0.0,
+            phi_retract_mode="bch",
+            pos_phi="none",
+        )
+
+    assert cfg.e_phi_lr == 0.0

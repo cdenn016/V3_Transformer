@@ -33,6 +33,28 @@ _VALID_OMEGA_REFLECTION    = ("off", "init_seed", "metropolis")
 _REFLECT_OK                = ("glk", "block_glk", "so_k")   # so_k: valid O(K) seed; gl: ambient seed valid
 
 
+def _cross_couplings_are_bracket_closed(
+    cross_couplings: List[Tuple[int, int]],
+) -> bool:
+    r"""Whether directed full-block couplings form a Lie-bracket-closed basis.
+
+    The runtime basis contains every diagonal head block and, for each directed
+    edge ``(a, b)``, the full off-diagonal block ``E_ab tensor A``. Its bracket is
+    ``[E_ab tensor A, E_cd tensor B] = delta_bc E_ad tensor AB
+    - delta_da E_cb tensor BA``. Diagonal targets already belong to the basis;
+    every off-diagonal target belongs exactly when the directed edge relation is
+    transitive. This graph test is therefore equivalent to closure of the runtime
+    block-matrix basis without constructing the ``(n_gen, n_gen, K, K)`` bracket
+    tensor during configuration validation.
+    """
+    edges = set(cross_couplings)
+    for a, b in edges:
+        for c, d in edges:
+            if b == c and a != d and (a, d) not in edges:
+                return False
+    return True
+
+
 @dataclass
 class VFE3Config:
     """The single authoritative configuration surface for VFE_3.0.
@@ -1101,21 +1123,22 @@ class VFE3Config:
                     raise ValueError(
                         f"cross_couplings head indices ({a},{b}) out of range [0, {self.n_heads})"
                     )
-            coupled_heads = {head for pair in self.cross_couplings for head in pair}
-            phi_bch_active = self.phi_retract_mode == "bch"
+            basis_is_closed = _cross_couplings_are_bracket_closed(self.cross_couplings)
+            phi_bch_active = self.e_phi_lr > 0.0 and self.phi_retract_mode == "bch"
             positional_bch_active = self.pos_phi != "none" and self.pos_phi_compose == "bch"
-            if (self.close_basis is False and len(coupled_heads) >= 3
+            if (self.close_basis is False and not basis_is_closed
                     and (phi_bch_active or positional_bch_active)):
                 active_routes = []
                 if phi_bch_active:
-                    active_routes.append("phi_retract_mode='bch'")
+                    active_routes.append("phi_retract_mode='bch' with e_phi_lr>0")
                 if positional_bch_active:
                     active_routes.append("active pos_phi with pos_phi_compose='bch'")
                 raise ValueError(
-                    "close_basis=False is invalid for cross_couplings spanning 3 or more heads "
-                    f"when BCH is active through {', '.join(active_routes)}: the raw basis is not "
-                    "closed under Lie brackets and BCH would truncate out-of-span terms. Set "
-                    "close_basis=True or disable every BCH route."
+                    "close_basis=False is invalid for this nonclosed cross_couplings relation "
+                    f"when BCH is active through {', '.join(active_routes)}: the runtime basis is "
+                    "not closed under Lie brackets and BCH would truncate out-of-span terms. Set "
+                    "close_basis=True, supply every directed transitive edge, or disable every "
+                    "reachable BCH route."
                 )
             # Cross-coupling's off-block generators destroy the per-head direct sum, so the group
             # builder reports a SINGLE irrep block [K]: n_heads no longer sets the runtime
