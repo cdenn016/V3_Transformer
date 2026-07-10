@@ -177,6 +177,44 @@ def _periodic_loader(V=6, period=3, n=600, seq_len=8, batch_size=8, seed=0):
                       generator=g)
 
 
+def test_run_training_applies_cfg_seed_and_deterministic_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import vfe3.train as train_module
+    from vfe3.runtime import seed_everything
+
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, batch_size=2, deterministic=False, seed=37)
+    loader = _periodic_loader(V=cfg.vocab_size, n=96, seq_len=cfg.max_seq_len,
+                              batch_size=cfg.batch_size, seed=cfg.seed)
+    monkeypatch.setattr(train_module, "make_dataloader", lambda *args, **kwargs: loader)
+    monkeypatch.setattr(train_module, "train", lambda *args, **kwargs: [])
+
+    was_algorithms = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    was_cudnn_deterministic = torch.backends.cudnn.deterministic
+    was_cudnn_benchmark = torch.backends.cudnn.benchmark
+    had_cublas = "CUBLAS_WORKSPACE_CONFIG" in os.environ
+    was_cublas = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    try:
+        seed_everything(999, deterministic=True)
+        model, _ = train_module.run_training(cfg, dataset="synthetic", n_steps=0)
+        assert model.cfg is cfg
+        assert torch.initial_seed() == cfg.seed
+        assert torch.are_deterministic_algorithms_enabled() is False
+        assert torch.backends.cudnn.deterministic is False
+        assert torch.backends.cudnn.benchmark is True
+    finally:
+        torch.use_deterministic_algorithms(was_algorithms, warn_only=was_warn_only)
+        torch.backends.cudnn.deterministic = was_cudnn_deterministic
+        torch.backends.cudnn.benchmark = was_cudnn_benchmark
+        if had_cublas:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = was_cublas
+        else:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+
+
 def _random3_loader(V=6, n=600, seq_len=8, batch_size=8, data_seed=101, loader_seed=0):
     # UNLEARNABLE negative control: each token drawn iid uniform over the SAME 3 active
     # tokens {0,1,2}. The next token is independent of the current one, so the irreducible

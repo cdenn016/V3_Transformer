@@ -305,8 +305,10 @@ def test_guard_saturation_full_cov_floor_binds() -> None:
 def test_finalize_writes_tier3_research_and_provenance() -> None:
     import json
     from vfe3.run_artifacts import RunArtifacts, finalize_run
-    torch.manual_seed(0)
-    cfg = _cfg(log_interval=6, eval_interval=12, eval_max_batches=2, generate_figures=False)
+    from vfe3.runtime import seed_everything
+    cfg = _cfg(log_interval=6, eval_interval=12, eval_max_batches=2, generate_figures=False,
+               deterministic=True)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(DEVICE)
     loader = _loader(cfg)
     with tempfile.TemporaryDirectory() as tmp:
@@ -325,6 +327,12 @@ def test_finalize_writes_tier3_research_and_provenance() -> None:
         # provenance.json: code/data/env state a config-only record omits
         prov = json.loads((root / "provenance.json").read_text())
         assert {"seed", "torch_version", "git_sha", "git_dirty"} <= set(prov)
+        assert prov["deterministic_state"] == {
+            "algorithms": True,
+            "cudnn_deterministic": True,
+            "cudnn_benchmark": False,
+            "cublas_workspace_config": ":4096:8",
+        }
         # summary.json scaling-law point
         summ = json.loads((root / "summary.json").read_text())
         assert {"n_params", "tokens_seen", "est_flops_6ND"} <= set(summ["scaling_point"])
@@ -336,3 +344,4 @@ def test_finalize_writes_tier3_research_and_provenance() -> None:
         # history-only trend figures
         for fig in ("grad_norm.png", "belief_condition.png", "estep_convergence_trend.png"):
             assert (root / fig).exists(), f"missing trend figure {fig}"
+    seed_everything(cfg.seed, deterministic=False)

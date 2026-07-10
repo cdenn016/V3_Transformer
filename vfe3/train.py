@@ -37,6 +37,7 @@ from vfe3.model.block import _as_coeff
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
 #                                                      lazily (function-local), so there is no cycle
+from vfe3.runtime import seed_everything
 from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source for the phi-clamp threshold (M2)
 
 
@@ -1331,7 +1332,7 @@ def run_training(
     never written), reuses ``loader`` as the validation loader (train == val), and never runs
     the end-of-run test eval. Kept only for the lightweight in-process smoke use it already had.
     """
-    torch.manual_seed(cfg.seed)              # reproducible prior-table init + data order
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = VFEModel(cfg).to(device)         # move to CUDA where available (mirrors train_vfe3.main)
     loader = make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size, max_tokens=max_tokens)

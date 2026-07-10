@@ -14,7 +14,7 @@ _LOG = logging.getLogger("test_run_naming")
 
 def _cfg(**kw) -> VFE3Config:
     base = dict(vocab_size=6, embed_dim=20, n_heads=2, max_seq_len=8, n_layers=1,
-                gauge_group="block_glk", use_prior_bank=False, use_head_mixer=True)
+                gauge_group="block_glk", use_prior_bank=False, use_head_mixer=True, seed=0)
     base.update(kw)
     return VFE3Config(**base)
 
