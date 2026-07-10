@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
+from vfe3.families.laplace import DiagonalLaplace
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.retraction import (
     _eigh_damped,
@@ -15,6 +16,7 @@ from vfe3.geometry.retraction import (
     get_retraction,
     retract_logeuclidean_full,
 )
+from vfe3.geometry.transport import get_transport, stable_matrix_exp_pair
 from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import PriorBank
 from vfe3.numerics import apply_mu_trust_region
@@ -268,3 +270,174 @@ def test_log_euclidean_scalar_uses_h_over_sigma_chart_tangent() -> None:
     expected = sigma * torch.exp(tangent / sigma)
 
     assert torch.allclose(out, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_regime_ii_soft_cap_is_finite_before_squaring() -> None:
+    group = get_group("glk")(2)
+    n_gen = group.generators.shape[0]
+    phi = torch.zeros(1, 2, n_gen)
+    mu = torch.tensor([[[1.0, 0.0], [1.0, 0.0]]])
+    connection_W = torch.zeros(n_gen, 2, 2)
+    connection_W[0, 0, 0] = 1.0e20
+    connection_W.requires_grad_(True)
+
+    omega = get_transport("regime_ii")(
+        phi,
+        group,
+        mu=mu,
+        connection_W=connection_W,
+        cocycle_relaxation=1.0,
+        delta_soft_cap=12.0,
+    )["Omega"]
+    omega.sum().backward()
+
+    assert torch.isfinite(omega).all()
+    assert not torch.allclose(omega[0, 0, 1], torch.eye(2))
+    assert connection_W.grad is not None
+    assert torch.isfinite(connection_W.grad).all()
+
+
+def test_regime_ii_covariant_soft_cap_is_finite_before_squaring() -> None:
+    group = get_group("glk")(2)
+    n_gen = group.generators.shape[0]
+    phi = torch.zeros(1, 2, n_gen)
+    mu = torch.tensor([[[0.0, 0.0], [1.0, 0.0]]])
+    sigma = torch.ones(1, 2, 2)
+    connection_M = torch.zeros(n_gen, 3)
+    connection_M[0, 0] = 1.0e20
+    connection_M.requires_grad_(True)
+
+    omega = get_transport("regime_ii_covariant")(
+        phi,
+        group,
+        mu=mu,
+        sigma=sigma,
+        connection_M=connection_M,
+        cocycle_relaxation=1.0,
+        delta_soft_cap=12.0,
+    )["Omega"]
+    omega.sum().backward()
+
+    assert torch.isfinite(omega).all()
+    assert not torch.allclose(omega[0, 0, 1], torch.eye(2))
+    assert connection_M.grad is not None
+    assert torch.isfinite(connection_M.grad).all()
+
+
+def test_regime_ii_direct_link_soft_cap_is_finite_before_squaring() -> None:
+    group = get_group("glk")(2)
+    n_gen = group.generators.shape[0]
+    phi = torch.zeros(1, 2, n_gen)
+    connection_L = torch.zeros(2, 2, n_gen)
+    connection_L[0, 1, 0] = 1.0e20
+    connection_L[1, 0, 0] = 1.0e20
+    connection_L.requires_grad_(True)
+
+    omega = get_transport("regime_ii_link")(
+        phi,
+        group,
+        connection_L=connection_L,
+        link_alpha=1.0,
+        link_soft_cap=6.0,
+    )["Omega"]
+    omega.sum().backward()
+
+    assert torch.isfinite(omega).all()
+    assert not torch.allclose(omega[0, 1], torch.eye(2))
+    assert connection_L.grad is not None
+    assert torch.isfinite(connection_L.grad).all()
+
+
+def test_large_skew_dim_mode_matches_float64_matrix_exp() -> None:
+    matrix = torch.tensor([[0.0, 1000.0], [-1000.0, 0.0]])
+
+    exp_pos, exp_neg = stable_matrix_exp_pair(
+        matrix,
+        skew_symmetric=True,
+        max_norm=float("inf"),
+        exp_fp64_mode="dim",
+        exp_fp64_norm_threshold=5.0,
+    )
+    reference = torch.linalg.matrix_exp(matrix.double()).float()
+
+    assert torch.equal(exp_pos, reference)
+    assert torch.equal(exp_neg, reference.transpose(-1, -2))
+
+
+def test_small_skew_dim_mode_keeps_float32_identity() -> None:
+    matrix = torch.tensor([[0.0, 0.25], [-0.25, 0.0]])
+
+    exp_pos, exp_neg = stable_matrix_exp_pair(
+        matrix,
+        skew_symmetric=True,
+        max_norm=float("inf"),
+        exp_fp64_mode="dim",
+        exp_fp64_norm_threshold=5.0,
+    )
+    reference = torch.linalg.matrix_exp(matrix)
+
+    assert torch.equal(exp_pos, reference)
+    assert torch.equal(exp_neg, reference.transpose(-1, -2))
+
+
+def test_laplace_renyi_large_separation_has_finite_gradients() -> None:
+    mu_q = torch.tensor([[0.0]], requires_grad=True)
+    b_q = torch.tensor([[1.0]], requires_grad=True)
+    mu_p = torch.tensor([[2000.0]], requires_grad=True)
+    b_p = torch.tensor([[1.0]], requires_grad=True)
+
+    divergence = DiagonalLaplace(mu_q, b_q)._renyi_terms(
+        DiagonalLaplace(mu_p, b_p),
+        alpha=1.5,
+        eps=1e-6,
+    )
+    gradients = torch.autograd.grad(divergence.sum(), (mu_q, b_q, mu_p, b_p))
+
+    assert torch.isfinite(divergence).all()
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+def test_laplace_renyi_alpha_gt_one_matches_numerical_quadrature() -> None:
+    alpha = 1.5
+    mu_q = torch.tensor([[0.0]])
+    b_q = torch.tensor([[0.75]])
+    mu_p = torch.tensor([[2.0]])
+    b_p = torch.tensor([[1.0]])
+    got = DiagonalLaplace(mu_q, b_q)._renyi_terms(
+        DiagonalLaplace(mu_p, b_p),
+        alpha=alpha,
+        eps=1e-6,
+    ).double()
+
+    x = torch.linspace(-40.0, 40.0, 200_001, dtype=torch.float64)
+    log_q = -math.log(2.0 * float(b_q)) - (x - float(mu_q)).abs() / float(b_q)
+    log_p = -math.log(2.0 * float(b_p)) - (x - float(mu_p)).abs() / float(b_p)
+    integral = torch.trapezoid(torch.exp(alpha * log_q + (1.0 - alpha) * log_p), x)
+    expected = torch.log(integral) / (alpha - 1.0)
+
+    assert torch.allclose(got.squeeze(), expected, rtol=2e-5, atol=2e-5)
+
+
+def test_laplace_renyi_divergent_blend_clamps_without_poisoning_gradients() -> None:
+    kl_max = 123.0
+    mu_q = torch.tensor([[0.0, 0.0]], requires_grad=True)
+    b_q = torch.tensor([[1.0, 4.0]], requires_grad=True)
+    mu_p = torch.tensor([[2.0, 2000.0]])
+    b_p = torch.ones(1, 2)
+
+    got = DiagonalLaplace(mu_q, b_q).renyi_per_coord(
+        DiagonalLaplace(mu_p, b_p),
+        alpha=1.5,
+        kl_max=kl_max,
+    )
+    good = DiagonalLaplace(mu_q[:, :1], b_q[:, :1]).renyi_per_coord(
+        DiagonalLaplace(mu_p[:, :1], b_p[:, :1]),
+        alpha=1.5,
+        kl_max=kl_max,
+    )
+    got.sum().backward()
+
+    assert torch.equal(got[:, :1], good)
+    assert torch.equal(got[:, 1:], torch.full_like(got[:, 1:], kl_max))
+    assert mu_q.grad is not None and torch.isfinite(mu_q.grad).all()
+    assert b_q.grad is not None and torch.isfinite(b_q.grad).all()

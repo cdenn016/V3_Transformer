@@ -222,6 +222,24 @@ def gauge_invariant_edge_features(
     return feats.to(orig_dtype)                            # back to the caller's working dtype
 
 
+def _soft_cap_frobenius(
+    matrix: torch.Tensor,             # (..., K, K) embedded Lie-algebra matrices
+
+    *,
+    max_norm: float,
+) -> torch.Tensor:
+    r"""Smoothly cap each matrix as $M / \sqrt{1 + \lVert M\rVert_F^2 / c^2}$.
+
+    The norm algebra runs in float64 before squaring so a finite float32 ``M`` cannot overflow
+    ``||M||_F^2`` and spuriously collapse the capped matrix to zero. The result returns to the
+    caller's working dtype; the float64 island remains differentiable.
+    """
+    matrix64 = matrix.double()
+    fro_sq64 = matrix64.square().sum(dim=(-2, -1), keepdim=True)
+    scale64  = torch.rsqrt(1.0 + fro_sq64 / (max_norm * max_norm))
+    return (matrix64 * scale64).to(matrix.dtype)
+
+
 @register_transport("flat")
 def _build_flat(
     phi:        torch.Tensor,             # (B, N, n_gen) gauge frames
@@ -377,8 +395,7 @@ def _build_regime_ii(
         # keeps the cap's gradient finite at delta_mat=0 (the W=0 oracle and d Omega/d W at W=0
         # are untouched -- the zero-norm NaN-grad trap) and the map is STRICTLY monotone in
         # cocycle_relaxation (the homotopy never saturates).
-        fro_sq      = delta_mat_c.pow(2).sum(dim=(-2, -1), keepdim=True)
-        delta_mat_c = delta_mat_c * torch.rsqrt(1.0 + fro_sq / (delta_soft_cap * delta_soft_cap))
+        delta_mat_c = _soft_cap_frobenius(delta_mat_c, max_norm=delta_soft_cap)
         # Per-edge group element exp(delta_ij . G); reuse the stable block-exp machinery
         # (only_forward: the edge factor enters Omega once, no exp(-delta) needed). exp_dim keys
         # the float64-island decision on the per-head block actually exponentiated (audit
@@ -548,8 +565,7 @@ def _build_regime_ii_covariant(
         delta_mat_c = torch.einsum("bija,akl->bijkl", delta_c, generators)     # (B, C, N, K, K) Lie-algebra edge
         # Smooth per-edge Frobenius cap on the embedded operator (same safeguard / squared-norm-no-sqrt
         # finite-grad-at-zero trick as regime_ii); keeps stable_matrix_exp_pair on the EXACT operator.
-        fro_sq      = delta_mat_c.pow(2).sum(dim=(-2, -1), keepdim=True)
-        delta_mat_c = delta_mat_c * torch.rsqrt(1.0 + fro_sq / (delta_soft_cap * delta_soft_cap))
+        delta_mat_c = _soft_cap_frobenius(delta_mat_c, max_norm=delta_soft_cap)
 
         exp_delta_c, _ = stable_matrix_exp_pair(
             delta_mat_c, skew_symmetric=group.skew_symmetric, only_forward=True,
@@ -607,8 +623,7 @@ def _direct_link_edge_exp(
         link_coord = link_coord.masked_fill(eye_N.view(n_tok, n_tok, 1), 0.0)      # self-edge -> I
         generators = group.generators.to(device=device, dtype=torch.float32)
         link_mat = torch.einsum("ija,akl->ijkl", link_coord, generators)           # (N,N,K,K) Lie-algebra edge
-        fro_sq = link_mat.pow(2).sum(dim=(-2, -1), keepdim=True)
-        link_mat = link_mat * torch.rsqrt(1.0 + fro_sq / (link_soft_cap * link_soft_cap))
+        link_mat = _soft_cap_frobenius(link_mat, max_norm=link_soft_cap)
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     exp_link, _ = stable_matrix_exp_pair(
         link_mat, skew_symmetric=group.skew_symmetric, only_forward=True,
@@ -840,7 +855,11 @@ def stable_matrix_exp_pair(
         # drop to float32 and drift from the full exp. exp_dim (when given) overrides the keying
         # dimension -- see the docstring.
         d_eff = exp_dim if exp_dim is not None else d
-        up_dtype = torch.float64 if d_eff >= dim_threshold else torch.float32
+        with torch.no_grad():
+            large_skew = skew_symmetric and bool(
+                (mat_norm * scale).max() >= exp_fp64_norm_threshold
+            )
+        up_dtype = torch.float64 if d_eff >= dim_threshold or large_skew else torch.float32
     else:
         raise ValueError(f"exp_fp64_mode must be 'dim' or 'norm', got {exp_fp64_mode!r}")
 
