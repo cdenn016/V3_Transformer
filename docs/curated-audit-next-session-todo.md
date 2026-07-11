@@ -101,8 +101,9 @@ Verify that no configured value changed, the pure path remains available, and th
 - O8 functional review-close commit: `ca64a90`.
 - Feature branch: `fix/curated-audit-salvage-20260709`.
 - Feature worktree: `C:\tmp\V3_Transformer_curated_audit_salvage_20260709`.
-- Feature branch final pre-merge SHA: `<fill after TODO commit>`.
-- Merge worktree/branch: `<fill after integration>`.
-- Merge commit: `<fill after integration>`.
-- Final `origin/main`: `<fill after integration>`.
-- Final remote feature branch: `<fill after fast-forward>`.
+- Feature branch final pre-merge SHA: `f29eef8`.
+- Merge worktree/branch: `C:\tmp\V3_Transformer_curated_audit_merge_20260710` / `merge/curated-audit-salvage-20260710`.
+- Local merge commit: `801e878`.
+- Remote `origin/main`: remains `90f2361`; the environment rejected GitHub export because it could not verify whether the external repository was private/trusted, even after explicit user approval.
+- Remote feature branch: not created for the same approval-gate reason.
+- Local post-merge record tip: use `git log -1 main`; local `main` and `fix/curated-audit-salvage-20260709` were fast-forwarded to that same tip after this record was committed.
