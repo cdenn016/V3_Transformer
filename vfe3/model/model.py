@@ -215,7 +215,8 @@ class VFEModel(nn.Module):
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             lambda_h=cfg.lambda_h, lambda_gamma=cfg.lambda_gamma,
-            prior_source=cfg.prior_source, s_e_step=cfg.s_e_step,
+            prior_source=cfg.prior_source, s_frame_mode=cfg.s_frame_mode,
+            s_e_step=cfg.s_e_step,
             # r is a GRADIENT leaf only under r_update_mode='gradient'; under 'barycenter' it is
             # set in-place each M-step by the closed-form barycenter (PriorBank.barycenter_r_,
             # driven from train_step) and so must stay ungrouped/requires_grad=False.
@@ -419,6 +420,8 @@ class VFEModel(nn.Module):
             _g = torch.Generator().manual_seed(int(cfg.seed))
             self.pos_phi_free = nn.Parameter(
                 torch.randn(cfg.max_seq_len, n_gen, generator=_g) * cfg.pos_phi_scale)
+            if cfg.s_frame_mode == "phi_tilde":
+                self.s_pos_phi_free = nn.Parameter(self.pos_phi_free.detach().clone())
             if cfg.effective_e_step_gradient in ("detach", "straight_through"):
                 # Footgun (mirrors connection_W): pos_phi_free enters the loss ONLY
                 # through the E-step belief transport. The 'detach' and 'straight_through' estimators

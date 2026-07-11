@@ -156,6 +156,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                               #   | "frozen" (random fixed frame: e_phi_lr=m_phi_lr=0, phi_scale kept).
                                               #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
+    s_frame_mode              = "tied",       # "tied" | "phi_tilde" (independent model frame, default off)
     
     
     omega_retract_mode        = "lie_exp",  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
@@ -319,6 +320,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     m_p_mu_lr                 = 0.0125,   
     m_p_sigma_lr              = 0.01,     
     m_phi_lr                  = 0.010,   
+    m_s_phi_lr                = 0.016,          # model-frame M-step LR (inert while s_frame_mode="tied")
     
     weight_decay              = 0.02,
     phi_weight_decay          = 0.05,
@@ -1180,6 +1182,27 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
         "param": "m_phi_lr", "values": [0.0075, 0.009, 0.01, 0.0115],
+    },
+
+    "s_frame_mode": {
+        "description": "model-channel gauge frame: tied belief phi vs independent phi_tilde",
+        "param": "s_frame_mode", "values": ["tied", "phi_tilde"],
+        "requires": {
+            "s_e_step": True,
+            "prior_source": "model_channel",
+            "share_refine_s_transport": False,
+        },
+    },
+
+    "m_s_phi_lr": {
+        "description": "M-step LR for the independent phi_tilde model frame",
+        "param": "m_s_phi_lr", "values": [0.004, 0.008, 0.016, 0.032],
+        "requires": {
+            "s_frame_mode": "phi_tilde",
+            "s_e_step": True,
+            "prior_source": "model_channel",
+            "share_refine_s_transport": False,
+        },
     },
     
     

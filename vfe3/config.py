@@ -21,6 +21,7 @@ from typing import Any, List, Mapping, Optional, Tuple
 # use_prior_bank / are NotImplementedError second-gates after the registry check). The static
 # tuples below are the remaining seams WITHOUT a registry.
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
+_VALID_S_FRAME_MODES       = ("tied", "phi_tilde")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_PRIOR_SOURCES       = ("token", "model_channel")
 _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
@@ -94,6 +95,7 @@ class VFE3Config:
     # gauge seam
     gauge_group:               str   = "block_glk"
     gauge_parameterization:    str   = "phi"          # 'phi' (exp(phi.G), the pure default) | 'omega_direct' (store U in GL(K); glk/block_glk, transport_mode='flat', e_phi_lr=0)
+    s_frame_mode:              str   = "tied"         # 'tied' (reuse belief phi) | 'phi_tilde' (independent model phi)
 
     # gauge_transport: ablation meta-toggle over the GL(K) gauge FRAME (the A1 / EXP-2 gauge on/off/
     # frozen experiment; docs/hypotheses/2026-06-21-hypotheses.md). DISTINCT from transport_mode below
@@ -542,6 +544,7 @@ class VFE3Config:
     m_p_mu_lr:                 float = 0.025
     m_p_sigma_lr:              float = 0.0025
     m_phi_lr:                  float = 0.015
+    m_s_phi_lr:                float = 0.015
     
     
     # Geometrically-correct gauge M-step (opt-in, default OFF -> plain AdamW on phi_embed/pos_phi_free).
@@ -994,6 +997,35 @@ class VFE3Config:
                 f"block_glk/tied_block_glk with n_heads >= 2, or an so_n/sp_n irrep tower."
             )
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
+        _require(self.s_frame_mode, _VALID_S_FRAME_MODES, "s_frame_mode")
+        if self.s_frame_mode == "phi_tilde":
+            if self.gauge_parameterization != "phi":
+                raise ValueError(
+                    "s_frame_mode='phi_tilde' requires gauge_parameterization='phi'; "
+                    f"got {self.gauge_parameterization!r}."
+                )
+            if not self.s_e_step:
+                raise ValueError("s_frame_mode='phi_tilde' requires s_e_step=True.")
+            if self.prior_source != "model_channel":
+                raise ValueError(
+                    "s_frame_mode='phi_tilde' requires prior_source='model_channel'; "
+                    f"got {self.prior_source!r}."
+                )
+            if self.share_refine_s_transport:
+                raise ValueError(
+                    "s_frame_mode='phi_tilde' requires share_refine_s_transport=False because "
+                    "the belief and model frames have distinct parameter graphs."
+                )
+            if self.phi_reflection != "off":
+                raise ValueError(
+                    "s_frame_mode='phi_tilde' currently requires phi_reflection='off'; "
+                    f"got {self.phi_reflection!r}."
+                )
+            if self.pos_rotation != "none":
+                raise ValueError(
+                    "s_frame_mode='phi_tilde' currently requires pos_rotation='none'; "
+                    f"got {self.pos_rotation!r}."
+                )
         # transport_mode selects the connection REGIME. Validated against the transport REGISTRY
         # (not a hardcoded literal list) so a newly registered regime is a valid config value
         # without editing this validator. Default 'flat' is the Regime-I phi-cocycle (the pure path
@@ -2111,6 +2143,24 @@ class VFE3Config:
                 f"'detach'. Set detach_e_step=False and use e_step_gradient to select the mode, "
                 f"or leave e_step_gradient='unroll'."
             )
+        if self.s_frame_mode == "phi_tilde":
+            if self.effective_e_step_gradient in ("detach", "straight_through"):
+                import warnings
+                warnings.warn(
+                    f"s_frame_mode='phi_tilde' with effective E-step estimator "
+                    f"{self.effective_e_step_gradient!r} severs the model-frame training path "
+                    "through _refine_s; use e_step_gradient='unroll' to train phi_tilde.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            if self.m_s_phi_lr == 0.0:
+                import warnings
+                warnings.warn(
+                    "s_frame_mode='phi_tilde' with m_s_phi_lr=0 freezes the independent model "
+                    "frame at its cloned initialization.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         # Both 'straight_through' and 'detach' sever the per-iteration E-step tangent, so a learnable
         # parameter whose only loss path IS that tangent receives no gradient and silently freezes.
         # (detach_e_step=True also detaches but is forced to e_step_gradient='unroll' here and is warned
@@ -2249,7 +2299,7 @@ class VFE3Config:
             raise ValueError(f"mu_trust_mode must be 'box' or 'ball', got {self.mu_trust_mode!r}")
         if self.e_step_mu_precond not in ("fisher", "raw"):
             raise ValueError(f"e_step_mu_precond must be 'fisher' or 'raw', got {self.e_step_mu_precond!r}")
-        for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr", "min_lr_frac"):
+        for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "m_s_phi_lr", "weight_decay", "phi_weight_decay", "min_lr", "min_lr_frac"):
             v = getattr(self, name)
             if v < 0.0 or v != v:                            # v != v rejects NaN (which passes < 0.0)
                 raise ValueError(f"{name} must be >= 0 (and not NaN), got {v}")

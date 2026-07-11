@@ -136,6 +136,7 @@ config = dict(
                                               #   | "frozen" (random fixed frame: e_phi_lr=m_phi_lr=0, phi_scale kept).
                                               #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
+    s_frame_mode              = "tied",       # "tied" | "phi_tilde" (independent model frame, default off)
     
     
     omega_retract_mode        = "lie_exp",  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
@@ -299,6 +300,7 @@ config = dict(
     m_p_mu_lr                 = 0.0125,   
     m_p_sigma_lr              = 0.003,     
     m_phi_lr                  = 0.016,   
+    m_s_phi_lr                = 0.016,          # model-frame M-step LR (inert while s_frame_mode="tied")
     
     weight_decay              = 0.02,
     phi_weight_decay          = 0.05,

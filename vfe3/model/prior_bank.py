@@ -179,6 +179,7 @@ class PriorBank(nn.Module):
         lambda_h:            float = 0.0,
         lambda_gamma:        float = 0.0,
         prior_source:        str   = "token",
+        s_frame_mode:        str   = "tied",
         s_e_step:            bool  = False,
         learnable_r:         bool  = False,
 
@@ -247,6 +248,7 @@ class PriorBank(nn.Module):
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
         self.prior_source = prior_source
+        self.s_frame_mode = s_frame_mode
         self.s_e_step = s_e_step
         self.unigram_kappa = unigram_kappa
         self.decode_unigram_prior = decode_unigram_prior
@@ -261,6 +263,8 @@ class PriorBank(nn.Module):
         self.mu_embed         = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
         self.sigma_log_embed  = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
         self.phi_embed        = nn.Parameter(phi_scale * torch.randn(vocab_size, n_gen))
+        if s_frame_mode == "phi_tilde":
+            self.s_phi_embed = nn.Parameter(self.phi_embed.detach().clone())
         self.decode_log_scale = nn.Parameter(torch.zeros(1))
 
         # Arm-2 control (encode_mode='per_token_additive'): a NON-structural use of the SAME learned
@@ -482,6 +486,13 @@ class PriorBank(nn.Module):
             self.s_sigma_log_embed[token_ids], eps=self.eps,
         )                                                                         # (B, N, K)
         return s_mu, s_sigma
+
+    def s_phi(
+        self,
+        token_ids: torch.Tensor,         # (B, N) integer token ids
+    ) -> torch.Tensor:                   # (B, N, n_gen) model-channel frame coordinates
+        r"""Look up the independently stored model-channel frame coordinates."""
+        return self.s_phi_embed[token_ids]
 
     @torch.no_grad()
     def barycenter_r_(self) -> None:
