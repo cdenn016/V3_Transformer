@@ -2092,8 +2092,9 @@ class VFEModel(nn.Module):
             link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             clamp_monitor=cfg.transport_clamp_monitor,
             cocycle_relaxation=cfg.cocycle_relaxation,
-            gauge_parameterization=(cfg.gauge_parameterization if out.omega is not None else "phi"),
+            gauge_parameterization=cfg.gauge_parameterization,
             omega=out.omega,                                          # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
+            reflection=out.reflection,                                # phi-path R_i Omega_ij R_j fold (None -> unchanged)
         )
         mu_tv = sigma_tv = None
         if rope is not None:
@@ -2208,7 +2209,7 @@ class VFEModel(nn.Module):
         # Active-frame health. Under omega_direct, ``phi`` is an inactive table and can disagree
         # arbitrarily with the stored element; derive every frame invariant from ``out.omega`` and do
         # not exponentiate inactive coordinates. Compact blocks are reduced directly as the represented
-        # block-diagonal element. The phi path below is unchanged.
+        # block-diagonal element. The phi path uses the active reflected vertex when present.
         if out.omega is not None:
             if isinstance(out.omega, CompactBlockElement):
                 active_blocks = out.omega.expanded_blocks()                    # (N,H,d,d)
@@ -2237,6 +2238,11 @@ class VFEModel(nn.Module):
                 metrics.gauge_trace_spread(out.phi, self.group.generators))
             active_vertex = compute_transport_operators(
                 out.phi.unsqueeze(0), self.group)["exp_phi"][0]                 # (N,K,K)
+            if out.reflection is not None:
+                # Active disconnected-component frame g_i = R_i exp(phi_i). Scaling row zero
+                # applies the left factor R_i = diag(sign_i, 1, ...) used by the transport fold.
+                active_vertex = active_vertex.clone()
+                active_vertex[..., 0, :] *= out.reflection[..., None]
             ginv = metrics.group_gauge_invariant(active_vertex, self.group).float()
             active_svd = torch.linalg.svdvals(active_vertex)
             vertex_cond = active_svd[..., 0] / active_svd[..., -1].clamp(min=cfg.eps)
@@ -2422,8 +2428,9 @@ class VFEModel(nn.Module):
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 clamp_monitor=cfg.transport_clamp_monitor,
                 cocycle_relaxation=cfg.cocycle_relaxation,
-                gauge_parameterization=(cfg.gauge_parameterization if belief.omega is not None else "phi"),
+                gauge_parameterization=cfg.gauge_parameterization,
                 omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
+                reflection=belief.reflection,                        # phi-path R_i Omega_ij R_j fold (None -> unchanged)
             )                                                        # (N, N, K, K)
             if rope is not None:
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
@@ -2547,8 +2554,9 @@ class VFEModel(nn.Module):
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 clamp_monitor=cfg.transport_clamp_monitor,
                 cocycle_relaxation=cfg.cocycle_relaxation,
-                gauge_parameterization=(cfg.gauge_parameterization if belief.omega is not None else "phi"),
+                gauge_parameterization=cfg.gauge_parameterization,
                 omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
+                reflection=belief.reflection,                        # phi-path R_i Omega_ij R_j fold (None -> unchanged)
             )
             mu_tv = sigma_tv = None
             if rope is not None:
@@ -2623,6 +2631,9 @@ class VFEModel(nn.Module):
                     metrics.gauge_trace_spread(belief.phi, self.group.generators)))
                 active_vertex = compute_transport_operators(
                     belief.phi.unsqueeze(0), self.group)["exp_phi"][0]
+                if belief.reflection is not None:
+                    active_vertex = active_vertex.clone()
+                    active_vertex[..., 0, :] *= belief.reflection[..., None]
                 active_invariant = metrics.group_gauge_invariant(
                     active_vertex, self.group).float()
             rec["gauge_invariant_spread"].append(

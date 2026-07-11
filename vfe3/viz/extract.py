@@ -27,7 +27,9 @@ from vfe3.free_energy import (
 from vfe3.inference.e_step import _transport, e_step_iteration, free_energy_value
 # Transport-mode state-routing sets (registry metadata, as model.py): the extractors below feed
 # mu/sigma to _transport by membership here, never by matching literal mode names.
-from vfe3.geometry.transport import _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA, transport_covariance, transport_mean
+from vfe3.geometry.lie_ops import CompactBlockElement
+from vfe3.geometry.transport import (CompactFactoredTransport, _TRANSPORT_NEEDS_MU,
+                                     _TRANSPORT_NEEDS_SIGMA, transport_covariance, transport_mean)
 from vfe3.model.block import vfe_block
 from vfe3.numerics import bounded_variance_from_log
 
@@ -44,8 +46,11 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
     ``diagnostics`` do -- the callers' ``mu_p = belief.mu`` handoff then anchors to the refined s,
     so every extracted trajectory/figure describes the model that actually trained."""
     enc = model.prior_bank.encode(token_ids[:1])                  # (1, N, ...)
-    belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=model._apply_pos_phi(enc.phi[0]),
-                         omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
+    belief = BeliefState(
+        mu=enc.mu[0], sigma=enc.sigma[0], phi=model._apply_pos_phi(enc.phi[0]),
+        omega=enc.omega[0] if enc.omega is not None else None,       # omega-direct GL(K) frame
+        reflection=enc.reflection[0] if enc.reflection is not None else None,   # phi-path sign
+    )
     n = belief.mu.shape[0]
     rope = model._rope_rotation(n, token_ids.device)
     s_belief = None
@@ -58,6 +63,7 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
     if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
         log_prior = model._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
                                             omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
+                                            reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None,
                                             s_belief=s_belief)[0]
     return belief, log_prior, rope                                    # forward's beliefs.sigma (model.py:762)
 
@@ -79,6 +85,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         family=cfg.family, divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
+        gauge_parameterization=cfg.gauge_parameterization,
         cocycle_relaxation=cfg.cocycle_relaxation, connection_W=getattr(model, "connection_W", None),
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
@@ -100,7 +107,8 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
         lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
         include_attention_entropy=cfg.include_attention_entropy, family=cfg.family,
         divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
-        transport_mode=cfg.transport_mode, cocycle_relaxation=cfg.cocycle_relaxation,
+        transport_mode=cfg.transport_mode, gauge_parameterization=cfg.gauge_parameterization,
+        cocycle_relaxation=cfg.cocycle_relaxation,
         link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
         log_prior=log_prior,
         connection_W=getattr(model, "connection_W", None),
@@ -219,6 +227,7 @@ def belief_ce_bank(
             if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
                 log_prior = model._fold_gamma_prior(log_prior, tokens, beliefs.phi,
                                                     omega=beliefs.omega if beliefs.omega is not None else None,
+                                                    reflection=beliefs.reflection if beliefs.reflection is not None else None,
                                                     s_belief=s_belief)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
@@ -230,6 +239,7 @@ def belief_ce_bank(
                 connection_M=getattr(model, "connection_M", None),
                 connection_L=getattr(model, "connection_L", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                gauge_parameterization=cfg.gauge_parameterization,
             )
             trs = metrics.sigma_trace(out.sigma, diagonal=cfg.diagonal_covariance).reshape(-1)   # (B*N,)
             tgt = targets.reshape(-1)
@@ -295,6 +305,7 @@ def belief_bank(
             if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
                 log_prior = model._fold_gamma_prior(log_prior, tokens, beliefs.phi,
                                                     omega=beliefs.omega if beliefs.omega is not None else None,
+                                                    reflection=beliefs.reflection if beliefs.reflection is not None else None,
                                                     s_belief=s_belief)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
@@ -306,6 +317,7 @@ def belief_bank(
                 connection_M=getattr(model, "connection_M", None),
                 connection_L=getattr(model, "connection_L", None),
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                gauge_parameterization=cfg.gauge_parameterization,
             )
             b = tokens.shape[0]
             mus.append(out.mu.reshape(b * n, -1))
@@ -394,6 +406,7 @@ def across_layer_belief_trace(
             connection_M=getattr(model, "connection_M", None),
             connection_L=getattr(model, "connection_L", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+            gauge_parameterization=cfg.gauge_parameterization,
         )
         mus.append(belief.mu)
         sigmas.append(belief.sigma)
@@ -436,6 +449,9 @@ def numerical_health(
     # described a flat-transport belief, not the model that trained. Mirrors converged_state.
     omega = _transport(
         out.phi, model.group, transport_mode=cfg.transport_mode,
+        gauge_parameterization=cfg.gauge_parameterization,
+        omega=out.omega,
+        reflection=out.reflection,
         mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
         sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
         connection_W=getattr(model, "connection_W", None),
@@ -492,9 +508,9 @@ def converged_state(
     connection_W, rope, family, divergence, alpha) but returns the underlying tensors the scalar
     diagnostics discard. The gauge-equivariance certificate, per-head gauge invariants, belief
     spectrum / SPD ellipses, and the guard-saturation / causal panels all read from these. Returns
-    the converged ``mu`` (N, K), ``sigma`` (N, K) or (N, K, K), ``phi`` (N, n_gen), the per-token
-    vertex factor ``exp_phi`` (N, K, K) = exp(embed(phi_i)), the pre-rope pairwise transport
-    ``omega`` (N, N, K, K) (the phi-cocycle the equivariance/holonomy metrics co-transform),
+    the converged ``mu`` (N, K), ``sigma`` (N, K) or (N, K, K), ``phi`` (N, n_gen), the active
+    per-token vertex factor under the compatibility key ``exp_phi`` (N, K, K), and the dense pre-rope
+    pairwise transport ``omega`` (N, N, K, K) that the equivariance/holonomy metrics consume,
     the pairwise ``energy`` and attention ``beta`` ((N, N) or (H, N, N)), and the per-token
     self-divergence ``self_div`` (N,) or (N, K).
     """
@@ -518,14 +534,18 @@ def converged_state(
             connection_L=getattr(model, "connection_L", None),
             rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
             capture=cap,
+            gauge_parameterization=cfg.gauge_parameterization,
         )
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma     # rebuild last-block prior
         mu_p, sigma_p = belief.mu, belief.sigma                         # exact iff L==1 or rho==0
         for _ in range(cfg.n_layers - 1):
             mu_p = (1.0 - rho) * mu_p + rho * out.mu
             sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
-        omega = _transport(                                            # (N, N, K, K) phi-cocycle (pre-rope)
+        omega = _transport(                                            # active pairwise transport (pre-rope)
             out.phi, model.group, transport_mode=cfg.transport_mode,
+            gauge_parameterization=cfg.gauge_parameterization,
+            omega=out.omega,
+            reflection=out.reflection,
             mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
             sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
             connection_W=getattr(model, "connection_W", None),
@@ -555,7 +575,21 @@ def converged_state(
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
             lambda_alpha_mode=cfg.lambda_alpha_mode,
         )
-        exp_phi = compute_transport_operators(out.phi.unsqueeze(0), model.group)["exp_phi"][0]
+        if out.omega is not None:
+            # Report compatibility: retain the historical ``exp_phi`` key while exposing the ACTIVE
+            # omega-direct vertex frame. Compact storage stays compact through inference and is made
+            # dense only at this explicit, off-hot-path figure boundary.
+            exp_phi = out.omega.to_dense() if isinstance(out.omega, CompactBlockElement) else out.omega
+        else:
+            exp_phi = compute_transport_operators(out.phi.unsqueeze(0), model.group)["exp_phi"][0]
+            if out.reflection is not None:
+                # Active phi-path vertex factor g_i = R_i exp(phi_i); scaling row zero applies the
+                # left reflection R_i = diag(sign_i, 1, ...), exactly matching _transport's fold.
+                exp_phi = exp_phi.clone()
+                exp_phi[..., 0, :] *= out.reflection[..., None]
+        # ``report.py`` has legacy dense consumers (gauge-equivariance and curvature-field panels).
+        # Preserve their public tensor contract without forcing live inference to densify compact U.
+        omega_dense = omega.to_dense_omega() if isinstance(omega, CompactFactoredTransport) else omega
     finally:
         if was_training:
             model.train()
@@ -564,7 +598,7 @@ def converged_state(
         "sigma":    out.sigma,
         "phi":      out.phi,
         "exp_phi":  exp_phi,
-        "omega":    omega,
+        "omega":    omega_dense,
         "energy":   energy,
         "beta":     beta,
         "self_div": self_div,
@@ -604,6 +638,9 @@ def attention_entropy_cov_gap(
             out = e_step_iteration(out, mu_p, sigma_p, model.group, **ikw)
         omega = _transport(
             out.phi, model.group, transport_mode=cfg.transport_mode,
+            gauge_parameterization=cfg.gauge_parameterization,
+            omega=out.omega,
+            reflection=out.reflection,
             mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
             sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
             connection_W=getattr(model, "connection_W", None),

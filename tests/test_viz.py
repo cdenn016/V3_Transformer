@@ -530,6 +530,204 @@ def test_plot_numerical_trust_saves(tmp_path):
     assert _saved_nonempty(p)
 
 
+# --- extractor replay fidelity across gauge parameterizations ---
+
+def _replay_model(*, gauge_parameterization="phi", **over):
+    base = dict(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=1,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=2,
+        gauge_group="glk",
+        family="gaussian_full",
+        transport_mode="flat",
+        pos_rotation="none",
+        use_head_mixer=False,
+        use_prior_bank=True,
+        decode_mode="full",
+        pos_phi="none",
+        e_phi_lr=0.0,
+        gauge_parameterization=gauge_parameterization,
+    )
+    base.update(over)
+    torch.manual_seed(31)
+    model = VFEModel(VFE3Config(**base))
+    model.eval()
+    if gauge_parameterization == "omega_direct":
+        with torch.no_grad():
+            model.prior_bank.phi_embed.zero_()                    # inactive chart: identity cocycle
+            frames = torch.eye(4).expand(base["vocab_size"], 4, 4).clone()
+            index = torch.arange(base["vocab_size"], dtype=frames.dtype)
+            frames[:, 0, 0] = 1.0 + 0.12 * index                  # invertible triangular frames
+            frames[:, 0, 1] = 0.07 * index
+            model.prior_bank.omega_embed.copy_(frames)
+    return model
+
+
+def _raw_forward_belief(model, tokens):
+    capture = {}
+    with torch.no_grad():
+        model.forward_beliefs(tokens, capture=capture)
+    return capture["out"]
+
+
+def test_converged_state_omega_direct_uses_stored_frame():
+    from vfe3.geometry.transport import build_transport_from_element, compute_transport_operators
+
+    model = _replay_model(gauge_parameterization="omega_direct")
+    tokens = torch.tensor([[0, 1, 2, 3]])
+    forward = _raw_forward_belief(model, tokens)
+    state = extract.converged_state(model, tokens)
+
+    stored = forward.omega[0]
+    expected = build_transport_from_element(stored, model.group)["Omega"]
+    phi_path = compute_transport_operators(
+        state["phi"].unsqueeze(0), model.group)["Omega"][0]
+
+    assert torch.allclose(state["mu"], forward.mu[0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(state["sigma"], forward.sigma[0], atol=1e-5, rtol=1e-5)
+    assert torch.equal(state["exp_phi"], stored)                  # compatibility key, active U_i
+    assert torch.allclose(state["omega"], expected, atol=1e-6, rtol=1e-6)
+    assert (expected - phi_path).abs().max().item() > 1e-3       # fails if replay falls through phi
+
+
+def test_omega_direct_iterative_extractors_match_forward_transport():
+    from vfe3.inference.e_step import free_energy_value
+
+    model = _replay_model(gauge_parameterization="omega_direct")
+    tokens = torch.tensor([[0, 1, 2, 3]])
+    forward = _raw_forward_belief(model, tokens)
+
+    trace = extract.e_step_belief_trace(model, tokens)
+    layers = extract.across_layer_belief_trace(model, tokens)
+    bank = extract.belief_bank(model, [tokens])
+
+    assert torch.allclose(trace["mu"][-1], forward.mu[0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(trace["sigma"][-1], forward.sigma[0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(layers["mu"][-1], forward.mu[0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(layers["sigma"][-1], forward.sigma[0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(bank["mu"], forward.mu.reshape(4, 4), atol=1e-5, rtol=1e-5)
+    assert torch.allclose(bank["sigma"], forward.sigma.reshape(4, 4, 4), atol=1e-5, rtol=1e-5)
+
+    initial, log_prior, rope = extract._encode_one(model, tokens)
+    fkw = extract._fe_kwargs(model, log_prior, rope)
+    assert fkw.pop("gauge_parameterization") == "omega_direct"
+    final = initial._replace(
+        mu=trace["mu"][-1], sigma=trace["sigma"][-1], phi=trace["phi"][-1])
+    expected_f = free_energy_value(
+        final, initial.mu, initial.sigma, model.group,
+        gauge_parameterization="omega_direct", **fkw)
+    phi_f = free_energy_value(
+        final, initial.mu, initial.sigma, model.group,
+        gauge_parameterization="phi", **fkw)
+    assert torch.allclose(trace["free_energy"][-1], expected_f, atol=1e-5, rtol=1e-5)
+    assert (expected_f - phi_f).abs().item() > 1e-4
+
+
+def test_phi_extractors_remain_unchanged(monkeypatch):
+    import vfe3.inference.e_step as e_step_module
+
+    from vfe3.geometry.transport import compute_transport_operators
+    from vfe3.inference.e_step import _transport
+
+    model = _replay_model()
+    tokens = torch.tensor([[0, 1, 2, 3]])
+    forward = _raw_forward_belief(model, tokens)
+    state = extract.converged_state(model, tokens)
+    built = compute_transport_operators(state["phi"].unsqueeze(0), model.group)
+
+    assert torch.allclose(state["mu"], forward.mu[0], atol=1e-5, rtol=1e-5)
+    assert torch.equal(state["exp_phi"], built["exp_phi"][0])
+    assert torch.equal(state["omega"], built["Omega"][0])
+    belief, log_prior, rope = extract._encode_one(model, tokens)
+    assert belief.omega is None and belief.reflection is None
+    assert extract._iter_kwargs(model, log_prior, rope)["gauge_parameterization"] == "phi"
+    assert extract._fe_kwargs(model, log_prior, rope)["gauge_parameterization"] == "phi"
+
+    reflected = _replay_model(phi_reflection="init_seed")
+    reflected_forward = _raw_forward_belief(reflected, tokens)
+    reflected_state = extract.converged_state(reflected, tokens)
+    initial, _, _ = extract._encode_one(reflected, tokens)
+    encoded = reflected.prior_bank.encode(tokens)
+    assert torch.equal(initial.reflection, encoded.reflection[0])
+    expected = _transport(
+        reflected_state["phi"], reflected.group,
+        gauge_parameterization="phi", reflection=initial.reflection)
+    unreflected = _transport(
+        reflected_state["phi"], reflected.group, gauge_parameterization="phi")
+    active = compute_transport_operators(
+        reflected_state["phi"].unsqueeze(0), reflected.group)["exp_phi"][0].clone()
+    active[..., 0, :] *= initial.reflection[..., None]
+    assert torch.allclose(reflected_state["mu"], reflected_forward.mu[0], atol=1e-5, rtol=1e-5)
+    assert torch.equal(reflected_state["exp_phi"], active)
+    assert torch.allclose(reflected_state["omega"], expected, atol=1e-6, rtol=1e-6)
+    assert (expected - unreflected).abs().max().item() > 1e-3
+
+    # The model's three unbatched diagnostic replays are sibling report surfaces. Spy on their
+    # actual import seam and compare each reflected operator with an unreflected counterfactual at
+    # the SAME converged belief, so merely observing different model outputs cannot pass vacuously.
+    real_transport = e_step_module._transport
+    diagnostic_calls = []
+
+    def transport_spy(phi, group, **kwargs):
+        got = real_transport(phi, group, **kwargs)
+        if "gauge_parameterization" in kwargs and "omega" in kwargs:
+            counterfactual_kwargs = dict(kwargs)
+            counterfactual_kwargs["reflection"] = None
+            unreflected_got = real_transport(phi, group, **counterfactual_kwargs)
+            diagnostic_calls.append({
+                "gauge_parameterization": kwargs["gauge_parameterization"],
+                "omega": kwargs["omega"],
+                "reflection": kwargs.get("reflection"),
+                "reflection_effect": float((got - unreflected_got).abs().max()),
+            })
+        return got
+
+    monkeypatch.setattr(e_step_module, "_transport", transport_spy)
+    diagnostic_replays = (
+        ("diagnostics", lambda: reflected.diagnostics(tokens)),
+        ("attention_maps", lambda: reflected.attention_maps(tokens)),
+        ("diagnostics_per_layer", lambda: reflected.diagnostics_per_layer(tokens)),
+    )
+    for name, replay in diagnostic_replays:
+        before = len(diagnostic_calls)
+        assert replay() is not None, name
+        calls = diagnostic_calls[before:]
+        assert len(calls) == 1, (name, calls)
+        call = calls[0]
+        assert call["gauge_parameterization"] == "phi", name
+        assert call["omega"] is None, name
+        assert torch.equal(call["reflection"], initial.reflection), name
+        assert call["reflection_effect"] > 1e-3, name
+
+
+def test_reflected_so_frame_drives_model_gauge_invariants():
+    from vfe3 import metrics
+
+    model = _replay_model(gauge_group="so_k", phi_reflection="init_seed")
+    tokens = torch.tensor([[0, 1, 2, 3]])
+    with torch.no_grad():
+        model.prior_bank.phi_embed.zero_()                        # exp(phi_i) = I exactly
+
+    signs = model.prior_bank.encode(tokens).reflection[0]
+    active = torch.eye(4).expand(4, 4, 4).clone()
+    active[..., 0, :] *= signs[..., None]                         # R_i exp(0) = R_i
+    expected = metrics.group_gauge_invariant(active, model.group).float()
+    unreflected = metrics.group_gauge_invariant(
+        torch.eye(4).expand_as(active), model.group).float()
+    assert (expected - unreflected).abs().max().item() > 1.0      # disconnected sector is visible
+
+    diagnostics = model.diagnostics(tokens)
+    per_layer = model.diagnostics_per_layer(tokens)
+    expected_mean = float(expected.mean())
+    expected_spread = float(expected.std(unbiased=False))
+    assert diagnostics["gauge_invariant_mean"] == pytest.approx(expected_mean, abs=1e-6)
+    assert diagnostics["gauge_invariant_spread"] == pytest.approx(expected_spread, abs=1e-6)
+    assert per_layer["gauge_invariant_spread"] == pytest.approx([expected_spread], abs=1e-6)
+
+
 # --- vocabulary next-token probability figures (extractors + the four arm-list plotters) ---
 
 def _vocab_model(**kw):
