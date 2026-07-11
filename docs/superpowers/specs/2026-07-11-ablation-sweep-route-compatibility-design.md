@@ -1,7 +1,7 @@
 # Design: Ablation Sweep Route Compatibility
 
 Date: 2026-07-11
-Status: approved for implementation
+Status: implemented and verified
 Branch: `codex/ablation-sweep-route-20260711`
 Base: `origin/main` at `ecc128966087cbba6471c028cfe2076d78d73b84`
 
