@@ -133,8 +133,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.008,
-    decode_mode               = 'diagonal_chunked',   #"expected_likelihood_chunked" diagonal_chunked
+    decode_mode               = 'diagonal_chunked',  #"full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "diagonal_untied", "full"
     encode_mode               = "per_token",   #"per_token_additive"
+    
     
     oracle_unroll_grad        = False,
     
@@ -152,13 +153,16 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     omega_retract_mode        = "lie_exp",  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
     omega_reflection           = "off",      # omega_direct det<0 seeding: 'off' (det>0 only) | 'init_seed' | 'metropolis'
     omega_metropolis_temperature  = 1.0 ,   # T in the metropolis det-sign accept min(1, exp(-dF/T)); >0
-    omega_metropolis_every        = 1,       # cadence in optimizer steps for the metropolis det-sign sweep; >=1
+    omega_metropolis_every        = 100,       # cadence in optimizer steps for the metropolis det-sign sweep; >=1
+   
     # (counts train-loop iterations, 1:1 with optimizer steps INCLUDING under grad_accum_steps>1,
     # which chunks intra-step -- see vfe3/train.py::train_step docstring; diverges only when a step's
     # update is dropped by the NaN/Inf skip_step guard, see spec Sec.4)
     omega_compact_storage        = False,     # opt-in compact (V,H,d,d)/(V,d,d) block storage (equal-block groups)
     omega_reorth_every            = 0 ,        # SO-group re-orthogonalization cadence in M-steps (0 = off)
     phi_reflection               = "off",      # phi-path det<0 via R*exp(phi): 'off' (default) | 'init_seed' | 'metropolis'; reuses omega_metropolis_temperature/every
+    
+    
     
     
     m_phi_natural_grad        = False,        # natural gradient on phi m-step
@@ -291,9 +295,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     # and prior_source = 'model_channel'
     ####################################
     
-    r_update_mode             = "gradient",         # "gradient" (AdamW M-step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
+    r_update_mode             = "gradient",          # "gradient" (AdamW M-step; correct under s_e_step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
     prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"
-    learnable_r               = True,               # un-freeze hyper-prior centroid r (empirical-Bayes)
+    learnable_r               = False,               # un-freeze hyper-prior centroid r (empirical-Bayes)
     s_e_step                  = True,
     
     e_s_mu_lr                 = 0.85,
@@ -305,8 +309,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
         
     m_p_mu_lr                 = 0.0125,   
-    m_p_sigma_lr              = 0.003,     
-    m_phi_lr                  = 0.016,   
+    m_p_sigma_lr              = 0.01,     
+    m_phi_lr                  = 0.010,   
     
     weight_decay              = 0.02,
     phi_weight_decay          = 0.05,
@@ -319,7 +323,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        and Hand-Off
     #################################
     
-    norm_type_block           = "none",              # "none" | "mahalanobis"
+    layernorm_affine          = False,
+    norm_type_block           = "none",             # "none" | "mahalanobis"
     norm_type_final           = "none",              # "none" | "mahalanobis"
     
     prior_handoff_rho         = 0,                 # 1.0 = full flow; 0.0 = priors frozen
@@ -331,16 +336,22 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     e_mu_q_trust              = None,
     e_sigma_q_trust           = 10.0,
-    sigma_max                 = 100.0,
+    sigma_max                 = 10.0,
     
     #################################
     #         Misc/Logging
     #################################     
     amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
         
-    log_interval              = 50000,       # console log every N steps (0 = off)
-    eval_interval             = 5000,      # periodic validation every N steps (0 = off)
-    checkpoint_interval       = 15001,     # save a resumable checkpoint every N steps (0 = off)
+    log_interval              = 100,       # console log every N steps (0 = off)
+    eval_interval             = 1500,      # periodic validation every N steps (0 = off)
+    checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
+
+    generate_figures          = False,     # OFF: skip the heavy-compute figure set at finalize_run (UMAP
+                                           # belief-category triptych, model/belief UMAP, belief bank, E-step
+                                           # replay, holonomy sampling) + the per-eval attention/gamma heatmaps.
+                                           # True re-enables; make_figures.py re-runs them for a trained run.
+                                           # The cheap dashboards (loss/val-ppl/holonomy/free-energy) still write.
 
     use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF = pure
                                            # path: model is the last SGD iterate). ON: eval/best-save/final
@@ -354,10 +365,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     ############################################################
 
     # --- E-step update rule ---
-    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
+    e_step_update             = "mm_exact",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
                                              # coordinate minimizer at frozen beta: precision fusion in ONE
                                              # iteration, same cost; kernel route only)
-    mm_damping                = 1.0,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
+    mm_damping                = 0.75,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
 
     # --- randomized-depth E-step (recurrent-depth recipe) ---
     randomize_e_steps         = False,       # training forwards sample T ~ Uniform{e_steps_min..e_steps_max}
@@ -403,7 +414,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     share_refine_s_transport  = True,        # build the flat transport ONCE per forward, share s-refine + belief
                                              # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
     compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
-
 )
     
 
@@ -1147,7 +1157,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.0025, 0.01, 0.0125, 0.013, 0.015, 0.025],
+        "param": "m_phi_lr", "values": [0.0075, 0.009, 0.01, 0.0115],
     },
     
     
@@ -1169,6 +1179,37 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "phi_weight_decay":{
         "description": "weight decay on phi",
         "param": "phi_weight_decay", "values": [0.005, 0.015, 0.035, 0.05, 0.075, 0.1],
+    },
+
+    "mm_damping": {  # MM-exact E-step damping eta in (0,1]; 'requires' pins e_step_update='mm_exact' so the
+        # damped coordinate-minimizer step is actually taken every cell (1.0 = full exact minimizer).
+        "description": "MM-exact E-step damping eta in (0,1] (requires mm_exact E-step)",
+        "param": "mm_damping", "values": [0.25, 0.5, 0.75, 1.0],
+        "requires": {"e_step_update": "mm_exact"},
+    },
+
+    "query_tau_c": {  # query-adaptive temperature strength c >= 0 (0 = inert); 'requires' forces
+        # query_adaptive_tau=True so tau_i = tau_h (1 + c * tr_h Sigma_i / d_h) is live on every cell.
+        "description": "query-adaptive temperature strength c (requires query_adaptive_tau=True)",
+        "param": "query_tau_c", "values": [0.5, 1.0, 2.0, 4.0],
+        "requires": {"query_adaptive_tau": True},
+    },
+
+    "lambda_twohop": {  # two-hop coupling F2 = lam2 sum_ik (beta@beta)_ik KL_ik (0 = OFF = pure canonical F;
+        # effective depth 2 at L=1). Numeric values -> _plot_one_sweep draws the x-sorted LINE plot.
+        "description": "two-hop coupling weight lambda_twohop (0 = OFF)",
+        "param": "lambda_twohop", "values": [0.0, 0.001, 0.005, 0.01],
+    },
+
+    "sigma_weight_decay": {  # separate AdamW weight decay for the log-variance tables (None = inherit
+        # weight_decay). Numeric radii -> LINE plot; the None (inherit) baseline runs via train_vfe3.
+        "description": "AdamW weight decay on the log-variance (sigma) tables",
+        "param": "sigma_weight_decay", "values": [0.0, 0.02, 0.05, 0.1],
+    },
+
+    "warmup_steps": {  # LR warmup length before the cosine decay (0 = no warmup, straight into cosine).
+        "description": "LR warmup steps before cosine decay",
+        "param": "warmup_steps", "values": [0, 10, 100, 500, 1000, 5000],
     },
 
     
@@ -1197,7 +1238,12 @@ NON_SWEPT_FIELDS = (
 # CONFIG["sweep"]="<name>"); add or remove names to shape a session. Cheap-to-expensive is a good
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
-    
+   
+    "mm_damping",
+   "query_tau_c",
+   "lambda_twohop",
+   "sigma_weight_decay",
+   "warmup_steps", 
    
   #"gauge_transport",
  # "attention_entropy",
@@ -1251,8 +1297,11 @@ SWEEP_ORDER: List[str] = [
     
    # "mass_phi",
    # "mstep_self_coupling_weight",
-    
-    
+
+   # --- 2026-07-11 restored/added sweeps ---
+   
+
+
 ]
 
 
