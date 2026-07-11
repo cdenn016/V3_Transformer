@@ -1736,10 +1736,10 @@ class VFE3Config:
         # decode_mode sets the RANK of the prior-bank KL-decode kernel: 'diagonal'/'diagonal_chunked'
         # consume a diagonal sigma (B,N,K); 'full'/'full_chunked' consume a full sigma (B,N,K,K). It
         # must agree with the covariance family, else the rank mismatch is a shape RuntimeError at the
-        # first forward. The use_prior_bank=False linear decode discards sigma and reads decode_mode
-        # for exactly one thing: '*_chunked' selects the fused chunked-CE training path over
-        # logits = mu @ W^T (vram audit 2026-06-10) -- rank is irrelevant there, so the cross-check
-        # stays gated on use_prior_bank.
+        # first forward. The use_prior_bank=False linear decode discards sigma, and its own active
+        # registration controls dense versus fused-CE training; decode_mode does not route that
+        # no-prior path. Rank is therefore irrelevant there, so the cross-check stays gated on
+        # use_prior_bank.
         decode_is_full = _DECODERS[self.decode_mode].supports_full
         if self.use_prior_bank and decode_is_full == family_is_diagonal:
             raise ValueError(
