@@ -65,6 +65,71 @@ def test_greedy_equals_forward_argmax_first_token():
     assert torch.equal(out[:, -1], expected)
 
 
+def test_generate_decodes_only_last_position(monkeypatch):
+    model = _tiny_model()
+    V = model.cfg.vocab_size
+    prompt = torch.randint(0, V, (2, 3))
+    original_forward_beliefs = model.forward_beliefs
+    calls = []
+
+    def tracked_forward_beliefs(
+        token_ids,
+        *,
+        return_logits=False,
+        decode_last=False,
+        **kwargs,
+    ):
+        belief, logits = original_forward_beliefs(
+            token_ids,
+            return_logits=return_logits,
+            decode_last=decode_last,
+            **kwargs,
+        )
+        calls.append((return_logits, decode_last, tuple(logits.shape)))
+        return belief, logits
+
+    monkeypatch.setattr(model, "forward_beliefs", tracked_forward_beliefs)
+    out = model.generate(prompt, max_new_tokens=2, greedy=True)
+
+    assert out.shape == (2, 5)
+    assert calls == [
+        (True, True, (2, 1, V)),
+        (True, True, (2, 1, V)),
+    ]
+
+
+def test_generate_rejects_nonfinite_logit_rows(monkeypatch):
+    model = _tiny_model()
+    V = model.cfg.vocab_size
+    prompt = torch.randint(0, V, (2, 3))
+    injected = {"logits": torch.zeros(2, 1, V)}
+
+    def fake_forward_beliefs(
+        token_ids,
+        *,
+        return_logits=False,
+        decode_last=False,
+        **kwargs,
+    ):
+        assert return_logits and decode_last
+        return None, injected["logits"]
+
+    monkeypatch.setattr(model, "forward_beliefs", fake_forward_beliefs)
+
+    injected["logits"] = torch.zeros(2, 1, V)
+    injected["logits"][0] = float("-inf")
+    with pytest.raises(ValueError, match=r"generation logits have no finite value in rows \[0\]"):
+        model.generate(prompt, max_new_tokens=1, greedy=False, top_k=2)
+
+    injected["logits"] = torch.zeros(2, 1, V)
+    injected["logits"][0, 0, 0] = float("inf")
+    with pytest.raises(
+        ValueError,
+        match=r"generation retained logits contain non-finite values in rows \[0\]",
+    ):
+        model.generate(prompt, max_new_tokens=1, greedy=False, top_k=2)
+
+
 def test_greedy_ignores_temperature_topk_topp():
     # Greedy returns before any temperature/top_k/top_p logic: a wild temperature
     # and aggressive top_k/top_p alongside greedy=True must not change the result.

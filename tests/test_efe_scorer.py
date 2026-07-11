@@ -238,6 +238,57 @@ def test_generate_policy_branch_dispatches_and_stays_in_vocab():
     assert torch.equal(seq[:, :3], prompt)                  # prompt preserved
 
 
+def test_policy_rejects_context_plus_candidate_over_limit(monkeypatch):
+    m = _model(policy_mode="efe_one_step", policy_preference="flat", max_seq_len=8)
+    context = torch.randint(0, m.cfg.vocab_size, (1, 10))
+
+    def fail_forward_beliefs(*args, **kwargs):
+        pytest.fail("overlength policy context reached base decode")
+
+    monkeypatch.setattr(m, "forward_beliefs", fail_forward_beliefs)
+    with pytest.raises(
+        ValueError,
+        match=r"context length N=10 plus candidate length L=1 exceeds max_seq_len=8",
+    ):
+        m.generate(context, max_new_tokens=1, greedy=True)
+
+
+def test_policy_menu_rejects_nonfinite_base_logits(monkeypatch):
+    m = _model(
+        policy_mode="efe_one_step",
+        policy_preference="flat",
+        policy_top_k=4,
+    )
+    V = m.cfg.vocab_size
+    context = torch.randint(0, V, (2, 3))
+    injected = {"logits": torch.zeros(2, 1, V)}
+
+    def fake_forward_beliefs(
+        token_ids,
+        *,
+        return_logits=False,
+        decode_last=False,
+        **kwargs,
+    ):
+        assert return_logits and decode_last
+        return None, injected["logits"]
+
+    monkeypatch.setattr(m, "forward_beliefs", fake_forward_beliefs)
+
+    injected["logits"] = torch.zeros(2, 1, V)
+    injected["logits"][0] = float("-inf")
+    with pytest.raises(ValueError, match=r"policy base logits have no finite value in rows \[0\]"):
+        m._policy_select(context, greedy=True)
+
+    injected["logits"] = torch.zeros(2, 1, V)
+    injected["logits"][0, 0, 0] = float("inf")
+    with pytest.raises(
+        ValueError,
+        match=r"policy menu logits contain non-finite retained values in rows \[0\]",
+    ):
+        m._policy_select(context, greedy=True)
+
+
 def test_preference_builders():
     m = _model()
     V = 16

@@ -252,6 +252,21 @@ def _amb_sigma_mc(
 
 # ---- scorer internals ------------------------------------------------------------------------------
 
+def _validate_policy_context(
+    context:          torch.Tensor,                   # (B, N) current policy context
+
+    candidate_length: int,                            # L appended action tokens
+    max_seq_len:      int,                            # model sequence bound
+) -> None:
+    """Reject a policy rollout that cannot preserve its complete context and candidate."""
+    N = context.shape[1]
+    if N + candidate_length > max_seq_len:
+        raise ValueError(
+            f"policy context length N={N} plus candidate length L={candidate_length} exceeds "
+            f"max_seq_len={max_seq_len}; policy paths do not truncate context."
+        )
+
+
 def _rollout_predictive(
     context:     torch.Tensor,                       # (B, N) context ids
     candidates:  torch.Tensor,                       # (B, Kp, L) candidate continuation ids
@@ -269,15 +284,13 @@ def _rollout_predictive(
     B, N = context.shape
     Kp, L = candidates.shape[1], candidates.shape[2]
     max_len = model.cfg.max_seq_len
+    _validate_policy_context(context, L, max_len)
     # Cache fast path (Phase 3a): on the verified causal/filtering/flat/single-block regime, and when
     # context+candidate fits the built length (no sliding-window eviction, which would invalidate the
     # prefix), compute only the appended positions' E-step rows against a shared context. Golden-tested
     # equal to the full recompute below to float tolerance (tests/test_belief_cache.py).
-    if cache_supported(model.cfg) and N + L <= max_len:
+    if cache_supported(model.cfg):
         return rollout_predictive_cached(context, candidates, model, base_logits=base_logits)
-    if N + L > max_len:                              # keep context+action within the model's built length
-        context = context[:, -(max_len - L):]
-        N = context.shape[1]
     ctx_exp = context.unsqueeze(1).expand(B, Kp, N)              # (B, Kp, N)
     ext = torch.cat([ctx_exp, candidates], dim=2).reshape(B * Kp, N + L)   # (B*Kp, N+L)
     _belief, logits = model.rollout_beliefs(ext, return_logits=True)       # logits (B*Kp, N+L, V)
@@ -456,6 +469,7 @@ def _policy_efe_rollout(
         raise ValueError(
             f"efe_rollout candidates carry the H-action policy sequence: candidate length L={L} must "
             f"equal horizon={horizon}.")
+    _validate_policy_context(context, L, model.cfg.max_seq_len)
     if not cache_supported(model.cfg):
         raise NotImplementedError(
             "efe_rollout (horizon>1) requires the belief-prefix cache, which is exact only for the "

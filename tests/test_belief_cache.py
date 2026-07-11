@@ -162,3 +162,18 @@ def test_efe_rollout_guards():
         cand2 = torch.randint(0, V, (1, 2, 2))
         with pytest.raises(NotImplementedError):
             get_policy("efe_rollout")(ctx, cand2, pref, m2, horizon=2)
+
+
+def test_efe_rollout_rejects_context_plus_horizon_over_limit():
+    from vfe3.inference.policy import get_policy, get_preference
+    m = _model(max_seq_len=8)
+    V, H = m.cfg.vocab_size, 2
+    ctx = torch.randint(0, V, (1, 7))
+    cand = torch.randint(0, V, (1, 3, H))
+    pref = get_preference("flat")(m.prior_bank)
+    with torch.no_grad():
+        with pytest.raises(
+            ValueError,
+            match=r"context length N=7 plus candidate length L=2 exceeds max_seq_len=8",
+        ):
+            get_policy("efe_rollout")(ctx, cand, pref, m, horizon=H)
