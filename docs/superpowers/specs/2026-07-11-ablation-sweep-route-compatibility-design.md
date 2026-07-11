@@ -10,9 +10,10 @@ Base: `origin/main` at `ecc128966087cbba6471c028cfe2076d78d73b84`
 The complete CPU suite on the rebased P6 branch reported four ablation sweep-construction
 failures. A detached worktree at the exact `origin/main` base reproduced all four failures without
 any P6 files present. The failing cells inherit `e_step_update="mm_exact"` from
-`ablation.py`'s active `BASELINE_CONFIG`, but their scientific purpose requires an autograd-oracle
-belief-gradient route. `VFE3Config` correctly rejects MM-exact on that route because the closed-form
-MM update is available only to the eligible diagonal-Gaussian filtering kernel.
+`ablation.py`'s active `BASELINE_CONFIG`, but each affected sweep contains at least one
+scientifically required arm on the autograd-oracle belief-gradient route. `VFE3Config` correctly
+rejects MM-exact on that route because the closed-form MM update is available only to the eligible
+diagonal-Gaussian filtering kernel.
 
 The affected sweeps are `attention_entropy`, whose entropy-suppressed arms disable a kernel
 eligibility condition; `gauge_equivariance`, whose full-covariance arms require the oracle;
@@ -38,10 +39,13 @@ requirement. `attention_entropy`, `gauge_equivariance`, and `regime_ii` will add
 `"requires": {"e_step_update": "gradient"}`. `pos_extrapolation` will add the same key to its
 existing `requires` mapping while retaining its existing oracle and sequence-length requirements.
 
-This changes only the generated cells for experiments whose own arms necessarily leave the
-MM-exact kernel domain. It does not change the baseline used by ordinary ablation cells, the
-explicit `mm_damping` sweep, or the main training configuration. The saved cell configuration will
-state `e_step_update="gradient"` directly; there will be no hidden coercion.
+This changes only the generated cells for four experiments that each contain at least one arm
+outside the MM-exact kernel domain. Runtime dispatch classifies seven of their 13 arms as oracle
+routes and six as kernel routes. Applying the gradient update to every arm within each sweep keeps
+the scientific comparisons on one controlled update rule. It does not change the baseline used by
+ordinary ablation cells, the explicit `mm_damping` sweep, or the main training configuration. The
+saved cell configuration will state `e_step_update="gradient"` directly; there will be no hidden
+coercion.
 
 ## Rejected alternatives
 
@@ -67,8 +71,8 @@ before P6 is pushed and merged.
 
 ## Acceptance criteria
 
-The repair is accepted when all four sweeps construct under their scientifically required oracle
-route, both active config dictionaries retain the approved values, no hidden fallback or validator
-relaxation exists, the prerequisite diff is limited to sweep contracts, regression coverage, and
-the dated documentation, and the complete suite is green on both the prerequisite branch and the
-rebased P6 branch.
+The repair is accepted when all four mixed-route sweeps construct under one controlled gradient
+update rule, both active config dictionaries retain the approved values, no hidden fallback or
+validator relaxation exists, the prerequisite diff is limited to sweep contracts, regression
+coverage, and the dated documentation, and the complete suite is green on both the prerequisite
+branch and the rebased P6 branch.

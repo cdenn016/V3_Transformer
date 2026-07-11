@@ -17,12 +17,12 @@ def test_active_update_rule_config_values_are_preserved() -> None:
     "sweep_name",
     ["attention_entropy", "gauge_equivariance", "pos_extrapolation", "regime_ii"],
 )
-def test_oracle_only_sweep_arms_use_local_gradient_contract(sweep_name: str) -> None:
+def test_route_constrained_sweep_arms_use_local_gradient_contract(sweep_name: str) -> None:
     runs = ablation.make_run_overrides(sweep_name)
     assert runs
     for label, overrides in runs:
         assert overrides.get("e_step_update") == "gradient", (
-            f"{sweep_name}/{label} must select the legal oracle-route update locally"
+            f"{sweep_name}/{label} must select the controlled gradient update locally"
         )
         cfg_dict = ablation._cell_cfg_dict(
             {**overrides, "vocab_size": 64, "max_seq_len": 16},
