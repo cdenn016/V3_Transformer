@@ -152,6 +152,24 @@ def test_policy_posterior_rejects_all_infinite_candidate_row():
         _policy_posterior(score, 1.0, None)
 
 
+def test_policy_posterior_rejects_nan_and_positive_infinity_with_row_indices():
+    score = torch.tensor([
+        [0.0, float("nan"), float("inf")],
+        [0.0, float("inf"), 1.0],
+        [0.0, float("-inf"), float("inf")],
+    ])
+    with pytest.raises(ValueError, match=r"NaN or \+inf.*rows \[0, 2\]"):
+        _policy_posterior(score, 1.0, None)
+
+
+def test_policy_posterior_retains_partial_negative_infinity_support():
+    score = torch.tensor([[0.0, float("inf"), 1.0]])
+    posterior = _policy_posterior(score, 1.0, None)
+    expected = torch.softmax(torch.tensor([[0.0, float("-inf"), -1.0]]), dim=-1)
+    assert torch.equal(posterior[:, 1], torch.zeros(1))
+    assert torch.allclose(posterior, expected)
+
+
 def test_logprob_control_scores_by_logprob_with_zero_efe_terms():
     m = _model()
     ctx = torch.tensor([[1, 2, 3, 4, 5]])

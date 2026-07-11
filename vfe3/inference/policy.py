@@ -313,6 +313,10 @@ def _policy_posterior(
     logits = -gamma * score
     if log_prior is not None:
         logits = logits + log_prior
+    invalid_row = torch.isnan(logits).any(dim=-1) | torch.isposinf(logits).any(dim=-1)
+    if bool(invalid_row.any()):
+        rows = invalid_row.nonzero(as_tuple=False).flatten().tolist()
+        raise ValueError(f"policy posterior logits contain NaN or +inf candidates in rows {rows}")
     finite_row = torch.isfinite(logits).any(dim=-1)
     if not bool(finite_row.all()):
         rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()
