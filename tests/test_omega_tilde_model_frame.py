@@ -450,6 +450,37 @@ def test_attached_model_estep_trains_and_moves_learned_model_position_frame() ->
     assert not torch.equal(model.s_pos_phi_free, position_before)
 
 
+def test_phi_tilde_mm_exact_device_smoke(device: torch.device) -> None:
+    model = _model(
+        s_frame_mode="phi_tilde",
+        pos_phi="learned",
+        e_step_update="mm_exact",
+        m_s_phi_lr=0.01,
+        phi_weight_decay=0.0,
+    ).to(device)
+    optimizer = build_optimizer(model, model.cfg)
+    token_ids = torch.tensor([[0, 1, 2, 3]], device=device)
+    targets = torch.tensor([[1, 2, 3, 4]], device=device)
+    belief_phi = model._apply_pos_phi(model.prior_bank.encode(token_ids).phi)
+    model_phi = model._resolve_model_frame(token_ids, belief_phi)
+    energy = model._gamma_energy(token_ids, model_phi)[0]
+    token_before = model.prior_bank.s_phi_embed.detach().clone()
+    position_before = model.s_pos_phi_free.detach().clone()
+
+    assert model_phi.device == token_ids.device
+    assert torch.isfinite(energy).all()
+    _, loss, _ = model(token_ids, targets)
+    loss.backward()
+    for parameter in (model.prior_bank.s_phi_embed, model.s_pos_phi_free):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert float(parameter.grad.abs().sum()) > 0.0
+    optimizer.step()
+
+    assert not torch.equal(model.prior_bank.s_phi_embed, token_before)
+    assert not torch.equal(model.s_pos_phi_free, position_before)
+
+
 def test_phi_tilde_checkpoint_round_trip_restores_frame_and_config(tmp_path) -> None:
     cfg = _cfg(s_frame_mode="phi_tilde", m_s_phi_lr=0.007)
     model = VFEModel(cfg)

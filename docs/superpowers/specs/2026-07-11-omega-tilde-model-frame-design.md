@@ -2,7 +2,7 @@
 
 Date: 2026-07-11
 
-Status: approved design direction; implementation not yet started
+Status: implemented and verified on 2026-07-11
 
 ## 1. Decision
 
@@ -86,11 +86,11 @@ congruence, exactly as on the existing tied path.
 | `m_s_phi_lr` | `0.015` | M-step learning rate for model-frame parameters. It is inert when `s_frame_mode="tied"`. |
 | `share_refine_s_transport` | existing default | Must be `False` under `phi_tilde`, because the model and belief transports have distinct parameter graphs. |
 
-The click-run dictionaries will add `s_frame_mode="tied"` and `m_s_phi_lr=0.016`, matching their
-current `m_phi_lr=0.016` so enabling the new mode does not silently introduce a learning-rate
-timescale claim. The separate field permits later controlled sweeps. `ablation.py` will expose a
-two-cell `s_frame_mode` arm and an `m_s_phi_lr` sweep, but neither will be added to the active
-`RUN_SWEEPS` list by this feature.
+The click-run dictionaries will add `s_frame_mode="tied"` and `m_s_phi_lr=0.016`. This matches the
+belief-frame rate in `train_vfe3.py`; `ablation.py` retains its pre-existing `m_phi_lr=0.010`
+unchanged and exposes the model-frame clock separately. The separate field permits later controlled
+sweeps. `ablation.py` will expose a two-cell `s_frame_mode` arm and an `m_s_phi_lr` sweep, but neither
+will be added to the active `SWEEP_ORDER` list by this feature.
 
 `phi_tilde` requires `gauge_parameterization="phi"`, an active `s_e_step=True` model channel,
 `prior_source="model_channel"`, and `share_refine_s_transport=False`. It rejects
