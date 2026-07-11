@@ -1,6 +1,6 @@
 r"""One-forward diagnostic snapshots and replay-free evaluation consumers."""
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import math
 
 import pytest
@@ -96,6 +96,24 @@ def test_snapshot_and_independent_diagnostics_are_value_equal() -> None:
     per_layer_expected = model.diagnostics_per_layer(tokens)
     _assert_scalar_dict_equal(per_layer_actual, per_layer_expected)
     assert torch.allclose(snapshot.logits, model(tokens), atol=1e-6, rtol=1e-6)
+
+
+def test_snapshot_diagnostics_ignore_other_batch_rows_in_model_channel_state() -> None:
+    model = _model(lambda_h=0.25, lambda_gamma=0.25)
+    tokens = _tokens()
+    snapshot = model.build_diagnostic_snapshot(tokens)
+    assert snapshot.s_belief is not None
+
+    s_mu, s_sigma = snapshot.s_belief
+    changed_mu = s_mu.clone()
+    changed_sigma = s_sigma.clone()
+    changed_mu[1] += 100.0
+    changed_sigma[1] *= 7.0
+    changed = replace(snapshot, s_belief=(changed_mu, changed_sigma))
+
+    expected = model.diagnostics(tokens, snapshot=snapshot)
+    actual = model.diagnostics(tokens, snapshot=changed)
+    _assert_scalar_dict_equal(actual, expected)
 
 
 def test_attention_and_trace_reuse_snapshot_without_forward_replay(monkeypatch) -> None:

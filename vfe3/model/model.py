@@ -2305,7 +2305,10 @@ class VFEModel(nn.Module):
         else:
             snapshot = self._validate_diagnostic_snapshot(token_ids, snapshot)
             belief = _sequence_belief(snapshot.initial_belief)
-            s_belief = snapshot.s_belief
+            s_belief = None if snapshot.s_belief is None else (
+                snapshot.s_belief[0][:1],
+                snapshot.s_belief[1][:1],
+            )
             n = belief.mu.shape[0]
             log_prior = self._first_sequence_log_prior(snapshot.log_prior, token_ids.shape[0])
             rope = snapshot.rope
