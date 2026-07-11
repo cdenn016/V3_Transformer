@@ -403,7 +403,8 @@ def spearman_rho(
     ry = _average_ranks(y)
     rx, ry = rx - rx.mean(), ry - ry.mean()
     denominator = rx.norm() * ry.norm()
-    return float((rx * ry).sum() / denominator.clamp(min=eps))
+    correlation = (rx * ry).sum() / denominator.clamp(min=eps)
+    return float(correlation.clamp(min=-1.0, max=1.0))
 
 
 def cv(
