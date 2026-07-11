@@ -190,7 +190,6 @@ def generate_figures(
     mc_belief   = _safe(lambda: extract.model_channel_belief(model, tok), "model_channel_belief")
     r_centroid  = _safe(lambda: extract.hyper_prior_centroid(model, tok), "hyper_prior_centroid")
     h_coupling  = _safe(lambda: extract.hyper_prior_coupling(model, tok), "hyper_prior_coupling")
-    gamma_attn  = _safe(lambda: extract.gamma_attention(model, tok), "gamma_attention")
     mc_bank     = _safe(lambda: extract.model_channel_bank(model, token_batches, max_sequences=max_sequences),
                         "model_channel_bank")
     vstats      = (None if skip_full_vocab else
@@ -255,19 +254,9 @@ def generate_figures(
     _emit("attention_structure",
           lambda p: figs.plot_attention_structure(amaps, path=p),
           amaps is not None)
-    # Per-head belief-beta attention heatmaps (magma), one file per (layer, head) -- the per-head
-    # detail behind attention_structure; matched by the model-channel gamma maps (viridis) below.
-    if amaps is not None:
-        bm = amaps if amaps.dim() == 4 else amaps[None]              # (L, H, N, N)
-        for li in range(bm.shape[0]):
-            for hi in range(bm.shape[1]):
-                bname = (f"attention_beta_head{hi}" if bm.shape[0] == 1
-                         else f"attention_beta_layer{li}_head{hi}")
-                _emit(bname,
-                      lambda p, li=li, hi=hi: figs.plot_attention_heatmap(
-                          bm[li, hi], cmap="magma", symbol=r"\beta",
-                          title=f"Belief attention - layer {li} head {hi}", path=p),
-                      True)
+    # Per-head beta/gamma attention heatmaps are NOT emitted here: training already writes them at
+    # every eval_interval (RunArtifacts.save_attention_maps / save_gamma_attention_maps under
+    # <run_dir>/attention/), so end-of-training copies in figures/ were redundant.
     _emit("per_layer_diagnostics",                               # the depth axis the aggregates collapse
           lambda p: figs.plot_per_layer_diagnostics(per_layer, path=p),
           per_layer is not None)
@@ -318,17 +307,6 @@ def generate_figures(
     _emit("hyper_prior_coupling",                                 # the h figure (lambda_h block)
           lambda p: figs.plot_hyper_prior_coupling(h_coupling, path=p),
           h_coupling is not None)
-    # Per-head model-coupling (gamma) attention heatmaps (viridis), one file per head -- the
-    # s-channel sibling of the belief beta maps, in a distinct color family.
-    if gamma_attn is not None:
-        gm = gamma_attn["gamma"]                                  # (H, N, N)
-        gm = gm if gm.dim() == 3 else gm[None]
-        for hi in range(gm.shape[0]):
-            _emit(f"attention_gamma_head{hi}",
-                  lambda p, hi=hi: figs.plot_attention_heatmap(
-                      gm[hi], cmap="viridis", symbol=r"\gamma",
-                      title=f"Model-coupling attention - head {hi}", path=p),
-                  True)
     for ch in ("mu", "sigma"):                                    # model-channel s UMAP (no phi: shares belief gauge)
         _emit(f"model_umap_{ch}",
               lambda p, ch=ch: figs.plot_belief_umap(mc_bank, ch, kind="Model", decode=decode, path=p),
