@@ -23,6 +23,11 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 # Wong colourblind-safe qualitative palette (used module-wide, incl. the trajectory defaults).
 _CB = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000"]
 
+# tab20 reindex for cluster coloring: the ten saturated distinct hues first, their pastels second,
+# both grays last (grays are confusable with the light-gray noise layer). tab20's native order is
+# saturated/pastel pairs of the SAME hue, so size-adjacent clusters differed only in lightness.
+_TAB20_DISTINCT = [0, 2, 4, 6, 8, 10, 12, 16, 18, 1, 3, 5, 7, 9, 11, 13, 17, 19, 14, 15]
+
 
 def _np(x) -> np.ndarray:
     """Detach a torch tensor (or pass an array) to a contiguous numpy array."""
@@ -76,6 +81,11 @@ def _zoom_bar_value_axis(ax, values, *, vertical: bool = True,
     (ax.set_ylim if vertical else ax.set_xlim)(lo, hi)
 
 
+# Default UMAP hyper-parameters. Module-level so the on-figure parameter footer states the values
+# actually used instead of restating literals (they are not otherwise in the plot functions' scope).
+_UMAP_N_NEIGHBORS = 15                                           # local-neighborhood size (callers scale with N)
+_UMAP_MIN_DIST    = 0.1                                          # display-tuned spacing (0.0 for clustering runs)
+
 # Worker source for the ISOLATED umap embedding subprocess (see umap_embed).
 # init="pca" skips UMAP's spectral eigensolver, which on disconnected / near-degenerate belief
 # clouds fails to converge (tiny eigengap) and silently falls back to uniform-random init; PCA is
@@ -87,7 +97,8 @@ _UMAP_WORKER_SRC = (
     "import umap\n"
     "X = np.load(sys.argv[1])\n"
     "reducer = umap.UMAP(n_neighbors=int(sys.argv[3]), min_dist=float(sys.argv[4]),\n"
-    "                    n_components=2, init='pca', random_state=int(sys.argv[5]), n_jobs=1)\n"
+    "                    n_components=int(sys.argv[6]), init='pca', random_state=int(sys.argv[5]),\n"
+    "                    n_jobs=1)\n"
     "np.save(sys.argv[2], reducer.fit_transform(X))\n"
 )
 
@@ -96,11 +107,12 @@ def umap_embed(
     features,                            # (N, D) tensor/array
 
     *,
-    n_neighbors: int = 15,
-    min_dist:    float = 0.1,
-    seed:        int = 0,
+    n_neighbors:  int = _UMAP_N_NEIGHBORS,
+    min_dist:     float = _UMAP_MIN_DIST,
+    n_components: int = 2,
+    seed:         int = 0,
 ):
-    r"""2-D UMAP embedding of ``features`` ((N, D) -> (N, 2)), run in an ISOLATED subprocess.
+    r"""UMAP embedding of ``features`` ((N, D) -> (N, n_components)), run in an ISOLATED subprocess.
 
     umap-learn's numba/llvmlite native layer can die with a Windows ACCESS VIOLATION when it
     initializes inside a long-running, heavily loaded process (observed on Python 3.14 after
@@ -111,11 +123,14 @@ def umap_embed(
     (numba genuinely unsupported, umap-learn absent) raises the OSError/ImportError the umap
     consumers were already written to handle (audit 2026-07-05 verification fix)."""
     X = _np(features)
+    # PCA init raises when n_components exceeds the feature dim or N-1 (e.g. the phi channel of a
+    # small algebra, tiny CPU test banks), so clamp it the same way n_neighbors is clamped below.
+    n_components = max(1, min(n_components, X.shape[1], max(1, X.shape[0] - 1)))
     # A fully collapsed channel (every point identical -> zero variance) has no embedding, and PCA
     # init would divide by total variance 0 and yield NaN. Return a trivial finite layout so the
     # downstream clustering / KDE stay valid (faithful: constant features carry no 2-D structure).
     if X.shape[0] < 3 or float(np.ptp(X, axis=0).max()) <= 0.0:
-        return np.zeros((X.shape[0], 2), dtype=float)
+        return np.zeros((X.shape[0], n_components), dtype=float)
     n_neighbors = min(n_neighbors, max(2, X.shape[0] - 1))
     import os
     import shutil
@@ -129,8 +144,8 @@ def umap_embed(
         np.save(fin, X)
         proc = subprocess.run(
             [sys.executable, "-c", _UMAP_WORKER_SRC,
-             fin, fout, str(n_neighbors), str(min_dist), str(seed)],
-            capture_output=True, timeout=600,
+             fin, fout, str(n_neighbors), str(min_dist), str(seed), str(n_components)],
+            capture_output=True, timeout=1200,
         )
         if proc.returncode != 0:
             tail = proc.stderr.decode(errors="replace")[-500:]
@@ -1613,24 +1628,88 @@ def _token_category_labels(
 
 
 def _cluster_embedding(
-    coords: np.ndarray,                  # (M, 2) UMAP coordinates
+    coords: np.ndarray,                  # (M, D) clustering-space coordinates (2-D display or higher-D)
 
     *,
     seed:   int = 0,
-) -> np.ndarray:                         # (M,) integer cluster labels (-1 = noise)
-    r"""Density-cluster a 2-D embedding into data-driven groups (HDBSCAN; KMeans fallback).
+) -> tuple:                              # ((M,) integer cluster labels (-1 = noise), method description)
+    r"""Density-cluster an embedding into data-driven groups (HDBSCAN; KMeans fallback).
 
     HDBSCAN finds variable-density clusters AND an explicit noise label (-1) -- the right tool for the
-    belief embedding's tight peripheral function-word islands around a diffuse content core -- with
-    ``min_cluster_size`` scaled to the cloud size. Falls back to KMeans (no noise label) only when the
-    installed sklearn predates ``cluster.HDBSCAN`` (<1.3). Deterministic given ``coords``."""
+    belief embedding's tight peripheral function-word islands around a diffuse content core. Parameter
+    regime (audit 2026-07-11): ``leaf`` selection with a scale-relative ``cluster_selection_epsilon``
+    instead of the default ``eom``, which on a diffuse-core-plus-islands cloud prefers the root-level
+    blob (the one-giant-cluster failure); ``min_cluster_size`` grows as sqrt(M) so the 64-sequence
+    finalize bank and the 256-sequence make_figures bank get comparable granularity (the old linear
+    M//60 floor did not); ``min_samples`` is tied to the size floor rather than a fixed noisy 5.
+    Falls back to KMeans (no noise label) only when the installed sklearn predates ``cluster.HDBSCAN``
+    (<1.3); a genuine HDBSCAN runtime error propagates to the caller's best-effort guard instead of
+    silently switching algorithms. Returns ``(labels, method_desc)`` where ``method_desc`` names the
+    algorithm and parameters actually used (for the on-figure footer). Deterministic given ``coords``
+    (HDBSCAN has no RNG; the KMeans fallback is seeded)."""
     M = coords.shape[0]
+    if M < 3:                                                    # no clusters to find (HDBSCAN would raise)
+        return np.full(M, -1, dtype=int), "degenerate (<3 points)"
     try:
         from sklearn.cluster import HDBSCAN
-        return HDBSCAN(min_cluster_size=max(20, M // 60), min_samples=5).fit_predict(coords)
-    except Exception:                                            # pragma: no cover - old sklearn only
+    except ImportError:                                          # pragma: no cover - old sklearn only
         from sklearn.cluster import KMeans
-        return KMeans(n_clusters=max(2, min(14, M // 50)), n_init=10, random_state=seed).fit_predict(coords)
+        k = max(2, min(14, M // 50))
+        return (KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(coords),
+                f"KMeans fallback (k={k}, no noise label)")
+    mcs = max(2, min(max(20, int(np.sqrt(M))), M))               # clamps keep tiny test banks valid
+    ms  = max(1, min(max(10, mcs // 20), M))
+    eps = 0.02 * float(np.ptp(coords, axis=0).max())
+    labels = HDBSCAN(min_cluster_size=mcs, min_samples=ms, cluster_selection_method="leaf",
+                     cluster_selection_epsilon=eps).fit_predict(coords)
+    return labels, f"HDBSCAN(mcs={mcs}, ms={ms}, leaf, eps={eps:.2g})"
+
+
+def _density_peak_anchor(
+    pts:    np.ndarray,                  # (n_c, 2) one cluster's display coordinates
+    extent: list,                        # [[xmin, xmax], [ymin, ymax]] global display extent
+
+    *,
+    grid:   int = 200,
+    smooth: float = 2.0,
+) -> np.ndarray:                         # (2,) an actual member point at the cluster's density peak
+    r"""The cluster MEMBER at the peak of a smoothed 2-D histogram of the cluster -- a robust anchor.
+
+    The previous anchor (member nearest the arithmetic mean) lands in empty space for crescent or
+    multi-island clusters, because the mean falls off-support. Binning the members onto a fixed grid,
+    smoothing, and scoring each MEMBER by the smoothed density at its own bin guarantees an on-support
+    anchor inside the dominant lobe (scoring bins rather than members could pick an empty bin after
+    smoothing). np.argmax's first-index rule makes ties deterministic. Falls back to the old
+    nearest-to-mean member if scipy is unavailable or the histogram degenerates."""
+    try:
+        from scipy.ndimage import gaussian_filter
+        hist, xe, ye = np.histogram2d(pts[:, 0], pts[:, 1], bins=grid, range=extent)
+        hs = gaussian_filter(hist, sigma=smooth)
+        ix = np.clip(np.searchsorted(xe, pts[:, 0], side="right") - 1, 0, grid - 1)
+        iy = np.clip(np.searchsorted(ye, pts[:, 1], side="right") - 1, 0, grid - 1)
+        return pts[int(np.argmax(hs[ix, iy]))]
+    except Exception:                                            # scipy absent / degenerate extent
+        return pts[np.argmin(((pts - pts.mean(0)) ** 2).sum(1))]
+
+
+def _lift_label_display(raw: str) -> Optional[str]:
+    r"""Render one decoded token for a cluster label, keeping BPE word-boundary information.
+
+    The old ``strip()``-everything rendering made bare punctuation ("=", ",") read as noise and made
+    continuation subwords ("omach", "ing") indistinguishable from whole words (GPT-2 BPE encodes the
+    word boundary as a leading space, which strip destroyed). Punctuation-only tokens are repr-quoted
+    (','), continuation subwords (letters, no leading space) get a middle-dot prefix (·ing); the
+    classification reuses :func:`_bpe_category` so boundary semantics live in one place. Returns None
+    for empty / replacement-char / non-printable BPE-byte fragments (dropped)."""
+    core = raw.strip()
+    if not core or "�" in core or not core.isprintable():
+        return None
+    cat = _bpe_category(raw)
+    if cat == 0:                                                 # punctuation-only -> quote the glyphs
+        return repr(core)
+    if cat == 4:                                                 # continuation subword -> mark boundary
+        return "·" + core
+    return core
 
 
 def _cluster_lift_labels(
@@ -1639,23 +1718,32 @@ def _cluster_lift_labels(
     decode:    Optional[object],         # decode([id]) -> str; None -> raw id string
 
     *,
-    k:         int = 3,
-    floor:     int = 2,
-) -> Dict[int, str]:
-    r"""Per-cluster DISTINCTIVE-token label by enrichment (lift): one comma-joined string per cluster.
+    k:          int = 3,
+    floor:      int = 2,
+    with_stats: bool = False,
+) -> Dict:
+    r"""Per-cluster DISTINCTIVE-token label by enrichment: one comma-joined string per cluster.
 
     The globally frequent tokens (the, comma, of) occur in EVERY cluster, so raw-frequency labels are
-    uninformative; the lift score lift(t, c) = (count of t in c / |c|) / (count of t / M) ranks a token by
-    how CONCENTRATED it is in cluster c -- surfacing what the cluster is about. Keeps candidates with
-    in-cluster count >= ``floor``, ranks by lift, and returns the top-``k`` unique decoded strings
-    (stripped; replacement-char / non-printable BPE-byte fragments dropped). ``decode is None`` -> raw id.
+    uninformative. Ranking is by the smoothed log-odds of membership,
+    ``log((ct+a)/(n_c+a*V)) - log((glob-ct+a)/((M-n_c)+a*V))`` with ``a = 0.5`` and ``V`` the observed
+    token types -- the additive smoothing breaks the raw-lift degeneracy where every cluster-exclusive
+    token ties at exactly lift = M/n_c regardless of count (audit 2026-07-11: the old
+    ``scored.sort(reverse=True)`` then broke those ties by decoded string DESCENDING, deterministically
+    promoting rare high-codepoint accented glyphs -- the "ū, ō, ī" labels). Residual ties break by
+    global count then FORWARD lexicographic order. Keeps candidates with in-cluster count >= ``floor``;
+    tokens render via :func:`_lift_label_display`. ``decode is None`` -> raw id strings.
+    ``with_stats=True`` returns ``{cluster: (label, top raw lift)}`` (the raw lift of the top-ranked
+    token, for the caller's mixed-core gate); default returns ``{cluster: label}``.
     """
     ids = token_ids.astype(int)
     M = ids.size
-    uniq = np.unique(ids)
-    sm = {int(t): (decode([int(t)]) if decode is not None else str(int(t))) for t in uniq}
-    glob = {int(t): int((ids == t).sum()) for t in uniq}
-    out: Dict[int, str] = {}
+    uniq, counts = np.unique(ids, return_counts=True)
+    sm   = {int(t): (decode([int(t)]) if decode is not None else str(int(t))) for t in uniq}
+    glob = {int(t): int(ct) for t, ct in zip(uniq.tolist(), counts.tolist())}
+    a = 0.5
+    V = uniq.size
+    out: Dict = {}
     for c in sorted(set(labels.tolist()) - {-1}):
         m = labels == c
         n_c = int(m.sum())
@@ -1666,20 +1754,26 @@ def _cluster_lift_labels(
         for t, ct in zip(loc_ids.tolist(), loc_ct.tolist()):
             if ct < floor:
                 continue
-            s = str(sm[int(t)]).strip()
-            if not s or "�" in s or not s.isprintable():    # drop empty / replacement-char / byte fragments
+            s = _lift_label_display(str(sm[int(t)]))
+            if s is None:
                 continue
-            scored.append(((ct / n_c) / (glob[int(t)] / M), s))
-        scored.sort(reverse=True)
-        seen, toks = set(), []
-        for _, s in scored:
+            g = glob[int(t)]
+            score = (np.log((ct + a) / (n_c + a * V))
+                     - np.log((g - ct + a) / ((M - n_c) + a * V)))
+            lift = (ct / n_c) / (g / M)
+            scored.append((score, g, s, lift))
+        scored.sort(key=lambda r: (-r[0], -r[1], r[2]))          # score desc, count desc, A->Z
+        seen, toks, top_lift = set(), [], 0.0
+        for _, _, s, lift in scored:
             if s not in seen:
                 seen.add(s)
                 toks.append(s)
+                if len(toks) == 1:
+                    top_lift = float(lift)
             if len(toks) >= k:
                 break
         if toks:
-            out[c] = ", ".join(toks)
+            out[c] = (", ".join(toks), top_lift) if with_stats else ", ".join(toks)
     return out
 
 
@@ -1691,111 +1785,154 @@ def plot_belief_umap(
     *,
     kind:             str              = "Belief",  # title noun: 'Belief' (q channel) / 'Model' (s channel)
     decode:           Optional[object] = None,   # decode(list[int]) -> str; None -> id labels
-    n_clusters_label: int              = 14,     # annotate the N largest clusters
+    n_clusters_label: int              = 14,     # legend/badge rows for the N largest clusters
     seed:             int              = 0,
     sil_sample:       int              = 2000,
     path:             Optional[str]    = None,
 ):
-    r"""F5: data-driven cluster map of one belief channel, each cluster labelled by its distinctive tokens.
+    r"""F5: data-driven cluster map of one belief channel -- numbered badges plus a legend band.
 
     ONE figure per channel (the caller emits mu / sigma / phi separately). The channel is embedded
     faithfully to its geometry (mu Euclidean, Sigma in the log-Euclidean chart, phi in the gauge
-    coordinates), the 2-D cloud is density-clustered (:func:`_cluster_embedding`), and the
-    ``n_clusters_label`` largest clusters are annotated -- a star at the cluster MEDOID and a leader to a
-    collision-free margin label of its top distinctive tokens by enrichment/lift (:func:`_cluster_lift_labels`),
-    so the reader sees WHAT each cluster is. A faint grey kernel-density underlay makes the dense core read
-    as density rather than an opaque blob; partial-opacity rasterized points keep overplotting legible; and
-    HDBSCAN noise is drawn light grey behind. This replaces the a-priori linguistic-category colouring,
-    which does NOT separate the belief geometry (silhouette near zero) -- that quantitative view lives in the
-    companion :func:`plot_belief_category_separation`; the function/content silhouette is noted in the title
-    for context when ``decode`` is available. ``decode is None`` falls back to raw token-id labels.
+    coordinates). Clusters are NOT computed on the 2-D display embedding (which tears and compresses
+    distances -- the documented UMAP anti-pattern): they come from a separate seeded clustering-space
+    embedding of the SAME features (min_dist=0, up to 10 components; the native features directly when
+    they are already that low-dimensional), so one cluster may legitimately render as several 2-D
+    islands. Each of the ``n_clusters_label`` largest clusters gets a numbered badge at its density-peak
+    member (:func:`_density_peak_anchor`) and a legend row -- number, color swatch, distinctive tokens
+    by smoothed log-odds enrichment (:func:`_cluster_lift_labels`), and size -- replacing the old
+    margin callouts whose full-span placement produced whole-plot leader lines. A dominant cluster
+    whose top token is not actually distinctive (raw lift < 1.5, or >25% of the bank) is labelled
+    "mixed core" instead of enrichment junk. Thin gray contours show DISPLAY-SPACE point density
+    (overplotting relief only -- 2-D UMAP does not preserve feature-space density); per-cluster point
+    size/alpha scale with population so the core stays translucent. The parameter footer states the
+    embedding, clustering, bank size, and per-channel metric; the function/content silhouette (the
+    a-priori-categories-do-not-separate caveat) is a small footnote when ``decode`` is available, with
+    the quantitative view in :func:`plot_belief_category_separation`. ``decode is None`` -> raw id labels.
     """
     feats = _belief_channel_features(bank, channel)
-    coords = _np(umap_embed(feats, seed=seed)).astype(float)
+    X = _np(feats).astype(float)
+    M = X.shape[0]
     token_ids = _np(bank["token_ids"]).astype(int)
-    labels = _cluster_embedding(coords, seed=seed)
+    n_disp = int(np.clip(round(np.sqrt(max(M, 1)) / 4.0), _UMAP_N_NEIGHBORS, 100))
+    coords = _np(umap_embed(feats, n_neighbors=n_disp, seed=seed)).astype(float)
+    if coords.shape[1] < 2:                                      # 1-D feature channel / M<=2: the
+        coords = np.column_stack([coords, np.zeros(len(coords))])   # n_components clamp returns (M,1)
+    cl_dim = min(10, X.shape[1], max(1, M - 1))
+    if cl_dim >= X.shape[1]:                                     # features already low-D: cluster them directly
+        cluster_coords, cluster_space = X, f"native {X.shape[1]}-D features"
+    else:
+        try:
+            cluster_coords = _np(umap_embed(feats, n_neighbors=30, min_dist=0.0,
+                                            n_components=cl_dim, seed=seed)).astype(float)
+            cluster_space = f"{cl_dim}-D UMAP (min_dist=0)"
+        except Exception:                                        # clustering embed failed -> status quo
+            cluster_coords, cluster_space = coords, "2-D display embedding"
+    labels, method_desc = _cluster_embedding(cluster_coords, seed=seed)
     cl = sorted(set(labels.tolist()) - {-1}, key=lambda c: -int((labels == c).sum()))
     noise = float((labels == -1).mean())
-    lab_text = _cluster_lift_labels(token_ids, labels, decode, k=3)
+    lab_stats = _cluster_lift_labels(token_ids, labels, decode, k=3, with_stats=True)
 
-    fig, ax = plt.subplots(figsize=(9.0, 6.6))
+    fig, ax = plt.subplots(figsize=(9.6, 6.4))
+    fig.subplots_adjust(left=0.02, right=0.68, top=0.92, bottom=0.07)
     xmin, xmax = float(coords[:, 0].min()), float(coords[:, 0].max())
     ymin, ymax = float(coords[:, 1].min()), float(coords[:, 1].max())
     rx, ry = (xmax - xmin) or 1.0, (ymax - ymin) or 1.0
-    try:                                                         # faint density underlay (best-effort)
+    try:                                                         # display-space density relief (best-effort)
         from scipy.stats import gaussian_kde
+        rng = np.random.default_rng(seed)
+        sub = coords if M <= 8000 else coords[rng.choice(M, size=8000, replace=False)]
         gx, gy = np.mgrid[xmin:xmax:120j, ymin:ymax:120j]
-        zz = gaussian_kde(coords.T)(np.vstack([gx.ravel(), gy.ravel()])).reshape(gx.shape)
-        ax.contourf(gx, gy, zz, levels=8, cmap="Greys", alpha=0.28, zorder=0)
-    except Exception:                                            # singular cloud / no scipy -> skip underlay
+        zz = gaussian_kde(sub.T)(np.vstack([gx.ravel(), gy.ravel()])).reshape(gx.shape)
+        lv = np.linspace(0.0, float(zz.max()), 10)[2:]           # drop the lowest bands: keep the page white
+        ax.contour(gx, gy, zz, levels=lv, colors="0.45", linewidths=0.5, alpha=0.6, zorder=3)
+    except Exception:                                            # singular cloud / no scipy -> skip relief
         pass
     nm = labels == -1
     if nm.any():
         ax.scatter(coords[nm, 0], coords[nm, 1], s=4, c="#bbbbbb", alpha=0.30, linewidths=0,
                    rasterized=True, zorder=1)
-    palette = plt.cm.tab20(np.linspace(0, 1, 20))
+    palette = plt.cm.tab20(np.linspace(0, 1, 20))[_TAB20_DISTINCT]
     col = {c: palette[i % 20] for i, c in enumerate(cl)}
     for c in cl:
         m = labels == c
-        ax.scatter(coords[m, 0], coords[m, 1], s=6, color=col[c], alpha=0.5, linewidths=0,
+        n_c = int(m.sum())
+        s_pt = float(np.clip(9.0 - 1.2 * np.log10(max(n_c, 1)), 2.5, 8.0))
+        a_pt = float(np.clip(2500.0 / max(n_c, 1), 0.10, 0.75))
+        ax.scatter(coords[m, 0], coords[m, 1], s=s_pt, color=col[c], alpha=a_pt, linewidths=0,
                    rasterized=True, zorder=2)
-    # Collision-free margin callouts: assign each labelled cluster to its NEAREST margin (top / bottom /
-    # left / right), then space the labels evenly along that margin with a leader to the cluster medoid.
-    # Four sides (vs one top + one bottom row) spread ~14 labels to ~3-4 per side, so neither crowds and
-    # the leaders stay short -- the failure the single-row layout hit when most clusters sat one side of
-    # the centre.
-    cx, cy = float(np.median(coords[:, 0])), float(np.median(coords[:, 1]))
-    items = []
-    for c in cl[:n_clusters_label]:
-        if c not in lab_text:
-            continue
+    # Numbered badges at density-peak anchors + legend band on the right. Badge numbers are the
+    # descending-size rank (deterministic: seeded embeddings, RNG-free HDBSCAN, stable sort). A
+    # fixed-order greedy nudge de-overlaps badges; a short leader marks any nudged badge's anchor.
+    extent = [[xmin, xmax], [ymin, ymax]]
+    r_sep = 0.045 * max(rx, ry)
+    placed: list = []
+    rows:   list = []
+    for rank, c in enumerate(cl[:n_clusters_label], start=1):
         pts = coords[labels == c]
-        md = pts[np.argmin(((pts - pts.mean(0)) ** 2).sum(1))]   # medoid: robust in-cluster anchor
-        items.append((c, md, lab_text[c]))
-    sides: Dict[str, list] = {"top": [], "bottom": [], "left": [], "right": []}
-    for c, md, lab in items:
-        dx, dy = (md[0] - cx) / rx, (md[1] - cy) / ry
-        if abs(dx) >= abs(dy):
-            sides["right" if dx >= 0 else "left"].append((c, md, lab))
-        else:
-            sides["top" if dy >= 0 else "bottom"].append((c, md, lab))
-    x_left, x_right = xmin - 0.04 * rx, xmax + 0.04 * rx
-    y_top, y_bot = ymax + 0.15 * ry, ymin - 0.15 * ry
-
-    def _callout(c, md, lab, lx, ly, ha, va):
-        ax.plot([md[0], lx], [md[1], ly], color=col[c], lw=0.7, alpha=0.7, zorder=4)
-        ax.scatter([md[0]], [md[1]], marker="*", s=55, color=col[c], edgecolor="black",
-                   linewidths=0.5, zorder=6)
-        ax.annotate(lab, xy=(lx, ly), fontsize=8, fontweight="bold", zorder=7, ha=ha, va=va,
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=col[c], lw=1.0, alpha=0.9))
-
-    for side in ("top", "bottom"):
-        row = sorted(sides[side], key=lambda it: it[1][0])      # order by x
-        xs = np.linspace(xmin, xmax, len(row)) if len(row) > 1 else [0.5 * (xmin + xmax)]
-        yrow, va = (y_top, "bottom") if side == "top" else (y_bot, "top")
-        for (c, md, lab), lx in zip(row, xs):
-            _callout(c, md, lab, lx, yrow, "center", va)
-    for side in ("left", "right"):
-        col_ = sorted(sides[side], key=lambda it: it[1][1])     # order by y
-        ys = np.linspace(ymin, ymax, len(col_)) if len(col_) > 1 else [0.5 * (ymin + ymax)]
-        xcol, ha = (x_left, "right") if side == "left" else (x_right, "left")
-        for (c, md, lab), ly in zip(col_, ys):
-            _callout(c, md, lab, xcol, ly, ha, "center")
-    ax.set_xlim(xmin - 0.30 * rx, xmax + 0.30 * rx)             # room for the left / right label boxes
-    ax.set_ylim(y_bot - 0.08 * ry, y_top + 0.08 * ry)
+        anchor = _density_peak_anchor(pts, extent).astype(float)
+        pos = anchor.copy()
+        for _ in range(24):
+            clash = next((q for q in placed
+                          if abs(pos[0] - q[0]) < r_sep and abs(pos[1] - q[1]) < r_sep), None)
+            if clash is None:
+                break
+            d = pos - clash
+            nrm = float(np.hypot(*d))
+            pos = pos + (d / nrm) * r_sep if nrm > 0 else pos + np.array([r_sep, 0.0])
+        pos = np.array([np.clip(pos[0], xmin, xmax), np.clip(pos[1], ymin, ymax)])  # keep badges on-axes
+        placed.append(pos)
+        n_c = int((labels == c).sum())
+        lab, top_lift = lab_stats.get(c, ("", 0.0))
+        if not lab or n_c / M > 0.25 or top_lift < 1.5:          # nothing is CONCENTRATED here -> say so
+            lab = "mixed core"
+        if float(np.hypot(*(pos - anchor))) > 1e-9:
+            ax.plot([anchor[0], pos[0]], [anchor[1], pos[1]], color=col[c], lw=0.7, alpha=0.8, zorder=5)
+        ax.scatter([pos[0]], [pos[1]], s=150, marker="o", facecolor="white", edgecolor=col[c],
+                   linewidths=1.5, zorder=6)
+        ax.text(pos[0], pos[1], str(rank), fontsize=7.5, fontweight="bold",
+                ha="center", va="center", zorder=7)
+        rows.append((rank, c, lab, n_c))
+    fig.text(0.70, 0.905, "clusters (by size) — distinctive tokens", fontsize=8.5,
+             fontweight="bold", va="top")
+    y = 0.865
+    for rank, c, lab, n_c in rows:
+        txt = lab if len(lab) <= 34 else lab[:33] + "…"
+        fig.text(0.700, y, "■", color=col[c], fontsize=9, va="center")
+        fig.text(0.716, y, f"{rank}. {txt}", fontsize=8, va="center")
+        fig.text(0.716, y - 0.022, f"n={n_c:,} ({n_c / M:.0%})", fontsize=6.5, color="0.4", va="center")
+        y -= 0.055
+    if len(cl) > n_clusters_label:                               # no silent cap
+        fig.text(0.70, y, f"+ {len(cl) - n_clusters_label} smaller clusters (points only)",
+                 fontsize=7, color="0.4", va="center")
+    if nm.any():
+        ax.scatter([], [], s=12, c="#bbbbbb", label=f"unclustered ({noise:.0%})")
+    ax.scatter([], [], s=60, marker="o", facecolor="white", edgecolor="0.35", linewidths=1.2,
+               label="badge = cluster density peak")
+    ax.legend(loc="lower left", fontsize=7, frameon=False)
+    ax.set_xlim(xmin - 0.04 * rx, xmax + 0.04 * rx)
+    ax.set_ylim(ymin - 0.06 * ry, ymax + 0.06 * ry)
     ax.set_xticks([]); ax.set_yticks([])
-    title = (f"{kind} {channel} — {len(cl)} data-driven clusters ({noise * 100:.0f}% noise); "
-             f"labels = distinctive (lift) tokens")
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    ax.set_title(f"{kind} {channel} — {len(cl)} data-driven clusters, {noise:.0%} unclustered",
+                 fontsize=11)
     if decode is not None:
         try:
             cats, _ = _token_category_labels(token_ids, decode, "function_content")
-            sil = clustering_metrics(_np(feats), cats, sample_size=sil_sample)["silhouette"]
-            title += (f"\nfunction/content category silhouette {sil:+.2f} "
-                      f"(~0 -> a-priori categories do not separate; clusters above are data-driven)")
+            sil = clustering_metrics(X, cats, sample_size=sil_sample)["silhouette"]
+            fig.text(0.02, 0.038, f"function/content category silhouette {sil:+.2f} in native space "
+                                  f"(~0 -> a-priori linguistic categories do not separate this channel)",
+                     fontsize=6.5, color="0.4", ha="left", va="bottom")
         except Exception:
             pass
-    ax.set_title(title, fontsize=10)
-    fig.tight_layout()
+    metric = {"mu": "Euclidean", "sigma": "log-Euclidean vech", "phi": "gauge coords"}.get(channel, "Euclidean")
+    n_seqs = int(np.unique(_np(bank["seq_idx"])).size) if "seq_idx" in bank else 0
+    fig.text(0.98, 0.012,
+             f"display: UMAP(n_neighbors={n_disp}, min_dist={_UMAP_MIN_DIST}, init=pca, seed={seed})"
+             f" · clusters: {method_desc} in {cluster_space}"
+             f" · M={M:,} tokens / {n_seqs} seqs · metric: {metric}",
+             fontsize=6, color="0.4", ha="right", va="bottom")
     return _save(fig, path)
 
 
