@@ -53,6 +53,23 @@ def test_gauge_diag_pullback_collects_cos_and_cond():
     assert gd["pullback_cond_max"] >= gd["pullback_cond_median"] - 1e-6
 
 
+def test_gauge_diag_declares_pullback_metric_as_full(monkeypatch):
+    from vfe3 import numerics
+
+    kinds = []
+
+    def _condition_number(matrix, *, eps=1e-12, kind="auto"):
+        kinds.append(kind)
+        return torch.ones(matrix.shape[:-2], device=matrix.device, dtype=matrix.dtype)
+
+    monkeypatch.setattr(numerics, "condition_number", _condition_number)
+    opt = _natgrad_opt_with_grads("pullback_per_block")
+    opt._collect_gauge_diag = True
+    opt.step()
+
+    assert kinds and set(kinds) == {"full"}
+
+
 def test_gauge_diag_killing_cos_is_one_and_no_cond():
     opt = _natgrad_opt_with_grads("killing_per_block")
     opt._collect_gauge_diag = True

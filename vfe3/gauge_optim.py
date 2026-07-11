@@ -482,7 +482,9 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                             from vfe3.numerics import condition_number
                             Gm = pullback_metric_per_block(flat_phi[active], Gd, self._irrep_dims)
                             eye = torch.eye(Gm.shape[-1], dtype=Gm.dtype, device=Gm.device)
-                            cond_acc.append(condition_number(Gm + 1e-6 * eye).reshape(-1))
+                            cond_acc.append(
+                                condition_number(Gm + 1e-6 * eye, kind="full").reshape(-1)
+                            )
                 nat = nat.reshape_as(g)
 
                 state = self.state[p]
