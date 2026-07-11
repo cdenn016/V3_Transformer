@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 import vfe3.model.prior_bank as prior_bank_module
 from vfe3.config import VFE3Config
-from vfe3.model.prior_bank import PriorBank, _CHUNKED_DECODERS, _FULL_DECODERS
+from vfe3.model.prior_bank import PriorBank, get_decode_registration
 
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
@@ -133,9 +133,10 @@ def _naive_el_logits(pb, mu_q, sigma_q):
 
 
 def test_expected_likelihood_registered_at_diagonal_rank():
-    # Config's rank cross-check reads _FULL_DECODERS; the new kernel must land diagonal.
-    assert "expected_likelihood_chunked" in _CHUNKED_DECODERS
-    assert "expected_likelihood_chunked" not in _FULL_DECODERS
+    registration = get_decode_registration("expected_likelihood_chunked")
+    assert registration.supports_chunked is True
+    assert registration.supports_full is False
+    assert registration.fused_ce is PriorBank.decode_ce_expected_likelihood_chunked
 
 
 def test_expected_likelihood_config_validates_diagonal_only():

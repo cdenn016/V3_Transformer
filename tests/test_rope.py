@@ -86,6 +86,20 @@ def _rope_cfg(**kw):
     return VFE3Config(**base)
 
 
+def test_rope_cache_key_tracks_mutated_rope_base():
+    model = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=100.0))
+    device = model.prior_bank.mu_embed.device
+    first = model._rope_rotation(8, device)
+
+    model.cfg.rope_base = 2.0
+    second = model._rope_rotation(8, device)
+    fresh = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=2.0))._rope_rotation(8, device)
+
+    assert not torch.equal(first, second)
+    assert torch.equal(second, fresh)
+    assert len(model._rope_cache) == 2
+
+
 def test_rope_changes_logits_vs_no_rope():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (2, 8))

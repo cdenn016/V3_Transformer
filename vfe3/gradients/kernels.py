@@ -33,6 +33,7 @@ def register_kernel(name: str, *, override: bool = False) -> Callable:
         if name in _KERNELS and not override:
             raise KeyError(f"kernel {name!r} already registered; pass override=True to replace")
         _KERNELS[name] = fn
+        _COMPILED_KERNELS.pop(name, None)
         return fn
     return _wrap
 

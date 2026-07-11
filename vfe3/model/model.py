@@ -28,7 +28,7 @@ from vfe3.geometry.transport import RopeTransport, _TRANSPORT_NEEDS_MU, _TRANSPO
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.positional_phi import apply_positional_phi
-from vfe3.model.prior_bank import _CHUNKED_DECODERS, PriorBank
+from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.model.stack import vfe_stack
 from vfe3.numerics import bounded_variance_from_log
 
@@ -520,7 +520,7 @@ class VFEModel(nn.Module):
         if self.cfg.pos_rotation == "none":
             return None
         dtype = self.prior_bank.mu_embed.dtype
-        key = (n, device, dtype)
+        key = (n, device, dtype, self.cfg.pos_rotation, self.cfg.rope_base)
         cached = self._rope_cache.get(key)
         if cached is None:
             cached = get_pos_rotation(self.cfg.pos_rotation)(
@@ -1232,49 +1232,26 @@ class VFEModel(nn.Module):
         # the autocast E-step), mirroring retraction.py's in-island sigma.float(). On the default
         # fp32 path .float() is a value-identical no-op AND the island is a nullcontext (see
         # _amp_off_context), so this block is byte-identical to the no-AMP build.
-        # Fused chunked-vocab decode+CE (decode_mode='diagonal_chunked', training path only): when
-        # targets are given, compute the cross-entropy by iterating V in chunks and accumulating a
-        # streaming logsumexp + a target-logit gather, so the (B, N, V) logit tensor is NEVER
-        # materialized (the memory win). KL-readout (use_prior_bank=True) routes to the diagonal
-        # kernel's fused CE (equal to 'diagonal' decode -> F.cross_entropy to atol-1e-3,
-        # tests/test_chunked_decode.py); the linear ablation (use_prior_bank=False) routes to its
-        # own fused CE over logits = mu @ W^T (+ b) (vram audit 2026-06-10: the dense linear path
-        # retained logits + cross_entropy's log-softmax copy, ~2 x B*N*V fp32, the single largest
-        # decode cost at large B). logits is None on this branch by design -- forming them would
-        # defeat the purpose; the training/eval callers (train.py) discard the returned logits.
-        # Inference (targets=None) still routes through decode() below for full logits.
+        # A decoder that advertises a fused CE dispatches through the callable stored in its single
+        # registration record. This keeps inference decode and training CE coherent for custom
+        # registry additions; the linear ablation uses its own registered fused CE while retaining
+        # decode_mode as the opt-in chunking toggle. logits is None on this branch by design.
+        decode_registration = get_decode_registration(self.cfg.decode_mode)
         fused_chunked = (
             targets is not None
-            and self.cfg.decode_mode in _CHUNKED_DECODERS
+            and decode_registration.supports_chunked
         )
         if fused_chunked:
             with self._amp_off_context(token_ids.device):
-                if self.cfg.use_prior_bank and self.cfg.decode_mode == "full_chunked":
-                    # full-covariance KL CE via the diagonal-prior closed form: no (B,N,V) logits
-                    # AND no (B,N,V,K,K) per-pair Cholesky workspace (decode_ce_full_chunked).
-                    ce = self.prior_bank.decode_ce_full_chunked(
-                        mu_final.float(), sigma_final.float(), targets,
-                        z_loss_weight=self.cfg.z_loss_weight,
-                    )
-                elif self.cfg.use_prior_bank and self.cfg.decode_mode == "expected_likelihood_chunked":
-                    # Expected-likelihood (Gaussian-convolution) readout: the fused CE twin of the
-                    # 'expected_likelihood_chunked' decode kernel (variances ADD, log N(mu_q; mu_v,
-                    # Sigma_q + Sigma_v)); routed explicitly since the generic bank branch below
-                    # assumes the diagonal-KL kernel.
-                    ce = self.prior_bank.decode_ce_expected_likelihood_chunked(
-                        mu_final.float(), sigma_final.float(), targets,
-                        z_loss_weight=self.cfg.z_loss_weight,
-                    )
-                elif self.cfg.use_prior_bank:
-                    ce = self.prior_bank.decode_ce_diagonal_chunked(
-                        mu_final.float(), sigma_final.float(), targets,
+                if self.cfg.use_prior_bank:
+                    ce = decode_registration.fused_ce(
+                        self.prior_bank, mu_final.float(), sigma_final.float(), targets,
                         z_loss_weight=self.cfg.z_loss_weight,
                     )
                 else:
-                    # linear decode; the chunked-CE path is rank-agnostic, so a '*_chunked'
-                    # decode_mode (diagonal_chunked or full_chunked) both route here.
-                    ce = self.prior_bank.decode_ce_linear_chunked(
-                        mu_final.float(), targets,
+                    linear_registration = get_decode_registration("linear")
+                    ce = linear_registration.fused_ce(
+                        self.prior_bank, mu_final.float(), targets,
                         z_loss_weight=self.cfg.z_loss_weight,
                     )
             logits = None                                        # no (B, N, V) tensor on the fused path

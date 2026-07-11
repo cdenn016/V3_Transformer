@@ -761,6 +761,10 @@ class VFE3Config:
             raise ValueError(f"eps must be positive, got {self.eps}")
         if self.kl_max <= 0.0:
             raise ValueError(f"kl_max must be positive, got {self.kl_max}")
+        if not (math.isfinite(self.rope_base) and self.rope_base > 0.0):
+            raise ValueError(f"rope_base must be finite and positive, got {self.rope_base}")
+        if not (math.isfinite(self.alibi_slope) and self.alibi_slope >= 0.0):
+            raise ValueError(f"alibi_slope must be finite and nonnegative, got {self.alibi_slope}")
         # sigma_max caps the covariance in the SPD retractions (clamp max=sigma_max); a nonfinite
         # or sub-eps cap would push the clamped covariance below eps / negative / NaN (audit
         # 2026-07-01 F2). None stays permissive (no cap).
@@ -1023,13 +1027,16 @@ class VFE3Config:
                 )
         # 'omega_direct' stores the per-token frame as a structure-group element U_i (belief.omega),
         # sourced from prior_bank.omega_embed, transport Omega_ij = U_i U_j^{-1}. Phase 2 scope:
-        # all seven omega-eligible groups (_OMEGA_GROUPS below), the flat regime, and no E-step
-        # frame refinement. Everything outside that scope is rejected with a clear message.
+        # every group whose registration advertises omega_direct_capable, the flat regime, and no
+        # E-step frame refinement. Everything outside that scope is rejected with a clear message.
         if self.gauge_parameterization == "omega_direct":
-            _OMEGA_GROUPS = ("glk", "block_glk", "tied_block_glk", "so_k", "so_n", "sp", "sp_n")
-            if self.gauge_group not in _OMEGA_GROUPS:
+            omega_groups = tuple(sorted(
+                name for name, builder in _GROUPS.items()
+                if getattr(builder, "omega_direct_capable", False)
+            ))
+            if not getattr(_GROUPS[self.gauge_group], "omega_direct_capable", False):
                 raise ValueError(
-                    f"gauge_parameterization='omega_direct' supports gauge_group in {_OMEGA_GROUPS}; "
+                    f"gauge_parameterization='omega_direct' supports gauge_group in {omega_groups}; "
                     f"got {self.gauge_group!r}."
                 )
             # det<0 seeding is group-specific; reject where the ambient diag(-1,1,...) seed is not a
@@ -1316,6 +1323,12 @@ class VFE3Config:
         # avoids a config <- alpha_i cycle.
         from vfe3.alpha_i import _ALPHAS
         _require(self.lambda_alpha_mode, tuple(sorted(_ALPHAS)), "lambda_alpha_mode")
+        if (self.lambda_alpha_mode == "constant"
+                and not (math.isfinite(self.lambda_alpha) and self.lambda_alpha >= 0.0)):
+            raise ValueError(
+                f"lambda_alpha must be finite and nonnegative under lambda_alpha_mode='constant', "
+                f"got {self.lambda_alpha}"
+            )
         # lambda_h_mode validated against the hyper-prior-coupling registry (the model-fiber mirror of
         # lambda_alpha_mode). r_update_mode selects the centroid M-step (gradient vs closed-form barycenter).
         from vfe3.lambda_h_i import _LAMBDA_H_MODES
@@ -1616,7 +1629,7 @@ class VFE3Config:
                 "rotations R(theta_i) do not commute with a global gauge element, so gauge-RoPE "
                 "breaks the global gauge equivariance of F/beta for every group (probe: beta "
                 "residual 0.44-0.61 under rope vs 7e-6 without). The equivariant positional paths "
-                "are pos_phi='sinusoidal'/'learned' (composed into phi) or pos_rotation='none'.",
+                "are pos_phi='frozen'/'learned' (composed into phi) or pos_rotation='none'.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -1718,7 +1731,7 @@ class VFE3Config:
         # / spd_retract_mode above). Local import avoids a config <- prior_bank cycle. decode_mode must
         # NOT accept 'linear': that kernel is reached only through the use_prior_bank=False second-gate
         # (a learned linear readout), never via decode_mode, so it is excluded from the valid set.
-        from vfe3.model.prior_bank import _DECODERS, _ENCODERS, _FULL_DECODERS
+        from vfe3.model.prior_bank import _DECODERS, _ENCODERS
         _require(self.decode_mode, tuple(sorted(set(_DECODERS) - {"linear"})), "decode_mode")
         # decode_mode sets the RANK of the prior-bank KL-decode kernel: 'diagonal'/'diagonal_chunked'
         # consume a diagonal sigma (B,N,K); 'full'/'full_chunked' consume a full sigma (B,N,K,K). It
@@ -1727,7 +1740,7 @@ class VFE3Config:
         # for exactly one thing: '*_chunked' selects the fused chunked-CE training path over
         # logits = mu @ W^T (vram audit 2026-06-10) -- rank is irrelevant there, so the cross-check
         # stays gated on use_prior_bank.
-        decode_is_full = self.decode_mode in _FULL_DECODERS
+        decode_is_full = _DECODERS[self.decode_mode].supports_full
         if self.use_prior_bank and decode_is_full == family_is_diagonal:
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "

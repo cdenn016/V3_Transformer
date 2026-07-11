@@ -31,6 +31,7 @@ kernel is pinned to EXACTLY (and under ``log_softmax``); both are alpha=1 KL.
 """
 
 import warnings
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -50,9 +51,19 @@ from vfe3.numerics import bounded_variance_from_log, safe_cholesky
 #   decode: fn(pb, mu_q, sigma_q, tau_eff) -> logits (B, N, V)
 # ---------------------------------------------------------------------------
 _ENCODERS: Dict[str, Callable] = {}
-_DECODERS: Dict[str, Callable] = {}
-_FULL_DECODERS:    set = set()   # decoders consuming a full (B,N,K,K) covariance (rank metadata)
-_CHUNKED_DECODERS: set = set()   # decoders with a fused chunked-CE training path (no (B,N,V) logits)
+
+
+@dataclass(frozen=True)
+class DecodeRegistration:
+    """A decode callable and all routing capabilities attached to that callable."""
+
+    callable:         Callable
+    supports_full:    bool
+    supports_chunked: bool
+    fused_ce:         Optional[Callable]
+
+
+_DECODERS: Dict[str, DecodeRegistration] = {}
 
 # Once-per-process guard for the decode_unigram_prior=True-with-unset-table warning
 # (the decode then degenerates to the current uniform-prior behavior).
@@ -82,14 +93,21 @@ def get_encode(name: str) -> Callable:
     return _ENCODERS[name]
 
 
-def register_decode(name: str, *, is_full: bool = False, chunked: bool = False, override: bool = False) -> Callable:
+def register_decode(
+    name: str,
+
+    *,
+    supports_full:    bool               = False,
+    supports_chunked: bool               = False,
+    override:         bool               = False,
+    fused_ce:         Optional[Callable] = None,
+) -> Callable:
     """Decorator registering a decode kernel under ``name``.
 
-    ``is_full``/``chunked`` are routing metadata: ``is_full`` flags a decoder that consumes a full
-    ``(B, N, K, K)`` covariance (read by the config rank cross-check), ``chunked`` flags one with a
-    fused chunked-CE training path (read by the model's fused-CE dispatch). Declaring them AT
-    REGISTRATION keeps the add-by-registering contract -- a new decoder advertises its capabilities
-    here instead of being threaded into literal-name tuples at the call sites.
+    ``supports_full`` flags a decoder that consumes a full ``(B, N, K, K)`` covariance.
+    ``supports_chunked`` advertises a fused chunked-CE training path, whose callable is ``fused_ce``.
+    The callable and all capabilities are replaced atomically, so an override cannot retain stale
+    routing metadata from the prior registration.
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
     existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
@@ -97,22 +115,33 @@ def register_decode(name: str, *, is_full: bool = False, chunked: bool = False, 
     def _wrap(fn: Callable) -> Callable:
         if name in _DECODERS and not override:
             raise KeyError(f"decode mode {name!r} already registered; pass override=True to replace")
-        _DECODERS[name] = fn
-        if is_full:
-            _FULL_DECODERS.add(name)
-        if chunked:
-            _CHUNKED_DECODERS.add(name)
+        if supports_chunked != (fused_ce is not None):
+            raise ValueError(
+                f"decode mode {name!r} must declare supports_chunked=True exactly when fused_ce "
+                f"is provided"
+            )
+        _DECODERS[name] = DecodeRegistration(
+            callable=fn,
+            supports_full=supports_full,
+            supports_chunked=supports_chunked,
+            fused_ce=fused_ce,
+        )
         return fn
     return _wrap
 
 
-def get_decode(name: str) -> Callable:
-    """Return the registered decode kernel for ``name`` (KeyError if absent)."""
+def get_decode_registration(name: str) -> DecodeRegistration:
+    """Return the complete registration record for ``name`` (KeyError if absent)."""
     if name not in _DECODERS:
         raise KeyError(
             f"no decode mode registered under {name!r}; available: {sorted(_DECODERS)}"
         )
     return _DECODERS[name]
+
+
+def get_decode(name: str) -> Callable:
+    """Return the registered decode kernel for ``name`` (KeyError if absent)."""
+    return get_decode_registration(name).callable
 
 
 class PriorBank(nn.Module):
@@ -1110,7 +1139,11 @@ def _decode_diagonal(
     return -kl_v / tau_eff                                               # reference_decode's safe_kl_clamp (r2 id17)
 
 
-@register_decode("diagonal_chunked", chunked=True)
+@register_decode(
+    "diagonal_chunked",
+    supports_chunked=True,
+    fused_ce=PriorBank.decode_ce_diagonal_chunked,
+)
 def _decode_diagonal_chunked(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -1127,7 +1160,7 @@ def _decode_diagonal_chunked(
     return _decode_diagonal(pb, mu_q, sigma_q, tau_eff)
 
 
-@register_decode("full", is_full=True)
+@register_decode("full", supports_full=True)
 def _decode_full(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -1160,7 +1193,12 @@ def _decode_full(
     return -kl_v / tau_eff
 
 
-@register_decode("full_chunked", is_full=True, chunked=True)
+@register_decode(
+    "full_chunked",
+    supports_full=True,
+    supports_chunked=True,
+    fused_ce=PriorBank.decode_ce_full_chunked,
+)
 def _decode_full_chunked(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -1194,7 +1232,11 @@ def _decode_full_chunked(
     return -kl_v / tau_eff                                               # _decode_diagonal (audit 2026-07-05 m5)
 
 
-@register_decode("expected_likelihood_chunked", chunked=True)
+@register_decode(
+    "expected_likelihood_chunked",
+    supports_chunked=True,
+    fused_ce=PriorBank.decode_ce_expected_likelihood_chunked,
+)
 def _decode_expected_likelihood_chunked(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -1237,7 +1279,11 @@ def _decode_expected_likelihood_chunked(
     return torch.cat(logit_chunks, dim=-1)                               # (B, N, V)
 
 
-@register_decode("linear")
+@register_decode(
+    "linear",
+    supports_chunked=True,
+    fused_ce=PriorBank.decode_ce_linear_chunked,
+)
 def _decode_linear(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
