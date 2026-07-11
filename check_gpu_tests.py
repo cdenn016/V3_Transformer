@@ -33,6 +33,8 @@ from dataclasses import replace
 
 import torch
 
+from check_junit import run_pytest_junit
+
 
 def _run_t3(dev):
     from tests.test_train import (_MARGINAL_ENTROPY_P3, _CUTOVER_MARGIN,
@@ -76,19 +78,29 @@ def main():
     t3_ok = _run_t3(dev)
 
     t6_code = 0
+    t6_counts = None
     if RUN_T6:
-        import pytest
         t6 = [
             "tests/test_laplace_family.py::test_laplace_cuda_matches_cpu",          # t6: Laplace CPU<->CUDA agreement
             "tests/test_efe_scorer.py::test_preference_builders_are_device_aware",  # t6: efe-scorer device regression
         ]
         print("t6 -- CUDA-only pytest tests:")
-        t6_code = pytest.main(t6 + ["-v", "-p", "no:cacheprovider"])
+        t6_code, t6_counts = run_pytest_junit(
+            t6 + ["-v", "-p", "no:cacheprovider"],
+            prefix="vfe3-gpu-t6-",
+        )
 
     bar = "=" * 64
     print("\n" + bar)
-    print(f"GPU CHECK: t3 gate {'CLEARS' if t3_ok else 'FAILS'} the ln(3) margin"
-          + (f"  |  t6 {'GREEN' if t6_code == 0 else f'FAIL (exit {t6_code})'}" if RUN_T6 else ""))
+    if RUN_T6:
+        t6_summary = (
+            f"  |  t6 {'GREEN' if t6_code == 0 else f'FAIL (exit {t6_code})'} "
+            f"({t6_counts['passes']} passed, {t6_counts['skipped']} skipped, "
+            f"{t6_counts['failures']} failed, {t6_counts['errors']} errors)"
+        )
+    else:
+        t6_summary = ""
+    print(f"GPU CHECK: t3 gate {'CLEARS' if t3_ok else 'FAILS'} the ln(3) margin" + t6_summary)
     print(bar)
     # exit 0 only if the t3 gate clears AND (t6 ran green or was skipped)
     return 0 if (t3_ok and t6_code == 0) else 1

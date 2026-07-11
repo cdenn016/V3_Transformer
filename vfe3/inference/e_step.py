@@ -899,31 +899,35 @@ def e_step(
     group:             GaugeGroup,
 
     *,
-    n_iter:            int   = 1,
-    tau:               'float | torch.Tensor' = 1.0,
-    e_q_mu_lr:         float = 0.1,
-    e_q_sigma_lr:      float = 0.1,
-    e_phi_lr:          float = 0.1,
-    return_trajectory: bool  = False,
-    e_step_gradient:   str   = "unroll",
-    oracle_unroll_grad: bool = False,            # explicit (not in kwargs): keep it off the F_diag bag
+    tau:                       'float | torch.Tensor' = 1.0,
+
+    e_q_mu_lr:                 float = 0.1,
+    e_q_sigma_lr:              float = 0.1,
+    e_phi_lr:                  float = 0.1,
+    exp_fp64_norm_threshold:   float = 5.0,       # 'norm': max clamped block ||M||_F upcast threshold
+
+    n_iter:                    int = 1,
     # Tier-1 loop control (2026-07-05; explicit, off the F_diag bag). All default OFF/byte-identical.
-    e_steps_min:           int  = 1,             # randomize_e_steps: T ~ Uniform{e_steps_min..e_steps_max}
-    e_steps_max:           int  = 4,
-    e_steps_backprop_last: int  = 0,             # truncated backprop: no_grad prefix, detach at the boundary (0 = OFF)
-    randomize_e_steps:     bool = False,         # training forwards sample T; eval keeps n_iter
-    e_step_halt_tol:       Optional[float] = None,       # eval halting: break when mean KL(q^t||q^{t-1}) < tol
+    e_steps_min:               int = 1,           # randomize_e_steps: T ~ Uniform{e_steps_min..e_steps_max}
+    e_steps_max:               int = 4,
+    e_steps_backprop_last:     int = 0,           # truncated backprop: no_grad prefix, detach at the boundary (0 = OFF)
+
+    e_step_gradient:           str = "unroll",
     # Tier-1 transport perf toggles (2026-07-05; explicit, off the F_diag bag -- that diagnostic
     # deliberately keeps the default transport numerics). All default OFF/byte-identical.
-    exp_fp64_mode:           str   = "dim",      # flat-builder float64-island keying ('dim' | 'norm')
-    exp_fp64_norm_threshold: float = 5.0,        # 'norm': max clamped block ||M||_F upcast threshold
-    transport_mean_per_head: bool  = False,      # factored transport_mean contracts per gauge block
-    grad_record:       Optional[dict]         = None,   # diag out-param (explicit): LAST iteration's belief-grad norms
-    rope:              Optional[torch.Tensor] = None,
-    rope_on_cov:       bool                   = False,
-    rope_on_value:     bool                   = True,
+    exp_fp64_mode:             str = "dim",       # flat-builder float64-island keying ('dim' | 'norm')
 
-    log_prior:         Optional[torch.Tensor] = None,
+    return_trajectory:           bool = False,
+    oracle_unroll_grad:          bool = False,    # explicit (not in kwargs): keep it off the F_diag bag
+    randomize_e_steps:           bool = False,    # training forwards sample T; eval keeps n_iter
+    transport_mean_per_head:     bool = False,    # factored transport_mean contracts per gauge block
+    rope_on_cov:                 bool = False,
+    rope_on_value:               bool = True,
+
+    e_step_halt_tol:             Optional[float]        = None,   # eval halting: break when mean KL(q^t||q^{t-1}) < tol
+    grad_record:                 Optional[dict]         = None,   # diag out-param: LAST iteration's belief-grad norms
+    rope:                        Optional[torch.Tensor] = None,
+    log_prior:                   Optional[torch.Tensor] = None,
     prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,   # share_refine_s_transport: caller-built flat transport
     **kwargs,
 ) -> 'BeliefState | Tuple[BeliefState, List[float]]':

@@ -26,7 +26,7 @@ os.environ["VFE3_TEST_DEVICE"] = DEVICE     # tests read this at import time
 
 import sys
 
-import pytest
+from check_junit import run_pytest_junit
 
 # Each entry: (finding, "path::test"). Parametrized tests expand to all their cases.
 AUDIT_TESTS = [
@@ -71,13 +71,21 @@ if __name__ == "__main__":
     args = node_ids + ["-p", "no:cacheprovider"]
     args += ["-v"] if VERBOSE else []
     args += ["-x"] if STOP_ON_FIRST_FAIL else []
-    print(f"Running {len(node_ids)} audit-fix tests on device={DEVICE!r} ...\n")
-    code = pytest.main(args)
+    print(f"Running {len(node_ids)} requested audit-fix nodes on device={DEVICE!r} ...\n")
+    code, counts = run_pytest_junit(args, prefix="vfe3-audit-fixes-")
     bar = "=" * 64
     print("\n" + bar)
     if code == 0:
-        print(f"AUDIT-FIX VERIFICATION: ALL GREEN  ({len(node_ids)} tests, device={DEVICE})")
+        print(
+            "AUDIT-FIX VERIFICATION: ALL GREEN  "
+            f"({counts['passes']} passed, {counts['skipped']} skipped, "
+            f"{counts['tests']} collected, device={DEVICE})"
+        )
     else:
-        print(f"AUDIT-FIX VERIFICATION: FAILURES  (pytest exit code {code}, device={DEVICE})")
+        print(
+            "AUDIT-FIX VERIFICATION: FAILURES  "
+            f"({counts['passes']} passed, {counts['failures']} failed, {counts['errors']} errors, "
+            f"{counts['skipped']} skipped, pytest exit code {code}, device={DEVICE})"
+        )
     print(bar)
     sys.exit(code)

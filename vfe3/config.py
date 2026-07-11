@@ -2320,6 +2320,11 @@ class VFE3Config:
                 f"exp_fp64_norm_threshold must be > 0, got {self.exp_fp64_norm_threshold}"
             )
         if self.randomize_e_steps:
+            if type(self.e_steps_min) is not int or type(self.e_steps_max) is not int:
+                raise ValueError(
+                    "e_steps_min and e_steps_max must be integers when randomize_e_steps=True, got "
+                    f"e_steps_min={self.e_steps_min!r}, e_steps_max={self.e_steps_max!r}"
+                )
             if not (1 <= self.e_steps_min <= self.e_steps_max):
                 raise ValueError(
                     f"randomize_e_steps needs 1 <= e_steps_min <= e_steps_max, got "

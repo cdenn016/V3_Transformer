@@ -726,6 +726,26 @@ def test_omega_direct_reflection_cross_check_fail_closed():
     assert VFE3Config(embed_dim=4, n_heads=1, gauge_group="glk", **base).omega_reflection == "init_seed"
 
 
+@pytest.mark.parametrize("e_steps_min,e_steps_max", [
+    (1.0, 4),
+    (1, 4.0),
+    (True, 4),
+    (1, False),
+])
+def test_randomized_e_step_bounds_require_exact_integers(e_steps_min, e_steps_max):
+    with pytest.raises(ValueError, match="e_steps_min and e_steps_max must be integers"):
+        VFE3Config(
+            randomize_e_steps=True,
+            e_steps_min=e_steps_min,
+            e_steps_max=e_steps_max,
+        )
+
+
+def test_randomized_e_step_integer_bounds_remain_valid():
+    cfg = VFE3Config(randomize_e_steps=True, e_steps_min=2, e_steps_max=5)
+    assert (cfg.e_steps_min, cfg.e_steps_max) == (2, 5)
+
+
 @pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), float("-inf")])
 def test_constant_lambda_alpha_requires_finite_nonnegative_value(value):
     with pytest.raises(ValueError, match="lambda_alpha"):

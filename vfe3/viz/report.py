@@ -153,14 +153,14 @@ def generate_figures(
     readout     = _safe(lambda: extract.decode_readout(model), "decode_readout")
     run_label   = f"K{cfg.embed_dim}"
 
-    # gpt2/cl100k decoder for the belief-UMAP linguistic-category colouring + token labels (None when
-    # tiktoken is absent or the dataset has no real tokenizer -> the UMAP greys out and labels by id).
+    # gpt2/cl100k decoder for the belief-UMAP linguistic-category coloring + token labels (None when
+    # tiktoken is absent or the dataset has no real tokenizer -> the UMAP grays out and labels by id).
     decode = None
     try:
         from vfe3.data.datasets import get_tiktoken_decoder
         decode = get_tiktoken_decoder(dataset)
     except Exception as exc:
-        logger.warning("token decoder unavailable (%s); belief UMAP will grey out", exc)
+        logger.warning("token decoder unavailable (%s); belief UMAP will gray out", exc)
 
     # Decode-calibration reliability bins (conf/acc/frac) the run already wrote to research.json
     # (run_artifacts._calibration_and_strata); the B1/EXP-3 reliability diagram only plots them.
@@ -273,7 +273,7 @@ def generate_figures(
           lambda p: figs.plot_hyper_prior_coupling(h_coupling, path=p),
           h_coupling is not None)
     # Per-head model-coupling (gamma) attention heatmaps (viridis), one file per head -- the
-    # s-channel sibling of the belief beta maps, in a distinct colour family.
+    # s-channel sibling of the belief beta maps, in a distinct color family.
     if gamma_attn is not None:
         gm = gamma_attn["gamma"]                                  # (H, N, N)
         gm = gm if gm.dim() == 3 else gm[None]
