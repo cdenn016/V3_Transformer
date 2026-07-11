@@ -14,7 +14,6 @@ so a gradient step on the priors improves inference end to end. Click-to-run: ed
 import contextlib
 import logging
 import math
-import time
 import weakref
 from numbers import Real
 from pathlib import Path
@@ -40,6 +39,7 @@ from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
 #                                                      lazily (function-local), so there is no cycle
 from vfe3.runtime import seed_everything
+from vfe3.timing import TrainingTimer
 from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source for the phi-clamp threshold (M2)
 
 
@@ -1024,9 +1024,10 @@ def train(
                 "checkpoint data_state cannot be replayed by the current loader: "
                 "batches_consumed exceeds the saved epoch") from exc
         batches_consumed += 1
-    win_t0 = time.perf_counter()
-    train_t0 = win_t0                                 # cumulative wall-clock origin (D1/EXP-8; resets on resume)
-    win_i0 = start_step
+    timing_enabled = bool(log_interval) or (
+        artifacts is not None and bool(eval_interval) and val_loader is not None
+    )
+    timer = TrainingTimer(device) if timing_enabled else None
     last_val: Dict[str, float] = {}                  # most recent validation, carried into each CSV row
     last_val_diag: Dict[str, float] = {k: float("nan") for k in _VAL_DIAG_KEYS}   # held-out probes, carried forward
     for step in _step_indices():
@@ -1062,9 +1063,13 @@ def train(
             # leaving the train_step RNG stream and weights byte-identical.
             d = model.diagnostics(tokens)
         step_status: Dict[str, bool] = {}
+        if timer is not None:
+            timer.start_step()
         losses.append(train_step(model, optimizer, scheduler, tokens, targets,
                                   grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
                                   scaler=scaler, metrics_out=step_metrics, status_out=step_status))
+        if timer is not None:
+            timer.finish_step(n_tokens=tokens.numel())
         # Metropolis det-sign sweep (opt-in, default OFF): runs on the POST-optimizer-step model,
         # gated + cadence-checked by the helper; inert (no call, no generator draw) unless
         # cfg.omega_reflection == 'metropolis'. tokens is the SAME input batch just fed to train_step.
@@ -1077,22 +1082,19 @@ def train(
             # post-step re-forward made train_ce one optimizer step ahead of train_loss (audit r2 id5).
             ce = step_metrics.get("train_ce", float("nan")) if step_metrics is not None else float("nan")
             # d (the F-decomposition) is computed PRE-step above so it shares train_ce's provenance (m7).
-            # Throughput + peak memory over the window since the last log/eval, then reset the window.
-            # Computed here (not inside do_log) so a CSV row on an eval-only step still carries the rate.
-            now = time.perf_counter()
-            rate = (step + 1 - win_i0) / max(now - win_t0, 1e-9)             # optimizer steps/s
-            toks_per_s = rate * int(tokens.shape[0]) * int(tokens.shape[1])  # tokens/s
-            if torch.cuda.is_available():
-                peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
-                torch.cuda.reset_peak_memory_stats()
+            assert timer is not None
+            train_timing = timer.sample_train_window()
+            if device.type == "cuda":
+                peak_mem_mb = torch.cuda.max_memory_allocated(device) / 1e6
+                torch.cuda.reset_peak_memory_stats(device)
             else:
                 peak_mem_mb = float("nan")
-            win_t0, win_i0 = now, step + 1
 
         if do_log:
             logger.info(
-                "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | it/s: %.2f | \n\n         Train PPL: %.1f \n",
-                step + 1, n_steps, losses[-1], ce, d["attn_entropy"], rate, math.exp(min(ce, 20.0)),
+                "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | train it/s: %.2f | \n\n         Train PPL: %.1f \n",
+                step + 1, n_steps, losses[-1], ce, d["attn_entropy"],
+                train_timing.train_steps_per_s, math.exp(min(ce, 20.0)),
             )
             logger.info(
                 "    F: self %.4f | belief %.4f | entropy %.4f | total %.4f | eff_rank %.2f | BPC %.4f",
@@ -1162,6 +1164,18 @@ def train(
             if ema is not None:
                 ema.restore(model)                       # live SGD weights back before the next train_step
 
+        # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
+        if (artifacts is not None and cfg.checkpoint_interval
+                and (step + 1) % cfg.checkpoint_interval == 0):
+            checkpoint_data_state = ({
+                "epoch_start_generator_state": epoch_start_generator_state,
+                "batches_consumed":            batches_consumed,
+                "epoch":                       epoch,
+            } if epoch_start_generator_state is not None else None)
+            artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler, ema=ema,
+                                      metropolis_generator=metro_gen,
+                                      data_state=checkpoint_data_state)
+
         # Persistence is opt-in: with no artifacts object do_csv is False, so the silent/in-memory
         # path is unchanged. A metrics.csv row is written every LOG_INTERVAL (and every eval) -- the
         # dense per-step diagnostics off the graph. The EVAL-CADENCE columns (val_ce/ppl/bpc,
@@ -1196,9 +1210,8 @@ def train(
                 "holonomy_deviation": d["holonomy_deviation"],
                 "gauge_trace_spread": d["gauge_trace_spread"],
             }
-            # Throughput + peak memory (Tier-1): tokens/s over the window and CUDA peak MB.
-            row["tokens_per_s"] = toks_per_s
-            row["peak_mem_mb"]  = peak_mem_mb
+            # Peak memory (Tier-1): CUDA peak MB at the clean train-window boundary.
+            row["peak_mem_mb"] = peak_mem_mb
             # Learnable softmax temperatures (default-off): log the live kappa values once per
             # metrics row so finalize_run can plot their training trajectory. The variance is the
             # population variance across irrep blocks/heads at that step (0 for a single block).
@@ -1218,9 +1231,6 @@ def train(
                         _kb = float(_kv[_bi])
                         row[f"kappa_{_ch}_b{_bi}"] = _kb
                         row[f"tau_{_ch}_b{_bi}"]   = _kb * float(_dims[_bi]) ** 0.5
-            # Cumulative wall time since training start (D1/EXP-8): the x-axis of the per-wall-clock
-            # convergence curve (val_ppl vs wall_clock_s). 'now' is the window timestamp captured above.
-            row["wall_clock_s"] = now - train_t0
             # Generalization gap (Tier-1): val-set CE minus the per-step train CE (positive = overfit,
             # the standard convention). The train side is seq-0 (diagnostics runs on seq 0) while val is
             # the token-weighted val-set mean, so read it as a TREND, not an absolute. Eval-cadence like
@@ -1306,19 +1316,14 @@ def train(
             for _mck in ("hyper_prior", "hyper_prior_weighted", "gamma_coupling", "gamma_meta_entropy"):
                 if _mck in d:
                     row[_mck] = d[_mck] / n_tok
+            pipeline_timing = timer.sample_pipeline_window()
+            row["train_step_ms_mean"]      = train_timing.train_step_ms_mean
+            row["train_step_tokens_per_s"] = train_timing.train_step_tokens_per_s
+            row["pipeline_tokens_per_s"]   = pipeline_timing.pipeline_tokens_per_s
+            row["tokens_per_s"]            = pipeline_timing.pipeline_tokens_per_s
+            row["wall_clock_s"]            = pipeline_timing.wall_clock_s
             artifacts.log_metrics(row)
-
-        # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
-        if (artifacts is not None and cfg.checkpoint_interval
-                and (step + 1) % cfg.checkpoint_interval == 0):
-            checkpoint_data_state = ({
-                "epoch_start_generator_state": epoch_start_generator_state,
-                "batches_consumed":            batches_consumed,
-                "epoch":                       epoch,
-            } if epoch_start_generator_state is not None else None)
-            artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler, ema=ema,
-                                      metropolis_generator=metro_gen,
-                                      data_state=checkpoint_data_state)
+            timer.reset_pipeline_window()
     if ema is not None:
         ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses
