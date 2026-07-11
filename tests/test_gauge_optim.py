@@ -194,12 +194,12 @@ def test_state_dict_roundtrips_omega_reorth_cadence(monkeypatch):
     assert legacy_opt._omega_step == 0
 
 
-def test_omega_reorthogonalizes_only_dirty_rows(monkeypatch):
+def test_omega_reorthogonalizes_only_dirty_rows(monkeypatch, device):
     import vfe3.gauge_optim as gauge_optim_mod
     from vfe3.geometry.groups import get_group
 
-    group = get_group("so_k")(K=4)
-    U = nn.Parameter(torch.eye(4).expand(5, 4, 4).clone())
+    group = get_group("so_k")(K=4, device=device)
+    U = nn.Parameter(torch.eye(4, device=device).expand(5, 4, 4).clone())
     with torch.no_grad():
         U[0] *= 1.20
         U[4] *= 0.80
@@ -225,6 +225,8 @@ def test_omega_reorthogonalizes_only_dirty_rows(monkeypatch):
     opt.step()
 
     assert seen_shapes == [(2, 4, 4)]
+    assert opt.state[U]["omega_dirty"].device == U.device
+    assert not bool(opt.state[U]["omega_dirty"].any())
     assert torch.equal(U.detach()[[0, 4]], untouched_before)
 
 

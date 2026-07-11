@@ -295,7 +295,8 @@ def test_mstep_self_coupling_reads_converged_pretransform_belief():
         for dlt in model.head_mixer.mixer_deltas:
             dlt.add_(0.3)
     tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
-    logits, loss, _ = model(tok, tgt)
+    logits = model(tok)
+    _, loss, _ = model(tok, tgt)
     ce = F.cross_entropy(logits.reshape(-1, model.cfg.vocab_size), tgt.reshape(-1),
                          ignore_index=-100)
     # replicate the forward's belief pipeline with the capture

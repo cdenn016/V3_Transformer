@@ -28,7 +28,7 @@ def test_full_covariance_model_runs_end_to_end():
     """The full-covariance pure path runs encode -> E-step -> full decode -> CE, forward+backward."""
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.01, e_phi_lr=0.0,
-                     family="gaussian_full", decode_mode="full")
+                     family="gaussian_full", decode_mode="full", use_prior_bank=True)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (2, 5)); targets = torch.randint(0, 20, (2, 5))
     beliefs = model.prior_bank.encode(tokens)

@@ -96,7 +96,8 @@ def _model_forward_finite(prior_name: str):
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (2, 8))
     targets = torch.randint(0, 12, (2, 8))
-    logits, _, ce = model(tokens, targets)
+    logits = model(tokens)
+    _, _, ce = model(tokens, targets)
     assert torch.isfinite(logits).all() and torch.isfinite(ce)
 
 

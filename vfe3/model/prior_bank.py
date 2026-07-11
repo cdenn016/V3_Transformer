@@ -619,7 +619,7 @@ class PriorBank(nn.Module):
     ) -> torch.Tensor:                   # (B, N, V) logits
         r"""Decode logits via the selected kernel; ``use_prior_bank`` is the single gate.
 
-        True (default, pure path): the KL-to-prior readout -KL(q_i || pi_v)/tau_eff with the
+        True (the opt-in pure path): the KL-to-prior readout -KL(q_i || pi_v)/tau_eff with the
         covariance structure given by ``decode_mode`` (diagonal | full). False (ablation): the
         ``linear`` kernel logits = mu_q @ W^T (sigma_q and tau_eff ignored). Routing here -- not
         through a second config value -- keeps ``decode_mode`` and ``use_prior_bank`` from ever

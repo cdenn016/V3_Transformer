@@ -40,7 +40,8 @@ def test_alibi_single_block_runs_with_n_heads_1_at_any_batch():
     prior = model._attention_log_prior(5, torch.device("cpu"))
     assert prior.shape == (5, 5)                                # squeezed, no phantom head axis
     tok = torch.randint(0, 12, (3, 5)); tgt = torch.randint(0, 12, (3, 5))
-    logits, loss, _ = model(tok, tgt)
+    logits = model(tok)
+    _, loss, _ = model(tok, tgt)
     assert logits.shape == (3, 5, 12)
     assert torch.isfinite(loss)
 

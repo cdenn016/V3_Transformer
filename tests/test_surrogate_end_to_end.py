@@ -44,7 +44,8 @@ def test_surrogate_forward_and_backward_through_oracle_branch():
     torch.manual_seed(0)
     model = VFEModel(cfg)
     tokens, targets = _batch()
-    logits, loss, ce = model(tokens, targets)               # (logits, differentiable loss, detached CE)
+    logits = model(tokens)
+    _, loss, ce = model(tokens, targets)                    # fused training CE may omit logits
     assert torch.isfinite(logits).all() and torch.isfinite(loss) and torch.isfinite(ce)
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.grad is not None]

@@ -558,23 +558,23 @@ def test_compact_omega_cache_rebuild_matches_full_rollout(monkeypatch):
         f"max |dq|={float((q_cache - q_full).abs().max()):.2e}"
 
 
-def test_omega_direct_cache_matches_full_after_skew_frame_drift():
+def test_omega_direct_cache_matches_full_after_skew_frame_drift(device):
     torch.manual_seed(0)
     m = VFEModel(_cfg(
         gauge_parameterization="omega_direct", gauge_group="so_k",
         family="gaussian_diagonal", decode_mode="diagonal", n_e_steps=1,
-    ))
+    )).to(device)
     assert cache_supported(m.cfg)
 
     with torch.no_grad():
-        drifted = torch.eye(4).expand(m.cfg.vocab_size, 4, 4).clone()
-        drifted[:, 0, 0] = torch.linspace(1.05, 1.30, m.cfg.vocab_size)
-        drifted[:, 0, 1] = torch.linspace(0.03, 0.12, m.cfg.vocab_size)
+        drifted = torch.eye(4, device=device).expand(m.cfg.vocab_size, 4, 4).clone()
+        drifted[:, 0, 0] = torch.linspace(1.05, 1.30, m.cfg.vocab_size, device=device)
+        drifted[:, 0, 1] = torch.linspace(0.03, 0.12, m.cfg.vocab_size, device=device)
         m.prior_bank.omega_embed.copy_(drifted)
 
     B, N, Kp, L, V = 2, 2, 2, 1, m.cfg.vocab_size
-    context = torch.tensor([[0, 1], [2, 3]])
-    candidates = torch.tensor([[[4], [5]], [[1], [4]]])
+    context = torch.tensor([[0, 1], [2, 3]], device=device)
+    candidates = torch.tensor([[[4], [5]], [[1], [4]]], device=device)
 
     with torch.no_grad():
         base_logits = m.forward(context)[:, -1, :]
@@ -586,6 +586,8 @@ def test_omega_direct_cache_matches_full_after_skew_frame_drift():
             context, candidates, m, base_logits=base_logits)
 
     lp_full = torch.gather(torch.log_softmax(base_logits, dim=-1), 1, candidates[:, :, 0])
+    assert q_cache.device == context.device
+    assert lp_cache.device == context.device
     assert torch.allclose(lp_cache, lp_full, atol=1e-6)
     assert torch.allclose(q_cache, q_full, atol=2e-5), \
         f"max |dq|={float((q_cache - q_full).abs().max()):.2e}"
@@ -726,18 +728,19 @@ def test_element_transport_skew_group_uses_transpose_inverse():
     assert torch.allclose(torch.einsum("...kl,...ml->...km", om, om), eye, atol=1e-4)
 
 
-def test_skew_element_transport_uses_true_inverse_after_orthogonality_drift():
-    grp = get_group("so_k")(K=3)
-    U = torch.eye(3).expand(1, 2, 3, 3).clone()
+def test_skew_element_transport_uses_true_inverse_after_orthogonality_drift(device):
+    grp = get_group("so_k")(K=3, device=device)
+    U = torch.eye(3, device=device).expand(1, 2, 3, 3).clone()
     U[0, 1] = torch.tensor([
         [1.00, 0.30, 0.00],
         [0.05, 1.20, 0.00],
         [0.00, 0.10, 0.85],
-    ])
+    ], device=device)
 
     built = build_transport_from_element(U, grp)
     true_inverse = torch.linalg.inv(U.double()).to(U.dtype)
 
+    assert built["exp_neg_phi"].device == U.device
     assert torch.allclose(built["exp_neg_phi"][0, 1], true_inverse[0, 1], atol=1e-7, rtol=1e-6)
     assert not torch.allclose(
         built["exp_neg_phi"][0, 1], U[0, 1].transpose(-1, -2), atol=1e-5, rtol=1e-5,

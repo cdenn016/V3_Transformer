@@ -94,22 +94,37 @@ def test_fp16_with_gauge_natural_grad_steps_the_frame():
     assert not torch.equal(phi0, m.prior_bank.phi_embed), "gauge frame did not move under fp16 scaler"
 
 
-def test_ema_does_not_advance_on_gradscaler_overflow(monkeypatch):
+def test_ema_does_not_advance_on_gradscaler_overflow(monkeypatch, device):
     torch.manual_seed(0)
     cfg = _tiny_cfg(amp_dtype="fp16", use_ema=True, ema_decay=0.9, max_steps=1)
-    model = VFEModel(cfg)
+    model = VFEModel(cfg).to(device)
     model.prior_bank.mu_embed.register_hook(
         lambda grad: torch.full_like(grad, float("inf")))
     tok, tgt = _batch(cfg)
+    before = {name: param.detach().clone() for name, param in model.named_parameters()}
 
     updates = []
+    scalers = []
     update = EMA.update
+    grad_scaler = torch.amp.GradScaler
+
+    def _capture_scaler(*args, **kwargs):
+        scaler = grad_scaler(*args, **kwargs)
+        scalers.append((scaler, float(scaler.get_scale())))
+        return scaler
 
     def _record_update(self, live_model):
         updates.append(True)
         update(self, live_model)
 
+    monkeypatch.setattr(torch.amp, "GradScaler", _capture_scaler)
     monkeypatch.setattr(EMA, "update", _record_update)
-    train(model, [(tok, tgt)], cfg, n_steps=1, generate_samples=False)
+    train(model, [(tok, tgt)], cfg, n_steps=1, device=device, generate_samples=False)
 
     assert updates == []
+    assert len(scalers) == 1
+    scaler, initial_scale = scalers[0]
+    assert scaler.is_enabled()
+    assert float(scaler.get_scale()) < initial_scale
+    for name, param in model.named_parameters():
+        assert torch.equal(param, before[name])

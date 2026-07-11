@@ -1962,7 +1962,7 @@ class VFE3Config:
         # encode_mode validated against the live encoder registry (per_token + the 'gauge_fixed'
         # stub, which the existing NotImplementedError guard below then rejects).
         _require(self.encode_mode, tuple(sorted(_ENCODERS)), "encode_mode")
-        # use_prior_bank is the SINGLE decode gate. True (default, pure path): the KL-to-prior
+        # use_prior_bank is the SINGLE decode gate. True (the opt-in pure path): the KL-to-prior
         # readout logits = -KL(q_i || pi_v)/tau_eff over the gauge-orbit prior bank, with the
         # covariance structure selected by decode_mode (diagonal | full). False (the linear-decode
         # ablation): decode is a plain linear projection mu_q -> logits via a learned (V, K)

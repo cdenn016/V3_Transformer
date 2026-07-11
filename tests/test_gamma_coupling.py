@@ -149,11 +149,13 @@ def test_gamma_predictively_inert_logits_and_ce_independent_of_s():
     model = _make_model(0.5)
     tokens = torch.randint(0, 20, (3, 5))
     targets = torch.randint(0, 20, (3, 5))
-    logits1, _, ce1 = model(tokens, targets)
+    logits1 = model(tokens)
+    _, _, ce1 = model(tokens, targets)
     with torch.no_grad():
         model.prior_bank.s_mu_embed.normal_(0.0, 1.0)       # perturb the model channel
         model.prior_bank.s_sigma_log_embed.normal_(0.0, 1.0)
-    logits2, _, ce2 = model(tokens, targets)
+    logits2 = model(tokens)
+    _, _, ce2 = model(tokens, targets)
     assert torch.equal(logits1, logits2)                    # prediction unchanged
     assert torch.equal(ce1, ce2)                            # pure CE unchanged
 

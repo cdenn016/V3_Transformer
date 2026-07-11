@@ -1,7 +1,7 @@
 r"""use_prior_bank=False: the linear-projection decode boundary.
 
-The theoretically pure default (use_prior_bank=True) decodes via the KL-to-prior readout
-(logits = -KL(q_i || pi_v)/tau_eff). A second path, the use_prior_bank=False ablation,
+The theoretically pure opt-in path (use_prior_bank=True) decodes via the KL-to-prior readout
+(logits = -KL(q_i || pi_v)/tau_eff). The selected default, use_prior_bank=False,
 decodes via a plain linear output projection mu -> logits (sigma discarded); the user gets better
 results there and wants the with/without comparison in V3. The encode and
 the free-energy self-coupling stay on the PriorBank either way -- the toggle controls only
@@ -75,8 +75,10 @@ def test_model_forward_and_backward_under_use_prior_bank_false():
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))
     targets = torch.randint(0, 20, (3, 5))
-    logits, loss, _ = model(tokens, targets)
+    logits = model(tokens)
+    train_logits, loss, _ = model(tokens, targets)
     assert logits.shape == (3, 5, 20)
+    assert train_logits is None
     assert torch.isfinite(loss)
     loss.backward()
     g = model.prior_bank.output_proj_weight.grad

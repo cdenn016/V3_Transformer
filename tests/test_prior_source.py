@@ -41,6 +41,7 @@ def _make(prior_source: str = "token", *, lambda_gamma: float = 0.0, lambda_h: f
         vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
         n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0, mstep_self_coupling_weight=0.0,
         prior_source=prior_source, lambda_gamma=lambda_gamma, lambda_h=lambda_h, seed=seed,
+        use_prior_bank=True,
     )   # pos_phi="learned" (default) is fine: pos_phi_free is seeded from a dedicated cfg.seed
         # generator (model.py), so it is byte-identical across token vs model_channel models
     torch.manual_seed(seed)              # the model does NOT self-seed; pin RNG before construction
@@ -95,7 +96,7 @@ def test_copy_equivalence_holds_through_mstep_and_multilayer():
         cfg = VFE3Config(
             vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=2,
             n_e_steps=2, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
-            mstep_self_coupling_weight=0.5, prior_source=src, seed=0,
+            mstep_self_coupling_weight=0.5, prior_source=src, seed=0, use_prior_bank=True,
         )   # pos_phi default "learned" is fine: seed-dedicated pos_phi_free is model-invariant
         torch.manual_seed(0)
         return VFEModel(cfg)
