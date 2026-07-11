@@ -193,6 +193,18 @@ class PriorBank(nn.Module):
         gauge_group_is_tied:    bool                = False,
     ) -> None:
         super().__init__()
+        if gauge_parameterization == "omega_direct" and encode_mode == "per_token_additive":
+            raise ValueError(
+                "gauge_parameterization='omega_direct' is incompatible with "
+                "encode_mode='per_token_additive': the additive encoder returns no stored omega "
+                "frame. Use encode_mode='per_token', or gauge_parameterization='phi' for the "
+                "additive control."
+            )
+        if type(omega_compact_storage) is not bool:
+            raise ValueError(
+                "omega_compact_storage must be a bool, got "
+                f"{type(omega_compact_storage).__name__}: {omega_compact_storage!r}"
+            )
         self.vocab_size = vocab_size
         self.K = K
         self.n_gen = n_gen

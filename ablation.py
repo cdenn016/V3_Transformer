@@ -495,7 +495,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # comparison across gauge charts, phi vs omega_direct per gauge_group.
     # One phi baseline plus one omega_direct cell per gauge_group in vfe3.config._OMEGA_GROUPS, reusing
     # the group_n/irrep_spec/phi_precond_mode payloads from the gauge_group arm above (~383-398):
-    #   - glk/so_k/sp are single-block groups -> use_head_mixer=False (same as the gauge_group arm).
+    #   - glk/so_k/sp are single-block groups -> n_heads=1 and use_head_mixer=False so the runtime
+    #     block count matches the per-head attention priors.
     #   - block_glk/tied_block_glk keep the baseline's use_head_mixer=True (n_heads=2 is >= 2 equal
     #     blocks); tied_block_glk additionally overrides phi_precond_mode='killing' because the
     #     baseline's 'killing_per_block' generators do not partition per head under the tied gauge
@@ -513,7 +514,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "phi",                         "gauge_parameterization": "phi"},
 
             {"label": "omega_direct_glk",             "gauge_parameterization": "omega_direct",
-             "gauge_group": "glk",                    "use_head_mixer": False},
+             "gauge_group": "glk",                    "n_heads": 1, "use_head_mixer": False},
 
             {"label": "omega_direct_block_glk",       "gauge_parameterization": "omega_direct",
              "gauge_group": "block_glk",               "n_heads": 2},
@@ -522,10 +523,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
              "gauge_group": "tied_block_glk",          "n_heads": 2, "phi_precond_mode": "killing"},
 
             {"label": "omega_direct_so_k",            "gauge_parameterization": "omega_direct",
-             "gauge_group": "so_k",                    "use_head_mixer": False},
+             "gauge_group": "so_k",                    "n_heads": 1, "use_head_mixer": False},
 
             {"label": "omega_direct_sp",               "gauge_parameterization": "omega_direct",
-             "gauge_group": "sp",                       "use_head_mixer": False},
+             "gauge_group": "sp",                       "n_heads": 1, "use_head_mixer": False},
 
             {"label": "omega_direct_so3_spin2x4",     "gauge_parameterization": "omega_direct",
              "gauge_group": "so_n", "group_n": 3, "irrep_spec": [("l2", 4)],
@@ -535,7 +536,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
              "gauge_group": "sp_n", "group_n": 4, "irrep_spec": [("sym2", 2)],
              "phi_precond_mode": "killing"},
         ],
-        "requires": {"transport_mode": "flat"},
+        "requires": {"transport_mode": "flat", "pos_phi": "none"},
     },
 
 

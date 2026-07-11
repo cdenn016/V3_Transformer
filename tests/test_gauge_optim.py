@@ -7,6 +7,18 @@ from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
 from vfe3.gauge_optim import GaugeNaturalGradAdamW
 
 
+@pytest.mark.parametrize("value", [-1, 1.5, True, False, "2", None])
+def test_direct_optimizer_rejects_invalid_omega_reorth_every(value):
+    generators = generate_glk_multihead(4, 2).float()
+    omega = nn.Parameter(torch.eye(4).unsqueeze(0))
+
+    with pytest.raises(ValueError, match="omega_reorth_every"):
+        GaugeNaturalGradAdamW(
+            [{"params": [omega], "lr": 0.1, "omega": True, "weight_decay": 0.0}],
+            generators, [2, 2], omega_reorth_every=value, weight_decay=0.0,
+        )
+
+
 def test_gauge_step_is_natural_gradient_on_active_rows_only():
     # The gauge group is stepped by phi <- phi - lr * (momentum*buf + natgrad), NOT by AdamW.
     # With momentum 0 the step is exactly -lr * natural_gradient; rows with no gradient (tokens

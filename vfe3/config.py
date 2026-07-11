@@ -783,6 +783,13 @@ class VFE3Config:
         # no-op (the pure learned-frame path). 'off' forces Omega_ij = I; 'frozen' freezes a random frame.
         _require(self.gauge_transport, _VALID_GAUGE_TRANSPORT, "gauge_transport")
         if self.gauge_transport == "off":
+            if self.omega_reflection != "off" or self.phi_reflection != "off":
+                raise ValueError(
+                    "gauge_transport='off' requires both omega_reflection='off' and "
+                    "phi_reflection='off' so the frame is exactly the identity; got "
+                    f"omega_reflection={self.omega_reflection!r}, "
+                    f"phi_reflection={self.phi_reflection!r}."
+                )
             # Omega = exp(phi_i) exp(-phi_j) = I needs a ZERO frame AND no other transport modifier, so
             # the two non-flat transport layers must also be off (else Omega != I and the cell is mislabeled).
             if self.pos_rotation != "none":
@@ -806,6 +813,14 @@ class VFE3Config:
                 UserWarning, stacklevel=2,
             )
         elif self.gauge_transport == "frozen":
+            if self.gauge_parameterization == "omega_direct":
+                raise ValueError(
+                    "gauge_transport='frozen' is not supported with "
+                    "gauge_parameterization='omega_direct': omega_embed initializes to the identity "
+                    "(or a discrete reflection), not the random phi_scale-controlled frame promised "
+                    "by the frozen mode, and a Metropolis reflection could still mutate it. Use "
+                    "gauge_transport='on', or gauge_parameterization='phi' for a random fixed frame."
+                )
             if self.phi_scale <= 0.0:
                 raise ValueError(
                     f"gauge_transport='frozen' needs a nonzero random frame (phi_scale>0), got "
@@ -968,6 +983,21 @@ class VFE3Config:
         from vfe3.geometry.transport import _TRANSPORTS
         _require(self.transport_mode, tuple(sorted(_TRANSPORTS)), "transport_mode")
         _require(self.omega_retract_mode, _VALID_OMEGA_RETRACT, "omega_retract_mode")
+        if type(self.omega_compact_storage) is not bool:
+            raise ValueError(
+                "omega_compact_storage must be a bool, got "
+                f"{type(self.omega_compact_storage).__name__}: {self.omega_compact_storage!r}"
+            )
+        if type(self.omega_reorth_every) is not int or self.omega_reorth_every < 0:
+            raise ValueError(
+                "omega_reorth_every must be a nonnegative int, got "
+                f"{type(self.omega_reorth_every).__name__}: {self.omega_reorth_every!r}"
+            )
+        if type(self.omega_metropolis_every) is not int or self.omega_metropolis_every < 1:
+            raise ValueError(
+                "omega_metropolis_every must be an int >= 1, got "
+                f"{type(self.omega_metropolis_every).__name__}: {self.omega_metropolis_every!r}"
+            )
         if self.omega_reflection == "ste":
             raise NotImplementedError(
                 "omega_reflection='ste' (straight-through det-sign) is not implemented; use "
@@ -1035,6 +1065,19 @@ class VFE3Config:
         # every group whose registration advertises omega_direct_capable, the flat regime, and no
         # E-step frame refinement. Everything outside that scope is rejected with a clear message.
         if self.gauge_parameterization == "omega_direct":
+            if self.pos_phi != "none":
+                raise ValueError(
+                    "gauge_parameterization='omega_direct' transports from the stored omega frame and "
+                    f"does not consume positional phi; got pos_phi={self.pos_phi!r}. Set "
+                    "pos_phi='none'."
+                )
+            if self.encode_mode == "per_token_additive":
+                raise ValueError(
+                    "gauge_parameterization='omega_direct' is incompatible with "
+                    "encode_mode='per_token_additive': the additive encoder returns no stored omega "
+                    "frame. Use encode_mode='per_token', or gauge_parameterization='phi' for the "
+                    "additive control."
+                )
             omega_groups = tuple(sorted(
                 name for name, builder in _GROUPS.items()
                 if getattr(builder, "omega_direct_capable", False)
@@ -1068,8 +1111,6 @@ class VFE3Config:
                         f"it {why}. Use gauge_group in {_REFLECT_OK}, or omega_reflection='off'.")
                 if self.omega_metropolis_temperature <= 0.0:
                     raise ValueError(f"omega_metropolis_temperature must be > 0, got {self.omega_metropolis_temperature}")
-                if self.omega_metropolis_every < 1:
-                    raise ValueError(f"omega_metropolis_every must be >= 1, got {self.omega_metropolis_every}")
                 # Final-review Fix B (2026-07-08): efficacy guardrail, not a correctness gate. Under a
                 # diagonal covariance family the canonical reflection R=diag(-1,1,...,1) leaves the
                 # diagonal covariance invariant under the congruence Omega Sigma Omega^T (transport

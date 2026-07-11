@@ -103,6 +103,11 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         omega_reorth_every: int   = 0,
         **kwargs,
     ) -> None:
+        if type(omega_reorth_every) is not int or omega_reorth_every < 0:
+            raise ValueError(
+                "omega_reorth_every must be a nonnegative int, got "
+                f"{type(omega_reorth_every).__name__}: {omega_reorth_every!r}"
+            )
         super().__init__(params, **kwargs)
         self._generators        = generators
         self._irrep_dims        = irrep_dims
@@ -118,7 +123,7 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         # model.group.skew_symmetric (threaded from build_optimizer); omega_reorth_every>0 turns on a
         # periodic polar re-orthogonalization every that many M-steps. Default 0 = off = byte-identical.
         self._skew_symmetric     = bool(skew_symmetric)
-        self._omega_reorth_every = int(omega_reorth_every)
+        self._omega_reorth_every = omega_reorth_every
         self._omega_step         = 0                     # M-step counter for the reorth cadence
         # Moment rule for the natural-gradient gauge step: 'heavy_ball' (default; momentum only, no
         # per-coordinate normalization) or 'adam' (Adam m/v/bias-correction ON the natural gradient,

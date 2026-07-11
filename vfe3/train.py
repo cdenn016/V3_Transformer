@@ -259,6 +259,16 @@ def build_optimizer(
         )
 
     if nat or omega_direct:
+        if omega_direct:
+            import warnings
+            warnings.warn(
+                "gauge_parameterization='omega_direct' updates omega_embed with stateless "
+                "retraction SGD: m_gauge_momentum and m_gauge_update_rule do not apply to the omega "
+                "group. They apply only to phi-coordinate gauge groups when "
+                "m_phi_natural_grad=True.",
+                UserWarning,
+                stacklevel=2,
+            )
         # Geometrically-correct gauge frame: natural-gradient + momentum on the gauge groups under
         # cfg.phi_precond_mode (set it to 'pullback_per_block' for the exact exp-map metric -- killing
         # is conformal, so under this manual natural-grad step (which AdamW never normalizes) it is a

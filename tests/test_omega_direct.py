@@ -19,7 +19,7 @@ def _cfg(**over):
     base = dict(vocab_size=6, embed_dim=4, n_heads=1, max_seq_len=4, n_layers=1, n_e_steps=2,
                 gauge_group="glk", family="gaussian_full", transport_mode="flat",
                 pos_rotation="none", use_head_mixer=False, use_prior_bank=True, decode_mode="full",
-                e_phi_lr=0.0)
+                pos_phi="none", e_phi_lr=0.0)
     base.update(over)
     return VFE3Config(**base)
 
@@ -101,12 +101,9 @@ def test_build_belief_transport_omega_direct_branch():
     assert torch.allclose(phi_out, eye, atol=1e-6)            # glk single-block returns a dense Omega tensor
 
 
-def test_e_step_preserves_omega_across_belief_rebuilds():
-    # Regression for the belief-reconstruction omega drop: e_step_iteration returns a rebuilt
-    # BeliefState, and if it drops the constant omega frame then the NEXT iteration's transport
-    # build reads belief.omega == None and build_transport_from_element(None, ...) crashes. Chaining
-    # two iterations at e_phi_lr>0 (so the per-iteration rebuild path fires, not the e_phi_lr==0
-    # hoist) exercises exactly that: iter 2 reads iter 1's returned omega.
+def test_lower_level_omega_direct_rejects_phi_estep_update():
+    # Config rejects this unsupported cross-chart update, but direct E-step callers bypass config.
+    # Fail at the lower API boundary before the phi update can silently optimize an inert chart.
     K, N = 4, 3
     grp = get_group("glk")(K=K)
     n_gen = grp.generators.shape[0]
@@ -119,19 +116,27 @@ def test_e_step_preserves_omega_across_belief_rebuilds():
     mu_p = torch.zeros(1, N, K)
     sigma_p = torch.ones(1, N, K)
 
-    # (1) two chained iterations (iter 2 reads iter 1's rebuilt belief.omega): no crash + omega kept.
-    b1 = e_step_iteration(belief, mu_p, sigma_p, grp, e_phi_lr=0.1,
-                          gauge_parameterization="omega_direct")
-    assert b1.omega is not None                               # FIX 1: rebuild must carry omega through
-    b2 = e_step_iteration(b1, mu_p, sigma_p, grp, e_phi_lr=0.1,
-                          gauge_parameterization="omega_direct")
-    assert b2.omega is not None
-    assert torch.equal(b2.omega, U)                           # constant frame, unchanged by the E-step
+    with pytest.raises(ValueError, match="e_phi_lr"):
+        e_step_iteration(belief, mu_p, sigma_p, grp, e_phi_lr=0.1,
+                         gauge_parameterization="omega_direct")
+    with pytest.raises(ValueError, match="e_phi_lr"):
+        e_step(belief, mu_p, sigma_p, grp, n_iter=2, e_phi_lr=0.1,
+               gauge_parameterization="omega_direct")
 
-    # (2) end-to-end e_step (n_iter=2) also returns a belief that still carries omega.
-    out = e_step(belief, mu_p, sigma_p, grp, n_iter=2, e_phi_lr=0.1,
-                 gauge_parameterization="omega_direct")
-    assert out.omega is not None
+
+def test_multilayer_post_estep_transforms_preserve_omega_direct_frame():
+    # block.py applies block_norm after each E-step. Its BeliefState rebuild must retain the stored
+    # omega frame so layer 2 consumes the same U_i that layer 1 did, rather than falling back to phi.
+    model = VFEModel(_cfg(gauge_parameterization="omega_direct", n_layers=2,
+                          norm_type_block="mahalanobis"))
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+    expected = model.prior_bank._omega_lookup(token_ids)
+
+    belief, _ = model.forward_beliefs(token_ids)
+
+    assert belief.omega is not None
+    assert torch.equal(belief.omega, expected)
+    assert torch.isfinite(belief.mu).all()
 
 
 def test_free_energy_value_filtered_keys_rejects_omega_direct():
@@ -164,6 +169,18 @@ def test_prior_bank_omega_table_gated_and_encodes_identity():
     b = pb.encode(torch.zeros(1, 3, dtype=torch.long))
     assert b.omega.shape == (1, 3, 4, 4)
     assert torch.allclose(b.omega, torch.eye(4).expand(1, 3, 4, 4), atol=1e-7)
+
+
+def test_prior_bank_rejects_omega_direct_additive_encoder():
+    with pytest.raises(ValueError, match="per_token_additive"):
+        PriorBank(vocab_size=6, K=4, n_gen=16, gauge_parameterization="omega_direct",
+                  irrep_dims=[4], encode_mode="per_token_additive")
+
+
+@pytest.mark.parametrize("value", [0, 1, "False", None])
+def test_prior_bank_omega_compact_storage_requires_strict_bool(value):
+    with pytest.raises(ValueError, match="omega_compact_storage"):
+        PriorBank(vocab_size=6, K=4, n_gen=16, omega_compact_storage=value)
 
 
 def test_prior_bank_omega_reflection_seeds_det_negative():
@@ -869,7 +886,7 @@ def test_omega_compact_flag_is_noop_for_equal_dim_towers():
         base = dict(vocab_size=6, n_heads=1, max_seq_len=4, n_layers=1, n_e_steps=2,
                     gauge_parameterization="omega_direct", family="gaussian_full", transport_mode="flat",
                     pos_rotation="none", use_head_mixer=False, use_prior_bank=True, decode_mode="full",
-                    e_phi_lr=0.0)
+                    pos_phi="none", e_phi_lr=0.0)
         base.update(over)
         return VFE3Config(**base)
     over = dict(gauge_group="so_n", embed_dim=6, group_n=3, irrep_spec=[("l1", 2)])   # SO(3) l1 x2 -> [3,3]
@@ -935,7 +952,12 @@ def test_ablation_omega_direct_arm_builds():
     built = {}
     for label, overrides in runs:
         cfg_dict = ablation._cell_cfg_dict(overrides, seed=0, max_steps=1)
-        built[label] = VFE3Config(**cfg_dict)                  # must not raise for ANY cell
+        # Keep all semantic baseline/sweep interactions while making the construction regression
+        # small enough for the unit suite (omega_direct otherwise allocates V x K x K at GPT-2 V).
+        cfg_dict.update(vocab_size=8, max_seq_len=4, batch_size=1)
+        cfg = VFE3Config(**cfg_dict)
+        model = VFEModel(cfg)                                  # must not raise for ANY cell
+        built[label] = model.cfg
 
     assert built["phi"].gauge_parameterization == "phi"
     seen_groups = set()
@@ -946,6 +968,23 @@ def test_ablation_omega_direct_arm_builds():
         assert cfg.s_e_step == built["phi"].s_e_step                 # ditto for the s-channel E-step
         seen_groups.add(cfg.gauge_group)
     assert seen_groups == {"glk", "block_glk", "tied_block_glk", "so_k", "sp", "so_n", "sp_n"}
+
+
+def test_gauge_parameterization_sweep_disables_positional_phi_for_all_cells():
+    import ablation
+
+    runs = ablation.make_run_overrides("gauge_parameterization")
+
+    assert runs
+    assert all(overrides["pos_phi"] == "none" for _, overrides in runs)
+
+
+def test_omega_direct_optimizer_warns_that_gauge_momentum_and_rule_do_not_apply():
+    from vfe3.train import build_optimizer
+
+    model = VFEModel(_cfg(gauge_parameterization="omega_direct"))
+    with pytest.warns(UserWarning, match="retraction SGD"):
+        build_optimizer(model, model.cfg)
 
 
 def test_gamma_coupling_term_uses_stored_frame_not_phi_cocycle():

@@ -606,6 +606,11 @@ def e_step_iteration(
     ``e_step_update='mm_exact'`` (kernel route only) replaces the mu/sigma gradient + retraction
     with the closed-form precision fusion at frozen beta (``mm_exact_update``), damped by
     ``mm_damping`` in natural coordinates; the phi sub-step is untouched either way."""
+    if gauge_parameterization == "omega_direct" and e_phi_lr != 0.0:
+        raise ValueError(
+            "gauge_parameterization='omega_direct' does not support E-step phi updates; "
+            f"got e_phi_lr={e_phi_lr}. Set e_phi_lr=0.0."
+        )
     # Build the forward belief-transport (P0 #2): on the flat + block-diagonal-with-equal-blocks
     # path this is a FactoredTransport (the per-token exps only, NO dense (B,N,N,K,K) Omega), which
     # the belief-gradient kernel / oracle consume opaquely through transport_mean / covariance;
@@ -940,6 +945,11 @@ def e_step(
     # into each e_step_iteration call below (alongside the **kwargs spread), so it must be removed
     # from the kwargs bag first or the explicit kwarg + spread would collide (duplicate keyword).
     gauge_param_kw:     str = kwargs.pop("gauge_parameterization", "phi")
+    if gauge_param_kw == "omega_direct" and e_phi_lr != 0.0:
+        raise ValueError(
+            "gauge_parameterization='omega_direct' does not support E-step phi updates; "
+            f"got e_phi_lr={e_phi_lr}. Set e_phi_lr=0.0."
+        )
     _hoisted_omega: 'torch.Tensor | FactoredTransport | RopeTransport | None' = None
     if e_phi_lr == 0.0 and transport_mode_kw == "flat":
         if prebuilt_transport is not None:

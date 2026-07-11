@@ -77,6 +77,13 @@ def test_gauge_transport_off_rejects_regime_ii():
         VFE3Config(gauge_transport="off", transport_mode="regime_ii")
 
 
+@pytest.mark.parametrize("phi_reflection", ["init_seed", "metropolis"])
+def test_gauge_transport_off_rejects_phi_reflection(phi_reflection):
+    with pytest.raises(ValueError, match="reflection"):
+        VFE3Config(gauge_transport="off", gauge_group="glk",
+                   phi_reflection=phi_reflection)
+
+
 def test_gauge_transport_frozen_freezes_lrs_keeps_random_frame():
     """gauge_transport='frozen' keeps the random frame (phi_scale unchanged, pos_phi unchanged) but
     freezes its learning (e_phi_lr=0, m_phi_lr=0)."""
@@ -225,7 +232,8 @@ def test_config_accepts_omega_direct_on_gl_groups():
     """omega_direct is now a live element-valued chart on the GL groups (glk, block_glk)."""
     for grp, over in (("glk", {}), ("block_glk", {"n_heads": 2})):
         cfg = VFE3Config(gauge_parameterization="omega_direct", gauge_group=grp,
-                         embed_dim=4, n_heads=over.get("n_heads", 1), transport_mode="flat", e_phi_lr=0.0)
+                         embed_dim=4, n_heads=over.get("n_heads", 1), transport_mode="flat",
+                         pos_phi="none", e_phi_lr=0.0)
         assert cfg.gauge_parameterization == "omega_direct"
     assert VFE3Config(gauge_parameterization="phi").gauge_parameterization == "phi"
 
@@ -235,18 +243,60 @@ def test_config_rejects_omega_direct_off_scope():
     accepted -- see test_omega_direct_accepts_all_eligible_groups), so only the still-live scope
     rejections (E-step frame refinement, non-flat transport) remain here."""
     with pytest.raises(ValueError):                       # E-step frame refinement not supported yet
-        VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1, e_phi_lr=0.1)
+        VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4,
+                   n_heads=1, pos_phi="none", e_phi_lr=0.1)
     with pytest.raises(ValueError):                       # only the flat regime in Phase 1
         VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1,
-                   transport_mode="regime_ii")
+                   transport_mode="regime_ii", pos_phi="none")
+
+
+@pytest.mark.parametrize("pos_phi", ["learned", "frozen"])
+def test_omega_direct_rejects_active_positional_phi(pos_phi):
+    with pytest.raises(ValueError, match="pos_phi"):
+        VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4,
+                   n_heads=1, e_phi_lr=0.0, pos_phi=pos_phi)
+
+
+def test_omega_direct_rejects_additive_encoder():
+    with pytest.raises(ValueError, match="per_token_additive"):
+        VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4,
+                   n_heads=1, e_phi_lr=0.0, pos_phi="none",
+                   encode_mode="per_token_additive")
 
 
 def test_config_omega_retract_and_reflection_validated():
     with pytest.raises(ValueError):
         VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1,
-                   omega_retract_mode="bogus")
+                   omega_retract_mode="bogus", pos_phi="none")
     assert VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1,
-                      omega_retract_mode="cayley").omega_retract_mode == "cayley"
+                      omega_retract_mode="cayley", pos_phi="none").omega_retract_mode == "cayley"
+
+
+@pytest.mark.parametrize("value", [1, 0, "False", None])
+def test_omega_compact_storage_requires_strict_bool(value):
+    with pytest.raises(ValueError, match="omega_compact_storage"):
+        VFE3Config(omega_compact_storage=value)
+
+    assert VFE3Config(omega_compact_storage=False).omega_compact_storage is False
+    assert VFE3Config(omega_compact_storage=True).omega_compact_storage is True
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True, "2", None])
+def test_omega_reorth_every_requires_nonnegative_integer(value):
+    with pytest.raises(ValueError, match="omega_reorth_every"):
+        VFE3Config(omega_reorth_every=value)
+
+    assert VFE3Config(omega_reorth_every=0).omega_reorth_every == 0
+    assert VFE3Config(omega_reorth_every=3).omega_reorth_every == 3
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True, False, "2", None])
+def test_omega_metropolis_every_requires_positive_integer(value):
+    with pytest.raises(ValueError, match="omega_metropolis_every"):
+        VFE3Config(omega_metropolis_every=value)
+
+    assert VFE3Config(omega_metropolis_every=1).omega_metropolis_every == 1
+    assert VFE3Config(omega_metropolis_every=3).omega_metropolis_every == 3
 
 
 def test_config_accepts_use_prior_bank_false():
@@ -634,20 +684,21 @@ def test_omega_direct_accepts_active_gamma_channel(gamma_toggle):
     CONSTRUCTS. (s_e_step alone -- no lambda_gamma -- also constructs; it only carries the orthogonal
     prior_source='model_channel' requirement, which has nothing to do with the omega frame.)"""
     cfg = VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk",
-                     embed_dim=4, n_heads=1, **gamma_toggle)
+                     embed_dim=4, n_heads=1, pos_phi="none", **gamma_toggle)
     assert cfg.gauge_parameterization == "omega_direct"
 
 
 def test_omega_direct_pure_channel_off_constructs():
     r"""The default (gamma-off) omega_direct config is accepted: lambda_gamma=0, s_e_step=False,
     gamma_as_beta_prior=False leave no s-channel transport to mis-frame."""
-    cfg = VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1)
+    cfg = VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4,
+                     n_heads=1, pos_phi="none")
     assert cfg.gauge_parameterization == "omega_direct"
 
 
 def test_omega_direct_accepts_all_eligible_groups():
     common = dict(gauge_parameterization="omega_direct", transport_mode="flat", e_phi_lr=0.0,
-                  lambda_gamma=0.0, s_e_step=False)
+                  lambda_gamma=0.0, s_e_step=False, pos_phi="none")
     for grp, over in (("glk", {}), ("block_glk", {"n_heads": 2}), ("tied_block_glk", {"n_heads": 2}),
                       ("sp", {}), ("so_k", {}),
                       ("so_n", {"group_n": 3, "irrep_spec": [("l0", 1), ("l1", 1)]}),
@@ -660,7 +711,8 @@ def test_omega_direct_accepts_all_eligible_groups():
 def test_omega_direct_reflection_cross_check_fail_closed():
     import pytest
     base = dict(gauge_parameterization="omega_direct", transport_mode="flat", e_phi_lr=0.0,
-                lambda_gamma=0.0, s_e_step=False, omega_reflection="init_seed", use_head_mixer=False)
+                lambda_gamma=0.0, s_e_step=False, omega_reflection="init_seed", use_head_mixer=False,
+                pos_phi="none")
     # reject init_seed where it is vacuous / group-incorrect
     with pytest.raises(ValueError):    # sp: no det<0 component
         VFE3Config(embed_dim=4, n_heads=1, gauge_group="sp", **base)
@@ -739,6 +791,7 @@ def test_omega_direct_capability_comes_from_group_registration():
             n_heads=1,
             gauge_group=capable_name,
             gauge_parameterization="omega_direct",
+            pos_phi="none",
             e_phi_lr=0.0,
         )
         assert cfg.gauge_group == capable_name
@@ -753,6 +806,7 @@ def test_omega_direct_capability_comes_from_group_registration():
                 n_heads=1,
                 gauge_group=incapable_name,
                 gauge_parameterization="omega_direct",
+                pos_phi="none",
                 e_phi_lr=0.0,
             )
     finally:

@@ -7,7 +7,8 @@ from vfe3.config import VFE3Config
 
 def _omega_cfg(**over):
     base = dict(gauge_parameterization="omega_direct", transport_mode="flat", e_phi_lr=0.0,
-                embed_dim=4, n_heads=1, use_head_mixer=False, lambda_gamma=0.0, s_e_step=False)
+                embed_dim=4, n_heads=1, use_head_mixer=False, lambda_gamma=0.0, s_e_step=False,
+                pos_phi="none")
     base.update(over)
     return VFE3Config(**base)
 
@@ -54,6 +55,20 @@ def test_off_and_init_seed_unchanged():
     assert _omega_cfg(omega_reflection="init_seed", gauge_group="glk").omega_reflection == "init_seed"
 
 
+@pytest.mark.parametrize("omega_reflection", ["init_seed", "metropolis"])
+def test_gauge_transport_off_rejects_omega_reflection(omega_reflection):
+    with pytest.raises(ValueError, match="reflection"):
+        _omega_cfg(gauge_group="glk", gauge_transport="off",
+                   omega_reflection=omega_reflection)
+
+
+@pytest.mark.parametrize("omega_reflection", ["off", "init_seed", "metropolis"])
+def test_gauge_transport_frozen_rejects_omega_direct(omega_reflection):
+    with pytest.raises(ValueError, match="frozen"):
+        _omega_cfg(gauge_group="glk", gauge_transport="frozen",
+                   omega_reflection=omega_reflection)
+
+
 # --------------------------------------------------------------------------------------------------
 # Task 2: the move -- metropolis_omega_step (fixed-belief DeltaF-gated det-sign flip)
 # --------------------------------------------------------------------------------------------------
@@ -66,7 +81,7 @@ def _model(**over):
     base = dict(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4, n_heads=1,
                 vocab_size=6, max_seq_len=4, n_layers=1, n_e_steps=2, transport_mode="flat",
                 e_phi_lr=0.0, use_head_mixer=False, family="gaussian_diagonal", decode_mode="diagonal",
-                lambda_gamma=0.0, s_e_step=False, omega_reflection="metropolis")
+                lambda_gamma=0.0, s_e_step=False, omega_reflection="metropolis", pos_phi="none")
     base.update(over)
     return VFEModel(VFE3Config(**base))
 
@@ -74,7 +89,8 @@ def _model(**over):
 def test_off_is_noop_no_rng_no_mutation():
     m = VFEModel(VFE3Config(gauge_parameterization="omega_direct", gauge_group="glk", embed_dim=4,
                             n_heads=1, vocab_size=6, max_seq_len=4, n_layers=1, transport_mode="flat",
-                            e_phi_lr=0.0, use_head_mixer=False, omega_reflection="off"))
+                            e_phi_lr=0.0, use_head_mixer=False, omega_reflection="off",
+                            pos_phi="none"))
     before = m.prior_bank.omega_embed.detach().clone()
     g = torch.Generator().manual_seed(0)
     stats = m.metropolis_omega_step(torch.tensor([[0, 1, 2]]), generator=g)
