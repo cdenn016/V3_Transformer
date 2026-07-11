@@ -13,6 +13,7 @@ g in G <= GL(K), so every group here is admissible for "gaussian".
 """
 
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -33,16 +34,17 @@ from vfe3.geometry.irreps import direct_sum_generators
 class GaugeGroup:
     """A structure group plus the metadata the transport layer consumes."""
 
-    name:               str
-    generators:         torch.Tensor          # (n_gen, K, K) Lie-algebra basis
-    irrep_dims:         List[int]             # block sizes; sum == K
-    skew_symmetric:     bool                  # exp(-M) = exp(M)^T fast path
-    invariant_families: Tuple[str, ...] = ("gaussian", "gaussian_full")  # exactly invariant under the GL(K) congruence; the diagonal readout is NOT (see check_admissible)
-    irrep_labels:       Optional[List[str]] = None # per-block label ('l1', 'sym2', ...); None = label-less
-    algebra:            Optional[str] = None  # irrep-registry algebra key ('so' | 'sp'); None = label-less
+    name:                 str
+    generators:           torch.Tensor                       # (n_gen, K, K) Lie-algebra basis
+    irrep_dims:           List[int]                          # block sizes; sum == K
+    skew_symmetric:       bool                               # exp(-M) = exp(M)^T fast path
+    omega_direct_capable: bool                   = False     # stored group-element frame U_i is implemented
+    invariant_families:   Tuple[str, ...]        = ("gaussian", "gaussian_full")  # exactly invariant under the GL(K) congruence; the diagonal readout is NOT (see check_admissible)
+    irrep_labels:         Optional[List[str]]    = None      # per-block label ('l1', 'sym2', ...); None = label-less
+    algebra:              Optional[str]          = None      # irrep-registry algebra key ('so' | 'sp'); None = label-less
 
     # Cached pseudo-inverse of the generator Frobenius Gram (computed once, off __init__/eq/repr).
-    _gram_pinv_cache:   Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
+    _gram_pinv_cache:     Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
 
     def gram_pinv(self) -> torch.Tensor:
         r"""Cached ``gram_pinv(generators)`` -- the Gram pseudo-inverse ``extract_phi`` projects with.
@@ -84,17 +86,42 @@ class GaugeGroup:
 _GROUPS: Dict[str, Callable[..., GaugeGroup]] = {}
 
 
-def register_group(name: str, *, override: bool = False) -> Callable:
+def register_group(
+    name: str,
+
+    *,
+    override:             bool           = False,
+    omega_direct_capable: Optional[bool] = None,
+) -> Callable:
     """Decorator registering a GaugeGroup builder under ``name``.
 
-    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
-    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    ``omega_direct_capable`` advertises whether the registered builder supports stored
+    group-element frames. Duplicate keys fail closed (audit 2026-07-01 round-3): a second
+    registration under an existing name silently shadowed the first. Pass ``override=True`` to
+    replace deliberately.
     """
     def _wrap(fn: Callable[..., GaugeGroup]) -> Callable[..., GaugeGroup]:
         if name in _GROUPS and not override:
             raise KeyError(f"gauge group {name!r} already registered; pass override=True to replace")
-        _GROUPS[name] = fn
-        return fn
+        capability = (
+            bool(getattr(fn, "omega_direct_capable", False))
+            if omega_direct_capable is None
+            else omega_direct_capable
+        )
+
+        @wraps(fn)
+        def _coherent_builder(*args, **kwargs) -> GaugeGroup:
+            group = fn(*args, **kwargs)
+            if not isinstance(group, GaugeGroup):
+                raise TypeError(
+                    f"gauge group builder {name!r} returned {type(group).__name__}, expected GaugeGroup"
+                )
+            group.omega_direct_capable = capability
+            return group
+
+        setattr(_coherent_builder, "omega_direct_capable", capability)
+        _GROUPS[name] = _coherent_builder
+        return _coherent_builder
     return _wrap
 
 
@@ -107,7 +134,7 @@ def get_group(name: str) -> Callable[..., GaugeGroup]:
     return _GROUPS[name]
 
 
-@register_group("glk")
+@register_group("glk", omega_direct_capable=True)
 def _build_glk(
     K:       int,
 
@@ -117,10 +144,15 @@ def _build_glk(
 ) -> GaugeGroup:
     """Full GL(K): single block, full gl(K) generators."""
     G = generate_glk(K, dtype=dtype, device=device)
-    return GaugeGroup(name="glk", generators=G, irrep_dims=[K], skew_symmetric=False)
+    return GaugeGroup(
+        name="glk",
+        generators=G,
+        irrep_dims=[K],
+        skew_symmetric=False,
+    )
 
 
-@register_group("block_glk")
+@register_group("block_glk", omega_direct_capable=True)
 def _build_block_glk(
     K:               int,
     n_heads:         int,
@@ -158,7 +190,7 @@ def _build_block_glk(
     )
 
 
-@register_group("tied_block_glk")
+@register_group("tied_block_glk", omega_direct_capable=True)
 def _build_tied_block_glk(
     K:               int,
     n_heads:         int,
@@ -188,7 +220,7 @@ def _build_tied_block_glk(
     )
 
 
-@register_group("so_k")
+@register_group("so_k", omega_direct_capable=True)
 def _build_so_k(
     K:       int,
 
@@ -198,7 +230,12 @@ def _build_so_k(
 ) -> GaugeGroup:
     """SO(K): skew-symmetric so(K) generators (single block)."""
     G = generate_son(K, dtype=dtype, device=device)
-    return GaugeGroup(name="so_k", generators=G, irrep_dims=[K], skew_symmetric=True)
+    return GaugeGroup(
+        name="so_k",
+        generators=G,
+        irrep_dims=[K],
+        skew_symmetric=True,
+    )
 
 
 def check_admissible(
@@ -287,7 +324,7 @@ def check_admissible(
     return True
 
 
-@register_group("so_n")
+@register_group("so_n", omega_direct_capable=True)
 def _build_so_n(
     K:          int,
 
@@ -337,7 +374,7 @@ def _build_so_n(
     )
 
 
-@register_group("sp_n")
+@register_group("sp_n", omega_direct_capable=True)
 def _build_sp_n(
     K:          int,
 
@@ -380,7 +417,7 @@ def _build_sp_n(
     )
 
 
-@register_group("sp")
+@register_group("sp", omega_direct_capable=True)
 def _build_sp(
     K:       int,
 
@@ -396,4 +433,9 @@ def _build_sp(
     GL(K) congruence action makes the divergence invariant under any g in GL(K) <= Sp(2m,R).
     """
     G = generate_sp(K, dtype=dtype, device=device)
-    return GaugeGroup(name="sp", generators=G, irrep_dims=[K], skew_symmetric=False)
+    return GaugeGroup(
+        name="sp",
+        generators=G,
+        irrep_dims=[K],
+        skew_symmetric=False,
+    )

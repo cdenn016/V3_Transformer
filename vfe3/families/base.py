@@ -11,7 +11,7 @@ family slots in behind -- by writing-and-registering a subclass, never editing c
 
 import warnings
 from abc import ABC, abstractmethod
-from typing import Callable, ClassVar, Dict, List, Tuple, Type
+from typing import Callable, ClassVar, Dict, List, Optional, Tuple, Type
 
 import torch
 
@@ -105,19 +105,20 @@ class BeliefParams(ABC):
 
     def natural_gradient(
         self,
-        grad_mu:    torch.Tensor,             # (..., K) Euclidean grad wrt mu (location)
-        grad_sigma: torch.Tensor,             # (..., K)/(..., K, K) Euclidean grad wrt the sigma slot
+        grad_mu:    torch.Tensor,                    # (..., K) Euclidean grad wrt mu (location)
+        grad_sigma: Optional[torch.Tensor],          # None freezes sigma; else Euclidean grad wrt sigma
 
         *,
         eps:        float = 1e-6,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:   # (nat_mu, nat_sigma) = Fisher^{-1} grad
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:   # (nat_mu, nat_sigma) = Fisher^{-1} grad
         r"""Fisher preconditioner: Euclidean -> natural gradient for THIS family, ``g^{-1} grad``
         with ``g`` the family's Fisher-Rao metric on its (location, scale) coordinates. The single
         seam the E-step's preconditioner step dispatches through (``e_step_iteration``), so a family
         is descended in ITS OWN information geometry rather than a hardcoded Gaussian Fisher (which
         is the wrong DIRECTION on a non-Gaussian product manifold, not a rescalable learning rate).
         Not abstract -- existing families need no edit until they opt in; the base raises because the
-        correct metric is family-dependent."""
+        correct metric is family-dependent. ``grad_sigma=None`` requests the family-aware mean
+        block only and must return ``nat_sigma=None`` without evaluating the sigma block."""
         raise NotImplementedError(
             f"{type(self).__name__} does not override natural_gradient, the family's Fisher "
             f"preconditioner (Euclidean -> natural gradient). Provide it so the E-step descends in "

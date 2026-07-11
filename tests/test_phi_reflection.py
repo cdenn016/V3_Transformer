@@ -95,6 +95,53 @@ def test_reflection_fold_matches_R_Omega_R_and_flips_det(group_name, group_kw):
     assert torch.equal(_dense_omega(none), Om_base)
 
 
+def test_nonflat_oracle_transport_threads_reflection() -> None:
+    from vfe3.belief import BeliefState
+    from vfe3.geometry.groups import get_group
+    from vfe3.inference.e_step import build_belief_transport, e_step_iteration
+
+    torch.manual_seed(23)
+    n, k = 3, 4
+    group = get_group("glk")(k)
+    n_gen = group.generators.shape[0]
+    mu = 0.5 * torch.randn(n, k, dtype=torch.float32)
+    sigma = torch.rand(n, k, dtype=torch.float32) + 0.6
+    phi = 0.1 * torch.randn(n, n_gen, dtype=torch.float32)
+    mu_p = torch.randn(n, k, dtype=torch.float32)
+    sigma_p = torch.rand(n, k, dtype=torch.float32) + 0.6
+    connection_W = 0.2 * torch.randn(n_gen, k, k, dtype=torch.float32)
+    positive = torch.ones(n, dtype=torch.float32)
+    mixed = torch.tensor([1.0, -1.0, 1.0], dtype=torch.float32)
+
+    positive_transport = build_belief_transport(
+        phi, group, transport_mode="regime_ii", mu=mu,
+        connection_W=connection_W, reflection=positive,
+    )
+    mixed_transport = build_belief_transport(
+        phi, group, transport_mode="regime_ii", mu=mu,
+        connection_W=connection_W, reflection=mixed,
+    )
+    assert not torch.allclose(
+        _dense_omega(positive_transport), _dense_omega(mixed_transport), atol=1e-6,
+    )
+
+    positive_belief = BeliefState(mu=mu, sigma=sigma, phi=phi, reflection=positive)
+    mixed_belief = positive_belief._replace(reflection=mixed)
+    kwargs = dict(
+        e_q_mu_lr=0.05,
+        e_q_sigma_lr=0.0,
+        e_phi_lr=0.0,
+        skip_belief_sigma_update=True,
+        gradient_mode="filtering",
+        transport_mode="regime_ii",
+        connection_W=connection_W,
+    )
+    positive_step = e_step_iteration(positive_belief, mu_p, sigma_p, group, **kwargs)
+    mixed_step = e_step_iteration(mixed_belief, mu_p, sigma_p, group, **kwargs)
+
+    assert not torch.allclose(positive_step.mu, mixed_step.mu, atol=1e-6)
+
+
 # --- Task 3: reflection reaches the gamma / s-channel and the F-eval --------------------------
 
 def _model(**over):

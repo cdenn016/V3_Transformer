@@ -102,7 +102,7 @@ def main():
           f"max_seq_len={mcfg.max_seq_len} vocab={mcfg.vocab_size}")
     seq_len = min(cfg["seq_len"], mcfg.max_seq_len)
     loader = make_dataloader(cfg["dataset"], cfg["split"], seq_len, cfg["batch_size"],
-                             shuffle=False, drop_last=True)
+                             shuffle=False, drop_last=True, vocab_size=mcfg.vocab_size)
 
     record = measure_sigma_gate(
         model, loader, checkpoint_id=cfg["checkpoint_id"], spec_commit=spec_commit(),

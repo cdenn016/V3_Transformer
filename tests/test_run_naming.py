@@ -4,6 +4,8 @@ timestamp) the user organizes runs by. Pure filesystem/string logic -- no model 
 import logging
 import math
 
+import pytest
+
 import train_vfe3
 from vfe3.config import VFE3Config
 
@@ -12,7 +14,7 @@ _LOG = logging.getLogger("test_run_naming")
 
 def _cfg(**kw) -> VFE3Config:
     base = dict(vocab_size=6, embed_dim=20, n_heads=2, max_seq_len=8, n_layers=1,
-                gauge_group="block_glk", use_prior_bank=False, use_head_mixer=True)
+                gauge_group="block_glk", use_prior_bank=False, use_head_mixer=True, seed=0)
     base.update(kw)
     return VFE3Config(**base)
 
@@ -31,6 +33,15 @@ def test_run_label_seed_suffix_distinguishes_seeds():
     # the _s<seed> suffix keeps a multi-seed launch's run folders distinct (and seed-identifiable)
     assert train_vfe3._run_label(_cfg(seed=3), "wikitext-103").endswith("_s3")
     assert train_vfe3._run_label(_cfg(seed=64), "wikitext-103").endswith("_s64")
+
+
+@pytest.mark.parametrize(
+    "dataset",
+    ["", ".", "..", "a/b", "a\\b", "../evil", "C:evil", "bad name"],
+)
+def test_run_label_rejects_unsafe_dataset(dataset):
+    with pytest.raises(ValueError):
+        train_vfe3._run_label(_cfg(), dataset)
 
 
 def test_run_dir_prefixes_label_with_timestamp():
@@ -74,3 +85,8 @@ def test_rename_skips_when_ppl_missing_or_nonfinite(tmp_path):
 def test_rename_skips_when_dir_absent(tmp_path):
     missing = str(tmp_path / "20260607-124645_nope")
     assert train_vfe3._rename_run_by_ppl(missing, "nope", 100.0, _LOG) == missing
+
+
+def test_single_run_rejects_seed_precedence_mismatch():
+    with pytest.raises(ValueError, match="SEEDS.*config.*seed"):
+        train_vfe3._resolve_seeds({"seed": 6}, seeds=(54,), num_runs=1)

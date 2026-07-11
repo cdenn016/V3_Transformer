@@ -91,6 +91,36 @@ def test_load_checkpoint_restores_optimizer_state(tmp_path):
     assert int(any_state["step"]) == 3
 
 
+def test_load_checkpoint_restamps_current_optimizer_group_metadata(tmp_path):
+    saved_cfg = _cfg(m_p_mu_lr=0.03, m_p_sigma_lr=0.02, m_phi_lr=0.01,
+                     weight_decay=0.2)
+    saved_model = VFEModel(saved_cfg)
+    saved_opt = build_optimizer(saved_model, saved_cfg)
+    art = RunArtifacts(tmp_path / "saved", saved_cfg, saved_model)
+    ckpt = art.save_checkpoint(1, saved_model, saved_opt, saved_cfg)
+
+    current_cfg = _cfg(m_p_mu_lr=0.003, m_p_sigma_lr=0.002, m_phi_lr=0.001,
+                       weight_decay=0.0)
+    current_model = VFEModel(current_cfg)
+    current_opt = build_optimizer(current_model, current_cfg)
+    current_metadata = [{k: v for k, v in group.items() if k != "params"}
+                        for group in current_opt.param_groups]
+    current_params = [list(group["params"]) for group in current_opt.param_groups]
+
+    load_checkpoint(ckpt, current_model, current_opt)
+
+    for group, metadata, params in zip(current_opt.param_groups, current_metadata, current_params):
+        assert {k: v for k, v in group.items() if k != "params"} == metadata
+        assert len(group["params"]) == len(params)
+        assert all(loaded is current for loaded, current in zip(group["params"], params))
+
+
+def test_missing_checkpoint_preserves_file_not_found(tmp_path):
+    model = VFEModel(_cfg())
+    with pytest.raises(FileNotFoundError):
+        load_checkpoint(tmp_path / "missing.pt", model)
+
+
 def test_resume_matches_uninterrupted_run(tmp_path):
     r"""The end-to-end equivalence: straight 4-step run == (2 steps -> checkpoint -> resume to 4).
 
@@ -163,31 +193,113 @@ def _shuffled_loader(seq_len: int = 8, bs: int = 4, n: int = 480,
     return DataLoader(ds, batch_size=bs, shuffle=True, drop_last=True, generator=g)
 
 
-def test_shuffled_resume_warns_and_is_not_batch_equivalent(tmp_path):
-    r"""C1 (audit 2026-07-01, documented limitation): a RandomSampler's epoch permutation and
-    intra-epoch cursor are NOT persisted, so a resumed SHUFFLED run draws a different batch
-    sequence than the uninterrupted run (weights/optimizer/RNG ARE restored). Resume must WARN,
-    and this test PINS the non-equivalence so it cannot silently change."""
-    cfg = _cfg(checkpoint_interval=2)
+def test_shuffled_resume_matches_uninterrupted_run(tmp_path):
+    r"""A shuffled six-step run is identical to three steps plus an exact resume."""
+    cfg = _cfg(checkpoint_interval=3, max_steps=6)
 
-    torch.manual_seed(0)                                        # Run A: straight through 4 steps
+    torch.manual_seed(0)
     model_a = VFEModel(cfg)
-    losses_a = train(model_a, _shuffled_loader(), cfg, n_steps=4)
+    losses_a = train(model_a, _shuffled_loader(n=105), cfg, n_steps=6)
+    final_a = _params(model_a)
 
-    torch.manual_seed(0)                                        # Run B: identical first 2 steps + checkpoint
+    torch.manual_seed(0)
     model_b = VFEModel(cfg)
     art = RunArtifacts(tmp_path / "run", cfg, model_b)
-    train(model_b, _shuffled_loader(), cfg, n_steps=2, artifacts=art)
-    ckpt = tmp_path / "run" / "checkpoints" / "step_2.pt"
+    loader_b = _shuffled_loader(n=105)
+    epoch_start_generator_state = loader_b.generator.get_state().clone()
+    losses_b = train(model_b, loader_b, cfg, n_steps=3, artifacts=art)
+    ckpt = tmp_path / "run" / "checkpoints" / "step_3.pt"
     assert ckpt.exists()
+    saved_data_state = torch.load(ckpt, weights_only=True)["data_state"]
+    assert set(saved_data_state) == {"epoch_start_generator_state", "batches_consumed", "epoch"}
+    assert torch.equal(saved_data_state["epoch_start_generator_state"], epoch_start_generator_state)
+    assert saved_data_state["batches_consumed"] == 3
+    assert saved_data_state["epoch"] == 0
 
-    model_c = VFEModel(cfg)                                     # Run C: resume with a FRESH iterator
-    with pytest.warns(UserWarning, match="not batch-identical"):
-        losses_c = train(model_c, _shuffled_loader(), cfg, n_steps=4, resume_from=ckpt)
-    assert len(losses_c) == 2
-    # The resumed stream restarts the epoch permutation, so steps 2-3 see DIFFERENT batches than
-    # run A's steps 2-3 (same weights at step 2 -> the loss values diverge). Documents the gap.
-    assert losses_c != losses_a[2:]
+    model_c = VFEModel(cfg)
+    resume_art = RunArtifacts(tmp_path / "resumed", cfg, model_c)
+    losses_c = train(model_c, _shuffled_loader(n=105), cfg, n_steps=6,
+                     artifacts=resume_art, resume_from=ckpt)
+
+    assert len(losses_b) == len(losses_c) == 3
+    assert losses_b + losses_c == losses_a
+    for uninterrupted, resumed in zip(final_a, _params(model_c)):
+        assert torch.equal(uninterrupted, resumed)
+    resumed_data_state = torch.load(
+        tmp_path / "resumed" / "checkpoints" / "step_6.pt", weights_only=True)["data_state"]
+    assert resumed_data_state["epoch"] == 1
+    assert resumed_data_state["batches_consumed"] == 3
+    assert not torch.equal(resumed_data_state["epoch_start_generator_state"],
+                           epoch_start_generator_state)
+
+
+def test_exact_shuffled_resume_requires_loader_generator(tmp_path):
+    cfg = _cfg(checkpoint_interval=1, max_steps=2)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    loader = _shuffled_loader()
+    loader.generator = None
+    loader.sampler.generator = None
+    art = RunArtifacts(tmp_path / "run", cfg, model)
+    train(model, loader, cfg, n_steps=1, artifacts=art)
+
+    resume_loader = _shuffled_loader()
+    resume_loader.generator = None
+    resume_loader.sampler.generator = None
+    with pytest.raises(RuntimeError, match="exact shuffled resume.*generator"):
+        train(VFEModel(cfg), resume_loader, cfg, n_steps=2,
+              resume_from=tmp_path / "run" / "checkpoints" / "step_1.pt")
+
+
+@pytest.mark.parametrize(("field", "bad_value"), [
+    ("batches_consumed", 1.5),
+    ("batches_consumed", True),
+    ("batches_consumed", -1),
+    ("epoch", 1.5),
+    ("epoch", True),
+    ("epoch", -1),
+])
+def test_save_checkpoint_rejects_malformed_data_cursor(tmp_path, field, bad_value):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model)
+    data_state = {
+        "epoch_start_generator_state": torch.Generator().manual_seed(0).get_state(),
+        "batches_consumed":            0,
+        "epoch":                       0,
+    }
+    data_state[field] = bad_value
+
+    with pytest.raises(ValueError, match=rf"{field}.*non-negative integer"):
+        art.save_checkpoint(1, model, build_optimizer(model, cfg), cfg, data_state=data_state)
+
+
+@pytest.mark.parametrize(("field", "bad_value"), [
+    ("batches_consumed", 1.5),
+    ("batches_consumed", True),
+    ("batches_consumed", -1),
+    ("epoch", 1.5),
+    ("epoch", True),
+    ("epoch", -1),
+])
+def test_load_checkpoint_rejects_malformed_data_cursor(tmp_path, field, bad_value):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model)
+    valid_data_state = {
+        "epoch_start_generator_state": torch.Generator().manual_seed(0).get_state(),
+        "batches_consumed":            0,
+        "epoch":                       0,
+    }
+    checkpoint = art.save_checkpoint(
+        1, model, build_optimizer(model, cfg), cfg, data_state=valid_data_state)
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["data_state"][field] = bad_value
+    malformed_checkpoint = tmp_path / f"malformed-{field}.pt"
+    torch.save(bundle, malformed_checkpoint)
+
+    with pytest.raises(ValueError, match=rf"{field}.*non-negative integer"):
+        load_checkpoint(malformed_checkpoint, VFEModel(cfg), data_state={})
 
 
 def test_resume_restores_best_val_state(tmp_path):

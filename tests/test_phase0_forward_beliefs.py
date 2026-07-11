@@ -41,7 +41,7 @@ _ATOL = 1e-5
 
 def _base(**kw) -> VFE3Config:
     d = dict(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, n_layers=2,
-             n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.02, use_prior_bank=True)
+             n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.02, use_prior_bank=True, seed=0)
     d.update(kw)
     return VFE3Config(**d)
 

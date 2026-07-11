@@ -7,9 +7,14 @@ silent path (no artifacts object) must write nothing and stay bitwise-identical 
 covered by tests/test_train.py::test_silent_and_logging_paths_are_bitwise_identical).
 """
 
+import hashlib
 import json
+import logging
 import math
+import os
+import subprocess
 import types
+from dataclasses import asdict
 
 import pytest
 import torch
@@ -18,7 +23,14 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts, _pure_path_report, finalize_run
+from vfe3 import run_artifacts
+from vfe3.run_artifacts import (
+    RunArtifacts,
+    _calibration_and_strata,
+    _pure_path_report,
+    finalize_run,
+    semantic_config_fingerprint,
+)
 from vfe3.train import build_optimizer, train
 
 
@@ -38,7 +50,7 @@ def _cfg(**kw):
 
 
 def test_config_checkpoint_interval_default_and_validated():
-    assert VFE3Config().checkpoint_interval == 0               # off by default (pure path)
+    assert VFE3Config().checkpoint_interval == 25000
     assert VFE3Config(checkpoint_interval=1000).checkpoint_interval == 1000
     with pytest.raises(ValueError):
         VFE3Config(checkpoint_interval=-1)
@@ -78,6 +90,25 @@ def test_maybe_save_best_only_on_improvement(tmp_path):
     assert art.best_val_ppl == 8.0 and art.best_step == 3
 
 
+def test_best_model_bundle_embeds_semantic_config_fingerprint(tmp_path):
+    cfg = _cfg(n_e_steps=3)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+
+    assert art.maybe_save_best(1, model, 5.0) is True
+    bundle = torch.load(art.best_path, weights_only=True)
+
+    assert set(bundle) == {"model_state", "config", "config_fingerprint"}
+    assert bundle["config"] == asdict(cfg)
+    expected = hashlib.sha256(json.dumps(
+        bundle["config"], sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    assert bundle["config_fingerprint"] == expected
+    assert bundle["config_fingerprint"] == semantic_config_fingerprint(bundle["config"])
+    reordered = dict(reversed(list(bundle["config"].items())))
+    assert semantic_config_fingerprint(reordered) == bundle["config_fingerprint"]
+
+
 def test_save_checkpoint_is_loadable(tmp_path):
     cfg = _cfg()
     model = VFEModel(cfg)
@@ -105,9 +136,33 @@ def test_writes_are_atomic_no_temp_left(tmp_path):
     assert list((tmp_path / "r").rglob("*.tmp")) == []          # run_dir AND ckpt_dir hold no temps
     assert json.loads((tmp_path / "r" / "summary.json").read_text()) == {"a": 1}
     best = torch.load(tmp_path / "r" / "best_model.pt", weights_only=True)
-    assert set(best) == set(model.state_dict())
+    assert set(best["model_state"]) == set(model.state_dict())
     ckpt = torch.load(p, weights_only=True)
     assert ckpt["step"] == 2
+
+
+@pytest.mark.parametrize("name", [
+    "", ".", "..", "a/b", r"a\b", "C:evil", "C:/evil", r"C:\evil",
+])
+def test_save_json_rejects_non_bare_filename(tmp_path, name):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+
+    with pytest.raises(ValueError, match="bare filename"):
+        art.save_json(name, {"unsafe": True})
+
+
+def test_save_json_rejects_absolute_filename(tmp_path):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    outside = tmp_path / "outside.json"
+
+    with pytest.raises(ValueError, match="bare filename"):
+        art.save_json(str(outside), {"unsafe": True})
+
+    assert not outside.exists()
 
 
 def test_best_model_overwrite_replaces(tmp_path):
@@ -120,7 +175,7 @@ def test_best_model_overwrite_replaces(tmp_path):
     with torch.no_grad():
         model.prior_bank.mu_embed.add_(1.0)                     # make the second save distinguishable
     assert art.maybe_save_best(2, model, 8.0) is True           # improved -> replaces the existing file
-    loaded = torch.load(tmp_path / "r" / "best_model.pt", weights_only=True)
+    loaded = torch.load(tmp_path / "r" / "best_model.pt", weights_only=True)["model_state"]
     cur = model.state_dict()
     assert all(torch.equal(loaded[k], cur[k]) for k in cur)     # the SECOND state won
 
@@ -225,6 +280,155 @@ def test_finalize_run_writes_test_results_and_figures(tmp_path):
     summary = json.loads((tmp_path / "run" / "summary.json").read_text())
     assert "test_ppl" in summary and "best_val_ppl" in summary
     assert "reloaded_best" in summary   # m26: surface whether best_model.pt was reloaded (cross-dir resume honesty)
+
+
+def test_frequency_strata_use_training_corpus_counts():
+    class _FixedLogits(torch.nn.Module):
+        def __init__(self, logits: torch.Tensor) -> None:
+            super().__init__()
+            self.register_buffer("logits", logits)
+
+        def forward(self, _tokens: torch.Tensor) -> torch.Tensor:
+            return self.logits
+
+    targets = torch.tensor([[0, 0, 1, 1, 2, 2]])
+    tokens = torch.zeros_like(targets)
+    logits = torch.tensor([[[4.0, 0.0, 0.0], [2.0, 0.0, 0.0],
+                            [0.0, 3.0, 0.0], [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 2.0], [0.0, 0.0, 0.5]]])
+    corpus_counts = torch.tensor([1, 10, 100])
+
+    out = _calibration_and_strata(
+        corpus_counts,
+        _FixedLogits(logits),
+        [(tokens, targets)],
+        torch.device("cpu"),
+    )
+
+    ce = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        targets.reshape(-1),
+        reduction="none",
+    )
+    strata = out["corpus_freq_strata_ce"]
+    assert strata["rare"] == pytest.approx(float(ce[:2].mean()))
+    assert strata["mid"] == pytest.approx(float(ce[2:4].mean()))
+    assert strata["frequent"] == pytest.approx(float(ce[4:].mean()))
+    assert "freq_strata_ce" not in out
+
+
+def test_frequency_strata_cutoffs_ignore_imbalanced_evaluation_duplicates():
+    class _FixedLogits(torch.nn.Module):
+        def __init__(self, logits: torch.Tensor) -> None:
+            super().__init__()
+            self.register_buffer("logits", logits)
+
+        def forward(self, _tokens: torch.Tensor) -> torch.Tensor:
+            return self.logits
+
+    targets = torch.tensor([[1, 1, 1, 1, 1, 3, 4, 0]])
+    tokens = torch.zeros_like(targets)
+    logits = torch.tensor([[
+        [0.0, 0.5, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.5, 0.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0, 0.0, 0.0],
+        [0.0, 2.5, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 3.0],
+        [0.25, 0.0, 0.0, 0.0, 0.0],
+    ]])
+    corpus_counts = torch.tensor([0, 1, 10, 100, 1000])
+
+    out = _calibration_and_strata(
+        corpus_counts,
+        _FixedLogits(logits),
+        [(tokens, targets)],
+        torch.device("cpu"),
+    )
+
+    ce = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        targets.reshape(-1),
+        reduction="none",
+    )
+    strata = out["corpus_freq_strata_ce"]
+    expected_rare = torch.cat((ce[:5], ce[7:])).mean()
+    assert strata["rare"] == pytest.approx(float(expected_rare))
+    assert strata["mid"] == pytest.approx(float(ce[5]))
+    assert strata["frequent"] == pytest.approx(float(ce[6]))
+
+
+def test_provenance_records_all_split_hashes_and_data_knobs(tmp_path):
+    cfg = _cfg(generate_figures=False)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    train_loader = _loader(seed=1, n=300)
+    val_loader = _loader(seed=2, n=360)
+    test_loader = _loader(seed=3, n=420)
+
+    finalize_run(
+        model,
+        art,
+        cfg,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        data_seed=17,
+        max_tokens=300,
+        tokenizer_tag="synthetic-v1",
+    )
+
+    prov = json.loads((tmp_path / "run" / "provenance.json").read_text(encoding="utf-8"))
+    for split, loader in (("train", train_loader), ("val", val_loader), ("test", test_loader)):
+        tokens = loader.dataset.tokens
+        expected = hashlib.sha256(tokens.detach().cpu().numpy().tobytes()).hexdigest()
+        assert prov[f"{split}_data_sha256"] == expected
+        assert prov[f"{split}_data_n_tokens"] == int(tokens.numel())
+    assert prov["data_seed"] == 17
+    assert prov["max_tokens"] == 300
+    assert prov["tokenizer_tag"] == "synthetic-v1"
+    assert prov["data_sha256"] == prov["test_data_sha256"]
+    assert prov["data_n_tokens"] == prov["test_data_n_tokens"]
+
+
+def test_provenance_git_probe_timeout_records_error(tmp_path, monkeypatch):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    timeout = subprocess.TimeoutExpired(["git", "rev-parse", "HEAD"], 5)
+    def _which(name):
+        assert name == "git"
+        return "C:/trusted/git.exe"
+
+    monkeypatch.setattr(run_artifacts.shutil, "which", _which)
+
+    def _time_out(*args, **kwargs):
+        assert kwargs["timeout"] == 5
+        assert kwargs["env"] is not os.environ
+        assert kwargs["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+        raise timeout
+
+    monkeypatch.setattr(run_artifacts.subprocess, "check_output", _time_out)
+    run_artifacts._write_provenance(
+        art,
+        cfg,
+        model,
+        train_loader=None,
+        val_loader=None,
+        test_loader=None,
+        data_seed=None,
+        max_tokens=None,
+        tokenizer_tag=None,
+        logger=logging.getLogger("test-provenance"),
+    )
+
+    prov = json.loads((tmp_path / "run" / "provenance.json").read_text(encoding="utf-8"))
+    assert prov["git_sha"] is None
+    assert prov["git_dirty"] is None
+    assert prov["git_dirty_fingerprint"] is None
+    assert prov["git_error"] == repr(timeout)
 
 
 def test_metrics_csv_includes_gauge_geometry_columns(tmp_path):

@@ -6,8 +6,9 @@ import pytest
 import torch
 
 from vfe3.config import VFE3Config
+from vfe3.ema import EMA
 from vfe3.model.model import VFEModel
-from vfe3.train import build_optimizer, train_step
+from vfe3.train import build_optimizer, train, train_step
 
 
 def _tiny_cfg(**overrides) -> VFE3Config:
@@ -91,3 +92,24 @@ def test_fp16_with_gauge_natural_grad_steps_the_frame():
     tok, tgt = _batch(cfg)
     train_step(m, opt, sch, tok, tgt, grad_clip=1.0, scaler=scaler)
     assert not torch.equal(phi0, m.prior_bank.phi_embed), "gauge frame did not move under fp16 scaler"
+
+
+def test_ema_does_not_advance_on_gradscaler_overflow(monkeypatch):
+    torch.manual_seed(0)
+    cfg = _tiny_cfg(amp_dtype="fp16", use_ema=True, ema_decay=0.9, max_steps=1)
+    model = VFEModel(cfg)
+    model.prior_bank.mu_embed.register_hook(
+        lambda grad: torch.full_like(grad, float("inf")))
+    tok, tgt = _batch(cfg)
+
+    updates = []
+    update = EMA.update
+
+    def _record_update(self, live_model):
+        updates.append(True)
+        update(self, live_model)
+
+    monkeypatch.setattr(EMA, "update", _record_update)
+    train(model, [(tok, tgt)], cfg, n_steps=1, generate_samples=False)
+
+    assert updates == []

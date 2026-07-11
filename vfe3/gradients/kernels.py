@@ -33,6 +33,7 @@ def register_kernel(name: str, *, override: bool = False) -> Callable:
         if name in _KERNELS and not override:
             raise KeyError(f"kernel {name!r} already registered; pass override=True to replace")
         _KERNELS[name] = fn
+        _COMPILED_KERNELS.pop(name, None)
         return fn
     return _wrap
 
@@ -88,7 +89,7 @@ def _diag_kl_filtering_kernel(
     sigma_p:    torch.Tensor,             # (N, K)
     mu_t:       torch.Tensor,             # (N, N, K) transported key means
     sigma_t:    torch.Tensor,             # (N, N, K) transported key variances
-    beta:       torch.Tensor,             # (N, N) or (H, N, N) MASKED attention weights
+    beta:       torch.Tensor,             # (N, N) or (H, N, N) raw attention weights
     alpha_coef: torch.Tensor,             # (N, 1) or (N, K) self-coupling coefficient
 
     *,
@@ -97,7 +98,8 @@ def _diag_kl_filtering_kernel(
     lambda_beta:     'float | torch.Tensor' = 1.0,   # weight on the belief-coupling (pair) term
     lambda_twohop:   float = 0.0,                # weight on the DETACHED two-hop (beta @ beta) pair term (0 = pure)
     need_sigma_grad: bool  = True,               # False -> skip the sigma pair contraction, return (grad_mu, None)
-    irrep_dims:      Optional[List[int]] = None, # block sizes; maps head h(k) onto coordinate k
+    irrep_dims:      Optional[List[int]]    = None, # block sizes; maps head h(k) onto coordinate k
+    pair_mask:       Optional[torch.Tensor] = None, # destination-energy derivative mask; None means beta is pre-masked
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Diagonal-KL query-side (filtering) gradient (per-head aware).
 
@@ -110,8 +112,13 @@ def _diag_kl_filtering_kernel(
     ``free_energy`` (the envelope identity makes the pair term equal to d/dtheta of that block at
     beta*, so scaling both by the same factor keeps kernel == oracle).
 
-    ``beta`` is the (already pair-masked) attention weight in its COMPACT per-head form; the
-    coordinate-resolution weight beta_ij^(h(k)) is realized inside ``_pair_contract`` by
+    ``beta`` is the raw attention weight in its COMPACT per-head form. ``pair_mask`` gates only
+    destination-energy derivatives: the one-hop derivative uses ``beta * pair_mask``, while the
+    two-hop derivative uses ``(beta.detach() @ beta.detach()) * pair_mask``. Thus a zero or
+    saturated intermediate edge may still carry hop mass, but a zero or saturated destination
+    energy has the same zero derivative as the scalar clamp. For backward-compatible direct kernel
+    calls, ``pair_mask=None`` treats ``beta`` as already masked. The coordinate-resolution weight
+    beta_ij^(h(k)) is realized inside ``_pair_contract`` by
     contracting the head axis against a head-shaped VIEW of the pair difference, so the
     (..., N, N, K) ``beta_coord`` broadcast the old kernel consumed is never materialized
     (vram audit 2026-06-10: one full B x N^2 x K tensor saved for backward, for free).
@@ -119,7 +126,7 @@ def _diag_kl_filtering_kernel(
     Self-term saturation mask m_i = 1[0 < D(q_i||p_i) < kl_max]: the oracle differentiates through
     safe_kl_clamp(D, [0, kl_max]), whose gradient is 0 once the raw self-divergence saturates the
     clamp, so the hand kernel zeros its self-term there to stay EXACTLY equal to the filtering
-    oracle. The pairwise term needs no mask: a saturated E_ij drives beta_ij -> 0 on both sides.
+    oracle. The pairwise clamp mask is supplied by the caller from the clamped energy grid.
 
     The mask is shape-driven by ``alpha_coef``: a per-position coefficient (N,1) carries a summed
     self-divergence clamped as one scalar, so the mask is per-token (N,1); a per-coordinate
@@ -136,18 +143,22 @@ def _diag_kl_filtering_kernel(
         raw_self  = _raw_diag_kl_per_coord(mu_q, sigma_q, mu_p, sigma_p, eps=eps)   # (N, K)
         self_mask = ((raw_self > 0.0) & (raw_self < kl_max)).to(mu_q.dtype)
 
+    beta_pair = beta if pair_mask is None else beta * pair_mask
+
     # Two-hop hop weights W2_ik = Sum_j beta_ij beta_jk (per head), DETACHED -- the fixed
     # cross-workstream convention shared with the F-side term in free_energy: same pairwise KL
     # energy grid (mu_t/sigma_t already cover every (i, k) pair under the flat cocycle, where
-    # Omega_ij Omega_jk = Omega_ik), no entropy term for the hop block. ``beta`` here is the
-    # already pair-masked weight, so saturated one-hop links carry no hop mass.
+    # Omega_ij Omega_jk = Omega_ik), no entropy term for the hop block. Compose the RAW attention
+    # factors, then apply the clamp mask only to the destination energy derivative.
     w2 = None
     if lambda_twohop != 0.0:
         w2 = torch.matmul(beta.detach(), beta.detach())        # (..., N, N) or (..., H, N, N)
+        if pair_mask is not None:
+            w2 = w2 * pair_mask
 
     diff_mu  = (mu_q.unsqueeze(-2) - mu_t) / st                # (..., N, N, K)
     self_mu  = self_mask * alpha_coef * (mu_q - mu_p) / sp
-    pair_mu  = _pair_contract(beta, diff_mu, irrep_dims)
+    pair_mu  = _pair_contract(beta_pair, diff_mu, irrep_dims)
     grad_mu  = self_mu + lambda_beta * pair_mu
     if w2 is not None:
         grad_mu = grad_mu + lambda_twohop * _pair_contract(w2, diff_mu, irrep_dims)
@@ -158,7 +169,7 @@ def _diag_kl_filtering_kernel(
 
     diff_sig = 0.5 * (1.0 / st - 1.0 / sq.unsqueeze(-2))       # (..., N, N, K)
     self_sig = self_mask * alpha_coef * 0.5 * (1.0 / sp - 1.0 / sq)
-    pair_sig = _pair_contract(beta, diff_sig, irrep_dims)
+    pair_sig = _pair_contract(beta_pair, diff_sig, irrep_dims)
     grad_sigma = self_sig + lambda_beta * pair_sig
     if w2 is not None:
         grad_sigma = grad_sigma + lambda_twohop * _pair_contract(w2, diff_sig, irrep_dims)
@@ -290,7 +301,7 @@ def belief_gradients(
     b0:           float = 1.0,
     c0:           float = 1.0,
     lambda_beta:  'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure F)
-    lambda_twohop: float = 0.0,                   # weight on the detached two-hop pair term (kernel route only)
+    lambda_twohop: float = 0.0,                   # weight on the detached two-hop pair term
 
     include_attention_entropy: bool = True,
     create_graph:              bool = False,   # unroll: oracle returns a differentiable grad (to prior)
@@ -332,21 +343,12 @@ def belief_gradients(
         decoupled_value_gauge=decoupled_value,
     )
     if not use_kernel:
-        if lambda_twohop != 0.0:
-            # The two-hop coupling gradient is implemented only in the closed-form kernel; the
-            # autograd oracle differentiates the canonical F, which carries no hop block. Warn
-            # (default filter: once) rather than silently descending a different objective.
-            import warnings
-            warnings.warn(
-                f"lambda_twohop={lambda_twohop} is served by the autograd ORACLE on this route, "
-                "which ignores the two-hop coupling term; only the closed-form kernel route "
-                "implements it.",
-                UserWarning, stacklevel=2,
-            )
         return belief_gradients_autograd(
             mu, sigma, mu_p, sigma_p, omega, tau=tau, renyi_order=renyi_order,
             kl_max=kl_max, eps=eps, b0=b0, c0=c0, value=value, lambda_beta=lambda_beta,
+            lambda_twohop=lambda_twohop,
             include_attention_entropy=include_attention_entropy, create_graph=create_graph,
+            need_sigma_grad=need_sigma_grad,
             gradient_mode=gradient_mode, family=family, divergence_family=divergence_family,
             lambda_alpha_mode=lambda_alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior,
             omega_builder=omega_builder,
@@ -376,13 +378,13 @@ def belief_gradients(
     coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=lambda_alpha_mode)
     if not alpha_is_per_coord(lambda_alpha_mode):
         coef = coef.unsqueeze(-1)                 # (N,) -> (N,1) per-position broadcast; per-coord sd is already (N,K)
-    # The masked beta stays in its COMPACT per-head form; the kernel's _pair_contract realizes
+    # The raw beta stays in its COMPACT per-head form; the kernel's _pair_contract realizes
     # beta_ij^(h(k)) against a head-shaped view of the pair difference, so the (..., N, N, K)
     # beta_coord broadcast is never materialized (vram audit 2026-06-10).
-    kernel_args   = (mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta * pair_mask, coef)
+    kernel_args   = (mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta, coef)
     kernel_kwargs = dict(kl_max=kl_max, eps=eps, lambda_beta=lambda_beta,
                          lambda_twohop=lambda_twohop, need_sigma_grad=need_sigma_grad,
-                         irrep_dims=irrep_dims)
+                         irrep_dims=irrep_dims, pair_mask=pair_mask)
     if compile_pair_kernel:
         try:
             return _get_compiled_kernel(family)(*kernel_args, **kernel_kwargs)
@@ -421,6 +423,8 @@ def mm_exact_update(
     family:            str = "gaussian_diagonal",
     divergence_family: str = "renyi",
 
+    need_sigma_update: bool = True,             # False -> omit sigma fusion and return the input sigma exactly
+
     irrep_dims:    Optional[List[int]]    = None,
     log_prior:     Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:          # (mu_star, sigma_star), each (..., N, K)
@@ -431,7 +435,8 @@ def mm_exact_update(
 
         F_hat = Sum_i m_i a_i KL(q_i || p_i)
               + Sum_ij w_ij^(h(k)) KL(q_i || Omega_ij q_j),
-        w_ij  = lambda_beta beta_ij + lambda_twohop (beta beta)_ij,
+        w_ij  = m_ij [lambda_beta beta_ij + lambda_twohop (beta beta)_ij],
+        m_ij  = 1[0 < E_ij < kl_max],
 
     obtained by zeroing the hand kernel's grad_mu / grad_sigma expressions, is the precision fusion
 
@@ -443,8 +448,10 @@ def mm_exact_update(
     see the comment at the mask) and a_i the same alpha coefficient the kernel
     uses at the CURRENT point (state-dependent envelope frozen). mu* is sigma_q-independent (the
     kernel's grad_mu carries no sigma_q), so the pair is jointly exact in one evaluation. beta and
-    the transported moments are the SAME intermediates ``belief_gradients`` builds (same pair
-    masking), so the fusion is the exact minimizer of the objective the kernel's gradient descends.
+    the transported moments are the SAME intermediates ``belief_gradients`` builds. The one-hop
+    derivative uses ``beta * pair_mask``; the two-hop derivative composes raw detached beta first,
+    then applies ``pair_mask`` to the destination energy, matching the scalar functional. Thus the
+    fusion is the exact minimizer of the objective the kernel's gradient descends.
     The returned sigma* carries only the ``eps`` floor; the caller applies its damping and the
     sigma_max cap. The graph stays LIVE through (mu*, sigma*) (analytic in mu/sigma via beta, sd),
     matching the kernel's unroll behavior; the caller detaches for straight_through.
@@ -482,8 +489,8 @@ def mm_exact_update(
 
     w = lambda_beta * (beta * pair_mask)
     if lambda_twohop != 0.0:
-        bm = (beta * pair_mask).detach()                             # detached hop weights (convention)
-        w = w + lambda_twohop * torch.matmul(bm, bm)
+        w2 = torch.matmul(beta.detach(), beta.detach())              # raw detached hop factors
+        w = w + lambda_twohop * (w2 * pair_mask)                     # mask destination derivative only
 
     sp = sigma_p.clamp(min=eps)
     st = sigma_t.clamp(min=eps)
@@ -491,16 +498,19 @@ def mm_exact_update(
     prior_prec = a / sp                                              # (..., N, K) m a / sigma_p
     pair_prec  = _pair_contract(w, 1.0 / st, irrep_dims)             # (..., N, K) Sum_j w / sigma_t
     pair_mean  = _pair_contract(w, mu_t / st, irrep_dims)            # (..., N, K) Sum_j w mu_t / sigma_t
-    pair_mass  = _pair_mass(w, irrep_dims, K)                        # (..., N, K) Sum_j w
     prec = prior_prec + pair_prec                                   # pre-clamp fused precision
     P = prec.clamp(min=eps)                                         # eps guards the all-saturated row
-    mu_star    = (a * mu_p / sp + pair_mean) / P
-    sigma_star = ((a + pair_mass) / P).clamp(min=eps)
+    mu_star = (a * mu_p / sp + pair_mean) / P
     # m12: on a fully saturated row (a==0 and all w==0) prec floors to 0; dividing the zero numerator by
     # eps snapped the belief to (0, eps), the OPPOSITE of the gradient route (which stays put). Keep the
     # live belief where prec floors, matching the gradient route and preserving graph liveness.
     degenerate = prec <= eps
-    mu_star    = torch.where(degenerate, mu, mu_star)
+    mu_star = torch.where(degenerate, mu, mu_star)
+    if not need_sigma_update:
+        return mu_star, sigma
+
+    pair_mass  = _pair_mass(w, irrep_dims, K)                        # (..., N, K) Sum_j w
+    sigma_star = ((a + pair_mass) / P).clamp(min=eps)
     sigma_star = torch.where(degenerate, sigma, sigma_star)
     return mu_star, sigma_star
 

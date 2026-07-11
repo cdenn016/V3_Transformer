@@ -76,8 +76,11 @@ def test_train_step_metrics_out_captures_grad_norm() -> None:
     tok = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.max_seq_len), device=DEVICE)
     tgt = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.max_seq_len), device=DEVICE)
     out: dict = {}
-    loss = train_step(model, opt, sched, tok, tgt, grad_clip=1.0, metrics_out=out)
+    status: dict = {}
+    loss = train_step(model, opt, sched, tok, tgt, grad_clip=1.0,
+                      metrics_out=out, status_out=status)
     assert isinstance(loss, float) and math.isfinite(loss)         # bare-float return preserved
+    assert status == {"did_step": True}
     assert math.isfinite(out["grad_norm"]) and out["grad_norm"] >= 0.0
     for k in ("grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"):
         assert k in out and math.isfinite(out[k])
@@ -305,15 +308,25 @@ def test_guard_saturation_full_cov_floor_binds() -> None:
 def test_finalize_writes_tier3_research_and_provenance() -> None:
     import json
     from vfe3.run_artifacts import RunArtifacts, finalize_run
-    torch.manual_seed(0)
-    cfg = _cfg(log_interval=6, eval_interval=12, eval_max_batches=2, generate_figures=False)
+    from vfe3.runtime import seed_everything
+    cfg = _cfg(log_interval=6, eval_interval=12, eval_max_batches=2, generate_figures=False,
+               deterministic=True)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(DEVICE)
     loader = _loader(cfg)
     with tempfile.TemporaryDirectory() as tmp:
         art = RunArtifacts(tmp, cfg, model, dataset="synthetic-period3", device=str(DEVICE))
         losses = train(model, loader, cfg, n_steps=24, log_interval=6, eval_interval=12,
                        val_loader=loader, artifacts=art, device=DEVICE, generate_samples=False)
-        res = finalize_run(model, art, cfg, test_loader=loader, losses=losses, device=DEVICE)
+        res = finalize_run(
+            model,
+            art,
+            cfg,
+            train_loader=loader,
+            test_loader=loader,
+            losses=losses,
+            device=DEVICE,
+        )
         root = Path(tmp)
         # the n_e_steps=0 capacity-gain falsifier is computed and the budget is restored
         assert "estep_capacity_gain" in res and math.isfinite(res["estep_capacity_gain"])
@@ -325,14 +338,21 @@ def test_finalize_writes_tier3_research_and_provenance() -> None:
         # provenance.json: code/data/env state a config-only record omits
         prov = json.loads((root / "provenance.json").read_text())
         assert {"seed", "torch_version", "git_sha", "git_dirty"} <= set(prov)
+        assert prov["deterministic_state"] == {
+            "algorithms": True,
+            "cudnn_deterministic": True,
+            "cudnn_benchmark": False,
+            "cublas_workspace_config": ":4096:8",
+        }
         # summary.json scaling-law point
         summ = json.loads((root / "summary.json").read_text())
         assert {"n_params", "tokens_seen", "est_flops_6ND"} <= set(summ["scaling_point"])
         assert summ["scaling_point"]["tokens_seen"] == cfg.max_steps * cfg.batch_size * cfg.max_seq_len
         # research.json: calibration + frequency strata + FD gradient check
         rj = json.loads((root / "research.json").read_text())
-        assert math.isfinite(rj["ece"]) and "freq_strata_ce" in rj
+        assert math.isfinite(rj["ece"]) and "corpus_freq_strata_ce" in rj
         assert math.isfinite(rj["fd_gradient_worst_rel_error"]) and rj["fd_gradient_worst_rel_error"] >= 0.0
         # history-only trend figures
         for fig in ("grad_norm.png", "belief_condition.png", "estep_convergence_trend.png"):
             assert (root / fig).exists(), f"missing trend figure {fig}"
+    seed_everything(cfg.seed, deterministic=False)

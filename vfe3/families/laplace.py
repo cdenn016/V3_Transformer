@@ -55,7 +55,7 @@ non-permutation gauge. Use under permutation/sign gauge for exactness.
 """
 
 import math
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -111,12 +111,12 @@ class DiagonalLaplace(BeliefParams):
 
     def natural_gradient(
         self,
-        grad_mu:    torch.Tensor,             # (..., K) Euclidean grad wrt mu (location)
-        grad_sigma: torch.Tensor,             # (..., K) Euclidean grad wrt the scale b
+        grad_mu:    torch.Tensor,                    # (..., K) Euclidean grad wrt mu (location)
+        grad_sigma: Optional[torch.Tensor],          # None freezes sigma; else grad wrt scale b
 
         *,
         eps:        float = 1e-6,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:   # (nat_mu, nat_b) = Fisher^{-1} grad
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:   # (nat_mu, nat_b) = Fisher^{-1} grad
         r"""Diagonal-Laplace Fisher preconditioner. The Laplace(mu, b) Fisher information is
         DIAGONAL and EQUAL on both coordinates, ``I_mu = I_b = 1 / b^2`` (a location-scale family;
         verified symbolically), so the natural gradient is ``b^2 * grad`` on BOTH the location and
@@ -130,8 +130,8 @@ class DiagonalLaplace(BeliefParams):
         with torch.amp.autocast(self.sigma.device.type, enabled=False):  # tensor-keyed (audit 2026-07-05 m10)
             b2        = self.sigma.float().clamp(min=eps).square()      # (..., K) b^2 = I^{-1}
             nat_mu    = b2 * grad_mu.float()
-            nat_sigma = b2 * grad_sigma.float()
-        return nat_mu.to(orig_dtype), nat_sigma.to(orig_dtype)
+            nat_sigma = None if grad_sigma is None else b2 * grad_sigma.float()
+        return nat_mu.to(orig_dtype), None if nat_sigma is None else nat_sigma.to(orig_dtype)
 
     def _renyi_terms(
         self,
@@ -160,6 +160,41 @@ class DiagonalLaplace(BeliefParams):
         c_q  = alpha / b_q64
         c_p  = (1.0 - alpha) / b_p64
         csum = c_q + c_p
+        if alpha > 1.0:
+            # Split the integral at the two locations. Each interval is positive, so its log can
+            # be combined without ever materializing exp(-c_p * s), which overflows at large
+            # separation because c_p < 0. Divergent tail blends are replaced before any branch
+            # algebra, keeping the documented NaN -> kl_max policy without poisoning gradients.
+            convergent = csum > 0.0
+            c_q_safe    = torch.where(convergent, c_q, torch.ones_like(c_q))
+            c_p_safe    = torch.where(convergent, c_p, torch.zeros_like(c_p))
+            csum_safe   = torch.where(convergent, csum, torch.ones_like(csum))
+            s_safe      = torch.where(convergent, s64, torch.zeros_like(s64))
+
+            c_mid = 0.5 * (c_p_safe + c_q_safe)
+            x     = 0.5 * (c_p_safe - c_q_safe) * s_safe
+            small = x.abs() < 1e-3
+            x_s   = torch.where(small, x, torch.zeros_like(x))
+            log_sinhc_small = torch.log1p(x_s.square() / 6.0 + x_s.pow(4) / 120.0)
+
+            x_l = torch.where(small, torch.ones_like(x), x.abs())
+            log_sinhc_large = (
+                x_l + torch.log1p(-torch.exp(-2.0 * x_l))
+                - math.log(2.0) - torch.log(x_l)
+            )
+            log_sinhc = torch.where(small, log_sinhc_small, log_sinhc_large)
+
+            tiny       = torch.finfo(s_safe.dtype).tiny
+            log_middle = -c_mid * s_safe + torch.log(s_safe.clamp_min(tiny)) + log_sinhc
+            log_left   = -c_p_safe * s_safe - torch.log(csum_safe)
+            log_right  = -c_q_safe * s_safe - torch.log(csum_safe)
+            log_integral = torch.logaddexp(torch.logaddexp(log_left, log_middle), log_right)
+            log_int = (log_integral - math.log(2.0)
+                       - alpha * torch.log(b_q64) - (1.0 - alpha) * torch.log(b_p64))
+            div = log_int / (alpha - 1.0)
+            div = torch.where(convergent, div, div.new_tensor(float("nan")))
+            return div.to(mu_q.dtype)
+
         d    = c_p - c_q
         e_q  = torch.exp(-c_q * s64)
         e_p  = torch.exp(-c_p * s64)

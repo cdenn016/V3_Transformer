@@ -21,6 +21,7 @@ Device-agnostic (CPU default; set VFE3_TEST_DEVICE=cuda for the GPU).
 """
 import os
 
+import pytest
 import torch
 
 from vfe3.belief import BeliefState
@@ -63,6 +64,40 @@ def _forward_reference(model, tokens: torch.Tensor):
     with torch.no_grad():
         model.forward_beliefs(tokens, capture=cap)
     return cap["out"]
+
+
+def _refined_rope_gamma_model() -> VFEModel:
+    with pytest.warns(UserWarning, match="gauge"):
+        cfg = VFE3Config(
+            vocab_size=16,
+            embed_dim=8,
+            n_heads=2,
+            max_seq_len=8,
+            n_layers=1,
+            n_e_steps=2,
+            e_q_mu_lr=0.2,
+            e_q_sigma_lr=0.1,
+            e_phi_lr=0.0,
+            e_s_mu_lr=0.7,
+            e_s_sigma_lr=0.2,
+            prior_source="model_channel",
+            s_e_step=True,
+            lambda_h=1.0,
+            lambda_gamma=0.75,
+            gamma_as_beta_prior=True,
+            gamma_prior_weight=1.0,
+            pos_rotation="rope",
+        )
+    torch.manual_seed(23)
+    model = VFEModel(cfg).to(DEVICE)
+    model.eval()
+    with torch.no_grad():
+        model.prior_bank.s_mu_embed.normal_(mean=0.0, std=0.7)
+        model.prior_bank.s_sigma_log_embed.normal_(mean=0.0, std=0.25)
+        model.prior_bank.phi_embed.normal_(mean=0.0, std=0.15)
+        model.prior_bank.r_mu.fill_(0.8)
+        model.prior_bank.r_sigma_log.fill_(0.1)
+    return model
 
 
 def test_extractor_belief_matches_forward_under_precision_weighted_attention():
@@ -140,3 +175,93 @@ def test_extractor_fold_and_anchor_are_noops_on_default_config():
     assert torch.equal(bank["mu"],    out0.mu.reshape(b * n, -1))
     assert torch.equal(bank["sigma"], out0.sigma.reshape(b * n, *out0.sigma.shape[2:]))
     assert torch.equal(bank["phi"],   out0.phi.reshape(b * n, -1))
+
+
+def test_encode_one_matches_forward_under_refined_rope_gamma() -> None:
+    model = _refined_rope_gamma_model()
+    tokens = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.long, device=DEVICE)
+    ref = _forward_reference(model, tokens)
+
+    belief, log_prior, rope = extract._encode_one(model, tokens)
+    out = _stack(model, belief, log_prior, rope)
+
+    assert torch.allclose(out.mu, ref.mu[0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(out.sigma, ref.sigma[0], atol=1e-5, rtol=1e-5)
+
+
+def test_belief_bank_matches_forward_under_refined_rope_gamma() -> None:
+    model = _refined_rope_gamma_model()
+    tokens = torch.tensor(
+        [[0, 1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1, 0]],
+        dtype=torch.long,
+        device=DEVICE,
+    )
+    ref = _forward_reference(model, tokens)
+    bank = extract.belief_bank(model, [tokens])
+    b, n = tokens.shape
+
+    assert torch.allclose(bank["mu"], ref.mu.reshape(b * n, -1), atol=1e-5, rtol=1e-5)
+    assert torch.allclose(
+        bank["sigma"], ref.sigma.reshape(b * n, *ref.sigma.shape[2:]), atol=1e-5, rtol=1e-5,
+    )
+
+
+def test_belief_ce_bank_matches_forward_sigma_under_refined_rope_gamma() -> None:
+    model = _refined_rope_gamma_model()
+    tokens = torch.tensor(
+        [[0, 1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1, 0]],
+        dtype=torch.long,
+        device=DEVICE,
+    )
+    targets = torch.roll(tokens, shifts=-1, dims=1)
+    ref = _forward_reference(model, tokens)
+    bank = extract.belief_ce_bank(model, [(tokens, targets)], max_batches=1)
+    expected_trace = ref.sigma.sum(dim=-1).reshape(-1)
+
+    assert torch.allclose(bank["tr_sigma"], expected_trace, atol=1e-5, rtol=1e-5)
+
+
+def test_s_channel_refinement_matches_direct_rope_refine() -> None:
+    model = _refined_rope_gamma_model()
+    tokens = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.long, device=DEVICE)
+    enc = model.prior_bank.encode(tokens)
+    phi0 = model._apply_pos_phi(enc.phi)
+    rope = model._rope_rotation(tokens.shape[1], tokens.device)
+    assert rope is not None
+    s0_mu, s0_sigma = model.prior_bank.encode_s(tokens)
+    expected_mu, expected_sigma = model._refine_s(tokens, phi0, rope=rope)
+    unrotated_mu, _ = model._refine_s(tokens, phi0)
+
+    result = extract.s_channel_refinement(model, tokens)
+
+    assert result is not None
+    expected_mu_delta = (expected_mu[0] - s0_mu[0]).norm(dim=-1).cpu()
+    expected_logsigma_delta = (
+        expected_sigma[0].clamp(min=model.cfg.eps).log()
+        - s0_sigma[0].clamp(min=model.cfg.eps).log()
+    ).norm(dim=-1).cpu()
+    assert torch.allclose(result["mu_delta"], expected_mu_delta, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(result["logsigma_delta"], expected_logsigma_delta, atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(expected_mu, unrotated_mu, atol=1e-6, rtol=1e-6)
+
+
+def test_model_channel_bank_matches_direct_rope_refine() -> None:
+    model = _refined_rope_gamma_model()
+    tokens = torch.tensor(
+        [[0, 1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1, 0]],
+        dtype=torch.long,
+        device=DEVICE,
+    )
+    phi0 = model._apply_pos_phi(model.prior_bank.encode(tokens).phi)
+    rope = model._rope_rotation(tokens.shape[1], tokens.device)
+    assert rope is not None
+    expected_mu, expected_sigma = model._refine_s(tokens, phi0, rope=rope)
+    unrotated_mu, _ = model._refine_s(tokens, phi0)
+
+    bank = extract.model_channel_bank(model, [tokens])
+
+    assert bank is not None
+    b, n = tokens.shape
+    assert torch.allclose(bank["mu"], expected_mu.reshape(b * n, -1), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(bank["sigma"], expected_sigma.reshape(b * n, -1), atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(expected_mu, unrotated_mu, atol=1e-6, rtol=1e-6)

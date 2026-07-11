@@ -880,7 +880,7 @@ def plot_grad_norm_decomposition(
 
 @register_figure("estep_grad_norm_decomposition")
 def plot_estep_grad_norm_decomposition(
-    history: Dict,                       # step + any of: estep_grad_norm_mu, estep_grad_norm_sigma, estep_grad_norm_phi
+    history: Dict,                       # step + single-batch or microbatch-mean E-step grad norms
 
     *,
     path:    Optional[str] = None,
@@ -892,13 +892,21 @@ def plot_estep_grad_norm_decomposition(
     parameter) gradient pushes each belief-component family, this shows how hard the INFERENCE (E-step)
     gradient ``\nabla F`` pushes the belief tuple ``(mu, Sigma, phi)`` itself -- the RAW gradient inside
     the last E-step iteration, before the Fisher / natural-gradient preconditioning, captured by
-    model.forward(estep_grad_out=...). A component reads 0 (dropped on the log y) when its substep is off
-    (e.g. phi when e_phi_lr=0).
+    model.forward(estep_grad_out=...). Accumulated steps use the arithmetic mean across contributing
+    microbatches. A component reads 0 (dropped on the log y) when its substep is off (e.g. phi when
+    e_phi_lr=0).
     """
+    mean_keys = (
+        "estep_grad_norm_mu_microbatch_mean",
+        "estep_grad_norm_sigma_microbatch_mean",
+        "estep_grad_norm_phi_microbatch_mean",
+    )
+    keys = (mean_keys if any(key in history for key in mean_keys)
+            else ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi"))
     spec = [
-        ("estep_grad_norm_mu",    r"$\|\nabla_\mu F\|_2$",    _CB[0], "mu"),
-        ("estep_grad_norm_sigma", r"$\|\nabla_\Sigma F\|_2$", _CB[1], "sigma"),
-        ("estep_grad_norm_phi",   r"$\|\nabla_\phi F\|_2$",   _CB[2], "phi"),
+        (keys[0], r"$\|\nabla_\mu F\|_2$",    _CB[0], "mu"),
+        (keys[1], r"$\|\nabla_\Sigma F\|_2$", _CB[1], "sigma"),
+        (keys[2], r"$\|\nabla_\phi F\|_2$",   _CB[2], "phi"),
     ]
     return _grad_norm_decomp_fig(
         history, spec, "E-step gradient norm decomposition",
@@ -3301,9 +3309,9 @@ PUB_LABELS: Dict[str, str] = {
     "sigma_trace_cv":     r"$\mathrm{CV}_i[\mathrm{tr}\,\Sigma_i]$",
     "sigma_ce_spearman":  r"$\rho_s(\mathrm{tr}\,\Sigma,\ \mathrm{CE})$",
     "fd_gradient_worst_rel_error": "finite-diff worst rel. error",
-    "freq_strata_ce.rare":     r"$\mathrm{CE}_{\mathrm{rare}}$ (nats)",
-    "freq_strata_ce.mid":      r"$\mathrm{CE}_{\mathrm{mid}}$ (nats)",
-    "freq_strata_ce.frequent": r"$\mathrm{CE}_{\mathrm{frequent}}$ (nats)",
+    "corpus_freq_strata_ce.rare":     r"$\mathrm{CE}_{\mathrm{rare}}$ (nats)",
+    "corpus_freq_strata_ce.mid":      r"$\mathrm{CE}_{\mathrm{mid}}$ (nats)",
+    "corpus_freq_strata_ce.frequent": r"$\mathrm{CE}_{\mathrm{frequent}}$ (nats)",
     # -- geometry-health dashboard (gauge / SPD / Fisher / guard) --
     "holonomy_wilson":         r"Wilson holonomy $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$ (gauge-invariant)",
     "cocycle_residual":        "cocycle residual (flatness)",

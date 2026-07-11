@@ -118,7 +118,11 @@ def test_val_builder_resid_logged_with_head_mixer(tmp_path):
 def _write_cell(sweep_dir, label, result):
     d = sweep_dir / label
     d.mkdir(parents=True)
-    (d / "ablation_result.json").write_text(json.dumps({"label": label, **result}))
+    marker = {"label": label, **result}
+    marker.setdefault("final_val_ppl", marker.get("primary_val_ppl"))
+    marker.setdefault("status", "success")
+    marker.setdefault("error_kind", None)
+    (d / "ablation_result.json").write_text(json.dumps(marker))
 
 
 def test_plot_gauge_transport_driver(tmp_path):

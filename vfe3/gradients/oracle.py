@@ -56,17 +56,20 @@ def belief_gradients_autograd(
     omega:        'torch.Tensor | FactoredTransport | RopeTransport',   # (N,N,K,K) dense OR factored exps
 
     *,
-    tau:          'float | torch.Tensor' = 1.0,
-    renyi_order:  float = 1.0,
-    kl_max:       float = 100.0,
-    eps:          float = 1e-6,
-    b0:           float = 1.0,
-    c0:           float = 1.0,
-    value:        float = 1.0,
-    lambda_beta:  'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure F)
+    tau:           'float | torch.Tensor' = 1.0,
+    lambda_beta:   'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure F)
+
+    renyi_order:   float = 1.0,
+    kl_max:        float = 100.0,
+    eps:           float = 1e-6,
+    b0:            float = 1.0,
+    c0:            float = 1.0,
+    value:         float = 1.0,
+    lambda_twohop: float = 0.0,                   # weight on detached two-hop coupling (0.0 = pure F)
 
     include_attention_entropy: bool = True,
     create_graph:              bool = False,   # True (unroll): live leaf + differentiable grad to prior
+    need_sigma_grad:           bool = True,    # False -> return (grad_mu, None)
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
@@ -76,7 +79,7 @@ def belief_gradients_autograd(
     log_prior:                 Optional[torch.Tensor] = None,
     omega_builder:             Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
                                                  'torch.Tensor | FactoredTransport | RopeTransport']] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:   # (grad_mu, grad_sigma), each (N, K)
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:   # (grad_mu, grad_sigma), each (N, K)
     r"""Autograd of canonical F_red w.r.t. (mu, sigma). See module docstring for modes.
 
     ``irrep_dims`` (when multi-block) routes the per-head energy through ``pairwise_energy``;
@@ -92,9 +95,9 @@ def belief_gradients_autograd(
     slots (query-side d delta/d mu_i only -- mean-field coordinate ascent); under smoothing both
     slots share the live leaves (full gradient, the stationary point of the global F)."""
     # Live leaves (keep the unrolled chain) only when create_graph is requested AND the belief
-    # genuinely carries grad upstream; otherwise a detached clone (autograd.grad needs a grad leaf,
-    # and there is no unrolled signal to preserve when the belief is grad-free, e.g. a no_grad caller
-    # or a direct unit-test call).
+    # genuinely carries grad upstream. The truncated E-step establishes that contract by creating
+    # fresh attached leaves at the last-k boundary. Otherwise use a detached clone (autograd.grad
+    # needs a grad leaf, and there is no unrolled signal to preserve for a no_grad caller).
     use_live = create_graph and mu.requires_grad and sigma.requires_grad
     if use_live:
         mu_q, sigma_q = mu, sigma
@@ -139,12 +142,16 @@ def belief_gradients_autograd(
                                           kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                           irrep_dims=irrep_dims)
     F = free_energy(
-        sd, energy, alpha, tau=tau, lambda_beta=lambda_beta,
+        sd, energy, alpha, tau=tau, lambda_beta=lambda_beta, lambda_twohop=lambda_twohop,
         include_attention_entropy=include_attention_entropy,
         log_prior=log_prior, alpha_reg=(reg if lambda_alpha_mode != "constant" else None),
         coupling_energy=coupling_energy,
     )
-    grad_mu, grad_sigma = torch.autograd.grad(F, [mu_q, sigma_q], create_graph=use_live)
+    if need_sigma_grad:
+        grad_mu, grad_sigma = torch.autograd.grad(F, [mu_q, sigma_q], create_graph=use_live)
+    else:
+        grad_mu, = torch.autograd.grad(F, [mu_q], create_graph=use_live)
+        grad_sigma = None
     if use_live:
         return grad_mu, grad_sigma                         # differentiable -> unrolled signal to prior
-    return grad_mu.detach(), grad_sigma.detach()
+    return grad_mu.detach(), None if grad_sigma is None else grad_sigma.detach()

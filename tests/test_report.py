@@ -6,6 +6,7 @@ trained run produced only one of the publication figures. The proof is PNG files
 integration test asserts the figure set actually appears when the driver runs the real model.
 """
 
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -15,7 +16,7 @@ from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts, finalize_run
 from vfe3.train import train
 from vfe3.viz.extract import converged_state
-from vfe3.viz.report import generate_figures
+from vfe3.viz.report import generate_figures, vocab_comparison_figures
 
 
 def _loader(seed=0, n=600, seq_len=8, bs=8):
@@ -116,6 +117,24 @@ def test_finalize_skips_figures_when_disabled(tmp_path):
                    val_loader=_loader(seed=1), artifacts=art)
     finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
     assert not (tmp_path / "run" / "figures").exists()
+
+
+def test_vocab_comparison_rejects_mixed_tokenizers(tmp_path):
+    cfg = _cfg()
+    model = _model()
+    gpt2 = RunArtifacts(tmp_path / "gpt2", cfg, model, dataset="wikitext-103")
+    cl100k = RunArtifacts(tmp_path / "cl100k", cfg, model, dataset="wiki-en")
+
+    with pytest.raises(ValueError, match="mixed tokenizer tags") as exc:
+        vocab_comparison_figures(
+            [gpt2.run_dir, cl100k.run_dir],
+            tmp_path / "comparison",
+        )
+
+    message = str(exc.value)
+    assert "tiktoken" in message
+    assert "tiktoken_cl100k" in message
+    assert not (tmp_path / "comparison").exists()
 
 
 def test_metrics_csv_logs_at_log_cadence(tmp_path):

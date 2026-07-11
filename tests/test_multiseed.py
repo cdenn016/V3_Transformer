@@ -7,6 +7,7 @@ import json
 import math
 
 import numpy as np
+import pytest
 
 import multiseed_analysis as ms
 
@@ -35,6 +36,7 @@ def test_aggregate_skips_nonfinite_and_unreadable(tmp_path):
     _write_run(tmp_path / "b", float("inf"), seed=2)         # inf serializes to "Infinity" -> skipped
     (tmp_path / "c").mkdir()
     (tmp_path / "c" / "summary.json").write_text("{ not json")
+    (tmp_path / "c" / "config.json").write_text(json.dumps({"seed": 3}))
     out = ms.aggregate_seed_metric(tmp_path)
     assert out["n"] == 1 and abs(out["mean"] - 10.0) < 1e-9
     assert math.isnan(out["sd"])                            # n<2 -> SD undefined
@@ -56,10 +58,11 @@ def test_flag_noise_dominated():
 # Full cross-seed digest (2026-06-22): run-root resolution, seed source, curves,
 # per-layer, research scalars, and the new figure functions.
 # =============================================================================
-def _write_full_run(d, *, ppl, seed, metrics=None, per_layer=None, research=None):
+def _write_full_run(d, *, ppl, seed, metrics=None, per_layer=None, research=None, config=None):
     d.mkdir(parents=True, exist_ok=True)
     (d / "summary.json").write_text(json.dumps({"test_ppl": ppl}))
-    (d / "config.json").write_text(json.dumps({"seed": None}))           # real seed lives in provenance
+    config = {"seed": None} if config is None else config
+    (d / "config.json").write_text(json.dumps(config))                    # real seed lives in provenance
     (d / "provenance.json").write_text(json.dumps({"seed": seed}))
     if metrics is not None:
         (d / "metrics.csv").write_text(metrics)
@@ -107,10 +110,79 @@ def test_aggregate_seed_metric_uses_provenance_seed(tmp_path):
     assert out["n"] == 2 and sorted(out["seeds"]) == [23, 54]
 
 
+def test_seed_dirs_reject_mixed_semantic_configs(tmp_path):
+    run_a = tmp_path / "run_s1"
+    run_b = tmp_path / "run_s2"
+    _write_full_run(
+        run_a,
+        ppl=10.0,
+        seed=1,
+        config={"config": {"seed": 1, "embed_dim": 20}, "timestamp": "first"},
+    )
+    _write_full_run(
+        run_b,
+        ppl=11.0,
+        seed=2,
+        config={"config": {"seed": 2, "embed_dim": 40}, "timestamp": "second"},
+    )
+
+    with pytest.raises(ValueError, match="mixed semantic config fingerprints") as exc:
+        ms._seed_dirs(tmp_path)
+
+    message = str(exc.value)
+    assert ms._config_fingerprint(run_a / "config.json") in message
+    assert ms._config_fingerprint(run_b / "config.json") in message
+    assert str(run_a / "config.json") in message
+    assert str(run_b / "config.json") in message
+    with pytest.raises(ValueError, match="mixed semantic config fingerprints"):
+        ms.aggregate_seed_metric(tmp_path)
+
+
+def test_seed_dirs_accept_homogeneous_semantic_configs(tmp_path):
+    nested = tmp_path / "run_s1"
+    flat = tmp_path / "run_s2"
+    _write_full_run(
+        nested,
+        ppl=10.0,
+        seed=1,
+        config={
+            "config": {"seed": 1, "embed_dim": 20, "data": {"seed": 101, "name": "fixed"}},
+            "timestamp": "first",
+        },
+    )
+    _write_full_run(
+        flat,
+        ppl=12.0,
+        seed=2,
+        config={"seed": 2, "embed_dim": 20, "data": {"seed": 202, "name": "fixed"}},
+    )
+
+    assert (
+        ms._config_fingerprint(nested / "config.json")
+        == ms._config_fingerprint(flat / "config.json")
+    )
+    assert ms._seed_dirs(tmp_path) == [nested, flat]
+    out = ms.aggregate_seed_metric(tmp_path)
+    assert out["n"] == 2
+    assert out["mean"] == pytest.approx(11.0)
+
+
+@pytest.mark.parametrize("config_text", [None, "{ not json"])
+def test_seed_dirs_reject_missing_or_unreadable_config(tmp_path, config_text):
+    run_dir = tmp_path / "run_s1"
+    run_dir.mkdir()
+    (run_dir / "summary.json").write_text(json.dumps({"test_ppl": 10.0}))
+    if config_text is not None:
+        (run_dir / "config.json").write_text(config_text)
+
+    with pytest.raises(ValueError, match="readable config.json"):
+        ms._seed_dirs(tmp_path)
+
+
 def test_aggregate_scalar_reads_dotted_research_key(tmp_path):
-    _write_full_run(tmp_path / "a", ppl=1.0, seed=1, research={"freq_strata_ce": {"rare": 7.0}})
-    _write_full_run(tmp_path / "b", ppl=1.0, seed=2, research={"freq_strata_ce": {"rare": 9.0}})
-    out = ms.aggregate_scalar(tmp_path, "freq_strata_ce.rare")
+    _write_full_run(tmp_path / "a", ppl=1.0, seed=1, research={"corpus_freq_strata_ce": {"rare": 7.0}})
+    _write_full_run(tmp_path / "b", ppl=1.0, seed=2, research={"corpus_freq_strata_ce": {"rare": 9.0}})
+    out = ms.aggregate_scalar(tmp_path, "corpus_freq_strata_ce.rare")
     assert out["n"] == 2 and abs(out["mean"] - 8.0) < 1e-9
 
 

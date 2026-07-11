@@ -31,6 +31,7 @@ kernel is pinned to EXACTLY (and under ``log_softmax``); both are alpha=1 KL.
 """
 
 import warnings
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -40,7 +41,7 @@ from torch import nn
 from vfe3.belief import BeliefState
 from vfe3.divergence import get_family, kl
 from vfe3.families.base import _logdet_chol
-from vfe3.numerics import safe_cholesky
+from vfe3.numerics import bounded_variance_from_log, safe_cholesky
 
 
 # ---------------------------------------------------------------------------
@@ -50,9 +51,19 @@ from vfe3.numerics import safe_cholesky
 #   decode: fn(pb, mu_q, sigma_q, tau_eff) -> logits (B, N, V)
 # ---------------------------------------------------------------------------
 _ENCODERS: Dict[str, Callable] = {}
-_DECODERS: Dict[str, Callable] = {}
-_FULL_DECODERS:    set = set()   # decoders consuming a full (B,N,K,K) covariance (rank metadata)
-_CHUNKED_DECODERS: set = set()   # decoders with a fused chunked-CE training path (no (B,N,V) logits)
+
+
+@dataclass(frozen=True)
+class DecodeRegistration:
+    """A decode callable and all routing capabilities attached to that callable."""
+
+    callable:         Callable
+    supports_full:    bool
+    supports_chunked: bool
+    fused_ce:         Optional[Callable]
+
+
+_DECODERS: Dict[str, DecodeRegistration] = {}
 
 # Once-per-process guard for the decode_unigram_prior=True-with-unset-table warning
 # (the decode then degenerates to the current uniform-prior behavior).
@@ -82,14 +93,21 @@ def get_encode(name: str) -> Callable:
     return _ENCODERS[name]
 
 
-def register_decode(name: str, *, is_full: bool = False, chunked: bool = False, override: bool = False) -> Callable:
+def register_decode(
+    name: str,
+
+    *,
+    supports_full:    bool               = False,
+    supports_chunked: bool               = False,
+    override:         bool               = False,
+    fused_ce:         Optional[Callable] = None,
+) -> Callable:
     """Decorator registering a decode kernel under ``name``.
 
-    ``is_full``/``chunked`` are routing metadata: ``is_full`` flags a decoder that consumes a full
-    ``(B, N, K, K)`` covariance (read by the config rank cross-check), ``chunked`` flags one with a
-    fused chunked-CE training path (read by the model's fused-CE dispatch). Declaring them AT
-    REGISTRATION keeps the add-by-registering contract -- a new decoder advertises its capabilities
-    here instead of being threaded into literal-name tuples at the call sites.
+    ``supports_full`` flags a decoder that consumes a full ``(B, N, K, K)`` covariance.
+    ``supports_chunked`` advertises a fused chunked-CE training path, whose callable is ``fused_ce``.
+    The callable and all capabilities are replaced atomically, so an override cannot retain stale
+    routing metadata from the prior registration.
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
     existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
@@ -97,22 +115,33 @@ def register_decode(name: str, *, is_full: bool = False, chunked: bool = False, 
     def _wrap(fn: Callable) -> Callable:
         if name in _DECODERS and not override:
             raise KeyError(f"decode mode {name!r} already registered; pass override=True to replace")
-        _DECODERS[name] = fn
-        if is_full:
-            _FULL_DECODERS.add(name)
-        if chunked:
-            _CHUNKED_DECODERS.add(name)
+        if supports_chunked != (fused_ce is not None):
+            raise ValueError(
+                f"decode mode {name!r} must declare supports_chunked=True exactly when fused_ce "
+                f"is provided"
+            )
+        _DECODERS[name] = DecodeRegistration(
+            callable=fn,
+            supports_full=supports_full,
+            supports_chunked=supports_chunked,
+            fused_ce=fused_ce,
+        )
         return fn
     return _wrap
 
 
-def get_decode(name: str) -> Callable:
-    """Return the registered decode kernel for ``name`` (KeyError if absent)."""
+def get_decode_registration(name: str) -> DecodeRegistration:
+    """Return the complete registration record for ``name`` (KeyError if absent)."""
     if name not in _DECODERS:
         raise KeyError(
             f"no decode mode registered under {name!r}; available: {sorted(_DECODERS)}"
         )
     return _DECODERS[name]
+
+
+def get_decode(name: str) -> Callable:
+    """Return the registered decode kernel for ``name`` (KeyError if absent)."""
+    return get_decode_registration(name).callable
 
 
 class PriorBank(nn.Module):
@@ -402,7 +431,9 @@ class PriorBank(nn.Module):
         via _prior_mu_table/_prior_sigma_log_table (encode/self-coupling/decode), making s the prior.
         """
         s_mu = self.s_mu_embed[token_ids]                                       # (B, N, K)
-        s_sigma = torch.exp(self.s_sigma_log_embed[token_ids]).clamp(min=self.eps)  # (B, N, K)
+        s_sigma = bounded_variance_from_log(
+            self.s_sigma_log_embed[token_ids], eps=self.eps,
+        )                                                                         # (B, N, K)
         return s_mu, s_sigma
 
     @torch.no_grad()
@@ -439,7 +470,7 @@ class PriorBank(nn.Module):
         UNTRANSPORTED, uniform-weight centroid -- not the cross-scale shadow r_i=Omega_tilde[s^(s+1)].
         """
         s_mu = self.s_mu_embed                                                   # (V, K)
-        s_sigma = torch.exp(self.s_sigma_log_embed).clamp(min=self.eps)          # (V, K)
+        s_sigma = bounded_variance_from_log(self.s_sigma_log_embed, eps=self.eps)  # (V, K)
         r_mu = s_mu.mean(dim=0)                                                  # (K,)
         r_var = (s_sigma + (s_mu - r_mu) ** 2).mean(dim=0)                       # (K,) within + between
         self.r_mu.copy_(r_mu)
@@ -580,7 +611,9 @@ class PriorBank(nn.Module):
         """
         tau_eff = self._tau_eff(tau)
         mu_v = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
-        sigma_v = torch.exp(self._decode_sigma_log_table()).clamp(min=self.eps)   # (V, K)
+        sigma_v = bounded_variance_from_log(
+            self._decode_sigma_log_table(), eps=self.eps,
+        )                                                                         # (V, K)
         mu_q_b = mu_q.unsqueeze(-2)                                      # (B, N, 1, K)
         sigma_q_b = sigma_q.unsqueeze(-2)                               # (B, N, 1, K)
         diag = get_family("gaussian_diagonal")
@@ -631,7 +664,9 @@ class PriorBank(nn.Module):
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
 
-        sigma_v_all = torch.exp(self._decode_sigma_log_table()).clamp(min=self.eps)   # (V, K)
+        sigma_v_all = bounded_variance_from_log(
+            self._decode_sigma_log_table(), eps=self.eps,
+        )                                                                             # (V, K)
         mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
         c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
@@ -716,9 +751,9 @@ class PriorBank(nn.Module):
         is the gaussian_full KL with a DIAGONAL second covariance, which collapses every per-pair
         (K, K) Cholesky into matmuls over V PLUS one per-position log|Sigma_q|. This returns the two
         pieces that depend on q only (not on the vocabulary):
-            diag_sq_reg = diag(Sigma_q) + eps         (B, N, K)  -- the regularized query variances
-            logdet_q    = log|Sigma_q + eps I|        (B, N)
-        regularized with the SAME eps the gaussian_full closed form adds to both covariances
+            diag_sq = diag(Sigma_q)                    (B, N, K)  -- the raw query variances
+            logdet_q = log|Sigma_q|                    (B, N)
+        with the same round-zero-first factorization as the gaussian_full closed form
         (families/gaussian.py renyi_closed_form), so the diagonal-prior closed form is value-equal
         to ``_decode_full`` (the per-pair Cholesky seam) without ever forming a (B, N, V, K, K)
         workspace. ``safe_cholesky`` (jittered, never raises) yields a finite log-det where its
@@ -728,14 +763,11 @@ class PriorBank(nn.Module):
         -> -inf logit). The SPD retraction keeps Sigma_q PD in training, so ok is all-True and
         the -inf branch never engages on the pure path.
         """
-        K = sigma_q.shape[-1]
-        eye = torch.eye(K, device=sigma_q.device, dtype=sigma_q.dtype)
-        sq_reg = sigma_q + self.eps * eye                                  # (B, N, K, K)
-        diag_sq_reg = torch.diagonal(sq_reg, dim1=-2, dim2=-1)             # (B, N, K) = diag(Sigma_q)+eps
-        L, ok = safe_cholesky(sq_reg, eps=self.eps, rounds=5)
+        diag_sq = torch.diagonal(sigma_q, dim1=-2, dim2=-1)                # (B, N, K) = diag(Sigma_q)
+        L, ok = safe_cholesky(sigma_q, eps=self.eps, rounds=5)
         logdet_q = _logdet_chol(L)                                         # (B, N)
         logdet_q = torch.where(ok, logdet_q, logdet_q.new_full((), float("-inf")))
-        return diag_sq_reg, logdet_q
+        return diag_sq, logdet_q
 
     def decode_ce_full_chunked(
         self,
@@ -757,8 +789,8 @@ class PriorBank(nn.Module):
         (K, K) work is ONE log|Sigma_q| per position (``_full_cov_query_invariants``). This is the
         full-cov twin of ``decode_ce_diagonal_chunked`` -- same streaming logsumexp + target gather
         inside a gradient checkpoint, same global centering offset c = mean_v(mu_v) for fp32
-        stability -- with the diagonal query variance replaced by diag(Sigma_q)+eps, the prior
-        regularized by sigma_v+eps, and the per-position v-independent term K + sum_k log sigma_q
+        stability -- with the diagonal query variance replaced by diag(Sigma_q), the prior kept at
+        its existing variance floor, and the per-position v-independent term K + sum_k log sigma_q
         replaced by K + log|Sigma_q|. Value-equal to F.cross_entropy(_decode_full(...)) to the
         decode's atol-1e-3 (tests/test_fullcov_alpha_roadmap_2026_06_13.py). The unigram-prior
         chunk-slice add and the z_loss_weight term follow ``decode_ce_diagonal_chunked`` exactly
@@ -768,14 +800,16 @@ class PriorBank(nn.Module):
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
 
-        sigma_v_all = torch.exp(self._decode_sigma_log_table()).clamp(min=self.eps)   # (V, K)
+        sigma_v_all = bounded_variance_from_log(
+            self._decode_sigma_log_table(), eps=self.eps,
+        )                                                                             # (V, K)
         mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
         c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
 
-        diag_sq_reg, logdet_q = self._full_cov_query_invariants(sigma_q)   # (B,N,K), (B,N)
+        diag_sq, logdet_q = self._full_cov_query_invariants(sigma_q)       # (B,N,K), (B,N)
         mc_q = mu_q - c                                                     # (B, N, K) centered query means
-        lhs = torch.cat([diag_sq_reg + mc_q ** 2, -2.0 * mc_q], dim=-1)     # (B, N, 2K)
+        lhs = torch.cat([diag_sq + mc_q ** 2, -2.0 * mc_q], dim=-1)         # (B, N, 2K)
         # v-INDEPENDENT term of -KL/tau_eff (cancels in the CE difference, carried so each chunk's
         # logits equal _decode_full's): K + log|Sigma_q| (the full-cov analogue of K + sum_k log sigma_q).
         per_pos = self.K + logdet_q.unsqueeze(-1)                          # (B, N, 1)
@@ -787,14 +821,14 @@ class PriorBank(nn.Module):
                              u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
             r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
 
-            a_v = sum_k[(diag(Sigma_q)+eps + (mc_q-mc_v)^2)/sigma_v_reg] + sum_k log sigma_v_reg
-                = trace_term + mahalanobis + log|diag(sigma_v)+eps I|, the gaussian_full KL with a
+            a_v = sum_k[(diag(Sigma_q) + (mc_q-mc_v)^2)/sigma_v] + sum_k log sigma_v
+                = trace_term + mahalanobis + log|diag(sigma_v)|, the gaussian_full KL with a
             diagonal prior; logit = -0.5(a_v - per_pos)/tau_eff. The (B, N, Vc) chunk logit lives
             only here so checkpointing frees it after forward.
             """
             rhs = torch.cat([inv_v_c, mu_v_c * inv_v_c], dim=-1)            # (Vc, 2K), mu_v_c centered
             a_v = lhs_ @ rhs.transpose(-1, -2)                             # (B, N, Vc)
-            a_v = a_v + (mu_v_c ** 2 * inv_v_c).sum(-1) + lsum_c            # + sum_k(mc_v^2/sigma_v_reg + log sigma_v_reg)
+            a_v = a_v + (mu_v_c ** 2 * inv_v_c).sum(-1) + lsum_c            # + sum_k(mc_v^2/sigma_v + log sigma_v)
             logit_chunk = -0.5 * (a_v - per_pos_) / tau_eff                # (B, N, Vc)
             if u_c is not None:
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
@@ -809,8 +843,8 @@ class PriorBank(nn.Module):
         for v0 in range(0, V, chunk):
             v1 = min(v0 + chunk, V)
             mc_v_c = (mu_v_all[v0:v1] - c)                                  # (Vc, K) centered prior means
-            inv_v_c = 1.0 / (sigma_v_all[v0:v1] + self.eps)                # (Vc, K) = 1/(sigma_v+eps)
-            lsum_c = torch.log(sigma_v_all[v0:v1] + self.eps).sum(-1)      # (Vc,) = sum_k log(sigma_v+eps)
+            inv_v_c = 1.0 / sigma_v_all[v0:v1]                             # (Vc, K) = 1/sigma_v
+            lsum_c = torch.log(sigma_v_all[v0:v1]).sum(-1)                 # (Vc,) = sum_k log sigma_v
             u_c = u_all[v0:v1] if u_all is not None else None              # (Vc,) or None
             in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
@@ -938,7 +972,9 @@ class PriorBank(nn.Module):
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
 
-        sigma_v_all = torch.exp(self._decode_sigma_log_table()).clamp(min=self.eps)   # (V, K)
+        sigma_v_all = bounded_variance_from_log(
+            self._decode_sigma_log_table(), eps=self.eps,
+        )                                                                             # (V, K)
         mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
 
@@ -1005,7 +1041,9 @@ def _encode_per_token(
     off-diagonal mass into. The mean / gauge tables are shared across families.
     """
     mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
-    sigma_diag = torch.exp(pb._prior_sigma_log_table()[token_ids]).clamp(min=pb.eps)  # (B, N, K), sigma > 0
+    sigma_diag = bounded_variance_from_log(
+        pb._prior_sigma_log_table()[token_ids], eps=pb.eps,
+    )                                                                                 # (B, N, K), sigma > 0
     phi = pb.phi_embed[token_ids]                                            # (B, N, n_gen)
     omega = pb._omega_lookup(token_ids) if getattr(pb, "gauge_parameterization", "phi") == "omega_direct" else None
     sigma = sigma_diag if pb.diagonal_covariance else torch.diag_embed(sigma_diag)
@@ -1028,7 +1066,9 @@ def _encode_per_token_additive(
     equivariant; use with ``transport_mode='flat'`` and ``pos_phi='none'`` so no other channel transports.
     """
     mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
-    sigma_diag = torch.exp(pb._prior_sigma_log_table()[token_ids]).clamp(min=pb.eps)  # (B, N, K)
+    sigma_diag = bounded_variance_from_log(
+        pb._prior_sigma_log_table()[token_ids], eps=pb.eps,
+    )                                                                                 # (B, N, K)
     phi_code = pb.phi_embed[token_ids]                                       # (B, N, n_gen) learned table
     mu = mu + phi_code @ pb.additive_R.t()                                   # (B, N, K) structure-free shift
     phi = torch.zeros_like(phi_code)                                         # Omega = I: no gl(g) transport
@@ -1080,7 +1120,7 @@ def _decode_diagonal(
     ``(mu_q - c) - (mu_v - c) == mu_q - mu_v`` the closed form is unchanged exactly while
     the cancelled magnitude collapses to the residual spread of the means.
     """
-    sigma_v = torch.exp(pb._decode_sigma_log_table()).clamp(min=pb.eps)  # (V, K)
+    sigma_v = bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps)  # (V, K)
     mu_v = pb._decode_mu_table()                                        # (V, K) decode table (untied if set)
     inv_v = 1.0 / sigma_v                                               # (V, K) = 1/sigma_v
 
@@ -1099,7 +1139,11 @@ def _decode_diagonal(
     return -kl_v / tau_eff                                               # reference_decode's safe_kl_clamp (r2 id17)
 
 
-@register_decode("diagonal_chunked", chunked=True)
+@register_decode(
+    "diagonal_chunked",
+    supports_chunked=True,
+    fused_ce=PriorBank.decode_ce_diagonal_chunked,
+)
 def _decode_diagonal_chunked(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -1116,7 +1160,7 @@ def _decode_diagonal_chunked(
     return _decode_diagonal(pb, mu_q, sigma_q, tau_eff)
 
 
-@register_decode("full", is_full=True)
+@register_decode("full", supports_full=True)
 def _decode_full(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -1134,15 +1178,27 @@ def _decode_full(
     the theoretically pure full-covariance path, not the fast diagonal kernel.
     """
     mu_v = pb._decode_mu_table()                                         # (V, K) decode table (untied if set)
-    sigma_v = torch.diag_embed(torch.exp(pb._decode_sigma_log_table()).clamp(min=pb.eps))  # (V, K, K) diagonal-as-full
+    sigma_v = torch.diag_embed(
+        bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps)
+    )                                                                                       # (V, K, K) diagonal-as-full
     mu_q_b = mu_q.unsqueeze(-2)                                          # (B, N, 1, K)
     sigma_q_b = sigma_q.unsqueeze(-3)                                    # (B, N, 1, K, K)
     full = get_family("gaussian_full")
-    kl_v = kl(full(mu_q_b, sigma_q_b), full(mu_v, sigma_v), kl_max=float("inf"))  # (B, N, V)
+    kl_v = kl(
+        full(mu_q_b, sigma_q_b),
+        full(mu_v, sigma_v),
+        kl_max=float("inf"),
+        eps=pb.eps,
+    )                                                                       # (B, N, V)
     return -kl_v / tau_eff
 
 
-@register_decode("full_chunked", is_full=True, chunked=True)
+@register_decode(
+    "full_chunked",
+    supports_full=True,
+    supports_chunked=True,
+    fused_ce=PriorBank.decode_ce_full_chunked,
+)
 def _decode_full_chunked(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -1158,25 +1214,29 @@ def _decode_full_chunked(
     that ``_decode_full`` builds, by exploiting the diagonal prior (see ``_full_cov_query_invariants``).
     Value-equal to ``decode_mode='full'`` to atol-1e-3 (tests/test_fullcov_alpha_roadmap_2026_06_13.py).
     """
-    sigma_v = torch.exp(pb._decode_sigma_log_table()).clamp(min=pb.eps)  # (V, K) diagonal decode variances
+    sigma_v = bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps)  # (V, K) diagonal decode variances
     mu_v = pb._decode_mu_table()                                         # (V, K) decode table (untied if set)
-    inv_v = 1.0 / (sigma_v + pb.eps)                                     # (V, K) = 1/(sigma_v+eps)
+    inv_v = 1.0 / sigma_v                                                # (V, K) = 1/sigma_v
 
-    diag_sq_reg, logdet_q = pb._full_cov_query_invariants(sigma_q)       # (B,N,K), (B,N)
+    diag_sq, logdet_q = pb._full_cov_query_invariants(sigma_q)           # (B,N,K), (B,N)
     c = mu_v.mean(dim=0, keepdim=True)                                   # (1, K) v-independent shift
     mc_v = mu_v - c                                                      # (V, K) centered prior means
     mc_q = mu_q - c                                                      # (B, N, K) centered query means
 
-    lhs = torch.cat([diag_sq_reg + mc_q ** 2, -2.0 * mc_q], dim=-1)      # (B, N, 2K)
+    lhs = torch.cat([diag_sq + mc_q ** 2, -2.0 * mc_q], dim=-1)          # (B, N, 2K)
     rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)                       # (V, 2K)
     a_v = lhs @ rhs.transpose(-1, -2)                                    # (B, N, V): trace + mahalanobis core
-    a_v = a_v + (mc_v ** 2 * inv_v).sum(-1) + torch.log(sigma_v + pb.eps).sum(-1)  # + sum_k(mc_v^2/sigma_v_reg + log sigma_v_reg)
+    a_v = a_v + (mc_v ** 2 * inv_v).sum(-1) + torch.log(sigma_v).sum(-1)  # + sum_k(mc_v^2/sigma_v + log sigma_v)
     per_pos = pb.K + logdet_q.unsqueeze(-1)                              # (B, N, 1) = K + log|Sigma_q|
     kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0)                        # (B, N, V); KL>=0 floor matches
     return -kl_v / tau_eff                                               # _decode_diagonal (audit 2026-07-05 m5)
 
 
-@register_decode("expected_likelihood_chunked", chunked=True)
+@register_decode(
+    "expected_likelihood_chunked",
+    supports_chunked=True,
+    fused_ce=PriorBank.decode_ce_expected_likelihood_chunked,
+)
 def _decode_expected_likelihood_chunked(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -1203,7 +1263,9 @@ def _decode_expected_likelihood_chunked(
     is inherent to producing every logit (the training memory win is the fused CE twin
     ``decode_ce_expected_likelihood_chunked``).
     """
-    sigma_v_all = torch.exp(pb._decode_sigma_log_table()).clamp(min=pb.eps)   # (V, K)
+    sigma_v_all = bounded_variance_from_log(
+        pb._decode_sigma_log_table(), eps=pb.eps,
+    )                                                                         # (V, K)
     mu_v_all = pb._decode_mu_table()                                     # (V, K) decode table (untied if set)
     chunk = pb.decode_chunk_size
     V = pb.vocab_size
@@ -1217,7 +1279,11 @@ def _decode_expected_likelihood_chunked(
     return torch.cat(logit_chunks, dim=-1)                               # (B, N, V)
 
 
-@register_decode("linear")
+@register_decode(
+    "linear",
+    supports_chunked=True,
+    fused_ce=PriorBank.decode_ce_linear_chunked,
+)
 def _decode_linear(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means

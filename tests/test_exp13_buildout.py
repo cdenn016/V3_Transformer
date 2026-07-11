@@ -78,6 +78,7 @@ def test_plot_pos_extrapolation_driver(tmp_path):
                        ("learned", [{"n": 8, "ce": 3.0}, {"n": 16, "ce": 5.0}])]:
         d = sweep / lab; d.mkdir(parents=True)
         (d / "ablation_result.json").write_text(
-            json.dumps({"label": lab, "primary_val_ppl": 20.0, "extrap_ce": curve}))
+            json.dumps({"label": lab, "primary_val_ppl": 20.0, "final_val_ppl": 20.0,
+                        "status": "success", "error_kind": None, "extrap_ce": curve}))
     ablation._plot_pos_extrapolation(sweep, figdir)
     assert (figdir / "pos_extrapolation_extrapolation.png").exists()

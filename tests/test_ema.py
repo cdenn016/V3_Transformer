@@ -163,6 +163,26 @@ def test_ema_does_not_perturb_training_trajectory():
     assert losses_on == losses_off                        # trajectory untouched
 
 
+def test_ema_does_not_advance_when_train_step_skips(monkeypatch):
+    torch.manual_seed(0)
+    cfg = _cfg(use_ema=True, ema_decay=0.9, max_steps=1)
+    model = VFEModel(cfg)
+    model.prior_bank.mu_embed.register_hook(
+        lambda grad: torch.full_like(grad, float("nan")))
+
+    updates = []
+    update = EMA.update
+
+    def _record_update(self, live_model):
+        updates.append(True)
+        update(self, live_model)
+
+    monkeypatch.setattr(EMA, "update", _record_update)
+    train(model, _const_loader(), cfg, n_steps=1, generate_samples=False)
+
+    assert updates == []
+
+
 def test_ema_changes_final_model():
     # With EMA on, the returned model holds the averaged weights -> differs from the SGD-final model.
     torch.manual_seed(0)

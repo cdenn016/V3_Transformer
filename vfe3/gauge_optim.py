@@ -31,7 +31,7 @@ group. Only ACTIVE rows (nonzero gradient -- the batch's tokens) are preconditio
 per-token metric solves touch the batch, not the whole vocabulary.
 """
 
-from typing import List
+from typing import Dict, List
 
 import torch
 
@@ -154,6 +154,34 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
             step = s.get("step")
             if step is not None and not torch.is_tensor(step):
                 s["step"] = torch.tensor(float(step))
+
+    def state_dict(self) -> Dict[str, object]:                         # type: ignore[override]
+        r"""Serialize AdamW state plus the M-step count that drives omega reorthogonalization."""
+        state = super().state_dict()
+        state["optimizer_extra"] = {"omega_step": int(self._omega_step)}
+        return state
+
+    def load_state_dict(
+        self,
+        state_dict: Dict[str, object],
+    ) -> None:                                                        # type: ignore[override]
+        r"""Restore AdamW state and the omega cadence, accepting legacy state with a warning."""
+        core_state = dict(state_dict)
+        extra = core_state.pop("optimizer_extra", None)
+        super().load_state_dict(core_state)
+        if isinstance(extra, dict) and "omega_step" in extra:
+            self._omega_step = int(extra["omega_step"])
+            return
+
+        import warnings
+        self._omega_step = 0
+        warnings.warn(
+            "GaugeNaturalGradAdamW checkpoint has no optimizer_extra.omega_step; the omega "
+            "reorthogonalization cadence restarts at zero (non-exact resume when "
+            "omega_reorth_every > 0).",
+            UserWarning,
+            stacklevel=2,
+        )
 
     def _compact_gld_basis(
         self,

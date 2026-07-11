@@ -6,7 +6,7 @@ maps are added so the generic Bregman/Renyi-from-A path can be pinned against th
 """
 
 import math
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -232,12 +232,12 @@ class DiagonalGaussian(BeliefParams):
 
     def natural_gradient(
         self,
-        grad_mu:    torch.Tensor,             # (..., K) Euclidean grad wrt mu
-        grad_sigma: torch.Tensor,             # (..., K) Euclidean grad wrt the variance sigma
+        grad_mu:    torch.Tensor,                    # (..., K) Euclidean grad wrt mu
+        grad_sigma: Optional[torch.Tensor],          # None freezes sigma; else grad wrt variance
 
         *,
         eps:        float = 1e-6,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         r"""Diagonal-Gaussian Fisher preconditioner ``(sigma*grad_mu, 2 sigma^2 grad_sigma)``.
         Delegates to the pinned geometry kernel so the live numerics stay byte-identical to the
         golden-tested ``retraction.natural_gradient`` (local import avoids a families<-geometry
@@ -308,12 +308,12 @@ class FullGaussian(BeliefParams):
 
     def natural_gradient(
         self,
-        grad_mu:    torch.Tensor,             # (..., K) Euclidean grad wrt mu
-        grad_sigma: torch.Tensor,             # (..., K, K) Euclidean grad wrt the covariance
+        grad_mu:    torch.Tensor,                    # (..., K) Euclidean grad wrt mu
+        grad_sigma: Optional[torch.Tensor],          # None freezes sigma; else grad wrt covariance
 
         *,
         eps:        float = 1e-6,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         r"""Full-Gaussian Fisher preconditioner ``(Sigma grad_mu, 2 Sigma grad_sigma Sigma)``
         (symmetrized). Delegates to the pinned geometry kernel, which selects the full-covariance
         branch by rank (``sigma.dim() == grad_mu.dim() + 1``), so the numerics stay byte-identical

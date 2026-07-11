@@ -99,6 +99,16 @@ def test_config_accepts_registered_and_rejects_unknown_policy_mode():
         VFE3Config(policy_mode="not_a_real_policy")
 
 
+def test_logprob_control_rejects_ignored_config_fields():
+    VFE3Config(policy_mode="logprob_control", policy_preference="flat")
+    with pytest.raises(ValueError, match="logprob_control.*policy_horizon"):
+        VFE3Config(policy_mode="logprob_control", policy_preference="flat", policy_horizon=2)
+    for score_terms in (("risk",), ("ambiguity", "risk")):
+        with pytest.raises(ValueError, match="logprob_control.*policy_score_terms"):
+            VFE3Config(policy_mode="logprob_control", policy_preference="flat",
+                       policy_score_terms=score_terms)
+
+
 def test_generic_policy_rejects_context_requiring_preference():
     # audit F4 (2026-06-28): generate() cannot feed a per-episode goal / p_data, so 'task' and
     # 'held_out_predictive' are invalid with policy_mode != 'none'. The DEFAULT preference is 'task',
@@ -123,6 +133,12 @@ def test_config_rejects_bad_policy_numerics():
         VFE3Config(policy_horizon=0)
     with pytest.raises(ValueError):
         VFE3Config(policy_precision=0.0)
+
+
+@pytest.mark.parametrize("bad_precision", [float("nan"), float("inf"), float("-inf")])
+def test_config_rejects_nonfinite_policy_precision(bad_precision):
+    with pytest.raises(ValueError, match="policy_precision"):
+        VFE3Config(policy_precision=bad_precision)
 
 
 def test_config_rejects_invalid_policy_score_terms():

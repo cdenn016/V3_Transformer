@@ -73,6 +73,8 @@ def test_plot_mu_precond_driver(tmp_path):
         for t in (1, 3):
             d = sweep / f"{p}_T{t}"; d.mkdir(parents=True)
             (d / "ablation_result.json").write_text(json.dumps(
-                {"label": f"{p}_T{t}", "primary_val_ppl": 30.0 + (2.0 if p == "raw" else 0.0)}))
+                {"label": f"{p}_T{t}", "primary_val_ppl": 30.0 + (2.0 if p == "raw" else 0.0),
+                 "final_val_ppl": 30.0 + (2.0 if p == "raw" else 0.0),
+                 "status": "success", "error_kind": None}))
     ablation._plot_mu_precond(sweep, figdir)
     assert (figdir / "fisher_mu_precond_mu_precond.png").exists()

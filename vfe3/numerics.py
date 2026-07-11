@@ -22,6 +22,29 @@ def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
     return 0.5 * (matrix + matrix.transpose(-1, -2))
 
 
+def bounded_variance_from_log(
+    log_sigma: torch.Tensor,
+
+    *,
+    eps:     float = 1e-6,
+    max_log: float = 80.0,
+) -> torch.Tensor:
+    r"""Exponentiate a trainable log-variance without overflowing float32.
+
+    Values in the normal ``[log(eps), max_log]`` range retain the ordinary ``exp`` map. Larger
+    detached parameter values emit the numerical warning and are capped only for exponentiation;
+    ``sigma_max`` is a separate belief-state retraction policy and is deliberately not used here.
+    """
+    if bool((log_sigma.detach() > max_log).any()):
+        import warnings
+        warnings.warn(
+            f"trainable log-variance exceeds max_log={max_log:g}; clamping before exponentiation",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return torch.exp(log_sigma.clamp(max=max_log)).clamp(min=eps)
+
+
 def apply_mu_trust_region(
     delta_mu: torch.Tensor,              # (..., K) proposed mean step (e_q_mu_lr * nat_grad_mu)
     sigma_q:  torch.Tensor,              # (..., K) diagonal variances OR (..., K, K) covariance
@@ -34,25 +57,56 @@ def apply_mu_trust_region(
 ) -> torch.Tensor:                       # (..., K) clamped step, same shape/dtype as delta_mu
     r"""Whitened E-step mean trust region.
 
-    Bounds the per-iteration mean update in :math:`\sigma`-whitened (Mahalanobis) units so a
-    large VFE mean gradient cannot overshoot the belief by more than ``trust`` standard deviations:
+    Bounds the per-iteration mean update in covariance-whitened (Mahalanobis) units so a large
+    VFE mean gradient cannot overshoot the belief by more than ``trust`` standard deviations.
+    Let ``L`` be ``diag(sqrt(sigma_q))`` for diagonal covariance or the round-zero Cholesky factor
+    of a full covariance. Then:
 
-        scale    = sqrt(diag(sigma_q)),  whitened = delta_mu / scale
-        box      : clamp(whitened, -trust, +trust) * scale          (per-coordinate)
-        ball     : delta_mu * min(trust / ||whitened||_2, 1)        (direction-preserving)
+        whitened = solve(L, delta_mu)
+        box      : L @ clamp(whitened, -trust, +trust)
+        ball     : L @ (whitened * min(trust / ||whitened||_2, 1))
 
     ``box`` is the recommended mode. This is a step-size guard, OFF by default at the call site
-    (``e_mu_q_trust=None``); when ``trust`` does not bind it is the identity.
+    (``e_mu_q_trust=None``). A failed full-covariance Cholesky uses the prior marginal-variance
+    path for that batch element only.
     """
-    sigma_diag = sigma_q if is_diagonal else sigma_q.diagonal(dim1=-2, dim2=-1)
-    scale = sigma_diag.clamp(min=eps).sqrt()
-    whitened = delta_mu / scale
+    if mode not in ("box", "ball"):
+        raise ValueError(f"apply_mu_trust_region mode={mode!r}; expected 'box' or 'ball'.")
+
+    if is_diagonal:
+        scale = sigma_q.clamp(min=eps).sqrt()
+        whitened = delta_mu / scale
+        if mode == "ball":
+            norm2 = whitened.norm(dim=-1, keepdim=True)
+            return delta_mu * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
+        return whitened.clamp(-trust, trust) * scale
+
+    factor, ok = safe_cholesky(sigma_q, eps=eps, rounds=0)
+    eye = torch.eye(sigma_q.shape[-1], device=sigma_q.device, dtype=sigma_q.dtype)
+    safe_factor = torch.where(ok.unsqueeze(-1).unsqueeze(-1), factor, eye.expand_as(factor))
+    whitened = torch.linalg.solve_triangular(
+        safe_factor,
+        delta_mu.unsqueeze(-1),
+        upper=False,
+    ).squeeze(-1)
     if mode == "ball":
         norm2 = whitened.norm(dim=-1, keepdim=True)
-        return delta_mu * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
-    if mode != "box":
-        raise ValueError(f"apply_mu_trust_region mode={mode!r}; expected 'box' or 'ball'.")
-    return whitened.clamp(-trust, trust) * scale
+        bounded = whitened * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
+    else:
+        bounded = whitened.clamp(-trust, trust)
+    full_out = (safe_factor @ bounded.unsqueeze(-1)).squeeze(-1)
+    if bool(ok.all()):
+        return full_out
+
+    sigma_diag = sigma_q.diagonal(dim1=-2, dim2=-1)
+    scale = sigma_diag.clamp(min=eps).sqrt()
+    fallback_white = delta_mu / scale
+    if mode == "ball":
+        fallback_norm = fallback_white.norm(dim=-1, keepdim=True)
+        fallback = delta_mu * (trust / fallback_norm.clamp(min=eps)).clamp(max=1.0)
+    else:
+        fallback = fallback_white.clamp(-trust, trust) * scale
+    return torch.where(ok.unsqueeze(-1), full_out, fallback)
 
 
 def safe_cholesky(

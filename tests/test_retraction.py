@@ -137,7 +137,7 @@ def test_spd_affine_bit_identical_full():
     assert torch.equal(seam, legacy)
 
 
-# --- log_euclidean SPD retraction variant (spec 2a, pure log-chart) --------
+# --- log_euclidean SPD retraction variant (ambient tangent -> log chart) ---
 def _logm_eigh(sigma: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Independent eigh-based matrix log (test oracle, distinct from the impl)."""
     sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
@@ -196,9 +196,12 @@ def test_log_euclidean_identity_tangent_is_identity():
 
 
 def test_log_euclidean_full_matches_independent_expm_logm():
-    """Full case equals an INDEPENDENTLY computed expm(logm(Sigma) + step*sym(delta))
-    via torch.linalg.matrix_exp + an eigh-based logm written here. Well-conditioned
-    Sigma + modest step so neither the eps floor nor the sigma_max cap binds."""
+    """Full case equals an independent expm(logm(Sigma) + step*Dlog_Sigma[delta]).
+
+    The chart tangent oracle is a centered float64 finite difference of the test-local
+    matrix logarithm. Sigma is well-conditioned and the step is modest so neither the
+    eps floor nor the sigma_max cap binds.
+    """
     g = torch.Generator().manual_seed(22)
     A = torch.randn(3, 4, 4, generator=g)
     sigma = A @ A.transpose(-1, -2) + 2.0 * torch.eye(4)   # well-conditioned SPD
@@ -209,15 +212,20 @@ def test_log_euclidean_full_matches_independent_expm_logm():
         sigma, delta, mean_ndim=2, step_size=step, trust_region=0.0,
         eps=1e-9, sigma_max=1e9,
     )
-    log_sigma = _logm_eigh(sigma, eps=1e-9)
-    sym_delta = 0.5 * (delta + delta.transpose(-1, -2))
-    expected = torch.linalg.matrix_exp(log_sigma + step * sym_delta)
+    sigma64 = sigma.to(torch.float64)
+    delta64 = delta.to(torch.float64)
+    fd_step = 1e-6
+    log_sigma = _logm_eigh(sigma64, eps=1e-9)
+    chart_tangent = (
+        _logm_eigh(sigma64 + fd_step * delta64, eps=1e-9)
+        - _logm_eigh(sigma64 - fd_step * delta64, eps=1e-9)
+    ) / (2.0 * fd_step)
+    expected = torch.linalg.matrix_exp(log_sigma + step * chart_tangent).to(out.dtype)
     assert torch.allclose(out, expected, atol=1e-5)
 
 
 def test_log_euclidean_diagonal_is_log_chart_step():
-    """Diagonal case applies the tangent directly in the log chart:
-    sigma_new = sigma * exp(step * delta) (NO affine 1/sigma whitening)."""
+    """The diagonal chart tangent is Dlog_sigma[delta] = delta / sigma."""
     g = torch.Generator().manual_seed(23)
     sigma = torch.rand(4, 5, generator=g) + 0.2
     delta = 0.3 * torch.randn(4, 5, generator=g)
@@ -226,14 +234,12 @@ def test_log_euclidean_diagonal_is_log_chart_step():
         sigma, delta, mean_ndim=2, step_size=step, trust_region=0.0,
         eps=1e-9, sigma_max=1e9,
     )
-    expected = sigma * torch.exp(step * delta)
+    expected = sigma * torch.exp(step * delta / sigma)
     assert torch.allclose(out, expected, atol=1e-5)
 
 
-def test_log_euclidean_diagonal_differs_from_affine():
-    """Under the seam's pre-whitened tangent convention LE does NOT reduce to
-    spd_affine on the diagonal (affine whitens by 1/sigma, LE does not), so they
-    differ for a non-identity sigma. Pins the verified scope finding."""
+def test_log_euclidean_diagonal_matches_affine():
+    """For commuting diagonal covariances, the two ambient-tangent maps coincide."""
     g = torch.Generator().manual_seed(24)
     sigma = torch.rand(4, 5, generator=g) + 0.5      # non-identity
     delta = 0.3 * torch.randn(4, 5, generator=g)
@@ -244,7 +250,7 @@ def test_log_euclidean_diagonal_differs_from_affine():
     affine = get_retraction("spd_affine")(
         sigma, delta, mean_ndim=2, step_size=step, trust_region=0.0, eps=1e-9, sigma_max=1e9,
     )
-    assert not torch.allclose(le, affine, atol=1e-3)
+    assert torch.equal(le, affine)
 
 
 def test_log_euclidean_registered_and_config_accepts():
@@ -258,9 +264,12 @@ def test_log_euclidean_registered_and_config_accepts():
 
 def test_log_euclidean_diagonal_pairing_warns():
     """Config WARNs (not errors) when log_euclidean is paired with a diagonal family
-    (the log-chart step lacks the affine Fisher whitening there)."""
+    because the commuting diagonal reduction is not a distinct geometry."""
     from vfe3.config import VFE3Config
-    with pytest.warns(UserWarning, match="log_euclidean"):
+    with pytest.warns(
+        UserWarning,
+        match="maps the ambient covariance tangent through the Log-Euclidean chart",
+    ):
         VFE3Config(spd_retract_mode="log_euclidean", family="gaussian_diagonal")
 
 

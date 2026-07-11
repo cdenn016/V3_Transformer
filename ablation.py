@@ -53,7 +53,9 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -71,6 +73,7 @@ from vfe3.metrics import (
 )
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
+from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, evaluate, train
 from vfe3.viz.extract import across_layer_belief_trace, attention_entropy_cov_gap, converged_state
 
@@ -1399,17 +1402,19 @@ def get_loader(
 
     *,
     max_tokens:  Optional[int] = None,
+    vocab_size:  Optional[int] = None,
 ) -> Any:
     r"""DataLoader for ``dataset``/``split``. A missing cache raises ``FileNotFoundError``.
 
-    Memoised on ``(dataset, seq_len, batch_size, split, cap)`` so runs that do not change
+    Memoised on ``(dataset, seq_len, batch_size, split, cap, vocab_size)`` so runs that do not change
     those reuse one cached loader (the corpus cache loads once), while a sweep over
-    ``batch_size`` / ``max_seq_len`` correctly builds a distinct, matching loader. ``max_tokens``
-    caps only the train split (validation is always full). The loader never substitutes synthetic
-    data for a missing real corpus -- that would mislabel synthetic numbers as a corpus measurement.
+    ``batch_size`` / ``max_seq_len`` / ``vocab_size`` correctly builds a distinct, matching loader.
+    ``max_tokens`` caps only the train split (validation is always full). The loader never
+    substitutes synthetic data for a missing real corpus -- that would mislabel synthetic numbers
+    as a corpus measurement.
     """
     cap = max_tokens if split == "train" else None
-    key = (dataset, seq_len, batch_size, split, cap)
+    key = (dataset, seq_len, batch_size, split, cap, vocab_size)
     if key in _LOADER_CACHE:
         return _LOADER_CACHE[key]
     # Split-aware loader semantics, mirroring train_vfe3._select_loader: only the train stream is
@@ -1418,7 +1423,7 @@ def get_loader(
     # the eval flags must be passed explicitly here).
     loader = make_dataloader(dataset, split, seq_len, batch_size,
                              shuffle=(split == "train"), drop_last=(split == "train"),
-                             max_tokens=cap)
+                             max_tokens=cap, vocab_size=vocab_size)
     _LOADER_CACHE[key] = loader
     return loader
 
@@ -1426,22 +1431,6 @@ def get_loader(
 # =============================================================================
 # SINGLE-RUN EXECUTOR
 # =============================================================================
-
-def _seed_everything(seed: int, deterministic: bool = True) -> None:
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if deterministic:
-        # Full run-to-run reproducibility (esp. on the GPU, whose default kernels use
-        # nondeterministic atomics / cuBLAS autotuning). CUBLAS_WORKSPACE_CONFIG must be set BEFORE
-        # the first CUDA op to fully take effect; setdefault here is best-effort (works when
-        # _seed_everything runs before model/CUDA init) -- for a hard guarantee also export it at
-        # process launch. warn_only=True keeps the run alive if an op lacks a deterministic kernel.
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
 
 def _cell_cfg_dict(
     overrides:  Dict[str, Any],
@@ -1577,7 +1566,8 @@ def _eval_at_growing_n(model: Any, cfg: VFE3Config, dataset: str, device: torch.
     out: List[Dict[str, Any]] = []
     for n in n_list:
         try:
-            loader = get_loader(dataset, n, cfg.batch_size, "validation")
+            loader = get_loader(dataset, n, cfg.batch_size, "validation",
+                                vocab_size=cfg.vocab_size)
             m = evaluate(model, loader, device=device)
             out.append({"n": n, "ce": float(m["ce"]), "ppl": float(m["ppl"])})
         except Exception as exc:                              # short split / OOM at large N -> drop point
@@ -1615,13 +1605,14 @@ def run_single(
                 "primary_val_ppl": float("inf"), "seed": int(seed),
                 "overrides": _jsonable(overrides)}
 
-    _seed_everything(cfg.seed, deterministic=cfg.deterministic)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(device)
     n_params = int(sum(p.numel() for p in model.parameters()))
 
     train_loader = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "train",
-                              max_tokens=max_tokens)
-    val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation")
+                              max_tokens=max_tokens, vocab_size=cfg.vocab_size)
+    val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation",
+                              vocab_size=cfg.vocab_size)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts = RunArtifacts(run_dir, cfg, model, dataset=dataset, device=device)
@@ -1632,7 +1623,7 @@ def run_single(
     # the same config would see different batches depending on its position in the sweep, and
     # the comparison would be confounded by data order. Reseeding here, after the model is built,
     # pins every cell to the same batch sequence regardless of order.
-    _seed_everything(cfg.seed, deterministic=cfg.deterministic)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     for loader in (train_loader, val_loader):                # synthetic loaders carry their own generator
         if getattr(loader, "generator", None) is not None:
             loader.generator.manual_seed(cfg.seed)
@@ -1706,16 +1697,23 @@ _CSV_COLUMNS = [
     "wall_time_s", "seed", "error",
 ]
 
+_DIAGNOSTIC_RESULT_KEYS = {
+    "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
+    "rank_resid", "rank_resid_by_layer", "cov_gap", "energy_klmax_frac",
+}
+
 
 def _cell_is_current(
     run_dir:    Path,
     overrides:  Dict[str, Any],
 
     *,
-    seed:       int,
-    dataset:    str,
-    max_steps:  Optional[int] = None,
-    max_tokens: Optional[int] = None,
+    seed:                  int,
+    dataset:               str,
+    collect_diagnostics:   bool = False,
+    collect_extrapolation: bool = False,
+    max_steps:             Optional[int] = None,
+    max_tokens:            Optional[int] = None,
 ) -> bool:
     r"""True iff a completed cell's persisted config.json matches the config we would build now.
 
@@ -1733,6 +1731,11 @@ def _cell_is_current(
     field, so it never lands in config.json: a smoke cell capped at 10k tokens and a later full run
     would otherwise compare byte-identical. It is persisted in the ``ablation_result.json`` marker
     and compared here (a marker missing the key reads as None -> a capped re-run fails closed).
+
+    A current marker must also record successful completion with a finite terminal validation PPL.
+    Requested diagnostic and extrapolation collections are cache requirements: the marker must record
+    the corresponding request flag and contain its output, so enabling either collection cannot reuse
+    a headline-only cell.
     """
     cj = run_dir / "config.json"
     if not cj.exists():
@@ -1751,8 +1754,32 @@ def _cell_is_current(
         marker = json.loads((run_dir / "ablation_result.json").read_text(encoding="utf-8"))
     except Exception:                                        # no/unreadable marker -> re-run
         return False
+    if not isinstance(marker, dict):                         # parseable but incomplete marker -> re-run
+        return False
     cur = int(max_tokens) if max_tokens is not None else None
-    return marker.get("max_tokens", None) == cur
+    if marker.get("max_tokens", None) != cur:
+        return False
+    if marker.get("status") != "success" or marker.get("error_kind") is not None:
+        return False
+    try:
+        terminal_ppl = float(marker["final_val_ppl"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not math.isfinite(terminal_ppl):
+        return False
+    saved_diagnostics   = marker.get("collect_diagnostics")
+    saved_extrapolation = marker.get("collect_extrapolation")
+    if type(saved_diagnostics) is not bool or saved_diagnostics != collect_diagnostics:
+        return False
+    if type(saved_extrapolation) is not bool or saved_extrapolation != collect_extrapolation:
+        return False
+    if collect_diagnostics:
+        if not any(key in marker for key in _DIAGNOSTIC_RESULT_KEYS):
+            return False
+    if collect_extrapolation:
+        if not isinstance(marker.get("extrap_ce"), list):
+            return False
+    return True
 
 
 def _sanitize(label: str) -> str:
@@ -1787,14 +1814,26 @@ def _collect_sweep_results(sweep_dir: Path) -> List[Dict[str, Any]]:
     new cell dirs alongside the old ones, and this union picks up all of them. Re-running the SAME
     label overwrites that one marker while the others persist, so the union is additive and never
     subtracts (to drop a point, delete its cell directory). ``sorted`` keeps CSV row order
-    deterministic; unreadable/partial markers are skipped rather than aborting the read.
+    deterministic. Unreadable, non-object, failed, errored, and nonfinite-terminal markers are
+    skipped rather than entering the analysis frame.
     """
     results: List[Dict[str, Any]] = []
     for marker in sorted(sweep_dir.glob("*/ablation_result.json")):
         try:
-            results.append(json.loads(marker.read_text(encoding="utf-8")))
-        except Exception:                                       # unreadable/partial marker -> skip
+            result = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:                                       # unreadable marker -> skip
             continue
+        if not isinstance(result, Mapping):
+            continue
+        if result.get("status") != "success" or result.get("error_kind") is not None:
+            continue
+        try:
+            terminal_ppl = float(result["final_val_ppl"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(terminal_ppl):
+            continue
+        results.append(dict(result))
     return results
 
 
@@ -1815,6 +1854,8 @@ def run_sweep(
     sweep_dir = output_dir / sweep_name
     sweep_dir.mkdir(parents=True, exist_ok=True)
     runs = make_run_overrides(sweep_name)
+    collect_diagnostics   = bool(sweep.get("collect_diagnostics", False))
+    collect_extrapolation = bool(sweep.get("collect_extrapolation", False))
     # Multi-seed (I1/EXP-1): a sweep may declare ``seeds`` to replicate every cell across seeds for an
     # across-seed error bar. Each (cell, seed) gets its own ``{label}__s{seed}`` run dir and result row
     # (the seed also lives in the existing ``seed`` column), so the across-seed aggregate is a plain
@@ -1838,7 +1879,9 @@ def run_sweep(
 
         if resume and marker.exists():
             if _cell_is_current(run_dir, overrides, seed=cell_seed, max_steps=max_steps,
-                                max_tokens=max_tokens, dataset=dataset):
+                                max_tokens=max_tokens, dataset=dataset,
+                                collect_diagnostics=collect_diagnostics,
+                                collect_extrapolation=collect_extrapolation):
                 print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
                 results.append(json.loads(marker.read_text(encoding="utf-8")))
                 continue
@@ -1848,8 +1891,8 @@ def run_sweep(
         t0 = time.perf_counter()
         try:
             result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
-                                 seed=cell_seed, collect_diagnostics=sweep.get("collect_diagnostics", False),
-                                 collect_extrapolation=sweep.get("collect_extrapolation", False),
+                                 seed=cell_seed, collect_diagnostics=collect_diagnostics,
+                                 collect_extrapolation=collect_extrapolation,
                                  max_tokens=max_tokens, max_steps=max_steps)
         except Exception as exc:                             # a training crash must not kill the sweep
             logger.exception("sweep %s / %s crashed", sweep_name, label)
@@ -1859,6 +1902,16 @@ def run_sweep(
         finally:
             _cleanup()
 
+        result.setdefault("error_kind", None)
+        result["collect_diagnostics"]   = collect_diagnostics
+        result["collect_extrapolation"] = collect_extrapolation
+        try:
+            terminal_ppl = float(result["final_val_ppl"])
+        except (KeyError, TypeError, ValueError):
+            terminal_ppl = float("inf")
+        result["final_val_ppl"] = terminal_ppl
+        successful = result["error_kind"] is None and math.isfinite(terminal_ppl)
+        result["status"] = "success" if successful else "failed"
         result["sweep"] = sweep_name
         result["wall_time_s"] = time.perf_counter() - t0
         marker.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")

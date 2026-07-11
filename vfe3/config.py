@@ -33,6 +33,28 @@ _VALID_OMEGA_REFLECTION    = ("off", "init_seed", "metropolis")
 _REFLECT_OK                = ("glk", "block_glk", "so_k")   # so_k: valid O(K) seed; gl: ambient seed valid
 
 
+def _cross_couplings_are_bracket_closed(
+    cross_couplings: List[Tuple[int, int]],
+) -> bool:
+    r"""Whether directed full-block couplings form a Lie-bracket-closed basis.
+
+    The runtime basis contains every diagonal head block and, for each directed
+    edge ``(a, b)``, the full off-diagonal block ``E_ab tensor A``. Its bracket is
+    ``[E_ab tensor A, E_cd tensor B] = delta_bc E_ad tensor AB
+    - delta_da E_cb tensor BA``. Diagonal targets already belong to the basis;
+    every off-diagonal target belongs exactly when the directed edge relation is
+    transitive. This graph test is therefore equivalent to closure of the runtime
+    block-matrix basis without constructing the ``(n_gen, n_gen, K, K)`` bracket
+    tensor during configuration validation.
+    """
+    edges = set(cross_couplings)
+    for a, b in edges:
+        for c, d in edges:
+            if b == c and a != d and (a, d) not in edges:
+                return False
+    return True
+
+
 @dataclass
 class VFE3Config:
     """The single authoritative configuration surface for VFE_3.0.
@@ -739,6 +761,10 @@ class VFE3Config:
             raise ValueError(f"eps must be positive, got {self.eps}")
         if self.kl_max <= 0.0:
             raise ValueError(f"kl_max must be positive, got {self.kl_max}")
+        if not (math.isfinite(self.rope_base) and self.rope_base > 0.0):
+            raise ValueError(f"rope_base must be finite and positive, got {self.rope_base}")
+        if not (math.isfinite(self.alibi_slope) and self.alibi_slope >= 0.0):
+            raise ValueError(f"alibi_slope must be finite and nonnegative, got {self.alibi_slope}")
         # sigma_max caps the covariance in the SPD retractions (clamp max=sigma_max); a nonfinite
         # or sub-eps cap would push the clamped covariance below eps / negative / NaN (audit
         # 2026-07-01 F2). None stays permissive (no cap).
@@ -1001,13 +1027,16 @@ class VFE3Config:
                 )
         # 'omega_direct' stores the per-token frame as a structure-group element U_i (belief.omega),
         # sourced from prior_bank.omega_embed, transport Omega_ij = U_i U_j^{-1}. Phase 2 scope:
-        # all seven omega-eligible groups (_OMEGA_GROUPS below), the flat regime, and no E-step
-        # frame refinement. Everything outside that scope is rejected with a clear message.
+        # every group whose registration advertises omega_direct_capable, the flat regime, and no
+        # E-step frame refinement. Everything outside that scope is rejected with a clear message.
         if self.gauge_parameterization == "omega_direct":
-            _OMEGA_GROUPS = ("glk", "block_glk", "tied_block_glk", "so_k", "so_n", "sp", "sp_n")
-            if self.gauge_group not in _OMEGA_GROUPS:
+            omega_groups = tuple(sorted(
+                name for name, builder in _GROUPS.items()
+                if getattr(builder, "omega_direct_capable", False)
+            ))
+            if not getattr(_GROUPS[self.gauge_group], "omega_direct_capable", False):
                 raise ValueError(
-                    f"gauge_parameterization='omega_direct' supports gauge_group in {_OMEGA_GROUPS}; "
+                    f"gauge_parameterization='omega_direct' supports gauge_group in {omega_groups}; "
                     f"got {self.gauge_group!r}."
                 )
             # det<0 seeding is group-specific; reject where the ambient diag(-1,1,...) seed is not a
@@ -1101,6 +1130,23 @@ class VFE3Config:
                     raise ValueError(
                         f"cross_couplings head indices ({a},{b}) out of range [0, {self.n_heads})"
                     )
+            basis_is_closed = _cross_couplings_are_bracket_closed(self.cross_couplings)
+            phi_bch_active = self.e_phi_lr > 0.0 and self.phi_retract_mode == "bch"
+            positional_bch_active = self.pos_phi != "none" and self.pos_phi_compose == "bch"
+            if (self.close_basis is False and not basis_is_closed
+                    and (phi_bch_active or positional_bch_active)):
+                active_routes = []
+                if phi_bch_active:
+                    active_routes.append("phi_retract_mode='bch' with e_phi_lr>0")
+                if positional_bch_active:
+                    active_routes.append("active pos_phi with pos_phi_compose='bch'")
+                raise ValueError(
+                    "close_basis=False is invalid for this nonclosed cross_couplings relation "
+                    f"when BCH is active through {', '.join(active_routes)}: the runtime basis is "
+                    "not closed under Lie brackets and BCH would truncate out-of-span terms. Set "
+                    "close_basis=True, supply every directed transitive edge, or disable every "
+                    "reachable BCH route."
+                )
             # Cross-coupling's off-block generators destroy the per-head direct sum, so the group
             # builder reports a SINGLE irrep block [K]: n_heads no longer sets the runtime
             # attention-head count and the energy is one full-K block. Fail FAST here on the
@@ -1277,6 +1323,12 @@ class VFE3Config:
         # avoids a config <- alpha_i cycle.
         from vfe3.alpha_i import _ALPHAS
         _require(self.lambda_alpha_mode, tuple(sorted(_ALPHAS)), "lambda_alpha_mode")
+        if (self.lambda_alpha_mode == "constant"
+                and not (math.isfinite(self.lambda_alpha) and self.lambda_alpha >= 0.0)):
+            raise ValueError(
+                f"lambda_alpha must be finite and nonnegative under lambda_alpha_mode='constant', "
+                f"got {self.lambda_alpha}"
+            )
         # lambda_h_mode validated against the hyper-prior-coupling registry (the model-fiber mirror of
         # lambda_alpha_mode). r_update_mode selects the centroid M-step (gradient vs closed-form barycenter).
         from vfe3.lambda_h_i import _LAMBDA_H_MODES
@@ -1577,7 +1629,7 @@ class VFE3Config:
                 "rotations R(theta_i) do not commute with a global gauge element, so gauge-RoPE "
                 "breaks the global gauge equivariance of F/beta for every group (probe: beta "
                 "residual 0.44-0.61 under rope vs 7e-6 without). The equivariant positional paths "
-                "are pos_phi='sinusoidal'/'learned' (composed into phi) or pos_rotation='none'.",
+                "are pos_phi='frozen'/'learned' (composed into phi) or pos_rotation='none'.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -1642,20 +1694,18 @@ class VFE3Config:
         # manuscript-canonical affine-invariant exponential map (the pure path always exists).
         from vfe3.geometry.retraction import _RETRACTIONS
         _require(self.spd_retract_mode, tuple(sorted(_RETRACTIONS)), "spd_retract_mode")
-        # log_euclidean is a genuinely new variant only for the full-covariance family. On a
-        # diagonal family it applies the tangent in the matrix-log chart WITHOUT the affine
-        # 1/sigma Fisher whitening, so under this seam's pre-whitened tangent convention it does
-        # NOT coincide with the manuscript-canonical 'spd_affine' there -- it is a non-canonical
-        # log-chart step. Warn (not error) so the harmless-but-non-canonical pairing surfaces; the
-        # user toggles families and retraction modes independently.
+        # log_euclidean is a distinct variant only for the full-covariance family. On a diagonal
+        # family, Dlog_sigma[H] = H / sigma, so its ambient-tangent retraction coincides with the
+        # manuscript-canonical 'spd_affine' path. Warn (not error) because the pairing is valid but
+        # does not select a distinct geometry; the user toggles families and modes independently.
         if self.spd_retract_mode == "log_euclidean" and family_is_diagonal:
             import warnings
             warnings.warn(
-                "spd_retract_mode='log_euclidean' with a diagonal-covariance family applies the "
-                "tangent in the log chart without the affine 1/sigma Fisher whitening, so it does "
-                "NOT reduce to the canonical 'spd_affine' here (it is a non-canonical log-chart "
-                "step). log_euclidean is a genuinely new variant only for a full-covariance "
-                "family; prefer 'spd_affine' on the diagonal family, or use 'gaussian_full'.",
+                "spd_retract_mode='log_euclidean' with a diagonal-covariance family maps the "
+                "ambient covariance tangent through the Log-Euclidean chart using H / sigma, "
+                "which coincides with the canonical 'spd_affine' retraction on commuting diagonal "
+                "covariances. The pairing is valid but selects a distinct geometry only for a "
+                "full-covariance family.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -1681,16 +1731,16 @@ class VFE3Config:
         # / spd_retract_mode above). Local import avoids a config <- prior_bank cycle. decode_mode must
         # NOT accept 'linear': that kernel is reached only through the use_prior_bank=False second-gate
         # (a learned linear readout), never via decode_mode, so it is excluded from the valid set.
-        from vfe3.model.prior_bank import _DECODERS, _ENCODERS, _FULL_DECODERS
+        from vfe3.model.prior_bank import _DECODERS, _ENCODERS
         _require(self.decode_mode, tuple(sorted(set(_DECODERS) - {"linear"})), "decode_mode")
         # decode_mode sets the RANK of the prior-bank KL-decode kernel: 'diagonal'/'diagonal_chunked'
         # consume a diagonal sigma (B,N,K); 'full'/'full_chunked' consume a full sigma (B,N,K,K). It
         # must agree with the covariance family, else the rank mismatch is a shape RuntimeError at the
-        # first forward. The use_prior_bank=False linear decode discards sigma and reads decode_mode
-        # for exactly one thing: '*_chunked' selects the fused chunked-CE training path over
-        # logits = mu @ W^T (vram audit 2026-06-10) -- rank is irrelevant there, so the cross-check
-        # stays gated on use_prior_bank.
-        decode_is_full = self.decode_mode in _FULL_DECODERS
+        # first forward. The use_prior_bank=False linear decode discards sigma, and its own active
+        # registration controls dense versus fused-CE training; decode_mode does not route that
+        # no-prior path. Rank is therefore irrelevant there, so the cross-check stays gated on
+        # use_prior_bank.
+        decode_is_full = _DECODERS[self.decode_mode].supports_full
         if self.use_prior_bank and decode_is_full == family_is_diagonal:
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
@@ -1711,8 +1761,9 @@ class VFE3Config:
             raise ValueError(f"policy_top_k must be >= 1, got {self.policy_top_k}")
         if self.policy_horizon < 1:
             raise ValueError(f"policy_horizon must be >= 1, got {self.policy_horizon}")
-        if self.policy_precision <= 0.0:
-            raise ValueError(f"policy_precision (gamma) must be > 0, got {self.policy_precision}")
+        if not math.isfinite(self.policy_precision) or self.policy_precision <= 0.0:
+            raise ValueError(
+                f"policy_precision (gamma) must be finite and > 0, got {self.policy_precision}")
         # audit F5 (2026-06-28): close the construction gaps where an invalid policy config validated and
         # only failed deep inside generate(). score_terms must be a nonempty subset of the EFE term names
         # the scorer assembles (a typo otherwise surfaces as a cryptic KeyError in _policy_efe_one_step).
@@ -1724,6 +1775,16 @@ class VFE3Config:
             raise ValueError(
                 f"policy_score_terms {bad_terms} not in {_efe_score_terms}; G(pi) is a sum over these "
                 f"EFE terms (spec Section 3.2).")
+        if self.policy_mode == "logprob_control" and self.policy_horizon != 1:
+            raise ValueError(
+                f"policy_mode='logprob_control' accepts only policy_horizon=1 because it scores one "
+                f"continuation token; got policy_horizon={self.policy_horizon}.")
+        if (self.policy_mode == "logprob_control"
+                and self.policy_score_terms != ("risk", "ambiguity")):
+            raise ValueError(
+                f"policy_mode='logprob_control' accepts only the default policy_score_terms="
+                f"('risk', 'ambiguity') metadata because it scores raw continuation log-probability; "
+                f"got {self.policy_score_terms}.")
         # mode/horizon pairing: efe_one_step is the H=1 scorer (H>1 is efe_rollout, gated on a belief
         # cache). Reject the mismatch at construction rather than mid-generate (policy.py raises there).
         if self.policy_mode == "efe_one_step" and self.policy_horizon != 1:
@@ -1785,6 +1846,15 @@ class VFE3Config:
             raise ValueError(
                 f"precision_attention_b0 must be positive (the b0 in the per-key reliability "
                 f"-log(b0 + tr Sigma_j)), got {self.precision_attention_b0}")
+        if self.precision_weighted_attention:
+            import warnings
+            warnings.warn(
+                "precision_weighted_attention=True uses a detached precision prior evaluated at "
+                "the fixed covariance entering each block. It is a fixed-covariance surrogate, "
+                "not a jointly optimized covariance-dependent attention objective.",
+                UserWarning,
+                stacklevel=2,
+            )
         # precision_attention_per_head only shapes the bias WHEN precision_weighted_attention is on.
         if self.precision_attention_per_head and not self.precision_weighted_attention:
             import warnings
@@ -2185,6 +2255,17 @@ class VFE3Config:
                 )
             if not (0.0 < self.mm_damping <= 1.0):
                 raise ValueError(f"mm_damping must be in (0, 1], got {self.mm_damping}")
+            if self.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord"):
+                import warnings
+                warnings.warn(
+                    f"e_step_update='mm_exact' with lambda_alpha_mode={self.lambda_alpha_mode!r} "
+                    "computes the frozen state-dependent-alpha majorizer minimizer; the iteration "
+                    f"takes a step toward it using mm_damping={self.mm_damping} (a damped step for "
+                    "values below 1.0, the full step at 1.0). It is not one-step exact for the "
+                    "profiled state-dependent-alpha objective.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         if self.unigram_kappa < 0.0:
             raise ValueError(f"unigram_kappa must be >= 0, got {self.unigram_kappa}")
         _require(self.exp_fp64_mode, ("dim", "norm"), "exp_fp64_mode")

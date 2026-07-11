@@ -24,6 +24,7 @@ had no figures. These tests pin:
 import csv
 import math
 
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -103,6 +104,34 @@ def test_refined_s_belief_is_none_off_s_e_step():
     m = _model(lambda_h=0.25)                                      # model channel on (r table), s_e_step off
     tok = torch.randint(0, 6, (1, 8))
     assert m._refined_s_belief(tok) is None
+
+
+def test_lambda_h_zero_state_dependent_diagnostics_has_zero_weighted_effect() -> None:
+    with pytest.warns(UserWarning):
+        state_dependent = _model(
+            s_e_step=True,
+            prior_source="model_channel",
+            lambda_h=0.0,
+            lambda_h_mode="state_dependent",
+            lambda_gamma=0.0,
+        )
+    with pytest.warns(UserWarning):
+        constant = _model(
+            s_e_step=True,
+            prior_source="model_channel",
+            lambda_h=0.0,
+            lambda_h_mode="constant",
+            lambda_gamma=0.0,
+        )
+    constant.load_state_dict(state_dependent.state_dict())
+    tok = torch.tensor([[0, 1, 2, 3, 4, 5, 0, 1]], dtype=torch.long)
+
+    state_dependent_diag = state_dependent.diagnostics(tok)
+    constant_diag = constant.diagnostics(tok)
+
+    assert state_dependent_diag["hyper_prior"] > 0.0
+    assert state_dependent_diag["hyper_prior_weighted"] == 0.0
+    assert state_dependent_diag["total"] == pytest.approx(constant_diag["total"], abs=1e-7)
 
 
 # ---- (2) gamma split: envelope identity + mean/sum reduction consistency ---------------------------
@@ -342,7 +371,6 @@ def test_finalize_emits_model_channel_terms_iff_active(tmp_path):
 # ---- (11) model-channel UMAP bank: gating + the redesigned figure renders on the s channel --------
 
 def test_model_channel_bank_gating_and_umap_render(tmp_path):
-    import pytest
     batches = [torch.randint(0, 6, (8, 8)) for _ in range(2)]
     assert extract.model_channel_bank(_model(), batches) is None           # pure path: no s tables
     bk = extract.model_channel_bank(_active(), batches, max_sequences=16)

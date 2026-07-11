@@ -165,29 +165,35 @@ def _pref_task(
     prior_bank: 'object',                            # PriorBank: vocab handle (V)
 
     *,
-    goal:    'int | torch.Tensor',                   # goal token id (scalar) or (B,) per-episode goals
-    beta_C:  float                  = 5.0,           # preference precision (spec: 5.0 -> goal mass ~0.90)
-    support: Optional[torch.Tensor] = None,          # (S,) allowed (state) token ids; mass ~0 elsewhere
-    eps:     float                  = 1e-12,
-    device:  Optional[torch.device] = None,          # model device (audit F5); None -> CPU (direct-call default)
+    goal:          'int | torch.Tensor',             # goal token id (scalar) or (B,) per-episode goals
+    beta_C:        float                  = 5.0,     # preference precision (spec: 5.0 -> goal mass ~0.90)
+    eps:           float                  = 1e-12,
+    support:       Optional[torch.Tensor] = None,    # (S,) allowed (state) token ids
+    device:        Optional[torch.device] = None,    # model device (audit F5); None -> CPU
+    support_floor: Optional[float]        = None,    # None -> hard -inf; finite -> explicit soft floor
     **kwargs,
 ) -> torch.Tensor:                                   # (V,) or (B, V) log p(o|C) = log softmax(beta_C U_C)
     r"""The explicit, peaked goal preference p(o|C) = softmax(beta_C U_C): utility beta_C on the goal
-    symbol, 0 on other ``support`` (state) symbols, and ~0 mass (-inf utility) on non-support tokens.
-    The genuine pragmatic-EFE arm (spec Section 2.3). Per-episode: pass a (B,) ``goal`` for a (B, V)
-    preference whose peak differs per episode. ``device`` honors the model device (audit F5)."""
+    symbol and 0 on other ``support`` (state) symbols. ``support_floor=None`` preserves exact hard
+    support with -inf outside it; a supplied finite floor is an explicit finite-floor preference and is
+    normalized with the other utilities. The genuine pragmatic-EFE arm (spec Section 2.3). Per-episode:
+    pass a (B,) ``goal`` for a (B, V) preference whose peak differs per episode. ``device`` honors the
+    model device (audit F5)."""
+    if support_floor is not None and not math.isfinite(support_floor):
+        raise ValueError(f"support_floor must be finite or None, got {support_floor}")
     V = prior_bank.vocab_size
     goal_t = goal.to(device) if isinstance(goal, torch.Tensor) else torch.tensor(goal, device=device)
     if support is not None and device is not None:
         support = support.to(device)
+    floor = float("-inf") if support_floor is None else support_floor
     if goal_t.dim() == 0:                            # scalar goal -> (V,)
-        U = torch.zeros(V, device=device) if support is None else torch.full((V,), float("-inf"), device=device)
+        U = torch.zeros(V, device=device) if support is None else torch.full((V,), floor, device=device)
         if support is not None:
             U[support] = 0.0
         U[goal_t] = beta_C
         return torch.log_softmax(U, dim=-1)
     B = goal_t.shape[0]                              # (B,) goals -> (B, V)
-    U = torch.zeros(B, V, device=device) if support is None else torch.full((B, V), float("-inf"), device=device)
+    U = torch.zeros(B, V, device=device) if support is None else torch.full((B, V), floor, device=device)
     if support is not None:
         U[:, support] = 0.0
     U[torch.arange(B, device=device), goal_t] = beta_C
@@ -220,7 +226,9 @@ def _amb_likelihood_entropy(
     r"""The default ambiguity: the entropy of the decoded predictive categorical at the belief MEAN,
     using no sigma (spec Section 3.3). At the v1 point belief q(o|pi) = p(o|mu_s), so this equals the
     predictive entropy and the MI bridge I = predictive_entropy - ambiguity is identically 0."""
-    return -(q_log.exp() * q_log).sum(dim=-1)
+    q = q_log.exp()
+    q_log_term = torch.where(q > 0, q * q_log, torch.zeros_like(q))
+    return -q_log_term.sum(dim=-1)
 
 
 @register_ambiguity("sigma_mc")
@@ -244,6 +252,25 @@ def _amb_sigma_mc(
 
 # ---- scorer internals ------------------------------------------------------------------------------
 
+def _validate_policy_context(
+    context:          torch.Tensor,                   # (B, N) current policy context
+
+    candidate_length: int,                            # L appended action tokens
+    max_seq_len:      int,                            # model sequence bound
+) -> None:
+    """Reject a policy rollout that cannot preserve its complete context and candidate."""
+    N = context.shape[1]
+    if N <= 0:
+        raise ValueError(f"policy context must be nonempty, got N={N}")
+    if candidate_length <= 0:
+        raise ValueError(f"policy candidate length must be > 0, got L={candidate_length}")
+    if N + candidate_length > max_seq_len:
+        raise ValueError(
+            f"policy context length N={N} plus candidate length L={candidate_length} exceeds "
+            f"max_seq_len={max_seq_len}; policy paths do not truncate context."
+        )
+
+
 def _rollout_predictive(
     context:     torch.Tensor,                       # (B, N) context ids
     candidates:  torch.Tensor,                       # (B, Kp, L) candidate continuation ids
@@ -261,19 +288,18 @@ def _rollout_predictive(
     B, N = context.shape
     Kp, L = candidates.shape[1], candidates.shape[2]
     max_len = model.cfg.max_seq_len
+    _validate_policy_context(context, L, max_len)
     # Cache fast path (Phase 3a): on the verified causal/filtering/flat/single-block regime, and when
     # context+candidate fits the built length (no sliding-window eviction, which would invalidate the
     # prefix), compute only the appended positions' E-step rows against a shared context. Golden-tested
     # equal to the full recompute below to float tolerance (tests/test_belief_cache.py).
-    if cache_supported(model.cfg) and N + L <= max_len:
+    if cache_supported(model.cfg):
         return rollout_predictive_cached(context, candidates, model, base_logits=base_logits)
-    if N + L > max_len:                              # keep context+action within the model's built length
-        context = context[:, -(max_len - L):]
-        N = context.shape[1]
     ctx_exp = context.unsqueeze(1).expand(B, Kp, N)              # (B, Kp, N)
     ext = torch.cat([ctx_exp, candidates], dim=2).reshape(B * Kp, N + L)   # (B*Kp, N+L)
-    _belief, logits = model.rollout_beliefs(ext, return_logits=True)       # logits (B*Kp, N+L, V)
-    last = logits[:, -1, :]                                      # (B*Kp, V) post-action prediction
+    _belief, logits = model.rollout_beliefs(
+        ext, return_logits=True, decode_last=True)                # logits (B*Kp, 1, V)
+    last = logits[:, 0, :]                                        # (B*Kp, V) post-action prediction
     q_log = torch.log_softmax(last, dim=-1).reshape(B, Kp, -1)  # (B, Kp, V) = log q(o|pi)
     if base_logits is None:
         base_logits = model.forward(context)[:, -1, :]          # (B, V) base last-position logits
@@ -288,13 +314,11 @@ def _efe_terms(
 ) -> 'Tuple[torch.Tensor, torch.Tensor]':
     r"""risk = KL[q(o|pi) || p(o|C)] and the predictive entropy H[q(o|pi)] (spec Section 2.6)."""
     q = q_log.exp()
+    q_log_term = torch.where(q > 0, q * q_log, torch.zeros_like(q))
     logpC = preference.view(1, 1, -1) if preference.dim() == 1 else preference.unsqueeze(1)
-    # Defensive finite floor: a zero-support preference (log p = -inf where q has mass) would make the
-    # forward KL diverge to +inf and the policy posterior collapse to nan. Proper preferences sit well
-    # above -60, so this never bites them; it only caps an otherwise-infinite penalty.
-    logpC = logpC.clamp_min(-60.0)
-    risk = (q * (q_log - logpC)).sum(dim=-1)                     # (B, Kp) forward KL
-    pred_ent = -(q * q_log).sum(dim=-1)                          # (B, Kp) H[q]
+    preference_term = torch.where(q > 0, q * logpC, torch.zeros_like(q))
+    risk = (q_log_term - preference_term).sum(dim=-1)            # (B, Kp) forward KL; may be +inf
+    pred_ent = -q_log_term.sum(dim=-1)                            # (B, Kp) H[q]
     return risk, pred_ent
 
 
@@ -307,6 +331,14 @@ def _policy_posterior(
     logits = -gamma * score
     if log_prior is not None:
         logits = logits + log_prior
+    invalid_row = torch.isnan(logits).any(dim=-1) | torch.isposinf(logits).any(dim=-1)
+    if bool(invalid_row.any()):
+        rows = invalid_row.nonzero(as_tuple=False).flatten().tolist()
+        raise ValueError(f"policy posterior logits contain NaN or +inf candidates in rows {rows}")
+    finite_row = torch.isfinite(logits).any(dim=-1)
+    if not bool(finite_row.all()):
+        rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()
+        raise ValueError(f"policy posterior has no finite candidate in rows {rows}")
     return torch.softmax(logits, dim=-1)
 
 
@@ -369,6 +401,11 @@ def _policy_efe_one_step(
         raise ValueError(
             f"efe_one_step is the H=1 scorer; got horizon={horizon}. Horizon>1 is efe_rollout, which "
             f"is gated on a belief/key-value cache (spec Section 3.5).")
+    L = candidates.shape[2]
+    _validate_policy_context(context, L, model.cfg.max_seq_len)
+    if L != horizon:
+        raise ValueError(
+            f"efe_one_step candidate length L={L} must equal horizon={horizon}.")
     return _efe_score(context, candidates, preference, model, gamma=gamma, score_terms=score_terms,
                       ambiguity_mode=ambiguity_mode, log_prior=log_prior, base_logits=base_logits)
 
@@ -392,10 +429,21 @@ def _policy_logprob_control(
     r"""The matched-compute control: pays the SAME Kp rollout cost as efe_one_step but scores by raw
     continuation log-prob (score = -log_prob), with risk/ambiguity/epistemic returned as zeros so the
     diagnostic columns line up (spec Section 3.2)."""
+    if horizon != 1:
+        raise ValueError(f"logprob_control accepts only horizon=1, got {horizon}")
+    L = candidates.shape[2]
+    _validate_policy_context(context, L, model.cfg.max_seq_len)
+    if L != horizon:
+        raise ValueError(
+            f"logprob_control candidate length L={L} must equal horizon={horizon}.")
+    if score_terms != ("risk", "ambiguity"):
+        raise ValueError(
+            "logprob_control scores raw continuation log-probability and accepts only the default "
+            f"score_terms=('risk', 'ambiguity') metadata, got {score_terms}")
     q_log, log_prob = _rollout_predictive(context, candidates, model, base_logits=base_logits)
     zeros = torch.zeros_like(log_prob)
     score = -log_prob                                           # lower G <-> higher continuation logprob
-    post = _policy_posterior(score, gamma, log_prior)
+    post = _policy_posterior(score, gamma, None)                 # log_prob already contains the base prior
     return PolicyScore(score, zeros, zeros, zeros, log_prob, post)
 
 
@@ -436,6 +484,7 @@ def _policy_efe_rollout(
         raise ValueError(
             f"efe_rollout candidates carry the H-action policy sequence: candidate length L={L} must "
             f"equal horizon={horizon}.")
+    _validate_policy_context(context, L, model.cfg.max_seq_len)
     if not cache_supported(model.cfg):
         raise NotImplementedError(
             "efe_rollout (horizon>1) requires the belief-prefix cache, which is exact only for the "

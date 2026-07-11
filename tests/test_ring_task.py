@@ -1,6 +1,7 @@
 r"""Phase 1 tests for the ring goal-steering environment (vfe3/inference/ring_task.py; spec Section 4.1).
 Deterministic env/data/preference tests (no training) plus a harness smoke test on an untrained model.
 """
+import pytest
 import torch
 
 from vfe3.config import VFE3Config
@@ -41,7 +42,7 @@ def test_sample_batch_shapes_and_transition_target():
 
 def test_ring_preference_is_distance_graded():
     goals = torch.tensor([4])
-    logp = rt.ring_preference(goals, beta_C=5.0)           # (1, V)
+    logp = rt.ring_preference(goals, beta_C=5.0, support_floor=-45.0)  # (1, V)
     p = logp.exp()[0]
     assert torch.allclose(p.sum(), torch.tensor(1.0), atol=1e-5)
     assert int(p.argmax()) == 4                            # peaks on the goal
@@ -49,6 +50,16 @@ def test_ring_preference_is_distance_graded():
     # strictly decreasing with ring distance: p(goal) > p(dist 1) > p(dist 2)
     assert float(p[4]) > float(p[5]) > float(p[6])
     assert float(p[5]) == float(p[3])                      # symmetric in ring distance (dist 1 both sides)
+
+
+def test_ring_preference_support_floor_is_explicit_and_normalized():
+    goals = torch.tensor([4])
+    hard = rt.ring_preference(goals, beta_C=5.0)
+    assert torch.isfinite(hard[:, :rt.M]).all()
+    assert torch.isneginf(hard[:, rt.M:]).all()
+    finite = rt.ring_preference(goals, beta_C=5.0, support_floor=-45.0)
+    assert torch.isfinite(finite).all()
+    assert torch.allclose(finite.exp().sum(dim=-1), torch.ones(1), atol=1e-6)
 
 
 def test_ring_preference_keeps_efe_score_finite():
@@ -64,13 +75,31 @@ def test_ring_preference_keeps_efe_score_finite():
     ctx = rt.render_context(goals, torch.tensor([0, 5]))
     base = model.forward(ctx)[:, -1, :]
     topk = base.topk(8, dim=-1).indices
-    pref = rt.ring_preference(goals, beta_C=5.0)
+    pref = rt.ring_preference(goals, beta_C=5.0, support_floor=-45.0)
     with torch.no_grad():
         out = get_policy("efe_one_step")(ctx, topk.unsqueeze(-1), pref, model, gamma=1.0, base_logits=base)
     assert torch.isfinite(out.risk).all()
     assert torch.isfinite(out.score).all()
     assert torch.isfinite(out.policy_posterior).all()
     assert torch.allclose(out.policy_posterior.sum(-1), torch.ones(2), atol=1e-5)
+
+
+def test_decode_menu_rejects_invalid_sampling_inputs():
+    logits = torch.tensor([[2.0, 1.0, 0.0]])
+    for temperature in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="temperature"):
+            rt._decode_menu(logits, "temp_sample", temperature=temperature)
+    for top_p in (0.0, -0.1, 1.1, float("nan"), float("inf")):
+        for mode in ("nucleus", "typical"):
+            with pytest.raises(ValueError, match="top_p"):
+                rt._decode_menu(logits, mode, top_p=top_p)
+    for bad_logits in (
+        torch.tensor([[0.0, float("nan")]]),
+        torch.tensor([[0.0, float("inf")]]),
+        torch.full((1, 2), float("-inf")),
+    ):
+        with pytest.raises(ValueError, match="finite"):
+            rt._decode_menu(bad_logits, "temp_sample")
 
 
 def test_run_episodes_smoke_shapes_on_untrained_model():
@@ -87,6 +116,32 @@ def test_run_episodes_smoke_shapes_on_untrained_model():
     assert out["steps_to_goal"].shape == (4,) and out["frac_at_goal"].shape == (4,)
     assert (out["steps_to_goal"] <= 5).all()
     assert torch.isfinite(out["mean_risk"]) and torch.isfinite(out["mean_ambiguity"])  # scorer diagnostics
+
+
+def test_run_episodes_rejects_invalid_context_before_policy_side_effects(monkeypatch):
+    cfg = VFE3Config(vocab_size=rt.V, embed_dim=12, n_heads=2, max_seq_len=5,
+                     n_layers=1, n_e_steps=1, use_prior_bank=False)
+    model = VFEModel(cfg)
+    goals = torch.tensor([2])
+    states = torch.tensor([5])
+
+    def fail_forward(*args, **kwargs):
+        pytest.fail("invalid ring context reached base forward")
+
+    monkeypatch.setattr(model, "forward", fail_forward)
+    with pytest.raises(
+        ValueError,
+        match=r"context length N=5 plus candidate length L=1 exceeds max_seq_len=5",
+    ):
+        rt.run_episodes(model, goals, states, "efe_one_step", budget=1)
+
+    monkeypatch.setattr(
+        rt,
+        "render_context",
+        lambda goals, states: torch.empty((goals.shape[0], 0), dtype=torch.long),
+    )
+    with pytest.raises(ValueError, match=r"context must be nonempty, got N=0"):
+        rt.run_episodes(model, goals, states, "efe_one_step", budget=1)
 
 
 def test_run_episodes_phase2_baseline_arms_run_and_stay_valid():

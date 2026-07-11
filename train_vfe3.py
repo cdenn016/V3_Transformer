@@ -27,12 +27,19 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each
 #   override by exporting KMP_DUPLICATE_LIB_OK yourself. See docs/edits/2026-06-05.
 
 import logging
+from typing import Dict, List, Sequence
 
 import torch
 from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
-from vfe3.data.datasets import make_dataloader
+from vfe3.data.datasets import (
+    _tokenizer_tag,
+    _validate_path_component,
+    cached_token_count,
+    make_dataloader,
+)
+from vfe3.runtime import seed_everything
 from vfe3.train import _fmt_tau, evaluate, train
 
 
@@ -458,7 +465,8 @@ def _select_loader(
     # -> legacy global-RNG shuffle (byte-identical). Val/test do not shuffle, so a generator is moot there.
     gen = torch.Generator().manual_seed(int(DATA_SEED)) if (is_train and DATA_SEED is not None) else None
     return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
-                           shuffle=is_train, drop_last=is_train, max_tokens=cap, generator=gen)
+                           shuffle=is_train, drop_last=is_train, max_tokens=cap,
+                           vocab_size=cfg.vocab_size, generator=gen)
 
 
 def _run_label(cfg: VFE3Config, dataset: str) -> str:
@@ -469,6 +477,7 @@ def _run_label(cfg: VFE3Config, dataset: str) -> str:
     in progress, and ``_rename_run_by_ppl`` swaps that prefix for the test perplexity at finalize. The
     ``_s<seed>`` suffix keeps a multi-seed launch's run folders distinct (and identifiable by seed).
     """
+    _validate_path_component(dataset, "dataset")
     tags = (("_linear" if not cfg.use_prior_bank else "")
             + ("_mix" if cfg.use_head_mixer else "")
             + ("_cross" if cfg.cross_couplings else ""))
@@ -538,7 +547,7 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     from vfe3.run_artifacts import RunArtifacts, finalize_run
 
     cfg = VFE3Config(**{**config, "seed": seed})         # per-run seed override (config `seed` is the default)
-    torch.manual_seed(cfg.seed)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(DEVICE)
     train_loader = _select_loader(DATASET, cfg, split="train")
     val_loader = _select_loader(DATASET, cfg, split="validation")
@@ -564,9 +573,8 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     # MAX_TOKENS actually caps the train stream (the default None loads the whole corpus, so no cap line).
     full_corpus_tokens = None
     if MAX_TOKENS is not None:
-        from vfe3.data.datasets import load_cached_tokens
         try:
-            full_corpus_tokens = int(load_cached_tokens(DATASET, "train").numel())
+            full_corpus_tokens = cached_token_count(DATASET, "train")
         except FileNotFoundError:
             full_corpus_tokens = None
     logger.info(_banner(model, cfg, DATASET, DEVICE, cfg.max_steps,
@@ -578,7 +586,7 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     # here would make this entry point train on a DIFFERENT batch order than ablation.py for an
     # identical config+seed (model init itself is already identical). Mirrors ablation.run_single's
     # post-build reseed so the two entry points reproduce each other.
-    torch.manual_seed(cfg.seed)
+    seed_everything(cfg.seed, deterministic=cfg.deterministic)
     t0 = time.perf_counter()
     losses = train(
         model, train_loader, cfg,
@@ -605,10 +613,47 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     if artifacts is not None:
         test_loader = _select_loader(DATASET, cfg, split="test")
         test_tpc = _tokens_per_char(DATASET, "test") or 1.0
-        results = finalize_run(model, artifacts, cfg, test_loader=test_loader, losses=losses,
-                               tokens_per_char=test_tpc, device=torch.device(DEVICE), wall_time=wall, logger=logger)
+        results = finalize_run(
+            model,
+            artifacts,
+            cfg,
+            tokens_per_char=test_tpc,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            losses=losses,
+            data_seed=DATA_SEED,
+            max_tokens=MAX_TOKENS,
+            tokenizer_tag=_tokenizer_tag(DATASET),
+            device=torch.device(DEVICE),
+            wall_time=wall,
+            logger=logger,
+        )
         run_dir = _rename_run_by_ppl(run_dir, _run_label(cfg, DATASET), results.get("test_ppl"), logger)
         logger.info("Artifacts written to %s", run_dir)
+
+
+def _resolve_seeds(
+    run_config: Dict[str, object],
+    seeds:      Sequence[int],
+    num_runs:   int,
+) -> List[int]:
+    """Resolve click-to-run seeds without silently overriding a one-run config seed."""
+    if seeds:
+        if len(seeds) < num_runs:
+            raise ValueError(
+                f"SEEDS lists {len(seeds)} seed(s) but NUM_RUNS={num_runs}; "
+                "provide at least NUM_RUNS seeds"
+            )
+        if num_runs == 1 and int(seeds[0]) != int(run_config["seed"]):
+            raise ValueError(
+                f"SEEDS[0]={int(seeds[0])} conflicts with config seed={int(run_config['seed'])}; "
+                "make the one-run seed values agree"
+            )
+        return [int(seed) for seed in seeds[:num_runs]]
+    if num_runs != 1:
+        raise ValueError(f"NUM_RUNS={num_runs} > 1 but SEEDS is empty; list one seed per run in SEEDS")
+    return [int(run_config["seed"])]
 
 
 def main() -> None:
@@ -618,15 +663,7 @@ def main() -> None:
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger = logging.getLogger("train_vfe3")
-    if SEEDS:
-        if len(SEEDS) < NUM_RUNS:
-            raise ValueError(
-                f"SEEDS lists {len(SEEDS)} seed(s) but NUM_RUNS={NUM_RUNS}; provide at least NUM_RUNS seeds")
-        seeds = list(SEEDS[:NUM_RUNS])
-    elif NUM_RUNS != 1:
-        raise ValueError(f"NUM_RUNS={NUM_RUNS} > 1 but SEEDS is empty; list one seed per run in SEEDS")
-    else:
-        seeds = [config["seed"]]                          # single run on the config seed (unchanged path)
+    seeds = _resolve_seeds(config, seeds=SEEDS, num_runs=NUM_RUNS)
     for i, s in enumerate(seeds):
         if len(seeds) > 1:
             logger.info("\n%s\n# Run %d/%d  (seed=%d)\n%s", "#" * 64, i + 1, len(seeds), int(s), "#" * 64)

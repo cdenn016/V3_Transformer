@@ -17,8 +17,7 @@ import torch
 
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
-from vfe3.families.base import get_family
-from vfe3.families.gaussian import diag_kl_unclamped
+from vfe3.families.base import get_family, kl
 from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
@@ -471,6 +470,7 @@ def phi_alignment_loss(
     rope_on_value:             bool  = True,          # False -> value aggregation uses the un-rotated base
 
     rope:         Optional[torch.Tensor] = None,      # (N,K,K) gauge-RoPE rotation (None -> off)
+    reflection:   Optional[torch.Tensor] = None,      # (N,) per-token sign s_i; None -> connected component
     log_prior:    Optional[torch.Tensor] = None,
     connection_W: Optional[torch.Tensor] = None,      # learned regime_ii connection (held fixed here)
     connection_M: Optional[torch.Tensor] = None,      # learned regime_ii_covariant connection (Route B; held fixed here)
@@ -486,8 +486,11 @@ def phi_alignment_loss(
     penalty, so the effective phi step is e_phi_lr * lambda_beta * nabla (lambda_beta and e_phi_lr
     interact). The ``mass_phi`` term makes the phi E-step descend the PENALIZED
     objective during inference (distinct from the outer M-step ||phi||^2 on the learned prior
-    table). The canonical (entropy) branch reuses ``reduced_free_energy``, the -tau log Z envelope
-    form.
+    table). The coherent canonical branch reuses ``reduced_free_energy``, the -tau log Z envelope
+    form. When RoPE is present with ``on_value=False``, beta instead comes from the rotated score
+    energy while the coupling sum uses the unrotated base-transport value energy; beta remains live
+    because it is not stationary for that decoupled block. ``reflection`` folds the belief's
+    discrete sheet into either transport before its energy is evaluated.
     """
     # Build Omega under the ACTIVE connection regime so the phi step descends the SAME objective as
     # the mu/sigma step. regime_ii reads the (fixed) belief means mu and the learned connection_W;
@@ -497,6 +500,7 @@ def phi_alignment_loss(
     # phi-gradient is preserved while the per-iteration dense (N,N,K,K) Omega disappears on the
     # flat equal-blocks path.
     omega = build_belief_transport(phi, group, transport_mode=transport_mode, mu=mu, sigma=sigma,
+                                   reflection=reflection,
                                    connection_W=connection_W, connection_M=connection_M,
                                    connection_L=connection_L, link_alpha=link_alpha,
                                    link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
@@ -505,13 +509,27 @@ def phi_alignment_loss(
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma)
     fam = get_family(family)
-    energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=renyi_order, kl_max=kl_max, eps=eps,
-                             divergence_family=divergence_family, irrep_dims=group.irrep_dims)
+    score_energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=renyi_order,
+                                   kl_max=kl_max, eps=eps, divergence_family=divergence_family,
+                                   irrep_dims=group.irrep_dims)
     mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0
+    if isinstance(omega, RopeTransport) and not omega.on_value:
+        mu_tv = transport_mean(omega.base, mu)
+        sigma_tv = transport_covariance(omega.base, sigma)
+        value_energy = pairwise_energy(fam(mu, sigma), fam(mu_tv, sigma_tv), alpha=renyi_order,
+                                       kl_max=kl_max, eps=eps, divergence_family=divergence_family,
+                                       irrep_dims=group.irrep_dims)
+        zero = score_energy.new_zeros(score_energy.shape[:-1])
+        return free_energy(
+            zero, score_energy, zero,
+            tau=tau, lambda_beta=lambda_beta,
+            include_attention_entropy=include_attention_entropy,
+            log_prior=log_prior, coupling_energy=value_energy,
+        ) + mass
     if include_attention_entropy:
-        return lambda_beta * reduced_free_energy(energy, tau=tau, log_prior=log_prior).sum() + mass
-    beta = attention_weights(energy, tau=tau, log_prior=log_prior)
-    return lambda_beta * (beta * energy).sum() + mass
+        return lambda_beta * reduced_free_energy(score_energy, tau=tau, log_prior=log_prior).sum() + mass
+    beta = attention_weights(score_energy, tau=tau, log_prior=log_prior)
+    return lambda_beta * (beta * score_energy).sum() + mass
 
 
 def e_step_iteration(
@@ -616,6 +634,7 @@ def e_step_iteration(
                 # filtering -- the same coordinate-ascent split as mu/mu_key) so autograd sees
                 # d Omega/d sigma on every path, not only the live unroll (audit 2026-07-01 C4).
                 sigma=sigma_q, sigma_key=sigma_k, connection_M=connection_M,
+                reflection=belief.reflection,
                 cocycle_relaxation=cocycle_relaxation, clamp_monitor=clamp_monitor,
                 rope=rope, rope_on_cov=rope_on_cov,
                 rope_on_value=rope_on_value,
@@ -682,6 +701,7 @@ def e_step_iteration(
             tau=tau, b0=b0, c0=c0, lambda_beta=lambda_beta,
             kl_max=kl_max, eps=eps, lambda_twohop=lambda_twohop, value=value,
             lambda_alpha_mode=lambda_alpha_mode, family=family, divergence_family=divergence_family,
+            need_sigma_update=(not skip_belief_sigma_update),
             irrep_dims=group.irrep_dims, log_prior=log_prior,
         )
         # Backward estimator, mirroring the gradient path: 'unroll' keeps the analytic graph
@@ -746,11 +766,14 @@ def e_step_iteration(
         # metric, so a non-Gaussian family (e.g. laplace_diagonal, I_mu=I_b=1/b^2) is descended in its
         # own geometry instead of the hardcoded Gaussian Fisher. The Gaussian families delegate to the
         # pinned geometry kernel (byte-identical); 'family' is the same key passed to belief_gradients.
-        # (grad_sigma is None only under skip_belief_sigma_update, whose sigma update is skipped below;
-        # a zero tangent keeps the family seam's signature intact.)
-        gs_precond = grad_sigma if grad_sigma is not None else torch.zeros_like(belief.sigma)
-        nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
-            grad_mu, gs_precond, eps=eps)
+        # When both sigma is frozen and the mean uses the raw Euclidean arm, no natural-gradient
+        # component is consumed. Bypass the family preconditioner entirely instead of computing and
+        # discarding its sigma arm. The natural-mean route still delegates to the family metric.
+        if grad_sigma is None and e_step_mu_precond == "raw":
+            nat_mu, nat_sigma = grad_mu, None
+        else:
+            nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
+                grad_mu, grad_sigma, eps=eps)
 
         # STRAIGHT-THROUGH (manuscript Algorithm 1, GL(K)_attention.tex:2050): detach the per-iteration
         # tangent so only the ADDITIVE chain stays live -- the belief is rebuilt as mu_prev + delta and
@@ -762,7 +785,9 @@ def e_step_iteration(
         # forward VALUE is unchanged (detach never alters a number). This mirrors the phi step, which is
         # already straight-through (fresh detached leaf, create_graph=False).
         if e_step_gradient == "straight_through":
-            nat_mu, nat_sigma = nat_mu.detach(), nat_sigma.detach()
+            nat_mu = nat_mu.detach()
+            if nat_sigma is not None:
+                nat_sigma = nat_sigma.detach()
 
         # B3/EXP-14 mean-arm ablation: descend the Fisher natural gradient nat_mu (= Sigma*grad_mu for a
         # diagonal Gaussian) by default, or the raw Euclidean grad_mu under e_step_mu_precond='raw'. The
@@ -822,6 +847,7 @@ def e_step_iteration(
                 # mu/sigma step, else under pos_rotation='rope' + e_phi_lr>0 phi optimizes a different
                 # free energy than mu/sigma (audit 2026-06-17 round 2 id15). None/off -> byte-identical.
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                reflection=belief.reflection,
                 # INTENTIONAL asymmetry (audit 2026-06-09 D3): connection_W is detached here, so
                 # the learned Regime-II connection trains ONLY through the mu/sigma belief path,
                 # never through the phi-step autograd island (whose grad is a constant tangent to
@@ -899,7 +925,7 @@ def e_step(
     T ~ Uniform{e_steps_min..e_steps_max} on grad-enabled (training) forwards, from the GLOBAL
     torch RNG; ``e_steps_backprop_last=k`` runs all but the last k iterations under no_grad and
     detaches the belief at the boundary (truncated backprop); ``e_step_halt_tol`` breaks the eval
-    (no_grad) loop when the mean diagonal-Gaussian KL(q^t || q^{t-1}) drops below tol."""
+    (no_grad) loop when the mean configured-family KL(q^t || q^{t-1}) drops below tol."""
     traj: List[float] = []
 
     # Hoist the flat transport when phi is frozen across iterations (e_phi_lr==0).  On the flat
@@ -968,6 +994,7 @@ def e_step(
     if e_steps_backprop_last > 0 and grad_on:
         no_grad_prefix = max(n_total - e_steps_backprop_last, 0)
     halt_eps: float = kwargs.get("eps", 1e-6)
+    halt_family = get_family(kwargs.get("family", "gaussian_diagonal")) if e_step_halt_tol is not None else None
 
     if return_trajectory:
         traj.append(_f_diag(belief))
@@ -989,20 +1016,24 @@ def e_step(
                     **kwargs,
                 )
             if t == no_grad_prefix - 1:
-                # Truncation boundary: fresh detached mu/sigma/phi leaves so the last-k graph starts
+                # Truncation boundary: fresh attached mu/sigma/phi leaves so the last-k graph starts
                 # here. _replace carries the omega frame (and s/r) through; omega is left ATTACHED
                 # (undetached) on purpose -- it is CONSTANT across E-step iterations, so it is not part
                 # of the truncated mu/sigma/phi unroll and does not reintroduce graph depth, and keeping
                 # it attached preserves the M-step gradient to omega_embed for the post-boundary
                 # iterations. Detaching it here would wrongly sever that gradient.
-                belief = belief._replace(mu=belief.mu.detach(), sigma=belief.sigma.detach(),
-                                         phi=belief.phi.detach())
+                belief = belief._replace(
+                    mu=belief.mu.detach().requires_grad_(True),
+                    sigma=belief.sigma.detach().requires_grad_(True),
+                    phi=belief.phi.detach().requires_grad_(True),
+                )
                 # m10: the hoisted flat transport was built from the PRE-boundary phi under grad, so the
                 # last-k iterations (which consume it via _prebuilt_omega) would leak transport gradient
-                # through the boundary to the encode/pos-phi tables. Rebuild it from the now-detached phi
+                # through the boundary to the encode/pos-phi tables. Rebuild it from the boundary phi
                 # (values unchanged at e_phi_lr==0, so the forward is byte-identical -- only the leaked
-                # graph is severed). A caller-shared prebuilt_transport is already detached, so leave it.
-                if _hoisted_omega is not None and prebuilt_transport is None:
+                # graph is severed). Caller-shared transports are attached on unrolled paths and require
+                # the same rebuild as internally hoisted transports.
+                if _hoisted_omega is not None:
                     _hoisted_omega = build_belief_transport(
                         belief.phi, group,
                         transport_mode="flat",
@@ -1030,12 +1061,16 @@ def e_step(
         if return_trajectory:
             traj.append(_f_diag(belief))
         if e_step_halt_tol is not None and not grad_on and t + 1 < n_total:
-            # Eval-time halting: mean over tokens of the closed-form diagonal-Gaussian
-            # KL(q^t || q^{t-1}) (the per-iteration belief move); break when < tol. The guard on
-            # t+1 < n_total skips a wasted check after the final iteration.
+            # Eval-time halting: mean over tokens of the configured-family KL(q^t || q^{t-1})
+            # (the per-iteration belief move); break when < tol. The guard on t+1 < n_total skips
+            # a wasted check after the final iteration.
             with torch.no_grad():
-                move = diag_kl_unclamped(belief.mu, belief.sigma, prev_mu, prev_sigma,
-                                         eps=halt_eps).mean()
+                move = kl(
+                    halt_family(belief.mu, belief.sigma),
+                    halt_family(prev_mu, prev_sigma),
+                    kl_max=float("inf"),
+                    eps=halt_eps,
+                ).mean()
             if move.item() < e_step_halt_tol:
                 break
     return (belief, traj) if return_trajectory else belief

@@ -15,7 +15,9 @@ from vfe3.config import VFE3Config
 from vfe3.inference.policy import (
     PolicyScore,
     _efe_terms,
+    _policy_posterior,
     _rollout_predictive,
+    _validate_policy_context,
     get_ambiguity,
     get_policy,
     get_preference,
@@ -34,6 +36,15 @@ def test_efe_terms_match_hand_computation():
     assert abs(float(pred_ent) - 1.02965) < 1e-4
     ce = -(q * pC.log()).sum()
     assert abs(float(risk + pred_ent) - float(ce)) < 1e-5   # the pragmatic-collapse identity
+
+
+def test_efe_terms_handle_zero_probability_without_nan():
+    q_log = torch.tensor([[[0.0, float("-inf")]]])
+    preference = torch.full((2,), -math.log(2.0))
+    risk, pred_ent = _efe_terms(q_log, preference)
+    assert torch.isfinite(risk).all() and torch.isfinite(pred_ent).all()
+    assert torch.allclose(risk, torch.full_like(risk, math.log(2.0)))
+    assert torch.equal(pred_ent, torch.zeros_like(pred_ent))
 
 
 def test_likelihood_entropy_ambiguity_equals_predictive_entropy():
@@ -136,6 +147,30 @@ def test_policy_posterior_matches_softmax_formula():
     assert torch.allclose(out.policy_posterior, manual, atol=1e-6)
 
 
+def test_policy_posterior_rejects_all_infinite_candidate_row():
+    score = torch.full((1, 4), float("inf"))
+    with pytest.raises(ValueError, match="no finite candidate"):
+        _policy_posterior(score, 1.0, None)
+
+
+def test_policy_posterior_rejects_nan_and_positive_infinity_with_row_indices():
+    score = torch.tensor([
+        [0.0, float("nan"), float("inf")],
+        [0.0, float("inf"), 1.0],
+        [0.0, float("-inf"), float("inf")],
+    ])
+    with pytest.raises(ValueError, match=r"NaN or \+inf.*rows \[0, 2\]"):
+        _policy_posterior(score, 1.0, None)
+
+
+def test_policy_posterior_retains_partial_negative_infinity_support():
+    score = torch.tensor([[0.0, float("inf"), 1.0]])
+    posterior = _policy_posterior(score, 1.0, None)
+    expected = torch.softmax(torch.tensor([[0.0, float("-inf"), -1.0]]), dim=-1)
+    assert torch.equal(posterior[:, 1], torch.zeros(1))
+    assert torch.allclose(posterior, expected)
+
+
 def test_logprob_control_scores_by_logprob_with_zero_efe_terms():
     m = _model()
     ctx = torch.tensor([[1, 2, 3, 4, 5]])
@@ -149,13 +184,45 @@ def test_logprob_control_scores_by_logprob_with_zero_efe_terms():
     assert torch.allclose(out.policy_posterior, torch.softmax(2.0 * out.log_prob, dim=-1), atol=1e-6)
 
 
-def test_gates_and_horizon_guards_raise():
+def test_logprob_control_does_not_double_count_base_prior():
+    m = _model()
+    ctx = torch.tensor([[1, 2, 3, 4, 5]])
+    cand = torch.tensor([[[0], [1], [2], [3]]])
+    base = torch.linspace(-1.0, 1.0, m.cfg.vocab_size).unsqueeze(0)
+    pref = get_preference("flat")(m.prior_bank)
+    menu_log_prior = torch.log_softmax(torch.gather(base, 1, cand.squeeze(-1)), dim=-1)
+    with torch.no_grad():
+        out = get_policy("logprob_control")(
+            ctx, cand, pref, m, gamma=1.0, log_prior=menu_log_prior, base_logits=base)
+    expected = torch.softmax(out.log_prob, dim=-1)
+    double_counted = torch.softmax(2.0 * out.log_prob, dim=-1)
+    assert torch.allclose(out.policy_posterior, expected, atol=1e-6)
+    assert not torch.allclose(out.policy_posterior, double_counted, atol=1e-6)
+
+
+def test_gates_and_horizon_guards_raise(monkeypatch):
+    from vfe3.inference import policy as policy_module
     m = _model()
     ctx = torch.tensor([[1, 2, 3, 4, 5]])
     cand, base = _menu(m, ctx, Kp=4)
     pref = get_preference("flat")(m.prior_bank)
+
+    def fail_rollout(*args, **kwargs):
+        pytest.fail("invalid one-step policy reached rollout")
+
+    monkeypatch.setattr(policy_module, "_rollout_predictive", fail_rollout)
     with pytest.raises(ValueError):                          # efe_one_step is H=1 only
         get_policy("efe_one_step")(ctx, cand, pref, m, horizon=2, base_logits=base)
+    for mode in ("efe_one_step", "logprob_control"):
+        cand2 = torch.randint(0, m.cfg.vocab_size, (1, 4, 2))
+        with pytest.raises(ValueError, match=r"candidate length L=2 must equal horizon=1"):
+            get_policy(mode)(ctx, cand2, pref, m, horizon=1, base_logits=base)
+        empty_candidates = torch.empty((1, 4, 0), dtype=torch.long)
+        with pytest.raises(ValueError, match=r"candidate length must be > 0, got L=0"):
+            get_policy(mode)(ctx, empty_candidates, pref, m, horizon=1, base_logits=base)
+        empty_context = torch.empty((1, 0), dtype=torch.long)
+        with pytest.raises(ValueError, match=r"context must be nonempty, got N=0"):
+            get_policy(mode)(empty_context, cand, pref, m, horizon=1, base_logits=base)
     # efe_rollout (H>1) is unlocked by the Phase-3a cache but REQUIRES it: this _model() (n_layers=2,
     # n_e_steps=2, e_phi_lr>0) is not cache-supported, so a correctly-shaped H=2 call still raises.
     cand2 = torch.randint(0, m.cfg.vocab_size, (1, 4, 2))
@@ -163,6 +230,11 @@ def test_gates_and_horizon_guards_raise():
         get_policy("efe_rollout")(ctx, cand2, pref, m, horizon=2)
     with pytest.raises(RuntimeError):                        # sigma_mc gated on the sigma-validation gate
         get_ambiguity("sigma_mc")(torch.log_softmax(torch.randn(1, 4, 16), dim=-1))
+
+
+def test_policy_context_validator_accepts_exact_boundary():
+    context = torch.ones((1, 7), dtype=torch.long)
+    assert _validate_policy_context(context, 1, 8) is None
 
 
 def test_sigma_mc_raise_names_flag_has_no_consumer():
@@ -188,6 +260,84 @@ def test_generate_policy_branch_dispatches_and_stays_in_vocab():
     assert torch.equal(seq[:, :3], prompt)                  # prompt preserved
 
 
+def test_policy_rejects_context_plus_candidate_over_limit(monkeypatch):
+    m = _model(policy_mode="efe_one_step", policy_preference="flat", max_seq_len=8)
+    context = torch.randint(0, m.cfg.vocab_size, (1, 8))
+
+    def fail_forward_beliefs(*args, **kwargs):
+        pytest.fail("overlength policy context reached base decode")
+
+    monkeypatch.setattr(m, "forward_beliefs", fail_forward_beliefs)
+    with pytest.raises(
+        ValueError,
+        match=r"context length N=8 plus candidate length L=1 exceeds max_seq_len=8",
+    ):
+        m.generate(context, max_new_tokens=1, greedy=True)
+
+
+def test_policy_menu_rejects_nonfinite_base_logits(monkeypatch):
+    from vfe3.inference import policy as policy_module
+    m = _model(
+        policy_mode="efe_one_step",
+        policy_preference="flat",
+        policy_top_k=4,
+    )
+    V = m.cfg.vocab_size
+    context = torch.randint(0, V, (2, 3))
+    injected = {"logits": torch.zeros(2, 1, V)}
+
+    def fake_forward_beliefs(
+        token_ids,
+        *,
+        return_logits=False,
+        decode_last=False,
+        **kwargs,
+    ):
+        assert return_logits and decode_last
+        return None, injected["logits"]
+
+    monkeypatch.setattr(m, "forward_beliefs", fake_forward_beliefs)
+
+    def fake_get_policy(name):
+        def fake_policy(context, candidates, preference, model, **kwargs):
+            B, Kp = candidates.shape[:2]
+            zeros = torch.zeros(B, Kp)
+            posterior = torch.zeros(B, Kp)
+            posterior[:, 0] = 1.0
+            return PolicyScore(zeros, zeros, zeros, zeros, zeros, posterior)
+        return fake_policy
+
+    monkeypatch.setattr(policy_module, "get_policy", fake_get_policy)
+
+    injected["logits"] = torch.zeros(2, 1, V)
+    injected["logits"][0] = float("-inf")
+    with pytest.raises(ValueError, match=r"policy base logits have no finite value in rows \[0\]"):
+        m._policy_select(context, greedy=True)
+
+    injected["logits"] = torch.zeros(2, 1, V)
+    injected["logits"][0, 0, 0] = float("nan")
+    injected["logits"][1, 0, 1] = float("inf")
+    with pytest.raises(
+        ValueError,
+        match=r"policy base logits contain NaN or \+inf values in rows \[0, 1\]",
+    ):
+        m._policy_select(context, greedy=True)
+
+    injected["logits"] = torch.zeros(2, 1, V)
+    injected["logits"][0] = float("-inf")
+    injected["logits"][0, 0, 0] = 0.0
+    with pytest.raises(
+        ValueError,
+        match=r"policy menu logits contain non-finite retained values in rows \[0\]",
+    ):
+        m._policy_select(context, greedy=True)
+
+    injected["logits"] = torch.full((2, 1, V), float("-inf"))
+    injected["logits"][:, :, :4] = torch.arange(4, dtype=torch.float32)
+    selected = m._policy_select(context, greedy=True)
+    assert selected.shape == (2, 1)                        # filtered-out -inf remains valid
+
+
 def test_preference_builders():
     m = _model()
     V = 16
@@ -198,7 +348,16 @@ def test_preference_builders():
     task = get_preference("task")(m.prior_bank, goal=3, beta_C=5.0, support=support)
     p = task.exp()
     assert int(p.argmax()) == 3
-    assert float(p[8:].sum()) < 1e-5                         # non-support tokens carry ~0 mass
+    assert torch.isneginf(task[8:]).all()                    # default support remains exact/hard
+    finite_task = get_preference("task")(
+        m.prior_bank, goal=3, beta_C=5.0, support=support, support_floor=-30.0)
+    assert torch.isfinite(finite_task).all()
+    assert torch.allclose(finite_task.exp().sum(), torch.tensor(1.0), atol=1e-6)
+    assert float(finite_task.exp()[8:].sum()) < 1e-5         # explicit finite-floor preference
+    for bad_floor in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="support_floor"):
+            get_preference("task")(
+                m.prior_bank, goal=3, beta_C=5.0, support=support, support_floor=bad_floor)
     # batched goal -> (B, V)
     task_b = get_preference("task")(m.prior_bank, goal=torch.tensor([1, 4]), beta_C=5.0)
     assert task_b.shape == (2, V)

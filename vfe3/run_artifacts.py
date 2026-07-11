@@ -7,7 +7,7 @@ A training run produces a self-contained directory::
       metrics.csv        one row per periodic eval (step, train_loss, lr, val_ce/ppl/bpc, diagnostics)
       checkpoints/
         step_<N>.pt      resumable {step, model_state, optimizer_state, config}
-      best_model.pt      model.state_dict() at the lowest validation PPL seen so far
+      best_model.pt      {model_state, config, config_fingerprint} at the lowest validation PPL
       test_results.json  end-of-run TEST-split eval on the reloaded best checkpoint
       summary.json       headline numbers (best_val_ppl, test_ppl, wall_time, ...)
       loss_curve.png     training cross-entropy trajectory
@@ -24,19 +24,38 @@ survive a viz problem.
 """
 
 import csv
+import hashlib
 import json
 import logging
 import math
 import os
+import shutil
+import subprocess
 import time
 from dataclasses import asdict
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from pathlib import Path, PureWindowsPath
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import torch
 
 from vfe3.config import VFE3Config
 from vfe3.ema import EMA
+from vfe3.runtime import deterministic_state
+
+
+def _require_nonnegative_int(value: object, field: str) -> int:
+    """Return an exact nonnegative integer cursor; reject coercible lookalikes."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"data_state {field} must be a non-negative integer")
+    return value
+
+
+def semantic_config_fingerprint(
+    config: Mapping[str, Any],
+) -> str:
+    """Return the stable SHA-256 fingerprint of a normalized semantic config mapping."""
+    normalized = json.dumps(dict(config), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _atomic_replace(
@@ -119,6 +138,11 @@ class RunArtifacts:
 
         Atomic: written to a same-directory ``.tmp`` then published via ``os.replace``, so a crash
         mid-write can never leave a truncated/partial JSON at the final name."""
+        candidate         = Path(name)
+        windows_candidate = PureWindowsPath(name)
+        if (not name or name in {".", ".."} or "/" in name or "\\" in name
+                or candidate.name != name or candidate.is_absolute() or windows_candidate.drive):
+            raise ValueError(f"artifact name must be a regular bare filename, got {name!r}")
         path = self.run_dir / name
         tmp  = self.run_dir / (name + ".tmp")
         tmp.write_text(json.dumps(obj, indent=2, default=str))
@@ -146,15 +170,21 @@ class RunArtifacts:
             csv.DictWriter(fh, fieldnames=self._fieldnames).writerow(csv_row)
 
     def maybe_save_best(self, step: int, model: torch.nn.Module, val_ppl: float) -> bool:
-        r"""Save ``model.state_dict()`` to ``best_model.pt`` iff ``val_ppl`` is a new minimum.
+        r"""Save weights bound to their semantic config iff ``val_ppl`` is a new minimum.
 
         Atomic (same-dir tmp + ``os.replace``): a crash or Windows lock mid-save can never leave a
         corrupt/unreadable ``best_model.pt`` where a good one stood."""
         if val_ppl < self.best_val_ppl:
             self.best_val_ppl = float(val_ppl)
             self.best_step = int(step)
+            config = asdict(self.cfg)
+            bundle = {
+                "model_state":        model.state_dict(),
+                "config":             config,
+                "config_fingerprint": semantic_config_fingerprint(config),
+            }
             tmp = self.best_path.with_suffix(".pt.tmp")
-            torch.save(model.state_dict(), tmp)
+            torch.save(bundle, tmp)
             _atomic_replace(self.best_path, tmp)
             return True
         return False
@@ -256,8 +286,10 @@ class RunArtifacts:
         cfg:       VFE3Config,
 
         *,
-        scaler:    Optional['torch.amp.GradScaler'] = None,
-        ema:       Optional[EMA]                     = None,
+        scaler:               Optional['torch.amp.GradScaler'] = None,
+        ema:                  Optional[EMA]                     = None,
+        metropolis_generator: Optional[torch.Generator]         = None,
+        data_state:            Optional[Dict[str, object]]       = None,
     ) -> Path:
         r"""Write a resumable ``checkpoints/step_<N>.pt`` (model + optimizer + RNG + config + step).
 
@@ -271,6 +303,10 @@ class RunArtifacts:
         ``best_val_ppl``/``best_step`` (audit 2026-07-01 C2): the model-selection state is bundled
         so a resumed run reports the run-wide best, not just the continuation's best. The write is
         atomic (same-dir tmp + ``os.replace``) so a crash never leaves a corrupt ``step_<N>.pt``.
+        ``metropolis_generator`` carries the private accept/reject stream independently of the
+        global CPU/CUDA RNG so a resumed discrete-reflection sweep continues at the next draw.
+        ``data_state`` records the current epoch's starting loader-generator state and cursor;
+        the state tensor is cloned into the bundle so later generator advances cannot mutate it.
         """
         path = self.ckpt_dir / f"step_{step}.pt"
         tmp  = path.with_suffix(".pt.tmp")
@@ -278,17 +314,30 @@ class RunArtifacts:
             "cpu":  torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
+        saved_data_state = None
+        if data_state is not None:
+            batches_consumed = _require_nonnegative_int(
+                data_state["batches_consumed"], "batches_consumed")
+            epoch = _require_nonnegative_int(data_state["epoch"], "epoch")
+            saved_data_state = {
+                "epoch_start_generator_state": data_state["epoch_start_generator_state"].clone(),
+                "batches_consumed":            batches_consumed,
+                "epoch":                       epoch,
+            }
         torch.save({
             "step":            int(step),
             "model_state":     model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "rng_state":       rng_state,
+            "metropolis_rng_state": (metropolis_generator.get_state()
+                                      if metropolis_generator is not None else None),
             "config":          asdict(cfg),
             "scaler_state":    (scaler.state_dict()
                                 if scaler is not None and scaler.is_enabled() else None),
             "ema_state":       (ema.state_dict() if ema is not None else None),
             "best_val_ppl":    float(self.best_val_ppl),
             "best_step":       self.best_step,
+            "data_state":      saved_data_state,
         }, tmp)
         _atomic_replace(path, tmp)
         return path
@@ -300,21 +349,25 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
 
     *,
-    map_location: 'Optional[str | torch.device]'        = None,
-    restore_rng:  bool                                   = True,
-    scaler:       Optional['torch.amp.GradScaler']       = None,
-    cfg:          Optional[VFE3Config]                   = None,
-    ema:          Optional[EMA]                          = None,
-    artifacts:    'Optional[RunArtifacts]'               = None,
+    map_location:         'Optional[str | torch.device]'   = None,
+    restore_rng:          bool                             = True,
+    scaler:               Optional['torch.amp.GradScaler'] = None,
+    cfg:                  Optional[VFE3Config]             = None,
+    ema:                  Optional[EMA]                    = None,
+    artifacts:            'Optional[RunArtifacts]'         = None,
+    metropolis_generator: Optional[torch.Generator]        = None,
+    data_state:            Optional[Dict[str, object]]      = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
     This is the LOAD half of the resumable checkpoint. It always restores the model weights;
     it restores the AdamW optimizer state (momentum buffers + per-parameter step counts) when an
-    ``optimizer`` is supplied, and the CPU/CUDA RNG when ``restore_rng`` is set and the bundle
-    carries it (checkpoints written before RNG was persisted simply skip that step). The returned
-    integer is the number of completed M-steps; ``train(resume_from=...)`` uses it to rebuild the
-    cosine ``LambdaLR`` at the saved step and to start the loop from there.
+    ``optimizer`` is supplied, then reapplies that optimizer's current non-parameter group metadata
+    so the current config remains authoritative. The CPU/CUDA RNG and the optional private
+    ``metropolis_generator`` are restored when ``restore_rng`` is set and the bundle carries their
+    states (older checkpoints simply skip absent RNG fields). The returned integer is the number of
+    completed M-steps; ``train(resume_from=...)`` uses it to rebuild the cosine ``LambdaLR`` at the
+    saved step and to start the loop from there.
 
     ``scaler`` (audit 2026-06-09 IE3): when given AND the bundle carries a saved scaler state,
     the fp16 GradScaler's scale/growth counters are restored (bundles written before the scaler
@@ -324,7 +377,8 @@ def load_checkpoint(
     shape-changing divergence, but shape-preserving semantic drift (LR schedule, n_e_steps,
     e_*_lr, ...) would otherwise pass silently. ``artifacts`` (audit 2026-07-01 C2): when given,
     the bundled ``best_val_ppl``/``best_step`` model-selection state is restored into it (bundles
-    without those fields skip the restore).
+    without those fields skip the restore). When a mutable ``data_state`` mapping is supplied, it
+    is filled from the bundled iterator cursor; older checkpoints leave it empty.
 
     The bundle is loaded with ``weights_only=True`` by default, which refuses to execute arbitrary
     pickle reductions: our bundle carries only tensors, an ``asdict`` config dict, and RNG tensors
@@ -334,11 +388,14 @@ def load_checkpoint(
     the legacy ``weights_only=False`` load -- only use that for a checkpoint you trust, since that
     path can execute arbitrary code embedded in the pickle.
     """
+    checkpoint_path = Path(path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"checkpoint file not found: {checkpoint_path}")
     if map_location is None:
         map_location = next(model.parameters()).device
     trust = bool(getattr(cfg, "trust_resume_checkpoint", False))
     try:
-        ckpt = torch.load(Path(path), map_location=map_location, weights_only=True)
+        ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
     except Exception as exc:                                    # safe load rejected a non-tensor object
         if not trust:
             raise RuntimeError(
@@ -347,10 +404,22 @@ def load_checkpoint(
                 f"trust_resume_checkpoint=True to allow the legacy weights_only=False load (which can "
                 f"execute arbitrary code embedded in the pickle)."
             ) from exc
-        ckpt = torch.load(Path(path), map_location=map_location, weights_only=False)
+        ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    saved_data_state = ckpt.get("data_state")
+    if saved_data_state is not None:
+        saved_batches_consumed = _require_nonnegative_int(
+            saved_data_state["batches_consumed"], "batches_consumed")
+        saved_epoch = _require_nonnegative_int(saved_data_state["epoch"], "epoch")
     model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
+        fresh = [{k: v for k, v in group.items() if k != "params"}
+                 for group in optimizer.param_groups]
         optimizer.load_state_dict(ckpt["optimizer_state"])
+        for group, metadata in zip(optimizer.param_groups, fresh):
+            params = group["params"]
+            group.clear()
+            group.update(metadata)
+            group["params"] = params
     if scaler is not None and ckpt.get("scaler_state") is not None:
         scaler.load_state_dict(ckpt["scaler_state"])
     # EMA shadow: restore it so a resumed run continues the SAME running average instead of re-seeding
@@ -395,65 +464,162 @@ def load_checkpoint(
         torch.set_rng_state(rng["cpu"].cpu() if hasattr(rng["cpu"], "cpu") else rng["cpu"])
         if rng.get("cuda") is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
+    if restore_rng and metropolis_generator is not None and ckpt.get("metropolis_rng_state") is not None:
+        metro_state = ckpt["metropolis_rng_state"]
+        metropolis_generator.set_state(
+            metro_state.cpu() if hasattr(metro_state, "cpu") else metro_state)
+    if data_state is not None:
+        data_state.clear()
+        if saved_data_state is not None:
+            data_state.update({
+                "epoch_start_generator_state": saved_data_state["epoch_start_generator_state"],
+                "batches_consumed":            saved_batches_consumed,
+                "epoch":                       saved_epoch,
+            })
     return int(ckpt["step"])
 
 
-def _write_provenance(
-    artifacts:   RunArtifacts,
-    cfg:         VFE3Config,
-    model:       torch.nn.Module,
-    test_loader: Optional[Iterable],
-    logger:      logging.Logger,
-) -> None:
-    r"""Best-effort ``provenance.json``: git SHA + dirty flag, library/CUDA versions, the data hash,
-    and the seed -- so two runs with an identical ``config.json`` are still distinguishable by CODE
-    and DATA state (the reproducibility gap a config-only record leaves open). Every probe is
-    guarded; a missing git binary or uncacheable loader simply records ``None``."""
-    import hashlib
-    import subprocess
+def _git_environment(
+    git_executable: str,
+) -> Dict[str, str]:
+    r"""Minimal noninteractive environment for bounded Git provenance probes."""
+    env = {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": str(Path(git_executable).resolve().parent),
+    }
+    for name in ("COMSPEC", "PATHEXT", "SYSTEMROOT", "WINDIR"):
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
+    return env
 
-    prov: Dict[str, object] = {
-        "seed":          cfg.seed,
-        "n_params":      int(sum(p.numel() for p in model.parameters())),
-        "torch_version": torch.__version__,
-        "cuda_version":  torch.version.cuda,
-        "device_name":   (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
+
+def _git_code_identity(
+    root: Optional[Path] = None,
+) -> Dict[str, object]:
+    r"""Return HEAD plus an exact dirty-tree fingerprint, or a persisted probe error."""
+    repo = Path(__file__).resolve().parent.parent if root is None else Path(root).resolve()
+    identity: Dict[str, object] = {
+        "git_sha":               None,
+        "git_dirty":             None,
+        "git_dirty_fingerprint": None,
     }
     try:
-        root = Path(__file__).resolve().parent.parent
-        prov["git_sha"] = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=str(root), stderr=subprocess.DEVNULL).decode().strip()
-        prov["git_dirty"] = bool(subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=str(root), stderr=subprocess.DEVNULL).decode().strip())
-    except Exception:
-        prov["git_sha"], prov["git_dirty"] = None, None
-    try:                                                        # content hash of the token stream
-        ds = getattr(test_loader, "dataset", None)
-        toks = getattr(ds, "tokens", None)
-        if toks is not None:
-            prov["data_sha256"]   = hashlib.sha256(toks.detach().cpu().numpy().tobytes()).hexdigest()
-            prov["data_n_tokens"] = int(toks.numel())
-    except Exception:
-        pass
+        git_executable = shutil.which("git")
+        if git_executable is None:
+            raise FileNotFoundError("git executable was not found on PATH")
+        env = _git_environment(git_executable)
+
+        def _git(*args: str) -> bytes:
+            return subprocess.check_output(
+                [git_executable,
+                 "-c", "core.fsmonitor=false",
+                 "-c", f"safe.directory={repo.as_posix()}",
+                 *args],
+                cwd=str(repo),
+                env=env,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+
+        identity["git_sha"] = _git("rev-parse", "HEAD").decode("ascii").strip()
+        status = _git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        identity["git_dirty"] = bool(status)
+        if status:
+            diff = _git("diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--")
+            untracked = _git("ls-files", "--others", "--exclude-standard", "-z")
+            digest = hashlib.sha256()
+            digest.update(b"status\0")
+            digest.update(status)
+            digest.update(b"\0diff\0")
+            digest.update(diff)
+            digest.update(b"\0untracked\0")
+            for raw_name in (name for name in untracked.split(b"\0") if name):
+                path = repo / os.fsdecode(raw_name)
+                digest.update(raw_name)
+                digest.update(b"\0")
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+            identity["git_dirty_fingerprint"] = digest.hexdigest()
+    except Exception as exc:
+        identity["git_sha"] = None
+        identity["git_dirty"] = None
+        identity["git_dirty_fingerprint"] = None
+        identity["git_error"] = repr(exc)
+    return identity
+
+
+def _write_provenance(
+    artifacts: RunArtifacts,
+    cfg:       VFE3Config,
+    model:     torch.nn.Module,
+    logger:    logging.Logger,
+
+    *,
+    train_loader:  Optional[Iterable] = None,
+    val_loader:    Optional[Iterable] = None,
+    test_loader:   Optional[Iterable] = None,
+    data_seed:     Optional[int]      = None,
+    max_tokens:    Optional[int]      = None,
+    tokenizer_tag: Optional[str]      = None,
+) -> None:
+    r"""Write code, environment, per-split data, and data-order provenance best-effort."""
+
+    prov: Dict[str, object] = {
+        "seed":                cfg.seed,
+        "deterministic_state": deterministic_state(),
+        "n_params":            int(sum(p.numel() for p in model.parameters())),
+        "torch_version":       torch.__version__,
+        "cuda_version":        torch.version.cuda,
+        "device_name":         (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
+        "data_seed":           (int(data_seed) if data_seed is not None else None),
+        "max_tokens":          (int(max_tokens) if max_tokens is not None else None),
+        "tokenizer_tag":       tokenizer_tag,
+    }
+    prov.update(_git_code_identity())
+    for split, loader in (("train", train_loader), ("val", val_loader), ("test", test_loader)):
+        sha_key = f"{split}_data_sha256"
+        n_key = f"{split}_data_n_tokens"
+        prov[sha_key], prov[n_key] = None, None
+        try:
+            dataset = getattr(loader, "dataset", None)
+            tokens = getattr(dataset, "tokens", None)
+            if tokens is not None:
+                raw = tokens.detach().cpu().numpy().tobytes()
+                prov[sha_key] = hashlib.sha256(raw).hexdigest()
+                prov[n_key] = int(tokens.numel())
+        except Exception:
+            pass
+    # Backward-compatible held-out aliases consumed by existing scaling-analysis artifacts.
+    prov["data_sha256"] = prov["test_data_sha256"]
+    prov["data_n_tokens"] = prov["test_data_n_tokens"]
     artifacts.save_json("provenance.json", prov)
     logger.info("wrote provenance.json (git_sha=%s dirty=%s)", prov.get("git_sha"), prov.get("git_dirty"))
 
 
 @torch.no_grad()
 def _calibration_and_strata(
-    model:       torch.nn.Module,
-    test_loader: Iterable,
-    device:      torch.device,
+    corpus_counts: torch.Tensor,             # (V,) training-corpus unigram counts
+
+    model:         torch.nn.Module,
+    test_loader:   Iterable,
+    device:        torch.device,
 
     *,
     max_batches: int = 20,
     n_bins:      int = 15,
 ) -> Dict[str, object]:
-    r"""Decode calibration (ECE + reliability curve) and token-frequency-stratified CE over the test
+    r"""Decode calibration (ECE + reliability curve) and corpus-frequency-stratified CE over the test
     split. The decode is non-standard (KL-to-prior Mahalanobis or mu @ W^T with Sigma feeding the
     logit scale), so a mis-scaled ``decode_log_scale`` can leave PPL acceptable while the probability
-    mass is wrong -- PPL alone cannot catch it. The frequency strata expose prior-table tail
-    stagnation (rare-token rows may be undertrained). Off-graph; capped at ``max_batches``."""
+    mass is wrong -- PPL alone cannot catch it. Bucket cutoffs are quantiles over the positive-count
+    token types in the complete training corpus; sampled target duplication cannot move them, and
+    evaluation targets unseen in training are rare. The aggregated values remain sampled held-out CE.
+    The strata expose prior-table tail stagnation. Off-graph; capped at ``max_batches``."""
     import torch.nn.functional as F
 
     confs, corrects, nats, tgts = [], [], [], []
@@ -485,15 +651,26 @@ def _calibration_and_strata(
             acc, cf, w = corr[m].mean(), conf[m].mean(), m.float().mean()
             ece += float(w * (acc - cf).abs())
             rel.append({"conf": float(cf), "acc": float(acc), "frac": float(w)})
-    counts = torch.bincount(tg, minlength=int(tg.max()) + 1).float()
-    tok_count = counts[tg]                                      # unigram count of each token's target
-    q1, q2 = torch.quantile(tok_count, torch.tensor([1 / 3, 2 / 3], device=tok_count.device)).tolist()
+    if corpus_counts.ndim != 1:
+        raise ValueError("corpus_counts must be a one-dimensional training-corpus bincount")
+    counts = corpus_counts.to(device=tg.device)
+    if int(tg.max()) >= counts.numel():
+        raise ValueError("corpus_counts does not cover every sampled evaluation target")
+    positive_counts = counts[counts > 0].float()
+    if positive_counts.numel() == 0:
+        q1, q2 = 0.0, 0.0
+    else:
+        quantiles = positive_counts.new_tensor([1 / 3, 2 / 3])
+        q1, q2 = torch.quantile(positive_counts, quantiles).tolist()
+    tok_count = counts[tg].float()                              # training-corpus count of each target
+    seen = tok_count > 0
     strata = {}
-    for name, mask in (("rare", tok_count <= q1),
-                       ("mid", (tok_count > q1) & (tok_count <= q2)),
-                       ("frequent", tok_count > q2)):
+    for name, mask in (("rare", (~seen) | (tok_count <= q1)),
+                       ("mid", seen & (tok_count > q1) & (tok_count <= q2)),
+                       ("frequent", seen & (tok_count > q2))):
         strata[name] = float(nat[mask].mean()) if mask.any() else float("nan")
-    return {"ece": ece, "reliability": rel, "overall_ce": float(nat.mean()), "freq_strata_ce": strata}
+    return {"ece": ece, "reliability": rel, "overall_ce": float(nat.mean()),
+            "corpus_freq_strata_ce": strata}
 
 
 def _fd_gradient_check(
@@ -548,6 +725,7 @@ def _write_research_artifacts(
     model:       torch.nn.Module,
     artifacts:   RunArtifacts,
     cfg:         VFE3Config,
+    train_loader: Optional[Iterable],
     test_loader: Optional[Iterable],
     device:      torch.device,
     logger:      logging.Logger,
@@ -559,7 +737,15 @@ def _write_research_artifacts(
         return
     out: Dict[str, object] = {}
     try:
-        out.update(_calibration_and_strata(model, test_loader, device))
+        train_dataset = getattr(train_loader, "dataset", None)
+        train_tokens = getattr(train_dataset, "tokens", None)
+        if train_tokens is None:
+            raise ValueError("training loader dataset does not expose corpus tokens")
+        corpus_counts = torch.bincount(
+            train_tokens.detach().reshape(-1).to(device="cpu", dtype=torch.long),
+            minlength=int(cfg.vocab_size),
+        )
+        out.update(_calibration_and_strata(corpus_counts, model, test_loader, device))
     except Exception as exc:
         logger.warning("calibration/strata probe failed (%s); skipped", exc)
     try:
@@ -665,11 +851,16 @@ def finalize_run(
     cfg:         VFE3Config,
 
     *,
-    test_loader:     Optional[Iterable] = None,
-    losses:          Optional[List[float]] = None,
-    tokens_per_char: float = 1.0,           # test BPC char-correction (1.0 = bits/token)
-    device:          Optional[torch.device] = None,
-    wall_time:       Optional[float] = None,
+    tokens_per_char: float                    = 1.0,   # test BPC char-correction (1.0 = bits/token)
+    train_loader:    Optional[Iterable]       = None,
+    val_loader:      Optional[Iterable]       = None,
+    test_loader:     Optional[Iterable]       = None,
+    losses:          Optional[List[float]]    = None,
+    data_seed:       Optional[int]            = None,
+    max_tokens:      Optional[int]            = None,
+    tokenizer_tag:   Optional[str]            = None,
+    device:          Optional[torch.device]   = None,
+    wall_time:       Optional[float]          = None,
     logger:          Optional[logging.Logger] = None,
 ) -> Dict[str, object]:
     r"""Reload the best-val checkpoint, score the TEST split, and write summary + figures.
@@ -687,10 +878,23 @@ def finalize_run(
 
     reloaded_best = False
     if artifacts.best_path.exists():
-        # best_model.pt is a pure state_dict (torch.save(model.state_dict(), ...)), so weights_only=True
-        # loads it identically while refusing arbitrary pickle execution on a tampered checkpoint
-        # (matches the datasets.py precedent).
-        model.load_state_dict(torch.load(artifacts.best_path, map_location=device, weights_only=True))
+        bundle = torch.load(artifacts.best_path, map_location=device, weights_only=True)
+        if not isinstance(bundle, Mapping) or not {
+                "model_state", "config", "config_fingerprint"}.issubset(bundle):
+            raise ValueError(
+                f"best checkpoint {artifacts.best_path} is not a semantic best-model bundle")
+        saved_config = bundle["config"]
+        if not isinstance(saved_config, Mapping):
+            raise ValueError(
+                f"best checkpoint {artifacts.best_path} has a non-mapping config")
+        saved_fingerprint = semantic_config_fingerprint(saved_config)
+        if bundle["config_fingerprint"] != saved_fingerprint:
+            raise ValueError(
+                f"best checkpoint {artifacts.best_path} has a config fingerprint mismatch")
+        if saved_fingerprint != semantic_config_fingerprint(asdict(cfg)):
+            raise ValueError(
+                f"best checkpoint {artifacts.best_path} does not match the active config")
+        model.load_state_dict(bundle["model_state"])
         reloaded_best = True
         logger.info("Reloaded best-val checkpoint (step %s, val PPL %.3f) for test eval",
                     artifacts.best_step, artifacts.best_val_ppl)
@@ -745,7 +949,18 @@ def finalize_run(
     # Reproducibility provenance (git SHA / data hash / versions) + a scaling-law data point -- the
     # externally-grounded records a config-only artifact omits (identical config.json can come from
     # different code and data, and a single run carries no (N, tokens, FLOPs, loss) frontier point).
-    _write_provenance(artifacts, cfg, model, test_loader, logger)
+    _write_provenance(
+        artifacts,
+        cfg,
+        model,
+        logger,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        data_seed=data_seed,
+        max_tokens=max_tokens,
+        tokenizer_tag=tokenizer_tag,
+    )
     n_params = int(sum(p.numel() for p in model.parameters()))
     tokens_seen = int(cfg.max_steps) * int(cfg.batch_size) * int(cfg.max_seq_len)
     # scaling-law data point: the 6ND FLOP proxy is LOOSE for a no-NN E-step model, so record the
@@ -790,10 +1005,10 @@ def finalize_run(
     except Exception as exc:
         logger.warning("pure-path report failed (%s); skipped", exc)
 
-    # Research artifacts (decode calibration / frequency-stratified loss / FD gradient check) -- the
+    # Research artifacts (decode calibration / corpus-frequency-stratified loss / FD gradient check) --
     # externally-grounded probes that do NOT presuppose the gauge framework. Best-effort, AFTER the
     # test-eval n_e_steps restore so the model is in its trained state. Run before the figure pass.
-    _write_research_artifacts(model, artifacts, cfg, test_loader, device, logger)
+    _write_research_artifacts(model, artifacts, cfg, train_loader, test_loader, device, logger)
 
     _save_figures(artifacts, losses, logger)
     # Single-run publication figure set (model-replay), auto-run at the end of training unless
@@ -877,6 +1092,16 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "rope_on_value":                bool(cfg.rope_on_value),
             "lambda_gamma":                 float(cfg.lambda_gamma),
             "s_e_step":                     bool(cfg.s_e_step),
+            # Truthful fixed-surrogate ledger (C6): these derived booleans expose when the run
+            # intentionally freezes a state-dependent quantity rather than following its full
+            # joint objective. Defaults are False, preserving the pure path.
+            "fixed_covariance_surrogate":   bool(getattr(cfg, "skip_belief_sigma_update", False)),
+            "detached_precision_prior":     bool(cfg.precision_weighted_attention),
+            "detached_query_adaptive_tau":  bool(getattr(cfg, "query_adaptive_tau", False)),
+            "state_dependent_alpha_majorizer": (
+                getattr(cfg, "e_step_update", "gradient") == "mm_exact"
+                and cfg.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord")
+            ),
             # regime_ii_covariant under gaussian_diagonal is a CONTROLLED APPROXIMATION (the
             # diagonal cone is not closed under GL congruence Omega Sigma Omega^T -- audit C5),
             # so a diagonal covariant run is never reported as exact Route B.
@@ -1016,9 +1241,17 @@ def _save_figures(
                 figs.plt.close(fig)
         # E-step belief-gradient decomposition (mu / sigma / phi): the INFERENCE analogue of the M-step
         # figure above -- ||grad F|| over the belief tuple per inner-loop component, logged by train_step
-        # from model.forward's estep_grad_out. Same presence gate; independent of the M-step columns (a
-        # component may be present in one and absent in the other), so build its own row set.
-        eg_keys = ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi")
+        # from model.forward's estep_grad_out. Accumulated runs prefer the explicitly named arithmetic
+        # microbatch means; single-batch runs retain the historical column names. Same presence gate;
+        # independent of the M-step columns, so build its own row set.
+        eg_mean_keys = (
+            "estep_grad_norm_mu_microbatch_mean",
+            "estep_grad_norm_sigma_microbatch_mean",
+            "estep_grad_norm_phi_microbatch_mean",
+        )
+        eg_keys = (eg_mean_keys if any(any(k in r for k in eg_mean_keys)
+                                      for r in artifacts.history)
+                   else ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi"))
         eg_present = [k for k in eg_keys
                       if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
         if eg_present:

@@ -16,7 +16,7 @@ import torch
 
 from vfe3.belief import BeliefState
 from vfe3.families.base import get_family
-from vfe3.free_energy import attention_weights, pairwise_energy
+from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.transport import (
     compute_transport_operators,
@@ -42,15 +42,15 @@ def _setup(N=4, K=2, seed=0, device=torch.device("cpu")):
 
 def _frozen_intermediates(mu, sigma, omega, tau=1.5, log_prior=None):
     """The SAME frozen (start-point) intermediates the kernel/mm build: transported key
-    moments, masked beta, constant-alpha coefficient."""
+    moments, raw beta, destination-energy mask, and constant-alpha coefficient."""
     fam = get_family("gaussian_diagonal")
     mu_t = transport_mean(omega, mu)
     sigma_t = transport_covariance(omega, sigma, diagonal_out=True)
     energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0)
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)
-    beta_m = beta * ((energy > 0.0) & (energy < 100.0)).to(beta.dtype)
+    pair_mask = ((energy > 0.0) & (energy < 100.0)).to(beta.dtype)
     coef = torch.ones(mu.shape[0], 1, device=mu.device)
-    return mu_t, sigma_t, beta_m, coef
+    return mu_t, sigma_t, beta, pair_mask, coef
 
 
 # --- (a) mm_exact stationarity ----------------------------------------------
@@ -58,10 +58,11 @@ def _frozen_intermediates(mu, sigma, omega, tau=1.5, log_prior=None):
 def test_mm_exact_stationarity_frozen_beta(device):
     mu, sigma, mu_p, sigma_p, omega, grp, _ = _setup(device=device)
     mu_star, sigma_star = mm_exact_update(mu, sigma, mu_p, sigma_p, omega, tau=1.5)
-    mu_t, sigma_t, beta_m, coef = _frozen_intermediates(mu, sigma, omega, tau=1.5)
+    mu_t, sigma_t, beta, pair_mask, coef = _frozen_intermediates(mu, sigma, omega, tau=1.5)
     # the analytic kernel gradients AT (mu*, sigma*) with FROZEN beta / transported moments
     g_mu, g_sigma = get_kernel("gaussian_diagonal")(
-        mu_star, sigma_star, mu_p, sigma_p, mu_t, sigma_t, beta_m, coef)
+        mu_star, sigma_star, mu_p, sigma_p, mu_t, sigma_t, beta, coef,
+        pair_mask=pair_mask)
     assert torch.allclose(g_mu, torch.zeros_like(g_mu), atol=1e-4)
     assert torch.allclose(g_sigma, torch.zeros_like(g_sigma), atol=1e-4)
 
@@ -73,11 +74,30 @@ def test_mm_exact_stationarity_folds_twohop(device):
     lt = 0.7
     mu_star, sigma_star = mm_exact_update(mu, sigma, mu_p, sigma_p, omega, tau=1.5,
                                           lambda_twohop=lt)
-    mu_t, sigma_t, beta_m, coef = _frozen_intermediates(mu, sigma, omega, tau=1.5)
+    mu_t, sigma_t, beta, pair_mask, coef = _frozen_intermediates(mu, sigma, omega, tau=1.5)
     g_mu, g_sigma = get_kernel("gaussian_diagonal")(
-        mu_star, sigma_star, mu_p, sigma_p, mu_t, sigma_t, beta_m, coef, lambda_twohop=lt)
+        mu_star, sigma_star, mu_p, sigma_p, mu_t, sigma_t, beta, coef,
+        lambda_twohop=lt, pair_mask=pair_mask)
     assert torch.allclose(g_mu, torch.zeros_like(g_mu), atol=1e-4)
     assert torch.allclose(g_sigma, torch.zeros_like(g_sigma), atol=1e-4)
+
+    # Independent scalar truth for the adapted raw-beta fixture: beta and the clamp mask are frozen
+    # at the majorization point, so their entropy contributes no derivative. The MM point must also
+    # zero autograd of that scalar, not merely agree with the hand kernel implementation.
+    mu_q = mu_star.detach().requires_grad_(True)
+    sigma_q = sigma_star.detach().requires_grad_(True)
+    fam = get_family("gaussian_diagonal")
+    self_div = self_divergence_for_alpha(
+        fam(mu_q, sigma_q), fam(mu_p, sigma_p), alpha=1.0,
+    )
+    energy = pairwise_energy(fam(mu_q, sigma_q), fam(mu_t, sigma_t), alpha=1.0)
+    w2 = beta.detach() @ beta.detach()
+    scalar = (self_div.sum()
+              + (beta.detach() * pair_mask * energy).sum()
+              + lt * (w2 * pair_mask * energy).sum())
+    g_mu_ref, g_sigma_ref = torch.autograd.grad(scalar, [mu_q, sigma_q])
+    assert torch.allclose(g_mu_ref, torch.zeros_like(g_mu_ref), atol=1e-4)
+    assert torch.allclose(g_sigma_ref, torch.zeros_like(g_sigma_ref), atol=1e-4)
 
 
 # --- (b) mm_exact monotonicity ----------------------------------------------

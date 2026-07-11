@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -189,8 +190,23 @@ def write_sigma_gate_artifact(
     slug = re.sub(r"[^A-Za-z0-9._-]", "_", checkpoint_id).strip("._") or "artifact"
     h    = hashlib.sha1(checkpoint_id.encode("utf-8")).hexdigest()[:8]
     path = os.path.join(out_dir, f"{slug}__{h}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    tmp  = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=out_dir,
+            prefix=os.path.basename(path) + ".", suffix=".tmp", delete=False,
+        ) as f:
+            tmp = f.name
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
     return path
 
 

@@ -672,3 +672,89 @@ def test_omega_direct_reflection_cross_check_fail_closed():
     # accept init_seed where it is group-correct
     assert VFE3Config(embed_dim=4, n_heads=1, gauge_group="so_k", **base).omega_reflection == "init_seed"
     assert VFE3Config(embed_dim=4, n_heads=1, gauge_group="glk", **base).omega_reflection == "init_seed"
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), float("-inf")])
+def test_constant_lambda_alpha_requires_finite_nonnegative_value(value):
+    with pytest.raises(ValueError, match="lambda_alpha"):
+        VFE3Config(lambda_alpha_mode="constant", lambda_alpha=value)
+    assert VFE3Config(lambda_alpha_mode="constant", lambda_alpha=0.0).lambda_alpha == 0.0
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_rope_base_requires_finite_positive_value(value):
+    with pytest.raises(ValueError, match="rope_base"):
+        VFE3Config(rope_base=value)
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), float("-inf")])
+def test_alibi_slope_requires_finite_nonnegative_value(value):
+    with pytest.raises(ValueError, match="alibi_slope"):
+        VFE3Config(alibi_slope=value)
+    assert VFE3Config(alibi_slope=0.0).alibi_slope == 0.0
+
+
+def test_rope_warning_names_only_registered_positional_modes():
+    from vfe3.model.positional_phi import _POS_PHI
+
+    with pytest.warns(UserWarning) as caught:
+        VFE3Config(pos_rotation="rope")
+    messages = " ".join(str(item.message) for item in caught)
+
+    assert "sinusoidal" not in messages
+    assert "frozen" in messages
+    assert {"frozen", "learned"}.issubset(_POS_PHI)
+
+
+def test_omega_direct_capability_comes_from_group_registration():
+    from vfe3.geometry.groups import GaugeGroup, _GROUPS, get_group, register_group
+
+    capable_name = "audit_omega_capable_alias"
+    incapable_name = "audit_omega_incapable_alias"
+
+    @register_group(capable_name, omega_direct_capable=True)
+    def _build_capable(K, *args, **kwargs):
+        base = get_group("glk")(K, *args, **kwargs)
+        return GaugeGroup(
+            name=capable_name,
+            generators=base.generators,
+            irrep_dims=base.irrep_dims,
+            skew_symmetric=base.skew_symmetric,
+        )
+
+    @register_group(incapable_name)
+    def _build_incapable(K, *args, **kwargs):
+        base = get_group("glk")(K, *args, **kwargs)
+        return GaugeGroup(
+            name=incapable_name,
+            generators=base.generators,
+            irrep_dims=base.irrep_dims,
+            skew_symmetric=base.skew_symmetric,
+            omega_direct_capable=True,
+        )
+
+    try:
+        cfg = VFE3Config(
+            embed_dim=4,
+            n_heads=1,
+            gauge_group=capable_name,
+            gauge_parameterization="omega_direct",
+            e_phi_lr=0.0,
+        )
+        assert cfg.gauge_group == capable_name
+        assert get_group("glk")(4).omega_direct_capable is True
+        assert _build_capable(4).omega_direct_capable is True
+        assert _build_incapable(4).omega_direct_capable is False
+        assert get_group(capable_name)(4).omega_direct_capable is True
+        assert get_group(incapable_name)(4).omega_direct_capable is False
+        with pytest.raises(ValueError, match="omega_direct"):
+            VFE3Config(
+                embed_dim=4,
+                n_heads=1,
+                gauge_group=incapable_name,
+                gauge_parameterization="omega_direct",
+                e_phi_lr=0.0,
+            )
+    finally:
+        _GROUPS.pop(capable_name, None)
+        _GROUPS.pop(incapable_name, None)

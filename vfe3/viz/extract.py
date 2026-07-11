@@ -29,6 +29,7 @@ from vfe3.inference.e_step import _transport, e_step_iteration, free_energy_valu
 # mu/sigma to _transport by membership here, never by matching literal mode names.
 from vfe3.geometry.transport import _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA, transport_covariance, transport_mean
 from vfe3.model.block import vfe_block
+from vfe3.numerics import bounded_variance_from_log
 
 
 def _model_device(model) -> torch.device:
@@ -45,16 +46,19 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
     enc = model.prior_bank.encode(token_ids[:1])                  # (1, N, ...)
     belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=model._apply_pos_phi(enc.phi[0]),
                          omega=enc.omega[0] if enc.omega is not None else None)   # carry the GL(K) frame under omega_direct
-    if model.cfg.s_e_step:
-        s_mu1, s_sigma1 = model._refine_s(token_ids[:1], belief.phi.unsqueeze(0))
-        belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
     n = belief.mu.shape[0]
+    rope = model._rope_rotation(n, token_ids.device)
+    s_belief = None
+    if model.cfg.s_e_step:
+        s_mu1, s_sigma1 = model._refine_s(token_ids[:1], belief.phi.unsqueeze(0), rope=rope)
+        s_belief = (s_mu1, s_sigma1)
+        belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
     log_prior = model._attention_log_prior(n, token_ids.device)
     log_prior = model._fold_precision_bias(log_prior, belief.sigma)   # no-op unless precision_weighted_attention;
     if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
         log_prior = model._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                                            omega=belief.omega.unsqueeze(0) if belief.omega is not None else None)[0]
-    rope = model._rope_rotation(n, token_ids.device)                  # belief.sigma is post-s_e_step, matching
+                                            omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
+                                            s_belief=s_belief)[0]
     return belief, log_prior, rope                                    # forward's beliefs.sigma (model.py:762)
 
 
@@ -204,15 +208,18 @@ def belief_ce_bank(
             conf_flat, pred_flat = flat_logits.softmax(dim=-1).max(dim=-1)        # (B*N,) confidence, argmax
             beliefs = model.prior_bank.encode(tokens)             # mirror forward so the traced sigma
             beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi))   # IS the decode's belief
+            rope = model._rope_rotation(n, device)
+            s_belief = None
             if cfg.s_e_step:                                       # anchor belief to the refined model channel
-                s_mu1, s_sigma1 = model._refine_s(tokens, beliefs.phi)
+                s_mu1, s_sigma1 = model._refine_s(tokens, beliefs.phi, rope=rope)
+                s_belief = (s_mu1, s_sigma1)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
             log_prior = model._attention_log_prior(n, device)
             log_prior = model._fold_precision_bias(log_prior, beliefs.sigma)   # no-op unless precision_weighted_attention
             if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
                 log_prior = model._fold_gamma_prior(log_prior, tokens, beliefs.phi,
-                                                    omega=beliefs.omega if beliefs.omega is not None else None)
-            rope = model._rope_rotation(n, device)
+                                                    omega=beliefs.omega if beliefs.omega is not None else None,
+                                                    s_belief=s_belief)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
                 log_prior=log_prior, block_norm=model.block_norm,
@@ -276,16 +283,19 @@ def belief_bank(
             tokens = tokens.to(device)
             beliefs = model.prior_bank.encode(tokens)
             beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi))
-            if cfg.s_e_step:                                       # anchor belief to the refined model channel
-                s_mu1, s_sigma1 = model._refine_s(tokens, beliefs.phi)
-                beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
             n = tokens.shape[1]
+            rope = model._rope_rotation(n, device)
+            s_belief = None
+            if cfg.s_e_step:                                       # anchor belief to the refined model channel
+                s_mu1, s_sigma1 = model._refine_s(tokens, beliefs.phi, rope=rope)
+                s_belief = (s_mu1, s_sigma1)
+                beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
             log_prior = model._attention_log_prior(n, device)
             log_prior = model._fold_precision_bias(log_prior, beliefs.sigma)   # no-op unless precision_weighted_attention
             if model.cfg.gamma_as_beta_prior:                                # m4: match forward's hierarchical gamma prior fold
                 log_prior = model._fold_gamma_prior(log_prior, tokens, beliefs.phi,
-                                                    omega=beliefs.omega if beliefs.omega is not None else None)
-            rope = model._rope_rotation(n, device)
+                                                    omega=beliefs.omega if beliefs.omega is not None else None,
+                                                    s_belief=s_belief)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
                 log_prior=log_prior, block_norm=model.block_norm,
@@ -647,10 +657,11 @@ def s_channel_refinement(model, token_ids: torch.Tensor) -> Optional[dict]:
     cfg, pb = model.cfg, model.prior_bank
     enc  = pb.encode(token_ids[:1])                                # (1, N, ...)
     phi0 = model._apply_pos_phi(enc.phi[0]).unsqueeze(0)           # (1, N, n_gen) frozen gauge frame
+    rope = model._rope_rotation(token_ids.shape[1], token_ids.device)
     s0_mu, s0_sigma = (t[0] for t in pb.encode_s(token_ids[:1]))   # (N, K) static model channel
-    s1_mu, s1_sigma = (t[0] for t in model._refine_s(token_ids[:1], phi0))  # (N, K) refined
+    s1_mu, s1_sigma = (t[0] for t in model._refine_s(token_ids[:1], phi0, rope=rope))  # (N, K) refined
     r_mu    = pb.r_mu.expand_as(s1_mu)                             # (N, K) frozen hyper-prior centroid
-    r_sigma = torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).expand_as(s1_sigma)
+    r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps).expand_as(s1_sigma)
     kl = get_functional("renyi")                                  # KL = renyi at alpha=1
     r  = DiagonalGaussian(r_mu, r_sigma)
     kl_s0_r = kl(DiagonalGaussian(s0_mu, s0_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
@@ -701,9 +712,10 @@ def hyper_prior_centroid(model, token_ids: torch.Tensor) -> Optional[dict]:
     if getattr(pb, "r_mu", None) is None:
         return None
     s_mu, s_sigma = (t[0] for t in pb.encode_s(token_ids[:1]))     # (N, K)
+    r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps).detach().cpu()  # (K,)
     return {
         "r_mu":         pb.r_mu.detach().cpu(),                                      # (K,)
-        "r_sigma":      torch.exp(pb.r_sigma_log).clamp(min=cfg.eps).detach().cpu(), # (K,)
+        "r_sigma":      r_sigma,                                                      # (K,)
         "s_mu_mean":    s_mu.mean(dim=0).cpu(),                                      # (K,)
         "s_mu_std":     s_mu.std(dim=0).cpu(),                                       # (K,)
         "s_sigma_mean": s_sigma.mean(dim=0).cpu(),                                   # (K,)
@@ -771,10 +783,11 @@ def model_channel_bank(
         for tokens in token_batches:
             tokens = tokens.to(device)
             s_mu, s_sigma = model.prior_bank.encode_s(tokens)         # (B, N, K) static model channel
+            b, n = tokens.shape
             if model.cfg.s_e_step:                                    # refine -> position-dependent, like q
                 phi0 = model._apply_pos_phi(model.prior_bank.encode(tokens).phi)
-                s_mu, s_sigma = model._refine_s(tokens, phi0)
-            b, n = tokens.shape
+                rope = model._rope_rotation(n, device)
+                s_mu, s_sigma = model._refine_s(tokens, phi0, rope=rope)
             mus.append(s_mu.reshape(b * n, -1))
             sigmas.append(s_sigma.reshape(b * n, -1))
             tids.append(tokens.reshape(b * n))
