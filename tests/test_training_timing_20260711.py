@@ -50,8 +50,16 @@ def _direct_batches() -> list[tuple[torch.Tensor, torch.Tensor]]:
 def test_cpu_timer_aggregates_and_resets_windows() -> None:
     from vfe3.timing import TrainingTimer
 
+    def _cuda_factory_forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("CPU timer invoked an injected CUDA factory")
+
     clock = _ManualClock()
-    timer = TrainingTimer(torch.device("cpu"), clock=clock)
+    timer = TrainingTimer(
+        torch.device("cpu"),
+        clock=clock,
+        cuda_event_factory=_cuda_factory_forbidden,
+        cuda_stream_factory=_cuda_factory_forbidden,
+    )
     timer.start_step()
     clock.advance(0.010)
     timer.finish_step(n_tokens=8)
@@ -127,6 +135,12 @@ def test_cuda_timer_uses_only_event_specific_reporting_syncs(
     timer.start_step()
     timer.finish_step(n_tokens=24)
     assert not [item for item in trace if item[0] == "sync"]
+    assert [item for item in trace if item[0] == "factory"] == [
+        ("factory", True),
+        ("factory", True),
+        ("factory", True),
+        ("factory", True),
+    ]
 
     clean = timer.sample_train_window()
     assert [item for item in trace if item[0] == "sync"] == [("sync", "e2")]
@@ -138,6 +152,13 @@ def test_cuda_timer_uses_only_event_specific_reporting_syncs(
     assert [item for item in trace if item[0] == "sync"] == [
         ("sync", "e2"),
         ("sync", "pipeline"),
+    ]
+    assert [item for item in trace if item[0] == "factory"] == [
+        ("factory", True),
+        ("factory", True),
+        ("factory", True),
+        ("factory", True),
+        ("factory", False),
     ]
 
 
@@ -255,6 +276,42 @@ def test_mixed_log_eval_rows_keep_timing_schema_rectangular(
         csv_rows = list(csv.DictReader(handle))
     assert len(csv_rows) == 2
     assert all(set(row) == expected_fields for row in csv_rows)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_real_cuda_training_timing_smoke(tmp_path: Path) -> None:
+    import vfe3.train as train_module
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    cfg = _tiny_training_cfg(max_steps=2)
+    model = VFEModel(cfg).to(device)
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model, device=str(device))
+
+    train_module.train(
+        model,
+        _direct_batches(),
+        cfg,
+        n_steps=2,
+        log_interval=1,
+        eval_interval=None,
+        val_loader=None,
+        device=device,
+        artifacts=artifacts,
+        generate_samples=False,
+    )
+
+    assert len(artifacts.history) == 2
+    for row in artifacts.history:
+        assert math.isfinite(row["train_step_ms_mean"])
+        assert row["train_step_ms_mean"] >= 0.0
+        assert math.isfinite(row["wall_clock_s"])
+        assert row["wall_clock_s"] >= 0.0
+        assert math.isfinite(row["train_step_tokens_per_s"])
+        assert row["train_step_tokens_per_s"] > 0.0
+        assert math.isfinite(row["pipeline_tokens_per_s"])
+        assert row["pipeline_tokens_per_s"] > 0.0
+        assert row["tokens_per_s"] == row["pipeline_tokens_per_s"]
 
 
 def test_cpu_train_on_cuda_capable_host_never_calls_cuda_helpers(

@@ -171,13 +171,16 @@ def test_metrics_csv_has_tier1_columns_and_is_rectangular() -> None:
             rows = list(csv.DictReader(fh))
     assert rows, "no metrics rows written"
     cols = set(rows[0].keys())
+    explicit_timing = ["train_step_ms_mean", "train_step_tokens_per_s", "pipeline_tokens_per_s"]
     need = (["grad_norm", "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi", "loss_finite",
              "estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi",
-             "tokens_per_s", "peak_mem_mb", "generalization_gap",
+             *explicit_timing, "tokens_per_s", "peak_mem_mb", "generalization_gap",
              "self_coupling", "self_divergence"] + _NEW_DIAG_KEYS)
     assert not [c for c in need if c not in cols], f"CSV missing Tier-1 columns: {[c for c in need if c not in cols]}"
     # rectangular: every row carries the identical column set
     assert all(set(r.keys()) == cols for r in rows)
+    assert all(row["tokens_per_s"] == row["pipeline_tokens_per_s"] for row in rows)
+    assert all(math.isfinite(float(row[key])) for row in rows for key in explicit_timing)
     # the pure path logs no equivariance-break order parameters
     assert "connection_w_norm" not in cols and "head_mixer_drift" not in cols
 
