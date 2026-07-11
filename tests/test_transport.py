@@ -3,8 +3,10 @@ import torch
 
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.transport import (
+    _TRANSPORTS,
     compute_transport_operators,
     get_transport,
+    get_transport_registration,
     register_transport,
     transport_covariance,
     transport_mean,
@@ -125,21 +127,48 @@ def test_transport_covariance_full_matches_explicit_matmul():
 
 
 # --- register_transport / get_transport seam (roadmap; connection-regime axis) ---
+def test_register_transport_requires_covariance_class():
+    with pytest.raises(TypeError, match="covariance_class"):
+        register_transport("_test_missing_covariance_class")
+
+
 def test_transport_registry_round_trip():
     """register_transport/get_transport round-trip and the unknown-name KeyError."""
     sentinel = object()
 
-    @register_transport("_test_dummy_transport")
+    @register_transport("_test_dummy_transport", covariance_class="test-only")
     def _dummy(*args, **kwargs):
         return sentinel
 
     try:
         assert get_transport("_test_dummy_transport")() is sentinel
+        registration = get_transport_registration("_test_dummy_transport")
+        assert registration.callable is _dummy
+        assert registration.needs_mu is False
+        assert registration.needs_sigma is False
+        assert registration.batch_independent is False
+        assert registration.covariance_class == "test-only"
         with pytest.raises(KeyError):
             get_transport("nope")
+        with pytest.raises(KeyError):
+            get_transport_registration("nope")
     finally:
-        from vfe3.geometry.transport import _TRANSPORTS
         _TRANSPORTS.pop("_test_dummy_transport", None)
+
+
+def test_every_transport_registers_covariance_class():
+    expected = {
+        "flat":                   "covariant (flat)",
+        "regime_ii":              "gauge-fixed (non-covariant)",
+        "regime_ii_covariant":    "covariant",
+        "regime_ii_link":         "gauge-fixed",
+        "regime_ii_link_charted": "covariant",
+    }
+    assert {name: _TRANSPORTS[name].covariance_class for name in expected} == expected
+    assert all(
+        isinstance(registration.covariance_class, str) and registration.covariance_class
+        for registration in _TRANSPORTS.values()
+    )
 
 
 def test_flat_is_registered():

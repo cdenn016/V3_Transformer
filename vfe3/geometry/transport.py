@@ -246,7 +246,18 @@ def _rope_dense_omega(
 # under 'flat' (:func:`_build_flat`, the no-NN pure default) and the non-flat edge-relaxed Regime II
 # under 'regime_ii' (:func:`_build_regime_ii` below, the sanctioned default-OFF learned-connection
 # exception; spec docs/superpowers/specs/2026-06-01-regime-ii-connection-design.md).
-_TRANSPORTS: Dict[str, Callable[..., TransportDict]] = {}
+@dataclass(frozen=True)
+class TransportRegistration:
+    """A transport builder and every routing/reporting declaration attached to it."""
+
+    callable:          Callable[..., TransportDict]
+    needs_mu:          bool
+    needs_sigma:       bool
+    batch_independent: bool
+    covariance_class:  str
+
+
+_TRANSPORTS: Dict[str, TransportRegistration] = {}
 _TRANSPORT_NEEDS_MU:    set = set()   # regimes whose Omega builder reads the belief means mu
 _TRANSPORT_NEEDS_SIGMA: set = set()   # regimes whose Omega builder reads the belief covariance sigma
 _TRANSPORT_BATCH_INDEPENDENT: set = set()   # regimes whose Omega is the SAME for every sequence in the
@@ -256,12 +267,20 @@ _TRANSPORT_BATCH_INDEPENDENT: set = set()   # regimes whose Omega is the SAME fo
 
 
 def register_transport(
-    name: str, *, needs_mu: bool = False, needs_sigma: bool = False, batch_independent: bool = False,
-    override: bool = False,
+    name: str,
+
+    *,
+    covariance_class:  str,
+    needs_mu:          bool = False,
+    needs_sigma:       bool = False,
+    batch_independent: bool = False,
+    override:          bool = False,
 ) -> Callable:
     """Decorator registering a transport (connection-regime) builder under ``name``.
 
-    ``needs_mu``/``needs_sigma`` are state-routing metadata: they declare which belief fields the
+    ``covariance_class`` is the exact covariance/equivariance label emitted in run artifacts. It is
+    mandatory so every config-selectable transport is reportable without a second literal dispatch
+    table. ``needs_mu``/``needs_sigma`` are state-routing metadata: they declare which belief fields the
     regime's Omega builder consumes, so callers feed mu/sigma by querying the registry rather than
     matching literal mode names. Declaring them here keeps the add-by-registering contract -- a new
     stateful regime advertises its requirements at registration, not at every call site.
@@ -274,32 +293,49 @@ def register_transport(
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an existing
     name silently shadowed the first, so a config-selected seam could dispatch to an unintended
-    implementation. Pass ``override=True`` to replace deliberately; the replacement DISCARDS the
-    name from every metadata set first and re-adds per the new flags, so stale membership cannot
-    survive an override.
+    implementation. Pass ``override=True`` to replace deliberately. The callable and all declarations
+    are installed together as one frozen record; the legacy routing sets are then derived from that
+    complete record, so stale membership cannot survive an override.
     """
+    if not isinstance(covariance_class, str) or not covariance_class:
+        raise ValueError("transport covariance_class must be a nonempty string")
+
     def _wrap(fn: Callable[..., TransportDict]) -> Callable[..., TransportDict]:
         if name in _TRANSPORTS and not override:
             raise KeyError(f"transport mode {name!r} already registered; pass override=True to replace")
-        _TRANSPORTS[name] = fn
-        _TRANSPORT_NEEDS_MU.discard(name)             # override: drop stale metadata before re-adding
+        registration = TransportRegistration(
+            callable=fn,
+            needs_mu=needs_mu,
+            needs_sigma=needs_sigma,
+            batch_independent=batch_independent,
+            covariance_class=covariance_class,
+        )
+        _TRANSPORTS[name] = registration
+        # Compatibility views for existing hot-path membership checks. Their values are derived only
+        # from the just-installed complete record; none is inherited from an overridden registration.
+        _TRANSPORT_NEEDS_MU.discard(name)
         _TRANSPORT_NEEDS_SIGMA.discard(name)
         _TRANSPORT_BATCH_INDEPENDENT.discard(name)
-        if needs_mu:
+        if registration.needs_mu:
             _TRANSPORT_NEEDS_MU.add(name)
-        if needs_sigma:
+        if registration.needs_sigma:
             _TRANSPORT_NEEDS_SIGMA.add(name)
-        if batch_independent:
+        if registration.batch_independent:
             _TRANSPORT_BATCH_INDEPENDENT.add(name)
         return fn
     return _wrap
 
 
-def get_transport(name: str) -> Callable[..., TransportDict]:
-    """Return the registered transport builder (KeyError-with-available-list if absent)."""
+def get_transport_registration(name: str) -> TransportRegistration:
+    """Return the complete registration record for ``name`` (KeyError if absent)."""
     if name not in _TRANSPORTS:
         raise KeyError(f"no transport {name!r}; available: {sorted(_TRANSPORTS)}")
     return _TRANSPORTS[name]
+
+
+def get_transport(name: str) -> Callable[..., TransportDict]:
+    """Return the registered transport builder (KeyError-with-available-list if absent)."""
+    return get_transport_registration(name).callable
 
 
 def gauge_invariant_edge_features(
@@ -379,7 +415,7 @@ def _soft_cap_frobenius(
     return (matrix64 * scale64).to(matrix.dtype)
 
 
-@register_transport("flat")
+@register_transport("flat", covariance_class="covariant (flat)")
 def _build_flat(
     phi:        torch.Tensor,             # (B, N, n_gen) gauge frames
     group:      GaugeGroup,               # supplies generators, skew flag, irrep_dims
@@ -404,7 +440,11 @@ def _build_flat(
                                        clamp_monitor=clamp_monitor)
 
 
-@register_transport("regime_ii", needs_mu=True)
+@register_transport(
+    "regime_ii",
+    covariance_class="gauge-fixed (non-covariant)",
+    needs_mu=True,
+)
 def _build_regime_ii(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
     group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims
@@ -580,7 +620,12 @@ def _regime_ii_query_chunk(
     return max(1, min(n, _REGIME_II_CHUNK_ELEMS // per_row))
 
 
-@register_transport("regime_ii_covariant", needs_mu=True, needs_sigma=True)
+@register_transport(
+    "regime_ii_covariant",
+    covariance_class="covariant",
+    needs_mu=True,
+    needs_sigma=True,
+)
 def _build_regime_ii_covariant(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
     group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims
@@ -772,7 +817,11 @@ def _direct_link_edge_exp(
     return exp_link.to(dtype)
 
 
-@register_transport("regime_ii_link", batch_independent=True)
+@register_transport(
+    "regime_ii_link",
+    covariance_class="gauge-fixed",
+    batch_independent=True,
+)
 def _build_regime_ii_link(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames (IGNORED: bare link reads only connection_L)
     group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims
@@ -829,7 +878,7 @@ def _build_regime_ii_link(
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
-@register_transport("regime_ii_link_charted")
+@register_transport("regime_ii_link_charted", covariance_class="covariant")
 def _build_regime_ii_link_charted(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
     group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims

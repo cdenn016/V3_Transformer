@@ -212,8 +212,7 @@ def test_pure_path_report_regime_ii_covariant_exact_flag():
 
 def test_pure_path_report_transport_covariance_class():
     # C7 (audit 2026-07-01): plain regime_ii's bilinear edge is gauge-FIXED; the report must never
-    # group it with the covariant Route B. Every registered mode maps to a class; an unknown mode
-    # falls through to its own name (no KeyError).
+    # group it with the covariant Route B. Every shipped registration owns its exact class.
     expected = {"flat":                   "covariant (flat)",
                 "regime_ii":              "gauge-fixed (non-covariant)",
                 "regime_ii_covariant":    "covariant",
@@ -222,8 +221,36 @@ def test_pure_path_report_transport_covariance_class():
     for mode, label in expected.items():
         rep = _pure_path_report(_report_cfg(transport_mode=mode), [])
         assert rep["config_toggles"]["transport_covariance_class"] == label, mode
-    rep = _pure_path_report(_report_cfg(transport_mode="future_mode"), [])
-    assert rep["config_toggles"]["transport_covariance_class"] == "future_mode"
+    with pytest.raises(KeyError, match="no transport"):
+        _pure_path_report(_report_cfg(transport_mode="future_mode"), [])
+
+
+def test_pure_path_report_reads_transport_registry_metadata():
+    from vfe3.geometry import transport
+
+    original = transport.get_transport_registration("flat")
+    try:
+        transport.register_transport(
+            "flat",
+            covariance_class="registry-probe",
+            needs_mu=original.needs_mu,
+            needs_sigma=original.needs_sigma,
+            batch_independent=original.batch_independent,
+            override=True,
+        )(original.callable)
+
+        report = _pure_path_report(_report_cfg(transport_mode="flat"), [])
+
+        assert report["config_toggles"]["transport_covariance_class"] == "registry-probe"
+    finally:
+        transport.register_transport(
+            "flat",
+            covariance_class=original.covariance_class,
+            needs_mu=original.needs_mu,
+            needs_sigma=original.needs_sigma,
+            batch_independent=original.batch_independent,
+            override=True,
+        )(original.callable)
 
 
 def test_diagonal_gl_route_reports_not_exactly_gauge_invariant():

@@ -1063,10 +1063,12 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
                 return float(v)
         return None
     from vfe3.geometry.groups import get_group
+    from vfe3.geometry.transport import get_transport_registration
 
     group_builder = get_group(cfg.gauge_group)
     invariant_families = tuple(getattr(group_builder, "invariant_families", ()))
     family_group_invariant = cfg.family in invariant_families
+    transport_registration = get_transport_registration(cfg.transport_mode)
     fixed_prior_surrogate = bool(cfg.precision_weighted_attention)
 
     pure_flags = {
@@ -1133,15 +1135,9 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             # so a diagonal covariant run is never reported as exact Route B.
             "regime_ii_covariant_exact":    (cfg.transport_mode != "regime_ii_covariant")
                                             or family_group_invariant,
-            # Covariance class of the ACTIVE transport (audit C7): plain regime_ii's bilinear edge
-            # delta_ij = mu_i^T W mu_j is gauge-FIXED (invariant only at W=0), never covariant.
-            # .get default: a newly registered mode reports its own name rather than KeyError-ing.
-            "transport_covariance_class":   {"flat":                   "covariant (flat)",
-                                             "regime_ii":              "gauge-fixed (non-covariant)",
-                                             "regime_ii_covariant":    "covariant",
-                                             "regime_ii_link":         "gauge-fixed",
-                                             "regime_ii_link_charted": "covariant",
-                                             }.get(cfg.transport_mode, cfg.transport_mode),
+            # Covariance class of the ACTIVE transport (audit C7), owned by its complete registry
+            # record. An unregistered mode fails closed instead of inventing report metadata.
+            "transport_covariance_class":   transport_registration.covariance_class,
         },
         "converged_stress": {k: _last(k) for k in (
             "guard_sigma_floor_frac", "guard_sigma_ceil_frac", "guard_energy_klmax_frac",
