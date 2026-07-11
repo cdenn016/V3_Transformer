@@ -775,7 +775,11 @@ def test_duplicate_single_n_does_not_persist_nan_fit(tmp_path, monkeypatch):
     assert summary["pooled_fit"] is None
     assert summary["pooled_fit_status"] == "not_fitted"
     assert summary["per_route"] == {}
-    assert "nan" not in raw.lower()
+
+    def _reject_nonfinite_json(value):
+        pytest.fail(f"scaling summary persisted non-finite JSON constant {value!r}")
+
+    assert json.loads(raw, parse_constant=_reject_nonfinite_json) == summary
     text = (tmp_path / "SCALING_ANALYSIS.md").read_text(encoding="utf-8").lower()
     assert "status: **not_fitted**" in text
     assert "no pooled estimate is available" in text

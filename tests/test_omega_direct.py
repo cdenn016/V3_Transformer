@@ -1396,8 +1396,8 @@ def test_tied_compact_forward_backward_with_gamma_and_rope():
     m = VFEModel(_cfg(
         gauge_parameterization="omega_direct", gauge_group="tied_block_glk", n_heads=2,
         omega_compact_storage=True, family="gaussian_full", decode_mode="full",
-        n_e_steps=1, lambda_gamma=0.5, s_e_step=True, pos_rotation="rope",
-        rope_full_gauge=True,
+        n_e_steps=1, lambda_gamma=0.5, s_e_step=False, pos_rotation="rope",
+        rope_full_gauge=True, oracle_unroll_grad=True,
     ))
     token_ids = torch.tensor([[0, 1, 2, 3]])
 

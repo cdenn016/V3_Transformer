@@ -191,6 +191,7 @@ def test_custom_chunked_decode_dispatches_registered_fused_ce():
             n_layers=1,
             n_e_steps=1,
             decode_mode=name,
+            use_prior_bank=True,
             e_phi_lr=0.0,
         )
         model = VFEModel(cfg)
