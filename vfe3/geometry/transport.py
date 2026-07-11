@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from vfe3.geometry.groups import GaugeGroup
+from vfe3.geometry.lie_ops import CompactBlockElement, _equal_diag_blocks
 from vfe3.numerics import safe_cholesky
 
 TransportDict = Dict[str, torch.Tensor]
@@ -58,6 +59,87 @@ class FactoredTransport:
 
 
 @dataclass
+class CompactFactoredTransport:
+    r"""Flat equal-block transport whose vertex factors stay ``(..., N, H, d, d)``.
+
+    ``exp_blocks`` and ``inv_blocks`` are the stored vertex elements and their true per-block
+    inverses. Mean, diagonal-covariance, and full-covariance contractions consume these factors
+    without forming a vertex or pairwise ``K x K`` matrix. :meth:`to_dense_omega` is the explicit
+    compatibility boundary for legacy consumers that require a dense pairwise operator.
+    """
+
+    exp_blocks:    torch.Tensor           # (..., N, H, d, d) stored U_i blocks
+    inv_blocks:    torch.Tensor           # (..., N, H, d, d) true U_j^{-1} blocks
+    K:             int
+    mean_per_head: bool = False
+
+    def __post_init__(self) -> None:
+        compatible = (
+            self.exp_blocks.dim() == self.inv_blocks.dim()
+            and self.exp_blocks.shape[:-4] == self.inv_blocks.shape[:-4]
+            and self.exp_blocks.shape[-3:] == self.inv_blocks.shape[-3:]
+        )
+        if not compatible:
+            raise ValueError(
+                "compact transport factors must share leading batch and trailing block shapes "
+                "(their query/key token counts may differ), got "
+                f"{tuple(self.exp_blocks.shape)} and {tuple(self.inv_blocks.shape)}")
+        if self.exp_blocks.dim() < 4 or self.exp_blocks.shape[-1] != self.exp_blocks.shape[-2]:
+            raise ValueError(
+                "compact transport factors must have (..., N, H, d, d) square-block layout, got "
+                f"{tuple(self.exp_blocks.shape)}")
+        H, d = self.exp_blocks.shape[-3], self.exp_blocks.shape[-1]
+        if type(self.K) is not int or self.K <= 0 or H * d != self.K:
+            raise ValueError(f"compact transport has H={H}, d={d}, but H*d != K={self.K!r}")
+        if type(self.mean_per_head) is not bool:
+            raise ValueError(
+                "mean_per_head must be a bool, got "
+                f"{type(self.mean_per_head).__name__}: {self.mean_per_head!r}")
+
+    @property
+    def n_blocks(self) -> int:
+        return self.exp_blocks.shape[-3]
+
+    @property
+    def block_dim(self) -> int:
+        return self.exp_blocks.shape[-1]
+
+    @property
+    def irrep_dims(self) -> List[int]:
+        return [self.block_dim] * self.n_blocks
+
+    @property
+    def device(self) -> torch.device:
+        return self.exp_blocks.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.exp_blocks.dtype
+
+    def unsqueeze(self, dim: int) -> 'CompactFactoredTransport':
+        r"""Insert a leading batch axis without materializing either pairwise or dense matrices."""
+        n_leading = self.exp_blocks.dim() - 4
+        logical_rank = n_leading + 4                    # conceptual (..., Nq, Nk, K, K) transport
+        normalized = dim if dim >= 0 else dim + logical_rank + 1
+        if normalized < 0 or normalized > n_leading:
+            raise ValueError(
+                "CompactFactoredTransport.unsqueeze may only add a leading axis before "
+                "the conceptual (Nq, Nk, K, K) transport axes")
+        return CompactFactoredTransport(
+            self.exp_blocks.unsqueeze(normalized),
+            self.inv_blocks.unsqueeze(normalized),
+            self.K,
+            mean_per_head=self.mean_per_head,
+        )
+
+    def to_dense_omega(self) -> torch.Tensor:
+        r"""Explicit compatibility conversion to dense ``(..., N, N, K, K)`` transport."""
+        exp_dense = CompactBlockElement(self.exp_blocks, self.K).to_dense()
+        inv_dense = CompactBlockElement(self.inv_blocks, self.K).to_dense()
+        return torch.einsum("...ikl,...jlm->...ijkm", exp_dense, inv_dense)
+
+
+@dataclass
 class RopeTransport:
     r"""A built transport wrapped with a gauge-RoPE positional rotation R(theta).
 
@@ -82,18 +164,74 @@ class RopeTransport:
     ``base`` while beta comes from the rotated score energy, and ``gradients/kernels.py`` routes the
     decoupled case to the oracle (beta is no longer the coupling sum's stationary point, so the
     closed-form envelope kernel does not apply). ``transport_mean`` / ``transport_covariance`` always
-    honour the rotation (the score path); the value path transports on ``base`` directly.
+    honor the rotation (the score path); the value path transports on ``base`` directly.
     """
 
-    base:     'torch.Tensor | FactoredTransport'  # (N,N,K,K) dense OR factored transport
+    base:     'torch.Tensor | FactoredTransport | CompactFactoredTransport'  # dense OR factored transport
     rope:     torch.Tensor                        # (N, K, K) block-diagonal orthogonal rotation
     on_cov:   bool = False
     on_value: bool = True                         # False -> value aggregation uses the UN-rotated base (RoPE Q/K only)
 
+    def __post_init__(self) -> None:
+        if isinstance(self.base, CompactFactoredTransport):
+            n_query = self.base.exp_blocks.shape[-4]
+            n_key = self.base.inv_blocks.shape[-4]
+            K = self.base.K
+        elif isinstance(self.base, FactoredTransport):
+            if self.base.exp_phi.dim() < 3 or self.base.exp_neg_phi.dim() < 3:
+                raise ValueError("RopeTransport factored base must have (..., N, K, K) factors")
+            if (self.base.exp_phi.shape[-2] != self.base.exp_phi.shape[-1]
+                    or self.base.exp_neg_phi.shape[-2] != self.base.exp_neg_phi.shape[-1]):
+                raise ValueError(
+                    "RopeTransport factored base factors must each end in square K x K matrix "
+                    f"axes; got {tuple(self.base.exp_phi.shape)} and "
+                    f"{tuple(self.base.exp_neg_phi.shape)}")
+            if self.base.exp_phi.shape[-1] != self.base.exp_neg_phi.shape[-1]:
+                raise ValueError(
+                    "RopeTransport factored base factors must use the same K; got "
+                    f"Kq={self.base.exp_phi.shape[-1]}, Kk={self.base.exp_neg_phi.shape[-1]}")
+            if self.base.exp_phi.shape[:-3] != self.base.exp_neg_phi.shape[:-3]:
+                raise ValueError(
+                    "RopeTransport factored base factors must have matching leading batch shapes; "
+                    f"got {tuple(self.base.exp_phi.shape[:-3])} and "
+                    f"{tuple(self.base.exp_neg_phi.shape[:-3])}")
+            n_query = self.base.exp_phi.shape[-3]
+            n_key = self.base.exp_neg_phi.shape[-3]
+            K = self.base.exp_phi.shape[-1]
+        else:
+            if self.base.dim() < 4:
+                raise ValueError("RopeTransport dense base must have (..., Nq, Nk, K, K) layout")
+            if self.base.shape[-2] != self.base.shape[-1]:
+                raise ValueError(
+                    "RopeTransport dense base must end in square K x K matrix axes; got "
+                    f"shape {tuple(self.base.shape)}")
+            n_query = self.base.shape[-4]
+            n_key = self.base.shape[-3]
+            K = self.base.shape[-1]
+        if n_query != n_key:
+            raise ValueError(
+                "RopeTransport requires a square token transport because one rope tensor is "
+                f"shared by query and key rotations; got Nq={n_query}, Nk={n_key}")
+        if (self.rope.dim() < 3 or self.rope.shape[-1] != K
+                or self.rope.shape[-2] != K):
+            raise ValueError(
+                f"RopeTransport rope must have (..., N, K, K) with K={K}, got "
+                f"{tuple(self.rope.shape)}")
+        if self.rope.shape[-3] != n_query:
+            raise ValueError(
+                "RopeTransport rope token length must match both transport token axes; "
+                f"got rope N={self.rope.shape[-3]}, Nq=Nk={n_query}")
 
-def _rope_dense_omega(base: 'torch.Tensor | FactoredTransport', rope: torch.Tensor) -> torch.Tensor:
+
+def _rope_dense_omega(
+    base: 'torch.Tensor | FactoredTransport | CompactFactoredTransport',
+    rope: torch.Tensor,
+) -> torch.Tensor:
     r"""Effective dense Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T (full-gauge / dense path)."""
-    omega = base.to_dense_omega() if isinstance(base, FactoredTransport) else base   # (...,N,N,K,K)
+    omega = (
+        base.to_dense_omega()
+        if isinstance(base, (FactoredTransport, CompactFactoredTransport)) else base
+    )                                                                               # (...,N,N,K,K)
     # R_i Omega_ij R_j^T: contract R on the left of the i-axis output and the right (transposed) of j.
     rot = torch.einsum("...ikl,...ijlm,...jnm->...ijkn", rope, omega, rope)
     return rot
@@ -1003,13 +1141,38 @@ def compute_transport_operators(
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
+def _checked_group_inverse(
+    omega: torch.Tensor,                    # (..., d, d) stored full elements or compact blocks
+) -> torch.Tensor:
+    r"""True float64 inverse with immediate nonfinite/singular failure and dtype restoration."""
+    with torch.no_grad():
+        if not bool(torch.isfinite(omega).all()):
+            raise FloatingPointError("omega group element contains nonfinite values before inversion")
+    try:
+        with torch.amp.autocast(omega.device.type, enabled=False):
+            inverse64 = torch.linalg.inv(omega.double())
+    except RuntimeError as exc:
+        raise ValueError("omega group element is singular and cannot be inverted") from exc
+    with torch.no_grad():
+        if not bool(torch.isfinite(inverse64).all()):
+            raise FloatingPointError(
+                "omega group-element inverse is nonfinite; the element is singular or numerically "
+                "unrepresentable")
+    inverse = inverse64.to(omega.dtype)
+    with torch.no_grad():
+        if not bool(torch.isfinite(inverse).all()):
+            raise FloatingPointError(
+                f"omega group-element inverse is nonfinite after conversion to {omega.dtype}")
+    return inverse
+
+
 def group_element_inverse(
-    omega:        torch.Tensor,             # (..., K, K) stored group elements
+    omega:        'torch.Tensor | CompactBlockElement',  # (..., K, K) element or compact (...,H,d,d) blocks
     group:        GaugeGroup,               # supplies the skew-generator flag
 
     *,
     residual_tol: float = 1e-4,
-) -> torch.Tensor:
+) -> 'torch.Tensor | CompactBlockElement':
     r"""Group-element inverse with a rowwise orthogonality-residual gate.
 
     For a skew-generator group, the transpose approximation is used only when
@@ -1022,9 +1185,16 @@ def group_element_inverse(
         raise ValueError(
             f"residual_tol must be finite and nonnegative, got {residual_tol!r}")
 
+    if isinstance(omega, CompactBlockElement):
+        inverse_blocks = _checked_group_inverse(omega.blocks)
+        return CompactBlockElement(inverse_blocks, omega.K, tied=omega.tied)
+
     if not group.skew_symmetric:
-        with torch.amp.autocast(omega.device.type, enabled=False):
-            return torch.linalg.inv(omega.double()).to(omega.dtype)
+        return _checked_group_inverse(omega)
+
+    with torch.no_grad():
+        if not bool(torch.isfinite(omega).all()):
+            raise FloatingPointError("omega group element contains nonfinite values before inversion")
 
     K = omega.shape[-1]
     omega_flat = omega.reshape(-1, K, K)
@@ -1039,33 +1209,37 @@ def group_element_inverse(
     if not bool(drifted.any()):
         return omega.transpose(-1, -2)
 
-    with torch.amp.autocast(omega.device.type, enabled=False):
-        drifted_inverse = torch.linalg.inv(omega_flat[drifted].double()).to(omega.dtype)
+    drifted_inverse = _checked_group_inverse(omega_flat[drifted])
     inverse = omega_flat.transpose(-1, -2).clone()
     inverse[drifted] = drifted_inverse
     return inverse.reshape_as(omega)
 
 
 def build_transport_from_element(
-    omega:  torch.Tensor,             # (B, N, K, K) per-token GL(K) element U_i (block-diagonal for block_glk)
+    omega:  'torch.Tensor | CompactBlockElement',  # dense (B,N,K,K) or compact block element
     group:  GaugeGroup,
-) -> 'FactoredTransport | TransportDict':
+) -> 'CompactFactoredTransport | FactoredTransport | TransportDict':
     r"""Exp-free flat cocycle from a stored group element: Omega_ij = U_i U_j^{-1}.
 
     The 'omega_direct' parameterization stores the frame as the element U_i itself rather than the
     Lie-algebra coordinate phi_i, so the transport is assembled WITHOUT any matrix exponential --
-    only the inverse U_j^{-1}. The FactoredTransport / builder-dict slots exp_phi / exp_neg_phi are
-    filled with U_i and U_j^{-1} directly; every downstream consumer (transport_mean,
-    transport_covariance, RoPE) reads only those two slots, so nothing else changes.
+    only the inverse U_j^{-1}. Dense elements fill the FactoredTransport / builder-dict slots
+    directly. CompactBlockElement inputs invert their d x d blocks and return
+    CompactFactoredTransport, so every contraction remains compact.
 
     U_j^{-1} uses :func:`group_element_inverse`: non-skew rows and drifted skew rows enter a bounded
     float64 inverse island, while skew rows satisfying the orthogonality-residual tolerance use the
     transpose approximation fast path. Public inverse factors return to the input dtype. For
-    equal-block groups (block_glk) a FactoredTransport is returned so the per-head fast paths run;
-    for a single block (glk), the dense {'exp_phi','exp_neg_phi','Omega'} dict is returned (matching
+    equal-block dense groups (block_glk) a FactoredTransport is returned so the per-head fast paths
+    run; for a compact equal-block element, CompactFactoredTransport is returned; for a single block
+    (glk), the dense {'exp_phi','exp_neg_phi','Omega'} dict is returned (matching
     compute_transport_operators' return shape).
     """
-    u_inv = group_element_inverse(omega, group)                    # (B, N, K, K)
+    u_inv = group_element_inverse(omega, group)
+    if isinstance(omega, CompactBlockElement):
+        assert isinstance(u_inv, CompactBlockElement)
+        return CompactFactoredTransport(
+            omega.expanded_blocks(), u_inv.expanded_blocks(), omega.K)
     block_dims = group.irrep_dims
     if len(block_dims) > 1 and len(set(block_dims)) == 1:
         return FactoredTransport(exp_phi=omega, exp_neg_phi=u_inv, irrep_dims=list(block_dims))
@@ -1125,7 +1299,7 @@ def build_factored_transport(
 
 
 def transport_mean(
-    omega: 'torch.Tensor | FactoredTransport | RopeTransport',   # (..., N, N, K, K) dense OR factored exps
+    omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
     mu:    torch.Tensor,                                          # (..., N, K) source (key, index j) means
 ) -> torch.Tensor:
     r"""Gauge action on means: mu_t[i,j] = Omega_ij @ mu_j. Returns (..., N, N, K).
@@ -1153,6 +1327,8 @@ def transport_mean(
         m = torch.einsum("...jlk,...jl->...jk", omega.rope, mu)        # (..., N, K)
         t = transport_mean(omega.base, m)                             # (..., N, N, K)
         return torch.einsum("...ikl,...ijl->...ijk", omega.rope, t)   # post-rotate by R_i
+    if isinstance(omega, CompactFactoredTransport):
+        return _compact_factored_mean(omega, mu)
     if isinstance(omega, FactoredTransport):
         if omega.mean_per_head:
             return _factored_per_head_mean(omega, mu)
@@ -1162,7 +1338,7 @@ def transport_mean(
 
 
 def transport_covariance(
-    omega: 'torch.Tensor | FactoredTransport | RopeTransport',   # (..., N, N, K, K) dense OR factored exps
+    omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
     sigma: torch.Tensor,                                          # (..., N, K) diagonal OR (..., N, K, K) full
 
     *,
@@ -1192,9 +1368,28 @@ def transport_covariance(
     if isinstance(omega, RopeTransport):
         if not omega.on_cov:
             return transport_covariance(omega.base, sigma, diagonal_out=diagonal_out)   # mu-only
+        if isinstance(omega.base, CompactFactoredTransport):
+            blocks = _equal_diag_blocks(
+                omega.rope, omega.base.n_blocks, omega.base.block_dim)
+            exp_blocks = torch.einsum(
+                "...nhkl,...nhlm->...nhkm", blocks, omega.base.exp_blocks)
+            inv_blocks = torch.einsum(
+                "...nhkl,...nhml->...nhkm", omega.base.inv_blocks, blocks)
+            rotated = CompactFactoredTransport(
+                exp_blocks, inv_blocks, omega.base.K,
+                mean_per_head=omega.base.mean_per_head)
+            return transport_covariance(rotated, sigma, diagonal_out=diagonal_out)
         # full-gauge: sandwich with the rotated dense operator (requires full covariance).
         return transport_covariance(_rope_dense_omega(omega.base, omega.rope), sigma,
                                     diagonal_out=diagonal_out)
+    if isinstance(omega, CompactFactoredTransport):
+        is_diag = (
+            sigma.dim() == omega.exp_blocks.dim() - 2
+            if diagonal_out is None else diagonal_out
+        )
+        if is_diag:
+            return _compact_factored_diagonal_covariance(omega, sigma)
+        return _compact_factored_full_covariance(omega, sigma)
     if isinstance(omega, FactoredTransport):
         # Diagonal sigma is (..., N, K) -> same rank as exp_phi minus the trailing K axis; a full
         # sigma is (..., N, K, K) -> same rank as exp_phi (the dense-Omega rank-gap is +1 here
@@ -1237,6 +1432,63 @@ def transport_covariance(
     out = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
                        omega.double(), sigma.double(), omega.double())
     return out.to(sigma.dtype)
+
+
+def _compact_factored_mean(
+    factored: CompactFactoredTransport,
+    mu:       torch.Tensor,               # (..., N, K) source means
+) -> torch.Tensor:                        # (..., N, N, K) transported means
+    r"""Mean transport over ``H`` compact ``d x d`` blocks, never a dense ``K x K`` factor."""
+    H, d = factored.n_blocks, factored.block_dim
+    mu_blocks = mu.reshape(*mu.shape[:-1], H, d)                         # (..., N, H, d)
+    key = torch.einsum(
+        "...jhlp,...jhp->...jhl", factored.inv_blocks, mu_blocks)
+    out = torch.einsum(
+        "...ihkl,...jhl->...ijhk", factored.exp_blocks, key)
+    return out.reshape(*out.shape[:-2], factored.K)
+
+
+def _compact_pair_blocks(
+    factored: CompactFactoredTransport,
+) -> torch.Tensor:                        # (..., N, N, H, d, d) pairwise block operators
+    r"""Build only pairwise ``d x d`` blocks ``U_i^(h) U_j^(-1,h)``."""
+    return torch.einsum(
+        "...ihkl,...jhlm->...ijhkm", factored.exp_blocks, factored.inv_blocks)
+
+
+def _compact_factored_diagonal_covariance(
+    factored: CompactFactoredTransport,
+    sigma:    torch.Tensor,               # (..., N, K) diagonal variances
+) -> torch.Tensor:                        # (..., N, N, K) diagonal sandwich
+    r"""Diagonal congruence over compact blocks without a dense ``K x K`` operator.
+
+    First form each key-side second moment
+    ``C_j = U_j^-1 diag(sigma_j) U_j^-T`` and contract it with each query factor. This avoids the
+    ``(..., N_q, N_k, H, d, d)`` pair-block allocation for every block and sequence shape.
+    """
+    H, d = factored.n_blocks, factored.block_dim
+    sigma_blocks = sigma.reshape(*sigma.shape[:-1], H, d)                 # (..., N, H, d)
+    key_second = torch.einsum(
+        "...jhlp,...jhmp,...jhp->...jhlm",
+        factored.inv_blocks, factored.inv_blocks, sigma_blocks)           # (...,Nk,H,d,d)
+    out = torch.einsum(
+        "...ihkl,...jhlm,...ihkm->...ijhk",
+        factored.exp_blocks, key_second, factored.exp_blocks)
+    return out.reshape(*out.shape[:-2], factored.K)
+
+
+def _compact_factored_full_covariance(
+    factored: CompactFactoredTransport,
+    sigma:    torch.Tensor,               # (..., N, K, K) full SPD covariances
+) -> torch.Tensor:                        # (..., N, N, K, K) full congruence output
+    r"""Full congruence from compact blocks; the output is full but no dense operator is built."""
+    H, d = factored.n_blocks, factored.block_dim
+    sigma_blocks = sigma.reshape(*sigma.shape[:-3], sigma.shape[-3], H, d, H, d)
+    omega_blocks = _compact_pair_blocks(factored).double()
+    out = torch.einsum(
+        "...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
+        omega_blocks, sigma_blocks.double(), omega_blocks)
+    return out.reshape(*out.shape[:-4], factored.K, factored.K).to(sigma.dtype)
 
 
 def _factored_per_head_mean(

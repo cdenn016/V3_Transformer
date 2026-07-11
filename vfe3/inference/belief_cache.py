@@ -40,7 +40,8 @@ from vfe3.belief import BeliefState
 from vfe3.families.base import get_family
 from vfe3.free_energy import attention_tau, attention_weights, pairwise_energy, self_divergence_for_alpha
 from vfe3.geometry.retraction import get_retraction
-from vfe3.geometry.transport import (compute_transport_operators, group_element_inverse,
+from vfe3.geometry.lie_ops import CompactBlockElement
+from vfe3.geometry.transport import (CompactFactoredTransport, compute_transport_operators, group_element_inverse,
                                      transport_covariance, transport_mean)
 from vfe3.gradients.kernels import get_kernel
 
@@ -99,7 +100,7 @@ def _appended_belief_step(
     tau:               'float | torch.Tensor',          # softmax temperature kappa*sqrt(dim_h)
 
     *,
-    omega_key_inverse: Optional[torch.Tensor] = None,   # (B', M, K, K), shared-prefix inverse factors
+    omega_key_inverse: 'torch.Tensor | CompactBlockElement | None' = None,  # shared-prefix inverses
 
 ) -> BeliefState:
     r"""One filtering-kernel E-step iteration for the APPENDED query rows against the full (causal)
@@ -127,7 +128,13 @@ def _appended_belief_step(
             group_element_inverse(beliefs.omega, group)
             if omega_key_inverse is None else omega_key_inverse
         )                                                                                 # (B', M, K, K)
-        omega = torch.einsum("bikl,bjlm->bijkm", U_q, U_k_inv)                           # (B', L, M, K, K)
+        if isinstance(U_q, CompactBlockElement):
+            if not isinstance(U_k_inv, CompactBlockElement):
+                raise TypeError("compact omega query requires compact key inverses")
+            omega = CompactFactoredTransport(
+                U_q.expanded_blocks(), U_k_inv.expanded_blocks(), U_q.K)
+        else:
+            omega = torch.einsum("bikl,bjlm->bijkm", U_q, U_k_inv)                       # (B', L, M, K, K)
     else:
         exp_q = compute_transport_operators(
             phi_q, group,
@@ -207,15 +214,31 @@ def rollout_predictive_cached(
     omega_key_inverse = None
     if model.cfg.gauge_parameterization == "omega_direct":
         K = beliefs.omega.shape[-1]
-        omega_by_candidate = beliefs.omega.reshape(B, Kp, M, K, K)
-        context_inverse = group_element_inverse(
-            omega_by_candidate[:, 0, :N], model.group)                      # (B, N, K, K), once
-        appended_inverse = group_element_inverse(
-            beliefs.omega[:, N:], model.group)                              # (B*Kp, L, K, K)
-        shared_context_inverse = context_inverse.unsqueeze(1).expand(
-            B, Kp, N, K, K).reshape(B * Kp, N, K, K)
-        omega_key_inverse = torch.cat(
-            [shared_context_inverse, appended_inverse], dim=1)              # (B*Kp, M, K, K)
+        if isinstance(beliefs.omega, CompactBlockElement):
+            block_suffix = beliefs.omega.blocks.shape[2:]
+            omega_by_candidate = CompactBlockElement(
+                beliefs.omega.blocks.reshape(B, Kp, M, *block_suffix),
+                K, tied=beliefs.omega.tied)
+            context_inverse = group_element_inverse(
+                omega_by_candidate[:, 0, :N], model.group)                  # compact (B,N,...), once
+            appended_inverse = group_element_inverse(
+                beliefs.omega[:, N:], model.group)                          # compact (B*Kp,L,...)
+            shared_blocks = context_inverse.blocks.unsqueeze(1).expand(
+                B, Kp, N, *context_inverse.blocks.shape[2:]).reshape(
+                    B * Kp, N, *context_inverse.blocks.shape[2:])
+            omega_key_inverse = CompactBlockElement(
+                torch.cat([shared_blocks, appended_inverse.blocks], dim=1),
+                K, tied=beliefs.omega.tied)
+        else:
+            omega_by_candidate = beliefs.omega.reshape(B, Kp, M, K, K)
+            context_inverse = group_element_inverse(
+                omega_by_candidate[:, 0, :N], model.group)                  # (B, N, K, K), once
+            appended_inverse = group_element_inverse(
+                beliefs.omega[:, N:], model.group)                          # (B*Kp, L, K, K)
+            shared_context_inverse = context_inverse.unsqueeze(1).expand(
+                B, Kp, N, K, K).reshape(B * Kp, N, K, K)
+            omega_key_inverse = torch.cat(
+                [shared_context_inverse, appended_inverse], dim=1)          # (B*Kp, M, K, K)
 
     log_prior = model._attention_log_prior(M, device)                       # (M, M) or (H, M, M) causal
     log_prior_app = log_prior[..., N:, :]                                   # appended query rows -> (..., L, M)

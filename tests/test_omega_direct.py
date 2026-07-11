@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 import torch
 
@@ -5,9 +7,10 @@ from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.geometry.generators import generate_glk, generate_son, reflection_element
 from vfe3.geometry.groups import get_group
-from vfe3.geometry.lie_ops import retract_omega
-from vfe3.geometry.transport import (build_transport_from_element, compute_transport_operators,
-                                      group_element_inverse, transport_mean, FactoredTransport)
+from vfe3.geometry.lie_ops import CompactBlockElement, retract_omega
+from vfe3.geometry.transport import (RopeTransport, build_transport_from_element, compute_transport_operators,
+                                      group_element_inverse, transport_covariance, transport_mean,
+                                      CompactFactoredTransport, FactoredTransport)
 from vfe3.inference import belief_cache as belief_cache_module
 from vfe3.inference.belief_cache import cache_supported, rollout_predictive_cached
 from vfe3.inference.e_step import build_belief_transport, e_step, e_step_iteration, free_energy_value
@@ -456,6 +459,44 @@ def test_omega_direct_cache_rebuild_matches_full_rollout():
         f"max |dq|={float((q_cache - q_full).abs().max()):.2e}"
 
 
+def test_compact_omega_cache_rebuild_matches_full_rollout(monkeypatch):
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(
+        gauge_parameterization="omega_direct", gauge_group="block_glk", n_heads=2,
+        omega_compact_storage=True, family="gaussian_diagonal", decode_mode="diagonal",
+        n_e_steps=1,
+    ))
+    assert cache_supported(m.cfg)
+    with torch.no_grad():
+        m.prior_bank.omega_embed.add_(
+            0.12 * torch.randn(
+                m.prior_bank.omega_embed.shape,
+                generator=torch.Generator().manual_seed(31)))
+
+    def _forbid_dense(*args, **kwargs):
+        raise AssertionError("compact cache materialized a dense K x K operator")
+
+    monkeypatch.setattr(CompactBlockElement, "to_dense", _forbid_dense)
+    monkeypatch.setattr(CompactFactoredTransport, "to_dense_omega", _forbid_dense)
+
+    B, N, Kp, L, V = 2, 2, 2, 1, m.cfg.vocab_size
+    context = torch.tensor([[0, 1], [2, 3]])
+    candidates = torch.tensor([[[4], [5]], [[1], [4]]])
+    with torch.no_grad():
+        base_logits = m.forward(context)[:, -1, :]
+        ext = torch.cat(
+            [context.unsqueeze(1).expand(B, Kp, N), candidates], dim=2).reshape(B * Kp, N + L)
+        _belief, logits = m.rollout_beliefs(ext, return_logits=True)
+        q_full = torch.log_softmax(logits[:, -1, :], dim=-1).reshape(B, Kp, V)
+        q_cache, lp_cache = rollout_predictive_cached(
+            context, candidates, m, base_logits=base_logits)
+
+    lp_full = torch.gather(torch.log_softmax(base_logits, dim=-1), 1, candidates[:, :, 0])
+    assert torch.allclose(lp_cache, lp_full, atol=1e-6)
+    assert torch.allclose(q_cache, q_full, atol=2e-5), \
+        f"max |dq|={float((q_cache - q_full).abs().max()):.2e}"
+
+
 def test_omega_direct_cache_matches_full_after_skew_frame_drift():
     torch.manual_seed(0)
     m = VFEModel(_cfg(
@@ -624,6 +665,24 @@ def test_element_transport_skew_group_uses_transpose_inverse():
     assert torch.allclose(torch.einsum("...kl,...ml->...km", om, om), eye, atol=1e-4)
 
 
+def test_skew_element_transport_uses_true_inverse_after_orthogonality_drift():
+    grp = get_group("so_k")(K=3)
+    U = torch.eye(3).expand(1, 2, 3, 3).clone()
+    U[0, 1] = torch.tensor([
+        [1.00, 0.30, 0.00],
+        [0.05, 1.20, 0.00],
+        [0.00, 0.10, 0.85],
+    ])
+
+    built = build_transport_from_element(U, grp)
+    true_inverse = torch.linalg.inv(U.double()).to(U.dtype)
+
+    assert torch.allclose(built["exp_neg_phi"][0, 1], true_inverse[0, 1], atol=1e-7, rtol=1e-6)
+    assert not torch.allclose(
+        built["exp_neg_phi"][0, 1], U[0, 1].transpose(-1, -2), atol=1e-5, rtol=1e-5,
+    )
+
+
 def test_element_transport_nonskew_still_uses_inv_byte_identical():
     grp = get_group("glk")(K=3)                               # skew_symmetric=False -> unchanged inv path
     U = (torch.eye(3) + 0.1 * torch.randn(1, 2, 3, 3, generator=torch.Generator().manual_seed(1)))
@@ -648,6 +707,26 @@ def test_omega_direct_sp_symplectic_membership_and_cocycle():
     assert torch.allclose(UtJU, J.expand_as(UtJU), atol=1e-4)
     om = build_transport_from_element(U, grp)["Omega"]         # single block (irrep_dims=[4]) -> dict
     assert torch.allclose(om[0, 0, 1] @ om[0, 1, 2], om[0, 0, 2], atol=1e-4)   # cocycle
+
+
+def test_sp_omega_membership_diagnostic_detects_drift():
+    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+
+    grp = get_group("sp")(K=4)
+    U = torch.nn.Parameter(torch.eye(4).expand(3, 4, 4).clone())
+    with torch.no_grad():
+        U[1, 0, 0] = 1.25
+    opt = GaugeNaturalGradAdamW(
+        [{"params": [U], "lr": 0.0, "omega": True, "weight_decay": 0.0}],
+        grp.generators, grp.irrep_dims, group_name=grp.name, weight_decay=0.0,
+    )
+    opt._collect_gauge_diag = True
+    U.grad = torch.zeros_like(U)
+    U.grad[1, 0, 0] = 1.0
+
+    opt.step()
+
+    assert opt._gauge_diag["omega_symplectic_residual_max"] > 0.1
 
 
 def test_omega_direct_full_model_forward_sp_spn_tied():
@@ -751,7 +830,7 @@ def test_gauge_optim_omega_reorth_is_noop_for_irrep_tower():
 def test_omega_compact_storage_param_parity_and_assembly():
     pb_full = PriorBank(vocab_size=6, K=4, n_gen=8, gauge_parameterization="omega_direct", irrep_dims=[2, 2])
     pb_cmp  = PriorBank(vocab_size=6, K=4, n_gen=8, gauge_parameterization="omega_direct", irrep_dims=[2, 2],
-                        omega_compact_storage=True)
+                        omega_compact_storage=True, gauge_group_name="block_glk")
     assert pb_full.omega_embed.shape == (6, 4, 4)             # full (V,K,K)
     assert pb_cmp.omega_embed.shape == (6, 2, 2, 2)           # compact (V,H,d,d)
     assert pb_cmp.omega_embed.numel() == 6 * 8                # == V * n_gen (matches phi_embed)
@@ -759,24 +838,524 @@ def test_omega_compact_storage_param_parity_and_assembly():
     tok = torch.zeros(1, 3, dtype=torch.long)
     om = pb_cmp.encode(tok).omega
     assert om.shape == (1, 3, 4, 4)
-    assert torch.allclose(om, torch.eye(4).expand(1, 3, 4, 4), atol=1e-7)
+    assert isinstance(om, CompactBlockElement)
+    assert torch.allclose(om.to_dense(), torch.eye(4).expand(1, 3, 4, 4), atol=1e-7)
     # off-blocks are exactly zero for a non-identity compact frame
     with torch.no_grad():
         pb_cmp.omega_embed[0, 0] = torch.tensor([[1.2, 0.3], [0.0, 0.9]])
-    om2 = pb_cmp.encode(torch.zeros(1, 1, dtype=torch.long)).omega[0, 0]
+    om2 = pb_cmp.encode(torch.zeros(1, 1, dtype=torch.long)).omega[0, 0].to_dense()
     assert torch.allclose(om2[:2, 2:], torch.zeros(2, 2)) and torch.allclose(om2[2:, :2], torch.zeros(2, 2))
     # block 0 carries the edited compact block; block 1 stays identity (independent heads)
     assert torch.allclose(om2[:2, :2], torch.tensor([[1.2, 0.3], [0.0, 0.9]]), atol=1e-7)
     assert torch.allclose(om2[2:, 2:], torch.eye(2), atol=1e-7)
 
 
+def test_tied_compact_element_rejects_partial_logical_matrix_slice():
+    blocks = torch.eye(2).expand(2, 3, 2, 2).clone()
+    element = CompactBlockElement(blocks, K=4, tied=True)
+
+    leading = element[:, :1]
+    explicit_full_matrix = element[..., :, :]
+    assert leading.shape == (2, 1, 4, 4)
+    assert torch.equal(leading.blocks, blocks[:, :1])
+    assert torch.equal(explicit_full_matrix.blocks, blocks)
+    with pytest.raises(ValueError, match="matrix axes intact.*to_dense"):
+        element[..., :1, :1]
+
+
+def test_tied_compact_element_rejects_multiaxis_boolean_mask():
+    blocks = torch.eye(2).expand(2, 3, 2, 2).clone()
+    element = CompactBlockElement(blocks, K=4, tied=True)
+    mask_BN = torch.tensor([[True, False, True], [False, True, False]])
+
+    with pytest.raises(ValueError, match="boolean advanced indexing.*blocks.*to_dense"):
+        element[mask_BN, :2]
+
+
+@pytest.mark.parametrize("owner", [None, "so_n", "sp_n", "unknown"])
+def test_omega_compact_storage_requires_block_glk_owner(owner):
+    with pytest.raises(ValueError, match="explicit gauge_group_name"):
+        PriorBank(
+            vocab_size=6, K=4, n_gen=8, gauge_parameterization="omega_direct",
+            irrep_dims=[2, 2], omega_compact_storage=True, gauge_group_name=owner,
+        )
+
+
+@pytest.mark.parametrize(
+    "owner,tied",
+    [("block_glk", True), ("tied_block_glk", False)],
+)
+def test_omega_compact_storage_rejects_inconsistent_tie_metadata(owner, tied):
+    with pytest.raises(ValueError, match="inconsistent"):
+        PriorBank(
+            vocab_size=6, K=4, n_gen=4, gauge_parameterization="omega_direct",
+            irrep_dims=[2, 2], omega_compact_storage=True,
+            gauge_group_name=owner, gauge_group_is_tied=tied,
+        )
+
+
+def test_compact_transport_inverts_blocks_without_dense_K_matrix(monkeypatch):
+    import vfe3.geometry.lie_ops as lie_ops_module
+
+    K, H, d = 6, 3, 2
+    grp = get_group("block_glk")(K=K, n_heads=H)
+    pb = PriorBank(
+        vocab_size=6, K=K, n_gen=H * d * d, gauge_parameterization="omega_direct",
+        irrep_dims=[d] * H, omega_compact_storage=True, gauge_group_name="block_glk",
+    )
+    with torch.no_grad():
+        pb.omega_embed.add_(
+            0.05 * torch.randn(pb.omega_embed.shape, generator=torch.Generator().manual_seed(17)))
+
+    def _forbid_dense_reconstruction(*args, **kwargs):
+        raise AssertionError("compact transport reconstructed a dense K x K element")
+
+    monkeypatch.setattr(lie_ops_module, "_from_equal_diag_blocks", _forbid_dense_reconstruction)
+    element = pb._omega_lookup(torch.tensor([[0, 1, 2]]))
+    assert isinstance(element, CompactBlockElement)
+
+    seen_inverse_shapes = []
+    original_inverse = torch.linalg.inv
+
+    def _inverse_spy(matrix):
+        seen_inverse_shapes.append(tuple(matrix.shape[-2:]))
+        return original_inverse(matrix)
+
+    monkeypatch.setattr(torch.linalg, "inv", _inverse_spy)
+    built = build_transport_from_element(element, grp)
+
+    assert isinstance(built, CompactFactoredTransport)
+    assert seen_inverse_shapes == [(d, d)]
+    assert built.exp_blocks.shape == (1, 3, H, d, d)
+    assert built.inv_blocks.shape == (1, 3, H, d, d)
+
+
+def test_full_and_compact_omega_transport_match():
+    K, H, d, N = 6, 3, 2, 4
+    grp = get_group("block_glk")(K=K, n_heads=H)
+    gen = torch.Generator().manual_seed(23)
+    blocks = torch.eye(d).expand(1, N, H, d, d).clone()
+    blocks = blocks + 0.08 * torch.randn(blocks.shape, generator=gen)
+    compact = CompactBlockElement(blocks, K)
+    compact_transport = build_transport_from_element(compact, grp)
+    dense_omega = compact_transport.to_dense_omega()                  # canonical represented operator
+    mu = torch.randn(1, N, K, generator=gen)
+    sigma_diag = torch.rand(1, N, K, generator=gen) + 0.5
+    A = torch.randn(1, N, K, K, generator=gen)
+    sigma_full = A @ A.transpose(-1, -2) + 0.5 * torch.eye(K)
+
+    assert torch.allclose(
+        transport_mean(compact_transport, mu), transport_mean(dense_omega, mu),
+        atol=2e-6, rtol=1e-5,
+    )
+    assert torch.allclose(
+        transport_covariance(compact_transport, sigma_diag),
+        transport_covariance(dense_omega, sigma_diag), atol=2e-6, rtol=1e-5,
+    )
+    assert torch.allclose(
+        transport_covariance(compact_transport, sigma_full),
+        transport_covariance(dense_omega, sigma_full), atol=2e-5, rtol=1e-5,
+    )
+
+
+def test_compact_factored_unsqueeze_negative_alias_and_matrix_rejection():
+    H, d, K, L, M = 2, 2, 4, 2, 3
+    exp_blocks = torch.eye(d).expand(L, H, d, d).clone()
+    inv_blocks = torch.eye(d).expand(M, H, d, d).clone()
+    factored = CompactFactoredTransport(exp_blocks, inv_blocks, K)
+
+    positive = factored.unsqueeze(0)
+    negative = factored.unsqueeze(-5)                         # logical (L,M,K,K) rank -> leading alias
+    assert torch.equal(positive.exp_blocks, negative.exp_blocks)
+    assert torch.equal(positive.inv_blocks, negative.inv_blocks)
+    for dim in (1, 2, 3, 4, -1, -2, -3, -4):
+        with pytest.raises(ValueError, match="leading axis"):
+            factored.unsqueeze(dim)
+    assert torch.equal(
+        positive.unsqueeze(0).exp_blocks, positive.unsqueeze(-6).exp_blocks)
+    assert torch.equal(
+        positive.unsqueeze(1).exp_blocks, positive.unsqueeze(-5).exp_blocks)
+    with pytest.raises(ValueError, match="leading axis"):
+        positive.unsqueeze(-4)
+
+
+@pytest.mark.parametrize(
+    "irrep_dims,match",
+    [
+        (None, "explicit irrep_dims"),
+        ([4], "more than one"),
+        ([3, 1], "equal irrep dimensions"),
+        ([2, 0], "positive int"),
+        ([2, True], "positive int"),
+        ([2, 2], r"sum\(irrep_dims\)==K"),
+    ],
+)
+def test_compact_prior_bank_rejects_invalid_requested_layout(irrep_dims, match):
+    with pytest.raises(ValueError, match=match):
+        PriorBank(
+            vocab_size=4, K=5, n_gen=8, gauge_parameterization="omega_direct",
+            irrep_dims=irrep_dims, omega_compact_storage=True,
+            gauge_group_name="block_glk",
+        )
+
+
+def test_reflection_scope_is_owner_driven_and_public():
+    with pytest.warns(UserWarning, match="block-0 probe"):
+        block = PriorBank(
+            vocab_size=4, K=4, n_gen=8, gauge_parameterization="omega_direct",
+            irrep_dims=[2, 2], omega_compact_storage=True,
+            gauge_group_name="block_glk", omega_reflection="init_seed",
+        )
+    towers = [
+        PriorBank(
+            vocab_size=4, K=4, n_gen=8, gauge_parameterization="omega_direct",
+            irrep_dims=[2, 2], gauge_group_name=owner, omega_reflection="init_seed",
+        )
+        for owner in ("so_n", "sp_n")
+    ]
+
+    assert block.reflection_scope == "block_0_probe"
+    assert all(tower.reflection_scope == "full_element" for tower in towers)
+
+
+@pytest.mark.parametrize(
+    "builder_kwargs",
+    [
+        {"n_heads": 1},
+        {"n_heads": 2, "cross_couplings": [(0, 1)]},
+    ],
+    ids=["one_head", "cross_coupled"],
+)
+def test_single_block_block_glk_reflection_scope_is_full_element(builder_kwargs):
+    group = get_group("block_glk")(K=4, **builder_kwargs)
+    assert group.irrep_dims == [4]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        bank = PriorBank(
+            vocab_size=4, K=4, n_gen=group.generators.shape[0],
+            gauge_parameterization="omega_direct", irrep_dims=list(group.irrep_dims),
+            gauge_group_name=group.name, omega_reflection="init_seed",
+        )
+
+    assert bank.reflection_scope == "full_element"
+    assert not caught
+
+
+@pytest.mark.parametrize("L,M,d", [(2, 5, 2), (3, 2, 4)])
+def test_compact_mixed_query_key_transport_matches_dense_oracle(L, M, d, monkeypatch):
+    import vfe3.geometry.transport as transport_module
+
+    H, K = 2, 2 * d
+    gen = torch.Generator().manual_seed(101 + d)
+    exp_blocks = torch.eye(d).expand(1, L, H, d, d).clone()
+    inv_blocks = torch.eye(d).expand(1, M, H, d, d).clone()
+    exp_blocks = exp_blocks + 0.04 * torch.randn(exp_blocks.shape, generator=gen)
+    inv_blocks = inv_blocks + 0.04 * torch.randn(inv_blocks.shape, generator=gen)
+    compact = CompactFactoredTransport(exp_blocks, inv_blocks, K)
+    dense = compact.to_dense_omega()
+    mu = torch.randn(1, M, K, generator=gen)
+    sigma_diag = torch.rand(1, M, K, generator=gen) + 0.5
+    A = torch.randn(1, M, K, K, generator=gen)
+    sigma_full = A @ A.transpose(-1, -2) + 0.5 * torch.eye(K)
+
+    assert torch.allclose(transport_mean(compact, mu), transport_mean(dense, mu), atol=2e-6, rtol=1e-5)
+    original_pairs = transport_module._compact_pair_blocks
+
+    def _forbid_pairs(*args, **kwargs):
+        raise AssertionError("diagonal covariance allocated pair blocks")
+
+    monkeypatch.setattr(transport_module, "_compact_pair_blocks", _forbid_pairs)
+    assert torch.allclose(
+        transport_covariance(compact, sigma_diag),
+        transport_covariance(dense, sigma_diag), atol=2e-6, rtol=1e-5)
+    monkeypatch.setattr(transport_module, "_compact_pair_blocks", original_pairs)
+    assert torch.allclose(
+        transport_covariance(compact, sigma_full),
+        transport_covariance(dense, sigma_full), atol=2e-5, rtol=1e-5)
+
+
+def test_compact_diagonal_covariance_d_greater_than_keys_never_builds_pairs(monkeypatch):
+    import vfe3.geometry.transport as transport_module
+
+    L, M, H, d, K = 3, 2, 2, 4, 8
+    gen = torch.Generator().manual_seed(107)
+    exp_blocks = torch.eye(d).expand(1, L, H, d, d).clone()
+    inv_blocks = torch.eye(d).expand(1, M, H, d, d).clone()
+    exp_blocks += 0.03 * torch.randn(exp_blocks.shape, generator=gen)
+    inv_blocks += 0.03 * torch.randn(inv_blocks.shape, generator=gen)
+    compact = CompactFactoredTransport(exp_blocks, inv_blocks, K)
+    dense = compact.to_dense_omega()
+    sigma = torch.rand(1, M, K, generator=gen) + 0.5
+
+    def _forbid_pairs(*args, **kwargs):
+        raise AssertionError("diagonal covariance allocated pair blocks")
+
+    monkeypatch.setattr(transport_module, "_compact_pair_blocks", _forbid_pairs)
+    got = transport_covariance(compact, sigma)
+    expected = transport_covariance(dense, sigma)
+    assert torch.allclose(got, expected, atol=2e-6, rtol=1e-5)
+
+
+def test_compact_full_gauge_rope_covariance_matches_dense_oracle():
+    N, H, d, K = 3, 2, 2, 4
+    gen = torch.Generator().manual_seed(109)
+    blocks = torch.eye(d).expand(N, H, d, d).clone()
+    blocks += 0.04 * torch.randn(blocks.shape, generator=gen)
+    compact = CompactFactoredTransport(blocks, torch.linalg.inv(blocks.double()).to(blocks.dtype), K)
+    dense = compact.to_dense_omega()
+    angles = torch.tensor([0.1, 0.3, 0.6])
+    rotations = torch.stack([
+        torch.tensor([[torch.cos(a), -torch.sin(a)], [torch.sin(a), torch.cos(a)]])
+        for a in angles
+    ])
+    rope_blocks = rotations.unsqueeze(1).expand(N, H, d, d)
+    rope = CompactBlockElement(rope_blocks, K).to_dense()
+    A = torch.randn(N, K, K, generator=gen)
+    sigma = A @ A.transpose(-1, -2) + 0.5 * torch.eye(K)
+
+    got = transport_covariance(RopeTransport(compact, rope, on_cov=True), sigma)
+    expected = transport_covariance(RopeTransport(dense, rope, on_cov=True), sigma)
+    assert torch.allclose(got, expected, atol=2e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "representation,L,M",
+    [("compact", 2, 3), ("dense", 3, 2)],
+)
+def test_rope_transport_rejects_nonsquare_query_key_base(representation, L, M):
+    H, d, K = 2, 2, 4
+    exp_blocks = torch.eye(d).expand(L, H, d, d).clone()
+    inv_blocks = torch.eye(d).expand(M, H, d, d).clone()
+    compact = CompactFactoredTransport(exp_blocks, inv_blocks, K)
+    base = compact if representation == "compact" else compact.to_dense_omega()
+    rope = torch.eye(K).expand(L, K, K).clone()
+
+    with pytest.raises(ValueError, match="square token transport"):
+        RopeTransport(base, rope)
+
+
+@pytest.mark.parametrize("representation", ["compact", "dense"])
+def test_rope_transport_rejects_mismatched_rotation_length(representation):
+    N, H, d, K = 3, 2, 2, 4
+    blocks = torch.eye(d).expand(N, H, d, d).clone()
+    compact = CompactFactoredTransport(blocks, blocks.clone(), K)
+    base = compact if representation == "compact" else compact.to_dense_omega()
+    rope = torch.eye(K).expand(N - 1, K, K).clone()
+
+    with pytest.raises(ValueError, match="rope token length"):
+        RopeTransport(base, rope)
+
+
+def test_rope_transport_rejects_dense_singleton_matrix_axis():
+    N, K = 3, 4
+    base = torch.zeros(N, N, 1, K)
+    rope = torch.eye(K).expand(N, K, K).clone()
+
+    with pytest.raises(ValueError, match="dense base.*square K x K"):
+        RopeTransport(base, rope)
+
+
+@pytest.mark.parametrize(
+    "exp_shape,inv_shape,match",
+    [
+        ((3, 1, 4), (3, 4, 4), "each end in square K x K"),
+        ((3, 4, 4), (3, 5, 5), "same K"),
+        ((1, 3, 4, 4), (2, 3, 4, 4), "matching leading batch shapes"),
+    ],
+    ids=["singleton_matrix_axis", "different_K", "different_batch_shape"],
+)
+def test_rope_transport_rejects_malformed_factored_base(exp_shape, inv_shape, match):
+    base = FactoredTransport(
+        torch.zeros(exp_shape), torch.zeros(inv_shape), irrep_dims=[2, 2])
+    rope = torch.eye(4).expand(3, 4, 4).clone()
+
+    with pytest.raises(ValueError, match=match):
+        RopeTransport(base, rope)
+
+
+def test_compact_sampled_metrics_match_canonical_dense_operator():
+    import vfe3.metrics as metrics_module
+
+    N, H, d, K = 5, 2, 2, 4
+    gen = torch.Generator().manual_seed(113)
+    exp_blocks = torch.eye(d).expand(N, H, d, d).clone()
+    inv_blocks = torch.eye(d).expand(N, H, d, d).clone()
+    exp_blocks += 0.08 * torch.randn(exp_blocks.shape, generator=gen)
+    inv_blocks += 0.07 * torch.randn(inv_blocks.shape, generator=gen)
+    compact = CompactFactoredTransport(exp_blocks, inv_blocks, K)
+    dense = compact.to_dense_omega()
+
+    assert torch.allclose(
+        metrics_module.transport_asymmetry(compact),
+        metrics_module.transport_asymmetry(dense), atol=2e-6, rtol=1e-5)
+    compact_h = metrics_module.holonomy_deviation_sampled(
+        compact, n_triples=24, n_boot=16, seed=7)
+    dense_h = metrics_module.holonomy_deviation_sampled(
+        dense, n_triples=24, n_boot=16, seed=7)
+    assert compact_h.keys() == dense_h.keys()
+    for key in compact_h:
+        assert torch.allclose(compact_h[key], dense_h[key], atol=2e-5, rtol=1e-5), key
+    compact_w = metrics_module.holonomy_wilson_sampled(
+        compact, n_heads=H, irrep_dims=[d] * H, n_triples=24, n_boot=16, seed=7)
+    dense_w = metrics_module.holonomy_wilson_sampled(
+        dense, n_heads=H, irrep_dims=[d] * H, n_triples=24, n_boot=16, seed=7)
+    assert compact_w.keys() == dense_w.keys()
+    for key in compact_w:
+        assert torch.allclose(compact_w[key], dense_w[key], atol=2e-5, rtol=1e-5), key
+    assert torch.allclose(
+        metrics_module.cocycle_residual_sampled(compact, n_triples=24, seed=7),
+        metrics_module.cocycle_residual_sampled(dense, n_triples=24, seed=7),
+        atol=2e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("L,M", [(2, 3), (3, 2)])
+@pytest.mark.parametrize("representation", ["compact", "dense"])
+@pytest.mark.parametrize(
+    "metric_name",
+    [
+        "transport_asymmetry",
+        "holonomy_deviation_sampled",
+        "holonomy_wilson_sampled",
+        "cocycle_residual_sampled",
+    ],
+)
+def test_square_graph_metrics_reject_rectangular_transport(
+    metric_name, representation, L, M,
+):
+    import vfe3.metrics as metrics_module
+
+    H, d, K = 2, 2, 4
+    exp_blocks = torch.eye(d).expand(L, H, d, d).clone()
+    inv_blocks = torch.eye(d).expand(M, H, d, d).clone()
+    compact = CompactFactoredTransport(exp_blocks, inv_blocks, K)
+    omega = compact if representation == "compact" else compact.to_dense_omega()
+    metric = getattr(metrics_module, metric_name)
+
+    with pytest.raises(ValueError, match=r"square token transport \(Nq == Nk\)"):
+        metric(omega)
+
+
+@pytest.mark.parametrize("representation", ["compact", "dense"])
+@pytest.mark.parametrize(
+    "metric_name",
+    [
+        "holonomy_deviation_sampled",
+        "holonomy_wilson_sampled",
+        "cocycle_residual_sampled",
+    ],
+)
+def test_sampled_graph_metrics_reject_batched_square_transport_before_empty_return(
+    metric_name, representation,
+):
+    import vfe3.metrics as metrics_module
+
+    B, N, H, d, K = 1, 2, 2, 2, 4
+    blocks = torch.eye(d).expand(B, N, H, d, d).clone()
+    compact = CompactFactoredTransport(blocks, blocks.clone(), K)
+    omega = compact if representation == "compact" else compact.to_dense_omega()
+    metric = getattr(metrics_module, metric_name)
+
+    with pytest.raises(ValueError, match=r"requires (?:an )?unbatched"):
+        metric(omega)
+
+
+@pytest.mark.parametrize(
+    "metric_name",
+    [
+        "transport_asymmetry",
+        "holonomy_deviation_sampled",
+        "holonomy_wilson_sampled",
+        "cocycle_residual_sampled",
+    ],
+)
+def test_graph_metrics_reject_dense_nonsquare_matrix_axes(metric_name):
+    import vfe3.metrics as metrics_module
+
+    omega = torch.zeros(3, 3, 1, 4)
+    metric = getattr(metrics_module, metric_name)
+
+    with pytest.raises(ValueError, match="trailing square K x K"):
+        metric(omega)
+
+
+def test_compact_free_energy_and_diagnostics_never_dense_materialize(monkeypatch):
+    import vfe3.geometry.transport as transport_module
+
+    m = VFEModel(_cfg(
+        gauge_parameterization="omega_direct", gauge_group="block_glk", n_heads=2,
+        omega_compact_storage=True, family="gaussian_diagonal", decode_mode="diagonal",
+        n_e_steps=1,
+    ))
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+    active_blocks = torch.tensor([
+        [[[2.0, 0.0], [0.0, 1.0]], [[0.5, 0.0], [0.0, 1.0]]],
+        [[[4.0, 0.0], [0.0, 1.0]], [[0.25, 0.0], [0.0, 2.0]]],
+        [[[1.0, 0.0], [0.0, 3.0]], [[2.0, 0.0], [0.0, 0.5]]],
+        [[[0.5, 0.0], [0.0, 2.0]], [[1.0, 0.0], [0.0, 4.0]]],
+    ])
+    with torch.no_grad():
+        m.prior_bank.omega_embed[:4].copy_(active_blocks)
+        m.prior_bank.phi_embed.fill_(7.0)                     # deliberately unrelated inactive chart
+    enc = m.prior_bank.encode(token_ids)
+    belief = BeliefState(
+        mu=enc.mu[0], sigma=enc.sigma[0], phi=enc.phi[0], omega=enc.omega[0])
+
+    def _forbid_dense(*args, **kwargs):
+        raise AssertionError("compact omega crossed an implicit dense compatibility boundary")
+
+    monkeypatch.setattr(CompactBlockElement, "to_dense", _forbid_dense)
+    monkeypatch.setattr(CompactFactoredTransport, "to_dense_omega", _forbid_dense)
+    monkeypatch.setattr(transport_module, "compute_transport_operators", _forbid_dense)
+
+    value = free_energy_value(
+        belief, belief.mu, belief.sigma, m.group,
+        family="gaussian_diagonal", gauge_parameterization="omega_direct")
+    diagnostics = m.diagnostics(token_ids)
+
+    assert torch.isfinite(value)
+    assert all(torch.isfinite(torch.tensor(v)) for v in diagnostics.values())
+    block_logdet = torch.linalg.slogdet(active_blocks).logabsdet
+    block_svd = torch.linalg.svdvals(active_blocks)
+    full_logdet = block_logdet.sum(dim=-1)
+    represented_cond = (
+        block_svd[..., 0].amax(dim=-1) / block_svd[..., -1].amin(dim=-1))
+    anisotropy = block_svd[..., 0] / block_svd[..., -1]
+    assert diagnostics["gauge_trace_spread"] == pytest.approx(
+        float(full_logdet.std(unbiased=False)), rel=1e-6)
+    assert diagnostics["gauge_invariant_mean"] == pytest.approx(float(full_logdet.mean()), rel=1e-6)
+    assert diagnostics["gauge_invariant_spread"] == pytest.approx(
+        float(full_logdet.std(unbiased=False)), rel=1e-6)
+    assert diagnostics["vertex_cond_max"] == pytest.approx(float(represented_cond.max()), rel=1e-6)
+    assert diagnostics["gauge_head_aniso_mean"] == pytest.approx(float(anisotropy.mean()), rel=1e-6)
+    assert diagnostics["gauge_head_logdet_spread"] == pytest.approx(
+        float(block_logdet.std(unbiased=False)), rel=1e-6)
+
+
+def test_tied_compact_forward_backward_with_gamma_and_rope():
+    m = VFEModel(_cfg(
+        gauge_parameterization="omega_direct", gauge_group="tied_block_glk", n_heads=2,
+        omega_compact_storage=True, family="gaussian_full", decode_mode="full",
+        n_e_steps=1, lambda_gamma=0.5, s_e_step=True, pos_rotation="rope",
+        rope_full_gauge=True,
+    ))
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+
+    logits = m(token_ids)[0]
+    logits.square().mean().backward()
+
+    assert torch.isfinite(logits).all()
+    assert m.prior_bank.omega_embed.grad is not None
+    assert torch.isfinite(m.prior_bank.omega_embed.grad).all()
+
+
 def test_omega_compact_tied_shares_one_block():
     pb = PriorBank(vocab_size=6, K=4, n_gen=4, gauge_parameterization="omega_direct", irrep_dims=[2, 2],
-                   omega_compact_storage=True, gauge_group_is_tied=True)   # tied flag threaded from model.py
+                   omega_compact_storage=True, gauge_group_is_tied=True,
+                   gauge_group_name="tied_block_glk")   # tied flag threaded from model.py
     assert pb.omega_embed.shape == (6, 2, 2)                  # (V,d,d) one shared block
     with torch.no_grad():                                     # a non-identity shared block
         pb.omega_embed[0] = torch.tensor([[1.3, 0.2], [0.0, 0.8]])
-    om = pb.encode(torch.zeros(1, 1, dtype=torch.long)).omega[0, 0]
+    om = pb.encode(torch.zeros(1, 1, dtype=torch.long)).omega[0, 0].to_dense()
     assert torch.allclose(om[:2, :2], om[2:, 2:], atol=1e-7)  # same block in both heads
     assert torch.allclose(om[:2, 2:], torch.zeros(2, 2)) and torch.allclose(om[2:, :2], torch.zeros(2, 2))
 
@@ -795,7 +1374,7 @@ def test_omega_compact_optimizer_step_equals_full_step_on_blocks():
     Eb[3] = 0.0                                               # one inactive row (exercises the active mask)
 
     pb_cmp  = PriorBank(V, K, H * d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H,
-                        omega_compact_storage=True)
+                        omega_compact_storage=True, gauge_group_name="block_glk")
     pb_full = PriorBank(V, K, H * d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H)
     with torch.no_grad():
         pb_cmp.omega_embed.copy_(blocks)
@@ -823,7 +1402,8 @@ def test_omega_compact_tied_optimizer_step_moves_shared_block():
     V, H, d, K = 6, 2, 2, 4
     G_full = generate_glk_multihead_tied(K, H)               # (4, 4, 4) tied basis; last dim == K
     pb = PriorBank(V, K, d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H,
-                   omega_compact_storage=True, gauge_group_is_tied=True)
+                   omega_compact_storage=True, gauge_group_is_tied=True,
+                   gauge_group_name="tied_block_glk")
     assert pb.omega_embed.shape == (V, d, d)                 # (V,d,d), dim 3
     g = torch.Generator().manual_seed(7)
     grad = torch.randn(V, d, d, generator=g)
@@ -838,7 +1418,7 @@ def test_omega_compact_tied_optimizer_step_moves_shared_block():
     assert torch.allclose(U[3], before[3], atol=1e-6)        # inactive row untouched
     assert torch.det(U[0]) > 0                               # stays in GL+(d)
     # the assembled frame still shares the ONE stepped block across both heads, off-blocks zero
-    om = pb.encode(torch.zeros(1, 1, dtype=torch.long)).omega[0, 0]
+    om = pb.encode(torch.zeros(1, 1, dtype=torch.long)).omega[0, 0].to_dense()
     assert torch.allclose(om[:2, :2], om[2:, 2:], atol=1e-7)
     assert torch.allclose(om[:2, 2:], torch.zeros(2, 2)) and torch.allclose(om[2:, :2], torch.zeros(2, 2))
 
@@ -863,7 +1443,8 @@ def test_omega_compact_tied_step_magnitude_equals_full_tied_step():
 
     pb_full = PriorBank(V, K, d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H)  # (V,K,K) I init
     pb_cmp  = PriorBank(V, K, d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H,
-                        omega_compact_storage=True, gauge_group_is_tied=True)                     # (V,d,d) I init
+                        omega_compact_storage=True, gauge_group_is_tied=True,
+                        gauge_group_name="tied_block_glk")                     # (V,d,d) I init
     pb_full.omega_embed.grad = E_full.clone()
     pb_cmp.omega_embed.grad  = E_cmp.clone()
 
@@ -873,7 +1454,7 @@ def test_omega_compact_tied_step_magnitude_equals_full_tied_step():
     _opt(pb_full).step()
     _opt(pb_cmp).step()
 
-    assembled = pb_cmp._omega_lookup(torch.arange(V).unsqueeze(0))[0]     # (V,K,K) broadcast+assemble
+    assembled = pb_cmp._omega_lookup(torch.arange(V).unsqueeze(0))[0].to_dense()
     assert torch.allclose(assembled, pb_full.omega_embed.data, atol=1e-5)
 
 
@@ -900,17 +1481,18 @@ def test_omega_compact_flag_is_noop_for_equal_dim_towers():
 
 
 def test_omega_compact_tied_backward_sums_head_slot_gradients():
-    """End-to-end autograd through _from_equal_diag_blocks/expand: every other compact-storage
-    test sets p.grad manually; none does a real loss.backward() through the assembled belief.omega.
-    Encodes a token batch, forms a scalar loss on the ASSEMBLED (B,N,K,K) belief.omega, and checks
+    """End-to-end autograd through the explicit compatibility conversion: every other compact-storage
+    test sets p.grad manually; none does a real loss.backward() through dense compatibility output.
+    Encodes a token batch, explicitly converts belief.omega to (B,N,K,K), and checks
     omega_embed.grad has the right shape AND -- for the TIED shared (V,d,d) block -- equals the SUM
-    over the H head-slots of the assembled element's own gradient (the broadcast adjoint the
-    _omega_lookup docstring claims). Weights the loss with random per-entry coefficients (not a
+    over the H head-slots of the assembled element's own gradient (the tied broadcast adjoint).
+    Weights the loss with random per-entry coefficients (not a
     plain .sum()) so a bug that averaged instead of summed over H, or dropped a head slot, would not
     be masked by an all-ones gradient."""
     V, H, d, K = 6, 2, 2, 4
     pb = PriorBank(V, K, d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H,
-                   omega_compact_storage=True, gauge_group_is_tied=True)
+                   omega_compact_storage=True, gauge_group_is_tied=True,
+                   gauge_group_name="tied_block_glk")
     assert pb.omega_embed.shape == (V, d, d)                  # (V,d,d): one shared block
 
     tok = torch.tensor([[0, 1, 2]])                            # (1,3), distinct tokens -> clean per-token check
@@ -918,7 +1500,7 @@ def test_omega_compact_tied_backward_sums_head_slot_gradients():
     assert belief.omega.shape == (1, 3, K, K)
 
     w = torch.randn(1, 3, K, K, generator=torch.Generator().manual_seed(0))  # random per-entry weights
-    loss = (belief.omega * w).sum()
+    loss = (belief.omega.to_dense() * w).sum()
     loss.backward()
 
     assert pb.omega_embed.grad is not None

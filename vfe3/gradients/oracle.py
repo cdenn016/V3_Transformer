@@ -26,6 +26,7 @@ from vfe3.free_energy import free_energy, pairwise_energy, self_divergence_for_a
 # typing.get_type_hints resolves the annotation. transport.py does not import this module, so there
 # is no import cycle.
 from vfe3.geometry.transport import (
+    CompactFactoredTransport,
     FactoredTransport,
     RopeTransport,
     transport_covariance,
@@ -39,13 +40,13 @@ from vfe3.geometry.transport import (
 # E-step. autograd.grad needs grad enabled, so the oracle carries its own enable_grad island,
 # exactly as the phi step does (e_step.py).
 #
-# ``create_graph`` mirrors the hand kernel's behaviour on the UNROLLED E-step (e_step_gradient=
+# ``create_graph`` mirrors the hand kernel's behavior on the UNROLLED E-step (e_step_gradient=
 # 'unroll'): with create_graph=True the query leaf is the LIVE belief (not a detached clone) and the
 # returned grads keep their grad_fn, so the unrolled-through-inference signal reaches the prior
 # tables for non-kernel families (smoothing / gaussian_full / renyi_order!=1) -- exactly as the closed-
 # form kernel already does. With create_graph=False (the default, used for detach / straight-through /
 # diagnostics / any no_grad caller) the oracle clones a detached leaf and .detach()-es the result, a
-# constant tangent that leaks no graph -- byte-identical to the previous behaviour. Either way the
+# constant tangent that leaks no graph -- byte-identical to the previous behavior. Either way the
 # returned VALUES are the same (autograd.grad gives the same numbers); only connectivity differs.
 @torch.enable_grad()
 def belief_gradients_autograd(
@@ -53,7 +54,7 @@ def belief_gradients_autograd(
     sigma:        torch.Tensor,           # (N, K) belief variances
     mu_p:         torch.Tensor,           # (N, K) prior means
     sigma_p:      torch.Tensor,           # (N, K) prior variances
-    omega:        'torch.Tensor | FactoredTransport | RopeTransport',   # (N,N,K,K) dense OR factored exps
+    omega:        'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
 
     *,
     tau:           'float | torch.Tensor' = 1.0,
@@ -78,7 +79,7 @@ def belief_gradients_autograd(
     irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
     omega_builder:             Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-                                                 'torch.Tensor | FactoredTransport | RopeTransport']] = None,
+                                                 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport']] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:   # (grad_mu, grad_sigma), each (N, K)
     r"""Autograd of canonical F_red w.r.t. (mu, sigma). See module docstring for modes.
 

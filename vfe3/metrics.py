@@ -17,6 +17,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from vfe3.geometry.transport import CompactFactoredTransport
+
 
 def effective_rank(
     spectrum: torch.Tensor,              # (..., K) non-negative spectrum (diagonal variances or eigenvalues)
@@ -587,8 +589,51 @@ def per_head_gauge_invariants(
 
 # --- transport / energy directedness (the ln(3) symmetry-breaking signal) ---
 
+def _require_square_token_transport(
+    omega:       'torch.Tensor | CompactFactoredTransport',
+    metric_name: str,
+) -> int:
+    r"""Return N after rejecting rectangular query/key transport at graph-metric boundaries."""
+    if isinstance(omega, CompactFactoredTransport):
+        n_query = omega.exp_blocks.shape[-4]
+        n_key = omega.inv_blocks.shape[-4]
+    else:
+        if omega.dim() < 4:
+            raise ValueError(
+                f"{metric_name} requires (..., Nq, Nk, K, K) transport layout, got "
+                f"{tuple(omega.shape)}")
+        if omega.shape[-2] != omega.shape[-1]:
+            raise ValueError(
+                f"{metric_name} requires trailing square K x K matrix axes, got "
+                f"{tuple(omega.shape[-2:])} in shape {tuple(omega.shape)}")
+        n_query = omega.shape[-4]
+        n_key = omega.shape[-3]
+    if n_query != n_key:
+        raise ValueError(
+            f"{metric_name} requires a square token transport (Nq == Nk); "
+            f"got Nq={n_query}, Nk={n_key}")
+    return n_query
+
+
+def _require_unbatched_square_token_transport(
+    omega:       'torch.Tensor | CompactFactoredTransport',
+    metric_name: str,
+) -> int:
+    r"""Validate the unbatched square graph consumed by sampled triangle metrics."""
+    if isinstance(omega, CompactFactoredTransport):
+        if omega.exp_blocks.dim() != 4 or omega.inv_blocks.dim() != 4:
+            raise ValueError(
+                f"{metric_name} requires unbatched compact (N, H, d, d) factors; got "
+                f"{tuple(omega.exp_blocks.shape)} and {tuple(omega.inv_blocks.shape)}")
+    elif omega.dim() != 4:
+        raise ValueError(
+            f"{metric_name} requires an unbatched dense (N, N, K, K) transport; got "
+            f"shape {tuple(omega.shape)}")
+    return _require_square_token_transport(omega, metric_name)
+
+
 def transport_asymmetry(
-    omega: torch.Tensor,                 # (..., N, N, K, K) pairwise transport Omega_ij
+    omega: 'torch.Tensor | CompactFactoredTransport',
 ) -> torch.Tensor:                       # (..., N, N) A_ij = ||Omega_ij - Omega_ji||_F
     r"""Directedness of the transport: A_ij = ||Omega_ij - Omega_ji||_F.
 
@@ -596,8 +641,26 @@ def transport_asymmetry(
     the learned directed transport Omega_ij = exp(phi_i) exp(-phi_j) breaks the i<->j averaging
     symmetry. Omega_ji is the swap of the two token axes (not a matrix transpose).
     """
+    _require_square_token_transport(omega, "transport_asymmetry")
+    if isinstance(omega, CompactFactoredTransport):
+        blocks = torch.einsum(
+            "...ihkl,...jhlm->...ijhkm", omega.exp_blocks, omega.inv_blocks)
+        delta = blocks - blocks.transpose(-5, -4)                # swap i/j; keep H,d,d
+        return delta.square().sum(dim=(-3, -2, -1)).sqrt()
     omega_ji = omega.transpose(-4, -3)                           # swap the i and j token axes
     return torch.linalg.norm(omega - omega_ji, dim=(-2, -1))
+
+
+def _compact_sampled_pairs(
+    omega: CompactFactoredTransport,
+    left:  torch.Tensor,                  # (T,) query indices
+    right: torch.Tensor,                  # (T,) key indices
+) -> torch.Tensor:                        # (T,H,d,d) sampled Omega_left,right blocks
+    r"""Sample pairwise block operators without materializing ``(N,N,K,K)`` or dense ``K``."""
+    if omega.exp_blocks.dim() != 4:
+        raise ValueError("sampled compact transport metrics require unbatched (N,H,d,d) factors")
+    return torch.einsum(
+        "thkl,thlm->thkm", omega.exp_blocks[left], omega.inv_blocks[right])
 
 
 def energy_directedness(
@@ -726,7 +789,7 @@ def positional_content_score(
 # --- holonomy / curvature (corrected sampling; Regime-II quantity) ---
 
 def holonomy_deviation_sampled(
-    omega:            torch.Tensor,      # (N, N, K, K) pairwise transport Omega_ij
+    omega:            'torch.Tensor | CompactFactoredTransport',
 
     *,
     n_triples:        int  = 512,
@@ -742,20 +805,31 @@ def holonomy_deviation_sampled(
     every triangle closes (H = I) so this is ~0 (a flatness certificate); genuine curvature
     appears only under the opt-in regime_ii connection.
     """
-    n, k = omega.shape[0], omega.shape[-1]
-    eye = torch.eye(k, device=omega.device, dtype=omega.dtype)
-    gen = torch.Generator(device=omega.device).manual_seed(int(seed))
-    draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=omega.device)
+    compact = isinstance(omega, CompactFactoredTransport)
+    n = _require_unbatched_square_token_transport(omega, "holonomy_deviation_sampled")
+    k = omega.K if compact else omega.shape[-1]
+    device, dtype = omega.device, omega.dtype
+    eye = torch.eye(omega.block_dim if compact else k, device=device, dtype=dtype)
+    gen = torch.Generator(device=device).manual_seed(int(seed))
+    draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=device)
     keep = (draw[:, 0] != draw[:, 1]) & (draw[:, 1] != draw[:, 2]) & (draw[:, 0] != draw[:, 2])
     idx = draw[keep][:n_triples]
     if idx.numel() == 0:
-        z = omega.new_zeros(())
+        z = torch.zeros((), device=device, dtype=dtype)
         return {"mean": z, "ci_lo": z, "ci_hi": z,
-                "per_triple": omega.new_zeros(0), "span": omega.new_zeros(0)}
-    h = omega[idx[:, 0], idx[:, 1]] @ omega[idx[:, 1], idx[:, 2]] @ omega[idx[:, 2], idx[:, 0]]
-    per = torch.linalg.norm(h - eye, dim=(-2, -1))               # (T,)
-    span = (idx.amax(dim=1) - idx.amin(dim=1)).to(omega.dtype)
-    ridx = torch.randint(0, per.shape[0], (n_boot, per.shape[0]), generator=gen, device=omega.device)
+                "per_triple": torch.zeros(0, device=device, dtype=dtype),
+                "span": torch.zeros(0, device=device, dtype=dtype)}
+    if compact:
+        o_ij = _compact_sampled_pairs(omega, idx[:, 0], idx[:, 1])
+        o_jk = _compact_sampled_pairs(omega, idx[:, 1], idx[:, 2])
+        o_ki = _compact_sampled_pairs(omega, idx[:, 2], idx[:, 0])
+        h = o_ij @ o_jk @ o_ki
+        per = (h - eye).square().sum(dim=(-3, -2, -1)).sqrt()
+    else:
+        h = omega[idx[:, 0], idx[:, 1]] @ omega[idx[:, 1], idx[:, 2]] @ omega[idx[:, 2], idx[:, 0]]
+        per = torch.linalg.norm(h - eye, dim=(-2, -1))           # (T,)
+    span = (idx.amax(dim=1) - idx.amin(dim=1)).to(dtype)
+    ridx = torch.randint(0, per.shape[0], (n_boot, per.shape[0]), generator=gen, device=device)
     boot = per[ridx].mean(dim=1)
     return {
         "mean":       per.mean(),
@@ -767,7 +841,7 @@ def holonomy_deviation_sampled(
 
 
 def holonomy_wilson_sampled(
-    omega:      torch.Tensor,            # (N, N, K, K) pairwise transport Omega_ij
+    omega:      'torch.Tensor | CompactFactoredTransport',
 
     *,
     n_heads:    int                 = 1,
@@ -794,7 +868,10 @@ def holonomy_wilson_sampled(
     genuine holonomy appears only under the opt-in regime_ii connection. Seeded random triples match
     ``holonomy_deviation_sampled`` so the two observables are directly comparable.
     """
-    n, k = omega.shape[0], omega.shape[-1]
+    compact = isinstance(omega, CompactFactoredTransport)
+    n = _require_unbatched_square_token_transport(omega, "holonomy_wilson_sampled")
+    k = omega.K if compact else omega.shape[-1]
+    device, dtype = omega.device, omega.dtype
     if irrep_dims is not None:
         if sum(irrep_dims) != k:
             raise ValueError(f"sum(irrep_dims)={sum(irrep_dims)} must equal K={k}")
@@ -803,23 +880,43 @@ def holonomy_wilson_sampled(
     elif n_heads > 1 and k % n_heads != 0:
         raise ValueError(f"n_heads={n_heads} must divide K={k} for the per-head Wilson decomposition")
     n_blocks = n_heads if irrep_dims is None else len(irrep_dims)
-    gen = torch.Generator(device=omega.device).manual_seed(int(seed))
-    draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=omega.device)
+    if compact and irrep_dims is not None and irrep_dims != omega.irrep_dims:
+        raise ValueError(
+            f"compact irrep_dims={omega.irrep_dims} do not match requested {irrep_dims}")
+    if compact and n_heads > 1 and n_heads != omega.n_blocks:
+        raise ValueError(
+            f"compact n_heads={n_heads} must match stored blocks={omega.n_blocks}")
+    gen = torch.Generator(device=device).manual_seed(int(seed))
+    draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=device)
     keep = (draw[:, 0] != draw[:, 1]) & (draw[:, 1] != draw[:, 2]) & (draw[:, 0] != draw[:, 2])
     idx = draw[keep][:n_triples]
     if idx.numel() == 0:
-        z = omega.new_zeros(())
-        return {"wilson_mean": omega.new_ones(()), "deviation_mean": z, "ci_lo": z, "ci_hi": z,
-                "per_triple": omega.new_zeros(0), "span": omega.new_zeros(0),
-                "per_head": omega.new_ones(n_blocks)}
-    h = omega[idx[:, 0], idx[:, 1]] @ omega[idx[:, 1], idx[:, 2]] @ omega[idx[:, 2], idx[:, 0]]   # (T, K, K)
-    diag = torch.diagonal(h, dim1=-2, dim2=-1)                   # (T, K) Re diagonal of H
-    per = diag.sum(dim=-1) / k                                   # (T,) W_ijk / K
-    span = (idx.amax(dim=1) - idx.amin(dim=1)).to(omega.dtype)
+        z = torch.zeros((), device=device, dtype=dtype)
+        return {"wilson_mean": torch.ones((), device=device, dtype=dtype),
+                "deviation_mean": z, "ci_lo": z, "ci_hi": z,
+                "per_triple": torch.zeros(0, device=device, dtype=dtype),
+                "span": torch.zeros(0, device=device, dtype=dtype),
+                "per_head": torch.ones(n_blocks, device=device, dtype=dtype)}
+    if compact:
+        o_ij = _compact_sampled_pairs(omega, idx[:, 0], idx[:, 1])
+        o_jk = _compact_sampled_pairs(omega, idx[:, 1], idx[:, 2])
+        o_ki = _compact_sampled_pairs(omega, idx[:, 2], idx[:, 0])
+        h = o_ij @ o_jk @ o_ki                                  # (T,H,d,d)
+        block_trace = torch.diagonal(h, dim1=-2, dim2=-1).sum(dim=-1)  # (T,H)
+        per = block_trace.sum(dim=-1) / k
+        diag = None
+    else:
+        h = omega[idx[:, 0], idx[:, 1]] @ omega[idx[:, 1], idx[:, 2]] @ omega[idx[:, 2], idx[:, 0]]
+        diag = torch.diagonal(h, dim1=-2, dim2=-1)               # (T,K)
+        per = diag.sum(dim=-1) / k
+    span = (idx.amax(dim=1) - idx.amin(dim=1)).to(dtype)
     dev = 1.0 - per                                              # (T,) Wilson-action density 1 - W/K
-    ridx = torch.randint(0, dev.shape[0], (n_boot, dev.shape[0]), generator=gen, device=omega.device)
+    ridx = torch.randint(0, dev.shape[0], (n_boot, dev.shape[0]), generator=gen, device=device)
     boot = dev[ridx].mean(dim=1)
-    if irrep_dims is not None:
+    if compact:
+        native = block_trace.mean(dim=0) / omega.block_dim
+        per_head = native if (irrep_dims is not None or n_heads > 1) else per.mean().reshape(1)
+    elif irrep_dims is not None:
         blocks   = torch.split(diag, irrep_dims, dim=-1)             # B chunks, each (T, d_b)
         per_head = torch.stack([b.sum(dim=-1).mean(dim=0) / b.shape[-1] for b in blocks])   # (B,) W^(b)/d_b
     else:
@@ -853,7 +950,7 @@ def curvature_field(
 
 
 def cocycle_residual_sampled(
-    omega:      torch.Tensor,            # (N, N, K, K) pairwise transport Omega_ij
+    omega:      'torch.Tensor | CompactFactoredTransport',
 
     *,
     n_triples:  int = 512,
@@ -867,13 +964,20 @@ def cocycle_residual_sampled(
     non-cocycle (regime_ii) transport gives > 0. Seeded random triples (matching
     ``holonomy_deviation_sampled``) avoid the row-major low-index sampling bias.
     """
-    n, k = omega.shape[0], omega.shape[-1]
-    gen = torch.Generator(device=omega.device).manual_seed(int(seed))
-    draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=omega.device)
+    compact = isinstance(omega, CompactFactoredTransport)
+    n = _require_unbatched_square_token_transport(omega, "cocycle_residual_sampled")
+    device, dtype = omega.device, omega.dtype
+    gen = torch.Generator(device=device).manual_seed(int(seed))
+    draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=device)
     keep = (draw[:, 0] != draw[:, 1]) & (draw[:, 1] != draw[:, 2]) & (draw[:, 0] != draw[:, 2])
     idx = draw[keep][:n_triples]
     if idx.numel() == 0:
-        return omega.new_zeros(())
+        return torch.zeros((), device=device, dtype=dtype)
+    if compact:
+        o_ik = _compact_sampled_pairs(omega, idx[:, 0], idx[:, 2])
+        o_ij = _compact_sampled_pairs(omega, idx[:, 0], idx[:, 1])
+        o_jk = _compact_sampled_pairs(omega, idx[:, 1], idx[:, 2])
+        return (o_ik - o_ij @ o_jk).square().sum(dim=(-3, -2, -1)).sqrt().mean()
     o_ik = omega[idx[:, 0], idx[:, 2]]                           # (T, K, K)
     o_ij = omega[idx[:, 0], idx[:, 1]]
     o_jk = omega[idx[:, 1], idx[:, 2]]
@@ -1210,7 +1314,7 @@ def _m_attn_entropy(*, beta: torch.Tensor, **kw) -> float:
 
 
 @register_metric("holonomy_deviation")
-def _m_holonomy(*, omega: torch.Tensor, **kw) -> float:
+def _m_holonomy(*, omega: 'torch.Tensor | CompactFactoredTransport', **kw) -> float:
     """Mean triangle-holonomy departure from identity (curvature proxy).
 
     Routes to the SAMPLED estimator (audit 2026-06-10 F16): the deterministic row-major

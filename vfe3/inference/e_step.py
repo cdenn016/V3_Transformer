@@ -20,6 +20,7 @@ from vfe3.belief import BeliefState
 from vfe3.families.base import get_family, kl
 from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
+from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
 from vfe3.geometry.retraction import get_retraction, retract_phi
 from vfe3.numerics import apply_mu_trust_region
@@ -27,6 +28,7 @@ from vfe3.geometry.transport import (
     _TRANSPORT_BATCH_INDEPENDENT,
     _TRANSPORT_NEEDS_MU,
     _TRANSPORT_NEEDS_SIGMA,
+    CompactFactoredTransport,
     FactoredTransport,
     RopeTransport,
     build_factored_transport,
@@ -60,9 +62,9 @@ def _transport(
     mu_key:             Optional[torch.Tensor] = None,      # regime_ii KEY-slot means (None -> mu; oracle detach split)
     sigma_key:          Optional[torch.Tensor] = None,      # regime_ii_covariant KEY-slot variances (None -> sigma)
     gauge_parameterization: str                    = "phi",   # 'phi' (exp path) | 'omega_direct' (stored element)
-    omega:              Optional[torch.Tensor] = None,      # (B, N, K, K) per-token U_i (omega_direct only)
+    omega:              'torch.Tensor | CompactBlockElement | None' = None,  # stored U_i (omega_direct only)
     reflection:         Optional[torch.Tensor] = None,      # (N,) or (B, N) per-token sign s_i; phi-path fold (None -> off)
-) -> torch.Tensor:                            # (N, N, K, K) or (B, N, N, K, K) Omega_ij
+) -> 'torch.Tensor | CompactFactoredTransport':
     r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
     The build is config-selected through ``get_transport(transport_mode)``; the default 'flat' is
@@ -80,7 +82,11 @@ def _transport(
     sees batched (B, N, K) means."""
     if gauge_parameterization == "omega_direct":
         built = build_transport_from_element(omega, group)
-        return built["Omega"] if isinstance(built, dict) else built.to_dense_omega()
+        if isinstance(built, dict):
+            return built["Omega"]
+        if isinstance(built, CompactFactoredTransport):
+            return built
+        return built.to_dense_omega()                         # preserve the shipped noncompact block path
     build = get_transport(transport_mode)
     batch_independent = transport_mode in _TRANSPORT_BATCH_INDEPENDENT
     if phi.dim() == 2:
@@ -180,7 +186,7 @@ def build_belief_transport(
     *,
     transport_mode:     str                    = "flat",   # connection-regime registry key
     gauge_parameterization: str                = "phi",    # 'phi' (exp path) | 'omega_direct' (stored element)
-    omega:              Optional[torch.Tensor] = None,      # (B, N, K, K) per-token U_i (omega_direct only)
+    omega:              'torch.Tensor | CompactBlockElement | None' = None,  # stored U_i (omega_direct only)
     gauge_mode:         str                    = "learned", # 'learned' | 'trivial' (forwarded to the builder)
     cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
     link_alpha:         float                  = 1.0,       # direct-link scale (regime_ii_link / _charted)
@@ -202,7 +208,7 @@ def build_belief_transport(
     sigma_key:          Optional[torch.Tensor] = None,      # regime_ii_covariant KEY-slot variances (None -> sigma)
     rope:               Optional[torch.Tensor] = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
     reflection:         Optional[torch.Tensor] = None,      # (B, N) per-token sign s_i in {+1,-1}; phi-path fold (None -> off)
-) -> 'torch.Tensor | FactoredTransport | RopeTransport':
+) -> 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport':
     r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
 
     On the flat + block-diagonal-with-equal-blocks path (``_can_fuse_flat``) returns a
@@ -230,7 +236,7 @@ def build_belief_transport(
     and dense routes (the non-flat regime builders keep their own keying and swallow them).
     """
     if gauge_parameterization == "omega_direct":
-        # build_transport_from_element returns a FactoredTransport for the equal-block groups
+        # build_transport_from_element returns a compact/factored transport for equal-block groups
         # (block_glk) and a {'exp_phi','exp_neg_phi','Omega'} DICT for a single block (glk). The
         # forward consumers (transport_mean / transport_covariance) accept a dense tensor,
         # FactoredTransport, or RopeTransport -- NOT a dict -- so normalize the single-block dict to
@@ -590,7 +596,7 @@ def e_step_iteration(
     rope_on_cov:               bool                   = False,  # full-gauge: rotate covariance too
     rope_on_value:             bool                   = True,   # False -> value aggregation uses the un-rotated base
     grad_record:               Optional[dict]         = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
-    _prebuilt_omega:           'torch.Tensor | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: flat-path cache from e_step (phi-invariant when e_phi_lr==0)
+    _prebuilt_omega:           'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: flat-path cache from e_step
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
     (autograd of the alignment block + preconditioner + Lie retraction).
@@ -912,7 +918,7 @@ def e_step(
     rope_on_value:     bool                   = True,
 
     log_prior:         Optional[torch.Tensor] = None,
-    prebuilt_transport: 'torch.Tensor | FactoredTransport | RopeTransport | None' = None,   # share_refine_s_transport: caller-built flat transport (consumed only when the internal hoist would fire)
+    prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,   # share_refine_s_transport: caller-built flat transport
     **kwargs,
 ) -> 'BeliefState | Tuple[BeliefState, List[float]]':
     r"""Iterate ``e_step_iteration`` ``n_iter`` times (parallel mean-field). Optionally
@@ -950,7 +956,7 @@ def e_step(
             "gauge_parameterization='omega_direct' does not support E-step phi updates; "
             f"got e_phi_lr={e_phi_lr}. Set e_phi_lr=0.0."
         )
-    _hoisted_omega: 'torch.Tensor | FactoredTransport | RopeTransport | None' = None
+    _hoisted_omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None
     if e_phi_lr == 0.0 and transport_mode_kw == "flat":
         if prebuilt_transport is not None:
             # share_refine_s_transport (default OFF): the caller built the flat transport ONCE from

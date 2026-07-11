@@ -31,7 +31,7 @@ group. Only ACTIVE rows (nonzero gradient -- the batch's tokens) are preconditio
 per-token metric solves touch the batch, not the whole vocabulary.
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -52,6 +52,56 @@ def _polar_orthogonalize(
     with torch.amp.autocast(U.device.type, enabled=False):
         W, _, Vh = torch.linalg.svd(U.double(), full_matrices=False)
         return (W @ Vh).to(U.dtype)
+
+
+def _require_finite_nonsingular_omega(
+    U: torch.Tensor,                      # (..., d, d) updated full elements or compact blocks
+) -> None:
+    r"""Fail immediately when an omega retraction produces a nonfinite or singular element."""
+    with torch.no_grad(), torch.amp.autocast(U.device.type, enabled=False):
+        if not bool(torch.isfinite(U).all()):
+            raise FloatingPointError("omega retraction produced a nonfinite group element")
+        sign, logabsdet = torch.linalg.slogdet(U.reshape(-1, U.shape[-1], U.shape[-1]).double())
+        if bool((sign == 0).any()):
+            raise ValueError("omega retraction produced a singular group element")
+        if not bool(torch.isfinite(logabsdet).all()):
+            raise FloatingPointError("omega retraction produced a nonfinite log-determinant")
+
+
+def _omega_condition_values(
+    U: torch.Tensor,                      # (..., d, d) updated full elements or compact blocks
+) -> torch.Tensor:                        # (...) spectral condition number per element/block
+    r"""Float64 condition of each represented element for log-cadence diagnostics.
+
+    An untied compact row has shape ``(A, H, d, d)`` and represents the block diagonal
+    ``diag(U_1, ..., U_H)``. Its largest singular value is the largest singular value over every
+    block and its smallest is the smallest over every block; taking ``cond`` block-by-block would
+    miss cross-block scale separation. Dense and tied ``(A, d, d)`` rows keep their ordinary matrix
+    condition.
+    """
+    with torch.no_grad(), torch.amp.autocast(U.device.type, enabled=False):
+        if U.dim() == 4:                                      # (A,H,d,d) untied compact elements
+            singular = torch.linalg.svdvals(U.double())       # (A,H,d), descending within each block
+            return singular[..., 0].amax(dim=-1) / singular[..., -1].amin(dim=-1)
+        return torch.linalg.cond(U.reshape(-1, U.shape[-1], U.shape[-1]).double())
+
+
+def _symplectic_membership_residual(
+    U: torch.Tensor,                      # (..., K, K), K even, defining Sp(K,R) representation
+) -> torch.Tensor:                        # (...) relative ||U^T J U - J||_F
+    r"""Relative defining-representation symplectic residual ``||U^T J U-J||_F/||J||_F``."""
+    K = U.shape[-1]
+    if K % 2 != 0:
+        raise ValueError(f"symplectic omega diagnostic requires even K, got K={K}")
+    with torch.no_grad(), torch.amp.autocast(U.device.type, enabled=False):
+        m = K // 2
+        J = torch.zeros(K, K, device=U.device, dtype=torch.float64)
+        eye = torch.eye(m, device=U.device, dtype=torch.float64)
+        J[:m, m:] = eye
+        J[m:, :m] = -eye
+        U64 = U.double()
+        error = U64.transpose(-1, -2) @ J @ U64 - J
+        return error.norm(dim=(-2, -1)) / J.norm()
 
 
 class GaugeNaturalGradAdamW(torch.optim.AdamW):
@@ -95,12 +145,13 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         irrep_dims:     List[int],            # block sizes (sum == K); used by *_per_block metrics
 
         *,
-        precond_mode:       str   = "pullback_per_block",
-        gauge_momentum:     float = 0.9,
-        gauge_update_rule:  str   = "heavy_ball",
-        omega_retract_mode: str   = "lie_exp",
-        skew_symmetric:     bool  = False,
-        omega_reorth_every: int   = 0,
+        precond_mode:       str           = "pullback_per_block",
+        gauge_momentum:     float         = 0.9,
+        gauge_update_rule:  str           = "heavy_ball",
+        omega_retract_mode: str           = "lie_exp",
+        skew_symmetric:     bool          = False,
+        omega_reorth_every: int           = 0,
+        group_name:         Optional[str] = None,
         **kwargs,
     ) -> None:
         if type(omega_reorth_every) is not int or omega_reorth_every < 0:
@@ -108,6 +159,8 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 "omega_reorth_every must be a nonnegative int, got "
                 f"{type(omega_reorth_every).__name__}: {omega_reorth_every!r}"
             )
+        if group_name is not None and (not isinstance(group_name, str) or not group_name):
+            raise ValueError(f"group_name must be a nonempty str or None, got {group_name!r}")
         super().__init__(params, **kwargs)
         self._generators        = generators
         self._irrep_dims        = irrep_dims
@@ -125,6 +178,8 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         self._skew_symmetric     = bool(skew_symmetric)
         self._omega_reorth_every = omega_reorth_every
         self._omega_step         = 0                     # M-step counter for the reorth cadence
+        self._group_name         = group_name
+        self._has_omega_group    = any(group.get("omega", False) for group in self.param_groups)
         # Moment rule for the natural-gradient gauge step: 'heavy_ball' (default; momentum only, no
         # per-coordinate normalization) or 'adam' (Adam m/v/bias-correction ON the natural gradient,
         # restoring 1/sqrt(v) normalization while keeping the metric direction).
@@ -137,7 +192,8 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         # True only on a log/eval step, so the silent hot path computes NOTHING extra. When set, step()
         # stashes cos(nat, grad) (1.0 for the conformal killing rescale; <1 when pullback reshapes the
         # direction) and -- on the pullback modes -- the per-token metric condition number into
-        # _gauge_diag, which train.py reads into metrics.csv.
+        # _gauge_diag. Omega-direct groups additionally report active-row element condition, or the
+        # defining Sp(K,R) membership residual for ``sp``. train.py reads the fixed keys into metrics.csv.
         self._collect_gauge_diag = False
         self._gauge_diag: dict   = {}
 
@@ -163,30 +219,74 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
     def state_dict(self) -> Dict[str, object]:                         # type: ignore[override]
         r"""Serialize AdamW state plus the M-step count that drives omega reorthogonalization."""
         state = super().state_dict()
-        state["optimizer_extra"] = {"omega_step": int(self._omega_step)}
+        state["optimizer_extra"] = {
+            "omega_step":         int(self._omega_step),
+            "omega_dirty_format": 1,
+        }
         return state
 
     def load_state_dict(
         self,
         state_dict: Dict[str, object],
     ) -> None:                                                        # type: ignore[override]
-        r"""Restore AdamW state and the omega cadence, accepting legacy state with a warning."""
+        r"""Restore AdamW state, omega cadence, and versioned dirty-row masks.
+
+        Pre-O5 checkpoints may carry ``omega_step`` but no dirty-mask format marker. If a live
+        single-block skew cadence resumes from that format, every row is conservatively marked dirty:
+        the missing mask cannot prove which rows accumulated drift before the checkpoint. Current
+        checkpoints carry ``omega_dirty_format=1``; a missing mask in that format means clean.
+        """
         core_state = dict(state_dict)
         extra = core_state.pop("optimizer_extra", None)
         super().load_state_dict(core_state)
         if isinstance(extra, dict) and "omega_step" in extra:
             self._omega_step = int(extra["omega_step"])
-            return
+        else:
+            import warnings
+            self._omega_step = 0
+            warnings.warn(
+                "GaugeNaturalGradAdamW checkpoint has no optimizer_extra.omega_step; the omega "
+                "reorthogonalization cadence restarts at zero (non-exact resume when "
+                "omega_reorth_every > 0).",
+                UserWarning,
+                stacklevel=2,
+            )
 
-        import warnings
-        self._omega_step = 0
-        warnings.warn(
-            "GaugeNaturalGradAdamW checkpoint has no optimizer_extra.omega_step; the omega "
-            "reorthogonalization cadence restarts at zero (non-exact resume when "
-            "omega_reorth_every > 0).",
-            UserWarning,
-            stacklevel=2,
+        current_dirty_format = isinstance(extra, dict) and extra.get("omega_dirty_format") == 1
+        legacy_skew_cadence = (
+            not current_dirty_format
+            and self._has_omega_group
+            and self._skew_symmetric
+            and self._omega_reorth_every > 0
+            and len(self._irrep_dims) == 1
         )
+        for group in self.param_groups:
+            if not group.get("omega", False):
+                continue
+            for p in group["params"]:
+                dirty = self.state[p].get("omega_dirty")
+                if dirty is None:
+                    dirty = torch.full(
+                        (p.shape[0],), legacy_skew_cadence,
+                        dtype=torch.bool, device=p.device)
+                else:
+                    if dirty.shape != (p.shape[0],):
+                        raise ValueError(
+                            f"optimizer omega_dirty has shape {tuple(dirty.shape)}, expected "
+                            f"({p.shape[0]},)")
+                    dirty = dirty.to(device=p.device, dtype=torch.bool)
+                    if legacy_skew_cadence:
+                        dirty.fill_(True)
+                self.state[p]["omega_dirty"] = dirty
+        if legacy_skew_cadence:
+            import warnings
+            warnings.warn(
+                "GaugeNaturalGradAdamW checkpoint predates optimizer_extra.omega_dirty_format; "
+                "all omega rows were marked dirty so the next scheduled orthogonal projection "
+                "cannot silently skip pre-checkpoint drift.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def _compact_gld_basis(
         self,
@@ -229,8 +329,12 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 "the frame. Call step() with no closure."
             )
         collect = self._collect_gauge_diag                             # gated: True only on log/eval steps
+        if collect:
+            self._gauge_diag = {}                                      # never expose a prior attempted step
         cos_acc: List[float] = []
         cond_acc: List[torch.Tensor] = []
+        omega_cond_acc: List[torch.Tensor] = []
+        omega_sp_acc: List[torch.Tensor] = []
         for group in self.param_groups:
             if group.get("omega", False):
                 # omega_direct group: the params ARE stored GL(K) group elements U (shape (V, K, K)),
@@ -261,6 +365,7 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                         p.grad = None
                         continue
                     Ua, Ea = U[act], E[act]                            # (A,K,K) / (A,H,d,d) / (A,d,d)
+                    _require_finite_nonsingular_omega(Ua)
                     if untied_compact or tied_compact:
                         d      = Ua.shape[-1]
                         Gd, gp = self._compact_gld_basis(d, U.device, U.dtype)   # gl(d) basis + cached gram_pinv
@@ -282,14 +387,37 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                             # (The untied gl(d)^H generators are Gram = I, already correct -- do NOT scale.)
                             xi = xi / (K_full // d)
                         Ur = retract_omega(Ua_r, -lr * xi, Gd, mode=mode)
-                        U[act] = Ur.reshape(Ua.shape)                  # back to (A,H,d,d) / (A,d,d)
+                        Ur = Ur.reshape(Ua.shape)                      # back to (A,H,d,d) / (A,d,d)
+                        _require_finite_nonsingular_omega(Ur)
+                        U[act] = Ur
                     else:
                         Gd = self._generators.to(device=U.device, dtype=U.dtype)
                         if full_gp is None:
                             full_gp = gram_pinv(Gd)                    # (n_gen, n_gen) cached per step
                         # natural-gradient tangent xi = Gram^{-1} proj_g(U^T E); (U^T E)_{km} = sum_l U_{lk} E_{lm}
                         xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua, Ea), Gd, gram_pinv_=full_gp)
-                        U[act] = retract_omega(Ua, -lr * xi, Gd, mode=mode)   # (A, K, K) U <- U retr(-lr xi)
+                        Ur = retract_omega(Ua, -lr * xi, Gd, mode=mode)
+                        _require_finite_nonsingular_omega(Ur)
+                        U[act] = Ur                                    # (A, K, K) U <- U retr(-lr xi)
+                    state = self.state[p]
+                    dirty = state.get("omega_dirty")
+                    if dirty is None:
+                        dirty = torch.zeros(U.shape[0], dtype=torch.bool, device=U.device)
+                        state["omega_dirty"] = dirty
+                    elif dirty.shape != (U.shape[0],):
+                        raise ValueError(
+                            f"optimizer omega_dirty has shape {tuple(dirty.shape)}, expected "
+                            f"({U.shape[0]},)")
+                    elif dirty.device != U.device or dirty.dtype != torch.bool:
+                        dirty = dirty.to(device=U.device, dtype=torch.bool)
+                        state["omega_dirty"] = dirty
+                    dirty.logical_or_(act)
+                    if collect:
+                        updated = U[act]
+                        if self._group_name == "sp" and not (untied_compact or tied_compact):
+                            omega_sp_acc.append(_symplectic_membership_residual(updated).reshape(-1))
+                        else:
+                            omega_cond_acc.append(_omega_condition_values(updated).reshape(-1))
                     p.grad = None                                      # consumed: AdamW no-ops on it
                 # Orthogonality-drift control (default OFF: omega_reorth_every=0 -> byte-identical).
                 # Polar reorth guarantees O(K) membership, which equals the structure group ONLY for
@@ -310,7 +438,22 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                     self._omega_step += 1
                     if self._omega_step % self._omega_reorth_every == 0:
                         for p in group["params"]:
-                            p.data.copy_(_polar_orthogonalize(p.data))
+                            dirty = self.state[p].get("omega_dirty")
+                            if dirty is None:
+                                continue
+                            if dirty.shape != (p.shape[0],):
+                                raise ValueError(
+                                    f"optimizer omega_dirty has shape {tuple(dirty.shape)}, expected "
+                                    f"({p.shape[0]},)")
+                            if dirty.device != p.device or dirty.dtype != torch.bool:
+                                dirty = dirty.to(device=p.device, dtype=torch.bool)
+                                self.state[p]["omega_dirty"] = dirty
+                            if not bool(dirty.any()):
+                                continue
+                            projected = _polar_orthogonalize(p.data[dirty])
+                            _require_finite_nonsingular_omega(projected)
+                            p.data[dirty] = projected
+                            dirty.zero_()
                 continue
             if not group.get("gauge", False):
                 continue
@@ -377,11 +520,18 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                     p.add_(buf, alpha=-lr)                             # phi <- phi - lr*m
                 p.grad = None                                          # consumed: AdamW no-ops on it
         if collect:
-            self._gauge_diag = {}
             if cos_acc:
                 self._gauge_diag["cos_nat_phi"] = sum(cos_acc) / len(cos_acc)
             if cond_acc:
                 allc = torch.cat(cond_acc)
                 self._gauge_diag["pullback_cond_median"] = float(allc.median())
                 self._gauge_diag["pullback_cond_max"]    = float(allc.max())
+            if omega_cond_acc:
+                allc = torch.cat(omega_cond_acc)
+                self._gauge_diag["omega_condition_median"] = float(allc.median())
+                self._gauge_diag["omega_condition_max"]    = float(allc.max())
+            if omega_sp_acc:
+                allr = torch.cat(omega_sp_acc)
+                self._gauge_diag["omega_symplectic_residual_median"] = float(allr.median())
+                self._gauge_diag["omega_symplectic_residual_max"]    = float(allr.max())
         return super().step()                                          # closure already rejected above

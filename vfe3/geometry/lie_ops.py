@@ -12,6 +12,7 @@ import hashlib
 import math
 import warnings
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -269,6 +270,177 @@ def _from_equal_diag_blocks(
     torch.diagonal(o5, dim1=-4, dim2=-2).copy_(blocks.movedim(-3, -1))
     return out
 
+
+@dataclass
+class CompactBlockElement:
+    r"""A compact equal-block group element without a dense :math:`K\times K` allocation.
+
+    ``blocks`` stores ``(..., H, d, d)`` independent blocks, or ``(..., d, d)`` when ``tied=True``.
+    The represented element has ``K = H d`` and exactly zero off-block entries. Structural slicing,
+    reshaping, expansion, cloning, and detaching preserve the compact representation;
+    callers that genuinely require a dense compatibility tensor must request :meth:`to_dense`
+    explicitly.
+    """
+
+    blocks: torch.Tensor
+    K:      int
+    tied:   bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.K) is not int or self.K <= 0:
+            raise ValueError(f"K must be a positive int, got {type(self.K).__name__}: {self.K!r}")
+        if type(self.tied) is not bool:
+            raise ValueError(
+                f"tied must be a bool, got {type(self.tied).__name__}: {self.tied!r}")
+        min_rank = 2 if self.tied else 3
+        if self.blocks.dim() < min_rank or self.blocks.shape[-1] != self.blocks.shape[-2]:
+            layout = "(..., d, d)" if self.tied else "(..., H, d, d)"
+            raise ValueError(
+                f"CompactBlockElement blocks must have square layout {layout}, got "
+                f"shape {tuple(self.blocks.shape)}")
+        d = self.blocks.shape[-1]
+        if self.K % d != 0:
+            raise ValueError(f"K={self.K} must be divisible by block dimension d={d}")
+        if not self.tied and self.blocks.shape[-3] * d != self.K:
+            raise ValueError(
+                f"untied blocks have H={self.blocks.shape[-3]} and d={d}, but H*d != K={self.K}")
+
+    @property
+    def block_dim(self) -> int:
+        return self.blocks.shape[-1]
+
+    @property
+    def n_blocks(self) -> int:
+        return self.K // self.block_dim
+
+    @property
+    def shape(self) -> torch.Size:
+        leading = self.blocks.shape[:-2] if self.tied else self.blocks.shape[:-3]
+        return torch.Size((*leading, self.K, self.K))
+
+    @property
+    def device(self) -> torch.device:
+        return self.blocks.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.blocks.dtype
+
+    @property
+    def requires_grad(self) -> bool:
+        return self.blocks.requires_grad
+
+    def dim(self) -> int:
+        return len(self.shape)
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def expanded_blocks(self) -> torch.Tensor:
+        r"""Return ``(..., H, d, d)`` blocks, broadcasting the tied block without densifying."""
+        if not self.tied:
+            return self.blocks
+        return self.blocks.unsqueeze(-3).expand(
+            *self.blocks.shape[:-2], self.n_blocks, self.block_dim, self.block_dim)
+
+    def to_dense(self) -> torch.Tensor:
+        r"""Explicit compatibility conversion to the represented dense ``(..., K, K)`` element."""
+        return _from_equal_diag_blocks(self.expanded_blocks(), self.K)
+
+    def clone(self) -> 'CompactBlockElement':
+        return CompactBlockElement(self.blocks.clone(), self.K, self.tied)
+
+    def detach(self) -> 'CompactBlockElement':
+        return CompactBlockElement(self.blocks.detach(), self.K, self.tied)
+
+    def _storage_index(self, index: object) -> tuple:
+        r"""Translate logical indexing while leaving the represented matrix axes intact."""
+        logical_rank = self.dim()
+        n_leading = logical_rank - 2
+        raw = index if isinstance(index, tuple) else (index,)
+        if any(isinstance(item, torch.Tensor) and item.dtype == torch.bool for item in raw):
+            raise ValueError(
+                "CompactBlockElement does not support boolean advanced indexing because a mask "
+                "may consume multiple logical axes; index .blocks at an internal compact call "
+                "site or call to_dense() for logical tensor indexing")
+        if sum(item is Ellipsis for item in raw) > 1:
+            raise IndexError("an index can only have a single ellipsis")
+        consumed = sum(item is not None and item is not Ellipsis for item in raw)
+        if consumed > logical_rank:
+            raise IndexError(
+                f"too many indices for CompactBlockElement of dimension {logical_rank}")
+        missing = logical_rank - consumed
+        expanded = []
+        for item in raw:
+            if item is Ellipsis:
+                expanded.extend([slice(None)] * missing)
+            else:
+                expanded.append(item)
+        if not any(item is Ellipsis for item in raw):
+            expanded.extend([slice(None)] * missing)
+
+        storage_index = []
+        logical_axis = 0
+        for item in expanded:
+            if item is None:
+                if logical_axis > n_leading:
+                    raise ValueError(
+                        "CompactBlockElement indexing may only insert leading axes; call "
+                        "to_dense() before inserting a matrix axis")
+                storage_index.append(item)
+                continue
+            if logical_axis < n_leading:
+                storage_index.append(item)
+            elif not (isinstance(item, slice)
+                      and item.start is None and item.stop is None and item.step is None):
+                raise ValueError(
+                    "CompactBlockElement indexing must leave both logical matrix axes intact; "
+                    "call to_dense() before slicing a matrix axis")
+            logical_axis += 1
+        return tuple(storage_index)
+
+    def __getitem__(self, index: object) -> 'CompactBlockElement':
+        return CompactBlockElement(self.blocks[self._storage_index(index)], self.K, self.tied)
+
+    def __setitem__(self, index: object, value: 'CompactBlockElement') -> None:
+        if not isinstance(value, CompactBlockElement):
+            raise TypeError(
+                "compact element assignment requires CompactBlockElement; call to_dense() for "
+                "dense compatibility operations")
+        if value.K != self.K or value.tied != self.tied:
+            raise ValueError("compact element assignment requires matching K and tied layout")
+        self.blocks[self._storage_index(index)] = value.blocks
+
+    def unsqueeze(self, dim: int) -> 'CompactBlockElement':
+        n_leading = self.dim() - 2
+        normalized = dim if dim >= 0 else dim + self.dim() + 1
+        if normalized < 0 or normalized > n_leading:
+            raise ValueError(
+                "CompactBlockElement.unsqueeze may only add a leading batch/token axis; call "
+                "to_dense() before inserting a matrix axis")
+        return CompactBlockElement(self.blocks.unsqueeze(normalized), self.K, self.tied)
+
+    def reshape(self, *shape: int) -> 'CompactBlockElement':
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list, torch.Size)):
+            shape = tuple(shape[0])
+        if len(shape) < 2 or tuple(shape[-2:]) != (self.K, self.K):
+            raise ValueError(
+                f"compact reshape must preserve trailing dense shape ({self.K}, {self.K}), got {shape}")
+        suffix = (self.block_dim, self.block_dim)
+        if not self.tied:
+            suffix = (self.n_blocks, *suffix)
+        return CompactBlockElement(self.blocks.reshape(*shape[:-2], *suffix), self.K, self.tied)
+
+    def expand(self, *shape: int) -> 'CompactBlockElement':
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list, torch.Size)):
+            shape = tuple(shape[0])
+        if len(shape) < 2 or tuple(shape[-2:]) != (self.K, self.K):
+            raise ValueError(
+                f"compact expand must preserve trailing dense shape ({self.K}, {self.K}), got {shape}")
+        suffix = (self.block_dim, self.block_dim)
+        if not self.tied:
+            suffix = (self.n_blocks, *suffix)
+        return CompactBlockElement(self.blocks.expand(*shape[:-2], *suffix), self.K, self.tied)
 
 @register_compose("bch")
 def compose_bch(

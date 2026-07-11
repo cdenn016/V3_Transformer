@@ -22,9 +22,11 @@ from vfe3.attention_prior import attention_log_prior
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup, get_group
+from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.geometry.norms import get_norm
 from vfe3.geometry.rope import get_pos_rotation
-from vfe3.geometry.transport import RopeTransport, _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA
+from vfe3.geometry.transport import (CompactFactoredTransport, FactoredTransport, RopeTransport,
+                                     _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA)
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.positional_phi import apply_positional_phi
@@ -177,6 +179,7 @@ class VFEModel(nn.Module):
             omega_compact_storage=(cfg.omega_compact_storage
                                    and cfg.gauge_group in ("block_glk", "tied_block_glk")),
             gauge_group_is_tied=(cfg.gauge_group == "tied_block_glk"),
+            gauge_group_name=self.group.name,
         )
         # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
         # maps (K, eps), so re-instantiating them per block/forward only churned objects.
@@ -602,7 +605,7 @@ class VFEModel(nn.Module):
         *,
         e_step_gradient:    str                    = "unroll",
         rope:               Optional[torch.Tensor] = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
-        prebuilt_transport: Optional[object]       = None,      # shared flat transport from phi0
+        prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,
     ) -> 'tuple[torch.Tensor, torch.Tensor]':
         r"""Refine the model channel s by its own E-step toward the frozen hyper-prior r plus the
         gamma model-consensus, with the shared gauge frame phi0 held fixed (e_phi_lr=0). Returns the
@@ -1015,9 +1018,9 @@ class VFEModel(nn.Module):
         positions and the beliefs (mu, sigma) held FIXED.
 
         Under ``'omega'`` mode the frame is left-multiplied by the canonical reflection
-        R = reflection_element(K) (det R = -1): R is applied to the FULL assembled (K, K) frame; for
-        compact block-diagonal storage this flips block 0 only (reflection_element(K)'s top-left d-block
-        is reflection_element(d), the rest identity), matching the source-table flip in
+        R = reflection_element(K) (det R = -1) on dense storage. Compact block-diagonal storage applies
+        the equivalent operator without allocating K x K: reflection_element(d) multiplies block 0 and
+        every other block remains unchanged, matching the source-table flip in
         :meth:`_flip_omega_embed_row`. Under ``'phi'`` mode the per-token reflection sign is negated
         (s -> -s) at the masked positions; the §3 fold in ``build_belief_transport`` then applies
         R_i Omega_ij R_j at F-eval, matching the source-buffer flip in :meth:`_flip_reflection_sign_row`."""
@@ -1025,10 +1028,21 @@ class VFEModel(nn.Module):
         mask = (token_ids == token_id)                                                       # (B, N)
         if mode == "omega":
             from vfe3.geometry.generators import reflection_element
-            k    = belief.omega.shape[-1]
-            r    = reflection_element(k, dtype=belief.omega.dtype, device=belief.omega.device)   # (K, K)
-            trial_omega = belief.omega.clone()
-            trial_omega[mask] = torch.einsum("kl,...lm->...km", r, trial_omega[mask])        # R @ U at masked
+            if isinstance(belief.omega, CompactBlockElement):
+                if belief.omega.tied:
+                    raise ValueError("compact Metropolis reflection requires untied block storage")
+                r = reflection_element(
+                    belief.omega.block_dim, dtype=belief.omega.dtype, device=belief.omega.device)
+                trial_omega = belief.omega.clone()
+                selected = trial_omega.blocks[mask].clone()                                  # (#,H,d,d)
+                selected[:, 0] = r @ selected[:, 0]                                           # block-0 probe
+                trial_omega.blocks[mask] = selected
+            else:
+                k = belief.omega.shape[-1]
+                r = reflection_element(k, dtype=belief.omega.dtype, device=belief.omega.device)
+                trial_omega = belief.omega.clone()
+                trial_omega[mask] = torch.einsum(
+                    "kl,...lm->...km", r, trial_omega[mask])                                 # R @ U
             return belief._replace(omega=trial_omega)
         trial_reflection = belief.reflection.clone()                                         # phi: s -> -s at masked
         trial_reflection[mask] *= -1.0
@@ -1058,14 +1072,14 @@ class VFEModel(nn.Module):
 
     def _flip_omega_embed_row(
         self,
-        R:        torch.Tensor,              # reflection_element(K) (K, K); det R = -1
+        R:        torch.Tensor,              # full reflection_element(K), or compact reflection_element(d)
 
         token_id: int,                       # source-table row (token id) to flip
     ) -> None:
         r"""Left-multiply the stored frame of ``token_id`` by the reflection R IN PLACE, toggling its
         det-sign. Respects the storage layout (mirrors the init_seed seeding in prior_bank): full
-        (V, K, K) -> R @ row; compact (V, H, d, d) -> R's top-left d-block applied to block 0 only
-        (blocks 1..H-1 are identity under reflection_element(K)).
+        (V, K, K) -> R_K @ row; compact (V, H, d, d) -> R_d applied to block 0 only
+        (blocks 1..H-1 are unchanged under the represented full reflection).
 
         This in-place write happens after optimizer.step() and does not touch AdamW's exp_avg/
         exp_avg_sq buffers for this row -- the moment staleness caveat, see :meth:`metropolis_omega_step`."""
@@ -1081,7 +1095,10 @@ class VFEModel(nn.Module):
                 assert pb.omega_embed.dim() == 4, (
                     "compact det-sign flip assumes untied (V,H,d,d); tied (V,d,d) is gated out at config")
                 d = pb.omega_embed.shape[-1]                            # compact block size
-                pb.omega_embed[token_id, 0] = R[:d, :d] @ pb.omega_embed[token_id, 0]
+                if R.shape != (d, d):
+                    raise ValueError(
+                        f"compact reflection must have shape ({d}, {d}), got {tuple(R.shape)}")
+                pb.omega_embed[token_id, 0] = R @ pb.omega_embed[token_id, 0]
             else:
                 pb.omega_embed[token_id] = R @ pb.omega_embed[token_id]
 
@@ -1113,9 +1130,10 @@ class VFEModel(nn.Module):
         'metropolis'), ``'phi'`` flips the per-token ``reflection_sign`` buffer (gauge_parameterization=
         'phi' + phi_reflection='metropolis'). Both share this sweep; only the per-token flip and the
         trial-frame construction differ. The beliefs are held FIXED (a Metropolis-within-Gibbs block
-        move on the joint F): each proposed sign flip (an orthogonal involution R = reflection_element(K),
-        det R = -1, so the proposal is symmetric and the Hastings ratio reduces to the plain Metropolis
-        accept) is accepted with min(1, exp(-DeltaF / T)). On accept the source table
+        move on the joint F): each proposed sign flip is an orthogonal involution (dense
+        ``reflection_element(K)`` or its compact block-0 ``reflection_element(d)`` representation),
+        both with determinant -1. The proposal is symmetric, so the Hastings ratio reduces to the
+        plain Metropolis acceptance probability min(1, exp(-DeltaF / T)). On acceptance the source table
         (``omega_embed`` / ``reflection_sign``) is mutated in place and the flipped belief is carried
         forward, so the next token's DeltaF is measured against the post-accept state (a correct MCMC
         chain). Everything runs under no_grad. Returns a small stats dict (proposed/accepted counts,
@@ -1148,8 +1166,13 @@ class VFEModel(nn.Module):
             R = None
             if mode == "omega":                                         # phi flips a scalar sign, no R needed
                 from vfe3.geometry.generators import reflection_element
-                k = belief.omega.shape[-1]
-                R = reflection_element(k, dtype=belief.omega.dtype, device=belief.omega.device)   # (K, K)
+                reflection_dim = (
+                    belief.omega.block_dim
+                    if isinstance(belief.omega, CompactBlockElement)
+                    else belief.omega.shape[-1]
+                )
+                R = reflection_element(
+                    reflection_dim, dtype=belief.omega.dtype, device=belief.omega.device)
             f_cur = self._metropolis_free_energy(belief, mu_p, sigma_p, mode=mode)
             proposed = accepted = 0
             dfs: list = []
@@ -1495,7 +1518,7 @@ class VFEModel(nn.Module):
         phi:       torch.Tensor,             # (B, N, n_gen) gauge frame (TIED flat transport)
 
         *,
-        omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
+        omega:     'torch.Tensor | CompactBlockElement | None' = None,  # stored belief frame; None -> phi
         reflection: Optional[torch.Tensor] = None,  # (B, N) per-token sign s_i; phi-path R_i Omega_ij R_j fold; None -> off
         s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
     ) -> 'tuple[torch.Tensor, float | torch.Tensor, Optional[torch.Tensor]]':
@@ -1547,7 +1570,7 @@ class VFEModel(nn.Module):
         phi:       torch.Tensor,             # (B, N, n_gen) converged gauge frame (detached by caller)
 
         *,
-        omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
+        omega:     'torch.Tensor | CompactBlockElement | None' = None,  # stored belief frame; None -> phi
         reflection: Optional[torch.Tensor] = None,  # (B, N) per-token sign s_i; phi-path R_i Omega_ij R_j fold; None -> off
     ) -> torch.Tensor:                       # () model-coupling block (UNWEIGHTED)
         r"""The gamma model-coupling block at the given gauge frame (UNWEIGHTED).
@@ -1576,7 +1599,7 @@ class VFEModel(nn.Module):
 
         *,
         eps:       float = 1e-12,
-        omega:     Optional[torch.Tensor] = None,   # (B, N, K, K) belief GL(K) frame under omega_direct; None -> phi path
+        omega:     'torch.Tensor | CompactBlockElement | None' = None,  # stored belief frame; None -> phi
         reflection: Optional[torch.Tensor] = None,  # (B, N) per-token sign s_i; phi-path R_i Omega_ij R_j fold; None -> off
         s_belief:  'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s); None -> raw s tables
     ) -> 'Dict[str, torch.Tensor]':          # SUM-scale {coupling, meta_entropy, total}
@@ -1917,7 +1940,7 @@ class VFEModel(nn.Module):
         *,
         log_eps:    float                                              = 1e-12,  # floor for log(pi) on allowed support
 
-        omega:      Optional[torch.Tensor]                             = None,   # (B, N, K, K) stored GL(K) frame
+        omega:      'torch.Tensor | CompactBlockElement | None'        = None,   # stored GL(K) frame
         reflection: Optional[torch.Tensor]                             = None,   # (B, N) phi-path reflection sign
         s_belief:   'Optional[tuple[torch.Tensor, torch.Tensor]]'       = None,   # refined (mu_s, sigma_s); raw tables if None
     ) -> torch.Tensor:                       # (B, [H,] N, N) mixed log-prior
@@ -2165,7 +2188,7 @@ class VFEModel(nn.Module):
         # local neighborhood -- a systematically biased sample. The sampled mean is representative and
         # still ~0 on the flat phi-cocycle (flatness certificate); the dict key is unchanged.
         # ---- extended per-eval observability (2026-06-13 run-diagnostics rollout) ----
-        # Every reduction below reads tensors already materialized above (out.mu/sigma/phi, exp_phi,
+        # Every reduction below reads tensors already materialized above (out.mu/sigma/active frame,
         # omega, energy, beta, self_div); no extra forward, no_grad. NEW keys only -- d["total"] and
         # the existing block values are untouched (test_model_channel_diagnostics pins total's closure;
         # test_regime_ii pins d["holonomy_deviation"], whose semantics is preserved as the mean below).
@@ -2182,12 +2205,42 @@ class VFEModel(nn.Module):
         # Manuscript-canonical gauge invariant: the Wilson-action density 1 - Re Tr(H)/K (PIFB:862-869),
         # the trace complement of the Frobenius certificate above; ~0 on the flat cocycle, > 0 under regime_ii.
         d["holonomy_wilson"]    = float(metrics.holonomy_wilson_sampled(omega)["deviation_mean"])
-        d["gauge_trace_spread"] = float(metrics.gauge_trace_spread(out.phi, self.group.generators))
-
-        # Group-correct gauge invariant: gauge_trace_spread is identically 0 on SO(N)/Sp(2m) (traceless
-        # generators), so dispatch the right invariant of exp(phi) and report its spread over tokens.
-        exp_phi = compute_transport_operators(out.phi.unsqueeze(0), self.group)["exp_phi"][0]  # (N, K, K)
-        ginv = metrics.group_gauge_invariant(exp_phi, self.group).float()
+        # Active-frame health. Under omega_direct, ``phi`` is an inactive table and can disagree
+        # arbitrarily with the stored element; derive every frame invariant from ``out.omega`` and do
+        # not exponentiate inactive coordinates. Compact blocks are reduced directly as the represented
+        # block-diagonal element. The phi path below is unchanged.
+        if out.omega is not None:
+            if isinstance(out.omega, CompactBlockElement):
+                active_blocks = out.omega.expanded_blocks()                    # (N,H,d,d)
+                block_logdet = torch.linalg.slogdet(active_blocks).logabsdet    # (N,H)
+                block_svd = torch.linalg.svdvals(active_blocks)                 # (N,H,d)
+                full_logdet = block_logdet.sum(dim=-1)                          # (N,)
+                d["gauge_trace_spread"] = float(full_logdet.std(unbiased=False))
+                ginv = full_logdet.float()                                      # compact owners are GL blocks
+                vertex_cond = (
+                    block_svd[..., 0].amax(dim=-1)
+                    / block_svd[..., -1].amin(dim=-1).clamp(min=cfg.eps))
+                _ghi = {
+                    "logdet": block_logdet,
+                    "anisotropy": block_svd[..., 0] / block_svd[..., -1].clamp(min=cfg.eps),
+                }
+            else:
+                active_vertex = out.omega                                       # (N,K,K) stored element
+                active_logdet = torch.linalg.slogdet(active_vertex).logabsdet
+                d["gauge_trace_spread"] = float(active_logdet.std(unbiased=False))
+                ginv = metrics.group_gauge_invariant(active_vertex, self.group).float()
+                active_svd = torch.linalg.svdvals(active_vertex)
+                vertex_cond = active_svd[..., 0] / active_svd[..., -1].clamp(min=cfg.eps)
+                _ghi = metrics.per_head_gauge_invariants(active_vertex, self.group.irrep_dims)
+        else:
+            d["gauge_trace_spread"] = float(
+                metrics.gauge_trace_spread(out.phi, self.group.generators))
+            active_vertex = compute_transport_operators(
+                out.phi.unsqueeze(0), self.group)["exp_phi"][0]                 # (N,K,K)
+            ginv = metrics.group_gauge_invariant(active_vertex, self.group).float()
+            active_svd = torch.linalg.svdvals(active_vertex)
+            vertex_cond = active_svd[..., 0] / active_svd[..., -1].clamp(min=cfg.eps)
+            _ghi = metrics.per_head_gauge_invariants(active_vertex, self.group.irrep_dims)
         d["gauge_invariant_mean"]   = float(ginv.mean())
         d["gauge_invariant_spread"] = float(ginv.std(unbiased=False))
 
@@ -2196,8 +2249,7 @@ class VFEModel(nn.Module):
         # on the FLAT cocycle (Omega_ji = Omega_ij^{-1} != Omega_ij), so it is NOT a curvature /
         # non-flatness signal; cocycle_residual and holonomy_deviation are the flatness diagnostics.
         d["cocycle_residual"] = float(metrics.cocycle_residual_sampled(omega))   # composition-law flatness
-        _svd_v = torch.linalg.svdvals(exp_phi)                      # (N, K) vertex-factor singular values
-        d["vertex_cond_max"]  = float((_svd_v[..., 0] / _svd_v[..., -1].clamp(min=cfg.eps)).max())
+        d["vertex_cond_max"]  = float(vertex_cond.max())
         #   FLAT path: pairwise cond(Omega_ij) = cond(exp_phi_i exp(-phi_j)) <= vertex_cond_max^2. Under
         #   regime_ii the edge factor exp(delta_ij) adds conditioning NOT captured here -- sandwich_absmax
         #   below is the direct (Omega Sigma Omega^T) overflow signal that DOES see it.
@@ -2211,7 +2263,6 @@ class VFEModel(nn.Module):
         # spread). Informative for block_glk / tied_block_glk (independent per-block GL frames); for the
         # orthogonal/symplectic tied towers (so_k/so_n/sp_n) it is structurally vacuous (det=1, unit
         # singular values, one shared group element), so read it only on the GL-block groups.
-        _ghi = metrics.per_head_gauge_invariants(exp_phi, self.group.irrep_dims)
         d["gauge_head_aniso_mean"]    = float(_ghi["anisotropy"].float().mean())
         d["gauge_head_logdet_spread"] = float(_ghi["logdet"].float().std(unbiased=False))
 
@@ -2554,16 +2605,35 @@ class VFEModel(nn.Module):
             rec["self_divergence"].append(float(self_div.sum()))
             rec["holonomy_deviation"].append(float(metrics.holonomy_deviation_sampled(omega)["mean"]))
             rec["holonomy_wilson"].append(float(metrics.holonomy_wilson_sampled(omega)["deviation_mean"]))
-            rec["gauge_trace_spread"].append(float(metrics.gauge_trace_spread(belief.phi, self.group.generators)))
-            exp_phi = compute_transport_operators(belief.phi.unsqueeze(0), self.group)["exp_phi"][0]
+            if belief.omega is not None:
+                if isinstance(belief.omega, CompactBlockElement):
+                    block_logdet = torch.linalg.slogdet(
+                        belief.omega.expanded_blocks()).logabsdet
+                    active_invariant = block_logdet.sum(dim=-1).float()
+                else:
+                    active_logdet = torch.linalg.slogdet(belief.omega).logabsdet
+                    active_invariant = metrics.group_gauge_invariant(
+                        belief.omega, self.group).float()
+                rec["gauge_trace_spread"].append(
+                    float(active_logdet.std(unbiased=False))
+                    if not isinstance(belief.omega, CompactBlockElement)
+                    else float(active_invariant.std(unbiased=False)))
+            else:
+                rec["gauge_trace_spread"].append(float(
+                    metrics.gauge_trace_spread(belief.phi, self.group.generators)))
+                active_vertex = compute_transport_operators(
+                    belief.phi.unsqueeze(0), self.group)["exp_phi"][0]
+                active_invariant = metrics.group_gauge_invariant(
+                    active_vertex, self.group).float()
             rec["gauge_invariant_spread"].append(
-                float(metrics.group_gauge_invariant(exp_phi, self.group).float().std(unbiased=False)))
+                float(active_invariant.std(unbiased=False)))
             _diag = belief.sigma.dim() == belief.mu.dim()
             spec = belief.sigma if _diag else torch.linalg.eigvalsh(belief.sigma)
             rec["effective_rank"].append(float(metrics.effective_rank(spec).mean()))
             rec["attn_entropy"].append(float(metrics.attention_entropy(beta)))
             bs = metrics.belief_spectrum(belief.sigma, diagonal=_diag, eps=cfg.eps)
             rec["belief_cond_median"].append(float(bs["condition"].float().median()))
+            # Coordinate-chart diagnostic only: under omega_direct phi is intentionally inactive.
             rec["phi_norm_mean"].append(float(torch.linalg.norm(belief.phi, dim=-1).mean()))
 
             mu_p = (1.0 - rho) * mu_p + rho * belief.mu              # handoff (mirrors vfe_stack)

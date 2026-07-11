@@ -285,6 +285,7 @@ def build_optimizer(
             omega_retract_mode=cfg.omega_retract_mode,
             skew_symmetric=model.group.skew_symmetric,
             omega_reorth_every=cfg.omega_reorth_every,
+            group_name=model.group.name,
             weight_decay=cfg.weight_decay,
         )
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
@@ -994,6 +995,10 @@ def train(
         step_metrics: Optional[Dict[str, float]] = {} if (do_log or do_csv) else None
         if hasattr(optimizer, "_collect_gauge_diag"):        # D1/EXP-8: gate the gauge M-step diagnostics
             optimizer._collect_gauge_diag = bool(do_log or do_csv)   # to log/eval steps (silent path unchanged)
+            if optimizer._collect_gauge_diag:
+                # A nonfinite/otherwise skipped optimizer step must not leave the prior log step's
+                # health values visible as if they were collected for this attempt.
+                optimizer._gauge_diag = {}
         if do_log or do_csv:                                 # off the hot path (audit 2026-07-05 m8)
             _warn_phi_transport_clamp(model)
             # m7: diagnostics on the PRE-step weights so the logged F-decomposition shares the pre-step
@@ -1212,6 +1217,17 @@ def train(
                 if getattr(optimizer, "_precond_mode", "") in ("pullback", "pullback_per_block"):
                     row["pullback_cond_median"] = _gd.get("pullback_cond_median", float("nan"))
                     row["pullback_cond_max"]    = _gd.get("pullback_cond_max", float("nan"))
+                if getattr(optimizer, "_has_omega_group", False):
+                    if getattr(optimizer, "_group_name", None) == "sp":
+                        row["omega_symplectic_residual_median"] = _gd.get(
+                            "omega_symplectic_residual_median", float("nan"))
+                        row["omega_symplectic_residual_max"] = _gd.get(
+                            "omega_symplectic_residual_max", float("nan"))
+                    else:
+                        row["omega_condition_median"] = _gd.get(
+                            "omega_condition_median", float("nan"))
+                        row["omega_condition_max"] = _gd.get(
+                            "omega_condition_max", float("nan"))
             # Held-out per-eval probes (Tier-2): the full fixed val-diag column set. Eval-cadence like
             # val_ce above -- the fresh probe values on an eval row, NaN (rendered blank) on the
             # log-interval rows in between, NOT carried forward. The key set is identical in both
@@ -1272,7 +1288,7 @@ def coverage_lines(
     stride = int(ds.stride)
     batch = int(loader.batch_size)
     windows = len(ds)
-    spe = len(loader)                                # batches per epoch (honours drop_last)
+    spe = len(loader)                                # batches per epoch (honors drop_last)
     epochs = (n_steps / spe) if spe > 0 else float("nan")
     tokens_seen = n_steps * batch * seq_len
 

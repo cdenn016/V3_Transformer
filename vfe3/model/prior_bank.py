@@ -41,6 +41,7 @@ from torch import nn
 from vfe3.belief import BeliefState
 from vfe3.divergence import get_family, kl
 from vfe3.families.base import _logdet_chol
+from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.numerics import bounded_variance_from_log, safe_cholesky
 
 
@@ -191,6 +192,7 @@ class PriorBank(nn.Module):
         phi_reflection:         str                 = "off",
         omega_compact_storage:  bool                = False,
         gauge_group_is_tied:    bool                = False,
+        gauge_group_name:       Optional[str]       = None,
     ) -> None:
         super().__init__()
         if gauge_parameterization == "omega_direct" and encode_mode == "per_token_additive":
@@ -205,6 +207,35 @@ class PriorBank(nn.Module):
                 "omega_compact_storage must be a bool, got "
                 f"{type(omega_compact_storage).__name__}: {omega_compact_storage!r}"
             )
+        if omega_compact_storage:
+            compact_groups = {"block_glk", "tied_block_glk"}
+            if gauge_group_name not in compact_groups:
+                raise ValueError(
+                    "omega_compact_storage requires explicit gauge_group_name='block_glk' or "
+                    f"'tied_block_glk'; got {gauge_group_name!r}")
+            expected_tied = gauge_group_name == "tied_block_glk"
+            if gauge_group_is_tied != expected_tied:
+                raise ValueError(
+                    "gauge_group_is_tied is inconsistent with gauge_group_name: "
+                    f"group={gauge_group_name!r}, tied={gauge_group_is_tied!r}")
+            if irrep_dims is None:
+                raise ValueError("omega_compact_storage requires explicit irrep_dims")
+            if len(irrep_dims) <= 1:
+                raise ValueError(
+                    "omega_compact_storage requires more than one irrep block; "
+                    f"got irrep_dims={irrep_dims!r}")
+            if any(type(d) is not int or d <= 0 for d in irrep_dims):
+                raise ValueError(
+                    "omega_compact_storage requires every irrep dimension to be a positive int; "
+                    f"got irrep_dims={irrep_dims!r}")
+            if len(set(irrep_dims)) != 1:
+                raise ValueError(
+                    "omega_compact_storage requires equal irrep dimensions; "
+                    f"got irrep_dims={irrep_dims!r}")
+            if sum(irrep_dims) != K:
+                raise ValueError(
+                    f"omega_compact_storage requires sum(irrep_dims)==K; "
+                    f"got sum={sum(irrep_dims)}, K={K}")
         self.vocab_size = vocab_size
         self.K = K
         self.n_gen = n_gen
@@ -220,6 +251,7 @@ class PriorBank(nn.Module):
         self.unigram_kappa = unigram_kappa
         self.decode_unigram_prior = decode_unigram_prior
         self.gauge_parameterization = gauge_parameterization
+        self.gauge_group_name = gauge_group_name
         self.irrep_dims = irrep_dims
         # untie applies to the KL-to-bank decode only (the linear ablation is already untied by
         # construction), so the flag is resolved against use_prior_bank once, here.
@@ -337,21 +369,34 @@ class PriorBank(nn.Module):
         # tied tied_block_glk; irrep_dims = [d]*H, H>1) the full (V,K,K) table wastes ~H x (off-blocks
         # frozen zero). Store the H distinct blocks (V,H,d,d) untied, or the ONE shared block (V,d,d)
         # tied -- both matching phi_embed's V*n_gen param count exactly (V*H*d^2 / V*d^2 = V*n_gen).
-        # encode assembles the transport-ready block-diagonal (B,N,K,K) so the downstream stack is
-        # untouched. Compaction changes the table SHAPE (would break a Phase-1 (V,K,K) checkpoint), so
+        # encode carries these blocks in CompactBlockElement; inverse and transport stay blockwise,
+        # while explicit compatibility callers may request a dense element. Compaction changes the
+        # table SHAPE (would break a Phase-1 (V,K,K) checkpoint), so
         # the opt-in flag is the state-dict safety: default OFF keeps the shipped (V,K,K) path
         # byte-identical. Single-block groups (glk/so_k/sp) and the irrep towers (so_n/sp_n) keep
         # (V,K,K) this phase (nothing to compact / element-vs-coordinate tension deferred).
         self._omega_compact = False
         self._omega_tied    = bool(gauge_group_is_tied)
+        self.reflection_scope = "full_element"
+        if (gauge_group_name == "block_glk"
+                and irrep_dims is not None
+                and len(irrep_dims) > 1
+                and (omega_reflection != "off" or phi_reflection != "off")):
+            # Multi-block block_glk is a product GL(d)^H with 2^H orientation sectors. The existing
+            # reflection proposal is diag(-1,1,...) at K scale, so it probes block 0 only; keep the
+            # proposal unchanged and label its intentionally limited scope instead of implying all
+            # sectors. One-head and cross-coupled block_glk report irrep_dims=[K] and therefore use
+            # the complete represented element rather than this product-group label.
+            self.reflection_scope = "block_0_probe"
+            warnings.warn(
+                "block-GL reflection is a block-0 probe: the existing proposal flips only the first "
+                "GL(d) block and does not explore all 2^H product-group orientation sectors.",
+                UserWarning,
+                stacklevel=2,
+            )
         if gauge_parameterization == "omega_direct":
             dims = irrep_dims
-            compact = (
-                omega_compact_storage
-                and dims is not None
-                and len(dims) > 1
-                and len(set(dims)) == 1
-            )
+            compact = omega_compact_storage
             self._omega_compact = compact
             if compact:
                 H, d = len(dims), dims[0]
@@ -403,29 +448,19 @@ class PriorBank(nn.Module):
     def _omega_lookup(
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
-    ) -> torch.Tensor:                   # (B, N, K, K) transport-ready block-diagonal frame
-        r"""Look up the per-token gauge frame U_i as a full (B, N, K, K) element.
+    ) -> 'torch.Tensor | CompactBlockElement':
+        r"""Look up the per-token gauge frame U_i without changing its storage representation.
 
         Non-compact (default): a plain (V, K, K) table lookup. Compact
-        (``_omega_compact``): the compact (V, H, d, d) / (V, d, d) block table is looked up and
-        assembled into the block-diagonal (B, N, K, K) via the differentiable scatter
-        ``lie_ops._from_equal_diag_blocks`` -- off-blocks stay EXACTLY zero and autograd routes the
-        dense-frame gradient back onto the compact table with no manual adjoint. For the TIED table
-        the single block broadcasts into all H diagonal slots; the broadcast's autograd adjoint SUMS
-        the H per-block gradients onto the shared block (exactly the tied update). The assembled
-        (B, N, K, K) is what ``belief.omega`` carries, so the entire downstream transport stack is
-        unchanged whether or not the storage is compact.
+        (``_omega_compact``): return ``CompactBlockElement`` around the live looked-up
+        (B, N, H, d, d) / tied (B, N, d, d) blocks. Inverse and transport contractions consume
+        those blocks directly. Dense K x K reconstruction is available only through the container's
+        explicit compatibility method ``to_dense()``.
         """
         g = self.omega_embed[token_ids]                                      # (B,N,K,K) or (B,N,H,d,d)/(B,N,d,d)
         if not self._omega_compact:
             return g
-        from vfe3.geometry.lie_ops import _from_equal_diag_blocks
-        H, d = len(self.irrep_dims), self.irrep_dims[0]
-        if self._omega_tied:                                                 # (B,N,d,d) -> broadcast into H slots
-            blocks = g.unsqueeze(-3).expand(*g.shape[:-2], H, d, d)          # (B,N,H,d,d) view (shared storage)
-        else:
-            blocks = g                                                       # (B,N,H,d,d) already
-        return _from_equal_diag_blocks(blocks, self.K)                       # (B,N,K,K) block-diagonal
+        return CompactBlockElement(g, self.K, tied=self._omega_tied)
 
     def encode_s(
         self,

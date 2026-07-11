@@ -180,6 +180,52 @@ def test_exact_delta_f_matches_independent_recompute():
     assert abs(dF_move - dF_indep) < 1e-5                               # exact-DeltaF anchor (fp5)
 
 
+def test_compact_metropolis_uses_block_reflection_and_matches_source_flip(monkeypatch):
+    import vfe3.geometry.generators as generators_module
+    from vfe3.geometry.lie_ops import CompactBlockElement
+    from vfe3.geometry.transport import CompactFactoredTransport
+
+    m = _model(
+        vocab_size=4, gauge_group="block_glk", n_heads=2,
+        omega_compact_storage=True,
+    )
+    tok = torch.tensor([[0, 1, 2, 3]])
+    tid = 1
+    belief, mu_p, sigma_p = m._metropolis_prepare(tok)
+    assert isinstance(belief.omega, CompactBlockElement)
+    d = belief.omega.block_dim
+    R_d = reflection_element(d)
+
+    def _forbid_dense(*args, **kwargs):
+        raise AssertionError("compact Metropolis materialized a dense K x K element")
+
+    monkeypatch.setattr(CompactBlockElement, "to_dense", _forbid_dense)
+    monkeypatch.setattr(CompactFactoredTransport, "to_dense_omega", _forbid_dense)
+    original_reflection = generators_module.reflection_element
+    reflection_sizes = []
+
+    def _tracked_reflection(size, **kwargs):
+        reflection_sizes.append(size)
+        if size == m.cfg.embed_dim:
+            raise AssertionError("compact Metropolis allocated reflection_element(K)")
+        return original_reflection(size, **kwargs)
+
+    monkeypatch.setattr(generators_module, "reflection_element", _tracked_reflection)
+
+    dF_move = m._metropolis_delta_f(belief, mu_p, sigma_p, tok, tid)
+    F_cur = m._metropolis_free_energy(belief, mu_p, sigma_p)
+    m._flip_omega_embed_row(R_d, tid)
+    relooked = m.prior_bank._omega_lookup(tok)
+    F_trial = m._metropolis_free_energy(belief._replace(omega=relooked), mu_p, sigma_p)
+    m._flip_omega_embed_row(R_d, tid)
+
+    assert abs(dF_move - (F_trial - F_cur)) < 1e-5
+    stats = m.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(0))
+    assert reflection_sizes and all(size == d for size in reflection_sizes)
+    assert "reflection_scope" not in stats
+    assert m.prior_bank.reflection_scope == "block_0_probe"
+
+
 def test_metropolis_step_stats_finite():
     m = _model(vocab_size=4)
     tok = torch.tensor([[0, 1, 2, 3]])

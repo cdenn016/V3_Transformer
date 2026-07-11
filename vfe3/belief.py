@@ -17,6 +17,7 @@ signature sweep, and the 3-field default is byte-identical in behavior.
 from typing import NamedTuple, Optional
 
 import torch
+from vfe3.geometry.lie_ops import CompactBlockElement
 
 
 class BeliefState(NamedTuple):
@@ -28,5 +29,5 @@ class BeliefState(NamedTuple):
 
     s:     Optional[torch.Tensor] = None      # optional future hyper-prior channel s_i (None by default)
     r:     Optional[torch.Tensor] = None      # optional future hyper-prior channel r_i (None by default)
-    omega: Optional[torch.Tensor] = None      # optional GL(K) frame U_i (..., N, K, K); set only on gauge_parameterization='omega_direct'
+    omega: 'torch.Tensor | CompactBlockElement | None' = None  # optional stored GL(K) frame, dense or compact
     reflection: Optional[torch.Tensor] = None # (..., N) per-token sign +1/-1; set only on the phi path under phi_reflection

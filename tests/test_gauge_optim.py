@@ -163,10 +163,13 @@ def test_state_dict_roundtrips_omega_reorth_cadence(monkeypatch):
 
     source_U = nn.Parameter(torch.eye(4).expand(2, 4, 4).contiguous())
     source_opt = _optimizer(source_U)
+    source_U.grad = torch.zeros_like(source_U)
+    source_U.grad[1, 0, 1] = 1.0
     source_opt.step()
     source_opt.step()
     state = source_opt.state_dict()
     assert state["optimizer_extra"]["omega_step"] == 2
+    assert state["optimizer_extra"]["omega_dirty_format"] == 1
 
     calls = []
     original_polar = gauge_optim_mod._polar_orthogonalize
@@ -189,3 +192,169 @@ def test_state_dict_roundtrips_omega_reorth_cadence(monkeypatch):
     with pytest.warns(UserWarning, match="non-exact resume"):
         legacy_opt.load_state_dict(legacy)
     assert legacy_opt._omega_step == 0
+
+
+def test_omega_reorthogonalizes_only_dirty_rows(monkeypatch):
+    import vfe3.gauge_optim as gauge_optim_mod
+    from vfe3.geometry.groups import get_group
+
+    group = get_group("so_k")(K=4)
+    U = nn.Parameter(torch.eye(4).expand(5, 4, 4).clone())
+    with torch.no_grad():
+        U[0] *= 1.20
+        U[4] *= 0.80
+    untouched_before = U.detach()[[0, 4]].clone()
+    seen_shapes = []
+    original_polar = gauge_optim_mod._polar_orthogonalize
+
+    def _spy(rows):
+        seen_shapes.append(tuple(rows.shape))
+        return original_polar(rows)
+
+    monkeypatch.setattr(gauge_optim_mod, "_polar_orthogonalize", _spy)
+    opt = GaugeNaturalGradAdamW(
+        [{"params": [U], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
+        group.generators, group.irrep_dims, skew_symmetric=True,
+        omega_reorth_every=2, weight_decay=0.0,
+    )
+    U.grad = torch.zeros_like(U)
+    U.grad[1, 0, 1] = 1.0
+    opt.step()
+    U.grad = torch.zeros_like(U)
+    U.grad[3, 1, 2] = 1.0
+    opt.step()
+
+    assert seen_shapes == [(2, 4, 4)]
+    assert torch.equal(U.detach()[[0, 4]], untouched_before)
+
+
+def test_dirty_rows_clear_after_cadence():
+    from vfe3.geometry.groups import get_group
+
+    group = get_group("so_k")(K=4)
+
+    def _optimizer(parameter):
+        return GaugeNaturalGradAdamW(
+            [{"params": [parameter], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
+            group.generators, group.irrep_dims, skew_symmetric=True,
+            omega_reorth_every=2, weight_decay=0.0,
+        )
+
+    source_U = nn.Parameter(torch.eye(4).expand(4, 4, 4).clone())
+    source_opt = _optimizer(source_U)
+    source_U.grad = torch.zeros_like(source_U)
+    source_U.grad[1, 0, 1] = 1.0
+    source_opt.step()
+    assert torch.equal(
+        source_opt.state[source_U]["omega_dirty"],
+        torch.tensor([False, True, False, False]),
+    )
+    assert source_opt.state[source_U]["omega_dirty"].dtype == torch.bool
+
+    checkpoint = source_opt.state_dict()
+    resumed_U = nn.Parameter(source_U.detach().clone())
+    resumed_opt = _optimizer(resumed_U)
+    resumed_opt.load_state_dict(checkpoint)
+    assert torch.equal(
+        resumed_opt.state[resumed_U]["omega_dirty"],
+        torch.tensor([False, True, False, False]),
+    )
+    assert resumed_opt.state[resumed_U]["omega_dirty"].dtype == torch.bool
+    assert resumed_opt.state[resumed_U]["omega_dirty"].device == resumed_U.device
+    resumed_U.grad = torch.zeros_like(resumed_U)
+    resumed_U.grad[2, 1, 2] = 1.0
+    resumed_opt.step()
+
+    assert not bool(resumed_opt.state[resumed_U]["omega_dirty"].any())
+
+
+def test_pre_o5_checkpoint_with_omega_step_marks_every_row_dirty():
+    from vfe3.geometry.groups import get_group
+
+    group = get_group("so_k")(K=4)
+
+    def _optimizer(parameter):
+        return GaugeNaturalGradAdamW(
+            [{"params": [parameter], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
+            group.generators, group.irrep_dims, skew_symmetric=True,
+            omega_reorth_every=3, weight_decay=0.0,
+        )
+
+    source_U = nn.Parameter(torch.eye(4).expand(5, 4, 4).clone())
+    source_opt = _optimizer(source_U)
+    source_U.grad = torch.zeros_like(source_U)
+    source_U.grad[2, 0, 1] = 1.0
+    source_opt.step()
+    checkpoint = source_opt.state_dict()
+    checkpoint["optimizer_extra"].pop("omega_dirty_format")     # pre-O5: step exists, marker absent
+    for state in checkpoint["state"].values():
+        state.pop("omega_dirty", None)                            # pre-O5 carried no dirty mask
+
+    resumed_U = nn.Parameter(source_U.detach().clone())
+    resumed_opt = _optimizer(resumed_U)
+    with pytest.warns(UserWarning, match="all omega rows were marked dirty"):
+        resumed_opt.load_state_dict(checkpoint)
+
+    dirty = resumed_opt.state[resumed_U]["omega_dirty"]
+    assert resumed_opt._omega_step == 1                           # cadence position is preserved
+    assert dirty.dtype == torch.bool and dirty.device == resumed_U.device
+    assert torch.equal(dirty, torch.ones(5, dtype=torch.bool))
+
+
+def test_current_checkpoint_without_dirty_mask_defaults_clean():
+    from vfe3.geometry.groups import get_group
+
+    group = get_group("so_k")(K=4)
+    source_U = nn.Parameter(torch.eye(4).expand(3, 4, 4).clone())
+    source_opt = GaugeNaturalGradAdamW(
+        [{"params": [source_U], "lr": 0.0, "omega": True, "weight_decay": 0.0}],
+        group.generators, group.irrep_dims, skew_symmetric=True,
+        omega_reorth_every=2, weight_decay=0.0,
+    )
+    checkpoint = source_opt.state_dict()
+    assert checkpoint["optimizer_extra"]["omega_dirty_format"] == 1
+
+    resumed_U = nn.Parameter(source_U.detach().clone())
+    resumed_opt = GaugeNaturalGradAdamW(
+        [{"params": [resumed_U], "lr": 0.0, "omega": True, "weight_decay": 0.0}],
+        group.generators, group.irrep_dims, skew_symmetric=True,
+        omega_reorth_every=2, weight_decay=0.0,
+    )
+    resumed_opt.load_state_dict(checkpoint)
+
+    assert torch.equal(
+        resumed_opt.state[resumed_U]["omega_dirty"], torch.zeros(3, dtype=torch.bool))
+
+
+def test_compact_omega_condition_captures_cross_block_scale():
+    from vfe3.geometry.groups import get_group
+
+    group = get_group("block_glk")(K=4, n_heads=2)
+    blocks = torch.stack([100.0 * torch.eye(2), 0.01 * torch.eye(2)]).unsqueeze(0)
+    U = nn.Parameter(blocks)
+    opt = GaugeNaturalGradAdamW(
+        [{"params": [U], "lr": 0.0, "omega": True, "weight_decay": 0.0}],
+        group.generators, group.irrep_dims, group_name=group.name, weight_decay=0.0,
+    )
+    opt._collect_gauge_diag = True
+    U.grad = torch.ones_like(U)
+
+    opt.step()
+
+    assert opt._gauge_diag["omega_condition_max"] == pytest.approx(1.0e4, rel=1e-6)
+
+
+def test_attempted_diagnostic_step_clears_stale_gauge_health():
+    group = generate_glk_multihead(4, 2).float()
+    phi = nn.Parameter(torch.zeros(3, group.shape[0]))
+    opt = GaugeNaturalGradAdamW(
+        [{"params": [phi], "lr": 0.0, "gauge": True, "weight_decay": 0.0}],
+        group, [2, 2], weight_decay=0.0,
+    )
+    opt._collect_gauge_diag = True
+    opt._gauge_diag = {"pullback_cond_max": 123.0}
+    phi.grad = None
+
+    opt.step()
+
+    assert opt._gauge_diag == {}
