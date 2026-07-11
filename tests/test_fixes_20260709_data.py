@@ -9,7 +9,9 @@ Finding 45: tokenizer_vocab_size records the per-tokenizer vocab bound and
 validate_token_range (wired into make_dataloader via ``vocab_size``) rejects token ids
 that would overrun the model's cfg.vocab_size-sized tables, naming the tokenizer.
 """
+import ast
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -71,6 +73,46 @@ def test_load_pt_limit_uses_mmap(tmp_path, monkeypatch):
     assert seen == [True]
 
 
+def test_load_pt_limit_slices_before_int64_materialization(tmp_path, monkeypatch):
+    pt = cache_path("wikitext-103", "train", suffix="pt", cache_dir=tmp_path)
+    pt.parent.mkdir(parents=True, exist_ok=True)
+    pt.touch()
+    events = []
+
+    class _LoadProbe:
+        def reshape(self, *_shape):
+            events.append("reshape")
+            return self
+
+        def __getitem__(self, key):
+            assert key == slice(None, 5)
+            events.append("slice")
+            return self
+
+        def clone(self):
+            events.append("clone")
+            return self
+
+        def to(self, dtype):
+            assert dtype is torch.long
+            events.append("to-int64")
+            return torch.arange(5, dtype=torch.long)
+
+    seen = []
+
+    def fake_load(*_args, **kwargs):
+        seen.append(kwargs.get("mmap"))
+        return _LoadProbe()
+
+    monkeypatch.setattr(dsmod.torch, "load", fake_load)
+
+    out = load_cached_tokens("wikitext-103", "train", cache_dir=tmp_path, limit=5)
+
+    assert torch.equal(out, torch.arange(5, dtype=torch.long))
+    assert seen == [True]
+    assert events == ["reshape", "slice", "clone", "to-int64"]
+
+
 def test_load_pt_limit_none_is_unchanged(tmp_path):
     toks = _write_pt_cache(tmp_path, n=20)
     out = load_cached_tokens("wikitext-103", "train", cache_dir=tmp_path)
@@ -87,9 +129,49 @@ def test_load_bin_limit_slices_memmap(tmp_path):
     assert out_all.shape == (8,)
 
 
-def test_cached_token_count_pt(tmp_path):
+def test_load_bin_limit_slices_before_int64_materialization(tmp_path, monkeypatch):
+    _write_bin_cache(tmp_path, n=8)
+    events = []
+
+    class _MemmapProbe:
+        def __getitem__(self, key):
+            assert key == slice(None, 4)
+            events.append("slice")
+            return self
+
+    probe = _MemmapProbe()
+
+    def fake_memmap(*_args, **_kwargs):
+        events.append("memmap")
+        return probe
+
+    def fake_asarray(value):
+        assert value is probe
+        events.append("asarray")
+        return np.arange(4, dtype=np.int32)
+
+    monkeypatch.setattr(dsmod.np, "memmap", fake_memmap)
+    monkeypatch.setattr(dsmod.np, "asarray", fake_asarray)
+
+    out = load_cached_tokens("wiki-en", "test", cache_dir=tmp_path, limit=4)
+
+    assert torch.equal(out, torch.arange(4, dtype=torch.long))
+    assert events == ["memmap", "slice", "asarray"]
+
+
+def test_cached_token_count_pt_uses_mmap(tmp_path, monkeypatch):
     _write_pt_cache(tmp_path, n=20)
+    real_load = torch.load
+    seen = []
+
+    def spy_load(*args, **kwargs):
+        seen.append(kwargs.get("mmap"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(dsmod.torch, "load", spy_load)
+
     assert cached_token_count("wikitext-103", "train", cache_dir=tmp_path) == 20
+    assert seen == [True]
 
 
 def test_cached_token_count_bin_reads_metadata_only(tmp_path):
@@ -170,8 +252,50 @@ def test_validate_token_range_rejects_overflow_naming_tokenizer():
 
 
 def test_validate_token_range_rejects_negative_ids():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as ei:
         validate_token_range(torch.tensor([-1, 2]), 8, dataset="wikitext-103")
+    msg = str(ei.value)
+    assert "negative token id" in msg
+    assert "repair or rebuild" in msg
+    assert "set vocab_size" not in msg
+
+
+@pytest.mark.parametrize(
+    ("source_path", "callee", "expected_value_kind"),
+    [
+        ("train_vfe3.py",        "make_dataloader", "active-config"),
+        ("sigma_gate_measure.py", "make_dataloader", "active-config"),
+        ("vfe3/train.py",         "make_dataloader", "active-config"),
+        ("vfe3/viz/report.py",    "make_dataloader", "active-config"),
+        ("ablation.py",           "make_dataloader", "forwarded"),
+        ("scaling.py",            "make_dataloader", "forwarded"),
+        ("ablation.py",           "get_loader",      "active-config"),
+        ("scaling.py",            "get_loader",      "active-config"),
+    ],
+)
+def test_production_loader_calls_keep_vocab_size_guard(
+    source_path,
+    callee,
+    expected_value_kind,
+):
+    tree = ast.parse(Path(source_path).read_text(encoding="utf-8"), filename=source_path)
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            isinstance(node.func, ast.Name) and node.func.id == callee
+            or isinstance(node.func, ast.Attribute) and node.func.attr == callee
+        )
+    ]
+    assert calls, (source_path, callee)
+    for call in calls:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert "vocab_size" in keywords, (source_path, callee)
+        value = keywords["vocab_size"]
+        if expected_value_kind == "forwarded":
+            assert isinstance(value, ast.Name) and value.id == "vocab_size", source_path
+        else:
+            assert isinstance(value, ast.Attribute) and value.attr == "vocab_size", source_path
 
 
 def test_make_dataloader_vocab_size_guard(monkeypatch):

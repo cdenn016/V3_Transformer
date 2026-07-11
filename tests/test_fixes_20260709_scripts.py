@@ -131,6 +131,15 @@ def test_generate_efe_rejects_corrupt_embedded_config_fingerprint(tmp_path):
         generate_efe._load_checkpoint({"checkpoint": checkpoint, "config_from": None})
 
 
+def test_generate_efe_rejects_empty_bound_model_state(tmp_path):
+    checkpoint = tmp_path / "best_model.pt"
+    config = {"vocab_size": 50257, "n_e_steps": 1}
+    _save_bound_bundle(checkpoint, config, {})
+
+    with pytest.raises(ValueError, match="nonempty model_state"):
+        generate_efe._load_checkpoint({"checkpoint": checkpoint, "config_from": None})
+
+
 def test_generate_efe_loads_self_bound_best_bundle(tmp_path):
     checkpoint = tmp_path / "best_model.pt"
     state_dict = {"weight": torch.tensor([1.0])}

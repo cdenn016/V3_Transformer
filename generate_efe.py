@@ -114,8 +114,9 @@ def _load_checkpoint(
                 raise ValueError(
                     f"semantic config mismatch between {checkpoint} and {config_from}")
         state_dict = obj["model_state"]
-        if not isinstance(state_dict, Mapping):
-            raise ValueError(f"checkpoint {checkpoint} has a malformed model_state")
+        if not isinstance(state_dict, Mapping) or not state_dict:
+            raise ValueError(
+                f"checkpoint {checkpoint} must contain a nonempty model_state mapping")
         return config_dict, state_dict
 
     config_from = cfg.get("config_from")

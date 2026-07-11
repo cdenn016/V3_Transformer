@@ -139,7 +139,12 @@ def validate_token_range(
     if tokens.numel() == 0:
         return
     lo, hi = int(tokens.min()), int(tokens.max())
-    if lo < 0 or hi >= vocab_size:
+    if lo < 0:
+        raise ValueError(
+            f"dataset {dataset!r} (tokenizer {_tokenizer_tag(dataset)!r}) contains negative token ids "
+            f"down to {lo}; repair or rebuild the tokenized cache before loading it"
+        )
+    if hi >= vocab_size:
         required_vocab_size = max(hi + 1, tokenizer_vocab_size(dataset))
         raise ValueError(
             f"dataset {dataset!r} (tokenizer {_tokenizer_tag(dataset)!r}) has token ids in "
