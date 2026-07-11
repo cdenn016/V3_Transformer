@@ -756,6 +756,8 @@ class VFEModel(nn.Module):
         ``rollout_beliefs``), not from this method.
         """
         B, N = token_ids.shape
+        if decode_last and N <= 0:
+            raise ValueError("decode_last=True requires a nonempty token context")
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
         beliefs = beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))
         log_prior = self._attention_log_prior(N, token_ids.device)
@@ -1176,6 +1178,7 @@ class VFEModel(nn.Module):
 
         *,
         return_logits: bool          = True,             # continuation scoring needs the decode    -> A
+        decode_last:   bool          = False,            # decode only terminal logits as (B, 1, V)
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
         r"""Public no-grad belief rollout: the active-inference contract's D (initial belief from the
         current context) and the one-step B (transition rule) building block. A single forward of
@@ -1183,9 +1186,11 @@ class VFEModel(nn.Module):
         candidate ACTION token to ``token_ids`` and re-calling realizes one transition q*_t -> q*_{t+1};
         iterating it H times is the fixed-horizon rollout. The environment's response to a committed
         action is appended by the generation loop AFTER selection, never inside the scored rollout.
-        Returns the SAME tensors ``forward`` would, so it adds no new numerical path.
+        By default it returns the SAME tensors ``forward`` would, so it adds no new numerical path;
+        ``decode_last=True`` preserves the complete belief and decodes only terminal ``(B, 1, V)`` logits.
         """
-        return self.forward_beliefs(token_ids, return_logits=return_logits)
+        return self.forward_beliefs(
+            token_ids, return_logits=return_logits, decode_last=decode_last)
 
     def forward(
         self,
@@ -1726,6 +1731,8 @@ class VFEModel(nn.Module):
         # are checked only on the sampled policy_mode='none' path.
         if max_new_tokens < 0:
             raise ValueError(f"max_new_tokens must be >= 0, got {max_new_tokens}")
+        if token_ids.shape[1] <= 0:
+            raise ValueError("generate requires a nonempty token context")
         if not greedy and self.cfg.policy_mode == "none":
             if not (temperature > 0.0):
                 raise ValueError(f"temperature must be > 0, got {temperature}")
@@ -1762,6 +1769,11 @@ class VFEModel(nn.Module):
                 _belief, decoded = self.forward_beliefs(
                     context, return_logits=True, decode_last=True)
                 logits = decoded[:, 0, :]                                # (B, V) last position
+                invalid_row = torch.isnan(logits).any(dim=-1) | torch.isposinf(logits).any(dim=-1)
+                if bool(invalid_row.any()):
+                    rows = invalid_row.nonzero(as_tuple=False).flatten().tolist()
+                    raise ValueError(
+                        f"generation logits contain NaN or +inf values in rows {rows}")
                 finite_row = torch.isfinite(logits).any(dim=-1)
                 if not bool(finite_row.all()):
                     rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()
@@ -1852,6 +1864,11 @@ class VFEModel(nn.Module):
         _validate_policy_context(context, 1, self.cfg.max_seq_len)
         _belief, decoded = self.forward_beliefs(context, return_logits=True, decode_last=True)
         base_logits = decoded[:, 0, :]                               # (B, V) base last-position logits
+        invalid_row = torch.isnan(base_logits).any(dim=-1) | torch.isposinf(base_logits).any(dim=-1)
+        if bool(invalid_row.any()):
+            rows = invalid_row.nonzero(as_tuple=False).flatten().tolist()
+            raise ValueError(
+                f"policy base logits contain NaN or +inf values in rows {rows}")
         finite_row = torch.isfinite(base_logits).any(dim=-1)
         if not bool(finite_row.all()):
             rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()

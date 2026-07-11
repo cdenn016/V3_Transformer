@@ -69,6 +69,11 @@ def test_generate_decodes_only_last_position(monkeypatch):
     model = _tiny_model()
     V = model.cfg.vocab_size
     prompt = torch.randint(0, V, (2, 3))
+    empty = torch.empty((2, 0), dtype=torch.long)
+    with pytest.raises(ValueError, match=r"decode_last=True requires a nonempty token context"):
+        model.forward_beliefs(empty, return_logits=True, decode_last=True)
+    with pytest.raises(ValueError, match=r"generate requires a nonempty token context"):
+        model.generate(empty, max_new_tokens=1, greedy=True)
     original_forward_beliefs = model.forward_beliefs
     calls = []
 
@@ -117,17 +122,28 @@ def test_generate_rejects_nonfinite_logit_rows(monkeypatch):
     monkeypatch.setattr(model, "forward_beliefs", fake_forward_beliefs)
 
     injected["logits"] = torch.zeros(2, 1, V)
+    injected["logits"][0, 0, 0] = float("nan")
+    injected["logits"][1, 0, 1] = float("inf")
+    with pytest.raises(
+        ValueError,
+        match=r"generation logits contain NaN or \+inf values in rows \[0, 1\]",
+    ):
+        model.generate(prompt, max_new_tokens=1, greedy=True)
+
+    injected["logits"] = torch.zeros(2, 1, V)
     injected["logits"][0] = float("-inf")
     with pytest.raises(ValueError, match=r"generation logits have no finite value in rows \[0\]"):
         model.generate(prompt, max_new_tokens=1, greedy=False, top_k=2)
 
     injected["logits"] = torch.zeros(2, 1, V)
-    injected["logits"][0, 0, 0] = float("inf")
+    injected["logits"][0, 0, 4:] = float("-inf")
+    out = model.generate(prompt, max_new_tokens=1, greedy=False, top_k=2)
+    assert out.shape == (2, 4)                              # filtered-out -inf remains valid
     with pytest.raises(
         ValueError,
         match=r"generation retained logits contain non-finite values in rows \[0\]",
     ):
-        model.generate(prompt, max_new_tokens=1, greedy=False, top_k=2)
+        model.generate(prompt, max_new_tokens=1, greedy=False)
 
 
 def test_greedy_ignores_temperature_topk_topp():

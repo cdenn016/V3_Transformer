@@ -24,7 +24,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from vfe3.config import VFE3Config
-from vfe3.inference.policy import get_policy, get_preference
+from vfe3.inference.policy import _validate_policy_context, get_policy, get_preference
 from vfe3.model.model import VFEModel
 
 # ---- sealed vocabulary layout (spec Section 4.1) ----
@@ -308,6 +308,7 @@ def run_episodes(
     n_dec = 0
     for t in range(budget):
         context = render_context(goals, state)                            # (B, 5)
+        _validate_policy_context(context, 1, model.cfg.max_seq_len)
         base_logits = model.forward(context)[:, -1, :]                    # (B, V)
         if policy_mode == "greedy_ref":
             action = base_logits.argmax(dim=-1)                           # unmodified generate (full vocab)

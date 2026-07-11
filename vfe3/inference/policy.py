@@ -260,6 +260,10 @@ def _validate_policy_context(
 ) -> None:
     """Reject a policy rollout that cannot preserve its complete context and candidate."""
     N = context.shape[1]
+    if N <= 0:
+        raise ValueError(f"policy context must be nonempty, got N={N}")
+    if candidate_length <= 0:
+        raise ValueError(f"policy candidate length must be > 0, got L={candidate_length}")
     if N + candidate_length > max_seq_len:
         raise ValueError(
             f"policy context length N={N} plus candidate length L={candidate_length} exceeds "
@@ -293,8 +297,9 @@ def _rollout_predictive(
         return rollout_predictive_cached(context, candidates, model, base_logits=base_logits)
     ctx_exp = context.unsqueeze(1).expand(B, Kp, N)              # (B, Kp, N)
     ext = torch.cat([ctx_exp, candidates], dim=2).reshape(B * Kp, N + L)   # (B*Kp, N+L)
-    _belief, logits = model.rollout_beliefs(ext, return_logits=True)       # logits (B*Kp, N+L, V)
-    last = logits[:, -1, :]                                      # (B*Kp, V) post-action prediction
+    _belief, logits = model.rollout_beliefs(
+        ext, return_logits=True, decode_last=True)                # logits (B*Kp, 1, V)
+    last = logits[:, 0, :]                                        # (B*Kp, V) post-action prediction
     q_log = torch.log_softmax(last, dim=-1).reshape(B, Kp, -1)  # (B, Kp, V) = log q(o|pi)
     if base_logits is None:
         base_logits = model.forward(context)[:, -1, :]          # (B, V) base last-position logits
@@ -396,6 +401,11 @@ def _policy_efe_one_step(
         raise ValueError(
             f"efe_one_step is the H=1 scorer; got horizon={horizon}. Horizon>1 is efe_rollout, which "
             f"is gated on a belief/key-value cache (spec Section 3.5).")
+    L = candidates.shape[2]
+    _validate_policy_context(context, L, model.cfg.max_seq_len)
+    if L != horizon:
+        raise ValueError(
+            f"efe_one_step candidate length L={L} must equal horizon={horizon}.")
     return _efe_score(context, candidates, preference, model, gamma=gamma, score_terms=score_terms,
                       ambiguity_mode=ambiguity_mode, log_prior=log_prior, base_logits=base_logits)
 
@@ -421,6 +431,11 @@ def _policy_logprob_control(
     diagnostic columns line up (spec Section 3.2)."""
     if horizon != 1:
         raise ValueError(f"logprob_control accepts only horizon=1, got {horizon}")
+    L = candidates.shape[2]
+    _validate_policy_context(context, L, model.cfg.max_seq_len)
+    if L != horizon:
+        raise ValueError(
+            f"logprob_control candidate length L={L} must equal horizon={horizon}.")
     if score_terms != ("risk", "ambiguity"):
         raise ValueError(
             "logprob_control scores raw continuation log-probability and accepts only the default "

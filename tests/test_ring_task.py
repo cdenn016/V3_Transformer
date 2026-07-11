@@ -118,6 +118,32 @@ def test_run_episodes_smoke_shapes_on_untrained_model():
     assert torch.isfinite(out["mean_risk"]) and torch.isfinite(out["mean_ambiguity"])  # scorer diagnostics
 
 
+def test_run_episodes_rejects_invalid_context_before_policy_side_effects(monkeypatch):
+    cfg = VFE3Config(vocab_size=rt.V, embed_dim=12, n_heads=2, max_seq_len=5,
+                     n_layers=1, n_e_steps=1, use_prior_bank=False)
+    model = VFEModel(cfg)
+    goals = torch.tensor([2])
+    states = torch.tensor([5])
+
+    def fail_forward(*args, **kwargs):
+        pytest.fail("invalid ring context reached base forward")
+
+    monkeypatch.setattr(model, "forward", fail_forward)
+    with pytest.raises(
+        ValueError,
+        match=r"context length N=5 plus candidate length L=1 exceeds max_seq_len=5",
+    ):
+        rt.run_episodes(model, goals, states, "efe_one_step", budget=1)
+
+    monkeypatch.setattr(
+        rt,
+        "render_context",
+        lambda goals, states: torch.empty((goals.shape[0], 0), dtype=torch.long),
+    )
+    with pytest.raises(ValueError, match=r"context must be nonempty, got N=0"):
+        rt.run_episodes(model, goals, states, "efe_one_step", budget=1)
+
+
 def test_run_episodes_phase2_baseline_arms_run_and_stay_valid():
     # Phase 2 (spec 4.3): greedy reference + goal-free sampling baselines run end-to-end and carry no
     # scorer diagnostics (they do not score risk/ambiguity).
