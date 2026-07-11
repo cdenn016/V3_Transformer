@@ -7,7 +7,8 @@ from vfe3.geometry.generators import generate_glk, generate_son, reflection_elem
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.lie_ops import retract_omega
 from vfe3.geometry.transport import (build_transport_from_element, compute_transport_operators,
-                                      transport_mean, FactoredTransport)
+                                      group_element_inverse, transport_mean, FactoredTransport)
+from vfe3.inference import belief_cache as belief_cache_module
 from vfe3.inference.belief_cache import cache_supported, rollout_predictive_cached
 from vfe3.inference.e_step import build_belief_transport, e_step, e_step_iteration, free_energy_value
 from vfe3.model.model import VFEModel
@@ -438,6 +439,69 @@ def test_omega_direct_cache_rebuild_matches_full_rollout():
         f"max |dq|={float((q_cache - q_full).abs().max()):.2e}"
 
 
+def test_omega_direct_cache_matches_full_after_skew_frame_drift():
+    torch.manual_seed(0)
+    m = VFEModel(_cfg(
+        gauge_parameterization="omega_direct", gauge_group="so_k",
+        family="gaussian_diagonal", decode_mode="diagonal", n_e_steps=1,
+    ))
+    assert cache_supported(m.cfg)
+
+    with torch.no_grad():
+        drifted = torch.eye(4).expand(m.cfg.vocab_size, 4, 4).clone()
+        drifted[:, 0, 0] = torch.linspace(1.05, 1.30, m.cfg.vocab_size)
+        drifted[:, 0, 1] = torch.linspace(0.03, 0.12, m.cfg.vocab_size)
+        m.prior_bank.omega_embed.copy_(drifted)
+
+    B, N, Kp, L, V = 2, 2, 2, 1, m.cfg.vocab_size
+    context = torch.tensor([[0, 1], [2, 3]])
+    candidates = torch.tensor([[[4], [5]], [[1], [4]]])
+
+    with torch.no_grad():
+        base_logits = m.forward(context)[:, -1, :]
+        ctx_exp = context.unsqueeze(1).expand(B, Kp, N)
+        ext = torch.cat([ctx_exp, candidates], dim=2).reshape(B * Kp, N + L)
+        _belief, logits = m.rollout_beliefs(ext, return_logits=True)
+        q_full = torch.log_softmax(logits[:, -1, :], dim=-1).reshape(B, Kp, V)
+        q_cache, lp_cache = rollout_predictive_cached(
+            context, candidates, m, base_logits=base_logits)
+
+    lp_full = torch.gather(torch.log_softmax(base_logits, dim=-1), 1, candidates[:, :, 0])
+    assert torch.allclose(lp_cache, lp_full, atol=1e-6)
+    assert torch.allclose(q_cache, q_full, atol=2e-5), \
+        f"max |dq|={float((q_cache - q_full).abs().max()):.2e}"
+
+
+def test_cached_omega_inverts_shared_prefix_once(monkeypatch):
+    m = VFEModel(_cfg(
+        gauge_parameterization="omega_direct", family="gaussian_diagonal",
+        decode_mode="diagonal", n_e_steps=1,
+    ))
+    assert cache_supported(m.cfg)
+
+    B, N, Kp, L, V, K = 2, 2, 3, 2, m.cfg.vocab_size, m.cfg.embed_dim
+    context = torch.tensor([[0, 1], [2, 3]])
+    candidates = torch.tensor([
+        [[1, 2], [3, 4], [4, 5]],
+        [[0, 1], [2, 3], [4, 5]],
+    ])
+    inverse_shapes = []
+    original_inverse = belief_cache_module.group_element_inverse
+
+    def tracked_inverse(omega, group, **kwargs):
+        inverse_shapes.append(tuple(omega.shape))
+        return original_inverse(omega, group, **kwargs)
+
+    monkeypatch.setattr(belief_cache_module, "group_element_inverse", tracked_inverse)
+    with torch.no_grad():
+        q_log, log_prob = rollout_predictive_cached(
+            context, candidates, m, base_logits=torch.zeros(B, V))
+
+    assert q_log.shape == (B, Kp, V)
+    assert log_prob.shape == (B, Kp)
+    assert inverse_shapes == [(B, N, K, K), (B * Kp, L, K, K)]
+
+
 def test_appended_belief_step_omega_direct_uses_stored_frame():
     # Direct unit-level regression for the rebuild branch itself (Step 3): with the SAME (small,
     # near-zero) phi field but a DIFFERENT stored omega frame, the omega_direct rebuild must produce
@@ -472,15 +536,69 @@ def test_appended_belief_step_omega_direct_uses_stored_frame():
     assert not torch.allclose(out1.mu, out2.mu, atol=1e-6)         # the stored frame must feed the rebuild
 
 
+def test_group_element_inverse_mixed_skew_rows_matches_reference_and_gradient():
+    group = get_group("so_k")(K=3)
+    clean_0 = torch.eye(3)
+    clean_1 = torch.tensor([
+        [0.0, -1.0, 0.0],
+        [1.0,  0.0, 0.0],
+        [0.0,  0.0, 1.0],
+    ])
+    drifted_0 = torch.tensor([
+        [1.10, 0.20, 0.00],
+        [0.00, 0.90, 0.10],
+        [0.00, 0.00, 1.05],
+    ])
+    drifted_1 = torch.tensor([
+        [0.95, 0.00, 0.15],
+        [0.05, 1.20, 0.00],
+        [0.00, 0.10, 0.85],
+    ])
+    omega = torch.stack([clean_0, drifted_0, drifted_1, clean_1]).reshape(2, 2, 3, 3)
+    omega = omega.requires_grad_(True)
+    drifted = torch.tensor([[False, True], [True, False]], device=omega.device)
+
+    got = group_element_inverse(omega, group, residual_tol=1e-4)
+    transpose = omega.transpose(-1, -2)
+    true_inverse = torch.linalg.inv(omega.double()).to(omega.dtype)
+
+    assert got.shape == omega.shape
+    assert got.dtype == omega.dtype
+    assert got.device == omega.device
+    assert torch.equal(got[~drifted], transpose[~drifted])
+    assert torch.allclose(got[drifted], true_inverse[drifted], atol=1e-7, rtol=1e-6)
+
+    weights = torch.arange(got.numel(), device=got.device, dtype=got.dtype).reshape_as(got) / got.numel()
+    grad = torch.autograd.grad((got * weights).sum(), omega)[0]
+
+    omega_ref = omega.detach().clone().requires_grad_(True)
+    reference = omega_ref.transpose(-1, -2).clone()
+    reference[drifted] = torch.linalg.inv(omega_ref[drifted].double()).to(omega_ref.dtype)
+    grad_reference = torch.autograd.grad((reference * weights).sum(), omega_ref)[0]
+
+    assert torch.isfinite(grad).all()
+    assert torch.isfinite(grad_reference).all()
+    assert torch.allclose(grad, grad_reference, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("group_name", ["so_k", "glk"])
+@pytest.mark.parametrize("residual_tol", [-1.0, float("nan"), float("inf")])
+def test_group_element_inverse_rejects_invalid_residual_tol(group_name, residual_tol):
+    group = get_group(group_name)(K=3)
+    omega = torch.eye(3).reshape(1, 1, 3, 3)
+    with pytest.raises(ValueError, match="residual_tol must be finite and nonnegative"):
+        group_element_inverse(omega, group, residual_tol=residual_tol)
+
+
 def test_element_transport_skew_group_uses_transpose_inverse():
     grp = get_group("so_k")(K=4)                              # skew_symmetric=True -> U in O(4)
     g = torch.Generator().manual_seed(11)
     xi = 0.2 * torch.randn(1, 3, grp.generators.shape[0], generator=g)
     U = retract_omega(torch.eye(4).expand(1, 3, 4, 4).contiguous(), xi, grp.generators)  # in SO(4)
     built = build_transport_from_element(U, grp)              # single block -> dict
-    # atol=0 alone is NOT bit-exact (default rtol=1e-5 masks the ~5e-7 inv-vs-transpose gap);
+    # atol=0 alone is NOT bitwise (default rtol=1e-5 masks the ~5e-7 inv-vs-transpose gap);
     # rtol=0 too makes this a true bitwise check that only the transpose branch satisfies.
-    assert torch.allclose(built["exp_neg_phi"], U.transpose(-1, -2), atol=0, rtol=0)   # EXACT transpose, no inv
+    assert torch.allclose(built["exp_neg_phi"], U.transpose(-1, -2), atol=0, rtol=0)   # bitwise transpose fast path
     # cocycle telescopes
     om = built["Omega"]
     assert torch.allclose(om[0, 0, 1] @ om[0, 1, 2], om[0, 0, 2], atol=1e-5)

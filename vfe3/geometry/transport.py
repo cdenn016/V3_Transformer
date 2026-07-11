@@ -8,6 +8,7 @@ diagonal-covariance fast path plus an exact full-covariance congruence). Regime 
 gauge-RoPE folds a positional rotation into the transport via :class:`RopeTransport`.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -1002,6 +1003,49 @@ def compute_transport_operators(
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
+def group_element_inverse(
+    omega:        torch.Tensor,             # (..., K, K) stored group elements
+    group:        GaugeGroup,               # supplies the skew-generator flag
+
+    *,
+    residual_tol: float = 1e-4,
+) -> torch.Tensor:
+    r"""Group-element inverse with a rowwise orthogonality-residual gate.
+
+    For a skew-generator group, the transpose approximation is used only when
+    ``||U^T U - I||_F <= residual_tol`` for that row. The residual is evaluated in a bounded
+    float64 island. Unless a row is exactly orthogonal, this fast path approximates rather than
+    equals its inverse. Drifted skew rows and every non-skew row use a true float64 inverse. The
+    public result is cast back to ``omega.dtype`` so the surrounding float32 path is unchanged.
+    """
+    if not math.isfinite(residual_tol) or residual_tol < 0.0:
+        raise ValueError(
+            f"residual_tol must be finite and nonnegative, got {residual_tol!r}")
+
+    if not group.skew_symmetric:
+        with torch.amp.autocast(omega.device.type, enabled=False):
+            return torch.linalg.inv(omega.double()).to(omega.dtype)
+
+    K = omega.shape[-1]
+    omega_flat = omega.reshape(-1, K, K)
+    with torch.no_grad(), torch.amp.autocast(omega.device.type, enabled=False):
+        omega_check = omega_flat.detach().double()
+        eye = torch.eye(K, device=omega.device, dtype=torch.float64)
+        residual = (
+            omega_check.transpose(-1, -2) @ omega_check - eye
+        ).norm(dim=(-2, -1))
+        drifted = ~torch.isfinite(residual) | (residual > residual_tol)
+
+    if not bool(drifted.any()):
+        return omega.transpose(-1, -2)
+
+    with torch.amp.autocast(omega.device.type, enabled=False):
+        drifted_inverse = torch.linalg.inv(omega_flat[drifted].double()).to(omega.dtype)
+    inverse = omega_flat.transpose(-1, -2).clone()
+    inverse[drifted] = drifted_inverse
+    return inverse.reshape_as(omega)
+
+
 def build_transport_from_element(
     omega:  torch.Tensor,             # (B, N, K, K) per-token GL(K) element U_i (block-diagonal for block_glk)
     group:  GaugeGroup,
@@ -1014,17 +1058,14 @@ def build_transport_from_element(
     filled with U_i and U_j^{-1} directly; every downstream consumer (transport_mean,
     transport_covariance, RoPE) reads only those two slots, so nothing else changes.
 
-    U_j^{-1} is computed in a float64 island (the congruence Omega Sigma Omega^T squares cond(U); the
-    inverse degrades as det U -> 0, which the free-energy barrier keeps a trained U away from). For
-    the equal-block groups (block_glk) a FactoredTransport is returned so the per-head fast paths run;
-    for a single block (glk) the dense {'exp_phi','exp_neg_phi','Omega'} dict is returned (matching
+    U_j^{-1} uses :func:`group_element_inverse`: non-skew rows and drifted skew rows enter a bounded
+    float64 inverse island, while skew rows satisfying the orthogonality-residual tolerance use the
+    transpose approximation fast path. Public inverse factors return to the input dtype. For
+    equal-block groups (block_glk) a FactoredTransport is returned so the per-head fast paths run;
+    for a single block (glk), the dense {'exp_phi','exp_neg_phi','Omega'} dict is returned (matching
     compute_transport_operators' return shape).
     """
-    if group.skew_symmetric:
-        u_inv = omega.transpose(-1, -2)                           # U^{-1} = U^T exactly (orthogonal group), free
-    else:
-        with torch.amp.autocast(omega.device.type, enabled=False):   # fp64 island (non-compact inverse)
-            u_inv = torch.linalg.inv(omega.double()).to(omega.dtype)  # (B, N, K, K)
+    u_inv = group_element_inverse(omega, group)                    # (B, N, K, K)
     block_dims = group.irrep_dims
     if len(block_dims) > 1 and len(set(block_dims)) == 1:
         return FactoredTransport(exp_phi=omega, exp_neg_phi=u_inv, irrep_dims=list(block_dims))

@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from vfe3.config import VFE3Config
+from vfe3.inference import belief_cache as belief_cache_module
 from vfe3.inference.belief_cache import cache_supported, rollout_predictive_cached
 from vfe3.inference.policy import _rollout_predictive
 from vfe3.model.model import VFEModel
@@ -31,6 +32,7 @@ def _supported_ns(**over):
         transport_mode="flat", e_phi_lr=0.0, beta_attention_prior="causal", s_e_step=False,
         precision_weighted_attention=False, pos_rotation="none", use_head_mixer=False,
         use_cg_coupling=False, e_step_mu_precond="fisher", e_mu_q_trust=None,
+        phi_reflection="off",
         # M3 (audit 2026-07-06): result-changing toggles the cache does not replicate, at their
         # cache-eligible defaults so _supported_ns() stays supported.
         lambda_twohop=0.0, e_step_update="gradient", skip_belief_sigma_update=False,
@@ -73,6 +75,44 @@ def test_cached_matches_full_rollout(use_prior_bank, L, n_heads):
         f"max |dq|={float((q_cache - q_full).abs().max()):.2e}"
 
 
+def test_cached_matches_full_with_norm_keyed_matrix_exp(monkeypatch):
+    threshold = 1e-8
+    m = _model(n_heads=1, exp_fp64_mode="norm", exp_fp64_norm_threshold=threshold)
+    assert cache_supported(m.cfg)
+
+    B, N, Kp, L, V = 1, 4, 3, 2, m.cfg.vocab_size
+    context = torch.tensor([[0, 1, 2, 3]])
+    candidates = torch.tensor([[[4, 5], [6, 7], [8, 9]]])
+
+    with torch.no_grad():
+        base_logits = m.forward(context)[:, -1, :]
+        ctx_exp = context.unsqueeze(1).expand(B, Kp, N)
+        ext = torch.cat([ctx_exp, candidates], dim=2).reshape(B * Kp, N + L)
+        _belief, logits = m.rollout_beliefs(ext, return_logits=True)
+        q_full = torch.log_softmax(logits[:, -1, :], dim=-1).reshape(B, Kp, V)
+
+    calls = []
+    original_compute = belief_cache_module.compute_transport_operators
+
+    def tracked_compute(phi, group, **kwargs):
+        calls.append((
+            kwargs.get("exp_fp64_mode", "dim"),
+            kwargs.get("exp_fp64_norm_threshold", 5.0),
+        ))
+        return original_compute(phi, group, **kwargs)
+
+    monkeypatch.setattr(belief_cache_module, "compute_transport_operators", tracked_compute)
+    with torch.no_grad():
+        q_cache, lp_cache = rollout_predictive_cached(
+            context, candidates, m, base_logits=base_logits)
+
+    lp_full = torch.gather(torch.log_softmax(base_logits, dim=-1), 1, candidates[:, :, 0])
+    assert calls == [("norm", threshold), ("norm", threshold)]
+    assert torch.allclose(lp_cache, lp_full, atol=1e-6)
+    assert torch.allclose(q_cache, q_full, atol=1e-5, rtol=1e-4), \
+        f"max |dq|={float((q_cache - q_full).abs().max()):.2e}"
+
+
 def test_cache_supported_guard():
     assert cache_supported(_supported_ns())                 # the supported regime
     assert cache_supported(VFE3Config())                    # and the REAL default config is that regime
@@ -97,6 +137,12 @@ def test_cache_supported_guard():
         dict(renyi_order=0.5),
     ):
         assert not cache_supported(_supported_ns(**kw)), kw
+
+
+def test_cache_supported_rejects_phi_reflection():
+    assert cache_supported(_supported_ns(phi_reflection="off"))
+    assert not cache_supported(_supported_ns(phi_reflection="init_seed"))
+    assert not cache_supported(_supported_ns(phi_reflection="metropolis"))
 
 
 def test_cache_supported_gates_result_changing_toggles():
@@ -162,6 +208,21 @@ def test_efe_rollout_guards():
         cand2 = torch.randint(0, V, (1, 2, 2))
         with pytest.raises(NotImplementedError):
             get_policy("efe_rollout")(ctx, cand2, pref, m2, horizon=2)
+
+
+def test_efe_rollout_reflection_fails_closed():
+    from vfe3.inference.policy import get_policy, get_preference
+
+    m = _model(phi_reflection="init_seed")
+    H = 2
+    context = torch.tensor([[0, 1, 2, 3]])
+    candidates = torch.tensor([[[4, 5], [6, 7]]])
+    preference = get_preference("flat")(m.prior_bank)
+
+    with torch.no_grad():
+        with pytest.raises(NotImplementedError, match="requires the belief-prefix cache"):
+            get_policy("efe_rollout")(
+                context, candidates, preference, m, horizon=H)
 
 
 def test_efe_rollout_rejects_context_plus_horizon_over_limit():

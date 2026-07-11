@@ -14,8 +14,9 @@ tested against (``tests/test_belief_cache.py``) -- a single block (``n_layers=1`
 iteration (``n_e_steps=1``), the closed-form filtering kernel (``gaussian_diagonal`` + KL +
 ``include_attention_entropy``), flat transport, a causal belief prior, a frozen gauge frame
 (``e_phi_lr=0``), no gauge-RoPE (``pos_rotation='none'``), no model channel (``s_e_step=False``), no
-precision-bias fold, no learned head mixer / CG coupling, and the Fisher mean preconditioner with no
-mean trust region. ANY other config makes :func:`cache_supported` return ``False`` and the caller
+phi reflection, no precision-bias fold, no learned head mixer / CG coupling, and the Fisher mean
+preconditioner with no mean trust region. ANY other config makes :func:`cache_supported` return
+``False`` and the caller
 falls back to the full recompute in ``policy.py`` (correct, just slower). The fast path reuses the
 SAME primitives the live E-step uses (``transport_mean`` / ``transport_covariance``,
 ``pairwise_energy``, ``attention_weights``, the registered belief kernel, the family Fisher natural
@@ -39,7 +40,8 @@ from vfe3.belief import BeliefState
 from vfe3.families.base import get_family
 from vfe3.free_energy import attention_tau, attention_weights, pairwise_energy, self_divergence_for_alpha
 from vfe3.geometry.retraction import get_retraction
-from vfe3.geometry.transport import compute_transport_operators, transport_covariance, transport_mean
+from vfe3.geometry.transport import (compute_transport_operators, group_element_inverse,
+                                     transport_covariance, transport_mean)
 from vfe3.gradients.kernels import get_kernel
 
 # Belief priors that mask the future to exactly zero weight (j>i -> -inf -> exp = 0), the condition
@@ -68,6 +70,7 @@ def cache_supported(cfg: 'object') -> bool:
         and cfg.include_attention_entropy
         and cfg.transport_mode == "flat"
         and cfg.e_phi_lr == 0.0
+        and cfg.phi_reflection == "off"
         and cfg.beta_attention_prior in _CAUSAL_PRIORS
         and not cfg.s_e_step
         and not cfg.precision_weighted_attention
@@ -88,12 +91,15 @@ def cache_supported(cfg: 'object') -> bool:
 
 
 def _appended_belief_step(
-    beliefs:       BeliefState,             # (B', M) iteration-0 (encode + pos_phi) FULL field
-    log_prior_app: torch.Tensor,            # (L, M) or (H, L, M) causal prior, appended query rows
+    beliefs:           BeliefState,                     # (B', M) iteration-0 (encode + pos_phi) FULL field
+    log_prior_app:     torch.Tensor,                    # (L, M) or (H, L, M) causal prior, appended query rows
 
-    model:         'object',                 # VFEModel: group / cfg / learned-scalar handles
-    n_context:     int,                      # N: appended positions are [N:]
-    tau:           'float | torch.Tensor',   # softmax temperature kappa*sqrt(dim_h)
+    model:             'object',                        # VFEModel: group / cfg / learned-scalar handles
+    n_context:         int,                             # N: appended positions are [N:]
+    tau:               'float | torch.Tensor',          # softmax temperature kappa*sqrt(dim_h)
+
+    *,
+    omega_key_inverse: Optional[torch.Tensor] = None,   # (B', M, K, K), shared-prefix inverse factors
 
 ) -> BeliefState:
     r"""One filtering-kernel E-step iteration for the APPENDED query rows against the full (causal)
@@ -117,12 +123,22 @@ def _appended_belief_step(
     # differs. The default (phi) branch is untouched.
     if cfg.gauge_parameterization == "omega_direct":
         U_q = beliefs.omega[:, N:]                                                       # (B', L, K, K) query frames
-        with torch.amp.autocast(U_q.device.type, enabled=False):
-            U_k_inv = torch.linalg.inv(beliefs.omega.double()).to(U_q.dtype)             # (B', M, K, K)
+        U_k_inv = (
+            group_element_inverse(beliefs.omega, group)
+            if omega_key_inverse is None else omega_key_inverse
+        )                                                                                 # (B', M, K, K)
         omega = torch.einsum("bikl,bjlm->bijkm", U_q, U_k_inv)                           # (B', L, M, K, K)
     else:
-        exp_q     = compute_transport_operators(phi_q, group)["exp_phi"]                 # (B', L, K, K)
-        exp_neg_k = compute_transport_operators(phi_k, group)["exp_neg_phi"]             # (B', M, K, K)
+        exp_q = compute_transport_operators(
+            phi_q, group,
+            exp_fp64_mode=cfg.exp_fp64_mode,
+            exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+        )["exp_phi"]                                                                      # (B', L, K, K)
+        exp_neg_k = compute_transport_operators(
+            phi_k, group,
+            exp_fp64_mode=cfg.exp_fp64_mode,
+            exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+        )["exp_neg_phi"]                                                                  # (B', M, K, K)
         omega     = torch.einsum("bikl,bjlm->bijkm", exp_q, exp_neg_k)                   # (B', L, M, K, K)
     mu_t      = transport_mean(omega, mu_k)                                              # (B', L, M, K)
     sig_t     = transport_covariance(omega, sig_k)                                       # (B', L, M, K)
@@ -188,11 +204,27 @@ def rollout_predictive_cached(
     beliefs = model.prior_bank.encode(ext)                                  # (B*Kp, M) belief
     beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi))
 
+    omega_key_inverse = None
+    if model.cfg.gauge_parameterization == "omega_direct":
+        K = beliefs.omega.shape[-1]
+        omega_by_candidate = beliefs.omega.reshape(B, Kp, M, K, K)
+        context_inverse = group_element_inverse(
+            omega_by_candidate[:, 0, :N], model.group)                      # (B, N, K, K), once
+        appended_inverse = group_element_inverse(
+            beliefs.omega[:, N:], model.group)                              # (B*Kp, L, K, K)
+        shared_context_inverse = context_inverse.unsqueeze(1).expand(
+            B, Kp, N, K, K).reshape(B * Kp, N, K, K)
+        omega_key_inverse = torch.cat(
+            [shared_context_inverse, appended_inverse], dim=1)              # (B*Kp, M, K, K)
+
     log_prior = model._attention_log_prior(M, device)                       # (M, M) or (H, M, M) causal
     log_prior_app = log_prior[..., N:, :]                                   # appended query rows -> (..., L, M)
     tau = attention_tau(_as_coeff(model.cfg.kappa_beta, device), model.group.irrep_dims)
 
-    app = _appended_belief_step(beliefs, log_prior_app, model, N, tau)
+    app = _appended_belief_step(
+        beliefs, log_prior_app, model, N, tau,
+        omega_key_inverse=omega_key_inverse,
+    )
 
     # Post-E-step per-position transforms then decode, matching forward_beliefs at n_layers=1:
     # block_norm (if any) -> (no inter-block handoff) -> final_norm (if any) -> decode.
