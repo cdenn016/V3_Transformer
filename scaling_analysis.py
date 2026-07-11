@@ -23,7 +23,7 @@ import csv
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -43,8 +43,13 @@ _CSV_COLUMNS = [
     "n_gen", "gauge_group", "n_layers", "n_e_steps", "family", "tokens_seen", "est_flops_6ND",
     "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl", "test_bpc",
     "estep_final_f_per_token", "best_val_ppl",
-    "wall_time_s", "data_sha256", "git_sha",
+    "wall_time_s", "data_sha256", "train_data_sha256", "val_data_sha256", "test_data_sha256",
+    "git_sha",
 ]
+
+_ROUTE_NOTES = {
+    "blocks_K48_tied_2x": "tied structural ablation; not a strict full-covariance pure control",
+}
 
 
 # =============================================================================
@@ -102,7 +107,10 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
             "best_val_ppl": (summ.get("best_val_ppl") if summ.get("best_val_ppl") is not None
                              else test.get("best_val_ppl")),
             "wall_time_s": summ.get("wall_time_s", sp.get("wall_time_s")),
-            "data_sha256": prov.get("data_sha256"),
+            "data_sha256": prov.get("data_sha256") or prov.get("test_data_sha256"),
+            "train_data_sha256": prov.get("train_data_sha256"),
+            "val_data_sha256": prov.get("val_data_sha256"),
+            "test_data_sha256": prov.get("test_data_sha256") or prov.get("data_sha256"),
             "git_sha":     prov.get("git_sha"),
         })
     return rows
@@ -127,6 +135,86 @@ def _as_float(x: Any) -> float:
         return float(x)
     except (TypeError, ValueError):
         return float("nan")
+
+
+def _sorted_strings(rows: List[Dict[str, Any]], key: str) -> List[str]:
+    return sorted({str(r[key]) for r in rows if r.get(key)})
+
+
+def _analysis_provenance(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    r"""Summarize the code, data, and token-budget identities of the fitted parameter rows."""
+    sha_keys = ("data_sha256", "train_data_sha256", "val_data_sha256", "test_data_sha256")
+    sha_sets = {key: _sorted_strings(rows, key) for key in sha_keys}
+    git_shas = _sorted_strings(rows, "git_sha")
+    token_values = sorted({
+        value for value in (_as_float(r.get("tokens_seen")) for r in rows)
+        if np.isfinite(value)
+    })
+    token_budgets: List[int | float] = [int(v) if float(v).is_integer() else float(v) for v in token_values]
+    missing = {
+        "git_sha": sum(not r.get("git_sha") for r in rows),
+        "train_data_sha256": sum(not r.get("train_data_sha256") for r in rows),
+        "val_data_sha256": sum(not r.get("val_data_sha256") for r in rows),
+        "test_data_sha256": sum(not (r.get("test_data_sha256") or r.get("data_sha256")) for r in rows),
+    }
+    mixed_corpus = any(len(sha_sets[key]) > 1 for key in sha_keys)
+    return {
+        **sha_sets,
+        "git_sha": git_shas,
+        "n_distinct_data_sha256": len(sha_sets["data_sha256"]),
+        "n_distinct_train_data_sha256": len(sha_sets["train_data_sha256"]),
+        "n_distinct_val_data_sha256": len(sha_sets["val_data_sha256"]),
+        "n_distinct_test_data_sha256": len(sha_sets["test_data_sha256"]),
+        "n_distinct_git_sha": len(git_shas),
+        "mixed_corpus": mixed_corpus,
+        "code_drift": len(git_shas) > 1,
+        "token_budgets": token_budgets,
+        "n_distinct_token_budgets": len(token_budgets),
+        "token_budget_varies": len(token_budgets) > 1,
+        "n_missing_token_budgets": sum(not np.isfinite(_as_float(r.get("tokens_seen"))) for r in rows),
+        "missing": missing,
+    }
+
+
+def _pooled_status(
+    provenance: Dict[str, Any],
+    frontier:   Dict[str, Any],
+
+    *,
+    has_fit:    bool,
+    n_routes:   int,
+) -> Tuple[str, List[str]]:
+    if not has_fit:
+        return "not_fitted", []
+    reasons: List[str] = []
+    if provenance.get("code_drift"):
+        reasons.append("code_drift")
+    if provenance.get("mixed_corpus"):
+        reasons.append("mixed_corpus")
+    if provenance.get("token_budget_varies"):
+        reasons.append("token_budget_varies")
+    if any(int(v) > 0 for v in (provenance.get("missing") or {}).values()):
+        reasons.append("incomplete_provenance")
+    if int(provenance.get("n_missing_token_budgets", 0)) > 0:
+        reasons.append("incomplete_token_budget")
+    if frontier.get("testable") and frontier.get("collapses") is False:
+        reasons.append("routes_diverge")
+    if reasons:
+        return "confounded", reasons
+    if frontier.get("testable") and frontier.get("collapses") is None:
+        return "unassessed", []
+    if n_routes > 1 and not frontier.get("testable"):
+        return "unassessed", []
+    return "clean", []
+
+
+def _frontier_verdict(frontier: Dict[str, Any]) -> str:
+    collapses = frontier.get("collapses")
+    if collapses is True:
+        return "one shared frontier (routes collapse)"
+    if collapses is False:
+        return "routes diverge (route-specific slope/intercept)"
+    return "indeterminate (route collapse could not be decided)"
 
 
 def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -254,9 +342,17 @@ def ancova_frontier_collapse(points: List[Dict[str, Any]], min_points: int = 2) 
     and a total dof margin (n > 2R). Returns the F statistic, dof, p-value, and per-route point counts."""
     by_route: Dict[str, List[Dict[str, Any]]] = {}
     for p in points:
-        by_route.setdefault(p["route"], []).append(p)
-    routes = {r: ps for r, ps in by_route.items() if len(ps) >= min_points}
-    out: Dict[str, Any] = {"routes": {r: len(ps) for r, ps in routes.items()}, "testable": False}
+        n_params = _as_float(p.get("n_params"))
+        ce_mean = _as_float(p.get("ce_mean"))
+        if np.isfinite(n_params) and n_params > 0.0 and np.isfinite(ce_mean) and ce_mean > 0.0:
+            by_route.setdefault(p["route"], []).append(p)
+    route_sizes = {r: {float(p["n_params"]) for p in ps} for r, ps in by_route.items()}
+    routes = {r: ps for r, ps in by_route.items() if len(route_sizes[r]) >= min_points}
+    out: Dict[str, Any] = {
+        "routes": {r: len(ps) for r, ps in routes.items()},
+        "distinct_sizes": {r: len(route_sizes[r]) for r in routes},
+        "testable": False,
+    }
     if len(routes) < 2:
         out["reason"] = "need >= 2 routes with enough sizes"
         return out
@@ -314,18 +410,39 @@ def analyze() -> None:
     print(f"\nVFE_3.0 scaling analysis\n  input:   {input_dir}\n  runs:    {len(rows)}"
           f"\n  csv:     {input_dir / 'scaling_points.csv'}")
 
-    # provenance guards: a frontier must be one corpus + (ideally) one code state.
-    shas = {r["data_sha256"] for r in rows if r.get("data_sha256")}
-    gits = {r["git_sha"] for r in rows if r.get("git_sha")}
-    if len(shas) > 1:
-        logger.warning("harvested runs span %d distinct data_sha256 -- mixed corpus confounds the fit", len(shas))
-    if len(gits) > 1:
-        logger.warning("harvested runs span %d distinct git_sha -- code drift across the sweep", len(gits))
-
     points = aggregate_points(rows)
     param_points = [p for p in points if p["route"] != INFERENCE_ROUTE]
     infer_points = [p for p in points if p["route"] == INFERENCE_ROUTE]
+    fit_param_mask = np.array([
+        np.isfinite(_as_float(p.get("n_params"))) and _as_float(p.get("n_params")) > 0.0
+        for p in param_points
+    ], dtype=bool)
+    fit_param_points = [p for p, keep in zip(param_points, fit_param_mask) if keep]
+    retained_param_cells = {
+        (p["route"], p["label"])
+        for p in fit_param_points
+    }
+    param_rows = [
+        r for r in rows
+        if (r["route"], r["label"]) in retained_param_cells
+        and np.isfinite(_as_float(r.get("test_ce"))) and _as_float(r.get("test_ce")) > 0.0
+    ]
     _print_points_table(points)
+
+    # Persist every identity used to judge whether the parameter frontier is comparable.  Scope the
+    # sets to the rows that actually enter L(N), not flat-N inference arms that are plotted separately.
+    provenance = _analysis_provenance(param_rows)
+    if provenance["mixed_corpus"]:
+        logger.warning("harvested parameter runs span multiple data SHA-256 identities -- mixed corpus confounds the fit")
+    if provenance["code_drift"]:
+        logger.warning("harvested parameter runs span %d distinct git_sha -- code drift across the sweep",
+                       provenance["n_distinct_git_sha"])
+    if provenance["token_budget_varies"]:
+        logger.warning("harvested parameter runs span multiple token budgets -- data budget confounds the fit")
+
+    routes = sorted({p["route"] for p in fit_param_points})
+    frontier = ancova_frontier_collapse(fit_param_points, min_points=CONFIG["min_points"])
+    route_notes = {route: _ROUTE_NOTES[route] for route in routes if route in _ROUTE_NOTES}
 
     # Accumulate the printed fits / tests into a persisted summary (scaling_summary.json plus the
     # SCALING_ANALYSIS.md report): the pooled fit, bootstrap CI, per-route exponents, the
@@ -333,51 +450,102 @@ def analyze() -> None:
     summary: Dict[str, Any] = {
         "input_dir": str(input_dir), "n_runs": len(rows), "with_offset": CONFIG["with_offset"],
         "n_param_points": len(param_points), "n_inference_points": len(infer_points),
-        "pooled_fit": None, "per_route": {}, "frontier_collapse": None, "estep_structural": None,
+        "n_fitted_param_points": len(fit_param_points),
+        "provenance": provenance, "pooled_fit": None, "pooled_fit_status": "not_fitted",
+        "pooled_fit_confounds": [], "per_route": {}, "frontier_collapse": frontier,
+        "route_notes": route_notes, "estep_structural": None,
     }
 
+    weights_by_route: Dict[str, np.ndarray] = {}
+    if param_points:
+        from vfe3.viz.figures import _scaling_sem_weights
+        all_means = np.array([p["ce_mean"] for p in param_points], dtype=float)
+        all_sem = np.array([p["ce_sem"] for p in param_points], dtype=float)
+        all_weights = _scaling_sem_weights(all_means, all_sem)
+        for route in sorted({p["route"] for p in param_points}):
+            route_mask = np.array([p["route"] == route for p in param_points], dtype=bool)
+            positive_x = np.array([
+                np.isfinite(_as_float(p.get("n_params"))) and _as_float(p.get("n_params")) > 0.0
+                for p in param_points
+            ], dtype=bool)
+            weights_by_route[route] = all_weights[route_mask & positive_x]
+        fit_weights = all_weights[fit_param_mask]
+    else:
+        all_weights = np.array([], dtype=float)
+        fit_weights = np.array([], dtype=float)
+
     # ---- L(N) power law + bootstrap exponent CI (pooled over the parameter routes) ----
-    if len(param_points) >= 2:
+    n_distinct_param_sizes = len({float(p["n_params"]) for p in fit_param_points})
+    summary["n_distinct_param_sizes"] = n_distinct_param_sizes
+    if n_distinct_param_sizes >= 2:
         from vfe3.viz.figures import _fit_power_law
-        xs = np.array([p["n_params"] for p in param_points], dtype=float)
-        ys = np.array([p["ce_mean"] for p in param_points], dtype=float)
-        sem = np.array([p["ce_sem"] for p in param_points], dtype=float)
-        w = np.where(sem > 0, (ys / np.where(sem > 0, sem, 1.0)) ** 2, 1.0)
-        fit = _fit_power_law(xs, ys, weights=w, with_offset=CONFIG["with_offset"])
-        a_hat, lo, hi = bootstrap_exponent_ci(param_points, weights=w, n_boot=CONFIG["n_bootstrap"],
-                                              with_offset=CONFIG["with_offset"])
-        print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}  "
-              f"[95% CI {lo:.4f}, {hi:.4f}]   A = {fit['A']:.4g}   "
-              + (f"E = {fit['E']:.4f}   " if CONFIG["with_offset"] else "")
-              + f"R^2 = {fit['r2']:.4f}   over {fit['n_points']} sizes")
-        summary["pooled_fit"] = {
-            "form": fit["form"], "alpha": fit["alpha"], "alpha_ci": [lo, hi],
-            "A": fit["A"], "E": fit.get("E"), "r2": fit["r2"], "n_points": fit["n_points"],
-        }
-        # ---- per-route fits + frontier-collapse F-test ----
-        routes = sorted({p["route"] for p in param_points})
-        if len(routes) > 1:
+        xs = np.array([p["n_params"] for p in fit_param_points], dtype=float)
+        ys = np.array([p["ce_mean"] for p in fit_param_points], dtype=float)
+        fit = _fit_power_law(xs, ys, weights=fit_weights, with_offset=CONFIG["with_offset"])
+        _a_hat, lo, hi = bootstrap_exponent_ci(
+            fit_param_points,
+            weights=fit_weights,
+            n_boot=CONFIG["n_bootstrap"],
+            with_offset=CONFIG["with_offset"],
+        )
+        if np.isfinite(_as_float(fit.get("alpha"))):
+            print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}  "
+                  f"[95% CI {lo:.4f}, {hi:.4f}]   A = {fit['A']:.4g}   "
+                  + (f"E = {fit['E']:.4f}   " if fit["form"] == "offset_power_law" else "")
+                  + f"R^2 = {fit['r2']:.4f}   over {fit['n_distinct_sizes']} distinct sizes")
+            summary["pooled_fit"] = {
+                "form": fit["form"], "alpha": fit["alpha"], "alpha_ci": [lo, hi],
+                "A": fit["A"], "E": fit.get("E"), "r2": fit["r2"], "n_points": fit["n_points"],
+                "n_distinct_sizes": fit["n_distinct_sizes"],
+            }
+        else:
+            print("\n(pooled L(N) estimator returned no finite exponent; no estimate persisted)")
+        # ---- per-route fits use exact slices of the one pooled SEM-weight vector ----
+        if routes:
             print("\nper-route exponents:")
             for r in routes:
-                pr = [p for p in param_points if p["route"] == r]
-                if len(pr) >= 2:
+                pr = [p for p in fit_param_points if p["route"] == r]
+                route_sizes = {float(p["n_params"]) for p in pr}
+                if len(route_sizes) >= 2:
+                    route_mask = np.array([p["route"] == r for p in fit_param_points], dtype=bool)
+                    route_weights = fit_weights[route_mask]
                     fr = _fit_power_law(np.array([p["n_params"] for p in pr], dtype=float),
-                                        np.array([p["ce_mean"] for p in pr], dtype=float))
-                    print(f"  {r:<14} alpha={fr['alpha']:.4f}  R^2={fr['r2']:.4f}  ({len(pr)} sizes)")
-                    summary["per_route"][r] = {"alpha": fr["alpha"], "r2": fr["r2"], "n_sizes": len(pr)}
+                                        np.array([p["ce_mean"] for p in pr], dtype=float),
+                                        weights=route_weights, with_offset=CONFIG["with_offset"])
+                    if not np.isfinite(_as_float(fr.get("alpha"))):
+                        print(f"  {r:<14} (estimator returned no finite exponent; no estimate persisted)")
+                        continue
+                    display = f"{r} [structural ablation]" if r in route_notes else r
+                    print(f"  {display:<36} alpha={fr['alpha']:.4f}  R^2={fr['r2']:.4f}  "
+                          f"({fr['n_distinct_sizes']} distinct sizes; {fr['form']})")
+                    summary["per_route"][r] = {
+                        "form": fr["form"], "alpha": fr["alpha"], "A": fr["A"], "E": fr.get("E"),
+                        "r2": fr["r2"], "n_points": fr["n_points"],
+                        "n_distinct_sizes": fr["n_distinct_sizes"], "n_sizes": fr["n_distinct_sizes"],
+                    }
                 else:
-                    print(f"  {r:<14} (only {len(pr)} size; need >= 2 to fit)")
-            anc = ancova_frontier_collapse(param_points, min_points=CONFIG["min_points"])
-            summary["frontier_collapse"] = anc
-            if anc.get("testable"):
-                verdict = ("ONE shared frontier (routes collapse)" if anc["collapses"]
-                           else "routes DIVERGE (route-specific slope/intercept)")
-                print(f"\nfrontier-collapse F-test:  F({anc['df1']},{anc['df2']}) = {anc['F']:.3f}  "
-                      f"p = {anc['p_value']:.4g}  ->  {verdict}")
-            else:
-                print(f"\nfrontier-collapse F-test: not testable ({anc.get('reason')})")
+                    print(f"  {r:<14} (only {len(route_sizes)} distinct size; need >= 2 to fit)")
     else:
-        print("\n(only one parameter size present; add more sizes to fit L(N))")
+        print(f"\n(only {n_distinct_param_sizes} distinct parameter size present; add more sizes to fit L(N))")
+
+    if frontier.get("testable"):
+        verdict = _frontier_verdict(frontier)
+        print(f"\nfrontier-collapse F-test:  F({frontier['df1']},{frontier['df2']}) = {frontier['F']:.3f}  "
+              f"p = {frontier['p_value']:.4g}  ->  {verdict}")
+    else:
+        print(f"\nfrontier-collapse F-test: not testable ({frontier.get('reason')})")
+
+    status, confounds = _pooled_status(
+        provenance,
+        frontier,
+        has_fit=summary["pooled_fit"] is not None,
+        n_routes=len(routes),
+    )
+    summary["pooled_fit_status"] = status
+    summary["pooled_fit_confounds"] = confounds
+    if summary["pooled_fit"] is not None:
+        detail = f" ({', '.join(confounds)})" if confounds else ""
+        print(f"pooled fit status: {status.upper()}{detail}")
 
     # ---- C2/EXP-5: structural non-Neal-Hinton EM -- F-vs-CE decorrelation across the n_e_steps arms ----
     estep_pts = sorted([p for p in infer_points if p["scale_knob"] == "n_e_steps"
@@ -410,34 +578,75 @@ def analyze() -> None:
         logger.warning("scaling summary write failed (%s); skipped", exc)
 
     # ---- figures (best-effort, never fatal) ----
-    _make_figures(param_points, infer_points, fig_dir)
+    _make_figures(param_points, infer_points, fig_dir, weights_by_route=weights_by_route)
     print(f"\nfigures -> {fig_dir}")
 
 
 def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
     r"""Render ``summary`` as a readable SCALING_ANALYSIS.md (the pooled fit, per-route exponents,
-    frontier-collapse F-test, and E-step structural-EM correlations that were console-only)."""
+    persisted provenance/confounds, frontier test, and E-step structural-EM correlations)."""
     L = ["# VFE_3.0 scaling analysis", "",
          f"- input: `{summary.get('input_dir')}`",
          f"- runs: {summary.get('n_runs')}  (parameter points: {summary.get('n_param_points')}, "
          f"inference points: {summary.get('n_inference_points')})",
-         f"- fit form: {'E + A N^-alpha (offset)' if summary.get('with_offset') else 'A N^-alpha'}", ""]
+         f"- requested fit: {'E + A N^-alpha (offset)' if summary.get('with_offset') else 'A N^-alpha'}", ""]
+
+    provenance = summary.get("provenance") or {}
+    if provenance:
+        def _values(key: str) -> str:
+            values = provenance.get(key) or []
+            return ", ".join(f"`{value}`" for value in values) if values else "(missing)"
+
+        L += ["## Provenance and confounds", "",
+              f"- Git SHA set: {_values('git_sha')}",
+              f"- train-data SHA-256 set: {_values('train_data_sha256')}",
+              f"- validation-data SHA-256 set: {_values('val_data_sha256')}",
+              f"- test-data SHA-256 set: {_values('test_data_sha256')}",
+              f"- legacy held-out data SHA-256 set: {_values('data_sha256')}",
+              f"- token budgets: {_values('token_budgets')}",
+              f"- code drift: {bool(provenance.get('code_drift'))}",
+              f"- mixed corpus: {bool(provenance.get('mixed_corpus'))}",
+              f"- token-budget variation: {bool(provenance.get('token_budget_varies'))}",
+              f"- missing identities: `{json.dumps(provenance.get('missing') or {}, sort_keys=True)}`",
+              f"- missing token budgets: {int(provenance.get('n_missing_token_budgets', 0))}", ""]
+
     pf = summary.get("pooled_fit")
+    status = str(summary.get("pooled_fit_status", "unassessed"))
+    confounds = summary.get("pooled_fit_confounds") or []
+    status_line = f"- status: **{status}**"
+    if confounds:
+        status_line += f" ({', '.join(str(reason) for reason in confounds)})"
     if pf:
+        n_sizes = pf.get("n_distinct_sizes", pf.get("n_points"))
         L += ["## Pooled L(N) power law", "",
+              status_line,
+              f"- realized fit form: `{pf.get('form', 'unknown')}`",
               f"- exponent alpha = {pf['alpha']:.4f}  (95% CI [{pf['alpha_ci'][0]:.4f}, {pf['alpha_ci'][1]:.4f}])",
               f"- A = {pf['A']:.4g}" + (f", E = {pf['E']:.4f}"
-                                        if summary.get("with_offset") and pf.get("E") is not None else ""),
-              f"- R^2 = {pf['r2']:.4f} over {pf['n_points']} sizes", ""]
+                                        if pf.get("form") == "offset_power_law" and pf.get("E") is not None else ""),
+              f"- R^2 = {pf['r2']:.4f} over {n_sizes} distinct sizes ({pf['n_points']} points)", ""]
+    else:
+        L += ["## Pooled L(N) power law", "", status_line,
+              "- no pooled estimate is available", ""]
     pr = summary.get("per_route") or {}
     if pr:
-        L += ["## Per-route exponents", "", "| route | alpha | R^2 | sizes |", "|---|---|---|---|"]
-        L += [f"| {r} | {d['alpha']:.4f} | {d['r2']:.4f} | {d['n_sizes']} |" for r, d in pr.items()]
+        L += ["## Per-route exponents", "",
+              "| route | realized form | alpha | R^2 | distinct sizes |",
+              "|---|---|---|---|---|"]
+        L += [
+            f"| {r} | {d.get('form', 'unknown')} | {d['alpha']:.4f} | {d['r2']:.4f} | "
+            f"{d.get('n_distinct_sizes', d.get('n_sizes'))} |"
+            for r, d in pr.items()
+        ]
+        L.append("")
+    route_notes = summary.get("route_notes") or {}
+    if route_notes:
+        L += ["## Route interpretation", ""]
+        L += [f"- `{route}`: {note}." for route, note in route_notes.items()]
         L.append("")
     anc = summary.get("frontier_collapse")
     if anc and anc.get("testable"):
-        verdict = ("one shared frontier (routes collapse)" if anc.get("collapses")
-                   else "routes diverge (route-specific slope/intercept)")
+        verdict = _frontier_verdict(anc)
         L += ["## Frontier-collapse F-test", "",
               f"- F({anc['df1']},{anc['df2']}) = {anc['F']:.3f}, p = {anc['p_value']:.4g}",
               f"- verdict: {verdict}", ""]
@@ -452,8 +661,14 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
     path.write_text("\n".join(L), encoding="utf-8")
 
 
-def _make_figures(param_points: List[Dict[str, Any]], infer_points: List[Dict[str, Any]],
-                  fig_dir: Path) -> None:
+def _make_figures(
+    param_points: List[Dict[str, Any]],
+    infer_points: List[Dict[str, Any]],
+    fig_dir:      Path,
+
+    *,
+    weights_by_route: Optional[Mapping[str, np.ndarray]] = None,
+) -> None:
     try:
         from vfe3.viz import figures as figs
         figs.set_publication_style()
@@ -476,19 +691,22 @@ def _make_figures(param_points: List[Dict[str, Any]], infer_points: List[Dict[st
         if len({p["route"] for p in param_points}) > 1:
             _try("scaling_routes_overlay.png", lambda: figs.plot_scaling_routes(
                 param_points, x_key="n_params", xlabel="parameters N",
+                with_offset=CONFIG["with_offset"], weights_by_route=weights_by_route,
                 path=str(fig_dir / "scaling_routes_overlay.png")))
         # compute axis (a proxy): CE vs estimated FLOPs across the size grid (tokens fixed -> compute
         # grows with N). Labeled a proxy; uses the 6ND column.
         if any(np.isfinite(p["est_flops_6ND"]) for p in param_points):
             _try("scaling_ce_vs_flops.png", lambda: figs.plot_scaling_law(
                 param_points, x_key="est_flops_6ND", xlabel="est FLOPs (6ND proxy)",
-                title="Scaling vs compute (6ND proxy)", path=str(fig_dir / "scaling_ce_vs_flops.png")))
+                with_offset=CONFIG["with_offset"], title="Scaling vs compute (6ND proxy)",
+                path=str(fig_dir / "scaling_ce_vs_flops.png")))
         # data axis: only meaningful if tokens_seen actually varies (add a data route to populate it).
         toks = {p["tokens_seen"] for p in param_points if np.isfinite(p["tokens_seen"])}
         if len(toks) > 1:
             _try("scaling_ce_vs_tokens.png", lambda: figs.plot_scaling_law(
                 param_points, x_key="tokens_seen", xlabel="tokens seen (data)",
-                title="Scaling vs data", path=str(fig_dir / "scaling_ce_vs_tokens.png")))
+                with_offset=CONFIG["with_offset"], title="Scaling vs data",
+                path=str(fig_dir / "scaling_ce_vs_tokens.png")))
         # Pooled PPL offset law vs width (the June-27 headline result): PPL = E + A K^{-b} over ALL
         # parameter points, distinct from the per-arm kmup_stability split below. Uses the per-point
         # ppl_mean from aggregate_points; gated on >= 2 distinct widths.

@@ -11,6 +11,7 @@ r"""Tests for the 2026-06-28 reporting build-out (surfacing already-logged diagn
 Device-agnostic (CPU). Figures use the Agg backend.
 """
 import csv as _csv
+import json
 import logging
 import os
 import types
@@ -397,6 +398,324 @@ def test_seed_aggregate_groups_seeds():
 
 # --------------------------------------------------------------------------- scaling summary report
 
+def _write_scaling_analysis_run(
+    root,
+    *,
+    route,
+    label,
+    seed,
+    n_params,
+    test_ce,
+    tokens_seen=1000,
+    git_sha="git-a",
+    train_sha="train-a",
+    val_sha="val-a",
+    test_sha="test-a",
+):
+    run = root / f"{route}_{label}_s{seed}"
+    run.mkdir()
+    (run / "summary.json").write_text(json.dumps({
+        "n_params": n_params,
+        "scaling_point": {
+            "n_params": n_params,
+            "n_learnable_params": n_params,
+            "embed_dim": 4,
+            "n_heads": 1,
+            "n_gen": 16,
+            "gauge_group": "glk",
+            "n_layers": 1,
+            "n_e_steps": 1,
+            "tokens_seen": tokens_seen,
+            "test_ce": test_ce,
+        },
+    }), encoding="utf-8")
+    (run / "config.json").write_text(json.dumps({"config": {
+        "seed": seed,
+        "embed_dim": 4,
+        "n_heads": 1,
+        "n_layers": 1,
+        "n_e_steps": 1,
+        "family": "gaussian_diagonal",
+    }}), encoding="utf-8")
+    (run / "scaling_cell.json").write_text(json.dumps({
+        "route": route,
+        "scale_knob": "n_params",
+        "label": label,
+    }), encoding="utf-8")
+    (run / "provenance.json").write_text(json.dumps({
+        "seed": seed,
+        "git_sha": git_sha,
+        "train_data_sha256": train_sha,
+        "val_data_sha256": val_sha,
+        "test_data_sha256": test_sha,
+        "data_sha256": test_sha,
+    }), encoding="utf-8")
+
+
+def test_all_scaling_tables_and_overlays_share_estimator(tmp_path, monkeypatch):
+    # Two routes, four sizes each, and two seeds per cell give every table and
+    # overlay enough sizes for the requested offset estimator.  With symmetric
+    # seed values mean +/- 0.05, SEM is exactly 0.05 at every point.
+    import pytest
+    pytest.importorskip("scipy")
+
+    for route_i, route in enumerate(("route_a", "route_b")):
+        for n_params in (100, 200, 400, 800):
+            mean = 2.0 + (5.0 + route_i) * n_params ** -0.3
+            for seed, delta in ((1, -0.05), (2, 0.05)):
+                _write_scaling_analysis_run(
+                    tmp_path,
+                    route=route,
+                    label=f"n{n_params}",
+                    seed=seed,
+                    n_params=n_params,
+                    test_ce=mean + delta,
+                )
+
+    real_fit = figs._fit_power_law
+    calls = []
+
+    def _record_fit(N, L, *, weights=None, with_offset=False):
+        calls.append({
+            "N": np.asarray(N, dtype=float).copy(),
+            "L": np.asarray(L, dtype=float).copy(),
+            "weights": None if weights is None else np.asarray(weights, dtype=float).copy(),
+            "with_offset": with_offset,
+        })
+        return real_fit(N, L, weights=weights, with_offset=with_offset)
+
+    monkeypatch.setattr(figs, "_fit_power_law", _record_fit)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", True)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+
+    scaling_analysis.analyze()
+
+    assert len(calls) >= 8
+    assert all(call["with_offset"] is True for call in calls)
+    assert all(call["weights"] is not None for call in calls)
+    for call in calls:
+        np.testing.assert_allclose(call["weights"], (call["L"] / 0.05) ** 2, rtol=1e-12)
+
+    summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["pooled_fit"]["form"] == "offset_power_law"
+    assert all(fit["form"] == "offset_power_law" for fit in summary["per_route"].values())
+
+
+def test_scaling_summary_persists_code_and_data_drift(tmp_path, monkeypatch):
+    _write_scaling_analysis_run(
+        tmp_path,
+        route="grow_K",
+        label="n100",
+        seed=1,
+        n_params=100,
+        test_ce=4.5,
+        tokens_seen=1000,
+        git_sha="git-a",
+        train_sha="train-a",
+    )
+    _write_scaling_analysis_run(
+        tmp_path,
+        route="grow_K",
+        label="n200",
+        seed=1,
+        n_params=200,
+        test_ce=4.2,
+        tokens_seen=2000,
+        git_sha="git-b",
+        train_sha="train-b",
+    )
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setattr(scaling_analysis, "_make_figures", lambda *args, **kwargs: None)
+
+    scaling_analysis.analyze()
+
+    summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
+    provenance = summary["provenance"]
+    assert provenance["git_sha"] == ["git-a", "git-b"]
+    assert provenance["train_data_sha256"] == ["train-a", "train-b"]
+    assert provenance["val_data_sha256"] == ["val-a"]
+    assert provenance["test_data_sha256"] == ["test-a"]
+    assert provenance["code_drift"] is True
+    assert provenance["mixed_corpus"] is True
+    assert provenance["token_budgets"] == [1000, 2000]
+    assert provenance["token_budget_varies"] is True
+    assert provenance["missing"] == {
+        "git_sha": 0,
+        "train_data_sha256": 0,
+        "val_data_sha256": 0,
+        "test_data_sha256": 0,
+    }
+    assert summary["pooled_fit_status"] == "confounded"
+    assert set(summary["pooled_fit_confounds"]) == {"code_drift", "mixed_corpus", "token_budget_varies"}
+
+    text = (tmp_path / "SCALING_ANALYSIS.md").read_text(encoding="utf-8")
+    for value in ("git-a", "git-b", "train-a", "train-b", "1000", "2000", "confounded"):
+        assert value in text
+
+
+def test_divergent_routes_mark_pooled_fit_confounded(tmp_path, monkeypatch):
+    for route, ce0 in (("grow_K", 4.6), ("blocks_K48_tied_2x", 4.1)):
+        for i, n_params in enumerate((100, 200)):
+            _write_scaling_analysis_run(
+                tmp_path,
+                route=route,
+                label=f"n{n_params}",
+                seed=1,
+                n_params=n_params,
+                test_ce=ce0 - 0.1 * i,
+            )
+    ancova = {
+        "routes": {"blocks_K48_tied_2x": 2, "grow_K": 2},
+        "testable": True,
+        "F": 12.0,
+        "df1": 2,
+        "df2": 4,
+        "p_value": 0.004,
+        "rss_pooled": 0.4,
+        "rss_full": 0.04,
+        "collapses": False,
+    }
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setattr(scaling_analysis, "ancova_frontier_collapse", lambda *args, **kwargs: ancova)
+    monkeypatch.setattr(scaling_analysis, "_make_figures", lambda *args, **kwargs: None)
+
+    scaling_analysis.analyze()
+
+    summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["pooled_fit"] is not None
+    assert summary["pooled_fit_status"] == "confounded"
+    assert summary["pooled_fit_confounds"] == ["routes_diverge"]
+    assert summary["frontier_collapse"] == ancova
+    assert summary["route_notes"]["blocks_K48_tied_2x"] == (
+        "tied structural ablation; not a strict full-covariance pure control"
+    )
+
+    text = (tmp_path / "SCALING_ANALYSIS.md").read_text(encoding="utf-8")
+    assert "Pooled L(N) power law" in text
+    assert "confounded" in text
+    assert "tied structural ablation" in text
+    assert "not a strict full-covariance pure control" in text
+
+
+def test_indeterminate_ancova_is_unassessed_not_divergent(tmp_path, monkeypatch, capsys):
+    for route, ce0 in (("route_a", 4.6), ("route_b", 4.4)):
+        for i, n_params in enumerate((100, 200)):
+            _write_scaling_analysis_run(
+                tmp_path,
+                route=route,
+                label=f"n{n_params}",
+                seed=1,
+                n_params=n_params,
+                test_ce=ce0 - 0.1 * i,
+            )
+    ancova = {
+        "routes": {"route_a": 2, "route_b": 2},
+        "testable": True,
+        "F": 1.0,
+        "df1": 2,
+        "df2": 4,
+        "p_value": float("nan"),
+        "rss_pooled": 0.2,
+        "rss_full": 0.1,
+        "collapses": None,
+    }
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setattr(scaling_analysis, "ancova_frontier_collapse", lambda *args, **kwargs: ancova)
+    monkeypatch.setattr(scaling_analysis, "_make_figures", lambda *args, **kwargs: None)
+
+    scaling_analysis.analyze()
+
+    summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["pooled_fit"] is not None
+    assert summary["pooled_fit_status"] == "unassessed"
+    assert summary["pooled_fit_confounds"] == []
+    console = capsys.readouterr().out.lower()
+    assert "indeterminate" in console
+    assert "routes diverge" not in console
+    text = (tmp_path / "SCALING_ANALYSIS.md").read_text(encoding="utf-8").lower()
+    assert "indeterminate" in text
+    assert "routes diverge" not in text
+
+
+def test_duplicate_single_n_does_not_persist_nan_fit(tmp_path, monkeypatch):
+    for label, ce in (("arm_a", 4.5), ("arm_b", 4.3)):
+        _write_scaling_analysis_run(
+            tmp_path,
+            route="grow_K_mup",
+            label=label,
+            seed=1,
+            n_params=100,
+            test_ce=ce,
+        )
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", True)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setattr(scaling_analysis, "_make_figures", lambda *args, **kwargs: None)
+
+    scaling_analysis.analyze()
+
+    raw = (tmp_path / "scaling_summary.json").read_text(encoding="utf-8")
+    summary = json.loads(raw)
+    assert summary["pooled_fit"] is None
+    assert summary["pooled_fit_status"] == "not_fitted"
+    assert summary["per_route"] == {}
+    assert "nan" not in raw.lower()
+    text = (tmp_path / "SCALING_ANALYSIS.md").read_text(encoding="utf-8").lower()
+    assert "status: **not_fitted**" in text
+    assert "no pooled estimate is available" in text
+
+
+def test_ancova_requires_distinct_sizes_per_route(tmp_path, monkeypatch):
+    for route, n_params, ce0 in (("route_a", 100, 4.5), ("route_b", 200, 4.2)):
+        for arm in range(3):
+            _write_scaling_analysis_run(
+                tmp_path,
+                route=route,
+                label=f"arm_{arm}",
+                seed=1,
+                n_params=n_params,
+                test_ce=ce0 - 0.02 * arm,
+            )
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setattr(scaling_analysis, "_make_figures", lambda *args, **kwargs: None)
+
+    scaling_analysis.analyze()
+
+    summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["pooled_fit"] is not None
+    assert summary["frontier_collapse"]["testable"] is False
+    assert summary["frontier_collapse"]["routes"] == {}
+    assert summary["pooled_fit_status"] == "unassessed"
+
+
+def test_scaling_md_persists_not_fitted_status(tmp_path):
+    out = tmp_path / "SCALING_ANALYSIS.md"
+    scaling_analysis._write_scaling_md(out, {
+        "input_dir": str(tmp_path),
+        "n_runs": 1,
+        "n_param_points": 1,
+        "n_inference_points": 0,
+        "with_offset": True,
+        "pooled_fit": None,
+        "pooled_fit_status": "not_fitted",
+        "pooled_fit_confounds": [],
+    })
+
+    text = out.read_text(encoding="utf-8")
+    assert text.count("## Pooled L(N) power law") == 1
+    assert "status: **not_fitted**" in text
+    assert "no pooled estimate is available" in text
+
+
 def test_write_scaling_md(tmp_path):
     summary = {
         "input_dir": str(tmp_path), "n_runs": 6, "with_offset": True,
@@ -407,10 +726,16 @@ def test_write_scaling_md(tmp_path):
         "frontier_collapse": {"testable": True, "collapses": True, "df1": 2, "df2": 8,
                               "F": 0.5, "p_value": 0.62},
         "estep_structural": {"n_arms": 3, "pearson_ne_final_f": -0.95, "pearson_final_f_test_ce": 0.1},
+        "provenance": {"git_sha": ["abc"], "train_data_sha256": ["train"],
+                       "val_data_sha256": ["val"], "test_data_sha256": ["test"],
+                       "data_sha256": ["test"], "code_drift": False, "mixed_corpus": False,
+                       "token_budgets": [1000], "token_budget_varies": False, "missing": {}},
+        "pooled_fit_status": "clean", "pooled_fit_confounds": [],
+        "route_notes": {},
     }
     out = tmp_path / "SCALING_ANALYSIS.md"
     scaling_analysis._write_scaling_md(out, summary)
     text = out.read_text(encoding="utf-8")
     for section in ("Pooled L(N) power law", "Per-route exponents", "Frontier-collapse F-test",
-                    "E-step structural-EM check"):
+                    "E-step structural-EM check", "Provenance and confounds"):
         assert section in text

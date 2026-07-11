@@ -10,7 +10,7 @@ Tensors are accepted as torch or numpy; everything is detached to numpy for plot
 A registry (``register_figure``) lets a new figure slot in by name.
 """
 
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Mapping, Optional
 
 import matplotlib
 
@@ -2378,19 +2378,32 @@ def _fit_power_law(
     r"""Fit ``L(N)``. Default: log-log (weighted) least squares ``L = A * N^{-alpha}`` (returns
     ``alpha = -slope``); ``with_offset=True`` fits the Chinchilla irreducible-loss form
     ``L = E + A * N^{-alpha}`` via ``scipy.optimize.curve_fit`` and silently falls back to the
-    log-log fit if scipy is absent or the solve fails. Never raises; degenerate input (<2 finite
-    positive points) returns NaNs so the caller can skip the overlay."""
+    log-log fit if scipy is absent or the solve fails. Degenerate input (<2 distinct finite positive
+    sizes) returns NaNs so the caller can skip the overlay; malformed weights raise ``ValueError``.
+    """
     N = _np(N).astype(float).reshape(-1)
     L = _np(L).astype(float).reshape(-1)
+    if N.size != L.size:
+        raise ValueError(f"N and L must have equal lengths, got {N.size} and {L.size}")
     m = np.isfinite(N) & np.isfinite(L) & (N > 0) & (L > 0)
+    w_all = None if weights is None else _np(weights).astype(float).reshape(-1)
+    if w_all is not None and w_all.size != N.size:
+        raise ValueError(f"weights must have length {N.size}, got {w_all.size}")
     N, L = N[m], L[m]
+    w = None if w_all is None else w_all[m]
+    if (w is not None and w.size > 0
+            and (not np.all(np.isfinite(w)) or np.any(w < 0.0) or not np.any(w > 0.0))):
+        raise ValueError("filtered weights must be finite, nonnegative, and contain a positive value")
+    n_distinct_sizes = int(np.unique(N).size)
     out: Dict[str, object] = {"alpha": float("nan"), "A": float("nan"), "E": 0.0,
-                              "r2": float("nan"), "n_points": int(N.size), "form": "power_law"}
-    if N.size < 2:
+                              "r2": float("nan"), "n_points": int(N.size),
+                              "n_distinct_sizes": n_distinct_sizes, "form": "power_law"}
+    if with_offset and n_distinct_sizes < 4:
+        out["form"] = "power_law_fallback_underdetermined"
+    if N.size < 2 or n_distinct_sizes < 2:
         return out
     x, y = np.log(N), np.log(L)
-    w = None if weights is None else _np(weights).astype(float).reshape(-1)[m]
-    if with_offset and N.size >= 3:
+    if with_offset and n_distinct_sizes >= 4:
         try:
             from scipy.optimize import curve_fit
             p0 = [max(0.0, float(L.min()) * 0.5), float(np.exp(np.mean(y))), 0.3]
@@ -2403,10 +2416,11 @@ def _fit_power_law(
             Lp = E + A * np.power(N, -al)
             ss_res = float(np.sum((L - Lp) ** 2))
             ss_tot = float(np.sum((L - L.mean()) ** 2))
-            return {"alpha": al, "A": A, "E": E, "n_points": int(N.size), "form": "offset_power_law",
+            return {"alpha": al, "A": A, "E": E, "n_points": int(N.size),
+                    "n_distinct_sizes": n_distinct_sizes, "form": "offset_power_law",
                     "r2": (1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"))}
         except Exception:
-            pass                                                # fall through to the log-log fit
+            out["form"] = "power_law_fallback_solver"
     import warnings
     with warnings.catch_warnings():                          # bootstrap resamples can repeat x's -> ill-conditioned
         warnings.simplefilter("ignore", np.exceptions.RankWarning)
@@ -2437,10 +2451,13 @@ def _scaling_point_stats(points: list, x_key: str = "n_params") -> Dict[str, np.
     x, mean, sem, ci, ns, sx, sy = [], [], [], [], [], [], []
     for p in points:
         seeds = [float(s) for s in p.get("ce_seeds", []) if np.isfinite(s)]
-        if not seeds or not np.isfinite(p.get(x_key, float("nan"))):
+        try:
+            xv = float(p.get(x_key, float("nan")))
+        except (TypeError, ValueError):
+            continue
+        if not seeds or not np.isfinite(xv) or xv <= 0.0:
             continue
         arr = np.asarray(seeds, dtype=float)
-        xv = float(p[x_key])
         x.append(xv); mean.append(float(arr.mean())); ns.append(arr.size)
         s = float(arr.std(ddof=1)) / np.sqrt(arr.size) if arr.size > 1 else 0.0
         sem.append(s); ci.append(_t95(arr.size) * s)
@@ -2448,6 +2465,39 @@ def _scaling_point_stats(points: list, x_key: str = "n_params") -> Dict[str, np.
     return {"x": np.asarray(x), "mean": np.asarray(mean), "sem": np.asarray(sem),
             "ci95": np.asarray(ci), "n": np.asarray(ns, dtype=int),
             "seed_x": np.asarray(sx), "seed_y": np.asarray(sy)}
+
+
+def _scaling_sem_weights(mean: object, sem: object) -> np.ndarray:
+    r"""Inverse-variance weights for a log-loss fit from point means and their SEMs.
+
+    By the delta method, ``Var(log(mean)) ~= (SEM / mean)^2``, so the WLS
+    weight is ``(mean / SEM)^2``.  A zero SEM receives unit weight instead of
+    infinite leverage, matching the pre-existing headline-fit policy.
+    """
+    mean_arr = _np(mean).astype(float).reshape(-1)
+    sem_arr = _np(sem).astype(float).reshape(-1)
+    if mean_arr.size != sem_arr.size:
+        raise ValueError(f"mean and sem must have equal lengths, got {mean_arr.size} and {sem_arr.size}")
+    weights = np.ones_like(mean_arr)
+    positive = np.isfinite(mean_arr) & np.isfinite(sem_arr) & (mean_arr > 0.0) & (sem_arr > 0.0)
+    weights[positive] = (mean_arr[positive] / sem_arr[positive]) ** 2
+    return weights
+
+
+def _scaling_route_label(route: str) -> str:
+    if route == "blocks_K48_tied_2x":
+        return f"{route} (tied structural ablation)"
+    return route
+
+
+def _scaling_fit_form_label(form: object) -> str:
+    labels = {
+        "offset_power_law": "offset power law",
+        "power_law": "power law",
+        "power_law_fallback_underdetermined": "power-law fallback (underdetermined)",
+        "power_law_fallback_solver": "power-law fallback (solver failure)",
+    }
+    return labels.get(str(form), str(form).replace("_", " "))
 
 
 @register_figure("scaling_law")
@@ -2478,13 +2528,14 @@ def plot_scaling_law(
         ax.errorbar(st["x"], st["mean"], yerr=st["ci95"], fmt="o", color=_CB[1], ms=6,
                     capsize=3, lw=0, elinewidth=1.2, label="mean (95% CI)", zorder=3)
     fit = None
-    if st["x"].size >= 2:
-        w = np.where(st["sem"] > 0, (st["mean"] / np.where(st["sem"] > 0, st["sem"], 1.0)) ** 2, 1.0)
+    if np.unique(st["x"]).size >= 2:
+        w = _scaling_sem_weights(st["mean"], st["sem"])
         fit = _fit_power_law(st["x"], st["mean"], weights=w, with_offset=with_offset)
         xx = np.geomspace(st["x"].min(), st["x"].max(), 100)
         yy = fit["E"] + fit["A"] * np.power(xx, -fit["alpha"])
         lbl = (rf"fit $\alpha$={fit['alpha']:.3f}, $R^2$={fit['r2']:.3f}"
-               + (f", E={fit['E']:.3f}" if with_offset else ""))
+               + (f", E={fit['E']:.3f}" if fit["form"] == "offset_power_law" else "")
+               + f", {_scaling_fit_form_label(fit['form'])}")
         ax.plot(xx, yy, "--", color="#444444", lw=1.6, label=lbl, zorder=4)
         yfit_pts = fit["E"] + fit["A"] * np.power(st["x"], -fit["alpha"])
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -2505,10 +2556,14 @@ def plot_scaling_routes(
     points: list,                        # [{n_params, ce_seeds:[...], route, label}, ...]
 
     *,
-    x_key:  str = "n_params",
-    xlabel: str = "parameters N",
-    title:  str = "Routes to N: does the frontier collapse?",
-    path:   Optional[str] = None,
+    with_offset:      bool,
+
+    x_key:            str = "n_params",
+    xlabel:           str = "parameters N",
+    title:            str = "Routes to N: does the frontier collapse?",
+
+    weights_by_route: Optional[Mapping[str, np.ndarray]] = None,
+    path:             Optional[str]                      = None,
 ):
     r"""Multi-route overlay: ``test_ce`` vs ``N`` with points colored AND markered by which knob grew
     ``N`` (embed_dim / gauge block size / depth / ...), each route's own power-law fit, and a dashed
@@ -2516,28 +2571,56 @@ def plot_scaling_routes(
     different slope) does not -- the visual companion to the analyzer's ANCOVA test. Marker shape
     duplicates the color so the routes survive greyscale printing."""
     routes = sorted({str(p.get("route", "?")) for p in points})
-    markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
-    fig, ax = plt.subplots(figsize=(6.4, 4.8))
-    for i, r in enumerate(routes):
+    route_stats = []
+    for r in routes:
         st = _scaling_point_stats([p for p in points if str(p.get("route", "?")) == r], x_key)
         if not st["x"].size:
             continue
+        if weights_by_route is None:
+            weights = _scaling_sem_weights(st["mean"], st["sem"])
+        else:
+            if r not in weights_by_route:
+                raise ValueError(f"weights_by_route is missing route {r!r}")
+            weights = _np(weights_by_route[r]).astype(float).reshape(-1)
+            if weights.size != st["x"].size:
+                raise ValueError(
+                    f"weights_by_route[{r!r}] has length {weights.size}; "
+                    f"expected {st['x'].size} after point filtering"
+                )
+            if (not np.all(np.isfinite(weights)) or np.any(weights < 0.0)
+                    or not np.any(weights > 0.0)):
+                raise ValueError(
+                    f"weights_by_route[{r!r}] must be finite, nonnegative, and contain a positive value"
+                )
+        route_stats.append((r, st, weights))
+
+    markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
+    fig, ax = plt.subplots(figsize=(6.4, 4.8))
+    for i, (r, st, weights) in enumerate(route_stats):
         c, mk = _CB[i % len(_CB)], markers[i % len(markers)]
         ax.errorbar(st["x"], st["mean"], yerr=st["ci95"], fmt=mk, color=c, ms=6, capsize=2,
                     lw=0, elinewidth=1.0)
-        if st["x"].size >= 2:
-            fit = _fit_power_law(st["x"], st["mean"])
+        if np.unique(st["x"]).size >= 2:
+            fit = _fit_power_law(st["x"], st["mean"], weights=weights, with_offset=with_offset)
             xx = np.geomspace(st["x"].min(), st["x"].max(), 60)
-            ax.plot(xx, fit["A"] * np.power(xx, -fit["alpha"]), color=c, lw=1.4,
-                    label=rf"{r} ($\alpha$={fit['alpha']:.3f})")
+            yy = fit["E"] + fit["A"] * np.power(xx, -fit["alpha"])
+            ax.plot(xx, yy, color=c, lw=1.4,
+                    label=rf"{_scaling_route_label(r)} ($\alpha$={fit['alpha']:.3f}; "
+                          rf"{_scaling_fit_form_label(fit['form'])})")
         else:
-            ax.plot([], [], marker=mk, color=c, lw=0, label=f"{r} (1 pt)")
-    stall = _scaling_point_stats(points, x_key)
-    if stall["x"].size >= 2:
-        g = _fit_power_law(stall["x"], stall["mean"])
-        xx = np.geomspace(stall["x"].min(), stall["x"].max(), 60)
-        ax.plot(xx, g["A"] * np.power(xx, -g["alpha"]), "--", color="#444444", lw=1.6,
-                label=rf"pooled ($\alpha$={g['alpha']:.3f})")
+            ax.plot([], [], marker=mk, color=c, lw=0, label=f"{_scaling_route_label(r)} (1 pt)")
+    if route_stats:
+        pooled_x = np.concatenate([st["x"] for _, st, _ in route_stats])
+        pooled_mean = np.concatenate([st["mean"] for _, st, _ in route_stats])
+        pooled_weights = np.concatenate([weights for _, _, weights in route_stats])
+    else:
+        pooled_x = pooled_mean = pooled_weights = np.array([], dtype=float)
+    if np.unique(pooled_x).size >= 2:
+        g = _fit_power_law(pooled_x, pooled_mean, weights=pooled_weights, with_offset=with_offset)
+        xx = np.geomspace(pooled_x.min(), pooled_x.max(), 60)
+        yy = g["E"] + g["A"] * np.power(xx, -g["alpha"])
+        ax.plot(xx, yy, "--", color="#444444", lw=1.6,
+                label=rf"pooled ($\alpha$={g['alpha']:.3f}; {_scaling_fit_form_label(g['form'])})")
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set(xlabel=xlabel, ylabel="test CE (nats/token)", title=title)
     ax.legend(fontsize=7.5, frameon=False)
@@ -3222,9 +3305,11 @@ def plot_kmup_stability(
     r"""F1/EXP-6: inverse-K scaling width-fixed (grow_K) vs muP-corrected (grow_K_mup) on a shared
     K=embed_dim axis.
 
-    test PPL vs K per route with cross-seed 95% CI bars (the small-sample t-quantile, not a fixed 1.96)
-    and an offset power-law fit PPL = A K^{-alpha} + E overlaid; the exponent b = -alpha is annotated
-    per route. The grow_K_mup route is split into its matched /fixed and /mup arms upstream, so
+    Test PPL vs K per route with cross-seed 95% CI bars (the small-sample t-quantile, not a fixed 1.96)
+    and a requested offset power-law fit ``PPL = A K^{-alpha} + E`` overlaid when at least four
+    distinct widths identify it. Smaller grids, including the live three-size ``grow_K`` route, show
+    and label the realized log-log fallback without reporting an irreducible floor. The exponent
+    ``b = -alpha`` is annotated per route. The grow_K_mup route is split into its matched /fixed and /mup arms upstream, so
     |b_fixed - b_muP| -- the width-stability readout -- is read directly off the two muP curves; a large
     gap means the headline exponent is partly optimization mis-tuning the muP correction removes."""
     fig, ax = plt.subplots(figsize=(6.8, 4.8))
@@ -3235,13 +3320,14 @@ def plot_kmup_stability(
         ci = np.array([_t95(int(p.get("n", 2))) * float(p.get("ppl_sem", 0.0)) for p in pts], float)
         col = _CB[j % len(_CB)]
         ax.errorbar(K, y, yerr=ci, fmt="o", color=col, capsize=3, lw=1.4, label=name)
-        if K.size >= 2:
+        if np.unique(K).size >= 2:
             fit = _fit_power_law(K, y, with_offset=True)
             a = fit.get("alpha", float("nan"))
             if np.isfinite(a):
                 Kf = np.linspace(float(K.min()), float(K.max()), 100)
                 ax.plot(Kf, fit["A"] * Kf ** (-a) + fit.get("E", 0.0), "-", color=col, lw=1.3, alpha=0.7)
-                ax.plot([], [], " ", label=f"   {name}: b={-a:+.3f}")
+                ax.plot([], [], " ",
+                        label=f"   {name}: {_scaling_fit_form_label(fit['form'])}, b={-a:+.3f}")
     ax.set(xlabel="K (embed_dim)", ylabel="test PPL")
     ax.set_title("μP width-stability of the inverse-K exponent")
     ax.legend(fontsize=8, frameon=False)
@@ -3256,13 +3342,13 @@ def plot_ppl_offset(
     *,
     path:   Optional[str] = None,
 ):
-    r"""Pooled test-PPL offset law against width: PPL = E + A K^{-alpha} (exponent b = -alpha) over ALL
-    parameter points.
+    r"""Pooled test-PPL fit against width over all parameter points.
 
-    The headline width-scaling figure the June-27 result is cited as (an OFFSET law in PPL vs
-    ``embed_dim``), pooled over every parameter route -- distinct from ``kmup_stability``, which SPLITS
+    The figure requests ``PPL = E + A K^{-alpha}`` when at least four distinct widths identify the
+    three-parameter form and otherwise labels the realized log-log fallback without an ``E`` estimate.
+    It pools every parameter route -- distinct from ``kmup_stability``, which splits
     the muP arms to read the width-stability contrast. Each point carries the across-seed mean PPL with
-    a small-sample t-quantile CI when seeds are present; the offset fit and its exponent b are overlaid."""
+    a small-sample t-quantile CI when seeds are present; the realized fit and exponent ``b`` are overlaid."""
     pts = sorted([p for p in points
                   if np.isfinite(float(p.get("embed_dim", float("nan"))))
                   and np.isfinite(float(p.get("ppl_mean", float("nan")))) and float(p["ppl_mean"]) > 0],
@@ -3281,9 +3367,12 @@ def plot_ppl_offset(
         a = fit.get("alpha", float("nan"))
         if np.isfinite(a):
             Kf = np.linspace(float(K.min()), float(K.max()), 100)
+            fit_label = f"{_scaling_fit_form_label(fit['form'])}  b={-a:+.3f}"
+            if fit["form"] == "offset_power_law":
+                fit_label += f"  E={fit['E']:.3f}"
             ax.plot(Kf, fit["A"] * Kf ** (-a) + fit.get("E", 0.0), "-", color=_CB[1], lw=1.6,
-                    label=f"offset fit  b={-a:+.3f}  E={fit.get('E', 0.0):.3f}")
-    ax.set(xlabel="K (embed_dim)", ylabel="test PPL", title="Pooled PPL offset law vs width")
+                    label=fit_label)
+    ax.set(xlabel="K (embed_dim)", ylabel="test PPL", title="Pooled PPL fit vs width")
     ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)

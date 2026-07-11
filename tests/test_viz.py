@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 
 from vfe3.viz.figures import (
     _fe_terms,
+    _fit_power_law,
     attention_graph,
     clustering_metrics,
     get_figure,
@@ -35,9 +36,12 @@ from vfe3.viz.figures import (
     plot_holonomy_curvature,
     plot_ln3_symmetry_breaking,
     plot_lr_grid_heatmap,
+    plot_kmup_stability,
     plot_numerical_trust,
     plot_per_layer_diagnostics,
     plot_pareto_frontier,
+    plot_ppl_offset,
+    plot_scaling_routes,
     plot_spd_ellipses,
     plot_trajectory,
     plot_vocab_calibration,
@@ -59,6 +63,82 @@ def _saved_nonempty(path):
 def test_set_publication_style_runs():
     set_publication_style()
     assert plt.rcParams["savefig.dpi"] == 300
+
+
+def test_offset_fit_requires_four_distinct_sizes():
+    # Four observations at only three distinct sizes do not identify the
+    # three-parameter E + A*N**(-alpha) model with residual degrees of freedom.
+    N = np.array([1.0e2, 1.0e3, 1.0e4, 1.0e4])
+    L = np.array([4.7, 4.2, 3.9, 3.8])
+
+    fit = _fit_power_law(N, L, with_offset=True)
+
+    assert fit["form"] == "power_law_fallback_underdetermined"
+    assert fit["n_points"] == 4
+    assert fit["n_distinct_sizes"] == 3
+
+    plain = _fit_power_law(N, L, with_offset=False)
+    assert plain["form"] == "power_law"
+    assert plain["n_distinct_sizes"] == 3
+
+
+def test_offset_solver_failure_is_labeled(monkeypatch):
+    scipy_optimize = pytest.importorskip("scipy.optimize")
+
+    def _fail_solver(*args, **kwargs):
+        raise RuntimeError("synthetic solver failure")
+
+    monkeypatch.setattr(scipy_optimize, "curve_fit", _fail_solver)
+    N = np.array([1.0e2, 1.0e3, 1.0e4, 1.0e5])
+    L = np.array([4.7, 4.2, 3.9, 3.8])
+
+    fit = _fit_power_law(N, L, with_offset=True)
+
+    assert fit["form"] == "power_law_fallback_solver"
+    assert fit["E"] == 0.0
+    assert fit["n_distinct_sizes"] == 4
+
+
+def test_ppl_figures_label_underdetermined_fallbacks():
+    # The live grow_K route has three widths.  It may show a fallback curve,
+    # but neither figure may call that two-parameter curve an offset law or
+    # report a fitted irreducible floor E.
+    points = [
+        {"embed_dim": K, "ppl_mean": ppl, "ppl_sem": 0.1, "n_seeds": 3}
+        for K, ppl in ((60, 95.0), (80, 90.0), (100, 87.0))
+    ]
+    fig = plot_ppl_offset(points)
+    offset_text = " ".join(text.get_text() for text in fig.axes[0].get_legend().get_texts())
+    assert "fallback" in offset_text.lower()
+    assert "offset fit" not in offset_text.lower()
+    assert "E=" not in offset_text
+    assert "offset law" not in fig.axes[0].get_title().lower()
+    plt.close(fig)
+
+    routes = {"grow_K": [
+        {"embed_dim": p["embed_dim"], "ppl_mean": p["ppl_mean"],
+         "ppl_sem": p["ppl_sem"], "n": p["n_seeds"]}
+        for p in points
+    ]}
+    fig = plot_kmup_stability(routes)
+    kmup_text = " ".join(text.get_text() for text in fig.axes[0].get_legend().get_texts())
+    assert "fallback" in kmup_text.lower()
+    assert "offset" not in kmup_text.lower()
+    assert "E=" not in kmup_text
+    plt.close(fig)
+
+
+def test_scaling_routes_validates_supplied_weights_after_filtering():
+    points = [
+        {"route": "a", "n_params": 100.0, "ce_seeds": [4.0, 4.2]},
+        {"route": "a", "n_params": float("nan"), "ce_seeds": [3.9, 4.1]},
+    ]
+    with pytest.raises(ValueError, match="expected 1 after point filtering"):
+        plot_scaling_routes(
+            points,
+            with_offset=False,
+            weights_by_route={"a": np.ones(2)},
+        )
 
 
 def test_clustering_metrics_separated_blobs():
