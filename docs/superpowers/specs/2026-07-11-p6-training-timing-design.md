@@ -1,9 +1,9 @@
 # Design: P6 Training and Pipeline Throughput Instrumentation
 
 Date: 2026-07-11
-Status: approved design, awaiting written-spec review
+Status: approved for implementation; reporting-boundary synchronization corrected during planning
 Branch: `codex/p6-training-timing-20260711`
-Base: `origin/main` at `c7064e9f6a2c91a1dd7f109865d5e2dcff987ad4`
+Base: `origin/main` at `81dd6ae12dd9774c6fe348646bd668580eb38701`
 Worktree: `C:\tmp\V3_Transformer_p6_training_timing_20260711`
 
 ## Purpose
@@ -37,16 +37,19 @@ measurement of every host-only action inside the call.
 
 On CUDA, each completed training step records one start event and one end event on the resolved
 training device's current stream. Finishing a step does not synchronize it. At a log or metrics-row
-boundary, the latest end event is synchronized once, after which the elapsed milliseconds for every
-pair in that reporting window are summed. This produces an exact event total for the completed
-window without synchronizing nonreporting steps. An operator who selects a reporting cadence of one
-step necessarily requests this report-time synchronization after every step; the implementation will
-not hide that cost or add a second synchronization. On CPU, the same boundary is measured with
-`time.perf_counter()`. The device decision is based on the resolved training device's `device.type`,
-never on the process-wide result of `torch.cuda.is_available()`. The current training path does not
-dispatch unjoined auxiliary-stream work. If that changes, the auxiliary streams must join the timed
-stream before the end event or the metric must be relabeled; the P6 helper will not claim to time
-unordered work on another stream.
+boundary, the latest clean-step end event is synchronized, after which the elapsed milliseconds for
+every pair in that reporting window are summed. This supplies the clean rate for the existing
+pre-callback console line. After callbacks, checkpointing, and ordinary row construction, a second
+event is recorded and synchronized on that same stream before pipeline wall time is sampled. The
+second boundary prevents asynchronous callback work from spilling into the next pipeline window.
+Both synchronizations are event-specific and occur only on reporting steps; the implementation will
+not call global `torch.cuda.synchronize()`. An operator who selects a reporting cadence of one step
+therefore requests both reporting boundaries after every step. On CPU, both boundaries use
+`time.perf_counter()` without CUDA calls. The device decision is based on the resolved training
+device's `device.type`, never on the process-wide result of `torch.cuda.is_available()`. The current
+training path does not dispatch unjoined auxiliary-stream work. If that changes, the auxiliary
+streams must join the timed stream before the boundary event or the metric must be relabeled; the P6
+helper will not claim to time unordered work on another stream.
 
 The pipeline window begins after resume-data replay and immediately before the first ordinary batch
 acquisition. After a persisted row, the next window begins only after that row has been appended.
@@ -73,8 +76,9 @@ sample.
 A focused `TrainingTimer` component will live in `vfe3/timing.py`. It will own the CPU timestamps or
 CUDA event pairs, the clean-window step and token counts, the independent pipeline token count, the
 pipeline window origin, and the cumulative training origin used by `wall_clock_s`. Its public
-operations will express four transitions: start a training step, finish that step with its token
-count, sample and clear the clean training-step window, and sample or reset the pipeline window.
+operations will express five transitions: start a training step, finish that step with its token
+count, sample and clear the clean training-step window, sample the pipeline window, and reset the
+pipeline window after a successful metrics append.
 Clock and CUDA-event construction will have narrow test seams so deterministic unit tests do not
 sleep or require a GPU.
 
@@ -134,15 +138,16 @@ CPU runs remain fully supported even when CUDA is installed. CUDA runs create ev
 actual resolved CUDA device. The implementation will not synchronize when an individual step merely
 finishes, will not add synchronization on nonreporting steps, will not call global device
 synchronization, and will not impose a performance threshold that could make correctness tests
-sensitive to machine load.
+sensitive to machine load. Reporting steps use the clean-step and post-callback event boundaries
+described above because omitting the latter would undercount asynchronous callback work.
 
 ## Test and verification design
 
 Implementation will proceed test-first. A deterministic CPU unit test will drive a manual clock
 through several unequal step intervals and assert the exact mean milliseconds, clean steps per
 second, token rate, pipeline rate, and reset behavior. A fake CUDA-event test will assert event
-recording order, millisecond conversion, exact aggregation, and one synchronization at the reporting
-boundary with no synchronization at individual step completion. A CPU-on-CUDA-host regression will
+recording order, millisecond conversion, exact aggregation, the two event-specific reporting
+synchronizations, and no synchronization at individual step completion. A CPU-on-CUDA-host regression will
 make CUDA helper calls raise and prove that a CPU timer and CPU training row never touch them.
 
 A training-loop integration regression will assign deterministic virtual durations to a training
@@ -165,10 +170,10 @@ CUDA kernels, change transport settings, redesign the progress bar, revise peak-
 run a long performance benchmark. Those are separate performance tasks.
 
 The implementation is accepted when clean timing brackets only `train_step`, pipeline timing assigns
-callbacks and checkpoints to the correct reporting window, CUDA synchronization occurs only at an
-explicit reporting boundary, CPU execution makes no CUDA calls, all metrics rows remain rectangular,
-the legacy field is preserved as the documented alias, and focused CPU plus CUDA verification passes
-without a model-output or random-stream change.
+callbacks and checkpoints to the correct reporting window, CUDA synchronization is event-specific
+and occurs only at the two explicit reporting boundaries, CPU execution makes no CUDA calls, all
+metrics rows remain rectangular, the legacy field is preserved as the documented alias, and focused
+CPU plus CUDA verification passes without a model-output or random-stream change.
 
 Implementation does not begin until this written specification is committed, self-reviewed, and
 accepted by the user. A detailed test-driven implementation plan follows that acceptance.
