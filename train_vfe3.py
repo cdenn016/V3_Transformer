@@ -136,7 +136,7 @@ config = dict(
                                               #   | "frozen" (random fixed frame: e_phi_lr=m_phi_lr=0, phi_scale kept).
                                               #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
-    s_frame_mode              = "tied",       # "tied" | "phi_tilde" (independent model frame, default off)
+    s_frame_mode              = "tied",       # "tied" | "phi_tilde" (independent model-channel gauge frame)
     
     
     omega_retract_mode        = "lie_exp",  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
@@ -286,7 +286,7 @@ config = dict(
     
     r_update_mode             = "gradient",          # "gradient" (AdamW M-step; correct under s_e_step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
     prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"
-    learnable_r               = True,               # un-freeze hyper-prior centroid r (empirical-Bayes)
+    learnable_r               = False,               # un-freeze hyper-prior centroid r (empirical-Bayes)
     s_e_step                  = True,
     
     e_s_mu_lr                 = 0.85,
@@ -298,9 +298,9 @@ config = dict(
     #################################
         
     m_p_mu_lr                 = 0.0125,   
-    m_p_sigma_lr              = 0.003,     
-    m_phi_lr                  = 0.016,   
-    m_s_phi_lr                = 0.016,          # model-frame M-step LR (inert while s_frame_mode="tied")
+    m_p_sigma_lr              = 0.01,     
+    m_phi_lr                  = 0.010,   
+    m_s_phi_lr                = 0.016,         # M-step LR for independent model-channel frame (phi_tilde)
     
     weight_decay              = 0.02,
     phi_weight_decay          = 0.05,
@@ -313,7 +313,8 @@ config = dict(
     #        and Hand-Off
     #################################
     
-    norm_type_block           = "none",              # "none" | "mahalanobis"
+    layernorm_affine          = False,
+    norm_type_block           = "none",             # "none" | "mahalanobis"
     norm_type_final           = "none",              # "none" | "mahalanobis"
     
     prior_handoff_rho         = 0,                 # 1.0 = full flow; 0.0 = priors frozen
@@ -325,7 +326,7 @@ config = dict(
     
     e_mu_q_trust              = None,
     e_sigma_q_trust           = 10.0,
-    sigma_max                 = 100.0,
+    sigma_max                 = 10.0,
     
     #################################
     #         Misc/Logging
@@ -336,7 +337,7 @@ config = dict(
     eval_interval             = 1500,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
 
-    generate_figures          = False,     # OFF: skip the heavy-compute figure set at finalize_run (UMAP
+    generate_figures          = True,     # OFF: skip the heavy-compute figure set at finalize_run (UMAP
                                            # belief-category triptych, model/belief UMAP, belief bank, E-step
                                            # replay, holonomy sampling) + the per-eval attention/gamma heatmaps.
                                            # True re-enables; make_figures.py re-runs them for a trained run.
@@ -354,10 +355,10 @@ config = dict(
     ############################################################
 
     # --- E-step update rule ---
-    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
+    e_step_update             = "mm_exact",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
                                              # coordinate minimizer at frozen beta: precision fusion in ONE
                                              # iteration, same cost; kernel route only)
-    mm_damping                = 1.0,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
+    mm_damping                = 0.75,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
 
     # --- randomized-depth E-step (recurrent-depth recipe) ---
     randomize_e_steps         = False,       # training forwards sample T ~ Uniform{e_steps_min..e_steps_max}

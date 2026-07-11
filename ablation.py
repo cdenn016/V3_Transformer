@@ -156,7 +156,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                               #   | "frozen" (random fixed frame: e_phi_lr=m_phi_lr=0, phi_scale kept).
                                               #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
-    s_frame_mode              = "tied",       # "tied" | "phi_tilde" (independent model frame, default off)
+    s_frame_mode              = "tied",       # "tied" | "phi_tilde" (independent model-channel gauge frame)
     
     
     omega_retract_mode        = "lie_exp",  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
@@ -320,7 +320,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     m_p_mu_lr                 = 0.0125,   
     m_p_sigma_lr              = 0.01,     
     m_phi_lr                  = 0.010,   
-    m_s_phi_lr                = 0.016,          # model-frame M-step LR (inert while s_frame_mode="tied")
+    m_s_phi_lr                = 0.016,         # M-step LR for independent model-channel frame (phi_tilde)
     
     weight_decay              = 0.02,
     phi_weight_decay          = 0.05,
@@ -353,8 +353,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################     
     amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
         
-    log_interval              = 100,       # console log every N steps (0 = off)
-    eval_interval             = 1500,      # periodic validation every N steps (0 = off)
+    log_interval              = 100000,       # console log every N steps (0 = off)
+    eval_interval             = 150000,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
 
     generate_figures          = False,     # OFF: skip the heavy-compute figure set at finalize_run (UMAP
@@ -802,24 +802,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
     
 
-    "e_mu_q_trust": {  # E3 / EXP-24: mean trust region (BOX mode) as a stability guard. The endpoint
-        # is the NaN/loss-spike rate (nonfinite_frac, already logged per eval), NOT PPL -- it is
-        # near-inert at the production embed_dim<=64 / e_q_mu_lr operating point; it binds only at
-        # large embed_dim or raised LR. Numeric radii (single-field 'param'/'values') so _plot_one_sweep
-        # draws the x-sorted LINE plot like m_phi_lr; the unbounded 'off' (e_mu_q_trust=None) baseline
-        # cannot sit on a numeric axis, so run it separately in train_vfe3 if you need the endpoint.
-        "description": "E-step mean trust-region radius (box mode); endpoint = nonfinite_frac [E3/EXP-24]",
-        "param": "e_mu_q_trust", "values": [1.0, 2.0, 5.0],
-        "requires": {"mu_trust_mode": "box"},
-    },
-
-    "e_mu_q_trust_ball": {  # E3 / EXP-24, BALL mode: the SAME mean trust region under the 2-norm ball
-        # clip (mu_trust_mode='ball') instead of the per-coordinate box. Same numeric radii -> LINE plot;
-        # 'requires' pins mu_trust_mode='ball' on every cell (consulted only when e_mu_q_trust is set).
-        "description": "E-step mean trust-region radius (ball mode); endpoint = nonfinite_frac [E3/EXP-24]",
-        "param": "e_mu_q_trust", "values": [1.0, 2.0, 5.0],
-        "requires": {"mu_trust_mode": "ball"},
-    },
+    
 
     "regime_ii": {  # A4 / EXP-15: trained Regime-II connection trainability (flat vs learned connection_W).
         # transport_mode='regime_ii' auto-enables oracle_unroll_grad and creates the learned bilinear
@@ -938,14 +921,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         ],
     },
 
-    "use_ema": {
-        "description": "EMA/Polyak weight averaging off vs on (eval/best-save/final use the average)",
-        "param": "use_ema", "values": [False, True],
-    },
-    "ema_decay": {
-        "description": "EMA decay rate (slower average as decay -> 1); requires use_ema=True",
-        "param": "ema_decay", "values": [0.99, 0.999, 0.9995], "requires": {"use_ema": True},
-    },
+    
 
     # === belief family =====================================================
     # The full arm flips family (which derives diagonal_covariance) and moves off the per-coordinate
@@ -959,14 +935,28 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         ],
     },
 
-    "e_sigma_q_trust": {
-        "description": "E-step SPD retraction trust radius",
-        "param": "e_sigma_q_trust", "values": [10.0, 15],
+
+    "kappa_beta_per_head": {  # per-head tau_h = kappa_beta[h]*sqrt(d_head); list len MUST == n_heads
+        # Lists assume the baseline n_heads=2 on  equal-block group (block_glk/tied_block_glk);
+        # single-block groups (glk/so_k/sp) reject a list. Mean held at 1.0 so this isolates the
+        # per-head ASYMMETRY from the global-temperature axis the scalar 'kappa_beta' sweep covers;
+        # [1.0, 1.0] is the uniform reference and is byte-identical to the scalar kappa_beta=1 baseline.
+        "description": "per-head belief attention temperature (asymmetry at fixed mean 1.0, n_heads=2)",
+        "configs": [
+            {"label": "uniform_1.0",   "kappa_beta": [1.0, 1.0]},
+            {"label": "split_0.8_1.2", "kappa_beta": [0.8, 1.2]},
+            {"label": "split_1.2_0.8", "kappa_beta": [1.2, 0.8]},
+            {"label": "split_0.6_1.4", "kappa_beta": [0.6, 1.4]},
+            {"label": "split_1.4_0.6", "kappa_beta": [1.4, 0.6]},
+            # geo-mean-tau confound controls (B11-a/EXP-11): tied arms whose scalar kappa equals the
+            # GEOMETRIC mean of a dispersed pair, isolating per-head ASYMMETRY from the geo-mean tau
+            # shift the arithmetic-mean-1.0 dispersed arms carry. sqrt(0.8*1.2)=0.97980,
+            # sqrt(0.6*1.4)=0.91652. They sit at dispersion 0 on the dispersion-vs-PPL figure.
+            {"label": "geomean_0.8_1.2", "kappa_beta": [0.97980, 0.97980]},
+            {"label": "geomean_0.6_1.4", "kappa_beta": [0.91652, 0.91652]},
+        ],
     },
 
-    # === free-energy coupling ==============================================
-    
-    
     "lambda_h_mode": {
         "description": "self-coupling lambda_h form",
         "param": "lambda_h_mode",
@@ -981,6 +971,68 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "state-dependent alpha shape c0_h (numerator)",
         "param": "c0_h", "values": [0.1, 1.0, 5.0], "requires": {"lambda_h_mode": "state_dependent"},
     },
+
+    "renyi_order": {  # B2 / EXP-12: Renyi alpha-attention sweep + the alpha>1 non-PD saturation diagnostic.
+        # oracle_unroll_grad MUST be on for a fair divergence-order comparison: renyi_order != 1 routes
+        # the autograd oracle, whose default (detached) gradient truncates the through-inference signal
+        # to the priors/gauge-frame tables, while renyi_order == 1 uses the always-live analytic kernel.
+        # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
+        # spuriously ~2.5x faster AND worse). No-op at renyi_order == 1 (the kernel ignores the toggle).
+        # alpha<1 is mass-covering, alpha>1 mode-seeking; for alpha>1 the non-PD blend saturates to
+        # kl_max with zero gradient (S27), predicting a non-monotone H(beta)-vs-alpha tail.
+        # collect_diagnostics captures attn_entropy (H(beta)) + energy_klmax_frac (the saturation
+        # fraction) per cell -> the renyi_saturation figure.
+        "description": "Renyi divergence order alpha (both sides of 1) + non-PD saturation diagnostic [B2/EXP-12]",
+        "param": "renyi_order", "values": [0.5, 0.8, 1.0, 1.2, 1.5, 2.0],
+        "requires": {"oracle_unroll_grad": True},
+        "collect_diagnostics": True,
+    },
+
+
+
+
+
+    "e_mu_q_trust": {  # E3 / EXP-24: mean trust region (BOX mode) as a stability guard. The endpoint
+        # is the NaN/loss-spike rate (nonfinite_frac, already logged per eval), NOT PPL -- it is
+        # near-inert at the production embed_dim<=64 / e_q_mu_lr operating point; it binds only at
+        # large embed_dim or raised LR. Numeric radii (single-field 'param'/'values') so _plot_one_sweep
+        # draws the x-sorted LINE plot like m_phi_lr; the unbounded 'off' (e_mu_q_trust=None) baseline
+        # cannot sit on a numeric axis, so run it separately in train_vfe3 if you need the endpoint.
+        "description": "E-step mean trust-region radius (box mode); endpoint = nonfinite_frac [E3/EXP-24]",
+        "param": "e_mu_q_trust", "values": [1.0, 2.0, 5.0],
+        "requires": {"mu_trust_mode": "box"},
+    },
+
+    "e_mu_q_trust_ball": {  # E3 / EXP-24, BALL mode: the SAME mean trust region under the 2-norm ball
+        # clip (mu_trust_mode='ball') instead of the per-coordinate box. Same numeric radii -> LINE plot;
+        # 'requires' pins mu_trust_mode='ball' on every cell (consulted only when e_mu_q_trust is set).
+        "description": "E-step mean trust-region radius (ball mode); endpoint = nonfinite_frac [E3/EXP-24]",
+        "param": "e_mu_q_trust", "values": [1.0, 2.0, 5.0],
+        "requires": {"mu_trust_mode": "ball"},
+    },
+
+
+    "e_sigma_q_trust": {
+        "description": "E-step SPD retraction trust radius",
+        "param": "e_sigma_q_trust", "values": [10.0, 15],
+    },
+    
+    
+    "sigma_max": {  # E1 / EXP-20: does the SPD variance ceiling ever bind? (read guard_sigma_ceil_frac)
+        "description": "SPD variance ceiling sigma_max (binding vs slack) [E1/EXP-20]",
+        "param": "sigma_max", "values": [7.5, 10, 20],
+    },
+    
+    
+    
+    
+    
+    
+
+    # === free-energy coupling ==============================================
+    
+    
+    
     
    
     
@@ -1038,15 +1090,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
     
     
-    "decode_tau": {
-        "description": "KL-to-prior decode temperature",
-        "param": "decode_tau", "values": [0.007, 0.008, 0.009], "requires": {"use_prior_bank": True},
+    
+    
+    
+    
+    
+    "lambda_alpha": {
+        "description": "constant self-coupling value (lambda_alpha_mode=constant)",
+        "param": "lambda_alpha", "values": [0.0, 0.25, 0.5, 0.75, 1, 2.5, 5], "requires": {"lambda_alpha_mode": "constant"},
     },
-    
-    
-    
-    
-    
     
     
     "lambda_beta": {
@@ -1071,6 +1123,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
+    
+    
+    
+    
     "kappa_gamma": {
         "description": "model-channel temperature tau_gamma = kappa_gamma * sqrt(d_head)",
         "param": "kappa_gamma", "values": [0.9, 1, 1.1], 
@@ -1080,62 +1136,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
        "description": "attention temperature tau = kappa * sqrt(d_head)",
        "param": "kappa_beta", "values": [0.9, 1, 1.1],
     },
-
-    "kappa_beta_per_head": {  # per-head tau_h = kappa_beta[h]*sqrt(d_head); list len MUST == n_heads
-        # Lists assume the baseline n_heads=2 on  equal-block group (block_glk/tied_block_glk);
-        # single-block groups (glk/so_k/sp) reject a list. Mean held at 1.0 so this isolates the
-        # per-head ASYMMETRY from the global-temperature axis the scalar 'kappa_beta' sweep covers;
-        # [1.0, 1.0] is the uniform reference and is byte-identical to the scalar kappa_beta=1 baseline.
-        "description": "per-head belief attention temperature (asymmetry at fixed mean 1.0, n_heads=2)",
-        "configs": [
-            {"label": "uniform_1.0",   "kappa_beta": [1.0, 1.0]},
-            {"label": "split_0.8_1.2", "kappa_beta": [0.8, 1.2]},
-            {"label": "split_1.2_0.8", "kappa_beta": [1.2, 0.8]},
-            {"label": "split_0.6_1.4", "kappa_beta": [0.6, 1.4]},
-            {"label": "split_1.4_0.6", "kappa_beta": [1.4, 0.6]},
-            # geo-mean-tau confound controls (B11-a/EXP-11): tied arms whose scalar kappa equals the
-            # GEOMETRIC mean of a dispersed pair, isolating per-head ASYMMETRY from the geo-mean tau
-            # shift the arithmetic-mean-1.0 dispersed arms carry. sqrt(0.8*1.2)=0.97980,
-            # sqrt(0.6*1.4)=0.91652. They sit at dispersion 0 on the dispersion-vs-PPL figure.
-            {"label": "geomean_0.8_1.2", "kappa_beta": [0.97980, 0.97980]},
-            {"label": "geomean_0.6_1.4", "kappa_beta": [0.91652, 0.91652]},
-        ],
-    },
-   
-  
     
-    
-    "lambda_alpha": {
-        "description": "constant self-coupling value (lambda_alpha_mode=constant)",
-        "param": "lambda_alpha", "values": [0.0, 0.25, 0.5, 0.75, 1, 2.5, 5], "requires": {"lambda_alpha_mode": "constant"},
-    },
-    
-
-    
-    
-
-    
-    
-    
-    "renyi_order": {  # B2 / EXP-12: Renyi alpha-attention sweep + the alpha>1 non-PD saturation diagnostic.
-        # oracle_unroll_grad MUST be on for a fair divergence-order comparison: renyi_order != 1 routes
-        # the autograd oracle, whose default (detached) gradient truncates the through-inference signal
-        # to the priors/gauge-frame tables, while renyi_order == 1 uses the always-live analytic kernel.
-        # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
-        # spuriously ~2.5x faster AND worse). No-op at renyi_order == 1 (the kernel ignores the toggle).
-        # alpha<1 is mass-covering, alpha>1 mode-seeking; for alpha>1 the non-PD blend saturates to
-        # kl_max with zero gradient (S27), predicting a non-monotone H(beta)-vs-alpha tail.
-        # collect_diagnostics captures attn_entropy (H(beta)) + energy_klmax_frac (the saturation
-        # fraction) per cell -> the renyi_saturation figure.
-        "description": "Renyi divergence order alpha (both sides of 1) + non-PD saturation diagnostic [B2/EXP-12]",
-        "param": "renyi_order", "values": [0.5, 0.8, 1.0, 1.2, 1.5, 2.0],
-        "requires": {"oracle_unroll_grad": True},
-        "collect_diagnostics": True,
+    "decode_tau": {
+        "description": "KL-to-prior decode temperature",
+        "param": "decode_tau", "values": [0.007, 0.008, 0.009], "requires": {"use_prior_bank": True},
     },
     
     
-    
-    
+
     
     
     
@@ -1144,8 +1152,6 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
        "description": "E-step natural-gradient step size for mu_s",
        "param": "e_s_mu_lr", "values": [0.6, 0.7, 0.8, 0.9],
     },
-    
-    
     
     
     "e_q_mu_lr": {
@@ -1185,7 +1191,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
     "s_frame_mode": {
-        "description": "model-channel gauge frame: tied belief phi vs independent phi_tilde",
+        "description": "model-channel gauge frame: tied belief frame vs independent phi_tilde",
         "param": "s_frame_mode", "values": ["tied", "phi_tilde"],
         "requires": {
             "gauge_parameterization": "phi",
@@ -1198,26 +1204,29 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
     "m_s_phi_lr": {
-        "description": "M-step LR for the independent phi_tilde model frame",
+        "description": "M-step LR for the independent model-channel gauge frame (phi_tilde)",
         "param": "m_s_phi_lr", "values": [0.004, 0.008, 0.016, 0.032],
         "requires": {
-            "s_frame_mode": "phi_tilde",
             "gauge_parameterization": "phi",
             "phi_reflection": "off",
             "pos_rotation": "none",
             "s_e_step": True,
             "prior_source": "model_channel",
             "share_refine_s_transport": False,
+            "s_frame_mode": "phi_tilde",
         },
     },
     
     
     
     
-    "sigma_max": {  # E1 / EXP-20: does the SPD variance ceiling ever bind? (read guard_sigma_ceil_frac)
-        "description": "SPD variance ceiling sigma_max (binding vs slack) [E1/EXP-20]",
-        "param": "sigma_max", "values": [20, 30, 40],
-    },
+   
+    
+    
+    
+    
+    
+    
     
     
     "weight_decay": {
@@ -1232,13 +1241,27 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "phi_weight_decay", "values": [0.005, 0.015, 0.035, 0.05, 0.075, 0.1],
     },
 
+    "sigma_weight_decay": {  # separate AdamW weight decay for the log-variance tables (None = inherit
+        # weight_decay). Numeric radii -> LINE plot; the None (inherit) baseline runs via train_vfe3.
+        "description": "AdamW weight decay on the log-variance (sigma) tables",
+        "param": "sigma_weight_decay", "values": [0.0, 0.02, 0.05, 0.1],
+    },
+
+
+
+
+
+
+
     "mm_damping": {  # MM-exact E-step damping eta in (0,1]; 'requires' pins e_step_update='mm_exact' so the
         # damped coordinate-minimizer step is actually taken every cell (1.0 = full exact minimizer).
         "description": "MM-exact E-step damping eta in (0,1] (requires mm_exact E-step)",
-        "param": "mm_damping", "values": [0.25, 0.5, 0.75, 1.0],
+        "param": "mm_damping", "values": [0.65, 0.7, 0.75, 0.8],
         "requires": {"e_step_update": "mm_exact"},
     },
 
+    
+    
     "query_tau_c": {  # query-adaptive temperature strength c >= 0 (0 = inert); 'requires' forces
         # query_adaptive_tau=True so tau_i = tau_h (1 + c * tr_h Sigma_i / d_h) is live on every cell.
         "description": "query-adaptive temperature strength c (requires query_adaptive_tau=True)",
@@ -1246,17 +1269,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "requires": {"query_adaptive_tau": True},
     },
 
+    
+    
     "lambda_twohop": {  # two-hop coupling F2 = lam2 sum_ik (beta@beta)_ik KL_ik (0 = OFF = pure canonical F;
         # effective depth 2 at L=1). Numeric values -> _plot_one_sweep draws the x-sorted LINE plot.
         "description": "two-hop coupling weight lambda_twohop (0 = OFF)",
         "param": "lambda_twohop", "values": [0.0, 0.001, 0.005, 0.01],
     },
 
-    "sigma_weight_decay": {  # separate AdamW weight decay for the log-variance tables (None = inherit
-        # weight_decay). Numeric radii -> LINE plot; the None (inherit) baseline runs via train_vfe3.
-        "description": "AdamW weight decay on the log-variance (sigma) tables",
-        "param": "sigma_weight_decay", "values": [0.0, 0.02, 0.05, 0.1],
-    },
+    
 
     "warmup_steps": {  # LR warmup length before the cosine decay (0 = no warmup, straight into cosine).
         "description": "LR warmup steps before cosine decay",
@@ -1291,10 +1312,14 @@ NON_SWEPT_FIELDS = (
 SWEEP_ORDER: List[str] = [
    
     "mm_damping",
-   "query_tau_c",
-   "lambda_twohop",
+    
+   
    "sigma_weight_decay",
    "warmup_steps", 
+   
+   "m_phi_lr",
+   "m_p_mu_lr",
+   "m_p_sigma_lr",
    
   #"gauge_transport",
  # "attention_entropy",
@@ -1316,6 +1341,8 @@ SWEEP_ORDER: List[str] = [
   # "decode_tau",
   # "lambda_alpha",
   
+  "query_tau_c",
+  
  # "sigma_max",
   "weight_decay",
   "phi_weight_decay",
@@ -1326,7 +1353,7 @@ SWEEP_ORDER: List[str] = [
    
     "lambda_beta",
     "lambda_gamma",
-   "lambda_h",
+     "lambda_h",
    # "renyi_order",
    # "lambda_alpha",
    "e_mu_q_trust",
@@ -1339,10 +1366,8 @@ SWEEP_ORDER: List[str] = [
 
     #"pos_phi_scale",  
    
-   "m_phi_lr",
-   "m_p_mu_lr",
-   "m_p_sigma_lr",
    
+   "lambda_twohop",
   # "kappa_beta",
   # "kappa_gamma",   
     
