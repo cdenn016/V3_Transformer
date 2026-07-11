@@ -56,6 +56,7 @@ def _transport(
     exp_fp64_mode:           str   = "dim",                 # stable_matrix_exp_pair island keying (flat builder; 'dim' | 'norm')
     exp_fp64_norm_threshold: float = 5.0,                   # 'norm': max clamped block ||M||_F upcast threshold
     clamp_monitor:      bool                   = False,     # opt-in: warn when the exp Frobenius clamp fires (host sync)
+    transport_mean_per_head: bool  = False,                 # omega-direct factored mean contracts per gauge block
     connection_W:       Optional[torch.Tensor] = None,      # (n_gen, K, K) learned bilinear connection (regime_ii, NN exception)
     connection_M:       Optional[torch.Tensor] = None,      # (n_gen, 3) learned covariant connection (regime_ii_covariant, NN exception)
     connection_L:       Optional[torch.Tensor] = None,      # (max_seq, max_seq, n_gen) learned direct link (regime_ii_link*, NN exception)
@@ -81,7 +82,8 @@ def _transport(
     forward) flows straight through. ``mu``/``mu_key`` are unsqueezed to match so the builder always
     sees batched (B, N, K) means."""
     if gauge_parameterization == "omega_direct":
-        built = build_transport_from_element(omega, group)
+        built = build_transport_from_element(
+            omega, group, mean_per_head=transport_mean_per_head)
         if isinstance(built, dict):
             return built["Omega"]
         if isinstance(built, CompactFactoredTransport):
@@ -242,7 +244,8 @@ def build_belief_transport(
         # FactoredTransport, or RopeTransport -- NOT a dict -- so normalize the single-block dict to
         # its dense Omega, matching the phi path (which returns a dense (B,N,N,K,K) Omega for glk via
         # _transport). block_glk keeps the FactoredTransport fast path untouched.
-        built = build_transport_from_element(omega, group)
+        built = build_transport_from_element(
+            omega, group, mean_per_head=transport_mean_per_head)
         if isinstance(built, dict):
             built = built["Omega"]
     elif _can_fuse_flat(transport_mode, group):
@@ -316,7 +319,7 @@ def free_energy_value(
     include_attention_entropy: bool = True,
     skip_belief_sigma_update:  bool = False,           # accepted-and-ignored iteration-only knob
     compile_pair_kernel:       bool = False,           # accepted-and-ignored iteration-only knob
-    transport_mean_per_head:   bool = False,           # accepted-and-ignored Tier-1 transport-numerics knob
+    transport_mean_per_head:   bool = False,           # HONORED by omega-direct factored transport
     rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
     rope_on_value:             bool = True,            # False -> value aggregation uses the un-rotated base
     family:                    str  = "gaussian_diagonal",
@@ -360,9 +363,11 @@ def free_energy_value(
     model path, so under gauge-RoPE the logged F is the F being descended, not the un-rotated one.
     ``lambda_twohop`` is likewise HONORED (detached beta@beta hop weights against the same energy
     grid, no entropy term), so the logged F carries the two-hop block the kernel descends.
-    The Tier-1 transport perf toggles (``transport_mean_per_head``, ``exp_fp64_mode``,
-    ``exp_fp64_norm_threshold``) are accepted-and-ignored: they change transport numerics at
-    round-off only, so the diagnostic F keeps the default (dense-mean, dim-keyed) build.
+    ``transport_mean_per_head`` is forwarded to omega-direct element builds. Compact builds retain
+    the configured metadata; the legacy noncompact diagnostic seam still materializes its dense
+    operator. The exp-island toggles
+    (``exp_fp64_mode`` / ``exp_fp64_norm_threshold``) remain accepted-and-ignored: they change
+    transport numerics at round-off only, so the diagnostic F keeps the default dim-keyed build.
     """
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
     # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
@@ -382,6 +387,7 @@ def free_energy_value(
             connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
             link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
             cocycle_relaxation=cocycle_relaxation,
+            transport_mean_per_head=transport_mean_per_head,
         )
     else:
         # The filtered (mixed current-query / frozen-key frame) transport has no regime_ii form;
@@ -907,8 +913,8 @@ def e_step(
     e_steps_backprop_last: int  = 0,             # truncated backprop: no_grad prefix, detach at the boundary (0 = OFF)
     randomize_e_steps:     bool = False,         # training forwards sample T; eval keeps n_iter
     e_step_halt_tol:       Optional[float] = None,       # eval halting: break when mean KL(q^t||q^{t-1}) < tol
-    # Tier-1 transport perf toggles (2026-07-05; explicit, off the F_diag bag -- the diagnostic
-    # free_energy_value accepts-and-ignores them anyway). All default OFF/byte-identical.
+    # Tier-1 transport perf toggles (2026-07-05; explicit, off the F_diag bag -- that diagnostic
+    # deliberately keeps the default transport numerics). All default OFF/byte-identical.
     exp_fp64_mode:           str   = "dim",      # flat-builder float64-island keying ('dim' | 'norm')
     exp_fp64_norm_threshold: float = 5.0,        # 'norm': max clamped block ||M||_F upcast threshold
     transport_mean_per_head: bool  = False,      # factored transport_mean contracts per gauge block

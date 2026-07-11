@@ -202,6 +202,26 @@ def test_regime_ii_link_charted_none_reduces_to_flat_cocycle():
     assert torch.allclose(out, flat, atol=1e-6, rtol=0.0)
 
 
+def test_charted_trivial_gauge_preserves_edge_link():
+    """Trivial vertex frames leave the direct edge factor instead of erasing the connection."""
+    phi, connection_l, grp = _inputs(seed=121, B=2, N=4)
+    connection_l.zero_()
+    connection_l[0, 1, 0] = 0.25
+
+    charted = get_transport("regime_ii_link_charted")(
+        phi, grp, gauge_mode="trivial", connection_L=connection_l, link_alpha=1.0,
+    )["Omega"]
+    bare = get_transport("regime_ii_link")(
+        phi, grp, gauge_mode="trivial", connection_L=connection_l, link_alpha=1.0,
+    )["Omega"]
+    expected = bare.unsqueeze(0).expand_as(charted)
+
+    assert torch.allclose(charted, expected, atol=1e-6, rtol=0.0)
+    assert not torch.allclose(
+        charted[0, 0, 1], torch.eye(grp.generators.shape[-1]), atol=1e-6, rtol=0.0,
+    )
+
+
 def test_regime_ii_link_charted_nonzero_is_non_flat():
     """A nonzero connection_L gives non-trivial triangle holonomy under the charted sandwich."""
     phi, connection_l, grp = _inputs(seed=13, B=1, N=4)

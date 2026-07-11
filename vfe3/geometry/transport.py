@@ -857,14 +857,17 @@ def _build_regime_ii_link_charted(
     through a non-invariant bilinear. Belief-INDEPENDENT (no needs_mu/needs_sigma -> kernel-eligible),
     but ``phi``-dependent (so it travels the dense, per-sequence path and is the more expensive of the
     two link modes). Its ``A=0`` limit is the Regime-I flat cocycle ``exp(phi_i)exp(-phi_j)`` (NOT the
-    bare identity-link limit). A nonzero ``connection_L`` gives non-trivial triangle holonomy.
+    bare identity-link limit). Under ``gauge_mode='trivial'`` the vertex factors become identities but
+    the direct edge factor remains ``exp(link_alpha * A_ij . G)``. A nonzero ``connection_L`` gives
+    non-trivial triangle holonomy.
 
     Returns the flat builder's dict shape: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K), 'Omega'
     (B,N,N,K,K) (genuinely batched, because exp_phi is per-sequence).
     """
-    # Flat (cocycle) fast path: no connection / link_alpha=0 / trivial gauge -> exp(phi_i)exp(-phi_j)
-    # byte-identically. A zero (grad-requiring) connection_L is NOT short-circuited (autograd at A=0).
-    if connection_L is None or link_alpha == 0.0 or gauge_mode == "trivial":
+    # Flat (cocycle) fast path: no connection / link_alpha=0 -> exp(phi_i)exp(-phi_j)
+    # byte-identically. A trivial vertex gauge still retains the direct edge factor, and a zero
+    # (grad-requiring) connection_L is NOT short-circuited (autograd at A=0).
+    if connection_L is None or link_alpha == 0.0:
         return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
     fac = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
@@ -1218,6 +1221,9 @@ def group_element_inverse(
 def build_transport_from_element(
     omega:  'torch.Tensor | CompactBlockElement',  # dense (B,N,K,K) or compact block element
     group:  GaugeGroup,
+
+    *,
+    mean_per_head: bool = False,
 ) -> 'CompactFactoredTransport | FactoredTransport | TransportDict':
     r"""Exp-free flat cocycle from a stored group element: Omega_ij = U_i U_j^{-1}.
 
@@ -1233,16 +1239,22 @@ def build_transport_from_element(
     equal-block dense groups (block_glk) a FactoredTransport is returned so the per-head fast paths
     run; for a compact equal-block element, CompactFactoredTransport is returned; for a single block
     (glk), the dense {'exp_phi','exp_neg_phi','Omega'} dict is returned (matching
-    compute_transport_operators' return shape).
+    compute_transport_operators' return shape). ``mean_per_head`` is stored on either factored
+    container so downstream mean transport can honor the configured block contraction.
     """
     u_inv = group_element_inverse(omega, group)
     if isinstance(omega, CompactBlockElement):
         assert isinstance(u_inv, CompactBlockElement)
         return CompactFactoredTransport(
-            omega.expanded_blocks(), u_inv.expanded_blocks(), omega.K)
+            omega.expanded_blocks(), u_inv.expanded_blocks(), omega.K,
+            mean_per_head=mean_per_head,
+        )
     block_dims = group.irrep_dims
     if len(block_dims) > 1 and len(set(block_dims)) == 1:
-        return FactoredTransport(exp_phi=omega, exp_neg_phi=u_inv, irrep_dims=list(block_dims))
+        return FactoredTransport(
+            exp_phi=omega, exp_neg_phi=u_inv, irrep_dims=list(block_dims),
+            mean_per_head=mean_per_head,
+        )
     Omega = torch.einsum("...ikl,...jlm->...ijkm", omega, u_inv)   # (B, N, N, K, K)
     return {"exp_phi": omega, "exp_neg_phi": u_inv, "Omega": Omega}
 

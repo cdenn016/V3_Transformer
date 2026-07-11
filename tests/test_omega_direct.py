@@ -13,7 +13,13 @@ from vfe3.geometry.transport import (RopeTransport, build_transport_from_element
                                       CompactFactoredTransport, FactoredTransport)
 from vfe3.inference import belief_cache as belief_cache_module
 from vfe3.inference.belief_cache import cache_supported, rollout_predictive_cached
-from vfe3.inference.e_step import build_belief_transport, e_step, e_step_iteration, free_energy_value
+from vfe3.inference.e_step import (
+    _transport,
+    build_belief_transport,
+    e_step,
+    e_step_iteration,
+    free_energy_value,
+)
 from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import PriorBank
 
@@ -87,6 +93,61 @@ def test_element_transport_block_glk_is_factored():
     mu = torch.randn(1, 3, 4)
     mt = transport_mean(built, mu)                           # (1,3,3,4) via the factored fast path
     assert mt.shape == (1, 3, 3, 4)
+
+
+def test_element_transport_omega_direct_wires_mean_per_head():
+    K, H, d, N = 6, 3, 2, 4
+    grp = get_group("block_glk")(K=K, n_heads=H)
+    gen = torch.Generator().manual_seed(31)
+    blocks = torch.eye(d).expand(1, N, H, d, d).clone()
+    blocks = blocks + 0.06 * torch.randn(blocks.shape, generator=gen)
+    compact = CompactBlockElement(blocks, K)
+    element = compact.to_dense()
+    phi = torch.zeros(1, N, grp.generators.shape[0])          # ignored on the omega-direct path
+    mu = torch.randn(1, N, K, generator=gen)
+
+    default = build_transport_from_element(element, grp)
+    direct = build_transport_from_element(element, grp, mean_per_head=True)
+    forward = build_belief_transport(
+        phi, grp, gauge_parameterization="omega_direct", omega=element,
+        transport_mean_per_head=True,
+    )
+
+    assert isinstance(default, FactoredTransport) and not default.mean_per_head
+    assert isinstance(direct, FactoredTransport) and direct.mean_per_head
+    assert isinstance(forward, FactoredTransport) and forward.mean_per_head
+    dense = direct.to_dense_omega()
+    expected = transport_mean(dense, mu)
+    assert torch.allclose(transport_mean(direct, mu), expected, atol=2e-6, rtol=1e-5)
+    assert torch.allclose(transport_mean(forward, mu), expected, atol=2e-6, rtol=1e-5)
+
+
+def test_compact_element_transport_omega_direct_wires_mean_per_head():
+    K, H, d, N = 6, 3, 2, 4
+    grp = get_group("block_glk")(K=K, n_heads=H)
+    gen = torch.Generator().manual_seed(32)
+    blocks = torch.eye(d).expand(1, N, H, d, d).clone()
+    blocks = blocks + 0.06 * torch.randn(blocks.shape, generator=gen)
+    element = CompactBlockElement(blocks, K)
+    phi = torch.zeros(1, N, grp.generators.shape[0])          # ignored on the omega-direct path
+    mu = torch.randn(1, N, K, generator=gen)
+
+    direct = build_transport_from_element(element, grp, mean_per_head=True)
+    forward = build_belief_transport(
+        phi, grp, gauge_parameterization="omega_direct", omega=element,
+        transport_mean_per_head=True,
+    )
+    replay = _transport(
+        phi, grp, gauge_parameterization="omega_direct", omega=element,
+        transport_mean_per_head=True,
+    )
+
+    for built in (direct, forward, replay):
+        assert isinstance(built, CompactFactoredTransport) and built.mean_per_head
+    dense = direct.to_dense_omega()
+    expected = transport_mean(dense, mu)
+    for built in (direct, forward, replay):
+        assert torch.allclose(transport_mean(built, mu), expected, atol=2e-6, rtol=1e-5)
 
 
 def test_build_belief_transport_omega_direct_branch():
