@@ -32,6 +32,7 @@ from vfe3.metrics import (
     per_head_gauge_invariants,
     positional_content_score,
     self_coupling_profile,
+    spearman_rho,
     spd_geodesic_distance,
     structured_head_scores,
     transport_asymmetry,
@@ -396,11 +397,59 @@ def test_estep_residuals_zero_for_constant_trajectory():
     assert moving["r_mu"].shape == (3, 6)                          # T = T+1 - 1
 
 
+def test_spearman_rho_uses_fractional_average_ranks_for_ties():
+    x = torch.tensor([1.0, 1.0, 2.0, 3.0])
+    y = torch.tensor([1.0, 2.0, 2.0, 3.0])
+    rank_x = torch.tensor([0.5, 0.5, 2.0, 3.0], dtype=torch.float64)
+    rank_y = torch.tensor([0.0, 1.5, 1.5, 3.0], dtype=torch.float64)
+    expected = float(torch.corrcoef(torch.stack([rank_x, rank_y]))[0, 1])
+
+    assert abs(spearman_rho(x, y) - expected) < 1e-12
+
+
+def test_spearman_rho_filters_paired_nonfinite_entries():
+    x = torch.tensor([1.0, float("nan"), 2.0, 3.0, float("inf"), 4.0])
+    y = torch.tensor([4.0, 99.0, 3.0, 2.0, 1.0, float("nan")])
+
+    assert abs(spearman_rho(x, y) + 1.0) < 1e-12
+
+
+def test_spearman_rho_returns_nan_with_fewer_than_two_finite_pairs():
+    rho = spearman_rho(
+        torch.tensor([1.0, float("nan"), float("inf")]),
+        torch.tensor([2.0, 3.0, 4.0]),
+    )
+
+    assert math.isnan(rho)
+
+
+def test_spearman_rho_returns_zero_for_constant_finite_input():
+    assert spearman_rho(torch.ones(4), torch.arange(4.0)) == 0.0
+    assert spearman_rho(torch.arange(4.0), torch.ones(4)) == 0.0
+
+
+def test_spearman_rho_non_degenerate_ordering_is_unchanged():
+    x = torch.arange(5.0)
+    assert abs(spearman_rho(x, 2.0 * x + 1.0) - 1.0) < 1e-12
+    assert abs(spearman_rho(x, -x) + 1.0) < 1e-12
+
+
 def test_bootstrap_ce_band_brackets_point():
     nats = torch.rand(40) * 5.0 + 1.0
     toks = torch.full((40,), 10.0)
     band = bootstrap_ce_band(nats, toks, n_boot=500, seed=0)
     assert band["lo"] <= band["ce"] <= band["hi"]
+
+
+def test_bootstrap_ce_band_returns_nan_for_zero_total_tokens():
+    band = bootstrap_ce_band(
+        torch.tensor([2.0, 3.0, 4.0]),
+        torch.zeros(3),
+        n_boot=20,
+        seed=0,
+    )
+
+    assert all(math.isnan(band[key]) for key in ("ce", "lo", "hi"))
 
 
 def test_bootstrap_token_ce_band_paired_zero_when_equal():

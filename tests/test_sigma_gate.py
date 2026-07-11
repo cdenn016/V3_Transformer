@@ -37,6 +37,19 @@ def test_spearman_bootstrap_ci_brackets_and_bounded():
     assert rho > 0.8 and lo > 0.0                                # clearly positive, CI excludes 0
 
 
+def test_spearman_bootstrap_ci_point_estimate_uses_average_tie_ranks():
+    sigma = torch.tensor([1.0, 1.0, 2.0, 3.0])
+    ce = torch.tensor([1.0, 2.0, 2.0, 3.0])
+    rank_sigma = torch.tensor([0.5, 0.5, 2.0, 3.0], dtype=torch.float64)
+    rank_ce = torch.tensor([0.0, 1.5, 1.5, 3.0], dtype=torch.float64)
+    expected = float(torch.corrcoef(torch.stack([rank_sigma, rank_ce]))[0, 1])
+
+    rho, lo, hi = spearman_bootstrap_ci(sigma, ce, n_boot=32, seed=2)
+
+    assert abs(rho - expected) < 1e-12
+    assert -1.0 <= lo <= hi <= 1.0
+
+
 def test_permutation_floor_is_small_under_the_null():
     g = torch.Generator().manual_seed(0)
     sigma = torch.rand(4000, generator=g)

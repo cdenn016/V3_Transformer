@@ -12,7 +12,7 @@ A theoretically pure path is always available (the unregularized op); the fallba
 guards that activate only when the pure path fails, and they are documented as such.
 """
 
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import torch
 
@@ -199,16 +199,31 @@ def floor_eigenvalues(
 
 def condition_number(
     matrix: torch.Tensor,                # (..., K, K) symmetric PD OR (..., K) diagonal variances
+
     *,
-    eps:    float = 1e-12,
+    eps:    float                               = 1e-12,
+    kind:   Literal["auto", "full", "diagonal"] = "auto",
 ) -> torch.Tensor:                       # (...) lambda_max / lambda_min
     r"""Spectral condition number lambda_max / lambda_min (clamped at ``eps``).
 
-    Accepts a full covariance (square trailing dims (..., K, K), via ``eigvalsh``) OR a diagonal
-    variance spectrum (non-square trailing dims (..., K), max/min over the last axis) so the monitor
-    works on the default ``gaussian_diagonal`` family instead of raising on the rank mismatch (audit
-    2026-06-13 L13). The square-trailing test resolves the two for any (..., N, K) with N != K."""
-    if matrix.dim() < 2 or matrix.shape[-1] != matrix.shape[-2]:
+    ``kind='diagonal'`` always treats the last axis as a variance spectrum, including a square
+    ``(N, K)`` table with ``N == K``. ``kind='full'`` requires square trailing dimensions and uses
+    ``eigvalsh``. ``kind='auto'`` preserves the legacy shape inference: square trailing dimensions
+    select the full-matrix path and every other non-scalar shape selects the diagonal path.
+    """
+    if kind not in ("auto", "full", "diagonal"):
+        raise ValueError(
+            f"condition_number kind must be 'auto', 'full', or 'diagonal', got {kind!r}")
+
+    square = matrix.dim() >= 2 and matrix.shape[-1] == matrix.shape[-2]
+    if kind == "full" and not square:
+        raise ValueError(
+            "condition_number kind='full' requires square trailing dimensions (..., K, K), "
+            f"got shape {tuple(matrix.shape)}")
+    full = kind == "full" or (kind == "auto" and square)
+    if not full:
+        if matrix.dim() == 0:
+            raise ValueError("condition_number diagonal input must have at least one dimension")
         spec = matrix.float()
         lam_min = spec.min(dim=-1).values
         cond = spec.max(dim=-1).values / lam_min.clamp(min=eps)

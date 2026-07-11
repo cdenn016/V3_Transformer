@@ -475,9 +475,8 @@ def numerical_health(
                              kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
                              irrep_dims=model.group.irrep_dims)
     beta = attention_weights(energy, tau=attention_tau(model.effective_kappa_beta(out.mu.device), model.group.irrep_dims), log_prior=log_prior)
-    spec = out.sigma if out.sigma.dim() == out.mu.dim() else condition_number(out.sigma)
-    cond = float(condition_number(out.sigma).max()) if out.sigma.dim() > out.mu.dim() else \
-        float((spec.amax(dim=-1) / spec.amin(dim=-1).clamp(min=1e-12)).max())
+    condition_kind = "diagonal" if out.sigma.dim() == out.mu.dim() else "full"
+    cond = float(condition_number(out.sigma, kind=condition_kind).max())
     health = {
         "nan_mu":     nan_inf_fraction(out.mu),
         "nan_sigma":  nan_inf_fraction(out.sigma),

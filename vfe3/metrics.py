@@ -359,6 +359,25 @@ def depth_decay_rate(
     return float(((x - xm) * (y - ym)).sum() / ((x - xm) ** 2).sum().clamp(min=eps))
 
 
+def _average_ranks(
+    values: torch.Tensor,                # (M,) finite sample
+) -> torch.Tensor:                       # (M,) zero-based fractional ranks
+    r"""Average ranks for a finite one-dimensional sample, assigning one rank to each tie group."""
+    order = torch.argsort(values)
+    sorted_values = values[order]
+    _, inverse, counts = torch.unique_consecutive(
+        sorted_values,
+        return_inverse=True,
+        return_counts=True,
+    )
+    ends = counts.cumsum(dim=0).to(torch.float64)
+    starts = ends - counts.to(torch.float64)
+    average = 0.5 * (starts + ends - 1.0)
+    ranks = torch.empty_like(values, dtype=torch.float64)
+    ranks[order] = average[inverse]
+    return ranks
+
+
 def spearman_rho(
     x: torch.Tensor,                     # (M,) sample
     y: torch.Tensor,                     # (M,) sample
@@ -369,16 +388,22 @@ def spearman_rho(
     r"""Spearman rank correlation: the Pearson correlation of the RANKS of x and y.
 
     The headline statistic of the Sigma_q-calibration probe (B1/EXP-3): rho(tr Sigma_q, per-token
-    CE). Ranks via double argsort (ties broken by position, adequate for continuous diagnostics).
-    Returns 0.0 for a degenerate zero-variance input rather than NaN.
+    CE). Non-finite observations are removed by a paired mask, and ties receive their fractional
+    average rank. Fewer than two paired-finite observations return NaN. A finite constant input has
+    zero rank variance and retains the established 0.0 convention.
     """
     x, y = x.flatten().to(torch.float64), y.flatten().to(torch.float64)
     if x.numel() != y.numel():
         raise ValueError(f"spearman_rho needs equal-length inputs, got {x.numel()} vs {y.numel()}")
-    rx = x.argsort().argsort().to(torch.float64)
-    ry = y.argsort().argsort().to(torch.float64)
+    paired_finite = torch.isfinite(x) & torch.isfinite(y)
+    x, y = x[paired_finite], y[paired_finite]
+    if x.numel() < 2:
+        return float("nan")
+    rx = _average_ranks(x)
+    ry = _average_ranks(y)
     rx, ry = rx - rx.mean(), ry - ry.mean()
-    return float((rx * ry).sum() / (rx.norm() * ry.norm()).clamp(min=eps))
+    denominator = rx.norm() * ry.norm()
+    return float((rx * ry).sum() / denominator.clamp(min=eps))
 
 
 def cv(
@@ -1088,13 +1113,18 @@ def bootstrap_ce_band(
 
     Resamples validation sequences with replacement and reports the token-weighted CE
     sum(nats) / sum(tokens) percentiles. This is within-run uncertainty over the eval set, NOT a
-    cross-seed confidence interval (the run protocol is single-seed); captions must say so.
+    cross-seed confidence interval (the run protocol is single-seed); captions must say so. An
+    aggregate with zero evaluated tokens has no cross-entropy estimate and returns NaN for all fields.
     """
+    total_tokens = per_seq_tokens.sum()
+    if bool(total_tokens == 0):
+        nan = float("nan")
+        return {"ce": nan, "lo": nan, "hi": nan}
     gen = torch.Generator(device=per_seq_nats.device).manual_seed(int(seed))
     s = per_seq_nats.shape[0]
     idx = torch.randint(0, s, (n_boot, s), generator=gen, device=per_seq_nats.device)
     boot = per_seq_nats[idx].sum(dim=1) / per_seq_tokens[idx].sum(dim=1).clamp(min=1.0)
-    point = float(per_seq_nats.sum() / per_seq_tokens.sum().clamp(min=1.0))
+    point = float(per_seq_nats.sum() / total_tokens)
     return {"ce": point, "lo": float(torch.quantile(boot, q_lo)), "hi": float(torch.quantile(boot, q_hi))}
 
 

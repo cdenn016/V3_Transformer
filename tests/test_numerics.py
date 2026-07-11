@@ -51,6 +51,30 @@ def test_condition_number_non_pd_returns_inf():
     assert torch.isinf(cond) and cond > 0
 
 
+def test_condition_number_diagonal_kind_disambiguates_square_table():
+    table = torch.tensor([
+        [2.0, 1.0],
+        [1.0, 2.0],
+    ])
+
+    diagonal = condition_number(table, kind="diagonal")
+    full = condition_number(table, kind="full")
+
+    assert torch.allclose(diagonal, torch.tensor([2.0, 2.0]))
+    assert torch.allclose(full, torch.tensor(3.0), atol=1e-6)
+    assert torch.equal(condition_number(table), full)                    # auto preserves square -> full
+
+
+def test_condition_number_full_kind_requires_square_matrix():
+    with pytest.raises(ValueError, match="square trailing dimensions"):
+        condition_number(torch.ones(2, 3), kind="full")
+
+
+def test_condition_number_rejects_unknown_kind():
+    with pytest.raises(ValueError, match="kind"):
+        condition_number(torch.ones(3), kind="spectrum")
+
+
 def test_nan_inf_fraction_counts_nonfinite():
     t = torch.tensor([1.0, float("nan"), float("inf"), 2.0])
     assert abs(nan_inf_fraction(t) - 0.5) < 1e-6
