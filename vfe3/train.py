@@ -1095,11 +1095,16 @@ def train(
                 # argument expressions evaluated HERE in the caller, OUTSIDE the save helpers'
                 # internal try/except, so guard them too -- a replay error must never kill training
                 # (audit 2026-07-01 F11). Kept at EVAL cadence (one grid per eval, not per log).
-                try:
-                    artifacts.save_attention_maps(step + 1, model.attention_maps(tokens), logger=logger)
-                    artifacts.save_gamma_attention_maps(step + 1, model.gamma_attention_maps(tokens), logger=logger)
-                except Exception as exc:
-                    logger.warning("       (attention-map replay failed: %s); continuing", exc)
+                if cfg.generate_figures:
+                    try:
+                        artifacts.save_attention_maps(step + 1, model.attention_maps(tokens), logger=logger)
+                        artifacts.save_gamma_attention_maps(
+                            step + 1,
+                            model.gamma_attention_maps(tokens),
+                            logger=logger,
+                        )
+                    except Exception as exc:
+                        logger.warning("       (attention-map replay failed: %s); continuing", exc)
             if ema is not None:
                 ema.restore(model)                       # live SGD weights back before the next train_step
 

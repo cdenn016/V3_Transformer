@@ -1024,22 +1024,18 @@ def finalize_run(
     # (UMAP, E-step replay, holonomy sampling, a belief bank over many sequences), so a failure is
     # logged and never disturbs the saved numeric results. Drives the BEST-val model reloaded above.
     if getattr(cfg, "generate_figures", True):
-        # Memory-budget guard (audit 2026-07-01 F9): the figure extractors materialize dense
-        # full-vocab (B, N, V) logits + probabilities, which on a large run (e.g. V=50257, N=1024,
-        # B=16) can make finalization the memory peak. Skip the figure pass over an ~8 GB estimate
-        # unless the run opts in via force_large_figures; small runs stay below the threshold, so
-        # the default-on behavior is byte-identical there.
-        approx_gb = 8.0 * int(cfg.vocab_size) * int(cfg.max_seq_len) * int(cfg.batch_size) / 1e9   # fp32 logits+probs (B, N, V) peak
-        if approx_gb > 8.0 and not getattr(cfg, "force_large_figures", False):
-            logger.warning("skipping publication figures: est full-vocab peak ~%.1f GB exceeds "
-                           "8 GB guard; set force_large_figures=True to override", approx_gb)
-        else:
-            try:
-                from vfe3.viz.report import generate_figures
-                generate_figures(artifacts.run_dir, model=model, loader=test_loader,
-                                 device=device, logger=logger)
-            except Exception as exc:
-                logger.warning("publication figure generation failed (%s); numeric results are saved", exc)
+        try:
+            from vfe3.viz.report import generate_figures
+            generate_figures(
+                artifacts.run_dir,
+                model=model,
+                loader=test_loader,
+                device=device,
+                allow_large=bool(getattr(cfg, "force_large_figures", False)),
+                logger=logger,
+            )
+        except Exception as exc:
+            logger.warning("publication figure generation failed (%s); numeric results are saved", exc)
     return results
 
 

@@ -7,8 +7,9 @@ variant swaps without editing call sites.
 """
 
 import math
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+import warnings
+from dataclasses import dataclass, fields
+from typing import Any, List, Mapping, Optional, Tuple
 
 # Seams with a live registry (gauge_group, lambda_alpha_mode, attention priors, norms; alongside
 # transport/retraction/positional/divergence) are validated against that registry in __post_init__
@@ -626,12 +627,11 @@ class VFE3Config:
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
     generate_figures:          bool          = True         # auto-run the single-run publication figures at finalize_run (off the hot path)
 
-    # Memory-guard override for the finalize_run figure pass (audit 2026-07-01 F9): the reporting
-    # extractors materialize full (B, N, V) logits/probs, so finalize_run skips the publication
-    # figures when the estimated full-vocab peak exceeds its memory guard. Default False keeps the
-    # guard; True forces the figure pass despite a large estimate (opt-in large-run override).
+    # Memory-guard override for full-vocabulary reporting inputs (audit 2026-07-01 F9): the two
+    # extractors that materialize full (B, N, V) logits/probabilities are skipped above the guard,
+    # while lighter figures still run. True opts those large inputs back in.
     force_large_figures:       bool          = False
-    
+
     # Opt-in mixed precision for CUDA throughput (RTX 5090). None (default) = OFF = the pure fp32
     # path: NO autocast context is entered anywhere in the forward, so the loss/logits are
     # byte-identical to the no-AMP build. 'bf16' / 'fp16' wrap the E-step / belief pipeline in
@@ -2262,10 +2262,11 @@ class VFE3Config:
         # Security/behavior-relevant bools must be REAL bools, not truthy coercions (audit
         # 2026-07-01 F12): load_checkpoint reads bool(cfg.trust_resume_checkpoint), so the string
         # "False" would coerce to True and enable the unsafe weights_only=False fallback;
-        # generate_figures and use_ema gate code paths by truthiness the same way. `type(x) is not
+        # generate_figures, force_large_figures, and use_ema gate code paths by truthiness the same
+        # way. `type(x) is not
         # bool` (not isinstance) rejects the int/str footguns. Deliberately NOT swept across every
-        # bool field (over-validation risk) -- only the audit-called-out three.
-        for _bname in ("trust_resume_checkpoint", "generate_figures", "use_ema"):
+        # bool field (over-validation risk) -- only the audit-called-out fields.
+        for _bname in ("trust_resume_checkpoint", "generate_figures", "force_large_figures", "use_ema"):
             _bval = getattr(self, _bname)
             if type(_bval) is not bool:
                 raise ValueError(f"{_bname} must be a bool, got {type(_bval).__name__}: {_bval!r}")
@@ -2433,6 +2434,29 @@ class VFE3Config:
         in __post_init__, so this never silently overrides a meaningful e_step_gradient.
         """
         return "detach" if self.detach_e_step else self.e_step_gradient
+
+
+def config_from_serialized(
+    payload: Mapping[str, Any],
+
+    *,
+    source: str,
+) -> VFE3Config:
+    """Build an effective config while warning about fields unknown to this code version."""
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"serialized config from {source} must be a mapping")
+    known = {field.name for field in fields(VFE3Config)}
+    unknown = sorted(str(key) for key in payload if key not in known)
+    if unknown:
+        warnings.warn(
+            f"serialized config from {source} contains unknown field(s) {unknown}; ignoring them",
+            UserWarning,
+            stacklevel=2,
+        )
+    migrated = {key: value for key, value in payload.items() if key in known}
+    if isinstance(migrated.get("policy_score_terms"), list):
+        migrated["policy_score_terms"] = tuple(migrated["policy_score_terms"])
+    return VFE3Config(**migrated)
 
 
 def _require(value: Optional[str], valid: Tuple[object, ...], name: str) -> None:

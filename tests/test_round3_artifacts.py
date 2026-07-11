@@ -97,6 +97,46 @@ def test_emit_closes_figure_registered_by_raising_thunk(tmp_path, monkeypatch):
     assert not (tmp_path / "run" / "figures" / "estep_convergence.png").exists()
 
 
+@pytest.mark.parametrize("failure_mode", ["thunk", "save"])
+def test_comparison_emit_closes_figures_after_thunk_or_save_failure(
+    tmp_path,
+    monkeypatch,
+    failure_mode,
+):
+    from vfe3.viz import figures as figs
+    from vfe3.viz import report
+
+    model = _model()
+    art = run_artifacts.RunArtifacts(
+        tmp_path / "run",
+        model.cfg,
+        model,
+        dataset="synthetic-period3",
+    )
+    art.maybe_save_best(1, model, 1.0)
+    monkeypatch.setattr(report, "_build_loader", lambda *args, **kwargs: _loader())
+    monkeypatch.setattr(report.extract, "vocab_prediction_stats", lambda *args, **kwargs: {})
+    monkeypatch.setattr(report.extract, "decode_readout", lambda *args, **kwargs: None)
+
+    def _failing_plot(*args, **kwargs):
+        fig = figs.plt.figure()
+        if failure_mode == "thunk":
+            raise RuntimeError("simulated comparison thunk failure")
+
+        def _fail_save(*save_args, **save_kwargs):
+            raise RuntimeError("simulated comparison save failure")
+
+        fig.savefig = _fail_save
+        return fig
+
+    monkeypatch.setattr(figs, "plot_vocab_probability_heatmap", _failing_plot)
+    before = set(figs.plt.get_fignums())
+
+    report.vocab_comparison_figures([art.run_dir], tmp_path / "comparison")
+
+    assert set(figs.plt.get_fignums()) == before
+
+
 # ---------------------------------------------------------------- sigma-gate slug collision (punch item 7)
 
 def test_sigma_gate_colliding_checkpoint_ids_write_distinct_files(tmp_path):

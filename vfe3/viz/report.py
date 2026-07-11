@@ -23,13 +23,15 @@ experiment to set up). Neither is produced here.
 
 import json
 import logging
+from dataclasses import asdict
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Mapping, Optional
 
 import torch
 
 from vfe3 import metrics
-from vfe3.config import VFE3Config
+from vfe3.config import VFE3Config, config_from_serialized
+from vfe3.run_artifacts import semantic_config_fingerprint
 from vfe3.viz import extract
 from vfe3.viz import figures as figs
 
@@ -37,11 +39,37 @@ from vfe3.viz import figures as figs
 def _load_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
     r"""Rebuild ``(cfg, dataset)`` from ``run_dir/config.json`` (the RunArtifacts metadata)."""
     data = json.loads((run_dir / "config.json").read_text())
-    cfg_dict = dict(data["config"])
-    # Legacy: config.json files written when diagonal_covariance was a dataclass field carry the
-    # key under "config"; it is now a derived property of family, so drop it before the rebuild.
-    cfg_dict.pop("diagonal_covariance", None)
-    return VFE3Config(**cfg_dict), data.get("dataset", "")
+    if not isinstance(data, Mapping) or not isinstance(data.get("config"), Mapping):
+        raise ValueError(f"run metadata {run_dir / 'config.json'} has no config mapping")
+    cfg = config_from_serialized(data["config"], source=str(run_dir / "config.json"))
+    return cfg, data.get("dataset", "")
+
+
+def _load_best_model_state(
+    path: Path,
+    cfg:  VFE3Config,
+
+    *,
+    map_location: object,
+) -> Mapping[str, torch.Tensor]:
+    """Validate and unwrap a self-bound ``best_model.pt`` for strict model loading."""
+    payload = torch.load(path, map_location=map_location, weights_only=True)
+    required = {"model_state", "config", "config_fingerprint"}
+    if not isinstance(payload, Mapping) or not payload or not required.issubset(payload):
+        raise ValueError(f"best checkpoint {path} is not a self-bound model/config bundle")
+    embedded = payload["config"]
+    if not isinstance(embedded, Mapping) or not embedded:
+        raise ValueError(f"best checkpoint {path} has no embedded config mapping")
+    raw_fingerprint = semantic_config_fingerprint(embedded)
+    if payload["config_fingerprint"] != raw_fingerprint:
+        raise ValueError(f"best checkpoint {path} has a config fingerprint mismatch")
+    embedded_cfg = config_from_serialized(embedded, source=f"{path} embedded config")
+    if asdict(embedded_cfg) != asdict(cfg):
+        raise ValueError(f"best checkpoint {path} has a semantic config mismatch with config.json")
+    model_state = payload["model_state"]
+    if not isinstance(model_state, Mapping) or not model_state:
+        raise ValueError(f"best checkpoint {path} must contain a nonempty model_state mapping")
+    return model_state
 
 
 def _build_loader(dataset: str, cfg: VFE3Config, split: str):
@@ -73,11 +101,12 @@ def generate_figures(
     run_dir:       'str | Path',
 
     *,
+    split:         str                         = "validation",
+    max_sequences: int                         = 64,
+    allow_large:   bool                        = False,
     model:         Optional[torch.nn.Module]   = None,   # skip the reload; drive this live model
     loader:        Optional[object]            = None,   # skip the default loader build
     device:        Optional[torch.device]      = None,
-    split:         str                         = "validation",
-    max_sequences: int                         = 64,
     n_e_steps:     Optional[int]               = None,
     logger:        Optional[logging.Logger]    = None,
 ) -> List[Path]:
@@ -87,9 +116,11 @@ def generate_figures(
     ``run_dir/best_model.pt``; pass ``model`` to drive a live in-memory model instead (the test
     path, and any post-train call that still holds the weights). ``loader`` defaults to a stable
     unshuffled loader for the run's dataset (raises if the cache is absent; pass ``loader`` to override).
-    ``max_sequences`` caps the belief bank that feeds the UMAP triptych; ``n_e_steps`` overrides
-    the E-step trace length (default: the trained ``cfg.n_e_steps``). Returns the figure paths
-    actually written (best-effort: a failed figure is logged and omitted).
+    ``max_sequences`` caps the belief bank that feeds the UMAP triptych. ``allow_large`` opts into
+    the two full-vocabulary extractors when their estimated logits-plus-probabilities peak exceeds
+    8 GB; lighter inputs and figures still run when they are skipped. ``n_e_steps`` overrides the
+    E-step trace length (default: the trained ``cfg.n_e_steps``). Returns the figure paths actually
+    written (best-effort: a failed figure is logged and omitted).
     """
     run_dir = Path(run_dir)
     figdir = run_dir / "figures"
@@ -103,7 +134,10 @@ def generate_figures(
         best = run_dir / "best_model.pt"
         if not best.exists():
             raise FileNotFoundError(f"no best_model.pt in {run_dir}; train with RunArtifacts first")
-        model.load_state_dict(torch.load(best, map_location=device or "cpu", weights_only=True))
+        model.load_state_dict(
+            _load_best_model_state(best, cfg, map_location=device or "cpu"),
+            strict=True,
+        )
     else:
         cfg = model.cfg
         dataset = ""
@@ -124,6 +158,15 @@ def generate_figures(
         raise RuntimeError(f"loader for {dataset!r}/{split!r} yielded no batches")
     tok = token_batches[0][:1]                                         # one sequence for the single-seq figures
 
+    full_vocab_gb = 8.0 * int(cfg.vocab_size) * int(cfg.max_seq_len) * int(cfg.batch_size) / 1e9
+    skip_full_vocab = full_vocab_gb > 8.0 and not allow_large
+    if skip_full_vocab:
+        logger.warning(
+            "full-vocab figure inputs skipped: estimated logits+probabilities peak %.1f GB exceeds "
+            "the 8 GB guard; pass allow_large=True to override",
+            full_vocab_gb,
+        )
+
     def _safe(fn: Callable, label: str):
         r"""Run a model-replay extractor, logging+swallowing a failure so the rest proceed."""
         try:
@@ -137,8 +180,9 @@ def generate_figures(
     layer_trace = _safe(lambda: extract.across_layer_belief_trace(model, tok), "across_layer_belief_trace")
     bank        = _safe(lambda: extract.belief_bank(model, token_batches, max_sequences=max_sequences), "belief_bank")
     cstate      = _safe(lambda: extract.converged_state(model, tok), "converged_state")
-    ce_bank     = _safe(lambda: extract.belief_ce_bank(model, loader, device=device, max_batches=n_batches),
-                        "belief_ce_bank")    # B1/EXP-3 Sigma_q<->CE join (calibration figures)
+    ce_bank     = (None if skip_full_vocab else
+                   _safe(lambda: extract.belief_ce_bank(model, loader, device=device, max_batches=n_batches),
+                         "belief_ce_bank"))   # B1/EXP-3 Sigma_q<->CE join (calibration figures)
     amaps       = _safe(lambda: model.attention_maps(tok), "attention_maps")
     per_layer   = _safe(lambda: model.diagnostics_per_layer(tok), "diagnostics_per_layer")
     health      = _safe(lambda: extract.numerical_health(model, tok), "numerical_health")
@@ -149,7 +193,9 @@ def generate_figures(
     gamma_attn  = _safe(lambda: extract.gamma_attention(model, tok), "gamma_attention")
     mc_bank     = _safe(lambda: extract.model_channel_bank(model, token_batches, max_sequences=max_sequences),
                         "model_channel_bank")
-    vstats      = _safe(lambda: extract.vocab_prediction_stats(model, token_batches), "vocab_prediction_stats")
+    vstats      = (None if skip_full_vocab else
+                   _safe(lambda: extract.vocab_prediction_stats(model, token_batches),
+                         "vocab_prediction_stats"))
     readout     = _safe(lambda: extract.decode_readout(model), "decode_readout")
     run_label   = f"K{cfg.embed_dim}"
 
@@ -386,7 +432,10 @@ def vocab_comparison_figures(
         best = rd / "best_model.pt"
         if not best.exists():
             raise FileNotFoundError(f"no best_model.pt in {rd}; train with RunArtifacts first")
-        model.load_state_dict(torch.load(best, map_location=device or "cpu", weights_only=True))
+        model.load_state_dict(
+            _load_best_model_state(best, cfg, map_location=device or "cpu"),
+            strict=True,
+        )
         dev = device or next(model.parameters()).device
         model = model.to(dev)
         model.eval()
@@ -411,15 +460,21 @@ def vocab_comparison_figures(
         if not available:
             logger.info("comparison figure %r skipped (input unavailable)", name)
             return
+        before = set(figs.plt.get_fignums())
+        fig = None
         try:
             path = out / f"{name}.png"
             fig = thunk()
             fig.savefig(str(path))
-            figs.plt.close(fig)
             written.append(path)
             logger.info("figure -> %s", path)
         except Exception as exc:
             logger.warning("comparison figure %r failed (%s); continuing", name, exc)
+        finally:
+            if fig is not None:
+                figs.plt.close(fig)
+            for num in set(figs.plt.get_fignums()) - before:
+                figs.plt.close(num)
 
     _emit("vocab_probability_heatmap_compare",
           lambda: figs.plot_vocab_probability_heatmap(arms_pred, decode=decode), bool(arms_pred))

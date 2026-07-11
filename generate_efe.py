@@ -21,12 +21,11 @@ WHAT THIS CAN AND CANNOT DO ON WIKITEXT (read before expecting a win):
 
 Run on the GPU (the iterative E-step is slow on CPU); it auto-uses CUDA when available.
 """
-from dataclasses import fields
 from typing import Any, Mapping, Optional, Tuple
 
 import torch
 
-from vfe3.config import VFE3Config
+from vfe3.config import config_from_serialized
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import semantic_config_fingerprint
 
@@ -163,22 +162,11 @@ def _build_model(
 ) -> VFEModel:
     """Rebuild the model at the checkpoint's architecture with the policy fields overridden, then load
     the weights. The scorer adds no parameters, so the state_dict matches regardless of policy_mode."""
-    valid = {f.name for f in fields(VFE3Config)}
-    # audit F12 (2026-07-01): dropping genuine legacy fields is the intended migration, but do it
-    # LOUDLY -- a renamed/removed field silently reverting to the current default could change the
-    # reconstructed architecture with no notice. Warn, never raise (older checkpoints must load).
-    import warnings
-    dropped = sorted(set(config_dict) - valid)
-    if dropped:
-        warnings.warn(
-            f"generate_efe: checkpoint config has {len(dropped)} field(s) unknown to the current "
-            f"VFE3Config, dropping them (behavior falls back to defaults): {dropped}",
-            UserWarning, stacklevel=2,
-        )
-    cfg_dict = {k: v for k, v in config_dict.items() if k in valid}    # drop any stale/unknown keys
-    cfg_dict.update(policy_overrides)                                  # VFE3Config.__post_init__ validates the combo
-    model = VFEModel(VFE3Config(**cfg_dict)).to(device)
-    model.load_state_dict(state_dict)                                  # strict: scorer is param-free
+    cfg_dict = dict(config_dict)
+    cfg_dict.update(policy_overrides)
+    cfg = config_from_serialized(cfg_dict, source="generate_efe checkpoint config")
+    model = VFEModel(cfg).to(device)
+    model.load_state_dict(state_dict, strict=True)                      # scorer is parameter-free
     model.eval()
     return model
 

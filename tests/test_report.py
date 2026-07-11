@@ -6,6 +6,9 @@ trained run produced only one of the publication figures. The proof is PNG files
 integration test asserts the figure set actually appears when the driver runs the real model.
 """
 
+from dataclasses import asdict
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -13,7 +16,7 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts, finalize_run
+from vfe3.run_artifacts import RunArtifacts, finalize_run, semantic_config_fingerprint
 from vfe3.train import train
 from vfe3.viz.extract import converged_state
 from vfe3.viz.report import generate_figures, vocab_comparison_figures
@@ -85,10 +88,92 @@ def test_generate_figures_reloads_from_run_dir(tmp_path):
     cfg = _cfg()
     model = _model()
     art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")   # writes config.json
-    torch.save(model.state_dict(), art.best_path)                                   # the reloaded weights
+    art.maybe_save_best(1, model, 1.0)                                               # self-bound best bundle
     paths = generate_figures(tmp_path / "run", loader=_loader(), max_sequences=16)
     assert len(paths) >= 6
     assert (tmp_path / "run" / "figures" / "numerical_trust.png").exists()
+
+
+def test_generate_figures_rejects_corrupt_best_bundle_fingerprint(tmp_path):
+    cfg = _cfg()
+    model = _model()
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    art.maybe_save_best(1, model, 1.0)
+    bundle = torch.load(art.best_path, map_location="cpu", weights_only=True)
+    bundle["config_fingerprint"] = "corrupt"
+    torch.save(bundle, art.best_path)
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        generate_figures(art.run_dir, loader=_loader(), max_sequences=16)
+
+
+def test_generate_figures_rejects_empty_best_bundle_state(tmp_path):
+    cfg = _cfg()
+    model = _model()
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    config = asdict(cfg)
+    torch.save({
+        "model_state": {},
+        "config": config,
+        "config_fingerprint": semantic_config_fingerprint(config),
+    }, art.best_path)
+
+    with pytest.raises(ValueError, match="nonempty model_state"):
+        generate_figures(art.run_dir, loader=_loader(), max_sequences=16)
+
+
+def test_vocab_comparison_rejects_semantically_mismatched_best_bundle(tmp_path):
+    cfg = _cfg()
+    model = _model()
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    mismatched = asdict(_cfg(n_e_steps=3))
+    torch.save({
+        "model_state": model.state_dict(),
+        "config": mismatched,
+        "config_fingerprint": semantic_config_fingerprint(mismatched),
+    }, art.best_path)
+
+    with pytest.raises(ValueError, match="semantic config mismatch"):
+        vocab_comparison_figures([art.run_dir], tmp_path / "comparison")
+
+
+class _MemoryGuardModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+        self.cfg = SimpleNamespace(
+            vocab_size=50257,
+            max_seq_len=1024,
+            batch_size=32,
+            n_e_steps=1,
+            embed_dim=4,
+        )
+
+
+def test_generate_figures_memory_guard_skips_only_full_vocab_extractors(tmp_path, monkeypatch, caplog):
+    from vfe3.viz import extract
+
+    calls = []
+    monkeypatch.setattr(extract, "e_step_belief_trace", lambda *args, **kwargs: calls.append("trace"))
+    monkeypatch.setattr(extract, "belief_ce_bank", lambda *args, **kwargs: calls.append("ce_bank"))
+    monkeypatch.setattr(extract, "vocab_prediction_stats", lambda *args, **kwargs: calls.append("vocab"))
+    loader = [torch.zeros((1, 2), dtype=torch.long)]
+
+    generate_figures(tmp_path / "guarded", model=_MemoryGuardModel(), loader=loader)
+
+    assert "trace" in calls
+    assert "ce_bank" not in calls
+    assert "vocab" not in calls
+    assert "full-vocab" in caplog.text
+
+    calls.clear()
+    generate_figures(
+        tmp_path / "allowed",
+        model=_MemoryGuardModel(),
+        loader=loader,
+        allow_large=True,
+    )
+    assert {"ce_bank", "vocab"} <= set(calls)
 
 
 def test_finalize_autoruns_figures(tmp_path):
@@ -117,6 +202,29 @@ def test_finalize_skips_figures_when_disabled(tmp_path):
                    val_loader=_loader(seed=1), artifacts=art)
     finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
     assert not (tmp_path / "run" / "figures").exists()
+
+
+def test_train_skips_periodic_attention_figures_when_generation_disabled(tmp_path, monkeypatch):
+    cfg = _cfg(generate_figures=False, max_steps=1)
+    model = _model(generate_figures=False, max_steps=1)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    calls = []
+    monkeypatch.setattr(art, "save_attention_maps", lambda *args, **kwargs: calls.append("beta"))
+    monkeypatch.setattr(art, "save_gamma_attention_maps", lambda *args, **kwargs: calls.append("gamma"))
+
+    train(
+        model,
+        _loader(),
+        cfg,
+        n_steps=1,
+        log_interval=0,
+        eval_interval=1,
+        val_loader=_loader(seed=1),
+        artifacts=art,
+        generate_samples=False,
+    )
+
+    assert calls == []
 
 
 def test_vocab_comparison_rejects_mixed_tokenizers(tmp_path):

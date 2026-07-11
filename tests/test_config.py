@@ -1,6 +1,6 @@
 import pytest
 
-from vfe3.config import VFE3Config
+from vfe3.config import VFE3Config, config_from_serialized
 
 
 def test_config_defaults():
@@ -129,6 +129,25 @@ def test_load_config_drops_legacy_diagonal_covariance_key(tmp_path):
         json.dumps({"config": cfg_dict, "dataset": "wikitext-103"}))
     cfg, dataset = _load_config(tmp_path)
     assert cfg.diagonal_covariance is True and dataset == "wikitext-103"
+
+
+def test_config_from_serialized_warns_and_drops_unknown_legacy_fields():
+    payload = {"vocab_size": 17, "diagonal_covariance": True, "removed_future_knob": "legacy"}
+
+    with pytest.warns(UserWarning, match="removed_future_knob"):
+        cfg = config_from_serialized(payload, source="legacy config.json")
+
+    assert cfg.vocab_size == 17
+    assert cfg.diagonal_covariance is True
+
+
+def test_config_from_serialized_restores_policy_term_tuple_from_json():
+    cfg = config_from_serialized(
+        {"policy_score_terms": ["risk", "ambiguity"]},
+        source="config.json",
+    )
+
+    assert cfg.policy_score_terms == ("risk", "ambiguity")
 
 
 def test_config_rejects_nan_min_lr():
@@ -579,7 +598,8 @@ def test_sigma_max_validated():
 
 
 def test_bool_fields_reject_truthy_non_bools():
-    r"""Audit 2026-07-01 F12: trust_resume_checkpoint / generate_figures / use_ema are consumed
+    r"""Audit 2026-07-01 F12: trust_resume_checkpoint / generate_figures /
+    force_large_figures / use_ema are consumed
     by truthiness (load_checkpoint reads bool(cfg.trust_resume_checkpoint), so the string
     "False" would coerce to True and enable the unsafe weights_only=False fallback). Non-bool
     values are rejected at construction; real-bool defaults still construct."""
@@ -589,6 +609,8 @@ def test_bool_fields_reject_truthy_non_bools():
         VFE3Config(generate_figures=1)
     with pytest.raises(ValueError):
         VFE3Config(use_ema="0")
+    with pytest.raises(ValueError):
+        VFE3Config(force_large_figures=1)
     cfg = VFE3Config()
     assert cfg.trust_resume_checkpoint is False and cfg.generate_figures is True
 
@@ -665,7 +687,7 @@ def test_regime_ii_covariant_full_family_no_approximation_warning():
 
 def test_force_large_figures_default_off():
     r"""Audit 2026-07-01 F9 (safe variant): force_large_figures is the opt-in override for the
-    finalize_run figure-pass memory guard; default False keeps the guard so small-run behavior
+    full-vocabulary extractor memory guard; default False keeps the guard so small-run behavior
     is unchanged."""
     assert VFE3Config().force_large_figures is False
     assert VFE3Config(force_large_figures=True).force_large_figures is True

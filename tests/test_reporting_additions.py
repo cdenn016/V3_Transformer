@@ -433,21 +433,19 @@ def _finalize_ns(**over):
     return types.SimpleNamespace(**base)
 
 
-def test_finalize_run_skips_figures_over_memory_guard(tmp_path, monkeypatch, caplog):
-    # F9 (audit 2026-07-01): the figure extractors materialize dense (B, N, V) logits+probs, so
-    # finalize_run must SKIP the figure pass (with a warning) when the estimated full-vocab peak
-    # exceeds the 8 GB guard and force_large_figures is off.
+def test_finalize_run_delegates_memory_guard_to_figure_driver(tmp_path, monkeypatch):
+    # The reusable figure driver owns the selective full-vocab guard. finalize_run must still run
+    # the lighter figure pass and forward the explicit large-extractor policy.
     torch.manual_seed(0)
     real_cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2,
                           batch_size=2)
     model = VFEModel(real_cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
     calls = []
-    monkeypatch.setattr("vfe3.viz.report.generate_figures", lambda *a, **k: calls.append(a))
-    with caplog.at_level(logging.WARNING):
-        finalize_run(model, art, _finalize_ns(), test_loader=None)
-    assert calls == []                                          # figure pass skipped by the guard
-    assert any("skipping publication figures" in r.getMessage() for r in caplog.records)
+    monkeypatch.setattr("vfe3.viz.report.generate_figures", lambda *a, **k: calls.append((a, k)))
+    finalize_run(model, art, _finalize_ns(), test_loader=None)
+    assert len(calls) == 1
+    assert calls[0][1]["allow_large"] is False
 
 
 def test_finalize_run_force_large_figures_overrides_guard(tmp_path, monkeypatch):
@@ -459,9 +457,10 @@ def test_finalize_run_force_large_figures_overrides_guard(tmp_path, monkeypatch)
     model = VFEModel(real_cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
     calls = []
-    monkeypatch.setattr("vfe3.viz.report.generate_figures", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr("vfe3.viz.report.generate_figures", lambda *a, **k: calls.append((a, k)))
     finalize_run(model, art, _finalize_ns(force_large_figures=True), test_loader=None)
-    assert calls                                                # figure pass attempted despite the estimate
+    assert len(calls) == 1
+    assert calls[0][1]["allow_large"] is True
 
 
 # --------------------------------------------------------------------------- held-out geometry columns
