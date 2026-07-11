@@ -84,6 +84,7 @@ def main():
             "tests/test_laplace_family.py::test_laplace_cuda_matches_cpu",          # t6: Laplace CPU<->CUDA agreement
             "tests/test_efe_scorer.py::test_preference_builders_are_device_aware",  # t6: efe-scorer device regression
             "tests/test_training_timing_20260711.py::test_real_cuda_training_timing_smoke",
+            "tests/test_p3_pairwise_stats_reuse_20260711.py::test_p3_cuda_filtering_and_mm_reuse_smoke",
         ]
         print("t6 -- CUDA-only pytest tests:")
         t6_code, t6_counts = run_pytest_junit(

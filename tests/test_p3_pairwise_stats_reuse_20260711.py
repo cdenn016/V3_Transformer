@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
+from vfe3.attention_prior import attention_log_prior
 from vfe3.config import VFE3Config
 from vfe3.families.base import get_family
 from vfe3.free_energy import (attention_weights, pairwise_energy, self_divergence_for_alpha)
@@ -221,6 +222,69 @@ def test_diagonal_kl_pair_stats_preserve_exact_kl_max_mask_boundary() -> None:
     assert torch.equal(stats.pair_mask, reference_mask)
 
 
+def test_diagonal_kl_pair_stats_preserve_exact_zero_energy_boundary() -> None:
+    mu_q = torch.tensor([[0.25, -0.75]], dtype=torch.float32)
+    sigma_q = torch.tensor([[0.5, 1.5]], dtype=torch.float32)
+    mu_t = mu_q.unsqueeze(-2).clone()
+    sigma_t = sigma_q.unsqueeze(-2).clone()
+
+    stats = diagonal_kl_pair_stats(
+        mu_q,
+        sigma_q,
+        mu_t,
+        sigma_t,
+        kl_max=100.0,
+        eps=1e-6,
+        irrep_dims=None,
+    )
+
+    assert torch.equal(stats.energy, torch.zeros_like(stats.energy))
+    assert torch.equal(stats.pair_mask, torch.zeros_like(stats.pair_mask))
+    assert torch.equal(stats.delta_tq, torch.zeros_like(stats.delta_tq))
+
+
+def test_p3_exact_kl_max_self_energy_gates_saturated_row_to_pass_through() -> None:
+    mu = torch.tensor([[0.0]], dtype=torch.float32)
+    sigma = torch.tensor([[3461.013427734375]], dtype=torch.float32)
+    mu_p = torch.tensor([[831.9871826171875]], dtype=torch.float32)
+    sigma_p = sigma.clone()
+    omega = torch.ones(1, 1, 1, 1, dtype=torch.float32)
+    family = get_family("gaussian_diagonal")
+    self_energy = self_divergence_for_alpha(
+        family(mu, sigma),
+        family(mu_p, sigma_p),
+        alpha=1.0,
+        kl_max=100.0,
+        eps=1e-6,
+        divergence_family="renyi",
+        lambda_alpha_mode="constant",
+    )
+
+    assert torch.equal(self_energy, torch.full_like(self_energy, 100.0))
+    grad_mu, grad_sigma = belief_gradients(
+        mu,
+        sigma,
+        mu_p,
+        sigma_p,
+        omega,
+        reuse_pairwise_kl_stats=True,
+    )
+    mu_star, sigma_star = mm_exact_update(
+        mu,
+        sigma,
+        mu_p,
+        sigma_p,
+        omega,
+        reuse_pairwise_kl_stats=True,
+    )
+
+    assert grad_sigma is not None
+    assert torch.equal(grad_mu, torch.zeros_like(grad_mu))
+    assert torch.equal(grad_sigma, torch.zeros_like(grad_sigma))
+    assert torch.equal(mu_star, mu)
+    assert torch.equal(sigma_star, sigma)
+
+
 def _consumer_inputs(
     *,
     requires_grad: bool = False,
@@ -303,6 +367,7 @@ def _mm_call(
     reuse:             bool,
 
     irrep_dims: list[int] | None,
+    log_prior:  torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return mm_exact_update(
         *inputs,
@@ -315,8 +380,82 @@ def _mm_call(
         lambda_alpha_mode=lambda_alpha_mode,
         need_sigma_update=need_sigma_update,
         irrep_dims=irrep_dims,
+        log_prior=log_prior,
         reuse_pairwise_kl_stats=reuse,
     )
+
+
+def test_p3_causal_noself_prior_preserves_exact_hard_masks() -> None:
+    inputs = _consumer_inputs()
+    mu, sigma, _, _, omega = inputs
+    log_prior = attention_log_prior(
+        "causal_noself",
+        mu.shape[-2],
+        mu.shape[-2],
+        device=mu.device,
+        dtype=mu.dtype,
+    )
+    mu_t = transport_mean(omega, mu.detach())
+    sigma_t = transport_covariance(omega, sigma.detach(), diagonal_out=True)
+    stats = diagonal_kl_pair_stats(mu, sigma, mu_t, sigma_t, irrep_dims=[2, 2])
+    beta = attention_weights(stats.energy, tau=1.3, log_prior=log_prior)
+    forbidden = torch.triu(torch.ones_like(log_prior, dtype=torch.bool), diagonal=0)
+    forbidden[0, 0] = False
+
+    assert torch.equal(beta[..., forbidden], torch.zeros_like(beta[..., forbidden]))
+    assert torch.equal(beta[..., 0, 0], torch.ones_like(beta[..., 0, 0]))
+
+    filtering_off = _filtering_call(
+        inputs,
+        lambda_twohop=0.7,
+        lambda_alpha_mode="state_dependent",
+        reuse=False,
+        irrep_dims=[2, 2],
+        log_prior=log_prior,
+    )
+    filtering_on = _filtering_call(
+        inputs,
+        lambda_twohop=0.7,
+        lambda_alpha_mode="state_dependent",
+        reuse=True,
+        irrep_dims=[2, 2],
+        log_prior=log_prior,
+    )
+    mm_off = _mm_call(
+        inputs,
+        lambda_twohop=0.7,
+        lambda_alpha_mode="state_dependent",
+        need_sigma_update=True,
+        reuse=False,
+        irrep_dims=[2, 2],
+        log_prior=log_prior,
+    )
+    mm_on = _mm_call(
+        inputs,
+        lambda_twohop=0.7,
+        lambda_alpha_mode="state_dependent",
+        need_sigma_update=True,
+        reuse=True,
+        irrep_dims=[2, 2],
+        log_prior=log_prior,
+    )
+
+    for actual, expected in zip(filtering_on + mm_on, filtering_off + mm_off):
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-6)
+
+
+def test_p3_mm_frozen_sigma_is_exactly_equal_with_reuse() -> None:
+    inputs = _consumer_inputs()
+    _, sigma_star = _mm_call(
+        inputs,
+        lambda_twohop=0.7,
+        lambda_alpha_mode="state_dependent_per_coord",
+        need_sigma_update=False,
+        reuse=True,
+        irrep_dims=[2, 2],
+    )
+
+    assert torch.equal(sigma_star, inputs[1])
 
 
 def _legacy_pair_context(
@@ -579,6 +718,90 @@ def test_p3_false_forbids_statistics_helper(
 
 
 @pytest.mark.parametrize(
+    "route",
+    [
+        "smoothing",
+        "renyi_half",
+        "gaussian_full",
+        "entropy_suppressed",
+        "nonflat_transport",
+    ],
+)
+def test_p3_oracle_routes_forbid_statistics_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    route:       str,
+) -> None:
+    def _forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError(f"the pair-statistics helper must not run on the {route} route")
+
+    oracle_calls = 0
+
+    def _oracle(*args: object, **kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal oracle_calls
+        oracle_calls += 1
+        assert isinstance(args[0], torch.Tensor)
+        assert isinstance(args[1], torch.Tensor)
+        return torch.zeros_like(args[0]), torch.zeros_like(args[1])
+
+    monkeypatch.setattr(kernels_module, "diagonal_kl_pair_stats", _forbidden, raising=False)
+    monkeypatch.setattr(kernels_module, "belief_gradients_autograd", _oracle)
+    inputs = _consumer_inputs()
+    route_kwargs: dict[str, object] = {}
+    if route == "smoothing":
+        route_kwargs["gradient_mode"] = "smoothing"
+    elif route == "renyi_half":
+        route_kwargs["renyi_order"] = 0.5
+    elif route == "gaussian_full":
+        mu, sigma, mu_p, sigma_p, omega = inputs
+        inputs = (mu, torch.diag_embed(sigma), mu_p, torch.diag_embed(sigma_p), omega)
+        route_kwargs["family"] = "gaussian_full"
+    elif route == "entropy_suppressed":
+        route_kwargs["include_attention_entropy"] = False
+    else:
+        route_kwargs["transport_mode"] = "regime_ii"
+        route_kwargs["omega_builder"] = lambda *args: inputs[-1]
+
+    outputs = belief_gradients(
+        *inputs,
+        reuse_pairwise_kl_stats=True,
+        **route_kwargs,
+    )
+
+    assert oracle_calls == 1
+    assert all(torch.isfinite(output).all() for output in outputs)
+
+
+@pytest.mark.parametrize("consumer", ["filtering", "mm_exact"])
+def test_p3_non_float32_inputs_forbid_statistics_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    consumer:    str,
+) -> None:
+    def _forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the float32-only pair-statistics helper must not run")
+
+    monkeypatch.setattr(kernels_module, "diagonal_kl_pair_stats", _forbidden, raising=False)
+    inputs = tuple(tensor.to(torch.float64) for tensor in _consumer_inputs())
+    with pytest.raises(RuntimeError, match="expected scalar type Float but found Double"):
+        if consumer == "filtering":
+            _filtering_call(
+                inputs,
+                lambda_twohop=0.7,
+                lambda_alpha_mode="state_dependent",
+                reuse=True,
+                irrep_dims=None,
+            )
+        else:
+            _mm_call(
+                inputs,
+                lambda_twohop=0.7,
+                lambda_alpha_mode="state_dependent",
+                need_sigma_update=True,
+                reuse=True,
+                irrep_dims=None,
+            )
+
+
+@pytest.mark.parametrize(
     ("supply_inv", "supply_delta"),
     [(True, False), (False, True)],
     ids=("inverse_only", "delta_only"),
@@ -674,8 +897,20 @@ def _output_vjp(
     outputs: tuple[torch.Tensor, torch.Tensor],
     inputs:  tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor, ...]:
-    probe_mu = torch.linspace(0.2, 1.1, outputs[0].numel()).reshape_as(outputs[0])
-    probe_sigma = torch.linspace(-0.7, 0.4, outputs[1].numel()).reshape_as(outputs[1])
+    probe_mu = torch.linspace(
+        0.2,
+        1.1,
+        outputs[0].numel(),
+        device=outputs[0].device,
+        dtype=outputs[0].dtype,
+    ).reshape_as(outputs[0])
+    probe_sigma = torch.linspace(
+        -0.7,
+        0.4,
+        outputs[1].numel(),
+        device=outputs[1].device,
+        dtype=outputs[1].dtype,
+    ).reshape_as(outputs[1])
     objective = (outputs[0] * probe_mu).sum() + (outputs[1] * probe_sigma).sum()
     return torch.autograd.grad(objective, inputs[:4], retain_graph=True)
 
@@ -809,6 +1044,65 @@ def test_diagonal_kl_pair_stats_preserve_batched_head_layout_and_live_vjps() -> 
     )
     vjps = torch.autograd.grad(objective, (mu_q, sigma_q, mu_t, sigma_t))
     assert all(torch.isfinite(vjp).all() for vjp in vjps)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_p3_cuda_filtering_and_mm_reuse_smoke() -> None:
+    device = torch.device("cuda")
+    mu, sigma, mu_p, sigma_p, omega = _consumer_inputs()
+    inputs = (
+        mu.to(device).detach().requires_grad_(True),
+        sigma.to(device).detach().requires_grad_(True),
+        mu_p.to(device).detach().requires_grad_(True),
+        sigma_p.to(device).detach().requires_grad_(True),
+        omega.to(device),
+    )
+    filtering = _filtering_call(
+        inputs,
+        lambda_twohop=0.7,
+        lambda_alpha_mode="state_dependent_per_coord",
+        reuse=True,
+        irrep_dims=[2, 2],
+    )
+    mm_update = _mm_call(
+        inputs,
+        lambda_twohop=0.7,
+        lambda_alpha_mode="state_dependent_per_coord",
+        need_sigma_update=True,
+        reuse=True,
+        irrep_dims=[2, 2],
+    )
+
+    assert all(torch.isfinite(output).all() for output in filtering + mm_update)
+    assert all(torch.isfinite(vjp).all() for vjp in _output_vjp(filtering, inputs))
+    assert all(torch.isfinite(vjp).all() for vjp in _output_vjp(mm_update, inputs))
+
+    mu_t = transport_mean(inputs[-1], inputs[0].detach())
+    sigma_t = transport_covariance(inputs[-1], inputs[1].detach(), diagonal_out=True)
+    stats = diagonal_kl_pair_stats(
+        inputs[0],
+        inputs[1],
+        mu_t,
+        sigma_t,
+        kl_max=100.0,
+        eps=1e-6,
+        irrep_dims=[2, 2],
+    )
+    family = get_family("gaussian_diagonal")
+    reference_energy = pairwise_energy(
+        family(inputs[0], inputs[1]),
+        family(mu_t, sigma_t),
+        alpha=1.0,
+        kl_max=100.0,
+        eps=1e-6,
+        divergence_family="renyi",
+        irrep_dims=[2, 2],
+    )
+    reference_mask = (
+        (reference_energy > 0.0) & (reference_energy < 100.0)
+    ).to(reference_energy.dtype)
+
+    assert torch.equal(stats.pair_mask, reference_mask)
 
 
 @pytest.mark.parametrize(
