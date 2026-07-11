@@ -48,6 +48,10 @@ EXPECTED_IDS = ACTIONABLE_IDS | set(PRECLOSED_CLASSES) | DEFERRED_IDS
 LedgerRow = tuple[str, str, str, str, str, str, str]
 
 
+def _format_ledger_row(columns: tuple[str, ...]) -> str:
+    return "| " + " | ".join(columns) + " |"
+
+
 def _parse_ledger_rows(ledger_text: str) -> dict[str, LedgerRow]:
     rows: dict[str, LedgerRow] = {}
     header_seen = False
@@ -87,38 +91,35 @@ def _parse_ledger_rows(ledger_text: str) -> dict[str, LedgerRow]:
 
 
 @pytest.mark.parametrize(
-    ("needle", "replacement", "message"),
+    ("mutation", "message"),
     [
-        (
-            "",
-            "\n| EXTRA | FIXED | pending | pending | pending | pending | CLOSED |",
-            "identifier universe",
-        ),
-        (
-            "| 2 | FIXED | pending | pending | pending | pending | OPEN |",
-            "| 2 | FIXED | pending | pending | pending | OPEN |",
-            "seven cells",
-        ),
-        ("| 2 | FIXED |", "| 2 | UNKNOWN |", "unknown class"),
-        (
-            "| 2 | FIXED | pending | pending | pending | pending | OPEN |",
-            "| 2 | FIXED | pending | pending | pending | pending | UNKNOWN |",
-            "unknown status",
-        ),
+        ("extra_id", "identifier universe"),
+        ("malformed_schema", "seven cells"),
+        ("unknown_class", "unknown class"),
+        ("unknown_status", "unknown status"),
     ],
     ids=("extra-id", "malformed-schema", "unknown-class", "unknown-status"),
 )
 def test_closure_ledger_rejects_invalid_rows(
-    needle:      str,
-    replacement: str,
-    message:     str,
+    mutation: str,
+    message:  str,
 ) -> None:
     ledger_text = LEDGER_PATH.read_text(encoding="utf-8")
-    if needle:
-        assert needle in ledger_text
-        ledger_text = ledger_text.replace(needle, replacement, 1)
+    if mutation == "extra_id":
+        ledger_text += "\n| EXTRA | FIXED | complete | n/a | n/a | synthetic | CLOSED |"
     else:
-        ledger_text += replacement
+        row = _parse_ledger_rows(ledger_text)["2"]
+        original = _format_ledger_row(row)
+        replacement = list(row)
+        if mutation == "malformed_schema":
+            replacement = replacement[:-1]
+        elif mutation == "unknown_class":
+            replacement[1] = "UNKNOWN"
+        else:
+            replacement[-1] = "UNKNOWN"
+        assert original in ledger_text
+        ledger_text = ledger_text.replace(
+            original, _format_ledger_row(tuple(replacement)), 1)
 
     with pytest.raises(AssertionError, match=message):
         _parse_ledger_rows(ledger_text)
@@ -126,11 +127,16 @@ def test_closure_ledger_rejects_invalid_rows(
 
 def test_closure_ledger_allows_actionable_rows_to_close() -> None:
     ledger_text = LEDGER_PATH.read_text(encoding="utf-8")
-    open_row = "| 2 | FIXED | pending | pending | pending | pending | OPEN |"
-    closed_row = "| 2 | FIXED | pending | pending | pending | pending | CLOSED |"
-    assert open_row in ledger_text
+    closed_row = _parse_ledger_rows(ledger_text)["2"]
+    assert closed_row[-1] == "CLOSED"
+    open_row = closed_row[:-1] + ("OPEN",)
+    closed_text = _format_ledger_row(closed_row)
+    open_text = _format_ledger_row(open_row)
+    assert closed_text in ledger_text
 
-    rows = _parse_ledger_rows(ledger_text.replace(open_row, closed_row, 1))
+    open_ledger = ledger_text.replace(closed_text, open_text, 1)
+    assert _parse_ledger_rows(open_ledger)["2"][-1] == "OPEN"
+    rows = _parse_ledger_rows(open_ledger.replace(open_text, closed_text, 1))
 
     assert rows["2"][-1] == "CLOSED"
 
@@ -143,3 +149,9 @@ def test_closure_ledger_inventory() -> None:
     assert len(ACTIONABLE_IDS) == 117
     assert len(PRECLOSED_CLASSES) == 9
     assert len(DEFERRED_IDS) == 6
+    assert {row[-1] for row in rows.values()} == {"CLOSED"}
+    assert all(
+        cell.casefold() != "pending"
+        for row in rows.values()
+        for cell in row[2:6]
+    )
