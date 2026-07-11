@@ -14,10 +14,10 @@ Two sweep shapes are supported, both declared in the ``SWEEPS`` registry:
 
 The baseline is the self-contained ``BASELINE_CONFIG`` dict below -- a full ``VFE3Config`` toggle
 set kept deliberately separate from ``train_vfe3.py`` so an ablation can pin its own (fast)
-operating point. It tracks train_vfe3.py's K=20 / block_glk point except for three intentional
-deltas: ``m_gauge_update_rule`` ("adam" here vs "heavy_ball" there), ``phi_precond_mode``
-("killing_per_block" vs "pullback_per_block"), and ``m_p_sigma_lr`` (0.0035 vs 0.0045); keep the
-two in sync by hand when the training operating point moves. Each run gets a self-contained
+operating point. It tracks train_vfe3.py's K=20 / block_glk point; keep the two in sync by hand
+when the training operating point moves. ``kl_max`` is derived as ``8 * embed_dim`` below exactly
+as in train_vfe3.py, and ``DATA_SEED`` mirrors ``train_vfe3.DATA_SEED``, so an identical config
+trains on the identical batch order and reproduces train_vfe3.py run-for-run. Each run gets a self-contained
 ``RunArtifacts`` directory (``config.json``, ``metrics.csv``, ``best_model.pt``, figures)
 nested under its sweep, plus an ``ablation_result.json`` headline used for resume and the
 sweep-level leaderboard.
@@ -63,7 +63,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from vfe3.config import VFE3Config
-from vfe3.data.datasets import make_dataloader
+from vfe3.data.datasets import make_dataloader, tokens_per_char
 from vfe3.metrics import (
     attention_entropy,
     gauge_equivariance_residual,
@@ -78,6 +78,14 @@ from vfe3.train import coverage_lines, evaluate, train
 from vfe3.viz.extract import across_layer_belief_trace, attention_entropy_cov_gap, converged_state
 
 logger = logging.getLogger("ablation")
+
+
+# DATA_SEED (EXP-1 variance floor), mirroring train_vfe3.DATA_SEED: when set to an int, the TRAIN
+# loader's shuffle order is fixed to this seed via an explicit generator, INDEPENDENT of the
+# per-cell model seed. None keeps the legacy behavior (shuffle drawn from the global RNG, which
+# run_single's post-build reseed pins to cfg.seed). Keep this EQUAL to train_vfe3.DATA_SEED so the
+# two entry points train on the same batch order and reproduce each other under an identical config.
+DATA_SEED: Optional[int] = 3
 
 
 # =============================================================================
@@ -415,7 +423,14 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                              # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
     compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
 )
-    
+
+# kl_max is the numerical safety-net clamp on EVERY divergence, scaled with K exactly as in
+# train_vfe3.py (``config["kl_max"] = 8 * config["embed_dim"]``) so the two entry points share one
+# objective under an identical config -- the K-independent 100.0 dataclass default would silently
+# differ from train_vfe3's 160 at K=20. A sweep that changes embed_dim must override kl_max itself
+# (the K=28 multi-arm below already sets kl_max=224).
+BASELINE_CONFIG["kl_max"] = 8 * BASELINE_CONFIG["embed_dim"]
+
 
 
 # =============================================================================
@@ -1477,10 +1492,14 @@ def get_loader(
     # Split-aware loader semantics, mirroring train_vfe3._select_loader: only the train stream is
     # shuffled and tail-dropped; validation/test read the WHOLE split in a stable order so the
     # held-out PPL is a full-corpus measurement (make_dataloader defaults to the train regime, so
-    # the eval flags must be passed explicitly here).
+    # the eval flags must be passed explicitly here). The TRAIN shuffle order is fixed to DATA_SEED
+    # when set (an explicit generator, as in train_vfe3._select_loader); None -> no generator ->
+    # legacy global-RNG shuffle, pinned to cfg.seed by run_single's post-build reseed. The cached
+    # generator's state advances across cells; run_single re-pins it to DATA_SEED per cell.
+    gen = torch.Generator().manual_seed(int(DATA_SEED)) if (split == "train" and DATA_SEED is not None) else None
     loader = make_dataloader(dataset, split, seq_len, batch_size,
                              shuffle=(split == "train"), drop_last=(split == "train"),
-                             max_tokens=cap, vocab_size=vocab_size)
+                             max_tokens=cap, vocab_size=vocab_size, generator=gen)
     _LOADER_CACHE[key] = loader
     return loader
 
@@ -1671,6 +1690,10 @@ def run_single(
     val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation",
                               vocab_size=cfg.vocab_size)
 
+    # Bits-per-CHARACTER correction for the val BPC, mirroring train_vfe3 (None -- synthetic / no
+    # tiktoken / cache absent -- keeps 1.0 = honest bits-per-token). Memoized, so cells share it.
+    val_tpc = tokens_per_char(dataset, "validation") or 1.0
+
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts = RunArtifacts(run_dir, cfg, model, dataset=dataset, device=device)
 
@@ -1681,9 +1704,12 @@ def run_single(
     # the comparison would be confounded by data order. Reseeding here, after the model is built,
     # pins every cell to the same batch sequence regardless of order.
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
-    for loader in (train_loader, val_loader):                # synthetic loaders carry their own generator
+    for loader, is_train in ((train_loader, True), (val_loader, False)):  # synthetic loaders carry their own generator
         if getattr(loader, "generator", None) is not None:
-            loader.generator.manual_seed(cfg.seed)
+            # The train loader's DATA_SEED generator (get_loader) is re-pinned to DATA_SEED, not
+            # cfg.seed: its state advanced across cells (memoised loader), and train_vfe3 hands
+            # each run a FRESH generator at DATA_SEED -- reseeding here reproduces that exactly.
+            loader.generator.manual_seed(int(DATA_SEED) if (is_train and DATA_SEED is not None) else cfg.seed)
 
     print(f"    K={cfg.embed_dim} heads={len(model.group.irrep_dims)} group={cfg.gauge_group} "
           f"family={cfg.family} | steps={cfg.max_steps} batch={cfg.batch_size} | {n_params:,} params")
@@ -1696,6 +1722,7 @@ def run_single(
         log_interval=cfg.log_interval,
         eval_interval=cfg.eval_interval,
         val_loader=val_loader,
+        tokens_per_char=val_tpc,
         device=device,
         logger=logger,
         artifacts=artifacts,
@@ -1705,7 +1732,7 @@ def run_single(
     # Unconditional final validation pass: guarantees a number even when max_steps is below
     # eval_interval (a periodic eval never fired). best_val_ppl is the lowest the periodic
     # eval saw (inf if none); the headline takes the better of the two.
-    m = evaluate(model, val_loader, device=device)
+    m = evaluate(model, val_loader, tokens_per_char=val_tpc, device=device)
     best = artifacts.best_val_ppl
     primary = min(best, m["ppl"]) if best != float("inf") else m["ppl"]
 
