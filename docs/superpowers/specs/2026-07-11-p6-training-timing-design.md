@@ -1,7 +1,7 @@
 # Design: P6 Training and Pipeline Throughput Instrumentation
 
 Date: 2026-07-11
-Status: approved for implementation; reporting-boundary synchronization corrected during planning
+Status: implemented and verified
 Branch: `codex/p6-training-timing-20260711`
 Base: `origin/main` at `81dd6ae12dd9774c6fe348646bd668580eb38701`
 Worktree: `C:\tmp\V3_Transformer_p6_training_timing_20260711`
