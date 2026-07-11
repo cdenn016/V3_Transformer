@@ -338,12 +338,15 @@ def test_generate_figures_emits_model_channel_figures(tmp_path):
     on = _active()
     written = {p.name for p in generate_figures(tmp_path / "on", model=on, loader=_loader(), max_sequences=16)}
     for name in ("model_channel_belief.png", "hyper_prior_centroid.png",
-                 "hyper_prior_coupling.png", "attention_gamma_head0.png"):
+                 "hyper_prior_coupling.png"):
         assert name in written, name
+    # Per-head gamma heatmaps are training-side eval_interval artifacts (attention/step_*_gamma_head*),
+    # no longer duplicated into figures/ by generate_figures.
+    assert not any(n.startswith("attention_gamma") for n in written)
     off = _model()
     written_off = {p.name for p in generate_figures(tmp_path / "off", model=off, loader=_loader(), max_sequences=16)}
     assert not ({"model_channel_belief.png", "hyper_prior_centroid.png",
-                 "hyper_prior_coupling.png", "attention_gamma_head0.png"} & written_off)
+                 "hyper_prior_coupling.png"} & written_off)
 
 
 # ---- (10) finalize_run's root figures emit model_channel_terms.png iff active ---------------------
