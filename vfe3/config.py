@@ -471,7 +471,12 @@ class VFE3Config:
     prior_handoff_rho:         float = 1.0          # 1.0 = full flow; 0.0 = priors frozen
     prior_handoff_sigma:       float = 0.0          # sigma damping (0.0 = frozen at embedding)
 
-    # normalization
+    # normalization. Registry keys (vfe3.geometry.norms; add-by-registering): "none" (identity,
+    # gauge-pure default) | "mahalanobis" (gauge-invariant Mahalanobis rescale) | "layernorm"
+    # (standard parameter-free transformer LayerNorm over the belief dim -- OPT-IN, NON-gauge-
+    # equivariant baseline: centering and per-coordinate variance in the fixed basis do not commute
+    # with g in GL(K), so LN(g mu) != g LN(mu); the gauge-pure paths remain "none"/"mahalanobis").
+    # block = applied per block inside the E-step; final = applied once post-stack before decode.
     norm_type_block:           str   = "none"
     norm_type_final:           str   = "none"
 

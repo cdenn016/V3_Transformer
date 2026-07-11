@@ -1,5 +1,6 @@
 import torch
-from vfe3.geometry.norms import MahalanobisNorm
+import torch.nn.functional as F
+from vfe3.geometry.norms import LayerNorm, MahalanobisNorm, _NORMS, get_norm
 
 
 def test_mahalanobis_formula_diagonal():
@@ -33,3 +34,58 @@ def test_mahalanobis_is_gauge_invariant_scale():
     sig_g = g @ sigma_full @ g.T
     out_g = norm(mu_g, sig_g)
     assert torch.allclose(out_g, out @ g.T, atol=1e-4)
+
+
+def test_layernorm_matches_torch_reference():
+    # Parameter-free LayerNorm == torch.nn.functional.layer_norm over the last dim (no affine).
+    K = 4
+    norm = LayerNorm(K, eps=1e-5)
+    mu = torch.randn(3, 5, K)
+    sigma = torch.rand(3, 5, K) + 0.5                       # ignored by LN
+    out = norm(mu, sigma)
+    ref = F.layer_norm(mu, (K,), weight=None, bias=None, eps=1e-5)
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_layernorm_standardizes_features():
+    # Output has ~zero feature-mean and ~unit (biased) feature-variance over the belief dim.
+    K = 5
+    norm = LayerNorm(K)
+    mu = torch.randn(7, K) * 3.0 + 2.0
+    out = norm(mu, torch.ones(7, K))
+    assert torch.allclose(out.mean(-1), torch.zeros(7), atol=1e-5)
+    assert torch.allclose(out.var(-1, unbiased=False), torch.ones(7), atol=1e-4)
+
+
+def test_layernorm_ignores_sigma():
+    # LN acts on the point mu; sigma is inert (like the identity norm) and its shape is never read,
+    # so a diagonal and a full-covariance sigma give byte-identical output.
+    K = 3
+    norm = LayerNorm(K)
+    mu = torch.randn(4, K)
+    out_diag = norm(mu, torch.rand(4, K) + 0.5)
+    out_full = norm(mu, torch.rand(4, K, K))               # full-cov shape also ignored (no crash)
+    assert torch.allclose(out_diag, out_full, atol=1e-6)
+
+
+def test_layernorm_is_not_gauge_equivariant():
+    # DOCUMENTED departure: standard LayerNorm is NOT gauge-equivariant. Pin LN(g mu) != g LN(mu)
+    # for a generic (non-orthogonal) g in GL(K), so a future refactor cannot silently assume
+    # equivariance here (mirrors the equivariance-break pins on head_mixer / regime_ii). The
+    # gauge-pure norms remain none / mahalanobis.
+    K = 3
+    rng = torch.Generator().manual_seed(0)
+    norm = LayerNorm(K)
+    g = torch.randn(K, K, generator=rng) + 2 * torch.eye(K)  # invertible, generic (non-orthogonal)
+    mu = torch.randn(2, K, generator=rng)
+    ln_mu = norm(mu, torch.ones(2, K))
+    ln_gmu = norm(mu @ g.T, torch.ones(2, K))
+    assert not torch.allclose(ln_gmu, ln_mu @ g.T, atol=1e-3)
+
+
+def test_layernorm_registered_and_buildable():
+    # Registered under "layernorm" and buildable via get_norm; config validation reads _NORMS, so
+    # registration alone makes "layernorm" a valid norm_type_block / norm_type_final value.
+    assert "layernorm" in _NORMS
+    built = get_norm("layernorm")(4, eps=1e-6)
+    assert isinstance(built, LayerNorm)

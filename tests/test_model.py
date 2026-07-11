@@ -167,6 +167,22 @@ def test_norm_type_final_is_wired():
     assert not torch.allclose(m_norm(tok), m_none(tok))
 
 
+def test_norm_type_layernorm_is_wired_both_seams():
+    # "layernorm" flows end-to-end through BOTH norm seams (block + final) with no model.py change:
+    # the registry key builds via get_norm(cfg.norm_type_*) and the standardized means change the
+    # logits vs 'none'. Parameter-free: it adds no learnable parameters over the 'none' model, so
+    # there is no optimizer wiring to do (the whole point of the parameter-free variant).
+    base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
+                n_e_steps=1, e_q_mu_lr=0.05)
+    tok = torch.randint(0, 12, (2, 4))
+    torch.manual_seed(0); m_ln   = VFEModel(VFE3Config(**base, norm_type_block="layernorm",
+                                                       norm_type_final="layernorm"))
+    torch.manual_seed(0); m_none = VFEModel(VFE3Config(**base, norm_type_block="none",
+                                                       norm_type_final="none"))
+    assert not torch.allclose(m_ln(tok), m_none(tok))
+    assert sum(p.numel() for p in m_ln.parameters()) == sum(p.numel() for p in m_none.parameters())
+
+
 # --- Audit 2026-05-31 --------------------------------------------------------
 def test_manual_seed_makes_model_init_reproducible():
     """run_training pins reproducibility via torch.manual_seed(cfg.seed) before building the model;

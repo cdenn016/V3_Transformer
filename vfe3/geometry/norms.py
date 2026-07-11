@@ -1,9 +1,14 @@
-r"""Gauge-equivariant normalization for VFE_3.0 belief means.
+r"""Normalization registry for VFE_3.0 belief means.
 
+The gauge-pure options are ``none`` (identity, trivially equivariant) and ``mahalanobis``.
 MahalanobisNorm rescales mu by the gauge-invariant Mahalanobis length:
     mu_norm = mu * sqrt(K / (mu^T Sigma^-1 mu + eps)).
 Since mu^T Sigma^-1 mu is invariant under mu->g mu, Sigma->g Sigma g^T, the scale is
 gauge-invariant and mu_norm transforms as a vector. Pure math, no parameters.
+
+``layernorm`` is an OPT-IN, NON-gauge-equivariant baseline: standard parameter-free transformer
+LayerNorm standardization of the mean over the belief dimension (see LayerNorm). It is provided as
+an ablation / baseline against the gauge-pure paths, which remain ``none``/``mahalanobis``.
 """
 
 from typing import Callable, Dict
@@ -78,6 +83,47 @@ class MahalanobisNorm:
         return mu * torch.sqrt(self.K / s2.clamp(min=self.eps))
 
 
+class LayerNorm:
+    r"""Standard (parameter-free) LayerNorm over the belief mean.
+
+    ``mu_norm = (mu - mean(mu)) / sqrt(var(mu) + eps)``, the mean and (biased) variance taken over
+    the last (belief) dimension -- the conventional transformer LayerNorm standardization (Ba,
+    Kiros and Hinton 2016) applied to the belief MEAN mu. ``sigma`` is ignored (as in the ``none``
+    norm): LayerNorm acts on the point mu, not the covariance, and never inspects ``sigma``'s shape
+    (diagonal or full-covariance sigma pass through untouched). The standardization matches
+    ``torch.nn.LayerNorm(elementwise_affine=False)`` -- biased variance (divide by K, not K-1) with
+    eps added inside the sqrt; the default ``eps`` (1e-6) follows the sibling MahalanobisNorm rather
+    than torch's 1e-5 default (eps changes the output only where the feature variance is ~0).
+
+    NON-gauge-equivariant by construction: the mean-subtraction and per-coordinate variance are
+    taken in the FIXED coordinate basis, so ``LN(g mu) != g LN(mu)`` for a general g in GL(K)
+    (contrast MahalanobisNorm's gauge-invariant scale). This is an OPT-IN ablation / baseline norm;
+    the gauge-pure options remain ``none`` (identity) and ``mahalanobis`` (gauge-invariant scale).
+    Parameter-free -- no learned affine (gamma/beta), hence no optimizer wiring and no NN; the
+    learned-affine variant is a documented follow-up (it needs M-step param-group wiring).
+    """
+
+    def __init__(
+        self,
+        K:   int,
+
+        *,
+        eps: float = 1e-6,
+    ) -> None:
+        self.K = K
+        self.eps = eps
+
+    def __call__(
+        self,
+        mu:    torch.Tensor,             # (..., K) means
+        sigma: torch.Tensor,             # (..., K) or (..., K, K); ignored (LN acts on mu)
+    ) -> torch.Tensor:                   # (..., K) standardized means
+        r"""Standardize ``mu`` over the last dim: ``(mu - E[mu]) / sqrt(Var[mu] + eps)``."""
+        mu_centered = mu - mu.mean(dim=-1, keepdim=True)              # (..., K) zero feature-mean
+        var = mu_centered.pow(2).mean(dim=-1, keepdim=True)          # (..., 1) biased variance
+        return mu_centered * torch.rsqrt(var + self.eps)
+
+
 @register_norm("none")
 def _norm_none(K: int, **kwargs) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Identity norm (no rescaling)."""
@@ -90,3 +136,9 @@ def _norm_none(K: int, **kwargs) -> Callable[[torch.Tensor, torch.Tensor], torch
 def _norm_mahalanobis(K: int, *, eps: float = 1e-6, **kwargs) -> MahalanobisNorm:
     """MahalanobisNorm builder."""
     return MahalanobisNorm(K, eps=eps)
+
+
+@register_norm("layernorm")
+def _norm_layernorm(K: int, *, eps: float = 1e-6, **kwargs) -> LayerNorm:
+    """Standard parameter-free LayerNorm builder (opt-in, non-gauge-equivariant baseline)."""
+    return LayerNorm(K, eps=eps)
