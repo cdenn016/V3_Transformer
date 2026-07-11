@@ -43,8 +43,18 @@ This V3 is a production quality gauge-theoretic VFE transformer that allows clea
   temperature multiplies the gauge-invariant per-block energy and touches no gauge transport, so
   equivariance is preserved; `log_kappa_beta` (and `log_kappa_gamma` under `s_e_step`) carries the
   same `detach_e_step`/`straight_through` freeze footgun (`kappa_gamma` on the scored
-  `lambda_gamma>0` path trains under any estimator). (`learnable_r`,
-  `pos_phi='learned'` are the other default-OFF learned-scalar/table toggles in the same family.)
+  `lambda_gamma>0` path trains under any estimator). (6) `layernorm_affine=True` adds a learned
+  per-feature affine `gamma`/`beta` to any `"layernorm"` norm seam (`mu_norm = gamma*LN(mu) + beta`,
+  raw `(K,)` nn.Parameters carried by an `AffineLayerNorm` nn.Module, init `gamma=1`/`beta=0` so
+  step 0 is byte-identical; default OFF, inert unless a seam is `"layernorm"`). Unlike (4)/(5) it is
+  NOT gauge-preserving — the per-coordinate affine in the fixed basis does not commute with `g` in
+  GL(K); it sits on the same non-gauge-pure path `"layernorm"` already occupies, adding a diagonal
+  scale/shift on top of its centering (an opt-in non-equivariant baseline; the gauge-pure norms
+  remain `"none"`/`"mahalanobis"`). As the BLOCK norm it is applied to the belief VALUE inside the
+  stack, so (unlike (5), which enters only the E-step tangent) it trains under `unroll` AND
+  `straight_through` and is frozen ONLY by the fully-detached E-step (effective `detach`); as the
+  FINAL norm it trains under any estimator. (`learnable_r`, `pos_phi='learned'` are the other
+  default-OFF learned-scalar/table toggles in the same family.)
 - NO CLI arg parsing; entry points are click-to-run (edit config dicts, then run).
 - float32 throughout; CUDA where applicable (user has an RTX 5090).
 - High modularity: a config-selected registry behind every seam (divergence,

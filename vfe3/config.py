@@ -476,10 +476,29 @@ class VFE3Config:
     # gauge-pure default) | "mahalanobis" (gauge-invariant Mahalanobis rescale) | "layernorm"
     # (standard parameter-free transformer LayerNorm over the belief dim -- OPT-IN, NON-gauge-
     # equivariant baseline: centering and per-coordinate variance in the fixed basis do not commute
-    # with g in GL(K), so LN(g mu) != g LN(mu); the gauge-pure paths remain "none"/"mahalanobis").
+    # with g in GL(K), so LN(g mu) != g LN(mu); the gauge-pure paths remain "none"/"mahalanobis";
+    # set layernorm_affine=True for the learned gamma/beta affine variant).
     # block = applied per block inside the E-step; final = applied once post-stack before decode.
     norm_type_block:           str   = "none"
     norm_type_final:           str   = "none"
+
+    # SANCTIONED LEARNED-SCALAR EXCEPTION (t5_bias / learnable_kappa family, default OFF): add a
+    # learned per-feature affine gamma/beta to any "layernorm" norm seam -> mu_norm = gamma*LN(mu) +
+    # beta, exactly torch.nn.LayerNorm(elementwise_affine=True) on the belief mean. gamma inits to 1
+    # and beta to 0, so a learnable model is BYTE-IDENTICAL to the parameter-free "layernorm" at
+    # construction. gamma/beta are raw nn.Parameter diagonal scale/shift tables (shared across
+    # blocks for the block seam; a separate pair for the final seam), NOT an nn.Linear/MLP/activation
+    # -- no hidden network. They stay NON-gauge-equivariant (the per-coordinate affine in the fixed
+    # basis does not commute with g in GL(K)): the affine sits on the same non-gauge-pure path
+    # "layernorm" already occupies, adding a diagonal scale/shift on top of its centering, so the
+    # gauge-pure paths remain "none"/"mahalanobis". Inert (no params, warned) unless a norm seam is
+    # "layernorm". As the BLOCK norm the affine is applied to the belief VALUE inside the stack, so
+    # (unlike learnable_kappa, which enters only the E-step tangent) it trains under 'unroll' AND
+    # 'straight_through' and is frozen ONLY by the fully-detached E-step (effective 'detach', which
+    # no_grads the stack; model.__init__ warns); as the FINAL norm it is post-stack and trains under
+    # any estimator. Grouped in build_optimizer at m_p_mu_lr, weight_decay=0, role='mu' (like
+    # t5_bias / log_kappa).
+    layernorm_affine:          bool  = False
 
     # M-step / training
     # E-step backward estimator (manuscript Algorithm 1, GL(K)_attention.tex:2050). Three modes:

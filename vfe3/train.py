@@ -277,6 +277,18 @@ def build_optimizer(
         groups.append({"params": [model.log_kappa_beta],  "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
     if getattr(model, "log_kappa_gamma", None) is not None:     # learnable_kappa_gamma=True (model channel)
         groups.append({"params": [model.log_kappa_gamma], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
+    # LayerNorm affine (layernorm_affine=True on a "layernorm" seam): learned per-feature gamma/beta
+    # on the belief mean, carried by the block/final AffineLayerNorm nn.Modules. weight_decay=0 --
+    # gamma/beta are normalization calibration, not capacity (decaying gamma toward 0 shrinks the
+    # normalized signal; the same exemption t5_bias / log_kappa / output_proj_bias carry). role='mu'
+    # is the catch-all for learned non-variance/non-gauge tables; NO gauge flag (the affine touches
+    # no gauge transport), so it rides as plain AdamW even under GaugeNaturalGradAdamW.
+    ln_affine = []
+    for _nm in (getattr(model, "block_norm", None), getattr(model, "final_norm", None)):
+        if isinstance(_nm, torch.nn.Module):
+            ln_affine += [p for p in _nm.parameters() if p.requires_grad]
+    if ln_affine:
+        groups.append({"params": ln_affine, "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
 
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
     # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the

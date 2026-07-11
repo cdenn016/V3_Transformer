@@ -241,12 +241,47 @@ class VFEModel(nn.Module):
             gauge_group_is_tied=(cfg.gauge_group == "tied_block_glk"),
             gauge_group_name=self.group.name,
         )
-        # Stateless norm instances built ONCE (audit 2d/4f): they are parameter-free pure
-        # maps (K, eps), so re-instantiating them per block/forward only churned objects.
-        self.block_norm = get_norm(cfg.norm_type_block)(cfg.embed_dim, eps=cfg.eps) \
+        # Norm instances built ONCE (audit 2d/4f). The gauge-pure norms (none/mahalanobis) and the
+        # parameter-free layernorm are stateless pure maps (K, eps); layernorm_affine=True makes a
+        # "layernorm" seam an AffineLayerNorm nn.Module whose gamma/beta REGISTER as submodule params
+        # (grouped by build_optimizer). Each seam gets its own affine pair; the block seam's affine
+        # is shared across the L blocks (the block norm is a single shared instance). affine=... is
+        # ignored by the none/mahalanobis builders (they accept **kwargs).
+        self.block_norm = get_norm(cfg.norm_type_block)(cfg.embed_dim, eps=cfg.eps,
+                                                        affine=cfg.layernorm_affine) \
             if cfg.norm_type_block != "none" else None
-        self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps) \
+        self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps,
+                                                        affine=cfg.layernorm_affine) \
             if cfg.norm_type_final != "none" else None
+        # layernorm_affine footgun / inert warnings (mirror learnable_kappa). The affine gamma/beta
+        # exist only on a "layernorm" seam; on the BLOCK seam they are applied inside the E-step, so
+        # a severing estimator freezes them.
+        if cfg.layernorm_affine:
+            _ln_block = cfg.norm_type_block == "layernorm"
+            _ln_final = cfg.norm_type_final == "layernorm"
+            if not (_ln_block or _ln_final):
+                import warnings
+                warnings.warn(
+                    "layernorm_affine=True but neither norm_type_block nor norm_type_final is "
+                    "'layernorm': no affine gamma/beta are created and the toggle is inert. Set a "
+                    "norm seam to 'layernorm' to use the learned affine.",
+                    UserWarning, stacklevel=2,
+                )
+            elif _ln_block and cfg.effective_e_step_gradient == "detach":
+                # Unlike learnable_kappa (which enters only the E-step TANGENT and is also frozen by
+                # 'straight_through'), the block affine is applied to the belief VALUE, so it trains
+                # under 'unroll' AND 'straight_through' (both keep the value differentiable) and is
+                # frozen ONLY by the fully-detached E-step, which no_grads the whole stack.
+                import warnings
+                warnings.warn(
+                    "layernorm_affine=True with norm_type_block='layernorm' and the effective "
+                    "E-step estimator 'detach' freezes the BLOCK norm's gamma/beta: 'detach' runs "
+                    "the whole belief stack (including the block norm) under no_grad, so the affine "
+                    "receives no gradient. Use 'unroll' or 'straight_through' (both keep the belief "
+                    "value differentiable), or place the affine layernorm on norm_type_final "
+                    "(post-stack, trains under any estimator).",
+                    UserWarning, stacklevel=2,
+                )
         # Opt-in Schur-commutant head mixer (default off). Built ONCE from the gauge group's
         # irrep blocks. Label-less groups need >= 2 EQUAL blocks (block_glk/tied_block_glk);
         # labeled irrep towers (so_n/sp_n) mix per isotypic component (mults-one towers get

@@ -6,14 +6,18 @@ MahalanobisNorm rescales mu by the gauge-invariant Mahalanobis length:
 Since mu^T Sigma^-1 mu is invariant under mu->g mu, Sigma->g Sigma g^T, the scale is
 gauge-invariant and mu_norm transforms as a vector. Pure math, no parameters.
 
-``layernorm`` is an OPT-IN, NON-gauge-equivariant baseline: standard parameter-free transformer
-LayerNorm standardization of the mean over the belief dimension (see LayerNorm). It is provided as
-an ablation / baseline against the gauge-pure paths, which remain ``none``/``mahalanobis``.
+``layernorm`` is an OPT-IN, NON-gauge-equivariant baseline: standard transformer LayerNorm
+standardization of the mean over the belief dimension (see LayerNorm). With ``layernorm_affine=True``
+the builder returns the AffineLayerNorm variant, which adds a learned per-feature affine (gamma/beta)
+on top of the standardization -- a SANCTIONED learned-scalar exception (t5_bias / learnable_kappa
+family), still non-equivariant. Both are ablations / baselines against the gauge-pure paths, which
+remain ``none``/``mahalanobis``.
 """
 
 from typing import Callable, Dict
 
 import torch
+import torch.nn as nn
 
 _NORMS: Dict[str, Callable] = {}
 
@@ -83,6 +87,21 @@ class MahalanobisNorm:
         return mu * torch.sqrt(self.K / s2.clamp(min=self.eps))
 
 
+def _ln_standardize(
+    mu:  torch.Tensor,               # (..., K) means
+    eps: float,                      # variance floor added inside the sqrt
+) -> torch.Tensor:                   # (..., K) standardized means
+    r"""LayerNorm standardization over the last dim: ``(mu - E[mu]) / sqrt(Var[mu] + eps)``.
+
+    Biased variance (divide by K, not K-1) with eps added inside the sqrt, matching
+    ``torch.nn.functional.layer_norm(mu, (K,), weight=None, bias=None, eps)``. Shared by the
+    parameter-free ``LayerNorm`` and the learned-affine ``AffineLayerNorm``.
+    """
+    mu_centered = mu - mu.mean(dim=-1, keepdim=True)                  # (..., K) zero feature-mean
+    var = mu_centered.pow(2).mean(dim=-1, keepdim=True)               # (..., 1) biased variance
+    return mu_centered * torch.rsqrt(var + eps)
+
+
 class LayerNorm:
     r"""Standard (parameter-free) LayerNorm over the belief mean.
 
@@ -99,8 +118,7 @@ class LayerNorm:
     taken in the FIXED coordinate basis, so ``LN(g mu) != g LN(mu)`` for a general g in GL(K)
     (contrast MahalanobisNorm's gauge-invariant scale). This is an OPT-IN ablation / baseline norm;
     the gauge-pure options remain ``none`` (identity) and ``mahalanobis`` (gauge-invariant scale).
-    Parameter-free -- no learned affine (gamma/beta), hence no optimizer wiring and no NN; the
-    learned-affine variant is a documented follow-up (it needs M-step param-group wiring).
+    Parameter-free -- no learned affine (gamma/beta); the AffineLayerNorm sibling adds the affine.
     """
 
     def __init__(
@@ -119,9 +137,54 @@ class LayerNorm:
         sigma: torch.Tensor,             # (..., K) or (..., K, K); ignored (LN acts on mu)
     ) -> torch.Tensor:                   # (..., K) standardized means
         r"""Standardize ``mu`` over the last dim: ``(mu - E[mu]) / sqrt(Var[mu] + eps)``."""
-        mu_centered = mu - mu.mean(dim=-1, keepdim=True)              # (..., K) zero feature-mean
-        var = mu_centered.pow(2).mean(dim=-1, keepdim=True)          # (..., 1) biased variance
-        return mu_centered * torch.rsqrt(var + self.eps)
+        return _ln_standardize(mu, self.eps)
+
+
+class AffineLayerNorm(nn.Module):
+    r"""Standard LayerNorm with a learned per-feature affine: ``mu_norm = gamma * LN(mu) + beta``.
+
+    Applies the same standardization as ``LayerNorm`` (see :func:`_ln_standardize`), then a learned
+    per-feature scale ``gamma`` (``weight``) and shift ``beta`` (``bias``), each of shape ``(K,)``,
+    exactly ``torch.nn.LayerNorm(K, elementwise_affine=True)`` on the belief MEAN (``sigma`` ignored).
+    ``gamma`` inits to ones and ``beta`` to zeros, so at construction the affine is the identity and
+    the output is BYTE-IDENTICAL to the parameter-free ``LayerNorm`` (the same step-0 contract the
+    learnable_kappa / t5_bias exceptions carry).
+
+    SANCTIONED LEARNED-SCALAR EXCEPTION (t5_bias / learnable_kappa family, default OFF via
+    ``layernorm_affine``): ``gamma``/``beta`` are raw ``nn.Parameter`` diagonal scale/shift tables,
+    not an ``nn.Linear`` / MLP / activation, so they carry no hidden network. They are still
+    NON-gauge-equivariant -- a per-coordinate affine in the fixed basis does not commute with a
+    general g in GL(K); the affine sits on the same non-gauge-pure path LayerNorm already occupies,
+    adding a diagonal scale/shift on top of its centering (an opt-in baseline, not a gauge-pure path;
+    those remain ``none``/``mahalanobis``). As an ``nn.Module`` its parameters
+    register on the owning model and must be placed in an M-step optimizer group (train.build_optimizer
+    groups them at ``m_p_mu_lr``, ``weight_decay=0``, ``role='mu'``). When used as the BLOCK norm the
+    affine is applied to the belief VALUE inside the stack, so (unlike learnable_kappa, which enters
+    only the E-step tangent) it trains under ``'unroll'`` AND ``'straight_through'`` and is frozen
+    ONLY by the fully-detached E-step (effective ``'detach'``, which no_grads the whole stack;
+    model.__init__ warns). As the FINAL norm it is post-stack and trains under any estimator.
+    """
+
+    def __init__(
+        self,
+        K:   int,
+
+        *,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.K = K
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(K))                    # (K,) gamma, init 1 -> identity affine
+        self.bias   = nn.Parameter(torch.zeros(K))                   # (K,) beta,  init 0
+
+    def forward(
+        self,
+        mu:    torch.Tensor,             # (..., K) means
+        sigma: torch.Tensor,             # (..., K) or (..., K, K); ignored (LN acts on mu)
+    ) -> torch.Tensor:                   # (..., K) standardized + affine means
+        r"""``gamma * LN(mu) + beta`` (standardize over the last dim, then per-feature affine)."""
+        return _ln_standardize(mu, self.eps) * self.weight + self.bias
 
 
 @register_norm("none")
@@ -139,6 +202,10 @@ def _norm_mahalanobis(K: int, *, eps: float = 1e-6, **kwargs) -> MahalanobisNorm
 
 
 @register_norm("layernorm")
-def _norm_layernorm(K: int, *, eps: float = 1e-6, **kwargs) -> LayerNorm:
-    """Standard parameter-free LayerNorm builder (opt-in, non-gauge-equivariant baseline)."""
-    return LayerNorm(K, eps=eps)
+def _norm_layernorm(K: int, *, eps: float = 1e-6, affine: bool = False, **kwargs):
+    """Standard LayerNorm builder (opt-in, non-gauge-equivariant baseline).
+
+    ``affine=False`` (default) -> parameter-free ``LayerNorm``; ``affine=True`` (config
+    ``layernorm_affine``) -> the learned per-feature ``AffineLayerNorm``.
+    """
+    return AffineLayerNorm(K, eps=eps) if affine else LayerNorm(K, eps=eps)
