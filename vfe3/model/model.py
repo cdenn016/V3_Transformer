@@ -30,6 +30,7 @@ from vfe3.geometry.transport import (CompactFactoredTransport, DirectLinkTranspo
                                      _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA)
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import _as_coeff, vfe_block
+from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.model.stack import vfe_stack
@@ -136,6 +137,7 @@ class DiagnosticSnapshot:
     logits:            torch.Tensor
     beta_maps:         torch.Tensor
     gamma_maps:        Optional[torch.Tensor]
+    model_phi:         Optional[torch.Tensor]
     trace_states:      'Tuple[BeliefState, ...]'
     trace_free_energy: torch.Tensor
     s_belief:          'Optional[Tuple[torch.Tensor, torch.Tensor]]'
@@ -682,6 +684,26 @@ class VFEModel(nn.Module):
             pos_phi_free=getattr(self, "pos_phi_free", None),
         )
 
+    def _resolve_model_frame(
+        self,
+        token_ids:  torch.Tensor,        # (B, N) integer token ids
+        belief_phi: torch.Tensor,        # (B, N, n_gen) already composed belief frame
+    ) -> torch.Tensor:                   # (B, N, n_gen) effective model-channel frame
+        r"""Resolve the tied or independently stored model-channel frame once."""
+        independent = self.cfg.s_frame_mode == "phi_tilde"
+        return resolve_model_frame(
+            belief_phi,
+            mode=self.cfg.s_frame_mode,
+            model_phi=self.prior_bank.s_phi(token_ids) if independent else None,
+            group=self.group,
+            pos_phi_free=getattr(self, "s_pos_phi_free", None) if independent else None,
+            pos_phi=self.cfg.pos_phi,
+            compose_mode=self.cfg.pos_phi_compose,
+            bch_order=self.cfg.bch_pe_order,
+            pos_phi_scale=self.cfg.pos_phi_scale,
+            project_slk=self.cfg.pos_phi_project_slk,
+        )
+
     def effective_kappa_beta(self, device: torch.device) -> 'float | torch.Tensor':
         r"""The belief-channel kappa actually in force: exp(log_kappa_beta) (live, differentiable)
         under learnable_kappa_beta, else the config constant via _as_coeff (a scalar float, or an
@@ -814,7 +836,8 @@ class VFEModel(nn.Module):
         if not self.cfg.s_e_step:
             return None
         enc = self.prior_bank.encode(token_ids[:1])
-        phi0 = self._apply_pos_phi(enc.phi[0]).unsqueeze(0)          # (1, N, n_gen) encoded frame, fixed
+        belief_phi = self._apply_pos_phi(enc.phi[0]).unsqueeze(0)    # (1, N, n_gen) belief frame
+        phi0 = self._resolve_model_frame(token_ids[:1], belief_phi) # (1, N, n_gen) model frame
         rope = self._rope_rotation(token_ids.shape[1], token_ids.device)
         return self._refine_s(token_ids[:1], phi0, rope=rope)        # (1, N, K) x2
 
@@ -861,9 +884,11 @@ class VFEModel(nn.Module):
             raise ValueError("decode_last=True requires a nonempty token context")
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
         beliefs = beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))
+        model_phi = self._resolve_model_frame(token_ids, beliefs.phi)
         diagnostic_capture = capture.get("diagnostic") if capture is not None else None
         if diagnostic_capture is not None:
             diagnostic_capture["encoded_belief"] = beliefs
+            diagnostic_capture["model_phi"] = model_phi
         log_prior = self._attention_log_prior(N, token_ids.device)
         rope = self._rope_rotation(N, token_ids.device)
 
@@ -904,7 +929,8 @@ class VFEModel(nn.Module):
         amp = self._amp_context(token_ids.device)
         with run, amp:
             shared_omega = None
-            if (self.cfg.share_refine_s_transport
+            if (self.cfg.s_frame_mode == "tied"
+                    and self.cfg.share_refine_s_transport
                     and self.cfg.transport_mode == "flat"
                     and self.cfg.e_phi_lr == 0.0
                     and rope is None):
@@ -933,7 +959,7 @@ class VFEModel(nn.Module):
                 # Live model channel: refine s (phi0 fixed), then anchor the belief to it -- q0 and
                 # the belief prior (mu_p, sigma_p) both become the refined s1. The belief E-step
                 # self-couples to its prior every iteration, so s reaches mu_final even at n_e_steps=1.
-                s_mu1, s_sigma1 = self._refine_s(token_ids, beliefs.phi, e_step_gradient=e_step_gradient,
+                s_mu1, s_sigma1 = self._refine_s(token_ids, model_phi, e_step_gradient=e_step_gradient,
                                                  rope=rope,
                                                  prebuilt_transport=shared_omega)
                 s_belief = (s_mu1, s_sigma1)
@@ -951,8 +977,10 @@ class VFEModel(nn.Module):
                 # pi <- (1-w) softmax(B) + w gamma (h->s->p->q: models tell beliefs where to attend).
                 # Detached like the precision bias above, so the closed-form belief kernel stays
                 # exact; the forward's diagnostic replays do NOT refold this (forward-path only).
-                log_prior = self._fold_gamma_prior(log_prior, token_ids, beliefs.phi, omega=beliefs.omega,
-                                                   reflection=beliefs.reflection if beliefs.reflection is not None else None,
+                tied_model_frame = self.cfg.s_frame_mode == "tied"
+                log_prior = self._fold_gamma_prior(log_prior, token_ids, model_phi,
+                                                   omega=beliefs.omega if tied_model_frame else None,
+                                                   reflection=(beliefs.reflection if tied_model_frame else None),
                                                    s_belief=s_belief)
             if diagnostic_capture is not None:
                 diagnostic_capture["initial_belief"] = beliefs
@@ -1522,10 +1550,13 @@ class VFEModel(nn.Module):
             # the canonical E-step F; restoring it (or keeping it severed) is part of the deferred s->q
             # design, NOT this term. Computed once per forward at the loss level (like diagnostics()).
             # The body lives in _gamma_coupling_term so diagnostics logs the SAME term (audit V2).
+            tied_model_frame = self.cfg.s_frame_mode == "tied"
+            model_phi = self._resolve_model_frame(token_ids, belief.phi)
             loss = loss + self.cfg.lambda_gamma * self._gamma_coupling_term(
-                token_ids, belief.phi.detach(),
-                omega=belief.omega.detach() if belief.omega is not None else None,
-                reflection=belief.reflection if belief.reflection is not None else None)   # non-diff buffer -> no detach
+                token_ids, model_phi.detach(),
+                omega=(belief.omega.detach()
+                       if tied_model_frame and belief.omega is not None else None),
+                reflection=(belief.reflection if tied_model_frame else None))
         return logits, loss, ce.detach()
 
     @property
@@ -1764,6 +1795,7 @@ class VFEModel(nn.Module):
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
                              omega=enc.omega[0] if enc.omega is not None else None,   # carry the GL(K) frame under omega_direct
                              reflection=enc.reflection[0] if enc.reflection is not None else None)   # carry the phi-path reflection sign
+        model_phi = self._resolve_model_frame(token_ids[:1], belief.phi.unsqueeze(0))
         s_belief = self._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
         if s_belief is not None:
             belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
@@ -1771,9 +1803,12 @@ class VFEModel(nn.Module):
         log_prior = self._attention_log_prior(n, token_ids.device)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward/diagnostics/attention_maps (r2 id22)
         if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
-            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
-                                               reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None,
+            tied_model_frame = self.cfg.s_frame_mode == "tied"
+            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], model_phi,
+                                               omega=(belief.omega.unsqueeze(0)
+                                                      if tied_model_frame and belief.omega is not None else None),
+                                               reflection=(belief.reflection.unsqueeze(0)
+                                                           if tied_model_frame and belief.reflection is not None else None),
                                                s_belief=s_belief)[0]
         rope = self._rope_rotation(n, token_ids.device)
         out = vfe_stack(                                             # converged belief gauge frame
@@ -1788,10 +1823,13 @@ class VFEModel(nn.Module):
             gauge_parameterization=self.cfg.gauge_parameterization,
             kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
         )
+        tied_model_frame = self.cfg.s_frame_mode == "tied"
+        model_phi = self._resolve_model_frame(token_ids[:1], out.phi.unsqueeze(0))
         e_s, gamma_tau, gamma_log_prior = self._gamma_energy(
-            token_ids[:1], out.phi.unsqueeze(0),
-            omega=out.omega.unsqueeze(0) if out.omega is not None else None,
-            reflection=out.reflection.unsqueeze(0) if out.reflection is not None else None,
+            token_ids[:1], model_phi,
+            omega=(out.omega.unsqueeze(0) if tied_model_frame and out.omega is not None else None),
+            reflection=(out.reflection.unsqueeze(0)
+                        if tied_model_frame and out.reflection is not None else None),
             s_belief=s_belief)
         gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)[0]   # drop batch
         if gamma.dim() == 2:                                        # single-block group -> add an H=1 axis
@@ -2199,10 +2237,14 @@ class VFEModel(nn.Module):
 
         state = _sequence_belief(belief)
         s0 = None if s_belief is None else (s_belief[0][:1], s_belief[1][:1])
+        tied_model_frame = self.cfg.s_frame_mode == "tied"
+        model_phi = self._resolve_model_frame(token_ids[:1], state.phi.unsqueeze(0))
         e_s, gamma_tau, gamma_log_prior = self._gamma_energy(
-            token_ids[:1], state.phi.unsqueeze(0),
-            omega=state.omega.unsqueeze(0) if state.omega is not None else None,
-            reflection=state.reflection.unsqueeze(0) if state.reflection is not None else None,
+            token_ids[:1], model_phi,
+            omega=(state.omega.unsqueeze(0)
+                   if tied_model_frame and state.omega is not None else None),
+            reflection=(state.reflection.unsqueeze(0)
+                        if tied_model_frame and state.reflection is not None else None),
             s_belief=s0,
         )
         gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)[0]
@@ -2257,6 +2299,8 @@ class VFEModel(nn.Module):
             logits=_freeze_tensor(logits),
             beta_maps=_freeze_tensor(beta_maps),
             gamma_maps=_freeze_tensor(gamma_maps),
+            model_phi=_freeze_tensor(
+                self._resolve_model_frame(token_ids, capture["out"].phi)),
             trace_states=tuple(_freeze_belief(belief) for belief in trace["beliefs"]),
             trace_free_energy=_freeze_tensor(trace_free_energy),
             s_belief=(None if s_belief is None else (
@@ -2312,6 +2356,7 @@ class VFEModel(nn.Module):
             belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
                                  omega=enc.omega[0] if enc.omega is not None else None,
                                  reflection=enc.reflection[0] if enc.reflection is not None else None)
+            initial_model_phi = self._resolve_model_frame(token_ids[:1], belief.phi.unsqueeze(0))
             s_belief = self._refined_s_belief(token_ids)
             if s_belief is not None:
                 belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
@@ -2319,10 +2364,13 @@ class VFEModel(nn.Module):
             log_prior = self._attention_log_prior(n, token_ids.device)
             log_prior = self._fold_precision_bias(log_prior, belief.sigma)
             if self.cfg.gamma_as_beta_prior:
+                tied_model_frame = cfg.s_frame_mode == "tied"
                 log_prior = self._fold_gamma_prior(
-                    log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                    omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
-                    reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None,
+                    log_prior, token_ids[:1], initial_model_phi,
+                    omega=(belief.omega.unsqueeze(0)
+                           if tied_model_frame and belief.omega is not None else None),
+                    reflection=(belief.reflection.unsqueeze(0)
+                                if tied_model_frame and belief.reflection is not None else None),
                     s_belief=s_belief)[0]
             rope = self._rope_rotation(n, token_ids.device)
             cap: dict = {}
@@ -2458,10 +2506,16 @@ class VFEModel(nn.Module):
             d["hyper_prior_weighted"] = _hp_weighted                                      # EXACT contribution folded into total (state_dependent != cfg.lambda_h*raw); the F-decomposition figure reads this
             d["total"] += _hp_weighted
         if cfg.lambda_gamma > 0.0 or cfg.s_e_step:                  # gamma block evaluated at out.phi
+            tied_model_frame = cfg.s_frame_mode == "tied"
+            gamma_model_phi = (self._resolve_model_frame(token_ids[:1], out.phi.unsqueeze(0))
+                               if snapshot is None else snapshot.model_phi)
             g = self._gamma_coupling_terms(
-                token_ids[:1], out.phi.unsqueeze(0),
-                omega=out.omega.unsqueeze(0) if out.omega is not None else None,
-                reflection=out.reflection.unsqueeze(0) if out.reflection is not None else None, s_belief=s_belief)
+                token_ids[:1], gamma_model_phi,
+                omega=(out.omega.unsqueeze(0)
+                       if tied_model_frame and out.omega is not None else None),
+                reflection=(out.reflection.unsqueeze(0)
+                            if tied_model_frame and out.reflection is not None else None),
+                s_belief=s_belief)
             d["gamma_coupling"]     = float(g["coupling"])           # raw sum_{h,i,j} gamma E^s
             d["gamma_meta_entropy"] = float(g["meta_entropy"])       # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
             d["total"] += cfg.lambda_gamma * (d["gamma_coupling"] + d["gamma_meta_entropy"])
@@ -2666,6 +2720,7 @@ class VFEModel(nn.Module):
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
                              omega=enc.omega[0] if enc.omega is not None else None,   # carry the GL(K) frame under omega_direct
                              reflection=enc.reflection[0] if enc.reflection is not None else None)   # carry the phi-path reflection sign
+        model_phi = self._resolve_model_frame(token_ids[:1], belief.phi.unsqueeze(0))
         n = belief.mu.shape[0]
         rope = self._rope_rotation(n, token_ids.device)
         s_belief = None
@@ -2673,15 +2728,18 @@ class VFEModel(nn.Module):
             # Live model channel (audit 2026-06-09 IE1): refine s and anchor the replayed belief
             # (q0 AND the handoff prior below) to it, exactly as forward/diagnostics do, so the
             # figure attention replays the model that actually trained.
-            s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0), rope=rope)
+            s_mu1, s_sigma1 = self._refine_s(token_ids[:1], model_phi, rope=rope)
             s_belief = (s_mu1, s_sigma1)
             belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
         log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
         log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
         if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
-            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
-                                               reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None,
+            tied_model_frame = cfg.s_frame_mode == "tied"
+            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], model_phi,
+                                               omega=(belief.omega.unsqueeze(0)
+                                                      if tied_model_frame and belief.omega is not None else None),
+                                               reflection=(belief.reflection.unsqueeze(0)
+                                                           if tied_model_frame and belief.reflection is not None else None),
                                                s_belief=s_belief)[0]
         fam = get_family(cfg.family)
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
@@ -2794,20 +2852,24 @@ class VFEModel(nn.Module):
             belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
                                  omega=enc.omega[0] if enc.omega is not None else None,
                                  reflection=enc.reflection[0] if enc.reflection is not None else None)
+            model_phi = self._resolve_model_frame(token_ids[:1], belief.phi.unsqueeze(0))
             n = belief.mu.shape[0]
             rope = self._rope_rotation(n, token_ids.device)
             s_belief = None
             if cfg.s_e_step:
-                s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0), rope=rope)
+                s_mu1, s_sigma1 = self._refine_s(token_ids[:1], model_phi, rope=rope)
                 s_belief = (s_mu1, s_sigma1)
                 belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
             log_prior = self._attention_log_prior(n, token_ids.device)
             log_prior = self._fold_precision_bias(log_prior, belief.sigma)
             if self.cfg.gamma_as_beta_prior:
+                tied_model_frame = cfg.s_frame_mode == "tied"
                 log_prior = self._fold_gamma_prior(
-                    log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                    omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
-                    reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None,
+                    log_prior, token_ids[:1], model_phi,
+                    omega=(belief.omega.unsqueeze(0)
+                           if tied_model_frame and belief.omega is not None else None),
+                    reflection=(belief.reflection.unsqueeze(0)
+                                if tied_model_frame and belief.reflection is not None else None),
                     s_belief=s_belief)[0]
         else:
             snapshot = self._validate_diagnostic_snapshot(token_ids, snapshot)

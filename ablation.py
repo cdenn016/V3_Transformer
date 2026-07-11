@@ -1188,6 +1188,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "model-channel gauge frame: tied belief phi vs independent phi_tilde",
         "param": "s_frame_mode", "values": ["tied", "phi_tilde"],
         "requires": {
+            "gauge_parameterization": "phi",
+            "phi_reflection": "off",
+            "pos_rotation": "none",
             "s_e_step": True,
             "prior_source": "model_channel",
             "share_refine_s_transport": False,
@@ -1199,6 +1202,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "m_s_phi_lr", "values": [0.004, 0.008, 0.016, 0.032],
         "requires": {
             "s_frame_mode": "phi_tilde",
+            "gauge_parameterization": "phi",
+            "phi_reflection": "off",
+            "pos_rotation": "none",
             "s_e_step": True,
             "prior_source": "model_channel",
             "share_refine_s_transport": False,

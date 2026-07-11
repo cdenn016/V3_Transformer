@@ -828,10 +828,12 @@ class VFE3Config:
             self.pos_phi   = "none"
             self.e_phi_lr  = 0.0
             self.m_phi_lr  = 0.0
+            self.m_s_phi_lr = 0.0
             import warnings
             warnings.warn(
                 "gauge_transport='off': forcing the gauge frame to the identity (phi_scale=0.0, "
-                "pos_phi='none', e_phi_lr=0.0, m_phi_lr=0.0), so Omega_ij=I for all i,j.",
+                "pos_phi='none', e_phi_lr=0.0, m_phi_lr=0.0, m_s_phi_lr=0.0), so "
+                "both channel transports are identity and frozen.",
                 UserWarning, stacklevel=2,
             )
         elif self.gauge_transport == "frozen":
@@ -850,10 +852,12 @@ class VFE3Config:
                 )
             self.e_phi_lr = 0.0
             self.m_phi_lr = 0.0
+            self.m_s_phi_lr = 0.0
             import warnings
             warnings.warn(
                 f"gauge_transport='frozen': freezing the random gauge frame at init "
-                f"(phi_scale={self.phi_scale}, e_phi_lr=0.0, m_phi_lr=0.0); Omega is fixed, not learned.",
+                f"(phi_scale={self.phi_scale}, e_phi_lr=0.0, m_phi_lr=0.0, m_s_phi_lr=0.0); "
+                "both channel frames are fixed, not learned.",
                 UserWarning, stacklevel=2,
             )
 
