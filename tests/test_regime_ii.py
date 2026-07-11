@@ -166,11 +166,13 @@ def test_model_init_flat_equals_flat_forward():
 
     torch.manual_seed(0)
     flat_model = VFEModel(_tiny_cfg(transport_mode="flat"))
-    logits_flat, loss_flat, _ = flat_model(tokens, targets)
+    logits_flat = flat_model(tokens)
+    _, loss_flat, _ = flat_model(tokens, targets)
 
     torch.manual_seed(0)
     r2_model = VFEModel(_tiny_cfg(transport_mode="regime_ii"))
-    logits_r2, loss_r2, _ = r2_model(tokens, targets)
+    logits_r2 = r2_model(tokens)
+    _, loss_r2, _ = r2_model(tokens, targets)
 
     assert torch.allclose(logits_flat, logits_r2, atol=1e-6, rtol=0.0)
     assert torch.allclose(loss_flat, loss_r2, atol=1e-6, rtol=0.0)
