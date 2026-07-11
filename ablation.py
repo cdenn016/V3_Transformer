@@ -643,6 +643,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # entropy term; __post_init__ does not auto-enable the oracle for entropy=False).
         "description": "attention-entropy canonical vs surrogate, kappa in {1.0, 0.25}, on the oracle [C1/EXP-4]",
         "collect_diagnostics": True,
+        "requires": {"e_step_update": "gradient"},
         "seeds": [6, 64, 23],                                # I1: across-seed error bar (esp. the low-kappa gap)
         "configs": [
             {"label": "canon_k1.0",  "include_attention_entropy": True,  "oracle_unroll_grad": True, "kappa_beta": 1.0},
@@ -659,6 +660,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # full-cov certificate -- ~eps for the tied arm, climbing for the untied one.
         "description": "tied (exact) vs untied (head-mixer drift) gauge equivariance, full cov [A2/EXP-9]",
         "collect_diagnostics": True,
+        "requires": {"e_step_update": "gradient"},
         # s_e_step=False: the live model-channel E-step is diagonal-only (s/r tables are diagonal by
         # construction) and rejects family='gaussian_full', which EXP-9 requires (the covariance break
         # only shows under the full-cov mixer; the diagonal closed form is equivariant under diagonal
@@ -823,6 +825,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # ||connection|| trainability scatter (_plot_holonomy_trainability). Opt-in, equivariance-
         # breaking at nonzero W (default OFF; user-accepted -- see CLAUDE.md exception (3)).
         "description": "Regime-II connection: flat vs learned; holonomy vs ||connection|| trainability [A4/EXP-15]",
+        "requires": {"e_step_update": "gradient"},
         "configs": [
             {"label": "flat",      "transport_mode": "flat"},
             {"label": "regime_ii", "transport_mode": "regime_ii"},
@@ -871,7 +874,11 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # saturation; the figure measures offset extrapolation, not the bucket horizon).
         "description": "positional extrapolation: offset (alibi/t5) vs absolute (learned/rope), eval @ growing N [H1/EXP-13]",
         "collect_extrapolation": True,
-        "requires": {"oracle_unroll_grad": True, "max_seq_len": 128},
+        "requires": {
+            "oracle_unroll_grad": True,
+            "max_seq_len":        128,
+            "e_step_update":      "gradient",
+        },
         "configs": [
             {"label": "alibi",   "beta_attention_prior": "causal_alibi",
              "pos_phi": "none",    "pos_rotation": "none"},
