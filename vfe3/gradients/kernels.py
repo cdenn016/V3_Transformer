@@ -16,8 +16,8 @@ from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
 from vfe3.families.base import get_family
 from vfe3.families.gaussian import diag_kl_unclamped, diag_kl_unclamped_per_coord
 from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence_for_alpha
-from vfe3.geometry.transport import (CompactFactoredTransport, FactoredTransport, RopeTransport,
-                                      transport_covariance, transport_mean)
+from vfe3.geometry.transport import (CompactFactoredTransport, DirectLinkTransport, FactoredTransport,
+                                      RopeTransport, transport_covariance, transport_mean)
 from vfe3.gradients.oracle import belief_gradients_autograd
 
 _KERNELS: Dict[str, Callable] = {}
@@ -292,7 +292,7 @@ def belief_gradients(
     sigma:        torch.Tensor,           # (N, K)
     mu_p:         torch.Tensor,           # (N, K)
     sigma_p:      torch.Tensor,           # (N, K)
-    omega:        'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None',
+    omega:        'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None',
 
     *,
     tau:          'float | torch.Tensor' = 1.0,
@@ -407,7 +407,7 @@ def mm_exact_update(
     sigma:        torch.Tensor,           # (N, K) or (B, N, K) belief variances (live)
     mu_p:         torch.Tensor,           # (N, K) or (B, N, K) prior means
     sigma_p:      torch.Tensor,           # (N, K) or (B, N, K) prior variances
-    omega:        'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
+    omega:        'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport',
 
     *,
     tau:          'float | torch.Tensor' = 1.0,

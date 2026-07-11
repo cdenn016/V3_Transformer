@@ -18,8 +18,10 @@ exponentiated after a self-edge mask + embedded-matrix Frobenius soft cap:
     The co-transforming vertex frames carry the whole conjugation and the constant
     middle factor is insulated, so it IS EXACTLY gauge-covariant for ANY constant A
     (Omega_ij -> g_i Omega_ij g_j^{-1}). Belief-independent (kernel-eligible). Its A=0
-    limit is the Regime-I flat cocycle exp(phi_i)exp(-phi_j). Returns a genuinely
-    batched (B,N,N,K,K) Omega (exp_phi is per-sequence).
+    limit is the Regime-I flat cocycle exp(phi_i)exp(-phi_j). Forward inference
+    retains the per-sequence vertex factors around the shared edge table and does
+    not materialize a batched pairwise Omega; direct registry callers may request
+    that dense compatibility representation explicitly.
 """
 
 import math
@@ -176,7 +178,7 @@ def test_regime_ii_link_is_frame_independent_and_breaks_covariance():
 # --- charted regime_ii_link_charted: exact covariance, flat-cocycle A=0 limit, non-flat ------
 
 def test_regime_ii_link_charted_dict_shape_is_batched():
-    """The charted sandwich returns a genuinely batched (B,N,N,K,K) Omega (exp_phi is per-sequence)."""
+    """A direct registry caller receives the explicit batched compatibility representation."""
     phi, connection_l, grp = _inputs(seed=10, B=2, N=4)
     K = grp.generators.shape[-1]
     out = get_transport("regime_ii_link_charted")(phi, grp, connection_L=connection_l, link_alpha=1.0)
@@ -537,19 +539,211 @@ def test_converged_state_omega_reflects_connection_l():
 
 # --- numerical / performance guardrails (D3 memory, AMP) -------------------------------------
 
+@pytest.mark.parametrize("mode", ["regime_ii_link", "regime_ii_link_charted"])
+def test_direct_link_factored_mean_matches_dense_reference(mode):
+    from vfe3.geometry.transport import DirectLinkTransport, transport_mean
+    from vfe3.inference.e_step import build_belief_transport
+
+    phi, connection_l, grp = _inputs(seed=19, B=2, N=4)
+    mu = torch.randn(2, 4, grp.generators.shape[-1], generator=torch.Generator().manual_seed(190))
+    factored = build_belief_transport(
+        phi,
+        grp,
+        transport_mode=mode,
+        connection_L=connection_l,
+        link_alpha=1.0,
+    )
+
+    assert isinstance(factored, DirectLinkTransport)
+    dense = factored.to_dense_omega()
+    assert torch.allclose(
+        transport_mean(factored, mu),
+        transport_mean(dense, mu),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("mode", ["regime_ii_link", "regime_ii_link_charted"])
+def test_direct_link_factored_diagonal_covariance_matches_dense_reference(mode):
+    from vfe3.geometry.transport import DirectLinkTransport, transport_covariance
+    from vfe3.inference.e_step import build_belief_transport
+
+    phi, connection_l, grp = _inputs(seed=20, B=2, N=4)
+    sigma = torch.rand(2, 4, grp.generators.shape[-1], generator=torch.Generator().manual_seed(200)) + 0.5
+    factored = build_belief_transport(
+        phi,
+        grp,
+        transport_mode=mode,
+        connection_L=connection_l,
+        link_alpha=1.0,
+    )
+
+    assert isinstance(factored, DirectLinkTransport)
+    dense = factored.to_dense_omega()
+    assert torch.allclose(
+        transport_covariance(factored, sigma, diagonal_out=True),
+        transport_covariance(dense, sigma, diagonal_out=True),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("mode", ["regime_ii_link", "regime_ii_link_charted"])
+def test_direct_link_factored_full_covariance_matches_dense_reference(mode):
+    from vfe3.geometry.transport import DirectLinkTransport, transport_covariance
+    from vfe3.inference.e_step import build_belief_transport
+
+    phi, connection_l, grp = _inputs(seed=21, B=2, N=4)
+    K = grp.generators.shape[-1]
+    raw = torch.randn(2, 4, K, K, generator=torch.Generator().manual_seed(210))
+    sigma = raw @ raw.transpose(-1, -2) + 0.25 * torch.eye(K)
+    factored = build_belief_transport(
+        phi,
+        grp,
+        transport_mode=mode,
+        connection_L=connection_l,
+        link_alpha=1.0,
+    )
+
+    assert isinstance(factored, DirectLinkTransport)
+    dense = factored.to_dense_omega()
+    assert torch.allclose(
+        transport_covariance(factored, sigma, diagonal_out=False),
+        transport_covariance(dense, sigma, diagonal_out=False),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_charted_direct_link_does_not_materialize_dense_pair_transport(monkeypatch):
+    from vfe3.geometry.transport import DirectLinkTransport, transport_covariance, transport_mean
+    from vfe3.inference.e_step import build_belief_transport
+
+    phi, connection_l, grp = _inputs(seed=22, B=2, N=4)
+    K = grp.generators.shape[-1]
+    mu = torch.randn(2, 4, K, generator=torch.Generator().manual_seed(220))
+    sigma_diag = torch.rand(2, 4, K, generator=torch.Generator().manual_seed(221)) + 0.5
+    raw = torch.randn(2, 4, K, K, generator=torch.Generator().manual_seed(222))
+    sigma_full = raw @ raw.transpose(-1, -2) + 0.25 * torch.eye(K)
+
+    def _forbid_dense(_self):
+        raise AssertionError("charted E-step transport materialized dense pairwise Omega")
+
+    monkeypatch.setattr(DirectLinkTransport, "to_dense_omega", _forbid_dense)
+    factored = build_belief_transport(
+        phi,
+        grp,
+        transport_mode="regime_ii_link_charted",
+        connection_L=connection_l,
+        link_alpha=1.0,
+    )
+
+    assert isinstance(factored, DirectLinkTransport)
+    transport_mean(factored, mu)
+    transport_covariance(factored, sigma_diag, diagonal_out=True)
+    transport_covariance(factored, sigma_full, diagonal_out=False)
+
+
+def test_bare_direct_link_skips_vertex_exponentials(monkeypatch):
+    from vfe3.geometry import transport
+    from vfe3.inference.e_step import build_belief_transport
+
+    phi, connection_l, grp = _inputs(seed=23, B=3, N=4)
+
+    def _forbid_vertex_build(*args, **kwargs):
+        raise AssertionError("bare direct link built unused vertex exponentials")
+
+    monkeypatch.setattr(transport, "build_factored_transport", _forbid_vertex_build)
+    factored = build_belief_transport(
+        phi,
+        grp,
+        transport_mode="regime_ii_link",
+        connection_L=connection_l,
+        link_alpha=1.0,
+    )
+
+    assert isinstance(factored, transport.DirectLinkTransport)
+    assert factored.exp_phi is None
+    assert factored.exp_neg_phi is None
+    assert factored.exp_link.shape == (4, 4, grp.generators.shape[-1], grp.generators.shape[-1])
+
+
+@pytest.mark.parametrize("mode", ["regime_ii_link", "regime_ii_link_charted"])
+def test_direct_link_factored_preserves_reflection_and_rope(mode, monkeypatch):
+    from vfe3.geometry.transport import DirectLinkTransport, RopeTransport, transport_covariance, transport_mean
+    from vfe3.inference.e_step import build_belief_transport
+
+    phi, connection_l, grp = _inputs(seed=24, B=2, N=4)
+    K = grp.generators.shape[-1]
+    reflection = torch.tensor([[1.0, -1.0, 1.0, -1.0], [-1.0, 1.0, -1.0, 1.0]])
+    theta = 0.35
+    rope = torch.eye(K).expand(4, K, K).clone()
+    rope[:, 0, 0] = math.cos(theta)
+    rope[:, 0, 1] = -math.sin(theta)
+    rope[:, 1, 0] = math.sin(theta)
+    rope[:, 1, 1] = math.cos(theta)
+    mu = torch.randn(2, 4, K, generator=torch.Generator().manual_seed(240))
+    sigma_diag = torch.rand(2, 4, K, generator=torch.Generator().manual_seed(242)) + 0.5
+    raw = torch.randn(2, 4, K, K, generator=torch.Generator().manual_seed(241))
+    sigma = raw @ raw.transpose(-1, -2) + 0.25 * torch.eye(K)
+
+    wrapped = build_belief_transport(
+        phi,
+        grp,
+        transport_mode=mode,
+        connection_L=connection_l,
+        link_alpha=1.0,
+        reflection=reflection,
+        rope=rope,
+        rope_on_cov=True,
+    )
+
+    assert isinstance(wrapped, RopeTransport)
+    assert isinstance(wrapped.base, DirectLinkTransport)
+    dense_base = wrapped.base.to_dense_omega()
+    dense_rope = torch.einsum("ikl,...ijlm,jnm->...ijkn", rope, dense_base, rope)
+
+    def _forbid_dense(_self):
+        raise AssertionError("RoPE/reflection direct-link path materialized dense pairwise Omega")
+
+    monkeypatch.setattr(DirectLinkTransport, "to_dense_omega", _forbid_dense)
+    assert torch.allclose(
+        transport_mean(wrapped, mu),
+        transport_mean(dense_rope, mu),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        transport_covariance(wrapped, sigma_diag, diagonal_out=True),
+        transport_covariance(dense_rope, sigma_diag, diagonal_out=True),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        transport_covariance(wrapped, sigma, diagonal_out=False),
+        transport_covariance(dense_rope, sigma, diagonal_out=False),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
 def test_regime_ii_link_build_belief_transport_is_batch_collapsed():
-    """The D3 collapse is realized end-to-end: build_belief_transport returns the bare link at
-    logical (N,N,K,K) for a batched phi, NOT a materialized (B,N,N,K,K)."""
+    """The D3 collapse is realized end-to-end without a batched or pairwise compatibility copy."""
+    from vfe3.geometry.transport import DirectLinkTransport
     from vfe3.inference.e_step import build_belief_transport
     phi, connection_l, grp = _inputs(seed=20, B=8, N=4)
     K = grp.generators.shape[-1]
     omega = build_belief_transport(phi, grp, transport_mode="regime_ii_link",
                                    connection_L=connection_l, link_alpha=1.0)
-    assert omega.shape == (4, 4, K, K)                                   # NOT (8,4,4,K,K)
+    assert isinstance(omega, DirectLinkTransport)
+    assert omega.exp_phi is None and omega.exp_neg_phi is None
+    assert omega.exp_link.shape == (4, 4, K, K)                           # NOT (8,4,4,K,K)
+    assert omega.to_dense_omega().shape == (4, 4, K, K)                   # explicit compatibility only
 
 
 def test_direct_link_dense_bytes_estimator():
-    """The dense (B,N,N,K,K) byte estimate (the cost the bare-link collapse avoids)."""
+    """The dense (B,N,N,K,K) byte estimate is the compatibility cost both factored links avoid."""
     from vfe3.geometry.transport import _direct_link_dense_bytes
     assert _direct_link_dense_bytes(64, 128, 64, torch.float32) == 64 * 128 * 128 * 64 * 64 * 4
 

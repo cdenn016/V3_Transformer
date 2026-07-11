@@ -1,6 +1,9 @@
 import csv
+import gc
 import logging
 import math
+import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -40,6 +43,124 @@ def test_phi_clamp_monitor_threshold_matches_transport_clamp():
     monitor_thr = inspect.signature(_warn_phi_transport_clamp).parameters["max_norm"].default
     clamp_thr   = inspect.signature(stable_matrix_exp_pair).parameters["max_norm"].default
     assert monitor_thr == clamp_thr, f"monitor trips at {monitor_thr}, clamp fires at {clamp_thr}"
+
+
+def test_phi_clamp_monitor_reuses_cached_gram(monkeypatch):
+    import vfe3.train as train_module
+
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4)
+    model = VFEModel(cfg)
+    calls = []
+    real_einsum = torch.einsum
+
+    def _counted_einsum(equation, *operands, **kwargs):
+        if equation == "aij,bij->ab":
+            calls.append(equation)
+        return real_einsum(equation, *operands, **kwargs)
+
+    train_module._PHI_CLAMP_WARNED = False
+    train_module._PHI_CLAMP_GRAM_CACHE.clear()
+    monkeypatch.setattr(torch, "einsum", _counted_einsum)
+
+    train_module._warn_phi_transport_clamp(model)
+    train_module._warn_phi_transport_clamp(model)
+
+    assert calls == ["aij,bij->ab"]
+
+
+def test_phi_clamp_monitor_invalidates_cached_gram_on_generator_version(monkeypatch):
+    import vfe3.train as train_module
+
+    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4)
+    model = VFEModel(cfg)
+    calls = []
+    real_einsum = torch.einsum
+
+    def _counted_einsum(equation, *operands, **kwargs):
+        if equation == "aij,bij->ab":
+            calls.append(equation)
+        return real_einsum(equation, *operands, **kwargs)
+
+    train_module._PHI_CLAMP_WARNED = False
+    train_module._PHI_CLAMP_GRAM_CACHE.clear()
+    monkeypatch.setattr(torch, "einsum", _counted_einsum)
+
+    train_module._warn_phi_transport_clamp(model)
+    with torch.no_grad():
+        model.group.generators.add_(0.0)              # value-stable mutation still increments _version
+    train_module._warn_phi_transport_clamp(model)
+
+    assert calls == ["aij,bij->ab", "aij,bij->ab"]
+
+
+def test_phi_clamp_gram_cache_uses_full_metadata_key_without_value_reads():
+    from vfe3.train import _phi_clamp_gram_key
+
+    class _MetadataOnlyGenerator:
+        shape = (3, 4, 4)
+        device = torch.device("cuda")
+        dtype = torch.float32
+        _version = 7
+
+        def item(self):
+            raise AssertionError("cache key read CUDA tensor data")
+
+        def cpu(self):
+            raise AssertionError("cache key copied CUDA tensor data to the host")
+
+        def tolist(self):
+            raise AssertionError("cache key copied CUDA tensor data to the host")
+
+        def __bool__(self):
+            raise AssertionError("cache key synchronized through tensor truthiness")
+
+    generators = _MetadataOnlyGenerator()
+    key = _phi_clamp_gram_key(generators)
+
+    assert key == (
+        id(generators),
+        (3, 4, 4),
+        torch.device("cuda"),
+        torch.float32,
+        7,
+    )
+
+
+def test_phi_clamp_gram_cache_stores_detached_tensor():
+    import vfe3.train as train_module
+
+    generators = torch.randn(2, 2, 2, requires_grad=True)
+    train_module._PHI_CLAMP_GRAM_CACHE.clear()
+
+    gram = train_module._cached_phi_clamp_gram(generators)
+
+    assert gram.requires_grad is False
+    assert gram.grad_fn is None
+    train_module._PHI_CLAMP_GRAM_CACHE.clear()
+
+
+def test_phi_clamp_gram_cache_weakref_cleanup():
+    import vfe3.train as train_module
+
+    generators = torch.zeros(2, 2, 2)
+    model = SimpleNamespace(
+        group=SimpleNamespace(generators=generators),
+        prior_bank=SimpleNamespace(phi_embed=None),
+        pos_phi_free=None,
+    )
+    train_module._PHI_CLAMP_WARNED = False
+    train_module._PHI_CLAMP_GRAM_CACHE.clear()
+
+    train_module._warn_phi_transport_clamp(model)
+    generator_ref = weakref.ref(generators)
+    assert train_module._PHI_CLAMP_GRAM_CACHE
+
+    del model
+    del generators
+    gc.collect()
+
+    assert generator_ref() is None
+    assert train_module._PHI_CLAMP_GRAM_CACHE == {}
 
 
 def test_parameter_report_leaves_global_rng_untouched():

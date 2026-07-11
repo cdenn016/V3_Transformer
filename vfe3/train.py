@@ -15,6 +15,7 @@ import contextlib
 import logging
 import math
 import time
+import weakref
 from numbers import Real
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -43,6 +44,46 @@ from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source f
 
 
 _PHI_CLAMP_WARNED: bool = False
+_PhiClampGramKey = Tuple[int, Tuple[int, ...], torch.device, torch.dtype, int]
+_PHI_CLAMP_GRAM_CACHE: Dict[
+    _PhiClampGramKey,
+    Tuple[weakref.ReferenceType, torch.Tensor],
+] = {}
+
+
+def _phi_clamp_gram_key(generators: torch.Tensor) -> _PhiClampGramKey:
+    r"""Metadata-only cache key; reads no tensor value and causes no CUDA host synchronization."""
+    return (
+        id(generators),
+        tuple(generators.shape),
+        generators.device,
+        generators.dtype,
+        generators._version,
+    )
+
+
+def _cached_phi_clamp_gram(generators: torch.Tensor) -> torch.Tensor:
+    r"""Reuse ``tr(G_a^T G_b)`` until the generator object or its metadata/version changes."""
+    key = _phi_clamp_gram_key(generators)
+    identity = key[0]
+    for stale_key, (generator_ref, _gram) in list(_PHI_CLAMP_GRAM_CACHE.items()):
+        if stale_key[0] == identity and (
+                stale_key != key or generator_ref() is not generators):
+            _PHI_CLAMP_GRAM_CACHE.pop(stale_key, None)
+
+    cached = _PHI_CLAMP_GRAM_CACHE.get(key)
+    if cached is not None and cached[0]() is generators:
+        return cached[1]
+
+    gram = torch.einsum("aij,bij->ab", generators, generators).detach()
+
+    def _cleanup(dead_ref: weakref.ReferenceType) -> None:
+        for cached_key, (generator_ref, _cached_gram) in list(_PHI_CLAMP_GRAM_CACHE.items()):
+            if cached_key[0] == identity and generator_ref is dead_ref:
+                _PHI_CLAMP_GRAM_CACHE.pop(cached_key, None)
+
+    _PHI_CLAMP_GRAM_CACHE[key] = (weakref.ref(generators, _cleanup), gram)
+    return gram
 
 
 def _warn_phi_transport_clamp(
@@ -52,7 +93,8 @@ def _warn_phi_transport_clamp(
 ) -> None:
     r"""Warn ONCE when a gauge-frame table's embedded Frobenius norm exceeds the transport clamp.
 
-    ``stable_matrix_exp_pair`` rescales any ``||M||_F > max_norm`` (default 15) and returns the
+    ``stable_matrix_exp_pair`` rescales any ``||M||_F > max_norm`` (the shared transport-clamp
+    default) and returns the
     surrogate ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)``; its per-call monitor is opt-in because
     it costs a host sync on the E-step hot path. The M-step, however, steps ``phi_embed`` /
     ``pos_phi_free`` with NO trust region (``GaugeNaturalGradAdamW`` / plain AdamW), so a drifting
@@ -68,7 +110,7 @@ def _warn_phi_transport_clamp(
     tables = [("phi_embed", getattr(model.prior_bank, "phi_embed", None)),
               ("pos_phi_free", getattr(model, "pos_phi_free", None))]
     with torch.no_grad():
-        gram = torch.einsum("aij,bij->ab", gen, gen)   # (n_gen, n_gen) = tr(G_a^T G_b)
+        gram = _cached_phi_clamp_gram(gen)              # (n_gen, n_gen) = tr(G_a^T G_b)
         for name, tab in tables:
             if tab is None:
                 continue

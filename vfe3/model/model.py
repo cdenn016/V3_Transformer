@@ -26,7 +26,7 @@ from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.geometry.norms import get_norm
 from vfe3.geometry.rope import get_pos_rotation
-from vfe3.geometry.transport import (CompactFactoredTransport, FactoredTransport, RopeTransport,
+from vfe3.geometry.transport import (CompactFactoredTransport, DirectLinkTransport, FactoredTransport, RopeTransport,
                                      _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA)
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import _as_coeff, vfe_block
@@ -665,7 +665,7 @@ class VFEModel(nn.Module):
         *,
         e_step_gradient:    str                    = "unroll",
         rope:               Optional[torch.Tensor] = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
-        prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,
+        prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,
     ) -> 'tuple[torch.Tensor, torch.Tensor]':
         r"""Refine the model channel s by its own E-step toward the frozen hyper-prior r plus the
         gamma model-consensus, with the shared gauge frame phi0 held fixed (e_phi_lr=0). Returns the

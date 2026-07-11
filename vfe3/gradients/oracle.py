@@ -21,12 +21,13 @@ import torch
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.families.base import get_family
 from vfe3.free_energy import free_energy, pairwise_energy, self_divergence_for_alpha
-# FactoredTransport / RopeTransport are named in the `omega` forward-ref annotation below; import
-# them at runtime (alongside the transport helpers this module already imports) so
+# Forward transport containers are named in the `omega` forward-ref annotation below; import them
+# at runtime (alongside the transport helpers this module already imports) so
 # typing.get_type_hints resolves the annotation. transport.py does not import this module, so there
 # is no import cycle.
 from vfe3.geometry.transport import (
     CompactFactoredTransport,
+    DirectLinkTransport,
     FactoredTransport,
     RopeTransport,
     transport_covariance,
@@ -54,7 +55,7 @@ def belief_gradients_autograd(
     sigma:        torch.Tensor,           # (N, K) belief variances
     mu_p:         torch.Tensor,           # (N, K) prior means
     sigma_p:      torch.Tensor,           # (N, K) prior variances
-    omega:        'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
+    omega:        'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport',
 
     *,
     tau:           'float | torch.Tensor' = 1.0,
@@ -79,7 +80,7 @@ def belief_gradients_autograd(
     irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
     omega_builder:             Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-                                                 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport']] = None,
+                                                 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport']] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:   # (grad_mu, grad_sigma), each (N, K)
     r"""Autograd of canonical F_red w.r.t. (mu, sigma). See module docstring for modes.
 

@@ -18,9 +18,6 @@ from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement, _equal_diag_blocks
 from vfe3.numerics import safe_cholesky
 
-TransportDict = Dict[str, torch.Tensor]
-
-
 @dataclass
 class FactoredTransport:
     r"""The flat phi-cocycle transport in FACTORED form: the per-token (B, N, K, K) vertex
@@ -56,6 +53,61 @@ class FactoredTransport:
         via the leading ellipsis (an optional batch axis flows through; the unbatched call matches).
         """
         return torch.einsum("...ikl,...jlm->...ijkm", self.exp_phi, self.exp_neg_phi)
+
+
+@dataclass
+class DirectLinkTransport:
+    r"""Direct edge transport with an optional live vertex chart, never a dense pairwise product.
+
+    ``exp_link`` is the batch-independent edge factor ``L_ij`` with shape ``(N, N, K, K)``.
+    The bare link stores no vertex factors. The charted link stores ``exp_phi_i`` and
+    ``exp_neg_phi_j`` so consumers contract
+
+        Omega_ij = exp_phi_i L_ij exp_neg_phi_j
+
+    directly into means and covariances. :meth:`to_dense_omega` is the explicit compatibility
+    boundary for diagnostics and legacy registry callers that genuinely require ``Omega``.
+    """
+
+    exp_link:     torch.Tensor
+    exp_phi:      Optional[torch.Tensor] = None
+    exp_neg_phi:  Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        if self.exp_link.dim() != 4 or self.exp_link.shape[-1] != self.exp_link.shape[-2]:
+            raise ValueError(
+                "direct-link edge factors must have (Nq, Nk, K, K) square-matrix layout, got "
+                f"{tuple(self.exp_link.shape)}")
+        if (self.exp_phi is None) != (self.exp_neg_phi is None):
+            raise ValueError("charted direct-link transport requires both vertex factors or neither")
+        if self.exp_phi is None:
+            return
+        compatible = (
+            self.exp_phi.dim() >= 3
+            and self.exp_neg_phi.dim() == self.exp_phi.dim()
+            and self.exp_phi.shape[:-3] == self.exp_neg_phi.shape[:-3]
+            and self.exp_phi.shape[-2] == self.exp_phi.shape[-1]
+            and self.exp_neg_phi.shape[-2] == self.exp_neg_phi.shape[-1]
+            and self.exp_phi.shape[-1] == self.exp_link.shape[-1]
+            and self.exp_neg_phi.shape[-1] == self.exp_link.shape[-1]
+            and self.exp_phi.shape[-3] == self.exp_link.shape[-4]
+            and self.exp_neg_phi.shape[-3] == self.exp_link.shape[-3]
+        )
+        if not compatible:
+            raise ValueError(
+                "charted direct-link vertex factors must match the edge token and matrix axes, got "
+                f"link={tuple(self.exp_link.shape)}, exp_phi={tuple(self.exp_phi.shape)}, "
+                f"exp_neg_phi={tuple(self.exp_neg_phi.shape)}")
+
+    def to_dense_omega(self) -> torch.Tensor:
+        r"""Materialize ``Omega_ij`` only for an explicit compatibility consumer."""
+        if self.exp_phi is None:
+            return self.exp_link
+        return torch.einsum(
+            "...ikl,ijlm,...jmn->...ijkn", self.exp_phi, self.exp_link, self.exp_neg_phi)
+
+
+TransportDict = Dict[str, 'torch.Tensor | DirectLinkTransport | None']
 
 
 @dataclass
@@ -167,13 +219,21 @@ class RopeTransport:
     honor the rotation (the score path); the value path transports on ``base`` directly.
     """
 
-    base:     'torch.Tensor | FactoredTransport | CompactFactoredTransport'  # dense OR factored transport
+    base:     'torch.Tensor | DirectLinkTransport | FactoredTransport | CompactFactoredTransport'
     rope:     torch.Tensor                        # (N, K, K) block-diagonal orthogonal rotation
     on_cov:   bool = False
     on_value: bool = True                         # False -> value aggregation uses the UN-rotated base (RoPE Q/K only)
 
     def __post_init__(self) -> None:
-        if isinstance(self.base, CompactFactoredTransport):
+        if isinstance(self.base, DirectLinkTransport):
+            if self.base.exp_phi is None:
+                n_query = self.base.exp_link.shape[-4]
+                n_key = self.base.exp_link.shape[-3]
+            else:
+                n_query = self.base.exp_phi.shape[-3]
+                n_key = self.base.exp_neg_phi.shape[-3]
+            K = self.base.exp_link.shape[-1]
+        elif isinstance(self.base, CompactFactoredTransport):
             n_query = self.base.exp_blocks.shape[-4]
             n_key = self.base.inv_blocks.shape[-4]
             K = self.base.K
@@ -224,13 +284,13 @@ class RopeTransport:
 
 
 def _rope_dense_omega(
-    base: 'torch.Tensor | FactoredTransport | CompactFactoredTransport',
+    base: 'torch.Tensor | DirectLinkTransport | FactoredTransport | CompactFactoredTransport',
     rope: torch.Tensor,
 ) -> torch.Tensor:
     r"""Effective dense Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T (full-gauge / dense path)."""
     omega = (
         base.to_dense_omega()
-        if isinstance(base, (FactoredTransport, CompactFactoredTransport)) else base
+        if isinstance(base, (DirectLinkTransport, FactoredTransport, CompactFactoredTransport)) else base
     )                                                                               # (...,N,N,K,K)
     # R_i Omega_ij R_j^T: contract R on the left of the i-axis output and the right (transposed) of j.
     rot = torch.einsum("...ikl,...ijlm,...jnm->...ijkn", rope, omega, rope)
@@ -831,6 +891,7 @@ def _build_regime_ii_link(
     link_alpha:         float                  = 1.0,
     link_soft_cap:      float                  = 6.0,
     clamp_monitor:      bool                   = False,  # opt-in: warn when the exp Frobenius clamp fires
+    materialize:        bool                   = True,   # compatibility callers may request explicit Omega
     connection_L:       Optional[torch.Tensor] = None,   # (max_seq_len, max_seq_len, n_gen) learned direct link (NN exception)
     **kwargs,                                            # tolerated (shares the flat builder's call shape)
 ) -> TransportDict:
@@ -851,17 +912,11 @@ def _build_regime_ii_link(
     ``I != g_i g_j^{-1}``. The EXACTLY covariant member is ``regime_ii_link_charted`` (the frame
     sandwich). A nonzero ``connection_L`` gives non-trivial triangle holonomy (curvature > 0).
 
-    BATCH-INDEPENDENT: ``Omega`` is a function of ``connection_L`` only, so the builder returns it at
-    logical ``(N, N, K, K)`` (NO batch axis) and ``transport_mean`` / ``transport_covariance`` broadcast
-    it across the batch -- the D3 memory collapse (a dense ``(B, N, N, K, K)`` would OOM at the stated
-    operating point). ``_transport`` reads the ``batch_independent`` registry flag to skip its
-    per-sequence ``[0]`` strip.
-
-    Returns the SAME dict keys as the flat builder: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K) (both
-    UNUSED for the bare link, kept for dict parity), 'Omega' (N,N,K,K).
+    BATCH-INDEPENDENT: the forward builder returns :class:`DirectLinkTransport` with only the
+    ``(N, N, K, K)`` edge factor. It never builds the unused vertex exponentials and broadcasts the
+    edge across the batch during contraction. ``materialize=True`` is the explicit registry-level
+    compatibility boundary; it returns the same logical ``(N, N, K, K)`` tensor without a batch copy.
     """
-    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
-    exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K), unused
     N = phi.shape[1]
     K = group.generators.shape[-1]
     device, dtype = phi.device, phi.dtype
@@ -870,12 +925,19 @@ def _build_regime_ii_link(
     # d Omega / d connection_L there is the generator structure (exp'(0)=I), so the generic path keeps
     # connection_L in the autograd graph (short-circuiting would freeze it at init).
     if connection_L is None or link_alpha == 0.0:
-        omega = torch.eye(K, device=device, dtype=dtype).expand(N, N, K, K).contiguous()
-        return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
-    omega = _direct_link_edge_exp(connection_L, group, N, link_alpha=link_alpha,
-                                  link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
-                                  device=device, dtype=dtype)                                # (N,N,K,K)
-    return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
+        exp_link = torch.eye(K, device=device, dtype=dtype).expand(N, N, K, K).contiguous()
+    else:
+        exp_link = _direct_link_edge_exp(
+            connection_L, group, N,
+            link_alpha=link_alpha,
+            link_soft_cap=link_soft_cap,
+            clamp_monitor=clamp_monitor,
+            device=device,
+            dtype=dtype,
+        )
+    direct = DirectLinkTransport(exp_link=exp_link)
+    omega = direct.to_dense_omega() if materialize else direct
+    return {"exp_phi": None, "exp_neg_phi": None, "Omega": omega}
 
 
 @register_transport("regime_ii_link_charted", covariance_class="covariant")
@@ -888,6 +950,7 @@ def _build_regime_ii_link_charted(
     link_alpha:         float                  = 1.0,
     link_soft_cap:      float                  = 6.0,
     clamp_monitor:      bool                   = False,  # opt-in: warn when the exp Frobenius clamp fires
+    materialize:        bool                   = True,   # compatibility callers may request explicit Omega
     connection_L:       Optional[torch.Tensor] = None,   # (max_seq_len, max_seq_len, n_gen) learned direct link (NN exception)
     **kwargs,                                            # tolerated (shares the flat builder's call shape)
 ) -> TransportDict:
@@ -904,38 +967,49 @@ def _build_regime_ii_link_charted(
     conjugation and the constant middle factor reads nothing, so there is nothing to break). This is
     the OPPOSITE of ``regime_ii``, whose middle factor ``mu_i^T W mu_j`` reads the transforming beliefs
     through a non-invariant bilinear. Belief-INDEPENDENT (no needs_mu/needs_sigma -> kernel-eligible),
-    but ``phi``-dependent (so it travels the dense, per-sequence path and is the more expensive of the
-    two link modes). Its ``A=0`` limit is the Regime-I flat cocycle ``exp(phi_i)exp(-phi_j)`` (NOT the
-    bare identity-link limit). Under ``gauge_mode='trivial'`` the vertex factors become identities but
-    the direct edge factor remains ``exp(link_alpha * A_ij . G)``. A nonzero ``connection_L`` gives
+    but ``phi``-dependent, so it retains per-sequence vertex factors around the shared edge table.
+    Its ``A=0`` limit is the Regime-I flat cocycle ``exp(phi_i)exp(-phi_j)`` (NOT the bare
+    identity-link limit). Under ``gauge_mode='trivial'`` the vertex factors become identities but the
+    direct edge factor remains ``exp(link_alpha * A_ij . G)``. A nonzero ``connection_L`` gives
     non-trivial triangle holonomy.
 
-    Returns the flat builder's dict shape: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K), 'Omega'
-    (B,N,N,K,K) (genuinely batched, because exp_phi is per-sequence).
+    The E-step requests :class:`DirectLinkTransport`, retaining the live vertex and edge factors
+    without materializing ``(B,N,N,K,K)``. ``materialize=True`` remains the explicit compatibility
+    boundary for direct registry callers and diagnostics.
     """
-    # Flat (cocycle) fast path: no connection / link_alpha=0 -> exp(phi_i)exp(-phi_j)
-    # byte-identically. A trivial vertex gauge still retains the direct edge factor, and a zero
-    # (grad-requiring) connection_L is NOT short-circuited (autograd at A=0).
-    if connection_L is None or link_alpha == 0.0:
-        return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
     fac = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
     N = phi.shape[1]
-    exp_link = _direct_link_edge_exp(connection_L, group, N, link_alpha=link_alpha,
-                                     link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
-                                     device=phi.device, dtype=phi.dtype)                     # (N,N,K,K)
-    # Omega_ij = exp(phi_i) @ exp(link A_ij) @ exp(-phi_j); the batch-independent exp_link broadcasts.
-    omega = torch.einsum("bikl,ijlm,bjmn->bijkn", exp_phi, exp_link, exp_neg_phi)   # (B, N, N, K, K)
+    K = group.generators.shape[-1]
+    # No connection / zero alpha is the exact flat cocycle. A grad-requiring zero connection still
+    # takes the generic edge-exp route so d exp(0) / d connection_L remains live.
+    if connection_L is None or link_alpha == 0.0:
+        exp_link = torch.eye(K, device=phi.device, dtype=phi.dtype).expand(N, N, K, K).contiguous()
+    else:
+        exp_link = _direct_link_edge_exp(
+            connection_L, group, N,
+            link_alpha=link_alpha,
+            link_soft_cap=link_soft_cap,
+            clamp_monitor=clamp_monitor,
+            device=phi.device,
+            dtype=phi.dtype,
+        )
+    direct = DirectLinkTransport(
+        exp_link=exp_link,
+        exp_phi=exp_phi,
+        exp_neg_phi=exp_neg_phi,
+    )
+    omega = direct.to_dense_omega() if materialize else direct
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
 def _direct_link_dense_bytes(batch: int, n_tok: int, k: int, dtype: torch.dtype) -> int:
     r"""Bytes of a DENSE batched ``(B, N, N, K, K)`` link transport.
 
-    This is the materialized cost the bare ``regime_ii_link`` AVOIDS: its Omega is batch-independent,
-    so the builder returns it at logical ``(N, N, K, K)`` (a factor ``B`` smaller) and lets
-    ``transport_mean`` / ``transport_covariance`` broadcast across the batch. The charted mode IS
-    genuinely ``(B, N, N, K, K)`` (per-sequence frames), so this is its true footprint."""
+    This is the compatibility-only cost both direct-link modes avoid on the forward path. The bare
+    link stores only the batch-independent ``(N, N, K, K)`` edge table. The charted link additionally
+    stores two ``(B, N, K, K)`` vertex tables; its contractions never multiply them into a dense
+    pairwise ``(B, N, N, K, K)`` operator."""
     bytes_per = torch.tensor([], dtype=dtype).element_size()
     return batch * n_tok * n_tok * k * k * bytes_per
 
@@ -1360,7 +1434,7 @@ def build_factored_transport(
 
 
 def transport_mean(
-    omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
+    omega: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport',
     mu:    torch.Tensor,                                          # (..., N, K) source (key, index j) means
 ) -> torch.Tensor:
     r"""Gauge action on means: mu_t[i,j] = Omega_ij @ mu_j. Returns (..., N, N, K).
@@ -1388,6 +1462,8 @@ def transport_mean(
         m = torch.einsum("...jlk,...jl->...jk", omega.rope, mu)        # (..., N, K)
         t = transport_mean(omega.base, m)                             # (..., N, N, K)
         return torch.einsum("...ikl,...ijl->...ijk", omega.rope, t)   # post-rotate by R_i
+    if isinstance(omega, DirectLinkTransport):
+        return _direct_link_mean(omega, mu)
     if isinstance(omega, CompactFactoredTransport):
         return _compact_factored_mean(omega, mu)
     if isinstance(omega, FactoredTransport):
@@ -1399,7 +1475,7 @@ def transport_mean(
 
 
 def transport_covariance(
-    omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
+    omega: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport',
     sigma: torch.Tensor,                                          # (..., N, K) diagonal OR (..., N, K, K) full
 
     *,
@@ -1423,12 +1499,31 @@ def transport_covariance(
     sandwich, so full covariance is never the round-off factoring.
 
     ROPETRANSPORT path (``omega`` is a :class:`RopeTransport`): means-only (``on_cov=False``) uses
-    the un-rotated base covariance; full-gauge (``on_cov=True``) sandwiches with the rotated dense
-    operator.
+    the un-rotated base covariance; full-gauge (``on_cov=True``) applies the RoPE congruence. A
+    direct-link base remains factored through that congruence; other bases retain their established
+    dense or compact dispatch.
     """
     if isinstance(omega, RopeTransport):
         if not omega.on_cov:
             return transport_covariance(omega.base, sigma, diagonal_out=diagonal_out)   # mu-only
+        if isinstance(omega.base, DirectLinkTransport):
+            is_diag = _direct_link_is_diagonal(omega.base, sigma, diagonal_out)
+            if omega.base.exp_phi is None:
+                exp_phi = omega.rope
+                exp_neg_phi = omega.rope.transpose(-1, -2)
+            else:
+                exp_phi = torch.einsum(
+                    "...ikl,...ilm->...ikm", omega.rope, omega.base.exp_phi)
+                exp_neg_phi = torch.einsum(
+                    "...ikl,...iml->...ikm", omega.base.exp_neg_phi, omega.rope)
+            # Fold R_i and R_j^T into the optional vertices, preserving the direct-link diagonal
+            # contraction instead of promoting diagonal sigma to a pairwise full covariance.
+            rotated = DirectLinkTransport(
+                exp_link=omega.base.exp_link,
+                exp_phi=exp_phi,
+                exp_neg_phi=exp_neg_phi,
+            )
+            return transport_covariance(rotated, sigma, diagonal_out=is_diag)
         if isinstance(omega.base, CompactFactoredTransport):
             blocks = _equal_diag_blocks(
                 omega.rope, omega.base.n_blocks, omega.base.block_dim)
@@ -1440,9 +1535,13 @@ def transport_covariance(
                 exp_blocks, inv_blocks, omega.base.K,
                 mean_per_head=omega.base.mean_per_head)
             return transport_covariance(rotated, sigma, diagonal_out=diagonal_out)
-        # full-gauge: sandwich with the rotated dense operator (requires full covariance).
+        # Other full-gauge bases use the established rotated dense operator.
         return transport_covariance(_rope_dense_omega(omega.base, omega.rope), sigma,
                                     diagonal_out=diagonal_out)
+    if isinstance(omega, DirectLinkTransport):
+        if _direct_link_is_diagonal(omega, sigma, diagonal_out):
+            return _direct_link_diagonal_covariance(omega, sigma)
+        return _direct_link_full_covariance(omega, sigma)
     if isinstance(omega, CompactFactoredTransport):
         is_diag = (
             sigma.dim() == omega.exp_blocks.dim() - 2
@@ -1492,6 +1591,111 @@ def transport_covariance(
     # groups are untouched, so the hot path is unchanged.
     out = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
                        omega.double(), sigma.double(), omega.double())
+    return out.to(sigma.dtype)
+
+
+def _direct_link_mean(
+    direct: DirectLinkTransport,
+    mu:     torch.Tensor,               # (..., N, K) source means
+) -> torch.Tensor:                      # (..., N, N, K) transported means
+    r"""Contract direct edge and optional vertex factors without pairwise ``Omega``."""
+    if direct.exp_phi is None:
+        return torch.einsum("ijkl,...jl->...ijk", direct.exp_link, mu)
+    key = torch.einsum("...jlp,...jp->...jl", direct.exp_neg_phi, mu)
+    linked = torch.einsum("ijlm,...jm->...ijl", direct.exp_link, key)
+    return torch.einsum("...ikl,...ijl->...ijk", direct.exp_phi, linked)
+
+
+def _direct_link_is_diagonal(
+    direct:       DirectLinkTransport,
+    sigma:        torch.Tensor,
+    diagonal_out: Optional[bool],
+) -> bool:
+    if diagonal_out is not None:
+        return diagonal_out
+    if direct.exp_phi is not None:
+        return sigma.dim() == direct.exp_phi.dim() - 1
+    # The bare link is batch-independent. As on the legacy dense route, a batched diagonal/full
+    # ambiguity must be resolved by the caller's explicit ``diagonal_out`` flag.
+    return sigma.dim() == direct.exp_link.dim() - 2
+
+
+def _direct_link_key_covariance(
+    direct: DirectLinkTransport,
+    sigma:  torch.Tensor,               # (..., N, K) diagonal or (..., N, K, K) full
+
+    *,
+    diagonal: bool,
+) -> torch.Tensor:                      # (..., N, K, K) key covariance after exp_neg_phi
+    if direct.exp_neg_phi is None:
+        return torch.diag_embed(sigma) if diagonal else sigma
+    if diagonal:
+        return torch.einsum(
+            "...jkl,...jml,...jl->...jkm",
+            direct.exp_neg_phi,
+            direct.exp_neg_phi,
+            sigma,
+        )
+    return torch.einsum(
+        "...jkl,...jlm,...jnm->...jkn",
+        direct.exp_neg_phi,
+        sigma,
+        direct.exp_neg_phi,
+    )
+
+
+def _direct_link_diagonal_covariance(
+    direct: DirectLinkTransport,
+    sigma:  torch.Tensor,               # (..., N, K) diagonal variances
+) -> torch.Tensor:                      # (..., N, N, K) diagonal congruence
+    r"""Diagonal congruence from live edge/vertex factors without pairwise ``Omega``."""
+    if direct.exp_phi is None:
+        return torch.einsum(
+            "ijka,ijka,...ja->...ijk",
+            direct.exp_link,
+            direct.exp_link,
+            sigma,
+        )
+    key_cov = _direct_link_key_covariance(direct, sigma, diagonal=True)
+    # One output row at a time keeps the live pairwise object at (...,N,N,K), never
+    # (...,N,N,K,K). Each row is (exp_phi_i[k,:] exp_link_ij), then r C_j r^T.
+    parts: List[torch.Tensor] = []
+    for k in range(direct.exp_link.shape[-1]):
+        linked_row = torch.einsum(
+            "...ia,ijab->...ijb", direct.exp_phi[..., k, :], direct.exp_link)
+        parts.append(torch.einsum(
+            "...ijb,...jbc,...ijc->...ij", linked_row, key_cov, linked_row))
+    return torch.stack(parts, dim=-1)
+
+
+def _direct_link_full_covariance(
+    direct: DirectLinkTransport,
+    sigma:  torch.Tensor,               # (..., N, K, K) full covariances
+) -> torch.Tensor:                      # (..., N, N, K, K) full congruence output
+    r"""Full direct-link congruence; the output is dense but no pairwise operator is built."""
+    if direct.exp_neg_phi is None:
+        key_cov = sigma.double()
+    else:
+        exp_neg_phi = direct.exp_neg_phi.double()
+        key_cov = torch.einsum(
+            "...jkl,...jlm,...jnm->...jkn",
+            exp_neg_phi,
+            sigma.double(),
+            exp_neg_phi,
+        )
+    exp_link = direct.exp_link.double()
+    edge_cov = torch.einsum(
+        "ijka,...jab,ijnb->...ijkn",
+        exp_link,
+        key_cov,
+        exp_link,
+    )
+    if direct.exp_phi is None:
+        out = edge_cov
+    else:
+        exp_phi = direct.exp_phi.double()
+        out = torch.einsum(
+            "...ika,...ijab,...inb->...ijkn", exp_phi, edge_cov, exp_phi)
     return out.to(sigma.dtype)
 
 

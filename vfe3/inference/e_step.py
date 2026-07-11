@@ -29,6 +29,7 @@ from vfe3.geometry.transport import (
     _TRANSPORT_NEEDS_MU,
     _TRANSPORT_NEEDS_SIGMA,
     CompactFactoredTransport,
+    DirectLinkTransport,
     FactoredTransport,
     RopeTransport,
     build_factored_transport,
@@ -57,6 +58,7 @@ def _transport(
     exp_fp64_norm_threshold: float = 5.0,                   # 'norm': max clamped block ||M||_F upcast threshold
     clamp_monitor:      bool                   = False,     # opt-in: warn when the exp Frobenius clamp fires (host sync)
     transport_mean_per_head: bool  = False,                 # omega-direct factored mean contracts per gauge block
+    materialize:        bool                   = True,      # compatibility/diagnostic boundary for direct-link containers
     connection_W:       Optional[torch.Tensor] = None,      # (n_gen, K, K) learned bilinear connection (regime_ii, NN exception)
     connection_M:       Optional[torch.Tensor] = None,      # (n_gen, 3) learned covariant connection (regime_ii_covariant, NN exception)
     connection_L:       Optional[torch.Tensor] = None,      # (max_seq, max_seq, n_gen) learned direct link (regime_ii_link*, NN exception)
@@ -65,7 +67,7 @@ def _transport(
     gauge_parameterization: str                    = "phi",   # 'phi' (exp path) | 'omega_direct' (stored element)
     omega:              'torch.Tensor | CompactBlockElement | None' = None,  # stored U_i (omega_direct only)
     reflection:         Optional[torch.Tensor] = None,      # (N,) or (B, N) per-token sign s_i; phi-path fold (None -> off)
-) -> 'torch.Tensor | CompactFactoredTransport':
+) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport':
     r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
     The build is config-selected through ``get_transport(transport_mode)``; the default 'flat' is
@@ -101,23 +103,34 @@ def _transport(
                       connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                       link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                       exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                      cocycle_relaxation=cocycle_relaxation)["Omega"]
-        # A batch-independent builder (regime_ii_link) already returns (N,N,K,K); ordinary builders
-        # return (1,N,N,K,K) on the unbatched diagnostics path -> strip the batch-of-one.
-        built = omega if batch_independent else omega[0]
+                      cocycle_relaxation=cocycle_relaxation, materialize=False)["Omega"]
+        # A batch-independent bare direct link has no batch axis. Ordinary dense builders return
+        # (1,N,N,K,K), and a charted direct link has batch-of-one vertex factors, on this unbatched
+        # compatibility/diagnostic path -> strip that batch-of-one while retaining the edge table.
+        if isinstance(omega, DirectLinkTransport):
+            built = omega if batch_independent else dataclasses.replace(
+                omega,
+                exp_phi=omega.exp_phi[0],
+                exp_neg_phi=omega.exp_neg_phi[0],
+            )
+        else:
+            built = omega if batch_independent else omega[0]
     else:
         built = build(phi, group, gauge_mode=gauge_mode, mu=mu, mu_key=mu_key,
                       sigma=sigma, sigma_key=sigma_key,
                       connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                       link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                       exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                      cocycle_relaxation=cocycle_relaxation)["Omega"]
-    # Reflection fold (phi-reflection design sec 3): R_i Omega_ij R_j on the dense phi-cocycle Omega
-    # (omega_direct returned early above, so this is the phi path only). None (default) is
-    # byte-identical. free_energy_value's global-F build routes belief.reflection through here so the
-    # logged / Metropolis-DeltaF F is reflection-dependent.
+                      cocycle_relaxation=cocycle_relaxation, materialize=False)["Omega"]
+    # Reflection fold (phi-reflection design sec 3): R_i Omega_ij R_j on the phi path. Direct-link
+    # containers fold the signs into their optional vertex factors; dense transports retain the
+    # established row/column scaling. None (default) is byte-identical. free_energy_value's global-F
+    # build routes belief.reflection through here so the logged / Metropolis-DeltaF F is
+    # reflection-dependent.
     if reflection is not None:
         built = _apply_reflection(built, reflection)
+    if materialize and isinstance(built, DirectLinkTransport):
+        return built.to_dense_omega()
     return built
 
 
@@ -138,12 +151,12 @@ def _can_fuse_flat(transport_mode: str, group: GaugeGroup) -> bool:
 
 
 def _apply_reflection(
-    built:          'torch.Tensor | FactoredTransport',
+    built:          'torch.Tensor | DirectLinkTransport | FactoredTransport',
     reflection:     torch.Tensor,                     # (..., N) QUERY per-token sign s_i in {+1, -1}
 
     *,
     key_reflection: Optional[torch.Tensor] = None,    # (..., N) KEY sign s_j; None -> reflection (global, query==key)
-) -> 'torch.Tensor | FactoredTransport':
+) -> 'torch.Tensor | DirectLinkTransport | FactoredTransport':
     r"""Fold the per-token reflection R_i = diag(s_i, 1, ..., 1) into the flat phi-cocycle transport:
     Omega_ij -> R_i Omega_ij R_j (phi-reflection design sec 3).
 
@@ -169,6 +182,29 @@ def _apply_reflection(
     correct with no further change.
     """
     key_reflection = reflection if key_reflection is None else key_reflection
+    if isinstance(built, DirectLinkTransport):
+        if built.exp_phi is None:
+            K = built.exp_link.shape[-1]
+
+            def _reflection_factor(sign: torch.Tensor) -> torch.Tensor:
+                eye = torch.eye(
+                    K,
+                    device=built.exp_link.device,
+                    dtype=built.exp_link.dtype,
+                ).expand(*sign.shape, K, K).clone()
+                eye[..., 0, 0] = sign.to(device=eye.device, dtype=eye.dtype)
+                return eye
+
+            return dataclasses.replace(
+                built,
+                exp_phi=_reflection_factor(reflection),
+                exp_neg_phi=_reflection_factor(key_reflection),
+            )
+        exp_phi = built.exp_phi.clone()
+        exp_neg_phi = built.exp_neg_phi.clone()
+        exp_phi[..., 0, :] *= reflection[..., :, None]
+        exp_neg_phi[..., :, 0] *= key_reflection[..., :, None]
+        return dataclasses.replace(built, exp_phi=exp_phi, exp_neg_phi=exp_neg_phi)
     if isinstance(built, FactoredTransport):
         exp_phi     = built.exp_phi.clone()                                    # (..., N, K, K)
         exp_neg_phi = built.exp_neg_phi.clone()                                # (..., N, K, K)
@@ -210,17 +246,18 @@ def build_belief_transport(
     sigma_key:          Optional[torch.Tensor] = None,      # regime_ii_covariant KEY-slot variances (None -> sigma)
     rope:               Optional[torch.Tensor] = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
     reflection:         Optional[torch.Tensor] = None,      # (B, N) per-token sign s_i in {+1,-1}; phi-path fold (None -> off)
-) -> 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport':
+) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport':
     r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
 
     On the flat + block-diagonal-with-equal-blocks path (``_can_fuse_flat``) returns a
     :class:`FactoredTransport` -- the per-token exps only, NEVER the dense (B,N,N,K,K) Omega --
     which ``transport_mean`` / ``transport_covariance`` consume on a fused fast path (the mean is an
-    exact reassociation; the diagonal covariance factors per head). Every other case
-    (regime_ii, single-block / cross-coupled groups, trivial gauge) falls back to ``_transport``'s
-    DENSE Omega exactly as before, so those numerics are unchanged; that fallback is REGISTRY-driven
-    (belief tensors gated on ``_TRANSPORT_NEEDS_MU`` / ``_TRANSPORT_NEEDS_SIGMA`` membership, never
-    on literal mode names). The factored container flows
+    exact reassociation; the diagonal covariance factors per head). The direct-link modes return a
+    :class:`DirectLinkTransport` whose edge and optional vertex factors also remain separate through
+    mean and covariance contraction. Other cases (regime_ii, single-block / cross-coupled groups,
+    trivial gauge) fall back to ``_transport``'s DENSE Omega exactly as before, so those numerics are
+    unchanged; that fallback is REGISTRY-driven (belief tensors gated on ``_TRANSPORT_NEEDS_MU`` /
+    ``_TRANSPORT_NEEDS_SIGMA`` membership, never on literal mode names). The factored container flows
     OPAQUELY through ``belief_gradients`` (kernel + oracle), which only ever forward it to
     ``transport_mean`` / ``transport_covariance``; the oracle's full-cov / smoothing routes rebuild
     the dense Omega from the factors on demand (byte-identical).
@@ -265,7 +302,7 @@ def build_belief_transport(
                            connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                            link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                            exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                           cocycle_relaxation=cocycle_relaxation)
+                           cocycle_relaxation=cocycle_relaxation, materialize=False)
     # Reflection fold (phi-reflection design sec 3): fold R_i = diag(s_i, 1, ...) into the built
     # transport, Omega_ij -> R_i Omega_ij R_j, BEFORE the RoPE wrap (RoPE composes on the reflected
     # base). phi-path ONLY -- omega_direct carries its own omega_reflection det-sign and ignores this.
@@ -602,7 +639,7 @@ def e_step_iteration(
     rope_on_cov:               bool                   = False,  # full-gauge: rotate covariance too
     rope_on_value:             bool                   = True,   # False -> value aggregation uses the un-rotated base
     grad_record:               Optional[dict]         = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
-    _prebuilt_omega:           'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: flat-path cache from e_step
+    _prebuilt_omega:           'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: forward-transport cache from e_step
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
     (autograd of the alignment block + preconditioner + Lie retraction).
@@ -929,7 +966,7 @@ def e_step(
     state_record:                Optional[dict]         = None,   # diag out-param: every belief iterate + matching F tensor
     rope:                        Optional[torch.Tensor] = None,
     log_prior:                   Optional[torch.Tensor] = None,
-    prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,   # share_refine_s_transport: caller-built flat transport
+    prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,   # share_refine_s_transport: caller-built forward transport
     **kwargs,
 ) -> 'BeliefState | Tuple[BeliefState, List[float]]':
     r"""Iterate ``e_step_iteration`` ``n_iter`` times (parallel mean-field). Optionally
@@ -969,7 +1006,7 @@ def e_step(
             "gauge_parameterization='omega_direct' does not support E-step phi updates; "
             f"got e_phi_lr={e_phi_lr}. Set e_phi_lr=0.0."
         )
-    _hoisted_omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None
+    _hoisted_omega: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None
     if e_phi_lr == 0.0 and transport_mode_kw == "flat":
         if prebuilt_transport is not None:
             # share_refine_s_transport (default OFF): the caller built the flat transport ONCE from
