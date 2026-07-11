@@ -438,8 +438,9 @@ def test_cluster_embedding_and_lift_labels():
     coords = np.vstack([c0, c1])
     # cluster 0 = mostly token 5 ('apple') + stopword 0 ('the'); cluster 1 = mostly token 9 ('zebra') + 'the'
     tids = np.concatenate([np.array([5] * 60 + [0] * 20), np.array([9] * 60 + [0] * 20)])
-    labels = _cluster_embedding(coords, seed=0)
+    labels, method_desc = _cluster_embedding(coords, seed=0)
     assert set(labels.tolist()) - {-1}                          # at least one real cluster found
+    assert method_desc.startswith(("HDBSCAN", "KMeans"))        # on-figure footer names the algorithm
     names = {5: "apple", 9: "zebra", 0: "the"}
     # top-1 by lift: the distinctive token (apple lift 2.0, zebra lift 2.0) outranks the stopword
     # 'the' (present in both clusters -> lift ~1.0), so the per-cluster top label is never the stopword.

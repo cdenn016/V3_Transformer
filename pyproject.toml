@@ -15,7 +15,10 @@ dependencies = ["torch", "numpy", "matplotlib"]
 [project.optional-dependencies]
 dev = ["pytest"]
 data = ["tiktoken"]          # tokenizer for dataset cache builds (tests importorskip it)
-viz = ["umap-learn"]         # optional UMAP figures (tests skip when absent)
+# scikit-learn>=1.3 supplies cluster.HDBSCAN + silhouette/Calinski-Harabasz and scipy the KDE
+# relief / curve_fit / t-CI used by the figure set; both were previously reached only via
+# umap-learn's transitive dependencies (sklearn<1.3 silently degraded HDBSCAN to KMeans).
+viz = ["umap-learn", "scikit-learn>=1.3", "scipy"]   # optional UMAP figures (tests skip when absent)
 
 [tool.setuptools.packages.find]
 include = ["vfe3*"]
