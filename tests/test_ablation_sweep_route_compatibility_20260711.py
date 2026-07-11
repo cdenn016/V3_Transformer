@@ -9,8 +9,8 @@ from vfe3.model.model import VFEModel
 def test_active_update_rule_config_values_are_preserved() -> None:
     assert ablation.BASELINE_CONFIG["e_step_update"] == "mm_exact"
     assert ablation.BASELINE_CONFIG["mm_damping"] == 0.75
-    assert train_vfe3.config["e_step_update"] == "gradient"
-    assert train_vfe3.config["mm_damping"] == 1.0
+    assert train_vfe3.config["e_step_update"] == "mm_exact"
+    assert train_vfe3.config["mm_damping"] == 0.75
 
 
 @pytest.mark.parametrize(
