@@ -1232,11 +1232,12 @@ class VFEModel(nn.Module):
         # the autocast E-step), mirroring retraction.py's in-island sigma.float(). On the default
         # fp32 path .float() is a value-identical no-op AND the island is a nullcontext (see
         # _amp_off_context), so this block is byte-identical to the no-AMP build.
-        # A decoder that advertises a fused CE dispatches through the callable stored in its single
-        # registration record. This keeps inference decode and training CE coherent for custom
-        # registry additions; the linear ablation uses its own registered fused CE while retaining
-        # decode_mode as the opt-in chunking toggle. logits is None on this branch by design.
-        decode_registration = get_decode_registration(self.cfg.decode_mode)
+        # Select the same active decoder record PriorBank.decode uses: the configured prior-bank
+        # mode on the geometric path, or linear on the no-prior ablation. Capability routing and
+        # fused dispatch then come from that one record, so an unrelated configured mode cannot
+        # control the active linear path. logits is None on the fused branch by design.
+        active_decode_mode = self.cfg.decode_mode if self.cfg.use_prior_bank else "linear"
+        decode_registration = get_decode_registration(active_decode_mode)
         fused_chunked = (
             targets is not None
             and decode_registration.supports_chunked
@@ -1249,8 +1250,7 @@ class VFEModel(nn.Module):
                         z_loss_weight=self.cfg.z_loss_weight,
                     )
                 else:
-                    linear_registration = get_decode_registration("linear")
-                    ce = linear_registration.fused_ce(
+                    ce = decode_registration.fused_ce(
                         self.prior_bank, mu_final.float(), targets,
                         z_loss_weight=self.cfg.z_loss_weight,
                     )

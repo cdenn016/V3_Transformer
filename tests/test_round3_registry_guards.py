@@ -35,7 +35,6 @@ _DECORATOR_REGISTRIES = [
     (kernels_mod.register_kernel,                 kernels_mod._KERNELS,                 "gaussian_diagonal"),
     (retraction_mod.register_retraction,          retraction_mod._RETRACTIONS,          "spd_affine"),
     (norms_mod.register_norm,                     norms_mod._NORMS,                     "mahalanobis"),
-    (groups_mod.register_group,                   groups_mod._GROUPS,                   "glk"),
     (precond_mod.register_precond,                precond_mod._PRECOND,                 "none"),
     (rope_mod.register_pos_rotation,              rope_mod._POS_ROTATIONS,              "rope"),
     (pos_phi_mod.register_pos_phi,                pos_phi_mod._POS_PHI,                 "none"),
@@ -92,11 +91,36 @@ def test_register_irrep_duplicate_key_fails_closed_and_override_replaces():
     assert irreps_mod._IRREPS[key] == (orig_dim_fn, orig_build_fn)
 
 
+def test_register_group_duplicate_key_fails_closed_and_override_replaces_record():
+    name = "glk"
+    original = groups_mod._GROUPS[name]
+
+    def _replacement(*args, **kwargs):
+        return original(*args, **kwargs)
+
+    try:
+        with pytest.raises(KeyError):
+            groups_mod.register_group(name)(_replacement)
+        assert groups_mod._GROUPS[name] is original
+
+        registered = groups_mod.register_group(
+            name,
+            omega_direct_capable=False,
+            override=True,
+        )(_replacement)
+        assert groups_mod._GROUPS[name] is registered
+        assert registered is not _replacement
+        assert registered(2).omega_direct_capable is False
+    finally:
+        groups_mod._GROUPS[name] = original
+
+
 @pytest.mark.parametrize(
     "reg",
     [reg for reg, _, _ in _DECORATOR_REGISTRIES]
-    + [prior_bank_mod.register_decode, policy_mod.register_policy, irreps_mod.register_irrep],
-    ids=_IDS + ["register_decode", "register_policy", "register_irrep"],
+    + [groups_mod.register_group, prior_bank_mod.register_decode,
+       policy_mod.register_policy, irreps_mod.register_irrep],
+    ids=_IDS + ["register_group", "register_decode", "register_policy", "register_irrep"],
 )
 def test_override_parameter_is_keyword_only(reg):
     # punch item 6: register_policy's override was positional; the convention (register_alpha,
@@ -182,6 +206,104 @@ def test_custom_chunked_decode_dispatches_registered_fused_ce():
         assert calls[0][-1] == cfg.z_loss_weight
     finally:
         prior_bank_mod._DECODERS.pop(name, None)
+
+
+def test_no_prior_dense_routing_reads_linear_registration_capability():
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+
+    original = prior_bank_mod._DECODERS["linear"]
+    try:
+        prior_bank_mod.register_decode("linear", override=True)(original.callable)
+        cfg = VFE3Config(
+            vocab_size=8,
+            embed_dim=4,
+            n_heads=1,
+            max_seq_len=3,
+            n_layers=1,
+            n_e_steps=1,
+            decode_mode="diagonal_chunked",
+            use_prior_bank=False,
+            e_phi_lr=0.0,
+        )
+        model = VFEModel(cfg)
+        tokens = torch.tensor([[0, 1, 2]])
+        targets = torch.tensor([[1, 2, 3]])
+
+        logits, _loss, _ce = model(tokens, targets)
+
+        assert logits is not None
+    finally:
+        _restore_decode("linear", original)
+
+
+def test_no_prior_fused_routing_reads_linear_registration_callable():
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+
+    original = prior_bank_mod._DECODERS["linear"]
+    calls = []
+
+    def _fused_ce(pb, mu_q, targets, *, z_loss_weight=0.0):
+        calls.append((pb, mu_q.shape, targets.shape, z_loss_weight))
+        return mu_q.sum() * 0.0 + 3.5
+
+    try:
+        prior_bank_mod.register_decode(
+            "linear",
+            supports_chunked=True,
+            fused_ce=_fused_ce,
+            override=True,
+        )(original.callable)
+        cfg = VFE3Config(
+            vocab_size=8,
+            embed_dim=4,
+            n_heads=1,
+            max_seq_len=3,
+            n_layers=1,
+            n_e_steps=1,
+            decode_mode="diagonal",
+            use_prior_bank=False,
+            e_phi_lr=0.0,
+        )
+        model = VFEModel(cfg)
+        tokens = torch.tensor([[0, 1, 2]])
+        targets = torch.tensor([[1, 2, 3]])
+
+        logits, _loss, ce = model(tokens, targets)
+
+        assert logits is None
+        assert torch.equal(ce, ce.new_tensor(3.5))
+        assert len(calls) == 1
+        assert calls[0][0] is model.prior_bank
+        assert calls[0][-1] == cfg.z_loss_weight
+    finally:
+        _restore_decode("linear", original)
+
+
+@pytest.mark.parametrize(
+    "supports_chunked, fused_ce",
+    [
+        pytest.param(True, None, id="capability_without_callable"),
+        pytest.param(False, lambda *args, **kwargs: None, id="callable_without_capability"),
+    ],
+)
+def test_decode_registration_rejects_incoherent_chunked_declarations(
+    supports_chunked,
+    fused_ce,
+):
+    name = "audit_incoherent_chunked"
+
+    def _decode(*args, **kwargs):
+        return None
+
+    with pytest.raises(ValueError, match="supports_chunked"):
+        prior_bank_mod.register_decode(
+            name,
+            supports_chunked=supports_chunked,
+            fused_ce=fused_ce,
+        )(_decode)
+    assert name not in prior_bank_mod._DECODERS
 
 
 def test_kernel_registration_invalidates_compiled_cache():

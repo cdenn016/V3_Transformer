@@ -707,22 +707,31 @@ def test_rope_warning_names_only_registered_positional_modes():
 
 
 def test_omega_direct_capability_comes_from_group_registration():
-    from vfe3.geometry.groups import _GROUPS, get_group, register_group
+    from vfe3.geometry.groups import GaugeGroup, _GROUPS, get_group, register_group
 
     capable_name = "audit_omega_capable_alias"
     incapable_name = "audit_omega_incapable_alias"
 
     @register_group(capable_name, omega_direct_capable=True)
     def _build_capable(K, *args, **kwargs):
-        group = get_group("glk")(K, *args, **kwargs)
-        group.name = capable_name
-        return group
+        base = get_group("glk")(K, *args, **kwargs)
+        return GaugeGroup(
+            name=capable_name,
+            generators=base.generators,
+            irrep_dims=base.irrep_dims,
+            skew_symmetric=base.skew_symmetric,
+        )
 
     @register_group(incapable_name)
     def _build_incapable(K, *args, **kwargs):
-        group = get_group("glk")(K, *args, **kwargs)
-        group.name = incapable_name
-        return group
+        base = get_group("glk")(K, *args, **kwargs)
+        return GaugeGroup(
+            name=incapable_name,
+            generators=base.generators,
+            irrep_dims=base.irrep_dims,
+            skew_symmetric=base.skew_symmetric,
+            omega_direct_capable=True,
+        )
 
     try:
         cfg = VFE3Config(
@@ -734,6 +743,10 @@ def test_omega_direct_capability_comes_from_group_registration():
         )
         assert cfg.gauge_group == capable_name
         assert get_group("glk")(4).omega_direct_capable is True
+        assert _build_capable(4).omega_direct_capable is True
+        assert _build_incapable(4).omega_direct_capable is False
+        assert get_group(capable_name)(4).omega_direct_capable is True
+        assert get_group(incapable_name)(4).omega_direct_capable is False
         with pytest.raises(ValueError, match="omega_direct"):
             VFE3Config(
                 embed_dim=4,

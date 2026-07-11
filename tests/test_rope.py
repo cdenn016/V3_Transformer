@@ -100,6 +100,35 @@ def test_rope_cache_key_tracks_mutated_rope_base():
     assert len(model._rope_cache) == 2
 
 
+def test_rope_cache_key_tracks_mutated_pos_rotation():
+    from vfe3.geometry import rope as rope_module
+
+    name = "audit_negated_rope"
+
+    @rope_module.register_pos_rotation(name)
+    def _negated_rope(positions, irrep_dims, *, base=100.0, device=None, dtype=torch.float32):
+        return -build_rope_rotation(
+            positions,
+            irrep_dims,
+            base=base,
+            device=device,
+            dtype=dtype,
+        )
+
+    try:
+        model = VFEModel(_rope_cfg(pos_rotation="rope"))
+        device = model.prior_bank.mu_embed.device
+        first = model._rope_rotation(8, device)
+
+        model.cfg.pos_rotation = name
+        second = model._rope_rotation(8, device)
+
+        assert torch.equal(second, -first)
+        assert len(model._rope_cache) == 2
+    finally:
+        rope_module._POS_ROTATIONS.pop(name, None)
+
+
 def test_rope_changes_logits_vs_no_rope():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (2, 8))

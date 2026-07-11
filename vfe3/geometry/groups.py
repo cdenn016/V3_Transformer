@@ -13,6 +13,7 @@ g in G <= GL(K), so every group here is admissible for "gaussian".
 """
 
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -107,9 +108,20 @@ def register_group(
             if omega_direct_capable is None
             else omega_direct_capable
         )
-        setattr(fn, "omega_direct_capable", capability)
-        _GROUPS[name] = fn
-        return fn
+
+        @wraps(fn)
+        def _coherent_builder(*args, **kwargs) -> GaugeGroup:
+            group = fn(*args, **kwargs)
+            if not isinstance(group, GaugeGroup):
+                raise TypeError(
+                    f"gauge group builder {name!r} returned {type(group).__name__}, expected GaugeGroup"
+                )
+            group.omega_direct_capable = capability
+            return group
+
+        setattr(_coherent_builder, "omega_direct_capable", capability)
+        _GROUPS[name] = _coherent_builder
+        return _coherent_builder
     return _wrap
 
 
@@ -137,7 +149,6 @@ def _build_glk(
         generators=G,
         irrep_dims=[K],
         skew_symmetric=False,
-        omega_direct_capable=True,
     )
 
 
@@ -176,7 +187,6 @@ def _build_block_glk(
         generators=G,
         irrep_dims=irrep_dims,
         skew_symmetric=False,
-        omega_direct_capable=True,
     )
 
 
@@ -207,7 +217,6 @@ def _build_tied_block_glk(
         generators=G,
         irrep_dims=[d_head] * n_heads,
         skew_symmetric=False,
-        omega_direct_capable=True,
     )
 
 
@@ -226,7 +235,6 @@ def _build_so_k(
         generators=G,
         irrep_dims=[K],
         skew_symmetric=True,
-        omega_direct_capable=True,
     )
 
 
@@ -361,7 +369,6 @@ def _build_so_n(
         generators=G.to(dtype).to(device),
         irrep_dims=dims,
         skew_symmetric=True,
-        omega_direct_capable=True,
         irrep_labels=labels,
         algebra="so",
     )
@@ -405,7 +412,6 @@ def _build_sp_n(
         generators=G.to(dtype).to(device),
         irrep_dims=dims,
         skew_symmetric=False,
-        omega_direct_capable=True,
         irrep_labels=labels,
         algebra="sp",
     )
@@ -432,5 +438,4 @@ def _build_sp(
         generators=G,
         irrep_dims=[K],
         skew_symmetric=False,
-        omega_direct_capable=True,
     )
