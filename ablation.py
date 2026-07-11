@@ -772,17 +772,23 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
     
 
-    "e_mu_q_trust": {  # E3 / EXP-24: mean trust region as a stability guard. The endpoint is the
-        # NaN/loss-spike rate (nonfinite_frac, already logged per eval), NOT PPL -- it is near-inert at
-        # the production embed_dim<=64 / e_q_mu_lr operating point; it binds only at large embed_dim or
-        # raised LR. 'off' (None) is the unbounded baseline.
+    "e_mu_q_trust": {  # E3 / EXP-24: mean trust region (BOX mode) as a stability guard. The endpoint
+        # is the NaN/loss-spike rate (nonfinite_frac, already logged per eval), NOT PPL -- it is
+        # near-inert at the production embed_dim<=64 / e_q_mu_lr operating point; it binds only at
+        # large embed_dim or raised LR. Numeric radii (single-field 'param'/'values') so _plot_one_sweep
+        # draws the x-sorted LINE plot like m_phi_lr; the unbounded 'off' (e_mu_q_trust=None) baseline
+        # cannot sit on a numeric axis, so run it separately in train_vfe3 if you need the endpoint.
         "description": "E-step mean trust-region radius (box mode); endpoint = nonfinite_frac [E3/EXP-24]",
-        "configs": [
-            {"label": "off",     "e_mu_q_trust": None, "mu_trust_mode": "box"},
-            {"label": "trust_5", "e_mu_q_trust": 5.0,  "mu_trust_mode": "box"},
-            {"label": "trust_2", "e_mu_q_trust": 2.0,  "mu_trust_mode": "box"},
-            {"label": "trust_1", "e_mu_q_trust": 1.0,  "mu_trust_mode": "box"},
-        ],
+        "param": "e_mu_q_trust", "values": [1.0, 2.0, 5.0],
+        "requires": {"mu_trust_mode": "box"},
+    },
+
+    "e_mu_q_trust_ball": {  # E3 / EXP-24, BALL mode: the SAME mean trust region under the 2-norm ball
+        # clip (mu_trust_mode='ball') instead of the per-coordinate box. Same numeric radii -> LINE plot;
+        # 'requires' pins mu_trust_mode='ball' on every cell (consulted only when e_mu_q_trust is set).
+        "description": "E-step mean trust-region radius (ball mode); endpoint = nonfinite_frac [E3/EXP-24]",
+        "param": "e_mu_q_trust", "values": [1.0, 2.0, 5.0],
+        "requires": {"mu_trust_mode": "ball"},
     },
 
     "regime_ii": {  # A4 / EXP-15: trained Regime-II connection trainability (flat vs learned connection_W).
@@ -1226,7 +1232,8 @@ SWEEP_ORDER: List[str] = [
    # "renyi_order",
    # "lambda_alpha",
    "e_mu_q_trust",
-   
+   "e_mu_q_trust_ball",
+
    "e_s_mu_lr",
    "e_q_mu_lr",
     
@@ -2137,12 +2144,23 @@ def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
         ax.set_ylabel("validation PPL")            # numeric line plot: PPL on the y-axis
     else:
         order = sorted(range(len(ppls)), key=lambda k: ppls[k])
-        ax.barh(range(len(order)), [ppls[k] for k in order],
+        vals = [ppls[k] for k in order]
+        ax.barh(range(len(order)), vals,
                 color=["#2ca02c" if j == 0 else "#1f77b4" for j in range(len(order))])
         ax.set_yticks(range(len(order)))
         ax.set_yticklabels([labels[k] for k in order])
         ax.invert_yaxis()
         ax.set_xlabel("validation PPL")            # horizontal bars: PPL on the x-axis (m30)
+        # Zoom the value axis to a padded [min, max] window (not [0, max]) so near-equal PPLs are
+        # visually distinguishable instead of all reading as full-length bars, and annotate each bar
+        # with its value so the truncated bars are not misread.
+        lo, hi = min(vals), max(vals)
+        if hi > lo:
+            span = hi - lo
+            ax.set_xlim(lo - 0.25 * span, hi + 0.30 * span)
+        for j, v in enumerate(vals):
+            ax.annotate(f"{v:.2f}", xy=(v, j), xytext=(4, 0), textcoords="offset points",
+                        va="center", ha="left", fontsize=8, clip_on=False)
     ax.set_title(sweep_dir.name)
     fig.tight_layout()
     fig_dir.mkdir(exist_ok=True)

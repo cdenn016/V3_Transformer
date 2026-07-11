@@ -58,6 +58,24 @@ def _save(fig, path: Optional[str]):
     return fig
 
 
+def _zoom_bar_value_axis(ax, values, *, vertical: bool = True,
+                         lo_frac: float = 0.25, hi_frac: float = 0.12) -> None:
+    r"""Zoom a bar chart's VALUE axis to a padded ``[min, max]`` window (not ``[0, max]``) so
+    near-equal bars are distinguishable instead of all reading as full bars from zero. No-op unless
+    there are at least two finite values that are not all equal (so a single- or constant-valued
+    chart keeps its default autoscale)."""
+    v = np.asarray([x for x in values if x is not None], dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size < 2:
+        return
+    vmin, vmax = float(v.min()), float(v.max())
+    if vmax <= vmin:
+        return
+    span = vmax - vmin
+    lo, hi = vmin - lo_frac * span, vmax + hi_frac * span
+    (ax.set_ylim if vertical else ax.set_xlim)(lo, hi)
+
+
 # Worker source for the ISOLATED umap embedding subprocess (see umap_embed).
 # init="pca" skips UMAP's spectral eigensolver, which on disconnected / near-degenerate belief
 # clouds fails to converge (tiny eigengap) and silently falls back to uniform-random init; PCA is
@@ -2976,6 +2994,7 @@ def plot_entropy_ppl_gap(
             ax.annotate(f"Δ={surr[i] - canon[i]:+.2f}", (x[i], max(canon[i], surr[i])),
                         textcoords="offset points", xytext=(0, 4), ha="center", fontsize=8)
     ax.set_xticks(x); ax.set_xticklabels([f"κ={k:g}" for k in kappas])
+    _zoom_bar_value_axis(ax, canon + surr, hi_frac=0.20)   # padded window + headroom for the Δ labels
     ax.set(ylabel="validation PPL")
     ax.set_title("Canonical-F vs entropy-suppressed surrogate (PPL gap by κ)")
     ax.legend(fontsize=8, frameon=False)
@@ -3094,6 +3113,8 @@ def plot_gauge_transport_bars(
             ax.annotate(rf"$|\Omega-I|$={dev:.0e}", (x[di] + w, _v("off", d, "ppl")),
                         textcoords="offset points", xytext=(0, 4), ha="center", fontsize=7)
     ax.set_xticks(x); ax.set_xticklabels(depths)
+    _zoom_bar_value_axis(                                  # padded window + headroom for the |Ω-I| labels
+        ax, [_v(m, d, "ppl") for m, _ in modes for d in depths], hi_frac=0.20)
     ax.set(xlabel="depth", ylabel="validation PPL")
     ax.set_title("GL(K) gauge transport: ON vs frozen vs OFF (Ω=I)")
     ax.legend(fontsize=8, frameon=False, title="gauge")
@@ -3145,8 +3166,13 @@ def plot_ppl_equivariance_bars(
     labels = [str(c["label"]) for c in cells]
     x = np.arange(len(cells))
     fig, ax = plt.subplots(figsize=(6.4, 4.4))
-    ax.bar(x, [float(c["ppl"]) for c in cells], 0.5, color=_CB[0], label="val PPL")
+    ppls = [float(c["ppl"]) for c in cells]
+    ax.bar(x, ppls, 0.5, color=_CB[0], label="val PPL")
     ax.set_xticks(x); ax.set_xticklabels(labels)
+    _zoom_bar_value_axis(ax, ppls, hi_frac=0.15)          # padded window so near-equal PPLs are legible
+    for xi, v in zip(x, ppls):
+        ax.annotate(f"{v:.2f}", xy=(xi, v), xytext=(0, 3), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=8, clip_on=False)
     ax.set_ylabel("validation PPL")
     resid = [float(c["resid"]) if np.isfinite(_as_f(c.get("resid"))) else np.nan for c in cells]
     if any(np.isfinite(resid)):
