@@ -21,7 +21,6 @@ from typing import Any, List, Mapping, Optional, Tuple
 # use_prior_bank / are NotImplementedError second-gates after the registry check). The static
 # tuples below are the remaining seams WITHOUT a registry.
 _VALID_GAUGE_PARAM         = ("phi", "omega_direct")
-_VALID_S_FRAME_MODES       = ("tied", "phi_tilde")
 _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_PRIOR_SOURCES       = ("token", "model_channel")
 _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
@@ -1001,7 +1000,8 @@ class VFE3Config:
                 f"block_glk/tied_block_glk with n_heads >= 2, or an so_n/sp_n irrep tower."
             )
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
-        _require(self.s_frame_mode, _VALID_S_FRAME_MODES, "s_frame_mode")
+        from vfe3.model.model_frame import model_frame_modes
+        _require(self.s_frame_mode, model_frame_modes(), "s_frame_mode")
         if self.s_frame_mode == "phi_tilde":
             if self.gauge_parameterization != "phi":
                 raise ValueError(
@@ -2165,6 +2165,23 @@ class VFE3Config:
                     UserWarning,
                     stacklevel=2,
                 )
+            if self.lambda_gamma == 0.0:
+                import warnings
+                warnings.warn(
+                    "s_frame_mode='phi_tilde' with lambda_gamma=0 gives the model E-step no "
+                    "frame-dependent coupling, so the independent model frame receives no "
+                    "objective gradient.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            if self.e_s_mu_lr == 0.0 and self.e_s_sigma_lr == 0.0:
+                import warnings
+                warnings.warn(
+                    "s_frame_mode='phi_tilde' with e_s_mu_lr=e_s_sigma_lr=0 leaves the refined "
+                    "model belief unchanged, severing the model-frame path to cross-entropy.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         # Both 'straight_through' and 'detach' sever the per-iteration E-step tangent, so a learnable
         # parameter whose only loss path IS that tangent receives no gradient and silently freezes.
         # (detach_e_step=True also detaches but is forced to e_step_gradient='unroll' here and is warned
@@ -2267,6 +2284,7 @@ class VFE3Config:
                 self.transport_mode in ("regime_ii", "regime_ii_covariant")
                 or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
                 or self.pos_phi == "learned"
+                or self.s_frame_mode == "phi_tilde"
                 # t5_bias's only gradient path is likewise the E-step tangent (audit 2026-07-05 m9);
                 # the predicate mirrors the model's parameter-creation gate (model.py: created only
                 # when a t5_relative_bias channel is active).
@@ -2289,6 +2307,7 @@ class VFE3Config:
                 "oracle_unroll_grad=False. A learnable parameter that enters the loss only through the "
                 "E-step tangent (connection_W under transport_mode='regime_ii', r_mu/r_sigma_log under "
                 "learnable_r+r_update_mode='gradient'+s_e_step, pos_phi_free under pos_phi='learned', "
+                "s_phi_embed/s_pos_phi_free under s_frame_mode='phi_tilde', "
                 "t5_bias under t5_learnable_bias with an active t5_relative_bias channel, "
                 "log_kappa_beta under learnable_kappa_beta, log_kappa_gamma under "
                 "learnable_kappa_gamma+s_e_step) "

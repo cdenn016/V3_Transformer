@@ -442,7 +442,8 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
         *dead_line,
-        f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  phi={cfg.m_phi_lr}",
+        f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  "
+        f"phi={cfg.m_phi_lr}  s_phi={cfg.m_s_phi_lr}",
         f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",

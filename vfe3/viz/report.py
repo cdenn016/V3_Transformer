@@ -307,7 +307,9 @@ def generate_figures(
     _emit("hyper_prior_coupling",                                 # the h figure (lambda_h block)
           lambda p: figs.plot_hyper_prior_coupling(h_coupling, path=p),
           h_coupling is not None)
-    for ch in ("mu", "sigma"):                                    # model-channel s UMAP (no phi: shares belief gauge)
+    model_channels = (("mu", "sigma", "phi")
+                      if mc_bank is not None and "phi" in mc_bank else ("mu", "sigma"))
+    for ch in model_channels:                                      # phi is emitted only for independent phi_tilde
         _emit(f"model_umap_{ch}",
               lambda p, ch=ch: figs.plot_belief_umap(mc_bank, ch, kind="Model", decode=decode, path=p),
               mc_bank is not None)

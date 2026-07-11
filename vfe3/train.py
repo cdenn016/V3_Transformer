@@ -43,7 +43,8 @@ from vfe3.timing import TrainingTimer
 from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source for the phi-clamp threshold (M2)
 
 
-_PHI_CLAMP_WARNED: bool = False
+_PHI_CLAMP_WARNED:   bool = False
+_S_PHI_CLAMP_WARNED: bool = False
 _PhiClampGramKey = Tuple[int, Tuple[int, ...], torch.device, torch.dtype, int]
 _PHI_CLAMP_GRAM_CACHE: Dict[
     _PhiClampGramKey,
@@ -91,7 +92,7 @@ def _warn_phi_transport_clamp(
 
     max_norm: float = TRANSPORT_CLAMP_MAX_NORM,   # single source: stable_matrix_exp_pair's Frobenius clamp
 ) -> None:
-    r"""Warn ONCE when a gauge-frame table's embedded Frobenius norm exceeds the transport clamp.
+    r"""Warn once per channel when a gauge-frame table exceeds the transport clamp.
 
     ``stable_matrix_exp_pair`` rescales any ``||M||_F > max_norm`` (the shared transport-clamp
     default) and returns the
@@ -103,31 +104,41 @@ def _warn_phi_transport_clamp(
     ``||sum_a phi^a G_a||_F^2 = phi^T Gram phi``, ``Gram_ab = tr(G_a^T G_b)`` -- one (rows, n_gen)
     matmul, never materializing the (rows, K, K) embedding.
     """
-    global _PHI_CLAMP_WARNED
-    if _PHI_CLAMP_WARNED:
-        return
+    global _PHI_CLAMP_WARNED, _S_PHI_CLAMP_WARNED
     gen = model.group.generators                       # (n_gen, K, K)
-    tables = [("phi_embed", getattr(model.prior_bank, "phi_embed", None)),
-              ("pos_phi_free", getattr(model, "pos_phi_free", None))]
+    tables = [("belief.phi_embed", getattr(model.prior_bank, "phi_embed", None)),
+              ("model.s_phi_embed", getattr(model.prior_bank, "s_phi_embed", None)),
+              ("belief.pos_phi_free", getattr(model, "pos_phi_free", None)),
+              ("model.s_pos_phi_free", getattr(model, "s_pos_phi_free", None))]
     with torch.no_grad():
         gram = _cached_phi_clamp_gram(gen)              # (n_gen, n_gen) = tr(G_a^T G_b)
         for name, tab in tables:
             if tab is None:
                 continue
+            model_frame = name.startswith("model.")
+            if (_S_PHI_CLAMP_WARNED if model_frame else _PHI_CLAMP_WARNED):
+                continue
             phi = tab.reshape(-1, tab.shape[-1]).to(gram.dtype)
             frob2_max = ((phi @ gram) * phi).sum(-1).max()
             if bool(frob2_max > max_norm ** 2):        # host sync: log-cadence only
                 import warnings
+                remediation = (
+                    "lower m_s_phi_lr or accept the surrogate model transport"
+                    if model_frame else
+                    "bound the belief frame (mass_phi, lower m_phi_lr) or accept the surrogate transport"
+                )
                 warnings.warn(
                     f"{name}: embedded gauge-frame Frobenius norm "
                     f"{float(frob2_max.clamp(min=0.0).sqrt()):.2f} exceeds the transport clamp "
                     f"max_norm={max_norm}; stable_matrix_exp_pair now returns the clamped surrogate "
-                    f"exp(max_norm*M/||M||), not exp(M). Bound the frame (mass_phi, lower m_phi_lr) "
-                    f"or accept the surrogate transport. Warned once; further drift is not re-reported.",
+                    f"exp(max_norm*M/||M||), not exp(M). {remediation}. Warned once for this "
+                    "channel; further drift is not re-reported.",
                     RuntimeWarning, stacklevel=2,
                 )
-                _PHI_CLAMP_WARNED = True
-                return
+                if model_frame:
+                    _S_PHI_CLAMP_WARNED = True
+                else:
+                    _PHI_CLAMP_WARNED = True
 
 
 def build_optimizer(
@@ -139,8 +150,9 @@ def build_optimizer(
     The three prior tables carry distinct natural scales, so each is given its own
     M-step learning rate: the mean table ``mu_embed`` at ``m_p_mu_lr``; the (log) scale
     tables ``sigma_log_embed`` and the decode temperature ``decode_log_scale`` together
-    at ``m_p_sigma_lr``; the gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``. The
-    weight decay ``cfg.weight_decay`` is shared.
+    at ``m_p_sigma_lr``; the belief gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``;
+    and an active independent model frame at ``m_s_phi_lr``. The weight decay
+    ``cfg.weight_decay`` is shared.
 
     Optional parameters are grouped only when their toggle is on: the linear decode weight
     ``output_proj_weight`` (use_prior_bank=False) at ``m_p_mu_lr`` (a mean-readout scale); the
@@ -231,6 +243,20 @@ def build_optimizer(
             pos_group["gauge"] = True
             pos_group["weight_decay"] = 0.0
         groups.append(pos_group)
+    if getattr(pb, "s_phi_embed", None) is not None:             # s_frame_mode='phi_tilde'
+        model_frame_params = [pb.s_phi_embed]
+        if getattr(model, "s_pos_phi_free", None) is not None:
+            model_frame_params.append(model.s_pos_phi_free)
+        model_frame_group = {
+            "params": model_frame_params,
+            "lr": cfg.m_s_phi_lr,
+            "weight_decay": cfg.phi_weight_decay,
+            "role": "phi",
+        }
+        if nat and all(parameter.shape[-1] == n_gen for parameter in model_frame_params):
+            model_frame_group["gauge"] = True
+            model_frame_group["weight_decay"] = 0.0
+        groups.append(model_frame_group)
     if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (lambda_gamma>0 or
         groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu"})    # prior_source=model_channel):
         groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd})  # mean@m_p_mu_lr, log-scale@
@@ -899,6 +925,12 @@ def train(
     # this is exactly the pure half-cosine-to-zero (the theoretically pure path). base_lrs are the
     # CONFIGURED per-group LRs, captured before any scheduler multiplier or resume-load mutates group['lr'].
     base_lrs = [g["lr"] for g in optimizer.param_groups]
+    s_phi_parameter = getattr(model.prior_bank, "s_phi_embed", None)
+    s_phi_group_index = (
+        next(index for index, group in enumerate(optimizer.param_groups)
+             if any(parameter is s_phi_parameter for parameter in group["params"]))
+        if s_phi_parameter is not None else None
+    )
 
     # Opt-in RESUME (PL8): an explicit resume_from arg, else cfg.resume_from, else from scratch. When set,
     # restore model weights + AdamW momentum + RNG from the checkpoint and rebuild the cosine LambdaLR at
@@ -1210,6 +1242,8 @@ def train(
                 "holonomy_deviation": d["holonomy_deviation"],
                 "gauge_trace_spread": d["gauge_trace_spread"],
             }
+            if s_phi_group_index is not None:
+                row["lr_s_phi"] = float(lrs[s_phi_group_index])
             # Peak memory (Tier-1): CUDA peak MB at the clean train-window boundary.
             row["peak_mem_mb"] = peak_mem_mb
             # Learnable softmax temperatures (default-off): log the live kappa values once per
@@ -1462,7 +1496,8 @@ def _banner(
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
         *dead_line,
-        f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  phi={cfg.m_phi_lr}",
+        f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  "
+        f"phi={cfg.m_phi_lr}  s_phi={cfg.m_s_phi_lr}",
         f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",

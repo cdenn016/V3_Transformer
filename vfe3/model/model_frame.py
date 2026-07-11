@@ -1,6 +1,6 @@
 r"""Registry-backed selection of the model-channel gauge frame."""
 
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -34,6 +34,11 @@ def get_model_frame(name: str) -> ModelFrameBuilder:
     return _MODEL_FRAMES[name]
 
 
+def model_frame_modes() -> Tuple[str, ...]:
+    r"""Return the registered model-frame configuration keys."""
+    return tuple(sorted(_MODEL_FRAMES))
+
+
 @register_model_frame("tied")
 def _tied_model_frame(
     belief_phi: torch.Tensor,
@@ -49,14 +54,14 @@ def _independent_model_frame(
     belief_phi: torch.Tensor,
 
     *,
+    pos_phi_scale: float                  = 0.02,
+    bch_order:     int                    = 4,
+    project_slk:   bool                   = False,
+    pos_phi:       str                    = "none",
+    compose_mode:  str                    = "bch",
     model_phi:     Optional[torch.Tensor] = None,
-    group:         Optional[GaugeGroup]  = None,
+    group:         Optional[GaugeGroup]   = None,
     pos_phi_free:  Optional[torch.Tensor] = None,
-    pos_phi:       str = "none",
-    compose_mode:  str = "bch",
-    bch_order:     int = 4,
-    pos_phi_scale: float = 0.02,
-    project_slk:   bool = False,
     **kwargs,
 ) -> torch.Tensor:
     r"""Compose the independently stored model token and positional frame coordinates."""
@@ -80,14 +85,15 @@ def resolve_model_frame(
 
     *,
     mode:          str,
+
+    pos_phi_scale: float                  = 0.02,
+    bch_order:     int                    = 4,
+    project_slk:   bool                   = False,
+    pos_phi:       str                    = "none",
+    compose_mode:  str                    = "bch",
     model_phi:     Optional[torch.Tensor] = None,
-    group:         Optional[GaugeGroup]  = None,
+    group:         Optional[GaugeGroup]   = None,
     pos_phi_free:  Optional[torch.Tensor] = None,
-    pos_phi:       str = "none",
-    compose_mode:  str = "bch",
-    bch_order:     int = 4,
-    pos_phi_scale: float = 0.02,
-    project_slk:   bool = False,
 ) -> torch.Tensor:
     r"""Dispatch model-frame resolution without teaching consumers about frame storage."""
     return get_model_frame(mode)(

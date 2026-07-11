@@ -720,7 +720,7 @@ class VFEModel(nn.Module):
     def _refine_s(
         self,
         token_ids:          torch.Tensor,   # (B, N) integer token ids
-        phi0:               torch.Tensor,   # (B, N, n_gen) encoded gauge frame (shared, held FIXED)
+        phi0:               torch.Tensor,   # (B, N, n_gen) effective model frame (held FIXED)
 
         *,
         e_step_gradient:    str                    = "unroll",
@@ -728,7 +728,7 @@ class VFEModel(nn.Module):
         prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,
     ) -> 'tuple[torch.Tensor, torch.Tensor]':
         r"""Refine the model channel s by its own E-step toward the frozen hyper-prior r plus the
-        gamma model-consensus, with the shared gauge frame phi0 held fixed (e_phi_lr=0). Returns the
+        gamma model-consensus, with the selected model frame phi0 held fixed (e_phi_lr=0). Returns the
         refined (mu_s, sigma_s); the s-tables train through the unrolled trajectory."""
         from vfe3.belief import BeliefState
         from vfe3.inference.e_step import e_step
@@ -789,7 +789,7 @@ class VFEModel(nn.Module):
             phi_precond_mode=cfg.phi_precond_mode,
             phi_retract_mode=cfg.phi_retract_mode,
             spd_retract_mode=cfg.spd_retract_mode,
-            # TIED FLAT transport for the s-channel, INTENTIONALLY ignoring cfg.transport_mode
+            # FLAT model-frame transport for the s-channel, INTENTIONALLY ignoring cfg.transport_mode
             # (audit 2026-06-10 F7, mirroring _gamma_coupling_term's documented choice): the model
             # channel refines under the flat phi0 cocycle even when the belief channel runs
             # regime_ii -- the learned edge connection is a belief-channel object (delta reads the
@@ -1541,12 +1541,12 @@ class VFEModel(nn.Module):
             # object as the belief beta block, so it REUSES pairwise_energy + reduced_free_energy with
             # (q,p,beta,pi,tau) -> (s,Omega s,gamma,pi^s,tau_g). The s tables are always diagonal (V,K),
             # so the kernel is DiagonalGaussian regardless of cfg.family; divergence_family is the
-            # orthogonal functional seam. TIED transport: Omega_tilde is the flat phi-cocycle
-            # exp(phi_i)exp(-phi_j) from the CONVERGED belief frame out.phi (exact tie for the default
-            # flat regime; a documented simplification under regime_ii), DETACHED -- so the gamma
+            # orthogonal functional seam. Omega_tilde is the selected flat model-frame cocycle,
+            # tied to the converged belief frame by default or independently parameterized under
+            # s_frame_mode='phi_tilde'. It is DETACHED on this scored path, so the gamma
             # gradient flows ONLY to the s tables and the forward (logits/ce above) is byte-identical
             # to the gamma=0 path (the model channel is predictively INERT: s does NOT feed q). The
-            # detach deliberately severs the phi<-gamma coupling that full tied transport would carry in
+            # detach deliberately severs the model-frame <- gamma coupling that a scored frame update would carry in
             # the canonical E-step F; restoring it (or keeping it severed) is part of the deferred s->q
             # design, NOT this term. Computed once per forward at the loss level (like diagnostics()).
             # The body lives in _gamma_coupling_term so diagnostics logs the SAME term (audit V2).
@@ -1654,7 +1654,7 @@ class VFEModel(nn.Module):
     def _gamma_energy(
         self,
         token_ids: torch.Tensor,             # (B, N) integer token ids
-        phi:       torch.Tensor,             # (B, N, n_gen) gauge frame (TIED flat transport)
+        phi:       torch.Tensor,             # (B, N, n_gen) explicit effective model frame
 
         *,
         omega:     'torch.Tensor | CompactBlockElement | None' = None,  # stored belief frame; None -> phi
@@ -1664,8 +1664,9 @@ class VFEModel(nn.Module):
         r"""Shared model-coupling setup: the s-channel pairwise energy E^s_ij, the gamma softmax
         temperature tau_g, and the gamma attention log-prior.
 
-        The s-channel mirror of the belief beta channel under TIED FLAT transport from ``phi``
-        (Omega_tilde_ij = exp(phi_i) exp(-phi_j)): E^s_ij = D(s_i || Omega_tilde_ij s_j) on the
+        The s-channel mirror of the belief beta channel under FLAT transport from the explicit
+        model frame ``phi`` (Omega_tilde_ij = exp(phi_i) exp(-phi_j)): E^s_ij =
+        D(s_i || Omega_tilde_ij s_j) on the
         diagonal s tables, per irrep block (head). Transport is factored-when-fusable (audit P4),
         exactly the E-step dispatch. Consumed by :meth:`_gamma_coupling_term` (the forward loss),
         :meth:`_gamma_coupling_terms` (the split diagnostic), and :meth:`gamma_attention_maps`
@@ -1779,8 +1780,8 @@ class VFEModel(nn.Module):
         of :meth:`attention_maps`.
 
         gamma_ij = softmax_j( log pi^s_ij - E^s_ij / tau_g ) on the model-channel beliefs s under the
-        TIED FLAT transport from the CONVERGED belief gauge frame (the frame :meth:`diagnostics` and
-        the gamma loss evaluate the block at). Returns ``(H, N, N)`` (rows = query i, cols = key j;
+        selected FLAT model transport (the tied converged belief frame or the independently stored
+        phi_tilde frame). Returns ``(H, N, N)`` (rows = query i, cols = key j;
         H = len(group.irrep_dims), 1 for a single-block group) or ``None`` when the model channel is
         inactive (no s tables). OFF the training hot path (no_grad); for periodic figure generation.
         """
@@ -2088,7 +2089,7 @@ class VFEModel(nn.Module):
         self,
         log_prior: Optional[torch.Tensor],   # (N,N)/(H,N,N) belief log-prior (precision bias already folded), or None
         token_ids: torch.Tensor,             # (B, N) integer token ids
-        phi:       torch.Tensor,             # (B, N, n_gen) gauge frame for the gamma TIED flat transport
+        phi:       torch.Tensor,             # (B, N, n_gen) explicit effective model frame
 
         *,
         log_eps:    float                                              = 1e-12,  # floor for log(pi) on allowed support
@@ -2508,7 +2509,7 @@ class VFEModel(nn.Module):
         if cfg.lambda_gamma > 0.0 or cfg.s_e_step:                  # gamma block evaluated at out.phi
             tied_model_frame = cfg.s_frame_mode == "tied"
             gamma_model_phi = (self._resolve_model_frame(token_ids[:1], out.phi.unsqueeze(0))
-                               if snapshot is None else snapshot.model_phi)
+                               if snapshot is None else snapshot.model_phi[:1])
             g = self._gamma_coupling_terms(
                 token_ids[:1], gamma_model_phi,
                 omega=(out.omega.unsqueeze(0)

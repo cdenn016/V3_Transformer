@@ -748,8 +748,8 @@ def s_channel_refinement(model, token_ids: torch.Tensor) -> Optional[dict]:
 
     Returns ``None`` when ``cfg.s_e_step`` is False (the s-channel does not run, so the figure is
     skipped). Otherwise replays the SAME two steps ``forward``/``diagnostics`` take -- the static
-    encode ``s0 = encode_s(tokens)`` and the refined ``s1 = _refine_s(tokens, pos_phi(phi))`` under
-    the frozen gauge frame -- and measures, per token position, how far the model channel moved and
+    encode ``s0 = encode_s(tokens)`` and the refined ``s1 = _refine_s(tokens, model_phi)`` under
+    the selected fixed model frame -- and measures, per token position, how far the model channel moved and
     how it tracks the frozen hyper-prior centroid ``r = (r_mu, exp(r_sigma_log))``:
 
       mu_delta[i]       = ||s1_mu[i]   - s0_mu[i]||_2                         (mean refinement)
@@ -859,8 +859,8 @@ def gamma_attention(
     :meth:`VFEModel.gamma_attention_maps`.
 
     Returns ``None`` when the model channel is inactive. Otherwise returns the per-head gamma weights
-    ``gamma`` (H, N, N) = softmax_j(log pi^s - E^s/tau_g) on the model-channel beliefs s under the tied
-    flat transport from the converged belief gauge frame -- the s-channel analogue of the belief beta maps."""
+    ``gamma`` (H, N, N) = softmax_j(log pi^s - E^s/tau_g) on the model-channel beliefs s under the
+    selected effective model frame -- the s-channel analogue of the belief beta maps."""
     ids = token_ids if snapshot is not None else token_ids[:1]
     g = model.gamma_attention_maps(ids, snapshot=snapshot)
     if g is None:
@@ -883,9 +883,11 @@ def model_channel_bank(
     for each batch it looks up the static model-channel belief ``s_i = N(s_mu, s_sigma)`` via ``encode_s``,
     and -- when ``s_e_step`` -- refines it through the s E-step (so s is position-dependent, exactly as the
     belief bank's q is), then stacks the per-token ``mu = s_mu`` (M, K) and ``sigma = s_sigma`` (M, K) with
-    ``token_ids`` (M,) and ``seq_idx`` (M,). There is NO ``phi`` channel: the model channel shares the belief
-    gauge frame, so an s-channel phi UMAP would duplicate the belief one. Feeds ``plot_belief_umap`` directly
-    (channels mu / sigma), so the redesigned cluster-and-distinctive-token view applies to the slow channel.
+    ``token_ids`` (M,) and ``seq_idx`` (M,). Under ``s_frame_mode='phi_tilde'`` the bank also carries
+    the independently resolved model frame ``phi`` (M, n_gen), enabling a model-frame UMAP. Tied mode
+    omits that duplicate channel and preserves the existing bank/output contract. Feeds
+    ``plot_belief_umap`` directly, so the redesigned cluster-and-distinctive-token view applies to the
+    slow channel.
     NB i and j are token POSITIONS, not separate channels: this single bank embeds every s_i (all positions);
     the i<->j pairing lives only in the gamma_ij model-coupling attention (see :func:`gamma_attention`).
     """
@@ -894,20 +896,26 @@ def model_channel_bank(
     device = device or _model_device(model)
     was_training = model.training
     model.eval()
-    mus, sigmas, tids, sidx = [], [], [], []
+    mus, sigmas, phis, tids, sidx = [], [], [], [], []
     seq_counter = 0
     try:
         for tokens in token_batches:
             tokens = tokens.to(device)
             s_mu, s_sigma = model.prior_bank.encode_s(tokens)         # (B, N, K) static model channel
             b, n = tokens.shape
+            model_phi = None
             if model.cfg.s_e_step:                                    # refine -> position-dependent, like q
                 belief_phi = model._apply_pos_phi(model.prior_bank.encode(tokens).phi)
-                phi0 = model._resolve_model_frame(tokens, belief_phi)
+                model_phi = model._resolve_model_frame(tokens, belief_phi)
                 rope = model._rope_rotation(n, device)
-                s_mu, s_sigma = model._refine_s(tokens, phi0, rope=rope)
+                s_mu, s_sigma = model._refine_s(tokens, model_phi, rope=rope)
             mus.append(s_mu.reshape(b * n, -1))
             sigmas.append(s_sigma.reshape(b * n, -1))
+            if model.cfg.s_frame_mode == "phi_tilde":
+                if model_phi is None:
+                    belief_phi = model._apply_pos_phi(model.prior_bank.encode(tokens).phi)
+                    model_phi = model._resolve_model_frame(tokens, belief_phi)
+                phis.append(model_phi.reshape(b * n, -1))
             tids.append(tokens.reshape(b * n))
             sidx.append(torch.arange(seq_counter, seq_counter + b, device=device).repeat_interleave(n))
             seq_counter += b
@@ -916,12 +924,15 @@ def model_channel_bank(
     finally:
         if was_training:
             model.train()
-    return {
+    bank = {
         "mu":        torch.cat(mus),
         "sigma":     torch.cat(sigmas),
         "token_ids": torch.cat(tids),
         "seq_idx":   torch.cat(sidx),
     }
+    if phis:
+        bank["phi"] = torch.cat(phis)
+    return bank
 
 
 def _vocab_display_panel(

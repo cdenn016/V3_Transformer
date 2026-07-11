@@ -1,6 +1,7 @@
 """Independent model-channel gauge-frame contracts (phi-tilde)."""
 
 import copy
+import csv
 
 import pytest
 import torch
@@ -10,6 +11,11 @@ import train_vfe3
 from vfe3.config import VFE3Config
 from vfe3.geometry.transport import compute_transport_operators
 from vfe3.model.model import VFEModel
+from vfe3.model import model_frame
+from vfe3.run_artifacts import RunArtifacts, load_checkpoint
+from vfe3.train import _banner as training_banner
+from vfe3.train import _warn_phi_transport_clamp, build_optimizer, train
+from vfe3.viz import extract
 
 
 BASE = dict(
@@ -62,6 +68,16 @@ def test_tied_mode_adds_no_state_or_rng_draw() -> None:
     assert not hasattr(explicit.prior_bank, "s_phi_embed")
     assert not hasattr(explicit, "s_pos_phi_free")
 
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+    targets = torch.tensor([[1, 2, 3, 4]])
+    implicit_logits = implicit(token_ids)
+    explicit_logits = explicit(token_ids)
+    _, implicit_loss, implicit_ce = implicit(token_ids, targets)
+    _, explicit_loss, explicit_ce = explicit(token_ids, targets)
+    assert torch.equal(implicit_logits, explicit_logits)
+    assert torch.equal(implicit_loss, explicit_loss)
+    assert torch.equal(implicit_ce, explicit_ce)
+
 
 def test_phi_tilde_clones_complete_learned_frame_without_aliasing_or_rng() -> None:
     torch.manual_seed(31)
@@ -109,6 +125,15 @@ def test_invalid_model_frame_mode_is_rejected() -> None:
         _cfg(s_frame_mode="not_a_model_frame")
 
 
+def test_registered_model_frame_mode_is_config_selectable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        model_frame._MODEL_FRAMES,
+        "registered_test_frame",
+        lambda belief_phi, **kwargs: belief_phi,
+    )
+    assert _cfg(s_frame_mode="registered_test_frame").s_frame_mode == "registered_test_frame"
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -116,11 +141,24 @@ def test_invalid_model_frame_mode_is_rejected() -> None:
         {"e_step_gradient": "straight_through"},
         {"detach_e_step": True},
         {"m_s_phi_lr": 0.0},
+        {"lambda_gamma": 0.0},
+        {"e_s_mu_lr": 0.0, "e_s_sigma_lr": 0.0},
     ],
 )
 def test_phi_tilde_warns_when_its_training_path_is_severed(overrides: dict[str, object]) -> None:
     with pytest.warns(UserWarning, match="phi_tilde"):
         _cfg(s_frame_mode="phi_tilde", **overrides)
+
+
+def test_phi_tilde_warns_when_a_detached_oracle_severs_its_gradient() -> None:
+    with pytest.warns(UserWarning, match="s_phi_embed/s_pos_phi_free"):
+        _cfg(
+            s_frame_mode="phi_tilde",
+            pos_phi="none",
+            gradient_mode="smoothing",
+            e_step_update="gradient",
+            oracle_unroll_grad=False,
+        )
 
 
 @pytest.mark.parametrize("gauge_transport", ["off", "frozen"])
@@ -170,6 +208,62 @@ def test_phi_tilde_effective_frame_and_transport_match_tied_at_clone_init() -> N
     belief_omega = compute_transport_operators(belief_phi, model.group)["Omega"]
     model_omega = compute_transport_operators(model_phi, model.group)["Omega"]
     assert torch.equal(model_omega, belief_omega)
+
+
+def test_phi_tilde_frame_graph_is_independent_of_the_belief_frame_graph() -> None:
+    model = _model(s_frame_mode="phi_tilde")
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+    belief_phi = model._apply_pos_phi(model.prior_bank.encode(token_ids).phi)
+    model_phi = model._resolve_model_frame(token_ids, belief_phi)
+
+    model_phi.square().sum().backward()
+
+    assert model.prior_bank.phi_embed.grad is None
+    assert model.pos_phi_free.grad is None
+    for parameter in (model.prior_bank.s_phi_embed, model.s_pos_phi_free):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert float(parameter.grad.abs().sum()) > 0.0
+
+
+def test_phi_tilde_gamma_energy_respects_a_common_coordinate_pushforward() -> None:
+    model = _model(
+        s_frame_mode="phi_tilde",
+        gauge_group="so_k",
+        n_heads=1,
+        pos_phi="none",
+    ).double()
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+    with torch.no_grad():
+        model.prior_bank.phi_embed.zero_()
+        model.prior_bank.s_phi_embed.zero_()
+        model.prior_bank.s_sigma_log_embed.zero_()
+    belief_phi0 = model.prior_bank.encode(token_ids).phi
+    model_phi0 = model._resolve_model_frame(token_ids, belief_phi0)
+    energy0 = model._gamma_energy(token_ids, model_phi0)[0]
+    s_mu0 = model.prior_bank.s_mu_embed.detach().clone()
+
+    eta = 0.2 * torch.randn(
+        model.group.generators.shape[0],
+        dtype=torch.float64,
+        generator=torch.Generator().manual_seed(7),
+    )
+    gauge = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", eta, model.group.generators))
+    with torch.no_grad():
+        model.prior_bank.mu_embed.copy_(
+            torch.einsum("kl,vl->vk", gauge, model.prior_bank.mu_embed))
+        model.prior_bank.s_mu_embed.copy_(
+            torch.einsum("kl,vl->vk", gauge, model.prior_bank.s_mu_embed))
+        model.prior_bank.r_mu.copy_(gauge @ model.prior_bank.r_mu)
+        model.prior_bank.phi_embed.copy_(eta.expand_as(model.prior_bank.phi_embed))
+        model.prior_bank.s_phi_embed.copy_(eta.expand_as(model.prior_bank.s_phi_embed))
+    belief_phi1 = model.prior_bank.encode(token_ids).phi
+    model_phi1 = model._resolve_model_frame(token_ids, belief_phi1)
+    energy1 = model._gamma_energy(token_ids, model_phi1)[0]
+
+    assert not torch.equal(model.prior_bank.s_mu_embed, s_mu0)
+    assert torch.equal(model_phi1, belief_phi1)
+    assert torch.allclose(energy1, energy0, atol=5e-8, rtol=1e-8)
 
 
 def test_phi_tilde_transport_is_a_flat_vertex_cocycle() -> None:
@@ -239,3 +333,212 @@ def test_diagnostic_snapshot_freezes_the_effective_model_frame() -> None:
         model.prior_bank.s_phi_embed.add_(0.5)
     assert torch.equal(snapshot.model_phi, frozen)
     assert torch.equal(model.gamma_attention_maps(token_ids, snapshot=snapshot), snapshot.gamma_maps)
+
+
+def test_batch_snapshot_diagnostics_reduce_the_first_model_frame_only() -> None:
+    model = _model(s_frame_mode="phi_tilde", pos_phi="none")
+    token_ids = torch.tensor([
+        [0, 1, 2, 3],
+        [8, 7, 6, 5],
+    ])
+    batch_snapshot = model.build_diagnostic_snapshot(token_ids)
+    first_snapshot = model.build_diagnostic_snapshot(token_ids[:1])
+
+    batch_diagnostics = model.diagnostics(token_ids, snapshot=batch_snapshot)
+    first_diagnostics = model.diagnostics(token_ids[:1], snapshot=first_snapshot)
+
+    assert batch_diagnostics["gamma_coupling"] == pytest.approx(
+        first_diagnostics["gamma_coupling"], abs=1e-7)
+    assert batch_diagnostics["gamma_meta_entropy"] == pytest.approx(
+        first_diagnostics["gamma_meta_entropy"], abs=1e-7)
+
+
+def _optimizer_group_for(
+    optimizer: torch.optim.Optimizer,
+    parameter: torch.nn.Parameter,
+) -> dict[str, object]:
+    groups = [group for group in optimizer.param_groups
+              if any(candidate is parameter for candidate in group["params"])]
+    assert len(groups) == 1
+    return groups[0]
+
+
+def test_phi_tilde_optimizer_uses_its_own_lr_and_exact_coverage() -> None:
+    model = _model(
+        s_frame_mode="phi_tilde",
+        m_s_phi_lr=0.007,
+        phi_weight_decay=0.031,
+    )
+    optimizer = build_optimizer(model, model.cfg)
+
+    token_group = _optimizer_group_for(optimizer, model.prior_bank.s_phi_embed)
+    position_group = _optimizer_group_for(optimizer, model.s_pos_phi_free)
+    assert token_group is position_group
+    assert token_group["lr"] == 0.007
+    assert token_group["role"] == "phi"
+    assert token_group["weight_decay"] == 0.031
+
+    grouped = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+    assert len(grouped) == len({id(parameter) for parameter in grouped})
+    assert {parameter for parameter in model.parameters() if parameter.requires_grad} == set(grouped)
+
+
+def test_phi_tilde_natural_gradient_group_is_geometric_and_decay_free() -> None:
+    model = _model(
+        s_frame_mode="phi_tilde",
+        m_phi_natural_grad=True,
+        phi_precond_mode="pullback_per_block",
+        m_s_phi_lr=0.006,
+        phi_weight_decay=0.2,
+    )
+    optimizer = build_optimizer(model, model.cfg)
+    group = _optimizer_group_for(optimizer, model.prior_bank.s_phi_embed)
+
+    assert group is _optimizer_group_for(optimizer, model.s_pos_phi_free)
+    assert group["gauge"] is True
+    assert group["weight_decay"] == 0.0
+    assert group["lr"] == 0.006
+
+
+@pytest.mark.parametrize("e_step_update", ["gradient", "mm_exact"])
+def test_attached_model_estep_trains_and_moves_phi_tilde(e_step_update: str) -> None:
+    model = _model(
+        s_frame_mode="phi_tilde",
+        pos_phi="none",
+        e_step_update=e_step_update,
+        m_s_phi_lr=0.01,
+        phi_weight_decay=0.0,
+    )
+    optimizer = build_optimizer(model, model.cfg)
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+    targets = torch.tensor([[1, 2, 3, 4]])
+    before = model.prior_bank.s_phi_embed.detach().clone()
+
+    _, loss, _ = model(token_ids, targets)
+    loss.backward()
+    gradient = model.prior_bank.s_phi_embed.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert float(gradient.abs().sum()) > 0.0
+    optimizer.step()
+
+    assert not torch.equal(model.prior_bank.s_phi_embed, before)
+
+
+def test_attached_model_estep_trains_and_moves_learned_model_position_frame() -> None:
+    model = _model(
+        s_frame_mode="phi_tilde",
+        pos_phi="learned",
+        m_s_phi_lr=0.01,
+        phi_weight_decay=0.0,
+    )
+    optimizer = build_optimizer(model, model.cfg)
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+    targets = torch.tensor([[1, 2, 3, 4]])
+    token_before = model.prior_bank.s_phi_embed.detach().clone()
+    position_before = model.s_pos_phi_free.detach().clone()
+
+    _, loss, _ = model(token_ids, targets)
+    loss.backward()
+    for parameter in (model.prior_bank.s_phi_embed, model.s_pos_phi_free):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert float(parameter.grad.abs().sum()) > 0.0
+    optimizer.step()
+
+    assert not torch.equal(model.prior_bank.s_phi_embed, token_before)
+    assert not torch.equal(model.s_pos_phi_free, position_before)
+
+
+def test_phi_tilde_checkpoint_round_trip_restores_frame_and_config(tmp_path) -> None:
+    cfg = _cfg(s_frame_mode="phi_tilde", m_s_phi_lr=0.007)
+    model = VFEModel(cfg)
+    optimizer = build_optimizer(model, cfg)
+    with torch.no_grad():
+        model.prior_bank.s_phi_embed.add_(0.25)
+        model.s_pos_phi_free.sub_(0.125)
+    token_frame = model.prior_bank.s_phi_embed.detach().clone()
+    position_frame = model.s_pos_phi_free.detach().clone()
+
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model)
+    checkpoint = artifacts.save_checkpoint(3, model, optimizer, cfg)
+    bundle = torch.load(checkpoint, weights_only=True)
+    assert bundle["config"]["s_frame_mode"] == "phi_tilde"
+    assert bundle["config"]["m_s_phi_lr"] == 0.007
+
+    restored = VFEModel(cfg)
+    restored_optimizer = build_optimizer(restored, cfg)
+    assert load_checkpoint(checkpoint, restored, restored_optimizer, cfg=cfg) == 3
+    assert torch.equal(restored.prior_bank.s_phi_embed, token_frame)
+    assert torch.equal(restored.s_pos_phi_free, position_frame)
+
+
+def test_strict_state_loading_rejects_tied_phi_tilde_migration() -> None:
+    tied = _model(s_frame_mode="tied")
+    independent = _model(s_frame_mode="phi_tilde")
+
+    with pytest.raises(RuntimeError, match="Error.*state_dict"):
+        tied.load_state_dict(independent.state_dict(), strict=True)
+    with pytest.raises(RuntimeError, match="Error.*state_dict"):
+        independent.load_state_dict(tied.state_dict(), strict=True)
+
+
+def test_phi_tilde_learning_rate_is_visible_in_banner_and_metrics(tmp_path) -> None:
+    cfg = _cfg(s_frame_mode="phi_tilde", m_s_phi_lr=0.007)
+    model = VFEModel(cfg)
+    banner = training_banner(
+        model,
+        cfg,
+        dataset="synthetic",
+        device=torch.device("cpu"),
+        n_steps=1,
+    )
+    assert "s_phi=0.007" in banner
+
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+    targets = torch.tensor([[1, 2, 3, 4]])
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model)
+    train(
+        model,
+        [(token_ids, targets)],
+        cfg,
+        n_steps=1,
+        log_interval=1,
+        eval_interval=0,
+        artifacts=artifacts,
+        generate_samples=False,
+    )
+    with open(artifacts.csv_path, newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert "lr_s_phi" in row
+    assert float(row["lr_s_phi"]) >= 0.0
+
+
+def test_model_channel_bank_exposes_only_the_independent_model_frame() -> None:
+    token_ids = torch.tensor([[0, 1, 2, 3]])
+    independent = _model(s_frame_mode="phi_tilde")
+    independent_bank = extract.model_channel_bank(independent, [token_ids])
+    belief_phi = independent._apply_pos_phi(independent.prior_bank.encode(token_ids).phi)
+    expected_phi = independent._resolve_model_frame(token_ids, belief_phi).reshape(-1, belief_phi.shape[-1])
+
+    assert independent_bank is not None
+    assert torch.equal(independent_bank["phi"], expected_phi)
+
+    tied = _model(s_frame_mode="tied")
+    tied_bank = extract.model_channel_bank(tied, [token_ids])
+    assert tied_bank is not None
+    assert "phi" not in tied_bank
+
+
+def test_transport_clamp_monitor_identifies_the_model_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vfe3.train as train_module
+
+    model = _model(s_frame_mode="phi_tilde", pos_phi="none")
+    with torch.no_grad():
+        model.prior_bank.phi_embed.zero_()
+        model.prior_bank.s_phi_embed.fill_(100.0)
+    monkeypatch.setattr(train_module, "_PHI_CLAMP_WARNED", False)
+    monkeypatch.setattr(train_module, "_S_PHI_CLAMP_WARNED", False)
+
+    with pytest.warns(RuntimeWarning, match="model.s_phi_embed.*m_s_phi_lr"):
+        _warn_phi_transport_clamp(model)
