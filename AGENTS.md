@@ -71,9 +71,39 @@ VFE3_TEST_DEVICE=cuda for the GPU).
 **user has RTX5090 GPU** - use cuda and code accordingly where applicable
 
 
-**ALWAYS BRANCH FRESH FROM MAIN** - each session should be a fresh branch from main
+## Mandatory Git Lifecycle
 
-**DONT LEAVE MESSES!!** ALWAYS CLEAN UP temp FILES FROM ATOMIC EDITS AND SUCH WHEN FINISHED!
+For every task that changes files, the following workflow is the default definition of done. The
+user does not need to repeat it.
+
+1. Before editing, run `git fetch origin` and inspect the current `origin/main` log.
+2. Never work directly in the user's existing checkout. Create a separate temporary git worktree
+   and a fresh task branch from `origin/main`.
+3. Never stash, reset, clean, restore, overwrite, or otherwise alter pre-existing user changes.
+4. Make all task changes only inside the temporary worktree.
+5. Track every file created by the task, including reports, test artifacts, patches, logs, and
+   temporary files. Delete task-owned temporary artifacts before completion, but never delete files
+   that predated the task.
+6. Run verification appropriate to the change and inspect the actual exit status and
+   machine-readable results. Update the required dated post-edit document.
+7. Inspect `git status --short` and the staged diff, then commit every intended task change.
+8. Push the task branch to `origin`. After verification succeeds, merge the task branch into `main`
+   and push `main`.
+9. Fast-forward the user's local `main` checkout only when doing so cannot alter or overwrite user
+   WIP. If WIP prevents a safe fast-forward, leave it untouched and report that explicitly.
+10. After confirming the merge and push, remove the temporary worktree and delete the local task
+    branch. Run final cleanliness checks and report the task branch, commit SHA, pushed remote
+    branch, resulting `origin/main` SHA, verification result, worktree removal, and final
+    `git status --short`, including the owner of any remaining dirty files.
+
+A task is not complete merely because a file was edited. It is complete only after verified changes
+are committed, pushed, merged into `main`, `origin/main` is updated, safe local fast-forwarding is
+performed, and task-owned temporary artifacts are removed. If permissions, conflicts, failing
+verification, remote changes, or user WIP prevent any step, stop and report the exact blocker. Never
+silently substitute "changes are ready" for the required completed lifecycle.
+
+Do not claim that a repository is clean without showing the final `git status --short`. Do not claim
+that the remote is updated without fetching and inspecting `origin/main`.
 
 ## Mathematical Reference
 
