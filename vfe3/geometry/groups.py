@@ -39,7 +39,7 @@ class GaugeGroup:
     irrep_dims:           List[int]                          # block sizes; sum == K
     skew_symmetric:       bool                               # exp(-M) = exp(M)^T fast path
     omega_direct_capable: bool                   = False     # stored group-element frame U_i is implemented
-    invariant_families:   Tuple[str, ...]        = ("gaussian", "gaussian_full")  # exactly invariant under the GL(K) congruence; the diagonal readout is NOT (see check_admissible)
+    invariant_families:   Tuple[str, ...]        = ()        # registry-declared exact families; empty fails closed
     irrep_labels:         Optional[List[str]]    = None      # per-block label ('l1', 'sym2', ...); None = label-less
     algebra:              Optional[str]          = None      # irrep-registry algebra key ('so' | 'sp'); None = label-less
 
@@ -84,21 +84,28 @@ class GaugeGroup:
 
 
 _GROUPS: Dict[str, Callable[..., GaugeGroup]] = {}
+_GAUSSIAN_INVARIANT_FAMILIES = ("gaussian", "gaussian_full")
 
 
 def register_group(
     name: str,
 
     *,
-    override:             bool           = False,
-    omega_direct_capable: Optional[bool] = None,
+    override:             bool                   = False,
+    invariant_families:   Tuple[str, ...]        = (),
+
+    omega_direct_capable: Optional[bool]         = None,
 ) -> Callable:
     """Decorator registering a GaugeGroup builder under ``name``.
 
     ``omega_direct_capable`` advertises whether the registered builder supports stored
-    group-element frames. Duplicate keys fail closed (audit 2026-07-01 round-3): a second
-    registration under an existing name silently shadowed the first. Pass ``override=True`` to
-    replace deliberately.
+    group-element frames. ``invariant_families`` declares the family names whose divergences are
+    exactly invariant under this builder's group action; omission means no family is certified.
+    The wrapper writes both declarations onto itself and every returned :class:`GaugeGroup`, so an
+    explicit override replaces the registry callable and its complete metadata atomically.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an existing
+    name silently shadowed the first. Pass ``override=True`` to replace deliberately.
     """
     def _wrap(fn: Callable[..., GaugeGroup]) -> Callable[..., GaugeGroup]:
         if name in _GROUPS and not override:
@@ -108,6 +115,7 @@ def register_group(
             if omega_direct_capable is None
             else omega_direct_capable
         )
+        families = tuple(invariant_families)
 
         @wraps(fn)
         def _coherent_builder(*args, **kwargs) -> GaugeGroup:
@@ -117,9 +125,11 @@ def register_group(
                     f"gauge group builder {name!r} returned {type(group).__name__}, expected GaugeGroup"
                 )
             group.omega_direct_capable = capability
+            group.invariant_families = families
             return group
 
         setattr(_coherent_builder, "omega_direct_capable", capability)
+        setattr(_coherent_builder, "invariant_families", families)
         _GROUPS[name] = _coherent_builder
         return _coherent_builder
     return _wrap
@@ -134,7 +144,11 @@ def get_group(name: str) -> Callable[..., GaugeGroup]:
     return _GROUPS[name]
 
 
-@register_group("glk", omega_direct_capable=True)
+@register_group(
+    "glk",
+    omega_direct_capable=True,
+    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+)
 def _build_glk(
     K:       int,
 
@@ -152,7 +166,11 @@ def _build_glk(
     )
 
 
-@register_group("block_glk", omega_direct_capable=True)
+@register_group(
+    "block_glk",
+    omega_direct_capable=True,
+    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+)
 def _build_block_glk(
     K:               int,
     n_heads:         int,
@@ -190,7 +208,11 @@ def _build_block_glk(
     )
 
 
-@register_group("tied_block_glk", omega_direct_capable=True)
+@register_group(
+    "tied_block_glk",
+    omega_direct_capable=True,
+    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+)
 def _build_tied_block_glk(
     K:               int,
     n_heads:         int,
@@ -220,7 +242,11 @@ def _build_tied_block_glk(
     )
 
 
-@register_group("so_k", omega_direct_capable=True)
+@register_group(
+    "so_k",
+    omega_direct_capable=True,
+    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+)
 def _build_so_k(
     K:       int,
 
@@ -324,7 +350,11 @@ def check_admissible(
     return True
 
 
-@register_group("so_n", omega_direct_capable=True)
+@register_group(
+    "so_n",
+    omega_direct_capable=True,
+    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+)
 def _build_so_n(
     K:          int,
 
@@ -374,7 +404,11 @@ def _build_so_n(
     )
 
 
-@register_group("sp_n", omega_direct_capable=True)
+@register_group(
+    "sp_n",
+    omega_direct_capable=True,
+    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+)
 def _build_sp_n(
     K:          int,
 
@@ -417,7 +451,11 @@ def _build_sp_n(
     )
 
 
-@register_group("sp", omega_direct_capable=True)
+@register_group(
+    "sp",
+    omega_direct_capable=True,
+    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+)
 def _build_sp(
     K:       int,
 

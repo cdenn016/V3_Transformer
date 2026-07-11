@@ -802,19 +802,27 @@ def _cost_model_fields(
     d_head = K / n_blocks                                        # representative block dim
     model_channel = (cfg.lambda_h > 0.0 or cfg.lambda_gamma > 0.0
                      or cfg.prior_source == "model_channel" or cfg.s_e_step)
-    # ACTIVE params per token: decode reads every vocab row (2*V*K: mu+sigma readout) plus the single
-    # looked-up belief row (2K + n_gen). The V*n_gen phi bulk is NOT touched by decode.
-    active = (2 * V * K) + (2 * K + n_gen)
-    if not cfg.use_prior_bank:
-        active += V * K                                         # output_proj_weight (linear readout)
+    # ACTIVE params per token: the single looked-up belief row is always 2K+n_gen. The decoder then
+    # reads EITHER the prior-bank mean/variance rows (2VK) OR the linear output matrix (VK) and its
+    # optional V-vector bias. The V*n_gen phi bulk is not touched by either full-vocabulary readout.
+    token_row = 2 * K + n_gen
+    if cfg.use_prior_bank:
+        decode_readout = 2 * V * K
+    else:
+        decode_readout = V * K + (V if cfg.decode_bias else 0)
+    active = token_row + decode_readout
     if model_channel:
         active += 2 * V * K                                     # s tables enter encode/decode
-    # Transparent analytic FLOP proxy. Per token: decode matmul over all V (2VK) + L*T E-step
-    # iterations whose per-token cost is the O(N) attention energy (2*N*K) and the O(N) transport
-    # apply (2*N*d_head^2). Constants are O(1); this is a proxy, not a calibrated count.
+    # Transparent analytic FLOP proxy. Per token: decode over all V (2VK), L*T belief E-step
+    # iterations, and one T-iteration model-channel refinement when s_e_step is enabled. Each E-step
+    # iteration has O(N) attention energy (2NK) plus O(N) transport application (2N*d_head^2).
+    # Constants are O(1); this is a proxy, not a calibrated count.
     L, T, N = int(cfg.n_layers), int(cfg.n_e_steps), int(cfg.max_seq_len)
-    fpt_decode = 2.0 * V * K
-    fpt_estep  = L * T * (2.0 * N * K + 2.0 * N * d_head * d_head)
+    fpt_decode         = 2.0 * V * K
+    estep_kernel       = 2.0 * N * K + 2.0 * N * d_head * d_head
+    belief_estep       = L * T * estep_kernel
+    model_estep        = T * estep_kernel if cfg.s_e_step else 0.0
+    fpt_estep          = belief_estep + model_estep
     est_flops_analytic = (fpt_decode + fpt_estep) * float(tokens_seen)
     out: Dict[str, object] = {
         "embed_dim":               K,
@@ -1043,20 +1051,28 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     toggles intentionally, so a non-pure run is recorded (``on_pure_path=False`` with the offending
     flags), never flagged as wrong. ``pure_flags`` covers the principal gauge / decode / free-energy
     purity axes (canonical attention entropy, flat transport, constant/static coupling weights,
-    prior-bank decode, no head mixer, unweighted attention); it does NOT enumerate every default-OFF
-    learned-scalar toggle (pos_phi, learnable_r, t5_learnable_bias, use_cg_coupling),
+    prior-bank decode, full sigma updates, no two-hop/fixed-prior surrogate, no head mixer,
+    unweighted attention); it does NOT enumerate every default-OFF learned-scalar toggle
+    (pos_phi, learnable_r, t5_learnable_bias, use_cg_coupling),
     so ``on_pure_path`` certifies these axes rather than a full no-learned-parameter audit.
     ``gauge_flags``/``on_gauge_pure_path`` is a SECOND, independent axis (audit 2026-07-01 F8): the
-    gauge / model-channel path (learned gauge transport, no positional rotation, no model-channel
-    coupling) -- a run can be pure on the free-energy/decode axis while a gauge setting alters the
-    executed belief path, and vice versa. ``converged_stress`` reads the last finite value of each
-    guard / flatness column (None if absent)."""
+    gauge / model-channel path (learned gauge transport, phi parameterization, no reflection or
+    positional rotation, family/group invariance, no model-channel coupling) -- a run can be pure on
+    the free-energy/decode axis while a gauge setting alters the executed belief path, and vice versa.
+    ``converged_stress`` reads the last finite value of each guard / flatness column (None if absent)."""
     def _last(key: str) -> Optional[float]:
         for r in reversed(history):
             v = r.get(key)
             if isinstance(v, (int, float)) and math.isfinite(v):
                 return float(v)
         return None
+    from vfe3.geometry.groups import get_group
+
+    group_builder = get_group(cfg.gauge_group)
+    invariant_families = tuple(getattr(group_builder, "invariant_families", ()))
+    family_group_invariant = cfg.family in invariant_families
+    fixed_prior_surrogate = bool(cfg.precision_weighted_attention)
+
     pure_flags = {
         "canonical_attention_entropy": bool(cfg.include_attention_entropy),
         "flat_transport":              cfg.transport_mode == "flat",
@@ -1064,6 +1080,9 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
         "prior_bank_decode":           bool(cfg.use_prior_bank),
         "no_head_mixer":               not cfg.use_head_mixer,
         "unweighted_attention":        not cfg.precision_weighted_attention,
+        "full_sigma_update":           not cfg.skip_belief_sigma_update,
+        "no_twohop_coupling":          cfg.lambda_twohop == 0.0,
+        "no_fixed_prior_surrogate":    not fixed_prior_surrogate,
     }
     # Second, INDEPENDENT purity axis (audit 2026-07-01 F8): the gauge / model-channel path. Keyed
     # on pos_rotation itself rather than the RoPE sub-toggles (rope_full_gauge / rope_on_value),
@@ -1072,6 +1091,9 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
         "learned_gauge_transport":   cfg.gauge_transport == "on",
         "no_positional_rotation":    cfg.pos_rotation == "none",
         "no_model_channel_coupling": cfg.lambda_gamma == 0.0 and not cfg.s_e_step,
+        "phi_parameterization":      cfg.gauge_parameterization == "phi",
+        "no_reflection_sampling":    cfg.omega_reflection == "off" and cfg.phi_reflection == "off",
+        "family_group_invariant":    family_group_invariant,
     }
     return {
         "on_pure_path":       all(pure_flags.values()),
@@ -1092,11 +1114,19 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "rope_on_value":                bool(cfg.rope_on_value),
             "lambda_gamma":                 float(cfg.lambda_gamma),
             "s_e_step":                     bool(cfg.s_e_step),
+            "skip_belief_sigma_update":      bool(cfg.skip_belief_sigma_update),
+            "lambda_twohop":                 float(cfg.lambda_twohop),
+            "gauge_parameterization":        cfg.gauge_parameterization,
+            "omega_reflection":              cfg.omega_reflection,
+            "phi_reflection":                cfg.phi_reflection,
+            "gauge_group":                   cfg.gauge_group,
+            "family":                        cfg.family,
+            "group_invariant_families":      list(invariant_families),
             # Truthful fixed-surrogate ledger (C6): these derived booleans expose when the run
             # intentionally freezes a state-dependent quantity rather than following its full
             # joint objective. Defaults are False, preserving the pure path.
             "fixed_covariance_surrogate":   bool(getattr(cfg, "skip_belief_sigma_update", False)),
-            "detached_precision_prior":     bool(cfg.precision_weighted_attention),
+            "detached_precision_prior":     fixed_prior_surrogate,
             "detached_query_adaptive_tau":  bool(getattr(cfg, "query_adaptive_tau", False)),
             "state_dependent_alpha_majorizer": (
                 getattr(cfg, "e_step_update", "gradient") == "mm_exact"
@@ -1106,7 +1136,7 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             # diagonal cone is not closed under GL congruence Omega Sigma Omega^T -- audit C5),
             # so a diagonal covariant run is never reported as exact Route B.
             "regime_ii_covariant_exact":    (cfg.transport_mode != "regime_ii_covariant")
-                                            or (cfg.family == "gaussian_full"),
+                                            or family_group_invariant,
             # Covariance class of the ACTIVE transport (audit C7): plain regime_ii's bilinear edge
             # delta_ij = mu_i^T W mu_j is gauge-FIXED (invariant only at W=0), never covariant.
             # .get default: a newly registered mode reports its own name rather than KeyError-ing.

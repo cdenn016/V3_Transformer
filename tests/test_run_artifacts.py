@@ -189,7 +189,10 @@ def _report_cfg(**over):
                 use_prior_bank=True, use_head_mixer=False,
                 lambda_beta=1.0, precision_weighted_attention=False,
                 gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
-                lambda_gamma=0.0, s_e_step=False, family="gaussian_diagonal")
+                lambda_gamma=0.0, s_e_step=False,
+                skip_belief_sigma_update=False, lambda_twohop=0.0,
+                gauge_parameterization="phi", omega_reflection="off", phi_reflection="off",
+                gauge_group="glk", family="gaussian_diagonal")
     base.update(over)
     return types.SimpleNamespace(**base)
 
@@ -221,6 +224,82 @@ def test_pure_path_report_transport_covariance_class():
         assert rep["config_toggles"]["transport_covariance_class"] == label, mode
     rep = _pure_path_report(_report_cfg(transport_mode="future_mode"), [])
     assert rep["config_toggles"]["transport_covariance_class"] == "future_mode"
+
+
+def test_diagonal_gl_route_reports_not_exactly_gauge_invariant():
+    diagonal = _pure_path_report(_report_cfg(family="gaussian_diagonal", gauge_group="glk"), [])
+    full = _pure_path_report(_report_cfg(family="gaussian_full", gauge_group="glk"), [])
+
+    assert diagonal["gauge_flags"]["family_group_invariant"] is False
+    assert diagonal["on_gauge_pure_path"] is False
+    assert full["gauge_flags"]["family_group_invariant"] is True
+    assert full["on_gauge_pure_path"] is True
+    assert diagonal["config_toggles"]["group_invariant_families"] == ["gaussian", "gaussian_full"]
+
+
+def test_pure_path_queries_builder_metadata_without_constructing_group():
+    from vfe3.geometry import groups
+
+    name = "_test_metadata_only_group"
+    try:
+        @groups.register_group(name, invariant_families=("gaussian_full",))
+        def _must_not_build(K):
+            raise AssertionError("pure-path reporting must not construct a gauge group")
+
+        report = _pure_path_report(_report_cfg(gauge_group=name, family="gaussian_full"), [])
+        assert report["gauge_flags"]["family_group_invariant"] is True
+    finally:
+        groups._GROUPS.pop(name, None)
+
+
+def test_group_invariance_metadata_fails_closed_and_override_is_atomic():
+    from vfe3.geometry import groups
+
+    name = "_test_invariance_metadata_group"
+    try:
+        @groups.register_group(name, omega_direct_capable=True)
+        def _undeclared(K):
+            return groups.GaugeGroup(
+                name=name,
+                generators=torch.zeros(1, K, K),
+                irrep_dims=[K],
+                skew_symmetric=False,
+                invariant_families=("gaussian_full",),
+            )
+
+        undeclared = groups.get_group(name)
+        assert undeclared.invariant_families == ()
+        assert undeclared(K=2).invariant_families == ()
+
+        @groups.register_group(
+            name,
+            override=True,
+            omega_direct_capable=False,
+            invariant_families=("gaussian", "gaussian_full"),
+        )
+        def _declared(K):
+            return groups.GaugeGroup(
+                name=name,
+                generators=torch.zeros(1, K, K),
+                irrep_dims=[K],
+                skew_symmetric=False,
+            )
+
+        declared = groups.get_group(name)
+        built = declared(K=2)
+        assert declared.omega_direct_capable is False
+        assert declared.invariant_families == ("gaussian", "gaussian_full")
+        assert built.omega_direct_capable is False
+        assert built.invariant_families == ("gaussian", "gaussian_full")
+    finally:
+        groups._GROUPS.pop(name, None)
+
+
+def test_shipped_group_builders_declare_full_gaussian_invariance():
+    from vfe3.geometry.groups import get_group
+
+    for name in ("glk", "block_glk", "tied_block_glk", "so_k", "so_n", "sp", "sp_n"):
+        assert get_group(name).invariant_families == ("gaussian", "gaussian_full")
 
 
 def test_train_with_artifacts_writes_files(tmp_path):

@@ -26,7 +26,13 @@ import ablation
 import scaling_analysis
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts, _pure_path_report, _save_figures, finalize_run
+from vfe3.run_artifacts import (
+    RunArtifacts,
+    _cost_model_fields,
+    _pure_path_report,
+    _save_figures,
+    finalize_run,
+)
 from vfe3.train import train
 from vfe3.viz import figures as figs
 
@@ -258,6 +264,79 @@ def test_save_figures_emits_kappa_block_trajectory(tmp_path):
 
 # --------------------------------------------------------------------------- pure-path certificate
 
+def _cost_cfg(**over):
+    base = dict(
+        vocab_size=11, embed_dim=6, n_heads=2, max_seq_len=7, batch_size=2,
+        n_layers=2, n_e_steps=3, max_steps=5,
+        lambda_h=0.0, lambda_gamma=0.0, prior_source="prior_bank", s_e_step=False,
+        use_prior_bank=False, decode_bias=False,
+        diagonal_covariance=True, gauge_group="block_glk", amp_dtype="fp32",
+    )
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def _cost_model(*, K=6, n_gen=5, n_blocks=2):
+    return types.SimpleNamespace(
+        group=types.SimpleNamespace(
+            generators=torch.zeros(n_gen, K, K),
+            irrep_dims=[K // n_blocks] * n_blocks,
+        ),
+        parameters=lambda: iter(()),
+    )
+
+
+def test_cost_model_linear_decode_does_not_count_prior_bank_readout():
+    V, K, n_gen = 11, 6, 5
+    model = _cost_model(K=K, n_gen=n_gen)
+    token_row = 2 * K + n_gen
+
+    linear = _cost_model_fields(model, _cost_cfg(), n_params=123, tokens_seen=13)
+    biased = _cost_model_fields(
+        model,
+        _cost_cfg(decode_bias=True),
+        n_params=123,
+        tokens_seen=13,
+    )
+    prior_bank = _cost_model_fields(
+        model,
+        _cost_cfg(use_prior_bank=True),
+        n_params=123,
+        tokens_seen=13,
+    )
+
+    assert linear["active_params_per_token"] == token_row + V * K
+    assert biased["active_params_per_token"] == token_row + V * K + V
+    assert prior_bank["active_params_per_token"] == token_row + 2 * V * K
+    assert linear["flops_per_token_decode"] == prior_bank["flops_per_token_decode"] == 2.0 * V * K
+
+
+def test_cost_model_counts_s_channel_estep_once_per_forward():
+    V, K, n_gen, N, L, T, n_blocks = 11, 6, 5, 7, 2, 3, 2
+    tokens_seen = 13
+    model = _cost_model(K=K, n_gen=n_gen, n_blocks=n_blocks)
+    cfg = _cost_cfg(
+        max_seq_len=N,
+        n_layers=L,
+        n_e_steps=T,
+        prior_source="model_channel",
+        s_e_step=True,
+    )
+
+    out = _cost_model_fields(model, cfg, n_params=123, tokens_seen=tokens_seen)
+
+    d_head = K / n_blocks
+    estep_kernel = 2.0 * N * K + 2.0 * N * d_head * d_head
+    belief_estep = L * T * estep_kernel
+    s_estep = T * estep_kernel
+    decode = 2.0 * V * K
+    expected_active = (2 * K + n_gen) + V * K + 2 * V * K
+    assert out["model_channel_active"] is True
+    assert out["active_params_per_token"] == expected_active
+    assert out["flops_per_token_estep"] == belief_estep + s_estep
+    assert out["est_flops_analytic"] == (decode + belief_estep + s_estep) * tokens_seen
+
+
 def _pure_ns(**over):
     r"""SimpleNamespace with every attribute _pure_path_report reads, at the pure values."""
     base = dict(
@@ -265,7 +344,10 @@ def _pure_ns(**over):
         use_prior_bank=True, use_head_mixer=False,
         lambda_beta=1.0, precision_weighted_attention=False,
         gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
-        lambda_gamma=0.0, s_e_step=False)
+        lambda_gamma=0.0, s_e_step=False,
+        skip_belief_sigma_update=False, lambda_twohop=0.0,
+        gauge_parameterization="phi", omega_reflection="off", phi_reflection="off",
+        gauge_group="glk", family="gaussian_full")
     base.update(over)
     return types.SimpleNamespace(**base)
 
@@ -302,6 +384,32 @@ def test_gauge_purity_axis_is_independent_of_fe_axis():
         assert key in rep["config_toggles"]
 
 
+def test_pure_path_marks_sigma_twohop_reflection_and_surrogates():
+    rep = _pure_path_report(_pure_ns(
+        skip_belief_sigma_update=True,
+        lambda_twohop=0.25,
+        precision_weighted_attention=True,
+        gauge_parameterization="omega_direct",
+        omega_reflection="metropolis",
+    ), [])
+
+    assert rep["on_pure_path"] is False
+    assert rep["pure_flags"]["full_sigma_update"] is False
+    assert rep["pure_flags"]["no_twohop_coupling"] is False
+    assert rep["pure_flags"]["no_fixed_prior_surrogate"] is False
+    assert rep["on_gauge_pure_path"] is False
+    assert rep["gauge_flags"]["phi_parameterization"] is False
+    assert rep["gauge_flags"]["no_reflection_sampling"] is False
+    toggles = rep["config_toggles"]
+    assert toggles["skip_belief_sigma_update"] is True
+    assert toggles["lambda_twohop"] == 0.25
+    assert toggles["gauge_parameterization"] == "omega_direct"
+    assert toggles["omega_reflection"] == "metropolis"
+    assert toggles["phi_reflection"] == "off"
+    assert toggles["fixed_covariance_surrogate"] is True
+    assert toggles["detached_precision_prior"] is True
+
+
 # --------------------------------------------------------------------------- figure memory guard
 
 def _finalize_ns(**over):
@@ -312,13 +420,15 @@ def _finalize_ns(**over):
         vocab_size=50257, max_seq_len=1024, batch_size=32,
         generate_figures=True, force_large_figures=False,
         # numeric-path attrs (summary / provenance / cost model / pure-path report)
-        seed=0, max_steps=2, use_prior_bank=True, use_head_mixer=False,
+        seed=0, max_steps=2, use_prior_bank=True, decode_bias=False, use_head_mixer=False,
         include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
         lambda_beta=1.0, precision_weighted_attention=False,
         gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
-        lambda_gamma=0.0, s_e_step=False,
+        lambda_gamma=0.0, s_e_step=False, skip_belief_sigma_update=False, lambda_twohop=0.0,
+        gauge_parameterization="phi", omega_reflection="off", phi_reflection="off",
         embed_dim=8, n_heads=2, n_layers=1, n_e_steps=1, diagonal_covariance=True,
-        gauge_group="block_glk", lambda_h=0.0, prior_source="prior_bank", amp_dtype="fp32")
+        gauge_group="block_glk", family="gaussian_full",
+        lambda_h=0.0, prior_source="prior_bank", amp_dtype="fp32")
     base.update(over)
     return types.SimpleNamespace(**base)
 
