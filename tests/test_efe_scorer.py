@@ -15,6 +15,7 @@ from vfe3.config import VFE3Config
 from vfe3.inference.policy import (
     PolicyScore,
     _efe_terms,
+    _policy_posterior,
     _rollout_predictive,
     get_ambiguity,
     get_policy,
@@ -34,6 +35,15 @@ def test_efe_terms_match_hand_computation():
     assert abs(float(pred_ent) - 1.02965) < 1e-4
     ce = -(q * pC.log()).sum()
     assert abs(float(risk + pred_ent) - float(ce)) < 1e-5   # the pragmatic-collapse identity
+
+
+def test_efe_terms_handle_zero_probability_without_nan():
+    q_log = torch.tensor([[[0.0, float("-inf")]]])
+    preference = torch.full((2,), -math.log(2.0))
+    risk, pred_ent = _efe_terms(q_log, preference)
+    assert torch.isfinite(risk).all() and torch.isfinite(pred_ent).all()
+    assert torch.allclose(risk, torch.full_like(risk, math.log(2.0)))
+    assert torch.equal(pred_ent, torch.zeros_like(pred_ent))
 
 
 def test_likelihood_entropy_ambiguity_equals_predictive_entropy():
@@ -136,6 +146,12 @@ def test_policy_posterior_matches_softmax_formula():
     assert torch.allclose(out.policy_posterior, manual, atol=1e-6)
 
 
+def test_policy_posterior_rejects_all_infinite_candidate_row():
+    score = torch.full((1, 4), float("inf"))
+    with pytest.raises(ValueError, match="no finite candidate"):
+        _policy_posterior(score, 1.0, None)
+
+
 def test_logprob_control_scores_by_logprob_with_zero_efe_terms():
     m = _model()
     ctx = torch.tensor([[1, 2, 3, 4, 5]])
@@ -147,6 +163,22 @@ def test_logprob_control_scores_by_logprob_with_zero_efe_terms():
     assert torch.equal(out.risk, z) and torch.equal(out.ambiguity, z) and torch.equal(out.epistemic, z)
     assert torch.allclose(out.score, -out.log_prob, atol=1e-6)
     assert torch.allclose(out.policy_posterior, torch.softmax(2.0 * out.log_prob, dim=-1), atol=1e-6)
+
+
+def test_logprob_control_does_not_double_count_base_prior():
+    m = _model()
+    ctx = torch.tensor([[1, 2, 3, 4, 5]])
+    cand = torch.tensor([[[0], [1], [2], [3]]])
+    base = torch.linspace(-1.0, 1.0, m.cfg.vocab_size).unsqueeze(0)
+    pref = get_preference("flat")(m.prior_bank)
+    menu_log_prior = torch.log_softmax(torch.gather(base, 1, cand.squeeze(-1)), dim=-1)
+    with torch.no_grad():
+        out = get_policy("logprob_control")(
+            ctx, cand, pref, m, gamma=1.0, log_prior=menu_log_prior, base_logits=base)
+    expected = torch.softmax(out.log_prob, dim=-1)
+    double_counted = torch.softmax(2.0 * out.log_prob, dim=-1)
+    assert torch.allclose(out.policy_posterior, expected, atol=1e-6)
+    assert not torch.allclose(out.policy_posterior, double_counted, atol=1e-6)
 
 
 def test_gates_and_horizon_guards_raise():
@@ -198,7 +230,16 @@ def test_preference_builders():
     task = get_preference("task")(m.prior_bank, goal=3, beta_C=5.0, support=support)
     p = task.exp()
     assert int(p.argmax()) == 3
-    assert float(p[8:].sum()) < 1e-5                         # non-support tokens carry ~0 mass
+    assert torch.isneginf(task[8:]).all()                    # default support remains exact/hard
+    finite_task = get_preference("task")(
+        m.prior_bank, goal=3, beta_C=5.0, support=support, support_floor=-30.0)
+    assert torch.isfinite(finite_task).all()
+    assert torch.allclose(finite_task.exp().sum(), torch.tensor(1.0), atol=1e-6)
+    assert float(finite_task.exp()[8:].sum()) < 1e-5         # explicit finite-floor preference
+    for bad_floor in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="support_floor"):
+            get_preference("task")(
+                m.prior_bank, goal=3, beta_C=5.0, support=support, support_floor=bad_floor)
     # batched goal -> (B, V)
     task_b = get_preference("task")(m.prior_bank, goal=torch.tensor([1, 4]), beta_C=5.0)
     assert task_b.shape == (2, V)

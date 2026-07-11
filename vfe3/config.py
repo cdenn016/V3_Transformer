@@ -1748,8 +1748,9 @@ class VFE3Config:
             raise ValueError(f"policy_top_k must be >= 1, got {self.policy_top_k}")
         if self.policy_horizon < 1:
             raise ValueError(f"policy_horizon must be >= 1, got {self.policy_horizon}")
-        if self.policy_precision <= 0.0:
-            raise ValueError(f"policy_precision (gamma) must be > 0, got {self.policy_precision}")
+        if not math.isfinite(self.policy_precision) or self.policy_precision <= 0.0:
+            raise ValueError(
+                f"policy_precision (gamma) must be finite and > 0, got {self.policy_precision}")
         # audit F5 (2026-06-28): close the construction gaps where an invalid policy config validated and
         # only failed deep inside generate(). score_terms must be a nonempty subset of the EFE term names
         # the scorer assembles (a typo otherwise surfaces as a cryptic KeyError in _policy_efe_one_step).
@@ -1761,6 +1762,16 @@ class VFE3Config:
             raise ValueError(
                 f"policy_score_terms {bad_terms} not in {_efe_score_terms}; G(pi) is a sum over these "
                 f"EFE terms (spec Section 3.2).")
+        if self.policy_mode == "logprob_control" and self.policy_horizon != 1:
+            raise ValueError(
+                f"policy_mode='logprob_control' accepts only policy_horizon=1 because it scores one "
+                f"continuation token; got policy_horizon={self.policy_horizon}.")
+        if (self.policy_mode == "logprob_control"
+                and self.policy_score_terms != ("risk", "ambiguity")):
+            raise ValueError(
+                f"policy_mode='logprob_control' accepts only the default policy_score_terms="
+                f"('risk', 'ambiguity') metadata because it scores raw continuation log-probability; "
+                f"got {self.policy_score_terms}.")
         # mode/horizon pairing: efe_one_step is the H=1 scorer (H>1 is efe_rollout, gated on a belief
         # cache). Reject the mismatch at construction rather than mid-generate (policy.py raises there).
         if self.policy_mode == "efe_one_step" and self.policy_horizon != 1:

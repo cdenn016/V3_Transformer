@@ -17,6 +17,7 @@ the precondition any model-based planner needs (predictive-adequacy gate, Sectio
 This module is pure environment + data + a batched closed-loop runner; the orchestration (three-seed
 training, the arm matrix, paired statistics, go/no-go) lives in the experiment script.
 """
+import math
 import time
 from typing import Dict, Optional, Tuple
 
@@ -58,11 +59,13 @@ def ring_preference(
     goals:  torch.Tensor,            # (B,) goal state ids
 
     *,
-    beta_C: float = 5.0,             # preference precision (sealed constant)
+    beta_C:        float           = 5.0,  # preference precision (sealed constant)
+    support_floor: Optional[float] = None, # None -> hard -inf; finite -> explicit soft floor
 ) -> torch.Tensor:                   # (B, V) log p_task(o)
     r"""The ring's instantiation of the spec's task preference p(o|C) = softmax(beta_C U_C) with the
-    DISTANCE-GRADED utility U_C(o) = -ring_distance(o, g) on the M state tokens and ~0 mass (-inf
-    utility) on non-state tokens.
+    DISTANCE-GRADED utility U_C(o) = -ring_distance(o, g) on the M state tokens. ``support_floor=None``
+    retains exact hard support (-inf on non-state tokens); a supplied finite value is explicitly
+    reported as a finite-floor preference and normalized together with the state utilities.
 
     Correction to the spec's literal wording (Section 4.1): a pure peak on the goal symbol (uniform
     mass over all other states) carries NO one-step gradient at ring-distance > 1 -- both neighboring
@@ -70,13 +73,11 @@ def ring_preference(
     reduces the distance. The spec's own solvability argument ("the reachable state nearest the goal
     is closest to the goal-peaked preference") requires a distance-graded utility, which this provides;
     the sealed beta_C=5.0 is kept (its 0.90 goal-mass figure was the uniform-off-goal reading)."""
+    if support_floor is not None and not math.isfinite(support_floor):
+        raise ValueError(f"support_floor must be finite or None, got {support_floor}")
     states = state_support().to(goals.device)                        # (M,)
     dist = ring_distance(states.unsqueeze(0), goals.unsqueeze(1))     # (B, M)
-    # Non-state tokens get a FINITE floor utility one ring-step below the farthest state, so they carry
-    # negligible-but-nonzero mass ("approximately zero", spec Section 4.1). A -inf floor (exactly zero)
-    # makes the forward KL(q || p_task) diverge wherever the model's q has any off-state mass, which
-    # collapses every candidate's score to +inf and the policy posterior to nan.
-    floor = -beta_C * (M / 2 + 1)
+    floor = float("-inf") if support_floor is None else support_floor
     U = torch.full((goals.shape[0], V), floor, device=goals.device)
     U[:, :M] = -beta_C * dist.float()
     return torch.log_softmax(U, dim=-1)
@@ -228,6 +229,12 @@ def _decode_menu(
     r"""Goal-free standard decoding strategies over the candidate menu (spec Section 4.3). Temperature
     sampling, nucleus (top-p), and locally-typical sampling (Meister et al. 2022). The draw is taken on
     CPU with the optional generator for device-independent reproducibility (mirrors the 'random' arm)."""
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(f"temperature must be finite and > 0, got {temperature}")
+    if not math.isfinite(top_p) or not (0.0 < top_p <= 1.0):
+        raise ValueError(f"top_p must be finite and in (0, 1], got {top_p}")
+    if not bool(torch.isfinite(menu_logits).all()):
+        raise ValueError("menu_logits must contain only finite values")
     if mode == "temp_sample":
         probs = torch.softmax(menu_logits / temperature, dim=-1)
     elif mode in ("nucleus", "typical"):
@@ -237,7 +244,8 @@ def _decode_menu(
             order = p.sort(dim=-1, descending=True)                       # most probable first
             sorted_p, sorted_idx = order.values, order.indices
         else:                                                            # locally-typical
-            H = -(p * logp).sum(dim=-1, keepdim=True)                     # (B,1) entropy
+            p_logp = torch.where(p > 0, p * logp, torch.zeros_like(p))
+            H = -p_logp.sum(dim=-1, keepdim=True)                         # (B,1) entropy
             shift = (-logp - H).abs()                                     # deviation from expected info
             order = shift.sort(dim=-1)                                    # most typical (smallest) first
             sorted_idx = order.indices
@@ -250,6 +258,9 @@ def _decode_menu(
         probs = probs / probs.sum(dim=-1, keepdim=True)
     else:
         raise ValueError(f"unknown sampling baseline {mode!r}")
+    row_mass = probs.sum(dim=-1)
+    if not bool(torch.isfinite(probs).all()) or not bool((row_mass > 0).all()):
+        raise ValueError("sampling probabilities must be finite with positive mass in every row")
     idx = torch.multinomial(probs.cpu(), 1, generator=generator)         # CPU draw (generator-safe)
     return idx.to(menu_logits.device)
 
@@ -326,7 +337,9 @@ def run_episodes(
             candidates = topk.unsqueeze(-1)                              # (B, |menu|, 1)
             log_prior = torch.log_softmax(menu_logits, dim=-1)          # (B, |menu|) candidate prior E
             if preference_key == "task":
-                pref = ring_preference(goals, beta_C=beta_C)              # distance-graded p_task (B, V)
+                support_floor = -beta_C * (M / 2 + 1)                     # explicit finite-floor arm
+                pref = ring_preference(
+                    goals, beta_C=beta_C, support_floor=support_floor)     # distance-graded p_task (B, V)
             elif preference_key == "flat":
                 pref = get_preference("flat")(model.prior_bank, device=device)
             elif preference_key == "held_out_predictive":
