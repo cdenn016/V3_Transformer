@@ -926,6 +926,7 @@ def e_step(
 
     e_step_halt_tol:             Optional[float]        = None,   # eval halting: break when mean KL(q^t||q^{t-1}) < tol
     grad_record:                 Optional[dict]         = None,   # diag out-param: LAST iteration's belief-grad norms
+    state_record:                Optional[dict]         = None,   # diag out-param: every belief iterate + matching F tensor
     rope:                        Optional[torch.Tensor] = None,
     log_prior:                   Optional[torch.Tensor] = None,
     prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,   # share_refine_s_transport: caller-built flat transport
@@ -933,7 +934,9 @@ def e_step(
 ) -> 'BeliefState | Tuple[BeliefState, List[float]]':
     r"""Iterate ``e_step_iteration`` ``n_iter`` times (parallel mean-field). Optionally
     returns the global-F trajectory (a DIAGNOSTIC; parallel updates are not guaranteed
-    monotone per iteration).
+    monotone per iteration). ``state_record`` captures the same initial/updated beliefs and
+    free-energy tensors without changing the return type; it is used only by the one-forward
+    diagnostic snapshot path.
 
     ``e_step_gradient`` is the backward estimator forwarded to each iteration: 'unroll' (default,
     full second-order trajectory gradient) or 'straight_through' (per-iteration tangent detached,
@@ -988,20 +991,57 @@ def e_step(
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
             )
 
-    def _f_diag(b: BeliefState) -> float:
+    record_sequence_index = (
+        state_record.get("sequence_index") if state_record is not None else None)
+
+    def _f_diag(
+        b: BeliefState,
+        sequence_index: Optional[int] = None,
+    ) -> torch.Tensor:
         # Diagnostic scalar: under no_grad so the logged trajectory never enters the
-        # training graph, and .item() instead of float(tensor) makes the host sync explicit.
+        # training graph. The legacy float trajectory performs its explicit .item() below;
+        # diagnostic snapshots retain the scalar tensor and avoid that host transfer.
         # rope/rope_on_cov are forwarded explicitly (audit PP6): the logged F carries the same
         # RoPE-wrapped transport the iterations descend.
         # NOTE (audit 2026-06-13): under a non-'constant' lambda_alpha_mode/lambda_h_mode the forwarded kwargs
         # carry the regularizer into free_energy_value (alpha_reg=R), so the logged F is the AUGMENTED
         # objective F+R the iterations actually descend (the envelope-correct value), not the bare
         # divergence-weighted F. At the constant default alpha_reg=None, so the trajectory is the pure F.
+        b_eval, mu_eval, sigma_eval, prior_eval, tau_eval = b, mu_p, sigma_p, log_prior, tau
+        if sequence_index is not None and b.mu.dim() >= 3:
+            b_eval = b._replace(
+                mu=b.mu[sequence_index], sigma=b.sigma[sequence_index], phi=b.phi[sequence_index],
+                s=b.s[sequence_index] if b.s is not None else None,
+                r=b.r[sequence_index] if b.r is not None else None,
+                omega=b.omega[sequence_index] if b.omega is not None else None,
+                reflection=(b.reflection[sequence_index]
+                            if b.reflection is not None else None))
+            mu_eval = mu_p[sequence_index]
+            sigma_eval = sigma_p[sequence_index]
+            if isinstance(tau, torch.Tensor) and tau.dim() >= 2 and tau.shape[0] == b.mu.shape[0]:
+                tau_eval = tau[sequence_index]
+            if log_prior is not None:
+                unbatched_rank = 2 if len(group.irrep_dims) == 1 else 3
+                if log_prior.dim() == unbatched_rank + 1 and log_prior.shape[0] == b.mu.shape[0]:
+                    prior_eval = log_prior[sequence_index]
         with torch.no_grad():
-            return free_energy_value(b, mu_p, sigma_p, group, tau=tau, log_prior=log_prior,
+            return free_energy_value(b_eval, mu_eval, sigma_eval, group, tau=tau_eval, log_prior=prior_eval,
                                      rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                                      gauge_parameterization=gauge_param_kw,
-                                     **kwargs).item()
+                                     **kwargs).detach()
+
+    if state_record is not None:
+        state_record.clear()
+        state_record["sequence_index"] = record_sequence_index
+        state_record["beliefs"] = []
+        state_record["free_energy"] = []
+
+    def _record_diagnostic_state(b: BeliefState) -> None:
+        if return_trajectory:
+            traj.append(_f_diag(b).item())
+        if state_record is not None:
+            state_record["beliefs"].append(b)
+            state_record["free_energy"].append(_f_diag(b, record_sequence_index))
 
     # Tier-1 loop control (all default OFF -> the pure fixed-depth loop below, byte-identical).
     # grad-enabled == a TRAINING forward (the eval/generate paths run under no_grad): the
@@ -1022,8 +1062,8 @@ def e_step(
     halt_eps: float = kwargs.get("eps", 1e-6)
     halt_family = get_family(kwargs.get("family", "gaussian_diagonal")) if e_step_halt_tol is not None else None
 
-    if return_trajectory:
-        traj.append(_f_diag(belief))
+    if return_trajectory or state_record is not None:
+        _record_diagnostic_state(belief)
     for t in range(n_total):
         if e_step_halt_tol is not None and not grad_on:
             prev_mu, prev_sigma = belief.mu, belief.sigma
@@ -1084,8 +1124,8 @@ def e_step(
                 _prebuilt_omega=_hoisted_omega,
                 **kwargs,
             )
-        if return_trajectory:
-            traj.append(_f_diag(belief))
+        if return_trajectory or state_record is not None:
+            _record_diagnostic_state(belief)
         if e_step_halt_tol is not None and not grad_on and t + 1 < n_total:
             # Eval-time halting: mean over tokens of the configured-family KL(q^t || q^{t-1})
             # (the per-iteration belief move); break when < tol. The guard on t+1 < n_total skips

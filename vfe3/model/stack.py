@@ -68,6 +68,11 @@ def vfe_stack(
     # input stays connected, while every E-step output is fixed state for the M-step contract.
     detach_capture = capture is not None and e_step_gradient == "detach"
     capture_mu_p, capture_sigma_p = mu_p, sigma_p
+    diagnostic_capture = capture.get("diagnostic") if capture is not None else None
+    if diagnostic_capture is not None:
+        diagnostic_capture.setdefault("layer_priors", [])
+        diagnostic_capture.setdefault("layer_converged", [])
+        diagnostic_capture.setdefault("layer_outputs", [])
     # Hoist the loop-invariant temperature computation out of the per-layer vfe_block call.
     # attention_tau depends only on the kappa, group.irrep_dims, and device -- all constant across
     # layers -- so computing it once here and passing it as tau avoids L redundant calls.
@@ -79,6 +84,8 @@ def vfe_stack(
         else _as_coeff(cfg.kappa_beta, belief.mu.device),
         group.irrep_dims)
     for layer_index in range(cfg.n_layers):
+        if diagnostic_capture is not None:
+            diagnostic_capture["layer_priors"].append((mu_p, sigma_p))
         # Per-query adaptive temperature (cfg.query_adaptive_tau, default OFF): rescale the hoisted
         # per-head tau by the DETACHED uncertainty trace of the belief ENTERING this block,
         # tau_i,h = tau_h (1 + c tr_h(Sigma_i)/d_h) -- the query-side dual of the detached precision
@@ -108,8 +115,14 @@ def vfe_stack(
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,
                            rope_on_value=rope_on_value, tau=tau_b,
                            capture=capture, grad_record=grad_record,   # each block overwrites; last wins
+                           state_record=(diagnostic_capture.setdefault(
+                               "e_step_trace", {"sequence_index": 0})
+                                         if diagnostic_capture is not None and layer_index == 0 else None),
                            prebuilt_transport=prebuilt_transport,      # phi is loop-invariant when e_phi_lr==0
                            gauge_parameterization=gauge_parameterization)
+        if diagnostic_capture is not None:
+            diagnostic_capture["layer_converged"].append(capture["converged"])
+            diagnostic_capture["layer_outputs"].append(belief)
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
         if detach_capture and layer_index < cfg.n_layers - 1:

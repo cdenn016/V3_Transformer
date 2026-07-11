@@ -673,6 +673,26 @@ def test_converged_state_omega_direct_uses_stored_frame():
     assert (expected - phi_path).abs().max().item() > 1e-3       # fails if replay falls through phi
 
 
+def test_snapshot_converged_state_preserves_omega_direct_report_boundary(monkeypatch):
+    from vfe3.geometry.transport import build_transport_from_element
+
+    model = _replay_model(gauge_parameterization="omega_direct")
+    tokens = torch.tensor([[0, 1, 2, 3]])
+    snapshot = model.build_diagnostic_snapshot(tokens)
+    stored = snapshot.stack_output.omega[0]
+    expected = build_transport_from_element(stored, model.group)["Omega"]
+
+    def replay_forbidden(*args, **kwargs):
+        raise AssertionError("snapshot converged_state replayed inference")
+
+    monkeypatch.setattr(model, "forward_beliefs", replay_forbidden)
+    monkeypatch.setattr(model.prior_bank, "encode", replay_forbidden)
+    state = extract.converged_state(model, tokens, snapshot=snapshot)
+
+    assert torch.equal(state["exp_phi"], stored)
+    assert torch.allclose(state["omega"], expected, atol=1e-6, rtol=1e-6)
+
+
 def test_omega_direct_iterative_extractors_match_forward_transport():
     from vfe3.inference.e_step import free_energy_value
 

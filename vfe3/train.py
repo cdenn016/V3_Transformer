@@ -714,8 +714,9 @@ def _val_diagnostics(
     val_tok = val_tok.to(device)
     val_tgt = val_tgt.to(device) if val_tgt is not None else None
     vn = max(int(val_tok.shape[1]), 1)
+    snapshot = model.build_diagnostic_snapshot(val_tok)
 
-    vd = model.diagnostics(val_tok)                              # held-out F decomposition (per token)
+    vd = model.diagnostics(val_tok, snapshot=snapshot)           # held-out F decomposition (per token)
     out["val_self_coupling"]      = vd["self_coupling"]     / vn
     out["val_self_divergence"]    = vd["self_divergence"]   / vn
     out["val_belief_coupling"]    = vd["belief_coupling"]   / vn
@@ -740,7 +741,7 @@ def _val_diagnostics(
     out["val_guard_energy_klmax_frac"] = vd["guard_energy_klmax_frac"]
     out["val_nonfinite_frac"]          = vd["nonfinite_frac"]
 
-    amaps = model.attention_maps(val_tok)                       # (L, H, N, N) all layers/heads
+    amaps = model.attention_maps(val_tok, snapshot=snapshot)    # (L, H, N, N) all layers/heads
     hmin = M.attention_entropy_rows(amaps).min(dim=-1).values   # (L, H) per-head min row entropy
     out["val_attn_entropy_min_all"] = float(hmin.min())
     out["val_attn_collapsed_heads"] = float((hmin < 0.6931471805599453).float().sum())
@@ -757,7 +758,7 @@ def _val_diagnostics(
         out["val_head_redundancy_js"] = float(torch.stack(
             [M.head_redundancy_js(amaps[li])[off].mean() for li in range(amaps.shape[0])]).mean())
 
-    tr = ex.e_step_belief_trace(model, val_tok)                 # E-step inner-loop trajectory
+    tr = ex.e_step_belief_trace(model, val_tok, snapshot=snapshot)  # captured E-step trajectory
     f = tr["free_energy"] / vn                                  # PER-TOKEN (free_energy_value is a per-seq SUM)
     out["estep_f_drop"] = float(f[-1] - f[0])                   # < 0 = F descended over the inner loop
     # fraction of inner iterations that did NOT decrease F. EXPECTED to be nonzero for parallel
@@ -771,7 +772,7 @@ def _val_diagnostics(
         out[_key] = float(res[_nm][-1].mean()) if res[_nm].numel() else 0.0
 
     if val_tgt is not None:                                     # per-position within-sequence loss
-        vlog = model(val_tok)                                   # (B, N, V) inference path
+        vlog = snapshot.logits                                  # (B, N, V) same captured inference path
         b, n = val_tok.shape
         per = F.cross_entropy(vlog.reshape(-1, vlog.shape[-1]).float(), val_tgt.reshape(-1),
                               ignore_index=-100, reduction="none").reshape(b, n)
@@ -789,7 +790,7 @@ def _val_diagnostics(
     # fault drops just this scalar (NaN-rectangular), not the whole val-diag row.
     if model.head_mixer is not None:
         try:
-            cst = ex.converged_state(model, val_tok)
+            cst = ex.converged_state(model, val_tok, snapshot=snapshot)
             br = M.head_mixer_gauge_residual(cst["mu"], cst["sigma"], model.head_mixer, model.group,
                                              diagonal=model.cfg.diagonal_covariance)
             out["val_builder_resid"] = float(torch.cat([br["mu_residual"], br["sigma_residual"]]).median())

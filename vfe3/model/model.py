@@ -12,6 +12,7 @@ the batch around the (unbatched) E-step; decode and CE are batched.
 import inspect
 import math
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence, Tuple, Dict
 
 import torch
@@ -116,6 +117,65 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
     raise ValueError(
         f"gauge group {cfg.gauge_group!r} builder has unsupported positional arity {arity}; "
         f"build_group dispatches K (arity 1) or (K, n_heads) (arity 2)"
+    )
+
+
+@dataclass(frozen=True)
+class DiagnosticSnapshot:
+    r"""Frozen tensors captured from one no-grad belief forward for evaluation consumers."""
+
+    owner:             object = field(repr=False, compare=False)
+    token_ids:         torch.Tensor
+    encoded_belief:    BeliefState
+    initial_belief:    BeliefState
+    layer_priors:      'Tuple[Tuple[torch.Tensor, torch.Tensor], ...]'
+    layer_converged:   'Tuple[BeliefState, ...]'
+    layer_outputs:     'Tuple[BeliefState, ...]'
+    stack_output:      BeliefState
+    final_belief:      BeliefState
+    logits:            torch.Tensor
+    beta_maps:         torch.Tensor
+    gamma_maps:        Optional[torch.Tensor]
+    trace_states:      'Tuple[BeliefState, ...]'
+    trace_free_energy: torch.Tensor
+    s_belief:          'Optional[Tuple[torch.Tensor, torch.Tensor]]'
+    rope:              Optional[torch.Tensor]
+    log_prior:         Optional[torch.Tensor]
+
+
+def _freeze_tensor(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    return None if value is None else value.detach().clone()
+
+
+def _freeze_frame(
+    value: 'torch.Tensor | CompactBlockElement | None',
+) -> 'torch.Tensor | CompactBlockElement | None':
+    if value is None:
+        return None
+    return value.detach().clone()
+
+
+def _freeze_belief(belief: BeliefState) -> BeliefState:
+    return belief._replace(
+        mu=_freeze_tensor(belief.mu),
+        sigma=_freeze_tensor(belief.sigma),
+        phi=_freeze_tensor(belief.phi),
+        s=_freeze_tensor(belief.s),
+        r=_freeze_tensor(belief.r),
+        omega=_freeze_frame(belief.omega),
+        reflection=_freeze_tensor(belief.reflection),
+    )
+
+
+def _sequence_belief(belief: BeliefState, index: int = 0) -> BeliefState:
+    return belief._replace(
+        mu=belief.mu[index],
+        sigma=belief.sigma[index],
+        phi=belief.phi[index],
+        s=belief.s[index] if belief.s is not None else None,
+        r=belief.r[index] if belief.r is not None else None,
+        omega=belief.omega[index] if belief.omega is not None else None,
+        reflection=belief.reflection[index] if belief.reflection is not None else None,
     )
 
 
@@ -763,6 +823,9 @@ class VFEModel(nn.Module):
             raise ValueError("decode_last=True requires a nonempty token context")
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
         beliefs = beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))
+        diagnostic_capture = capture.get("diagnostic") if capture is not None else None
+        if diagnostic_capture is not None:
+            diagnostic_capture["encoded_belief"] = beliefs
         log_prior = self._attention_log_prior(N, token_ids.device)
         rope = self._rope_rotation(N, token_ids.device)
 
@@ -853,6 +916,13 @@ class VFEModel(nn.Module):
                 log_prior = self._fold_gamma_prior(log_prior, token_ids, beliefs.phi, omega=beliefs.omega,
                                                    reflection=beliefs.reflection if beliefs.reflection is not None else None,
                                                    s_belief=s_belief)
+            if diagnostic_capture is not None:
+                diagnostic_capture["initial_belief"] = beliefs
+                diagnostic_capture["s_belief"] = (
+                    self.prior_bank.encode_s(token_ids)
+                    if s_belief is None and self._model_channel_active else s_belief)
+                diagnostic_capture["rope"] = rope
+                diagnostic_capture["log_prior"] = log_prior
             # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
             # M-step self-coupling term in forward (manuscript: the self-term reads q*, not the
             # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.
@@ -1632,6 +1702,9 @@ class VFEModel(nn.Module):
     def gamma_attention_maps(
         self,
         token_ids: torch.Tensor,             # (B, N) token ids; only sequence 0 is used
+
+        *,
+        snapshot:  Optional[DiagnosticSnapshot] = None,
     ) -> Optional[torch.Tensor]:             # (H, N, N) gamma_ij, or None when the s channel is off
         r"""Per-head model-coupling attention gamma_ij for sequence 0 (no_grad), the s-channel mirror
         of :meth:`attention_maps`.
@@ -1642,8 +1715,12 @@ class VFEModel(nn.Module):
         H = len(group.irrep_dims), 1 for a single-block group) or ``None`` when the model channel is
         inactive (no s tables). OFF the training hot path (no_grad); for periodic figure generation.
         """
+        if snapshot is not None:
+            snapshot = self._validate_diagnostic_snapshot(token_ids, snapshot)
         if not self._model_channel_active:
             return None
+        if snapshot is not None:
+            return snapshot.gamma_maps
         from vfe3.free_energy import attention_weights
         enc = self.prior_bank.encode(token_ids[:1])
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
@@ -1997,6 +2074,159 @@ class VFEModel(nn.Module):
         sig = sigma if sigma.dim() == mu.dim() else sigma.diagonal(dim1=-2, dim2=-1)
         return query_adaptive_tau(sig, tau, self.group.irrep_dims, c=self.cfg.query_tau_c)
 
+    def _first_sequence_log_prior(
+        self,
+        log_prior: Optional[torch.Tensor],
+        batch_size: int,
+    ) -> Optional[torch.Tensor]:
+        r"""Drop a captured batch axis while preserving the optional attention-head axis."""
+        if log_prior is None:
+            return None
+        unbatched_rank = 2 if len(self.group.irrep_dims) == 1 else 3
+        if log_prior.dim() == unbatched_rank + 1 and log_prior.shape[0] == batch_size:
+            return log_prior[0]
+        return log_prior
+
+    def _validate_diagnostic_snapshot(
+        self,
+        token_ids: torch.Tensor,
+        snapshot: DiagnosticSnapshot,
+    ) -> DiagnosticSnapshot:
+        if snapshot.owner is not self:
+            raise ValueError("diagnostic snapshot belongs to a different model instance")
+        if not torch.equal(snapshot.token_ids, token_ids):
+            raise ValueError("diagnostic snapshot token_ids do not match this request")
+        return snapshot
+
+    @torch.no_grad()
+    def _attention_map_for_belief(
+        self,
+        belief:   BeliefState,
+        log_prior: Optional[torch.Tensor],
+        rope:      Optional[torch.Tensor],
+    ) -> torch.Tensor:                         # (H, N, N)
+        r"""Compute beta from an already captured block output, without replaying inference."""
+        from vfe3.inference.e_step import _transport
+        from vfe3.geometry.transport import transport_mean, transport_covariance
+        from vfe3.families.base import get_family
+        from vfe3.free_energy import pairwise_energy, attention_weights, attention_tau
+
+        cfg = self.cfg
+        omega = _transport(
+            belief.phi, self.group, transport_mode=cfg.transport_mode,
+            mu=(belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
+            sigma=(belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
+            connection_W=getattr(self, "connection_W", None),
+            connection_M=getattr(self, "connection_M", None),
+            connection_L=getattr(self, "connection_L", None),
+            link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+            clamp_monitor=cfg.transport_clamp_monitor,
+            cocycle_relaxation=cfg.cocycle_relaxation,
+            gauge_parameterization=cfg.gauge_parameterization,
+            omega=belief.omega,
+            reflection=belief.reflection,
+        )
+        if rope is not None:
+            rope_omega = RopeTransport(
+                base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                on_value=cfg.rope_on_value)
+            mu_t = transport_mean(rope_omega, belief.mu)
+            sigma_t = transport_covariance(rope_omega, belief.sigma)
+        else:
+            mu_t = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
+            sigma_t = transport_covariance(omega.unsqueeze(0), belief.sigma.unsqueeze(0))[0]
+        fam = get_family(cfg.family)
+        energy = pairwise_energy(
+            fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
+            alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+            divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
+        )
+        base_tau = attention_tau(
+            self.effective_kappa_beta(belief.mu.device), self.group.irrep_dims)
+        beta = attention_weights(
+            energy, tau=self._beta_tau(belief.sigma, belief.mu, base_tau),
+            log_prior=log_prior)
+        return beta.unsqueeze(0) if beta.dim() == 2 else beta
+
+    @torch.no_grad()
+    def _gamma_map_for_belief(
+        self,
+        token_ids:   torch.Tensor,
+        belief:      BeliefState,
+        s_belief:    'Optional[Tuple[torch.Tensor, torch.Tensor]]',
+    ) -> Optional[torch.Tensor]:                # (H, N, N), or None
+        if not self._model_channel_active:
+            return None
+        from vfe3.free_energy import attention_weights
+
+        state = _sequence_belief(belief)
+        s0 = None if s_belief is None else (s_belief[0][:1], s_belief[1][:1])
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(
+            token_ids[:1], state.phi.unsqueeze(0),
+            omega=state.omega.unsqueeze(0) if state.omega is not None else None,
+            reflection=state.reflection.unsqueeze(0) if state.reflection is not None else None,
+            s_belief=s0,
+        )
+        gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)[0]
+        return gamma.unsqueeze(0) if gamma.dim() == 2 else gamma
+
+    @torch.no_grad()
+    def build_diagnostic_snapshot(
+        self,
+        token_ids: torch.Tensor,                 # (B, N) integer token ids
+    ) -> DiagnosticSnapshot:
+        r"""Capture one immutable evaluation snapshot from exactly one belief forward.
+
+        The capture path records the encoded and stack-entry beliefs, every block's live prior,
+        pre-transform converged belief and post-transform output, plus the first block's actual
+        E-step states and free-energy values. Beta/gamma maps are then reduced from those captured
+        tensors; no encode, E-step, block, or stack replay is performed.
+        """
+        diagnostic: dict = {}
+        capture = {"diagnostic": diagnostic}
+        final_belief, logits = self.forward_beliefs(
+            token_ids, return_logits=True, capture=capture)
+        if logits is None:
+            raise RuntimeError("diagnostic snapshot requested logits but the decoder returned None")
+
+        log_prior = diagnostic["log_prior"]
+        log_prior0 = self._first_sequence_log_prior(log_prior, token_ids.shape[0])
+        layer_outputs = tuple(diagnostic["layer_outputs"])
+        beta_maps = torch.stack([
+            self._attention_map_for_belief(_sequence_belief(layer), log_prior0, diagnostic["rope"])
+            for layer in layer_outputs
+        ])
+        gamma_maps = self._gamma_map_for_belief(
+            token_ids, capture["out"], diagnostic["s_belief"])
+        trace = diagnostic["e_step_trace"]
+        trace_free_energy = torch.stack([
+            value.reshape(()) for value in trace["free_energy"]])
+        s_belief = diagnostic["s_belief"]
+
+        return DiagnosticSnapshot(
+            owner=self,
+            token_ids=_freeze_tensor(token_ids),
+            encoded_belief=_freeze_belief(diagnostic["encoded_belief"]),
+            initial_belief=_freeze_belief(diagnostic["initial_belief"]),
+            layer_priors=tuple(
+                (_freeze_tensor(mu_p), _freeze_tensor(sigma_p))
+                for mu_p, sigma_p in diagnostic["layer_priors"]),
+            layer_converged=tuple(
+                _freeze_belief(belief) for belief in diagnostic["layer_converged"]),
+            layer_outputs=tuple(_freeze_belief(belief) for belief in layer_outputs),
+            stack_output=_freeze_belief(capture["out"]),
+            final_belief=_freeze_belief(final_belief),
+            logits=_freeze_tensor(logits),
+            beta_maps=_freeze_tensor(beta_maps),
+            gamma_maps=_freeze_tensor(gamma_maps),
+            trace_states=tuple(_freeze_belief(belief) for belief in trace["beliefs"]),
+            trace_free_energy=_freeze_tensor(trace_free_energy),
+            s_belief=(None if s_belief is None else (
+                _freeze_tensor(s_belief[0]), _freeze_tensor(s_belief[1]))),
+            rope=_freeze_tensor(diagnostic["rope"]),
+            log_prior=_freeze_tensor(log_prior),
+        )
+
     @torch.no_grad()
     def diagnostics(
         self,
@@ -2004,6 +2234,7 @@ class VFEModel(nn.Module):
 
         *,
         log_likelihood: Optional[torch.Tensor] = None,  # (N,) optional E_q[log p(o|k)] diagnostic seam
+        snapshot:       Optional[DiagnosticSnapshot] = None,  # one-forward captured evaluation state
     ) -> dict:
         r"""Faithful per-step VFE diagnostics at the converged belief (no_grad).
 
@@ -2038,38 +2269,48 @@ class VFEModel(nn.Module):
         from vfe3 import numerics
 
         cfg = self.cfg
-        enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
-        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
-                             omega=enc.omega[0] if enc.omega is not None else None,   # carry the GL(K) frame under omega_direct
-                             reflection=enc.reflection[0] if enc.reflection is not None else None)   # carry the phi-path reflection sign
-        s_belief = self._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
-        if s_belief is not None:
-            belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
-        n = belief.mu.shape[0]
-        log_prior = self._attention_log_prior(n, token_ids.device)    # (N, N)
-        log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior (r2 id22)
-        if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
-            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
-                                               reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None,
-                                               s_belief=s_belief)[0]
-        rope = self._rope_rotation(n, token_ids.device)               # rope shapes the converged belief (as forward)
-        cap: dict = {}                                                # q* capture (F self-term reads it, as forward)
-        out = vfe_stack(                                              # converged belief
-            belief, belief.mu, belief.sigma, self.group, cfg,
-            log_prior=log_prior, block_norm=self.block_norm,
-            head_mixer=self.head_mixer,                               # per-block mixing -> diagnostics' final belief matches forward
-            cg_coupling=self.cg_coupling,
-            lambda_beta=cfg.lambda_beta,                              # constant coupling weight
-            connection_W=getattr(self, "connection_W", None),         # learned Regime-II connection (None on the flat pure path)
-            connection_M=getattr(self, "connection_M", None),         # learned covariant (Route B) connection (None unless regime_ii_covariant)
-            connection_L=getattr(self, "connection_L", None),         # learned direct link (None unless regime_ii_link*)
-            rope=rope, rope_on_cov=cfg.rope_full_gauge,               # match forward: converge WITH rope, not post-hoc
-            rope_on_value=cfg.rope_on_value,
-            capture=cap,
-            gauge_parameterization=cfg.gauge_parameterization,
-            kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
-        )
+        if snapshot is None:
+            enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
+            belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
+                                 omega=enc.omega[0] if enc.omega is not None else None,
+                                 reflection=enc.reflection[0] if enc.reflection is not None else None)
+            s_belief = self._refined_s_belief(token_ids)
+            if s_belief is not None:
+                belief = belief._replace(mu=s_belief[0][0], sigma=s_belief[1][0])
+            n = belief.mu.shape[0]
+            log_prior = self._attention_log_prior(n, token_ids.device)
+            log_prior = self._fold_precision_bias(log_prior, belief.sigma)
+            if self.cfg.gamma_as_beta_prior:
+                log_prior = self._fold_gamma_prior(
+                    log_prior, token_ids[:1], belief.phi.unsqueeze(0),
+                    omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
+                    reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None,
+                    s_belief=s_belief)[0]
+            rope = self._rope_rotation(n, token_ids.device)
+            cap: dict = {}
+            out = vfe_stack(
+                belief, belief.mu, belief.sigma, self.group, cfg,
+                log_prior=log_prior, block_norm=self.block_norm,
+                head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
+                lambda_beta=cfg.lambda_beta,
+                connection_W=getattr(self, "connection_W", None),
+                connection_M=getattr(self, "connection_M", None),
+                connection_L=getattr(self, "connection_L", None),
+                rope=rope, rope_on_cov=cfg.rope_full_gauge,
+                rope_on_value=cfg.rope_on_value,
+                capture=cap,
+                gauge_parameterization=cfg.gauge_parameterization,
+                kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
+            )
+        else:
+            snapshot = self._validate_diagnostic_snapshot(token_ids, snapshot)
+            belief = _sequence_belief(snapshot.initial_belief)
+            s_belief = snapshot.s_belief
+            n = belief.mu.shape[0]
+            log_prior = self._first_sequence_log_prior(snapshot.log_prior, token_ids.shape[0])
+            rope = snapshot.rope
+            out = _sequence_belief(snapshot.stack_output)
+            cap = {"converged": _sequence_belief(snapshot.layer_converged[-1])}
 
         rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
         rho_s = cfg.prior_handoff_sigma
@@ -2127,7 +2368,12 @@ class VFEModel(nn.Module):
         # per-query tau from the CONVERGED belief sigma (the state this diagnostic scores).
         _tau_b = self._beta_tau(out.sigma, out.mu,
                                 attention_tau(self.effective_kappa_beta(out.mu.device), self.group.irrep_dims))
-        beta = attention_weights(energy, tau=_tau_b, log_prior=log_prior)
+        if snapshot is None:
+            beta = attention_weights(energy, tau=_tau_b, log_prior=log_prior)
+        else:
+            beta = snapshot.beta_maps[-1]
+            if energy.dim() == 2:
+                beta = beta[0]
         _q_conv = cap["converged"]                                   # q*: the F self-term reads the
         self_div = self_divergence_for_alpha(                        # pre-transform converged belief
             fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p),      # (matches the M-step term; F19)
@@ -2345,6 +2591,9 @@ class VFEModel(nn.Module):
     def attention_maps(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+
+        *,
+        snapshot:  Optional[DiagnosticSnapshot] = None,
     ) -> torch.Tensor:                     # (L, H, N, N) per-layer, per-head attention beta_ij
         r"""Per-layer, per-head attention weights ``beta_ij`` for sequence 0 (no_grad).
 
@@ -2364,6 +2613,8 @@ class VFEModel(nn.Module):
         diagnostics folds the FINAL belief into the handoff while this replay uses each block's
         own output -- the EXACT trajectory the model ran).
         """
+        if snapshot is not None:
+            return self._validate_diagnostic_snapshot(token_ids, snapshot).beta_maps
         from vfe3.inference.e_step import _transport
         from vfe3.geometry.transport import transport_mean, transport_covariance
         from vfe3.families.base import get_family
@@ -2462,6 +2713,7 @@ class VFEModel(nn.Module):
 
         *,
         log_likelihood: Optional[torch.Tensor] = None,  # (N,) optional E_q[log p(o|k)] diagnostic seam
+        snapshot:       Optional[DiagnosticSnapshot] = None,
     ) -> dict:                             # each value a list of length L = cfg.n_layers
         r"""Per-LAYER (inference-depth) belief-channel diagnostics for sequence 0 (no_grad).
 
@@ -2496,24 +2748,32 @@ class VFEModel(nn.Module):
         from vfe3 import metrics
 
         cfg = self.cfg
-        enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
-        belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
-                             omega=enc.omega[0] if enc.omega is not None else None,   # carry the GL(K) frame under omega_direct
-                             reflection=enc.reflection[0] if enc.reflection is not None else None)   # carry the phi-path reflection sign
-        n = belief.mu.shape[0]
-        rope = self._rope_rotation(n, token_ids.device)
-        s_belief = None
-        if cfg.s_e_step:                                              # anchor q0 + handoff to refined s (as forward)
-            s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0), rope=rope)
-            s_belief = (s_mu1, s_sigma1)
-            belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
-        log_prior = self._attention_log_prior(n, token_ids.device)   # (N, N)
-        log_prior = self._fold_precision_bias(log_prior, belief.sigma)  # match forward's prior
-        if self.cfg.gamma_as_beta_prior:                             # m4: match forward's hierarchical gamma prior fold
-            log_prior = self._fold_gamma_prior(log_prior, token_ids[:1], belief.phi.unsqueeze(0),
-                                               omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
-                                               reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None,
-                                               s_belief=s_belief)[0]
+        if snapshot is None:
+            enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
+            belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
+                                 omega=enc.omega[0] if enc.omega is not None else None,
+                                 reflection=enc.reflection[0] if enc.reflection is not None else None)
+            n = belief.mu.shape[0]
+            rope = self._rope_rotation(n, token_ids.device)
+            s_belief = None
+            if cfg.s_e_step:
+                s_mu1, s_sigma1 = self._refine_s(token_ids[:1], belief.phi.unsqueeze(0), rope=rope)
+                s_belief = (s_mu1, s_sigma1)
+                belief = belief._replace(mu=s_mu1[0], sigma=s_sigma1[0])
+            log_prior = self._attention_log_prior(n, token_ids.device)
+            log_prior = self._fold_precision_bias(log_prior, belief.sigma)
+            if self.cfg.gamma_as_beta_prior:
+                log_prior = self._fold_gamma_prior(
+                    log_prior, token_ids[:1], belief.phi.unsqueeze(0),
+                    omega=belief.omega.unsqueeze(0) if belief.omega is not None else None,
+                    reflection=belief.reflection.unsqueeze(0) if belief.reflection is not None else None,
+                    s_belief=s_belief)[0]
+        else:
+            snapshot = self._validate_diagnostic_snapshot(token_ids, snapshot)
+            belief = _sequence_belief(snapshot.initial_belief)
+            n = belief.mu.shape[0]
+            rope = snapshot.rope
+            log_prior = self._first_sequence_log_prior(snapshot.log_prior, token_ids.shape[0])
         fam = get_family(cfg.family)
         _lb = cfg.lambda_beta
         _tau = attention_tau(self.effective_kappa_beta(belief.mu.device), self.group.irrep_dims)
@@ -2527,22 +2787,26 @@ class VFEModel(nn.Module):
         if log_likelihood is not None:
             keys.append("observation_likelihood")
         rec: dict = {k: [] for k in keys}
-        for _ in range(cfg.n_layers):
-            cap: dict = {}                                            # pre-transform converged belief (F self-term)
-            belief = vfe_block(                                       # converged belief at this block
-                belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
-                block_norm=self.block_norm, head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
-                lambda_beta=cfg.lambda_beta,
-                connection_W=getattr(self, "connection_W", None),
-                connection_M=getattr(self, "connection_M", None),
-                connection_L=getattr(self, "connection_L", None),
-                rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-                gauge_parameterization=cfg.gauge_parameterization,
-                # query_adaptive_tau replay fidelity: the ENTERING belief's per-query tau, exactly as
-                # vfe_stack passes the forward E-step; OFF path returns _tau (value-identical).
-                tau=self._beta_tau(belief.sigma, belief.mu, _tau),
-                capture=cap,
-            )
+        for layer_index in range(cfg.n_layers):
+            if snapshot is None:
+                cap: dict = {}
+                belief = vfe_block(
+                    belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
+                    block_norm=self.block_norm, head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
+                    lambda_beta=cfg.lambda_beta,
+                    connection_W=getattr(self, "connection_W", None),
+                    connection_M=getattr(self, "connection_M", None),
+                    connection_L=getattr(self, "connection_L", None),
+                    rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                    gauge_parameterization=cfg.gauge_parameterization,
+                    tau=self._beta_tau(belief.sigma, belief.mu, _tau),
+                    capture=cap,
+                )
+            else:
+                prior = snapshot.layer_priors[layer_index]
+                mu_p, sigma_p = prior[0][0], prior[1][0]
+                belief = _sequence_belief(snapshot.layer_outputs[layer_index])
+                cap = {"converged": _sequence_belief(snapshot.layer_converged[layer_index])}
             _tau_c = self._beta_tau(belief.sigma, belief.mu, _tau)   # converged-belief tau (as diagnostics)
             omega = _transport(                                       # (N, N, K, K) under the ACTIVE regime
                 belief.phi, self.group, transport_mode=cfg.transport_mode,
@@ -2583,7 +2847,12 @@ class VFEModel(nn.Module):
                     divergence_family=cfg.divergence_family,
                     irrep_dims=self.group.irrep_dims,
                 )
-            beta = attention_weights(energy, tau=_tau_c, log_prior=log_prior)
+            if snapshot is None:
+                beta = attention_weights(energy, tau=_tau_c, log_prior=log_prior)
+            else:
+                beta = snapshot.beta_maps[layer_index]
+                if energy.dim() == 2:
+                    beta = beta[0]
             _q = cap["converged"]                                    # self-term reads THIS block's prior (per-layer exact)
             self_div = self_divergence_for_alpha(
                 fam(_q.mu, _q.sigma), fam(mu_p, sigma_p),
@@ -2647,6 +2916,7 @@ class VFEModel(nn.Module):
             # Coordinate-chart diagnostic only: under omega_direct phi is intentionally inactive.
             rec["phi_norm_mean"].append(float(torch.linalg.norm(belief.phi, dim=-1).mean()))
 
-            mu_p = (1.0 - rho) * mu_p + rho * belief.mu              # handoff (mirrors vfe_stack)
-            sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
+            if snapshot is None:
+                mu_p = (1.0 - rho) * mu_p + rho * belief.mu          # handoff (mirrors vfe_stack)
+                sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
         return rec

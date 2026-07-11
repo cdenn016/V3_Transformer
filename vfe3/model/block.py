@@ -46,6 +46,7 @@ def vfe_block(
     tau:             'Optional[float | torch.Tensor]' = None,  # softmax temperature (precomputed by vfe_stack; None -> compute here)
     capture:         Optional[dict]            = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
     grad_record:     Optional[dict]            = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
+    state_record:    Optional[dict]            = None,   # diag out-param: E-step belief/F trace (None -> no capture)
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: caller-built flat transport (None -> e_step builds its own)
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
 ) -> BeliefState:
@@ -81,7 +82,7 @@ def vfe_block(
         connection_L=connection_L, link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
         clamp_monitor=cfg.transport_clamp_monitor,
         e_step_gradient=e_step_gradient, oracle_unroll_grad=cfg.oracle_unroll_grad,
-        grad_record=grad_record,
+        grad_record=grad_record, state_record=state_record,
         log_prior=log_prior,
         rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
         # Tier-1/Tier-2 toggles (2026-07-05; all default OFF/byte-identical). The iteration-only
