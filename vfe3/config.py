@@ -698,6 +698,10 @@ class VFE3Config:
     # dense K-axis einsum (the off-blocks are exactly zero). Same sum, ~n_heads x fewer FLOPs on the
     # dominant pair GEMM. Numerics: fp32 reassociation only (pinned allclose 1e-6).
     transport_mean_per_head:   bool  = False
+
+    # Reuse one canonical diagonal-KL pair-statistics bundle between attention and the filtering
+    # gradient / MM consumer. Default OFF preserves the legacy arithmetic and routing exactly.
+    reuse_pairwise_kl_stats:   bool  = False
     
     # fp64 island keying for stable_matrix_exp_pair. 'dim' (default): upcast when the block dim
     # >= its dim_threshold (the long-standing rule). 'norm': upcast only when the clamped block

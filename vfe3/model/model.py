@@ -803,6 +803,7 @@ class VFEModel(nn.Module):
             # Tier-1 transport perf toggles: the s-channel E-step shares the flat transport
             # numerics with the belief channel (all default OFF/byte-identical).
             transport_mean_per_head=cfg.transport_mean_per_head,
+            reuse_pairwise_kl_stats=cfg.reuse_pairwise_kl_stats,
             exp_fp64_mode=cfg.exp_fp64_mode,
             exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
             e_step_update=cfg.e_step_update,

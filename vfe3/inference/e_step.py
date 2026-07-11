@@ -356,6 +356,7 @@ def free_energy_value(
     include_attention_entropy: bool = True,
     skip_belief_sigma_update:  bool = False,           # accepted-and-ignored iteration-only knob
     compile_pair_kernel:       bool = False,           # accepted-and-ignored iteration-only knob
+    reuse_pairwise_kl_stats:   bool = False,           # accepted-and-ignored iteration-only knob
     transport_mean_per_head:   bool = False,           # HONORED by omega-direct factored transport
     rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
     rope_on_value:             bool = True,            # False -> value aggregation uses the un-rotated base
@@ -389,7 +390,8 @@ def free_energy_value(
         E_ij = D(q_i || Omega_ij q_j),  beta = softmax_j(log_prior - E/tau).
 
     The step-size / E-step-only knobs (gradient_mode, phi_precond_mode, phi_retract_mode,
-    spd_retract_mode, sigma_max, e_sigma_q_trust) are declared here as EXPLICIT accept-and-ignore
+    spd_retract_mode, sigma_max, e_sigma_q_trust, reuse_pairwise_kl_stats) are declared here as
+    EXPLICIT accept-and-ignore
     parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may forward one knob
     bag to both this and ``e_step_iteration`` while a MISSPELLED real parameter still raises
     ``TypeError`` here instead of being silently swallowed. ``transport_mode`` / ``connection_W`` /
@@ -612,6 +614,7 @@ def e_step_iteration(
     include_attention_entropy: bool = True,
     skip_belief_sigma_update:  bool = False,             # freeze the belief sigma through this iteration (no grad, no retraction)
     compile_pair_kernel:       bool = False,             # torch.compile the closed-form pair kernel (lazy cache)
+    reuse_pairwise_kl_stats:   bool = False,             # opt-in P3 statistics reuse
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
@@ -756,6 +759,7 @@ def e_step_iteration(
             kl_max=kl_max, eps=eps, lambda_twohop=lambda_twohop, value=value,
             lambda_alpha_mode=lambda_alpha_mode, family=family, divergence_family=divergence_family,
             need_sigma_update=(not skip_belief_sigma_update),
+            reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
             irrep_dims=group.irrep_dims, log_prior=log_prior,
         )
         # Backward estimator, mirroring the gradient path: 'unroll' keeps the analytic graph
@@ -801,6 +805,7 @@ def e_step_iteration(
             # sigma update below is skipped either way).
             need_sigma_grad=(not skip_belief_sigma_update),
             compile_pair_kernel=compile_pair_kernel,
+            reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
             # Opt-in unrolled-oracle: make the autograd oracle (non-kernel families) return a
             # differentiable belief gradient so the through-inference signal reaches the prior, matching
             # the hand kernel. Gated on the explicit oracle_unroll_grad toggle (default OFF preserves the

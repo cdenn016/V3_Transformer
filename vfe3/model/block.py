@@ -87,7 +87,8 @@ def vfe_block(
         rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
         # Tier-1/Tier-2 toggles (2026-07-05; all default OFF/byte-identical). The iteration-only
         # knobs (e_step_update/mm_damping/lambda_twohop/skip_belief_sigma_update/
-        # compile_pair_kernel) ride e_step's **kwargs into e_step_iteration AND the diagnostic
+        # compile_pair_kernel/reuse_pairwise_kl_stats) ride e_step's **kwargs into
+        # e_step_iteration AND the diagnostic
         # free_energy_value (which accepts-and-ignores the iteration-only ones, and HONORS
         # lambda_twohop in the logged F); the loop-control knobs bind explicitly on e_step.
         # skip_belief_sigma_update is a BELIEF-channel toggle: _refine_s never passes it, so the
@@ -96,6 +97,7 @@ def vfe_block(
         lambda_twohop=cfg.lambda_twohop,
         skip_belief_sigma_update=cfg.skip_belief_sigma_update,
         compile_pair_kernel=cfg.compile_pair_kernel,
+        reuse_pairwise_kl_stats=cfg.reuse_pairwise_kl_stats,
         transport_mean_per_head=cfg.transport_mean_per_head,
         exp_fp64_mode=cfg.exp_fp64_mode,
         exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,

@@ -19,6 +19,7 @@ from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence
 from vfe3.geometry.transport import (CompactFactoredTransport, DirectLinkTransport, FactoredTransport,
                                       RopeTransport, transport_covariance, transport_mean)
 from vfe3.gradients.oracle import belief_gradients_autograd
+from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
 
 _KERNELS: Dict[str, Callable] = {}
 _COMPILED_KERNELS: Dict[str, Callable] = {}   # lazy torch.compile cache (compile_pair_kernel toggle)
@@ -101,6 +102,8 @@ def _diag_kl_filtering_kernel(
     need_sigma_grad: bool  = True,               # False -> skip the sigma pair contraction, return (grad_mu, None)
     irrep_dims:      Optional[List[int]]    = None, # block sizes; maps head h(k) onto coordinate k
     pair_mask:       Optional[torch.Tensor] = None, # destination-energy derivative mask; None means beta is pre-masked
+    pair_inv_sigma_t: Optional[torch.Tensor] = None, # precomputed 1 / clamp(sigma_t); None keeps legacy arithmetic
+    pair_delta_tq:    Optional[torch.Tensor] = None, # precomputed mu_t - mu_q; paired with pair_inv_sigma_t
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Diagonal-KL query-side (filtering) gradient (per-head aware).
 
@@ -135,7 +138,12 @@ def _diag_kl_filtering_kernel(
     the mask is per-coordinate (N,K) and a saturated coordinate is gated WITHOUT killing its
     unsaturated neighbours. The two coincide at K=1.
     """
-    sp = sigma_p.clamp(min=eps); sq = sigma_q.clamp(min=eps); st = sigma_t.clamp(min=eps)
+    if (pair_inv_sigma_t is None) != (pair_delta_tq is None):
+        raise ValueError(
+            "pair_inv_sigma_t and pair_delta_tq must be provided together"
+        )
+    sp = sigma_p.clamp(min=eps); sq = sigma_q.clamp(min=eps)
+    st = sigma_t.clamp(min=eps) if pair_inv_sigma_t is None else None
 
     if alpha_coef.shape[-1] == 1:                                               # per-position alpha
         raw_self  = _raw_diag_kl(mu_q, sigma_q, mu_p, sigma_p, eps=eps)         # (N,)
@@ -157,7 +165,10 @@ def _diag_kl_filtering_kernel(
         if pair_mask is not None:
             w2 = w2 * pair_mask
 
-    diff_mu  = (mu_q.unsqueeze(-2) - mu_t) / st                # (..., N, N, K)
+    if pair_inv_sigma_t is None:
+        diff_mu = (mu_q.unsqueeze(-2) - mu_t) / st             # (..., N, N, K)
+    else:
+        diff_mu = -pair_delta_tq * pair_inv_sigma_t             # (..., N, N, K)
     self_mu  = self_mask * alpha_coef * (mu_q - mu_p) / sp
     pair_mu  = _pair_contract(beta_pair, diff_mu, irrep_dims)
     grad_mu  = self_mu + lambda_beta * pair_mu
@@ -168,7 +179,10 @@ def _diag_kl_filtering_kernel(
         # contraction is dead compute -- skip it entirely rather than discarding its result.
         return grad_mu, None
 
-    diff_sig = 0.5 * (1.0 / st - 1.0 / sq.unsqueeze(-2))       # (..., N, N, K)
+    if pair_inv_sigma_t is None:
+        diff_sig = 0.5 * (1.0 / st - 1.0 / sq.unsqueeze(-2))   # (..., N, N, K)
+    else:
+        diff_sig = 0.5 * (pair_inv_sigma_t - 1.0 / sq.unsqueeze(-2))
     self_sig = self_mask * alpha_coef * 0.5 * (1.0 / sp - 1.0 / sq)
     pair_sig = _pair_contract(beta_pair, diff_sig, irrep_dims)
     grad_sigma = self_sig + lambda_beta * pair_sig
@@ -308,6 +322,7 @@ def belief_gradients(
     create_graph:              bool = False,   # unroll: oracle returns a differentiable grad (to prior)
     need_sigma_grad:           bool = True,    # False -> kernel skips the sigma pair contraction (grad_sigma None)
     compile_pair_kernel:       bool = False,   # torch.compile the closed-form kernel (lazy cache; eager fallback)
+    reuse_pairwise_kl_stats:   bool = False,   # reuse graph-live diagonal-KL pair statistics on the canonical route
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
@@ -366,8 +381,23 @@ def belief_gradients(
     fam = get_family(family)
     sd = self_divergence_for_alpha(fam(mu, sigma), fam(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
-    energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0, kl_max=kl_max, eps=eps,
-                             divergence_family=divergence_family, irrep_dims=irrep_dims)
+    pair_stats = None
+    if (reuse_pairwise_kl_stats
+            and all(tensor.dtype == torch.float32 for tensor in (mu, sigma, mu_t, sigma_t))):
+        pair_stats = diagonal_kl_pair_stats(
+            mu,
+            sigma,
+            mu_t,
+            sigma_t,
+            kl_max=kl_max,
+            eps=eps,
+            irrep_dims=irrep_dims,
+        )
+    if pair_stats is None:
+        energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0, kl_max=kl_max, eps=eps,
+                                 divergence_family=divergence_family, irrep_dims=irrep_dims)
+    else:
+        energy = pair_stats.energy
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)   # (N,N) or (H,N,N)
     # Pair-term saturation mask (audit 2026-06-09 P7): the oracle differentiates
     # beta_ij * clamp(E_ij, [0, kl_max]), whose pair gradient VANISHES wherever the raw energy
@@ -375,7 +405,10 @@ def belief_gradients(
     # Without the mask a fully saturated row softmaxes to uniform beta over constant energies and
     # the kernel's transported pair term deviates from autograd-of-F by orders of magnitude.
     # Mirrors the self-term mask inside the kernel body; beta itself (the weights) is unchanged.
-    pair_mask = ((energy > 0.0) & (energy < kl_max)).to(beta.dtype)
+    if pair_stats is None:
+        pair_mask = ((energy > 0.0) & (energy < kl_max)).to(beta.dtype)
+    else:
+        pair_mask = pair_stats.pair_mask.to(beta.dtype)
     coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=lambda_alpha_mode)
     if not alpha_is_per_coord(lambda_alpha_mode):
         coef = coef.unsqueeze(-1)                 # (N,) -> (N,1) per-position broadcast; per-coord sd is already (N,K)
@@ -386,6 +419,9 @@ def belief_gradients(
     kernel_kwargs = dict(kl_max=kl_max, eps=eps, lambda_beta=lambda_beta,
                          lambda_twohop=lambda_twohop, need_sigma_grad=need_sigma_grad,
                          irrep_dims=irrep_dims, pair_mask=pair_mask)
+    if pair_stats is not None:
+        kernel_kwargs["pair_inv_sigma_t"] = pair_stats.inv_sigma_t
+        kernel_kwargs["pair_delta_tq"] = pair_stats.delta_tq
     if compile_pair_kernel:
         try:
             return _get_compiled_kernel(family)(*kernel_args, **kernel_kwargs)
@@ -424,7 +460,8 @@ def mm_exact_update(
     family:            str = "gaussian_diagonal",
     divergence_family: str = "renyi",
 
-    need_sigma_update: bool = True,             # False -> omit sigma fusion and return the input sigma exactly
+    need_sigma_update:       bool = True,       # False -> omit sigma fusion and return the input sigma exactly
+    reuse_pairwise_kl_stats: bool = False,      # reuse graph-live diagonal-KL pair statistics on the canonical route
 
     irrep_dims:    Optional[List[int]]    = None,
     log_prior:     Optional[torch.Tensor] = None,
@@ -463,10 +500,32 @@ def mm_exact_update(
     fam = get_family(family)
     sd = self_divergence_for_alpha(fam(mu, sigma), fam(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
-    energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0, kl_max=kl_max, eps=eps,
-                             divergence_family=divergence_family, irrep_dims=irrep_dims)
+    pair_stats = None
+    decoupled_value = isinstance(omega, RopeTransport) and not omega.on_value
+    if (reuse_pairwise_kl_stats
+            and family == "gaussian_diagonal"
+            and divergence_family == "renyi"
+            and not decoupled_value
+            and all(tensor.dtype == torch.float32 for tensor in (mu, sigma, mu_t, sigma_t))):
+        pair_stats = diagonal_kl_pair_stats(
+            mu,
+            sigma,
+            mu_t,
+            sigma_t,
+            kl_max=kl_max,
+            eps=eps,
+            irrep_dims=irrep_dims,
+        )
+    if pair_stats is None:
+        energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0, kl_max=kl_max, eps=eps,
+                                 divergence_family=divergence_family, irrep_dims=irrep_dims)
+    else:
+        energy = pair_stats.energy
     beta = attention_weights(energy, tau=tau, log_prior=log_prior)   # (..., N, N) or (..., H, N, N)
-    pair_mask = ((energy > 0.0) & (energy < kl_max)).to(beta.dtype)  # same gating as belief_gradients
+    if pair_stats is None:
+        pair_mask = ((energy > 0.0) & (energy < kl_max)).to(beta.dtype)
+    else:
+        pair_mask = pair_stats.pair_mask.to(beta.dtype)
     coef = alpha_gradient_coefficient(sd, value=value, b0=b0, c0=c0, mode=lambda_alpha_mode)
     if not alpha_is_per_coord(lambda_alpha_mode):
         coef = coef.unsqueeze(-1)                                    # (N,) -> (N,1)
@@ -494,11 +553,15 @@ def mm_exact_update(
         w = w + lambda_twohop * (w2 * pair_mask)                     # mask destination derivative only
 
     sp = sigma_p.clamp(min=eps)
-    st = sigma_t.clamp(min=eps)
     K = mu.shape[-1]
     prior_prec = a / sp                                              # (..., N, K) m a / sigma_p
-    pair_prec  = _pair_contract(w, 1.0 / st, irrep_dims)             # (..., N, K) Sum_j w / sigma_t
-    pair_mean  = _pair_contract(w, mu_t / st, irrep_dims)            # (..., N, K) Sum_j w mu_t / sigma_t
+    if pair_stats is None:
+        st = sigma_t.clamp(min=eps)
+        pair_prec = _pair_contract(w, 1.0 / st, irrep_dims)          # (..., N, K) Sum_j w / sigma_t
+        pair_mean = _pair_contract(w, mu_t / st, irrep_dims)         # (..., N, K) Sum_j w mu_t / sigma_t
+    else:
+        pair_prec = _pair_contract(w, pair_stats.inv_sigma_t, irrep_dims)
+        pair_mean = _pair_contract(w, mu_t * pair_stats.inv_sigma_t, irrep_dims)
     prec = prior_prec + pair_prec                                   # pre-clamp fused precision
     P = prec.clamp(min=eps)                                         # eps guards the all-saturated row
     mu_star = (a * mu_p / sp + pair_mean) / P
