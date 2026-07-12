@@ -43,29 +43,154 @@ runs the optional model channel and the `L`-by-`T` belief-refinement stack;
 `VFEModel.forward` applies the selected decoder. Cross-entropy then supplies the
 supervised outer loss and the artifact layer records the run.
 
+## Mathematical state and transport
+
+The model uses the following notation throughout the derivation.
+
+| Symbol | Meaning |
+|---|---|
+| $q_i$ | Refined Gaussian belief at token $i$ |
+| $p_i$ | Token prior and initial belief supplied to the belief channel |
+| $s_i$ | Optional model-channel Gaussian state |
+| $r$ | Global, token-independent Gaussian hyper-prior for the model channel |
+| $\beta_{ij}^{(h)}$ | Belief-channel source weight from token $j$ to token $i$ in head $h$ |
+| $\gamma_{ij}^{(h)}$ | Model-channel source weight from token $j$ to token $i$ in head $h$ |
+| $\phi_i$ | Coordinates of token $i$ in the registered gauge Lie algebra |
+| $U_i$ | Group-valued local frame obtained from $\phi_i$ |
+| $\Omega_{ij}$ | Relative transport that expresses token $j$ in token $i$'s frame |
+| $K$ | Total belief dimension |
+| $H$ | Number of equal gauge blocks and attention heads |
+| $d_h$ | Dimension of one equal block, $K/H$ |
+
+Three scopes are kept separate below. An **ambient exact result** is a theorem for unrestricted
+full Gaussians and invertible pushforwards. A **reusable-engine formula** is an implemented route
+whose assumptions are stated with it. A **checked-in specialization** records the branches and
+values selected by the committed `train_vfe3.py`; it is not an architectural restriction.
+
+At ambient scope, each token carries a full Gaussian and a frame in an equal-block general linear
+group. The reusable phi route forms an algebra matrix from registered generators before applying
+the matrix exponential:
+
+$$
+\begin{aligned}
+q_i &= \mathcal N(\mu_i,\Sigma_i), &
+\mu_i &\in \mathbb R^K, &
+\Sigma_i &\in \operatorname{SPD}(K), \\
+A_i &= \sum_a \phi_i^a G_a \in \mathfrak g, &
+U_i &= \exp(A_i), &
+\Omega_{ij} &= U_iU_j^{-1}, \\
+G_{\mathrm{block}} &= \prod_{h=1}^{H}\operatorname{GL}(d_h), &
+d_h &= K/H, &
+U_i &= \operatorname{diag}\left(U_i^{(1)},\ldots,U_i^{(H)}\right).
+\end{aligned}
+$$
+
+The checked-in specialization has $K=20$, $H=2$, and $d_h=10$, so its exponential-chart frame
+has two $\operatorname{GL}^{+}(10)$ blocks. Every real matrix exponential has positive determinant,
+but the real exponential map is not surjective onto the positive-determinant component. The phi
+chart therefore covers only $\operatorname{image}(\exp)\subsetneq\operatorname{GL}^{+}(10)$ in
+each block.
+
+For an ambient full Gaussian, transport is the exact pushforward. The checked-in diagonal family
+uses the reusable engine's projected covariance operation, where $\sigma_j$ is a variance vector
+and $\operatorname{Diag}(\sigma_j)$ is its diagonal covariance matrix:
+
+$$
+\begin{aligned}
+\widetilde\mu_{ij} &= \Omega_{ij}\mu_j, \\
+\widetilde\Sigma_{ij} &= \Omega_{ij}\Sigma_j\Omega_{ij}^{\top}, \\
+\widetilde\sigma_{ij} &= \operatorname{diag}\left(
+\Omega_{ij}\operatorname{Diag}(\sigma_j)\Omega_{ij}^{\top}
+\right).
+\end{aligned}
+$$
+
+Unrestricted congruence is exact and closed on full covariances. It is not closed on the diagonal
+family under a general $\operatorname{GL}(K)$ transport: the diagonal cone is preserved for every
+diagonal input only by monomial transformations. The final line above is therefore a diagonal
+projection of a full covariance sandwich, not an unrestricted gauge action within the diagonal
+family.
+
+For $P=\mathcal N(\mu_P,\Sigma_P)$ and $Q=\mathcal N(\mu_Q,\Sigma_Q)$, the ambient comparison is
+the forward Gaussian KL. The checked-in route evaluates its diagonal, per-head specialization on
+$I_h=\{(h-1)d_h+1,\ldots,hd_h\}$:
+
+$$
+\begin{aligned}
+D_{\mathrm{KL}}(P\Vert Q)
+&= \frac12\left[
+\operatorname{tr}(\Sigma_Q^{-1}\Sigma_P)
++(\mu_P-\mu_Q)^{\top}\Sigma_Q^{-1}(\mu_P-\mu_Q)
+-K
++\log\frac{\det\Sigma_Q}{\det\Sigma_P}
+\right], \\
+E_{ij}^{(h)}
+&= C_{[0,K_{\max}]}\left[
+\frac12\sum_{k\in I_h}\left(
+\frac{\sigma_{ik}}{\widetilde\sigma_{ij,k}}
++\frac{(\widetilde\mu_{ij,k}-\mu_{ik})^2}{\widetilde\sigma_{ij,k}}
+-1
++\log\frac{\widetilde\sigma_{ij,k}}{\sigma_{ik}}
+\right)
+\right].
+\end{aligned}
+$$
+
+Before division or logarithms, diagonal variances are floored at $\varepsilon=10^{-6}$.
+$C_{[0,K_{\max}]}$ clamps finite values to $[0,K_{\max}]$, maps NaN and positive infinity to
+$K_{\max}$, and maps negative infinity to zero. The checked-in setting chooses order-one Renyi,
+which is forward KL with the belief as its first argument, and sets $K_{\max}=8K=160$.
+
+The ambient full-Gaussian pair score also has an exact local gauge law. For arbitrary invertible
+frame changes $h_i$ and $h_j$, the transported source and query change together, while vertex-frame
+transport obeys a flat cocycle:
+
+$$
+\begin{aligned}
+q_i' &= (h_i)_*q_i, &
+q_j' &= (h_j)_*q_j, &
+\Omega_{ij}' &= h_i\Omega_{ij}h_j^{-1}, \\
+D_{\mathrm{KL}}\left(q_i'\Vert(\Omega_{ij}')_*q_j'\right)
+&= D_{\mathrm{KL}}\left(q_i\Vert(\Omega_{ij})_*q_j\right), \\
+\Omega_{ij}\Omega_{jk} &= \Omega_{ik}, &
+\Omega_{ij}\Omega_{jk}\Omega_{ki} &= I.
+\end{aligned}
+$$
+
+This invariance theorem is limited to ambient full-Gaussian pushforwards. The projected diagonal
+route, the linear readout, and the untied head mixer are outside it, so it is not a theorem of
+whole-model gauge invariance. Flatness is the operator identity obtained from
+$\Omega_{ij}=U_iU_j^{-1}$; it does not imply path independence for repeated diagonal projection,
+because projection is not a group action.
+
 ## Attention as variational source selection
 
-For query position `i`, let `E_ij` be a fixed scalar comparison between `q_i` and the
-transported source `Omega_ij* q_j`, let `pi_ij` be a normalized prior on the active source
-support, and let `tau > 0`. The fixed-row objective and its Gibbs minimizer are
+For a fixed query $i$ and head $h$, let $\pi_{ij}^{(h)}$ be a normalized prior on the active
+source support. Holding beliefs, transports, comparison energies, and that prior fixed gives the
+entropy-regularized row objective and its normalized Gibbs solution:
 
 $$
-\mathcal F_i(\beta_i) = \sum_j \beta_{ij} E_{ij}
-+ \tau \sum_j \beta_{ij} \log\frac{\beta_{ij}}{\pi_{ij}},
-\qquad
-\beta_{ij}^{*} = \frac{\pi_{ij}\exp(-E_{ij}/\tau)}
-{\sum_k \pi_{ik}\exp(-E_{ik}/\tau)}.
+\begin{aligned}
+\mathcal F_i^{(h)}(\beta_i^{(h)})
+&= \sum_j \beta_{ij}^{(h)}E_{ij}^{(h)}
++\tau_h\sum_j\beta_{ij}^{(h)}
+\log\frac{\beta_{ij}^{(h)}}{\pi_{ij}^{(h)}}, \\
+\tau_h &= \kappa_\beta\sqrt{d_h}, \\
+\beta_{ij}^{(h)*}
+&= \frac{\pi_{ij}^{(h)}\exp\left(-E_{ij}^{(h)}/\tau_h\right)}
+{\sum_k\pi_{ik}^{(h)}\exp\left(-E_{ik}^{(h)}/\tau_h\right)}.
+\end{aligned}
 $$
 
-For positive prior mass on the active support, this is the unique row-wise minimizer at
-fixed beliefs, transports, energies, and prior. The relative-entropy term is part of the
-stationary softmax result; removing it changes the row problem rather than merely
-changing its presentation.
+For positive prior mass on the active support, this is the unique row-wise minimizer under those
+fixed quantities. The checked-in profile has $\kappa_\beta=\kappa_\gamma=1$ and $d_h=10$, hence
+$\tau_\beta=\tau_\gamma=\sqrt{10}$. The relative-entropy term is part of the stationary Gibbs
+result; removing it changes the row problem rather than merely changing its presentation.
 
 Registry-selected scalar energies preserve this Gibbs calculation because the row
-derivation treats `E_ij` as fixed. They do not all acquire the same probabilistic
+derivation treats $E_{ij}^{(h)}$ as fixed. They do not all acquire the same probabilistic
 meaning. The canonical KL construction carries the stated belief-coupling variational
-interpretation, and at `tau = 1` the ordinary mixture-KL identity applies. Replacing KL
+interpretation, and at $\tau=1$ the ordinary mixture-KL identity applies. Replacing KL
 with another registered divergence still defines a Gibbs source-selection rule, but does
 not by itself define an ELBO or make the complete training loop optimize one variational
 free energy.
@@ -140,19 +265,10 @@ choices.
 
 ## Geometry and mathematical scope
 
-For unrestricted Gaussian distributions and an invertible common pushforward `A`, KL
-has the exact invariance
-
-$$
-\mathrm{KL}(A_*q \mathbin{\|} A_*p) = \mathrm{KL}(q \mathbin{\|} p),
-\qquad
-\Omega_{ij}' = h_i \Omega_{ij} h_j^{-1}.
-$$
-
-The second relation is the induced transport law under independent local frame changes.
-If `q_i` and `q_j` are pushed forward by `h_i` and `h_j` while transport transforms by
-that law, the transported source in frame `i` receives the same common pushforward as
-the query. The full-Gaussian KL pair score is therefore invariant.
+The ambient invariance and induced local transport law are stated in the mathematical
+core above. If `q_i` and `q_j` are pushed forward by `h_i` and `h_j` while transport
+transforms by that law, the transported source in frame `i` receives the same common
+pushforward as the query. The full-Gaussian KL pair score is therefore invariant.
 
 The diagonal covariance family is not closed under a general GL(K) congruence:
 `A diag(sigma) A^T` is usually non-diagonal. The diagonal implementation consequently
