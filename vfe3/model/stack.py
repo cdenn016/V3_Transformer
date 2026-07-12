@@ -47,8 +47,10 @@ def vfe_stack(
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
     rope_on_value:   bool                      = True,   # False -> value aggregation uses the un-rotated base
-    capture:         Optional[MStepCapture]    = None,   # out-param: LAST block's converged belief + live prior
+
+    capture:         Optional[MStepCapture]        = None,   # out-param: LAST block's converged belief + live prior
     grad_record:     Optional[EStepGradientRecord] = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
+
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: one flat transport shared across blocks (valid: e_phi_lr==0 + flat, phi loop-invariant)
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
     kappa_beta_override: 'Optional[float | torch.Tensor]' = None,   # learnable_kappa_beta: live exp(log_kappa_beta) (t5-exception family); None -> cfg.kappa_beta

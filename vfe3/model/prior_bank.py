@@ -32,7 +32,7 @@ kernel is pinned to EXACTLY (and under ``log_softmax``); both are alpha=1 KL.
 
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 import torch
 import torch.utils.checkpoint as _checkpoint
@@ -1095,7 +1095,45 @@ DecodeCallable = Callable[
     [PriorBank, torch.Tensor, torch.Tensor, torch.Tensor],
     torch.Tensor,
 ]
-FusedCECallable = Callable[..., torch.Tensor]
+
+
+class GeometricFusedCECallable(Protocol):
+    """Fused CE contract for covariance-aware geometric decoders."""
+
+    def __call__(
+        self,
+        pb:            PriorBank,
+        mu_q:          torch.Tensor,
+        sigma_q:       torch.Tensor,
+        targets:       torch.Tensor,
+
+        *,
+        z_loss_weight: float           = 0.0,
+        tau:           Optional[float] = None,
+        chunk_size:    Optional[int]   = None,
+        ignore_index:  int             = -100,
+    ) -> torch.Tensor:
+        ...
+
+
+class LinearFusedCECallable(Protocol):
+    """Fused CE contract for the mean-only linear decoder."""
+
+    def __call__(
+        self,
+        pb:            PriorBank,
+        mu_q:          torch.Tensor,
+        targets:       torch.Tensor,
+
+        *,
+        z_loss_weight: float         = 0.0,
+        chunk_size:    Optional[int] = None,
+        ignore_index:  int           = -100,
+    ) -> torch.Tensor:
+        ...
+
+
+FusedCECallable = GeometricFusedCECallable | LinearFusedCECallable
 
 
 @register_encode("per_token")

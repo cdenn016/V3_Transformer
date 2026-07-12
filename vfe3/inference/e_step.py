@@ -656,14 +656,15 @@ def e_step_iteration(
     transport_mean_per_head:       bool  = False,  # Tier-1: factored transport_mean contracts per gauge block
     compact_phi_block_transport:   bool  = False,  # P1: packed canonical flat block_glk phi factors
 
-    log_prior:                 Optional[torch.Tensor] = None,
-    connection_W:              Optional[torch.Tensor] = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
-    connection_M:              Optional[torch.Tensor] = None,   # learned covariant connection for regime_ii_covariant (Route B; None -> pure path)
-    connection_L:              Optional[torch.Tensor] = None,   # learned direct link for regime_ii_link* (NN exception; None -> pure path)
-    rope:                      Optional[torch.Tensor] = None,   # (N, K, K) gauge-RoPE rotation
-    rope_on_cov:               bool                   = False,  # full-gauge: rotate covariance too
-    rope_on_value:             bool                   = True,   # False -> value aggregation uses the un-rotated base
+    log_prior:                 Optional[torch.Tensor]        = None,
+    connection_W:              Optional[torch.Tensor]        = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
+    connection_M:              Optional[torch.Tensor]        = None,   # learned covariant connection for regime_ii_covariant (Route B; None -> pure path)
+    connection_L:              Optional[torch.Tensor]        = None,   # learned direct link for regime_ii_link* (NN exception; None -> pure path)
+    rope:                      Optional[torch.Tensor]        = None,   # (N, K, K) gauge-RoPE rotation
+    rope_on_cov:               bool                          = False,  # full-gauge: rotate covariance too
+    rope_on_value:             bool                          = True,   # False -> value aggregation uses the un-rotated base
     grad_record:               Optional[EStepGradientRecord] = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
+
     _prebuilt_omega:           'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: forward-transport cache from e_step
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
@@ -1012,11 +1013,12 @@ def e_step(
     rope_on_cov:                 bool = False,
     rope_on_value:               bool = True,
 
-    e_step_halt_tol:             Optional[float]        = None,   # eval halting: break when mean KL(q^t||q^{t-1}) < tol
+    e_step_halt_tol:             Optional[float]               = None,   # eval halting: break when mean KL(q^t||q^{t-1}) < tol
     grad_record:                 Optional[EStepGradientRecord] = None,   # diag out-param: LAST iteration's belief-grad norms
-    state_record:                Optional[dict]         = None,   # diag out-param: every belief iterate + matching F tensor
-    rope:                        Optional[torch.Tensor] = None,
-    log_prior:                   Optional[torch.Tensor] = None,
+    state_record:                Optional[dict]                = None,   # diag out-param: every belief iterate + matching F tensor
+    rope:                        Optional[torch.Tensor]        = None,
+    log_prior:                   Optional[torch.Tensor]        = None,
+
     prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,   # share_refine_s_transport: caller-built forward transport
     **kwargs,
 ) -> 'BeliefState | Tuple[BeliefState, List[float]]':

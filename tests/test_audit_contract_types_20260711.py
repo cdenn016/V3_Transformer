@@ -1,7 +1,7 @@
 """Regression pins for the July 11 type-contract and half-Fisher audit fixes."""
 
 from importlib import import_module, util
-from inspect import signature
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, get_args, get_type_hints, is_typeddict
 
@@ -71,7 +71,70 @@ def test_prior_bank_registries_use_concrete_callable_aliases() -> None:
     assert prior_bank.DecodeCallable == Callable[
         [prior_bank.PriorBank, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
     ]
-    assert prior_bank.FusedCECallable == Callable[..., torch.Tensor]
+    assert prior_bank.FusedCECallable != Callable[..., torch.Tensor]
+    assert set(get_args(prior_bank.FusedCECallable)) == {
+        prior_bank.GeometricFusedCECallable,
+        prior_bank.LinearFusedCECallable,
+    }
+
+    geometric = signature(prior_bank.GeometricFusedCECallable.__call__)
+    assert [
+        (parameter.name, parameter.kind)
+        for parameter in geometric.parameters.values()
+    ] == [
+        ("self", Parameter.POSITIONAL_OR_KEYWORD),
+        ("pb", Parameter.POSITIONAL_OR_KEYWORD),
+        ("mu_q", Parameter.POSITIONAL_OR_KEYWORD),
+        ("sigma_q", Parameter.POSITIONAL_OR_KEYWORD),
+        ("targets", Parameter.POSITIONAL_OR_KEYWORD),
+        ("z_loss_weight", Parameter.KEYWORD_ONLY),
+        ("tau", Parameter.KEYWORD_ONLY),
+        ("chunk_size", Parameter.KEYWORD_ONLY),
+        ("ignore_index", Parameter.KEYWORD_ONLY),
+    ]
+    geometric_hints = get_type_hints(prior_bank.GeometricFusedCECallable.__call__)
+    assert geometric_hints == {
+        "pb": prior_bank.PriorBank,
+        "mu_q": torch.Tensor,
+        "sigma_q": torch.Tensor,
+        "targets": torch.Tensor,
+        "z_loss_weight": float,
+        "tau": Optional[float],
+        "chunk_size": Optional[int],
+        "ignore_index": int,
+        "return": torch.Tensor,
+    }
+    assert geometric.parameters["z_loss_weight"].default == 0.0
+    assert geometric.parameters["tau"].default is None
+    assert geometric.parameters["chunk_size"].default is None
+    assert geometric.parameters["ignore_index"].default == -100
+
+    linear = signature(prior_bank.LinearFusedCECallable.__call__)
+    assert [
+        (parameter.name, parameter.kind)
+        for parameter in linear.parameters.values()
+    ] == [
+        ("self", Parameter.POSITIONAL_OR_KEYWORD),
+        ("pb", Parameter.POSITIONAL_OR_KEYWORD),
+        ("mu_q", Parameter.POSITIONAL_OR_KEYWORD),
+        ("targets", Parameter.POSITIONAL_OR_KEYWORD),
+        ("z_loss_weight", Parameter.KEYWORD_ONLY),
+        ("chunk_size", Parameter.KEYWORD_ONLY),
+        ("ignore_index", Parameter.KEYWORD_ONLY),
+    ]
+    linear_hints = get_type_hints(prior_bank.LinearFusedCECallable.__call__)
+    assert linear_hints == {
+        "pb": prior_bank.PriorBank,
+        "mu_q": torch.Tensor,
+        "targets": torch.Tensor,
+        "z_loss_weight": float,
+        "chunk_size": Optional[int],
+        "ignore_index": int,
+        "return": torch.Tensor,
+    }
+    assert linear.parameters["z_loss_weight"].default == 0.0
+    assert linear.parameters["chunk_size"].default is None
+    assert linear.parameters["ignore_index"].default == -100
 
     module_hints = get_type_hints(prior_bank)
     assert module_hints["_ENCODERS"] == Dict[str, prior_bank.EncodeCallable]
