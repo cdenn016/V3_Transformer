@@ -56,7 +56,7 @@
 \maketitle
 
 \begin{abstract}
-We develop a gauge-covariant variational-inference framework on a principal $G$-bundle in which agents are smooth local sections carrying beliefs $q(c)$, priors $p(c)$, and gauge frames $\phi(c)$. Inter-agent interaction is mediated by transport operators $\Omega_{ij} = e^{\phi_i} e^{-\phi_j}$, and coupling weights arise from an entropy-regularized KL-consensus problem whose solution is a softmax over Kullback-Leibler divergences. At the simplex optimum the entropy-retaining alignment scalar reduces to $-\tau\log Z$, and its state derivative is the corresponding envelope gradient. The checked-in multi-agent implementation differentiates this scalar total, so its active update is potential descent rather than a nonintegrable softmax-response field.
+We develop a gauge-covariant variational-inference framework on a principal $G$-bundle in which agents are smooth local sections carrying beliefs $q(c)$, priors $p(c)$, and gauge frames $\phi(c)$. Inter-agent interaction is mediated by transport operators $\Omega_{ij} = e^{\phi_i} e^{-\phi_j}$, and coupling weights arise from an entropy-regularized KL-consensus problem whose solution is a softmax over Kullback-Leibler divergences. At the simplex optimum the entropy-retaining alignment scalar reduces to $-\tau\log Z$, and its state derivative is the corresponding envelope gradient. The checked-in multi-agent implementation differentiates this scalar total, so its active update is potential descent rather than a nonintegrable softmax-response field. At the population level we prove a scoped obstruction: on an open mean-field family, live pairwise KL divergences against other variational factors cannot be the negative evidence lower bound of one fixed state-level joint. This does not preclude generative representations at other levels. The zero-within-scale hierarchical Gaussian tree is exact; a uniformly positive finite-state response map has at least one equilibrium-frozen auxiliary source model; and every normalizable consensus energy defines a Gibbs law over belief configurations. These constructions occupy different probabilistic levels and are not interchangeable.
 
 We show that standard scaled dot-product attention is recovered as a gauge-fixed and isotropic-Gaussian limit of the KL-consensus construction, up to a separately introduced learned bilinear compatibility $M$, the standard normalization and bias assumptions, and a learnable temperature scalar $\kappa$ on top of the dimensional $\sqrt{d_k}$ scaling (with $\kappa = 1$ recovering~\cite{vaswani2017attention}); the result is a recovery in a limit, not a derivation of attention from gauge theory alone (Section~\ref{sec:transformers}). A working language model with no learned $W_Q/W_K/W_V$ projections, no MLPs, and no pointwise activations (the sweep configuration retains a learned post-attention output projection $W_O$ and layer normalization) is characterized on WikiText-103 across eleven embedding dimensions at an iso-token budget. The bundled aggregate table contains 32 runs: two at $K_q=90$ and three at every other dimension. Its descriptive aggregate-level fit $\mathrm{PPL}=aK_q^b+c$ gives $a=1805.55$, $b=-1.0489$, $c=61.17$, and $R^2=0.99982$ (Section~\ref{sec:scaling_validation}). Raw per-seed records are unavailable, so no resampling interval or hypothesis test is reported. The exponent describes this single-architecture sweep and is not a claim of universality or competitive language-modeling quality. The multi-scale meta-agent construction remains a theoretical and executable research program whose empirical validation is specified prospectively (Sections~\ref{sec:participatory} and~\ref{sec:methods}).
 
@@ -549,7 +549,7 @@ Q(k, z) = q_i(k) \cdot \beta(z),
 where $\beta(z = j) \equiv \beta_{ij} \geq 0$ are variational attention weights satisfying $\sum_j \beta_{ij} = 1$. The factorization $Q(k \mid z) = q_i(k)$ for all $z$ is a substantive structural assumption, not a tractability simplification: it imposes source-independence on the consensus belief, requiring that the same $q_i$ explain the data conditional on every candidate source $j$. The softmax form of the attention weights derived below follows from this source-independence constraint together with the entropy-regularized KL energy, not from the variational principle alone. Without source-independence the minimizer of $D_{\mathrm{KL}}[Q \| P]$ over unconstrained $Q(k,z)$ is $Q = P$ exactly, attaining zero alignment energy with $\beta = \pi$ and $Q(k \mid z{=}j) = \Omega_{ij}q_j$: no divergence-dependent softmax and no consensus pressure on a single belief arise. The factorization $Q(k \mid z) = q_i(k)$ is therefore the generative assumption of the construction, forcing one belief to explain the data under every candidate source, and the closed form $\beta_{ij} \propto \pi_j \exp(-D_{\mathrm{KL}}(q_i \| \Omega_{ij}q_j)/\tau)$ is its exact consequence.
 
 \paragraph{Alignment free energy.}
-The free energy for the alignment component is the KL divergence between the variational posterior and the generative model:
+For a fixed row of source templates $P(k\mid z{=}j)$, the alignment component is the KL divergence between the row variational posterior and the corresponding auxiliary source-selection model:
 \begin{equation}
 \mathcal{F}_{\text{align}} = D_{\mathrm{KL}}[Q(k,z) \| P(k,z)] = \sum_j \beta_{ij} \int dk  q_i(k) \log \frac{q_i(k) \beta_{ij}}{P(k \mid z{=}j) \pi_j}.
 \end{equation}
@@ -558,7 +558,7 @@ Decomposing the logarithm yields
 \mathcal{F}_{\text{align}} = \sum_j \beta_{ij} \left[ \underbrace{\int dk  q_i(k) \log \frac{q_i(k)}{P(k \mid z{=}j)}}_{=  D_{\mathrm{KL}}[q_i \| \Omega_{ij} q_j]} + \log \beta_{ij} - \log \pi_j \right].
 \label{eq:mixture_free_energy}
 \end{equation}
-The identification of the integral with $D_{\mathrm{KL}}[q_i \| \Omega_{ij} q_j]$ follows directly from the definition of KL divergence and the generative model $P(k \mid z{=}j) = (\Omega_{ij} q_j)(k)$, with no approximation. Defining the alignment energy $E_{ij} \equiv D_{\mathrm{KL}}[q_i \| \Omega_{ij} q_j]$ gives
+The identification of the integral with $D_{\mathrm{KL}}[q_i \| \Omega_{ij} q_j]$ follows directly from the definition of KL divergence after setting $P(k \mid z{=}j) = (\Omega_{ij} q_j)(k)$. It is an exact row identity conditional on those templates; the population-level fixedness issue is addressed below. Defining the alignment energy $E_{ij} \equiv D_{\mathrm{KL}}[q_i \| \Omega_{ij} q_j]$ gives
 \begin{equation}
 \mathcal{F}_{\text{align}} = \sum_j \beta_{ij} \big( E_{ij} + \log \beta_{ij} - \log \pi_j \big).
 \label{eq:mixture_energy_entropy}
@@ -591,7 +591,7 @@ A temperature $\tau>0$ is introduced by writing the entropy-regularized objectiv
 \end{equation}
 The energy carries the factor $1/\tau$, while the prior $\pi_k$ enters at unit log-weight; the masking and positional special cases below substitute into this form.
 
-\paragraph{Status of the construction.} With the solution in hand, its status can be stated exactly. The mixture-of-sources construction is best read as a consensus-energy ansatz rather than a generative-model derivation: the component distributions $P(k \mid z{=}j) = \Omega_{ij}q_j$ depend on the variational posteriors $q_j$ of other agents, so the ``generative model'' is itself a function of variational quantities and is not held fixed in the standard variational sense, and the alignment free energy is an engineered energy functional penalizing belief disagreement after gauge transport, with the source-independence factorization of Eq.~\eqref{eq:mixture_posterior} as its generative assumption. Retaining the entropy-prior term makes this functional a scalar potential whose optimum is the log-partition form derived below. The choice of forward KL is pinned within the $f$-divergence class by the conditional representation theorem (Appendix~\ref{app:conditional_representation}, Theorem~\ref{thm:representation_app}): within the class satisfying assumptions (i)--(iii) of that appendix (locality / $f$-divergence form, linear coupling, exponential-family closure of the minimizer) and the standard real-analyticity-of-$f$ hypothesis on the generator, the forward KL is the unique $f$-divergence consistent with the geometric-mean Boltzmann stationary form for the belief update and a consistent envelope-theorem dual interpretation for the attention weights. An alternative augmented-model reading, in which a joint generative model over all agents' latent states yields the pairwise KL terms by mean-field decomposition of the joint evidence lower bound, is suggestive, but its self-consistency depends on a fixed-point result we do not establish; we treat the augmented-model framing as motivational and the consensus-energy framing as primary. Appendix~\ref{app:mf_fixedpoint_status} distinguishes the scalar potential implemented here from a deliberately asymmetric receiver-only field that is not used by the checked-in optimizer.
+\paragraph{Status of the construction.} With the solution in hand, its status can be stated exactly. The mixture-of-sources construction is best read as a consensus-energy ansatz rather than a fixed state-level generative-model derivation: the component distributions $P(k \mid z{=}j) = \Omega_{ij}q_j$ depend on the variational posteriors $q_j$ of other agents, so the row model moves when the population variational state moves. Retaining the entropy-prior term makes the resulting population functional a scalar potential whose optimum is the log-partition form derived below. The choice of forward KL is pinned within the $f$-divergence class by the conditional representation theorem (Appendix~\ref{app:conditional_representation}, Theorem~\ref{thm:representation_app}): within the class satisfying assumptions (i)--(iii) of that appendix (locality / $f$-divergence form, linear coupling, exponential-family closure of the minimizer) and the standard real-analyticity-of-$f$ hypothesis on the generator, the forward KL is the unique $f$-divergence consistent with the geometric-mean Boltzmann stationary form for the belief update and a consistent envelope-theorem dual interpretation for the attention weights. Theorem~\ref{thm:state_level_elbo_nogo} proves that the live within-scale terms cannot, on an open mean-field family, equal the negative evidence lower bound of one fixed joint on the original agent-state variables. The obstruction does not exclude the exact zero-coupling hierarchical joint, the equilibrium-frozen auxiliary construction of Theorem~\ref{thm:self_consistent_source_equilibrium}, or the belief-configuration Gibbs lift of Theorem~\ref{thm:belief_configuration_gibbs_lift}. Appendix~\ref{app:mf_fixedpoint_status} also distinguishes the scalar potential implemented here from a deliberately asymmetric receiver-only field that is not used by the checked-in optimizer.
 
 \subsection{Non-Uniform Attention Priors: Masking and Positional Biases}
 \label{sec:nonuniform_priors}
@@ -654,9 +654,9 @@ On base manifolds of dimension $\dim(\mathcal{C}) \geq 1$, the gauge frame field
 
 Gauge covariance is preserved on arbitrary base manifolds: under the simultaneous group-level transformation $U_i(c) \mapsto U_i(c) g(c)$ for all $i$ with arbitrary $g: \mathcal{C} \to G$, the transport operators satisfy $\Omega_{ij}(c) \mapsto U_i(c) g(c) g(c)^{-1} U_j(c)^{-1} = \Omega_{ij}(c)$. The Lie-algebra additive form $\phi_i \mapsto \phi_i + \xi$ realizes this transformation only when $\xi$ commutes with the $\phi_i$, so that $\exp(\phi_i + \xi) = \exp(\phi_i)\exp(\xi)$, and the additive form is therefore an abelian shorthand; the full non-abelian invariance is captured at the group level. This is the information-theoretic analog of general covariance.
 
-\subsection{Base Priors and the Full Generative Model}
+\subsection{Base Priors and the Population Construction}
 
-Each agent's prior $p_i$ and hyper-prior $r_i$ are realized as cross-scale shadows of the meta-agent's belief and generative model via Eq.~\eqref{eq:cross_scale_shadow}. At intermediate scales they are not independent learned objects: $p_i^{(s)}(k_i; c) = \mathcal{N}(k_i; \mu_{0,i}^{(q)}(c), \Sigma_{0,i}^{(q)}(c))$ regularizes the latent state $k_i$ with parameters determined by $\Omega_{i,I}[q_I^{(s+1)}]$, and $r_i^{(s)}(m_i; c) = \mathcal{N}(m_i; \mu_{0,i}^{(s)}(c), \Sigma_{0,i}^{(s)}(c))$ regularizes the generative-model parameters $m_i$ with parameters determined by $\tilde\Omega_{i,I}[s_I^{(s+1)}]$. Different agents inherit different prior parameters not from independent inductive biases but from different transport operators $\Omega_{i,I}$ and from the spatial profile of the meta-agent's belief field. At the top scale $r_i^{(s_{\max})}$ reduces to a fixed boundary condition encoding evolutionary or training-time defaults, and in the working framework with the slow subsystem frozen the per-token PriorBank role of $p_i$ in the transformer limit is local to each agent without violating the shadow relation. The full generative model at each point $c$ combines the single-agent free energy~\cite{Friston2010, parr2022active} with the mixture-of-sources alignment derived above: the belief channel posits that agent $i$'s latent state was generated by one of its neighbors according to the mixture model~\eqref{eq:mixture_joint}, and the model channel has an identical structure with coupling weights $\gamma_{ij}(c)$ replacing $\beta_{ij}(c)$ and model-fiber transport $\tilde{\Omega}_{ij}(c)$ replacing belief-fiber transport $\Omega_{ij}(c)$.
+Each agent's prior $p_i$ and hyper-prior $r_i$ are realized as cross-scale shadows of the meta-agent's belief and generative model via Eq.~\eqref{eq:cross_scale_shadow}. At intermediate scales they are not independent learned objects: $p_i^{(s)}(k_i; c) = \mathcal{N}(k_i; \mu_{0,i}^{(q)}(c), \Sigma_{0,i}^{(q)}(c))$ regularizes the latent state $k_i$ with parameters determined by $\Omega_{i,I}[q_I^{(s+1)}]$, and $r_i^{(s)}(m_i; c) = \mathcal{N}(m_i; \mu_{0,i}^{(s)}(c), \Sigma_{0,i}^{(s)}(c))$ regularizes the generative-model parameters $m_i$ with parameters determined by $\tilde\Omega_{i,I}[s_I^{(s+1)}]$. Different agents inherit different prior parameters not from independent inductive biases but from different transport operators $\Omega_{i,I}$ and from the spatial profile of the meta-agent's belief field. At the top scale $r_i^{(s_{\max})}$ reduces to a fixed boundary condition encoding evolutionary or training-time defaults, and in the working framework with the slow subsystem frozen the per-token PriorBank role of $p_i$ in the transformer limit is local to each agent without violating the shadow relation. The population construction at each point $c$ combines the single-agent free-energy terms~\cite{Friston2010, parr2022active} with the two row-wise mixture-of-sources alignments derived above: the belief channel uses $\beta_{ij}(c)$ and $\Omega_{ij}(c)$, while the model channel uses $\gamma_{ij}(c)$ and $\tilde{\Omega}_{ij}(c)$. Each row is a normalized auxiliary source-selection model when its transported templates are fixed, but the live population functional is not thereby one fixed global state-level model; Appendix~\ref{app:mf_fixedpoint_status} states the exact representability boundary and the available enlarged constructions.
 
 \subsection{The Pointwise Variational Free Energy}
 
@@ -3165,7 +3165,7 @@ Let the hierarchy be a finite tree of depth $s_{\max}$ and finite breadth, with 
 For each parent-child edge $(i, \pi(i))$ at scale $s$, define the Gibbs factor
 \begin{equation}
 \chi_{i,\pi(i)}^{(s)}\big(k_i^{(s)}, k_{\pi(i)}^{(s+1)}\big)
- = 
+=
 (2\pi\sigma^2)^{-K_q/2} \exp\left[-\frac{1}{2\sigma^2}
 \big\|k_i^{(s)} - \Omega_{i,\pi(i)}  k_{\pi(i)}^{(s+1)}\big\|^2\right],
 \label{eq:gibbs_factor}
@@ -3173,7 +3173,7 @@ For each parent-child edge $(i, \pi(i))$ at scale $s$, define the Gibbs factor
 where $\Omega_{i,\pi(i)} = \exp(\phi_i^{(s)})\exp(-\phi_{\pi(i)}^{(s+1)}) \in G$ is the inter-scale gauge transport of Section~\ref{sec:transport_hierarchy} and $\sigma^2 > 0$ is a link-stiffness parameter. The top-level prior $\pi(k^{(s_{\max})})$ is the boundary condition fixed at initialization (Section~\ref{sec:cross_scale_shadows}). The augmented joint over all agent-scale latents is
 \begin{equation}
 p_{\sigma}\big(\{k_i^{(s)}\}, o\big)
- = 
+=
 p(o \mid \{k_i^{(0)}\}) \prod_{s = 0}^{s_{\max}-1} \prod_{i \in I_s} \chi_{i,\pi(i)}^{(s)}\big(k_i^{(s)}, k_{\pi(i)}^{(s+1)}\big)  \pi\big(k^{(s_{\max})}\big).
 \label{eq:augmented_joint}
 \end{equation}
@@ -3197,7 +3197,7 @@ We apply mean-field variational inference to the augmented joint, factorizing th
 The variational free energy
 \begin{equation}
 \mathcal{F}_{\sigma}[q]
- = 
+=
 \sum_{s, i} \mathbb{E}_{q_i^{(s)}}\big[\log q_i^{(s)}\big]
 - \sum_{s, i} \mathbb{E}_{q_i^{(s)} q_{\pi(i)}^{(s+1)}}\big[\log \chi_{i,\pi(i)}^{(s)}\big]
 - \mathbb{E}_{q^{(0)}}\big[\log p(o \mid k^{(0)})\big]
@@ -3206,7 +3206,7 @@ The variational free energy
 is stationary with respect to the mean-field factorization $q(\{k_i^{(s)}\}) = \prod_{s, i} q_i^{(s)}(k_i^{(s)})$ when each component satisfies
 \begin{equation}
 \log q_i^{(s)}(k_i)
- = 
+=
 \text{const}
 + \mathbb{E}_{q_{\pi(i)}^{(s+1)}}\big[\log \chi_{i,\pi(i)}^{(s)}(k_i, k_{\pi(i)})\big]
 + \sum_{j : \pi(j) = i} \mathbb{E}_{q_j^{(s-1)}}\big[\log \chi_{j,i}^{(s-1)}(k_j, k_i)\big]
@@ -3264,9 +3264,130 @@ The parent-message-isolation regime under which Lemma~\ref{lem:shadow_mf_optimum
 \subsection{Status of the Mean-Field Fixed-Point Question}
 \label{app:mf_fixedpoint_status}
 
-The reduction above settles the cross-scale construction at zero within-scale coupling, but it leaves open the broader question raised in the body (Section~\ref{sec:mixture_derivation}, ``Status of the construction''): whether the within-scale consensus energy that the multi-agent functional discloses is itself the variational free energy of a closed generative model with a guaranteed fixed point. We separate the two cases, because they have different answers.
+The reduction above settles the cross-scale construction at zero within-scale coupling. The within-scale question has three separate answers: a general obstruction for a fixed joint on the original state variables, a self-consistent auxiliary model that becomes fixed only after an equilibrium is selected, and an exact Gibbs lift whose random variable is an entire belief configuration.
 
-At zero within-scale coupling ($\beta_{ij} = \gamma_{ij} = 0$), the cross-scale augmented joint of Definition~\ref{def:augmented_joint} is a closed variational object. Assume the top-level prior $\pi(k^{(s_{\max})})$ is a nondegenerate Gaussian with full-rank precision $\Lambda_{\mathrm{top}}$, and take the leaf observation term absent or Gaussian; this assumption is needed both for the negative log joint to be a quadratic form in the stacked latents and for the positive-definiteness below. The precision matrix of that quadratic form is block-sparse along the hierarchical tree, with nonzero blocks only on the diagonal and on parent-child edges: the diagonal block of agent $i$ is $\sigma^{-2}\big(I + \sum_{j : \pi(j) = i}\Omega_{j,i}^\top\Omega_{j,i}\big)$, where the identity contribution is absent at the top scale (the prior precision $\Lambda_{\mathrm{top}}$ takes its place) and the leaf blocks additionally carry any Gaussian likelihood curvature, and the off-diagonal block on each parent-child edge is $-\sigma^{-2}\Omega_{i,\pi(i)}$ together with its transpose. The link terms alone are only positive semidefinite, with kernel the consistent-propagation subspace on which $k_i = \Omega_{i,\pi(i)}k_{\pi(i)}$ along every edge; the full-rank prior precision at the top removes this kernel, so for finite $\sigma^2 > 0$ the stacked precision is symmetric positive definite, the joint is a proper Gaussian, and the coordinate-ascent mean-field updates of Lemma~\ref{lem:mf_fixedpoint} are Gauss-Seidel sweeps on an SPD system, which converge to the unique global optimum. In this regime the ELBO interpretation is exact and the fixed point exists and is unique.
+\subsubsection{Fixed State-Level Representation: General Obstruction}
+
+Let $(\mathsf{X}_i,\nu_i)$ be the state space of agent $i$, and let $T_{ij}$ denote the fixed mass-preserving positive linear transport induced by $(\Omega_{ij})_*$. A family $\mathcal{Q}_i$ of strictly positive densities is called mixture-open here when every zero-mass tangent $h_i$ under consideration with $h_i/q_i\in L^\infty(q_i)$ generates $q_i(t)=q_i+t h_i\in\mathcal{Q}_i$ for all sufficiently small $|t|$. All differentiated integrals below are assumed finite.
+
+\begin{theorem}[State-level mean-field ELBO obstruction]
+\label{thm:state_level_elbo_nogo}
+Let the factors $q_i\in\mathcal{Q}_i$ vary independently, let at least one nonself coefficient $\beta_{ij}>0$, and consider
+\begin{equation}
+\mathcal{C}(q)
+=\mathcal{F}_{\mathrm{rest}}(q)
++\sum_{a\ne b}\beta_{ab}D_{\mathrm{KL}}(q_a\|T_{ab}q_b),
+\label{eq:population_consensus_nogo_functional}
+\end{equation}
+where $D^3_{q_iq_jq_j}\mathcal{F}_{\mathrm{rest}}=0$ for $i\ne j$. Assume that for one active edge $(i,j)$ there is an admissible tangent $h_j$ such that
+\begin{equation}
+g_{ij}:=\left(\frac{T_{ij}h_j}{T_{ij}q_j}\right)^2,
+\label{eq:nogo_nondegenerate_tangent}
+\end{equation}
+is bounded and nonconstant $q_i$-almost everywhere. Then there is no density $p_\theta$ on $\prod_i\mathsf{X}_i$, independent of $q$, and no constant $c$ such that
+\begin{equation}
+\mathcal{C}(q)
+=D_{\mathrm{KL}}\left(\bigotimes_iq_i\middle\|p_\theta\right)+c,
+\label{eq:state_level_elbo_representation_impossible}
+\end{equation}
+throughout the open product family.
+\end{theorem}
+
+\begin{proof}
+Write $Q_q=\bigotimes_iq_i$. The standard fixed-model mean-field decomposition~\cite{Wainwright2008} gives
+\begin{equation}
+D_{\mathrm{KL}}(Q_q\|p_\theta)
+=\sum_i\int_{\mathsf{X}_i}q_i\log q_i d\nu_i
+-\int_{\prod_i\mathsf{X}_i}\left(\prod_iq_i\right)\log p_\theta d\nu_{1:N}.
+\label{eq:fixed_joint_mean_field_structure}
+\end{equation}
+The entropy is separable, while the fixed-model energy is affine in each factor. Therefore
+\begin{equation}
+D^3_{q_iq_jq_j}D_{\mathrm{KL}}(Q_q\|p_\theta)[a_i,h_j,h_j]=0,
+\qquad i\ne j.
+\label{eq:fixed_joint_third_variation_zero}
+\end{equation}
+For the active consensus edge, take $q_i(s)=q_i+s a_i$ and $q_j(t)=q_j+t h_j$. Direct differentiation gives
+\begin{equation}
+\left.
+\frac{\partial^3}{\partial s\partial t^2}
+D_{\mathrm{KL}}(q_i(s)\|T_{ij}q_j(t))
+\right|_{s=t=0}
+=\int_{\mathsf{X}_i}a_i g_{ij}d\nu_i.
+\label{eq:consensus_third_variation}
+\end{equation}
+Choose $a_i=q_i(g_{ij}-\mathbb{E}_{q_i}[g_{ij}])$, which has zero mass and satisfies $a_i/q_i\in L^\infty(q_i)$ because $g_{ij}$ is bounded; it is therefore admissible for a sufficiently small mixture path. Equation~\eqref{eq:consensus_third_variation} becomes $\operatorname{Var}_{q_i}(g_{ij})>0$, contradicting Eq.~\eqref{eq:fixed_joint_third_variation_zero}. The terms collected in $\mathcal{F}_{\mathrm{rest}}$ cannot cancel this mixed variation by hypothesis. Every other ordered-edge term also has zero $q_i,q_j,q_j$ variation: an unrelated edge omits one varied factor, while the reverse edge is affine in $q_j$ outside its entropy and that entropy's second variation is independent of $q_i$.
+\end{proof}
+
+\begin{remark}[Scope of the obstruction]
+\label{rem:state_level_elbo_nogo_scope}
+The theorem applies directly to the entropy-retaining functional by holding its independently varied attention rows fixed. The self terms, likelihood terms with fixed observation models, and categorical attention entropies lie in $\mathcal{F}_{\mathrm{rest}}$. The result concerns an ordinary mean-field factorization on the original agent-state variables. It does not exclude frozen source templates, restricted quadratic families, compatible auxiliary variables, a model selected after a fixed point, or a probability law over belief configurations. If the attention optimum $\beta^*(q)$ has already been substituted, its response derivatives define a different reduced functional and require a separate representation test.
+\end{remark}
+
+\subsubsection{Exact Cross-Scale Gaussian Exception}
+
+At zero raw within-scale coupling ($\tilde\beta_{ij}=\tilde\gamma_{ij}=0$, so the alignment sectors are absent), the cross-scale augmented joint of Definition~\ref{def:augmented_joint} is a closed variational object. Assume the top-level prior $\pi(k^{(s_{\max})})$ is a nondegenerate Gaussian with full-rank precision $\Lambda_{\mathrm{top}}$, and take the leaf observation term absent or Gaussian; this assumption is needed both for the negative log joint to be a quadratic form in the stacked latents and for the positive-definiteness below. The precision matrix of that quadratic form is block-sparse along the hierarchical tree, with nonzero blocks only on the diagonal and on parent-child edges: the diagonal block of agent $i$ is $\sigma^{-2}\big(I + \sum_{j : \pi(j) = i}\Omega_{j,i}^\top\Omega_{j,i}\big)$, where the identity contribution is absent at the top scale (the prior precision $\Lambda_{\mathrm{top}}$ takes its place) and the leaf blocks additionally carry any Gaussian likelihood curvature, and the off-diagonal block on each parent-child edge is $-\sigma^{-2}\Omega_{i,\pi(i)}$ together with its transpose. The link terms alone are only positive semidefinite, with kernel the consistent-propagation subspace on which $k_i = \Omega_{i,\pi(i)}k_{\pi(i)}$ along every edge; the full-rank prior precision at the top removes this kernel, so for finite $\sigma^2 > 0$ the stacked precision is symmetric positive definite, the joint is a proper Gaussian, and the coordinate-ascent mean-field updates of Lemma~\ref{lem:mf_fixedpoint} are Gauss-Seidel sweeps on an SPD system, which converge to the unique global optimum. In this regime the ELBO interpretation is exact and the fixed point exists and is unique.
+
+\subsubsection{Self-Consistent Equilibrium Representation}
+
+\begin{theorem}[Existence of a self-consistent source model]
+\label{thm:self_consistent_source_equilibrium}
+Let the latent alphabet $\mathsf{X}$ and the agent set be finite. Let $p_i(k)>0$, let $\pi_{ij}>0$ with $\sum_j\pi_{ij}=1$, and let $a_i>0$, $\lambda>0$, and $\tau>0$. Assume every stochastic transport has a uniform floor: there is $\epsilon>0$ such that $(T_{ij}q)(k)\ge\epsilon$ for every probability vector $q$, state $k$, and active edge. Define
+\begin{equation}
+E_{ij}(q):=D_{\mathrm{KL}}(q_i\|T_{ij}q_j),
+\qquad
+\beta_{ij}(q):=
+\frac{\pi_{ij}\exp[-E_{ij}(q)/\tau]}
+{\sum_m\pi_{im}\exp[-E_{im}(q)/\tau]},
+\label{eq:self_consistent_attention}
+\end{equation}
+and $A_i:=a_i+\lambda$. The geometric-pooling response map
+\begin{equation}
+B_i(q)(k):=
+\frac{
+p_i(k)^{a_i/A_i}
+\prod_j[T_{ij}q_j(k)]^{\lambda\beta_{ij}(q)/A_i}
+}{
+\sum_{u\in\mathsf{X}}
+p_i(u)^{a_i/A_i}
+\prod_j[T_{ij}q_j(u)]^{\lambda\beta_{ij}(q)/A_i}
+},
+\label{eq:self_consistent_response_map}
+\end{equation}
+has at least one receiver-response equilibrium $q^\star=B(q^\star)$. Write $\beta^\star:=\beta(q^\star)$.
+
+At any such fixed point, define normalized row distributions
+\begin{equation}
+P_i^\star(k,j):=\pi_{ij}[T_{ij}q_j^\star](k),
+\qquad
+Q_i^\star(k,j):=\beta_{ij}^\star q_i^\star(k).
+\label{eq:equilibrium_source_joint}
+\end{equation}
+They satisfy the exact identity
+\begin{equation}
+D_{\mathrm{KL}}(Q_i^\star\|P_i^\star)
+=\sum_j\beta_{ij}^\star D_{\mathrm{KL}}(q_i^\star\|T_{ij}q_j^\star)
++D_{\mathrm{KL}}(\beta_i^\star\|\pi_i).
+\label{eq:equilibrium_row_kl_identity}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+The uniform floor makes every energy in Eq.~\eqref{eq:self_consistent_attention} continuous on the closed product simplex. Hence $\beta(q)$ and $B(q)$ are continuous, and $B$ maps that compact convex simplex into itself. Brouwer's theorem gives a receiver-response equilibrium. For fixed source templates and fixed $\beta_i$, the Euler equation for
+\begin{equation}
+a_iD_{\mathrm{KL}}(r\|p_i)
++\lambda\sum_j\beta_{ij}D_{\mathrm{KL}}(r\|T_{ij}q_j),
+\label{eq:frozen_row_geometric_pool_objective}
+\end{equation}
+under $\sum_k r(k)=1$ gives $r=B_i(q)$, so the fixed point is self-consistent with the frozen-row optimum. Expanding $\log[Q_i^\star/P_i^\star]$ and summing over $(k,j)$ proves Eq.~\eqref{eq:equilibrium_row_kl_identity}.
+\end{proof}
+
+\begin{remark}[What the equilibrium construction proves]
+\label{rem:equilibrium_model_scope}
+The distributions $P_i^\star$ are fixed and normalized only after $q^\star$ has been selected. Their product is a proper auxiliary model over independent row variables, but it duplicates the transported source templates. It is not automatically a joint over shared latent variables $(k_1,\ldots,k_N)$. Such a joint additionally requires compatible conditionals, an acyclic factorization, or an undirected normalized potential. Equation~\eqref{eq:equilibrium_row_kl_identity} matches the ordinary row KL at unit attention temperature; arbitrary $\tau$ gives the tempered loss-based update of Eq.~\eqref{eq:self_consistent_attention}, a generalized-Bayesian construction rather than one unscaled KL~\cite{BissiriHolmesWalker2016}. Because the response holds incoming source roles fixed, its equilibrium is not thereby a stationary point of the global smoothing scalar. The theorem proves existence, not uniqueness or convergence of a particular update schedule.
+\end{remark}
+
+\subsubsection{Scalar Objectives and Update Fields}
 
 The within-scale construction requires a distinction between three objects. First, the canonical entropy-retaining row objective is $\mathcal{F}_{i,\mathrm{full}}=\sum_j\beta_{ij}E_{ij}+\tau\sum_j\beta_{ij}\log(\beta_{ij}/\pi_{ij})$. At its simplex optimum it is exactly $-\tau\log Z_i$, and the envelope theorem gives $\mathrm{d}\mathcal{F}_{i,\mathrm{red}}=\sum_j\beta_{ij}^*\mathrm{d}E_{ij}$. Summing over rows therefore gives one scalar potential with a symmetric Hessian. This is the objective constructed by the checked-in \texttt{FullVFE} path and differentiated through its scalar \texttt{total}. Second, the entropy-suppressed quantity $S=\sum_{ij}\beta_{ij}^*(x)E_{ij}(x)$ is a different scalar. Its response terms change its gradient but do not change the symmetry of its Hessian. Third, the deliberately asymmetric field
 \begin{equation}
@@ -3275,11 +3396,11 @@ V_i^{\mathrm{rec}}(x):=\partial_{x_i}\left(\sum_j\beta_{ij}^*(x)E_{ij}(x)\right)
 \text{with all }\partial_{x_i}\left(\sum_m\beta_{\ell m}^*E_{\ell m}\right),\ \ell\ne i,\ \text{discarded},
 \label{eq:receiver_only_field}
 \end{equation}
-is not the gradient of either scalar and is generically nonintegrable because cross-row mixed derivatives need not match. This nonpotential field is an optional update approximation, not a property of the softmax, the noncompact gauge group, or automatic differentiation through a scalar. The consensus functional remains an engineered scalar rather than a closed generative-model ELBO; that epistemic distinction does not require a nonsymmetric Hessian claim.
+is not the gradient of either scalar and is generically nonintegrable because cross-row mixed derivatives need not match. This nonpotential field is an optional update approximation, not a property of the softmax, the noncompact gauge group, or automatic differentiation through a scalar. The consensus functional remains an engineered scalar rather than a fixed state-level generative-model ELBO; that epistemic distinction does not require a nonsymmetric Hessian claim.
 
-Existence of a fixed point for the coupled system is more nuanced than a Brouwer argument alone suggests. An interior fixed point exists under a mild symmetry hypothesis: the symmetric consensus state $\mu_i \equiv 0$ is stationary for every prior strength $\alpha>0$, temperature $\tau>0$, and finite $N$ when the prior means vanish. Every pairwise alignment mean-gradient $\Lambda_{t,ij}(\mu_i-\Omega_{ij}\mu_j)$ and the prior pull vanish there. Local stability follows in the frozen-$\beta$, orthogonal-transport setting; for live state-dependent softmax on $\mathrm{GL}^+(K_q)$, local stability, global uniqueness, and global convergence remain open. A Banach guarantee is available after freezing covariances and attention weights and restricting transports to a compact orthogonal subgroup: then the mean sub-map $\mu_i\leftarrow(\alpha\Lambda_p+\sum_j\beta_{ij}\Lambda_{t,ij})^{-1}(\alpha\Lambda_p\mu_{p,i}+\sum_j\beta_{ij}\Lambda_{t,ij}\Omega_{ij}\mu_j)$ has neighbor-operator norm at most $\lambda_{\max}(\sum_j\beta_{ij}\Lambda_{t,ij})/[\alpha\lambda_{\min}(\Lambda_p)+\lambda_{\max}(\sum_j\beta_{ij}\Lambda_{t,ij})]<1$. Relaxing those restrictions removes this contraction proof, but it does not remove the canonical scalar potential. Strong monotonicity can instead provide a sufficient uniqueness criterion for the receiver-only field~\eqref{eq:receiver_only_field} on a bounded invariant set; that statement concerns the optional asymmetric approximation rather than the checked-in scalar descent.
+Existence for the full Gaussian gauge system is more nuanced than the compact finite-state result of Theorem~\ref{thm:self_consistent_source_equilibrium}. A restricted stationary point exists under a symmetry hypothesis: the mean-only consensus state $\mu_i \equiv 0$ is stationary for every prior strength $\alpha>0$, temperature $\tau>0$, and finite $N$ when the prior means vanish and observation forcing is absent. Every pairwise alignment mean-gradient $\Lambda_{t,ij}(\mu_i-\Omega_{ij}\mu_j)$ and the prior pull vanish there. This does not prove a fixed point for the covariance and frame coordinates. Local stability follows in the frozen-$\beta$, orthogonal-transport setting; for live state-dependent softmax on $\mathrm{GL}^+(K_q)$, local stability, global uniqueness, and global convergence remain open. Noncompact frame directions also prevent a direct compactness argument unless one imposes a gauge slice, bounded invariant container, or coercive frame prior. A Banach guarantee is available after freezing covariances and attention weights and restricting transports to a compact orthogonal subgroup: then the mean sub-map $\mu_i\leftarrow(\alpha\Lambda_p+\sum_j\beta_{ij}\Lambda_{t,ij})^{-1}(\alpha\Lambda_p\mu_{p,i}+\sum_j\beta_{ij}\Lambda_{t,ij}\Omega_{ij}\mu_j)$ has neighbor-operator norm at most $\lambda_{\max}(\sum_j\beta_{ij}\Lambda_{t,ij})/[\alpha\lambda_{\min}(\Lambda_p)+\lambda_{\max}(\sum_j\beta_{ij}\Lambda_{t,ij})]<1$. Relaxing those restrictions removes this contraction proof, but it does not remove the canonical scalar potential. Strong monotonicity can instead provide a sufficient uniqueness criterion for the receiver-only field~\eqref{eq:receiver_only_field} on a bounded invariant set; that statement concerns the optional asymmetric approximation rather than the checked-in scalar descent.
 
-The practical consequence for this paper is limited. A prospective experiment should include both a $\gamma_{ij}=0$ slow-channel ablation and a predeclared nonzero slow-coupling arm, while retaining the fast-channel belief alignment. The cross-scale augmented joint supplies the closed, uniquely-solvable backbone of the dynamics, but no perturbative bound on the within-scale corrections has been established (the expansion in the raw couplings $\tilde\beta_{ij}$ of Section~\ref{sec:raw_alignment_weights} is deferred above), so no artifact-backed result presently quantifies how within-scale terms perturb the cross-scale fixed point. The open items are this perturbative control and the interior fixed-point theory for the fully coupled, state-dependent, $\mathrm{GL}^+(K_q)$ system, which we leave to future work.
+The practical consequence for this paper is limited. A prospective experiment should include both a $\gamma_{ij}=0$ slow-channel ablation and a predeclared nonzero slow-coupling arm, while retaining the fast-channel belief alignment. The cross-scale augmented joint supplies the closed, uniquely-solvable backbone of the dynamics, and Theorem~\ref{thm:self_consistent_source_equilibrium} proves existence for a uniformly positive finite-state equilibrium map. No perturbative bound on the within-scale corrections has been established, however, and no artifact-backed result presently quantifies how those terms perturb the Gaussian cross-scale fixed point. The open items are this perturbative control, compatibility of cyclic row models, and uniqueness and convergence for the fully coupled, state-dependent, $\mathrm{GL}^+(K_q)$ system.
 
 \section{Renormalization-Group Construction for Meta-Agent Formation}
 \label{sec:meta_agent_rg}
@@ -3287,15 +3408,71 @@ The practical consequence for this paper is limited. A prospective experiment sh
 The free-energy improvement criterion~\eqref{eq:meta_agent_FE_criterion}, the variational barycenter~\eqref{eq:meta_agent_barycenter}, and the frame Karcher mean~\eqref{eq:meta_agent_frame_barycenter} can be embedded in a renormalization-group construction~\cite{Wilson1971, Cardy1996} that separates two distinct claims. Theorem-level statements with their proofs are in the theorem subsection (Appendix~\ref{app:rigorous_rg}): partition-function preservation, functoriality of the exact pushforward, gauge covariance of the coarse-graining map, exact conditional-Gaussian closure under the density-level hypothesis~(A6) and flat transport, the schematic closure-residual bound with its explicit scalar-case constants, and the detector-retention link. The epistemic standing of the three claims below, exact pushforward, conditional closure, and detector surrogacy, is fixed in Section~\ref{sec:rg_status} and is not re-argued here. The first part of this appendix states the working forms with their hypotheses and points to the theorem subsection where the rigorous version is needed. The pushforward step is exact and structural: any measurable coarse-graining map admits a renormalized free energy through its pushforward measure, with partition function and coarse observables preserved by construction. The closure step is approximate and conditional in the operational regime: the exact renormalized free energy lies near the multi-agent functional class only under explicit hypotheses on cluster coherence, edge-marginal compatibility, gauge-group regularity, and timescale separation, while exact quadratic-plus-log-determinant closure requires the stronger conditionally Gaussian fiber identity~(A6). We state the two claims separately so that the closure ansatz is not mistaken for a derivation of equivalence. Each step below uses standard identities cited in place: the pushforward Radon-Nikodym form is the Boltzmann projection of a Gibbs measure under a measurable map~\cite{Cardy1996}; the saddle-point step is the Laplace approximation around the parent configuration~\cite{Cardy1996}; the constrained slow metric is the graph pullback along the Fenichel slaving map, whereas the algebraic metric Schur complement supported by~\cite{HornJohnson2013} is the separate quotient construction and agrees with the graph pullback only under the compatibility condition stated below; and the equivariance of the Karcher frame and M-projection belief barycenters under the gauge action below follows from two mechanisms, compact-case bi-invariance for the frame objective and common-pushforward invariance for the forward-KL belief objective.
 
 \paragraph{Status of the Gibbs ensemble.}
-The pushforward construction is stated for the variational Gibbs measure $d\mathbb{P}_s = Z_s^{-1}\exp[-\mathcal{F}_s/\tau] d\nu_s$ on agent configurations. This is a hypothetical thermal ensemble, not the law realized by the framework's deterministic natural-gradient dynamics, which descend $\mathcal{F}_s$ to a single trajectory rather than sampling $\exp[-\mathcal{F}_s/\tau]$; we do not posit a Langevin or maximum-entropy mechanism that would make $\exp[-\mathcal{F}_s/\tau]$ the law of the agent states. The partition-function and observable-preservation results below are exact statements about that posited ensemble, and contact with the implemented dynamics is made only in the zero-temperature saddle limit $\tau \to 0$ of Eq.~\eqref{eq:rg_exact_free_energy}, where the finite-$\tau$ fluctuation determinant and anharmonic corrections become subdominant.
+The pushforward construction is stated for a configuration-space Gibbs measure $d\mathbb{P}_s = Z_s^{-1}\exp[-\mathcal{F}_s/T_{\mathrm{cfg}}]d\nu_s$. This is a hypothetical thermal ensemble, not the law realized by the framework's deterministic natural-gradient dynamics, which descend $\mathcal{F}_s$ to a single trajectory rather than sampling the ensemble. We do not posit a Langevin or maximum-entropy mechanism that makes this Gibbs law the distribution of implemented agent states. The partition-function and observable-preservation results below are exact statements about the posited ensemble when it is normalizable, and contact with the implemented dynamics is made only in the zero-configuration-temperature saddle limit $T_{\mathrm{cfg}}\to0$ of Eq.~\eqref{eq:rg_exact_free_energy}. The symbol $T_{\mathrm{cfg}}$ is distinct from the attention temperature $\tau$.
+
+\begin{theorem}[Belief-configuration Gibbs lift]
+\label{thm:belief_configuration_gibbs_lift}
+Let $(\mathfrak{X},\mathcal{A},\nu_0)$ be a measurable configuration space with proper reference probability measure $\nu_0$, let $\mathcal{F}:\mathfrak{X}\to(-\infty,+\infty]$ be measurable, and let $T_{\mathrm{cfg}}>0$. Define
+\begin{equation}
+Z_{\mathcal{F}}
+:=\int_{\mathfrak{X}}
+\exp[-\mathcal{F}(X)/T_{\mathrm{cfg}}]d\nu_0(X).
+\label{eq:belief_configuration_partition}
+\end{equation}
+A probability measure $\mathbb{P}_{\mathcal{F}}\ll\nu_0$ with density
+\begin{equation}
+\frac{d\mathbb{P}_{\mathcal{F}}}{d\nu_0}(X)
+=Z_{\mathcal{F}}^{-1}
+\exp[-\mathcal{F}(X)/T_{\mathrm{cfg}}].
+\label{eq:belief_configuration_gibbs_density}
+\end{equation}
+exists if and only if $0<Z_{\mathcal{F}}<\infty$. For every probability measure $R\ll\nu_0$ for which the terms are finite,
+\begin{equation}
+\mathbb{E}_{R}[\mathcal{F}]
++T_{\mathrm{cfg}}D_{\mathrm{KL}}(R\|\nu_0)
+=T_{\mathrm{cfg}}D_{\mathrm{KL}}(R\|\mathbb{P}_{\mathcal{F}})
+-T_{\mathrm{cfg}}\log Z_{\mathcal{F}}.
+\label{eq:belief_configuration_vfe_identity}
+\end{equation}
+Consequently,
+\begin{equation}
+-T_{\mathrm{cfg}}\log Z_{\mathcal{F}}
+=\inf_{R\ll\nu_0}
+\left\{
+\mathbb{E}_{R}[\mathcal{F}]
++T_{\mathrm{cfg}}D_{\mathrm{KL}}(R\|\nu_0)
+\right\},
+\label{eq:belief_configuration_gibbs_variational_principle}
+\end{equation}
+with unique minimizer $R=\mathbb{P}_{\mathcal{F}}$. If $\mathcal{F}$ is bounded below $\nu_0$-almost surely and finite on a set of positive $\nu_0$-measure, then $0<Z_{\mathcal{F}}<\infty$.
+\end{theorem}
+
+\begin{proof}
+The condition $0<Z_{\mathcal{F}}<\infty$ is necessary and sufficient to normalize Eq.~\eqref{eq:belief_configuration_gibbs_density}. When it holds,
+\begin{equation}
+\log\frac{dR}{d\mathbb{P}_{\mathcal{F}}}
+=\log\frac{dR}{d\nu_0}
++\frac{\mathcal{F}}{T_{\mathrm{cfg}}}
++\log Z_{\mathcal{F}}.
+\label{eq:gibbs_lift_radon_nikodym_identity}
+\end{equation}
+Integration under $R$ proves Eq.~\eqref{eq:belief_configuration_vfe_identity}. Nonnegativity of relative entropy gives the infimum and its unique minimizer. If $\mathcal{F}\ge m$ almost surely, then $Z_{\mathcal{F}}\le\exp(-m/T_{\mathrm{cfg}})<\infty$; finiteness of $\mathcal{F}$ on a positive-measure set gives $Z_{\mathcal{F}}>0$.
+\end{proof}
+
+\begin{remark}[Probabilistic level and gauge volume]
+\label{rem:gibbs_lift_interpretation}
+Theorem~\ref{thm:belief_configuration_gibbs_lift} proves the existence of a generative model over belief configurations $X$, not over only the original state latents $k_i$. The exact density relation is $\mathcal{F}(X)/T_{\mathrm{cfg}}=-\log[d\mathbb{P}_{\mathcal{F}}/d\nu_0](X)-\log Z_{\mathcal{F}}$, so $\mathcal{F}$ is the configuration energy, equivalently the temperature-scaled negative log Radon-Nikodym density up to normalization. Equation~\eqref{eq:belief_configuration_vfe_identity} is the resulting exact meta-level variational free energy; it does not convert the pointwise population functional into the state-level ELBO excluded by Theorem~\ref{thm:state_level_elbo_nogo}. A hierarchical model may treat the beliefs $q_i$ themselves as random latent measures, draw $X\sim\mathbb{P}_{\mathcal{F}}$, then draw $k_i\sim q_i$ and observations from a fixed likelihood. Its ELBO necessarily contains the configuration entropy $T_{\mathrm{cfg}}D_{\mathrm{KL}}(R\|\nu_0)$ in addition to $\mathbb{E}_R[\mathcal{F}]$, so the original functional is the prior energy or MAP objective inside the enlarged model. This is also the loss-based generalized-Bayesian reading of the Gibbs law~\cite{BissiriHolmesWalker2016}.
+
+A proper reference probability makes the existence condition transparent. Raw invariant volume on a noncompact gauge orbit does not. If $\mathcal{F}$ is gauge-invariant and $\nu_0$ disintegrates into a quotient measure times Haar measure on $G=\mathrm{GL}^+(K_q)$, the Haar factor has infinite volume. A proper construction must therefore quotient or gauge-fix with the appropriate Jacobian, impose a compact container, add a coercive symmetry-breaking prior, or choose a proper non-Haar reference measure. No unregulated $\mathrm{GL}^+(K_q)$ Haar ensemble is claimed below.
+\end{remark}
 
 \paragraph{Exact pushforward RG.}
-Let $X_s = \{q_i, p_i, U_i, \chi_i\}_{i \in I_s}$ denote the microscopic state at scale $s$ and write the variational Gibbs measure as $d\mathbb{P}_s(X_s) = Z_s^{-1} \exp[-\mathcal{F}_s(X_s)/\tau] d\nu_s(X_s)$ with reference measure $\nu_s$ on the Gaussian parameters, masks, and gauge frames. For each admissible cluster $I \subset I_s$, defined as a connected component of the pairwise overlap graph, define the parent state $Y_I = (q_I, p_I, U_I, \chi_I)$ via the M-projection barycenter~\eqref{eq:meta_agent_barycenter}, the Karcher frame~\eqref{eq:meta_agent_frame_barycenter}, and the multi-child overlap mask $\chi_I(c) = \mathbb{1}\{\sum_{i \in I}\chi_i(c) \ge 2\}$. The cluster maps $\mathcal{R}_I : X_s \mapsto Y_I$ assemble into a global coarse-graining map $\mathcal{R}_s$. The exact renormalized free energy is defined against an intrinsic parent reference measure: let $\nu_{s+1}$ be the canonical product reference measure on the parent state space (Haar on parent frames, Lebesgue on parent means, the chosen SPD measure on parent covariances, counting measure on masks), and let $\widetilde{\rho}_{s+1} = (\mathcal{R}_s)_*\big(e^{-\mathcal{F}_s/\tau} d\nu_s\big)$ be the pushforward of the finite unnormalized Gibbs measure. Assume $\mathcal{R}_s$, restricted to the mean, covariance, and frame sector, is almost everywhere a submersion on the positive-weight stratum; the coarea formula then disintegrates $e^{-\mathcal{F}_s/\tau} d\nu_s$ along the fibers of $\mathcal{R}_s$, giving $\widetilde{\rho}_{s+1} \ll \nu_{s+1}$ with density
+Let $X_s = \{q_i, p_i, U_i, \chi_i\}_{i \in I_s}$ denote the microscopic state at scale $s$ and write the variational Gibbs measure as $d\mathbb{P}_s(X_s) = Z_s^{-1}\exp[-\mathcal{F}_s(X_s)/T_{\mathrm{cfg}}]d\nu_s(X_s)$ with a proper or explicitly normalized quotient reference measure $\nu_s$ on the Gaussian parameters, masks, and gauge frames. For each admissible cluster $I \subset I_s$, defined as a connected component of the pairwise overlap graph, define the parent state $Y_I = (q_I, p_I, U_I, \chi_I)$ via the M-projection barycenter~\eqref{eq:meta_agent_barycenter}, the Karcher frame~\eqref{eq:meta_agent_frame_barycenter}, and the multi-child overlap mask $\chi_I(c) = \mathbb{1}\{\sum_{i \in I}\chi_i(c) \ge 2\}$. The cluster maps $\mathcal{R}_I : X_s \mapsto Y_I$ assemble into a global coarse-graining map $\mathcal{R}_s$. The exact renormalized free energy is defined against an intrinsic parent reference measure: let $\nu_{s+1}$ be the corresponding proper product or quotient measure on the parent state space, and let $\widetilde{\rho}_{s+1} = (\mathcal{R}_s)_*\big(e^{-\mathcal{F}_s/T_{\mathrm{cfg}}}d\nu_s\big)$ be the pushforward of the finite unnormalized Gibbs measure. On each fixed-dimensional positive-weight stratum, assume that $\nu_s$ and $\nu_{s+1}$ have smooth strictly positive densities relative to the chosen Riemannian volume measures, that $\mathcal{R}_s$ is almost everywhere a $C^1$ submersion on the mean, covariance, and frame sector, and that $\widetilde{\rho}_{s+1}\ll\nu_{s+1}$. The coarea formula then disintegrates the source measure along the fibers of $\mathcal{R}_s$, giving the density
 \begin{equation}
-\exp[-\mathcal{F}_{s+1}(Y)/\tau] = \frac{d\widetilde{\rho}_{s+1}}{d\nu_{s+1}}(Y) = \int_{\mathcal{R}_s^{-1}(Y)} e^{-\mathcal{F}_s/\tau} d\mathcal{H}_Y, \qquad \widetilde{\rho}_{s+1} = (\mathcal{R}_s)_*\big(e^{-\mathcal{F}_s/\tau} d\nu_s\big),
+\exp[-\mathcal{F}_{s+1}(Y)/T_{\mathrm{cfg}}] = \frac{d\widetilde{\rho}_{s+1}}{d\nu_{s+1}}(Y) = \int_{\mathcal{R}_s^{-1}(Y)} e^{-\mathcal{F}_s/T_{\mathrm{cfg}}}d\mathcal{H}_Y, \qquad \widetilde{\rho}_{s+1} = (\mathcal{R}_s)_*\big(e^{-\mathcal{F}_s/T_{\mathrm{cfg}}}d\nu_s\big),
 \label{eq:rg_exact_free_energy}
 \end{equation}
-where $d\mathcal{H}_Y$ is the fiber measure of the disintegration; the construction preserves the partition function ($Z_{s+1} = Z_s$) and every observable depending only on retained variables ($\mathbb{E}_{s+1}[A(Y)] = \mathbb{E}_s[A(\mathcal{R}_s(X))]$). The reference measure is deliberately not defined as the pushforward $(\mathcal{R}_s)_*\nu_s$: that measure fails $\sigma$-finiteness whenever a cluster has $|I| \ge 2$, because the barycenter map has positive-dimensional affine fibers of infinite Lebesgue mass in the mean sector, so a Radon-Nikodym derivative against it does not exist; the disintegration route above avoids this. Partition-function and observable preservation (Theorem~\ref{thm:rg_pushforward}) are unaffected, since they use only mass transport, not the density representation. The zero-temperature limit reduces~\eqref{eq:rg_exact_free_energy} to $\mathcal{F}_{s+1}(Y) = \inf_{X : \mathcal{R}_s(X) = Y} \mathcal{F}_s(X)$ up to subleading entropic corrections. This identity is structural; it does not yet claim that $\mathcal{F}^{\mathrm{exact}}_{s+1}$ has multi-agent form.
+where $d\mathcal{H}_Y$ denotes the conditional fiber measure, including the normal-Jacobian factor and the ratio of the source and target reference densities. The construction preserves the partition function ($Z_{s+1} = Z_s$) and every observable depending only on retained variables ($\mathbb{E}_{s+1}[A(Y)] = \mathbb{E}_s[A(\mathcal{R}_s(X))]$). The reference measure is deliberately not defined as the pushforward $(\mathcal{R}_s)_*\nu_s$: that measure fails $\sigma$-finiteness whenever a cluster has $|I| \ge 2$, because the barycenter map has positive-dimensional affine fibers of infinite Lebesgue mass in the mean sector, so a Radon-Nikodym derivative against it does not exist; the disintegration route above avoids this. Partition-function and observable preservation (Theorem~\ref{thm:rg_pushforward}) are unaffected, since they use only mass transport, not the density representation. The zero-configuration-temperature limit reduces~\eqref{eq:rg_exact_free_energy} to $\mathcal{F}_{s+1}(Y) = \inf_{X : \mathcal{R}_s(X) = Y} \mathcal{F}_s(X)$ up to subleading entropic corrections. This identity is structural; it does not yet claim that $\mathcal{F}^{\mathrm{exact}}_{s+1}$ has multi-agent form.
 
 Two distinct gauge actions are operative in this manuscript and the renormalization construction must be stated relative to a specific one. Under \emph{Action~(a) (internal frame relabeling)}, the global diagonal right-translation $U_i \mapsto U_i g$ for a single $g \in G$ shared by all agents leaves $\Omega_{ij} = U_i U_j^{-1}$ pointwise invariant, and is the redundancy under which the manuscript identifies frame-invariant observables. Under \emph{Action~(b) (base-local active gauge)}, a smooth map $h : \mathcal{C} \to G$ applied diagonally as $U_i(c) \mapsto h(c) U_i(c)$ and $q_i(c) \mapsto h(c)_\# q_i(c)$ on every agent at the same base point transports the parent frame as $U_I \mapsto h U_I$ and conjugates the inter-agent transports,
 \begin{equation}
@@ -3304,12 +3481,12 @@ Two distinct gauge actions are operative in this manuscript and the renormalizat
 so KL-based observables transform by common pushforward and are invariant by Theorem~\ref{thm:glk_invariance}, while $\Omega_{ij}$ itself transforms tensorially under~(b) (covariant, not invariant). Independent per-agent transformations $g_i(c) \neq g_j(c)$ are not gauge redundancies in the sense of either base-manifold action (a) or (b) and represent active changes of the epistemic configuration; they are a redundancy only of the formal index-space lattice gauge of Section~\ref{sec:transport}, under which the frames carry no physical content and only closed-loop holonomies are observable, a bookkeeping device distinct from the physical base-local action (b) that this construction uses. Under~(b), both the Karcher frame and M-projection belief barycenters commute with the diagonal pushforward, giving $\mathcal{R}_I(h \cdot X) = h \cdot \mathcal{R}_I(X)$ and the renormalized invariance $\mathcal{F}_{s+1}(h \cdot Y) = \mathcal{F}_{s+1}(Y)$ when the reference measure $\nu_s$ is gauge-invariant. For compact $G = \mathrm{SO}(N)$ the normalized bi-invariant Haar measure provides this; for the noncompact $\mathrm{GL}^+(K_q)$, Haar measure is still bi-invariant (the group is unimodular) but has infinite total mass, and the Lebesgue factors of the reference measure on the Gaussian parameters are only quasi-invariant under the action (per-agent Jacobian density $|\det h|^{K_q+2}$, from $|\det h|^{1}$ on the mean $\mu \mapsto h\mu$ and $|\det h|^{K_q+1}$ on the covariance congruence $\Sigma \mapsto h\Sigma h^\top$), so a gauge slice or Radon-Nikodym correction is required.
 
 \paragraph{Closure ansatz on the multi-agent class.}
-The pushforward construction defines $\mathcal{F}^{\mathrm{exact}}_{s+1}$ exactly. Whether $\mathcal{F}^{\mathrm{exact}}_{s+1}$ retains the multi-agent functional form of $\mathcal{F}_s$ is a separate claim. Only the normalized Gibbs probability $Z^{-1}e^{-\mathcal{F}/\tau}d\nu$ is invariant under $\mathcal{F}\mapsto\mathcal{F}+c$: the unnormalized density is multiplied by $e^{-c/\tau}$ and its partition function changes by the same factor. We therefore separate quotient closure, partition-function calibration, uniform energy error, and force error. On a parent neighborhood $\mathcal{N}_I$, let $Z_I^{\mathrm{exact}}$ and $Z_I^{\mathrm{agent}}$ be the corresponding local partition functions and define
+The pushforward construction defines $\mathcal{F}^{\mathrm{exact}}_{s+1}$ exactly. Whether $\mathcal{F}^{\mathrm{exact}}_{s+1}$ retains the multi-agent functional form of $\mathcal{F}_s$ is a separate claim. Only the normalized Gibbs probability $Z^{-1}e^{-\mathcal{F}/T_{\mathrm{cfg}}}d\nu$ is invariant under $\mathcal{F}\mapsto\mathcal{F}+c$: the unnormalized density is multiplied by $e^{-c/T_{\mathrm{cfg}}}$ and its partition function changes by the same factor. We therefore separate quotient closure, partition-function calibration, uniform energy error, and force error. On a parent neighborhood $\mathcal{N}_I$, let $Z_I^{\mathrm{exact}}$ and $Z_I^{\mathrm{agent}}$ be the corresponding local partition functions and define
 \begin{align}
 \delta_{I,0}^{\mathrm{quot}}
  &= \inf_{c\in\mathbb{R}}\big\|\mathcal{F}^{\mathrm{exact}}_{s+1}-\mathcal{F}^{\mathrm{agent}}_{s+1}-c\big\|_{L^\infty(\mathcal{N}_I)}, \nonumber\\
 c_I^Z
- &= \tau\log\frac{Z_I^{\mathrm{agent}}}{Z_I^{\mathrm{exact}}}, \qquad
+ &= T_{\mathrm{cfg}}\log\frac{Z_I^{\mathrm{agent}}}{Z_I^{\mathrm{exact}}}, \qquad
 \widehat{\mathcal{F}}^{\mathrm{agent}}_{s+1}=\mathcal{F}^{\mathrm{agent}}_{s+1}+c_I^Z, \nonumber\\
 r_I
  &= \mathcal{F}^{\mathrm{exact}}_{s+1}-\widehat{\mathcal{F}}^{\mathrm{agent}}_{s+1}, \qquad
@@ -3345,10 +3522,10 @@ which reduces to the ordinary algebraic connectivity $\lambda_2(L_I)$ only for u
 
 Integrating out the internal modes by Laplace approximation~\cite{Cardy1996} yields
 \begin{equation}
-\mathcal{F}_{s+1}(Y_I) = \mathcal{F}_{\mathrm{eff}}(Y_I) + \tfrac{\tau}{2}\log\det{}'H_I^\perp(Y_I) + \mathrm{const} + \mathcal{E}_{\mathrm{anh}},
+\mathcal{F}_{s+1}(Y_I) = \mathcal{F}_{\mathrm{eff}}(Y_I) + \tfrac{T_{\mathrm{cfg}}}{2}\log\det{}'H_I^\perp(Y_I) + \mathrm{const} + \mathcal{E}_{\mathrm{anh}},
 \label{eq:rg_laplace}
 \end{equation}
-with anharmonic remainder $\mathcal{E}_{\mathrm{anh}} = O(\tau^2 \|H^{-1}\|^3 \|T_3\|^2 + \tau^2 \|H^{-1}\|^2 \|T_4\|)$ controlled by the cubic and quartic derivative tensors $T_3, T_4$ of $\mathcal{F}_s$ at the saddle (the cubic enters squared by parity, the quartic linearly).
+with anharmonic remainder $\mathcal{E}_{\mathrm{anh}} = O(T_{\mathrm{cfg}}^2 \|H^{-1}\|^3 \|T_3\|^2 + T_{\mathrm{cfg}}^2 \|H^{-1}\|^2 \|T_4\|)$ controlled by the cubic and quartic derivative tensors $T_3, T_4$ of $\mathcal{F}_s$ at the saddle (the cubic enters squared by parity, the quartic linearly).
 
 The renormalized inter-cluster coupling must be constructed at the raw-conductance level rather than at the normalized-attention level, because $\beta_{ij}$ is a row-normalized softmax distribution and summing across cluster pairs would destroy that normalization. Define the unnormalized edge conductance $\kappa_{ij} := \pi_{ij}\exp(-E_{ij}/\tau)$, so that $\beta_{ij} = \kappa_{ij}/\sum_k \kappa_{ik}$ and the envelope-eliminated free energy is $F_{\mathrm{red},i} = -\tau \log \sum_k \kappa_{ik}$. Coarse-graining with cluster weights $w_i^I \ge 0$ subject to $\sum_{i \in I} w_i^I = 1$ gives
 \begin{equation}
@@ -3384,7 +3561,7 @@ Two distinct retention principles apply to a closed parent. The Wilsonian releva
 \Delta_I = \mathcal{L}_{\mathrm{micro}}(I) - \mathcal{L}_{\mathrm{parent}}(I), \qquad \mathcal{L}_{\mathrm{parent}}(I) = \widehat{\mathcal{F}}_{s+1}^{\mathrm{agent},*}(I) + C_{\mathrm{parent}}(I),
 \label{eq:rg_retention_gain}
 \end{equation}
-with complexity penalty $C(I)$ chosen as a Bayesian evidence prior $-\tau \log P(I)$, a BIC penalty $\tfrac{\tau}{2} k_I \log n_I$, or a variational complexity $\mathrm{KL}(Q_I \| P_I)$. RG-relevant directions need not minimize description length, and MDL-preferred coarsenings need not be RG-relevant; the two criteria coincide only in favorable regimes. The free-energy improvement criterion~\eqref{eq:meta_agent_FE_criterion} of Section~\ref{sec:meta_agent_variational} is the special case $\Delta_I > 0$ at unspecified $C(I)$.
+with complexity penalty $C(I)$ chosen as a Bayesian evidence prior $-T_{\mathrm{cfg}}\log P(I)$, a BIC penalty $\tfrac{T_{\mathrm{cfg}}}{2} k_I \log n_I$, or a variational complexity $\mathrm{KL}(Q_I \| P_I)$. RG-relevant directions need not minimize description length, and MDL-preferred coarsenings need not be RG-relevant; the two criteria coincide only in favorable regimes. The free-energy improvement criterion~\eqref{eq:meta_agent_FE_criterion} of Section~\ref{sec:meta_agent_variational} is the special case $\Delta_I > 0$ at unspecified $C(I)$.
 
 \paragraph{Detector as candidate-selection surrogate.}
 Under conditions~(i)--(v) and timescale separation, the exact renormalized free energy admits an agent-form approximation in the $C^0$ quotient sense, with $\delta_{I,0}^{\mathrm{quot}}$ receiving the structural contributions from barycentric dispersion $V_I$, transport and holonomy variation $\mathcal{H}_{IJ}$, edge-marginal weight mismatch, Laplace anharmonics, non-Gaussian closure errors, and gauge-fixing corrections for noncompact groups. The calibrated residual $\delta_{I,0}$ must be checked after partition-function normalization, and a small force residual $\delta_{I,1}$ is an additional $C^1$ hypothesis rather than a consequence of those inputs. The threshold detector developed in Section~\ref{sec:meta_agent_threshold} is a candidate-selection surrogate for the $C^0$ diagnostic conditions of the closure ansatz, not of the exact pushforward. Energy retention also requires the calibrated $\delta_{I,0}$ hypothesis used below; force-level accuracy further requires an independently measured or assumed bound $\delta_{I,1}<\theta_1$, which the detector and the present residual proposition do not supply.
@@ -3402,8 +3579,8 @@ Q(Y)=\mathcal{F}_0+\tfrac12(Y-Y_0)^\top B(Y-Y_0),
 \end{equation}
 a smooth saddle $\xi^*(Y)$, and a smooth constrained precision $A_{\xi\xi}(Y)\succ0$ such that the disintegrated fiber density satisfies
 \begin{equation}
-e^{-\mathcal{F}_s(Y,\xi)/\tau}d\mathcal{H}_Y(\xi)
-=e^{-Q(Y)/\tau}\exp\left[-\frac{1}{2\tau}(\xi-\xi^*(Y))^\top A_{\xi\xi}(Y)(\xi-\xi^*(Y))\right]d\xi,
+e^{-\mathcal{F}_s(Y,\xi)/T_{\mathrm{cfg}}}d\mathcal{H}_Y(\xi)
+=e^{-Q(Y)/T_{\mathrm{cfg}}}\exp\left[-\frac{1}{2T_{\mathrm{cfg}}}(\xi-\xi^*(Y))^\top A_{\xi\xi}(Y)(\xi-\xi^*(Y))\right]d\xi,
 \end{equation}
 for every internal $\xi$ on the fiber; a merely local quadratic Taylor expansion is excluded from (A6) and instead gives the Laplace formula~\eqref{eq:rg_laplace} with its anharmonic remainder; (A7)~flat transport across each cluster pair, all transported edges $\Theta_{ij}^{IJ}$ coinciding so that the holonomy residuals $\mathcal{H}_{IJ}$ vanish.
 \end{assumption}
@@ -3411,7 +3588,7 @@ for every internal $\xi$ on the fiber; a merely local quadratic Taylor expansion
 Assumptions~(A1)--(A5) restate conditions~(i)--(v) of the working-form part; (A6) is the exact solvable-regime hypothesis and absorbs the coarea or disintegration density into the conditional Gaussian identity, while (A7) is the additional flat-transport hypothesis used by Theorem~\ref{thm:rg_exact_closure}.
 
 \paragraph{State and reference measure.}
-Fix a finite grid $\Lambda_s \subset \mathcal{C}$ at scale $s$ and an index set $\mathcal{I}_s$ of microscopic agents. The scale-$s$ state is $X_s = \{x_i\}_{i \in \mathcal{I}_s}$ with $x_i = (q_i, p_i, U_i, \chi_i)$ where $q_i(c) = \mathcal{N}(\mu_i(c), \Sigma_i(c))$, $p_i(c) = \mathcal{N}(m_i(c), \Pi_i(c))$, $U_i(c) \in G$, and $\chi_i(c) \in \{0, 1\}$. Inter-agent transport is $\Omega_{ij} = U_i U_j^{-1}$ with $\Omega_{ij} q_j = \mathcal{N}(\Omega_{ij}\mu_j, \Omega_{ij}\Sigma_j\Omega_{ij}^\top)$, and similarly on the model fiber with possibly distinct representation. The microscopic free energy $\mathcal{F}_s : X_s \to \mathbb{R} \cup \{+\infty\}$ takes the multi-agent KL form of Section~\ref{sec:one_rung}, and the variational Gibbs measure is $d\mathbb{P}_s = Z_s^{-1}\exp[-\mathcal{F}_s/\tau] d\nu_s$, with reference measure $\nu_s$ assembled from Haar measure on frames, Lebesgue measure on means, counting measure on masks, and a chosen measure on positive-definite covariances.
+Fix a finite grid $\Lambda_s \subset \mathcal{C}$ at scale $s$ and an index set $\mathcal{I}_s$ of microscopic agents. The scale-$s$ state is $X_s = \{x_i\}_{i \in \mathcal{I}_s}$ with $x_i = (q_i, p_i, U_i, \chi_i)$ where $q_i(c) = \mathcal{N}(\mu_i(c), \Sigma_i(c))$, $p_i(c) = \mathcal{N}(m_i(c), \Pi_i(c))$, $U_i(c) \in G$, and $\chi_i(c) \in \{0, 1\}$. Inter-agent transport is $\Omega_{ij} = U_i U_j^{-1}$ with $\Omega_{ij} q_j = \mathcal{N}(\Omega_{ij}\mu_j, \Omega_{ij}\Sigma_j\Omega_{ij}^\top)$, and similarly on the model fiber with possibly distinct representation. The microscopic free energy $\mathcal{F}_s : X_s \to \mathbb{R} \cup \{+\infty\}$ takes the multi-agent KL form of Section~\ref{sec:one_rung}, and the variational Gibbs measure is $d\mathbb{P}_s = Z_s^{-1}\exp[-\mathcal{F}_s/T_{\mathrm{cfg}}]d\nu_s$, with $\nu_s$ a proper probability reference or a normalized quotient/gauge-fixed measure. Raw Haar measure on noncompact $\mathrm{GL}^+(K_q)$ is excluded by Remark~\ref{rem:gibbs_lift_interpretation}.
 
 \paragraph{Coarse-graining map.}
 A candidate parent cluster $I \subset \mathcal{I}_s$ satisfies $|I| \ge 2$, connected overlap subgraph, nonempty multi-child support $\chi_I(c) = \mathbf{1}\{\sum_{i \in I}\chi_i(c) \ge 2\}$, local frame coherence on a convex normal ball of $G$, and finite belief and model dispersions. The selected partition is $\mathcal{P}_s = \{I_1, \ldots, I_{N_{s+1}}\}$. For each $I$, the parent frame is the Riemannian center of mass
@@ -3433,7 +3610,7 @@ The working-form part of this appendix states the exact pushforward identity~\eq
 
 \begin{theorem}[Partition function and observable preservation]
 \label{thm:rg_pushforward}
-Let $\mathcal{R}_s : X_s \to X_{s+1}$ be measurable, let $d\rho_s = e^{-\mathcal{F}_s/\tau} d\nu_s$ denote the unnormalized variational measure on $X_s$ with total mass $Z_s := \rho_s(X_s)$, and define the unnormalized pushforward $\rho_{s+1} := (\mathcal{R}_s)_*\rho_s$. Then $Z_{s+1} := \rho_{s+1}(X_{s+1}) = Z_s$, and the normalized pushforward $\mathbb{P}_{s+1} := (\mathcal{R}_s)_*\mathbb{P}_s$ of $\mathbb{P}_s = Z_s^{-1}\rho_s$ satisfies $\mathbb{E}_{s+1}[A(Y)] = \mathbb{E}_s[A(\mathcal{R}_s(X))]$ for every bounded measurable parent observable $A : X_{s+1} \to \mathbb{R}$.
+Let $\mathcal{R}_s : X_s \to X_{s+1}$ be measurable, let $d\rho_s = e^{-\mathcal{F}_s/T_{\mathrm{cfg}}}d\nu_s$ denote the unnormalized variational measure on $X_s$ with finite positive total mass $Z_s := \rho_s(X_s)$, and define the unnormalized pushforward $\rho_{s+1} := (\mathcal{R}_s)_*\rho_s$. Then $Z_{s+1} := \rho_{s+1}(X_{s+1}) = Z_s$, and the normalized pushforward $\mathbb{P}_{s+1} := (\mathcal{R}_s)_*\mathbb{P}_s$ of $\mathbb{P}_s = Z_s^{-1}\rho_s$ satisfies $\mathbb{E}_{s+1}[A(Y)] = \mathbb{E}_s[A(\mathcal{R}_s(X))]$ for every bounded measurable parent observable $A : X_{s+1} \to \mathbb{R}$.
 \end{theorem}
 
 \begin{proof}
@@ -3480,9 +3657,9 @@ The exact $\mathcal{F}_{s+1}^{\mathrm{exact}}$ generally contains all interactio
 Under Assumptions~(A1)--(A7) of Assumption~\ref{ass:closure_regime}, the exact renormalized free energy on each fixed-dimensional positive-weight stratum is
 \begin{equation}
 \mathcal{F}_{s+1}^{\mathrm{exact}}(Y)
-=Q(Y)+\frac{\tau}{2}\log\det{}'A_{\xi\xi}(Y)+\mathrm{const}.
+=Q(Y)+\frac{T_{\mathrm{cfg}}}{2}\log\det{}'A_{\xi\xi}(Y)+\mathrm{const}.
 \end{equation}
-It is therefore an exactly quadratic parent functional augmented by the smooth potential $V(Y):=\tfrac{\tau}{2}\log\det{}'A_{\xi\xi}(Y)$. If the conditional normal form is induced by an exact joint block quadratic with constant blocks,
+It is therefore an exactly quadratic parent functional augmented by the smooth potential $V(Y):=\tfrac{T_{\mathrm{cfg}}}{2}\log\det{}'A_{\xi\xi}(Y)$. If the conditional normal form is induced by an exact joint block quadratic with constant blocks,
 \begin{equation}
 \mathcal{F}_s(Y,\xi)
 =\mathcal{F}_0+\frac12
@@ -3501,10 +3678,10 @@ while the log-determinant is an additive constant.
 \begin{proof}
 Integrating the exact conditional-Gaussian density in Assumption~(A6) over the constrained internal subspace gives
 \begin{equation}
-\int\exp\left[-\frac{1}{2\tau}(\xi-\xi^*)^\top A_{\xi\xi}(Y)(\xi-\xi^*)\right]d\xi
-=(2\pi\tau)^{r/2}\det{}'A_{\xi\xi}(Y)^{-1/2},
+\int\exp\left[-\frac{1}{2T_{\mathrm{cfg}}}(\xi-\xi^*)^\top A_{\xi\xi}(Y)(\xi-\xi^*)\right]d\xi
+=(2\pi T_{\mathrm{cfg}})^{r/2}\det{}'A_{\xi\xi}(Y)^{-1/2},
 \end{equation}
-where $r$ is the fixed internal dimension of the stratum. Taking $-\tau\log$ yields the stated formula without a Laplace approximation. The constant-block identities follow by completing the square. The other hypotheses enter upstream: compactness and local frame coherence in~(A5) and~(A2) make the parent frame and barycenter well-posed; the positive constrained gap~(A3) makes the Gaussian integral converge; flat transport in~(A7) removes holonomy contributions; and edge-marginal compatibility in~(A4) removes the first-order mismatch identified in the working-form part. Identification with transported-difference KL terms and admissible nonnegative row-structured couplings remains the representability question excluded from the statement.
+where $r$ is the fixed internal dimension of the stratum. Taking $-T_{\mathrm{cfg}}\log$ yields the stated formula without a Laplace approximation. The constant-block identities follow by completing the square. The other hypotheses enter upstream: compactness and local frame coherence in~(A5) and~(A2) make the parent frame and barycenter well-posed; the positive constrained gap~(A3) makes the Gaussian integral converge; flat transport in~(A7) removes holonomy contributions; and edge-marginal compatibility in~(A4) removes the first-order mismatch identified in the working-form part. Identification with transported-difference KL terms and admissible nonnegative row-structured couplings remains the representability question excluded from the statement.
 \end{proof}
 
 \begin{remark}
@@ -3515,9 +3692,9 @@ Assumption~(A6) is an exact solvable-regime hypothesis. Gaussian child marginals
 Outside Assumption~(A6), let $\xi^*(Y)$ be a nondegenerate internal saddle of the effective fiber action, including the coarea density, defined by $\nabla_\xi\Phi_s(Y,\xi^*(Y))=0$, and set $\eta=\xi-\xi^*(Y)$. Under the standard uniform Laplace regularity and tail conditions, Laplace integration~\cite{wong2001asymptotic} gives the anharmonic remainder $\mathcal{E}_{\mathrm{anh}}$ of~\eqref{eq:rg_laplace} with the schematic bound
 \begin{equation}
 |\mathcal{E}_{\mathrm{anh}}|
-=O\left(\tau^2\|H^{-1}\|^3\|T_3\|^2+\tau^2\|H^{-1}\|^2\|T_4\|\right),
+=O\left(T_{\mathrm{cfg}}^2\|H^{-1}\|^3\|T_3\|^2+T_{\mathrm{cfg}}^2\|H^{-1}\|^2\|T_4\|\right),
 \end{equation}
-where $T_3,T_4$ are the cubic and quartic derivative tensors at the saddle. With $\|H^{-1}\|\leq m_I^{-1}$ from~\eqref{eq:rg_constrained_gap}, perturbative control requires $\sqrt{\tau}\|T_3\|m_I^{-3/2}\ll1$ and $\tau\|T_4\|m_I^{-2}\ll1$. This formalizes the high-coherence, spectrally gapped, weakly anharmonic regime in which the working-form approximation of the preceding part is valid.
+where $T_3,T_4$ are the cubic and quartic derivative tensors at the saddle. With $\|H^{-1}\|\leq m_I^{-1}$ from~\eqref{eq:rg_constrained_gap}, perturbative control requires $\sqrt{T_{\mathrm{cfg}}}\|T_3\|m_I^{-3/2}\ll1$ and $T_{\mathrm{cfg}}\|T_4\|m_I^{-2}\ll1$. This formalizes the high-coherence, spectrally gapped, weakly anharmonic regime in which the working-form approximation of the preceding part is valid.
 
 \paragraph{Renormalized inter-cluster transport.}
 Beyond the renormalized raw conductance $\kappa_{IJ}^R$ of~\eqref{eq:rg_inter_cluster}, the full closure also requires a single renormalized transport $\Omega_{IJ}^R$ for each cluster pair. Transport the microscopic edge into parent coordinates as $\Theta_{ij}^{IJ} = \Omega_{Ii}\Omega_{ij}\Omega_{jJ}$ (with conventions chosen consistently for source and target frames). Define the parent transport by the weighted Karcher mean
@@ -3560,7 +3737,7 @@ C_1^{(I)} = \frac{\sqrt 2}{12} \cdot \frac{\|F(q_I)\|_{\mathrm{op}}^{3/2}}{m_I^{
 \end{equation}
 obtained by composing the canonical Pinsker constant $\tfrac{1}{\sqrt 2}$~\cite{CoverThomas2006} with the third-cumulant Edgeworth coefficient $\tfrac{1}{6}$, the Pinsker constant entering to first power against a single $\sqrt{\mathrm{KL}}$ factor of the $V^{3/2}$ dispersion so that the composition is $\tfrac{1}{6}\cdot\tfrac{1}{\sqrt 2} = \tfrac{\sqrt 2}{12}$ rather than a cubed-Pinsker $\tfrac{\sqrt 2}{24}$, and the anharmonic contribution obeys the explicit per-cluster bound
 \begin{equation}
-\limsup_{\tau\to0^+}\frac{|\mathcal{E}_{\mathrm{anh}}^{(I)}|}{\tau^2} \leq \frac{1}{8} \cdot \frac{\|T_4\|_{\mathrm{op}}}{m_I^2} + \frac{5}{24} \cdot \frac{\|T_3\|_{\mathrm{op}}^2}{m_I^3},
+\limsup_{T_{\mathrm{cfg}}\to0^+}\frac{|\mathcal{E}_{\mathrm{anh}}^{(I)}|}{T_{\mathrm{cfg}}^2} \leq \frac{1}{8} \cdot \frac{\|T_4\|_{\mathrm{op}}}{m_I^2} + \frac{5}{24} \cdot \frac{\|T_3\|_{\mathrm{op}}^2}{m_I^3},
 \label{eq:rg_C5_explicit}
 \end{equation}
 from the integrated post-Laplace Wick coefficients $\tfrac{1}{8}$ on $T_4$ and $\tfrac{5}{24} = \tfrac{1}{12} + \tfrac{1}{8}$ on $T_3^2$ (the sunset and double-bubble two-loop topologies of the leading saddle-point correction)~\cite{BenderOrszag1999, wong2001asymptotic}, so that the multiplier $C_5$ of Proposition~\ref{thm:rg_residual} is an absolute $O(1)$ constant rather than a second copy of the anharmonic coefficient. The cluster-indexed $C_1^{(I)}$ is read inside the sum of Proposition~\ref{thm:rg_residual}, equivalently $C_1 = \max_I C_1^{(I)}$. For constrained internal dimension $r>1$, including multi-mode clusters even when $K_q=1$, the contractions $T_4 \mathbin{:} (H^{-1} \otimes H^{-1})$ and $T_3 H^{-1} T_3$ carry dimension-dependent trace factors that the operator norms alone do not control, so the displayed values do not extend verbatim beyond $r=1$.
@@ -3569,10 +3746,10 @@ from the integrated post-Laplace Wick coefficients $\tfrac{1}{8}$ on $T_4$ and $
 Two derivation-status notes attach to the proposition rather than to its constants. The Pinsker citation supplies the Pinsker half of the $C_1^{(I)}$ composition; the step from KL dispersion to the $L^\infty$ closure norm is taken at the schematic grade of Proposition~\ref{thm:rg_residual} rather than derived independently. The constants $C_2, C_3, C_4, C_6$ remain proposition-grade at this stage and admit analogous Laplace-derived values under further specifications, deferred to future work. These values are the integrated free-energy coefficients of the Laplace expansion at the parent saddle; they differ from the Edgeworth density-correction coefficients $\tfrac{1}{24}$ on $H_4$ and $\tfrac{1}{72}$ on $H_6$ that appear in the Hermite expansion of the perturbed Gaussian density, because the closure norm sees the integrated free-energy correction $-\log(Z/Z_0)$ rather than the density correction $h_1(\xi)$ itself. In the 1D test case, the central-Hermite evaluation $|H_4(0)| = 3$ and $|H_6(0)| = 15$ relates the two normalizations arithmetically as $\tfrac{1}{8} = 3 \cdot \tfrac{1}{24}$ and $\tfrac{5}{24} = 15 \cdot \tfrac{1}{72}$, but the sup-norm of $H_n$ on $\mathcal{N}_I$ exceeds the central value once $R$ exceeds the Hermite threshold $R_n$ ($R_4 = \sqrt{3-\sqrt{3}} \approx 1.126$ for $H_4$, while $H_6$ already crosses at $R_6 \approx 0.973$), so the centerpoint identification is not an $L^\infty$ bound on neighborhoods larger than the binding (smaller) radius $R_6 \approx 0.973$.
 
 \paragraph{Detector as sufficient surrogate.}
-The threshold detector of Section~\ref{sec:meta_agent_threshold} can be replaced by a bounded exponential detector. With $C_q(I) = \exp[-V_I^{(q)}/\tau_q]$, $C_p(I) = \exp[-V_I^{(p)}/\tau_p]$, and presence $P_I = |\Lambda_s|^{-1}\sum_{c \in \Lambda_s}\chi_I(c) \in [0, 1]$, define $\Gamma_I = P_I C_q(I) C_p(I) \in [0, 1]$. The second channel is written here with the appendix's coarse-grained second fiber, dispersion $V_I^{(p)}$ and temperature $\tau_p$; it is identical in form to the body detector's model channel $C_s, \tau_s, V^{(s)}$ of Section~\ref{sec:meta_agent_threshold}, the subscript reflecting that the appendix coarse-grains the $(q,p)$ pair while the body detector reads $(q,s)$ coherence. The detector selects $I$ if $\Gamma_I > \Gamma_{\min}$, $|I| \ge N_{\min}$, and $m_I > m_{\min}$; the gap condition is what makes the detector approximate a closure rather than only a similarity threshold. The canonical detector of Section~\ref{sec:meta_agent_threshold} and the reference implementation test only $\Gamma_I > \Gamma_{\min}$ and $|I| \ge N_{\min}$, without the gap condition; by the present classification the detector actually used is a similarity threshold, and Theorem~\ref{thm:rg_detector_retention} below, whose hypothesis encodes the gap through $A_I = \tau m_I$, validates the strengthened detector stated here rather than the implemented one. Because the explicit closure constants of Proposition~\ref{thm:rg_residual_explicit} scale as $C_1^{(I)} \sim m_I^{-1/2}$ and $\mathcal{E}_{\mathrm{anh}}^{(I)} \sim m_I^{-2}, m_I^{-3}$, they diverge as the constrained gap $m_I \to 0$; without the gap check the formed clusters carry no lower bound on $m_I$, so those constants, and the closure-residual control they quantify, are vacuous for the clusters the implemented detector actually forms, as classified in Section~\ref{sec:meta_agent_threshold}.
+The threshold detector of Section~\ref{sec:meta_agent_threshold} can be replaced by a bounded exponential detector. With $C_q(I) = \exp[-V_I^{(q)}/\tau_q]$, $C_p(I) = \exp[-V_I^{(p)}/\tau_p]$, and presence $P_I = |\Lambda_s|^{-1}\sum_{c \in \Lambda_s}\chi_I(c) \in [0, 1]$, define $\Gamma_I = P_I C_q(I) C_p(I) \in [0, 1]$. The second channel is written here with the appendix's coarse-grained second fiber, dispersion $V_I^{(p)}$ and temperature $\tau_p$; it is identical in form to the body detector's model channel $C_s, \tau_s, V^{(s)}$ of Section~\ref{sec:meta_agent_threshold}, the subscript reflecting that the appendix coarse-grains the $(q,p)$ pair while the body detector reads $(q,s)$ coherence. The detector selects $I$ if $\Gamma_I > \Gamma_{\min}$, $|I| \ge N_{\min}$, and $m_I > m_{\min}$; the gap condition is what makes the detector approximate a closure rather than only a similarity threshold. The canonical detector of Section~\ref{sec:meta_agent_threshold} and the reference implementation test only $\Gamma_I > \Gamma_{\min}$ and $|I| \ge N_{\min}$, without the gap condition; by the present classification the detector actually used is a similarity threshold, and Theorem~\ref{thm:rg_detector_retention} below, whose hypothesis encodes the gap through $A_I = T_{\mathrm{cfg}}m_I$, validates the strengthened detector stated here rather than the implemented one. Because the explicit closure constants of Proposition~\ref{thm:rg_residual_explicit} scale as $C_1^{(I)} \sim m_I^{-1/2}$ and $\mathcal{E}_{\mathrm{anh}}^{(I)} \sim m_I^{-2}, m_I^{-3}$, they diverge as the constrained gap $m_I \to 0$; without the gap check the formed clusters carry no lower bound on $m_I$, so those constants, and the closure-residual control they quantify, are vacuous for the clusters the implemented detector actually forms, as classified in Section~\ref{sec:meta_agent_threshold}.
 
 \begin{remark}[Local derivation of the Lipschitz bound]
-The Lipschitz bound used as the hypothesis of Theorem~\ref{thm:rg_detector_retention} below is a hypothesis, not a result of this appendix: a first-order Taylor expansion of the parent free energy around the high-coherence configuration under the closure-ansatz conditions~(i)--(v) motivates it, with the local Lipschitz constants bounded by operator norms of the parent Fisher information~\cite{Amari2016}, $L_q \le \lambda_{\max}(F(q_I)) \cdot \max_i\|w_i^I\|$ and $L_p \le \lambda_{\max}(F(p_I)) \cdot \max_i\|w_i^I\|$, and the saving term identified with the constrained spectral gap of Eq.~\eqref{eq:rg_constrained_gap} via $A_I = \tau \cdot m_I$ in the leading-order Laplace approximation around the parent barycenter; these identifications are asserted at the same proposition grade as the constants $C_2, C_3, C_4, C_6$ of Proposition~\ref{thm:rg_residual} and are not derived here. The positivity of the saving term $A_I$, the assertion that coarse-graining lowers the optimized free energy at all, enters the theorem as a hypothesis rather than as a conclusion of this appendix. The theorem statement retains the conditional form because the locality of the derivation is the regime in which the closure ansatz itself holds.
+The Lipschitz bound used as the hypothesis of Theorem~\ref{thm:rg_detector_retention} below is a hypothesis, not a result of this appendix: a first-order Taylor expansion of the parent free energy around the high-coherence configuration under the closure-ansatz conditions~(i)--(v) motivates it, with the local Lipschitz constants bounded by operator norms of the parent Fisher information~\cite{Amari2016}, $L_q \le \lambda_{\max}(F(q_I)) \cdot \max_i\|w_i^I\|$ and $L_p \le \lambda_{\max}(F(p_I)) \cdot \max_i\|w_i^I\|$, and the saving term identified with the constrained spectral gap of Eq.~\eqref{eq:rg_constrained_gap} via $A_I = T_{\mathrm{cfg}}m_I$ in the leading-order Laplace approximation around the parent barycenter; these identifications are asserted at the same proposition grade as the constants $C_2, C_3, C_4, C_6$ of Proposition~\ref{thm:rg_residual} and are not derived here. The positivity of the saving term $A_I$, the assertion that coarse-graining lowers the optimized free energy at all, enters the theorem as a hypothesis rather than as a conclusion of this appendix. The theorem statement retains the conditional form because the locality of the derivation is the regime in which the closure ansatz itself holds.
 \end{remark}
 
 \begin{theorem}[Detector implies positive retention gain]
@@ -3608,7 +3785,7 @@ The gauge structure is carried by the inter-agent transport $\Omega_{ij}$ of Eq.
 
 The symbol $\pi$ serves several roles, disambiguated by argument and decoration: $\pi: \mathcal{N} \to \mathcal{C}$ is the principal-bundle projection; $\pi_{ij}$ and $\pi^{(s)}_{ij}$ are attention priors; $\pi_v$ are PriorBank entries (Section~\ref{sec:transformers}); and the parent-assignment map of the hierarchical tree is written $\mathrm{pa}(i)$ in the body and $\pi(i)$ in the appendices (Appendix~\ref{app:augmented_joint}), where the top-level prior $\pi(k^{(s_{\max})})$ also appears.
 
-The unsubscripted $\tau$ is the attention and entropy temperature in the canonical free energy of Eq.~\eqref{eq:pointwise_free_energy}; in the working implementation it is factorized as $\tau = \kappa\sqrt{K_q}$ on the belief channel and $\kappa\sqrt{K_m}$ on the model channel, with $\kappa$ a learnable scalar and the square-root factor the dimension scaling. The remaining time, temperature, and coupling symbols have disjoint meanings. The dimensionless information-update clock of Part~II is $\tau_i$ (Section~\ref{sec:time_info}); detector dispersion temperatures are $\tau_q$, $\tau_s$, and $\tau_p$ where their respective channels appear; and the indexed $\tau^{(q)}_{ij}$ and $\tau^{(s)}_{ij}$ are coupling strengths in Appendix~\ref{app:gradients}. Relaxation times use $t$ exclusively: $t_q$, $t_s$, and $t_\phi$ are the characteristic belief, model, and frame times in Section~\ref{sec:timescales}, with $t_s \sim \epsilon^{-1}t_q$ and $t_\phi \sim \epsilon^{-2}t_q$, while $t^{(s)}$, $t_{\mathrm{belief}}^{(s)}$, and $t_{\mathrm{model}}^{(s)}$ are the scale-indexed relaxation times in Section~\ref{sec:ouroboros}. Among the variational and coupling weights, $\alpha_i$ is the per-agent variational precision weighting the agent's own belief-prior coupling $\alpha_i\mathrm{KL}(q_i \| p_i)$, while the unsubscripted order parameter $\alpha$ of the R\'enyi extension (Section~\ref{sec:transformers}) is the divergence order, with $\alpha \to 1$ the KL limit, distinguished from $\alpha_i$ by the absence of the agent subscript; $w_i^I$ is the cluster-aggregation weight of constituent $i$ in cluster $I$ in the meta-agent barycenter (Section~\ref{sec:meta_agent_formation}), while the singly subscripted $w_j$ of the apex closure (Section~\ref{sec:ouroboros}) are hierarchy-coherence weights, not cluster-aggregation weights; $\beta_{ij}$ is the inter-agent attention weight on belief alignment, and $\gamma_{ij}$ is the inter-agent coupling on the model channel; the last two are row-normalized softmax distributions and are not used interchangeably.
+The unsubscripted $\tau$ is the attention and entropy temperature in the canonical free energy of Eq.~\eqref{eq:pointwise_free_energy}; in the working implementation it is factorized as $\tau = \kappa\sqrt{K_q}$ on the belief channel and $\kappa\sqrt{K_m}$ on the model channel, with $\kappa$ a learnable scalar and the square-root factor the dimension scaling. The configuration-space Gibbs temperature in Appendix~\ref{sec:meta_agent_rg} is the distinct symbol $T_{\mathrm{cfg}}$. The remaining time, temperature, and coupling symbols have disjoint meanings. The dimensionless information-update clock of Part~II is $\tau_i$ (Section~\ref{sec:time_info}); detector dispersion temperatures are $\tau_q$, $\tau_s$, and $\tau_p$ where their respective channels appear; and the indexed $\tau^{(q)}_{ij}$ and $\tau^{(s)}_{ij}$ are coupling strengths in Appendix~\ref{app:gradients}. Relaxation times use $t$ exclusively: $t_q$, $t_s$, and $t_\phi$ are the characteristic belief, model, and frame times in Section~\ref{sec:timescales}, with $t_s \sim \epsilon^{-1}t_q$ and $t_\phi \sim \epsilon^{-2}t_q$, while $t^{(s)}$, $t_{\mathrm{belief}}^{(s)}$, and $t_{\mathrm{model}}^{(s)}$ are the scale-indexed relaxation times in Section~\ref{sec:ouroboros}. Among the variational and coupling weights, $\alpha_i$ is the per-agent variational precision weighting the agent's own belief-prior coupling $\alpha_i\mathrm{KL}(q_i \| p_i)$, while the unsubscripted order parameter $\alpha$ of the R\'enyi extension (Section~\ref{sec:transformers}) is the divergence order, with $\alpha \to 1$ the KL limit, distinguished from $\alpha_i$ by the absence of the agent subscript; $w_i^I$ is the cluster-aggregation weight of constituent $i$ in cluster $I$ in the meta-agent barycenter (Section~\ref{sec:meta_agent_formation}), while the singly subscripted $w_j$ of the apex closure (Section~\ref{sec:ouroboros}) are hierarchy-coherence weights, not cluster-aggregation weights; $\beta_{ij}$ is the inter-agent attention weight on belief alignment, and $\gamma_{ij}$ is the inter-agent coupling on the model channel; the last two are row-normalized softmax distributions and are not used interchangeably.
 
 \bibliographystyle{unsrt}
 \bibliography{references}

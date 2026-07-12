@@ -253,6 +253,174 @@ general, the KL of one variational distribution against a fixed global generativ
 single-system evidence bound above therefore does not become an end-to-end evidence-bound theorem
 for the coupled population merely by adding the alignment sectors.
 
+### Does a population generative model exist?
+
+There are three distinct questions. On the original product of agent-state spaces, a fixed
+mean-field generative model is generically obstructed. An auxiliary source model can nevertheless
+become fixed after a self-consistent equilibrium is selected. At a higher probabilistic level, the
+entire population functional can define an exact energy-based model over belief configurations
+whenever its partition function is finite. These statements are compatible because their random
+variables and quantifiers differ.
+
+For the state-level obstruction, let
+$Q_q(x_{1:N}):=\prod_i q_i(x_i)$ and suppose that a normalized density
+$p_\theta(x_{1:N})$, independent of $q$, generated the coupled objective on an open product family.
+Its mean-field KL would have the form
+
+$$
+\begin{aligned}
+D_{\mathrm{KL}}(Q_q\Vert p_\theta)
+&=\sum_i\int_{\mathcal X_i}q_i(x_i)\log q_i(x_i)d\nu_i(x_i) \\
+&\quad-
+\int_{\prod_i\mathcal X_i}
+\left[\prod_iq_i(x_i)\right]
+\log p_\theta(x_{1:N})d\nu_{1:N}(x_{1:N}).
+\end{aligned}
+$$
+
+The entropy is separable, and the fixed-model energy is affine in each factor while the other
+factors are held fixed. Hence, for $i\ne j$, every admissible pair of zero-mass perturbations
+$a_i$ and $h_j$ satisfies
+
+$$
+\delta_{q_i}\delta_{q_j}^{2}
+D_{\mathrm{KL}}(Q_q\Vert p_\theta)[a_i,h_j,h_j]=0.
+$$
+
+Now hold an active attention coefficient $\beta_{ij}>0$ fixed and consider one transported
+consensus term
+$C_{ij}(q):=\beta_{ij}D_{\mathrm{KL}}(q_i\Vert T_{ij}q_j)$, where $T_{ij}$ is a fixed
+positive mass-preserving transport. Along
+$q_i(s)=q_i+s a_i$ and $q_j(t)=q_j+t h_j$, direct differentiation gives
+
+$$
+\left.
+\frac{\partial^3 C_{ij}}{\partial s\partial t^2}
+\right|_{s=t=0}
+=\beta_{ij}\int_{\mathcal X_i}
+a_i(x)
+\left[
+\frac{T_{ij}h_j(x)}{T_{ij}q_j(x)}
+\right]^2d\nu_i(x).
+$$
+
+If
+$g_{ij}:=[T_{ij}h_j/(T_{ij}q_j)]^2$ is bounded and nonconstant under $q_i$, choose
+$a_i=q_i(g_{ij}-\mathbb E_{q_i}[g_{ij}])$. The mixed variation becomes
+
+$$
+\beta_{ij}\mathrm{Var}_{q_i}(g_{ij})>0,
+$$
+
+contradicting the fixed-model identity. With several positive heads on the same ordered pair, use
+
+$$
+G_{ij}:=\sum_h\beta_{ij}^{(h)}
+\left[
+\frac{T_{ij}^{(h)}h_j}{T_{ij}^{(h)}q_j}
+\right]^2,
+\qquad
+a_i:=q_i\left(G_{ij}-\mathbb E_{q_i}[G_{ij}]\right).
+$$
+
+The complete same-pair contribution is then $\mathrm{Var}_{q_i}(G_{ij})>0$ whenever $G_{ij}$ is
+nonconstant. Unrelated ordered pairs omit one varied factor, and the reverse edge is affine in the
+repeated sender variation outside an entropy whose second variation is independent of $q_i$.
+Assuming the remaining terms have zero $q_i,q_j,q_j$ variation, they cannot cancel the obstruction.
+Thus, under this nondegeneracy condition, the population consensus functional cannot equal
+$D_{\mathrm{KL}}(\prod_iq_i\Vert p_\theta)+c$ on an open family for one fixed state-level
+$p_\theta$. The result does not exclude zero coupling, frozen source templates, degenerate
+restricted families, compatible auxiliary variables, or models over a larger latent space. It
+also does not analyze the different reduced functional obtained after substituting a
+state-dependent optimum $\beta^\ast(q)$.
+
+The first constructive alternative is an equilibrium-frozen source model. On a finite latent
+alphabet, assume positive priors $p_i$, positive row priors $\pi_{ij}$, positive coefficients
+$a_i$, $\lambda$, and $\tau$, and stochastic transports with a uniform positive floor. Define
+
+$$
+\begin{aligned}
+E_{ij}(q)&:=D_{\mathrm{KL}}(q_i\Vert T_{ij}q_j), \\
+\beta_{ij}(q)&:=
+\frac{\pi_{ij}\exp[-E_{ij}(q)/\tau]}
+{\sum_m\pi_{im}\exp[-E_{im}(q)/\tau]}, \\
+B_i(q)(x)&:=
+\frac{
+p_i(x)^{a_i/A_i}
+\prod_j[T_{ij}q_j(x)]^{\lambda\beta_{ij}(q)/A_i}}
+{\sum_u
+p_i(u)^{a_i/A_i}
+\prod_j[T_{ij}q_j(u)]^{\lambda\beta_{ij}(q)/A_i}},
+\qquad A_i:=a_i+\lambda.
+\end{aligned}
+$$
+
+The map $B$ is continuous on the compact product simplex, so Brouwer's theorem gives at least one
+own-row filtering fixed point $q^\ast=B(q^\ast)$. This does not establish stationarity of a
+smoothing objective that also differentiates incoming source roles. After selecting such an
+equilibrium, define the normalized row distributions
+
+$$
+P_i^\ast(x,j):=\pi_{ij}T_{ij}q_j^\ast(x),
+\qquad
+Q_i^\ast(x,j):=\beta_{ij}^\ast q_i^\ast(x).
+$$
+
+They obey the exact identity
+
+$$
+D_{\mathrm{KL}}(Q_i^\ast\Vert P_i^\ast)
+=\sum_j\beta_{ij}^\ast
+D_{\mathrm{KL}}(q_i^\ast\Vert T_{ij}q_j^\ast)
++D_{\mathrm{KL}}(\beta_i^\ast\Vert\pi_i).
+$$
+
+This proves existence of a proper auxiliary row model after equilibrium selection. The product of
+the row models duplicates the source templates, however, and is not automatically one joint model
+over shared $(x_1,\ldots,x_N)$. A shared joint additionally needs compatible conditionals, an
+acyclic factorization, or a normalized undirected potential. The identity matches the canonical
+unscaled row KL at unit attention temperature; other temperatures give a tempered generalized-Bayes
+construction.
+
+The second constructive alternative changes the probabilistic level. Let $X$ denote an entire
+belief configuration, let $\rho_0$ be a proper reference probability measure on configuration
+space, and let $T_{\mathrm{cfg}}>0$. For any measurable population energy $\mathcal F(X)$, define
+
+$$
+Z_{\mathcal F}:=
+\int\exp[-\mathcal F(X)/T_{\mathrm{cfg}}]d\rho_0(X).
+$$
+
+If and only if $0<Z_{\mathcal F}<\infty$, the density
+
+$$
+\frac{dP_{\mathcal F}}{d\rho_0}(X)
+:=Z_{\mathcal F}^{-1}
+\exp[-\mathcal F(X)/T_{\mathrm{cfg}}]
+$$
+
+defines a generative model over belief configurations. For every $R\ll\rho_0$ for which the terms
+are finite,
+
+$$
+\mathbb E_R[\mathcal F]
++T_{\mathrm{cfg}}D_{\mathrm{KL}}(R\Vert\rho_0)
+=T_{\mathrm{cfg}}D_{\mathrm{KL}}(R\Vert P_{\mathcal F})
+-T_{\mathrm{cfg}}\log Z_{\mathcal F}.
+$$
+
+This is an exact meta-level VFE. The original population functional is the configuration energy,
+or the MAP objective in the zero-configuration-temperature limit, rather than the complete
+state-level ELBO. On noncompact Gaussian, SPD, and $\mathrm{GL}^+(K_q)$ sectors, normalizability
+is not automatic: $\exp[-\mathcal F/T_{\mathrm{cfg}}]$ must be integrable under the proper
+reference law. Under a proper reference probability, an energy bounded below and finite on a set
+of positive reference measure is sufficient; coercivity is another sufficient condition.
+A regulated container, gauge fixing, or quotient can
+remove divergent gauge-orbit volume, but integrability in the remaining physical directions must
+still be checked. At zero within-scale coupling, the separate cross-scale PIFB hierarchy is already
+a proper Gaussian generative tree; its full-rank top prior makes the stacked precision positive
+definite and its mean-field coordinate updates have a unique optimum.
+
 ### Continuum functional with base and fiber supports
 
 Let $\mathcal C$ be a base manifold equipped with measure $\mu_{\mathcal C}$. Agent $i$ is
@@ -556,10 +724,90 @@ a_i^{\ast} &:= \frac{c_0}{b_0+D(q_i\Vert p_i)}.
 \end{aligned}
 $$
 
-The optional detached two-hop coefficient is zero in the checked-in profile. Here $b_0=c_0=1$
-and the only belief iteration starts from $q_i^{(0)}=p_i$. It therefore evaluates
+Here $b_0=c_0=1$ and the only belief iteration starts from $q_i^{(0)}=p_i$. It therefore evaluates
 $D(q_i^{(0)}\Vert p_i)=0$ and $a_i^{\ast}=1$ at that initialization; this value is not asserted away
 from that state.
+
+### Experimental detached two-hop regularizer
+
+The experimental `lambda_twohop` path augments the belief objective with a two-step attention-graph
+endpoint penalty. To expose the selected filtering/MM semantics, let $\bar q$ denote the detached
+source state. That route evaluates
+
+$$
+\begin{aligned}
+W_{ik}^{(2,h)}(\bar q)
+&:=\sum_j
+\beta_{ij}^{(h)}(\bar q)
+\beta_{jk}^{(h)}(\bar q), \\
+\mathcal F_2(\bar q;q)
+&:=\lambda_{\mathrm{twohop}}
+\sum_{h,i,k}
+W_{ik}^{(2,h)}(\bar q)
+\widehat E_{ik}^{q,h}(q_i;\bar q_k).
+\end{aligned}
+$$
+
+Here $\widehat E$ is the same registry-selected, clamped value-energy grid used by the one-hop
+filtering term; its derivative is gated by the destination clamp mask. The receiver query $q_i$ is
+live and the source key $\bar q_k$ is detached.
+
+Because each attention matrix is row-stochastic, $W^{(2,h)}=(\beta^{(h)})^2$ is the two-step
+transition kernel of the attention Markov chain. Therefore
+
+$$
+\mathcal F_2(\bar q;q)
+=\lambda_{\mathrm{twohop}}
+\sum_{h,i}
+\mathbb E_{k\sim W_i^{(2,h)}(\bar q)}
+\left[\widehat E_{ik}^{q,h}(q_i;\bar q_k)\right].
+$$
+
+This is a graph-diffusion consensus regularizer, not a second canonical VFE row. Every route computes
+`beta.detach() @ beta.detach()`, so both attention factors are fixed and the response derivative of
+$(\beta(q))^2$ is always omitted. On the filtering route, the endpoint key is also detached and the
+derivative is that of $\mathcal F_2(\bar q;q)$ above. On the smoothing oracle, query and endpoint-key
+roles share live belief leaves, so the endpoint energy contributes both roles even though
+$W^{(2)}$ remains detached. The code supplies no independent two-hop prior and no categorical
+relative-entropy term for $W^{(2)}$ in either mode.
+
+The selected ablation uses the `mm_exact` filtering route rather than a literal gradient step. It
+adds $\lambda_{\mathrm{twohop}}W^{(2)}$ to the frozen precision-fusion weights. Belief covariance is
+frozen, `mm_damping=0.75`, and only the mean target responds:
+
+$$
+\mu_i^+=0.25\mu_i+0.75\mu_i^\ast.
+$$
+
+This is a damped frozen-attention, frozen-key majorizer update for the endpoint-consensus surrogate.
+
+In the flat vertex-frame regime,
+
+$$
+\Omega_{ij}\Omega_{jk}=\Omega_{ik},
+$$
+
+so the direct endpoint transport used by $E_{ik}$ agrees with transport composed along
+$i\leftarrow j\leftarrow k$. This cocycle does not make KL additive along the path and does not
+imply $E_{ik}=E_{ij}+E_{jk}$. Under edge-local nonflat transport, the direct $\Omega_{ik}$ generally
+differs from $\Omega_{ij}\Omega_{jk}$, so the term retains its graph-regularization meaning but loses
+the composed-generative-path reading.
+
+The term can be included as one contribution to the configuration energy in the Gibbs lift above,
+provided the enlarged partition function remains finite. It does not evade the fixed state-level
+ELBO obstruction. A genuinely variational two-hop source row would instead require an independently
+normalized row variable, a fixed prior for that row, its own relative entropy, and a joint
+stationarity derivation.
+
+The implementation scope is narrower than the full population theory. The term acts only in the
+belief channel; there is no corresponding model-channel $\gamma$ term, and the frame-alignment
+subproblem does not include it. The selected experimental sweep keeps frame refinement off, making
+the latter mismatch inactive. The ordinary reflection-aware belief path retains the term, but the
+Metropolis reflection accept/reject scorer omits it. The no-snapshot E-step trace used by both the
+end-of-run report and `test_results.json::estep_final_f_per_token` also omits it, while production
+validation diagnostics use the captured state and include it.
+The canonical pure profile retains `lambda_twohop=0.0`; the dedicated ablation evaluates
+`0.0`, `0.001`, `0.005`, and `0.01` as explicitly non-pure extensions.
 
 The model channel has its own target-blind objective. It balances the same-scale hyper-prior
 against gamma-weighted transported consensus, then hands its single refined state to both the
