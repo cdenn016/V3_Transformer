@@ -1,7 +1,9 @@
 # V3_Transformer
 
 V3_Transformer is an experimental, target-blind structural-refinement sequence model.
-Each token is represented by a Gaussian belief and a local gauge frame. A forward pass
+Each token is represented by a configured distributional belief and a local gauge frame.
+The dataclass defaults, checked-in experiment, and preserved pure profile use Gaussian
+beliefs; the reusable engine also exposes a factorized Laplace family. A forward pass
 applies a finite number of transport-coupled refinement steps, then trains a next-token
 readout with a separate outer cross-entropy objective. The next-token target is absent
 from the internal refinement computation.
@@ -90,9 +92,11 @@ engine or the preserved pure profile.
 ### State construction
 
 `PriorBank.encode` maps token ids to a prior state `p_i` and initializes
-`q_i^(0) = p_i`. The selected belief family determines whether covariance is stored as a
-diagonal vector or a full SPD matrix. Token frames are combined with the selected
-positional construction before pair transport is evaluated.
+`q_i^(0) = p_i`. The diagonal Gaussian stores `sigma` as per-coordinate variance, the
+full Gaussian stores it as an SPD covariance matrix, and the factorized Laplace family
+reuses the same slot for its positive per-coordinate scale `b`, not for covariance. Token
+frames are combined with the selected positional construction before pair transport is
+evaluated.
 
 ### Optional model-channel refinement
 
