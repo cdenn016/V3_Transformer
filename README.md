@@ -278,7 +278,7 @@ When a [`RunArtifacts`](vfe3/run_artifacts.py) instance is supplied, a run direc
 | `test_results.json` | Held-out test evaluation after reloading the best checkpoint. |
 | `provenance.json` | Git, environment, and dataset provenance. |
 | `summary.json` | Headline end-of-run values and timing. |
-| `pure_path_report.json` | Configuration audit written when pure-path reporting is enabled. |
+| `pure_path_report.json` | Configuration audit attempted during every finalization; write failures are logged and skipped. |
 | `research.json` and figure files | Optional research probes and diagnostic or publication-oriented plots. |
 
 Cheap history figures are produced during finalization. Heavier replay figures obey
