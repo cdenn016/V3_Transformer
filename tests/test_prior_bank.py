@@ -70,7 +70,7 @@ def test_decode_matches_reference_across_table_routes(
         logits = pb.decode(mu_q, sigma_q, tau=1.7)
     with pytest.warns(RuntimeWarning, match="max_log=80"):
         ref = pb.reference_decode(mu_q, sigma_q, tau=1.7)
-    assert torch.allclose(logits, ref, atol=1e-3)
+    assert torch.allclose(logits, ref, atol=1e-3, rtol=0.0)
 
 
 def test_decode_tau_scaling():
