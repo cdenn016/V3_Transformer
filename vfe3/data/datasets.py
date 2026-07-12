@@ -8,11 +8,12 @@ The cache holds 1-D token-id streams under
 ``input = tokens[i:i+L]``, ``target = tokens[i+1:i+L+1]``. No neural code, no CLI.
 """
 
+import hashlib
 import json
 import os
 import re
 from pathlib import Path
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -67,6 +68,90 @@ def cache_path(
     _validate_path_component(split,   "split")
     root = default_cache_dir() if cache_dir is None else Path(cache_dir)
     return root / f"{dataset}_{split}_{_tokenizer_tag(dataset)}_tokens.{suffix}"
+
+
+def _sha256_file(path: Path) -> str:
+    r"""Stream ``path`` in fixed 1 MiB blocks and return its SHA-256 hex digest.
+
+    Reads the file in bounded blocks (never materializing the whole corpus in memory) so hashing a
+    multi-hundred-megabyte tokenized cache stays within a fixed working set.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+_CACHE_SOURCE_IDENTITY_MEMO: dict = {}
+
+
+def cache_source_identity(
+    dataset:   str,
+    split:     str = "validation",
+
+    *,
+    cache_dir: Optional[Path] = None,
+) -> Dict[str, object]:
+    r"""Return the tokenizer, format, byte size, and SHA-256 identity of one cache source.
+
+    Resolves the concrete cache file for ``dataset``/``split`` -- the ``.pt`` tensor cache first,
+    then the ``.bin`` memmap with its ``.meta.json`` sidecar -- and returns a mapping that binds
+    reuse to the EXACT bytes on disk: the resolved cache ``format``, byte ``size_bytes``, the
+    streamed ``sha256`` digest, the tokenizer tag, and (for ``.bin``) the parsed sidecar ``meta``
+    plus its own ``meta_sha256`` digest, so a corpus edit that leaves the binary untouched but
+    changes ``n_tokens`` is still caught. Raises ``FileNotFoundError`` when neither cache exists
+    (the caller treats an unhashable source as "forbid reuse").
+
+    Identities are memoized within one process by ``(resolved path, byte size, nanosecond mtime)``
+    so a sweep hashes each unchanged corpus once; a file that changes size or mtime lands under a
+    new key and is re-hashed, so the memo never serves a stale digest.
+    """
+    tokenizer_tag = _tokenizer_tag(dataset)
+    pt = cache_path(dataset, split, suffix="pt", cache_dir=cache_dir)
+    if pt.exists():
+        resolved = pt.resolve()
+        stat = resolved.stat()
+        key = ("pt", str(resolved), stat.st_size, stat.st_mtime_ns)
+        cached = _CACHE_SOURCE_IDENTITY_MEMO.get(key)
+        if cached is not None:
+            return dict(cached)
+        identity: Dict[str, object] = {
+            "format":        "pt",
+            "tokenizer_tag": tokenizer_tag,
+            "size_bytes":    int(stat.st_size),
+            "sha256":        _sha256_file(resolved),
+            "meta":          None,
+            "meta_sha256":   None,
+        }
+        _CACHE_SOURCE_IDENTITY_MEMO[key] = dict(identity)
+        return identity
+
+    binp = cache_path(dataset, split, suffix="bin", cache_dir=cache_dir)
+    if binp.exists():
+        resolved = binp.resolve()
+        stat = resolved.stat()
+        meta_path = Path(str(binp) + ".meta.json")
+        meta_stat = meta_path.stat() if meta_path.exists() else None
+        key = ("bin", str(resolved), stat.st_size, stat.st_mtime_ns,
+               (meta_stat.st_size, meta_stat.st_mtime_ns) if meta_stat is not None else None)
+        cached = _CACHE_SOURCE_IDENTITY_MEMO.get(key)
+        if cached is not None:
+            return dict(cached)
+        identity = {
+            "format":        "bin",
+            "tokenizer_tag": tokenizer_tag,
+            "size_bytes":    int(stat.st_size),
+            "sha256":        _sha256_file(resolved),
+            "meta":          (json.loads(meta_path.read_text()) if meta_path.exists() else None),
+            "meta_sha256":   (_sha256_file(meta_path) if meta_path.exists() else None),
+        }
+        _CACHE_SOURCE_IDENTITY_MEMO[key] = dict(identity)
+        return identity
+
+    raise FileNotFoundError(
+        f"no tokenized cache for {dataset!r}/{split!r}: tried {pt} and {binp}"
+    )
 
 
 def load_cached_tokens(

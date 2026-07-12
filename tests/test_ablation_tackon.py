@@ -31,41 +31,6 @@ def _write_marker(sweep_dir: Path, label: str, ppl: float) -> None:
     )
 
 
-def _write_resume_cell(
-    run_dir: Path,
-    marker: object,
-    *,
-    dataset: str = "wikitext-103",
-    max_steps=None,
-) -> None:
-    from dataclasses import asdict
-    from vfe3.config import VFE3Config
-
-    run_dir.mkdir()
-    cfg_dict = ablation._cell_cfg_dict({}, seed=6, max_steps=max_steps)
-    saved = {
-        "config": json.loads(json.dumps(asdict(VFE3Config(**cfg_dict)), default=str)),
-        "dataset": dataset,
-    }
-    (run_dir / "config.json").write_text(json.dumps(saved), encoding="utf-8")
-    (run_dir / "ablation_result.json").write_text(json.dumps(marker), encoding="utf-8")
-
-
-def _successful_marker(**updates) -> dict:
-    marker = {
-        "label": "cell",
-        "error_kind": None,
-        "status": "success",
-        "primary_val_ppl": 10.0,
-        "final_val_ppl": 10.0,
-        "seed": 6,
-        "collect_diagnostics": False,
-        "collect_extrapolation": False,
-    }
-    marker.update(updates)
-    return marker
-
-
 def test_collect_union_and_tack_on(tmp_path: Path) -> None:
     sweep_dir = tmp_path / "kappa"
     sweep_dir.mkdir()
@@ -178,125 +143,18 @@ def test_get_loader_threads_split_aware_shuffle_drop_last(monkeypatch) -> None:
     assert captured["train"].get("drop_last") is True
 
 
-def test_cell_is_current_false_on_dataset_change(tmp_path: Path) -> None:
-    r"""Resume must not serve a cell trained on a DIFFERENT dataset as current. The cell's
-    VFE3Config carries no dataset field (it is a session knob), so _cell_is_current must also
-    compare the persisted top-level config.json 'dataset' against the current session dataset.
-    The marker carries no max_tokens key (a pre-fix cell): a full-data resume (max_tokens=None)
-    must still read it as current (missing key == None, the backward-compat path)."""
-    run_dir = tmp_path / "cell"
-    _write_resume_cell(run_dir, _successful_marker())
-
-    assert ablation._cell_is_current(run_dir, {}, seed=6, dataset="wikitext-103") is True
-    assert ablation._cell_is_current(run_dir, {}, seed=6, dataset="wikitext-2") is False
-
-
-def test_cell_is_current_checks_max_tokens(tmp_path: Path) -> None:
-    r"""max_tokens (the loader train-token cap) is not a VFE3Config field, so config.json alone
-    cannot distinguish a capped smoke cell from a full run: _cell_is_current must also compare
-    the max_tokens persisted in the ablation_result.json marker."""
-    run_dir = tmp_path / "cell"
-    ds = "wikitext-103"
-    _write_resume_cell(run_dir, _successful_marker(max_tokens=1000), dataset=ds, max_steps=1)
-
-    assert ablation._cell_is_current(run_dir, {}, seed=6, dataset=ds, max_steps=1,
-                                     max_tokens=1000) is True
-    assert ablation._cell_is_current(run_dir, {}, seed=6, dataset=ds, max_steps=1,
-                                     max_tokens=None) is False
-
-
-def test_cell_is_current_rejects_failed_or_incomplete_markers(tmp_path: Path) -> None:
-    markers = [
-        [],
-        _successful_marker(status="failed", error_kind="train"),
-        _successful_marker(error_kind="train"),
-        _successful_marker(final_val_ppl=float("inf")),
-        _successful_marker(final_val_ppl=float("nan")),
-    ]
-    missing_status = _successful_marker()
-    missing_status.pop("status")
-    markers.append(missing_status)
-    missing_terminal = _successful_marker()
-    missing_terminal.pop("final_val_ppl")
-    markers.append(missing_terminal)
-
-    for i, marker in enumerate(markers):
-        run_dir = tmp_path / f"cell_{i}"
-        _write_resume_cell(run_dir, marker)
-        assert ablation._cell_is_current(
-            run_dir, {}, seed=6, dataset="wikitext-103",
-        ) is False
-
-
-def test_cell_is_current_requires_requested_diagnostic_output(tmp_path: Path) -> None:
-    flag_missing = tmp_path / "flag_missing"
-    _write_resume_cell(flag_missing, _successful_marker())
-    assert ablation._cell_is_current(
-        flag_missing, {}, seed=6, dataset="wikitext-103", collect_diagnostics=True,
-    ) is False
-
-    output_missing = tmp_path / "output_missing"
-    _write_resume_cell(output_missing, _successful_marker(collect_diagnostics=True))
-    assert ablation._cell_is_current(
-        output_missing, {}, seed=6, dataset="wikitext-103", collect_diagnostics=True,
-    ) is False
-
-    complete = tmp_path / "complete"
-    _write_resume_cell(complete, _successful_marker(
-        collect_diagnostics=True, attn_entropy=1.0,
-    ))
-    assert ablation._cell_is_current(
-        complete, {}, seed=6, dataset="wikitext-103", collect_diagnostics=True,
-    ) is True
-
-
-def test_cell_is_current_requires_requested_extrapolation_output(tmp_path: Path) -> None:
-    flag_missing = tmp_path / "flag_missing"
-    _write_resume_cell(flag_missing, _successful_marker())
-    assert ablation._cell_is_current(
-        flag_missing, {}, seed=6, dataset="wikitext-103", collect_extrapolation=True,
-    ) is False
-
-    output_missing = tmp_path / "output_missing"
-    _write_resume_cell(output_missing, _successful_marker(collect_extrapolation=True))
-    assert ablation._cell_is_current(
-        output_missing, {}, seed=6, dataset="wikitext-103", collect_extrapolation=True,
-    ) is False
-
-    complete = tmp_path / "complete"
-    _write_resume_cell(complete, _successful_marker(
-        collect_extrapolation=True, extrap_ce=[],
-    ))
-    assert ablation._cell_is_current(
-        complete, {}, seed=6, dataset="wikitext-103", collect_extrapolation=True,
-    ) is True
-
-
-def test_cell_is_current_requires_exact_boolean_request_flags(tmp_path: Path) -> None:
-    markers = []
-    missing_diagnostics = _successful_marker()
-    missing_diagnostics.pop("collect_diagnostics")
-    markers.append(missing_diagnostics)
-    missing_extrapolation = _successful_marker()
-    missing_extrapolation.pop("collect_extrapolation")
-    markers.append(missing_extrapolation)
-    markers.extend([
-        _successful_marker(collect_diagnostics=True, attn_entropy=1.0),
-        _successful_marker(collect_extrapolation=True, extrap_ce=[]),
-        _successful_marker(collect_diagnostics=1),
-        _successful_marker(collect_extrapolation=0),
-    ])
-
-    for i, marker in enumerate(markers):
-        run_dir = tmp_path / f"flag_{i}"
-        _write_resume_cell(run_dir, marker)
-        assert ablation._cell_is_current(
-            run_dir, {}, seed=6, dataset="wikitext-103",
-            collect_diagnostics=False, collect_extrapolation=False,
-        ) is False
-
-
 def test_run_sweep_markers_persist_requests_and_terminal_state(tmp_path: Path, monkeypatch) -> None:
+    # Per-cell _cell_is_current staleness (dataset / max_tokens / diagnostic-flag / marker-validity)
+    # is now bound to cell_contract.json and covered in tests/test_ablation_artifact_resume_20260712.py.
+    # Stub the contract's code + corpus identity so this run-sweep marker test stays fast, deterministic,
+    # and independent of any real tokenized cache on disk.
+    monkeypatch.setattr(ablation, "_git_code_identity",
+                        lambda: {"git_sha": "0" * 40, "git_dirty": False, "git_dirty_fingerprint": None})
+    monkeypatch.setattr(ablation, "cache_source_identity",
+                        lambda dataset, split, *, cache_dir=None: {
+                            "format": "pt", "tokenizer_tag": "tiktoken", "size_bytes": len(split),
+                            "sha256": "0" * 64, "meta": None, "meta_sha256": None})
+
     sweep_name = "marker_contract"
     monkeypatch.setitem(ablation.SWEEPS, sweep_name, {
         "description": "marker contract test",
@@ -347,6 +205,12 @@ def test_run_sweep_markers_persist_requests_and_terminal_state(tmp_path: Path, m
     assert markers["failure"]["error_kind"] == "train"
     assert "final_val_ppl" in markers["failure"]
     assert not math.isfinite(markers["failure"]["final_val_ppl"])
+
+    # A reuse contract is published only for the successful cell (never for the failed one).
+    success_dir = tmp_path / sweep_name / ablation._sanitize("success")
+    failure_dir = tmp_path / sweep_name / ablation._sanitize("failure")
+    assert (success_dir / "cell_contract.json").exists()
+    assert not (failure_dir / "cell_contract.json").exists()
 
 
 def test_expand_range_sign_mismatch_raises() -> None:
