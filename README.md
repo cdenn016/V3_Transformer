@@ -76,7 +76,7 @@ $$
 \begin{aligned}
 q_i &= \mathcal N(\mu_i,\Sigma_i), &
 \mu_i &\in \mathbb R^K, &
-\Sigma_i &\in \operatorname{SPD}(K), \\
+\Sigma_i &\in \mathrm{SPD}(K), \\
 A_i &= \sum_a \phi_i^a G_a \in \mathfrak g, &
 \widehat A_i
 &= \begin{cases}
@@ -85,9 +85,9 @@ A_i, & \lVert A_i\rVert_F\leq 20, \\
 \end{cases} \\
 U_i &= \exp(\widehat A_i), &
 \Omega_{ij} &= U_iU_j^{-1}, \\
-G_{\mathrm{block}} &= \prod_{h=1}^{H}\operatorname{GL}(d_h), &
+G_{\mathrm{block}} &= \prod_{h=1}^{H}\mathrm{GL}(d_h), &
 d_h &= K/H, &
-U_i &= \operatorname{diag}\left(U_i^{(1)},\ldots,U_i^{(H)}\right).
+U_i &= \mathrm{diag}\left(U_i^{(1)},\ldots,U_i^{(H)}\right).
 \end{aligned}
 $$
 
@@ -97,32 +97,32 @@ constant. Outer frame gradients therefore differentiate through the scaled matri
 are not the derivative of the displayed radial normalization.
 
 The checked-in specialization has $K=20$, $H=2$, and $d_h=10$, so its effective frame has two
-$\operatorname{GL}^{+}(10)$ blocks. Every real matrix exponential has positive determinant, but
+$\mathrm{GL}^{+}(10)$ blocks. Every real matrix exponential has positive determinant, but
 the real exponential map is not surjective onto the positive-determinant component. Within
 $\lVert A_i\rVert_F\leq20$, the map agrees with the ordinary exponential parameterization. Outside
 that region, the safeguard collapses radial magnitudes onto the norm-20 boundary, so the effective
 map is not itself a chart. Its joint frame image is restricted to
 $\exp\{B\in\mathfrak g:\lVert B\rVert_F\leq20\}$, a strict subset of the unclamped block-group
 exponential image; each block remains in
-$\operatorname{image}(\exp:\mathfrak{gl}(10)\to\operatorname{GL}^{+}(10))
-\subsetneq\operatorname{GL}^{+}(10)$.
+$\mathrm{im}(\exp:\mathfrak{gl}(10)\to\mathrm{GL}^{+}(10))
+\subsetneq\mathrm{GL}^{+}(10)$.
 
 For an ambient full Gaussian, transport is the exact pushforward. The checked-in diagonal family
 uses the reusable engine's projected covariance operation, where $\sigma_j$ is a variance vector
-and $\operatorname{Diag}(\sigma_j)$ is its diagonal covariance matrix:
+and $\mathrm{Diag}(\sigma_j)$ is its diagonal covariance matrix:
 
 $$
 \begin{aligned}
 \widetilde\mu_{ij} &= \Omega_{ij}\mu_j, \\
 \widetilde\Sigma_{ij} &= \Omega_{ij}\Sigma_j\Omega_{ij}^{\top}, \\
-\widetilde\sigma_{ij} &= \operatorname{diag}\left(
-\Omega_{ij}\operatorname{Diag}(\sigma_j)\Omega_{ij}^{\top}
+\widetilde\sigma_{ij} &= \mathrm{diag}\left(
+\Omega_{ij}\mathrm{Diag}(\sigma_j)\Omega_{ij}^{\top}
 \right).
 \end{aligned}
 $$
 
 Unrestricted congruence is exact and closed on full covariances. It is not closed on the diagonal
-family under a general $\operatorname{GL}(K)$ transport: the diagonal cone is preserved for every
+family under a general $\mathrm{GL}(K)$ transport: the diagonal cone is preserved for every
 diagonal input only by monomial transformations. The final line above is therefore a diagonal
 projection of a full covariance sandwich, not an unrestricted gauge action within the diagonal
 family.
@@ -135,7 +135,7 @@ $$
 \begin{aligned}
 D_{\mathrm{KL}}(P\Vert Q)
 &= \frac12\left[
-\operatorname{tr}(\Sigma_Q^{-1}\Sigma_P)
+\mathrm{tr}(\Sigma_Q^{-1}\Sigma_P)
 +(\mu_P-\mu_Q)^{\top}\Sigma_Q^{-1}(\mu_P-\mu_Q)
 -K
 +\log\frac{\det\Sigma_Q}{\det\Sigma_P}
@@ -163,11 +163,11 @@ transport obeys a flat cocycle:
 
 $$
 \begin{aligned}
-q_i' &= (h_i)_*q_i, &
-q_j' &= (h_j)_*q_j, &
+q_i' &= (h_i)_{\ast}q_i, &
+q_j' &= (h_j)_{\ast}q_j, &
 \Omega_{ij}' &= h_i\Omega_{ij}h_j^{-1}, \\
-D_{\mathrm{KL}}\left(q_i'\Vert(\Omega_{ij}')_*q_j'\right)
-&= D_{\mathrm{KL}}\left(q_i\Vert(\Omega_{ij})_*q_j\right), \\
+D_{\mathrm{KL}}\left(q_i'\Vert(\Omega_{ij}')_{\ast}q_j'\right)
+&= D_{\mathrm{KL}}\left(q_i\Vert(\Omega_{ij})_{\ast}q_j\right), \\
 \Omega_{ij}\Omega_{jk} &= \Omega_{ik}, &
 \Omega_{ij}\Omega_{jk}\Omega_{ki} &= I.
 \end{aligned}
@@ -194,7 +194,7 @@ $$
 +\tau_h\sum_j\beta_{ij}^{(h)}
 \log\frac{\beta_{ij}^{(h)}}{\pi_{ij}^{(h)}}, \\
 \tau_h &= \kappa_\beta\sqrt{d_h}, \\
-\beta_{ij}^{(h)*}
+\beta_{ij}^{(h)\ast}
 &= \frac{\pi_{ij}^{(h)}\exp\left(-E_{ij}^{(h)}/\tau_h\right)}
 {\sum_k\pi_{ik}^{(h)}\exp\left(-E_{ik}^{(h)}/\tau_h\right)}.
 \end{aligned}
@@ -231,13 +231,13 @@ E_{ij}^{q,h}
 +\tau_{\beta,h}\log\frac{\beta_{ij}^{(h)}}{\pi_{ij}^{q,h}}
 \right], \\
 R(a) &:= b_0a-c_0\log a, &
-a_i^* &:= \frac{c_0}{b_0+D(q_i\Vert p_i)}.
+a_i^{\ast} &:= \frac{c_0}{b_0+D(q_i\Vert p_i)}.
 \end{aligned}
 $$
 
 The optional detached two-hop coefficient is zero in the checked-in profile. Here $b_0=c_0=1$
 and the only belief iteration starts from $q_i^{(0)}=p_i$. It therefore evaluates
-$D(q_i^{(0)}\Vert p_i)=0$ and $a_i^*=1$ at that initialization; this value is not asserted away
+$D(q_i^{(0)}\Vert p_i)=0$ and $a_i^{\ast}=1$ at that initialization; this value is not asserted away
 from that state.
 
 The model channel has its own target-blind objective. It balances the same-scale hyper-prior
@@ -271,12 +271,12 @@ space:
 $$
 \begin{aligned}
 \rho_j
-&:= -\log\left(2+\operatorname{tr}\Sigma_{s,j}^{(1)}\right), &
+&:= -\log\left(2+\mathrm{tr}\Sigma_{s,j}^{(1)}\right), &
 \pi_{hij}^{b}
-&:= \operatorname{softmax}_j\left(B_{hij}^{q}+\rho_j\right), \\
+&:= \mathrm{softmax}_j\left(B_{hij}^{q}+\rho_j\right), \\
 \overline\pi_{hij}^{q}
 &:= (1-w)\pi_{hij}^{b}
-+w\operatorname{stopgrad}\left(\gamma_{ij}^{(h)}\right), &
++w\mathrm{stopgrad}\left(\gamma_{ij}^{(h)}\right), &
 w&=0.5.
 \end{aligned}
 $$
@@ -288,23 +288,23 @@ edge.
 
 For the active diagonal-KL `mm_exact` route, let $h(k)$ be the head containing coordinate $k$.
 Hold the attention weights, transported keys, current self coefficient, and clamp masks fixed.
-Absorb the self mask into $c_{ik}:=m_i^{\mathrm{self}}a_i^*$ and use the strict pair mask in the
+Absorb the self mask into $c_{ik}:=m_i^{\mathrm{self}}a_i^{\ast}$ and use the strict pair mask in the
 nonnegative effective pair weight. On a nondegenerate coordinate, the precision fusion is
 
 $$
 \begin{aligned}
-c_{ik} &:= m_i^{\mathrm{self}}a_i^*\geq 0, &
+c_{ik} &:= m_i^{\mathrm{self}}a_i^{\ast}\geq 0, &
 m_{ij}^{(h)} &:= \mathbf 1\left\{0<E_{ij}^{(h)}<K_{\max}\right\}, \\
 w_{ijk} &:= \lambda_\beta m_{ij}^{(h(k))}\beta_{ij}^{(h(k))}\geq 0, \\
 P_{ik}
 &:= \frac{c_{ik}}{\sigma_{p,ik}}
 +\sum_j\frac{w_{ijk}}{\widetilde\sigma_{ij,k}}, \\
-\mu_{ik}^{*}
+\mu_{ik}^{\ast}
 &:= \frac{
 c_{ik}\mu_{p,ik}/\sigma_{p,ik}
 +\sum_jw_{ijk}\widetilde\mu_{ij,k}/\widetilde\sigma_{ij,k}
 }{P_{ik}}, &
-\sigma_{ik}^{*}
+\sigma_{ik}^{\ast}
 &:= \frac{c_{ik}+\sum_jw_{ijk}}{P_{ik}}.
 \end{aligned}
 $$
@@ -324,11 +324,11 @@ same damping value but freezes covariance, so its mean is damped directly in mea
 $$
 \begin{aligned}
 \Lambda &:= \Sigma^{-1}, &
-\Lambda^{+} &:= (1-\eta)\Lambda+\eta\Lambda^{*}, \\
+\Lambda^{+} &:= (1-\eta)\Lambda+\eta\Lambda^{\ast}, \\
 (\Lambda\mu)^{+}
-&:= (1-\eta)\Lambda\mu+\eta\Lambda^{*}\mu^{*}, &
+&:= (1-\eta)\Lambda\mu+\eta\Lambda^{\ast}\mu^{\ast}, &
 \eta&=0.75, \\
-\mu^{(1)}&=0.25\mu^{(0)}+0.75\mu^{*}, &
+\mu^{(1)}&=0.25\mu^{(0)}+0.75\mu^{\ast}, &
 \sigma^{(1)}&=\sigma^{(0)}, &
 \phi^{(1)}&=\phi^{(0)}.
 \end{aligned}
@@ -347,7 +347,7 @@ $$
 \widetilde\nabla_{\mu}\mathcal F
 &:= \Sigma\nabla_{\mu}\mathcal F, &
 \widetilde\nabla_{\Sigma}\mathcal F
-&:= 2\Sigma\operatorname{sym}\left(\nabla_{\Sigma}\mathcal F\right)\Sigma, \\
+&:= 2\Sigma\mathrm{sym}\left(\nabla_{\Sigma}\mathcal F\right)\Sigma, \\
 \widetilde\nabla_{\mu}\mathcal F
 &:= \sigma\odot\nabla_{\mu}\mathcal F, &
 \widetilde\nabla_{\sigma}\mathcal F
@@ -421,7 +421,7 @@ the next block prior. With one layer, that inter-block handoff has no downstream
 ### Decode and outer objective
 
 Two alternative registered decode boundaries map the refined belief to vocabulary logits. Let
-$m_i$ be the mean of $q_i^*$, let $W_v$ and $b_v$ be the linear readout parameters for vocabulary
+$m_i$ be the mean of $q_i^{\ast}$, let $W_v$ and $b_v$ be the linear readout parameters for vocabulary
 item $v$, and let $p_v^{\mathrm{decode}}$ be its decode-bank Gaussian prior. With $M$ equal to the
 number of targets not masked by $-100$, the two logit boundaries and the supervised objective are
 
@@ -429,12 +429,12 @@ $$
 \begin{aligned}
 z_{iv} &= m_i^{\top}W_v+b_v
 && \text{(linear boundary)}, \\
-z_{iv} &= -\frac{D_{\mathrm{KL}}\left(q_i^*\Vert p_v^{\mathrm{decode}}\right)}
+z_{iv} &= -\frac{D_{\mathrm{KL}}\left(q_i^{\ast}\Vert p_v^{\mathrm{decode}}\right)}
 {\tau_{\mathrm{decode}}}
 && \text{(KL-to-prior boundary)}, \\
 \mathcal L_{\mathrm{CE}}
 &= -\frac{1}{M}\sum_{b,i:y_{bi}\ne-100}
-\log\operatorname{softmax}(z_{bi})_{y_{bi}}.
+\log\mathrm{softmax}(z_{bi})_{y_{bi}}.
 \end{aligned}
 $$
 
