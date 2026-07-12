@@ -214,6 +214,327 @@ with another registered divergence still defines a Gibbs source-selection rule, 
 not by itself define an ELBO or make the complete training loop optimize one variational
 free energy.
 
+## Full variational free energy: continuum theory and the 0D language model
+
+### Evidence bound on an explicit support
+
+Let $(\mathcal X,\nu)$ be a latent measured space, let $p_\theta(o,x)$ be a normalized
+joint density, and let $q(x)$ be a variational density. Assume $p_\theta(o)>0$,
+$q\ll p_\theta(\cdot\mid o)$, and finite displayed integrals. The ordinary single-system
+variational free energy is the negative of the evidence lower bound:
+
+$$
+\begin{aligned}
+\mathcal F[q,\theta;o]
+&:= \int_{\mathrm{supp}(q)}q(x)
+\log\frac{q(x)}{p_\theta(o,x)}d\nu(x) \\
+&= \int_{\mathrm{supp}(q)}q(x)
+\log\frac{q(x)}{p_\theta(x\mid o)}d\nu(x)
+-\log p_\theta(o) \\
+&= \int_{\mathrm{supp}(q)}q(x)
+\log\frac{q(x)}{p_\theta(x)}d\nu(x)
+-\int_{\mathrm{supp}(q)}q(x)
+\log p_\theta(o\mid x)d\nu(x) \\
+&=D_{\mathrm{KL}}\left(q\Vert p_\theta(\cdot\mid o)\right)
+-\log p_\theta(o)
+\geq -\log p_\theta(o).
+\end{aligned}
+$$
+
+The first integral is the definition, the second equality substitutes Bayes' rule, and the third
+splits the joint density into prior and likelihood. The bound follows from nonnegativity of
+forward KL. If the required absolute continuity fails, the corresponding KL and free energy are
+$+\infty$ rather than a finite objective.
+
+The interacting theory below retains this complexity-minus-accuracy structure and adds
+gauge-transported consensus energies. Those source components contain neighboring variational
+beliefs, so the population functional is an engineered consensus-energy extension; it is not, in
+general, the KL of one variational distribution against a fixed global generative model. The
+single-system evidence bound above therefore does not become an end-to-end evidence-bound theorem
+for the coupled population merely by adding the alignment sectors.
+
+### Continuum functional with base and fiber supports
+
+Let $\mathcal C$ be a base manifold equipped with measure $\mu_{\mathcal C}$. Agent $i$ is
+present through a smooth support field $\chi_i:\mathcal C\to[0,1]$, with pair support
+$\chi_{ij}(c):=\chi_i(c)\chi_j(c)$. At $c\in\mathcal C$, the densities
+$q_i(k\mid c)$ and $p_i(k\mid c)$ live on the state fiber with reference measure
+$\nu^q_{i,c}$, while $s_i(m\mid c)$ and $r_i(m\mid c)$ live on the model fiber with reference
+measure $\nu^s_{i,c}$. Define the corresponding probability measures by
+
+$$
+\begin{aligned}
+dQ_i^c(k)&:=q_i(k\mid c)d\nu^q_{i,c}(k), &
+dP_i^c(k)&:=p_i(k\mid c)d\nu^q_{i,c}(k), \\
+dS_i^c(m)&:=s_i(m\mid c)d\nu^s_{i,c}(m), &
+dR_i^c(m)&:=r_i(m\mid c)d\nu^s_{i,c}(m).
+\end{aligned}
+$$
+
+Define the active fiber supports
+$\mathcal K_i(c):=\mathrm{supp}(q_i(\cdot\mid c))$ and
+$\mathcal M_i(c):=\mathrm{supp}(s_i(\cdot\mid c))$.
+
+When the transported source measures are dominated by the receiver reference measures, write their
+Radon–Nikodym densities as
+
+$$
+\begin{aligned}
+\overline q_{j\to i}(k\mid c)
+&:=\frac{d\left[(\Omega^q_{ij}(c))_{\ast}Q_j^c\right]}
+{d\nu^q_{i,c}}(k), \\
+\overline s_{j\to i}(m\mid c)
+&:=\frac{d\left[(\Omega^s_{ij}(c))_{\ast}S_j^c\right]}
+{d\nu^s_{i,c}}(m).
+\end{aligned}
+$$
+
+The state self-divergence, model hyper-prior divergence, two transported comparison energies,
+and observation accuracy are then explicit support integrals:
+
+$$
+\begin{aligned}
+\mathcal D_i^q(c)
+&:=D_{\mathrm{KL}}(Q_i^c\Vert P_i^c) \\
+&=\int_{\mathcal K_i(c)}q_i(k\mid c)
+\log\frac{q_i(k\mid c)}{p_i(k\mid c)}d\nu^q_{i,c}(k), \\
+\mathcal D_i^s(c)
+&:=D_{\mathrm{KL}}(S_i^c\Vert R_i^c) \\
+&=\int_{\mathcal M_i(c)}s_i(m\mid c)
+\log\frac{s_i(m\mid c)}{r_i(m\mid c)}d\nu^s_{i,c}(m), \\
+\mathcal E_{ij}^q(c)
+&:=D_{\mathrm{KL}}\left(Q_i^c\Vert(\Omega^q_{ij}(c))_{\ast}Q_j^c\right) \\
+&=\int_{\mathcal K_i(c)}q_i(k\mid c)
+\log\frac{q_i(k\mid c)}{\overline q_{j\to i}(k\mid c)}d\nu^q_{i,c}(k), \\
+\mathcal E_{ij}^s(c)
+&:=D_{\mathrm{KL}}\left(S_i^c\Vert(\Omega^s_{ij}(c))_{\ast}S_j^c\right) \\
+&=\int_{\mathcal M_i(c)}s_i(m\mid c)
+\log\frac{s_i(m\mid c)}{\overline s_{j\to i}(m\mid c)}d\nu^s_{i,c}(m), \\
+\mathcal A_i(c)
+&:=\int_{\mathcal K_i(c)}q_i(k\mid c)
+\log p_\theta\left(o_i(c)\mid k,m_i(c),c\right)d\nu^q_{i,c}(k).
+\end{aligned}
+$$
+
+The measure-level KL definitions are primary. Each transported comparison is $+\infty$ unless its
+receiver measure is absolutely continuous with respect to the transported source measure. The
+density equalities additionally require the displayed common dominating measures; ambient
+Gaussian fibers satisfy that condition. Finiteness of the self-sectors likewise requires
+$Q_i^c\ll P_i^c$ and $S_i^c\ll R_i^c$. The model parameter $m_i(c)$ is held fixed inside the
+observation expectation, matching the canonical PIFB functional's expectation over $q_i$.
+
+Let $\pi_{ij}^{q}(c)$ and $\pi_{ij}^{s}(c)$ be pre-mask source priors. Absorb pair support into
+normalized active-row priors. The row masses and their domains are
+
+$$
+\begin{aligned}
+\rho_i^q(c)&:=\sum_\ell\chi_{i\ell}(c)\pi_{i\ell}^{q}(c), &
+\mathcal C_i^q&:=\lbrace c\in\mathcal C:\rho_i^q(c)>0\rbrace, \\
+\rho_i^s(c)&:=\sum_\ell\chi_{i\ell}(c)\pi_{i\ell}^{s}(c), &
+\mathcal C_i^s&:=\lbrace c\in\mathcal C:\rho_i^s(c)>0\rbrace, \\
+\widetilde\pi_{ij}^{q}(c)
+&:=\frac{\chi_{ij}(c)\pi_{ij}^{q}(c)}{\rho_i^q(c)},
+& c&\in\mathcal C_i^q, \\
+\widetilde\pi_{ij}^{s}(c)
+&:=\frac{\chi_{ij}(c)\pi_{ij}^{s}(c)}{\rho_i^s(c)},
+& c&\in\mathcal C_i^s, \\
+\beta_{ij}(c)&\geq0, & \sum_j\beta_{ij}(c)&=1,
+& c&\in\mathcal C_i^q, \\
+\gamma_{ij}(c)&\geq0, & \sum_j\gamma_{ij}(c)&=1,
+& c&\in\mathcal C_i^s.
+\end{aligned}
+$$
+
+Rows are defined only on active receiver support. Every row sum below is restricted to entries with
+positive normalized prior; forbidden entries have $\beta_{ij}=\gamma_{ij}=0$. We use the
+continuous extension $0\log(0/\pi)=0$ for $\pi>0$, while positive mass on a zero-prior source
+has infinite categorical KL. For fixed $c\in\mathcal C_i^q$, use the source-independent
+factorization
+$\mathcal Q_i(k,j\mid c)=\beta_{ij}(c)q_i(k\mid c)$ and
+$\mathcal P_i(k,j\mid c)=\widetilde\pi_{ij}^{q}(c)\overline q_{j\to i}(k\mid c)$. Each complete
+belief row at unit temperature is then exactly a KL on the joint source-state space:
+
+$$
+\begin{aligned}
+D_{\mathrm{KL}}(\mathcal Q_i\Vert\mathcal P_i)
+&=\sum_j\int_{\mathcal K_i(c)}\beta_{ij}(c)q_i(k\mid c)
+\log\frac{\beta_{ij}(c)q_i(k\mid c)}
+{\widetilde\pi_{ij}^{q}(c)\overline q_{j\to i}(k\mid c)}d\nu^q_{i,c}(k) \\
+&=\sum_j\beta_{ij}(c)
+\left[
+\mathcal E_{ij}^q(c)
++\log\frac{\beta_{ij}(c)}{\widetilde\pi_{ij}^{q}(c)}
+\right].
+\end{aligned}
+$$
+
+The model identity follows by replacing
+$(q,\overline q,\beta,\widetilde\pi^q)$ with
+$(s,\overline s,\gamma,\widetilde\pi^s)$. A general positive temperature scales the
+categorical relative entropy and yields the tempered row objective derived in the preceding
+section. With channel temperatures $\tau_\beta,\tau_\gamma>0$ and model hyper-prior weight
+$\lambda_h>0$, the canonical one-scale continuum functional is
+
+$$
+\begin{aligned}
+\mathcal F_{\mathcal C}
+&:=\sum_i\int_{\mathcal C}\chi_i(c)\mathcal D_i^q(c)d\mu_{\mathcal C}(c) \\
+&\quad+\lambda_h\sum_i\int_{\mathcal C}
+\chi_i(c)\mathcal D_i^s(c)d\mu_{\mathcal C}(c) \\
+&\quad+\sum_{i,j}\int_{\mathcal C_i^q}\beta_{ij}(c)
+\left[
+\mathcal E_{ij}^q(c)
++\tau_\beta\log\frac{\beta_{ij}(c)}{\widetilde\pi_{ij}^{q}(c)}
+\right]d\mu_{\mathcal C}(c) \\
+&\quad+\sum_{i,j}\int_{\mathcal C_i^s}\gamma_{ij}(c)
+\left[
+\mathcal E_{ij}^s(c)
++\tau_\gamma\log\frac{\gamma_{ij}(c)}{\widetilde\pi_{ij}^{s}(c)}
+\right]d\mu_{\mathcal C}(c) \\
+&\quad-\sum_i\int_{\mathcal C}\chi_i(c)\mathcal A_i(c)d\mu_{\mathcal C}(c).
+\end{aligned}
+$$
+
+At a populated hierarchy scale $\zeta$, the parent meta-agent $I=\mathrm{pa}(i)$ supplies the
+state prior and model hyper-prior as cross-scale transported shadows:
+
+$$
+\begin{aligned}
+p_i^{(\zeta)}
+&=\left(\Omega_{iI}^{q,(\zeta)}\right)_{\ast}q_I^{(\zeta+1)}, \\
+r_i^{(\zeta)}
+&=\left(\Omega_{iI}^{s,(\zeta)}\right)_{\ast}s_I^{(\zeta+1)}.
+\end{aligned}
+$$
+
+Adding the scale superscript to every field gives the same five-sector functional at each
+populated scale under the PIFB closure ansatz. The arrows $r\to s$ and $p\to q$ are therefore
+within-fiber prior relations, while the construction of $p$ and $r$ is cross-scale; it is not a
+same-scale causal chain $s\to p$.
+
+This is the full, unminimized functional: $\beta$ and $\gamma$ remain variational row fields and
+their categorical relative entropies are present. The canonical state self-term has unit weight.
+Its adaptive-precision extension replaces the first integrand by
+
+$$
+\begin{aligned}
+\mathcal D_i^q(c)
+&\longmapsto a_i(c)\mathcal D_i^q(c)+R(a_i(c)), \\
+R(a)&:=b_0a-c_0\log a, \\
+a_i^{\ast}(c)&=\frac{c_0}{b_0+\mathcal D_i^q(c)},
+\qquad b_0,c_0>0.
+\end{aligned}
+$$
+
+The regularizer is part of the adaptive functional; dropping it changes both the optimum and the
+envelope derivative. Setting $a_i=1$ and $R=0$ recovers the canonical self-sector.
+
+Minimizing the active row fields while holding beliefs, transports, supports, and priors fixed
+gives
+
+$$
+\begin{aligned}
+Z_i^q(c)
+&:=\sum_j\widetilde\pi_{ij}^{q}(c)
+\exp\left[-\mathcal E_{ij}^q(c)/\tau_\beta\right], \\
+Z_i^s(c)
+&:=\sum_j\widetilde\pi_{ij}^{s}(c)
+\exp\left[-\mathcal E_{ij}^s(c)/\tau_\gamma\right], \\
+\beta_{ij}^{\ast}(c)
+&=\frac{\widetilde\pi_{ij}^{q}(c)
+\exp\left[-\mathcal E_{ij}^q(c)/\tau_\beta\right]}{Z_i^q(c)}, \\
+\gamma_{ij}^{\ast}(c)
+&=\frac{\widetilde\pi_{ij}^{s}(c)
+\exp\left[-\mathcal E_{ij}^s(c)/\tau_\gamma\right]}{Z_i^s(c)}.
+\end{aligned}
+$$
+
+Substitution turns each complete energy-plus-entropy row into $-\tau_\beta\log Z_i^q(c)$ or
+$-\tau_\gamma\log Z_i^s(c)$. The entropy-suppressed sums
+$\sum_j\beta_{ij}^{\ast}\mathcal E_{ij}^q$ and
+$\sum_j\gamma_{ij}^{\ast}\mathcal E_{ij}^s$ are different scalar functions, not alternate
+spellings of that reduced envelope.
+
+### Zero-dimensional language-model specialization
+
+For the transformer, collapse the base to one point
+$\mathcal C_0=\lbrace c_0\rbrace$ with $\mu_{\mathcal C_0}(\lbrace c_0\rbrace)=1$ and
+$\chi_i(c_0)=1$ for every present token. Then
+
+$$
+\int_{\mathcal C_0}\chi_i(c)f_i(c)d\mu_{\mathcal C_0}(c)=f_i(c_0).
+$$
+
+All base-coordinate derivatives disappear; $i$ now indexes token-agents, and causal or padding
+support is carried by finite active source sets $\mathcal J_i^{q,h}$ and
+$\mathcal J_i^{s,h}$ and their normalized priors rather than by a spatial support field. The
+general zero-dimensional library supports an undivided fiber or registered unequal irreducible
+blocks. The
+checked-in `block_glk` profile splits each state and model fiber into $H$ equal blocks of dimension
+$d_h=K/H$. The repository also exposes positive whole-sector scales $\lambda_\beta$ and
+$\lambda_\gamma$; because each multiplies an entire row functional, neither changes that row's
+Gibbs minimizer. The resulting observation-inclusive KL reference for that equal-block profile is
+
+$$
+\begin{aligned}
+\mathcal F_{\mathrm{0D}}^{\mathrm{KL}}
+&:=\sum_i\left[a_iD_{\mathrm{KL}}(q_i\Vert p_i)+R(a_i)\right]
++\lambda_h\sum_iD_{\mathrm{KL}}(s_i\Vert r) \\
+&\quad+\lambda_\beta\sum_{h,i}\sum_{j\in\mathcal J_i^{q,h}}
+\beta_{ij}^{(h)}
+\left[
+E_{ij}^{q,h}
++\tau_{\beta,h}\log\frac{\beta_{ij}^{(h)}}{\pi_{ij}^{q,h}}
+\right] \\
+&\quad+\lambda_\gamma\sum_{h,i}\sum_{j\in\mathcal J_i^{s,h}}
+\gamma_{ij}^{(h)}
+\left[
+E_{ij}^{s,h}
++\tau_{\gamma,h}\log\frac{\gamma_{ij}^{(h)}}{\pi_{ij}^{s,h}}
+\right] \\
+&\quad-\sum_i\mathbb E_{k_i\sim q_i}
+\left[\log p_\theta(o_i\mid k_i,m_i)\right],
+\end{aligned}
+$$
+
+where
+
+$$
+\begin{aligned}
+E_{ij}^{q,h}
+&:=D_{\mathrm{KL}}\left(
+q_i^{(h)}\Vert(\Omega_{ij}^{q,h})_{\ast}q_j^{(h)}
+\right), \\
+E_{ij}^{s,h}
+&:=D_{\mathrm{KL}}\left(
+s_i^{(h)}\Vert(\Omega_{ij}^{s,h})_{\ast}s_j^{(h)}
+\right), \\
+\tau_{\beta,h}&:=\kappa_\beta\sqrt{d_h}, &
+\tau_{\gamma,h}&:=\kappa_\gamma\sqrt{d_h}, \\
+\sum_{j\in\mathcal J_i^{q,h}}\beta_{ij}^{(h)}&=1, &
+\sum_{j\in\mathcal J_i^{s,h}}\gamma_{ij}^{(h)}&=1.
+\end{aligned}
+$$
+
+In the checked-in tied-frame, flat-transport route,
+$\Omega_{ij}^{s,h}=\Omega_{ij}^{q,h}=\Omega_{ij}^{(h)}$; an independent model-frame registry
+entry can replace the model transport. The one-step model refinement then supplies
+$q_i^{(0)}=p_i=s_i^{(1)}$, and the continuum hyper-prior field $r_i(c)$ specializes to the
+global token-independent $r$. At `renyi_order=1.0`, the registered Rényi family selects the
+forward-KL formula required by the evidence-bound and joint-mixture readings. The executable
+diagonal route can subsequently project transported covariances and clamp scalar energies, so its
+reported comparison energy need not equal the ambient support integral everywhere. Other
+registered divergences retain the fixed-energy Gibbs row algebra but define generalized structural
+objectives rather than the negative ELBO displayed above.
+
+The last observation term completes the theoretical 0D VFE; it is not active inside the deployed
+model or belief refinements. The checked-in path first performs one target-blind $s$ refinement,
+sets $q^{(0)}=p=s^{(1)}$, and then performs one target-blind $q$ refinement. A separate linear
+decode and next-token cross-entropy train parameters through those finite unrolled updates. The
+implementation therefore constructs an inferred state with the two structural free-energy slices;
+it does not minimize $\mathcal F_{\mathrm{0D}}^{\mathrm{KL}}$ end to end or establish monotone
+descent of one shared ELBO.
+
 ## Inner objectives and executable updates
 
 The belief channel is defined relative to a target-blind structural objective. Its one-hop term
