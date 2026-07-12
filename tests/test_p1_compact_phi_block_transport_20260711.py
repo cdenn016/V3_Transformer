@@ -630,6 +630,30 @@ def _tiny_two_channel_config(compact: bool) -> VFE3Config:
     )
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_gamma_energy_forwards_transport_mean_per_head_for_both_factor_layouts(
+    monkeypatch: pytest.MonkeyPatch,
+    compact:     bool,
+) -> None:
+    model = VFEModel(_tiny_two_channel_config(compact)).eval()
+    token_ids = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long)
+    phi = model.prior_bank.encode(token_ids).phi
+    seen: list[object] = []
+    original = e_step_module.build_belief_transport
+
+    def _spy(*args: object, **kwargs: object) -> object:
+        result = original(*args, **kwargs)
+        seen.append(result)
+        return result
+
+    monkeypatch.setattr(e_step_module, "build_belief_transport", _spy)
+    model._gamma_energy(token_ids, phi)
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], (CompactFactoredTransport, FactoredTransport))
+    assert seen[0].mean_per_head is True
+
+
 def test_compact_phi_block_transport_reaches_shared_and_gamma_model_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
