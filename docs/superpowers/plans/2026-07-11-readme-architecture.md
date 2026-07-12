@@ -14,14 +14,12 @@
 - Treat `origin/main` commit `01204cfb7374` as the traced implementation baseline unless a fresh fetch shows that it advanced.
 - Do not modify source, configuration, tests, manuscripts, run artifacts, or the Research vault.
 - Use American English and avoid the project's banned prose patterns.
-- Do not use LaTeX spacing macros `\;`, `\,`, or `\!`.
+- Do not use the repository's forbidden LaTeX spacing commands.
 - Do not claim that finite internal refinements converge, that the complete training loop optimizes one ELBO/VFE, or that the diagonal family realizes exact unrestricted GL(K) invariance.
 - Do not report historical pass counts or benchmark results in the README.
 - Do not run pytest; the user explicitly waived tests for this documentation task.
 - Update `docs/2026-07-11-edits.md`, the existing same-day post-edit record.
 - Preserve every file and configuration change in the user's live checkout.
-
----
 
 ### Task 1: Replace the README with the approved expert architecture document
 
