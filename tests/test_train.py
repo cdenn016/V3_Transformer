@@ -1,8 +1,10 @@
 import csv
 import gc
+import json
 import logging
 import math
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,8 +14,16 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts
-from vfe3.train import build_optimizer, evaluate, lr_lambda, train, train_step, _floor_lr_lambdas
+from vfe3.run_artifacts import RunArtifacts, finalize_validation_run, load_checkpoint
+from vfe3.train import (
+    TrainingTerminalState,
+    build_optimizer,
+    evaluate,
+    lr_lambda,
+    train,
+    train_step,
+    _floor_lr_lambdas,
+)
 
 
 def test_optimizer_groups_priors_by_m_lr():
@@ -712,3 +722,257 @@ def test_select_loader_raises_on_missing_cache(monkeypatch):
     for split in ("train", "validation", "test"):
         with pytest.raises(FileNotFoundError):
             train_vfe3._select_loader("wikitext-103", cfg, split=split)
+
+
+# =============================================================================
+# Terminal callback + validation-only finalizer (PB-02, audit 2026-07-12)
+# =============================================================================
+# A default ablation cell (log/eval interval above max_steps, checkpoint_interval=0) trains fine but
+# used to save no metrics.csv / best_model.pt / resumable bundle. train() now invokes a terminal
+# callback once, immediately after the final optimizer step, and finalize_validation_run() turns that
+# snapshot into a complete VALIDATION-ONLY artifact set (never a test split) plus a resumable checkpoint
+# whose weights + optimizer moments are BOTH the raw iterate (never EMA weights paired with raw moments).
+# Tiny CPU models throughout: embed_dim=4, n_heads=1, n_layers=1, n_e_steps=1, two batches.
+
+
+def _terminal_cfg(**kw):
+    base = dict(vocab_size=6, embed_dim=4, n_heads=1, max_seq_len=8, n_layers=1,
+                n_e_steps=1, gauge_group="glk", use_head_mixer=False,
+                e_q_mu_lr=0.5, e_q_sigma_lr=0.05, e_phi_lr=0.0,
+                m_p_mu_lr=0.1, m_p_sigma_lr=0.05, m_phi_lr=0.0,
+                warmup_steps=1, max_steps=2, kl_max=32)
+    base.update(kw)
+    return VFE3Config(**base)
+
+
+def _terminal_loader(seed=7, n=64, seq_len=8, bs=4):
+    # Two batches (8 windows / bs 4, drop_last); shuffled with an explicit generator so the terminal
+    # checkpoint captures a resumable data cursor.
+    g = torch.Generator().manual_seed(seed)
+    base = torch.arange(3).repeat(n // 3 + 2)
+    ds = TokenWindows(base[:n].long(), seq_len)
+    return DataLoader(ds, batch_size=bs, shuffle=True, drop_last=True, generator=g)
+
+
+def _terminal_val_loader(n=48, seq_len=8, bs=4):
+    base = torch.arange(3).repeat(n // 3 + 2)
+    ds = TokenWindows(base[:n].long(), seq_len)
+    return DataLoader(ds, batch_size=bs, shuffle=False, drop_last=False)
+
+
+def _make_terminal_state(model, cfg, *, ema=None):
+    r"""A real TrainingTerminalState built from the model's current (raw) weights + optimizer + RNG."""
+    opt = build_optimizer(model, cfg)
+    raw = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+    rng = {"cpu": torch.get_rng_state().clone(),
+           "cuda": ([s.clone() for s in torch.cuda.get_rng_state_all()]
+                    if torch.cuda.is_available() else None)}
+    return TrainingTerminalState(
+        step=int(cfg.max_steps), optimizer=opt, scaler=None, ema=ema,
+        metropolis_generator=torch.Generator().manual_seed(0),
+        data_state=None, raw_model_state=raw, rng_state=rng)
+
+
+def test_train_terminal_callback_receives_resumable_state():
+    torch.manual_seed(0)
+    cfg = _terminal_cfg(use_ema=True, ema_decay=0.5)
+    model = VFEModel(cfg)
+    loader = _terminal_loader()
+    captured = {"calls": 0}
+
+    def cb(state, callback_losses):
+        captured["calls"] += 1
+        captured["state"] = state
+        captured["losses_len"] = len(callback_losses)
+
+    train(model, loader, cfg, n_steps=cfg.max_steps, terminal_callback=cb)
+
+    assert captured["calls"] == 1                                   # invoked EXACTLY once
+    st = captured["state"]
+    assert st.step == cfg.max_steps                                 # the completed-step count
+    assert isinstance(st.optimizer, torch.optim.Optimizer)
+    assert st.ema is not None                                       # use_ema=True -> the live EMA
+    assert isinstance(st.metropolis_generator, torch.Generator)
+    assert set(st.raw_model_state) == set(model.state_dict())       # full state_dict, strictly reloadable
+    assert "cpu" in st.rng_state and st.rng_state["cpu"] is not None
+    assert captured["losses_len"] == cfg.max_steps
+    # The callback fires BEFORE the trailing ema.copy_to: the captured raw_model_state is the raw
+    # last-iterate, while train() returns the EMA weights, so at least one trainable table differs.
+    final = model.state_dict()
+    assert any(not torch.equal(st.raw_model_state[n], final[n])
+               for n, p in model.named_parameters() if p.requires_grad)
+
+
+def test_validation_finalizer_records_validation_without_test_fields(tmp_path, monkeypatch):
+    monkeypatch.setattr("vfe3.run_artifacts._git_code_identity",
+                        lambda *a, **k: {"git_sha": "0" * 40, "git_dirty": False,
+                                         "git_dirty_fingerprint": None})
+    torch.manual_seed(0)
+    cfg = _terminal_cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    state = _make_terminal_state(model, cfg)
+    mapping = finalize_validation_run(
+        model, art, cfg, _terminal_val_loader(), losses=[1.0, 0.9],
+        terminal_state=state, device=torch.device("cpu"))
+
+    summary = json.loads((tmp_path / "r" / "summary.json").read_text())
+    assert summary["selection_split"] == "validation"
+    for forbidden in ("test_ce", "test_ppl", "test_bpc"):
+        assert forbidden not in summary
+    for required in ("primary_val_ppl", "final_val_ce", "final_val_ppl", "final_val_bpc",
+                     "best_val_ppl", "best_step", "n_steps", "n_params", "final_train_loss",
+                     "wall_time_s", "terminal_checkpoint", "figures_written"):
+        assert required in summary
+    assert isinstance(summary["figures_written"], list)
+
+    vr = json.loads((tmp_path / "r" / "validation_results.json").read_text())
+    assert vr["selection_split"] == "validation"
+    assert "test_ppl" not in vr
+
+    assert set(mapping) == {"primary_val_ppl", "final_val_ppl", "final_val_ce", "final_val_bpc",
+                            "best_val_ppl", "best_step", "final_train_loss", "n_params",
+                            "terminal_checkpoint"}
+    # After the terminal maybe_save_best the primary equals the selected finite best (no earlier best).
+    assert mapping["primary_val_ppl"] == mapping["best_val_ppl"] == mapping["final_val_ppl"]
+    assert Path(mapping["terminal_checkpoint"]).exists()
+    assert (tmp_path / "r" / "checkpoints" / f"step_{cfg.max_steps}.pt").exists()
+
+
+def test_validation_finalizer_appends_to_existing_metrics_schema(tmp_path, monkeypatch):
+    monkeypatch.setattr("vfe3.run_artifacts._git_code_identity",
+                        lambda *a, **k: {"git_sha": "0" * 40, "git_dirty": False,
+                                         "git_dirty_fingerprint": None})
+    torch.manual_seed(0)
+    cfg = _terminal_cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    # An established (richer) training schema locks the CSV fieldnames on its first row; the terminal
+    # row's five keys are a SUBSET, so the append writes blanks for the extra columns rather than crashing.
+    art.log_metrics({"step": 1, "train_loss": 1.0, "train_ce": 1.0, "val_ce": float("nan"),
+                     "val_ppl": float("nan"), "val_bpc": float("nan"), "lr_mu": 0.01,
+                     "attn_entropy": 0.5})
+    state = _make_terminal_state(model, cfg)
+    finalize_validation_run(model, art, cfg, _terminal_val_loader(), losses=[1.0, 0.9],
+                            terminal_state=state, device=torch.device("cpu"))
+
+    with open(tmp_path / "r" / "metrics.csv", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert "attn_entropy" in rows[0]                                # original schema preserved
+    assert rows[-1]["step"] == str(cfg.max_steps)                   # terminal row appended
+    assert rows[-1]["val_ppl"] != ""                               # terminal validation recorded
+    assert rows[-1]["attn_entropy"] == ""                          # non-terminal column left blank
+
+
+def test_terminal_callback_restores_cpu_and_cuda_rng(tmp_path, monkeypatch):
+    monkeypatch.setattr("vfe3.run_artifacts._git_code_identity",
+                        lambda *a, **k: {"git_sha": "0" * 40, "git_dirty": False,
+                                         "git_dirty_fingerprint": None})
+    torch.manual_seed(0)
+    cfg = _terminal_cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    val = _terminal_val_loader()
+    captured = {}
+
+    def cb(state, callback_losses):
+        # Global RNG captured immediately after the last training step (== state.rng_state).
+        captured["cpu"] = state.rng_state["cpu"].clone()
+        captured["cuda"] = ([s.clone() for s in state.rng_state["cuda"]]
+                            if state.rng_state["cuda"] is not None else [])
+        # The finalizer draws RNG (eval + figures) then restores the captured state in its finally.
+        finalize_validation_run(model, art, cfg, val, losses=callback_losses,
+                                terminal_state=state, device=torch.device("cpu"))
+
+    train(model, _terminal_loader(), cfg, n_steps=cfg.max_steps, artifacts=art,
+          val_loader=val, terminal_callback=cb)
+
+    assert torch.equal(torch.get_rng_state(), captured["cpu"])      # CPU stream rewound
+    cuda_now = ([s for s in torch.cuda.get_rng_state_all()]
+                if torch.cuda.is_available() else [])               # empty list on a CPU-only host
+    assert [s.tolist() for s in cuda_now] == [s.tolist() for s in captured["cuda"]]
+
+
+def test_terminal_checkpoint_resumes_optimizer_rng_and_next_step(tmp_path, monkeypatch):
+    monkeypatch.setattr("vfe3.run_artifacts._git_code_identity",
+                        lambda *a, **k: {"git_sha": "0" * 40, "git_dirty": False,
+                                         "git_dirty_fingerprint": None})
+    torch.manual_seed(0)
+    cfg = _terminal_cfg(max_steps=2)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    val = _terminal_val_loader()
+    loader = _terminal_loader()
+    result = {}
+
+    def cb(state, callback_losses):
+        result.update(finalize_validation_run(
+            model, art, cfg, val, losses=callback_losses, train_loader=loader,
+            terminal_state=state, device=torch.device("cpu")))
+
+    train(model, loader, cfg, n_steps=cfg.max_steps, artifacts=art,
+          val_loader=val, terminal_callback=cb)
+
+    ckpt = result["terminal_checkpoint"]
+    assert Path(ckpt).exists()
+    bundle = torch.load(ckpt, weights_only=True)                   # safe-loads (tensors + config only)
+    assert bundle["step"] == cfg.max_steps
+    for slot in ("model_state", "optimizer_state", "rng_state", "scaler_state", "ema_state",
+                 "data_state", "best_val_ppl", "best_step"):
+        assert slot in bundle
+
+    # Resume: a fresh model + optimizer continues from the saved step for EXACTLY one more step.
+    torch.manual_seed(0)
+    cfg_resume = _terminal_cfg(max_steps=cfg.max_steps + 1)
+    fresh = VFEModel(cfg_resume)
+    losses_resume = train(fresh, _terminal_loader(), cfg_resume, n_steps=cfg.max_steps + 1,
+                          resume_from=ckpt, device=torch.device("cpu"))
+    assert len(losses_resume) == 1                                 # start_step == max_steps -> one step
+    assert math.isfinite(losses_resume[0])
+
+
+def test_terminal_checkpoint_ema_raw_weights_resume_exactly(tmp_path, monkeypatch):
+    monkeypatch.setattr("vfe3.run_artifacts._git_code_identity",
+                        lambda *a, **k: {"git_sha": "0" * 40, "git_dirty": False,
+                                         "git_dirty_fingerprint": None})
+    # UNINTERRUPTED control (raw trajectory, no EMA): 3 steps.
+    torch.manual_seed(0)
+    cfg_ctrl = _terminal_cfg(max_steps=3, use_ema=False)
+    ctrl = VFEModel(cfg_ctrl)
+    train(ctrl, _terminal_loader(), cfg_ctrl, n_steps=3, device=torch.device("cpu"))
+    ctrl_raw = {n: p.detach().clone() for n, p in ctrl.named_parameters() if p.requires_grad}
+
+    # INTERRUPTED first leg: 2 steps WITH EMA. EMA.update draws no RNG and (no periodic eval) never
+    # touches the live weights, so the raw 2-step trajectory matches the control's first two steps.
+    torch.manual_seed(0)
+    cfg_ema = _terminal_cfg(max_steps=2, use_ema=True, ema_decay=0.5)
+    interrupted = VFEModel(cfg_ema)
+    art = RunArtifacts(tmp_path / "r", cfg_ema, interrupted)
+    val = _terminal_val_loader()
+    loader = _terminal_loader()
+    grab = {}
+
+    def cb(state, callback_losses):
+        grab["raw2"] = {k: v.clone() for k, v in state.raw_model_state.items()}
+        grab.update(finalize_validation_run(
+            interrupted, art, cfg_ema, val, losses=callback_losses, train_loader=loader,
+            terminal_state=state, device=torch.device("cpu")))
+
+    train(interrupted, loader, cfg_ema, n_steps=2, artifacts=art,
+          val_loader=val, terminal_callback=cb)
+    ckpt = grab["terminal_checkpoint"]
+
+    # The returned model + best_model.pt use the EMA weights (differ from the raw iterate).
+    ema_final = {n: p.detach().clone() for n, p in interrupted.named_parameters() if p.requires_grad}
+    assert any(not torch.equal(ema_final[n], grab["raw2"][n]) for n in ema_final)
+    best_bundle = torch.load(tmp_path / "r" / "best_model.pt", weights_only=True)
+    assert any(not torch.equal(best_bundle["model_state"][n], grab["raw2"][n]) for n in ema_final)
+
+    # Resume the RAW step from the checkpoint (raw weights + raw optimizer moments) and match control.
+    torch.manual_seed(0)
+    cfg_res = _terminal_cfg(max_steps=3, use_ema=False)
+    resumed = VFEModel(cfg_res)
+    train(resumed, _terminal_loader(), cfg_res, n_steps=3, resume_from=ckpt, device=torch.device("cpu"))
+    for n, p in resumed.named_parameters():
+        if p.requires_grad:
+            assert torch.allclose(p.detach(), ctrl_raw[n], atol=1e-5, rtol=1e-4), n

@@ -34,7 +34,7 @@ import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional
 
 import torch
 
@@ -42,6 +42,9 @@ from vfe3.config import VFE3Config
 from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.ema import EMA
 from vfe3.runtime import deterministic_state
+
+if TYPE_CHECKING:                                        # forward ref only: train imports RunArtifacts
+    from vfe3.train import TrainingTerminalState         # at top level, so a runtime import here cycles
 
 
 def _require_nonnegative_int(value: object, field: str) -> int:
@@ -1065,6 +1068,178 @@ def finalize_run(
         except Exception as exc:
             logger.warning("publication figure generation failed (%s); numeric results are saved", exc)
     return results
+
+
+def _restore_rng_state(
+    rng_state: Mapping[str, object],
+) -> None:
+    r"""Restore the captured CPU (and any available CUDA) global RNG states.
+
+    Mirrors ``load_checkpoint``'s RNG restore: the CPU state must be a CPU ByteTensor and the CUDA
+    per-device states are set only when CUDA is available (a CPU-only host silently skips the CUDA leg).
+    """
+    cpu = rng_state.get("cpu")
+    if cpu is not None:
+        torch.set_rng_state(cpu.cpu() if hasattr(cpu, "cpu") else cpu)
+    cuda = rng_state.get("cuda")
+    if cuda is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([s.cpu() if hasattr(s, "cpu") else s for s in cuda])
+
+
+@torch.no_grad()
+def finalize_validation_run(
+    model:       torch.nn.Module,
+    artifacts:   RunArtifacts,
+    cfg:         VFE3Config,
+    val_loader:  Iterable,
+
+    *,
+    tokens_per_char: float                    = 1.0,
+    train_loader:    Optional[Iterable]       = None,
+    losses:          Optional[List[float]]    = None,
+    data_seed:       Optional[int]            = None,
+    max_tokens:      Optional[int]            = None,
+    tokenizer_tag:   Optional[str]            = None,
+    device:          Optional[torch.device]   = None,
+    wall_time:       Optional[float]          = None,
+    logger:          Optional[logging.Logger] = None,
+    terminal_state:  "Optional[TrainingTerminalState]" = None,
+) -> Dict[str, object]:
+    r"""Score validation, save terminal artifacts, and never open a test split.
+
+    The validation-only sibling of :func:`finalize_run` (PB-02): invoked ONCE as a ``train`` terminal
+    callback so even a default ablation cell (log/eval interval above ``max_steps``,
+    ``checkpoint_interval=0``) publishes a complete resumable artifact set. Model selection and every
+    reported number use VALIDATION data only -- the split is labeled ``selection_split="validation"``
+    and ``summary.json`` never carries ``test_ce``/``test_ppl``/``test_bpc``.
+
+    Successful sequence (the model enters with RAW last-iterate weights): if EMA exists, copy the EMA
+    shadow into the model, then evaluate ``val_loader`` once, append a terminal metrics row, publish the
+    selected best weights (``best_model.pt``), write ``validation_results.json``, collect VALIDATION-only
+    provenance and the pure-path report, and render the history-only figures -- all against the EMA (or
+    raw) weights. A ``finally`` block then strictly reloads ``terminal_state.raw_model_state`` and
+    restores the captured CPU/CUDA RNG. After a successful validation the resumable terminal checkpoint
+    is written from the RESTORED raw model plus its matching optimizer/scaler/EMA/private-RNG/data cursor
+    (so the checkpoint never pairs EMA weights with raw optimizer moments), ``summary.json`` is written
+    only after that checkpoint exists, and EMA is copied back into the live model so ``train`` keeps its
+    returned-model behavior. A validation/checkpoint failure restores the raw weights/RNG and re-raises,
+    publishing no summary (and, via the caller, no success contract).
+
+    Returns the exact ablation merge mapping ``{"primary_val_ppl", "final_val_ppl", "final_val_ce",
+    "final_val_bpc", "best_val_ppl", "best_step", "final_train_loss", "n_params", "terminal_checkpoint"}``.
+    ``primary_val_ppl`` is the minimum of the finite run-wide best and the final validation PPL (or the
+    final value when no earlier best exists); after ``maybe_save_best`` it equals the selected finite best.
+    """
+    from vfe3.train import evaluate                              # local import avoids an import cycle
+
+    logger = logger or logging.getLogger(__name__)
+    if device is None:
+        device = next(model.parameters()).device
+    ema = terminal_state.ema if terminal_state is not None else None
+
+    n_params = int(sum(p.numel() for p in model.parameters()))
+    final_train_loss = (float(losses[-1]) if losses else None)
+
+    try:
+        # Evaluation, best-weight publication, provenance, and figures all run against the DEPLOYED
+        # averaged weights (the model entered holding the raw last-iterate weights).
+        if ema is not None:
+            ema.copy_to(model)
+
+        metrics = evaluate(model, val_loader, tokens_per_char=tokens_per_char, device=device)
+        final_ce, final_ppl, final_bpc = (
+            float(metrics["ce"]), float(metrics["ppl"]), float(metrics["bpc"]))
+
+        # Terminal metrics row: compatible with an empty history (defines the schema) OR an established
+        # training schema (its five keys are a subset of the training columns, so the append is clean).
+        terminal_row = {
+            "step":       int(cfg.max_steps),
+            "train_loss": float(losses[-1]) if losses else float("nan"),
+            "val_ce":     final_ce,
+            "val_ppl":    final_ppl,
+            "val_bpc":    final_bpc,
+        }
+        # Run-wide best BEFORE the terminal save: primary is the better of the finite periodic best and
+        # the final validation, so after maybe_save_best it equals the selected finite best.
+        prior_best = artifacts.best_val_ppl
+        artifacts.log_metrics(terminal_row)
+        artifacts.maybe_save_best(cfg.max_steps, model, final_ppl)
+        primary_val_ppl = (min(prior_best, final_ppl) if math.isfinite(prior_best) else final_ppl)
+        best_val_ppl = (artifacts.best_val_ppl if artifacts.best_val_ppl != float("inf") else None)
+
+        artifacts.save_json("validation_results.json", {
+            "selection_split": "validation",
+            "val_ce":          final_ce,
+            "val_ppl":         final_ppl,
+            "val_bpc":         final_bpc,
+            "primary_val_ppl": float(primary_val_ppl),
+            "best_val_ppl":    best_val_ppl,
+            "best_step":       artifacts.best_step,
+        })
+
+        # Reproducibility provenance -- VALIDATION ONLY (test_loader=None): the ablation finalizer must
+        # never open a test split.
+        _write_provenance(
+            artifacts, cfg, model, logger,
+            train_loader=train_loader, val_loader=val_loader, test_loader=None,
+            data_seed=data_seed, max_tokens=max_tokens, tokenizer_tag=tokenizer_tag,
+        )
+        try:
+            artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history))
+        except Exception as exc:
+            logger.warning("pure-path report failed (%s); skipped", exc)
+        _save_figures(artifacts, losses, logger)
+    finally:
+        # Strict raw-state reload + RNG restore, on BOTH the success and failure paths: the terminal
+        # checkpoint below pairs the RAW model with the raw optimizer moments (never the EMA weights),
+        # and the global RNG is rewound to its captured post-final-step value.
+        if terminal_state is not None:
+            model.load_state_dict(terminal_state.raw_model_state)
+            _restore_rng_state(terminal_state.rng_state)
+
+    # Reached only after a successful validation pass. Write the resumable terminal checkpoint from the
+    # restored raw model, then summary.json (only after the checkpoint exists), then copy EMA back.
+    terminal_checkpoint: Optional[str] = None
+    if terminal_state is not None:
+        checkpoint_path = artifacts.save_checkpoint(
+            int(cfg.max_steps), model, terminal_state.optimizer, cfg,
+            scaler=terminal_state.scaler, ema=ema,
+            metropolis_generator=terminal_state.metropolis_generator,
+            data_state=terminal_state.data_state,
+        )
+        terminal_checkpoint = str(checkpoint_path)
+
+    figures_written = sorted(p.name for p in artifacts.run_dir.glob("*.png") if p.is_file())
+    artifacts.save_json("summary.json", {
+        "selection_split":     "validation",
+        "primary_val_ppl":     float(primary_val_ppl),
+        "final_val_ce":        final_ce,
+        "final_val_ppl":       final_ppl,
+        "final_val_bpc":       final_bpc,
+        "best_val_ppl":        best_val_ppl,
+        "best_step":           artifacts.best_step,
+        "n_steps":             int(cfg.max_steps),
+        "n_params":            n_params,
+        "final_train_loss":    final_train_loss,
+        "wall_time_s":         (float(wall_time) if wall_time is not None else None),
+        "terminal_checkpoint": terminal_checkpoint,
+        "figures_written":     figures_written,
+    })
+
+    if ema is not None:
+        ema.copy_to(model)                                      # train() returns the deployed EMA weights
+
+    return {
+        "primary_val_ppl":     float(primary_val_ppl),
+        "final_val_ppl":       final_ppl,
+        "final_val_ce":        final_ce,
+        "final_val_bpc":       final_bpc,
+        "best_val_ppl":        best_val_ppl,
+        "best_step":           artifacts.best_step,
+        "final_train_loss":    final_train_loss,
+        "n_params":            n_params,
+        "terminal_checkpoint": terminal_checkpoint,
+    }
 
 
 def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:

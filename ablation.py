@@ -72,7 +72,13 @@ from vfe3.metrics import (
     rank_one_residual,
 )
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts, _atomic_replace, _git_code_identity, semantic_config_fingerprint
+from vfe3.run_artifacts import (
+    RunArtifacts,
+    _atomic_replace,
+    _git_code_identity,
+    finalize_validation_run,
+    semantic_config_fingerprint,
+)
 from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, evaluate, train
 from vfe3.viz.extract import across_layer_belief_trace, attention_entropy_cov_gap, converged_state
@@ -1777,7 +1783,33 @@ def run_single(
     for _cov in coverage_lines(train_loader, cfg.max_steps, dataset):
         print(f"   {_cov}")
 
-    losses = train(
+    # Terminal artifact set (PB-02): a VALIDATION-ONLY finalizer runs once as a train() callback --
+    # immediately after the final optimizer step -- so even a default cell (log/eval interval above
+    # max_steps, checkpoint_interval=0) publishes a complete resumable artifact set (terminal metrics
+    # row, best_model.pt, validation_results.json, summary.json, provenance, figures, and a resumable
+    # terminal checkpoint) WITHOUT ever scoring a test split. The finalizer's returned merge mapping
+    # carries the headline (primary/final validation, best, terminal_checkpoint); run_single overlays it
+    # on the label/error/seed/overrides/token-cap metadata below. Periodic log/eval/checkpoint cadence is
+    # no longer relied on for the artifact set -- generation/checkpointing is this one post-final step.
+    terminal_result: Dict[str, Any] = {}
+    train_start = time.perf_counter()
+
+    def _terminal_callback(state, callback_losses):
+        terminal_result.update(finalize_validation_run(
+            model, artifacts, cfg, val_loader,
+            tokens_per_char=val_tpc,
+            train_loader=train_loader,
+            losses=callback_losses,
+            data_seed=(int(DATA_SEED) if DATA_SEED is not None else int(cfg.seed)),
+            max_tokens=max_tokens,
+            tokenizer_tag=_tokenizer_tag(dataset),
+            device=device,
+            wall_time=time.perf_counter() - train_start,
+            logger=logger,
+            terminal_state=state,
+        ))
+
+    train(
         model, train_loader, cfg,
         n_steps=cfg.max_steps,
         log_interval=cfg.log_interval,
@@ -1788,29 +1820,17 @@ def run_single(
         logger=logger,
         artifacts=artifacts,
         generate_samples=False,                              # pure silent path: no sample text
+        terminal_callback=_terminal_callback,
     )
 
-    # Unconditional final validation pass: guarantees a number even when max_steps is below
-    # eval_interval (a periodic eval never fired). best_val_ppl is the lowest the periodic
-    # eval saw (inf if none); the headline takes the better of the two.
-    m = evaluate(model, val_loader, tokens_per_char=val_tpc, device=device)
-    best = artifacts.best_val_ppl
-    primary = min(best, m["ppl"]) if best != float("inf") else m["ppl"]
-
-    result = {
-        "label":            label,
-        "error_kind":       None,
-        "primary_val_ppl":  float(primary),
-        "final_val_ppl":    float(m["ppl"]),
-        "final_val_ce":     float(m["ce"]),
-        "final_val_bpc":    float(m["bpc"]),
-        "best_val_ppl":     (float(best) if best != float("inf") else None),
-        "final_train_loss": (float(losses[-1]) if losses else None),
-        "n_params":         n_params,
-        "seed":             int(cfg.seed),
-        "overrides":        _jsonable(overrides),
-        "max_tokens":       (int(max_tokens) if max_tokens is not None else None),
+    result: Dict[str, Any] = {
+        "label":      label,
+        "error_kind": None,
+        "seed":       int(cfg.seed),
+        "overrides":  _jsonable(overrides),
+        "max_tokens": (int(max_tokens) if max_tokens is not None else None),
     }
+    result.update(terminal_result)                           # primary/final/best/terminal_checkpoint headline
     if collect_diagnostics:                                  # opt-in converged-state probes (S2)
         result.update(_cell_diagnostics(model, cfg, val_loader, device))
     if collect_extrapolation:                                # opt-in growing-N eval (H1/EXP-13)
@@ -2110,6 +2130,18 @@ def run_sweep(
         if successful and collect_extrapolation and not isinstance(result.get("extrap_ce"), list):
             logger.warning("  [%s] requested extrapolation output missing -> cell marked failed", label)
             successful = False
+
+        # Terminal artifact completeness (PB-02): the reuse contract is published only after the
+        # terminal finalizer wrote a resumable checkpoint. run_single's finalizer returns
+        # terminal_checkpoint pointing at checkpoints/step_<max_steps>.pt; require it to exist so a cell
+        # that finished with only a headline (no resumable bundle) is never served as complete. A result
+        # that carries no terminal_checkpoint key at all (a stubbed run_single in a unit test) is exempt;
+        # a real trained cell always sets it, so the gate binds exactly the cells that actually finalized.
+        if successful and "terminal_checkpoint" in result:
+            terminal_checkpoint = result.get("terminal_checkpoint")
+            if not (isinstance(terminal_checkpoint, str) and Path(terminal_checkpoint).exists()):
+                logger.warning("  [%s] terminal checkpoint missing -> cell marked failed", label)
+                successful = False
 
         # A successful cell is cached only when its contract can be rebuilt now: rebuild it (the
         # pre-run build was skipped or lost a transient source race), and if it still cannot be built

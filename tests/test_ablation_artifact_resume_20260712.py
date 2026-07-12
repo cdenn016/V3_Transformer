@@ -310,3 +310,164 @@ def test_missing_or_corrupt_source_contract_forbids_reuse_without_aborting_sweep
     assert not (race_dir / "cell_contract.json").exists()
     assert good_marker["status"] == "success"
     assert (good_dir / "cell_contract.json").exists()
+
+
+# =============================================================================
+# Terminal artifact set for a default cell (PB-02): run_single finalizes + run_sweep gates
+# =============================================================================
+# A default cell (log/eval interval above max_steps, checkpoint_interval=0) used to finish with a
+# headline number but write no metrics.csv / best_model.pt / resumable bundle. run_single now runs a
+# validation-only finalizer as a train() terminal callback, and run_sweep publishes the reuse contract
+# only after the returned terminal checkpoint exists. These build TINY real models (embed_dim=4,
+# n_heads=1, two batches); loaders and code/corpus identity are monkeypatched so no real cache is needed.
+
+import math
+
+from torch.utils.data import DataLoader
+
+from vfe3.data.datasets import TokenWindows
+from vfe3.model.model import VFEModel
+from vfe3.train import train
+
+
+_TINY_BASELINE = dict(
+    vocab_size=6, embed_dim=4, n_heads=1, max_seq_len=8, batch_size=4,
+    max_steps=2, n_layers=1, n_e_steps=1, seed=6, warmup_steps=1,
+    gauge_group="glk", use_head_mixer=False, generate_figures=False,
+    e_q_mu_lr=0.5, e_q_sigma_lr=0.05, e_phi_lr=0.0,
+    m_p_mu_lr=0.1, m_p_sigma_lr=0.05, m_phi_lr=0.0,
+    kl_max=32,
+)
+
+
+def _tiny_train_loader(seed=7, n=64, seq_len=8, bs=4):
+    g = torch.Generator().manual_seed(seed)
+    base = torch.arange(3).repeat(n // 3 + 2)
+    ds = TokenWindows(base[:n].long(), seq_len)
+    return DataLoader(ds, batch_size=bs, shuffle=True, drop_last=True, generator=g)
+
+
+def _fake_get_loader(dataset, seq_len, batch_size, split, *, max_tokens=None, vocab_size=None):
+    if split == "train":
+        return _tiny_train_loader(seq_len=seq_len, bs=batch_size)
+    base = torch.arange(3).repeat(48 // 3 + 2)
+    ds = TokenWindows(base[:48].long(), seq_len)
+    return DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+
+def _patch_tiny_cell(monkeypatch):
+    r"""Point run_single at tiny synthetic loaders + deterministic code/tokenizer identity."""
+    monkeypatch.setattr(ablation, "BASELINE_CONFIG", dict(_TINY_BASELINE))
+    monkeypatch.setattr(ablation, "get_loader", _fake_get_loader)
+    monkeypatch.setattr(ablation, "tokens_per_char", lambda *a, **k: 1.0)
+    monkeypatch.setattr(ablation, "_tokenizer_tag", lambda *a, **k: "tiktoken")
+    monkeypatch.setattr("vfe3.run_artifacts._git_code_identity",
+                        lambda *a, **k: dict(FIXED_CODE_IDENTITY))
+
+
+def test_default_ablation_cell_writes_terminal_artifact_set(tmp_path, monkeypatch):
+    _patch_tiny_cell(monkeypatch)
+    torch.manual_seed(0)
+    run_dir = tmp_path / "cell"
+    result = ablation.run_single("cell", {}, run_dir, dataset=DATASET,
+                                 device=torch.device("cpu"), seed=6, max_steps=2)
+
+    # The finalizer returned the full merge headline (a default cell no longer relies on cadence).
+    assert result["error_kind"] is None
+    for key in ("primary_val_ppl", "final_val_ppl", "best_val_ppl", "best_step",
+                "final_train_loss", "n_params", "terminal_checkpoint"):
+        assert key in result
+
+    # The advertised artifact set is on disk.
+    for name in ("metrics.csv", "best_model.pt", "summary.json", "validation_results.json",
+                 "provenance.json", "pure_path_report.json"):
+        assert (run_dir / name).exists(), name
+    ckpt_path = run_dir / "checkpoints" / "step_2.pt"
+    assert ckpt_path.exists()
+    assert result["terminal_checkpoint"] == str(ckpt_path)
+
+    # The resumable bundle carries model / optimizer / scaler+EMA slots / RNG / data cursor / step /
+    # best-selection metadata, and safe-loads under weights_only=True.
+    bundle = torch.load(ckpt_path, weights_only=True)
+    assert bundle["step"] == 2
+    for slot in ("model_state", "optimizer_state", "rng_state", "scaler_state", "ema_state",
+                 "data_state", "best_val_ppl", "best_step"):
+        assert slot in bundle
+    assert bundle["data_state"] is not None                       # shuffled train loader -> real cursor
+
+    # summary.json is validation-only.
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["selection_split"] == "validation"
+    for forbidden in ("test_ce", "test_ppl", "test_bpc"):
+        assert forbidden not in summary
+
+    # Resume exactly one additional optimizer step from the terminal checkpoint.
+    torch.manual_seed(0)
+    cfg_resume = VFE3Config(**ablation._cell_cfg_dict({}, seed=6, max_steps=3))
+    fresh = VFEModel(cfg_resume)
+    losses_resume = train(fresh, _tiny_train_loader(), cfg_resume, n_steps=3,
+                          resume_from=str(ckpt_path), device=torch.device("cpu"))
+    assert len(losses_resume) == 1                                 # start_step == 2 -> one more step
+
+
+def test_run_single_finalizes_before_writing_success_contract(tmp_path, monkeypatch):
+    r"""run_sweep publishes a reuse contract only after the returned terminal checkpoint exists: a
+    success result whose terminal_checkpoint path is missing is gated to a failed cell (no contract)."""
+    monkeypatch.setattr(ablation, "_git_code_identity", lambda: dict(FIXED_CODE_IDENTITY))
+    monkeypatch.setattr(ablation, "cache_source_identity", _fake_source_ok)
+    sweep_name = "terminal_gate"
+    monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "terminal checkpoint gate"})
+    monkeypatch.setattr(ablation, "make_run_overrides",
+                        lambda _n: [("no_ckpt", {}), ("with_ckpt", {})])
+    real_ckpt = tmp_path / "real_step.pt"
+    real_ckpt.write_text("x", encoding="utf-8")
+
+    def fake_run_single(label, overrides, run_dir, **kwargs):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        tc = str(real_ckpt) if label == "with_ckpt" else str(run_dir / "checkpoints" / "step_2.pt")
+        return {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
+                "final_val_ppl": 9.0, "seed": 6, "terminal_checkpoint": tc}
+
+    monkeypatch.setattr(ablation, "run_single", fake_run_single)
+    monkeypatch.setattr(ablation, "_cleanup", lambda: None)
+    ablation.run_sweep(sweep_name, tmp_path, dataset=DATASET, device=None, seed=6, resume=False)
+
+    no_ckpt_dir = tmp_path / sweep_name / ablation._sanitize("no_ckpt")
+    with_ckpt_dir = tmp_path / sweep_name / ablation._sanitize("with_ckpt")
+    no_marker = json.loads((no_ckpt_dir / "ablation_result.json").read_text(encoding="utf-8"))
+    with_marker = json.loads((with_ckpt_dir / "ablation_result.json").read_text(encoding="utf-8"))
+    assert no_marker["status"] == "failed"
+    assert not (no_ckpt_dir / "cell_contract.json").exists()
+    assert with_marker["status"] == "success"
+    assert (with_ckpt_dir / "cell_contract.json").exists()
+
+
+def test_run_single_terminal_merge_preserves_metadata_and_primary_val_ppl(tmp_path, monkeypatch):
+    r"""An earlier periodic best below the final validation is the returned primary_val_ppl, while the
+    label / seed / overrides / token cap / parameter count survive the finalizer merge."""
+    _patch_tiny_cell(monkeypatch)
+    # A single periodic eval sets a best of 2.0 (below the terminal 100.0); primary must equal that best.
+    calls = {"n": 0}
+
+    def fake_evaluate(model, loader, **kw):
+        calls["n"] += 1
+        ppl = 2.0 if calls["n"] == 1 else 100.0
+        ce = math.log(ppl)
+        return {"ce": ce, "ppl": ppl, "bpc": ce / math.log(2.0)}
+
+    monkeypatch.setattr("vfe3.train.evaluate", fake_evaluate)
+
+    overrides = {"eval_interval": 2}                              # one periodic eval fires at step 2
+    result = ablation.run_single("mycell", overrides, tmp_path / "cell", dataset=DATASET,
+                                 device=torch.device("cpu"), seed=6, max_tokens=123, max_steps=2)
+
+    assert result["primary_val_ppl"] == 2.0                       # min(periodic best 2.0, final 100.0)
+    assert result["final_val_ppl"] == 100.0
+    assert result["best_val_ppl"] == 2.0
+    assert result["label"] == "mycell"                            # metadata preserved through the merge
+    assert result["seed"] == 6
+    assert result["overrides"] == {"eval_interval": 2}
+    assert result["max_tokens"] == 123
+    assert isinstance(result["n_params"], int) and result["n_params"] > 0
+    assert result["error_kind"] is None
+    assert "terminal_checkpoint" in result

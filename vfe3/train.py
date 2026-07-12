@@ -17,7 +17,7 @@ import math
 import weakref
 from numbers import Real
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -880,6 +880,26 @@ def _val_diagnostics(
     return out
 
 
+class TrainingTerminalState(NamedTuple):
+    r"""Snapshot of the resumable training state handed to a ``train`` terminal callback.
+
+    Captured immediately after the final optimizer step (before the trailing ``ema.copy_to``): the
+    completed-step count, the live optimizer / scaler / EMA / private Metropolis generator / data
+    cursor, plus CLONED copies of the raw last-iterate ``state_dict`` and the CPU/CUDA global RNG
+    states. A validation-only finalizer uses these to score validation and best-save on the EMA (or
+    raw) weights, then strictly reload the raw model and RNG and write a resumable checkpoint whose
+    weights and optimizer moments are BOTH the raw iterate (never EMA weights paired with raw moments).
+    """
+    step:                 int
+    optimizer:            torch.optim.Optimizer
+    scaler:               Optional["torch.amp.GradScaler"]
+    ema:                  Optional[object]
+    metropolis_generator: Optional[torch.Generator]
+    data_state:           Optional[DataState]
+    raw_model_state:      Dict[str, torch.Tensor]
+    rng_state:            Dict[str, object]
+
+
 def train(
     model:  VFEModel,
     loader: Iterable[Tuple[torch.Tensor, torch.Tensor]],   # yields (tokens, targets) batches
@@ -897,6 +917,7 @@ def train(
     logger:          Optional[logging.Logger] = None,
     artifacts:       Optional["RunArtifacts"] = None,
     resume_from:     'Optional[str | Path]'   = None,   # checkpoints/step_<N>.pt to resume from (None -> cfg.resume_from -> from scratch)
+    terminal_callback: Optional[Callable[[TrainingTerminalState, List[float]], None]] = None,   # invoked ONCE after the final step (PB-02)
 
     generate_samples:  bool                                     = True,   # False -> pure silent path (no sample text)
     sample_decode:     Optional[Callable[[Sequence[int]], str]] = None,   # token-ids -> text; None -> auto by vocab
@@ -1359,6 +1380,40 @@ def train(
             row["wall_clock_s"]            = pipeline_timing.wall_clock_s
             artifacts.log_metrics(row)
             timer.reset_pipeline_window()
+    # Terminal callback seam (PB-02): immediately after the final optimizer step and BEFORE the
+    # trailing ema.copy_to(model), hand the resumable training state to an optional callback so a
+    # default cell (log/eval interval above max_steps, checkpoint_interval=0) can finalize a complete
+    # artifact set -- validation eval, best weights, summary, and a resumable terminal checkpoint -- in
+    # one opt-in operation. The model still holds the RAW last-iterate weights here; the CLONED
+    # raw_model_state + CPU/CUDA RNG let the finalizer restore that raw state after scoring on the EMA
+    # weights. terminal_callback=None keeps the pure path byte-identical: no clone, no RNG work, just
+    # the direct ema.copy_to/return below.
+    if terminal_callback is not None:
+        raw_model_state = {name: tensor.detach().clone()
+                           for name, tensor in model.state_dict().items()}
+        rng_state: Dict[str, object] = {
+            "cpu":  torch.get_rng_state().clone(),
+            "cuda": ([s.clone() for s in torch.cuda.get_rng_state_all()]
+                     if torch.cuda.is_available() else None),
+        }
+        terminal_data_state: Optional[DataState] = ({
+            "epoch_start_generator_state": epoch_start_generator_state,
+            "batches_consumed":            batches_consumed,
+            "epoch":                       epoch,
+        } if epoch_start_generator_state is not None else None)
+        terminal_callback(
+            TrainingTerminalState(
+                step=n_steps,
+                optimizer=optimizer,
+                scaler=scaler,
+                ema=ema,
+                metropolis_generator=metro_gen,
+                data_state=terminal_data_state,
+                raw_model_state=raw_model_state,
+                rng_state=rng_state,
+            ),
+            losses,
+        )
     if ema is not None:
         ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses
