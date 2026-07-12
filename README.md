@@ -166,8 +166,10 @@ because projection is not a group action.
 ## Attention as variational source selection
 
 For a fixed query $i$ and head $h$, let $\pi_{ij}^{(h)}$ be a normalized prior on the active
-source support. Holding beliefs, transports, comparison energies, and that prior fixed gives the
-entropy-regularized row objective and its normalized Gibbs solution:
+source support. Minimize over the probability simplex $\beta_{ij}^{(h)}\geq 0$ and
+$\sum_j\beta_{ij}^{(h)}=1$, with $\tau_h>0$ (equivalently $\kappa_\beta>0$). Holding beliefs,
+transports, comparison energies, and that prior fixed then gives the entropy-regularized row
+objective and its normalized Gibbs solution:
 
 $$
 \begin{aligned}
@@ -182,8 +184,9 @@ $$
 \end{aligned}
 $$
 
-For positive prior mass on the active support, this is the unique row-wise minimizer under those
-fixed quantities. The checked-in profile has $\kappa_\beta=\kappa_\gamma=1$ and $d_h=10$, hence
+For positive prior mass on the active support, strict convexity at $\tau_h>0$ makes this the unique
+row-wise constrained minimizer under those fixed quantities. The checked-in profile has
+$\kappa_\beta=\kappa_\gamma=1$ and $d_h=10$, hence
 $\tau_\beta=\tau_\gamma=\sqrt{10}$. The relative-entropy term is part of the stationary Gibbs
 result; removing it changes the row problem rather than merely changing its presentation.
 
