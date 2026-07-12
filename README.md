@@ -102,7 +102,7 @@ the real exponential map is not surjective onto the positive-determinant compone
 $\lVert A_i\rVert_F\leq20$, the map agrees with the ordinary exponential parameterization. Outside
 that region, the safeguard collapses radial magnitudes onto the norm-20 boundary, so the effective
 map is not itself a chart. Its joint frame image is restricted to
-$\exp\{B\in\mathfrak g:\lVert B\rVert_F\leq20\}$, a strict subset of the unclamped block-group
+$\exp\lbrace B\in\mathfrak g:\lVert B\rVert_F\leq20\rbrace$, a strict subset of the unclamped block-group
 exponential image; each block remains in
 $\mathrm{im}(\exp:\mathfrak{gl}(10)\to\mathrm{GL}^{+}(10))
 \subsetneq\mathrm{GL}^{+}(10)$.
@@ -129,7 +129,7 @@ family.
 
 For $P=\mathcal N(\mu_P,\Sigma_P)$ and $Q=\mathcal N(\mu_Q,\Sigma_Q)$, the ambient comparison is
 the forward Gaussian KL. The checked-in route evaluates its diagonal, per-head specialization on
-$I_h=\{(h-1)d_h+1,\ldots,hd_h\}$:
+$I_h=\lbrace (h-1)d_h+1,\ldots,hd_h\rbrace$:
 
 $$
 \begin{aligned}
@@ -294,7 +294,7 @@ nonnegative effective pair weight. On a nondegenerate coordinate, the precision 
 $$
 \begin{aligned}
 c_{ik} &:= m_i^{\mathrm{self}}a_i^{\ast}\geq 0, &
-m_{ij}^{(h)} &:= \mathbf 1\left\{0<E_{ij}^{(h)}<K_{\max}\right\}, \\
+m_{ij}^{(h)} &:= \mathbf 1\left\lbrace 0<E_{ij}^{(h)}<K_{\max}\right\rbrace, \\
 w_{ijk} &:= \lambda_\beta m_{ij}^{(h(k))}\beta_{ij}^{(h(k))}\geq 0, \\
 P_{ik}
 &:= \frac{c_{ik}}{\sigma_{p,ik}}
