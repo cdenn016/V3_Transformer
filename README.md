@@ -400,11 +400,38 @@ the next block prior. With one layer, that inter-block handoff has no downstream
 
 ### Decode and outer objective
 
-The prior-bank boundary scores a refined belief by negative KL to vocabulary priors. The
-linear boundary projects the refined mean and can add a learned vocabulary bias.
-Next-token cross-entropy is evaluated after this choice. It is a separate supervised
-objective, not an observation term inside every internal E-step and not proof that all
-inner and outer updates are coordinate descent on one scalar functional.
+Two alternative registered decode boundaries map the refined belief to vocabulary logits. Let
+$m_i$ be the mean of $q_i^*$, let $W_v$ and $b_v$ be the linear readout parameters for vocabulary
+item $v$, and let $p_v^{\mathrm{decode}}$ be its decode-bank Gaussian prior. With $M$ equal to the
+number of targets not masked by $-100$, the two logit boundaries and the supervised objective are
+
+$$
+\begin{aligned}
+z_{iv} &= m_i^{\top}W_v+b_v
+&& \text{(linear boundary)}, \\
+z_{iv} &= -\frac{D_{\mathrm{KL}}\left(q_i^*\Vert p_v^{\mathrm{decode}}\right)}
+{\tau_{\mathrm{decode}}}
+&& \text{(KL-to-prior boundary)}, \\
+\mathcal L_{\mathrm{CE}}
+&= -\frac{1}{M}\sum_{b,i:y_{bi}\ne-100}
+\log\operatorname{softmax}(z_{bi})_{y_{bi}}.
+\end{aligned}
+$$
+
+The first and second logit equations are alternatives, not additive score terms. The checked-in
+experiment sets `use_prior_bank=False` and `decode_bias=True`, so it selects the registered linear
+boundary. Its logits depend on the refined mean and learned bias; belief covariance and
+$\tau_{\mathrm{decode}}$ do not enter them. Setting `use_prior_bank=True` exposes the registered
+prior-bank modes, including the displayed KL-to-prior boundary, while other registered decode
+modes retain their own stated scoring rules.
+
+The causal training windows use $x_i=t_i$ and $y_i=t_{i+1}$. At the checked-in values
+`mass_phi=0`, `mstep_self_coupling_weight=0`, and `z_loss_weight=0`, no corresponding outer
+penalty augments cross-entropy. Because `s_e_step=True`, the explicit hyper-prior and gamma outer
+blocks are also gated off rather than scored a second time after their structural role in the
+model refinement. The backpropagated scalar is therefore exactly next-token cross-entropy through
+the unrolled `s` and `q` paths. This outer scalar is not identical to either target-blind inner
+structural objective $\mathcal F_s$ or $\mathcal F_q$.
 
 ### Optimizer routing
 
