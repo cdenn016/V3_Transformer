@@ -108,6 +108,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
         link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+        compact_phi_block_transport=model._compact_phi_blocks_enabled(),
         log_prior=log_prior,
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )

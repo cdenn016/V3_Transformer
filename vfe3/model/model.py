@@ -672,6 +672,17 @@ class VFEModel(nn.Module):
             return nullcontext()
         return torch.autocast(device_type=device.type, enabled=False)
 
+    def _compact_phi_blocks_enabled(self) -> bool:
+        r"""Whether this model is on the canonical route supported by the packed phi fast path."""
+        cfg = self.cfg
+        return (
+            cfg.compact_phi_block_transport
+            and cfg.gauge_parameterization == "phi"
+            and cfg.transport_mode == "flat"
+            and cfg.phi_reflection == "off"
+            and self.group.phi_coordinate_layout == "block_head_row_major"
+        )
+
     def _apply_pos_phi(self, phi: torch.Tensor) -> torch.Tensor:
         r"""Compose the configured BCH positional element into the gauge frame (no-op for 'none')."""
         if self.cfg.pos_phi == "none":
@@ -681,6 +692,7 @@ class VFEModel(nn.Module):
             mode=self.cfg.pos_phi, compose_mode=self.cfg.pos_phi_compose,
             order=self.cfg.bch_pe_order, scale=self.cfg.pos_phi_scale,
             project_slk=self.cfg.pos_phi_project_slk,
+            compact_blocks=self._compact_phi_blocks_enabled(),
             pos_phi_free=getattr(self, "pos_phi_free", None),
         )
 
@@ -702,6 +714,7 @@ class VFEModel(nn.Module):
             bch_order=self.cfg.bch_pe_order,
             pos_phi_scale=self.cfg.pos_phi_scale,
             project_slk=self.cfg.pos_phi_project_slk,
+            compact_blocks=self._compact_phi_blocks_enabled(),
         )
 
     def effective_kappa_beta(self, device: torch.device) -> 'float | torch.Tensor':
@@ -803,6 +816,7 @@ class VFEModel(nn.Module):
             # Tier-1 transport perf toggles: the s-channel E-step shares the flat transport
             # numerics with the belief channel (all default OFF/byte-identical).
             transport_mean_per_head=cfg.transport_mean_per_head,
+            compact_phi_block_transport=self._compact_phi_blocks_enabled(),
             reuse_pairwise_kl_stats=cfg.reuse_pairwise_kl_stats,
             exp_fp64_mode=cfg.exp_fp64_mode,
             exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
@@ -952,6 +966,7 @@ class VFEModel(nn.Module):
                     # Tier-1 transport perf toggles: the shared build must carry the same island
                     # keying / per-head mean flag the per-e_step hoists would have used.
                     transport_mean_per_head=self.cfg.transport_mean_per_head,
+                    compact_phi_block_transport=self._compact_phi_blocks_enabled(),
                     exp_fp64_mode=self.cfg.exp_fp64_mode,
                     exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
                 )
@@ -1688,7 +1703,9 @@ class VFEModel(nn.Module):
         gp = cfg.gauge_parameterization if omega is not None else "phi"
         omega = build_belief_transport(phi, self.group, transport_mode="flat",
                                        gauge_parameterization=gp, omega=omega,
-                                       reflection=reflection)   # phi-path reflection fold (None -> byte-identical); Tier-1 transport toggles left at defaults: diagnostics exactness unaffected (values identical to round-off)
+                                       reflection=reflection,
+                                       transport_mean_per_head=cfg.transport_mean_per_head,
+                                       compact_phi_block_transport=self._compact_phi_blocks_enabled())
         s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
         s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
         e_s = pairwise_energy(

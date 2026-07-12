@@ -125,13 +125,14 @@ def apply_positional_phi(
     group: GaugeGroup,
 
     *,
-    mode:         str   = "none",
-    compose_mode: str   = "bch",
-    order:        int   = 4,
-    scale:        float = 0.02,
-    frozen_axis:  int   = 0,
-    project_slk:  bool  = False,
-    pos_phi_free: Optional[torch.Tensor] = None,
+    mode:           str                    = "none",
+    compose_mode:   str                    = "bch",
+    order:          int                    = 4,
+    scale:          float                  = 0.02,
+    frozen_axis:    int                    = 0,
+    project_slk:    bool                   = False,
+    compact_blocks: bool                   = False,  # canonical block_glk: packed BCH embedding
+    pos_phi_free:   Optional[torch.Tensor] = None,
     **kwargs,                             # variant params flow through to the builder
 ) -> torch.Tensor:
     r"""Compose the per-position element into ``phi`` via ``compose_phi`` (BCH by default).
@@ -149,9 +150,15 @@ def apply_positional_phi(
         return phi
     if project_slk:
         coords = project_phi_to_slk(coords, group.generators, group.irrep_dims)
+    use_compact = (
+        compact_blocks
+        and group.phi_coordinate_layout == "block_head_row_major"
+        and compose_mode == "bch"
+    )
     # block_dims: lets compose_bch run its Dynkin brackets on the (H, d, d) diagonal-block
     # stacks for a multi-equal-block group (identical values, 1/H the bracket memory; vram
     # audit 2026-06-10 -- this call pinned ~34 (B, N, K, K) bracket tensors in the unrolled
     # graph). compose_euclidean ignores it; single-block groups pass [K] and stay dense.
     return compose_phi(phi, coords, group.generators, order=order, mode=compose_mode,
-                       gram_pinv_=group.gram_pinv(), block_dims=list(group.irrep_dims))
+                       gram_pinv_=(None if use_compact else group.gram_pinv()),
+                       block_dims=list(group.irrep_dims), compact_blocks=use_compact)

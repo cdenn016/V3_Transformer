@@ -1382,6 +1382,47 @@ def build_transport_from_element(
     return {"exp_phi": omega, "exp_neg_phi": u_inv, "Omega": Omega}
 
 
+def _stable_compact_glk_exp_pair(
+    blocks:                  torch.Tensor,       # (..., H, d, d) block-diagonal gl(d)^H element
+
+    *,
+    exp_fp64_mode:           str   = "dim",     # float64-island keying: 'dim' | 'norm'
+    exp_fp64_norm_threshold: float = 5.0,
+    clamp_monitor:           bool  = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Exponentiate packed equal blocks with the dense path's global clamp and dtype rules."""
+    with torch.no_grad():
+        mat_norm = blocks.square().sum(dim=(-3, -2, -1), keepdim=True).sqrt().clamp(min=1e-8)
+        scale = (TRANSPORT_CLAMP_MAX_NORM / mat_norm).clamp(max=1.0)
+        if clamp_monitor:
+            frac = (scale < 1.0).float().mean()
+            if bool(frac > 0):
+                import warnings
+                warnings.warn(
+                    f'stable_matrix_exp_pair: Frobenius clamp active on {float(frac):.1%} of matrices '
+                    f'(max_norm={TRANSPORT_CLAMP_MAX_NORM}); returned factor is a surrogate, not exp(M).',
+                    RuntimeWarning, stacklevel=2,
+                )
+    blocks = blocks * scale
+
+    d = blocks.shape[-1]
+    orig_dtype = blocks.dtype
+    if exp_fp64_mode == "norm":
+        with torch.no_grad():
+            key_norm = blocks.norm(dim=(-2, -1)).max()
+        up_dtype = torch.float64 if bool(key_norm >= exp_fp64_norm_threshold) else torch.float32
+    elif exp_fp64_mode == "dim":
+        up_dtype = torch.float64 if d >= 20 else torch.float32
+    else:
+        raise ValueError(f"exp_fp64_mode must be 'dim' or 'norm', got {exp_fp64_mode!r}")
+
+    with torch.amp.autocast(blocks.device.type, enabled=False):
+        blocks_up = blocks.to(up_dtype).contiguous()
+        exp_pos = torch.linalg.matrix_exp(blocks_up).to(orig_dtype)
+        exp_neg = torch.linalg.matrix_exp(-blocks_up).to(orig_dtype)
+    return exp_pos, exp_neg
+
+
 def build_factored_transport(
     phi:        torch.Tensor,             # (..., N, n_gen) gauge frames (optional leading batch axis)
     group:      GaugeGroup,               # block-diagonal with equal blocks (len(irrep_dims) > 1)
@@ -1392,21 +1433,39 @@ def build_factored_transport(
     exp_fp64_norm_threshold: float = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
     clamp_monitor:           bool  = False,       # opt-in: warn when the exp Frobenius clamp fires
     mean_per_head:           bool  = False,       # container flag: transport_mean contracts per gauge block
-) -> FactoredTransport:
+    compact_blocks:          bool  = False,       # canonical block_glk: retain (..., N, H, d, d) factors
+) -> 'CompactFactoredTransport | FactoredTransport':
     r"""Flat phi-cocycle transport in FACTORED form, skipping the dense (..., N, N, K, K) Omega.
 
     Builds only the per-token vertex exponentials exp(phi_i), exp(-phi_j) (the same factors
     ``compute_transport_operators`` builds) and the ``ikl,jlm->ijkm`` Omega einsum is NEVER run.
+    With ``compact_blocks=True`` on canonical uncoupled ``block_glk``, both the algebra embedding
+    and the returned factors retain ``(..., N, H, d, d)`` storage; every other group and the
+    default keep the legacy dense-vertex :class:`FactoredTransport` representation.
     The pairwise contraction is deferred into ``transport_mean`` / ``transport_covariance``'s fast
     path (P0 #2). Caller guards this to the flat + block-diagonal-with-equal-blocks path; here it
     only requires the exps, which the block-diagonal exp machinery already produces. Rank-agnostic
     via the leading ellipsis: a (B, N, n_gen) frame (batched forward) and a (N, n_gen) frame (the
     unbatched block / diagnostics path) both flow through.
     """
+    block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
+    compact = (
+        compact_blocks
+        and group.phi_coordinate_layout == "block_head_row_major"
+        and block_dims is not None
+        and len(set(block_dims)) == 1
+        and group.generators.shape[0] == len(block_dims) * block_dims[0] * block_dims[0]
+    )
     if gauge_mode == "trivial":
         # Trivial gauge: exp = I. Build the same per-token factors the dense path would (the
         # caller's guard normally excludes trivial, but keep the container well-formed).
         K = group.generators.shape[-1]
+        if compact:
+            H, d = len(block_dims), block_dims[0]
+            eye_d = torch.eye(d, device=phi.device, dtype=phi.dtype)
+            eye = eye_d.expand(*phi.shape[:-1], H, d, d).contiguous()
+            return CompactFactoredTransport(
+                exp_blocks=eye, inv_blocks=eye, K=K, mean_per_head=mean_per_head)
         eye_K = torch.eye(K, device=phi.device, dtype=phi.dtype)
         eye = eye_K.expand(*phi.shape[:-1], K, K).contiguous()
         return FactoredTransport(exp_phi=eye, exp_neg_phi=eye, irrep_dims=list(group.irrep_dims),
@@ -1414,8 +1473,29 @@ def build_factored_transport(
     if gauge_mode != "learned":
         raise ValueError(f"gauge_mode must be 'learned' or 'trivial', got {gauge_mode!r}")
 
+    if compact:
+        H, d = len(block_dims), block_dims[0]
+        # generate_glk_multihead orders the canonical uncoupled block_glk coordinates as
+        # H consecutive row-major d x d matrices. The reshape is therefore the exact algebra
+        # embedding with the structural zero off-block entries omitted.
+        phi_blocks = phi.reshape(*phi.shape[:-1], H, d, d)
+        if phi_blocks.dtype == torch.float32 and torch.is_autocast_enabled(phi.device.type):
+            # The legacy einsum(phi, generators) is an autocast-eligible contraction. A reshape
+            # performs no arithmetic and would otherwise leave packed factors in fp32, changing
+            # both values and gradients under AMP. Mirror the contraction's public output dtype
+            # without allocating the dense K x K embedding.
+            phi_blocks = phi_blocks.to(torch.get_autocast_dtype(phi.device.type))
+        exp_blocks, inv_blocks = _stable_compact_glk_exp_pair(
+            phi_blocks,
+            exp_fp64_mode=exp_fp64_mode,
+            exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+            clamp_monitor=clamp_monitor,
+        )
+        return CompactFactoredTransport(
+            exp_blocks=exp_blocks, inv_blocks=inv_blocks, K=group.generators.shape[-1],
+            mean_per_head=mean_per_head)
+
     phi_matrix = torch.einsum("...na,aij->...nij", phi, group.generators)
-    block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     # exp_dim: same block-scale float64-island keying as compute_transport_operators (see the
     # comment there) -- the factored hot path is exactly where the (B, N, K, K) f64 upcast hurt.
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
