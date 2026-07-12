@@ -449,15 +449,16 @@ def retract_phi(
     group:        GaugeGroup,             # supplies generators, skew flag, irrep_dims
 
     *,
-    step_size:    float = 1.0,
-    eps:          float = 1e-6,
-    order:        int   = 4,
-    project_slk:  bool  = False,
-    mode:         str   = "euclidean",
+    step_size:      float           = 1.0,
+    eps:            float           = 1e-6,
+    order:          int             = 4,
+    project_slk:    bool            = False,
+    compact_blocks: bool            = False,
+    mode:           str             = "euclidean",
 
-    trust_region: Optional[float] = None, # None -> group default (GL:0.1, SO:0.3)
-    max_norm:     Optional[float] = None, # None -> group default (GL:5.0, SO:pi)
-    trace_clamp:  Optional[float] = None, # soft per-block |tr| cap (GL only)
+    trust_region:   Optional[float] = None, # None -> group default (GL:0.1, SO:0.3)
+    max_norm:       Optional[float] = None, # None -> group default (GL:5.0, SO:pi)
+    trace_clamp:    Optional[float] = None, # soft per-block |tr| cap (GL only)
 ) -> torch.Tensor:
     r"""Group-aware phi retraction dispatcher (Gaussian-specialized).
 
@@ -468,6 +469,11 @@ def retract_phi(
       max_norm are taken from the group's compactness when not given.
     """
     G = group.generators
+    compact_blocks = (
+        compact_blocks
+        and mode == "bch"
+        and group.phi_coordinate_layout == "block_head_row_major"
+    )
     if trust_region is None:
         trust_region = 0.3 if group.skew_symmetric else 0.1
     if max_norm is None:
@@ -482,6 +488,8 @@ def retract_phi(
     phi_new = retract_glk(
         phi, delta_phi, G, step_size=step_size, trust_region=trust_region,
         max_norm=max_norm, eps=eps, order=order, mode=mode,
+        compact_blocks=compact_blocks,
+        block_dims=(group.irrep_dims if compact_blocks else None),
     )
     if project_slk:
         phi_new = project_phi_to_slk(phi_new, G, group.irrep_dims)

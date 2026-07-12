@@ -63,6 +63,13 @@ def vfe_block(
     group.irrep_dims. Pass a precomputed value from vfe_stack to avoid recomputing each layer."""
     if tau is None:
         tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims)
+    compact_phi_blocks = (
+        cfg.compact_phi_block_transport
+        and gauge_parameterization == "phi"
+        and cfg.transport_mode == "flat"
+        and cfg.phi_reflection == "off"
+        and group.phi_coordinate_layout == "block_head_row_major"
+    )
     out = e_step(
         belief, mu_p, sigma_p, group,
         n_iter=cfg.n_e_steps, tau=tau,
@@ -99,6 +106,7 @@ def vfe_block(
         compile_pair_kernel=cfg.compile_pair_kernel,
         reuse_pairwise_kl_stats=cfg.reuse_pairwise_kl_stats,
         transport_mean_per_head=cfg.transport_mean_per_head,
+        compact_phi_block_transport=compact_phi_blocks,
         exp_fp64_mode=cfg.exp_fp64_mode,
         exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
         randomize_e_steps=cfg.randomize_e_steps,

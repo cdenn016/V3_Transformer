@@ -115,9 +115,10 @@ def compose_euclidean(
     generators: torch.Tensor,             # (n_gen, K, K) (unused; kept for a uniform seam)
 
     *,
-    order:      int = 0,
-    gram_pinv_: Optional[torch.Tensor] = None,
-    block_dims: Optional[List[int]]    = None,   # unused; uniform seam with compose_bch
+    order:          int                    = 0,
+    compact_blocks: bool                   = False,  # unused; uniform seam with compose_bch
+    gram_pinv_:     Optional[torch.Tensor] = None,
+    block_dims:     Optional[List[int]]    = None,   # unused; uniform seam with compose_bch
 ) -> torch.Tensor:
     r"""Plain Lie-algebra step phi1 + phi2 (exact iff [phi1, phi2] = 0).
 
@@ -449,11 +450,12 @@ def compose_bch(
     generators:  torch.Tensor,            # (n_gen, K, K)
 
     *,
-    closure_tol: float                  = 1e-4,
-    eps:         float                  = 1e-12,
-    order:       int                    = 4,
-    gram_pinv_:  Optional[torch.Tensor] = None,
-    block_dims:  Optional[List[int]]    = None,   # group irrep_dims; >1 equal blocks -> blocked brackets
+    closure_tol:    float                  = 1e-4,
+    eps:            float                  = 1e-12,
+    order:          int                    = 4,
+    compact_blocks: bool                   = False,  # canonical block_glk: omit dense X/Y/Z embedding
+    gram_pinv_:     Optional[torch.Tensor] = None,
+    block_dims:     Optional[List[int]]    = None,   # group irrep_dims; >1 equal blocks -> blocked brackets
 ) -> torch.Tensor:
     r"""BCH chart correction: coords of log(exp(embed phi1) exp(embed phi2)).
 
@@ -489,6 +491,33 @@ def compose_bch(
     closed (default direct-sum) basis the residual is ~0 so the guard is silent and the
     returned phi is unchanged.
     """
+    blocked = (
+        order >= 1
+        and block_dims is not None
+        and len(block_dims) > 1
+        and len(set(block_dims)) == 1
+    )
+    if (compact_blocks
+            and blocked
+            and generators.shape[0] == len(block_dims) * block_dims[0] * block_dims[0]):
+        H, d = len(block_dims), block_dims[0]
+        Xb = phi1.reshape(*phi1.shape[:-1], H, d, d)
+        Yb = phi2.reshape(*phi2.shape[:-1], H, d, d)
+        if Xb.dtype == torch.float32 and torch.is_autocast_enabled(Xb.device.type):
+            autocast_dtype = torch.get_autocast_dtype(Xb.device.type)
+            Xb = Xb.to(autocast_dtype)
+            Yb = Yb.to(autocast_dtype)
+        if Xb.shape != Yb.shape:
+            Xb, Yb = torch.broadcast_tensors(Xb, Yb)
+            Xb = Xb.contiguous()
+            Yb = Yb.contiguous()
+        Zb = Xb + Yb + _bch_dynkin_correction(Xb, Yb, order)
+        phi = Zb.reshape(*Zb.shape[:-3], generators.shape[0])
+        # The explicit block_head_row_major capability is set only by the canonical direct-sum
+        # gl(d)^H builder, whose elementary matrix basis is bracket-closed by construction.
+        # Skipping the generic closure scan here also avoids its dense Gram projection.
+        return phi
+
     X = embed_phi(phi1, generators)
     Y = embed_phi(phi2, generators)
     if X.shape != Y.shape:
@@ -499,12 +528,6 @@ def compose_bch(
         X = X.contiguous()
         Y = Y.contiguous()
     Z = X + Y
-    blocked = (
-        order >= 1
-        and block_dims is not None
-        and len(block_dims) > 1
-        and len(set(block_dims)) == 1
-    )
     if blocked:
         H, d = len(block_dims), block_dims[0]
         Xb = _equal_diag_blocks(X, H, d)
@@ -531,14 +554,19 @@ def compose_phi(
     generators: torch.Tensor,             # (n_gen, K, K)
 
     *,
-    order:      int = 4,
-    mode:       str = "euclidean",
-    gram_pinv_: Optional[torch.Tensor] = None,
-    block_dims: Optional[List[int]]    = None,   # group irrep_dims (compose_bch blocked brackets)
+    order:          int                    = 4,
+    mode:           str                    = "euclidean",
+    compact_blocks: bool                   = False,  # canonical block_glk packed-coordinate BCH
+    gram_pinv_:     Optional[torch.Tensor] = None,
+    block_dims:     Optional[List[int]]    = None,   # group irrep_dims (compose_bch blocked brackets)
 ) -> torch.Tensor:
     r"""Dispatch to the registered composition rule `mode`."""
-    return get_compose(mode)(phi1, phi2, generators, order=order, gram_pinv_=gram_pinv_,
-                             block_dims=block_dims)
+    compose = get_compose(mode)
+    if compact_blocks:
+        return compose(phi1, phi2, generators, order=order, gram_pinv_=gram_pinv_,
+                       block_dims=block_dims, compact_blocks=True)
+    return compose(phi1, phi2, generators, order=order, gram_pinv_=gram_pinv_,
+                   block_dims=block_dims)
 
 
 def _retract_core(
@@ -546,14 +574,16 @@ def _retract_core(
     delta_phi:    torch.Tensor,           # (..., n_gen) tangent step direction
 
     *,
-    step_size:    float = 1.0,
-    trust_region: Optional[float] = 0.1,   # None / <=0 disables the trust-region clamp
-    max_norm:     Optional[float] = 5.0,   # None / <=0 disables the max-norm clamp
-    eps:          float = 1e-6,
-    order:        int   = 4,
-    mode:         str   = "euclidean",
-    generators:   Optional[torch.Tensor]  = None,
-    gram_pinv_:   Optional[torch.Tensor]  = None,
+    step_size:      float                  = 1.0,
+    eps:            float                  = 1e-6,
+    order:          int                    = 4,
+    mode:           str                    = "euclidean",
+    compact_blocks: bool                   = False,
+    trust_region:   Optional[float]        = 0.1,   # None / <=0 disables the trust-region clamp
+    max_norm:       Optional[float]        = 5.0,   # None / <=0 disables the max-norm clamp
+    generators:     Optional[torch.Tensor] = None,
+    gram_pinv_:     Optional[torch.Tensor] = None,
+    block_dims:     Optional[List[int]]    = None,
 ) -> torch.Tensor:
     r"""Shared retraction: scale -> trust-region clamp -> compose -> max-norm clamp.
 
@@ -566,7 +596,20 @@ def _retract_core(
     if trust_region is not None and trust_region > 0:
         u_norm = update.norm(dim=-1, keepdim=True)
         update = update * (trust_region / (u_norm + eps)).clamp(max=1.0)
-    phi_new = compose_phi(phi, update, generators, order=order, mode=mode, gram_pinv_=gram_pinv_)
+    if compact_blocks:
+        phi_new = compose_phi(
+            phi,
+            update,
+            generators,
+            order=order,
+            mode=mode,
+            gram_pinv_=gram_pinv_,
+            block_dims=block_dims,
+            compact_blocks=True,
+        )
+    else:
+        phi_new = compose_phi(phi, update, generators, order=order, mode=mode,
+                              gram_pinv_=gram_pinv_)
     if max_norm is not None and max_norm > 0:
         n_norm = phi_new.norm(dim=-1, keepdim=True)
         phi_new = torch.where(n_norm > max_norm, phi_new * (max_norm / (n_norm + eps)), phi_new)
@@ -580,19 +623,22 @@ def retract_glk(
     generators:   torch.Tensor,           # (n_gen, K, K)
 
     *,
-    step_size:    float = 1.0,
-    trust_region: float = 0.1,            # tighter than SO(N): GL(K) is non-compact
-    max_norm:     float = 10.0,            # bounds singular values to ~[e^-5, e^5]
-    eps:          float = 1e-6,
-    order:        int   = 4,
-    mode:         str   = "euclidean",
-    gram_pinv_:   Optional[torch.Tensor] = None,
+    step_size:      float                  = 1.0,
+    trust_region:   float                  = 0.1,    # tighter than SO(N): GL(K) is non-compact
+    max_norm:       float                  = 10.0,   # bounds singular values to ~[e^-5, e^5]
+    eps:            float                  = 1e-6,
+    order:          int                    = 4,
+    mode:           str                    = "euclidean",
+    compact_blocks: bool                   = False,
+    gram_pinv_:     Optional[torch.Tensor] = None,
+    block_dims:     Optional[List[int]]    = None,
 ) -> torch.Tensor:
     r"""GL(K) retraction (no det control here; the dispatcher applies it)."""
     return _retract_core(
         phi, delta_phi, step_size=step_size, trust_region=trust_region,
         max_norm=max_norm, eps=eps, order=order, mode=mode,
-        generators=generators, gram_pinv_=gram_pinv_,
+        compact_blocks=compact_blocks, generators=generators, gram_pinv_=gram_pinv_,
+        block_dims=block_dims,
     )
 
 

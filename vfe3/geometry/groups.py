@@ -42,6 +42,7 @@ class GaugeGroup:
     invariant_families:   Tuple[str, ...]        = ()        # registry-declared exact families; empty fails closed
     irrep_labels:         Optional[List[str]]    = None      # per-block label ('l1', 'sym2', ...); None = label-less
     algebra:              Optional[str]          = None      # irrep-registry algebra key ('so' | 'sp'); None = label-less
+    phi_coordinate_layout: Optional[str]         = None      # explicit packed-coordinate capability; None = unknown
 
     # Cached pseudo-inverse of the generator Frobenius Gram (computed once, off __init__/eq/repr).
     _gram_pinv_cache:     Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
@@ -205,6 +206,8 @@ def _build_block_glk(
         generators=G,
         irrep_dims=irrep_dims,
         skew_symmetric=False,
+        phi_coordinate_layout=("block_head_row_major"
+                               if n_heads > 1 and not cross_couplings else None),
     )
 
 

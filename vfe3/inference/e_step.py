@@ -222,35 +222,38 @@ def build_belief_transport(
     group:              GaugeGroup,
 
     *,
-    transport_mode:     str                    = "flat",   # connection-regime registry key
-    gauge_parameterization: str                = "phi",    # 'phi' (exp path) | 'omega_direct' (stored element)
-    omega:              'torch.Tensor | CompactBlockElement | None' = None,  # stored U_i (omega_direct only)
-    gauge_mode:         str                    = "learned", # 'learned' | 'trivial' (forwarded to the builder)
-    cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
-    link_alpha:         float                  = 1.0,       # direct-link scale (regime_ii_link / _charted)
-    link_soft_cap:      float                  = 6.0,       # direct-link embedded-Frobenius soft cap
-    clamp_monitor:      bool                   = False,     # opt-in: warn when the exp Frobenius clamp fires (host sync)
-    rope_on_cov:        bool                   = False,     # rotate the covariance too (full-gauge)
-    rope_on_value:      bool                   = True,      # False -> value aggregation uses the un-rotated base
+    transport_mode:              str                                         = "flat",   # connection-regime registry key
+    gauge_parameterization:      str                                         = "phi",    # 'phi' (exp path) | 'omega_direct' (stored element)
+    omega:                       'torch.Tensor | CompactBlockElement | None' = None,     # stored U_i (omega_direct only)
+    gauge_mode:                  str                                         = "learned", # 'learned' | 'trivial' (forwarded to the builder)
+    cocycle_relaxation:          float                                       = 1.0,       # regime_ii homotopy alpha; 0 -> flat
+    link_alpha:                  float                                       = 1.0,       # direct-link scale (regime_ii_link / _charted)
+    link_soft_cap:               float                                       = 6.0,       # direct-link embedded-Frobenius soft cap
+    clamp_monitor:               bool                                        = False,     # opt-in: warn when the exp Frobenius clamp fires (host sync)
+    rope_on_cov:                 bool                                        = False,     # rotate the covariance too (full-gauge)
+    rope_on_value:               bool                                        = True,      # False -> value aggregation uses the un-rotated base
     # Tier-1 transport perf toggles (2026-07-05; default OFF = byte-identical: the dense einsum and
     # the 'dim' island rule stay the default code paths).
-    exp_fp64_mode:           str   = "dim",                 # stable_matrix_exp_pair island keying (flat builders; 'dim' | 'norm')
-    exp_fp64_norm_threshold: float = 5.0,                   # 'norm': upcast only when max clamped block ||M||_F >= this
-    transport_mean_per_head: bool  = False,                 # factored transport_mean contracts per gauge block (fused path only)
-    mu:                 Optional[torch.Tensor] = None,      # regime_ii edge connection reads these
-    sigma:              Optional[torch.Tensor] = None,      # regime_ii_covariant features read these
-    connection_W:       Optional[torch.Tensor] = None,      # regime_ii learned bilinear connection
-    connection_M:       Optional[torch.Tensor] = None,      # regime_ii_covariant learned covariant connection (Route B)
-    connection_L:       Optional[torch.Tensor] = None,      # regime_ii_link* learned direct link
-    mu_key:             Optional[torch.Tensor] = None,      # regime_ii KEY-slot means (None -> mu)
-    sigma_key:          Optional[torch.Tensor] = None,      # regime_ii_covariant KEY-slot variances (None -> sigma)
-    rope:               Optional[torch.Tensor] = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
-    reflection:         Optional[torch.Tensor] = None,      # (B, N) per-token sign s_i in {+1,-1}; phi-path fold (None -> off)
+    exp_fp64_mode:               str                                         = "dim",    # stable_matrix_exp_pair island keying (flat builders; 'dim' | 'norm')
+    exp_fp64_norm_threshold:     float                                       = 5.0,      # 'norm': upcast only when max clamped block ||M||_F >= this
+    transport_mean_per_head:     bool                                        = False,    # factored transport_mean contracts per gauge block (fused path only)
+    compact_phi_block_transport: bool                                        = False,    # packed phi factors for canonical flat block_glk
+    mu:                          Optional[torch.Tensor]                      = None,     # regime_ii edge connection reads these
+    sigma:                       Optional[torch.Tensor]                      = None,     # regime_ii_covariant features read these
+    connection_W:                Optional[torch.Tensor]                      = None,     # regime_ii learned bilinear connection
+    connection_M:                Optional[torch.Tensor]                      = None,     # regime_ii_covariant learned covariant connection (Route B)
+    connection_L:                Optional[torch.Tensor]                      = None,     # regime_ii_link* learned direct link
+    mu_key:                      Optional[torch.Tensor]                      = None,     # regime_ii KEY-slot means (None -> mu)
+    sigma_key:                   Optional[torch.Tensor]                      = None,     # regime_ii_covariant KEY-slot variances (None -> sigma)
+    rope:                        Optional[torch.Tensor]                      = None,     # (N, K, K) gauge-RoPE rotation (None -> off)
+    reflection:                  Optional[torch.Tensor]                      = None,     # (B, N) per-token sign s_i in {+1,-1}; phi-path fold (None -> off)
 ) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport':
     r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
 
     On the flat + block-diagonal-with-equal-blocks path (``_can_fuse_flat``) returns a
-    :class:`FactoredTransport` -- the per-token exps only, NEVER the dense (B,N,N,K,K) Omega --
+    :class:`FactoredTransport` -- or, for the opt-in canonical block_glk P1 route, a
+    :class:`CompactFactoredTransport` -- containing per-token exps only, NEVER the dense
+    (B,N,N,K,K) Omega --
     which ``transport_mean`` / ``transport_covariance`` consume on a fused fast path (the mean is an
     exact reassociation; the diagonal covariance factors per head). The direct-link modes return a
     :class:`DirectLinkTransport` whose edge and optional vertex factors also remain separate through
@@ -289,7 +292,9 @@ def build_belief_transport(
         built = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
                                          exp_fp64_mode=exp_fp64_mode,
                                          exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                                         mean_per_head=transport_mean_per_head)
+                                         mean_per_head=transport_mean_per_head,
+                                         compact_blocks=(compact_phi_block_transport
+                                                         and reflection is None))
     else:
         # Registry-driven routing (audit 2026-07-01 round-3, punch 12b): forward ALL state kwargs
         # once, gating the belief tensors on the registry's needs-sets (the add-by-registering
@@ -517,8 +522,12 @@ def phi_alignment_loss(
     link_alpha:                float = 1.0,           # direct-link scale (regime_ii_link / _charted)
     link_soft_cap:             float = 6.0,           # direct-link embedded-Frobenius soft cap
     clamp_monitor:             bool  = False,         # opt-in: warn when the exp Frobenius clamp fires
-    rope_on_cov:               bool  = False,         # gauge-RoPE: rotate the covariance sandwich too
-    rope_on_value:             bool  = True,          # False -> value aggregation uses the un-rotated base
+    exp_fp64_mode:                 str   = "dim",  # flat phi-factor float64-island keying
+    exp_fp64_norm_threshold:       float = 5.0,
+    transport_mean_per_head:       bool  = False,
+    compact_phi_block_transport:   bool  = False,
+    rope_on_cov:                   bool  = False,  # gauge-RoPE: rotate the covariance sandwich too
+    rope_on_value:                 bool  = True,   # False -> value aggregation uses the un-rotated base
 
     rope:         Optional[torch.Tensor] = None,      # (N,K,K) gauge-RoPE rotation (None -> off)
     reflection:   Optional[torch.Tensor] = None,      # (N,) per-token sign s_i; None -> connected component
@@ -550,12 +559,22 @@ def phi_alignment_loss(
     # LIVE phi leaf -- the factored container is differentiable in phi, so the envelope
     # phi-gradient is preserved while the per-iteration dense (N,N,K,K) Omega disappears on the
     # flat equal-blocks path.
+    compact_phi_block_transport = (
+        compact_phi_block_transport
+        and transport_mode == "flat"
+        and reflection is None
+        and group.phi_coordinate_layout == "block_head_row_major"
+    )
     omega = build_belief_transport(phi, group, transport_mode=transport_mode, mu=mu, sigma=sigma,
                                    reflection=reflection,
                                    connection_W=connection_W, connection_M=connection_M,
                                    connection_L=connection_L, link_alpha=link_alpha,
                                    link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                                    cocycle_relaxation=cocycle_relaxation,
+                                   exp_fp64_mode=exp_fp64_mode,
+                                   exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                                   transport_mean_per_head=transport_mean_per_head,
+                                   compact_phi_block_transport=compact_phi_block_transport,
                                    rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value)
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = transport_covariance(omega, sigma)
@@ -630,9 +649,10 @@ def e_step_iteration(
     link_alpha:                float = 1.0,                    # direct-link scale (regime_ii_link / _charted)
     link_soft_cap:             float = 6.0,                    # direct-link embedded-Frobenius soft cap
     clamp_monitor:             bool = False,                   # opt-in: warn when the exp Frobenius clamp fires (host sync)
-    exp_fp64_mode:             str   = "dim",                  # Tier-1: flat-builder float64-island keying ('dim' | 'norm')
-    exp_fp64_norm_threshold:   float = 5.0,                    # Tier-1 'norm': max clamped block ||M||_F upcast threshold
-    transport_mean_per_head:   bool  = False,                  # Tier-1: factored transport_mean contracts per gauge block
+    exp_fp64_mode:                 str   = "dim",  # Tier-1: flat-builder float64-island keying ('dim' | 'norm')
+    exp_fp64_norm_threshold:       float = 5.0,    # Tier-1 'norm': max clamped block ||M||_F upcast threshold
+    transport_mean_per_head:       bool  = False,  # Tier-1: factored transport_mean contracts per gauge block
+    compact_phi_block_transport:   bool  = False,  # P1: packed canonical flat block_glk phi factors
 
     log_prior:                 Optional[torch.Tensor] = None,
     connection_W:              Optional[torch.Tensor] = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
@@ -663,6 +683,13 @@ def e_step_iteration(
             "gauge_parameterization='omega_direct' does not support E-step phi updates; "
             f"got e_phi_lr={e_phi_lr}. Set e_phi_lr=0.0."
         )
+    compact_phi_block_transport = (
+        compact_phi_block_transport
+        and transport_mode == "flat"
+        and gauge_parameterization == "phi"
+        and belief.reflection is None
+        and group.phi_coordinate_layout == "block_head_row_major"
+    )
     # Build the forward belief-transport (P0 #2): on the flat + block-diagonal-with-equal-blocks
     # path this is a FactoredTransport (the per-token exps only, NO dense (B,N,N,K,K) Omega), which
     # the belief-gradient kernel / oracle consume opaquely through transport_mean / covariance;
@@ -713,6 +740,7 @@ def e_step_iteration(
                 cocycle_relaxation=cocycle_relaxation,
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
+                compact_phi_block_transport=compact_phi_block_transport,
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
             )
         omega_builder = None
@@ -916,6 +944,10 @@ def e_step_iteration(
                 connection_M=(connection_M.detach() if connection_M is not None else None),
                 connection_L=(connection_L.detach() if connection_L is not None else None),
                 link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
+                exp_fp64_mode=exp_fp64_mode,
+                exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                transport_mean_per_head=transport_mean_per_head,
+                compact_phi_block_transport=compact_phi_block_transport,
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]
         if grad_record is not None:                      # RAW phi-gradient norm (pre-precondition)
@@ -923,7 +955,14 @@ def e_step_iteration(
         grad_phi = precondition_phi_gradient(
             grad_phi, belief.phi, group.generators, mode=phi_precond_mode, irrep_dims=group.irrep_dims,
         )
-        phi = retract_phi(belief.phi, -grad_phi, group, step_size=e_phi_lr, mode=phi_retract_mode)
+        phi = retract_phi(
+            belief.phi,
+            -grad_phi,
+            group,
+            step_size=e_phi_lr,
+            mode=phi_retract_mode,
+            compact_blocks=compact_phi_block_transport,
+        )
 
     # _replace (not a fresh BeliefState): carry the untouched channels (omega frame, s/r) through the
     # rebuild. omega is the CONSTANT GL(K) frame under gauge_parameterization='omega_direct' -- the
@@ -963,6 +1002,7 @@ def e_step(
     oracle_unroll_grad:          bool = False,    # explicit (not in kwargs): keep it off the F_diag bag
     randomize_e_steps:           bool = False,    # training forwards sample T; eval keeps n_iter
     transport_mean_per_head:     bool = False,    # factored transport_mean contracts per gauge block
+    compact_phi_block_transport: bool = False,    # packed canonical flat block_glk phi factors
     rope_on_cov:                 bool = False,
     rope_on_value:               bool = True,
 
@@ -1011,6 +1051,13 @@ def e_step(
             "gauge_parameterization='omega_direct' does not support E-step phi updates; "
             f"got e_phi_lr={e_phi_lr}. Set e_phi_lr=0.0."
         )
+    compact_phi_block_transport = (
+        compact_phi_block_transport
+        and transport_mode_kw == "flat"
+        and gauge_param_kw == "phi"
+        and belief.reflection is None
+        and group.phi_coordinate_layout == "block_head_row_major"
+    )
     _hoisted_omega: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None
     if e_phi_lr == 0.0 and transport_mode_kw == "flat":
         if prebuilt_transport is not None:
@@ -1030,6 +1077,7 @@ def e_step(
                 clamp_monitor=kwargs.get("clamp_monitor", False),
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
+                compact_phi_block_transport=compact_phi_block_transport,
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
             )
 
@@ -1117,6 +1165,7 @@ def e_step(
                     e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
                     exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                     transport_mean_per_head=transport_mean_per_head,
+                    compact_phi_block_transport=compact_phi_block_transport,
                     grad_record=grad_record,
                     gauge_parameterization=gauge_param_kw,
                     log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
@@ -1151,6 +1200,7 @@ def e_step(
                         clamp_monitor=kwargs.get("clamp_monitor", False),
                         exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                         transport_mean_per_head=transport_mean_per_head,
+                        compact_phi_block_transport=compact_phi_block_transport,
                         rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                     )
         else:
@@ -1160,6 +1210,7 @@ def e_step(
                 e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
+                compact_phi_block_transport=compact_phi_block_transport,
                 grad_record=grad_record,                       # last iteration overwrites -> converged-ish grad
                 gauge_parameterization=gauge_param_kw,
                 log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
