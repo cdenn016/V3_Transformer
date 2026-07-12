@@ -32,13 +32,13 @@ import os
 import shutil
 import subprocess
 import time
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional
 
 import torch
 
-from vfe3.config import VFE3Config
+from vfe3.config import VFE3Config, config_from_serialized
 from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.ema import EMA
 from vfe3.runtime import deterministic_state
@@ -96,6 +96,112 @@ def _atomic_replace(
         except Exception:
             _cleanup_tmp()
             raise
+
+
+def _selection_semantic_config(
+    config: 'VFE3Config | Mapping[str, object]',
+) -> Dict[str, object]:
+    r"""Project a config down to the fields that determine the SELECTED weights.
+
+    Model selection depends on architecture, family/transport/decode, optimizer/schedule, and every
+    objective weight -- but NOT on resume bookkeeping (``resume_from``) or output cadence
+    (``log_interval``, ``checkpoint_interval``, ``generate_figures``). Comparing this projection lets
+    a cross-run resume carry otherwise-identical selected weights even when the resumed run changed
+    its resume path or figure/log cadence, while every architecture/objective difference still
+    invalidates the bundle.
+
+    A live :class:`VFE3Config` starts from ``asdict`` directly. A SERIALIZED mapping is first checked
+    key-by-key against the current fields -- an unknown newer field FAILS CLOSED rather than being
+    silently ignored (as :func:`config_from_serialized` would) -- and is then migrated through
+    ``config_from_serialized`` so a genuinely older mapping acquires the current defaults for any
+    field it predates. The raw mapping's full ``config_fingerprint`` is verified elsewhere (before
+    this normalization), so default migration never hides excluded-field tampering."""
+    if isinstance(config, VFE3Config):
+        normalized = asdict(config)
+    elif isinstance(config, Mapping):
+        known = {field.name for field in fields(VFE3Config)}
+        unknown = sorted(str(key) for key in config if key not in known)
+        if unknown:
+            raise ValueError(
+                f"best-model selection config carries field(s) unknown to this code version "
+                f"{unknown}; refusing to migrate (an artifact from a newer code version)")
+        normalized = asdict(config_from_serialized(
+            config, source="best-model selection compatibility"))
+    else:
+        raise TypeError(
+            f"_selection_semantic_config expects a VFE3Config or mapping, got {type(config).__name__}")
+    for key in ("resume_from", "log_interval", "checkpoint_interval", "generate_figures"):
+        normalized.pop(key, None)
+    return normalized
+
+
+def _read_best_model_bundle(
+    path:                 Path,
+    cfg:                  VFE3Config,
+    expected_model_state: Mapping[str, torch.Tensor],
+    map_location:         'str | torch.device',
+) -> Dict[str, object]:
+    r"""Safe-load ``best_model.pt`` and validate it as a portable selected-weights bundle, NONMUTATING.
+
+    Loaded with ``weights_only=True`` (the bundle is only tensors, an ``asdict`` config, and a
+    fingerprint string). Fails closed unless every check passes: the bundle is the three-key semantic
+    best-model mapping; its stored full ``config_fingerprint`` equals the recomputed fingerprint of its
+    own saved config (excluded-field tampering is still caught BEFORE the selection projection); the
+    SELECTION projection of the saved config matches the live config's projection; and ``model_state``
+    matches ``expected_model_state`` key-for-key on tensor type, shape, and dtype. Neither ``cfg`` nor
+    ``expected_model_state`` is mutated, and no state is loaded into any model. Returns the validated
+    bundle as a plain ``dict``."""
+    bundle = torch.load(path, map_location=map_location, weights_only=True)
+    if not isinstance(bundle, Mapping) or set(bundle) != {
+            "model_state", "config", "config_fingerprint"}:
+        raise RuntimeError(f"best-model bundle at {path} is not a semantic best-model mapping")
+    saved_config = bundle["config"]
+    if not isinstance(saved_config, Mapping):
+        raise RuntimeError(f"best-model bundle at {path} has a non-mapping config")
+    if bundle["config_fingerprint"] != semantic_config_fingerprint(saved_config):
+        raise RuntimeError(f"best-model bundle at {path} has a config fingerprint mismatch")
+    if (semantic_config_fingerprint(_selection_semantic_config(saved_config))
+            != semantic_config_fingerprint(_selection_semantic_config(cfg))):
+        raise RuntimeError(
+            f"best-model bundle at {path} does not match the active selection config")
+    saved_state = bundle["model_state"]
+    if not isinstance(saved_state, Mapping):
+        raise RuntimeError(f"best-model bundle at {path} has a non-mapping model_state")
+    if set(saved_state) != set(expected_model_state):
+        raise RuntimeError(
+            f"best-model bundle at {path} model_state keys do not match the live model")
+    for key, expected in expected_model_state.items():
+        actual = saved_state[key]
+        if not isinstance(actual, torch.Tensor):
+            raise RuntimeError(f"best-model bundle at {path} entry {key!r} is not a tensor")
+        if actual.shape != expected.shape or actual.dtype != expected.dtype:
+            raise RuntimeError(
+                f"best-model bundle at {path} entry {key!r} has an incompatible shape/dtype "
+                f"(got {tuple(actual.shape)}/{actual.dtype}, expected "
+                f"{tuple(expected.shape)}/{expected.dtype})")
+    return dict(bundle)
+
+
+def _publish_best_model_bundle(
+    bundle:               Mapping[str, object],
+    expected_model_state: Mapping[str, torch.Tensor],
+    artifacts:            'RunArtifacts',
+) -> None:
+    r"""Revalidate ``bundle`` against the live run and atomically publish it as the run's ``best_model.pt``.
+
+    Writes through a same-directory ``.pt.tmp`` and ``os.replace`` so no reader ever sees a partial
+    bundle; revalidates the exact bytes it writes (a byte-for-byte round-trip through
+    :func:`_read_best_model_bundle`) so a corrupt in-memory bundle fails closed before it is published.
+    The bundle is NEVER loaded into the live training model -- publication only makes the selection
+    checkpoint reachable in the new run directory for later finalization."""
+    tmp = artifacts.best_path.with_suffix(".pt.tmp")
+    torch.save(dict(bundle), tmp)
+    try:
+        _read_best_model_bundle(tmp, artifacts.cfg, expected_model_state, "cpu")
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    _atomic_replace(artifacts.best_path, tmp)
 
 
 class RunArtifacts:
@@ -344,6 +450,24 @@ class RunArtifacts:
                 "batches_consumed":            batches_consumed,
                 "epoch":                       epoch,
             }
+        # Portable best-model selection state (PB-03): a finite best_val_ppl means best_model.pt IS the
+        # selected checkpoint, so its validated bundle is embedded here and travels with the checkpoint
+        # across a cross-run-directory resume (older bundles carried only the scalar, whose file was left
+        # behind). A finite best scalar without a readable, matching best_model.pt is an integrity error
+        # and MUST prevent checkpoint publication; no validation best -> explicit empty selection state.
+        if math.isfinite(float(self.best_val_ppl)):
+            if not self.best_path.is_file():
+                raise RuntimeError(
+                    f"finite best_val_ppl ({float(self.best_val_ppl)}) but no readable best_model.pt "
+                    f"at {self.best_path}; cannot embed a portable best-model bundle")
+            best_model_bundle: Optional[Dict[str, object]] = _read_best_model_bundle(
+                self.best_path, cfg, model.state_dict(), "cpu")
+            saved_best_val_ppl = float(self.best_val_ppl)
+            saved_best_step    = self.best_step
+        else:
+            best_model_bundle  = None
+            saved_best_val_ppl = float("inf")
+            saved_best_step    = None
         torch.save({
             "step":            int(step),
             "model_state":     model.state_dict(),
@@ -355,12 +479,73 @@ class RunArtifacts:
             "scaler_state":    (scaler.state_dict()
                                 if scaler is not None and scaler.is_enabled() else None),
             "ema_state":       (ema.state_dict() if ema is not None else None),
-            "best_val_ppl":    float(self.best_val_ppl),
-            "best_step":       self.best_step,
+            "best_val_ppl":    saved_best_val_ppl,
+            "best_step":       saved_best_step,
+            "best_model_bundle": best_model_bundle,
             "data_state":      saved_data_state,
         }, tmp)
         _atomic_replace(path, tmp)
         return path
+
+
+def _restore_best_selection(
+    ckpt:                 Mapping[str, object],
+    checkpoint_path:      Path,
+    artifacts:            'RunArtifacts',
+    expected_model_state: Mapping[str, torch.Tensor],
+    map_location:         'str | torch.device',
+) -> None:
+    r"""Restore portable best-model selection state into ``artifacts`` from a loaded checkpoint (PB-03).
+
+    Precedence: (1) validate + publish a modern checkpoint's embedded ``best_model_bundle``; (2) for a
+    legacy checkpoint lacking that field, validate ``<old_run>/best_model.pt`` (``old_run`` is
+    ``checkpoint_path.parent.parent``) and publish it into the new run; (3) otherwise reset the
+    selection state to empty, warning only when a finite-but-unreachable best scalar is being dropped.
+    The best weights are only PUBLISHED (made reachable in the new run directory), never loaded into the
+    live training model. After publication the scalar metadata is set and the file is required to exist.
+    """
+    import warnings
+
+    embedded = ckpt.get("best_model_bundle")
+    ckpt_best_ppl = ckpt.get("best_val_ppl")
+    had_finite_best = ckpt_best_ppl is not None and math.isfinite(float(ckpt_best_ppl))
+
+    # (1) Modern checkpoint carrying an embedded validated bundle.
+    if isinstance(embedded, Mapping):
+        _publish_best_model_bundle(embedded, expected_model_state, artifacts)
+        artifacts.best_val_ppl = float(ckpt_best_ppl)
+        artifacts.best_step    = ckpt.get("best_step")
+        if not artifacts.best_path.is_file():
+            raise RuntimeError(
+                "best-model bundle is not reachable after publication into the resumed run")
+        return
+
+    # (2) Legacy checkpoint (no best_model_bundle field): import the sibling best_model.pt if reachable.
+    if "best_model_bundle" not in ckpt and had_finite_best:
+        old_best = checkpoint_path.parent.parent / "best_model.pt"
+        if old_best.is_file():
+            bundle = _read_best_model_bundle(
+                old_best, artifacts.cfg, expected_model_state, map_location)
+            _publish_best_model_bundle(bundle, expected_model_state, artifacts)
+            artifacts.best_val_ppl = float(ckpt_best_ppl)
+            artifacts.best_step    = ckpt.get("best_step")
+            if not artifacts.best_path.is_file():
+                raise RuntimeError(
+                    "best-model bundle is not reachable after publication into the resumed run")
+            return
+
+    # (3) No reachable selected weights: reset to empty, never retaining an unreachable finite scalar.
+    artifacts.best_val_ppl = float("inf")
+    artifacts.best_step    = None
+    if had_finite_best:
+        warnings.warn(
+            f"resume from {checkpoint_path.name} carried finite best-val metadata "
+            f"(best_val_ppl={float(ckpt_best_ppl)}) but no reachable best-model weights (neither an "
+            f"embedded bundle nor a sibling best_model.pt); dropping the unreachable selection state, "
+            f"so model selection restarts from this run.",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 def load_checkpoint(
@@ -395,10 +580,14 @@ def load_checkpoint(
     when given, the CURRENT config is compared against the bundle's saved config and any
     differing fields are warned about -- strict ``load_state_dict`` already catches
     shape-changing divergence, but shape-preserving semantic drift (LR schedule, n_e_steps,
-    e_*_lr, ...) would otherwise pass silently. ``artifacts`` (audit 2026-07-01 C2): when given,
-    the bundled ``best_val_ppl``/``best_step`` model-selection state is restored into it (bundles
-    without those fields skip the restore). When a mutable ``data_state`` mapping is supplied, it
-    is filled from the bundled iterator cursor; older checkpoints leave it empty.
+    e_*_lr, ...) would otherwise pass silently. ``artifacts`` (audit 2026-07-01 C2, PB-03): when
+    given, the portable best-model selection state is restored into it -- a modern checkpoint's
+    embedded, validated ``best_model_bundle`` (or, for a legacy checkpoint, the sibling
+    ``<old_run>/best_model.pt``) is published into the resumed run's directory and the
+    ``best_val_ppl``/``best_step`` scalars are set; when no reachable bundle exists the selection state
+    resets to ``inf``/``None`` with one warning, so an unreachable best scalar is never retained. When a
+    mutable ``data_state`` mapping is supplied, it is filled from the bundled iterator cursor; older
+    checkpoints leave it empty.
 
     The bundle is loaded with ``weights_only=True`` by default, which refuses to execute arbitrary
     pickle reductions: our bundle carries only tensors, an ``asdict`` config dict, and RNG tensors
@@ -452,14 +641,15 @@ def load_checkpoint(
             ema.load_state_dict(ckpt["ema_state"])
         else:
             ema.reset(model)   # no bundled shadow: reseed from the just-loaded weights, not the pre-load init
-    # Best-val model-selection state (audit 2026-07-01 C2): restore best_val_ppl/best_step into the
-    # resumed run's RunArtifacts so a continuation with no post-resume improvement still reports the
-    # run-wide best. Only the scalar metadata is bundled; best_model.pt itself lives in the run_dir
-    # (correct for a same-run_dir resume; a cross-run_dir resume still lacks the weights file).
-    # Bundles written before these fields existed simply skip the restore (backward compatible).
-    if artifacts is not None and ckpt.get("best_val_ppl") is not None:
-        artifacts.best_val_ppl = float(ckpt["best_val_ppl"])
-        artifacts.best_step    = ckpt.get("best_step")
+    # Portable best-val model-selection state (PB-03, extends audit 2026-07-01 C2): restore
+    # best_val_ppl/best_step AND make the selected weights reachable in the resumed run's directory,
+    # so a cross-run_dir resume no longer restores best metadata whose best_model.pt is missing. The
+    # scalar is never retained without reachable weights (audit m26). By precedence:
+    #   (1) a modern checkpoint's embedded best_model_bundle is validated and published into the new run;
+    #   (2) a legacy checkpoint (no such field) validates <old_run>/best_model.pt and publishes it;
+    #   (3) neither -> the selection state resets to empty, and any unreachable finite scalar is dropped.
+    if artifacts is not None:
+        _restore_best_selection(ckpt, checkpoint_path, artifacts, model.state_dict(), map_location)
     if cfg is not None and ckpt.get("config") is not None:
         saved = ckpt["config"]
         current = asdict(cfg)
@@ -915,8 +1105,14 @@ def finalize_run(
     if device is None:
         device = next(model.parameters()).device
 
+    # Reachability guard (PB-03): finite best metadata REQUIRES a reachable best_model.pt; an old file
+    # left with best_val_ppl=inf is ignored (not treated as selected state). The held-out test eval
+    # intentionally scores the SELECTED validation checkpoint, so reload it whenever selection is live.
+    has_best_metadata = math.isfinite(float(artifacts.best_val_ppl))
+    if has_best_metadata and not artifacts.best_path.is_file():
+        raise RuntimeError("finite best-model metadata has no reachable weights")
     reloaded_best = False
-    if artifacts.best_path.exists():
+    if has_best_metadata:
         bundle = torch.load(artifacts.best_path, map_location=device, weights_only=True)
         if not isinstance(bundle, Mapping) or not {
                 "model_state", "config", "config_fingerprint"}.issubset(bundle):
@@ -927,12 +1123,16 @@ def finalize_run(
             raise ValueError(
                 f"best checkpoint {artifacts.best_path} has a non-mapping config")
         saved_fingerprint = semantic_config_fingerprint(saved_config)
+        # RETAINED full internal fingerprint check (excluded-field tampering is still caught)...
         if bundle["config_fingerprint"] != saved_fingerprint:
             raise ValueError(
                 f"best checkpoint {artifacts.best_path} has a config fingerprint mismatch")
-        if saved_fingerprint != semantic_config_fingerprint(asdict(cfg)):
+        # ...but the saved-vs-live comparison is on the SELECTION PROJECTION, so a resume-path or
+        # output-cadence change cannot reject otherwise-identical selected weights.
+        if (semantic_config_fingerprint(_selection_semantic_config(saved_config))
+                != semantic_config_fingerprint(_selection_semantic_config(cfg))):
             raise ValueError(
-                f"best checkpoint {artifacts.best_path} does not match the active config")
+                f"best checkpoint {artifacts.best_path} does not match the active selection config")
         model.load_state_dict(bundle["model_state"])
         reloaded_best = True
         logger.info("Reloaded best-val checkpoint (step %s, val PPL %.3f) for test eval",
@@ -1137,6 +1337,14 @@ def finalize_validation_run(
         device = next(model.parameters()).device
     ema = terminal_state.ema if terminal_state is not None else None
 
+    # Reachability guard (PB-03): entering with FINITE best metadata (a resumed periodic best) requires
+    # a reachable best_model.pt. A recomputed ablation cell instead enters with INFINITE metadata even
+    # when a stale file survives on disk, so that file is ignored -- terminal validation replaces it
+    # below rather than the finalizer silently selecting the previous cell's weights. This finalizer
+    # never loads a preexisting best into the live model before scoring the terminal EMA.
+    if math.isfinite(float(artifacts.best_val_ppl)) and not artifacts.best_path.is_file():
+        raise RuntimeError("finite best-model metadata has no reachable weights")
+
     n_params = int(sum(p.numel() for p in model.parameters()))
     final_train_loss = (float(losses[-1]) if losses else None)
 
@@ -1164,6 +1372,12 @@ def finalize_validation_run(
         prior_best = artifacts.best_val_ppl
         artifacts.log_metrics(terminal_row)
         artifacts.maybe_save_best(cfg.max_steps, model, final_ppl)
+        # After the terminal save the selection is live and MUST be reachable: maybe_save_best either
+        # atomically replaced any stale file with the terminal weights (a recomputed cell) or left an
+        # already-reachable earlier best (guarded above). Fail closed before publishing the success
+        # contract so a stale-contract rerun never selects the previous cell's weights.
+        if not (math.isfinite(float(artifacts.best_val_ppl)) and artifacts.best_path.is_file()):
+            raise RuntimeError("finite best-model metadata has no reachable weights")
         primary_val_ppl = (min(prior_best, final_ppl) if math.isfinite(prior_best) else final_ppl)
         best_val_ppl = (artifacts.best_val_ppl if artifacts.best_val_ppl != float("inf") else None)
 
