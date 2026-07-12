@@ -1704,6 +1704,7 @@ class VFEModel(nn.Module):
         omega = build_belief_transport(phi, self.group, transport_mode="flat",
                                        gauge_parameterization=gp, omega=omega,
                                        reflection=reflection,
+                                       transport_mean_per_head=cfg.transport_mean_per_head,
                                        compact_phi_block_transport=self._compact_phi_blocks_enabled())
         s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
         s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
