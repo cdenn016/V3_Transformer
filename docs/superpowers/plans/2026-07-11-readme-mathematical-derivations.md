@@ -46,12 +46,14 @@ In one display block, define the Gaussian state, Lie-algebra chart, group elemen
 
 ```text
 q_i=N(mu_i,Sigma_i), mu_i in R^K, Sigma_i in SPD(K);
-A_i=sum_a phi_i^a G_a, U_i=exp(A_i), Omega_ij=U_i U_j^{-1};
+A_i=sum_a phi_i^a G_a;
+Ahat_i=A_i when ||A_i||_F<=20, else Ahat_i=20 A_i/||A_i||_F;
+U_i=exp(Ahat_i), Omega_ij=U_i U_j^{-1};
 G_block=product_{h=1}^H GL(d_h), d_h=K/H,
 U_i=diag(U_i^(1),...,U_i^(H)).
 ```
 
-Immediately specialize to `K=20`, `H=2`, and `d_h=10`, and describe the checked-in frame as two `GL^+(10)` blocks. Explain that one real matrix exponential stays in the positive-determinant component but is not a surjection onto that component.
+Immediately specialize to `K=20`, `H=2`, and `d_h=10`, and describe the checked-in frame as two `GL^+(10)` blocks. State that the non-skew path applies the whole-frame norm-20 clamp before exponentiation. Explain that the ordinary exponential parameterization applies without modification only inside the unclamped region; beyond it, radial magnitudes collapse onto the clamp boundary, and the effective joint frame image is a restricted subset of the unclamped block-group exponential image. Also state that each real matrix exponential stays in the positive-determinant component but that the blockwise exponential map is not a surjection onto that component.
 
 - [ ] **Step 3: Write display blocks 2 and 3 for transport and comparison energy**
 
@@ -149,9 +151,9 @@ pi_bar_hij^q=(1-w)pi_hij^b+w stopgrad(gamma_hij), w=0.5.
 
 Distinguish the prior-mixture weight `w=0.5` from the model-coupling coefficient `lambda_gamma=0.75`, and state that this detached fold alters the q forward update without carrying a gradient into s through that edge.
 
-- [ ] **Step 4: Write display block 9 for the frozen-attention MM target**
+- [ ] **Step 4: Write display block 9 for the mask-selected `mm_exact` target**
 
-Define the nonnegative effective weights `c_ik` and `w_ijk`, precision `P_ik`, precision-weighted mean target `mu_ik^*`, and variance target `sigma_ik^*`. Label the formulas as the exact minimizer of a frozen-attention, detached-key, diagonal-KL majorizer, not an exact minimizer of the self-consistent profiled objective.
+Define the strict pair mask `m_ij^(h) = 1{0 < E_ij^(h) < K_max}`, the nonnegative effective weights `c_ik` and `w_ijk`, precision `P_ik`, precision-weighted mean target `mu_ik^*`, and variance target `sigma_ik^*`. With attention, transported keys, coefficients, and masks fixed, label the formulas as closed-form minimizers over the enabled, nondegenerate coordinates of the mask-selected diagonal-KL surrogate implemented by `mm_exact`. State that exact-zero pair energies are omitted, so the surrogate is not a majorizer of the canonical frozen-attention objective, and deny majorization, descent, and exact self-consistent-argmin guarantees.
 
 - [ ] **Step 5: Write display block 10 for damping and the checked-in q specialization**
 
@@ -164,7 +166,7 @@ mu^(1)=0.25 mu^(0)+0.75 mu^*,
 sigma^(1)=sigma^(0), phi^(1)=phi^(0).
 ```
 
-State that the s step uses covariance-enabled MM with `eta=0.75`, while the q E-step freezes covariance and frames. Clarify that `e_phi_lr=0` does not freeze outer frame learning: AdamW uses `m_phi_lr=0.010`. Also clarify that the upstream s covariance and active mixer can still change covariance outside the q E-step.
+State that the s step uses covariance-enabled `mm_exact` fusion with `eta=0.75`, while the q E-step freezes covariance and frames. Clarify that `e_phi_lr=0` does not freeze outer frame learning: AdamW uses `m_phi_lr=0.010`. Also clarify that the upstream s covariance and active mixer can still change covariance outside the q E-step.
 
 - [ ] **Step 6: Write display block 11 for the alternate Fisher-gradient route**
 
@@ -181,7 +183,7 @@ Label these as a reusable registered route that is inactive under the checked-in
 
 - [ ] **Step 7: State the objective boundary**
 
-End the section with a prominent prose paragraph stating that `F_s` and `F_q` are target-blind structural objectives, the outer next-token loss is separate, and each inner stage performs one damped frozen-attention MM step. Explicitly deny one-ELBO, shared-functional EM monotonicity, evidence-ascent, convergence, and global-free-energy-descent claims for the production forward pass.
+End the section with a prominent prose paragraph stating that `F_s` and `F_q` are target-blind structural objectives, the outer next-token loss is separate, and each inner stage takes one damped step toward a mask-selected `mm_exact` fusion target. Explicitly deny majorization, surrogate-descent, exact self-consistent-argmin, one-ELBO, shared-functional EM monotonicity, evidence-ascent, convergence, and global-free-energy-descent claims for the production forward pass.
 
 - [ ] **Step 8: Inspect the second-stage structure**
 

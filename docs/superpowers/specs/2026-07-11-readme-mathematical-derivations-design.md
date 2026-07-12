@@ -67,8 +67,8 @@ Each mathematical block must identify one of three scopes in its surrounding pro
 
 No equation may silently move between these scopes. In particular, the full-Gaussian invariance
 theorem does not certify the projected diagonal route, the registered Fisher-gradient formula does
-not describe the active MM update, and the inner structural objectives do not become the outer
-next-token loss.
+not describe the active `mm_exact` fusion, and the inner structural objectives do not become the
+outer next-token loss.
 
 ## Notation and belief geometry
 
@@ -87,7 +87,13 @@ $$
 $$
 A_i=\sum_a\phi_i^aG_a\in\mathfrak g,
 \qquad
-U_i=\exp(A_i),
+\widehat A_i=
+\begin{cases}
+A_i, & \lVert A_i\rVert_F\leq20, \\
+20A_i/\lVert A_i\rVert_F, & \lVert A_i\rVert_F>20,
+\end{cases}
+\qquad
+U_i=\exp(\widehat A_i),
 \qquad
 \Omega_{ij}=U_iU_j^{-1}.
 $$
@@ -102,10 +108,13 @@ d_h=K/H,
 U_i=\operatorname{diag}\left(U_i^{(1)},\ldots,U_i^{(H)}\right).
 $$
 
-The checked-in chart has `K=20`, `H=2`, and `d_h=10`, so it realizes two `GL^+(10)` gauge blocks.
-The prose will distinguish algebra coordinates `phi`, algebra matrices `A`,
-and group elements `U`. It will also state that one real exponential lies in the positive
-determinant component but does not cover every element of that component.
+The checked-in non-skew route has `K=20`, `H=2`, and `d_h=10`, so its effective frame has two
+`GL^+(10)` gauge blocks. The prose will distinguish algebra coordinates `phi`, raw algebra matrices
+`A`, effective clamped matrices `A-hat`, and group elements `U`. It will state that the ordinary
+exponential parameterization applies without modification only inside the norm-20 region; outside
+it, radial magnitudes collapse onto the clamp boundary. The resulting joint frame image is a
+restricted subset of the unclamped block-group exponential image, and each block's exponential
+image does not cover every element of the positive-determinant component.
 
 ## Transport and Gaussian comparison energy
 
@@ -293,10 +302,12 @@ $$
 The final q attention uses `overline pi` in the Gibbs rule. The README will distinguish the
 `lambda_gamma=0.75` model-coupling weight from the independent `w=0.5` prior-mixture weight.
 
-## Frozen-attention MM update
+## Mask-selected `mm_exact` fusion target
 
-The README will derive the one-hop diagonal-KL target used by the checked-in route. With clamp
-masks absorbed into nonnegative effective weights `c_ik` and `w_ijk`, define
+The README will derive the one-hop diagonal-KL target used by the checked-in route. With attention,
+transported keys, coefficients, and masks fixed, the pair mask is the strict
+`m_ij^(h) = 1{0 < E_ij^(h) < K_max}` gate. With the masks absorbed into nonnegative effective
+weights `c_ik` and `w_ijk`, define
 
 $$
 P_{ik}
@@ -315,8 +326,11 @@ c_{ik}\mu_{p,ik}/\sigma_{p,ik}
 =\frac{c_{ik}+\sum_jw_{ijk}}{P_{ik}}.
 $$
 
-The prose will define this as the exact minimizer of a frozen-attention, detached-key,
-diagonal-KL majorizer. It is not an exact minimizer of the self-consistent profiled objective.
+The prose will define these formulas as closed-form minimizers over the enabled, nondegenerate
+coordinates of the mask-selected diagonal-KL surrogate implemented by `mm_exact`. The strict mask
+omits exactly zero-energy pairs, so this surrogate is not a majorizer of the canonical
+frozen-attention objective. The prose will deny majorization, descent, and exact
+self-consistent-argmin guarantees.
 
 When covariance is enabled, damping acts in Gaussian natural coordinates:
 
@@ -401,9 +415,10 @@ the forward q update but carries no gradient into s through that fold.
 
 The mathematical core will end with a prominent prose statement: the production forward pass does
 not optimize one ELBO or one VFE scalar. `F_s` and `F_q` are target-blind structural objectives;
-`L_CE` is a separate supervised outer objective. Each inner stage performs one damped,
-frozen-attention MM step rather than an exact self-consistent argmin. No shared-functional EM
-monotonicity, evidence ascent, convergence, or global free-energy descent follows.
+`L_CE` is a separate supervised outer objective. Each inner stage takes one damped step toward a
+mask-selected `mm_exact` fusion target rather than an exact self-consistent argmin. No
+majorization, surrogate descent, shared-functional EM monotonicity, evidence ascent, convergence,
+or global free-energy descent follows.
 
 ## Final display-block packing
 
@@ -418,7 +433,7 @@ blocks:
 6. Belief objective, self-coupling regularizer, and profiled coefficient.
 7. Model objective, committed coefficients, and `q^(0)=p=s^(1)` handoff.
 8. Precision reliability, detached gamma fold, and the resulting beta prior.
-9. Frozen-attention MM precision, mean target, and variance target.
+9. Mask-selected `mm_exact` precision, mean target, and variance target.
 10. Natural-coordinate damping and the checked-in frozen-q-covariance specialization.
 11. Full and diagonal Gaussian Fisher-gradient formulas, labeled as the alternate gradient route.
 12. Linear and KL-to-prior decode formulas together with next-token cross-entropy.

@@ -68,8 +68,9 @@ whose assumptions are stated with it. A **checked-in specialization** records th
 values selected by the committed `train_vfe3.py`; it is not an architectural restriction.
 
 At ambient scope, each token carries a full Gaussian and a frame in an equal-block general linear
-group. The reusable phi route forms an algebra matrix from registered generators before applying
-the matrix exponential:
+group. The reusable phi route forms the raw algebra matrix from registered generators. On the
+checked-in non-skew path, the matrix supplied to the exponential is the effective matrix obtained
+by the whole-frame Frobenius-norm safeguard:
 
 $$
 \begin{aligned}
@@ -77,7 +78,12 @@ q_i &= \mathcal N(\mu_i,\Sigma_i), &
 \mu_i &\in \mathbb R^K, &
 \Sigma_i &\in \operatorname{SPD}(K), \\
 A_i &= \sum_a \phi_i^a G_a \in \mathfrak g, &
-U_i &= \exp(A_i), &
+\widehat A_i
+&= \begin{cases}
+A_i, & \lVert A_i\rVert_F\leq 20, \\
+20A_i/\lVert A_i\rVert_F, & \lVert A_i\rVert_F>20,
+\end{cases} \\
+U_i &= \exp(\widehat A_i), &
 \Omega_{ij} &= U_iU_j^{-1}, \\
 G_{\mathrm{block}} &= \prod_{h=1}^{H}\operatorname{GL}(d_h), &
 d_h &= K/H, &
@@ -85,11 +91,16 @@ U_i &= \operatorname{diag}\left(U_i^{(1)},\ldots,U_i^{(H)}\right).
 \end{aligned}
 $$
 
-The checked-in specialization has $K=20$, $H=2$, and $d_h=10$, so its exponential-chart frame
-has two $\operatorname{GL}^{+}(10)$ blocks. Every real matrix exponential has positive determinant,
-but the real exponential map is not surjective onto the positive-determinant component. The phi
-chart therefore covers only $\operatorname{image}(\exp)\subsetneq\operatorname{GL}^{+}(10)$ in
-each block.
+The checked-in specialization has $K=20$, $H=2$, and $d_h=10$, so its effective frame has two
+$\operatorname{GL}^{+}(10)$ blocks. Every real matrix exponential has positive determinant, but
+the real exponential map is not surjective onto the positive-determinant component. Within
+$\lVert A_i\rVert_F\leq20$, the map agrees with the ordinary exponential parameterization. Outside
+that region, the safeguard collapses radial magnitudes onto the norm-20 boundary, so the effective
+map is not itself a chart. Its joint frame image is restricted to
+$\exp\{B\in\mathfrak g:\lVert B\rVert_F\leq20\}$, a strict subset of the unclamped block-group
+exponential image; each block remains in
+$\operatorname{image}(\exp:\mathfrak{gl}(10)\to\operatorname{GL}^{+}(10))
+\subsetneq\operatorname{GL}^{+}(10)$.
 
 For an ambient full Gaussian, transport is the exact pushforward. The checked-in diagonal family
 uses the reusable engine's projected covariance operation, where $\sigma_j$ is a variance vector
@@ -270,15 +281,15 @@ $\lambda_\gamma=0.75$. The final belief attention uses $\overline\pi^q$ in its G
 detached fold changes the belief forward update without carrying a gradient into $s$ through that
 edge.
 
-For the active diagonal-KL route, let $h(k)$ be the head containing coordinate $k$. Absorb the
-self and pair clamp masks into the nonnegative effective weights
-$c_{ik}:=m_i^{\mathrm{self}}a_i^*$ and
-$w_{ijk}:=\lambda_\beta m_{ij}^{(h(k))}\beta_{ij}^{(h(k))}$. On a nondegenerate coordinate, the
-frozen-attention precision fusion is
+For the active diagonal-KL `mm_exact` route, let $h(k)$ be the head containing coordinate $k$.
+Hold the attention weights, transported keys, current self coefficient, and clamp masks fixed.
+Absorb the self mask into $c_{ik}:=m_i^{\mathrm{self}}a_i^*$ and use the strict pair mask in the
+nonnegative effective pair weight. On a nondegenerate coordinate, the precision fusion is
 
 $$
 \begin{aligned}
 c_{ik} &:= m_i^{\mathrm{self}}a_i^*\geq 0, &
+m_{ij}^{(h)} &:= \mathbf 1\left\{0<E_{ij}^{(h)}<K_{\max}\right\}, \\
 w_{ijk} &:= \lambda_\beta m_{ij}^{(h(k))}\beta_{ij}^{(h(k))}\geq 0, \\
 P_{ik}
 &:= \frac{c_{ik}}{\sigma_{p,ik}}
@@ -293,12 +304,15 @@ c_{ik}\mu_{p,ik}/\sigma_{p,ik}
 \end{aligned}
 $$
 
-These targets exactly minimize the frozen-attention, detached-key, diagonal-KL majorizer. They do
-not exactly minimize the self-consistent profiled objective, whose weights change with the belief.
-If every effective precision on a coordinate is suppressed by a clamp, the implementation retains
-the current belief rather than applying the displayed nondegenerate quotient.
+With those quantities fixed, these formulas are closed-form minimizers over the enabled,
+nondegenerate coordinates of the mask-selected diagonal-KL surrogate implemented by `mm_exact`.
+The strict pair mask excludes exactly zero-energy pairs. The resulting surrogate is therefore not
+a majorizer of the canonical frozen-attention objective, and the update has no majorization,
+descent, or exact self-consistent-argmin guarantee. If every effective precision on a coordinate is
+suppressed by a clamp, the implementation retains the current belief rather than applying the
+displayed nondegenerate quotient.
 
-When covariance is enabled, MM damping is performed in Gaussian natural coordinates. The
+When covariance is enabled, `mm_exact` damping is performed in Gaussian natural coordinates. The
 checked-in model step uses this covariance-enabled route with $\eta=0.75$. The belief step uses the
 same damping value but freezes covariance, so its mean is damped directly in mean coordinates:
 
@@ -341,9 +355,10 @@ checked-in `mm_exact` selection. They do not describe the frame AdamW update, an
 convergence of the finite refinement schedule.
 
 **Objective boundary.** $\mathcal F_s$ and $\mathcal F_q$ are target-blind structural objectives;
-the supervised outer next-token cross-entropy is separate. Each inner stage performs one damped,
-frozen-attention MM step, not an exact self-consistent argmin. The production forward pass therefore
-does not optimize one ELBO and has no shared-functional EM monotonicity, evidence-ascent,
+the supervised outer next-token cross-entropy is separate. Under the checked-in route, each inner
+stage takes one damped step toward a mask-selected `mm_exact` fusion target, not an exact
+self-consistent argmin. The production forward pass therefore does not optimize one ELBO and has
+no majorization, surrogate-descent, shared-functional EM monotonicity, evidence-ascent,
 convergence, or global-free-energy-descent guarantee.
 
 ## Execution profiles
@@ -387,8 +402,8 @@ the token prior supplies `q_i^(0)` directly.
 The attention-prior builder defines the active support and positional log prior. Optional
 detached precision reliability and gamma mixing modify that prior before the Gibbs row is
 formed. Each `e_step` iteration constructs transport, evaluates pair energies, computes
-Gibbs weights, and applies either a configured gradient step or a damped
-majorization-minimization update to the enabled state components. These are finite
+Gibbs weights, and applies either a configured gradient step or a damped, mask-selected
+closed-form fusion to the enabled state components. These are finite
 filtering iterations; the code does not require or assert an internal limiting state.
 
 ### Stack transforms and handoff
@@ -437,9 +452,10 @@ structural objective $\mathcal F_s$ or $\mathcal F_q$.
 
 `vfe3.train` groups every trainable parameter by role, checks optimizer coverage, and
 routes the outer gradients according to the configured unroll or estimator policy. The
-checked-in experiment uses AdamW for its active token, model-channel, frame, mixer, and
-linear-readout parameters. Other optimizer and frame-update routes remain configuration
-choices.
+checked-in experiment uses AdamW for its active model-channel, frame, mixer, and linear-readout
+parameters. Under `prior_source="model_channel"`, the token-prior mean and variance tables remain
+grouped but are inactive: they receive no gradient, parameter update, or weight decay. Other
+optimizer and frame-update routes remain configuration choices.
 
 ## Geometry and mathematical scope
 
