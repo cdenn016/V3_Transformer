@@ -275,19 +275,19 @@ def belief_spectrum(
     }
 
 
-def fisher_trace(
+def half_fisher_trace(
     sigma:    torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
 
     *,
     eps:      float = 1e-12,
     diagonal: Optional[bool] = None,
-) -> torch.Tensor:                       # (...) per-token Fisher-information trace in the mean block
-    r"""Per-token Fisher-information trace of the Gaussian mean block, tr(Sigma^{-1}) / 2.
+) -> torch.Tensor:                       # (...) per-token one-half mean-block Fisher trace
+    r"""Per-token KL quadratic coefficient, one-half tr(Sigma^{-1}) in the mean block.
 
-    For a Gaussian N(mu, Sigma) the Fisher information of the mean is Sigma^{-1}; its trace
-    measures total precision (confidence). Diagonal: sum_k 1 / (2 sigma_k). Full:
-    (1/2) tr(Sigma^{-1}). Used as the marker-size glyph in the belief-UMAP figure (confident
-    beliefs render solid).
+    For a Gaussian N(mu, Sigma), the mean-block Fisher information is Sigma^{-1}. The
+    second-order KL coefficient is one-half its trace: sum_k 1 / (2 sigma_k) for diagonal
+    covariance and (1/2) tr(Sigma^{-1}) for full covariance. This is a precision diagnostic,
+    not the full Fisher trace.
     """
     if _is_full_cov(sigma, diagonal):
         sym = 0.5 * (sigma + sigma.transpose(-1, -2))
@@ -299,6 +299,9 @@ def fisher_trace(
     return (0.5 / sigma.clamp(min=eps)).sum(dim=-1)
 
 
+fisher_trace = half_fisher_trace
+
+
 def sigma_trace(
     sigma:    torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
 
@@ -307,7 +310,7 @@ def sigma_trace(
 ) -> torch.Tensor:                       # (...) per-token tr(Sigma_q) = sum_k Var_k
     r"""Per-token covariance trace tr(Sigma_q) = sum_k Var_k -- the total belief UNCERTAINTY.
 
-    The complement of ``fisher_trace`` (which returns the PRECISION trace tr(Sigma^{-1})/2): for the
+    The complement of ``half_fisher_trace`` (the PRECISION coefficient tr(Sigma^{-1})/2): for the
     Sigma_q-as-calibrated-uncertainty probe (B1/EXP-3) the load-bearing quantity is the variance
     trace itself, whose across-token spread (see ``cv``) gates whether the channel carries any
     decode-time signal. Diagonal: sum_k sigma_k. Full: sum_k Sigma_kk.

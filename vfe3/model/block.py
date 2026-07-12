@@ -13,13 +13,14 @@ import torch
 
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
+from vfe3.contracts import EStepGradientRecord, MStepCapture
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.free_energy import attention_tau
 from vfe3.inference.e_step import e_step
 
 
-def _as_coeff(v: 'float | list', device: torch.device) -> 'float | torch.Tensor':
-    r"""Pass a scalar b0/c0 through unchanged; turn a list into a (K,) float32 tensor on device."""
+def _as_coeff(v: 'float | list | tuple', device: torch.device) -> 'float | torch.Tensor':
+    r"""Pass a scalar through unchanged; turn a list or tuple into a float32 tensor on device."""
     return torch.as_tensor(v, dtype=torch.float32, device=device) if isinstance(v, (list, tuple)) else v
 
 
@@ -44,8 +45,8 @@ def vfe_block(
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
     rope_on_value:   bool                      = True,   # False -> value aggregation uses the un-rotated base
     tau:             'Optional[float | torch.Tensor]' = None,  # softmax temperature (precomputed by vfe_stack; None -> compute here)
-    capture:         Optional[dict]            = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
-    grad_record:     Optional[dict]            = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
+    capture:         Optional[MStepCapture]    = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
+    grad_record:     Optional[EStepGradientRecord] = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
     state_record:    Optional[dict]            = None,   # diag out-param: E-step belief/F trace (None -> no capture)
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: caller-built flat transport (None -> e_step builds its own)
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)

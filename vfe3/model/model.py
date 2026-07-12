@@ -22,6 +22,7 @@ from torch import nn
 from vfe3.attention_prior import attention_log_prior
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
+from vfe3.contracts import EStepGradientOutput, EStepGradientRecord, MStepCapture
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.geometry.norms import get_norm
@@ -863,8 +864,8 @@ class VFEModel(nn.Module):
         *,
         return_logits:  bool           = False,          # also decode logits; else logits is None
         decode_last:    bool           = False,          # decode only the last position as (B, 1, V)
-        capture:        Optional[dict] = None,           # out-param: M-step intermediates (q*, final-block prior, raw out)
-        estep_grad_out: Optional[dict] = None,           # diag out-param: E-step belief-grad norms (forwarded)
+        capture:        Optional[MStepCapture]       = None,   # out-param: M-step intermediates (q*, final-block prior, raw out)
+        estep_grad_out: Optional[EStepGradientOutput] = None,   # diag out-param: E-step belief-grad norms (forwarded)
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
         r"""Run the belief pipeline and return the converged belief q* (post final_norm), optionally
         with the decoded logits. This is the single belief-production seam shared by ``forward``,
@@ -1008,7 +1009,9 @@ class VFEModel(nn.Module):
             # capture: the last block's CONVERGED (pre-transform) belief q*, consumed by the
             # M-step self-coupling term in forward (manuscript: the self-term reads q*, not the
             # transformed handoff; audit 2026-06-09 overnight F19). None when the term is off.
-            grad_rec = {} if estep_grad_out is not None else None   # E-step belief-grad capture (gated, off by default)
+            grad_rec: Optional[EStepGradientRecord] = (
+                {} if estep_grad_out is not None else None
+            )                                                       # E-step belief-grad capture (gated, off by default)
             out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                             log_prior=log_prior, block_norm=self.block_norm,
                             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
@@ -1373,7 +1376,7 @@ class VFEModel(nn.Module):
         targets:   Optional[torch.Tensor] = None,   # (B, N) next-token ids (-100 = ignore)
 
         *,
-        estep_grad_out: Optional[dict] = None,   # diag out-param: filled with the E-step belief-grad norms
+        estep_grad_out: Optional[EStepGradientOutput] = None,   # diag out-param: filled with the E-step belief-grad norms
     ) -> 'torch.Tensor | Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]':
         r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given.
 
@@ -1394,7 +1397,9 @@ class VFEModel(nn.Module):
         # cap (non-None only when the M-step self-coupling term is on) is filled by forward_beliefs
         # with the converged q*, the live final-block prior, the encode-time prior, and the raw
         # pre-final_norm stack output.
-        cap = {} if self.cfg.mstep_self_coupling_weight > 0.0 else None
+        cap: Optional[MStepCapture] = (
+            {} if self.cfg.mstep_self_coupling_weight > 0.0 else None
+        )
         belief, _ = self.forward_beliefs(token_ids, return_logits=False,
                                          capture=cap, estep_grad_out=estep_grad_out)
         mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm; sigma = out.sigma
@@ -2654,8 +2659,8 @@ class VFEModel(nn.Module):
         d["eff_rank_median"] = float(er.median())
         d["eff_rank_p95"]    = float(torch.quantile(er, 0.95))
 
-        # Belief Fisher-information trace (tr Sigma^-1 / 2 = total belief precision/confidence).
-        fish = metrics.fisher_trace(out.sigma, diagonal=_diag, eps=cfg.eps).float()
+        # One-half mean-block Fisher trace (the KL quadratic coefficient and belief precision).
+        fish = metrics.half_fisher_trace(out.sigma, diagonal=_diag, eps=cfg.eps).float()
         d["fisher_trace_mean"]   = float(fish.mean())
         d["fisher_trace_median"] = float(fish.median())
 

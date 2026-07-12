@@ -2,6 +2,7 @@ import math
 
 import torch
 
+import vfe3.metrics as metrics_module
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.transport import compute_transport_operators
 from vfe3.metrics import (
@@ -154,6 +155,20 @@ def test_fisher_trace_diag_full_agree():
     # diagonal); calling by keyword in that order matches the positional-sigma result.
     assert torch.allclose(fisher_trace(sigma, eps=1e-9, diagonal=True), ft, atol=1e-6)
     assert torch.allclose(fisher_trace(torch.diag_embed(sigma), eps=1e-9, diagonal=False), ft, atol=1e-4)
+
+
+def test_half_fisher_trace_is_the_named_implementation_and_fisher_trace_alias():
+    half_fisher_trace = getattr(metrics_module, "half_fisher_trace", None)
+    assert half_fisher_trace is not None
+    assert fisher_trace is half_fisher_trace
+    assert "UMAP" not in (half_fisher_trace.__doc__ or "")
+
+    sigma = torch.tensor([[2.0, 4.0]])
+    expected = 0.5 * torch.linalg.inv(torch.diag_embed(sigma)).diagonal(
+        dim1=-2, dim2=-1
+    ).sum(-1)
+    assert torch.allclose(half_fisher_trace(sigma), expected)
+    assert torch.allclose(half_fisher_trace(torch.diag_embed(sigma)), expected)
 
 
 def test_attention_entropy_rows_reduces_to_global():

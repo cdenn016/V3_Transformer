@@ -31,6 +31,7 @@ except ImportError:                                 # tqdm optional: absent -> n
     _redirect_logging = contextlib.nullcontext
 
 from vfe3.config import VFE3Config
+from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.data.datasets import make_dataloader
 from vfe3.ema import EMA
 from vfe3.free_energy import attention_tau
@@ -944,7 +945,7 @@ def train(
     loader_sampler = getattr(loader, "sampler", None)
     shuffled_loader = isinstance(loader_sampler, torch.utils.data.RandomSampler)
     loader_generator = getattr(loader, "generator", None)
-    resume_data_state: Dict[str, object] = {}
+    resume_data_state: DataStateBuffer = {}
     if (resume_path is not None and shuffled_loader
             and not isinstance(loader_generator, torch.Generator)):
         raise RuntimeError(
@@ -1199,7 +1200,7 @@ def train(
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
         if (artifacts is not None and cfg.checkpoint_interval
                 and (step + 1) % cfg.checkpoint_interval == 0):
-            checkpoint_data_state = ({
+            checkpoint_data_state: Optional[DataState] = ({
                 "epoch_start_generator_state": epoch_start_generator_state,
                 "batches_consumed":            batches_consumed,
                 "epoch":                       epoch,

@@ -51,17 +51,17 @@ from vfe3.numerics import bounded_variance_from_log, safe_cholesky
 #   encode: fn(pb, token_ids) -> BeliefState
 #   decode: fn(pb, mu_q, sigma_q, tau_eff) -> logits (B, N, V)
 # ---------------------------------------------------------------------------
-_ENCODERS: Dict[str, Callable] = {}
+_ENCODERS: 'Dict[str, EncodeCallable]' = {}
 
 
 @dataclass(frozen=True)
 class DecodeRegistration:
     """A decode callable and all routing capabilities attached to that callable."""
 
-    callable:         Callable
+    callable:         'DecodeCallable'
     supports_full:    bool
     supports_chunked: bool
-    fused_ce:         Optional[Callable]
+    fused_ce:         'Optional[FusedCECallable]'
 
 
 _DECODERS: Dict[str, DecodeRegistration] = {}
@@ -71,13 +71,18 @@ _DECODERS: Dict[str, DecodeRegistration] = {}
 _WARNED_UNIGRAM_UNSET: bool = False
 
 
-def register_encode(name: str, *, override: bool = False) -> Callable:
+def register_encode(
+    name: str,
+
+    *,
+    override: bool = False,
+) -> 'Callable[[EncodeCallable], EncodeCallable]':
     """Decorator registering an encode kernel under ``name``.
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
     existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
     """
-    def _wrap(fn: Callable) -> Callable:
+    def _wrap(fn: 'EncodeCallable') -> 'EncodeCallable':
         if name in _ENCODERS and not override:
             raise KeyError(f"encode mode {name!r} already registered; pass override=True to replace")
         _ENCODERS[name] = fn
@@ -85,7 +90,7 @@ def register_encode(name: str, *, override: bool = False) -> Callable:
     return _wrap
 
 
-def get_encode(name: str) -> Callable:
+def get_encode(name: str) -> 'EncodeCallable':
     """Return the registered encode kernel for ``name`` (KeyError if absent)."""
     if name not in _ENCODERS:
         raise KeyError(
@@ -101,8 +106,8 @@ def register_decode(
     supports_full:    bool               = False,
     supports_chunked: bool               = False,
     override:         bool               = False,
-    fused_ce:         Optional[Callable] = None,
-) -> Callable:
+    fused_ce:         'Optional[FusedCECallable]' = None,
+) -> 'Callable[[DecodeCallable], DecodeCallable]':
     """Decorator registering a decode kernel under ``name``.
 
     ``supports_full`` flags a decoder that consumes a full ``(B, N, K, K)`` covariance.
@@ -113,7 +118,7 @@ def register_decode(
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
     existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
     """
-    def _wrap(fn: Callable) -> Callable:
+    def _wrap(fn: 'DecodeCallable') -> 'DecodeCallable':
         if name in _DECODERS and not override:
             raise KeyError(f"decode mode {name!r} already registered; pass override=True to replace")
         if supports_chunked != (fused_ce is not None):
@@ -140,7 +145,7 @@ def get_decode_registration(name: str) -> DecodeRegistration:
     return _DECODERS[name]
 
 
-def get_decode(name: str) -> Callable:
+def get_decode(name: str) -> 'DecodeCallable':
     """Return the registered decode kernel for ``name`` (KeyError if absent)."""
     return get_decode_registration(name).callable
 
@@ -1083,6 +1088,14 @@ class PriorBank(nn.Module):
             # z-loss on the streamed log Z (see decode_ce_diagonal_chunked); 0.0 guard = byte-identical.
             ce = ce + z_loss_weight * (logsumexp_v ** 2 * valid).sum() / valid.sum().clamp_min(1)
         return ce
+
+
+EncodeCallable = Callable[[PriorBank, torch.Tensor], BeliefState]
+DecodeCallable = Callable[
+    [PriorBank, torch.Tensor, torch.Tensor, torch.Tensor],
+    torch.Tensor,
+]
+FusedCECallable = Callable[..., torch.Tensor]
 
 
 @register_encode("per_token")

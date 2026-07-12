@@ -39,6 +39,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 import torch
 
 from vfe3.config import VFE3Config
+from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.ema import EMA
 from vfe3.runtime import deterministic_state
 
@@ -194,7 +195,7 @@ class RunArtifacts:
         step:   int,
         maps:   torch.Tensor,                 # (L, H, N, N) per-layer per-head attention
         logger: Optional[logging.Logger] = None,
-    ) -> Optional[list]:
+    ) -> Optional[List[Path]]:
         r"""Best-effort attention heatmaps for one periodic eval: one figure per (layer, head).
 
         Writes ``attention/step_<N>_layer<l>_head<h>.png`` per (layer, head) -- a LOG-scaled beta
@@ -247,7 +248,7 @@ class RunArtifacts:
         step:   int,
         maps:   'Optional[torch.Tensor]',     # (H, N, N) per-head model-coupling gamma, or None (channel off)
         logger: Optional[logging.Logger] = None,
-    ) -> Optional[list]:
+    ) -> Optional[List[Path]]:
         r"""Best-effort model-coupling (gamma) heatmaps for one periodic eval: one figure per head.
 
         The s-channel sibling of :meth:`save_attention_maps`. Writes
@@ -305,7 +306,7 @@ class RunArtifacts:
         scaler:               Optional['torch.amp.GradScaler'] = None,
         ema:                  Optional[EMA]                     = None,
         metropolis_generator: Optional[torch.Generator]         = None,
-        data_state:            Optional[Dict[str, object]]       = None,
+        data_state:            Optional[DataState]               = None,
     ) -> Path:
         r"""Write a resumable ``checkpoints/step_<N>.pt`` (model + optimizer + RNG + config + step).
 
@@ -372,7 +373,7 @@ def load_checkpoint(
     ema:                  Optional[EMA]                    = None,
     artifacts:            'Optional[RunArtifacts]'         = None,
     metropolis_generator: Optional[torch.Generator]        = None,
-    data_state:            Optional[Dict[str, object]]      = None,
+    data_state:            Optional[DataStateBuffer]        = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
