@@ -7,7 +7,13 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup, get_group
-from vfe3.geometry.lie_ops import _COMPOSE, _equal_diag_blocks, compose_phi, register_compose
+from vfe3.geometry.lie_ops import (
+    _COMPOSE,
+    _equal_diag_blocks,
+    compose_bch,
+    compose_phi,
+    register_compose,
+)
 from vfe3.geometry.retraction import retract_phi
 from vfe3.geometry.transport import (
     CompactFactoredTransport,
@@ -33,6 +39,89 @@ viz_extract_module = importlib.import_module("vfe3.viz.extract")
 def test_compact_phi_block_transport_defaults_off_and_accepts_opt_in() -> None:
     assert VFE3Config().compact_phi_block_transport is False
     assert VFE3Config(compact_phi_block_transport=True).compact_phi_block_transport is True
+
+
+def test_dense_and_compact_bch_keep_float32_under_cpu_autocast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(37)
+    group = get_group("block_glk")(4, 2)
+    phi1 = 0.03 * torch.randn(2, 3, group.generators.shape[0])
+    phi2 = 0.03 * torch.randn(3, group.generators.shape[0])
+    kwargs = {
+        "order": 4,
+        "gram_pinv_": group.gram_pinv(),
+        "block_dims": group.irrep_dims,
+    }
+    dense_ref = compose_bch(phi1, phi2, group.generators, **kwargs)
+    compact_ref = compose_bch(
+        phi1,
+        phi2,
+        group.generators,
+        compact_blocks=True,
+        **kwargs,
+    )
+
+    original_autocast = torch.amp.autocast
+    autocast_calls: list[tuple[str, bool]] = []
+
+    def _autocast_spy(device_type: str, *args: object, **kwargs: object) -> object:
+        autocast_calls.append((device_type, bool(kwargs.get("enabled", True))))
+        return original_autocast(device_type, *args, **kwargs)
+
+    monkeypatch.setattr(torch.amp, "autocast", _autocast_spy)
+    dense_plain = compose_bch(phi1, phi2, group.generators, **kwargs)
+    compact_plain = compose_bch(
+        phi1,
+        phi2,
+        group.generators,
+        compact_blocks=True,
+        **kwargs,
+    )
+    assert autocast_calls == []
+    assert torch.equal(dense_plain, dense_ref)
+    assert torch.equal(compact_plain, compact_ref)
+
+    with original_autocast("cpu", dtype=torch.bfloat16):
+        dense = compose_bch(phi1, phi2, group.generators, **kwargs)
+        compact = compose_bch(
+            phi1,
+            phi2,
+            group.generators,
+            compact_blocks=True,
+            **kwargs,
+        )
+    assert autocast_calls == [("cpu", False), ("cpu", False)]
+    assert dense.dtype == torch.float32
+    assert compact.dtype == torch.float32
+    assert torch.equal(dense, dense_ref)
+    assert torch.equal(compact, compact_ref)
+
+    phi1_double = phi1.double()
+    phi2_double = phi2.double()
+    generators_double = group.generators.double()
+    gram_double = group.gram_pinv().double()
+    with original_autocast("cpu", dtype=torch.bfloat16):
+        dense_double = compose_bch(
+            phi1_double,
+            phi2_double,
+            generators_double,
+            order=4,
+            gram_pinv_=gram_double,
+            block_dims=group.irrep_dims,
+        )
+        compact_double = compose_bch(
+            phi1_double,
+            phi2_double,
+            generators_double,
+            order=4,
+            compact_blocks=True,
+            gram_pinv_=gram_double,
+            block_dims=group.irrep_dims,
+        )
+    assert autocast_calls == [("cpu", False), ("cpu", False)]
+    assert dense_double.dtype == torch.float64
+    assert compact_double.dtype == torch.float64
 
 
 def test_compact_phi_block_transport_changes_only_opted_in_block_glk_layout(

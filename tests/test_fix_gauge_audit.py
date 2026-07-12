@@ -11,7 +11,10 @@ These tests pin the new SILENT-ON-CLOSED-BASIS diagnostic guards: a non-closed b
 from both consumers, the SAME chain with ``close_basis=True`` (genuinely bracket-closed) is
 silent, and the DEFAULT direct-sum group (cross_couplings=None) is silent.
 """
+import gc
+import importlib
 import warnings
+import weakref
 
 import pytest
 import torch
@@ -19,6 +22,9 @@ import torch
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.lie_ops import compose_bch
 from vfe3.geometry.phi_preconditioner import _structure_constants
+
+
+lie_ops_module = importlib.import_module("vfe3.geometry.lie_ops")
 
 # Distinctive, stable substrings emitted by the two guards (match against these so the
 # "no warning" assertions do not false-fail on unrelated torch/numpy warnings).
@@ -44,6 +50,89 @@ def _bch_inputs(n_gen: int) -> tuple:
     phi1 = torch.randn(n_gen, dtype=torch.float64)
     phi2 = torch.randn(n_gen, dtype=torch.float64)
     return phi1, phi2
+
+
+def _clear_bch_closure_caches() -> None:
+    lie_ops_module._BRACKET_CLOSURE_RES.clear()
+    lie_ops_module._BRACKET_CLOSURE_WARNED.clear()
+    if hasattr(lie_ops_module, "_BRACKET_CLOSURE_IDENTITIES"):
+        lie_ops_module._BRACKET_CLOSURE_IDENTITIES.clear()
+
+
+def test_bch_closure_identity_cache_hashes_once_per_identity_and_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_bch_closure_caches()
+    generators = _build(close_basis=False, cross=None).generators.clone()
+    signature_calls = 0
+    original = lie_ops_module._basis_value_signature
+
+    def _signature_spy(basis: torch.Tensor) -> tuple:
+        nonlocal signature_calls
+        signature_calls += 1
+        return original(basis)
+
+    monkeypatch.setattr(lie_ops_module, "_basis_value_signature", _signature_spy)
+    lie_ops_module.warn_if_basis_not_closed(generators, where="identity-cache")
+    lie_ops_module.warn_if_basis_not_closed(generators, where="identity-cache")
+    assert signature_calls == 1
+    assert len(lie_ops_module._BRACKET_CLOSURE_RES) == 1
+
+    equal_value_copy = generators.clone()
+    lie_ops_module.warn_if_basis_not_closed(equal_value_copy, where="identity-cache")
+    assert signature_calls == 2
+    assert len(lie_ops_module._BRACKET_CLOSURE_RES) == 1
+
+    generators[0, 0, 0].add_(0.125)
+    lie_ops_module.warn_if_basis_not_closed(generators, where="identity-cache-mutated")
+    assert signature_calls == 3
+    assert len(lie_ops_module._BRACKET_CLOSURE_RES) == 2
+
+
+def test_bch_closure_identity_cache_is_bounded_weak_and_checks_exact_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_bch_closure_caches()
+    template = _build(close_basis=False, cross=None).generators
+    live_bases = [template.clone() for _ in range(40)]
+    for basis in live_bases:
+        lie_ops_module.warn_if_basis_not_closed(basis, where="identity-cache-bound")
+
+    identity_cache = lie_ops_module._BRACKET_CLOSURE_IDENTITIES
+    assert len(identity_cache) == 32
+
+    generators = template.clone().requires_grad_()
+    other = template.clone()
+    identity_key = (
+        id(generators),
+        generators._version,
+        tuple(generators.shape),
+        generators.dtype,
+        generators.device,
+    )
+    bogus_signature = (tuple(generators.shape), generators.dtype, b"wrong-caller")
+    identity_cache[identity_key] = (weakref.ref(other), bogus_signature)
+    signature_calls = 0
+    original = lie_ops_module._basis_value_signature
+
+    def _signature_spy(basis: torch.Tensor) -> tuple:
+        nonlocal signature_calls
+        signature_calls += 1
+        return original(basis)
+
+    monkeypatch.setattr(lie_ops_module, "_basis_value_signature", _signature_spy)
+    lie_ops_module.warn_if_basis_not_closed(generators, where="identity-cache-exact")
+    assert signature_calls == 1
+
+    cached_ref, cached_signature = identity_cache[identity_key]
+    assert isinstance(cached_ref, weakref.ReferenceType)
+    assert cached_ref() is generators
+    assert all(not isinstance(item, torch.Tensor) for item in cached_signature)
+    generators_ref = weakref.ref(generators)
+    del generators
+    gc.collect()
+    assert generators_ref() is None
+    assert identity_key not in identity_cache
 
 
 def _max_offspan_bracket_residual(G: torch.Tensor) -> float:

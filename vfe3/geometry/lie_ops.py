@@ -11,6 +11,7 @@ determinant control. Pure: operates on a generator TENSOR, not a GaugeGroup.
 import hashlib
 import math
 import warnings
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
@@ -130,9 +131,10 @@ def compose_euclidean(
 
 # Bracket closure depends only on basis values. Cache scalar diagnostics by a stable CPU
 # signature so equal-value copies share work and no caller tensor (especially CUDA storage)
-# remains owned by the cache. Both LRU tables are bounded because diagnostics may see many
+# remains owned by the cache. All LRU tables are bounded because diagnostics may see many
 # transient bases in sweeps and tests.
 _BRACKET_CLOSURE_CACHE_MAXSIZE: int = 32
+_BRACKET_CLOSURE_IDENTITIES: OrderedDict = OrderedDict()  # identity/version -> (weak ref, value signature)
 _BRACKET_CLOSURE_RES: OrderedDict = OrderedDict()       # value signature -> max residual
 _BRACKET_CLOSURE_WARNED: OrderedDict = OrderedDict()    # (value signature, where) -> None
 
@@ -156,6 +158,40 @@ def _bounded_lru_store(
     cache.move_to_end(key)
     while len(cache) > _BRACKET_CLOSURE_CACHE_MAXSIZE:
         cache.popitem(last=False)
+
+
+def _cached_basis_value_signature(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+) -> tuple:
+    """Resolve the value signature through a weak, mutation-aware identity cache."""
+    identity_key = (
+        id(generators),
+        generators._version,
+        tuple(generators.shape),
+        generators.dtype,
+        generators.device,
+    )
+    cached = _BRACKET_CLOSURE_IDENTITIES.get(identity_key)
+    if cached is not None:
+        basis_ref, value_signature = cached
+        if basis_ref() is generators:
+            _BRACKET_CLOSURE_IDENTITIES.move_to_end(identity_key)
+            return value_signature
+        del _BRACKET_CLOSURE_IDENTITIES[identity_key]
+
+    value_signature = _basis_value_signature(generators)
+
+    def _drop_dead_identity(basis_ref: weakref.ReferenceType) -> None:
+        current = _BRACKET_CLOSURE_IDENTITIES.get(identity_key)
+        if current is not None and current[0] is basis_ref:
+            del _BRACKET_CLOSURE_IDENTITIES[identity_key]
+
+    _bounded_lru_store(
+        _BRACKET_CLOSURE_IDENTITIES,
+        identity_key,
+        (weakref.ref(generators, _drop_dead_identity), value_signature),
+    )
+    return value_signature
 
 
 def warn_if_basis_not_closed(
@@ -194,7 +230,7 @@ def warn_if_basis_not_closed(
     path is to build cross-coupled towers with ``close_basis=True`` (close_under_brackets), which
     yields a bracket-closed algebra rather than relying on this size-gated diagnostic.
     """
-    key = _basis_value_signature(generators)
+    key = _cached_basis_value_signature(generators)
     max_res = _BRACKET_CLOSURE_RES.get(key)
     if max_res is None:
         n_gen, K = generators.shape[0], generators.shape[-1]
@@ -454,6 +490,7 @@ def compose_bch(
     eps:            float                  = 1e-12,
     order:          int                    = 4,
     compact_blocks: bool                   = False,  # canonical block_glk: omit dense X/Y/Z embedding
+    _autocast_guarded: bool                = False,
     gram_pinv_:     Optional[torch.Tensor] = None,
     block_dims:     Optional[List[int]]    = None,   # group irrep_dims; >1 equal blocks -> blocked brackets
 ) -> torch.Tensor:
@@ -491,6 +528,24 @@ def compose_bch(
     closed (default direct-sum) basis the residual is ~0 so the guard is silent and the
     returned phi is unchanged.
     """
+    if (not _autocast_guarded
+            and phi1.dtype == torch.float32
+            and phi2.dtype == torch.float32
+            and torch.is_autocast_enabled(phi1.device.type)):
+        with torch.amp.autocast(phi1.device.type, enabled=False):
+            return compose_bch(
+                phi1,
+                phi2,
+                generators,
+                closure_tol=closure_tol,
+                eps=eps,
+                order=order,
+                compact_blocks=compact_blocks,
+                _autocast_guarded=True,
+                gram_pinv_=gram_pinv_,
+                block_dims=block_dims,
+            )
+
     blocked = (
         order >= 1
         and block_dims is not None
@@ -503,10 +558,6 @@ def compose_bch(
         H, d = len(block_dims), block_dims[0]
         Xb = phi1.reshape(*phi1.shape[:-1], H, d, d)
         Yb = phi2.reshape(*phi2.shape[:-1], H, d, d)
-        if Xb.dtype == torch.float32 and torch.is_autocast_enabled(Xb.device.type):
-            autocast_dtype = torch.get_autocast_dtype(Xb.device.type)
-            Xb = Xb.to(autocast_dtype)
-            Yb = Yb.to(autocast_dtype)
         if Xb.shape != Yb.shape:
             Xb, Yb = torch.broadcast_tensors(Xb, Yb)
             Xb = Xb.contiguous()
