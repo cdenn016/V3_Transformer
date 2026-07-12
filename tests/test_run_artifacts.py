@@ -606,3 +606,60 @@ def test_finalize_reloads_best_checkpoint(tmp_path):
                    val_loader=_loader(seed=1), artifacts=art)
     res = finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
     assert res["reloaded_best"] is True
+
+
+def test_fd_gradient_check_restores_param_on_midloop_failure():
+    """Audit 2026-07-12 N1: the FD probe perturbs a LIVE decode parameter through a
+    storage-sharing view; a forward that raises between the +eps write and the restore
+    previously left the parameter perturbed for every subsequent probe (the caller catches
+    broadly). The perturbation loop must restore the coordinate on the way out."""
+    cfg = _cfg(generate_figures=False)
+    model = VFEModel(cfg)
+    loader = _loader(seed=1, n=120)
+    pb = model.prior_bank
+    p = (pb.output_proj_weight
+         if getattr(pb, "output_proj_weight", None) is not None else pb.decode_log_scale)
+    before = p.detach().clone()
+
+    calls = {"n": 0}
+    real_forward = model.forward
+
+    def _failing_forward(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:            # first PERTURBED eval: after flat[j] = orig + fd_eps
+            raise RuntimeError("injected mid-probe failure")
+        return real_forward(*args, **kwargs)
+
+    model.forward = _failing_forward
+    with pytest.raises(RuntimeError, match="injected mid-probe"):
+        run_artifacts._fd_gradient_check(model, loader, torch.device("cpu"))
+    assert calls["n"] >= 2, "probe never reached the perturbation loop"
+    assert torch.equal(p.detach(), before), "decode parameter left perturbed by +/-fd_eps"
+
+
+def test_provenance_hash_failure_warns_not_silent(tmp_path, caplog):
+    """Audit 2026-07-12 N2: a failure while hashing a split's corpus previously hit a bare
+    ``except Exception: pass`` -- provenance.json silently recorded null data hashes. The
+    failure must be logged (the keys stay best-effort None so finalize never crashes)."""
+
+    class _ExplodingTokens:
+        def detach(self):
+            raise RuntimeError("corrupt token stream")
+
+    train_loader = types.SimpleNamespace(
+        dataset=types.SimpleNamespace(tokens=_ExplodingTokens()))
+
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    with caplog.at_level(logging.WARNING, logger="test-provenance-n2"):
+        run_artifacts._write_provenance(
+            art, cfg, model,
+            train_loader=train_loader, val_loader=None, test_loader=None,
+            data_seed=None, max_tokens=None, tokenizer_tag=None,
+            logger=logging.getLogger("test-provenance-n2"),
+        )
+    prov = json.loads((tmp_path / "run" / "provenance.json").read_text(encoding="utf-8"))
+    assert prov["train_data_sha256"] is None                  # best-effort null, not a crash
+    assert any("corrupt token stream" in rec.getMessage() and "train" in rec.getMessage()
+               for rec in caplog.records), "hash failure was swallowed silently"

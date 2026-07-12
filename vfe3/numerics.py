@@ -12,6 +12,8 @@ A theoretically pure path is always available (the unregularized op); the fallba
 guards that activate only when the pure path fails, and they are documented as such.
 """
 
+import weakref
+from collections import OrderedDict
 from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import torch
@@ -20,6 +22,59 @@ import torch
 def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
     """Average a matrix with its transpose (kills asymmetric round-off)."""
     return 0.5 * (matrix + matrix.transpose(-1, -2))
+
+
+# Weak, mutation-aware cache for the bounded_variance_from_log overflow check (audit 2026-07-12
+# N13; the lie_ops/killing-cache identity+version pattern). The hot-path callers (prior_bank's
+# decode/encode table reads) re-read the SAME parameter tables several times per forward, and the
+# check's bool((...).any()) is a device->host sync per call -- key the RESULT on
+# (id, _version, ...) with a weakref liveness guard so an unchanged table syncs once, an in-place
+# optimizer step (version bump) triggers exactly one recheck, and a dead/recycled id can never
+# serve a stale verdict.
+_MAX_LOG_CHECK_CACHE: 'OrderedDict[tuple, tuple]' = OrderedDict()
+_MAX_LOG_CHECK_CACHE_MAXSIZE = 32
+
+
+def _max_log_exceeded(
+    log_sigma: torch.Tensor,
+    max_log:   float,
+) -> bool:
+    """The one host-syncing overflow check (the cached slow path)."""
+    return bool((log_sigma.detach() > max_log).any())
+
+
+def _cached_max_log_exceeded(
+    log_sigma: torch.Tensor,
+    max_log:   float,
+) -> bool:
+    """Resolve the overflow check through the weak, mutation-aware identity/version cache."""
+    if log_sigma.is_inference():
+        # Inference tensors track NO _version counter (reading it raises), so there is no
+        # mutation signal to key on -- fall back to the direct uncached check (the pre-cache
+        # behavior; one sync per call, exactly as before the N13 cache).
+        return _max_log_exceeded(log_sigma, max_log)
+    key = (id(log_sigma), log_sigma._version, tuple(log_sigma.shape), log_sigma.dtype,
+           log_sigma.device, max_log)
+    cached = _MAX_LOG_CHECK_CACHE.get(key)
+    if cached is not None:
+        tensor_ref, exceeded = cached
+        if tensor_ref() is log_sigma:
+            _MAX_LOG_CHECK_CACHE.move_to_end(key)
+            return exceeded
+        del _MAX_LOG_CHECK_CACHE[key]
+
+    exceeded = _max_log_exceeded(log_sigma, max_log)
+
+    def _drop_dead_entry(tensor_ref: weakref.ReferenceType) -> None:
+        current = _MAX_LOG_CHECK_CACHE.get(key)
+        if current is not None and current[0] is tensor_ref:
+            del _MAX_LOG_CHECK_CACHE[key]
+
+    _MAX_LOG_CHECK_CACHE[key] = (weakref.ref(log_sigma, _drop_dead_entry), exceeded)
+    _MAX_LOG_CHECK_CACHE.move_to_end(key)
+    while len(_MAX_LOG_CHECK_CACHE) > _MAX_LOG_CHECK_CACHE_MAXSIZE:
+        _MAX_LOG_CHECK_CACHE.popitem(last=False)
+    return exceeded
 
 
 def bounded_variance_from_log(
@@ -34,8 +89,11 @@ def bounded_variance_from_log(
     Values in the normal ``[log(eps), max_log]`` range retain the ordinary ``exp`` map. Larger
     detached parameter values emit the numerical warning and are capped only for exponentiation;
     ``sigma_max`` is a separate belief-state retraction policy and is deliberately not used here.
+    The overflow check is identity/version-cached (audit 2026-07-12 N13): one device->host sync
+    per table mutation instead of per call; the warning still fires on every call while the table
+    stays above ``max_log`` (from the cached host bool).
     """
-    if bool((log_sigma.detach() > max_log).any()):
+    if _cached_max_log_exceeded(log_sigma, max_log):
         import warnings
         warnings.warn(
             f"trainable log-variance exceeds max_log={max_log:g}; clamping before exponentiation",
@@ -162,7 +220,9 @@ def safe_spd_inverse(
     retry mirrors ``safe_cholesky`` so one non-PD batch element cannot poison the exact inverse of
     its well-conditioned siblings. The pure path is ``t=0`` with the documented default ridge.
     """
-    M = _symmetrize(matrix.float())
+    # float64 stays float64 (audit 2026-07-12 N4/N12 dtype policy); half promotes to fp32.
+    compute_dtype = torch.float64 if matrix.dtype == torch.float64 else torch.float32
+    M = _symmetrize(matrix.to(compute_dtype))
     K = M.shape[-1]
     eye = torch.eye(K, device=M.device, dtype=M.dtype)
     L, info = torch.linalg.cholesky_ex(M + eps * eye)        # round 0: documented eps ridge

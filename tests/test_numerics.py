@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from vfe3.numerics import (
+    bounded_variance_from_log,
     check_finite,
     condition_number,
     floor_eigenvalues,
@@ -129,3 +130,52 @@ def test_run_monitors_record():
     M = torch.diag(torch.tensor([1.0, 9.0]))
     rec2 = run_monitors(M, ["condition_number"])
     assert abs(rec2["condition_number"] - 9.0) < 1e-3
+
+
+def test_bounded_variance_overflow_check_is_version_cached(monkeypatch):
+    """Audit 2026-07-12 N13: bounded_variance_from_log forced a device->host sync per call via
+    bool((log_sigma > max_log).any()) -- its hot-path callers re-read the SAME parameter tables
+    several times per forward. The check result is now cached on (identity, _version) with a
+    weakref liveness guard (the lie_ops/killing-cache pattern): one sync per table mutation, not
+    per call. Warning and value semantics are byte-identical -- a table above max_log still warns
+    on EVERY call (from the cached host bool) and still exponentiates the clamped values."""
+    import warnings as warnings_module
+
+    from vfe3 import numerics as numerics_module
+
+    calls = {"n": 0}
+    real_check = numerics_module._max_log_exceeded
+
+    def _counting_check(log_sigma, max_log):
+        calls["n"] += 1
+        return real_check(log_sigma, max_log)
+
+    monkeypatch.setattr(numerics_module, "_max_log_exceeded", _counting_check)
+
+    table = torch.nn.Parameter(torch.zeros(4, 3))
+    for _ in range(5):
+        numerics_module.bounded_variance_from_log(table)
+    assert calls["n"] == 1, f"unchanged tensor re-synced {calls['n']} times"
+
+    with torch.no_grad():
+        table[0, 0] = 99.0                       # in-place write bumps _version -> one recheck
+    with pytest.warns(RuntimeWarning, match="max_log"):
+        out = numerics_module.bounded_variance_from_log(table)
+    assert calls["n"] == 2
+    torch.testing.assert_close(out[0, 0], torch.exp(torch.tensor(80.0)))   # clamped exp unchanged
+
+    # unchanged again -> no new sync, but the warning still fires every call (cached host bool)
+    with warnings_module.catch_warnings(record=True) as records:
+        warnings_module.simplefilter("always")
+        numerics_module.bounded_variance_from_log(table)
+    assert calls["n"] == 2
+    assert any(issubclass(r.category, RuntimeWarning) for r in records)
+
+
+def test_bounded_variance_from_log_works_under_inference_mode():
+    """Regression guard (2026-07-12 review of the N13 cache): inference tensors track NO
+    _version counter, so the version-keyed cache must BYPASS (direct uncached check, the
+    pre-cache behavior) rather than crash reading log_sigma._version."""
+    with torch.inference_mode():
+        out = bounded_variance_from_log(torch.zeros(3))
+    torch.testing.assert_close(out, torch.ones(3))

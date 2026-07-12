@@ -460,3 +460,32 @@ def test_log_euclidean_e_step_full_cov_runs():
     loss.backward()
     assert torch.isfinite(mu.grad).all()
     assert torch.isfinite(sigma.grad).all()
+
+
+def test_log_euclidean_full_reuses_sigma_eigendecomposition(monkeypatch):
+    """Audit 2026-07-12 N9: retract_logeuclidean_full eigendecomposes the symmetrized sigma for
+    logm(Sigma), then _frechet_log_spd re-ran _eigh_damped on the IDENTICAL matrix -- the dominant
+    eigh computed twice. The precomputed (pre-clamp) pair is now passed through, so one full
+    retraction costs exactly THREE eigendecompositions (sigma, the chart sum M, the projected
+    output), with values byte-identical (same decomposition, same eps clamp)."""
+    from vfe3.geometry import retraction as retraction_module
+
+    torch.manual_seed(3)
+    a = torch.randn(2, 3, 3, dtype=torch.float64)
+    sigma = a @ a.transpose(-1, -2) + 0.5 * torch.eye(3, dtype=torch.float64)
+    h = torch.randn(2, 3, 3, dtype=torch.float64)
+    h = 0.5 * (h + h.transpose(-1, -2))
+
+    expected = retract_logeuclidean_full(sigma, h, step_size=0.1)
+
+    calls = {"n": 0}
+    real_eigh = retraction_module._eigh_damped
+
+    def _counting_eigh(matrix, gap_eps):
+        calls["n"] += 1
+        return real_eigh(matrix, gap_eps)
+
+    monkeypatch.setattr(retraction_module, "_eigh_damped", _counting_eigh)
+    out = retraction_module.retract_logeuclidean_full(sigma, h, step_size=0.1)
+    assert torch.equal(out, expected)                       # counting wrapper is value-transparent
+    assert calls["n"] == 3, f"expected 3 eigendecompositions per retraction, got {calls['n']}"

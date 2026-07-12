@@ -150,6 +150,17 @@ def test_config_from_serialized_restores_policy_term_tuple_from_json():
     assert cfg.policy_score_terms == ("risk", "ambiguity")
 
 
+def test_direct_construction_accepts_policy_score_terms_list():
+    """Audit 2026-07-12 N8: a directly-constructed config with a LIST policy_score_terms is
+    semantically valid -- the membership check accepts any iterable and config_from_serialized
+    coerces lists -- but the logprob_control tuple-equality gate spuriously rejected it
+    (["risk","ambiguity"] != ("risk","ambiguity")). __post_init__ now coerces list -> tuple
+    (the irrep_spec / cross_couplings precedent), protecting both paths identically."""
+    cfg = VFE3Config(policy_mode="logprob_control", policy_preference="flat",
+                     policy_score_terms=["risk", "ambiguity"])
+    assert cfg.policy_score_terms == ("risk", "ambiguity")
+
+
 def test_config_rejects_nan_min_lr():
     import math
     with pytest.raises(ValueError):
@@ -421,6 +432,20 @@ def test_tied_block_glk_rejects_killing_per_block():
                    phi_precond_mode="killing_per_block")
     for ok in ("none", "clip", "killing"):
         VFE3Config(embed_dim=4, n_heads=2, gauge_group="tied_block_glk", phi_precond_mode=ok)
+
+
+def test_tied_block_glk_rejects_pullback_per_block():
+    """Audit 2026-07-12 N14: 'pullback_per_block' needs the SAME per-block generator partition as
+    'killing_per_block' and is identically undefined under tied_block_glk's shared kron(I_n, gl(d))
+    generators -- but only the killing variant was rejected at construction, so the pairing the
+    config itself recommends under m_phi_natural_grad crashed opaquely at the first E-step /
+    optimizer step ("generator not supported in a single irrep block"). Reject both per-block
+    modes at config time, mirroring the so_n/sp_n irrep-tower guard; the ambient 'pullback'
+    (full-basis metric, no partition needed) stays accepted."""
+    with pytest.raises(ValueError):
+        VFE3Config(embed_dim=4, n_heads=2, gauge_group="tied_block_glk",
+                   phi_precond_mode="pullback_per_block")
+    VFE3Config(embed_dim=4, n_heads=2, gauge_group="tied_block_glk", phi_precond_mode="pullback")
 
 
 def test_config_phi_retract_mode_validated():

@@ -609,8 +609,14 @@ def _write_provenance(
                 raw = tokens.detach().cpu().numpy().tobytes()
                 prov[sha_key] = hashlib.sha256(raw).hexdigest()
                 prov[n_key] = int(tokens.numel())
-        except Exception:
-            pass
+        except (AttributeError, RuntimeError, TypeError, ValueError, OSError, MemoryError) as exc:
+            # Best-effort provenance, narrowed to the realistic hash-path failures (audit
+            # 2026-07-12 N2): exotic loader/dtype/allocation errors must not crash finalize, but
+            # the failure is LOGGED -- previously a bare `except Exception: pass` silently
+            # recorded null data hashes, indistinguishable from a loader without corpus tokens --
+            # while a programming error (NameError/KeyError/...) now surfaces instead of
+            # masquerading as a missing corpus.
+            logger.warning("%s-split provenance data hash failed (%s); recording null", split, exc)
     # Backward-compatible held-out aliases consumed by existing scaling-analysis artifacts.
     prov["data_sha256"] = prov["test_data_sha256"]
     prov["data_n_tokens"] = prov["test_data_n_tokens"]
@@ -726,11 +732,16 @@ def _fd_gradient_check(
     with torch.no_grad():
         for j in idx:
             orig = float(flat[j])
-            flat[j] = orig + fd_eps
-            _, lp, _ = model(tok, tgt)
-            flat[j] = orig - fd_eps
-            _, lm, _ = model(tok, tgt)
-            flat[j] = orig
+            # try/finally (audit 2026-07-12 N1): `flat` is a storage-sharing view of the LIVE
+            # decode parameter, and the caller catches broadly -- a forward that raises between
+            # the +/-eps writes must not leave the parameter perturbed for subsequent probes.
+            try:
+                flat[j] = orig + fd_eps
+                _, lp, _ = model(tok, tgt)
+                flat[j] = orig - fd_eps
+                _, lm, _ = model(tok, tgt)
+            finally:
+                flat[j] = orig
             fd = (float(lp) - float(lm)) / (2.0 * fd_eps)
             ana = float(gflat[j])
             worst = max(worst, abs(fd - ana) / max(abs(fd), abs(ana), 1e-8))

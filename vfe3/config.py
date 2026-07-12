@@ -313,7 +313,14 @@ class VFE3Config:
     # belief phi.detach()), so the gamma gradient reaches ONLY the s tables and the forward
     # (logits/ce) is byte-identical to the gamma=0 path -- the model channel stays predictively INERT
     # (s does NOT feed q). The detach deliberately severs the phi<-gamma coupling that full tied
-    # transport would carry; restoring it is part of the deferred s->q design. lambda_gamma>0 ALONE
+    # transport would carry; restoring it is part of the deferred s->q design. NB (audit 2026-07-12
+    # N17): the gamma-sourced frame force dF_gamma/dphi of the canonical F is severed on EVERY
+    # executable route -- this scored path detaches, and the s E-step (`_refine_s`) pins its
+    # e_phi_lr to 0.0 -- with NO exposing toggle (e_phi_lr>0 exposes only the beta-sourced force;
+    # no e_s_phi_lr exists). The PASSIVE-frame reading (the gamma block regulates the s tables in a
+    # frame it never back-reacts on) is the INTENDED interim pure path until the deferred s->q
+    # design lands; an indirect second-order path to phi_embed survives only under
+    # s_e_step+unroll through the graph-attached model frame. lambda_gamma>0 ALONE
     # creates the s tables (the r tables stay hyper-prior-only). NB: the mean over (B, H, N) makes
     # lambda_gamma=1 a per-token-per-head mean weight, NOT the canonical sum-over-ij; the scale is a
     # free coupling.
@@ -675,10 +682,15 @@ class VFE3Config:
     # ------------------------------------------------------------------
 
     # E-step update rule. 'gradient' (default, pure current path): one natural-gradient step per
-    # inner iteration. 'mm_exact': the closed-form MM/coordinate-exact minimizer of the beta-frozen
-    # majorizer F_hat = sum_i a_i KL(q_i||p_i) + lambda_beta sum_ij beta0_ij KL(q_i||Omega_ij q_j)
-    # -- precisions add, means fuse precision-weighted (harmonic-barycenter sigma*), a monotone
-    # F descent exact in ONE iteration at the same O(N^2 K) cost. KERNEL-ROUTE ONLY (filtering +
+    # inner iteration. 'mm_exact': the closed-form coordinate minimizer of the beta-frozen,
+    # strict-pair-masked diagonal-KL surrogate F_hat = sum_i a_i KL(q_i||p_i)
+    # + lambda_beta sum_ij beta0_ij KL(q_i||Omega_ij q_j) -- precisions add, means fuse
+    # precision-weighted (harmonic-barycenter sigma*) at the same O(N^2 K) cost. NB (audit
+    # 2026-07-12 N18, matching README "mm_exact"): the strict pair mask excludes the structural
+    # E_ii = 0 self-pairs, so the surrogate is NOT a majorizer of the canonical frozen-attention
+    # objective and the update carries NO majorization / monotone-F-descent / exact
+    # self-consistent-argmin guarantee -- it is a one-step fusion toward the mask-selected target.
+    # KERNEL-ROUTE ONLY (filtering +
     # gaussian_diagonal + renyi order 1 + attention entropy); rejected otherwise in __post_init__.
     e_step_update:             str   = "gradient"     # "gradient" | "mm_exact"
     
@@ -1820,17 +1832,22 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
-        # 'killing_per_block' builds a per-HEAD Killing metric and requires generators that partition
-        # per block (block_glk's independent gl(d_head) per head). The tied gauge's shared generators
-        # kron(I_n, gl(d_head)) each act on EVERY block, so the per-block partition does not exist;
-        # reject at construction (it otherwise fails cryptically inside the first E-step). The ambient
-        # 'killing', 'clip', and 'none' preconditioners are unaffected.
-        if self.gauge_group == "tied_block_glk" and self.phi_precond_mode == "killing_per_block":
+        # The per-block preconditioners ('killing_per_block' / 'pullback_per_block') build a per-HEAD
+        # metric and require generators that partition per block (block_glk's independent gl(d_head)
+        # per head). The tied gauge's shared generators kron(I_n, gl(d_head)) each act on EVERY
+        # block, so the per-block partition does not exist; reject BOTH at construction, mirroring
+        # the so_n/sp_n irrep-tower guard (audit 2026-07-12 N14 -- previously only the killing
+        # variant was rejected, so the m_gauge_update_rule-recommended 'pullback_per_block' pairing
+        # crashed opaquely at the first E-step / natural-gradient optimizer step). The ambient
+        # 'killing'/'pullback' (full-basis metrics), 'clip', and 'none' are unaffected.
+        if (self.gauge_group == "tied_block_glk"
+                and self.phi_precond_mode in ("killing_per_block", "pullback_per_block")):
             raise ValueError(
-                "phi_precond_mode='killing_per_block' is incompatible with gauge_group="
+                f"phi_precond_mode={self.phi_precond_mode!r} is incompatible with gauge_group="
                 "'tied_block_glk': the shared kron(I_n, gl(d)) generators do not partition per head, "
-                "so the per-block Killing metric is undefined. Use 'none', 'clip', or the ambient "
-                "'killing'."
+                "so the per-block metric is undefined. Use 'none', 'clip', or the ambient "
+                "'killing'/'pullback' (the ambient 'pullback' is feasible only up to K<=12 -- "
+                "its structure-constants build is O(K^6))."
             )
 
         # decode / encode
@@ -1878,6 +1895,11 @@ class VFE3Config:
         # audit F5 (2026-06-28): close the construction gaps where an invalid policy config validated and
         # only failed deep inside generate(). score_terms must be a nonempty subset of the EFE term names
         # the scorer assembles (a typo otherwise surfaces as a cryptic KeyError in _policy_efe_one_step).
+        # List -> tuple coercion (audit 2026-07-12 N8; the irrep_spec/cross_couplings precedent): a
+        # directly-constructed LIST is semantically valid but failed the logprob_control tuple-equality
+        # gate below, while the deserialized path already coerced -- protect both paths identically.
+        if isinstance(self.policy_score_terms, list):
+            self.policy_score_terms = tuple(self.policy_score_terms)
         _efe_score_terms = ("risk", "ambiguity", "epistemic")
         if len(self.policy_score_terms) == 0:
             raise ValueError("policy_score_terms must be nonempty; G(pi) is a sum over the EFE terms")
@@ -2408,10 +2430,11 @@ class VFE3Config:
                 import warnings
                 warnings.warn(
                     f"e_step_update='mm_exact' with lambda_alpha_mode={self.lambda_alpha_mode!r} "
-                    "computes the frozen state-dependent-alpha majorizer minimizer; the iteration "
-                    f"takes a step toward it using mm_damping={self.mm_damping} (a damped step for "
-                    "values below 1.0, the full step at 1.0). It is not one-step exact for the "
-                    "profiled state-dependent-alpha objective.",
+                    "computes the frozen-alpha minimizer of the strict-pair-masked surrogate "
+                    "(NOT a majorizer of the canonical objective; see the e_step_update note); the "
+                    f"iteration takes a step toward it using mm_damping={self.mm_damping} (a damped "
+                    "step for values below 1.0, the full step at 1.0). It is not one-step exact for "
+                    "the profiled state-dependent-alpha objective.",
                     UserWarning,
                     stacklevel=2,
                 )

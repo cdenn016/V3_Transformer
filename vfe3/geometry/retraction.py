@@ -130,6 +130,10 @@ def _frechet_log_spd(
 
     *,
     eps:     float = 1e-6,
+    eig:     Optional[Tuple[torch.Tensor, torch.Tensor]] = None,   # precomputed _eigh_damped of the
+                                            # SYMMETRIZED sigma, PRE-clamp (audit 2026-07-12 N9:
+                                            # lets retract_logeuclidean_full reuse its own eigh
+                                            # instead of decomposing the identical matrix twice)
 ) -> torch.Tensor:
     r"""Fréchet derivative of the matrix logarithm at ``sigma`` applied to ``tangent``.
 
@@ -141,10 +145,13 @@ def _frechet_log_spd(
     ``L_ij = (log(lambda_i) - log(lambda_j)) / (lambda_i - lambda_j)``.
     The repeated-eigenvalue branch uses the continuous reciprocal-mean limit.
     """
-    sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
     tangent = 0.5 * (tangent + tangent.transpose(-1, -2))
 
-    eigenvalues, eigenvectors = _eigh_damped(sigma, _rel_gap_eps(sigma))
+    if eig is None:
+        sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
+        eigenvalues, eigenvectors = _eigh_damped(sigma, _rel_gap_eps(sigma))
+    else:
+        eigenvalues, eigenvectors = eig
     eigenvalues = eigenvalues.clamp(min=eps)
     log_eigenvalues = torch.log(eigenvalues)
 
@@ -184,8 +191,10 @@ def retract_spd_diagonal(
     _check_sigma_max(sigma_max, eps)
     orig_dtype = sigma_diag.dtype
     with torch.amp.autocast(sigma_diag.device.type, enabled=False):     # tensor-keyed (audit 2026-07-05 m10)
-        sigma_safe = sigma_diag.float().clamp(min=eps)
-        delta_sigma = delta_sigma.float()
+        # float64 stays float64 (audit 2026-07-12 N12, the retract_spd_full F12 policy); half promotes to fp32.
+        compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
+        sigma_safe = sigma_diag.to(compute_dtype).clamp(min=eps)
+        delta_sigma = delta_sigma.to(compute_dtype)
         whitened = delta_sigma / sigma_safe
         if trust_region is not None and trust_region > 0:
             whitened = whitened.clamp(-trust_region, trust_region)
@@ -330,12 +339,15 @@ def retract_logeuclidean_full(
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
         delta_sigma = 0.5 * (delta_sigma + delta_sigma.transpose(-1, -2))
 
-        eigenvalues, eigenvectors = _eigh_damped(sigma, _rel_gap_eps(sigma))
-        eigenvalues = eigenvalues.clamp(min=eps)
+        eig_raw, eigenvectors = _eigh_damped(sigma, _rel_gap_eps(sigma))
+        eigenvalues = eig_raw.clamp(min=eps)
         log_eig = torch.log(eigenvalues)
         log_sigma = eigenvectors * log_eig.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
 
-        tangent = step_size * _frechet_log_spd(sigma, delta_sigma, eps=eps)
+        # Reuse this eigendecomposition for the Fréchet chart map (audit 2026-07-12 N9): sigma is
+        # already symmetrized above and _frechet_log_spd applies the SAME eps clamp, so passing the
+        # pre-clamp pair is byte-identical to its own eigh of the identical matrix.
+        tangent = step_size * _frechet_log_spd(sigma, delta_sigma, eps=eps, eig=(eig_raw, eigenvectors))
         if trust_region is not None and trust_region > 0:                # clamp the TANGENT, not the
             t_norm  = torch.linalg.norm(tangent, ord='fro', dim=(-2, -1), keepdim=True)   # base point,
             tangent = tangent * torch.clamp(trust_region / (t_norm + eps), max=1.0)       # so R(S,0)=S.
@@ -392,8 +404,10 @@ def retract_log_euclidean(
     # diagonal: Dlog_sigma[delta_sigma] = delta_sigma / sigma
     orig_dtype = sigma.dtype
     with torch.amp.autocast(sigma.device.type, enabled=False):          # tensor-keyed (audit 2026-07-05 m10)
-        sigma_safe  = sigma.float().clamp(min=eps)
-        delta_sigma = delta_sigma.float() / sigma_safe
+        # float64 stays float64 (audit 2026-07-12 N12, matching the full arm above); half promotes to fp32.
+        compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
+        sigma_safe  = sigma.to(compute_dtype).clamp(min=eps)
+        delta_sigma = delta_sigma.to(compute_dtype) / sigma_safe
         if trust_region is not None and trust_region > 0:
             delta_sigma = delta_sigma.clamp(-trust_region, trust_region)
         exp_arg   = (step_size * delta_sigma).clamp(-50.0, 50.0)
@@ -425,9 +439,11 @@ def natural_gradient(
     is_diagonal = sigma_q.dim() == grad_mu.dim()
     orig_dtype = sigma_q.dtype
     with torch.amp.autocast(sigma_q.device.type, enabled=False):        # tensor-keyed (audit 2026-07-05 m10)
-        sigma_q    = sigma_q.float()
-        grad_mu    = grad_mu.float()
-        grad_sigma = None if grad_sigma is None else grad_sigma.float()
+        # float64 stays float64 (audit 2026-07-12 N12; keyed on sigma_q, the metric); half promotes to fp32.
+        compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
+        sigma_q    = sigma_q.to(compute_dtype)
+        grad_mu    = grad_mu.to(compute_dtype)
+        grad_sigma = None if grad_sigma is None else grad_sigma.to(compute_dtype)
         if is_diagonal:
             sigma_safe     = sigma_q.clamp(min=eps)
             nat_grad_mu    = sigma_safe * grad_mu
