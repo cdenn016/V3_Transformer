@@ -165,3 +165,51 @@ hardening; F7/F8/F11/F19 are type or naming corrections; F15 needs an explicit d
 AMP policy before any edit. F5, F6, F9, F12, F16-F18, F20, F21, and F22 should not block work.
 
 No fixes were applied in this investigation.
+
+## Remediation closure
+
+The confirmed implementation findings were repaired on branch `codex/fix-audit-20260711` in an
+isolated worktree started from `origin/main` at `b734a9f`. Before push, the reviewed commits rebased
+without conflict onto the documentation-only `origin/main` advance at `ecb2887`; the code and test
+patches were unchanged. Per user direction, no baseline suite completed or contributed a result:
+the initially started run was stopped, its partial XML was deleted, and none of its output was used.
+Remediation verification began only after a regression test or production file had changed; each
+behavioral repair first produced its intended RED failure, then passed its focused GREEN gate before
+independent review. The table below uses the post-rebase commit IDs.
+
+| Findings | Closure | Commits |
+|---|---|---|
+| F4 | Replaced the unbounded strong-reference Killing inverse cache with a 32-entry weak identity/version LRU, cached per-block inverses by stable parent basis, and constructed cached inverses without autograd graphs. | `7852144`, `9a648a1` |
+| F1, F15 | Added a bounded weak identity/version front cache before BCH basis hashing while retaining equal-value sharing, and placed dense plus compact float32 BCH arithmetic in a disabled-autocast island. | `37f227e` |
+| F2 | Deleted the drifted local decode twin, routed golden comparisons through `PriorBank.reference_decode`, and pinned tied/untied token/model-channel tables plus bounded-variance extremes with zero relative tolerance. | `3299b6f`, `b8c99a4` |
+| F10, F12, F13, F14 | Closed only newly created figures after plotting failures, retained float64 full-SPD arithmetic, rejected nonfinite/negative adaptive-temperature strengths, and rejected invalid direct `mm_exact` damping before kernel work. | `7860167` |
+| F3, F7, F8, F11, F19 | Added precise callable and `TypedDict` contracts, documented tuple coefficients, typed figure paths, renamed the implementation to `half_fisher_trace` with an exact `fisher_trace` compatibility alias, and corrected human-facing labels without changing artifact keys. | `82b789c`, `8c343c5` |
+
+F5 and F6 remain extension-interface observations, F9 remains a documented correct-first generation
+cost, F16 through F18 remain informational unused imports, F20 remains intentional JSON
+normalization, F21 remains refuted because `"gaussian"` is a live admissibility alias, and F22
+remains the intentional Gauss-Seidel/autograd split. Those items were not edited.
+
+The focused controller checks recorded 41 tests for F4, 63 for F1/F15, 28 for F2, 230 for the
+runtime boundary repairs, and 90 for the contract/naming repairs, all with zero failures and zero
+errors. Independent reviewers rejected three intermediate patches: cached Killing inverses initially
+retained autograd graphs, the decode extreme used a permissive relative tolerance, and the first
+typing pass left fused CE as `Callable[..., Tensor]`. Commits `9a648a1`, `b8c99a4`, and `8c343c5`
+closed those issues, after which every task review approved without a remaining Critical,
+Important, or Minor finding.
+
+Final machine-readable verification was:
+
+| Gate | Runtime and result | JUnit SHA-256 |
+|---|---|---|
+| Consolidated focused CPU | 452 tests, 447 passed, 5 skipped, 0 failures, 0 errors, 19.347 s | `297D1669460F7462185D7397CCF0280BCD6F29E29BC5F620E2969D082D5AF41E` |
+| RTX 5090 targeted CUDA | 63 tests, 63 passed, 0 skipped, 0 failures, 0 errors, 3.646 s; CUDA 12.8 PyTorch runtime on NVIDIA GeForce RTX 5090 | `34783938B27C1DC307752C0A6D94AA800E166E3F7E5C254BF29EB0CFDE71A0B7` |
+| Complete default suite | 2,341 tests, 2,324 passed, 17 skipped, 0 failures, 0 errors, 314.913 s | `223AE4CCA822F641BE07BC1FC5DAF8682D963D643961D96A2B055CCFDC2CFFBA` |
+
+The machine's default project interpreters contained CPU-only PyTorch, so the CUDA gate used the
+existing CUDA-enabled `C:\anaconda\python.exe` environment. An initial environment-discovery batch
+included a CPU-only frozen-oracle test under that older PyTorch build and missed its absolute
+tolerance by `2.398e-6`; the same test passed in the complete default suite. That diagnostic batch
+is excluded from the GPU result above. The final CUDA gate used GPU-resident cache, BCH, float64
+SPD, decode, gauge-optimizer, and MM tests. `git diff --check` and `python -m compileall -q vfe3`
+also exited zero after the final code change.

@@ -25,8 +25,9 @@ paths remain unchanged.
 - Keep PriorBank production decode unchanged; F2 is a golden-oracle coverage repair.
 - Preserve checkpoint fields, CSV metric keys, and the fisher_trace compatibility name.
 - Do not implement or delete F5, F6, F9, F16-F18, or F20-F22.
-- Add regression tests before production edits and observe RED. The user waived baseline tests, so
-  the first test execution occurs only after a test file changes.
+- Add regression tests before production edits and observe RED. The user waived a completed
+  baseline; an initially started run was stopped and discarded, so validation used for the
+  remediation begins only after a test file changes.
 - Run pytest without an extra -q and derive counts from JUnit XML.
 - Use American English and aligned function signatures.
 
@@ -311,7 +312,7 @@ Commit message: refactor(contracts): type audit seams precisely
 - [ ] **Step 1: Update the investigation and dated record**
 
 Record each repaired finding, focused JUnit evidence, and reasons Informational/Refuted items remain
-unchanged. State that no baseline test ran before code changes.
+unchanged. State that no baseline completed or contributed a result before code changes.
 
 - [ ] **Step 2: Run source and syntax gates**
 
