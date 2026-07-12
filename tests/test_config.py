@@ -775,6 +775,13 @@ def test_constant_lambda_alpha_requires_finite_nonnegative_value(value):
     assert VFE3Config(lambda_alpha_mode="constant", lambda_alpha=0.0).lambda_alpha == 0.0
 
 
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_query_tau_c_requires_finite_nonnegative_value(value):
+    with pytest.raises(ValueError, match="query_tau_c must be finite and >= 0"):
+        VFE3Config(query_tau_c=value)
+    assert VFE3Config(query_tau_c=0.0).query_tau_c == 0.0
+
+
 @pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
 def test_rope_base_requires_finite_positive_value(value):
     with pytest.raises(ValueError, match="rope_base"):

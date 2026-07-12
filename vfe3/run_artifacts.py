@@ -198,13 +198,19 @@ class RunArtifacts:
         r"""Best-effort attention heatmaps for one periodic eval: one figure per (layer, head).
 
         Writes ``attention/step_<N>_layer<l>_head<h>.png`` per (layer, head) -- a LOG-scaled beta
-        heatmap (see :func:`vfe3.viz.figures.plot_attention_heatmap`) on a colour scale shared
+        heatmap (see :func:`vfe3.viz.figures.plot_attention_heatmap`) on a color scale shared
         across panels so heads/layers stay comparable. Mirrors ``_save_figures``: a plotting or
         dependency error is logged and swallowed (never fatal to the run), and each figure is
         closed so ~30 evals do not leak figures. Returns the paths written, or None on failure.
         """
         try:
             from vfe3.viz import figures as figs
+        except Exception as exc:                                    # a viz error must never kill training
+            (logger or logging.getLogger(__name__)).warning(
+                "attention-map figure at step %d failed (%s); training continues", step, exc)
+            return None
+        before = set(figs.plt.get_fignums())
+        try:
             figs.set_publication_style()
             m = maps.detach().cpu() if hasattr(maps, "detach") else torch.as_tensor(maps)
             if m.dim() == 2:                                        # (N, N) -> one layer, one head
@@ -230,6 +236,8 @@ class RunArtifacts:
                     paths.append(path)
             return paths
         except Exception as exc:                                    # a viz error must never kill training
+            for number in set(figs.plt.get_fignums()) - before:
+                figs.plt.close(number)
             (logger or logging.getLogger(__name__)).warning(
                 "attention-map figure at step %d failed (%s); training continues", step, exc)
             return None
@@ -244,7 +252,7 @@ class RunArtifacts:
 
         The s-channel sibling of :meth:`save_attention_maps`. Writes
         ``attention/step_<N>_gamma_head<h>.png`` per head -- a LOG-scaled gamma_ij heatmap on the
-        VIRIDIS colour map (the belief beta channel uses magma) so the two channels read apart, on a
+        VIRIDIS color map (the belief beta channel uses magma) so the two channels read apart, on a
         scale shared across heads. ``maps`` is None when the model channel is inactive
         (``gamma_attention_maps`` returns None) -> no-op. A plotting error is logged and swallowed.
         """
@@ -252,6 +260,12 @@ class RunArtifacts:
             return None
         try:
             from vfe3.viz import figures as figs
+        except Exception as exc:                                    # a viz error must never kill training
+            (logger or logging.getLogger(__name__)).warning(
+                "gamma-map figure at step %d failed (%s); training continues", step, exc)
+            return None
+        before = set(figs.plt.get_fignums())
+        try:
             figs.set_publication_style()
             m = maps.detach().cpu() if hasattr(maps, "detach") else torch.as_tensor(maps)
             if m.dim() == 2:                                        # (N, N) -> one head
@@ -274,6 +288,8 @@ class RunArtifacts:
                 paths.append(path)
             return paths
         except Exception as exc:                                    # a viz error must never kill training
+            for number in set(figs.plt.get_fignums()) - before:
+                figs.plt.close(number)
             (logger or logging.getLogger(__name__)).warning(
                 "gamma-map figure at step %d failed (%s); training continues", step, exc)
             return None

@@ -224,8 +224,9 @@ def retract_spd_full(
         delta_sigma = delta_sigma.reshape(B * N, K, K)
 
     with torch.amp.autocast(sigma.device.type, enabled=False):          # tensor-keyed (audit 2026-07-05 m10)
-        sigma = sigma.float()
-        delta_sigma = delta_sigma.float()
+        compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
+        sigma = sigma.to(dtype=compute_dtype)
+        delta_sigma = delta_sigma.to(dtype=compute_dtype)
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
         delta_sigma = 0.5 * (delta_sigma + delta_sigma.transpose(-1, -2))
 

@@ -127,6 +127,23 @@ def test_mm_exact_rejects_oracle_route(device):
                          e_step_update="mm_exact", gradient_mode="smoothing")
 
 
+@pytest.mark.parametrize("mm_damping", [0.0, -0.1, 1.01, float("nan"), float("inf")])
+def test_mm_exact_direct_call_rejects_invalid_damping(device, mm_damping):
+    mu, sigma, mu_p, sigma_p, omega, grp, phi = _setup(device=device)
+    belief = BeliefState(mu=mu, sigma=sigma, phi=phi[0])
+    with pytest.raises(ValueError, match="mm_damping must be finite and in \\(0, 1\\]"):
+        e_step_iteration(
+            belief,
+            mu_p,
+            sigma_p,
+            grp,
+            tau=1.5,
+            e_phi_lr=0.0,
+            e_step_update="mm_exact",
+            mm_damping=mm_damping,
+        )
+
+
 # --- (c) two-hop kernel term -------------------------------------------------
 
 def test_twohop_zero_is_byte_identical(device):

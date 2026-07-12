@@ -2453,8 +2453,10 @@ class VFE3Config:
                 )
         if self.lambda_twohop < 0.0:
             raise ValueError(f"lambda_twohop must be >= 0, got {self.lambda_twohop}")
-        if self.query_tau_c < 0.0:
-            raise ValueError(f"query_tau_c must be >= 0, got {self.query_tau_c}")
+        if not math.isfinite(self.query_tau_c) or self.query_tau_c < 0.0:
+            raise ValueError(
+                f"query_tau_c must be finite and >= 0, got {self.query_tau_c}"
+            )
         if self.z_loss_weight < 0.0:
             raise ValueError(f"z_loss_weight must be >= 0, got {self.z_loss_weight}")
         if self.sigma_weight_decay is not None and (

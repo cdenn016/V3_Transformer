@@ -362,6 +362,40 @@ def test_save_attention_maps_is_best_effort(tmp_path):
     assert art.save_attention_maps(1, object()) is None         # bad maps -> None, no exception
 
 
+@pytest.mark.parametrize(("writer", "maps"), [
+    ("save_attention_maps", torch.ones(1, 1, 2, 2)),
+    ("save_gamma_attention_maps", torch.ones(1, 2, 2)),
+])
+def test_attention_writer_closes_only_new_figures_on_plot_failure(
+    tmp_path,
+    monkeypatch,
+    writer,
+    maps,
+):
+    from vfe3.viz import figures as figs
+
+    cfg = _cfg()
+    art = RunArtifacts(tmp_path / "run", cfg, VFEModel(cfg))
+    existing = figs.plt.figure()
+    created = []
+
+    def _raise_after_creating_figure(*args, **kwargs):
+        fig = figs.plt.figure()
+        created.append(fig.number)
+        raise RuntimeError("plot failed after allocating a figure")
+
+    monkeypatch.setattr(figs, "plot_attention_heatmap", _raise_after_creating_figure)
+    try:
+        assert getattr(art, writer)(1, maps) is None
+        open_figures = set(figs.plt.get_fignums())
+        assert existing.number in open_figures
+        assert open_figures.isdisjoint(created)
+    finally:
+        figs.plt.close(existing)
+        for number in created:
+            figs.plt.close(number)
+
+
 def test_train_without_artifacts_writes_nothing(tmp_path):
     cfg = _cfg()
     torch.manual_seed(0)

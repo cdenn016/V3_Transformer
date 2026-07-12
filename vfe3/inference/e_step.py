@@ -11,6 +11,7 @@ guaranteed monotone per iteration; F-descent holds as a DIRECTION property
 """
 
 import dataclasses
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -770,6 +771,10 @@ def e_step_iteration(
         # ``mm_exact_update``). Derived from the diagonal-KL filtering kernel, so it is
         # kernel-route ONLY; config __post_init__ rejects oracle-routed configs, and direct
         # callers get the same rejection here.
+        if not math.isfinite(mm_damping) or not (0.0 < mm_damping <= 1.0):
+            raise ValueError(
+                f"mm_damping must be finite and in (0, 1], got {mm_damping}"
+            )
         if not uses_kernel_route(
                 renyi_order=renyi_order, gradient_mode=gradient_mode, family=family,
                 divergence_family=divergence_family,

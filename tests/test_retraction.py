@@ -82,6 +82,19 @@ def test_full_retraction_K1_matches_diagonal_formula():
     assert torch.allclose(out.reshape(()), expected, atol=1e-4)
 
 
+def test_full_retraction_float64_tiny_diagonal_tangent_matches_affine_exponential():
+    sigma_diag = torch.tensor([1.25, 2.5, 4.0], dtype=torch.float64)
+    delta_diag = torch.tensor([1e-8, -1e-8, 2e-8], dtype=torch.float64)
+    sigma = torch.diag(sigma_diag).unsqueeze(0)
+    delta = torch.diag(delta_diag).unsqueeze(0)
+
+    out = retract_spd_full(sigma, delta, trust_region=0.0, sigma_max=None)
+    expected = torch.diag(sigma_diag * torch.exp(delta_diag / sigma_diag)).unsqueeze(0)
+
+    assert out.dtype == torch.float64
+    torch.testing.assert_close(out, expected, rtol=0.0, atol=1e-12)
+
+
 # --- register_retraction / get_retraction seam (roadmap item 4) ------------
 def test_retraction_registry_round_trip():
     """register_retraction/get_retraction round-trip and the unknown-name KeyError."""

@@ -100,6 +100,8 @@ def query_adaptive_tau(
     against the (..., [H,] N) log-partition. Monotone increasing in tr Sigma for c > 0; at c = 0
     it equals the base tau on every row (value-identical to the scalar path).
     """
+    if not math.isfinite(c) or c < 0.0:
+        raise ValueError(f"c must be finite and >= 0, got {c}")
     sig = sigma.detach()
     if len(irrep_dims) == 1:
         scale = 1.0 + c * sig.sum(dim=-1, keepdim=True) / float(irrep_dims[0])   # (..., N, 1)

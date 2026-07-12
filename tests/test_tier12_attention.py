@@ -4,6 +4,7 @@ two-hop coupling F-term. Tiny shapes; device-agnostic (set VFE3_TEST_DEVICE=cuda
 """
 import os
 
+import pytest
 import torch
 
 from vfe3.attention_prior import attention_log_prior
@@ -103,6 +104,13 @@ def test_query_tau_off_path_identical_and_on_path_load_bearing():
     # bitwise the scalar-tau computation -- the OFF path's byte-identity proxy.
     assert torch.equal(l_off, l_c0)
     assert not torch.allclose(l_off, l_on)                   # the adaptive tau is load-bearing
+
+
+@pytest.mark.parametrize("c", [-1.0, float("nan"), float("inf")])
+def test_query_adaptive_tau_rejects_nonfinite_or_negative_c(c):
+    sigma = torch.ones(2, 3, 4)
+    with pytest.raises(ValueError, match="c must be finite and >= 0"):
+        query_adaptive_tau(sigma, 1.0, [4], c=c)
 
 
 # ------------------------------------------------ (c) gamma-as-beta-prior fold
