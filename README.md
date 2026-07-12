@@ -91,6 +91,11 @@ U_i &= \operatorname{diag}\left(U_i^{(1)},\ldots,U_i^{(H)}\right).
 \end{aligned}
 $$
 
+The piecewise formula describes forward values. The implementation computes its scale under
+`torch.no_grad()` and multiplies by that detached scale, so autograd treats the current scale as a
+constant. Outer frame gradients therefore differentiate through the scaled matrix exponential but
+are not the derivative of the displayed radial normalization.
+
 The checked-in specialization has $K=20$, $H=2$, and $d_h=10$, so its effective frame has two
 $\operatorname{GL}^{+}(10)$ blocks. Every real matrix exponential has positive determinant, but
 the real exponential map is not surjective onto the positive-determinant component. Within
@@ -211,8 +216,8 @@ free energy.
 
 ## Inner objectives and executable updates
 
-The belief channel minimizes a target-blind structural objective. Its one-hop term uses the
-belief attention weights and the same entropy regularizer that produces the Gibbs row solution.
+The belief channel is defined relative to a target-blind structural objective. Its one-hop term
+uses the belief attention weights and the same entropy regularizer that produces the Gibbs row solution.
 The checked-in state-dependent self-coupling profiles the positive coefficient $a_i$ against its
 regularizer in the same objective:
 

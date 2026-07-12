@@ -114,7 +114,10 @@ The checked-in non-skew route has `K=20`, `H=2`, and `d_h=10`, so its effective 
 exponential parameterization applies without modification only inside the norm-20 region; outside
 it, radial magnitudes collapse onto the clamp boundary. The resulting joint frame image is a
 restricted subset of the unclamped block-group exponential image, and each block's exponential
-image does not cover every element of the positive-determinant component.
+image does not cover every element of the positive-determinant component. The prose will also state
+that this piecewise formula specifies forward values: the implementation computes the scale under
+`torch.no_grad()` and autograd treats that scale as constant, so outer frame gradients are not the
+derivative of the displayed radial normalization.
 
 ## Transport and Gaussian comparison energy
 

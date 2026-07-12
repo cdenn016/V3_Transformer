@@ -53,7 +53,7 @@ G_block=product_{h=1}^H GL(d_h), d_h=K/H,
 U_i=diag(U_i^(1),...,U_i^(H)).
 ```
 
-Immediately specialize to `K=20`, `H=2`, and `d_h=10`, and describe the checked-in frame as two `GL^+(10)` blocks. State that the non-skew path applies the whole-frame norm-20 clamp before exponentiation. Explain that the ordinary exponential parameterization applies without modification only inside the unclamped region; beyond it, radial magnitudes collapse onto the clamp boundary, and the effective joint frame image is a restricted subset of the unclamped block-group exponential image. Also state that each real matrix exponential stays in the positive-determinant component but that the blockwise exponential map is not a surjection onto that component.
+Immediately specialize to `K=20`, `H=2`, and `d_h=10`, and describe the checked-in frame as two `GL^+(10)` blocks. State that the non-skew path applies the whole-frame norm-20 clamp before exponentiation. Explain that the ordinary exponential parameterization applies without modification only inside the unclamped region; beyond it, radial magnitudes collapse onto the clamp boundary, and the effective joint frame image is a restricted subset of the unclamped block-group exponential image. Also state that each real matrix exponential stays in the positive-determinant component but that the blockwise exponential map is not a surjection onto that component. Require a gradient-boundary sentence: the piecewise clamp gives forward values, while the implementation computes the scale under `torch.no_grad()` and autograd treats it as constant, so outer frame gradients are not the derivative of the displayed radial normalization.
 
 - [ ] **Step 3: Write display blocks 2 and 3 for transport and comparison energy**
 
