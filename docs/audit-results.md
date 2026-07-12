@@ -1,4 +1,112 @@
-# Ultra-Deep Audit — V3_Transformer (vfe3) — 2026-07-06
+# Partial-Buildout Audit — V3_Transformer — 2026-07-12
+
+## Outcome
+
+This audit inspected the complete repository at `origin/main` commit
+`2a988eb16e8907864bc4c01ddc04ef13e90001fc` for features that have executable artifacts but stop
+before a required configuration, runtime, persistence, observation, or testing boundary. It did not
+treat a comment, manuscript ambition, reserved registry name, default toggle choice, or disclosed
+approximation as sufficient evidence. A candidate survived only when current executable source showed
+both an implemented portion and a missing end-to-end seam.
+
+Independent verification confirmed 16 partial candidates, which consolidate to 15 implementation
+findings because the two-hop phi omission and the Metropolis objective omission share one root cause.
+The exclusion register separately records five intentional complete limitations, three reserved or
+unstarted ideas, and three refuted claims. After adversarial review, one finding remains High, twelve
+are Medium, and two are Low. No default model-training or inference mathematical-correctness failure
+was found; PB-01 is instead a default-on experiment-integrity defect. No production code was changed.
+
+The full baseline command was:
+
+```powershell
+python -m pytest -x --junitxml="C:\tmp\vfe3-partial-build-baseline-20260712.xml"
+```
+
+It completed with `2346 passed, 17 skipped, 0 failed, 0 errors` in 349.32 seconds. The pass count came
+from the pytest output and is independently checked against the JUnit XML before closeout.
+
+## Scope and method
+
+The live checkout was dirty and one commit behind the fetched remote, so it was left untouched. The
+audit ran in `C:\tmp\V3_Transformer-partial-build-audit-20260712` on branch
+`codex/partial-build-audit-20260712`, created directly from the fetched `origin/main`. The repository
+contained 218 Python files, below the whole-repository audit threshold.
+
+Three read-only investigators covered runtime and configuration reachability, mathematical and state
+completeness, and experiment/reporting/data completeness. Their claims were deduplicated and sent to a
+fresh verifier that re-read every cited path. The four candidates initially rated High received a
+separate skeptic/defender challenge. Source behavior, rather than comments, determined every final
+verdict. Comments and the Research wiki were used only to identify intended boundaries and avoid
+misclassifying a disclosed scope choice as a defect.
+
+## Confirmed partial buildouts
+
+| ID | Severity | Partial boundary | Executable evidence | Completion plan |
+|---|---:|---|---|---|
+| PB-01 | **High** | Default-on ablation resume can reuse stale cells after source, tokenizer, or corpus changes. | `_cell_is_current()` compares reconstructed config, a dataset label, token cap, marker status, and requested diagnostics, but no code or data identity; the cache hit is then reused at `ablation.py:1851-1927,2025-2032,2050-2062`. | [`2026-07-12-artifact-resume-integrity.md`](superpowers/plans/2026-07-12-artifact-resume-integrity.md) |
+| PB-02 | Medium | A default ablation cell does not produce the self-contained artifact set the runner advertises. | The remote baseline has `max_steps=15000`, `log_interval=100000`, and `eval_interval=150000`; `_cell_cfg_dict()` forces `checkpoint_interval=0`. The final validation computes the headline result but does not write `metrics.csv`, `best_model.pt`, or a resumable terminal bundle (`ablation.py:20-23,109,356-360,1584-1589,1758-1818`; `vfe3/train.py:1079-1084`). | [`2026-07-12-artifact-resume-integrity.md`](superpowers/plans/2026-07-12-artifact-resume-integrity.md) |
+| PB-03 | Medium | Cross-run resume restores historical-best metadata without restoring the corresponding weights. | Checkpoints contain the current model state plus `best_val_ppl` and `best_step`, while load restores only those best scalars. A fresh run directory has no old `best_model.pt`, and finalization reloads only a best file found in the new directory (`vfe3/run_artifacts.py:344-358,452-459,915-946`; `train_vfe3.py:520-579`). `reloaded_best=False` exposes the mismatch but does not repair it. | [`2026-07-12-artifact-resume-integrity.md`](superpowers/plans/2026-07-12-artifact-resume-integrity.md) |
+| PB-04 | Medium | The EFE ring experiment discards each trained model and cannot resume completed seeds. | The seed loop trains and evaluates a model, then retains only aggregate adequacy, arm metrics, and gates in one JSON record; no per-seed state, RNG, config fingerprint, or code identity is serialized (`efe_ring_experiment.py:224-270`). | [`2026-07-12-artifact-resume-integrity.md`](superpowers/plans/2026-07-12-artifact-resume-integrity.md) |
+| PB-05 | Medium | `efe_rollout` is implemented and config-valid but unreachable through public generation. | Configuration accepts `policy_horizon>1`, and the scorer consumes `(B,Kp,H)` candidates, but `_policy_select()` raises because it constructs only `(B,Kp,1)` menus (`vfe3/config.py:1927-1930`; `vfe3/inference/policy.py:450-497`; `vfe3/model/model.py:2033-2043`). | [`2026-07-12-efe-policy-generation-completion.md`](superpowers/plans/2026-07-12-efe-policy-generation-completion.md) |
+| PB-06 | Medium, gate-blocked | A validated sigma-gate artifact cannot activate `sigma_mc`. | Configuration can validate a PASS record, but the registered estimator always raises and the generation call supplies no ambiguity-mode dispatch (`vfe3/config.py:1951-1964`; `vfe3/inference/policy.py:234-250`; `vfe3/model/model.py:2067-2070`). The current empirical gate is FAIL, so implementation must remain fail-closed. | [`2026-07-12-efe-policy-generation-completion.md`](superpowers/plans/2026-07-12-efe-policy-generation-completion.md) |
+| PB-07 | Low | Metric and figure registries do not drive production reports, and four completed sweep plots are orphaned. | Non-test call search finds `compute_metrics()` and `get_figure()` only at their definitions; production drivers call concrete functions. `capacity_scaling`, `pareto_frontier`, `ablation_forest`, and `lr_grid_heatmap` render in tests but have no persisted-artifact driver (`vfe3/metrics.py:1302-1409`; `vfe3/viz/figures.py:497-515,2295-2453`; `vfe3/viz/report.py:222-342`). | [`2026-07-12-reporting-registry-completion.md`](superpowers/plans/2026-07-12-reporting-registry-completion.md) |
+| PB-08 | Medium, performance | The corpus “memmap” route materializes the requested stream as a full int64 tensor. | The `.bin` loader opens `np.memmap` and immediately converts the entire view to `torch.long`; the uncapped `.pt` branch disables mapped loading (`vfe3/data/datasets.py:86-101,220-230,247-283`). | [`2026-07-12-out-of-core-corpus-loading.md`](superpowers/plans/2026-07-12-out-of-core-corpus-loading.md) |
+| PB-09 | Medium, architectural | The observation likelihood exists as a scalar and diagnostic seam but has no live inference value or gradient path. | `free_energy()` accepts and subtracts `log_likelihood`, while the production E-step scalar call omits it and the analytic kernels expose no observation input (`vfe3/free_energy.py:371-387,464-465`; `vfe3/inference/e_step.py:489-494`; `vfe3/gradients/kernels.py:86-104`). A literal target injection would be acausal at deployment, so this requires an observation-model design rather than one more argument. | Existing comprehensive plan: [`2026-07-11-backprop-free-vfe-lm-plan.md`](plans/2026-07-11-backprop-free-vfe-lm-plan.md) |
+| PB-10 | Medium | The active q/p/s/h hierarchy has no single typed evaluator with explicit reduction and stop-gradient semantics. | The authoritative `free_energy()` evaluates the q self/beta blocks only. Hyper-prior and gamma terms are either added separately or realized through `_refine_s`, and diagnostics reconstruct them separately (`vfe3/free_energy.py:371-403`; `vfe3/model/model.py:1542-1583,2520-2548`). | [`2026-07-12-hierarchical-probabilistic-completeness.md`](superpowers/plans/2026-07-12-hierarchical-probabilistic-completeness.md) |
+| PB-11 | Medium | The model channel remains a diagonal-Gaussian, flat-connection island while supported belief routes use full covariance or nonflat transport. | `s_e_step` rejects full covariance; `_refine_s()` fixes `family="gaussian_diagonal"` and `transport_mode="flat"`; `_gamma_energy()` also uses flat transport (`vfe3/config.py:1554-1590,2145-2158`; `vfe3/model/model.py:773-816,1699-1723`). | [`2026-07-12-hierarchical-probabilistic-completeness.md`](superpowers/plans/2026-07-12-hierarchical-probabilistic-completeness.md) |
+| PB-12 | Medium | Nonzero two-hop coupling is absent from the phi coordinate objective and from Metropolis scoring. | Mean and covariance routes include `lambda_twohop`, but `phi_alignment_loss()` has no such input. The reflection scorer also omits two-hop and the folded precision/gamma priors, although compatible combinations construct (`vfe3/inference/e_step.py:505-540,935-970`; `vfe3/model/model.py:1130-1158`). | [`2026-07-12-phi-reflection-objective-parity.md`](superpowers/plans/2026-07-12-phi-reflection-objective-parity.md) |
+| PB-13 | Medium | Clebsch-Gordan coupling transforms means but has no covariance pushforward or explicit probabilistic energy contribution. | `CGCoupling.forward()` computes a bilinear mean delta and returns sigma unchanged; the block applies that tuple directly (`vfe3/model/cg_coupling.py:11-13,139-162`; `vfe3/model/block.py:157-158`). | [`2026-07-12-hierarchical-probabilistic-completeness.md`](superpowers/plans/2026-07-12-hierarchical-probabilistic-completeness.md) |
+| PB-14 | Medium | The prior-bank decode remains fixed Gaussian alpha-1 KL under supported non-KL or non-Gaussian E-step objectives. | Configuration accepts the objective but warns that decode ignores `renyi_order` and `divergence_family`; decoder kernels call the fixed KL path (`vfe3/config.py:1999-2028`; `vfe3/model/prior_bank.py:20-30`). | [`2026-07-12-hierarchical-probabilistic-completeness.md`](superpowers/plans/2026-07-12-hierarchical-probabilistic-completeness.md) |
+| PB-15 | Low | Gradient clipping strategy is configurable, but its threshold is not on the authoritative click-run config surface. | `VFE3Config` exposes `grad_clip_per_role`, while `train()` owns an independent `grad_clip=1.0` argument and the click-run entry points do not pass it (`vfe3/config.py:795-799`; `vfe3/train.py:455,883-905,1538-1545`; `train_vfe3.py:601-611`; `ablation.py:1780-1791`; `scaling.py:765-768`; `check_gpu_tests.py:55-56`). | [`2026-07-12-gradient-clipping-config-wiring.md`](superpowers/plans/2026-07-12-gradient-clipping-config-wiring.md) |
+
+## Adversarial rulings on proposed High findings
+
+| Candidate | Skeptic | Defender | Final | Source-backed reason |
+|---|---|---|---|---|
+| Default ablation artifact contract | Medium | Medium | **DOWNGRADED to Medium** | The terminal validation number and aggregate marker survive, and checkpoint suppression is explicit; the defect is reproducibility and archival completeness, not corrupted training. |
+| Stale ablation resume | High | High | **UPHELD High** | Resume is default-on and silently combines cells whose source or corpus content may differ while labels and config remain equal. |
+| Cross-run best-weight continuity | Medium | High | **DOWNGRADED to Medium** | The selected weights are genuinely absent, but `reloaded_best=False` exposes the condition and resume is opt-in. The mixed best metadata still requires repair. |
+| Observation-conditioned inference | Low | Medium | **DOWNGRADED to Medium architectural priority** | No supported configuration claims a live observation E-step, and the deployed target-blind path is correct for causal generation. The partial seam matters for the canonical research program, not current default execution. |
+
+## Excluded candidates
+
+The following boundaries are real but are not partially runnable features, so no implementation plan
+is assigned by this audit.
+
+| Disposition | Candidate | Reason |
+|---|---|---|
+| Intentional complete limitation | Flat-preference EFE generation | With the default risk-plus-ambiguity terms, flat preference cancels to a constant; the click-run script explicitly selects ambiguity-only confidence reranking. A typed goal-context API would be a separate future design, not a missing promise or part of the PB-05/PB-06 completion plan. |
+| Intentional complete limitation | Ordinary generation without an incremental cache | Generation is correct and explicitly full-recompute. A generic cache would be a separate performance design, not a correctness defect or part of the PB-05/PB-06 completion plan. |
+| Intentional complete limitation | Outer frame updates are additive | `phi_retract_mode` is an inner E-step setting. A manifold-aware outer optimizer would be a new feature. |
+| Intentional complete limitation | Synchronous best-model writes | The writer is correct and atomic. Its cost should be measured before an asynchronous redesign. |
+| Intentional complete limitation | Diagonal GL(K) covariance projection | The projection is disclosed and the exact full-covariance sibling already exists. |
+| Reserved, not public | `gauge_fixed` encoder | The registry name and callable both fail closed before a valid model can run. Promote it through a design decision before planning implementation. |
+| Reserved, not public | Row-lazy vocabulary optimizer | No runnable registry or partial optimizer exists; this is an unstarted performance idea. |
+| Reserved, not public | Exact compact-subgroup Route A / Wilson action | Only a design note exists beside the implemented Route B. It is a research target, not a half-runnable route. |
+| Refuted | Filtered-key nonflat/omega-direct global-F route | Production call sites use `keys=None`; the guards block optional direct diagnostic combinations only. |
+| Refuted | Laplace natural-parameter exceptions | Varying-location Laplace is not a joint natural exponential family; its closed-form divergence and Fisher natural-gradient routes are implemented and live. |
+| Refuted | Reflection STE as a promised mode | Both STE values are rejected at construction and are not presented as supported. The Metropolis objective mismatch survives separately as PB-12. |
+
+## Plan order
+
+The recommended execution order is based on evidence integrity and dependency structure, not raw line
+count. First implement artifact/resume integrity, because stale cells and missing selected weights can
+invalidate experiments produced by every later feature. Next implement the small gradient-clipping
+config seam and the out-of-core loader. Then close phi/Metropolis objective parity before running any
+two-hop/reflection experiment. Implement hierarchical probabilistic completeness before reporting
+registry completion: reporting composes with the versioned ablation contract and the final typed
+diagnostic decomposition. The policy-generation plan can follow artifact integrity but must retain its
+empirical sigma FAIL gate. PB-09 already has a larger, falsifiable nudged two-phase plan and should not
+be replaced by a cosmetic `log_likelihood` call.
+
+## Research-wiki disposition
+
+The audit consulted `[[VFE Transformer Program]]`, `[[Nudged two-phase EM]]`, the sigma-gate failure
+record, and the EFE policy pre-registration. No Research-vault file was changed. The verified
+partial-buildout inventory is worth ingesting into the project page after user confirmation because it
+updates implementation status without changing the underlying theory.
+
+# Archived audit — V3_Transformer (vfe3) — 2026-07-06
 
 **Fix status (branch `fix/audit-2026-07-06-majors`)**: all four MAJOR findings (M1-M4) fixed with TDD and pinned by new tests (M1: `test_extractors_use_learned_kappa_in_iter_and_fe_kwargs`, `test_converged_state_beta_tracks_learned_kappa`; M2: `test_phi_clamp_monitor_threshold_matches_transport_clamp`; M3: `test_cache_supported_gates_result_changing_toggles`; M4: `test_gauge_transport_figure_aggregates_seeds`, `test_mu_precond_figure_aggregates_seeds`, `test_attention_entropy_figure_aggregates_seeds`). Full suite excluding the `test_viz.py` sklearn/llvmlite env crash: `tests=1539 failures=0 errors=0`. The MINOR (m1-m31), test-suite (t1-t8), and hygiene (h1) items below are NOT yet addressed. See `docs/2026-07-06-edits.md`.
 
