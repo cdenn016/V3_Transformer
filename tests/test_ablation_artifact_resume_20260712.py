@@ -146,6 +146,65 @@ def test_cell_reuse_rejects_semantic_config_drift(tmp_path: Path, monkeypatch) -
     assert ablation._cell_is_current(run_dir, drifted) is False
 
 
+def test_cell_reuse_rejects_max_tokens_or_dataset_drift(tmp_path: Path, monkeypatch) -> None:
+    r"""Explicit per-axis regression protection: the loader seams (train token cap, session dataset)
+    are contract fields, so a capped smoke cell can never be served for a full run and vice versa."""
+    run_dir, contract = _setup_cell(tmp_path, monkeypatch)
+    assert ablation._cell_is_current(run_dir, contract) is True
+    capped = copy.deepcopy(contract)
+    capped["max_tokens"] = 10_000
+    assert ablation._cell_is_current(run_dir, capped) is False
+    other_dataset = copy.deepcopy(contract)
+    other_dataset["dataset"] = "wikitext-2"
+    assert ablation._cell_is_current(run_dir, other_dataset) is False
+
+
+def test_missing_requested_diagnostics_output_forbids_contract_publication(tmp_path: Path, monkeypatch) -> None:
+    r"""A collect_diagnostics=True cell whose result carries NO diagnostic output is INCOMPLETE:
+    _cell_diagnostics returns {} on wholesale converged_state failure (error_kind stays None and the
+    terminal PPL stays finite), so without this gate the empty cell would publish a contract and be
+    served as [CACHED] forever. It must instead be converted to a failed result with no contract, so
+    the next run recomputes; a sibling cell WITH its requested output publishes and is reusable."""
+    monkeypatch.setattr(ablation, "_git_code_identity", lambda: dict(FIXED_CODE_IDENTITY))
+    monkeypatch.setattr(ablation, "cache_source_identity", _fake_source_ok)
+    sweep_name = "contract_diag_output"
+    monkeypatch.setitem(ablation.SWEEPS, sweep_name, {
+        "description": "requested-diagnostics completeness gate",
+        "collect_diagnostics": True,
+        "collect_extrapolation": True,
+    })
+    monkeypatch.setattr(ablation, "make_run_overrides",
+                        lambda _n: [("empty", {}), ("complete", {})])
+
+    def fake_run_single(label, overrides, run_dir, **kwargs):
+        result = {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
+                  "final_val_ppl": 9.0, "seed": 6}
+        if label == "complete":
+            result["attn_entropy"] = 1.0                    # requested diagnostics output present
+            result["extrap_ce"] = []                        # requested extrapolation output present
+        return result
+
+    monkeypatch.setattr(ablation, "run_single", fake_run_single)
+    monkeypatch.setattr(ablation, "_cleanup", lambda: None)
+    ablation.run_sweep(sweep_name, tmp_path, dataset=DATASET, device=None, seed=6, resume=False)
+
+    flags = {"collect_diagnostics": True, "collect_extrapolation": True}
+    expected = ablation._expected_cell_contract_or_none({}, DATASET, flags, seed=6)
+    assert expected is not None
+
+    empty_dir = tmp_path / sweep_name / ablation._sanitize("empty")
+    empty_marker = json.loads((empty_dir / "ablation_result.json").read_text(encoding="utf-8"))
+    assert empty_marker["status"] == "failed"
+    assert not (empty_dir / "cell_contract.json").exists()
+    assert ablation._cell_is_current(empty_dir, expected) is False
+
+    complete_dir = tmp_path / sweep_name / ablation._sanitize("complete")
+    complete_marker = json.loads((complete_dir / "ablation_result.json").read_text(encoding="utf-8"))
+    assert complete_marker["status"] == "success"
+    assert (complete_dir / "cell_contract.json").exists()
+    assert ablation._cell_is_current(complete_dir, expected) is True
+
+
 # =============================================================================
 # cache_source_identity: SHA-256 identity tracks the bytes on disk
 # =============================================================================

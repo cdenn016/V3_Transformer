@@ -1842,6 +1842,12 @@ _CSV_COLUMNS = [
     "wall_time_s", "seed", "error",
 ]
 
+_DIAGNOSTIC_RESULT_KEYS = {
+    "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
+    "rank_resid", "rank_resid_by_layer", "cov_gap", "energy_klmax_frac",
+}
+
+
 _CELL_CONTRACT_SCHEMA_VERSION = 1
 
 
@@ -2090,6 +2096,20 @@ def run_sweep(
             terminal_ppl = float("inf")
         result["final_val_ppl"] = terminal_ppl
         successful = result["error_kind"] is None and math.isfinite(terminal_ppl)
+
+        # Requested collections are terminal artifacts, so their OUTPUT presence is part of
+        # "complete": _cell_diagnostics returns {} on wholesale converged_state failure (and
+        # silently skips failed probes) while error_kind stays None and the terminal PPL stays
+        # finite, so a headline-only "success" under collect_diagnostics=True would otherwise
+        # publish a contract and be served as [CACHED] forever. Convert such an incomplete cell
+        # to a failed result (no contract published) so the next run recomputes it.
+        if successful and collect_diagnostics and not any(
+                key in result for key in _DIAGNOSTIC_RESULT_KEYS):
+            logger.warning("  [%s] requested diagnostics output missing -> cell marked failed", label)
+            successful = False
+        if successful and collect_extrapolation and not isinstance(result.get("extrap_ce"), list):
+            logger.warning("  [%s] requested extrapolation output missing -> cell marked failed", label)
+            successful = False
 
         # A successful cell is cached only when its contract can be rebuilt now: rebuild it (the
         # pre-run build was skipped or lost a transient source race), and if it still cannot be built
