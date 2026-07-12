@@ -1,153 +1,479 @@
-# Backprop-Free Gauge-VFE Language Model: Implementation Plan
+# Backprop-Free Gauge-VFE Language Model: Revised Investigation and Implementation Plan
 
-**Date:** 2026-07-11
-**Status:** Plan (no implementation yet)
-**Provenance:** Produced by a 14-agent adversarial investigation (5 recon agents: VFE_2.0 pure_fep autopsy, V3 architecture map, wiki/manuscript harvest, external literature calibration, closed-form math grounding; 4 independent design memos: conjugate-CAVI, analytic-local-gradients, gauge/frame geometry, credit-assignment; 4 adversarial challenges, all designs surviving with amendments; 1 synthesis). Key file:line citations spot-verified independently against source (see Appendix C).
+> **For agentic workers:** Use `superpowers:subagent-driven-development` or
+> `superpowers:executing-plans` only after the route-selection gate in Phase 1 has passed. Do not
+> begin any model-code phase speculatively.
 
-## 1. Executive summary
+**Date:** 2026-07-11. **Revised:** 2026-07-12.
 
-This plan builds a fully backprop-free trainer for the gauge-theoretic VFE transformer as a new `vfe3/fep/` subpackage behind V3's existing registry seams. The training step is a nudged two-phase EM: a free phase byte-identical to deployed inference (the `mm_exact` closed-form E-step), followed by two symmetric nudged continuations at observation strengths $\pm\lambda$ that share the free phase's settled state and iteration budget, so the truncation drift that would otherwise contaminate the equilibrium-propagation estimator cancels as common mode. Decode-side parameters train by direct analytic cross-entropy derivatives (per-row damped Gauss-Newton on the untied decode bank, convex one-dimensional Newton on the decode scale). Every other family — encode tables, gauge frames, positional frames, attention-prior tables, temperatures — receives its predictive credit exclusively through the $1/(2\lambda)$-scaled contrastive difference of analytic envelope statistics between the two nudged equilibria, which estimates the through-$q^*$ term $(\partial\mathrm{CE}/\partial q^*)(\partial q^*/\partial\theta)$ that pure_fep structurally dropped; small free-phase generative components (moment matching) survive only as explicitly weighted regularizers with collapse guards. Autograd appears nowhere in the learning path and everywhere in the test suite, as the oracle that pins every analytic gradient. The plan is gated by measured milestones — BPE unigram, KenLM 5-gram on the identical token stream, the published DFA band, then a 2x band against matched-K backprop V3 — and Phase 0 measures the detach-vs-unroll gap in today's V3, the single cheapest number that bounds what any fixed-point method can achieve here.
+**Status:** Theory-gated plan. No implementation exists. Phases 0 and 1 are investigations; they
+may terminate the project before model code is added.
 
-## 2. Post-mortem: why pure_fep stalled at ~25000 PPL
+**Goal:** Determine whether V3 can assign next-token credit without differentiating through the
+inference trajectory, and implement that trainer only if its update rule agrees with the settled
+cross-entropy gradient under explicit mathematical and numerical gates.
 
-The autopsy, the math grounding, and all four adversarial challenges converge on a two-tier verdict: a structural failure that capped the ceiling at near-bigram statistics, and an optimization-scale failure that prevented the model from even reaching that ceiling.
+**Architecture:** One application of the free-phase sweep remains byte-identical to deployed V3
+inference. The plan separately represents the configured finite production iterate and the
+continued-to-equilibrium state required by a fixed-point theorem, then gates their discrepancy.
+Predictive credit may proceed through one of two routes: a genuine joint-energy route supporting
+equilibrium propagation, or a separately derived fixed-point vector-field route. The existing V3
+filtering map is not presumed to satisfy either route. Decode parameters retain direct analytic
+cross-entropy updates; all other parameter families remain frozen until their selected credit rule
+passes a finite-difference oracle.
 
-**Cause 1 (structural, primary): the target-blind fixed point dropped the entire predictive credit path.** The E-step never received targets ("Law 1", VFE_2.0 `e_step.py:2010-2013`), so $q^*$ was stationary for $F$ without the likelihood; the fixed-$q^*$ M-step gradient $\partial F/\partial\theta|_{q^*}$ therefore missed the first-order term $(\partial\mathrm{CE}/\partial q^*)(\partial q^*/\partial\theta)$ — the only pathway by which attention $\beta$, transport $\Omega(\phi)$, and the E-step dynamics could learn to predict. The envelope theorem that justifies EM fails for the CE term by construction because E-step and M-step optimized different functionals. The repo's own README concedes the consequence (VFE_2.0 `README.md:192`): clean-EM fits local (near-bigram) statistics but does not learn to link distant tokens. Everything except the prototype readout was reservoir computing.
+**Tech stack:** Python, PyTorch float32, CUDA on the RTX 5090 for scale experiments, analytic
+kernels in production, and autograd only in tiny test oracles.
 
-**Cause 2 (optimization scale): Euclidean global-LR steps at exactly the scales where they detonate.** With logit spread pinned to $O(\log V)\approx 11$ and $\mathrm{KL}\sim O(K)$, the decode temperature must scale as $\tau\sim O(K)$; the per-row CE gradient then carries $(1/\tau)\times(BN/V)$ factors, $\sim 10^{-3}$-scale and token-frequency-dependent, while the default update was `param.add_(grad, alpha=-lr)` with one global LR (`mstep.py:831-837`). Any LR that moves rare rows detonates frequent rows. The near-uniform 25000-PPL signature (only ~0.7 nats below uniform) is this failure's fingerprint; the recorded 1400 train-PPL plateau after the adam+cosine fixes is Cause 1's.
+## 1. Revision record and scope
 
-**Cause 3: encode/decode tying.** `mu_embed[v]` served simultaneously as the encode prior of $v$ (pulled toward beliefs where $v$ occurs) and the decode prototype for predicting $v$ (pulled toward beliefs one position earlier) — a blurred bigram geometry at best (`mstep.py:155-163` vs `:210-237`).
+The original plan was produced by a 14-agent adversarial investigation and committed as
+`f1674f222cec4df09d86419ad29985d7b81ce402`, with Git author and committer `cdenn016` and
+`Claude Fable 5` recorded as co-author. The July 12 review retained its staged empirical method,
+analytic decode updates, collapse diagnostics, and frame falsifier, but found that its central
+learning rule was not implementation-ready.
 
-**Cause 4: degenerate hyperparameter laws.** At fixed $q^*$, $\partial F_{red}/\partial\tau = \mathrm{KL}(\beta\|\pi)\ge 0$ (sympy-verified) and $\mathrm{grad}\,c_0\ge 0$, $\mathrm{grad}\,b_0\le 0$ always (`mstep.py:357-370`): descent monotonically anneals $\alpha\to 0$ and slammed `decode_log_scale` to its clamp floor (the recorded CE-pinned-at-$\log V$ episode).
+This revision corrects six points. First, selectively removing the decode-temperature factor from
+the target attraction changes the stated cross-entropy objective. Second, the shipped `mm_exact`
+filtering cascade has not been shown to be stationary descent on one joint scalar energy, so the
+ordinary scalar equilibrium-propagation contrast does not automatically apply. Third, the
+negative nudge is a signed curvature contribution rather than an ordinary convex precision-fusion
+pair. Fourth, shared initialization does not by itself prove cancellation of truncation error.
+Fifth, the detach-versus-unroll comparison is a calibration measurement rather than an upper
+bound. Sixth, VFE2 already contains a substantial `coupled_fep` experiment that directly bears on
+the proposed causal diagnosis and must be audited before a new trainer is designed.
 
-**Cause 5: frame learning blind and evaluated at the wrong point.** The 10M-parameter `phi_embed` (76%+ of trainable parameters) descended a target-free alignment objective whose optimum is transport homogenization, evaluated at the raw frame while the forward composed it with a permanently random positional table (`mstep.py:681-688` vs `positional.py:143-146`).
+The plan does not modify the deployed forward, existing backprop trainer, or pure configuration
+path. It does not claim EM monotonicity, predictive-coding equivalence to backpropagation, or an
+EqProp gradient theorem unless the corresponding gate below passes.
 
-**Causes 6-7: frozen families and train/deploy mismatch.** Temperatures, deep-block precisions, and positional geometry were frozen forever; M-step gradients were computed at a nested-meta $q^*$ that the evaluated forward never ran.
+## 2. Evidence ledger
 
-The adjudicated ranking matters for design: fixing Cause 2 alone buys bigram-class perplexity (a few hundred to ~1400); fixing Cause 1 is what everything above bigram depends on, and all four challenge verdicts agree that a weakly nudged phase whose statistics are consumed *directly* (rather than contrasted) re-runs Cause 1 at 98-99% strength.
+| Claim | Current status | Required disposition |
+|---|---|---|
+| Target-blind `pure_fep` omits the through-fixed-point CE term | Code-supported | Retain as a structural diagnosis, not as a complete causal explanation of any PPL plateau |
+| An artifact records exactly 25,000 PPL | Unsupported; the original plan itself says none was found | Remove as a factual premise; reconstruct actual runs in Phase 0 |
+| The post-fix plateau is caused only by missing through-state credit | Plausible, not isolated | Compare clean-EM, backprop oracle, and prior target-aware coupled paths under matched data and scale |
+| Symmetric nudging removes first-order finite-nudge bias | Established for suitable energy-based EqProp systems | Apply only after the joint-energy gate; do not generalize it to arbitrary truncation drift |
+| Current V3 `mm_exact` supports scalar EqProp | Unproved | Test integrability and construct an explicit scalar energy or reject this route |
+| Selective target scaling remains exact CE | False for `tau_eff != 1` | Use the exact CE derivative and handle scale with preconditioning |
+| Negative nudge remains convex precision fusion | False without an additional curvature bound | Prove phase existence or use the one-sided fallback |
+| Detach-versus-unroll gap upper-bounds the proposed method | False | Report it only as a matched calibration measurement |
+| VFE2 has no prior target-aware local-learning experiment | False | Audit `transformer/vfe/coupled_fep/` and its historical honest, leak, and filter results |
+| DFA and predictive-coding PPL values are direct V3 gates | False across differing datasets and tokenizers | Treat literature values as context; use only matched local baselines as gates |
 
-## 3. The learning rule
+## 3. Non-negotiable observation algebra
 
-**One functional.** Training restores the observation term to the canonical $F$ (PIFB.tex:1287; today a dead stub, `vfe3/free_energy.py:403-413`). Per position $i$ with target $y_i$, define $\ell_i(q_i) = -\log\,\mathrm{softmax}_v(-\mathrm{KL}(q_i\|p_v)/\tau_{\mathrm{eff}})[y_i]$ and the nudged objective $F_\lambda = F + \lambda\sum_{i,l}\ell_i(q_i^{(l)})$, injected at every layer $l$ (the deep-supervision surrogate; see §6 Phase 5 for the honesty gate). The observation coupling carries its own precision knob: the target-attraction term enters the belief update as an extra (mean, precision) pair $(\mu_p[y_i], \beta_{obs}/\sigma_p[y_i])$ fused exactly into `mm_exact_update`'s convex precision fusion (`vfe3/gradients/kernels.py:441`), with $\beta_{obs} = \lambda$ decoupled from $1/\tau_{\mathrm{eff}}$ and annealed toward $O(1)$ relative to the prior precision $\alpha$. This repairs the scaling inversion all four challenges flagged: target credit must not weaken as $1/K$ when $\tau\sim K$ grows. The softmax repulsion term has negative precision and is handled by one damped explicit step on its linearization at the current nudged iterate — labeled a damped heuristic, with per-iteration $F_\lambda$ descent monitored, never asserted (the CCCP label is dropped per the challenge verdicts).
+For vocabulary energy
 
-**Three phase runs per minibatch.** Phase A: the free forward, byte-identical to today's detach-estimator inference (`mm_exact` settling, prior handoff `stack.py:126`), settled to a *stationarity-residual* gate (norm of the analytic belief gradient at exit, not step size). Phases B$^+$/B$^-$: from the shared Phase-A state, continue $T_c$ iterations of the same E-step with the observation term at $+\lambda$ and $-\lambda$, same iteration count, with $R \ge 1$ top-down re-sweeps of the stack (handoff priors recomputed from nudged beliefs) so the observation term reaches blocks $0..L-2$ through both the per-layer injection and the re-anchored cascade. Because both signs share the start and the budget, the free phase's non-convergence drift is common mode and cancels in the difference; a periodic $\lambda=0$ control continuation and finite-difference oracle checks at tiny $K$ audit the residual bias.
+$$
+E_v(q)=\mathrm{KL}(q\|p_v),
+$$
 
-**The gradient decomposition.** For any parameter $\theta$, the CE derivative splits as
+the deployed decode cross-entropy is
 
-$$\frac{d\mathrm{CE}}{d\theta} = \underbrace{\frac{\partial\mathrm{CE}}{\partial\theta}\Big|_{q^*}}_{\text{direct, analytic}} + \underbrace{\frac{\partial\mathrm{CE}}{\partial q^*}\frac{\partial q^*}{\partial\theta}}_{\text{through-}q^*}.$$
+$$
+C(q,y)=\frac{E_y(q)}{\tau_{\mathrm{eff}}}
+ + \log\sum_v \exp\left(-\frac{E_v(q)}{\tau_{\mathrm{eff}}}\right).
+$$
 
-The direct term exists only for the decode families and is computed in closed form from Phase-A statistics (sympy-verified forms, Recon 5 §2-3). The through-$q^*$ term — the term whose absence was Cause 1 — is estimated for every family by the symmetric equilibrium-propagation contrast
+Its exact belief derivative is
 
-$$\widehat{g}_\theta = \frac{1}{2\lambda}\Big[\frac{\partial F}{\partial\theta}\Big|_{q^*_{+\lambda}} - \frac{\partial F}{\partial\theta}\Big|_{q^*_{-\lambda}}\Big],$$
+$$
+\nabla_q C
+=\frac{1}{\tau_{\mathrm{eff}}}
+ \left(\nabla_q E_y-\sum_v P_v\nabla_q E_v\right),
+\qquad
+P_v=\mathrm{softmax}_v\left(-E_v/\tau_{\mathrm{eff}}\right).
+$$
 
-where $\partial F/\partial\theta$ is the analytic envelope expression through the reduced free energy $F_{red} = -\tau\log Z$ (softmax-KKT, ledger-verified), evaluated under `no_grad`. This is the mandatory form: no non-decode family consumes single-phase nudged statistics directly. The contrast is streamed across batches with stepwise-EM decay $\eta_t = (t+t_0)^{-\kappa_{EM}}$, $\kappa_{EM}\in(0.6, 0.9)$ (Cappé-Moulines; Liang-Klein's robust band), which removes the fixed-step noise floor that the gauge-geom challenge identified as Cause-2 recidivism.
+The target attraction and softmax repulsion therefore carry the same
+`lambda_obs / tau_eff` coefficient. Production code must not remove the temperature factor from
+only one term. Dimension and token-frequency scaling are handled by a belief-space natural metric,
+per-family preconditioner, trust region, or step size without changing this derivative.
 
-**Composite updates.** Each family's update is $\Delta\theta = \mathrm{Precond}\big(\eta_c\,\widehat{g}_\theta + \eta_g\, g^{gen}_\theta\big)$, where $g^{gen}_\theta$ is the free-phase generative envelope component (for the conjugate tables, the m-projection residual) and $\eta_g \ll \eta_c$. This mirrors what backprop V3 actually optimizes — CE plus a small self-coupling regularizer (`model.py:1456-1505`) — and answers the generative-discriminative dilution objection: prediction is the primary signal, $F$-descent the anchor, and the mass ratio $\eta_c/\eta_g$ is an explicit, logged knob rather than an accident of $\alpha\tau$. For the encode tables the contrast is *derived*, not pasted: $\partial F/\partial\mu_p[v] = -\sum_{i\in I_v}\alpha_i\,\sigma_p^{-1}(\mu_{q,i}-\mu_p[v])$, so the contrast reduces to $\frac{1}{2\lambda}\sum_{i\in I_v}\alpha_i\,\sigma_p^{-1}(\mu^{+}_{q,i}-\mu^{-}_{q,i})$ — the EqProp estimate of the encode row's true CE gradient, replacing the underived $(Y-P)/\tau$ paste that the gauge-geom challenge rejected.
+The nudged objective, where an energy route exists, is exactly
 
-**Quarantine rule.** Any parameter whose single-phase $F$-gradient has fixed sign is barred from $F$-descent forever: temperatures ($\partial F_{red}/\partial\tau = \mathrm{KL}(\beta\|\pi)\ge 0$), $c_0/b_0$. They receive contrast-only estimates or periodic one-dimensional held-out-CE search; $\alpha_i$ remains the closed-form Gamma-MAP envelope with fixed hyperparameters.
+$$
+E_{\lambda}(z,\theta)
+=E_{\mathrm{joint}}(z,\theta)+\lambda C(z,y;\theta).
+$$
 
-**Convergence honesty.** No EM monotonicity or PC-equals-BP guarantee is claimed: $F$ is not an ELBO of a normalized model (the $-\tau\log Z$ term), the settling is truncated, and the table sweeps are Jacobi. The guarantees are replaced by hard gates — stationarity residuals on both phases (M-steps skipped when violated), monitored majorizer descent (logged, not asserted), contrast-vs-control cosine, and per-family SNR — plus the oracle test suite.
+`E_joint` is the same scalar whose gradient generates the certified free dynamics and whose partial
+derivatives enter every Route-E contrast. A different surrogate may not generate the phase states
+or the reported statistics.
 
-## 4. Update-law table
+At `lambda < 0`, the CE curvature is signed. In the metric used by Route E, define the normalized
+curvature margin
 
-| Family | Update rule | Target-information path | Preconditioner | Cost |
-|---|---|---|---|---|
-| `decode_mu/sigma_log_embed` (untied, `prior_bank.py:364`) | per-row damped Gauss-Newton $\Delta_v = -(G_v+\rho I)^{-1}\nabla_v$, $G_v = \tau^{-2}\sum_i P_{iv}(1-P_{iv})g_{iv}g_{iv}^T$ diagonal; per-row trust region + min-count gate for Zipf tail | direct $\partial\mathrm{CE}/\partial\theta$ (softmax residual $Y-P$), Phase A | GGN (cancels $1/\tau$, count, frequency) | 3 extra matmuls in the chunked fused-CE loop |
-| `decode_log_scale` | 1-D Newton on $b=1/\tau_{\mathrm{eff}}$: $\partial^2\mathrm{CE}/\partial b^2 = \sum_i \mathrm{Var}_{P_i}(\mathrm{KL}_i)\ge 0$; 500-step freeze | direct, convex | exact curvature | negligible |
-| `mu_embed`/`sigma_log_embed` (encode) | $\eta_c\cdot$ EqProp contrast of self-coupling stats $+\ \eta_g\cdot$ streamed m-projection onto Phase-A beliefs ($N_v, S^1_v, S^2_v$ scatter-add); $\sigma$ updated from positive generative mass only in v1; per-row KL trust region | through-$q^*$ contrast (derived; §3) | expectation-parameter natural gradient (Khan-Rue identity) | $O(BNK)$ scatter |
-| `phi_embed` (so_n/sp_n towers) | damped Lie-retraction step on the streamed contrastive envelope gradient, chained through the right-trivialized $d\exp$ per irrep block (ledger-verified to ~1e-10); trust region $\|\Delta\phi\|_\infty \le 0.05$; frozen first ~2k steps | through-$q^*$ contrast only ($\eta_g = 0$: the free-phase term is the H4 homogenization objective) | Killing per block — stated as preconditioner only, never Fisher-optimal | one attention-shaped contraction per phase, reusing mm_exact intermediates |
-| `phi_embed` Procrustes variant (opt-in) | $\max_R \mathrm{tr}(RC_v)$ closed d×d SVD (atan2 at $d=2$) on the streamed composite statistic; requires new `sigma_isotropic_per_block=True` seam | same contrast statistic | exact subproblem solver | $V\cdot H$ tiny SVDs, milliseconds |
-| `pos_phi_free` | same as `phi_embed`, scattered per position; composed-frame evaluation (fixes Cause 5) | through-$q^*$ contrast | Killing per block | as above |
-| `s_mu/s_sigma_log` (+`s_phi`) — model channel, v2 | precision fusion (mm_exact algebra) on Phase-A stats $+$ EqProp contrast of the $\gamma$-channel envelope | through-$q^*$ contrast (second-order attenuation acknowledged; SNR-gated) | fusion is natural | $O(BNK)$ |
-| `r_mu/r_sigma_log` | `barycenter_r_` (shipped, `vfe3/model/prior_bank.py:498`) | none (regularizing centroid, acknowledged) | e-flat barycenter | free |
-| `log_kappa_beta/gamma` | contrast scalar per head from $\mathrm{KL}(\beta_{+\lambda}\|\pi)-\mathrm{KL}(\beta_{-\lambda}\|\pi)$, curvature-damped; fallback golden-section on held-out CE every ~2k steps | contrast / held-out CE | second-difference damping | negligible |
-| `t5_bias` | contrast per bucket $\Delta b_k \propto \frac{1}{2\lambda}\sum_{(ij)\in k}(\beta^+_{ij}-\beta^-_{ij})$, per-row mean projected out (shift degeneracy); the self-confirming IPF fit to $\beta$ is barred | contrast | none needed | streamed bucket sums |
-| $c_0/b_0$ ($\alpha$ hyper) | frozen in v1 ($\alpha_i$ closed-form MAP with fixed hyper); contrast-only candidate in v2 | — | — | — |
-| `output_proj` (linear ablation) | delta rule with diagonal Fisher damping (the manuscript's own proposal, GL(K)_attention.tex:2417) | direct residual | diagonal Fisher | one matmul |
-| `reflection_sign` | existing Metropolis $\Delta F$ flips, scored on the nudged $F$ (gains a target path for free) | acceptance score | — | shipped |
-| dropped: `connection_W/M/L`, `head_mixer`, `cg_coupling`, `AffineLayerNorm`, BCH positional composition | not built in v1 — non-pure exceptions or genuinely hard Fréchet chains; mixer/CG have a per-block least-squares law if ever wanted | — | — | — |
+$$
+m_{\lambda}
+=\frac{\lambda_{\min}(M^{-1/2}\nabla_z^2E_{\lambda}M^{-1/2})}
+       {\max(\|M^{-1/2}\nabla_z^2E_{\lambda}M^{-1/2}\|_2,1)}.
+$$
 
-## 5. Architecture and repo strategy
+A negative phase is admissible only if `m_lambda >= 1e-6` in the float64 oracle and the production
+float32 conservative bound is at least `1e-4`, or if an independently certified update-map bound
+has spectral radius `rho(DT_lambda) <= 0.99`. Covariance eigenvalues must also remain above the
+configured floor. These are acceptance inequalities, not telemetry. If that gate fails while both
+positive phases remain admissible, then for a family with
+`partial C / partial theta = 0` define
 
-The build lands inside V3, not a fresh repo: the seam map shows a backprop-free trainer is expressible as new registrants with zero call-site edits, and a clean-room v4 would forfeit ~200 golden/oracle/property tests plus the shipped closed-form machinery. Concretely, a new package `vfe3/fep/` containing: `observe.py` (the observation-term kernel — a registered `e_step_update='mm_exact_obs'` sibling of `mm_exact` that fuses the attraction pair and takes the damped repulsion step); `phases.py` (the three-phase runner and shared-start bookkeeping, built on the existing `capture` plumbing, `model.py:884-1042`); `stats.py` (streamed sufficient-statistic accumulators: row moments, contrastive envelope statistics, frame scatters, bucket sums, with $\eta_t$ decay); `rules.py` (a `register_m_rule` registry mapping each parameter family to its update law, mirroring `register_kernel`); `train_fep.py` (a click-to-run entry beside `train.py` with a forward-under-`no_grad` + statistics + update loop; no scaler, no `.backward()`, no `.grad` reads). Config gains `m_step_mode`, `lambda_obs`, `t_c`, `t_relax`, `eta_c/eta_g` per family, `frame_update` (`dexp_grad` default, `procrustes` opt-in), and `sigma_isotropic_per_block`.
+$$
+h_{\lambda}
+=\frac{
+ \partial_{\theta}E_{\mathrm{joint}}(z_{+\lambda},\theta)
+ -\partial_{\theta}E_{\mathrm{joint}}(z_0,\theta)
+}{\lambda},
+\qquad
+\widehat g_{\mathrm{one}}=2h_{\lambda/2}-h_{\lambda}.
+$$
 
-Reused verbatim: `mm_exact_update` and the hand kernels (`vfe3/gradients/kernels.py`), the fused closed-form KL decode (`vfe3/model/prior_bank.py:1152+`) and `decode_ce_diagonal_chunked` (`vfe3/model/prior_bank.py:684`), `barycenter_r_`, transport/retraction/norm/group registries, `phi_preconditioner.py`, the Metropolis hook, data loaders, `evaluate()`, checkpointing, and — as test infrastructure only — `gradients/oracle.py`'s autograd-of-F pattern. The deployed forward is untouched; the free phase is pinned byte-identical to the current detach-estimator forward by a regression test.
+This one-sided Richardson estimator is the only permitted signed-phase fallback. It requires its
+own phase-existence and finite-difference convergence gate. If either positive phase fails, the
+M-step is skipped; the code may not silently fall back to unextrapolated nudged statistics. A
+family that appears directly in `C` also receives the analytic direct term at `z_0`, as specified
+under Route E.
 
-## 6. Staged build plan
+## 4. Route-selection theorem gate
 
-**Phase 0 — instrument the disease and bound the cure (deliverables: measurements, no model code).** (a) Reproduce the pure_fep failure at tiny scale (K=4, single-digit dims, CPU) and confirm the diagnostic suite of §7 catches it: near-bigram plateau, frozen-family detectors firing on `pos_phi_free`/kappa, bank-dispersion trajectory. (b) Measure the detach-vs-unroll test-PPL gap on current V3 at small scale (same config, estimator seam flipped) — this number upper-bounds every envelope-only component of this design and calibrates how much through-$q^*$ credit is worth at each depth; no such measurement exists in docs/ or the wiki. (c) Compute BPE unigram PPL exactly on V3's tokenization of wikitext-103 and build a KenLM 5-gram on the identical token stream (word-level anchor 152.7). Done when all three numbers are in `vfe3_runs/` and the diagnostics repo-tested. **Gate: none (measurement phase).**
+Let `z` contain every live belief state at every layer, and let
 
-**Phase 1 — kernels and oracles.** Implement `mm_exact_obs` (attraction fusion + damped repulsion), the analytic decode-CE gradients (rows, scale, and belief-side $\partial\mathrm{CE}/\partial\mu_q,\sigma_q$), and the envelope statistics for every family in §4. Tests (K=2-4, CPU, sub-second): every analytic gradient pinned against autograd-of-F at fixed $q^*$ including saturation edges; the sigma-nudge cancellation ($\sum_v(Y-P)=0$) pinned; a regression asserting single-phase $\partial F_{red}/\partial\tau \ge 0$ while the contrast is sign-indefinite; byte-identity of the free phase with the detach forward. **Gate: all oracle tests green from junitxml.**
+$$
+R(z,\theta)=z-T(z,\theta)
+$$
 
-**Phase 2 — readout-only trainer (M0).** `train_fep.py` running decode GGN + scale Newton + encode m-projection only, 1 layer, K=20-32, no contrast machinery. **Gate M0: beat measured BPE unigram within 2k steps and reach bigram-class PPL (below 0.5x unigram) within one epoch.** Failure falsifies the streaming-statistics/GGN machinery itself. This gate also pins the pre-registered prediction that generative-only training plateaus near bigram; if it goes far below 5-gram territory without contrast, the Cause-1 diagnosis is wrong and the plan is revised.
+be the residual of one exact production inference sweep, including masks, detached keys,
+attention recomputation, clamps, damping, and cross-layer prior handoff. Phase 1 must select one of
+the following outcomes.
 
-**Phase 3 — contrast machinery (the design's heart).** Symmetric $\pm\lambda$ continuations with shared start, streamed contrasts, stationarity-residual gates, periodic $\lambda=0$ control, per-family SNR logging. Tests: the contrast estimator pinned against finite differences of the *settled* CE at tiny K (cosine > 0.9 as $\lambda\to 0$); the control continuation showing the drift term is common mode (contrast at $\lambda$ vs $\lambda/2$ consistent *and* both agreeing with FD — the pc-local challenge showed cosine-only consistency can pass under coherent bias, so FD agreement is the binding check). **Gate: FD-oracle agreement at K=2-4; on a tiny LM, sustained Pearson(F_free, CE) > 0 — the pre-registered C2/EXP-5 flip.**
+### Route E: joint energy and equilibrium propagation
 
-**Phase 4 — full single-layer system (M1, M2-φ).** Encode contrast, φ and pos_phi contrast-dexp updates, t5 contrast, kappa search, collapse guards live. **Gate M1: beat the KenLM 5-gram on the identical token stream within 25k steps (1 layer, K=32).** **Gate M2-φ (the frame falsifier): contrast-φ vs frozen-random-φ at matched steps and equal decode must differ by ≥ 10% test PPL.** If not, transport learning is dead weight: fall back to `frame_update='procrustes'` behind the isotropy seam, then to honest freezing — and the design is reported as a prototype readout, not a transformer.
+Route E is the preferred strict backprop-free route. It requires an explicit scalar
+`E_joint(z, theta)` whose stationary equations match the proposed free and nudged updates. Let
+`z_deploy` be the state after the configured finite number of production sweeps and `z_0` the state
+obtained by continuing the same map to the registered stationarity tolerance. These are different
+objects unless a parity gate proves otherwise. At tiny dimensions, either the residual itself or
+the covector obtained through an explicitly defined
+positive-definite mobility or metric must have a symmetric state Jacobian to numerical tolerance
+away from nondifferentiable boundaries. The same scalar energy must decrease under each accepted
+update, and the settled symmetric contrast must converge to the finite-difference derivative of
+settled CE as `lambda -> 0`.
 
-**Phase 5 — depth (M3).** Per-layer observation injection + $T_{relax}$ top-down re-sweeps; specify and test which layer's beliefs feed each shared table (default: $\alpha$-weighted sum over layers, with an early-vs-late row-conflict diagnostic). **Gate M3: n_layers=4 beats n_layers=1 at matched width by ≥ 15% and reaches PPL ≤ 150.** Failure with healthy diagnostics falsifies the deep-supervision surrogate; the pre-registered remedies are more re-sweeps and larger $T_c$ before abandoning depth.
+For a family with no direct appearance in `C`, passing Route E permits the through-state contrast
 
-**Phase 6 — wikitext-103 scale (M4).** K=32-64, full corpus, RTX 5090. **Gate M4: test PPL ≤ 100 (inside the published DFA band 52-93, the only non-backprop transformer LM numbers in print); stretch: within 2x of matched-K backprop V3 (≤ ~130-310 against the 66-155 band).** Cost budget: three settled no_grad forwards plus scatters and one $(V,BN)\times(BN,K)$ matmul per step — ~2-3x today's forward, no backward graph, comfortably inside the 5090.
+$$
+\widehat g_{\theta}
+=\frac{1}{2\lambda}
+ \left[
+ \frac{\partial E_{\mathrm{joint}}}{\partial\theta}(z_{+\lambda},\theta)
+ -\frac{\partial E_{\mathrm{joint}}}{\partial\theta}(z_{-\lambda},\theta)
+ \right].
+$$
 
-## 7. Diagnostics plan (logged every step unless noted)
+For every parameter that appears directly in `C`, including decode-bank parameters and the decode
+scale, the total update also includes the analytic direct term
+`partial C(z_0, theta) / partial theta`. Attention temperatures that affect CE only through the
+settled state have no such direct term. Each family’s oracle must test the same decomposition used
+in production.
 
-Per-family update health: $\|\Delta\theta\|/\|\theta\|$ (healthy 1e-3 to 1e-2; near-zero = the pure_fep frozen-family disease made observable). Per-family contrast SNR: $\|$streamed contrast$\|$ / cross-batch std of the minibatch contrast; any family persistently below 1 at feasible $\lambda$ and batch size is declared information-starved and switched to its fallback (search or freeze) rather than left to integrate noise. Bank collapse: between-row variance of `mu_embed`, mean and dispersion of $\sigma_p$, effective rank of the bank, decode logit spread and top-1 margin — with an enforced dispersion floor and a hard abort alarm (the single most likely first-1k-steps failure). Phase health: stationarity residual at exit of each phase (M-steps skipped above threshold); free-vs-nudged belief KL per layer (the depth-attenuation profile — if it decays geometrically toward layer 0, deep credit is dying and $T_{relax}$ must rise). Estimator health: contrast-vs-control cosine, $\pm\lambda$ vs $\lambda/2$ agreement, periodic FD spot checks at tiny K. Saturation counters on every clamp (kl_max, decode clamp, sigma floors) — saturated coordinates have zero analytic gradient and freeze silently (the K=160 r-freeze incident). Science metrics: Pearson(F_free, CE); corr(tr $\Sigma_q$, CE), which must flip sign once the observation term contracts covariances (reversing the 2026-06-29 sigma-gate FAIL); per-layer $\beta$ entropy.
+Failure means this formula is prohibited on the current dynamics. A new energy-derived inference
+variant may be proposed, but it must remain an opt-in registry variant and preserve the deployed
+pure path.
 
-## 8. Risks and fallbacks
+### Route V: explicit vector-field fixed-point rule
 
-- **Contrast SNR too low for φ/κ/t5 at feasible batch sizes** (the residual form of Cause 1): fallback per family via `m_rule='ce_search'` (periodic 1-D held-out search) or `m_rule='frozen'` (honest freeze), gated by the SNR monitor; raise $\lambda$ within the contraction budget before freezing.
-- **Nudged phase fails to contract** (PIFB.tex:1620-1622 warns fast-subsystem contraction is unproven for coupled GL+(K)): halve $\lambda$, raise fusion damping (`nudge_damping`), skip M-steps on residual-gate violation; hard fallback `t_c=0` reduces the system to Phase-2 readout mode, which still clears M0.
-- **PriorBank barycenter collapse**: dispersion floor + abort; raise $\eta_c/\eta_g$; per-row KL trust region; last-resort toggle `untie_decode_bank=False` with the derived tied contrastive fixed point $c_{iv} = \alpha\mathbf 1[v(i)=v] + (Y_{iv}-P_{iv})/\tau$ (accepting residual Cause 3).
-- **Truncation-drift bias in the contrast**: symmetric nudging is the default; `eqprop_control=True` runs the $\lambda=0$ control per batch if the periodic audit shows residual bias.
-- **Depth credit decays** (μPC-style): raise `t_relax`; anneal per-layer injection weights; fallback to n_layers=2 and report the depth ceiling honestly.
-- **Procrustes premise absent in shipped configs** (per-coordinate sigma): default `frame_update='dexp_grad'` needs no premise; the `procrustes` variant is gated on the new `sigma_isotropic_per_block` seam and its K→H capacity cost is a measured ablation, not a footnote.
-- **Zipf-tail GGN degeneracy** ($G_v\to 0$ turns damped Newton back into a raw scaled gradient — the V2 failure mode): `decode_min_count` gate + per-row trust region.
-- **Deep-supervision surrogate diverges from deploy CE**: monitored by evaluating always on Phase A; if per-layer injection hurts final-layer CE, restrict injection to the last two layers (`obs_layers` config).
+If the residual is not integrable, the plan may derive a rule for the actual vector field. The exact
+settled CE derivative satisfies
 
-## 9. Open theory questions worth a manuscript note
+$$
+R_z^T v=C_z^T,
+\qquad
+\frac{dC}{d\theta}=C_{\theta}-v^T R_{\theta}.
+$$
 
-Contraction of the coupled GL+(K) fast subsystem under observation coupling, and an error bound for the EqProp contrast in terms of the stationarity residual of truncated settling (the practical replacement for the equilibrium premise). The generative-discriminative weighting question: for what observation-term weight does block-coordinate descent of the canonical $F$ reproduce the CE-optimal parameters that Adam-normalized pure-CE descent finds — the dilution problem stated exactly. The temperature degeneracy $\partial F_{red}/\partial\tau = \mathrm{KL}(\beta\|\pi)\ge 0$ as a general obstruction to learning softmax temperatures by free-energy descent, and its resolution by contrastive estimation. Frame identifiability: what the contrastive frame objective identifies on the gauge orbit when $\beta$ is near-uniform. The projection bias of diagonal-family moment matching under non-monomial transport (ledger §5.3) as a systematic error term in conjugate M-steps. Whether the per-layer observation injection bounds deploy-CE credit from above or below relative to last-layer-only nudging.
+This route may use analytic Jacobian-vector operators and an iterative linear solve, but no autograd
+or retained backward graph in production. Because the transpose solve is an implicit credit
+operator, it must be reported as fixed-point implicit differentiation rather than ordinary EqProp.
+A modified nonconservative-EP rule is acceptable only with its own derivation and finite-difference
+oracle. Whether this interpretation satisfies the project's stricter meaning of “backprop-free” is
+a user decision at the Phase 1 gate.
 
-## 10. Wiki/manuscript ingest list (after user confirmation, later)
+### Stop outcome
 
-- The adjudicated pure_fep post-mortem (ranked causes with file evidence) under the VFE Transformer Program page.
-- The gradient decomposition and symmetric-contrast learning rule (direct analytic term + EqProp through-$q^*$ term) as the program's backprop-free prescription.
-- The temperature/hyperparameter quarantine results ($\partial F_{red}/\partial\tau = \mathrm{KL}(\beta\|\pi)$; sign-monotone $c_0/b_0$) with sympy verification.
-- The decode-scale convexity result ($\partial^2\mathrm{CE}/\partial b^2 = \sum\mathrm{Var}_P(\mathrm{KL})$) and the per-row GGN scale analysis of the 25000-PPL signature.
-- The Procrustes reduction, its per-block-isotropy premise, and the capacity-cost ablation once measured.
-- The Phase-0 detach-vs-unroll gap measurement (a standing calibration number for all fixed-point training claims).
-- Milestone results as they land (M0-M4), including the literature calibration table (DFA 52-93, KN 5-gram, measured unigram) and the frame-falsifier outcome.
+If neither route agrees with finite differences, non-decode families remain frozen. The project may
+continue only as the readout-only M0 control. It must not ship a single-phase nudged-statistics rule
+under an EqProp or exact-gradient label.
 
-## Appendix A — Adjudication record (design duels)
+## 5. Planned file boundaries
 
-All four design memos survived adversarial challenge, each with mandatory amendments that the synthesis in §3-§8 folds in. The synthesis adopts the "credit" skeleton amended per its challenge, with the other three contributing their surviving machinery.
+The following boundaries apply only after their owning phase passes.
 
-| Design | Verdict | Core contribution to the synthesis | Decisive challenge findings folded in |
-|---|---|---|---|
-| **cavi** (clamped-EM conjugate learning) | survives w/ amendments | streamed stepwise-EM sufficient statistics; closed-form moment matching for conjugate tables; the generative-only ablation as the M0 falsifier | positive-phase-only statistics repeat Cause 1 at ~98% strength → contrasts mandatory; observation precision must decouple from $1/\tau$; no inter-block credit without top-down re-sweeps; encode-bank collapse guard required |
-| **pc-local** (two-phase PC with natural-metric analytic updates) | survives w/ amendments | per-row decode GGN; the quarantine rule for sign-monotone hyperparameters; autograd-oracle test discipline; byte-identical free phase | final-block-only nudging gives zero contrast to non-final layers → full-stack relaxation is the baseline; truncation drift needs a $\lambda=0$ control / symmetric nudging; step-size gates must become stationarity-residual gates |
-| **gauge-geom** (Procrustes-MM frame M-steps) | survives w/ amendments | the Procrustes closed form and its exactness premise (per-block isotropic sigma) as an opt-in seam; dexp analytic gradient as default; Metropolis reserved for discrete components | plain-clamped frame statistics reproduce Cause 5 (homogenization) → contrastive statistic is the default; streamed (not per-minibatch) frame statistics; monotonicity demoted from guarantee to logged diagnostic |
-| **credit** (nudged two-phase EM, EqProp credit) | survives w/ amendments | the overall skeleton: free phase + nudged continuations, mm_exact fusion of the observation term, per-layer injection, contraction gating | $\lambda$-dilution: conjugate M-steps must consume the $1/(2\lambda)$-scaled contrast, not raw nudged statistics; symmetric $\pm\lambda$ (Laborieux-style) to kill $O(\lambda)$ bias; measure the detach-vs-unroll gap FIRST (Phase 0); PriorBank collapse guards |
+| Path | Responsibility |
+|---|---|
+| `vfe3/fep/residual.py` | Pack the multilayer state and evaluate the exact production-sweep residual `R(z, theta)` |
+| `vfe3/fep/observe.py` | Exact decode CE, belief derivatives, direct decode-row derivatives, and scale derivatives |
+| `vfe3/fep/energy.py` | Route-E joint energy and analytic partial derivatives; absent if Route E fails |
+| `vfe3/fep/vector_field.py` | Route-V analytic Jacobian-vector operators and solver; absent if Route V is rejected |
+| `vfe3/fep/phases.py` | Free/nudged settling, shared-state bookkeeping, residual gates, and phase-existence checks |
+| `vfe3/fep/stats.py` | Streamed sufficient statistics and uncertainty estimates without parameter mutation |
+| `vfe3/fep/rules.py` | Registered, family-specific updates after oracle approval |
+| `vfe3/fep/trainer.py` | Backprop-free training loop with no `.backward()`, optimizer, scaler, or `.grad` reads |
+| `train_fep.py` | Root click-to-run config and entry point, parallel to `train_vfe3.py` |
+| `tests/fep/` | Algebra, residual, route-selection, phase, update, and end-to-end oracle tests |
 
-## Appendix B — pure_fep autopsy detail (VFE_2.0)
+Contrary to the original plan, this work cannot be expressed with zero call-site edits. Config
+validation, E-step dispatch, multilayer capture, phase resweeps, checkpoint state, run provenance,
+and the training entry point all require explicit integration. Every edit must preserve existing
+defaults and registry-selected pure paths.
 
-Update machinery actually running in `clean_em` mode: `apply_slow_update` (`mstep.py:1010`) steps the PriorBank `mu_embed`/`sigma_log_embed` (analytic self-coupling + decode-CE gradients, fisher_mean preconditioner option, adam/cosine added 2026-05-27), copies a `phi_embed` update from an alignment-only local objective (`mstep.py:1003,1196`), steps `mu_s_embed`/`sigma_s_log_embed` with fixed learning rates (`mstep.py:1229-1230`), and updates block-0 `raw_c0`/`raw_b0` plus the meta slot banks.
+## 6. Phase 0: reconstruct the evidence before designing the cure
 
-Learnable state frozen forever in clean_em: `decode_log_scale` (frozen after its collapse-to-uniform episode); `pos_phi_free` (random init, BCH-composed into every frame each forward, never updated); `raw_c0/raw_b0` of blocks 1..L-1; attention temperature kappa; `output_proj.bias`; vestigial `mu_s/sigma_s` on the active path; all E-step structural constants.
+**Files:** Create the tracked directory
+`docs/investigations/backprop-free-fep-phase0-2026-07-12/` containing `report.md`, `manifest.json`,
+`metrics.jsonl`, and one exact config JSON per experimental arm. Raw checkpoints and transient logs
+live under the valid Windows naming convention
+`C:\tmp\vfe3-fep-phase0-20260712-{short_sha}`, with `{short_sha}` replaced by the source commit’s
+seven hexadecimal characters when the phase starts. Record their hashes and extracted metrics in
+the tracked manifest, then delete those task-owned temporary files before the phase is complete.
 
-Ranked failure hypotheses (adjudicated):
+1. Record the exact Git commits, configs, tokenizer, dataset split, seeds, parameter counts, and
+   reachable training modes for VFE2 `pure_fep`, VFE2 `coupled_fep`, and V3.
+2. Recover the VFE2 `coupled_fep` design and audit history. Distinguish `honest`, the target-leaking
+   negative control, and `filter`, which uses present-token reconstruction plus learned
+   roll-forward. Do not infer a result from a design document when no run artifact exists.
+3. Reproduce tiny matched runs for reachable modes: VFE2 clean-EM, VFE2 backprop oracle, VFE2
+   coupled honest, VFE2 coupled filter, the matched VFE2 coupled leak negative control, V3 detached
+   inference, and V3 unrolled/backprop estimator. The leak mode is diagnostic only and cannot
+   qualify as a language-model result.
+4. Compute unigram, bigram, and 5-gram baselines on the identical V3 BPE token stream. Retain the
+   published word-level 152.7 value only as historical context.
+5. Report actual train, validation, and test CE/PPL with artifact paths. Do not repeat the exact
+   25,000-PPL narrative unless a machine-readable artifact establishes it.
+6. Measure the detached-versus-unrolled difference in CE, per-family gradient cosine, gradient norm,
+   and depth attenuation. Label it “calibration,” not “upper bound.”
 
-1. **[high]** Clean-EM at a target-blind fixed point structurally drops the predictive credit path $(\partial\mathrm{CE}/\partial q^*)(\partial q^*/\partial\theta)$ — attention, transport, and E-step dynamics can never learn to predict; the model is a reservoir with a Gaussian-prototype readout. Evidence: `e_step.py:2010-2013` (Law 1: no targets parameter); `mstep.py:1015-1032` (all grads at detached fixed q*); `config.py:155` + `mstep.py:1056-1061` (`mstep_credit='ift'` stubbed NotImplemented — the acknowledged missing credit); `README.md:192` concedes near-bigram ceiling.
-2. **[high]** Encode/decode tying: `mu_embed[v]` is both encode prior (beliefs where $v$ occurs) and decode prototype (beliefs one position before $v$) — blurred bigram geometry at best. Evidence: `mstep.py:155-163` vs `:210-237`; recorded plateau train PPL ~1400 vs ~133 backprop same-size.
-3. **[high]** Degenerate hyperparameter laws at fixed q*: grad_c0 ≥ 0, grad_b0 ≤ 0 always → alpha self-anneals to zero (token-identity washout); same pathology previously collapsed `decode_log_scale` to the clamp floor (CE pinned at log V). Evidence: `mstep.py:357-370`; `config.py:119`; `train_pure_fep.py:142`.
-4. **[high]** phi learning blind and misaligned: 10M-parameter `phi_embed` (76%+ of trainable params) descends a target-free alignment objective (optimum = transport homogenization) evaluated at raw phi while the forward runs BCH-4(phi, frozen random pos table). Evidence: `mstep.py:681-688` vs `positional.py:139-146`.
-5. **[medium]** Train/deploy mismatch: M-step gradients computed at nested-meta q*; eval/generation run the plain no-meta forward. Evidence: `mstep.py:1074-1085`; `trainer.py:151`; `estep.py:409-421` (PF-6b).
-6. **[medium]** Tuning-class contributors: sum-reduced gradients with global LR on a 0.1-std table (~30%-of-init coordinate steps); slot banks bypassing the optimizer; constant-LR noise floor. Real but secondary — the 10x gap to backprop survived the adam+cosine and trust-region fixes.
+**Gate P0:** A reviewer can reproduce every reported number from a named config and artifact. If
+the prior target-aware paths already falsify the structural diagnosis, revise the model hypothesis
+before Phase 1.
 
-Recorded artifacts: step-0 CE=23.5 NaN episode; the decode_log_scale collapse pinning CE at log V (PPL 50257 — likely the reported ~25000's era); post-fix plateau at train PPL ~1400 vs ~133 for the same-size backprop model. No artifact records exactly 25000; it most plausibly reflects val PPL from the collapse-era or early-plateau runs.
+## 7. Phase 1: exact algebra, residual map, and route selection
 
-## Appendix C — Provenance and verification
+### Task 1.1: Pin the observation derivatives
 
-Produced 2026-07-11 by a four-phase adversarial workflow (Recon → Design → Challenge → Synthesize; 14 agents, ~1.53M tokens, all agents completed). External calibration numbers from the literature recon: uniform 50k-BPE = 50257; KN 5-gram word-level wikitext-103 test PPL = 152.7 (Tang & Lin 2018); DFA transformer LM 93.3 micro / 52.0 macro vs 29.8 backprop (Launay et al., NeurIPS 2020, BPE-32k) — the only published backprop-free transformer LM perplexities; PC-trained transformer results exist only at 1-block scale (Pinchetti et al., NeurIPS 2022); Forward-Forward has no working LM result; iPC (Salvatori et al., ICLR 2024) supplies the incremental-EM convergence framing; no fully gradient-free from-scratch transformer LM exists in print.
+**Files:** Create `vfe3/fep/observe.py` and
+`tests/fep/test_observation_gradients.py`.
 
-Spot-verified citations (read directly from source during plan assembly): `mstep.py:831-832` global-LR default `param.add_(grad, alpha=-lr)`; `e_step.py:2010-2013` "Law 1 enforced: No targets parameter exists"; VFE_2.0 `README.md:192` near-bigram concession; `vfe3/gradients/kernels.py:441` `mm_exact_update`; `vfe3/model/prior_bank.py:498` `barycenter_r_`, `:684` `decode_ce_diagonal_chunked`, `:1152+` fused closed-form `-KL/tau_eff` decode registrant; `mstep.py:1003/1196/1229-1230` pure_fep in-place update sites. Remaining line references originate from recon agents reading the source directly; verify before citing in a manuscript.
+The tests must compare analytic derivatives of CE with respect to `mu_q`, `sigma_q`, decode means,
+decode log-variances, and inverse temperature against an autograd oracle at `K=2..4`. Include
+`tau_eff != 1`, saturated-but-unclamped logits, repeated vocabulary rows, and ignored targets. Add
+a regression asserting that selectively dropping `1 / tau_eff` from target attraction fails.
+
+Run:
+
+```powershell
+python -m pytest tests/fep/test_observation_gradients.py --junitxml=C:\tmp\vfe3-fep-observe.xml
+```
+
+**Gate 1.1:** Zero failures and errors in JUnit XML; relative error below `1e-5` in float64 oracle
+tests and below `2e-4` in float32 tests.
+
+### Task 1.2: Define the production residual
+
+**Files:** Create `vfe3/fep/residual.py`, `tests/fep/test_residual_map.py`, and
+`tests/fep/test_train_deploy_equilibrium_gap.py`; modify capture seams in `vfe3/model/model.py` and
+`vfe3/model/stack.py` only as required to expose state without changing default values.
+
+The residual must reproduce one production sweep exactly, including frozen-key filtering,
+strict-pair masks, attention recomputation, damping, clamps, and layer handoffs. A byte-parity test
+must compare one residual-map sweep against one production sweep for every supported `mm_exact`
+configuration selected for this project. Separately compute `z_deploy` at the configured finite
+iteration budget and `z_0` after continued settling. Record their per-token belief KL, CE gap, and
+stationarity residual.
+
+**Gate 1.2:** Either deployment uses the same residual-based settling rule as training, behind an
+opt-in FEP deployment mode, or the finite deployment state satisfies mean belief
+`KL(z_deploy || z_0) <= 1e-3` and absolute CE gap `<= 0.01` nats per token. Failure means the
+settled objective is a different model and blocks Route E for finite-step deployment.
+
+### Task 1.3: Test integrability rather than assuming it
+
+**Files:** Create `tests/fep/test_integrability_gate.py` and
+`docs/investigations/backprop-free-fep-route-gate-2026-07-12.md`.
+
+At differentiable tiny states, define `G(z) = M(z)^{-1} R(z)`, where `M` is the explicitly proposed
+positive-definite mobility; use `M = I` if no mobility is proposed. Compute the full Jacobian of
+`G` with the test-only autograd oracle and report
+
+$$
+\epsilon_{\mathrm{curl}}
+=\frac{\|G_z-G_z^T\|_F}{\max(\|G_z\|_F,10^{-12})}.
+$$
+
+Test the complete multilayer map as well as isolated self, pair, attention, and prior-handoff
+blocks. Masks and clamps must be held in a locally constant regime. A large antisymmetric component
+rejects ordinary scalar EqProp for that map.
+
+**Gate 1.3:** Route E requires `epsilon_curl <= 1e-6` in float64, a positive-definite `M` when one
+is used, and an explicitly evaluated joint energy whose gradient is `G`. Otherwise select Route V
+or stop.
+
+### Task 1.4E: Validate Route E
+
+**Files:** Create `vfe3/fep/energy.py`, `tests/fep/test_energy_descent.py`,
+`tests/fep/test_energy_contrast_oracle.py`, and `tests/fep/test_nudge_stability.py`.
+
+Pin analytic energy partials against autograd, require accepted state updates to lower the same
+energy, and compare the symmetric contrast to central finite differences of CE evaluated at the
+same settled state `z_0`. For the negative phase, report the smallest local curvature eigenvalue and
+demonstrate `m_lambda >= 1e-6` in the float64 oracle, the registered production bound of at least
+`1e-4` or `rho(DT_lambda) <= 0.99`, and covariance positivity throughout settling. The same test
+file must exercise the one-sided fallback by choosing a case where the negative phase is rejected
+while the `lambda` and `lambda/2` positive phases pass, then compare
+`2 h_(lambda/2) - h_lambda` against the same settled-CE finite difference.
+
+**Gate 1.4E:** For symmetric nudging, as `lambda` is halved over at least three values, gradient
+error decreases at the expected second-order rate until numerical error dominates; cosine exceeds
+`0.99`; relative norm error is below `0.05`; every phase meets its residual and positivity
+thresholds. The one-sided Richardson arm must independently show second-order convergence, cosine
+above `0.99`, and relative norm error below `0.05`. Otherwise no fallback is registered.
+
+### Task 1.4V: Validate Route V
+
+**Files:** Create `vfe3/fep/vector_field.py`, `tests/fep/test_vector_field_oracle.py`, and
+`tests/fep/test_adjoint_solver.py`.
+
+Pin analytic `R_z^T v` and `R_theta^T v` products against test-only autograd, then compare the full
+implicit derivative against central finite differences of settled CE. Record solver residual,
+iteration count, conditioning estimate, and memory. This task is an alternative to Task 1.4E, not a
+second estimator to blend with it.
+
+**Gate 1.4V:** Gradient cosine exceeds `0.99`, relative norm error is below `0.05`, and the linear
+solver reaches relative residual below `1e-5` without retained trajectory storage. User approval is
+required before treating this route as satisfying the project’s backprop-free objective.
+
+## 8. Phase 2: readout-only control
+
+**Files:** Create `vfe3/fep/stats.py`, the decode-only portion of `vfe3/fep/rules.py`,
+`vfe3/fep/trainer.py`, `train_fep.py`, `tests/fep/test_decode_rules.py`, and
+`tests/fep/test_train_fep_readout.py`.
+
+Train only the untied decode bank and inverse temperature from free-phase statistics. Use per-row
+damped Gauss-Newton or another oracle-pinned preconditioner, per-row count gates, and trust regions.
+Encode, frame, positional, attention-prior, and temperature families not explicitly covered by the
+decode rule remain frozen. The trainer must contain no `.backward()`, optimizer, scaler, or `.grad`
+read.
+
+**Gate M0:** Beat the measured BPE unigram and bigram controls under matched tokens and budget.
+Failure after oracle parity rejects the proposed readout machinery; it does not by itself prove that
+streamed statistics are mathematically wrong.
+
+## 9. Phase 3: selected fixed-point credit rule
+
+**Files:** Create `vfe3/fep/phases.py`; extend `vfe3/fep/rules.py`; modify `vfe3/config.py`,
+`vfe3/inference/e_step.py`, `vfe3/model/block.py`, `vfe3/model/stack.py`, `vfe3/run_artifacts.py`,
+`vfe3/fep/trainer.py`, and `train_fep.py`; create `tests/fep/test_phase_parity.py`,
+`tests/fep/test_phase_stability.py`, `tests/fep/test_fep_checkpoint.py`, and one family-specific
+oracle test per enabled update.
+
+Implement only the route selected in Phase 1. Every family begins disabled and is enabled after its
+own settled-CE finite-difference test passes. Route E uses exact CE nudging with common
+`lambda_obs / tau_eff` scaling; Route V uses only the approved residual rule. If a negative phase
+fails its curvature, contraction, or covariance gate, use the registered one-sided Richardson rule
+only when both positive phases pass their gates. If they do not, skip the M-step and record the
+reason.
+
+Stream estimates with uncertainty and stepwise decay only after per-minibatch oracle agreement has
+been established. A high cosine between two biased estimates is not sufficient; finite-difference
+agreement remains binding.
+
+**Gate M1-credit:** On a tiny language model, enabled encode updates agree with settled-CE finite
+differences and improve held-out CE relative to the frozen-encode M0 control across at least three
+seeds. No absolute PPL target substitutes for this causal comparison.
+
+## 10. Phase 4: single-layer geometry and frame falsification
+
+Enable encode tables, `phi`, positional frames, T5 prior tables, and temperature rules one family at
+a time. Frame updates use the shipped preconditioner only as a preconditioner; they do not claim it
+is the full `GL(K)` metric. Procrustes remains opt-in and requires the explicitly tested
+per-block-isotropic covariance premise.
+
+**Gate M1-LM:** Beat the locally trained 5-gram baseline on the identical BPE stream within the
+pre-registered budget. **Gate M2-phi:** learned-frame versus frozen-random-frame runs, with identical
+decode and seeds, must improve test PPL by at least 10 percent. Otherwise report frame learning as
+dead weight for this configuration and retain the honest frozen-frame path.
+
+## 11. Phase 5: depth
+
+Depth begins only after the single-layer estimator passes. Specify which layer contributes to each
+shared table, expose the rule in config, and test early-versus-late row conflict. Observation terms
+are injected only where the selected route’s joint objective or residual derivation permits them.
+Top-down resweeps are counted explicitly in compute and may not be described as ordinary forwards.
+
+**Gate M3:** At matched width, data, seeds, and total compute, four layers improve test PPL by at
+least 15 percent over one layer. Failure first triggers a measured sweep over settling tolerance and
+resweep count. Persistent failure rejects the depth mechanism rather than merely raising the budget.
+
+## 12. Phase 6: WikiText-103 scale
+
+Run `K=32..64` on the RTX 5090 only after all prior gates. Compare against matched-token, matched-K,
+matched-data local backprop V3, readout-only M0, and frozen-frame controls. DFA and predictive-coding
+papers remain literature context, not numeric acceptance bands.
+
+Report actual cost as
+
+$$
+T_{\mathrm{free}}+T_{+}+T_{-}+T_{\mathrm{resweep}}+T_{\mathrm{solve}},
+$$
+
+or the corresponding one-sided form. Do not summarize this as “two to three forwards” unless a
+profiler establishes that ratio against the exact matched V3 training step.
+
+**Gate M4:** The selected route improves test PPL over M0 and remains within two times the matched
+backprop V3 PPL across three seeds, without violating residual, covariance, saturation, or update-SNR
+gates. Absolute literature PPL is reported separately.
+
+## 13. Diagnostics and abort conditions
+
+Every run records phase residuals, accepted and skipped M-steps, signed-phase existence checks,
+covariance minima, clamp and saturation counts, free-to-nudged belief KL by layer, estimator error
+against periodic tiny-oracle probes, per-family update norm and SNR, bank dispersion and effective
+rank, decode logit spread, and train/validation/test CE and PPL.
+
+Abort rather than silently freeze when the bank collapses, a covariance becomes nonpositive, a phase
+cannot meet its residual threshold, an enabled family remains below the pre-registered SNR floor, or
+the estimator repeatedly disagrees with finite differences. A fallback that changes the objective or
+credit rule creates a new named experimental arm and requires a new gate.
+
+## 14. Verification and completion requirements
+
+Each implementation task follows test-first development. Focused commands omit extra `-q` because
+`pyproject.toml` already supplies it. Pass counts come from JUnit XML. Before any phase is called
+complete, run its focused tests, the relevant existing regression surface, `git diff --check`, the
+plan’s placeholder and banned-language scan, and a staged-diff review. Full-suite verification is
+reserved for phases that change production code.
+
+The final implementation, if reached, must preserve a mathematically pure default path, use float32
+in production, keep extreme computation opt-in, update the dated post-edit document, and complete
+the repository’s branch, push, merge, and cleanup lifecycle.
+
+## 15. Literature calibration
+
+The applicable primary references are Scellier and Bengio (2017) for energy-based equilibrium
+propagation; Laborieux et al. (2021) for symmetric finite-nudge bias reduction under EqProp
+assumptions; Scellier et al. (2018) for vector-field generalization and its symmetry-dependent
+gradient error; Millidge, Tschantz, and Buckley (2020) for predictive coding on translated
+computation graphs; Launay et al. (2020) for DFA on transformer language modeling; and Pinchetti et
+al. (2022) for predictive-coding training of transformers on conditional language models.
+
+These papers do not establish the July 11 rule for V3’s detached filtering cascade. Claims about the
+absence of any published backprop-free transformer language model must be scoped to the precise
+autoregressive, from-scratch, dataset, and tokenizer setting rather than stated absolutely.
+
+## 16. Wiki and manuscript handling
+
+The research wiki currently describes the superseded scalar-contrast proposal. After this revised
+plan is reviewed and only with user confirmation, update `[[Nudged two-phase EM]]`, the associated
+2026-07-11 run source, and the VFE Transformer Program page. Manuscript claims wait for Phase 1
+route selection and may describe no gradient equivalence before the corresponding proof and oracle
+gates pass.
