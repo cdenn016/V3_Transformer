@@ -323,7 +323,7 @@ G_{ij}:=\sum_h\beta_{ij}^{(h)}
 a_i:=q_i\left(G_{ij}-\mathbb E_{q_i}[G_{ij}]\right).
 $$
 
-The complete same-pair contribution is then $\mathrm{Var}_{q_i}(G_{ij})>0$ whenever $G_{ij}$ is
+The complete same-pair contribution is then $Var_{q_i}(G_{ij})>0$ whenever $G_{ij}$ is
 nonconstant. Unrelated ordered pairs omit one varied factor, and the reverse edge is affine in the
 repeated sender variation outside an entropy whose second variation is independent of $q_i$.
 Assuming the remaining terms have zero $q_i,q_j,q_j$ variation, they cannot cancel the obstruction.
