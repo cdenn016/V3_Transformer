@@ -1,22 +1,8 @@
+import pytest
 import torch
 import torch.nn.functional as F
 from vfe3.belief import BeliefState
-from vfe3.divergence import kl as _kl
-from vfe3.families.gaussian import DiagonalGaussian
 from vfe3.model.prior_bank import PriorBank
-
-
-def _reference_decode(pb, mu_q, sigma_q, tau):
-    # General reference: -KL(q_i || pi_v)/tau by broadcasting the divergence seam over V.
-    # kl_max=inf: a DECODE preserves the full KL ranking, so the seam's default
-    # kl_max=100 saturation (which flattens distant priors to a single -100 logit) is
-    # disabled -- matching the unclamped fused kernel across the whole input domain.
-    mu_v = pb.mu_embed; sigma_v = torch.exp(pb.sigma_log_embed)
-    mu_q_b = mu_q.unsqueeze(-2)                               # (B,N,1,K)
-    sigma_q_b = sigma_q.unsqueeze(-2)
-    klv = _kl(DiagonalGaussian(mu_q_b, sigma_q_b), DiagonalGaussian(mu_v, sigma_v),
-              kl_max=float("inf"))                           # (B,N,V) via broadcast
-    return -klv / tau
 
 
 def test_encode_shapes_and_positive_sigma():
@@ -42,10 +28,49 @@ def test_decode_matches_divergence_seam_exactly():
     pb = PriorBank(V, K, n_gen)
     mu_q = torch.randn(2, 3, K, generator=rng); sigma_q = torch.rand(2, 3, K, generator=rng) + 0.5
     logits = pb.decode(mu_q, sigma_q)
-    ref = _reference_decode(pb, mu_q, sigma_q, pb.decode_tau)  # decode_log_scale=0 -> tau_eff=decode_tau
+    # decode_log_scale=0 -> tau_eff=decode_tau
+    ref = pb.reference_decode(mu_q, sigma_q, tau=pb.decode_tau)
     assert torch.allclose(logits, ref, atol=1e-3)             # EXACT -KL/tau (per-position term kept)
     # shift-invariant pin (robust to a dropped-constant variant):
     assert torch.allclose(F.log_softmax(logits, dim=-1), F.log_softmax(ref, dim=-1), atol=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("prior_source", "untie_decode_bank"),
+    [
+        ("token", False),
+        ("token", True),
+        ("model_channel", False),
+        ("model_channel", True),
+    ],
+    ids=["tied-token", "untied-token", "tied-model-channel", "untied-model-channel"],
+)
+def test_decode_matches_reference_across_table_routes(
+    prior_source:      str,
+    untie_decode_bank: bool,
+) -> None:
+    V, K, n_gen = 5, 3, 9
+    pb = PriorBank(
+        V,
+        K,
+        n_gen,
+        decode_tau=1.7,
+        prior_source=prior_source,
+        untie_decode_bank=untie_decode_bank,
+    )
+    with torch.no_grad():
+        pb._decode_mu_table().copy_(torch.linspace(-0.75, 0.75, V * K).reshape(V, K))
+        pb._decode_sigma_log_table().copy_(
+            torch.tensor([-20.0, -0.25, 81.0, -20.0, 0.5]).unsqueeze(-1).expand(V, K)
+        )
+
+    mu_q = torch.tensor([[[0.2, -0.3, 0.4]]])
+    sigma_q = torch.tensor([[[0.8, 1.1, 0.6]]])
+    with pytest.warns(RuntimeWarning, match="max_log=80"):
+        logits = pb.decode(mu_q, sigma_q, tau=1.7)
+    with pytest.warns(RuntimeWarning, match="max_log=80"):
+        ref = pb.reference_decode(mu_q, sigma_q, tau=1.7)
+    assert torch.allclose(logits, ref, atol=1e-3)
 
 
 def test_decode_tau_scaling():
@@ -71,7 +96,7 @@ def test_decode_matches_seam_in_large_kl_regime():
         pb.mu_embed.normal_(0.0, 1.0)
     mu_q = 5.0 * torch.ones(1, 1, K); sigma_q = torch.ones(1, 1, K)
     logits = pb.decode(mu_q, sigma_q)
-    ref = _reference_decode(pb, mu_q, sigma_q, pb.decode_tau)
+    ref = pb.reference_decode(mu_q, sigma_q, tau=pb.decode_tau)
     implied_kl = (-logits * pb.decode_tau)
     assert implied_kl.max().item() > 100.0                   # genuinely past the old clamp
     assert torch.allclose(logits, ref, atol=1e-3)            # EXACT pin holds in the clamped regime
@@ -93,7 +118,7 @@ def test_decode_exact_at_large_mean_offset():
         pb.mu_embed.normal_(0.0, 0.1).add_(1000.0)           # means clustered far from zero
     mu_q = (1000.0 + 0.1) * torch.ones(1, 1, K); sigma_q = torch.ones(1, 1, K)
     logits = pb.decode(mu_q, sigma_q)
-    ref = _reference_decode(pb, mu_q, sigma_q, pb.decode_tau)
+    ref = pb.reference_decode(mu_q, sigma_q, tau=pb.decode_tau)
     assert torch.allclose(logits, ref, atol=1e-3)
     assert torch.allclose(
         F.log_softmax(logits, dim=-1), F.log_softmax(ref, dim=-1), atol=1e-4
