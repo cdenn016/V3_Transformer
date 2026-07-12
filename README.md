@@ -294,7 +294,7 @@ nonnegative effective pair weight. On a nondegenerate coordinate, the precision 
 $$
 \begin{aligned}
 c_{ik} &:= m_i^{\mathrm{self}}a_i^{\ast}\geq 0, &
-m_{ij}^{(h)} &:= \mathbf 1\left\lbrace 0<E_{ij}^{(h)}<K_{\max}\right\rbrace, \\
+m_{ij}^{(h)} &:= \mathbf 1\left[0<E_{ij}^{(h)}<K_{\max}\right], \\
 w_{ijk} &:= \lambda_\beta m_{ij}^{(h(k))}\beta_{ij}^{(h(k))}\geq 0, \\
 P_{ik}
 &:= \frac{c_{ik}}{\sigma_{p,ik}}
