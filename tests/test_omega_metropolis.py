@@ -312,3 +312,76 @@ def test_metropolis_generator_state_roundtrips(tmp_path, monkeypatch):
     monkeypatch.setattr(resumed_model, "metropolis_omega_step", _record_resumed)
     train(resumed_model, loader, resumed_model.cfg, n_steps=3, resume_from=checkpoint_path)
     assert resumed_draws == [expected_resumed]
+
+
+# --------------------------------------------------------------------------------------------------
+# Audit 2026-07-12 N7: _metropolis_free_energy evaluates the batch in ONE free_energy_value call
+# --------------------------------------------------------------------------------------------------
+from vfe3.belief import BeliefState
+
+
+def _reference_per_sequence_sum(model, belief, mu_p, sigma_p, *, mode):
+    """The pre-N7 per-sequence reference: one single-sequence free_energy_value per batch row,
+    summed as Python floats. Pins the batched implementation to the same total."""
+    from vfe3.free_energy import attention_tau
+    from vfe3.inference.e_step import free_energy_value
+    from vfe3.model.block import _as_coeff
+    cfg, grp = model.cfg, model.group
+    gp = "omega_direct" if mode == "omega" else "phi"
+    dev = belief.mu.device
+    tau = attention_tau(model.effective_kappa_beta(dev), grp.irrep_dims)
+    log_prior = model._attention_log_prior(belief.mu.shape[-2], dev)
+    total = 0.0
+    with torch.no_grad():
+        for b in range(belief.mu.shape[0]):
+            bel = BeliefState(
+                mu=belief.mu[b], sigma=belief.sigma[b],
+                phi=(belief.phi[b] if belief.phi is not None else None),
+                omega=(belief.omega[b] if belief.omega is not None else None),
+                reflection=(belief.reflection[b] if belief.reflection is not None else None))
+            total += free_energy_value(
+                bel, mu_p[b], sigma_p[b], grp,
+                tau=tau, renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
+                b0=_as_coeff(cfg.b0, dev), c0=_as_coeff(cfg.c0, dev),
+                lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
+                include_attention_entropy=cfg.include_attention_entropy,
+                family=cfg.family, divergence_family=cfg.divergence_family,
+                lambda_alpha_mode=cfg.lambda_alpha_mode,
+                gauge_parameterization=gp, log_prior=log_prior,
+            ).item()
+    return total
+
+
+@pytest.mark.parametrize("mode", ["omega", "phi"])
+def test_metropolis_free_energy_single_batched_eval_matches_per_sequence_sum(mode, monkeypatch):
+    """One batched free_energy_value call (one host sync) per fixed-belief F -- not one per
+    sequence -- with the total pinned to the per-sequence sum. free_energy_value reduces by
+    sum() over every leading axis and sequences are independent, so the batched scalar IS the
+    per-sequence sum up to float summation order."""
+    import vfe3.inference.e_step as e_step_module
+
+    if mode == "omega":
+        m = _model(n_e_steps=1)
+    else:
+        m = VFEModel(VFE3Config(
+            gauge_parameterization="phi", gauge_group="glk", embed_dim=4, n_heads=1,
+            vocab_size=6, max_seq_len=4, n_layers=1, n_e_steps=1, transport_mode="flat",
+            e_phi_lr=0.0, use_head_mixer=False, family="gaussian_diagonal",
+            decode_mode="diagonal", lambda_gamma=0.0, s_e_step=False,
+            phi_reflection="metropolis", pos_phi="none"))
+    tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0], [4, 4, 5, 1]])       # B=3
+    belief, mu_p, sigma_p = m._metropolis_prepare(tokens, mode=mode)
+
+    ref = _reference_per_sequence_sum(m, belief, mu_p, sigma_p, mode=mode)
+
+    real_fe = e_step_module.free_energy_value
+    calls = {"n": 0}
+
+    def _counting_fe(*args, **kwargs):
+        calls["n"] += 1
+        return real_fe(*args, **kwargs)
+
+    monkeypatch.setattr(e_step_module, "free_energy_value", _counting_fe)
+    total = m._metropolis_free_energy(belief, mu_p, sigma_p, mode=mode)
+    assert calls["n"] == 1, f"expected ONE batched F eval, got {calls['n']} (per-sequence loop)"
+    assert total == pytest.approx(ref, rel=1e-5, abs=1e-5)

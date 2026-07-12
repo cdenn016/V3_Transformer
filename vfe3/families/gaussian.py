@@ -333,10 +333,17 @@ class FullGaussian(BeliefParams):
         r"""Closed-form full-covariance Gaussian Renyi/KL (ported verbatim from
         ``divergence._gaussian_full_renyi``; mu_q=self, mu_t=other)."""
         K = self.mu.shape[-1]
-        mu_q = self.mu.float()
-        sigma_q = self.sigma.float()
-        mu_t = other.mu.float()
-        sigma_t = other.sigma.float()
+        # float64 computes in float64 (audit 2026-07-12 N11, the F12 dtype policy: an fp64 island
+        # is preserved end to end instead of silently collapsing to fp32 precision -- measured ~4%
+        # relative error at cond(Sigma)~1e6); half/fp32 keep the existing fp32 compute.
+        compute_dtype = (torch.float64
+                         if torch.float64 in (self.mu.dtype, self.sigma.dtype,
+                                              other.mu.dtype, other.sigma.dtype)
+                         else torch.float32)
+        mu_q = self.mu.to(compute_dtype)
+        sigma_q = self.sigma.to(compute_dtype)
+        mu_t = other.mu.to(compute_dtype)
+        sigma_t = other.sigma.to(compute_dtype)
         # NO unconditional eps ridge (audit 2026-07-05 m1): the old ``sigma + eps*eye`` scored
         # N(mu, Sigma + eps I) ALWAYS -- a standing 1e-6 bias in values and gradients on the pure
         # full-covariance path, unlike the diagonal path's clamp (inert whenever the SPD retraction

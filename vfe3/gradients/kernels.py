@@ -466,7 +466,9 @@ def mm_exact_update(
     irrep_dims:    Optional[List[int]]    = None,
     log_prior:     Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:          # (mu_star, sigma_star), each (..., N, K)
-    r"""Closed-form MM/coordinate-exact minimizer of the beta-frozen diagonal-KL majorizer.
+    r"""Closed-form coordinate minimizer of the beta-frozen, strict-pair-masked diagonal-KL
+    surrogate (NOT a majorizer of the canonical frozen-attention objective -- the strict pair
+    mask below excludes the structural E_ii = 0 self-pairs; see README "mm_exact").
 
     At frozen attention weights beta (and frozen transported key moments -- the filtering split),
     the per-coordinate stationary point of

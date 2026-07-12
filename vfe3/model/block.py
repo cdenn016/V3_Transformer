@@ -24,6 +24,49 @@ def _as_coeff(v: 'float | list | tuple', device: torch.device) -> 'float | torch
     return torch.as_tensor(v, dtype=torch.float32, device=device) if isinstance(v, (list, tuple)) else v
 
 
+def e_step_shared_kwargs(
+    cfg:    VFE3Config,
+    device: torch.device,
+) -> dict:
+    r"""The cfg-derived shared knob bag ``e_step`` forwards through its ``**kwargs`` to BOTH
+    ``e_step_iteration`` and the diagnostic ``free_energy_value``.
+
+    Single source of truth (audit 2026-07-12 N5): ``vfe_block`` spreads this into its ``e_step``
+    call, and the viz extractors (``vfe3.viz.extract._iter_kwargs`` / ``_fe_kwargs``) build their
+    direct ``e_step_iteration`` / ``free_energy_value`` bags on top of it, so a new iteration knob
+    reaches production and diagnostics together instead of silently diverging (previously the
+    extractors dropped ``e_step_update`` / ``mm_damping`` / ``lambda_twohop`` /
+    ``skip_belief_sigma_update``, which the committed baselines set off-default). Runtime objects
+    (tau, lambda_beta, log_prior, rope, connections, gauge_parameterization) stay per-call-site;
+    the Tier-1 transport-numerics toggles (exp_fp64_*, transport_mean_per_head) stay explicit
+    ``e_step`` parameters, deliberately off this bag (the diagnostic F keeps default transport
+    numerics). ``free_energy_value`` declares every iteration-only key here as an explicit
+    accept-and-ignore parameter, so one bag serves both consumers and a misspelled knob still
+    raises ``TypeError``.
+    """
+    return dict(
+        renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
+        b0=_as_coeff(cfg.b0, device), c0=_as_coeff(cfg.c0, device),
+        kl_max=cfg.kl_max, eps=cfg.eps,
+        sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
+        e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
+        e_step_mu_precond=cfg.e_step_mu_precond,
+        include_attention_entropy=cfg.include_attention_entropy, gradient_mode=cfg.gradient_mode,
+        family=cfg.family, divergence_family=cfg.divergence_family,
+        lambda_alpha_mode=cfg.lambda_alpha_mode,
+        phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
+        spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
+        cocycle_relaxation=cfg.cocycle_relaxation,
+        link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+        clamp_monitor=cfg.transport_clamp_monitor,
+        e_step_update=cfg.e_step_update, mm_damping=cfg.mm_damping,
+        lambda_twohop=cfg.lambda_twohop,
+        skip_belief_sigma_update=cfg.skip_belief_sigma_update,
+        compile_pair_kernel=cfg.compile_pair_kernel,
+        reuse_pairwise_kl_stats=cfg.reuse_pairwise_kl_stats,
+    )
+
+
 def vfe_block(
     belief:     BeliefState,
     mu_p:       torch.Tensor,             # (N, K) prior means
@@ -77,37 +120,12 @@ def vfe_block(
         belief, mu_p, sigma_p, group,
         n_iter=cfg.n_e_steps, tau=tau,
         e_q_mu_lr=cfg.e_q_mu_lr, e_q_sigma_lr=cfg.e_q_sigma_lr, e_phi_lr=cfg.e_phi_lr,
-        renyi_order=cfg.renyi_order, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, belief.mu.device), c0=_as_coeff(cfg.c0, belief.mu.device),
         lambda_beta=lambda_beta,
-        kl_max=cfg.kl_max, eps=cfg.eps,
-        sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
-        e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
-        e_step_mu_precond=cfg.e_step_mu_precond,
-        include_attention_entropy=cfg.include_attention_entropy,
-        gradient_mode=cfg.gradient_mode, family=cfg.family, divergence_family=cfg.divergence_family,
-        lambda_alpha_mode=cfg.lambda_alpha_mode,
-        phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
-        spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
-        cocycle_relaxation=cfg.cocycle_relaxation, connection_W=connection_W, connection_M=connection_M,
-        connection_L=connection_L, link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-        clamp_monitor=cfg.transport_clamp_monitor,
+        connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
         e_step_gradient=e_step_gradient, oracle_unroll_grad=cfg.oracle_unroll_grad,
         grad_record=grad_record, state_record=state_record,
         log_prior=log_prior,
         rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
-        # Tier-1/Tier-2 toggles (2026-07-05; all default OFF/byte-identical). The iteration-only
-        # knobs (e_step_update/mm_damping/lambda_twohop/skip_belief_sigma_update/
-        # compile_pair_kernel/reuse_pairwise_kl_stats) ride e_step's **kwargs into
-        # e_step_iteration AND the diagnostic
-        # free_energy_value (which accepts-and-ignores the iteration-only ones, and HONORS
-        # lambda_twohop in the logged F); the loop-control knobs bind explicitly on e_step.
-        # skip_belief_sigma_update is a BELIEF-channel toggle: _refine_s never passes it, so the
-        # s-channel sigma update is untouched.
-        e_step_update=cfg.e_step_update, mm_damping=cfg.mm_damping,
-        lambda_twohop=cfg.lambda_twohop,
-        skip_belief_sigma_update=cfg.skip_belief_sigma_update,
-        compile_pair_kernel=cfg.compile_pair_kernel,
-        reuse_pairwise_kl_stats=cfg.reuse_pairwise_kl_stats,
         transport_mean_per_head=cfg.transport_mean_per_head,
         compact_phi_block_transport=compact_phi_blocks,
         exp_fp64_mode=cfg.exp_fp64_mode,
@@ -118,6 +136,13 @@ def vfe_block(
         e_step_halt_tol=cfg.e_step_halt_tol,
         prebuilt_transport=prebuilt_transport,
         gauge_parameterization=gauge_parameterization,
+        # The cfg-derived shared knob bag (audit 2026-07-12 N5: single source of truth with the
+        # viz extractors). It rides e_step's **kwargs into e_step_iteration AND the diagnostic
+        # free_energy_value (which accepts-and-ignores the iteration-only knobs, and HONORS
+        # lambda_twohop in the logged F); the loop-control knobs bind explicitly on e_step.
+        # skip_belief_sigma_update is a BELIEF-channel toggle: _refine_s never passes it, so the
+        # s-channel sigma update is untouched.
+        **e_step_shared_kwargs(cfg, belief.mu.device),
     )
     if capture is not None:
         # The CONVERGED variational belief q* -- what the E-step's F was minimized over,

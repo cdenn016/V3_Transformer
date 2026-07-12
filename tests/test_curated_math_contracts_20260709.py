@@ -77,7 +77,10 @@ def test_state_dependent_alpha_mm_damped_warning_separates_target_and_step() -> 
         )
 
     messages = _warning_messages(records)
-    assert "computes the frozen state-dependent-alpha majorizer minimizer" in messages
+    # Audit 2026-07-12 N18: the warning no longer calls the target a "majorizer minimizer" --
+    # the strict-pair-masked surrogate is NOT a majorizer of the canonical objective.
+    assert "computes the frozen-alpha minimizer of the strict-pair-masked surrogate" in messages
+    assert "not a majorizer" in messages
     assert "a damped step for values below 1.0" in messages
     assert "the full step at 1.0" in messages
     assert "exactly minimizes" not in messages

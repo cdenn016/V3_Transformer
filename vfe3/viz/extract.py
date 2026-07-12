@@ -17,7 +17,7 @@ from vfe3 import metrics
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
 from vfe3.families.base import get_family
-from vfe3.model.block import _as_coeff       # list b0/c0 -> (K,) tensor (M6), mirroring vfe_block
+from vfe3.model.block import _as_coeff, e_step_shared_kwargs   # shared cfg->kwargs bag (audit 2026-07-12 N5)
 from vfe3.free_energy import (
     attention_tau,
     attention_weights,
@@ -87,54 +87,51 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
 
 
 def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -> dict:
-    r"""The full ``e_step_iteration`` knob bag assembled from the model config (mirrors vfe_block)."""
+    r"""The full ``e_step_iteration`` knob bag: the production shared cfg bag
+    (``e_step_shared_kwargs``, audit 2026-07-12 N5 -- previously a hand-rolled copy that silently
+    dropped ``e_step_update``/``mm_damping``/``lambda_twohop``/``skip_belief_sigma_update``) plus
+    the runtime extras ``vfe_block``/``e_step`` bind per call (tau, step sizes, connections,
+    transport toggles, log_prior, rope)."""
     cfg = model.cfg
-    return dict(
-        tau=attention_tau(model.effective_kappa_beta(model.prior_bank.mu_embed.device), model.group.irrep_dims),
+    kw = e_step_shared_kwargs(cfg, _model_device(model))
+    kw.update(
+        tau=attention_tau(model.effective_kappa_beta(_model_device(model)), model.group.irrep_dims),
         e_q_mu_lr=cfg.e_q_mu_lr, e_q_sigma_lr=cfg.e_q_sigma_lr, e_phi_lr=cfg.e_phi_lr,
-        renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
-        b0=_as_coeff(cfg.b0, model.prior_bank.mu_embed.device),
-        c0=_as_coeff(cfg.c0, model.prior_bank.mu_embed.device),
-        lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
-        sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust, mass_phi=cfg.mass_phi,
-        e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
-        e_step_mu_precond=cfg.e_step_mu_precond,
-        include_attention_entropy=cfg.include_attention_entropy, gradient_mode=cfg.gradient_mode,
-        family=cfg.family, divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
-        phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
-        spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
+        lambda_beta=cfg.lambda_beta,
         gauge_parameterization=cfg.gauge_parameterization,
-        cocycle_relaxation=cfg.cocycle_relaxation, connection_W=getattr(model, "connection_W", None),
-        connection_M=getattr(model, "connection_M", None),
-        connection_L=getattr(model, "connection_L", None),
-        link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-        compact_phi_block_transport=model._compact_phi_blocks_enabled(),
-        log_prior=log_prior,
-        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-    )
-
-
-def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = None) -> dict:
-    r"""The ``free_energy_value`` knob subset (it rejects the iteration-only step-size knobs).
-    ``rope`` is honored (audit PP6): the logged F carries the RoPE-wrapped transport."""
-    cfg = model.cfg
-    return dict(
-        tau=attention_tau(model.effective_kappa_beta(model.prior_bank.mu_embed.device), model.group.irrep_dims),
-        renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
-        b0=_as_coeff(cfg.b0, model.prior_bank.mu_embed.device),
-        c0=_as_coeff(cfg.c0, model.prior_bank.mu_embed.device),
-        lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
-        include_attention_entropy=cfg.include_attention_entropy, family=cfg.family,
-        divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
-        transport_mode=cfg.transport_mode, gauge_parameterization=cfg.gauge_parameterization,
-        cocycle_relaxation=cfg.cocycle_relaxation,
-        link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-        log_prior=log_prior,
         connection_W=getattr(model, "connection_W", None),
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
+        compact_phi_block_transport=model._compact_phi_blocks_enabled(),
+        transport_mean_per_head=cfg.transport_mean_per_head,
+        exp_fp64_mode=cfg.exp_fp64_mode,
+        exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+        log_prior=log_prior,
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
+    return kw
+
+
+def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = None) -> dict:
+    r"""The ``free_energy_value`` knob bag: the SAME shared cfg bag production's ``e_step``
+    forwards to its diagnostic F (``free_energy_value`` declares the iteration-only knobs as
+    explicit accept-and-ignore parameters and HONORS ``lambda_twohop``, audit 2026-07-12 N5), plus
+    the runtime extras. ``rope`` is honored (audit PP6): the logged F carries the RoPE-wrapped
+    transport. The step-size knobs (e_q_mu_lr/e_q_sigma_lr/e_phi_lr) stay off this bag --
+    ``free_energy_value`` rejects them, exactly as production binds them on ``e_step`` only."""
+    cfg = model.cfg
+    kw = e_step_shared_kwargs(cfg, _model_device(model))
+    kw.update(
+        tau=attention_tau(model.effective_kappa_beta(_model_device(model)), model.group.irrep_dims),
+        lambda_beta=cfg.lambda_beta,
+        gauge_parameterization=cfg.gauge_parameterization,
+        connection_W=getattr(model, "connection_W", None),
+        connection_M=getattr(model, "connection_M", None),
+        connection_L=getattr(model, "connection_L", None),
+        log_prior=log_prior,
+        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+    )
+    return kw
 
 
 @torch.no_grad()

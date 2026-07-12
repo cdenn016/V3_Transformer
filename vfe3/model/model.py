@@ -1116,9 +1116,14 @@ class VFEModel(nn.Module):
 
         Mirrors the belief E-step's ``free_energy_value`` kwargs (tau, self-coupling value/b0/c0,
         lambda_beta, family/divergence, entropy term) so ``belief.omega`` enters F through the
-        belief-coupling transport Omega_ij = U_i U_j^{-1}. ``free_energy_value``'s non-RoPE path is
-        single-sequence (it adds a dummy batch axis), so F is evaluated per (N, K) sequence and
-        summed. The current and trial evaluations call this with IDENTICAL kwargs and differ only in
+        belief-coupling transport Omega_ij = U_i U_j^{-1}. ONE batched ``free_energy_value`` call
+        (audit 2026-07-12 N7): the softmax/prior/energy ops are batch-broadcasting and the final
+        reduction is a sum over every leading axis, so the batched scalar IS the per-sequence sum
+        (sequences are independent; attention rows never mix batch elements) -- one host sync per F
+        instead of one per sequence, collapsing the sweep in :meth:`metropolis_omega_step` from
+        (1+n_unique)xB synced evals to (1+n_unique). Pinned to the per-sequence sum by
+        ``tests/test_omega_metropolis.py``. The current and trial evaluations call this with
+        IDENTICAL kwargs and differ only in
         ``belief.omega``, so the Metropolis DeltaF is exact and self-consistent (the absolute F need
         not equal the training loss).
 
@@ -1142,22 +1147,15 @@ class VFEModel(nn.Module):
         n         = belief.mu.shape[-2]
         log_prior = self._attention_log_prior(n, dev)
         with torch.no_grad():
-            total = 0.0
-            for b in range(belief.mu.shape[0]):
-                bel = BeliefState(
-                    mu=belief.mu[b], sigma=belief.sigma[b],
-                    phi=(belief.phi[b] if belief.phi is not None else None),
-                    omega=(belief.omega[b] if belief.omega is not None else None),
-                    reflection=(belief.reflection[b] if belief.reflection is not None else None))
-                total += free_energy_value(
-                    bel, mu_p[b], sigma_p[b], grp,
-                    tau=tau, renyi_order=cfg.renyi_order, value=cfg.lambda_alpha, b0=b0, c0=c0,
-                    lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
-                    include_attention_entropy=cfg.include_attention_entropy,
-                    family=cfg.family, divergence_family=cfg.divergence_family,
-                    lambda_alpha_mode=cfg.lambda_alpha_mode,
-                    gauge_parameterization=gp, log_prior=log_prior,
-                ).item()
+            total = free_energy_value(
+                belief, mu_p, sigma_p, grp,
+                tau=tau, renyi_order=cfg.renyi_order, value=cfg.lambda_alpha, b0=b0, c0=c0,
+                lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
+                include_attention_entropy=cfg.include_attention_entropy,
+                family=cfg.family, divergence_family=cfg.divergence_family,
+                lambda_alpha_mode=cfg.lambda_alpha_mode,
+                gauge_parameterization=gp, log_prior=log_prior,
+            ).item()
         return total
 
     def _metropolis_trial_belief(
@@ -1569,7 +1567,12 @@ class VFEModel(nn.Module):
             # to the gamma=0 path (the model channel is predictively INERT: s does NOT feed q). The
             # detach deliberately severs the model-frame <- gamma coupling that a scored frame update would carry in
             # the canonical E-step F; restoring it (or keeping it severed) is part of the deferred s->q
-            # design, NOT this term. Computed once per forward at the loss level (like diagnostics()).
+            # design, NOT this term. Audit 2026-07-12 N17: together with _refine_s pinning its
+            # e_phi_lr to 0.0, this severs the gamma-sourced frame force dF_gamma/dphi on EVERY
+            # executable route, with no exposing toggle -- the PASSIVE-frame reading is the intended
+            # interim pure path (see the lambda_gamma config note); only an indirect second-order
+            # path to phi_embed survives under s_e_step+unroll via the graph-attached model frame.
+            # Computed once per forward at the loss level (like diagnostics()).
             # The body lives in _gamma_coupling_term so diagnostics logs the SAME term (audit V2).
             tied_model_frame = self.cfg.s_frame_mode == "tied"
             model_phi = self._resolve_model_frame(token_ids, belief.phi)
