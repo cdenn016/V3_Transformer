@@ -1,8 +1,12 @@
+import gc
 import math
+import weakref
 
 import torch
 
+import vfe3.geometry.phi_preconditioner as phi_preconditioner
 from vfe3.geometry.generators import generate_glk, generate_glk_multihead, generate_son
+from vfe3.geometry.groups import get_group
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
 
 
@@ -20,18 +24,49 @@ def test_clip_scales_large_gradient_to_c():
     assert torch.allclose(out.norm(dim=-1), torch.full((2,), 10.0), atol=1e-3)
 
 
-def test_killing_cache_retains_generators_reference():
-    # m17: the killing-inverse cache keys on generators.data_ptr() but must RETAIN the generators
-    # tensor, else a freed-and-realloc'd same-shape basis at the same address returns a stale inverse.
-    import gc
-    import weakref
-    from vfe3.geometry.phi_preconditioner import build_killing_preconditioner
-    G = generate_son(3).clone()                     # fresh storage (not held by any generator factory cache)
-    build_killing_preconditioner(G)
-    ref = weakref.ref(G)
-    del G
+def test_killing_per_block_caches_parent_without_strong_retention():
+    cache = phi_preconditioner._KILLING_INV_CACHE
+    cache.clear()
+    group = get_group("block_glk")(4, 2)
+    generators = group.generators
+    first = phi_preconditioner.build_killing_preconditioner_per_block(
+        generators, group.irrep_dims,
+    )
+    second = phi_preconditioner.build_killing_preconditioner_per_block(
+        generators, group.irrep_dims,
+    )
+    assert second is first
+    ref = weakref.ref(generators)
+    del group, generators, first, second
     gc.collect()
-    assert ref() is not None, "killing cache dropped the generators tensor (its data_ptr can be recycled)"
+    assert ref() is None
+    assert not cache
+
+
+def test_killing_cache_recomputes_after_in_place_basis_mutation():
+    cache = phi_preconditioner._KILLING_INV_CACHE
+    cache.clear()
+    generators = generate_son(3).clone()
+    first = phi_preconditioner.build_killing_preconditioner(generators)
+    generators.mul_(2.0)
+    second = phi_preconditioner.build_killing_preconditioner(generators)
+    assert second is not first
+    assert not torch.allclose(second, first)
+
+
+def test_killing_cache_is_lru_bounded():
+    cache = phi_preconditioner._KILLING_INV_CACHE
+    cache.clear()
+    generators = [generate_son(3).clone() for _ in range(33)]
+    inverses = [
+        phi_preconditioner.build_killing_preconditioner(basis)
+        for basis in generators[:32]
+    ]
+    assert phi_preconditioner.build_killing_preconditioner(generators[0]) is inverses[0]
+    phi_preconditioner.build_killing_preconditioner(generators[32])
+    assert len(cache) == 32
+    assert phi_preconditioner.build_killing_preconditioner(generators[0]) is inverses[0]
+    assert phi_preconditioner.build_killing_preconditioner(generators[1]) is not inverses[1]
 
 
 def test_pullback_series_warns_on_non_convergence():

@@ -25,8 +25,10 @@ Ad(K)-invariant metric, not a bi-invariant one. The pullback metric is the
 position-dependent alternative for the non-compact regime.
 """
 
+from collections import OrderedDict
 import math
 import warnings
+import weakref
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -100,14 +102,85 @@ def killing_metric(
     return 2.0 * K * gram - 2.0 * torch.outer(traces, traces)
 
 
-# Memoized Killing inverses, keyed on the generators' IDENTITY (data_ptr) + dtype/device/
-# shape + (center_reg, tol). The inverse depends only on the fixed generator basis, so it is
-# loop-invariant across every E-step iteration; caching avoids rebuilding an O(n_gen^3) float64
-# eigh per iteration when a killing preconditioner is active (audit 4d). Keying on data_ptr is
-# staleness-safe: a .to(device/dtype) move produces a NEW tensor (new ptr) -> cache miss ->
-# recompute, so a moved model never reuses a stale-device inverse.
-_KILLING_INV_CACHE: Dict[tuple, tuple] = {}     # key -> (generators_ref, inv); retain generators (m17)
+# Memoized Killing inverses, weakly keyed on generator identity and mutation version. The inverse
+# depends only on the fixed generator basis, so it is loop-invariant across every E-step iteration;
+# caching avoids rebuilding an O(n_gen^3) float64 eigh when a Killing preconditioner is active.
+_KILLING_INV_CACHE_MAXSIZE: int = 32
+_KILLING_INV_CACHE: OrderedDict[
+    tuple, tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor]
+] = OrderedDict()
 _PULLBACK_SERIES_WARNED: bool = False           # warn-once guard for Psi-series non-convergence (m19)
+
+
+def _killing_cache_key(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+    variant:    tuple,                    # ("full",) or ("per_block", irrep_dims)
+
+    *,
+    tol:        float           = 1e-6,
+    center_reg: Optional[float] = None,
+) -> tuple:
+    """Return the identity/version cache key for one Killing-inverse variant."""
+    return (
+        id(generators), int(generators._version), tuple(generators.shape),
+        generators.dtype, generators.device, variant, center_reg, tol,
+    )
+
+
+def _get_cached_killing_inverse(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+    key:        tuple,
+) -> Optional[torch.Tensor]:
+    """Return an identity-valid cache hit and promote it to most recently used."""
+    cached = _KILLING_INV_CACHE.get(key)
+    if cached is None:
+        return None
+    generators_ref, inverse = cached
+    if generators_ref() is not generators:
+        _KILLING_INV_CACHE.pop(key, None)
+        return None
+    _KILLING_INV_CACHE.move_to_end(key)
+    return inverse
+
+
+def _cache_killing_inverse(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+    inverse:    torch.Tensor,             # (n_gen, n_gen) inverse metric
+    key:        tuple,
+) -> torch.Tensor:
+    """Store one weak cache entry and evict the least-recently-used overflow."""
+    def _remove_dead_entry(
+        generators_ref: weakref.ReferenceType[torch.Tensor],
+    ) -> None:
+        cached = _KILLING_INV_CACHE.get(key)
+        if cached is not None and cached[0] is generators_ref:
+            _KILLING_INV_CACHE.pop(key, None)
+
+    generators_ref = weakref.ref(generators, _remove_dead_entry)
+    _KILLING_INV_CACHE[key] = (generators_ref, inverse)
+    _KILLING_INV_CACHE.move_to_end(key)
+    while len(_KILLING_INV_CACHE) > _KILLING_INV_CACHE_MAXSIZE:
+        _KILLING_INV_CACHE.popitem(last=False)
+    return inverse
+
+
+def _build_killing_preconditioner_uncached(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+
+    *,
+    center_reg: Optional[float] = None,   # None -> 2*K; lifts the numerical nullspace
+    tol:        float           = 1e-6,
+) -> torch.Tensor:                        # (n_gen, n_gen) regularized inverse metric
+    """Build the inverse Killing metric without reading or writing the shared cache."""
+    K = generators.shape[-1]
+    reg = float(2 * K) if center_reg is None else float(center_reg)
+    orig_dtype = generators.dtype
+    M = killing_metric(generators).double()
+    M = 0.5 * (M + M.transpose(-1, -2))
+    evals, evecs = torch.linalg.eigh(M)
+    evals = torch.where(evals.abs() < tol, torch.full_like(evals, reg), evals)
+    inv = (evecs * (1.0 / evals).unsqueeze(-2)) @ evecs.transpose(-1, -2)
+    return inv.to(orig_dtype)
 
 
 def build_killing_preconditioner(
@@ -128,26 +201,20 @@ def build_killing_preconditioner(
     or O(K) (the semisimple part) -- a clean gap, no genuine eigenvalue near ``tol``. A custom basis
     with a true small-but-nonzero Killing eigenvalue would have it wrongly lifted; on this inactive
     opt-in path (mode='none' is the default pure path) that case does not arise for shipped groups.
-    Memoized on the generator basis (see ``_KILLING_INV_CACHE``): loop-invariant, so it is
-    built once per (basis, center_reg, tol), not per E-step iteration.
+    Memoized weakly on the generator basis identity and mutation version (see
+    ``_KILLING_INV_CACHE``): loop-invariant, so it is built once per
+    (basis, version, center_reg, tol), not per E-step iteration.
     """
-    key = (generators.data_ptr(), tuple(generators.shape), generators.dtype,
-           generators.device, center_reg, tol)
-    cached = _KILLING_INV_CACHE.get(key)
+    key = _killing_cache_key(
+        generators, ("full",), center_reg=center_reg, tol=tol,
+    )
+    cached = _get_cached_killing_inverse(generators, key)
     if cached is not None:
-        return cached[1]                                 # (generators_ref, inv) -> inv
-
-    K = generators.shape[-1]
-    reg = float(2 * K) if center_reg is None else float(center_reg)
-    orig_dtype = generators.dtype
-    M = killing_metric(generators).double()
-    M = 0.5 * (M + M.transpose(-1, -2))
-    evals, evecs = torch.linalg.eigh(M)
-    evals = torch.where(evals.abs() < tol, torch.full_like(evals, reg), evals)
-    inv = (evecs * (1.0 / evals).unsqueeze(-2)) @ evecs.transpose(-1, -2)
-    inv = inv.to(orig_dtype)
-    _KILLING_INV_CACHE[key] = (generators, inv)          # retain generators so its data_ptr key can't recycle (m17)
-    return inv
+        return cached
+    inverse = _build_killing_preconditioner_uncached(
+        generators, center_reg=center_reg, tol=tol,
+    )
+    return _cache_killing_inverse(generators, inverse, key)
 
 
 @register_precond("killing")
@@ -206,6 +273,12 @@ def build_killing_preconditioner_per_block(
     """
     if len(irrep_dims) == 1:
         return build_killing_preconditioner(generators, center_reg=center_reg, tol=tol)
+    key = _killing_cache_key(
+        generators, ("per_block", tuple(irrep_dims)), center_reg=center_reg, tol=tol,
+    )
+    cached = _get_cached_killing_inverse(generators, key)
+    if cached is not None:
+        return cached
     block_of = _generator_block_index(generators, irrep_dims)
     n_gen = generators.shape[0]
     Minv  = torch.zeros(n_gen, n_gen, dtype=generators.dtype, device=generators.device)
@@ -213,10 +286,10 @@ def build_killing_preconditioner_per_block(
     for h, d in enumerate(irrep_dims):
         idx     = (block_of == h).nonzero(as_tuple=True)[0]
         sub     = generators[idx][:, start:start + d, start:start + d].contiguous()   # local d_h rep
-        sub_inv = build_killing_preconditioner(sub, center_reg=center_reg, tol=tol)
+        sub_inv = _build_killing_preconditioner_uncached(sub, center_reg=center_reg, tol=tol)
         Minv[idx.unsqueeze(-1), idx.unsqueeze(0)] = sub_inv
         start += d
-    return Minv
+    return _cache_killing_inverse(generators, Minv, key)
 
 
 @register_precond("killing_per_block")
