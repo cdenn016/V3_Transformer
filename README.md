@@ -198,6 +198,154 @@ with another registered divergence still defines a Gibbs source-selection rule, 
 not by itself define an ELBO or make the complete training loop optimize one variational
 free energy.
 
+## Inner objectives and executable updates
+
+The belief channel minimizes a target-blind structural objective. Its one-hop term uses the
+belief attention weights and the same entropy regularizer that produces the Gibbs row solution.
+The checked-in state-dependent self-coupling profiles the positive coefficient $a_i$ against its
+regularizer in the same objective:
+
+$$
+\begin{aligned}
+\mathcal F_q
+&:= \sum_i\left[a_iD(q_i\Vert p_i)+R(a_i)\right]
++\lambda_\beta\sum_{h,i,j}\beta_{ij}^{(h)}
+\left[
+E_{ij}^{q,h}
++\tau_{\beta,h}\log\frac{\beta_{ij}^{(h)}}{\pi_{ij}^{q,h}}
+\right], \\
+R(a) &:= b_0a-c_0\log a, &
+a_i^* &:= \frac{c_0}{b_0+D(q_i\Vert p_i)}.
+\end{aligned}
+$$
+
+The optional detached two-hop coefficient is zero in the checked-in profile. Here $b_0=c_0=1$
+and the only belief iteration starts from $q_i^{(0)}=p_i$. It therefore evaluates
+$D(q_i^{(0)}\Vert p_i)=0$ and $a_i^*=1$ at that initialization; this value is not asserted away
+from that state.
+
+The model channel has its own target-blind objective. It balances the same-scale hyper-prior
+against gamma-weighted transported consensus, then hands its single refined state to both the
+belief initialization and the belief prior:
+
+$$
+\begin{aligned}
+\mathcal F_s
+&:= \lambda_h\sum_iD_{\mathrm{KL}}(s_i\Vert r)
++\lambda_\gamma\sum_{h,i,j}\gamma_{ij}^{(h)}
+\left[
+E_{ij}^{s,h}
++\tau_{\gamma,h}\log\frac{\gamma_{ij}^{(h)}}{\pi_{ij}^{s,h}}
+\right], \\
+\lambda_h &= 0.25, &
+\lambda_\gamma &= 0.75, &
+\tau_{\gamma,h} &= \sqrt{10}, &
+q_i^{(0)} &= p_i=s_i^{(1)}.
+\end{aligned}
+$$
+
+The global $r$ is token-independent and frozen because `learnable_r=False`. This is an
+implemented same-scale hierarchy, not the full multiscale PIFB theory. Its finite schedule does
+not establish a slower learned model timescale.
+
+Before the belief step, the refined model covariance supplies a detached global reliability bias.
+The gamma posterior is then mixed with that reliability-adjusted belief prior in probability
+space:
+
+$$
+\begin{aligned}
+\rho_j
+&:= -\log\left(2+\operatorname{tr}\Sigma_{s,j}^{(1)}\right), &
+\pi_{hij}^{b}
+&:= \operatorname{softmax}_j\left(B_{hij}^{q}+\rho_j\right), \\
+\overline\pi_{hij}^{q}
+&:= (1-w)\pi_{hij}^{b}
++w\operatorname{stopgrad}\left(\gamma_{ij}^{(h)}\right), &
+w&=0.5.
+\end{aligned}
+$$
+
+The prior-mixture weight $w=0.5$ is distinct from the model-coupling coefficient
+$\lambda_\gamma=0.75$. The final belief attention uses $\overline\pi^q$ in its Gibbs rule. The
+detached fold changes the belief forward update without carrying a gradient into $s$ through that
+edge.
+
+For the active diagonal-KL route, let $h(k)$ be the head containing coordinate $k$. Absorb the
+self and pair clamp masks into the nonnegative effective weights
+$c_{ik}:=m_i^{\mathrm{self}}a_i^*$ and
+$w_{ijk}:=\lambda_\beta m_{ij}^{(h(k))}\beta_{ij}^{(h(k))}$. On a nondegenerate coordinate, the
+frozen-attention precision fusion is
+
+$$
+\begin{aligned}
+c_{ik} &:= m_i^{\mathrm{self}}a_i^*\geq 0, &
+w_{ijk} &:= \lambda_\beta m_{ij}^{(h(k))}\beta_{ij}^{(h(k))}\geq 0, \\
+P_{ik}
+&:= \frac{c_{ik}}{\sigma_{p,ik}}
++\sum_j\frac{w_{ijk}}{\widetilde\sigma_{ij,k}}, \\
+\mu_{ik}^{*}
+&:= \frac{
+c_{ik}\mu_{p,ik}/\sigma_{p,ik}
++\sum_jw_{ijk}\widetilde\mu_{ij,k}/\widetilde\sigma_{ij,k}
+}{P_{ik}}, &
+\sigma_{ik}^{*}
+&:= \frac{c_{ik}+\sum_jw_{ijk}}{P_{ik}}.
+\end{aligned}
+$$
+
+These targets exactly minimize the frozen-attention, detached-key, diagonal-KL majorizer. They do
+not exactly minimize the self-consistent profiled objective, whose weights change with the belief.
+If every effective precision on a coordinate is suppressed by a clamp, the implementation retains
+the current belief rather than applying the displayed nondegenerate quotient.
+
+When covariance is enabled, MM damping is performed in Gaussian natural coordinates. The
+checked-in model step uses this covariance-enabled route with $\eta=0.75$. The belief step uses the
+same damping value but freezes covariance, so its mean is damped directly in mean coordinates:
+
+$$
+\begin{aligned}
+\Lambda &:= \Sigma^{-1}, &
+\Lambda^{+} &:= (1-\eta)\Lambda+\eta\Lambda^{*}, \\
+(\Lambda\mu)^{+}
+&:= (1-\eta)\Lambda\mu+\eta\Lambda^{*}\mu^{*}, &
+\eta&=0.75, \\
+\mu^{(1)}&=0.25\mu^{(0)}+0.75\mu^{*}, &
+\sigma^{(1)}&=\sigma^{(0)}, &
+\phi^{(1)}&=\phi^{(0)}.
+\end{aligned}
+$$
+
+Thus the `s` step updates covariance, whereas the `q` E-step freezes covariance and frames.
+`e_phi_lr=0` does not freeze outer frame learning: the checked-in plain AdamW route uses
+`m_phi_lr=0.010`. Covariance can also change outside the `q` E-step through the upstream `s`
+refinement and the active head mixer.
+
+The reusable engine separately registers the Gaussian Fisher-gradient route. For full covariance
+and its diagonal variance specialization, respectively, its natural gradients are
+
+$$
+\begin{aligned}
+\widetilde\nabla_{\mu}\mathcal F
+&:= \Sigma\nabla_{\mu}\mathcal F, &
+\widetilde\nabla_{\Sigma}\mathcal F
+&:= 2\Sigma\operatorname{sym}\left(\nabla_{\Sigma}\mathcal F\right)\Sigma, \\
+\widetilde\nabla_{\mu}\mathcal F
+&:= \sigma\odot\nabla_{\mu}\mathcal F, &
+\widetilde\nabla_{\sigma}\mathcal F
+&:= 2\sigma^2\odot\nabla_{\sigma}\mathcal F.
+\end{aligned}
+$$
+
+These equations describe the reusable registered gradient route, which is inactive under the
+checked-in `mm_exact` selection. They do not describe the frame AdamW update, and they do not imply
+convergence of the finite refinement schedule.
+
+**Objective boundary.** $\mathcal F_s$ and $\mathcal F_q$ are target-blind structural objectives;
+the supervised outer next-token cross-entropy is separate. Each inner stage performs one damped,
+frozen-attention MM step, not an exact self-consistent argmin. The production forward pass therefore
+does not optimize one ELBO and has no shared-functional EM monotonicity, evidence-ascent,
+convergence, or global-free-energy-descent guarantee.
+
 ## Execution profiles
 
 The repository exposes an engine and several concrete profiles. They are separate
