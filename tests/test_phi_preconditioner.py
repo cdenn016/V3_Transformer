@@ -43,6 +43,19 @@ def test_killing_per_block_caches_parent_without_strong_retention():
     assert not cache
 
 
+def test_killing_cache_does_not_retain_requires_grad_basis():
+    cache = phi_preconditioner._KILLING_INV_CACHE
+    cache.clear()
+    generators = generate_son(3).clone().requires_grad_()
+    inverse = phi_preconditioner.build_killing_preconditioner(generators)
+    assert inverse.requires_grad is False
+    ref = weakref.ref(generators)
+    del generators, inverse
+    gc.collect()
+    assert ref() is None
+    assert not cache
+
+
 def test_killing_cache_recomputes_after_in_place_basis_mutation():
     cache = phi_preconditioner._KILLING_INV_CACHE
     cache.clear()

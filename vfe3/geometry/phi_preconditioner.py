@@ -172,15 +172,16 @@ def _build_killing_preconditioner_uncached(
     tol:        float           = 1e-6,
 ) -> torch.Tensor:                        # (n_gen, n_gen) regularized inverse metric
     """Build the inverse Killing metric without reading or writing the shared cache."""
-    K = generators.shape[-1]
-    reg = float(2 * K) if center_reg is None else float(center_reg)
-    orig_dtype = generators.dtype
-    M = killing_metric(generators).double()
-    M = 0.5 * (M + M.transpose(-1, -2))
-    evals, evecs = torch.linalg.eigh(M)
-    evals = torch.where(evals.abs() < tol, torch.full_like(evals, reg), evals)
-    inv = (evecs * (1.0 / evals).unsqueeze(-2)) @ evecs.transpose(-1, -2)
-    return inv.to(orig_dtype)
+    with torch.no_grad():
+        K = generators.shape[-1]
+        reg = float(2 * K) if center_reg is None else float(center_reg)
+        orig_dtype = generators.dtype
+        M = killing_metric(generators).double()
+        M = 0.5 * (M + M.transpose(-1, -2))
+        evals, evecs = torch.linalg.eigh(M)
+        evals = torch.where(evals.abs() < tol, torch.full_like(evals, reg), evals)
+        inv = (evecs * (1.0 / evals).unsqueeze(-2)) @ evecs.transpose(-1, -2)
+        return inv.to(orig_dtype)
 
 
 def build_killing_preconditioner(
