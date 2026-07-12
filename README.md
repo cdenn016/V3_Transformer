@@ -1,271 +1,320 @@
-# V3_Transformer (VFE_3.0)
+# V3_Transformer
 
-A clean-room rebuild of the gauge-theoretic variational-free-energy transformer. The
-defining constraint is that there are no neural networks in the pure path: no
-`nn.Linear`, no MLP, no activations. All representational capacity comes from
-iteratively minimizing a variational free energy `F` over a per-token Gaussian belief
-tuple `(mu, Sigma, phi)`, and the only learnable objects are the prior tables in the
-`PriorBank`. Backpropagation is still used, but only to learn those priors: the loss
-flows backward through the unrolled belief inference. The theory is developed in
-`Manuscripts-Theory/` (`GL(K)_attention.tex`, `GL(K)_supplementary.tex`, `PIFB.tex`), which
-mirrors the canonical copies in the shared `Research/manuscripts/` vault. Design and audit
-notes live under `docs/`.
+V3_Transformer is an experimental, target-blind structural-refinement sequence model.
+Each token is represented by a Gaussian belief and a local gauge frame. A forward pass
+applies a finite number of transport-coupled refinement steps, then trains a next-token
+readout with a separate outer cross-entropy objective. The next-token target is absent
+from the internal refinement computation.
 
-The codebase is built bottom-up with every kernel numerically pinned by its own
-golden regression tests, and every modeling choice sits behind a
-config-selected registry so that variants slot in by registration rather than by editing
-call sites.
+The preserved pure profile has no learned Q/K/V projections, MLP, or pointwise
+activation. That statement applies to a selected configuration, not to every executable
+profile. The `VFE3Config()` dataclass defaults and the checked-in `train_vfe3.py`
+experiment enable learned components outside that pure profile. The implementation is
+registry-heavy, and each configuration claim below names the scope to which it applies.
 
-## The core idea
+## Architecture at a glance
 
-A transformer layer is replaced by an inference step. Each token `i` carries a Gaussian
-belief `q_i = N(mu_i, Sigma_i)` together with a gauge frame `phi_i` (an element of a Lie
-algebra). A forward pass encodes tokens into their prior beliefs, runs an iterative
-descent on a free energy that couples every belief to a learned prior and to every other
-belief through gauge-covariant transport, and then decodes the converged belief by
-measuring its KL divergence to each vocabulary prior. Attention is not a learned bilinear
-map; it is the softmax that arises as the stationary point of the belief-coupling block of
-`F`. "Heads" are the irreducible blocks of the gauge group acting on the belief.
+The graph shows the generic executable path. Configuration selects the optional
+model-channel route, the refinement update, post-block transforms, and the decode
+boundary.
 
-The mechanism the code actually computes at decode time is a KL-nearest-prior readout:
-the next-token logits are `-KL(q_i || pi_v)/tau_eff` over the vocabulary `v`. The richer
-free-energy-principle reading — beliefs as a community of agents, the next token as the
-agent that most lowers free energy — is an interpretation of this mechanism, not a
-separate computation in the code.
-
-## Architecture
-
-The model is `encode -> E-step stack -> (optional head mix) -> (optional norm) -> decode
--> cross-entropy`. The diagram shows the three nested loops that give the model its depth:
-the inner E-step iteration (run `T = n_e_steps` times), the per-block loop (`L = n_layers`
-blocks, with a belief-to-prior handoff between them), and the outer M-step that
-backpropagates the cross-entropy through the entire unrolled inference into the PriorBank
-tables.
-
-```
- token_ids (B, N)
-      |
-      v
- +-----------------------------------------------------------------------------+
- | PriorBank.encode : table lookup  token -> (mu, Sigma, phi),  q := p          |
- +-----------------------------------------------------------------------------+
-      |
-      |  + positional phi  (optional BCH / RoPE gauge composition)
-      v
- ====== E-STEP STACK : L blocks ==============================================
- |                                                                            |
- |   per block: iterate the E-step  T = n_e_steps  times                      |
- |                                                                            |
- |   .------------------- inner E-step iteration (x T) -------------------.    |
- |   |                                                                    |    |
- |   |  transport     Omega_ij = exp(phi_i . G) exp(-phi_j . G)           |    |
- |   |  energy        E_ij = D( q_i || Omega_ij q_j )      (per irrep blk)|    |
- |   |  attention     beta_ij = softmax_j( log_prior_ij - E_ij / tau )    |    |
- |   |  belief grad   dF/d(mu, Sigma)   (envelope kernel / autograd)      |    |
- |   |  Fisher        natural-gradient precondition                       |    |
- |   |  retract       mu  <- mu - lr * nat_mu        (Euclidean)          |    |
- |   |                Sigma <- SPD affine-invariant exp-map step          |    |
- |   |                phi <- Lie retraction of preconditioned dF/dphi     |    |
- |   '--------------------------------------------------------------------'    |
- |                                                                            |
- |   handoff to next block:  mu_p <- (1-rho) mu_p + rho mu_q                   |
- |                           Sigma_p <- (1-rho_s) Sigma_p + rho_s Sigma_q      |
- ============================================================================
-      |
-      v   converged belief (mu*, Sigma*, phi*)
- +-----------------------------------------------------------------------------+
- | PriorBank.decode :  logits_{i,v} = -KL( q_i* || pi_v ) / tau_eff   (over V)  |
- +-----------------------------------------------------------------------------+
-      |
-      v
- cross-entropy  vs  next-token targets
-      |
-      '----------------------------------------------.
-                                                     |  M-step: loss.backward()
-                                                     |  through the UNROLLED E-step
-                                                     v
- +-----------------------------------------------------------------------------+
- | AdamW (per-group LRs) updates ONLY the PriorBank tables:                     |
- |   mu_embed (V,K), sigma_log_embed (V,K), phi_embed (V,n_gen), decode_log_scale|
- +-----------------------------------------------------------------------------+
+```mermaid
+flowchart LR
+    tokens["Token ids"] --> encode["PriorBank encode"]
+    encode --> frame["Position and frame construction"]
+    frame --> model_channel{"Model-channel refinement enabled?"}
+    model_channel -->|yes| refine_s["Refine s against r and gamma consensus"]
+    model_channel -->|no| prior["Initial belief q0 = p"]
+    refine_s --> prior
+    prior --> stack["L blocks, T refinement steps"]
+    stack --> decode{"Decode boundary"}
+    decode -->|prior bank| kl_decode["Negative KL to vocabulary priors"]
+    decode -->|linear| linear_decode["Mean projection"]
+    kl_decode --> ce["Next-token cross-entropy"]
+    linear_decode --> ce
+    ce --> optimizer["AdamW parameter update"]
+    ce --> artifacts["Metrics, checkpoints, provenance, figures"]
 ```
 
-The only parameters in the pure path are the prior tables: a mean table `mu_embed`
-`(V, K)`, a log-variance table `sigma_log_embed` `(V, K)`, a gauge-frame table
-`phi_embed` `(V, n_gen)`, and a scalar decode temperature `decode_log_scale`. There is no
-attention projection, no feedforward block, and no output embedding matrix on this path.
-Everything else in the model is a fixed, parameter-free numerical operator.
+`PriorBank.encode` constructs token priors and initial beliefs. `VFEModel.forward_beliefs`
+runs the optional model channel and the `L`-by-`T` belief-refinement stack;
+`VFEModel.forward` applies the selected decoder. Cross-entropy then supplies the
+supervised outer loss and the artifact layer records the run.
 
-### Encode
+## Attention as variational source selection
 
-`PriorBank.encode` looks up the per-token prior `pi = N(mu_v, exp(sigma_log_v))` with
-gauge frame `phi_v` and uses it as the initial belief, so inference begins at `q = p`.
-The diagonal family stores `Sigma` as a variance vector; the full-covariance family
-embeds the same per-token variances as a diagonal SPD matrix that the full E-step then
-evolves off-diagonal mass into.
+For query position `i`, let `E_ij` be a fixed scalar comparison between `q_i` and the
+transported source `Omega_ij* q_j`, let `pi_ij` be a normalized prior on the active source
+support, and let `tau > 0`. The fixed-row objective and its Gibbs minimizer are
 
-### The E-step
+$$
+\mathcal F_i(\beta_i) = \sum_j \beta_{ij} E_{ij}
++ \tau \sum_j \beta_{ij} \log\frac{\beta_{ij}}{\pi_{ij}},
+\qquad
+\beta_{ij}^{*} = \frac{\pi_{ij}\exp(-E_{ij}/\tau)}
+{\sum_k \pi_{ik}\exp(-E_{ik}/\tau)}.
+$$
 
-Each block runs `n_e_steps` iterations of `e_step_iteration`, a natural-gradient descent
-on `F` over the belief. One iteration, with all positions updated in parallel
-(mean-field), proceeds as follows. The gauge frames define a pairwise transport operator
-`Omega_ij = exp(phi_i . G) exp(-phi_j . G)`, where `G` are the Lie-algebra generators of
-the gauge group; this is the flat Regime-I cocycle, the pure path. The transport acts on a
-belief by the GL(K) congruence (sandwich) action `mu -> Omega mu`, `Sigma -> Omega Sigma
-Omega^T`. The per-pair belief-coupling energy is the divergence of the query belief from
-each transported key belief, `E_ij = D(q_i || Omega_ij q_j)`, computed independently per
-gauge-irrep block (this is what gives the per-head energy). Attention weights are the
-softmax `beta_ij = softmax_j(log_prior_ij - E_ij / tau)` with temperature `tau = kappa *
-sqrt(d_block)`, where `d_block` is the irrep-block size; `kappa = 1` recovers the Vaswani
-`sqrt(d_k)` temperature.
+For positive prior mass on the active support, this is the unique row-wise minimizer at
+fixed beliefs, transports, energies, and prior. The relative-entropy term is part of the
+stationary softmax result; removing it changes the row problem rather than merely
+changing its presentation.
 
-The mean and covariance are then updated by a Fisher natural gradient of `F`, retracted so
-that they stay on their manifolds: the mean moves by an ordinary Euclidean step, while the
-covariance moves along the affine-invariant SPD geodesic `Sigma_new = Sigma^{1/2}
-exp(Sigma^{-1/2} (lr * dSigma) Sigma^{-1/2}) Sigma^{1/2}`, which reduces on the diagonal
-cone to `sigma_new = sigma * exp(lr * dsigma / sigma)` and is positive by construction.
-The gauge frame `phi` is updated last: its gradient genuinely requires autograd (it is
-taken through the belief-coupling block as a function of `phi`), after which it is
-preconditioned and retracted back onto the group by a Lie-algebra step. Parallel
-mean-field updates are not guaranteed monotone per iteration; free-energy descent holds as
-a direction property.
+Registry-selected scalar energies preserve this Gibbs calculation because the row
+derivation treats `E_ij` as fixed. They do not all acquire the same probabilistic
+meaning. The canonical KL construction carries the stated belief-coupling variational
+interpretation, and at `tau = 1` the ordinary mixture-KL identity applies. Replacing KL
+with another registered divergence still defines a Gibbs source-selection rule, but does
+not by itself define an ELBO or make the complete training loop optimize one variational
+free energy.
 
-### The block stack and handoff
+## Execution profiles
 
-`vfe_stack` runs `L = n_layers` blocks. After each block the converged belief is blended
-into the next block's prior, `mu_p <- (1 - rho) mu_p + rho mu_q` and `Sigma_p <- (1 -
-rho_s) Sigma_p + rho_s Sigma_q`, so that depth is realized by repeatedly re-priming the
-inference rather than by stacking distinct weight matrices. With `rho = 0` the priors are
-frozen across blocks; with `rho = 1` the belief flows fully into the next prior.
+The repository exposes an engine and several concrete profiles. They are separate
+baselines.
 
-### Decode
+| Profile | Role | Executed choices |
+|---|---|---|
+| Reusable engine | Configurable inference and training system | Finite Gaussian or Laplace belief refinement with selectable groups, transports, attention priors, update rules, block transforms, decoders, and gradient estimators. |
+| `VFE3Config()` defaults | Library construction baseline | Diagonal Gaussian, order-one Renyi/KL energy, block-GL flat phi transport, learned positional phi, one token-prior belief channel, gradient E-step, no head mixer, and an unbiased linear mean decoder. This is not the pure profile. |
+| Checked-in `train_vfe3.py` snapshot | Mutable click-to-run experiment | Wikitext-103 with `K=20`, `H=2`, `L=1`, `T=1`; diagonal order-one Renyi/KL energies; block-GL flat phi transport and learned BCH position; same-scale `s -> q` refinement; state-dependent self-coupling; detached precision and gamma prior folds; damped `mm_exact` updates; skipped `q` covariance update; zero phi E-step rate; head mixer; biased linear decode; outer cross-entropy and AdamW. |
+| Preserved pure profile | Theory-preserving configuration | Token prior, one `q` channel, flat phi cocycle, canonical attention entropy, constant self-coupling, enabled belief-covariance updates, no mixer, no detached precision prior, and KL-to-prior decode. This is the profile with no learned Q/K/V projections, MLP, or pointwise activation. |
+| Opt-in experiments | Explicit extensions and ablations | Full Gaussian or Laplace beliefs, alternate gauge groups, omega-direct frames and reflection sampling, nonflat transports, CG coupling, RoPE or T5 position, alternate decoders, randomized refinement depth, and policy scoring. |
 
-`PriorBank.decode` scores the converged belief against every vocabulary prior and returns
-`logits_{i,v} = -KL(q_i || pi_v) / tau_eff`. For the diagonal family this is computed in
-closed form by a single fused matmul, with a global mean-centering shift applied before
-the matmul to defeat the catastrophic cancellation that the Mahalanobis reconstruction
-would otherwise suffer in float32. A chunked variant computes the cross-entropy without
-ever materializing the `(B, N, V)` logit tensor, and an exact Cholesky-based kernel serves
-the full-covariance family. The decode is invoked with `kl_max = inf` so that the full KL
-ranking over the vocabulary is preserved (the training-time saturation that flattens
-distant priors would destroy the argmax).
+The checked-in row records one source snapshot, not an architectural definition. Editing
+the click-to-run dictionary changes that experiment without redefining the reusable
+engine or the preserved pure profile.
 
-### The M-step
+## End-to-end model flow
 
-Training (`vfe3/train.py`) builds an AdamW optimizer with per-group learning rates over
-the prior tables and a linear-warmup-then-cosine schedule with an optional learning-rate
-floor. Because the E-step is unrolled into the autograd graph, the cross-entropy loss
-backpropagates through the entire inference trajectory and into the prior tables; the
-mean, log-variance, and gauge-frame tables each get their own learning rate
-(`m_p_mu_lr`, `m_p_sigma_lr`, `m_phi_lr`).
+### State construction
 
-## The free energy
+`PriorBank.encode` maps token ids to a prior state `p_i` and initializes
+`q_i^(0) = p_i`. The selected belief family determines whether covariance is stored as a
+diagonal vector or a full SPD matrix. Token frames are combined with the selected
+positional construction before pair transport is evaluated.
 
-The single authoritative scalar (assembled in `vfe3/free_energy.py`) is, on the default
-path,
+### Optional model-channel refinement
 
+When the model channel is active, the model-level state `s_i` is refined against a global
+centroid `r` and gamma-weighted transported peers at the same sequence scale. The refined
+`s` state becomes the initial state and prior for the `q` channel. A detached gamma
+posterior can also be folded into the beta attention prior. When this route is disabled,
+the token prior supplies `q_i^(0)` directly.
+
+### Attention prior and belief refinement
+
+The attention-prior builder defines the active support and positional log prior. Optional
+detached precision reliability and gamma mixing modify that prior before the Gibbs row is
+formed. Each `e_step` iteration constructs transport, evaluates pair energies, computes
+Gibbs weights, and applies either a configured gradient step or a damped
+majorization-minimization update to the enabled state components. These are finite
+filtering iterations; the code does not require or assert an internal limiting state.
+
+### Stack transforms and handoff
+
+`vfe_block` runs `T = n_e_steps` iterations. Optional head mixing, Clebsch-Gordan
+coupling, and block normalization act at the configured block boundary. `vfe_stack` runs
+`L = n_layers` blocks and uses the configured mean and covariance handoff to construct
+the next block prior. With one layer, that inter-block handoff has no downstream block.
+
+### Decode and outer objective
+
+The prior-bank boundary scores a refined belief by negative KL to vocabulary priors. The
+linear boundary projects the refined mean and can add a learned vocabulary bias.
+Next-token cross-entropy is evaluated after this choice. It is a separate supervised
+objective, not an observation term inside every internal E-step and not proof that all
+inner and outer updates are coordinate descent on one scalar functional.
+
+### Optimizer routing
+
+`vfe3.train` groups every trainable parameter by role, checks optimizer coverage, and
+routes the outer gradients according to the configured unroll or estimator policy. The
+checked-in experiment uses AdamW for its active token, model-channel, frame, mixer, and
+linear-readout parameters. Other optimizer and frame-update routes remain configuration
+choices.
+
+## Geometry and mathematical scope
+
+For unrestricted Gaussian distributions and an invertible common pushforward `A`, KL
+has the exact invariance
+
+$$
+\mathrm{KL}(A_*q \mathbin{\|} A_*p) = \mathrm{KL}(q \mathbin{\|} p),
+\qquad
+\Omega_{ij}' = h_i \Omega_{ij} h_j^{-1}.
+$$
+
+The second relation is the induced transport law under independent local frame changes.
+If `q_i` and `q_j` are pushed forward by `h_i` and `h_j` while transport transforms by
+that law, the transported source in frame `i` receives the same common pushforward as
+the query. The full-Gaussian KL pair score is therefore invariant.
+
+The diagonal covariance family is not closed under a general GL(K) congruence:
+`A diag(sigma) A^T` is usually non-diagonal. The diagonal implementation consequently
+projects or approximates the ambient action outside transformations that preserve the
+diagonal cone, including monomial transformations. Exact unrestricted GL(K) invariance
+must not be assigned to the checked-in diagonal route.
+
+Flat Regime-I transport is a vertex cocycle, `Omega_ij = U_i U_j^-1`. Products around
+closed loops cancel to identity, so its loop holonomy is `H = I`. Registered nonflat
+edge transports are opt-in experiments, and their gauge guarantees depend on the
+selected construction. Nonzero holonomy is not a property of the flat click-run path.
+
+Gaussian covariance statistics carry Fisher and affine-invariant SPD geometry. That fact
+does not turn every frame metric, preconditioner, or AdamW frame update into a full-GL
+natural gradient. Frame-metric choices and nonflat connection dynamics are experimental
+implementation paths with narrower guarantees.
+
+## Registry-driven extension points
+
+The component map links each public responsibility to its source owner.
+
+| Responsibility | Source |
+|---|---|
+| Configuration, profile fields, and compatibility guards | [`vfe3/config.py`](vfe3/config.py) |
+| Belief state and distribution families | [`vfe3/belief.py`](vfe3/belief.py), [`vfe3/families/`](vfe3/families/) |
+| Pair divergences and the attention objective | [`vfe3/divergence.py`](vfe3/divergence.py), [`vfe3/free_energy.py`](vfe3/free_energy.py) |
+| Self-coupling policies | [`vfe3/alpha_i.py`](vfe3/alpha_i.py) |
+| Gauge groups, frames, transport, and retractions | [`vfe3/geometry/`](vfe3/geometry/) |
+| Iterative inference and analytic gradients | [`vfe3/inference/e_step.py`](vfe3/inference/e_step.py), [`vfe3/gradients/`](vfe3/gradients/) |
+| Model channel, blocks, stack, and forward path | [`vfe3/model/model.py`](vfe3/model/model.py), [`stack.py`](vfe3/model/stack.py), [`block.py`](vfe3/model/block.py) |
+| Encode and decode boundaries | [`vfe3/model/prior_bank.py`](vfe3/model/prior_bank.py) |
+| Outer training and optimizer coverage | [`vfe3/train.py`](vfe3/train.py) |
+| Generation and policy scoring | [`vfe3/inference/policy.py`](vfe3/inference/policy.py), [`generate_efe.py`](generate_efe.py), [`efe_ring_experiment.py`](efe_ring_experiment.py) |
+| Run persistence and provenance | [`vfe3/run_artifacts.py`](vfe3/run_artifacts.py) |
+| Numeric diagnostics | [`vfe3/metrics.py`](vfe3/metrics.py) |
+| Figure extraction and rendering | [`vfe3/viz/`](vfe3/viz/), [`make_figures.py`](make_figures.py) |
+
+Many algebraic seams are selected through registries. Some execution controls, including
+the gradient estimator, prior source, gauge parameterization, and omega retraction, use
+validated direct dispatch. The code is therefore registry-heavy rather than universally
+registry-dispatched.
+
+## Implementation status
+
+| Category | Current boundary |
+|---|---|
+| Implemented core | Prior-bank encoding, frame construction, transported pair energies, Gibbs attention, finite `q` refinement, block stacking, prior-bank and linear decoders, outer cross-entropy/AdamW training, generation, metrics, and run artifacts. |
+| Pure-profile controls | A selectable one-channel, flat-transport, constant-self-coupling, covariance-updating, KL-decoding path remains available without learned Q/K/V projections, MLPs, pointwise activations, a mixer, or detached precision weighting. |
+| Opt-in experiments | Full covariance, Laplace beliefs, alternate groups, omega-direct and reflection frames, several nonflat transports, CG coupling, alternate position and decode modes, randomized depth, policy scoring, and richer diagnostics. |
+| Partial implementations | The diagonal family projects a general GL(K) action. The same-scale model channel is live, but its `s` refinement is restricted to a diagonal Gaussian, flat model transport, and one global centroid `r`. It is not the full multiscale hierarchy. |
+| Deliberate stubs | The registered `gauge_fixed` encode seam raises instead of silently substituting another encoder. The `sigma_mc` policy ambiguity estimator also raises and has no live consumer. |
+| Interpretations | Tokens as agents, transported agreement as consensus or predictive coding, layers as inference time, and learning as symmetry breaking are readings of the computation, not additional executable mechanisms. |
+| Broader future theory | The full multiscale PIFB hierarchy, distinct model and belief timescales, validated nontrivial holonomy dynamics, and broader physical or philosophical claims remain outside the implemented transformer. |
+
+## Running the repository
+
+### Installation and data
+
+Use Python 3.10 or newer. Install the project and its development, data, and visualization
+extras from the repository root:
+
+```powershell
+python -m pip install -e ".[dev,data,viz]"
 ```
-F = sum_i [ alpha_i * D(q_i || p_i)
-          + lambda_beta * ( sum_j beta_ij E_ij  +  tau * sum_j beta_ij log(beta_ij / pi_ij) ) ]
+
+Real-corpus entrypoints are cache-only. They expect pre-tokenized `.pt` streams or
+`.bin` streams with their sidecars under `~/.cache/tokenized_cache`. The loaders do not
+download, tokenize, or replace a missing real corpus with synthetic data.
+
+### Click-to-run workflow
+
+Entrypoints do not parse command-line configuration. Edit the configuration dictionary
+near the top of the selected script, then run it directly:
+
+```powershell
+python train_vfe3.py
 ```
 
-with `E_ij = D(q_i || Omega_ij q_j)`, `beta_ij = softmax_j(log_prior - E/tau)`, and `pi =
-softmax_j(log_prior)`. The first term is the self-coupling of each belief to its prior; the
-bracket is the belief-coupling block, whose two pieces are the energy `beta E` and the
-attention-distribution entropy `tau beta log(beta/pi)`. The entropy term is not optional
-decoration: it is exactly what makes the softmax `beta` a stationary point of `F`. Without
-it the row-Lagrangian yields a delta rather than a softmax, and the canonical free energy
-and the entropy-suppressed surrogate (toggled by `include_attention_entropy`) differ in
-their gradients. At `beta*` the whole block collapses to the reduced envelope form `-tau
-log Z_i`, which the code uses on the analytic path.
+| Entrypoint | Scope |
+|---|---|
+| [`train_vfe3.py`](train_vfe3.py) | Primary cached-corpus training, evaluation, and finalization path. |
+| [`ablation.py`](ablation.py) | Named architecture and configuration ablations. |
+| [`scaling.py`](scaling.py) | Width, group, and training-budget scaling runs. |
+| [`make_figures.py`](make_figures.py) | Regenerates eligible figures from a saved run. |
+| [`generate_efe.py`](generate_efe.py) | Checkpoint-based generation and policy comparison driver. |
+| [`efe_ring_experiment.py`](efe_ring_experiment.py) | Controlled ring experiment for goal-directed policy scoring. |
 
-`F` is divergence-agnostic. The per-pair energies and self-divergences come from a
-divergence registry, so `KL` is just the Renyi divergence at order one, and a new
-f-divergence or a new covariance kernel slots in by registration. The self-coupling weight
-`alpha_i` is itself a registry choice: a constant, a closed-form state-dependent function
-of the self-divergence, or a per-coordinate variant. For the diagonal Gaussian the KL
-kernel is the familiar `0.5 [ sum_k (sigma_q/sigma_p + (mu_q - mu_p)^2/sigma_p) - K + sum_k
-log(sigma_p/sigma_q) ]`.
+### Test commands
 
-The belief family is likewise a registry. Beyond the diagonal and full-covariance
-Gaussians, the first genuinely non-Gaussian family is a factorized (diagonal) Laplace
-(`laplace_diagonal`) — exponential L1 tails rather than the Gaussian's L2, with a
-non-differentiable cusp at the mode. Because a varying-location Laplace is not a natural
-exponential family (its sufficient statistic `|x - mu|` depends on the parameter), it
-supplies a closed-form Renyi/KL divergence directly rather than going through the generic
-log-partition path; and because a rotated diagonal Laplace is not a diagonal Laplace, its
-gauge transport is distributionally exact only under a permutation/sign gauge element and
-becomes a marginal-scale projection under a general rotation — the same projection the
-diagonal Gaussian already incurs in the live pipeline, plus a shape-level break. It is the
-first family to exercise the closed-form-override seam (rather than the generic Bregman
-path), so adding a non-Gaussian belief is genuinely write-and-register.
+The project-level pytest configuration already supplies quiet output. Do not append a
+second `-q` when a visible summary is required.
 
-## Gauge theory
+Run the default CPU-oriented suite with:
 
-The geometric content lives in the gauge group acting on beliefs. A `GaugeGroup` bundles
-the Lie-algebra generators with the metadata transport needs — the irrep-block sizes, a
-skew-symmetry fast-path flag, and the families whose divergence is invariant under the
-group's representation. The admissibility condition is that the divergence be invariant
-under common pushforward by the representation, `D(rho(g) q || rho(g) p) = D(q || p)`. For
-the Gaussian family under the GL(K) congruence action this holds for every `g` in any
-subgroup of GL(K), so every registered group is admissible for the Gaussian belief.
+```powershell
+python -m pytest
+```
 
-The default group is `block_glk`, the block-diagonal `GL(d_head)^{n_heads}`: each head is
-an independent `GL(d_head)` factor, and the irrep blocks are exactly the heads. The
-registry also provides full `glk` (a single `GL(K)` block), `tied_block_glk` (one shared
-`GL(d_head)` frame across all heads, under which the optional head mixer is exactly
-equivariant), `so_k` (the orthogonal group, with the skew-symmetric fast path), and `sp`
-(the real symplectic group `Sp(2m, R)` in even dimension). Transport between two tokens is
-the flat phi-cocycle, and its triangle holonomy `Omega_ij Omega_jk Omega_ki` is the
-identity for the flat connection, which the diagnostics use as a flatness certificate —
-reported both as the Frobenius deviation `||H - I||_F` and as the gauge-invariant Wilson
-observable `Re Tr(H)/K` with a per-head trace decomposition.
+Include tests marked as slow with:
 
-## Modularity and the pure-path discipline
+```powershell
+python -m pytest --runslow
+```
 
-Every modeling seam is a named entry in a registry validated at config time: the
-divergence functional, the belief family, the gauge group, the connection regime, the
-SPD retraction, the phi preconditioner and retraction, the positional encoding, the
-attention prior, the normalization, the encode and decode kernels, and the E-step backward
-estimator. The single `VFE3Config` dataclass selects them all by name; adding a variant
-means writing and registering it, never editing a call site.
+Route device-aware tests to CUDA with:
 
-A standing project rule is that a theoretically pure path always exists under the
-appropriate toggles, and any computationally or theoretically aggressive feature is opt-in
-and default-off. The pure path is the one described above: a single belief channel `q` over
-its prior `p`, the flat Regime-I cocycle, the KL-to-prior decode, constant self-coupling,
-and a fully unrolled E-step gradient. The following are all default-off extension points,
-several of which are deliberately predictively inert or still partially wired, and should
-not be read as part of the live default model.
+```powershell
+$env:VFE3_TEST_DEVICE = "cuda"
+python -m pytest
+```
 
-The sanctioned neural-network exceptions, each a single learnable parameter rather than a
-network and each byte-identical to the pure path at initialization, are: a linear output
-projection that replaces the KL decode (`use_prior_bank=False`, the linear-decode
-ablation); a learned Schur-commutant head mixer (`use_head_mixer=True`); a learned bilinear
-edge connection for non-flat Regime-II transport (`transport_mode='regime_ii'`); and a
-learned per-bucket T5 relative-position attention bias
-(`t5_learnable_bias=True`). The Regime-II connection and the head mixer break strict gauge
-equivariance away from their zero/identity initialization, which is documented and
-user-accepted; the T5 bias, a scalar function of position offset that touches no gauge
-transport, does not, which makes it the cleanest of the exceptions.
+## Outputs and diagnostics
 
-The hierarchical channel of the manuscript — a hyper-prior `h -> s -> p -> q` with a
-model-channel belief `s` and a global centroid `r` — is only partially realized. The
-hyper-prior term `lambda_h * KL(s || r)` and the model-coupling term `lambda_gamma *
-F_red^s` exist as default-off training-loss regularizers on a second set of `s` tables, but
-the `s` channel does not feed the belief `q` (its transport is tied and detached, so it is
-predictively inert), and the full `s -> q` coupling and the `s`-channel E-step update are
-deferred.
+When a [`RunArtifacts`](vfe3/run_artifacts.py) instance is supplied, a run directory under
+`vfe3_runs/` becomes the durable record.
 
-## Conventions
+| Artifact | Contents |
+|---|---|
+| `config.json` | Full configuration plus run metadata. |
+| `metrics.csv` | Periodic training, validation, and diagnostic rows. |
+| `checkpoints/step_<N>.pt` | Resumable model, optimizer, RNG, configuration, and step state. |
+| `best_model.pt` | Semantic best-validation model bundle with configuration fingerprint. |
+| `test_results.json` | Held-out test evaluation after reloading the best checkpoint. |
+| `provenance.json` | Git, environment, and dataset provenance. |
+| `summary.json` | Headline end-of-run values and timing. |
+| `pure_path_report.json` | Configuration audit written when pure-path reporting is enabled. |
+| `research.json` and figure files | Optional research probes and diagnostic or publication-oriented plots. |
 
-The code follows a strict function-signature convention (tensors first, then typed
-scalars, then plain scalars, then optionals and `**kwargs`, with vertically aligned names,
-types, and `=` signs and tensor-shape comments at the boundaries) and uses paper notation
-for variable names (`mu_q`, `sigma_q`, `alpha`, `kappa`, `tau`). It is float32 throughout
-with CUDA where applicable, and there is no CLI argument parsing: entry points are
-click-to-run, so you edit a config dict and run. Tests are device-agnostic (CPU by
-default; set `VFE3_TEST_DEVICE=cuda` for the GPU) and include golden-equivalence checks
-against their pinned reference values, finite-difference gradient checks against the
-autograd-of-`F` oracle, and property tests for non-negativity, self-divergence-zero, and
-gauge equivariance.
+Cheap history figures are produced during finalization. Heavier replay figures obey
+`generate_figures` and can be regenerated by `make_figures.py`. Numeric artifacts remain
+available when optional visualization fails.
+
+## Repository map
+
+```text
+V3_Transformer/
+|-- vfe3/
+|   |-- families/       belief distributions and divergences
+|   |-- geometry/       groups, transports, frames, and retractions
+|   |-- gradients/      analytic and autograd refinement kernels
+|   |-- inference/      E-step and policy machinery
+|   |-- model/          PriorBank, blocks, stack, and VFEModel
+|   |-- viz/            extraction, diagnostics, and figures
+|   |-- config.py       validated configuration surface
+|   |-- free_energy.py fixed-row and scored objective components
+|   |-- train.py        optimizer and training loop
+|   '-- run_artifacts.py
+|-- tests/              regression, property, gradient, and integration tests
+|-- docs/               design, audit, experiment, and edit records
+|-- Manuscripts-Theory/ working theory manuscripts
+|-- train_vfe3.py       primary click-to-run experiment
+|-- ablation.py         ablation entrypoint
+|-- scaling.py          scaling entrypoint
+'-- pyproject.toml      package and pytest configuration
+```
+
+## Theory and manuscripts
+
+The repository contains working manuscript copies, not an authority that overrides the
+active code or every broader theoretical claim. The [GL(K) attention manuscript](<Manuscripts-Theory/GL(K)_attention.tex>)
+develops the principal attention and gauge construction, while its
+[supplement](<Manuscripts-Theory/GL(K)_supplementary.tex>) records supporting derivations
+and scope. The [PIFB manuscript](<Manuscripts-Theory/PIFB.tex>) is a broader companion
+framework; its full multiscale program is not implemented by this repository.
+
+For implementation intent and review history, use the source-linked code map above and
+the records under [`docs/`](docs/). Where a manuscript interpretation and an executable
+profile differ, the checked-in configuration and runtime path determine what the program
+actually computes.
