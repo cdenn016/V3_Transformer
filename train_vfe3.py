@@ -218,7 +218,7 @@ config = dict(
     #                Self Energy:  
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "state_dependent",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
     lambda_h_mode              = "constant",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h)
     
     b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
@@ -226,7 +226,7 @@ config = dict(
        
     lambda_alpha               = 1,          # constant self-coupling value
     lambda_h                   = 0.25,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
-    #lambda h ~0.25/6 = 0.04 for K=160 d=20
+    
     
     b0_h                       = 1.0,        # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
     c0_h                       = 1.0,        # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h
@@ -263,7 +263,7 @@ config = dict(
 
     t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
 
-    precision_weighted_attention = True,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
+    precision_weighted_attention = False,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
                                                  # into the attention prior (diagnostic; OFF = position-only prior)
     precision_attention_b0       = 2.0,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
     precision_attention_per_head = False,        # per-key reliability PER HEAD (trace over each block's coords) vs
@@ -297,13 +297,14 @@ config = dict(
     #        Learning Rates
     #################################
         
-    m_p_mu_lr                 = 0.0125,   
+    m_p_mu_lr                 = 0.0125,     #0.013
     m_p_sigma_lr              = 0.01,     
     m_phi_lr                  = 0.010,   
+    
     m_s_phi_lr                = 0.016,         # M-step LR for independent model-channel frame (phi_tilde)
     
     weight_decay              = 0.02,
-    phi_weight_decay          = 0.05,
+    phi_weight_decay          = 0.035, #0.035
     
     min_lr                    = 0,       # absolute cosine-decay LR floor (0.0 = pure cosine)
     min_lr_frac               = 0.01,    # proportional LR floor, max(min_lr, frac*base); OFF
@@ -337,7 +338,7 @@ config = dict(
     eval_interval             = 1500,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
 
-    generate_figures          = True,     # OFF: skip the heavy-compute figure set at finalize_run (UMAP
+    generate_figures          = False,     # OFF: skip the heavy-compute figure set at finalize_run (UMAP
                                            # belief-category triptych, model/belief UMAP, belief bank, E-step
                                            # replay, holonomy sampling) + the per-eval attention/gamma heatmaps.
                                            # True re-enables; make_figures.py re-runs them for a trained run.
@@ -375,7 +376,7 @@ config = dict(
     # log N(mu_q; mu_v, Sigma_q + Sigma_v) - select it above under use_prior_bank=True.
     untie_decode_bank         = False,       # use_prior_bank=True only: decode reads its OWN cloned (V,K) tables
     z_loss_weight             = 0,           # z-loss on the decode partition: w * mean(logsumexp^2) (0 = OFF)
-    sigma_weight_decay        = None,        # AdamW decay for log-variance tables (None = inherit weight_decay;
+    sigma_weight_decay        = None,           # AdamW decay for log-variance tables (None = inherit weight_decay;
                                              # 0.0 exempts sigma from the unintended log-sigma->0 pull)
 
     # --- attention / coupling ---
@@ -397,7 +398,9 @@ config = dict(
                                              # for linear-decode configs; user asserts sigma has no consumer)
 
     # --- compute reclamation (exactness-preserving perf; default OFF) ---
-    transport_mean_per_head   = False,       # per-head transport_mean einsum (~n_heads x fewer FLOPs, allclose 1e-6)
+    compact_phi_block_transport  = True,
+    reuse_pairwise_kl_stats   = True,
+    transport_mean_per_head   = True,       # per-head transport_mean einsum (~n_heads x fewer FLOPs, allclose 1e-6)
     exp_fp64_mode             = "dim",       # "dim" (long-standing: fp64 when block dim >= 20) | "norm" (fp64 only
                                              # when clamped ||M||_F >= exp_fp64_norm_threshold; d_head=25 blocks
                                              # currently run fp64 PERMANENTLY under "dim")
