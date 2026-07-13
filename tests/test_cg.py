@@ -179,6 +179,32 @@ def test_cg_forward_moments_jacobian_matches_autograd():
     assert torch.allclose(res.jacobian, J_auto, atol=1e-10, rtol=0.0)
 
 
+def test_cg_forward_moments_jacobian_matches_autograd_multipath():
+    r"""Multi-path [l0, l1] tower (K=4): three live paths -- the (l0,l0,l0) and (l1,l1,l0)
+    self-pairs plus the (l0,l1,l1) distinct-source pair -- so the OFF-diagonal (target != source)
+    Jacobian blocks and the self-pair double contraction are all exercised, not just the single
+    l2 self-pair block above."""
+    from vfe3.model.cg_coupling import CGCoupling
+    from vfe3.geometry.groups import get_group
+    grp = get_group("so_n")(4, group_n=3, irrep_spec=[("l0", 1), ("l1", 1)],
+                            dtype=torch.float64)
+    cpl = CGCoupling(3, "so", grp.irrep_dims, grp.irrep_labels).double()
+    assert len(cpl.paths) >= 3                                   # multi-path, multi-group tower
+    torch.manual_seed(2)
+    with torch.no_grad():
+        cpl.path_weights.copy_(0.7 * torch.randn(cpl.path_weights.shape[0],
+                                                 dtype=torch.float64))
+    mu = torch.randn(4, dtype=torch.float64)
+    sigma = torch.rand(4, dtype=torch.float64) + 0.1
+
+    def f(m):
+        return cpl.forward_moments(m, sigma).mu
+
+    res = cpl.forward_moments(mu, sigma)
+    J_auto = torch.autograd.functional.jacobian(f, mu)
+    assert torch.allclose(res.jacobian, J_auto, atol=1e-10, rtol=0.0)
+
+
 def test_cg_forward_moments_delta_covariance_is_J_sigma_JT_spd():
     cpl, _ = _l2_coupling(mode="delta_full", weight=0.5)
     sigma = _sym_spd(5)

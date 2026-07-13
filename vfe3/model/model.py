@@ -313,7 +313,8 @@ class VFEModel(nn.Module):
                 cg_covariance_mode=cfg.cg_covariance_mode)
         else:
             self.cg_coupling = None
-        if (cfg.use_head_mixer or cfg.use_cg_coupling) \
+        if (cfg.use_head_mixer
+                or (cfg.use_cg_coupling and cfg.cg_energy_weight == 0.0)) \
                 and cfg.effective_e_step_gradient == "detach":
             # Footgun (mirrors connection_W / pos_phi_free above and below): the
             # mixer and the CG coupling are applied INSIDE the vfe_stack call, which the
@@ -324,14 +325,20 @@ class VFEModel(nn.Module):
             # never adapt (audit 2026-06-09 overnight F31, challenge-upheld). Gate on the
             # EFFECTIVE estimator so both the detach_e_step bool and the
             # e_step_gradient='detach' string route warn; 'unroll' and 'straight_through'
-            # run the stack grad-enabled and train them.
+            # run the stack grad-enabled and train them. EXCEPTION (PB-13): with
+            # cg_energy_weight>0 the post-stack torch.enable_grad re-evaluation trains
+            # path_weights through the CG moment energy even under detach (the mean->CE path
+            # stays detached), so the 'frozen at zero init' claim is false there and the CG
+            # clause is gated off; the head mixer has no such side channel and always warns.
             import warnings
             warnings.warn(
                 "use_head_mixer/use_cg_coupling with the effective E-step estimator 'detach' "
                 "freezes mixer_deltas/path_weights: both modules are applied inside the "
                 "no_grad-wrapped vfe_stack, so they receive NO gradient and stay at their "
                 "identity/zero init. Use an 'unroll' E-step (detach_e_step=False, "
-                "e_step_gradient='unroll') or 'straight_through' to train them.",
+                "e_step_gradient='unroll') or 'straight_through' to train them (or, for the "
+                "CG coupling alone, cg_energy_weight>0, whose detached-mode re-evaluation "
+                "trains path_weights).",
                 stacklevel=2,
             )
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): the LEARNED bilinear edge connection

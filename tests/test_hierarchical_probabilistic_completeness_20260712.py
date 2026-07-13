@@ -1023,6 +1023,24 @@ def test_cg_energy_two_layers_ordered_capture_and_layer_mean(monkeypatch):
     assert diag["cg_moment_energy"] == pytest.approx(2.0)               # mean_layers(mean_tokens) = mean(1, 3)
 
 
+# --- the detach freeze warning is accurate under the energy re-evaluation -------------------
+
+def test_detach_freeze_warning_gated_off_when_cg_energy_trains_path_weights():
+    r"""Under detach, cg_energy_weight>0 trains path_weights through the post-stack enable_grad
+    re-evaluation, so the 'frozen at zero init' warning would be false -- it must NOT fire. At
+    weight 0 the CG module genuinely freezes and the warning stays (pinned separately by
+    test_audit_fixes_2026_06_10::test_detach_with_mixer_or_cg_warns)."""
+    from vfe3.model.model import VFEModel
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        VFEModel(_cg_cfg("detach", cg_energy_weight=0.5))
+    assert not any("freezes mixer_deltas" in str(w.message) for w in rec)
+    with warnings.catch_warnings(record=True) as rec0:
+        warnings.simplefilter("always")
+        VFEModel(_cg_cfg("detach", cg_energy_weight=0.0))
+    assert any("freezes mixer_deltas" in str(w.message) for w in rec0)
+
+
 # --- construction guards --------------------------------------------------------------------
 
 def test_cg_energy_weight_requires_coupling():
