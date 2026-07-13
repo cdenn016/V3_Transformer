@@ -32,6 +32,8 @@ def test_shared_contracts_pin_only_the_cited_mutable_dict_schemas() -> None:
             "prior": BeliefState,
             "out": BeliefState,
             "beta_prior_context": contracts.EffectiveBetaPriorContext,
+            "cg_moment_energy_rows": List[torch.Tensor],
+            "cg_pre_moments": List[Tuple[torch.Tensor, torch.Tensor]],
         },
         contracts.EStepGradientRecord: {
             "mu": torch.Tensor,

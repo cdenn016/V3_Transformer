@@ -190,6 +190,21 @@ class VFE3Config:
     # default-off): learned scalar path weights, zero-init (step 0 byte-identical).
     use_cg_coupling:           bool  = False
 
+    # CG covariance pushforward mode (opt-in; default 'passthrough' = the means-only phase, sigma
+    # untouched). 'delta_full' applies the delta-method Gaussian moment closure sigma_out =
+    # sym(J Sigma J^T), with J the exact analytic Jacobian of the bilinear CG map at the current
+    # mean -- a FIRST-ORDER pushforward, NOT an exact distributional image. It requires a
+    # full-covariance Gaussian family (family='gaussian_full') because J Sigma J^T is dense; the
+    # means-only 'passthrough' is the pure default. Validated below.
+    cg_covariance_mode:        str   = "passthrough"     # "passthrough" | "delta_full"
+
+    # CG moment-energy regularizer weight (opt-in; default 0.0 = off, everything untouched). When
+    # > 0 the outer objective adds ONCE cg_energy_weight * mean_layers(mean_tokens(D(q_post||q_pre))),
+    # the post-CG moment divergence of the belief against its pre-CG value -- a q-only regularizer
+    # that never reweights the canonical q/p/s/h hierarchy. Requires use_cg_coupling=True (validated
+    # below).
+    cg_energy_weight:          float = 0.0
+
     # BCH positional encoding (default "learned"): a per-position Lie-algebra element pos_phi_i
     # composed into the token gauge frame via compose_phi BEFORE transport. "learned" owns a model
     # parameter table (max_seq_len, n_gen); "frozen" is the parameter-free i*pos_phi_scale on one
@@ -996,6 +1011,31 @@ class VFE3Config:
             raise ValueError(
                 f"use_cg_coupling requires an irrep-labeled tower group ('so_n'/'sp_n'); got "
                 f"gauge_group={self.gauge_group!r}"
+            )
+        # CG moment-closure (PB-13). The pushforward mode is a two-value key; 'delta_full' needs a
+        # full-covariance Gaussian family (the dense J Sigma J^T cannot be stored diagonally, and the
+        # first-order moment closure is Gaussian). The q-only moment regularizer weight must be a
+        # finite non-negative scalar, and any positive weight needs the CG coupling live (it reads the
+        # coupling's per-layer pushforward). At weight 0 with 'passthrough' every check is inert.
+        if self.cg_covariance_mode not in ("passthrough", "delta_full"):
+            raise ValueError(
+                f"cg_covariance_mode must be 'passthrough' or 'delta_full'; got "
+                f"{self.cg_covariance_mode!r}"
+            )
+        if self.cg_covariance_mode == "delta_full" and self.family != "gaussian_full":
+            raise ValueError(
+                f"cg_covariance_mode='delta_full' needs a full-covariance Gaussian family "
+                f"(family='gaussian_full'); the delta-method J Sigma J^T is dense and a "
+                f"diagonal/non-Gaussian family cannot carry it (got family={self.family!r})."
+            )
+        if not math.isfinite(self.cg_energy_weight) or self.cg_energy_weight < 0.0:
+            raise ValueError(
+                f"cg_energy_weight must be finite and >= 0; got {self.cg_energy_weight!r}"
+            )
+        if self.cg_energy_weight > 0.0 and not self.use_cg_coupling:
+            raise ValueError(
+                f"cg_energy_weight={self.cg_energy_weight} > 0 requires use_cg_coupling=True "
+                f"(the moment-energy regularizer reads the CG coupling's per-layer pushforward)."
             )
         # The head mixer needs >= 2 gauge blocks to mix (audit 2026-06-09 overnight PP1). Two
         # single-block cases, handled differently:

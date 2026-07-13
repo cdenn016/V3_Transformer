@@ -1,6 +1,6 @@
 """Shared type contracts for mutable runtime dictionaries."""
 
-from typing import NamedTuple, Optional, Tuple, TypedDict
+from typing import List, NamedTuple, Optional, Tuple, TypedDict
 
 import torch
 
@@ -66,6 +66,13 @@ class MStepCapture(TypedDict, total=False):
     prior:              BeliefState
     out:                BeliefState
     beta_prior_context: EffectiveBetaPriorContext
+    # CG moment-energy participation (PB-13). Present ONLY when cfg.cg_energy_weight>0. Attached
+    # E-step estimators append the per-layer D(q_post||q_pre) rows to ``cg_moment_energy_rows``; the
+    # 'detach' estimator instead appends the detached pre-CG (mu, sigma) pairs to ``cg_pre_moments``
+    # for the post-stack ``torch.enable_grad`` re-evaluation. A capture allocated only for M-step
+    # self-coupling never carries either key.
+    cg_moment_energy_rows: List[torch.Tensor]
+    cg_pre_moments:        List[Tuple[torch.Tensor, torch.Tensor]]
 
 
 class EStepGradientRecord(TypedDict, total=False):

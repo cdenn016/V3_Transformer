@@ -309,7 +309,8 @@ class VFEModel(nn.Module):
             from vfe3.model.cg_coupling import CGCoupling
             self.cg_coupling = CGCoupling(
                 cfg.group_n, self.group.algebra,
-                self.group.irrep_dims, self.group.irrep_labels)
+                self.group.irrep_dims, self.group.irrep_labels,
+                cg_covariance_mode=cfg.cg_covariance_mode)
         else:
             self.cg_coupling = None
         if (cfg.use_head_mixer or cfg.use_cg_coupling) \
@@ -1455,8 +1456,15 @@ class VFEModel(nn.Module):
         # with the converged q*, the live final-block prior, the encode-time prior, and the raw
         # pre-final_norm stack output.
         cap: Optional[MStepCapture] = (
-            {} if self.cfg.mstep_self_coupling_weight > 0.0 else None
+            {} if (self.cfg.mstep_self_coupling_weight > 0.0
+                   or self.cfg.cg_energy_weight > 0.0) else None
         )
+        if cap is not None and self.cfg.cg_energy_weight > 0.0:
+            # Initialize the CG moment-energy lists ONLY when the regularizer is on. A capture
+            # allocated solely for M-step self-coupling leaves these keys absent, so vfe_block never
+            # appends to (or stacks) a CG list (PB-13).
+            cap["cg_moment_energy_rows"] = []
+            cap["cg_pre_moments"] = []
         belief, _ = self.forward_beliefs(token_ids, return_logits=False,
                                          capture=cap, estep_grad_out=estep_grad_out)
         mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm; sigma = out.sigma
@@ -1663,6 +1671,45 @@ class VFEModel(nn.Module):
                 zeros, zeros, zeros, zeros,
                 hyper_prior_rows, model_coupling_rows, meta_entropy_rows, zeros,
                 q_reduction="sum", model_reduction="mean").total
+        if self.cfg.cg_energy_weight > 0.0:
+            # CG MOMENT-ENERGY REGULARIZER (PB-13): a q-only term added to the outer objective ONCE,
+            # NEVER routed through hierarchical_free_energy_terms and never reweighting the canonical
+            # q/p/s/h total. Under an attached E-step estimator each block already appended its
+            # grad-connected D(q_post||q_pre) rows; under the 'detach' estimator the blocks stashed the
+            # detached pre-CG moments, and the shared CGCoupling.forward_moments is re-evaluated here
+            # under torch.enable_grad from each fixed pair -- detached from belief inference but
+            # attached to path_weights. The token-then-layer mean (each row.mean() over tokens, then
+            # mean over layers) is weighted and added; the per-layer values and the assembled
+            # objective_total_with_cg are reported on the diagnostic side channel only.
+            from vfe3.model.cg_coupling import cg_moment_energy_rows
+            cfg = self.cfg
+            if cfg.effective_e_step_gradient == "detach":
+                per_layer_rows = []
+                with torch.enable_grad():
+                    for pre_mu, pre_sigma in cap["cg_pre_moments"]:
+                        res = self.cg_coupling.forward_moments(pre_mu, pre_sigma)
+                        per_layer_rows.append(cg_moment_energy_rows(
+                            pre_mu, pre_sigma, res.mu, res.sigma,
+                            renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                            family=cfg.family, divergence_family=cfg.divergence_family))
+            else:
+                per_layer_rows = cap["cg_moment_energy_rows"]
+            if (len(per_layer_rows) != cfg.n_layers
+                    or any(r.numel() == 0 for r in per_layer_rows)):
+                raise RuntimeError(
+                    f"cg_energy_weight>0 requires exactly n_layers={cfg.n_layers} nonempty CG "
+                    f"moment-energy row tensors; got {len(per_layer_rows)} "
+                    f"({[tuple(r.shape) for r in per_layer_rows]}). An empty capture must never "
+                    f"reach torch.stack."
+                )
+            layer_means = torch.stack([rows.mean() for rows in per_layer_rows])   # (n_layers,)
+            cg_moment_energy = layer_means.mean()
+            loss = loss + cfg.cg_energy_weight * cg_moment_energy
+            self._cg_energy_diagnostics = {
+                "cg_moment_energy":        float(cg_moment_energy.detach()),
+                "cg_moment_energy_layers": [float(v.detach()) for v in layer_means],
+                "objective_total_with_cg": float(loss.detach()),
+            }
         return logits, loss, ce.detach()
 
     @property

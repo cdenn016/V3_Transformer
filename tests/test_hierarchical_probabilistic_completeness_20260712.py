@@ -846,3 +846,202 @@ def test_nonflat_model_channel_constructs_without_flat_island_warning():
         flat_island = [w for w in caught
                        if "FLAT phi-cocycle" in str(w.message) or "no non-flat transport law" in str(w.message)]
         assert not flat_island, f"{tm} still warns the model channel is a flat island: {[str(w.message) for w in flat_island]}"
+
+
+# ===========================================================================
+# PB-13 (Task 4, 2026-07-12): probabilistic CG moment closure + q-only moment
+# regularizer. The CG coupling now exposes an exact analytic Jacobian and a
+# delta-method covariance pushforward; cg_energy_weight>0 adds
+# cg_energy_weight * mean_layers(mean_tokens(D(q_post||q_pre))) to the outer
+# objective EXACTLY ONCE, leaving the canonical q/p/s/h hierarchy total untouched.
+# ===========================================================================
+
+import warnings                                                              # noqa: E402
+
+
+def _cg_cfg(grad_mode="unroll", cg_energy_weight=0.0, **kw):
+    from vfe3.config import VFE3Config
+    base = dict(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1,
+                n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
+                gauge_group="so_n", group_n=3, irrep_spec=[("l0", 1), ("l1", 1)],
+                phi_precond_mode="none", use_cg_coupling=True,
+                cg_energy_weight=cg_energy_weight, e_step_gradient=grad_mode)
+    base.update(kw)
+    return VFE3Config(**base)
+
+
+def _cg_model(grad_mode="unroll", cg_energy_weight=0.0, weight_shift=0.3, **kw):
+    from vfe3.model.model import VFEModel
+    torch.manual_seed(0)
+    with warnings.catch_warnings():                              # use_cg_coupling + detach warns; not under test here
+        warnings.simplefilter("ignore")
+        m = VFEModel(_cg_cfg(grad_mode, cg_energy_weight, **kw))
+    torch.manual_seed(5)
+    with torch.no_grad():                                        # non-degenerate beliefs -> a sizable CG delta
+        m.prior_bank.mu_embed.normal_(0.0, 0.6)
+        m.prior_bank.phi_embed.normal_(0.0, 0.2)
+        if weight_shift is not None:
+            m.cg_coupling.path_weights.add_(weight_shift)        # nonzero CG paths
+    return m
+
+
+def _cg_tokens():
+    torch.manual_seed(1)
+    return torch.randint(0, 8, (2, 6)), torch.randint(0, 8, (2, 6))
+
+
+# --- the moment-energy rows equal a direct active-family divergence oracle ------------------
+
+def test_cg_moment_energy_rows_match_divergence_oracle():
+    from vfe3.model.cg_coupling import CGCoupling, cg_moment_energy_rows
+    from vfe3.families.base import get_family
+    from vfe3.free_energy import self_divergence
+    from vfe3.geometry.groups import get_group
+
+    grp = get_group("so_n")(4, group_n=3, irrep_spec=[("l0", 1), ("l1", 1)], dtype=torch.float64)
+    cpl = CGCoupling(3, "so", grp.irrep_dims, grp.irrep_labels).double()
+    with torch.no_grad():
+        cpl.path_weights.copy_(0.3 * torch.randn(cpl.path_weights.shape[0], dtype=torch.float64))
+    mu = torch.randn(2, 5, 4, dtype=torch.float64)
+    sigma = torch.rand(2, 5, 4, dtype=torch.float64) + 0.1               # diagonal
+    res = cpl.forward_moments(mu, sigma)                                 # passthrough -> post_sigma == sigma
+    rows = cg_moment_energy_rows(mu, sigma, res.mu, res.sigma,
+                                 renyi_order=1.0, family="gaussian_diagonal",
+                                 divergence_family="renyi")
+    fam = get_family("gaussian_diagonal")
+    oracle = self_divergence(fam(res.mu, res.sigma), fam(mu, sigma),
+                             alpha=1.0, divergence_family="renyi")
+    assert rows.shape == (2, 5)
+    assert torch.allclose(rows, oracle, atol=1e-12, rtol=0.0)
+
+
+# --- the outer loss and path_weights gradient change with the energy, both estimators -------
+
+@pytest.mark.parametrize("grad_mode", ["unroll", "detach"])
+def test_cg_energy_changes_loss_and_path_weight_grad(grad_mode):
+    tok, tgt = _cg_tokens()
+    m_w = _cg_model(grad_mode, cg_energy_weight=0.5)
+    m_0 = _cg_model(grad_mode, cg_energy_weight=0.0)                     # same seed + same weight_shift
+    _, loss_w, _ = m_w(tok, tgt)
+    _, loss_0, _ = m_0(tok, tgt)
+    assert not torch.allclose(loss_w, loss_0)                           # energy term moved the objective
+    loss_w.backward()
+    loss_0.backward()
+    g_w = m_w.cg_coupling.path_weights.grad
+    assert g_w is not None and torch.isfinite(g_w).all() and float(g_w.abs().sum()) > 0.0
+    g_0 = m_0.cg_coupling.path_weights.grad
+    if grad_mode == "detach":
+        # without the energy, detach wraps the CG mean coupling in no_grad -> path_weights frozen.
+        assert g_0 is None or float(g_0.abs().sum()) == 0.0
+    else:
+        assert g_0 is not None and not torch.allclose(g_w, g_0)
+
+
+def test_cg_energy_is_added_exactly_once():
+    r"""loss(weight>0) - weight * cg_moment_energy == loss(weight=0): the regularizer enters once."""
+    tok, tgt = _cg_tokens()
+    m_w = _cg_model("unroll", cg_energy_weight=0.5)
+    m_0 = _cg_model("unroll", cg_energy_weight=0.0)
+    _, loss_w, _ = m_w(tok, tgt)
+    _, loss_0, _ = m_0(tok, tgt)
+    diag = m_w._cg_energy_diagnostics
+    recovered = loss_w - m_w.cfg.cg_energy_weight * diag["cg_moment_energy"]
+    assert torch.allclose(recovered, loss_0, atol=1e-6)
+    assert diag["objective_total_with_cg"] == pytest.approx(float(loss_w.detach()))
+
+
+def test_cg_energy_weight_zero_is_exactly_pre_change_loss():
+    r"""cg_energy_weight=0 leaves the objective byte-identical across two identical builds AND never
+    populates the diagnostic side channel."""
+    tok, tgt = _cg_tokens()
+    m_a = _cg_model("unroll", cg_energy_weight=0.0)
+    m_b = _cg_model("unroll", cg_energy_weight=0.0)
+    _, la, _ = m_a(tok, tgt)
+    _, lb, _ = m_b(tok, tgt)
+    assert torch.equal(la, lb)
+    assert not hasattr(m_a, "_cg_energy_diagnostics")
+
+
+# --- an M-step-only capture never reads or stacks a CG list ---------------------------------
+
+def test_mstep_capture_without_cg_energy_never_touches_cg_lists():
+    from vfe3.model.model import VFEModel
+    torch.manual_seed(0)
+    cfg = _cg_cfg("unroll", cg_energy_weight=0.0, use_cg_coupling=False,
+                  mstep_self_coupling_weight=0.5)
+    m = VFEModel(cfg)
+    tok, tgt = _cg_tokens()
+    _, loss, _ = m(tok, tgt)                                            # must not raise (no empty stack / missing key)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert not hasattr(m, "_cg_energy_diagnostics")
+
+
+# --- the q-only regularizer cannot reweight the independent hyper-prior (h/s) block ---------
+
+def test_cg_energy_cannot_reweight_hyper_prior_block():
+    tok, tgt = _cg_tokens()
+    kw = dict(prior_source="token", s_e_step=False, lambda_h=0.25)
+    m_0 = _cg_model("unroll", cg_energy_weight=0.0, **kw)
+    m_1 = _cg_model("unroll", cg_energy_weight=0.5, **kw)
+    torch.manual_seed(7)
+    for m in (m_0, m_1):
+        with torch.no_grad():                                          # identical non-degenerate s/r tables
+            torch.manual_seed(7)
+            m.prior_bank.s_mu_embed.normal_(0.0, 0.5)
+            torch.manual_seed(8)
+            m.prior_bank.s_sigma_log_embed.normal_(0.0, 0.3)
+    _, l0, _ = m_0(tok, tgt)
+    _, l1, _ = m_1(tok, tgt)
+    l0.backward()
+    l1.backward()
+    # the CG moment energy is q-only: it can touch NEITHER the s tables NOR the global r centroid.
+    assert torch.equal(m_0.prior_bank.s_mu_embed.grad, m_1.prior_bank.s_mu_embed.grad)
+    assert torch.equal(m_0.prior_bank.s_sigma_log_embed.grad, m_1.prior_bank.s_sigma_log_embed.grad)
+
+
+# --- two layers: ordered per-layer captures and the token-then-layer mean -------------------
+
+def test_cg_energy_two_layers_ordered_capture_and_layer_mean(monkeypatch):
+    m = _cg_model("unroll", cg_energy_weight=0.5, n_layers=2)
+    tok, tgt = _cg_tokens()
+
+    seen = {"n": 0}
+
+    def spy(pre_mu, pre_sigma, post_mu, post_sigma, **kw):
+        val = 1.0 if seen["n"] == 0 else 3.0                            # layer-indexed constant rows
+        seen["n"] += 1
+        return pre_mu.new_full(pre_mu.shape[:-1], val)                  # (..., N)
+
+    monkeypatch.setattr("vfe3.model.block.cg_moment_energy_rows", spy)
+    _, loss, _ = m(tok, tgt)
+    diag = m._cg_energy_diagnostics
+    assert seen["n"] == 2                                               # both applications ran, none omitted
+    assert len(diag["cg_moment_energy_layers"]) == 2
+    assert diag["cg_moment_energy_layers"][0] == pytest.approx(1.0)     # ordered
+    assert diag["cg_moment_energy_layers"][1] == pytest.approx(3.0)
+    assert diag["cg_moment_energy"] == pytest.approx(2.0)               # mean_layers(mean_tokens) = mean(1, 3)
+
+
+# --- construction guards --------------------------------------------------------------------
+
+def test_cg_energy_weight_requires_coupling():
+    with pytest.raises(ValueError, match="use_cg_coupling"):
+        _cg_cfg("unroll", cg_energy_weight=0.5, use_cg_coupling=False)
+
+
+def test_negative_or_nonfinite_cg_energy_weight_rejected():
+    with pytest.raises(ValueError, match="cg_energy_weight"):
+        _cg_cfg("unroll", cg_energy_weight=-1.0)
+    with pytest.raises(ValueError, match="cg_energy_weight"):
+        _cg_cfg("unroll", cg_energy_weight=float("nan"))
+
+
+def test_delta_full_requires_gaussian_full():
+    with pytest.raises(ValueError, match="delta_full"):
+        _cg_cfg("unroll", cg_covariance_mode="delta_full", family="gaussian_diagonal")
+
+
+def test_cg_covariance_mode_validated():
+    with pytest.raises(ValueError, match="cg_covariance_mode"):
+        _cg_cfg("unroll", cg_covariance_mode="bogus")

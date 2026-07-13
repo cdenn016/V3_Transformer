@@ -17,6 +17,7 @@ from vfe3.contracts import EStepGradientRecord, MStepCapture
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.free_energy import attention_tau
 from vfe3.inference.e_step import e_step
+from vfe3.model.cg_coupling import cg_moment_energy_rows
 
 
 def _as_coeff(v: 'float | list | tuple', device: torch.device) -> 'float | torch.Tensor':
@@ -155,8 +156,30 @@ def vfe_block(
         mu_mixed, sigma_mixed = head_mixer(out.mu, out.sigma)   # so the mixed belief feeds norm + handoff
         out = out._replace(mu=mu_mixed, sigma=sigma_mixed)   # (per-block apply order); _replace preserves phi/omega/reflection
     if cg_coupling is not None:              # opt-in CG cross-type coupling: after mixing, before norm
-        mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)
-        out = out._replace(mu=mu_cg, sigma=sigma_cg)   # _replace preserves phi/omega/reflection
+        # CG moment-energy participation (PB-13): the CG lists live in ``capture`` ONLY when
+        # cfg.cg_energy_weight>0, so their presence is the sole trigger. A capture allocated only for
+        # M-step self-coupling (no lists) or a captureless scorer/diagnostics call falls to the plain
+        # mean update below and never reads a CG list.
+        if capture is not None and "cg_moment_energy_rows" in capture:
+            pre_mu, pre_sigma = out.mu, out.sigma
+            if e_step_gradient == "detach":
+                # The block runs under the caller's no_grad; stash the DETACHED pre-CG moments for the
+                # post-stack torch.enable_grad re-evaluation, and apply the plain (mode-selected) mean
+                # coupling for the forward value.
+                capture["cg_pre_moments"].append((pre_mu.detach(), pre_sigma.detach()))
+                mu_cg, sigma_cg = cg_coupling(pre_mu, pre_sigma)
+                out = out._replace(mu=mu_cg, sigma=sigma_cg)
+            else:
+                # Attached estimator: the moment result AND its D(q_post||q_pre) rows are grad-connected.
+                res = cg_coupling.forward_moments(pre_mu, pre_sigma)
+                capture["cg_moment_energy_rows"].append(cg_moment_energy_rows(
+                    pre_mu, pre_sigma, res.mu, res.sigma,
+                    renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                    family=cfg.family, divergence_family=cfg.divergence_family))
+                out = out._replace(mu=res.mu, sigma=res.sigma)
+        else:
+            mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)
+            out = out._replace(mu=mu_cg, sigma=sigma_cg)   # _replace preserves phi/omega/reflection
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         out = out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/omega/reflection
     return out
