@@ -265,11 +265,18 @@ config = dict(
     
     e_q_mu_lr                 = 0.9,
     e_q_sigma_lr              = 0.001,
-    e_phi_lr                  = 0.00,     
-    
+    e_phi_lr                  = 0.00,
+
+    #################################
+    #      Training Mechanics
+    #################################
+
+    grad_clip                 = 1.0,         # gradient clip: global L2 norm unless grad_clip_per_role; None/0.0 disables
+    grad_clip_per_role        = False,       # baseline: one global-norm clip (train_vfe3.py's ablation default is True)
+
     skip_belief_sigma_update  = True,
     share_refine_s_transport  = True,
-    
+
     ####################################
     #       Model E-step LR's
     #      If s_e_step = True
@@ -763,6 +770,7 @@ def run_cell(
     test_tpc = _tokens_per_char(dataset, "test") or 1.0
     t0 = time.perf_counter()
     losses = train(model, train_loader, cfg, n_steps=cfg.max_steps,
+                   grad_clip=cfg.grad_clip,
                    log_interval=cfg.log_interval, eval_interval=cfg.eval_interval,
                    val_loader=val_loader, tokens_per_char=val_tpc, device=device,
                    logger=logger, artifacts=artifacts, generate_samples=False)

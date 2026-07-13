@@ -416,6 +416,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     # self-edge attention sink (diagonal -inf except (0,0)).
 
     # --- training mechanics ---
+    grad_clip                 = 1.0,         # gradient clip: global L2 norm unless grad_clip_per_role; None/0.0 disables
     grad_clip_per_role        = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
                                              # (global is phi-dominated and silently rescales other roles)
     skip_belief_sigma_update  = True,        # skip the belief-channel sigma E-step update (dead-compute ablation
@@ -1812,6 +1813,7 @@ def run_single(
     train(
         model, train_loader, cfg,
         n_steps=cfg.max_steps,
+        grad_clip=cfg.grad_clip,
         log_interval=cfg.log_interval,
         eval_interval=cfg.eval_interval,
         val_loader=val_loader,

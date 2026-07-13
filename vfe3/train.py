@@ -1598,6 +1598,7 @@ def run_training(
     losses = train(
         model, loader, cfg,
         n_steps=n_steps,
+        grad_clip=cfg.grad_clip,
         log_interval=cfg.log_interval,
         eval_interval=cfg.eval_interval,
         val_loader=loader,
