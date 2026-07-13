@@ -411,6 +411,10 @@ def test_generate_efe_builds_both_arms_before_pairing_cpu_and_cuda_rng(monkeypat
         "policy_top_k":       8,
         "policy_precision":   1.0,
         "policy_horizon":     1,
+        "policy_ambiguity_mode":            "likelihood_entropy",   # Task 5: newly exposed _POLICY_FIELDS
+        "policy_sigma_mc_samples":          16,
+        "policy_sigma_ambiguity_validated": False,
+        "policy_sigma_gate_artifact":       None,
         "max_new_tokens":     1,
         "greedy":             False,
     }

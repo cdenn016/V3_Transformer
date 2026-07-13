@@ -21,6 +21,12 @@ WHAT THIS CAN AND CANNOT DO ON WIKITEXT (read before expecting a win):
     cache-supported checkpoint config (vfe3/inference/belief_cache.py::cache_supported) and
     policy_horizon>1; on an unsupported config the scorer fails closed rather than paying the dishonest
     full recompute. This script supports policy_mode in {none, efe_one_step, logprob_control, efe_rollout}.
+  * policy_ambiguity_mode selects the EFE ambiguity estimator (registry key, exposed in CONFIG below).
+    The default 'likelihood_entropy' is the sigma-free arm actually used in production. 'sigma_mc' has
+    an executable antithetic-Monte-Carlo estimator (audit PB-06) but stays GATE-CLOSED: setting
+    policy_sigma_ambiguity_validated / policy_sigma_gate_artifact / policy_sigma_mc_samples does NOT by
+    itself unlock it -- construction still fails closed because the shipped sigma-gate preregistration
+    resolves the live specification identity to FAIL (no matching empirical PASS record exists yet).
 
 Run on the GPU (the iterative E-step is slow on CPU); it auto-uses CUDA when available.
 """
@@ -51,13 +57,19 @@ CONFIG = dict(
     policy_top_k       = 8,                     # candidate menu width Kp
     policy_precision   = 1,                   # gamma in softmax(-gamma * G)
     policy_horizon     = 1,                     # 1 for efe_one_step; >1 for efe_rollout (needs a cache-supported cfg)
+    policy_ambiguity_mode            = "likelihood_entropy",  # ambiguity registry key; 'sigma_mc' is gate-closed (PB-06)
+    policy_sigma_mc_samples          = 16,                    # sealed MC sample count for 'sigma_mc'; inert at the default ambiguity
+    policy_sigma_ambiguity_validated = False,                 # PB-06 precondition flag; True alone never unlocks 'sigma_mc'
+    policy_sigma_gate_artifact       = None,                  # path to a PASS sigma-gate record; required (not sufficient) for 'sigma_mc'
 
     device       = None,        # None -> cuda if available else cpu
 )
 # -----------------------------------------------------------------------------
 
 _POLICY_FIELDS = ("policy_mode", "policy_preference", "policy_score_terms",
-                  "policy_top_k", "policy_precision", "policy_horizon")
+                  "policy_top_k", "policy_precision", "policy_horizon",
+                  "policy_ambiguity_mode", "policy_sigma_mc_samples",
+                  "policy_sigma_ambiguity_validated", "policy_sigma_gate_artifact")
 _CL100K_DATASETS = frozenset({"wiki-en", "wiki-ja"})
 
 

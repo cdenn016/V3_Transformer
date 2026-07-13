@@ -478,16 +478,19 @@ class VFE3Config:
     policy_precision:          float           = 1.0      # policy precision gamma in softmax(-gamma G)
     policy_preference:         str             = "task"   # preference registry key -> p(o | C)
     policy_score_terms:        Tuple[str, ...] = ("risk", "ambiguity")  # which EFE terms enter G(pi)
-    # sigma-validation gate (spec Sections 2.7, 4.5, Guard 4): a PRECONDITION RECORD ONLY (audit
-    # 2026-07-01 F5). Setting it True (with a policy_sigma_gate_artifact pointing at a PASS sigma-gate
-    # record) records that the pre-registered sigma gate passed; it does NOT enable any sigma-derived
-    # ambiguity -- NO code path reads the flag, the EFE ambiguity term is always 'likelihood_entropy',
-    # and get_ambiguity('sigma_mc') still raises (fail-closed). May be set True ONLY together with the
-    # artifact: __post_init__ enforces BOTH the structural check (artifact named) AND the content check
-    # (the file exists and carries status=='PASS', via vfe3.inference.sigma_gate.verify_gate_artifact),
-    # so a FAIL/missing/unreadable record cannot flip the flag silently. A Phase-3 consumer that reads
-    # the validated artifact (and checks the spec_commit MATCH against the live spec commit) must be
-    # added before any sigma arm unlocks.
+    # sigma-validation gate (spec Sections 2.7, 4.5, Guard 4): a PRECONDITION RECORD (audit 2026-07-01
+    # F5, current contract updated PB-06). Setting it True (with a policy_sigma_gate_artifact pointing
+    # at a PASS sigma-gate record) records that the pre-registered sigma gate passed; it is only ONE of
+    # several requirements for policy_ambiguity_mode='sigma_mc' (alongside an EFE scorer, a Gaussian
+    # family, exactly policy_sigma_mc_samples=16, and a prereg-registered PASS governing identity) and
+    # never unlocks the gated estimator by itself -- the ambiguity term stays 'likelihood_entropy'
+    # unless policy_ambiguity_mode is explicitly set to 'sigma_mc' AND every other precondition below
+    # holds. May be set True ONLY together with the artifact: __post_init__ enforces BOTH the structural
+    # check (artifact named) AND the content check (the file exists and carries status=='PASS', via
+    # vfe3.inference.sigma_gate.verify_gate_artifact), so a FAIL/missing/unreadable record cannot flip
+    # the flag silently. VFEModel.generate is the Phase-3 consumer: it derives the four live identities
+    # (model behavior, spec, code, measurement context) and calls verify_sigma_consumer_gate before any
+    # sigma_mc dispatch, re-checking the spec_commit MATCH against the live spec identity there.
     policy_sigma_ambiguity_validated: bool          = False
     policy_sigma_gate_artifact:       Optional[str] = None
     # policy_ambiguity_mode selects the EFE ambiguity estimator (ambiguity registry key). The default
