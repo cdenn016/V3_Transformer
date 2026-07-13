@@ -369,8 +369,8 @@ def test_l15_effective_rank_full_cov_uses_eigenvalues():
     K = 4
     A = torch.randn(2, K, K)
     sigma = A @ A.transpose(-1, -2) + torch.eye(K)              # (2,K,K) full covariance
-    got = get_metric("effective_rank")(sigma=sigma)
-    ref = float(effective_rank(_spectrum(sigma)).mean())
+    got = get_metric("effective_rank")(sigma=sigma, diagonal=False)   # explicit flag (PB-07)
+    ref = float(effective_rank(_spectrum(sigma, diagonal=False)).mean())
     assert abs(got - ref) < 1e-5
 
 
@@ -379,7 +379,7 @@ def test_l15_effective_rank_diagonal_unchanged():
 
     torch.manual_seed(0)
     sigma = torch.rand(2, 5, 4) + 0.1                            # (B,N,K) diagonal variances
-    got = get_metric("effective_rank")(sigma=sigma)
+    got = get_metric("effective_rank")(sigma=sigma, diagonal=True)    # explicit flag (PB-07)
     ref = float(effective_rank(sigma).mean())                    # diagonal: variances ARE the spectrum
     assert abs(got - ref) < 1e-5
 

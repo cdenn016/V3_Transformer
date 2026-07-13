@@ -1346,13 +1346,17 @@ def get_metric(name: str) -> Callable:
 # kernel (effective_rank(None) etc.). The trailing **kw stays only to absorb SIBLING
 # metrics' context keys, since ``compute_metrics`` floods the full context to every metric.
 @register_metric("effective_rank")
-def _m_eff_rank(*, sigma: torch.Tensor, **kw) -> float:
+def _m_eff_rank(*, sigma: torch.Tensor, diagonal: bool, **kw) -> float:
     """Mean spectral effective rank of the belief covariances.
 
     Routes through ``_spectrum`` so a FULL covariance (..., K, K) is reduced to its eigenvalue
     spectrum before the participation ratio (audit 2026-06-13 L15); passing the matrix directly
-    treated its rows as a spectrum. A diagonal (..., K) variance tensor is its own spectrum."""
-    return float(effective_rank(_spectrum(sigma)).mean())
+    treated its rows as a spectrum. A diagonal (..., K) variance tensor is its own spectrum.
+
+    ``diagonal`` is REQUIRED (no auto-inference): a diagonal (N, K) variance table with N == K is
+    square in its last two axes, so shape-based auto-inference would misread it as a full (K, K)
+    covariance and eigvalsh a variance vector. The caller passes the explicit flag (audit PB-07)."""
+    return float(effective_rank(_spectrum(sigma, diagonal=diagonal)).mean())
 
 
 @register_metric("attention_entropy")
@@ -1421,3 +1425,25 @@ def compute_metrics(
     Most metrics return a float; ``free_energy_terms`` returns a nested ``Dict[str, float]``,
     so the value type is widened accordingly."""
     return {n: get_metric(n)(**context) for n in names}
+
+
+# ---------------------------------------------------------------------------
+# Production diagnostics group (audit PB-07): the metric names ``VFEModel.diagnostics()``
+# dispatches through the registry, plus the declarative (metric, output_key, flatten) mapping
+# the call site walks to assemble its dict. ``attention_entropy`` (row entropy) is aliased to
+# ``attn_entropy`` so it does NOT overwrite the free-energy component named ``attention_entropy``
+# that ``free_energy_terms`` returns; ``free_energy_terms`` flattens its returned mapping into the
+# dict (the call site guards the flatten against overwrite collisions). Holonomy / gauge metrics
+# stay OFF this group: their diagnostics consume sibling confidence bounds and active-frame
+# branches the scalar registry wrappers do not return.
+# ---------------------------------------------------------------------------
+DIAGNOSTIC_METRIC_NAMES = (
+    "attention_entropy",
+    "free_energy_terms",
+    "effective_rank",
+)
+DIAGNOSTIC_METRIC_OUTPUTS = (
+    ("attention_entropy", "attn_entropy", False),
+    ("free_energy_terms", None, True),
+    ("effective_rank", "effective_rank", False),
+)

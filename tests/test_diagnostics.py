@@ -6,6 +6,7 @@ import math
 import pytest
 import torch
 
+from vfe3 import metrics
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.train import _val_diagnostics
@@ -41,6 +42,43 @@ def _assert_scalar_dict_equal(actual: dict, expected: dict) -> None:
             assert actual[key] == pytest.approx(expected[key], rel=1e-5, abs=1e-6), key
         else:
             assert math.isclose(actual[key], expected[key], rel_tol=1e-5, abs_tol=1e-6), key
+
+
+def test_diagnostics_registry_dispatch_substitutes_attention_entropy() -> None:
+    r"""PB-07: ``diagnostics()`` routes the row-entropy ``attention_entropy`` metric through the metric
+    registry (aliased to ``attn_entropy``), so a registered override reaches it there -- while the
+    free-energy component named ``attention_entropy`` (returned by ``free_energy_terms``) is untouched,
+    proving the alias prevents the row entropy from overwriting the component of the same name."""
+    model = _model(embed_dim=2, n_heads=1, n_layers=1)
+    tokens = _tokens()
+    baseline = model.diagnostics(tokens)
+    sentinel = -12345.0
+    original = metrics.get_metric("attention_entropy")
+    try:
+        metrics.register_metric("attention_entropy", override=True)(lambda **kw: sentinel)
+        d = model.diagnostics(tokens)
+    finally:
+        metrics.register_metric("attention_entropy", override=True)(original)
+    assert metrics.get_metric("attention_entropy") is original           # restore succeeded
+    assert d["attn_entropy"] == sentinel                                 # row entropy routed via registry
+    assert d["attention_entropy"] != sentinel                           # free-energy component distinct
+    assert d["attention_entropy"] == pytest.approx(baseline["attention_entropy"], rel=1e-6, abs=1e-9)
+
+
+def test_effective_rank_registry_dispatch_uses_explicit_diagonal_flag() -> None:
+    r"""PB-07: the registered ``effective_rank`` wrapper REQUIRES an explicit ``diagonal`` flag and
+    threads it to ``_spectrum``. A diagonal (N, K) variance table with N == K is square in its last two
+    axes, so shape auto-inference misclassifies it as a full covariance and eigvalsh a variance vector;
+    the explicit flag keeps the diagonal interpretation."""
+    torch.manual_seed(0)
+    K = 3
+    sigma = torch.rand(K, K) + 0.5                                       # N == K diagonal variance table
+    got = metrics.get_metric("effective_rank")(sigma=sigma, diagonal=True)
+    ref = float(metrics.effective_rank(sigma).mean())                    # variances ARE the spectrum
+    eig = torch.linalg.eigvalsh(0.5 * (sigma + sigma.transpose(-1, -2)))
+    wrong = float(metrics.effective_rank(eig).mean())                    # misclassified full-cov reading
+    assert got == pytest.approx(ref, rel=1e-6, abs=1e-9)                 # explicit flag -> diagonal spectrum
+    assert abs(ref - wrong) > 1e-3                                       # the two readings genuinely differ
 
 
 def test_eval_diagnostics_builds_one_snapshot(monkeypatch) -> None:
