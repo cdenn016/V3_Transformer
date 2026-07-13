@@ -62,6 +62,63 @@ def semantic_config_fingerprint(
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def sigma_behavior_config(
+    cfg: "VFE3Config | Mapping[str, object]",
+) -> Dict[str, object]:
+    r"""Return the non-policy config projection that controls belief transition and decode (PB-06).
+
+    Every ``policy_*`` field chooses the candidate MENU, horizons, preferences, score weights, ambiguity
+    dispatch, and gate authorization AROUND an already defined candidate; none of them alters the
+    underlying ``rollout_predictive_state`` belief transition or the ``PriorBank.decode`` distribution
+    whose sigma utility the gate measured. So the sigma-gate model-behavior fingerprint is bound to every
+    non-policy field (``decode_tau``, family/divergence, the E-step, transport, prior-bank settings, ...)
+    and INVARIANT to the policy fields: a checkpoint measured under ``policy_mode='none'`` and consumed
+    under ``policy_mode='efe_rollout'`` with different preference/score/top-k/horizon/gate fields carry
+    the SAME projection. Accepts a live :class:`VFE3Config` (via ``asdict``) or a serialized mapping."""
+    if isinstance(cfg, VFE3Config):
+        base: Dict[str, object] = asdict(cfg)
+    elif isinstance(cfg, Mapping):
+        base = dict(cfg)
+    else:
+        raise TypeError(
+            f"sigma_behavior_config expects a VFE3Config or mapping, got {type(cfg).__name__}")
+    return {key: value for key, value in base.items() if not str(key).startswith("policy_")}
+
+
+def model_behavior_fingerprint(
+    semantic_config: Mapping[str, object],
+    state_dict:      Mapping[str, torch.Tensor],
+) -> str:
+    r"""Hash canonical semantic config plus sorted tensor metadata and bytes (PB-06).
+
+    Binds a sigma-gate artifact to the EXACT model whose sigma utility was measured: the digest is
+    prefixed with ``semantic_config_fingerprint(semantic_config)`` (typically
+    :func:`sigma_behavior_config`), then folds each state-dict entry in SORTED key order -- the
+    length-delimited key, the tensor ``dtype`` and ``shape``, and the raw contiguous ``uint8`` byte view
+    of ``tensor.detach().cpu().contiguous().reshape(-1)``. Key order cannot change the digest (sorted),
+    but any changed weight value, dtype, or shape does, as does any non-policy behavior field (via the
+    prefix). Non-tensor state-dict values are rejected."""
+    digest = hashlib.sha256()
+    digest.update(semantic_config_fingerprint(semantic_config).encode("utf-8"))
+    digest.update(b"\0state\0")
+    for key in sorted(state_dict):
+        value = state_dict[key]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"model_behavior_fingerprint expects tensor state-dict values; entry {key!r} is "
+                f"{type(value).__name__}")
+        key_bytes = str(key).encode("utf-8")
+        digest.update(len(key_bytes).to_bytes(8, "big"))
+        digest.update(key_bytes)
+        meta = f"{value.dtype}|{tuple(value.shape)}".encode("utf-8")
+        digest.update(len(meta).to_bytes(8, "big"))
+        digest.update(meta)
+        raw = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
 def _atomic_replace(
     final: Path,                         # destination (the artifact name readers load)
     tmp:   Path,                         # same-directory temp file, already fully written

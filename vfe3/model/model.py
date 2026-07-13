@@ -2143,6 +2143,39 @@ class VFEModel(nn.Module):
                 UserWarning,
                 stacklevel=2,
             )
+        # PB-06 sigma-consumer gate: WHEN AND ONLY WHEN the ambiguity arm is the gated 'sigma_mc', derive
+        # the four live identities ONCE and verify the pre-registered consumer gate before any rollout,
+        # then thread them through _policy_select. policy_ambiguity_mode='likelihood_entropy' (and
+        # policy_mode='none') never hashes the model/code/corpus, inspects the specification, or reads the
+        # artifact -- the pure path stays untouched. Providers are resolved through vfe3.inference.sigma_gate
+        # at call time (no unpatchable aliases).
+        sigma_gate_ids: Dict[str, Optional[str]] = {}
+        if self.cfg.policy_ambiguity_mode == "sigma_mc":
+            from vfe3.inference import sigma_gate
+            from vfe3.run_artifacts import (model_behavior_fingerprint, semantic_config_fingerprint,
+                                            sigma_behavior_config)
+            behavior = model_behavior_fingerprint(sigma_behavior_config(self.cfg), self.state_dict())
+            spec = sigma_gate.sigma_gate_spec_identity()
+            if spec == "unknown":
+                raise ValueError(
+                    "policy_ambiguity_mode='sigma_mc' requires a resolvable governing specification "
+                    "identity; sigma_gate_spec_identity() returned 'unknown'.")
+            code = sigma_gate.sigma_consumer_code_identity()
+            meas_context = sigma_gate.sigma_measurement_context(self.cfg)
+            context_fp = semantic_config_fingerprint(meas_context)
+            sigma_gate.verify_sigma_consumer_gate(
+                self.cfg.policy_sigma_gate_artifact,
+                actual_model_behavior_sha256=behavior,
+                actual_spec_identity=spec,
+                actual_code_identity_sha256=code,
+                actual_measurement_context_sha256=context_fp,
+            )
+            sigma_gate_ids = dict(
+                model_behavior_sha256=behavior,
+                sigma_spec_identity=spec,
+                sigma_code_identity_sha256=code,
+                sigma_measurement_context_sha256=context_fp,
+            )
         seq = token_ids
         for _ in range(max_new_tokens):
             if self.cfg.policy_mode == "none":
@@ -2205,7 +2238,7 @@ class VFEModel(nn.Module):
                 # EFE policy rerank (no_grad). Reached only under a non-default policy_mode toggle, so
                 # default generation (policy_mode='none') is byte-identical (spec Section 3.4).
                 context = seq                                             # policy paths never truncate context
-                next_token = self._policy_select(context, greedy=greedy)   # (B, 1)
+                next_token = self._policy_select(context, greedy=greedy, **sigma_gate_ids)   # (B, 1)
             seq = torch.cat([seq, next_token], dim=-1)
         return seq
 
@@ -2216,33 +2249,38 @@ class VFEModel(nn.Module):
 
         *,
         greedy:  bool = True,            # True -> argmax the policy posterior; else sample it
+        model_behavior_sha256:      Optional[str] = None,   # PB-06 consumer-gate identities (sigma_mc only)
+        sigma_spec_identity:        Optional[str] = None,
+        sigma_code_identity_sha256: Optional[str] = None,
+        sigma_measurement_context_sha256: Optional[str] = None,
     ) -> torch.Tensor:                   # (B, 1) selected next-token id
-        r"""EFE policy selection over a fixed top-``policy_top_k`` candidate menu (spec Section 3.4).
+        r"""EFE policy selection over a top-``policy_top_k`` candidate menu (spec Section 3.4).
 
-        Decodes the base last-position logits once (the pre-registered candidate generator E), scores
-        the menu through the configured ``policy_mode`` scorer with the candidate prior E = the base
-        softmax over the menu, and returns the argmax (or a sample) of the policy posterior. The
-        environment response to a committed action is appended by the closed-loop driver, never here
-        (the scored rollout appends the action only; spec Section 2.2).
+        Decodes the base last-position logits once (the pre-registered candidate generator E), then
+        constructs the candidate menu: a one-step ``(B, Kp, 1)`` top-k menu for every mode except
+        ``policy_mode='efe_rollout'``, which builds the bounded H-step beam menu ``(B, Kp, H)`` through
+        :func:`vfe3.inference.candidate_menu.build_topk_policy_menu` (audit PB-05). The menu is scored
+        through the configured ``policy_mode`` scorer with the candidate prior E (the base softmax over
+        the one-step menu, or the beam log-softmax for efe_rollout), and the argmax (or a sample) of the
+        policy posterior selects a policy; the committed token is that policy's FIRST action (identical
+        to the selected token in the one-step case). The environment response to a committed action is
+        appended by the closed-loop driver, never here (the scored rollout appends the action only; spec
+        Section 2.2).
 
         Note: ``policy_preference='task'`` / ``'held_out_predictive'`` need per-episode / per-corpus
         context (the goal, or p_data) that ``generate`` does not supply, so those preferences are
         driven through the closed-loop experiment harness, which calls the scorer directly; under
         ``generate`` the meaningful preference is the global ``'flat'``.
         """
+        from vfe3.inference.candidate_menu import build_topk_policy_menu
         from vfe3.inference.policy import _validate_policy_context, get_policy, get_preference
-        # audit F4 (2026-07-01): the config validates efe_rollout (with horizon>1), but this generic
-        # path can only build a one-step candidate menu, so fail closed HERE -- at the exact point the
-        # missing H-step candidate generator would be needed -- with a clear error instead of the
-        # cryptic mid-scorer candidate-length ValueError.
-        if self.cfg.policy_mode == "efe_rollout":
-            raise NotImplementedError(
-                "policy_mode='efe_rollout' (horizon>1) is not reachable through generate(): the generic "
-                "policy path builds a one-step (B, Kp, 1) candidate menu, but efe_rollout requires an "
-                "H-token (B, Kp, H) policy menu and no H-step candidate generator exists. Drive efe_rollout "
-                "through a harness that builds H-action candidates and calls get_policy('efe_rollout') "
-                "directly, or set policy_mode='efe_one_step' (horizon=1).")
-        _validate_policy_context(context, 1, self.cfg.max_seq_len)
+        # audit PB-05 (2026-07-12): efe_rollout (horizon>1) is now reachable through generate() via the
+        # bounded H-step beam menu (vfe3/inference/candidate_menu.py); only candidate CONSTRUCTION
+        # branches on policy_mode -- the one-step block below is unchanged. The scorer's cache gate is
+        # NOT relaxed: efe_rollout still fails closed on a cache-unsupported config inside
+        # get_policy('efe_rollout') (spec Section 3.5), not here.
+        horizon = self.cfg.policy_horizon if self.cfg.policy_mode == "efe_rollout" else 1
+        _validate_policy_context(context, horizon, self.cfg.max_seq_len)
         _belief, decoded = self.forward_beliefs(context, return_logits=True, decode_last=True)
         base_logits = decoded[:, 0, :]                               # (B, V) base last-position logits
         invalid_row = torch.isnan(base_logits).any(dim=-1) | torch.isposinf(base_logits).any(dim=-1)
@@ -2254,27 +2292,41 @@ class VFEModel(nn.Module):
         if not bool(finite_row.all()):
             rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()
             raise ValueError(f"policy base logits have no finite value in rows {rows}")
-        Kp = self.cfg.policy_top_k
-        topk = base_logits.topk(Kp, dim=-1).indices                # (B, Kp) candidate token ids (generator E)
-        candidates = topk.unsqueeze(-1)                            # (B, Kp, 1) one-step action tokens
-        menu_logits = torch.gather(base_logits, 1, topk)          # (B, Kp) base logits over the menu
-        retained_finite = torch.isfinite(menu_logits).all(dim=-1)
-        if not bool(retained_finite.all()):
-            rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
-            raise ValueError(f"policy menu logits contain non-finite retained values in rows {rows}")
-        log_prior = torch.log_softmax(menu_logits, dim=-1)        # (B, Kp) log E(pi): base softmax over menu
+        if self.cfg.policy_mode == "efe_rollout":
+            candidates, log_prior = build_topk_policy_menu(        # (B, Kp, H) H-action beams, (B, Kp) log E
+                context, base_logits, self,
+                horizon=horizon, width=self.cfg.policy_top_k,
+            )
+        else:
+            Kp = self.cfg.policy_top_k
+            topk = base_logits.topk(Kp, dim=-1).indices            # (B, Kp) candidate token ids (generator E)
+            candidates = topk.unsqueeze(-1)                        # (B, Kp, 1) one-step action tokens
+            menu_logits = torch.gather(base_logits, 1, topk)      # (B, Kp) base logits over the menu
+            retained_finite = torch.isfinite(menu_logits).all(dim=-1)
+            if not bool(retained_finite.all()):
+                rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
+                raise ValueError(f"policy menu logits contain non-finite retained values in rows {rows}")
+            log_prior = torch.log_softmax(menu_logits, dim=-1)    # (B, Kp) log E(pi): base softmax over menu
         preference = get_preference(self.cfg.policy_preference)(
             self.prior_bank, device=base_logits.device)            # (V,)/(B,V) log p(o|C), on the model device (audit F5)
         out = get_policy(self.cfg.policy_mode)(
             context, candidates, preference, self,
             gamma=self.cfg.policy_precision, horizon=self.cfg.policy_horizon,
             score_terms=self.cfg.policy_score_terms, log_prior=log_prior, base_logits=base_logits,
+            ambiguity_mode=self.cfg.policy_ambiguity_mode,
+            model_behavior_sha256=model_behavior_sha256,
+            sigma_spec_identity=sigma_spec_identity,
+            sigma_code_identity_sha256=sigma_code_identity_sha256,
+            sigma_measurement_context_sha256=sigma_measurement_context_sha256,
         )
         if greedy:
             idx = out.policy_posterior.argmax(dim=-1, keepdim=True)         # (B, 1) menu index
         else:
             idx = torch.multinomial(out.policy_posterior, num_samples=1)    # (B, 1)
-        return torch.gather(topk, 1, idx)                          # (B, 1) selected token id
+        selected = torch.gather(                                   # (B, 1, H) the selected policy sequence
+            candidates, 1, idx.unsqueeze(-1).expand(-1, -1, candidates.shape[-1]),
+        )
+        return selected[:, 0, :1]                                  # (B, 1) FIRST action of the selected policy
 
     def _fold_precision_bias(
         self,

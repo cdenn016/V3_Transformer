@@ -37,6 +37,7 @@ import torch
 
 from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
 from vfe3.belief import BeliefState
+from vfe3.contracts import PolicyRollout
 from vfe3.families.base import get_family
 from vfe3.free_energy import attention_tau, attention_weights, pairwise_energy, self_divergence_for_alpha
 from vfe3.geometry.retraction import get_retraction
@@ -183,7 +184,7 @@ def _appended_belief_step(
 
 
 @torch.no_grad()
-def rollout_predictive_cached(
+def rollout_predictive_state_cached(
     context:     torch.Tensor,             # (B, N) context ids
     candidates:  torch.Tensor,             # (B, Kp, L) candidate continuation ids
 
@@ -191,14 +192,17 @@ def rollout_predictive_cached(
 
     *,
     base_logits: Optional[torch.Tensor] = None,   # (B, V) reused base last-position logits
-) -> 'Tuple[torch.Tensor, torch.Tensor]':
-    r"""Cache-accelerated drop-in for ``policy._rollout_predictive`` on the :func:`cache_supported`
-    path. Returns the predicted outcome distribution q(o|pi) = p(o | q*_pi) as log-probs (B, Kp, V)
-    read from the LAST appended position, and the raw continuation log-prob (B, Kp) of the first
-    action token under the BASE predictive -- identical semantics to ``_rollout_predictive``, but the
-    Kp candidates share one context pass: only the appended positions' E-step rows are recomputed,
-    attending causally to the shared context. The caller guarantees N + L <= ``cfg.max_seq_len`` (no
-    sliding-window eviction, which would invalidate the prefix)."""
+) -> 'PolicyRollout':
+    r"""Cache-accelerated, state-carrying drop-in for ``policy._rollout_predictive_state`` on the
+    :func:`cache_supported` path (PB-06). Returns a :class:`PolicyRollout`: the predicted outcome
+    distribution q(o|pi) = p(o | q*_pi) as log-probs (B, Kp, V) read from the LAST appended position,
+    the raw continuation log-prob (B, Kp) of the first action token under the BASE predictive, and the
+    terminal belief mean (B, Kp, K) / covariance (B, Kp, K[,K]) at the last appended position AFTER the
+    same block_norm/final_norm that produced ``q_log`` -- identical semantics to
+    ``_rollout_predictive_state``, but the Kp candidates share one context pass: only the appended
+    positions' E-step rows are recomputed, attending causally to the shared context. The caller
+    guarantees N + L <= ``cfg.max_seq_len`` (no sliding-window eviction, which would invalidate the
+    prefix)."""
     B, N = context.shape
     Kp, L = candidates.shape[1], candidates.shape[2]
     M = N + L
@@ -258,9 +262,31 @@ def rollout_predictive_cached(
         mu_out = model.final_norm(mu_out, app.sigma)
     logits = model.prior_bank.decode(mu_out.float(), app.sigma.float())     # (B*Kp, L, V)
     q_log = torch.log_softmax(logits[:, -1, :], dim=-1).reshape(B, Kp, -1)  # (B, Kp, V) = log q(o|pi)
+    # Terminal belief moments at the last appended position: the mean AFTER block_norm/final_norm (the
+    # same mu_out that decoded q_log), and the E-step covariance app.sigma. mu (B, Kp, K), sigma
+    # (B, Kp, K[,K]).
+    mu = mu_out[:, -1].reshape(B, Kp, *mu_out.shape[2:])
+    sigma = app.sigma[:, -1].reshape(B, Kp, *app.sigma.shape[2:])
 
     if base_logits is None:
         base_logits = model.forward(context)[:, -1, :]                      # (B, V) base last-position logits
     base_logp = torch.log_softmax(base_logits, dim=-1)
     log_prob = torch.gather(base_logp, 1, candidates[:, :, 0])              # (B, Kp) logprob of the first action
-    return q_log, log_prob
+    return PolicyRollout(q_log=q_log, log_prob=log_prob, mu=mu, sigma=sigma)
+
+
+@torch.no_grad()
+def rollout_predictive_cached(
+    context:     torch.Tensor,             # (B, N) context ids
+    candidates:  torch.Tensor,             # (B, Kp, L) candidate continuation ids
+
+    model:       'object',                  # VFEModel: prior_bank / group / cfg + belief helpers
+
+    *,
+    base_logits: Optional[torch.Tensor] = None,   # (B, V) reused base last-position logits
+) -> 'Tuple[torch.Tensor, torch.Tensor]':
+    r"""Compatibility wrapper (PB-06): the historical two-tensor cached rollout return. Delegates to
+    :func:`rollout_predictive_state_cached` and returns exactly ``(q_log, log_prob)`` so existing
+    external unpacking is unchanged."""
+    state = rollout_predictive_state_cached(context, candidates, model, base_logits=base_logits)
+    return state.q_log, state.log_prob

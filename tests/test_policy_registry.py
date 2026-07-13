@@ -190,11 +190,76 @@ def test_sigma_gate_flag_requires_passing_artifact(tmp_path):
     assert cfg.policy_sigma_ambiguity_validated is True
 
 
+def test_config_defaults_ambiguity_mode_and_samples():
+    cfg = VFE3Config()
+    assert cfg.policy_ambiguity_mode == "likelihood_entropy"
+    assert cfg.policy_sigma_mc_samples == 16
+
+
+def test_config_rejects_unknown_ambiguity_mode():
+    with pytest.raises(ValueError, match="policy_ambiguity_mode"):
+        VFE3Config(policy_ambiguity_mode="not_a_registered_ambiguity")
+
+
+def _pass_artifact(tmp_path):
+    import json
+    from vfe3.inference.sigma_gate import sigma_gate_spec_identity
+    ok = tmp_path / "pass.json"
+    ok.write_text(json.dumps({"status": "PASS", "spec_commit": sigma_gate_spec_identity()}),
+                  encoding="utf-8")
+    return str(ok)
+
+
+def test_config_sigma_mc_requires_all_preconditions(tmp_path):
+    art = _pass_artifact(tmp_path)
+    # sigma_mc needs an EFE scorer, gaussian family, the validated flag, an artifact, and 16 samples.
+    with pytest.raises(ValueError):                               # policy_mode not an EFE scorer
+        VFE3Config(policy_ambiguity_mode="sigma_mc", policy_mode="logprob_control",
+                   policy_preference="flat")
+    with pytest.raises(ValueError):                               # missing the validated flag
+        VFE3Config(policy_ambiguity_mode="sigma_mc", policy_mode="efe_one_step",
+                   policy_preference="flat", family="gaussian_diagonal")
+    with pytest.raises(ValueError):                               # validated flag but no artifact
+        VFE3Config(policy_ambiguity_mode="sigma_mc", policy_mode="efe_one_step",
+                   policy_preference="flat", family="gaussian_diagonal",
+                   policy_sigma_ambiguity_validated=True)
+
+
+def test_config_sigma_mc_rejects_non_16_sample_count(tmp_path):
+    art = _pass_artifact(tmp_path)
+    for bad in (1, 8, 15, 17, 32):
+        with pytest.raises(ValueError):
+            VFE3Config(policy_ambiguity_mode="sigma_mc", policy_mode="efe_one_step",
+                       policy_preference="flat", family="gaussian_diagonal",
+                       policy_sigma_ambiguity_validated=True, policy_sigma_gate_artifact=art,
+                       policy_sigma_mc_samples=bad)
+
+
+def test_config_sigma_mc_rejected_under_production_fail_manifest(tmp_path):
+    # All structural preconditions satisfied, but the production spec identity is registered FAIL, so a
+    # sigma_mc config cannot be constructed against the shipped preregistry (fail-closed).
+    art = _pass_artifact(tmp_path)
+    with pytest.raises(ValueError):
+        VFE3Config(policy_ambiguity_mode="sigma_mc", policy_mode="efe_one_step",
+                   policy_preference="flat", family="gaussian_diagonal",
+                   policy_sigma_ambiguity_validated=True, policy_sigma_gate_artifact=art,
+                   policy_sigma_mc_samples=16)
+
+
+def test_config_validated_flag_does_not_turn_on_sigma_mc(tmp_path):
+    # policy_sigma_ambiguity_validated=True under likelihood_entropy is still allowed and inert; the
+    # flag must never enable sigma_mc by itself.
+    art = _pass_artifact(tmp_path)
+    cfg = VFE3Config(policy_sigma_ambiguity_validated=True, policy_sigma_gate_artifact=art)
+    assert cfg.policy_ambiguity_mode == "likelihood_entropy"
+
+
 def test_sigma_gate_flag_has_no_executable_consumer(tmp_path):
-    # audit F5 (2026-07-01): policy_sigma_ambiguity_validated=True (with a PASS artifact) is a
-    # PRECONDITION RECORD ONLY -- no code path routes ambiguity_mode to 'sigma_mc', so the scorer
-    # still uses the default 'likelihood_entropy' and runs fine (no sigma_mc RuntimeError). This
-    # pins that the validated flag does NOT unlock the gated estimator by itself.
+    # audit F5 (2026-07-01), updated for PB-06: policy_sigma_ambiguity_validated=True (with a PASS
+    # artifact) is a PRECONDITION RECORD ONLY -- routing to 'sigma_mc' exists now but ONLY via
+    # policy_ambiguity_mode='sigma_mc' (validated + consumer-gated), which stays at its default
+    # 'likelihood_entropy' here, so the scorer runs fine (no sigma_mc RuntimeError). This pins that
+    # the validated flag does NOT turn the gated estimator on by itself.
     import json
     import torch
     from vfe3.model.model import VFEModel
@@ -216,8 +281,55 @@ def test_sigma_gate_flag_has_no_executable_consumer(tmp_path):
     from vfe3.inference.policy import _rollout_predictive
     with torch.no_grad():
         q_log, _ = _rollout_predictive(ctx, cand, m)
-    assert torch.allclose(out.ambiguity, get_ambiguity("likelihood_entropy")(q_log), atol=1e-6)
+    est = get_ambiguity("likelihood_entropy")(q_log)           # AmbiguityEstimate (PB-06)
+    assert torch.allclose(out.ambiguity, est.expected_conditional_entropy, atol=1e-6)
     # and the generic generate() path also completes under the validated flag
     with torch.no_grad():
         seq = m.generate(ctx, 2, greedy=True)
     assert seq.shape == (1, 7)
+
+
+# ======================================================================================
+# Task 5 (PB-05/PB-06): the click-to-run driver exposes only the validated policy fields.
+# ======================================================================================
+
+def test_generate_efe_exposes_the_four_sigma_fields_and_no_identity_overrides():
+    # audit PB-05/06: _POLICY_FIELDS is the exact set of policy knobs generate_efe.py's CONFIG can
+    # override. The four sigma-gate fields must be present; the four consumer-derived identities
+    # (model_behavior_sha256, spec_identity, code_identity_sha256, measurement_context_sha256) must
+    # NOT be, since VFEModel.generate derives them itself from the live model/source/corpus.
+    import generate_efe
+    assert set(generate_efe._POLICY_FIELDS) == {
+        "policy_mode", "policy_preference", "policy_score_terms", "policy_top_k",
+        "policy_precision", "policy_horizon", "policy_ambiguity_mode", "policy_sigma_mc_samples",
+        "policy_sigma_ambiguity_validated", "policy_sigma_gate_artifact",
+    }
+    identity_fields = {"checkpoint", "model_behavior_sha256", "spec_identity",
+                       "code_identity_sha256", "measurement_context_sha256"}
+    assert not identity_fields & set(generate_efe._POLICY_FIELDS)
+
+
+def test_generate_efe_driver_rejects_sigma_mc_override_before_generation(tmp_path, monkeypatch):
+    # Task 5: a user who points the newly exposed sigma fields at a structurally valid PASS artifact
+    # must still be rejected BEFORE any model is built or weights are loaded, because the shipped
+    # preregistry resolves the live spec identity to FAIL (mirrors
+    # test_config_sigma_mc_rejected_under_production_fail_manifest, but through the actual driver entry
+    # point generate_efe._build_model rather than VFE3Config directly).
+    import generate_efe
+
+    art = _pass_artifact(tmp_path)
+    config_dict = dict(family="gaussian_diagonal")               # simulates the checkpoint's embedded config
+    overrides = {key: value for key, value in dict(
+        policy_mode="efe_one_step", policy_preference="flat",
+        policy_score_terms=("risk", "ambiguity"), policy_top_k=8, policy_precision=1.0,
+        policy_horizon=1, policy_ambiguity_mode="sigma_mc", policy_sigma_mc_samples=16,
+        policy_sigma_ambiguity_validated=True, policy_sigma_gate_artifact=art,
+    ).items() if key in generate_efe._POLICY_FIELDS}
+    assert overrides["policy_ambiguity_mode"] == "sigma_mc"       # the extended field actually flows through
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("VFEModel must not be constructed when the sigma_mc gate rejects the config")
+    monkeypatch.setattr(generate_efe, "VFEModel", _boom)
+
+    with pytest.raises(ValueError, match="not registered as PASS"):
+        generate_efe._build_model(config_dict, {}, policy_overrides=overrides, device="cpu")

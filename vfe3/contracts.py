@@ -57,6 +57,38 @@ class MetropolisObjectiveContext(NamedTuple):
     prior:     EffectiveBetaPriorContext         # fixed pre-stack effective-prior context (folds rebuilt per candidate)
 
 
+class AmbiguityEstimate(NamedTuple):
+    r"""The ambiguity-estimator return: the predictive OUTCOME marginal plus the expected conditional
+    entropy (PB-06 sigma_mc). Both estimators return this NamedTuple so the scorer reads two named
+    fields regardless of which ambiguity arm is active. The default ``likelihood_entropy`` arm returns
+    ``predictive_log_prob`` equal to the input point predictive ``q_log`` unchanged and
+    ``expected_conditional_entropy`` its entropy H[q(o|mu_s)] (so the MI bridge collapses to 0 exactly).
+    The gated ``sigma_mc`` arm returns the NORMALIZED Monte-Carlo marginal q(o|pi) = E_s p(o|s) and the
+    Monte-Carlo estimate of E_s H[p(o|s)]. The scorer forms risk from ``predictive_log_prob``, sets the
+    ambiguity term to ``expected_conditional_entropy``, and the epistemic MI bridge from their gap."""
+
+    predictive_log_prob:          torch.Tensor   # (B, Kp, V) normalized predictive outcome marginal
+    expected_conditional_entropy: torch.Tensor   # (B, Kp) E_{q(s|pi)} H[p(o|s)]
+
+
+class PolicyRollout(NamedTuple):
+    r"""The state-carrying result of one EFE candidate rollout (PB-06).
+
+    Extends the historical two-tensor ``(q_log, log_prob)`` return with the TERMINAL belief moments read
+    at the last appended position, so a sigma-dependent ambiguity estimator can read the belief
+    covariance the rollout actually converged to (the sigma-free ``likelihood_entropy`` arm ignores
+    ``mu``/``sigma``). ``mu`` is ``(B, Kp, K)`` and ``sigma`` is ``(B, Kp, K)`` (diagonal family) or
+    ``(B, Kp, K, K)`` (full family). The full path reads them from the returned ``BeliefState``; the
+    cached path reads them from the appended positions after the same block_norm/final_norm that produced
+    ``q_log``. The compatibility wrappers ``_rollout_predictive`` / ``rollout_predictive_cached`` return
+    exactly ``(q_log, log_prob)`` so existing two-tensor unpacking is unchanged."""
+
+    q_log:    torch.Tensor   # (B, Kp, V) log q(o|pi) at the terminal predictive
+    log_prob: torch.Tensor   # (B, Kp) raw first-action continuation log-prob under the base predictive
+    mu:       torch.Tensor   # (B, Kp, K) terminal belief mean
+    sigma:    torch.Tensor   # (B, Kp, K) or (B, Kp, K, K) terminal belief covariance
+
+
 class MStepCapture(TypedDict, total=False):
     """Mutable intermediates captured for the M-step self-coupling term."""
 

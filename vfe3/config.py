@@ -478,18 +478,30 @@ class VFE3Config:
     policy_precision:          float           = 1.0      # policy precision gamma in softmax(-gamma G)
     policy_preference:         str             = "task"   # preference registry key -> p(o | C)
     policy_score_terms:        Tuple[str, ...] = ("risk", "ambiguity")  # which EFE terms enter G(pi)
-    # sigma-validation gate (spec Sections 2.7, 4.5, Guard 4): a PRECONDITION RECORD ONLY (audit
-    # 2026-07-01 F5). Setting it True (with a policy_sigma_gate_artifact pointing at a PASS sigma-gate
-    # record) records that the pre-registered sigma gate passed; it does NOT enable any sigma-derived
-    # ambiguity -- NO code path reads the flag, the EFE ambiguity term is always 'likelihood_entropy',
-    # and get_ambiguity('sigma_mc') still raises (fail-closed). May be set True ONLY together with the
-    # artifact: __post_init__ enforces BOTH the structural check (artifact named) AND the content check
-    # (the file exists and carries status=='PASS', via vfe3.inference.sigma_gate.verify_gate_artifact),
-    # so a FAIL/missing/unreadable record cannot flip the flag silently. A Phase-3 consumer that reads
-    # the validated artifact (and checks the spec_commit MATCH against the live spec commit) must be
-    # added before any sigma arm unlocks.
+    # sigma-validation gate (spec Sections 2.7, 4.5, Guard 4): a PRECONDITION RECORD (audit 2026-07-01
+    # F5, current contract updated PB-06). Setting it True (with a policy_sigma_gate_artifact pointing
+    # at a PASS sigma-gate record) records that the pre-registered sigma gate passed; it is only ONE of
+    # several requirements for policy_ambiguity_mode='sigma_mc' (alongside an EFE scorer, a Gaussian
+    # family, exactly policy_sigma_mc_samples=16, and a prereg-registered PASS governing identity) and
+    # never unlocks the gated estimator by itself -- the ambiguity term stays 'likelihood_entropy'
+    # unless policy_ambiguity_mode is explicitly set to 'sigma_mc' AND every other precondition below
+    # holds. May be set True ONLY together with the artifact: __post_init__ enforces BOTH the structural
+    # check (artifact named) AND the content check (the file exists and carries status=='PASS', via
+    # vfe3.inference.sigma_gate.verify_gate_artifact), so a FAIL/missing/unreadable record cannot flip
+    # the flag silently. VFEModel.generate is the Phase-3 consumer: it derives the four live identities
+    # (model behavior, spec, code, measurement context) and calls verify_sigma_consumer_gate before any
+    # sigma_mc dispatch, re-checking the spec_commit MATCH against the live spec identity there.
     policy_sigma_ambiguity_validated: bool          = False
     policy_sigma_gate_artifact:       Optional[str] = None
+    # policy_ambiguity_mode selects the EFE ambiguity estimator (ambiguity registry key). The default
+    # 'likelihood_entropy' is the sigma-free arm (I == 0 at the v1 point belief). 'sigma_mc' is the
+    # gated sigma-derived arm (PB-06): valid ONLY with an EFE scorer, a Gaussian family,
+    # policy_sigma_ambiguity_validated=True, a PASS gate artifact, and exactly policy_sigma_mc_samples=16,
+    # AND only when the content-based governing identity is registered PASS in the shipped preregistry
+    # (the shipped identity is FAIL, so sigma_mc cannot be constructed in production -- the live model /
+    # corpus checks stay at the consumer boundary in VFEModel.generate).
+    policy_ambiguity_mode:            str           = "likelihood_entropy"
+    policy_sigma_mc_samples:          int           = 16
 
     # cross-block belief handoff (mu_q -> mu_p)
     prior_handoff_rho:         float = 1.0          # 1.0 = full flow; 0.0 = priors frozen
@@ -1917,8 +1929,9 @@ class VFE3Config:
         # registry (add-by-registering, like transport_mode / decode_mode above). 'none' (default) is
         # registered, so the pure path validates; a not-yet-registered scorer key raises here until the
         # build phase that registers it lands. Local import avoids a config <- inference.policy cycle.
-        from vfe3.inference.policy import _GENERATE_SAFE_PREFERENCES, _POLICIES
+        from vfe3.inference.policy import _AMBIGUITIES, _GENERATE_SAFE_PREFERENCES, _POLICIES
         _require(self.policy_mode, tuple(sorted(_POLICIES)), "policy_mode")
+        _require(self.policy_ambiguity_mode, tuple(sorted(_AMBIGUITIES)), "policy_ambiguity_mode")
         if self.policy_top_k < 1:
             raise ValueError(f"policy_top_k must be >= 1, got {self.policy_top_k}")
         if self.policy_horizon < 1:
@@ -1996,6 +2009,41 @@ class VFE3Config:
                     "without one.")
             from vfe3.inference.sigma_gate import verify_gate_artifact
             verify_gate_artifact(self.policy_sigma_gate_artifact)
+        # PB-06: the gated sigma_mc ambiguity. Structural preconditions first (an EFE scorer, a Gaussian
+        # family, the validated precondition flag, a named artifact, and exactly the sealed sample count
+        # S=16), then the prereg-aware artifact verification against the CURRENT content-based governing
+        # identity. Construction cannot verify the not-yet-constructed live model or current corpus;
+        # those checks remain at the consumer boundary (VFEModel.generate -> verify_sigma_consumer_gate).
+        if self.policy_ambiguity_mode == "sigma_mc":
+            if self.policy_mode not in ("efe_one_step", "efe_rollout"):
+                raise ValueError(
+                    f"policy_ambiguity_mode='sigma_mc' requires an EFE scorer "
+                    f"(policy_mode in ('efe_one_step', 'efe_rollout')), got {self.policy_mode!r}.")
+            if self.family not in ("gaussian_diagonal", "gaussian_full"):
+                raise ValueError(
+                    f"policy_ambiguity_mode='sigma_mc' requires a Gaussian family "
+                    f"(gaussian_diagonal or gaussian_full), got family={self.family!r}.")
+            if not self.policy_sigma_ambiguity_validated:
+                raise ValueError(
+                    "policy_ambiguity_mode='sigma_mc' requires policy_sigma_ambiguity_validated=True "
+                    "with a PASS sigma-gate artifact (spec Sections 2.7, 4.5).")
+            if not self.policy_sigma_gate_artifact:
+                raise ValueError(
+                    "policy_ambiguity_mode='sigma_mc' requires policy_sigma_gate_artifact to point at a "
+                    "PASS sigma-gate record.")
+            if self.policy_sigma_mc_samples != 16:
+                raise ValueError(
+                    f"policy_ambiguity_mode='sigma_mc' requires the preregistered "
+                    f"policy_sigma_mc_samples=16, got {self.policy_sigma_mc_samples}.")
+            from vfe3.inference import sigma_gate
+            current_spec = sigma_gate.sigma_gate_spec_identity()
+            if current_spec == "unknown":
+                raise ValueError(
+                    "policy_ambiguity_mode='sigma_mc' requires a resolvable governing specification "
+                    "identity; sigma_gate_spec_identity() returned 'unknown' (missing/undecodable "
+                    "governing docs).")
+            sigma_gate.verify_sigma_prereg_gate(
+                self.policy_sigma_gate_artifact, actual_spec_identity=current_spec)
         # decode_bias is a learned per-vocab log-unigram bias on the use_prior_bank=False LINEAR
         # decode (logits = mu_q @ W^T + b). On the prior-bank KL path the per-vocab priors
         # (mu_p, sigma_p) already carry the unigram role, so the bias is never created there; warn

@@ -788,6 +788,30 @@ class PriorBank(nn.Module):
             logits = logits + self._unigram_bias()                       # (B, N, V) + (V,)
         return logits
 
+    def decode_point(
+        self,
+        mu_s: torch.Tensor,              # (..., K) point (state) means, arbitrary leading axes
+    ) -> torch.Tensor:                   # (..., V) logits p(o | s) at the eps-floor point covariance
+        r"""Decode the point observation model p(o | s) at an eps-floor covariance of the bank's rank.
+
+        The sigma_mc ambiguity estimator (PB-06) draws state samples s ~ N(mu, Sigma) and needs the
+        per-sample OUTCOME distribution p(o | s), i.e. the decode of a POINT belief centered at each
+        sampled mean. This scores that point belief with the smallest well-posed covariance -- an
+        eps-floor of the bank's configured rank: ``full_like(mu_s, self.eps)`` for the diagonal/linear
+        family and ``self.eps * I_K`` broadcast over the leading axes for the full family (so the
+        registered ``full``/``family`` kernel receives a genuine ``(..., K, K)`` covariance, not a
+        silently-diagonal floor). It routes through :meth:`decode` so decode-mode registration AND the
+        optional unigram-bias seam stay single-sourced; it adds no parameter or state-dict key. The
+        leading axes of ``mu_s`` (e.g. ``(B, Kp, S)``) pass straight through the broadcasting kernels to
+        the returned ``(..., V)`` logits."""
+        if self.diagonal_covariance:
+            sigma = torch.full_like(mu_s, self.eps)              # (..., K) eps-floor diagonal variances
+        else:
+            K = mu_s.shape[-1]
+            eye = torch.eye(K, device=mu_s.device, dtype=mu_s.dtype)
+            sigma = self.eps * eye.expand(*mu_s.shape[:-1], K, K)  # (..., K, K) eps-floor full covariance
+        return self.decode(mu_s, sigma)
+
     def reference_decode(
         self,
         mu_q:    torch.Tensor,           # (B, N, K) posterior means

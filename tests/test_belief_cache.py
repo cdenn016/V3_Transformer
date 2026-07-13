@@ -243,6 +243,34 @@ def test_efe_rollout_rejects_context_plus_horizon_over_limit():
             get_policy("efe_rollout")(ctx, cand, pref, m, horizon=H)
 
 
+@pytest.mark.parametrize("use_prior_bank", [False, True])
+@pytest.mark.parametrize("L", [1, 3])
+def test_rollout_predictive_state_cached_carries_terminal_state(use_prior_bank, L):
+    # PB-06: the cached state-carrying rollout returns the terminal belief mean/covariance (post
+    # block_norm/final_norm) at the last appended position, matches the full state path, and keeps the
+    # two-tensor wrapper byte-identical to (q_log, log_prob).
+    from vfe3.contracts import PolicyRollout
+    from vfe3.inference.belief_cache import rollout_predictive_state_cached
+    from vfe3.inference.policy import _rollout_predictive_state
+    m = _model(use_prior_bank=use_prior_bank, n_heads=1)
+    assert cache_supported(m.cfg)
+    B, N, Kp, V, K = 2, 5, 4, m.cfg.vocab_size, m.cfg.embed_dim
+    torch.manual_seed(3)
+    context = torch.randint(0, V, (B, N))
+    candidates = torch.randint(0, V, (B, Kp, L))
+    with torch.no_grad():
+        base_logits = m.forward(context)[:, -1, :]
+        state = rollout_predictive_state_cached(context, candidates, m, base_logits=base_logits)
+        q_cache, lp_cache = rollout_predictive_cached(context, candidates, m, base_logits=base_logits)
+        full = _rollout_predictive_state(context, candidates, m, base_logits=base_logits)
+    assert isinstance(state, PolicyRollout)
+    assert torch.equal(state.q_log, q_cache) and torch.equal(state.log_prob, lp_cache)
+    assert state.mu.shape == (B, Kp, K) and state.sigma.shape == (B, Kp, K)
+    # _rollout_predictive_state routes through the cache on a supported config, so it IS this state.
+    assert torch.equal(full.mu, state.mu) and torch.equal(full.sigma, state.sigma)
+    assert (state.sigma > 0).all()
+
+
 def test_noncache_policy_rollout_decodes_only_terminal_position(monkeypatch):
     m = _model(n_e_steps=2)                                # unsupported cache -> full rollout path
     B, N, Kp, L, V = 2, 5, 3, 2, m.cfg.vocab_size

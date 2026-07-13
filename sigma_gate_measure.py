@@ -14,18 +14,46 @@ The artifact is written to vfe3_policy_results/sigma_gate/<checkpoint_id>.json w
 so the policy_sigma_ambiguity_validated config flag can be bound to a matching PASS record (Guard 4).
 """
 import dataclasses
-import hashlib
 import os
-import subprocess
 
 import torch
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import make_dataloader
-from vfe3.inference.sigma_gate import measure_sigma_gate
+from vfe3.inference.sigma_gate import (
+    SEALED_MEASUREMENT_CONTEXT,
+    measure_sigma_gate,
+    sigma_consumer_code_identity,
+    sigma_gate_spec_identity,
+    sigma_measurement_context,
+)
 from vfe3.model.model import VFEModel
+from vfe3.run_artifacts import (
+    model_behavior_fingerprint,
+    semantic_config_fingerprint,
+    sigma_behavior_config,
+)
 
 SPEC = "docs/superpowers/specs/2026-06-28-active-inference-efe-policy-scorer-spec.md"
+
+
+def _verify_sealed_config(cfg):
+    r"""Reject any edited CONFIG value that differs from the sealed measurement context (PB-06), so the
+    producer cannot silently measure another dataset/split/loader than the pre-registered one."""
+    sealed = {
+        "dataset":     SEALED_MEASUREMENT_CONTEXT["dataset"],
+        "split":       SEALED_MEASUREMENT_CONTEXT["split"],
+        "seq_len":     SEALED_MEASUREMENT_CONTEXT["requested_seq_len"],
+        "batch_size":  SEALED_MEASUREMENT_CONTEXT["batch_size"],
+        "max_batches": SEALED_MEASUREMENT_CONTEXT["max_batches"],
+        "seeds":       tuple(SEALED_MEASUREMENT_CONTEXT["seeds"]),
+    }
+    for key, want in sealed.items():
+        got = tuple(cfg[key]) if key == "seeds" else cfg[key]
+        if got != want:
+            raise ValueError(
+                f"sigma_gate_measure CONFIG[{key!r}]={got!r} differs from the sealed measurement context "
+                f"{want!r}; the gate must measure the pre-registered context (spec Sections 4.5/4.7).")
 
 CONFIG = dict(
     checkpoint="",                       # REQUIRED: path to the operating-point checkpoint (.pt)
@@ -40,34 +68,6 @@ CONFIG = dict(
     # The model arch is read from the checkpoint's stored config (save_checkpoint saves asdict(cfg)),
     # so any saved checkpoint loads as-is with no manual arch entry to get wrong.
 )
-
-
-def spec_commit():
-    r"""Provenance stamp for the governing spec (audit F2, 2026-06-28). Returns the spec's last commit
-    hash when the spec is tracked and clean; otherwise a content-bound stamp, so a gate artifact can
-    never look commit-bound while the governing spec is actually untracked or dirty (the old code fell
-    back to `git rev-parse HEAD`, binding the artifact to the code revision rather than the spec text).
-    Formats:
-      <commit>               tracked and clean
-      <commit>+dirty:<sha12> tracked with uncommitted edits
-      untracked:<sha12>      not in git
-      unknown                git or the spec file is unavailable
-    where <sha12> is the first 12 hex digits of sha256(spec bytes)."""
-    def _git(*a):
-        try:
-            return subprocess.run(["git", *a], capture_output=True, text=True, check=True).stdout.strip()
-        except Exception:
-            return ""
-    try:
-        with open(SPEC, "rb") as f:
-            sha12 = hashlib.sha256(f.read()).hexdigest()[:12]
-    except Exception:
-        return "unknown"
-    commit = _git("log", "-1", "--format=%H", "--", SPEC)
-    if not commit:
-        return f"untracked:{sha12}"
-    dirty = bool(_git("status", "--porcelain", "--", SPEC))
-    return f"{commit}+dirty:{sha12}" if dirty else commit
 
 
 def load_model_from_checkpoint(path, device):
@@ -92,7 +92,13 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if not cfg["checkpoint"]:
         raise ValueError("set CONFIG['checkpoint'] to an operating-point checkpoint path before running")
-    print(f"device={device}  checkpoint={cfg['checkpoint']}  spec_commit={spec_commit()[:12]}")
+    _verify_sealed_config(cfg)
+    spec = sigma_gate_spec_identity()
+    if spec == "unknown":
+        raise ValueError(
+            "the governing specification identity is 'unknown' (missing/undecodable governing docs); "
+            "restore them before measuring the gate (spec Sections 4.5/4.7).")
+    print(f"device={device}  checkpoint={cfg['checkpoint']}  spec_identity={spec[:12]}")
     if device == "cpu":
         print("WARNING: running on CPU; the iterative E-step belief replay is slow. Run on the GPU.")
 
@@ -104,9 +110,18 @@ def main():
     loader = make_dataloader(cfg["dataset"], cfg["split"], seq_len, cfg["batch_size"],
                              shuffle=False, drop_last=True, vocab_size=mcfg.vocab_size)
 
+    # PB-06 provenance the consumer gate binds to: the exact non-policy behavior fingerprint, the
+    # declared-source code identity, and the sealed loader/statistic context + its fingerprint.
+    behavior = model_behavior_fingerprint(sigma_behavior_config(mcfg), model.state_dict())
+    code_identity = sigma_consumer_code_identity()
+    meas_context = sigma_measurement_context(mcfg)
+    context_fp = semantic_config_fingerprint(meas_context)
+
     record = measure_sigma_gate(
-        model, loader, checkpoint_id=cfg["checkpoint_id"], spec_commit=spec_commit(),
-        seeds=cfg["seeds"], out_dir=cfg["out_dir"], max_batches=cfg["max_batches"], device=device)
+        model, loader, checkpoint_id=cfg["checkpoint_id"], spec_commit=spec,
+        seeds=cfg["seeds"], out_dir=cfg["out_dir"], max_batches=cfg["max_batches"], device=device,
+        model_behavior_sha256=behavior, code_identity_sha256=code_identity,
+        measurement_context=meas_context, measurement_context_sha256=context_fp)
 
     print(f"\n=== sigma-validation gate: {record['status']} ===")
     print(f"  n_tokens            {record['n_tokens']}")
