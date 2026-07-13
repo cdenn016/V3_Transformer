@@ -1572,48 +1572,71 @@ class VFEModel(nn.Module):
         # (s_e_step=False) the s-channel blocks reduce with mean() (per-position) while the belief
         # channel sums (free_energy.py); lambda_h / lambda_gamma are calibrated against that
         # per-position scale, a fixed 1/(B*N) relative to the sum-reduced belief block.
-        if self.cfg.lambda_h > 0.0 and not self.cfg.s_e_step:
-            # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
-            # lines 1241-1249): L += lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
-            # regularized toward the global hyper-prior centroid r. Opt-in, default-off
-            # (lambda_h=0 -> byte-identical to the term-absent path). Grad-connected (no detach), so
-            # it backprops to the learned s/r tables (the channel trains), and computed from the
-            # converged s/r tables OUTSIDE the E-step (s_i does not couple into q this increment).
-            # The h->s->p->q coupling and the s-channel E-step update remain DEFERRED. The weight is
-            # now applied INSIDE _hyper_prior_term via the lambda_h_mode registry (constant: cfg.lambda_h;
-            # state_dependent: the envelope lambda_h*_i=c0_h/(b0_h+KL) + R_h),
-            # so the term is added directly with NO external lambda_h factor (byte-identical for constant).
-            loss = loss + self._hyper_prior_term(token_ids)
-        if self.cfg.lambda_gamma > 0.0 and not self.cfg.s_e_step:
-            # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
-            # lines 1241-1249): L += lambda_gamma * mean_i F_red^s_i, the reduced (envelope) form of
-            # the model-coupling block sum_ij [ gamma_ij KL(s_i||Omega_tilde_ij s_j) + tau_g gamma_ij
-            # log(gamma_ij/pi^s_ij) ], with optimal gamma_ij = softmax_j(log pi^s - E^s/tau_g) and, at
-            # the optimum, the block = -tau_g log Z^s_i. The s-channel is the SAME softmax-over-KL
-            # object as the belief beta block, so it REUSES pairwise_energy + reduced_free_energy with
-            # (q,p,beta,pi,tau) -> (s,Omega s,gamma,pi^s,tau_g). The s tables are always diagonal (V,K),
-            # so the kernel is DiagonalGaussian regardless of cfg.family; divergence_family is the
-            # orthogonal functional seam. Omega_tilde is the selected flat model-frame cocycle,
-            # tied to the converged belief frame by default or independently parameterized under
-            # s_frame_mode='phi_tilde'. It is DETACHED on this scored path, so the gamma
-            # gradient flows ONLY to the s tables and the forward (logits/ce above) is byte-identical
-            # to the gamma=0 path (the model channel is predictively INERT: s does NOT feed q). The
-            # detach deliberately severs the model-frame <- gamma coupling that a scored frame update would carry in
-            # the canonical E-step F; restoring it (or keeping it severed) is part of the deferred s->q
-            # design, NOT this term. Audit 2026-07-12 N17: together with _refine_s pinning its
-            # e_phi_lr to 0.0, this severs the gamma-sourced frame force dF_gamma/dphi on EVERY
-            # executable route, with no exposing toggle -- the PASSIVE-frame reading is the intended
-            # interim pure path (see the lambda_gamma config note); only an indirect second-order
-            # path to phi_embed survives under s_e_step+unroll via the graph-attached model frame.
-            # Computed once per forward at the loss level (like diagnostics()).
-            # The body lives in _gamma_coupling_term so diagnostics logs the SAME term (audit V2).
-            tied_model_frame = self.cfg.s_frame_mode == "tied"
-            model_phi = self._resolve_model_frame(token_ids, belief.phi)
-            loss = loss + self.cfg.lambda_gamma * self._gamma_coupling_term(
-                token_ids, model_phi.detach(),
-                omega=(belief.omega.detach()
-                       if tied_model_frame and belief.omega is not None else None),
-                reflection=(belief.reflection if tied_model_frame else None))
+        # HYPER-PRIOR + MODEL-COUPLING CHANNELS via the SINGLE typed hierarchical evaluator (PB-10):
+        # the two scored s-channel blocks (both gated on `not s_e_step`) are assembled as zero q rows
+        # plus live h/s rows through hierarchical_free_energy_terms with model_reduction='mean', and
+        # added ONCE to the unchanged legacy q loss instead of two independent += increments. The
+        # canonical gamma branch now carries the mathematically equal coupling-plus-entropy
+        # decomposition (via _gamma_coupling_rows) rather than the fused reduced envelope, so its fp32
+        # association changes (no bitwise claim on the active model channel); the all-off pure path
+        # (lambda_h == lambda_gamma == 0) skips the block entirely and stays byte-identical.
+        if (self.cfg.lambda_h > 0.0 or self.cfg.lambda_gamma > 0.0) and not self.cfg.s_e_step:
+            from vfe3.free_energy import hierarchical_free_energy_terms
+            cfg = self.cfg
+            hyper_prior_rows = None
+            model_coupling_rows = None
+            meta_entropy_rows = None
+            if cfg.lambda_h > 0.0:
+                # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
+                # lines 1241-1249): lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
+                # regularized toward the global hyper-prior centroid r. Grad-connected (no detach), so
+                # it backprops to the learned s/r tables, computed from the converged s/r tables OUTSIDE
+                # the E-step (s_i does not couple into q this increment). The h->s->p->q coupling and the
+                # s-channel E-step update remain DEFERRED. The weight is applied INSIDE
+                # _hyper_prior_weighted via the lambda_h_mode registry (constant: cfg.lambda_h;
+                # state_dependent: the envelope lambda_h*_i=c0_h/(b0_h+KL) + R_h), so the per-token row
+                # is added with NO external lambda_h factor; model_reduction='mean' reproduces the old
+                # mean_i reduction (== the prior _hyper_prior_term).
+                hyper_prior_rows = self._hyper_prior_weighted(token_ids)          # (B, N) WEIGHTED
+            if cfg.lambda_gamma > 0.0:
+                # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
+                # lines 1241-1249): lambda_gamma * mean_i [ sum_j gamma_ij KL(s_i||Omega_tilde_ij s_j)
+                # + tau_g sum_j gamma_ij log(gamma_ij/pi^s_ij) ], with gamma_ij = softmax_j(log pi^s -
+                # E^s/tau_g). The s-channel is the SAME softmax-over-KL object as the belief beta block.
+                # Omega_tilde is the selected flat model-frame cocycle, tied to the converged belief frame
+                # by default or independently parameterized under s_frame_mode='phi_tilde'; it is DETACHED
+                # on this scored path, so the gamma gradient flows ONLY to the s tables and the forward
+                # (logits/ce above) is byte-identical to the gamma=0 path (the model channel is
+                # predictively INERT: s does NOT feed q). The detach deliberately severs the
+                # model-frame <- gamma coupling a scored frame update would carry; audit 2026-07-12 N17:
+                # together with _refine_s pinning e_phi_lr to 0.0 this severs dF_gamma/dphi on EVERY
+                # executable route, with no exposing toggle -- the PASSIVE-frame reading is the intended
+                # interim pure path (see the lambda_gamma config note). _gamma_coupling_rows returns the
+                # per-query coupling and meta-entropy split (head_reduction='mean' matching the live
+                # _gamma_coupling_term average over B/H/N); include_attention_entropy=False is the
+                # surrogate (coupling only), so the meta row is then an exact zero.
+                tied_model_frame = cfg.s_frame_mode == "tied"
+                model_phi = self._resolve_model_frame(token_ids, belief.phi)
+                c_rows, me_rows = self._gamma_coupling_rows(
+                    token_ids, model_phi.detach(), head_reduction="mean",
+                    omega=(belief.omega.detach()
+                           if tied_model_frame and belief.omega is not None else None),
+                    reflection=(belief.reflection if tied_model_frame else None))
+                model_coupling_rows = cfg.lambda_gamma * c_rows                   # (B, N)
+                meta_entropy_rows = (cfg.lambda_gamma * me_rows
+                                     if cfg.include_attention_entropy
+                                     else torch.zeros_like(c_rows))
+            ref = hyper_prior_rows if hyper_prior_rows is not None else model_coupling_rows
+            zeros = torch.zeros_like(ref)                                         # (B, N) zero rows
+            if hyper_prior_rows is None:
+                hyper_prior_rows = zeros
+            if model_coupling_rows is None:
+                model_coupling_rows = zeros
+                meta_entropy_rows = zeros
+            loss = loss + hierarchical_free_energy_terms(
+                zeros, zeros, zeros, zeros,
+                hyper_prior_rows, model_coupling_rows, meta_entropy_rows, zeros,
+                q_reduction="sum", model_reduction="mean").total
         return logits, loss, ce.detach()
 
     @property
@@ -1826,6 +1849,47 @@ class VFEModel(nn.Module):
                 * (torch.log(gamma_w.clamp(min=eps)) - torch.log(pi_s.clamp(min=eps)))).sum()
         total = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior).sum()
         return {"coupling": coupling, "meta_entropy": meta, "total": total}
+
+    def _gamma_coupling_rows(
+        self,
+        token_ids:      torch.Tensor,       # (B, N) integer token ids
+        phi:            torch.Tensor,       # (B, N, n_gen) explicit model frame (caller detaches)
+
+        *,
+        head_reduction: str,                # 'mean' (training) | 'sum' (diagnostics) over heads
+        eps:            float = 1e-12,
+        omega:          'torch.Tensor | CompactBlockElement | None' = None,  # stored belief frame; None -> phi
+        reflection:     Optional[torch.Tensor] = None,  # (B, N) per-token sign s_i; None -> off
+        s_belief:       'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s)
+    ) -> 'tuple[torch.Tensor, torch.Tensor]':  # (B, N) coupling rows, (B, N) meta-entropy rows
+        r"""Per-query (B, N) split of the gamma model-coupling block: the coupling row
+        sum_j gamma_ij E^s_ij and the meta-entropy row tau_g sum_j gamma_ij log(gamma_ij/pi^s_ij),
+        each UNWEIGHTED (the caller applies lambda_gamma). After summing the key axis the head axis is
+        reduced by ``head_reduction``: ``"mean"`` for the forward loss -- turning (B,H,N) into (B,N)
+        so that ``model_reduction="mean"`` reproduces the live :meth:`_gamma_coupling_term` average
+        over B/H/N -- and ``"sum"`` for diagnostics, preserving its existing sum-over-heads scale. The
+        single-block (single-head) path inserts and then removes a singleton head axis so both
+        reductions run through the same code. gamma is the exact softmax of E^s (undetached), so the
+        s tables carry gradient; the row split is the mathematically equal coupling-plus-entropy form
+        of the fused envelope (their fp32 association differs -- no bitwise claim)."""
+        from vfe3.free_energy import _broadcast_tau, attention_weights
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(
+            token_ids, phi, omega=omega, reflection=reflection, s_belief=s_belief)
+        gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
+        pi_s = (torch.softmax(gamma_log_prior, dim=-1) if gamma_log_prior is not None
+                else torch.full_like(gamma_w, 1.0 / gamma_w.shape[-1]))
+        tau_e = _broadcast_tau(gamma_tau, e_s)                        # (H,1,1) per-head, else scalar
+        coupling_key = (gamma_w * e_s).sum(dim=-1)                    # (B, [H,] N)
+        meta_key = (tau_e * gamma_w
+                    * (torch.log(gamma_w.clamp(min=eps)) - torch.log(pi_s.clamp(min=eps)))).sum(dim=-1)
+        if coupling_key.dim() == 2:                                   # single-block: insert singleton head
+            coupling_key = coupling_key.unsqueeze(1)                  # (B, 1, N)
+            meta_key = meta_key.unsqueeze(1)
+        if head_reduction == "mean":
+            return coupling_key.mean(dim=1), meta_key.mean(dim=1)     # (B, N)
+        if head_reduction == "sum":
+            return coupling_key.sum(dim=1), meta_key.sum(dim=1)       # (B, N)
+        raise ValueError(f"head_reduction must be 'mean' or 'sum', got {head_reduction!r}")
 
     @torch.no_grad()
     def gamma_attention_maps(
@@ -2594,25 +2658,53 @@ class VFEModel(nn.Module):
         # into ``total`` at the SAME sum scale, so train.py's uniform per-token /n_tok yields a
         # commensurate decomposition (the prior fold added per-token MEANS into the per-sequence SUM
         # total -- a 1/N under-weight of the model channel).
-        if cfg.lambda_h > 0.0 or cfg.s_e_step:                       # r table exists on this path
-            d["hyper_prior"] = float(self._hyper_prior_kl(token_ids[:1], s_belief=s_belief).sum())   # sum_i KL(s_i||r) (refined s1 under s_e_step)
-            _hp_weighted = float(self._hyper_prior_weighted(token_ids[:1], s_belief=s_belief).sum())  # WEIGHTED (lambda_h_mode); == cfg.lambda_h*hyper_prior for 'constant'
-            d["hyper_prior_weighted"] = _hp_weighted                                      # EXACT contribution folded into total (state_dependent != cfg.lambda_h*raw); the F-decomposition figure reads this
-            d["total"] += _hp_weighted
-        if cfg.lambda_gamma > 0.0 or cfg.s_e_step:                  # gamma block evaluated at out.phi
-            tied_model_frame = cfg.s_frame_mode == "tied"
-            gamma_model_phi = (self._resolve_model_frame(token_ids[:1], out.phi.unsqueeze(0))
-                               if snapshot is None else snapshot.model_phi[:1])
-            g = self._gamma_coupling_terms(
-                token_ids[:1], gamma_model_phi,
-                omega=(out.omega.unsqueeze(0)
-                       if tied_model_frame and out.omega is not None else None),
-                reflection=(out.reflection.unsqueeze(0)
-                            if tied_model_frame and out.reflection is not None else None),
-                s_belief=s_belief)
-            d["gamma_coupling"]     = float(g["coupling"])           # raw sum_{h,i,j} gamma E^s
-            d["gamma_meta_entropy"] = float(g["meta_entropy"])       # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
-            d["total"] += cfg.lambda_gamma * (d["gamma_coupling"] + d["gamma_meta_entropy"])
+        # The whole q/p/s/h decomposition is reassembled ONCE through the single typed evaluator
+        # (PB-10): the live hyper-prior/gamma rows join the per-query belief rows (built from the
+        # captured beta) with q_reduction='sum', model_reduction='sum' -- the persisted per-sequence
+        # SUM scale -- instead of incrementing d["total"] independently per model block.
+        hyper_active = cfg.lambda_h > 0.0 or cfg.s_e_step            # r table exists on this path
+        gamma_active = cfg.lambda_gamma > 0.0 or cfg.s_e_step        # gamma block evaluated at out.phi
+        if hyper_active or gamma_active:
+            from vfe3.alpha_i import alpha_is_per_coord
+            from vfe3.free_energy import _belief_free_energy_rows, hierarchical_free_energy_terms
+            belief_rows = _belief_free_energy_rows(                  # (N,) q rows for seq 0 (reuse beta)
+                self_div, energy, alpha, tau=_tau_b, lambda_beta=_lb,
+                lambda_twohop=cfg.lambda_twohop,
+                include_attention_entropy=cfg.include_attention_entropy,
+                log_prior=log_prior,
+                alpha_reg=(alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
+                coupling_energy=coupling_energy, log_likelihood=log_likelihood,
+                beta_override=beta,
+                per_coord=alpha_is_per_coord(cfg.lambda_alpha_mode))  # exact axis truth (no inference)
+            zeros = torch.zeros_like(belief_rows.self_coupling)      # (N,)
+            hyper_prior_rows = zeros
+            model_coupling_rows = zeros
+            meta_entropy_rows = zeros
+            if hyper_active:
+                d["hyper_prior"] = float(self._hyper_prior_kl(token_ids[:1], s_belief=s_belief).sum())   # sum_i KL(s_i||r) (refined s1 under s_e_step)
+                hyper_prior_rows = self._hyper_prior_weighted(token_ids[:1], s_belief=s_belief)[0]        # (N,) WEIGHTED (lambda_h_mode); == cfg.lambda_h*KL for 'constant'
+                d["hyper_prior_weighted"] = float(hyper_prior_rows.sum())                                 # EXACT contribution folded into total; the F-decomposition figure reads this
+            if gamma_active:
+                tied_model_frame = cfg.s_frame_mode == "tied"
+                gamma_model_phi = (self._resolve_model_frame(token_ids[:1], out.phi.unsqueeze(0))
+                                   if snapshot is None else snapshot.model_phi[:1])
+                c_rows, me_rows = self._gamma_coupling_rows(         # (1, N) rows: sum over heads
+                    token_ids[:1], gamma_model_phi, head_reduction="sum",
+                    omega=(out.omega.unsqueeze(0)
+                           if tied_model_frame and out.omega is not None else None),
+                    reflection=(out.reflection.unsqueeze(0)
+                                if tied_model_frame and out.reflection is not None else None),
+                    s_belief=s_belief)
+                d["gamma_coupling"]     = float(c_rows[0].sum())     # raw sum_{h,i,j} gamma E^s
+                d["gamma_meta_entropy"] = float(me_rows[0].sum())    # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
+                model_coupling_rows = cfg.lambda_gamma * c_rows[0]   # (N,)
+                meta_entropy_rows = cfg.lambda_gamma * me_rows[0]
+            d["total"] = float(hierarchical_free_energy_terms(
+                belief_rows.self_coupling, belief_rows.belief_coupling,
+                belief_rows.attention_entropy, belief_rows.twohop_coupling,
+                hyper_prior_rows, model_coupling_rows, meta_entropy_rows,
+                belief_rows.observation_nll,
+                q_reduction="sum", model_reduction="sum").total)
         spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
         d["effective_rank"] = float(metrics.effective_rank(spec).mean())
         # Gauge-geometry probes (diagnostics tier): the curvature proxy -- mean Frobenius departure
