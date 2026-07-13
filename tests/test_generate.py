@@ -426,3 +426,44 @@ def test_generate_efe_builds_both_arms_before_pairing_cpu_and_cuda_rng(monkeypat
     assert torch.equal(cuda_states[0][0], cuda_states[1][0])
     assert base_out.tolist() == [[0]]
     assert policy_out.tolist() == [[0]]
+
+
+# ======================================================================================
+# PB-06: sigma_mc consumer gate wiring in generate() -- fail-closed, and never touched off the arm.
+# ======================================================================================
+
+def test_generate_none_policy_never_touches_sigma_providers(monkeypatch):
+    from vfe3.inference import sigma_gate as sg
+
+    def _boom(*a, **k):
+        raise AssertionError("policy_mode='none' must not inspect the sigma specification")
+
+    monkeypatch.setattr(sg, "sigma_gate_spec_identity", _boom)
+    monkeypatch.setattr(sg, "sigma_consumer_code_identity", _boom)
+    monkeypatch.setattr(sg, "verify_sigma_consumer_gate", _boom)
+    model = _tiny_model()                                       # policy_mode='none'
+    out = model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=2, greedy=True)
+    assert out.shape == (1, 5)
+
+
+def test_generate_likelihood_entropy_policy_never_touches_sigma_providers(monkeypatch):
+    from vfe3.inference import sigma_gate as sg
+
+    def _boom(*a, **k):
+        raise AssertionError("non-sigma_mc ambiguity must not read the sigma artifact")
+
+    monkeypatch.setattr(sg, "sigma_gate_spec_identity", _boom)
+    monkeypatch.setattr(sg, "verify_sigma_consumer_gate", _boom)
+    model = _tiny_model(policy_mode="efe_one_step", policy_preference="flat", policy_top_k=4)
+    out = model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=2, greedy=True)
+    assert out.shape == (1, 5)
+
+
+def test_generate_sigma_mc_calls_consumer_gate_and_fails_closed():
+    # A model whose ambiguity is flipped to sigma_mc after construction must fail closed at the consumer
+    # boundary: the production preregistry resolves the live spec identity to FAIL, so generate() raises
+    # (it never reaches the not-yet-implemented estimator).
+    model = _tiny_model(policy_mode="efe_one_step", policy_preference="flat", policy_top_k=4)
+    model.cfg.policy_ambiguity_mode = "sigma_mc"
+    with pytest.raises(ValueError):
+        model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=1, greedy=True)

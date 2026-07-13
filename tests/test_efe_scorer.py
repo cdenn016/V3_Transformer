@@ -368,6 +368,39 @@ def test_preference_builders():
     assert torch.allclose(hop, p_data.log(), atol=1e-5)
 
 
+def test_rollout_predictive_state_full_path_carries_terminal_state():
+    # PB-06: the state-carrying rollout returns the terminal belief mean/covariance alongside q_log and
+    # the raw continuation log-prob, and the two-tensor wrapper stays byte-identical to (q_log, log_prob).
+    from vfe3.contracts import PolicyRollout
+    from vfe3.inference.policy import _rollout_predictive_state
+    from vfe3.inference.belief_cache import cache_supported
+    m = _model()                                            # n_layers=2, n_e_steps=2 -> NOT cache-supported
+    assert not cache_supported(m.cfg)
+    ctx = torch.tensor([[1, 2, 3, 4, 5]])
+    cand, base = _menu(m, ctx, Kp=4)
+    B, Kp, K = 1, 4, m.cfg.embed_dim
+    with torch.no_grad():
+        state = _rollout_predictive_state(ctx, cand, m, base_logits=base)
+        q_log, log_prob = _rollout_predictive(ctx, cand, m, base_logits=base)
+    assert isinstance(state, PolicyRollout)
+    assert torch.equal(state.q_log, q_log) and torch.equal(state.log_prob, log_prob)
+    assert state.mu.shape == (B, Kp, K)                     # (B, Kp, K) terminal mean
+    assert state.sigma.shape == (B, Kp, K)                  # (B, Kp, K) diagonal terminal covariance
+    assert torch.isfinite(state.mu).all() and (state.sigma > 0).all()
+
+
+def test_rollout_predictive_state_full_covariance_shape():
+    m = _model(n_heads=1, family="gaussian_full", use_prior_bank=True, decode_mode="full")
+    from vfe3.inference.policy import _rollout_predictive_state
+    ctx = torch.tensor([[1, 2, 3, 4, 5]])
+    cand, base = _menu(m, ctx, Kp=3)
+    B, Kp, K = 1, 3, m.cfg.embed_dim
+    with torch.no_grad():
+        state = _rollout_predictive_state(ctx, cand, m, base_logits=base)
+    assert state.sigma.shape == (B, Kp, K, K)               # (B, Kp, K, K) full terminal covariance
+    assert state.mu.shape == (B, Kp, K)
+
+
 def test_preference_builders_are_device_aware():
     # audit F5 (2026-06-28): the generic builders must honor the requested device, else generate() on
     # CUDA builds a CPU preference and hits a CPU/CUDA mismatch. Default (device=None) stays on CPU for

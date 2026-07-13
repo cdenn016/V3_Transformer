@@ -2143,6 +2143,39 @@ class VFEModel(nn.Module):
                 UserWarning,
                 stacklevel=2,
             )
+        # PB-06 sigma-consumer gate: WHEN AND ONLY WHEN the ambiguity arm is the gated 'sigma_mc', derive
+        # the four live identities ONCE and verify the pre-registered consumer gate before any rollout,
+        # then thread them through _policy_select. policy_ambiguity_mode='likelihood_entropy' (and
+        # policy_mode='none') never hashes the model/code/corpus, inspects the specification, or reads the
+        # artifact -- the pure path stays untouched. Providers are resolved through vfe3.inference.sigma_gate
+        # at call time (no unpatchable aliases).
+        sigma_gate_ids: Dict[str, Optional[str]] = {}
+        if self.cfg.policy_ambiguity_mode == "sigma_mc":
+            from vfe3.inference import sigma_gate
+            from vfe3.run_artifacts import (model_behavior_fingerprint, semantic_config_fingerprint,
+                                            sigma_behavior_config)
+            behavior = model_behavior_fingerprint(sigma_behavior_config(self.cfg), self.state_dict())
+            spec = sigma_gate.sigma_gate_spec_identity()
+            if spec == "unknown":
+                raise ValueError(
+                    "policy_ambiguity_mode='sigma_mc' requires a resolvable governing specification "
+                    "identity; sigma_gate_spec_identity() returned 'unknown'.")
+            code = sigma_gate.sigma_consumer_code_identity()
+            meas_context = sigma_gate.sigma_measurement_context(self.cfg)
+            context_fp = semantic_config_fingerprint(meas_context)
+            sigma_gate.verify_sigma_consumer_gate(
+                self.cfg.policy_sigma_gate_artifact,
+                actual_model_behavior_sha256=behavior,
+                actual_spec_identity=spec,
+                actual_code_identity_sha256=code,
+                actual_measurement_context_sha256=context_fp,
+            )
+            sigma_gate_ids = dict(
+                model_behavior_sha256=behavior,
+                sigma_spec_identity=spec,
+                sigma_code_identity_sha256=code,
+                sigma_measurement_context_sha256=context_fp,
+            )
         seq = token_ids
         for _ in range(max_new_tokens):
             if self.cfg.policy_mode == "none":
@@ -2205,7 +2238,7 @@ class VFEModel(nn.Module):
                 # EFE policy rerank (no_grad). Reached only under a non-default policy_mode toggle, so
                 # default generation (policy_mode='none') is byte-identical (spec Section 3.4).
                 context = seq                                             # policy paths never truncate context
-                next_token = self._policy_select(context, greedy=greedy)   # (B, 1)
+                next_token = self._policy_select(context, greedy=greedy, **sigma_gate_ids)   # (B, 1)
             seq = torch.cat([seq, next_token], dim=-1)
         return seq
 
@@ -2216,6 +2249,10 @@ class VFEModel(nn.Module):
 
         *,
         greedy:  bool = True,            # True -> argmax the policy posterior; else sample it
+        model_behavior_sha256:      Optional[str] = None,   # PB-06 consumer-gate identities (sigma_mc only)
+        sigma_spec_identity:        Optional[str] = None,
+        sigma_code_identity_sha256: Optional[str] = None,
+        sigma_measurement_context_sha256: Optional[str] = None,
     ) -> torch.Tensor:                   # (B, 1) selected next-token id
         r"""EFE policy selection over a top-``policy_top_k`` candidate menu (spec Section 3.4).
 
@@ -2276,6 +2313,11 @@ class VFEModel(nn.Module):
             context, candidates, preference, self,
             gamma=self.cfg.policy_precision, horizon=self.cfg.policy_horizon,
             score_terms=self.cfg.policy_score_terms, log_prior=log_prior, base_logits=base_logits,
+            ambiguity_mode=self.cfg.policy_ambiguity_mode,
+            model_behavior_sha256=model_behavior_sha256,
+            sigma_spec_identity=sigma_spec_identity,
+            sigma_code_identity_sha256=sigma_code_identity_sha256,
+            sigma_measurement_context_sha256=sigma_measurement_context_sha256,
         )
         if greedy:
             idx = out.policy_posterior.argmax(dim=-1, keepdim=True)         # (B, 1) menu index

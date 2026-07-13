@@ -57,6 +57,24 @@ class MetropolisObjectiveContext(NamedTuple):
     prior:     EffectiveBetaPriorContext         # fixed pre-stack effective-prior context (folds rebuilt per candidate)
 
 
+class PolicyRollout(NamedTuple):
+    r"""The state-carrying result of one EFE candidate rollout (PB-06).
+
+    Extends the historical two-tensor ``(q_log, log_prob)`` return with the TERMINAL belief moments read
+    at the last appended position, so a sigma-dependent ambiguity estimator can read the belief
+    covariance the rollout actually converged to (the sigma-free ``likelihood_entropy`` arm ignores
+    ``mu``/``sigma``). ``mu`` is ``(B, Kp, K)`` and ``sigma`` is ``(B, Kp, K)`` (diagonal family) or
+    ``(B, Kp, K, K)`` (full family). The full path reads them from the returned ``BeliefState``; the
+    cached path reads them from the appended positions after the same block_norm/final_norm that produced
+    ``q_log``. The compatibility wrappers ``_rollout_predictive`` / ``rollout_predictive_cached`` return
+    exactly ``(q_log, log_prob)`` so existing two-tensor unpacking is unchanged."""
+
+    q_log:    torch.Tensor   # (B, Kp, V) log q(o|pi) at the terminal predictive
+    log_prob: torch.Tensor   # (B, Kp) raw first-action continuation log-prob under the base predictive
+    mu:       torch.Tensor   # (B, Kp, K) terminal belief mean
+    sigma:    torch.Tensor   # (B, Kp, K) or (B, Kp, K, K) terminal belief covariance
+
+
 class MStepCapture(TypedDict, total=False):
     """Mutable intermediates captured for the M-step self-coupling term."""
 

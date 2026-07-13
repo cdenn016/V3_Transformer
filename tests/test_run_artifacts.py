@@ -716,3 +716,96 @@ def test_provenance_hash_failure_warns_not_silent(tmp_path, caplog):
     assert prov["train_data_sha256"] is None                  # best-effort null, not a crash
     assert any("corrupt token stream" in rec.getMessage() and "train" in rec.getMessage()
                for rec in caplog.records), "hash failure was swallowed silently"
+
+
+# ======================================================================================
+# PB-06: model_behavior_fingerprint + sigma_behavior_config (non-policy behavior projection).
+# ======================================================================================
+from vfe3.run_artifacts import model_behavior_fingerprint, sigma_behavior_config
+
+
+def _sigma_model(seed=0, **kw):
+    d = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+             n_e_steps=1, e_phi_lr=0.0, family="gaussian_diagonal", seed=seed)
+    d.update(kw)
+    torch.manual_seed(seed)
+    return VFEModel(VFE3Config(**d))
+
+
+def test_sigma_behavior_config_drops_every_policy_field():
+    cfg = VFE3Config(policy_mode="none")
+    proj = sigma_behavior_config(cfg)
+    assert not any(k.startswith("policy_") for k in proj)
+    assert "decode_tau" in proj and "family" in proj and "divergence_family" in proj
+
+
+def test_sigma_behavior_config_invariant_to_policy_fields():
+    # A checkpoint config (policy_mode='none') and a consumer config (efe_rollout + different
+    # preference/score/top-k/horizon/gate fields) share the SAME behavior projection.
+    ckpt = VFE3Config(policy_mode="none")
+    consumer = VFE3Config(policy_mode="efe_rollout", policy_preference="flat", policy_horizon=2,
+                          policy_top_k=4, policy_score_terms=("risk",), policy_precision=2.0)
+    assert sigma_behavior_config(ckpt) == sigma_behavior_config(consumer)
+
+
+def test_sigma_behavior_config_accepts_mapping_and_matches_dataclass():
+    cfg = VFE3Config()
+    assert sigma_behavior_config(cfg) == sigma_behavior_config(asdict(cfg))
+
+
+def test_model_behavior_fingerprint_is_key_order_invariant():
+    m = _sigma_model()
+    sd = m.state_dict()
+    reordered = dict(reversed(list(sd.items())))
+    cfg_proj = sigma_behavior_config(m.cfg)
+    assert model_behavior_fingerprint(cfg_proj, sd) == model_behavior_fingerprint(cfg_proj, reordered)
+
+
+def test_model_behavior_fingerprint_sensitive_to_one_changed_value():
+    m = _sigma_model()
+    sd = m.state_dict()
+    cfg_proj = sigma_behavior_config(m.cfg)
+    base = model_behavior_fingerprint(cfg_proj, sd)
+    key = next(iter(sd))
+    perturbed = {k: (v.clone() if k != key else v.clone()) for k, v in sd.items()}
+    perturbed[key].reshape(-1)[0] += 1.0
+    assert model_behavior_fingerprint(cfg_proj, perturbed) != base
+
+
+def test_model_behavior_fingerprint_sensitive_to_dtype_and_shape():
+    m = _sigma_model()
+    sd = m.state_dict()
+    cfg_proj = sigma_behavior_config(m.cfg)
+    base = model_behavior_fingerprint(cfg_proj, sd)
+    key = next(iter(sd))
+    dtype_changed = dict(sd); dtype_changed[key] = sd[key].to(torch.float64)
+    assert model_behavior_fingerprint(cfg_proj, dtype_changed) != base
+    shape_changed = dict(sd); shape_changed[key] = sd[key].reshape(-1)
+    assert model_behavior_fingerprint(cfg_proj, shape_changed) != base
+
+
+def test_model_behavior_fingerprint_sensitive_to_non_policy_config():
+    import dataclasses
+    m = _sigma_model()
+    sd = m.state_dict()
+    base = model_behavior_fingerprint(sigma_behavior_config(m.cfg), sd)
+    cfg2 = dataclasses.replace(m.cfg, decode_tau=m.cfg.decode_tau + 0.25)
+    assert model_behavior_fingerprint(sigma_behavior_config(cfg2), sd) != base
+
+
+def test_model_behavior_fingerprint_survives_state_dict_save_load(tmp_path):
+    m = _sigma_model()
+    cfg_proj = sigma_behavior_config(m.cfg)
+    base = model_behavior_fingerprint(cfg_proj, m.state_dict())
+    p = tmp_path / "sd.pt"
+    torch.save(m.state_dict(), p)
+    reloaded = torch.load(p, weights_only=True)
+    assert model_behavior_fingerprint(cfg_proj, reloaded) == base
+
+
+def test_model_behavior_fingerprint_rejects_non_tensor_value():
+    m = _sigma_model()
+    sd = dict(m.state_dict())
+    sd["__bogus__"] = "not a tensor"
+    with pytest.raises((TypeError, ValueError)):
+        model_behavior_fingerprint(sigma_behavior_config(m.cfg), sd)

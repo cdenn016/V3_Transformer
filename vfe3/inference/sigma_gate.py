@@ -27,7 +27,8 @@ import json
 import os
 import re
 import tempfile
-from typing import Dict, Optional, Tuple
+from pathlib import Path
+from typing import Dict, Mapping, Optional, Tuple
 
 import torch
 
@@ -175,13 +176,42 @@ def write_sigma_gate_artifact(
     spec_commit:   str,
     seeds:         Tuple[int, ...],
     out_dir:       str = "vfe3_policy_results/sigma_gate",
+    model_behavior_sha256:      Optional[str]                  = None,
+    code_identity_sha256:       Optional[str]                  = None,
+    measurement_context:        Optional[Mapping[str, object]] = None,
+    measurement_context_sha256: Optional[str]                  = None,
 ) -> str:                            # the written artifact path
     r"""Write the versioned, machine-readable gate artifact (spec Section 4.5) carrying the checkpoint
-    id, the spec commit hash, the seed list, and the full record with its PASS/FAIL stamp. The config
-    flag ``policy_sigma_ambiguity_validated`` may be set True only with a ``policy_sigma_gate_artifact``
-    reference to a PASS record whose spec commit matches (config.py Guard 4)."""
+    id, the (now content-based) spec identity, the seed list, and the full record with its PASS/FAIL
+    stamp. When supplied, the PB-06 provenance fields (``model_behavior_sha256``,
+    ``code_identity_sha256``, ``measurement_context`` + its fingerprint) are folded into the payload so a
+    consumer can bind the artifact to the exact model/source/data measured; the writer RECOMPUTES the
+    context fingerprint from the stored mapping and raises on a mismatch. The writer also REFUSES to
+    publish or overwrite a PASS under a resolved-FAIL preregistration (a reproduction is diagnostic-only;
+    a real PASS is a separate reviewed manifest-only update)."""
+    if record.get("status") == "PASS":
+        try:
+            prereg = load_sigma_gate_preregistry().get(spec_commit)
+        except ValueError:
+            prereg = None
+        if prereg is not None and prereg.get("status") == "FAIL":
+            raise ValueError(
+                f"refusing to write a PASS sigma-gate artifact under a resolved-FAIL preregistration for "
+                f"identity {spec_commit!r}; a reproduction is diagnostic-only (spec Section 4.5).")
     os.makedirs(out_dir, exist_ok=True)
     payload = dict(checkpoint_id=checkpoint_id, spec_commit=spec_commit, seeds=list(seeds), **record)
+    if measurement_context is not None:
+        from vfe3.run_artifacts import semantic_config_fingerprint
+        recomputed = semantic_config_fingerprint(measurement_context)
+        if measurement_context_sha256 is not None and recomputed != measurement_context_sha256:
+            raise ValueError(
+                "sigma-gate measurement_context_sha256 does not match the stored measurement_context")
+        payload["measurement_context"] = dict(measurement_context)
+        payload["measurement_context_sha256"] = recomputed
+    if model_behavior_sha256 is not None:
+        payload["model_behavior_sha256"] = model_behavior_sha256
+    if code_identity_sha256 is not None:
+        payload["code_identity_sha256"] = code_identity_sha256
     # Slugify the FILENAME only (a checkpoint_id carrying os.sep / '..' / a drive colon must not
     # escape out_dir); the payload above keeps the RAW checkpoint_id for provenance. The slug is
     # lossy ('ckpt a' / 'ckpt:a' / 'ckpt/a' all map to 'ckpt_a'), so a stable short hash of the
@@ -255,16 +285,275 @@ def measure_sigma_gate(
     max_batches:   Optional[int]  = 20,
     device:        Optional[torch.device] = None,
     write:         bool           = True,
+    model_behavior_sha256:      Optional[str]                  = None,
+    code_identity_sha256:       Optional[str]                  = None,
+    measurement_context:        Optional[Mapping[str, object]] = None,
+    measurement_context_sha256: Optional[str]                  = None,
     **gate_kwargs,
 ) -> Dict[str, object]:
     r"""End-to-end gate run: pull aligned per-token (tr_sigma, ce, conf, correct) from
     ``belief_ce_bank`` on the held-out loader, evaluate the gate, and (by default) write the artifact.
-    Returns the full record. ``write=False`` is for tests."""
+    Returns the full record. ``write=False`` is for tests. The PB-06 provenance fields
+    (``model_behavior_sha256``, ``code_identity_sha256``, ``measurement_context`` + its fingerprint) are
+    passed straight through to :func:`write_sigma_gate_artifact`."""
     from vfe3.viz.extract import belief_ce_bank
     bank = belief_ce_bank(model, loader, device=device, max_batches=max_batches)
     record = evaluate_sigma_gate(bank["tr_sigma"], bank["ce"], bank["conf"], bank["correct"],
                                  **gate_kwargs)
     if write:
         record["artifact_path"] = write_sigma_gate_artifact(
-            record, checkpoint_id=checkpoint_id, spec_commit=spec_commit, seeds=seeds, out_dir=out_dir)
+            record, checkpoint_id=checkpoint_id, spec_commit=spec_commit, seeds=seeds, out_dir=out_dir,
+            model_behavior_sha256=model_behavior_sha256, code_identity_sha256=code_identity_sha256,
+            measurement_context=measurement_context,
+            measurement_context_sha256=measurement_context_sha256)
+    return record
+
+
+# ======================================================================================
+# PB-06: content-based governing identity, consumer code identity, the sealed measurement context,
+# the preregistration manifest, and the strict sigma-consumer gate.
+# ======================================================================================
+
+# The governing preregistration records: the spec plus the sigma-gate pre-registration note. The
+# specification IDENTITY is a hash of THESE FILES' normalized content -- never a git commit SHA -- so
+# the commit that restored them is not circular with the identity that authorizes the gate.
+GOVERNING_SPEC_PATHS: Tuple[str, ...] = (
+    "docs/superpowers/specs/2026-06-28-active-inference-efe-policy-scorer-spec.md",
+    "docs/research/active-inference/2026-06-28-sigma-gate-prereg.md",
+)
+
+# Sealed gate-statistic thresholds. These MUST equal the ``thresholds`` mapping ``evaluate_sigma_gate``
+# stamps into a record, so a measured artifact's thresholds and its sealed context agree byte-for-byte.
+SEALED_GATE_THRESHOLDS: Dict[str, object] = {
+    "spearman_min": 0.2,
+    "ece_max":      0.05,
+    "alpha":        0.05,
+    "n_strata":     10,
+    "n_bins":       10,
+    "n_boot":       2000,
+    "n_perm":       1000,
+}
+
+# Sealed loader / sampler / statistic context (spec Sections 4.5/4.7). The consumer derives the SAME
+# mapping from the live config and current corpus; any drift fails the gate closed.
+SEALED_MEASUREMENT_CONTEXT: Dict[str, object] = {
+    "dataset":           "wikitext-103",
+    "split":             "test",
+    "requested_seq_len": 128,
+    "batch_size":        16,
+    "max_batches":       20,
+    "shuffle":           False,
+    "drop_last":         True,
+    "seeds":             [6, 23, 64],
+    "sigma_samples":     16,
+    "mc_seed":           0,
+    "sampling_rule":     "antithetic_shared_v1",
+    "statistic_seed":    0,
+}
+
+_PREREGISTRY_PATH = Path(__file__).resolve().parent / "sigma_gate_preregistry.json"
+
+
+def _governing_root(root: 'Optional[str | Path]') -> Path:
+    r"""The repository root the governing/source paths are resolved against (``vfe3/inference`` -> up 2)."""
+    return Path(__file__).resolve().parents[2] if root is None else Path(root)
+
+
+def _normalize_text_bytes(raw: bytes) -> bytes:
+    r"""UTF-8 decode then canonicalize CRLF and lone CR to LF, so a checkout's line-ending convention
+    (this host runs ``core.autocrlf=true``) never changes an identity. Raises on undecodable bytes."""
+    return raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
+def sigma_gate_spec_identity(
+    root: 'Optional[str | Path]' = None,
+) -> str:
+    r"""Content-based governing identity of the sigma gate (PB-06). Sorts the governing relative paths
+    lexicographically, then folds each UTF-8 path and its CRLF/CR-normalized UTF-8 content into a
+    SHA-256, with an 8-byte big-endian length delimiter immediately before each path and content
+    payload. It NEVER includes a git commit SHA, so the restored-doc commit is not circular; and it is
+    LF/CRLF/CR-invariant. Any missing or undecodable governing file yields ``"unknown"`` (fail-closed).
+    The producer and every consumer read the identity through this one helper."""
+    base = _governing_root(root)
+    digest = hashlib.sha256()
+    for rel in sorted(GOVERNING_SPEC_PATHS):
+        try:
+            content = (base / rel).read_bytes()
+            normalized = _normalize_text_bytes(content)
+        except (OSError, UnicodeDecodeError):
+            return "unknown"
+        rel_bytes = rel.encode("utf-8")
+        digest.update(len(rel_bytes).to_bytes(8, "big"))
+        digest.update(rel_bytes)
+        digest.update(len(normalized).to_bytes(8, "big"))
+        digest.update(normalized)
+    return digest.hexdigest()
+
+
+def sigma_consumer_code_identity(
+    root: 'Optional[str | Path]' = None,
+) -> str:
+    r"""Content identity of the executable sigma-arm sources (PB-06): every sorted ``vfe3/**/*.py`` file
+    plus ``sigma_gate_measure.py``, each folded as a length-delimited normalized relative path and
+    CRLF-normalized content, excluding ``__pycache__``. Generated artifacts, docs, tests, and the JSON
+    preregistry are naturally excluded (only ``*.py`` under ``vfe3`` and the one measurement script are
+    declared), so writing/replacing the gate JSON or updating the preregistry leaves this identity
+    unchanged while editing a copied policy/model source changes it. RAISES if any declared source is
+    unreadable -- an integrity error, unlike the fail-closed ``"unknown"`` of the spec identity."""
+    base = _governing_root(root)
+    declared = [p for p in (base / "vfe3").rglob("*.py") if "__pycache__" not in p.parts]
+    declared.append(base / "sigma_gate_measure.py")
+    entries = sorted((p.relative_to(base).as_posix(), p) for p in declared)
+    digest = hashlib.sha256()
+    for rel, path in entries:
+        try:
+            normalized = _normalize_text_bytes(path.read_bytes())
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError(f"sigma consumer code identity cannot read declared source {rel!r}: {exc}")
+        rel_bytes = rel.encode("utf-8")
+        digest.update(len(rel_bytes).to_bytes(8, "big"))
+        digest.update(rel_bytes)
+        digest.update(len(normalized).to_bytes(8, "big"))
+        digest.update(normalized)
+    return digest.hexdigest()
+
+
+def sigma_measurement_context(
+    cfg: 'object',
+
+    *,
+    cache_dir: 'Optional[Path]' = None,
+) -> Dict[str, object]:
+    r"""Return the sealed loader/statistic/sampler context plus the current corpus identity (PB-06).
+
+    Starts from :data:`SEALED_MEASUREMENT_CONTEXT`, adds the effective ``min(128, cfg.max_seq_len)``,
+    the tokenizer tag, the sealed ``thresholds``, and ``cache_source_identity(dataset, split,
+    cache_dir)`` (the artifact-integrity plan's byte-exact corpus binding). A missing or changed corpus
+    raises (fail-closed) so the consumer cannot silently measure against different data."""
+    from vfe3.data.datasets import _tokenizer_tag, cache_source_identity
+    dataset = SEALED_MEASUREMENT_CONTEXT["dataset"]
+    split = SEALED_MEASUREMENT_CONTEXT["split"]
+    max_seq_len = cfg["max_seq_len"] if isinstance(cfg, Mapping) else cfg.max_seq_len
+    context = dict(SEALED_MEASUREMENT_CONTEXT)
+    context["effective_seq_len"] = min(int(context["requested_seq_len"]), int(max_seq_len))
+    context["tokenizer_tag"] = _tokenizer_tag(dataset)
+    context["thresholds"] = dict(SEALED_GATE_THRESHOLDS)
+    context["cache_source_identity"] = cache_source_identity(dataset, split, cache_dir=cache_dir)
+    return context
+
+
+def canonical_json_sha256(
+    path: 'str | Path',
+) -> str:
+    r"""SHA-256 of an artifact's CANONICAL JSON (parse then
+    ``json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)``), so LF/CRLF,
+    indentation, and key order cannot change identity. Unreadable/undecodable JSON raises ``ValueError``."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"sigma-gate artifact {str(path)!r} is unreadable JSON: {exc}")
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def load_sigma_gate_preregistry(
+    path: 'Optional[str | Path]' = None,
+) -> Dict[str, object]:
+    r"""Load the tracked, non-code authorization manifest (fail-closed) as a mapping keyed by the exact
+    content-based governing identity. Production resolves this through the module at call time, so a test
+    may substitute a temporary manifest without an unpatchable alias."""
+    target = _PREREGISTRY_PATH if path is None else Path(path)
+    try:
+        with open(target, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"sigma-gate preregistry {str(target)!r} is unreadable: {exc}")
+    if not isinstance(data, dict):
+        raise ValueError("sigma-gate preregistry must be a JSON object keyed by governing identity")
+    return data
+
+
+def _computed_gate_pass(
+    record:     Mapping[str, object],
+    thresholds: Mapping[str, object],
+) -> bool:
+    r"""Recompute the sealed PASS predicate from a record's stored statistics + thresholds."""
+    return bool(
+        float(record["sigma_ce_spearman"]) >= float(thresholds["spearman_min"])
+        and float(record["spearman_ci"][0]) > 0.0
+        and float(record["spearman_ci"][0]) > float(record["permutation_floor"])
+        and record["stratified_ce"]["monotone"] is True
+        and float(record["sigma_binned_ece"]) < float(thresholds["ece_max"])
+    )
+
+
+def verify_sigma_prereg_gate(
+    path: str,
+
+    *,
+    actual_spec_identity: str,
+) -> Dict[str, object]:
+    r"""Prereg-aware artifact verifier for VFE3Config construction (PB-06): reject unregistered /
+    resolved-FAIL identities, artifact byte-hash mismatch, stale spec, and a status/statistic
+    contradiction. It does NOT verify the not-yet-constructed live model or current corpus -- those live
+    checks are the consumer boundary (:func:`verify_sigma_consumer_gate`)."""
+    prereg = load_sigma_gate_preregistry().get(actual_spec_identity)
+    if prereg is None or prereg.get("status") != "PASS":
+        raise ValueError("sigma-gate governing identity is not registered as PASS")
+    if canonical_json_sha256(Path(path)) != prereg.get("artifact_sha256"):
+        raise ValueError("sigma-gate artifact bytes do not match the preregistration registry")
+    record = verify_gate_artifact(path, expected_spec_commit=actual_spec_identity, require_pass=True)
+    thresholds = record.get("thresholds")
+    if not isinstance(thresholds, Mapping):
+        raise ValueError("sigma-gate artifact carries no thresholds mapping")
+    if record.get("status") != ("PASS" if _computed_gate_pass(record, thresholds) else "FAIL"):
+        raise ValueError("sigma-gate status contradicts its stored statistics")
+    return record
+
+
+def verify_sigma_consumer_gate(
+    path: str,
+
+    *,
+    actual_model_behavior_sha256:      str,
+    actual_spec_identity:              str,
+    actual_code_identity_sha256:       str,
+    actual_measurement_context_sha256: str,
+) -> Dict[str, object]:
+    r"""Strict consumer-boundary gate over DERIVED live identities (PB-06). Rejects an unregistered or
+    resolved-FAIL governing identity before reading PASS; a canonical byte-hash that does not match the
+    manifest; a stale spec / non-PASS record; a model-behavior, code, or sealed-context fingerprint that
+    does not match the LIVE model/source/data; a duplicated seed/threshold provenance contradicting the
+    sealed context; and a stored status that contradicts the recomputed statistics. Returns the record."""
+    from vfe3.run_artifacts import semantic_config_fingerprint
+    prereg = load_sigma_gate_preregistry().get(actual_spec_identity)
+    if prereg is None or prereg.get("status") != "PASS":
+        raise ValueError("sigma-gate governing identity is not registered as PASS")
+    if canonical_json_sha256(Path(path)) != prereg.get("artifact_sha256"):
+        raise ValueError("sigma-gate artifact bytes do not match the preregistration registry")
+    record = verify_gate_artifact(
+        path,
+        expected_spec_commit=actual_spec_identity,
+        require_pass=True,
+    )
+    if record.get("model_behavior_sha256") != actual_model_behavior_sha256:
+        raise ValueError(
+            "sigma-gate model-behavior fingerprint does not match the live model"
+        )
+    if record.get("code_identity_sha256") != actual_code_identity_sha256:
+        raise ValueError("sigma-gate code identity does not match the live source")
+    context = record.get("measurement_context")
+    if (not isinstance(context, Mapping)
+            or semantic_config_fingerprint(context) != record.get("measurement_context_sha256")
+            or record.get("measurement_context_sha256") != actual_measurement_context_sha256):
+        raise ValueError("sigma-gate measurement context does not match sealed live data/statistics")
+    if record.get("seeds") != context.get("seeds"):
+        raise ValueError("sigma-gate duplicated seed provenance contradicts its sealed context")
+    if record.get("thresholds") != context.get("thresholds"):
+        raise ValueError("sigma-gate measured thresholds contradict its sealed context")
+    thresholds = context["thresholds"]
+    computed_pass = _computed_gate_pass(record, thresholds)
+    if record.get("status") != ("PASS" if computed_pass else "FAIL"):
+        raise ValueError("sigma-gate status contradicts its stored statistics")
     return record

@@ -28,7 +28,8 @@ from typing import Callable, Dict, NamedTuple, Optional, Tuple
 
 import torch
 
-from vfe3.inference.belief_cache import cache_supported, rollout_predictive_cached
+from vfe3.contracts import PolicyRollout
+from vfe3.inference.belief_cache import cache_supported, rollout_predictive_cached, rollout_predictive_state_cached
 
 
 _POLICIES:    Dict[str, Callable] = {}
@@ -271,7 +272,7 @@ def _validate_policy_context(
         )
 
 
-def _rollout_predictive(
+def _rollout_predictive_state(
     context:     torch.Tensor,                       # (B, N) context ids
     candidates:  torch.Tensor,                       # (B, Kp, L) candidate continuation ids
 
@@ -279,12 +280,15 @@ def _rollout_predictive(
 
     *,
     base_logits: Optional[torch.Tensor] = None,      # (B, V) base last-position logits (reused if given)
-) -> 'Tuple[torch.Tensor, torch.Tensor]':
-    r"""Batched one-step rollout. For each candidate appends its ACTION token(s) to the context and
-    rolls the belief forward through the shared seam, returning the predicted outcome distribution
-    q(o|pi) = p(o | q*_pi) as log-probs (B, Kp, V) and the raw continuation log-prob (B, Kp) of the
-    first action token under the BASE predictive. The environment response is NOT folded into the
-    rollout (spec Section 2.2). All Kp candidates run in one batched forward (B*Kp sequences)."""
+) -> 'PolicyRollout':
+    r"""Batched one-step rollout carrying the TERMINAL belief state (PB-06). For each candidate appends
+    its ACTION token(s) to the context and rolls the belief forward through the shared seam, returning a
+    :class:`PolicyRollout` with the predicted outcome distribution q(o|pi) = p(o | q*_pi) as log-probs
+    (B, Kp, V), the raw continuation log-prob (B, Kp) of the first action token under the BASE
+    predictive, and the terminal belief mean (B, Kp, K) and covariance (B, Kp, K[,K]) read from the LAST
+    appended position of the returned ``BeliefState`` (post block_norm/final_norm). The environment
+    response is NOT folded into the rollout (spec Section 2.2). All Kp candidates run in one batched
+    forward (B*Kp sequences); the cache fast path engages on the supported config."""
     B, N = context.shape
     Kp, L = candidates.shape[1], candidates.shape[2]
     max_len = model.cfg.max_seq_len
@@ -294,18 +298,38 @@ def _rollout_predictive(
     # prefix), compute only the appended positions' E-step rows against a shared context. Golden-tested
     # equal to the full recompute below to float tolerance (tests/test_belief_cache.py).
     if cache_supported(model.cfg):
-        return rollout_predictive_cached(context, candidates, model, base_logits=base_logits)
+        return rollout_predictive_state_cached(context, candidates, model, base_logits=base_logits)
     ctx_exp = context.unsqueeze(1).expand(B, Kp, N)              # (B, Kp, N)
     ext = torch.cat([ctx_exp, candidates], dim=2).reshape(B * Kp, N + L)   # (B*Kp, N+L)
-    _belief, logits = model.rollout_beliefs(
+    belief, logits = model.rollout_beliefs(
         ext, return_logits=True, decode_last=True)                # logits (B*Kp, 1, V)
     last = logits[:, 0, :]                                        # (B*Kp, V) post-action prediction
     q_log = torch.log_softmax(last, dim=-1).reshape(B, Kp, -1)  # (B, Kp, V) = log q(o|pi)
+    # Terminal belief moments at the last appended position (the returned belief already carries
+    # block_norm/final_norm), reshaped candidate-major: mu (B, Kp, K), sigma (B, Kp, K[,K]).
+    mu = belief.mu[:, -1].reshape(B, Kp, *belief.mu.shape[2:])
+    sigma = belief.sigma[:, -1].reshape(B, Kp, *belief.sigma.shape[2:])
     if base_logits is None:
         base_logits = model.forward(context)[:, -1, :]          # (B, V) base last-position logits
     base_logp = torch.log_softmax(base_logits, dim=-1)          # (B, V)
     log_prob = torch.gather(base_logp, 1, candidates[:, :, 0])  # (B, Kp) logprob of the first action
-    return q_log, log_prob
+    return PolicyRollout(q_log=q_log, log_prob=log_prob, mu=mu, sigma=sigma)
+
+
+def _rollout_predictive(
+    context:     torch.Tensor,                       # (B, N) context ids
+    candidates:  torch.Tensor,                       # (B, Kp, L) candidate continuation ids
+
+    model:       'object',                            # VFEModel: rollout_beliefs / forward / prior_bank
+
+    *,
+    base_logits: Optional[torch.Tensor] = None,      # (B, V) base last-position logits (reused if given)
+) -> 'Tuple[torch.Tensor, torch.Tensor]':
+    r"""Compatibility wrapper (PB-06): the historical two-tensor rollout return. Delegates to
+    :func:`_rollout_predictive_state` and returns exactly ``(q_log, log_prob)`` so existing external
+    unpacking is unchanged."""
+    state = _rollout_predictive_state(context, candidates, model, base_logits=base_logits)
+    return state.q_log, state.log_prob
 
 
 def _efe_terms(
@@ -355,15 +379,33 @@ def _efe_score(
     ambiguity_mode: str,
     log_prior:      Optional[torch.Tensor],
     base_logits:    Optional[torch.Tensor],
+    model_behavior_sha256:      Optional[str] = None,
+    sigma_spec_identity:        Optional[str] = None,
+    sigma_code_identity_sha256: Optional[str] = None,
+    sigma_measurement_context_sha256: Optional[str] = None,
 ) -> 'PolicyScore':
     r"""Shared EFE scoring body for ``efe_one_step`` (H=1) and ``efe_rollout`` (H>1): roll the
-    candidates forward (the cache fast path engages inside ``_rollout_predictive`` when supported),
+    candidates forward (the cache fast path engages inside ``_rollout_predictive_state`` when supported),
     form risk + ambiguity, and return the policy posterior. The horizon distinction lives entirely in
     the candidate length L and the per-scorer guards; the scoring algebra is identical because the
     rollout always reads the LAST appended position's predictive q(o|pi). The ``sum`` below reduces
     over the enabled ``score_terms`` (risk/ambiguity/epistemic), NOT over timesteps: even at H > 1
-    the terms are evaluated once, on the terminal predictive (audit F3)."""
-    q_log, log_prob = _rollout_predictive(context, candidates, model, base_logits=base_logits)
+    the terms are evaluated once, on the terminal predictive (audit F3).
+
+    Under the gated ``sigma_mc`` ambiguity (PB-06) all four consumer-gate identities are REQUIRED (fail
+    closed): a direct scorer call without them raises before the estimator, so a trained nonzero sigma
+    cannot be called an ambiguity value without the validated gate. Every other registered ambiguity
+    ignores the identities, so existing modes stay source-compatible."""
+    if ambiguity_mode == "sigma_mc" and (
+            model_behavior_sha256 is None or sigma_spec_identity is None
+            or sigma_code_identity_sha256 is None or sigma_measurement_context_sha256 is None):
+        raise ValueError(
+            "ambiguity_mode='sigma_mc' requires the validated consumer-gate identities "
+            "(model_behavior_sha256, sigma_spec_identity, sigma_code_identity_sha256, "
+            "sigma_measurement_context_sha256); they are supplied only after VFEModel.generate verifies "
+            "verify_sigma_consumer_gate. It fails closed when any is absent (spec Sections 2.7/4.5).")
+    state = _rollout_predictive_state(context, candidates, model, base_logits=base_logits)
+    q_log, log_prob = state.q_log, state.log_prob
     risk, pred_ent = _efe_terms(q_log, preference)
     ambiguity = get_ambiguity(ambiguity_mode)(q_log, model=model)
     epistemic = pred_ent - ambiguity                            # MI bridge; ==0 at v1 (likelihood_entropy)
@@ -390,6 +432,10 @@ def _policy_efe_one_step(
     ambiguity_mode: str                = "likelihood_entropy",   # ambiguity registry key
     log_prior:     Optional[torch.Tensor] = None,    # (B, Kp) log candidate prior E; None -> uniform
     base_logits:   Optional[torch.Tensor] = None,    # (B, V) reused base logits (avoid a duplicate fwd)
+    model_behavior_sha256:      Optional[str] = None,   # PB-06 consumer-gate identities (sigma_mc only)
+    sigma_spec_identity:        Optional[str] = None,
+    sigma_code_identity_sha256: Optional[str] = None,
+    sigma_measurement_context_sha256: Optional[str] = None,
     **kwargs,
 ) -> 'PolicyScore':
     r"""The v1 one-step EFE scorer. G(pi) = risk(pi) + ambiguity(pi) = KL[q(o|pi)||p(o|C)] +
@@ -407,7 +453,11 @@ def _policy_efe_one_step(
         raise ValueError(
             f"efe_one_step candidate length L={L} must equal horizon={horizon}.")
     return _efe_score(context, candidates, preference, model, gamma=gamma, score_terms=score_terms,
-                      ambiguity_mode=ambiguity_mode, log_prior=log_prior, base_logits=base_logits)
+                      ambiguity_mode=ambiguity_mode, log_prior=log_prior, base_logits=base_logits,
+                      model_behavior_sha256=model_behavior_sha256,
+                      sigma_spec_identity=sigma_spec_identity,
+                      sigma_code_identity_sha256=sigma_code_identity_sha256,
+                      sigma_measurement_context_sha256=sigma_measurement_context_sha256)
 
 
 @register_policy("logprob_control")
@@ -462,6 +512,10 @@ def _policy_efe_rollout(
     ambiguity_mode: str                 = "likelihood_entropy",   # ambiguity registry key
     log_prior:      Optional[torch.Tensor] = None,    # (B, Kp) log candidate prior E; None -> uniform
     base_logits:    Optional[torch.Tensor] = None,    # (B, V) reused base logits
+    model_behavior_sha256:      Optional[str] = None,   # PB-06 consumer-gate identities (sigma_mc only)
+    sigma_spec_identity:        Optional[str] = None,
+    sigma_code_identity_sha256: Optional[str] = None,
+    sigma_measurement_context_sha256: Optional[str] = None,
     **kwargs,
 ) -> 'PolicyScore':
     r"""The staged horizon extension (H > 1): a TERMINAL-OUTCOME rollout scorer, not a per-step
@@ -494,4 +548,8 @@ def _policy_efe_rollout(
             "the full per-candidate recompute, making the Kp*H cost dishonest (spec Section 3.5). Use a "
             "cache-supported config, or efe_one_step (horizon=1).")
     return _efe_score(context, candidates, preference, model, gamma=gamma, score_terms=score_terms,
-                      ambiguity_mode=ambiguity_mode, log_prior=log_prior, base_logits=base_logits)
+                      ambiguity_mode=ambiguity_mode, log_prior=log_prior, base_logits=base_logits,
+                      model_behavior_sha256=model_behavior_sha256,
+                      sigma_spec_identity=sigma_spec_identity,
+                      sigma_code_identity_sha256=sigma_code_identity_sha256,
+                      sigma_measurement_context_sha256=sigma_measurement_context_sha256)
