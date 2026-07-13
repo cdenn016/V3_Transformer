@@ -255,10 +255,11 @@ def test_config_validated_flag_does_not_turn_on_sigma_mc(tmp_path):
 
 
 def test_sigma_gate_flag_has_no_executable_consumer(tmp_path):
-    # audit F5 (2026-07-01): policy_sigma_ambiguity_validated=True (with a PASS artifact) is a
-    # PRECONDITION RECORD ONLY -- no code path routes ambiguity_mode to 'sigma_mc', so the scorer
-    # still uses the default 'likelihood_entropy' and runs fine (no sigma_mc RuntimeError). This
-    # pins that the validated flag does NOT unlock the gated estimator by itself.
+    # audit F5 (2026-07-01), updated for PB-06: policy_sigma_ambiguity_validated=True (with a PASS
+    # artifact) is a PRECONDITION RECORD ONLY -- routing to 'sigma_mc' exists now but ONLY via
+    # policy_ambiguity_mode='sigma_mc' (validated + consumer-gated), which stays at its default
+    # 'likelihood_entropy' here, so the scorer runs fine (no sigma_mc RuntimeError). This pins that
+    # the validated flag does NOT turn the gated estimator on by itself.
     import json
     import torch
     from vfe3.model.model import VFEModel

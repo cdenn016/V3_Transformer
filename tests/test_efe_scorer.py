@@ -237,15 +237,16 @@ def test_policy_context_validator_accepts_exact_boundary():
     assert _validate_policy_context(context, 1, 8) is None
 
 
-def test_sigma_mc_raise_names_flag_has_no_consumer():
-    # audit F5 (2026-07-01): the gate message must state that policy_sigma_ambiguity_validated ALONE
-    # does not unlock sigma_mc -- the flag is a precondition record with no executable consumer until
-    # a Phase-3 consumer that reads the validated artifact is added.
+def test_sigma_mc_raise_names_flag_and_unimplemented_estimator():
+    # PB-06 (supersedes the audit-F5 no-consumer pin): the consumer routing now exists (generate ->
+    # _policy_select -> _efe_score under a fully verified sigma_mc config), so the gate message must
+    # state that policy_sigma_ambiguity_validated ALONE still does not unlock sigma_mc AND that the
+    # estimator BODY is not yet implemented (Task 4), keeping the raise load-bearing.
     with pytest.raises(RuntimeError) as e:
         get_ambiguity("sigma_mc")(torch.log_softmax(torch.randn(1, 4, 16), dim=-1))
     msg = str(e.value)
     assert "policy_sigma_ambiguity_validated" in msg
-    assert "does NOT unlock" in msg and "NO executable consumer" in msg
+    assert "does NOT unlock" in msg and "NOT YET IMPLEMENTED" in msg
 
 
 def test_generate_policy_branch_dispatches_and_stays_in_vocab():

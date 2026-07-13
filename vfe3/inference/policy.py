@@ -239,15 +239,20 @@ def _amb_sigma_mc(
     **kwargs,
 ) -> torch.Tensor:
     r"""The sigma-dependent Monte-Carlo ambiguity E_{mu^(s)~N(mu,Sigma)} H[p(o|mu^(s))] (spec Sections
-    2.7, 4.5). GATED: it is unlocked only after the pre-registered sigma-validation gate passes; until
-    then it must never be dispatched, so a trained nonzero sigma cannot be called an ambiguity value."""
+    2.7, 4.5). GATED (PB-06): dispatch reaches here only under a FULLY VERIFIED sigma_mc configuration
+    -- ``policy_ambiguity_mode='sigma_mc'`` validated at construction (an EFE scorer, a Gaussian family,
+    ``policy_sigma_ambiguity_validated=True``, a PASS artifact, S=16, and a prereg-registered PASS
+    governing identity) plus the consumer boundary (``VFEModel.generate`` verifies
+    ``verify_sigma_consumer_gate`` and ``_efe_score`` requires all four derived identities). The
+    estimator BODY -- the antithetic shared-noise MC sampler -- is not yet implemented (Task 4), so this
+    raise stays LOAD-BEARING: even a fully authorized dispatch fails closed rather than calling a
+    trained nonzero sigma an ambiguity value."""
     raise RuntimeError(
-        "ambiguity='sigma_mc' is gated behind the sigma-validation gate (spec Sections 2.7/4.5) and "
-        "currently has NO executable consumer: setting policy_sigma_ambiguity_validated=True with a "
-        "matching PASS artifact records the precondition but does NOT unlock this estimator by itself "
-        "-- no code path routes ambiguity_mode to 'sigma_mc' (the scorers always use "
-        "'likelihood_entropy'), and a Phase-3 consumer that reads the validated artifact must be "
-        "added before it can be dispatched."
+        "ambiguity='sigma_mc' is dispatchable only under a fully verified sigma_mc config "
+        "(policy_ambiguity_mode='sigma_mc' plus the preregistration and consumer gates of spec "
+        "Sections 2.7/4.5); setting policy_sigma_ambiguity_validated=True alone does NOT unlock it. "
+        "The estimator body (the antithetic shared-noise MC sampler) is NOT YET IMPLEMENTED -- "
+        "Task 4 -- so this raise stays fail-closed even for an authorized dispatch."
     )
 
 

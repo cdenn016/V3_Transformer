@@ -459,11 +459,20 @@ def test_generate_likelihood_entropy_policy_never_touches_sigma_providers(monkey
     assert out.shape == (1, 5)
 
 
-def test_generate_sigma_mc_calls_consumer_gate_and_fails_closed():
+def test_generate_sigma_mc_calls_consumer_gate_and_fails_closed(tmp_path, monkeypatch):
     # A model whose ambiguity is flipped to sigma_mc after construction must fail closed at the consumer
     # boundary: the production preregistry resolves the live spec identity to FAIL, so generate() raises
-    # (it never reaches the not-yet-implemented estimator).
+    # (it never reaches the not-yet-implemented estimator). The sealed corpus is seeded into a temporary
+    # cache dir behind the default_cache_dir seam (mirroring tests/test_sigma_gate.py) so the assertion
+    # is deterministically the intended production-FAIL ValueError on any machine, never a
+    # FileNotFoundError from a missing ambient wikitext-103 test cache.
+    from vfe3.data import datasets as datasets_module
+    from vfe3.data.datasets import cache_path
+    corpus = cache_path("wikitext-103", "test", suffix="pt", cache_dir=tmp_path)
+    corpus.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.arange(64, dtype=torch.int64), corpus)
+    monkeypatch.setattr(datasets_module, "default_cache_dir", lambda: tmp_path)
     model = _tiny_model(policy_mode="efe_one_step", policy_preference="flat", policy_top_k=4)
     model.cfg.policy_ambiguity_mode = "sigma_mc"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not registered as PASS"):
         model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=1, greedy=True)
