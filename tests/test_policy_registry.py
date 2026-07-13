@@ -281,7 +281,8 @@ def test_sigma_gate_flag_has_no_executable_consumer(tmp_path):
     from vfe3.inference.policy import _rollout_predictive
     with torch.no_grad():
         q_log, _ = _rollout_predictive(ctx, cand, m)
-    assert torch.allclose(out.ambiguity, get_ambiguity("likelihood_entropy")(q_log), atol=1e-6)
+    est = get_ambiguity("likelihood_entropy")(q_log)           # AmbiguityEstimate (PB-06)
+    assert torch.allclose(out.ambiguity, est.expected_conditional_entropy, atol=1e-6)
     # and the generic generate() path also completes under the validated flag
     with torch.no_grad():
         seq = m.generate(ctx, 2, greedy=True)

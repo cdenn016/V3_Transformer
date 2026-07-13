@@ -12,12 +12,16 @@ conditions on a longer sequence and has no relation to forward(prompt). Those
 oracles therefore use max_new_tokens=1.
 """
 
+import os
+
 import pytest
 import torch
 
 import generate_efe
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
+
+_DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
 def _tiny_model(seed: int = 0, **overrides) -> VFEModel:
@@ -476,3 +480,82 @@ def test_generate_sigma_mc_calls_consumer_gate_and_fails_closed(tmp_path, monkey
     model.cfg.policy_ambiguity_mode = "sigma_mc"
     with pytest.raises(ValueError, match="not registered as PASS"):
         model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=1, greedy=True)
+
+
+def _run_sigma_mc_synthetic_pass(tmp_path, monkeypatch, device, *, policy_mode, **overrides):
+    """SYNTHETIC PASS plumbing ONLY (NOT an empirical sigma-arm validation): build a temporary governing
+    identity, code identity, sealed corpus, PASS artifact, and manifest, inject the providers at
+    generate()'s call sites, then run generate() so the consumer gate opens and _amb_sigma_mc actually
+    runs. Mirrors tests/test_sigma_gate.py::_valid_gate, adapted to generate()'s (root-less) call sites.
+    """
+    import json
+
+    from vfe3.data import datasets as datasets_module
+    from vfe3.data.datasets import cache_path
+    from vfe3.inference import sigma_gate as sg
+    from vfe3.run_artifacts import (model_behavior_fingerprint, semantic_config_fingerprint,
+                                    sigma_behavior_config)
+
+    # Sealed corpus behind the default_cache_dir seam so sigma_measurement_context resolves off-cache.
+    corpus = cache_path("wikitext-103", "test", suffix="pt", cache_dir=tmp_path)
+    corpus.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.arange(64, dtype=torch.int64), corpus)
+    monkeypatch.setattr(datasets_module, "default_cache_dir", lambda: tmp_path)
+
+    # Fixed synthetic governing + code identities injected at generate()'s root-less call sites.
+    spec, code = "synthetic-spec-identity", "synthetic-code-identity"
+    monkeypatch.setattr(sg, "sigma_gate_spec_identity", lambda *a, **k: spec)
+    monkeypatch.setattr(sg, "sigma_consumer_code_identity", lambda *a, **k: code)
+
+    # Build the tiny live model only after injection; flip to the sigma_mc arm post-construction.
+    model = _tiny_model(policy_mode=policy_mode, policy_preference="flat",
+                        policy_top_k=4, **overrides).to(device)
+    model.cfg.policy_ambiguity_mode = "sigma_mc"
+
+    meas = sg.sigma_measurement_context(model.cfg)
+    behavior = model_behavior_fingerprint(sigma_behavior_config(model.cfg), model.state_dict())
+    ctx_fp = semantic_config_fingerprint(meas)
+    record = {
+        "status": "PASS", "checkpoint_id": "synthetic-generate-checkpoint",
+        "model_behavior_sha256": behavior, "spec_commit": spec, "code_identity_sha256": code,
+        "measurement_context": meas, "measurement_context_sha256": ctx_fp, "seeds": meas["seeds"],
+        "sigma_ce_spearman": 0.5, "spearman_ci": [0.3, 0.7], "permutation_floor": 0.1,
+        "stratified_ce": {"monotone": True}, "sigma_binned_ece": 0.01, "thresholds": meas["thresholds"],
+    }
+    art = tmp_path / "synthetic_generate_gate.json"
+    art.write_text(json.dumps(record), encoding="utf-8")
+    manifest = {spec: {"status": "PASS", "artifact_sha256": sg.canonical_json_sha256(art),
+                       "test_only": True}}
+    monkeypatch.setattr(sg, "load_sigma_gate_preregistry", lambda *a, **k: manifest)
+    model.cfg.policy_sigma_gate_artifact = str(art)
+
+    prompt = torch.tensor([[1, 2, 3]], device=device)
+    before = torch.get_rng_state()
+    out = model.generate(prompt, max_new_tokens=2, greedy=True)
+    after = torch.get_rng_state()
+    assert torch.equal(before, after)                          # local MC generator: global RNG untouched
+    assert out.device.type == device.type                      # the run stays on device
+    return out
+
+
+def test_generate_sigma_mc_synthetic_pass_runs_estimator_cpu(tmp_path, monkeypatch):
+    # SYNTHETIC PASS plumbing ONLY: the gate opens on a temporary PASS artifact so generate() runs the
+    # sigma_mc estimator end-to-end on CPU. The empirical FAIL preregistry remains authoritative.
+    out = _run_sigma_mc_synthetic_pass(tmp_path, monkeypatch, torch.device("cpu"),
+                                       policy_mode="efe_one_step")
+    assert out.shape == (1, 5)
+    assert int(out.max()) < 16 and int(out.min()) >= 0
+    assert torch.equal(out[:, :3], torch.tensor([[1, 2, 3]]))  # prompt preserved
+
+
+@pytest.mark.skipif(_DEVICE.type != "cuda",
+                    reason="RTX 5090 CUDA smoke; set VFE3_TEST_DEVICE=cuda to run")
+def test_efe_rollout_sigma_mc_cuda_synthetic_pass(tmp_path, monkeypatch):
+    # SYNTHETIC PASS plumbing ONLY (NOT an empirical sigma-arm validation): drives efe_rollout through
+    # generate() and _amb_sigma_mc on the RTX 5090 with the consumer gate held open on a temporary PASS
+    # artifact, pinning that the antithetic MC sampler keeps the run on-device and leaves the global RNG
+    # untouched. SKIPS cleanly on a CPU host (VFE3_TEST_DEVICE unset).
+    out = _run_sigma_mc_synthetic_pass(tmp_path, monkeypatch, _DEVICE,
+                                       policy_mode="efe_rollout", policy_horizon=2)
+    assert out.shape == (1, 5)
+    assert int(out.max()) < 16 and int(out.min()) >= 0

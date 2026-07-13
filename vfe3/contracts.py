@@ -57,6 +57,20 @@ class MetropolisObjectiveContext(NamedTuple):
     prior:     EffectiveBetaPriorContext         # fixed pre-stack effective-prior context (folds rebuilt per candidate)
 
 
+class AmbiguityEstimate(NamedTuple):
+    r"""The ambiguity-estimator return: the predictive OUTCOME marginal plus the expected conditional
+    entropy (PB-06 sigma_mc). Both estimators return this NamedTuple so the scorer reads two named
+    fields regardless of which ambiguity arm is active. The default ``likelihood_entropy`` arm returns
+    ``predictive_log_prob`` equal to the input point predictive ``q_log`` unchanged and
+    ``expected_conditional_entropy`` its entropy H[q(o|mu_s)] (so the MI bridge collapses to 0 exactly).
+    The gated ``sigma_mc`` arm returns the NORMALIZED Monte-Carlo marginal q(o|pi) = E_s p(o|s) and the
+    Monte-Carlo estimate of E_s H[p(o|s)]. The scorer forms risk from ``predictive_log_prob``, sets the
+    ambiguity term to ``expected_conditional_entropy``, and the epistemic MI bridge from their gap."""
+
+    predictive_log_prob:          torch.Tensor   # (B, Kp, V) normalized predictive outcome marginal
+    expected_conditional_entropy: torch.Tensor   # (B, Kp) E_{q(s|pi)} H[p(o|s)]
+
+
 class PolicyRollout(NamedTuple):
     r"""The state-carrying result of one EFE candidate rollout (PB-06).
 

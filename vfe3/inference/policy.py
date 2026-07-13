@@ -28,8 +28,9 @@ from typing import Callable, Dict, NamedTuple, Optional, Tuple
 
 import torch
 
-from vfe3.contracts import PolicyRollout
+from vfe3.contracts import AmbiguityEstimate, PolicyRollout
 from vfe3.inference.belief_cache import cache_supported, rollout_predictive_cached, rollout_predictive_state_cached
+from vfe3.numerics import safe_cholesky
 
 
 _POLICIES:    Dict[str, Callable] = {}
@@ -223,37 +224,120 @@ def _amb_likelihood_entropy(
     q_log: torch.Tensor,                             # (B, Kp, V) log p(o | mu_s) at the belief MEAN
 
     **kwargs,
-) -> torch.Tensor:                                   # (B, Kp) H[p(o | mu_s)]
+) -> AmbiguityEstimate:                              # predictive_log_prob = q_log; entropy H[p(o|mu_s)]
     r"""The default ambiguity: the entropy of the decoded predictive categorical at the belief MEAN,
-    using no sigma (spec Section 3.3). At the v1 point belief q(o|pi) = p(o|mu_s), so this equals the
-    predictive entropy and the MI bridge I = predictive_entropy - ambiguity is identically 0."""
+    using no sigma (spec Section 3.3). At the v1 point belief q(o|pi) = p(o|mu_s), so the predictive
+    marginal is q_log ITSELF (returned unchanged) and this equals the predictive entropy, so the MI
+    bridge I = predictive_entropy - ambiguity is identically 0. Returns an :class:`AmbiguityEstimate`
+    so the scorer reads the same two fields for every arm; the four sigma-consumer identities and the
+    (mu, sigma, model, num_samples) kwargs are ignored on this sigma-free path (source-compatible with
+    every existing direct caller)."""
     q = q_log.exp()
     q_log_term = torch.where(q > 0, q * q_log, torch.zeros_like(q))
-    return -q_log_term.sum(dim=-1)
+    entropy = -q_log_term.sum(dim=-1)                            # (B, Kp) H[p(o | mu_s)]
+    return AmbiguityEstimate(predictive_log_prob=q_log, expected_conditional_entropy=entropy)
+
+
+def _antithetic_shared_state_samples(
+    mu:      torch.Tensor,                           # (B, Kp, K) terminal belief means
+    sigma:   torch.Tensor,                           # (B, Kp, K)/(B, Kp, K, K) terminal covariance
+
+    eps:         float,                              # covariance floor / Cholesky ridge (model.cfg.eps)
+
+    *,
+    num_samples: int,                                # S; MUST be 16 (sealed antithetic_shared_v1)
+    mc_seed:     int = 0,                            # sealed local-generator seed
+) -> torch.Tensor:                                   # (B, Kp, S, K) reparameterized state samples
+    r"""The sealed ``antithetic_shared_v1`` reparameterized sampler (PB-06, spec Sections 2.7/4.5).
+
+    Draws ``S // 2`` standard-normal draws on a LOCAL ``torch.Generator`` (seed ``mc_seed``) on the
+    belief device -- SHARED across the candidate axis within each batch element (a size-1 Kp axis
+    broadcast) so the global torch RNG is untouched and permuting candidates permutes the per-candidate
+    estimate. The antithetic partner of each draw is its negative, concatenated POSITIVE-then-negative
+    to give exactly ``S`` samples. Diagonal covariance uses ``sigma.clamp_min(eps).sqrt()``; full
+    covariance uses ``safe_cholesky(sigma, eps=eps, rounds=5)`` (the repository jitter policy -- NEVER
+    raw ``torch.linalg.cholesky``), reading its per-item ``ok`` mask and falling back to the point mean
+    (delta = 0) for any item whose Cholesky is unrecoverable even after the jitter escalation, so a
+    zero/near-singular covariance stays finite and converges to the point (likelihood_entropy) decode."""
+    if num_samples != 16:
+        raise ValueError(
+            f"the sealed antithetic_shared_v1 sampler requires num_samples=16, got {num_samples}.")
+    half = num_samples // 2
+    B, Kp, K = mu.shape
+    gen = torch.Generator(device=mu.device).manual_seed(mc_seed)
+    z = torch.randn(B, 1, half, K, generator=gen, device=mu.device, dtype=mu.dtype)  # (B,1,half,K) shared
+    mu_e = mu.unsqueeze(2)                                       # (B, Kp, 1, K)
+    if sigma.dim() == mu.dim():                                  # diagonal (B, Kp, K)
+        std = sigma.clamp_min(eps).sqrt().unsqueeze(2)          # (B, Kp, 1, K)
+        delta = std * z                                          # (B, Kp, half, K)
+    else:                                                        # full (B, Kp, K, K)
+        L, ok = safe_cholesky(sigma, eps=eps, rounds=5)         # (B, Kp, K, K), ok (B, Kp)
+        delta = (L.unsqueeze(2) @ z.unsqueeze(-1)).squeeze(-1)  # (B,Kp,1,K,K)@(B,1,half,K,1) -> (B,Kp,half,K)
+        delta = torch.where(ok[..., None, None], delta, torch.zeros_like(delta))
+    return torch.cat([mu_e + delta, mu_e - delta], dim=2)        # (B, Kp, S, K) positive-then-negative
 
 
 @register_ambiguity("sigma_mc")
 def _amb_sigma_mc(
-    q_log: torch.Tensor,
+    q_log: torch.Tensor,                             # (B, Kp, V) point predictive at the mean (unused here)
 
+    *,
+    mu:          torch.Tensor,                       # (B, Kp, K) terminal belief means
+    sigma:       torch.Tensor,                       # (B, Kp, K)/(B, Kp, K, K) terminal covariance
+    model:       object,                             # VFEModel: prior_bank (decode_point) + cfg
+    num_samples: int,                                # S; MUST be 16
+    model_behavior_sha256:      Optional[str] = None,
+    spec_identity:              Optional[str] = None,
+    code_identity_sha256:       Optional[str] = None,
+    measurement_context_sha256: Optional[str] = None,
     **kwargs,
-) -> torch.Tensor:
-    r"""The sigma-dependent Monte-Carlo ambiguity E_{mu^(s)~N(mu,Sigma)} H[p(o|mu^(s))] (spec Sections
-    2.7, 4.5). GATED (PB-06): dispatch reaches here only under a FULLY VERIFIED sigma_mc configuration
-    -- ``policy_ambiguity_mode='sigma_mc'`` validated at construction (an EFE scorer, a Gaussian family,
-    ``policy_sigma_ambiguity_validated=True``, a PASS artifact, S=16, and a prereg-registered PASS
-    governing identity) plus the consumer boundary (``VFEModel.generate`` verifies
-    ``verify_sigma_consumer_gate`` and ``_efe_score`` requires all four derived identities). The
-    estimator BODY -- the antithetic shared-noise MC sampler -- is not yet implemented (Task 4), so this
-    raise stays LOAD-BEARING: even a fully authorized dispatch fails closed rather than calling a
-    trained nonzero sigma an ambiguity value."""
-    raise RuntimeError(
-        "ambiguity='sigma_mc' is dispatchable only under a fully verified sigma_mc config "
-        "(policy_ambiguity_mode='sigma_mc' plus the preregistration and consumer gates of spec "
-        "Sections 2.7/4.5); setting policy_sigma_ambiguity_validated=True alone does NOT unlock it. "
-        "The estimator body (the antithetic shared-noise MC sampler) is NOT YET IMPLEMENTED -- "
-        "Task 4 -- so this raise stays fail-closed even for an authorized dispatch."
+) -> AmbiguityEstimate:
+    r"""The sigma-dependent Monte-Carlo ambiguity E_{s~N(mu,Sigma)} H[p(o|s)] with its antithetic
+    shared-noise predictive marginal (spec Sections 2.7, 4.5; PB-06).
+
+    GATED, fail-closed. Dispatch is authorized ONLY when all four live consumer-gate identities are
+    supplied (a direct registry call with none -- ``get_ambiguity('sigma_mc')(q_log)`` -- raises) AND
+    :func:`verify_sigma_consumer_gate` re-verifies the pre-registered artifact against them here, as
+    defense in depth: the artifact is re-READ per sigma dispatch so a post-construction replacement
+    fails closed, without rehashing the model/source/corpus on every generated token. It samples the
+    terminal state through :func:`_antithetic_shared_state_samples`, decodes each sample to its outcome
+    distribution via :meth:`PriorBank.decode_point`, and forms (i) the NORMALIZED predictive marginal
+    q(o|pi) = E_s p(o|s) stably as ``log_softmax(logsumexp_s(log p) - log S)`` and (ii) the Monte-Carlo
+    expected conditional entropy ``mean_s H[p(o|s)]`` with a ``where(prob > 0, ...)`` guard so exact
+    ``-inf`` sample-log-prob tails never form ``0 * -inf`` NaNs. The B/Kp/S axes are never flattened."""
+    if (model_behavior_sha256 is None or spec_identity is None
+            or code_identity_sha256 is None or measurement_context_sha256 is None):
+        raise RuntimeError(
+            "ambiguity='sigma_mc' is dispatchable only under the fully verified sigma_mc consumer gate: "
+            "all four derived identities (model_behavior_sha256, spec_identity, code_identity_sha256, "
+            "measurement_context_sha256) are REQUIRED and are supplied only after VFEModel.generate "
+            "verifies verify_sigma_consumer_gate (spec Sections 2.7/4.5). A direct registry dispatch "
+            "without them fails closed; setting policy_sigma_ambiguity_validated=True alone does NOT "
+            "unlock it.")
+    from vfe3.inference import sigma_gate
+    sigma_gate.verify_sigma_consumer_gate(
+        model.cfg.policy_sigma_gate_artifact,
+        actual_model_behavior_sha256=model_behavior_sha256,
+        actual_spec_identity=spec_identity,
+        actual_code_identity_sha256=code_identity_sha256,
+        actual_measurement_context_sha256=measurement_context_sha256,
     )
+    S = num_samples
+    samples = _antithetic_shared_state_samples(
+        mu, sigma, model.cfg.eps, num_samples=S)               # (B, Kp, S, K)
+    logits = model.prior_bank.decode_point(samples)             # (B, Kp, S, V)
+    sample_log_prob = torch.log_softmax(logits, dim=-1)         # (B, Kp, S, V) log p(o | s)
+    # Predictive marginal q(o|pi) = mean_s p(o|s): logsumexp over samples minus log S, then a final
+    # log_softmax to shed float normalization drift (the mixture is already normalized in exact math).
+    predictive_log_prob = torch.logsumexp(sample_log_prob, dim=2) - math.log(S)   # (B, Kp, V)
+    predictive_log_prob = torch.log_softmax(predictive_log_prob, dim=-1)
+    # Expected conditional entropy mean_s H[p(o|s)]; the where-guard keeps 0*(-inf) tails NaN-free.
+    sample_prob = sample_log_prob.exp()                         # (B, Kp, S, V)
+    ent_term = torch.where(sample_prob > 0, sample_prob * sample_log_prob, torch.zeros_like(sample_prob))
+    sample_entropy = -ent_term.sum(dim=-1)                      # (B, Kp, S) H[p(o|s)]
+    expected_conditional_entropy = sample_entropy.mean(dim=2)  # (B, Kp) E_s H[p(o|s)]
+    return AmbiguityEstimate(predictive_log_prob=predictive_log_prob,
+                             expected_conditional_entropy=expected_conditional_entropy)
 
 
 # ---- scorer internals ------------------------------------------------------------------------------
@@ -410,9 +494,23 @@ def _efe_score(
             "sigma_measurement_context_sha256); they are supplied only after VFEModel.generate verifies "
             "verify_sigma_consumer_gate. It fails closed when any is absent (spec Sections 2.7/4.5).")
     state = _rollout_predictive_state(context, candidates, model, base_logits=base_logits)
-    q_log, log_prob = state.q_log, state.log_prob
-    risk, pred_ent = _efe_terms(q_log, preference)
-    ambiguity = get_ambiguity(ambiguity_mode)(q_log, model=model)
+    log_prob = state.log_prob
+    # Dispatch the ambiguity BEFORE risk so the predictive marginal is single-sourced: under sigma_mc it
+    # is the antithetic MC marginal q(o|pi) = E_s p(o|s); under likelihood_entropy it is q_log unchanged,
+    # so risk/pred_ent stay byte-identical to the pre-PB-06 default path.
+    estimate = get_ambiguity(ambiguity_mode)(
+        state.q_log,
+        mu=state.mu,
+        sigma=state.sigma,
+        model=model,
+        num_samples=model.cfg.policy_sigma_mc_samples,
+        model_behavior_sha256=model_behavior_sha256,
+        spec_identity=sigma_spec_identity,
+        code_identity_sha256=sigma_code_identity_sha256,
+        measurement_context_sha256=sigma_measurement_context_sha256,
+    )
+    risk, pred_ent = _efe_terms(estimate.predictive_log_prob, preference)
+    ambiguity = estimate.expected_conditional_entropy
     epistemic = pred_ent - ambiguity                            # MI bridge; ==0 at v1 (likelihood_entropy)
     terms = {"risk": risk, "ambiguity": ambiguity, "epistemic": -epistemic}
     score = sum(terms[t] for t in score_terms)

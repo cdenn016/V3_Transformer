@@ -308,3 +308,78 @@ def test_registered_family_modes_are_family_consistent_dual_rank():
     assert get_decode_registration("full").covariance_kinds == frozenset({"full"})
     assert get_decode_registration("diagonal").family_consistent is False
     assert get_decode_registration("full").family_consistent is False
+
+
+# --- decode_point: the eps-floor point decode the sigma_mc ambiguity estimator uses (PB-06) --------
+
+def test_decode_point_delegates_to_active_registered_decoder(monkeypatch):
+    import vfe3.model.prior_bank as pbmod
+    V, K, n_gen = 5, 3, 6
+    torch.manual_seed(0)
+    pb = PriorBank(V, K, n_gen)                                  # diagonal default; decode_mode='diagonal'
+    real = get_decode("diagonal")
+    captured = {}
+
+    def spy(name):
+        assert name == "diagonal"                               # decode_point routes through the active mode
+        def _kernel(pb_, mu_q, sigma_q, tau_eff):
+            captured["mu"] = mu_q
+            captured["sigma"] = sigma_q
+            return real(pb_, mu_q, sigma_q, tau_eff)
+        return _kernel
+
+    monkeypatch.setattr(pbmod, "get_decode", spy)
+    mu_s = torch.randn(2, 4, 7, K)                               # (B, Kp, S, K)
+    logits = pb.decode_point(mu_s)
+    assert logits.shape == (2, 4, 7, V)                         # (B, Kp, S, V), leading axes preserved
+    assert torch.equal(captured["mu"], mu_s)
+    assert captured["sigma"].shape == (2, 4, 7, K)              # diagonal eps-floor covariance
+    assert torch.allclose(captured["sigma"], torch.full_like(mu_s, pb.eps))
+
+
+def test_decode_point_full_family_passes_full_covariance(monkeypatch):
+    # Full family: decode_point must build a genuine (B, Kp, S, K, K) covariance, NOT a diagonal floor.
+    import vfe3.model.prior_bank as pbmod
+    V, K, n_gen = 5, 3, 6
+    torch.manual_seed(0)
+    pb = PriorBank(V, K, n_gen, family="gaussian_full", diagonal_covariance=False, decode_mode="full")
+    captured = {}
+
+    def spy(name):
+        def _kernel(pb_, mu_q, sigma_q, tau_eff):
+            captured["sigma"] = sigma_q
+            return mu_q.new_zeros(mu_q.shape[:-1] + (pb_.vocab_size,))
+        return _kernel
+
+    monkeypatch.setattr(pbmod, "get_decode", spy)
+    mu_s = torch.randn(2, 4, 7, K)
+    logits = pb.decode_point(mu_s)
+    assert logits.shape == (2, 4, 7, V)
+    assert captured["sigma"].shape == (2, 4, 7, K, K)          # full eps*I covariance of the bank's rank
+    assert torch.allclose(captured["sigma"], pb.eps * torch.eye(K).expand(2, 4, 7, K, K))
+
+
+def test_decode_point_includes_unigram_bias_when_enabled():
+    V, K, n_gen = 5, 3, 6
+    torch.manual_seed(0)
+    pb = PriorBank(V, K, n_gen, decode_unigram_prior=True, unigram_kappa=1.0)
+    pb.set_unigram_log_prior(torch.arange(1, V + 1, dtype=torch.float32))
+    mu_s = torch.randn(2, 4, K)
+    kernel = get_decode(pb.decode_mode)(pb, mu_s, torch.full_like(mu_s, pb.eps), pb._tau_eff(None))
+    assert torch.allclose(pb.decode_point(mu_s), kernel + pb._unigram_bias(), atol=1e-6)  # single-sourced
+    # toggled off: no bias added (same as the bare kernel)
+    torch.manual_seed(0)
+    pb_off = PriorBank(V, K, n_gen)
+    kernel_off = get_decode(pb_off.decode_mode)(
+        pb_off, mu_s, torch.full_like(mu_s, pb_off.eps), pb_off._tau_eff(None))
+    assert torch.allclose(pb_off.decode_point(mu_s), kernel_off, atol=1e-6)
+
+
+def test_decode_point_adds_no_parameter_or_state_dict_key():
+    V, K, n_gen = 5, 3, 6
+    torch.manual_seed(0)
+    pb = PriorBank(V, K, n_gen)
+    keys_before = set(pb.state_dict().keys())
+    _ = pb.decode_point(torch.randn(1, 2, K))
+    assert set(pb.state_dict().keys()) == keys_before          # stateless: no new parameter/buffer
+    assert keys_before == {"mu_embed", "sigma_log_embed", "phi_embed", "decode_log_scale"}
