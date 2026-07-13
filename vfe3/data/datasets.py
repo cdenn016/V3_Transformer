@@ -21,6 +21,13 @@ from torch.utils.data import DataLoader, Dataset
 
 _CL100K_DATASETS = ("wiki-ja", "wiki-en")
 
+# Integer dtypes an on-disk token cache may hold. Uncapped loads keep any of these mapped in their
+# native width (no corpus-sized int64 copy); a capped load owns an int64 clone. Used by the cache
+# loader and TokenWindows to reject bool / floating / complex caches before they index a table.
+SUPPORTED_TOKEN_DTYPES = frozenset(
+    {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
+)
+
 
 def default_cache_dir() -> Path:
     """The shared tokenized cache: ``~/.cache/tokenized_cache``."""
@@ -154,6 +161,25 @@ def cache_source_identity(
     )
 
 
+def _require_supported_token_dtype(
+    tokens: torch.Tensor,
+    source: Path,
+) -> None:
+    if tokens.dtype not in SUPPORTED_TOKEN_DTYPES:
+        names = ", ".join(sorted(str(dtype) for dtype in SUPPORTED_TOKEN_DTYPES))
+        raise TypeError(f"token cache {source} has dtype {tokens.dtype}; expected one of {names}")
+
+
+def _require_supported_numpy_token_dtype(dtype: np.dtype, source: Path) -> None:
+    try:
+        torch_dtype = torch.from_numpy(np.empty((0,), dtype=dtype)).dtype
+    except TypeError as exc:
+        raise TypeError(f"token cache {source} has unsupported dtype {dtype}") from exc
+    if torch_dtype not in SUPPORTED_TOKEN_DTYPES:
+        names = ", ".join(sorted(str(item) for item in SUPPORTED_TOKEN_DTYPES))
+        raise TypeError(f"token cache {source} has dtype {dtype}; expected one of {names}")
+
+
 def load_cached_tokens(
     dataset:    str,
     split:      str            = "validation",
@@ -162,28 +188,40 @@ def load_cached_tokens(
     cache_dir:  Optional[Path] = None,
     limit:      Optional[int]  = None,
 ) -> torch.Tensor:
-    """Load the 1-D token-id stream for ``dataset``/``split`` as an int64 tensor.
+    """Load the 1-D token-id stream for ``dataset``/``split``.
 
-    Tries the ``.pt`` (torch.load) cache, then the ``.bin`` int32 memmap (size from the
-    ``.meta.json`` sidecar). ``limit`` is applied before int64 materialization. Raises
-    FileNotFoundError if neither is present.
+    Tries the ``.pt`` (torch.load) cache, then the ``.bin`` memmap (size and dtype from the
+    ``.meta.json`` sidecar). An uncapped load keeps the corpus mapped in its NATIVE integer
+    dtype (any of :data:`SUPPORTED_TOKEN_DTYPES`) -- no corpus-sized int64 copy is allocated;
+    the caller (``TokenWindows``) converts to ``torch.long`` before indexing. A ``limit`` yields
+    an OWNED ``torch.long`` clone of exactly the first ``limit`` tokens, sliced before any int64
+    materialization. The dtype is validated before either branch can slice or cast, so bool /
+    floating / complex caches are rejected rather than silently reinterpreted as token ids.
+    Raises FileNotFoundError if neither cache is present.
     """
     pt = cache_path(dataset, split, suffix="pt", cache_dir=cache_dir)
     if pt.exists():
-        tokens = torch.load(pt, weights_only=True, mmap=(limit is not None)).reshape(-1)
+        tokens = torch.load(pt, weights_only=True, mmap=True)
+        _require_supported_token_dtype(tokens, source=pt)
+        if tokens.dim() != 1 or not tokens.is_contiguous():
+            raise ValueError(f"token cache {pt} must be a contiguous 1-D tensor")
         if limit is not None:
-            tokens = tokens[:limit].clone()
-        return tokens.to(torch.long)
+            return tokens[:limit].clone().to(torch.long)
+        return tokens
 
     binp = cache_path(dataset, split, suffix="bin", cache_dir=cache_dir)
     if binp.exists():
         meta = json.loads(Path(str(binp) + ".meta.json").read_text())
         n = int(meta["n_tokens"])
         dtype = np.dtype(meta.get("dtype", "int32"))
+        _require_supported_numpy_token_dtype(dtype, source=binp)
         mm = np.memmap(binp, dtype=dtype, mode="r", shape=(n,))
         if limit is not None:
-            mm = mm[:limit]
-        return torch.from_numpy(np.asarray(mm)).to(torch.long)
+            capped = torch.from_numpy(np.asarray(mm[:limit]))
+            return capped.clone() if capped.dtype == torch.long else capped.to(torch.long)
+        tokens = torch.from_numpy(np.asarray(mm))
+        _require_supported_token_dtype(tokens, source=binp)
+        return tokens
 
     raise FileNotFoundError(
         f"no tokenized cache for {dataset!r}/{split!r}: tried {pt} and {binp}"

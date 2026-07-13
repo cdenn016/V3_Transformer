@@ -54,14 +54,16 @@ def test_load_synthetic_pt_cache(tmp_path):
 
 
 def test_load_synthetic_bin_cache(tmp_path):
-    # wiki-en-style int32 memmap + meta.json sidecar
+    # wiki-en-style int32 memmap + meta.json sidecar. An uncapped load stays mapped in the native
+    # int32 dtype (no corpus-sized int64 copy); the exact values still round-trip.
     p = cache_path("wiki-en", "test", suffix="bin", cache_dir=tmp_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     arr = np.random.randint(0, 100277, size=(300,), dtype=np.int32)
     arr.tofile(p)
     (p.parent / (p.name + ".meta.json")).write_text(json.dumps({"n_tokens": 300, "dtype": "int32"}))
     out = load_cached_tokens("wiki-en", "test", cache_dir=tmp_path)
-    assert out.dtype == torch.long and out.shape == (300,)
+    assert out.dtype == torch.int32 and out.shape == (300,)
+    assert torch.equal(out, torch.from_numpy(arr))
     assert out.max() < 100277
 
 
