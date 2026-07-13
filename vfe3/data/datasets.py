@@ -350,7 +350,9 @@ class TokenWindows(Dataset):
     ) -> None:
         if tokens.dim() != 1:
             raise ValueError(f"tokens must be 1-D, got shape {tuple(tokens.shape)}")
-        self.tokens = tokens.to(torch.long)
+        if tokens.dtype not in SUPPORTED_TOKEN_DTYPES:
+            raise ValueError(f"tokens must have integer dtype, got {tokens.dtype}")
+        self.tokens = tokens
         self.seq_len = seq_len
         self.stride = seq_len if stride is None else stride
         usable = self.tokens.numel() - seq_len - 1
@@ -364,7 +366,8 @@ class TokenWindows(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         start = idx * self.stride
         end = start + self.seq_len
-        return self.tokens[start:end], self.tokens[start + 1:end + 1]
+        window = self.tokens[start:end + 1].to(torch.long)
+        return window[:-1], window[1:]
 
 
 def make_dataloader(

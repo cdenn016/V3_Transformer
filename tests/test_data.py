@@ -23,6 +23,32 @@ def test_token_windows_shift_and_length():
     assert torch.equal(y, torch.arange(1, 6))                 # target is input shifted by 1
 
 
+def test_token_windows_casts_only_the_active_l_plus_one_slice():
+    tokens = torch.arange(20, dtype=torch.int32)
+    ds = TokenWindows(tokens, seq_len=4, stride=4)
+    x, y = ds[1]
+    assert x.dtype == y.dtype == torch.long
+    assert x.tolist() == [4, 5, 6, 7]
+    assert y.tolist() == [5, 6, 7, 8]
+    assert ds.tokens.dtype == torch.int32
+
+
+def test_token_windows_never_casts_the_backing_corpus(monkeypatch):
+    tokens = torch.arange(100, dtype=torch.int32)
+    ds = TokenWindows(tokens, seq_len=8, stride=8)
+    original = torch.Tensor.to
+    converted_numel = []
+
+    def tracked_to(self, *args, **kwargs):
+        converted_numel.append(self.numel())
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", tracked_to)
+    x, y = ds[3]
+    assert x.shape == y.shape == (8,)
+    assert converted_numel == [9]
+
+
 def test_get_tiktoken_decoder_synthetic_is_none():
     # The synthetic anchor has no real tokenizer, so no decoder (the caller emits no sample text).
     assert get_tiktoken_decoder("synthetic-period3") is None
