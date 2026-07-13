@@ -820,6 +820,19 @@ def test_alibi_slope_requires_finite_nonnegative_value(value):
     assert VFE3Config(alibi_slope=0.0).alibi_slope == 0.0
 
 
+@pytest.mark.parametrize("value", [None, 0.0, 0, 0.25, 1.0])
+def test_grad_clip_accepts_none_or_finite_nonnegative_real(value):
+    assert VFE3Config(grad_clip=value).grad_clip == value
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, "1.0", -0.1, float("nan"), float("inf"), float("-inf")]
+)
+def test_grad_clip_rejects_invalid_domain(value):
+    with pytest.raises(ValueError, match=r"grad_clip.*finite real value >= 0"):
+        VFE3Config(grad_clip=value)
+
+
 def test_rope_warning_names_only_registered_positional_modes():
     from vfe3.model.positional_phi import _POS_PHI
 
