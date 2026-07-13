@@ -1460,6 +1460,18 @@ class VFE3Config:
         from vfe3.lambda_h_i import _LAMBDA_H_MODES
         _require(self.lambda_h_mode, _LAMBDA_H_MODES, "lambda_h_mode")
         _require(self.r_update_mode, ("gradient", "barycenter"), "r_update_mode")
+        # r_update_mode='barycenter' needs a closed-form barycenter for the model-channel family.
+        # PriorBank.barycenter_r_ implements the moment-matched m-projection ONLY for the Gaussian
+        # families (gaussian_diagonal diagonal moments, gaussian_full full moments, PB-11); a
+        # non-Gaussian family (e.g. laplace_diagonal) has no registered barycenter, so reject the
+        # pair at construction (before model build) rather than silently mis-updating r.
+        if self.r_update_mode == "barycenter" and self.family not in ("gaussian_diagonal", "gaussian_full"):
+            raise ValueError(
+                f"r_update_mode='barycenter' has no registered closed-form barycenter for "
+                f"family={self.family!r}: the moment-matched m-projection is implemented only for the "
+                f"Gaussian families (gaussian_diagonal, gaussian_full). Use r_update_mode='gradient' "
+                f"for {self.family!r}."
+            )
         # A per-coordinate alpha form (state_dependent_per_coord) weights each coordinate's
         # self-divergence by its own alpha^(k), which needs a per-coordinate self-divergence.
         # That decomposition exists only for the diagonal family (full-covariance KL couples

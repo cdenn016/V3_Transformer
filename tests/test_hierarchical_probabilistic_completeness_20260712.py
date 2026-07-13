@@ -451,3 +451,215 @@ def test_scored_outer_loss_matches_pre_change_assembly(include_entropy, n_heads)
             continue
         assert a is not None and b is not None
         torch.testing.assert_close(b, a, rtol=2e-3, atol=1e-4)
+
+
+# ===========================================================================
+# PB-11 (Task 2, 2026-07-12): family-owned model-channel + full-SPD prior storage.
+#
+# Under family='gaussian_full' the model-channel s/r tables carry a packed strict-lower
+# Cholesky (K*(K-1)//2) alongside the log-variance diagonal, so encode_s/r_parameters return
+# a full (..., K, K) covariance; diagonal and Laplace channels create NO packed keys and stay
+# byte-identical. _hyper_prior_kl dispatches KL(s||r) through the configured family, and
+# barycenter_r_ moment-matches full Gaussians. Vocabulary-prior and decode variance tables stay
+# diagonal in every family.
+# ===========================================================================
+
+from vfe3.families.covariance_tables import (                    # noqa: E402
+    covariance_from_packed,
+    packed_from_covariance,
+    packed_strict_lower_size,
+)
+from vfe3.numerics import bounded_variance_from_log              # noqa: E402
+
+
+def _pb11_model(**kw):
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+
+    base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                n_e_steps=1, lambda_h=0.5)
+    base.update(kw)
+    torch.manual_seed(0)
+    return VFEModel(VFE3Config(**base))
+
+
+def _full_kw(**kw):
+    base = dict(family="gaussian_full", decode_mode="full")
+    base.update(kw)
+    return base
+
+
+def _param_names(model):
+    return {name for name, _ in model.named_parameters()}
+
+
+# --- helper-level: bounded-diagonal SPD assembly (K=3, log_diag=100) -------------------------
+
+def test_covariance_from_packed_bounded_diagonal_stays_finite():
+    log_diag = torch.full((3,), 100.0)
+    packed = torch.zeros(packed_strict_lower_size(3))             # zero off-diagonal -> pure diagonal
+    cov = covariance_from_packed(log_diag, packed)
+    assert cov.shape == (3, 3)
+    assert torch.isfinite(cov).all()                             # 100 is bounded BEFORE the sqrt
+    diag = torch.diagonal(cov, dim1=-2, dim2=-1)
+    assert torch.equal(diag, bounded_variance_from_log(log_diag))  # exact diagonal == bounded variance
+    off = cov - torch.diag_embed(diag)
+    assert torch.equal(off, torch.zeros_like(off))               # off-diagonal is exactly zero
+
+
+def test_covariance_from_packed_is_spd_and_round_trips():
+    torch.manual_seed(3)
+    log_diag = torch.randn(2, 3) * 0.3
+    packed = torch.randn(2, packed_strict_lower_size(3)) * 0.5
+    cov = covariance_from_packed(log_diag, packed)
+    assert cov.shape == (2, 3, 3)
+    assert torch.allclose(cov, cov.transpose(-1, -2), atol=1e-6)  # symmetric
+    eigs = torch.linalg.eigvalsh(cov)
+    assert (eigs > 0).all()                                      # positive definite
+    log_diag_rt, packed_rt = packed_from_covariance(cov)
+    cov_rt = covariance_from_packed(log_diag_rt, packed_rt)
+    torch.testing.assert_close(cov_rt, cov, rtol=1e-5, atol=1e-6)  # exact inverse
+
+
+# --- pure path: diagonal / Laplace channels create NO packed keys ---------------------------
+
+def test_diagonal_model_channel_has_no_packed_keys():
+    m = _pb11_model()                                            # gaussian_diagonal (default) + lambda_h
+    names = _param_names(m)
+    assert "prior_bank.s_mu_embed" in names                      # the model channel IS built
+    assert not any("sigma_lower" in n for n in names)           # ...but with no packed Cholesky keys
+    s_mu, s_sigma = m.prior_bank.encode_s(torch.zeros(1, 4, dtype=torch.long))
+    assert s_sigma.shape == (1, 4, m.cfg.embed_dim)             # (B, N, K) diagonal rank
+    r_mu, r_sigma = m.prior_bank.r_parameters()
+    assert r_sigma.shape == (m.cfg.embed_dim,)                  # (K,) diagonal rank
+
+
+def test_laplace_model_channel_constructs_with_gradient_r_update():
+    m = _pb11_model(**{"family": "laplace_diagonal", "r_update_mode": "gradient",
+                       "prior_source": "model_channel"})
+    names = _param_names(m)
+    assert not any("sigma_lower" in n for n in names)           # Laplace (diagonal) creates no packed keys
+    s_mu, s_sigma = m.prior_bank.encode_s(torch.zeros(1, 4, dtype=torch.long))
+    assert s_sigma.shape == (1, 4, m.cfg.embed_dim)            # diagonal rank
+    r_mu, r_sigma = m.prior_bank.r_parameters()
+    assert r_sigma.shape == (m.cfg.embed_dim,)
+
+
+def test_barycenter_rejected_for_family_without_registered_barycenter():
+    from vfe3.config import VFE3Config
+    with pytest.raises(ValueError, match="barycenter"):
+        VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8,
+                   family="laplace_diagonal", lambda_h=0.5, learnable_r=True,
+                   prior_source="model_channel", r_update_mode="barycenter")
+
+
+# --- full path: packed shapes, rank, SPD reconstruction -------------------------------------
+
+def test_full_model_channel_packed_shapes_zero_init():
+    m = _pb11_model(**_full_kw())
+    pb = m.prior_bank
+    V, K = m.cfg.vocab_size, m.cfg.embed_dim
+    n_lower = packed_strict_lower_size(K)
+    assert pb.s_sigma_lower_embed.shape == (V, n_lower)
+    assert pb.r_sigma_lower.shape == (n_lower,)
+    assert torch.equal(pb.s_sigma_lower_embed, torch.zeros(V, n_lower))   # zero-init -> diagonal at start
+    assert torch.equal(pb.r_sigma_lower, torch.zeros(n_lower))
+
+
+def test_full_encode_s_and_r_parameters_return_full_rank():
+    m = _pb11_model(**_full_kw())
+    pb = m.prior_bank
+    K = m.cfg.embed_dim
+    tok = torch.zeros(2, 4, dtype=torch.long)
+    s_mu, s_sigma = pb.encode_s(tok)
+    assert s_mu.shape == (2, 4, K)
+    assert s_sigma.shape == (2, 4, K, K)                        # full covariance rank
+    r_mu, r_sigma = pb.r_parameters()
+    assert r_mu.shape == (K,)
+    assert r_sigma.shape == (K, K)
+    # zero-init packed lower -> the encoded covariance is exactly the diagonal bounded variance.
+    diag = bounded_variance_from_log(pb.s_sigma_log_embed[tok], eps=m.cfg.eps)
+    torch.testing.assert_close(s_sigma, torch.diag_embed(diag), rtol=0.0, atol=0.0)
+
+
+def test_full_encode_s_covariance_is_spd_with_offdiagonal():
+    m = _pb11_model(**_full_kw())
+    pb = m.prior_bank
+    with torch.no_grad():
+        pb.s_sigma_lower_embed.normal_(0.0, 0.4)               # nonzero off-diagonal Cholesky
+    tok = torch.arange(4, dtype=torch.long).reshape(1, 4)
+    _, s_sigma = pb.encode_s(tok)
+    eigs = torch.linalg.eigvalsh(s_sigma)
+    assert (eigs > 0).all()                                     # SPD everywhere
+    off = s_sigma - torch.diag_embed(torch.diagonal(s_sigma, dim1=-2, dim2=-1))
+    assert float(off.abs().max()) > 0.0                        # genuinely off-diagonal
+
+
+# --- vocabulary / decode tables stay diagonal in every family -------------------------------
+
+def test_vocab_and_decode_tables_have_no_lower_triangle_keys():
+    m = _pb11_model(**_full_kw(untie_decode_bank=True, use_prior_bank=True))
+    names = _param_names(m)
+    # Only the model-channel s/r tables carry packed lower keys; the vocabulary prior
+    # (sigma_log_embed) and the untied decode variance table stay diagonal.
+    lower_keys = {n for n in names if "sigma_lower" in n}
+    assert lower_keys == {"prior_bank.s_sigma_lower_embed", "prior_bank.r_sigma_lower"}
+    assert m.prior_bank.sigma_log_embed.shape == (m.cfg.vocab_size, m.cfg.embed_dim)
+    assert m.prior_bank.decode_sigma_log_embed.shape == (m.cfg.vocab_size, m.cfg.embed_dim)
+
+
+# --- gradients flow to the off-diagonal s/r Cholesky ----------------------------------------
+
+def test_full_hyper_prior_kl_dispatches_full_family_and_grads_offdiagonal():
+    m = _pb11_model(**_full_kw(learnable_r=True, r_update_mode="gradient",
+                               prior_source="model_channel"))
+    pb = m.prior_bank
+    assert pb.r_sigma_lower.requires_grad                       # learnable_r un-freezes the packed centroid
+    with torch.no_grad():
+        pb.s_mu_embed.normal_(0.0, 0.5)
+        pb.s_sigma_lower_embed.normal_(0.0, 0.3)               # nonzero -> off-diagonal KL gradient
+        pb.r_sigma_lower.normal_(0.0, 0.3)
+    tok = torch.arange(4, dtype=torch.long).reshape(1, 4)
+    kl = m._hyper_prior_kl(tok)                                 # dispatched through get_family(gaussian_full)
+    assert kl.shape == (1, 4)
+    kl.sum().backward()
+    assert pb.s_sigma_lower_embed.grad is not None
+    assert float(pb.s_sigma_lower_embed.grad.abs().sum()) > 0.0
+    assert pb.r_sigma_lower.grad is not None
+    assert float(pb.r_sigma_lower.grad.abs().sum()) > 0.0
+
+
+# --- full-Gaussian barycenter moment matching -----------------------------------------------
+
+def test_full_barycenter_matches_full_gaussian_moments():
+    m = _pb11_model(**_full_kw())
+    pb = m.prior_bank
+    torch.manual_seed(11)
+    with torch.no_grad():
+        pb.s_mu_embed.normal_(0.0, 0.7)
+        pb.s_sigma_log_embed.normal_(0.0, 0.3)
+        pb.s_sigma_lower_embed.normal_(0.0, 0.4)
+
+    s_sigma = covariance_from_packed(pb.s_sigma_log_embed, pb.s_sigma_lower_embed,
+                                     eps=m.cfg.eps)             # (V, K, K)
+    r_mu_expected = pb.s_mu_embed.mean(dim=0)                   # (K,)
+    centered = pb.s_mu_embed - r_mu_expected                    # (V, K)
+    outer = centered.unsqueeze(-1) * centered.unsqueeze(-2)     # (V, K, K)
+    r_sigma_expected = (s_sigma + outer).mean(dim=0)            # (K, K) within + between
+
+    pb.barycenter_r_()
+    torch.testing.assert_close(pb.r_mu, r_mu_expected, rtol=1e-5, atol=1e-6)
+    r_sigma_actual = covariance_from_packed(pb.r_sigma_log, pb.r_sigma_lower, eps=m.cfg.eps)
+    torch.testing.assert_close(r_sigma_actual, r_sigma_expected, rtol=1e-4, atol=1e-6)
+
+
+# --- optimizer coverage: packed tables are grouped ------------------------------------------
+
+def test_full_packed_tables_are_covered_by_the_optimizer():
+    from vfe3.train import build_optimizer
+    m = _pb11_model(**_full_kw(learnable_r=True, r_update_mode="gradient",
+                               prior_source="model_channel"))
+    opt = build_optimizer(m, m.cfg)                             # raises if any trainable param is ungrouped
+    grouped = {p for g in opt.param_groups for p in g["params"]}
+    assert m.prior_bank.s_sigma_lower_embed in grouped
+    assert m.prior_bank.r_sigma_lower in grouped

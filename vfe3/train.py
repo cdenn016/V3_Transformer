@@ -261,6 +261,11 @@ def build_optimizer(
     if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (lambda_gamma>0 or
         groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu"})    # prior_source=model_channel):
         groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd})  # mean@m_p_mu_lr, log-scale@
+        if getattr(pb, "s_sigma_lower_embed", None) is not None:  # gaussian_full: packed strict-lower Cholesky
+            # The off-diagonal capacity of the full model-channel covariance -- grouped in the sigma
+            # role with m_p_sigma_lr and the configured sigma weight decay, exactly like its diagonal
+            # sibling s_sigma_log_embed above (PB-11). Absent (no group) on diagonal/Laplace families.
+            groups.append({"params": [pb.s_sigma_lower_embed], "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd})
         # m_p_sigma_lr, mirroring the belief tables. s is the model channel / (under model_channel) the
         # live belief prior, so it must train. The hyper-prior CENTROID r is grouped only when
         # learnable_r un-freezes it (next block); FROZEN-by-default r (requires_grad=False, prior_bank.py)
@@ -273,6 +278,12 @@ def build_optimizer(
         # the same exemption the learned unigram-bias prior (output_proj_bias) and the gauge frame carry.
         groups.append({"params": [pb.r_mu],        "lr": cfg.m_p_mu_lr,    "weight_decay": 0.0, "role": "mu"})     # centroid mean
         groups.append({"params": [pb.r_sigma_log], "lr": cfg.m_p_sigma_lr, "weight_decay": 0.0, "role": "sigma"})  # centroid log-scale
+        if getattr(pb, "r_sigma_lower", None) is not None:      # gaussian_full centroid: packed strict-lower Cholesky
+            # The centroid's off-diagonal Cholesky; grouped in the sigma role at m_p_sigma_lr with the
+            # SAME hard weight_decay=0.0 exemption r_sigma_log carries (r is a hyper-prior centroid,
+            # not capacity; decaying it corrupts the m-projection). requires_grad follows learnable_r
+            # like the diagonal centroid, so this group exists exactly when r is an optimizer leaf.
+            groups.append({"params": [pb.r_sigma_lower], "lr": cfg.m_p_sigma_lr, "weight_decay": 0.0, "role": "sigma"})
     if getattr(model, "connection_W", None) is not None:        # transport_mode='regime_ii' learned
         w_group = {"params": [model.connection_W], "lr": cfg.m_phi_lr, "role": "phi"}   # connection -> gauge LR
         if cfg.connection_weight_decay is not None:             # dedicated connection-norm ceiling

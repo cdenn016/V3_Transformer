@@ -39,8 +39,13 @@ import torch.utils.checkpoint as _checkpoint
 from torch import nn
 
 from vfe3.belief import BeliefState
-from vfe3.divergence import get_family, kl
+from vfe3.divergence import family_cov_kind, get_family, kl
 from vfe3.families.base import _logdet_chol
+from vfe3.families.covariance_tables import (
+    covariance_from_packed,
+    packed_from_covariance,
+    packed_strict_lower_size,
+)
 from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.numerics import bounded_variance_from_log, safe_cholesky
 
@@ -176,6 +181,7 @@ class PriorBank(nn.Module):
         decode_tau:          float = 1.0,
         eps:                 float = 1e-6,
         diagonal_covariance: bool  = True,
+        family:              str   = "gaussian_diagonal",
         use_prior_bank:      bool  = True,
         decode_bias:         bool  = False,
         encode_mode:         str   = "per_token",
@@ -248,6 +254,11 @@ class PriorBank(nn.Module):
         self.decode_tau = decode_tau
         self.eps = eps
         self.diagonal_covariance = diagonal_covariance
+        # family drives the model-channel (s/r) covariance rank: 'full' -> packed strict-lower
+        # Cholesky tables (SPD covariance), else the diagonal log-variance tables. The vocabulary
+        # prior and decode variance tables stay diagonal in EVERY family (PB-11).
+        self.family = family
+        self._s_cov_kind = family_cov_kind(family)
         self.use_prior_bank = use_prior_bank
         self.encode_mode = encode_mode
         self.decode_mode = decode_mode
@@ -328,6 +339,14 @@ class PriorBank(nn.Module):
         if lambda_h > 0.0 or lambda_gamma > 0.0 or prior_source == "model_channel" or s_e_step:
             self.s_mu_embed        = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
             self.s_sigma_log_embed = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
+            if self._s_cov_kind == "full":
+                # gaussian_full model channel (PB-11): the packed strict-lower Cholesky (V, K*(K-1)//2)
+                # completing s_sigma_log_embed's diagonal into a full SPD covariance L L^T. ZERO-init
+                # (torch.zeros, no RNG) so the initial model-channel covariances are exactly diagonal
+                # AND the RNG order of every subsequent table is byte-unchanged from the pre-PB-11 build.
+                # Diagonal/Laplace channels create no packed key -> pure diagonal state_dict is identical.
+                self.s_sigma_lower_embed = nn.Parameter(
+                    torch.zeros(vocab_size, packed_strict_lower_size(K)))
         if lambda_h > 0.0 or s_e_step:
             # Hyper-prior centroid r (r_mu, r_sigma_log): the centroid the model beliefs s_i are
             # regularized toward via lambda_h*KL(s_i||r). DEFAULT FROZEN (learnable_r=False,
@@ -340,6 +359,11 @@ class PriorBank(nn.Module):
             # which VFE3Config.__post_init__ warns about.
             self.r_mu              = nn.Parameter(torch.zeros(K), requires_grad=learnable_r)
             self.r_sigma_log       = nn.Parameter(torch.full((K,), sigma_log_init), requires_grad=learnable_r)
+            if self._s_cov_kind == "full":
+                # The packed strict-lower Cholesky of the centroid r (gaussian_full, PB-11): zero-init
+                # (r starts diagonal), grouped/frozen exactly like r_sigma_log via learnable_r.
+                self.r_sigma_lower = nn.Parameter(
+                    torch.zeros(packed_strict_lower_size(K)), requires_grad=learnable_r)
             # DESIGN NOTE (audit 2026-06-15): the token-dependent top-down hyper-prior
             # r_i = Omega_tilde[s_I^{(s+1)}] (PIFB eq:cross_scale_shadow / eq:topdown_priors) is the
             # model-fiber transport of a GENUINELY EMERGED scale-(s+1) meta-agent, and is OUT OF SCOPE for
@@ -475,22 +499,49 @@ class PriorBank(nn.Module):
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Look up the per-token model-channel belief s_i = N(s_mu, s_sigma) (diagonal).
+        r"""Look up the per-token model-channel belief s_i = N(s_mu, s_sigma).
 
-        Returns (s_mu, s_sigma) with s_mu (B, N, K) and s_sigma (B, N, K) the positive
-        variances exp(s_sigma_log).clamp(min=eps). Available on the active-model-channel path
-        (lambda_h>0 OR lambda_gamma>0, where the s tables are created); consumed as
-        DiagonalGaussian(s_mu, s_sigma) by BOTH the hyper-prior term lambda_h*KL(s_i||r) and the
-        gamma model-coupling block. Through THESE two consumers s_i is NOT coupled into the belief q
-        (the gamma transport is tied+detached), so it stays predictively inert. The s->q coupling is
-        a SEPARATE path: prior_source=='model_channel' routes the belief prior to the SAME s tables
-        via _prior_mu_table/_prior_sigma_log_table (encode/self-coupling/decode), making s the prior.
+        Returns (s_mu, s_sigma) with s_mu (B, N, K); the covariance rank FOLLOWS the family
+        (``family_cov_kind``): a diagonal/Laplace family yields the positive variances
+        exp(s_sigma_log).clamp(min=eps) as (B, N, K), while ``gaussian_full`` assembles the packed
+        strict-lower Cholesky into the full SPD covariance L L^T as (B, N, K, K). Available on the
+        active-model-channel path (lambda_h>0, lambda_gamma>0, prior_source='model_channel', or
+        s_e_step, where the s tables are created); consumed as ``get_family(cfg.family)(s_mu,
+        s_sigma)`` by the hyper-prior term lambda_h*KL(s_i||r). Through this consumer s_i is NOT
+        coupled into the belief q, so it stays predictively inert. The s->q coupling is a SEPARATE
+        path: prior_source=='model_channel' routes the belief prior to the SAME s tables via
+        _prior_mu_table/_prior_sigma_log_table (which read the DIAGONAL log-variance table).
         """
         s_mu = self.s_mu_embed[token_ids]                                       # (B, N, K)
-        s_sigma = bounded_variance_from_log(
-            self.s_sigma_log_embed[token_ids], eps=self.eps,
-        )                                                                         # (B, N, K)
+        if self._s_cov_kind == "full":
+            s_sigma = covariance_from_packed(
+                self.s_sigma_log_embed[token_ids], self.s_sigma_lower_embed[token_ids], eps=self.eps,
+            )                                                                     # (B, N, K, K)
+        else:
+            s_sigma = bounded_variance_from_log(
+                self.s_sigma_log_embed[token_ids], eps=self.eps,
+            )                                                                     # (B, N, K)
         return s_mu, s_sigma
+
+    def r_parameters(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""The global hyper-prior centroid r = N(r_mu, r_sigma) with covariance rank FOLLOWING the
+        family (``family_cov_kind``).
+
+        Returns (r_mu, r_sigma) with r_mu (K,); a diagonal/Laplace family yields the positive
+        variances exp(r_sigma_log).clamp(min=eps) as (K,), while ``gaussian_full`` assembles the
+        packed strict-lower Cholesky into the full SPD covariance L L^T as (K, K). Available on the
+        centroid path (lambda_h>0 or s_e_step, where the r tables are created); consumed as
+        ``get_family(cfg.family)(r_mu, r_sigma)`` by the hyper-prior term (replacing the direct
+        log-variance reads so a full family carries its off-diagonal centroid covariance).
+        """
+        r_mu = self.r_mu                                                        # (K,)
+        if self._s_cov_kind == "full":
+            r_sigma = covariance_from_packed(
+                self.r_sigma_log, self.r_sigma_lower, eps=self.eps,
+            )                                                                     # (K, K)
+        else:
+            r_sigma = bounded_variance_from_log(self.r_sigma_log, eps=self.eps)  # (K,)
+        return r_mu, r_sigma
 
     def s_phi(
         self,
@@ -531,7 +582,26 @@ class PriorBank(nn.Module):
         point (VFE3Config.__post_init__ warns). It also drops the model-fiber transport Omega_tilde and
         the per-type weights of the manuscript meta-agent barycenter, so it is a same-scale,
         UNTRANSPORTED, uniform-weight centroid -- not the cross-scale shadow r_i=Omega_tilde[s^(s+1)].
+
+        FAMILY (PB-11): for ``gaussian_full`` the moment match runs over FULL covariances --
+        ``r_Sigma = mean_v[Sigma_s_v + (s_mu_v - r_mu)(s_mu_v - r_mu)^T]`` (within-covariance plus
+        the outer product of the mean spread), the full-Gaussian m-projection -- and is written back
+        through the packed Cholesky (r_sigma_log + r_sigma_lower). The diagonal branch is unchanged.
         """
+        if self._s_cov_kind == "full":
+            s_mu = self.s_mu_embed                                               # (V, K)
+            s_sigma = covariance_from_packed(
+                self.s_sigma_log_embed, self.s_sigma_lower_embed, eps=self.eps,
+            )                                                                     # (V, K, K)
+            r_mu = s_mu.mean(dim=0)                                              # (K,)
+            centered = s_mu - r_mu                                               # (V, K)
+            outer = centered.unsqueeze(-1) * centered.unsqueeze(-2)              # (V, K, K)
+            r_sigma = (s_sigma + outer).mean(dim=0)                             # (K, K) within + between
+            r_log_diag, r_packed = packed_from_covariance(r_sigma, eps=self.eps)
+            self.r_mu.copy_(r_mu)
+            self.r_sigma_log.copy_(r_log_diag)
+            self.r_sigma_lower.copy_(r_packed)
+            return
         s_mu = self.s_mu_embed                                                   # (V, K)
         s_sigma = bounded_variance_from_log(self.s_sigma_log_embed, eps=self.eps)  # (V, K)
         r_mu = s_mu.mean(dim=0)                                                  # (K,)

@@ -220,6 +220,7 @@ class VFEModel(nn.Module):
             mu_init_std=cfg.mu_init_std, sigma_init=cfg.sigma_init, phi_scale=cfg.phi_scale,
             decode_tau=cfg.decode_tau, eps=cfg.eps,
             diagonal_covariance=cfg.diagonal_covariance,
+            family=cfg.family,
             use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
@@ -1662,21 +1663,22 @@ class VFEModel(nn.Module):
         s_i is the refined model belief when ``s_belief`` is supplied (the forward's s1 under
         ``s_e_step``, so the diagnostic reads the SAME s the model uses), else encoded fresh from the
         s tables; measured against the global centroid r, grad-connected (no detach). The covariance
-        kernel is DiagonalGaussian regardless of cfg.family (the s/r tables are always diagonal
-        (V,K)/(K,)); r (K,) broadcasts over the (B, N) token axis. :meth:`_hyper_prior_term` reduces
-        this to its mean (the forward-loss scale); :meth:`diagnostics` and the s/r/h figures consume
-        the per-token vector / its sum.
+        kernel is ``get_family(cfg.family)`` (PB-11): a diagonal/Laplace family scores diagonal
+        (V,K)/(K,) s/r, while ``gaussian_full`` scores the full SPD s/r covariances that
+        ``encode_s``/``r_parameters`` now assemble from the packed Cholesky tables; r broadcasts over
+        the (B, N) token axis. :meth:`_hyper_prior_term` reduces this to its mean (the forward-loss
+        scale); :meth:`diagnostics` and the s/r/h figures consume the per-token vector / its sum.
         """
-        from vfe3.families.gaussian import DiagonalGaussian
+        from vfe3.divergence import get_family
         from vfe3.free_energy import self_divergence, self_divergence_per_coord
         cfg = self.cfg
         pb = self.prior_bank
-        s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B, N, K)
-        r_mu = pb.r_mu                                               # (K,)
-        r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps)  # (K,)
+        family = get_family(cfg.family)
+        s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B,N,K) or (B,N,K,K)
+        r_mu, r_sigma = pb.r_parameters()                           # (K,) / (K,K)
         div = self_divergence_per_coord if per_coord else self_divergence
         return div(
-            DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),
+            family(s_mu, s_sigma), family(r_mu, r_sigma),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family,
         )                                                            # (B, N) summed, or (B, N, K) per-coord
