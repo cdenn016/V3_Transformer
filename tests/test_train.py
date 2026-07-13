@@ -635,6 +635,121 @@ def test_train_step_skips_on_nonfinite_grad_with_finite_loss():
     assert sched.last_epoch == 2                                    # scheduler stepped UNCONDITIONALLY
 
 
+# =============================================================================
+# Gradient-clipping runtime pinning (PB-15): None/zero disable, global vs
+# per-role clip counts, omitted-vs-explicit equivalence, terminal-callback seam.
+# =============================================================================
+
+def _clip_case(*, per_role=False):
+    cfg = VFE3Config(
+        vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4,
+        grad_clip_per_role=per_role,
+    )
+    model = VFEModel(cfg)
+    optimizer = build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda step: lr_lambda(step, cfg)
+    )
+    tokens = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+    targets = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    return model, optimizer, scheduler, tokens, targets
+
+
+def _install_clip_spy(monkeypatch):
+    calls = []
+
+    def spy(parameters, max_norm, *args, **kwargs):
+        params = list(parameters)
+        calls.append(({id(p) for p in params}, float(max_norm)))
+        return torch.tensor(0.0)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy)
+    return calls
+
+
+def test_grad_clip_global_calls_once_with_all_parameters(monkeypatch):
+    model, optimizer, scheduler, tokens, targets = _clip_case(per_role=False)
+    calls = _install_clip_spy(monkeypatch)
+    train_step(model, optimizer, scheduler, tokens, targets, grad_clip=0.25)
+    assert calls == [({id(p) for p in model.parameters()}, 0.25)]
+
+
+def test_grad_clip_per_role_calls_once_per_nonempty_role(monkeypatch):
+    model, optimizer, scheduler, tokens, targets = _clip_case(per_role=True)
+    expected = {}
+    for group in optimizer.param_groups:
+        expected.setdefault(group.get("role", "other"), set()).update(
+            id(p) for p in group["params"]
+        )
+    calls = _install_clip_spy(monkeypatch)
+    train_step(model, optimizer, scheduler, tokens, targets, grad_clip=0.25)
+    assert {frozenset(ids) for ids, _ in calls} == {
+        frozenset(ids) for ids in expected.values() if ids
+    }
+    assert all(max_norm == 0.25 for _, max_norm in calls)
+    flattened = [pid for ids, _ in calls for pid in ids]
+    assert len(flattened) == len(set(flattened))
+
+
+@pytest.mark.parametrize("grad_clip", [None, 0.0])
+def test_grad_clip_off_still_steps(monkeypatch, grad_clip):
+    model, optimizer, scheduler, tokens, targets = _clip_case()
+    calls = _install_clip_spy(monkeypatch)
+    status = {}
+    before_epoch = scheduler.last_epoch
+    train_step(
+        model, optimizer, scheduler, tokens, targets,
+        grad_clip=grad_clip, status_out=status,
+    )
+    assert calls == []
+    assert status["did_step"] is True
+    assert scheduler.last_epoch == before_epoch + 1
+
+
+def test_omitted_grad_clip_matches_explicit_one(monkeypatch):
+    left, left_opt, left_sched, tokens, targets = _clip_case()
+    right, right_opt, right_sched, _, _ = _clip_case()
+    right.load_state_dict(left.state_dict())
+    right_opt.load_state_dict(left_opt.state_dict())
+    right_sched.load_state_dict(left_sched.state_dict())
+    original = torch.nn.utils.clip_grad_norm_
+    calls = []
+
+    def tracked(parameters, max_norm, *args, **kwargs):
+        params = list(parameters)
+        calls.append((len(params), float(max_norm)))
+        return original(params, max_norm, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", tracked)
+    train_step(left, left_opt, left_sched, tokens, targets)
+    split = len(calls)
+    train_step(right, right_opt, right_sched, tokens, targets, grad_clip=1.0)
+    assert calls[:split] == calls[split:]
+    for key, value in left.state_dict().items():
+        assert torch.equal(value, right.state_dict()[key])
+
+
+def test_grad_clip_signature_preserves_terminal_callback():
+    r"""PB-15 seam guard: the clipping annotation/wiring edit must not erase the PB-02
+    terminal-callback contract -- train() still invokes it exactly once with a
+    TrainingTerminalState, even when grad_clip is threaded through explicitly."""
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    captured = {"calls": 0}
+
+    def cb(state, callback_losses):
+        captured["calls"] += 1
+        captured["state"] = state
+
+    train(model, _periodic_loader(seed=0), cfg, n_steps=1,
+          terminal_callback=cb, grad_clip=cfg.grad_clip)
+
+    assert captured["calls"] == 1
+    assert isinstance(captured["state"], TrainingTerminalState)
+
+
 def test_attention_map_replay_failure_does_not_kill_training(tmp_path, monkeypatch, caplog):
     r"""F11 (audit 2026-07-01): the attention/gamma map replays are argument expressions evaluated
     in the CALLER, outside the save helpers' internal try/except -- a replay error must be caught

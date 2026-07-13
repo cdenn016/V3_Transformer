@@ -452,7 +452,7 @@ def train_step(
     targets:   torch.Tensor,             # (B, N) next-token ids (-100 = ignore)
 
     *,
-    grad_clip:        float                              = 1.0,
+    grad_clip:        Optional[float]                    = 1.0,
     grad_accum_steps: int                                = 1,
     scaler:           Optional['torch.amp.GradScaler']  = None,
     metrics_out:      Optional[dict]                     = None,
@@ -463,6 +463,11 @@ def train_step(
     Zeroes the prior-table gradients, runs the forward (encode -> unrolled E-step ->
     decode -> CE), backpropagates the loss through inference to the prior tables, clips
     the global gradient norm to ``grad_clip``, then takes one AdamW + scheduler step.
+    ``grad_clip`` of ``None`` or ``0.0`` disables clipping entirely (the optimizer and
+    scheduler still step on the raw gradient); any positive value clips ONCE, after
+    accumulation and unscale, to that global L2 norm. Under ``cfg.grad_clip_per_role``
+    the same threshold is applied independently to each optimizer-group role
+    (mu/sigma/phi) rather than once over all parameters together.
 
     With ``grad_accum_steps == K > 1`` the batch is split into ``K`` equal chunks along
     the batch axis; each chunk's loss is divided by ``K`` and ``backward()``-ed,
@@ -906,8 +911,8 @@ def train(
     cfg:    VFE3Config,
 
     *,
-    n_steps:   int   = 100,
-    grad_clip: float = 1.0,
+    n_steps:   int             = 100,
+    grad_clip: Optional[float] = 1.0,
 
     log_interval:    Optional[int]            = None,
     eval_interval:   Optional[int]            = None,
