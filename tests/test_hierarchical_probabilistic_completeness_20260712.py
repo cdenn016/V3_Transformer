@@ -1137,3 +1137,227 @@ def test_family_chunked_all_ignore_is_finite_zero():
     ce = pb.decode_ce_family_chunked(mu_q, sigma_q, targets, chunk_size=3)
     assert torch.isfinite(ce) and ce.item() == 0.0
     ce.backward()                                                      # grad-connected (no autograd error)
+
+
+# ===========================================================================
+# Task 6 (2026-07-12): end-to-end CPU matrix over the completed hierarchy.
+#
+# One forward/backward per family/transport/decode cell, each V<=9 / K<6: finite loss and
+# gradients, optimizer coverage (build_optimizer asserts its groups cover model.parameters()
+# exactly), a state-dict save/load round trip that reproduces the forward, and typed-term
+# equality -- the reported per-token hierarchy blocks reconstruct diagnostics['total'] through
+# the single typed evaluator (PB-10). The unit-level shape/gradient tests above already pin the
+# packed storage, family dispatch, nonflat parity, and CG closure internals; this matrix is the
+# integrated cell coverage on top of them.
+# ===========================================================================
+
+import os                                                              # noqa: E402
+
+
+_MATRIX_CELLS = {
+    # canonical diagonal / flat -- the pure route (no model channel, flat transport).
+    "canonical_diagonal_flat": dict(
+        vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1, n_e_steps=2,
+        family="gaussian_diagonal", transport_mode="flat"),
+    # full-SPD model channel -- packed strict-lower Cholesky s/r tables (PB-11), gradient centroid.
+    "full_spd_model_channel": dict(
+        vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1, n_e_steps=2,
+        family="gaussian_full", decode_mode="full", prior_source="model_channel",
+        lambda_h=0.5, lambda_gamma=0.5, learnable_r=True, r_update_mode="gradient"),
+    # Laplace model channel decoded through the family-consistent KL-to-prior readout (PB-14).
+    "laplace_family_decode": dict(
+        vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1, n_e_steps=2,
+        family="laplace_diagonal", prior_source="model_channel", r_update_mode="gradient",
+        use_prior_bank=True, decode_mode="family", lambda_h=0.5),
+    # nonflat full model channel -- the covariant Regime-II connection shared by both channels (PB-11).
+    "nonflat_full_model_channel": dict(
+        vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1, n_e_steps=2,
+        family="gaussian_full", decode_mode="full", prior_source="model_channel",
+        transport_mode="regime_ii_covariant", lambda_gamma=0.5, oracle_unroll_grad=True),
+    # full-CG moment closure -- delta_full covariance pushforward + moment-energy regularizer (PB-13).
+    "full_cg_moment_closure": dict(
+        vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1, n_e_steps=2,
+        family="gaussian_full", decode_mode="full",
+        gauge_group="so_n", group_n=3, irrep_spec=[("l0", 1), ("l1", 1)],
+        phi_precond_mode="none", use_cg_coupling=True, cg_energy_weight=0.5,
+        cg_covariance_mode="delta_full", e_step_gradient="unroll"),
+}
+
+
+def _build_matrix_model(kw):
+    r"""Build a matrix-cell model and perturb every trainable table off its (often zero) init so the
+    hierarchy energy, transport, and CG paths are all genuinely exercised. Warnings (the benign
+    full-covariance linear-decode note, the regime_ii oracle auto-enable) are silenced here."""
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        torch.manual_seed(0)
+        cfg = VFE3Config(**kw)
+        m = VFEModel(cfg)
+    torch.manual_seed(3)
+    with torch.no_grad():
+        for p in m.parameters():
+            if p.requires_grad and p.dim() >= 1:
+                p.normal_(0.0, 0.3)
+    return m, cfg
+
+
+def _reconstruct_total(d, cfg):
+    r"""Reassemble diagnostics['total'] from the reported (raw) hierarchy blocks, applying the same
+    weights and gates the typed evaluator uses inside ``diagnostics``: lambda_beta on the belief
+    coupling and (gated) attention entropy, lambda_twohop on the two-hop block, the pre-weighted
+    hyper-prior contribution, and lambda_gamma on the gamma coupling + meta-entropy."""
+    lb = cfg.lambda_beta
+    recon = d["self_coupling"] + lb * d["belief_coupling"]
+    if cfg.include_attention_entropy:
+        recon += lb * d["attention_entropy"]
+    if cfg.lambda_twohop != 0.0:
+        recon += cfg.lambda_twohop * d.get("twohop_coupling", 0.0)
+    recon += d.get("hyper_prior_weighted", 0.0)
+    recon += cfg.lambda_gamma * (d.get("gamma_coupling", 0.0) + d.get("gamma_meta_entropy", 0.0))
+    return recon
+
+
+@pytest.mark.parametrize("cell", sorted(_MATRIX_CELLS))
+def test_end_to_end_hierarchy_matrix(cell):
+    kw = _MATRIX_CELLS[cell]
+    m, cfg = _build_matrix_model(kw)
+    torch.manual_seed(1)
+    tok = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
+    tgt = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
+
+    # one forward / backward
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        loss = m(tok, tgt)[1]
+    assert torch.isfinite(loss), f"{cell}: non-finite loss"
+    loss.backward()
+
+    # finite gradients (at least one live parameter, all finite)
+    grads = [(name, p.grad) for name, p in m.named_parameters() if p.grad is not None]
+    assert grads, f"{cell}: no parameter received a gradient"
+    for name, g in grads:
+        assert torch.isfinite(g).all(), f"{cell}: non-finite gradient in {name}"
+
+    # optimizer coverage: build_optimizer raises if any trainable parameter is ungrouped.
+    from vfe3.train import build_optimizer
+    build_optimizer(m, cfg)
+
+    # save/load round trip: a fresh model reloaded from the state dict reproduces the forward loss.
+    from vfe3.model.model import VFEModel
+    sd = m.state_dict()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        torch.manual_seed(0)
+        fresh = VFEModel(cfg)
+        fresh.load_state_dict(sd)
+        with torch.no_grad():
+            loss_fresh = fresh(tok, tgt)[1]
+    assert torch.allclose(loss.detach(), loss_fresh, atol=1e-6, rtol=0.0), \
+        f"{cell}: state-dict reload changed the forward loss"
+
+    # typed-term equality: the reported blocks reconstruct the typed hierarchy total.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        d = m.diagnostics(tok)
+    assert math.isfinite(d["total"]), f"{cell}: non-finite diagnostics total"
+    recon = _reconstruct_total(d, cfg)
+    assert abs(d["total"] - recon) < 1e-3, \
+        f"{cell}: typed total {d['total']} != reconstruction {recon}"
+
+
+# ---------------------------------------------------------------------------
+# RTX 5090 CUDA smoke (Task 6 Step 5). Guarded by VFE3_TEST_DEVICE; SKIPS cleanly on CPU and
+# awaits an explicit GPU run. Exercises the full-covariance model channel under the live s E-step
+# and the covariant Regime-II connection -- the heaviest completed-hierarchy path.
+# ---------------------------------------------------------------------------
+
+_DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
+
+
+@pytest.mark.skipif(_DEVICE.type != "cuda",
+                    reason="RTX 5090 CUDA smoke; set VFE3_TEST_DEVICE=cuda to run")
+def test_hierarchy_full_covariant_cuda_smoke():
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+    from vfe3.families.covariance_tables import covariance_from_packed
+    from vfe3.train import build_optimizer
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        torch.manual_seed(0)
+        cfg = VFE3Config(
+            vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1, n_e_steps=2,
+            family="gaussian_full", decode_mode="full", prior_source="model_channel",
+            s_e_step=True, transport_mode="regime_ii_covariant",
+            lambda_h=0.5, lambda_gamma=0.5, r_update_mode="gradient", oracle_unroll_grad=True)
+        m = VFEModel(cfg).to(_DEVICE)
+    torch.manual_seed(3)
+    with torch.no_grad():
+        for p in m.parameters():
+            if p.requires_grad and p.dim() >= 1:
+                p.normal_(0.0, 0.3)
+
+    tok = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len), device=_DEVICE)
+    tgt = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len), device=_DEVICE)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        loss = m(tok, tgt)[1]
+    assert torch.isfinite(loss)                                        # finite loss
+    assert loss.is_cuda                                                # CUDA residency
+    loss.backward()
+
+    grads = [(name, p.grad) for name, p in m.named_parameters() if p.grad is not None]
+    assert grads
+    for name, g in grads:
+        assert g.is_cuda, f"gradient {name} left CUDA"
+        assert torch.isfinite(g).all(), f"non-finite gradient in {name}"
+
+    build_optimizer(m, cfg).step()                                     # one optimizer step
+
+    pb = m.prior_bank
+    s_cov = covariance_from_packed(pb.s_sigma_log_embed, pb.s_sigma_lower_embed, eps=cfg.eps)
+    assert s_cov.is_cuda                                               # packed s covariance on CUDA
+    eigs = torch.linalg.eigvalsh(s_cov)
+    assert (eigs > 0).all()                                           # SPD model covariances
+
+
+# ---------------------------------------------------------------------------
+# Pure-route identity probe (Task 6 Step 3): the feature branch and its merge base must produce a
+# byte-identical fingerprint of one deterministic forward/backward/optimizer step of the default
+# (diagonal / flat) route. tests/hierarchy_identity_probe.py writes each bundle; this test recursively
+# compares the two named by VFE3_BASELINE_BUNDLE / VFE3_FEATURE_BUNDLE with torch.equal. Any difference
+# is BLOCKING -- the completed hierarchy is meant to leave the pure path untouched.
+# ---------------------------------------------------------------------------
+
+def _assert_bundle_equal(a, b, path="bundle"):
+    if isinstance(a, torch.Tensor):
+        assert isinstance(b, torch.Tensor), f"{path}: tensor vs {type(b).__name__}"
+        assert a.shape == b.shape, f"{path}: shape {tuple(a.shape)} != {tuple(b.shape)}"
+        assert a.dtype == b.dtype, f"{path}: dtype {a.dtype} != {b.dtype}"
+        assert torch.equal(a, b), f"{path}: tensor values differ"
+    elif isinstance(a, dict):
+        assert isinstance(b, dict), f"{path}: dict vs {type(b).__name__}"
+        assert set(a) == set(b), f"{path}: key set differs ({set(a) ^ set(b)})"
+        for k in a:
+            _assert_bundle_equal(a[k], b[k], f"{path}.{k}")
+    elif isinstance(a, (list, tuple)):
+        assert isinstance(b, (list, tuple)), f"{path}: sequence vs {type(b).__name__}"
+        assert len(a) == len(b), f"{path}: length {len(a)} != {len(b)}"
+        for i, (x, y) in enumerate(zip(a, b)):
+            _assert_bundle_equal(x, y, f"{path}[{i}]")
+    else:
+        assert a == b, f"{path}: {a!r} != {b!r}"
+
+
+def test_pure_route_bundle_is_byte_identical_to_branch_base():
+    baseline = os.environ.get("VFE3_BASELINE_BUNDLE")
+    feature = os.environ.get("VFE3_FEATURE_BUNDLE")
+    if not baseline or not feature:
+        pytest.skip("set VFE3_BASELINE_BUNDLE and VFE3_FEATURE_BUNDLE (see hierarchy_identity_probe.py)")
+    base_bundle = torch.load(baseline, weights_only=False)
+    feat_bundle = torch.load(feature, weights_only=False)
+    assert base_bundle["state_dict_keys"] == feat_bundle["state_dict_keys"]
+    _assert_bundle_equal(base_bundle, feat_bundle)
