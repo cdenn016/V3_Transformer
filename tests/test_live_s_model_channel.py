@@ -189,3 +189,86 @@ def test_s_e_step_forward_runs_finite_under_so_k():
     tok = torch.randint(0, m.cfg.vocab_size, (1, 4))
     lg = m(tok)
     assert torch.isfinite(lg).all()
+
+
+# ===========================================================================
+# PB-11 (Task 3, 2026-07-12): _refine_s consumes the configured family and the
+# active connection law (was hardcoded family='gaussian_diagonal' + flat transport).
+# ===========================================================================
+
+def test_refine_s_full_covariance_returns_full_rank():
+    # s_e_step + gaussian_full was REJECTED at construction pre-change (the diagonal s-refine
+    # would overwrite the (B,N,K,K) belief sigma). The family-dispatched _refine_s now refines the
+    # model channel AS a full Gaussian: the refined sigma keeps full (B,N,K,K) rank.
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel", family="gaussian_full",
+                           decode_mode="full", lambda_h=1.0, lambda_gamma=1.0,
+                           e_s_mu_lr=0.5, e_s_sigma_lr=0.5))
+    K = m.cfg.embed_dim
+    tok = torch.randint(0, m.cfg.vocab_size, (2, 4))
+    phi0 = m._apply_pos_phi(m.prior_bank.encode(tok).phi)
+    s0_mu, s0_sigma = m.prior_bank.encode_s(tok)
+    assert s0_sigma.shape == (2, 4, K, K)                       # encode_s covariance is full rank
+    s1_mu, s1_sigma = m._refine_s(tok, phi0)
+    assert s1_mu.shape == (2, 4, K)
+    assert s1_sigma.shape == (2, 4, K, K)                       # refined s stays full rank (no crash)
+    assert torch.isfinite(s1_mu).all() and torch.isfinite(s1_sigma).all()
+
+
+def test_refine_s_full_covariance_forward_and_backward_run():
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel", family="gaussian_full",
+                           decode_mode="full", lambda_h=1.0, lambda_gamma=1.0, e_s_mu_lr=0.5))
+    tok = _tok(m)
+    tgt = _tok(m)
+    _, loss, _ = m(tok, targets=tgt)                            # full-cov live-s forward (was unreachable)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert m.prior_bank.s_mu_embed.grad is not None
+    assert float(m.prior_bank.s_mu_embed.grad.abs().sum()) > 0.0
+
+
+def test_refine_s_laplace_family_diagonal_rank_runs():
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel", family="laplace_diagonal",
+                           r_update_mode="gradient", lambda_h=1.0, lambda_gamma=1.0,
+                           e_s_mu_lr=0.5, e_s_sigma_lr=0.5))
+    K = m.cfg.embed_dim
+    tok = torch.randint(0, m.cfg.vocab_size, (2, 4))
+    phi0 = m._apply_pos_phi(m.prior_bank.encode(tok).phi)
+    s1_mu, s1_sigma = m._refine_s(tok, phi0)
+    assert s1_mu.shape == (2, 4, K) and s1_sigma.shape == (2, 4, K)   # Laplace is diagonal rank
+    assert torch.isfinite(s1_mu).all() and torch.isfinite(s1_sigma).all()
+
+
+def test_refine_s_shares_connection_W():
+    # regime_ii s-refine reads the s-channel means AND the shared connection_W (was flat-hardcoded,
+    # so connection_W had no effect on the refined s).
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel", transport_mode="regime_ii",
+                           lambda_h=1.0, lambda_gamma=1.0, e_s_mu_lr=0.5, e_s_sigma_lr=0.5))
+    with torch.no_grad():
+        m.prior_bank.s_mu_embed.normal_(0.0, 0.5)
+        m.connection_W.normal_(0.0, 0.6)
+    tok = torch.randint(0, m.cfg.vocab_size, (2, 4))
+    phi0 = m._apply_pos_phi(m.prior_bank.encode(tok).phi)
+    s1a, _ = m._refine_s(tok, phi0)
+    with torch.no_grad():
+        m.connection_W.mul_(1.8)
+    s1b, _ = m._refine_s(tok, phi0)
+    assert not torch.allclose(s1a, s1b)                         # refined s moves with the shared connection
+
+
+def test_refine_s_gradient_reaches_connection_W():
+    torch.manual_seed(0)
+    m = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel", transport_mode="regime_ii",
+                           lambda_h=1.0, lambda_gamma=1.0, e_s_mu_lr=0.5))
+    with torch.no_grad():
+        m.prior_bank.s_mu_embed.normal_(0.0, 0.5)
+        m.connection_W.normal_(0.0, 0.4)
+    tok = _tok(m)
+    tgt = _tok(m)
+    _, loss, _ = m(tok, targets=tgt)
+    loss.backward()
+    assert m.connection_W.grad is not None
+    assert float(m.connection_W.grad.abs().sum()) > 0.0        # s-refine keeps the connection gradient live

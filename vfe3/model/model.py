@@ -41,7 +41,6 @@ from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.model.stack import vfe_stack
-from vfe3.numerics import bounded_variance_from_log
 
 
 # Transport-mode state-routing sets: which regimes' Omega builders read mu/sigma. Sourced from the
@@ -738,6 +737,25 @@ class VFEModel(nn.Module):
         p = getattr(self, "log_kappa_gamma", None)
         return torch.exp(p).to(device) if p is not None else _as_coeff(self.cfg.kappa_gamma, device)
 
+    def _model_channel_connection_kwargs(self) -> dict:
+        r"""The connection-law knob bag the model channel SHARES with the belief channel (PB-11):
+        the active learned connections (``connection_W``/``M``/``L``, all None on the flat pure path)
+        plus the link/cocycle/clamp controls. Threaded into BOTH :meth:`_refine_s`'s E-step and
+        :meth:`_gamma_energy`'s transport build so the s-fiber transports under the SAME connection
+        the belief E-step uses, instead of an isolated flat cocycle. On the flat pure path every
+        connection is None and the controls are their inert defaults, so the call is byte-identical.
+        The per-mode decision of WHICH belief tensors (s_mu/s_sigma) feed the builder is made by the
+        caller from the transport-registration metadata, not here."""
+        cfg = self.cfg
+        return dict(
+            connection_W=getattr(self, "connection_W", None),
+            connection_M=getattr(self, "connection_M", None),
+            connection_L=getattr(self, "connection_L", None),
+            link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+            cocycle_relaxation=cfg.cocycle_relaxation,
+            clamp_monitor=cfg.transport_clamp_monitor,
+        )
+
     def _refine_s(
         self,
         token_ids:          torch.Tensor,   # (B, N) integer token ids
@@ -768,8 +786,13 @@ class VFEModel(nn.Module):
         # build_belief_transport), matching the belief channel. A BUFFER lookup (non-differentiable),
         # so -- unlike omega_s -- there is NO detach/attach concern; None on the pure path.
         reflection_s = pb.reflection_sign[token_ids] if cfg.phi_reflection != "off" else None
-        r_mu    = pb.r_mu.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
-        r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps).expand_as(s_sigma)
+        # Family-rank frozen centroid r (PB-11): r_parameters() returns the (K,) diagonal / (K,K) full
+        # covariance matching cfg.family, so the full-covariance s E-step scores against a full r
+        # (the prior fix that unblocks s_e_step + gaussian_full; the diagonal path is byte-identical
+        # since r_parameters uses the SAME bounded_variance_from_log(pb.r_sigma_log, eps=pb.eps)).
+        r_mu_t, r_sigma_t = pb.r_parameters()                         # (K,) / (K,) or (K,K)
+        r_mu    = r_mu_t.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
+        r_sigma = r_sigma_t.expand_as(s_sigma)                        # (B,N,K) diag or (B,N,K,K) full
         gamma_tau       = attention_tau(self.effective_kappa_gamma(s_mu.device), grp.irrep_dims)
         gamma_log_prior = self._attention_log_prior(
             token_ids.shape[1], token_ids.device, prior=cfg.gamma_attention_prior,
@@ -805,20 +828,22 @@ class VFEModel(nn.Module):
             # s-refine silently ran the default 'fisher' even under e_step_mu_precond='raw',
             # contaminating the B3/EXP-14 mean-arm ablation (raw belief channel, Fisher s channel).
             e_step_mu_precond=cfg.e_step_mu_precond,
-            family="gaussian_diagonal",
+            family=cfg.family,
             divergence_family=cfg.divergence_family,
             phi_precond_mode=cfg.phi_precond_mode,
             phi_retract_mode=cfg.phi_retract_mode,
             spd_retract_mode=cfg.spd_retract_mode,
-            # FLAT model-frame transport for the s-channel, INTENTIONALLY ignoring cfg.transport_mode
-            # (audit 2026-06-10 F7, mirroring _gamma_coupling_term's documented choice): the model
-            # channel refines under the flat phi0 cocycle even when the belief channel runs
-            # regime_ii -- the learned edge connection is a belief-channel object (delta reads the
-            # belief means, not s), and the s E-step runs with phi held fixed. Thread
-            # cfg.transport_mode + connection_W here if the s-channel is ever meant to share the
-            # learned connection.
-            transport_mode="flat",
+            # SHARED connection regime for the s-channel (PB-11): the model channel refines under
+            # cfg.transport_mode with the SAME learned connection the belief E-step uses, threaded via
+            # _model_channel_connection_kwargs. The stateful regime_ii/covariant Omega is rebuilt each
+            # iteration from the CHANNEL-LOCAL s means/covariances (e_step reads belief.mu/sigma, which
+            # here are s_mu/s_sigma), not the belief means; the link modes read only connection_L. phi0
+            # is still held fixed (e_phi_lr=0). Flat -> every connection None == the byte-identical pure
+            # path. share_refine_s_transport (the flat prebuilt hoist) is gated to flat at its caller,
+            # so a non-flat mode never receives a flat prebuilt transport.
+            transport_mode=cfg.transport_mode,
             gauge_parameterization=cfg.gauge_parameterization,
+            **self._model_channel_connection_kwargs(),
             e_step_gradient=e_step_gradient,
             oracle_unroll_grad=cfg.oracle_unroll_grad,
             # Tier-1 transport perf toggles: the s-channel E-step shares the flat transport
@@ -1746,36 +1771,55 @@ class VFEModel(nn.Module):
         r"""Shared model-coupling setup: the s-channel pairwise energy E^s_ij, the gamma softmax
         temperature tau_g, and the gamma attention log-prior.
 
-        The s-channel mirror of the belief beta channel under FLAT transport from the explicit
-        model frame ``phi`` (Omega_tilde_ij = exp(phi_i) exp(-phi_j)): E^s_ij =
-        D(s_i || Omega_tilde_ij s_j) on the
-        diagonal s tables, per irrep block (head). Transport is factored-when-fusable (audit P4),
+        The s-channel mirror of the belief beta channel (PB-11): the s tables are scored in the
+        CONFIGURED family ``get_family(cfg.family)`` and transported through the SAME connection
+        regime the belief E-step uses, E^s_ij = D(s_i || Omega_ij s_j) per irrep block (head), with
+        Omega_ij built by ``cfg.transport_mode`` (flat -> exp(phi_i) exp(-phi_j); regime_ii/covariant
+        -> the learned edge factor read from the CHANNEL-LOCAL s means/covariances; the link modes ->
+        the shared connection_L). Transport is factored-when-fusable on the flat path (audit P4),
         exactly the E-step dispatch. Consumed by :meth:`_gamma_coupling_term` (the forward loss),
         :meth:`_gamma_coupling_terms` (the split diagnostic), and :meth:`gamma_attention_maps`
         (the gamma_ij figure), so all three read the SAME energy/temperature/prior.
         """
-        from vfe3.families.gaussian import DiagonalGaussian
+        from vfe3.families.base import get_family
         from vfe3.free_energy import attention_tau, pairwise_energy
-        from vfe3.geometry.transport import transport_covariance, transport_mean
+        from vfe3.geometry.transport import (
+            _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA, transport_covariance, transport_mean,
+        )
         from vfe3.inference.e_step import build_belief_transport
         cfg = self.cfg
         pb = self.prior_bank
-        s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B, N, K)
+        fam = get_family(cfg.family)
+        s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B,N,K) or (B,N,K,K)
         n_pos = token_ids.shape[1]
         # omega_direct only when the caller actually supplies the belief frame (omega is not None);
-        # callers with no frame in scope pass omega=None and the s-channel falls back to the flat phi
-        # cocycle (a documented s-channel simplification -- the gamma block is DETACHED and predictively
-        # inert). Under the default 'phi' parameterization omega is always None, so this is byte-identical.
+        # callers with no frame in scope pass omega=None and the s-channel uses the phi cocycle. Under
+        # the default 'phi' parameterization omega is always None, so this is byte-identical.
         gp = cfg.gauge_parameterization if omega is not None else "phi"
-        omega = build_belief_transport(phi, self.group, transport_mode="flat",
+        # Share the belief channel's connection regime (PB-11): build the s-fiber transport through the
+        # SAME registry, gating the belief tensors it consumes on the transport-registration metadata
+        # (needs_mu/needs_sigma) rather than a mode-name conditional -- the stateful regime_ii/covariant
+        # transport reads the CHANNEL-LOCAL s means/covariances, the belief-independent link modes read
+        # only connection_L. Flat -> mu/sigma gated to None + every connection None == the byte-identical
+        # pure path.
+        tm = cfg.transport_mode
+        omega = build_belief_transport(phi, self.group, transport_mode=tm,
                                        gauge_parameterization=gp, omega=omega,
                                        reflection=reflection,
+                                       mu=(s_mu if tm in _TRANSPORT_NEEDS_MU else None),
+                                       sigma=(s_sigma if tm in _TRANSPORT_NEEDS_SIGMA else None),
                                        transport_mean_per_head=cfg.transport_mean_per_head,
-                                       compact_phi_block_transport=self._compact_phi_blocks_enabled())
+                                       compact_phi_block_transport=self._compact_phi_blocks_enabled(),
+                                       **self._model_channel_connection_kwargs())
         s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
-        s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
+        # diagonal_out resolves the diagonal (B,N,K) vs full (B,N,K,K) sandwich EXACTLY as the belief
+        # channel does (gradients/kernels.py, oracle.py: diagonal_out=(sigma.dim()==mu.dim())). This is
+        # load-bearing for the batch-independent bare link, whose batch-collapsed operator makes the
+        # rank-gap heuristic mis-read a batched diagonal sigma as full; harmless (same branch) elsewhere.
+        s_sigma_t = transport_covariance(omega, s_sigma,             # (B,N,N,K) diag or (B,N,N,K,K) full
+                                         diagonal_out=(s_sigma.dim() == s_mu.dim()))
         e_s = pairwise_energy(
-            DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(s_mu_t, s_sigma_t),
+            fam(s_mu, s_sigma), fam(s_mu_t, s_sigma_t),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
         )                                                            # (B,H,N,N) block_glk; (B,N,N) single-block

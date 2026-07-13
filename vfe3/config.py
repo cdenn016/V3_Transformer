@@ -1575,35 +1575,12 @@ class VFE3Config:
                     "s_e_step=True requires prior_source='model_channel' so the s-tables are the "
                     f"model's vocab table for encode and decode; got prior_source={self.prior_source!r}."
                 )
-            # The live s-refine (_refine_s) and the s/r tables are DIAGONAL by construction (the s
-            # table is (V,K) and the centroid r is (K,)). Under a full-covariance family the belief
-            # sigma is (B,N,K,K) and the diagonal refined-s would overwrite it with a (B,N,K) tensor,
-            # crashing deep in the full kernel with an opaque shape error. Reject at construction so
-            # the (unsupported) full-cov s-channel fails fast with a clear message; the diagonal
-            # family is the supported pure path for the s E-step.
-            if not family_is_diagonal:
-                raise ValueError(
-                    "s_e_step=True refines the model channel as a DIAGONAL Gaussian (the s/r tables "
-                    f"are diagonal by construction), incompatible with family={self.family!r}. Use a "
-                    "diagonal-covariance family (e.g. 'gaussian_diagonal') for the live s E-step."
-                )
-            # The s-refine (_refine_s) hardcodes family='gaussian_diagonal': the model channel is
-            # uniformly DiagonalGaussian by design. A non-Gaussian (but diagonal) belief family
-            # therefore still runs a GAUSSIAN s E-step while the belief runs its own family -- a
-            # well-posed mixed prior/posterior (no NaN), but the model channel is NOT refined in the
-            # belief's family. Warn (do not raise) so the double-opt-in (s_e_step + non-Gaussian
-            # family) is not silent; the pure path is family='gaussian_diagonal'.
-            elif self.family != "gaussian_diagonal":
-                import warnings
-                warnings.warn(
-                    f"s_e_step=True refines the model channel as a Gaussian (_refine_s hardcodes "
-                    f"family='gaussian_diagonal'), but family={self.family!r}: the s-channel E-step "
-                    f"runs Gaussian while the belief is {self.family!r}. This is a well-posed "
-                    f"mixed-family prior/posterior (no NaN), but the model channel is not refined in "
-                    f"the belief's family. Use family='gaussian_diagonal' to match, or accept the "
-                    f"mixed-family s-refine.",
-                    UserWarning, stacklevel=2,
-                )
+            # PB-11: _refine_s now refines the model channel in the CONFIGURED family (family=cfg.family)
+            # against the family-rank frozen centroid r (r_parameters() returns the (K,) diagonal or
+            # (K,K) full covariance), and encode_s/r_parameters carry the matching covariance rank. So
+            # the old rejection of a full-covariance family AND the old "runs Gaussian while the belief
+            # is <family>" mixed-family warning are obsolete: any registered family's covariance action
+            # is supported by the shared transport, so no family combination is rejected here.
             if self.lambda_h == 0.0 and self.lambda_gamma == 0.0:
                 import warnings
                 warnings.warn(
@@ -2157,21 +2134,26 @@ class VFE3Config:
                 "gauge.",
                 UserWarning, stacklevel=2,
             )
-        # F7 (audit 2026-07-01): the s-channel (model coupling + s E-step) transports the s tables
-        # under the FLAT phi-cocycle only (_gamma_energy / _refine_s pass transport_mode="flat"),
-        # regardless of cfg.transport_mode. Under a NON-FLAT belief transport the belief and model
-        # channels then run different connections -- the s-fiber has no non-flat transport law yet,
-        # so the model-channel comparison is NOT gauge-covariant. Warn (non-breaking) so a run does
-        # not describe it as sharing the active connection.
+        # F7 -> PB-11: the s-channel (_gamma_energy / _refine_s) now transports the s tables through
+        # cfg.transport_mode with the SAME shared connection the belief channel uses, so the old
+        # flat-island warning ("the s-fiber has no non-flat transport law") is obsolete and removed --
+        # a valid nonflat model channel constructs silently. The remaining guard is on the family's
+        # COVARIANCE ACTION, not on flatness: only a combination the registered family's covariance
+        # structure cannot support is rejected. Every registered family reports cov_kind in
+        # {'diagonal', 'full'}, both of which the transport covariance sandwich handles (the diagonal
+        # readout is the C5 controlled approximation warned about above; the full sandwich is exact),
+        # so no combination is unsupported today. A future family whose covariance the transport cannot
+        # act on is caught here rather than crashing deep in the s-channel build.
         if self.transport_mode != "flat" and (self.lambda_gamma > 0.0 or self.s_e_step):
-            import warnings
-            warnings.warn(
-                f"transport_mode={self.transport_mode!r} is non-flat, but the model channel "
-                f"(lambda_gamma={self.lambda_gamma}, s_e_step={self.s_e_step}) transports the s tables "
-                "under the FLAT phi-cocycle only; the s-fiber has no non-flat transport law. The "
-                "model-channel coupling is NOT gauge-covariant under this connection.",
-                UserWarning, stacklevel=2,
-            )
+            from vfe3.divergence import family_cov_kind
+            if family_cov_kind(self.family) not in ("diagonal", "full"):
+                raise ValueError(
+                    f"transport_mode={self.transport_mode!r} model channel (lambda_gamma="
+                    f"{self.lambda_gamma}, s_e_step={self.s_e_step}) needs a family whose covariance "
+                    f"the transport sandwich Omega Sigma Omega^T can act on (cov_kind in "
+                    f"{{'diagonal', 'full'}}); got family={self.family!r} with cov_kind="
+                    f"{family_cov_kind(self.family)!r}."
+                )
 
         # normalization validated against the norm REGISTRY (add-by-registering). Local import
         # avoids a config <- norms cycle.

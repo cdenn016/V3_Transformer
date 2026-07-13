@@ -170,13 +170,16 @@ def test_t5_learnable_bias_inert_without_channel_warns():
                                  t5_learnable_bias=True)
 
 
-# --- Fix 5: s_e_step refines a non-Gaussian belief's model channel as Gaussian -----------------
+# --- Fix 5 -> PB-11 (2026-07-12): _refine_s now refines the model channel in cfg.family, so the old
+# "runs Gaussian while the belief is <family>" mixed-family warning is obsolete and removed. -----
 _F5 = "mixed-family"
 
 
-def test_s_e_step_non_gaussian_family_warns():
-    assert _warns_matching(_F5, family="laplace_diagonal", s_e_step=True,
-                           prior_source="model_channel", lambda_h=1.0)
+def test_s_e_step_non_gaussian_family_no_longer_warns_mixed_family():
+    # _refine_s dispatches through get_family(cfg.family): a Laplace s channel IS refined as Laplace,
+    # so there is no Gaussian/Laplace mismatch to warn about anymore.
+    assert not _warns_matching(_F5, family="laplace_diagonal", s_e_step=True,
+                               prior_source="model_channel", lambda_h=1.0)
 
 
 def test_s_e_step_gaussian_family_silent():

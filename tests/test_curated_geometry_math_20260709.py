@@ -96,7 +96,12 @@ def test_prior_model_and_decode_variance_reads_share_guard() -> None:
         "_decode_sigma_log_table",
     )
     expected_guarded_reads = {
-        "model": Counter({"pb.r_sigma_log": 2}),
+        # PB-11 (2026-07-12): _refine_s reads the frozen centroid r through pb.r_parameters() (which
+        # bounds self.r_sigma_log inside prior_bank), NOT a direct model.py bounded_variance_from_log
+        # call, so the guarded r read now lives in prior_bank instead of model. The SPD-safety guard is
+        # preserved -- every trainable log-variance table still reaches a variance only through a
+        # bounded_variance_from_log call; only its location moved.
+        "model": Counter(),
         "prior_bank": Counter(
             {
                 "self.s_sigma_log_embed[token_ids]": 1,
@@ -104,6 +109,7 @@ def test_prior_model_and_decode_variance_reads_share_guard() -> None:
                 "self._decode_sigma_log_table()": 4,
                 "pb._prior_sigma_log_table()[token_ids]": 2,
                 "pb._decode_sigma_log_table()": 4,
+                "self.r_sigma_log": 1,
             }
         ),
         "extract": Counter({"pb.r_sigma_log": 2}),

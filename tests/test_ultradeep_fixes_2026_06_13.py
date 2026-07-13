@@ -16,18 +16,28 @@ from vfe3.families.gaussian import DiagonalGaussian, FullGaussian
 
 
 # ---------------------------------------------------------------------------
-# M1 — s_e_step=True must reject a full-covariance family at construction
-#      (the s/r channel is diagonal by construction; otherwise the E-step
-#      crashes deep in a kernel with an opaque shape error)
+# M1 — s_e_step=True now REFINES the model channel in the configured family (PB-11,
+#      2026-07-12): the diagonal-only rejection is obsolete because _refine_s dispatches
+#      through get_family(cfg.family) against the family-rank centroid r, so a full-covariance
+#      s channel constructs and refines to a full (B,N,K,K) covariance instead of crashing.
 # ---------------------------------------------------------------------------
-def test_m1_s_e_step_rejects_full_covariance_family():
-    with pytest.raises(ValueError, match="diagonal"):
-        VFE3Config(
-            s_e_step=True,
-            prior_source="model_channel",
-            family="gaussian_full",
-            lambda_h=0.5,
-        )
+def test_m1_s_e_step_accepts_and_refines_full_covariance_family():
+    from vfe3.model.model import VFEModel
+
+    cfg = VFE3Config(
+        vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1, n_e_steps=1,
+        s_e_step=True, prior_source="model_channel", family="gaussian_full", decode_mode="full",
+        lambda_h=0.5, lambda_gamma=1.0, e_s_mu_lr=0.5, e_s_sigma_lr=0.5,
+    )
+    assert cfg.s_e_step and cfg.family == "gaussian_full"
+    torch.manual_seed(0)
+    m = VFEModel(cfg)
+    tok = torch.randint(0, 6, (2, 4))
+    phi0 = m._apply_pos_phi(m.prior_bank.encode(tok).phi)
+    s1_mu, s1_sigma = m._refine_s(tok, phi0)
+    assert s1_mu.shape == (2, 4, 4)
+    assert s1_sigma.shape == (2, 4, 4, 4)                             # refined s stays full rank
+    assert torch.isfinite(s1_mu).all() and torch.isfinite(s1_sigma).all()
 
 
 def test_m1_s_e_step_accepts_diagonal_family():

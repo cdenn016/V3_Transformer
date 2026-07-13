@@ -663,3 +663,186 @@ def test_full_packed_tables_are_covered_by_the_optimizer():
     grouped = {p for g in opt.param_groups for p in g["params"]}
     assert m.prior_bank.s_sigma_lower_embed in grouped
     assert m.prior_bank.r_sigma_lower in grouped
+
+
+# ===========================================================================
+# PB-11 (Task 3, 2026-07-12): model-channel family + nonflat transport parity.
+#
+# _gamma_energy now dispatches through get_family(cfg.family) and builds the
+# s-channel transport through the SAME connection-regime registry the belief
+# channel uses, sharing the active connection_W/M/L and gating the belief tensors
+# it feeds the builder on the transport-registration metadata (needs_mu/needs_sigma)
+# rather than a mode-name conditional. The stateful regime_ii/covariant s-channel
+# transport reads the s-channel means/covariances (channel-local), not the belief q.
+# ===========================================================================
+
+from vfe3.families.base import get_family as _get_family                        # noqa: E402
+from vfe3.free_energy import pairwise_energy as _pairwise_energy                 # noqa: E402
+from vfe3.geometry.transport import (                                           # noqa: E402
+    _TRANSPORT_NEEDS_MU,
+    _TRANSPORT_NEEDS_SIGMA,
+    transport_covariance as _transport_covariance,
+    transport_mean as _transport_mean,
+)
+from vfe3.inference.e_step import build_belief_transport as _build_belief_transport  # noqa: E402
+
+
+def _gamma_model(**kw):
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+
+    # prior_source='token' (default) keeps the belief mu_embed table SEPARATE from the s tables, so the
+    # channel-local "transport reads the s state, not the belief q state" assertions are meaningful
+    # (model_channel would tie encode() to encode_s and collapse the distinction). lambda_gamma>0 still
+    # creates the s tables the gamma model coupling reads.
+    base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                n_e_steps=1, lambda_h=0.0, lambda_gamma=0.5)
+    base.update(kw)
+    torch.manual_seed(0)
+    m = VFEModel(VFE3Config(**base))
+    torch.manual_seed(11)
+    with torch.no_grad():                                       # non-degenerate s / belief / frame tables
+        m.prior_bank.s_mu_embed.normal_(0.0, 0.5)
+        m.prior_bank.s_sigma_log_embed.normal_(0.0, 0.3)
+        m.prior_bank.mu_embed.normal_(0.0, 0.5)
+        m.prior_bank.phi_embed.normal_(0.0, 0.2)
+    return m
+
+
+def _transport_from_state(m, phi, *, mu_state, sigma_state):
+    r"""Build the s-channel transport exactly as the family/registry-driven ``_gamma_energy`` must:
+    forward the active connections and gate the state tensors on the transport-registration metadata."""
+    cfg = m.cfg
+    tm = cfg.transport_mode
+    return _build_belief_transport(
+        phi, m.group, transport_mode=tm, gauge_parameterization="phi",
+        mu=(mu_state if tm in _TRANSPORT_NEEDS_MU else None),
+        sigma=(sigma_state if tm in _TRANSPORT_NEEDS_SIGMA else None),
+        connection_W=getattr(m, "connection_W", None),
+        connection_M=getattr(m, "connection_M", None),
+        connection_L=getattr(m, "connection_L", None),
+        link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+        cocycle_relaxation=cfg.cocycle_relaxation,
+    )
+
+
+def _gamma_e_s_reference(m, tok, phi, *, mu_state, sigma_state):
+    r"""The configured-family s-channel pairwise energy under a transport built from ``mu_state`` /
+    ``sigma_state`` -- the golden the metadata-driven ``_gamma_energy`` must reproduce."""
+    cfg = m.cfg
+    fam = _get_family(cfg.family)
+    s_mu, s_sigma = m.prior_bank.encode_s(tok)
+    omega = _transport_from_state(m, phi, mu_state=mu_state, sigma_state=sigma_state)
+    s_mu_t = _transport_mean(omega, s_mu)
+    s_sigma_t = _transport_covariance(omega, s_sigma, diagonal_out=(s_sigma.dim() == s_mu.dim()))
+    return _pairwise_energy(fam(s_mu, s_sigma), fam(s_mu_t, s_sigma_t),
+                            alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                            divergence_family=cfg.divergence_family,
+                            irrep_dims=m.group.irrep_dims)
+
+
+def _belief_channel_energy(m, tok, phi):
+    r"""The belief (q) channel pairwise energy under the SAME active connection, transport fed the
+    belief means/covariances -- so it responds to the shared connection independently of the s path."""
+    cfg = m.cfg
+    fam = _get_family(cfg.family)
+    enc = m.prior_bank.encode(tok)
+    omega = _transport_from_state(m, phi, mu_state=enc.mu, sigma_state=enc.sigma)
+    q_mu_t = _transport_mean(omega, enc.mu)
+    q_sigma_t = _transport_covariance(omega, enc.sigma, diagonal_out=(enc.sigma.dim() == enc.mu.dim()))
+    return _pairwise_energy(fam(enc.mu, enc.sigma), fam(q_mu_t, q_sigma_t),
+                            alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                            divergence_family=cfg.divergence_family,
+                            irrep_dims=m.group.irrep_dims)
+
+
+# --- family parity: _gamma_energy dispatches the configured family --------------------------
+
+@pytest.mark.parametrize("family,extra,cov_rank", [
+    ("gaussian_diagonal", {}, 3),
+    ("gaussian_full", {"decode_mode": "full"}, 4),
+    ("laplace_diagonal", {"r_update_mode": "gradient"}, 3),
+])
+def test_gamma_energy_dispatches_configured_family(family, extra, cov_rank):
+    m = _gamma_model(family=family, **extra)
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    e_s, tau, log_prior = m._gamma_energy(tok, phi)             # gaussian_full: crashed pre-change
+    assert torch.isfinite(e_s).all()
+    _, s_sigma = m.prior_bank.encode_s(tok)
+    assert s_sigma.dim() == cov_rank                            # covariance rank follows the family
+    # e_s is the configured-family energy, not a hardcoded DiagonalGaussian one.
+    ref = _gamma_e_s_reference(m, tok, phi, mu_state=None, sigma_state=None)
+    torch.testing.assert_close(e_s, ref, rtol=1e-4, atol=1e-5)
+
+
+def test_hyper_prior_kl_dispatches_configured_family_full_rank():
+    m = _gamma_model(family="gaussian_full", decode_mode="full", lambda_h=0.5)
+    tok = torch.randint(0, 6, (2, 5))
+    kl = m._hyper_prior_kl(tok)
+    assert kl.shape == (2, 5) and torch.isfinite(kl).all()
+    _, s_sigma = m.prior_bank.encode_s(tok)
+    assert s_sigma.dim() == 4                                   # full-rank s covariance scored
+
+
+# --- nonflat parity: both q and s energies respond to the shared connection -----------------
+
+def test_gamma_energy_shares_connection_W_both_channels_change():
+    m = _gamma_model(transport_mode="regime_ii")
+    with torch.no_grad():
+        m.connection_W.normal_(0.0, 0.5)
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    e_s0 = m._gamma_energy(tok, phi)[0].clone()
+    q_e0 = _belief_channel_energy(m, tok, phi).clone()
+    with torch.no_grad():
+        m.connection_W.mul_(1.7)                               # perturb ONLY the shared connection
+    e_s1 = m._gamma_energy(tok, phi)[0]
+    q_e1 = _belief_channel_energy(m, tok, phi)
+    assert not torch.allclose(e_s0, e_s1)                      # s-channel now reads connection_W (was flat)
+    assert not torch.allclose(q_e0, q_e1)                      # belief channel reads the same connection
+
+
+def test_gamma_energy_regime_ii_transport_reads_s_state_not_q_state():
+    m = _gamma_model(transport_mode="regime_ii")
+    with torch.no_grad():
+        m.connection_W.normal_(0.0, 0.6)
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    e_s = m._gamma_energy(tok, phi)[0]
+    s_mu, s_sigma = m.prior_bank.encode_s(tok)
+    enc = m.prior_bank.encode(tok)
+    assert not torch.allclose(s_mu, enc.mu)                    # s and belief means genuinely differ
+    ref_s = _gamma_e_s_reference(m, tok, phi, mu_state=s_mu, sigma_state=s_sigma)
+    torch.testing.assert_close(e_s, ref_s, rtol=1e-4, atol=1e-5)   # transport reads the s-channel state
+    ref_q = _gamma_e_s_reference(m, tok, phi, mu_state=enc.mu, sigma_state=enc.sigma)
+    assert not torch.allclose(e_s, ref_q)                     # ...not the belief-channel state
+
+
+def test_gamma_energy_gradient_reaches_connection_W():
+    m = _gamma_model(transport_mode="regime_ii")
+    with torch.no_grad():
+        m.connection_W.normal_(0.0, 0.4)
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    e_s = m._gamma_energy(tok, phi)[0]
+    e_s.sum().backward()
+    assert m.connection_W.grad is not None
+    assert float(m.connection_W.grad.abs().sum()) > 0.0       # shared connection is live in the s block
+
+
+# --- config: a valid nonflat model channel constructs without the flat-island warning -------
+
+def test_nonflat_model_channel_constructs_without_flat_island_warning():
+    import warnings
+
+    from vfe3.config import VFE3Config
+
+    for tm in ("regime_ii", "regime_ii_covariant", "regime_ii_link_charted"):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                       transport_mode=tm, lambda_gamma=0.5, prior_source="model_channel")
+        flat_island = [w for w in caught
+                       if "FLAT phi-cocycle" in str(w.message) or "no non-flat transport law" in str(w.message)]
+        assert not flat_island, f"{tm} still warns the model channel is a flat island: {[str(w.message) for w in flat_island]}"
