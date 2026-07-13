@@ -26,6 +26,7 @@ from vfe3.contracts import (
     EffectiveBetaPriorContext,
     EStepGradientOutput,
     EStepGradientRecord,
+    MetropolisObjectiveContext,
     MStepCapture,
 )
 from vfe3.geometry.groups import GaugeGroup, get_group
@@ -1089,15 +1090,28 @@ class VFEModel(nn.Module):
 
         *,
         mode:      Optional[str] = None,     # 'omega' | 'phi'; None -> resolve from cfg
-    ) -> 'Tuple[BeliefState, torch.Tensor, torch.Tensor]':
-        r"""Converged belief + belief prior for the (fixed-belief) Metropolis det-sign F-eval.
+    ) -> MetropolisObjectiveContext:
+        r"""Fixed q/p state for the (fixed-belief) Metropolis det-sign F-eval, as ONE
+        :class:`MetropolisObjectiveContext` (audit PB-12).
 
-        Runs the belief pipeline once under no_grad and returns the belief carrying the frame the
-        E-step actually minimized (``capture['converged']``, the pre-final_norm converged q*; falls
-        back to the returned post-norm belief if that lacks the mode's frame field) together with the
-        encode-time prior means/variances (``capture['prior']``). These are held FIXED across the sweep
-        -- only the frame is flipped (``belief.omega`` under 'omega', ``belief.reflection`` under 'phi')
-        -- so the Metropolis DeltaF is the exact change in the joint F under the block move."""
+        Runs the belief pipeline once under no_grad and captures everything the scorer needs to
+        evaluate the EXACT active fixed-belief objective, held FIXED across the sweep so only the frame
+        is flipped (``belief.omega`` under 'omega', ``belief.reflection`` under 'phi'):
+
+          - ``belief`` -- the final block's converged q* carrying the frame the E-step minimized
+            (``capture['converged']``, pre-final_norm; falls back to the returned post-norm belief only
+            if that lacks the mode's frame field). The sweep initializes ``f_cur`` and the sequential
+            current state from THIS exact object before constructing any trial.
+          - ``mu_p``/``sigma_p`` -- the HANDOFF-ADJUSTED prior entering the FINAL block
+            (``capture['final_block_prior']``), NOT the encode prior (they coincide only at n_layers=1),
+            so the self-coupling and coupling terms score against the same p the final block descended.
+          - ``tau`` -- the final block's ENTRY-derived query-adaptive temperature
+            (``capture['final_block_tau']``), the tau that PRODUCED q*, not a tau recomputed from the
+            converged sigma.
+          - ``rope`` -- the positional RoPE rotation for this token length (None when off).
+          - ``prior`` -- the fixed pre-stack :class:`EffectiveBetaPriorContext`; the scorer rebuilds the
+            candidate-dependent effective prior per proposal from it and the trial frame.
+        """
         mode = mode or self._reflection_metropolis_mode()
         with torch.no_grad():
             cap: Dict = {}
@@ -1107,61 +1121,73 @@ class VFEModel(nn.Module):
                 belief_f = conv if (conv is not None and conv.omega is not None) else belief
             else:                                     # phi: prefer the converged frame carrying the sign
                 belief_f = conv if (conv is not None and conv.reflection is not None) else belief
-            prior     = cap["prior"]                  # encode-time prior BeliefState (post s-refine)
-        return belief_f, prior.mu, prior.sigma
+            mu_p, sigma_p = cap["final_block_prior"]  # handoff-adjusted prior ENTERING the final block
+            rope = self._rope_rotation(token_ids.shape[-1], token_ids.device)
+        return MetropolisObjectiveContext(
+            token_ids=token_ids, mu_p=mu_p, sigma_p=sigma_p, belief=belief_f,
+            tau=cap["final_block_tau"], rope=rope, prior=cap["beta_prior_context"])
 
     def _metropolis_free_energy(
         self,
-        belief:  BeliefState,                # fixed belief carrying .omega (B, N, K, K) or .reflection (B, N)
-        mu_p:    torch.Tensor,               # (B, N, K) prior means
-        sigma_p: torch.Tensor,               # (B, N, K) prior variances
+        belief:  BeliefState,                        # candidate belief carrying .omega (B,N,K,K) or .reflection (B,N)
+        context: MetropolisObjectiveContext,         # fixed q/p state (prior, tau, prior moments, rope)
 
         *,
-        mode:    Optional[str] = None,       # 'omega' | 'phi'; None -> resolve from cfg
+        mode:    Optional[str] = None,               # 'omega' | 'phi'; None -> resolve from cfg
     ) -> float:
-        r"""Scalar free energy of a FIXED belief, summed over the batch (sequences are independent).
+        r"""Scalar free energy of a FIXED belief under the EXACT active objective, summed over the batch
+        (sequences are independent). Audit PB-12: scores the SAME F the E-step descended.
 
-        Mirrors the belief E-step's ``free_energy_value`` kwargs (tau, self-coupling value/b0/c0,
-        lambda_beta, family/divergence, entropy term) so ``belief.omega`` enters F through the
-        belief-coupling transport Omega_ij = U_i U_j^{-1}. ONE batched ``free_energy_value`` call
-        (audit 2026-07-12 N7): the softmax/prior/energy ops are batch-broadcasting and the final
-        reduction is a sum over every leading axis, so the batched scalar IS the per-sequence sum
-        (sequences are independent; attention rows never mix batch elements) -- one host sync per F
-        instead of one per sequence, collapsing the sweep in :meth:`metropolis_omega_step` from
-        (1+n_unique)xB synced evals to (1+n_unique). Pinned to the per-sequence sum by
-        ``tests/test_omega_metropolis.py``. The current and trial evaluations call this with
-        IDENTICAL kwargs and differ only in
-        ``belief.omega``, so the Metropolis DeltaF is exact and self-consistent (the absolute F need
-        not equal the training loss).
+        Rebuilds the candidate-dependent effective attention prior via
+        ``_effective_beta_log_prior(belief, context.prior)`` -- the precision fold reads the FIXED
+        pre-stack ``context.prior.precision_sigma`` (frame-blind; identical for current and trial), and
+        only the tied-gamma fold varies with the proposed frame -- then evaluates ``free_energy_value``
+        with the FIXED captured tau (``context.tau``, the final block's entry-derived query-adaptive
+        temperature), the FIXED handoff-adjusted prior moments (``context.mu_p``/``context.sigma_p``),
+        the honored ``lambda_twohop``, and the ACTIVE transport/RoPE/numerics controls
+        (``transport_mode``, ``connection_W``/``M``/``L``, cocycle/link/clamp, ``transport_mean_per_head``,
+        ``context.rope`` + ``rope_on_cov``/``rope_on_value``, ``exp_fp64_mode``/``exp_fp64_norm_threshold``).
+        Current and trial thus differ ONLY in the proposed frame/reflection, so the Metropolis DeltaF is
+        the exact change in the joint F under the block move.
 
-        Caveat: ``log_prior`` here is the RAW ``_attention_log_prior`` -- it does NOT replay
-        ``_fold_precision_bias`` (``cfg.precision_weighted_attention``) or ``_fold_gamma_prior``
-        (``cfg.gamma_as_beta_prior``), both default OFF, which ``forward_beliefs`` may have folded into
-        the prior the belief actually converged under. ``lambda_twohop`` (default 0.0) is likewise not
-        forwarded to ``free_energy_value``. Under either opt-in fold, or nonzero ``lambda_twohop``,
-        DeltaF is therefore a close approximation to the fold-consistent value rather than exact --
-        current and trial are still scored against the IDENTICAL (raw) prior, so accept/reject remains
-        well-defined and self-consistent, just not against the same prior the E-step used."""
-        from vfe3.free_energy import attention_tau
+        ONE batched ``free_energy_value`` call (audit 2026-07-12 N7): the softmax/prior/energy ops are
+        batch-broadcasting and the final reduction sums over every leading axis, so the batched scalar
+        IS the per-sequence sum (sequences are independent; attention rows never mix batch elements) --
+        one host sync per F. The absolute F need not equal the training loss, but the DeltaF is exact.
+
+        Caveat (optimizer-moment staleness, see :meth:`metropolis_omega_step`): the accepted flip is
+        written to the source table AFTER ``optimizer.step()``, so AdamW's moment buffers for a flipped
+        row stay stale for one step -- unchanged by this objective-parity work."""
         from vfe3.inference.e_step import free_energy_value
         cfg, grp = self.cfg, self.group
         mode      = mode or self._reflection_metropolis_mode()
         gp        = "omega_direct" if mode == "omega" else "phi"
         dev       = belief.mu.device
-        tau       = attention_tau(self.effective_kappa_beta(dev), grp.irrep_dims)
         b0        = _as_coeff(cfg.b0, dev)
         c0        = _as_coeff(cfg.c0, dev)
-        n         = belief.mu.shape[-2]
-        log_prior = self._attention_log_prior(n, dev)
         with torch.no_grad():
+            # Per-candidate effective prior: the SAME authoritative builder the forward E-step used, so
+            # the folded precision/tied-gamma prior the belief converged under is reproduced exactly.
+            log_prior = self._effective_beta_log_prior(belief, context.prior)
             total = free_energy_value(
-                belief, mu_p, sigma_p, grp,
-                tau=tau, renyi_order=cfg.renyi_order, value=cfg.lambda_alpha, b0=b0, c0=c0,
+                belief, context.mu_p, context.sigma_p, grp,
+                tau=context.tau, renyi_order=cfg.renyi_order, value=cfg.lambda_alpha, b0=b0, c0=c0,
                 lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
+                lambda_twohop=cfg.lambda_twohop,
                 include_attention_entropy=cfg.include_attention_entropy,
                 family=cfg.family, divergence_family=cfg.divergence_family,
                 lambda_alpha_mode=cfg.lambda_alpha_mode,
                 gauge_parameterization=gp, log_prior=log_prior,
+                transport_mode=cfg.transport_mode,
+                connection_W=getattr(self, "connection_W", None),
+                connection_M=getattr(self, "connection_M", None),
+                connection_L=getattr(self, "connection_L", None),
+                cocycle_relaxation=cfg.cocycle_relaxation,
+                link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+                clamp_monitor=cfg.transport_clamp_monitor,
+                transport_mean_per_head=cfg.transport_mean_per_head,
+                rope=context.rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
             ).item()
         return total
 
@@ -1210,25 +1236,25 @@ class VFEModel(nn.Module):
 
     def _metropolis_delta_f(
         self,
-        belief:    BeliefState,              # fixed belief carrying .omega or .reflection
-        mu_p:      torch.Tensor,             # (B, N, K) prior means
-        sigma_p:   torch.Tensor,             # (B, N, K) prior variances
-        token_ids: torch.Tensor,             # (B, N) integer token ids
+        context:   MetropolisObjectiveContext,   # fixed q/p state + current belief (context.belief)
 
-        token_id:  int,                      # token whose det-sign flip is scored
+        token_id:  int,                          # token whose det-sign flip is scored
         *,
-        mode:      Optional[str] = None,     # 'omega' | 'phi'; None -> resolve from cfg
+        mode:      Optional[str] = None,         # 'omega' | 'phi'; None -> resolve from cfg
     ) -> float:
-        r"""Exact fixed-belief DeltaF = F(trial) - F(current) for flipping ``token_id``'s det-sign.
+        r"""Exact fixed-belief DeltaF = F(trial) - F(current) for flipping ``token_id``'s det-sign,
+        scored against the EXACT active objective (audit PB-12).
 
         The sweep in :meth:`metropolis_omega_step` carries F_cur forward for efficiency; this helper
-        recomputes both terms so the exact-DeltaF regression test can compare it against an independent
-        source-flip (pinning the masked trial-belief flip == the source ``omega_embed`` / ``reflection_sign``
-        flip)."""
+        recomputes both terms from ``context.belief`` so the exact-DeltaF regression test can compare it
+        against an independent source-flip (pinning the masked trial-belief flip == the source
+        ``omega_embed`` / ``reflection_sign`` flip). Current and trial reuse the SAME fixed
+        precision/tau/prior moments; only the proposed frame/reflection differs."""
         mode  = mode or self._reflection_metropolis_mode()
-        trial = self._metropolis_trial_belief(belief, token_ids, token_id, mode=mode)
-        return (self._metropolis_free_energy(trial, mu_p, sigma_p, mode=mode)
-                - self._metropolis_free_energy(belief, mu_p, sigma_p, mode=mode))
+        belief = context.belief
+        trial = self._metropolis_trial_belief(belief, context.token_ids, token_id, mode=mode)
+        return (self._metropolis_free_energy(trial, context, mode=mode)
+                - self._metropolis_free_energy(belief, context, mode=mode))
 
     def _flip_omega_embed_row(
         self,
@@ -1300,12 +1326,11 @@ class VFEModel(nn.Module):
         mean DeltaF) for logging. See docs/superpowers/specs/2026-07-08-omega-direct-metropolis-detsign-
         design.md (omega) and docs/superpowers/specs/2026-07-08-phi-reflection-design.md Sec.5 (phi).
 
-        Caveat (see :meth:`_metropolis_free_energy`): under ``cfg.precision_weighted_attention`` or
-        ``cfg.gamma_as_beta_prior`` (both default OFF) DeltaF is scored against the raw attention
-        log-prior rather than the folded prior the belief converged under, so it is a close
-        approximation there rather than exact; ``cfg.lambda_twohop`` (default 0.0) is likewise not
-        forwarded. Accept/reject stays well-defined either way since current and trial are always
-        scored against the identical prior.
+        Objective parity (audit PB-12): DeltaF is scored against the EXACT active fixed-belief objective
+        -- the folded precision/tied-gamma attention prior, the two-hop coupling block, the query-adaptive
+        (final-block entry-derived) tau, the handoff-adjusted final-block prior, and the active
+        transport/RoPE numerics all match the F the E-step descended (see :meth:`_metropolis_free_energy`
+        and :meth:`_metropolis_prepare`).
 
         Caveat (optimizer-moment staleness, final-review Fix C): ``omega_embed`` is mutated in place
         AFTER ``optimizer.step()`` for the iteration, so AdamW's ``exp_avg``/``exp_avg_sq`` moment
@@ -1322,7 +1347,8 @@ class VFEModel(nn.Module):
             return {}
         temp = float(cfg.omega_metropolis_temperature)
         with torch.no_grad():
-            belief, mu_p, sigma_p = self._metropolis_prepare(token_ids, mode=mode)
+            context = self._metropolis_prepare(token_ids, mode=mode)
+            belief  = context.belief                                   # current state: init from the exact prepared object
             R = None
             if mode == "omega":                                         # phi flips a scalar sign, no R needed
                 from vfe3.geometry.generators import reflection_element
@@ -1333,12 +1359,12 @@ class VFEModel(nn.Module):
                 )
                 R = reflection_element(
                     reflection_dim, dtype=belief.omega.dtype, device=belief.omega.device)
-            f_cur = self._metropolis_free_energy(belief, mu_p, sigma_p, mode=mode)
+            f_cur = self._metropolis_free_energy(belief, context, mode=mode)
             proposed = accepted = 0
             dfs: list = []
             for tid in torch.unique(token_ids).tolist():
-                trial   = self._metropolis_trial_belief(belief, token_ids, tid, mode=mode)
-                f_trial = self._metropolis_free_energy(trial, mu_p, sigma_p, mode=mode)
+                trial   = self._metropolis_trial_belief(belief, context.token_ids, tid, mode=mode)
+                f_trial = self._metropolis_free_energy(trial, context, mode=mode)
                 df      = f_trial - f_cur
                 dfs.append(df)
                 proposed += 1

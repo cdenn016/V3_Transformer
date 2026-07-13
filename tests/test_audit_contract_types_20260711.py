@@ -28,8 +28,10 @@ def test_shared_contracts_pin_only_the_cited_mutable_dict_schemas() -> None:
         contracts.MStepCapture: {
             "converged": BeliefState,
             "final_block_prior": Tuple[torch.Tensor, torch.Tensor],
+            "final_block_tau": float | torch.Tensor,
             "prior": BeliefState,
             "out": BeliefState,
+            "beta_prior_context": contracts.EffectiveBetaPriorContext,
         },
         contracts.EStepGradientRecord: {
             "mu": torch.Tensor,

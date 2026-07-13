@@ -29,11 +29,40 @@ class EffectiveBetaPriorContext(NamedTuple):
     s_sigma:         Optional[torch.Tensor]   # refined model-belief covariance, or None (raw s tables)
 
 
+class MetropolisObjectiveContext(NamedTuple):
+    r"""Fixed q/p state the reflection-Metropolis scorer evaluates the EXACT active objective from.
+
+    Captured once per sweep by ``VFEModel._metropolis_prepare`` from a single belief forward, then held
+    FIXED across every proposal so the fixed-belief ``DeltaF = F(trial) - F(current)`` is the exact
+    change in the joint free energy the E-step descended (audit PB-12). ``belief`` is the final block's
+    converged/current ``BeliefState`` (carrying the frame the E-step minimized -- ``omega`` under the
+    omega-direct move, ``reflection`` under the phi move); the sweep initializes ``f_cur`` and the
+    sequential current state from this exact object before constructing any trial. ``mu_p``/``sigma_p``
+    are the HANDOFF-ADJUSTED prior moments ENTERING the final block (``MStepCapture['final_block_prior']``,
+    equal to the encode prior only at ``n_layers==1``), ``tau`` the exact query-adaptive temperature the
+    final block used (``MStepCapture['final_block_tau']`` -- the ENTRY-derived tau that produced the
+    converged belief, NOT a tau recomputed from the converged sigma), and ``rope`` the positional RoPE
+    rotation for this token length (``None`` when ``pos_rotation=='none'``). ``prior`` is the fixed
+    pre-stack :class:`EffectiveBetaPriorContext`; the scorer rebuilds the candidate-dependent effective
+    prior per proposal via ``_effective_beta_log_prior(candidate_belief, prior)`` -- the precision fold
+    reads the FIXED ``prior.precision_sigma`` (frame-blind), and only the tied-gamma fold varies with the
+    proposed frame. Nothing else is candidate-dependent, so one context serves the whole sweep."""
+
+    token_ids: torch.Tensor                     # (B, N) integer token ids
+    mu_p:      torch.Tensor                     # (B, N, K) final-block handoff-adjusted prior means
+    sigma_p:   torch.Tensor                     # (B, N, K)/(B, N, K, K) final-block prior variances
+    belief:    BeliefState                      # final-block converged/current belief (carries the frame)
+    tau:       'float | torch.Tensor'           # final-block entry-derived (query-adaptive) softmax tau
+    rope:      Optional[torch.Tensor]           # (N, K, K) positional RoPE rotation, or None
+    prior:     EffectiveBetaPriorContext         # fixed pre-stack effective-prior context (folds rebuilt per candidate)
+
+
 class MStepCapture(TypedDict, total=False):
     """Mutable intermediates captured for the M-step self-coupling term."""
 
     converged:          BeliefState
     final_block_prior:  Tuple[torch.Tensor, torch.Tensor]
+    final_block_tau:    'float | torch.Tensor'
     prior:              BeliefState
     out:                BeliefState
     beta_prior_context: EffectiveBetaPriorContext

@@ -20,6 +20,7 @@ Pins:
 
 Device-agnostic (CPU default; set VFE3_TEST_DEVICE=cuda for the GPU). Tiny models (K < 6).
 """
+import math
 import os
 import warnings
 
@@ -28,13 +29,14 @@ import torch
 
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
-from vfe3.contracts import EffectiveBetaPriorContext
+from vfe3.contracts import EffectiveBetaPriorContext, MetropolisObjectiveContext
 from vfe3.families.base import get_family
-from vfe3.free_energy import free_energy, pairwise_energy, reduced_free_energy
+from vfe3.free_energy import attention_tau, free_energy, pairwise_energy, query_adaptive_tau, reduced_free_energy
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.rope import build_rope_rotation
 from vfe3.geometry.transport import RopeTransport, transport_covariance, transport_mean
 from vfe3.inference.e_step import build_belief_transport, free_energy_value, phi_alignment_loss
+from vfe3.model.block import _as_coeff
 from vfe3.model.model import VFEModel
 
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
@@ -406,3 +408,409 @@ def test_phi_twohop_zero_weight_is_exact_identity(decoupled_rope):
 
     assert torch.equal(ext.detach(), old.detach())
     assert torch.equal(grad_ext, grad_old)
+
+
+# ==================================================================================================
+# Task 3 (audit PB-12): the Metropolis reflection scorer evaluates the EXACT active fixed-belief
+# objective. The current scorer omits the precision/tied-gamma folds, the two-hop block, the
+# query-adaptive tau, the handoff-adjusted final-block prior, and the active transport/RoPE numerics.
+# After the fix, ``_metropolis_prepare`` returns one ``MetropolisObjectiveContext`` and
+# ``_metropolis_free_energy(belief, context)`` calls ``_effective_beta_log_prior(belief, context.prior)``
+# per candidate and ``free_energy_value`` with the fixed captured tau/prior/rope + every active
+# transport control, so the fixed-belief DeltaF is the exact change in F the E-step descended.
+# All models are TINY (V=6, K=4, N=3), CPU-bound, device-agnostic.
+# ==================================================================================================
+_GAMMA_OVER = dict(gamma_as_beta_prior=True, lambda_gamma=0.5, kappa_gamma=1.0, gamma_prior_weight=0.5)
+
+
+def _metro_model(mode, *, seed=0, perturb=True, **over) -> VFEModel:
+    r"""Tiny reflection-Metropolis model. ``mode='omega'`` -> omega_direct + omega_reflection;
+    ``mode='phi'`` -> phi + phi_reflection. Tables are perturbed so the transport and every fold bite
+    (nonzero phi -> Omega != I; varying tr Sigma -> nontrivial precision/adaptive-tau; s tables ->
+    nontrivial gamma)."""
+    base = dict(gauge_group="glk", embed_dim=4, n_heads=1, vocab_size=6, max_seq_len=4,
+                n_layers=1, n_e_steps=2, transport_mode="flat", e_phi_lr=0.0,
+                use_head_mixer=False, family="gaussian_diagonal", decode_mode="diagonal",
+                lambda_gamma=0.0, s_e_step=False, pos_phi="none")
+    if mode == "omega":
+        base.update(gauge_parameterization="omega_direct", omega_reflection="metropolis")
+    else:
+        base.update(gauge_parameterization="phi", phi_reflection="metropolis")
+    base.update(over)
+    torch.manual_seed(seed)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")   # diagonal-family 'near-no sheet selection' efficacy warning
+        m = VFEModel(VFE3Config(**base)).to(DEVICE)
+    m.eval()
+    if perturb:
+        with torch.no_grad():
+            m.prior_bank.sigma_log_embed.add_(
+                0.4 * torch.randn_like(m.prior_bank.sigma_log_embed))
+            if hasattr(m.prior_bank, "phi_embed"):
+                m.prior_bank.phi_embed.add_(0.3 * torch.randn_like(m.prior_bank.phi_embed))
+            if hasattr(m.prior_bank, "s_mu_embed"):
+                m.prior_bank.s_mu_embed.add_(0.5 * torch.randn_like(m.prior_bank.s_mu_embed))
+                m.prior_bank.s_sigma_log_embed.add_(
+                    0.3 * torch.randn_like(m.prior_bank.s_sigma_log_embed))
+            for a in ("connection_W", "connection_M", "connection_L"):
+                p = getattr(m, a, None)
+                if p is not None:
+                    p.add_(0.15 * torch.randn_like(p))   # nonzero regime-II connection -> non-flat
+    return m
+
+
+def _metro_tokens(n: int = 3, b: int = 1, seed: int = 5) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    # distinct ids per row so the transport Omega_ij != I and the reflection genuinely moves F
+    return torch.stack([torch.randperm(6, generator=g)[:n] for _ in range(b)]).to(DEVICE)
+
+
+def _scorer_F(m, belief, context, *, mode) -> float:
+    r"""Independent oracle for one fixed-belief F: rebuild the effective prior for THIS candidate via
+    the authoritative ``_effective_beta_log_prior`` and evaluate ``free_energy_value`` with the fixed
+    captured tau/prior/rope and every active transport/numerics control (audit PB-12). The scorer
+    must reproduce this exactly."""
+    cfg, grp = m.cfg, m.group
+    gp = "omega_direct" if mode == "omega" else "phi"
+    dev = belief.mu.device
+    lp = m._effective_beta_log_prior(belief, context.prior)
+    with torch.no_grad():
+        return free_energy_value(
+            belief, context.mu_p, context.sigma_p, grp,
+            tau=context.tau, renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
+            b0=_as_coeff(cfg.b0, dev), c0=_as_coeff(cfg.c0, dev),
+            lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
+            lambda_twohop=cfg.lambda_twohop, include_attention_entropy=cfg.include_attention_entropy,
+            family=cfg.family, divergence_family=cfg.divergence_family,
+            lambda_alpha_mode=cfg.lambda_alpha_mode, gauge_parameterization=gp, log_prior=lp,
+            transport_mode=cfg.transport_mode,
+            connection_W=getattr(m, "connection_W", None),
+            connection_M=getattr(m, "connection_M", None),
+            connection_L=getattr(m, "connection_L", None),
+            cocycle_relaxation=cfg.cocycle_relaxation, link_alpha=cfg.link_alpha,
+            link_soft_cap=cfg.link_soft_cap, clamp_monitor=cfg.transport_clamp_monitor,
+            transport_mean_per_head=cfg.transport_mean_per_head, rope=context.rope,
+            rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+            exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+        ).item()
+
+
+def _oracle_delta(m, context, tid, *, mode) -> float:
+    cur = context.belief
+    trial = m._metropolis_trial_belief(cur, context.token_ids, tid, mode=mode)
+    return _scorer_F(m, trial, context, mode=mode) - _scorer_F(m, cur, context, mode=mode)
+
+
+def _raw_F(m, belief, context, *, mode) -> float:
+    r"""The PRE-Task-3 RAW-prior scorer body (scalar tau, ``_attention_log_prior`` with NO folds, no
+    two-hop, no active transport controls). The independent reference for the folds-off identity and
+    the acceptance-boundary corrected-vs-raw comparison."""
+    cfg, grp = m.cfg, m.group
+    gp = "omega_direct" if mode == "omega" else "phi"
+    dev = belief.mu.device
+    tau = attention_tau(m.effective_kappa_beta(dev), grp.irrep_dims)
+    log_prior = m._attention_log_prior(belief.mu.shape[-2], dev)
+    with torch.no_grad():
+        return free_energy_value(
+            belief, context.mu_p, context.sigma_p, grp,
+            tau=tau, renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
+            b0=_as_coeff(cfg.b0, dev), c0=_as_coeff(cfg.c0, dev),
+            lambda_beta=cfg.lambda_beta, kl_max=cfg.kl_max, eps=cfg.eps,
+            include_attention_entropy=cfg.include_attention_entropy,
+            family=cfg.family, divergence_family=cfg.divergence_family,
+            lambda_alpha_mode=cfg.lambda_alpha_mode, gauge_parameterization=gp,
+            log_prior=log_prior).item()
+
+
+def _raw_delta(m, context, tid, *, mode) -> float:
+    cur = context.belief
+    trial = m._metropolis_trial_belief(cur, context.token_ids, tid, mode=mode)
+    return _raw_F(m, trial, context, mode=mode) - _raw_F(m, cur, context, mode=mode)
+
+
+def _src_sign_state(m, tid, mode) -> float:
+    return (m.prior_bank.reflection_sign[tid].item() if mode == "phi"
+            else torch.det(m.prior_bank.omega_embed[tid]).item())
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 1: exact-delta parity across the folds (precision / tied gamma / two-hop / adaptive tau / all).
+# --------------------------------------------------------------------------------------------------
+_FOLD_OVER = {
+    "precision":    dict(precision_weighted_attention=True, precision_attention_b0=1.5),
+    "gamma":        dict(**_GAMMA_OVER),
+    "twohop":       dict(lambda_twohop=0.3),
+    "adaptive_tau": dict(query_adaptive_tau=True, query_tau_c=0.9),
+    "all":          dict(precision_weighted_attention=True, precision_attention_b0=1.5,
+                         lambda_twohop=0.3, query_adaptive_tau=True, query_tau_c=0.9, **_GAMMA_OVER),
+}
+
+
+@pytest.mark.parametrize("mode", ["omega", "phi"])
+@pytest.mark.parametrize("fold", list(_FOLD_OVER))
+def test_metropolis_delta_matches_active_objective(mode, fold):
+    m = _metro_model(mode, **_FOLD_OVER[fold])
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode=mode)
+    tid = int(torch.unique(tok)[1])                             # a non-first token, genuinely moved
+    move = m._metropolis_delta_f(context, tid, mode=mode)
+    oracle = _oracle_delta(m, context, tid, mode=mode)
+    assert abs(move) > 0.0, f"[{mode}/{fold}] delta is vacuously zero"
+    assert abs(move - oracle) < 1e-8, f"[{mode}/{fold}] move={move} oracle={oracle}"
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 1: exact-delta parity across the active TRANSPORT numerics (flat / RoPE-on-cov /
+# RoPE-decoupled-value for both modes; regime_ii variants for phi only -- omega-direct is flat-only).
+# --------------------------------------------------------------------------------------------------
+_TCFG = {
+    "flat":           dict(),
+    "rope_decoupled": dict(pos_rotation="rope", rope_on_value=False),
+    "rope_on_cov":    dict(pos_rotation="rope", rope_full_gauge=True,
+                           family="gaussian_full", decode_mode="full"),
+}
+
+
+@pytest.mark.parametrize("mode", ["omega", "phi"])
+@pytest.mark.parametrize("tcfg", list(_TCFG))
+def test_metropolis_delta_matches_active_objective_transport(mode, tcfg):
+    m = _metro_model(mode, **_TCFG[tcfg])
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode=mode)
+    if tcfg.startswith("rope"):
+        assert context.rope is not None                        # the positional RoPE tensor is captured
+    tid = int(torch.unique(tok)[1])
+    move = m._metropolis_delta_f(context, tid, mode=mode)
+    oracle = _oracle_delta(m, context, tid, mode=mode)
+    assert abs(move - oracle) < 1e-8, f"[{mode}/{tcfg}] move={move} oracle={oracle}"
+
+
+@pytest.mark.parametrize("tmode", ["regime_ii", "regime_ii_covariant",
+                                   "regime_ii_link", "regime_ii_link_charted"])
+def test_metropolis_delta_matches_active_objective_regime_ii_phi_only(tmode):
+    # omega-direct Metropolis is flat-only, so the non-flat connection regimes are phi-reflection only.
+    m = _metro_model("phi", transport_mode=tmode)
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode="phi")
+    tid = int(torch.unique(tok)[1])
+    move = m._metropolis_delta_f(context, tid, mode="phi")
+    oracle = _oracle_delta(m, context, tid, mode="phi")
+    assert abs(move - oracle) < 1e-8, f"[{tmode}] move={move} oracle={oracle}"
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 1: the query-adaptive tau is the final-block ENTRY-derived tau (not recomputed from the
+# converged sigma), captured in MStepCapture['final_block_tau'].
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("mode", ["omega", "phi"])
+def test_metropolis_tau_is_final_block_entry_derived(mode):
+    m = _metro_model(mode, query_adaptive_tau=True, query_tau_c=0.9, n_e_steps=3, e_q_sigma_lr=0.5)
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode=mode)
+    dev = context.belief.mu.device
+    base_tau = attention_tau(m.effective_kappa_beta(dev), m.group.irrep_dims)
+    diag: dict = {}
+    with torch.no_grad():
+        m.forward_beliefs(tok, capture={"diagnostic": diag})
+    entry_sigma = diag["initial_belief"].sigma                 # belief ENTERING the (final=only) block
+    expected = query_adaptive_tau(entry_sigma, base_tau, m.group.irrep_dims, c=m.cfg.query_tau_c)
+    torch.testing.assert_close(context.tau, expected)          # tau is entry-derived
+    conv_tau = query_adaptive_tau(context.belief.sigma, base_tau, m.group.irrep_dims,
+                                  c=m.cfg.query_tau_c)
+    assert not torch.allclose(context.belief.sigma, entry_sigma)   # the E-step moved sigma
+    assert not torch.allclose(context.tau, conv_tau)           # NOT recomputed from converged sigma
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 1: with a nonzero mean/sigma handoff (n_layers=2), the scorer prior is the FINAL-block
+# handoff-adjusted prior, NOT the encode-time prior.
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("mode", ["omega", "phi"])
+def test_metropolis_uses_final_block_handoff_prior(mode):
+    m = _metro_model(mode, n_layers=2, prior_handoff_rho=0.6, prior_handoff_sigma=0.4)
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode=mode)
+    cap: dict = {}
+    with torch.no_grad():
+        m.forward_beliefs(tok, capture=cap)
+    fbp_mu, fbp_sigma = cap["final_block_prior"]
+    torch.testing.assert_close(context.mu_p, fbp_mu)           # == the handoff-adjusted final prior
+    torch.testing.assert_close(context.sigma_p, fbp_sigma)
+    assert not torch.allclose(context.mu_p, cap["prior"].mu)   # != the encode-time prior
+    assert not torch.allclose(context.sigma_p, cap["prior"].sigma)
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 1: the precision fold reads the FIXED pre-stack covariance (context), unequal to both the
+# current and the trial belief covariance; the tied gamma fold moves with the proposed frame.
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("mode", ["omega", "phi"])
+def test_metropolis_precision_fold_uses_context_not_belief(mode):
+    m = _metro_model(mode, precision_weighted_attention=True, precision_attention_b0=1.5,
+                     n_e_steps=3, e_q_sigma_lr=0.5, **_GAMMA_OVER)
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode=mode)
+    trial = m._metropolis_trial_belief(context.belief, context.token_ids,
+                                       int(torch.unique(tok)[1]), mode=mode)
+    # the captured precision covariance is the pre-stack sigma, unequal to current AND trial cov
+    assert not torch.allclose(context.prior.precision_sigma, context.belief.sigma)
+    assert not torch.allclose(context.prior.precision_sigma, trial.sigma)
+    lp_cur = m._effective_beta_log_prior(context.belief, context.prior)
+    lp_trial = m._effective_beta_log_prior(trial, context.prior)
+    fin = torch.isfinite(lp_cur)
+    assert not torch.allclose(lp_cur[fin], lp_trial[fin])      # tied gamma moves with the frame
+
+    # precision ONLY (no gamma): the fold is frame-blind and reads the FIXED context sigma, so a frame
+    # flip leaves the prior EXACTLY unchanged even though the trial belief carries a different frame.
+    m2 = _metro_model(mode, precision_weighted_attention=True, precision_attention_b0=1.5,
+                      n_e_steps=3, e_q_sigma_lr=0.5)
+    ctx2 = m2._metropolis_prepare(tok, mode=mode)
+    tr2 = m2._metropolis_trial_belief(ctx2.belief, ctx2.token_ids,
+                                      int(torch.unique(tok)[1]), mode=mode)
+    _assert_priors_equal(m2._effective_beta_log_prior(ctx2.belief, ctx2.prior),
+                         m2._effective_beta_log_prior(tr2, ctx2.prior),
+                         msg="precision-only fold must be frame-blind")
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 1: free_energy_value forwards exp_fp64_mode / exp_fp64_norm_threshold to _transport (the fp64
+# island now triggers identically in the active evaluator and the Metropolis oracle).
+# --------------------------------------------------------------------------------------------------
+def test_metropolis_fp64_island_forwarded_to_transport(monkeypatch):
+    m = _metro_model("phi", exp_fp64_mode="norm", exp_fp64_norm_threshold=0.5)
+    with torch.no_grad():
+        m.prior_bank.phi_embed.mul_(4.0)                       # large ||M||_F -> above the threshold
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode="phi")
+
+    import vfe3.inference.e_step as es
+    real = es._transport
+    seen: dict = {}
+
+    def spy(*a, **k):
+        seen.setdefault("mode", k.get("exp_fp64_mode"))
+        seen.setdefault("thr", k.get("exp_fp64_norm_threshold"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(es, "_transport", spy)
+    m._metropolis_free_energy(context.belief, context, mode="phi")
+    assert seen.get("mode") == "norm"                          # configured island key reaches _transport
+    assert seen.get("thr") == 0.5
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 1: phi_tilde model frame -> the belief-frame reflection is not consumed (tested reflection-OFF,
+# because live config rejects phi_tilde + either Metropolis mode).
+# --------------------------------------------------------------------------------------------------
+def test_metropolis_scorer_prior_phi_tilde_invariant_reflection_off():
+    m = _phi_tilde_model()
+    tokens = _tokens(m, n=3)
+    ctx, initial, _ = _forward_capture(m, tokens)
+    injected = initial._replace(reflection=torch.where(
+        torch.arange(initial.mu.shape[-2], device=DEVICE) % 2 == 0, -1.0, 1.0
+    ).expand(initial.mu.shape[:-1]).clone())
+    _assert_priors_equal(m._effective_beta_log_prior(initial, ctx),
+                         m._effective_beta_log_prior(injected, ctx),
+                         msg="phi_tilde model frame must ignore the belief reflection")
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 1: caller-contract -- _metropolis_prepare returns one context whose belief has shape (B,N,K),
+# and the sweep's FIRST scorer call receives that same current belief before any proposal is applied.
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("mode", ["omega", "phi"])
+def test_metropolis_prepare_caller_contract(mode, monkeypatch):
+    m = _metro_model(mode)
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode=mode)
+    assert isinstance(context, MetropolisObjectiveContext)
+    B, N = tok.shape
+    K = m.cfg.embed_dim
+    assert context.belief.mu.shape == (B, N, K)
+    assert context.belief.sigma.shape == (B, N, K)
+
+    captured: dict = {}
+    real_prep = m._metropolis_prepare
+
+    def prep_spy(token_ids, *, mode=None):
+        c = real_prep(token_ids, mode=mode)
+        captured["ctx"] = c
+        return c
+
+    seen: list = []
+    real_fe = m._metropolis_free_energy
+
+    def fe_spy(belief, ctx, *, mode=None):
+        seen.append(belief)
+        return real_fe(belief, ctx, mode=mode)
+
+    monkeypatch.setattr(m, "_metropolis_prepare", prep_spy)
+    monkeypatch.setattr(m, "_metropolis_free_energy", fe_spy)
+    m.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(0))
+    assert seen and seen[0] is captured["ctx"].belief          # first F call = current, pre-proposal
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 2: acceptance-boundary -- the corrected (folded) delta changes the accept/reject result vs the
+# raw-prior scorer. The tied-gamma fold flips token-0's delta sign (verified), so at tiny T the
+# corrected objective decides opposite to the raw one; the sweep must follow the CORRECTED decision.
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("mode", ["omega", "phi"])
+def test_metropolis_acceptance_boundary_corrected_vs_raw(mode):
+    found = None
+    tok = _metro_tokens()
+    for seed in range(40):
+        m = _metro_model(mode, seed=seed, **_GAMMA_OVER)
+        context = m._metropolis_prepare(tok, mode=mode)
+        tid0 = int(torch.unique(tok).min())
+        dF_corr = m._metropolis_delta_f(context, tid0, mode=mode)
+        dF_raw = _raw_delta(m, context, tid0, mode=mode)
+        if (dF_corr <= 0.0) != (dF_raw <= 0.0):                # opposite accept at tiny T
+            found = (m, context, tid0, dF_corr, dF_raw)
+            break
+    assert found is not None, f"[{mode}] no seed produced a corrected-vs-raw accept flip within budget"
+    m, context, tid0, dF_corr, dF_raw = found
+
+    m.cfg.omega_metropolis_temperature = 1e-6                  # tiny T: accept iff dF <= 0
+    before = _src_sign_state(m, tid0, mode)
+    gen = torch.Generator().manual_seed(0)
+    n_unique = int(torch.unique(tok).numel())
+    m.metropolis_omega_step(tok, generator=gen)
+    after = _src_sign_state(m, tid0, mode)
+    flipped = before * after < 0.0
+    assert flipped == (dF_corr <= 0.0)                         # sweep followed the CORRECTED objective
+    assert (dF_corr <= 0.0) != (dF_raw <= 0.0)                 # ... and the raw scorer would decide otherwise
+    ref = torch.Generator().manual_seed(0)                     # RNG advanced once per proposal
+    for _ in range(n_unique):
+        torch.rand((), generator=ref)
+    assert torch.equal(gen.get_state(), ref.get_state())
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 3: off-path identity -- both reflection modes off -> the scorer is NEVER invoked; folds off ->
+# the refactored delta equals the pre-Task-3 raw-prior calculation EXACTLY.
+# --------------------------------------------------------------------------------------------------
+def test_metropolis_scorer_not_invoked_when_reflection_off(monkeypatch):
+    m = _model()                                               # plain model, both reflection modes off
+    tok = _tokens(m, n=3)
+
+    def _boom(*a, **k):
+        raise AssertionError("the Metropolis scorer must not be invoked with reflection off")
+
+    monkeypatch.setattr(m, "_metropolis_free_energy", _boom)
+    monkeypatch.setattr(m, "_metropolis_prepare", _boom)
+    assert m.metropolis_omega_step(tok, generator=torch.Generator().manual_seed(0)) == {}
+
+
+@pytest.mark.parametrize("mode", ["omega", "phi"])
+def test_metropolis_folds_off_delta_equals_raw_prior(mode):
+    # No folds, n_layers=1, flat, no RoPE, scalar tau -> the effective prior is the RAW attention
+    # prior and the final-block prior is the encode prior, so the refactored delta must equal the
+    # pre-Task-3 raw-prior calculation to float round-off.
+    m = _metro_model(mode)
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode=mode)
+    tid = int(torch.unique(tok)[1])
+    move = m._metropolis_delta_f(context, tid, mode=mode)
+    raw = _raw_delta(m, context, tid, mode=mode)
+    assert abs(move - raw) < 1e-9, f"[{mode}] refactored={move} raw={raw}"

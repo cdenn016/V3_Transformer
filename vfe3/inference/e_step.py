@@ -358,7 +358,7 @@ def free_energy_value(
     e_step_update:             str  = "gradient",      # accepted-and-ignored iteration-only knob
     mass_phi:                  float = 0.0,            # accepted-and-ignored iteration-only knob (phi penalty)
     mm_damping:                float = 1.0,            # accepted-and-ignored iteration-only knob
-    exp_fp64_norm_threshold:   float = 5.0,            # accepted-and-ignored Tier-1 transport-numerics knob
+    exp_fp64_norm_threshold:   float = 5.0,            # HONORED: forwarded to the global-F _transport float64-island keying
 
     include_attention_entropy: bool = True,
     skip_belief_sigma_update:  bool = False,           # accepted-and-ignored iteration-only knob
@@ -371,7 +371,7 @@ def free_energy_value(
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
     gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
-    exp_fp64_mode:             str  = "dim",           # accepted-and-ignored Tier-1 transport-numerics knob
+    exp_fp64_mode:             str  = "dim",           # HONORED: forwarded to the global-F _transport float64-island keying
     phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
     spd_retract_mode:          str  = "spd_affine",    # accepted-and-ignored iteration-only knob
@@ -411,9 +411,10 @@ def free_energy_value(
     grid, no entropy term), so the logged F carries the two-hop block the kernel descends.
     ``transport_mean_per_head`` is forwarded to omega-direct element builds. Compact builds retain
     the configured metadata; the legacy noncompact diagnostic seam still materializes its dense
-    operator. The exp-island toggles
-    (``exp_fp64_mode`` / ``exp_fp64_norm_threshold``) remain accepted-and-ignored: they change
-    transport numerics at round-off only, so the diagnostic F keeps the default dim-keyed build.
+    operator. The exp-island toggles (``exp_fp64_mode`` / ``exp_fp64_norm_threshold``) are HONORED for
+    the global (``keys=None``) F: they are forwarded to the ``_transport`` build so the fp64 island keys
+    identically to the model E-step (audit PB-12; the reflection/two-hop scorer reuses this evaluator,
+    so its numerics match the active objective, not a default dim-keyed diagnostic).
     """
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
     # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
@@ -434,6 +435,7 @@ def free_energy_value(
             link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
             cocycle_relaxation=cocycle_relaxation,
             transport_mean_per_head=transport_mean_per_head,
+            exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
         )
     else:
         # The filtered (mixed current-query / frozen-key frame) transport has no regime_ii form;

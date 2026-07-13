@@ -322,17 +322,18 @@ def test_phi_exact_delta_f_matches_independent_recompute():
     m = _metro_model(vocab_size=4)
     tok = torch.tensor([[0, 1, 2, 3]])
     tid = 1
-    belief, mu_p, sigma_p = m._metropolis_prepare(tok)
+    context = m._metropolis_prepare(tok)
+    belief = context.belief
     assert belief.reflection is not None                               # reflection actually enters F
-    dF_move = m._metropolis_delta_f(belief, mu_p, sigma_p, tok, tid)
+    dF_move = m._metropolis_delta_f(context, tid)
     assert dF_move == dF_move                                          # finite (not NaN)
     assert abs(dF_move) > 0.0                                          # genuinely nonzero (distinct tokens)
     # Independent oracle: flip the source buffer row, re-look-up the (fixed-belief) per-position sign,
     # recompute F.
-    F_cur = m._metropolis_free_energy(belief, mu_p, sigma_p)
+    F_cur = m._metropolis_free_energy(belief, context)
     m._flip_reflection_sign_row(tid)
     relooked = m.prior_bank.reflection_sign[tok]                       # per-position signs from flipped buffer
-    F_trial = m._metropolis_free_energy(belief._replace(reflection=relooked), mu_p, sigma_p)
+    F_trial = m._metropolis_free_energy(belief._replace(reflection=relooked), context)
     m._flip_reflection_sign_row(tid)                                   # restore (sign flip is involutory)
     dF_indep = F_trial - F_cur
     assert abs(dF_move - dF_indep) < 1e-5                              # exact-DeltaF anchor (fp5)
@@ -361,8 +362,8 @@ def test_phi_uphill_flip_gated_by_metropolis_acceptance():
     torch.manual_seed(1)
     m = _metro_model(vocab_size=4)
     tok = torch.tensor([[0, 1, 2, 3]])
-    belief, mu_p, sigma_p = m._metropolis_prepare(tok)
-    dF0 = m._metropolis_delta_f(belief, mu_p, sigma_p, tok, 0)
+    context = m._metropolis_prepare(tok)
+    dF0 = m._metropolis_delta_f(context, 0)
     assert dF0 > 0.0                                                   # genuinely uphill at this seed
 
     # (1) Tiny temperature: dF0/T so negative that exp(-dF0/T) underflows to 0.0 -> token 0 is

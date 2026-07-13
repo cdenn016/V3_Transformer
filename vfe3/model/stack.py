@@ -110,6 +110,13 @@ def vfe_stack(
                     )
             else:
                 capture["final_block_prior"] = (mu_p.clone(), sigma_p.clone())
+            # The EXACT query-adaptive temperature the final block ran (the ENTRY-derived tau computed
+            # just above from the belief entering this block), so the reflection/two-hop scorer reuses
+            # the tau that PRODUCED capture['converged'] -- not the scalar encode tau, nor a tau
+            # recomputed from the converged sigma (audit PB-12). query_adaptive_tau detaches its own
+            # sigma; the base tau carries learnable_kappa_beta's graph, but the scorer reads it under
+            # no_grad, so this is a value-only capture.
+            capture["final_block_tau"] = tau_b
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
                            lambda_beta=lambda_beta,
