@@ -33,7 +33,6 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from vfe3.viz.specs import FigureSpec, emit_registered_figures
 from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
 
 logger = logging.getLogger("scaling_analysis")
@@ -42,15 +41,10 @@ INFERENCE_ROUTE = "inference"                                # flat-N routes, pl
 
 # PB-07: validation-metric figures (capacity_scaling.png, pareto_frontier.png) read validation_points
 # (aggregate_validation_points, keyed on the persisted best_val_ppl) -- never the test-metric
-# points/param_points/infer_points used above. The route each axis reads is defined once here.
+# points/param_points/infer_points used above. The route each axis reads is defined once here; the
+# FigureSpec pair itself is built lazily inside _make_figures (behind the same guarded viz import the
+# figure pass already uses) so `import scaling_analysis` never requires the matplotlib stack.
 AXIS_ROUTES: Dict[str, str] = {"embed_dim": "grow_K", "n_heads": "blocksize", "n_layers": INFERENCE_ROUTE}
-
-SCALING_FIGURE_SPECS = (
-    FigureSpec("capacity_scaling", "capacity_scaling.png",
-               lambda ctx: capacity_scaling_kwargs(ctx["validation_points"], ctx["axis_routes"])),
-    FigureSpec("pareto_frontier", "pareto_frontier.png",
-               lambda ctx: pareto_frontier_kwargs(ctx["validation_points"])),
-)
 
 CONFIG: Dict[str, Any] = {
     "input_dir":   "vfe3_scaling_results/blocks_K48",      # where scaling.py wrote the run dirs
@@ -432,7 +426,16 @@ def analyze() -> None:
           f"\n  csv:     {input_dir / 'scaling_points.csv'}")
 
     points = aggregate_points(rows)
-    validation_points = aggregate_validation_points(rows)     # PB-07: best_val_ppl-keyed, never test metrics
+    # PB-07: best_val_ppl-keyed validation points for the two registered supplementary figures --
+    # best-effort: aggregate_validation_points keeps its fail-loud ValueError (an explicit-null
+    # best_val_ppl beside finite sibling seeds is a data-integrity fault, never silently dropped or
+    # substituted with a test metric), but that fault withholds ONLY the validation figures; it must
+    # never abort the legacy test-metric analysis below.
+    try:
+        validation_points: Optional[List[Dict[str, Any]]] = aggregate_validation_points(rows)
+    except Exception as exc:
+        logger.warning("validation-point aggregation failed (%s); capacity_scaling/pareto_frontier withheld", exc)
+        validation_points = None
     param_points = [p for p in points if p["route"] != INFERENCE_ROUTE]
     infer_points = [p for p in points if p["route"] == INFERENCE_ROUTE]
     fit_param_mask = np.array([
@@ -703,15 +706,26 @@ def _make_figures(
 
     if validation_points is not None and axis_routes is not None:
         # PB-07: dispatch the two registered validation-metric figures through the declarative
-        # FigureSpec seam (vfe3.viz.specs); emit_registered_figures isolates a single spec's failure
-        # (never raises here), matching this function's own best-effort contract.
-        written = emit_registered_figures(
-            SCALING_FIGURE_SPECS,
-            {"validation_points": validation_points, "axis_routes": axis_routes},
-            fig_dir,
-        )
-        for out_path in written:
-            print(f"  figure -> {out_path}")
+        # FigureSpec seam. vfe3.viz.specs is imported lazily behind this try (the same graceful
+        # degradation the figs import above gets), and the whole dispatch is best-effort: a failure
+        # here skips only these two figures, never the legacy figure pass below.
+        try:
+            from vfe3.viz.specs import FigureSpec, emit_registered_figures
+            SCALING_FIGURE_SPECS = (
+                FigureSpec("capacity_scaling", "capacity_scaling.png",
+                           lambda ctx: capacity_scaling_kwargs(ctx["validation_points"], ctx["axis_routes"])),
+                FigureSpec("pareto_frontier", "pareto_frontier.png",
+                           lambda ctx: pareto_frontier_kwargs(ctx["validation_points"])),
+            )
+            written = emit_registered_figures(
+                SCALING_FIGURE_SPECS,
+                {"validation_points": validation_points, "axis_routes": axis_routes},
+                fig_dir,
+            )
+            for out_path in written:
+                print(f"  figure -> {out_path}")
+        except Exception as exc:
+            logger.warning("registered validation figures skipped (%s)", exc)
 
     def _try(name: str, fn) -> None:
         try:

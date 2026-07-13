@@ -233,3 +233,40 @@ def test_scaling_analysis_emits_capacity_scaling_and_pareto_frontier_pngs(tmp_pa
     pareto_png = fig_dir / "pareto_frontier.png"
     assert capacity_png.is_file() and capacity_png.stat().st_size > 0
     assert pareto_png.is_file() and pareto_png.stat().st_size > 0
+
+
+def test_analyze_survives_explicit_null_best_val_ppl_and_skips_validation_figures(tmp_path, monkeypatch, caplog):
+    r"""PB-07 robustness: an explicit-null best_val_ppl beside finite sibling seeds is a
+    data-integrity fault for the VALIDATION figures only. analyze() must still produce every legacy
+    output (CSV harvest, fit summary, markdown report) and withhold just the two registered
+    validation figures, logging one warning that names the fault -- the adapter's fail-loud
+    ValueError contract stays, it just cannot take down the unrelated test-metric analysis."""
+    import logging as _logging
+
+    for embed_dim, n_params, best_val_ppl in ((20, 1000, 40.0), (40, 2000, 30.0), (80, 4000, 20.0)):
+        for seed, delta in ((0, -1.0), (1, 1.0)):
+            _write_val_run(
+                tmp_path, route="grow_K", scale_knob="embed_dim", label=f"K{embed_dim}",
+                seed=seed, embed_dim=embed_dim, n_heads=4, n_layers=2, n_params=n_params,
+                best_val_ppl=(None if (embed_dim, seed) == (40, 1) else best_val_ppl + delta),
+                wall_time_s=10.0 + embed_dim,
+            )
+
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    with caplog.at_level(_logging.WARNING, logger="scaling_analysis"):
+        scaling_analysis.analyze()                              # must NOT raise
+
+    # legacy outputs are all still produced
+    assert (tmp_path / "scaling_points.csv").is_file()
+    assert (tmp_path / "scaling_summary.json").is_file()
+    assert (tmp_path / "SCALING_ANALYSIS.md").is_file()
+    summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["n_runs"] == 6
+
+    # the two validation figures are withheld, with one warning naming the fault
+    fig_dir = tmp_path / "figures"
+    assert not (fig_dir / "capacity_scaling.png").exists()
+    assert not (fig_dir / "pareto_frontier.png").exists()
+    null_warnings = [r for r in caplog.records if "explicit-null" in r.getMessage()]
+    assert len(null_warnings) == 1
