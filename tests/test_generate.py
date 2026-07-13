@@ -31,6 +31,17 @@ def _tiny_model(seed: int = 0, **overrides) -> VFEModel:
     return VFEModel(cfg)
 
 
+def _tiny_cache_supported_policy_model(seed: int = 0, **overrides) -> VFEModel:
+    """A tiny cache-supported policy model (audit PB-05). The tiny defaults (n_layers=1, n_e_steps=1,
+    e_phi_lr=0, flat transport, causal filtering) are the cache-supported regime, so efe_rollout is
+    reachable through generate(); the assert pins that the fixture stays supported if the defaults
+    drift (an unsupported fixture would make efe_rollout fail closed instead of exercising the menu)."""
+    from vfe3.inference.belief_cache import cache_supported
+    model = _tiny_model(seed=seed, **overrides)
+    assert cache_supported(model.cfg), "fixture must be cache-supported for efe_rollout"
+    return model
+
+
 def test_shape_in_vocab_and_prompt_preserved():
     model = _tiny_model()
     V = model.cfg.vocab_size
@@ -262,18 +273,85 @@ def test_generate_kwargs_order():
     assert (out >= 0).all() and (out < V).all()
 
 
-def test_generate_rejects_efe_rollout_policy_mode():
-    # audit F4 (2026-07-01): VFE3Config accepts policy_mode='efe_rollout' (with horizon>1), but the
-    # generic generate() path only builds a one-step (B, Kp, 1) candidate menu and no H-step candidate
-    # generator exists -- generate() must fail closed with a clear NotImplementedError at dispatch,
-    # not the cryptic mid-scorer candidate-length ValueError.
-    model = _tiny_model(policy_mode="efe_rollout", policy_preference="flat", policy_horizon=2)
-    V = model.cfg.vocab_size
-    prompt = torch.randint(0, V, (1, 3))
-    with pytest.raises(NotImplementedError) as e:
+def test_generate_reaches_efe_rollout_and_commits_first_action():
+    # audit PB-05 (2026-07-12): efe_rollout (horizon>1) is now REACHABLE through generate() on a
+    # cache-supported config -- it builds a bounded H-step beam menu and commits the FIRST action of
+    # the selected policy. Replaces the old fail-closed NotImplementedError test.
+    model = _tiny_cache_supported_policy_model(
+        policy_mode="efe_rollout", policy_preference="flat", policy_horizon=2, policy_top_k=3)
+    prompt = torch.tensor([[1, 2]], dtype=torch.long)
+    out = model.generate(prompt, max_new_tokens=1, greedy=True)
+    assert out.shape == (1, 3)
+    assert (out >= 0).all() and (out < model.cfg.vocab_size).all()
+    assert torch.equal(out[:, :2], prompt)                            # prompt preserved
+
+
+def test_efe_rollout_commits_first_action_of_selected_policy(monkeypatch):
+    # audit PB-05: prove the H-step menu carries length-horizon candidates with a normalized log_prior,
+    # and that generate commits candidates[selected_menu_index, 0] -- the FIRST action of the selected
+    # policy, NOT its terminal action. A scorer spy captures the menu and forces the selected index.
+    from vfe3.inference import policy as policy_module
+    model = _tiny_cache_supported_policy_model(
+        policy_mode="efe_rollout", policy_preference="flat", policy_horizon=2, policy_top_k=3)
+    captured = {}
+
+    def fake_scorer(context, candidates, preference, mdl, *, log_prior, **kwargs):
+        captured["candidates"] = candidates.clone()
+        captured["log_prior"] = log_prior.clone()
+        B, Kp, _H = candidates.shape
+        differ = candidates[..., 0] != candidates[..., -1]            # (B, Kp) first != terminal action
+        assert bool(differ.any()), "fixture needs a beam whose first and terminal actions differ"
+        chosen = torch.where(
+            differ.any(-1), differ.float().argmax(-1), torch.zeros(B, dtype=torch.long))
+        captured["chosen"] = chosen
+        post = torch.zeros(B, Kp)
+        post[torch.arange(B), chosen] = 1.0                          # force the selected menu index
+        z = torch.zeros(B, Kp)
+        return policy_module.PolicyScore(z, z, z, z, z, post)
+
+    monkeypatch.setattr(policy_module, "get_policy", lambda name: fake_scorer)
+    prompt = torch.tensor([[1, 2]], dtype=torch.long)
+    out = model.generate(prompt, max_new_tokens=1, greedy=True)
+
+    cand = captured["candidates"]
+    chosen = captured["chosen"]
+    assert cand.shape == (1, 3, model.cfg.policy_horizon)            # (B, Kp, H): length-horizon menu
+    assert torch.allclose(                                            # log_prior E(pi) is normalized
+        captured["log_prior"].exp().sum(-1), torch.ones(1), atol=1e-6)
+    first_action = cand[0, chosen[0], 0]
+    terminal_action = cand[0, chosen[0], -1]
+    assert out[0, -1].item() == first_action.item()                  # committed the FIRST action
+    assert first_action.item() != terminal_action.item()            # and it is genuinely not the terminal one
+
+
+def test_none_mode_generate_never_calls_build_topk_policy_menu(monkeypatch):
+    # audit PB-05: the H-step menu builder is on the efe_rollout branch only. Under policy_mode='none'
+    # generate() never reaches _policy_select, so build_topk_policy_menu is never imported/called; a
+    # monkeypatched raise proves it, and the seeded output stays byte-identical to the pre-change pin.
+    import vfe3.inference.candidate_menu as candidate_menu
+
+    def boom(*args, **kwargs):
+        raise AssertionError("build_topk_policy_menu must not be called under policy_mode='none'")
+
+    monkeypatch.setattr(candidate_menu, "build_topk_policy_menu", boom)
+    model = _tiny_model(seed=0)                                       # policy_mode defaults to 'none'
+    prompt = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    out = model.generate(prompt, max_new_tokens=4, greedy=True)
+    assert out.tolist() == [[1, 2, 3, 10, 3, 10, 3]]                 # base-commit golden, unchanged
+
+
+def test_generate_efe_rollout_rejects_cache_unsupported_config():
+    # audit PB-05: the H-step menu does NOT relax the scorer's cache gate. On a cache-unsupported
+    # config efe_rollout still fails closed (get_policy('efe_rollout') raises), never silently paying
+    # the dishonest full recompute (spec Section 3.5).
+    from vfe3.inference.belief_cache import cache_supported
+    model = _tiny_model(
+        policy_mode="efe_rollout", policy_preference="flat", policy_horizon=2, policy_top_k=3,
+        n_e_steps=2)                                                 # n_e_steps=2 breaks cache support
+    assert not cache_supported(model.cfg)
+    prompt = torch.tensor([[1, 2]], dtype=torch.long)
+    with pytest.raises(NotImplementedError, match="belief-prefix cache"):
         model.generate(prompt, 1, greedy=True)
-    msg = str(e.value)
-    assert "candidate menu" in msg and "H-token" in msg
 
 
 def test_policy_mode_rejects_call_time_sampler_knobs():

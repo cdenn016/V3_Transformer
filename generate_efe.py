@@ -16,8 +16,11 @@ WHAT THIS CAN AND CANNOT DO ON WIKITEXT (read before expecting a win):
     is unvalidated (see docs/research/active-inference/2026-06-29-v3-active-inference-closeout.md).
   * Goal-steering (policy_preference='task') is NOT available here -- config rejects it in generate()
     because it needs a goal token; drive the scorer directly through a harness (cf. ring_task.py).
-  * efe_rollout (horizon>1) is NOT wired into generate() either (its candidate menu is single-token);
-    use a harness. This script supports policy_mode in {none, efe_one_step, logprob_control}.
+  * efe_rollout (horizon>1) IS reachable through generate() (audit PB-05): it builds a bounded H-step
+    beam candidate menu and commits the first action of the selected policy. It REQUIRES a
+    cache-supported checkpoint config (vfe3/inference/belief_cache.py::cache_supported) and
+    policy_horizon>1; on an unsupported config the scorer fails closed rather than paying the dishonest
+    full recompute. This script supports policy_mode in {none, efe_one_step, logprob_control, efe_rollout}.
 
 Run on the GPU (the iterative E-step is slow on CPU); it auto-uses CUDA when available.
 """
@@ -42,12 +45,12 @@ CONFIG = dict(
     greedy          = False,     # True -> argmax / argmax-of-policy-posterior; deterministic
 
     # --- EFE policy scorer (the "active inference" knobs) ---
-    policy_mode        = "efe_one_step",        # none | efe_one_step | logprob_control
+    policy_mode        = "efe_one_step",        # none | efe_one_step | logprob_control | efe_rollout (cache-supported cfg, horizon>1)
     policy_preference  = "flat",                # generate() allows only 'flat'
     policy_score_terms = ("ambiguity",),        # ('risk','ambiguity') = no-op on LM; ('ambiguity',) = confidence reranker
     policy_top_k       = 8,                     # candidate menu width Kp
     policy_precision   = 1,                   # gamma in softmax(-gamma * G)
-    policy_horizon     = 1,                     # must be 1 for efe_one_step in generate()
+    policy_horizon     = 1,                     # 1 for efe_one_step; >1 for efe_rollout (needs a cache-supported cfg)
 
     device       = None,        # None -> cuda if available else cpu
 )
