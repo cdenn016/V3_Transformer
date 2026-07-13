@@ -16,10 +16,17 @@ scaling headline carries no tokens-per-character factor for the validation split
 "bits per character" would be wrong.
 """
 
+import json
 import logging
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
+
+from vfe3.data.datasets import _sha256_file
+from vfe3.metrics import bootstrap_token_ce_band
 
 logger = logging.getLogger(__name__)
 
@@ -150,3 +157,167 @@ def pareto_frontier_kwargs(points: List[Dict[str, Any]]) -> Optional[Dict[str, A
             "label":          [p["label"] for p in ordered],
         }
     }
+
+
+# =============================================================================
+# PB-07: ablation-report adapters (component forest, joint-LR grid).
+#
+# The forest reads per-cell paired-token nats persisted as ``val_token_nats.pt`` and re-verifies the
+# marker's byte/tensor identity (sha256 + size + numel + dtype) before trusting a file, so a
+# same-shape finite overwrite (a re-run that changed the bytes without updating the marker) is
+# rejected rather than silently plotted. The grid reads the accumulated sweep rows and requires the
+# exact Cartesian product declared by persisted sweep metadata.
+# =============================================================================
+
+
+def _successful_markers_by_label(sweep_dir: Path) -> Dict[str, Dict[str, Any]]:
+    r"""Every successful cell's ``ablation_result.json`` under ``sweep_dir``, keyed by its label.
+
+    Mirrors the sweep runner's success criteria (``status == "success"``, no ``error_kind``, finite
+    terminal PPL); each returned marker is augmented with its resolved cell directory under the
+    private ``_cell_dir`` key so ``_load_token_vector`` can find the sibling token file. Unreadable,
+    non-object, failed, errored, and nonfinite-terminal markers are skipped.
+    """
+    markers: Dict[str, Dict[str, Any]] = {}
+    for marker_path in sorted(sweep_dir.glob("*/ablation_result.json")):
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception:                                        # unreadable marker -> skip
+            continue
+        if not isinstance(marker, Mapping):
+            continue
+        if marker.get("status") != "success" or marker.get("error_kind") is not None:
+            continue
+        try:
+            terminal_ppl = float(marker["final_val_ppl"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(terminal_ppl):
+            continue
+        label = marker.get("label")
+        if not isinstance(label, str):
+            continue
+        augmented = dict(marker)
+        augmented["_cell_dir"] = str(marker_path.parent)
+        markers[label] = augmented
+    return markers
+
+
+def _load_token_vector(sweep_dir: Path, marker: Mapping[str, Any]) -> Optional[torch.Tensor]:
+    r"""Safe-load the marker's paired-token nats vector, or ``None`` if its identity does not verify.
+
+    Resolves ONLY the marker's exact child filename (``val_token_nats.pt``) under the cell directory
+    -- any other value is refused, so no path outside the cell can be read -- then re-verifies the
+    same byte/tensor identity the resume validator binds: a true ``paired_token_bootstrap`` flag, an
+    existing file whose recomputed streamed SHA-256 and byte size equal the marker, and a
+    ``weights_only`` safe load that yields a finite, nonempty, one-dimensional tensor whose numel and
+    string dtype equal the marker. Any mismatch fails closed (returns ``None``).
+    """
+    if not marker.get("paired_token_bootstrap"):
+        return None
+    if marker.get("val_token_nats_path") != "val_token_nats.pt":
+        return None
+    cell_dir = marker.get("_cell_dir")
+    if not cell_dir:
+        return None
+    expected_sha    = marker.get("val_token_nats_sha256")
+    expected_size   = marker.get("val_token_nats_size_bytes")
+    expected_numel  = marker.get("val_token_nats_numel")
+    expected_dtype  = marker.get("val_token_nats_dtype")
+    if not (isinstance(expected_sha, str) and expected_sha):
+        return None
+    path = Path(cell_dir) / "val_token_nats.pt"
+    if not path.is_file():
+        return None
+    if path.stat().st_size != expected_size:
+        return None
+    if _sha256_file(path) != expected_sha:
+        return None
+    try:
+        tensor = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return None
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    if tensor.ndim != 1 or tensor.numel() == 0:
+        return None
+    if int(tensor.numel()) != expected_numel or str(tensor.dtype) != expected_dtype:
+        return None
+    if not bool(torch.isfinite(tensor).all()):
+        return None
+    return tensor
+
+
+def ablation_forest_kwargs(sweep_dir: Path, baseline_label: str) -> Optional[Dict[str, Any]]:
+    r"""Build ``plot_ablation_forest``'s ``rows`` kwarg from persisted, aligned paired-token vectors.
+
+    The named baseline arm must exist and load; every arm must be aligned (same token length) with
+    it; each arm's delta / lo / hi is the paired bootstrap-over-tokens band (``seed=0``) converted
+    from nats to BITS per token (divided by ``ln 2``). A missing baseline, a shape mismatch, or a
+    token file whose identity no longer verifies withholds the whole figure (returns ``None``).
+    """
+    markers = _successful_markers_by_label(sweep_dir)
+    baseline_marker = markers.get(baseline_label)
+    if baseline_marker is None:
+        logger.warning("ablation_forest withheld: no successful %r baseline cell under %s",
+                       baseline_label, sweep_dir)
+        return None
+    baseline = _load_token_vector(sweep_dir, baseline_marker)
+    if baseline is None:
+        logger.warning("ablation_forest withheld: baseline token vector failed identity verification")
+        return None
+    rows: List[Dict[str, Any]] = []
+    for label in sorted(markers):
+        arm = _load_token_vector(sweep_dir, markers[label])
+        if arm is None or arm.shape != baseline.shape:
+            logger.warning("ablation_forest withheld: arm %r has a missing or misaligned token vector",
+                           label)
+            return None
+        band = bootstrap_token_ce_band(arm, baseline, seed=0)
+        rows.append({"label": label, **{key: band[key] / math.log(2.0)
+                                        for key in ("delta", "lo", "hi")}})
+    return {"rows": rows}
+
+
+def lr_grid_heatmap_kwargs(
+    rows:     List[Dict[str, Any]],
+    x_key:    str,
+    y_key:    str,
+    x_values: Sequence[float],
+    y_values: Sequence[float],
+    baseline: Tuple[float, float],
+) -> Optional[Dict[str, Any]]:
+    r"""Build ``plot_lr_grid_heatmap``'s ``grid`` kwarg from one completed two-dimensional sweep.
+
+    Requires the EXACT Cartesian product declared by the persisted grid metadata: every ``(x, y)``
+    pair from ``x_values`` x ``y_values`` present exactly once, each carrying a finite
+    ``primary_val_ppl``. A duplicate cell, a missing cell, an off-grid pair, a nonfinite value, or a
+    row whose ``overrides`` lacks either learning rate withholds the whole figure (returns ``None``).
+    """
+    xs = tuple(float(value) for value in x_values)
+    ys = tuple(float(value) for value in y_values)
+    expected = {(x, y) for y in ys for x in xs}
+    cells: Dict[Tuple[float, float], float] = {}
+    for row in rows:
+        overrides = row.get("overrides")
+        if not isinstance(overrides, Mapping):
+            logger.warning("lr_grid_heatmap withheld: a row carries no overrides mapping")
+            return None
+        try:
+            pair = (float(overrides[x_key]), float(overrides[y_key]))
+            value = float(row["primary_val_ppl"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning("lr_grid_heatmap withheld: a row lacks %r/%r or a finite primary_val_ppl",
+                           x_key, y_key)
+            return None
+        if pair not in expected or pair in cells or not math.isfinite(value):
+            logger.warning("lr_grid_heatmap withheld: off-grid, duplicate, or nonfinite cell %s", pair)
+            return None
+        cells[pair] = value
+    if set(cells) != expected:
+        logger.warning("lr_grid_heatmap withheld: incomplete grid (%d of %d cells present)",
+                       len(cells), len(expected))
+        return None
+    z = np.asarray([[cells[(x, y)] for x in xs] for y in ys], dtype=float)
+    return {"grid": {"x": np.asarray(xs), "y": np.asarray(ys), "z": z,
+                     "xlabel": x_key, "ylabel": y_key, "baseline": baseline}}

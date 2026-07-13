@@ -9,9 +9,11 @@ r"""Tests for the 2026-06-22 figures-tail build-out (EXP-1/2/6/9/10/11 auto-disp
 Device-agnostic (CPU). Figures use the Agg backend.
 """
 import csv as _csv
+import hashlib
 import json
 import math
 import os
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
@@ -22,11 +24,19 @@ import torch
 import ablation
 import scaling_analysis
 from vfe3.config import VFE3Config
+from vfe3.metrics import bootstrap_token_ce_band
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.train import train
 from vfe3.viz import figures as figs
-from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
+from vfe3.viz.specs import FigureSpec, emit_registered_figures
+from vfe3.viz.sweep_adapters import (
+    ablation_forest_kwargs,
+    aggregate_validation_points,
+    capacity_scaling_kwargs,
+    lr_grid_heatmap_kwargs,
+    pareto_frontier_kwargs,
+)
 
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
@@ -324,3 +334,152 @@ def test_pareto_frontier_kwargs_pins_sorted_points_and_excludes_inference_route(
     assert result["points"]["bits_per_token"].tolist() == pytest.approx([5.0, 4.0, 2.0, 1.0])
     assert result["points"]["wall_time"].tolist() == pytest.approx([11.0, 22.0, 32.0, 42.0])
     assert result["points"]["label"] == ["K20", "K40", "K80", "K100"]   # the 5 inference points excluded
+
+
+# --------------------------------------------------------------------------- PB-07: persisted-artifact
+# adapters for the ablation forest and joint-LR grid figures (vfe3.viz.sweep_adapters).
+#
+# ablation_forest_kwargs reads persisted, aligned val_token_nats.pt tensors bound by a per-marker
+# byte/tensor identity (sha256 + size + numel + dtype); lr_grid_heatmap_kwargs reads the accumulated
+# sweep rows and the Cartesian metadata. Both are pure fixtures -- no model is built.
+
+
+def _write_forest_cell(sweep_dir: Path, label: str, tensor: torch.Tensor, *, paired: bool = True):
+    r"""One successful forest cell: an aligned per-token nats tensor plus a marker that records the
+    exact byte/tensor identity the adapter re-verifies before trusting the file."""
+    cell = sweep_dir / label.replace("=", "_").replace(",", "_")
+    cell.mkdir(parents=True, exist_ok=True)
+    tpath = cell / "val_token_nats.pt"
+    torch.save(tensor, tpath)
+    sha = hashlib.sha256(tpath.read_bytes()).hexdigest()
+    marker = {
+        "sweep": sweep_dir.name, "label": label, "status": "success", "error_kind": None,
+        "primary_val_ppl": 10.0, "final_val_ppl": 10.0, "n_params": 100, "seed": 6,
+        "paired_token_bootstrap": bool(paired),
+        "val_token_nats_path": "val_token_nats.pt" if paired else None,
+        "val_token_nats_sha256": sha if paired else None,
+        "val_token_nats_size_bytes": tpath.stat().st_size if paired else None,
+        "val_token_nats_numel": int(tensor.numel()) if paired else None,
+        "val_token_nats_dtype": str(tensor.dtype) if paired else None,
+    }
+    (cell / "ablation_result.json").write_text(json.dumps(marker), encoding="utf-8")
+    return cell, tpath
+
+
+def test_ablation_forest_kwargs_rows_match_paired_bootstrap_oracle(tmp_path):
+    torch.manual_seed(0)
+    sweep = tmp_path / "component_ablation_forest"
+    baseline = torch.rand(64, dtype=torch.float32)
+    arms = {"baseline": baseline,
+            "head_mixer_off": baseline + 0.1 * torch.rand(64),
+            "precision_attention_off": baseline + 0.2 * torch.rand(64)}
+    for label, arm in arms.items():
+        _write_forest_cell(sweep, label, arm)
+
+    out = ablation_forest_kwargs(sweep, "baseline")
+    assert out is not None
+    rows = {r["label"]: r for r in out["rows"]}
+    assert set(rows) == set(arms)
+    for label, arm in arms.items():
+        band = bootstrap_token_ce_band(arm, baseline, seed=0)      # oracle: same seed as the adapter
+        assert rows[label]["delta"] == pytest.approx(band["delta"] / math.log(2.0))
+        assert rows[label]["lo"] == pytest.approx(band["lo"] / math.log(2.0))
+        assert rows[label]["hi"] == pytest.approx(band["hi"] / math.log(2.0))
+
+
+def test_ablation_forest_kwargs_none_without_baseline_marker(tmp_path):
+    sweep = tmp_path / "component_ablation_forest"
+    _write_forest_cell(sweep, "head_mixer_off", torch.rand(32, dtype=torch.float32))
+    assert ablation_forest_kwargs(sweep, "baseline") is None
+
+
+def test_ablation_forest_kwargs_none_on_shape_mismatch(tmp_path):
+    sweep = tmp_path / "component_ablation_forest"
+    _write_forest_cell(sweep, "baseline", torch.rand(64, dtype=torch.float32))
+    _write_forest_cell(sweep, "head_mixer_off", torch.rand(32, dtype=torch.float32))  # length differs
+    assert ablation_forest_kwargs(sweep, "baseline") is None
+
+
+def test_ablation_forest_kwargs_rejects_same_shape_finite_replacement(tmp_path):
+    r"""Overwriting a valid tensor with DIFFERENT finite values of the same shape/dtype leaves the
+    marker's recorded digest stale, so the adapter must reject the whole figure (digest changed)."""
+    sweep = tmp_path / "component_ablation_forest"
+    _write_forest_cell(sweep, "baseline", torch.ones(64, dtype=torch.float32))
+    _cell, tpath = _write_forest_cell(sweep, "head_mixer_off", torch.ones(64, dtype=torch.float32))
+    torch.save(torch.full((64,), 2.0, dtype=torch.float32), tpath)   # same size/dtype, new bytes
+    assert ablation_forest_kwargs(sweep, "baseline") is None
+
+
+def _grid_row(mu, sigma, ppl):
+    return {"label": f"mu={mu:g},sigma={sigma:g}", "primary_val_ppl": ppl,
+            "overrides": {"e_q_mu_lr": mu, "e_q_sigma_lr": sigma}}
+
+
+def _complete_grid_rows(xs, ys):
+    return [_grid_row(mu, sigma, 100.0 + 10 * i + j)
+            for i, sigma in enumerate(ys) for j, mu in enumerate(xs)]
+
+
+def test_lr_grid_heatmap_kwargs_cartesian_complete_and_sorted(tmp_path):
+    xs, ys = [0.5, 0.9], [0.0, 0.001]
+    out = lr_grid_heatmap_kwargs(_complete_grid_rows(xs, ys),
+                                 "e_q_mu_lr", "e_q_sigma_lr", xs, ys, (0.9, 0.001))
+    assert out is not None
+    grid = out["grid"]
+    assert grid["x"].tolist() == [0.5, 0.9]
+    assert grid["y"].tolist() == [0.0, 0.001]
+    assert grid["z"].tolist() == [[100.0, 101.0], [110.0, 111.0]]     # z[iy][ix] from primary_val_ppl
+    assert grid["xlabel"] == "e_q_mu_lr" and grid["ylabel"] == "e_q_sigma_lr"
+    assert grid["baseline"] == (0.9, 0.001)
+
+
+def test_lr_grid_heatmap_kwargs_none_on_duplicate_cell(tmp_path):
+    xs, ys = [0.5, 0.9], [0.0, 0.001]
+    rows = _complete_grid_rows(xs, ys) + [_grid_row(0.5, 0.0, 200.0)]  # duplicate (0.5, 0.0)
+    assert lr_grid_heatmap_kwargs(rows, "e_q_mu_lr", "e_q_sigma_lr", xs, ys, (0.9, 0.001)) is None
+
+
+def test_lr_grid_heatmap_kwargs_none_on_missing_cell(tmp_path):
+    xs, ys = [0.5, 0.9], [0.0, 0.001]
+    rows = _complete_grid_rows(xs, ys)[:-1]                            # 3 of 4 cells present
+    assert lr_grid_heatmap_kwargs(rows, "e_q_mu_lr", "e_q_sigma_lr", xs, ys, (0.9, 0.001)) is None
+
+
+def test_lr_grid_heatmap_kwargs_none_on_nonfinite_value(tmp_path):
+    xs, ys = [0.5, 0.9], [0.0, 0.001]
+    rows = _complete_grid_rows(xs, ys)
+    rows[0] = _grid_row(0.5, 0.0, float("inf"))
+    assert lr_grid_heatmap_kwargs(rows, "e_q_mu_lr", "e_q_sigma_lr", xs, ys, (0.9, 0.001)) is None
+
+
+def test_emit_registered_ablation_forest_and_lr_grid_figures(tmp_path):
+    torch.manual_seed(0)
+    fig_dir = tmp_path / "figures"
+    sweep = tmp_path / "component_ablation_forest"
+    baseline = torch.rand(64, dtype=torch.float32)
+    _write_forest_cell(sweep, "baseline", baseline)
+    _write_forest_cell(sweep, "head_mixer_off", baseline + 0.1 * torch.rand(64))
+    xs, ys = [0.5, 0.9], [0.0, 0.001]
+    ctx = {"sweep_dir": sweep, "rows": _complete_grid_rows(xs, ys), "baseline_label": "baseline",
+           "grid_x": "e_q_mu_lr", "grid_y": "e_q_sigma_lr",
+           "grid_x_values": xs, "grid_y_values": ys, "baseline": (0.9, 0.001)}
+    specs = [
+        FigureSpec("ablation_forest", "ablation_forest.png",
+                   lambda c: ablation_forest_kwargs(c["sweep_dir"], c["baseline_label"])),
+        FigureSpec("lr_grid_heatmap", "lr_grid_heatmap.png",
+                   lambda c: lr_grid_heatmap_kwargs(c["rows"], c["grid_x"], c["grid_y"],
+                                                    c["grid_x_values"], c["grid_y_values"], c["baseline"])),
+    ]
+    emit_registered_figures(specs, ctx, fig_dir)
+    assert (fig_dir / "ablation_forest.png").stat().st_size > 0
+    assert (fig_dir / "lr_grid_heatmap.png").stat().st_size > 0
+
+
+def test_emit_ablation_forest_skipped_when_baseline_absent(tmp_path):
+    fig_dir = tmp_path / "figures"
+    sweep = tmp_path / "component_ablation_forest"
+    _write_forest_cell(sweep, "head_mixer_off", torch.rand(16, dtype=torch.float32))  # no baseline arm
+    specs = [FigureSpec("ablation_forest", "ablation_forest.png",
+                        lambda c: ablation_forest_kwargs(c["sweep_dir"], c["baseline_label"]))]
+    emit_registered_figures(specs, {"sweep_dir": sweep, "baseline_label": "baseline"}, fig_dir)
+    assert not (fig_dir / "ablation_forest.png").exists()

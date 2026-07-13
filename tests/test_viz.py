@@ -592,7 +592,11 @@ def test_plot_ablation_forest_and_lr_grid_save(tmp_path):
             "z": np.array([[190., 185., 188.], [186., 180., 184.]]),
             "xlabel": "m_p_mu_lr", "ylabel": "m_p_sigma_lr", "baseline": (0.02, 0.002)}
     p1 = tmp_path / "f12a.png"; p2 = tmp_path / "f12b.png"
-    fig = plot_ablation_forest(rows, path=str(p1)); plt.close(fig)
+    fig = plot_ablation_forest(rows, path=str(p1))
+    # PB-07: the forest x-axis is delta BITS/TOKEN (paired per-token nats / ln 2), not the
+    # character-corrected BPC of the scaling figures -- pin the relabel.
+    assert fig.axes[0].get_xlabel() == r"$\Delta$ bits/token vs full model"
+    plt.close(fig)
     fig = plot_lr_grid_heatmap(grid, path=str(p2)); plt.close(fig)
     assert _saved_nonempty(p1) and _saved_nonempty(p2)
 

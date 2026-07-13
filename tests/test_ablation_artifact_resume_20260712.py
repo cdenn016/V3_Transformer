@@ -188,7 +188,10 @@ def test_missing_requested_diagnostics_output_forbids_contract_publication(tmp_p
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)
     ablation.run_sweep(sweep_name, tmp_path, dataset=DATASET, device=None, seed=6, resume=False)
 
-    flags = {"collect_diagnostics": True, "collect_extrapolation": True}
+    # The contract's diagnostic_flags now also binds paired_token_bootstrap (PB-07); this sweep does
+    # not request it, so the published contract records it false and the rebuilt expected must match.
+    flags = {"collect_diagnostics": True, "collect_extrapolation": True,
+             "paired_token_bootstrap": False}
     expected = ablation._expected_cell_contract_or_none({}, DATASET, flags, seed=6)
     assert expected is not None
 

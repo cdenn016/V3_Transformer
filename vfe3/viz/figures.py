@@ -2401,15 +2401,17 @@ def plot_pareto_frontier(
 
 @register_figure("ablation_forest")
 def plot_ablation_forest(
-    rows: list,                          # [{label, delta, [lo], [hi]}] delta-BPC vs the full model
+    rows: list,                          # [{label, delta, [lo], [hi]}] delta bits/token vs the full model
 
     *,
     path: Optional[str] = None,
 ):
-    r"""F12 Panel A: baseline-ladder ablation forest of delta-BPC from the full model.
+    r"""F12 Panel A: baseline-ladder ablation forest of delta bits/token from the full model.
 
     Each disabling ablation is a point with a paired bootstrap-over-tokens interval (single-seed
-    within-run, not a cross-seed CI), sorted by effect size; the zero line is the full model.
+    within-run, not a cross-seed CI), sorted by effect size; the zero line is the full model. The
+    axis is delta bits/token (paired per-token nats divided by ln 2), NOT the character-corrected
+    bits-per-character of the scaling figures.
     """
     rows = sorted(rows, key=lambda r: r["delta"])
     y = np.arange(len(rows))
@@ -2422,7 +2424,7 @@ def plot_ablation_forest(
     ax.axvline(0.0, color="#444444", ls="--", lw=1)
     ax.set_yticks(y)
     ax.set_yticklabels([r["label"] for r in rows])
-    ax.set(xlabel=r"$\Delta$ BPC vs full model", title="Component ablations (paired token bootstrap)")
+    ax.set(xlabel=r"$\Delta$ bits/token vs full model", title="Component ablations (paired token bootstrap)")
     fig.tight_layout()
     return _save(fig, path)
 
