@@ -1893,20 +1893,22 @@ class VFE3Config:
         # (a learned linear readout), never via decode_mode, so it is excluded from the valid set.
         from vfe3.model.prior_bank import _DECODERS, _ENCODERS
         _require(self.decode_mode, tuple(sorted(set(_DECODERS) - {"linear"})), "decode_mode")
-        # decode_mode sets the RANK of the prior-bank KL-decode kernel: 'diagonal'/'diagonal_chunked'
-        # consume a diagonal sigma (B,N,K); 'full'/'full_chunked' consume a full sigma (B,N,K,K). It
-        # must agree with the covariance family, else the rank mismatch is a shape RuntimeError at the
-        # first forward. The use_prior_bank=False linear decode discards sigma, and its own active
-        # registration controls dense versus fused-CE training; decode_mode does not route that
-        # no-prior path. Rank is therefore irrelevant there, so the cross-check stays gated on
-        # use_prior_bank.
-        decode_is_full = _DECODERS[self.decode_mode].supports_full
-        if self.use_prior_bank and decode_is_full == family_is_diagonal:
+        # decode_mode sets the covariance RANK(s) of the prior-bank decode kernel via its resolved
+        # DecodeRegistration.covariance_kinds: 'diagonal'/'diagonal_chunked' -> {'diagonal'};
+        # 'full'/'full_chunked' -> {'full'}; the family-consistent 'family'/'family_chunked' ->
+        # {'diagonal','full'} (both ranks). The configured family's cov_kind must be a MEMBER of that
+        # set (validated as membership, not as an exclusive rank bit), else the rank mismatch is a
+        # shape RuntimeError at the first forward. The use_prior_bank=False linear decode discards
+        # sigma and its own active registration controls dense-vs-fused training; decode_mode does not
+        # route that no-prior path, so the cross-check stays gated on use_prior_bank.
+        decode_registration = _DECODERS[self.decode_mode]
+        family_kind = family_cov_kind(self.family)
+        if self.use_prior_bank and family_kind not in decode_registration.covariance_kinds:
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
-                f"'full'/'full_chunked' decode needs a full-covariance family and "
-                f"'diagonal'/'diagonal_chunked' decode needs a diagonal family. Pair a full decode_mode "
-                f"with a full family, use a diagonal decode_mode with a diagonal family, or set "
+                f"it scores covariance kinds {sorted(decode_registration.covariance_kinds)} but the "
+                f"family is {family_kind!r}. Pair a matching decode_mode (a 'full'/'diagonal' kernel "
+                f"with a full/diagonal family, or 'family'/'family_chunked' which score both), or set "
                 f"use_prior_bank=False (linear decode)."
             )
         if self.decode_chunk_size < 1:
@@ -2028,39 +2030,29 @@ class VFE3Config:
                 "there is no reliability bias to shape per head. Enable precision_weighted_attention.",
                 UserWarning,
             )
-        # use_prior_bank decode is a FIXED alpha=1 KL readout on the hardcoded Gaussian family
-        # (prior_bank.reference_decode / the fused kernels call divergence.kl); it does NOT read
-        # renyi_order / divergence_family. An opt-in non-KL/non-alpha=1 seam therefore minimizes the
-        # E-step under one divergence and reads logits out under another -- warn so the mismatch is a
-        # deliberate choice (the pure path is use_prior_bank=True with renyi / renyi_order=1).
-        if self.use_prior_bank and (self.renyi_order != 1.0 or self.divergence_family != "renyi"):
-            import warnings
-            warnings.warn(
-                f"use_prior_bank=True decodes at a FIXED alpha=1 KL, but the E-step minimizes under "
-                f"divergence_family={self.divergence_family!r}/renyi_order={self.renyi_order}: inference "
-                f"and the KL-to-prior readout use different divergences.",
-                UserWarning,
-                stacklevel=2,
-            )
-        # The use_prior_bank decode kernels hardcode the GAUSSIAN family (prior_bank.reference_decode /
-        # the fused kernels call get_family('gaussian_diagonal')/('gaussian_full'); they read neither
-        # `family` nor `divergence_family`). A non-Gaussian belief family runs a genuine non-Gaussian
-        # E-step but is then projected to logits through the WRONG (Gaussian) metric -- the converged
-        # belief is correct, only its readout uses the wrong divergence (argmax can flip). No
-        # Gaussian-only decode kernel for the other families exists, so warn (the pure readout paths
-        # are a Gaussian family, or use_prior_bank=False's linear decode which is family-agnostic).
-        if self.use_prior_bank and self.family not in ("gaussian_diagonal", "gaussian_full"):
-            import warnings
-            warnings.warn(
-                f"use_prior_bank=True decodes through a hardcoded GAUSSIAN KL readout, but "
-                f"family={self.family!r} is non-Gaussian: the E-step minimizes in the {self.family!r} "
-                f"geometry while the logits are read out under the Gaussian metric (the converged "
-                f"belief is correct; only its projection to logits uses the wrong divergence). Use a "
-                f"Gaussian family for the KL-to-prior decode, or use_prior_bank=False (the linear "
-                f"decode is family-agnostic).",
-                UserWarning,
-                stacklevel=2,
-            )
+        # PB-14 capability validation (replaces the old decode/E-step divergence-mismatch WARNINGS).
+        # The optimized 'diagonal'/'full' kernels hardcode a gaussian alpha=1 KL readout and ignore
+        # divergence_family/renyi_order, so a non-Gaussian family or a noncanonical divergence
+        # (renyi_order != 1 or a non-'renyi' functional) would read the belief out under the WRONG
+        # geometry. Such a config under use_prior_bank=True MUST select a family-consistent decode
+        # kernel ('family'/'family_chunked'), which scores logits = -D_configured(q||p_v)/tau_eff
+        # through the configured family AND divergence. Canonical gaussian/renyi/alpha=1 configs keep
+        # their fast modes (family_consistent is not required). The rank membership above already
+        # enforces family_cov_kind(family) in registration.covariance_kinds.
+        if self.use_prior_bank:
+            noncanonical = self.renyi_order != 1.0 or self.divergence_family != "renyi"
+            non_gaussian = self.family not in ("gaussian_diagonal", "gaussian_full")
+            if (noncanonical or non_gaussian) and not decode_registration.family_consistent:
+                raise ValueError(
+                    f"use_prior_bank=True with family={self.family!r}/"
+                    f"divergence_family={self.divergence_family!r}/renyi_order={self.renyi_order} "
+                    f"requires a family-consistent decode_mode ('family' or 'family_chunked') that "
+                    f"reads logits out under the configured divergence; decode_mode="
+                    f"{self.decode_mode!r} is a fixed gaussian alpha=1 KL kernel and would project "
+                    f"the belief through the wrong geometry (the argmax can flip). Set "
+                    f"decode_mode='family'/'family_chunked', or use_prior_bank=False (the linear "
+                    f"decode is family-agnostic)."
+                )
         # Full-covariance compute discarded at the decode boundary (B4): use_prior_bank=False decodes
         # by the linear readout logits = mu_q @ W^T, which DISCARDS sigma. With a full-covariance family
         # the E-step still evolves a (B, N, K, K) covariance (it shapes the mean trajectory, so the

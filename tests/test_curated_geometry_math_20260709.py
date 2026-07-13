@@ -106,9 +106,14 @@ def test_prior_model_and_decode_variance_reads_share_guard() -> None:
             {
                 "self.s_sigma_log_embed[token_ids]": 1,
                 "self.s_sigma_log_embed": 1,
+                # PB-14 (2026-07-12): reference_decode's own guarded self-read was replaced by a call to
+                # the module-level _decode_family (which reads pb._decode_sigma_log_table()); the new
+                # decode_ce_family_chunked adds a self-read, so the self count is unchanged (4) while the
+                # pb count gains _decode_family's read (4 -> 5). Every trainable log-variance table still
+                # reaches a variance only through a bounded_variance_from_log call.
                 "self._decode_sigma_log_table()": 4,
                 "pb._prior_sigma_log_table()[token_ids]": 2,
-                "pb._decode_sigma_log_table()": 4,
+                "pb._decode_sigma_log_table()": 5,
                 "self.r_sigma_log": 1,
             }
         ),

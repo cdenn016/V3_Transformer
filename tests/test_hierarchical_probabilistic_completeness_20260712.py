@@ -1063,3 +1063,77 @@ def test_delta_full_requires_gaussian_full():
 def test_cg_covariance_mode_validated():
     with pytest.raises(ValueError, match="cg_covariance_mode"):
         _cg_cfg("unroll", cg_covariance_mode="bogus")
+
+
+# ===========================================================================
+# PB-14 (Task 5, 2026-07-12): family/divergence-consistent chunked decode parity.
+#
+# `family_chunked` streams the vocabulary through the SAME registered functional and the
+# existing fused log-sum-exp/gather reduction, materializing only a per-chunk workspace inside
+# a gradient checkpoint (for a full family, (B,N,Vc,K,K)). Its CE and gradients (to mu_q, the
+# diagonal prior variances, the untied decode tables, and with the unigram bias active) must
+# equal the dense `family` decode -> cross-entropy for every supported family.
+# ===========================================================================
+
+import torch.nn.functional as F                                        # noqa: E402
+from vfe3.model.prior_bank import PriorBank, get_decode                # noqa: E402
+
+
+def _pb14_chunked_bank(family, order, *, untie, V=7, K=3, n_gen=4):
+    torch.manual_seed(0)
+    pb = PriorBank(V, K, n_gen, decode_tau=1.2, family=family,
+                   divergence_family="renyi", renyi_order=order, decode_mode="family_chunked",
+                   diagonal_covariance=(family != "gaussian_full"),
+                   untie_decode_bank=untie, decode_unigram_prior=True, decode_chunk_size=8192)
+    with torch.no_grad():
+        pb.mu_embed.normal_(0.0, 0.5)
+        pb.sigma_log_embed.normal_(0.0, 0.3)
+        if untie:
+            pb.decode_mu_embed.normal_(0.0, 0.5)
+            pb.decode_sigma_log_embed.normal_(0.0, 0.3)
+    pb.set_unigram_log_prior(torch.arange(1, V + 1, dtype=torch.float32))   # nonzero unigram bias
+    return pb
+
+
+@pytest.mark.parametrize("untie", [False, True])
+@pytest.mark.parametrize("family", ["gaussian_diagonal", "gaussian_full", "laplace_diagonal"])
+@pytest.mark.parametrize("order", [1.0, 0.5])
+def test_family_chunked_matches_dense_value_and_grads(family, order, untie):
+    V, K, B, N = 7, 3, 2, 4
+    pb = _pb14_chunked_bank(family, order, untie=untie, V=V, K=K)
+    g = torch.Generator().manual_seed(1)
+    mu_q = torch.randn(B, N, K, generator=g, requires_grad=True)
+    if family == "gaussian_full":
+        A = torch.randn(B, N, K, K, generator=g)
+        sigma_q = A @ A.transpose(-1, -2) + K * torch.eye(K)
+    else:
+        sigma_q = torch.rand(B, N, K, generator=g) + 0.3
+    targets = torch.randint(0, V, (B, N), generator=g)
+    targets[0, 0] = -100                                               # ignore_index honored identically
+
+    dense_logits = pb.decode(mu_q, sigma_q)                            # (B,N,V) inference == _decode_family + unigram
+    dense_ce = F.cross_entropy(dense_logits.reshape(-1, V), targets.reshape(-1), ignore_index=-100)
+    for chunk in (3, V, 8192):                                         # divides / single-window / >= V
+        chunked_ce = pb.decode_ce_family_chunked(mu_q, sigma_q, targets, chunk_size=chunk)
+        assert torch.allclose(chunked_ce, dense_ce, atol=1e-4), f"{family} order={order} chunk={chunk}"
+
+    leaves = ([mu_q, pb.decode_mu_embed, pb.decode_sigma_log_embed] if untie
+              else [mu_q, pb.mu_embed, pb.sigma_log_embed])
+    chunked_ce = pb.decode_ce_family_chunked(mu_q, sigma_q, targets, chunk_size=3)
+    g_dense = torch.autograd.grad(dense_ce, leaves, retain_graph=True, allow_unused=True)
+    g_chunk = torch.autograd.grad(chunked_ce, leaves, allow_unused=True)
+    for a, b in zip(g_dense, g_chunk):
+        if a is None and b is None:
+            continue
+        assert a is not None and b is not None
+        assert torch.allclose(a, b, atol=1e-3, rtol=0.0)
+
+
+def test_family_chunked_all_ignore_is_finite_zero():
+    pb = _pb14_chunked_bank("gaussian_diagonal", 1.0, untie=False)
+    mu_q = torch.randn(2, 4, 3, requires_grad=True)
+    sigma_q = torch.rand(2, 4, 3) + 0.3
+    targets = torch.full((2, 4), -100)
+    ce = pb.decode_ce_family_chunked(mu_q, sigma_q, targets, chunk_size=3)
+    assert torch.isfinite(ce) and ce.item() == 0.0
+    ce.backward()                                                      # grad-connected (no autograd error)

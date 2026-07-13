@@ -13,33 +13,38 @@ Modularity:
     decode_mode registry -- ``diagonal`` (fused closed form, default); ``diagonal_chunked``
         (fused decode+CE, inference delegates to ``diagonal``); ``full`` (exact full-covariance
         Cholesky decode); ``full_chunked`` (full-cov KL via the diagonal-prior closed form);
-        ``expected_likelihood_chunked`` (log N(mu_q; mu_v, Sigma_q + Sigma_v) Gaussian-convolution
-        scoring, diagonal only); plus the registered-but-config-excluded ``linear`` ablation
-        kernel (reached via use_prior_bank=False).
+        ``family`` / ``family_chunked`` (family/divergence-consistent decode: logits =
+        -D_configured(q || pi_v)/tau_eff through the CONFIGURED family and divergence functional,
+        both covariance ranks); ``expected_likelihood_chunked`` (log N(mu_q; mu_v, Sigma_q + Sigma_v)
+        Gaussian-convolution scoring, diagonal only); plus the registered-but-config-excluded
+        ``linear`` ablation kernel (reached via use_prior_bank=False).
 
-Covariance-structure seam (NOT divergence-agnostic): both ``reference_decode`` and the fused
-kernels score logits = -KL(q || pi_v)/tau_eff at a FIXED alpha=1 KL on a HARDCODED family --
-``gaussian_diagonal`` for the diagonal kernels and ``reference_decode``, ``gaussian_full`` for
-the full kernels. They call ``divergence.kl`` (Renyi at alpha=1) and never read ``cfg.renyi_order``
-or ``cfg.divergence_family``, so the decode boundary stays alpha=1 KL even when the E-step
-minimizes under a different alpha/functional (config.py warns when ``use_prior_bank=True`` is
-paired with a non-KL/non-alpha=1 seam). The registry seam is honored at the COVARIANCE-STRUCTURE
-granularity only: a new covariance structure (e.g. full-covariance) is added by writing-and-
-registering a new decode kernel (the registered ``full`` Cholesky kernel), never by editing a call
-site. ``reference_decode`` is the slow per-V seam-call cross-check that the fused ``diagonal``
-kernel is pinned to EXACTLY (and under ``log_softmax``); both are alpha=1 KL.
+Decode seam (PB-14): the family-consistent ``family``/``family_chunked`` kernels AND the
+authoritative ``reference_decode`` score logits = -D_configured(q || pi_v)/tau_eff through the
+CONFIGURED family (``self.family``) and divergence functional (``self.divergence_family`` at
+``self.renyi_order``), so the readout matches the E-step geometry. The fast ``diagonal``/``full``
+kernels remain the OPTIMIZED gaussian_* + renyi(alpha=1) implementations (they hardcode gaussian
+alpha=1 KL and ignore divergence_family/renyi_order); config pairs those single-rank kernels only
+with a canonical gaussian/renyi/alpha=1 seam, and REQUIRES a ``family_consistent`` decoder for any
+non-Gaussian family or noncanonical divergence under ``use_prior_bank=True``. The registry seam is
+honored at the COVARIANCE-STRUCTURE granularity (``DecodeRegistration.covariance_kinds``): a new
+covariance structure or a new family-consistent readout is added by writing-and-registering a decode
+kernel, never by editing a call site. The full kernels score a full q against the intentionally
+DIAGONAL vocabulary-prior table (promoted with diag_embed only when the family is full).
+``reference_decode`` is the slow per-V seam-call cross-check the fused canonical kernels are pinned
+to EXACTLY (and under ``log_softmax``) on the canonical path.
 """
 
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Callable, Dict, FrozenSet, List, Optional, Protocol, Tuple
 
 import torch
 import torch.utils.checkpoint as _checkpoint
 from torch import nn
 
 from vfe3.belief import BeliefState
-from vfe3.divergence import family_cov_kind, get_family, kl
+from vfe3.divergence import family_cov_kind, get_family, get_functional, kl
 from vfe3.families.base import _logdet_chol
 from vfe3.families.covariance_tables import (
     covariance_from_packed,
@@ -61,12 +66,40 @@ _ENCODERS: 'Dict[str, EncodeCallable]' = {}
 
 @dataclass(frozen=True)
 class DecodeRegistration:
-    """A decode callable and all routing capabilities attached to that callable."""
+    """A decode callable and all routing capabilities attached to that callable.
 
-    callable:         'DecodeCallable'
-    supports_full:    bool
-    supports_chunked: bool
-    fused_ce:         'Optional[FusedCECallable]'
+    ``covariance_kinds`` is the resolved set of family covariance structures the decoder scores
+    ("diagonal" and/or "full"); config validates ``family_cov_kind(cfg.family) in covariance_kinds``
+    rather than treating ``supports_full`` as an exclusive rank bit, so a dual-rank decoder (e.g.
+    ``family``) accepts BOTH a diagonal and a full family. ``supports_full`` is retained (public,
+    read by legacy callers) and stays coherent with the set: it is ``"full" in covariance_kinds``.
+    ``family_consistent`` flags a decoder that scores logits = -D_configured(q||p_v)/tau_eff through
+    the CONFIGURED family AND divergence functional (as opposed to the fast kernels' hardcoded
+    gaussian alpha=1 KL); config requires a family_consistent decoder for any non-Gaussian family or
+    noncanonical divergence under ``use_prior_bank=True``.
+
+    Direct construction ``DecodeRegistration(callable, supports_full, supports_chunked, fused_ce)``
+    stays source-compatible: the two new fields default, and ``__post_init__`` derives the legacy
+    singleton ``covariance_kinds`` from ``supports_full`` when it is not supplied.
+    """
+
+    callable:          'DecodeCallable'
+    supports_full:     bool
+    supports_chunked:  bool
+    fused_ce:          'Optional[FusedCECallable]'
+    family_consistent: bool                        = False
+    covariance_kinds:  'Optional[FrozenSet[str]]'  = None
+
+    def __post_init__(self) -> None:
+        # Resolve the covariance-kind set. Omitted -> the legacy singleton derived from
+        # supports_full (a frozen dataclass, so the resolved value is written via object.__setattr__).
+        if self.covariance_kinds is None:
+            object.__setattr__(
+                self, "covariance_kinds",
+                frozenset({"full"} if self.supports_full else {"diagonal"}),
+            )
+        else:
+            object.__setattr__(self, "covariance_kinds", frozenset(self.covariance_kinds))
 
 
 _DECODERS: Dict[str, DecodeRegistration] = {}
@@ -108,21 +141,45 @@ def register_decode(
     name: str,
 
     *,
-    supports_full:    bool               = False,
-    supports_chunked: bool               = False,
-    override:         bool               = False,
-    fused_ce:         'Optional[FusedCECallable]' = None,
+    supports_full:     Optional[bool]              = None,
+    supports_chunked:  bool                        = False,
+    override:          bool                        = False,
+    family_consistent: bool                        = False,
+    fused_ce:          'Optional[FusedCECallable]'      = None,
+    covariance_kinds:  'Optional[FrozenSet[str]]'       = None,
 ) -> 'Callable[[DecodeCallable], DecodeCallable]':
     """Decorator registering a decode kernel under ``name``.
 
-    ``supports_full`` flags a decoder that consumes a full ``(B, N, K, K)`` covariance.
-    ``supports_chunked`` advertises a fused chunked-CE training path, whose callable is ``fused_ce``.
-    The callable and all capabilities are replaced atomically, so an override cannot retain stale
-    routing metadata from the prior registration.
+    ``covariance_kinds`` is the resolved set of family covariance structures the decoder scores.
+    OMITTED -> derive the legacy singleton from ``supports_full`` (``{"full"}`` when True, else
+    ``{"diagonal"}``); SUPPLIED -> derive ``supports_full`` from membership (``"full" in kinds``) and
+    reject an explicitly contradictory legacy ``supports_full``. Every existing
+    ``register_decode(..., supports_full=True|False)`` call therefore keeps its old behavior.
+    ``family_consistent`` marks a decoder that reads logits out through the CONFIGURED family and
+    divergence functional. ``supports_chunked`` advertises a fused chunked-CE training path, whose
+    callable is ``fused_ce``. The callable and all capabilities are replaced atomically, so an
+    override cannot retain stale routing metadata from the prior registration.
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
     existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
     """
+    if covariance_kinds is None:
+        resolved_full  = bool(supports_full) if supports_full is not None else False
+        resolved_kinds = frozenset({"full"} if resolved_full else {"diagonal"})
+    else:
+        resolved_kinds = frozenset(covariance_kinds)
+        if not resolved_kinds or not resolved_kinds <= {"diagonal", "full"}:
+            raise ValueError(
+                f"decode mode {name!r} covariance_kinds must be a nonempty subset of "
+                f"{{'diagonal', 'full'}}, got {sorted(resolved_kinds)}"
+            )
+        resolved_full = "full" in resolved_kinds
+        if supports_full is not None and bool(supports_full) != resolved_full:
+            raise ValueError(
+                f"decode mode {name!r} has contradictory metadata: supports_full={supports_full} "
+                f"but covariance_kinds={sorted(resolved_kinds)} implies supports_full={resolved_full}"
+            )
+
     def _wrap(fn: 'DecodeCallable') -> 'DecodeCallable':
         if name in _DECODERS and not override:
             raise KeyError(f"decode mode {name!r} already registered; pass override=True to replace")
@@ -133,9 +190,11 @@ def register_decode(
             )
         _DECODERS[name] = DecodeRegistration(
             callable=fn,
-            supports_full=supports_full,
+            supports_full=resolved_full,
             supports_chunked=supports_chunked,
             fused_ce=fused_ce,
+            family_consistent=family_consistent,
+            covariance_kinds=resolved_kinds,
         )
         return fn
     return _wrap
@@ -182,6 +241,8 @@ class PriorBank(nn.Module):
         eps:                 float = 1e-6,
         diagonal_covariance: bool  = True,
         family:              str   = "gaussian_diagonal",
+        divergence_family:   str   = "renyi",
+        renyi_order:         float = 1.0,
         use_prior_bank:      bool  = True,
         decode_bias:         bool  = False,
         encode_mode:         str   = "per_token",
@@ -258,6 +319,13 @@ class PriorBank(nn.Module):
         # Cholesky tables (SPD covariance), else the diagonal log-variance tables. The vocabulary
         # prior and decode variance tables stay diagonal in EVERY family (PB-11).
         self.family = family
+        # divergence_family / renyi_order drive the family-consistent decode kernels
+        # (decode_mode='family'/'family_chunked'): logits = -D_configured(q||p_v)/tau_eff scored
+        # through get_functional(divergence_family) at alpha=renyi_order. The fast gaussian kernels
+        # (diagonal/full) ignore them (they hardcode gaussian alpha=1 KL); config only pairs those
+        # with a canonical gaussian/renyi/alpha=1 seam. Defaults reproduce the old fixed-KL readout.
+        self.divergence_family = divergence_family
+        self.renyi_order = renyi_order
         self._s_cov_kind = family_cov_kind(family)
         self.use_prior_bank = use_prior_bank
         self.encode_mode = encode_mode
@@ -727,31 +795,26 @@ class PriorBank(nn.Module):
 
         *,
         tau:     Optional[float] = None,  # override decode_tau; None -> self.decode_tau
-    ) -> torch.Tensor:                   # (B, N, V) logits = -KL(q || pi_v)/tau_eff
-        r"""Divergence-agnostic reference decode: -KL(q_i || pi_v)/tau_eff via the seam.
+    ) -> torch.Tensor:                   # (B, N, V) logits = -D_configured(q || pi_v)/tau_eff
+        r"""Authoritative reference decode: -D_configured(q_i || pi_v)/tau_eff via the seam.
 
-        Broadcasts the ``divergence.kl`` seam over the vocabulary V (general but slow,
-        O(B*N*V*K)). The fused ``diagonal`` kernel is pinned to this exactly and under
-        log-softmax; a new divergence family needs no decode edit (only the seam call).
+        Dispatches through the CONFIGURED family (``self.family``) and divergence functional
+        (``self.divergence_family`` at ``self.renyi_order``), broadcasting the seam over the
+        vocabulary V in one shot (general but slow, O(B*N*V*K)). This is the same computation the
+        registered ``family`` kernel performs, so it stays the oracle for the fast canonical kernels:
+        for a canonical gaussian + renyi + alpha=1 config it equals the fused ``diagonal``/``full``
+        kernels exactly (and under log-softmax); for a non-Gaussian family or a noncanonical
+        divergence it reads the belief out under the SAME geometry the E-step minimized.
 
-        The seam is invoked with ``kl_max=inf``: a DECODE must preserve the full KL
-        ranking over the vocabulary, so the divergence saturation policy (default
-        ``kl_max=100``, which flattens every distant prior to a single -100 logit and
-        destroys the argmax) is disabled here. The fused kernel computes the unclamped
-        -KL/tau_eff, so both decode paths agree across the whole input domain, not only
-        where KL < 100. (``nan_to_num`` inside ``safe_kl_clamp`` still maps NaN/+inf
-        from degenerate pairs to +inf -> -inf logits.)
+        The seam is invoked with ``kl_max=inf``: a DECODE must preserve the full divergence ranking
+        over the vocabulary, so the saturation policy (default ``kl_max=100``, which flattens every
+        distant prior to a single -100 logit and destroys the argmax) is disabled here. The full q is
+        scored against the intentionally DIAGONAL vocabulary-prior table (promoted with diag_embed
+        only for a full family). (``nan_to_num`` inside ``safe_kl_clamp`` still maps NaN/+inf from
+        degenerate pairs to +inf -> -inf logits.)
         """
         tau_eff = self._tau_eff(tau)
-        mu_v = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
-        sigma_v = bounded_variance_from_log(
-            self._decode_sigma_log_table(), eps=self.eps,
-        )                                                                         # (V, K)
-        mu_q_b = mu_q.unsqueeze(-2)                                      # (B, N, 1, K)
-        sigma_q_b = sigma_q.unsqueeze(-2)                               # (B, N, 1, K)
-        diag = get_family("gaussian_diagonal")
-        kl_v = kl(diag(mu_q_b, sigma_q_b), diag(mu_v, sigma_v), kl_max=float("inf"))  # (B, N, V), unclamped
-        logits = -kl_v / tau_eff
+        logits = _decode_family(self, mu_q, sigma_q, tau_eff)           # configured family/divergence
         if self.decode_unigram_prior:
             logits = logits + self._unigram_bias()                       # same seam as decode()
         return logits
@@ -1159,6 +1222,104 @@ class PriorBank(nn.Module):
             ce = ce + z_loss_weight * (logsumexp_v ** 2 * valid).sum() / valid.sum().clamp_min(1)
         return ce
 
+    def decode_ce_family_chunked(
+        self,
+        mu_q:    torch.Tensor,           # (B, N, K) posterior means
+        sigma_q: torch.Tensor,           # (B, N, K) or (B, N, K, K) posterior (co)variances
+        targets: torch.Tensor,           # (B, N) next-token ids (-100 = ignore)
+
+        *,
+        z_loss_weight: float           = 0.0,   # z-loss coefficient on mean(logsumexp^2); 0.0 = OFF
+        tau:           Optional[float] = None,   # override decode_tau; None -> self.decode_tau
+        chunk_size:    Optional[int]   = None,   # vocab-chunk width; None -> self.decode_chunk_size
+        ignore_index:  int             = -100,
+    ) -> torch.Tensor:                   # () scalar mean cross-entropy
+        r"""Fused chunked-vocab cross-entropy for the FAMILY-consistent decode (``decode_mode=
+        'family_chunked'``) WITHOUT the dense (B, N, V) logits.
+
+        The family-consistent twin of ``decode_ce_diagonal_chunked``: each vocab chunk streams
+        through the SAME registered functional ``get_functional(self.divergence_family)`` at
+        ``alpha=self.renyi_order`` (logits = -D_configured(q || pi_v)/tau_eff, ``kl_max=inf``) and the
+        same fused log-sum-exp/gather reduction inside a gradient checkpoint, so the (B, N, V) tensor
+        is never materialized. The vocabulary prior table is DIAGONAL; a FULL family promotes each
+        chunk with ``diag_embed`` and materializes only a (B, N, Vc, K, K) functional workspace inside
+        the checkpoint (never a full SPD vocabulary table). Value/gradient-equal to the dense
+        ``family`` decode -> cross-entropy. The unigram-prior chunk-slice add and the z_loss_weight
+        term follow ``decode_ce_diagonal_chunked`` (see there); both default OFF.
+        """
+        tau_eff = self._tau_eff(tau)
+        chunk = self.decode_chunk_size if chunk_size is None else chunk_size
+        V = self.vocab_size
+
+        family_cls = get_family(self.family)
+        is_full = family_cls.cov_kind == "full"
+        functional = get_functional(self.divergence_family)
+
+        sigma_v_all = bounded_variance_from_log(
+            self._decode_sigma_log_table(), eps=self.eps,
+        )                                                                             # (V, K) diagonal prior
+        mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
+        u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
+
+        q_mu = mu_q.unsqueeze(-2)                                            # (B, N, 1, K)
+        q_sigma = sigma_q.unsqueeze(-3 if is_full else -2)                   # (B, N, 1, K[, K])
+
+        def _chunk_summaries(q_mu_:   torch.Tensor, q_sigma_:   torch.Tensor,
+                             mu_v_c:  torch.Tensor, sigma_v_c:  torch.Tensor,
+                             in_chunk_f: torch.Tensor, local_idx: torch.Tensor,
+                             u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
+            r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
+
+            The functional workspace ((B, N, Vc) diagonal / (B, N, Vc, K, K) full) is born and dies
+            here so checkpointing frees it after forward; recompute is deterministic (the functional
+            has no RNG), so value and gradient match the dense family decode exactly.
+            """
+            q = family_cls(q_mu_, q_sigma_)
+            p = family_cls(mu_v_c, sigma_v_c)
+            energy = functional(q, p, alpha=self.renyi_order,
+                                kl_max=float("inf"), eps=self.eps)         # (B, N, Vc)
+            logit_chunk = -energy / tau_eff                                # (B, N, Vc)
+            if u_c is not None:
+                logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
+            lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
+            gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
+            return lse_chunk, gathered * in_chunk_f                        # zero where target not in chunk
+
+        valid = targets != ignore_index                                    # (B, N) bool
+        lse_chunks = []
+        target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)  # (B, N)
+
+        for v0 in range(0, V, chunk):
+            v1 = min(v0 + chunk, V)
+            mu_v_c = mu_v_all[v0:v1]                                       # (Vc, K)
+            sigma_v_c = (torch.diag_embed(sigma_v_all[v0:v1]) if is_full
+                         else sigma_v_all[v0:v1])                          # (Vc, K[, K]) diag-embedded if full
+            u_c = u_all[v0:v1] if u_all is not None else None              # (Vc,) or None
+            in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
+            in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
+            local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
+            if torch.is_grad_enabled() and (mu_q.requires_grad or mu_v_all.requires_grad):
+                lse_chunk, contrib = _checkpoint.checkpoint(
+                    _chunk_summaries, q_mu, q_sigma, mu_v_c, sigma_v_c, in_chunk_f, local_idx,
+                    u_c, use_reentrant=False,
+                )
+            else:
+                lse_chunk, contrib = _chunk_summaries(
+                    q_mu, q_sigma, mu_v_c, sigma_v_c, in_chunk_f, local_idx, u_c
+                )
+            lse_chunks.append(lse_chunk)
+            target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
+
+        logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
+        ce_per_pos = logsumexp_v - target_logit                            # (B, N) = -log-softmax at target
+        # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
+        # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
+        ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
+        if z_loss_weight > 0.0:
+            # z-loss on the streamed log Z (see decode_ce_diagonal_chunked); 0.0 guard = byte-identical.
+            ce = ce + z_loss_weight * (logsumexp_v ** 2 * valid).sum() / valid.sum().clamp_min(1)
+        return ce
+
 
 EncodeCallable = Callable[[PriorBank, torch.Tensor], BeliefState]
 DecodeCallable = Callable[
@@ -1409,6 +1570,70 @@ def _decode_full_chunked(
     per_pos = pb.K + logdet_q.unsqueeze(-1)                              # (B, N, 1) = K + log|Sigma_q|
     kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0)                        # (B, N, V); KL>=0 floor matches
     return -kl_v / tau_eff                                               # _decode_diagonal (audit 2026-07-05 m5)
+
+
+@register_decode(
+    "family",
+    covariance_kinds=frozenset({"diagonal", "full"}),
+    family_consistent=True,
+)
+def _decode_family(
+    pb:      PriorBank,
+    mu_q:    torch.Tensor,               # (B, N, K) posterior means
+    sigma_q: torch.Tensor,               # (B, N, K) or (B, N, K, K) posterior (co)variances
+    tau_eff: torch.Tensor,               # () effective temperature
+) -> torch.Tensor:                       # (B, N, V) logits = -D_configured(q || pi_v)/tau_eff
+    r"""Family/divergence-consistent decode (PB-14): logits = -D_configured(q_i || pi_v)/tau_eff.
+
+    Scores the posterior q_i against every vocabulary prior pi_v through the CONFIGURED belief family
+    ``pb.family`` and divergence functional ``pb.divergence_family`` at ``alpha=pb.renyi_order``, so
+    the readout matches the E-step geometry rather than a hardcoded gaussian alpha=1 KL. As in the
+    other decode kernels the seam is invoked with ``kl_max=inf`` (a DECODE must preserve the full
+    divergence ranking over the vocabulary). The vocabulary prior table is intentionally DIAGONAL in
+    every family (PB-11); a full family promotes it with ``diag_embed`` so a full q is scored against
+    a diagonal-as-full prior. Broadcasting the functional over V materializes a (B, N, V) energy
+    (a full family a (B, N, V, K, K) workspace): general but O(B*N*V*...); the training memory win is
+    the fused CE twin ``decode_ce_family_chunked``. For a canonical gaussian + renyi + alpha=1 config
+    this equals the fast ``diagonal``/``full`` kernels (and ``reference_decode`` is pinned to it)."""
+    family_cls = get_family(pb.family)
+    q_sigma = sigma_q.unsqueeze(-3 if family_cls.cov_kind == "full" else -2)
+    q = family_cls(mu_q.unsqueeze(-2), q_sigma)
+    p_sigma_diag = bounded_variance_from_log(
+        pb._decode_sigma_log_table(), eps=pb.eps
+    )                                                                       # (V, K) diagonal prior variances
+    p_sigma = (
+        torch.diag_embed(p_sigma_diag)
+        if family_cls.cov_kind == "full"
+        else p_sigma_diag
+    )                                                                       # (V, K) or (V, K, K)
+    p = family_cls(pb._decode_mu_table(), p_sigma)
+    functional = get_functional(pb.divergence_family)
+    energy = functional(q, p, alpha=pb.renyi_order,
+                        kl_max=float("inf"), eps=pb.eps)                    # (B, N, V)
+    return -energy / tau_eff
+
+
+@register_decode(
+    "family_chunked",
+    covariance_kinds=frozenset({"diagonal", "full"}),
+    family_consistent=True,
+    supports_chunked=True,
+    fused_ce=PriorBank.decode_ce_family_chunked,
+)
+def _decode_family_chunked(
+    pb:      PriorBank,
+    mu_q:    torch.Tensor,               # (B, N, K) posterior means
+    sigma_q: torch.Tensor,               # (B, N, K) or (B, N, K, K) posterior (co)variances
+    tau_eff: torch.Tensor,               # () effective temperature
+) -> torch.Tensor:                       # (B, N, V) logits = -D_configured(q || pi_v)/tau_eff
+    r"""Inference (targets=None) decode for ``decode_mode='family_chunked'``: full family logits.
+
+    The chunked mode's training memory win is the FUSED decode+CE in ``decode_ce_family_chunked``
+    (it never forms (B, N, V)). When ``decode`` is called for logits (sampling / generation /
+    inference), correctness is what matters, so this delegates to the exact ``family`` kernel --
+    the returned logits are byte-identical to ``decode_mode='family'``.
+    """
+    return _decode_family(pb, mu_q, sigma_q, tau_eff)
 
 
 @register_decode(

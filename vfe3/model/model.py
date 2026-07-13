@@ -220,6 +220,10 @@ class VFEModel(nn.Module):
             decode_tau=cfg.decode_tau, eps=cfg.eps,
             diagonal_covariance=cfg.diagonal_covariance,
             family=cfg.family,
+            # divergence_family/renyi_order feed the family-consistent decode kernels
+            # (decode_mode='family'/'family_chunked'), so the readout scores the SAME divergence the
+            # E-step minimized (PB-14). The fast gaussian kernels ignore them.
+            divergence_family=cfg.divergence_family, renyi_order=cfg.renyi_order,
             use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
