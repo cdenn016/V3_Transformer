@@ -38,7 +38,6 @@ from vfe3.geometry.transport import (
     build_transport_from_element,
     compute_transport_operators,
     get_transport,
-    transport_covariance,
     transport_mean,
 )
 from vfe3.gradients.kernels import belief_gradients, mm_exact_update, uses_kernel_route
@@ -461,23 +460,26 @@ def free_energy_value(
             q_sign = belief.reflection if belief.reflection is not None else torch.ones_like(belief.phi[..., 0])
             k_sign = key_belief.reflection if key_belief.reflection is not None else torch.ones_like(keys.phi[..., 0])
             omega = _apply_reflection(omega, q_sign, key_reflection=k_sign)
+    fam = get_family(family)
     mu_tv = sigma_tv = None
     if rope is not None:
         # Mirror the model path: R_i Omega_ij R_j^T on the means (and the covariance sandwich
         # under the full gauge). The Rope einsums are rank-agnostic, so no unsqueeze dance.
         wrapped = RopeTransport(base=omega, rope=rope, on_cov=rope_on_cov, on_value=rope_on_value)
         mu_t = transport_mean(wrapped, key_belief.mu)
-        sigma_t = transport_covariance(wrapped, key_belief.sigma)
+        sigma_t = fam.transport_dispersion(key_belief.sigma, wrapped)
         if not rope_on_value:
             # Diagnostic fidelity: log the DECOUPLED F the beliefs actually descend -- beta from the
             # rotated SCORE energy (mu_t/sigma_t), coupling sum from the UN-rotated base VALUE energy.
             mu_tv = transport_mean(wrapped.base, key_belief.mu)
-            sigma_tv = transport_covariance(wrapped.base, key_belief.sigma)
+            sigma_tv = fam.transport_dispersion(key_belief.sigma, wrapped.base)
     else:
         mu_t = transport_mean(omega.unsqueeze(0), key_belief.mu.unsqueeze(0))[0]
-        sigma_t = transport_covariance(omega.unsqueeze(0), key_belief.sigma.unsqueeze(0))[0]
+        sigma_t = fam.transport_dispersion(
+            key_belief.sigma.unsqueeze(0),
+            omega.unsqueeze(0),
+        )[0]
 
-    fam = get_family(family)
     sd = self_divergence_for_alpha(fam(belief.mu, belief.sigma), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max,
                                    eps=eps, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     alpha, reg = self_coupling_alpha(sd, value=value, mode=lambda_alpha_mode, b0=b0, c0=c0)
@@ -588,9 +590,9 @@ def phi_alignment_loss(
                                    transport_mean_per_head=transport_mean_per_head,
                                    compact_phi_block_transport=compact_phi_block_transport,
                                    rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value)
-    mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
-    sigma_t = transport_covariance(omega, sigma)
     fam = get_family(family)
+    mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
+    sigma_t = fam.transport_dispersion(sigma, omega)
     score_energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=renyi_order,
                                    kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                    irrep_dims=group.irrep_dims)
@@ -602,7 +604,7 @@ def phi_alignment_loss(
     has_decoupled_value = isinstance(omega, RopeTransport) and not omega.on_value
     if has_decoupled_value:
         mu_tv = transport_mean(omega.base, mu)
-        sigma_tv = transport_covariance(omega.base, sigma)
+        sigma_tv = fam.transport_dispersion(sigma, omega.base)
         value_energy = pairwise_energy(fam(mu, sigma), fam(mu_tv, sigma_tv), alpha=renyi_order,
                                        kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                        irrep_dims=group.irrep_dims)

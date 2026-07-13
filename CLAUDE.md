@@ -54,7 +54,12 @@ This V3 is a production quality gauge-theoretic VFE transformer that allows clea
   stack, so (unlike (5), which enters only the E-step tangent) it trains under `unroll` AND
   `straight_through` and is frozen ONLY by the fully-detached E-step (effective `detach`); as the
   FINAL norm it trains under any estimator. (`learnable_r`, `pos_phi='learned'` are the other
-  default-OFF learned-scalar/table toggles in the same family.)
+  default-OFF learned-scalar/table toggles in the same family.) (7)
+  `query_adaptive_tau=True` with `query_tau_c>0` is an opt-in, noncompact GL(K)-breaking baseline:
+  its per-query scale uses the bare block trace `tr(Sigma_h)`, and
+  `tr(g_h Sigma_h g_h^T) != tr(Sigma_h)` for a general non-orthogonal frame. It is invariant for
+  orthogonal gauges; `query_tau_c=0` or `query_adaptive_tau=False` retains the pure base-temperature
+  path.
 - NO CLI arg parsing; entry points are click-to-run (edit config dicts, then run).
 - float32 throughout; CUDA where applicable (user has an RTX 5090).
 - High modularity: a config-selected registry behind every seam (divergence,

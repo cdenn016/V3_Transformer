@@ -25,9 +25,25 @@ def _press_slopes(
     device:  'torch.device | str | None',
     dtype:   torch.dtype,
 ) -> torch.Tensor:                          # (H,)
-    r"""Press et al. geometric per-head ALiBi slopes: slope_h = base * 2^(-8*h / n_heads)."""
-    h = torch.arange(1, n_heads + 1, device=device, dtype=dtype)
-    return base * torch.pow(2.0, -8.0 * h / n_heads)
+    r"""Reference Press et al. ALiBi slopes, including non-power-of-two head counts.
+
+    For a power-of-two ``H``, ``slope_h = 2^(-8h/H)``. Otherwise the reference construction
+    concatenates the nearest lower-power-of-two schedule with the even-indexed entries of the
+    next power-of-two schedule. ``base`` scales the completed reference schedule.
+    """
+    if n_heads < 1:
+        raise ValueError(f"n_heads must be positive, got {n_heads}")
+
+    def _power_of_two_slopes(count: int) -> torch.Tensor:
+        h = torch.arange(1, count + 1, device=device, dtype=dtype)
+        return torch.pow(2.0, -8.0 * h / count)
+
+    closest_power = 1 << (n_heads.bit_length() - 1)
+    slopes = _power_of_two_slopes(closest_power)
+    if closest_power != n_heads:
+        extra = _power_of_two_slopes(2 * closest_power)[::2][:n_heads - closest_power]
+        slopes = torch.cat((slopes, extra), dim=0)
+    return base * slopes
 
 
 _PRIORS: Dict[str, Callable] = {}
@@ -124,8 +140,8 @@ def prior_alibi(
 ) -> torch.Tensor:
     r"""ALiBi prior with per-head Press et al. slopes: B_hij = -slope_h * |i - j|.
 
-    Returns shape ``(H, N_q, N_k)`` where ``H = n_heads`` and
-    ``slope_h = alibi_slope * 2^(-8*h / n_heads)`` (h = 1..H).
+    Returns shape ``(H, N_q, N_k)`` where ``H = n_heads`` and the per-head slopes follow
+    Press et al.'s reference power-of-two schedule plus its non-power-of-two interpolation.
     """
     i      = torch.arange(n_query, device=device).unsqueeze(-1)
     j      = torch.arange(n_key,   device=device).unsqueeze(0)
@@ -148,8 +164,8 @@ def prior_causal_alibi(
 ) -> torch.Tensor:
     r"""Causal + ALiBi prior (Press et al. 2022 faithful, autoregressive form), per head.
 
-    Returns shape ``(H, N_q, N_k)`` where ``H = n_heads``.  Each head h has slope
-    ``alibi_slope * 2^(-8*h / n_heads)``; the causal mask is applied uniformly across heads:
+    Returns shape ``(H, N_q, N_k)`` where ``H = n_heads``. Each head uses Press et al.'s
+    reference slope schedule; the causal mask is applied uniformly across heads:
 
         B_hij = -slope_h * |i - j|   for j <= i   (allowed lower triangle),
         B_hij = -inf                  for j >  i   (causal mask).

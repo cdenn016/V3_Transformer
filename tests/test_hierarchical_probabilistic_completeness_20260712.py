@@ -681,7 +681,6 @@ from vfe3.free_energy import pairwise_energy as _pairwise_energy                
 from vfe3.geometry.transport import (                                           # noqa: E402
     _TRANSPORT_NEEDS_MU,
     _TRANSPORT_NEEDS_SIGMA,
-    transport_covariance as _transport_covariance,
     transport_mean as _transport_mean,
 )
 from vfe3.inference.e_step import build_belief_transport as _build_belief_transport  # noqa: E402
@@ -734,7 +733,8 @@ def _gamma_e_s_reference(m, tok, phi, *, mu_state, sigma_state):
     s_mu, s_sigma = m.prior_bank.encode_s(tok)
     omega = _transport_from_state(m, phi, mu_state=mu_state, sigma_state=sigma_state)
     s_mu_t = _transport_mean(omega, s_mu)
-    s_sigma_t = _transport_covariance(omega, s_sigma, diagonal_out=(s_sigma.dim() == s_mu.dim()))
+    s_sigma_t = fam.transport_dispersion(
+        s_sigma, omega, diagonal_out=(s_sigma.dim() == s_mu.dim()))
     return _pairwise_energy(fam(s_mu, s_sigma), fam(s_mu_t, s_sigma_t),
                             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                             divergence_family=cfg.divergence_family,
@@ -749,7 +749,8 @@ def _belief_channel_energy(m, tok, phi):
     enc = m.prior_bank.encode(tok)
     omega = _transport_from_state(m, phi, mu_state=enc.mu, sigma_state=enc.sigma)
     q_mu_t = _transport_mean(omega, enc.mu)
-    q_sigma_t = _transport_covariance(omega, enc.sigma, diagonal_out=(enc.sigma.dim() == enc.mu.dim()))
+    q_sigma_t = fam.transport_dispersion(
+        enc.sigma, omega, diagonal_out=(enc.sigma.dim() == enc.mu.dim()))
     return _pairwise_energy(fam(enc.mu, enc.sigma), fam(q_mu_t, q_sigma_t),
                             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                             divergence_family=cfg.divergence_family,

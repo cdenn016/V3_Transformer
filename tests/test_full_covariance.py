@@ -125,16 +125,16 @@ def test_full_renyi_alpha_gt1_nonpd_blend_clamps_to_kl_max():
     assert div.item() > 50.0                                       # ~kl_max, NOT the spurious ~0
 
 
-def test_full_entropy_survives_non_pd_covariance():
-    # FullGaussian.entropy must use the same safe (jittered, never-raising) Cholesky as the full-cov
-    # KL: a raw torch.linalg.cholesky on a numerically non-PD Sigma raises and kills a diagnostics
-    # / entropy call. Mirrors test_full_kl_survives_non_pd_covariance for the entropy path.
+def test_full_entropy_marks_non_pd_covariance_invalid():
+    # FullGaussian.entropy must use safe_cholesky without reporting a finite-but-wrong entropy when
+    # every jitter round fails.  Its sibling log_partition_at path propagates NaN under the same
+    # condition, while the valid-SPD path remains finite.
     from vfe3.families.gaussian import FullGaussian
     K = 4
     mu = torch.zeros(2, K)
     bad = torch.eye(K).clone(); bad[0, 0] = -1.0                 # negative eigenvalue -> not PD
     h = FullGaussian(mu, bad.expand(2, K, K).contiguous()).entropy()   # must NOT raise
-    assert torch.isfinite(h).all()
+    assert torch.isnan(h).all()
 
 
 # ===========================================================================

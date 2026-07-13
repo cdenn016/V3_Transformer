@@ -29,7 +29,7 @@ DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 def test_cov_gap_extractor_runs_and_is_positive():
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=48, embed_dim=8, n_heads=2, max_seq_len=12, n_e_steps=1)
+    cfg = VFE3Config(vocab_size=48, embed_dim=4, n_heads=2, max_seq_len=12, n_e_steps=1)
     model = VFEModel(cfg).to(DEVICE)
     out = attention_entropy_cov_gap(model, torch.randint(0, 48, (1, 12), device=DEVICE))
     per_tok = out["cov_gap_per_token"]
@@ -44,7 +44,7 @@ def test_cov_gap_folds_precision_bias_when_pwa_on():
     -log(b0+trSigma) key bias into beta's prior (as forward/belief_ce_bank do) -- here we exercise
     that path (rank-robust (N,K) sigma) and confirm it runs finite, not the random-init no-op default."""
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=48, embed_dim=8, n_heads=2, max_seq_len=12, n_e_steps=2,
+    cfg = VFE3Config(vocab_size=48, embed_dim=4, n_heads=2, max_seq_len=12, n_e_steps=2,
                      precision_weighted_attention=True, precision_attention_b0=2.0)
     model = VFEModel(cfg).to(DEVICE)
     out = attention_entropy_cov_gap(model, torch.randint(0, 48, (1, 12), device=DEVICE))

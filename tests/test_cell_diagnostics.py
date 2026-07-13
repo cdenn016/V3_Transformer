@@ -25,7 +25,7 @@ DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 def _drifted_mixer_model(gauge_group: str) -> VFEModel:
     """Tiny full-cov model with its head mixer pushed OFF identity (so a gauge break is visible)."""
-    cfg = VFE3Config(vocab_size=64, embed_dim=8, n_heads=2, max_seq_len=8,
+    cfg = VFE3Config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=8,
                      gauge_group=gauge_group, use_head_mixer=True, family="gaussian_full")
     model = VFEModel(cfg).to(DEVICE)
     with torch.no_grad():
@@ -38,7 +38,7 @@ def test_builder_residual_distinguishes_tied_from_untied_gauge():
     r"""mix(g.mu, g.Sigma.g^T) == g.mix(.).g^T for IN-group g: holds (eps) under the TIED gauge,
     breaks under the UNTIED per-head gauge of block_glk once the mixer has drifted from I."""
     torch.manual_seed(0)
-    n, k = 5, 8
+    n, k = 5, 4
     mu = torch.randn(n, k, device=DEVICE)
     base = torch.randn(n, k, k, device=DEVICE)
     sigma = base @ base.transpose(-1, -2) + k * torch.eye(k, device=DEVICE)      # SPD full cov
@@ -60,11 +60,11 @@ def test_builder_residual_zero_for_identity_mixer():
     r"""A mixer still at its identity init is trivially equivariant under ANY gauge (no drift,
     no break) -- the residual is exactly zero on both arms."""
     torch.manual_seed(1)
-    n, k = 4, 8
+    n, k = 4, 4
     mu = torch.randn(n, k, device=DEVICE)
     base = torch.randn(n, k, k, device=DEVICE)
     sigma = base @ base.transpose(-1, -2) + k * torch.eye(k, device=DEVICE)
-    cfg = VFE3Config(vocab_size=64, embed_dim=8, n_heads=2, max_seq_len=8,
+    cfg = VFE3Config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=8,
                      gauge_group="block_glk", use_head_mixer=True, family="gaussian_full")
     model = VFEModel(cfg).to(DEVICE)                                 # deltas at zero init
     r = head_mixer_gauge_residual(mu, sigma, model.head_mixer, model.group, seed=0)
@@ -116,7 +116,7 @@ def test_n_e_steps_em_arm_crosses_steps_and_gradient():
 def test_across_layer_trace_includes_rank_one_residual():
     r"""EXP-7: the per-layer belief trace surfaces the Dong rank-one residual r(X) by depth."""
     from vfe3.viz.extract import across_layer_belief_trace
-    cfg = VFE3Config(vocab_size=64, embed_dim=8, n_heads=2, max_seq_len=12, n_layers=3,
+    cfg = VFE3Config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=12, n_layers=3,
                      gauge_group="block_glk", use_head_mixer=True)
     model = VFEModel(cfg).to(DEVICE)
     tr = across_layer_belief_trace(model, torch.randint(0, 64, (1, 12), device=DEVICE))

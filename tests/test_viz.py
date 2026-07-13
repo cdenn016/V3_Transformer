@@ -28,7 +28,6 @@ from vfe3.viz.figures import (
     plot_estep_convergence,
     plot_free_energy_codescent,
     plot_free_energy_decomposition,
-    plot_free_energy_descent,
     plot_gauge_equivariance,
     plot_gauge_head_specialization,
     plot_grad_norm_decomposition,
@@ -241,17 +240,6 @@ def _T():
     return 5, 6, 4, 2          # T, N, K, H
 
 
-def test_plot_free_energy_descent_saves(tmp_path):
-    s = np.arange(10)
-    hist = {"step": s, "self_coupling": np.linspace(20, 5, 10), "belief_coupling": np.linspace(40, 30, 10),
-            "attention_entropy": np.linspace(10, 8, 10), "val_ce": np.linspace(6, 4, 10),
-            "free_energy_total": np.linspace(120, 80, 10)}
-    p = tmp_path / "f1.png"
-    fig = plot_free_energy_descent(hist, lambda_beta=1.0, self_div=torch.rand(20), path=str(p))
-    plt.close(fig)
-    assert _saved_nonempty(p)
-
-
 def _fe_hist(n=30):
     s = np.arange(1, n + 1) * 100
     return {"step": s, "self_coupling": np.full(n, 140.0), "belief_coupling": np.linspace(30, 20, n),
@@ -299,8 +287,7 @@ def test_fe_terms_belief_only_and_entropy_gate():
 
 def test_fe_figures_render_with_model_channel(tmp_path):
     h = _fe_hist_model_channel(30)
-    for fn, name in ((plot_free_energy_descent, "f1mc.png"),
-                     (plot_free_energy_decomposition, "decompmc.png"),
+    for fn, name in ((plot_free_energy_decomposition, "decompmc.png"),
                      (plot_free_energy_codescent, "codescentmc.png")):
         p = tmp_path / name
         fig = fn(h, lambda_beta=1.0, lambda_gamma=0.75, include_attention_entropy=True, path=str(p))

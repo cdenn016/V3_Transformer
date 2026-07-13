@@ -50,7 +50,6 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each
 import copy
 import csv
 import gc
-import hashlib
 import json
 import logging
 import math
@@ -78,6 +77,7 @@ from vfe3.metrics import (
     rank_one_residual,
 )
 from vfe3.model.model import VFEModel
+from vfe3.path_utils import filesystem_slug
 from vfe3.run_artifacts import (
     RunArtifacts,
     _atomic_replace,
@@ -2168,12 +2168,7 @@ def _sanitize(label: str) -> str:
     the RAW label is appended: distinct labels get distinct run dirs, while the map stays
     deterministic in the label so the resume [CACHED] path finds the same dir on re-run.
     """
-    out = label
-    for bad, repl in (("=", "_"), (" ", "_"), ("/", "_"), ("\\", "_"), ("..", "_"), (":", "_")):
-        out = out.replace(bad, repl)
-    out = out.lstrip("._") or "_"
-    h = hashlib.sha1(label.encode("utf-8")).hexdigest()[:8]
-    return f"{out}__{h}"
+    return filesystem_slug(label)
 
 
 def _write_sweep_csv(sweep_dir: Path, results: List[Dict[str, Any]]) -> None:

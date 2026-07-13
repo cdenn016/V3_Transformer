@@ -176,20 +176,37 @@ def generate_figures(
             return None
 
     # ---- expensive model-replay inputs, each guarded (a failure skips only its figures) ----
-    trace       = _safe(lambda: extract.e_step_belief_trace(model, tok, n_iter=n_e_steps), "e_step_belief_trace")
-    layer_trace = _safe(lambda: extract.across_layer_belief_trace(model, tok), "across_layer_belief_trace")
+    # The same-token diagnostics consume one captured forward. If capture itself fails, passing
+    # snapshot=None preserves the previous per-extractor best-effort fallback instead of dropping
+    # every dependent figure.
+    snapshot = _safe(lambda: model.build_diagnostic_snapshot(tok), "diagnostic_snapshot")
+    trace_snapshot = snapshot
+    if (snapshot is not None and n_e_steps is not None
+            and int(n_e_steps) != len(snapshot.trace_states) - 1):
+        trace_snapshot = None
+    trace       = _safe(lambda: extract.e_step_belief_trace(
+        model, tok, n_iter=n_e_steps, snapshot=trace_snapshot), "e_step_belief_trace")
+    layer_trace = _safe(lambda: extract.across_layer_belief_trace(
+        model, tok, snapshot=snapshot), "across_layer_belief_trace")
     bank        = _safe(lambda: extract.belief_bank(model, token_batches, max_sequences=max_sequences), "belief_bank")
-    cstate      = _safe(lambda: extract.converged_state(model, tok), "converged_state")
+    cstate      = _safe(lambda: extract.converged_state(
+        model, tok, snapshot=snapshot), "converged_state")
     ce_bank     = (None if skip_full_vocab else
                    _safe(lambda: extract.belief_ce_bank(model, loader, device=device, max_batches=n_batches),
                          "belief_ce_bank"))   # B1/EXP-3 Sigma_q<->CE join (calibration figures)
-    amaps       = _safe(lambda: model.attention_maps(tok), "attention_maps")
-    per_layer   = _safe(lambda: model.diagnostics_per_layer(tok), "diagnostics_per_layer")
-    health      = _safe(lambda: extract.numerical_health(model, tok), "numerical_health")
-    s_channel   = _safe(lambda: extract.s_channel_refinement(model, tok), "s_channel_refinement")
-    mc_belief   = _safe(lambda: extract.model_channel_belief(model, tok), "model_channel_belief")
-    r_centroid  = _safe(lambda: extract.hyper_prior_centroid(model, tok), "hyper_prior_centroid")
-    h_coupling  = _safe(lambda: extract.hyper_prior_coupling(model, tok), "hyper_prior_coupling")
+    amaps       = _safe(lambda: model.attention_maps(tok, snapshot=snapshot), "attention_maps")
+    per_layer   = _safe(lambda: model.diagnostics_per_layer(
+        tok, snapshot=snapshot), "diagnostics_per_layer")
+    health      = _safe(lambda: extract.numerical_health(
+        model, tok, snapshot=snapshot), "numerical_health")
+    s_channel   = _safe(lambda: extract.s_channel_refinement(
+        model, tok, snapshot=snapshot), "s_channel_refinement")
+    mc_belief   = _safe(lambda: extract.model_channel_belief(
+        model, tok, snapshot=snapshot), "model_channel_belief")
+    r_centroid  = _safe(lambda: extract.hyper_prior_centroid(
+        model, tok, snapshot=snapshot), "hyper_prior_centroid")
+    h_coupling  = _safe(lambda: extract.hyper_prior_coupling(
+        model, tok, snapshot=snapshot), "hyper_prior_coupling")
     mc_bank     = _safe(lambda: extract.model_channel_bank(model, token_batches, max_sequences=max_sequences),
                         "model_channel_bank")
     vstats      = (None if skip_full_vocab else
@@ -244,10 +261,6 @@ def generate_figures(
     _emit("belief_trajectories",
           lambda p: figs.plot_belief_trajectories(trace, layer_trace, path=p),
           trace is not None)
-    for ch in ("mu", "sigma", "phi"):                                 # one UMAP file per belief channel
-        _emit(f"belief_umap_{ch}",
-              lambda p, ch=ch: figs.plot_belief_umap(bank, ch, decode=decode, path=p),
-              bank is not None)
     _emit("belief_category_separation",
           lambda p: figs.plot_belief_category_separation(bank, decode=decode, path=p),
           bank is not None)
@@ -309,10 +322,17 @@ def generate_figures(
           h_coupling is not None)
     model_channels = (("mu", "sigma", "phi")
                       if mc_bank is not None and "phi" in mc_bank else ("mu", "sigma"))
-    for ch in model_channels:                                      # phi is emitted only for independent phi_tilde
-        _emit(f"model_umap_{ch}",
-              lambda p, ch=ch: figs.plot_belief_umap(mc_bank, ch, kind="Model", decode=decode, path=p),
-              mc_bank is not None)
+    with figs.UMAPWorker() as umap_worker:
+        for ch in ("mu", "sigma", "phi"):                         # one UMAP per belief channel
+            _emit(f"belief_umap_{ch}",
+                  lambda p, ch=ch: figs.plot_belief_umap(
+                      bank, ch, decode=decode, umap_worker=umap_worker, path=p),
+                  bank is not None)
+        for ch in model_channels:                                  # phi only for independent phi_tilde
+            _emit(f"model_umap_{ch}",
+                  lambda p, ch=ch: figs.plot_belief_umap(
+                      mc_bank, ch, kind="Model", decode=decode, umap_worker=umap_worker, path=p),
+                  mc_bank is not None)
     # Next-token vocabulary-probability figures (single-arm here; the cross-run K70-vs-K120 contrast
     # is the two-arm vocab_comparison_figures driver). vocab_confusion needs the token decoder for its
     # category bucketing; decode_readout is None (skipped) on the use_prior_bank=True KL-decode path.

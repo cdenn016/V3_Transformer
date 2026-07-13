@@ -25,7 +25,6 @@ Pure measurement functions take aligned per-token 1-D tensors and are device/gra
 import hashlib
 import json
 import os
-import re
 import tempfile
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple
@@ -33,6 +32,7 @@ from typing import Dict, Mapping, Optional, Tuple
 import torch
 
 from vfe3.metrics import cv, spearman_rho
+from vfe3.path_utils import filesystem_slug
 
 
 def spearman_bootstrap_ci(
@@ -148,6 +148,28 @@ def evaluate_sigma_gate(
     every statistic plus a single ``status`` of "PASS"/"FAIL". PASS iff spearman >= ``spearman_min`` and
     its bootstrap CI lower bound exceeds both zero and the permutation floor, the stratified CE is
     monotone, and the sigma-binned ECE < ``ece_max`` (spec Section 4.5)."""
+    if n_strata <= 0 or n_bins <= 0:
+        raise ValueError("n_strata and n_bins must be positive")
+    n_tokens = int(sigma.numel())
+    minimum_tokens = max(n_strata, n_bins)
+    thresholds = dict(spearman_min=spearman_min, ece_max=ece_max, alpha=alpha,
+                      n_strata=n_strata, n_bins=n_bins, n_boot=n_boot, n_perm=n_perm)
+    if n_tokens < minimum_tokens:
+        return dict(
+            n_tokens=n_tokens,
+            sigma_ce_spearman=None,
+            spearman_ci=None,
+            permutation_floor=None,
+            sigma_trace_cv=cv(sigma) if n_tokens >= 2 else 0.0,
+            stratified_ce=dict(sigma_means=[], ce_means=[], monotone=False,
+                               mono_spearman=None),
+            sigma_binned_ece=None,
+            thresholds=thresholds,
+            status="FAIL",
+            failure_reason="insufficient_tokens",
+            minimum_tokens=minimum_tokens,
+        )
+
     rho, ci_lo, ci_hi = spearman_bootstrap_ci(sigma, ce, n_boot=n_boot, alpha=alpha, seed=seed)
     floor = permutation_floor(sigma, ce, n_perm=n_perm, seed=seed)
     strat = sigma_stratified_ce(sigma, ce, n_strata=n_strata)
@@ -155,15 +177,14 @@ def evaluate_sigma_gate(
     passed = bool(rho >= spearman_min and ci_lo > 0.0 and ci_lo > floor
                   and strat["monotone"] and ece < ece_max)
     return dict(
-        n_tokens=int(sigma.numel()),
+        n_tokens=n_tokens,
         sigma_ce_spearman=rho,
         spearman_ci=[ci_lo, ci_hi],
         permutation_floor=floor,
         sigma_trace_cv=cv(sigma) if sigma.numel() >= 2 else 0.0,
         stratified_ce=strat,
         sigma_binned_ece=ece,
-        thresholds=dict(spearman_min=spearman_min, ece_max=ece_max, alpha=alpha,
-                        n_strata=n_strata, n_bins=n_bins, n_boot=n_boot, n_perm=n_perm),
+        thresholds=thresholds,
         status="PASS" if passed else "FAIL",
     )
 
@@ -217,9 +238,7 @@ def write_sigma_gate_artifact(
     # lossy ('ckpt a' / 'ckpt:a' / 'ckpt/a' all map to 'ckpt_a'), so a stable short hash of the
     # RAW id disambiguates: distinct checkpoint_ids never overwrite each other's PASS/FAIL record
     # (mirrors the ablation.py _sanitize C15 fix; audit 2026-07-01 round-3).
-    slug = re.sub(r"[^A-Za-z0-9._-]", "_", checkpoint_id).strip("._") or "artifact"
-    h    = hashlib.sha1(checkpoint_id.encode("utf-8")).hexdigest()[:8]
-    path = os.path.join(out_dir, f"{slug}__{h}.json")
+    path = os.path.join(out_dir, f"{filesystem_slug(checkpoint_id)}.json")
     tmp  = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -227,7 +246,7 @@ def write_sigma_gate_artifact(
             prefix=os.path.basename(path) + ".", suffix=".tmp", delete=False,
         ) as f:
             tmp = f.name
-            json.dump(payload, f, indent=2)
+            json.dump(payload, f, indent=2, allow_nan=False)
         os.replace(tmp, path)
     finally:
         if tmp is not None:

@@ -46,7 +46,7 @@ def test_pos_phi_learned_clamps_beyond_table():
 def test_forward_runs_beyond_max_seq_len(over):
     r"""Every positional scheme must run at N > max_seq_len (the learned arm crashed before the fix)."""
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8, **over)
+    cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, **over)
     model = VFEModel(cfg).to(DEVICE)
     logits = model(torch.randint(0, 32, (1, 16), device=DEVICE))     # N=16 > max_seq_len=8
     assert tuple(logits.shape) == (1, 16, 32) and torch.isfinite(logits).all()

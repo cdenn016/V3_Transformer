@@ -45,7 +45,7 @@ def _supported_ns(**over):
 def _model(**kw):
     # Defaults are the cache-supported regime: n_layers=1, n_e_steps=1, e_phi_lr=0, flat transport,
     # causal belief prior, filtering, gaussian_diagonal + KL. Only dims/seed are pinned here.
-    d = dict(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=16)
+    d = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=16)
     d.update(kw)
     torch.manual_seed(0)
     return VFEModel(VFE3Config(**d))
@@ -54,8 +54,11 @@ def _model(**kw):
 @pytest.mark.parametrize("use_prior_bank", [False, True])   # linear (ring) and KL-to-prior decode
 @pytest.mark.parametrize("L", [1, 3])                        # H = 1 (one-step) and H > 1 (rollout)
 @pytest.mark.parametrize("n_heads", [1, 2])                  # single-block and equal-block (factored) groups
-def test_cached_matches_full_rollout(use_prior_bank, L, n_heads):
-    m = _model(use_prior_bank=use_prior_bank, n_heads=n_heads)
+@pytest.mark.parametrize("attention_prior", ["causal", "causal_alibi", "causal_windowed"])
+def test_cached_matches_full_rollout(use_prior_bank, L, n_heads, attention_prior):
+    prior_kwargs = ({"attention_window": 2} if attention_prior == "causal_windowed" else {})
+    m = _model(use_prior_bank=use_prior_bank, n_heads=n_heads,
+               beta_attention_prior=attention_prior, **prior_kwargs)
     assert cache_supported(m.cfg)                            # the fast path must actually engage here
 
     B, N, Kp, V = 2, 5, 4, m.cfg.vocab_size

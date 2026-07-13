@@ -157,16 +157,16 @@ def test_entropy_matches_reference():
 # ---- gauge-transport honesty (the corrected boundary) ---------------------
 
 def test_transport_permutation_exact_rotation_projects():
-    from vfe3.geometry.transport import transport_covariance
     K = 2
     b = torch.tensor([[1.0, 4.0]])                                  # (1, K) diagonal scale
     perm = torch.tensor([[0.0, 1.0], [1.0, 0.0]]).reshape(1, 1, K, K)   # coord swap (permutation)
-    bt_perm = transport_covariance(perm, b)[0, 0]                   # diag(P diag(b) P^T) = permuted b
+    family = get_family("laplace_diagonal")
+    bt_perm = family.transport_dispersion(b, perm)[0, 0]            # exact |P| b = permuted b
     assert torch.allclose(bt_perm, torch.tensor([4.0, 1.0]), atol=1e-6)
     theta = 0.5
     R = torch.tensor([[math.cos(theta), -math.sin(theta)],
                       [math.sin(theta), math.cos(theta)]]).reshape(1, 1, K, K)
-    bt_rot = torch.sort(transport_covariance(R, b)[0, 0]).values    # diag(R diag(b) R^T): scales mix
+    bt_rot = torch.sort(family.transport_dispersion(b, R)[0, 0]).values   # variance-matched scales mix
     assert not torch.allclose(bt_rot, torch.sort(b[0]).values, atol=1e-3)   # not any permutation of b
 
 
@@ -177,8 +177,8 @@ def test_oracle_gradients_finite_for_laplace():
     from vfe3.gradients.oracle import belief_gradients_autograd
     from vfe3.inference.e_step import build_belief_transport
     torch.manual_seed(0)
-    g = get_group("block_glk")(8, 2)
-    N, K, n_gen = 5, 8, g.generators.shape[0]
+    g = get_group("block_glk")(4, 2)
+    N, K, n_gen = 5, 4, g.generators.shape[0]
     phi = torch.randn(1, N, n_gen) * 0.1
     omega = build_belief_transport(phi, g, transport_mode="flat")
     mu = torch.randn(1, N, K); sigma = torch.rand(1, N, K) + 0.5
@@ -236,7 +236,7 @@ def _F_laplace_filtering(mu_q, sigma_q, mu_p, sigma_p, mu_t, sigma_t, tau, order
 
 
 def _check_oracle_fd(order, atol):
-    from vfe3.geometry.transport import transport_covariance, transport_mean
+    from vfe3.geometry.transport import transport_mean
     from vfe3.gradients.oracle import belief_gradients_autograd
     mu, sigma, mu_p, sigma_p, omega = _oracle_setup()
     tau = 1.5
@@ -244,7 +244,8 @@ def _check_oracle_fd(order, atol):
                                           renyi_order=order, gradient_mode="filtering",
                                           family="laplace_diagonal")
     mu_t = transport_mean(omega.unsqueeze(0), mu.unsqueeze(0))[0]          # frozen keys (filtering)
-    sigma_t = transport_covariance(omega.unsqueeze(0), sigma.unsqueeze(0))[0]
+    family = get_family("laplace_diagonal")
+    sigma_t = family.transport_dispersion(sigma.unsqueeze(0), omega.unsqueeze(0))[0]
 
     # 4th-order central difference: f'(x) = [f(x-2h) - 8 f(x-h) + 8 f(x+h) - f(x+2h)] / (12 h).
     # O(h^4) truncation keeps the FD tight even where the Renyi curvature is high near a coordinate's

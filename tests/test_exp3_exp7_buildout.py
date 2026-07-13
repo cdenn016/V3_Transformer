@@ -32,7 +32,7 @@ DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
 def _tiny_model(**over) -> VFEModel:
-    cfg = VFE3Config(vocab_size=48, embed_dim=8, n_heads=2, max_seq_len=12, n_e_steps=1, **over)
+    cfg = VFE3Config(vocab_size=48, embed_dim=4, n_heads=2, max_seq_len=12, n_e_steps=1, **over)
     return VFEModel(cfg).to(DEVICE)
 
 

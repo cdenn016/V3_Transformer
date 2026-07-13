@@ -15,7 +15,7 @@ import torch
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
-BASE = dict(vocab_size=512, embed_dim=8, n_heads=2, max_seq_len=4, n_layers=1)
+BASE = dict(vocab_size=512, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1)
 
 
 def test_defaults_match_prior_bank_defaults():

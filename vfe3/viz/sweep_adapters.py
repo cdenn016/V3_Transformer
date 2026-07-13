@@ -149,14 +149,15 @@ def pareto_frontier_kwargs(points: List[Dict[str, Any]]) -> Optional[Dict[str, A
     if len(eligible) < _MIN_PARETO_POINTS:
         return None
     ordered = sorted(eligible, key=lambda p: p["n_params"])
-    return {
-        "points": {
-            "bits_per_token": np.array([p["val_bits_per_token_mean"] for p in ordered], dtype=float),
-            "n_params":       np.array([p["n_params"] for p in ordered], dtype=float),
-            "wall_time":      np.array([p["wall_time_mean"] for p in ordered], dtype=float),
-            "label":          [p["label"] for p in ordered],
-        }
+    plot_points = {
+        "bits_per_token": np.array([p["val_bits_per_token_mean"] for p in ordered], dtype=float),
+        "n_params":       np.array([p["n_params"] for p in ordered], dtype=float),
+        "label":          [p["label"] for p in ordered],
     }
+    wall_time = np.array([p.get("wall_time_mean", float("nan")) for p in ordered], dtype=float)
+    if np.all(np.isfinite(wall_time)):
+        plot_points["wall_time"] = wall_time
+    return {"points": plot_points}
 
 
 # =============================================================================

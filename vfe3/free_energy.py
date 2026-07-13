@@ -92,6 +92,9 @@ def query_adaptive_tau(
 
     tr_h the trace of query i's covariance over irrep block h (d_h = block size): an uncertain
     query (large tr Sigma) runs a HOTTER softmax and hedges over keys; a confident one commits.
+    This is an opt-in non-compact-GL(K)-breaking baseline because
+    ``tr(g Sigma g^T) != tr(Sigma)`` for a general non-orthogonal frame. It is invariant for
+    orthogonal gauges and the ``c=0`` path is the gauge-pure base temperature.
     DETACHED state function of the CURRENT belief (``sigma`` is detached here), so no gradient
     flows into the belief through the temperature and the closed-form belief kernel -- which
     consumes tau only through beta = softmax_j(B - E/tau) -- stays exact. The returned per-row

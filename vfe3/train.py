@@ -891,9 +891,38 @@ def _val_diagnostics(
             br = M.head_mixer_gauge_residual(cst["mu"], cst["sigma"], model.head_mixer, model.group,
                                              diagonal=model.cfg.diagonal_covariance)
             out["val_builder_resid"] = float(torch.cat([br["mu_residual"], br["sigma_residual"]]).median())
-        except Exception:                                          # leave NaN; never fail the eval
-            pass
+        except Exception as exc:                                   # leave NaN; never fail the eval
+            logging.getLogger(__name__).warning(
+                "head-mixer builder-residual diagnostic failed (%s); val_builder_resid remains "
+                "unavailable for this evaluation",
+                exc,
+            )
     return out
+
+
+def _save_eval_attention_maps(
+    token_ids: torch.Tensor,                # (B, N) post-step evaluation batch
+
+    model:     VFEModel,
+    artifacts: RunArtifacts,
+    logger:    logging.Logger,
+
+    *,
+    step:      int,
+) -> None:
+    r"""Save beta/gamma maps from one post-step, post-EMA diagnostic snapshot."""
+    tokens = token_ids[:1]
+    snapshot = model.build_diagnostic_snapshot(tokens)
+    artifacts.save_attention_maps(
+        step,
+        model.attention_maps(tokens, snapshot=snapshot),
+        logger=logger,
+    )
+    artifacts.save_gamma_attention_maps(
+        step,
+        model.gamma_attention_maps(tokens, snapshot=snapshot),
+        logger=logger,
+    )
 
 
 class TrainingTerminalState(NamedTuple):
@@ -1223,12 +1252,7 @@ def train(
                 # (audit 2026-07-01 F11). Kept at EVAL cadence (one grid per eval, not per log).
                 if cfg.generate_figures:
                     try:
-                        artifacts.save_attention_maps(step + 1, model.attention_maps(tokens), logger=logger)
-                        artifacts.save_gamma_attention_maps(
-                            step + 1,
-                            model.gamma_attention_maps(tokens),
-                            logger=logger,
-                        )
+                        _save_eval_attention_maps(tokens, model, artifacts, logger, step=step + 1)
                     except Exception as exc:
                         logger.warning("       (attention-map replay failed: %s); continuing", exc)
             if ema is not None:

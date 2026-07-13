@@ -62,8 +62,14 @@ def packed_from_covariance(
     """
     k = covariance.shape[-1]
     row, col = torch.tril_indices(k, k, offset=-1, device=covariance.device)
-    chol, _ = safe_cholesky(covariance, eps=eps, rounds=5)
+    chol, ok = safe_cholesky(covariance, eps=eps, rounds=5)
     diag = torch.diagonal(chol, dim1=-2, dim2=-1)                       # (..., K) = sqrt(variance)
     log_diag = torch.log((diag ** 2).clamp(min=eps))                   # (..., K)
     packed_lower = chol[..., row, col]                                 # (..., K*(K-1)//2)
+    log_diag = torch.where(ok.unsqueeze(-1), log_diag, log_diag.new_tensor(float("nan")))
+    packed_lower = torch.where(
+        ok.unsqueeze(-1),
+        packed_lower,
+        packed_lower.new_tensor(float("nan")),
+    )
     return log_diag, packed_lower

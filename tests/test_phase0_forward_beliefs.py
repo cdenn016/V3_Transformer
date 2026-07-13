@@ -4,11 +4,12 @@ extraction (docs/superpowers/specs/2026-06-28-active-inference-efe-policy-scorer
 The refactor factors the inline belief pipeline of ``VFEModel.forward`` (encode -> pos_phi -> optional
 s-refine -> precision-bias fold -> vfe_stack -> final_norm) into the shared seam ``forward_beliefs``,
 with ``rollout_beliefs`` the public no-grad wrapper the EFE scorer and generate share. It must leave
-``forward`` and ``generate`` byte-identical to HEAD 5e88afc.
+``forward`` and ``generate`` byte-identical to the pre-remediation baseline.
 
 Two complementary guards, mirroring tests/test_perf_equivalence.py's "freeze the pre-refactor numerics"
 discipline:
-  (1) scalar checksums captured from HEAD 5e88afc BEFORE the extraction (the cross-version HEAD pin),
+  (1) scalar checksums rebaselined at K=4 from unmodified `origin/main` 1b58d4f before the
+      2026-07-13 remediation,
       across the configs that exercise every touched branch: (a) inference logits, (b) dense training,
       (c) fused-chunked training, (d) mstep_self_coupling_weight>0, (e) mass_phi>0, (f) linear decode.
   (2) within-version seam invariants asserted bit-exactly with torch.equal (machine-independent): the
@@ -20,17 +21,17 @@ from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
-# --- frozen HEAD 5e88afc checksums (seed 0, the configs/tokens below) ---
-_A_LOGITS_SUM = -0.7388787270        # (a) inference logits, KL-to-prior decode
-_B_LOGITS_SUM = -0.7388787270        # (b) dense-train logits (== inference: same decode)
-_B_LOSS = 2.7725114822               # (b) dense training loss == ce (no mass_phi / mstep)
-_C_LOSS = 2.7725112438               # (c) fused-chunked CE (matches dense to ~1e-6, distinct kernel)
-_D_LOSS = 2.7725152969               # (d) loss WITH mstep self-coupling (> ce)
-_D_CE = 2.7725114822                 # (d) ce unchanged by the mstep term
-_E_LOSS = 2.7725725174               # (e) loss WITH mass_phi penalty (> ce)
-_E_CE = 2.7725114822                 # (e) ce unchanged by mass_phi
-_F_LOGITS_SUM = 0.1353830610         # (f) linear-decode inference logits
-_F_LOSS = 2.7706756592               # (f) linear-decode training loss == ce
+# --- frozen origin/main 1b58d4f K=4 checksums (seed 0, the configs/tokens below) ---
+_A_LOGITS_SUM = -0.3824235201        # (a) inference logits, KL-to-prior decode
+_B_LOGITS_SUM = -0.3824235201        # (b) dense-train logits (== inference: same decode)
+_B_LOSS = 2.7726001740               # (b) dense training loss == ce (no mass_phi / mstep)
+_C_LOSS = 2.7726004124               # (c) fused-chunked CE (matches dense to ~1e-6, distinct kernel)
+_D_LOSS = 2.7726044655               # (d) loss WITH mstep self-coupling (> ce)
+_D_CE = 2.7726001740                 # (d) ce unchanged by the mstep term
+_E_LOSS = 2.7726650238               # (e) loss WITH mass_phi penalty (> ce)
+_E_CE = 2.7726004124                 # (e) ce from the mass-penalty path
+_F_LOGITS_SUM = -0.1151125083        # (f) linear-decode inference logits
+_F_LOSS = 2.7732081413               # (f) linear-decode training loss == ce
 _GEN_GREEDY = [[1, 2, 3, 3, 3, 3, 3, 3]]   # greedy generate (argmax) HEAD pin
 
 _TOK = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 0]])
@@ -40,7 +41,7 @@ _ATOL = 1e-5
 
 
 def _base(**kw) -> VFE3Config:
-    d = dict(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, n_layers=2,
+    d = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=2,
              n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.02, use_prior_bank=True, seed=0)
     d.update(kw)
     return VFE3Config(**d)
@@ -134,7 +135,7 @@ def test_seam_forward_beliefs_equals_forward_inference():
         belief, fb_logits = m.forward_beliefs(_TOK, return_logits=True)
         fwd_logits = m(_TOK)
     assert isinstance(belief, BeliefState)
-    assert belief.mu.shape == (2, 8, 8) and (belief.sigma > 0).all()
+    assert belief.mu.shape == (2, 8, 4) and (belief.sigma > 0).all()
     assert torch.equal(fb_logits, fwd_logits)
     assert m.forward_beliefs(_TOK, return_logits=False)[1] is None
 

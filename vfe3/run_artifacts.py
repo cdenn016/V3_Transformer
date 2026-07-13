@@ -810,7 +810,7 @@ def _git_code_identity(
                 path = repo / os.fsdecode(raw_name)
                 digest.update(raw_name)
                 digest.update(b"\0")
-                digest.update(hashlib.sha256(path.read_bytes()).digest())
+                digest.update(bytes.fromhex(_sha256_file_content(path)))
             identity["git_dirty_fingerprint"] = digest.hexdigest()
     except Exception as exc:
         identity["git_sha"] = None
@@ -818,6 +818,39 @@ def _git_code_identity(
         identity["git_dirty_fingerprint"] = None
         identity["git_error"] = repr(exc)
     return identity
+
+
+def _sha256_file_content(
+    path: Path,
+
+    *,
+    chunk_bytes: int = 1024 * 1024,
+) -> str:
+    """Hash a file without materializing it in memory."""
+    if chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(chunk_bytes), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sha256_tensor_content(
+    tokens: torch.Tensor,
+
+    *,
+    chunk_tokens: int = 128 * 1024,
+) -> str:
+    r"""Hash token values canonically as int64 using bounded device-to-host chunks."""
+    if chunk_tokens <= 0:
+        raise ValueError("chunk_tokens must be positive")
+    flat = tokens.detach().reshape(-1)
+    digest = hashlib.sha256()
+    for start in range(0, flat.numel(), chunk_tokens):
+        chunk = flat[start:start + chunk_tokens].to(device="cpu", dtype=torch.long).contiguous()
+        digest.update(chunk.numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _write_provenance(
@@ -860,8 +893,7 @@ def _write_provenance(
                 # native cache dtype (int32 memmap) or int64 (capped load), and the pooled
                 # data_sha256 feeds scaling_analysis's mixed_corpus gate -- normalize to int64
                 # so identical corpora hash identically regardless of storage width.
-                raw = tokens.detach().to(torch.long).cpu().numpy().tobytes()
-                prov[sha_key] = hashlib.sha256(raw).hexdigest()
+                prov[sha_key] = _sha256_tensor_content(tokens)
                 prov[n_key] = int(tokens.numel())
         except (AttributeError, RuntimeError, TypeError, ValueError, OSError, MemoryError) as exc:
             # Best-effort provenance, narrowed to the realistic hash-path failures (audit
@@ -1631,7 +1663,41 @@ def _save_figures(
 ) -> None:
     r"""Best-effort publication figures from the logged history (no model re-run)."""
     try:
-        from vfe3.viz import figures as figs
+        from vfe3.viz import figures as raw_figs
+
+        class _SafePyplot:
+            r"""Delegate pyplot operations while making a failed renderer's ``None`` close a no-op."""
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(raw_figs.plt, name)
+
+            def close(self, figure: object = None) -> None:
+                if figure is not None:
+                    raw_figs.plt.close(figure)
+
+        class _IsolatedFigures:
+            r"""Proxy plot calls so one failed renderer cannot abort or leak into the next one."""
+
+            def __getattr__(self, name: str) -> object:
+                if name == "plt":
+                    return _SafePyplot()
+                value = getattr(raw_figs, name)
+                if not name.startswith("plot_") or not callable(value):
+                    return value
+
+                def _isolated(*args: object, **kwargs: object) -> object:
+                    before = set(raw_figs.plt.get_fignums())
+                    try:
+                        return value(*args, **kwargs)
+                    except Exception as exc:
+                        for number in set(raw_figs.plt.get_fignums()) - before:
+                            raw_figs.plt.close(number)
+                        logger.warning("figure %s failed (%s); remaining figures continue", name, exc)
+                        return None
+
+                return _isolated
+
+        figs = _IsolatedFigures()
         figs.set_publication_style()
         run = artifacts.run_dir
 

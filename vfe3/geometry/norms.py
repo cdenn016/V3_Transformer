@@ -19,6 +19,8 @@ from typing import Callable, Dict
 import torch
 import torch.nn as nn
 
+from vfe3.numerics import safe_cholesky
+
 _NORMS: Dict[str, Callable] = {}
 
 
@@ -48,8 +50,11 @@ class MahalanobisNorm:
 
     The Mahalanobis scalar ``s2 = mu^T Sigma^-1 mu`` is gauge-invariant under the FULL-covariance
     congruence: with mu->g mu, Sigma->g Sigma g^T it maps to
-    ``mu^T g^T (g Sigma g^T)^-1 g mu = mu^T Sigma^-1 mu`` (the ``linalg.solve`` branch below), so the
-    scale ``sqrt(K/s2)`` is invariant and ``mu_norm`` transforms as a vector. The DIAGONAL branch
+    ``mu^T g^T (g Sigma g^T)^-1 g mu = mu^T Sigma^-1 mu``. The exact SPD solve is evaluated in a
+    float64 island, so the scale ``sqrt(K/s2)`` is invariant up to storage precision and ``mu_norm``
+    transforms as a vector. If exact factorization fails, an explicitly approximate regularized
+    Cholesky/pseudo-inverse fallback keeps the forward finite; that fallback is not gauge-invariant
+    because an isotropic ridge does not transform by congruence. The DIAGONAL branch
     (``sum(mu^2 / sigma)``) is the Mahalanobis form only for a diagonal Sigma: it is invariant under
     the diagonal-scaling subgroup, NOT a general non-diagonal g in GL(K) -- consistent with the
     gaussian_diagonal family being declared non-GL(K)-invariant (groups.check_admissible). Pure math,
@@ -73,15 +78,30 @@ class MahalanobisNorm:
     ) -> torch.Tensor:                   # (..., K) rescaled means
         r"""Rescale ``mu`` by the gauge-invariant Mahalanobis length."""
         if sigma.dim() == mu.dim() + 1:        # full covariance (..., K, K)
-            # eps * I regularization (matching divergence._gaussian_full_renyi) so a
-            # singular / near-singular Sigma does not raise torch._C._LinAlgError and
-            # crash the forward pass; bounds the conditioning the solve sees. Dispatch on the
-            # full-cov rank (mu.dim()+1), mirroring natural_gradient, so a full Sigma can never
-            # fall into the diagonal-only (non-gauge-invariant) formula (audit 2026-06-17).
-            eye = torch.eye(self.K, device=sigma.device, dtype=sigma.dtype)        # (K, K)
-            sigma_reg = sigma + self.eps * eye                                     # (..., K, K)
-            sig_inv_mu = torch.linalg.solve(sigma_reg, mu.unsqueeze(-1)).squeeze(-1)   # Sigma^-1 mu
-            s2 = (mu * sig_inv_mu).sum(dim=-1, keepdim=True)                       # mu^T Sigma^-1 mu
+            # The pure path solves the unmodified SPD covariance in float64. Adding eps*I
+            # unconditionally would change the mathematical object and break exact GL(K)
+            # covariance even in infinite precision. Only elements whose exact Cholesky fails
+            # enter the explicitly approximate jitter/pseudo-inverse fallback.
+            sigma64 = 0.5 * (sigma.double() + sigma.double().transpose(-1, -2))
+            mu64 = mu.double()
+            factor, ok = safe_cholesky(sigma64, rounds=0)
+            exact = torch.cholesky_solve(mu64.unsqueeze(-1), factor).squeeze(-1)
+            if bool(ok.all()):
+                sig_inv_mu = exact
+            else:
+                factor_reg, ok_reg = safe_cholesky(sigma64, eps=self.eps, rounds=5)
+                regularized = torch.cholesky_solve(
+                    mu64.unsqueeze(-1),
+                    factor_reg,
+                ).squeeze(-1)
+                eye = torch.eye(self.K, device=sigma.device, dtype=torch.float64)
+                pseudo = (
+                    torch.linalg.pinv(sigma64 + self.eps * eye)
+                    @ mu64.unsqueeze(-1)
+                ).squeeze(-1)
+                fallback = torch.where(ok_reg.unsqueeze(-1), regularized, pseudo)
+                sig_inv_mu = torch.where(ok.unsqueeze(-1), exact, fallback)
+            s2 = (mu64 * sig_inv_mu).sum(dim=-1, keepdim=True).to(mu.dtype)
         else:                                   # diagonal variances (..., K)
             s2 = (mu ** 2 / sigma.clamp(min=self.eps)).sum(dim=-1, keepdim=True)
         return mu * torch.sqrt(self.K / s2.clamp(min=self.eps))

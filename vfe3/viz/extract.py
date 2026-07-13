@@ -14,7 +14,6 @@ import torch
 import torch.nn.functional as F
 
 from vfe3 import metrics
-from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
 from vfe3.families.base import get_family
 from vfe3.model.block import _as_coeff, e_step_shared_kwargs   # shared cfg->kwargs bag (audit 2026-07-12 N5)
@@ -29,7 +28,7 @@ from vfe3.inference.e_step import _transport, e_step_iteration, free_energy_valu
 # mu/sigma to _transport by membership here, never by matching literal mode names.
 from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.geometry.transport import (CompactFactoredTransport, _TRANSPORT_NEEDS_MU,
-                                     _TRANSPORT_NEEDS_SIGMA, transport_covariance, transport_mean)
+                                     _TRANSPORT_NEEDS_SIGMA, transport_mean)
 from vfe3.model.block import vfe_block
 from vfe3.numerics import bounded_variance_from_log
 
@@ -511,15 +510,15 @@ def numerical_health(
     )
     # Wrap in RopeTransport under pos_rotation='rope' so the reported nan/energy/beta fractions
     # describe the RoPE-rotated belief the model runs, mirroring converged_state/diagnostics (r2 id11).
+    fam = get_family(cfg.family)
     if rope is not None:
         rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                                    on_value=cfg.rope_on_value)
         mu_t    = transport_mean(rope_omega, out.mu)
-        sigma_t = transport_covariance(rope_omega, out.sigma)
+        sigma_t = fam.transport_dispersion(out.sigma, rope_omega)
     else:
         mu_t = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
-        sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
-    fam = get_family(cfg.family)
+        sigma_t = fam.transport_dispersion(out.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
     energy = pairwise_energy(fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.renyi_order,
                              kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
                              irrep_dims=model.group.irrep_dims)
@@ -616,15 +615,15 @@ def converged_state(
             link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             cocycle_relaxation=cfg.cocycle_relaxation,
         )
+        fam = get_family(cfg.family)
         if rope is not None:
             rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                                        on_value=cfg.rope_on_value)
             mu_t    = transport_mean(rope_omega, out.mu)
-            sigma_t = transport_covariance(rope_omega, out.sigma)
+            sigma_t = fam.transport_dispersion(out.sigma, rope_omega)
         else:
             mu_t    = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
-            sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
-        fam = get_family(cfg.family)
+            sigma_t = fam.transport_dispersion(out.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
         energy = pairwise_energy(
             fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.renyi_order,
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
@@ -741,7 +740,13 @@ def attention_entropy_cov_gap(
 
 
 @torch.no_grad()
-def s_channel_refinement(model, token_ids: torch.Tensor) -> Optional[dict]:
+def s_channel_refinement(
+    model,
+    token_ids: torch.Tensor,
+
+    *,
+    snapshot: 'Optional[DiagnosticSnapshot]' = None,
+) -> Optional[dict]:
     r"""Model-channel (s) refinement diagnostics for the ``s_e_step=True`` path (sequence 0).
 
     Returns ``None`` when ``cfg.s_e_step`` is False (the s-channel does not run, so the figure is
@@ -762,12 +767,21 @@ def s_channel_refinement(model, token_ids: torch.Tensor) -> Optional[dict]:
     from vfe3.families.gaussian import DiagonalGaussian
     from vfe3.divergence import get_functional
     cfg, pb = model.cfg, model.prior_bank
-    enc  = pb.encode(token_ids[:1])                                # (1, N, ...)
-    belief_phi = model._apply_pos_phi(enc.phi[0]).unsqueeze(0)     # (1, N, n_gen) belief frame
-    phi0 = model._resolve_model_frame(token_ids[:1], belief_phi)  # (1, N, n_gen) model frame
-    rope = model._rope_rotation(token_ids.shape[1], token_ids.device)
-    s0_mu, s0_sigma = (t[0] for t in pb.encode_s(token_ids[:1]))   # (N, K) static model channel
-    s1_mu, s1_sigma = (t[0] for t in model._refine_s(token_ids[:1], phi0, rope=rope))  # (N, K) refined
+    if snapshot is None:
+        enc  = pb.encode(token_ids[:1])                                # (1, N, ...)
+        belief_phi = model._apply_pos_phi(enc.phi[0]).unsqueeze(0)     # (1, N, n_gen) belief frame
+        phi0 = model._resolve_model_frame(token_ids[:1], belief_phi)  # (1, N, n_gen) model frame
+        rope = model._rope_rotation(token_ids.shape[1], token_ids.device)
+        s0 = pb.encode_s(token_ids[:1])                               # static model channel
+        s1 = model._refine_s(token_ids[:1], phi0, rope=rope)          # refined model channel
+    else:
+        snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
+        s0 = snapshot.s_encoded_belief
+        s1 = snapshot.s_belief
+        if s0 is None or s1 is None:
+            raise RuntimeError("diagnostic snapshot is missing the active model-channel beliefs")
+    s0_mu, s0_sigma = (tensor[0] for tensor in s0)                    # (N, K) static
+    s1_mu, s1_sigma = (tensor[0] for tensor in s1)                    # (N, K) refined
     r_mu    = pb.r_mu.expand_as(s1_mu)                             # (N, K) frozen hyper-prior centroid
     r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps).expand_as(s1_sigma)
     kl = get_functional("renyi")                                  # KL = renyi at alpha=1
@@ -784,7 +798,13 @@ def s_channel_refinement(model, token_ids: torch.Tensor) -> Optional[dict]:
 
 
 @torch.no_grad()
-def model_channel_belief(model, token_ids: torch.Tensor) -> Optional[dict]:
+def model_channel_belief(
+    model,
+    token_ids: torch.Tensor,
+
+    *,
+    snapshot: 'Optional[DiagnosticSnapshot]' = None,
+) -> Optional[dict]:
     r"""Model-channel beliefs s_i = N(s_mu, s_sigma) for sequence 0 (the ``s`` figure).
 
     Returns ``None`` when the model channel is inactive (no s tables). Otherwise looks up the static
@@ -797,7 +817,14 @@ def model_channel_belief(model, token_ids: torch.Tensor) -> Optional[dict]:
     if not model._model_channel_active:
         return None
     cfg, pb = model.cfg, model.prior_bank
-    s_mu, s_sigma = (t[0] for t in pb.encode_s(token_ids[:1]))     # (N, K)
+    if snapshot is None:
+        s_encoded = pb.encode_s(token_ids[:1])
+    else:
+        snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
+        s_encoded = snapshot.s_encoded_belief
+        if s_encoded is None:
+            raise RuntimeError("diagnostic snapshot is missing the active model-channel belief")
+    s_mu, s_sigma = (tensor[0] for tensor in s_encoded)            # (N, K)
     lam = torch.sort(s_sigma.clamp(min=cfg.eps), dim=-1, descending=True).values   # (N, K)
     return {
         "mu_mean":    s_mu.mean(dim=0).cpu(),                      # (K,)
@@ -809,7 +836,13 @@ def model_channel_belief(model, token_ids: torch.Tensor) -> Optional[dict]:
 
 
 @torch.no_grad()
-def hyper_prior_centroid(model, token_ids: torch.Tensor) -> Optional[dict]:
+def hyper_prior_centroid(
+    model,
+    token_ids: torch.Tensor,
+
+    *,
+    snapshot: 'Optional[DiagnosticSnapshot]' = None,
+) -> Optional[dict]:
     r"""The hyper-prior centroid r and how the model channel s clusters around it (the ``r`` figure).
 
     Returns ``None`` when r does not exist (it is created only when lambda_h>0 OR s_e_step). Otherwise
@@ -819,7 +852,14 @@ def hyper_prior_centroid(model, token_ids: torch.Tensor) -> Optional[dict]:
     cfg, pb = model.cfg, model.prior_bank
     if getattr(pb, "r_mu", None) is None:
         return None
-    s_mu, s_sigma = (t[0] for t in pb.encode_s(token_ids[:1]))     # (N, K)
+    if snapshot is None:
+        s_encoded = pb.encode_s(token_ids[:1])
+    else:
+        snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
+        s_encoded = snapshot.s_encoded_belief
+        if s_encoded is None:
+            raise RuntimeError("diagnostic snapshot is missing the active model-channel belief")
+    s_mu, s_sigma = (tensor[0] for tensor in s_encoded)            # (N, K)
     r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps).detach().cpu()  # (K,)
     return {
         "r_mu":         pb.r_mu.detach().cpu(),                                      # (K,)
@@ -831,7 +871,13 @@ def hyper_prior_centroid(model, token_ids: torch.Tensor) -> Optional[dict]:
 
 
 @torch.no_grad()
-def hyper_prior_coupling(model, token_ids: torch.Tensor) -> Optional[dict]:
+def hyper_prior_coupling(
+    model,
+    token_ids: torch.Tensor,
+
+    *,
+    snapshot: 'Optional[DiagnosticSnapshot]' = None,
+) -> Optional[dict]:
     r"""Per-token hyper-prior divergence KL(s_i||r) for sequence 0 (the ``h`` figure: the lambda_h block).
 
     Returns ``None`` when r does not exist. Uses ``model._hyper_prior_kl`` so the plotted per-position
@@ -840,7 +886,13 @@ def hyper_prior_coupling(model, token_ids: torch.Tensor) -> Optional[dict]:
     pb = model.prior_bank
     if getattr(pb, "r_mu", None) is None:
         return None
-    s_belief = model._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
+    if snapshot is None:
+        s_belief = model._refined_s_belief(token_ids)              # s1 under s_e_step; None -> raw
+    else:
+        snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
+        s_belief = snapshot.s_belief
+        if s_belief is None:
+            raise RuntimeError("diagnostic snapshot is missing the active model-channel belief")
     kl = model._hyper_prior_kl(token_ids[:1], s_belief=s_belief)[0]   # (N,)
     return {"kl_s_r": kl.cpu(), "lambda_h": float(model.cfg.lambda_h)}
 

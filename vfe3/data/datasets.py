@@ -10,7 +10,6 @@ The cache holds 1-D token-id streams under
 
 import hashlib
 import json
-import os
 import re
 from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence, Tuple

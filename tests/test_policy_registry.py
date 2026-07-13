@@ -267,7 +267,7 @@ def test_sigma_gate_flag_has_no_executable_consumer(tmp_path):
     ok.write_text(json.dumps({"status": "PASS", "spec_commit": "x"}), encoding="utf-8")
     torch.manual_seed(0)
     m = VFEModel(VFE3Config(
-        vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=16,
+        vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=16,
         policy_mode="efe_one_step", policy_preference="flat",
         policy_sigma_ambiguity_validated=True, policy_sigma_gate_artifact=str(ok)))
     V = m.cfg.vocab_size

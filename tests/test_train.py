@@ -439,7 +439,7 @@ def test_training_smoke_on_real_wikitext2_if_present():
     except FileNotFoundError:
         pytest.skip("wikitext-2 cache absent")
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=50257, embed_dim=8, n_heads=2, max_seq_len=16, n_layers=1,
+    cfg = VFE3Config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=16, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.3, e_phi_lr=0.0,
                      m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.0, warmup_steps=3, max_steps=30)
     model = VFEModel(cfg)

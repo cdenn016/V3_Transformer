@@ -226,7 +226,7 @@ def test_gamma_self_zero_under_identity_transport():
 # ---- (8) config validation + the tau_gamma property ------------------------------------------
 
 def test_tau_gamma_property():
-    cfg = VFE3Config(vocab_size=20, embed_dim=8, n_heads=2, kappa_gamma=2.0)
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, kappa_gamma=2.0)
     assert math.isclose(cfg.tau_gamma, 2.0 * (cfg.d_head ** 0.5))
 
 def test_config_negative_gamma_coupling_raises():

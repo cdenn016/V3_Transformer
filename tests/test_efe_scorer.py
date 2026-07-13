@@ -61,7 +61,7 @@ def test_likelihood_entropy_ambiguity_equals_predictive_entropy():
 # ---------- (2) end-to-end scorer tests on a small model ----------
 
 def _model(**kw):
-    d = dict(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=12, n_layers=2,
+    d = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=12, n_layers=2,
              n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.02, use_prior_bank=False)
     d.update(kw)
     torch.manual_seed(0)

@@ -41,7 +41,7 @@ def test_extract_phi_cached_pinv_matches_none():
 
 # ----------------------------------------------------------------------------- cross_couplings guards
 def _cross_cfg(**kw):
-    base = dict(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=6,
+    base = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=6,
                 gauge_group="block_glk", cross_couplings=[(0, 1)], beta_attention_prior="causal")
     base.update(kw)
     return base

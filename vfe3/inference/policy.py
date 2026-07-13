@@ -485,6 +485,12 @@ def _efe_score(
     closed): a direct scorer call without them raises before the estimator, so a trained nonzero sigma
     cannot be called an ambiguity value without the validated gate. Every other registered ambiguity
     ignores the identities, so existing modes stay source-compatible."""
+    valid_terms = ("risk", "ambiguity", "epistemic")
+    if not score_terms:
+        raise ValueError("score_terms must be nonempty so the EFE policy score remains a Tensor")
+    invalid_terms = tuple(term for term in score_terms if term not in valid_terms)
+    if invalid_terms:
+        raise ValueError(f"score_terms contains unknown EFE terms {invalid_terms}; expected {valid_terms}")
     if ambiguity_mode == "sigma_mc" and (
             model_behavior_sha256 is None or sigma_spec_identity is None
             or sigma_code_identity_sha256 is None or sigma_measurement_context_sha256 is None):
@@ -513,7 +519,7 @@ def _efe_score(
     ambiguity = estimate.expected_conditional_entropy
     epistemic = pred_ent - ambiguity                            # MI bridge; ==0 at v1 (likelihood_entropy)
     terms = {"risk": risk, "ambiguity": ambiguity, "epistemic": -epistemic}
-    score = sum(terms[t] for t in score_terms)
+    score = torch.stack([terms[term] for term in score_terms], dim=0).sum(dim=0)
     post = _policy_posterior(score, gamma, log_prior)
     return PolicyScore(score, risk, ambiguity, epistemic, log_prob, post)
 

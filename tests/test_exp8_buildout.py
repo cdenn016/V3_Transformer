@@ -28,7 +28,7 @@ DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 def _natgrad_opt_with_grads(precond_mode: str) -> GaugeNaturalGradAdamW:
     r"""A GaugeNaturalGradAdamW with phi_embed.grad populated by one backward pass."""
-    cfg = VFE3Config(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8,
+    cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8,
                      gauge_group="block_glk", m_phi_natural_grad=True,
                      phi_precond_mode=precond_mode, m_phi_lr=0.01, e_phi_lr=0.0)
     torch.manual_seed(0)
@@ -87,7 +87,7 @@ def test_gauge_diag_silent_when_flag_off():
 
 def test_wall_clock_column_in_metrics(tmp_path):
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=4,
+    cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
                      log_interval=2, eval_interval=2, batch_size=2)
     model = VFEModel(cfg).to(DEVICE)
     batches = [(torch.randint(0, 32, (2, 8), device=DEVICE),
@@ -106,7 +106,7 @@ def test_gauge_diag_columns_rectangular_through_train(tmp_path):
     metrics.csv, present in EVERY row (the fixed-key-set / NaN-default contract; log_metrics locks
     fieldnames on row 0, so a key first appearing later would break the CSV)."""
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=4,
+    cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
                      log_interval=2, eval_interval=2, batch_size=2, gauge_group="block_glk",
                      m_phi_natural_grad=True, phi_precond_mode="pullback_per_block",
                      m_phi_lr=0.01, e_phi_lr=0.0)

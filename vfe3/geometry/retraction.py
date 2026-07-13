@@ -183,9 +183,12 @@ def retract_spd_diagonal(
     eps:          float          = 1e-6,
     sigma_max:    Optional[float] = 10.0,   # matches VFE3Config.sigma_max
 ) -> torch.Tensor:
-    r"""Diagonal SPD retraction sigma_new = sigma * exp(tau * clamp(dsigma/sigma)).
+    r"""Diagonal SPD retraction sigma_new = sigma * exp(R), R = tau dsigma/sigma.
 
-    Positivity by construction (exp > 0); clamped to [eps, sigma_max].
+    ``trust_region`` projects the step-scaled whitened diagonal vector into one L2 ball. Its norm is
+    exactly the Frobenius norm of the corresponding diagonal matrix, so the shared trust value has
+    the same geometric meaning as the full-SPD arm. Positivity is by construction (exp > 0);
+    clamped to [eps, sigma_max].
     When sigma_max is None the eigenvalue ceiling is skipped (pure-path: eps floor only).
     """
     _check_sigma_max(sigma_max, eps)
@@ -196,9 +199,11 @@ def retract_spd_diagonal(
         sigma_safe = sigma_diag.to(compute_dtype).clamp(min=eps)
         delta_sigma = delta_sigma.to(compute_dtype)
         whitened = delta_sigma / sigma_safe
+        exp_arg = step_size * whitened
         if trust_region is not None and trust_region > 0:
-            whitened = whitened.clamp(-trust_region, trust_region)
-        exp_arg = (step_size * whitened).clamp(-50.0, 50.0)
+            tangent_norm = torch.linalg.vector_norm(exp_arg, dim=-1, keepdim=True)
+            exp_arg = exp_arg * torch.clamp(trust_region / (tangent_norm + eps), max=1.0)
+        exp_arg = exp_arg.clamp(-50.0, 50.0)
         sigma_new = sigma_safe * torch.exp(exp_arg)
     sigma_new = sigma_new.clamp(min=eps) if sigma_max is None else sigma_new.clamp(min=eps, max=sigma_max)
     return sigma_new.to(orig_dtype)
@@ -217,7 +222,7 @@ def retract_spd_full(
     r"""Full SPD retraction via the affine-invariant exponential map.
 
         Sigma_new = S^{1/2} exp(S^{-1/2} (tau dSigma) S^{-1/2}) S^{1/2},
-    with a Frobenius trust region on the whitened tangent and an eigenvalue
+    with one Frobenius-ball trust region on the whole whitened tangent matrix and an eigenvalue
     floor/ceiling [eps, sigma_max] (eigenvalues are variances: the SAME physical ceiling the
     diagonal arm applies to sigma). Uses the gap-regularized ``_eigh_damped`` eigendecomposition so
     the unrolled backward stays finite on a degenerate spectrum -- the isotropic ``Sigma = I`` default
@@ -289,9 +294,11 @@ def retract_spd_affine(
     ``retract_spd_full``; a diagonal sigma (matching the mean rank) uses ``retract_spd_diagonal``.
     Both are the same affine-invariant exponential map,
         Sigma_new = Sigma^{1/2} exp(Sigma^{-1/2} (step_size dSigma) Sigma^{-1/2}) Sigma^{1/2},
-    reduced to sigma_new = sigma exp(step_size dsigma/sigma) on the diagonal cone. Behavior-preserving:
-    a thin dispatcher that forwards verbatim to the bare functions; the Fisher metric conversion stays
-    in the E-step (``natural_gradient``), so the tangent ``delta_sigma`` arrives already preconditioned.
+    reduced to sigma_new = sigma exp(step_size dsigma/sigma) on the diagonal cone. The dispatcher
+    forwards to the bare functions; the Fisher metric conversion stays in the E-step
+    (``natural_gradient``), so the tangent ``delta_sigma`` arrives already preconditioned. The shared
+    ``trust_region`` bounds the L2 norm of the step-scaled diagonal tangent and the Frobenius norm of
+    the step-scaled full tangent, which are equal when the full tangent is diagonal.
     """
     if sigma.dim() == mean_ndim + 1:                     # full covariance (..., K, K)
         return retract_spd_full(

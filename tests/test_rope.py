@@ -79,7 +79,7 @@ from vfe3.model.model import VFEModel
 
 
 def _rope_cfg(**kw):
-    base = dict(vocab_size=6, embed_dim=8, n_heads=2, max_seq_len=8, n_layers=1,
+    base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                 n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0, gauge_group="block_glk",
                 warmup_steps=1, max_steps=4)
     base.update(kw)
@@ -87,13 +87,13 @@ def _rope_cfg(**kw):
 
 
 def test_rope_cache_key_tracks_mutated_rope_base():
-    model = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=100.0))
+    model = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=100.0, n_heads=1))
     device = model.prior_bank.mu_embed.device
     first = model._rope_rotation(8, device)
 
     model.cfg.rope_base = 2.0
     second = model._rope_rotation(8, device)
-    fresh = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=2.0))._rope_rotation(8, device)
+    fresh = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=2.0, n_heads=1))._rope_rotation(8, device)
 
     assert not torch.equal(first, second)
     assert torch.equal(second, fresh)
@@ -168,7 +168,7 @@ from vfe3.gradients.oracle import belief_gradients_autograd
 
 def _full_cov_cfg(**kw):
     """_rope_cfg defaults plus the full-covariance pair (family/decode_mode); diagonal_covariance derived."""
-    base = dict(vocab_size=6, embed_dim=8, n_heads=2, max_seq_len=8, n_layers=1,
+    base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                 n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0, gauge_group="block_glk",
                 warmup_steps=1, max_steps=4,
                 family="gaussian_full", decode_mode="full")

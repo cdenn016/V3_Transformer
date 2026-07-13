@@ -14,6 +14,20 @@ from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 
+_SOURCE_IDENTITIES = {
+    split: {"split": split, "sha256": split * 8}
+    for split in ("train", "validation", "test")
+}
+
+
+def _patch_source_identity(monkeypatch):
+    monkeypatch.setattr(
+        scaling,
+        "cache_source_identity",
+        lambda dataset, split: dict(_SOURCE_IDENTITIES[split]),
+    )
+
+
 def test_grow_k_mup_registered():
     assert "grow_K_mup" in scaling.ROUTES
 
@@ -58,8 +72,9 @@ def test_cell_is_current_checks_max_tokens(tmp_path, monkeypatch):
         "dataset": ds,
         "config": json.loads(json.dumps(asdict(cfg), default=str)),
     }), encoding="utf-8")
-    (run_dir / "scaling_cell.json").write_text(
-        json.dumps({"label": "cell", "max_tokens": 1000}), encoding="utf-8")
+    (run_dir / "scaling_cell.json").write_text(json.dumps({
+        "label": "cell", "max_tokens": 1000, "data_sources": _SOURCE_IDENTITIES,
+    }), encoding="utf-8")
     (run_dir / "provenance.json").write_text(json.dumps({
         "git_sha": "current-head",
         "git_dirty": False,
@@ -70,6 +85,7 @@ def test_cell_is_current_checks_max_tokens(tmp_path, monkeypatch):
         "git_dirty": False,
         "git_dirty_fingerprint": None,
     })
+    _patch_source_identity(monkeypatch)
 
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is True
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=None) is False
@@ -85,13 +101,15 @@ def test_cell_is_current_rejects_missing_or_mismatched_code_identity(tmp_path, m
         "dataset": ds,
         "config": json.loads(json.dumps(asdict(cfg), default=str)),
     }), encoding="utf-8")
-    (run_dir / "scaling_cell.json").write_text(
-        json.dumps({"label": "cell", "max_tokens": 1000}), encoding="utf-8")
+    (run_dir / "scaling_cell.json").write_text(json.dumps({
+        "label": "cell", "max_tokens": 1000, "data_sources": _SOURCE_IDENTITIES,
+    }), encoding="utf-8")
     monkeypatch.setattr(scaling, "_current_code_identity", lambda: {
         "git_sha": "current-head",
         "git_dirty": False,
         "git_dirty_fingerprint": None,
     })
+    _patch_source_identity(monkeypatch)
 
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
     (run_dir / "provenance.json").write_text(json.dumps({
@@ -107,6 +125,16 @@ def test_cell_is_current_rejects_missing_or_mismatched_code_identity(tmp_path, m
         "git_dirty_fingerprint": None,
     }), encoding="utf-8")
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is True
+
+    drifted_sources = dict(_SOURCE_IDENTITIES)
+    drifted_sources["train"] = {"split": "train", "sha256": "changed"}
+    monkeypatch.setattr(
+        scaling,
+        "cache_source_identity",
+        lambda dataset, split: dict(drifted_sources[split]),
+    )
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
+    _patch_source_identity(monkeypatch)
 
     monkeypatch.setattr(scaling, "_current_code_identity", lambda: {
         "git_sha": "current-head",

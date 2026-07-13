@@ -10,6 +10,7 @@ Tensors are accepted as torch or numpy; everything is detached to numpy for plot
 A registry (``register_figure``) lets a new figure slot in by name.
 """
 
+from types import TracebackType
 from typing import Callable, Dict, Mapping, Optional
 
 import matplotlib
@@ -86,21 +87,167 @@ def _zoom_bar_value_axis(ax, values, *, vertical: bool = True,
 _UMAP_N_NEIGHBORS = 15                                           # local-neighborhood size (callers scale with N)
 _UMAP_MIN_DIST    = 0.1                                          # display-tuned spacing (0.0 for clustering runs)
 
-# Worker source for the ISOLATED umap embedding subprocess (see umap_embed).
+# Worker source for the ISOLATED UMAP embedding subprocess (see UMAPWorker).
 # init="pca" skips UMAP's spectral eigensolver, which on disconnected / near-degenerate belief
 # clouds fails to converge (tiny eigengap) and silently falls back to uniform-random init; PCA is
 # deterministic and data-aware. n_jobs=1 matches what random_state already forces, so it also
 # silences UMAP's "n_jobs overridden" warning. Same compute, no warning cascade.
 _UMAP_WORKER_SRC = (
-    "import sys\n"
+    "import json, os, sys, traceback\n"
     "import numpy as np\n"
     "import umap\n"
-    "X = np.load(sys.argv[1])\n"
-    "reducer = umap.UMAP(n_neighbors=int(sys.argv[3]), min_dist=float(sys.argv[4]),\n"
-    "                    n_components=int(sys.argv[6]), init='pca', random_state=int(sys.argv[5]),\n"
-    "                    n_jobs=1)\n"
-    "np.save(sys.argv[2], reducer.fit_transform(X))\n"
+    "for line in sys.stdin:\n"
+    "    request = json.loads(line)\n"
+    "    try:\n"
+    "        X = np.load(request['input'])\n"
+    "        reducer = umap.UMAP(n_neighbors=int(request['n_neighbors']),\n"
+    "                            min_dist=float(request['min_dist']),\n"
+    "                            n_components=int(request['n_components']), init='pca',\n"
+    "                            random_state=int(request['seed']), n_jobs=1)\n"
+    "        np.save(request['output'], reducer.fit_transform(X))\n"
+    "        response = {'ok': True}\n"
+    "    except BaseException:\n"
+    "        response = {'ok': False, 'error': traceback.format_exc()[-4000:]}\n"
+    "    status_tmp = request['status'] + '.tmp'\n"
+    "    with open(status_tmp, 'w', encoding='utf-8') as handle:\n"
+    "        json.dump(response, handle)\n"
+    "    os.replace(status_tmp, request['status'])\n"
 )
+
+
+class UMAPWorker:
+    r"""One lazily started, crash-isolated UMAP interpreter reusable within a report."""
+
+    def __init__(self, *, timeout: float = 1200.0) -> None:
+        self.timeout = timeout
+        self._counter = 0
+        self._proc = None
+        self._stderr_handle = None
+        self._workdir = None
+
+    def _start(self) -> None:
+        if self._proc is not None:
+            return
+        import os
+        import subprocess
+        import sys
+        import tempfile
+        self._workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
+        stderr_path = os.path.join(self._workdir, "stderr.log")
+        worker_env = os.environ.copy()
+        worker_env["NUMBA_CACHE_DIR"] = os.path.join(self._workdir, "numba_cache")
+        self._stderr_handle = open(stderr_path, "w+b")
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c", _UMAP_WORKER_SRC],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=self._stderr_handle,
+            text=True,
+            env=worker_env,
+        )
+
+    def _error_tail(self) -> str:
+        import os
+        if self._stderr_handle is None or self._workdir is None:
+            return ""
+        self._stderr_handle.flush()
+        path = os.path.join(self._workdir, "stderr.log")
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 1000), os.SEEK_SET)
+                return handle.read().decode(errors="replace")
+        except OSError:
+            return ""
+
+    def embed(
+        self,
+        features: np.ndarray,
+
+        *,
+        n_neighbors:  int,
+        min_dist:     float,
+        n_components: int,
+        seed:         int,
+    ) -> np.ndarray:
+        import json
+        import os
+        import time
+        self._start()
+        assert self._proc is not None and self._proc.stdin is not None and self._workdir is not None
+        self._counter += 1
+        stem = os.path.join(self._workdir, f"request_{self._counter}")
+        fin, fout, status = f"{stem}_in.npy", f"{stem}_out.npy", f"{stem}_status.json"
+        np.save(fin, features)
+        request = dict(input=fin, output=fout, status=status, n_neighbors=n_neighbors,
+                       min_dist=min_dist, n_components=n_components, seed=seed)
+        try:
+            try:
+                self._proc.stdin.write(json.dumps(request) + "\n")
+                self._proc.stdin.flush()
+            except BrokenPipeError as exc:
+                tail = self._error_tail()
+                if "ModuleNotFoundError" in tail and "umap" in tail:
+                    raise ImportError("umap_embed needs umap-learn (pip install umap-learn)") from exc
+                raise OSError(f"UMAP worker pipe closed: {tail[-500:]}") from exc
+            deadline = time.monotonic() + self.timeout
+            while not os.path.exists(status):
+                returncode = self._proc.poll()
+                if returncode is not None:
+                    tail = self._error_tail()
+                    if "ModuleNotFoundError" in tail and "umap" in tail:
+                        raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
+                    raise OSError(f"UMAP worker exited (rc={returncode}): {tail[-500:]}")
+                if time.monotonic() >= deadline:
+                    self._proc.kill()
+                    raise TimeoutError(f"UMAP worker exceeded {self.timeout:.0f} seconds")
+                time.sleep(0.05)
+            with open(status, encoding="utf-8") as handle:
+                response = json.load(handle)
+            if not response.get("ok"):
+                error = str(response.get("error", "unknown worker failure"))
+                if "ModuleNotFoundError" in error and "umap" in error:
+                    raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
+                raise OSError(f"UMAP embedding worker failed: {error[-500:]}")
+            return np.load(fout)
+        finally:
+            for path in (fin, fout, status, f"{status}.tmp"):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+
+    def close(self) -> None:
+        import shutil
+        if self._proc is not None:
+            if self._proc.stdin is not None:
+                try:
+                    self._proc.stdin.close()
+                except OSError:
+                    pass
+            try:
+                self._proc.wait(timeout=5.0)
+            except Exception:
+                self._proc.kill()
+                self._proc.wait()
+            self._proc = None
+        if self._stderr_handle is not None:
+            self._stderr_handle.close()
+            self._stderr_handle = None
+        if self._workdir is not None:
+            shutil.rmtree(self._workdir, ignore_errors=True)
+            self._workdir = None
+
+    def __enter__(self) -> "UMAPWorker":
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: Optional[type[BaseException]],
+        _exc:      Optional[BaseException],
+        _tb:       Optional[TracebackType],
+    ) -> None:
+        self.close()
 
 
 def umap_embed(
@@ -111,17 +258,19 @@ def umap_embed(
     min_dist:     float = _UMAP_MIN_DIST,
     n_components: int = 2,
     seed:         int = 0,
-):
+    worker:        Optional[UMAPWorker] = None,
+) -> np.ndarray:
     r"""UMAP embedding of ``features`` ((N, D) -> (N, n_components)), run in an ISOLATED subprocess.
 
     umap-learn's numba/llvmlite native layer can die with a Windows ACCESS VIOLATION when it
     initializes inside a long-running, heavily loaded process (observed on Python 3.14 after
     hundreds of tests: llvmlite ``check_jit_execution`` faults; a fresh process imports numba
     fine) -- a process-killing crash no in-process try/except can catch, taking the whole
-    training finalize / test session down with it. Running the embedding in a fresh subprocess
-    fully isolates the native layer: same computation, same seeded result. A failing subprocess
-    (numba genuinely unsupported, umap-learn absent) raises the OSError/ImportError the umap
-    consumers were already written to handle (audit 2026-07-05 verification fix)."""
+    training finalize / test session down with it. Running the embedding in a subprocess fully
+    isolates the native layer: same computation, same seeded result. A report may reuse one such
+    worker for several embeddings without reimporting numba. A failing subprocess (numba genuinely
+    unsupported, umap-learn absent) raises the OSError/ImportError the UMAP consumers were already
+    written to handle (audit 2026-07-05 verification fix)."""
     X = _np(features)
     # PCA init raises when n_components exceeds the feature dim or N-1 (e.g. the phi channel of a
     # small algebra, tiny CPU test banks), so clamp it the same way n_neighbors is clamped below.
@@ -132,29 +281,12 @@ def umap_embed(
     if X.shape[0] < 3 or float(np.ptp(X, axis=0).max()) <= 0.0:
         return np.zeros((X.shape[0], n_components), dtype=float)
     n_neighbors = min(n_neighbors, max(2, X.shape[0] - 1))
-    import os
-    import shutil
-    import subprocess
-    import sys
-    import tempfile
-    workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
-    try:
-        fin  = os.path.join(workdir, "in.npy")
-        fout = os.path.join(workdir, "out.npy")
-        np.save(fin, X)
-        proc = subprocess.run(
-            [sys.executable, "-c", _UMAP_WORKER_SRC,
-             fin, fout, str(n_neighbors), str(min_dist), str(seed), str(n_components)],
-            capture_output=True, timeout=1200,
-        )
-        if proc.returncode != 0:
-            tail = proc.stderr.decode(errors="replace")[-500:]
-            if "ModuleNotFoundError" in tail and "umap" in tail:
-                raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
-            raise OSError(f"umap embedding subprocess failed (rc={proc.returncode}): {tail}")
-        return np.load(fout)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+    if worker is not None:
+        return worker.embed(X, n_neighbors=n_neighbors, min_dist=min_dist,
+                            n_components=n_components, seed=seed)
+    with UMAPWorker() as isolated_worker:
+        return isolated_worker.embed(X, n_neighbors=n_neighbors, min_dist=min_dist,
+                                     n_components=n_components, seed=seed)
 
 
 def plot_embedding(
@@ -580,53 +712,6 @@ def _belief_channel_features(bank: Dict, channel: str):
     raise ValueError(f"unknown belief channel {channel!r} (expected mu / sigma / phi)")
 
 
-@register_figure("free_energy_descent")
-def plot_free_energy_descent(
-    history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce, [hyper_prior_weighted, gamma_*]
-
-    *,
-    lambda_beta:               'float | np.ndarray' = 1.0,
-    lambda_gamma:              float = 0.0,
-    include_attention_entropy: bool  = True,
-    self_div:                  Optional[object] = None,   # (M,) converged self-divergences for the violin
-    path:                      Optional[str]    = None,
-):
-    r"""F1: the per-token complexity free-energy stack over training plus the F-vs-CE co-descent.
-
-    DESCRIPTIVE per-eval converged-belief snapshots from a representative batch (logged off the graph),
-    all in NATS PER TOKEN so the terms are commensurate (the caller normalizes the per-sequence-sum
-    diagnostics by the token count before logging). Panel A stacks the complexity / inference F that the
-    E-step descends -- self-coupling, the lambda_beta-scaled belief-coupling and attention-entropy, and
-    (when the model channel is live) the weighted hyper-prior and gamma model-coupling; the stack height
-    is that F. The data/likelihood term (CE) is NOT in the stack: there is no observation channel in the
-    LM, so the held-out CE is a readout, drawn separately. Panel B plots that SAME complexity F against
-    the held-out val CE on a twin axis -- the co-descent, evidence that minimizing F tracks the loss.
-    Panel C (when ``self_div`` is given) is the per-token self-divergence violin. ``lambda_beta`` accepts
-    a per-row vector (the learned-coupling trajectory) as well as a scalar; ``total`` matches the
-    free_energy_total column (the complexity F).
-    """
-    step, comps, total, ce = _fe_terms(history, lambda_beta, lambda_gamma=lambda_gamma,
-                                       include_attention_entropy=include_attention_entropy)
-    stack  = np.vstack([c for _, c in comps])
-    labels = [_FE_LABELS[k][0] for k, _ in comps]
-    ncol = 3 if self_div is not None else 2
-    fig, axes = plt.subplots(1, ncol, figsize=(4.4 * ncol, 3.6))
-    axes[0].stackplot(step, stack, colors=_CB[:len(comps)], alpha=0.85, labels=labels)
-    axes[0].set(xlabel="training step", ylabel="free energy (nats/token)", title="Complexity-F decomposition")
-    axes[0].legend(loc="upper right", fontsize=7, frameon=False)
-    axes[1].plot(step, total, color=_CB[0], lw=2)                # complexity F (matches the panel-A stack height)
-    axes[1].set(xlabel="training step", ylabel="F total (nats/token)", title="Co-descent (descriptive)")
-    ax2 = axes[1].twinx()
-    ax2.plot(step, ce, color=_CB[1], lw=2, ls="--")
-    ax2.set_ylabel("val CE (nats)", color=_CB[1])
-    if self_div is not None:
-        axes[2].violinplot([_np(self_div).ravel()], showmeans=True)
-        axes[2].set(xticks=[1], xticklabels=[r"$D(q_i\|p_i)$"], ylabel="nats",
-                    title="Self-divergence (per token)")
-    fig.tight_layout()
-    return _save(fig, path)
-
-
 # Canonical key -> (legend label, multi-line bar name) for the complexity-F components, in the
 # order they stack. Belief channel always present; the model channel (hyper-prior, model-coupling)
 # only when those columns are logged. The data term (CE) is NOT a component of F -- it is co-plotted
@@ -641,8 +726,7 @@ _FE_LABELS = {
 
 
 def _fe_terms(history: Dict, lambda_beta, *, lambda_gamma=0.0, include_attention_entropy=True) -> tuple:
-    r"""Per-eval complexity free-energy components (nats/token) shared by the descent/decomposition/
-    co-descent figures.
+    r"""Per-eval complexity free-energy components shared by the decomposition/co-descent figures.
 
     Returns ``(step, components, total, ce)`` where ``components`` is an ordered list of
     ``(canonical_key, array)`` pairs whose sum is ``total`` -- the per-token COMPLEXITY / inference free
@@ -1788,6 +1872,7 @@ def plot_belief_umap(
     n_clusters_label: int              = 14,     # legend/badge rows for the N largest clusters
     seed:             int              = 0,
     sil_sample:       int              = 2000,
+    umap_worker:      Optional[UMAPWorker] = None,
     path:             Optional[str]    = None,
 ):
     r"""F5: data-driven cluster map of one belief channel -- numbered badges plus a legend band.
@@ -1815,7 +1900,8 @@ def plot_belief_umap(
     M = X.shape[0]
     token_ids = _np(bank["token_ids"]).astype(int)
     n_disp = int(np.clip(round(np.sqrt(max(M, 1)) / 4.0), _UMAP_N_NEIGHBORS, 100))
-    coords = _np(umap_embed(feats, n_neighbors=n_disp, seed=seed)).astype(float)
+    coords = _np(umap_embed(feats, n_neighbors=n_disp, seed=seed,
+                            worker=umap_worker)).astype(float)
     if coords.shape[1] < 2:                                      # 1-D feature channel / M<=2: the
         coords = np.column_stack([coords, np.zeros(len(coords))])   # n_components clamp returns (M,1)
     cl_dim = min(10, X.shape[1], max(1, M - 1))
@@ -1824,7 +1910,8 @@ def plot_belief_umap(
     else:
         try:
             cluster_coords = _np(umap_embed(feats, n_neighbors=30, min_dist=0.0,
-                                            n_components=cl_dim, seed=seed)).astype(float)
+                                            n_components=cl_dim, seed=seed,
+                                            worker=umap_worker)).astype(float)
             cluster_space = f"{cl_dim}-D UMAP (min_dist=0)"
         except Exception:                                        # clustering embed failed -> status quo
             cluster_coords, cluster_space = coords, "2-D display embedding"
@@ -2166,16 +2253,16 @@ def plot_belief_spectrum(
 
     *,
     eps:       float = 1e-6,
-    sigma_max: float = 5.0,
-    diagonal:  Optional[bool] = None,
-    path:      Optional[str]  = None,
+    sigma_max: Optional[float] = 5.0,
+    diagonal:  Optional[bool]  = None,
+    path:      Optional[str]   = None,
 ):
     r"""F9: belief covariance geometry -- effective rank, guarded scree, and conditioning.
 
     Panel A: the per-token effective-rank violin (the distribution the logged mean discards).
-    Panel B: the eigenvalue scree (median + 10-90 band, log axis) with the eps / sigma_max
-    retraction guard lines, exposing whether apparent rank collapse rides the floor. Panel C: the
-    per-token spectral condition-number histogram.
+    Panel B: the eigenvalue scree (median + 10-90 band, log axis) with the eps floor and, when
+    enabled, sigma_max ceiling, exposing whether apparent rank collapse rides a guard. Panel C:
+    the per-token spectral condition-number histogram.
     """
     from vfe3 import metrics
     sp = metrics.belief_spectrum(sigma, diagonal=diagonal)
@@ -2189,7 +2276,9 @@ def plot_belief_spectrum(
     kk = np.arange(1, eig.shape[1] + 1)
     _median_band(axes[1], kk, eig.T, _CB[0], "eigenvalue")
     axes[1].axhline(eps, color=_CB[1], ls="--", lw=1, label=r"$\varepsilon$ floor")
-    axes[1].axhline(sigma_max, color=_CB[2], ls="--", lw=1, label=r"$\sigma_{\max}$ ceiling")
+    if sigma_max is not None:
+        axes[1].axhline(sigma_max, color=_CB[2], ls="--", lw=1,
+                        label=r"$\sigma_{\max}$ ceiling")
     axes[1].set_yscale("log")
     axes[1].set(xlabel="eigenvalue index", ylabel="eigenvalue", title="Guarded spectrum (scree)")
     axes[1].legend(fontsize=8, frameon=False)

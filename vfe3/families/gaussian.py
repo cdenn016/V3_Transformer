@@ -135,10 +135,14 @@ class DiagonalGaussian(BeliefParams):
         tracks the pipeline floor, while the natural-parameter maps only need positivity for
         log(-2 t2)."""
         K = self.mu.shape[-1]
-        mu_q = self.mu.float()
-        sigma_q = self.sigma.float().clamp(min=eps)
-        mu_t = other.mu.float()
-        sigma_t = other.sigma.float().clamp(min=eps)
+        compute_dtype = (torch.float64
+                         if torch.float64 in (self.mu.dtype, self.sigma.dtype,
+                                              other.mu.dtype, other.sigma.dtype)
+                         else torch.float32)
+        mu_q = self.mu.to(compute_dtype)
+        sigma_q = self.sigma.to(compute_dtype).clamp(min=eps)
+        mu_t = other.mu.to(compute_dtype)
+        sigma_t = other.sigma.to(compute_dtype).clamp(min=eps)
         if abs(alpha - 1.0) < 1e-6:
             trace_term  = (sigma_q / sigma_t).sum(dim=-1)
             delta       = mu_t - mu_q
@@ -192,10 +196,14 @@ class DiagonalGaussian(BeliefParams):
         to kl_max independently, whereas the closed form clamps the single summed scalar once, so a
         coordinate that individually exceeds kl_max diverges between the two. The independent
         per-coordinate clamp is the intended behavior here; only the recovery identity is conditional."""
-        mu_q = self.mu.float()
-        sigma_q = self.sigma.float().clamp(min=eps)
-        mu_t = other.mu.float()
-        sigma_t = other.sigma.float().clamp(min=eps)
+        compute_dtype = (torch.float64
+                         if torch.float64 in (self.mu.dtype, self.sigma.dtype,
+                                              other.mu.dtype, other.sigma.dtype)
+                         else torch.float32)
+        mu_q = self.mu.to(compute_dtype)
+        sigma_q = self.sigma.to(compute_dtype).clamp(min=eps)
+        mu_t = other.mu.to(compute_dtype)
+        sigma_t = other.sigma.to(compute_dtype).clamp(min=eps)
         delta = mu_t - mu_q
         if abs(alpha - 1.0) < 1e-6:
             per_coord = 0.5 * (
@@ -303,8 +311,9 @@ class FullGaussian(BeliefParams):
 
     def entropy(self) -> torch.Tensor:
         K = self.mu.shape[-1]
-        L, _ = safe_cholesky(self.sigma, rounds=5)
-        return 0.5 * _logdet_chol(L) + 0.5 * K * math.log(2.0 * math.pi * math.e)
+        L, ok = safe_cholesky(self.sigma, rounds=5)
+        entropy = 0.5 * _logdet_chol(L) + 0.5 * K * math.log(2.0 * math.pi * math.e)
+        return torch.where(ok, entropy, entropy.new_tensor(float("nan")))
 
     def natural_gradient(
         self,

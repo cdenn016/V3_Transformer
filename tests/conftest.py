@@ -44,6 +44,10 @@ _SLOW_TESTS = frozenset({
     "test_viz.py::test_plot_belief_umap_fallback_no_decode",
     "test_viz.py::test_plot_belief_umap_per_channel_categories",
     "test_viz.py::test_umap_embed_shape",
+    "test_model_channel_diagnostics_2026_06_13.py::test_generate_figures_emits_model_channel_figures",
+    "test_model_channel_diagnostics_2026_06_13.py::test_finalize_emits_model_channel_terms_iff_active",
+    "test_model_channel_diagnostics_2026_06_13.py::test_model_channel_bank_gating_and_umap_render",
+    "test_july13_root_fixes.py::test_umap_worker_reuses_one_process_for_two_embeddings",
     "test_run_diagnostics_2026_06_13.py::test_finalize_writes_tier3_research_and_provenance",
 })
 

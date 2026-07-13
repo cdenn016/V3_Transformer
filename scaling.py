@@ -46,7 +46,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from vfe3.config import VFE3Config
-from vfe3.data.datasets import _tokenizer_tag, make_dataloader, tokens_per_char as _tokens_per_char
+from vfe3.data.datasets import (
+    _tokenizer_tag,
+    cache_source_identity,
+    make_dataloader,
+    tokens_per_char as _tokens_per_char,
+)
 from vfe3.model.model import VFEModel, build_group
 from vfe3.run_artifacts import RunArtifacts, _git_code_identity, finalize_run
 from vfe3.runtime import seed_everything
@@ -616,22 +621,27 @@ def get_loader(
     split:      str,
 
     *,
+    data_seed:  Optional[int] = None,
     max_tokens: Optional[int] = None,
     vocab_size: Optional[int] = None,
 ) -> Any:
     r"""Split-aware DataLoader for ``dataset``/``split`` (a missing cache raises ``FileNotFoundError``).
 
-    Memoised on ``(dataset, seq_len, batch_size, split, cap, vocab_size)`` so the corpus loads once
-    across cells with the same data contract.
+    Memoized on ``(dataset, seq_len, batch_size, split, cap, vocab_size, data_seed)`` so the corpus
+    loads once across cells with the same data and sampling contract.
     Only the train stream shuffles / drops the partial last batch; validation/test read the whole split
     in a stable order so the held-out metric is a full-corpus measurement. ``max_tokens`` caps the train
     split only. No synthetic substitution for a missing real corpus."""
     cap = max_tokens if split == "train" else None
-    key = (dataset, seq_len, batch_size, split, cap, vocab_size)
+    seeded = split == "train" and data_seed is not None
+    key = (dataset, seq_len, batch_size, split, cap, vocab_size,
+           int(data_seed) if seeded else None)
     if key not in _LOADER_CACHE:
+        generator = torch.Generator().manual_seed(int(data_seed)) if seeded else None
         _LOADER_CACHE[key] = make_dataloader(dataset, split, seq_len, batch_size,
                                              shuffle=(split == "train"), drop_last=(split == "train"),
-                                             max_tokens=cap, vocab_size=vocab_size)
+                                             max_tokens=cap, vocab_size=vocab_size,
+                                             generator=generator)
     return _LOADER_CACHE[key]
 
 
@@ -655,6 +665,14 @@ def _cell_cfg_dict(overrides: Dict[str, Any], seed: int, max_steps: Optional[int
 def _current_code_identity() -> Dict[str, object]:
     """Current repository code identity used to validate a persisted scaling cell."""
     return _git_code_identity(Path(__file__).resolve().parent)
+
+
+def _data_source_identities(dataset: str) -> Dict[str, Dict[str, object]]:
+    """Current cached corpus identities for every split consumed by a scaling cell."""
+    return {
+        split: cache_source_identity(dataset, split)
+        for split in ("train", "validation", "test")
+    }
 
 
 def _cell_is_current(run_dir: Path, cfg: VFE3Config, dataset: str, max_tokens: Optional[int] = None) -> bool:
@@ -681,6 +699,15 @@ def _cell_is_current(run_dir: Path, cfg: VFE3Config, dataset: str, max_tokens: O
     except Exception:
         return False
     if cellmeta.get("max_tokens", None) != (int(max_tokens) if max_tokens is not None else None):
+        return False
+    saved_sources = cellmeta.get("data_sources")
+    if not isinstance(saved_sources, Mapping):
+        return False
+    try:
+        current_sources = _data_source_identities(dataset)
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    if dict(saved_sources) != current_sources:
         return False
     current = _current_code_identity()
     saved_sha = provenance.get("git_sha")
@@ -740,7 +767,7 @@ def run_cell(
           f"n_gen={n_gen} | N={actual_n:,}{gap} | steps={cfg.max_steps}")
 
     train_loader = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "train",
-                              max_tokens=max_tokens, vocab_size=cfg.vocab_size)
+                              data_seed=cfg.seed, max_tokens=max_tokens, vocab_size=cfg.vocab_size)
     val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation",
                               vocab_size=cfg.vocab_size)
     test_loader  = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "test",
@@ -764,6 +791,7 @@ def run_cell(
         "overrides": json.loads(json.dumps(cell["overrides"], default=str)),
         "predicted_n_params": pred_n, "n_gen": n_gen, "seed": int(seed),
         "max_tokens": (int(max_tokens) if max_tokens is not None else None),
+        "data_sources": _data_source_identities(dataset),
     })
 
     val_tpc = _tokens_per_char(dataset, "validation") or 1.0

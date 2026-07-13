@@ -113,27 +113,27 @@ def test_build_group_default_none_is_byte_identical():
     # path produces a group whose generators are bit-identical to the direct builder call.
     from vfe3.config import VFE3Config
     from vfe3.model.model import build_group
-    cfg = VFE3Config(embed_dim=8, n_heads=2, gauge_group="block_glk")
+    cfg = VFE3Config(embed_dim=4, n_heads=2, gauge_group="block_glk")
     assert cfg.cross_couplings is None
     wired = build_group(cfg)
-    direct = get_group("block_glk")(8, 2)
+    direct = get_group("block_glk")(4, 2)
     assert torch.equal(wired.generators, direct.generators)
     assert wired.irrep_dims == direct.irrep_dims
 
 
 def test_build_group_forwards_cross_couplings():
     # With cross_couplings set, build_group must forward the kwarg, yielding the extended
-    # (strictly larger) cross-head basis and the [K] super-block irrep structure. d_head = 4,
-    # base = n_heads * d_head^2 = 2*16 = 32; one coupling adds d_head^2 = 16 -> 48.
+    # (strictly larger) cross-head basis and the [K] super-block irrep structure. d_head = 2,
+    # base = n_heads * d_head^2 = 2*4 = 8; one coupling adds d_head^2 = 4 -> 12.
     from vfe3.config import VFE3Config
     from vfe3.model.model import build_group
-    base = build_group(VFE3Config(embed_dim=8, n_heads=2, gauge_group="block_glk"))
-    coupled = build_group(VFE3Config(embed_dim=8, n_heads=2, gauge_group="block_glk",
+    base = build_group(VFE3Config(embed_dim=4, n_heads=2, gauge_group="block_glk"))
+    coupled = build_group(VFE3Config(embed_dim=4, n_heads=2, gauge_group="block_glk",
                                      cross_couplings=[(0, 1)]))
-    assert coupled.generators.shape[0] == base.generators.shape[0] + 16
+    assert coupled.generators.shape[0] == base.generators.shape[0] + 4
     assert coupled.generators.shape[0] > base.generators.shape[0]   # strictly larger
-    assert base.irrep_dims == [4, 4]
-    assert coupled.irrep_dims == [8]                                # single super-block [K]
+    assert base.irrep_dims == [2, 2]
+    assert coupled.irrep_dims == [4]                                # single super-block [K]
 
 
 def test_unknown_group_raises():

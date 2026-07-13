@@ -146,6 +146,7 @@ class DiagnosticSnapshot:
     model_phi:         Optional[torch.Tensor]
     trace_states:      'Tuple[BeliefState, ...]'
     trace_free_energy: torch.Tensor
+    s_encoded_belief:  'Optional[Tuple[torch.Tensor, torch.Tensor]]'
     s_belief:          'Optional[Tuple[torch.Tensor, torch.Tensor]]'
     rope:              Optional[torch.Tensor]
     log_prior:         Optional[torch.Tensor]
@@ -1631,6 +1632,7 @@ class VFEModel(nn.Module):
             hyper_prior_rows = None
             model_coupling_rows = None
             meta_entropy_rows = None
+            s_belief = self.prior_bank.encode_s(token_ids)
             if cfg.lambda_h > 0.0:
                 # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
                 # lines 1241-1249): lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
@@ -1642,7 +1644,8 @@ class VFEModel(nn.Module):
                 # state_dependent: the envelope lambda_h*_i=c0_h/(b0_h+KL) + R_h), so the per-token row
                 # is added with NO external lambda_h factor; model_reduction='mean' reproduces the old
                 # mean_i reduction (== the prior _hyper_prior_term).
-                hyper_prior_rows = self._hyper_prior_weighted(token_ids)          # (B, N) WEIGHTED
+                hyper_prior_rows = self._hyper_prior_weighted(                    # (B, N) WEIGHTED
+                    token_ids, s_belief=s_belief)
             if cfg.lambda_gamma > 0.0:
                 # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
                 # lines 1241-1249): lambda_gamma * mean_i [ sum_j gamma_ij KL(s_i||Omega_tilde_ij s_j)
@@ -1666,7 +1669,8 @@ class VFEModel(nn.Module):
                     token_ids, model_phi.detach(), head_reduction="mean",
                     omega=(belief.omega.detach()
                            if tied_model_frame and belief.omega is not None else None),
-                    reflection=(belief.reflection if tied_model_frame else None))
+                    reflection=(belief.reflection if tied_model_frame else None),
+                    s_belief=s_belief)
                 model_coupling_rows = cfg.lambda_gamma * c_rows                   # (B, N)
                 meta_entropy_rows = (cfg.lambda_gamma * me_rows
                                      if cfg.include_attention_entropy
@@ -1717,9 +1721,9 @@ class VFEModel(nn.Module):
             cg_moment_energy = layer_means.mean()
             loss = loss + cfg.cg_energy_weight * cg_moment_energy
             self._cg_energy_diagnostics = {
-                "cg_moment_energy":        float(cg_moment_energy.detach()),
-                "cg_moment_energy_layers": [float(v.detach()) for v in layer_means],
-                "objective_total_with_cg": float(loss.detach()),
+                "cg_moment_energy":        cg_moment_energy.detach(),
+                "cg_moment_energy_layers": layer_means.detach(),
+                "objective_total_with_cg": loss.detach(),
             }
         return logits, loss, ce.detach()
 
@@ -1842,7 +1846,7 @@ class VFEModel(nn.Module):
         from vfe3.families.base import get_family
         from vfe3.free_energy import attention_tau, pairwise_energy
         from vfe3.geometry.transport import (
-            _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA, transport_covariance, transport_mean,
+            _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA, transport_mean,
         )
         from vfe3.inference.e_step import build_belief_transport
         cfg = self.cfg
@@ -1874,8 +1878,8 @@ class VFEModel(nn.Module):
         # channel does (gradients/kernels.py, oracle.py: diagonal_out=(sigma.dim()==mu.dim())). This is
         # load-bearing for the batch-independent bare link, whose batch-collapsed operator makes the
         # rank-gap heuristic mis-read a batched diagonal sigma as full; harmless (same branch) elsewhere.
-        s_sigma_t = transport_covariance(omega, s_sigma,             # (B,N,N,K) diag or (B,N,N,K,K) full
-                                         diagonal_out=(s_sigma.dim() == s_mu.dim()))
+        s_sigma_t = fam.transport_dispersion(                        # (B,N,N,K) diag or (B,N,N,K,K) full
+            s_sigma, omega, diagonal_out=(s_sigma.dim() == s_mu.dim()))
         e_s = pairwise_energy(
             fam(s_mu, s_sigma), fam(s_mu_t, s_sigma_t),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
@@ -1945,12 +1949,14 @@ class VFEModel(nn.Module):
         from vfe3.free_energy import _broadcast_tau, attention_weights, reduced_free_energy
         e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega, reflection=reflection, s_belief=s_belief)
         gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
-        pi_s = (torch.softmax(gamma_log_prior, dim=-1) if gamma_log_prior is not None
-                else torch.full_like(gamma_w, 1.0 / gamma_w.shape[-1]))
+        log_pi_s = (torch.log_softmax(gamma_log_prior, dim=-1)
+                    if gamma_log_prior is not None
+                    else torch.full_like(gamma_w, -math.log(gamma_w.shape[-1])))
+        log_pi_s = torch.where(torch.isfinite(log_pi_s), log_pi_s, torch.zeros_like(log_pi_s))
         tau_e = _broadcast_tau(gamma_tau, e_s)                       # (H,1,1) per-head, else scalar
         coupling = (gamma_w * e_s).sum()
         meta = (tau_e * gamma_w
-                * (torch.log(gamma_w.clamp(min=eps)) - torch.log(pi_s.clamp(min=eps)))).sum()
+                * (torch.log(gamma_w.clamp(min=eps)) - log_pi_s)).sum()
         total = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior).sum()
         return {"coupling": coupling, "meta_entropy": meta, "total": total}
 
@@ -1980,12 +1986,14 @@ class VFEModel(nn.Module):
         e_s, gamma_tau, gamma_log_prior = self._gamma_energy(
             token_ids, phi, omega=omega, reflection=reflection, s_belief=s_belief)
         gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
-        pi_s = (torch.softmax(gamma_log_prior, dim=-1) if gamma_log_prior is not None
-                else torch.full_like(gamma_w, 1.0 / gamma_w.shape[-1]))
+        log_pi_s = (torch.log_softmax(gamma_log_prior, dim=-1)
+                    if gamma_log_prior is not None
+                    else torch.full_like(gamma_w, -math.log(gamma_w.shape[-1])))
+        log_pi_s = torch.where(torch.isfinite(log_pi_s), log_pi_s, torch.zeros_like(log_pi_s))
         tau_e = _broadcast_tau(gamma_tau, e_s)                        # (H,1,1) per-head, else scalar
         coupling_key = (gamma_w * e_s).sum(dim=-1)                    # (B, [H,] N)
         meta_key = (tau_e * gamma_w
-                    * (torch.log(gamma_w.clamp(min=eps)) - torch.log(pi_s.clamp(min=eps)))).sum(dim=-1)
+                    * (torch.log(gamma_w.clamp(min=eps)) - log_pi_s)).sum(dim=-1)
         if coupling_key.dim() == 2:                                   # single-block: insert singleton head
             coupling_key = coupling_key.unsqueeze(1)                  # (B, 1, N)
             meta_key = meta_key.unsqueeze(1)
@@ -2497,11 +2505,12 @@ class VFEModel(nn.Module):
     ) -> torch.Tensor:                         # (H, N, N)
         r"""Compute beta from an already captured block output, without replaying inference."""
         from vfe3.inference.e_step import _transport
-        from vfe3.geometry.transport import transport_mean, transport_covariance
+        from vfe3.geometry.transport import transport_mean
         from vfe3.families.base import get_family
         from vfe3.free_energy import pairwise_energy, attention_weights, attention_tau
 
         cfg = self.cfg
+        fam = get_family(cfg.family)
         omega = _transport(
             belief.phi, self.group, transport_mode=cfg.transport_mode,
             mu=(belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
@@ -2521,11 +2530,11 @@ class VFEModel(nn.Module):
                 base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                 on_value=cfg.rope_on_value)
             mu_t = transport_mean(rope_omega, belief.mu)
-            sigma_t = transport_covariance(rope_omega, belief.sigma)
+            sigma_t = fam.transport_dispersion(belief.sigma, rope_omega)
         else:
             mu_t = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
-            sigma_t = transport_covariance(omega.unsqueeze(0), belief.sigma.unsqueeze(0))[0]
-        fam = get_family(cfg.family)
+            sigma_t = fam.transport_dispersion(
+                belief.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
         energy = pairwise_energy(
             fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
@@ -2596,6 +2605,12 @@ class VFEModel(nn.Module):
         trace_free_energy = torch.stack([
             value.reshape(()) for value in trace["free_energy"]])
         s_belief = diagnostic["s_belief"]
+        s_encoded_belief = None
+        if self._model_channel_active:
+            # The forward capture owns refined s1 under s_e_step. Preserve one static s0 lookup too
+            # so report consumers can compare s0/s1 without replaying the model-channel E-step.
+            s_encoded_belief = (self.prior_bank.encode_s(token_ids)
+                                if self.cfg.s_e_step else s_belief)
 
         return DiagnosticSnapshot(
             owner=self,
@@ -2617,6 +2632,8 @@ class VFEModel(nn.Module):
                 self._resolve_model_frame(token_ids, capture["out"].phi)),
             trace_states=tuple(_freeze_belief(belief) for belief in trace["beliefs"]),
             trace_free_energy=_freeze_tensor(trace_free_energy),
+            s_encoded_belief=(None if s_encoded_belief is None else (
+                _freeze_tensor(s_encoded_belief[0]), _freeze_tensor(s_encoded_belief[1]))),
             s_belief=(None if s_belief is None else (
                 _freeze_tensor(s_belief[0]), _freeze_tensor(s_belief[1]))),
             rope=_freeze_tensor(diagnostic["rope"]),
@@ -2657,7 +2674,7 @@ class VFEModel(nn.Module):
         belief-variance spectrum effective rank, not an attention rank).
         """
         from vfe3.inference.e_step import _transport
-        from vfe3.geometry.transport import transport_mean, transport_covariance, compute_transport_operators
+        from vfe3.geometry.transport import transport_mean, compute_transport_operators
         from vfe3.families.base import get_family
         from vfe3.free_energy import pairwise_energy, self_divergence_for_alpha, attention_weights, attention_tau
         from vfe3.alpha_i import self_coupling_alpha
@@ -2665,6 +2682,7 @@ class VFEModel(nn.Module):
         from vfe3 import numerics
 
         cfg = self.cfg
+        fam = get_family(cfg.family)
         if snapshot is None:
             enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
             belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
@@ -2745,14 +2763,13 @@ class VFEModel(nn.Module):
             rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                                        on_value=cfg.rope_on_value)
             mu_t    = transport_mean(rope_omega, out.mu)             # (N, N, K)
-            sigma_t = transport_covariance(rope_omega, out.sigma)    # (N, N, K)
+            sigma_t = fam.transport_dispersion(out.sigma, rope_omega) # (N, N, K)
             if not cfg.rope_on_value:
                 mu_tv    = transport_mean(omega, out.mu)
-                sigma_tv = transport_covariance(omega, out.sigma)
+                sigma_tv = fam.transport_dispersion(out.sigma, omega)
         else:
             mu_t    = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
-            sigma_t = transport_covariance(omega.unsqueeze(0), out.sigma.unsqueeze(0))[0]
-        fam = get_family(cfg.family)
+            sigma_t = fam.transport_dispersion(out.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
         energy = pairwise_energy(                                    # (N, N) or (H, N, N)
             fam(out.mu, out.sigma), fam(mu_t, sigma_t),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
@@ -3078,7 +3095,7 @@ class VFEModel(nn.Module):
         if snapshot is not None:
             return self._validate_diagnostic_snapshot(token_ids, snapshot).beta_maps
         from vfe3.inference.e_step import _transport
-        from vfe3.geometry.transport import transport_mean, transport_covariance
+        from vfe3.geometry.transport import transport_mean
         from vfe3.families.base import get_family
         from vfe3.free_energy import pairwise_energy, attention_weights, attention_tau
 
@@ -3153,10 +3170,11 @@ class VFEModel(nn.Module):
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                                            on_value=cfg.rope_on_value)
                 mu_t    = transport_mean(rope_omega, belief.mu)          # (N, N, K)
-                sigma_t = transport_covariance(rope_omega, belief.sigma) # (N, N, K)
+                sigma_t = fam.transport_dispersion(belief.sigma, rope_omega) # (N, N, K)
             else:
                 mu_t    = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
-                sigma_t = transport_covariance(omega.unsqueeze(0), belief.sigma.unsqueeze(0))[0]
+                sigma_t = fam.transport_dispersion(
+                    belief.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
             energy = pairwise_energy(                                 # (N, N) or (H, N, N)
                 fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
@@ -3205,8 +3223,7 @@ class VFEModel(nn.Module):
         ``phi_norm_mean``.
         """
         from vfe3.inference.e_step import _transport
-        from vfe3.geometry.transport import (transport_mean, transport_covariance,
-                                             compute_transport_operators)
+        from vfe3.geometry.transport import transport_mean, compute_transport_operators
         from vfe3.families.base import get_family
         from vfe3.free_energy import (pairwise_energy, self_divergence_for_alpha,
                                       attention_weights, attention_tau)
@@ -3297,13 +3314,14 @@ class VFEModel(nn.Module):
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                                            on_value=cfg.rope_on_value)
                 mu_t    = transport_mean(rope_omega, belief.mu)
-                sigma_t = transport_covariance(rope_omega, belief.sigma)
+                sigma_t = fam.transport_dispersion(belief.sigma, rope_omega)
                 if not cfg.rope_on_value:
                     mu_tv    = transport_mean(omega, belief.mu)
-                    sigma_tv = transport_covariance(omega, belief.sigma)
+                    sigma_tv = fam.transport_dispersion(belief.sigma, omega)
             else:
                 mu_t    = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
-                sigma_t = transport_covariance(omega.unsqueeze(0), belief.sigma.unsqueeze(0))[0]
+                sigma_t = fam.transport_dispersion(
+                    belief.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
             energy = pairwise_energy(                                 # (N, N) or (H, N, N)
                 fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,

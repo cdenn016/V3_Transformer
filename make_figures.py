@@ -18,8 +18,10 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each
 #   (also covers the umap/numba OpenMP that the figures pull in). The clean fix is one OpenMP in the
 #   env (e.g. `conda install nomkl`); override by exporting KMP_DUPLICATE_LIB_OK yourself.
 
+import json
 import logging
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -33,6 +35,7 @@ CONFIG = {
     "split":         "validation",                          # split the representative batch is drawn from
     "max_sequences": 256,                                   # belief-bank size for the UMAP triptych
     "n_e_steps":     None,                                  # E-step trace length (None -> trained cfg.n_e_steps)
+    "allow_large":   None,                                  # None -> inherit trained force_large_figures
 }
 
 
@@ -44,6 +47,17 @@ def _newest_run(root: str) -> Path:
     return max(runs, key=lambda p: p.stat().st_mtime)
 
 
+def _resolve_allow_large(run_dir: Path, configured: Optional[bool]) -> bool:
+    """Use an explicit driver override, otherwise inherit the trained run's figure policy."""
+    if configured is not None:
+        if not isinstance(configured, bool):
+            raise TypeError("CONFIG['allow_large'] must be bool or None")
+        return configured
+    payload = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    saved = payload.get("config", {})
+    return bool(saved.get("force_large_figures", False)) if isinstance(saved, dict) else False
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     run_dir = Path(CONFIG["run_dir"]) if CONFIG["run_dir"] else _newest_run(RUN_ROOT)
@@ -53,6 +67,7 @@ def main() -> None:
         device=torch.device(CONFIG["device"]),
         split=CONFIG["split"],
         max_sequences=CONFIG["max_sequences"],
+        allow_large=_resolve_allow_large(run_dir, CONFIG["allow_large"]),
         n_e_steps=CONFIG["n_e_steps"],
     )
     print(f"\nwrote {len(paths)} figures to {run_dir / 'figures'}")

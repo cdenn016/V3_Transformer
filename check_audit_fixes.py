@@ -46,7 +46,7 @@ AUDIT_TESTS = [
     ("m11", "tests/test_tier12_estep.py::test_straight_through_mean_trust_region_no_sigma_leak"),
     ("m12", "tests/test_tier12_estep.py::test_mm_exact_update_stays_put_on_saturated_row"),
     ("m16", "tests/test_transport.py::test_skew_transport_exp_not_clamped_for_large_phi"),
-    ("m17", "tests/test_phi_preconditioner.py::test_killing_cache_retains_generators_reference"),
+    ("m17", "tests/test_phi_preconditioner.py::test_killing_per_block_caches_parent_without_strong_retention"),
     ("m19", "tests/test_phi_preconditioner.py::test_pullback_series_warns_on_non_convergence"),
     ("m20", "tests/test_tier12_decode.py::test_z_loss_applied_on_dense_decode"),
     ("m26", "tests/test_run_artifacts.py::test_finalize_run_writes_test_results_and_figures"),

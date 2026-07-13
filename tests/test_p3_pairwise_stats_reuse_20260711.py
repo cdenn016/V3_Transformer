@@ -772,7 +772,7 @@ def test_p3_oracle_routes_forbid_statistics_helper(
 
 
 @pytest.mark.parametrize("consumer", ["filtering", "mm_exact"])
-def test_p3_non_float32_inputs_forbid_statistics_helper(
+def test_p3_float64_inputs_fall_back_without_statistics_helper(
     monkeypatch: pytest.MonkeyPatch,
     consumer:    str,
 ) -> None:
@@ -781,24 +781,42 @@ def test_p3_non_float32_inputs_forbid_statistics_helper(
 
     monkeypatch.setattr(kernels_module, "diagonal_kl_pair_stats", _forbidden, raising=False)
     inputs = tuple(tensor.to(torch.float64) for tensor in _consumer_inputs())
-    with pytest.raises(RuntimeError, match="expected scalar type Float but found Double"):
-        if consumer == "filtering":
-            _filtering_call(
-                inputs,
-                lambda_twohop=0.7,
-                lambda_alpha_mode="state_dependent",
-                reuse=True,
-                irrep_dims=None,
-            )
-        else:
-            _mm_call(
-                inputs,
-                lambda_twohop=0.7,
-                lambda_alpha_mode="state_dependent",
-                need_sigma_update=True,
-                reuse=True,
-                irrep_dims=None,
-            )
+    if consumer == "filtering":
+        outputs = _filtering_call(
+            inputs,
+            lambda_twohop=0.7,
+            lambda_alpha_mode="state_dependent",
+            reuse=True,
+            irrep_dims=None,
+        )
+        reference = _filtering_call(
+            inputs,
+            lambda_twohop=0.7,
+            lambda_alpha_mode="state_dependent",
+            reuse=False,
+            irrep_dims=None,
+        )
+    else:
+        outputs = _mm_call(
+            inputs,
+            lambda_twohop=0.7,
+            lambda_alpha_mode="state_dependent",
+            need_sigma_update=True,
+            reuse=True,
+            irrep_dims=None,
+        )
+        reference = _mm_call(
+            inputs,
+            lambda_twohop=0.7,
+            lambda_alpha_mode="state_dependent",
+            need_sigma_update=True,
+            reuse=False,
+            irrep_dims=None,
+        )
+
+    assert all(output.dtype == torch.float64 for output in outputs)
+    assert all(torch.isfinite(output).all() for output in outputs)
+    assert all(torch.equal(output, expected) for output, expected in zip(outputs, reference))
 
 
 @pytest.mark.parametrize(

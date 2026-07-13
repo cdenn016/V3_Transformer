@@ -233,7 +233,7 @@ def test_regime_ii_covariant_chunked_matches_unchunked():
     import pytest
     from vfe3.geometry import transport as T
 
-    phi, mu, sigma, grp = _phi_mu_sigma(seed=7, B=2, N=6, K=8, n_heads=2)
+    phi, mu, sigma, grp = _phi_mu_sigma(seed=7, B=2, N=6, K=4, n_heads=2)
     n_gen = grp.generators.shape[0]
     M0 = 0.2 * torch.randn(n_gen, 3, generator=torch.Generator().manual_seed(3))
     build = get_transport("regime_ii_covariant")
@@ -313,7 +313,10 @@ def test_regime_ii_covariant_edge_features_use_float64_congruence():
     builder must evaluate the edge-feature congruence + Cholesky in float64. The builder INPUTS
     (phi, mu, sigma) are well-conditioned and fp32-exact; the ill-conditioning is born INSIDE the
     congruence. Isolation test: the connection's contribution to the fp32-vs-float64 Omega gap must
-    be no larger than the flat (M=0) exp_phi baseline -- i.e. the feature path adds no fp32 blow-up."""
+    be no larger than the flat (M=0) exp_phi baseline -- i.e. the feature path adds no fp32 blow-up.
+
+    K=12 is an intentional exception to the K<6 CPU-fixture policy: this numerical stress regression
+    requires the higher-dimensional noncompact congruence to reproduce the conditioning defect."""
     import dataclasses
     from vfe3.geometry.transport import get_transport
     build = get_transport("regime_ii_covariant")
@@ -372,7 +375,7 @@ def test_regime_ii_covariant_omega_transforms_covariantly():
     tested (audit 2026-06-18 coverage gap). Closed-form correct behavior, so a regression guard."""
     from vfe3.geometry.transport import get_transport, build_factored_transport
     build = get_transport("regime_ii_covariant")
-    B, N, K, n_heads = 1, 4, 8, 2
+    B, N, K, n_heads = 1, 4, 4, 2
     grp = get_group("block_glk")(K, n_heads)
     n_gen = grp.generators.shape[0]
     gen = torch.Generator().manual_seed(21)
@@ -401,7 +404,7 @@ from vfe3.gradients.oracle import belief_gradients_autograd
 from vfe3.inference.e_step import build_belief_transport
 
 
-def _oracle_fixture(seed=0, B=1, N=4, K=8, n_heads=2):
+def _oracle_fixture(seed=0, B=1, N=4, K=4, n_heads=2):
     phi, mu, sigma, grp = _phi_mu_sigma(seed=seed, B=B, N=N, K=K, n_heads=n_heads)
     mu = 3.0 * mu                                        # inflate so the invariant features carry signal
     g = torch.Generator().manual_seed(seed + 100)

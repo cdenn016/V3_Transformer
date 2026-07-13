@@ -33,7 +33,7 @@ def test_renyi_sweep_spans_alpha_and_collects():
 
 def test_cell_diagnostics_emits_energy_klmax_frac():
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=48, embed_dim=8, n_heads=2, max_seq_len=12, n_e_steps=1)
+    cfg = VFE3Config(vocab_size=48, embed_dim=4, n_heads=2, max_seq_len=12, n_e_steps=1)
     model = VFEModel(cfg).to(DEVICE)
     loader = [(torch.randint(0, 48, (2, 12), device=DEVICE),
                torch.randint(0, 48, (2, 12), device=DEVICE))]

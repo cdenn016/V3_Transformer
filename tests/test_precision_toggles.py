@@ -218,7 +218,7 @@ def test_precision_weighted_attention_single_block_changes_forward_when_sigma_va
 def _fullcov_model(seed: int = 0, **over) -> VFEModel:
     # Mirrors the gauge_equivariance sweep arm: full covariance + multi-block block_glk + head
     # mixer + the KL-to-prior full-chunked decode, with precision-weighted attention ON. Tiny.
-    cfg = VFE3Config(vocab_size=20, embed_dim=8, n_heads=2, gauge_group="block_glk",
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, gauge_group="block_glk",
                      max_seq_len=5, n_layers=1, n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0,
                      mass_phi=0.0, mstep_self_coupling_weight=0.0,
                      family="gaussian_full", use_head_mixer=True, use_prior_bank=True,

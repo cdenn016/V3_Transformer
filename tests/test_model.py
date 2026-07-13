@@ -189,7 +189,7 @@ def test_manual_seed_makes_model_init_reproducible():
     verify the mechanism it relies on -- seeding then constructing yields identical prior tables,
     and a different seed yields different ones. (Seeding lives at the entry point, not __init__, so
     it does not clobber a caller-set RNG state.)"""
-    cfg = VFE3Config(vocab_size=40, embed_dim=8, n_heads=2, max_seq_len=4)
+    cfg = VFE3Config(vocab_size=40, embed_dim=4, n_heads=2, max_seq_len=4)
     torch.manual_seed(123); m1 = VFEModel(cfg)
     torch.manual_seed(123); m2 = VFEModel(cfg)
     assert torch.equal(m1.prior_bank.mu_embed, m2.prior_bank.mu_embed)
@@ -360,13 +360,14 @@ def test_model_runs_under_cross_coupled_block_glk():
     # through the same model/E-step machinery: a forward + loss.backward() with targets yields a
     # finite loss and finite, grad-connected gradients on the prior tables. This mirrors the
     # verify-first check; it is the oracle that the wired cross-coupled path works end-to-end.
-    cfg = VFE3Config(vocab_size=20, embed_dim=8, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
                      gauge_group="block_glk", cross_couplings=[(0, 1)],
                      phi_precond_mode="none")
     model = VFEModel(cfg)
     # the cross-coupled group is the extended (larger-than-direct-sum) basis
-    assert model.group.generators.shape[0] == 2 * 16 + 16   # base 32 + one coupling block 16
+    d_head = cfg.embed_dim // cfg.n_heads
+    assert model.group.generators.shape[0] == 3 * d_head * d_head
     tok = torch.randint(0, 20, (3, 5)); tgt = torch.randint(0, 20, (3, 5))
     _, loss, _ = model(tok, tgt)
     loss.backward()

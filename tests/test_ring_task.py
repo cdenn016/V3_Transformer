@@ -67,7 +67,7 @@ def test_ring_preference_keeps_efe_score_finite():
     # +inf wherever the model's q had off-state mass, collapsing score to inf and the posterior to nan.
     from vfe3.inference.policy import get_policy
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=rt.V, embed_dim=12, n_heads=2, max_seq_len=rt.SEQ_LEN,
+    cfg = VFE3Config(vocab_size=rt.V, embed_dim=4, n_heads=2, max_seq_len=rt.SEQ_LEN,
                      n_layers=1, n_e_steps=1, use_prior_bank=False)
     model = VFEModel(cfg)
     model.eval()
@@ -104,7 +104,7 @@ def test_decode_menu_rejects_invalid_sampling_inputs():
 
 def test_run_episodes_smoke_shapes_on_untrained_model():
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=rt.V, embed_dim=12, n_heads=2, max_seq_len=rt.SEQ_LEN,
+    cfg = VFE3Config(vocab_size=rt.V, embed_dim=4, n_heads=2, max_seq_len=rt.SEQ_LEN,
                      n_layers=1, n_e_steps=1, use_prior_bank=False)
     model = VFEModel(cfg)
     model.eval()
@@ -119,7 +119,7 @@ def test_run_episodes_smoke_shapes_on_untrained_model():
 
 
 def test_run_episodes_rejects_invalid_context_before_policy_side_effects(monkeypatch):
-    cfg = VFE3Config(vocab_size=rt.V, embed_dim=12, n_heads=2, max_seq_len=5,
+    cfg = VFE3Config(vocab_size=rt.V, embed_dim=4, n_heads=2, max_seq_len=5,
                      n_layers=1, n_e_steps=1, use_prior_bank=False)
     model = VFEModel(cfg)
     goals = torch.tensor([2])
@@ -148,7 +148,7 @@ def test_run_episodes_phase2_baseline_arms_run_and_stay_valid():
     # Phase 2 (spec 4.3): greedy reference + goal-free sampling baselines run end-to-end and carry no
     # scorer diagnostics (they do not score risk/ambiguity).
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=rt.V, embed_dim=12, n_heads=2, max_seq_len=rt.SEQ_LEN,
+    cfg = VFE3Config(vocab_size=rt.V, embed_dim=4, n_heads=2, max_seq_len=rt.SEQ_LEN,
                      n_layers=1, n_e_steps=1, use_prior_bank=False)
     model = VFEModel(cfg)
     model.eval()
@@ -170,7 +170,7 @@ def test_closed_loop_causality_holds_by_construction():
 
 def test_predictive_adequacy_runs_and_is_a_fraction():
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=rt.V, embed_dim=12, n_heads=2, max_seq_len=rt.SEQ_LEN,
+    cfg = VFE3Config(vocab_size=rt.V, embed_dim=4, n_heads=2, max_seq_len=rt.SEQ_LEN,
                      n_layers=1, n_e_steps=1, use_prior_bank=False)
     model = VFEModel(cfg)
     model.eval()

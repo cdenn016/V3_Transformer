@@ -70,7 +70,7 @@ def _refined_rope_gamma_model() -> VFEModel:
     with pytest.warns(UserWarning, match="gauge"):
         cfg = VFE3Config(
             vocab_size=16,
-            embed_dim=8,
+            embed_dim=4,
             n_heads=2,
             max_seq_len=8,
             n_layers=1,
@@ -102,7 +102,7 @@ def _refined_rope_gamma_model() -> VFEModel:
 
 def test_extractor_belief_matches_forward_under_precision_weighted_attention():
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8,
+    cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8,
                      precision_weighted_attention=True)
     model = VFEModel(cfg).to(DEVICE)
     with torch.no_grad():                            # vary tr Sigma_j across the vocab so the
@@ -124,7 +124,7 @@ def test_extractor_belief_matches_forward_under_precision_weighted_attention():
 
 def test_belief_bank_matches_forward_under_s_e_step():
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8,
+    cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8,
                      s_e_step=True, prior_source="model_channel", lambda_h=0.5,
                      precision_weighted_attention=True)
     model = VFEModel(cfg).to(DEVICE)
@@ -153,7 +153,7 @@ def test_extractor_fold_and_anchor_are_noops_on_default_config():
     # default path) the C9 edits are exact no-ops -- the fixed extractors reproduce the pre-fix
     # replay byte-for-byte.
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8)
+    cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8)
     model = VFEModel(cfg).to(DEVICE)
     model.eval()
     tokens = torch.randint(0, 16, (2, 8), device=DEVICE)

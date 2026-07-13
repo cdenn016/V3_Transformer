@@ -1,6 +1,6 @@
 """Lie-bracket closure: iteratively extend a generator basis until it is closed under [.,.]."""
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 

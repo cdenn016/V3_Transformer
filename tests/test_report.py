@@ -87,6 +87,86 @@ def test_generate_figures_drives_live_model(tmp_path):
     assert header.startswith("layer,") and "holonomy_deviation" in header and "total" in header
 
 
+def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
+    from vfe3.viz import extract, report
+
+    model = _model(s_e_step=True, lambda_h=0.2, lambda_gamma=0.2,
+                   prior_source="model_channel")
+    built = []
+    seen = []
+    real_build = model.build_diagnostic_snapshot
+
+    def build_snapshot(tokens):
+        snapshot = real_build(tokens)
+        built.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(model, "build_diagnostic_snapshot", build_snapshot)
+
+    for name in ("e_step_belief_trace", "across_layer_belief_trace", "converged_state",
+                 "numerical_health", "s_channel_refinement", "model_channel_belief",
+                 "hyper_prior_centroid", "hyper_prior_coupling"):
+        original = getattr(extract, name)
+
+        def wrapper(*args, _name=name, _original=original, **kwargs):
+            seen.append((_name, kwargs.get("snapshot")))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(extract, name, wrapper)
+
+    for name in ("attention_maps", "diagnostics_per_layer"):
+        original = getattr(model, name)
+
+        def wrapper(*args, _name=name, _original=original, **kwargs):
+            seen.append((_name, kwargs.get("snapshot")))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(model, name, wrapper)
+
+    class _NoopUMAPWorker:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+    monkeypatch.setattr(report.figs, "UMAPWorker", _NoopUMAPWorker)
+    monkeypatch.setattr(report.figs, "plot_belief_umap", lambda *args, **kwargs: plt.figure())
+
+    generate_figures(tmp_path / "run", model=model, loader=_loader(), max_sequences=1)
+
+    assert len(built) == 1
+    expected = {"e_step_belief_trace", "across_layer_belief_trace", "converged_state",
+                "numerical_health", "s_channel_refinement", "model_channel_belief",
+                "hyper_prior_centroid", "hyper_prior_coupling", "attention_maps",
+                "diagnostics_per_layer"}
+    assert {name for name, _ in seen} == expected
+    assert all(snapshot is built[0] for _, snapshot in seen)
+
+
+def test_model_channel_report_extractors_do_not_replay_snapshot_state(monkeypatch):
+    from vfe3.viz import extract
+
+    model = _model(s_e_step=True, lambda_h=0.2, lambda_gamma=0.2,
+                   prior_source="model_channel")
+    tokens = torch.randint(0, model.cfg.vocab_size, (1, model.cfg.max_seq_len))
+    snapshot = model.build_diagnostic_snapshot(tokens)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("snapshot-backed model-channel extractor replayed encode/refinement")
+
+    monkeypatch.setattr(model.prior_bank, "encode_s", forbidden)
+    monkeypatch.setattr(model, "_refine_s", forbidden)
+
+    outputs = (
+        extract.s_channel_refinement(model, tokens, snapshot=snapshot),
+        extract.model_channel_belief(model, tokens, snapshot=snapshot),
+        extract.hyper_prior_centroid(model, tokens, snapshot=snapshot),
+        extract.hyper_prior_coupling(model, tokens, snapshot=snapshot),
+    )
+    assert all(output is not None for output in outputs)
+
+
 def test_generate_figures_reloads_from_run_dir(tmp_path):
     # The reload path: config.json + best_model.pt -> rebuilt model -> figures, no live handle.
     cfg = _cfg()

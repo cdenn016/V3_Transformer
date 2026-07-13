@@ -38,7 +38,7 @@ _NEW_DIAG_KEYS = [
 
 
 def _cfg(**kw) -> VFE3Config:
-    base = dict(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, n_layers=1,
+    base = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                 batch_size=4, max_steps=20, warmup_steps=2)
     base.update(kw)
     return VFE3Config(**base)

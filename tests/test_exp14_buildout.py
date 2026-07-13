@@ -25,9 +25,9 @@ DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
 def test_e_step_mu_precond_default_and_validation():
-    assert VFE3Config(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8).e_step_mu_precond == "fisher"
+    assert VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8).e_step_mu_precond == "fisher"
     with pytest.raises(ValueError):
-        VFE3Config(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8, e_step_mu_precond="bogus")
+        VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, e_step_mu_precond="bogus")
 
 
 def test_raw_mean_precond_changes_output():
@@ -38,7 +38,7 @@ def test_raw_mean_precond_changes_output():
         torch.manual_seed(0)
         # sigma_init != 1 so nat_mu = sigma*grad_mu departs from the raw grad_mu from the first step
         # (at sigma=1 the two coincide); n_e_steps>1 compounds the difference.
-        cfg = VFE3Config(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8, n_e_steps=4,
+        cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, n_e_steps=4,
                          e_q_mu_lr=0.5, e_q_sigma_lr=0.1, sigma_init=0.25, e_step_mu_precond=precond)
         model = VFEModel(cfg).to(DEVICE)
         torch.manual_seed(1)

@@ -17,7 +17,7 @@ DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
 def _cfg(**over):
-    base = dict(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8, n_e_steps=2)
+    base = dict(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, n_e_steps=2)
     base.update(over)
     return VFE3Config(**base)
 

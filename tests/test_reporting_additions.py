@@ -132,7 +132,7 @@ def test_dashboard_drops_absent_and_empty():
 
 def test_save_figures_emits_dashboards(tmp_path):
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2)
+    cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2)
     model = VFEModel(cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
     keys = ("holonomy_wilson", "cocycle_residual", "fisher_trace_mean", "belief_cond_p95",
@@ -148,7 +148,7 @@ def test_save_figures_emits_dashboards(tmp_path):
 
 def test_save_figures_emits_kappa_histories(tmp_path):
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2,
+    cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2,
                      learnable_kappa_beta=True, learnable_kappa_gamma=True, lambda_gamma=0.1)
     model = VFEModel(cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
@@ -252,7 +252,7 @@ def test_offset_power_law_honors_weights():
 
 def test_save_figures_emits_kappa_block_trajectory(tmp_path):
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2,
+    cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2,
                      learnable_kappa_beta=True, learnable_kappa_gamma=True, lambda_gamma=0.1)
     model = VFEModel(cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
@@ -431,7 +431,7 @@ def _finalize_ns(**over):
         gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
         lambda_gamma=0.0, s_e_step=False, skip_belief_sigma_update=False, lambda_twohop=0.0,
         gauge_parameterization="phi", omega_reflection="off", phi_reflection="off",
-        embed_dim=8, n_heads=2, n_layers=1, n_e_steps=1, diagonal_covariance=True,
+        embed_dim=4, n_heads=2, n_layers=1, n_e_steps=1, diagonal_covariance=True,
         gauge_group="block_glk", family="gaussian_full",
         lambda_h=0.0, prior_source="prior_bank", amp_dtype="fp32")
     base.update(over)
@@ -442,7 +442,7 @@ def test_finalize_run_delegates_memory_guard_to_figure_driver(tmp_path, monkeypa
     # The reusable figure driver owns the selective full-vocab guard. finalize_run must still run
     # the lighter figure pass and forward the explicit large-extractor policy.
     torch.manual_seed(0)
-    real_cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2,
+    real_cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2,
                           batch_size=2)
     model = VFEModel(real_cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
@@ -457,7 +457,7 @@ def test_finalize_run_force_large_figures_overrides_guard(tmp_path, monkeypatch)
     # F9 counterpart: force_large_figures=True is the explicit large-run opt-in -- the figure pass
     # runs despite the over-budget estimate.
     torch.manual_seed(0)
-    real_cfg = VFE3Config(vocab_size=16, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=2,
+    real_cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2,
                           batch_size=2)
     model = VFEModel(real_cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
@@ -472,7 +472,7 @@ def test_finalize_run_force_large_figures_overrides_guard(tmp_path, monkeypatch)
 
 def test_train_logs_held_out_geometry(tmp_path):
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=32, embed_dim=8, n_heads=2, max_seq_len=8, max_steps=4,
+    cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
                      log_interval=2, eval_interval=2, batch_size=2)
     model = VFEModel(cfg).to(DEVICE)
     batches = [(torch.randint(0, 32, (2, 8), device=DEVICE),

@@ -416,7 +416,7 @@ class VFE3Config:
     # Mahalanobis ball). None reproduces the bare mu = mu - e_q_mu_lr*nat_mu bit-for-bit. A strong
     # setting is e_mu_q_trust=5.0, mu_trust_mode='box'.
     e_mu_q_trust:              Optional[float] = None
-    e_sigma_q_trust:           float = 5.0
+    e_sigma_q_trust:           float = 5.0       # diag L2 / full Frobenius: one shared whole-tangent ball
     
     mu_trust_mode:             str   = "box"          # "box" | "ball" (consulted only when e_mu_q_trust is not None)
     
@@ -426,7 +426,7 @@ class VFE3Config:
     # preconditioner (the sigma sector already whitens by 1/sigma in the affine retraction).
     e_step_mu_precond:         str   = "fisher"       # "fisher" | "raw"
 
-    sigma_max:                 float = 10.0
+    sigma_max:                 Optional[float] = 10.0
    
     gradient_mode:             str   = "filtering"   #"smoothing"
     
@@ -795,9 +795,9 @@ class VFE3Config:
     lambda_twohop:             float = 0.0
     
     # Per-query adaptive temperature tau_i = tau_h * (1 + query_tau_c * tr_h Sigma_i / d_h)
-    # (DETACHED state function): uncertain queries hedge, confident queries commit. The query-side
-    # dual of precision_weighted_attention (same detached footprint, same tr-Sigma gauge caveat
-    # under full GL).
+    # (DETACHED state function): uncertain queries hedge, confident queries commit. This is an
+    # OPT-IN GL(K)-BREAKING BASELINE on every non-compact gauge: tr(g Sigma g^T) != tr(Sigma)
+    # for a general g. query_tau_c=0 is inert and retains the pure base-temperature path.
     query_adaptive_tau:        bool  = False
     query_tau_c:               float = 1.0            # strength c >= 0 (0 = inert)
 
@@ -849,6 +849,10 @@ class VFE3Config:
         if self.sigma_max is not None and not (math.isfinite(self.sigma_max) and self.sigma_max >= self.eps):
             raise ValueError(
                 f"sigma_max must be None or finite and >= eps ({self.eps}), got {self.sigma_max}"
+            )
+        if not (math.isfinite(self.e_sigma_q_trust) and self.e_sigma_q_trust > 0.0):
+            raise ValueError(
+                f"e_sigma_q_trust must be finite and positive, got {self.e_sigma_q_trust}"
             )
 
         # gauge_transport ablation meta-toggle (A1 / EXP-2). Coerce the gauge-frame fields UP FRONT so
@@ -1130,6 +1134,13 @@ class VFE3Config:
                 "omega_metropolis_every must be an int >= 1, got "
                 f"{type(self.omega_metropolis_every).__name__}: {self.omega_metropolis_every!r}"
             )
+        if ((self.omega_reflection == "metropolis" or self.phi_reflection == "metropolis")
+                and not (math.isfinite(self.omega_metropolis_temperature)
+                         and self.omega_metropolis_temperature > 0.0)):
+            raise ValueError(
+                "omega_metropolis_temperature must be finite and > 0 when a Metropolis reflection "
+                f"is active, got {self.omega_metropolis_temperature}"
+            )
         if self.omega_reflection == "ste":
             raise NotImplementedError(
                 "omega_reflection='ste' (straight-through det-sign) is not implemented; use "
@@ -1241,8 +1252,6 @@ class VFE3Config:
                     raise ValueError(
                         f"omega_reflection='metropolis' is not available for gauge_group={self.gauge_group!r}: "
                         f"it {why}. Use gauge_group in {_REFLECT_OK}, or omega_reflection='off'.")
-                if self.omega_metropolis_temperature <= 0.0:
-                    raise ValueError(f"omega_metropolis_temperature must be > 0, got {self.omega_metropolis_temperature}")
                 # Final-review Fix B (2026-07-08): efficacy guardrail, not a correctness gate. Under a
                 # diagonal covariance family the canonical reflection R=diag(-1,1,...,1) leaves the
                 # diagonal covariance invariant under the congruence Omega Sigma Omega^T (transport
@@ -2056,6 +2065,14 @@ class VFE3Config:
                 "(linear decode) for the learned bias to take effect.",
                 UserWarning,
             )
+        if not self.use_prior_bank and self.decode_tau != 1.0:
+            import warnings
+            warnings.warn(
+                f"decode_tau={self.decode_tau} is inert when use_prior_bank=False: the linear decode "
+                "does not apply the KL-decode temperature. Set use_prior_bank=True for decode_tau to "
+                "affect logits, or leave decode_tau=1.0 on the linear path.",
+                UserWarning,
+            )
         # precision_weighted_attention's per-key reliability -log(b0 + tr Sigma_j) needs a positive b0.
         if self.precision_weighted_attention and self.precision_attention_b0 <= 0.0:
             raise ValueError(
@@ -2556,6 +2573,18 @@ class VFE3Config:
         if not math.isfinite(self.query_tau_c) or self.query_tau_c < 0.0:
             raise ValueError(
                 f"query_tau_c must be finite and >= 0, got {self.query_tau_c}"
+            )
+        if (self.query_adaptive_tau
+                and self.query_tau_c > 0.0
+                and self.gauge_group in ("glk", "block_glk", "tied_block_glk", "sp", "sp_n")):
+            import warnings
+            warnings.warn(
+                "query_adaptive_tau with query_tau_c>0 is an opt-in GL(K)-breaking baseline: "
+                "its bare covariance trace tr(g Sigma g^T) is not invariant under a general "
+                "non-orthogonal gauge. Set query_tau_c=0 or query_adaptive_tau=False for the "
+                "gauge-pure base-temperature path.",
+                UserWarning,
+                stacklevel=2,
             )
         if self.z_loss_weight < 0.0:
             raise ValueError(f"z_loss_weight must be >= 0, got {self.z_loss_weight}")

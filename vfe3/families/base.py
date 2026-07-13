@@ -138,6 +138,25 @@ class BeliefParams(ABC):
             f"per-block loop."
         )
 
+    @classmethod
+    def transport_dispersion(
+        cls,
+        dispersion: torch.Tensor,         # (..., N, K) diagonal or (..., N, K, K) full parameter
+        omega:      object,               # dense/factored/direct-link/RoPE transport container
+
+        *,
+        diagonal_out: Optional[bool] = None,
+    ) -> torch.Tensor:
+        r"""Transport the family's dispersion parameter under ``omega``.
+
+        Covariance-parameterized families inherit the congruence action. A location-scale family
+        overrides this seam when its stored parameter has a different homogeneity degree. The lazy
+        import avoids a module cycle while keeping family selection in the family registry rather
+        than hard-coding family names into geometry or inference call sites.
+        """
+        from vfe3.geometry.transport import transport_covariance
+        return transport_covariance(omega, dispersion, diagonal_out=diagonal_out)
+
 
 _FAMILIES: Dict[str, Type[BeliefParams]] = {}
 

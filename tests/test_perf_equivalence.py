@@ -1,9 +1,9 @@
 """Audit Group 4: golden equivalence gates for the performance rewrite.
 
-These tests FREEZE the current (pre-refactor) numerics as literal checksums so every perf
-change (factored transport, per-block matrix_exp, batch vectorization, cached invariants)
-is proven to preserve the result, not just to run. They are the oracle the refactor is
-written against; they were captured BEFORE any perf edit.
+These tests freeze representative numerics as literal checksums so performance changes
+(factored transport, per-block matrix_exp, batch vectorization, cached invariants) preserve
+the result rather than merely run. The K=4 model-forward checksums were captured from the
+unmodified `origin/main` commit 1b58d4f before the 2026-07-13 audit remediation.
 
 Perf note: equivalence is all that is asserted here. The wins (avoiding the dense
 (B,N,N,K,K) Omega; per-block float32 exp instead of a float64 full-K exp; a vectorized
@@ -20,8 +20,8 @@ from vfe3.model.model import VFEModel
 
 
 # --- frozen model-forward oracle (B=2, distinct sequences, seed 0) ---
-_FWD_LOSS       = 2.4851524830
-_FWD_LOGITS_SUM = -0.3535432816
+_FWD_LOSS       = 2.4850413799
+_FWD_LOGITS_SUM = -0.1507924795
 
 
 def _fwd_cfg() -> VFE3Config:
@@ -30,7 +30,7 @@ def _fwd_cfg() -> VFE3Config:
     # vectorization) is independent of the pos_phi gauge composition.
     # use_prior_bank=True: these checksums were captured on the KL-to-prior decode (the prior-bank
     # path the oracle guards); the default is now the linear-decode ablation.
-    return VFE3Config(vocab_size=12, embed_dim=8, n_heads=2, max_seq_len=6, n_layers=2,
+    return VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=2,
                       n_e_steps=2, e_phi_lr=0.1, pos_phi="none", use_prior_bank=True)
 
 

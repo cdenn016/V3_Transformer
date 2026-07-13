@@ -12,7 +12,6 @@ gauge_trace_spread (spread of log|det Omega| = tr embed(phi)), and free_energy_t
 (the per-term F decomposition).
 """
 
-import math
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -275,17 +274,25 @@ def belief_spectrum(
     r"""Per-token spectral picture of the belief covariances (all PER-TOKEN, not mean-reduced).
 
     Returns ``eigenvalues`` (..., K) sorted DESCENDING, the spectral condition number
-    ``condition`` = lam_max / lam_min (...), and the ``effective_rank`` (...). The sole producer
-    of the guarded eigenvalue scree (figure F9 Panel B); the numerical-trust panel references it.
+    ``condition`` = lam_max / lam_min (...), the ``effective_rank`` (...), and an explicit
+    ``is_positive_definite`` flag. Non-positive eigenvalues are retained for diagnosis and force
+    the condition number to +inf; only the effective-rank calculation projects them to zero.
     """
-    lam = _spectrum(sigma, diagonal=diagonal).clamp(min=0.0)
+    lam = _spectrum(sigma, diagonal=diagonal)
     lam_desc = torch.sort(lam, dim=-1, descending=True).values
     lam_max = lam_desc[..., 0]
-    lam_min = lam_desc[..., -1].clamp(min=eps)
+    lam_min = lam_desc[..., -1]
+    is_positive_definite = lam_min > 0.0
+    condition = torch.where(
+        is_positive_definite,
+        lam_max / lam_min.clamp(min=eps),
+        torch.full_like(lam_min, float("inf")),
+    )
     return {
-        "eigenvalues":    lam_desc,
-        "condition":      lam_max / lam_min,
-        "effective_rank": effective_rank(lam, eps=eps),
+        "eigenvalues":            lam_desc,
+        "condition":              condition,
+        "effective_rank":         effective_rank(lam.clamp(min=0.0), eps=eps),
+        "is_positive_definite":   is_positive_definite,
     }
 
 
@@ -534,7 +541,7 @@ def guard_saturation(
     *,
     diagonal:  Optional[bool] = None,
     eps:       float = 1e-6,
-    sigma_max: float = 5.0,
+    sigma_max: Optional[float] = 5.0,
     kl_max:    float = 100.0,
     rtol:      float = 1e-3,
 ) -> Dict[str, float]:
@@ -562,7 +569,8 @@ def guard_saturation(
 
     return {
         "sigma_floor_frac":   _frac(spec, eps, atol=spec_atol),
-        "sigma_ceil_frac":    _frac(spec, sigma_max, atol=spec_atol),
+        "sigma_ceil_frac":    (_frac(spec, sigma_max, atol=spec_atol)
+                                if sigma_max is not None else 0.0),
         "energy_klmax_frac":  _frac(energy, kl_max),
         "selfdiv_klmax_frac": _frac(self_div, kl_max),
     }
@@ -1385,19 +1393,23 @@ def _m_gauge_spread(*, phi: torch.Tensor, generators: torch.Tensor, **kw) -> flo
 @register_metric("free_energy_terms")
 def _m_free_energy_terms(
     *,
-    self_div=None,
-    energy=None,
-    beta=None,
-    alpha=None,
-    tau,
-    lambda_beta=1.0,
-    lambda_twohop=0.0,
-    include_attention_entropy=True,
-    log_prior=None,
-    alpha_reg=None,
-    coupling_energy=None,
-    log_likelihood=None,
-    **kw,
+    self_div:                  torch.Tensor,
+    energy:                    torch.Tensor,
+    beta:                      torch.Tensor,
+    alpha:                     torch.Tensor,
+
+    tau:                       'float | torch.Tensor',
+    lambda_beta:               'float | torch.Tensor' = 1.0,
+
+    lambda_twohop:             float = 0.0,
+
+    include_attention_entropy: bool = True,
+
+    log_prior:                 Optional[torch.Tensor] = None,
+    alpha_reg:                 Optional[torch.Tensor] = None,
+    coupling_energy:           Optional[torch.Tensor] = None,
+    log_likelihood:            Optional[torch.Tensor] = None,
+    **kw:                      object,
 ) -> Dict[str, float]:
     """Per-term free-energy decomposition (self-coupling, belief-coupling, attention entropy).
 

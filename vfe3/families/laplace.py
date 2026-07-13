@@ -39,19 +39,14 @@ DIVERGENCES (per coordinate; summed over k by ``renyi_closed_form``). With ``s =
   Validated to ~1e-10 against deterministic float64 trapezoidal integration (KL, Renyi on (0,1),
   the singularity limit, and self-divergence) before this module was written.
 
-TRANSPORT (honest scope). Gauge transport acts purely on the raw ``mu`` / ``sigma`` tensors before
-the family is constructed (``transport_mean`` / ``transport_covariance``), so a location-scale family
-rides it with no code change. It is distributionally EXACT only under a permutation/sign (1x1-block)
-gauge element. Under any non-permutation rotation -- including a compact SO(d) within-block rotation
-of ``block_glk`` (``d_head > 1``) and the non-orthogonal ``glk`` action -- a rotated diagonal Laplace
-is not a diagonal Laplace, so transport reinterprets ``diag(Omega diag(b) Omega^T)`` as the new
-marginal scale: a marginal-scale projection, not exact equivariance. This is the SAME diagonal
-projection the diagonal Gaussian already incurs in the live pipeline (only the FULL-covariance
-Gaussian KL is congruence-invariant under the live groups), PLUS a shape-level break (Laplace is not
-closed under rotation at all). The architecture already tolerates non-invariant transport scoring
-(the diagonal Gaussian runs as a projection), so this is documented, not a defect -- but it is not
-"exact at identity, drifts" the way the head-mixer is; it is a standing projection under any
-non-permutation gauge. Use under permutation/sign gauge for exactness.
+TRANSPORT (honest scope). The family-selected dispersion seam transports the scale with degree one.
+For a signed diagonal/permutation element this is exact: ``b'_k = |Omega_kk| b_k``. Under a general
+mixing operator a linear combination of independent Laplace variables is not factorized Laplace, so
+the live diagonal family uses the explicit variance-matching marginal projection
+``b'_k = sqrt(sum_l Omega_kl^2 b_l^2)``. This preserves dimensional homogeneity and exactness on the
+family-preserving subgroup without claiming distributional closure under rotations or a general
+non-compact GL(K) action. The full-covariance Gaussian remains the exact congruence family off that
+subgroup.
 """
 
 import math
@@ -87,6 +82,23 @@ class DiagonalLaplace(BeliefParams):
             torch.stack([p.mu for p in parts], dim=dim),
             torch.stack([p.sigma for p in parts], dim=dim),
         )
+
+    @classmethod
+    def transport_dispersion(
+        cls,
+        dispersion: torch.Tensor,         # (..., N, K) marginal scale b
+        omega:      object,               # dense/factored/direct-link/RoPE transport container
+
+        *,
+        diagonal_out: Optional[bool] = True,
+    ) -> torch.Tensor:
+        r"""Degree-one scale action, exact on signed diagonal/permutation gauges.
+
+        Off that subgroup the result is the variance-matching factorized-Laplace projection, not
+        an assertion that the pushed-forward joint law remains factorized Laplace.
+        """
+        from vfe3.geometry.transport import transport_scale
+        return transport_scale(dispersion, omega, diagonal_out=diagonal_out)
 
     def natural(self) -> Tuple[torch.Tensor, ...]:
         raise NotImplementedError(

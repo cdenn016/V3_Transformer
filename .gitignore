@@ -14,5 +14,6 @@ vfe3_runs/
 vfe3_ablation_results/
 vfe3_ablation_resultsA/
 vfe3_scaling_results/
+vfe3_policy_results/
 .claude/
 .codex/

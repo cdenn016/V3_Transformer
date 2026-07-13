@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from vfe3.families.base import _logdet_chol
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement, _equal_diag_blocks
 from vfe3.numerics import safe_cholesky
@@ -447,8 +448,8 @@ def gauge_invariant_edge_features(
     sinv_covq = torch.cholesky_solve(cov_q, L_s)           # S^{-1} Sigma_q  (..., K, K)
     trace     = torch.diagonal(sinv_covq, dim1=-2, dim2=-1).sum(dim=-1)   # (...,)  tr(S^{-1} Sigma_q)
 
-    logdet_s = 2.0 * torch.log(torch.diagonal(L_s, dim1=-2, dim2=-1)).sum(dim=-1)
-    logdet_q = 2.0 * torch.log(torch.diagonal(L_q, dim1=-2, dim2=-1)).sum(dim=-1)
+    logdet_s = _logdet_chol(L_s)
+    logdet_q = _logdet_chol(L_q)
     logdet   = logdet_s - logdet_q                         # (...,)  log det S - log det Sigma_q
 
     feats = torch.stack((mahal, trace, logdet), dim=-1)    # (..., 3)
@@ -576,14 +577,15 @@ def _build_regime_ii(
     Returns the SAME dict shape as the flat builder: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K),
     'Omega' (B,N,N,K,K).
     """
-    # Flat fast path: no connection at all (None), the homotopy collapses it (alpha=0), or the
-    # vertex factors are trivial -> delta plays no role -> Omega is exactly the flat cocycle. Skip the
-    # O(N^2) edge exps. NOTE: we deliberately do NOT short-circuit on an all-ZERO (but grad-requiring)
+    # Flat fast path: no connection at all (None), or the homotopy collapses it (alpha=0). Trivial
+    # vertex factors do NOT erase the edge: they leave Omega_ij = exp(delta_ij . G), matching the
+    # charted direct-link contract. NOTE: we deliberately do NOT short-circuit on an all-ZERO
+    # (but grad-requiring)
     # connection_W: at W=0 the edge factor exp(delta)=I numerically (so the W=0->flat oracle holds to
     # float tolerance), but d Omega / d W at W=0 is the generator structure (exp'(0)=I), NOT zero --
     # short-circuiting there would sever the autograd graph and freeze the parameter at init. The full
     # einsum path keeps W in the graph so the loss backpropagates to it.
-    if connection_W is None or cocycle_relaxation == 0.0 or gauge_mode == "trivial":
+    if connection_W is None or cocycle_relaxation == 0.0:
         return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
 
     # Vertex factors exp(phi_i), exp(-phi_j) in FACTORED form (audit 2026-06-10 F8a): the same
@@ -735,11 +737,12 @@ def _build_regime_ii_covariant(
     Returns the SAME dict shape as the flat builder: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K),
     'Omega' (B,N,N,K,K).
     """
-    # Flat fast path (mirrors regime_ii): no connection, alpha=0, or trivial gauge -> flat cocycle.
+    # Flat fast path (mirrors regime_ii): no connection or alpha=0. Trivial vertex factors retain
+    # the invariant edge factor exp(delta_ij . G), matching the charted direct-link contract.
     # An all-zero (but grad-requiring) M is NOT short-circuited -- delta=0 reduces to flat to fp32,
     # but d Omega / d M at M=0 is the generator structure (exp'(0)=I), so the generic path keeps M
     # in the autograd graph (it would otherwise freeze at init).
-    if connection_M is None or cocycle_relaxation == 0.0 or gauge_mode == "trivial":
+    if connection_M is None or cocycle_relaxation == 0.0:
         return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
 
     # Contract guard (audit 2026-06-18): with a connection the edge features need the query belief
@@ -1674,6 +1677,36 @@ def transport_covariance(
     return out.to(sigma.dtype)
 
 
+def transport_scale(
+    scale: torch.Tensor,   # (..., N, K) independent location-scale-family marginal scales
+    omega: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport',
+
+    *,
+    diagonal_out: Optional[bool] = True,
+) -> torch.Tensor:         # (..., N, N, K) variance-matching marginal scales
+    r"""Degree-one transport for a factorized location-scale family's marginal scale.
+
+    A signed diagonal/permutation operator maps independent scales exactly as
+    ``b'_k = |Omega_kk| b_k``. For a general mixing operator the push-forward of independent
+    Laplace coordinates is not factorized Laplace, so this seam returns the explicit
+    variance-matching marginal projection
+
+        b'_k = sqrt(sum_l Omega_kl^2 b_l^2).
+
+    This projection is homogeneous of degree one and reduces to the exact ``|Omega| b`` law on
+    the family-preserving subgroup. It is not a claim of distributional closure off that subgroup.
+    The covariance transport owns every dense/factored/direct-link/RoPE dispatch, so applying it
+    to the variance proxy ``b^2`` keeps those optimized paths shared without treating ``b`` itself
+    as a degree-two variance.
+    """
+    variance_proxy = transport_covariance(
+        omega,
+        scale.square(),
+        diagonal_out=diagonal_out,
+    )
+    return variance_proxy.clamp(min=0.0).sqrt()
+
+
 def _direct_link_mean(
     direct: DirectLinkTransport,
     mu:     torch.Tensor,               # (..., N, K) source means
@@ -1927,9 +1960,10 @@ def _factored_full_covariance(
     because the off-block entries of Omega are exactly 0 (Higham, block-diagonal product), so only the
     per-head (d, d) blocks of Omega ever multiply. The OUTPUT is still the full (..., N, N, K, K)
     sandwich (a full Sigma's off-diagonal blocks survive, mapped by Omega^(h) on the left and
-    Omega^(h') on the right -- exactly what the dense path computes); the win is that the dense
-    (..., N, N, K, K) Omega is never built (only the H per-head (..., N, N, d, d) operators) and each
-    block-pair sandwich runs in its own float64 island (M4) at the BLOCK scale, not the full K x K.
+    Omega^(h') on the right -- exactly what the dense path computes). For equal block sizes, one
+    batched float64 einsum carries both head axes and fuses the vertex factors, avoiding H^2 Python
+    dispatches and the dense (..., N, N, K, K) Omega. Heterogeneous irrep dimensions retain the
+    exact block-pair fallback because their rectangular blocks cannot share one head tensor.
     Value-equal to the dense ``transport_covariance(to_dense_omega(), sigma)``; pinned by
     tests/test_fullcov_alpha_roadmap_2026_06_13.py.
     """
@@ -1937,6 +1971,25 @@ def _factored_full_covariance(
     K = sum(dims)
     batch = sigma.shape[:-3]
     N = sigma.shape[-3]
+
+    if len(set(dims)) == 1:
+        H, d = len(dims), dims[0]
+        exp_phi = _equal_diag_blocks(factored.exp_phi, H, d).double()       # (..., N, H, d, d)
+        exp_neg = _equal_diag_blocks(factored.exp_neg_phi, H, d).double()  # (..., N, H, d, d)
+        sigma_blocks = sigma.reshape(*batch, N, H, d, H, d).double()
+        # One batched contraction over both explicit head axes. Algebraically this is
+        # Omega_h Sigma_(h,g) Omega_g^T with Omega_h = exp_phi_h exp_neg_h, but fusing the
+        # vertex factors avoids both the H^2 Python loop and H separate pair-operator builds.
+        out = torch.einsum(
+            "...ihax,...jhxb,...jhbgd,...igcy,...jgyd->...ijhagc",
+            exp_phi,
+            exp_neg,
+            sigma_blocks,
+            exp_phi,
+            exp_neg,
+        )
+        return out.reshape(*batch, N, N, K, K).to(sigma.dtype)
+
     out = sigma.new_zeros(*batch, N, N, K, K)
 
     # Per-head pairwise operators Omega^(h)_ij = exp(phi_i)^(h) @ exp(-phi_j)^(h), each (..., N, N, d, d):
@@ -1951,7 +2004,9 @@ def _factored_full_covariance(
         blocks.append((start, end, omega_h.double()))                  # float64 island (M4); cast ONCE per head
         start = end
 
-    # (h, h') output block = Omega^(h)_ij Sigma_j^(h,h') (Omega^(h')_ij)^T, in a float64 island (the
+    # Heterogeneous irrep dimensions cannot share one rectangular head tensor. Keep the exact
+    # block-pair fallback: (h, h') output block = Omega^(h)_ij Sigma_j^(h,h') (Omega^(h')_ij)^T,
+    # in a float64 island (the
     # congruence squares cond(Omega); audit M4) at the block scale, then cast back. The per-head
     # operators are pre-cast to float64 above (H casts) rather than re-cast inside this H x H loop
     # (which would be O(H^2) redundant casts of the same oh/oh2); only the distinct per-pair sigma

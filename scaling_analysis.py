@@ -312,9 +312,13 @@ def bootstrap_exponent_ci(
     n_boot:      int = 2000,
     with_offset: bool = False,
 ) -> Tuple[float, float, float]:
-    r"""Nested cluster bootstrap of the power-law exponent: each replicate resamples the SIZE points
-    with replacement (the lever-arm effect) and, within each kept point, resamples its seed CEs, then
-    refits. Returns (alpha_hat, lo2.5, hi97.5). Needs >= 2 points; degenerate -> NaNs.
+    r"""Bootstrap the power-law exponent with the same estimator form as the point estimate.
+
+    Ordinary power-law replicates resample size clusters and their seed CEs. A successful offset-law
+    fit keeps the distinct-size design fixed and resamples only seed CEs because cluster resampling
+    usually makes that three-parameter fit underdetermined. Replicates whose realized fit form differs
+    from the point estimate are rejected. Returns (alpha_hat, lo2.5, hi97.5). Needs >= 2 points;
+    degenerate or no same-form replicates -> NaNs.
 
     ``weights`` (per-point, same order as ``points``) MUST match the headline fit's weighting so the
     point estimate and the CI come from ONE estimator -- otherwise a weighted headline alpha can sit
@@ -325,17 +329,23 @@ def bootstrap_exponent_ci(
         return float("nan"), float("nan"), float("nan")
     seed_arrays = [np.asarray(p["ce_seeds"], dtype=float) for p in points]
     means = np.array([a.mean() for a in seed_arrays])
-    alpha_hat = _fit_power_law(xs, means, weights=weights, with_offset=with_offset)["alpha"]
+    point_fit = _fit_power_law(xs, means, weights=weights, with_offset=with_offset)
+    alpha_hat = point_fit["alpha"]
+    point_form = point_fit.get("form")
     rng = np.random.default_rng(0)                           # fixed -> reproducible CI
     boot: List[float] = []
     n = len(points)
     for _ in range(n_boot):
-        idx = rng.integers(0, n, n)
+        # The offset estimator needs four distinct sizes. Resampling size clusters silently turns
+        # most replicates into the no-offset fallback, so keep the fitted design fixed and resample
+        # only seed observations. The ordinary power-law fit retains the cluster bootstrap.
+        idx = np.arange(n) if point_form == "offset_power_law" else rng.integers(0, n, n)
         bx = xs[idx]
         by = np.array([float(rng.choice(seed_arrays[i], size=seed_arrays[i].size).mean()) for i in idx])
         bw = weights[idx] if weights is not None else None
-        a = _fit_power_law(bx, by, weights=bw, with_offset=with_offset)["alpha"]
-        if np.isfinite(a):
+        fit = _fit_power_law(bx, by, weights=bw, with_offset=with_offset)
+        a = fit["alpha"]
+        if np.isfinite(a) and fit.get("form") == point_form:
             boot.append(a)
     if not boot:
         return alpha_hat, float("nan"), float("nan")
