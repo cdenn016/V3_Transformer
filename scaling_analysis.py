@@ -13,6 +13,12 @@ nonlinear re-read. The x-axis is the recorded ``n_params`` (never a derived ``d^
 ``test_ce`` is null (no test split) or non-positive are dropped before the log fit; the analysis warns
 if the harvested points span more than one ``data_sha256`` (mixed corpus) or ``git_sha`` (code drift),
 either of which confounds a frontier.
+
+Two further figures, ``capacity_scaling.png`` and ``pareto_frontier.png`` (audit finding PB-07), are
+dispatched separately from persisted validation metrics: ``vfe3.viz.sweep_adapters.aggregate_validation_points``
+collapses seeds keyed on the persisted ``best_val_ppl`` (never a test metric) into ``validation bits/token``
+(``log2(best_val_ppl)``), which is NOT the character-corrected test BPC that ``aggregate_points`` /
+``bpc_mean`` carry above.
 """
 
 import os
@@ -27,9 +33,24 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
+from vfe3.viz.specs import FigureSpec, emit_registered_figures
+from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
+
 logger = logging.getLogger("scaling_analysis")
 
 INFERENCE_ROUTE = "inference"                                # flat-N routes, plotted separately from L(N)
+
+# PB-07: validation-metric figures (capacity_scaling.png, pareto_frontier.png) read validation_points
+# (aggregate_validation_points, keyed on the persisted best_val_ppl) -- never the test-metric
+# points/param_points/infer_points used above. The route each axis reads is defined once here.
+AXIS_ROUTES: Dict[str, str] = {"embed_dim": "grow_K", "n_heads": "blocksize", "n_layers": INFERENCE_ROUTE}
+
+SCALING_FIGURE_SPECS = (
+    FigureSpec("capacity_scaling", "capacity_scaling.png",
+               lambda ctx: capacity_scaling_kwargs(ctx["validation_points"], ctx["axis_routes"])),
+    FigureSpec("pareto_frontier", "pareto_frontier.png",
+               lambda ctx: pareto_frontier_kwargs(ctx["validation_points"])),
+)
 
 CONFIG: Dict[str, Any] = {
     "input_dir":   "vfe3_scaling_results/blocks_K48",      # where scaling.py wrote the run dirs
@@ -411,6 +432,7 @@ def analyze() -> None:
           f"\n  csv:     {input_dir / 'scaling_points.csv'}")
 
     points = aggregate_points(rows)
+    validation_points = aggregate_validation_points(rows)     # PB-07: best_val_ppl-keyed, never test metrics
     param_points = [p for p in points if p["route"] != INFERENCE_ROUTE]
     infer_points = [p for p in points if p["route"] == INFERENCE_ROUTE]
     fit_param_mask = np.array([
@@ -578,7 +600,8 @@ def analyze() -> None:
         logger.warning("scaling summary write failed (%s); skipped", exc)
 
     # ---- figures (best-effort, never fatal) ----
-    _make_figures(param_points, infer_points, fig_dir, weights_by_route=weights_by_route)
+    _make_figures(param_points, infer_points, fig_dir, weights_by_route=weights_by_route,
+                  validation_points=validation_points, axis_routes=AXIS_ROUTES)
     print(f"\nfigures -> {fig_dir}")
 
 
@@ -667,7 +690,9 @@ def _make_figures(
     fig_dir:      Path,
 
     *,
-    weights_by_route: Optional[Mapping[str, np.ndarray]] = None,
+    weights_by_route:  Optional[Mapping[str, np.ndarray]]       = None,
+    validation_points: Optional[List[Dict[str, Any]]]           = None,
+    axis_routes:       Optional[Mapping[str, str]]              = None,
 ) -> None:
     try:
         from vfe3.viz import figures as figs
@@ -675,6 +700,18 @@ def _make_figures(
     except Exception as exc:
         logger.warning("figures unavailable (%s); skipping the figure pass", exc)
         return
+
+    if validation_points is not None and axis_routes is not None:
+        # PB-07: dispatch the two registered validation-metric figures through the declarative
+        # FigureSpec seam (vfe3.viz.specs); emit_registered_figures isolates a single spec's failure
+        # (never raises here), matching this function's own best-effort contract.
+        written = emit_registered_figures(
+            SCALING_FIGURE_SPECS,
+            {"validation_points": validation_points, "axis_routes": axis_routes},
+            fig_dir,
+        )
+        for out_path in written:
+            print(f"  figure -> {out_path}")
 
     def _try(name: str, fn) -> None:
         try:

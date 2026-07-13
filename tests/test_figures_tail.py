@@ -10,11 +10,13 @@ Device-agnostic (CPU). Figures use the Agg backend.
 """
 import csv as _csv
 import json
+import math
 import os
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import pytest
 import torch
 
 import ablation
@@ -24,6 +26,7 @@ from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.train import train
 from vfe3.viz import figures as figs
+from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
 
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
@@ -179,3 +182,145 @@ def test_kmup_series_splits_fixed_and_mup_arms():
     assert set(series) == {"grow_K_mup/fixed", "grow_K_mup/mup"}
     assert all(len(v) == 3 for v in series.values())               # one point per K, no conflation
     assert [p["embed_dim"] for p in series["grow_K_mup/fixed"]] == [20.0, 40.0, 80.0]
+
+
+# --------------------------------------------------------------------------- PB-07: validation
+# adapters for capacity_scaling / pareto_frontier (vfe3.viz.sweep_adapters)
+#
+# aggregate_validation_points is keyed SOLELY on the persisted best_val_ppl -- every fixture below
+# sets test_ce/test_ppl/test_bpc to a deliberately different sentinel (999.0) so a mis-wired adapter
+# that silently read a test metric instead would fail these assertions rather than pass by accident.
+
+_AXIS_ROUTES = {"embed_dim": "grow_K", "n_heads": "blocksize", "n_layers": "inference"}
+
+
+def _val_row(route, scale_knob, label, seed, *, best_val_ppl, n_params=1000.0, embed_dim=None,
+             n_heads=None, n_layers=None, n_e_steps=None, wall_time_s=10.0,
+             test_ce=999.0, test_ppl=999.0, test_bpc=999.0):
+    return {"route": route, "scale_knob": scale_knob, "label": label, "seed": seed,
+            "n_params": n_params, "embed_dim": embed_dim, "n_heads": n_heads,
+            "n_layers": n_layers, "n_e_steps": n_e_steps,
+            "best_val_ppl": best_val_ppl, "wall_time_s": wall_time_s,
+            "test_ce": test_ce, "test_ppl": test_ppl, "test_bpc": test_bpc}
+
+
+def _grow_k_capacity_scaling_rows():
+    r"""Four grow_K/embed_dim points (K20..K100); every seed pair is a power of two so
+    log2(best_val_ppl) pins to a clean integer. K100 is validation-only (no test metric survives)."""
+    rows = []
+    for label, embed_dim, n_params, seeds, wall_times in (
+        ("K20",  20,  1000.0, (16.0, 64.0), (10.0, 12.0)),   # log2 -> 4, 6 -> mean 5.0
+        ("K40",  40,  2000.0, (8.0, 32.0),  (20.0, 24.0)),   # log2 -> 3, 5 -> mean 4.0
+        ("K80",  80,  4000.0, (4.0, 4.0),   (30.0, 34.0)),   # log2 -> 2, 2 -> mean 2.0
+    ):
+        for seed, (ppl, wt) in enumerate(zip(seeds, wall_times)):
+            rows.append(_val_row("grow_K", "embed_dim", label, seed, best_val_ppl=ppl,
+                                  n_params=n_params, embed_dim=embed_dim, n_heads=4, n_layers=2,
+                                  wall_time_s=wt))
+    # K100: validation-only fixture -- every test metric is null, must still survive aggregation.
+    for seed, (ppl, wt) in enumerate(zip((2.0, 2.0), (40.0, 44.0))):    # log2 -> 1, 1 -> mean 1.0
+        rows.append(_val_row("grow_K", "embed_dim", "K100", seed, best_val_ppl=ppl,
+                              n_params=8000.0, embed_dim=100, n_heads=4, n_layers=2, wall_time_s=wt,
+                              test_ce=None, test_ppl=None, test_bpc=None))
+    return rows
+
+
+def _inference_capacity_scaling_rows():
+    r"""infer_L (route=inference, scale_knob=n_layers) and infer_T (scale_knob=n_e_steps) rows
+    sharing route='inference': only the n_layers cells belong on the n_layers panel."""
+    rows = []
+    for n_layers, ppl, wt in ((1, 8.0, 5.0), (2, 16.0, 10.0), (3, 32.0, 15.0)):   # log2 -> 3, 4, 5
+        for seed in (0, 1):
+            rows.append(_val_row("inference", "n_layers", f"L{n_layers}", seed, best_val_ppl=ppl,
+                                  n_params=1000.0, embed_dim=20, n_heads=4, n_layers=n_layers,
+                                  wall_time_s=wt))
+    for n_e_steps in (1, 2):
+        rows.append(_val_row("inference", "n_e_steps", f"T{n_e_steps}", 0, best_val_ppl=100.0,
+                              n_params=1000.0, embed_dim=20, n_heads=4, n_layers=1,
+                              n_e_steps=n_e_steps, wall_time_s=1.0))
+    return rows
+
+
+def test_aggregate_validation_points_val_bits_per_token_mean_from_best_val_ppl_feeds_capacity_scaling():
+    points = aggregate_validation_points(_grow_k_capacity_scaling_rows())
+    by_label = {p["label"]: p for p in points}
+    assert by_label["K20"]["val_bits_per_token_mean"] == pytest.approx(
+        (math.log2(16.0) + math.log2(64.0)) / 2)
+    assert by_label["K20"]["val_bits_per_token_mean"] == pytest.approx(5.0)
+    assert by_label["K40"]["val_bits_per_token_mean"] == pytest.approx(4.0)
+    assert by_label["K80"]["val_bits_per_token_mean"] == pytest.approx(2.0)
+    # every row's test_ce/test_ppl/test_bpc sentinel (999.0) is nowhere near these values -- proof
+    # the adapter never read a test metric.
+    for label in ("K20", "K40", "K80"):
+        assert by_label[label]["val_bits_per_token_mean"] < 10.0
+
+
+def test_aggregate_validation_points_survives_validation_only_row_and_reaches_capacity_scaling_and_pareto_frontier():
+    rows = _grow_k_capacity_scaling_rows()
+    points = aggregate_validation_points(rows)
+    labels = {p["label"] for p in points}
+    assert "K100" in labels                                     # test_ce/test_ppl/test_bpc all None
+    k100 = next(p for p in points if p["label"] == "K100")
+    assert k100["val_bits_per_token_mean"] == pytest.approx(1.0)
+
+    cap = capacity_scaling_kwargs(points, _AXIS_ROUTES)
+    assert cap is not None
+    assert 100.0 in cap["scaling"]["embed_dim"]["x"].tolist()
+
+    pareto = pareto_frontier_kwargs(points)
+    assert pareto is not None
+    assert "K100" in pareto["points"]["label"]
+
+
+def test_capacity_scaling_kwargs_pins_sorted_axes_and_omits_unavailable_route():
+    rows = _grow_k_capacity_scaling_rows() + _inference_capacity_scaling_rows()
+    points = aggregate_validation_points(rows)
+    result = capacity_scaling_kwargs(points, _AXIS_ROUTES)
+    assert result is not None
+    # "blocksize" (n_heads) never ran in this fixture -> omitted, not an error.
+    assert set(result["scaling"]) == {"embed_dim", "n_layers"}
+
+    embed = result["scaling"]["embed_dim"]
+    assert embed["x"].tolist() == [20.0, 40.0, 80.0, 100.0]
+    assert embed["bits_per_token"].tolist() == pytest.approx([5.0, 4.0, 2.0, 1.0])
+    assert embed["wall_time"].tolist() == pytest.approx([11.0, 22.0, 32.0, 42.0])
+
+    # only the infer_L (scale_knob=n_layers) cells enter this panel; the infer_T (n_e_steps) cells
+    # sharing route='inference' must not, even though route equality alone would admit them.
+    nlayers = result["scaling"]["n_layers"]
+    assert nlayers["x"].tolist() == [1.0, 2.0, 3.0]
+    assert nlayers["bits_per_token"].tolist() == pytest.approx([3.0, 4.0, 5.0])
+    assert nlayers["wall_time"].tolist() == pytest.approx([5.0, 10.0, 15.0])
+
+
+def test_capacity_scaling_kwargs_none_when_selected_route_has_fewer_than_two_points():
+    rows = (_grow_k_capacity_scaling_rows() + _inference_capacity_scaling_rows()
+            + [_val_row("blocksize", "n_heads", "H4", 0, best_val_ppl=10.0, n_params=1000.0,
+                        embed_dim=20, n_heads=4, n_layers=2, wall_time_s=1.0)])
+    points = aggregate_validation_points(rows)
+    # "blocksize" (n_heads) is SELECTED (it ran) but has only 1 point -- withhold the whole figure.
+    assert capacity_scaling_kwargs(points, _AXIS_ROUTES) is None
+
+
+def test_aggregate_validation_points_raises_on_explicit_null_best_val_ppl_in_capacity_scaling_route():
+    rows = [
+        _val_row("grow_K", "embed_dim", "K20", 0, best_val_ppl=16.0, embed_dim=20),
+        _val_row("grow_K", "embed_dim", "K20", 1, best_val_ppl=64.0, embed_dim=20),
+        _val_row("grow_K", "embed_dim", "K40", 0, best_val_ppl=8.0, embed_dim=40),
+        _val_row("grow_K", "embed_dim", "K40", 1, best_val_ppl=None, embed_dim=40),   # explicit null
+        _val_row("grow_K", "embed_dim", "K80", 0, best_val_ppl=4.0, embed_dim=80),
+        _val_row("grow_K", "embed_dim", "K80", 1, best_val_ppl=4.0, embed_dim=80),
+    ]
+    with pytest.raises(ValueError, match="explicit-null"):
+        aggregate_validation_points(rows)
+
+
+def test_pareto_frontier_kwargs_pins_sorted_points_and_excludes_inference_route():
+    rows = _grow_k_capacity_scaling_rows() + _inference_capacity_scaling_rows()
+    points = aggregate_validation_points(rows)
+    result = pareto_frontier_kwargs(points)
+    assert result is not None
+    assert result["points"]["n_params"].tolist() == [1000.0, 2000.0, 4000.0, 8000.0]
+    assert result["points"]["bits_per_token"].tolist() == pytest.approx([5.0, 4.0, 2.0, 1.0])
+    assert result["points"]["wall_time"].tolist() == pytest.approx([11.0, 22.0, 32.0, 42.0])
+    assert result["points"]["label"] == ["K20", "K40", "K80", "K100"]   # the 5 inference points excluded

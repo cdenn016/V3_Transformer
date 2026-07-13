@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import scaling
+import scaling_analysis
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
@@ -171,3 +172,64 @@ def test_cell_is_current_rejects_non_object_cell_metadata(tmp_path, malformed):
     }), encoding="utf-8")
 
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
+
+
+# --------------------------------------------------------------------------- PB-07: end-to-end
+# registered scaling figures (capacity_scaling.png / pareto_frontier.png) driven by scaling_analysis
+
+def _write_val_run(root, *, route, scale_knob, label, seed, embed_dim, n_heads, n_layers,
+                    n_params, best_val_ppl, wall_time_s):
+    run = root / f"{route}_{label}_s{seed}"
+    run.mkdir()
+    (run / "summary.json").write_text(json.dumps({
+        "n_params": n_params,
+        "best_val_ppl": best_val_ppl,
+        "wall_time_s": wall_time_s,
+        "scaling_point": {
+            "n_params": n_params, "n_learnable_params": n_params,
+            "embed_dim": embed_dim, "n_heads": n_heads, "n_gen": 4,
+            "gauge_group": "glk", "n_layers": n_layers, "n_e_steps": 1,
+            "tokens_seen": 1000, "test_ce": 3.0,
+        },
+    }), encoding="utf-8")
+    (run / "config.json").write_text(json.dumps({"config": {
+        "seed": seed, "embed_dim": embed_dim, "n_heads": n_heads, "n_layers": n_layers,
+        "n_e_steps": 1, "family": "gaussian_diagonal",
+    }}), encoding="utf-8")
+    (run / "scaling_cell.json").write_text(json.dumps({
+        "route": route, "scale_knob": scale_knob, "label": label,
+    }), encoding="utf-8")
+    (run / "provenance.json").write_text(json.dumps({
+        "seed": seed, "git_sha": "git-a", "train_data_sha256": "train-a",
+        "val_data_sha256": "val-a", "test_data_sha256": "test-a", "data_sha256": "test-a",
+    }), encoding="utf-8")
+
+
+def test_scaling_analysis_emits_capacity_scaling_and_pareto_frontier_pngs(tmp_path, monkeypatch):
+    r"""End-to-end PB-07 gate: analyze() must dispatch BOTH registered validation-metric figures
+    (capacity_scaling.png, pareto_frontier.png), built from persisted best_val_ppl, alongside the
+    unchanged test-metric figures."""
+    for embed_dim, n_params, best_val_ppl in ((20, 1000, 40.0), (40, 2000, 30.0), (80, 4000, 20.0)):
+        for seed, delta in ((0, -1.0), (1, 1.0)):
+            _write_val_run(
+                tmp_path, route="grow_K", scale_knob="embed_dim", label=f"K{embed_dim}",
+                seed=seed, embed_dim=embed_dim, n_heads=4, n_layers=2, n_params=n_params,
+                best_val_ppl=best_val_ppl + delta, wall_time_s=10.0 + embed_dim,
+            )
+    for n_layers in (1, 2, 3):
+        for seed, delta in ((0, -0.5), (1, 0.5)):
+            _write_val_run(
+                tmp_path, route="inference", scale_knob="n_layers", label=f"L{n_layers}",
+                seed=seed, embed_dim=20, n_heads=4, n_layers=n_layers, n_params=1000,
+                best_val_ppl=25.0 + n_layers + delta, wall_time_s=5.0 * n_layers,
+            )
+
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    scaling_analysis.analyze()
+
+    fig_dir = tmp_path / "figures"
+    capacity_png = fig_dir / "capacity_scaling.png"
+    pareto_png = fig_dir / "pareto_frontier.png"
+    assert capacity_png.is_file() and capacity_png.stat().st_size > 0
+    assert pareto_png.is_file() and pareto_png.stat().st_size > 0

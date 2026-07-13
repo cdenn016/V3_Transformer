@@ -566,9 +566,9 @@ def test_trajectory_max_annotation_keeps_small_values(tmp_path):
 
 
 def test_plot_capacity_scaling_and_estep_capacity_save(tmp_path):
-    scaling = {"embed_dim": {"x": np.array([20, 40, 64]), "bpc": np.array([7.5, 7.0, 6.8]),
+    scaling = {"embed_dim": {"x": np.array([20, 40, 64]), "bits_per_token": np.array([7.5, 7.0, 6.8]),
                              "lo": np.array([7.4, 6.9, 6.7]), "hi": np.array([7.6, 7.1, 6.9])},
-               "n_layers": {"x": np.array([1, 2, 3]), "bpc": np.array([7.5, 7.1, 7.0])}}
+               "n_layers": {"x": np.array([1, 2, 3]), "bits_per_token": np.array([7.5, 7.1, 7.0])}}
     p1 = tmp_path / "f11a.png"; p2 = tmp_path / "f11b.png"
     fig = plot_capacity_scaling(scaling, path=str(p1)); plt.close(fig)
     fig = plot_estep_capacity(np.array([1, 2, 4]), np.array([7.5, 7.1, 6.9]), np.array([100., 90., 85.]),
@@ -577,7 +577,7 @@ def test_plot_capacity_scaling_and_estep_capacity_save(tmp_path):
 
 
 def test_plot_pareto_frontier_saves(tmp_path):
-    points = {"bpc": np.array([7.5, 7.0, 6.8, 7.2]), "n_params": np.array([1e4, 4e4, 9e4, 2e4]),
+    points = {"bits_per_token": np.array([7.5, 7.0, 6.8, 7.2]), "n_params": np.array([1e4, 4e4, 9e4, 2e4]),
               "wall_time": np.array([10., 30., 60., 18.])}
     p = tmp_path / "f11c.png"
     fig = plot_pareto_frontier(points, path=str(p)); plt.close(fig)
