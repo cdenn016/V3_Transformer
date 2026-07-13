@@ -26,8 +26,15 @@ import warnings
 import pytest
 import torch
 
+from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.contracts import EffectiveBetaPriorContext
+from vfe3.families.base import get_family
+from vfe3.free_energy import free_energy, pairwise_energy, reduced_free_energy
+from vfe3.geometry.groups import get_group
+from vfe3.geometry.rope import build_rope_rotation
+from vfe3.geometry.transport import RopeTransport, transport_covariance, transport_mean
+from vfe3.inference.e_step import build_belief_transport, free_energy_value, phi_alignment_loss
 from vfe3.model.model import VFEModel
 
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
@@ -289,3 +296,113 @@ def test_phi_tilde_gamma_invariant_to_candidate_reflection():
     base = model._effective_beta_log_prior(initial, ctx)
     same = model._effective_beta_log_prior(injected, ctx)
     _assert_priors_equal(base, same, msg="phi_tilde model frame must ignore the belief reflection")
+
+
+# --------------------------------------------------------------------------------------------------
+# Task 2 (audit m9 / PB-12): two-hop coupling in the phi objective.
+#
+# The mean/covariance E-step kernels honor lambda_twohop but phi_alignment_loss did not, so under
+# lambda_twohop>0 with e_phi_lr>0 phi descended a DIFFERENT objective. phi_alignment_loss must now
+# add the SAME detached-weight two-hop block free_energy already carries:
+#   F_2 = lambda_twohop * sum_ik (beta beta)_ik E_ik,   beta = softmax_j(log pi - E/tau),
+# with W2 = beta.detach() @ beta.detach() (no independent entropy term), on the value-gauge energy
+# grid. Its phi-gradient must match autograd of free_energy_value (which already honors
+# lambda_twohop) under both the coupled (flat) and decoupled-RoPE value gauges, and the block must
+# be an EXACT no-op at lambda_twohop=0.0.
+# --------------------------------------------------------------------------------------------------
+def _phi_beliefs(seed: int, *, n: int = 3, k: int = 3):
+    r"""Tiny (N=3, K=3) glk beliefs + prior + phi leaf for the phi-objective parity checks."""
+    torch.manual_seed(seed)
+    group = get_group("glk")(k)
+    mu = torch.randn(n, k, dtype=torch.float32, device=DEVICE)
+    sigma = torch.rand(n, k, dtype=torch.float32, device=DEVICE) + 0.6
+    mu_p = torch.randn(n, k, dtype=torch.float32, device=DEVICE)
+    sigma_p = torch.rand(n, k, dtype=torch.float32, device=DEVICE) + 0.6
+    phi = 0.2 * torch.randn(n, group.generators.shape[0], dtype=torch.float32, device=DEVICE)
+    log_prior = torch.randn(n, n, dtype=torch.float32, device=DEVICE)
+    return group, mu, sigma, mu_p, sigma_p, phi, log_prior
+
+
+def _rope_for(group, n: int, phi: torch.Tensor) -> torch.Tensor:
+    return build_rope_rotation(
+        torch.arange(n, device=DEVICE), group.irrep_dims,
+        base=10.0, device=phi.device, dtype=phi.dtype,
+    )
+
+
+def _phi_loss_pre_twohop(mu, sigma, phi, group, *, tau, lambda_beta, log_prior,
+                         rope=None, rope_on_value=True):
+    r"""Faithful copy of phi_alignment_loss's PRE-two-hop body (the flat-entropy and decoupled-RoPE
+    branches), rebuilt from the same public primitives. The independent 'old form' the extended loss
+    must reproduce EXACTLY at lambda_twohop=0.0 (defaults mirror phi_alignment_loss's)."""
+    omega = build_belief_transport(phi, group, transport_mode="flat", mu=mu, sigma=sigma,
+                                   rope=rope, rope_on_value=rope_on_value)
+    mu_t = transport_mean(omega, mu)
+    sigma_t = transport_covariance(omega, sigma)
+    fam = get_family("gaussian_diagonal")
+    score_energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0,
+                                   kl_max=100.0, eps=1e-6, divergence_family="renyi",
+                                   irrep_dims=group.irrep_dims)
+    mass = 0.0
+    if isinstance(omega, RopeTransport) and not omega.on_value:
+        mu_tv = transport_mean(omega.base, mu)
+        sigma_tv = transport_covariance(omega.base, sigma)
+        value_energy = pairwise_energy(fam(mu, sigma), fam(mu_tv, sigma_tv), alpha=1.0,
+                                       kl_max=100.0, eps=1e-6, divergence_family="renyi",
+                                       irrep_dims=group.irrep_dims)
+        zero = score_energy.new_zeros(score_energy.shape[:-1])
+        return free_energy(
+            zero, score_energy, zero,
+            tau=tau, lambda_beta=lambda_beta,
+            include_attention_entropy=True,
+            log_prior=log_prior, coupling_energy=value_energy,
+        ) + mass
+    return lambda_beta * reduced_free_energy(score_energy, tau=tau, log_prior=log_prior).sum() + mass
+
+
+@pytest.mark.parametrize("decoupled_rope", [False, True])
+def test_phi_twohop_gradient_matches_scalar_free_energy(decoupled_rope):
+    # Red oracle: the extended phi loss's two-hop phi-gradient must equal autograd of
+    # free_energy_value's (which already honors lambda_twohop) -- the self-coupling term is
+    # phi-independent, so only the coupled + two-hop blocks contribute to the phi gradient.
+    group, mu, sigma, mu_p, sigma_p, phi, log_prior = _phi_beliefs(seed=41)
+    n = mu.shape[0]
+    kw = dict(tau=1.3, lambda_beta=0.7, lambda_twohop=0.2, log_prior=log_prior)
+    if decoupled_rope:
+        kw.update(rope=_rope_for(group, n, phi), rope_on_value=False)
+
+    phi_loss = phi.clone().requires_grad_(True)
+    loss = phi_alignment_loss(mu, sigma, phi_loss, group, **kw)
+    grad_loss, = torch.autograd.grad(loss, phi_loss)
+
+    phi_scalar = phi.clone().requires_grad_(True)
+    scalar = free_energy_value(
+        BeliefState(mu=mu, sigma=sigma, phi=phi_scalar), mu_p, sigma_p, group, **kw)
+    grad_scalar, = torch.autograd.grad(scalar, phi_scalar)
+
+    torch.testing.assert_close(grad_loss, grad_scalar, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("decoupled_rope", [False, True])
+def test_phi_twohop_zero_weight_is_exact_identity(decoupled_rope):
+    # Zero-weight identity: at lambda_twohop=0.0 the extended loss must be BYTE-identical (torch.equal
+    # scalar AND gradient) to the pre-two-hop form -- the guarded block is a strict no-op.
+    group, mu, sigma, mu_p, sigma_p, phi, log_prior = _phi_beliefs(seed=43)
+    n = mu.shape[0]
+    tau, lambda_beta = 1.1, 0.8
+    rope = _rope_for(group, n, phi) if decoupled_rope else None
+    rope_on_value = not decoupled_rope
+
+    phi_ext = phi.clone().requires_grad_(True)
+    ext = phi_alignment_loss(mu, sigma, phi_ext, group, tau=tau, lambda_beta=lambda_beta,
+                             lambda_twohop=0.0, log_prior=log_prior,
+                             rope=rope, rope_on_value=rope_on_value)
+    grad_ext, = torch.autograd.grad(ext, phi_ext)
+
+    phi_old = phi.clone().requires_grad_(True)
+    old = _phi_loss_pre_twohop(mu, sigma, phi_old, group, tau=tau, lambda_beta=lambda_beta,
+                               log_prior=log_prior, rope=rope, rope_on_value=rope_on_value)
+    grad_old, = torch.autograd.grad(old, phi_old)
+
+    assert torch.equal(ext.detach(), old.detach())
+    assert torch.equal(grad_ext, grad_old)
