@@ -22,7 +22,12 @@ from torch import nn
 from vfe3.attention_prior import attention_log_prior
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
-from vfe3.contracts import EStepGradientOutput, EStepGradientRecord, MStepCapture
+from vfe3.contracts import (
+    EffectiveBetaPriorContext,
+    EStepGradientOutput,
+    EStepGradientRecord,
+    MStepCapture,
+)
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.geometry.norms import get_norm
@@ -981,24 +986,26 @@ class VFEModel(nn.Module):
                                                  prebuilt_transport=shared_omega)
                 s_belief = (s_mu1, s_sigma1)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
-            # Precision-weighted attention (default OFF): fold a DETACHED per-key reliability bias
-            # -log(b0 + tr Sigma_j) into log_prior so attention down-weights high-variance keys before
-            # the softmax. Detached -> the closed-form belief kernel treats it as a fixed prior (exact).
-            # Uses the belief sigma ENTERING the block (post s-refine): an intentional fixed encode-time
-            # reliability prior held across the E-step, NOT a per-iteration one (r2 id21). The shared
-            # helper folds the SAME prior in diagnostics()/attention_maps() (r2 id22).
-            log_prior = self._fold_precision_bias(log_prior, beliefs.sigma)
-            if self.cfg.gamma_as_beta_prior:
-                # Hierarchical attention prior (default OFF): fold the model channel's DETACHED
-                # posterior gamma_ij into the belief prior in PROBABILITY space,
-                # pi <- (1-w) softmax(B) + w gamma (h->s->p->q: models tell beliefs where to attend).
-                # Detached like the precision bias above, so the closed-form belief kernel stays
-                # exact; the forward's diagnostic replays do NOT refold this (forward-path only).
-                tied_model_frame = self.cfg.s_frame_mode == "tied"
-                log_prior = self._fold_gamma_prior(log_prior, token_ids, model_phi,
-                                                   omega=beliefs.omega if tied_model_frame else None,
-                                                   reflection=(beliefs.reflection if tied_model_frame else None),
-                                                   s_belief=s_belief)
+            # Effective belief-channel attention prior: fold the DETACHED precision-weighted reliability
+            # bias -log(b0 + tr Sigma_j) (cfg.precision_weighted_attention) and, under
+            # cfg.gamma_as_beta_prior, the DETACHED hierarchical gamma prior onto the RAW
+            # _attention_log_prior. Both folds are default-OFF and detached -> the closed-form belief
+            # kernel treats the result as a fixed prior (exact). Captured ONCE at this fixed pre-stack
+            # seam (precision_sigma is the belief sigma ENTERING the block, post s-refine: an intentional
+            # fixed encode-time reliability prior held across the E-step, NOT a per-iteration one --
+            # r2 id21) so the reflection/two-hop scorers reuse the SAME builder and score the SAME
+            # objective (audit PB-12). _effective_beta_log_prior is the single authoritative constructor.
+            beta_prior_context = EffectiveBetaPriorContext(
+                token_ids=token_ids,
+                base_log_prior=log_prior,
+                precision_sigma=beliefs.sigma,
+                model_phi=model_phi,
+                s_mu=(s_belief[0] if s_belief is not None else None),
+                s_sigma=(s_belief[1] if s_belief is not None else None),
+            )
+            log_prior = self._effective_beta_log_prior(beliefs, beta_prior_context)
+            if capture is not None:
+                capture["beta_prior_context"] = beta_prior_context
             if diagnostic_capture is not None:
                 diagnostic_capture["initial_belief"] = beliefs
                 diagnostic_capture["s_belief"] = (
@@ -2159,6 +2166,40 @@ class VFEModel(nn.Module):
         if support is not None:
             out = out.masked_fill(~support, float("-inf"))            # keep the EXACT -inf causal structure
         return out
+
+    def _effective_beta_log_prior(
+        self,
+        belief:  BeliefState,                      # candidate belief (supplies the tied-gamma frame)
+        context: EffectiveBetaPriorContext,        # fixed pre-stack capture (raw prior, precision sigma, model frame, refined s)
+    ) -> Optional[torch.Tensor]:
+        r"""The single authoritative belief-channel attention log-prior the E-step descends.
+
+        Folds the DETACHED precision-weighted reliability bias ``-log(b0 + tr Sigma_j)`` and, under
+        ``cfg.gamma_as_beta_prior``, the DETACHED hierarchical gamma prior onto ``context.base_log_prior``
+        (the RAW ``_attention_log_prior``), reproducing the pre-refactor inline ``forward_beliefs`` fold
+        sequence exactly. Shared by the forward and the reflection/two-hop scorers (audit PB-12) so every
+        belief-channel consumer scores the SAME objective.
+
+        The precision fold ALWAYS reads ``context.precision_sigma`` -- the FIXED pre-stack belief
+        covariance -- never ``belief.sigma``, so a candidate belief with a different covariance leaves the
+        precision-only prior EXACTLY unchanged. Under ``gamma_as_beta_prior`` the CANDIDATE ``belief``
+        supplies the tied-gamma frame (its ``omega``/``reflection``) ONLY when ``s_frame_mode=='tied'``;
+        the independent ``phi_tilde`` model frame consumes neither, so a belief-frame reflection leaves the
+        gamma fold unchanged. NOT ``@torch.no_grad()``: each fold detaches its own contribution
+        internally, so ``context.base_log_prior``'s graph (the learnable T5 relative-position bias) stays
+        live while the precision/gamma contributions stay detached. The helper allocates no persistent
+        state and never mutates or caches a candidate-dependent tensor."""
+        log_prior = self._fold_precision_bias(context.base_log_prior, context.precision_sigma)
+        if self.cfg.gamma_as_beta_prior:
+            tied_model_frame = self.cfg.s_frame_mode == "tied"
+            s_belief = None if context.s_mu is None else (context.s_mu, context.s_sigma)
+            log_prior = self._fold_gamma_prior(
+                log_prior, context.token_ids, context.model_phi,
+                omega=(belief.omega if tied_model_frame else None),
+                reflection=(belief.reflection if tied_model_frame else None),
+                s_belief=s_belief,
+            )
+        return log_prior
 
     def _beta_tau(
         self,
