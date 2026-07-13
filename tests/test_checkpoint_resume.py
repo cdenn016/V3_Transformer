@@ -370,6 +370,28 @@ def test_resume_from_cfg_field_is_picked_up(tmp_path):
     assert len(losses_c) == 2                                   # resumed from step 2 via the cfg field
 
 
+def test_resume_config_drift_reports_grad_clip_change(tmp_path):
+    r"""PB-15: changing only grad_clip across a resume is caught by the existing config-drift
+    warning in load_checkpoint (the same mechanism test_resume_warns_on_config_drift pins for
+    e_q_mu_lr), proving grad_clip participates in that comparison like any other semantic field."""
+    cfg = _cfg(grad_clip=1.0)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    path = art.save_checkpoint(2, model, opt, cfg)
+
+    drifted = VFE3Config(**{**cfg.__dict__, "grad_clip": 0.25})
+    with pytest.warns(UserWarning, match=r"config drift.*grad_clip"):
+        load_checkpoint(path, model, opt, cfg=drifted)
+
+    # identical config (grad_clip unchanged) -> silent
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        load_checkpoint(path, model, opt, cfg=cfg)
+
+
 # --------------------------------------------------------------------------- PB-03: portable best weights
 #
 # A cross-run-directory resume used to restore only the best_val_ppl/best_step SCALARS, so the
@@ -586,6 +608,41 @@ def test_selection_projection_migrates_missing_defaults_and_rejects_unknown_fiel
         dict(reversed(list(newer.items()))))
     with pytest.raises(ValueError):
         _selection_semantic_config(newer)
+
+
+def test_selection_projection_grad_clip_migrates_to_default_and_differentiates():
+    r"""PB-15 cross-plan regression: a raw legacy mapping predating grad_clip (simulated by
+    stripping the field from asdict(VFE3Config())) migrates through _selection_semantic_config
+    to the CURRENT default (grad_clip=1.0), matching the live default projection exactly -- an
+    explicit non-default grad_clip=0.25 must project differently. The raw legacy mapping's own
+    full fingerprint is verified BEFORE the projection (the tamper-check basis, mirroring
+    test_selection_projection_migrates_missing_defaults_and_rejects_unknown_fields above), and an
+    unknown field still fails closed rather than being silently ignored by config_from_serialized."""
+    from vfe3.run_artifacts import _selection_semantic_config
+
+    legacy = asdict(VFE3Config())
+    assert legacy["grad_clip"] == 1.0
+    del legacy["grad_clip"]
+    assert "grad_clip" not in legacy
+
+    # The raw legacy mapping's own full fingerprint is a stable function of key order.
+    assert semantic_config_fingerprint(legacy) == semantic_config_fingerprint(
+        dict(reversed(list(legacy.items()))))
+
+    live_default_projection = _selection_semantic_config(VFE3Config())
+    assert live_default_projection["grad_clip"] == 1.0
+    assert _selection_semantic_config(legacy) == live_default_projection
+
+    explicit = dict(legacy)
+    explicit["grad_clip"] = 0.25
+    explicit_projection = _selection_semantic_config(explicit)
+    assert explicit_projection["grad_clip"] == 0.25
+    assert explicit_projection != live_default_projection
+
+    unknown = dict(legacy)
+    unknown["a_field_from_the_future"] = 123
+    with pytest.raises(ValueError):
+        _selection_semantic_config(unknown)
 
 
 def test_resume_from_only_difference_survives_finalization(tmp_path, monkeypatch):

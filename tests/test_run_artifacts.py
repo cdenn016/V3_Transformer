@@ -68,6 +68,15 @@ def test_creates_run_dir_and_config_json(tmp_path):
     assert meta["config"]["embed_dim"] == 4
 
 
+@pytest.mark.parametrize("grad_clip", [None, 0.0, 0.25])
+def test_config_json_persists_grad_clip(tmp_path, grad_clip):
+    cfg = _cfg(grad_clip=grad_clip)
+    model = VFEModel(cfg)
+    RunArtifacts(tmp_path / "run", cfg, model)
+    meta = json.loads((tmp_path / "run" / "config.json").read_text(encoding="utf-8"))
+    assert meta["config"]["grad_clip"] == grad_clip
+
+
 def test_log_metrics_writes_csv_with_header(tmp_path):
     cfg = _cfg()
     model = VFEModel(cfg)
@@ -100,6 +109,7 @@ def test_best_model_bundle_embeds_semantic_config_fingerprint(tmp_path):
 
     assert set(bundle) == {"model_state", "config", "config_fingerprint"}
     assert bundle["config"] == asdict(cfg)
+    assert bundle["config"]["grad_clip"] == cfg.grad_clip
     expected = hashlib.sha256(json.dumps(
         bundle["config"], sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
@@ -109,8 +119,27 @@ def test_best_model_bundle_embeds_semantic_config_fingerprint(tmp_path):
     assert semantic_config_fingerprint(reordered) == bundle["config_fingerprint"]
 
 
+def test_best_model_bundle_grad_clip_changes_fingerprint(tmp_path):
+    # PB-15: grad_clip is part of the persisted config, so a bundle saved under a different
+    # grad_clip carries both the value AND a distinct semantic_config_fingerprint.
+    cfg_a = _cfg(grad_clip=1.0)
+    cfg_b = _cfg(grad_clip=0.25)
+    model_a, model_b = VFEModel(cfg_a), VFEModel(cfg_b)
+    art_a = RunArtifacts(tmp_path / "a", cfg_a, model_a)
+    art_b = RunArtifacts(tmp_path / "b", cfg_b, model_b)
+
+    assert art_a.maybe_save_best(1, model_a, 5.0) is True
+    assert art_b.maybe_save_best(1, model_b, 5.0) is True
+    bundle_a = torch.load(art_a.best_path, weights_only=True)
+    bundle_b = torch.load(art_b.best_path, weights_only=True)
+
+    assert bundle_a["config"]["grad_clip"] == 1.0
+    assert bundle_b["config"]["grad_clip"] == 0.25
+    assert bundle_a["config_fingerprint"] != bundle_b["config_fingerprint"]
+
+
 def test_save_checkpoint_is_loadable(tmp_path):
-    cfg = _cfg()
+    cfg = _cfg(grad_clip=0.25)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     art = RunArtifacts(tmp_path / "r", cfg, model)
@@ -121,6 +150,7 @@ def test_save_checkpoint_is_loadable(tmp_path):
     assert "model_state" in ckpt and "optimizer_state" in ckpt
     # model-selection state is bundled so a resumed run reports the run-wide best (audit 2026-07-01 C2)
     assert "best_val_ppl" in ckpt and "best_step" in ckpt
+    assert ckpt["config"]["grad_clip"] == 0.25
 
 
 def test_writes_are_atomic_no_temp_left(tmp_path):
