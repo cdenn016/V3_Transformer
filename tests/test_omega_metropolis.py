@@ -125,8 +125,8 @@ def test_uphill_flip_gated_by_metropolis_acceptance():
     torch.manual_seed(1)
     m = _model(vocab_size=4)
     tok = torch.tensor([[0, 1, 2, 3]])                                   # distinct tokens -> Omega_ij != I
-    belief, mu_p, sigma_p = m._metropolis_prepare(tok)
-    dF0 = m._metropolis_delta_f(belief, mu_p, sigma_p, tok, 0)
+    context = m._metropolis_prepare(tok)
+    dF0 = m._metropolis_delta_f(context, 0)
     assert dF0 > 0.0                                                     # genuinely uphill at this seed
 
     # (1) Tiny temperature: dF0/T is so negative that exp(-dF0/T) underflows to exactly 0.0 (fp64), so
@@ -164,17 +164,18 @@ def test_exact_delta_f_matches_independent_recompute():
     m = _model(vocab_size=4)
     tok = torch.tensor([[0, 1, 2, 3]])
     tid = 1
-    belief, mu_p, sigma_p = m._metropolis_prepare(tok)
+    context = m._metropolis_prepare(tok)
+    belief = context.belief
     assert belief.omega is not None                                     # omega actually enters F
-    dF_move = m._metropolis_delta_f(belief, mu_p, sigma_p, tok, tid)
+    dF_move = m._metropolis_delta_f(context, tid)
     assert dF_move == dF_move                                           # finite (not NaN)
     assert abs(dF_move) > 0.0                                           # genuinely nonzero (distinct tokens)
     # Independent oracle: flip the source table row, re-look-up the (fixed-belief) frame, recompute F.
-    F_cur = m._metropolis_free_energy(belief, mu_p, sigma_p)
+    F_cur = m._metropolis_free_energy(belief, context)
     R = reflection_element(belief.omega.shape[-1])
     m._flip_omega_embed_row(R, tid)
     relooked = m.prior_bank._omega_lookup(tok)                          # frame from the flipped source table
-    F_trial = m._metropolis_free_energy(belief._replace(omega=relooked), mu_p, sigma_p)
+    F_trial = m._metropolis_free_energy(belief._replace(omega=relooked), context)
     m._flip_omega_embed_row(R, tid)                                     # restore (R is involutory)
     dF_indep = F_trial - F_cur
     assert abs(dF_move - dF_indep) < 1e-5                               # exact-DeltaF anchor (fp5)
@@ -191,7 +192,8 @@ def test_compact_metropolis_uses_block_reflection_and_matches_source_flip(monkey
     )
     tok = torch.tensor([[0, 1, 2, 3]])
     tid = 1
-    belief, mu_p, sigma_p = m._metropolis_prepare(tok)
+    context = m._metropolis_prepare(tok)
+    belief = context.belief
     assert isinstance(belief.omega, CompactBlockElement)
     d = belief.omega.block_dim
     R_d = reflection_element(d)
@@ -212,11 +214,11 @@ def test_compact_metropolis_uses_block_reflection_and_matches_source_flip(monkey
 
     monkeypatch.setattr(generators_module, "reflection_element", _tracked_reflection)
 
-    dF_move = m._metropolis_delta_f(belief, mu_p, sigma_p, tok, tid)
-    F_cur = m._metropolis_free_energy(belief, mu_p, sigma_p)
+    dF_move = m._metropolis_delta_f(context, tid)
+    F_cur = m._metropolis_free_energy(belief, context)
     m._flip_omega_embed_row(R_d, tid)
     relooked = m.prior_bank._omega_lookup(tok)
-    F_trial = m._metropolis_free_energy(belief._replace(omega=relooked), mu_p, sigma_p)
+    F_trial = m._metropolis_free_energy(belief._replace(omega=relooked), context)
     m._flip_omega_embed_row(R_d, tid)
 
     assert abs(dF_move - (F_trial - F_cur)) < 1e-5
@@ -320,14 +322,18 @@ def test_metropolis_generator_state_roundtrips(tmp_path, monkeypatch):
 from vfe3.belief import BeliefState
 
 
-def _reference_per_sequence_sum(model, belief, mu_p, sigma_p, *, mode):
+def _reference_per_sequence_sum(model, context, *, mode):
     """The pre-N7 per-sequence reference: one single-sequence free_energy_value per batch row,
-    summed as Python floats. Pins the batched implementation to the same total."""
+    summed as Python floats. Pins the batched implementation to the same total. The N7 configs run
+    with the folds OFF and n_layers=1, so the effective prior is the RAW attention prior and the
+    final-block prior is the encode prior -- this raw per-sequence reference matches the folded scorer
+    there exactly."""
     from vfe3.free_energy import attention_tau
     from vfe3.inference.e_step import free_energy_value
     from vfe3.model.block import _as_coeff
     cfg, grp = model.cfg, model.group
     gp = "omega_direct" if mode == "omega" else "phi"
+    belief, mu_p, sigma_p = context.belief, context.mu_p, context.sigma_p
     dev = belief.mu.device
     tau = attention_tau(model.effective_kappa_beta(dev), grp.irrep_dims)
     log_prior = model._attention_log_prior(belief.mu.shape[-2], dev)
@@ -370,9 +376,9 @@ def test_metropolis_free_energy_single_batched_eval_matches_per_sequence_sum(mod
             decode_mode="diagonal", lambda_gamma=0.0, s_e_step=False,
             phi_reflection="metropolis", pos_phi="none"))
     tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0], [4, 4, 5, 1]])       # B=3
-    belief, mu_p, sigma_p = m._metropolis_prepare(tokens, mode=mode)
+    context = m._metropolis_prepare(tokens, mode=mode)
 
-    ref = _reference_per_sequence_sum(m, belief, mu_p, sigma_p, mode=mode)
+    ref = _reference_per_sequence_sum(m, context, mode=mode)
 
     real_fe = e_step_module.free_energy_value
     calls = {"n": 0}
@@ -382,6 +388,6 @@ def test_metropolis_free_energy_single_batched_eval_matches_per_sequence_sum(mod
         return real_fe(*args, **kwargs)
 
     monkeypatch.setattr(e_step_module, "free_energy_value", _counting_fe)
-    total = m._metropolis_free_energy(belief, mu_p, sigma_p, mode=mode)
+    total = m._metropolis_free_energy(context.belief, context, mode=mode)
     assert calls["n"] == 1, f"expected ONE batched F eval, got {calls['n']} (per-sequence loop)"
     assert total == pytest.approx(ref, rel=1e-5, abs=1e-5)

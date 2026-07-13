@@ -358,7 +358,7 @@ def free_energy_value(
     e_step_update:             str  = "gradient",      # accepted-and-ignored iteration-only knob
     mass_phi:                  float = 0.0,            # accepted-and-ignored iteration-only knob (phi penalty)
     mm_damping:                float = 1.0,            # accepted-and-ignored iteration-only knob
-    exp_fp64_norm_threshold:   float = 5.0,            # accepted-and-ignored Tier-1 transport-numerics knob
+    exp_fp64_norm_threshold:   float = 5.0,            # HONORED: forwarded to the global-F _transport float64-island keying
 
     include_attention_entropy: bool = True,
     skip_belief_sigma_update:  bool = False,           # accepted-and-ignored iteration-only knob
@@ -371,7 +371,7 @@ def free_energy_value(
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
     gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
-    exp_fp64_mode:             str  = "dim",           # accepted-and-ignored Tier-1 transport-numerics knob
+    exp_fp64_mode:             str  = "dim",           # HONORED: forwarded to the global-F _transport float64-island keying
     phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
     spd_retract_mode:          str  = "spd_affine",    # accepted-and-ignored iteration-only knob
@@ -411,9 +411,10 @@ def free_energy_value(
     grid, no entropy term), so the logged F carries the two-hop block the kernel descends.
     ``transport_mean_per_head`` is forwarded to omega-direct element builds. Compact builds retain
     the configured metadata; the legacy noncompact diagnostic seam still materializes its dense
-    operator. The exp-island toggles
-    (``exp_fp64_mode`` / ``exp_fp64_norm_threshold``) remain accepted-and-ignored: they change
-    transport numerics at round-off only, so the diagnostic F keeps the default dim-keyed build.
+    operator. The exp-island toggles (``exp_fp64_mode`` / ``exp_fp64_norm_threshold``) are HONORED for
+    the global (``keys=None``) F: they are forwarded to the ``_transport`` build so the fp64 island keys
+    identically to the model E-step (audit PB-12; the reflection/two-hop scorer reuses this evaluator,
+    so its numerics match the active objective, not a default dim-keyed diagnostic).
     """
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
     # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
@@ -434,6 +435,7 @@ def free_energy_value(
             link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
             cocycle_relaxation=cocycle_relaxation,
             transport_mean_per_head=transport_mean_per_head,
+            exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
         )
     else:
         # The filtered (mixed current-query / frozen-key frame) transport has no regime_ii form;
@@ -515,6 +517,7 @@ def phi_alignment_loss(
     eps:       float = 1e-6,
     mass_phi:  float = 0.0,
     lambda_beta: 'float | torch.Tensor' = 1.0,        # weight on the belief-coupling block (1.0 = pure)
+    lambda_twohop: float = 0.0,                        # weight on the detached two-hop coupling block (0.0 = OFF)
     family:    str   = "gaussian_diagonal",
     divergence_family: str = "renyi",
 
@@ -553,6 +556,13 @@ def phi_alignment_loss(
     energy while the coupling sum uses the unrotated base-transport value energy; beta remains live
     because it is not stationary for that decoupled block. ``reflection`` folds the belief's
     discrete sheet into either transport before its energy is evaluated.
+
+    ``lambda_twohop`` (0.0 = OFF, the pure canonical block) adds the SAME two-hop coupling block the
+    mu/sigma kernels and ``free_energy`` descend, F_2 = lambda_twohop Sum_ik (beta beta)_ik E_ik with
+    DETACHED hop weights W2 = beta beta and NO entropy term, so under lambda_twohop>0 the phi step
+    descends the same objective as the belief step (audit m9 / PB-12). beta comes from the SCORE
+    energy; the summed energy follows the coupling term's value-gauge selection (the score energy on
+    the coherent default, the base VALUE energy under the decoupled RoPE gauge).
     """
     # Build Omega under the ACTIVE connection regime so the phi step descends the SAME objective as
     # the mu/sigma step. regime_ii reads the (fixed) belief means mu and the learned connection_W;
@@ -585,23 +595,38 @@ def phi_alignment_loss(
                                    kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                    irrep_dims=group.irrep_dims)
     mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0
-    if isinstance(omega, RopeTransport) and not omega.on_value:
+    # value_energy is the coupling-sum energy grid: the SCORE energy on the coherent default, the
+    # UN-rotated base VALUE energy under the decoupled RoPE gauge. Both the base coupling block and
+    # the two-hop block sum over it (mirroring free_energy's coupling_energy selection).
+    value_energy = score_energy
+    has_decoupled_value = isinstance(omega, RopeTransport) and not omega.on_value
+    if has_decoupled_value:
         mu_tv = transport_mean(omega.base, mu)
         sigma_tv = transport_covariance(omega.base, sigma)
         value_energy = pairwise_energy(fam(mu, sigma), fam(mu_tv, sigma_tv), alpha=renyi_order,
                                        kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                        irrep_dims=group.irrep_dims)
         zero = score_energy.new_zeros(score_energy.shape[:-1])
-        return free_energy(
+        base = free_energy(
             zero, score_energy, zero,
             tau=tau, lambda_beta=lambda_beta,
             include_attention_entropy=include_attention_entropy,
             log_prior=log_prior, coupling_energy=value_energy,
-        ) + mass
-    if include_attention_entropy:
-        return lambda_beta * reduced_free_energy(score_energy, tau=tau, log_prior=log_prior).sum() + mass
-    beta = attention_weights(score_energy, tau=tau, log_prior=log_prior)
-    return lambda_beta * (beta * score_energy).sum() + mass
+        )
+    elif include_attention_entropy:
+        base = lambda_beta * reduced_free_energy(score_energy, tau=tau, log_prior=log_prior).sum()
+    else:
+        beta = attention_weights(score_energy, tau=tau, log_prior=log_prior)
+        base = lambda_beta * (beta * score_energy).sum()
+    if lambda_twohop != 0.0:
+        # Two-hop coupling block F_2 = lambda_twohop Sum_ik (beta beta)_ik E_ik (audit m9 / PB-12):
+        # DETACHED hop weights W2 = beta beta on the value-gauge energy grid, NO entropy term, so the
+        # phi step descends the SAME objective free_energy / the belief kernels carry under
+        # lambda_twohop>0. Zero-weight is a strict no-op (byte-identical phi values and gradients).
+        beta = attention_weights(score_energy, tau=tau, log_prior=log_prior)
+        hop = beta.detach() @ beta.detach()
+        base = base + lambda_twohop * (hop * value_energy).sum()
+    return base + mass
 
 
 def e_step_iteration(
@@ -934,7 +959,8 @@ def e_step_iteration(
             phi_g = belief.phi.detach().clone().requires_grad_(True)
             L = phi_alignment_loss(
                 mu, sigma, phi_g, group, tau=tau, renyi_order=renyi_order, kl_max=kl_max, eps=eps,
-                mass_phi=mass_phi, lambda_beta=lambda_beta, family=family, divergence_family=divergence_family,
+                mass_phi=mass_phi, lambda_beta=lambda_beta, lambda_twohop=lambda_twohop,
+                family=family, divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy, log_prior=log_prior,
                 transport_mode=transport_mode, cocycle_relaxation=cocycle_relaxation,
                 # gauge-RoPE: the phi step must descend the SAME rotated belief-coupling block as the
