@@ -562,6 +562,29 @@ def test_provenance_records_all_split_hashes_and_data_knobs(tmp_path):
     assert prov["data_n_tokens"] == prov["test_data_n_tokens"]
 
 
+def test_provenance_data_hash_is_dtype_independent(tmp_path):
+    # PB-08 follow-up: TokenWindows now stores tokens in their native cache dtype, so the SAME
+    # corpus content can sit in memory as int32 (uncapped .bin memmap) or int64 (capped load).
+    # The provenance hash is a CONTENT identity pooled by scaling_analysis.py's mixed_corpus
+    # gate; a storage-dtype-only divergence would false-positive that confound check.
+    cfg = _cfg(generate_figures=False)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    content = torch.arange(3).repeat(100)                     # (300,) identical token content
+    loader32 = DataLoader(TokenWindows(content.to(torch.int32), 8), batch_size=8)
+    loader64 = DataLoader(TokenWindows(content.to(torch.int64), 8), batch_size=8)
+
+    finalize_run(model, art, cfg,
+                 train_loader=loader32, val_loader=loader64, test_loader=loader64)
+
+    prov = json.loads((tmp_path / "run" / "provenance.json").read_text(encoding="utf-8"))
+    expected = hashlib.sha256(content.to(torch.int64).numpy().tobytes()).hexdigest()
+    assert prov["train_data_sha256"] == expected              # int32 storage hashes as content
+    assert prov["val_data_sha256"] == expected                # int64 storage: unchanged identity
+    assert prov["train_data_sha256"] == prov["val_data_sha256"]
+    assert prov["train_data_n_tokens"] == prov["val_data_n_tokens"] == 300
+
+
 def test_provenance_git_probe_timeout_records_error(tmp_path, monkeypatch):
     cfg = _cfg()
     model = VFEModel(cfg)

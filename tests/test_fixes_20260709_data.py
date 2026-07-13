@@ -10,6 +10,7 @@ validate_token_range (wired into make_dataloader via ``vocab_size``) rejects tok
 that would overrun the model's cfg.vocab_size-sized tables, naming the tokenizer.
 """
 import ast
+import gc
 import json
 from pathlib import Path
 
@@ -31,10 +32,10 @@ from vfe3.data.datasets import (
 # ---------------------------------------------------------------- Finding 42
 
 
-def _write_pt_cache(tmp_path, dataset="wikitext-103", split="train", n=20):
+def _write_pt_cache(tmp_path, dataset="wikitext-103", split="train", n=20, dtype=torch.int64):
     p = cache_path(dataset, split, suffix="pt", cache_dir=tmp_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    toks = torch.arange(n, dtype=torch.int64)
+    toks = torch.arange(n, dtype=dtype)
     torch.save(toks, p)
     return toks
 
@@ -47,6 +48,91 @@ def _write_bin_cache(tmp_path, dataset="wiki-en", split="test", n=8):
     (p.parent / (p.name + ".meta.json")).write_text(
         json.dumps({"n_tokens": n, "dtype": "int32"}))
     return arr
+
+
+# ---------------------------------------------------------------- PB-08: mapped native-dtype storage
+
+
+def test_uncapped_bin_stays_int32_and_capped_load_is_owned_long(tmp_path):
+    _write_bin_cache(tmp_path, dataset="wiki-en", split="train", n=32)
+    mapped = load_cached_tokens("wiki-en", "train", cache_dir=tmp_path)
+    capped = load_cached_tokens("wiki-en", "train", cache_dir=tmp_path, limit=8)
+    assert mapped.dtype == torch.int32
+    assert mapped.numel() == 32
+    assert capped.dtype == torch.long
+    assert capped.tolist() == list(range(8))
+
+
+def test_uncapped_pt_requests_mmap_and_preserves_native_dtype(tmp_path, monkeypatch):
+    _write_pt_cache(tmp_path, dataset="wiki-en", split="train", n=32, dtype=torch.int32)
+    original = torch.load
+    mmap_values = []
+
+    def tracked_load(*args, **kwargs):
+        mmap_values.append(kwargs.get("mmap"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", tracked_load)
+    mapped = load_cached_tokens("wiki-en", "train", cache_dir=tmp_path)
+    assert mapped.dtype == torch.int32
+    assert mmap_values == [True]
+
+
+def test_uncapped_pt_int8_is_accepted_and_native(tmp_path):
+    # a supported narrow integer dtype (int8) is mapped through uncapped without a widening copy,
+    # and a capped load of the same cache still returns an owned int64 stream.
+    _write_pt_cache(tmp_path, dataset="wikitext-103", split="train", n=16, dtype=torch.int8)
+    mapped = load_cached_tokens("wikitext-103", "train", cache_dir=tmp_path)
+    assert mapped.dtype == torch.int8
+    assert mapped.tolist() == list(range(16))
+    capped = load_cached_tokens("wikitext-103", "train", cache_dir=tmp_path, limit=4)
+    assert capped.dtype == torch.long
+    assert capped.tolist() == list(range(4))
+
+
+@pytest.mark.parametrize("limit", [None, 4])
+@pytest.mark.parametrize("dtype", [torch.bool, torch.float32])
+def test_pt_unsupported_dtype_is_rejected_capped_and_uncapped(tmp_path, dtype, limit):
+    # bool / floating .pt caches are rejected before any slice or cast, so a capped load can never
+    # turn them into apparently-valid long ids (validation precedes slice/cast).
+    p = cache_path("wikitext-103", "train", suffix="pt", cache_dir=tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    toks = torch.zeros(8, dtype=torch.bool) if dtype is torch.bool else torch.arange(8, dtype=dtype)
+    torch.save(toks, p)
+    with pytest.raises(TypeError):
+        load_cached_tokens("wikitext-103", "train", cache_dir=tmp_path, limit=limit)
+
+
+@pytest.mark.parametrize("limit", [None, 4])
+def test_bin_unsupported_dtype_is_rejected(tmp_path, limit):
+    # the NumPy dtype metadata is checked before np.memmap opens the corpus, so a float .bin cache
+    # is rejected (capped or uncapped) without materializing the stream.
+    p = cache_path("wiki-en", "test", suffix="bin", cache_dir=tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    np.arange(8, dtype=np.float32).tofile(p)
+    (p.parent / (p.name + ".meta.json")).write_text(
+        json.dumps({"n_tokens": 8, "dtype": "float32"}))
+    with pytest.raises(TypeError):
+        load_cached_tokens("wiki-en", "test", cache_dir=tmp_path, limit=limit)
+
+
+def test_capped_int64_bin_is_owned_and_source_mutation_cannot_change_it(tmp_path):
+    # a native int64 .bin cap clones the slice (a .to(long) no-op would keep the whole memmap): the
+    # returned tensor holds only the cap's bytes and is immune to a later edit of the backing file.
+    p = cache_path("wiki-en", "train", suffix="bin", cache_dir=tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    np.arange(32, dtype=np.int64).tofile(p)
+    (p.parent / (p.name + ".meta.json")).write_text(
+        json.dumps({"n_tokens": 32, "dtype": "int64"}))
+    capped = load_cached_tokens("wiki-en", "train", cache_dir=tmp_path, limit=8)
+    assert capped.dtype == torch.long
+    assert capped.tolist() == list(range(8))
+    # owned storage: exactly the cap, not the 32-token corpus
+    assert capped.untyped_storage().nbytes() == 8 * capped.element_size()
+    before = capped.clone()
+    gc.collect()                                         # release the memmap handle (Windows) before rewrite
+    np.arange(100, 132, dtype=np.int64).tofile(p)        # overwrite the corpus on disk
+    assert torch.equal(capped, before)
 
 
 def test_load_pt_limit_slices_and_releases_full_storage(tmp_path):
@@ -80,9 +166,15 @@ def test_load_pt_limit_slices_before_int64_materialization(tmp_path, monkeypatch
     events = []
 
     class _LoadProbe:
-        def reshape(self, *_shape):
-            events.append("reshape")
-            return self
+        # a supported native dtype and a contiguous 1-D shape so the pre-slice validation passes;
+        # the capped order is load -> validate (dtype/dim/contiguity) -> slice -> clone -> to(long).
+        dtype = torch.int64
+
+        def dim(self):
+            return 1
+
+        def is_contiguous(self):
+            return True
 
         def __getitem__(self, key):
             assert key == slice(None, 5)
@@ -110,7 +202,7 @@ def test_load_pt_limit_slices_before_int64_materialization(tmp_path, monkeypatch
 
     assert torch.equal(out, torch.arange(5, dtype=torch.long))
     assert seen == [True]
-    assert events == ["reshape", "slice", "clone", "to-int64"]
+    assert events == ["slice", "clone", "to-int64"]
 
 
 def test_load_pt_limit_none_is_unchanged(tmp_path):

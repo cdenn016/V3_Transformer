@@ -799,7 +799,11 @@ def _write_provenance(
             dataset = getattr(loader, "dataset", None)
             tokens = getattr(dataset, "tokens", None)
             if tokens is not None:
-                raw = tokens.detach().cpu().numpy().tobytes()
+                # Hash the CONTENT, not the storage: TokenWindows may hold the stream in its
+                # native cache dtype (int32 memmap) or int64 (capped load), and the pooled
+                # data_sha256 feeds scaling_analysis's mixed_corpus gate -- normalize to int64
+                # so identical corpora hash identically regardless of storage width.
+                raw = tokens.detach().to(torch.long).cpu().numpy().tobytes()
                 prov[sha_key] = hashlib.sha256(raw).hexdigest()
                 prov[n_key] = int(tokens.numel())
         except (AttributeError, RuntimeError, TypeError, ValueError, OSError, MemoryError) as exc:
