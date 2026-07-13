@@ -800,14 +800,49 @@ normalized row variable, a fixed prior for that row, its own relative entropy, a
 stationarity derivation.
 
 The implementation scope is narrower than the full population theory. The term acts only in the
-belief channel; there is no corresponding model-channel $\gamma$ term, and the frame-alignment
-subproblem does not include it. The selected experimental sweep keeps frame refinement off, making
-the latter mismatch inactive. The ordinary reflection-aware belief path retains the term, but the
-Metropolis reflection accept/reject scorer omits it. The no-snapshot E-step trace used by both the
-end-of-run report and `test_results.json::estep_final_f_per_token` also omits it, while production
-validation diagnostics use the captured state and include it.
+belief channel; there is no corresponding model-channel $\gamma$ term. The frame-alignment
+subproblem and the Metropolis reflection accept/reject scorer both now evaluate it, so the
+continuous frame update and the discrete det-sign move descend the same two-hop-augmented objective
+as the mean and covariance updates. The no-snapshot E-step trace used by both the end-of-run report
+and `test_results.json::estep_final_f_per_token` still omits it, while production validation
+diagnostics use the captured state and include it.
 The canonical pure profile retains `lambda_twohop=0.0`; the dedicated ablation evaluates
 `0.0`, `0.001`, `0.005`, and `0.01` as explicitly non-pure extensions.
+
+### One objective for means, covariances, frames, and reflections
+
+The mean update, the covariance update, the continuous frame-alignment step, and the discrete
+reflection accept/reject move all read a single free energy. The E-step descends it over the belief
+tuple; `free_energy_value` evaluates it as a scalar for a fixed belief; and the same evaluator scores
+every reflection proposal. A centralized builder constructs the belief-channel attention log-prior
+the E-step actually descends, folding the detached precision-weighted reliability bias and, under
+`gamma_as_beta_prior`, the detached hierarchical gamma prior onto the raw positional prior at a fixed
+pre-stack seam. The frame-alignment loss and the reflection scorer reuse this same builder, so they
+never score a different prior than the one the belief converged under.
+
+Two conventions keep the reused evaluations exact. The two-hop endpoint weight
+$W^{(2)}=\bar\beta\bar\beta$ is built from detached attention at the current hop, so the frame and
+reflection subproblems inherit the same fixed-hop detach the mean and covariance updates use rather
+than differentiating the source distribution. The candidate-dependent effective prior is recomputed
+per reflection proposal from the fixed captured context and the trial frame: the precision fold reads
+the frozen pre-stack covariance and is blind to the proposed frame, while the tied-gamma fold moves
+with it, so the Metropolis $\Delta F$ is the exact change in the joint free energy under the block
+move. The scorer also uses the final block's entry-derived query-adaptive temperature, the
+handoff-adjusted final-block prior, and the active transport, position, and finite-precision controls,
+so the scored $\Delta F$ matches the free energy the E-step descended.
+
+When every fold is off, the transport is flat, no position rotation is active, and the temperature is
+scalar, the effective prior reduces to the raw attention prior and the final-block prior coincides
+with the encode prior, so the reflection $\Delta F$ equals the earlier raw-prior calculation to
+floating-point round-off. This all-off identity fixes the refactor as a strict extension rather than a
+change of the pure path, and the two-hop block is a byte-identical no-op at `lambda_twohop=0.0`.
+
+The discrete det-sign proposals are gated by Metropolis accept/reject against this objective, drawn
+from a private generator that is threaded across steps and checkpointed independently of the global
+random streams, so a resumed run continues the accept sequence byte-identically. The
+straight-through-estimator variant of the learnable reflection sign remains rejected at construction
+time (`omega_reflection='ste'` and `phi_reflection='ste'` both raise); it is a recorded future
+direction, not an implemented path.
 
 The model channel has its own target-blind objective. It balances the same-scale hyper-prior
 against gamma-weighted transported consensus, then hands its single refined state to both the

@@ -814,3 +814,112 @@ def test_metropolis_folds_off_delta_equals_raw_prior(mode):
     move = m._metropolis_delta_f(context, tid, mode=mode)
     raw = _raw_delta(m, context, tid, mode=mode)
     assert abs(move - raw) < 1e-9, f"[{mode}] refactored={move} raw={raw}"
+
+
+# ==================================================================================================
+# Task 4 (audit PB-12): the final CPU combination matrix and the scope boundary. Mean, covariance,
+# phi, and reflection all descend the ONE objective free_energy_value evaluates; these cells close the
+# remaining crossed axes -- the tied-gamma fold folded onto every valid nonflat transport, the private
+# accept/reject generator surviving a checkpoint round-trip, and the RTX 5090 CUDA smoke (which skips
+# off the GPU). The reflection straight-through estimator stays construction-time rejected (config
+# raises on omega_reflection='ste' / phi_reflection='ste'), so it is out of scope here by design.
+# ==================================================================================================
+# The tied-gamma fold and each nonflat transport are pinned separately above; here they are CROSSED.
+# omega-direct Metropolis is flat-only, so the non-flat connection regimes are phi-reflection only.
+_NONFLAT_TCFG = {
+    "rope_decoupled":         dict(pos_rotation="rope", rope_on_value=False),
+    "rope_on_cov":            dict(pos_rotation="rope", rope_full_gauge=True,
+                                   family="gaussian_full", decode_mode="full"),
+    "regime_ii":              dict(transport_mode="regime_ii"),
+    "regime_ii_covariant":    dict(transport_mode="regime_ii_covariant"),
+    "regime_ii_link":         dict(transport_mode="regime_ii_link"),
+    "regime_ii_link_charted": dict(transport_mode="regime_ii_link_charted"),
+}
+
+
+@pytest.mark.parametrize("tcfg", list(_NONFLAT_TCFG))
+def test_metropolis_delta_matches_active_objective_tied_gamma_nonflat(tcfg):
+    # phi Metropolis with the tied-gamma fold AND a non-flat transport still scores the exact active
+    # DeltaF: the gamma fold reads the proposed frame while the transport bends the energy grid.
+    m = _metro_model("phi", **_GAMMA_OVER, **_NONFLAT_TCFG[tcfg])
+    assert m.cfg.gamma_as_beta_prior and m.cfg.s_frame_mode == "tied"
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode="phi")
+    tid = int(torch.unique(tok)[1])
+    move = m._metropolis_delta_f(context, tid, mode="phi")
+    oracle = _oracle_delta(m, context, tid, mode="phi")
+    assert abs(move) > 0.0, f"[gamma/{tcfg}] delta is vacuously zero"
+    assert abs(move - oracle) < 1e-8, f"[gamma/{tcfg}] move={move} oracle={oracle}"
+
+
+def test_metropolis_checkpoint_private_rng_continuation(tmp_path):
+    # The private accept/reject generator is threaded across steps and checkpointed INDEPENDENTLY of the
+    # global CPU/CUDA RNG (train.py builds it from cfg.seed before resume). A checkpoint save captures
+    # generator.get_state(); load restores it into a fresh, differently-seeded generator, so a resumed
+    # sweep continues the proposal draws byte-identically -- and the sweep itself never touches global RNG.
+    from vfe3.run_artifacts import RunArtifacts, load_checkpoint
+    from vfe3.train import build_optimizer
+
+    m = _metro_model("phi")
+    tok = _metro_tokens()
+    gen = torch.Generator().manual_seed(11)
+    global_before = torch.get_rng_state().clone()
+    m.metropolis_omega_step(tok, generator=gen)                    # advance the private stream
+    m.metropolis_omega_step(tok, generator=gen)
+    assert torch.equal(torch.get_rng_state(), global_before)       # private stream never touched global RNG
+
+    art = RunArtifacts(tmp_path / "run", m.cfg, m)
+    opt = build_optimizer(m, m.cfg)
+    saved = gen.get_state().clone()
+    ckpt = art.save_checkpoint(1, m, opt, m.cfg, metropolis_generator=gen)
+
+    resumed = torch.Generator().manual_seed(999)                   # deliberately different seed
+    assert not torch.equal(resumed.get_state(), saved)
+    load_checkpoint(ckpt, m, opt, metropolis_generator=resumed)
+    assert torch.equal(resumed.get_state(), saved)                 # byte-identical private-RNG restore
+
+    a = [torch.rand((), generator=gen).item() for _ in range(4)]
+    b = [torch.rand((), generator=resumed).item() for _ in range(4)]
+    assert a == b                                                  # the accept-draw continuation is identical
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 4: RTX 5090 CUDA smoke. Runs ONLY under VFE3_TEST_DEVICE=cuda on a CUDA host; skips on CPU.
+# The K=4 omega-Metropolis objective (two-hop + tied-gamma + precision folds) evaluates end-to-end on
+# the GPU with no device mismatch, the private accept generator drives a deterministic proposal
+# sequence, and the global CPU/CUDA RNG streams are untouched. Awaits a GPU run (this host is CPU-only).
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.skipif(DEVICE.type != "cuda" or not torch.cuda.is_available(),
+                    reason="RTX 5090 CUDA smoke: set VFE3_TEST_DEVICE=cuda on a CUDA host")
+def test_phi_reflection_objective_parity_cuda_smoke():
+    m = _metro_model("omega", lambda_twohop=0.1, precision_weighted_attention=True,
+                     precision_attention_b0=1.5, **_GAMMA_OVER)
+    tok = _metro_tokens()
+    context = m._metropolis_prepare(tok, mode="omega")
+
+    # CUDA-resident objective tensors (no device mismatch). tau is a scalar temperature, not a tensor.
+    for t in (context.belief.mu, context.belief.sigma, context.prior.base_log_prior,
+              context.mu_p, context.sigma_p):
+        assert t.device.type == "cuda"
+    lp = m._effective_beta_log_prior(context.belief, context.prior)
+    assert lp.device.type == "cuda"
+    assert torch.isfinite(lp[torch.isfinite(lp)]).all()
+
+    # Finite scores for the current belief and every trial flip.
+    assert math.isfinite(m._metropolis_free_energy(context.belief, context, mode="omega"))
+    for tid in torch.unique(tok).tolist():
+        trial = m._metropolis_trial_belief(context.belief, context.token_ids, tid, mode="omega")
+        assert math.isfinite(m._metropolis_free_energy(trial, context, mode="omega"))
+
+    # Deterministic private-generator proposal sequence + global CPU/CUDA RNG isolation.
+    cpu_before  = torch.get_rng_state().clone()
+    cuda_before = torch.cuda.get_rng_state_all()
+    gen = torch.Generator().manual_seed(0)
+    m.metropolis_omega_step(tok, generator=gen)
+    ref = torch.Generator().manual_seed(0)
+    for _ in range(int(torch.unique(tok).numel())):
+        torch.rand((), generator=ref)
+    assert torch.equal(gen.get_state(), ref.get_state())           # one deterministic draw per proposal
+    assert torch.equal(torch.get_rng_state(), cpu_before)          # global CPU RNG untouched
+    assert all(torch.equal(a, b)
+               for a, b in zip(torch.cuda.get_rng_state_all(), cuda_before))   # global CUDA RNG untouched
