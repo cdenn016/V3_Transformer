@@ -566,9 +566,9 @@ def test_trajectory_max_annotation_keeps_small_values(tmp_path):
 
 
 def test_plot_capacity_scaling_and_estep_capacity_save(tmp_path):
-    scaling = {"embed_dim": {"x": np.array([20, 40, 64]), "bpc": np.array([7.5, 7.0, 6.8]),
+    scaling = {"embed_dim": {"x": np.array([20, 40, 64]), "bits_per_token": np.array([7.5, 7.0, 6.8]),
                              "lo": np.array([7.4, 6.9, 6.7]), "hi": np.array([7.6, 7.1, 6.9])},
-               "n_layers": {"x": np.array([1, 2, 3]), "bpc": np.array([7.5, 7.1, 7.0])}}
+               "n_layers": {"x": np.array([1, 2, 3]), "bits_per_token": np.array([7.5, 7.1, 7.0])}}
     p1 = tmp_path / "f11a.png"; p2 = tmp_path / "f11b.png"
     fig = plot_capacity_scaling(scaling, path=str(p1)); plt.close(fig)
     fig = plot_estep_capacity(np.array([1, 2, 4]), np.array([7.5, 7.1, 6.9]), np.array([100., 90., 85.]),
@@ -577,7 +577,7 @@ def test_plot_capacity_scaling_and_estep_capacity_save(tmp_path):
 
 
 def test_plot_pareto_frontier_saves(tmp_path):
-    points = {"bpc": np.array([7.5, 7.0, 6.8, 7.2]), "n_params": np.array([1e4, 4e4, 9e4, 2e4]),
+    points = {"bits_per_token": np.array([7.5, 7.0, 6.8, 7.2]), "n_params": np.array([1e4, 4e4, 9e4, 2e4]),
               "wall_time": np.array([10., 30., 60., 18.])}
     p = tmp_path / "f11c.png"
     fig = plot_pareto_frontier(points, path=str(p)); plt.close(fig)
@@ -592,7 +592,11 @@ def test_plot_ablation_forest_and_lr_grid_save(tmp_path):
             "z": np.array([[190., 185., 188.], [186., 180., 184.]]),
             "xlabel": "m_p_mu_lr", "ylabel": "m_p_sigma_lr", "baseline": (0.02, 0.002)}
     p1 = tmp_path / "f12a.png"; p2 = tmp_path / "f12b.png"
-    fig = plot_ablation_forest(rows, path=str(p1)); plt.close(fig)
+    fig = plot_ablation_forest(rows, path=str(p1))
+    # PB-07: the forest x-axis is delta BITS/TOKEN (paired per-token nats / ln 2), not the
+    # character-corrected BPC of the scaling figures -- pin the relabel.
+    assert fig.axes[0].get_xlabel() == r"$\Delta$ bits/token vs full model"
+    plt.close(fig)
     fig = plot_lr_grid_heatmap(grid, path=str(p2)); plt.close(fig)
     assert _saved_nonempty(p1) and _saved_nonempty(p2)
 

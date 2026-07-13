@@ -2735,17 +2735,45 @@ class VFEModel(nn.Module):
             self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
         )
 
-        d = {"attn_entropy": float(metrics.attention_entropy(beta))}
+        # PB-07: route the migrated numeric diagnostics (row entropy, free-energy decomposition,
+        # belief effective rank) through the metric registry instead of three direct calls, so a
+        # config-selected override dispatches here too. The context carries exactly the inputs the
+        # three wrappers read. ``_diag`` is the dimension-based diagonal(N,K)-vs-full(N,K,K) flag
+        # passed explicitly to effective_rank because shape-squareness auto-inference mis-reads a
+        # diagonal (N, K) table as a full covariance when N == K (e.g. max_seq_len == embed_dim).
+        # ``attention_entropy`` (row entropy) is aliased to ``attn_entropy`` so it does not overwrite
+        # the free-energy component of the same name that ``free_energy_terms`` flattens in; the
+        # flatten carries an overwrite-collision guard. Holonomy/gauge metrics keep their bespoke
+        # paths below (they consume sibling confidence bounds / active-frame branches).
         _lb = cfg.lambda_beta   # scaled-F total reflects lambda_beta
-        terms = metrics.free_energy_terms(self_div, energy, beta, alpha,
-                                          tau=_tau_b,
-                                          lambda_beta=_lb, log_prior=log_prior,
-                                          lambda_twohop=cfg.lambda_twohop,
-                                          include_attention_entropy=cfg.include_attention_entropy,
-                                          alpha_reg=(alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
-                                          coupling_energy=coupling_energy,
-                                          log_likelihood=log_likelihood)
-        d.update({k: float(v) for k, v in terms.items()})
+        _diag = out.sigma.dim() == out.mu.dim()                     # diagonal (N,K) vs full (N,K,K)
+        metric_context = {
+            "sigma":                     out.sigma,
+            "diagonal":                  _diag,
+            "self_div":                  self_div,
+            "energy":                    energy,
+            "beta":                      beta,
+            "alpha":                     alpha,
+            "tau":                       _tau_b,
+            "lambda_beta":               _lb,
+            "lambda_twohop":             cfg.lambda_twohop,
+            "include_attention_entropy": cfg.include_attention_entropy,
+            "log_prior":                 log_prior,
+            "alpha_reg":                 (alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
+            "coupling_energy":           coupling_energy,
+            "log_likelihood":            log_likelihood,
+        }
+        registered = metrics.compute_metrics(list(metrics.DIAGNOSTIC_METRIC_NAMES), **metric_context)
+        d: Dict[str, float] = {}
+        for metric_name, output_name, flatten in metrics.DIAGNOSTIC_METRIC_OUTPUTS:
+            value = registered[metric_name]
+            if flatten:
+                overlap = set(value) & set(d)
+                if overlap:
+                    raise KeyError(f"diagnostic metric {metric_name!r} would overwrite {sorted(overlap)}")
+                d.update({key: float(item) for key, item in value.items()})
+            else:
+                d[output_name] = float(value)
         # Raw (un-regularized) belief->prior drift sum_i D(q_i||p_i): the divergence WITHOUT the
         # alpha_i coefficient OR the R(alpha_i) regularizer that free_energy_terms folds into
         # self_coupling. Under lambda_alpha_mode='constant' (alpha=1, R=0) the two coincide; under the
@@ -2809,8 +2837,6 @@ class VFEModel(nn.Module):
                 hyper_prior_rows, model_coupling_rows, meta_entropy_rows,
                 belief_rows.observation_nll,
                 q_reduction="sum", model_reduction="sum").total)
-        spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
-        d["effective_rank"] = float(metrics.effective_rank(spec).mean())
         # Gauge-geometry probes (diagnostics tier): the curvature proxy -- mean Frobenius departure
         # of the triangle holonomy Omega_ij Omega_jk Omega_ki from I (0 for the flat phi-cocycle) --
         # and the spread of log|det Omega| = tr(embed(phi)) across tokens (0 at phi=0). Pure
@@ -2825,10 +2851,9 @@ class VFEModel(nn.Module):
         # the existing block values are untouched (test_model_channel_diagnostics pins total's closure;
         # test_regime_ii pins d["holonomy_deviation"], whose semantics is preserved as the mean below).
         _LOG2 = 0.6931471805599453                                   # row-entropy floor for a 2-way split
-        _diag = out.sigma.dim() == out.mu.dim()                      # diagonal (N,K) vs full (N,K,K);
-        #   passed explicitly to the spectrum/Fisher/guard metrics below because shape-squareness
-        #   auto-inference mis-reads a diagonal (N, K) table as a full covariance when N == K
-        #   (e.g. max_seq_len == embed_dim) -- the same dim-based test the effective_rank line uses.
+        # ``_diag`` (diagonal (N,K) vs full (N,K,K)) is computed once in the registry-dispatch block
+        # above and reused by the spectrum/Fisher/guard metrics below; it is passed explicitly because
+        # shape-squareness auto-inference mis-reads a diagonal (N, K) table as full when N == K.
 
         hol = metrics.holonomy_deviation_sampled(omega)
         d["holonomy_deviation"] = float(hol["mean"])                 # unchanged key/semantics

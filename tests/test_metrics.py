@@ -107,6 +107,7 @@ def test_compute_metrics_registry_record():
     rec = compute_metrics(
         ["effective_rank", "attention_entropy", "holonomy_deviation", "gauge_trace_spread"],
         sigma=torch.rand(4, 3) + 0.5,
+        diagonal=True,                                                # effective_rank REQUIRES the flag (PB-07)
         beta=torch.softmax(torch.randn(4, 4), dim=-1),
         omega=omega,
         phi=phi[0],

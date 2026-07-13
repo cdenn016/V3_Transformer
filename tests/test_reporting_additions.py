@@ -6,11 +6,16 @@ r"""Tests for the 2026-06-28 reporting build-out (surfacing already-logged diagn
   * run_artifacts._pure_path_report reports the toggle/stress state and the on-pure-path flag;
   * train() surfaces the held-out gauge/SPD/Fisher geometry columns into metrics.csv;
   * ablation._seed_aggregate / _base_label group seeds into n/mean/SD/CV;
-  * scaling_analysis._write_scaling_md renders the console-only fits as a markdown report.
+  * scaling_analysis._write_scaling_md renders the console-only fits as a markdown report;
+  * end-to-end: scaling_analysis.analyze() and ablation.main() dispatch capacity_scaling /
+    pareto_frontier / ablation_forest / lr_grid_heatmap through the figure registry by NAME
+    (a monkeypatched registration is what actually produces each PNG) while every legacy output
+    keeps being written (PB-07 registry-completion Task 5).
 
 Device-agnostic (CPU). Figures use the Agg backend.
 """
 import csv as _csv
+import hashlib
 import json
 import logging
 import os
@@ -852,3 +857,180 @@ def test_write_scaling_md(tmp_path):
     for section in ("Pooled L(N) power law", "Per-route exponents", "Frontier-collapse F-test",
                     "E-step structural-EM check", "Provenance and confounds"):
         assert section in text
+
+
+# =============================================================================
+# PB-07 registry-completion Task 5: end-to-end production-driver integration.
+#
+# Both tests below monkeypatch the SPECIFIC registry slot each new figure claims
+# (``vfe3.viz.figures._FIGURES[name]``), not a direct-import reference. If either production
+# driver ever regressed to calling its plotter by direct import (bypassing ``get_figure``), the
+# stub would never run, the asserted PNG would still carry the old real-plot bytes (or be
+# missing entirely), and the captured-kwargs assertion below would KeyError -- so this is a
+# substitution test for "resolves by name", not just an existence check. Both drivers avoid any
+# model replay: ``scaling_analysis.analyze()`` reads only persisted JSON fixtures, and
+# ``ablation.main()`` runs with ``run_single`` stubbed to a fast fabricated cell.
+# =============================================================================
+
+def _write_scaling_validation_run(root, *, route, label, embed_dim, n_params, test_ce,
+                                  best_val_ppl, seed=1, wall_time_s=12.5):
+    r"""One persisted ``scaling_analysis`` run directory carrying BOTH the test-metric fields
+    ``aggregate_points`` reads (feeding the legacy scaling_ce_vs_params.png fit) and the
+    top-level ``best_val_ppl`` / ``wall_time_s`` fields ``aggregate_validation_points`` reads
+    (feeding the two PB-07 registered validation figures)."""
+    run = root / f"{route}_{label}_s{seed}"
+    run.mkdir()
+    (run / "summary.json").write_text(json.dumps({
+        "n_params":      n_params,
+        "best_val_ppl":  best_val_ppl,
+        "wall_time_s":   wall_time_s,
+        "scaling_point": {
+            "n_params": n_params, "n_learnable_params": n_params, "embed_dim": embed_dim,
+            "n_heads": 1, "n_gen": 16, "gauge_group": "glk", "n_layers": 1, "n_e_steps": 1,
+            "tokens_seen": 1000, "test_ce": test_ce,
+        },
+    }), encoding="utf-8")
+    (run / "config.json").write_text(json.dumps({"config": {
+        "seed": seed, "embed_dim": embed_dim, "n_heads": 1, "n_layers": 1, "n_e_steps": 1,
+        "family": "gaussian_diagonal",
+    }}), encoding="utf-8")
+    (run / "scaling_cell.json").write_text(json.dumps({
+        "route": route, "scale_knob": "embed_dim", "label": label,
+    }), encoding="utf-8")
+    (run / "provenance.json").write_text(json.dumps({
+        "seed": seed, "git_sha": "git-a", "train_data_sha256": "train-a",
+        "val_data_sha256": "val-a", "test_data_sha256": "test-a", "data_sha256": "test-a",
+    }), encoding="utf-8")
+
+
+def _stub_registered_figure(name, cap):
+    r"""A registered-figure stub that records the exact kwargs its caller resolved for ``name``
+    and writes a real (nonempty) PNG to ``path``, standing in for the true plotter."""
+    def _fn(*, path=None, **kwargs):
+        cap[name] = kwargs
+        fig = plt.figure()
+        if path is not None:
+            fig.savefig(path)
+        return fig
+    return _fn
+
+
+def test_scaling_analyze_dispatches_registered_figures_by_name_and_keeps_legacy_outputs(
+    tmp_path, monkeypatch,
+):
+    # Tiny persisted scaling fixture: 3 embed_dim points on route "grow_K" (AXIS_ROUTES maps the
+    # embed_dim axis to this route), each carrying a finite test_ce (legacy fit) and best_val_ppl
+    # (the PB-07 validation figures) so both the legacy and the two new figures have enough points.
+    _write_scaling_validation_run(tmp_path, route="grow_K", label="K8",  embed_dim=8,
+                                  n_params=100, test_ce=4.5, best_val_ppl=30.0)
+    _write_scaling_validation_run(tmp_path, route="grow_K", label="K16", embed_dim=16,
+                                  n_params=200, test_ce=4.2, best_val_ppl=24.0)
+    _write_scaling_validation_run(tmp_path, route="grow_K", label="K32", embed_dim=32,
+                                  n_params=400, test_ce=4.0, best_val_ppl=20.0)
+
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+
+    cap = {}
+    monkeypatch.setitem(figs._FIGURES, "capacity_scaling", _stub_registered_figure("capacity_scaling", cap))
+    monkeypatch.setitem(figs._FIGURES, "pareto_frontier", _stub_registered_figure("pareto_frontier", cap))
+
+    scaling_analysis.analyze()
+
+    fig_dir = tmp_path / "figures"
+    # The two PB-07 figures exist ONLY because the stub registered under their name ran --
+    # emit_registered_figures resolved them through get_figure("capacity_scaling" / "pareto_frontier").
+    assert (fig_dir / "capacity_scaling.png").exists() and (fig_dir / "capacity_scaling.png").stat().st_size > 0
+    assert (fig_dir / "pareto_frontier.png").exists() and (fig_dir / "pareto_frontier.png").stat().st_size > 0
+    assert "embed_dim" in cap["capacity_scaling"]["scaling"]
+    assert {"bits_per_token", "n_params"} <= set(cap["pareto_frontier"]["points"])
+
+    # Legacy scaling outputs are unaffected: the test-metric report, csv, and headline figure.
+    assert (tmp_path / "scaling_points.csv").exists()
+    assert (tmp_path / "scaling_summary.json").exists()
+    assert (tmp_path / "SCALING_ANALYSIS.md").exists()
+    assert (fig_dir / "scaling_ce_vs_params.png").exists()
+
+
+_FIXED_ABLATION_CODE_IDENTITY = {"git_sha": "a" * 40, "git_dirty": False, "git_dirty_fingerprint": None}
+
+
+def _fake_ablation_source_ok(dataset, split, *, cache_dir=None):
+    return {"format": "pt", "tokenizer_tag": "tiktoken", "size_bytes": len(split),
+            "sha256": "0" * 64 + split, "meta": None, "meta_sha256": None}
+
+
+def test_ablation_main_dispatches_registered_figures_by_name_and_keeps_legacy_outputs(
+    tmp_path, monkeypatch,
+):
+    # Stub the contract-building identity seams exactly as the existing PB-07 ablation-report
+    # tests do (tests/test_ablation_reporting.py::_stub_sweep_identity), and stub run_single so no
+    # model ever trains: each cell's terminal PPL is fabricated, and forest cells additionally
+    # publish a real val_token_nats.pt with a correctly recomputed identity.
+    monkeypatch.setattr(ablation, "_git_code_identity", lambda: dict(_FIXED_ABLATION_CODE_IDENTITY))
+    monkeypatch.setattr(ablation, "cache_source_identity", _fake_ablation_source_ok)
+    monkeypatch.setattr(ablation, "_cleanup", lambda: None)
+
+    forest_offsets = {"baseline": 0.0, "head_mixer_off": 0.4, "precision_attention_off": 0.25}
+
+    def fake_run_single(label, overrides, run_dir, **kwargs):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        result = {"label": label, "error_kind": None, "seed": 6,
+                  "overrides": ablation._jsonable(overrides)}
+        if kwargs.get("paired_token_bootstrap"):
+            idx = list(forest_offsets).index(label)
+            g = torch.Generator().manual_seed(1000 + idx)
+            vec = torch.rand(48, generator=g, dtype=torch.float32) * 0.1 + 1.0 + forest_offsets[label]
+            tpath = run_dir / "val_token_nats.pt"
+            torch.save(vec, tpath)
+            ppl = float(vec.mean())
+            result.update({
+                "primary_val_ppl": ppl, "final_val_ppl": ppl,
+                "val_token_nats_path":       "val_token_nats.pt",
+                "val_token_nats_sha256":     hashlib.sha256(tpath.read_bytes()).hexdigest(),
+                "val_token_nats_size_bytes": tpath.stat().st_size,
+                "val_token_nats_numel":      int(vec.numel()),
+                "val_token_nats_dtype":      str(vec.dtype),
+            })
+        else:
+            mu, sigma = overrides["e_q_mu_lr"], overrides["e_q_sigma_lr"]
+            ppl = 10.0 + (mu - 0.7) ** 2 * 5.0 + (sigma - 0.0005) ** 2 * 2000.0
+            result.update({"primary_val_ppl": ppl, "final_val_ppl": ppl})
+        return result
+
+    monkeypatch.setattr(ablation, "run_single", fake_run_single)
+
+    cap = {}
+    monkeypatch.setitem(figs._FIGURES, "ablation_forest", _stub_registered_figure("ablation_forest", cap))
+    monkeypatch.setitem(figs._FIGURES, "lr_grid_heatmap", _stub_registered_figure("lr_grid_heatmap", cap))
+
+    monkeypatch.setitem(ablation.CONFIG, "output_dir", str(tmp_path))
+    monkeypatch.setitem(ablation.CONFIG, "device", "cpu")
+    monkeypatch.setitem(ablation.CONFIG, "dataset", "wikitext-103")
+    monkeypatch.setitem(ablation.CONFIG, "resume", False)
+    monkeypatch.setitem(ablation.CONFIG, "seed", 6)
+    monkeypatch.setitem(ablation.CONFIG, "max_tokens", None)
+    monkeypatch.setitem(ablation.CONFIG, "max_steps", None)
+    monkeypatch.setitem(ablation.CONFIG, "list_only", False)
+
+    # Two production main() calls, one per opt-in report sweep (both out of SWEEP_ORDER, so each
+    # must be named explicitly); both write into the same output_dir/figures.
+    monkeypatch.setitem(ablation.CONFIG, "sweep", "component_ablation_forest")
+    ablation.main()
+    monkeypatch.setitem(ablation.CONFIG, "sweep", "e_q_mu_sigma_lr_grid")
+    ablation.main()
+
+    fig_dir = tmp_path / "figures"
+    assert (fig_dir / "ablation_forest.png").exists() and (fig_dir / "ablation_forest.png").stat().st_size > 0
+    assert (fig_dir / "lr_grid_heatmap.png").exists() and (fig_dir / "lr_grid_heatmap.png").stat().st_size > 0
+    assert {r["label"] for r in cap["ablation_forest"]["rows"]} == set(forest_offsets)
+    grid = cap["lr_grid_heatmap"]["grid"]
+    assert grid["z"].shape == (len(ablation._GRID_SIGMA_LRS), len(ablation._GRID_MU_LRS))
+
+    # Legacy per-sweep outputs (CSV, metadata, PPL figure) survive for both sweeps.
+    for name in ("component_ablation_forest", "e_q_mu_sigma_lr_grid"):
+        sweep_dir = tmp_path / name
+        assert (sweep_dir / "sweep_results.csv").exists()
+        assert (sweep_dir / "sweep_meta.json").exists()
+        assert (fig_dir / f"{name}.png").exists()

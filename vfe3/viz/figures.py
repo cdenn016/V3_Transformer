@@ -2294,26 +2294,27 @@ def plot_holonomy_curvature(
 
 @register_figure("capacity_scaling")
 def plot_capacity_scaling(
-    scaling: Dict,                       # {axis_name: {x, bpc, [lo, hi]}}
+    scaling: Dict,                       # {axis_name: {x, bits_per_token, [lo, hi]}}
 
     *,
     path:    Optional[str] = None,
 ):
-    r"""F11 Panel A: capacity scaling of val BPC vs each structural axis (K / heads / layers).
+    r"""F11 Panel A: capacity scaling of validation bits/token vs each structural axis (K / heads /
+    layers).
 
-    Each sub-panel shares the BPC axis; a bootstrap-over-validation-SEQUENCES band (NOT a cross-seed
-    CI -- single-seed protocol) is drawn when ``lo`` / ``hi`` are supplied.
+    Each sub-panel shares the bits/token axis; a bootstrap-over-validation-SEQUENCES band (NOT a
+    cross-seed CI -- single-seed protocol) is drawn when ``lo`` / ``hi`` are supplied.
     """
     keys = list(scaling)
     fig, axes = plt.subplots(1, len(keys), figsize=(4.2 * len(keys), 3.6), squeeze=False)
     for ax, key in zip(axes[0], keys):
         d = scaling[key]
-        x, bpc = _np(d["x"]), _np(d["bpc"])
+        x, bits = _np(d["x"]), _np(d["bits_per_token"])
         order = np.argsort(x)
-        ax.plot(x[order], bpc[order], "o-", color=_CB[0], lw=1.8)
+        ax.plot(x[order], bits[order], "o-", color=_CB[0], lw=1.8)
         if "lo" in d and "hi" in d:
             ax.fill_between(x[order], _np(d["lo"])[order], _np(d["hi"])[order], color=_CB[0], alpha=0.2)
-        ax.set(xlabel=key, ylabel="val BPC", title=f"Scaling vs {key}")
+        ax.set(xlabel=key, ylabel="validation bits/token", title=f"Scaling vs {key}")
     fig.suptitle("Capacity scaling (within-run bootstrap band)")
     fig.tight_layout()
     return _save(fig, path)
@@ -2356,17 +2357,18 @@ def plot_estep_capacity(
 
 @register_figure("pareto_frontier")
 def plot_pareto_frontier(
-    points: Dict,                        # {bpc, n_params, [wall_time], [label]}
+    points: Dict,                        # {bits_per_token, n_params, [wall_time], [label]}
 
     *,
     path:   Optional[str] = None,
 ):
-    r"""F11 Panel C: quality-vs-cost Pareto frontier of val BPC against parameters and wall time.
+    r"""F11 Panel C: quality-vs-cost Pareto frontier of validation bits/token against parameters and
+    wall time.
 
-    Non-dominated cells (lower BPC at lower cost) are connected into a stepwise frontier; dominated
-    points are faded.
+    Non-dominated cells (lower bits/token at lower cost) are connected into a stepwise frontier;
+    dominated points are faded.
     """
-    bpc = _np(points["bpc"])
+    bits = _np(points["bits_per_token"])
     npar = _np(points["n_params"])
     have_time = "wall_time" in points
     ncol = 2 if have_time else 1
@@ -2377,15 +2379,15 @@ def plot_pareto_frontier(
         best = np.inf
         front = np.zeros(cost.size, dtype=bool)
         for k in order:
-            if bpc[k] < best:
-                best = bpc[k]; front[k] = True
-        ax.scatter(cost[~front], bpc[~front], s=24, color="#bbbbbb", label="dominated")
-        ax.scatter(cost[front], bpc[front], s=40, color=_CB[1], label="frontier")
+            if bits[k] < best:
+                best = bits[k]; front[k] = True
+        ax.scatter(cost[~front], bits[~front], s=24, color="#bbbbbb", label="dominated")
+        ax.scatter(cost[front], bits[front], s=40, color=_CB[1], label="frontier")
         fo = order[np.isin(order, np.where(front)[0])]
-        ax.plot(cost[fo], bpc[fo], "-", color=_CB[1], lw=1.5)
+        ax.plot(cost[fo], bits[fo], "-", color=_CB[1], lw=1.5)
         if logx:
             ax.set_xscale("log")
-        ax.set(xlabel=xlabel, ylabel="val BPC")
+        ax.set(xlabel=xlabel, ylabel="validation bits/token")
         ax.legend(fontsize=8, frameon=False)
 
     _draw(axes[0][0], npar, "parameters", True)
@@ -2399,15 +2401,17 @@ def plot_pareto_frontier(
 
 @register_figure("ablation_forest")
 def plot_ablation_forest(
-    rows: list,                          # [{label, delta, [lo], [hi]}] delta-BPC vs the full model
+    rows: list,                          # [{label, delta, [lo], [hi]}] delta bits/token vs the full model
 
     *,
     path: Optional[str] = None,
 ):
-    r"""F12 Panel A: baseline-ladder ablation forest of delta-BPC from the full model.
+    r"""F12 Panel A: baseline-ladder ablation forest of delta bits/token from the full model.
 
     Each disabling ablation is a point with a paired bootstrap-over-tokens interval (single-seed
-    within-run, not a cross-seed CI), sorted by effect size; the zero line is the full model.
+    within-run, not a cross-seed CI), sorted by effect size; the zero line is the full model. The
+    axis is delta bits/token (paired per-token nats divided by ln 2), NOT the character-corrected
+    bits-per-character of the scaling figures.
     """
     rows = sorted(rows, key=lambda r: r["delta"])
     y = np.arange(len(rows))
@@ -2420,7 +2424,7 @@ def plot_ablation_forest(
     ax.axvline(0.0, color="#444444", ls="--", lw=1)
     ax.set_yticks(y)
     ax.set_yticklabels([r["label"] for r in rows])
-    ax.set(xlabel=r"$\Delta$ BPC vs full model", title="Component ablations (paired token bootstrap)")
+    ax.set(xlabel=r"$\Delta$ bits/token vs full model", title="Component ablations (paired token bootstrap)")
     fig.tight_layout()
     return _save(fig, path)
 

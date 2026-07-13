@@ -63,7 +63,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from vfe3.config import VFE3Config
-from vfe3.data.datasets import _tokenizer_tag, cache_source_identity, make_dataloader, tokens_per_char
+from vfe3.data.datasets import (
+    _sha256_file,
+    _tokenizer_tag,
+    cache_source_identity,
+    make_dataloader,
+    tokens_per_char,
+)
 from vfe3.metrics import (
     attention_entropy,
     gauge_equivariance_residual,
@@ -81,7 +87,14 @@ from vfe3.run_artifacts import (
 )
 from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, evaluate, train
-from vfe3.viz.extract import across_layer_belief_trace, attention_entropy_cov_gap, converged_state
+from vfe3.viz.extract import (
+    across_layer_belief_trace,
+    attention_entropy_cov_gap,
+    converged_state,
+    per_unit_eval_nats,
+)
+from vfe3.viz.specs import FigureSpec, emit_registered_figures
+from vfe3.viz.sweep_adapters import ablation_forest_kwargs, lr_grid_heatmap_kwargs
 
 logger = logging.getLogger("ablation")
 
@@ -1316,7 +1329,49 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "warmup_steps", "values": [0, 10, 100, 500, 1000, 5000],
     },
 
-    
+
+}
+
+
+# ---- PB-07 report sweeps: opt-in, NOT in SWEEP_ORDER, values DERIVED from the live entries above ----
+# component_ablation_forest is a single-seed multi-arm sweep that publishes per-cell paired-token nats
+# (paired_token_bootstrap=True) so ablation_forest_kwargs can plot a within-run bootstrap band of the
+# ablation delta in bits/token against the "baseline" arm. e_q_mu_sigma_lr_grid is the Cartesian
+# product of the two one-dimensional E-step learning-rate sweeps plus their baseline operating point,
+# so lr_grid_heatmap_kwargs can expose ridge interactions the 1-D slices cannot. Both are derived from
+# the live one-dimensional entries (not copied), so they track a future edit to those value lists.
+_GRID_MU_LRS = sorted(set([
+    *SWEEPS["e_q_mu_lr"]["values"],
+    BASELINE_CONFIG["e_q_mu_lr"],
+]))
+_GRID_SIGMA_LRS = sorted(set([
+    *SWEEPS["e_q_sigma_lr"]["values"],
+    BASELINE_CONFIG["e_q_sigma_lr"],
+]))
+
+SWEEPS["component_ablation_forest"] = {
+    "description": "paired-token component ablation forest",
+    "configs": [
+        {"label": "baseline"},
+        {"label": "head_mixer_off", "use_head_mixer": False},
+        {"label": "precision_attention_off", "precision_weighted_attention": False},
+    ],
+    "paired_token_bootstrap": True,
+    "forest_baseline_label": "baseline",
+}
+SWEEPS["e_q_mu_sigma_lr_grid"] = {
+    "description": "joint q-mean and q-covariance E-step learning-rate grid",
+    "configs": [
+        {"label": f"mu={mu:g},sigma={sigma:g}",
+         "e_q_mu_lr": mu, "e_q_sigma_lr": sigma}
+        for sigma in _GRID_SIGMA_LRS
+        for mu in _GRID_MU_LRS
+    ],
+    "grid_x": "e_q_mu_lr",
+    "grid_y": "e_q_sigma_lr",
+    "grid_x_values": _GRID_MU_LRS,
+    "grid_y_values": _GRID_SIGMA_LRS,
+    "grid_baseline": (BASELINE_CONFIG["e_q_mu_lr"], BASELINE_CONFIG["e_q_sigma_lr"]),
 }
 
 
@@ -1757,13 +1812,14 @@ def run_single(
     run_dir:     Path,
 
     *,
-    dataset:             str,
-    device:              torch.device,
-    seed:                int,
-    collect_diagnostics:   bool        = False,
-    collect_extrapolation: bool        = False,
-    max_tokens:          Optional[int] = None,
-    max_steps:           Optional[int] = None,
+    dataset:                str,
+    device:                 torch.device,
+    seed:                   int,
+    collect_diagnostics:    bool          = False,
+    collect_extrapolation:  bool          = False,
+    paired_token_bootstrap: bool          = False,
+    max_tokens:             Optional[int] = None,
+    max_steps:              Optional[int] = None,
 ) -> Dict[str, Any]:
     r"""Build a fresh model from baseline+overrides, train it, and score validation.
 
@@ -1860,11 +1916,51 @@ def run_single(
     result: Dict[str, Any] = {
         "label":      label,
         "error_kind": None,
+        "n_params":   n_params,
         "seed":       int(cfg.seed),
         "overrides":  _jsonable(overrides),
         "max_tokens": (int(max_tokens) if max_tokens is not None else None),
     }
     result.update(terminal_result)                           # primary/final/best/terminal_checkpoint headline
+
+    # PB-07 opt-in: publish the per-token validation nats (the paired within-run bootstrap the
+    # component-ablation forest consumes) as an atomic sibling artifact, and record its exact
+    # byte/tensor identity in the marker. Written BEFORE run_sweep publishes the reuse contract and
+    # completion marker, so the post-contract validator binds bytes that already exist on disk. The
+    # stable, unshuffled validation loader plus the shared seed make the vector position-aligned
+    # across arms. This per-unit extraction is the ONLY added validation replay; aggregate final
+    # validation stays owned by the terminal callback above.
+    token_identity: Optional[Dict[str, Any]] = None
+    if paired_token_bootstrap:
+        per_token = per_unit_eval_nats(model, val_loader, device=device)["per_token_nats"]
+        final_path = run_dir / "val_token_nats.pt"
+        tmp_path = run_dir / "val_token_nats.pt.tmp"
+        torch.save(per_token.detach().cpu(), tmp_path)
+        _atomic_replace(final_path, tmp_path)
+        token_identity = {
+            "path":       final_path.name,
+            "sha256":     _sha256_file(final_path),
+            "size_bytes": final_path.stat().st_size,
+            "numel":      int(per_token.numel()),
+            "dtype":      str(per_token.dtype),
+        }
+    result["paired_token_bootstrap"] = bool(paired_token_bootstrap)
+    result["val_token_nats_path"] = (
+        token_identity["path"] if token_identity is not None else None
+    )
+    result["val_token_nats_sha256"] = (
+        token_identity["sha256"] if token_identity is not None else None
+    )
+    result["val_token_nats_size_bytes"] = (
+        token_identity["size_bytes"] if token_identity is not None else None
+    )
+    result["val_token_nats_numel"] = (
+        token_identity["numel"] if token_identity is not None else None
+    )
+    result["val_token_nats_dtype"] = (
+        token_identity["dtype"] if token_identity is not None else None
+    )
+
     if collect_diagnostics:                                  # opt-in converged-state probes (S2)
         result.update(_cell_diagnostics(model, cfg, val_loader, device))
     if collect_extrapolation:                                # opt-in growing-N eval (H1/EXP-13)
@@ -1893,6 +1989,9 @@ _CSV_COLUMNS = [
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
     "rank_resid", "cov_gap", "energy_klmax_frac",
+    # opt-in paired-token artifact identity (PB-07; empty unless the sweep sets paired_token_bootstrap)
+    "paired_token_bootstrap", "val_token_nats_path", "val_token_nats_sha256",
+    "val_token_nats_size_bytes", "val_token_nats_numel", "val_token_nats_dtype",
     "wall_time_s", "seed", "error",
 ]
 
@@ -2010,6 +2109,58 @@ def _cell_is_current(
     return dict(loaded) == dict(expected_contract)
 
 
+def _paired_token_artifact_is_current(run_dir: Path, *, required: bool) -> bool:
+    r"""Return true only when the requested paired-token artifact is present and its identity verifies.
+
+    The cell contract's sorted ``diagnostic_flags`` binds the REQUEST (was paired_token_bootstrap
+    asked for); this post-contract validator binds the requested ARTIFACT's exact bytes and tensor
+    schema so a stale, tampered, or same-shape-but-different-bytes ``val_token_nats.pt`` forces a
+    re-run rather than a cache hit. When the sweep did not request the artifact (``required`` false)
+    there is nothing to bind, so it returns true immediately. Otherwise the completion marker must
+    record a real ``paired_token_bootstrap`` true, ``val_token_nats_path == "val_token_nats.pt"``,
+    and the exact SHA-256 / byte size / tensor length / dtype fields, the file must exist, its
+    recomputed streamed hash and byte size must match, and a ``weights_only`` safe load must yield a
+    finite, nonempty, one-dimensional tensor whose numel and string dtype equal the marker. Any
+    missing, malformed, or nonexact field fails closed.
+    """
+    if not required:
+        return True
+    try:
+        marker = json.loads((run_dir / "ablation_result.json").read_text(encoding="utf-8"))
+    except Exception:                                        # no/unreadable marker -> re-run
+        return False
+    if not isinstance(marker, Mapping):
+        return False
+    if marker.get("paired_token_bootstrap") is not True:
+        return False
+    if marker.get("val_token_nats_path") != "val_token_nats.pt":
+        return False
+    expected_sha   = marker.get("val_token_nats_sha256")
+    expected_size  = marker.get("val_token_nats_size_bytes")
+    expected_numel = marker.get("val_token_nats_numel")
+    expected_dtype = marker.get("val_token_nats_dtype")
+    if not (isinstance(expected_sha, str) and expected_sha):
+        return False
+    path = run_dir / "val_token_nats.pt"
+    if not path.is_file():
+        return False
+    if path.stat().st_size != expected_size:
+        return False
+    if _sha256_file(path) != expected_sha:
+        return False
+    try:
+        tensor = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return False
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    if tensor.ndim != 1 or tensor.numel() == 0:
+        return False
+    if int(tensor.numel()) != expected_numel or str(tensor.dtype) != expected_dtype:
+        return False
+    return bool(torch.isfinite(tensor).all())
+
+
 def _sanitize(label: str) -> str:
     r"""A filesystem-safe single path component (no separators, parent tokens, or drive colon).
 
@@ -2082,8 +2233,9 @@ def run_sweep(
     sweep_dir = output_dir / sweep_name
     sweep_dir.mkdir(parents=True, exist_ok=True)
     runs = make_run_overrides(sweep_name)
-    collect_diagnostics   = bool(sweep.get("collect_diagnostics", False))
-    collect_extrapolation = bool(sweep.get("collect_extrapolation", False))
+    collect_diagnostics    = bool(sweep.get("collect_diagnostics", False))
+    collect_extrapolation  = bool(sweep.get("collect_extrapolation", False))
+    paired_token_bootstrap = bool(sweep.get("paired_token_bootstrap", False))
     # Multi-seed (I1/EXP-1): a sweep may declare ``seeds`` to replicate every cell across seeds for an
     # across-seed error bar. Each (cell, seed) gets its own ``{label}__s{seed}`` run dir and result row
     # (the seed also lives in the existing ``seed`` column), so the across-seed aggregate is a plain
@@ -2100,8 +2252,9 @@ def run_sweep(
           f"\n  Output: {sweep_dir}{'  [resume ON]' if resume else ''}\n{'=' * 70}")
 
     diagnostic_flags = {
-        "collect_diagnostics":   collect_diagnostics,
-        "collect_extrapolation": collect_extrapolation,
+        "collect_diagnostics":    collect_diagnostics,
+        "collect_extrapolation":  collect_extrapolation,
+        "paired_token_bootstrap": paired_token_bootstrap,
     }
 
     results: List[Dict[str, Any]] = []
@@ -2120,7 +2273,12 @@ def run_sweep(
             expected_contract = _expected_cell_contract_or_none(
                 overrides, dataset, diagnostic_flags, seed=cell_seed,
                 max_steps=max_steps, max_tokens=max_tokens)
-            if expected_contract is not None and _cell_is_current(run_dir, expected_contract):
+            # The contract binds the request (diagnostic_flags carries paired_token_bootstrap); a
+            # separate post-contract validator binds the requested artifact's exact bytes/schema, so a
+            # missing or drifted val_token_nats.pt forbids reuse even when the contract still matches.
+            if (expected_contract is not None
+                    and _cell_is_current(run_dir, expected_contract)
+                    and _paired_token_artifact_is_current(run_dir, required=paired_token_bootstrap)):
                 print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
                 results.append(json.loads(marker.read_text(encoding="utf-8")))
                 continue
@@ -2132,6 +2290,7 @@ def run_sweep(
             result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
                                  seed=cell_seed, collect_diagnostics=collect_diagnostics,
                                  collect_extrapolation=collect_extrapolation,
+                                 paired_token_bootstrap=paired_token_bootstrap,
                                  max_tokens=max_tokens, max_steps=max_steps)
         except Exception as exc:                             # a training crash must not kill the sweep
             logger.exception("sweep %s / %s crashed", sweep_name, label)
@@ -2144,6 +2303,14 @@ def run_sweep(
         result.setdefault("error_kind", None)
         result["collect_diagnostics"]   = collect_diagnostics
         result["collect_extrapolation"] = collect_extrapolation
+        # The request flag always lands in the marker; the artifact identity fields default to null on
+        # any path (crash, or a sweep that did not request the artifact) so the CSV/adapters stay whole.
+        result["paired_token_bootstrap"] = paired_token_bootstrap
+        result.setdefault("val_token_nats_path", None)
+        result.setdefault("val_token_nats_sha256", None)
+        result.setdefault("val_token_nats_size_bytes", None)
+        result.setdefault("val_token_nats_numel", None)
+        result.setdefault("val_token_nats_dtype", None)
         try:
             terminal_ppl = float(result["final_val_ppl"])
         except (KeyError, TypeError, ValueError):
@@ -2221,6 +2388,16 @@ def run_sweep(
         "dataset":     dataset,
         "seed":        (cell_seeds if multiseed else seed),
         "timestamp":   time.strftime("%Y-%m-%d %H:%M:%S"),
+        # PB-07 report metadata (null for ordinary sweeps): lets the ablation-forest / joint-LR-grid
+        # adapters operate after a process restart, when only the persisted sweep view survives.
+        "paired_token_bootstrap": paired_token_bootstrap,
+        "forest_baseline_label":  sweep.get("forest_baseline_label"),
+        "grid_x":                 sweep.get("grid_x"),
+        "grid_y":                 sweep.get("grid_y"),
+        "grid_x_values":          sweep.get("grid_x_values"),
+        "grid_y_values":          sweep.get("grid_y_values"),
+        "grid_baseline":          (list(sweep["grid_baseline"])
+                                   if sweep.get("grid_baseline") is not None else None),
     }, indent=2), encoding="utf-8")
 
     # Final whole-frame write over the accumulated union (also covers the all-cached case, where
@@ -2913,10 +3090,38 @@ def main() -> None:
           f"\n  sweeps:  {', '.join(sweep_names)}")
 
     for name in sweep_names:
-        run_sweep(name, output_dir, dataset=CONFIG["dataset"], device=device,
-                  seed=CONFIG["seed"], resume=CONFIG["resume"],
-                  max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"])
+        union = run_sweep(name, output_dir, dataset=CONFIG["dataset"], device=device,
+                          seed=CONFIG["seed"], resume=CONFIG["resume"],
+                          max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"])
         sweep_dir = output_dir / name
+
+        # PB-07 registered ablation figures: dispatch the forest / joint-LR-grid figures through the
+        # figure registry from the persisted sweep view (metadata + accumulated rows). A spec whose
+        # adapter returns None (missing baseline arm / incomplete grid) is skipped, never fabricated;
+        # an ordinary sweep declares neither key, so `specs` is empty and this is a no-op.
+        sweep = SWEEPS[name]
+        meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
+        report_context = {
+            "sweep_dir":     sweep_dir,
+            "rows":          union,
+            "baseline_label": meta.get("forest_baseline_label"),
+            "grid_x":        meta.get("grid_x"),
+            "grid_y":        meta.get("grid_y"),
+            "grid_x_values": meta.get("grid_x_values"),
+            "grid_y_values": meta.get("grid_y_values"),
+            "baseline":      tuple(meta["grid_baseline"]) if meta.get("grid_baseline") else None,
+        }
+        specs = []
+        if sweep.get("paired_token_bootstrap"):
+            specs.append(FigureSpec("ablation_forest", "ablation_forest.png",
+                         lambda ctx: ablation_forest_kwargs(ctx["sweep_dir"], ctx["baseline_label"])))
+        if sweep.get("grid_x") and sweep.get("grid_y"):
+            specs.append(FigureSpec("lr_grid_heatmap", "lr_grid_heatmap.png",
+                         lambda ctx: lr_grid_heatmap_kwargs(
+                             ctx["rows"], ctx["grid_x"], ctx["grid_y"],
+                             ctx["grid_x_values"], ctx["grid_y_values"], ctx["baseline"])))
+        emit_registered_figures(specs, report_context, fig_dir)
+
         analyze_sweep(sweep_dir)                             # this sweep's table (accumulated)
         _plot_one_sweep(sweep_dir, fig_dir)                 # this sweep's PPL figure (tacked on)
         _plot_seed_aggregate(sweep_dir, fig_dir)           # multi-seed mean+/-SD forest (no-op if single-seed)

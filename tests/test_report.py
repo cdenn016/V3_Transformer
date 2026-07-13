@@ -6,9 +6,11 @@ trained run produced only one of the publication figures. The proof is PNG files
 integration test asserts the figure set actually appears when the driver runs the real model.
 """
 
+import logging
 from dataclasses import asdict
 from types import SimpleNamespace
 
+import matplotlib.pyplot as plt
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -19,7 +21,9 @@ from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts, finalize_run, semantic_config_fingerprint
 from vfe3.train import train
 from vfe3.viz.extract import converged_state
+from vfe3.viz.figures import register_figure
 from vfe3.viz.report import generate_figures, vocab_comparison_figures
+from vfe3.viz.specs import FigureSpec, emit_registered_figures
 
 
 def _loader(seed=0, n=600, seq_len=8, bs=8):
@@ -286,3 +290,132 @@ def test_generate_figures_emits_s_channel_under_s_e_step(tmp_path):
     off = _model(s_e_step=False)
     written_off = {p.name for p in generate_figures(tmp_path / "off", model=off, loader=_loader(), max_sequences=16)}
     assert "s_channel_refinement.png" not in written_off
+
+
+# ---------------------------------------------------------------------------
+# vfe3.viz.specs: declarative registered-report dispatch seam (PB-07).
+# ---------------------------------------------------------------------------
+
+def _one_axis_figure(path):
+    fig, ax = plt.subplots()
+    ax.plot([0, 1], [0, 1])
+    if path is not None:
+        fig.savefig(path)
+    return fig
+
+
+def test_emit_registered_figure_uses_registry(tmp_path, monkeypatch):
+    seen = {}
+
+    @register_figure("report_probe", override=True)
+    def probe(*, value, path=None):
+        seen["value"] = value
+        return _one_axis_figure(path)
+
+    spec = FigureSpec("report_probe", "probe.png", lambda ctx: {"value": ctx["value"]})
+    written = emit_registered_figures([spec], {"value": 7}, tmp_path)
+    assert [p.name for p in written] == ["probe.png"]
+    assert seen == {"value": 7}
+
+
+def test_emit_registered_figure_atomically_replaces_existing_target_on_success(tmp_path):
+    @register_figure("report_probe_replace", override=True)
+    def probe(*, path=None):
+        return _one_axis_figure(path)
+
+    target = tmp_path / "replace.png"
+    target.write_bytes(b"SENTINEL")
+    before = set(plt.get_fignums())
+    spec = FigureSpec("report_probe_replace", "replace.png", lambda ctx: {})
+    written = emit_registered_figures([spec], {}, tmp_path)
+    assert written == [target]
+    assert target.read_bytes() != b"SENTINEL"
+    assert target.stat().st_size > 0
+    assert not list(tmp_path.glob(".replace.*.tmp*"))
+    assert set(plt.get_fignums()) == before
+
+
+def test_emit_registered_figure_skips_when_adapter_returns_none(tmp_path, caplog):
+    target = tmp_path / "skip.png"
+    target.write_bytes(b"SENTINEL")
+    before = set(plt.get_fignums())
+    spec = FigureSpec("report_probe", "skip.png", lambda ctx: None)
+    with caplog.at_level(logging.WARNING):
+        written = emit_registered_figures([spec], {}, tmp_path)
+    assert written == []
+    assert target.read_bytes() == b"SENTINEL"
+    assert not list(tmp_path.glob(".skip.*.tmp*"))
+    assert set(plt.get_fignums()) == before
+    assert caplog.records == []                                      # intentional skip logs no warning
+
+
+def test_emit_registered_figure_closes_figure_when_builder_raises_after_creating_one(tmp_path, caplog):
+    @register_figure("report_probe_raise_after_create", override=True)
+    def probe(*, path=None):
+        plt.subplots()                                                # leaked figure the sweep must close
+        raise RuntimeError("boom after create")
+
+    target = tmp_path / "raise.png"
+    target.write_bytes(b"SENTINEL")
+    before = set(plt.get_fignums())
+    spec = FigureSpec("report_probe_raise_after_create", "raise.png", lambda ctx: {})
+    with caplog.at_level(logging.WARNING):
+        written = emit_registered_figures([spec], {}, tmp_path)
+    assert written == []
+    assert target.read_bytes() == b"SENTINEL"
+    assert not list(tmp_path.glob(".raise.*.tmp*"))
+    assert set(plt.get_fignums()) == before
+    assert len(caplog.records) == 1
+    assert "report_probe_raise_after_create" in caplog.text
+
+
+def test_emit_registered_figure_flags_builder_that_returns_without_writing(tmp_path, caplog):
+    @register_figure("report_probe_no_write", override=True)
+    def probe(*, path=None):
+        fig, ax = plt.subplots()
+        ax.plot([0, 1], [0, 1])
+        return fig                                                    # never saves to `path`
+
+    target = tmp_path / "nowrite.png"
+    target.write_bytes(b"SENTINEL")
+    before = set(plt.get_fignums())
+    spec = FigureSpec("report_probe_no_write", "nowrite.png", lambda ctx: {})
+    with caplog.at_level(logging.WARNING):
+        written = emit_registered_figures([spec], {}, tmp_path)
+    assert written == []
+    assert target.read_bytes() == b"SENTINEL"
+    assert not list(tmp_path.glob(".nowrite.*.tmp*"))
+    assert set(plt.get_fignums()) == before
+    assert "did not write its temporary output" in caplog.text
+
+
+def test_emit_registered_figure_flags_missing_registry_key(tmp_path, caplog):
+    target = tmp_path / "missing.png"
+    target.write_bytes(b"SENTINEL")
+    before = set(plt.get_fignums())
+    spec = FigureSpec("report_probe_does_not_exist", "missing.png", lambda ctx: {})
+    with caplog.at_level(logging.WARNING):
+        written = emit_registered_figures([spec], {}, tmp_path)
+    assert written == []
+    assert target.read_bytes() == b"SENTINEL"
+    assert not list(tmp_path.glob(".missing.*.tmp*"))
+    assert set(plt.get_fignums()) == before
+    assert "report_probe_does_not_exist" in caplog.text
+
+
+def test_emit_registered_figures_rejects_duplicate_output_names_before_dispatch(tmp_path):
+    target = tmp_path / "dup.png"
+    target.write_bytes(b"SENTINEL")
+    calls = []
+
+    def adapter(ctx):
+        calls.append(1)
+        return {}
+
+    spec_a = FigureSpec("report_probe", "dup.png", adapter)
+    spec_b = FigureSpec("report_probe", "dup.png", adapter)
+    with pytest.raises(ValueError, match="unique"):
+        emit_registered_figures([spec_a, spec_b], {}, tmp_path)
+    assert calls == []
+    assert target.read_bytes() == b"SENTINEL"
+    assert not list(tmp_path.glob(".dup.*.tmp*"))
