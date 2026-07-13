@@ -15,12 +15,54 @@ pushforward; the honest sigma treatment belongs to the deferred F-term phase -- 
 use_head_mixer family.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch import nn
 
 from vfe3.geometry.cg import cg_intertwiners, cg_selection
+
+
+class CGMomentResult(NamedTuple):
+    r"""Post-CG belief moments plus the exact analytic Jacobian of the mean map.
+
+    ``mu`` is mu + delta (the bilinear CG update); ``sigma`` is the pushed-forward covariance
+    (untouched under ``cg_covariance_mode='passthrough'``, the symmetrized delta-method image
+    sym(J Sigma J^T) under 'delta_full'); ``jacobian`` is J = d mu_out / d mu at the current mean,
+    (..., K, K). At zero path weights J is exactly the identity, mu == input mu, and sigma is the
+    input sigma exactly."""
+    mu:       torch.Tensor
+    sigma:    torch.Tensor
+    jacobian: torch.Tensor
+
+
+def cg_moment_energy_rows(
+    pre_mu:     torch.Tensor,             # (..., N, K) pre-CG belief means
+    pre_sigma:  torch.Tensor,             # (..., N, K) or (..., N, K, K) pre-CG covariance
+    post_mu:    torch.Tensor,             # (..., N, K) post-CG belief means
+    post_sigma: torch.Tensor,             # (..., N, K) or (..., N, K, K) post-CG covariance
+
+    *,
+    renyi_order:       float = 1.0,
+    kl_max:            float = 100.0,
+    eps:               float = 1e-6,
+    family:            str   = "gaussian_diagonal",
+    divergence_family: str   = "renyi",
+) -> torch.Tensor:                        # (..., N) D(q_post || q_pre)
+    r"""Per-token post-CG moment divergence D(q_post || q_pre) via the active-family divergence seam.
+
+    The q-only CG moment regularizer: the full-K self-divergence of the post-CG belief against its
+    pre-CG value (means-only under 'passthrough', mean-and-covariance under 'delta_full'). NOT a
+    second hierarchical total -- it reads only the belief (q) channel, never s/p/h. Divergence- and
+    family-agnostic: ``divergence_family`` selects the functional, ``family`` the covariance kernel.
+    """
+    from vfe3.families.base import get_family
+    from vfe3.free_energy import self_divergence
+    fam = get_family(family)
+    return self_divergence(
+        fam(post_mu, post_sigma), fam(pre_mu, pre_sigma),
+        alpha=renyi_order, kl_max=kl_max, eps=eps, divergence_family=divergence_family,
+    )
 
 
 class CGCoupling(nn.Module):
@@ -34,9 +76,11 @@ class CGCoupling(nn.Module):
         irrep_labels: Optional[List[str]],       # per-block labels (REQUIRED non-None)
 
         *,
-        atol:         float = 1e-8,              # CG null-space solve tolerance (shared with the prune)
+        atol:               float = 1e-8,        # CG null-space solve tolerance (shared with the prune)
+        cg_covariance_mode: str   = "passthrough",  # 'passthrough' | 'delta_full' (delta-method J Sigma J^T)
     ) -> None:
         super().__init__()
+        self.cg_covariance_mode = cg_covariance_mode
         if irrep_labels is None:
             raise ValueError(
                 "CGCoupling requires a labeled irrep tower (gauge_group 'so_n'/'sp_n')"
@@ -148,6 +192,9 @@ class CGCoupling(nn.Module):
         # could never train (audit 2026-06-09 overnight CR2 verifier correction).
         if not torch.is_grad_enabled() and self.is_identity():
             return mu, sigma
+        if self.cg_covariance_mode == "delta_full":
+            res = self.forward_moments(mu, sigma)                 # delta-method covariance pushforward
+            return res.mu, res.sigma
         cg = self._cast_buffers(mu.dtype, mu.device)              # per-(dtype, device), cached
         w = self.path_weights.to(dtype=mu.dtype)                  # one cast, differentiable
         delta = torch.zeros_like(mu)
@@ -160,3 +207,58 @@ class CGCoupling(nn.Module):
             delta[..., sc:sc + dc] = delta[..., sc:sc + dc] \
                 + torch.einsum("cd,...d->...c", cg[t][m], wsum)
         return mu + delta, sigma
+
+    def forward_moments(
+        self,
+        mu:    torch.Tensor,             # (..., K) belief means
+        sigma: torch.Tensor,             # (..., K) or (..., K, K)
+    ) -> CGMomentResult:
+        r"""Exact analytic moment closure of the bilinear CG map at the current mean.
+
+        The CG update delta^(c) = sum_p w_p C_p(x_p (x) y_p) is BILINEAR in the two source slices
+        of ``mu``, so its Jacobian is exact and analytic (no autograd): for a path C(x (x) y) the two
+        contractions C(. (x) y) and C(x (x) .) are the mean-derivative blocks landing in the
+        (target, source_a) and (target, source_b) sub-blocks of J. J starts at the identity, so at
+        zero path weights J == I, mu_out == mu, and (under 'delta_full') sigma_out == sigma exactly.
+        The covariance is pushed forward by the delta method sigma_out = sym(J Sigma J^T) under
+        'delta_full' (a FIRST-ORDER Gaussian moment closure, explicitly not an exact distributional
+        pushforward), or passed through untouched under 'passthrough'.
+        """
+        cg = self._cast_buffers(mu.dtype, mu.device)              # per-(dtype, device), cached
+        w = self.path_weights.to(dtype=mu.dtype)                  # one cast, differentiable
+        K = mu.shape[-1]
+        delta = torch.zeros_like(mu)
+        eye = torch.eye(K, dtype=mu.dtype, device=mu.device)
+        jac = eye.expand(*mu.shape[:-1], K, K).clone()            # (..., K, K), starts at identity
+        for (t, m, sc, dc, idxs, srcs) in self._groups:
+            sa0, da0, sb0, db0 = srcs[0]                          # da/db/dc constant within a group (fixed triple)
+            Cm = cg[t][m].reshape(dc, da0, db0)                   # (dc, da, db)
+            # Mean delta (same grouped arithmetic as forward).
+            x = torch.stack([mu[..., sa:sa + da] for (sa, da, _sb, _db) in srcs], dim=0)   # (P, ..., da)
+            y = torch.stack([mu[..., sb:sb + db] for (_sa, _da, sb, db) in srcs], dim=0)   # (P, ..., db)
+            xy = (x.unsqueeze(-1) * y.unsqueeze(-2)) \
+                .reshape(len(srcs), *x.shape[1:-1], -1)           # (P, ..., da*db)
+            wsum = torch.einsum("p,p...d->...d", w[idxs], xy)     # (..., da*db)
+            delta[..., sc:sc + dc] = delta[..., sc:sc + dc] \
+                + torch.einsum("cd,...d->...c", Cm.reshape(dc, -1), wsum)
+            # Analytic Jacobian: accumulate the two bilinear contractions per path (source copies
+            # differ within the group; the target block sc is shared). A self-pair (sa == sb) adds
+            # BOTH contractions into the same source columns -- the derivative of C(x (x) x).
+            for local_p, (sa, da, sb, db) in enumerate(srcs):
+                wp = w[idxs[local_p]]
+                xp = mu[..., sa:sa + da]                          # (..., da)
+                yp = mu[..., sb:sb + db]                          # (..., db)
+                j_dx = wp * torch.einsum("cij,...j->...ci", Cm, yp)   # (..., dc, da) = C(. (x) y)
+                jac[..., sc:sc + dc, sa:sa + da] = \
+                    jac[..., sc:sc + dc, sa:sa + da] + j_dx
+                j_dy = wp * torch.einsum("cij,...i->...cj", Cm, xp)   # (..., dc, db) = C(x (x) .)
+                jac[..., sc:sc + dc, sb:sb + db] = \
+                    jac[..., sc:sc + dc, sb:sb + db] + j_dy
+        mu_out = mu + delta
+        if self.cg_covariance_mode == "delta_full":
+            js = torch.einsum("...ij,...jk->...ik", jac, sigma)      # J Sigma
+            jsj = torch.einsum("...ik,...lk->...il", js, jac)        # (J Sigma) J^T
+            sigma_out = 0.5 * (jsj + jsj.transpose(-1, -2))          # symmetrize the delta-method image
+        else:
+            sigma_out = sigma
+        return CGMomentResult(mu_out, sigma_out, jac)

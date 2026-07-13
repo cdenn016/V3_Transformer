@@ -89,9 +89,13 @@ def test_per_coord_bhattacharyya_forward_backward_runs():
 # now finite. This pins that, and contrasts it with the truncated default (oracle_unroll_grad=False).
 # ---------------------------------------------------------------------------
 def _fullcov_model(renyi_order=1.0, oracle_unroll_grad=True, **kw):
+    # PB-14: a noncanonical renyi_order under use_prior_bank=True must read out through the
+    # family-consistent 'family' decoder (the fast 'full' KL kernel is gaussian alpha=1 only);
+    # the canonical order=1 keeps the fast 'full' kernel.
+    decode_mode = kw.pop("decode_mode", "full" if renyi_order == 1.0 else "family")
     cfg = VFE3Config(vocab_size=24, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.02, e_phi_lr=0.01,
-                     family="gaussian_full", decode_mode="full",
+                     family="gaussian_full", decode_mode=decode_mode,
                      use_prior_bank=True, pos_phi="learned",
                      renyi_order=renyi_order, e_step_gradient="unroll",
                      oracle_unroll_grad=oracle_unroll_grad, **kw)

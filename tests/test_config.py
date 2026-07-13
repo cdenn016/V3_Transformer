@@ -664,16 +664,21 @@ def test_bch_pe_order_zero_rejected_when_bch_compose_active():
     VFE3Config(pos_phi="none", bch_pe_order=0)            # inert combination -> accepted
 
 
-def test_nonflat_transport_with_active_model_channel_warns():
-    r"""Audit 2026-07-01 F7 (safe variant): the s-channel (_gamma_energy / _refine_s) transports
-    the s tables under the FLAT phi-cocycle only, so a non-flat belief transport plus an active
-    model channel (lambda_gamma>0 or s_e_step=True) runs different connections per channel --
-    the model-channel comparison is not gauge-covariant. Non-breaking UserWarning."""
-    with pytest.warns(UserWarning, match="non-flat"):
-        VFE3Config(transport_mode="regime_ii", lambda_gamma=1.0)
-    with pytest.warns(UserWarning, match="non-flat"):
-        VFE3Config(transport_mode="regime_ii_covariant", s_e_step=True,
-                   prior_source="model_channel", lambda_gamma=1.0)
+def test_nonflat_transport_with_active_model_channel_no_flat_island_warning():
+    r"""PB-11 (2026-07-12): the s-channel (_gamma_energy / _refine_s) now transports the s tables
+    through cfg.transport_mode with the SAME shared connection the belief channel uses, so the old
+    F7 flat-island warning ("the s-fiber has no non-flat transport law") is obsolete -- a valid
+    nonflat active model channel constructs silently (only the family covariance-action guard remains)."""
+    import warnings
+
+    for kw in (dict(transport_mode="regime_ii", lambda_gamma=1.0),
+               dict(transport_mode="regime_ii_covariant", s_e_step=True,
+                    prior_source="model_channel", lambda_gamma=1.0)):
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            VFE3Config(**kw)
+        assert not [r for r in rec
+                    if "FLAT phi-cocycle" in str(r.message) or "no non-flat transport law" in str(r.message)]
 
 
 def test_flat_or_inactive_model_channel_no_nonflat_warning():

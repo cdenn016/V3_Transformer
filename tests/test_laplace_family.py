@@ -331,3 +331,75 @@ def test_laplace_cuda_matches_cpu():
     x = torch.randint(0, 12, (2, 8), device=dev); y = torch.randint(0, 12, (2, 8), device=dev)
     _, loss, _ = m(x, y); loss.backward()
     assert torch.isfinite(loss)
+
+
+# ===========================================================================
+# PB-14 (Task 5, 2026-07-12): the family-consistent decode reads a Laplace belief out under
+# the Laplace divergence (not a hardcoded Gaussian KL). decode_mode='family' scores
+# logits = -D_configured(q||p_v)/tau_eff through the configured Laplace family + functional,
+# so a non-Gaussian belief + use_prior_bank=True now has a pure, geometry-matched readout.
+# ===========================================================================
+
+from vfe3.divergence import get_functional as _get_functional          # noqa: E402
+from vfe3.model.prior_bank import PriorBank, get_decode                 # noqa: E402
+from vfe3.numerics import bounded_variance_from_log                     # noqa: E402
+
+
+def _laplace_reference_logits(pb, mu_q, sigma_q, tau_eff):
+    family_cls = get_family(pb.family)
+    q = family_cls(mu_q.unsqueeze(-2), sigma_q.unsqueeze(-2))
+    p_sigma = bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps)
+    p = family_cls(pb._decode_mu_table(), p_sigma)
+    functional = _get_functional(pb.divergence_family)
+    energy = functional(q, p, alpha=pb.renyi_order, kl_max=float("inf"), eps=pb.eps)
+    return -energy / tau_eff
+
+
+@pytest.mark.parametrize("alpha", [0.5, 1.0])
+def test_family_decode_matches_direct_functional_laplace(alpha):
+    torch.manual_seed(0)
+    V, K, n_gen = 7, 3, 4
+    pb = PriorBank(V, K, n_gen, decode_tau=1.4, family="laplace_diagonal",
+                   divergence_family="renyi", renyi_order=alpha, decode_mode="family")
+    with torch.no_grad():
+        pb.mu_embed.normal_(0.0, 0.6)
+        pb.sigma_log_embed.normal_(0.0, 0.3)
+    mu_q = torch.randn(2, 4, K); sigma_q = torch.rand(2, 4, K) + 0.3
+    tau_eff = pb._tau_eff()
+    got = get_decode("family")(pb, mu_q, sigma_q, tau_eff)
+    exp = _laplace_reference_logits(pb, mu_q, sigma_q, tau_eff)
+    assert got.shape == (2, 4, V)
+    assert torch.allclose(got, exp, atol=1e-4, rtol=0.0)
+
+
+def test_laplace_family_decode_ranking_differs_from_gaussian_kl():
+    # The same (mu, sigma) tables read out under the Laplace KL rank the vocabulary differently
+    # from the Gaussian KL (the L1 vs L2 penalty on |mu_q - mu_v| and the scale term differ).
+    torch.manual_seed(3)
+    V, K, n_gen = 7, 3, 4
+    lap = PriorBank(V, K, n_gen, family="laplace_diagonal", renyi_order=1.0, decode_mode="family")
+    gauss = PriorBank(V, K, n_gen, family="gaussian_diagonal", renyi_order=1.0, decode_mode="family")
+    with torch.no_grad():
+        mu = torch.randn(V, K); sig_log = (torch.randn(V, K) * 0.5)
+        for pb in (lap, gauss):
+            pb.mu_embed.copy_(mu); pb.sigma_log_embed.copy_(sig_log)
+    mu_q = torch.randn(1, 6, K); sigma_q = torch.rand(1, 6, K) + 0.3
+    tau_eff = lap._tau_eff()
+    lap_logits = get_decode("family")(lap, mu_q, sigma_q, tau_eff)
+    gauss_logits = get_decode("family")(gauss, mu_q, sigma_q, tau_eff)
+    assert not torch.equal(lap_logits.argsort(-1), gauss_logits.argsort(-1))   # ranking genuinely differs
+
+
+def test_laplace_use_prior_bank_requires_family_consistent_decode():
+    # PB-14: a Laplace belief with use_prior_bank=True and a fast gaussian kernel is REJECTED
+    # (the readout would use the wrong geometry); decode_mode='family' is accepted.
+    with pytest.raises(ValueError, match="family-consistent"):
+        VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
+                   family="laplace_diagonal", use_prior_bank=True, decode_mode="diagonal")
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0,
+                     family="laplace_diagonal", use_prior_bank=True, decode_mode="family")
+    m = VFEModel(cfg)
+    x = torch.randint(0, 6, (2, 5)); y = torch.randint(0, 6, (2, 5))
+    _, loss, _ = m(x, y); loss.backward()
+    assert torch.isfinite(loss)

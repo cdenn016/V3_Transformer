@@ -730,3 +730,26 @@ def test_corrupt_embedded_best_bundle_rejected_on_resume(tmp_path, corruption):
     new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
     with pytest.raises(RuntimeError):
         load_checkpoint(ckpt, fresh, artifacts=new_art)
+
+
+def test_full_model_channel_packed_tables_round_trip(tmp_path):
+    r"""PB-11: the full-covariance model-channel packed Cholesky tables (s_sigma_lower_embed and
+    r_sigma_lower) survive a checkpoint save/load exactly, so a resumed full-Gaussian model channel
+    restores its off-diagonal covariance and not just the diagonal log-variance."""
+    cfg = _cfg(family="gaussian_full", decode_mode="full", lambda_h=0.5)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    with torch.no_grad():                                       # make the packed tables genuinely nonzero
+        model.prior_bank.s_sigma_lower_embed.normal_(0.0, 0.4)
+        model.prior_bank.r_sigma_lower.normal_(0.0, 0.4)
+    saved_s = model.prior_bank.s_sigma_lower_embed.detach().clone()
+    saved_r = model.prior_bank.r_sigma_lower.detach().clone()
+    art.save_checkpoint(4, model, opt, cfg)
+
+    fresh = VFEModel(cfg)                                       # a fresh model whose packed tables are still zero
+    assert not torch.equal(fresh.prior_bank.s_sigma_lower_embed, saved_s)
+    load_checkpoint(tmp_path / "r" / "checkpoints" / "step_4.pt", fresh)
+    assert torch.equal(fresh.prior_bank.s_sigma_lower_embed, saved_s)
+    assert torch.equal(fresh.prior_bank.r_sigma_lower, saved_r)

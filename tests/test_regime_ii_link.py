@@ -771,3 +771,108 @@ def test_regime_ii_link_self_edge_stays_identity_after_perturbing_diagonal():
     omega = get_transport("regime_ii_link")(phi, grp, connection_L=connection_l, link_alpha=1.0)["Omega"]
     idx = torch.arange(4)
     assert torch.allclose(omega[idx, idx], torch.eye(K).expand(4, K, K), atol=1e-6)
+
+
+# ===========================================================================
+# PB-11 (Task 3, 2026-07-12): model channel shares the direct-link connection.
+#
+# _gamma_energy builds the s-channel transport through the link registry when configured,
+# forwarding the shared connection_L (+ link_alpha / link_soft_cap). Per the registration
+# metadata the link modes are belief-state-INDEPENDENT (regime_ii_link is batch_independent,
+# neither carries needs_mu / needs_sigma), so the s-channel transport is invariant to the s / q
+# means and covariances; the charted variant additionally depends on the supplied frame phi.
+# ===========================================================================
+
+def _link_gamma_model(mode, **kw):
+    from vfe3.model.model import VFEModel
+
+    base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                n_e_steps=1, lambda_h=0.0, lambda_gamma=0.5, prior_source="model_channel",
+                transport_mode=mode, e_phi_lr=0.0)
+    base.update(kw)
+    torch.manual_seed(0)
+    m = VFEModel(VFE3Config(**base))
+    torch.manual_seed(5)
+    with torch.no_grad():
+        m.prior_bank.s_mu_embed.normal_(0.0, 0.5)
+        m.prior_bank.s_sigma_log_embed.normal_(0.0, 0.3)
+        m.prior_bank.phi_embed.normal_(0.0, 0.2)
+        m.connection_L.normal_(0.0, 0.3)                       # nonzero direct link
+    return m
+
+
+def _link_s_transport(m, phi):
+    r"""The action of the s-channel transport (as the metadata-driven ``_gamma_energy`` builds it:
+    the link modes carry no needs_mu / needs_sigma, so no belief state is fed to the builder) on a
+    FIXED probe mean, so a plain tensor comparison captures the transport across representations."""
+    from vfe3.geometry.transport import _TRANSPORT_NEEDS_MU, transport_mean
+    cfg = m.cfg
+    tm = cfg.transport_mode
+    B, N = phi.shape[0], phi.shape[1]
+    omega = build_belief_transport(
+        phi, m.group, transport_mode=tm, gauge_parameterization="phi",
+        mu=(None if tm not in _TRANSPORT_NEEDS_MU
+            else m.prior_bank.encode_s(torch.zeros(B, N, dtype=torch.long))[0]),
+        connection_L=getattr(m, "connection_L", None),
+        link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+    )
+    g = torch.Generator().manual_seed(99)
+    probe = torch.randn(B, N, m.cfg.embed_dim, generator=g)     # fixed key means
+    return transport_mean(omega, probe)                         # (B, N, N, K) transport action
+
+
+@pytest.mark.parametrize("mode", ["regime_ii_link", "regime_ii_link_charted"])
+def test_gamma_energy_link_reads_connection_L(mode):
+    m = _link_gamma_model(mode)
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    e_s0 = m._gamma_energy(tok, phi)[0].clone()
+    with torch.no_grad():
+        m.connection_L.mul_(2.3)
+    e_s1 = m._gamma_energy(tok, phi)[0]
+    assert not torch.allclose(e_s0, e_s1)                       # s-channel now reads connection_L (was flat)
+
+
+@pytest.mark.parametrize("mode", ["regime_ii_link", "regime_ii_link_charted"])
+def test_gamma_energy_link_gradient_reaches_connection_L(mode):
+    m = _link_gamma_model(mode)
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    m._gamma_energy(tok, phi)[0].sum().backward()
+    assert m.connection_L.grad is not None
+    assert float(m.connection_L.grad.abs().sum()) > 0.0
+
+
+def test_link_s_transport_is_belief_state_independent_but_moves_with_connection_L():
+    m = _link_gamma_model("regime_ii_link")
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    omega_a = _link_s_transport(m, phi)
+    # Perturbing the s / belief tables does NOT move the bare-link transport (no needs_mu/needs_sigma).
+    with torch.no_grad():
+        m.prior_bank.s_mu_embed.normal_(0.0, 0.9)
+        m.prior_bank.s_sigma_log_embed.normal_(0.0, 0.7)
+        m.prior_bank.mu_embed.normal_(0.0, 0.9)
+    omega_b = _link_s_transport(m, phi)
+    assert torch.allclose(omega_a, omega_b, atol=0.0)          # transport invariant to q/s mean+cov
+    # ...but it DOES move with the shared connection_L.
+    with torch.no_grad():
+        m.connection_L.mul_(1.7)
+    omega_c = _link_s_transport(m, phi)
+    assert not torch.allclose(omega_a, omega_c)
+
+
+def test_link_charted_transport_depends_on_frame_but_not_belief_state():
+    m = _link_gamma_model("regime_ii_link_charted")
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    omega_phi0 = _link_s_transport(m, phi)
+    # The charted sandwich exp(phi_i) exp(A) exp(-phi_j) IS frame-dependent.
+    omega_phi1 = _link_s_transport(m, phi + 0.2)
+    assert not torch.allclose(omega_phi0, omega_phi1)          # frame-coordinate sensitivity
+    # ...yet still invariant to the s / belief state (no needs_mu / needs_sigma).
+    with torch.no_grad():
+        m.prior_bank.s_mu_embed.normal_(0.0, 0.9)
+        m.prior_bank.mu_embed.normal_(0.0, 0.9)
+    omega_phi0b = _link_s_transport(m, phi)
+    assert torch.allclose(omega_phi0, omega_phi0b, atol=0.0)

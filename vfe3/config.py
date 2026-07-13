@@ -190,6 +190,21 @@ class VFE3Config:
     # default-off): learned scalar path weights, zero-init (step 0 byte-identical).
     use_cg_coupling:           bool  = False
 
+    # CG covariance pushforward mode (opt-in; default 'passthrough' = the means-only phase, sigma
+    # untouched). 'delta_full' applies the delta-method Gaussian moment closure sigma_out =
+    # sym(J Sigma J^T), with J the exact analytic Jacobian of the bilinear CG map at the current
+    # mean -- a FIRST-ORDER pushforward, NOT an exact distributional image. It requires a
+    # full-covariance Gaussian family (family='gaussian_full') because J Sigma J^T is dense; the
+    # means-only 'passthrough' is the pure default. Validated below.
+    cg_covariance_mode:        str   = "passthrough"     # "passthrough" | "delta_full"
+
+    # CG moment-energy regularizer weight (opt-in; default 0.0 = off, everything untouched). When
+    # > 0 the outer objective adds ONCE cg_energy_weight * mean_layers(mean_tokens(D(q_post||q_pre))),
+    # the post-CG moment divergence of the belief against its pre-CG value -- a q-only regularizer
+    # that never reweights the canonical q/p/s/h hierarchy. Requires use_cg_coupling=True (validated
+    # below).
+    cg_energy_weight:          float = 0.0
+
     # BCH positional encoding (default "learned"): a per-position Lie-algebra element pos_phi_i
     # composed into the token gauge frame via compose_phi BEFORE transport. "learned" owns a model
     # parameter table (max_seq_len, n_gen); "frozen" is the parameter-free i*pos_phi_scale on one
@@ -997,6 +1012,31 @@ class VFE3Config:
                 f"use_cg_coupling requires an irrep-labeled tower group ('so_n'/'sp_n'); got "
                 f"gauge_group={self.gauge_group!r}"
             )
+        # CG moment-closure (PB-13). The pushforward mode is a two-value key; 'delta_full' needs a
+        # full-covariance Gaussian family (the dense J Sigma J^T cannot be stored diagonally, and the
+        # first-order moment closure is Gaussian). The q-only moment regularizer weight must be a
+        # finite non-negative scalar, and any positive weight needs the CG coupling live (it reads the
+        # coupling's per-layer pushforward). At weight 0 with 'passthrough' every check is inert.
+        if self.cg_covariance_mode not in ("passthrough", "delta_full"):
+            raise ValueError(
+                f"cg_covariance_mode must be 'passthrough' or 'delta_full'; got "
+                f"{self.cg_covariance_mode!r}"
+            )
+        if self.cg_covariance_mode == "delta_full" and self.family != "gaussian_full":
+            raise ValueError(
+                f"cg_covariance_mode='delta_full' needs a full-covariance Gaussian family "
+                f"(family='gaussian_full'); the delta-method J Sigma J^T is dense and a "
+                f"diagonal/non-Gaussian family cannot carry it (got family={self.family!r})."
+            )
+        if not math.isfinite(self.cg_energy_weight) or self.cg_energy_weight < 0.0:
+            raise ValueError(
+                f"cg_energy_weight must be finite and >= 0; got {self.cg_energy_weight!r}"
+            )
+        if self.cg_energy_weight > 0.0 and not self.use_cg_coupling:
+            raise ValueError(
+                f"cg_energy_weight={self.cg_energy_weight} > 0 requires use_cg_coupling=True "
+                f"(the moment-energy regularizer reads the CG coupling's per-layer pushforward)."
+            )
         # The head mixer needs >= 2 gauge blocks to mix (audit 2026-06-09 overnight PP1). Two
         # single-block cases, handled differently:
         #   (1) A head-block group (block_glk/tied_block_glk) with n_heads < 2 is a single-HEAD
@@ -1460,6 +1500,18 @@ class VFE3Config:
         from vfe3.lambda_h_i import _LAMBDA_H_MODES
         _require(self.lambda_h_mode, _LAMBDA_H_MODES, "lambda_h_mode")
         _require(self.r_update_mode, ("gradient", "barycenter"), "r_update_mode")
+        # r_update_mode='barycenter' needs a closed-form barycenter for the model-channel family.
+        # PriorBank.barycenter_r_ implements the moment-matched m-projection ONLY for the Gaussian
+        # families (gaussian_diagonal diagonal moments, gaussian_full full moments, PB-11); a
+        # non-Gaussian family (e.g. laplace_diagonal) has no registered barycenter, so reject the
+        # pair at construction (before model build) rather than silently mis-updating r.
+        if self.r_update_mode == "barycenter" and self.family not in ("gaussian_diagonal", "gaussian_full"):
+            raise ValueError(
+                f"r_update_mode='barycenter' has no registered closed-form barycenter for "
+                f"family={self.family!r}: the moment-matched m-projection is implemented only for the "
+                f"Gaussian families (gaussian_diagonal, gaussian_full). Use r_update_mode='gradient' "
+                f"for {self.family!r}."
+            )
         # A per-coordinate alpha form (state_dependent_per_coord) weights each coordinate's
         # self-divergence by its own alpha^(k), which needs a per-coordinate self-divergence.
         # That decomposition exists only for the diagonal family (full-covariance KL couples
@@ -1563,35 +1615,12 @@ class VFE3Config:
                     "s_e_step=True requires prior_source='model_channel' so the s-tables are the "
                     f"model's vocab table for encode and decode; got prior_source={self.prior_source!r}."
                 )
-            # The live s-refine (_refine_s) and the s/r tables are DIAGONAL by construction (the s
-            # table is (V,K) and the centroid r is (K,)). Under a full-covariance family the belief
-            # sigma is (B,N,K,K) and the diagonal refined-s would overwrite it with a (B,N,K) tensor,
-            # crashing deep in the full kernel with an opaque shape error. Reject at construction so
-            # the (unsupported) full-cov s-channel fails fast with a clear message; the diagonal
-            # family is the supported pure path for the s E-step.
-            if not family_is_diagonal:
-                raise ValueError(
-                    "s_e_step=True refines the model channel as a DIAGONAL Gaussian (the s/r tables "
-                    f"are diagonal by construction), incompatible with family={self.family!r}. Use a "
-                    "diagonal-covariance family (e.g. 'gaussian_diagonal') for the live s E-step."
-                )
-            # The s-refine (_refine_s) hardcodes family='gaussian_diagonal': the model channel is
-            # uniformly DiagonalGaussian by design. A non-Gaussian (but diagonal) belief family
-            # therefore still runs a GAUSSIAN s E-step while the belief runs its own family -- a
-            # well-posed mixed prior/posterior (no NaN), but the model channel is NOT refined in the
-            # belief's family. Warn (do not raise) so the double-opt-in (s_e_step + non-Gaussian
-            # family) is not silent; the pure path is family='gaussian_diagonal'.
-            elif self.family != "gaussian_diagonal":
-                import warnings
-                warnings.warn(
-                    f"s_e_step=True refines the model channel as a Gaussian (_refine_s hardcodes "
-                    f"family='gaussian_diagonal'), but family={self.family!r}: the s-channel E-step "
-                    f"runs Gaussian while the belief is {self.family!r}. This is a well-posed "
-                    f"mixed-family prior/posterior (no NaN), but the model channel is not refined in "
-                    f"the belief's family. Use family='gaussian_diagonal' to match, or accept the "
-                    f"mixed-family s-refine.",
-                    UserWarning, stacklevel=2,
-                )
+            # PB-11: _refine_s now refines the model channel in the CONFIGURED family (family=cfg.family)
+            # against the family-rank frozen centroid r (r_parameters() returns the (K,) diagonal or
+            # (K,K) full covariance), and encode_s/r_parameters carry the matching covariance rank. So
+            # the old rejection of a full-covariance family AND the old "runs Gaussian while the belief
+            # is <family>" mixed-family warning are obsolete: any registered family's covariance action
+            # is supported by the shared transport, so no family combination is rejected here.
             if self.lambda_h == 0.0 and self.lambda_gamma == 0.0:
                 import warnings
                 warnings.warn(
@@ -1864,20 +1893,22 @@ class VFE3Config:
         # (a learned linear readout), never via decode_mode, so it is excluded from the valid set.
         from vfe3.model.prior_bank import _DECODERS, _ENCODERS
         _require(self.decode_mode, tuple(sorted(set(_DECODERS) - {"linear"})), "decode_mode")
-        # decode_mode sets the RANK of the prior-bank KL-decode kernel: 'diagonal'/'diagonal_chunked'
-        # consume a diagonal sigma (B,N,K); 'full'/'full_chunked' consume a full sigma (B,N,K,K). It
-        # must agree with the covariance family, else the rank mismatch is a shape RuntimeError at the
-        # first forward. The use_prior_bank=False linear decode discards sigma, and its own active
-        # registration controls dense versus fused-CE training; decode_mode does not route that
-        # no-prior path. Rank is therefore irrelevant there, so the cross-check stays gated on
-        # use_prior_bank.
-        decode_is_full = _DECODERS[self.decode_mode].supports_full
-        if self.use_prior_bank and decode_is_full == family_is_diagonal:
+        # decode_mode sets the covariance RANK(s) of the prior-bank decode kernel via its resolved
+        # DecodeRegistration.covariance_kinds: 'diagonal'/'diagonal_chunked' -> {'diagonal'};
+        # 'full'/'full_chunked' -> {'full'}; the family-consistent 'family'/'family_chunked' ->
+        # {'diagonal','full'} (both ranks). The configured family's cov_kind must be a MEMBER of that
+        # set (validated as membership, not as an exclusive rank bit), else the rank mismatch is a
+        # shape RuntimeError at the first forward. The use_prior_bank=False linear decode discards
+        # sigma and its own active registration controls dense-vs-fused training; decode_mode does not
+        # route that no-prior path, so the cross-check stays gated on use_prior_bank.
+        decode_registration = _DECODERS[self.decode_mode]
+        family_kind = family_cov_kind(self.family)
+        if self.use_prior_bank and family_kind not in decode_registration.covariance_kinds:
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
-                f"'full'/'full_chunked' decode needs a full-covariance family and "
-                f"'diagonal'/'diagonal_chunked' decode needs a diagonal family. Pair a full decode_mode "
-                f"with a full family, use a diagonal decode_mode with a diagonal family, or set "
+                f"it scores covariance kinds {sorted(decode_registration.covariance_kinds)} but the "
+                f"family is {family_kind!r}. Pair a matching decode_mode (a 'full'/'diagonal' kernel "
+                f"with a full/diagonal family, or 'family'/'family_chunked' which score both), or set "
                 f"use_prior_bank=False (linear decode)."
             )
         if self.decode_chunk_size < 1:
@@ -1999,39 +2030,29 @@ class VFE3Config:
                 "there is no reliability bias to shape per head. Enable precision_weighted_attention.",
                 UserWarning,
             )
-        # use_prior_bank decode is a FIXED alpha=1 KL readout on the hardcoded Gaussian family
-        # (prior_bank.reference_decode / the fused kernels call divergence.kl); it does NOT read
-        # renyi_order / divergence_family. An opt-in non-KL/non-alpha=1 seam therefore minimizes the
-        # E-step under one divergence and reads logits out under another -- warn so the mismatch is a
-        # deliberate choice (the pure path is use_prior_bank=True with renyi / renyi_order=1).
-        if self.use_prior_bank and (self.renyi_order != 1.0 or self.divergence_family != "renyi"):
-            import warnings
-            warnings.warn(
-                f"use_prior_bank=True decodes at a FIXED alpha=1 KL, but the E-step minimizes under "
-                f"divergence_family={self.divergence_family!r}/renyi_order={self.renyi_order}: inference "
-                f"and the KL-to-prior readout use different divergences.",
-                UserWarning,
-                stacklevel=2,
-            )
-        # The use_prior_bank decode kernels hardcode the GAUSSIAN family (prior_bank.reference_decode /
-        # the fused kernels call get_family('gaussian_diagonal')/('gaussian_full'); they read neither
-        # `family` nor `divergence_family`). A non-Gaussian belief family runs a genuine non-Gaussian
-        # E-step but is then projected to logits through the WRONG (Gaussian) metric -- the converged
-        # belief is correct, only its readout uses the wrong divergence (argmax can flip). No
-        # Gaussian-only decode kernel for the other families exists, so warn (the pure readout paths
-        # are a Gaussian family, or use_prior_bank=False's linear decode which is family-agnostic).
-        if self.use_prior_bank and self.family not in ("gaussian_diagonal", "gaussian_full"):
-            import warnings
-            warnings.warn(
-                f"use_prior_bank=True decodes through a hardcoded GAUSSIAN KL readout, but "
-                f"family={self.family!r} is non-Gaussian: the E-step minimizes in the {self.family!r} "
-                f"geometry while the logits are read out under the Gaussian metric (the converged "
-                f"belief is correct; only its projection to logits uses the wrong divergence). Use a "
-                f"Gaussian family for the KL-to-prior decode, or use_prior_bank=False (the linear "
-                f"decode is family-agnostic).",
-                UserWarning,
-                stacklevel=2,
-            )
+        # PB-14 capability validation (replaces the old decode/E-step divergence-mismatch WARNINGS).
+        # The optimized 'diagonal'/'full' kernels hardcode a gaussian alpha=1 KL readout and ignore
+        # divergence_family/renyi_order, so a non-Gaussian family or a noncanonical divergence
+        # (renyi_order != 1 or a non-'renyi' functional) would read the belief out under the WRONG
+        # geometry. Such a config under use_prior_bank=True MUST select a family-consistent decode
+        # kernel ('family'/'family_chunked'), which scores logits = -D_configured(q||p_v)/tau_eff
+        # through the configured family AND divergence. Canonical gaussian/renyi/alpha=1 configs keep
+        # their fast modes (family_consistent is not required). The rank membership above already
+        # enforces family_cov_kind(family) in registration.covariance_kinds.
+        if self.use_prior_bank:
+            noncanonical = self.renyi_order != 1.0 or self.divergence_family != "renyi"
+            non_gaussian = self.family not in ("gaussian_diagonal", "gaussian_full")
+            if (noncanonical or non_gaussian) and not decode_registration.family_consistent:
+                raise ValueError(
+                    f"use_prior_bank=True with family={self.family!r}/"
+                    f"divergence_family={self.divergence_family!r}/renyi_order={self.renyi_order} "
+                    f"requires a family-consistent decode_mode ('family' or 'family_chunked') that "
+                    f"reads logits out under the configured divergence; decode_mode="
+                    f"{self.decode_mode!r} is a fixed gaussian alpha=1 KL kernel and would project "
+                    f"the belief through the wrong geometry (the argmax can flip). Set "
+                    f"decode_mode='family'/'family_chunked', or use_prior_bank=False (the linear "
+                    f"decode is family-agnostic)."
+                )
         # Full-covariance compute discarded at the decode boundary (B4): use_prior_bank=False decodes
         # by the linear readout logits = mu_q @ W^T, which DISCARDS sigma. With a full-covariance family
         # the E-step still evolves a (B, N, K, K) covariance (it shapes the mean trajectory, so the
@@ -2145,21 +2166,26 @@ class VFE3Config:
                 "gauge.",
                 UserWarning, stacklevel=2,
             )
-        # F7 (audit 2026-07-01): the s-channel (model coupling + s E-step) transports the s tables
-        # under the FLAT phi-cocycle only (_gamma_energy / _refine_s pass transport_mode="flat"),
-        # regardless of cfg.transport_mode. Under a NON-FLAT belief transport the belief and model
-        # channels then run different connections -- the s-fiber has no non-flat transport law yet,
-        # so the model-channel comparison is NOT gauge-covariant. Warn (non-breaking) so a run does
-        # not describe it as sharing the active connection.
+        # F7 -> PB-11: the s-channel (_gamma_energy / _refine_s) now transports the s tables through
+        # cfg.transport_mode with the SAME shared connection the belief channel uses, so the old
+        # flat-island warning ("the s-fiber has no non-flat transport law") is obsolete and removed --
+        # a valid nonflat model channel constructs silently. The remaining guard is on the family's
+        # COVARIANCE ACTION, not on flatness: only a combination the registered family's covariance
+        # structure cannot support is rejected. Every registered family reports cov_kind in
+        # {'diagonal', 'full'}, both of which the transport covariance sandwich handles (the diagonal
+        # readout is the C5 controlled approximation warned about above; the full sandwich is exact),
+        # so no combination is unsupported today. A future family whose covariance the transport cannot
+        # act on is caught here rather than crashing deep in the s-channel build.
         if self.transport_mode != "flat" and (self.lambda_gamma > 0.0 or self.s_e_step):
-            import warnings
-            warnings.warn(
-                f"transport_mode={self.transport_mode!r} is non-flat, but the model channel "
-                f"(lambda_gamma={self.lambda_gamma}, s_e_step={self.s_e_step}) transports the s tables "
-                "under the FLAT phi-cocycle only; the s-fiber has no non-flat transport law. The "
-                "model-channel coupling is NOT gauge-covariant under this connection.",
-                UserWarning, stacklevel=2,
-            )
+            from vfe3.divergence import family_cov_kind
+            if family_cov_kind(self.family) not in ("diagonal", "full"):
+                raise ValueError(
+                    f"transport_mode={self.transport_mode!r} model channel (lambda_gamma="
+                    f"{self.lambda_gamma}, s_e_step={self.s_e_step}) needs a family whose covariance "
+                    f"the transport sandwich Omega Sigma Omega^T can act on (cov_kind in "
+                    f"{{'diagonal', 'full'}}); got family={self.family!r} with cov_kind="
+                    f"{family_cov_kind(self.family)!r}."
+                )
 
         # normalization validated against the norm REGISTRY (add-by-registering). Local import
         # avoids a config <- norms cycle.

@@ -25,8 +25,11 @@ def _inputs():
 
 
 def test_defaults_byte_identical_to_pre_fix():
-    r"""(1) alpha_reg=None, include_attention_entropy=True reproduces the inline free-energy-terms
-    recomputation exactly. The entropy log-prior uses the exact ``log_softmax`` (audit m8; formerly
+    r"""(1) alpha_reg=None, include_attention_entropy=True: the RAW per-block fields reproduce the
+    inline recomputation exactly (byte-identical float32). ``total`` alone now routes through the typed
+    hierarchical evaluator (PB-10), a row-then-query reduction that is not bitwise associative with the
+    one-shot ``.sum()`` grouping, so it is pinned to the same value within float32 rounding rather than
+    with ``==``. The entropy log-prior uses the exact ``log_softmax`` (audit m8; formerly
     ``log(softmax(.).clamp)``, which floored a finite deep-tail prior at ~-27.6 nats)."""
     self_div, energy, alpha, _, log_prior = _inputs()
     tau, lambda_beta, eps = 1.3, 0.9, 1e-12
@@ -46,10 +49,12 @@ def test_defaults_byte_identical_to_pre_fix():
     exp_entropy = float((_tau_e * (beta * (torch.log(beta.clamp(min=eps)) - log_pi))).sum())
     exp_total = exp_self + float(lambda_beta) * (exp_belief + exp_entropy)
 
-    assert out["self_coupling"] == exp_self
+    assert out["self_coupling"] == exp_self          # RAW fields stay byte-identical
     assert out["belief_coupling"] == exp_belief
     assert out["attention_entropy"] == exp_entropy
-    assert out["total"] == exp_total
+    torch.testing.assert_close(                       # total: evaluator association, same value in fp32
+        torch.tensor(out["total"]), torch.tensor(exp_total), rtol=1e-6, atol=1e-6,
+    )
     assert set(out) == {"self_coupling", "belief_coupling", "attention_entropy", "total"}
 
 

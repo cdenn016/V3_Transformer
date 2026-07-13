@@ -9,8 +9,6 @@ are not string-pinned, per repo convention):
         exact Cholesky inverse of its well-conditioned siblings.
 """
 
-import warnings
-
 import pytest
 import torch
 
@@ -20,30 +18,30 @@ from vfe3.families.gaussian import DiagonalGaussian
 from vfe3.numerics import safe_spd_inverse
 
 
-def _warns_matching(substr: str, **cfg_kw) -> bool:
-    """True iff building VFE3Config(**cfg_kw) emits a warning whose message contains substr."""
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        VFE3Config(**cfg_kw)
-    return any(substr in str(w.message) for w in rec)
+# --- M1 -> PB-14 (2026-07-12): the decode/E-step divergence mismatch is now a HARD capability
+# error, not a warning. A noncanonical divergence under use_prior_bank=True must select a
+# family-consistent decode kernel ('family'/'family_chunked'); the fast gaussian kernels are
+# rejected (they would read the belief out under the wrong geometry). --------------------------
+_PB14_SUBSTR = "family-consistent decode_mode"
 
 
-# --- M1: decode-vs-E-step divergence-mismatch warning -----------------------------------------
-_M1_SUBSTR = "decodes at a FIXED alpha=1 KL"
+def test_m1_noncanonical_divergence_requires_family_consistent_decode():
+    # renyi_order != 1 under the fast diagonal kernel: rejected.
+    with pytest.raises(ValueError, match=_PB14_SUBSTR):
+        VFE3Config(use_prior_bank=True, renyi_order=0.5)
+    # a non-renyi functional under the fast diagonal kernel: rejected.
+    with pytest.raises(ValueError, match=_PB14_SUBSTR):
+        VFE3Config(use_prior_bank=True, divergence_family="squared_hellinger")
+    # the family-consistent decode reads the configured divergence out and is accepted.
+    VFE3Config(use_prior_bank=True, renyi_order=0.5, decode_mode="family")
+    VFE3Config(use_prior_bank=True, divergence_family="squared_hellinger", decode_mode="family_chunked")
 
 
-def test_m1_use_prior_bank_nonkl_seam_warns():
-    # renyi_order != 1 under the prior-bank (KL) decode: warn.
-    assert _warns_matching(_M1_SUBSTR, use_prior_bank=True, renyi_order=0.5)
-    # a non-renyi functional under the prior-bank decode: warn.
-    assert _warns_matching(_M1_SUBSTR, use_prior_bank=True, divergence_family="squared_hellinger")
-
-
-def test_m1_pure_kl_seam_does_not_warn():
-    # the pure path (renyi / renyi_order=1) is silent.
-    assert not _warns_matching(_M1_SUBSTR, use_prior_bank=True)
+def test_m1_pure_kl_seam_and_linear_decode_construct():
+    # the pure path (renyi / renyi_order=1) needs no family-consistent decode.
+    VFE3Config(use_prior_bank=True)
     # use_prior_bank=False decodes linearly -- the decode/E-step mismatch does not apply.
-    assert not _warns_matching(_M1_SUBSTR, use_prior_bank=False, renyi_order=0.5)
+    VFE3Config(use_prior_bank=False, renyi_order=0.5)
 
 
 # --- L5: generic Renyi-from-A float64 cancellation guard near alpha=1 --------------------------

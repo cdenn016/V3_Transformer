@@ -118,18 +118,24 @@ def test_base_natural_gradient_raises_for_undeclared_family():
         _Bare().natural_gradient(torch.zeros(2), torch.zeros(2))
 
 
-# --- Fix 1: non-Gaussian decode under use_prior_bank warns -------------------------------------
-_F1 = "decodes through a hardcoded GAUSSIAN KL readout"
+# --- Fix 1 -> PB-14 (2026-07-12): a non-Gaussian belief under use_prior_bank=True is now a HARD
+# capability error unless the decode is family-consistent ('family'/'family_chunked'), which reads
+# the belief out under its own geometry. The fast gaussian kernels are rejected. ---------------
+_F1 = "family-consistent decode_mode"
 
 
-def test_laplace_use_prior_bank_decode_warns():
-    assert _warns_matching(_F1, family="laplace_diagonal", use_prior_bank=True)
+def test_laplace_use_prior_bank_requires_family_consistent_decode():
+    with pytest.raises(ValueError, match=_F1):
+        VFE3Config(family="laplace_diagonal", use_prior_bank=True)          # fast gaussian kernel rejected
+    # the family-consistent decode reads the Laplace belief out under the Laplace divergence.
+    VFE3Config(family="laplace_diagonal", use_prior_bank=True, decode_mode="family")
 
 
-def test_gaussian_or_linear_decode_silent():
-    assert not _warns_matching(_F1, family="gaussian_diagonal", use_prior_bank=True)
+def test_gaussian_or_linear_decode_construct():
+    # canonical gaussian + KL keeps its fast kernel.
+    VFE3Config(family="gaussian_diagonal", use_prior_bank=True)
     # use_prior_bank=False is the family-agnostic linear decode -> no mismatch.
-    assert not _warns_matching(_F1, family="laplace_diagonal", use_prior_bank=False)
+    VFE3Config(family="laplace_diagonal", use_prior_bank=False)
 
 
 # --- Fix 3: T5 bucket denominator guard --------------------------------------------------------
@@ -170,13 +176,16 @@ def test_t5_learnable_bias_inert_without_channel_warns():
                                  t5_learnable_bias=True)
 
 
-# --- Fix 5: s_e_step refines a non-Gaussian belief's model channel as Gaussian -----------------
+# --- Fix 5 -> PB-11 (2026-07-12): _refine_s now refines the model channel in cfg.family, so the old
+# "runs Gaussian while the belief is <family>" mixed-family warning is obsolete and removed. -----
 _F5 = "mixed-family"
 
 
-def test_s_e_step_non_gaussian_family_warns():
-    assert _warns_matching(_F5, family="laplace_diagonal", s_e_step=True,
-                           prior_source="model_channel", lambda_h=1.0)
+def test_s_e_step_non_gaussian_family_no_longer_warns_mixed_family():
+    # _refine_s dispatches through get_family(cfg.family): a Laplace s channel IS refined as Laplace,
+    # so there is no Gaussian/Laplace mismatch to warn about anymore.
+    assert not _warns_matching(_F5, family="laplace_diagonal", s_e_step=True,
+                               prior_source="model_channel", lambda_h=1.0)
 
 
 def test_s_e_step_gaussian_family_silent():

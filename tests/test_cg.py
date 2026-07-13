@@ -134,6 +134,128 @@ def test_cg_coupling_full_cov_sigma_passes_through():
     assert not torch.equal(mu2, mu)                      # means did move
 
 
+# ---------------------------------------------------------------------------
+# PB-13 (Task 4, 2026-07-12): analytic CG moment closure -- Jacobian, delta-method
+# covariance, and the post-CG moment divergence rows.
+# ---------------------------------------------------------------------------
+
+def _l2_group():
+    from vfe3.geometry.groups import get_group
+    # single l2 block (dim 5): l2 (x) l2 -> l2 is a symmetric slot, so the self-pair survives the
+    # prune (one live path). K = 5 exercises the Jacobian/covariance on a small CPU-bound tower.
+    return get_group("so_n")(5, group_n=3, irrep_spec=[("l2", 1)], dtype=torch.float64)
+
+
+def _l2_coupling(mode="passthrough", weight=None):
+    from vfe3.model.cg_coupling import CGCoupling
+    grp = _l2_group()
+    cpl = CGCoupling(3, "so", grp.irrep_dims, grp.irrep_labels,
+                     cg_covariance_mode=mode).double()
+    if weight is not None:
+        with torch.no_grad():
+            cpl.path_weights.copy_(weight * torch.randn(cpl.path_weights.shape[0],
+                                                        dtype=torch.float64))
+    return cpl, grp
+
+
+def _sym_spd(K):
+    M = torch.randn(K, K, dtype=torch.float64)
+    S = M @ M.transpose(-1, -2)
+    S = 0.5 * (S + S.transpose(-1, -2))                                       # bit-exactly symmetric
+    return S + K * torch.eye(K, dtype=torch.float64)                          # ...and SPD (PSD + K I)
+
+
+def test_cg_forward_moments_jacobian_matches_autograd():
+    cpl, _ = _l2_coupling(weight=0.5)
+    sigma = _sym_spd(5)
+    mu = torch.randn(5, dtype=torch.float64)
+    res = cpl.forward_moments(mu, sigma)
+    assert res.jacobian.shape == (5, 5)
+
+    def f(m):
+        return cpl.forward_moments(m, sigma).mu
+
+    J_auto = torch.autograd.functional.jacobian(f, mu)
+    assert torch.allclose(res.jacobian, J_auto, atol=1e-10, rtol=0.0)
+
+
+def test_cg_forward_moments_jacobian_matches_autograd_multipath():
+    r"""Multi-path [l0, l1] tower (K=4): three live paths -- the (l0,l0,l0) and (l1,l1,l0)
+    self-pairs plus the (l0,l1,l1) distinct-source pair -- so the OFF-diagonal (target != source)
+    Jacobian blocks and the self-pair double contraction are all exercised, not just the single
+    l2 self-pair block above."""
+    from vfe3.model.cg_coupling import CGCoupling
+    from vfe3.geometry.groups import get_group
+    grp = get_group("so_n")(4, group_n=3, irrep_spec=[("l0", 1), ("l1", 1)],
+                            dtype=torch.float64)
+    cpl = CGCoupling(3, "so", grp.irrep_dims, grp.irrep_labels).double()
+    assert len(cpl.paths) >= 3                                   # multi-path, multi-group tower
+    torch.manual_seed(2)
+    with torch.no_grad():
+        cpl.path_weights.copy_(0.7 * torch.randn(cpl.path_weights.shape[0],
+                                                 dtype=torch.float64))
+    mu = torch.randn(4, dtype=torch.float64)
+    sigma = torch.rand(4, dtype=torch.float64) + 0.1
+
+    def f(m):
+        return cpl.forward_moments(m, sigma).mu
+
+    res = cpl.forward_moments(mu, sigma)
+    J_auto = torch.autograd.functional.jacobian(f, mu)
+    assert torch.allclose(res.jacobian, J_auto, atol=1e-10, rtol=0.0)
+
+
+def test_cg_forward_moments_delta_covariance_is_J_sigma_JT_spd():
+    cpl, _ = _l2_coupling(mode="delta_full", weight=0.5)
+    sigma = _sym_spd(5)
+    mu = torch.randn(5, dtype=torch.float64)
+    res = cpl.forward_moments(mu, sigma)
+    J = res.jacobian
+    expected = J @ sigma @ J.transpose(-1, -2)
+    expected = 0.5 * (expected + expected.transpose(-1, -2))
+    assert torch.allclose(res.sigma, expected, atol=1e-12, rtol=0.0)
+    assert torch.allclose(res.sigma, res.sigma.transpose(-1, -2), atol=1e-14)   # symmetric
+    assert (torch.linalg.eigvalsh(res.sigma) > 0).all()                          # SPD
+
+
+def test_cg_forward_moments_zero_weight_is_exact_identity():
+    cpl, _ = _l2_coupling(mode="delta_full")           # path_weights zero-init
+    sigma = _sym_spd(5)
+    mu = torch.randn(5, dtype=torch.float64)
+    res = cpl.forward_moments(mu, sigma)
+    assert torch.equal(res.mu, mu)                                               # mu_out = mu exactly
+    assert torch.equal(res.sigma, sigma)                                         # sigma_out = sigma exactly
+    assert torch.equal(res.jacobian, torch.eye(5, dtype=torch.float64))          # J = I exactly
+
+
+def test_cg_forward_moments_covariance_is_gauge_congruent():
+    cpl, grp = _l2_coupling(mode="delta_full", weight=0.4)
+    g = torch.linalg.matrix_exp(
+        torch.einsum("a,aij->ij", 0.3 * torch.randn(3, dtype=torch.float64), grp.generators))
+    mu = torch.randn(5, dtype=torch.float64)
+    sigma = _sym_spd(5)
+    res = cpl.forward_moments(mu, sigma)
+    res_g = cpl.forward_moments(torch.einsum("kl,l->k", g, mu),
+                                torch.einsum("ik,kl,jl->ij", g, sigma, g))
+    assert torch.allclose(res_g.mu, torch.einsum("kl,l->k", g, res.mu), atol=1e-10)
+    assert torch.allclose(res_g.sigma,
+                          torch.einsum("ik,kl,jl->ij", g, res.sigma, g), atol=1e-9)
+
+
+def test_cg_forward_selects_passthrough_vs_delta_full():
+    cpl_pass, _ = _l2_coupling(mode="passthrough", weight=0.5)
+    cpl_full, _ = _l2_coupling(mode="delta_full", weight=0.5)
+    with torch.no_grad():                                # identical weights across the two modes
+        cpl_full.path_weights.copy_(cpl_pass.path_weights)
+    mu = torch.randn(3, 5, dtype=torch.float64)
+    sigma = _sym_spd(5).expand(3, 5, 5).contiguous()
+    mu_p, sig_p = cpl_pass(mu, sigma)
+    mu_f, sig_f = cpl_full(mu, sigma)
+    assert torch.equal(mu_p, mu_f)                       # the mean update is mode-independent
+    assert sig_p is sigma                                # passthrough returns sigma untouched
+    assert not torch.allclose(sig_f, sigma)             # delta_full pushes covariance forward
+
+
 def _e2e_cfg(**kw):
     from vfe3.config import VFE3Config
     base = dict(vocab_size=20, embed_dim=9, n_heads=3, max_seq_len=5, n_layers=1,

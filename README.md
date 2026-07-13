@@ -1089,6 +1089,56 @@ does not turn every frame metric, preconditioner, or AdamW frame update into a f
 natural gradient. Frame-metric choices and nonflat connection dynamics are experimental
 implementation paths with narrower guarantees.
 
+## Completed probabilistic hierarchy
+
+The typed evaluator in [`vfe3/free_energy.py`](vfe3/free_energy.py) scores the full
+`q -> p -> s -> h` hierarchy through one signed, pre-weighted set of per-query rows. The belief
+self-coupling, belief coupling, attention entropy, and two-hop rows reduce with the belief
+reduction; the hyper-prior, model-coupling, and meta-entropy rows reduce with the model
+reduction; and the observation row carries the decode term. Diagnostics and the scored outer
+loss both assemble their total through this one evaluator, so the reported blocks reconstruct
+the objective rather than approximating it.
+
+The model channel mirrors the belief channel's family and transport. Under
+`family="gaussian_full"` the model-channel `s` tables and the centroid `r` each carry a packed
+strict-lower Cholesky, so the packed-storage cost is `K(K-1)/2` parameters per table on top of
+the `K` log-variance diagonal; `gaussian_diagonal` and `laplace_diagonal` create no packed keys
+and remain byte-identical to the diagonal build. The hyper-prior `KL(s||r)` and the gamma model
+coupling dispatch through the configured family, and the model-channel transport is built from
+the same connection-regime registry the belief channel uses, sharing the active `connection_W`,
+`connection_M`, or `connection_L` and reading the `s` channel's own means and covariances. The
+live model E-step (`s_e_step=True`) is supported for every family whose covariance the transport
+sandwich can act on, `gaussian_full` included.
+
+The supported family, transport, and family-consistent decode combinations are:
+
+| Family | Model-channel transport | Family-consistent decode |
+|---|---|---|
+| `gaussian_diagonal` | `flat`, `regime_ii`, `regime_ii_covariant`, `regime_ii_link`, `regime_ii_link_charted` | `diagonal`, `diagonal_chunked`, `family`, `family_chunked` |
+| `gaussian_full` | same transport set (full covariance sandwich) | `full`, `full_chunked`, `family`, `family_chunked` |
+| `laplace_diagonal` | same transport set (diagonal readout) | `family`, `family_chunked` |
+
+The `family` and `family_chunked` decoders read logits out under the configured divergence and
+Renyi order, so a non-KL objective is scored consistently at the output boundary, while the
+fixed gaussian alpha=1 KL kernels (`diagonal` and `full` with their chunked forms) remain
+available for the KL route. Selecting a family-consistent decoder requires `use_prior_bank=True`.
+
+The optional Clebsch-Gordan covariance pushforward, `cg_covariance_mode="delta_full"`, is a
+first-order delta-method image `Sigma_out = sym(J Sigma J^T)`, with `J` the exact analytic
+Jacobian of the bilinear coupling at the current mean. It is a first-order pushforward, not the
+exact distributional image of the coupling, and it requires `gaussian_full` because the product
+is dense; the means-only `passthrough` stays the default. The optional moment-energy
+regularizer, `cg_energy_weight > 0`, adds
+`cg_energy_weight * mean_layers(mean_tokens(D(q_post || q_pre)))` to the outer objective exactly
+once and leaves the canonical `q/p/s/h` total unchanged.
+
+This deployed hierarchy is target-blind. It minimizes free energy over the belief tuple without
+conditioning on the token to be predicted, and the label reaches the objective only through the
+decode cross-entropy. The separately planned observation-conditioned, backprop-free trainer that
+would fold the target into the inner variational objective is specified in
+[`docs/plans/2026-07-11-backprop-free-vfe-lm-plan.md`](docs/plans/2026-07-11-backprop-free-vfe-lm-plan.md)
+and is a prerequisite there, not implemented in this hierarchy.
+
 ## Registry-driven extension points
 
 The component map links each public responsibility to its source owner.
@@ -1121,7 +1171,7 @@ registry-dispatched.
 | Implemented core | Prior-bank encoding, frame construction, transported pair energies, Gibbs attention, finite `q` refinement, block stacking, prior-bank and linear decoders, outer cross-entropy/AdamW training, generation, metrics, and run artifacts. |
 | Pure-profile controls | A selectable one-channel, flat-transport, constant-self-coupling, covariance-updating, KL-decoding path remains available without learned Q/K/V projections, MLPs, pointwise activations, a mixer, or detached precision weighting. |
 | Opt-in experiments | Full covariance, Laplace beliefs, alternate groups, omega-direct and reflection frames, several nonflat transports, CG coupling, alternate position and decode modes, randomized depth, policy scoring, and richer diagnostics. |
-| Partial implementations | The diagonal family projects a general GL(K) action. The same-scale model channel is live, but its `s` refinement is restricted to a diagonal Gaussian, flat model transport, and one global centroid `r`. It is not the full multiscale hierarchy. |
+| Partial implementations | The diagonal family projects a general GL(K) action. The same-scale model channel is live and now follows the configured family (including full-covariance `s`/`r`) and the shared nonflat transport, but it keeps one global centroid `r` and a single meta-scale. It is not the full multiscale hierarchy. |
 | Deliberate stubs | The registered `gauge_fixed` encode seam raises instead of silently substituting another encoder. The `sigma_mc` policy ambiguity estimator also raises and has no live consumer. |
 | Interpretations | Tokens as agents, transported agreement as consensus or predictive coding, layers as inference time, and learning as symmetry breaking are readings of the computation, not additional executable mechanisms. |
 | Broader future theory | The full multiscale PIFB hierarchy, distinct model and belief timescales, validated nontrivial holonomy dynamics, and broader physical or philosophical claims remain outside the implemented transformer. |

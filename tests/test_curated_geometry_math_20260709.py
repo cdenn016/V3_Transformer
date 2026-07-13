@@ -96,14 +96,25 @@ def test_prior_model_and_decode_variance_reads_share_guard() -> None:
         "_decode_sigma_log_table",
     )
     expected_guarded_reads = {
-        "model": Counter({"pb.r_sigma_log": 2}),
+        # PB-11 (2026-07-12): _refine_s reads the frozen centroid r through pb.r_parameters() (which
+        # bounds self.r_sigma_log inside prior_bank), NOT a direct model.py bounded_variance_from_log
+        # call, so the guarded r read now lives in prior_bank instead of model. The SPD-safety guard is
+        # preserved -- every trainable log-variance table still reaches a variance only through a
+        # bounded_variance_from_log call; only its location moved.
+        "model": Counter(),
         "prior_bank": Counter(
             {
                 "self.s_sigma_log_embed[token_ids]": 1,
                 "self.s_sigma_log_embed": 1,
+                # PB-14 (2026-07-12): reference_decode's own guarded self-read was replaced by a call to
+                # the module-level _decode_family (which reads pb._decode_sigma_log_table()); the new
+                # decode_ce_family_chunked adds a self-read, so the self count is unchanged (4) while the
+                # pb count gains _decode_family's read (4 -> 5). Every trainable log-variance table still
+                # reaches a variance only through a bounded_variance_from_log call.
                 "self._decode_sigma_log_table()": 4,
                 "pb._prior_sigma_log_table()[token_ids]": 2,
-                "pb._decode_sigma_log_table()": 4,
+                "pb._decode_sigma_log_table()": 5,
+                "self.r_sigma_log": 1,
             }
         ),
         "extract": Counter({"pb.r_sigma_log": 2}),

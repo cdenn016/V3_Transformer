@@ -41,7 +41,6 @@ from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.model.stack import vfe_stack
-from vfe3.numerics import bounded_variance_from_log
 
 
 # Transport-mode state-routing sets: which regimes' Omega builders read mu/sigma. Sourced from the
@@ -220,6 +219,11 @@ class VFEModel(nn.Module):
             mu_init_std=cfg.mu_init_std, sigma_init=cfg.sigma_init, phi_scale=cfg.phi_scale,
             decode_tau=cfg.decode_tau, eps=cfg.eps,
             diagonal_covariance=cfg.diagonal_covariance,
+            family=cfg.family,
+            # divergence_family/renyi_order feed the family-consistent decode kernels
+            # (decode_mode='family'/'family_chunked'), so the readout scores the SAME divergence the
+            # E-step minimized (PB-14). The fast gaussian kernels ignore them.
+            divergence_family=cfg.divergence_family, renyi_order=cfg.renyi_order,
             use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
@@ -309,10 +313,12 @@ class VFEModel(nn.Module):
             from vfe3.model.cg_coupling import CGCoupling
             self.cg_coupling = CGCoupling(
                 cfg.group_n, self.group.algebra,
-                self.group.irrep_dims, self.group.irrep_labels)
+                self.group.irrep_dims, self.group.irrep_labels,
+                cg_covariance_mode=cfg.cg_covariance_mode)
         else:
             self.cg_coupling = None
-        if (cfg.use_head_mixer or cfg.use_cg_coupling) \
+        if (cfg.use_head_mixer
+                or (cfg.use_cg_coupling and cfg.cg_energy_weight == 0.0)) \
                 and cfg.effective_e_step_gradient == "detach":
             # Footgun (mirrors connection_W / pos_phi_free above and below): the
             # mixer and the CG coupling are applied INSIDE the vfe_stack call, which the
@@ -323,14 +329,20 @@ class VFEModel(nn.Module):
             # never adapt (audit 2026-06-09 overnight F31, challenge-upheld). Gate on the
             # EFFECTIVE estimator so both the detach_e_step bool and the
             # e_step_gradient='detach' string route warn; 'unroll' and 'straight_through'
-            # run the stack grad-enabled and train them.
+            # run the stack grad-enabled and train them. EXCEPTION (PB-13): with
+            # cg_energy_weight>0 the post-stack torch.enable_grad re-evaluation trains
+            # path_weights through the CG moment energy even under detach (the mean->CE path
+            # stays detached), so the 'frozen at zero init' claim is false there and the CG
+            # clause is gated off; the head mixer has no such side channel and always warns.
             import warnings
             warnings.warn(
                 "use_head_mixer/use_cg_coupling with the effective E-step estimator 'detach' "
                 "freezes mixer_deltas/path_weights: both modules are applied inside the "
                 "no_grad-wrapped vfe_stack, so they receive NO gradient and stay at their "
                 "identity/zero init. Use an 'unroll' E-step (detach_e_step=False, "
-                "e_step_gradient='unroll') or 'straight_through' to train them.",
+                "e_step_gradient='unroll') or 'straight_through' to train them (or, for the "
+                "CG coupling alone, cg_energy_weight>0, whose detached-mode re-evaluation "
+                "trains path_weights).",
                 stacklevel=2,
             )
         # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): the LEARNED bilinear edge connection
@@ -737,6 +749,25 @@ class VFEModel(nn.Module):
         p = getattr(self, "log_kappa_gamma", None)
         return torch.exp(p).to(device) if p is not None else _as_coeff(self.cfg.kappa_gamma, device)
 
+    def _model_channel_connection_kwargs(self) -> dict:
+        r"""The connection-law knob bag the model channel SHARES with the belief channel (PB-11):
+        the active learned connections (``connection_W``/``M``/``L``, all None on the flat pure path)
+        plus the link/cocycle/clamp controls. Threaded into BOTH :meth:`_refine_s`'s E-step and
+        :meth:`_gamma_energy`'s transport build so the s-fiber transports under the SAME connection
+        the belief E-step uses, instead of an isolated flat cocycle. On the flat pure path every
+        connection is None and the controls are their inert defaults, so the call is byte-identical.
+        The per-mode decision of WHICH belief tensors (s_mu/s_sigma) feed the builder is made by the
+        caller from the transport-registration metadata, not here."""
+        cfg = self.cfg
+        return dict(
+            connection_W=getattr(self, "connection_W", None),
+            connection_M=getattr(self, "connection_M", None),
+            connection_L=getattr(self, "connection_L", None),
+            link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+            cocycle_relaxation=cfg.cocycle_relaxation,
+            clamp_monitor=cfg.transport_clamp_monitor,
+        )
+
     def _refine_s(
         self,
         token_ids:          torch.Tensor,   # (B, N) integer token ids
@@ -767,8 +798,13 @@ class VFEModel(nn.Module):
         # build_belief_transport), matching the belief channel. A BUFFER lookup (non-differentiable),
         # so -- unlike omega_s -- there is NO detach/attach concern; None on the pure path.
         reflection_s = pb.reflection_sign[token_ids] if cfg.phi_reflection != "off" else None
-        r_mu    = pb.r_mu.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
-        r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps).expand_as(s_sigma)
+        # Family-rank frozen centroid r (PB-11): r_parameters() returns the (K,) diagonal / (K,K) full
+        # covariance matching cfg.family, so the full-covariance s E-step scores against a full r
+        # (the prior fix that unblocks s_e_step + gaussian_full; the diagonal path is byte-identical
+        # since r_parameters uses the SAME bounded_variance_from_log(pb.r_sigma_log, eps=pb.eps)).
+        r_mu_t, r_sigma_t = pb.r_parameters()                         # (K,) / (K,) or (K,K)
+        r_mu    = r_mu_t.expand_as(s_mu)                              # (B, N, K) frozen r broadcast
+        r_sigma = r_sigma_t.expand_as(s_sigma)                        # (B,N,K) diag or (B,N,K,K) full
         gamma_tau       = attention_tau(self.effective_kappa_gamma(s_mu.device), grp.irrep_dims)
         gamma_log_prior = self._attention_log_prior(
             token_ids.shape[1], token_ids.device, prior=cfg.gamma_attention_prior,
@@ -804,20 +840,22 @@ class VFEModel(nn.Module):
             # s-refine silently ran the default 'fisher' even under e_step_mu_precond='raw',
             # contaminating the B3/EXP-14 mean-arm ablation (raw belief channel, Fisher s channel).
             e_step_mu_precond=cfg.e_step_mu_precond,
-            family="gaussian_diagonal",
+            family=cfg.family,
             divergence_family=cfg.divergence_family,
             phi_precond_mode=cfg.phi_precond_mode,
             phi_retract_mode=cfg.phi_retract_mode,
             spd_retract_mode=cfg.spd_retract_mode,
-            # FLAT model-frame transport for the s-channel, INTENTIONALLY ignoring cfg.transport_mode
-            # (audit 2026-06-10 F7, mirroring _gamma_coupling_term's documented choice): the model
-            # channel refines under the flat phi0 cocycle even when the belief channel runs
-            # regime_ii -- the learned edge connection is a belief-channel object (delta reads the
-            # belief means, not s), and the s E-step runs with phi held fixed. Thread
-            # cfg.transport_mode + connection_W here if the s-channel is ever meant to share the
-            # learned connection.
-            transport_mode="flat",
+            # SHARED connection regime for the s-channel (PB-11): the model channel refines under
+            # cfg.transport_mode with the SAME learned connection the belief E-step uses, threaded via
+            # _model_channel_connection_kwargs. The stateful regime_ii/covariant Omega is rebuilt each
+            # iteration from the CHANNEL-LOCAL s means/covariances (e_step reads belief.mu/sigma, which
+            # here are s_mu/s_sigma), not the belief means; the link modes read only connection_L. phi0
+            # is still held fixed (e_phi_lr=0). Flat -> every connection None == the byte-identical pure
+            # path. share_refine_s_transport (the flat prebuilt hoist) is gated to flat at its caller,
+            # so a non-flat mode never receives a flat prebuilt transport.
+            transport_mode=cfg.transport_mode,
             gauge_parameterization=cfg.gauge_parameterization,
+            **self._model_channel_connection_kwargs(),
             e_step_gradient=e_step_gradient,
             oracle_unroll_grad=cfg.oracle_unroll_grad,
             # Tier-1 transport perf toggles: the s-channel E-step shares the flat transport
@@ -1429,8 +1467,15 @@ class VFEModel(nn.Module):
         # with the converged q*, the live final-block prior, the encode-time prior, and the raw
         # pre-final_norm stack output.
         cap: Optional[MStepCapture] = (
-            {} if self.cfg.mstep_self_coupling_weight > 0.0 else None
+            {} if (self.cfg.mstep_self_coupling_weight > 0.0
+                   or self.cfg.cg_energy_weight > 0.0) else None
         )
+        if cap is not None and self.cfg.cg_energy_weight > 0.0:
+            # Initialize the CG moment-energy lists ONLY when the regularizer is on. A capture
+            # allocated solely for M-step self-coupling leaves these keys absent, so vfe_block never
+            # appends to (or stacks) a CG list (PB-13).
+            cap["cg_moment_energy_rows"] = []
+            cap["cg_pre_moments"] = []
         belief, _ = self.forward_beliefs(token_ids, return_logits=False,
                                          capture=cap, estep_grad_out=estep_grad_out)
         mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm; sigma = out.sigma
@@ -1572,48 +1617,110 @@ class VFEModel(nn.Module):
         # (s_e_step=False) the s-channel blocks reduce with mean() (per-position) while the belief
         # channel sums (free_energy.py); lambda_h / lambda_gamma are calibrated against that
         # per-position scale, a fixed 1/(B*N) relative to the sum-reduced belief block.
-        if self.cfg.lambda_h > 0.0 and not self.cfg.s_e_step:
-            # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
-            # lines 1241-1249): L += lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
-            # regularized toward the global hyper-prior centroid r. Opt-in, default-off
-            # (lambda_h=0 -> byte-identical to the term-absent path). Grad-connected (no detach), so
-            # it backprops to the learned s/r tables (the channel trains), and computed from the
-            # converged s/r tables OUTSIDE the E-step (s_i does not couple into q this increment).
-            # The h->s->p->q coupling and the s-channel E-step update remain DEFERRED. The weight is
-            # now applied INSIDE _hyper_prior_term via the lambda_h_mode registry (constant: cfg.lambda_h;
-            # state_dependent: the envelope lambda_h*_i=c0_h/(b0_h+KL) + R_h),
-            # so the term is added directly with NO external lambda_h factor (byte-identical for constant).
-            loss = loss + self._hyper_prior_term(token_ids)
-        if self.cfg.lambda_gamma > 0.0 and not self.cfg.s_e_step:
-            # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
-            # lines 1241-1249): L += lambda_gamma * mean_i F_red^s_i, the reduced (envelope) form of
-            # the model-coupling block sum_ij [ gamma_ij KL(s_i||Omega_tilde_ij s_j) + tau_g gamma_ij
-            # log(gamma_ij/pi^s_ij) ], with optimal gamma_ij = softmax_j(log pi^s - E^s/tau_g) and, at
-            # the optimum, the block = -tau_g log Z^s_i. The s-channel is the SAME softmax-over-KL
-            # object as the belief beta block, so it REUSES pairwise_energy + reduced_free_energy with
-            # (q,p,beta,pi,tau) -> (s,Omega s,gamma,pi^s,tau_g). The s tables are always diagonal (V,K),
-            # so the kernel is DiagonalGaussian regardless of cfg.family; divergence_family is the
-            # orthogonal functional seam. Omega_tilde is the selected flat model-frame cocycle,
-            # tied to the converged belief frame by default or independently parameterized under
-            # s_frame_mode='phi_tilde'. It is DETACHED on this scored path, so the gamma
-            # gradient flows ONLY to the s tables and the forward (logits/ce above) is byte-identical
-            # to the gamma=0 path (the model channel is predictively INERT: s does NOT feed q). The
-            # detach deliberately severs the model-frame <- gamma coupling that a scored frame update would carry in
-            # the canonical E-step F; restoring it (or keeping it severed) is part of the deferred s->q
-            # design, NOT this term. Audit 2026-07-12 N17: together with _refine_s pinning its
-            # e_phi_lr to 0.0, this severs the gamma-sourced frame force dF_gamma/dphi on EVERY
-            # executable route, with no exposing toggle -- the PASSIVE-frame reading is the intended
-            # interim pure path (see the lambda_gamma config note); only an indirect second-order
-            # path to phi_embed survives under s_e_step+unroll via the graph-attached model frame.
-            # Computed once per forward at the loss level (like diagnostics()).
-            # The body lives in _gamma_coupling_term so diagnostics logs the SAME term (audit V2).
-            tied_model_frame = self.cfg.s_frame_mode == "tied"
-            model_phi = self._resolve_model_frame(token_ids, belief.phi)
-            loss = loss + self.cfg.lambda_gamma * self._gamma_coupling_term(
-                token_ids, model_phi.detach(),
-                omega=(belief.omega.detach()
-                       if tied_model_frame and belief.omega is not None else None),
-                reflection=(belief.reflection if tied_model_frame else None))
+        # HYPER-PRIOR + MODEL-COUPLING CHANNELS via the SINGLE typed hierarchical evaluator (PB-10):
+        # the two scored s-channel blocks (both gated on `not s_e_step`) are assembled as zero q rows
+        # plus live h/s rows through hierarchical_free_energy_terms with model_reduction='mean', and
+        # added ONCE to the unchanged legacy q loss instead of two independent += increments. The
+        # canonical gamma branch now carries the mathematically equal coupling-plus-entropy
+        # decomposition (via _gamma_coupling_rows) rather than the fused reduced envelope, so its fp32
+        # association changes (no bitwise claim on the active model channel); the all-off pure path
+        # (lambda_h == lambda_gamma == 0) skips the block entirely and stays byte-identical.
+        if (self.cfg.lambda_h > 0.0 or self.cfg.lambda_gamma > 0.0) and not self.cfg.s_e_step:
+            from vfe3.free_energy import hierarchical_free_energy_terms
+            cfg = self.cfg
+            hyper_prior_rows = None
+            model_coupling_rows = None
+            meta_entropy_rows = None
+            if cfg.lambda_h > 0.0:
+                # HYPER-PRIOR CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
+                # lines 1241-1249): lambda_h * mean_i KL(s_i||r), the model-channel beliefs s_i
+                # regularized toward the global hyper-prior centroid r. Grad-connected (no detach), so
+                # it backprops to the learned s/r tables, computed from the converged s/r tables OUTSIDE
+                # the E-step (s_i does not couple into q this increment). The h->s->p->q coupling and the
+                # s-channel E-step update remain DEFERRED. The weight is applied INSIDE
+                # _hyper_prior_weighted via the lambda_h_mode registry (constant: cfg.lambda_h;
+                # state_dependent: the envelope lambda_h*_i=c0_h/(b0_h+KL) + R_h), so the per-token row
+                # is added with NO external lambda_h factor; model_reduction='mean' reproduces the old
+                # mean_i reduction (== the prior _hyper_prior_term).
+                hyper_prior_rows = self._hyper_prior_weighted(token_ids)          # (B, N) WEIGHTED
+            if cfg.lambda_gamma > 0.0:
+                # MODEL-COUPLING CHANNEL (manuscript Participatory_it_from_bit.tex eq:pointwise_free_energy,
+                # lines 1241-1249): lambda_gamma * mean_i [ sum_j gamma_ij KL(s_i||Omega_tilde_ij s_j)
+                # + tau_g sum_j gamma_ij log(gamma_ij/pi^s_ij) ], with gamma_ij = softmax_j(log pi^s -
+                # E^s/tau_g). The s-channel is the SAME softmax-over-KL object as the belief beta block.
+                # Omega_tilde is the selected flat model-frame cocycle, tied to the converged belief frame
+                # by default or independently parameterized under s_frame_mode='phi_tilde'; it is DETACHED
+                # on this scored path, so the gamma gradient flows ONLY to the s tables and the forward
+                # (logits/ce above) is byte-identical to the gamma=0 path (the model channel is
+                # predictively INERT: s does NOT feed q). The detach deliberately severs the
+                # model-frame <- gamma coupling a scored frame update would carry; audit 2026-07-12 N17:
+                # together with _refine_s pinning e_phi_lr to 0.0 this severs dF_gamma/dphi on EVERY
+                # executable route, with no exposing toggle -- the PASSIVE-frame reading is the intended
+                # interim pure path (see the lambda_gamma config note). _gamma_coupling_rows returns the
+                # per-query coupling and meta-entropy split (head_reduction='mean' matching the live
+                # _gamma_coupling_term average over B/H/N); include_attention_entropy=False is the
+                # surrogate (coupling only), so the meta row is then an exact zero.
+                tied_model_frame = cfg.s_frame_mode == "tied"
+                model_phi = self._resolve_model_frame(token_ids, belief.phi)
+                c_rows, me_rows = self._gamma_coupling_rows(
+                    token_ids, model_phi.detach(), head_reduction="mean",
+                    omega=(belief.omega.detach()
+                           if tied_model_frame and belief.omega is not None else None),
+                    reflection=(belief.reflection if tied_model_frame else None))
+                model_coupling_rows = cfg.lambda_gamma * c_rows                   # (B, N)
+                meta_entropy_rows = (cfg.lambda_gamma * me_rows
+                                     if cfg.include_attention_entropy
+                                     else torch.zeros_like(c_rows))
+            ref = hyper_prior_rows if hyper_prior_rows is not None else model_coupling_rows
+            zeros = torch.zeros_like(ref)                                         # (B, N) zero rows
+            if hyper_prior_rows is None:
+                hyper_prior_rows = zeros
+            if model_coupling_rows is None:
+                model_coupling_rows = zeros
+                meta_entropy_rows = zeros
+            loss = loss + hierarchical_free_energy_terms(
+                zeros, zeros, zeros, zeros,
+                hyper_prior_rows, model_coupling_rows, meta_entropy_rows, zeros,
+                q_reduction="sum", model_reduction="mean").total
+        if self.cfg.cg_energy_weight > 0.0:
+            # CG MOMENT-ENERGY REGULARIZER (PB-13): a q-only term added to the outer objective ONCE,
+            # NEVER routed through hierarchical_free_energy_terms and never reweighting the canonical
+            # q/p/s/h total. Under an attached E-step estimator each block already appended its
+            # grad-connected D(q_post||q_pre) rows; under the 'detach' estimator the blocks stashed the
+            # detached pre-CG moments, and the shared CGCoupling.forward_moments is re-evaluated here
+            # under torch.enable_grad from each fixed pair -- detached from belief inference but
+            # attached to path_weights. The token-then-layer mean (each row.mean() over tokens, then
+            # mean over layers) is weighted and added; the per-layer values and the assembled
+            # objective_total_with_cg are reported on the diagnostic side channel only.
+            from vfe3.model.cg_coupling import cg_moment_energy_rows
+            cfg = self.cfg
+            if cfg.effective_e_step_gradient == "detach":
+                per_layer_rows = []
+                with torch.enable_grad():
+                    for pre_mu, pre_sigma in cap["cg_pre_moments"]:
+                        res = self.cg_coupling.forward_moments(pre_mu, pre_sigma)
+                        per_layer_rows.append(cg_moment_energy_rows(
+                            pre_mu, pre_sigma, res.mu, res.sigma,
+                            renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                            family=cfg.family, divergence_family=cfg.divergence_family))
+            else:
+                per_layer_rows = cap["cg_moment_energy_rows"]
+            if (len(per_layer_rows) != cfg.n_layers
+                    or any(r.numel() == 0 for r in per_layer_rows)):
+                raise RuntimeError(
+                    f"cg_energy_weight>0 requires exactly n_layers={cfg.n_layers} nonempty CG "
+                    f"moment-energy row tensors; got {len(per_layer_rows)} "
+                    f"({[tuple(r.shape) for r in per_layer_rows]}). An empty capture must never "
+                    f"reach torch.stack."
+                )
+            layer_means = torch.stack([rows.mean() for rows in per_layer_rows])   # (n_layers,)
+            cg_moment_energy = layer_means.mean()
+            loss = loss + cfg.cg_energy_weight * cg_moment_energy
+            self._cg_energy_diagnostics = {
+                "cg_moment_energy":        float(cg_moment_energy.detach()),
+                "cg_moment_energy_layers": [float(v.detach()) for v in layer_means],
+                "objective_total_with_cg": float(loss.detach()),
+            }
         return logits, loss, ce.detach()
 
     @property
@@ -1639,21 +1746,22 @@ class VFEModel(nn.Module):
         s_i is the refined model belief when ``s_belief`` is supplied (the forward's s1 under
         ``s_e_step``, so the diagnostic reads the SAME s the model uses), else encoded fresh from the
         s tables; measured against the global centroid r, grad-connected (no detach). The covariance
-        kernel is DiagonalGaussian regardless of cfg.family (the s/r tables are always diagonal
-        (V,K)/(K,)); r (K,) broadcasts over the (B, N) token axis. :meth:`_hyper_prior_term` reduces
-        this to its mean (the forward-loss scale); :meth:`diagnostics` and the s/r/h figures consume
-        the per-token vector / its sum.
+        kernel is ``get_family(cfg.family)`` (PB-11): a diagonal/Laplace family scores diagonal
+        (V,K)/(K,) s/r, while ``gaussian_full`` scores the full SPD s/r covariances that
+        ``encode_s``/``r_parameters`` now assemble from the packed Cholesky tables; r broadcasts over
+        the (B, N) token axis. :meth:`_hyper_prior_term` reduces this to its mean (the forward-loss
+        scale); :meth:`diagnostics` and the s/r/h figures consume the per-token vector / its sum.
         """
-        from vfe3.families.gaussian import DiagonalGaussian
+        from vfe3.divergence import get_family
         from vfe3.free_energy import self_divergence, self_divergence_per_coord
         cfg = self.cfg
         pb = self.prior_bank
-        s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B, N, K)
-        r_mu = pb.r_mu                                               # (K,)
-        r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps)  # (K,)
+        family = get_family(cfg.family)
+        s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B,N,K) or (B,N,K,K)
+        r_mu, r_sigma = pb.r_parameters()                           # (K,) / (K,K)
         div = self_divergence_per_coord if per_coord else self_divergence
         return div(
-            DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(r_mu, r_sigma),
+            family(s_mu, s_sigma), family(r_mu, r_sigma),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family,
         )                                                            # (B, N) summed, or (B, N, K) per-coord
@@ -1721,36 +1829,55 @@ class VFEModel(nn.Module):
         r"""Shared model-coupling setup: the s-channel pairwise energy E^s_ij, the gamma softmax
         temperature tau_g, and the gamma attention log-prior.
 
-        The s-channel mirror of the belief beta channel under FLAT transport from the explicit
-        model frame ``phi`` (Omega_tilde_ij = exp(phi_i) exp(-phi_j)): E^s_ij =
-        D(s_i || Omega_tilde_ij s_j) on the
-        diagonal s tables, per irrep block (head). Transport is factored-when-fusable (audit P4),
+        The s-channel mirror of the belief beta channel (PB-11): the s tables are scored in the
+        CONFIGURED family ``get_family(cfg.family)`` and transported through the SAME connection
+        regime the belief E-step uses, E^s_ij = D(s_i || Omega_ij s_j) per irrep block (head), with
+        Omega_ij built by ``cfg.transport_mode`` (flat -> exp(phi_i) exp(-phi_j); regime_ii/covariant
+        -> the learned edge factor read from the CHANNEL-LOCAL s means/covariances; the link modes ->
+        the shared connection_L). Transport is factored-when-fusable on the flat path (audit P4),
         exactly the E-step dispatch. Consumed by :meth:`_gamma_coupling_term` (the forward loss),
         :meth:`_gamma_coupling_terms` (the split diagnostic), and :meth:`gamma_attention_maps`
         (the gamma_ij figure), so all three read the SAME energy/temperature/prior.
         """
-        from vfe3.families.gaussian import DiagonalGaussian
+        from vfe3.families.base import get_family
         from vfe3.free_energy import attention_tau, pairwise_energy
-        from vfe3.geometry.transport import transport_covariance, transport_mean
+        from vfe3.geometry.transport import (
+            _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA, transport_covariance, transport_mean,
+        )
         from vfe3.inference.e_step import build_belief_transport
         cfg = self.cfg
         pb = self.prior_bank
-        s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B, N, K)
+        fam = get_family(cfg.family)
+        s_mu, s_sigma = pb.encode_s(token_ids) if s_belief is None else s_belief   # (B,N,K) or (B,N,K,K)
         n_pos = token_ids.shape[1]
         # omega_direct only when the caller actually supplies the belief frame (omega is not None);
-        # callers with no frame in scope pass omega=None and the s-channel falls back to the flat phi
-        # cocycle (a documented s-channel simplification -- the gamma block is DETACHED and predictively
-        # inert). Under the default 'phi' parameterization omega is always None, so this is byte-identical.
+        # callers with no frame in scope pass omega=None and the s-channel uses the phi cocycle. Under
+        # the default 'phi' parameterization omega is always None, so this is byte-identical.
         gp = cfg.gauge_parameterization if omega is not None else "phi"
-        omega = build_belief_transport(phi, self.group, transport_mode="flat",
+        # Share the belief channel's connection regime (PB-11): build the s-fiber transport through the
+        # SAME registry, gating the belief tensors it consumes on the transport-registration metadata
+        # (needs_mu/needs_sigma) rather than a mode-name conditional -- the stateful regime_ii/covariant
+        # transport reads the CHANNEL-LOCAL s means/covariances, the belief-independent link modes read
+        # only connection_L. Flat -> mu/sigma gated to None + every connection None == the byte-identical
+        # pure path.
+        tm = cfg.transport_mode
+        omega = build_belief_transport(phi, self.group, transport_mode=tm,
                                        gauge_parameterization=gp, omega=omega,
                                        reflection=reflection,
+                                       mu=(s_mu if tm in _TRANSPORT_NEEDS_MU else None),
+                                       sigma=(s_sigma if tm in _TRANSPORT_NEEDS_SIGMA else None),
                                        transport_mean_per_head=cfg.transport_mean_per_head,
-                                       compact_phi_block_transport=self._compact_phi_blocks_enabled())
+                                       compact_phi_block_transport=self._compact_phi_blocks_enabled(),
+                                       **self._model_channel_connection_kwargs())
         s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
-        s_sigma_t = transport_covariance(omega, s_sigma)            # (B, N, N, K) diagonal sandwich
+        # diagonal_out resolves the diagonal (B,N,K) vs full (B,N,K,K) sandwich EXACTLY as the belief
+        # channel does (gradients/kernels.py, oracle.py: diagonal_out=(sigma.dim()==mu.dim())). This is
+        # load-bearing for the batch-independent bare link, whose batch-collapsed operator makes the
+        # rank-gap heuristic mis-read a batched diagonal sigma as full; harmless (same branch) elsewhere.
+        s_sigma_t = transport_covariance(omega, s_sigma,             # (B,N,N,K) diag or (B,N,N,K,K) full
+                                         diagonal_out=(s_sigma.dim() == s_mu.dim()))
         e_s = pairwise_energy(
-            DiagonalGaussian(s_mu, s_sigma), DiagonalGaussian(s_mu_t, s_sigma_t),
+            fam(s_mu, s_sigma), fam(s_mu_t, s_sigma_t),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
         )                                                            # (B,H,N,N) block_glk; (B,N,N) single-block
@@ -1826,6 +1953,47 @@ class VFEModel(nn.Module):
                 * (torch.log(gamma_w.clamp(min=eps)) - torch.log(pi_s.clamp(min=eps)))).sum()
         total = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior).sum()
         return {"coupling": coupling, "meta_entropy": meta, "total": total}
+
+    def _gamma_coupling_rows(
+        self,
+        token_ids:      torch.Tensor,       # (B, N) integer token ids
+        phi:            torch.Tensor,       # (B, N, n_gen) explicit model frame (caller detaches)
+
+        *,
+        head_reduction: str,                # 'mean' (training) | 'sum' (diagnostics) over heads
+        eps:            float = 1e-12,
+        omega:          'torch.Tensor | CompactBlockElement | None' = None,  # stored belief frame; None -> phi
+        reflection:     Optional[torch.Tensor] = None,  # (B, N) per-token sign s_i; None -> off
+        s_belief:       'Optional[tuple[torch.Tensor, torch.Tensor]]' = None,  # refined (mu_s, sigma_s)
+    ) -> 'tuple[torch.Tensor, torch.Tensor]':  # (B, N) coupling rows, (B, N) meta-entropy rows
+        r"""Per-query (B, N) split of the gamma model-coupling block: the coupling row
+        sum_j gamma_ij E^s_ij and the meta-entropy row tau_g sum_j gamma_ij log(gamma_ij/pi^s_ij),
+        each UNWEIGHTED (the caller applies lambda_gamma). After summing the key axis the head axis is
+        reduced by ``head_reduction``: ``"mean"`` for the forward loss -- turning (B,H,N) into (B,N)
+        so that ``model_reduction="mean"`` reproduces the live :meth:`_gamma_coupling_term` average
+        over B/H/N -- and ``"sum"`` for diagnostics, preserving its existing sum-over-heads scale. The
+        single-block (single-head) path inserts and then removes a singleton head axis so both
+        reductions run through the same code. gamma is the exact softmax of E^s (undetached), so the
+        s tables carry gradient; the row split is the mathematically equal coupling-plus-entropy form
+        of the fused envelope (their fp32 association differs -- no bitwise claim)."""
+        from vfe3.free_energy import _broadcast_tau, attention_weights
+        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(
+            token_ids, phi, omega=omega, reflection=reflection, s_belief=s_belief)
+        gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
+        pi_s = (torch.softmax(gamma_log_prior, dim=-1) if gamma_log_prior is not None
+                else torch.full_like(gamma_w, 1.0 / gamma_w.shape[-1]))
+        tau_e = _broadcast_tau(gamma_tau, e_s)                        # (H,1,1) per-head, else scalar
+        coupling_key = (gamma_w * e_s).sum(dim=-1)                    # (B, [H,] N)
+        meta_key = (tau_e * gamma_w
+                    * (torch.log(gamma_w.clamp(min=eps)) - torch.log(pi_s.clamp(min=eps)))).sum(dim=-1)
+        if coupling_key.dim() == 2:                                   # single-block: insert singleton head
+            coupling_key = coupling_key.unsqueeze(1)                  # (B, 1, N)
+            meta_key = meta_key.unsqueeze(1)
+        if head_reduction == "mean":
+            return coupling_key.mean(dim=1), meta_key.mean(dim=1)     # (B, N)
+        if head_reduction == "sum":
+            return coupling_key.sum(dim=1), meta_key.sum(dim=1)       # (B, N)
+        raise ValueError(f"head_reduction must be 'mean' or 'sum', got {head_reduction!r}")
 
     @torch.no_grad()
     def gamma_attention_maps(
@@ -2594,25 +2762,53 @@ class VFEModel(nn.Module):
         # into ``total`` at the SAME sum scale, so train.py's uniform per-token /n_tok yields a
         # commensurate decomposition (the prior fold added per-token MEANS into the per-sequence SUM
         # total -- a 1/N under-weight of the model channel).
-        if cfg.lambda_h > 0.0 or cfg.s_e_step:                       # r table exists on this path
-            d["hyper_prior"] = float(self._hyper_prior_kl(token_ids[:1], s_belief=s_belief).sum())   # sum_i KL(s_i||r) (refined s1 under s_e_step)
-            _hp_weighted = float(self._hyper_prior_weighted(token_ids[:1], s_belief=s_belief).sum())  # WEIGHTED (lambda_h_mode); == cfg.lambda_h*hyper_prior for 'constant'
-            d["hyper_prior_weighted"] = _hp_weighted                                      # EXACT contribution folded into total (state_dependent != cfg.lambda_h*raw); the F-decomposition figure reads this
-            d["total"] += _hp_weighted
-        if cfg.lambda_gamma > 0.0 or cfg.s_e_step:                  # gamma block evaluated at out.phi
-            tied_model_frame = cfg.s_frame_mode == "tied"
-            gamma_model_phi = (self._resolve_model_frame(token_ids[:1], out.phi.unsqueeze(0))
-                               if snapshot is None else snapshot.model_phi[:1])
-            g = self._gamma_coupling_terms(
-                token_ids[:1], gamma_model_phi,
-                omega=(out.omega.unsqueeze(0)
-                       if tied_model_frame and out.omega is not None else None),
-                reflection=(out.reflection.unsqueeze(0)
-                            if tied_model_frame and out.reflection is not None else None),
-                s_belief=s_belief)
-            d["gamma_coupling"]     = float(g["coupling"])           # raw sum_{h,i,j} gamma E^s
-            d["gamma_meta_entropy"] = float(g["meta_entropy"])       # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
-            d["total"] += cfg.lambda_gamma * (d["gamma_coupling"] + d["gamma_meta_entropy"])
+        # The whole q/p/s/h decomposition is reassembled ONCE through the single typed evaluator
+        # (PB-10): the live hyper-prior/gamma rows join the per-query belief rows (built from the
+        # captured beta) with q_reduction='sum', model_reduction='sum' -- the persisted per-sequence
+        # SUM scale -- instead of incrementing d["total"] independently per model block.
+        hyper_active = cfg.lambda_h > 0.0 or cfg.s_e_step            # r table exists on this path
+        gamma_active = cfg.lambda_gamma > 0.0 or cfg.s_e_step        # gamma block evaluated at out.phi
+        if hyper_active or gamma_active:
+            from vfe3.alpha_i import alpha_is_per_coord
+            from vfe3.free_energy import _belief_free_energy_rows, hierarchical_free_energy_terms
+            belief_rows = _belief_free_energy_rows(                  # (N,) q rows for seq 0 (reuse beta)
+                self_div, energy, alpha, tau=_tau_b, lambda_beta=_lb,
+                lambda_twohop=cfg.lambda_twohop,
+                include_attention_entropy=cfg.include_attention_entropy,
+                log_prior=log_prior,
+                alpha_reg=(alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
+                coupling_energy=coupling_energy, log_likelihood=log_likelihood,
+                beta_override=beta,
+                per_coord=alpha_is_per_coord(cfg.lambda_alpha_mode))  # exact axis truth (no inference)
+            zeros = torch.zeros_like(belief_rows.self_coupling)      # (N,)
+            hyper_prior_rows = zeros
+            model_coupling_rows = zeros
+            meta_entropy_rows = zeros
+            if hyper_active:
+                d["hyper_prior"] = float(self._hyper_prior_kl(token_ids[:1], s_belief=s_belief).sum())   # sum_i KL(s_i||r) (refined s1 under s_e_step)
+                hyper_prior_rows = self._hyper_prior_weighted(token_ids[:1], s_belief=s_belief)[0]        # (N,) WEIGHTED (lambda_h_mode); == cfg.lambda_h*KL for 'constant'
+                d["hyper_prior_weighted"] = float(hyper_prior_rows.sum())                                 # EXACT contribution folded into total; the F-decomposition figure reads this
+            if gamma_active:
+                tied_model_frame = cfg.s_frame_mode == "tied"
+                gamma_model_phi = (self._resolve_model_frame(token_ids[:1], out.phi.unsqueeze(0))
+                                   if snapshot is None else snapshot.model_phi[:1])
+                c_rows, me_rows = self._gamma_coupling_rows(         # (1, N) rows: sum over heads
+                    token_ids[:1], gamma_model_phi, head_reduction="sum",
+                    omega=(out.omega.unsqueeze(0)
+                           if tied_model_frame and out.omega is not None else None),
+                    reflection=(out.reflection.unsqueeze(0)
+                                if tied_model_frame and out.reflection is not None else None),
+                    s_belief=s_belief)
+                d["gamma_coupling"]     = float(c_rows[0].sum())     # raw sum_{h,i,j} gamma E^s
+                d["gamma_meta_entropy"] = float(me_rows[0].sum())    # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
+                model_coupling_rows = cfg.lambda_gamma * c_rows[0]   # (N,)
+                meta_entropy_rows = cfg.lambda_gamma * me_rows[0]
+            d["total"] = float(hierarchical_free_energy_terms(
+                belief_rows.self_coupling, belief_rows.belief_coupling,
+                belief_rows.attention_entropy, belief_rows.twohop_coupling,
+                hyper_prior_rows, model_coupling_rows, meta_entropy_rows,
+                belief_rows.observation_nll,
+                q_reduction="sum", model_reduction="sum").total)
         spec = out.sigma if out.sigma.dim() == out.mu.dim() else torch.linalg.eigvalsh(out.sigma)
         d["effective_rank"] = float(metrics.effective_rank(spec).mean())
         # Gauge-geometry probes (diagnostics tier): the curvature proxy -- mean Frobenius departure

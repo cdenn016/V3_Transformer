@@ -8,7 +8,7 @@ is a log-bias B_ij from the `attention_prior` seam; beta* = softmax_j(B - E/tau)
 """
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -464,3 +464,208 @@ def free_energy(
     if log_likelihood is not None:                              # observation/data term -E_q[log p(o|k)] (gated stub; no live caller)
         F = F - log_likelihood.sum()
     return F
+
+
+# ===========================================================================
+# Typed hierarchical (q/p/s/h) decomposition (PB-10).
+#
+# ``free_energy`` above is the pure q-only training scalar and keeps its byte-for-byte one-shot
+# ``.sum()`` reductions; it does NOT delegate to the rows below, because float32 one-shot reductions
+# are not bitwise associative with the row-then-query reductions the evaluator performs. The rows and
+# the evaluator are the SINGLE typed boundary the diagnostics and the opt-in scored h/s outer loss
+# route their hierarchy assembly through, so the hyper-prior and gamma channels are no longer summed
+# into the total by hand at each call site.
+# ===========================================================================
+
+class BeliefFreeEnergyRows(NamedTuple):
+    r"""Per-query (..., N) belief-channel rows: already SIGNED and WEIGHTED contributions.
+
+    ``self_coupling`` is alpha_i D(q_i||p_i) (+ R(alpha_i)) reduced over any coordinate axis;
+    ``belief_coupling`` is lambda_beta sum_j beta_ij E_ij; ``attention_entropy`` is
+    lambda_beta tau sum_j beta_ij log(beta_ij/pi_ij) (an exact zero row when the entropy is gated
+    off); ``twohop_coupling`` is lambda_twohop sum_k (beta beta)_ik E_ik (an exact zero row when
+    lambda_twohop == 0); ``observation_nll`` is -E_q[log p(o|x)] (an exact zero row when no
+    observation term is supplied). Absent blocks are ``torch.zeros_like`` of the self row, never a
+    hidden branch."""
+    self_coupling:     torch.Tensor
+    belief_coupling:   torch.Tensor
+    attention_entropy: torch.Tensor
+    twohop_coupling:   torch.Tensor
+    observation_nll:   torch.Tensor
+
+
+class HierarchicalFreeEnergyTerms(NamedTuple):
+    r"""The eight reduced hierarchical components and their assembled ``total``.
+
+    ``total`` is the field-order sum: self + belief coupling + attention entropy + two-hop +
+    hyper-prior + model coupling + meta-entropy + observation NLL."""
+    self_coupling:     torch.Tensor
+    belief_coupling:   torch.Tensor
+    attention_entropy: torch.Tensor
+    twohop_coupling:   torch.Tensor
+    hyper_prior:       torch.Tensor
+    model_coupling:    torch.Tensor
+    meta_entropy:      torch.Tensor
+    observation_nll:   torch.Tensor
+    total:             torch.Tensor
+
+
+def _reduce_row(row: torch.Tensor, how: str) -> torch.Tensor:
+    r"""Reduce a per-query row to a scalar by ``"sum"`` or ``"mean"`` over all batch/query entries."""
+    if how == "sum":
+        return row.sum()
+    if how == "mean":
+        return row.mean()
+    raise ValueError(f"reduction must be 'sum' or 'mean', got {how!r}")
+
+
+def hierarchical_free_energy_terms(
+    self_coupling_rows:     torch.Tensor,  # (..., N), already alpha-weighted and regularized
+    belief_coupling_rows:   torch.Tensor,  # (..., N), lambda_beta * sum_j beta_ij E_ij
+    attention_entropy_rows: torch.Tensor,  # (..., N), lambda_beta * tau * sum_j beta log(beta/pi)
+    twohop_coupling_rows:   torch.Tensor,  # (..., N), lambda_twohop * sum_k (beta beta)_ik E_ik
+    hyper_prior_rows:       torch.Tensor,  # (..., N), lambda_h_i D(s_i||h) + R_h
+    model_coupling_rows:    torch.Tensor,  # (..., N), lambda_gamma * sum_j gamma_ij E^s_ij
+    meta_entropy_rows:      torch.Tensor,  # (..., N), lambda_gamma * tau_g * sum_j gamma log(gamma/pi_s)
+    observation_nll_rows:   torch.Tensor,  # (..., N), -E_q[log p(o|x)]
+
+    *,
+    q_reduction:     str = "sum",
+    model_reduction: str = "mean",
+) -> HierarchicalFreeEnergyTerms:
+    r"""The single authoritative scalar evaluator over eight already-signed, already-weighted rows.
+
+    The first four rows and ``observation_nll_rows`` reduce with ``q_reduction``; the three s-channel
+    rows (``hyper_prior``, ``model_coupling``, ``meta_entropy``) reduce with ``model_reduction``. Each
+    reduction is ``"sum"`` or ``"mean"`` applied directly to every batch/query entry after the caller
+    has already collapsed the structural (coordinate/key/head) axes. Absent blocks are passed as
+    ``torch.zeros_like`` rows -- there is no hidden branch. The evaluator validates matching
+    ``(..., N)`` shapes and devices, reduces each row exactly once, and assembles ``total`` in the
+    fixed field order. It NEVER detaches or reweights an input (the only detach in this module lives
+    inside :func:`_belief_free_energy_rows`, forming the fixed two-hop weights); whether the model
+    frame was built passively or attached is the caller's choice, no longer hidden here."""
+    rows = (self_coupling_rows, belief_coupling_rows, attention_entropy_rows,
+            twohop_coupling_rows, hyper_prior_rows, model_coupling_rows,
+            meta_entropy_rows, observation_nll_rows)
+    for r in rows:
+        if not isinstance(r, torch.Tensor):
+            raise TypeError(f"every hierarchical row must be a torch.Tensor, got {type(r)!r}")
+    ref = self_coupling_rows
+    for r in rows:
+        if r.shape != ref.shape:
+            raise ValueError(
+                f"hierarchical rows must share one (..., N) shape; got {tuple(r.shape)} vs "
+                f"{tuple(ref.shape)}")
+        if r.device != ref.device:
+            raise ValueError(
+                f"hierarchical rows must share one device; got {r.device} vs {ref.device}")
+
+    self_coupling     = _reduce_row(self_coupling_rows,     q_reduction)
+    belief_coupling   = _reduce_row(belief_coupling_rows,   q_reduction)
+    attention_entropy = _reduce_row(attention_entropy_rows, q_reduction)
+    twohop_coupling   = _reduce_row(twohop_coupling_rows,   q_reduction)
+    hyper_prior       = _reduce_row(hyper_prior_rows,       model_reduction)
+    model_coupling    = _reduce_row(model_coupling_rows,    model_reduction)
+    meta_entropy      = _reduce_row(meta_entropy_rows,      model_reduction)
+    observation_nll   = _reduce_row(observation_nll_rows,   q_reduction)
+
+    total = (self_coupling + belief_coupling + attention_entropy + twohop_coupling
+             + hyper_prior + model_coupling + meta_entropy + observation_nll)
+    return HierarchicalFreeEnergyTerms(
+        self_coupling, belief_coupling, attention_entropy, twohop_coupling,
+        hyper_prior, model_coupling, meta_entropy, observation_nll, total,
+    )
+
+
+def _belief_free_energy_rows(
+    self_div:                  torch.Tensor,        # (..., N) or (..., N, K) D(q_i||p_i)
+    energy:                    torch.Tensor,        # (..., N, N) or (..., H, N, N) E_ij
+    alpha:                     torch.Tensor,        # (..., N) or (..., N, K) self-coupling
+
+    *,
+    tau:                       'float | torch.Tensor' = 1.0,
+    lambda_beta:               'float | torch.Tensor' = 1.0,
+    log_eps:                   float = 1e-12,
+    lambda_twohop:             float = 0.0,
+    include_attention_entropy: bool  = True,
+
+    log_prior:                 Optional[torch.Tensor] = None,   # (..., N, N) attention log-prior
+    alpha_reg:                 Optional[torch.Tensor] = None,   # (..., N[,K]) R(alpha) if state-dep
+    coupling_energy:           Optional[torch.Tensor] = None,   # (..., N, N) VALUE-gauge coupling energy
+    log_likelihood:            Optional[torch.Tensor] = None,   # (..., N) E_q[log p(o|k)]
+    beta_override:             Optional[torch.Tensor] = None,   # captured beta (avoids recompute)
+    per_coord:                 Optional[bool] = None,           # self_div carries a coord axis; None -> infer
+) -> BeliefFreeEnergyRows:
+    r"""Per-query (..., N) decomposition of the belief channel that :func:`free_energy` sums to a
+    scalar -- a NEW hierarchical/diagnostic path, NOT the scalar's reduction order.
+
+    It collapses the coordinate, key, and optional head axes while preserving the batch/query axes.
+    The five returned rows are already SIGNED and WEIGHTED (lambda_beta in both beta rows,
+    lambda_twohop in the two-hop row, ``observation_nll = -log_likelihood`` when present); the
+    attention-entropy row is an exact zero when the entropy is gated off, and the two-hop and
+    observation rows are exact zeros when absent. ``beta_override`` supplies a captured beta so
+    diagnostic weights are not recomputed. The ONLY detach here forms the fixed two-hop weights
+    W2 = beta.detach() @ beta.detach()."""
+    beta = (beta_override if beta_override is not None
+            else attention_weights(energy, tau=tau, log_prior=log_prior))
+    value_energy = energy if coupling_energy is None else coupling_energy
+
+    # Axis bookkeeping. ``energy`` is (..., N, N) or (..., H, N, N) (the head axis, block_glk, is 3rd
+    # from last); ``self_div`` is (..., N) or per-coordinate (..., N, K) (state_dependent_per_coord).
+    # The rank gap g = energy.dim() - self_div.dim() then reads: g == 2 -> head, no coord; g == 0 ->
+    # coord, no head; g == 1 is AMBIGUOUS between (no coord, no head) and (coord AND head), so it is
+    # disambiguated by shape -- (no coord, no head) requires self_div.shape == energy.shape[:-1]
+    # exactly. Callers that know the alpha form (diagnostics) pass ``per_coord`` explicitly, which
+    # also covers the H == N == K collision the shape test cannot separate.
+    gap = energy.dim() - self_div.dim()
+    if per_coord is None:
+        if gap == 0:
+            per_coord = True
+        elif gap == 2:
+            per_coord = False
+        elif gap == 1:
+            per_coord = self_div.shape != energy.shape[:-1]
+        else:
+            raise ValueError(
+                f"self_div rank {self_div.dim()} is inconsistent with energy rank {energy.dim()}")
+    has_head = (gap + (1 if per_coord else 0)) >= 2
+
+    def _collapse(x: torch.Tensor) -> torch.Tensor:                   # (..., [H,] N) -> (..., N)
+        return x.sum(dim=-2) if has_head else x
+
+    belief_row = lambda_beta * _collapse((beta * value_energy).sum(dim=-1))
+
+    self_term = alpha * self_div
+    if alpha_reg is not None:
+        self_term = self_term + alpha_reg
+    if per_coord:
+        self_term = self_term.sum(dim=-1)                             # collapse the coordinate axis
+    self_row = self_term
+    if self_row.shape != belief_row.shape:
+        raise ValueError(
+            f"belief rows disagree on the (..., N) shape: self {tuple(self_row.shape)} vs "
+            f"coupling {tuple(belief_row.shape)}; pass per_coord explicitly if the axis "
+            f"inference misread the layout")
+
+    if include_attention_entropy:
+        if log_prior is not None:
+            log_pi = torch.log_softmax(log_prior, dim=-1)
+            log_pi = torch.where(torch.isfinite(log_pi), log_pi, torch.zeros_like(log_pi))
+        else:
+            log_pi = math.log(max(1.0 / beta.shape[-1], log_eps))
+        _tau_e = _broadcast_tau(tau, energy)
+        entropy_full = _tau_e * (beta * (torch.log(beta.clamp(min=log_eps)) - log_pi))
+        entropy_row = lambda_beta * _collapse(entropy_full.sum(dim=-1))
+    else:
+        entropy_row = torch.zeros_like(self_row)
+
+    if lambda_twohop != 0.0:
+        w2 = beta.detach() @ beta.detach()                            # fixed hop weights (the ONLY detach)
+        twohop_row = lambda_twohop * _collapse((w2 * value_energy).sum(dim=-1))
+    else:
+        twohop_row = torch.zeros_like(self_row)
+
+    observation_row = (-log_likelihood if log_likelihood is not None
+                       else torch.zeros_like(self_row))
+
+    return BeliefFreeEnergyRows(self_row, belief_row, entropy_row, twohop_row, observation_row)

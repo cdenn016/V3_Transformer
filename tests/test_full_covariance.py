@@ -135,3 +135,71 @@ def test_full_entropy_survives_non_pd_covariance():
     bad = torch.eye(K).clone(); bad[0, 0] = -1.0                 # negative eigenvalue -> not PD
     h = FullGaussian(mu, bad.expand(2, K, K).contiguous()).entropy()   # must NOT raise
     assert torch.isfinite(h).all()
+
+
+# ===========================================================================
+# PB-14 (Task 5, 2026-07-12): family/divergence-consistent FULL decode.
+#
+# The generic `family` decode scores a full q against the intentionally DIAGONAL vocabulary
+# prior table (promoted to full via diag_embed only when the family is full) through the
+# configured divergence, with NO kl_max ranking clamp. It must equal a direct full-family
+# functional call, and the full config must construct via covariance-kind membership WITHOUT
+# adding a vocabulary/decode lower-triangle state key.
+# ===========================================================================
+
+from vfe3.divergence import get_family, get_functional                # noqa: E402
+from vfe3.model.prior_bank import PriorBank, get_decode                # noqa: E402
+from vfe3.numerics import bounded_variance_from_log                    # noqa: E402
+
+
+def _full_reference_logits(pb, mu_q, sigma_q, tau_eff):
+    family_cls = get_family(pb.family)
+    q = family_cls(mu_q.unsqueeze(-2), sigma_q.unsqueeze(-3))
+    p_sigma = torch.diag_embed(bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps))
+    p = family_cls(pb._decode_mu_table(), p_sigma)
+    functional = get_functional(pb.divergence_family)
+    energy = functional(q, p, alpha=pb.renyi_order, kl_max=float("inf"), eps=pb.eps)
+    return -energy / tau_eff
+
+
+def _spd_batch(B, N, K, gen):
+    A = torch.randn(B, N, K, K, generator=gen)
+    return A @ A.transpose(-1, -2) + K * torch.eye(K)
+
+
+@pytest.mark.parametrize("alpha", [0.5, 1.0, 1.5])
+def test_family_decode_matches_direct_functional_full_gaussian(alpha):
+    g = torch.Generator().manual_seed(0)
+    V, K, n_gen = 7, 3, 4
+    pb = PriorBank(V, K, n_gen, decode_tau=1.2, family="gaussian_full",
+                   divergence_family="renyi", renyi_order=alpha, decode_mode="family",
+                   diagonal_covariance=False)
+    with torch.no_grad():
+        pb.mu_embed.normal_(0.0, 0.6)
+        pb.sigma_log_embed.normal_(0.0, 0.3)
+    mu_q = torch.randn(2, 4, K, generator=g)
+    sigma_q = _spd_batch(2, 4, K, g)                            # full SPD query covariance
+    tau_eff = pb._tau_eff()
+    got = get_decode("family")(pb, mu_q, sigma_q, tau_eff)
+    exp = _full_reference_logits(pb, mu_q, sigma_q, tau_eff)
+    assert got.shape == (2, 4, V)
+    assert torch.allclose(got, exp, atol=1e-4, rtol=0.0)
+    if alpha == 1.0:                                            # canonical: matches the fast full kernel
+        full = get_decode("full")(pb, mu_q, sigma_q, tau_eff)
+        assert torch.allclose(got, full, atol=1e-3)
+
+
+def test_full_family_decode_config_has_no_decode_lower_triangle_keys():
+    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                     family="gaussian_full", decode_mode="family", use_prior_bank=True,
+                     untie_decode_bank=True)
+    model = VFEModel(cfg)
+    names = {n for n, _ in model.named_parameters()}
+    assert not any("sigma_lower" in n for n in names)           # decode/vocab tables stay diagonal
+    assert model.prior_bank.decode_sigma_log_embed.shape == (6, 4)
+    # end-to-end: full family + family decode runs forward + backward.
+    tokens = torch.randint(0, 6, (2, 5)); targets = torch.randint(0, 6, (2, 5))
+    _, loss, _ = model(tokens, targets)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.prior_bank.mu_embed.grad is not None

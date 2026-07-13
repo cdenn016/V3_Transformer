@@ -157,6 +157,10 @@ def free_energy_terms(
     subtracted from ``total`` when the gated observation seam supplies it. Their defaults preserve
     the original four-term result exactly.
     """
+    # RAW public fields (unchanged, unweighted, positive-likelihood): kept byte-for-byte for their
+    # reported values -- callers/figures read these individually. ``total`` alone routes through the
+    # single typed hierarchical evaluator (weights, entropy gate, negative-likelihood sign). We never
+    # divide a weighted row to recover a raw field, so zero weights stay valid.
     self_term = alpha * self_div
     if alpha_reg is not None:
         self_term = self_term + alpha_reg
@@ -171,21 +175,31 @@ def free_energy_terms(
         log_pi = torch.where(torch.isfinite(log_pi), log_pi, torch.zeros_like(log_pi))
     else:
         log_pi = torch.log(beta.new_tensor(1.0 / beta.shape[-1]).clamp(min=eps))
-    from vfe3.free_energy import _broadcast_tau          # align a per-head (H,) tau to the head axis
+    from vfe3.free_energy import (                       # align a per-head (H,) tau to the head axis
+        _belief_free_energy_rows, _broadcast_tau, hierarchical_free_energy_terms,
+    )
     _tau_e = _broadcast_tau(tau, energy)
     entropy = float((_tau_e * (beta * (torch.log(beta.clamp(min=eps)) - log_pi))).sum())
-    total = self_coupling + float(lambda_beta) * belief_coupling
-    if include_attention_entropy:
-        total = total + float(lambda_beta) * entropy
     twohop_coupling = None
     if lambda_twohop != 0.0:
         w2 = beta.detach() @ beta.detach()
         twohop_coupling = float((w2 * value_energy).sum())
-        total = total + lambda_twohop * twohop_coupling
     observation_likelihood = None
     if log_likelihood is not None:
         observation_likelihood = float(log_likelihood.sum())
-        total = total - observation_likelihood
+    # SIGNED, WEIGHTED belief rows + explicit zero model rows through the evaluator; use only its total.
+    rows = _belief_free_energy_rows(
+        self_div, energy, alpha, tau=tau, lambda_beta=lambda_beta, log_eps=eps,
+        lambda_twohop=lambda_twohop, include_attention_entropy=include_attention_entropy,
+        log_prior=log_prior, alpha_reg=alpha_reg, coupling_energy=coupling_energy,
+        log_likelihood=log_likelihood, beta_override=beta,
+    )
+    zero_model = torch.zeros_like(rows.self_coupling)
+    total = float(hierarchical_free_energy_terms(
+        rows.self_coupling, rows.belief_coupling, rows.attention_entropy, rows.twohop_coupling,
+        zero_model, zero_model, zero_model, rows.observation_nll,
+        q_reduction="sum", model_reduction="sum",
+    ).total)
     terms = {
         "self_coupling":   self_coupling,
         "belief_coupling": belief_coupling,

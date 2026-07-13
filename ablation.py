@@ -147,7 +147,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.008,
-    decode_mode               = 'diagonal_chunked',  #"full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "diagonal_untied", "full"
+    decode_mode               = 'diagonal_chunked',  #"full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "full", "family", "family_chunked" (family/family_chunked: divergence-consistent KL-to-prior decode, use_prior_bank=True)
     encode_mode               = "per_token",   #"per_token_additive"
     
     
@@ -212,6 +212,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 
     use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling (bilinear, exactly
                                                      # equivariant, means-only sigma; zero-init path weights)
+    cg_covariance_mode        = "passthrough",       # CG covariance pushforward: "passthrough" (means-only, pure) |
+                                                     # "delta_full" (delta-method sigma_out=sym(J Sigma J^T); needs family="gaussian_full")
+    cg_energy_weight          = 0.0,                 # CG moment-energy regularizer (0.0 = OFF; >0 adds once
+                                                     # cg_energy_weight*mean_layers(mean_tokens D(q_post||q_pre)); needs use_cg_coupling=True)
 
     ####################################
     # Non-Flat Connection - Regime II

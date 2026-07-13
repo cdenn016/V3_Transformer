@@ -460,3 +460,91 @@ def test_omega_builder_receives_four_tensor_args():
     assert all(isinstance(t, torch.Tensor) for t in calls[0])
     assert mu_q.requires_grad and sigma_q.requires_grad             # differentiation leaves
     assert not mu_k.requires_grad and not sigma_k.requires_grad     # filtering: key slots frozen
+
+
+# ===========================================================================
+# PB-11 (Task 3, 2026-07-12): model channel shares the Route-B covariant connection.
+#
+# _gamma_energy builds the s-channel transport through regime_ii_covariant when configured,
+# forwarding connection_M and (per the needs_mu + needs_sigma registration metadata) the
+# s-channel means AND covariances -- so its edge features are channel-local to the s state.
+# ===========================================================================
+
+def _covariant_gamma_model(**kw):
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+
+    # prior_source='token' (default) keeps the belief mu_embed table SEPARATE from the s tables, so the
+    # channel-local "transport reads the s means/covariances, not the belief q" assertion is meaningful.
+    base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                n_e_steps=1, lambda_h=0.0, lambda_gamma=0.5,
+                transport_mode="regime_ii_covariant")
+    base.update(kw)
+    torch.manual_seed(0)
+    m = VFEModel(VFE3Config(**base))
+    torch.manual_seed(7)
+    with torch.no_grad():
+        m.prior_bank.s_mu_embed.normal_(0.0, 0.5)
+        m.prior_bank.s_sigma_log_embed.normal_(0.0, 0.3)
+        m.prior_bank.mu_embed.normal_(0.0, 0.5)
+        m.prior_bank.phi_embed.normal_(0.0, 0.2)
+        m.connection_M.normal_(0.0, 0.4)                       # nonzero Route-B connection
+    return m
+
+
+def _covariant_e_s_ref(m, tok, phi, *, mu_state, sigma_state):
+    from vfe3.families.base import get_family
+    from vfe3.free_energy import pairwise_energy
+    from vfe3.geometry.transport import (
+        _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA, transport_covariance, transport_mean,
+    )
+    cfg = m.cfg
+    fam = get_family(cfg.family)
+    s_mu, s_sigma = m.prior_bank.encode_s(tok)
+    tm = cfg.transport_mode
+    omega = build_belief_transport(
+        phi, m.group, transport_mode=tm, gauge_parameterization="phi",
+        mu=(mu_state if tm in _TRANSPORT_NEEDS_MU else None),
+        sigma=(sigma_state if tm in _TRANSPORT_NEEDS_SIGMA else None),
+        connection_M=getattr(m, "connection_M", None),
+        link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
+        cocycle_relaxation=cfg.cocycle_relaxation,
+    )
+    s_mu_t = transport_mean(omega, s_mu)
+    s_sigma_t = transport_covariance(omega, s_sigma, diagonal_out=(s_sigma.dim() == s_mu.dim()))
+    return pairwise_energy(fam(s_mu, s_sigma), fam(s_mu_t, s_sigma_t),
+                           alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                           divergence_family=cfg.divergence_family, irrep_dims=m.group.irrep_dims)
+
+
+def test_gamma_energy_covariant_reads_connection_M():
+    m = _covariant_gamma_model()
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    e_s0 = m._gamma_energy(tok, phi)[0].clone()
+    with torch.no_grad():
+        m.connection_M.mul_(1.9)
+    e_s1 = m._gamma_energy(tok, phi)[0]
+    assert not torch.allclose(e_s0, e_s1)                       # s-channel now reads connection_M (was flat)
+
+
+def test_gamma_energy_covariant_transport_reads_s_means_and_covariances():
+    m = _covariant_gamma_model()
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    e_s = m._gamma_energy(tok, phi)[0]
+    s_mu, s_sigma = m.prior_bank.encode_s(tok)
+    enc = m.prior_bank.encode(tok)
+    ref_s = _covariant_e_s_ref(m, tok, phi, mu_state=s_mu, sigma_state=s_sigma)
+    torch.testing.assert_close(e_s, ref_s, rtol=1e-4, atol=1e-5)   # channel-local: reads the s state
+    ref_q = _covariant_e_s_ref(m, tok, phi, mu_state=enc.mu, sigma_state=enc.sigma)
+    assert not torch.allclose(e_s, ref_q)                      # ...not the belief (q) means/covariances
+
+
+def test_gamma_energy_covariant_gradient_reaches_connection_M():
+    m = _covariant_gamma_model()
+    tok = torch.randint(0, 6, (2, 5))
+    phi = m.prior_bank.encode(tok).phi
+    m._gamma_energy(tok, phi)[0].sum().backward()
+    assert m.connection_M.grad is not None
+    assert float(m.connection_M.grad.abs().sum()) > 0.0
