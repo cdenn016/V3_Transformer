@@ -689,13 +689,21 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # operating point. Off makes the tied arm's whole forward gauge-exact (modulo the head mixer being
         # studied), so the gauge-equivariance read is clean. (It does not enter the builder_resid /
         # gauge_resid certificates either way -- those are computed off mu/sigma/omega, not log_prior.)
+        # lambda_alpha_mode pinned 'constant' on every arm: the baseline's 'state_dependent_per_coord'
+        # needs a per-coordinate self-divergence, which exists only for a diagonal-covariance family
+        # (vfe3/config.py's alpha_is_per_coord/family_is_diagonal guard), but every arm here is
+        # family='gaussian_full'. 'constant' is the pure default (VFE3Config.lambda_alpha_mode) and is
+        # valid for any family, so it is the minimal, theory-neutral override that keeps the
+        # tied-vs-untied gauge-equivariance contrast the only difference between arms.
         "configs": [
             {"label": "untied_block_glk", "gauge_group": "block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
-             "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False},
+             "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False,
+             "lambda_alpha_mode": "constant"},
             {"label": "tied_block_glk",   "gauge_group": "tied_block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
-             "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False},
+             "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False,
+             "lambda_alpha_mode": "constant"},
             # PARAM-MATCHED CONTROL: the untied arm carries +55.6% params (14.10M vs 9.06M tied) because
             # the per-head gauge gives the head mixer a larger Schur commutant, so the raw tied-vs-untied
             # PPL gap is only an UPPER BOUND on the equivariance tax. This arm widens the exact-equivariant
@@ -707,7 +715,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "tied_block_glk_wide", "gauge_group": "tied_block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
              "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False,
-             "embed_dim": 28, "kl_max": 224},
+             "embed_dim": 28, "kl_max": 224, "lambda_alpha_mode": "constant"},
         ],
     },
 
