@@ -792,6 +792,9 @@ class VFE3Config:
     # the tied-vs-untied confound in the linear-vs-bank comparison; still a KL-to-priors decode.
     untie_decode_bank:         bool  = False
     
+    # Global-norm gradient clipping threshold consumed by train(). None disables clipping.
+    grad_clip:                 Optional[float] = 1.0
+
     # Per-role gradient clipping: clip each optimizer role group (mu / sigma / phi / ...) to
     # grad_clip separately instead of one GLOBAL norm over all parameters (which is dominated by
     # phi_embed and silently rescales every other group when it binds). False = the pure
@@ -2505,6 +2508,17 @@ class VFE3Config:
                 "no norms).",
                 UserWarning, stacklevel=2,
             )
+        if self.grad_clip is not None:
+            if (
+                isinstance(self.grad_clip, bool)
+                or not isinstance(self.grad_clip, (int, float))
+                or not math.isfinite(float(self.grad_clip))
+                or float(self.grad_clip) < 0.0
+            ):
+                raise ValueError(
+                    "grad_clip must be None or a finite real value >= 0; "
+                    f"got {self.grad_clip!r}"
+                )
 
     @property
     def tau(self) -> float:

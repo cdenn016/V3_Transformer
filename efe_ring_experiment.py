@@ -12,15 +12,25 @@ The sealed budgets below reproduce the pre-registration. To smoke-test the pipel
 set CONFIG['steps'] and CONFIG['n_episodes']/['n_dev'] small (this is logged in the output, so any
 deviation from the sealed run is visible -- no silent caps).
 """
+import hashlib
 import json
+import logging
 import math
 import os
+import pickle
 import time
+from dataclasses import asdict
+from numbers import Real
+from pathlib import Path
+from typing import Dict, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
 
 from vfe3.inference import ring_task as rt
+from vfe3.run_artifacts import _atomic_replace, semantic_config_fingerprint
+
+logger = logging.getLogger(__name__)
 
 # ---- pre-registration surface (spec Section 4.7); reduce only for a logged smoke test ----
 CONFIG = dict(
@@ -40,6 +50,7 @@ CONFIG = dict(
     delta_min=0.05,                  # minimum effect size (absolute success rate)
     alpha=0.05,
     out_dir="vfe3_policy_results/ring_v1",
+    resume=True,                     # reuse current per-seed bundles under out_dir/seeds; False = full recompute
 )
 
 
@@ -212,37 +223,276 @@ def run_checkpoint(model, cfg, device, seed):
     return dict(gamma=gamma, temp=temp, dev_success=dev_sr, metrics=metrics, gates=gates)
 
 
+# ---- per-seed durable bundles + resume state machine (audit PB-04) -------------------------------
+# Each seed is trained and evaluated independently and published atomically to
+# <out_dir>/seeds/seed_<seed>.pt so a crash never discards a finished seed. A 'trained' bundle carries
+# the model + adequacy (evaluation still pending); a 'complete' bundle also carries the validated
+# 12-arm result. Resume reuses a bundle ONLY when it is current -- same semantic experiment config,
+# same executable code, intact schema -- and fails closed (recomputes) on any absent/malformed/stale/
+# incompatible bundle. In-step optimizer resume is out of scope.
+
+_SEED_BUNDLE_SCHEMA_VERSION = 1
+
+
+def _semantic_experiment_config(cfg: Mapping[str, object]) -> Dict[str, object]:
+    """Return every training/evaluation field that can change one seed's result.
+
+    resume / out_dir / log_every are EXCLUDED: they set the reuse policy and I/O cadence, never the
+    trained weights or the measured arm matrix. The Phase-2 baseline constants TEMP_GRID /
+    NUCLEUS_TOP_P / TYPICAL_P / FDR_Q (module-level, not in CONFIG) DO shape the scored arms, so they
+    join the CONFIG fields in the semantic identity.
+    """
+    included = ("steps", "batch_size", "lr", "n_dev", "n_episodes", "budget",
+                "candidate_mode", "top_k", "beta_C", "gamma_grid",
+                "adequacy_threshold", "delta_min", "alpha")
+    semantic: Dict[str, object] = {key: cfg[key] for key in included}
+    semantic["TEMP_GRID"]     = TEMP_GRID
+    semantic["NUCLEUS_TOP_P"] = NUCLEUS_TOP_P
+    semantic["TYPICAL_P"]     = TYPICAL_P
+    semantic["FDR_Q"]         = FDR_Q
+    return semantic
+
+
+def _efe_ring_code_identity(root: Optional[Path] = None) -> str:
+    """Hash the executable ring entry point and package Python sources, never result files.
+
+    Digests the relative path plus bytes of ``efe_ring_experiment.py`` and every sorted
+    ``vfe3/**/*.py`` (``__pycache__`` excluded). It NEVER inspects git status, docs, ``out_dir``, seed
+    bundles, or aggregate results, so publishing a seed bundle or ``ring_v1_results.json`` under the
+    source tree leaves the identity unchanged while an edit to the executable code moves it.
+    """
+    base = Path(__file__).resolve().parent if root is None else Path(root).resolve()
+    sources = []
+    entry = base / "efe_ring_experiment.py"
+    if entry.is_file():
+        sources.append(entry)
+    package = base / "vfe3"
+    if package.is_dir():
+        sources.extend(sorted(p for p in package.glob("**/*.py") if "__pycache__" not in p.parts))
+    digest = hashlib.sha256()
+    for path in sources:
+        digest.update(path.relative_to(base).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _validated_complete_result(result: object, adequacy: float) -> Optional[Dict[str, object]]:
+    """Return a safe aggregate-ready copy of one complete result, else None.
+
+    Explicit so no restored mapping is indexed before validation: the top-level and result adequacy
+    must agree as finite reals (never bools), ``admitted`` must be a real bool, and when admitted the
+    tuning scalars, the exact 12-arm metrics key set (each arm a finite ``success``), and a real-bool
+    ``gates["go"]`` must all be present.
+    """
+    if not isinstance(result, Mapping):
+        return None
+    copied = dict(result)
+    result_adequacy = copied.get("adequacy")
+    if (not isinstance(result_adequacy, Real) or isinstance(result_adequacy, bool)
+            or not math.isfinite(float(result_adequacy))
+            or float(result_adequacy) != float(adequacy)):
+        return None
+    admitted_value = copied.get("admitted")
+    if type(admitted_value) is not bool:
+        return None
+    if admitted_value:
+        for name in ("gamma", "temp"):
+            value = copied.get(name)
+            if (not isinstance(value, Real) or isinstance(value, bool)
+                    or not math.isfinite(float(value))):
+                return None
+        metrics = copied.get("metrics")
+        gates = copied.get("gates")
+        expected_arms = {
+            "full_efe_tuned", "full_efe_g1", "risk_only", "ambiguity_only",
+            "flat_pref", "p_data_control", "temp_tuned_logprob", "logprob_baseline",
+            "nucleus", "typical", "greedy_ref", "random",
+        }
+        if not isinstance(metrics, Mapping) or set(metrics) != expected_arms:
+            return None
+        if not isinstance(gates, Mapping) or type(gates.get("go")) is not bool:
+            return None
+        for arm in metrics.values():
+            if not isinstance(arm, Mapping):
+                return None
+            success = arm.get("success")
+            if (not isinstance(success, Real) or isinstance(success, bool)
+                    or not math.isfinite(float(success))):
+                return None
+    return copied
+
+
+def _save_seed_bundle(
+    path:              Path,
+    model:             rt.VFEModel,
+    experiment_config: Mapping[str, object],
+    result:            Optional[Mapping[str, object]],
+
+    *,
+    seed:     int,
+    adequacy: float,
+    status:   str,
+) -> Path:
+    r"""Atomically publish a `trained` or `complete` seed bundle.
+
+    Written through ``seed_path.with_suffix(".pt.tmp")`` + the shared atomic-replace helper (same-dir
+    tmp + ``os.replace``), so the trained and complete states are each independently publishable and a
+    crash never leaves a truncated ``.pt`` at the final name.
+    """
+    semantic     = dict(experiment_config)
+    model_config = asdict(model.cfg)
+    bundle = {
+        "schema_version":              _SEED_BUNDLE_SCHEMA_VERSION,
+        "status":                      status,
+        "seed":                        int(seed),
+        "semantic_config":             semantic,
+        "semantic_config_fingerprint": semantic_config_fingerprint(semantic),
+        "code_identity_sha256":        _efe_ring_code_identity(),
+        "model_config":                model_config,
+        "model_config_fingerprint":    semantic_config_fingerprint(model_config),
+        "model_state":                 model.state_dict(),
+        "adequacy":                    float(adequacy),
+        "result":                      (dict(result) if result is not None else None),
+    }
+    tmp = path.with_suffix(".pt.tmp")
+    torch.save(bundle, tmp)
+    _atomic_replace(path, tmp)
+    return path
+
+
+def _load_seed_bundle_if_current(
+    path:              Path,
+    experiment_config: Mapping[str, object],
+    device:            torch.device,
+
+    *,
+    seed: int,
+) -> Optional[Tuple[rt.VFEModel, Dict[str, object]]]:
+    r"""Rebuild the model and return a current validated seed bundle, else return None.
+
+    Fails closed on an absent/malformed/stale/incompatible bundle: the schema, semantic experiment
+    fingerprint, executable code identity, adequacy, and (for a complete bundle) the full result must
+    all validate, and the model must rebuild + load strictly. A complete bundle's stored ``result`` is
+    replaced with the ``_validated_complete_result`` copy before returning. Expected file/safe-load/
+    schema/state-dict failures are caught, logged, and turned into None (the state machine then
+    recomputes); programming errors surface.
+    """
+    if not path.is_file():
+        return None
+    try:
+        bundle = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(bundle, Mapping):
+            raise RuntimeError("bundle is not a mapping")
+        if bundle.get("schema_version") != _SEED_BUNDLE_SCHEMA_VERSION:
+            raise RuntimeError(f"unsupported schema_version {bundle.get('schema_version')!r}")
+        status = bundle.get("status")
+        if status not in ("trained", "complete"):
+            raise RuntimeError(f"status {status!r} is neither 'trained' nor 'complete'")
+        if bundle.get("seed") != int(seed):
+            raise RuntimeError(f"bundle seed {bundle.get('seed')!r} != requested {int(seed)}")
+        if bundle.get("semantic_config_fingerprint") != semantic_config_fingerprint(dict(experiment_config)):
+            raise RuntimeError("semantic experiment config drift")
+        if bundle.get("code_identity_sha256") != _efe_ring_code_identity():
+            raise RuntimeError("executable code identity drift")
+        adequacy = bundle.get("adequacy")
+        if (not isinstance(adequacy, Real) or isinstance(adequacy, bool)
+                or not math.isfinite(float(adequacy))):
+            raise RuntimeError("adequacy is not a finite real number")
+        adequacy = float(adequacy)
+        result = bundle.get("result")
+        if status == "trained":
+            if result is not None:
+                raise RuntimeError("a trained bundle must not carry a result")
+            validated_result = None
+        else:
+            validated_result = _validated_complete_result(result, adequacy)
+            if validated_result is None:
+                raise RuntimeError("complete-result schema validation failed")
+        model_config = bundle.get("model_config")
+        if not isinstance(model_config, Mapping):
+            raise RuntimeError("model_config is not a mapping")
+        if bundle.get("model_config_fingerprint") != semantic_config_fingerprint(dict(model_config)):
+            raise RuntimeError("model_config fingerprint mismatch")
+        model_state = bundle.get("model_state")
+        if not isinstance(model_state, Mapping):
+            raise RuntimeError("model_state is not a mapping")
+        model = rt.VFEModel(rt.VFE3Config(**dict(model_config)))
+        model.load_state_dict(model_state)
+        model.to(device)
+        model.eval()
+    except (OSError, RuntimeError, ValueError, TypeError, EOFError, pickle.UnpicklingError) as exc:
+        logger.warning("seed %s bundle at %s is unusable (%s); recomputing",
+                       seed, getattr(path, "name", path), exc)
+        return None
+    return model, {"status": status, "adequacy": adequacy, "result": validated_result}
+
+
 def main():
     cfg = CONFIG
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    os.makedirs(cfg["out_dir"], exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}  | sealed run: {cfg['seeds']} seeds x {cfg['steps']} steps, "
           f"{cfg['n_episodes']} test episodes/arm")
-    if device == "cpu":
+    if device.type == "cpu":
         print("WARNING: running on CPU; the iterative E-step makes this very slow. Run on the GPU.")
 
     results = {"config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.items()},
-               "device": device, "checkpoints": {}}
+               "device": str(device), "checkpoints": {}}
+
+    out_dir  = Path(cfg["out_dir"])
+    seed_dir = out_dir / "seeds"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    semantic_cfg = _semantic_experiment_config(cfg)
     admitted = []
+
     for seed in cfg["seeds"]:
-        t0 = time.time()
-        print(f"\n[seed {seed}] training {cfg['steps']} steps (batch {cfg['batch_size']}) on {device}...", flush=True)
-        model, adeq = rt.train_ring_checkpoint(
-            seed=seed, steps=cfg["steps"], batch_size=cfg["batch_size"], lr=cfg["lr"],
-            log_every=cfg["log_every"], device=device)
-        ok = adeq >= cfg["adequacy_threshold"]
-        print(f"[seed {seed}] adequacy={adeq:.4f} ({'ADMIT' if ok else 'EXCLUDE'})  [{time.time()-t0:.0f}s]", flush=True)
-        entry = {"adequacy": adeq, "admitted": ok}
-        if ok:
-            entry.update(run_checkpoint(model, cfg, device, seed))
+        seed_path = seed_dir / f"seed_{int(seed)}.pt"
+        bundle = (_load_seed_bundle_if_current(seed_path, semantic_cfg, device, seed=seed)
+                  if cfg["resume"] else None)
+        if bundle is not None and bundle[1]["status"] == "complete":
+            entry = dict(bundle[1]["result"])
+            print(f"\n[seed {seed}] resumed COMPLETE from {seed_path.name} "
+                  f"(adequacy={entry['adequacy']:.4f}, "
+                  f"{'ADMIT' if entry['admitted'] else 'EXCLUDE'})", flush=True)
+        else:
+            if bundle is None:
+                t0 = time.time()
+                print(f"\n[seed {seed}] training {cfg['steps']} steps (batch {cfg['batch_size']}) "
+                      f"on {device}...", flush=True)
+                model, adequacy = rt.train_ring_checkpoint(
+                    seed=seed,
+                    steps=cfg["steps"],
+                    batch_size=cfg["batch_size"],
+                    lr=cfg["lr"],
+                    log_every=cfg["log_every"],
+                    device=str(device),
+                )
+                _save_seed_bundle(seed_path, model, semantic_cfg, None,
+                                  seed=seed, adequacy=adequacy, status="trained")
+                tail = f"  [{time.time() - t0:.0f}s]"
+            else:
+                model, saved = bundle
+                adequacy = float(saved["adequacy"])
+                tail = "  (resumed trained; evaluating)"
+            is_admitted = adequacy >= cfg["adequacy_threshold"]
+            print(f"[seed {seed}] adequacy={adequacy:.4f} "
+                  f"({'ADMIT' if is_admitted else 'EXCLUDE'}){tail}", flush=True)
+            entry = {"adequacy": adequacy, "admitted": is_admitted}
+            if is_admitted:
+                entry.update(run_checkpoint(model, cfg, str(device), seed))
+                g = entry["gates"]
+                print(f"   gamma*={entry['gamma']} temp*={entry['temp']}  "
+                      f"full_efe={entry['metrics']['full_efe_tuned']['success']:.3f}  "
+                      f"temp_lp={entry['metrics']['temp_tuned_logprob']['success']:.3f}  "
+                      f"p_data={entry['metrics']['p_data_control']['success']:.3f}  "
+                      f"random={entry['metrics']['random']['success']:.3f}  "
+                      f"causal={g['closed_loop_causal']}  GO={g['go']}")
+            _save_seed_bundle(seed_path, model, semantic_cfg, entry,
+                              seed=seed, adequacy=adequacy, status="complete")
+        if bool(entry["admitted"]):
             admitted.append(seed)
-            g = entry["gates"]
-            print(f"   gamma*={entry['gamma']} temp*={entry['temp']}  "
-                  f"full_efe={entry['metrics']['full_efe_tuned']['success']:.3f}  "
-                  f"temp_lp={entry['metrics']['temp_tuned_logprob']['success']:.3f}  "
-                  f"p_data={entry['metrics']['p_data_control']['success']:.3f}  "
-                  f"random={entry['metrics']['random']['success']:.3f}  "
-                  f"causal={g['closed_loop_causal']}  GO={g['go']}")
         results["checkpoints"][str(seed)] = entry
 
     # cross-seed aggregate + overall go/no-go (all admitted seeds must individually pass)
@@ -265,9 +515,13 @@ def main():
         results["verdict"] = "NO checkpoint cleared the predictive-adequacy precondition"
         print("\nVERDICT:", results["verdict"])
 
+    # Publish the cross-seed aggregate only after every requested seed has a complete entry above, and
+    # atomically (same-dir tmp + os.replace) so a crash never leaves a truncated ring_v1_results.json.
     out_path = os.path.join(cfg["out_dir"], "ring_v1_results.json")
-    with open(out_path, "w", encoding="utf-8") as f:
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
+    os.replace(tmp_path, out_path)
     print("wrote", out_path)
 
 

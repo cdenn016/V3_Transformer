@@ -53,7 +53,7 @@ def _run_t3(dev):
         cfg = replace(cfg, max_steps=MAX_STEPS)
         model = VFEModel(cfg).to(dev)
         losses = train(model, _periodic_loader(V=6, period=3, seed=seed),
-                       cfg, n_steps=MAX_STEPS, device=dev)
+                       cfg, n_steps=MAX_STEPS, grad_clip=cfg.grad_clip, device=dev)
         ends.append(float(losses[-1]))
         print(f"    seed {seed}: end CE = {ends[-1]:.4f}")
     med = _median(ends)

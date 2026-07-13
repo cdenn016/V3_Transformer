@@ -13,15 +13,26 @@ thing that can make their final weights differ is a missing restore leg -- model
 optimizer momentum (exp_avg/exp_avg_sq), or the scheduler's ``last_epoch``.
 """
 
+import math
+from dataclasses import asdict
+from pathlib import Path
+
 import pytest
 import torch
 from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
+from vfe3.ema import EMA
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts, load_checkpoint
-from vfe3.train import build_optimizer, train
+from vfe3.run_artifacts import (
+    RunArtifacts,
+    finalize_run,
+    finalize_validation_run,
+    load_checkpoint,
+    semantic_config_fingerprint,
+)
+from vfe3.train import TrainingTerminalState, build_optimizer, train
 
 
 def _const_loader(seq_len: int = 8, bs: int = 4) -> DataLoader:
@@ -357,3 +368,365 @@ def test_resume_from_cfg_field_is_picked_up(tmp_path):
     model_c = VFEModel(cfg_resume)
     losses_c = train(model_c, _const_loader(), cfg_resume, n_steps=4)
     assert len(losses_c) == 2                                   # resumed from step 2 via the cfg field
+
+
+def test_resume_config_drift_reports_grad_clip_change(tmp_path):
+    r"""PB-15: changing only grad_clip across a resume is caught by the existing config-drift
+    warning in load_checkpoint (the same mechanism test_resume_warns_on_config_drift pins for
+    e_q_mu_lr), proving grad_clip participates in that comparison like any other semantic field."""
+    cfg = _cfg(grad_clip=1.0)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    path = art.save_checkpoint(2, model, opt, cfg)
+
+    drifted = VFE3Config(**{**cfg.__dict__, "grad_clip": 0.25})
+    with pytest.warns(UserWarning, match=r"config drift.*grad_clip"):
+        load_checkpoint(path, model, opt, cfg=drifted)
+
+    # identical config (grad_clip unchanged) -> silent
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        load_checkpoint(path, model, opt, cfg=cfg)
+
+
+# --------------------------------------------------------------------------- PB-03: portable best weights
+#
+# A cross-run-directory resume used to restore only the best_val_ppl/best_step SCALARS, so the
+# selected weights (best_model.pt) never followed the checkpoint into the new run_dir; finalize then
+# saw finite best metadata whose file did not exist. save_checkpoint now embeds a VALIDATED best-model
+# bundle, and load_checkpoint publishes it (or a legacy sibling) into the new run, failing closed on
+# any missing/tampered/semantically-incompatible bundle. Selection compatibility is judged on the
+# SELECTION PROJECTION of the config (architecture/objective fields), so a resume-path or output-cadence
+# change cannot invalidate otherwise identical weights, while the full internal fingerprint still
+# detects excluded-field tampering. Tiny CPU models throughout (embed_dim=4).
+
+
+def _eval_loader(seq_len: int = 8, bs: int = 4) -> DataLoader:
+    base = torch.arange(3).repeat(20)
+    ds = TokenWindows(base[: seq_len * 6].long(), seq_len)
+    return DataLoader(ds, batch_size=bs, shuffle=False, drop_last=True)
+
+
+def _no_git(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vfe3.run_artifacts._git_code_identity",
+        lambda *a, **k: {"git_sha": "0" * 40, "git_dirty": False, "git_dirty_fingerprint": None})
+
+
+def _make_terminal_state(model, cfg, *, ema=None) -> TrainingTerminalState:
+    r"""A TrainingTerminalState from the model's current (raw) weights + a fresh optimizer + RNG."""
+    opt = build_optimizer(model, cfg)
+    raw = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+    rng = {"cpu": torch.get_rng_state().clone(),
+           "cuda": ([s.clone() for s in torch.cuda.get_rng_state_all()]
+                    if torch.cuda.is_available() else None)}
+    return TrainingTerminalState(
+        step=int(cfg.max_steps), optimizer=opt, scaler=None, ema=ema,
+        metropolis_generator=torch.Generator().manual_seed(0),
+        data_state=None, raw_model_state=raw, rng_state=rng)
+
+
+def _build_embedded_best_checkpoint(run_dir, cfg, *, best_ppl=5.0, best_step=2, final_step=4):
+    r"""Write a checkpoint whose embedded best bundle carries DISTINCT selected weights.
+
+    Returns (checkpoint_path, best_state, final_state). The best weights (saved to best_model.pt at
+    best_ppl) differ from the checkpoint's own model_state, so a later equality check proves the
+    SELECTED weights -- not the latest weights -- were carried across the resume."""
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    art = RunArtifacts(run_dir, cfg, model)
+    with torch.no_grad():
+        model.prior_bank.mu_embed.add_(0.5)                     # BEST weights
+    best_state = {n: p.detach().clone() for n, p in model.named_parameters()}
+    art.maybe_save_best(best_step, model, best_ppl)
+    with torch.no_grad():
+        model.prior_bank.mu_embed.add_(0.5)                     # FINAL weights (distinct from best)
+    final_state = {n: p.detach().clone() for n, p in model.named_parameters()}
+    ckpt = art.save_checkpoint(final_step, model, opt, cfg)
+    return ckpt, best_state, final_state
+
+
+def _strip_to_legacy(ckpt_path) -> None:
+    r"""Remove the best_model_bundle field so the checkpoint reads as a pre-PB-03 (legacy) bundle."""
+    bundle = torch.load(ckpt_path, weights_only=False)
+    del bundle["best_model_bundle"]
+    torch.save(bundle, ckpt_path)
+
+
+def test_cross_run_resume_restores_embedded_best_bundle(tmp_path):
+    cfg = _cfg()
+    ckpt, best_state, final_state = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
+    assert any(not torch.equal(best_state[n], final_state[n]) for n in best_state)   # distinct
+
+    fresh = VFEModel(cfg)                                        # a different init, a NEW run_dir
+    new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
+    assert new_art.best_val_ppl == float("inf") and new_art.best_step is None
+    load_checkpoint(ckpt, fresh, artifacts=new_art)
+
+    assert new_art.best_val_ppl == 5.0 and new_art.best_step == 2
+    assert new_art.best_path.is_file()                          # published into the NEW run_dir
+    published = torch.load(new_art.best_path, weights_only=True)["model_state"]
+    for n, v in best_state.items():
+        assert torch.equal(published[n], v)                     # the SELECTED (best) weights moved
+    live = dict(fresh.named_parameters())
+    for n, v in final_state.items():
+        assert torch.equal(live[n].detach(), v)                 # the model itself got the checkpoint weights
+
+
+def test_legacy_cross_run_resume_imports_sibling_best_bundle(tmp_path):
+    cfg = _cfg()
+    ckpt, best_state, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
+    _strip_to_legacy(ckpt)
+    assert "best_model_bundle" not in torch.load(ckpt, weights_only=False)   # genuinely legacy
+    assert (tmp_path / "A" / "best_model.pt").is_file()         # sibling <old_run>/best_model.pt present
+
+    fresh = VFEModel(cfg)
+    new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
+    load_checkpoint(ckpt, fresh, artifacts=new_art)
+
+    assert new_art.best_val_ppl == 5.0 and new_art.best_step == 2
+    assert new_art.best_path.is_file()
+    published = torch.load(new_art.best_path, weights_only=True)["model_state"]
+    for n, v in best_state.items():
+        assert torch.equal(published[n], v)                     # sibling best imported into the new run
+
+
+def test_resume_without_best_weights_drops_unreachable_best_metadata(tmp_path):
+    cfg = _cfg()
+    ckpt, _, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
+    _strip_to_legacy(ckpt)
+    (tmp_path / "A" / "best_model.pt").unlink()                 # neither embedded nor sibling weights
+
+    fresh = VFEModel(cfg)
+    new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
+    with pytest.warns(UserWarning):
+        load_checkpoint(ckpt, fresh, artifacts=new_art)
+
+    assert new_art.best_val_ppl == float("inf")                 # unreachable best scalar dropped
+    assert new_art.best_step is None
+    assert not new_art.best_path.exists()
+
+
+def test_checkpoint_rejects_finite_best_without_weights(tmp_path):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    opt = build_optimizer(model, cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    art.best_val_ppl = 5.0                                      # finite selection scalar...
+    art.best_step = 2
+    assert not art.best_path.exists()                          # ...with no readable best_model.pt
+
+    with pytest.raises(RuntimeError):
+        art.save_checkpoint(4, model, opt, cfg)                # integrity error -> no checkpoint
+
+
+def test_finalize_rejects_best_metadata_without_best_weights(tmp_path, monkeypatch):
+    _no_git(monkeypatch)
+    cfg = _cfg(generate_figures=False)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    art.best_val_ppl = 5.0                                      # finite metadata, unreachable weights
+    art.best_step = 2
+    assert not art.best_path.exists()
+
+    with pytest.raises(RuntimeError, match="no reachable weights"):
+        finalize_run(model, art, cfg, test_loader=None)
+
+
+def test_validation_finalizer_scores_terminal_ema_before_best_selection(tmp_path, monkeypatch):
+    _no_git(monkeypatch)
+    torch.manual_seed(0)
+    cfg = _cfg(use_ema=True, ema_decay=0.5, generate_figures=False)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+
+    # EMA shadow captured at init, then the raw weights are perturbed so the DEPLOYED EMA differs.
+    ema = EMA(model)
+    deployed_ema = {name: t.detach().clone() for name, t in ema.shadow.items()}
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.requires_grad:
+                p.add_(0.75)
+
+    # A DISTINCT prior best whose PPL (4.0) is LOWER than the final EMA result (9.0).
+    torch.manual_seed(123)
+    prior = VFEModel(cfg)
+    art.maybe_save_best(1, prior, 4.0)
+    prior_state = torch.load(art.best_path, weights_only=True)["model_state"]
+    prior_bytes = art.best_path.read_bytes()
+
+    calls = []
+
+    def fake_evaluate(m, loader, *, tokens_per_char=1.0, device=None):
+        calls.append({name: t.detach().clone() for name, t in m.state_dict().items()})
+        return {"ce": 2.0, "ppl": 9.0, "bpc": 2.5}
+
+    monkeypatch.setattr("vfe3.train.evaluate", fake_evaluate)
+
+    state = _make_terminal_state(model, cfg, ema=ema)
+    mapping = finalize_validation_run(
+        model, art, cfg, _eval_loader(), losses=[1.0, 0.9],
+        terminal_state=state, device=torch.device("cpu"))
+
+    assert len(calls) == 1                                      # scored the terminal EMA exactly once
+    scored = calls[0]
+    for name, ema_w in deployed_ema.items():
+        assert torch.equal(scored[name], ema_w)                # ...on the deployed EMA weights
+    assert any(not torch.equal(scored[name], prior_state[name]) for name in deployed_ema)  # not prior best
+    assert art.best_path.read_bytes() == prior_bytes           # prior best file untouched (9.0 !< 4.0)
+    assert mapping["primary_val_ppl"] == 4.0                   # the better prior best remains primary
+    assert mapping["best_val_ppl"] == 4.0
+    assert mapping["final_val_ppl"] == 9.0                     # final fields are the terminal score
+    assert mapping["final_val_ce"] == 2.0
+
+
+def test_selection_projection_migrates_missing_defaults_and_rejects_unknown_fields():
+    from vfe3.run_artifacts import _selection_semantic_config
+
+    cfg = _cfg()
+    live_projection = _selection_semantic_config(cfg)
+    serialized = asdict(cfg)
+
+    # The stored FULL fingerprint is a stable function of the raw mapping (the tamper-check basis).
+    assert semantic_config_fingerprint(serialized) == semantic_config_fingerprint(
+        dict(reversed(list(serialized.items()))))
+
+    # A genuinely older mapping missing a defaulted behavior field acquires the CURRENT default.
+    older = dict(serialized)
+    del older["decode_tau"]
+    assert "decode_tau" not in older
+    assert _selection_semantic_config(older) == live_projection
+
+    # An unknown newer field fails closed rather than being silently ignored.
+    newer = dict(serialized)
+    newer["a_field_from_the_future"] = 123
+    assert semantic_config_fingerprint(newer) == semantic_config_fingerprint(
+        dict(reversed(list(newer.items()))))
+    with pytest.raises(ValueError):
+        _selection_semantic_config(newer)
+
+
+def test_selection_projection_grad_clip_migrates_to_default_and_differentiates():
+    r"""PB-15 cross-plan regression: a raw legacy mapping predating grad_clip (simulated by
+    stripping the field from asdict(VFE3Config())) migrates through _selection_semantic_config
+    to the CURRENT default (grad_clip=1.0), matching the live default projection exactly -- an
+    explicit non-default grad_clip=0.25 must project differently. The raw legacy mapping's own
+    full fingerprint is verified BEFORE the projection (the tamper-check basis, mirroring
+    test_selection_projection_migrates_missing_defaults_and_rejects_unknown_fields above), and an
+    unknown field still fails closed rather than being silently ignored by config_from_serialized."""
+    from vfe3.run_artifacts import _selection_semantic_config
+
+    legacy = asdict(VFE3Config())
+    assert legacy["grad_clip"] == 1.0
+    del legacy["grad_clip"]
+    assert "grad_clip" not in legacy
+
+    # The raw legacy mapping's own full fingerprint is a stable function of key order.
+    assert semantic_config_fingerprint(legacy) == semantic_config_fingerprint(
+        dict(reversed(list(legacy.items()))))
+
+    live_default_projection = _selection_semantic_config(VFE3Config())
+    assert live_default_projection["grad_clip"] == 1.0
+    assert _selection_semantic_config(legacy) == live_default_projection
+
+    explicit = dict(legacy)
+    explicit["grad_clip"] = 0.25
+    explicit_projection = _selection_semantic_config(explicit)
+    assert explicit_projection["grad_clip"] == 0.25
+    assert explicit_projection != live_default_projection
+
+    unknown = dict(legacy)
+    unknown["a_field_from_the_future"] = 123
+    with pytest.raises(ValueError):
+        _selection_semantic_config(unknown)
+
+
+def test_resume_from_only_difference_survives_finalization(tmp_path, monkeypatch):
+    _no_git(monkeypatch)
+    cfg_a = _cfg(generate_figures=False)                        # resume_from=None
+    ckpt, best_state, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg_a)
+
+    # Resume into B under a config that differs ONLY in resume_from (and trust flags).
+    cfg_b = _cfg(generate_figures=False, resume_from=str(ckpt))
+    model_b = VFEModel(cfg_b)
+    new_art = RunArtifacts(tmp_path / "B", cfg_b, model_b)
+    load_checkpoint(ckpt, model_b, artifacts=new_art, cfg=cfg_b)
+    assert new_art.best_val_ppl == 5.0                         # imported despite the resume_from diff
+    assert new_art.best_path.is_file()
+    res = finalize_run(model_b, new_art, cfg_b, test_loader=_const_loader())
+    assert res["reloaded_best"] is True                        # finalize reloaded the imported best
+
+    # Control: a behavior-field difference (decode_tau) must REJECT the same bundle.
+    cfg_c = _cfg(generate_figures=False, decode_tau=2.0)
+    model_c = VFEModel(cfg_c)
+    art_c = RunArtifacts(tmp_path / "C", cfg_c, model_c)
+    with pytest.raises(RuntimeError):
+        load_checkpoint(ckpt, model_c, artifacts=art_c, cfg=cfg_c)
+
+
+def test_stale_contract_rerun_replaces_old_unselected_best(tmp_path, monkeypatch):
+    _no_git(monkeypatch)
+    torch.manual_seed(0)
+    cfg = _cfg(generate_figures=False)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+
+    # A stale best_model.pt left by a previous cell: distinct weights, on disk, but the recomputed
+    # cell begins with INFINITE in-memory best metadata (it must not silently select these weights).
+    stale = VFEModel(cfg)
+    with torch.no_grad():
+        for p in stale.parameters():
+            p.add_(3.0)
+    art.maybe_save_best(1, stale, 2.0)
+    stale_bytes = art.best_path.read_bytes()
+    stale_state = torch.load(art.best_path, weights_only=True)["model_state"]
+    art.best_val_ppl = float("inf")                            # recomputed-cell in-memory reset
+    art.best_step = None
+
+    state = _make_terminal_state(model, cfg)
+    mapping = finalize_validation_run(
+        model, art, cfg, _eval_loader(), losses=[1.0, 0.9],
+        terminal_state=state, device=torch.device("cpu"))
+
+    assert art.best_path.is_file()
+    assert art.best_path.read_bytes() != stale_bytes           # terminal validation replaced the file
+    new_state = torch.load(art.best_path, weights_only=True)["model_state"]
+    assert any(not torch.equal(new_state[k], stale_state[k]) for k in stale_state)
+    assert math.isfinite(mapping["primary_val_ppl"])
+    assert Path(mapping["terminal_checkpoint"]).exists()       # success contract published
+    assert (tmp_path / "r" / "summary.json").exists()
+
+
+@pytest.mark.parametrize("corruption", [
+    "stale_fingerprint", "missing_key", "extra_key",
+    "wrong_shape", "wrong_dtype", "non_tensor",
+])
+def test_corrupt_embedded_best_bundle_rejected_on_resume(tmp_path, corruption):
+    cfg = _cfg()
+    ckpt, _, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
+    bundle = torch.load(ckpt, weights_only=False)
+    embedded = bundle["best_model_bundle"]
+    model_state = embedded["model_state"]
+    a_key = next(iter(model_state))
+    if corruption == "stale_fingerprint":
+        embedded["config_fingerprint"] = "0" * 64
+    elif corruption == "missing_key":
+        del model_state[a_key]
+    elif corruption == "extra_key":
+        model_state["phantom_param"] = torch.zeros(2)
+    elif corruption == "wrong_shape":
+        model_state[a_key] = torch.zeros(model_state[a_key].shape + (1,))
+    elif corruption == "wrong_dtype":
+        model_state[a_key] = model_state[a_key].to(torch.float64)
+    elif corruption == "non_tensor":
+        model_state[a_key] = [1.0, 2.0, 3.0]
+    torch.save(bundle, ckpt)
+
+    fresh = VFEModel(cfg)
+    new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
+    with pytest.raises(RuntimeError):
+        load_checkpoint(ckpt, fresh, artifacts=new_art)

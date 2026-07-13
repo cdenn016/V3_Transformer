@@ -63,7 +63,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from vfe3.config import VFE3Config
-from vfe3.data.datasets import make_dataloader, tokens_per_char
+from vfe3.data.datasets import _tokenizer_tag, cache_source_identity, make_dataloader, tokens_per_char
 from vfe3.metrics import (
     attention_entropy,
     gauge_equivariance_residual,
@@ -72,7 +72,13 @@ from vfe3.metrics import (
     rank_one_residual,
 )
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts
+from vfe3.run_artifacts import (
+    RunArtifacts,
+    _atomic_replace,
+    _git_code_identity,
+    finalize_validation_run,
+    semantic_config_fingerprint,
+)
 from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, evaluate, train
 from vfe3.viz.extract import across_layer_belief_trace, attention_entropy_cov_gap, converged_state
@@ -411,6 +417,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     # self-edge attention sink (diagonal -inf except (0,0)).
 
     # --- training mechanics ---
+    grad_clip                 = 1.0,         # gradient clip: global L2 norm unless grad_clip_per_role; None/0.0 disables
     grad_clip_per_role        = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
                                              # (global is phi-dominated and silently rescales other roles)
     skip_belief_sigma_update  = True,        # skip the belief-channel sigma E-step update (dead-compute ablation
@@ -1797,9 +1804,36 @@ def run_single(
     for _cov in coverage_lines(train_loader, cfg.max_steps, dataset):
         print(f"   {_cov}")
 
-    losses = train(
+    # Terminal artifact set (PB-02): a VALIDATION-ONLY finalizer runs once as a train() callback --
+    # immediately after the final optimizer step -- so even a default cell (log/eval interval above
+    # max_steps, checkpoint_interval=0) publishes a complete resumable artifact set (terminal metrics
+    # row, best_model.pt, validation_results.json, summary.json, provenance, figures, and a resumable
+    # terminal checkpoint) WITHOUT ever scoring a test split. The finalizer's returned merge mapping
+    # carries the headline (primary/final validation, best, terminal_checkpoint); run_single overlays it
+    # on the label/error/seed/overrides/token-cap metadata below. Periodic log/eval/checkpoint cadence is
+    # no longer relied on for the artifact set -- generation/checkpointing is this one post-final step.
+    terminal_result: Dict[str, Any] = {}
+    train_start = time.perf_counter()
+
+    def _terminal_callback(state, callback_losses):
+        terminal_result.update(finalize_validation_run(
+            model, artifacts, cfg, val_loader,
+            tokens_per_char=val_tpc,
+            train_loader=train_loader,
+            losses=callback_losses,
+            data_seed=(int(DATA_SEED) if DATA_SEED is not None else int(cfg.seed)),
+            max_tokens=max_tokens,
+            tokenizer_tag=_tokenizer_tag(dataset),
+            device=device,
+            wall_time=time.perf_counter() - train_start,
+            logger=logger,
+            terminal_state=state,
+        ))
+
+    train(
         model, train_loader, cfg,
         n_steps=cfg.max_steps,
+        grad_clip=cfg.grad_clip,
         log_interval=cfg.log_interval,
         eval_interval=cfg.eval_interval,
         val_loader=val_loader,
@@ -1808,29 +1842,17 @@ def run_single(
         logger=logger,
         artifacts=artifacts,
         generate_samples=False,                              # pure silent path: no sample text
+        terminal_callback=_terminal_callback,
     )
 
-    # Unconditional final validation pass: guarantees a number even when max_steps is below
-    # eval_interval (a periodic eval never fired). best_val_ppl is the lowest the periodic
-    # eval saw (inf if none); the headline takes the better of the two.
-    m = evaluate(model, val_loader, tokens_per_char=val_tpc, device=device)
-    best = artifacts.best_val_ppl
-    primary = min(best, m["ppl"]) if best != float("inf") else m["ppl"]
-
-    result = {
-        "label":            label,
-        "error_kind":       None,
-        "primary_val_ppl":  float(primary),
-        "final_val_ppl":    float(m["ppl"]),
-        "final_val_ce":     float(m["ce"]),
-        "final_val_bpc":    float(m["bpc"]),
-        "best_val_ppl":     (float(best) if best != float("inf") else None),
-        "final_train_loss": (float(losses[-1]) if losses else None),
-        "n_params":         n_params,
-        "seed":             int(cfg.seed),
-        "overrides":        _jsonable(overrides),
-        "max_tokens":       (int(max_tokens) if max_tokens is not None else None),
+    result: Dict[str, Any] = {
+        "label":      label,
+        "error_kind": None,
+        "seed":       int(cfg.seed),
+        "overrides":  _jsonable(overrides),
+        "max_tokens": (int(max_tokens) if max_tokens is not None else None),
     }
+    result.update(terminal_result)                           # primary/final/best/terminal_checkpoint headline
     if collect_diagnostics:                                  # opt-in converged-state probes (S2)
         result.update(_cell_diagnostics(model, cfg, val_loader, device))
     if collect_extrapolation:                                # opt-in growing-N eval (H1/EXP-13)
@@ -1868,61 +1890,91 @@ _DIAGNOSTIC_RESULT_KEYS = {
 }
 
 
-def _cell_is_current(
-    run_dir:    Path,
-    overrides:  Dict[str, Any],
+_CELL_CONTRACT_SCHEMA_VERSION = 1
+
+
+def _cell_contract(
+    cfg:              VFE3Config,
+    dataset:          str,
+    diagnostic_flags: Mapping[str, bool],
 
     *,
-    seed:                  int,
-    dataset:               str,
-    collect_diagnostics:   bool = False,
-    collect_extrapolation: bool = False,
-    max_steps:             Optional[int] = None,
-    max_tokens:            Optional[int] = None,
-) -> bool:
-    r"""True iff a completed cell's persisted config.json matches the config we would build now.
+    data_seed:  int,
+    max_tokens: Optional[int]  = None,
+    cache_dir:  Optional[Path] = None,
+) -> Dict[str, object]:
+    r"""Build the versioned contract that authorizes reuse of one ablation cell.
 
-    Guards resume against baseline drift: ``ablation_result.json`` is keyed only by the
-    ``param=value`` label, which does NOT encode the imported ``train_vfe3`` baseline. Editing
-    an unrelated baseline field (e.g. ``embed_dim``) would otherwise let a stale result be
-    served as current. A cell is skipped only when its saved VFE3Config equals the freshly
-    built one (config-error cells have no config.json, so they are always re-run -- cheap).
-
-    The session ``dataset`` is NOT a VFE3Config field (it is the loader seam), so it is compared
-    separately against the persisted top-level ``config.json["dataset"]`` -- otherwise a rerun on a
-    DIFFERENT dataset would serve the wrong-dataset cell as current (the VFE3Config would match).
-
-    ``max_tokens`` (the loader train-split token cap) is likewise a loader seam, not a VFE3Config
-    field, so it never lands in config.json: a smoke cell capped at 10k tokens and a later full run
-    would otherwise compare byte-identical. It is persisted in the ``ablation_result.json`` marker
-    and compared here (a marker missing the key reads as None -> a capped re-run fails closed).
-
-    A current marker must also record successful completion with a finite terminal validation PPL.
-    Requested diagnostic and extrapolation collections are cache requirements: the marker must record
-    the corresponding request flag and contain its output, so enabling either collection cannot reuse
-    a headline-only cell.
+    The contract binds a cached cell to the full identity a bare ``param=value`` label omits, so
+    resume fails closed after ANY of them drifts (audit 2026-07-12 PB-01): the semantic-config
+    fingerprint (the imported baseline, not just the swept field), the session dataset / data seed /
+    token cap / tokenizer tag (loader seams that never land in ``config.json``), the per-split corpus
+    identity (byte size + streamed SHA-256, so a rebuilt or re-tokenized cache is caught even at the
+    same label), the repository code identity (HEAD plus a dirty-tree fingerprint), and the requested
+    diagnostic/extrapolation collections. ``cache_source_identity`` raises when a split's cache is
+    absent, which the caller converts into "forbid reuse" rather than a stale hit.
     """
-    cj = run_dir / "config.json"
-    if not cj.exists():
-        return False
+    return {
+        "schema_version":              _CELL_CONTRACT_SCHEMA_VERSION,
+        "semantic_config_fingerprint": semantic_config_fingerprint(asdict(cfg)),
+        "dataset":                     dataset,
+        "data_seed":                   int(data_seed),
+        "max_tokens":                  int(max_tokens) if max_tokens is not None else None,
+        "tokenizer_tag":               _tokenizer_tag(dataset),
+        "train_source":                cache_source_identity(dataset, "train", cache_dir=cache_dir),
+        "validation_source":           cache_source_identity(dataset, "validation", cache_dir=cache_dir),
+        "code_identity":               _git_code_identity(),
+        "diagnostic_flags":            dict(sorted(diagnostic_flags.items())),
+    }
+
+
+def _expected_cell_contract_or_none(
+    overrides: Mapping[str, object],
+    dataset: str,
+    diagnostic_flags: Mapping[str, bool],
+    *,
+    seed: int,
+    max_steps: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+) -> Optional[Dict[str, object]]:
+    r"""Build the reuse contract inside the per-cell failure boundary, else forbid reuse.
+
+    Wraps both ``VFE3Config`` construction and the corpus source hashing so a rejected config or a
+    missing/corrupt cache raises here rather than in the sweep loop: the exception is logged and
+    ``None`` is returned, which only forbids cache reuse (``run_single`` then executes inside its own
+    isolation and records the actual config/data error without aborting later cells). The data-order
+    seed recorded in the contract is the effective TRAIN-loader seed -- ``DATA_SEED`` when set (shared
+    across per-model seeds), else the cell seed -- matching ``run_single``'s post-build reseed.
+    """
     try:
-        built = json.loads(json.dumps(asdict(VFE3Config(
-            **_cell_cfg_dict(overrides, seed=seed, max_steps=max_steps))), default=str))
-        saved_obj = json.loads(cj.read_text(encoding="utf-8"))
-    except Exception:                                        # unbuildable now / unreadable -> re-run
-        return False
-    if saved_obj.get("dataset") != dataset:                  # session dataset changed -> re-run
-        return False
-    if saved_obj.get("config") != built:
-        return False
+        cfg = VFE3Config(**_cell_cfg_dict(dict(overrides), seed=seed, max_steps=max_steps))
+        data_seed = int(DATA_SEED) if DATA_SEED is not None else int(seed)
+        return _cell_contract(cfg, dataset, diagnostic_flags,
+                              data_seed=data_seed, max_tokens=max_tokens)
+    except Exception as exc:                                  # unbuildable config / unhashable corpus
+        logger.warning("  [contract unavailable -> reuse forbidden] %s", exc)
+        return None
+
+
+def _cell_is_current(
+    run_dir:           Path,
+    expected_contract: Mapping[str, object],
+) -> bool:
+    r"""Return true only for a successful cell with an exactly matching contract.
+
+    Fails closed on anything short of a completed success bound to ``expected_contract``: a legacy
+    directory carrying only the old ``ablation_result.json`` success marker and no
+    ``cell_contract.json`` re-runs, as does a marker that is unreadable, non-mapping, failed, or
+    lacks a finite terminal validation PPL. The published contract must parse, be a mapping, carry
+    the current schema version, and equal the freshly rebuilt ``expected_contract`` field for field
+    (ordinary nested mapping equality) -- any code, corpus, tokenizer, dataset, seed, token-cap,
+    semantic-config, or diagnostic-flag drift leaves the two unequal and forbids reuse.
+    """
     try:
         marker = json.loads((run_dir / "ablation_result.json").read_text(encoding="utf-8"))
-    except Exception:                                        # no/unreadable marker -> re-run
+    except Exception:                                        # no/unreadable success marker -> re-run
         return False
-    if not isinstance(marker, dict):                         # parseable but incomplete marker -> re-run
-        return False
-    cur = int(max_tokens) if max_tokens is not None else None
-    if marker.get("max_tokens", None) != cur:
+    if not isinstance(marker, Mapping):                      # parseable but not an object -> re-run
         return False
     if marker.get("status") != "success" or marker.get("error_kind") is not None:
         return False
@@ -1932,19 +1984,18 @@ def _cell_is_current(
         return False
     if not math.isfinite(terminal_ppl):
         return False
-    saved_diagnostics   = marker.get("collect_diagnostics")
-    saved_extrapolation = marker.get("collect_extrapolation")
-    if type(saved_diagnostics) is not bool or saved_diagnostics != collect_diagnostics:
+    contract_path = run_dir / "cell_contract.json"
+    if not contract_path.exists():                           # legacy dir / never-published contract
         return False
-    if type(saved_extrapolation) is not bool or saved_extrapolation != collect_extrapolation:
+    try:
+        loaded = json.loads(contract_path.read_text(encoding="utf-8"))
+    except Exception:                                        # truncated / corrupt contract -> re-run
         return False
-    if collect_diagnostics:
-        if not any(key in marker for key in _DIAGNOSTIC_RESULT_KEYS):
-            return False
-    if collect_extrapolation:
-        if not isinstance(marker.get("extrap_ce"), list):
-            return False
-    return True
+    if not isinstance(loaded, Mapping):
+        return False
+    if loaded.get("schema_version") != _CELL_CONTRACT_SCHEMA_VERSION:
+        return False
+    return dict(loaded) == dict(expected_contract)
 
 
 def _sanitize(label: str) -> str:
@@ -2036,21 +2087,32 @@ def run_sweep(
           f"\n  {sweep['description']}"
           f"\n  Output: {sweep_dir}{'  [resume ON]' if resume else ''}\n{'=' * 70}")
 
+    diagnostic_flags = {
+        "collect_diagnostics":   collect_diagnostics,
+        "collect_extrapolation": collect_extrapolation,
+    }
+
     results: List[Dict[str, Any]] = []
     for i, (label, overrides, cell_seed) in enumerate(cells):
         run_dir = sweep_dir / _sanitize(label)
         run_dir.mkdir(parents=True, exist_ok=True)
         marker = run_dir / "ablation_result.json"
+        contract_path = run_dir / "cell_contract.json"
 
+        # Reuse is authorized only by a versioned contract that binds this cell to its code identity,
+        # per-split corpus hashes, and semantic config (audit 2026-07-12 PB-01). The expected contract
+        # is built inside the per-cell failure boundary: an unbuildable config or unhashable corpus
+        # returns None, which forbids reuse (the cell re-runs) without breaching the sweep.
+        expected_contract: Optional[Dict[str, Any]] = None
         if resume and marker.exists():
-            if _cell_is_current(run_dir, overrides, seed=cell_seed, max_steps=max_steps,
-                                max_tokens=max_tokens, dataset=dataset,
-                                collect_diagnostics=collect_diagnostics,
-                                collect_extrapolation=collect_extrapolation):
+            expected_contract = _expected_cell_contract_or_none(
+                overrides, dataset, diagnostic_flags, seed=cell_seed,
+                max_steps=max_steps, max_tokens=max_tokens)
+            if expected_contract is not None and _cell_is_current(run_dir, expected_contract):
                 print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
                 results.append(json.loads(marker.read_text(encoding="utf-8")))
                 continue
-            print(f"\n--- {i + 1}/{len(cells)}: {label}  [config changed -> re-running] ---")
+            print(f"\n--- {i + 1}/{len(cells)}: {label}  [contract changed -> re-running] ---")
         else:
             print(f"\n--- {i + 1}/{len(cells)}: {label} ---")
         t0 = time.perf_counter()
@@ -2076,9 +2138,55 @@ def run_sweep(
             terminal_ppl = float("inf")
         result["final_val_ppl"] = terminal_ppl
         successful = result["error_kind"] is None and math.isfinite(terminal_ppl)
+
+        # Requested collections are terminal artifacts, so their OUTPUT presence is part of
+        # "complete": _cell_diagnostics returns {} on wholesale converged_state failure (and
+        # silently skips failed probes) while error_kind stays None and the terminal PPL stays
+        # finite, so a headline-only "success" under collect_diagnostics=True would otherwise
+        # publish a contract and be served as [CACHED] forever. Convert such an incomplete cell
+        # to a failed result (no contract published) so the next run recomputes it.
+        if successful and collect_diagnostics and not any(
+                key in result for key in _DIAGNOSTIC_RESULT_KEYS):
+            logger.warning("  [%s] requested diagnostics output missing -> cell marked failed", label)
+            successful = False
+        if successful and collect_extrapolation and not isinstance(result.get("extrap_ce"), list):
+            logger.warning("  [%s] requested extrapolation output missing -> cell marked failed", label)
+            successful = False
+
+        # Terminal artifact completeness (PB-02): the reuse contract is published only after the
+        # terminal finalizer wrote a resumable checkpoint. run_single's finalizer returns
+        # terminal_checkpoint pointing at checkpoints/step_<max_steps>.pt; require it to exist so a cell
+        # that finished with only a headline (no resumable bundle) is never served as complete. A result
+        # that carries no terminal_checkpoint key at all (a stubbed run_single in a unit test) is exempt;
+        # a real trained cell always sets it, so the gate binds exactly the cells that actually finalized.
+        if successful and "terminal_checkpoint" in result:
+            terminal_checkpoint = result.get("terminal_checkpoint")
+            if not (isinstance(terminal_checkpoint, str) and Path(terminal_checkpoint).exists()):
+                logger.warning("  [%s] terminal checkpoint missing -> cell marked failed", label)
+                successful = False
+
+        # A successful cell is cached only when its contract can be rebuilt now: rebuild it (the
+        # pre-run build was skipped or lost a transient source race), and if it still cannot be built
+        # convert the cell to a failed result rather than publish an un-authorizable cache hit.
+        contract = None
+        if successful:
+            contract = expected_contract if expected_contract is not None else \
+                _expected_cell_contract_or_none(
+                    overrides, dataset, diagnostic_flags, seed=cell_seed,
+                    max_steps=max_steps, max_tokens=max_tokens)
+            if contract is None:
+                successful = False
         result["status"] = "success" if successful else "failed"
         result["sweep"] = sweep_name
         result["wall_time_s"] = time.perf_counter() - t0
+
+        # Publish the contract atomically (same-dir tmp + os.replace) BEFORE the completion marker, so
+        # a reader that sees the success marker always sees a fully-written contract; a failed cell
+        # publishes no contract. Neither file is written after a training exception.
+        if successful and contract is not None:
+            tmp = contract_path.parent / (contract_path.name + ".tmp")
+            tmp.write_text(json.dumps(contract, indent=2), encoding="utf-8")
+            _atomic_replace(contract_path, tmp)
         marker.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
         results.append(result)
 
