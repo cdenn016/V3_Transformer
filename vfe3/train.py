@@ -945,6 +945,24 @@ class TrainingTerminalState(NamedTuple):
     rng_state:            Dict[str, object]
 
 
+def _training_cursor_fields(
+    completed_step:  int,
+    steps_per_epoch: int,
+) -> Dict[str, 'float | int']:
+    r"""Return a one-based data cursor for an absolute completed optimizer step."""
+    if completed_step < 1:
+        raise ValueError(f"completed_step must be >= 1, got {completed_step}")
+    if steps_per_epoch < 1:
+        raise ValueError(f"steps_per_epoch must be >= 1, got {steps_per_epoch}")
+    epoch_index, batch_index = divmod(completed_step - 1, steps_per_epoch)
+    return {
+        "epoch":           epoch_index + 1,
+        "batch_in_epoch":  batch_index + 1,
+        "steps_per_epoch": steps_per_epoch,
+        "corpus_pass":     completed_step / steps_per_epoch,
+    }
+
+
 def train(
     model:  VFEModel,
     loader: Iterable[Tuple[torch.Tensor, torch.Tensor]],   # yields (tokens, targets) batches
@@ -1091,6 +1109,13 @@ def train(
                 yield from bar
             finally:
                 bar.close()
+
+    try:
+        steps_per_epoch = int(len(loader))  # type: ignore[arg-type]
+    except (TypeError, AttributeError):
+        steps_per_epoch = 0
+    if steps_per_epoch < 0:
+        raise ValueError(f"loader length must be nonnegative, got {steps_per_epoch}")
 
     epoch = 0
     batches_consumed = 0
@@ -1304,6 +1329,15 @@ def train(
                 "holonomy_deviation": d["holonomy_deviation"],
                 "gauge_trace_spread": d["gauge_trace_spread"],
             }
+            if steps_per_epoch:
+                row.update(_training_cursor_fields(step + 1, steps_per_epoch))
+            else:
+                row.update({
+                    "epoch":           epoch + 1,
+                    "batch_in_epoch":  batches_consumed,
+                    "steps_per_epoch": float("nan"),
+                    "corpus_pass":     float("nan"),
+                })
             if s_phi_group_index is not None:
                 row["lr_s_phi"] = float(lrs[s_phi_group_index])
             # Peak memory (Tier-1): CUDA peak MB at the clean train-window boundary.

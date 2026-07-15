@@ -1728,10 +1728,26 @@ def _save_figures(
         if losses:
             # losses is one entry per optimizer step, so the 1-based step index IS the x-axis.
             n = len(losses)
+            steps_per_epoch = next(
+                (
+                    int(r["steps_per_epoch"])
+                    for r in artifacts.history
+                    if isinstance(r.get("steps_per_epoch"), (int, float))
+                    and math.isfinite(float(r["steps_per_epoch"]))
+                    and int(r["steps_per_epoch"]) > 0
+                ),
+                0,
+            )
+            epoch_boundaries = (
+                list(range(steps_per_epoch, n + 1, steps_per_epoch))
+                if steps_per_epoch
+                else None
+            )
             fig = figs.plot_trajectory(
                 losses, list(range(1, n + 1)), ylabel="train CE (nats/token)",
                 title="Training cross-entropy", color=figs._CB[0],
                 smooth=max(25, n // 240), annotate_final=True,
+                epoch_boundaries=epoch_boundaries,
                 path=str(run / "loss_curve.png"))
             figs.plt.close(fig)
         sx, sy = _aligned("val_ppl")

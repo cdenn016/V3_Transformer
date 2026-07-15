@@ -579,6 +579,7 @@ def plot_trajectory(
     median_line:    bool          = False,
     smooth:         int           = 0,
     annotate:       Optional[str] = None,   # 'min' | 'max' -> mark + label the running best point
+    epoch_boundaries: Optional[Sequence[float]] = None,
     path:           Optional[str] = None,
 ):
     r"""Line plot of a scalar trajectory over the real training step.
@@ -590,7 +591,8 @@ def plot_trajectory(
     or heavy-tailed series (perplexity, holonomy). ``annotate='min'|'max'`` marks that extremum with
     its step, ``annotate_final`` tags the last value at the right edge, and ``median_line`` draws the
     series median as a dashed reference (the typical value on a heavy-tailed log axis where the
-    spikes sit decades above the floor).
+    spikes sit decades above the floor). ``epoch_boundaries`` adds subdued vertical guides at
+    completed corpus passes; it does not alter either the raw series or its smoothing.
     """
     v = _np(values).reshape(-1).astype(float)
     x = np.arange(v.size, dtype=float) if steps is None else _np(steps).reshape(-1).astype(float)
@@ -603,6 +605,10 @@ def plot_trajectory(
         ax.plot(x, vplot, marker="o", ms=3, lw=1.5, color=color)
     else:
         ax.plot(x, vplot, lw=1.2, color=color)
+    if epoch_boundaries is not None:
+        for boundary in epoch_boundaries:
+            if np.isfinite(boundary):
+                ax.axvline(float(boundary), color="#777777", ls=":", lw=0.8, alpha=0.45, zorder=0)
     if logy:
         ax.set_yscale("log")
     if median_line and v.size:
