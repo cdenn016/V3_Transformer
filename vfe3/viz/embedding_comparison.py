@@ -286,6 +286,7 @@ def controlled_embedding_record(
     seq_len:                     int,
     contract:                    Mapping[str, object],
     taxonomy_unavailable_reason: Optional[str] = None,
+    semantic_probes:             Optional[Mapping[str, object]] = None,
 ) -> dict:
     """Compute the machine-readable controlled diagnostics for one channel and population."""
     values = np.asarray(features, dtype=float)
@@ -357,6 +358,14 @@ def controlled_embedding_record(
             "sequence_identity": _adjusted_mutual_information(clusters, sequence_array),
         },
     }
+    if semantic_probes is None:
+        from vfe3.viz import semantic_probes as semantic_probe_metrics
+
+        record["semantic_probes"] = semantic_probe_metrics.unavailable_record(
+            "semantic probes not provided"
+        )
+    else:
+        record["semantic_probes"] = copy.deepcopy(dict(semantic_probes))
     return record
 
 

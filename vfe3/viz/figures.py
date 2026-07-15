@@ -1998,6 +1998,23 @@ def plot_belief_umap(
             seeds=seeds_used,
         )
         contract["clustering"]["method_description"] = method_desc
+        from vfe3.viz import semantic_probes as semantic_probe_metrics
+
+        if not english_linguistic_diagnostics:
+            semantic_record = semantic_probe_metrics.unavailable_record(
+                "English semantic probes disabled for this dataset"
+            )
+        elif decode is None:
+            semantic_record = semantic_probe_metrics.unavailable_record(
+                "token decoder unavailable"
+            )
+        else:
+            semantic_record = semantic_probe_metrics.evaluate_semantic_probes(
+                X,
+                token_ids,
+                labels,
+                decode,
+            )
         controlled_record = embedding_comparison.controlled_embedding_record(
             features=X,
             coords_by_seed=coords_by_seed,
@@ -2013,6 +2030,7 @@ def plot_belief_umap(
                 None if english_linguistic_diagnostics
                 else "English-only linguistic taxonomies disabled for this dataset"
             ),
+            semantic_probes=semantic_record,
         )
     else:
         min_dist = _UMAP_MIN_DIST

@@ -218,6 +218,29 @@ def test_controlled_record_reports_projection_and_confound_metrics(tmp_path):
     assert not list(tmp_path.glob(".belief_umap_mu.*.tmp"))
 
 
+def test_controlled_record_round_trips_semantic_probe_section(tmp_path):
+    from vfe3.viz import embedding_comparison, semantic_probes
+
+    semantic = semantic_probes.unavailable_record("fixture semantic record")
+    record = embedding_comparison.controlled_embedding_record(
+        **_controlled_record_fixture(),
+        semantic_probes=semantic,
+    )
+    sidecar = embedding_comparison.write_json_atomic(record, tmp_path / "semantic.json")
+    loaded = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    assert loaded["semantic_probes"] == semantic
+
+
+def test_controlled_record_defaults_to_explicit_unavailable_semantics():
+    from vfe3.viz import embedding_comparison
+
+    record = embedding_comparison.controlled_embedding_record(**_controlled_record_fixture())
+
+    assert record["semantic_probes"]["available"] is False
+    assert record["semantic_probes"]["reason"] == "semantic probes not provided"
+
+
 def test_controlled_record_uses_null_reason_for_unavailable_taxonomy():
     from vfe3.viz import embedding_comparison
 
@@ -306,8 +329,71 @@ def test_controlled_plot_uses_fixed_display_and_pca_clustering(tmp_path):
         "value": None,
         "reason": "English-only linguistic taxonomies disabled for this dataset",
     }
+    assert record["semantic_probes"]["available"] is False
+    assert record["semantic_probes"]["reason"] == (
+        "English semantic probes disabled for this dataset"
+    )
     assert any("English linguistic taxonomies disabled" in text.get_text() for text in figure.texts)
     assert image_path.is_file() and sidecar_path.is_file()
+    figures.plt.close(figure)
+
+
+def test_controlled_plot_evaluates_semantics_from_native_features(tmp_path, monkeypatch):
+    from vfe3.viz import figures
+
+    features = np.asarray([
+        [0.0, 0.0, 0.0, 0.0], [0.2, 0.0, 0.0, 0.0],
+        [0.3, 0.0, 0.0, 0.0], [0.5, 0.0, 0.0, 0.0],
+        [4.0, 0.0, 0.0, 0.0], [4.2, 0.0, 0.0, 0.0],
+        [4.3, 0.0, 0.0, 0.0], [4.5, 0.0, 0.0, 0.0],
+        [0.0, 5.0, 0.0, 0.0], [0.2, 5.0, 0.0, 0.0],
+        [4.0, 5.0, 0.0, 0.0], [4.2, 5.0, 0.0, 0.0],
+    ])
+    token_ids = np.repeat(np.arange(6), 2)
+    bank = {
+        "mu": torch.tensor(features, dtype=torch.float32),
+        "sigma": torch.ones((12, 4), dtype=torch.float32),
+        "phi": torch.zeros((12, 2), dtype=torch.float32),
+        "token_ids": torch.tensor(token_ids),
+        "seq_idx": torch.arange(12) // 4,
+        "pos_idx": torch.arange(12) % 4,
+    }
+    decoded = {
+        0: " king",
+        1: " queen",
+        2: " father",
+        3: " mother",
+        4: " dog",
+        5: " cat",
+    }
+
+    class RecordingWorker:
+        def embed(self, values, *, n_neighbors, min_dist, n_components, seed):
+            return np.asarray(values, dtype=float)[:, :n_components] + seed * 1e-5
+
+    monkeypatch.setattr(
+        figures,
+        "_cluster_embedding",
+        lambda values, **kwargs: (np.repeat([0, 1, 2], 4), "HDBSCAN test labels"),
+    )
+    sidecar_path = tmp_path / "semantic_native.json"
+    figure = figures.plot_belief_umap(
+        bank,
+        "mu",
+        controlled=True,
+        decode=lambda ids: decoded[int(ids[0])],
+        umap_worker=RecordingWorker(),
+        path=str(tmp_path / "semantic_native.png"),
+        sidecar_path=str(sidecar_path),
+    )
+    record = json.loads(sidecar_path.read_text(encoding="utf-8"))
+
+    semantic = record["semantic_probes"]
+    assert semantic["available"] is True
+    assert semantic["resolution"]["resolved_concept_count"] == 6
+    assert semantic["native_space"]["concept_centroids"]["king"] == pytest.approx([0.1, 0, 0, 0])
+    assert semantic["pairs"]["king_queen"]["centroid_distance"]["value"] == pytest.approx(0.3)
+    assert "coordinates" not in semantic
     figures.plt.close(figure)
 
 
