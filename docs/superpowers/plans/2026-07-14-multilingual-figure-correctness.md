@@ -315,7 +315,7 @@ git commit -m "feat(viz): render Japanese and Arabic labels"
 - Modify: `vfe3/viz/figures.py:1805-2117`
 - Modify: `vfe3/viz/embedding_comparison.py:277-339`
 - Modify: `vfe3/viz/report.py:151-177,251-258,291-299,378-410,487-588`
-- Modify: `tests/test_embedding_comparison.py`
+- Modify: `tests/test_controlled_umap_comparison_20260714.py`
 - Modify: `tests/test_report.py`
 - Modify: `tests/test_viz.py`
 
@@ -335,7 +335,7 @@ Add a live report test with a small model/loader and a `RunArtifacts` config nam
 Run:
 
 ```powershell
-python -m pytest tests/test_embedding_comparison.py tests/test_report.py -k "taxonomy or multilingual or wiki_ja or wiki_ar" --junitxml=.pytest-task4-red.xml
+python -m pytest tests/test_controlled_umap_comparison_20260714.py tests/test_report.py -k "taxonomy or multilingual or wiki_ja or wiki_ar" --junitxml=.pytest-task4-red.xml
 ```
 
 Expected: failures show the missing reason argument and unwanted category figures.
@@ -363,7 +363,7 @@ Pass it to belief/model UMAP figures. Require it in the availability condition f
 Run:
 
 ```powershell
-python -m pytest tests/test_embedding_comparison.py tests/test_report.py tests/test_viz.py --junitxml=.pytest-task4-green.xml
+python -m pytest tests/test_controlled_umap_comparison_20260714.py tests/test_report.py tests/test_viz.py --junitxml=.pytest-task4-green.xml
 ```
 
 Expected: zero failures/errors; English tests retain category figures; Japanese/Arabic tests omit them deliberately.
@@ -371,7 +371,7 @@ Expected: zero failures/errors; English tests retain category figures; Japanese/
 - [ ] **Step 7: Commit dataset-aware diagnostics**
 
 ```powershell
-git add vfe3/viz/embedding_comparison.py vfe3/viz/figures.py vfe3/viz/report.py tests/test_embedding_comparison.py tests/test_report.py tests/test_viz.py
+git add vfe3/viz/embedding_comparison.py vfe3/viz/figures.py vfe3/viz/report.py tests/test_controlled_umap_comparison_20260714.py tests/test_report.py tests/test_viz.py
 git commit -m "fix(viz): gate English taxonomies by dataset"
 ```
 
@@ -390,7 +390,7 @@ git commit -m "fix(viz): gate English taxonomies by dataset"
 Run:
 
 ```powershell
-python -m pytest tests/test_data.py tests/test_fixes_20260709_data.py tests/test_viz_text.py tests/test_viz.py tests/test_embedding_comparison.py tests/test_report.py tests/test_reporting_additions.py --junitxml=.pytest-multilingual-focused.xml
+python -m pytest tests/test_data.py tests/test_fixes_20260709_data.py tests/test_viz_text.py tests/test_viz.py tests/test_controlled_umap_comparison_20260714.py tests/test_report.py tests/test_reporting_additions.py --junitxml=.pytest-multilingual-focused.xml
 ```
 
 Expected: zero failures and zero errors in the XML.

@@ -65,8 +65,19 @@ def _saved_nonempty(path):
 def test_set_publication_style_runs():
     set_publication_style()
     assert plt.rcParams["savefig.dpi"] == 300
+    assert "Yu Gothic" in plt.rcParams["font.family"]
     assert "Yu Gothic" in plt.rcParams["font.sans-serif"]
     assert "Noto Sans Arabic" in plt.rcParams["font.sans-serif"]
+
+
+def test_publication_style_renders_japanese_without_missing_glyph_warning():
+    set_publication_style()
+    fig, ax = plt.subplots()
+    ax.text(0.5, 0.5, "日本語")
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="Glyph .* missing from font.*", category=UserWarning)
+        fig.canvas.draw()
+    plt.close(fig)
 
 
 def test_token_display_wiring_preserves_japanese_and_shapes_arabic():

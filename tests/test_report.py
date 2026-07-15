@@ -87,6 +87,26 @@ def test_generate_figures_drives_live_model(tmp_path):
     assert header.startswith("layer,") and "holonomy_deviation" in header and "total" in header
 
 
+def test_generate_figures_skips_english_taxonomies_for_japanese(tmp_path, monkeypatch):
+    from vfe3.data import datasets
+
+    model = _model()
+    artifacts = RunArtifacts(tmp_path / "run", model.cfg, model, dataset="wiki-ja")
+    monkeypatch.setattr(datasets, "get_tiktoken_decoder", lambda dataset: lambda ids: "日本語")
+
+    paths = generate_figures(
+        artifacts.run_dir,
+        model=model,
+        loader=_loader(),
+        max_sequences=16,
+    )
+
+    written = {path.name for path in paths}
+    assert "belief_category_separation.png" not in written
+    assert "vocab_confusion.png" not in written
+    assert {"vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readout.png"} <= written
+
+
 def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
     from vfe3.viz import extract, report
 

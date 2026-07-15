@@ -35,6 +35,7 @@ from vfe3.run_artifacts import semantic_config_fingerprint
 from vfe3.viz import extract
 from vfe3.viz import embedding_comparison
 from vfe3.viz import figures as figs
+from vfe3.viz.text import supports_english_linguistic_taxonomies
 
 
 CONTROLLED_BANK_TOKENS = 16_384
@@ -174,6 +175,7 @@ def generate_figures(
     device = device or next(model.parameters()).device
     model = model.to(device)
     model.eval()
+    english_linguistic_diagnostics = supports_english_linguistic_taxonomies(dataset)
     figs.set_publication_style()
 
     if loader is None:
@@ -256,6 +258,11 @@ def generate_figures(
         decode = get_tiktoken_decoder(dataset)
     except Exception as exc:
         logger.warning("token decoder unavailable (%s); belief UMAP will gray out", exc)
+    if not english_linguistic_diagnostics:
+        logger.info(
+            "English-only belief-category and vocabulary-confusion figures disabled for dataset %r",
+            dataset,
+        )
 
     # Decode-calibration reliability bins (conf/acc/frac) the run already wrote to research.json
     # (run_artifacts._calibration_and_strata); the B1/EXP-3 reliability diagram only plots them.
@@ -296,7 +303,7 @@ def generate_figures(
           trace is not None)
     _emit("belief_category_separation",
           lambda p: figs.plot_belief_category_separation(bank, decode=decode, path=p),
-          bank is not None)
+          bank is not None and english_linguistic_diagnostics)
     _emit("attention_structure",
           lambda p: figs.plot_attention_structure(amaps, path=p),
           amaps is not None)
@@ -380,6 +387,7 @@ def generate_figures(
             _emit(f"belief_umap_{ch}",
                   lambda p, ch=ch: figs.plot_belief_umap(
                       bank, ch, decode=decode, controlled=controlled_bank,
+                      english_linguistic_diagnostics=english_linguistic_diagnostics,
                       seeds=(embedding_comparison.CONTROLLED_SEEDS if controlled_bank else None),
                       umap_worker=umap_worker, path=p,
                       sidecar_path=(str(figdir / f"belief_umap_{ch}.json")
@@ -389,6 +397,7 @@ def generate_figures(
             _emit(f"model_umap_{ch}",
                   lambda p, ch=ch: figs.plot_belief_umap(
                       mc_bank, ch, kind="Model", decode=decode, controlled=controlled_bank,
+                      english_linguistic_diagnostics=english_linguistic_diagnostics,
                       seeds=(embedding_comparison.CONTROLLED_SEEDS if controlled_bank else None),
                       umap_worker=umap_worker, path=p,
                       sidecar_path=(str(figdir / f"model_umap_{ch}.json")
@@ -405,7 +414,7 @@ def generate_figures(
           vstats is not None)
     _emit("vocab_confusion",
           lambda p: figs.plot_vocab_confusion([{**vstats, "label": run_label}], decode=decode, path=p),
-          vstats is not None and decode is not None)
+          vstats is not None and decode is not None and english_linguistic_diagnostics)
     _emit("decode_readout",
           lambda p: figs.plot_decode_readout([{**readout, "label": run_label}], decode=decode, path=p),
           readout is not None)
@@ -519,6 +528,14 @@ def vocab_comparison_figures(
     if len(tokenizer_tags) > 1:
         details = ", ".join(f"{run_dir}: {tag}" for run_dir, _, _, tag in prepared)
         raise ValueError(f"mixed tokenizer tags in vocabulary comparison: {details}")
+    english_linguistic_diagnostics = all(
+        supports_english_linguistic_taxonomies(dataset)
+        for _, _, dataset, _ in prepared
+    )
+    if not english_linguistic_diagnostics:
+        (logger or logging.getLogger(__name__)).info(
+            "English-only vocabulary confusion disabled for non-English comparison datasets"
+        )
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -583,7 +600,7 @@ def vocab_comparison_figures(
           lambda: figs.plot_vocab_calibration(arms_pred, decode=decode), bool(arms_pred))
     _emit("vocab_confusion_compare",
           lambda: figs.plot_vocab_confusion(arms_pred, decode=decode, taxonomy=taxonomy),
-          bool(arms_pred) and decode is not None)
+          bool(arms_pred) and decode is not None and english_linguistic_diagnostics)
     _emit("decode_readout_compare",
           lambda: figs.plot_decode_readout(arms_readout, decode=decode), bool(arms_readout))
 

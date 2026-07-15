@@ -275,16 +275,17 @@ def _adjusted_mutual_information(
 
 
 def controlled_embedding_record(
-    features:                np.ndarray,
-    coords_by_seed:          Mapping[int, np.ndarray],
-    cluster_labels:          object,
-    token_ids:               object,
-    bpe_labels:              Optional[object],
-    function_content_labels: Optional[object],
-    seq_idx:                 object,
-    pos_idx:                 object,
-    seq_len:                 int,
-    contract:                Mapping[str, object],
+    features:                    np.ndarray,
+    coords_by_seed:              Mapping[int, np.ndarray],
+    cluster_labels:              object,
+    token_ids:                   object,
+    bpe_labels:                  Optional[object],
+    function_content_labels:     Optional[object],
+    seq_idx:                     object,
+    pos_idx:                     object,
+    seq_len:                     int,
+    contract:                    Mapping[str, object],
+    taxonomy_unavailable_reason: Optional[str] = None,
 ) -> dict:
     """Compute the machine-readable controlled diagnostics for one channel and population."""
     values = np.asarray(features, dtype=float)
@@ -314,10 +315,20 @@ def controlled_embedding_record(
         "sequence_length": int(seq_len),
         "token_sha256": token_fingerprint(token_array),
     }
+    bpe_silhouette = (
+        _null_metric(taxonomy_unavailable_reason)
+        if bpe_labels is None and taxonomy_unavailable_reason is not None
+        else _native_silhouette(values, bpe_labels)
+    )
+    function_content_silhouette = (
+        _null_metric(taxonomy_unavailable_reason)
+        if function_content_labels is None and taxonomy_unavailable_reason is not None
+        else _native_silhouette(values, function_content_labels)
+    )
     record["native_space"] = {
         "silhouette": {
-            "bpe": _native_silhouette(values, bpe_labels),
-            "function_content": _native_silhouette(values, function_content_labels),
+            "bpe": bpe_silhouette,
+            "function_content": function_content_silhouette,
         }
     }
     record["projection"] = {
@@ -326,12 +337,22 @@ def controlled_embedding_record(
     }
     position_quartiles = relative_position_quartiles(position_array, seq_len=seq_len)
     non_noise = clusters[clusters != -1]
+    bpe_ami = (
+        _null_metric(taxonomy_unavailable_reason)
+        if bpe_labels is None and taxonomy_unavailable_reason is not None
+        else _adjusted_mutual_information(clusters, bpe_labels)
+    )
+    function_content_ami = (
+        _null_metric(taxonomy_unavailable_reason)
+        if function_content_labels is None and taxonomy_unavailable_reason is not None
+        else _adjusted_mutual_information(clusters, function_content_labels)
+    )
     record["clusters"] = {
         "count": int(np.unique(non_noise).size),
         "noise_fraction": float(np.mean(clusters == -1)),
         "adjusted_mutual_information": {
-            "bpe": _adjusted_mutual_information(clusters, bpe_labels),
-            "function_content": _adjusted_mutual_information(clusters, function_content_labels),
+            "bpe": bpe_ami,
+            "function_content": function_content_ami,
             "position_quartile": _adjusted_mutual_information(clusters, position_quartiles),
             "sequence_identity": _adjusted_mutual_information(clusters, sequence_array),
         },

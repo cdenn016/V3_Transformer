@@ -231,6 +231,27 @@ def test_controlled_record_uses_null_reason_for_unavailable_taxonomy():
     assert ami["value"] is None and ami["reason"] == "labels unavailable"
 
 
+def test_controlled_record_names_non_english_taxonomy_unavailability():
+    from vfe3.viz import embedding_comparison
+
+    fixture = _controlled_record_fixture()
+    fixture["bpe_labels"] = None
+    fixture["function_content_labels"] = None
+    reason = "English-only linguistic taxonomies disabled for wiki-ar"
+    record = embedding_comparison.controlled_embedding_record(
+        **fixture,
+        taxonomy_unavailable_reason=reason,
+    )
+
+    for taxonomy in ("bpe", "function_content"):
+        silhouette = record["native_space"]["silhouette"][taxonomy]
+        ami = record["clusters"]["adjusted_mutual_information"][taxonomy]
+        assert silhouette == {"value": None, "reason": reason}
+        assert ami == {"value": None, "reason": reason}
+    assert record["clusters"]["adjusted_mutual_information"]["position_quartile"]["value"] is not None
+    assert record["clusters"]["adjusted_mutual_information"]["sequence_identity"]["value"] is not None
+
+
 def test_controlled_plot_uses_fixed_display_and_pca_clustering(tmp_path):
     from vfe3.viz import embedding_comparison, figures
 
@@ -264,6 +285,7 @@ def test_controlled_plot_uses_fixed_display_and_pca_clustering(tmp_path):
         bank,
         "mu",
         controlled=True,
+        english_linguistic_diagnostics=False,
         decode=lambda ids: f" token{int(ids[0])}",
         umap_worker=worker,
         path=str(image_path),
@@ -280,6 +302,11 @@ def test_controlled_plot_uses_fixed_display_and_pca_clustering(tmp_path):
     assert record["display"]["seeds"] == list(embedding_comparison.CONTROLLED_SEEDS)
     assert record["clustering"]["space"] == "PCA 10-D"
     assert record["channel"]["feature_chart"] == "Euclidean means"
+    assert record["native_space"]["silhouette"]["bpe"] == {
+        "value": None,
+        "reason": "English-only linguistic taxonomies disabled for this dataset",
+    }
+    assert any("English linguistic taxonomies disabled" in text.get_text() for text in figure.texts)
     assert image_path.is_file() and sidecar_path.is_file()
     figures.plt.close(figure)
 

@@ -51,7 +51,7 @@ def set_publication_style() -> None:
         "savefig.dpi":     300,
         "savefig.bbox":    "tight",
         "font.size":       10,
-        "font.family":     "sans-serif",
+        "font.family":     list(MULTILINGUAL_SANS_SERIF),
         "font.sans-serif": list(MULTILINGUAL_SANS_SERIF),
         "axes.titlesize":  11,
         "axes.labelsize":  10,
@@ -1828,9 +1828,10 @@ def _cluster_lift_labels(
     decode:    Optional[object],         # decode([id]) -> str; None -> raw id string
 
     *,
-    k:          int = 3,
-    floor:      int = 2,
-    with_stats: bool = False,
+    k:                       int  = 3,
+    floor:                   int  = 2,
+    with_stats:              bool = False,
+    mark_subword_boundary:   bool = True,
 ) -> Dict:
     r"""Per-cluster DISTINCTIVE-token label by enrichment: one comma-joined string per cluster.
 
@@ -1845,6 +1846,8 @@ def _cluster_lift_labels(
     tokens render via :func:`_lift_label_display`. ``decode is None`` -> raw id strings.
     ``with_stats=True`` returns ``{cluster: (label, top raw lift)}`` (the raw lift of the top-ranked
     token, for the caller's mixed-core gate); default returns ``{cluster: label}``.
+    ``mark_subword_boundary=False`` suppresses the English leading-space convention for languages
+    whose word boundaries are not represented by spaces.
     """
     ids = token_ids.astype(int)
     M = ids.size
@@ -1864,7 +1867,10 @@ def _cluster_lift_labels(
         for t, ct in zip(loc_ids.tolist(), loc_ct.tolist()):
             if ct < floor:
                 continue
-            s = _lift_label_display(str(sm[int(t)]))
+            s = _lift_label_display(
+                str(sm[int(t)]),
+                mark_subword_boundary=mark_subword_boundary,
+            )
             if s is None:
                 continue
             g = glob[int(t)]
@@ -1893,16 +1899,17 @@ def plot_belief_umap(
     channel:          str = "mu",        # which belief channel to embed: 'mu' / 'sigma' / 'phi'
 
     *,
-    kind:             str              = "Belief",  # title noun: 'Belief' (q channel) / 'Model' (s channel)
-    decode:           Optional[object] = None,   # decode(list[int]) -> str; None -> id labels
-    n_clusters_label: int              = 14,     # legend/badge rows for the N largest clusters
-    seed:             int              = 0,
-    sil_sample:       int              = 2000,
-    controlled:       bool             = False,
-    seeds:            Optional[Sequence[int]] = None,
-    umap_worker:      Optional[UMAPWorker] = None,
-    path:             Optional[str]    = None,
-    sidecar_path:     Optional[str]    = None,
+    kind:                           str                        = "Belief",
+    n_clusters_label:               int                        = 14,
+    seed:                           int                        = 0,
+    sil_sample:                     int                        = 2000,
+    controlled:                     bool                       = False,
+    english_linguistic_diagnostics: bool                       = True,
+    decode:                         Optional[object]           = None,
+    seeds:                          Optional[Sequence[int]]    = None,
+    umap_worker:                    Optional[UMAPWorker]       = None,
+    path:                           Optional[str]              = None,
+    sidecar_path:                   Optional[str]              = None,
 ):
     r"""F5: data-driven cluster map of one belief channel -- numbered badges plus a legend band.
 
@@ -1923,6 +1930,8 @@ def plot_belief_umap(
     embedding, clustering, bank size, and per-channel metric; the function/content silhouette (the
     a-priori-categories-do-not-separate caveat) is a small footnote when ``decode`` is available, with
     the quantitative view in :func:`plot_belief_category_separation`. ``decode is None`` -> raw id labels.
+    Set ``english_linguistic_diagnostics=False`` for Japanese and Arabic so cluster labels stay native
+    and the English-only BPE-case/function-content measurements are recorded as unavailable.
     """
     if sidecar_path is not None and not controlled:
         raise ValueError("sidecar_path is only valid for a controlled UMAP")
@@ -1963,7 +1972,7 @@ def plot_belief_umap(
         if "seq_idx" not in bank or "pos_idx" not in bank:
             raise ValueError("controlled UMAP requires aligned seq_idx and pos_idx bank fields")
         bpe_labels = function_content_labels = None
-        if decode is not None:
+        if decode is not None and english_linguistic_diagnostics:
             bpe_labels, _ = _token_category_labels(token_ids, decode, "bpe")
             function_content_labels, _ = _token_category_labels(
                 token_ids,
@@ -1999,6 +2008,10 @@ def plot_belief_umap(
             pos_idx=bank["pos_idx"],
             seq_len=seq_len,
             contract=contract,
+            taxonomy_unavailable_reason=(
+                None if english_linguistic_diagnostics
+                else "English-only linguistic taxonomies disabled for this dataset"
+            ),
         )
     else:
         min_dist = _UMAP_MIN_DIST
@@ -2021,7 +2034,14 @@ def plot_belief_umap(
         coords = np.column_stack([coords, np.zeros(len(coords))])   # n_components clamp returns (M,1)
     cl = sorted(set(labels.tolist()) - {-1}, key=lambda c: -int((labels == c).sum()))
     noise = float((labels == -1).mean())
-    lab_stats = _cluster_lift_labels(token_ids, labels, decode, k=3, with_stats=True)
+    lab_stats = _cluster_lift_labels(
+        token_ids,
+        labels,
+        decode,
+        k=3,
+        with_stats=True,
+        mark_subword_boundary=english_linguistic_diagnostics,
+    )
 
     fig, ax = plt.subplots(figsize=(9.6, 6.4))
     fig.subplots_adjust(left=0.02, right=0.68, top=0.92, bottom=0.07)
@@ -2108,7 +2128,7 @@ def plot_belief_umap(
     mode_label = "controlled" if controlled else "exploratory"
     ax.set_title(f"{kind} {channel} - {mode_label} clusters: {len(cl)} groups, {noise:.0%} unclustered",
                  fontsize=11)
-    if decode is not None:
+    if decode is not None and english_linguistic_diagnostics:
         try:
             cats, _ = _token_category_labels(token_ids, decode, "function_content")
             sil = clustering_metrics(X, cats, sample_size=sil_sample)["silhouette"]
@@ -2134,6 +2154,8 @@ def plot_belief_umap(
             f" | display: UMAP(n_neighbors={n_disp}, min_dist={min_dist}, init=pca, seed={seed})"
             f" | clusters: {method_desc} in {cluster_space} | metric: {metric}"
         )
+    if not english_linguistic_diagnostics:
+        footer += " | English linguistic taxonomies disabled"
     fig.text(0.98, 0.012, footer, fontsize=6, color="0.4", ha="right", va="bottom")
     saved = _save(fig, path)
     if controlled and controlled_record is not None and (sidecar_path is not None or path is not None):
