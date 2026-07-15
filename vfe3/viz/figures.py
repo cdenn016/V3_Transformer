@@ -11,7 +11,7 @@ A registry (``register_figure``) lets a new figure slot in by name.
 """
 
 from types import TracebackType
-from typing import Callable, Dict, Mapping, Optional
+from typing import Callable, Dict, Mapping, Optional, Sequence
 
 import matplotlib
 
@@ -1715,7 +1715,10 @@ def _cluster_embedding(
     coords: np.ndarray,                  # (M, D) clustering-space coordinates (2-D display or higher-D)
 
     *,
-    seed:   int = 0,
+    seed:                      int             = 0,
+    min_cluster_size:          Optional[int]   = None,
+    min_samples:               Optional[int]   = None,
+    cluster_selection_epsilon: Optional[float] = None,
 ) -> tuple:                              # ((M,) integer cluster labels (-1 = noise), method description)
     r"""Density-cluster an embedding into data-driven groups (HDBSCAN; KMeans fallback).
 
@@ -1741,11 +1744,14 @@ def _cluster_embedding(
         k = max(2, min(14, M // 50))
         return (KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(coords),
                 f"KMeans fallback (k={k}, no noise label)")
-    mcs = max(2, min(max(20, int(np.sqrt(M))), M))               # clamps keep tiny test banks valid
-    ms  = max(1, min(max(10, mcs // 20), M))
-    eps = 0.02 * float(np.ptp(coords, axis=0).max())
+    adaptive_mcs = max(20, int(np.sqrt(M)))
+    mcs = max(2, min(adaptive_mcs if min_cluster_size is None else min_cluster_size, M))
+    adaptive_ms = max(10, mcs // 20)
+    ms = max(1, min(adaptive_ms if min_samples is None else min_samples, M))
+    eps = (0.02 * float(np.ptp(coords, axis=0).max())
+           if cluster_selection_epsilon is None else float(cluster_selection_epsilon))
     labels = HDBSCAN(min_cluster_size=mcs, min_samples=ms, cluster_selection_method="leaf",
-                     cluster_selection_epsilon=eps).fit_predict(coords)
+                     cluster_selection_epsilon=eps, copy=True).fit_predict(coords)
     return labels, f"HDBSCAN(mcs={mcs}, ms={ms}, leaf, eps={eps:.2g})"
 
 
@@ -1872,18 +1878,21 @@ def plot_belief_umap(
     n_clusters_label: int              = 14,     # legend/badge rows for the N largest clusters
     seed:             int              = 0,
     sil_sample:       int              = 2000,
+    controlled:       bool             = False,
+    seeds:            Optional[Sequence[int]] = None,
     umap_worker:      Optional[UMAPWorker] = None,
     path:             Optional[str]    = None,
+    sidecar_path:     Optional[str]    = None,
 ):
     r"""F5: data-driven cluster map of one belief channel -- numbered badges plus a legend band.
 
     ONE figure per channel (the caller emits mu / sigma / phi separately). The channel is embedded
     faithfully to its geometry (mu Euclidean, Sigma in the log-Euclidean chart, phi in the gauge
-    coordinates). Clusters are NOT computed on the 2-D display embedding (which tears and compresses
-    distances -- the documented UMAP anti-pattern): they come from a separate seeded clustering-space
-    embedding of the SAME features (min_dist=0, up to 10 components; the native features directly when
-    they are already that low-dimensional), so one cluster may legitimately render as several 2-D
-    islands. Each of the ``n_clusters_label`` largest clusters gets a numbered badge at its density-peak
+    coordinates). Controlled mode fixes the display settings, evaluates multiple seeds, and clusters
+    the native chart or deterministic PCA coordinates; its UMAP is display-only and it writes a JSON
+    sidecar. Exploratory mode preserves the adaptive display and previous higher-dimensional UMAP
+    clustering route. Each of the ``n_clusters_label`` largest clusters gets a numbered badge at its
+    density-peak
     member (:func:`_density_peak_anchor`) and a legend row -- number, color swatch, distinctive tokens
     by smoothed log-odds enrichment (:func:`_cluster_lift_labels`), and size -- replacing the old
     margin callouts whose full-span placement produced whole-plot leader lines. A dominant cluster
@@ -1895,27 +1904,101 @@ def plot_belief_umap(
     a-priori-categories-do-not-separate caveat) is a small footnote when ``decode`` is available, with
     the quantitative view in :func:`plot_belief_category_separation`. ``decode is None`` -> raw id labels.
     """
+    if sidecar_path is not None and not controlled:
+        raise ValueError("sidecar_path is only valid for a controlled UMAP")
     feats = _belief_channel_features(bank, channel)
     X = _np(feats).astype(float)
     M = X.shape[0]
     token_ids = _np(bank["token_ids"]).astype(int)
-    n_disp = int(np.clip(round(np.sqrt(max(M, 1)) / 4.0), _UMAP_N_NEIGHBORS, 100))
-    coords = _np(umap_embed(feats, n_neighbors=n_disp, seed=seed,
-                            worker=umap_worker)).astype(float)
+    controlled_record = None
+    if controlled:
+        from vfe3.viz import embedding_comparison
+        seeds_used = tuple(embedding_comparison.CONTROLLED_SEEDS if seeds is None else seeds)
+        if not seeds_used:
+            raise ValueError("controlled UMAP needs at least one seed")
+        display_seed = int(seeds_used[0])
+        n_disp = embedding_comparison.CONTROLLED_N_NEIGHBORS
+        min_dist = embedding_comparison.CONTROLLED_MIN_DIST
+        coords_by_seed = {
+            int(projection_seed): _np(umap_embed(
+                feats,
+                n_neighbors=n_disp,
+                min_dist=min_dist,
+                seed=int(projection_seed),
+                worker=umap_worker,
+            )).astype(float)
+            for projection_seed in seeds_used
+        }
+        coords = coords_by_seed[display_seed]
+        cluster_coords, cluster_space = embedding_comparison.cluster_coordinates(X)
+        labels, method_desc = _cluster_embedding(
+            cluster_coords,
+            seed=display_seed,
+            min_cluster_size=embedding_comparison.CONTROLLED_MIN_CLUSTER_SIZE,
+            min_samples=embedding_comparison.CONTROLLED_MIN_SAMPLES,
+            cluster_selection_epsilon=embedding_comparison.CONTROLLED_CLUSTER_EPSILON,
+        )
+        if not method_desc.startswith("HDBSCAN"):
+            raise RuntimeError("controlled clustering requires sklearn.cluster.HDBSCAN")
+        if "seq_idx" not in bank or "pos_idx" not in bank:
+            raise ValueError("controlled UMAP requires aligned seq_idx and pos_idx bank fields")
+        bpe_labels = function_content_labels = None
+        if decode is not None:
+            bpe_labels, _ = _token_category_labels(token_ids, decode, "bpe")
+            function_content_labels, _ = _token_category_labels(
+                token_ids,
+                decode,
+                "function_content",
+            )
+        positions = _np(bank["pos_idx"]).astype(int)
+        if positions.size == 0:
+            raise ValueError("controlled UMAP bank is empty")
+        seq_len = int(positions.max()) + 1
+        feature_chart = {
+            "mu": "Euclidean means",
+            "sigma": "log-Euclidean covariance coordinates",
+            "phi": "stored gauge coordinates",
+        }[channel]
+        contract = embedding_comparison.controlled_contract(
+            kind=kind,
+            channel=channel,
+            feature_dim=X.shape[1],
+            feature_chart=feature_chart,
+            clustering_space=cluster_space,
+            seeds=seeds_used,
+        )
+        contract["clustering"]["method_description"] = method_desc
+        controlled_record = embedding_comparison.controlled_embedding_record(
+            features=X,
+            coords_by_seed=coords_by_seed,
+            cluster_labels=labels,
+            token_ids=token_ids,
+            bpe_labels=bpe_labels,
+            function_content_labels=function_content_labels,
+            seq_idx=bank["seq_idx"],
+            pos_idx=bank["pos_idx"],
+            seq_len=seq_len,
+            contract=contract,
+        )
+    else:
+        min_dist = _UMAP_MIN_DIST
+        n_disp = int(np.clip(round(np.sqrt(max(M, 1)) / 4.0), _UMAP_N_NEIGHBORS, 100))
+        coords = _np(umap_embed(feats, n_neighbors=n_disp, seed=seed,
+                                worker=umap_worker)).astype(float)
+        cl_dim = min(10, X.shape[1], max(1, M - 1))
+        if cl_dim >= X.shape[1]:                                 # low-D features: cluster directly
+            cluster_coords, cluster_space = X, f"native {X.shape[1]}-D features"
+        else:
+            try:
+                cluster_coords = _np(umap_embed(feats, n_neighbors=30, min_dist=0.0,
+                                                n_components=cl_dim, seed=seed,
+                                                worker=umap_worker)).astype(float)
+                cluster_space = f"{cl_dim}-D UMAP (min_dist=0)"
+            except Exception:                                    # clustering embed failed -> old fallback
+                cluster_coords, cluster_space = coords, "2-D display embedding"
+        labels, method_desc = _cluster_embedding(cluster_coords, seed=seed)
     if coords.shape[1] < 2:                                      # 1-D feature channel / M<=2: the
         coords = np.column_stack([coords, np.zeros(len(coords))])   # n_components clamp returns (M,1)
-    cl_dim = min(10, X.shape[1], max(1, M - 1))
-    if cl_dim >= X.shape[1]:                                     # features already low-D: cluster them directly
-        cluster_coords, cluster_space = X, f"native {X.shape[1]}-D features"
-    else:
-        try:
-            cluster_coords = _np(umap_embed(feats, n_neighbors=30, min_dist=0.0,
-                                            n_components=cl_dim, seed=seed,
-                                            worker=umap_worker)).astype(float)
-            cluster_space = f"{cl_dim}-D UMAP (min_dist=0)"
-        except Exception:                                        # clustering embed failed -> status quo
-            cluster_coords, cluster_space = coords, "2-D display embedding"
-    labels, method_desc = _cluster_embedding(cluster_coords, seed=seed)
     cl = sorted(set(labels.tolist()) - {-1}, key=lambda c: -int((labels == c).sum()))
     noise = float((labels == -1).mean())
     lab_stats = _cluster_lift_labels(token_ids, labels, decode, k=3, with_stats=True)
@@ -2002,7 +2085,8 @@ def plot_belief_umap(
     ax.set_xticks([]); ax.set_yticks([])
     for sp in ax.spines.values():
         sp.set_visible(False)
-    ax.set_title(f"{kind} {channel} — {len(cl)} data-driven clusters, {noise:.0%} unclustered",
+    mode_label = "controlled" if controlled else "exploratory"
+    ax.set_title(f"{kind} {channel} - {mode_label} clusters: {len(cl)} groups, {noise:.0%} unclustered",
                  fontsize=11)
     if decode is not None:
         try:
@@ -2015,12 +2099,37 @@ def plot_belief_umap(
             pass
     metric = {"mu": "Euclidean", "sigma": "log-Euclidean vech", "phi": "gauge coords"}.get(channel, "Euclidean")
     n_seqs = int(np.unique(_np(bank["seq_idx"])).size) if "seq_idx" in bank else 0
-    fig.text(0.98, 0.012,
-             f"display: UMAP(n_neighbors={n_disp}, min_dist={_UMAP_MIN_DIST}, init=pca, seed={seed})"
-             f" · clusters: {method_desc} in {cluster_space}"
-             f" · M={M:,} tokens / {n_seqs} seqs · metric: {metric}",
-             fontsize=6, color="0.4", ha="right", va="bottom")
-    return _save(fig, path)
+    if controlled:
+        fingerprint = controlled_record["sample"]["token_sha256"][:12]
+        display_seed = controlled_record["display"]["display_seed"]
+        footer = (
+            f"controlled tokens: M={M:,} / {n_seqs} seqs / sha256={fingerprint}..."
+            f" | display: UMAP(n_neighbors={n_disp}, min_dist={min_dist}, init=pca, seed={display_seed})"
+            f" | clusters: {method_desc} in {cluster_space} | metric: {metric}"
+            " | gauge-fixed coordinate diagnostic"
+        )
+    else:
+        footer = (
+            f"exploratory sequences: M={M:,} tokens / {n_seqs} seqs"
+            f" | display: UMAP(n_neighbors={n_disp}, min_dist={min_dist}, init=pca, seed={seed})"
+            f" | clusters: {method_desc} in {cluster_space} | metric: {metric}"
+        )
+    fig.text(0.98, 0.012, footer, fontsize=6, color="0.4", ha="right", va="bottom")
+    saved = _save(fig, path)
+    if controlled and controlled_record is not None and (sidecar_path is not None or path is not None):
+        from pathlib import Path
+        from vfe3.viz import embedding_comparison
+        destination = sidecar_path or str(Path(path).with_suffix(".json"))
+        try:
+            embedding_comparison.write_json_atomic(controlled_record, destination)
+        except Exception:
+            if path is not None:
+                try:
+                    Path(path).unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+    return saved
 
 
 @register_figure("belief_category_separation")
