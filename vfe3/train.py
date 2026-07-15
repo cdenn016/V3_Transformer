@@ -783,6 +783,8 @@ _VAL_DIAG_KEYS = (
     # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
     "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
     "val_fisher_trace_mean", "val_belief_cond_p95", "val_phi_norm_mean", "val_phi_norm_std",
+    "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
+    "val_phi_exp_clamp_frac", "val_phi_exp_scale_min", "val_vertex_cond_p99",
     "val_guard_sigma_floor_frac", "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
     "val_nonfinite_frac",
 )
@@ -835,6 +837,16 @@ def _val_diagnostics(
     out["val_belief_cond_p95"]         = vd["belief_cond_p95"]
     out["val_phi_norm_mean"]           = vd["phi_norm_mean"]
     out["val_phi_norm_std"]            = vd["phi_norm_std"]
+    for _source, _target in (
+        ("phi_matrix_norm_p95", "val_phi_matrix_norm_p95"),
+        ("phi_matrix_norm_p99", "val_phi_matrix_norm_p99"),
+        ("phi_matrix_norm_max", "val_phi_matrix_norm_max"),
+        ("phi_exp_clamp_frac", "val_phi_exp_clamp_frac"),
+        ("phi_exp_scale_min", "val_phi_exp_scale_min"),
+        ("vertex_cond_p99", "val_vertex_cond_p99"),
+    ):
+        if _source in vd:
+            out[_target] = vd[_source]
     out["val_guard_sigma_floor_frac"]  = vd["guard_sigma_floor_frac"]
     out["val_guard_sigma_ceil_frac"]   = vd["guard_sigma_ceil_frac"]
     out["val_guard_energy_klmax_frac"] = vd["guard_energy_klmax_frac"]
@@ -1389,6 +1401,9 @@ def train(
                         "cocycle_residual", "vertex_cond_max", "sandwich_absmax", "transport_asymmetry",
                         "energy_abs_asymmetry", "energy_rel_asymmetry",
                         "gauge_head_aniso_mean", "gauge_head_logdet_spread",
+                        "phi_matrix_norm_median", "phi_matrix_norm_p95", "phi_matrix_norm_p99",
+                        "phi_matrix_norm_max", "phi_exp_clamp_frac", "phi_exp_scale_min",
+                        "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
                         "connection_w_norm", "connection_m_norm",
                         "connection_l_norm", "connection_l_offdiag_norm", "head_mixer_drift"):
                 if _dk in d:

@@ -3002,6 +3002,23 @@ class VFEModel(nn.Module):
         phi_norm = torch.linalg.norm(out.phi, dim=-1)               # (N,)
         d["phi_norm_mean"] = float(phi_norm.mean())
         d["phi_norm_std"]  = float(phi_norm.std(unbiased=False))
+        if cfg.gauge_parameterization == "phi":
+            from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM
+            phi_matrix = torch.einsum(
+                "na,aij->nij", out.phi.float(), self.group.generators.float())
+            matrix_norm = torch.linalg.matrix_norm(phi_matrix, ord="fro", dim=(-2, -1))
+            exp_scale = (
+                TRANSPORT_CLAMP_MAX_NORM / matrix_norm.clamp(min=cfg.eps)
+            ).clamp(max=1.0)
+            d["phi_matrix_norm_median"] = float(matrix_norm.median())
+            d["phi_matrix_norm_p95"] = float(torch.quantile(matrix_norm, 0.95))
+            d["phi_matrix_norm_p99"] = float(torch.quantile(matrix_norm, 0.99))
+            d["phi_matrix_norm_max"] = float(matrix_norm.max())
+            d["phi_exp_clamp_frac"] = float((exp_scale < 1.0).float().mean())
+            d["phi_exp_scale_min"] = float(exp_scale.min())
+            d["vertex_cond_median"] = float(vertex_cond.float().median())
+            d["vertex_cond_p95"] = float(torch.quantile(vertex_cond.float(), 0.95))
+            d["vertex_cond_p99"] = float(torch.quantile(vertex_cond.float(), 0.99))
 
         # Belief covariance conditioning + PD margin (effective_rank is blind to one collapsing mode).
         bs = metrics.belief_spectrum(out.sigma, diagonal=_diag, eps=cfg.eps)

@@ -1114,6 +1114,54 @@ def plot_estep_depth_sensitivity(
     return _save(fig, path)
 
 
+@register_figure("phi_numerics_reference")
+def plot_phi_numerics_reference(
+    record: Mapping[str, object],
+
+    *,
+    path:   Optional[str] = None,
+):
+    r"""Plot fp32/fp64 flat-closure references and BCH chart fidelity."""
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.6))
+    flatness = record.get("flatness", {})
+    labels = ["holonomy", "cocycle", "inverse"]
+    fp32 = [
+        float(flatness.get("numerical_holonomy_fp32_rel", np.nan)),
+        float(flatness.get("numerical_cocycle_fp32_rel", np.nan)),
+        float(flatness.get("inverse_consistency_fp32_rel", np.nan)),
+    ]
+    fp64 = [
+        float(flatness.get("numerical_holonomy_fp64_rel", np.nan)),
+        float(flatness.get("numerical_cocycle_fp64_rel", np.nan)),
+        float(flatness.get("inverse_consistency_fp64_rel", np.nan)),
+    ]
+    x = np.arange(len(labels))
+    axes[0].bar(x - 0.18, fp32, 0.36, color=_CB[0], label="fp32")
+    axes[0].bar(x + 0.18, fp64, 0.36, color=_CB[1], label="fp64 reference")
+    axes[0].set_xticks(x, labels)
+    axes[0].set_yscale("log")
+    axes[0].set(ylabel="relative numerical residual", title="Nominally flat closure")
+    axes[0].legend(frameon=False, fontsize=8)
+
+    bch = record.get("bch_fidelity", {})
+    bch_labels = ["median", "p95", "p99", "max"]
+    bch_values = [
+        float(bch.get("bch_relative_error_median", np.nan)),
+        float(bch.get("bch_relative_error_p95", np.nan)),
+        float(bch.get("bch_relative_error_p99", np.nan)),
+        float(bch.get("bch_relative_error_max", np.nan)),
+    ]
+    axes[1].bar(np.arange(len(bch_labels)), bch_values, color=_CB[3])
+    axes[1].set_xticks(np.arange(len(bch_labels)), bch_labels)
+    axes[1].set_yscale("log")
+    axes[1].set(ylabel="relative group-product error", title="Truncated BCH fidelity")
+    if not bch:
+        axes[1].text(0.5, 0.5, "BCH positional composition inactive",
+                     transform=axes[1].transAxes, ha="center", va="center")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
 # ---------------------------------------------------------------------------
 # History dashboards: small-multiples over metrics.csv columns the training loop
 # already logs but no standard figure surfaced (geometry / E-step / validation /
@@ -1202,7 +1250,8 @@ def plot_geometry_health(
     history: Dict,                       # step + gauge/SPD/Fisher/guard health columns (any subset)
 
     *,
-    path:    Optional[str] = None,
+    transport_mode: str           = "flat",
+    path:           Optional[str] = None,
 ):
     r"""Gauge / SPD / Fisher geometry-health dashboard over training.
 
@@ -1214,8 +1263,11 @@ def plot_geometry_health(
     drift from identity -- audit 2026-07-01 round-3). Together they say whether the learned geometry
     stays meaningful rather than degenerating to a flat cocycle (phi -> 0, an UNGAUGED transformer) or
     a guard-pinned fixed point. Each panel self-gates on column presence."""
+    flat = transport_mode == "flat"
     panels = [
-        {"title": "Holonomy / cocycle flatness", "ylabel": "curvature", "logy": True, "series": [
+        {"title": ("Numerical closure of flat transport" if flat else "Holonomy / cocycle curvature"),
+         "ylabel": ("numerical closure residual" if flat else "curvature"),
+         "logy": True, "series": [
             ("holonomy_wilson", r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$ (gauge-invariant)", _CB[0]),
             ("cocycle_residual", "cocycle residual", _CB[1]),
             ("holonomy_deviation", r"$\langle\|H-I\|_F\rangle$ (frame-dependent)", _CB[2])]},
@@ -1225,6 +1277,19 @@ def plot_geometry_health(
         {"title": "Gauge-frame magnitude", "ylabel": r"$\|\phi\|$", "series": [
             ("phi_norm_mean", r"mean $\|\phi\|$", _CB[0]),
             ("phi_norm_std", r"std $\|\phi\|$", _CB[5])]},
+        {"title": "Embedded phi chart radius", "ylabel": r"$\|\phi^a G_a\|_F$", "logy": True,
+         "series": [
+            ("phi_matrix_norm_p95", "p95", _CB[0]),
+            ("phi_matrix_norm_p99", "p99", _CB[1]),
+            ("phi_matrix_norm_max", "max", _CB[3])]},
+        {"title": "Exponential chart guard", "ylabel": "fraction / scale", "series": [
+            ("phi_exp_clamp_frac", "clamped fraction", _CB[1]),
+            ("phi_exp_scale_min", "minimum scale", _CB[2])]},
+        {"title": "Vertex conditioning", "ylabel": r"$\kappa(\exp\phi)$", "logy": True,
+         "series": [
+            ("vertex_cond_median", "median", _CB[0]),
+            ("vertex_cond_p95", "p95", _CB[1]),
+            ("vertex_cond_p99", "p99", _CB[3])]},
         {"title": "Belief conditioning", "ylabel": r"$\kappa(\Sigma)$", "logy": True, "series": [
             ("belief_cond_p95", "p95", _CB[1]),
             ("belief_cond_max", "max", _CB[3])]},

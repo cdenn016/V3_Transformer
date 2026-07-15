@@ -1302,6 +1302,23 @@ def finalize_run(
                 plt.close(_depth_figure)
         except Exception as exc:
             logger.warning("estep depth-sensitivity probe failed (%s); skipped", exc)
+        try:
+            _phi_batch = next(iter(depth_loader))
+            _phi_tokens = (
+                _phi_batch[0] if isinstance(_phi_batch, (tuple, list)) else _phi_batch
+            ).to(device)
+            _phi_record = collect_phi_numerics(model, _phi_tokens)
+            artifacts.save_json("phi_numerics.json", _phi_record)
+            from vfe3.viz.figures import plot_phi_numerics_reference
+            _phi_figure = plot_phi_numerics_reference(
+                _phi_record,
+                path=str(artifacts.run_dir / "phi_numerics_reference.png"),
+            )
+            if _phi_figure is not None:
+                from matplotlib import pyplot as plt
+                plt.close(_phi_figure)
+        except Exception as exc:
+            logger.warning("phi numerical-reference probe failed (%s); skipped", exc)
     artifacts.save_json("test_results.json", results)
 
     # Reproducibility provenance (git SHA / data hash / versions) + a scaling-law data point -- the
@@ -1443,6 +1460,80 @@ def collect_estep_depth_sensitivity(
         ),
         "points": points,
     }
+
+
+@torch.no_grad()
+def collect_phi_numerics(
+    model:  torch.nn.Module,
+    tokens: torch.Tensor,
+
+    *,
+    max_tokens: int = 8,
+) -> Dict[str, object]:
+    r"""Collect sampled chart, BCH, and fp32/fp64 flatness references off the hot path."""
+    from vfe3 import metrics
+    from vfe3.geometry.lie_ops import project_phi_to_slk
+    from vfe3.model.positional_phi import positional_phi_coords
+
+    was_training = bool(model.training)
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
+                if torch.cuda.is_available() else None)
+    try:
+        model.eval()
+        selected = tokens[:1, :max_tokens]
+        belief, _ = model.forward_beliefs(selected)
+        phi = belief.phi[0]
+        block_dims = list(model.group.irrep_dims)
+        record: Dict[str, object] = {
+            "sample_tokens": int(phi.shape[0]),
+            "runtime_dtype": str(phi.dtype),
+            "reference_dtype": "torch.float64",
+            "chart": metrics.phi_chart_statistics(
+                phi,
+                model.group.generators,
+                block_dims=block_dims,
+            ),
+        }
+        if model.cfg.transport_mode == "flat" and model.cfg.gauge_parameterization == "phi":
+            record["flatness"] = metrics.flatness_reference_statistics(
+                phi,
+                model.group.generators,
+                max_triangles=8,
+                block_dims=block_dims,
+            )
+        if model.cfg.pos_phi != "none" and model.cfg.pos_phi_compose == "bch":
+            encoded = model.prior_bank.encode(selected)
+            raw_phi = encoded.phi[0]
+            coords = positional_phi_coords(
+                model.cfg.pos_phi,
+                raw_phi.shape[-2],
+                raw_phi.shape[-1],
+                scale=model.cfg.pos_phi_scale,
+                pos_phi_free=getattr(model, "pos_phi_free", None),
+                device=raw_phi.device,
+                dtype=raw_phi.dtype,
+            )
+            if coords is not None:
+                if model.cfg.pos_phi_project_slk:
+                    coords = project_phi_to_slk(
+                        coords,
+                        model.group.generators,
+                        model.group.irrep_dims,
+                    )
+                record["bch_fidelity"] = metrics.bch_fidelity_statistics(
+                    raw_phi,
+                    coords,
+                    model.group.generators,
+                    order=model.cfg.bch_pe_order,
+                    block_dims=block_dims,
+                )
+        return record
+    finally:
+        model.train(was_training)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
 
 
 def _restore_rng_state(
@@ -1844,9 +1935,14 @@ def _save_figures(
         if hy:
             # Heavy-tailed (median ~1e-3, rare spikes ~1e3): log y + a median reference; NOT smoothed,
             # so the curvature spikes survive.
+            flat_transport = getattr(getattr(artifacts, "cfg", None), "transport_mode", "flat") == "flat"
             fig = figs.plot_trajectory(
-                hy, hx, ylabel=r"$\langle\|H_{ijk}-I\|_F\rangle$",
-                title="Holonomy deviation (frame-dependent Frobenius)", color=figs._CB[2],
+                hy, hx,
+                ylabel=("numerical closure residual" if flat_transport
+                         else r"$\langle\|H_{ijk}-I\|_F\rangle$"),
+                title=("Numerical closure of nominally flat transport" if flat_transport
+                       else "Holonomy curvature (frame-dependent Frobenius)"),
+                color=figs._CB[2],
                 logy=True, median_line=True, annotate="max",
                 path=str(run / "holonomy.png"))
             figs.plt.close(fig)
@@ -1992,12 +2088,19 @@ def _save_figures(
         hist_geom = _hist_subset((
             "holonomy_wilson", "cocycle_residual", "holonomy_deviation",
             "gauge_invariant_spread", "gauge_head_logdet_spread", "phi_norm_mean", "phi_norm_std",
+            "phi_matrix_norm_p95", "phi_matrix_norm_p99", "phi_matrix_norm_max",
+            "phi_exp_clamp_frac", "phi_exp_scale_min",
+            "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
             "belief_cond_p95", "belief_cond_max", "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
             "fisher_trace_mean", "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
             "guard_energy_klmax_frac", "guard_selfdiv_klmax_frac", "nonfinite_frac", "renyi_band_frac",
             "attn_entropy_min", "attn_entropy_collapsed_heads"))
         if hist_geom:
-            fig = figs.plot_geometry_health(hist_geom, path=str(run / "geometry_health.png"))
+            fig = figs.plot_geometry_health(
+                hist_geom,
+                transport_mode=getattr(getattr(artifacts, "cfg", None), "transport_mode", "flat"),
+                path=str(run / "geometry_health.png"),
+            )
             figs.plt.close(fig)
         # E-step inference-quality dashboard: the inner-loop F-drop, the nondecreasing fraction, and the
         # last-iter belief residuals -- the E-step evidence the single estep_f_drop curve does not show.
@@ -2018,7 +2121,9 @@ def _save_figures(
             "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
             "val_belief_cond_p95", "val_fisher_trace_mean", "val_guard_sigma_floor_frac",
             "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
-            "val_phi_norm_mean", "val_phi_norm_std"))
+            "val_phi_norm_mean", "val_phi_norm_std", "val_phi_matrix_norm_p95",
+            "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max", "val_phi_exp_clamp_frac",
+            "val_phi_exp_scale_min", "val_vertex_cond_p99"))
         if hist_val:
             fig = figs.plot_validation_sanity(hist_val, path=str(run / "validation_sanity.png"))
             figs.plt.close(fig)

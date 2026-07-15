@@ -96,6 +96,199 @@ def holonomy_deviation(
     return torch.linalg.norm(H - eye, dim=(-2, -1)).mean()
 
 
+def _finite_quantile(values: torch.Tensor, q: float) -> float:
+    """Return a finite-only quantile, or NaN when no finite sample exists."""
+    finite = values.detach().reshape(-1).float()
+    finite = finite[torch.isfinite(finite)]
+    return float(torch.quantile(finite, q)) if finite.numel() else float("nan")
+
+
+def phi_chart_statistics(
+    phi:        torch.Tensor,            # (..., n_gen) gauge-frame coordinates
+    generators: torch.Tensor,            # (n_gen, K, K)
+
+    *,
+    max_norm:   float               = 20.0,
+    eps:        float               = 1e-12,
+    block_dims: Optional[List[int]] = None,
+) -> Dict[str, float]:
+    r"""Summarize embedded chart radius, exponential clamp activation, and conditioning."""
+    matrix = torch.einsum("...a,aij->...ij", phi.double(), generators.double())
+    norm = torch.linalg.matrix_norm(matrix, ord="fro", dim=(-2, -1))
+    scale = (max_norm / norm.clamp(min=eps)).clamp(max=1.0)
+    from vfe3.geometry.transport import _blockwise_matrix_exp
+    scaled = matrix * scale[..., None, None]
+    exp_matrix = (_blockwise_matrix_exp(scaled, block_dims)
+                  if block_dims and len(block_dims) > 1
+                  else torch.linalg.matrix_exp(scaled))
+    singular = torch.linalg.svdvals(exp_matrix)
+    condition = singular[..., 0] / singular[..., -1].clamp(min=eps)
+    return {
+        "phi_matrix_norm_median": _finite_quantile(norm, 0.50),
+        "phi_matrix_norm_p95":    _finite_quantile(norm, 0.95),
+        "phi_matrix_norm_p99":    _finite_quantile(norm, 0.99),
+        "phi_matrix_norm_max":    float(norm.max()) if norm.numel() else float("nan"),
+        "phi_exp_clamp_frac":     float((scale < 1.0).float().mean()) if scale.numel() else 0.0,
+        "phi_exp_scale_min":      float(scale.min()) if scale.numel() else 1.0,
+        "vertex_cond_median":     _finite_quantile(condition, 0.50),
+        "vertex_cond_p95":        _finite_quantile(condition, 0.95),
+        "vertex_cond_p99":        _finite_quantile(condition, 0.99),
+        "vertex_cond_max_ref":    float(condition.max()) if condition.numel() else float("nan"),
+        "phi_chart_nonfinite_count": float((~torch.isfinite(matrix)).sum()),
+    }
+
+
+def bch_fidelity_statistics(
+    phi_x:      torch.Tensor,            # (..., n_gen) left chart coordinate
+    phi_y:      torch.Tensor,            # (..., n_gen) right chart coordinate
+    generators: torch.Tensor,            # (n_gen, K, K)
+
+    *,
+    order:      int                 = 4,
+    eps:        float               = 1e-12,
+    block_dims: Optional[List[int]] = None,
+) -> Dict[str, float]:
+    r"""Compare truncated BCH in the chart with the exact group product in fp64."""
+    from vfe3.geometry.lie_ops import compose_bch
+
+    x = phi_x.double()
+    y = phi_y.double()
+    basis = generators.double()
+    z = compose_bch(x, y, basis, order=order, block_dims=block_dims)
+    matrix_x = torch.einsum("...a,aij->...ij", x, basis)
+    matrix_y = torch.einsum("...a,aij->...ij", y, basis)
+    matrix_z = torch.einsum("...a,aij->...ij", z, basis)
+    from vfe3.geometry.transport import _blockwise_matrix_exp
+
+    def _exp(matrix: torch.Tensor) -> torch.Tensor:
+        return (_blockwise_matrix_exp(matrix, block_dims)
+                if block_dims and len(block_dims) > 1
+                else torch.linalg.matrix_exp(matrix))
+
+    exact = _exp(matrix_x) @ _exp(matrix_y)
+    approximate = _exp(matrix_z)
+    error = torch.linalg.matrix_norm(approximate - exact, ord="fro", dim=(-2, -1))
+    denominator = torch.linalg.matrix_norm(exact, ord="fro", dim=(-2, -1)).clamp(min=eps)
+    relative = error / denominator
+    input_norm = (
+        torch.linalg.matrix_norm(matrix_x, ord="fro", dim=(-2, -1))
+        + torch.linalg.matrix_norm(matrix_y, ord="fro", dim=(-2, -1))
+    ).clamp(min=eps)
+    amplification = torch.linalg.matrix_norm(matrix_z, ord="fro", dim=(-2, -1)) / input_norm
+    return {
+        "bch_relative_error_median": _finite_quantile(relative, 0.50),
+        "bch_relative_error_p95":    _finite_quantile(relative, 0.95),
+        "bch_relative_error_p99":    _finite_quantile(relative, 0.99),
+        "bch_relative_error_max":    float(relative.max()),
+        "bch_norm_amplification_median": _finite_quantile(amplification, 0.50),
+        "bch_norm_amplification_p95":    _finite_quantile(amplification, 0.95),
+        "bch_norm_amplification_max":    float(amplification.max()),
+        "bch_nonfinite_count": float((~torch.isfinite(relative)).sum()),
+    }
+
+
+def _deterministic_triples(n_tokens: int, max_triangles: int) -> List[Tuple[int, int, int]]:
+    """Return row-major distinct triples without drawing RNG state."""
+    triples: List[Tuple[int, int, int]] = []
+    for i in range(n_tokens):
+        for j in range(n_tokens):
+            if i == j:
+                continue
+            for k in range(n_tokens):
+                if k == i or k == j:
+                    continue
+                triples.append((i, j, k))
+                if len(triples) >= max_triangles:
+                    return triples
+    return triples
+
+
+def flatness_reference_statistics(
+    phi:        torch.Tensor,            # (N, n_gen) or (B, N, n_gen); first batch is sampled
+    generators: torch.Tensor,            # (n_gen, K, K)
+
+    *,
+    max_triangles: int   = 64,
+    max_norm:      float = 20.0,
+    eps:           float = 1e-12,
+    block_dims:    Optional[List[int]] = None,
+) -> Dict[str, float]:
+    r"""Compare fp32 and rebuilt-fp64 numerical closure of a flat vertex cocycle."""
+    coordinate = phi[0] if phi.dim() == 3 else phi
+    matrix64 = torch.einsum("na,aij->nij", coordinate.double(), generators.double())
+    norm64 = torch.linalg.matrix_norm(matrix64, ord="fro", dim=(-2, -1))
+    scale64 = (max_norm / norm64.clamp(min=eps)).clamp(max=1.0)
+    matrix64 = matrix64 * scale64[..., None, None]
+    triples = _deterministic_triples(matrix64.shape[0], max_triangles)
+    k_dim = matrix64.shape[-1]
+
+    def _measure(matrix: torch.Tensor) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        from vfe3.geometry.transport import _blockwise_matrix_exp
+        exp_pos = (_blockwise_matrix_exp(matrix, block_dims)
+                   if block_dims and len(block_dims) > 1
+                   else torch.linalg.matrix_exp(matrix))
+        exp_neg = (_blockwise_matrix_exp(-matrix, block_dims)
+                   if block_dims and len(block_dims) > 1
+                   else torch.linalg.matrix_exp(-matrix))
+        eye = torch.eye(k_dim, device=matrix.device, dtype=matrix.dtype)
+        inverse = torch.linalg.matrix_norm(exp_pos @ exp_neg - eye, ord="fro", dim=(-2, -1))
+        inverse_rel = inverse / torch.linalg.matrix_norm(eye, ord="fro").clamp(min=eps)
+        if not triples:
+            zero = matrix.new_zeros(())
+            return zero, zero, zero, zero, inverse.mean(), inverse_rel.mean()
+        index = torch.tensor(triples, device=matrix.device)
+        omega_ij = exp_pos[index[:, 0]] @ exp_neg[index[:, 1]]
+        omega_jk = exp_pos[index[:, 1]] @ exp_neg[index[:, 2]]
+        omega_ki = exp_pos[index[:, 2]] @ exp_neg[index[:, 0]]
+        omega_ik = exp_pos[index[:, 0]] @ exp_neg[index[:, 2]]
+        holonomy = omega_ij @ omega_jk @ omega_ki
+        hol_abs = torch.linalg.matrix_norm(holonomy - eye, ord="fro", dim=(-2, -1))
+        hol_rel = hol_abs / torch.linalg.matrix_norm(eye, ord="fro").clamp(min=eps)
+        composed = omega_ij @ omega_jk
+        cocycle_abs = torch.linalg.matrix_norm(composed - omega_ik, ord="fro", dim=(-2, -1))
+        cocycle_scale = torch.maximum(
+            torch.linalg.matrix_norm(composed, ord="fro", dim=(-2, -1)),
+            torch.linalg.matrix_norm(omega_ik, ord="fro", dim=(-2, -1)),
+        ).clamp(min=eps)
+        return (
+            hol_abs.mean(),
+            hol_rel.mean(),
+            cocycle_abs.mean(),
+            (cocycle_abs / cocycle_scale).mean(),
+            inverse.mean(),
+            inverse_rel.mean(),
+        )
+
+    ha32, hr32, ca32, cr32, ia32, ir32 = _measure(matrix64.float())
+    ha64, hr64, ca64, cr64, ia64, ir64 = _measure(matrix64)
+    return {
+        "numerical_holonomy_fp32_abs": float(ha32),
+        "numerical_holonomy_fp32_rel": float(hr32),
+        "numerical_holonomy_fp64_abs": float(ha64),
+        "numerical_holonomy_fp64_rel": float(hr64),
+        "numerical_cocycle_fp32_abs":  float(ca32),
+        "numerical_cocycle_fp32_rel":  float(cr32),
+        "numerical_cocycle_fp64_abs":  float(ca64),
+        "numerical_cocycle_fp64_rel":  float(cr64),
+        "inverse_consistency_fp32_abs": float(ia32),
+        "inverse_consistency_fp32_rel": float(ir32),
+        "inverse_consistency_fp64_abs": float(ia64),
+        "inverse_consistency_fp64_rel": float(ir64),
+        "flatness_reference_triangles": float(len(triples)),
+        "flatness_reference_nonfinite_count": float(sum(
+            not torch.isfinite(value)
+            for value in (ha32, hr32, ha64, hr64, ca32, cr32, ca64, cr64, ia32, ir32, ia64, ir64)
+        )),
+    }
+
+
 def gauge_trace_spread(
     phi:        torch.Tensor,            # (..., n_gen) gauge-frame coordinates
     generators: torch.Tensor,           # (n_gen, K, K)
