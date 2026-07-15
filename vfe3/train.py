@@ -793,6 +793,8 @@ _VAL_DIAG_KEYS = (
     "val_fisher_trace_mean", "val_belief_cond_p95", "val_phi_norm_mean", "val_phi_norm_std",
     "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
     "val_phi_exp_clamp_frac", "val_phi_exp_scale_min", "val_vertex_cond_p99",
+    "val_pos_phi_matrix_norm_p95", "val_pos_phi_matrix_norm_p99", "val_pos_phi_matrix_norm_max",
+    "val_pos_phi_exp_clamp_frac", "val_pos_phi_exp_scale_min",
     "val_guard_sigma_floor_frac", "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
     "val_nonfinite_frac",
 )
@@ -852,6 +854,11 @@ def _val_diagnostics(
         ("phi_exp_clamp_frac", "val_phi_exp_clamp_frac"),
         ("phi_exp_scale_min", "val_phi_exp_scale_min"),
         ("vertex_cond_p99", "val_vertex_cond_p99"),
+        ("pos_phi_matrix_norm_p95", "val_pos_phi_matrix_norm_p95"),
+        ("pos_phi_matrix_norm_p99", "val_pos_phi_matrix_norm_p99"),
+        ("pos_phi_matrix_norm_max", "val_pos_phi_matrix_norm_max"),
+        ("pos_phi_exp_clamp_frac", "val_pos_phi_exp_clamp_frac"),
+        ("pos_phi_exp_scale_min", "val_pos_phi_exp_scale_min"),
     ):
         if _source in vd:
             out[_target] = vd[_source]
@@ -1412,6 +1419,8 @@ def train(
                         "phi_matrix_norm_median", "phi_matrix_norm_p95", "phi_matrix_norm_p99",
                         "phi_matrix_norm_max", "phi_exp_clamp_frac", "phi_exp_scale_min",
                         "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
+                        "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_p99", "pos_phi_matrix_norm_max",
+                        "pos_phi_exp_clamp_frac", "pos_phi_exp_scale_min",
                         "connection_w_norm", "connection_m_norm",
                         "connection_l_norm", "connection_l_offdiag_norm", "head_mixer_drift"):
                 if _dk in d:

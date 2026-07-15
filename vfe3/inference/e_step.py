@@ -90,7 +90,8 @@ def _transport(
     gauge_parameterization: str                    = "phi",   # 'phi' (exp path) | 'omega_direct' (stored element)
     omega:              'torch.Tensor | CompactBlockElement | None' = None,  # stored U_i (omega_direct only)
     reflection:         Optional[torch.Tensor] = None,      # (N,) or (B, N) per-token sign s_i; phi-path fold (None -> off)
-) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport':
+    right_phi:          Optional[torch.Tensor] = None,      # exact right positional factor exp(Y)
+) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport':
     r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
     The build is config-selected through ``get_transport(transport_mode)``; the default 'flat' is
@@ -114,6 +115,19 @@ def _transport(
         if isinstance(built, CompactFactoredTransport):
             return built
         return built.to_dense_omega()                         # preserve the shipped noncompact block path
+    if right_phi is not None:
+        built = build_factored_transport(
+            phi, group,
+            gauge_mode=gauge_mode,
+            exp_fp64_mode=exp_fp64_mode,
+            exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+            clamp_monitor=clamp_monitor,
+            mean_per_head=transport_mean_per_head,
+            right_phi=right_phi,
+        )
+        if reflection is not None:
+            built = _apply_reflection(built, reflection)
+        return built.to_dense_omega() if materialize else built
     build = get_transport(transport_mode)
     batch_independent = transport_mode in _TRANSPORT_BATCH_INDEPENDENT
     if phi.dim() == 2:
@@ -270,6 +284,7 @@ def build_belief_transport(
     sigma_key:                   Optional[torch.Tensor]                      = None,     # regime_ii_covariant KEY-slot variances (None -> sigma)
     rope:                        Optional[torch.Tensor]                      = None,     # (N, K, K) gauge-RoPE rotation (None -> off)
     reflection:                  Optional[torch.Tensor]                      = None,     # (B, N) per-token sign s_i in {+1,-1}; phi-path fold (None -> off)
+    right_phi:                   Optional[torch.Tensor]                      = None,     # exact right positional factor exp(Y)
 ) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport':
     r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
 
@@ -311,11 +326,12 @@ def build_belief_transport(
             omega, group, mean_per_head=transport_mean_per_head)
         if isinstance(built, dict):
             built = built["Omega"]
-    elif _can_fuse_flat(transport_mode, group):
+    elif right_phi is not None or _can_fuse_flat(transport_mode, group):
         built = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
                                          exp_fp64_mode=exp_fp64_mode,
                                          exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                                          mean_per_head=transport_mean_per_head,
+                                         right_phi=right_phi,
                                          compact_blocks=(compact_phi_block_transport
                                                          and reflection is None))
     else:
@@ -346,12 +362,18 @@ def _transport_qk(
     query_phi: torch.Tensor,         # (N, n_gen) current query frames phi_i
     key_phi:   torch.Tensor,         # (N, n_gen) frozen key frames phi_j
     group:     GaugeGroup,
+    query_right_phi: Optional[torch.Tensor] = None,
+    key_right_phi:   Optional[torch.Tensor] = None,
 ) -> torch.Tensor:                   # (N, N, K, K) Omega_ij = exp(phi_i^q) exp(-phi_j^k)
     r"""Mixed-frame transport for the FILTERED objective: the query frame phi_i is current
     (belief) and the key frame phi_j is frozen (keys). Reduces to ``_transport`` exactly when
     query_phi == key_phi (the global / keys-None case)."""
-    exp_q     = compute_transport_operators(query_phi.unsqueeze(0), group)["exp_phi"][0]      # exp(phi_i^q)
-    exp_neg_k = compute_transport_operators(key_phi.unsqueeze(0), group)["exp_neg_phi"][0]    # exp(-phi_j^k)
+    query = build_factored_transport(query_phi, group, right_phi=query_right_phi)
+    key = build_factored_transport(key_phi, group, right_phi=key_right_phi)
+    if not isinstance(query, FactoredTransport) or not isinstance(key, FactoredTransport):
+        raise TypeError("mixed-frame transport requires dense FactoredTransport factors")
+    exp_q = query.exp_phi
+    exp_neg_k = key.exp_neg_phi
     return torch.einsum("ikl,jlm->ijkm", exp_q, exp_neg_k)
 
 
@@ -450,6 +472,7 @@ def free_energy_value(
             belief.phi, group, transport_mode=transport_mode,
             gauge_parameterization=gauge_parameterization, omega=belief.omega,
             reflection=belief.reflection,   # phi-path R_i Omega_ij R_j fold (None on the pure path -> byte-identical)
+            right_phi=belief.right_phi,
             mu=(belief.mu if transport_mode in _TRANSPORT_NEEDS_MU else None),
             sigma=(belief.sigma if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
             connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
@@ -473,7 +496,13 @@ def free_energy_value(
             raise NotImplementedError(
                 "filtered-keys free energy does not support gauge_parameterization='omega_direct' yet"
             )
-        omega = _transport_qk(belief.phi, keys.phi, group)
+        omega = _transport_qk(
+            belief.phi,
+            keys.phi,
+            group,
+            query_right_phi=belief.right_phi,
+            key_right_phi=keys.right_phi,
+        )
         # Filtered-transport reflection fold (phi path): the query slot carries the belief's sign s_i
         # and the KEY slot the frozen keys' sign s_j, so Omega_ij -> R_i Omega_ij R_j with independent
         # per-slot signs. In practice both beliefs come from the same reflection-bearing model, so both
@@ -560,6 +589,7 @@ def phi_alignment_loss(
 
     rope:         Optional[torch.Tensor] = None,      # (N,K,K) gauge-RoPE rotation (None -> off)
     reflection:   Optional[torch.Tensor] = None,      # (N,) per-token sign s_i; None -> connected component
+    right_phi:    Optional[torch.Tensor] = None,      # exact right positional factor exp(Y)
     log_prior:    Optional[torch.Tensor] = None,
     connection_W: Optional[torch.Tensor] = None,      # learned regime_ii connection (held fixed here)
     connection_M: Optional[torch.Tensor] = None,      # learned regime_ii_covariant connection (Route B; held fixed here)
@@ -603,6 +633,7 @@ def phi_alignment_loss(
     )
     omega = build_belief_transport(phi, group, transport_mode=transport_mode, mu=mu, sigma=sigma,
                                    reflection=reflection,
+                                   right_phi=right_phi,
                                    connection_W=connection_W, connection_M=connection_M,
                                    connection_L=connection_L, link_alpha=link_alpha,
                                    link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
@@ -788,6 +819,7 @@ def e_step_iteration(
                 belief.phi, group, transport_mode=transport_mode,
                 gauge_parameterization=gauge_parameterization, omega=belief.omega,
                 reflection=belief.reflection,   # phi-path reflection fold (None on the pure path -> byte-identical)
+                right_phi=belief.right_phi,
                 mu=belief.mu, connection_W=connection_W, connection_L=connection_L,
                 link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                 cocycle_relaxation=cocycle_relaxation,
@@ -993,6 +1025,7 @@ def e_step_iteration(
                 # free energy than mu/sigma (audit 2026-06-17 round 2 id15). None/off -> byte-identical.
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                 reflection=belief.reflection,
+                right_phi=belief.right_phi,
                 # INTENTIONAL asymmetry (audit 2026-06-09 D3): connection_W is detached here, so
                 # the learned Regime-II connection trains ONLY through the mu/sigma belief path,
                 # never through the phi-step autograd island (whose grad is a constant tangent to
@@ -1132,6 +1165,7 @@ def e_step(
                 transport_mode="flat",
                 gauge_parameterization=gauge_param_kw, omega=belief.omega,
                 reflection=belief.reflection,   # phi-path reflection fold (None on the pure path -> byte-identical)
+                right_phi=belief.right_phi,
                 gauge_mode="learned",   # not an e_step kwarg (no **kwargs sink downstream); literal, not a dead kwargs read (m14)
                 clamp_monitor=kwargs.get("clamp_monitor", False),
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
@@ -1164,7 +1198,10 @@ def e_step(
                 r=b.r[sequence_index] if b.r is not None else None,
                 omega=b.omega[sequence_index] if b.omega is not None else None,
                 reflection=(b.reflection[sequence_index]
-                            if b.reflection is not None else None))
+                            if b.reflection is not None else None),
+                right_phi=(b.right_phi[sequence_index]
+                           if b.right_phi is not None and b.right_phi.dim() == b.phi.dim()
+                           else b.right_phi))
             mu_eval = mu_p[sequence_index]
             sigma_eval = sigma_p[sequence_index]
             if isinstance(tau, torch.Tensor) and tau.dim() >= 2 and tau.shape[0] == b.mu.shape[0]:
@@ -1255,6 +1292,7 @@ def e_step(
                         transport_mode="flat",
                         gauge_parameterization=gauge_param_kw, omega=belief.omega,
                         reflection=belief.reflection,   # phi-path reflection fold (None on the pure path -> byte-identical)
+                        right_phi=belief.right_phi,
                         gauge_mode="learned",
                         clamp_monitor=kwargs.get("clamp_monitor", False),
                         exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,

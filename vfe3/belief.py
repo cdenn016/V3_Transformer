@@ -31,3 +31,4 @@ class BeliefState(NamedTuple):
     r:     Optional[torch.Tensor] = None      # optional future hyper-prior channel r_i (None by default)
     omega: 'torch.Tensor | CompactBlockElement | None' = None  # optional stored GL(K) frame, dense or compact
     reflection: Optional[torch.Tensor] = None # (..., N) per-token sign +1/-1; set only on the phi path under phi_reflection
+    right_phi: Optional[torch.Tensor] = None  # (..., N, n_gen) exact right positional factor exp(right_phi.G)

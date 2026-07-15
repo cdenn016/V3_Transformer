@@ -85,6 +85,9 @@ def _snapshot_sequence(belief: BeliefState, index: int = 0) -> BeliefState:
         r=belief.r[index] if belief.r is not None else None,
         omega=belief.omega[index] if belief.omega is not None else None,
         reflection=belief.reflection[index] if belief.reflection is not None else None,
+        right_phi=(belief.right_phi[index]
+                   if belief.right_phi is not None and belief.right_phi.dim() == belief.phi.dim()
+                   else belief.right_phi),
     )
 
 
@@ -100,6 +103,7 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
         mu=enc.mu[0], sigma=enc.sigma[0], phi=model._apply_pos_phi(enc.phi[0]),
         omega=enc.omega[0] if enc.omega is not None else None,       # omega-direct GL(K) frame
         reflection=enc.reflection[0] if enc.reflection is not None else None,   # phi-path sign
+        right_phi=model._pos_phi_right(enc.phi[0]),
     )
     model_phi = model._resolve_model_frame(token_ids[:1], belief.phi.unsqueeze(0))
     n = belief.mu.shape[0]
@@ -267,7 +271,10 @@ def belief_ce_bank(
                                   ignore_index=-100, reduction="none")            # (B*N,)
             conf_flat, pred_flat = flat_logits.softmax(dim=-1).max(dim=-1)        # (B*N,) confidence, argmax
             beliefs = model.prior_bank.encode(tokens)             # mirror forward so the traced sigma
-            beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi))   # IS the decode's belief
+            beliefs = beliefs._replace(
+                phi=model._apply_pos_phi(beliefs.phi),
+                right_phi=model._pos_phi_right(beliefs.phi),
+            )                                                       # IS the decode's belief
             model_phi = model._resolve_model_frame(tokens, beliefs.phi)
             rope = model._rope_rotation(n, device)
             s_belief = None
@@ -350,7 +357,10 @@ def belief_bank(
         for tokens in token_batches:
             tokens = tokens.to(device)
             beliefs = model.prior_bank.encode(tokens)
-            beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi))
+            beliefs = beliefs._replace(
+                phi=model._apply_pos_phi(beliefs.phi),
+                right_phi=model._pos_phi_right(beliefs.phi),
+            )
             model_phi = model._resolve_model_frame(tokens, beliefs.phi)
             n = tokens.shape[1]
             rope = model._rope_rotation(n, device)
@@ -654,6 +664,7 @@ def numerical_health(
         gauge_parameterization=cfg.gauge_parameterization,
         omega=out.omega,
         reflection=out.reflection,
+        right_phi=out.right_phi,
         mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
         sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
         connection_W=getattr(model, "connection_W", None),
@@ -722,7 +733,7 @@ def converged_state(
     self-divergence ``self_div`` (N,) or (N, K).
     """
     from vfe3.model.stack import vfe_stack
-    from vfe3.geometry.transport import RopeTransport, compute_transport_operators
+    from vfe3.geometry.transport import RopeTransport, build_factored_transport, compute_transport_operators
 
     cfg = model.cfg
     was_training = model.training
@@ -761,6 +772,7 @@ def converged_state(
             gauge_parameterization=cfg.gauge_parameterization,
             omega=out.omega,
             reflection=out.reflection,
+            right_phi=out.right_phi,
             mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
             sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
             connection_W=getattr(model, "connection_W", None),
@@ -804,7 +816,12 @@ def converged_state(
             # dense only at this explicit, off-hot-path figure boundary.
             exp_phi = out.omega.to_dense() if isinstance(out.omega, CompactBlockElement) else out.omega
         else:
-            exp_phi = compute_transport_operators(out.phi.unsqueeze(0), model.group)["exp_phi"][0]
+            if out.right_phi is not None:
+                exp_phi = build_factored_transport(
+                    out.phi.unsqueeze(0), model.group, right_phi=out.right_phi,
+                ).exp_phi[0]
+            else:
+                exp_phi = compute_transport_operators(out.phi.unsqueeze(0), model.group)["exp_phi"][0]
             if out.reflection is not None:
                 # Active phi-path vertex factor g_i = R_i exp(phi_i); scaling row zero applies the
                 # left reflection R_i = diag(sign_i, 1, ...), exactly matching _transport's fold.
@@ -864,6 +881,7 @@ def attention_entropy_cov_gap(
             gauge_parameterization=cfg.gauge_parameterization,
             omega=out.omega,
             reflection=out.reflection,
+            right_phi=out.right_phi,
             mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
             sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
             connection_W=getattr(model, "connection_W", None),

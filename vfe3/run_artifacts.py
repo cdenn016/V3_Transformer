@@ -1489,16 +1489,24 @@ def collect_phi_numerics(
             "sample_tokens": int(phi.shape[0]),
             "runtime_dtype": str(phi.dtype),
             "reference_dtype": "torch.float64",
+            "composition": model.cfg.pos_phi_compose,
             "chart": metrics.phi_chart_statistics(
                 phi,
                 model.group.generators,
                 block_dims=block_dims,
             ),
         }
+        if belief.right_phi is not None:
+            record["right_chart"] = metrics.phi_chart_statistics(
+                belief.right_phi,
+                model.group.generators,
+                block_dims=block_dims,
+            )
         if model.cfg.transport_mode == "flat" and model.cfg.gauge_parameterization == "phi":
             record["flatness"] = metrics.flatness_reference_statistics(
                 phi,
                 model.group.generators,
+                right_phi=belief.right_phi,
                 max_triangles=8,
                 block_dims=block_dims,
             )

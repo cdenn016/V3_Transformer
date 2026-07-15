@@ -1139,23 +1139,43 @@ def plot_phi_numerics_reference(
     axes[0].bar(x - 0.18, fp32, 0.36, color=_CB[0], label="fp32")
     axes[0].bar(x + 0.18, fp64, 0.36, color=_CB[1], label="fp64 reference")
     axes[0].set_xticks(x, labels)
-    axes[0].set_yscale("log")
+    if any(np.isfinite(value) and value > 0.0 for value in fp32 + fp64):
+        axes[0].set_yscale("log")
+    else:
+        axes[0].text(0.5, 0.92, "zero at displayed precision",
+                     transform=axes[0].transAxes, ha="center", va="top", fontsize=8)
     axes[0].set(ylabel="relative numerical residual", title="Nominally flat closure")
     axes[0].legend(frameon=False, fontsize=8)
 
     bch = record.get("bch_fidelity", {})
-    bch_labels = ["median", "p95", "p99", "max"]
-    bch_values = [
-        float(bch.get("bch_relative_error_median", np.nan)),
-        float(bch.get("bch_relative_error_p95", np.nan)),
-        float(bch.get("bch_relative_error_p99", np.nan)),
-        float(bch.get("bch_relative_error_max", np.nan)),
-    ]
-    axes[1].bar(np.arange(len(bch_labels)), bch_values, color=_CB[3])
-    axes[1].set_xticks(np.arange(len(bch_labels)), bch_labels)
-    axes[1].set_yscale("log")
-    axes[1].set(ylabel="relative group-product error", title="Truncated BCH fidelity")
-    if not bch:
+    right_chart = record.get("right_chart", {})
+    if bch:
+        bch_labels = ["median", "p95", "p99", "max"]
+        bch_values = [
+            float(bch.get("bch_relative_error_median", np.nan)),
+            float(bch.get("bch_relative_error_p95", np.nan)),
+            float(bch.get("bch_relative_error_p99", np.nan)),
+            float(bch.get("bch_relative_error_max", np.nan)),
+        ]
+        axes[1].bar(np.arange(len(bch_labels)), bch_values, color=_CB[3])
+        axes[1].set_xticks(np.arange(len(bch_labels)), bch_labels)
+        if any(np.isfinite(value) and value > 0.0 for value in bch_values):
+            axes[1].set_yscale("log")
+        axes[1].set(ylabel="relative group-product error", title="Truncated BCH fidelity")
+    elif right_chart:
+        left_chart = record.get("chart", {})
+        factor_labels = ["left p95", "left max", "right p95", "right max"]
+        factor_values = [
+            float(left_chart.get("phi_matrix_norm_p95", np.nan)),
+            float(left_chart.get("phi_matrix_norm_max", np.nan)),
+            float(right_chart.get("phi_matrix_norm_p95", np.nan)),
+            float(right_chart.get("phi_matrix_norm_max", np.nan)),
+        ]
+        axes[1].bar(np.arange(len(factor_labels)), factor_values, color=[_CB[0], _CB[0], _CB[3], _CB[3]])
+        axes[1].set_xticks(np.arange(len(factor_labels)), factor_labels, rotation=20, ha="right")
+        axes[1].set(ylabel="embedded Frobenius norm", title="Exact group-product factor radii")
+    else:
+        axes[1].set(title="Truncated BCH fidelity")
         axes[1].text(0.5, 0.5, "BCH positional composition inactive",
                      transform=axes[1].transAxes, ha="center", va="center")
     fig.tight_layout()
@@ -1281,10 +1301,14 @@ def plot_geometry_health(
          "series": [
             ("phi_matrix_norm_p95", "p95", _CB[0]),
             ("phi_matrix_norm_p99", "p99", _CB[1]),
-            ("phi_matrix_norm_max", "max", _CB[3])]},
+            ("phi_matrix_norm_max", "max", _CB[3]),
+            ("pos_phi_matrix_norm_p95", "positional p95", _CB[4]),
+            ("pos_phi_matrix_norm_max", "positional max", _CB[5])]},
         {"title": "Exponential chart guard", "ylabel": "fraction / scale", "series": [
             ("phi_exp_clamp_frac", "clamped fraction", _CB[1]),
-            ("phi_exp_scale_min", "minimum scale", _CB[2])]},
+            ("phi_exp_scale_min", "minimum scale", _CB[2]),
+            ("pos_phi_exp_clamp_frac", "positional clamped", _CB[4]),
+            ("pos_phi_exp_scale_min", "positional minimum", _CB[5])]},
         {"title": "Projected M-step chart", "ylabel": "fraction / scale", "series": [
             ("phi_chart_projected_fraction", "projected fraction", _CB[1]),
             ("phi_chart_projection_scale_min", "minimum scale", _CB[2])]},

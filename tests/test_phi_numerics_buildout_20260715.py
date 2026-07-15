@@ -5,6 +5,7 @@ import torch
 from vfe3.config import VFE3Config
 from vfe3.gauge_optim import project_phi_parameter_rows_
 from vfe3.geometry.groups import get_group
+from vfe3.geometry.transport import build_factored_transport
 from vfe3.metrics import (
     bch_fidelity_statistics,
     flatness_reference_statistics,
@@ -13,6 +14,7 @@ from vfe3.metrics import (
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import collect_phi_numerics
 from vfe3.train import build_optimizer, train_step
+from vfe3.viz.figures import plot_phi_numerics_reference
 
 
 def _gl2():
@@ -147,3 +149,72 @@ def test_disabled_chart_projection_is_not_called(monkeypatch) -> None:
 
     monkeypatch.setattr(train_module, "project_phi_parameter_rows_", _unexpected)
     train_step(model, optimizer, scheduler, tokens, targets)
+
+
+def test_group_product_vertex_and_inverse_match_direct_multiplication() -> None:
+    group = _gl2()
+    phi_x = torch.tensor([[[0.2, -0.1, 0.3, 0.05], [-0.2, 0.4, 0.1, -0.3]]])
+    phi_y = torch.tensor([[[0.1, 0.2, -0.2, 0.15], [0.05, -0.1, 0.3, 0.2]]])
+
+    built = build_factored_transport(phi_x, group, right_phi=phi_y)
+    matrix_x = torch.einsum("...a,aij->...ij", phi_x, group.generators)
+    matrix_y = torch.einsum("...a,aij->...ij", phi_y, group.generators)
+    expected = torch.linalg.matrix_exp(matrix_x) @ torch.linalg.matrix_exp(matrix_y)
+    expected_inverse = torch.linalg.matrix_exp(-matrix_y) @ torch.linalg.matrix_exp(-matrix_x)
+
+    torch.testing.assert_close(built.exp_phi, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(built.exp_neg_phi, expected_inverse, rtol=1e-5, atol=1e-6)
+
+
+def test_group_product_model_gradients_reach_token_and_position_tables() -> None:
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=1,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        pos_phi="learned",
+        pos_phi_compose="group_product",
+    )
+    model = VFEModel(cfg)
+    tokens = torch.tensor([[0, 1, 2, 3]])
+    targets = torch.tensor([[1, 2, 3, 4]])
+
+    _, loss, _ = model(tokens, targets)
+    loss.backward()
+
+    assert model.prior_bank.phi_embed.grad is not None
+    assert float(model.prior_bank.phi_embed.grad.abs().sum()) > 0.0
+    assert model.pos_phi_free.grad is not None
+    assert float(model.pos_phi_free.grad.abs().sum()) > 0.0
+
+
+def test_group_product_phi_report_tracks_both_factors() -> None:
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=1,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        pos_phi="learned",
+        pos_phi_compose="group_product",
+    )
+    model = VFEModel(cfg)
+    tokens = torch.tensor([[0, 1, 2, 3]])
+
+    record = collect_phi_numerics(model, tokens)
+
+    assert record["composition"] == "group_product"
+    assert "right_chart" in record
+    assert record["flatness"]["flatness_reference_factor_count"] == 2.0
+
+    figure = plot_phi_numerics_reference(record)
+    assert figure.axes[1].get_title() == "Exact group-product factor radii"
+
+    diagnostics = model.diagnostics(tokens)
+    assert "pos_phi_matrix_norm_p95" in diagnostics
+    assert "pos_phi_exp_clamp_frac" in diagnostics

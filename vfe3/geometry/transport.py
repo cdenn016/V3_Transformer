@@ -1437,6 +1437,7 @@ def build_factored_transport(
     clamp_monitor:           bool  = False,       # opt-in: warn when the exp Frobenius clamp fires
     mean_per_head:           bool  = False,       # container flag: transport_mean contracts per gauge block
     compact_blocks:          bool  = False,       # canonical block_glk: retain (..., N, H, d, d) factors
+    right_phi:               Optional[torch.Tensor] = None,  # (..., N, n_gen) exact right factor exp(Y)
 ) -> 'CompactFactoredTransport | FactoredTransport':
     r"""Flat phi-cocycle transport in FACTORED form, skipping the dense (..., N, N, K, K) Omega.
 
@@ -1494,6 +1495,18 @@ def build_factored_transport(
             exp_fp64_norm_threshold=exp_fp64_norm_threshold,
             clamp_monitor=clamp_monitor,
         )
+        if right_phi is not None:
+            right_blocks = right_phi.reshape(*right_phi.shape[:-1], H, d, d)
+            if right_blocks.dtype == torch.float32 and torch.is_autocast_enabled(phi.device.type):
+                right_blocks = right_blocks.to(torch.get_autocast_dtype(phi.device.type))
+            right_exp, right_inv = _stable_compact_glk_exp_pair(
+                right_blocks,
+                exp_fp64_mode=exp_fp64_mode,
+                exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                clamp_monitor=clamp_monitor,
+            )
+            exp_blocks = exp_blocks @ right_exp
+            inv_blocks = right_inv @ inv_blocks
         return CompactFactoredTransport(
             exp_blocks=exp_blocks, inv_blocks=inv_blocks, K=group.generators.shape[-1],
             mean_per_head=mean_per_head)
@@ -1512,6 +1525,20 @@ def build_factored_transport(
         max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
         clamp_monitor=clamp_monitor,
     )
+    if right_phi is not None:
+        right_matrix = torch.einsum("...na,aij->...nij", right_phi, group.generators)
+        right_exp, right_inv = stable_matrix_exp_pair(
+            right_matrix,
+            skew_symmetric=group.skew_symmetric,
+            block_dims=block_dims,
+            exp_dim=(max(block_dims) if block_dims is not None else None),
+            exp_fp64_mode=exp_fp64_mode,
+            exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+            max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
+            clamp_monitor=clamp_monitor,
+        )
+        exp_phi = exp_phi @ right_exp
+        exp_neg_phi = right_inv @ exp_neg_phi
     return FactoredTransport(exp_phi=exp_phi, exp_neg_phi=exp_neg_phi, irrep_dims=list(group.irrep_dims),
                              mean_per_head=mean_per_head)
 

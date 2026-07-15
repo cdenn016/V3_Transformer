@@ -30,7 +30,7 @@ from vfe3.contracts import (
     MStepCapture,
 )
 from vfe3.geometry.groups import GaugeGroup, get_group
-from vfe3.geometry.lie_ops import CompactBlockElement
+from vfe3.geometry.lie_ops import CompactBlockElement, project_phi_to_slk
 from vfe3.geometry.norms import get_norm
 from vfe3.geometry.rope import get_pos_rotation
 from vfe3.geometry.transport import (CompactFactoredTransport, DirectLinkTransport, FactoredTransport, RopeTransport,
@@ -38,7 +38,7 @@ from vfe3.geometry.transport import (CompactFactoredTransport, DirectLinkTranspo
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
-from vfe3.model.positional_phi import apply_positional_phi
+from vfe3.model.positional_phi import apply_positional_phi, positional_phi_coords
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.model.stack import vfe_stack
 
@@ -173,6 +173,7 @@ def _freeze_belief(belief: BeliefState) -> BeliefState:
         r=_freeze_tensor(belief.r),
         omega=_freeze_frame(belief.omega),
         reflection=_freeze_tensor(belief.reflection),
+        right_phi=_freeze_tensor(belief.right_phi),
     )
 
 
@@ -185,6 +186,9 @@ def _sequence_belief(belief: BeliefState, index: int = 0) -> BeliefState:
         r=belief.r[index] if belief.r is not None else None,
         omega=belief.omega[index] if belief.omega is not None else None,
         reflection=belief.reflection[index] if belief.reflection is not None else None,
+        right_phi=(belief.right_phi[index]
+                   if belief.right_phi is not None and belief.right_phi.dim() == belief.phi.dim()
+                   else belief.right_phi),
     )
 
 
@@ -704,8 +708,10 @@ class VFEModel(nn.Module):
         )
 
     def _apply_pos_phi(self, phi: torch.Tensor) -> torch.Tensor:
-        r"""Compose the configured BCH positional element into the gauge frame (no-op for 'none')."""
+        r"""Return the stored left coordinates, composing in-chart modes before transport."""
         if self.cfg.pos_phi == "none":
+            return phi
+        if self.cfg.pos_phi_compose == "group_product":
             return phi
         return apply_positional_phi(
             phi, self.group,
@@ -715,6 +721,20 @@ class VFEModel(nn.Module):
             compact_blocks=self._compact_phi_blocks_enabled(),
             pos_phi_free=getattr(self, "pos_phi_free", None),
         )
+
+    def _pos_phi_right(self, phi: torch.Tensor) -> Optional[torch.Tensor]:
+        r"""Return positional coordinates Y for the exact frame exp(X) exp(Y), else ``None``."""
+        if self.cfg.pos_phi_compose != "group_product" or self.cfg.pos_phi == "none":
+            return None
+        coords = positional_phi_coords(
+            self.cfg.pos_phi, phi.shape[-2], phi.shape[-1],
+            scale=self.cfg.pos_phi_scale,
+            pos_phi_free=getattr(self, "pos_phi_free", None),
+            device=phi.device, dtype=phi.dtype,
+        )
+        if coords is not None and self.cfg.pos_phi_project_slk:
+            coords = project_phi_to_slk(coords, self.group.generators, self.group.irrep_dims)
+        return coords
 
     def _resolve_model_frame(
         self,
@@ -814,7 +834,9 @@ class VFEModel(nn.Module):
         # scalar value, so dispatch the zero gate through the constant-zero form before refinement.
         lambda_h_mode = "constant" if cfg.lambda_h == 0.0 else cfg.lambda_h_mode
         out = e_step(
-            BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0, omega=omega_s, reflection=reflection_s), r_mu, r_sigma, grp,
+            BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0, omega=omega_s,
+                        reflection=reflection_s, right_phi=self._pos_phi_right(phi0)),
+            r_mu, r_sigma, grp,
             n_iter=cfg.n_e_steps,         tau=gamma_tau,
             e_q_mu_lr=cfg.e_s_mu_lr,      e_q_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
             # The s-channel self-coupling weight IS lambda_h (the hyper-prior precision): route it
@@ -944,7 +966,10 @@ class VFEModel(nn.Module):
         if decode_last and N <= 0:
             raise ValueError("decode_last=True requires a nonempty token context")
         beliefs = self.prior_bank.encode(token_ids)              # (B, N, K) ...
-        beliefs = beliefs._replace(phi=self._apply_pos_phi(beliefs.phi))
+        beliefs = beliefs._replace(
+            phi=self._apply_pos_phi(beliefs.phi),
+            right_phi=self._pos_phi_right(beliefs.phi),
+        )
         model_phi = self._resolve_model_frame(token_ids, beliefs.phi)
         diagnostic_capture = capture.get("diagnostic") if capture is not None else None
         if diagnostic_capture is not None:
@@ -1007,6 +1032,7 @@ class VFEModel(nn.Module):
                     beliefs.phi, self.group,
                     transport_mode="flat",
                     gauge_parameterization=self.cfg.gauge_parameterization, omega=beliefs.omega,
+                    right_phi=beliefs.right_phi,
                     reflection=beliefs.reflection if beliefs.reflection is not None else None,   # phi-path reflection fold (None -> byte-identical)
                     clamp_monitor=self.cfg.transport_clamp_monitor,
                     # Tier-1 transport perf toggles: the shared build must carry the same island
@@ -1083,7 +1109,7 @@ class VFEModel(nn.Module):
             mu_final = self.final_norm(mu_final, sigma_final)
 
         belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi, omega=out.omega,   # carry the GL(K) frame under omega_direct (None on the phi path)
-                             reflection=out.reflection)                                     # carry the phi-path per-token reflection sign (None on the pure path)
+                             reflection=out.reflection, right_phi=out.right_phi)              # carry exact positional right factor / reflection
         if capture is not None:
             # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
             # encode-time prior p (post s-refine) and the raw pre-final_norm stack output for callers
@@ -1868,6 +1894,7 @@ class VFEModel(nn.Module):
         omega = build_belief_transport(phi, self.group, transport_mode=tm,
                                        gauge_parameterization=gp, omega=omega,
                                        reflection=reflection,
+                                       right_phi=self._pos_phi_right(phi),
                                        mu=(s_mu if tm in _TRANSPORT_NEEDS_MU else None),
                                        sigma=(s_sigma if tm in _TRANSPORT_NEEDS_SIGMA else None),
                                        transport_mean_per_head=cfg.transport_mean_per_head,
@@ -2030,7 +2057,8 @@ class VFEModel(nn.Module):
         enc = self.prior_bank.encode(token_ids[:1])
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
                              omega=enc.omega[0] if enc.omega is not None else None,   # carry the GL(K) frame under omega_direct
-                             reflection=enc.reflection[0] if enc.reflection is not None else None)   # carry the phi-path reflection sign
+                             reflection=enc.reflection[0] if enc.reflection is not None else None,
+                             right_phi=self._pos_phi_right(enc.phi[0]))
         model_phi = self._resolve_model_frame(token_ids[:1], belief.phi.unsqueeze(0))
         s_belief = self._refined_s_belief(token_ids)                  # s1 under s_e_step (M2), else None (raw s tables)
         if s_belief is not None:
@@ -2524,6 +2552,7 @@ class VFEModel(nn.Module):
             gauge_parameterization=cfg.gauge_parameterization,
             omega=belief.omega,
             reflection=belief.reflection,
+            right_phi=belief.right_phi,
         )
         if rope is not None:
             rope_omega = RopeTransport(
@@ -2687,7 +2716,8 @@ class VFEModel(nn.Module):
             enc = self.prior_bank.encode(token_ids[:1])                    # (1, N, ...)
             belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
                                  omega=enc.omega[0] if enc.omega is not None else None,
-                                 reflection=enc.reflection[0] if enc.reflection is not None else None)
+                                 reflection=enc.reflection[0] if enc.reflection is not None else None,
+                                 right_phi=self._pos_phi_right(enc.phi[0]))
             initial_model_phi = self._resolve_model_frame(token_ids[:1], belief.phi.unsqueeze(0))
             s_belief = self._refined_s_belief(token_ids)
             if s_belief is not None:
@@ -2757,6 +2787,7 @@ class VFEModel(nn.Module):
             gauge_parameterization=cfg.gauge_parameterization,
             omega=out.omega,                                          # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
             reflection=out.reflection,                                # phi-path R_i Omega_ij R_j fold (None -> unchanged)
+            right_phi=out.right_phi,
         )
         mu_tv = sigma_tv = None
         if rope is not None:
@@ -2959,15 +2990,25 @@ class VFEModel(nn.Module):
                 vertex_cond = active_svd[..., 0] / active_svd[..., -1].clamp(min=cfg.eps)
                 _ghi = metrics.per_head_gauge_invariants(active_vertex, self.group.irrep_dims)
         else:
-            d["gauge_trace_spread"] = float(
-                metrics.gauge_trace_spread(out.phi, self.group.generators))
-            active_vertex = compute_transport_operators(
-                out.phi.unsqueeze(0), self.group)["exp_phi"][0]                 # (N,K,K)
+            if out.right_phi is not None:
+                from vfe3.geometry.transport import build_factored_transport
+                active_vertex = build_factored_transport(
+                    out.phi, self.group,
+                    exp_fp64_mode=cfg.exp_fp64_mode,
+                    exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+                    clamp_monitor=cfg.transport_clamp_monitor,
+                    right_phi=out.right_phi,
+                ).exp_phi
+            else:
+                active_vertex = compute_transport_operators(
+                    out.phi.unsqueeze(0), self.group)["exp_phi"][0]             # (N,K,K)
             if out.reflection is not None:
                 # Active disconnected-component frame g_i = R_i exp(phi_i). Scaling row zero
                 # applies the left factor R_i = diag(sign_i, 1, ...) used by the transport fold.
                 active_vertex = active_vertex.clone()
                 active_vertex[..., 0, :] *= out.reflection[..., None]
+            active_logdet = torch.linalg.slogdet(active_vertex).logabsdet
+            d["gauge_trace_spread"] = float(active_logdet.std(unbiased=False))
             ginv = metrics.group_gauge_invariant(active_vertex, self.group).float()
             active_svd = torch.linalg.svdvals(active_vertex)
             vertex_cond = active_svd[..., 0] / active_svd[..., -1].clamp(min=cfg.eps)
@@ -3019,6 +3060,19 @@ class VFEModel(nn.Module):
             d["vertex_cond_median"] = float(vertex_cond.float().median())
             d["vertex_cond_p95"] = float(torch.quantile(vertex_cond.float(), 0.95))
             d["vertex_cond_p99"] = float(torch.quantile(vertex_cond.float(), 0.99))
+            if out.right_phi is not None:
+                right_matrix = torch.einsum(
+                    "na,aij->nij", out.right_phi.float(), self.group.generators.float(),
+                )
+                right_norm = torch.linalg.matrix_norm(right_matrix, ord="fro", dim=(-2, -1))
+                right_scale = (
+                    TRANSPORT_CLAMP_MAX_NORM / right_norm.clamp(min=cfg.eps)
+                ).clamp(max=1.0)
+                d["pos_phi_matrix_norm_p95"] = float(torch.quantile(right_norm, 0.95))
+                d["pos_phi_matrix_norm_p99"] = float(torch.quantile(right_norm, 0.99))
+                d["pos_phi_matrix_norm_max"] = float(right_norm.max())
+                d["pos_phi_exp_clamp_frac"] = float((right_scale < 1.0).float().mean())
+                d["pos_phi_exp_scale_min"] = float(right_scale.min())
 
         # Belief covariance conditioning + PD margin (effective_rank is blind to one collapsing mode).
         bs = metrics.belief_spectrum(out.sigma, diagonal=_diag, eps=cfg.eps)
@@ -3120,7 +3174,8 @@ class VFEModel(nn.Module):
         enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
         belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
                              omega=enc.omega[0] if enc.omega is not None else None,   # carry the GL(K) frame under omega_direct
-                             reflection=enc.reflection[0] if enc.reflection is not None else None)   # carry the phi-path reflection sign
+                             reflection=enc.reflection[0] if enc.reflection is not None else None,
+                             right_phi=self._pos_phi_right(enc.phi[0]))
         model_phi = self._resolve_model_frame(token_ids[:1], belief.phi.unsqueeze(0))
         n = belief.mu.shape[0]
         rope = self._rope_rotation(n, token_ids.device)
@@ -3182,6 +3237,7 @@ class VFEModel(nn.Module):
                 gauge_parameterization=cfg.gauge_parameterization,
                 omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
                 reflection=belief.reflection,                        # phi-path R_i Omega_ij R_j fold (None -> unchanged)
+                right_phi=belief.right_phi,
             )                                                        # (N, N, K, K)
             if rope is not None:
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
@@ -3252,7 +3308,8 @@ class VFEModel(nn.Module):
             enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
             belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=self._apply_pos_phi(enc.phi[0]),
                                  omega=enc.omega[0] if enc.omega is not None else None,
-                                 reflection=enc.reflection[0] if enc.reflection is not None else None)
+                                 reflection=enc.reflection[0] if enc.reflection is not None else None,
+                                 right_phi=self._pos_phi_right(enc.phi[0]))
             model_phi = self._resolve_model_frame(token_ids[:1], belief.phi.unsqueeze(0))
             n = belief.mu.shape[0]
             rope = self._rope_rotation(n, token_ids.device)
@@ -3325,6 +3382,7 @@ class VFEModel(nn.Module):
                 gauge_parameterization=cfg.gauge_parameterization,
                 omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
                 reflection=belief.reflection,                        # phi-path R_i Omega_ij R_j fold (None -> unchanged)
+                right_phi=belief.right_phi,
             )
             mu_tv = sigma_tv = None
             if rope is not None:

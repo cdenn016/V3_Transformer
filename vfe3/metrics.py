@@ -206,6 +206,7 @@ def _deterministic_triples(n_tokens: int, max_triangles: int) -> List[Tuple[int,
 def flatness_reference_statistics(
     phi:        torch.Tensor,            # (N, n_gen) or (B, N, n_gen); first batch is sampled
     generators: torch.Tensor,            # (n_gen, K, K)
+    right_phi:  Optional[torch.Tensor] = None,  # exact second vertex factor exp(Y), if present
 
     *,
     max_triangles: int   = 64,
@@ -213,16 +214,32 @@ def flatness_reference_statistics(
     eps:           float = 1e-12,
     block_dims:    Optional[List[int]] = None,
 ) -> Dict[str, float]:
-    r"""Compare fp32 and rebuilt-fp64 numerical closure of a flat vertex cocycle."""
+    r"""Compare fp32 and rebuilt-fp64 numerical closure of a flat vertex cocycle.
+
+    With ``right_phi=Y``, the measured vertex and inverse are the actual exact-composition
+    operators ``U=exp(X) exp(Y)`` and ``U^{-1}=exp(-Y) exp(-X)``.
+    """
     coordinate = phi[0] if phi.dim() == 3 else phi
     matrix64 = torch.einsum("na,aij->nij", coordinate.double(), generators.double())
     norm64 = torch.linalg.matrix_norm(matrix64, ord="fro", dim=(-2, -1))
     scale64 = (max_norm / norm64.clamp(min=eps)).clamp(max=1.0)
     matrix64 = matrix64 * scale64[..., None, None]
+    right_matrix64 = None
+    if right_phi is not None:
+        right_coordinate = right_phi[0] if right_phi.dim() == 3 else right_phi
+        right_matrix64 = torch.einsum(
+            "na,aij->nij", right_coordinate.double(), generators.double(),
+        )
+        right_norm64 = torch.linalg.matrix_norm(right_matrix64, ord="fro", dim=(-2, -1))
+        right_scale64 = (max_norm / right_norm64.clamp(min=eps)).clamp(max=1.0)
+        right_matrix64 = right_matrix64 * right_scale64[..., None, None]
     triples = _deterministic_triples(matrix64.shape[0], max_triangles)
     k_dim = matrix64.shape[-1]
 
-    def _measure(matrix: torch.Tensor) -> Tuple[
+    def _measure(
+        matrix:       torch.Tensor,
+        right_matrix: Optional[torch.Tensor],
+    ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -231,12 +248,19 @@ def flatness_reference_statistics(
         torch.Tensor,
     ]:
         from vfe3.geometry.transport import _blockwise_matrix_exp
-        exp_pos = (_blockwise_matrix_exp(matrix, block_dims)
-                   if block_dims and len(block_dims) > 1
-                   else torch.linalg.matrix_exp(matrix))
-        exp_neg = (_blockwise_matrix_exp(-matrix, block_dims)
-                   if block_dims and len(block_dims) > 1
-                   else torch.linalg.matrix_exp(-matrix))
+        def _exp(value: torch.Tensor) -> torch.Tensor:
+            return (_blockwise_matrix_exp(value, block_dims)
+                    if block_dims and len(block_dims) > 1
+                    else torch.linalg.matrix_exp(value))
+
+        left_pos = _exp(matrix)
+        left_neg = _exp(-matrix)
+        if right_matrix is None:
+            exp_pos = left_pos
+            exp_neg = left_neg
+        else:
+            exp_pos = left_pos @ _exp(right_matrix)
+            exp_neg = _exp(-right_matrix) @ left_neg
         eye = torch.eye(k_dim, device=matrix.device, dtype=matrix.dtype)
         inverse = torch.linalg.matrix_norm(exp_pos @ exp_neg - eye, ord="fro", dim=(-2, -1))
         inverse_rel = inverse / torch.linalg.matrix_norm(eye, ord="fro").clamp(min=eps)
@@ -266,8 +290,10 @@ def flatness_reference_statistics(
             inverse_rel.mean(),
         )
 
-    ha32, hr32, ca32, cr32, ia32, ir32 = _measure(matrix64.float())
-    ha64, hr64, ca64, cr64, ia64, ir64 = _measure(matrix64)
+    ha32, hr32, ca32, cr32, ia32, ir32 = _measure(
+        matrix64.float(), None if right_matrix64 is None else right_matrix64.float(),
+    )
+    ha64, hr64, ca64, cr64, ia64, ir64 = _measure(matrix64, right_matrix64)
     return {
         "numerical_holonomy_fp32_abs": float(ha32),
         "numerical_holonomy_fp32_rel": float(hr32),
@@ -282,6 +308,7 @@ def flatness_reference_statistics(
         "inverse_consistency_fp64_abs": float(ia64),
         "inverse_consistency_fp64_rel": float(ir64),
         "flatness_reference_triangles": float(len(triples)),
+        "flatness_reference_factor_count": 2.0 if right_matrix64 is not None else 1.0,
         "flatness_reference_nonfinite_count": float(sum(
             not torch.isfinite(value)
             for value in (ha32, hr32, ha64, hr64, ca32, cr32, ca64, cr64, ia32, ir32, ia64, ir64)
