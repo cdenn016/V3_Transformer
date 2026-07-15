@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-_CL100K_DATASETS = ("wiki-ja", "wiki-en")
+_CL100K_DATASETS = ("wiki-ja", "wiki-en", "wiki-ar")
 
 # Integer dtypes an on-disk token cache may hold. Uncapped loads keep any of these mapped in their
 # native width (no corpus-sized int64 copy); a capped load owns an int64 clone. Used by the cache
@@ -34,7 +34,7 @@ def default_cache_dir() -> Path:
 
 
 def _tokenizer_tag(dataset: str) -> str:
-    """Cache tokenizer tag: cl100k for wiki-ja/wiki-en, plain tiktoken (gpt2) otherwise."""
+    """Cache tokenizer tag: cl100k for multilingual wiki caches, GPT-2 otherwise."""
     return "tiktoken_cl100k" if dataset in _CL100K_DATASETS else "tiktoken"
 
 
@@ -279,7 +279,7 @@ def get_tiktoken_decoder(
 ) -> 'Optional[Callable[[Sequence[int]], str]]':
     """A ``decode(token_ids) -> str`` for ``dataset``'s tokenizer, or None if unavailable.
 
-    Uses the SAME tokenizer the cache was built with (cl100k for wiki-ja/wiki-en, gpt2 otherwise,
+    Uses the SAME tokenizer the cache was built with (cl100k for wiki-ja/wiki-en/wiki-ar, GPT-2 otherwise,
     matching :func:`_tokenizer_tag`), so generated ids map back to text consistently. Lazy-imports
     tiktoken and returns None when tiktoken is absent or the dataset has no real tokenizer (the
     synthetic period-3 anchor), letting the caller treat None as "no sample text".

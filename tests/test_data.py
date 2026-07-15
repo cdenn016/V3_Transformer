@@ -1,4 +1,6 @@
 import json
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -6,10 +8,12 @@ import torch
 
 from vfe3.data.datasets import (
     TokenWindows,
+    _tokenizer_tag,
     cache_path,
     default_cache_dir,
     get_tiktoken_decoder,
     load_cached_tokens,
+    tokenizer_vocab_size,
 )
 
 
@@ -61,6 +65,28 @@ def test_get_tiktoken_decoder_roundtrips_when_tiktoken_present():
     dec = get_tiktoken_decoder("wikitext-103")
     assert dec is not None
     assert dec([15496, 995]) == "Hello world"                  # gpt2 ids for 'Hello world'
+
+
+def test_wiki_ar_uses_cl100k_cache_and_vocab(tmp_path):
+    assert _tokenizer_tag("wiki-ar") == "tiktoken_cl100k"
+    assert tokenizer_vocab_size("wiki-ar") == 100277
+    assert cache_path("wiki-ar", "validation", cache_dir=tmp_path).name == (
+        "wiki-ar_validation_tiktoken_cl100k_tokens.pt"
+    )
+
+
+def test_multilingual_decoders_select_cl100k(monkeypatch):
+    calls = []
+    fake = SimpleNamespace(
+        get_encoding=lambda name: calls.append(name) or SimpleNamespace(
+            decode=lambda ids: ",".join(str(i) for i in ids)
+        )
+    )
+    monkeypatch.setitem(sys.modules, "tiktoken", fake)
+
+    assert get_tiktoken_decoder("wiki-ja")([1, 2]) == "1,2"
+    assert get_tiktoken_decoder("wiki-ar")([3]) == "3"
+    assert calls == ["cl100k_base", "cl100k_base"]
 
 
 def test_token_windows_rejects_short_stream():

@@ -330,6 +330,7 @@ def test_tokenizer_vocab_size_per_dataset():
     assert tokenizer_vocab_size("wikitext-103") == 50257     # gpt2
     assert tokenizer_vocab_size("wiki-en") == 100277         # cl100k
     assert tokenizer_vocab_size("wiki-ja") == 100277
+    assert tokenizer_vocab_size("wiki-ar") == 100277
 
 
 def test_validate_token_range_passes_in_range():
