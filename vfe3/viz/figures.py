@@ -21,7 +21,7 @@ import numpy as np
 from matplotlib.colors import LogNorm
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
-from vfe3.viz.text import MULTILINGUAL_SANS_SERIF, display_text, token_label
+from vfe3.viz.text import display_text, installed_multilingual_sans_serif, token_label
 
 # Wong colorblind-safe qualitative palette (used module-wide, incl. the trajectory defaults).
 _CB = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000"]
@@ -46,13 +46,14 @@ def set_publication_style() -> None:
         sns.set_palette("colorblind")
     except ImportError:
         pass
+    font_families = installed_multilingual_sans_serif()
     plt.rcParams.update({
         "figure.dpi":      200,
         "savefig.dpi":     300,
         "savefig.bbox":    "tight",
         "font.size":       10,
-        "font.family":     list(MULTILINGUAL_SANS_SERIF),
-        "font.sans-serif": list(MULTILINGUAL_SANS_SERIF),
+        "font.family":     font_families,
+        "font.sans-serif": font_families,
         "axes.titlesize":  11,
         "axes.labelsize":  10,
         "axes.grid":       True,

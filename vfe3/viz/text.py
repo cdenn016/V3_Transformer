@@ -34,6 +34,15 @@ def supports_english_linguistic_taxonomies(dataset: str) -> bool:
     return dataset not in _NON_ENGLISH_LINGUISTIC_DATASETS
 
 
+def installed_multilingual_sans_serif() -> list[str]:
+    """Return the configured fallback families that Matplotlib can resolve on this machine."""
+    from matplotlib import font_manager
+
+    installed = {entry.name for entry in font_manager.fontManager.ttflist}
+    available = [name for name in MULTILINGUAL_SANS_SERIF if name in installed]
+    return available or ["DejaVu Sans"]
+
+
 def _contains_arabic(text: str) -> bool:
     """Return whether ``text`` contains a code point from an Arabic Unicode block."""
     return any(lo <= ord(char) <= hi for char in text for lo, hi in _ARABIC_RANGES)

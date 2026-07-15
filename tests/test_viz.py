@@ -1,3 +1,4 @@
+import logging
 import warnings
 
 import numpy as np
@@ -78,6 +79,18 @@ def test_publication_style_renders_japanese_without_missing_glyph_warning():
         warnings.filterwarnings("error", message="Glyph .* missing from font.*", category=UserWarning)
         fig.canvas.draw()
     plt.close(fig)
+
+
+def test_publication_style_does_not_request_uninstalled_font_families(caplog):
+    caplog.set_level(logging.WARNING, logger="matplotlib.font_manager")
+    set_publication_style()
+    fig, ax = plt.subplots()
+    ax.text(0.5, 0.5, "日本語 and العربية")
+    fig.canvas.draw()
+    plt.close(fig)
+
+    assert "Font family" not in caplog.text
+    assert "not found" not in caplog.text
 
 
 def test_token_display_wiring_preserves_japanese_and_shapes_arabic():
