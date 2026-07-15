@@ -43,6 +43,28 @@ from vfe3.geometry.transport import (
 from vfe3.gradients.kernels import belief_gradients, mm_exact_update, uses_kernel_route
 
 
+_E_STEP_UPDATE_ALIASES = {
+    "frozen_surrogate_exact": "mm_exact",
+    "gradient":               "gradient",
+    "mm_exact":               "mm_exact",
+}
+
+
+def canonical_e_step_update(name: str) -> str:
+    r"""Return the executable updater name while preserving config serialization.
+
+    ``mm_exact`` is retained for checkpoint compatibility. The descriptive
+    ``frozen_surrogate_exact`` spelling names the same closed-form minimizer of
+    the frozen-attention, strict-pair-masked surrogate; neither spelling claims
+    a fixed point of the live self-consistent E-step.
+    """
+    try:
+        return _E_STEP_UPDATE_ALIASES[name]
+    except KeyError as exc:
+        choices = ", ".join(sorted(_E_STEP_UPDATE_ALIASES))
+        raise ValueError(f"unknown e_step_update {name!r}; expected one of: {choices}") from exc
+
+
 def _transport(
     phi:                torch.Tensor,             # (N, n_gen) or (B, N, n_gen)
     group:              GaugeGroup,
@@ -708,6 +730,7 @@ def e_step_iteration(
     ``e_step_update='mm_exact'`` (kernel route only) replaces the mu/sigma gradient + retraction
     with the closed-form precision fusion at frozen beta (``mm_exact_update``), damped by
     ``mm_damping`` in natural coordinates; the phi sub-step is untouched either way."""
+    e_step_update = canonical_e_step_update(e_step_update)
     if gauge_parameterization == "omega_direct" and e_phi_lr != 0.0:
         raise ValueError(
             "gauge_parameterization='omega_direct' does not support E-step phi updates; "

@@ -610,6 +610,11 @@ class VFE3Config:
     #     Use with phi_precond_mode='pullback_per_block' for a geometric step that is not just AdamW.
     m_gauge_update_rule:       str   = "heavy_ball"
 
+    # Optional post-M-step chart guard. After a successful optimizer step, rows whose embedded
+    # matrix Frobenius norm exceeds this radius are projected back along the same algebra ray.
+    # None preserves the historical unconstrained M-step exactly.
+    phi_mstep_max_matrix_norm: Optional[float] = None
+
     weight_decay:              float = 0.05
    
     # SEPARATE AdamW weight decay for the gauge-frame coordinate tables (phi_embed, learned
@@ -853,6 +858,25 @@ class VFE3Config:
         if not (math.isfinite(self.e_sigma_q_trust) and self.e_sigma_q_trust > 0.0):
             raise ValueError(
                 f"e_sigma_q_trust must be finite and positive, got {self.e_sigma_q_trust}"
+            )
+        if self.phi_mstep_max_matrix_norm is not None and not (
+            math.isfinite(self.phi_mstep_max_matrix_norm)
+            and self.phi_mstep_max_matrix_norm > 0.0
+        ):
+            raise ValueError(
+                "phi_mstep_max_matrix_norm must be None or finite and positive, got "
+                f"{self.phi_mstep_max_matrix_norm}"
+            )
+        if self.pos_phi_compose == "group_product" and (
+            self.gauge_parameterization != "phi"
+            or self.transport_mode != "flat"
+            or self.s_frame_mode != "tied"
+        ):
+            raise ValueError(
+                "pos_phi_compose='group_product' requires gauge_parameterization='phi', "
+                "transport_mode='flat', and s_frame_mode='tied'; got "
+                f"gauge_parameterization={self.gauge_parameterization!r}, "
+                f"transport_mode={self.transport_mode!r}, s_frame_mode={self.s_frame_mode!r}."
             )
 
         # gauge_transport ablation meta-toggle (A1 / EXP-2). Coerce the gauge-frame fields UP FRONT so
@@ -1778,7 +1802,11 @@ class VFE3Config:
         _require(self.phi_retract_mode, tuple(sorted(_COMPOSE)), "phi_retract_mode")
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
-        _require(self.pos_phi_compose, tuple(sorted(_COMPOSE)), "pos_phi_compose")
+        _require(
+            self.pos_phi_compose,
+            tuple(sorted(set(_COMPOSE) | {"group_product"})),
+            "pos_phi_compose",
+        )
         # bch_pe_order gates the Dynkin corrections in compose_bch (they apply only at order >= 1);
         # order 0 leaves Z = X + Y -- plain additive composition still labeled 'bch' (audit
         # 2026-07-01 F12). Guarded on pos_phi != 'none' because _apply_pos_phi returns early there
@@ -2506,8 +2534,15 @@ class VFE3Config:
         _require(self.amp_dtype, (None, "bf16", "fp16"), "amp_dtype")
 
         # --- Tier-1/Tier-2 improvement toggles (2026-07-05) ---
-        _require(self.e_step_update, ("gradient", "mm_exact"), "e_step_update")
-        if self.e_step_update == "mm_exact":
+        _require(
+            self.e_step_update,
+            ("gradient", "mm_exact", "frozen_surrogate_exact"),
+            "e_step_update",
+        )
+        canonical_e_step_update = (
+            "mm_exact" if self.e_step_update == "frozen_surrogate_exact" else self.e_step_update
+        )
+        if canonical_e_step_update == "mm_exact":
             # The closed-form MM minimizer is derived from the diagonal-Gaussian KL filtering
             # kernel; every other route lacks the closed form (the same eligibility predicate as
             # uses_kernel_route).
