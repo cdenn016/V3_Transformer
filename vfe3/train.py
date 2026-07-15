@@ -35,6 +35,7 @@ from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.data.datasets import make_dataloader
 from vfe3.ema import EMA
 from vfe3.free_energy import attention_tau
+from vfe3.gauge_optim import project_phi_parameter_rows_
 from vfe3.model.block import _as_coeff
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
@@ -684,6 +685,13 @@ def train_step(
     _cfg = model.cfg
     if did_step and _cfg.learnable_r and _cfg.r_update_mode == "barycenter":
         model.prior_bank.barycenter_r_()   # gated with the optimizer step: never M-step on poisoned grads
+    if did_step and _cfg.phi_mstep_max_matrix_norm is not None:
+        projection_stats = project_phi_parameter_rows_(
+            model,
+            _cfg.phi_mstep_max_matrix_norm,
+        )
+        if metrics_out is not None:
+            metrics_out.update(projection_stats)
     scheduler.step()                       # UNCONDITIONAL: resume rebuilds LambdaLR at last_epoch=start_step-1
     #                                        assuming exactly one scheduler.step per loop iteration
     return step_loss
@@ -1422,6 +1430,19 @@ def train(
                             "grad_scale", "grad_accum_tok_spread"):
                     if _gk in step_metrics:
                         row[_gk] = step_metrics[_gk]
+            if cfg.phi_mstep_max_matrix_norm is not None:
+                for _pk in (
+                    "phi_chart_projected_rows",
+                    "phi_chart_total_rows",
+                    "phi_chart_projected_fraction",
+                    "phi_chart_preproject_max",
+                    "phi_chart_projection_scale_min",
+                ):
+                    row[_pk] = (
+                        step_metrics.get(_pk, float("nan"))
+                        if step_metrics is not None
+                        else float("nan")
+                    )
             # Gauge M-step geometry diagnostics (D1/EXP-8): cos(nat,grad) and the pullback metric
             # condition number, stashed by GaugeNaturalGradAdamW on this (log/eval) step. Written with a
             # FIXED key set per run (NaN default, like the _VAL_DIAG_KEYS block below) so the columns are

@@ -1285,6 +1285,9 @@ def plot_geometry_health(
         {"title": "Exponential chart guard", "ylabel": "fraction / scale", "series": [
             ("phi_exp_clamp_frac", "clamped fraction", _CB[1]),
             ("phi_exp_scale_min", "minimum scale", _CB[2])]},
+        {"title": "Projected M-step chart", "ylabel": "fraction / scale", "series": [
+            ("phi_chart_projected_fraction", "projected fraction", _CB[1]),
+            ("phi_chart_projection_scale_min", "minimum scale", _CB[2])]},
         {"title": "Vertex conditioning", "ylabel": r"$\kappa(\exp\phi)$", "logy": True,
          "series": [
             ("vertex_cond_median", "median", _CB[0]),

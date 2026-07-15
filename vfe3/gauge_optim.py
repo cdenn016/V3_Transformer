@@ -38,6 +38,71 @@ import torch
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient, pullback_metric_per_block
 
 
+@torch.no_grad()
+def project_phi_parameter_rows_(
+    model:           torch.nn.Module,
+    max_matrix_norm: float,
+
+    *,
+    chunk_rows:      int = 64,
+) -> Dict[str, float]:
+    r"""Project every trainable phi-table row to an embedded Frobenius-norm ball.
+
+    Projection rescales algebra coordinates along their current ray and deliberately leaves
+    optimizer moments unchanged. It covers belief token frames, independent model-channel frames,
+    and both learned positional tables when present.
+    """
+    if not torch.isfinite(torch.tensor(max_matrix_norm)) or max_matrix_norm <= 0.0:
+        raise ValueError(
+            f"max_matrix_norm must be finite and positive, got {max_matrix_norm}"
+        )
+    if type(chunk_rows) is not int or chunk_rows < 1:
+        raise ValueError(f"chunk_rows must be a positive int, got {chunk_rows!r}")
+    tables = [
+        getattr(model.prior_bank, "phi_embed", None),
+        getattr(model.prior_bank, "s_phi_embed", None),
+        getattr(model, "pos_phi_free", None),
+        getattr(model, "s_pos_phi_free", None),
+    ]
+    unique = []
+    seen = set()
+    for table in tables:
+        if table is not None and id(table) not in seen:
+            unique.append(table)
+            seen.add(id(table))
+
+    generators = model.group.generators
+    total_rows = 0
+    projected_rows = 0
+    norm_max_before = 0.0
+    minimum_scale = 1.0
+    for table in unique:
+        rows = table.reshape(-1, table.shape[-1])
+        if rows.shape[-1] != generators.shape[0]:
+            raise ValueError(
+                "phi chart projection requires full generator coordinates; got table width "
+                f"{rows.shape[-1]} and {generators.shape[0]} generators"
+            )
+        basis = generators.to(device=rows.device, dtype=rows.dtype)
+        total_rows += rows.shape[0]
+        for start in range(0, rows.shape[0], chunk_rows):
+            chunk = rows[start : start + chunk_rows]
+            embedded = torch.einsum("ra,aij->rij", chunk, basis)
+            norm = torch.linalg.matrix_norm(embedded, ord="fro", dim=(-2, -1))
+            scale = (max_matrix_norm / norm.clamp(min=1e-12)).clamp(max=1.0)
+            projected_rows += int((scale < 1.0).sum())
+            norm_max_before = max(norm_max_before, float(norm.max()))
+            minimum_scale = min(minimum_scale, float(scale.min()))
+            chunk.mul_(scale.unsqueeze(-1))
+    return {
+        "phi_chart_projected_rows":     float(projected_rows),
+        "phi_chart_total_rows":         float(total_rows),
+        "phi_chart_projected_fraction": projected_rows / max(total_rows, 1),
+        "phi_chart_preproject_max":     norm_max_before,
+        "phi_chart_projection_scale_min": minimum_scale,
+    }
+
+
 def _polar_orthogonalize(
     U: torch.Tensor,                      # (..., K, K) possibly drifted-off-O(K) element
 ) -> torch.Tensor:                        # (..., K, K) nearest orthogonal matrix

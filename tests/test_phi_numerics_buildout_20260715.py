@@ -3,6 +3,7 @@
 import torch
 
 from vfe3.config import VFE3Config
+from vfe3.gauge_optim import project_phi_parameter_rows_
 from vfe3.geometry.groups import get_group
 from vfe3.metrics import (
     bch_fidelity_statistics,
@@ -11,6 +12,7 @@ from vfe3.metrics import (
 )
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import collect_phi_numerics
+from vfe3.train import build_optimizer, train_step
 
 
 def _gl2():
@@ -82,3 +84,66 @@ def test_final_phi_numerics_collects_flatness_and_bch_without_state_change() -> 
     assert torch.equal(torch.get_rng_state(), rng_before)
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, state_before[name], rtol=0.0, atol=0.0)
+
+
+def test_project_phi_rows_bounds_all_belief_and_model_frame_tables() -> None:
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=1,
+        max_seq_len=4,
+        n_layers=1,
+        prior_source="model_channel",
+        s_frame_mode="phi_tilde",
+        s_e_step=True,
+        lambda_h=1.0,
+        lambda_gamma=1.0,
+        pos_phi="learned",
+    )
+    model = VFEModel(cfg)
+    tables = [
+        model.prior_bank.phi_embed,
+        model.prior_bank.s_phi_embed,
+        model.pos_phi_free,
+        model.s_pos_phi_free,
+    ]
+    with torch.no_grad():
+        for table in tables:
+            table.fill_(5.0)
+
+    stats = project_phi_parameter_rows_(model, 2.0, chunk_rows=3)
+
+    for table in tables:
+        embedded = torch.einsum("...a,aij->...ij", table, model.group.generators)
+        assert float(
+            torch.linalg.matrix_norm(embedded, ord="fro", dim=(-2, -1)).max().detach()
+        ) <= 2.0 + 1e-5
+    assert stats["phi_chart_projected_fraction"] == 1.0
+    assert stats["phi_chart_projected_rows"] == sum(table.shape[0] for table in tables)
+
+
+def test_disabled_chart_projection_is_not_called(monkeypatch) -> None:
+    import vfe3.train as train_module
+
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=1,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        pos_phi="none",
+        phi_mstep_max_matrix_norm=None,
+    )
+    model = VFEModel(cfg)
+    optimizer = build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    tokens = torch.tensor([[0, 1, 2, 3]])
+    targets = torch.tensor([[1, 2, 3, 4]])
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("disabled projection was called")
+
+    monkeypatch.setattr(train_module, "project_phi_parameter_rows_", _unexpected)
+    train_step(model, optimizer, scheduler, tokens, targets)

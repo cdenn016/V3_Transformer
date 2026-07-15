@@ -2091,6 +2091,7 @@ def _save_figures(
             "phi_matrix_norm_p95", "phi_matrix_norm_p99", "phi_matrix_norm_max",
             "phi_exp_clamp_frac", "phi_exp_scale_min",
             "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
+            "phi_chart_projected_fraction", "phi_chart_projection_scale_min",
             "belief_cond_p95", "belief_cond_max", "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
             "fisher_trace_mean", "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
             "guard_energy_klmax_frac", "guard_selfdiv_klmax_frac", "nonfinite_frac", "renyi_band_frac",
