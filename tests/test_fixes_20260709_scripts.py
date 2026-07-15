@@ -220,8 +220,9 @@ def test_generate_efe_selects_dataset_tokenizer(monkeypatch):
     generate_efe._tokenizer_for_dataset("wikitext-103", vocab_size=50257)
     generate_efe._tokenizer_for_dataset("wiki-en", vocab_size=100277)
     generate_efe._tokenizer_for_dataset("wiki-ja", vocab_size=100277)
+    generate_efe._tokenizer_for_dataset("wiki-ar", vocab_size=100277)
 
-    assert calls == ["gpt2", "cl100k_base", "cl100k_base"]
+    assert calls == ["gpt2", "cl100k_base", "cl100k_base", "cl100k_base"]
 
 
 def test_generate_efe_rejects_tokenizer_vocab_mismatch(monkeypatch):

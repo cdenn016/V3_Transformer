@@ -13,6 +13,7 @@ from vfe3.data.datasets import (
     default_cache_dir,
     get_tiktoken_decoder,
     load_cached_tokens,
+    tiktoken_encoding_name,
     tokenizer_vocab_size,
 )
 
@@ -69,6 +70,7 @@ def test_get_tiktoken_decoder_roundtrips_when_tiktoken_present():
 
 def test_wiki_ar_uses_cl100k_cache_and_vocab(tmp_path):
     assert _tokenizer_tag("wiki-ar") == "tiktoken_cl100k"
+    assert tiktoken_encoding_name("wiki-ar") == "cl100k_base"
     assert tokenizer_vocab_size("wiki-ar") == 100277
     assert cache_path("wiki-ar", "validation", cache_dir=tmp_path).name == (
         "wiki-ar_validation_tiktoken_cl100k_tokens.pt"

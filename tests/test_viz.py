@@ -57,6 +57,7 @@ from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.viz import extract
 from vfe3.viz import figures as figures_mod
+from vfe3.viz.text import installed_multilingual_sans_serif
 
 
 def _saved_nonempty(path):
@@ -66,9 +67,9 @@ def _saved_nonempty(path):
 def test_set_publication_style_runs():
     set_publication_style()
     assert plt.rcParams["savefig.dpi"] == 300
-    assert "Yu Gothic" in plt.rcParams["font.family"]
-    assert "Yu Gothic" in plt.rcParams["font.sans-serif"]
-    assert "Noto Sans Arabic" in plt.rcParams["font.sans-serif"]
+    expected = installed_multilingual_sans_serif()
+    assert list(plt.rcParams["font.family"]) == expected
+    assert list(plt.rcParams["font.sans-serif"]) == expected
 
 
 def test_publication_style_renders_japanese_without_missing_glyph_warning():

@@ -39,6 +39,12 @@ def _tokenizer_tag(dataset: str) -> str:
 
 
 _TOKENIZER_VOCAB_SIZE = {"tiktoken": 50257, "tiktoken_cl100k": 100277}
+_TIKTOKEN_ENCODING_NAME = {"tiktoken": "gpt2", "tiktoken_cl100k": "cl100k_base"}
+
+
+def tiktoken_encoding_name(dataset: str) -> str:
+    """Return the tiktoken encoding used to build ``dataset``'s cache."""
+    return _TIKTOKEN_ENCODING_NAME[_tokenizer_tag(dataset)]
 
 
 def tokenizer_vocab_size(dataset: str) -> int:
@@ -290,7 +296,7 @@ def get_tiktoken_decoder(
         import tiktoken
     except ImportError:
         return None
-    enc = tiktoken.get_encoding("cl100k_base" if dataset in _CL100K_DATASETS else "gpt2")
+    enc = tiktoken.get_encoding(tiktoken_encoding_name(dataset))
     return lambda ids: enc.decode([int(t) for t in ids])
 
 

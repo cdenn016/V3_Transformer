@@ -35,6 +35,7 @@ from typing import Any, Mapping, Optional, Tuple
 import torch
 
 from vfe3.config import config_from_serialized
+from vfe3.data.datasets import tiktoken_encoding_name
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import semantic_config_fingerprint
 
@@ -70,7 +71,6 @@ _POLICY_FIELDS = ("policy_mode", "policy_preference", "policy_score_terms",
                   "policy_top_k", "policy_precision", "policy_horizon",
                   "policy_ambiguity_mode", "policy_sigma_mc_samples",
                   "policy_sigma_ambiguity_validated", "policy_sigma_gate_artifact")
-_CL100K_DATASETS = frozenset({"wiki-en", "wiki-ja"})
 
 
 def _bound_config(
@@ -159,7 +159,7 @@ def _tokenizer_for_dataset(
 ) -> Any:
     """Load the cache-compatible tokenizer and require its vocabulary to match the model."""
     import tiktoken
-    encoding_name = "cl100k_base" if dataset in _CL100K_DATASETS else "gpt2"
+    encoding_name = tiktoken_encoding_name(dataset)
     enc = tiktoken.get_encoding(encoding_name)
     if enc.n_vocab != vocab_size:
         raise ValueError(
