@@ -40,6 +40,37 @@ def _model_device(model) -> torch.device:
     return model.prior_bank.mu_embed.device
 
 
+def _validate_bank_caps(
+    *,
+    max_tokens:    Optional[int],
+    max_sequences: Optional[int],
+) -> None:
+    """Reject ambiguous or empty belief-bank population requests."""
+    if max_tokens is not None and max_sequences is not None:
+        raise ValueError("max_tokens and max_sequences are mutually exclusive")
+    if max_tokens is not None and max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+    if max_sequences is not None and max_sequences <= 0:
+        raise ValueError("max_sequences must be positive")
+
+
+def _slice_bank_to_cap(
+    bank: Dict[str, torch.Tensor],
+
+    *,
+    max_tokens:    Optional[int],
+    max_sequences: Optional[int],
+) -> Dict[str, torch.Tensor]:
+    """Slice every token-aligned bank field to the requested exact population."""
+    if max_tokens is not None:
+        limit = min(max_tokens, bank["token_ids"].shape[0])
+    elif max_sequences is not None:
+        limit = int((bank["seq_idx"] < max_sequences).sum().item())
+    else:
+        return bank
+    return {key: value[:limit] for key, value in bank.items()}
+
+
 def _snapshot_sequence(belief: BeliefState, index: int = 0) -> BeliefState:
     r"""Select one batch row while preserving every optional belief/frame channel."""
     return belief._replace(
@@ -287,6 +318,7 @@ def belief_bank(
 
     *,
     device:         Optional[torch.device] = None,
+    max_tokens:     Optional[int]          = None,
     max_sequences:  Optional[int]          = None,
 ) -> Dict[str, torch.Tensor]:
     r"""Collect converged beliefs (mu, Sigma, phi) over many sequences into one bank.
@@ -295,15 +327,18 @@ def belief_bank(
     with the SAME per-block head_mixer / cg_coupling / block_norm the training forward applies,
     mirroring forward up to the stack's handoff belief; only final-norm decode prep is omitted) and
     stacks the per-token converged ``mu`` (M, K), ``sigma`` (M, K) or (M, K, K), ``phi``
-    (M, n_gen), with ``token_ids`` (M,) and ``seq_idx`` (M,). Feeds the mu / Sigma / phi UMAP
-    triptych and the at-scale clustering scores.
+    (M, n_gen), with ``token_ids`` (M,), ``seq_idx`` (M,), and within-sequence ``pos_idx``
+    (M,). ``max_tokens`` and ``max_sequences`` are mutually exclusive; either cap is applied
+    exactly to every aligned field. Feeds the mu / Sigma / phi UMAP triptych and the at-scale
+    clustering scores.
     """
     from vfe3.model.stack import vfe_stack
+    _validate_bank_caps(max_tokens=max_tokens, max_sequences=max_sequences)
     device = device or _model_device(model)
     cfg = model.cfg
     was_training = model.training
     model.eval()
-    mus, sigmas, phis, tids, sidx = [], [], [], [], []
+    mus, sigmas, phis, tids, sidx, pidx = [], [], [], [], [], []
     seq_counter = 0
     try:
         for tokens in token_batches:
@@ -344,19 +379,28 @@ def belief_bank(
             phis.append(out.phi.reshape(b * n, -1))
             tids.append(tokens.reshape(b * n))
             sidx.append(torch.arange(seq_counter, seq_counter + b, device=device).repeat_interleave(n))
+            pidx.append(torch.arange(n, device=device).repeat(b))
             seq_counter += b
-            if max_sequences is not None and seq_counter >= max_sequences:
+            token_count = sum(batch.shape[0] for batch in tids)
+            if ((max_tokens is not None and token_count >= max_tokens)
+                    or (max_sequences is not None and seq_counter >= max_sequences)):
                 break
     finally:
         if was_training:
             model.train()
-    return {
+    bank = {
         "mu":        torch.cat(mus),
         "sigma":     torch.cat(sigmas),
         "phi":       torch.cat(phis),
         "token_ids": torch.cat(tids),
         "seq_idx":   torch.cat(sidx),
+        "pos_idx":   torch.cat(pidx),
     }
+    return _slice_bank_to_cap(
+        bank,
+        max_tokens=max_tokens,
+        max_sequences=max_sequences,
+    )
 
 
 @torch.no_grad()
@@ -925,6 +969,7 @@ def model_channel_bank(
 
     *,
     device:         Optional[torch.device] = None,
+    max_tokens:     Optional[int]          = None,
     max_sequences:  Optional[int]          = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
     r"""Collect the model-channel beliefs s_i over many sequences -- the bank for the model-channel UMAP.
@@ -933,20 +978,21 @@ def model_channel_bank(
     for each batch it looks up the static model-channel belief ``s_i = N(s_mu, s_sigma)`` via ``encode_s``,
     and -- when ``s_e_step`` -- refines it through the s E-step (so s is position-dependent, exactly as the
     belief bank's q is), then stacks the per-token ``mu = s_mu`` (M, K) and ``sigma = s_sigma`` (M, K) with
-    ``token_ids`` (M,) and ``seq_idx`` (M,). Under ``s_frame_mode='phi_tilde'`` the bank also carries
-    the independently resolved model frame ``phi`` (M, n_gen), enabling a model-frame UMAP. Tied mode
-    omits that duplicate channel and preserves the existing bank/output contract. Feeds
+    ``token_ids`` (M,), ``seq_idx`` (M,), and within-sequence ``pos_idx`` (M,). Under
+    ``s_frame_mode='phi_tilde'`` the bank also carries the independently resolved model frame
+    ``phi`` (M, n_gen), enabling a model-frame UMAP. Tied mode omits that duplicate channel. Feeds
     ``plot_belief_umap`` directly, so the redesigned cluster-and-distinctive-token view applies to the
     slow channel.
     NB i and j are token POSITIONS, not separate channels: this single bank embeds every s_i (all positions);
     the i<->j pairing lives only in the gamma_ij model-coupling attention (see :func:`gamma_attention`).
     """
+    _validate_bank_caps(max_tokens=max_tokens, max_sequences=max_sequences)
     if not model._model_channel_active:
         return None
     device = device or _model_device(model)
     was_training = model.training
     model.eval()
-    mus, sigmas, phis, tids, sidx = [], [], [], [], []
+    mus, sigmas, phis, tids, sidx, pidx = [], [], [], [], [], []
     seq_counter = 0
     try:
         for tokens in token_batches:
@@ -968,8 +1014,11 @@ def model_channel_bank(
                 phis.append(model_phi.reshape(b * n, -1))
             tids.append(tokens.reshape(b * n))
             sidx.append(torch.arange(seq_counter, seq_counter + b, device=device).repeat_interleave(n))
+            pidx.append(torch.arange(n, device=device).repeat(b))
             seq_counter += b
-            if max_sequences is not None and seq_counter >= max_sequences:
+            token_count = sum(batch.shape[0] for batch in tids)
+            if ((max_tokens is not None and token_count >= max_tokens)
+                    or (max_sequences is not None and seq_counter >= max_sequences)):
                 break
     finally:
         if was_training:
@@ -979,10 +1028,15 @@ def model_channel_bank(
         "sigma":     torch.cat(sigmas),
         "token_ids": torch.cat(tids),
         "seq_idx":   torch.cat(sidx),
+        "pos_idx":   torch.cat(pidx),
     }
     if phis:
         bank["phi"] = torch.cat(phis)
-    return bank
+    return _slice_bank_to_cap(
+        bank,
+        max_tokens=max_tokens,
+        max_sequences=max_sequences,
+    )
 
 
 def _vocab_display_panel(

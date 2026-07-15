@@ -36,6 +36,9 @@ from vfe3.viz import extract
 from vfe3.viz import figures as figs
 
 
+CONTROLLED_BANK_TOKENS = 16_384
+
+
 def _load_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
     r"""Rebuild ``(cfg, dataset)`` from ``run_dir/config.json`` (the RunArtifacts metadata)."""
     data = json.loads((run_dir / "config.json").read_text())
@@ -97,12 +100,32 @@ def _collect_token_batches(
     return out
 
 
+def _resolve_bank_budget(
+    cfg: VFE3Config,
+
+    *,
+    max_tokens:    Optional[int],
+    max_sequences: Optional[int],
+) -> 'tuple[Optional[int], Optional[int], int]':
+    """Resolve the exact bank cap and number of loader batches needed to satisfy it."""
+    extract._validate_bank_caps(max_tokens=max_tokens, max_sequences=max_sequences)
+    if max_tokens is None and max_sequences is None:
+        max_tokens = CONTROLLED_BANK_TOKENS
+    if max_tokens is not None:
+        tokens_per_batch = max(int(cfg.batch_size) * int(cfg.max_seq_len), 1)
+        n_batches = max(1, -(-max_tokens // tokens_per_batch))
+    else:
+        n_batches = max(1, -(-int(max_sequences) // max(int(cfg.batch_size), 1)))
+    return max_tokens, max_sequences, n_batches
+
+
 def generate_figures(
     run_dir:       'str | Path',
 
     *,
     split:         str                         = "validation",
-    max_sequences: int                         = 64,
+    max_tokens:    Optional[int]               = None,
+    max_sequences: Optional[int]               = None,
     allow_large:   bool                        = False,
     model:         Optional[torch.nn.Module]   = None,   # skip the reload; drive this live model
     loader:        Optional[object]            = None,   # skip the default loader build
@@ -116,11 +139,13 @@ def generate_figures(
     ``run_dir/best_model.pt``; pass ``model`` to drive a live in-memory model instead (the test
     path, and any post-train call that still holds the weights). ``loader`` defaults to a stable
     unshuffled loader for the run's dataset (raises if the cache is absent; pass ``loader`` to override).
-    ``max_sequences`` caps the belief bank that feeds the UMAP triptych. ``allow_large`` opts into
-    the two full-vocabulary extractors when their estimated logits-plus-probabilities peak exceeds
-    8 GB; lighter inputs and figures still run when they are skipped. ``n_e_steps`` overrides the
-    E-step trace length (default: the trained ``cfg.n_e_steps``). Returns the figure paths actually
-    written (best-effort: a failed figure is logged and omitted).
+    When both population caps are omitted, the belief/model banks use the controlled default of
+    exactly 16,384 tokens. Explicit ``max_sequences`` calls preserve the exploratory compatibility
+    path; the two caps are mutually exclusive. ``allow_large`` opts into the two full-vocabulary
+    extractors when their estimated logits-plus-probabilities peak exceeds 8 GB; lighter inputs and
+    figures still run when they are skipped. ``n_e_steps`` overrides the E-step trace length
+    (default: the trained ``cfg.n_e_steps``). Returns the figure paths actually written
+    (best-effort: a failed figure is logged and omitted).
     """
     run_dir = Path(run_dir)
     figdir = run_dir / "figures"
@@ -152,7 +177,11 @@ def generate_figures(
 
     if loader is None:
         loader = _build_loader(dataset, cfg, split)
-    n_batches = max(2, -(-max_sequences // max(cfg.batch_size, 1)))    # ceil-div, >= 2 for the bank
+    max_tokens, max_sequences, n_batches = _resolve_bank_budget(
+        cfg,
+        max_tokens=max_tokens,
+        max_sequences=max_sequences,
+    )
     token_batches = _collect_token_batches(loader, device, n_batches)
     if not token_batches:
         raise RuntimeError(f"loader for {dataset!r}/{split!r} yielded no batches")
@@ -188,7 +217,8 @@ def generate_figures(
         model, tok, n_iter=n_e_steps, snapshot=trace_snapshot), "e_step_belief_trace")
     layer_trace = _safe(lambda: extract.across_layer_belief_trace(
         model, tok, snapshot=snapshot), "across_layer_belief_trace")
-    bank        = _safe(lambda: extract.belief_bank(model, token_batches, max_sequences=max_sequences), "belief_bank")
+    bank        = _safe(lambda: extract.belief_bank(
+        model, token_batches, max_tokens=max_tokens, max_sequences=max_sequences), "belief_bank")
     cstate      = _safe(lambda: extract.converged_state(
         model, tok, snapshot=snapshot), "converged_state")
     ce_bank     = (None if skip_full_vocab else
@@ -207,7 +237,8 @@ def generate_figures(
         model, tok, snapshot=snapshot), "hyper_prior_centroid")
     h_coupling  = _safe(lambda: extract.hyper_prior_coupling(
         model, tok, snapshot=snapshot), "hyper_prior_coupling")
-    mc_bank     = _safe(lambda: extract.model_channel_bank(model, token_batches, max_sequences=max_sequences),
+    mc_bank     = _safe(lambda: extract.model_channel_bank(
+        model, token_batches, max_tokens=max_tokens, max_sequences=max_sequences),
                         "model_channel_bank")
     vstats      = (None if skip_full_vocab else
                    _safe(lambda: extract.vocab_prediction_stats(model, token_batches),
