@@ -544,6 +544,23 @@ def _step_xaxis(ax) -> None:
     ax.xaxis.set_major_formatter(FuncFormatter(_kstep))
 
 
+def _set_finite_xlim(
+    ax:     object,
+    values: object,
+) -> bool:
+    """Set finite, nondegenerate x limits; pad a singleton by at least one step."""
+    finite = _np(values).reshape(-1).astype(float)
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        return False
+    lo, hi = float(finite.min()), float(finite.max())
+    if hi <= lo:
+        pad = max(1.0, abs(lo) * 0.01)
+        lo, hi = lo - pad, hi + pad
+    ax.set_xlim(lo, hi)
+    return True
+
+
 def plot_trajectory(
     values,                              # (T,) a scalar series (loss / free energy / diagnostic)
     steps          = None,               # (T,) x-coordinates (real training step); None -> sample index
@@ -605,8 +622,7 @@ def plot_trajectory(
     if annotate_final and v.size:
         ax.annotate(f"{v[-1]:.4g}", xy=(x[-1], v[-1]), xytext=(6, 0), textcoords="offset points",
                     va="center", fontsize=8, fontweight="bold", color=color)
-    if steps is not None and v.size:
-        ax.set_xlim(float(np.min(x)), float(np.max(x)))
+    if steps is not None and v.size and _set_finite_xlim(ax, x):
         _step_xaxis(ax)
     ax.set(title=title, xlabel="training step", ylabel=ylabel)
     fig.tight_layout()
@@ -792,8 +808,7 @@ def plot_free_energy_codescent(
     ln1, = ax.plot(step, _rolling_mean(total, w), lw=2.0, color=_CB[0], label=flab)
     ax.set(xlabel="training step", ylabel="free energy F (nats/token)")
     ax.yaxis.label.set_color(_CB[0]); ax.tick_params(axis="y", colors=_CB[0])
-    if step.size:
-        ax.set_xlim(float(step.min()), float(step.max()))
+    if step.size and _set_finite_xlim(ax, step):
         _step_xaxis(ax)
     ax2 = ax.twinx()
     ax2.spines["right"].set_visible(True)                         # set_publication_style hides it by default
@@ -914,8 +929,7 @@ def plot_model_channel_terms(
         ax.plot(x, _rolling_mean(vv, w), lw=2.0, color=color, label=f"{label}  ={vv[-1]:.3g}")
     if plotted:
         ax.set_yscale("symlog", linthresh=1e-4)                   # non-negative blocks, near-zero at init
-        if step.size:
-            ax.set_xlim(float(step.min()), float(step.max()))
+        if step.size and _set_finite_xlim(ax, step):
             _step_xaxis(ax)
         ax.legend(fontsize=8, frameon=False, loc="best")
     ax.set(xlabel="training step", ylabel="model-channel F block (nats/token)",
@@ -958,8 +972,7 @@ def _grad_norm_decomp_fig(
         ax.plot(x, _rolling_mean(vv, w), lw=2.0, color=color, label=f"{label}  ={vv[-1]:.3g}")
     if roles:
         ax.set_yscale("log")
-        if step.size:
-            ax.set_xlim(float(step.min()), float(step.max()))
+        if step.size and _set_finite_xlim(ax, step):
             _step_xaxis(ax)
         ax.legend(fontsize=8, frameon=False, loc="best")
         title = f"{title} ({' / '.join(roles)})"
@@ -986,13 +999,13 @@ def plot_grad_norm_decomposition(
     inference analogue is estep_grad_norm_decomposition.
     """
     spec = [
-        ("grad_norm_mu",    r"$\|\nabla_\mu \mathcal{L}\|_2$",    _CB[0], "mu"),
-        ("grad_norm_sigma", r"$\|\nabla_\Sigma \mathcal{L}\|_2$", _CB[1], "sigma"),
-        ("grad_norm_phi",   r"$\|\nabla_\phi \mathcal{L}\|_2$",   _CB[2], "phi"),
+        ("grad_norm_mu",    r"$\|\nabla_\mu L\|_2$",    _CB[0], "mu"),
+        ("grad_norm_sigma", r"$\|\nabla_\Sigma L\|_2$", _CB[1], "sigma"),
+        ("grad_norm_phi",   r"$\|\nabla_\phi L\|_2$",   _CB[2], "phi"),
     ]
     return _grad_norm_decomp_fig(
         history, spec, "M-step gradient norm decomposition",
-        r"pre-clip $\|\nabla_\theta \mathcal{L}\|_2$ (per role)", path)
+        r"pre-clip $\|\nabla_\theta L\|_2$ (per role)", path)
 
 
 @register_figure("estep_grad_norm_decomposition")
@@ -1136,8 +1149,7 @@ def _history_dashboard(
         ax = axes[i // ncols][i % ncols]
         _series_panel(ax, history, step, p["series"], logy=bool(p.get("logy", False)))
         ax.set(xlabel="training step", ylabel=p["ylabel"], title=p["title"])
-        if step.size:
-            ax.set_xlim(float(step.min()), float(step.max()))
+        if step.size and _set_finite_xlim(ax, step):
             _step_xaxis(ax)
     for j in range(len(live), nrows * ncols):                    # blank the unused grid cells
         axes[j // ncols][j % ncols].axis("off")
@@ -1485,8 +1497,8 @@ def plot_kappa_history(
     if keep.any():
         ax.plot(step[keep], mean[keep], "o-", color=_CB[0], lw=1.7, ms=3,
                 label=rf"mean $\kappa_{{{symbol}}}$")
-        ax.set_xlim(float(step[keep].min()), float(step[keep].max()))
-        _step_xaxis(ax)
+        if _set_finite_xlim(ax, step[keep]):
+            _step_xaxis(ax)
     ax.set(xlabel="training step", ylabel=rf"$\kappa_{{{symbol}}}$",
            title=f"Learned {channel} kappa over training")
     ax.legend(fontsize=8, frameon=False, loc="best")
@@ -1536,8 +1548,7 @@ def plot_kappa_block_trajectory(
                     ax.plot(step[keep], y[keep], "o-", ms=2.5, lw=1.4,
                             color=_CB[bi % len(_CB)], label=f"b{bi}")
             _sf = step[np.isfinite(step)]
-            if _sf.size:
-                ax.set_xlim(float(_sf.min()), float(_sf.max()))
+            if _sf.size and _set_finite_xlim(ax, _sf):
                 _step_xaxis(ax)
             ax.set(xlabel="training step", ylabel=qsym,
                    title=f"{ch} {quant} per irrep block")

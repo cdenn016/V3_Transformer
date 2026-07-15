@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -53,6 +55,7 @@ from vfe3.viz.figures import (
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.viz import extract
+from vfe3.viz import figures as figures_mod
 
 
 def _saved_nonempty(path):
@@ -62,6 +65,60 @@ def _saved_nonempty(path):
 def test_set_publication_style_runs():
     set_publication_style()
     assert plt.rcParams["savefig.dpi"] == 300
+
+
+def test_finite_xlim_pads_one_point_without_warning():
+    fig, ax = plt.subplots()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        assert figures_mod._set_finite_xlim(ax, np.array([15000.0]))
+    lo, hi = ax.get_xlim()
+    assert lo < 15000.0 < hi
+    plt.close(fig)
+
+
+def test_finite_xlim_preserves_distinct_endpoints():
+    fig, ax = plt.subplots()
+    assert figures_mod._set_finite_xlim(ax, np.array([100.0, 200.0]))
+    assert ax.get_xlim() == pytest.approx((100.0, 200.0))
+    plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: figures_mod.plot_trajectory([1.0], steps=[15000.0]),
+        lambda: figures_mod.plot_model_channel_terms({
+            "step": [15000.0], "hyper_prior": [1.0],
+        }),
+        lambda: figures_mod.plot_grad_norm_decomposition({
+            "step": [15000.0], "grad_norm_mu": [1.0],
+        }),
+        lambda: figures_mod._history_dashboard(
+            {"step": [15000.0], "metric": [1.0]},
+            [{"title": "metric", "ylabel": "value",
+              "series": [("metric", "metric", "#0072B2")]}],
+            "one-point dashboard",
+            None,
+        ),
+        lambda: figures_mod.plot_kappa_history({
+            "step": [15000.0], "kappa_beta_mean": [1.0], "kappa_beta_var": [0.0],
+        }),
+        lambda: figures_mod.plot_kappa_block_trajectory({
+            "step": [15000.0], "kappa_beta_b0": [1.0], "tau_beta_b0": [1.0],
+        }),
+    ],
+    ids=("trajectory", "model-channel", "gradient", "dashboard", "kappa", "kappa-block"),
+)
+def test_one_point_step_figures_do_not_request_identical_limits(factory):
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "error",
+            message="Attempting to set identical low and high xlims.*",
+            category=UserWarning,
+        )
+        fig = factory()
+    plt.close(fig)
 
 
 def test_offset_fit_requires_four_distinct_sizes():
