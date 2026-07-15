@@ -1086,6 +1086,34 @@ def plot_estep_convergence(
     return _save(fig, path)
 
 
+@register_figure("estep_depth_sensitivity")
+def plot_estep_depth_sensitivity(
+    record: Mapping[str, object],
+
+    *,
+    path:   Optional[str] = None,
+):
+    r"""Plot current-weight CE and free energy across enabled inference depths."""
+    points = list(record.get("points", []))
+    depths = np.asarray([point["depth"] for point in points], dtype=float)
+    ce = np.asarray([point["ce"] for point in points], dtype=float)
+    free_energy = np.asarray([point["free_energy_per_token"] for point in points], dtype=float)
+    fig, ax_ce = plt.subplots(figsize=(5.6, 3.6))
+    ax_f = ax_ce.twinx()
+    ax_ce.plot(depths, ce, "o-", color=_CB[0], label="CE")
+    ax_f.plot(depths, free_energy, "s--", color=_CB[1], label="E-step F/token")
+    trained_depth = float(record.get("trained_depth", np.nan))
+    if np.isfinite(trained_depth):
+        ax_ce.axvline(trained_depth, color="#555555", ls=":", lw=1.0, label="trained depth")
+    ax_ce.set(xlabel="E-step inference iterations", ylabel="CE (nats/token)")
+    ax_f.set_ylabel("free energy (nats/token)")
+    ax_ce.set_title("Current-weight inference-depth sensitivity")
+    lines = ax_ce.lines + ax_f.lines
+    ax_ce.legend(lines, [line.get_label() for line in lines], frameon=False, fontsize=8)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
 # ---------------------------------------------------------------------------
 # History dashboards: small-multiples over metrics.csv columns the training loop
 # already logs but no standard figure surfaced (geometry / E-step / validation /
@@ -1246,12 +1274,18 @@ def plot_estep_quality(
          "series": [("estep_f_drop", "F drop", _CB[0])]},
         {"title": "Inner-loop monotonicity", "ylabel": "nondecreasing fraction",
          "series": [("estep_f_nondecreasing_frac", "nondecreasing frac", _CB[1])]},
-        {"title": "Belief residuals (last iter)", "ylabel": "step length", "logy": True, "series": [
-            ("estep_r_mu_last", r"$r_\mu$", _CB[0]),
-            ("estep_r_sigma_last", r"$r_\Sigma$ (SPD)", _CB[1]),
-            ("estep_r_phi_last", r"$r_\phi$", _CB[2])]},
+        {"title": "Configured final movement", "ylabel": "step length", "logy": True, "series": [
+            ("estep_r_mu_last", r"$q_{T-1}\to q_T$: $r_\mu$", _CB[0]),
+            ("estep_r_sigma_last", r"$q_{T-1}\to q_T$: $r_\Sigma$", _CB[1]),
+            ("estep_r_phi_last", r"$q_{T-1}\to q_T$: $r_\phi$", _CB[2])]},
+        {"title": "One-step-ahead fixed-point residual", "ylabel": "residual", "logy": True,
+         "series": [
+            ("estep_fp_mu_rms", r"$q_T\to q_{T+1}$: $\mu$ RMS", _CB[0]),
+            ("estep_fp_sigma_rms", r"$q_T\to q_{T+1}$: $\Sigma$ RMS", _CB[1]),
+            ("estep_fp_phi_rms", r"$q_T\to q_{T+1}$: $\phi$ RMS", _CB[2]),
+            ("estep_fp_kl", r"$\mathrm{KL}(q_{T+1}\Vert q_T)$", _CB[3])]},
     ]
-    return _history_dashboard(history, panels, "E-step inference quality", path, ncols=3)
+    return _history_dashboard(history, panels, "E-step inference quality", path, ncols=4)
 
 
 @register_figure("validation_sanity")

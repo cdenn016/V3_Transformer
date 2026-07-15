@@ -14,8 +14,9 @@ import torch
 import torch.nn.functional as F
 
 from vfe3 import metrics
+from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
-from vfe3.families.base import get_family
+from vfe3.families.base import get_family, kl
 from vfe3.model.block import _as_coeff, e_step_shared_kwargs   # shared cfg->kwargs bag (audit 2026-07-12 N5)
 from vfe3.free_energy import (
     attention_tau,
@@ -23,7 +24,12 @@ from vfe3.free_energy import (
     pairwise_energy,
     self_divergence_for_alpha,
 )
-from vfe3.inference.e_step import _transport, e_step_iteration, free_energy_value
+from vfe3.inference.e_step import (
+    _transport,
+    canonical_e_step_update,
+    e_step_iteration,
+    free_energy_value,
+)
 # Transport-mode state-routing sets (registry metadata, as model.py): the extractors below feed
 # mu/sigma to _transport by membership here, never by matching literal mode names.
 from vfe3.geometry.lie_ops import CompactBlockElement
@@ -454,6 +460,110 @@ def e_step_belief_trace(
         "phi":          torch.stack(phis),
         "free_energy":  torch.stack([f.reshape(()) for f in fs]),
     }
+
+
+@torch.no_grad()
+def e_step_fixed_point_diagnostics(
+    model,
+    token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+) -> Dict[str, float]:
+    r"""Measure configured movement and the distinct one-step-ahead residual.
+
+    The executable map is replayed for the configured ``T`` iterations and once more. The
+    ``estep_r_*_last`` fields retain their historical step-length definitions on
+    ``q_{T-1} -> q_T``. The ``estep_fp_*`` fields measure ``q_T -> q_{T+1}``, which is the
+    actual residual of the live state-dependent update map. For the frozen-surrogate updater,
+    ``estep_target_gap`` measures the distance from the damped next iterate to the corresponding
+    undamped frozen-surrogate minimizer.
+    """
+    cfg = model.cfg
+    belief0, log_prior, rope = _encode_one(model, token_ids)
+    mu_p, sigma_p = belief0.mu, belief0.sigma
+    ikw = _iter_kwargs(model, log_prior, rope)
+    states = [belief0]
+    belief = belief0
+    for _ in range(int(cfg.n_e_steps) + 1):
+        belief = e_step_iteration(belief, mu_p, sigma_p, model.group, **ikw)
+        states.append(belief)
+
+    q_t = states[int(cfg.n_e_steps)]
+    q_next = states[int(cfg.n_e_steps) + 1]
+    out: Dict[str, float] = {}
+    if cfg.n_e_steps > 0:
+        configured = metrics.estep_residuals(
+            torch.stack([state.mu for state in states[: cfg.n_e_steps + 1]]),
+            torch.stack([state.sigma for state in states[: cfg.n_e_steps + 1]]),
+            torch.stack([state.phi for state in states[: cfg.n_e_steps + 1]]),
+            diagonal=cfg.diagonal_covariance,
+        )
+        for name, key in (
+            ("r_mu", "estep_r_mu_last"),
+            ("r_sigma", "estep_r_sigma_last"),
+            ("r_phi", "estep_r_phi_last"),
+        ):
+            out[key] = float(configured[name][-1].mean())
+    else:
+        out.update({
+            "estep_r_mu_last":    0.0,
+            "estep_r_sigma_last": 0.0,
+            "estep_r_phi_last":   0.0,
+        })
+
+    out["estep_fp_mu_rms"] = float((q_next.mu - q_t.mu).square().mean().sqrt())
+    out["estep_fp_sigma_rms"] = float((q_next.sigma - q_t.sigma).square().mean().sqrt())
+    out["estep_fp_phi_rms"] = float((q_next.phi - q_t.phi).square().mean().sqrt())
+
+    family = get_family(cfg.family)
+    out["estep_fp_kl"] = float(kl(
+        family(q_next.mu, q_next.sigma),
+        family(q_t.mu, q_t.sigma),
+        kl_max=cfg.kl_max,
+        eps=cfg.eps,
+    ).mean())
+
+    beta_t = model._attention_map_for_belief(q_t, log_prior, rope).float().clamp(min=cfg.eps)
+    beta_next = model._attention_map_for_belief(q_next, log_prior, rope).float().clamp(min=cfg.eps)
+    beta_mid = 0.5 * (beta_t + beta_next)
+    beta_js = 0.5 * (
+        (beta_t * (beta_t.log() - beta_mid.log())).sum(dim=-1)
+        + (beta_next * (beta_next.log() - beta_mid.log())).sum(dim=-1)
+    )
+    out["estep_beta_js"] = float(beta_js.mean())
+
+    prior = family(mu_p, sigma_p)
+
+    def _alpha(state: BeliefState) -> torch.Tensor:
+        divergence = self_divergence_for_alpha(
+            family(state.mu, state.sigma),
+            prior,
+            alpha=cfg.renyi_order,
+            kl_max=cfg.kl_max,
+            eps=cfg.eps,
+            divergence_family=cfg.divergence_family,
+            lambda_alpha_mode=cfg.lambda_alpha_mode,
+        )
+        return self_coupling_alpha(
+            divergence,
+            mode=cfg.lambda_alpha_mode,
+            value=cfg.lambda_alpha,
+            b0=_as_coeff(cfg.b0, state.mu.device),
+            c0=_as_coeff(cfg.c0, state.mu.device),
+        )[0]
+
+    out["estep_alpha_rms_delta"] = float((_alpha(q_next) - _alpha(q_t)).square().mean().sqrt())
+
+    out["estep_target_gap"] = float("nan")
+    if canonical_e_step_update(cfg.e_step_update) == "mm_exact":
+        target_kwargs = dict(ikw)
+        target_kwargs["mm_damping"] = 1.0
+        q_target = e_step_iteration(q_t, mu_p, sigma_p, model.group, **target_kwargs)
+        target_mse = torch.stack([
+            (q_next.mu - q_target.mu).square().mean(),
+            (q_next.sigma - q_target.sigma).square().mean(),
+            (q_next.phi - q_target.phi).square().mean(),
+        ]).mean()
+        out["estep_target_gap"] = float(target_mse.sqrt())
+    return out
 
 
 @torch.no_grad()

@@ -776,7 +776,9 @@ _VAL_DIAG_KEYS = (
     "val_attn_entropy_min_all", "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
     "estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
-    "estep_r_phi_last", "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
+    "estep_r_phi_last", "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms",
+    "estep_fp_phi_rms", "estep_target_gap", "estep_beta_js", "estep_alpha_rms_delta",
+    "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
     "val_builder_resid",
     # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
     "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
@@ -867,6 +869,7 @@ def _val_diagnostics(
     for _nm, _key in (("r_mu", "estep_r_mu_last"), ("r_sigma", "estep_r_sigma_last"),
                       ("r_phi", "estep_r_phi_last")):
         out[_key] = float(res[_nm][-1].mean()) if res[_nm].numel() else 0.0
+    out.update(ex.e_step_fixed_point_diagnostics(model, val_tok))
 
     if val_tgt is not None:                                     # per-position within-sequence loss
         vlog = snapshot.logits                                  # (B, N, V) same captured inference path

@@ -1276,6 +1276,32 @@ def finalize_run(
             logger.info("Converged final E-step F/token: %.4f", results["estep_final_f_per_token"])
         except Exception as exc:
             logger.warning("estep final-F probe failed (%s); skipped", exc)
+
+    depth_loader = val_loader if val_loader is not None else test_loader
+    if depth_loader is not None:
+        try:
+            _batch = next(iter(depth_loader))
+            if not isinstance(_batch, (tuple, list)) or len(_batch) < 2:
+                raise ValueError("depth sensitivity requires a (tokens, targets) batch")
+            _depth_tokens = _batch[0].to(device)
+            _depth_targets = _batch[1].to(device)
+            _depth_record = collect_estep_depth_sensitivity(
+                model,
+                _depth_tokens,
+                _depth_targets,
+                depths=(0, 1, 2, 3, 5, 8),
+            )
+            artifacts.save_json("estep_depth_sensitivity.json", _depth_record)
+            from vfe3.viz.figures import plot_estep_depth_sensitivity
+            _depth_figure = plot_estep_depth_sensitivity(
+                _depth_record,
+                path=str(artifacts.run_dir / "estep_depth_sensitivity.png"),
+            )
+            if _depth_figure is not None:
+                from matplotlib import pyplot as plt
+                plt.close(_depth_figure)
+        except Exception as exc:
+            logger.warning("estep depth-sensitivity probe failed (%s); skipped", exc)
     artifacts.save_json("test_results.json", results)
 
     # Reproducibility provenance (git SHA / data hash / versions) + a scaling-law data point -- the
@@ -1361,6 +1387,62 @@ def finalize_run(
         except Exception as exc:
             logger.warning("publication figure generation failed (%s); numeric results are saved", exc)
     return results
+
+
+@torch.no_grad()
+def collect_estep_depth_sensitivity(
+    model:   torch.nn.Module,
+    tokens:  torch.Tensor,
+    targets: torch.Tensor,
+    depths:  Iterable[int],
+) -> Dict[str, object]:
+    r"""Evaluate current weights at several inference depths on one fixed batch.
+
+    This is a sensitivity probe, not a retrained-depth comparison. Model mode, configured depth,
+    and global CPU/CUDA RNG state are restored exactly before return.
+    """
+    import torch.nn.functional as F
+    from vfe3.viz.extract import e_step_belief_trace
+
+    requested = list(depths)
+    if any(type(depth) is not int or depth < 0 for depth in requested):
+        raise ValueError(f"depths must contain nonnegative integers, got {requested!r}")
+    ordered = sorted(set(requested))
+    trained_depth = int(model.cfg.n_e_steps)
+    was_training = bool(model.training)
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
+                if torch.cuda.is_available() else None)
+    points: List[Dict[str, float | int]] = []
+    try:
+        model.eval()
+        for depth in ordered:
+            model.cfg.n_e_steps = depth
+            logits = model(tokens)
+            ce = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]).float(),
+                targets.reshape(-1),
+                ignore_index=-100,
+            )
+            trace = e_step_belief_trace(model, tokens, n_iter=depth)
+            points.append({
+                "depth":                 depth,
+                "ce":                    float(ce),
+                "free_energy_per_token": float(trace["free_energy"][-1]) / max(1, int(tokens.shape[1])),
+            })
+    finally:
+        model.cfg.n_e_steps = trained_depth
+        model.train(was_training)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+    return {
+        "trained_depth": trained_depth,
+        "interpretation": (
+            "current-weight inference-depth sensitivity; depths other than trained_depth were not retrained"
+        ),
+        "points": points,
+    }
 
 
 def _restore_rng_state(
@@ -1921,7 +2003,9 @@ def _save_figures(
         # last-iter belief residuals -- the E-step evidence the single estep_f_drop curve does not show.
         hist_estep = _hist_subset((
             "estep_f_drop", "estep_f_nondecreasing_frac",
-            "estep_r_mu_last", "estep_r_sigma_last", "estep_r_phi_last"))
+            "estep_r_mu_last", "estep_r_sigma_last", "estep_r_phi_last",
+            "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms", "estep_fp_phi_rms",
+            "estep_target_gap", "estep_beta_js", "estep_alpha_rms_delta"))
         if hist_estep:
             fig = figs.plot_estep_quality(hist_estep, path=str(run / "estep_quality.png"))
             figs.plt.close(fig)
