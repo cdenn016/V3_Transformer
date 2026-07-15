@@ -98,7 +98,7 @@ DEFAULT_SEMANTIC_MANIFEST: dict[str, object] = {
          "expectation": "close", "relation_type": "cognition association"},
         {"name": "believe_remember", "concept_a": "believe", "concept_b": "remember",
          "expectation": "close", "relation_type": "cognition association"},
-        {"name": "king_blue", "concept_a": "king", "concept_b": "blue",
+        {"name": "king_jump", "concept_a": "king", "concept_b": "jump",
          "expectation": "control", "relation_type": "cross-field control"},
         {"name": "father_fly", "concept_a": "father", "concept_b": "fly",
          "expectation": "control", "relation_type": "cross-field control"},

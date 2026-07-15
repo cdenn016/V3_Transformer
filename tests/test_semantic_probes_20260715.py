@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import numpy as np
 import pytest
@@ -85,7 +86,19 @@ def test_default_manifest_identity_and_required_examples():
     pairs = {pair["name"]: pair for pair in manifest["pairs"]}
     assert pairs["king_queen"]["expectation"] == "close"
     assert pairs["father_mother"]["expectation"] == "close"
+    assert pairs["king_jump"]["expectation"] == "control"
     assert pairs["king_father"]["expectation"] == "descriptive"
+
+
+def test_default_manifest_forms_are_exact_single_gpt2_tokens():
+    tiktoken = pytest.importorskip("tiktoken")
+    encoding = tiktoken.get_encoding("gpt2")
+
+    for concept in semantic_probes.DEFAULT_SEMANTIC_MANIFEST["concepts"]:
+        for form in concept["forms"]:
+            token_ids = encoding.encode(form)
+            assert len(token_ids) == 1, (concept["name"], form, token_ids)
+            assert encoding.decode(token_ids) == form
 
 
 @pytest.mark.parametrize(
@@ -226,6 +239,7 @@ def test_evaluator_reports_field_and_aggregate_metrics():
     assert record["aggregate"]["expectations"]["close"]["resolved_pair_count"] == 2
     assert record["aggregate"]["expectations"]["control"]["resolved_pair_count"] == 2
     assert _metric_value(record["aggregate"], "control_to_close_distance_ratio") > 1.0
+    json.dumps(record, allow_nan=False)
 
 
 def test_missing_pair_endpoint_produces_explicit_null_metrics():
