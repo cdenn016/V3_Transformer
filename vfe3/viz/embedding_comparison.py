@@ -16,7 +16,7 @@ from typing import Mapping, Optional, Sequence
 import numpy as np
 
 
-SCHEMA_VERSION              = 1
+SCHEMA_VERSION              = 2
 CONTROLLED_MAX_TOKENS       = 16_384
 CONTROLLED_N_NEIGHBORS      = 32
 CONTROLLED_MIN_DIST         = 0.1
@@ -391,6 +391,8 @@ _COMPARISON_FIELDS = (
     "clustering.min_samples",
     "clustering.cluster_selection_method",
     "clustering.cluster_selection_epsilon",
+    "semantic_probes.manifest.name",
+    "semantic_probes.manifest.schema_version",
 )
 
 
@@ -474,6 +476,33 @@ def comparison_summary(
                 ),
                 "ami_sequence_identity": _metric_scalar(
                     record, "clusters.adjusted_mutual_information.sequence_identity"
+                ),
+                "semantic_field_silhouette": _metric_scalar(
+                    record, "semantic_probes.native_space.semantic_field_silhouette"
+                ),
+                "semantic_field_ami": _metric_scalar(
+                    record,
+                    "semantic_probes.clusters.semantic_field_adjusted_mutual_information",
+                ),
+                "close_pair_mean_distance_percentile": _metric_scalar(
+                    record,
+                    "semantic_probes.aggregate.expectations.close.mean_distance_percentile",
+                ),
+                "close_pair_mean_reciprocal_rank": _metric_scalar(
+                    record,
+                    "semantic_probes.aggregate.expectations.close.mean_reciprocal_rank",
+                ),
+                "close_pair_hit_at_5_rate": _metric_scalar(
+                    record,
+                    "semantic_probes.aggregate.expectations.close.hit_at_5_rate",
+                ),
+                "close_pair_mean_hdbscan_co_membership": _metric_scalar(
+                    record,
+                    "semantic_probes.aggregate.expectations.close.mean_hdbscan_co_membership",
+                ),
+                "control_to_close_distance_ratio": _metric_scalar(
+                    record,
+                    "semantic_probes.aggregate.control_to_close_distance_ratio",
                 ),
             },
         })

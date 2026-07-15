@@ -2217,7 +2217,7 @@ def plot_controlled_embedding_comparison(
             for arm in metrics
         ], dtype=float)
 
-    fig, axes = plt.subplots(2, 2, figsize=(11.2, 7.2))
+    fig, axes = plt.subplots(3, 2, figsize=(11.2, 10.0))
     width = 0.36
 
     axes[0, 0].bar(x - width / 2, values("native_silhouette_bpe"), width,
@@ -2269,6 +2269,30 @@ def plot_controlled_embedding_comparison(
     axes[1, 1].set_title("Cluster-label adjusted mutual information")
     axes[1, 1].set_ylabel("AMI (noise excluded)")
     axes[1, 1].legend(frameon=False, fontsize=7, ncol=2)
+
+    axes[2, 0].bar(x - width / 2, values("semantic_field_silhouette"), width,
+                   label="field silhouette", color=_CB[5])
+    axes[2, 0].bar(x + width / 2, values("semantic_field_ami"), width,
+                   label="field-cluster AMI", color=_CB[6])
+    axes[2, 0].axhline(0.0, color="0.35", lw=0.8)
+    axes[2, 0].set_title("Native semantic-field structure")
+    axes[2, 0].set_ylabel("within-run score")
+    axes[2, 0].legend(frameon=False, fontsize=8)
+
+    semantic_pair_keys = (
+        ("close_pair_mean_reciprocal_rank", "mean reciprocal rank"),
+        ("close_pair_hit_at_5_rate", "hit at 5"),
+        ("close_pair_mean_hdbscan_co_membership", "HDBSCAN co-membership"),
+    )
+    semantic_width = 0.8 / len(semantic_pair_keys)
+    for index, (key, label) in enumerate(semantic_pair_keys):
+        offset = (index - (len(semantic_pair_keys) - 1) / 2) * semantic_width
+        axes[2, 1].bar(x + offset, values(key), semantic_width, label=label,
+                       color=_CB[(index + 7) % len(_CB)])
+    axes[2, 1].set_ylim(0.0, 1.05)
+    axes[2, 1].set_title("Preregistered close-pair retrieval")
+    axes[2, 1].set_ylabel("mean score")
+    axes[2, 1].legend(frameon=False, fontsize=7)
 
     for ax in axes.ravel():
         ax.set_xticks(x, labels, rotation=20, ha="right")

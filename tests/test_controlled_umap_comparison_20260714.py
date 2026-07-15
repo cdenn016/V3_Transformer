@@ -433,9 +433,29 @@ def test_exploratory_plot_retains_adaptive_single_embedding(tmp_path):
 
 
 def _matching_controlled_records():
-    from vfe3.viz import embedding_comparison
+    from vfe3.viz import embedding_comparison, semantic_probes
 
-    left = embedding_comparison.controlled_embedding_record(**_controlled_record_fixture())
+    semantic = semantic_probes.unavailable_record("comparison fixture")
+    semantic["available"] = True
+    semantic["reason"] = None
+    semantic["native_space"]["semantic_field_silhouette"] = {"value": 0.4, "reason": None}
+    semantic["clusters"]["semantic_field_adjusted_mutual_information"] = {
+        "value": 0.3,
+        "reason": None,
+    }
+    close = semantic["aggregate"]["expectations"]["close"]
+    close["mean_distance_percentile"] = {"value": 12.5, "reason": None}
+    close["mean_reciprocal_rank"] = {"value": 0.75, "reason": None}
+    close["hit_at_5_rate"] = {"value": 0.8, "reason": None}
+    close["mean_hdbscan_co_membership"] = {"value": 0.6, "reason": None}
+    semantic["aggregate"]["control_to_close_distance_ratio"] = {
+        "value": 2.0,
+        "reason": None,
+    }
+    left = embedding_comparison.controlled_embedding_record(
+        **_controlled_record_fixture(),
+        semantic_probes=semantic,
+    )
     return left, copy.deepcopy(left)
 
 
@@ -471,6 +491,29 @@ def test_comparator_reports_every_mismatched_contract_field():
     assert "clustering.min_samples" in str(exc.value)
 
 
+def test_comparator_rejects_semantic_manifest_drift():
+    from vfe3.viz import embedding_comparison
+
+    left, right = _matching_controlled_records()
+    right["semantic_probes"]["manifest"]["schema_version"] = 2
+
+    with pytest.raises(ValueError, match="semantic_probes.manifest.schema_version"):
+        embedding_comparison.validate_comparison_records([left, right])
+
+
+def test_controlled_comparison_figure_has_six_metric_panels():
+    from vfe3.viz import embedding_comparison, figures
+
+    left, right = _matching_controlled_records()
+    summary = embedding_comparison.comparison_summary([left, right], ["N=256", "N=512"])
+
+    figure = figures.plot_controlled_embedding_comparison(summary)
+
+    assert len(figure.axes) == 6
+    assert all("UMAP" not in axis.get_title() for axis in figure.axes)
+    figures.plt.close(figure)
+
+
 def test_cross_run_figure_contains_metrics_not_independent_coordinates(tmp_path):
     from vfe3.viz import embedding_comparison
 
@@ -502,7 +545,16 @@ def test_cross_run_figure_contains_metrics_not_independent_coordinates(tmp_path)
         "ami_function_content",
         "ami_position_quartile",
         "ami_sequence_identity",
+        "semantic_field_silhouette",
+        "semantic_field_ami",
+        "close_pair_mean_distance_percentile",
+        "close_pair_mean_reciprocal_rank",
+        "close_pair_hit_at_5_rate",
+        "close_pair_mean_hdbscan_co_membership",
+        "control_to_close_distance_ratio",
     }
+    assert comparison["arms"][0]["metrics"]["semantic_field_silhouette"] == 0.4
+    assert comparison["arms"][0]["metrics"]["close_pair_mean_reciprocal_rank"] == 0.75
 
 
 def test_generate_figures_default_wires_controlled_sidecars(tmp_path, monkeypatch):
