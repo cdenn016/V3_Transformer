@@ -65,6 +65,22 @@ def _saved_nonempty(path):
 def test_set_publication_style_runs():
     set_publication_style()
     assert plt.rcParams["savefig.dpi"] == 300
+    assert "Yu Gothic" in plt.rcParams["font.sans-serif"]
+    assert "Noto Sans Arabic" in plt.rcParams["font.sans-serif"]
+
+
+def test_token_display_wiring_preserves_japanese_and_shapes_arabic():
+    assert figures_mod._tok_label(lambda ids: "日本語", 1) == "日本語"
+    assert figures_mod._tok_label(lambda ids: "العربية", 2) != "العربية"
+    assert figures_mod._tok_label(lambda ids: "�", 3) == "3"
+
+
+def test_non_english_cluster_labels_do_not_add_english_subword_marker():
+    assert figures_mod._lift_label_display("日本語") == "·日本語"
+    assert figures_mod._lift_label_display(
+        "日本語",
+        mark_subword_boundary=False,
+    ) == "日本語"
 
 
 def test_finite_xlim_pads_one_point_without_warning():

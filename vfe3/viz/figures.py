@@ -1,7 +1,7 @@
 r"""Publication-quality figures for VFE_3.0 diagnostics (matplotlib; UMAP / networkx / sklearn).
 
 Figure generators over beliefs (means / gauge frames), attention, covariance, and training
-trajectories. Each returns a matplotlib Figure and optionally saves it; colourblind-safe
+trajectories. Each returns a matplotlib Figure and optionally saves it; colorblind-safe
 palette and journal-ish defaults via ``set_publication_style``. The heavier dependencies
 (UMAP, networkx, scikit-learn) are imported lazily inside the function that needs them, so
 the module imports even where one is absent (the function raises a clear message instead).
@@ -21,7 +21,9 @@ import numpy as np
 from matplotlib.colors import LogNorm
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
-# Wong colourblind-safe qualitative palette (used module-wide, incl. the trajectory defaults).
+from vfe3.viz.text import MULTILINGUAL_SANS_SERIF, display_text, token_label
+
+# Wong colorblind-safe qualitative palette (used module-wide, incl. the trajectory defaults).
 _CB = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000"]
 
 # tab20 reindex for cluster coloring: the ten saturated distinct hues first, their pastels second,
@@ -38,7 +40,7 @@ def _np(x) -> np.ndarray:
 
 
 def set_publication_style() -> None:
-    """Colourblind-safe palette + journal-ish matplotlib defaults (call once)."""
+    """Colorblind-safe palette + journal-ish matplotlib defaults (call once)."""
     try:
         import seaborn as sns
         sns.set_palette("colorblind")
@@ -49,6 +51,8 @@ def set_publication_style() -> None:
         "savefig.dpi":     300,
         "savefig.bbox":    "tight",
         "font.size":       10,
+        "font.family":     "sans-serif",
+        "font.sans-serif": list(MULTILINGUAL_SANS_SERIF),
         "axes.titlesize":  11,
         "axes.labelsize":  10,
         "axes.grid":       True,
@@ -578,7 +582,7 @@ def plot_trajectory(
 ):
     r"""Line plot of a scalar trajectory over the real training step.
 
-    The x-axis is ``steps`` when given (else the sample index, so the axis is no longer mislabelled
+    The x-axis is ``steps`` when given (else the sample index, so the axis is no longer mislabeled
     as a step). A long noisy series (pass ``smooth=w``) draws a faint raw line under a centered
     ``w``-point rolling mean and no per-point markers, which a thousand-point series otherwise
     collapses into a solid band; a short series (<=50 points) keeps markers. ``logy`` is for wide-range
@@ -1644,7 +1648,7 @@ def plot_belief_trajectories(
     return _save(fig, path)
 
 
-# --- linguistic-category labelling of gpt2-BPE tokens (colour + legend for the belief UMAP) -----
+# --- linguistic-category labeling of gpt2-BPE tokens (color + legend for the belief UMAP) -----
 
 # A compact English function-word (stopword) set for the function/content taxonomy. Matched on the
 # stripped, lower-cased decoded token, so a BPE word-start (" the") and a bare token ("the") both hit.
@@ -1793,7 +1797,12 @@ def _density_peak_anchor(
         return pts[np.argmin(((pts - pts.mean(0)) ** 2).sum(1))]
 
 
-def _lift_label_display(raw: str) -> Optional[str]:
+def _lift_label_display(
+    raw: str,
+
+    *,
+    mark_subword_boundary: bool = True,
+) -> Optional[str]:
     r"""Render one decoded token for a cluster label, keeping BPE word-boundary information.
 
     The old ``strip()``-everything rendering made bare punctuation ("=", ",") read as noise and made
@@ -1808,7 +1817,7 @@ def _lift_label_display(raw: str) -> Optional[str]:
     cat = _bpe_category(raw)
     if cat == 0:                                                 # punctuation-only -> quote the glyphs
         return repr(core)
-    if cat == 4:                                                 # continuation subword -> mark boundary
+    if cat == 4 and mark_subword_boundary:                       # continuation subword -> mark boundary
         return "·" + core
     return core
 
@@ -1907,7 +1916,7 @@ def plot_belief_umap(
     member (:func:`_density_peak_anchor`) and a legend row -- number, color swatch, distinctive tokens
     by smoothed log-odds enrichment (:func:`_cluster_lift_labels`), and size -- replacing the old
     margin callouts whose full-span placement produced whole-plot leader lines. A dominant cluster
-    whose top token is not actually distinctive (raw lift < 1.5, or >25% of the bank) is labelled
+    whose top token is not actually distinctive (raw lift < 1.5, or >25% of the bank) is labeled
     "mixed core" instead of enrichment junk. Thin gray contours show DISPLAY-SPACE point density
     (overplotting relief only -- 2-D UMAP does not preserve feature-space density); per-cluster point
     size/alpha scale with population so the core stays translucent. The parameter footer states the
@@ -2080,7 +2089,7 @@ def plot_belief_umap(
     for rank, c, lab, n_c in rows:
         txt = lab if len(lab) <= 34 else lab[:33] + "…"
         fig.text(0.700, y, "■", color=col[c], fontsize=9, va="center")
-        fig.text(0.716, y, f"{rank}. {txt}", fontsize=8, va="center")
+        fig.text(0.716, y, display_text(f"{rank}. {txt}"), fontsize=8, va="center")
         fig.text(0.716, y - 0.022, f"n={n_c:,} ({n_c / M:.0%})", fontsize=6.5, color="0.4", va="center")
         y -= 0.055
     if len(cl) > n_clusters_label:                               # no silent cap
@@ -3116,16 +3125,7 @@ def plot_inference_capacity(
 
 def _tok_label(decode, tid) -> str:
     r"""A short printable label for vocab id ``tid`` (decoded text, or the id with no decoder)."""
-    if decode is None:
-        return str(int(tid))
-    try:
-        s = decode([int(tid)])
-    except Exception:
-        return str(int(tid))
-    if s == "" or s.isspace():
-        return {" ": "·", "\n": "\\n", "\t": "\\t"}.get(s, "␣")  # show whitespace visibly
-    s = s.replace("\n", "\\n")
-    return s if len(s) <= 12 else s[:11] + "…"
+    return token_label(int(tid), decode=decode)
 
 
 @register_figure("vocab_probability_heatmap")
