@@ -25,7 +25,7 @@ import json
 import logging
 from dataclasses import asdict
 from pathlib import Path
-from typing import Callable, List, Mapping, Optional
+from typing import Callable, List, Mapping, Optional, Sequence
 
 import torch
 
@@ -33,6 +33,7 @@ from vfe3 import metrics
 from vfe3.config import VFE3Config, config_from_serialized
 from vfe3.run_artifacts import semantic_config_fingerprint
 from vfe3.viz import extract
+from vfe3.viz import embedding_comparison
 from vfe3.viz import figures as figs
 
 
@@ -182,6 +183,7 @@ def generate_figures(
         max_tokens=max_tokens,
         max_sequences=max_sequences,
     )
+    controlled_bank = max_tokens is not None
     token_batches = _collect_token_batches(loader, device, n_batches)
     if not token_batches:
         raise RuntimeError(f"loader for {dataset!r}/{split!r} yielded no batches")
@@ -353,17 +355,45 @@ def generate_figures(
           h_coupling is not None)
     model_channels = (("mu", "sigma", "phi")
                       if mc_bank is not None and "phi" in mc_bank else ("mu", "sigma"))
+    belief_controlled_ready = (
+        not controlled_bank
+        or (bank is not None and bank["token_ids"].shape[0] == max_tokens)
+    )
+    model_controlled_ready = (
+        not controlled_bank
+        or (mc_bank is not None and mc_bank["token_ids"].shape[0] == max_tokens)
+    )
+    if controlled_bank and bank is not None and not belief_controlled_ready:
+        logger.warning(
+            "controlled belief UMAP skipped: requested %d tokens but loader supplied %d",
+            max_tokens,
+            bank["token_ids"].shape[0],
+        )
+    if controlled_bank and mc_bank is not None and not model_controlled_ready:
+        logger.warning(
+            "controlled model UMAP skipped: requested %d tokens but loader supplied %d",
+            max_tokens,
+            mc_bank["token_ids"].shape[0],
+        )
     with figs.UMAPWorker() as umap_worker:
         for ch in ("mu", "sigma", "phi"):                         # one UMAP per belief channel
             _emit(f"belief_umap_{ch}",
                   lambda p, ch=ch: figs.plot_belief_umap(
-                      bank, ch, decode=decode, umap_worker=umap_worker, path=p),
-                  bank is not None)
+                      bank, ch, decode=decode, controlled=controlled_bank,
+                      seeds=(embedding_comparison.CONTROLLED_SEEDS if controlled_bank else None),
+                      umap_worker=umap_worker, path=p,
+                      sidecar_path=(str(figdir / f"belief_umap_{ch}.json")
+                                    if controlled_bank else None)),
+                  bank is not None and belief_controlled_ready)
         for ch in model_channels:                                  # phi only for independent phi_tilde
             _emit(f"model_umap_{ch}",
                   lambda p, ch=ch: figs.plot_belief_umap(
-                      mc_bank, ch, kind="Model", decode=decode, umap_worker=umap_worker, path=p),
-                  mc_bank is not None)
+                      mc_bank, ch, kind="Model", decode=decode, controlled=controlled_bank,
+                      seeds=(embedding_comparison.CONTROLLED_SEEDS if controlled_bank else None),
+                      umap_worker=umap_worker, path=p,
+                      sidecar_path=(str(figdir / f"model_umap_{ch}.json")
+                                    if controlled_bank else None)),
+                  mc_bank is not None and model_controlled_ready)
     # Next-token vocabulary-probability figures (single-arm here; the cross-run K70-vs-K120 contrast
     # is the two-arm vocab_comparison_figures driver). vocab_confusion needs the token decoder for its
     # category bucketing; decode_readout is None (skipped) on the use_prior_bank=True KL-decode path.
@@ -412,6 +442,46 @@ def generate_figures(
 
     logger.info("wrote %d single-run figures to %s", len(written), figdir)
     return written
+
+
+def compare_belief_umap_sidecars(
+    sidecars: Sequence['str | Path'],
+    labels:   Sequence[str],
+
+    *,
+    json_path:   'str | Path',
+    figure_path: 'str | Path',
+) -> 'tuple[Path, Path]':
+    """Validate controlled sidecars and write a metric-only JSON/PNG cross-run comparison."""
+    records = []
+    for sidecar in sidecars:
+        path = Path(sidecar)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"controlled sidecar {path} is not a JSON object")
+        records.append(payload)
+    summary = embedding_comparison.comparison_summary(records, labels)
+    output_json = Path(json_path)
+    output_figure = Path(figure_path)
+    output_figure.parent.mkdir(parents=True, exist_ok=True)
+    figure = None
+    try:
+        figure = figs.plot_controlled_embedding_comparison(
+            summary,
+            path=str(output_figure),
+        )
+        embedding_comparison.write_json_atomic(summary, output_json)
+    except Exception:
+        for destination in (output_figure, output_json):
+            try:
+                destination.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if figure is not None:
+            figs.plt.close(figure)
+    return output_json, output_figure
 
 
 def vocab_comparison_figures(

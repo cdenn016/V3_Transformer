@@ -2128,8 +2128,104 @@ def plot_belief_umap(
                     Path(path).unlink()
                 except FileNotFoundError:
                     pass
+            try:
+                Path(destination).unlink()
+            except FileNotFoundError:
+                pass
             raise
     return saved
+
+
+def plot_controlled_embedding_comparison(
+    comparison: Mapping[str, object],
+
+    *,
+    path: Optional[str] = None,
+):
+    """Render metric panels for controlled sidecars without plotting independent UMAP axes."""
+    arms = comparison.get("arms", [])
+    if not isinstance(arms, list) or len(arms) < 2:
+        raise ValueError("controlled comparison figure needs at least two arms")
+    labels = [str(arm["label"]) for arm in arms]
+    metrics = [arm["metrics"] for arm in arms]
+    x = np.arange(len(labels))
+
+    def values(key: str) -> np.ndarray:
+        return np.asarray([
+            np.nan if arm.get(key) is None else float(arm[key])
+            for arm in metrics
+        ], dtype=float)
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.2, 7.2))
+    width = 0.36
+
+    axes[0, 0].bar(x - width / 2, values("native_silhouette_bpe"), width,
+                   label="BPE", color=_CB[0])
+    axes[0, 0].bar(x + width / 2, values("native_silhouette_function_content"), width,
+                   label="function/content", color=_CB[1])
+    axes[0, 0].axhline(0.0, color="0.35", lw=0.8)
+    axes[0, 0].set_title("Native-chart taxonomy silhouette")
+    axes[0, 0].set_ylabel("silhouette")
+    axes[0, 0].legend(frameon=False, fontsize=8)
+
+    axes[0, 1].bar(x - width / 2, values("trustworthiness"), width,
+                   label="trustworthiness", color=_CB[2])
+    axes[0, 1].bar(x + width / 2, values("neighbor_overlap"), width,
+                   label="seed-neighbor overlap", color=_CB[3])
+    axes[0, 1].set_ylim(0.0, 1.05)
+    axes[0, 1].set_title("Projection stability")
+    axes[0, 1].legend(frameon=False, fontsize=8)
+
+    noise = values("noise_fraction")
+    bars = axes[1, 0].bar(x, noise, 0.55, color=_CB[4])
+    axes[1, 0].set_ylim(0.0, 1.05)
+    axes[1, 0].set_title("Controlled HDBSCAN noise")
+    axes[1, 0].set_ylabel("noise fraction")
+    counts = values("cluster_count")
+    for bar, count in zip(bars, counts):
+        if np.isfinite(count):
+            axes[1, 0].text(
+                bar.get_x() + bar.get_width() / 2,
+                min(float(bar.get_height()) + 0.04, 1.01),
+                f"{int(count)} clusters",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+            )
+
+    ami_keys = (
+        ("ami_bpe", "BPE"),
+        ("ami_function_content", "function/content"),
+        ("ami_position_quartile", "relative position"),
+        ("ami_sequence_identity", "sequence identity"),
+    )
+    ami_width = 0.8 / len(ami_keys)
+    for index, (key, label) in enumerate(ami_keys):
+        offset = (index - (len(ami_keys) - 1) / 2) * ami_width
+        axes[1, 1].bar(x + offset, values(key), ami_width, label=label,
+                       color=_CB[index])
+    axes[1, 1].axhline(0.0, color="0.35", lw=0.8)
+    axes[1, 1].set_title("Cluster-label adjusted mutual information")
+    axes[1, 1].set_ylabel("AMI (noise excluded)")
+    axes[1, 1].legend(frameon=False, fontsize=7, ncol=2)
+
+    for ax in axes.ravel():
+        ax.set_xticks(x, labels, rotation=20, ha="right")
+        ax.grid(axis="y", alpha=0.25)
+        ax.grid(axis="x", visible=False)
+    fig.suptitle("Controlled belief-geometry comparison", fontsize=12)
+    fig.text(
+        0.5,
+        0.012,
+        "Within-run metrics only; independent UMAP axes are not overlaid. "
+        "Belief charts are gauge-fixed coordinate diagnostics, not gauge-invariant observables.",
+        ha="center",
+        va="bottom",
+        fontsize=7,
+        color="0.35",
+    )
+    fig.tight_layout(rect=[0.0, 0.055, 1.0, 0.96])
+    return _save(fig, path)
 
 
 @register_figure("belief_category_separation")

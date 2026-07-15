@@ -339,6 +339,129 @@ def controlled_embedding_record(
     return record
 
 
+_COMPARISON_FIELDS = (
+    "schema_version",
+    "mode",
+    "sample.token_count",
+    "sample.token_sha256",
+    "channel.kind",
+    "channel.name",
+    "channel.feature_dim",
+    "channel.feature_chart",
+    "display.method",
+    "display.n_neighbors",
+    "display.min_dist",
+    "display.n_components",
+    "display.init",
+    "display.seeds",
+    "display.display_seed",
+    "clustering.algorithm",
+    "clustering.space",
+    "clustering.min_cluster_size",
+    "clustering.min_samples",
+    "clustering.cluster_selection_method",
+    "clustering.cluster_selection_epsilon",
+)
+
+
+def _dotted_value(record: Mapping[str, object], field: str) -> object:
+    """Read a required dotted field or raise a comparison-contract error naming it."""
+    value: object = record
+    for part in field.split("."):
+        if not isinstance(value, Mapping) or part not in value:
+            raise ValueError(f"controlled comparison record is missing {field}")
+        value = value[part]
+    return value
+
+
+def validate_comparison_records(records: Sequence[Mapping[str, object]]) -> None:
+    """Fail closed unless every sidecar describes the same controlled comparison contract."""
+    if len(records) < 2:
+        raise ValueError("controlled comparison needs at least two sidecar records")
+    reference = records[0]
+    mismatches = []
+    for index, record in enumerate(records[1:], start=1):
+        for field in _COMPARISON_FIELDS:
+            expected = _dotted_value(reference, field)
+            actual = _dotted_value(record, field)
+            if actual != expected:
+                mismatches.append(
+                    f"record[{index}].{field} ({actual!r} != {expected!r})"
+                )
+    if mismatches:
+        raise ValueError("controlled comparison contract mismatch: " + "; ".join(mismatches))
+
+
+def _metric_scalar(record: Mapping[str, object], field: str) -> Optional[float]:
+    """Extract a scalar or metric-record value for the compact cross-run artifact."""
+    value = _dotted_value(record, field)
+    if isinstance(value, Mapping):
+        value = value.get("value")
+    if value is None:
+        return None
+    scalar = float(value)
+    return scalar if np.isfinite(scalar) else None
+
+
+def comparison_summary(
+    records: Sequence[Mapping[str, object]],
+    labels:  Sequence[str],
+) -> dict:
+    """Build the metric-only cross-run summary after validating all controlled contracts."""
+    validate_comparison_records(records)
+    if len(labels) != len(records):
+        raise ValueError("labels must contain one entry per sidecar record")
+    if len(set(labels)) != len(labels):
+        raise ValueError("comparison labels must be unique")
+    arms = []
+    for label, record in zip(labels, records):
+        arms.append({
+            "label": str(label),
+            "sample": copy.deepcopy(record["sample"]),
+            "metrics": {
+                "native_silhouette_bpe": _metric_scalar(
+                    record, "native_space.silhouette.bpe"
+                ),
+                "native_silhouette_function_content": _metric_scalar(
+                    record, "native_space.silhouette.function_content"
+                ),
+                "trustworthiness": _metric_scalar(
+                    record, "projection.trustworthiness.mean"
+                ),
+                "neighbor_overlap": _metric_scalar(
+                    record, "projection.neighbor_overlap.mean"
+                ),
+                "cluster_count": _metric_scalar(record, "clusters.count"),
+                "noise_fraction": _metric_scalar(record, "clusters.noise_fraction"),
+                "ami_bpe": _metric_scalar(
+                    record, "clusters.adjusted_mutual_information.bpe"
+                ),
+                "ami_function_content": _metric_scalar(
+                    record, "clusters.adjusted_mutual_information.function_content"
+                ),
+                "ami_position_quartile": _metric_scalar(
+                    record, "clusters.adjusted_mutual_information.position_quartile"
+                ),
+                "ami_sequence_identity": _metric_scalar(
+                    record, "clusters.adjusted_mutual_information.sequence_identity"
+                ),
+            },
+        })
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "artifact": "controlled_belief_geometry_comparison",
+        "comparison_basis": (
+            "Within-run scalar diagnostics only; independently fitted UMAP axes are not shared."
+        ),
+        "coordinate_status": records[0]["coordinate_status"],
+        "validated_contract": {
+            field: copy.deepcopy(_dotted_value(records[0], field))
+            for field in _COMPARISON_FIELDS
+        },
+        "arms": arms,
+    }
+
+
 def write_json_atomic(
     record: Mapping[str, object],
     path:   'str | Path',

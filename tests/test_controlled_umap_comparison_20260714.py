@@ -1,7 +1,9 @@
 """Controlled belief-geometry comparison regressions (2026-07-14)."""
 
 from types import SimpleNamespace
+import copy
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -315,3 +317,109 @@ def test_exploratory_plot_retains_adaptive_single_embedding(tmp_path):
     assert len(worker.calls) == 1
     assert worker.calls[0][0] == figures._UMAP_N_NEIGHBORS
     figures.plt.close(figure)
+
+
+def _matching_controlled_records():
+    from vfe3.viz import embedding_comparison
+
+    left = embedding_comparison.controlled_embedding_record(**_controlled_record_fixture())
+    return left, copy.deepcopy(left)
+
+
+def test_comparator_accepts_matching_controlled_contracts():
+    from vfe3.viz import embedding_comparison
+
+    left, right = _matching_controlled_records()
+
+    embedding_comparison.validate_comparison_records([left, right])
+
+
+def test_comparator_rejects_token_population_mismatch():
+    from vfe3.viz import embedding_comparison
+
+    left, right = _matching_controlled_records()
+    right["sample"]["token_sha256"] = "different"
+
+    with pytest.raises(ValueError, match="sample.token_sha256"):
+        embedding_comparison.validate_comparison_records([left, right])
+
+
+def test_comparator_reports_every_mismatched_contract_field():
+    from vfe3.viz import embedding_comparison
+
+    left, right = _matching_controlled_records()
+    right["display"]["n_neighbors"] = 99
+    right["clustering"]["min_samples"] = 3
+
+    with pytest.raises(ValueError) as exc:
+        embedding_comparison.validate_comparison_records([left, right])
+
+    assert "display.n_neighbors" in str(exc.value)
+    assert "clustering.min_samples" in str(exc.value)
+
+
+def test_cross_run_figure_contains_metrics_not_independent_coordinates(tmp_path):
+    from vfe3.viz import embedding_comparison
+
+    left, right = _matching_controlled_records()
+    left_path = embedding_comparison.write_json_atomic(left, tmp_path / "n256.json")
+    right_path = embedding_comparison.write_json_atomic(right, tmp_path / "n512.json")
+
+    json_path, figure_path = report.compare_belief_umap_sidecars(
+        sidecars=[left_path, right_path],
+        labels=["N=256", "N=512"],
+        json_path=tmp_path / "comparison.json",
+        figure_path=tmp_path / "comparison.png",
+    )
+    comparison = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert json_path.is_file() and figure_path.is_file()
+    assert comparison["artifact"] == "controlled_belief_geometry_comparison"
+    assert [arm["label"] for arm in comparison["arms"]] == ["N=256", "N=512"]
+    assert "coordinates" not in comparison
+    assert "umap_coordinates" not in json.dumps(comparison)
+    assert set(comparison["arms"][0]["metrics"]) == {
+        "native_silhouette_bpe",
+        "native_silhouette_function_content",
+        "trustworthiness",
+        "neighbor_overlap",
+        "cluster_count",
+        "noise_fraction",
+        "ami_bpe",
+        "ami_function_content",
+        "ami_position_quartile",
+        "ami_sequence_identity",
+    }
+
+
+def test_generate_figures_default_wires_controlled_sidecars(tmp_path, monkeypatch):
+    from vfe3.viz import figures
+
+    model = _tiny_model()
+    loader = [torch.arange(0, 8).reshape(2, 4)]
+    calls = []
+
+    class NoopWorker:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+    def record_umap(*args, **kwargs):
+        calls.append(kwargs)
+        return figures.plt.figure()
+
+    monkeypatch.setattr(report.figs, "UMAPWorker", NoopWorker)
+    monkeypatch.setattr(report.figs, "plot_belief_umap", record_umap)
+
+    report.generate_figures(tmp_path / "run", model=model, loader=loader, max_tokens=8)
+
+    assert len(calls) == 3
+    assert all(call["controlled"] is True for call in calls)
+    assert all(call["sidecar_path"].endswith(".json") for call in calls)
+    assert {Path(call["sidecar_path"]).name for call in calls} == {
+        "belief_umap_mu.json",
+        "belief_umap_sigma.json",
+        "belief_umap_phi.json",
+    }
