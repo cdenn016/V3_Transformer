@@ -27,15 +27,14 @@ synthetic substitution); build the corpus cache first (see ``vfe3/data``).
 """
 
 import os
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each ship a
-#   libiomp5md.dll; the duplicate OpenMP init aborts the process (seen with n_e_steps>1). This MUST
-#   run before `import torch`. The clean fix is one OpenMP in the env (e.g. `conda install nomkl`);
-#   override by exporting KMP_DUPLICATE_LIB_OK yourself. See docs/edits/2026-06-05.
+if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import copy
 import gc
 import json
 import logging
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import asdict
@@ -53,7 +52,7 @@ from vfe3.data.datasets import (
     tokens_per_char as _tokens_per_char,
 )
 from vfe3.model.model import VFEModel, build_group
-from vfe3.run_artifacts import RunArtifacts, _git_code_identity, finalize_run
+from vfe3.run_artifacts import RunArtifacts, _git_code_identity, _write_json_atomic, finalize_run
 from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, train
 
@@ -468,6 +467,8 @@ def route_vary_block_fixed_k(
         h = embed_dim // b
         ov: Dict[str, Any] = {"embed_dim": embed_dim, "n_heads": h, "gauge_group": gauge_group,
                               "kl_max": 8 * embed_dim}
+        if gauge_group == "tied_block_glk":
+            ov["phi_precond_mode"] = "killing"
         if h < 2:
             ov["use_head_mixer"] = False
         if extra_overrides:
@@ -487,7 +488,8 @@ def route_group(embed_dim: int) -> List[Dict[str, Any]]:
     headless = {"beta_attention_prior": "causal"}
     return [
         {"label": f"K{embed_dim}_tied_h8", "route": "group", "scale_knob": "gauge_group",
-         "overrides": {"embed_dim": embed_dim, "n_heads": 8, "gauge_group": "tied_block_glk", **headless}},
+         "overrides": {"embed_dim": embed_dim, "n_heads": 8, "gauge_group": "tied_block_glk",
+                       "phi_precond_mode": "killing", **headless}},
         {"label": f"K{embed_dim}_block_h8", "route": "group", "scale_knob": "gauge_group",
          "overrides": {"embed_dim": embed_dim, "n_heads": 8, "gauge_group": "block_glk", **headless}},
         {"label": f"K{embed_dim}_so_k", "route": "group", "scale_knob": "gauge_group",
@@ -843,18 +845,87 @@ def _cleanup() -> None:
 # MAIN  (click-to-run; edit CONFIG / ROUTES above)
 # =============================================================================
 
-def main() -> None:
+def validate_routes() -> None:
+    """Construct every declared route arm before any training or output publication begins."""
+    errors: List[Tuple[str, str, str]] = []
+    for route_name, cells in ROUTES.items():
+        for cell in cells:
+            try:
+                VFE3Config(**_cell_cfg_dict(cell["overrides"], 0, None))
+            except (TypeError, ValueError) as exc:
+                errors.append((route_name, str(cell["label"]), str(exc)))
+    if errors:
+        detail = "\n".join(
+            f"  route {route!r}, arm {label!r}: {error}"
+            for route, label, error in errors
+        )
+        raise ValueError(f"scaling route construction failed:\n{detail}")
+
+
+def _validated_scaling_seeds(raw_seeds: object) -> List[int]:
+    if not isinstance(raw_seeds, (list, tuple)) or not raw_seeds:
+        raise ValueError("CONFIG['seeds'] must be a non-empty list or tuple of unique integers")
+    if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in raw_seeds):
+        raise ValueError("CONFIG['seeds'] must contain exact integers")
+    seeds = [int(seed) for seed in raw_seeds]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"CONFIG['seeds'] must be unique, got {seeds!r}")
+    return seeds
+
+
+def _scaling_design(route_names: List[str], seeds: List[int]) -> Dict[str, Any]:
+    cells = []
+    for route_name in route_names:
+        for cell in ROUTES[route_name]:
+            for seed in seeds:
+                cells.append({
+                    "route": route_name,
+                    "label": cell["label"],
+                    "seed": seed,
+                    "scale_knob": cell["scale_knob"],
+                    "run_dir": f"{route_name}/{cell['label']}/s{seed}",
+                    "status": "pending",
+                })
+    return {
+        "schema_version": 1,
+        "routes": list(route_names),
+        "seeds": list(seeds),
+        "status": "pending",
+        "cells": cells,
+    }
+
+
+def _scaling_result_status(result: Mapping[str, Any]) -> str:
+    if result.get("error_kind") is not None:
+        return "failed"
+    value = result.get("test_ce")
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value)) or float(value) <= 0.0):
+        return "nonfinite"
+    return "complete"
+
+
+def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     device = (torch.device("cuda" if torch.cuda.is_available() else "cpu")
               if CONFIG["device"] == "auto" else torch.device(CONFIG["device"]))
     output_dir = Path(CONFIG["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    route_names = CONFIG["routes"]
+    route_names = list(CONFIG["routes"])
     for name in route_names:
         if name not in ROUTES:
             raise ValueError(f"unknown route {name!r}; choose from {sorted(ROUTES)}")
-    seeds = list(CONFIG["seeds"])
+    validate_routes()
+    seeds = _validated_scaling_seeds(CONFIG["seeds"])
+    design = _scaling_design(route_names, seeds)
+    design_path = output_dir / "scaling_design.json"
+    _write_json_atomic(design_path, design)
+    design_cells = {
+        (cell["route"], cell["label"], int(cell["seed"])): cell
+        for cell in design["cells"]
+    }
+    incomplete = False
     n_cells = sum(len(ROUTES[n]) for n in route_names)
     print(f"\nVFE_3.0 parameter-scaling suite\n  device:  {device}\n  dataset: {CONFIG['dataset']}"
           f"\n  output:  {output_dir}\n  seeds:   {seeds}\n  routes:  {', '.join(route_names)}"
@@ -877,13 +948,40 @@ def main() -> None:
                            "test_bpc": None, "n_params": None}
                 finally:
                     _cleanup()
-                if res.get("error_kind") is None and not res.get("cached"):
+                status = _scaling_result_status(res)
+                published = dict(res)
+                published["status"] = status
+                if status == "nonfinite":
+                    if published.get("error_kind") is None:
+                        published["error_kind"] = "nonfinite"
+                    if published.get("error") is None:
+                        published["error"] = "test_ce is absent, non-finite, or non-positive"
+                run_dir.mkdir(parents=True, exist_ok=True)
+                _write_json_atomic(run_dir / "scaling_result.json", published)
+                if status != "complete":
+                    _write_json_atomic(run_dir / "scaling_failure.json", published)
+                    incomplete = True
+                manifest_cell = design_cells[(name, cell["label"], int(seed))]
+                manifest_cell.update({
+                    "status": status,
+                    "error_kind": published.get("error_kind"),
+                    "error": published.get("error"),
+                })
+                design["status"] = "incomplete" if incomplete else "running"
+                _write_json_atomic(design_path, design)
+                if status == "complete" and not res.get("cached"):
                     print(f"      -> test_ce={res.get('test_ce')}  ppl={res.get('test_ppl')}  "
                           f"({res.get('wall_time_s', 0.0):.0f}s)")
 
+    design["status"] = "incomplete" if incomplete else "complete"
+    _write_json_atomic(design_path, design)
+    if incomplete:
+        print(f"\nROUTES INCOMPLETE. Inspect {design_path} and per-cell scaling_failure.json files.")
+        return 1
     print(f"\nALL ROUTES COMPLETE. Aggregate + fit + plot with:  python scaling_analysis.py"
           f"  (reads {output_dir}/)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

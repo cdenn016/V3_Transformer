@@ -2315,23 +2315,25 @@ def plot_belief_umap(
         footer += " | English linguistic taxonomies disabled"
     fig.text(0.98, 0.012, footer, fontsize=6, color="0.4", ha="right", va="bottom")
     saved = _save(fig, path)
+    publication_outcomes = {
+        "figure": {
+            "path": str(path) if path is not None else None,
+            "published": path is not None,
+            "error": None,
+        },
+        "sidecar": {"path": None, "published": False, "error": None},
+    }
     if controlled and controlled_record is not None and (sidecar_path is not None or path is not None):
         from pathlib import Path
         from vfe3.viz import embedding_comparison
         destination = sidecar_path or str(Path(path).with_suffix(".json"))
+        publication_outcomes["sidecar"]["path"] = str(destination)
         try:
             embedding_comparison.write_json_atomic(controlled_record, destination)
-        except Exception:
-            if path is not None:
-                try:
-                    Path(path).unlink()
-                except FileNotFoundError:
-                    pass
-            try:
-                Path(destination).unlink()
-            except FileNotFoundError:
-                pass
-            raise
+            publication_outcomes["sidecar"]["published"] = True
+        except Exception as exc:
+            publication_outcomes["sidecar"]["error"] = str(exc)
+    saved._vfe3_publication_outcomes = publication_outcomes
     return saved
 
 

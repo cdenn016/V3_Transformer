@@ -22,6 +22,7 @@ viz = [
     "umap-learn",
     "scikit-learn>=1.3",
     "scipy",
+    "networkx",
     "arabic-reshaper",
     "python-bidi",
 ]   # optional publication figures, including native Arabic text shaping

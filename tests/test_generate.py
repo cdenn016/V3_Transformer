@@ -417,6 +417,7 @@ def test_generate_efe_builds_both_arms_before_pairing_cpu_and_cuda_rng(monkeypat
         "policy_sigma_gate_artifact":       None,
         "max_new_tokens":     1,
         "greedy":             False,
+        "generation_seed":    7,
     }
 
     torch.manual_seed(7)

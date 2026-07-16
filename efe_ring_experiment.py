@@ -13,10 +13,9 @@ set CONFIG['steps'] and CONFIG['n_episodes']/['n_dev'] small (this is logged in 
 deviation from the sealed run is visible -- no silent caps).
 """
 import hashlib
-import json
 import logging
 import math
-import os
+import os  # noqa: F401 - retained as the published atomic-replace monkeypatch seam
 import pickle
 import time
 from dataclasses import asdict
@@ -28,7 +27,13 @@ import numpy as np
 import torch
 
 from vfe3.inference import ring_task as rt
-from vfe3.run_artifacts import _atomic_replace, semantic_config_fingerprint
+from vfe3.run_artifacts import (
+    _atomic_replace,
+    _unique_sibling_temp,
+    _write_json_atomic,
+    semantic_config_fingerprint,
+)
+from vfe3.runtime import deterministic_state, seed_everything
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,7 @@ CONFIG = dict(
     steps=15000,                     # sealed training budget per seed
     batch_size=256,
     lr=3e-3,
+    deterministic=True,
     log_every=100,                   # print training step/loss/rate/ETA every N steps (0 = silent)
     n_dev=1000,                      # dev episodes for gamma tuning
     n_episodes=5000,                 # sealed test episodes per arm (paired)
@@ -231,7 +237,7 @@ def run_checkpoint(model, cfg, device, seed):
 # same executable code, intact schema -- and fails closed (recomputes) on any absent/malformed/stale/
 # incompatible bundle. In-step optimizer resume is out of scope.
 
-_SEED_BUNDLE_SCHEMA_VERSION = 1
+_SEED_BUNDLE_SCHEMA_VERSION = 2
 
 
 def _semantic_experiment_config(cfg: Mapping[str, object]) -> Dict[str, object]:
@@ -242,7 +248,7 @@ def _semantic_experiment_config(cfg: Mapping[str, object]) -> Dict[str, object]:
     NUCLEUS_TOP_P / TYPICAL_P / FDR_Q (module-level, not in CONFIG) DO shape the scored arms, so they
     join the CONFIG fields in the semantic identity.
     """
-    included = ("steps", "batch_size", "lr", "n_dev", "n_episodes", "budget",
+    included = ("steps", "batch_size", "lr", "deterministic", "n_dev", "n_episodes", "budget",
                 "candidate_mode", "top_k", "beta_C", "gamma_grid",
                 "adequacy_threshold", "delta_min", "alpha")
     semantic: Dict[str, object] = {key: cfg[key] for key in included}
@@ -337,8 +343,8 @@ def _save_seed_bundle(
 ) -> Path:
     r"""Atomically publish a `trained` or `complete` seed bundle.
 
-    Written through ``seed_path.with_suffix(".pt.tmp")`` + the shared atomic-replace helper (same-dir
-    tmp + ``os.replace``), so the trained and complete states are each independently publishable and a
+    Written through a uniquely reserved same-directory temporary + the shared atomic-replace helper,
+    so the trained and complete states are each independently publishable and a
     crash never leaves a truncated ``.pt`` at the final name.
     """
     semantic     = dict(experiment_config)
@@ -355,10 +361,11 @@ def _save_seed_bundle(
         "model_state":                 model.state_dict(),
         "adequacy":                    float(adequacy),
         "result":                      (dict(result) if result is not None else None),
+        "runtime_state":               deterministic_state(),
     }
-    tmp = path.with_suffix(".pt.tmp")
-    torch.save(bundle, tmp)
-    _atomic_replace(path, tmp)
+    with _unique_sibling_temp(path) as tmp:
+        torch.save(bundle, tmp)
+        _atomic_replace(path, tmp)
     return path
 
 
@@ -387,6 +394,9 @@ def _load_seed_bundle_if_current(
             raise RuntimeError("bundle is not a mapping")
         if bundle.get("schema_version") != _SEED_BUNDLE_SCHEMA_VERSION:
             raise RuntimeError(f"unsupported schema_version {bundle.get('schema_version')!r}")
+        runtime_state = bundle.get("runtime_state")
+        if not isinstance(runtime_state, Mapping):
+            raise RuntimeError("runtime_state is not a mapping")
         status = bundle.get("status")
         if status not in ("trained", "complete"):
             raise RuntimeError(f"status {status!r} is neither 'trained' nor 'complete'")
@@ -438,7 +448,7 @@ def main():
         print("WARNING: running on CPU; the iterative E-step makes this very slow. Run on the GPU.")
 
     results = {"config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.items()},
-               "device": str(device), "checkpoints": {}}
+               "device": str(device), "runtime_state": None, "checkpoints": {}}
 
     out_dir  = Path(cfg["out_dir"])
     seed_dir = out_dir / "seeds"
@@ -448,6 +458,7 @@ def main():
     admitted = []
 
     for seed in cfg["seeds"]:
+        seed_everything(int(seed), deterministic=bool(cfg["deterministic"]))
         seed_path = seed_dir / f"seed_{int(seed)}.pt"
         bundle = (_load_seed_bundle_if_current(seed_path, semantic_cfg, device, seed=seed)
                   if cfg["resume"] else None)
@@ -467,6 +478,7 @@ def main():
                     batch_size=cfg["batch_size"],
                     lr=cfg["lr"],
                     log_every=cfg["log_every"],
+                    deterministic=cfg["deterministic"],
                     device=str(device),
                 )
                 _save_seed_bundle(seed_path, model, semantic_cfg, None,
@@ -495,6 +507,8 @@ def main():
             admitted.append(seed)
         results["checkpoints"][str(seed)] = entry
 
+    results["runtime_state"] = deterministic_state()
+
     # cross-seed aggregate + overall go/no-go (all admitted seeds must individually pass)
     if admitted:
         def mean_sr(arm):
@@ -516,12 +530,9 @@ def main():
         print("\nVERDICT:", results["verdict"])
 
     # Publish the cross-seed aggregate only after every requested seed has a complete entry above, and
-    # atomically (same-dir tmp + os.replace) so a crash never leaves a truncated ring_v1_results.json.
-    out_path = os.path.join(cfg["out_dir"], "ring_v1_results.json")
-    tmp_path = out_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    os.replace(tmp_path, out_path)
+    # atomically through a unique same-directory temporary so a crash never truncates the result.
+    out_path = Path(cfg["out_dir"]) / "ring_v1_results.json"
+    _write_json_atomic(out_path, results)
     print("wrote", out_path)
 
 

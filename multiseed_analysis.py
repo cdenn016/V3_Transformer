@@ -32,6 +32,8 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from vfe3.run_artifacts import _write_json_atomic
+
 
 def _read_json(path: Path) -> Dict[str, Any]:
     try:
@@ -116,21 +118,12 @@ def aggregate_seed_metric(
     Non-finite or unreadable points are skipped (never crash the aggregation).
     """
     root = Path(run_root)
-    run_dirs = sorted({path.parent for path in root.rglob(filename)})
-    _assert_homogeneous_configs(run_dirs)
-    values: List[float] = []
-    seeds: List[Optional[int]] = []
-    for run_dir in run_dirs:
-        f = run_dir / filename
-        v = _as_finite_float(_read_json(f).get(key))
-        if v is None:
-            continue
-        values.append(v)
-        seeds.append(_seed_for(run_dir, config_name=seed_file))
-
-    out = _summarize(values)
-    out["seeds"] = seeds
-    return out
+    return _aggregate_requested_metric(
+        root,
+        key,
+        sources=(filename,),
+        seed_file=seed_file,
+    )
 
 
 def _summarize(values: List[float]) -> Dict[str, Any]:
@@ -200,6 +193,90 @@ def _seed_dirs(root: Path) -> List[Path]:
     return out
 
 
+def _requested_seeds(root: Path, observed: List[int]) -> tuple[List[int], bool]:
+    request_path = root / "multiseed_request.json"
+    request = _read_json(request_path)
+    if not request_path.is_file():
+        return sorted(set(observed)), False
+    raw = request.get("seeds")
+    if request.get("schema_version") != 1 or not isinstance(raw, list) or not raw:
+        raise ValueError(f"invalid multi-seed request manifest at {request_path}")
+    if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in raw):
+        raise ValueError(f"multi-seed request seeds must be exact integers at {request_path}")
+    seeds = [int(seed) for seed in raw]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"multi-seed request seeds must be unique at {request_path}")
+    return seeds, True
+
+
+def _aggregate_requested_metric(
+    root: Path,
+    key: str,
+
+    *,
+    sources: tuple,
+    seed_file: str = "config.json",
+) -> Dict[str, Any]:
+    run_dirs = _seed_dirs(root)
+    by_seed: Dict[int, List[Path]] = {}
+    for run_dir in run_dirs:
+        seed = _seed_for(run_dir, config_name=seed_file)
+        if seed is not None:
+            by_seed.setdefault(seed, []).append(run_dir)
+    requested, verified_request = _requested_seeds(root, list(by_seed))
+    values: List[float] = []
+    value_seeds: List[int] = []
+    cells: List[Dict[str, Any]] = []
+    for seed in requested:
+        matches = by_seed.get(seed, [])
+        if not matches:
+            cells.append({"seed": seed, "status": "missing", "value": None})
+            continue
+        if len(matches) > 1:
+            cells.append({"seed": seed, "status": "duplicate", "value": None,
+                          "run_dirs": [str(path) for path in matches]})
+            continue
+        run_dir = matches[0]
+        found = False
+        invalid = False
+        unreadable = False
+        value: Optional[float] = None
+        for source in sources:
+            source_path = run_dir / source
+            if not source_path.is_file():
+                continue
+            payload = _read_json(source_path)
+            if not payload:
+                unreadable = True
+                continue
+            raw = _dig(payload, key)
+            if raw is None:
+                continue
+            found = True
+            value = _as_finite_float(raw)
+            if value is not None:
+                break
+            invalid = True
+        if value is not None:
+            values.append(value)
+            value_seeds.append(seed)
+            cells.append({"seed": seed, "status": "complete", "value": value,
+                          "run_dir": str(run_dir)})
+        else:
+            status = "nonfinite" if found or invalid else "unreadable" if unreadable else "missing"
+            cells.append({"seed": seed, "status": status, "value": None,
+                          "run_dir": str(run_dir)})
+    out = _summarize(values)
+    out.update({
+        "seeds": value_seeds,
+        "requested_seeds": requested,
+        "request_verified": verified_request,
+        "cells": cells,
+        "complete": bool(cells) and all(cell["status"] == "complete" for cell in cells),
+    })
+    return out
+
+
 def _dig(d: Dict[str, Any], dotted: str) -> Any:
     r"""Nested lookup by dotted key (``"corpus_freq_strata_ce.rare"``); None if missing."""
     cur: Any = d
@@ -222,22 +299,7 @@ def aggregate_scalar(
     (ECE, ``corpus_freq_strata_ce.rare``, ...) that never appear in ``summary.json``.
     """
     root = _resolve_run_root(run_root)
-    values: List[float] = []
-    seeds: List[Optional[int]] = []
-    for run_dir in _seed_dirs(root):
-        val = None
-        for src in sources:
-            v = _as_finite_float(_dig(_read_json(run_dir / src), key))
-            if v is not None:
-                val = v
-                break
-        if val is None:
-            continue
-        values.append(val)
-        seeds.append(_seed_for(run_dir))
-    out = _summarize(values)
-    out["seeds"] = seeds
-    return out
+    return _aggregate_requested_metric(root, key, sources=sources)
 
 
 def _read_csv_columns(path: Path) -> Dict[str, List[Optional[float]]]:
@@ -564,11 +626,14 @@ def _emit_figures(root: Path, scalars, curves, per_layer) -> None:
 def main() -> None:
     root = _resolve_run_root(CONFIG["run_root"])
     seed_dirs = _seed_dirs(root)
-    if not seed_dirs:
+    if not seed_dirs and not (root / "multiseed_request.json").is_file():
         print(f"no per-seed run dirs under {str(root)!r} "
               f"(looked for summary.json / provenance.json / config.json)")
         return
     seeds = [_seed_for(d) for d in seed_dirs]
+    requested_seeds, request_verified = _requested_seeds(
+        root, [seed for seed in seeds if seed is not None]
+    )
     print(f"\n=== Multi-seed digest: {root}  ({len(seed_dirs)} seeds: {seeds}) ===\n")
 
     scalars: Dict[str, Any] = {}
@@ -577,6 +642,8 @@ def main() -> None:
     for k in SCALAR_KEYS:
         a = aggregate_scalar(root, k)
         if a["n"] == 0:
+            if a.get("request_verified"):
+                scalars[k] = a
             continue
         scalars[k] = a
         cvpct = 100 * a["cv"] if math.isfinite(a["cv"]) else float("nan")
@@ -589,9 +656,18 @@ def main() -> None:
 
     manifest = {
         "run_root": str(root),
-        "config_fingerprint": _config_fingerprint(seed_dirs[0] / "config.json"),
+        "config_fingerprint": (
+            _config_fingerprint(seed_dirs[0] / "config.json") if seed_dirs else None
+        ),
         "n_seeds": len(seed_dirs),
         "seeds": seeds,
+        "design": {
+            "requested_seeds": requested_seeds,
+            "request_verified": request_verified,
+            "complete": all(
+                scalar.get("complete", False) for scalar in scalars.values()
+            ) if scalars else False,
+        },
         "caveat": CAVEAT,
         "scalars": scalars,
         "curves_final_step": {c: _final_finite(d) for c, d in curves.items()},
@@ -599,8 +675,7 @@ def main() -> None:
                                for c, s in cols.items()}
                       for L, cols in per_layer.items()},
     }
-    (root / "multiseed_summary.json").write_text(
-        json.dumps(_json_clean(manifest), indent=2), encoding="utf-8")
+    _write_json_atomic(root / "multiseed_summary.json", _json_clean(manifest))
     _write_csv(root / "multiseed_summary.csv", scalars)
     _write_md(root / "MULTISEED_ANALYSIS.md", root, seeds, scalars, per_layer)
     for name in ("multiseed_summary.json", "multiseed_summary.csv", "MULTISEED_ANALYSIS.md"):

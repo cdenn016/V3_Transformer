@@ -37,7 +37,7 @@ import torch
 from vfe3.config import config_from_serialized
 from vfe3.data.datasets import tiktoken_encoding_name
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import semantic_config_fingerprint
+from vfe3.run_artifacts import _write_json_atomic, semantic_config_fingerprint
 
 # ---------------------------------- edit me ----------------------------------
 CONFIG = dict(
@@ -50,6 +50,8 @@ CONFIG = dict(
     prompt          = "A man sat",
     max_new_tokens  = 60,
     greedy          = False,     # True -> argmax / argmax-of-policy-posterior; deterministic
+    generation_seed = 6,         # explicit stochastic-decoding seed (also persisted below)
+    output_path     = "efe_generation.json",
 
     # --- EFE policy scorer (the "active inference" knobs) ---
     policy_mode        = "efe_one_step",        # none | efe_one_step | logprob_control | efe_rollout (cache-supported cfg, horizon>1)
@@ -215,6 +217,15 @@ def _run_generation_arms(
             config_dict, state_dict, policy_overrides=overrides, device=device,
         )
 
+    generation_seed = cfg.get("generation_seed")
+    if (isinstance(generation_seed, bool) or not isinstance(generation_seed, int)
+            or generation_seed < 0):
+        raise ValueError(
+            f"generation_seed must be a non-negative integer, got {generation_seed!r}"
+        )
+    # torch.manual_seed sets the CPU generator and every CUDA generator.  Apply it only after both
+    # models exist so model-construction RNG consumption cannot move either generation arm.
+    torch.manual_seed(generation_seed)
     cpu_state = torch.random.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     base_out = _generate(prompt_ids, base_model, cfg)
@@ -257,6 +268,27 @@ def main() -> None:
         print(f"identical to base? {same}"
               + ("  (expected for flat + default score_terms: the score is constant -> base greedy)"
                  if same else "  (the reranker changed the continuation)"))
+
+    output_path = cfg.get("output_path")
+    if not isinstance(output_path, str) or not output_path:
+        raise ValueError("output_path must be a non-empty path string")
+    record = {
+        "schema_version": 1,
+        "checkpoint": str(cfg["checkpoint"]),
+        "config_fingerprint": semantic_config_fingerprint(config_dict),
+        "generation_seed": int(cfg["generation_seed"]),
+        "greedy": bool(cfg["greedy"]),
+        "policy_mode": str(cfg["policy_mode"]),
+        "policy_score_terms": list(cfg["policy_score_terms"]),
+        "outputs": {
+            "base_token_ids": base_out.detach().cpu().tolist(),
+            "policy_token_ids": (
+                pol_out.detach().cpu().tolist() if pol_out is not None else None
+            ),
+        },
+    }
+    _write_json_atomic(output_path, record)
+    print(f"generation record: {output_path}")
 
 
 if __name__ == "__main__":

@@ -23,9 +23,9 @@ experiment to set up). Neither is produced here.
 
 import json
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, List, Mapping, Optional, Sequence
+from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence
 
 import torch
 
@@ -39,6 +39,19 @@ from vfe3.viz.text import supports_english_linguistic_taxonomies
 
 
 CONTROLLED_BANK_TOKENS = 16_384
+
+
+@dataclass(frozen=True)
+class ArtifactPublicationResult:
+    """Separately report the newly published comparison sidecar and figure."""
+
+    json_path:   Optional[Path]
+    figure_path: Optional[Path]
+    outcomes:    Dict[str, Dict[str, object]]
+
+    def __iter__(self) -> Iterator[Optional[Path]]:
+        yield self.json_path
+        yield self.figure_path
 
 
 def _load_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
@@ -285,9 +298,17 @@ def generate_figures(
         try:
             path = figdir / f"{name}.png"
             fig = thunk(str(path))
+            outcomes = getattr(fig, "_vfe3_publication_outcomes", None)
             figs.plt.close(fig)
             written.append(path)
             logger.info("figure -> %s", path)
+            if isinstance(outcomes, Mapping):
+                sidecar = outcomes.get("sidecar")
+                if isinstance(sidecar, Mapping) and sidecar.get("published"):
+                    logger.info("sidecar -> %s", sidecar.get("path"))
+                elif isinstance(sidecar, Mapping) and sidecar.get("error"):
+                    logger.warning("figure %r sidecar failed (%s); figure retained",
+                                   name, sidecar.get("error"))
         except Exception as exc:
             # The thunk can register a pyplot figure and then raise (tight_layout/savefig) before
             # _emit ever receives it; close what it registered (audit 2026-07-01 round-3).
@@ -464,7 +485,7 @@ def compare_belief_umap_sidecars(
     *,
     json_path:   'str | Path',
     figure_path: 'str | Path',
-) -> 'tuple[Path, Path]':
+) -> ArtifactPublicationResult:
     """Validate controlled sidecars and write a metric-only JSON/PNG cross-run comparison."""
     records = []
     for sidecar in sidecars:
@@ -477,24 +498,32 @@ def compare_belief_umap_sidecars(
     output_json = Path(json_path)
     output_figure = Path(figure_path)
     output_figure.parent.mkdir(parents=True, exist_ok=True)
+    outcomes: Dict[str, Dict[str, object]] = {
+        "figure": {"path": str(output_figure), "published": False, "error": None},
+        "sidecar": {"path": str(output_json), "published": False, "error": None},
+    }
     figure = None
+    published_figure: Optional[Path] = None
+    published_json: Optional[Path] = None
     try:
         figure = figs.plot_controlled_embedding_comparison(
             summary,
             path=str(output_figure),
         )
-        embedding_comparison.write_json_atomic(summary, output_json)
-    except Exception:
-        for destination in (output_figure, output_json):
-            try:
-                destination.unlink()
-            except FileNotFoundError:
-                pass
-        raise
+        outcomes["figure"]["published"] = True
+        published_figure = output_figure
+    except Exception as exc:
+        outcomes["figure"]["error"] = str(exc)
     finally:
         if figure is not None:
             figs.plt.close(figure)
-    return output_json, output_figure
+    try:
+        embedding_comparison.write_json_atomic(summary, output_json)
+        outcomes["sidecar"]["published"] = True
+        published_json = output_json
+    except Exception as exc:
+        outcomes["sidecar"]["error"] = str(exc)
+    return ArtifactPublicationResult(published_json, published_figure, outcomes)
 
 
 def vocab_comparison_figures(

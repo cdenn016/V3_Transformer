@@ -26,6 +26,7 @@ import torch
 from vfe3.config import VFE3Config
 from vfe3.inference.policy import _validate_policy_context, get_policy, get_preference
 from vfe3.model.model import VFEModel
+from vfe3.runtime import seed_everything
 
 # ---- sealed vocabulary layout (spec Section 4.1) ----
 M       = 16                    # ring size (state symbols q_0..q_{M-1} are token ids 0..M-1)
@@ -154,6 +155,7 @@ def train_ring_checkpoint(
     n_layers:    int   = 2,
     n_e_steps:   int   = 2,
     log_every:   int   = 0,                      # >0 -> print step/loss/rate/ETA every log_every steps
+    deterministic: bool = True,
     device:      Optional[str] = None,           # None -> cuda if available else cpu (use the 5090)
     cfg_overrides: Optional[dict] = None,
 ) -> Tuple[VFEModel, float]:
@@ -163,7 +165,6 @@ def train_ring_checkpoint(
     transitions; no dev-selection knob (final checkpoint taken). Runs on CUDA when available (the
     iterative E-step is slow on CPU; train this on the GPU)."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(seed)
     cfg_kw = dict(
         vocab_size=V, embed_dim=embed_dim, n_heads=n_heads, max_seq_len=SEQ_LEN,
         n_layers=n_layers, n_e_steps=n_e_steps, e_q_mu_lr=0.05, e_phi_lr=0.02,
@@ -171,7 +172,10 @@ def train_ring_checkpoint(
     )
     if cfg_overrides:
         cfg_kw.update(cfg_overrides)
-    model = VFEModel(VFE3Config(**cfg_kw)).to(device)
+    cfg_kw.update(seed=int(seed), deterministic=bool(deterministic))
+    cfg = VFE3Config(**cfg_kw)
+    seed_everything(seed, deterministic=cfg.deterministic)
+    model = VFEModel(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     gen = torch.Generator().manual_seed(seed + 10_000)      # CPU generator -> device-independent data
     model.train()

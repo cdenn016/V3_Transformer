@@ -16,8 +16,8 @@ contrast under investigation. This is a SEPARATE, opt-in step from training.
 """
 
 import os
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each ship a libiomp5md.dll;
-#   the duplicate OpenMP init aborts the process. MUST run before `import torch`.
+if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import logging
 

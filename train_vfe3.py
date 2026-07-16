@@ -21,12 +21,11 @@ smoke) job: run it on the CUDA interpreter (the RTX 5090), or drop ``MAX_TOKENS`
 """
 
 import os
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each ship a
-#   libiomp5md.dll; the duplicate OpenMP init aborts the process (seen with n_e_steps>1). This MUST
-#   run before `import torch`. The clean fix is one OpenMP in the env (e.g. `conda install nomkl`);
-#   override by exporting KMP_DUPLICATE_LIB_OK yourself. See docs/edits/2026-06-05.
+if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import logging
+from pathlib import Path
 from typing import Dict, List, Sequence
 
 import torch
@@ -502,18 +501,39 @@ def _run_label(cfg: VFE3Config, dataset: str) -> str:
     return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}_s{cfg.seed}"
 
 
-def _run_dir(cfg: VFE3Config, dataset: str) -> 'str | None':
-    r"""In-progress run dir ``vfe3_runs/<timestamp>_<label>/`` (None if RUN_ROOT is None).
+def _reserve_directory(root: Path, base: str) -> Path:
+    """Atomically reserve ``root/base`` and retry deterministic numeric suffixes on collision."""
+    root.mkdir(parents=True, exist_ok=True)
+    suffix = 1
+    while True:
+        candidate = root / (base if suffix == 1 else f"{base}_{suffix}")
+        try:
+            candidate.mkdir(exist_ok=False)
+        except FileExistsError:
+            suffix += 1
+            continue
+        return candidate
+
+
+def _run_dir(
+    cfg:     VFE3Config,
+    dataset: str,
+
+    *,
+    run_root: 'str | None' = None,
+) -> 'str | None':
+    r"""Reserve ``<run_root>/<timestamp>_<label>/`` (None when persistence is disabled).
 
     The timestamp keeps concurrent runs from colliding while training; ``_rename_run_by_ppl`` drops it in
-    favour of the held-out test perplexity once ``finalize_run`` has scored the test split.
+    favor of the held-out test perplexity once ``finalize_run`` has scored the test split.
     """
-    if RUN_ROOT is None:
+    selected_root = RUN_ROOT if run_root is None else run_root
+    if selected_root is None:
         return None
     from datetime import datetime
-    from pathlib import Path
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return str(Path(RUN_ROOT) / f"{stamp}_{_run_label(cfg, dataset)}")
+    base = f"{stamp}_{_run_label(cfg, dataset)}"
+    return str(_reserve_directory(Path(selected_root), base))
 
 
 def _rename_run_by_ppl(
@@ -552,11 +572,17 @@ def _rename_run_by_ppl(
     return str(dst)
 
 
-def _run_once(seed: int, logger: logging.Logger) -> None:
+def _run_once(
+    seed:   int,
+    logger: logging.Logger,
+
+    *,
+    run_root: 'str | None' = None,
+) -> None:
     r"""One full, independent training run at ``seed`` (build -> train -> val -> test/finalize).
 
     Builds a fresh ``VFE3Config`` from ``config`` with ``seed`` overridden, seeds the RNG, and runs the
-    complete pipeline into its own seed-labelled artifacts dir. Called once per resolved seed by
+    complete pipeline into its own seed-labeled artifacts dir. Called once per resolved seed by
     :func:`main`, so a multi-seed launch yields one independent, comparable run folder per seed.
     """
     import time
@@ -579,7 +605,7 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
 
     # Run-artifacts directory (config.json, metrics.csv, checkpoints/, best_model.pt, figures).
     # None disables persistence (RUN_ROOT = None); the synthetic fallback also runs unsaved-free.
-    run_dir = _run_dir(cfg, DATASET)
+    run_dir = _run_dir(cfg, DATASET, run_root=run_root)
     artifacts = None
     if run_dir is not None:
         from datetime import datetime
@@ -659,6 +685,8 @@ def _resolve_seeds(
     num_runs:   int,
 ) -> List[int]:
     """Resolve click-to-run seeds without silently overriding a one-run config seed."""
+    if isinstance(num_runs, bool) or not isinstance(num_runs, int) or num_runs <= 0:
+        raise ValueError(f"NUM_RUNS must be a positive integer, got {num_runs!r}")
     if seeds:
         if len(seeds) < num_runs:
             raise ValueError(
@@ -670,7 +698,10 @@ def _resolve_seeds(
                 f"SEEDS[0]={int(seeds[0])} conflicts with config seed={int(run_config['seed'])}; "
                 "make the one-run seed values agree"
             )
-        return [int(seed) for seed in seeds[:num_runs]]
+        selected = [int(seed) for seed in seeds[:num_runs]]
+        if len(set(selected)) != len(selected):
+            raise ValueError(f"selected SEEDS must be unique, got {selected!r}")
+        return selected
     if num_runs != 1:
         raise ValueError(f"NUM_RUNS={num_runs} > 1 but SEEDS is empty; list one seed per run in SEEDS")
     return [int(run_config["seed"])]
@@ -678,16 +709,31 @@ def _resolve_seeds(
 
 def main() -> None:
     r"""Click-to-run entry: train ``NUM_RUNS`` independent seeds back-to-back (default: one run on the
-    config ``seed``). Run i uses ``SEEDS[i]``; each run is fully independent with its own seed-labelled
-    artifacts directory, so a multi-seed launch produces one comparable run folder per seed.
+    config ``seed``). Run i uses ``SEEDS[i]``; each run is fully independent with its own seed-labeled
+    artifacts directory. A multi-seed launch owns one atomically reserved group containing its request
+    manifest and one comparable run folder per seed.
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger = logging.getLogger("train_vfe3")
     seeds = _resolve_seeds(config, seeds=SEEDS, num_runs=NUM_RUNS)
+    run_root = None
+    if RUN_ROOT is not None and len(seeds) > 1:
+        from datetime import datetime
+        from vfe3.run_artifacts import _write_json_atomic
+        group = _reserve_directory(
+            Path(RUN_ROOT),
+            f"multiseed_{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+        )
+        run_root = str(group)
+        _write_json_atomic(group / "multiseed_request.json", {
+            "schema_version": 1,
+            "seeds": seeds,
+        })
+        logger.info("Multi-seed run group: %s", group)
     for i, s in enumerate(seeds):
         if len(seeds) > 1:
             logger.info("\n%s\n# Run %d/%d  (seed=%d)\n%s", "#" * 64, i + 1, len(seeds), int(s), "#" * 64)
-        _run_once(int(s), logger)
+        _run_once(int(s), logger, run_root=run_root)
 
 
 if __name__ == "__main__":

@@ -22,8 +22,8 @@ collapses seeds keyed on the persisted ``best_val_ppl`` (never a test metric) in
 """
 
 import os
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # keep parity with the rest of the suite; numpy
-#   here pulls no torch, but the figures import vfe3.viz which may, so set it before any heavy import.
+if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import csv
 import json
@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import numpy as np
 
 from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
+from vfe3.run_artifacts import _write_json_atomic
 
 logger = logging.getLogger("scaling_analysis")
 
@@ -135,6 +136,67 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
             "git_sha":     prov.get("git_sha"),
         })
     return rows
+
+
+def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Left-join the declared scaling cells to harvested results and classify every request."""
+    path = input_dir / "scaling_design.json"
+    raw = _read_json(path)
+    requested = raw.get("cells")
+    if raw.get("schema_version") != 1 or not isinstance(requested, list):
+        return {
+            "available": False,
+            "complete": None,
+            "status": "unverifiable_design",
+            "cells": [],
+            "counts": {},
+        }
+
+    observed: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            key = (str(row["route"]), str(row["label"]), int(row["seed"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        observed.setdefault(key, []).append(row)
+
+    cells: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {}
+    for item in requested:
+        if not isinstance(item, Mapping):
+            cell = {"status": "unreadable", "error": "design cell is not a mapping"}
+        else:
+            cell = dict(item)
+            try:
+                key = (str(cell["route"]), str(cell["label"]), int(cell["seed"]))
+            except (KeyError, TypeError, ValueError):
+                cell["status"] = "unreadable"
+                cell["error"] = "design cell lacks a valid route, label, or seed"
+            else:
+                matches = observed.get(key, [])
+                declared = str(cell.get("status", "pending"))
+                if declared in {"failed", "nonfinite", "unreadable"}:
+                    cell["status"] = declared
+                elif len(matches) > 1:
+                    cell["status"] = "duplicate"
+                elif not matches:
+                    cell["status"] = "missing"
+                else:
+                    value = _as_float(matches[0].get("test_ce"))
+                    cell["status"] = (
+                        "complete" if np.isfinite(value) and value > 0.0 else "nonfinite"
+                    )
+        status = str(cell.get("status", "unreadable"))
+        counts[status] = counts.get(status, 0) + 1
+        cells.append(cell)
+    complete = bool(cells) and counts.get("complete", 0) == len(cells)
+    return {
+        "available": True,
+        "complete": complete,
+        "status": "complete" if complete else "incomplete",
+        "cells": cells,
+        "counts": counts,
+    }
 
 
 def write_csv(rows: List[Dict[str, Any]], out_path: Path) -> None:
@@ -440,7 +502,8 @@ def analyze() -> None:
         raise FileNotFoundError(f"input_dir {input_dir} does not exist; run scaling.py first")
 
     rows = harvest(input_dir)
-    if not rows:
+    design = _requested_design(input_dir, rows)
+    if not rows and not design["available"]:
         print(f"No runs (with summary.json) under {input_dir}; run scaling.py first.")
         return
     fig_dir = input_dir / "figures"
@@ -450,20 +513,26 @@ def analyze() -> None:
           f"\n  csv:     {input_dir / 'scaling_points.csv'}")
 
     points = aggregate_points(rows)
+    allow_parameter_fit = design["complete"] is not False
     # PB-07: best_val_ppl-keyed validation points for the two registered supplementary figures --
     # best-effort: aggregate_validation_points keeps its fail-loud ValueError (an explicit-null
     # best_val_ppl beside finite sibling seeds is a data-integrity fault, never silently dropped or
     # substituted with a test metric), but that fault withholds ONLY the validation figures; it must
     # never abort the legacy test-metric analysis below.
-    try:
-        validation_points: Optional[List[Dict[str, Any]]] = aggregate_validation_points(rows)
-    except Exception as exc:
-        logger.warning("validation-point aggregation failed (%s); capacity_scaling/pareto_frontier withheld", exc)
+    if allow_parameter_fit:
+        try:
+            validation_points: Optional[List[Dict[str, Any]]] = aggregate_validation_points(rows)
+        except Exception as exc:
+            logger.warning("validation-point aggregation failed (%s); capacity_scaling/pareto_frontier withheld", exc)
+            validation_points = None
+    else:
         validation_points = None
     param_points = [p for p in points if p["route"] != INFERENCE_ROUTE]
     infer_points = [p for p in points if p["route"] == INFERENCE_ROUTE]
+    fit_infer_points = infer_points if allow_parameter_fit else []
     fit_param_mask = np.array([
-        np.isfinite(_as_float(p.get("n_params"))) and _as_float(p.get("n_params")) > 0.0
+        allow_parameter_fit
+        and np.isfinite(_as_float(p.get("n_params"))) and _as_float(p.get("n_params")) > 0.0
         for p in param_points
     ], dtype=bool)
     fit_param_points = [p for p, keep in zip(param_points, fit_param_mask) if keep]
@@ -490,7 +559,11 @@ def analyze() -> None:
         logger.warning("harvested parameter runs span multiple token budgets -- data budget confounds the fit")
 
     routes = sorted({p["route"] for p in fit_param_points})
-    frontier = ancova_frontier_collapse(fit_param_points, min_points=CONFIG["min_points"])
+    frontier = (
+        ancova_frontier_collapse(fit_param_points, min_points=CONFIG["min_points"])
+        if allow_parameter_fit
+        else {"testable": False, "collapses": None, "reason": "incomplete_design"}
+    )
     route_notes = {route: _ROUTE_NOTES[route] for route in routes if route in _ROUTE_NOTES}
 
     # Accumulate the printed fits / tests into a persisted summary (scaling_summary.json plus the
@@ -500,6 +573,7 @@ def analyze() -> None:
         "input_dir": str(input_dir), "n_runs": len(rows), "with_offset": CONFIG["with_offset"],
         "n_param_points": len(param_points), "n_inference_points": len(infer_points),
         "n_fitted_param_points": len(fit_param_points),
+        "design": design,
         "provenance": provenance, "pooled_fit": None, "pooled_fit_status": "not_fitted",
         "pooled_fit_confounds": [], "per_route": {}, "frontier_collapse": frontier,
         "route_notes": route_notes, "estep_structural": None,
@@ -584,12 +658,15 @@ def analyze() -> None:
     else:
         print(f"\nfrontier-collapse F-test: not testable ({frontier.get('reason')})")
 
-    status, confounds = _pooled_status(
-        provenance,
-        frontier,
-        has_fit=summary["pooled_fit"] is not None,
-        n_routes=len(routes),
-    )
+    if allow_parameter_fit:
+        status, confounds = _pooled_status(
+            provenance,
+            frontier,
+            has_fit=summary["pooled_fit"] is not None,
+            n_routes=len(routes),
+        )
+    else:
+        status, confounds = "incomplete_design", ["incomplete_design"]
     summary["pooled_fit_status"] = status
     summary["pooled_fit_confounds"] = confounds
     if summary["pooled_fit"] is not None:
@@ -597,7 +674,7 @@ def analyze() -> None:
         print(f"pooled fit status: {status.upper()}{detail}")
 
     # ---- C2/EXP-5: structural non-Neal-Hinton EM -- F-vs-CE decorrelation across the n_e_steps arms ----
-    estep_pts = sorted([p for p in infer_points if p["scale_knob"] == "n_e_steps"
+    estep_pts = sorted([p for p in fit_infer_points if p["scale_knob"] == "n_e_steps"
                         and np.isfinite(p.get("f_mean", float("nan")))],
                        key=lambda q: q["n_e_steps"])
     if len(estep_pts) >= 2:
@@ -618,8 +695,7 @@ def analyze() -> None:
     # ---- persist the analysis summary (json + a human-readable markdown report); best-effort so a
     # serialization/render error never suppresses the figure pass below ----
     try:
-        (input_dir / "scaling_summary.json").write_text(
-            json.dumps(summary, indent=2, default=str), encoding="utf-8")
+        _write_json_atomic(input_dir / "scaling_summary.json", summary)
         _write_scaling_md(input_dir / "SCALING_ANALYSIS.md", summary)
         print(f"\nsummary -> {input_dir / 'scaling_summary.json'}"
               f"\n           {input_dir / 'SCALING_ANALYSIS.md'}")
@@ -627,7 +703,8 @@ def analyze() -> None:
         logger.warning("scaling summary write failed (%s); skipped", exc)
 
     # ---- figures (best-effort, never fatal) ----
-    _make_figures(param_points, infer_points, fig_dir, weights_by_route=weights_by_route,
+    figure_param_points = param_points if allow_parameter_fit else []
+    _make_figures(figure_param_points, fit_infer_points, fig_dir, weights_by_route=weights_by_route,
                   validation_points=validation_points, axis_routes=AXIS_ROUTES)
     print(f"\nfigures -> {fig_dir}")
 

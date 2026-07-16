@@ -42,10 +42,8 @@ Three guards make this safe for VFE_3.0's strict config surface:
 """
 
 import os
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each ship a
-#   libiomp5md.dll; the duplicate OpenMP init aborts the process (seen with n_e_steps>1). This MUST
-#   run before `import torch`. The clean fix is one OpenMP in the env (e.g. `conda install nomkl`);
-#   override by exporting KMP_DUPLICATE_LIB_OK yourself. See docs/edits/2026-06-05.
+if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import copy
 import csv
@@ -82,6 +80,8 @@ from vfe3.run_artifacts import (
     RunArtifacts,
     _atomic_replace,
     _git_code_identity,
+    _unique_sibling_temp,
+    _write_json_atomic,
     finalize_validation_run,
     semantic_config_fingerprint,
 )
@@ -594,11 +594,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "gauge group",
         "configs": [
             {"label": "block_glk",      "gauge_group": "block_glk"},
-            {"label": "tied_block_glk", "gauge_group": "tied_block_glk"},
+            {"label": "tied_block_glk", "gauge_group": "tied_block_glk",
+                                          "phi_precond_mode": "killing"},
             {"label": "glk",            "gauge_group": "glk",  "use_head_mixer": False},
             {"label": "so_k",           "gauge_group": "so_k", "use_head_mixer": False},
             {"label": "sp",             "gauge_group": "sp",   "use_head_mixer": False},
-            {"label": "so3_spin2x4",    "gauge_group": "so_n", "group_n": 3,
+            {"label": "so3_spin2x4",    "gauge_group": "so_n", "group_n": 3, "n_heads": 4,
              "irrep_spec": [("l2", 4)],                       "phi_precond_mode": "killing"},
             #{"label": "so3_tower",      "gauge_group": "so_n", "group_n": 3,
             # "irrep_spec": [("l0", 1), ("l1", 1), ("l3", 1), ("l4", 1)],
@@ -664,8 +665,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "connection regime: flat phi-cocycle vs learned non-flat (regime_ii bilinear, regime_ii_covariant Route B)",
         "configs": [
             {"label": "flat",                "transport_mode": "flat"},
-            {"label": "regime_ii",           "transport_mode": "regime_ii"},
-            {"label": "regime_ii_covariant", "transport_mode": "regime_ii_covariant"},
+            {"label": "regime_ii",           "transport_mode": "regime_ii",
+                                                "e_step_update": "gradient"},
+            {"label": "regime_ii_covariant", "transport_mode": "regime_ii_covariant",
+                                                "e_step_update": "gradient"},
         ],
     },
     
@@ -673,7 +676,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "cocycle_relaxation": {
         "description": "regime_ii homotopy (0 -> flat, 1 -> fully relaxed)",
         "param": "cocycle_relaxation", "values": [0.0, 0.5, 1.0],
-        "requires": {"transport_mode": "regime_ii"},
+        "requires": {"transport_mode": "regime_ii", "e_step_update": "gradient"},
     },
     
     
@@ -682,7 +685,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "cross-head GL(K) coupling (block-diagonal vs one coupled pair)",
         "configs": [
             {"label": "none",     "cross_couplings": None},
-            {"label": "pair_0_1", "cross_couplings": [(0, 1)]},
+            {"label": "pair_0_1", "cross_couplings": [(0, 1)],
+                                  "beta_attention_prior": "causal_noself",
+                                  "gamma_attention_prior": "causal_noself"},
         ],
         "requires": {"use_head_mixer": False},
     },
@@ -996,7 +1001,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "gauge-RoPE positional rotation (means-only) on/off",
         "configs": [
             {"label": "none", "pos_rotation": "none"},
-            {"label": "rope", "pos_rotation": "rope"},
+            {"label": "rope", "pos_rotation": "rope", "e_step_update": "gradient"},
         ],
     },
     
@@ -1010,13 +1015,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "rope_base": {
         "description": "RoPE rotary frequency base",
         "param": "rope_base", "values": [10.0, 100.0, 1000.0],
-        "requires": {"pos_rotation": "rope"},
+        "requires": {"pos_rotation": "rope", "e_step_update": "gradient"},
     },
     "rope_full_gauge": {  # rotating the covariance sandwich needs full covariance
         "description": "RoPE means-only vs full-gauge (rotates covariance; needs full cov)",
         "configs": [
-            {"label": "means_only", "pos_rotation": "rope"},
+            {"label": "means_only", "pos_rotation": "rope", "e_step_update": "gradient"},
             {"label": "full_gauge", "pos_rotation": "rope", "rope_full_gauge": True,
+                                    "e_step_update": "gradient",
                                     "family": "gaussian_full",
                                     "lambda_alpha_mode": "state_dependent"},
         ],
@@ -1031,7 +1037,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "belief covariance structure (diagonal vs full Gaussian)",
         "configs": [
             {"label": "diagonal", "family": "gaussian_diagonal"},
-            {"label": "full",     "family": "gaussian_full",
+            {"label": "full",     "family": "gaussian_full", "e_step_update": "gradient",
                                   "lambda_alpha_mode": "state_dependent"},
         ],
     },
@@ -1084,7 +1090,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # collect_diagnostics captures attn_entropy (H(beta)) + energy_klmax_frac (the saturation
         # fraction) per cell -> the renyi_saturation figure.
         "description": "Renyi divergence order alpha (both sides of 1) + non-PD saturation diagnostic [B2/EXP-12]",
-        "param": "renyi_order", "values": [0.5, 0.8, 1.0, 1.2, 1.5, 2.0],
+        "configs": [
+            {"label": "renyi_order=0.5", "renyi_order": 0.5, "e_step_update": "gradient"},
+            {"label": "renyi_order=0.8", "renyi_order": 0.8, "e_step_update": "gradient"},
+            {"label": "renyi_order=1.0", "renyi_order": 1.0},
+            {"label": "renyi_order=1.2", "renyi_order": 1.2, "e_step_update": "gradient"},
+            {"label": "renyi_order=1.5", "renyi_order": 1.5, "e_step_update": "gradient"},
+            {"label": "renyi_order=2.0", "renyi_order": 2.0, "e_step_update": "gradient"},
+        ],
         "requires": {"oracle_unroll_grad": True},
         "collect_diagnostics": True,
     },
@@ -1599,7 +1612,7 @@ def _swept_field_names(sweep: Dict[str, Any]) -> List[str]:
 
 
 def validate_sweeps(sweep_names: List[str]) -> None:
-    r"""Abort with the offending names unless every swept field is a real VFE3Config field.
+    r"""Abort unless every named arm references real fields and constructs against the baseline.
 
     VFE3Config(**cfg) would silently ignore an unknown kwarg only if it were dropped first;
     here a bad name would instead raise a TypeError mid-run (or, worse under a dict-merge
@@ -1620,6 +1633,21 @@ def validate_sweeps(sweep_names: List[str]) -> None:
             "ablation SWEEPS reference field(s) that do not exist on VFE3Config "
             f"(typo? renamed?):\n{lines}"
         )
+    construction_errors: List[Tuple[str, str, str]] = []
+    for name in sweep_names:
+        for label, overrides in make_run_overrides(name):
+            cfg = dict(BASELINE_CONFIG)
+            cfg.update(overrides)
+            try:
+                VFE3Config(**cfg)
+            except (TypeError, ValueError) as exc:
+                construction_errors.append((name, label, str(exc)))
+    if construction_errors:
+        lines = "\n".join(
+            f"  sweep {sweep!r}, arm {label!r}: {error}"
+            for sweep, label, error in construction_errors
+        )
+        raise ValueError(f"ablation arm construction failed:\n{lines}")
 
 
 # =============================================================================
@@ -2004,9 +2032,9 @@ def run_single(
     if paired_token_bootstrap:
         per_token = per_unit_eval_nats(model, val_loader, device=device)["per_token_nats"]
         final_path = run_dir / "val_token_nats.pt"
-        tmp_path = run_dir / "val_token_nats.pt.tmp"
-        torch.save(per_token.detach().cpu(), tmp_path)
-        _atomic_replace(final_path, tmp_path)
+        with _unique_sibling_temp(final_path) as tmp_path:
+            torch.save(per_token.detach().cpu(), tmp_path)
+            _atomic_replace(final_path, tmp_path)
         token_identity = {
             "path":       final_path.name,
             "sha256":     _sha256_file(final_path),
@@ -2428,10 +2456,8 @@ def run_sweep(
         # a reader that sees the success marker always sees a fully-written contract; a failed cell
         # publishes no contract. Neither file is written after a training exception.
         if successful and contract is not None:
-            tmp = contract_path.parent / (contract_path.name + ".tmp")
-            tmp.write_text(json.dumps(contract, indent=2), encoding="utf-8")
-            _atomic_replace(contract_path, tmp)
-        marker.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+            _write_json_atomic(contract_path, contract)
+        _write_json_atomic(marker, result)
         results.append(result)
 
         ppl = result["primary_val_ppl"]
@@ -3146,7 +3172,7 @@ def main() -> None:
     for name in sweep_names:
         if name not in SWEEPS:
             raise ValueError(f"unknown sweep {name!r}; choose from {sorted(SWEEPS)}")
-    validate_sweeps(sweep_names)                             # guard #1: loud field check
+    validate_sweeps(list(SWEEPS))                            # all declared arms must construct upfront
 
     output_dir.mkdir(parents=True, exist_ok=True)
     fig_dir = output_dir / "figures"

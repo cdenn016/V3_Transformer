@@ -13,10 +13,8 @@ this driver re-runs that same model-replay set on demand for an already-trained 
 """
 
 import os
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Anaconda + PyTorch each ship a
-#   libiomp5md.dll; the duplicate OpenMP init aborts the process. This MUST run before `import torch`
-#   (also covers the umap/numba OpenMP that the figures pull in). The clean fix is one OpenMP in the
-#   env (e.g. `conda install nomkl`); override by exporting KMP_DUPLICATE_LIB_OK yourself.
+if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import json
 import logging

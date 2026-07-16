@@ -31,10 +31,12 @@ import math
 import os
 import shutil
 import subprocess
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, fields
 from pathlib import Path, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -323,6 +325,41 @@ def _atomic_replace(
             raise
 
 
+@contextmanager
+def _unique_sibling_temp(final: Path) -> Iterator[Path]:
+    r"""Yield a uniquely reserved same-directory temporary path for one artifact writer.
+
+    ``mkstemp`` performs the reservation atomically, so concurrent writers to the same final
+    artifact never share a temporary filename.  The caller must publish with
+    :func:`_atomic_replace`; this context also removes an unconsumed temporary after any failure.
+    """
+    final = Path(final)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_path = tempfile.mkstemp(
+        dir=str(final.parent),
+        prefix=f".{final.name}.",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    tmp = Path(raw_path)
+    try:
+        yield tmp
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _write_json_atomic(final: Path, obj: object) -> Path:
+    """Serialize JSON through a unique same-directory temporary and atomically publish it."""
+    final = Path(final)
+    with _unique_sibling_temp(final) as tmp:
+        tmp.write_text(json.dumps(obj, indent=2, default=str), encoding="utf-8")
+        _atomic_replace(final, tmp)
+    return final
+
+
 def _selection_semantic_config(
     config: 'VFE3Config | Mapping[str, object]',
 ) -> Dict[str, object]:
@@ -414,19 +451,15 @@ def _publish_best_model_bundle(
 ) -> None:
     r"""Revalidate ``bundle`` against the live run and atomically publish it as the run's ``best_model.pt``.
 
-    Writes through a same-directory ``.pt.tmp`` and ``os.replace`` so no reader ever sees a partial
+    Writes through a uniquely reserved same-directory temporary and ``os.replace`` so no reader sees a partial
     bundle; revalidates the exact bytes it writes (a byte-for-byte round-trip through
     :func:`_read_best_model_bundle`) so a corrupt in-memory bundle fails closed before it is published.
     The bundle is NEVER loaded into the live training model -- publication only makes the selection
     checkpoint reachable in the new run directory for later finalization."""
-    tmp = artifacts.best_path.with_suffix(".pt.tmp")
-    torch.save(dict(bundle), tmp)
-    try:
+    with _unique_sibling_temp(artifacts.best_path) as tmp:
+        torch.save(dict(bundle), tmp)
         _read_best_model_bundle(tmp, artifacts.cfg, expected_model_state, "cpu")
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-    _atomic_replace(artifacts.best_path, tmp)
+        _atomic_replace(artifacts.best_path, tmp)
 
 
 class RunArtifacts:
@@ -471,18 +504,14 @@ class RunArtifacts:
     def save_json(self, name: str, obj: dict) -> Path:
         r"""Write ``obj`` as pretty JSON to ``run_dir/name`` (non-serializable -> str).
 
-        Atomic: written to a same-directory ``.tmp`` then published via ``os.replace``, so a crash
+        Atomic: written to a unique same-directory temporary then published via ``os.replace``, so a crash
         mid-write can never leave a truncated/partial JSON at the final name."""
         candidate         = Path(name)
         windows_candidate = PureWindowsPath(name)
         if (not name or name in {".", ".."} or "/" in name or "\\" in name
                 or candidate.name != name or candidate.is_absolute() or windows_candidate.drive):
             raise ValueError(f"artifact name must be a regular bare filename, got {name!r}")
-        path = self.run_dir / name
-        tmp  = self.run_dir / (name + ".tmp")
-        tmp.write_text(json.dumps(obj, indent=2, default=str))
-        _atomic_replace(path, tmp)
-        return path
+        return _write_json_atomic(self.run_dir / name, obj)
 
     def log_metrics(self, row: Dict[str, float]) -> None:
         r"""Append one metrics row to ``metrics.csv`` (header written on the first call).
@@ -518,9 +547,9 @@ class RunArtifacts:
                 "config":             config,
                 "config_fingerprint": semantic_config_fingerprint(config),
             }
-            tmp = self.best_path.with_suffix(".pt.tmp")
-            torch.save(bundle, tmp)
-            _atomic_replace(self.best_path, tmp)
+            with _unique_sibling_temp(self.best_path) as tmp:
+                torch.save(bundle, tmp)
+                _atomic_replace(self.best_path, tmp)
             return True
         return False
 
@@ -661,7 +690,6 @@ class RunArtifacts:
         the state tensor is cloned into the bundle so later generator advances cannot mutate it.
         """
         path = self.ckpt_dir / f"step_{step}.pt"
-        tmp  = path.with_suffix(".pt.tmp")
         rng_state = {
             "cpu":  torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -700,23 +728,24 @@ class RunArtifacts:
             best_model_bundle  = None
             saved_best_val_ppl = float("inf")
             saved_best_step    = None
-        torch.save({
-            "step":            int(step),
-            "model_state":     model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "rng_state":       rng_state,
-            "metropolis_rng_state": (metropolis_generator.get_state()
-                                      if metropolis_generator is not None else None),
-            "config":          asdict(cfg),
-            "scaler_state":    (scaler.state_dict()
-                                if scaler is not None and scaler.is_enabled() else None),
-            "ema_state":       (ema.state_dict() if ema is not None else None),
-            "best_val_ppl":    saved_best_val_ppl,
-            "best_step":       saved_best_step,
-            "best_model_bundle": best_model_bundle,
-            "data_state":      saved_data_state,
-        }, tmp)
-        _atomic_replace(path, tmp)
+        with _unique_sibling_temp(path) as tmp:
+            torch.save({
+                "step":            int(step),
+                "model_state":     model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "rng_state":       rng_state,
+                "metropolis_rng_state": (metropolis_generator.get_state()
+                                          if metropolis_generator is not None else None),
+                "config":          asdict(cfg),
+                "scaler_state":    (scaler.state_dict()
+                                    if scaler is not None and scaler.is_enabled() else None),
+                "ema_state":       (ema.state_dict() if ema is not None else None),
+                "best_val_ppl":    saved_best_val_ppl,
+                "best_step":       saved_best_step,
+                "best_model_bundle": best_model_bundle,
+                "data_state":      saved_data_state,
+            }, tmp)
+            _atomic_replace(path, tmp)
         return path
 
 
