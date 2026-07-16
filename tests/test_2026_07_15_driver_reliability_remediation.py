@@ -414,6 +414,39 @@ def test_multiseed_launch_persists_failed_cell_status(tmp_path):
     ]
 
 
+def test_multiseed_launch_is_running_before_first_seed_starts(tmp_path):
+    launch_root = tmp_path / "launches"
+    observed = []
+
+    def inspect_manifest(seed, logger, *, run_root=None):
+        del logger
+        observed.append((
+            seed,
+            json.loads((Path(run_root) / "multiseed_request.json").read_text(encoding="utf-8")),
+        ))
+
+    with (
+        mock.patch.object(train_vfe3, "RUN_ROOT", str(launch_root)),
+        mock.patch.object(train_vfe3, "NUM_RUNS", 2),
+        mock.patch.object(train_vfe3, "SEEDS", (1, 2)),
+        mock.patch.object(train_vfe3, "_run_once", inspect_manifest),
+    ):
+        train_vfe3.main()
+
+    assert observed[0] == (1, {
+        "schema_version": 1,
+        "status": "running",
+        "seeds": [1, 2],
+        "cells": [
+            {"seed": 1, "status": "pending"},
+            {"seed": 2, "status": "pending"},
+        ],
+    })
+    assert observed[1][0] == 2
+    assert observed[1][1]["status"] == "running"
+    assert observed[1][1]["cells"][0] == {"seed": 1, "status": "complete"}
+
+
 @pytest.mark.parametrize("failure", ["missing", "failed", "unreadable", "nonfinite"])
 def test_multiseed_withholds_curves_layers_and_main_publication_for_bad_requested_seed(
     tmp_path, monkeypatch, failure,

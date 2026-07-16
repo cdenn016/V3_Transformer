@@ -195,19 +195,101 @@ def test_aggregate_scalar_reads_dotted_research_key(tmp_path):
     assert out["n"] == 2 and abs(out["mean"] - 8.0) < 1e-9
 
 
-def test_aggregate_seed_curves_aligns_and_handles_nan(tmp_path):
+@pytest.mark.parametrize(
+    ("first_source", "expected_status"),
+    [
+        ("{ not json", "unreadable"),
+        (json.dumps({"test_ppl": float("inf")}), "nonfinite"),
+    ],
+)
+def test_aggregate_scalar_does_not_fallback_past_corrupt_or_nonfinite_source(
+    tmp_path, first_source, expected_status,
+):
     _write_request(tmp_path, [1, 2])
-    _write_full_run(tmp_path / "a", ppl=1.0, seed=1, metrics="step,x,y\n100,1,\n200,3,9\n")
+    _write_full_run(tmp_path / "a", ppl=10.0, seed=1)
+    _write_full_run(tmp_path / "b", ppl=11.0, seed=2)
+    (tmp_path / "b" / "summary.json").write_text(first_source)
+    (tmp_path / "b" / "test_results.json").write_text(json.dumps({"test_ppl": 99.0}))
+
+    out = ms.aggregate_scalar(tmp_path, "test_ppl")
+
+    assert out["n"] == 1 and out["values"] == [10.0]
+    assert out["complete"] is False
+    assert {cell["seed"]: cell["status"] for cell in out["cells"]} == {
+        1: "complete",
+        2: expected_status,
+    }
+
+
+def test_aggregate_scalar_falls_back_when_earlier_source_is_absent(tmp_path):
+    _write_request(tmp_path, [1, 2])
+    _write_full_run(tmp_path / "a", ppl=10.0, seed=1)
+    _write_full_run(tmp_path / "b", ppl=11.0, seed=2)
+    (tmp_path / "b" / "summary.json").unlink()
+    (tmp_path / "b" / "test_results.json").write_text(json.dumps({"test_ppl": 12.0}))
+
+    out = ms.aggregate_scalar(tmp_path, "test_ppl")
+
+    assert out["complete"] is True
+    assert out["values"] == [10.0, 12.0]
+
+
+def test_aggregate_seed_curves_aligns_every_requested_seed(tmp_path):
+    _write_request(tmp_path, [1, 2])
+    _write_full_run(tmp_path / "a", ppl=1.0, seed=1, metrics="step,x,y\n100,1,5\n200,3,9\n")
     _write_full_run(tmp_path / "b", ppl=1.0, seed=2, metrics="step,x,y\n100,3,7\n200,5,11\n")
     curves = ms.aggregate_seed_curves(tmp_path, columns=["x", "y"])
     np.testing.assert_allclose(curves["x"]["steps"], [100, 200])
     np.testing.assert_allclose(curves["x"]["mean"], [2.0, 4.0])
     np.testing.assert_allclose(curves["x"]["sd"][0], math.sqrt(2.0))      # ddof=1 over {1,3}
     np.testing.assert_allclose(curves["x"]["n"], [2, 2])
-    # y is empty in seed a at step 100 -> NaN-aware mean uses seed b only, n=1, sd undefined.
-    np.testing.assert_allclose(curves["y"]["mean"], [7.0, 10.0])
-    np.testing.assert_allclose(curves["y"]["n"], [1, 2])
-    assert math.isnan(curves["y"]["sd"][0])
+    np.testing.assert_allclose(curves["y"]["mean"], [6.0, 10.0])
+    np.testing.assert_allclose(curves["y"]["n"], [2, 2])
+
+
+@pytest.mark.parametrize(
+    "seed_two_metrics",
+    [
+        "step,x\n100,3\n",
+        "step,x\n100,3\n200,inf\n",
+    ],
+    ids=["missing-step", "nonfinite-point"],
+)
+def test_aggregate_seed_curves_withholds_partial_seed_points_and_main_figures(
+    tmp_path, monkeypatch, seed_two_metrics,
+):
+    _write_request(tmp_path, [1, 2])
+    layer = "layer,self_coupling\n0,1.0\n"
+    _write_full_run(
+        tmp_path / "a",
+        ppl=10.0,
+        seed=1,
+        metrics="step,x\n100,1\n200,2\n",
+        per_layer=layer,
+    )
+    _write_full_run(
+        tmp_path / "b",
+        ppl=11.0,
+        seed=2,
+        metrics=seed_two_metrics,
+        per_layer=layer,
+    )
+
+    assert ms.aggregate_seed_curves(tmp_path, columns=["x"]) == {}
+
+    emitted = []
+    monkeypatch.setitem(ms.CONFIG, "run_root", str(tmp_path))
+    monkeypatch.setitem(ms.CONFIG, "key", "test_ppl")
+    monkeypatch.setattr(ms, "SCALAR_KEYS", ["test_ppl"])
+    monkeypatch.setattr(ms, "_emit_figures", lambda *args: emitted.append(args))
+
+    ms.main()
+
+    summary = json.loads((tmp_path / "multiseed_summary.json").read_text(encoding="utf-8"))
+    assert summary["design"]["complete"] is False
+    assert summary["diagnostics"]["curves_complete"] is False
+    assert summary["withheld"]["figures"] is True
+    assert emitted == []
 
 
 def test_aggregate_per_layer(tmp_path):

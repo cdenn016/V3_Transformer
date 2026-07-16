@@ -736,6 +736,9 @@ def main() -> None:
         }
         _write_json_atomic(request_path, request_manifest)
         logger.info("Multi-seed run group: %s", group)
+    if request_manifest is not None and request_path is not None:
+        request_manifest["status"] = "running"
+        _write_json_atomic(request_path, request_manifest)
     for i, s in enumerate(seeds):
         if len(seeds) > 1:
             logger.info("\n%s\n# Run %d/%d  (seed=%d)\n%s", "#" * 64, i + 1, len(seeds), int(s), "#" * 64)

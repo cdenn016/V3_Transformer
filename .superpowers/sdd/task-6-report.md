@@ -89,3 +89,23 @@ python -m pytest tests/test_2026_07_15_driver_reliability_remediation.py tests/t
 ```
 
 JUnit recorded `tests=113 failures=0 errors=0 skipped=0 time=12.284`; pytest reported `113 passed, 70 warnings in 12.29s`. The two pre-existing scaling-analysis fixture helpers now create explicit completed request manifests, preserving their positive-fit and figure-publication coverage under the fail-closed contract. The run covered only the focused Task 6 module and the directly affected multiseed and scaling-analysis modules, as requested.
+
+## Q3 re-review repair
+
+The re-review closed three remaining multi-seed fail-closed gaps. Scalar aggregation now distinguishes an absent artifact from an existing corrupt artifact: a missing earlier source may fall back to the next contracted source, while malformed, non-object, or nonfinite data in an existing earlier source terminates that seed as unreadable or nonfinite. A later duplicate value cannot conceal the earlier corruption. Curve aggregation now requires a finite aligned value from every requested seed at every published step. Missing steps and nonfinite points withhold the curve set, causing `main()` to record incomplete curve status and withhold figures instead of publishing reduced-count means. The launcher now atomically promotes the request manifest from pending to running before invoking seed 1; later per-seed and terminal transitions are unchanged.
+
+The strict RED command was:
+
+```text
+python -m pytest tests/test_2026_07_15_driver_reliability_remediation.py tests/test_multiseed.py --junitxml=C:\tmp\vfe3-task6-rereview-red-20260716.xml
+```
+
+JUnit recorded `tests=68 failures=5 errors=0 skipped=0 time=8.367`; pytest reported `5 failed, 63 passed, 2 warnings in 8.37s`. The five failures were the first-seed pending-state observation, corrupt and nonfinite first-source fallback, and missing-step and nonfinite-point survivor curves.
+
+The final GREEN command was:
+
+```text
+python -m pytest tests/test_2026_07_15_driver_reliability_remediation.py tests/test_multiseed.py --junitxml=C:\tmp\vfe3-task6-rereview-green-20260716.xml
+```
+
+JUnit recorded `tests=68 failures=0 errors=0 skipped=0 time=5.956`; pytest reported `68 passed, 2 warnings in 5.96s`. This was the requested focused driver-reliability and directly affected multiseed gate, not the full suite.

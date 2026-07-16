@@ -340,33 +340,35 @@ def _aggregate_requested_metric(
             cells.append({"seed": seed, "status": design_cell["status"], "value": None})
             continue
         run_dir = Path(design_cell["run_dir"])
-        found = False
-        invalid = False
-        unreadable = False
+        status = "missing"
         value: Optional[float] = None
         for source in sources:
             source_path = run_dir / source
             if not source_path.is_file():
                 continue
-            payload = _read_json(source_path)
-            if not payload:
-                unreadable = True
-                continue
-            raw = _dig(payload, key)
-            if raw is None:
-                continue
-            found = True
-            value = _as_finite_float(raw)
-            if value is not None:
+            try:
+                payload = json.loads(source_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                status = "unreadable"
                 break
-            invalid = True
+            if not isinstance(payload, dict):
+                status = "unreadable"
+                break
+            present, raw = _dig_present(payload, key)
+            if not present:
+                continue
+            value = _as_finite_float(raw)
+            if value is None:
+                status = "nonfinite"
+                break
+            status = "complete"
+            break
         if value is not None:
             values.append(value)
             value_seeds.append(seed)
             cells.append({"seed": seed, "status": "complete", "value": value,
                           "run_dir": str(run_dir)})
         else:
-            status = "nonfinite" if found or invalid else "unreadable" if unreadable else "missing"
             cells.append({"seed": seed, "status": status, "value": None,
                           "run_dir": str(run_dir)})
     out = _summarize(values)
@@ -385,14 +387,14 @@ def _aggregate_requested_metric(
     return out
 
 
-def _dig(d: Dict[str, Any], dotted: str) -> Any:
-    r"""Nested lookup by dotted key (``"corpus_freq_strata_ce.rare"``); None if missing."""
+def _dig_present(d: Dict[str, Any], dotted: str) -> tuple[bool, Any]:
+    r"""Nested lookup by dotted key, distinguishing an absent key from an explicit null."""
     cur: Any = d
     for part in dotted.split("."):
         if not isinstance(cur, dict) or part not in cur:
-            return None
+            return False, None
         cur = cur[part]
-    return cur
+    return True, cur
 
 
 def aggregate_scalar(
@@ -443,9 +445,9 @@ def aggregate_seed_curves(
 ) -> Dict[str, Dict[str, np.ndarray]]:
     r"""Across-seed per-step curves from each seed's ``metrics.csv``.
 
-    Returns ``{column: {steps, mean, sd, n}}`` on the union ``x`` (step) grid, with the NaN-aware
-    across-seed mean / ddof=1 SD / finite-seed-count per step (sparse columns like ``val_*`` average
-    only the seeds that reported). ``columns=None`` -> every numeric column except ``x``.
+    Returns ``{column: {steps, mean, sd, n}}`` on the shared ``x`` (step) grid. Every published
+    value requires one finite aligned observation from every requested seed at that step;
+    otherwise the curve set is withheld. ``columns=None`` selects every numeric column except ``x``.
     """
     root = _resolve_run_root(run_root)
     design = _requested_seed_design(root)
@@ -484,14 +486,17 @@ def aggregate_seed_curves(
     for c in sel:
         if any(c not in seed_cols or not np.any(np.isfinite(seed_cols[c]))
                for _steps, seed_cols in per_seed):
-            continue
+            return {}
         stack = []
         for steps, cols in per_seed:
             row = np.full(grid.shape, np.nan)
             if c in cols:
                 row[np.searchsorted(grid, steps)] = cols[c]
             stack.append(row)
-        mean, sd, n = _nan_mean_sd(np.vstack(stack))
+        matrix = np.vstack(stack)
+        if not np.all(np.isfinite(matrix)):
+            return {}
+        mean, sd, n = _nan_mean_sd(matrix)
         out[c] = {"steps": grid, "mean": mean, "sd": sd, "n": n}
     return out
 
