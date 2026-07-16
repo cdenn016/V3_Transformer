@@ -1278,7 +1278,7 @@ def test_end_to_end_hierarchy_matrix(cell):
 _DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
-@pytest.mark.skipif(_DEVICE.type != "cuda",
+@pytest.mark.skipif(_DEVICE.type != "cuda" or not torch.cuda.is_available(),
                     reason="RTX 5090 CUDA smoke; set VFE3_TEST_DEVICE=cuda to run")
 def test_hierarchy_full_covariant_cuda_smoke():
     from vfe3.config import VFE3Config
@@ -1294,12 +1294,13 @@ def test_hierarchy_full_covariant_cuda_smoke():
             family="gaussian_full", decode_mode="full", prior_source="model_channel",
             s_e_step=True, transport_mode="regime_ii_covariant",
             lambda_h=0.5, lambda_gamma=0.5, r_update_mode="gradient", oracle_unroll_grad=True)
-        m = VFEModel(cfg).to(_DEVICE)
+        m = VFEModel(cfg)
     torch.manual_seed(3)
     with torch.no_grad():
         for p in m.parameters():
             if p.requires_grad and p.dim() >= 1:
                 p.normal_(0.0, 0.3)
+    m = m.to(_DEVICE)
 
     tok = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len), device=_DEVICE)
     tgt = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len), device=_DEVICE)
