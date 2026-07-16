@@ -34,7 +34,7 @@
 - Add `GaugeGroup.phi_norm_route() -> str`, returning `"diagonal_gram"` or `"dense_fallback"`.
 - Certify `glk`, non-closed `block_glk`, `tied_block_glk`, `so_k`, and `sp`; leave `so_n`, `sp_n`, and closed custom bases uncertified unless construction itself proves the property.
 
-- [ ] **Step 1: Write failing capability and Gram-invariant tests**
+- [x] **Step 1: Write failing capability and Gram-invariant tests**
 
 ```python
 @pytest.mark.parametrize("name,kwargs", [
@@ -60,23 +60,23 @@ def test_closed_basis_fails_closed_to_dense_route():
     assert group.phi_norm_route() == "dense_fallback"
 ```
 
-- [ ] **Step 2: Witness the missing metadata**
+- [x] **Step 2: Witness the missing metadata**
 
 Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py --junitxml=C:\tmp\vfe3-phi-projection-groups-red-20260715.xml`
 
 Expected: collection or attribute failures naming the absent `GaugeGroup` capability and methods.
 
-- [ ] **Step 3: Implement the minimum explicit capability and cache**
+- [x] **Step 3: Implement the minimum explicit capability and cache**
 
 Compute diagonal weights as `generators.square().sum(dim=(-2, -1)).detach()` only for certified groups. Cache the tensor and the optional uniform scalar without constructing a dense generator Gram. Mark `block_glk` certified when `close_basis=False`, including its unique elementary cross-coupling basis. Do not certify bracket-closed output.
 
-- [ ] **Step 4: Run the group tests**
+- [x] **Step 4: Run the group tests**
 
-Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_groups.py tests/test_generators.py --junitxml=C:\tmp\vfe3-phi-projection-groups-green-20260715.xml`
+Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_gauge_groups.py --junitxml=C:\tmp\vfe3-phi-projection-groups-green-20260715.xml`
 
 Expected: zero failures and zero errors.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add vfe3/geometry/groups.py tests/test_phi_projection_optimization_20260715.py
@@ -323,7 +323,7 @@ git commit -m "bench: verify phi projection scaling"
 
 - [ ] **Step 1: Run focused verification**
 
-Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py tests/test_train.py tests/test_viz.py tests/test_run_artifacts.py tests/test_groups.py tests/test_generators.py --junitxml=C:\tmp\vfe3-phi-projection-focused-final-20260715.xml`
+Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py tests/test_train.py tests/test_viz.py tests/test_run_artifacts.py tests/test_gauge_groups.py --junitxml=C:\tmp\vfe3-phi-projection-focused-final-20260715.xml`
 
 Read `tests`, `failures`, `errors`, `skipped`, and `time` from JUnit before recording results.
 

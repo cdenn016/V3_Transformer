@@ -43,9 +43,58 @@ class GaugeGroup:
     irrep_labels:         Optional[List[str]]    = None      # per-block label ('l1', 'sym2', ...); None = label-less
     algebra:              Optional[str]          = None      # irrep-registry algebra key ('so' | 'sp'); None = label-less
     phi_coordinate_layout: Optional[str]         = None      # explicit packed-coordinate capability; None = unknown
+    frobenius_gram_diagonal: bool                = False     # certified <G_a,G_b>_F=0 for a != b
 
     # Cached pseudo-inverse of the generator Frobenius Gram (computed once, off __init__/eq/repr).
     _gram_pinv_cache:     Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
+    _gram_diagonal_cache: Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
+    _gram_diagonal_key:   Optional[tuple]        = field(default=None, init=False, repr=False, compare=False)
+    _gram_uniform_cache:  Optional[float]        = field(default=None, init=False, repr=False, compare=False)
+    _gram_uniform_key:    Optional[tuple]        = field(default=None, init=False, repr=False, compare=False)
+    _gram_uniform_ready:  bool                   = field(default=False, init=False, repr=False, compare=False)
+
+    def _generator_cache_key(self) -> tuple:
+        """Metadata-only key that invalidates cached basis properties after mutation or replacement."""
+        return (
+            id(self.generators),
+            tuple(self.generators.shape),
+            self.generators.device,
+            self.generators.dtype,
+            self.generators._version,
+        )
+
+    def gram_diagonal(self) -> Optional[torch.Tensor]:
+        r"""Return cached weights ``||G_a||_F^2`` for a certified diagonal generator Gram."""
+        if not self.frobenius_gram_diagonal:
+            return None
+        key = self._generator_cache_key()
+        if self._gram_diagonal_cache is None or self._gram_diagonal_key != key:
+            self._gram_diagonal_cache = self.generators.square().sum(dim=(-2, -1)).detach()
+            self._gram_diagonal_key = key
+            self._gram_uniform_cache = None
+            self._gram_uniform_key = None
+            self._gram_uniform_ready = False
+        return self._gram_diagonal_cache
+
+    def gram_diagonal_uniform(self) -> Optional[float]:
+        r"""Return the common diagonal weight when all certified weights are exactly equal."""
+        diagonal = self.gram_diagonal()
+        if diagonal is None or diagonal.numel() == 0:
+            return None
+        key = self._generator_cache_key()
+        if not self._gram_uniform_ready or self._gram_uniform_key != key:
+            self._gram_uniform_cache = (
+                float(diagonal[0])
+                if bool(torch.all(diagonal == diagonal[0]))
+                else None
+            )
+            self._gram_uniform_key = key
+            self._gram_uniform_ready = True
+        return self._gram_uniform_cache
+
+    def phi_norm_route(self) -> str:
+        """Name the exact embedded-norm implementation enabled by this basis certificate."""
+        return "diagonal_gram" if self.frobenius_gram_diagonal else "dense_fallback"
 
     def gram_pinv(self) -> torch.Tensor:
         r"""Cached ``gram_pinv(generators)`` -- the Gram pseudo-inverse ``extract_phi`` projects with.
@@ -164,6 +213,7 @@ def _build_glk(
         generators=G,
         irrep_dims=[K],
         skew_symmetric=False,
+        frobenius_gram_diagonal=True,
     )
 
 
@@ -208,6 +258,7 @@ def _build_block_glk(
         skew_symmetric=False,
         phi_coordinate_layout=("block_head_row_major"
                                if n_heads > 1 and not cross_couplings else None),
+        frobenius_gram_diagonal=not close_basis,
     )
 
 
@@ -242,6 +293,7 @@ def _build_tied_block_glk(
         generators=G,
         irrep_dims=[d_head] * n_heads,
         skew_symmetric=False,
+        frobenius_gram_diagonal=True,
     )
 
 
@@ -264,6 +316,7 @@ def _build_so_k(
         generators=G,
         irrep_dims=[K],
         skew_symmetric=True,
+        frobenius_gram_diagonal=True,
     )
 
 
@@ -479,4 +532,5 @@ def _build_sp(
         generators=G,
         irrep_dims=[K],
         skew_symmetric=False,
+        frobenius_gram_diagonal=True,
     )
