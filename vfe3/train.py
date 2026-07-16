@@ -1450,6 +1450,8 @@ def train(
                     "phi_chart_projected_fraction",
                     "phi_chart_preproject_max",
                     "phi_chart_projection_scale_min",
+                    "phi_chart_projection_ms",
+                    "phi_chart_projection_stats_collected",
                 ):
                     row[_pk] = (
                         step_metrics.get(_pk, float("nan"))

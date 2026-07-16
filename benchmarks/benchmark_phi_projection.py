@@ -8,12 +8,17 @@ machine-readable JSON record outside the repository.
 import json
 import math
 import statistics
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Sequence
 
 import torch
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from vfe3.gauge_optim import (
     embedded_phi_frobenius_norm,

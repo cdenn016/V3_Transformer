@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -5,7 +8,8 @@ from vfe3.config import VFE3Config
 import vfe3.gauge_optim as gauge_optim
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.model.model import VFEModel
-from vfe3.train import build_optimizer, train_step
+from vfe3.run_artifacts import RunArtifacts
+from vfe3.train import build_optimizer, train, train_step
 
 
 def _four_phi_table_model() -> VFEModel:
@@ -442,3 +446,49 @@ def test_projection_benchmark_cpu_smoke_schema_and_bound() -> None:
     assert result["projection_median_ms"] >= 0.0
     assert result["projection_p95_ms"] >= result["projection_median_ms"]
     assert result["maximum_post_projection_norm"] <= 2.0 + 1e-5
+
+
+def test_enabled_projection_persists_timing_metrics_in_training_row(tmp_path) -> None:
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=1,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        pos_phi="none",
+        phi_mstep_max_matrix_norm=2.0,
+        max_steps=1,
+    )
+    model = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path, cfg, model)
+    loader = [(torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]]))]
+
+    train(
+        model,
+        loader,
+        cfg,
+        n_steps=1,
+        log_interval=1,
+        artifacts=artifacts,
+        generate_samples=False,
+    )
+
+    assert artifacts.history[0]["phi_chart_projection_stats_collected"] == 1.0
+    assert artifacts.history[0]["phi_chart_projection_ms"] >= 0.0
+    header = (tmp_path / "metrics.csv").read_text().splitlines()[0]
+    assert "phi_chart_projection_ms" in header
+
+
+def test_projection_benchmark_is_directly_runnable_from_repo_root() -> None:
+    result = subprocess.run(
+        [sys.executable, "benchmarks/benchmark_phi_projection.py"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    combined = result.stdout + result.stderr
+    assert "No module named 'vfe3'" not in combined
+    assert result.returncode == 0 or "CUDA is required" in combined

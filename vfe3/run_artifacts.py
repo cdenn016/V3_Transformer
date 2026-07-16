@@ -64,7 +64,7 @@ def semantic_config_fingerprint(
 
 def _phi_chart_norm_route(
     model: torch.nn.Module,
-    cfg:   VFE3Config,
+    cfg:   object,
 ) -> Optional[str]:
     """Persist the exact norm route only when the projected phi M-step is enabled."""
     if getattr(cfg, "phi_mstep_max_matrix_norm", None) is None:
