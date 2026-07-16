@@ -66,6 +66,7 @@ class BeliefParams(ABC):
 
     cov_kind:                 ClassVar[str]
     dispersion_is_covariance: ClassVar[bool] = False
+    effective_rank_rescale:   ClassVar[bool] = False
 
     @abstractmethod
     def coordinate_dim(self) -> int:

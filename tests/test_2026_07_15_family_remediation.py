@@ -218,6 +218,22 @@ def test_laplace_near_floor_spectrum_uses_covariance_units() -> None:
         figures.plt.close(figure)
 
 
+def test_laplace_default_floor_effective_rank_is_float32_safe() -> None:
+    scale = torch.tensor([[1e-12, 2e-12]])
+    spectrum = metrics.belief_spectrum(
+        scale,
+        family="laplace_diagonal",
+    )
+    per_token_rank = metrics.effective_rank_per_token(
+        scale,
+        family="laplace_diagonal",
+    )
+
+    assert spectrum["condition"].item() == pytest.approx(4.0)
+    assert spectrum["effective_rank"].item() == pytest.approx(100.0 / 68.0)
+    assert per_token_rank.item() == pytest.approx(100.0 / 68.0)
+
+
 def test_gaussian_near_floor_effective_rank_keeps_legacy_stabilizer() -> None:
     variance = torch.tensor([[1e-6, 2e-6]])
     baseline = metrics.effective_rank(variance, eps=1e-6)

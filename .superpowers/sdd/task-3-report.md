@@ -148,3 +148,36 @@ python -m pytest -p no:cacheprovider tests/test_families.py tests/test_laplace_f
 ```
 
 Their parsed JUnit attributes were `tests=90`, `failures=0`, `errors=0`, `skipped=1`, and `time=1.060`. The warnings are expected Laplace configuration warnings from existing tests. Both XML files were removed before commit.
+
+## Float32-safe Laplace effective rank
+
+The final numerical review found that the Laplace denominator floor alone was insufficient at the public default `eps=1e-12`. For scale `[1e-12, 2e-12]`, covariance eigenvalues are `[2e-24, 8e-24]`; squaring either the eigenvalues or the covariance floor underflows in float32, making both participation-ratio numerator and denominator zero.
+
+The regression was added before production edits and failed literally:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_2026_07_15_family_remediation.py::test_laplace_default_floor_effective_rank_is_float32_safe --tb=short
+E   assert nan == 1.4705882352941178
+1 failed in 0.09s
+```
+
+Laplace now opts into a dimensionless effective-rank path that divides each nonnegative spectrum by its own maximum before forming the participation ratio. This preserves the ratio, keeps all squared values in a safe float32 range, and returns zero for an all-zero spectrum. Gaussian does not opt in and therefore continues through its byte-compatible legacy arithmetic and denominator floor. The default-`eps` Laplace probe now reports condition `4` and effective rank `100/68`; the `eps=1e-6` Laplace and Gaussian legacy probes remain pinned.
+
+The final focused run was:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_2026_07_15_family_remediation.py --junitxml=.superpowers\sdd\task-3-underflow-focused.xml
+...........................                                              [100%]
+27 passed in 1.20s
+```
+
+Its parsed JUnit attributes were `tests=27`, `failures=0`, `errors=0`, `skipped=0`, and `time=1.203`.
+
+The family and metric neighbors were:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_families.py tests/test_laplace_family.py tests/test_metrics.py tests/test_experiment_metrics.py --junitxml=.superpowers\sdd\task-3-underflow-neighbor.xml
+89 passed, 1 skipped, 5 warnings in 1.07s
+```
+
+Their parsed JUnit attributes were `tests=90`, `failures=0`, `errors=0`, `skipped=1`, and `time=1.070`. The warnings are the same expected Laplace configuration warnings from existing tests. Both XML files were removed before commit.

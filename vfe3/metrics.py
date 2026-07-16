@@ -498,6 +498,30 @@ def _effective_rank_denominator_floor(
     return get_family(family).effective_rank_floor(eps)
 
 
+def _family_effective_rank(
+    spectrum: torch.Tensor,
+
+    *,
+    family:   Optional[str],
+    eps:      float,
+) -> torch.Tensor:
+    r"""Participation ratio with opt-in scale normalization for tiny family spectra."""
+    if family is not None:
+        from vfe3.families.base import get_family
+        if get_family(family).effective_rank_rescale:
+            lam = spectrum.float().clamp(min=0.0)
+            scale = lam.amax(dim=-1, keepdim=True)
+            normalized = lam / scale.clamp(min=torch.finfo(lam.dtype).tiny)
+            return effective_rank(
+                normalized,
+                eps=torch.finfo(normalized.dtype).tiny,
+            ).to(spectrum.dtype)
+    return effective_rank(
+        spectrum,
+        eps=_effective_rank_denominator_floor(family, eps),
+    )
+
+
 def effective_rank_per_token(
     sigma:    torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
 
@@ -512,9 +536,10 @@ def effective_rank_per_token(
     keeps the per-token distribution a single-seed run needs for a ridgeline/violin. Full
     covariances are passed through ``eigvalsh`` first.
     """
-    return effective_rank(
+    return _family_effective_rank(
         _spectrum(sigma, diagonal=diagonal, eps=eps, family=family),
-        eps=_effective_rank_denominator_floor(family, eps),
+        family=family,
+        eps=eps,
     )
 
 
@@ -547,9 +572,10 @@ def belief_spectrum(
     result: Dict[str, Any] = {
         "eigenvalues":            lam_desc,
         "condition":              condition,
-        "effective_rank":         effective_rank(
+        "effective_rank":         _family_effective_rank(
             lam.clamp(min=0.0),
-            eps=_effective_rank_denominator_floor(family, eps),
+            family=family,
+            eps=eps,
         ),
         "is_positive_definite":   is_positive_definite,
     }

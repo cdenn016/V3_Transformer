@@ -63,6 +63,7 @@ class DiagonalLaplace(BeliefParams):
 
     cov_kind = "diagonal"
     dispersion_is_covariance = False
+    effective_rank_rescale = True
 
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
         self.mu = mu                                   # (..., K) location
