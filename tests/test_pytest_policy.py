@@ -7,7 +7,6 @@ from tests.pytest_policy import (
     EXTERNAL_TESTS,
     RESOURCE_GROUPS,
     SLOW_TESTS,
-    UMAP_TESTS,
     node_key,
     pytest_collection_modifyitems,
 )
@@ -43,16 +42,15 @@ def test_node_key_normalizes_paths_and_parametrization() -> None:
 
 
 def test_runslow_preserves_slow_marker_without_skip() -> None:
-    item = _Item("tests/test_report.py::test_generate_figures_drives_live_model")
+    item = _Item("tests/test_report.py::test_finalize_skips_figures_when_disabled")
     pytest_collection_modifyitems(_Config(runslow=True), [item])
-    assert item.marker_names == ["slow", "umap", "xdist_group"]
-    assert item.marker_kwargs("xdist_group") == {"name": "umap"}
+    assert item.marker_names == ["slow"]
 
 
 def test_default_lane_marks_semantics_before_slow_skip() -> None:
-    item = _Item("tests/test_report.py::test_generate_figures_drives_live_model")
+    item = _Item("tests/test_report.py::test_finalize_skips_figures_when_disabled")
     pytest_collection_modifyitems(_Config(runslow=False), [item])
-    assert item.marker_names == ["slow", "umap", "xdist_group", "skip"]
+    assert item.marker_names == ["slow", "skip"]
     assert item.marker_kwargs("skip") == {
         "reason": "slow integration test; pass --runslow to run it",
     }
@@ -75,16 +73,18 @@ def test_external_bundle_probe_is_classified_without_a_parallel_group() -> None:
 
 
 def test_policy_sets_define_disjoint_execution_lanes() -> None:
-    assert (
-        "test_round3_artifacts.py::test_emit_closes_figure_registered_by_raising_thunk"
-        in UMAP_TESTS
-    )
-    assert UMAP_TESTS < SLOW_TESTS
+    assert SLOW_TESTS == {
+        "test_report.py::test_finalize_skips_figures_when_disabled",
+        "test_run_artifacts.py::test_train_with_artifacts_writes_attention_pngs",
+        (
+            "test_run_diagnostics_2026_06_13.py"
+            "::test_finalize_writes_tier3_research_and_provenance"
+        ),
+    }
     assert not (SLOW_TESTS & CUDA_TESTS)
     assert not (SLOW_TESTS & EXTERNAL_TESTS)
     assert not (CUDA_TESTS & EXTERNAL_TESTS)
-    assert set(RESOURCE_GROUPS) == UMAP_TESTS | CUDA_TESTS
-    assert {RESOURCE_GROUPS[key] for key in UMAP_TESTS} == {"umap"}
+    assert set(RESOURCE_GROUPS) == CUDA_TESTS
     assert {RESOURCE_GROUPS[key] for key in CUDA_TESTS} == {"cuda"}
 
 
@@ -116,7 +116,7 @@ def test_cuda_and_external_tables_cover_the_dedicated_prerequisite_lanes() -> No
 
 def test_every_policy_node_resolves_to_a_top_level_test_without_importing_modules() -> None:
     tests_dir = Path(__file__).parent
-    policy_nodes = SLOW_TESTS | UMAP_TESTS | CUDA_TESTS | EXTERNAL_TESTS | set(RESOURCE_GROUPS)
+    policy_nodes = SLOW_TESTS | CUDA_TESTS | EXTERNAL_TESTS | set(RESOURCE_GROUPS)
     functions_by_file: dict[str, set[str]] = {}
 
     for node in sorted(policy_nodes):

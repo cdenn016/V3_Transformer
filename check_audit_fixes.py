@@ -7,11 +7,6 @@ banner. No CLI args -- edit the config below, then::
 
 The RTX 5090: set ``DEVICE = "cuda"`` (or export ``VFE3_TEST_DEVICE=cuda``) to run on the GPU;
 the tests read ``VFE3_TEST_DEVICE`` at import, so it is set here BEFORE pytest imports them.
-
-NOTE: ``tests/test_viz.py`` is deliberately NOT listed -- importing it triggers the umap/llvmlite
-LLVM-JIT access violation on this Windows box (that crash IS audit finding t4/t5), which would abort
-the whole run. The three fixes with no dedicated test are byte-identical / cosmetic / docs / hygiene
-and are listed at the bottom for the record: m7, m14, m25, m30, h1 (and t4 above).
 """
 
 import os
@@ -49,7 +44,6 @@ AUDIT_TESTS = [
     ("m17", "tests/test_phi_preconditioner.py::test_killing_per_block_caches_parent_without_strong_retention"),
     ("m19", "tests/test_phi_preconditioner.py::test_pullback_series_warns_on_non_convergence"),
     ("m20", "tests/test_tier12_decode.py::test_z_loss_applied_on_dense_decode"),
-    ("m26", "tests/test_run_artifacts.py::test_finalize_run_writes_test_results_and_figures"),
     ("m29", "tests/test_reporting_additions.py::test_offset_power_law_honors_weights"),  # SKIPS without scipy
     ("m31", "tests/test_train.py::test_parameter_report_leaves_global_rng_untouched"),
     # ---- TEST-SUITE (t*) ----
@@ -63,8 +57,8 @@ AUDIT_TESTS = [
     ("feat", "tests/test_reporting_additions.py::test_save_figures_emits_kappa_block_trajectory"),
 ]
 
-# Fixes with no dedicated test (verified by byte-identity / cosmetic / docs / hygiene, and t4 which
-# lives in the crash-on-Windows test_viz.py): m7, m14, m25, m30, h1, t4.
+# Fixes with no dedicated test (verified by byte-identity / cosmetic / docs / hygiene):
+# m7, m14, m25, m30, h1, t4.
 
 if __name__ == "__main__":
     node_ids = [nid for _, nid in AUDIT_TESTS]

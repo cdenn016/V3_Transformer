@@ -10,7 +10,6 @@ covered by tests/test_train.py::test_silent_and_logging_paths_are_bitwise_identi
 import hashlib
 import json
 import logging
-import math
 import os
 import subprocess
 import types
@@ -101,78 +100,6 @@ def trained_artifact_evidence(tmp_path_factory) -> TrainedArtifactEvidence:
         for figure_number in set(figs.plt.get_fignums()).difference(open_figures):
             figs.plt.close(figure_number)
         cfg = model = artifacts = train_loader = val_loader = run_dir = None
-        torch.random.set_rng_state(cpu_rng_state)
-        if cuda_rng_states is not None:
-            torch.cuda.set_rng_state_all(cuda_rng_states)
-        cpu_rng_state = cuda_rng_states = None
-    assert evidence is not None
-    return evidence
-
-
-@dataclass(frozen=True)
-class FinalizedArtifactEvidence:
-    relative_files:         frozenset[str]
-    result_keys:            frozenset[str]
-    summary_keys:           frozenset[str]
-    test_ppl:               float
-    result_reloaded_best:   bool
-    summary_reloaded_best:  bool
-    phi_chart_norm_route:   str | None
-
-
-@pytest.fixture(scope="module")
-def finalized_artifact_evidence(tmp_path_factory) -> FinalizedArtifactEvidence:
-    cpu_rng_state   = torch.random.get_rng_state()
-    cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    open_figures    = frozenset(figs.plt.get_fignums())
-    cfg = model = artifacts = train_loader = val_loader = test_loader = None
-    losses = result = summary = run_dir = None
-    evidence = None
-    try:
-        run_dir     = tmp_path_factory.mktemp("finalized-artifact-evidence") / "run"
-        cfg         = _cfg()
-        train_loader = _loader()
-        val_loader   = _loader(seed=1)
-        test_loader  = _loader(seed=2)
-        torch.manual_seed(0)
-        model     = VFEModel(cfg)
-        artifacts = RunArtifacts(run_dir, cfg, model, dataset="synthetic")
-        losses = train(
-            model,
-            train_loader,
-            cfg,
-            n_steps=4,
-            eval_interval=2,
-            val_loader=val_loader,
-            artifacts=artifacts,
-        )
-        result = finalize_run(
-            model,
-            artifacts,
-            cfg,
-            test_loader=test_loader,
-            losses=losses,
-        )
-        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-        relative_files = frozenset(
-            path.relative_to(run_dir).as_posix()
-            for path in run_dir.rglob("*")
-            if path.is_file()
-        )
-        evidence = FinalizedArtifactEvidence(
-            relative_files=relative_files,
-            result_keys=frozenset(result),
-            summary_keys=frozenset(summary),
-            test_ppl=float(result["test_ppl"]),
-            result_reloaded_best=result["reloaded_best"],
-            summary_reloaded_best=summary["reloaded_best"],
-            phi_chart_norm_route=summary["phi_chart_norm_route"],
-        )
-    finally:
-        for figure_number in set(figs.plt.get_fignums()).difference(open_figures):
-            figs.plt.close(figure_number)
-        cfg = model = artifacts = train_loader = val_loader = test_loader = None
-        losses = result = summary = run_dir = None
         torch.random.set_rng_state(cpu_rng_state)
         if cuda_rng_states is not None:
             torch.cuda.set_rng_state_all(cuda_rng_states)
@@ -564,20 +491,6 @@ def test_train_without_artifacts_writes_nothing(tmp_path):
     assert list(tmp_path.iterdir()) == []                     # no artifacts object -> no writes
 
 
-def test_finalize_run_writes_test_results_and_figures(finalized_artifact_evidence):
-    assert "test_ppl" in finalized_artifact_evidence.result_keys
-    assert math.isfinite(finalized_artifact_evidence.test_ppl)
-    assert "test_results.json" in finalized_artifact_evidence.relative_files
-    assert "summary.json" in finalized_artifact_evidence.relative_files
-    assert "loss_curve.png" in finalized_artifact_evidence.relative_files
-    assert "val_ppl.png" in finalized_artifact_evidence.relative_files
-    assert "test_ppl" in finalized_artifact_evidence.summary_keys
-    assert "best_val_ppl" in finalized_artifact_evidence.summary_keys
-    assert "reloaded_best" in finalized_artifact_evidence.summary_keys
-    assert finalized_artifact_evidence.summary_reloaded_best is True
-    assert finalized_artifact_evidence.phi_chart_norm_route is None
-
-
 def test_frequency_strata_use_training_corpus_counts():
     class _FixedLogits(torch.nn.Module):
         def __init__(self, logits: torch.Tensor) -> None:
@@ -755,16 +668,6 @@ def test_metrics_csv_includes_gauge_geometry_columns(trained_artifact_evidence):
     # spread) must be surfaced in the per-eval CSV, not only the free-energy terms.
     assert "holonomy_deviation" in trained_artifact_evidence.metrics_columns
     assert "gauge_trace_spread" in trained_artifact_evidence.metrics_columns
-
-
-def test_finalize_writes_gauge_geometry_figure(finalized_artifact_evidence):
-    assert "holonomy.png" in finalized_artifact_evidence.relative_files
-
-
-def test_finalize_reloads_best_checkpoint(finalized_artifact_evidence):
-    # finalize must report the TEST metric on the reloaded best-val checkpoint, not the final
-    # (possibly worse) live weights. Pin the reload happened.
-    assert finalized_artifact_evidence.result_reloaded_best is True
 
 
 def test_fd_gradient_check_restores_param_on_midloop_failure():

@@ -2,37 +2,12 @@ import pytest
 
 
 SLOW_TESTS: frozenset[str] = frozenset({
-    "test_report.py::test_finalize_autoruns_figures",
-    "test_report.py::test_generate_figures_drives_live_model",
-    "test_report.py::test_generate_figures_reloads_from_run_dir",
     "test_report.py::test_finalize_skips_figures_when_disabled",
-    "test_run_artifacts.py::test_finalize_run_writes_test_results_and_figures",
-    "test_run_artifacts.py::test_finalize_writes_gauge_geometry_figure",
-    "test_run_artifacts.py::test_finalize_reloads_best_checkpoint",
     "test_run_artifacts.py::test_train_with_artifacts_writes_attention_pngs",
-    "test_round3_artifacts.py::test_emit_closes_figure_registered_by_raising_thunk",
-    "test_viz.py::test_plot_belief_umap_fallback_no_decode",
-    "test_viz.py::test_plot_belief_umap_per_channel_categories",
-    "test_viz.py::test_umap_embed_shape",
-    "test_july13_root_fixes.py::test_umap_worker_reuses_one_process_for_two_embeddings",
     (
         "test_run_diagnostics_2026_06_13.py"
         "::test_finalize_writes_tier3_research_and_provenance"
     ),
-})
-
-UMAP_TESTS: frozenset[str] = frozenset({
-    "test_round3_artifacts.py::test_emit_closes_figure_registered_by_raising_thunk",
-    "test_report.py::test_finalize_autoruns_figures",
-    "test_report.py::test_generate_figures_drives_live_model",
-    "test_report.py::test_generate_figures_reloads_from_run_dir",
-    "test_run_artifacts.py::test_finalize_run_writes_test_results_and_figures",
-    "test_run_artifacts.py::test_finalize_writes_gauge_geometry_figure",
-    "test_run_artifacts.py::test_finalize_reloads_best_checkpoint",
-    "test_viz.py::test_plot_belief_umap_fallback_no_decode",
-    "test_viz.py::test_plot_belief_umap_per_channel_categories",
-    "test_viz.py::test_umap_embed_shape",
-    "test_july13_root_fixes.py::test_umap_worker_reuses_one_process_for_two_embeddings",
 })
 
 CUDA_TESTS: frozenset[str] = frozenset({
@@ -61,7 +36,6 @@ EXTERNAL_TESTS: frozenset[str] = frozenset({
 })
 
 RESOURCE_GROUPS: dict[str, str] = {
-    **{key: "umap" for key in UMAP_TESTS},
     **{key: "cuda" for key in CUDA_TESTS},
 }
 
@@ -77,7 +51,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--runslow",
         action="store_true",
         default=False,
-        help="run the slow figure/artifact/UMAP integration tests (skipped by default)",
+        help="run the slow figure/artifact integration tests (skipped by default)",
     )
 
 
@@ -90,8 +64,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         key = node_key(item.nodeid)
         if key in SLOW_TESTS:
             item.add_marker(pytest.mark.slow)
-        if key in UMAP_TESTS:
-            item.add_marker(pytest.mark.umap)
         if key in CUDA_TESTS:
             item.add_marker(pytest.mark.cuda)
         if key in EXTERNAL_TESTS:

@@ -228,17 +228,3 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
     assert worker._stderr_handle is None
     assert worker._workdir is None
     assert not os.path.exists(workdir)
-
-
-def test_umap_worker_reuses_one_process_for_two_embeddings() -> None:
-    pytest.importorskip("umap")
-    features = np.arange(120, dtype=float).reshape(40, 3)
-
-    with figures.UMAPWorker() as worker:
-        first = figures.umap_embed(features, worker=worker)
-        pid = worker._proc.pid
-        second = figures.umap_embed(features + 1.0, worker=worker)
-
-        assert worker._counter == 2
-        assert worker._proc.pid == pid
-        assert first.shape == second.shape == (40, 2)

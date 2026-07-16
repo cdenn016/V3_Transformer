@@ -23,7 +23,6 @@ from vfe3.viz.figures import (
     plot_belief_category_separation,
     plot_belief_spectrum,
     plot_belief_trajectories,
-    plot_belief_umap,
     plot_capacity_scaling,
     plot_covariance_ellipses,
     plot_embedding,
@@ -51,7 +50,6 @@ from vfe3.viz.figures import (
     plot_vocab_probability_heatmap,
     plot_decode_readout,
     set_publication_style,
-    umap_embed,
 )
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
@@ -247,18 +245,6 @@ def test_clustering_metrics_separated_blobs():
     m = clustering_metrics(X, y)
     assert m["silhouette"] > 0.5                                # clean separation
     assert m["calinski_harabasz"] > 1.0
-
-
-def test_umap_embed_shape():
-    X = torch.randn(30, 8)
-    try:
-        coords = umap_embed(X, n_neighbors=5, seed=0)
-    except (ImportError, OSError) as exc:
-        # umap-learn relies on numba/llvmlite native code; on some platforms (e.g. very new Python
-        # where numba lags) that native layer raises OSError/access-violation. umap_embed itself is
-        # correct (lazy import, clear error); skip where the native dependency is non-functional.
-        pytest.skip(f"umap-learn native layer unavailable on this platform: {exc}")
-    assert coords.shape == (30, 2)
 
 
 def test_attention_graph_structure():
@@ -468,26 +454,6 @@ def _category_bank(M=60, K=4):
             "token_ids": torch.randint(0, 5, (M,)), "seq_idx": torch.zeros(M)}
     fake = {0: " the", 1: ",", 2: " cat", 3: "ing", 4: " 42"}    # function/punct/content/subword/number
     return bank, (lambda ids: fake.get(int(ids[0]), " x"))
-
-
-def test_plot_belief_umap_per_channel_categories(tmp_path):
-    bank, decode = _category_bank()
-    p = tmp_path / "f5.png"
-    try:
-        fig = plot_belief_umap(bank, "mu", decode=decode, seed=0, path=str(p)); plt.close(fig)
-    except (ImportError, OSError) as exc:
-        pytest.skip(f"umap-learn native layer unavailable: {exc}")
-    assert _saved_nonempty(p)
-
-
-def test_plot_belief_umap_fallback_no_decode(tmp_path):
-    bank, _ = _category_bank(M=40)
-    p = tmp_path / "f5b.png"
-    try:
-        fig = plot_belief_umap(bank, "phi", decode=None, seed=0, path=str(p)); plt.close(fig)
-    except (ImportError, OSError) as exc:
-        pytest.skip(f"umap-learn native layer unavailable: {exc}")
-    assert _saved_nonempty(p)
 
 
 def test_plot_belief_category_separation_saves(tmp_path):

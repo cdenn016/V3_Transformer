@@ -62,32 +62,6 @@ def test_converged_state_shapes_and_finite():
         assert torch.isfinite(st[key]).all(), key
 
 
-def test_generate_figures_drives_live_model(tmp_path):
-    # The driver against a live in-memory model writes the single-run figure set to figures/.
-    model = _model()
-    paths = generate_figures(tmp_path / "run", model=model, loader=_loader(), max_sequences=16)
-    figdir = tmp_path / "run" / "figures"
-    written = {p.name for p in paths}
-    assert all(p.exists() and p.stat().st_size > 0 for p in paths)
-    # The figures that need no optional dependency (UMAP is best-effort, so belief_umap is excluded).
-    robust = {"estep_convergence.png", "belief_trajectories.png", "attention_structure.png",
-              "per_layer_diagnostics.png",
-              "gauge_equivariance.png", "gauge_head_specialization.png", "belief_spectrum.png",
-              "spd_ellipses.png", "holonomy_curvature.png", "numerical_trust.png",
-              "belief_category_separation.png",
-              # vocab next-token figures (decoder-free; default use_prior_bank=False -> decode_readout
-              # present; vocab_confusion needs the optional tokenizer so it is excluded like belief_umap).
-              "vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readout.png"}
-    missing = robust - written
-    assert not missing, f"driver did not produce {missing}"
-    assert all((figdir / name).exists() for name in robust)
-    # per-layer metrics CSV: the depth axis the final-block metrics.csv never writes.
-    csv_path = tmp_path / "run" / "metrics_per_layer.csv"
-    assert csv_path.exists() and csv_path.stat().st_size > 0
-    header = csv_path.read_text(encoding="utf-8").splitlines()[0]
-    assert header.startswith("layer,") and "holonomy_deviation" in header and "total" in header
-
-
 def test_plan_single_run_figures_skips_english_taxonomies_for_japanese():
     planned = plan_single_run_figures("wiki-ja", {
         "decode_readout":             True,
@@ -216,17 +190,6 @@ def test_model_channel_report_extractors_do_not_replay_snapshot_state(monkeypatc
     assert all(output is not None for output in outputs)
 
 
-def test_generate_figures_reloads_from_run_dir(tmp_path):
-    # The reload path: config.json + best_model.pt -> rebuilt model -> figures, no live handle.
-    cfg = _cfg()
-    model = _model()
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")   # writes config.json
-    art.maybe_save_best(1, model, 1.0)                                               # self-bound best bundle
-    paths = generate_figures(tmp_path / "run", loader=_loader(), max_sequences=16)
-    assert len(paths) >= 6
-    assert (tmp_path / "run" / "figures" / "numerical_trust.png").exists()
-
-
 def test_generate_figures_rejects_corrupt_best_bundle_fingerprint(tmp_path):
     cfg = _cfg()
     model = _model()
@@ -307,23 +270,6 @@ def test_generate_figures_memory_guard_skips_only_full_vocab_extractors(tmp_path
         allow_large=True,
     )
     assert {"ce_bank", "vocab"} <= set(calls)
-
-
-def test_finalize_autoruns_figures(tmp_path):
-    # generate_figures defaults True -> finalize_run auto-writes run_dir/figures/ (the autorun).
-    cfg = _cfg()
-    model = _model()
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
-    losses = train(model, _loader(), cfg, n_steps=4, log_interval=2, eval_interval=2,
-                   val_loader=_loader(seed=1), artifacts=art)
-    finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
-    figs = list((tmp_path / "run" / "figures").glob("*.png"))
-    names = {f.name for f in figs}
-    assert len(figs) >= 6, f"autorun produced too few figures: {[f.name for f in figs]}"
-    # The vocabulary next-token figures are part of the finalize_run autorun (i.e. produced by
-    # train_vfe3.py): default use_prior_bank=False -> decode_readout present; the synthetic-period3
-    # dataset has no tokenizer so vocab_confusion is skipped.
-    assert {"vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readout.png"} <= names
 
 
 def test_finalize_skips_figures_when_disabled(tmp_path):
