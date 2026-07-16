@@ -229,6 +229,7 @@ def test_run_lane_cleans_junit_path_when_subprocess_launch_fails(
     [
         (None, 0),
         ("<testsuites>", 0),
+        ('<testsuite tests="0" failures="0" errors="0" skipped="0"/>', 0),
         ('<testsuite tests="1" failures="1" errors="0" skipped="0"/>', 0),
         ('<testsuite tests="1" failures="0" errors="1" skipped="0"/>', 0),
         ('<testsuite tests="1" failures="0" errors="0" skipped="0"/>', 5),

@@ -138,6 +138,8 @@ def _read_junit_counts(path: Path) -> dict[str, int]:
 
     if counts["failures"] + counts["errors"] + counts["skipped"] > counts["tests"]:
         raise ValueError("JUnit failure/error/skip counts exceed the test count")
+    if counts["tests"] == 0:
+        raise ValueError("JUnit XML contains no executed tests")
     return counts
 
 
