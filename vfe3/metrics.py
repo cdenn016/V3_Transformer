@@ -487,6 +487,17 @@ def _covariance_eigenvalue_floor(
     return get_family(family).covariance_floor(eps)
 
 
+def _effective_rank_denominator_floor(
+    family: Optional[str],
+    eps:    float,
+) -> float:
+    r"""Family-owned denominator stabilizer, including legacy Gaussian behavior."""
+    if family is None:
+        return eps
+    from vfe3.families.base import get_family
+    return get_family(family).effective_rank_floor(eps)
+
+
 def effective_rank_per_token(
     sigma:    torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
 
@@ -501,11 +512,9 @@ def effective_rank_per_token(
     keeps the per-token distribution a single-seed run needs for a ridgeline/violin. Full
     covariances are passed through ``eigvalsh`` first.
     """
-    covariance_floor = _covariance_eigenvalue_floor(family, eps)
-    rank_floor = eps if family is None else covariance_floor ** 2
     return effective_rank(
         _spectrum(sigma, diagonal=diagonal, eps=eps, family=family),
-        eps=rank_floor,
+        eps=_effective_rank_denominator_floor(family, eps),
     )
 
 
@@ -530,7 +539,6 @@ def belief_spectrum(
     lam_min = lam_desc[..., -1]
     is_positive_definite = lam_min > 0.0
     covariance_floor = _covariance_eigenvalue_floor(family, eps)
-    rank_floor = eps if family is None else covariance_floor ** 2
     condition = torch.where(
         is_positive_definite,
         lam_max / lam_min.clamp(min=covariance_floor),
@@ -539,7 +547,10 @@ def belief_spectrum(
     result: Dict[str, Any] = {
         "eigenvalues":            lam_desc,
         "condition":              condition,
-        "effective_rank":         effective_rank(lam.clamp(min=0.0), eps=rank_floor),
+        "effective_rank":         effective_rank(
+            lam.clamp(min=0.0),
+            eps=_effective_rank_denominator_floor(family, eps),
+        ),
         "is_positive_definite":   is_positive_definite,
     }
     if family is not None:

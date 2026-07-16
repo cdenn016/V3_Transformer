@@ -101,6 +101,11 @@ class DiagonalLaplace(BeliefParams):
         return 2.0 * eps ** 2
 
     @classmethod
+    def effective_rank_floor(cls, eps: float) -> float:
+        r"""Squared covariance-unit stabilizer for the Laplace participation ratio."""
+        return cls.covariance_floor(eps) ** 2
+
+    @classmethod
     def mean_fisher_precision(
         cls,
         dispersion: torch.Tensor,                    # (..., K) Laplace scale b

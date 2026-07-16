@@ -114,6 +114,11 @@ class DiagonalGaussian(BeliefParams):
         return eps
 
     @classmethod
+    def effective_rank_floor(cls, eps: float) -> float:
+        r"""Preserve the historical Gaussian participation-ratio stabilizer ``eps``."""
+        return eps
+
+    @classmethod
     def mean_fisher_precision(
         cls,
         dispersion: torch.Tensor,                    # (..., K) coordinate variances
@@ -358,6 +363,11 @@ class FullGaussian(BeliefParams):
 
     @classmethod
     def covariance_floor(cls, eps: float) -> float:
+        return eps
+
+    @classmethod
+    def effective_rank_floor(cls, eps: float) -> float:
+        r"""Preserve the historical Gaussian participation-ratio stabilizer ``eps``."""
         return eps
 
     @classmethod

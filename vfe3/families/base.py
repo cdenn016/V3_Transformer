@@ -153,6 +153,13 @@ class BeliefParams(ABC):
         )
 
     @classmethod
+    def effective_rank_floor(cls, eps: float) -> float:
+        r"""Denominator floor used by the family's effective-rank compatibility contract."""
+        raise NotImplementedError(
+            f"{cls.__name__} does not provide effective_rank_floor"
+        )
+
+    @classmethod
     def mean_fisher_precision(
         cls,
         dispersion: torch.Tensor,                    # (..., K) diagonal or (..., K, K) full parameter

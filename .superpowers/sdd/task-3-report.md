@@ -114,3 +114,37 @@ python -m pytest -p no:cacheprovider tests/test_families.py tests/test_laplace_f
 ```
 
 Its parsed JUnit attributes were `tests=309`, `failures=0`, `errors=0`, `skipped=13`, and `time=45.408`. The warnings are expected warnings exercised by existing neighboring configuration tests. The XML files were read for these counts and removed before commit.
+
+## Final compatibility correction: Gaussian effective-rank floor
+
+Review found that the covariance-floor repair had changed Gaussian near-floor effective rank. The historical Gaussian implementation passes `eps` directly as the participation-ratio denominator floor. Squaring the Gaussian covariance floor changed the result for variance `[1e-6, 2e-6]` at `eps=1e-6` from the legacy `9e-6` to `1.8`. Laplace still requires the squared covariance-unit floor to obtain its corrected near-floor rank.
+
+The Gaussian regression was added before production edits and failed literally:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_2026_07_15_family_remediation.py::test_gaussian_near_floor_effective_rank_keeps_legacy_stabilizer --tb=short
+E   assert False
+E    +  where False = torch.equal(tensor([1.8000]), tensor([9.0000e-06]))
+1 failed in 0.08s
+```
+
+Each family now owns its effective-rank denominator stabilizer. Diagonal and full Gaussian return the legacy `eps`; Laplace returns the square of its covariance eigenvalue floor. The existing Laplace test remains pinned to condition `4` and effective rank `100/68`.
+
+The final focused run was:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_2026_07_15_family_remediation.py --junitxml=.superpowers\sdd\task-3-final-focused.xml
+..........................                                               [100%]
+26 passed in 1.26s
+```
+
+Its parsed JUnit attributes were `tests=26`, `failures=0`, `errors=0`, `skipped=0`, and `time=1.265`.
+
+The requested family and metric neighbors were:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_families.py tests/test_laplace_family.py tests/test_metrics.py tests/test_experiment_metrics.py --junitxml=.superpowers\sdd\task-3-final-neighbor.xml
+89 passed, 1 skipped, 5 warnings in 1.06s
+```
+
+Their parsed JUnit attributes were `tests=90`, `failures=0`, `errors=0`, `skipped=1`, and `time=1.060`. The warnings are expected Laplace configuration warnings from existing tests. Both XML files were removed before commit.

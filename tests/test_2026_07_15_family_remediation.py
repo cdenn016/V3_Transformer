@@ -218,6 +218,25 @@ def test_laplace_near_floor_spectrum_uses_covariance_units() -> None:
         figures.plt.close(figure)
 
 
+def test_gaussian_near_floor_effective_rank_keeps_legacy_stabilizer() -> None:
+    variance = torch.tensor([[1e-6, 2e-6]])
+    baseline = metrics.effective_rank(variance, eps=1e-6)
+    per_token = metrics.effective_rank_per_token(
+        variance,
+        eps=1e-6,
+        family="gaussian_diagonal",
+    )
+    spectrum = metrics.belief_spectrum(
+        variance,
+        eps=1e-6,
+        family="gaussian_diagonal",
+    )
+
+    assert baseline.item() == pytest.approx(9e-6)
+    assert torch.equal(per_token, baseline)
+    assert torch.equal(spectrum["effective_rank"], baseline)
+
+
 def test_laplace_fisher_figure_labels_name_scale_precision() -> None:
     from vfe3.viz import figures
 
