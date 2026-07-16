@@ -419,3 +419,26 @@ def test_geometry_health_adds_projection_timing_panel_only_when_present() -> Non
     assert "Projected M-step cost" in [axis.get_title() for axis in timed_figure.axes]
     plt.close(old_figure)
     plt.close(timed_figure)
+
+
+def test_projection_benchmark_cpu_smoke_schema_and_bound() -> None:
+    from benchmarks.benchmark_phi_projection import benchmark_projection_case
+
+    result = benchmark_projection_case(
+        name="cpu_smoke",
+        K=4,
+        n_heads=2,
+        table_rows=[32, 8],
+        radius=2.0,
+        device=torch.device("cpu"),
+        warmups=1,
+        repeats=2,
+    )
+
+    assert result["name"] == "cpu_smoke"
+    assert result["route"] == "diagonal_gram"
+    assert result["total_rows"] == 40
+    assert result["coordinate_width"] == 8
+    assert result["projection_median_ms"] >= 0.0
+    assert result["projection_p95_ms"] >= result["projection_median_ms"]
+    assert result["maximum_post_projection_norm"] <= 2.0 + 1e-5

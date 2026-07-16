@@ -283,21 +283,21 @@ git commit -m "feat: report phi projection route and timing"
 - JSON output records device, torch version, seed, K, heads, vocabulary, number of tables and rows, route, warmups, repeats, projected median and p95 milliseconds, disabled-control median and p95 milliseconds where measured, overhead ratio, and maximum post-projection norm.
 - A small CPU smoke helper validates schema without enforcing timing.
 
-- [ ] **Step 1: Write a failing import/schema smoke test**
+- [x] **Step 1: Write a failing import/schema smoke test**
 
 Import the benchmark module, run its tiny CPU projection-only case, and validate finite timings, exact route, row count, and post-bound correctness. Timing thresholds stay out of pytest.
 
-- [ ] **Step 2: Witness the missing benchmark module**
+- [x] **Step 2: Witness the missing benchmark module**
 
 Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py -k benchmark --junitxml=C:\tmp\vfe3-phi-benchmark-red-20260715.xml`
 
 Expected: import failure for `benchmarks.benchmark_phi_projection`.
 
-- [ ] **Step 3: Implement the standalone benchmark**
+- [x] **Step 3: Implement the standalone benchmark**
 
 Use seeded tensors and warmed CUDA events. The K240 route must allocate phi coordinates but never a vocabulary-by-240-by-240 embedded tensor. Preserve the observed pre-fix K20 evidence, `340.7574` versus `83.5599` milliseconds per step, as historical context rather than fabricating a new pre-fix run.
 
-- [ ] **Step 4: Run CPU smoke and inspect GPU availability/load**
+- [x] **Step 4: Run CPU smoke and inspect GPU availability/load**
 
 Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py -k benchmark --junitxml=C:\tmp\vfe3-phi-benchmark-green-20260715.xml`
 
@@ -305,11 +305,13 @@ Expected: zero failures and zero errors.
 
 Before a CUDA run, inspect active GPU processes. If the user's training job is still active, do not contend with it; record the benchmark as deferred for resource isolation. Otherwise run the script and save JSON under `C:\tmp`, not the repository.
 
-- [ ] **Step 5: Evaluate acceptance evidence**
+- [x] **Step 5: Evaluate acceptance evidence**
+
+The CPU harness and full K20-shape sanity case passed. The CUDA acceptance measurement was deferred because `nvidia-smi` showed 87 percent GPU utilization and an active `C:\anaconda\python.exe` training process; contending with that process would perturb the user's run and invalidate timing evidence.
 
 The K20 projected training-step median overhead target is at most 10 percent, with 5 percent preferred. K240 must complete without OOM, report `diagonal_gram`, and satisfy the configured radius. If a full training-step control is too expensive at K240, report projection-only K240 evidence honestly rather than substituting an invented ratio.
 
-- [ ] **Step 6: Update the dated edit record and commit**
+- [x] **Step 6: Update the dated edit record and commit**
 
 ```powershell
 git add benchmarks/benchmark_phi_projection.py tests/test_phi_projection_optimization_20260715.py docs/2026-07-15-edits.md
