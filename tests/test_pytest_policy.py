@@ -1,9 +1,8 @@
 import ast
-from contextlib import contextmanager
 from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
@@ -138,8 +137,28 @@ class _FakeTorch:
         self.warn_only_enabled = warn_only
 
 
+class _FakePolicyLifecycle:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
 def _source_tree(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"))
+
+
+def _top_level_assignment(tree: ast.Module, name: str) -> ast.Assign:
+    return next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        )
+    )
 
 
 def _torch_import_line(tree: ast.Module) -> int:
@@ -377,44 +396,116 @@ def test_conftest_starts_cuda_policy_during_initialization_before_plugins() -> N
     assert start_assignment.lineno < fixture_definition.lineno
 
 
-def test_session_fixture_only_closes_already_started_policy(
+def test_session_fixture_uses_lifecycle_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    events: list[str] = []
-
-    @contextmanager
-    def _recording_policy(
-        _torch_module:          Any,
-        _requested_device_name: str,
-    ) -> Iterator[None]:
-        events.append("enter")
-        try:
-            yield
-        finally:
-            events.append("exit")
-
+    lifecycle = _FakePolicyLifecycle()
+    assert getattr(
+        test_conftest,
+        "_DETERMINISTIC_CUDA_POLICY_LIFECYCLE",
+        None,
+    ) is not None
     monkeypatch.setattr(
         test_conftest,
-        "_deterministic_cuda_policy",
-        _recording_policy,
-    )
-    starter = getattr(test_conftest, "_start_deterministic_cuda_policy", None)
-    assert callable(starter)
-
-    started_policy = starter(object(), "cuda:0")
-    assert events == ["enter"]
-    monkeypatch.setattr(
-        test_conftest,
-        "_DETERMINISTIC_CUDA_POLICY_CONTEXT",
-        started_policy,
+        "_DETERMINISTIC_CUDA_POLICY_LIFECYCLE",
+        lifecycle,
     )
 
     fixture_lifetime = test_conftest.deterministic_cuda_policy.__wrapped__()
     next(fixture_lifetime)
-    assert events == ["enter"]
+    assert lifecycle.close_calls == 0
     with pytest.raises(StopIteration):
         next(fixture_lifetime)
-    assert events == ["enter", "exit"]
+    assert lifecycle.close_calls == 1
+
+
+def test_pytest_unconfigure_cleans_policy_after_collection_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_hook = getattr(test_conftest, "pytest_unconfigure", None)
+    assert callable(cleanup_hook)
+    lifecycle = _FakePolicyLifecycle()
+    monkeypatch.setattr(
+        test_conftest,
+        "_DETERMINISTIC_CUDA_POLICY_LIFECYCLE",
+        lifecycle,
+    )
+
+    cleanup_hook(object())
+
+    assert lifecycle.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "previous_cublas_value",
+    [None, ":16:8"],
+    ids=["missing", "preexisting"],
+)
+def test_cuda_policy_lifecycle_restores_state_and_cublas_exactly_once(
+    monkeypatch:           pytest.MonkeyPatch,
+    previous_cublas_value: str | None,
+) -> None:
+    lifecycle_type = getattr(
+        test_conftest,
+        "_DeterministicCudaPolicyLifecycle",
+        None,
+    )
+    assert lifecycle_type is not None
+    environment = {}
+    if previous_cublas_value is not None:
+        environment["CUBLAS_WORKSPACE_CONFIG"] = previous_cublas_value
+    cublas_was_present = "CUBLAS_WORKSPACE_CONFIG" in environment
+    environment["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    fake_torch = _FakeTorch(modern_tf32=True)
+    policy_context = test_conftest._deterministic_cuda_policy(fake_torch, "cuda:0")
+    policy_context.__enter__()
+    lifecycle = lifecycle_type(
+        policy_context,
+        environment,
+        "cuda:0",
+        cublas_was_present,
+        previous_cublas_value,
+    )
+
+    lifecycle.close()
+
+    assert fake_torch.use_deterministic_calls == [(True, False), (False, True)]
+    if previous_cublas_value is None:
+        assert "CUBLAS_WORKSPACE_CONFIG" not in environment
+    else:
+        assert environment["CUBLAS_WORKSPACE_CONFIG"] == previous_cublas_value
+
+    environment["CUBLAS_WORKSPACE_CONFIG"] = "after-cleanup"
+    lifecycle.close()
+    assert fake_torch.use_deterministic_calls == [(True, False), (False, True)]
+    assert environment["CUBLAS_WORKSPACE_CONFIG"] == "after-cleanup"
+
+
+def test_cpu_policy_lifecycle_is_environment_inert() -> None:
+    lifecycle_type = getattr(
+        test_conftest,
+        "_DeterministicCudaPolicyLifecycle",
+        None,
+    )
+    assert lifecycle_type is not None
+    environment = {"CUBLAS_WORKSPACE_CONFIG": ":16:8"}
+    fake_torch = _FakeTorch(modern_tf32=True)
+    policy_context = test_conftest._deterministic_cuda_policy(fake_torch, "cpu")
+    policy_context.__enter__()
+    lifecycle = lifecycle_type(
+        policy_context,
+        environment,
+        "cpu",
+        True,
+        ":16:8",
+    )
+
+    lifecycle.close()
+    lifecycle.close()
+
+    assert fake_torch.use_deterministic_calls == []
+    assert environment == {"CUBLAS_WORKSPACE_CONFIG": ":16:8"}
 
 
 def test_cpu_deterministic_policy_is_inert(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -528,7 +619,17 @@ def test_cuda_request_establishes_cublas_config_before_torch_import() -> None:
         and isinstance(node.value.func, ast.Name)
         and node.value.func.id == "_validate_cuda_preimport"
     )
+    presence_snapshot = _top_level_assignment(
+        tree,
+        "_CUBLAS_WORKSPACE_CONFIG_WAS_PRESENT",
+    )
+    value_snapshot = _top_level_assignment(
+        tree,
+        "_PREVIOUS_CUBLAS_WORKSPACE_CONFIG",
+    )
 
+    assert presence_snapshot.lineno < validation_call.lineno
+    assert value_snapshot.lineno < validation_call.lineno
     assert validation_call.lineno < assignment.lineno
     assert assignment.lineno < _torch_import_line(tree)
     conditional = parent_by_child[assignment]
@@ -589,6 +690,85 @@ def test_gpu_runner_uses_only_the_canonical_serial_cuda_marker_lane() -> None:
         for value in string_literals
         if value.startswith("tests/") and "::test_" in value
     }
+
+
+def test_gpu_runner_fails_closed_on_canonical_junit_count() -> None:
+    runner_path = Path(__file__).parents[1] / "check_gpu_tests.py"
+    tree = _source_tree(runner_path)
+    policy_import = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "tests.pytest_policy"
+    )
+    assert {alias.name for alias in policy_import.names} == {
+        "CUDA_MIRROR_TESTS",
+        "CUDA_TESTS",
+    }
+    junit_import = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "check_junit"
+    )
+    assert "junit_is_exact_all_pass" in {alias.name for alias in junit_import.names}
+
+    expected_count = _top_level_assignment(tree, "EXPECTED_CUDA_TEST_COUNT")
+    assert isinstance(expected_count.value, ast.Call)
+    assert isinstance(expected_count.value.func, ast.Name)
+    assert expected_count.value.func.id == "len"
+    union = expected_count.value.args[0]
+    assert isinstance(union, ast.BinOp)
+    assert isinstance(union.op, ast.BitOr)
+    assert {
+        side.id
+        for side in (union.left, union.right)
+        if isinstance(side, ast.Name)
+    } == {"CUDA_TESTS", "CUDA_MIRROR_TESTS"}
+
+    predicate_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "junit_is_exact_all_pass"
+    ]
+    assert len(predicate_calls) == 1
+    assert isinstance(predicate_calls[0].args[0], ast.Name)
+    assert predicate_calls[0].args[0].id == "cuda_counts"
+    expected_keyword = next(
+        keyword
+        for keyword in predicate_calls[0].keywords
+        if keyword.arg == "expected_tests"
+    )
+    assert isinstance(expected_keyword.value, ast.Name)
+    assert expected_keyword.value.id == "EXPECTED_CUDA_TEST_COUNT"
+
+    green_labels = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.IfExp)
+        and isinstance(node.body, ast.Constant)
+        and node.body.value == "GREEN"
+    ]
+    assert any(
+        isinstance(node.test, ast.Name) and node.test.id == "cuda_ok"
+        for node in green_labels
+    )
+    main_definition = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    final_return = next(
+        node
+        for node in ast.walk(main_definition)
+        if isinstance(node, ast.Return)
+    )
+    assert any(
+        isinstance(node, ast.Name) and node.id == "cuda_ok"
+        for node in ast.walk(final_return.value)
+    )
 
 
 def test_gpu_runner_sets_cuda_process_environment_before_torch_import() -> None:

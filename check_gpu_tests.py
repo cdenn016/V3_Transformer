@@ -34,7 +34,11 @@ from dataclasses import replace
 
 import torch
 
-from check_junit import run_pytest_junit
+from check_junit import junit_is_exact_all_pass, run_pytest_junit
+from tests.pytest_policy import CUDA_MIRROR_TESTS, CUDA_TESTS
+
+
+EXPECTED_CUDA_TEST_COUNT = len(CUDA_TESTS | CUDA_MIRROR_TESTS)
 
 
 def _run_t3(dev: torch.device) -> bool:
@@ -80,18 +84,24 @@ def main() -> int:
 
     cuda_code = 0
     cuda_counts = None
+    cuda_ok = True
     if RUN_T6:
         print("CUDA marker lane -- canonical CUDA-only and mirrored tests:")
         cuda_code, cuda_counts = run_pytest_junit(
             ["-m", "cuda", "-v", "-p", "no:cacheprovider"],
             prefix="vfe3-gpu-cuda-",
         )
+        cuda_ok = cuda_code == 0 and junit_is_exact_all_pass(
+            cuda_counts,
+            expected_tests=EXPECTED_CUDA_TEST_COUNT,
+        )
 
     bar = "=" * 64
     print("\n" + bar)
     if RUN_T6:
+        cuda_status = "GREEN" if cuda_ok else f"FAIL (exit {cuda_code})"
         cuda_summary = (
-            f"  |  CUDA {'GREEN' if cuda_code == 0 else f'FAIL (exit {cuda_code})'} "
+            f"  |  CUDA {cuda_status} "
             f"({cuda_counts['passes']} passed, {cuda_counts['skipped']} skipped, "
             f"{cuda_counts['failures']} failed, {cuda_counts['errors']} errors)"
         )
@@ -100,7 +110,7 @@ def main() -> int:
     print(f"GPU CHECK: t3 gate {'CLEARS' if t3_ok else 'FAILS'} the ln(3) margin" + cuda_summary)
     print(bar)
     # exit 0 only if the t3 gate clears AND (the CUDA lane ran green or was skipped)
-    return 0 if (t3_ok and cuda_code == 0) else 1
+    return 0 if (t3_ok and cuda_ok) else 1
 
 
 if __name__ == "__main__":

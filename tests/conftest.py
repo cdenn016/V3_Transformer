@@ -1,12 +1,14 @@
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from contextlib import AbstractContextManager, contextmanager
 from typing import Any, Iterator
 
 
 _CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 _REQUESTED_DEVICE_NAME = os.environ.get("VFE3_TEST_DEVICE", "cpu")
+_CUBLAS_WORKSPACE_CONFIG_WAS_PRESENT = "CUBLAS_WORKSPACE_CONFIG" in os.environ
+_PREVIOUS_CUBLAS_WORKSPACE_CONFIG = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
 
 
 def _requests_cuda(name: str) -> bool:
@@ -107,9 +109,52 @@ def _start_deterministic_cuda_policy(
     return policy_context
 
 
+class _DeterministicCudaPolicyLifecycle:
+    def __init__(
+        self,
+        policy_context:        AbstractContextManager[None],
+        environment:           MutableMapping[str, str],
+        requested_device_name: str,
+        cublas_was_present:    bool,
+        previous_cublas_value: str | None,
+    ) -> None:
+        self._policy_context = policy_context
+        self._environment = environment
+        self._requested_device_name = requested_device_name
+        self._cublas_was_present = cublas_was_present
+        self._previous_cublas_value = previous_cublas_value
+        self._closed = False
+
+    def close(self) -> None:
+        """Close and restore process state once across all pytest exit paths."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._policy_context.__exit__(None, None, None)
+        finally:
+            if _requests_cuda(self._requested_device_name):
+                if (
+                    self._cublas_was_present
+                    and self._previous_cublas_value is not None
+                ):
+                    self._environment["CUBLAS_WORKSPACE_CONFIG"] = (
+                        self._previous_cublas_value
+                    )
+                else:
+                    self._environment.pop("CUBLAS_WORKSPACE_CONFIG", None)
+
+
 _DETERMINISTIC_CUDA_POLICY_CONTEXT = _start_deterministic_cuda_policy(
     torch,
     _REQUESTED_DEVICE_NAME,
+)
+_DETERMINISTIC_CUDA_POLICY_LIFECYCLE = _DeterministicCudaPolicyLifecycle(
+    _DETERMINISTIC_CUDA_POLICY_CONTEXT,
+    os.environ,
+    _REQUESTED_DEVICE_NAME,
+    _CUBLAS_WORKSPACE_CONFIG_WAS_PRESENT,
+    _PREVIOUS_CUBLAS_WORKSPACE_CONFIG,
 )
 
 pytest_plugins = ("tests.pytest_policy",)
@@ -120,7 +165,12 @@ def deterministic_cuda_policy() -> Iterator[None]:
     try:
         yield
     finally:
-        _DETERMINISTIC_CUDA_POLICY_CONTEXT.__exit__(None, None, None)
+        _DETERMINISTIC_CUDA_POLICY_LIFECYCLE.close()
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    del config
+    _DETERMINISTIC_CUDA_POLICY_LIFECYCLE.close()
 
 
 @pytest.fixture

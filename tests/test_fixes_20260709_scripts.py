@@ -59,6 +59,40 @@ def test_read_junit_counts_sums_testsuites_root(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {"tests": 0, "passes": 0, "failures": 0, "errors": 0, "skipped": 0},
+        {"tests": 4, "passes": 3, "failures": 1, "errors": 0, "skipped": 0},
+        {"tests": 4, "passes": 3, "failures": 0, "errors": 1, "skipped": 0},
+        {"tests": 4, "passes": 3, "failures": 0, "errors": 0, "skipped": 1},
+        {"tests": 4, "passes": 3, "failures": 0, "errors": 0, "skipped": 0},
+        {"tests": 3, "passes": 3, "failures": 0, "errors": 0, "skipped": 0},
+    ],
+    ids=["zero", "failure", "error", "skip", "inconsistent", "incomplete"],
+)
+def test_cuda_junit_predicate_rejects_incomplete_results(
+    counts: dict[str, int],
+) -> None:
+    predicate = getattr(check_junit, "junit_is_exact_all_pass", None)
+    assert callable(predicate)
+    assert predicate(counts, expected_tests=4) is False
+
+
+def test_cuda_junit_predicate_accepts_only_exact_all_pass_count() -> None:
+    predicate = getattr(check_junit, "junit_is_exact_all_pass", None)
+    assert callable(predicate)
+    counts = {
+        "tests": 4,
+        "passes": 4,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
+
+    assert predicate(counts, expected_tests=4) is True
+
+
 def test_run_pytest_junit_derives_counts_and_cleans_xml(monkeypatch):
     observed = {}
 

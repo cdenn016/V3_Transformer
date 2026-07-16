@@ -1,5 +1,6 @@
 """Shared machine-readable pytest accounting for click-to-run verification scripts."""
 
+from collections.abc import Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict, Sequence
@@ -39,6 +40,41 @@ def read_junit_counts(path: Path) -> Dict[str, int]:
     if counts["passes"] < 0:
         raise ValueError("JUnit failure/error/skip counts exceed the test count")
     return counts
+
+
+def junit_is_exact_all_pass(
+    counts: Mapping[str, int],
+
+    *,
+    expected_tests: int,
+) -> bool:
+    """Return whether JUnit proves the exact expected cohort passed in full."""
+    if (
+        isinstance(expected_tests, bool)
+        or not isinstance(expected_tests, int)
+        or expected_tests <= 0
+    ):
+        return False
+
+    fields = ("tests", "passes", "failures", "errors", "skipped")
+    try:
+        values = {field: counts[field] for field in fields}
+    except KeyError:
+        return False
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in values.values()
+    ):
+        return False
+    if values["tests"] != sum(values[field] for field in fields[1:]):
+        return False
+    return (
+        values["tests"] == expected_tests
+        and values["passes"] == expected_tests
+        and values["failures"] == 0
+        and values["errors"] == 0
+        and values["skipped"] == 0
+    )
 
 
 def run_pytest_junit(
