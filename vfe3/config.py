@@ -1489,18 +1489,20 @@ class VFE3Config:
                     "Valid, but equivalent to a single learnable scalar temperature.",
                     UserWarning, stacklevel=2,
                 )
-        if self.mass_phi < 0.0:
-            raise ValueError(f"mass_phi must be >= 0, got {self.mass_phi}")
-        if self.mstep_self_coupling_weight < 0.0:
+        if not math.isfinite(self.mass_phi) or self.mass_phi < 0.0:
+            raise ValueError(f"mass_phi must be >= 0 and finite, got {self.mass_phi}")
+        if (not math.isfinite(self.mstep_self_coupling_weight)
+                or self.mstep_self_coupling_weight < 0.0):
             raise ValueError(
-                f"mstep_self_coupling_weight must be >= 0, got {self.mstep_self_coupling_weight}"
+                "mstep_self_coupling_weight must be >= 0 and finite, got "
+                f"{self.mstep_self_coupling_weight}"
             )
-        if self.lambda_beta < 0.0:
-            raise ValueError(f"lambda_beta must be >= 0, got {self.lambda_beta}")
-        if self.lambda_h < 0.0:
-            raise ValueError(f"lambda_h must be >= 0, got {self.lambda_h}")
-        if self.lambda_gamma < 0.0:
-            raise ValueError(f"lambda_gamma must be >= 0, got {self.lambda_gamma}")
+        if not math.isfinite(self.lambda_beta) or self.lambda_beta < 0.0:
+            raise ValueError(f"lambda_beta must be >= 0 and finite, got {self.lambda_beta}")
+        if not math.isfinite(self.lambda_h) or self.lambda_h < 0.0:
+            raise ValueError(f"lambda_h must be >= 0 and finite, got {self.lambda_h}")
+        if not math.isfinite(self.lambda_gamma) or self.lambda_gamma < 0.0:
+            raise ValueError(f"lambda_gamma must be >= 0 and finite, got {self.lambda_gamma}")
         # attention priors validated against the prior REGISTRY (add-by-registering). Local import
         # avoids a config <- attention_prior cycle; the bound name is reused for beta_attention_prior below.
         from vfe3.attention_prior import _PRIORS
@@ -1676,8 +1678,9 @@ class VFE3Config:
 
         # E-step
         for name in ("e_q_mu_lr", "e_q_sigma_lr", "e_phi_lr", "e_s_mu_lr", "e_s_sigma_lr"):
-            if getattr(self, name) < 0.0:
-                raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be >= 0 and finite, got {value}")
         if self.s_e_step:
             # Intentional narrowing (not a membership check): of the valid prior_source values, only
             # 'model_channel' routes encode AND decode through the s-tables, which the live s-refine
@@ -2626,12 +2629,13 @@ class VFE3Config:
                     "gamma_as_beta_prior=True requires lambda_gamma > 0 (the model-channel s "
                     f"tables and gamma energy must exist), got lambda_gamma={self.lambda_gamma}"
                 )
-            if not (0.0 <= self.gamma_prior_weight <= 1.0):
-                raise ValueError(
-                    f"gamma_prior_weight must be in [0, 1], got {self.gamma_prior_weight}"
-                )
-        if self.lambda_twohop < 0.0:
-            raise ValueError(f"lambda_twohop must be >= 0, got {self.lambda_twohop}")
+        if not (math.isfinite(self.gamma_prior_weight)
+                and 0.0 <= self.gamma_prior_weight <= 1.0):
+            raise ValueError(
+                f"gamma_prior_weight must be in [0, 1] and finite, got {self.gamma_prior_weight}"
+            )
+        if not math.isfinite(self.lambda_twohop) or self.lambda_twohop < 0.0:
+            raise ValueError(f"lambda_twohop must be >= 0 and finite, got {self.lambda_twohop}")
         if not math.isfinite(self.query_tau_c) or self.query_tau_c < 0.0:
             raise ValueError(
                 f"query_tau_c must be finite and >= 0, got {self.query_tau_c}"
