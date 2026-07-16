@@ -1312,6 +1312,8 @@ def plot_geometry_health(
         {"title": "Projected M-step chart", "ylabel": "fraction / scale", "series": [
             ("phi_chart_projected_fraction", "projected fraction", _CB[1]),
             ("phi_chart_projection_scale_min", "minimum scale", _CB[2])]},
+        {"title": "Projected M-step cost", "ylabel": "milliseconds", "series": [
+            ("phi_chart_projection_ms", "projection time", _CB[0])]},
         {"title": "Vertex conditioning", "ylabel": r"$\kappa(\exp\phi)$", "logy": True,
          "series": [
             ("vertex_cond_median", "median", _CB[0]),

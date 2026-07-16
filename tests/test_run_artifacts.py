@@ -450,6 +450,7 @@ def test_finalize_run_writes_test_results_and_figures(tmp_path):
     summary = json.loads((tmp_path / "run" / "summary.json").read_text())
     assert "test_ppl" in summary and "best_val_ppl" in summary
     assert "reloaded_best" in summary   # m26: surface whether best_model.pt was reloaded (cross-dir resume honesty)
+    assert summary["phi_chart_norm_route"] is None
 
 
 def test_frequency_strata_use_training_corpus_counts():

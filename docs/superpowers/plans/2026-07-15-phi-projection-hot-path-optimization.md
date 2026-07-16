@@ -244,27 +244,27 @@ git commit -m "perf: gate phi projection diagnostics to logged steps"
 - The geometry-health history subset includes `phi_chart_projection_ms`.
 - `plot_geometry_health` shows timing only when the column is present; existing histories remain valid.
 
-- [ ] **Step 1: Write failing summary and optional-plot tests**
+- [x] **Step 1: Write failing summary and optional-plot tests**
 
 Verify disabled and enabled summary provenance without running long training. Verify that geometry-health plotting accepts old history and adds a labeled timing trace when the new field exists.
 
-- [ ] **Step 2: Witness missing provenance and plot routing**
+- [x] **Step 2: Witness missing provenance and plot routing**
 
 Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_viz.py -k 'phi_chart or geometry_health' --junitxml=C:\tmp\vfe3-phi-reporting-red-20260715.xml`
 
 Expected: failures for missing `phi_chart_norm_route` and omitted timing history.
 
-- [ ] **Step 3: Implement summary and optional figure fields**
+- [x] **Step 3: Implement summary and optional figure fields**
 
 Read route metadata from `model.group`; do not serialize a string into numeric `metrics.csv`. Keep timing absent from silent rows and absent from plots for historical runs.
 
-- [ ] **Step 4: Run reporting tests**
+- [x] **Step 4: Run reporting tests**
 
-Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_viz.py tests/test_run_artifacts.py tests/test_artifact_contract.py --junitxml=C:\tmp\vfe3-phi-reporting-green-20260715.xml`
+Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_viz.py tests/test_reporting_additions.py tests/test_run_artifacts.py tests/test_round3_artifacts.py --junitxml=C:\tmp\vfe3-phi-reporting-green-20260715.xml`
 
 Expected: zero failures and zero errors.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add vfe3/run_artifacts.py vfe3/viz/figures.py tests/test_phi_projection_optimization_20260715.py tests/test_viz.py

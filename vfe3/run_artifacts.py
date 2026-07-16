@@ -62,6 +62,17 @@ def semantic_config_fingerprint(
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _phi_chart_norm_route(
+    model: torch.nn.Module,
+    cfg:   VFE3Config,
+) -> Optional[str]:
+    """Persist the exact norm route only when the projected phi M-step is enabled."""
+    if getattr(cfg, "phi_mstep_max_matrix_norm", None) is None:
+        return None
+    route = getattr(model.group, "phi_norm_route", None)
+    return route() if route is not None else "dense_fallback"
+
+
 def sigma_behavior_config(
     cfg: "VFE3Config | Mapping[str, object]",
 ) -> Dict[str, object]:
@@ -1368,6 +1379,7 @@ def finalize_run(
         "wall_time_s":  wall_time,
         "use_prior_bank":  cfg.use_prior_bank,
         "use_head_mixer":  cfg.use_head_mixer,
+        "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "scaling_point":   scaling_point,
     })
 
@@ -1712,6 +1724,7 @@ def finalize_validation_run(
         "wall_time_s":         (float(wall_time) if wall_time is not None else None),
         "terminal_checkpoint": terminal_checkpoint,
         "figures_written":     figures_written,
+        "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
     })
 
     if ema is not None:
@@ -2100,6 +2113,7 @@ def _save_figures(
             "phi_exp_clamp_frac", "phi_exp_scale_min",
             "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
             "phi_chart_projected_fraction", "phi_chart_projection_scale_min",
+            "phi_chart_projection_ms",
             "belief_cond_p95", "belief_cond_max", "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
             "fisher_trace_mean", "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
             "guard_energy_klmax_frac", "guard_selfdiv_klmax_frac", "nonfinite_frac", "renyi_band_frac",

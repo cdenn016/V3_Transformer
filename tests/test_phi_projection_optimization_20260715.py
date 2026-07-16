@@ -378,3 +378,44 @@ def test_nonfinite_step_does_not_project(monkeypatch) -> None:
         )
 
     assert metrics["step_skipped"] == 1.0
+
+
+def test_phi_chart_summary_route_is_none_when_disabled_and_named_when_enabled() -> None:
+    import vfe3.run_artifacts as run_artifacts
+
+    assert hasattr(run_artifacts, "_phi_chart_norm_route")
+    disabled_cfg = VFE3Config(vocab_size=8, embed_dim=4, n_heads=1)
+    disabled_model = VFEModel(disabled_cfg)
+    enabled_cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=1,
+        phi_mstep_max_matrix_norm=2.0,
+    )
+    enabled_model = VFEModel(enabled_cfg)
+
+    assert run_artifacts._phi_chart_norm_route(disabled_model, disabled_cfg) is None
+    assert (
+        run_artifacts._phi_chart_norm_route(enabled_model, enabled_cfg)
+        == "diagonal_gram"
+    )
+
+
+def test_geometry_health_adds_projection_timing_panel_only_when_present() -> None:
+    from matplotlib import pyplot as plt
+    from vfe3.viz.figures import plot_geometry_health
+
+    old_history = {
+        "step": [1, 2, 3],
+        "phi_chart_projected_fraction": [0.1, 0.2, 0.1],
+    }
+    old_figure = plot_geometry_health(old_history)
+    assert "Projected M-step cost" not in [axis.get_title() for axis in old_figure.axes]
+
+    timed_history = dict(old_history)
+    timed_history["phi_chart_projection_ms"] = [0.4, 0.5, 0.3]
+    timed_figure = plot_geometry_health(timed_history)
+
+    assert "Projected M-step cost" in [axis.get_title() for axis in timed_figure.axes]
+    plt.close(old_figure)
+    plt.close(timed_figure)

@@ -834,9 +834,11 @@ def test_validation_finalizer_records_validation_without_test_fields(tmp_path, m
         assert forbidden not in summary
     for required in ("primary_val_ppl", "final_val_ce", "final_val_ppl", "final_val_bpc",
                      "best_val_ppl", "best_step", "n_steps", "n_params", "final_train_loss",
-                     "wall_time_s", "terminal_checkpoint", "figures_written"):
+                     "wall_time_s", "terminal_checkpoint", "figures_written",
+                     "phi_chart_norm_route"):
         assert required in summary
     assert isinstance(summary["figures_written"], list)
+    assert summary["phi_chart_norm_route"] is None
 
     vr = json.loads((tmp_path / "r" / "validation_results.json").read_text())
     assert vr["selection_split"] == "validation"
