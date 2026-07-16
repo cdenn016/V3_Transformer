@@ -214,14 +214,14 @@ class VFE3Config:
     # parameter table (max_seq_len, n_gen); "frozen" is the parameter-free i*pos_phi_scale on one
     # axis. The theoretically PURE no-composition path is "none". Validated against the pos_phi
     # registry.
-    pos_phi:                   str   = "learned"      # "none" | "learned" | "frozen"
-    pos_phi_compose:           str   = "bch"       # composition chart: bch (default) | euclidean
+    pos_phi:                   str             = "learned"   # "none" | "learned" | "frozen"
+    pos_phi_compose:           str             = "bch"       # composition chart: bch (default) | euclidean
     
-    bch_pe_order:              int   = 4           # BCH Dynkin truncation order (compose_phi order) 4 is just as good as 6
-    bch_residual_max:          Optional[float] = None  # opt-in fail-closed BCH/group-product relative residual
+    bch_pe_order:              int             = 4           # BCH Dynkin truncation order (compose_phi order) 4 is just as good as 6
+    bch_residual_max:          Optional[float] = None        # opt-in fail-closed BCH/group-product relative residual
    
-    pos_phi_scale:             float = 0.02        # learned-table init scale AND frozen per-position step
-    pos_phi_project_slk:       bool  = False       # per-block trace projection (det Omega = 1)
+    pos_phi_scale:             float           = 0.02        # learned-table init scale AND frozen per-position step
+    pos_phi_project_slk:       bool            = False       # per-block trace projection (det Omega = 1)
 
     # gauge-RoPE (default-off): a block-diagonal positional rotation R(theta) folded into the
     # transport (Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T). Means-only by default;

@@ -434,7 +434,6 @@ def gauge_invariant_edge_features(
     # transport_covariance upcasts its M4 sandwich. safe_cholesky degrades a non-PD S to NaN via its
     # ok mask (-> kl_max downstream) instead of raising a LinAlgError that aborts the whole forward.
     orig_dtype    = mu_q.dtype
-    K             = mu_q.shape[-1]
     mu_q,  cov_q  = mu_q.double(),  cov_q.double()
     mu_kt, cov_kt = mu_kt.double(), cov_kt.double()
     def _factor_with_status(
