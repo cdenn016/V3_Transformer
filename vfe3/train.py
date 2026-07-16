@@ -51,6 +51,33 @@ from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source f
 
 _PHI_CLAMP_WARNED:   bool = False
 _S_PHI_CLAMP_WARNED: bool = False
+_SUCCESSFUL_UPDATES_KEY = "successful_updates"
+
+
+def _successful_update_count(
+    optimizer: torch.optim.Optimizer,
+
+    *,
+    legacy_default: int = 0,
+) -> int:
+    r"""Read the accepted-update clock persisted in optimizer parameter-group metadata.
+
+    The checkpoint loader preserves this one runtime cursor while continuing to replace configured
+    group metadata from the current run. A checkpoint written before this field existed falls back
+    to its completed outer-step cursor.
+    """
+    if not optimizer.param_groups:
+        return legacy_default
+    value = optimizer.param_groups[0].get(_SUCCESSFUL_UPDATES_KEY, legacy_default)
+    return int(value)
+
+
+def _set_successful_update_count(
+    optimizer: torch.optim.Optimizer,
+    count:     int,
+) -> None:
+    for group in optimizer.param_groups:
+        group[_SUCCESSFUL_UPDATES_KEY] = int(count)
 
 
 def _warn_phi_transport_clamp(
@@ -488,6 +515,7 @@ def train_step(
     _scaler = scaler if scaler is not None else torch.amp.GradScaler(
         device=tokens.device.type, enabled=False)
 
+    successful_updates = _successful_update_count(optimizer)
     optimizer.zero_grad(set_to_none=True)
     _mb_tok: List[int] = []                                     # per-microbatch counted-token spread (accum only)
     # E-step belief-gradient capture: a dict the forward fills with the raw ||grad_mu/sigma/phi|| of F
@@ -696,8 +724,10 @@ def train_step(
                 _cfg.phi_mstep_max_matrix_norm,
                 collect_stats=False,
             )
-    scheduler.step()                       # UNCONDITIONAL: resume rebuilds LambdaLR at last_epoch=start_step-1
-    #                                        assuming exactly one scheduler.step per loop iteration
+    if did_step:
+        successful_updates += 1
+        scheduler.step()                   # accepted optimizer updates are the scheduler's clock
+    _set_successful_update_count(optimizer, successful_updates)
     return step_loss
 
 
@@ -708,6 +738,7 @@ def _maybe_metropolis_omega(
     *,
     step:      int,
     generator: torch.Generator,          # persistent seeded RNG, threaded across steps
+    did_step:  bool = True,              # False -> rejected optimizer attempt; no state/RNG transition
 ) -> None:
     r"""Gated + cadence-checked call to the learnable-reflection Metropolis det-sign sweep.
 
@@ -717,8 +748,11 @@ def _maybe_metropolis_omega(
     knobs name the shared move, not the storage, so they govern both modes). Factored out of the
     training loop so the seam is a single guarded line there (see design spec Sec.4);
     ``model.metropolis_omega_step`` is itself a no-op under any other mode, so this gate is a fast-path
-    short-circuit, not the sole safety net.
+    short-circuit, not the sole safety net. A rejected optimizer attempt is not a training-state
+    transition, so ``did_step=False`` returns before either frame mutation or private-generator use.
     """
+    if not did_step:
+        return
     cfg = model.cfg
     if ((cfg.omega_reflection == "metropolis" or cfg.phi_reflection == "metropolis")
             and (step % cfg.omega_metropolis_every == 0)):
@@ -1053,9 +1087,9 @@ def train(
 
     # Opt-in RESUME (PL8): an explicit resume_from arg, else cfg.resume_from, else from scratch. When set,
     # restore model weights + AdamW momentum + RNG from the checkpoint and rebuild the cosine LambdaLR at
-    # the saved step so the continuation is equivalent to an uninterrupted run. start_step is the number of
-    # completed M-steps; the loop runs range(start_step, n_steps). resume_path None leaves the from-scratch
-    # path byte-identical (scheduler built with last_epoch=-1, loop from 0).
+    # the persisted successful-update count so a rejected update does not consume schedule progress.
+    # start_step remains the outer-loop/data cursor; the loop runs range(start_step, n_steps). Legacy
+    # checkpoints without the new optimizer-group clock fall back to start_step.
     resume_path = resume_from if resume_from is not None else cfg.resume_from
     start_step = 0
     if device is None:
@@ -1097,10 +1131,14 @@ def train(
         # base (not the post-load group['lr'], which the restored optimizer state overwrote with base*cos).
         for group, base in zip(optimizer.param_groups, base_lrs):
             group["initial_lr"] = base
+        successful_updates = _successful_update_count(
+            optimizer, legacy_default=start_step)
+        _set_successful_update_count(optimizer, successful_updates)
         scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, _floor_lr_lambdas(base_lrs, cfg), last_epoch=start_step - 1)
+            optimizer, _floor_lr_lambdas(base_lrs, cfg), last_epoch=successful_updates - 1)
     else:
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _floor_lr_lambdas(base_lrs, cfg))
+        _set_successful_update_count(optimizer, 0)
     # Unigram log-prior decode (cfg.decode_unigram_prior, default OFF): fill the PriorBank's
     # unigram table from the TRAINING stream once, before the loop -- a fixed data statistic
     # (add-one-smoothed log frequencies), not a learned parameter. The counts come from the
@@ -1231,7 +1269,11 @@ def train(
         # Metropolis det-sign sweep (opt-in, default OFF): runs on the POST-optimizer-step model,
         # gated + cadence-checked by the helper; inert (no call, no generator draw) unless
         # cfg.omega_reflection == 'metropolis'. tokens is the SAME input batch just fed to train_step.
-        _maybe_metropolis_omega(model, tokens, step=step, generator=metro_gen)
+        successful_step = max(_successful_update_count(optimizer) - 1, 0)
+        _maybe_metropolis_omega(
+            model, tokens, step=successful_step, generator=metro_gen,
+            did_step=step_status["did_step"],
+        )
         if ema is not None and step_status["did_step"]:
             ema.update(model)                            # blend the post-step weights into the shadow
 

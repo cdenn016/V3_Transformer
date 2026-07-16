@@ -488,7 +488,8 @@ class RunArtifacts:
         r"""Write a resumable ``checkpoints/step_<N>.pt`` (model + optimizer + RNG + config + step).
 
         ``load_checkpoint`` reads this back to continue training: ``model_state`` and
-        ``optimizer_state`` restore the weights and AdamW momentum, ``rng_state`` restores the
+        ``optimizer_state`` restore the weights, AdamW momentum, and successful-update scheduler
+        clock; ``rng_state`` restores the
         CPU (and CUDA) generators for reproducible continuation, and ``step`` is the number of
         completed M-steps so the resumed run rebuilds the cosine ``LambdaLR`` at the right point.
         ``scaler`` (audit 2026-06-09 IE3): an ENABLED fp16 GradScaler's state (current scale +
@@ -689,14 +690,21 @@ def load_checkpoint(
         saved_epoch = _require_nonnegative_int(saved_data_state["epoch"], "epoch")
     model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
+        saved_optimizer_state = ckpt["optimizer_state"]
+        saved_groups = saved_optimizer_state.get("param_groups", [])
+        successful_updates = (
+            saved_groups[0].get("successful_updates") if saved_groups else None
+        )
         fresh = [{k: v for k, v in group.items() if k != "params"}
                  for group in optimizer.param_groups]
-        optimizer.load_state_dict(ckpt["optimizer_state"])
+        optimizer.load_state_dict(saved_optimizer_state)
         for group, metadata in zip(optimizer.param_groups, fresh):
             params = group["params"]
             group.clear()
             group.update(metadata)
             group["params"] = params
+            if successful_updates is not None:
+                group["successful_updates"] = int(successful_updates)
     if scaler is not None and ckpt.get("scaler_state") is not None:
         scaler.load_state_dict(ckpt["scaler_state"])
     # EMA shadow: restore it so a resumed run continues the SAME running average instead of re-seeding

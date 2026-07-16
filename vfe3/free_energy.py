@@ -451,7 +451,11 @@ def free_energy(
         else:
             log_pi = math.log(max(1.0 / beta.shape[-1], log_eps))
         _tau_e = _broadcast_tau(tau, energy)          # (H,1,1) for per-head, scalar otherwise
-        entropy = (_tau_e * (beta * (torch.log(beta.clamp(min=log_eps)) - log_pi))).sum()
+        # xlogy is the coherent zero-safe extension of beta * log(beta): it returns exactly zero
+        # at beta == 0 without flooring any positive tail probability. Flooring log(beta) changes
+        # the differentiated scalar below the floor and breaks the Gibbs-envelope derivative.
+        beta_for_log = torch.where(beta > 0.0, beta, torch.ones_like(beta))
+        entropy = (_tau_e * (torch.special.xlogy(beta, beta_for_log) - beta * log_pi)).sum()
         F = F + lambda_beta * entropy
     if lambda_twohop != 0.0:
         # Two-hop coupling block (cfg.lambda_twohop; 0.0 = OFF, pure canonical F):
@@ -657,7 +661,8 @@ def _belief_free_energy_rows(
         else:
             log_pi = math.log(max(1.0 / beta.shape[-1], log_eps))
         _tau_e = _broadcast_tau(tau, energy)
-        entropy_full = _tau_e * (beta * (torch.log(beta.clamp(min=log_eps)) - log_pi))
+        beta_for_log = torch.where(beta > 0.0, beta, torch.ones_like(beta))
+        entropy_full = _tau_e * (torch.special.xlogy(beta, beta_for_log) - beta * log_pi)
         entropy_row = lambda_beta * _collapse(entropy_full.sum(dim=-1))
     else:
         entropy_row = torch.zeros_like(self_row)

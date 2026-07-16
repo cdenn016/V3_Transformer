@@ -95,6 +95,35 @@ def belief_gradients_autograd(
     key-role semantics carry over exactly: under filtering the builder receives detached key
     slots (query-side d delta/d mu_i only -- mean-field coordinate ascent); under smoothing both
     slots share the live leaves (full gradient, the stationary point of the global F)."""
+    if torch.is_autocast_enabled(mu.device.type):
+        # The outer training autocast scales only the final loss. Inner derivative construction has
+        # already happened by then, so a bf16/fp16 transport or objective here cannot be recovered by
+        # GradScaler. Re-enter under an explicit fp32 island; recursion terminates immediately because
+        # autocast is disabled in the nested call. Tensor casts retain the graph for create_graph=True.
+        with torch.autocast(device_type=mu.device.type, enabled=False):
+            return belief_gradients_autograd(
+                mu.float(), sigma.float(), mu_p.float(), sigma_p.float(), omega,
+                tau=(tau.float() if isinstance(tau, torch.Tensor) else tau),
+                lambda_beta=(lambda_beta.float()
+                             if isinstance(lambda_beta, torch.Tensor) else lambda_beta),
+                renyi_order=renyi_order,
+                kl_max=kl_max,
+                eps=eps,
+                b0=b0,
+                c0=c0,
+                value=value,
+                lambda_twohop=lambda_twohop,
+                include_attention_entropy=include_attention_entropy,
+                create_graph=create_graph,
+                need_sigma_grad=need_sigma_grad,
+                gradient_mode=gradient_mode,
+                family=family,
+                divergence_family=divergence_family,
+                lambda_alpha_mode=lambda_alpha_mode,
+                irrep_dims=irrep_dims,
+                log_prior=(log_prior.float() if log_prior is not None else None),
+                omega_builder=omega_builder,
+            )
     # Live leaves (keep the unrolled chain) only when create_graph is requested AND the belief
     # genuinely carries grad upstream. The truncated E-step establishes that contract by creating
     # fresh attached leaves at the last-k boundary. Otherwise use a detached clone (autograd.grad

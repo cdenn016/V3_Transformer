@@ -12,8 +12,8 @@ new boundary:
   * ``_belief_free_energy_rows`` -- the per-query (..., N) decomposition of the belief channel whose
     summed rows reproduce ``free_energy()`` numerically (float64), with an exact zero observation
     slot and a ``beta_override`` seam so diagnostics does not recompute attention weights;
-  * the legacy scalar ``free_energy()`` keeps its byte-for-byte reduction order (float32 ``torch.equal``
-    for values AND gradients against a copied pre-change oracle) -- it does NOT delegate to the rows;
+  * the scalar ``free_energy()`` keeps its byte-for-byte value reduction order, while strictly positive
+    probability tails use the coherent entropy derivative instead of the pre-change clamped surrogate;
   * the compatibility wrapper ``metrics.free_energy_terms`` keeps its raw public field values while its
     ``total`` alone routes through the evaluator (weights, entropy gating, negative-likelihood sign);
   * the model channel (``_gamma_coupling_rows``) carries gradient into the s tables (no hidden detach)
@@ -196,7 +196,7 @@ def _legacy_scalar_oracle(self_div, energy, alpha, *, tau, lambda_beta, log_eps=
     return F
 
 
-def test_legacy_free_energy_reduction_order_is_bitwise_unchanged():
+def test_free_energy_value_order_and_coherent_entropy_gradient():
     torch.manual_seed(2)
     N = 6
     # A WIDE dynamic range so float32 sum regrouping is not associative: a row-then-query reduction
@@ -227,8 +227,14 @@ def test_legacy_free_energy_reduction_order_is_bitwise_unchanged():
     f_impl.backward()
     f_oracle.backward()
     assert torch.equal(s1.grad, s2.grad)
-    assert torch.equal(e1.grad, e2.grad)
     assert torch.equal(a1.grad, a2.grad)
+
+    beta = attention_weights(base_energy, tau=kw["tau"], log_prior=base_prior)
+    expected_energy_grad = (
+        kw["lambda_beta"] * beta
+        + kw["lambda_twohop"] * (beta.detach() @ beta.detach())
+    )
+    torch.testing.assert_close(e1.grad, expected_energy_grad, rtol=1e-5, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -1254,8 +1260,7 @@ def test_end_to_end_hierarchy_matrix(cell):
         torch.manual_seed(0)
         fresh = VFEModel(cfg)
         fresh.load_state_dict(sd)
-        with torch.no_grad():
-            loss_fresh = fresh(tok, tgt)[1]
+        loss_fresh = fresh(tok, tgt)[1]
     assert torch.allclose(loss.detach(), loss_fresh, atol=1e-6, rtol=0.0), \
         f"{cell}: state-dict reload changed the forward loss"
 

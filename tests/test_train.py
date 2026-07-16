@@ -500,8 +500,8 @@ def test_build_optimizer_groups_pos_phi_free():
 def test_train_step_skips_on_nonfinite_grad_with_finite_loss():
     r"""F1 (audit 2026-07-01): a FINITE scalar loss can still carry a NaN parameter gradient
     through the unrolled E-step; the finite-GRADIENT gate must skip the optimizer step so AdamW's
-    exp_avg/exp_avg_sq moment buffers are never poisoned. The scheduler still steps (resume
-    rebuilds LambdaLR assuming exactly one scheduler.step per loop iteration)."""
+    exp_avg/exp_avg_sq moment buffers are never poisoned. The scheduler is an accepted-update
+    transition and must remain unchanged when that update is rejected."""
     torch.manual_seed(0)
     cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
@@ -529,7 +529,7 @@ def test_train_step_skips_on_nonfinite_grad_with_finite_loss():
         for key in ("exp_avg", "exp_avg_sq"):
             if key in state:
                 assert torch.isfinite(state[key]).all()
-    assert sched.last_epoch == 2                                    # scheduler stepped UNCONDITIONALLY
+    assert sched.last_epoch == 1                                    # rejected update leaves schedule unchanged
 
 
 # =============================================================================

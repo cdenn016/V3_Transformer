@@ -475,7 +475,7 @@ def _scorer_F(m, belief, context, *, mode) -> float:
     dev = belief.mu.device
     lp = m._effective_beta_log_prior(belief, context.prior)
     with torch.no_grad():
-        return free_energy_value(
+        total = free_energy_value(
             belief, context.mu_p, context.sigma_p, grp,
             tau=context.tau, renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
             b0=_as_coeff(cfg.b0, dev), c0=_as_coeff(cfg.c0, dev),
@@ -492,7 +492,16 @@ def _scorer_F(m, belief, context, *, mode) -> float:
             transport_mean_per_head=cfg.transport_mean_per_head, rope=context.rope,
             rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
             exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
-        ).item()
+        )
+        if cfg.lambda_h > 0.0 or cfg.lambda_gamma > 0.0:
+            s_belief = (
+                (context.prior.s_mu, context.prior.s_sigma)
+                if context.prior.s_mu is not None and context.prior.s_sigma is not None
+                else None
+            )
+            total = total + m._model_channel_free_energy(
+                context.token_ids, belief, s_belief=s_belief)
+        return total.item()
 
 
 def _oracle_delta(m, context, tid, *, mode) -> float:
