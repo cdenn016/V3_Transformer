@@ -1,6 +1,6 @@
 # Test execution lanes
 
-The ordinary CPU entry point is the click-to-run driver. It accepts no command-line arguments, captures the logical CPU topology once, validates both configured worker counts before constructing the child environment or starting either subprocess, then launches the 12-worker fast lane and 3-worker slow lane separately. It stops after the first nonzero result and reports counts only from each lane's temporary JUnit XML file. A successful pytest exit with an empty JUnit suite is rejected. Both subprocesses receive every thread cap documented below.
+The ordinary CPU entry point is the click-to-run driver. It accepts no command-line arguments, captures the logical CPU topology once, validates both configured worker counts before constructing the child environment or starting either subprocess, then launches the 12-worker fast lane and 3-worker slow lane separately. It stops after the first nonzero result and reports counts only from each lane's temporary JUnit XML file. A successful pytest exit with an empty JUnit suite is rejected. Every `testsuite` must explicitly provide its `tests`, `failures`, `errors`, and `skipped` counters; missing attributes are invalid rather than silently interpreted as zero. The shared JUnit runner removes its temporary report even when validation raises. Both subprocesses receive every thread cap documented below.
 
 ```powershell
 python run_cpu_tests.py
@@ -62,7 +62,7 @@ Invoke-VFE3TestEnv $cpuParallelEnv {
 
 All eleven native UMAP integration tests were intentionally removed from the suite. Production UMAP support and the `umap-learn` visualization dependency remain, as do mocked worker-protocol tests and pure report-planning tests. The retained slow lane therefore contains exactly the three nodes selected by `tests/pytest_policy.py`; it is not a native UMAP lane.
 
-CUDA is a dedicated serial lane selected canonically with `-m cuda`. `tests/pytest_policy.py` currently defines six CUDA-only hardware tests and sixteen ordinary numerical contracts that join the CUDA marker only when the requested device type is CUDA. Collection policy, rather than a duplicated literal node list or a brittle hardcoded pass count, defines the executable matrix. The expected count is computed as `len(CUDA_TESTS | CUDA_MIRROR_TESTS)`, and success requires both a zero pytest exit and a positive, internally consistent JUnit result in which every expected node passed with no failures, errors, or skips.
+CUDA is a dedicated serial lane selected canonically with `-m cuda`. `tests/pytest_policy.py` currently defines six CUDA-only hardware tests and sixteen ordinary numerical contracts that join the CUDA marker only when the requested device type is CUDA. Collection policy, rather than a duplicated literal node list or a brittle hardcoded pass count, defines the executable matrix. The expected count is computed as `len(CUDA_TESTS | CUDA_MIRROR_TESTS)`, and success requires both a zero pytest exit and a positive, internally consistent JUnit result in which every expected node passed with no failures, errors, or skips. The shared parser first requires all four JUnit count attributes, so a truncated report cannot pass by omission; its temporary XML cleanup also runs when parsing fails.
 
 The default shell interpreter can have a CPU-only Torch build even when another environment contains CUDA Torch. On the development workstation the CUDA interpreter is `C:\anaconda\python.exe`; replace that path when the environment moves. Both `VFE3_TEST_DEVICE=cuda` and `CUBLAS_WORKSPACE_CONFIG=:4096:8` must be present before that interpreter imports Torch. After the safe Torch import, `tests/conftest.py` enters the deterministic CUDA policy during module initialization before plugin-driven collection. One idempotent lifecycle owner is shared by the session fixture and `pytest_unconfigure`, so normal session teardown and collection-abort teardown both restore state exactly once. It removes `CUBLAS_WORKSPACE_CONFIG` when it was initially absent, reinstates its exact preexisting value when present, and leaves CPU policy environment state untouched.
 
@@ -87,6 +87,11 @@ Invoke-VFE3TestEnv $cudaEnv {
     }
     [xml]$cudaResult = Get-Content -Raw -LiteralPath C:\tmp\vfe3-cuda.xml
     $cudaSuite = $cudaResult.testsuites.testsuite
+    $requiredCudaCounts = @("tests", "failures", "errors", "skipped")
+    $missingCudaCounts = @($requiredCudaCounts | Where-Object { -not $cudaSuite.HasAttribute($_) })
+    if ($missingCudaCounts.Count -ne 0) {
+        throw "The canonical CUDA JUnit report omitted required count attributes."
+    }
     if ([int]$cudaSuite.tests -ne $expectedCudaCount -or [int]$cudaSuite.failures -ne 0 `
             -or [int]$cudaSuite.errors -ne 0 -or [int]$cudaSuite.skipped -ne 0) {
         throw "The canonical CUDA lane did not pass its exact expected count."
