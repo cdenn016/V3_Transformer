@@ -112,6 +112,7 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
             self.requests = []
             self.inputs = []
             self.outputs = []
+            self.pending_statuses = []
             self.flush_count = 0
             self.closed = False
 
@@ -126,11 +127,10 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
                 axis=1,
             )
             np.save(request["output"], output)
-            with open(request["status"], "w", encoding="utf-8") as handle:
-                json.dump({"ok": True}, handle)
             self.requests.append(request)
             self.inputs.append(features.copy())
             self.outputs.append(output.copy())
+            self.pending_statuses.append(request["status"])
             return len(line)
 
         def flush(self) -> None:
@@ -146,8 +146,15 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
             self.stdin = _Stdin()
             self.wait_timeouts = []
             self.kill_count = 0
+            self.poll_count = 0
+            self.status_publications = 0
 
         def poll(self):
+            self.poll_count += 1
+            status = self.stdin.pending_statuses.pop(0)
+            with open(status, "w", encoding="utf-8") as handle:
+                json.dump({"ok": True}, handle)
+            self.status_publications += 1
             return None
 
         def wait(self, timeout=None):
@@ -191,6 +198,9 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
         assert worker._proc is process
         assert worker._counter == 2
         assert process.stdin.flush_count == 2
+        assert process.poll_count == 2
+        assert process.status_publications == 2
+        assert process.stdin.pending_statuses == []
         assert process.stdin.inputs[0].tolist() == first_features.tolist()
         assert process.stdin.inputs[1].tolist() == second_features.tolist()
         assert [
