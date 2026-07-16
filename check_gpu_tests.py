@@ -1,6 +1,6 @@
-r"""Click-to-run for the tests that NEED the GPU (the CPU audit suite is check_audit_fixes.py).
+r"""Click-to-run for the tests that need the GPU.
 
-Two things live here, both requiring CUDA (your RTX 5090):
+Two checks live here, both requiring CUDA (your RTX 5090):
 
   * t3  -- the learnability gate ``test_training_decreases_loss_on_structured_stream``. It is kept as
            a NON-strict xfail because on CPU the per-head-tau model clears the ln(3) floor by only a
@@ -8,8 +8,8 @@ Two things live here, both requiring CUDA (your RTX 5090):
            the same 3-seed period-3 training on the GPU and REPORTS the median end-CE, the ln(3)-margin
            threshold, and the headroom -- so you can decide whether to promote it to a hard gate (and
            re-tune the LRs via LR_OVERRIDES below).
-  * t6  -- the CUDA-only tests that are SKIPPED on CPU: the Laplace CPU<->CUDA agreement test and the
-           efe-scorer device-aware regression. Run here via pytest with VFE3_TEST_DEVICE=cuda.
+  * CUDA lane -- every test selected by the canonical ``cuda`` marker, including CUDA-only tests and
+                 the ordinary numerical contracts mirrored onto CUDA by the collection policy.
 
 No CLI args -- edit the config, then::
 
@@ -22,10 +22,11 @@ import os
 N_SEEDS      = 3          # t3 averages the median end-CE over this many fixed seeds
 MAX_STEPS    = 200        # t3 training steps per seed (the gate's default)
 LR_OVERRIDES = {}         # re-tune for the per-head tau, e.g. {"e_phi_lr": 0.4, "m_phi_lr": 0.06}
-RUN_T6       = True       # also run the CUDA-only pytest tests (Laplace agreement, efe-scorer device)
+RUN_T6       = True       # also run the canonical CUDA marker lane
 # ---------------------------------------------------------------------------
 
-os.environ["VFE3_TEST_DEVICE"] = "cuda"    # the t6 pytest tests read this at import
+os.environ["VFE3_TEST_DEVICE"] = "cuda"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import math
 import sys
@@ -36,7 +37,7 @@ import torch
 from check_junit import run_pytest_junit
 
 
-def _run_t3(dev):
+def _run_t3(dev: torch.device) -> bool:
     from tests.test_train import (_MARGINAL_ENTROPY_P3, _CUTOVER_MARGIN,
                                   _median, _periodic_loader, _structured_cfg)
     from vfe3.model.model import VFEModel
@@ -67,7 +68,7 @@ def _run_t3(dev):
     return clears
 
 
-def main():
+def main() -> int:
     if not torch.cuda.is_available():
         print("CUDA is not available in this environment -- these tests NEED the GPU.")
         print("Run this on the RTX 5090 (and make sure torch was installed with CUDA support).")
@@ -77,35 +78,29 @@ def main():
 
     t3_ok = _run_t3(dev)
 
-    t6_code = 0
-    t6_counts = None
+    cuda_code = 0
+    cuda_counts = None
     if RUN_T6:
-        t6 = [
-            "tests/test_laplace_family.py::test_laplace_cuda_matches_cpu",          # t6: Laplace CPU<->CUDA agreement
-            "tests/test_efe_scorer.py::test_preference_builders_are_device_aware",  # t6: efe-scorer device regression
-            "tests/test_training_timing_20260711.py::test_real_cuda_training_timing_smoke",
-            "tests/test_p3_pairwise_stats_reuse_20260711.py::test_p3_cuda_filtering_and_mm_reuse_smoke",
-        ]
-        print("t6 -- CUDA-only pytest tests:")
-        t6_code, t6_counts = run_pytest_junit(
-            t6 + ["-v", "-p", "no:cacheprovider"],
-            prefix="vfe3-gpu-t6-",
+        print("CUDA marker lane -- canonical CUDA-only and mirrored tests:")
+        cuda_code, cuda_counts = run_pytest_junit(
+            ["-m", "cuda", "-v", "-p", "no:cacheprovider"],
+            prefix="vfe3-gpu-cuda-",
         )
 
     bar = "=" * 64
     print("\n" + bar)
     if RUN_T6:
-        t6_summary = (
-            f"  |  t6 {'GREEN' if t6_code == 0 else f'FAIL (exit {t6_code})'} "
-            f"({t6_counts['passes']} passed, {t6_counts['skipped']} skipped, "
-            f"{t6_counts['failures']} failed, {t6_counts['errors']} errors)"
+        cuda_summary = (
+            f"  |  CUDA {'GREEN' if cuda_code == 0 else f'FAIL (exit {cuda_code})'} "
+            f"({cuda_counts['passes']} passed, {cuda_counts['skipped']} skipped, "
+            f"{cuda_counts['failures']} failed, {cuda_counts['errors']} errors)"
         )
     else:
-        t6_summary = ""
-    print(f"GPU CHECK: t3 gate {'CLEARS' if t3_ok else 'FAILS'} the ln(3) margin" + t6_summary)
+        cuda_summary = ""
+    print(f"GPU CHECK: t3 gate {'CLEARS' if t3_ok else 'FAILS'} the ln(3) margin" + cuda_summary)
     print(bar)
-    # exit 0 only if the t3 gate clears AND (t6 ran green or was skipped)
-    return 0 if (t3_ok and t6_code == 0) else 1
+    # exit 0 only if the t3 gate clears AND (the CUDA lane ran green or was skipped)
+    return 0 if (t3_ok and cuda_code == 0) else 1
 
 
 if __name__ == "__main__":
