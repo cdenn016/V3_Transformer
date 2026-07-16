@@ -62,9 +62,9 @@ Invoke-VFE3TestEnv $cpuParallelEnv {
 
 All eleven native UMAP integration tests were intentionally removed from the suite. Production UMAP support and the `umap-learn` visualization dependency remain, as do mocked worker-protocol tests and pure report-planning tests. The retained slow lane therefore contains exactly the three nodes selected by `tests/pytest_policy.py`; it is not a native UMAP lane.
 
-CUDA is a dedicated serial lane selected canonically with `-m cuda`. `tests/pytest_policy.py` currently defines six CUDA-only hardware tests and sixteen ordinary numerical contracts that join the CUDA marker only when the requested device type is CUDA. Collection policy, rather than a duplicated literal node list or a brittle hardcoded pass count, defines the executable matrix.
+CUDA is a dedicated serial lane selected canonically with `-m cuda`. `tests/pytest_policy.py` currently defines six CUDA-only hardware tests and sixteen ordinary numerical contracts that join the CUDA marker only when the requested device type is CUDA. Collection policy, rather than a duplicated literal node list or a brittle hardcoded pass count, defines the executable matrix. The expected count is computed as `len(CUDA_TESTS | CUDA_MIRROR_TESTS)`, and success requires both a zero pytest exit and a positive, internally consistent JUnit result in which every expected node passed with no failures, errors, or skips.
 
-The default shell interpreter can have a CPU-only Torch build even when another environment contains CUDA Torch. On the development workstation the CUDA interpreter is `C:\anaconda\python.exe`; replace that path when the environment moves. Both `VFE3_TEST_DEVICE=cuda` and `CUBLAS_WORKSPACE_CONFIG=:4096:8` must be present before that interpreter imports Torch. After the safe Torch import, `tests/conftest.py` enters the deterministic CUDA policy during module initialization before plugin-driven collection; the session fixture owns only the matching teardown. The lane then requires a nonempty JUnit suite with no failures, errors, or skips.
+The default shell interpreter can have a CPU-only Torch build even when another environment contains CUDA Torch. On the development workstation the CUDA interpreter is `C:\anaconda\python.exe`; replace that path when the environment moves. Both `VFE3_TEST_DEVICE=cuda` and `CUBLAS_WORKSPACE_CONFIG=:4096:8` must be present before that interpreter imports Torch. After the safe Torch import, `tests/conftest.py` enters the deterministic CUDA policy during module initialization before plugin-driven collection. One idempotent lifecycle owner is shared by the session fixture and `pytest_unconfigure`, so normal session teardown and collection-abort teardown both restore state exactly once. It removes `CUBLAS_WORKSPACE_CONFIG` when it was initially absent, reinstates its exact preexisting value when present, and leaves CPU policy environment state untouched.
 
 ```powershell
 $cudaPython = "C:\anaconda\python.exe"
@@ -77,15 +77,19 @@ Invoke-VFE3TestEnv $cudaEnv {
     if ($LASTEXITCODE -ne 0) {
         throw "The selected interpreter does not expose the intended RTX 5090 CUDA device."
     }
+    $expectedCudaCount = [int](& $cudaPython -c "from tests.pytest_policy import CUDA_MIRROR_TESTS, CUDA_TESTS; print(len(CUDA_TESTS | CUDA_MIRROR_TESTS))")
+    if ($LASTEXITCODE -ne 0 -or $expectedCudaCount -le 0) {
+        throw "The canonical CUDA policy did not provide a positive expected count."
+    }
     & $cudaPython -m pytest -m cuda --junitxml=C:\tmp\vfe3-cuda.xml --durations=100
     if ($LASTEXITCODE -ne 0) {
         throw "CUDA pytest exited with code $LASTEXITCODE."
     }
     [xml]$cudaResult = Get-Content -Raw -LiteralPath C:\tmp\vfe3-cuda.xml
     $cudaSuite = $cudaResult.testsuites.testsuite
-    if ([int]$cudaSuite.tests -le 0 -or [int]$cudaSuite.failures -ne 0 `
+    if ([int]$cudaSuite.tests -ne $expectedCudaCount -or [int]$cudaSuite.failures -ne 0 `
             -or [int]$cudaSuite.errors -ne 0 -or [int]$cudaSuite.skipped -ne 0) {
-        throw "The canonical CUDA lane was empty or did not execute cleanly."
+        throw "The canonical CUDA lane did not pass its exact expected count."
     }
 }
 ```
