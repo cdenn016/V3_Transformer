@@ -435,13 +435,7 @@ def test_plan_single_run_figures_routes_model_channel_outputs():
 
 # ---- (10) _save_figures routes model_channel_terms.png iff history is active ----------------------
 
-def test_save_figures_emits_model_channel_terms_iff_history_active(tmp_path, monkeypatch):
-    calls = []
-
-    def spy(history, *, path):
-        calls.append((history, path))
-
-    monkeypatch.setattr(figs, "plot_model_channel_terms", spy)
+def test_save_figures_emits_model_channel_terms_iff_history_active(tmp_path):
     cfg = _cfg(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
     art = RunArtifacts(tmp_path / "active", cfg, VFEModel(cfg), dataset="synthetic-period3")
     art.history = [
@@ -452,16 +446,14 @@ def test_save_figures_emits_model_channel_terms_iff_history_active(tmp_path, mon
     ]
     _save_figures(art, None, logging.getLogger("test.model-channel-routing"))
 
-    assert len(calls) == 1
-    assert set(calls[0][0]) == {"step", "hyper_prior", "gamma_coupling", "gamma_meta_entropy"}
-    assert calls[0][1] == str(art.run_dir / "model_channel_terms.png")
+    active_path = art.run_dir / "model_channel_terms.png"
+    assert active_path.exists() and active_path.stat().st_size > 0
 
-    calls.clear()
     cfg0 = _cfg()
     art0 = RunArtifacts(tmp_path / "inactive", cfg0, VFEModel(cfg0), dataset="synthetic-period3")
     art0.history = [{"step": 1, "total": 1.0}, {"step": 2, "total": 0.9}]
     _save_figures(art0, None, logging.getLogger("test.model-channel-routing"))
-    assert calls == []
+    assert not (art0.run_dir / "model_channel_terms.png").exists()
 
 
 # ---- (11) model-channel UMAP bank: extractor gating + pure output routing -------------------------

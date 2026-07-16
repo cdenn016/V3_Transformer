@@ -72,7 +72,7 @@ def pytest_collection_modifyitems(config, items):
 
 **Interfaces:**
 - Produces: `plan_single_run_figures(dataset: str, availability: Mapping[str, bool]) -> tuple[str, ...]`.
-- The tuple contains `<figure>.png` names in mapping order after input and language-route filtering.
+- The tuple contains `<figure>.png` names in stable publication-inventory order after input and language-route filtering.
 
 - [ ] **Step 1: Write failing plan tests.** Replace the Japanese full-render routing test with a pure call using true availability for `belief_category_separation`, `vocab_confusion`, `vocab_probability_heatmap`, `vocab_calibration`, and `decode_readout`. Add active/off availability cases for `s_channel_refinement`, `model_channel_belief`, `hyper_prior_centroid`, and `hyper_prior_coupling`.
 

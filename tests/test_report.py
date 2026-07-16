@@ -8,6 +8,7 @@ integration test asserts the figure set actually appears when the driver runs th
 
 import logging
 from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
@@ -151,10 +152,24 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
         def __exit__(self, exc_type, exc, traceback):
             return None
 
-    monkeypatch.setattr(report.figs, "UMAPWorker", _NoopUMAPWorker)
-    monkeypatch.setattr(report.figs, "plot_belief_umap", lambda *args, **kwargs: plt.figure())
+    umap_calls = []
 
-    generate_figures(tmp_path / "run", model=model, loader=_loader(), max_sequences=1)
+    def plot_umap(
+        _bank:   dict,
+        channel: str = "mu",
+        **kwargs: object,
+    ) -> object:
+        path = str(kwargs["path"])
+        kind = str(kwargs.get("kind", "Belief"))
+        umap_calls.append((channel, kind, Path(path).name))
+        figure = plt.figure()
+        figure.savefig(path)
+        return figure
+
+    monkeypatch.setattr(report.figs, "UMAPWorker", _NoopUMAPWorker)
+    monkeypatch.setattr(report.figs, "plot_belief_umap", plot_umap)
+
+    paths = generate_figures(tmp_path / "run", model=model, loader=_loader(), max_sequences=1)
 
     assert len(built) == 1
     expected = {"e_step_belief_trace", "across_layer_belief_trace", "converged_state",
@@ -163,6 +178,19 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
                 "diagnostics_per_layer"}
     assert {name for name, _ in seen} == expected
     assert all(snapshot is built[0] for _, snapshot in seen)
+    written = {path.name for path in paths}
+    assert {
+        "s_channel_refinement.png",
+        "model_channel_belief.png",
+        "hyper_prior_centroid.png",
+        "hyper_prior_coupling.png",
+        "model_umap_mu.png",
+        "model_umap_sigma.png",
+    } <= written
+    assert {
+        ("mu", "Model", "model_umap_mu.png"),
+        ("sigma", "Model", "model_umap_sigma.png"),
+    } <= set(umap_calls)
 
 
 def test_model_channel_report_extractors_do_not_replay_snapshot_state(monkeypatch):

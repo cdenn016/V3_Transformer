@@ -71,12 +71,18 @@ CUDA is a dedicated serial lane. The default shell interpreter can have a CPU-on
 
 ```powershell
 $cudaPython = "C:\anaconda\python.exe"
-& $cudaPython -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no CUDA device')"
+& $cudaPython -c "import sys, torch; ok = torch.cuda.is_available(); name = torch.cuda.get_device_name(0) if ok else 'no CUDA device'; print(torch.__version__, ok, name); sys.exit(0 if ok and 'RTX 5090' in name else 1)"
 if ($LASTEXITCODE -ne 0) {
-    throw "CUDA interpreter check failed with code $LASTEXITCODE."
+    throw "The selected interpreter does not expose the intended RTX 5090 CUDA device."
 }
 Invoke-VFE3TestEnv @{ VFE3_TEST_DEVICE = "cuda" } {
     & $cudaPython -m pytest -m cuda --junitxml=C:\tmp\vfe3-cuda.xml --durations=100
+}
+[xml]$cudaResult = Get-Content -Raw -LiteralPath C:\tmp\vfe3-cuda.xml
+$cudaSuite = $cudaResult.testsuites.testsuite
+if ([int]$cudaSuite.tests -ne 6 -or [int]$cudaSuite.failures -ne 0 `
+        -or [int]$cudaSuite.errors -ne 0 -or [int]$cudaSuite.skipped -ne 0) {
+    throw "CUDA lane did not execute all six tests successfully."
 }
 ```
 

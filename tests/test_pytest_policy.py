@@ -75,6 +75,10 @@ def test_external_bundle_probe_is_classified_without_a_parallel_group() -> None:
 
 
 def test_policy_sets_define_disjoint_execution_lanes() -> None:
+    assert (
+        "test_round3_artifacts.py::test_emit_closes_figure_registered_by_raising_thunk"
+        in UMAP_TESTS
+    )
     assert UMAP_TESTS < SLOW_TESTS
     assert not (SLOW_TESTS & CUDA_TESTS)
     assert not (SLOW_TESTS & EXTERNAL_TESTS)

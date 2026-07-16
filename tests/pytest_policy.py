@@ -22,6 +22,7 @@ SLOW_TESTS: frozenset[str] = frozenset({
 })
 
 UMAP_TESTS: frozenset[str] = frozenset({
+    "test_round3_artifacts.py::test_emit_closes_figure_registered_by_raising_thunk",
     "test_report.py::test_finalize_autoruns_figures",
     "test_report.py::test_generate_figures_drives_live_model",
     "test_report.py::test_generate_figures_reloads_from_run_dir",
