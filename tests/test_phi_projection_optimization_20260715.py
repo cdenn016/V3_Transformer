@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import warnings
 
 import pytest
 import torch
@@ -9,7 +10,7 @@ import vfe3.gauge_optim as gauge_optim
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
-from vfe3.train import build_optimizer, train, train_step
+from vfe3.train import build_optimizer, train
 
 
 def _four_phi_table_model() -> VFEModel:
@@ -371,7 +372,9 @@ def test_nonfinite_step_does_not_project(monkeypatch) -> None:
     monkeypatch.setattr(train_module, "project_phi_parameter_rows_", _unexpected)
     metrics = {}
 
-    with pytest.warns(UserWarning, match="lr_scheduler.step"):
+    scheduler_epoch = scheduler.last_epoch
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         train_module.train_step(
             model,
             optimizer,
@@ -381,6 +384,8 @@ def test_nonfinite_step_does_not_project(monkeypatch) -> None:
             metrics_out=metrics,
         )
 
+    assert not any("lr_scheduler.step" in str(item.message) for item in caught)
+    assert scheduler.last_epoch == scheduler_epoch
     assert metrics["step_skipped"] == 1.0
 
 

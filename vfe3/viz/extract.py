@@ -126,6 +126,71 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
     return belief, log_prior, rope                                    # forward's beliefs.sigma (model.py:762)
 
 
+@torch.no_grad()
+def collect_inference_bank(
+    model,
+    loader: Iterable,
+
+    *,
+    return_logits: bool                   = False,
+    max_batches:  Optional[int]           = None,
+    device:       Optional[torch.device]  = None,
+) -> List[Dict[str, object]]:
+    r"""Capture one authoritative belief inference per population batch for report reuse.
+
+    Each record retains the input/target tensors, raw stack output, optional CPU-hosted decode
+    logits, and the active model-channel state. CPU offload bounds accelerator residency to one
+    logit batch; population extractors move one record back only while consuming it. They therefore
+    avoid replaying ``forward_beliefs``, the E-step stack, or model-channel refinement without
+    retaining the whole full-vocabulary population on the accelerator.
+    """
+    device = device or _model_device(model)
+    was_training = model.training
+    model.eval()
+    records: List[Dict[str, object]] = []
+    try:
+        for i, batch in enumerate(loader):
+            if isinstance(batch, (tuple, list)):
+                tokens = batch[0]
+                targets = batch[1] if len(batch) > 1 else None
+            else:
+                tokens = batch
+                targets = None
+            tokens = tokens.to(device)
+            targets = targets.to(device) if targets is not None else None
+            capture: dict = {}
+            _, logits = model.forward_beliefs(
+                tokens,
+                return_logits=return_logits,
+                capture=capture,
+            )
+            out = capture["out"]
+            prior = capture["prior"]
+            s_mu = s_sigma = model_phi = None
+            if model._model_channel_active:
+                if model.cfg.s_e_step:
+                    s_mu, s_sigma = prior.mu, prior.sigma
+                else:
+                    s_mu, s_sigma = model.prior_bank.encode_s(tokens)
+                if model.cfg.s_frame_mode == "phi_tilde":
+                    model_phi = model._resolve_model_frame(tokens, prior.phi)
+            records.append({
+                "tokens": tokens,
+                "targets": targets,
+                "out": out,
+                "logits": (logits.cpu() if logits is not None else None),
+                "s_mu": s_mu,
+                "s_sigma": s_sigma,
+                "model_phi": model_phi,
+            })
+            if max_batches is not None and i + 1 >= max_batches:
+                break
+    finally:
+        if was_training:
+            model.train()
+    return records
+
+
 def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -> dict:
     r"""The full ``e_step_iteration`` knob bag: the production shared cfg bag
     (``e_step_shared_kwargs``, audit 2026-07-12 N5 -- previously a hand-rolled copy that silently
@@ -168,6 +233,7 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
         connection_W=getattr(model, "connection_W", None),
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
+        compact_phi_block_transport=model._compact_phi_blocks_enabled(),
         log_prior=log_prior,
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
@@ -232,8 +298,9 @@ def belief_ce_bank(
     loader:      Iterable[Tuple[torch.Tensor, torch.Tensor]],   # yields (tokens, targets) batches
 
     *,
-    device:      Optional[torch.device] = None,
-    max_batches: Optional[int]          = None,
+    device:         Optional[torch.device]              = None,
+    max_batches:    Optional[int]                       = None,
+    inference_bank: 'Optional[List[Dict[str, object]]]' = None,
 ) -> Dict[str, torch.Tensor]:
     r"""The Sigma_q <-> CE JOIN for the calibration probe (B1/EXP-3): per-token belief-covariance
     trace tr(Sigma_q) aligned with the decode cross-entropy that same belief produced.
@@ -255,6 +322,48 @@ def belief_ce_bank(
     sigma-validation gate (``vfe3.inference.sigma_gate``), and the Sigma-stratified-error /
     Sigma-CE-scatter figures consume. ``max_batches`` caps the join.
     """
+    if inference_bank is not None:
+        tr_sig, ces, tids, confs, corrects = [], [], [], [], []
+        for i, record in enumerate(inference_bank):
+            tokens = record["tokens"]
+            targets = record["targets"]
+            logits = record["logits"]
+            out = record["out"]
+            if targets is None or logits is None:
+                raise ValueError(
+                    "belief_ce_bank inference records require targets and decoded logits"
+                )
+            logits = logits.to(targets.device)
+            flat_logits = logits.reshape(-1, logits.shape[-1]).float()
+            per = F.cross_entropy(
+                flat_logits,
+                targets.reshape(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+            conf_flat, pred_flat = flat_logits.softmax(dim=-1).max(dim=-1)
+            trs = metrics.sigma_trace(
+                out.sigma,
+                diagonal=model.cfg.diagonal_covariance,
+                family=model.cfg.family,
+            ).reshape(-1)
+            tgt = targets.reshape(-1)
+            valid = tgt != -100
+            tr_sig.append(trs[valid])
+            ces.append(per[valid])
+            tids.append(tgt[valid])
+            confs.append(conf_flat[valid])
+            corrects.append((pred_flat[valid] == tgt[valid]).float())
+            if max_batches is not None and i + 1 >= max_batches:
+                break
+        return {
+            "tr_sigma": torch.cat(tr_sig),
+            "ce": torch.cat(ces),
+            "token_ids": torch.cat(tids),
+            "conf": torch.cat(confs),
+            "correct": torch.cat(corrects),
+        }
+
     from vfe3.model.stack import vfe_stack
     device = device or _model_device(model)
     cfg = model.cfg
@@ -335,9 +444,10 @@ def belief_bank(
     token_batches:  Iterable[torch.Tensor],   # iterable of (B, N) token-id batches
 
     *,
-    device:         Optional[torch.device] = None,
-    max_tokens:     Optional[int]          = None,
-    max_sequences:  Optional[int]          = None,
+    device:         Optional[torch.device]              = None,
+    max_tokens:     Optional[int]                       = None,
+    max_sequences:  Optional[int]                       = None,
+    inference_bank: 'Optional[List[Dict[str, object]]]' = None,
 ) -> Dict[str, torch.Tensor]:
     r"""Collect converged beliefs (mu, Sigma, phi) over many sequences into one bank.
 
@@ -350,8 +460,46 @@ def belief_bank(
     exactly to every aligned field. Feeds the mu / Sigma / phi UMAP triptych and the at-scale
     clustering scores.
     """
-    from vfe3.model.stack import vfe_stack
     _validate_bank_caps(max_tokens=max_tokens, max_sequences=max_sequences)
+    if inference_bank is not None:
+        mus, sigmas, phis, tids, sidx, pidx = [], [], [], [], [], []
+        seq_counter = 0
+        for record in inference_bank:
+            tokens = record["tokens"]
+            out = record["out"]
+            b, n = tokens.shape
+            mus.append(out.mu.reshape(b * n, -1))
+            sigmas.append(out.sigma.reshape(b * n, *out.sigma.shape[2:]))
+            phis.append(out.phi.reshape(b * n, -1))
+            tids.append(tokens.reshape(b * n))
+            sidx.append(
+                torch.arange(
+                    seq_counter,
+                    seq_counter + b,
+                    device=tokens.device,
+                ).repeat_interleave(n)
+            )
+            pidx.append(torch.arange(n, device=tokens.device).repeat(b))
+            seq_counter += b
+            token_count = sum(batch.shape[0] for batch in tids)
+            if ((max_tokens is not None and token_count >= max_tokens)
+                    or (max_sequences is not None and seq_counter >= max_sequences)):
+                break
+        bank = {
+            "mu": torch.cat(mus),
+            "sigma": torch.cat(sigmas),
+            "phi": torch.cat(phis),
+            "token_ids": torch.cat(tids),
+            "seq_idx": torch.cat(sidx),
+            "pos_idx": torch.cat(pidx),
+        }
+        return _slice_bank_to_cap(
+            bank,
+            max_tokens=max_tokens,
+            max_sequences=max_sequences,
+        )
+
+    from vfe3.model.stack import vfe_stack
     device = device or _model_device(model)
     cfg = model.cfg
     was_training = model.training
@@ -481,10 +629,16 @@ def e_step_belief_trace(
 def e_step_fixed_point_diagnostics(
     model,
     token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+
+    *,
+    snapshot: 'Optional[DiagnosticSnapshot]' = None,
 ) -> Dict[str, float]:
     r"""Measure configured movement and the distinct one-step-ahead residual.
 
-    The executable map is replayed for the configured ``T`` iterations and once more. The
+    The executable map is replayed for the configured ``T`` iterations and once more when no
+    snapshot is supplied. A diagnostic snapshot reuses its captured ``q_0,...,q_T`` states, where
+    ``T`` is the realized terminal iteration after optional early halting, and executes only the
+    new ``q_T -> q_{T+1}`` step. The
     ``estep_r_*_last`` fields retain their historical step-length definitions on
     ``q_{T-1} -> q_T``. The ``estep_fp_*`` fields measure ``q_T -> q_{T+1}``, which is the
     actual residual of the live state-dependent update map. For the frozen-surrogate updater,
@@ -492,23 +646,34 @@ def e_step_fixed_point_diagnostics(
     undamped frozen-surrogate minimizer.
     """
     cfg = model.cfg
-    belief0, log_prior, rope = _encode_one(model, token_ids)
+    if snapshot is None:
+        belief0, log_prior, rope = _encode_one(model, token_ids)
+        states = [belief0]
+        belief = belief0
+        mu_p, sigma_p = belief0.mu, belief0.sigma
+        ikw = _iter_kwargs(model, log_prior, rope)
+        for _ in range(int(cfg.n_e_steps)):
+            belief = e_step_iteration(belief, mu_p, sigma_p, model.group, **ikw)
+            states.append(belief)
+    else:
+        snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
+        states = [_snapshot_sequence(state) for state in snapshot.trace_states]
+        if not states:
+            raise ValueError("diagnostic snapshot contains no E-step states")
+        belief0 = states[0]
+        log_prior = model._first_sequence_log_prior(
+            snapshot.log_prior, token_ids.shape[0])
+        rope = snapshot.rope
     mu_p, sigma_p = belief0.mu, belief0.sigma
     ikw = _iter_kwargs(model, log_prior, rope)
-    states = [belief0]
-    belief = belief0
-    for _ in range(int(cfg.n_e_steps) + 1):
-        belief = e_step_iteration(belief, mu_p, sigma_p, model.group, **ikw)
-        states.append(belief)
-
-    q_t = states[int(cfg.n_e_steps)]
-    q_next = states[int(cfg.n_e_steps) + 1]
+    q_t = states[-1]
+    q_next = e_step_iteration(q_t, mu_p, sigma_p, model.group, **ikw)
     out: Dict[str, float] = {}
-    if cfg.n_e_steps > 0:
+    if len(states) > 1:
         configured = metrics.estep_residuals(
-            torch.stack([state.mu for state in states[: cfg.n_e_steps + 1]]),
-            torch.stack([state.sigma for state in states[: cfg.n_e_steps + 1]]),
-            torch.stack([state.phi for state in states[: cfg.n_e_steps + 1]]),
+            torch.stack([state.mu for state in states]),
+            torch.stack([state.sigma for state in states]),
+            torch.stack([state.phi for state in states]),
             diagonal=cfg.diagonal_covariance,
         )
         for name, key in (
@@ -1127,9 +1292,10 @@ def model_channel_bank(
     token_batches:  Iterable[torch.Tensor],   # iterable of (B, N) token-id batches
 
     *,
-    device:         Optional[torch.device] = None,
-    max_tokens:     Optional[int]          = None,
-    max_sequences:  Optional[int]          = None,
+    device:         Optional[torch.device]              = None,
+    max_tokens:     Optional[int]                       = None,
+    max_sequences:  Optional[int]                       = None,
+    inference_bank: 'Optional[List[Dict[str, object]]]' = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
     r"""Collect the model-channel beliefs s_i over many sequences -- the bank for the model-channel UMAP.
 
@@ -1148,6 +1314,56 @@ def model_channel_bank(
     _validate_bank_caps(max_tokens=max_tokens, max_sequences=max_sequences)
     if not model._model_channel_active:
         return None
+    if inference_bank is not None:
+        mus, sigmas, phis, tids, sidx, pidx = [], [], [], [], [], []
+        seq_counter = 0
+        for record in inference_bank:
+            tokens = record["tokens"]
+            s_mu = record["s_mu"]
+            s_sigma = record["s_sigma"]
+            if s_mu is None or s_sigma is None:
+                raise ValueError(
+                    "model_channel_bank inference records require model-channel beliefs"
+                )
+            b, n = tokens.shape
+            mus.append(s_mu.reshape(b * n, -1))
+            sigmas.append(s_sigma.reshape(b * n, -1))
+            if model.cfg.s_frame_mode == "phi_tilde":
+                model_phi = record["model_phi"]
+                if model_phi is None:
+                    raise ValueError(
+                        "model_channel_bank inference records require independent model frames"
+                    )
+                phis.append(model_phi.reshape(b * n, -1))
+            tids.append(tokens.reshape(b * n))
+            sidx.append(
+                torch.arange(
+                    seq_counter,
+                    seq_counter + b,
+                    device=tokens.device,
+                ).repeat_interleave(n)
+            )
+            pidx.append(torch.arange(n, device=tokens.device).repeat(b))
+            seq_counter += b
+            token_count = sum(batch.shape[0] for batch in tids)
+            if ((max_tokens is not None and token_count >= max_tokens)
+                    or (max_sequences is not None and seq_counter >= max_sequences)):
+                break
+        bank = {
+            "mu": torch.cat(mus),
+            "sigma": torch.cat(sigmas),
+            "token_ids": torch.cat(tids),
+            "seq_idx": torch.cat(sidx),
+            "pos_idx": torch.cat(pidx),
+        }
+        if phis:
+            bank["phi"] = torch.cat(phis)
+        return _slice_bank_to_cap(
+            bank,
+            max_tokens=max_tokens,
+            max_sequences=max_sequences,
+        )
+
     device = device or _model_device(model)
     was_training = model.training
     model.eval()
@@ -1243,11 +1459,12 @@ def vocab_prediction_stats(
     token_batches:  Iterable[torch.Tensor],   # iterable of (B, N) token-id batches
 
     *,
-    device:         Optional[torch.device] = None,
-    max_rows:       int = 40,
-    per_pos_k:      int = 3,
-    max_positions:  int = 64,
-    max_pairs:      int = 200_000,
+    max_rows:       int                                    = 40,
+    per_pos_k:      int                                    = 3,
+    max_positions:  int                                    = 64,
+    max_pairs:      int                                    = 200_000,
+    device:         Optional[torch.device]                 = None,
+    inference_bank: 'Optional[List[Dict[str, object]]]'    = None,
 ) -> Dict[str, object]:
     r"""Next-token predictive distributions over the vocabulary, for the vocab-probability figures.
 
@@ -1279,15 +1496,26 @@ def vocab_prediction_stats(
     n_pairs = 0
     disp: Optional[Dict[str, object]] = None
     try:
-        for batch in token_batches:
-            tokens = batch[0] if isinstance(batch, (tuple, list)) else batch
-            tokens = tokens.to(device)
+        sources = inference_bank if inference_bank is not None else token_batches
+        for batch in sources:
+            if inference_bank is not None:
+                tokens = batch["tokens"]
+                decoded = batch["logits"]
+                if decoded is None:
+                    raise ValueError(
+                        "vocab_prediction_stats inference records require decoded logits"
+                    )
+                decoded = decoded.to(device)
+            else:
+                tokens = batch[0] if isinstance(batch, (tuple, list)) else batch
+                tokens = tokens.to(device)
+                decoded = model(tokens)
             if tokens.dim() == 1:
                 tokens = tokens.unsqueeze(0)
             b, n = tokens.shape
             if n < 2:
                 continue
-            logits = model(tokens)[:, :-1].float()                  # (B, N-1, V) drop last (no in-window target)
+            logits = decoded[:, :-1].float()                        # (B, N-1, V) drop last (no in-window target)
             targets = tokens[:, 1:]                                 # (B, N-1) true next token
             probs = torch.softmax(logits, dim=-1)                   # (B, N-1, V)
             flatp = probs.reshape(-1, V)                            # (B*(N-1), V)

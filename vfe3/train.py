@@ -791,18 +791,19 @@ def evaluate(
     was_training = model.training
     model.eval()
     try:
-        total_nats = 0.0
-        total_tok = 0
+        total_nats = torch.zeros((), dtype=torch.float64, device=device)
+        total_tok = torch.zeros((), dtype=torch.float64, device=device)
         for i, (tokens, targets) in enumerate(loader):
             tokens = tokens.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             _, _, ce = model(tokens, targets)
-            n_b = int((targets != -100).sum())
-            total_nats += float(ce) * n_b
-            total_tok += n_b
+            n_b = (targets != -100).sum().to(dtype=torch.float64)
+            total_nats.add_(ce.detach().to(dtype=torch.float64) * n_b)
+            total_tok.add_(n_b)
             if max_batches is not None and i + 1 >= max_batches:
                 break               # draw exactly max_batches (process-then-break; no extra pull)
-        ce = total_nats / max(total_tok, 1)
+        total_nats_value, total_tok_value = torch.stack((total_nats, total_tok)).cpu().tolist()
+        ce = total_nats_value / max(total_tok_value, 1.0)
     finally:
         if was_training:
             model.train()
@@ -939,7 +940,7 @@ def _val_diagnostics(
     for _nm, _key in (("r_mu", "estep_r_mu_last"), ("r_sigma", "estep_r_sigma_last"),
                       ("r_phi", "estep_r_phi_last")):
         out[_key] = float(res[_nm][-1].mean()) if res[_nm].numel() else 0.0
-    out.update(ex.e_step_fixed_point_diagnostics(model, val_tok))
+    out.update(ex.e_step_fixed_point_diagnostics(model, val_tok, snapshot=snapshot))
 
     if val_tgt is not None:                                     # per-position within-sequence loss
         vlog = snapshot.logits                                  # (B, N, V) same captured inference path

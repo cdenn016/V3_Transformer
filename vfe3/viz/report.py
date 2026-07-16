@@ -115,6 +115,16 @@ def _collect_token_batches(
     return out
 
 
+def _collect_batches(loader, n_batches: int) -> List[object]:
+    r"""Materialize the bounded report population once, retaining targets for shared extraction."""
+    out: List[object] = []
+    for batch in loader:
+        out.append(batch)
+        if len(out) >= n_batches:
+            break
+    return out
+
+
 def _resolve_bank_budget(
     cfg: VFE3Config,
 
@@ -199,10 +209,9 @@ def generate_figures(
         max_sequences=max_sequences,
     )
     controlled_bank = max_tokens is not None
-    token_batches = _collect_token_batches(loader, device, n_batches)
-    if not token_batches:
+    report_batches = _collect_batches(loader, n_batches)
+    if not report_batches:
         raise RuntimeError(f"loader for {dataset!r}/{split!r} yielded no batches")
-    tok = token_batches[0][:1]                                         # one sequence for the single-seq figures
 
     full_vocab_gb = 8.0 * int(cfg.vocab_size) * int(cfg.max_seq_len) * int(cfg.batch_size) / 1e9
     skip_full_vocab = full_vocab_gb > 8.0 and not allow_large
@@ -221,6 +230,20 @@ def generate_figures(
             logger.warning("input %r failed (%s); dependent figures skipped", label, exc)
             return None
 
+    inference_bank = _safe(lambda: extract.collect_inference_bank(
+        model,
+        report_batches,
+        max_batches=n_batches,
+        device=device,
+        return_logits=not skip_full_vocab,
+    ), "inference_bank")
+    token_batches = (
+        [record["tokens"] for record in inference_bank]
+        if inference_bank is not None
+        else _collect_token_batches(report_batches, device, n_batches)
+    )
+    tok = token_batches[0][:1]                                         # one sequence for the single-seq figures
+
     # ---- expensive model-replay inputs, each guarded (a failure skips only its figures) ----
     # The same-token diagnostics consume one captured forward. If capture itself fails, passing
     # snapshot=None preserves the previous per-extractor best-effort fallback instead of dropping
@@ -235,11 +258,14 @@ def generate_figures(
     layer_trace = _safe(lambda: extract.across_layer_belief_trace(
         model, tok, snapshot=snapshot), "across_layer_belief_trace")
     bank        = _safe(lambda: extract.belief_bank(
-        model, token_batches, max_tokens=max_tokens, max_sequences=max_sequences), "belief_bank")
+        model, token_batches, max_tokens=max_tokens, max_sequences=max_sequences,
+        inference_bank=inference_bank), "belief_bank")
     cstate      = _safe(lambda: extract.converged_state(
         model, tok, snapshot=snapshot), "converged_state")
     ce_bank     = (None if skip_full_vocab else
-                   _safe(lambda: extract.belief_ce_bank(model, loader, device=device, max_batches=n_batches),
+                   _safe(lambda: extract.belief_ce_bank(
+                       model, report_batches, device=device, max_batches=n_batches,
+                       inference_bank=inference_bank),
                          "belief_ce_bank"))   # B1/EXP-3 Sigma_q<->CE join (calibration figures)
     amaps       = _safe(lambda: model.attention_maps(tok, snapshot=snapshot), "attention_maps")
     per_layer   = _safe(lambda: model.diagnostics_per_layer(
@@ -255,10 +281,12 @@ def generate_figures(
     h_coupling  = _safe(lambda: extract.hyper_prior_coupling(
         model, tok, snapshot=snapshot), "hyper_prior_coupling")
     mc_bank     = _safe(lambda: extract.model_channel_bank(
-        model, token_batches, max_tokens=max_tokens, max_sequences=max_sequences),
+        model, token_batches, max_tokens=max_tokens, max_sequences=max_sequences,
+        inference_bank=inference_bank),
                         "model_channel_bank")
     vstats      = (None if skip_full_vocab else
-                   _safe(lambda: extract.vocab_prediction_stats(model, token_batches),
+                   _safe(lambda: extract.vocab_prediction_stats(
+                       model, token_batches, inference_bank=inference_bank),
                          "vocab_prediction_stats"))
     readout     = _safe(lambda: extract.decode_readout(model), "decode_readout")
     run_label   = f"K{cfg.embed_dim}"

@@ -36,7 +36,6 @@ from vfe3.geometry.transport import (
     RopeTransport,
     build_factored_transport,
     build_transport_from_element,
-    compute_transport_operators,
     get_transport,
     transport_mean,
 )
@@ -420,6 +419,7 @@ def free_energy_value(
     compile_pair_kernel:       bool = False,           # accepted-and-ignored iteration-only knob
     reuse_pairwise_kl_stats:   bool = False,           # accepted-and-ignored iteration-only knob
     transport_mean_per_head:   bool = False,           # HONORED by omega-direct factored transport
+    compact_phi_block_transport: bool = False,         # HONORED by the compact diagnostic transport
     rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
     rope_on_value:             bool = True,            # False -> value aggregation uses the un-rotated base
     family:                    str  = "gaussian_diagonal",
@@ -480,19 +480,34 @@ def free_energy_value(
         # the beliefs actually descend (regime_ii reads the means + learned connection_W; flat ignores
         # both). Previously this always used flat transport, so under regime_ii the trajectory was a
         # flat-transport diagnostic, not the regime_ii objective.
-        omega = _transport(
-            belief.phi, group, transport_mode=transport_mode,
-            gauge_parameterization=gauge_parameterization, omega=belief.omega,
-            reflection=belief.reflection,   # phi-path R_i Omega_ij R_j fold (None on the pure path -> byte-identical)
-            right_phi=belief.right_phi,
-            mu=(belief.mu if transport_mode in _TRANSPORT_NEEDS_MU else None),
-            sigma=(belief.sigma if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
-            connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
-            link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
-            cocycle_relaxation=cocycle_relaxation,
-            transport_mean_per_head=transport_mean_per_head,
-            exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-        )
+        transport_kwargs = {
+            "transport_mode": transport_mode,
+            "gauge_parameterization": gauge_parameterization,
+            "omega": belief.omega,
+            "reflection": belief.reflection,
+            "right_phi": belief.right_phi,
+            "mu": (belief.mu if transport_mode in _TRANSPORT_NEEDS_MU else None),
+            "sigma": (belief.sigma if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
+            "connection_W": connection_W,
+            "connection_M": connection_M,
+            "connection_L": connection_L,
+            "link_alpha": link_alpha,
+            "link_soft_cap": link_soft_cap,
+            "clamp_monitor": clamp_monitor,
+            "cocycle_relaxation": cocycle_relaxation,
+            "transport_mean_per_head": transport_mean_per_head,
+            "exp_fp64_mode": exp_fp64_mode,
+            "exp_fp64_norm_threshold": exp_fp64_norm_threshold,
+        }
+        if compact_phi_block_transport:
+            omega = build_belief_transport(
+                belief.phi,
+                group,
+                compact_phi_block_transport=True,
+                **transport_kwargs,
+            )
+        else:
+            omega = _transport(belief.phi, group, **transport_kwargs)
     else:
         # The filtered (mixed current-query / frozen-key frame) transport has no regime_ii form;
         # reject a non-flat mode rather than silently logging a flat-transport filtered F.
@@ -1237,6 +1252,7 @@ def e_step(
             return free_energy_value(b_eval, mu_eval, sigma_eval, group, tau=tau_eval, log_prior=prior_eval,
                                      rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                                      gauge_parameterization=gauge_param_kw,
+                                     compact_phi_block_transport=compact_phi_block_transport,
                                      **kwargs).detach()
 
     if state_record is not None:

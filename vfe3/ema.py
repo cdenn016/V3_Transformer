@@ -88,11 +88,20 @@ class EMA:
         forever, so a single transient NaN/Inf would permanently poison the running average and the
         final ``copy_to`` would write it into the evaluated/checkpointed model (audit 2026-06-17 r2 id19).
         """
-        for name, param in model.named_parameters():
-            if name in self.shadow:
-                p = param.detach()
-                if torch.isfinite(p).all():
-                    self.shadow[name].mul_(self.decay).add_(p, alpha=1.0 - self.decay)
+        tracked = [
+            (name, param.detach())
+            for name, param in model.named_parameters()
+            if name in self.shadow
+        ]
+        if not tracked:
+            return
+        finite = torch.stack([
+            torch.isfinite(param).all()
+            for _, param in tracked
+        ]).cpu().tolist()
+        for (name, param), is_finite in zip(tracked, finite):
+            if is_finite:
+                self.shadow[name].mul_(self.decay).add_(param, alpha=1.0 - self.decay)
 
     @torch.no_grad()
     def store(self, model: torch.nn.Module) -> None:

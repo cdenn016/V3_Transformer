@@ -173,13 +173,17 @@ def project_phi_parameter_rows_(
             chunk.mul_(scale.unsqueeze(-1))
     if not collect_stats:
         return {}
-    projected_rows_value = float(projected_rows)
+    projected_rows_value, norm_max_value, minimum_scale_value = torch.stack((
+        projected_rows.to(dtype=generators.dtype),
+        norm_max_before,
+        minimum_scale,
+    )).cpu().tolist()
     return {
         "phi_chart_projected_rows":     projected_rows_value,
         "phi_chart_total_rows":         float(total_rows),
         "phi_chart_projected_fraction": projected_rows_value / max(total_rows, 1),
-        "phi_chart_preproject_max":     float(norm_max_before),
-        "phi_chart_projection_scale_min": float(minimum_scale),
+        "phi_chart_preproject_max":     norm_max_value,
+        "phi_chart_projection_scale_min": minimum_scale_value,
     }
 
 
@@ -199,18 +203,32 @@ def _polar_orthogonalize(
         return (W @ Vh).to(U.dtype)
 
 
+def _omega_validation_failure(
+    U: torch.Tensor,                      # (..., d, d) updated full elements or compact blocks
+) -> torch.Tensor:                       # () bool, retained on device for aggregate validation
+    r"""Native-dtype finite/nonsingular status without an eager host synchronization."""
+    with torch.no_grad(), torch.amp.autocast(U.device.type, enabled=False):
+        matrices = U.reshape(-1, U.shape[-1], U.shape[-1])
+        _, _, info = torch.linalg.lu_factor_ex(matrices, check_errors=False)
+        return torch.logical_or(~torch.isfinite(U).all(), (info != 0).any())
+
+
+def _omega_determinant_failure(
+    U: torch.Tensor,                      # (..., d, d) updated full elements or compact blocks
+) -> torch.Tensor:                       # () bool, diagnostic-only float64 determinant status
+    r"""Sparse determinant audit used only on an explicitly requested diagnostic step."""
+    with torch.no_grad(), torch.amp.autocast(U.device.type, enabled=False):
+        sign, logabsdet = torch.linalg.slogdet(
+            U.reshape(-1, U.shape[-1], U.shape[-1]).double())
+        return torch.logical_or((sign == 0).any(), ~torch.isfinite(logabsdet).all())
+
+
 def _require_finite_nonsingular_omega(
     U: torch.Tensor,                      # (..., d, d) updated full elements or compact blocks
 ) -> None:
-    r"""Fail immediately when an omega retraction produces a nonfinite or singular element."""
-    with torch.no_grad(), torch.amp.autocast(U.device.type, enabled=False):
-        if not bool(torch.isfinite(U).all()):
-            raise FloatingPointError("omega retraction produced a nonfinite group element")
-        sign, logabsdet = torch.linalg.slogdet(U.reshape(-1, U.shape[-1], U.shape[-1]).double())
-        if bool((sign == 0).any()):
-            raise ValueError("omega retraction produced a singular group element")
-        if not bool(torch.isfinite(logabsdet).all()):
-            raise FloatingPointError("omega retraction produced a nonfinite log-determinant")
+    r"""Fail closed with one host decision when a group element is nonfinite or singular."""
+    if bool(_omega_validation_failure(U)):
+        raise FloatingPointError("omega retraction produced a nonfinite or singular group element")
 
 
 def _omega_condition_values(
@@ -460,6 +478,24 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
             entry = cache[key] = (G, gram_pinv(G))
         return entry
 
+    def _full_generator_basis(
+        self,
+        device: torch.device,
+        dtype:  torch.dtype,
+    ) -> 'tuple[torch.Tensor, torch.Tensor]':  # converted basis and its cached Gram pseudo-inverse
+        r"""Cache the immutable full generator basis and factorization across optimizer steps."""
+        source = self._generators
+        cache = getattr(self, "_full_generator_cache", None)
+        if cache is None:
+            cache = self._full_generator_cache = {}
+        key = (id(source), source._version, device, dtype)
+        entry = cache.get(key)
+        if entry is None:
+            from vfe3.geometry.lie_ops import gram_pinv
+            basis = source.to(device=device, dtype=dtype)
+            entry = cache[key] = (basis, gram_pinv(basis))
+        return entry
+
     @torch.no_grad()
     def step(self, closure=None):                                      # type: ignore[override]
         if closure is not None:
@@ -496,8 +532,9 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 lr     = group["lr"]
                 mode   = getattr(self, "_omega_retract_mode", "lie_exp")
                 K_full = self._generators.shape[-1]                    # full frame dim K
-                from vfe3.geometry.lie_ops import extract_phi, gram_pinv, retract_omega
-                full_gp = None                                         # gram_pinv(full basis), built once per step
+                from vfe3.geometry.lie_ops import extract_phi, retract_omega
+                pending_updates = []
+                validation_failures: List[torch.Tensor] = []
                 for p in group["params"]:
                     if p.grad is None:
                         continue
@@ -506,11 +543,8 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                     untied_compact = U.dim() == 4                      # (V,H,d,d)
                     tied_compact   = U.dim() == 3 and U.shape[-1] < K_full  # (V,d,d), d < K
                     act = E.reshape(E.shape[0], -1).abs().sum(dim=-1) > 0   # (V,) rows with gradient
-                    if not bool(act.any()):
-                        p.grad = None
-                        continue
                     Ua, Ea = U[act], E[act]                            # (A,K,K) / (A,H,d,d) / (A,d,d)
-                    _require_finite_nonsingular_omega(Ua)
+                    validation_failures.append(_omega_validation_failure(Ua))
                     if untied_compact or tied_compact:
                         d      = Ua.shape[-1]
                         Gd, gp = self._compact_gld_basis(d, U.device, U.dtype)   # gl(d) basis + cached gram_pinv
@@ -533,17 +567,25 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                             xi = xi / (K_full // d)
                         Ur = retract_omega(Ua_r, -lr * xi, Gd, mode=mode)
                         Ur = Ur.reshape(Ua.shape)                      # back to (A,H,d,d) / (A,d,d)
-                        _require_finite_nonsingular_omega(Ur)
-                        U[act] = Ur
                     else:
-                        Gd = self._generators.to(device=U.device, dtype=U.dtype)
-                        if full_gp is None:
-                            full_gp = gram_pinv(Gd)                    # (n_gen, n_gen) cached per step
+                        Gd, full_gp = self._full_generator_basis(U.device, U.dtype)
                         # natural-gradient tangent xi = Gram^{-1} proj_g(U^T E); (U^T E)_{km} = sum_l U_{lk} E_{lm}
                         xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua, Ea), Gd, gram_pinv_=full_gp)
                         Ur = retract_omega(Ua, -lr * xi, Gd, mode=mode)
-                        _require_finite_nonsingular_omega(Ur)
-                        U[act] = Ur                                    # (A, K, K) U <- U retr(-lr xi)
+                    validation_failures.append(_omega_validation_failure(Ur))
+                    if collect:
+                        validation_failures.append(_omega_determinant_failure(Ur))
+                    pending_updates.append((
+                        p, U, act, Ur, untied_compact, tied_compact,
+                    ))
+
+                if validation_failures and bool(torch.stack(validation_failures).any()):
+                    raise FloatingPointError(
+                        "omega retraction produced a nonfinite or singular group element"
+                    )
+
+                for p, U, act, Ur, untied_compact, tied_compact in pending_updates:
+                    U[act] = Ur                                        # U <- U retr(-lr xi), after validation
                     state = self.state[p]
                     dirty = state.get("omega_dirty")
                     if dirty is None:
@@ -647,7 +689,8 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                     eps    = group["eps"]
                     m = state.get("gauge_m")
                     if m is None:
-                        m = torch.zeros_like(nat); state["gauge_m"] = m
+                        m = torch.zeros_like(nat)
+                        state["gauge_m"] = m
                         state["gauge_v"]    = torch.zeros_like(nat)
                         state["gauge_step"] = 0
                     v = state["gauge_v"]

@@ -1910,15 +1910,16 @@ class VFEModel(nn.Module):
         (audit V2). :meth:`_gamma_coupling_terms` is the SPLIT (coupling vs meta-entropy)
         diagnostic sibling.
         """
-        from vfe3.free_energy import attention_weights, reduced_free_energy
-        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega, reflection=reflection)
+        coupling_rows, meta_entropy_rows = self._gamma_coupling_rows(
+            token_ids,
+            phi,
+            head_reduction="mean",
+            omega=omega,
+            reflection=reflection,
+        )
         if self.cfg.include_attention_entropy:
-            # canonical: the envelope -tau_g log Z^s equals coupling + entropy at gamma*
-            return reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior).mean()
-        # Surrogate parity with the belief channel (audit 2026-06-09 P6): with the
-        # attention-entropy term suppressed the block is sum_j gamma_ij E^s_ij at gamma*.
-        gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
-        return (gamma_w * e_s).sum(dim=-1).mean()
+            return (coupling_rows + meta_entropy_rows).mean()
+        return coupling_rows.mean()
 
     def _gamma_coupling_terms(
         self,
@@ -1944,19 +1945,18 @@ class VFEModel(nn.Module):
         does not expose. pi^s is softmax(gamma_log_prior) (uniform 1/N when no prior); tau_g broadcasts
         per head exactly as the belief entropy term does.
         """
-        from vfe3.free_energy import _broadcast_tau, attention_weights, reduced_free_energy
-        e_s, gamma_tau, gamma_log_prior = self._gamma_energy(token_ids, phi, omega=omega, reflection=reflection, s_belief=s_belief)
-        gamma_w = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)
-        log_pi_s = (torch.log_softmax(gamma_log_prior, dim=-1)
-                    if gamma_log_prior is not None
-                    else torch.full_like(gamma_w, -math.log(gamma_w.shape[-1])))
-        log_pi_s = torch.where(torch.isfinite(log_pi_s), log_pi_s, torch.zeros_like(log_pi_s))
-        tau_e = _broadcast_tau(gamma_tau, e_s)                       # (H,1,1) per-head, else scalar
-        coupling = (gamma_w * e_s).sum()
-        gamma_for_log = torch.where(gamma_w > 0.0, gamma_w, torch.ones_like(gamma_w))
-        meta = (tau_e * (torch.special.xlogy(gamma_w, gamma_for_log)
-                         - gamma_w * log_pi_s)).sum()
-        total = reduced_free_energy(e_s, tau=gamma_tau, log_prior=gamma_log_prior).sum()
+        coupling_rows, meta_entropy_rows = self._gamma_coupling_rows(
+            token_ids,
+            phi,
+            head_reduction="sum",
+            eps=eps,
+            omega=omega,
+            reflection=reflection,
+            s_belief=s_belief,
+        )
+        coupling = coupling_rows.sum()
+        meta = meta_entropy_rows.sum()
+        total = coupling + meta
         return {"coupling": coupling, "meta_entropy": meta, "total": total}
 
     def _gamma_coupling_rows(
@@ -2575,6 +2575,45 @@ class VFEModel(nn.Module):
         return snapshot
 
     @torch.no_grad()
+    def _diagnostic_transport(
+        self,
+        belief: BeliefState,
+    ) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport':
+        r"""Build the active diagnostic transport without materializing compact block pairs."""
+        from vfe3.inference.e_step import _transport, build_belief_transport
+
+        cfg = self.cfg
+        kwargs = {
+            "transport_mode": cfg.transport_mode,
+            "mu": (belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
+            "sigma": (belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
+            "connection_W": getattr(self, "connection_W", None),
+            "connection_M": getattr(self, "connection_M", None),
+            "connection_L": getattr(self, "connection_L", None),
+            "link_alpha": cfg.link_alpha,
+            "link_soft_cap": cfg.link_soft_cap,
+            "clamp_monitor": cfg.transport_clamp_monitor,
+            "validity_max_norm": cfg.transport_chart_max_norm,
+            "exactness_out": self._transport_status,
+            "cocycle_relaxation": cfg.cocycle_relaxation,
+            "gauge_parameterization": cfg.gauge_parameterization,
+            "omega": belief.omega,
+            "reflection": belief.reflection,
+            "right_phi": belief.right_phi,
+        }
+        if self._compact_phi_blocks_enabled():
+            return build_belief_transport(
+                belief.phi,
+                self.group,
+                compact_phi_block_transport=True,
+                transport_mean_per_head=cfg.transport_mean_per_head,
+                exp_fp64_mode=cfg.exp_fp64_mode,
+                exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+                **kwargs,
+            )
+        return _transport(belief.phi, self.group, **kwargs)
+
+    @torch.no_grad()
     def _attention_map_for_belief(
         self,
         belief:   BeliefState,
@@ -2582,30 +2621,13 @@ class VFEModel(nn.Module):
         rope:      Optional[torch.Tensor],
     ) -> torch.Tensor:                         # (H, N, N)
         r"""Compute beta from an already captured block output, without replaying inference."""
-        from vfe3.inference.e_step import _transport
         from vfe3.geometry.transport import transport_mean
         from vfe3.families.base import get_family
         from vfe3.free_energy import pairwise_energy, attention_weights, attention_tau
 
         cfg = self.cfg
         fam = get_family(cfg.family)
-        omega = _transport(
-            belief.phi, self.group, transport_mode=cfg.transport_mode,
-            mu=(belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
-            sigma=(belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
-            connection_W=getattr(self, "connection_W", None),
-            connection_M=getattr(self, "connection_M", None),
-            connection_L=getattr(self, "connection_L", None),
-            link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-            clamp_monitor=cfg.transport_clamp_monitor,
-            validity_max_norm=cfg.transport_chart_max_norm,
-            exactness_out=self._transport_status,
-            cocycle_relaxation=cfg.cocycle_relaxation,
-            gauge_parameterization=cfg.gauge_parameterization,
-            omega=belief.omega,
-            reflection=belief.reflection,
-            right_phi=belief.right_phi,
-        )
+        omega = self._diagnostic_transport(belief)
         if rope is not None:
             rope_omega = RopeTransport(
                 base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
@@ -2754,7 +2776,6 @@ class VFEModel(nn.Module):
         ``observation_likelihood`` fields (nats; ``effective_rank`` is the per-token
         belief-variance spectrum effective rank, not an attention rank).
         """
-        from vfe3.inference.e_step import _transport
         from vfe3.geometry.transport import transport_mean, compute_transport_operators
         from vfe3.families.base import get_family
         from vfe3.free_energy import pairwise_energy, self_divergence_for_alpha, attention_weights, attention_tau
@@ -2827,23 +2848,7 @@ class VFEModel(nn.Module):
         # (flat -> ~0; regime_ii with a trained connection_W -> the non-trivial holonomy). regime_ii
         # reads the converged means out.mu and the learned connection_W; flat ignores both.
         # (rope was computed above and now also shaped the converged belief.)
-        omega = _transport(                                          # (N, N, K, K)
-            out.phi, self.group, transport_mode=cfg.transport_mode,
-            mu=(out.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
-            sigma=(out.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
-            connection_W=getattr(self, "connection_W", None),
-            connection_M=getattr(self, "connection_M", None),
-            connection_L=getattr(self, "connection_L", None),
-            link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-            clamp_monitor=cfg.transport_clamp_monitor,
-            validity_max_norm=cfg.transport_chart_max_norm,
-            exactness_out=self._transport_status,
-            cocycle_relaxation=cfg.cocycle_relaxation,
-            gauge_parameterization=cfg.gauge_parameterization,
-            omega=out.omega,                                          # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
-            reflection=out.reflection,                                # phi-path R_i Omega_ij R_j fold (None -> unchanged)
-            right_phi=out.right_phi,
-        )
+        omega = self._diagnostic_transport(out)
         mu_tv = sigma_tv = None
         if rope is not None:
             rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
