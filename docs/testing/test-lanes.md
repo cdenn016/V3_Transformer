@@ -1,6 +1,6 @@
 # Test execution lanes
 
-The ordinary CPU entry point is the click-to-run driver. It accepts no command-line arguments, launches the 12-worker fast lane and 3-worker slow lane as separate subprocesses, stops after the first nonzero result, and reports counts only from each lane's temporary JUnit XML file. Both subprocesses receive every thread cap documented below.
+The ordinary CPU entry point is the click-to-run driver. It accepts no command-line arguments, captures the logical CPU topology once, validates both configured worker counts before constructing the child environment or starting either subprocess, then launches the 12-worker fast lane and 3-worker slow lane separately. It stops after the first nonzero result and reports counts only from each lane's temporary JUnit XML file. A successful pytest exit with an empty JUnit suite is rejected. Both subprocesses receive every thread cap documented below.
 
 ```powershell
 python run_cpu_tests.py
@@ -64,7 +64,7 @@ All eleven native UMAP integration tests were intentionally removed from the sui
 
 CUDA is a dedicated serial lane selected canonically with `-m cuda`. `tests/pytest_policy.py` currently defines six CUDA-only hardware tests and sixteen ordinary numerical contracts that join the CUDA marker only when the requested device type is CUDA. Collection policy, rather than a duplicated literal node list or a brittle hardcoded pass count, defines the executable matrix.
 
-The default shell interpreter can have a CPU-only Torch build even when another environment contains CUDA Torch. On the development workstation the CUDA interpreter is `C:\anaconda\python.exe`; replace that path when the environment moves. Both `VFE3_TEST_DEVICE=cuda` and `CUBLAS_WORKSPACE_CONFIG=:4096:8` must be present before that interpreter imports Torch. The lane then requires a nonempty JUnit suite with no failures, errors, or skips.
+The default shell interpreter can have a CPU-only Torch build even when another environment contains CUDA Torch. On the development workstation the CUDA interpreter is `C:\anaconda\python.exe`; replace that path when the environment moves. Both `VFE3_TEST_DEVICE=cuda` and `CUBLAS_WORKSPACE_CONFIG=:4096:8` must be present before that interpreter imports Torch. After the safe Torch import, `tests/conftest.py` enters the deterministic CUDA policy during module initialization before plugin-driven collection; the session fixture owns only the matching teardown. The lane then requires a nonempty JUnit suite with no failures, errors, or skips.
 
 ```powershell
 $cudaPython = "C:\anaconda\python.exe"
@@ -103,7 +103,7 @@ Invoke-VFE3TestEnv @{
 }
 ```
 
-Branch coverage is measured over `vfe3`. The checked-in configuration enables branch measurement and parallel data-file support. This command covers the complete available CPU union while excluding unavailable CUDA and external prerequisites.
+Branch coverage is measured over `vfe3`. The checked-in configuration enables branch measurement and parallel data-file support. The command below intentionally measures the complete retained CPU union in one simpler 12-worker `loadscope` invocation while excluding unavailable CUDA and external prerequisites. This union-measurement command deviates from the ordinary execution design, which separately uses 12 workers for the fast lane and 3 workers for the three-node slow lane. It does not replace the 12/3 click-to-run driver or provide a like-for-like timing comparison with that sharded runner.
 
 ```powershell
 Invoke-VFE3TestEnv $cpuParallelEnv {
