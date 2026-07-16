@@ -92,13 +92,13 @@ assert {"vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readou
 - Modify: `tests/test_model_channel_diagnostics_2026_06_13.py`
 
 **Interfaces:**
-- Produces: frozen module-local records containing run directories and read-only result mappings.
-- Fixture setup may retain private model/config/artifact references only so a dependent finalization fixture can run once; test functions receive paths/results and do not mutate those references.
+- Produces: frozen module-local evidence records containing only tuples, frozensets, strings, numbers, booleans, or bytes.
+- Producers capture and restore CPU and CUDA RNG state, close readers and figures, freeze raw evidence, and release models, tensors, loaders, configs, mappings, artifacts, and paths before a test receives the record.
 
-- [ ] **Step 1: Add call-count regressions around fixture setup.** Use module-scoped fixtures backed by `tmp_path_factory`; separate tests continue to assert their original files and keys.
-- [ ] **Step 2: Convert the default artifact pair.** One trained run supplies `metrics.csv`, `best_model.pt`, checkpoints, and the two gauge-geometry CSV columns.
-- [ ] **Step 3: Convert the slow finalization trio.** One dependent finalized run supplies `test_results.json`, `summary.json`, loss/validation plots, `holonomy.png`, and the `reloaded_best` result while retaining three test nodes.
-- [ ] **Step 4: Convert active/off model-channel setup.** One active and one pure-path training setup supplies both CSV-column and attention-file assertions. A dependent fixture finalizes each route once for the root figure presence/absence contract.
+- [ ] **Step 1: Add frozen evidence record types and module-scoped producers backed by `tmp_path_factory`.** Return raw names, columns, values, keys, and scalar results rather than precomputed pass/fail booleans.
+- [ ] **Step 2: Convert the default artifact pair.** One trained producer supplies a frozen relative-file set, checkpoint-name tuple, and metrics-column set for the original file and gauge-column assertions.
+- [ ] **Step 3: Convert the slow finalization trio.** One separate slow producer performs one training and one finalization, then supplies frozen relative filenames, result keys and values, and summary keys and values while retaining three test nodes. It must not depend on the default producer.
+- [ ] **Step 4: Convert active/off model-channel setup.** Separate active and pure-path producers each train once and freeze CSV columns, raw numeric column values, and attention basenames. The three default test nodes consume those records. Slow active/off finalization remains a separate producer so default selection does not render figures.
 - [ ] **Step 5: Run the two affected modules with `--runslow` and machine-readable XML.** Confirm no assertion migrated behind the slow gate unless it was already slow.
 - [ ] **Step 6: Commit.** Commit with `perf: reuse immutable test artifacts`.
 
