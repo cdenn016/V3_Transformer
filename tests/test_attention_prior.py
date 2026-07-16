@@ -1,6 +1,23 @@
+from collections.abc import MutableMapping
+
+import pytest
 import torch
 
 from vfe3.attention_prior import attention_log_prior, register_prior
+
+
+_MISSING = object()
+
+
+def _restore_registry_entry(
+    registry: MutableMapping[str, object],
+    name:     str,
+    previous: object,
+) -> None:
+    if previous is _MISSING:
+        registry.pop(name, None)
+    else:
+        registry[name] = previous
 
 
 def test_uniform_is_zero_bias():
@@ -27,15 +44,22 @@ def test_alibi_is_linear_in_distance():
             assert torch.isclose(B[0, i, j], torch.tensor(-slope * abs(i - j)), atol=1e-6)
 
 
+@pytest.mark.registry_mutation
 def test_new_prior_with_novel_kwarg_reachable_without_editing_dispatcher():
     # Modularity: a new prior's OWN param must flow through the dispatcher's **kwargs
     # (not a hard-coded slope union), so it selects-with-config without editing the call site.
-    @register_prior("_test_windowed")
-    def _windowed(n_query, n_key, *, width=1, **kwargs):
-        i = torch.arange(n_query).unsqueeze(-1)
-        j = torch.arange(n_key).unsqueeze(0)
-        return torch.where((i - j).abs() <= width, 0.0, float("-inf"))
+    from vfe3.attention_prior import _PRIORS
+    name = "_test_windowed"
+    previous = _PRIORS.get(name, _MISSING)
+    try:
+        @register_prior(name, override=previous is not _MISSING)
+        def _windowed(n_query, n_key, *, width=1, **kwargs):
+            i = torch.arange(n_query).unsqueeze(-1)
+            j = torch.arange(n_key).unsqueeze(0)
+            return torch.where((i - j).abs() <= width, 0.0, float("-inf"))
 
-    B = attention_log_prior("_test_windowed", 4, 4, width=1)
-    assert B[0, 0] == 0.0 and B[0, 1] == 0.0
-    assert torch.isneginf(B[0, 2])
+        B = attention_log_prior(name, 4, 4, width=1)
+        assert B[0, 0] == 0.0 and B[0, 1] == 0.0
+        assert torch.isneginf(B[0, 2])
+    finally:
+        _restore_registry_entry(_PRIORS, name, previous)

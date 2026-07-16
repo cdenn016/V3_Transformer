@@ -1,6 +1,22 @@
+from collections.abc import MutableMapping
+
 import pytest
 
 from vfe3.config import VFE3Config, config_from_serialized
+
+
+_MISSING = object()
+
+
+def _restore_registry_entry(
+    registry: MutableMapping[str, object],
+    name:     str,
+    previous: object,
+) -> None:
+    if previous is _MISSING:
+        registry.pop(name, None)
+    else:
+        registry[name] = previous
 
 
 def test_config_defaults():
@@ -553,6 +569,7 @@ def test_pos_phi_compose_rejects_unknown():
         VFE3Config(pos_phi_compose="quaternion")
 
 
+@pytest.mark.registry_mutation
 def test_config_accepts_newly_registered_family_without_editing_config():
     """A new family registered with cov_kind='diagonal' is a valid config family and its derived
     diagonal_covariance property reads the registered cov_kind, without editing config.py (no
@@ -561,17 +578,17 @@ def test_config_accepts_newly_registered_family_without_editing_config():
     from vfe3.families.gaussian import DiagonalGaussian
 
     name = "laplace_diagonal_test"
-
-    @register_family(name)
-    class _LaplaceDiagonal(DiagonalGaussian):                            # cov_kind = "diagonal"
-        pass
-
+    previous = _FAMILIES.get(name, _MISSING)
     try:
+        @register_family(name, override=previous is not _MISSING)
+        class _LaplaceDiagonal(DiagonalGaussian):                        # cov_kind = "diagonal"
+            pass
+
         cfg = VFE3Config(family=name)                                    # must NOT raise
         assert cfg.family == name
         assert cfg.diagonal_covariance is True                          # derived from registered cov_kind
     finally:
-        _FAMILIES.pop(name, None)
+        _restore_registry_entry(_FAMILIES, name, previous)
 
 
 def test_rope_defaults_off_and_full_gauge_requires_full_cov():
@@ -584,6 +601,7 @@ def test_rope_defaults_off_and_full_gauge_requires_full_cov():
                family="gaussian_full", decode_mode="full")
 
 
+@pytest.mark.registry_mutation
 def test_gauge_group_validation_reads_registry_not_static_list():
     r"""Audit F4: a newly registered gauge group must be a valid config value WITHOUT editing
     config.py (the modularity contract -- add-by-registering). Mirrors transport_mode /
@@ -591,10 +609,15 @@ def test_gauge_group_validation_reads_registry_not_static_list():
     _VALID_GAUGE_GROUPS tuple."""
     from vfe3.geometry.groups import _GROUPS, get_group, register_group
     name = "audit_probe_glk_alias"
-    if name not in _GROUPS:
-        register_group(name)(lambda K, *a, **k: get_group("glk")(K))
-    cfg = VFE3Config(embed_dim=4, n_heads=1, gauge_group=name)
-    assert cfg.gauge_group == name                       # accepted via the registry, not a literal list
+    previous = _GROUPS.get(name, _MISSING)
+    try:
+        register_group(name, override=previous is not _MISSING)(
+            lambda K, *a, **k: get_group("glk")(K)
+        )
+        cfg = VFE3Config(embed_dim=4, n_heads=1, gauge_group=name)
+        assert cfg.gauge_group == name                   # accepted via the registry, not a literal list
+    finally:
+        _restore_registry_entry(_GROUPS, name, previous)
 
 
 def test_decode_mode_linear_stays_a_rejected_second_gate():
@@ -850,34 +873,40 @@ def test_rope_warning_names_only_registered_positional_modes():
     assert {"frozen", "learned"}.issubset(_POS_PHI)
 
 
+@pytest.mark.registry_mutation
 def test_omega_direct_capability_comes_from_group_registration():
     from vfe3.geometry.groups import GaugeGroup, _GROUPS, get_group, register_group
 
     capable_name = "audit_omega_capable_alias"
     incapable_name = "audit_omega_incapable_alias"
-
-    @register_group(capable_name, omega_direct_capable=True)
-    def _build_capable(K, *args, **kwargs):
-        base = get_group("glk")(K, *args, **kwargs)
-        return GaugeGroup(
-            name=capable_name,
-            generators=base.generators,
-            irrep_dims=base.irrep_dims,
-            skew_symmetric=base.skew_symmetric,
-        )
-
-    @register_group(incapable_name)
-    def _build_incapable(K, *args, **kwargs):
-        base = get_group("glk")(K, *args, **kwargs)
-        return GaugeGroup(
-            name=incapable_name,
-            generators=base.generators,
-            irrep_dims=base.irrep_dims,
-            skew_symmetric=base.skew_symmetric,
+    previous_capable = _GROUPS.get(capable_name, _MISSING)
+    previous_incapable = _GROUPS.get(incapable_name, _MISSING)
+    try:
+        @register_group(
+            capable_name,
+            override=previous_capable is not _MISSING,
             omega_direct_capable=True,
         )
+        def _build_capable(K, *args, **kwargs):
+            base = get_group("glk")(K, *args, **kwargs)
+            return GaugeGroup(
+                name=capable_name,
+                generators=base.generators,
+                irrep_dims=base.irrep_dims,
+                skew_symmetric=base.skew_symmetric,
+            )
 
-    try:
+        @register_group(incapable_name, override=previous_incapable is not _MISSING)
+        def _build_incapable(K, *args, **kwargs):
+            base = get_group("glk")(K, *args, **kwargs)
+            return GaugeGroup(
+                name=incapable_name,
+                generators=base.generators,
+                irrep_dims=base.irrep_dims,
+                skew_symmetric=base.skew_symmetric,
+                omega_direct_capable=True,
+            )
+
         cfg = VFE3Config(
             embed_dim=4,
             n_heads=1,
@@ -902,5 +931,5 @@ def test_omega_direct_capability_comes_from_group_registration():
                 e_phi_lr=0.0,
             )
     finally:
-        _GROUPS.pop(capable_name, None)
-        _GROUPS.pop(incapable_name, None)
+        _restore_registry_entry(_GROUPS, capable_name, previous_capable)
+        _restore_registry_entry(_GROUPS, incapable_name, previous_incapable)

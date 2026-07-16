@@ -31,4 +31,12 @@ include = ["vfe3", "vfe3.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q --strict-config --strict-markers"
+markers = [
+    "slow: heavy figure, artifact, or UMAP integration test; skipped unless --runslow",
+    "umap: integration test that executes the real UMAP implementation",
+    "cuda: test that requires a CUDA device",
+    "external: test that requires externally supplied artifacts or bundles",
+    "registry_mutation: test that temporarily changes a process-global registry",
+    "xdist_group(name): resource group used to serialize shared execution resources",
+]
