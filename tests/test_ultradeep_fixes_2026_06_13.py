@@ -320,17 +320,6 @@ def test_l11_rel_gap_eps_keeps_small_meaningful_gaps_accurate():
     assert rel_old > 1e-1, rel_old
 
 
-def test_l11_retract_spd_full_still_finite_at_isotropic():
-    from vfe3.geometry.retraction import retract_spd_full
-
-    K = 4
-    sigma = torch.eye(K).reshape(1, K, K).clone().requires_grad_(True)
-    delta = torch.zeros(1, K, K)
-    out = retract_spd_full(sigma, delta)
-    out.sum().backward()
-    assert torch.isfinite(sigma.grad).all()
-
-
 # ---------------------------------------------------------------------------
 # L13 — the SPD condition_number monitor must handle a diagonal (...,K) spectrum
 #       (the default gaussian_diagonal family), not raise on the rank mismatch

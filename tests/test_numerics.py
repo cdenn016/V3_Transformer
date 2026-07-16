@@ -13,12 +13,17 @@ from vfe3.numerics import (
 )
 
 
-def test_safe_spd_inverse_matches_inv_on_well_conditioned():
+@pytest.mark.parametrize("ridge", [
+    pytest.param(0.0,  id="zero"),
+    pytest.param(1e-7, id="regularized"),
+])
+def test_safe_spd_inverse_matches_linalg_inverse(ridge: float):
     g = torch.Generator().manual_seed(0)
     A = torch.randn(3, 4, 4, generator=g)
     M = A @ A.transpose(-1, -2) + torch.eye(4)              # SPD, well-conditioned
-    out = safe_spd_inverse(M)
-    assert torch.allclose(out, torch.linalg.inv(M), atol=1e-3)
+    out = safe_spd_inverse(M, eps=ridge)
+    expected = torch.linalg.inv(M + ridge * torch.eye(4))
+    assert torch.allclose(out, expected, atol=1e-3)
 
 
 def test_safe_spd_inverse_is_finite_on_singular():
