@@ -13,7 +13,7 @@
 - Preserve every independent finite-difference, oracle, golden, gauge, Regime-II, two-hop, retraction, and learnability contract named in the design.
 - Do not reduce seeds, step counts, thresholds, tolerances, dtypes, exact equality checks, or negative controls.
 - Keep mutable models, registries, RNG state, and artifact writers function-local except for narrowly controlled module fixture setup.
-- Keep CUDA, real UMAP, and external-bundle execution serial.
+- Keep CUDA and external-bundle execution at one worker and serialize real UMAP nodes relative to one another with an xdist resource group.
 - Use fixed xdist worker counts; do not add `-n auto` to repository defaults.
 - Obtain pass counts only from JUnit XML or another machine-readable result.
 
@@ -21,41 +21,45 @@
 
 **Files:**
 - Modify: `tests/conftest.py`
-- Create: `tests/test_test_harness.py`
-- Modify: the test modules containing the 18 current slow nodes and the six dedicated CUDA nodes
+- Create: `tests/pytest_policy.py`
+- Create: `tests/test_pytest_policy.py`
 - Modify: `tests/test_alpha_i.py`
 - Modify: `tests/test_attention_prior.py`
 - Modify: `tests/test_config.py`
 - Modify: `pyproject.toml`
 
 **Interfaces:**
-- Consumes: pytest item markers and the existing `--runslow` option.
-- Produces: intrinsic `slow`, `serial`, `cuda`, and `external_bundle` marks; a collection hook that only conditionally skips `slow` items.
+- Consumes: collected node IDs and the existing `--runslow` option.
+- Produces: tested `slow`, `umap`, `cuda`, `external`, and `xdist_group` policy tables; a collection hook that always assigns semantic markers before conditionally skipping slow items.
 
-- [ ] **Step 1: Write the failing hook regression.** Add fake config and item objects to `tests/test_test_harness.py`. The `--runslow=True` case must begin with an intrinsic slow marker and assert that the hook leaves `slow` present without adding `skip`; the default case must assert that `skip` is added.
+- [ ] **Step 1: Write the failing policy regressions.** Add fake config and item objects to `tests/test_pytest_policy.py`. Assert unconditional slow marking with and without `--runslow`, UMAP and CUDA resource grouping, external classification, policy-set relationships, and AST resolution of every table entry without importing test modules.
 
 ```python
-def test_runslow_preserves_intrinsic_slow_marker_without_skip():
-    item = _Item("tests/test_probe.py::test_probe", markers=(pytest.mark.slow,))
+def test_runslow_preserves_slow_marker_without_skip():
+    item = _Item("tests/test_report.py::test_generate_figures_drives_live_model")
     pytest_collection_modifyitems(_Config(runslow=True), [item])
-    assert item.marker_names == ["slow"]
+    assert item.marker_names == ["slow", "umap", "xdist_group"]
 ```
 
-- [ ] **Step 2: Run the new hook regression and confirm it fails against the allowlist hook.** Run `python -m pytest tests/test_test_harness.py --junitxml=artifacts/test-harness-red.xml`. Expected result: failure because the existing hook does not consume intrinsic slow markers as the source of truth.
-- [ ] **Step 3: Replace `_SLOW_TESTS` with intrinsic decorators.** Add `@pytest.mark.slow` to each current slow node. Add `@pytest.mark.serial` to real UMAP process tests, all dedicated CUDA tests, and the external-bundle case; also add `cuda` or `external_bundle` as applicable. Change the hook to:
+- [ ] **Step 2: Run the new policy regressions and confirm they fail against the current `conftest.py` policy.** Run `python -m pytest tests/test_pytest_policy.py --junitxml=artifacts/pytest-policy-red.xml`. Expected result: import or assertion failures because the plugin and resource classifications do not exist.
+- [ ] **Step 3: Extract the testable plugin.** Move the slow table and hooks into `tests/pytest_policy.py`; keep `tests/conftest.py` focused on the device fixture and `pytest_plugins = ("tests.pytest_policy",)`. Add fixed CUDA, external, and UMAP tables. Mark the hook `tryfirst`, assign all semantic markers unconditionally, and add the slow skip only when `--runslow` is false.
 
 ```python
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
     run_slow = config.getoption("--runslow")
     skip_slow = pytest.mark.skip(reason="slow integration test; pass --runslow to run it")
     for item in items:
-        if item.get_closest_marker("slow") is not None and not run_slow:
-            item.add_marker(skip_slow)
+        key = node_key(item.nodeid)
+        if key in SLOW_TESTS:
+            item.add_marker(pytest.mark.slow)
+            if not run_slow:
+                item.add_marker(skip_slow)
 ```
 
-- [ ] **Step 4: Register markers and strict validation.** Set `addopts = "-q --strict-markers"` and define the four marker descriptions under `[tool.pytest.ini_options]`.
+- [ ] **Step 4: Register markers and strict validation.** Set `addopts = "-q --strict-config --strict-markers"` and define `slow`, `umap`, `cuda`, `external`, `registry_mutation`, and `xdist_group` under `[tool.pytest.ini_options]`.
 - [ ] **Step 5: Restore registry mutations.** Capture the previous entry with a sentinel, perform the registration, and restore or delete the key in `finally` so worker order cannot leak state.
-- [ ] **Step 6: Run the harness and registry modules.** Run `python -m pytest tests/test_test_harness.py tests/test_alpha_i.py tests/test_attention_prior.py tests/test_config.py --junitxml=artifacts/task1.xml` and read the XML counts.
+- [ ] **Step 6: Run the policy and registry modules.** Run `python -m pytest tests/test_pytest_policy.py tests/test_alpha_i.py tests/test_attention_prior.py tests/test_config.py --junitxml=artifacts/task1.xml` and read the XML counts. Also collect `--runslow -m slow` and confirm the expected policy nodes are selected.
 - [ ] **Step 7: Commit.** Commit with `test: make execution lanes explicit`.
 
 ### Task 2: Pure report planning and routing tests
@@ -64,6 +68,7 @@ def pytest_collection_modifyitems(config, items):
 - Modify: `vfe3/viz/report.py`
 - Modify: `tests/test_report.py`
 - Modify: `tests/test_model_channel_diagnostics_2026_06_13.py`
+- Modify: `tests/pytest_policy.py`
 
 **Interfaces:**
 - Produces: `plan_single_run_figures(dataset: str, availability: Mapping[str, bool]) -> tuple[str, ...]`.
@@ -81,7 +86,7 @@ assert {"vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readou
 - [ ] **Step 2: Run those exact nodes and confirm import or attribute failure.** Record the failing JUnit XML.
 - [ ] **Step 3: Implement the pure planner.** Define the two English-only figure names once, filter only unavailable or route-ineligible names, and return a tuple. Do not call a model, loader, renderer, UMAP worker, or filesystem API.
 - [ ] **Step 4: Make `generate_figures` consume the plan.** Build the availability mapping from the existing extractor results and use membership in the planned set for fixed figure emissions. Preserve the current thunks, best-effort exception handling, and dynamic UMAP channel loops.
-- [ ] **Step 5: Retain integration boundaries.** Keep the live-model render, reload render, finalize autorun, and real UMAP lifecycle tests marked slow/serial as designed.
+- [ ] **Step 5: Retain integration boundaries.** Keep the live-model render, reload render, finalize autorun, and real UMAP lifecycle tests under the slow/UMAP policy. Remove routing-only nodes from the slow and UMAP tables after they become pure planner tests.
 - [ ] **Step 6: Run `tests/test_report.py` and `tests/test_model_channel_diagnostics_2026_06_13.py` with `--runslow`, save JUnit XML, and read counts.**
 - [ ] **Step 7: Commit.** Commit with `perf: separate report routing from rendering`.
 
@@ -133,7 +138,7 @@ assert {"vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readou
 - Coverage configuration: `branch = true`, `source = ["vfe3"]`, `parallel = true`, `show_missing = true`.
 
 - [ ] **Step 1: Add dependencies and coverage configuration.** Regenerate `uv.lock` with the repository's `uv` workflow.
-- [ ] **Step 2: Document the semantic lane union.** Include the serial default command, fixed two/four-worker CPU commands excluding `slow`, `serial`, and `cuda`, the serial slow/UMAP command, the RTX 5090 command, and the two-environment-variable external-bundle command. State that absent prerequisites are skips, not passes.
+- [ ] **Step 2: Document the semantic lane union.** Include the serial baseline command, fixed two/four-worker CPU commands using `--dist loadgroup` and excluding `slow`, `cuda`, and `external`, the grouped slow/UMAP command, the one-worker RTX 5090 command, and the one-worker two-environment-variable external-bundle command. State that absent prerequisites are skips, not passes.
 - [ ] **Step 3: Document branch-coverage and JUnit commands.** Keep generated XML and coverage files task-owned and outside the final commit.
 - [ ] **Step 4: Update the dated edit document with the implemented changes and verification evidence.**
 - [ ] **Step 5: Commit.** Commit with `build: add parallel coverage test tooling`.
