@@ -12,7 +12,7 @@ gauge_trace_spread (spread of log|det Omega| = tr embed(phi)), and free_energy_t
 (the per-term F decomposition).
 """
 
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -461,8 +461,16 @@ def _spectrum(
 
     *,
     diagonal: Optional[bool] = None,
+    eps:      float          = 1e-12,
+    family:   Optional[str]  = None,
 ) -> torch.Tensor:                       # (..., K) eigenvalue spectrum
     r"""The covariance spectrum: the variances themselves (diagonal) or ``eigvalsh`` (full)."""
+    if family is not None:
+        from vfe3.families.base import get_family
+        return get_family(family).diagnostic_statistics(
+            sigma,
+            eps=eps,
+        )["covariance_spectrum"]
     if _is_full_cov(sigma, diagonal):
         return torch.linalg.eigvalsh(0.5 * (sigma + sigma.transpose(-1, -2)))
     return sigma
@@ -474,6 +482,7 @@ def effective_rank_per_token(
     *,
     diagonal: Optional[bool] = None,
     eps:      float = 1e-12,
+    family:   Optional[str] = None,
 ) -> torch.Tensor:                       # (...) per-token effective rank (NOT mean-reduced)
     r"""Per-token spectral effective rank (sum lam)^2 / sum lam^2, the (...) VECTOR.
 
@@ -481,7 +490,10 @@ def effective_rank_per_token(
     keeps the per-token distribution a single-seed run needs for a ridgeline/violin. Full
     covariances are passed through ``eigvalsh`` first.
     """
-    return effective_rank(_spectrum(sigma, diagonal=diagonal), eps=eps)
+    return effective_rank(
+        _spectrum(sigma, diagonal=diagonal, eps=eps, family=family),
+        eps=eps,
+    )
 
 
 def belief_spectrum(
@@ -490,7 +502,8 @@ def belief_spectrum(
     *,
     diagonal: Optional[bool] = None,
     eps:      float = 1e-12,
-) -> Dict[str, torch.Tensor]:
+    family:   Optional[str] = None,
+) -> Dict[str, Any]:
     r"""Per-token spectral picture of the belief covariances (all PER-TOKEN, not mean-reduced).
 
     Returns ``eigenvalues`` (..., K) sorted DESCENDING, the spectral condition number
@@ -498,7 +511,7 @@ def belief_spectrum(
     ``is_positive_definite`` flag. Non-positive eigenvalues are retained for diagnosis and force
     the condition number to +inf; only the effective-rank calculation projects them to zero.
     """
-    lam = _spectrum(sigma, diagonal=diagonal)
+    lam = _spectrum(sigma, diagonal=diagonal, eps=eps, family=family)
     lam_desc = torch.sort(lam, dim=-1, descending=True).values
     lam_max = lam_desc[..., 0]
     lam_min = lam_desc[..., -1]
@@ -508,12 +521,18 @@ def belief_spectrum(
         lam_max / lam_min.clamp(min=eps),
         torch.full_like(lam_min, float("inf")),
     )
-    return {
+    result: Dict[str, Any] = {
         "eigenvalues":            lam_desc,
         "condition":              condition,
         "effective_rank":         effective_rank(lam.clamp(min=0.0), eps=eps),
         "is_positive_definite":   is_positive_definite,
     }
+    if family is not None:
+        from vfe3.families.base import get_family
+        labels = get_family(family).diagnostic_labels()
+        result["dispersion_label"] = labels["dispersion"]
+        result["spectrum_label"] = labels["covariance_spectrum"]
+    return result
 
 
 def half_fisher_trace(
@@ -522,6 +541,7 @@ def half_fisher_trace(
     *,
     eps:      float = 1e-12,
     diagonal: Optional[bool] = None,
+    family:   Optional[str] = None,
 ) -> torch.Tensor:                       # (...) per-token one-half mean-block Fisher trace
     r"""Per-token KL quadratic coefficient, one-half tr(Sigma^{-1}) in the mean block.
 
@@ -530,6 +550,19 @@ def half_fisher_trace(
     covariance and (1/2) tr(Sigma^{-1}) for full covariance. This is a precision diagnostic,
     not the full Fisher trace.
     """
+    if family is not None:
+        from vfe3.families.base import get_family
+        family_cls = get_family(family)
+        precision = family_cls.mean_fisher_precision(sigma, eps=eps)
+        if family_cls.cov_kind == "full":
+            precision_trace = torch.diagonal(
+                precision,
+                dim1=-2,
+                dim2=-1,
+            ).sum(dim=-1)
+        else:
+            precision_trace = precision.sum(dim=-1)
+        return 0.5 * precision_trace
     if _is_full_cov(sigma, diagonal):
         sym = 0.5 * (sigma + sigma.transpose(-1, -2))
         # eps ridge floors the inverse like the diagonal branch's clamp (audit 2026-06-09 IG1):
@@ -548,6 +581,7 @@ def sigma_trace(
 
     *,
     diagonal: Optional[bool] = None,
+    family:   Optional[str] = None,
 ) -> torch.Tensor:                       # (...) per-token tr(Sigma_q) = sum_k Var_k
     r"""Per-token covariance trace tr(Sigma_q) = sum_k Var_k -- the total belief UNCERTAINTY.
 
@@ -556,6 +590,9 @@ def sigma_trace(
     trace itself, whose across-token spread (see ``cv``) gates whether the channel carries any
     decode-time signal. Diagonal: sum_k sigma_k. Full: sum_k Sigma_kk.
     """
+    if family is not None:
+        from vfe3.families.base import get_family
+        return get_family(family).covariance_diagonal(sigma).sum(dim=-1)
     if _is_full_cov(sigma, diagonal):
         return torch.diagonal(sigma, dim1=-2, dim2=-1).sum(dim=-1)
     return sigma.sum(dim=-1)
@@ -1574,7 +1611,13 @@ def get_metric(name: str) -> Callable:
 # kernel (effective_rank(None) etc.). The trailing **kw stays only to absorb SIBLING
 # metrics' context keys, since ``compute_metrics`` floods the full context to every metric.
 @register_metric("effective_rank")
-def _m_eff_rank(*, sigma: torch.Tensor, diagonal: bool, **kw) -> float:
+def _m_eff_rank(
+    *,
+    sigma:    torch.Tensor,
+    diagonal: bool,
+    family:   Optional[str] = None,
+    **kw,
+) -> float:
     """Mean spectral effective rank of the belief covariances.
 
     Routes through ``_spectrum`` so a FULL covariance (..., K, K) is reduced to its eigenvalue
@@ -1584,7 +1627,11 @@ def _m_eff_rank(*, sigma: torch.Tensor, diagonal: bool, **kw) -> float:
     ``diagonal`` is REQUIRED (no auto-inference): a diagonal (N, K) variance table with N == K is
     square in its last two axes, so shape-based auto-inference would misread it as a full (K, K)
     covariance and eigvalsh a variance vector. The caller passes the explicit flag (audit PB-07)."""
-    return float(effective_rank(_spectrum(sigma, diagonal=diagonal)).mean())
+    return float(effective_rank(_spectrum(
+        sigma,
+        diagonal=diagonal,
+        family=family,
+    )).mean())
 
 
 @register_metric("attention_entropy")

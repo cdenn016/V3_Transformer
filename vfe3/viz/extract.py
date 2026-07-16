@@ -302,7 +302,11 @@ def belief_ce_bank(
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 gauge_parameterization=cfg.gauge_parameterization,
             )
-            trs = metrics.sigma_trace(out.sigma, diagonal=cfg.diagonal_covariance).reshape(-1)   # (B*N,)
+            trs = metrics.sigma_trace(
+                out.sigma,
+                diagonal=cfg.diagonal_covariance,
+                family=cfg.family,
+            ).reshape(-1)                                                    # (B*N,)
             tgt = targets.reshape(-1)
             valid = tgt != -100
             tr_sig.append(trs[valid])
@@ -619,7 +623,11 @@ def across_layer_belief_trace(
     sig_stack = torch.stack(sigmas)                              # (L, N, [K])
     base = sig_stack[0].unsqueeze(0).expand_as(sig_stack)
     d_ai = metrics.spd_geodesic_distance(base, sig_stack).mean(dim=-1)   # (L,) mean over tokens
-    eff = metrics.effective_rank_per_token(sig_stack).mean(dim=-1)       # (L,)
+    eff = metrics.effective_rank_per_token(
+        sig_stack,
+        diagonal=cfg.diagonal_covariance,
+        family=cfg.family,
+    ).mean(dim=-1)                                                        # (L,)
     r_one = metrics.rank_one_residual(mu_stack)                          # (L,) Dong r(X) per layer (F2/EXP-7)
     return {"mu": mu_stack, "sigma": sig_stack, "d_ai": d_ai,
             "effective_rank": eff, "rank_one_residual": r_one}
@@ -642,7 +650,7 @@ def numerical_health(
     safe_cholesky jitter rounds, pinv fallbacks -- would require instrumenting numerics and are
     left to a future pass.)
     """
-    from vfe3.numerics import condition_number, nan_inf_fraction
+    from vfe3.numerics import nan_inf_fraction
     from vfe3.geometry.transport import RopeTransport   # m5: used below under pos_rotation='rope' (was NameError)
     cfg = model.cfg
     if snapshot is None:
@@ -691,8 +699,13 @@ def numerical_health(
         energy,
         tau=attention_tau(model.effective_kappa_beta(out.mu.device), model.group.irrep_dims),
         log_prior=log_prior)
-    condition_kind = "diagonal" if out.sigma.dim() == out.mu.dim() else "full"
-    cond = float(condition_number(out.sigma, kind=condition_kind).max())
+    condition = metrics.belief_spectrum(
+        out.sigma,
+        diagonal=(out.sigma.dim() == out.mu.dim()),
+        eps=cfg.eps,
+        family=cfg.family,
+    )["condition"]
+    cond = float(condition.max())
     health = {
         "nan_mu":     nan_inf_fraction(out.mu),
         "nan_sigma":  nan_inf_fraction(out.sigma),
@@ -997,14 +1010,27 @@ def model_channel_belief(
         if s_encoded is None:
             raise RuntimeError("diagnostic snapshot is missing the active model-channel belief")
     s_mu, s_sigma = (tensor[0] for tensor in s_encoded)            # (N, K)
-    lam = torch.sort(s_sigma.clamp(min=cfg.eps), dim=-1, descending=True).values   # (N, K)
-    return {
+    family = get_family(cfg.family)
+    statistics = family.diagnostic_statistics(s_sigma, eps=cfg.eps)
+    lam = torch.sort(
+        statistics["covariance_spectrum"],
+        dim=-1,
+        descending=True,
+    ).values
+    result = {
         "mu_mean":    s_mu.mean(dim=0).cpu(),                      # (K,)
         "mu_std":     s_mu.std(dim=0).cpu(),                       # (K,)
         "sigma_mean": s_sigma.mean(dim=0).cpu(),                   # (K,)
         "spectrum":   lam.cpu(),                                   # (N, K)
-        "eff_rank":   metrics.effective_rank(s_sigma).cpu(),       # (N,)
+        "eff_rank":   metrics.effective_rank(
+            statistics["covariance_spectrum"],
+        ).cpu(),                                                     # (N,)
     }
+    if not family.dispersion_is_covariance:
+        labels = family.diagnostic_labels()
+        result["dispersion_label"] = labels["dispersion"]
+        result["spectrum_label"] = labels["covariance_spectrum"]
+    return result
 
 
 @torch.no_grad()

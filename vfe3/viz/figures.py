@@ -2679,6 +2679,7 @@ def plot_belief_spectrum(
     eps:       float = 1e-6,
     sigma_max: Optional[float] = 5.0,
     diagonal:  Optional[bool]  = None,
+    family:    Optional[str]   = None,
     path:      Optional[str]   = None,
 ):
     r"""F9: belief covariance geometry -- effective rank, guarded scree, and conditioning.
@@ -2689,19 +2690,41 @@ def plot_belief_spectrum(
     the per-token spectral condition-number histogram.
     """
     from vfe3 import metrics
-    sp = metrics.belief_spectrum(sigma, diagonal=diagonal)
+    sp = metrics.belief_spectrum(
+        sigma,
+        diagonal=diagonal,
+        eps=eps,
+        family=family,
+    )
     eig = _np(sp["eigenvalues"])                                 # (N, K) descending
     rank = _np(sp["effective_rank"])
     cond = _np(sp["condition"])
+    covariance_eps = eps
+    covariance_max = sigma_max
+    if family is not None:
+        import torch
+        from vfe3.families.base import get_family
+        family_cls = get_family(family)
+        if family_cls.cov_kind == "diagonal":
+            covariance_eps = float(family_cls.covariance_diagonal(
+                torch.tensor([eps]),
+                eps=0.0,
+            )[0])
+            if sigma_max is not None:
+                covariance_max = float(family_cls.covariance_diagonal(
+                    torch.tensor([sigma_max]),
+                    eps=0.0,
+                )[0])
     fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.8))
     axes[0].violinplot([rank], showmeans=True)
     axes[0].set(xticks=[1], xticklabels=["beliefs"], ylabel="effective rank",
                 title="Per-token effective rank")
     kk = np.arange(1, eig.shape[1] + 1)
     _median_band(axes[1], kk, eig.T, _CB[0], "eigenvalue")
-    axes[1].axhline(eps, color=_CB[1], ls="--", lw=1, label=r"$\varepsilon$ floor")
-    if sigma_max is not None:
-        axes[1].axhline(sigma_max, color=_CB[2], ls="--", lw=1,
+    axes[1].axhline(covariance_eps, color=_CB[1], ls="--", lw=1,
+                    label=r"$\varepsilon$ floor")
+    if covariance_max is not None:
+        axes[1].axhline(covariance_max, color=_CB[2], ls="--", lw=1,
                         label=r"$\sigma_{\max}$ ceiling")
     axes[1].set_yscale("log")
     axes[1].set(xlabel="eigenvalue index", ylabel="eigenvalue", title="Guarded spectrum (scree)")
@@ -2721,6 +2744,7 @@ def plot_spd_ellipses(
     *,
     dims:     tuple = (0, 1),
     diagonal: Optional[bool] = None,
+    family:   Optional[str]  = None,
     path:     Optional[str]  = None,
 ):
     r"""F9 (companion): correlation-bearing SPD covariance ellipses, coloured by effective rank.
@@ -2734,10 +2758,22 @@ def plot_spd_ellipses(
     from matplotlib.colors import Normalize
     from vfe3 import metrics
     m = _np(mu)
-    s = _np(sigma)
+    covariance = sigma
+    if family is not None:
+        import torch
+        from vfe3.families.base import get_family
+        family_cls = get_family(family)
+        dispersion = sigma if hasattr(sigma, "detach") else torch.as_tensor(sigma)
+        if family_cls.cov_kind == "diagonal":
+            covariance = family_cls.covariance_diagonal(dispersion)
+    s = _np(covariance)
     a, b = dims
     is_full = s.ndim >= 3 and s.shape[-1] == s.shape[-2] if diagonal is None else (not diagonal)
-    rank = _np(metrics.effective_rank_per_token(sigma, diagonal=diagonal))
+    rank = _np(metrics.effective_rank_per_token(
+        sigma,
+        diagonal=diagonal,
+        family=family,
+    ))
     norm = Normalize(vmin=rank.min(), vmax=rank.max() + 1e-12)
     cmap = plt.cm.viridis
     fig, ax = plt.subplots(figsize=(5, 4.4))

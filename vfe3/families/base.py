@@ -64,7 +64,8 @@ class BeliefParams(ABC):
         per-coordinate divergence, defined only for families whose divergence decomposes).
     """
 
-    cov_kind: ClassVar[str]
+    cov_kind:                 ClassVar[str]
+    dispersion_is_covariance: ClassVar[bool] = False
 
     @abstractmethod
     def coordinate_dim(self) -> int:
@@ -124,6 +125,90 @@ class BeliefParams(ABC):
             f"preconditioner (Euclidean -> natural gradient). Provide it so the E-step descends in "
             f"this family's information geometry rather than the hardcoded Gaussian Fisher."
         )
+
+    @classmethod
+    def covariance_diagonal(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K) diagonal or (..., K, K) full parameter
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:                               # (..., K) marginal covariance diagonal
+        r"""Map the stored family dispersion to ``diag(Cov[X])``.
+
+        The belief state's ``sigma`` slot is deliberately family-generic: it stores a Gaussian
+        variance/covariance but a Laplace scale. Consumers that need uncertainty, rather than the
+        raw parameter, dispatch through this hook. A family must override it because covariance
+        semantics cannot be inferred from ``cov_kind`` alone.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} does not provide covariance_diagonal for its dispersion parameter"
+        )
+
+    @classmethod
+    def mean_fisher_precision(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K) diagonal or (..., K, K) full parameter
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:                               # (..., K) diagonal or (..., K, K) precision
+        r"""Mean-block Fisher information in the family's stored coordinates."""
+        raise NotImplementedError(
+            f"{cls.__name__} does not provide mean_fisher_precision"
+        )
+
+    @classmethod
+    def trust_region_scale(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K) diagonal or (..., K, K) full parameter
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:                               # (..., K) scale or (..., K, K) whitening factor
+        r"""Factor ``L`` used to whiten a mean perturbation in this family's Fisher geometry."""
+        raise NotImplementedError(
+            f"{cls.__name__} does not provide trust_region_scale"
+        )
+
+    @classmethod
+    def mix_dispersion(
+        cls,
+        dispersion: torch.Tensor,                    # (..., n, d) or (..., K, K) family parameter
+        mixing:    torch.Tensor,                     # (m, n) component map or (K, K) dense map
+    ) -> torch.Tensor:
+        r"""Push the stored dispersion through an independent-component linear mixer."""
+        raise NotImplementedError(
+            f"{cls.__name__} does not provide mix_dispersion"
+        )
+
+    @classmethod
+    def diagnostic_labels(cls) -> Dict[str, str]:
+        r"""Human-readable labels distinguishing stored dispersion from covariance statistics."""
+        raise NotImplementedError(
+            f"{cls.__name__} does not provide diagnostic_labels"
+        )
+
+    @classmethod
+    def diagnostic_statistics(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K) diagonal or (..., K, K) full parameter
+
+        *,
+        eps:        float = 1e-12,
+    ) -> Dict[str, torch.Tensor]:
+        r"""Family-aware covariance spectrum and trace without computing Fisher inverses."""
+        covariance_diagonal = cls.covariance_diagonal(dispersion, eps=eps)
+        if cls.cov_kind == "full":
+            covariance = 0.5 * (dispersion + dispersion.transpose(-1, -2))
+            covariance_spectrum = torch.linalg.eigvalsh(covariance)
+        else:
+            covariance_spectrum = covariance_diagonal
+        return {
+            "covariance_diagonal": covariance_diagonal,
+            "covariance_spectrum": covariance_spectrum,
+            "covariance_trace":    covariance_diagonal.sum(dim=-1),
+        }
 
     @classmethod
     def stack(cls, parts: List["BeliefParams"], *, dim: int = 0) -> "BeliefParams":

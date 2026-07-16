@@ -1782,6 +1782,12 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     family_group_invariant = cfg.family in invariant_families
     transport_registration = get_transport_registration(cfg.transport_mode)
     fixed_prior_surrogate = bool(cfg.precision_weighted_attention)
+    head_mixer_compatibility = getattr(cfg, "head_mixer_compatibility", None)
+    if head_mixer_compatibility is None:
+        head_mixer_compatibility = VFE3Config.head_mixer_compatibility.fget(cfg)
+    head_mixer_gauge_compatible = getattr(cfg, "head_mixer_gauge_compatible", None)
+    if head_mixer_gauge_compatible is None:
+        head_mixer_gauge_compatible = VFE3Config.head_mixer_gauge_compatible.fget(cfg)
     covariance_feature_exact = _last("regime_ii_covariant_feature_exact")
     feature_jitter_recovered = covariance_feature_exact is not None and covariance_feature_exact < 0.5
     if cfg.transport_mode != "regime_ii_covariant":
@@ -1832,6 +1838,7 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
         "phi_parameterization":      cfg.gauge_parameterization == "phi",
         "no_reflection_sampling":    cfg.omega_reflection == "off" and cfg.phi_reflection == "off",
         "family_group_invariant":    family_group_invariant,
+        "head_mixer_intertwiner_compatible": head_mixer_gauge_compatible,
     }
     return {
         "on_pure_path":       all(pure_flags.values()),
@@ -1845,6 +1852,8 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "lambda_beta":                  float(cfg.lambda_beta),
             "use_prior_bank":               bool(cfg.use_prior_bank),
             "use_head_mixer":               bool(cfg.use_head_mixer),
+            "head_mixer_compatibility":      head_mixer_compatibility,
+            "head_mixer_gauge_compatible":   head_mixer_gauge_compatible,
             "precision_weighted_attention": bool(cfg.precision_weighted_attention),
             "gauge_transport":              cfg.gauge_transport,
             "pos_rotation":                 cfg.pos_rotation,

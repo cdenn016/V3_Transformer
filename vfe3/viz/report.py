@@ -328,10 +328,13 @@ def generate_figures(
               path=p),
           cstate is not None)
     _emit("belief_spectrum",
-          lambda p: figs.plot_belief_spectrum(cstate["sigma"], eps=cfg.eps, sigma_max=cfg.sigma_max, path=p),
+          lambda p: figs.plot_belief_spectrum(
+              cstate["sigma"], eps=cfg.eps, sigma_max=cfg.sigma_max,
+              family=cfg.family, path=p),
           cstate is not None)
     _emit("spd_ellipses",
-          lambda p: figs.plot_spd_ellipses(cstate["mu"], cstate["sigma"], path=p),
+          lambda p: figs.plot_spd_ellipses(
+              cstate["mu"], cstate["sigma"], family=cfg.family, path=p),
           cstate is not None)
     _emit("holonomy_curvature",
           lambda p: figs.plot_holonomy_curvature(

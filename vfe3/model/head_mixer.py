@@ -7,20 +7,21 @@ learned matrix :math:`A = I + \Delta \in \mathbb{R}^{n \times n}` embedded as
 per maximal run of equal-labeled blocks -- the full linear commutant of a mixed-irrep tower for
 real-type irreps -- so unequal block dimensions no longer raise a dim-collision hazard provided
 they carry different labels. Under ``block_glk`` the blocks are the ``n_heads`` heads, so the
-mixer mixes heads. Applied symmetrically to the mean and covariance:
+mixer mixes heads. Applied to the mean and through the configured family's dispersion hook:
 
 .. math::
     M    = \mathrm{blockdiag}_t(A_t \otimes I_{d_t}) \in \mathbb{R}^{K \times K}, \qquad
-    \mu' = M\,\mu, \qquad
-    \Sigma' = M\,\Sigma\,M^{\top},
+    \mu' = M\mu, \qquad
+    \Sigma' = M\Sigma M^{\top},
 
-with the diagonal-covariance closed form (the diagonal-of-sandwich approximation already used
+with the diagonal-Gaussian closed form (the diagonal-of-sandwich approximation already used
 throughout V3 when ``diagonal_covariance=True``)
 
 .. math::
-    \sigma'[m, c] = \sum_n A_t[m, n]^2\, \sigma[n, c]
+    \sigma'[m, c] = \sum_n A_t[m, n]^2 \sigma[n, c]
 
-applied block-by-block for each component :math:`t`.
+applied block-by-block for each component :math:`t`. Factorized Laplace instead uses the
+moment-matched scale :math:`b'[m,c] = \sqrt{\sum_n A_t[m,n]^2 b[n,c]^2}`.
 
 Initialization is exactly the identity (:math:`\Delta_t = 0`, stored as the delta-from-identity
 so the init is bit-exact), so a model with the mixer enabled is bitwise indistinguishable from
@@ -50,6 +51,8 @@ from typing import List, Optional, Tuple
 import torch
 from torch import nn
 
+from vfe3.families.base import get_family
+
 
 class HeadMixer(nn.Module):
     r"""Isotypic per-component mixer: one :math:`A_t = I + \Delta_t` per maximal run of
@@ -61,8 +64,13 @@ class HeadMixer(nn.Module):
         self,
         irrep_dims:   List[int],                      # gauge block sizes
         irrep_labels: Optional[List[str]] = None,     # per-block labels; None -> legacy equal-dims
+
+        *,
+        family:       str = "gaussian_diagonal",     # registered belief-family key
     ) -> None:
         super().__init__()
+        self.family_name = family
+        self._family = get_family(family)
         if len(irrep_dims) < 2:
             raise ValueError(
                 f"HeadMixer needs >= 2 blocks to mix, got irrep_dims={irrep_dims}; a single-block "
@@ -105,6 +113,10 @@ class HeadMixer(nn.Module):
         self.mixer_deltas = nn.ParameterList(
             nn.Parameter(torch.zeros(m, m)) for _, m, _ in self.components
         )
+        self._identity_states = tuple(
+            (id(delta), delta._version) for delta in self.mixer_deltas
+        )
+        self._identity_for_forward = True
         if irrep_labels is not None:
             # Silent-degeneracy warnings (audit 2026-06-09 overnight PP6/DB3). Runs are
             # CONTIGUOUS by construction, so (a) a label appearing in two non-adjacent runs
@@ -145,7 +157,23 @@ class HeadMixer(nn.Module):
         return torch.eye(d.shape[0], device=d.device, dtype=d.dtype) + d
 
     def is_identity(self) -> bool:
+        r"""Exact diagnostic predicate; forward uses the synchronization-free version cache."""
         return all(bool((d.detach() == 0).all().item()) for d in self.mixer_deltas)
+
+    def _identity_shortcut_available(self) -> bool:
+        r"""Whether identity passthrough is still certified without reading tensor values.
+
+        Parameters initialize exactly to zero. Replacement changes Python identity and any
+        in-place write increments ``Tensor._version``; after either change the shortcut fails
+        closed and the small mixer operation executes. This preserves the no-grad object-identity
+        contract at initialization without a device-to-host scalar transfer on each evaluation
+        forward.
+        """
+        states = tuple((id(delta), delta._version) for delta in self.mixer_deltas)
+        if states != self._identity_states:
+            self._identity_states = states
+            self._identity_for_forward = False
+        return self._identity_for_forward
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         r"""Remap the pre-isotypic key ``mixer_delta`` -> ``mixer_deltas.0`` so strict
@@ -155,6 +183,10 @@ class HeadMixer(nn.Module):
         if old in state_dict and len(self.mixer_deltas) == 1:
             state_dict[prefix + "mixer_deltas.0"] = state_dict.pop(old)
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        self._identity_states = tuple(
+            (id(delta), delta._version) for delta in self.mixer_deltas
+        )
+        self._identity_for_forward = False
 
     def forward(
         self,
@@ -164,7 +196,7 @@ class HeadMixer(nn.Module):
         # Grad-free identity short-circuit only: under autograd a zero-delta short-circuit
         # would sever mixer_deltas from the graph and the zero-init deltas could never train
         # (audit 2026-06-09 overnight CR3 verifier correction).
-        if not torch.is_grad_enabled() and self.is_identity():
+        if not torch.is_grad_enabled() and self._identity_shortcut_available():
             return mu, sigma
         mu_parts, sig_parts = [], []
         for t, (s, m, d) in enumerate(self.components):
@@ -177,14 +209,15 @@ class HeadMixer(nn.Module):
                             .reshape(*mu.shape[:-1], m * d))
             if sigma.dim() == mu.dim():                          # diagonal closed form
                 sblk = sigma[..., s:s + m * d].reshape(*sigma.shape[:-1], m, d)
-                sig_parts.append(torch.einsum("mn,...nd->...md", A * A, sblk)
+                sig_parts.append(self._family.mix_dispersion(sblk, A)
                                  .reshape(*sigma.shape[:-1], m * d))
         mu_out = torch.cat(mu_parts, dim=-1)
         if sigma.dim() == mu.dim():
             return mu_out, torch.cat(sig_parts, dim=-1)
         # full covariance: exact sandwich M Sigma M^T with the block-diagonal commutant M
         M = self._dense_m(sigma.device, sigma.dtype)             # (K, K)
-        return mu_out, M @ sigma @ M.transpose(-1, -2)
+        full_family = self._family if self._family.cov_kind == "full" else get_family("gaussian_full")
+        return mu_out, full_family.mix_dispersion(sigma, M)
 
     def _dense_m(self, device, dtype) -> torch.Tensor:
         r"""blockdiag_t(A_t kron I_d) materialized once per call (K x K, full-cov path only).

@@ -1004,6 +1004,7 @@ def e_step_iteration(
             delta_mu = apply_mu_trust_region(
                 delta_mu, trust_sigma, trust=e_mu_q_trust, mode=mu_trust_mode,
                 is_diagonal=(belief.sigma.dim() == belief.mu.dim()), eps=eps,
+                family=family,
             )
         mu = belief.mu - delta_mu
         if skip_belief_sigma_update:

@@ -62,6 +62,7 @@ class DiagonalLaplace(BeliefParams):
     r"""Factorized Laplace: ``mu`` (..., K) location, ``sigma`` (..., K) per-coordinate scale ``b``."""
 
     cov_kind = "diagonal"
+    dispersion_is_covariance = False
 
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
         self.mu = mu                                   # (..., K) location
@@ -82,6 +83,56 @@ class DiagonalLaplace(BeliefParams):
             torch.stack([p.mu for p in parts], dim=dim),
             torch.stack([p.sigma for p in parts], dim=dim),
         )
+
+    @classmethod
+    def covariance_diagonal(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K) Laplace scale b
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        r"""``diag(Cov[X]) = 2 b^2`` for independent Laplace coordinates."""
+        return 2.0 * dispersion.clamp(min=eps).square()
+
+    @classmethod
+    def mean_fisher_precision(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K) Laplace scale b
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        r"""Mean-block Fisher precision ``I_mu = 1 / b^2``."""
+        return dispersion.clamp(min=eps).square().reciprocal()
+
+    @classmethod
+    def trust_region_scale(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K) Laplace scale b
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        r"""Fisher-whitening scale ``I_mu^{-1/2} = b``."""
+        return dispersion.clamp(min=eps)
+
+    @classmethod
+    def mix_dispersion(
+        cls,
+        dispersion: torch.Tensor,                    # (..., n, d) independent scales b
+        mixing:    torch.Tensor,                     # (m, n) component mixer
+    ) -> torch.Tensor:
+        r"""Moment-matched scale ``b'_m = sqrt(sum_n A_mn^2 b_n^2)``."""
+        mixed_b2 = torch.einsum("mn,...nd->...md", mixing.square(), dispersion.square())
+        return mixed_b2.clamp_min(0.0).sqrt()
+
+    @classmethod
+    def diagnostic_labels(cls) -> dict[str, str]:
+        return {
+            "dispersion":          "Laplace scale b",
+            "covariance_spectrum": "marginal covariance variance",
+        }
 
     @classmethod
     def transport_dispersion(

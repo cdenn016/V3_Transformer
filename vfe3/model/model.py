@@ -41,6 +41,7 @@ from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi, positional_phi_coords
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.model.stack import vfe_stack
+from vfe3.families.base import get_family
 
 
 # Transport-mode state-routing sets: which regimes' Omega builders read mu/sigma. Sourced from the
@@ -52,10 +53,11 @@ _REGIME_NEEDS_SIGMA = _TRANSPORT_NEEDS_SIGMA
 
 
 def _precision_key_bias(
-    sigma:      torch.Tensor,        # (B, N, K) per-key belief variances
+    sigma:      torch.Tensor,        # (B, N, K)/(B, N, K, K) family dispersion
 
     *,
     b0:         float = 1.0,
+    family:     str   = "gaussian_diagonal",
     irrep_dims: 'Optional[Sequence[int]]' = None,   # per-head block sizes (sum == K); None -> global trace
 ) -> torch.Tensor:                   # (B, N) global, or (B, N, H) per-head, log-reliability
     r"""Per-key reliability bias for precision-weighted attention: ``-log(b0 + tr Sigma_j)``.
@@ -70,10 +72,11 @@ def _precision_key_bias(
     per-head gauge-block sizes are given, the trace is taken PER BLOCK (head) -> ``(B, N, H)``, so
     each head down-weights keys by its OWN block uncertainty.
     """
+    covariance_diagonal = get_family(family).covariance_diagonal(sigma)
     if irrep_dims is None:
-        return -torch.log(b0 + sigma.sum(dim=-1))                          # (B, N) global trace
-    tr = torch.stack([blk.sum(dim=-1)                                      # (B, N, H) per-block traces
-                      for blk in sigma.split(list(irrep_dims), dim=-1)], dim=-1)
+        return -torch.log(b0 + covariance_diagonal.sum(dim=-1))             # (B, N) global trace
+    tr = torch.stack([blk.sum(dim=-1)                                       # (B, N, H) per-block traces
+                      for blk in covariance_diagonal.split(list(irrep_dims), dim=-1)], dim=-1)
     return -torch.log(b0 + tr)
 
 
@@ -268,10 +271,12 @@ class VFEModel(nn.Module):
         # is shared across the L blocks (the block norm is a single shared instance). affine=... is
         # ignored by the none/mahalanobis builders (they accept **kwargs).
         self.block_norm = get_norm(cfg.norm_type_block)(cfg.embed_dim, eps=cfg.eps,
-                                                        affine=cfg.layernorm_affine) \
+                                                         family=cfg.family,
+                                                         affine=cfg.layernorm_affine) \
             if cfg.norm_type_block != "none" else None
         self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps,
-                                                        affine=cfg.layernorm_affine) \
+                                                         family=cfg.family,
+                                                         affine=cfg.layernorm_affine) \
             if cfg.norm_type_final != "none" else None
         # layernorm_affine footgun / inert warnings (mirror learnable_kappa). The affine gamma/beta
         # exist only on a "layernorm" seam; on the BLOCK seam they are applied inside the E-step, so
@@ -307,8 +312,8 @@ class VFEModel(nn.Module):
         # labeled irrep towers (so_n/sp_n) mix per isotypic component (mults-one towers get
         # per-head scalar gains -- the entire linear commutant there). Bad pairings fail here,
         # not at forward.
-        self.head_mixer = HeadMixer(self.group.irrep_dims,
-                                    irrep_labels=self.group.irrep_labels) \
+        self.head_mixer = HeadMixer(self.group.irrep_dims, family=cfg.family,
+                                     irrep_labels=self.group.irrep_labels) \
             if cfg.use_head_mixer else None
         # Opt-in CG cross-type coupling (default off; so_n/sp_n only). Built ONCE from the
         # group's labels; CGCoupling raises at construction when no admissible paths exist.
@@ -2424,16 +2429,19 @@ class VFEModel(nn.Module):
         if not self.cfg.precision_weighted_attention:
             return log_prior
         b0 = self.cfg.precision_attention_b0
-        if not self.cfg.diagonal_covariance:               # full cov (.., N, K, K) -> diagonal variances
-            sigma = sigma.diagonal(dim1=-2, dim2=-1)        # (.., N, K): tr is the diagonal sum below
         if len(self.group.irrep_dims) == 1:                # headless (.., N, N) energy: NO head axis
-            kb = _precision_key_bias(sigma, b0=b0).detach()                       # (.., N)
+            kb = _precision_key_bias(sigma, b0=b0, family=self.cfg.family).detach()   # (.., N)
             kb = kb.unsqueeze(-2)                                                 # (.., 1, N)
         elif self.cfg.precision_attention_per_head:        # per-head (.., H, N, N) energy
-            kb = _precision_key_bias(sigma, b0=b0, irrep_dims=self.group.irrep_dims).detach()  # (.., N, H)
+            kb = _precision_key_bias(
+                sigma,
+                b0=b0,
+                family=self.cfg.family,
+                irrep_dims=self.group.irrep_dims,
+            ).detach()                                                           # (.., N, H)
             kb = kb.transpose(-1, -2).unsqueeze(-2)                               # (.., H, 1, N)
         else:                                              # global bias, multi-block: head-broadcast
-            kb = _precision_key_bias(sigma, b0=b0).detach()                       # (.., N)
+            kb = _precision_key_bias(sigma, b0=b0, family=self.cfg.family).detach()   # (.., N)
             kb = kb.unsqueeze(-2).unsqueeze(-2)                                   # (.., 1, 1, N)
         return kb if log_prior is None else log_prior + kb
 
@@ -2897,6 +2905,7 @@ class VFEModel(nn.Module):
         metric_context = {
             "sigma":                     out.sigma,
             "diagonal":                  _diag,
+            "family":                    cfg.family,
             "self_div":                  self_div,
             "energy":                    energy,
             "beta":                      beta,
@@ -3130,7 +3139,12 @@ class VFEModel(nn.Module):
                 d["pos_phi_exp_scale_min"] = float(right_scale.min())
 
         # Belief covariance conditioning + PD margin (effective_rank is blind to one collapsing mode).
-        bs = metrics.belief_spectrum(out.sigma, diagonal=_diag, eps=cfg.eps)
+        bs = metrics.belief_spectrum(
+            out.sigma,
+            diagonal=_diag,
+            eps=cfg.eps,
+            family=cfg.family,
+        )
         cond = bs["condition"].float()
         d["belief_cond_median"] = float(cond.median())
         d["belief_cond_p95"]    = float(torch.quantile(cond, 0.95))
@@ -3140,13 +3154,23 @@ class VFEModel(nn.Module):
         d["belief_pd_margin"]   = float((bs["eigenvalues"][..., -1].clamp(min=cfg.eps).float() / cfg.eps).min())
 
         # Per-token effective-rank distribution (the logged mean hides a bimodal rank-1/rank-K collapse).
-        er = metrics.effective_rank_per_token(out.sigma, diagonal=_diag, eps=cfg.eps).float()
+        er = metrics.effective_rank_per_token(
+            out.sigma,
+            diagonal=_diag,
+            eps=cfg.eps,
+            family=cfg.family,
+        ).float()
         d["eff_rank_p5"]     = float(torch.quantile(er, 0.05))
         d["eff_rank_median"] = float(er.median())
         d["eff_rank_p95"]    = float(torch.quantile(er, 0.95))
 
         # One-half mean-block Fisher trace (the KL quadratic coefficient and belief precision).
-        fish = metrics.half_fisher_trace(out.sigma, diagonal=_diag, eps=cfg.eps).float()
+        fish = metrics.half_fisher_trace(
+            out.sigma,
+            diagonal=_diag,
+            eps=cfg.eps,
+            family=cfg.family,
+        ).float()
         d["fisher_trace_mean"]   = float(fish.mean())
         d["fisher_trace_median"] = float(fish.median())
 
@@ -3533,10 +3557,14 @@ class VFEModel(nn.Module):
             rec["gauge_invariant_spread"].append(
                 float(active_invariant.std(unbiased=False)))
             _diag = belief.sigma.dim() == belief.mu.dim()
-            spec = belief.sigma if _diag else torch.linalg.eigvalsh(belief.sigma)
-            rec["effective_rank"].append(float(metrics.effective_rank(spec).mean()))
             rec["attn_entropy"].append(float(metrics.attention_entropy(beta)))
-            bs = metrics.belief_spectrum(belief.sigma, diagonal=_diag, eps=cfg.eps)
+            bs = metrics.belief_spectrum(
+                belief.sigma,
+                diagonal=_diag,
+                eps=cfg.eps,
+                family=cfg.family,
+            )
+            rec["effective_rank"].append(float(bs["effective_rank"].mean()))
             rec["belief_cond_median"].append(float(bs["condition"].float().median()))
             # Coordinate-chart diagnostic only: under omega_direct phi is intentionally inactive.
             rec["phi_norm_mean"].append(float(torch.linalg.norm(belief.phi, dim=-1).mean()))

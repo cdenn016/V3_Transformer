@@ -77,6 +77,7 @@ class DiagonalGaussian(BeliefParams):
     """
 
     cov_kind = "diagonal"
+    dispersion_is_covariance = True
 
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
         self.mu = mu
@@ -97,6 +98,51 @@ class DiagonalGaussian(BeliefParams):
             torch.stack([p.mu for p in parts], dim=dim),
             torch.stack([p.sigma for p in parts], dim=dim),
         )
+
+    @classmethod
+    def covariance_diagonal(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K) coordinate variances
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        return dispersion
+
+    @classmethod
+    def mean_fisher_precision(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K) coordinate variances
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        return dispersion.clamp(min=eps).reciprocal()
+
+    @classmethod
+    def trust_region_scale(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K) coordinate variances
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        return dispersion.clamp(min=eps).sqrt()
+
+    @classmethod
+    def mix_dispersion(
+        cls,
+        dispersion: torch.Tensor,                    # (..., n, d) independent variances
+        mixing:    torch.Tensor,                     # (m, n) component mixer
+    ) -> torch.Tensor:
+        return torch.einsum("mn,...nd->...md", mixing.square(), dispersion)
+
+    @classmethod
+    def diagnostic_labels(cls) -> dict[str, str]:
+        return {
+            "dispersion":          "Gaussian variance",
+            "covariance_spectrum": "covariance variance",
+        }
 
     def natural(self) -> Tuple[torch.Tensor, torch.Tensor]:
         s = self.sigma.clamp(min=1e-12)
@@ -262,6 +308,7 @@ class FullGaussian(BeliefParams):
     """
 
     cov_kind = "full"
+    dispersion_is_covariance = True
 
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
         self.mu = mu
@@ -282,6 +329,58 @@ class FullGaussian(BeliefParams):
             torch.stack([p.mu for p in parts], dim=dim),
             torch.stack([p.sigma for p in parts], dim=dim),
         )
+
+    @classmethod
+    def covariance_diagonal(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K, K) covariance
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        return torch.diagonal(dispersion, dim1=-2, dim2=-1)
+
+    @classmethod
+    def mean_fisher_precision(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K, K) covariance
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        symmetric = 0.5 * (dispersion + dispersion.transpose(-1, -2))
+        eye = torch.eye(
+            dispersion.shape[-1],
+            device=dispersion.device,
+            dtype=dispersion.dtype,
+        )
+        return torch.linalg.inv(symmetric + eps * eye)
+
+    @classmethod
+    def trust_region_scale(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K, K) covariance
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        factor, _ = safe_cholesky(dispersion, eps=eps, rounds=0)
+        return factor
+
+    @classmethod
+    def mix_dispersion(
+        cls,
+        dispersion: torch.Tensor,                    # (..., K, K) covariance
+        mixing:    torch.Tensor,                     # (K, K) dense linear map
+    ) -> torch.Tensor:
+        return mixing @ dispersion @ mixing.transpose(-1, -2)
+
+    @classmethod
+    def diagnostic_labels(cls) -> dict[str, str]:
+        return {
+            "dispersion":          "Gaussian covariance",
+            "covariance_spectrum": "covariance eigenvalue",
+        }
 
     def natural(self) -> Tuple[torch.Tensor, torch.Tensor]:
         # Ridge the covariance before inverting to the precision (the natural parameter); the

@@ -112,6 +112,7 @@ def apply_mu_trust_region(
     mode:        str   = "box",
     is_diagonal: bool  = True,
     eps:         float = 1e-8,
+    family:      Optional[str] = None,
 ) -> torch.Tensor:                       # (..., K) clamped step, same shape/dtype as delta_mu
     r"""Whitened E-step mean trust region.
 
@@ -130,9 +131,14 @@ def apply_mu_trust_region(
     """
     if mode not in ("box", "ball"):
         raise ValueError(f"apply_mu_trust_region mode={mode!r}; expected 'box' or 'ball'.")
+    # Local import breaks numerics -> families.gaussian -> numerics during a fresh import.
+    from vfe3.families.base import get_family
+    family_cls = get_family(
+        family or ("gaussian_diagonal" if is_diagonal else "gaussian_full")
+    )
 
     if is_diagonal:
-        scale = sigma_q.clamp(min=eps).sqrt()
+        scale = family_cls.trust_region_scale(sigma_q, eps=eps)
         whitened = delta_mu / scale
         if mode == "ball":
             norm2 = whitened.norm(dim=-1, keepdim=True)
@@ -156,7 +162,7 @@ def apply_mu_trust_region(
     if bool(ok.all()):
         return full_out
 
-    sigma_diag = sigma_q.diagonal(dim1=-2, dim2=-1)
+    sigma_diag = family_cls.covariance_diagonal(sigma_q, eps=eps)
     scale = sigma_diag.clamp(min=eps).sqrt()
     fallback_white = delta_mu / scale
     if mode == "ball":

@@ -847,8 +847,8 @@ class VFE3Config:
         # numerics
         if self.eps <= 0.0:
             raise ValueError(f"eps must be positive, got {self.eps}")
-        if self.kl_max <= 0.0:
-            raise ValueError(f"kl_max must be positive, got {self.kl_max}")
+        if not (math.isfinite(self.kl_max) and self.kl_max > 0.0):
+            raise ValueError(f"kl_max must be finite and positive, got {self.kl_max}")
         if not (math.isfinite(self.rope_base) and self.rope_base > 0.0):
             raise ValueError(f"rope_base must be finite and positive, got {self.rope_base}")
         if not (math.isfinite(self.alibi_slope) and self.alibi_slope >= 0.0):
@@ -969,8 +969,10 @@ class VFE3Config:
         # local import avoids a config <- divergence <- families import cycle.
         from vfe3.divergence import divergence_functionals
         _require(self.divergence_family, divergence_functionals(), "divergence_family")
-        if self.renyi_order <= 0.0:
-            raise ValueError(f"renyi_order must be positive, got {self.renyi_order}")
+        if not (math.isfinite(self.renyi_order) and self.renyi_order > 0.0):
+            raise ValueError(
+                f"renyi_order must be finite and positive, got {self.renyi_order}"
+            )
 
         # model structure
         for name in ("vocab_size", "embed_dim", "max_seq_len", "n_heads"):
@@ -2722,6 +2724,38 @@ class VFE3Config:
         """
         from vfe3.divergence import family_cov_kind
         return family_cov_kind(self.family) == "diagonal"
+
+    @property
+    def head_mixer_gauge_compatible(self) -> bool:
+        r"""Whether the selected mixer route is an intertwiner for the selected gauge action.
+
+        ``block_glk`` assigns an independent frame to each head, so a trainable cross-head mixer
+        is not in that action's commutant. Tied/isotypic mixing is exact for full covariance;
+        diagonal dispersion projection is exact only for diagonal gauges. This is metadata only:
+        the established opt-in ``block_glk`` baseline remains selectable and the default remains
+        mixer-off.
+        """
+        compatibility = VFE3Config.head_mixer_compatibility.fget(self)
+        return compatibility in (
+            "disabled",
+            "tied_intertwiner",
+            "isotypic_intertwiner",
+        )
+
+    @property
+    def head_mixer_compatibility(self) -> str:
+        r"""Truthful label for artifact/config reporting of the selected mixer route."""
+        if not self.use_head_mixer:
+            return "disabled"
+        if self.gauge_group == "block_glk":
+            return "independent_head_nonintertwiner"
+        from vfe3.divergence import family_cov_kind
+        if family_cov_kind(self.family) == "diagonal":
+            prefix = "tied" if self.gauge_group == "tied_block_glk" else "isotypic"
+            return f"{prefix}_diagonal_projection_nonintertwiner"
+        if self.gauge_group == "tied_block_glk":
+            return "tied_intertwiner"
+        return "isotypic_intertwiner"
 
     @property
     def d_head(self) -> int:

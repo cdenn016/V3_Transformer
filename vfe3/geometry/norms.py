@@ -19,6 +19,7 @@ from typing import Callable, Dict
 import torch
 import torch.nn as nn
 
+from vfe3.families.base import get_family
 from vfe3.numerics import safe_cholesky
 
 _NORMS: Dict[str, Callable] = {}
@@ -63,13 +64,15 @@ class MahalanobisNorm:
 
     def __init__(
         self,
-        K:   int,
+        K: int,
 
         *,
-        eps: float = 1e-6,
+        family: str   = "gaussian_diagonal",
+        eps:    float = 1e-6,
     ) -> None:
         self.K = K
         self.eps = eps
+        self.family = get_family(family)
 
     def __call__(
         self,
@@ -103,7 +106,8 @@ class MahalanobisNorm:
                 sig_inv_mu = torch.where(ok.unsqueeze(-1), exact, fallback)
             s2 = (mu64 * sig_inv_mu).sum(dim=-1, keepdim=True).to(mu.dtype)
         else:                                   # diagonal variances (..., K)
-            s2 = (mu ** 2 / sigma.clamp(min=self.eps)).sum(dim=-1, keepdim=True)
+            precision = self.family.mean_fisher_precision(sigma, eps=self.eps)
+            s2 = (mu ** 2 * precision).sum(dim=-1, keepdim=True)
         return mu * torch.sqrt(self.K / s2.clamp(min=self.eps))
 
 
@@ -216,9 +220,16 @@ def _norm_none(K: int, **kwargs) -> Callable[[torch.Tensor, torch.Tensor], torch
 
 
 @register_norm("mahalanobis")
-def _norm_mahalanobis(K: int, *, eps: float = 1e-6, **kwargs) -> MahalanobisNorm:
+def _norm_mahalanobis(
+    K: int,
+
+    *,
+    family: str   = "gaussian_diagonal",
+    eps:    float = 1e-6,
+    **kwargs,
+) -> MahalanobisNorm:
     """MahalanobisNorm builder."""
-    return MahalanobisNorm(K, eps=eps)
+    return MahalanobisNorm(K, family=family, eps=eps)
 
 
 @register_norm("layernorm")
