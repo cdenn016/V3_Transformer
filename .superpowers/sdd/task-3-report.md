@@ -60,3 +60,57 @@ The parsed JUnit attributes were `tests=508`, `failures=0`, `errors=0`, `skipped
 A separate read-only review challenged the family mathematics, Gaussian compatibility, full-covariance behavior, identity certificate, gauge metadata, diagnostics, and import order. Its four concrete findings were corrected: the fresh-process circular import, stale identity state after deep copy, remaining family-blind published diagnostics, and eager full-covariance Fisher inversion during spectrum-only diagnostics. No additional family abstraction was added beyond the hooks required by the task brief.
 
 The intended commit contains the family implementations, their existing consumers, artifact/report propagation required for truthful diagnostics, the focused regression module, and this report. Shared untracked briefs, progress files, the daily ledger, and other agents' reports remain unmodified and unstaged.
+
+## Review correction: covariance floors, Fisher labels, and Gaussian arithmetic
+
+A post-commit review found three remaining defects. First, `belief_spectrum` used the stored-dispersion `eps` as a covariance-eigenvalue floor. For Laplace scale, the family covariance floor is `2*eps**2`; the condition denominator must use that value, while the effective-rank denominator floor has squared covariance units. Second, publication figures still described every half mean-Fisher trace as `tr(Sigma^-1)/2`, which is false for Laplace. Third, `MahalanobisNorm` multiplied by a precomputed Gaussian reciprocal, changing fp32 rounding relative to the prior direct operation `mu**2 / sigma`.
+
+The new near-floor regression failed as follows before production edits:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_2026_07_15_family_remediation.py::test_laplace_near_floor_spectrum_uses_covariance_units --tb=short
+E   assert 7.999999979801942e-06 == 4.0
+1 failed in 0.31s
+```
+
+The figure-label and artifact-wiring probes failed independently:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_2026_07_15_family_remediation.py::test_laplace_fisher_figure_labels_name_scale_precision --tb=short
+E   TypeError: plot_geometry_health() got an unexpected keyword argument 'family'
+1 failed in 0.33s
+
+python -m pytest -p no:cacheprovider tests/test_2026_07_15_family_remediation.py::test_run_artifact_fisher_dashboards_receive_family --tb=short
+E   AssertionError: assert {'geometry': None, 'validation': None} == {'geometry': 'laplace_diagonal', 'validation': 'laplace_diagonal'}
+1 failed in 1.28s
+```
+
+The Gaussian fp32 compatibility probe used nontrivial seven-coordinate values for which division and reciprocal multiplication differ by two ULPs in the accumulated quadratic (`58962.98828125` versus `58962.98046875`). It failed before the fix:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_2026_07_15_family_remediation.py::test_gaussian_mahalanobis_preserves_division_arithmetic_order --tb=short
+E   assert False
+E    +  where False = torch.equal(actual, expected)
+1 failed in 0.09s
+```
+
+The repair adds a family-owned covariance floor, uses its square for effective-rank stabilization, and propagates configured `eps` through model registry metrics, extraction, spectrum plots, and ellipse plots. At `b=[1e-6, 2e-6]`, the reported covariance spectrum is `[8e-12, 2e-12]`, the condition number is `4`, and effective rank is `100/68`, approximately `1.470588`. Fisher labels now come from family diagnostics: Laplace reports `0.5 sum_k b_k^-2`, Gaussian diagonal reports `0.5 sum_k sigma_k^-1`, and Gaussian full reports `tr(Sigma^-1)/2`. When family metadata is unavailable, figures use the truthful family-neutral expression `tr(I_mu)/2`. `RunArtifacts` passes the configured family to both Fisher dashboards. Finally, the family-owned Fisher quadratic preserves direct Gaussian division and uses direct division by `b**2` for Laplace.
+
+The final focused machine-readable run was:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_2026_07_15_family_remediation.py --junitxml=.superpowers\sdd\task-3-review-focused.xml
+.........................                                                [100%]
+25 passed in 1.25s
+```
+
+Its parsed JUnit attributes were `tests=25`, `failures=0`, `errors=0`, `skipped=0`, and `time=1.256`.
+
+The directly affected family, norm, metrics, model, extraction, figure, report, and artifact neighbor gate was:
+
+```text
+python -m pytest -p no:cacheprovider tests/test_families.py tests/test_laplace_family.py tests/test_norms.py tests/test_metrics.py tests/test_experiment_metrics.py tests/test_model.py tests/test_extract.py tests/test_model_channel_diagnostics_2026_06_13.py tests/test_run_artifacts.py tests/test_report.py tests/test_figures_tail.py tests/test_reporting_additions.py tests/test_audit_contract_types_20260711.py tests/test_diagnostics.py --junitxml=.superpowers\sdd\task-3-review-neighbor.xml
+296 passed, 13 skipped, 18 warnings in 45.41s
+```
+
+Its parsed JUnit attributes were `tests=309`, `failures=0`, `errors=0`, `skipped=13`, and `time=45.408`. The warnings are expected warnings exercised by existing neighboring configuration tests. The XML files were read for these counts and removed before commit.

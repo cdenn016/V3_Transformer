@@ -110,6 +110,10 @@ class DiagonalGaussian(BeliefParams):
         return dispersion
 
     @classmethod
+    def covariance_floor(cls, eps: float) -> float:
+        return eps
+
+    @classmethod
     def mean_fisher_precision(
         cls,
         dispersion: torch.Tensor,                    # (..., K) coordinate variances
@@ -118,6 +122,17 @@ class DiagonalGaussian(BeliefParams):
         eps:        float = 1e-12,
     ) -> torch.Tensor:
         return dispersion.clamp(min=eps).reciprocal()
+
+    @classmethod
+    def mean_fisher_quadratic(
+        cls,
+        mu:         torch.Tensor,                    # (..., K) mean coordinates
+        dispersion: torch.Tensor,                    # (..., K) coordinate variances
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        return mu ** 2 / dispersion.clamp(min=eps)
 
     @classmethod
     def trust_region_scale(
@@ -140,8 +155,9 @@ class DiagonalGaussian(BeliefParams):
     @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:
         return {
-            "dispersion":          "Gaussian variance",
-            "covariance_spectrum": "covariance variance",
+            "dispersion":             "Gaussian variance",
+            "covariance_spectrum":    "covariance variance",
+            "half_mean_fisher_trace": r"Half Fisher trace $\frac{1}{2}\sum_k \sigma_k^{-1}$",
         }
 
     def natural(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -341,6 +357,10 @@ class FullGaussian(BeliefParams):
         return torch.diagonal(dispersion, dim1=-2, dim2=-1)
 
     @classmethod
+    def covariance_floor(cls, eps: float) -> float:
+        return eps
+
+    @classmethod
     def mean_fisher_precision(
         cls,
         dispersion: torch.Tensor,                    # (..., K, K) covariance
@@ -378,8 +398,9 @@ class FullGaussian(BeliefParams):
     @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:
         return {
-            "dispersion":          "Gaussian covariance",
-            "covariance_spectrum": "covariance eigenvalue",
+            "dispersion":             "Gaussian covariance",
+            "covariance_spectrum":    "covariance eigenvalue",
+            "half_mean_fisher_trace": r"Half Fisher trace $\mathrm{tr}(\Sigma^{-1})/2$",
         }
 
     def natural(self) -> Tuple[torch.Tensor, torch.Tensor]:

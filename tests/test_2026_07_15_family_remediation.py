@@ -1,7 +1,9 @@
 """Regressions for the second-panel family/mixer remediation (S2-I1--I6, T2, C1)."""
 
 import copy
+import logging
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -96,6 +98,36 @@ def test_laplace_mahalanobis_norm_uses_mean_fisher_precision() -> None:
     assert torch.equal(actual, expected)
 
 
+def test_gaussian_mahalanobis_preserves_division_arithmetic_order() -> None:
+    mean = torch.tensor([[
+        -8.92149829864502,
+        5.149660110473633,
+        -7.426316738128662,
+        -0.3939628601074219,
+        -5.77911376953125,
+        0.2099761962890625,
+        9.311418533325195,
+    ]])
+    variance = torch.tensor([[
+        950.94677734375,
+        0.0007257265388034284,
+        0.00260880496352911,
+        0.07082255184650421,
+        120.90992736816406,
+        57.44921875,
+        0.06778386980295181,
+    ]])
+    direct_s2 = ((mean ** 2) / variance).sum(dim=-1, keepdim=True)
+    reciprocal_s2 = ((mean ** 2) * variance.reciprocal()).sum(dim=-1, keepdim=True)
+    expected = mean * torch.sqrt(7.0 / direct_s2)
+    reciprocal_result = mean * torch.sqrt(7.0 / reciprocal_s2)
+
+    actual = MahalanobisNorm(7)(mean, variance)
+
+    assert not torch.equal(expected, reciprocal_result)
+    assert torch.equal(actual, expected)
+
+
 def test_laplace_trust_region_whitens_by_scale_b() -> None:
     actual = apply_mu_trust_region(
         torch.tensor([[30.0]]),
@@ -147,6 +179,116 @@ def test_laplace_metrics_use_family_fisher_and_covariance_statistics() -> None:
     assert spectrum["dispersion_label"] == "Laplace scale b"
     assert spectrum["spectrum_label"] == "marginal covariance variance"
     assert registered_rank == pytest.approx(float((26.0**2) / (18.0**2 + 8.0**2)))
+
+
+def test_laplace_near_floor_spectrum_uses_covariance_units() -> None:
+    from vfe3.viz import figures
+
+    scale = torch.tensor([[1e-6, 2e-6]])
+    spectrum = metrics.belief_spectrum(
+        scale,
+        eps=1e-6,
+        family="laplace_diagonal",
+    )
+    per_token_rank = metrics.effective_rank_per_token(
+        scale,
+        eps=1e-6,
+        family="laplace_diagonal",
+    )
+
+    assert torch.allclose(
+        spectrum["eigenvalues"],
+        torch.tensor([[8e-12, 2e-12]]),
+        rtol=1e-6,
+        atol=0.0,
+    )
+    assert spectrum["condition"].item() == pytest.approx(4.0)
+    assert spectrum["effective_rank"].item() == pytest.approx(100.0 / 68.0)
+    assert per_token_rank.item() == pytest.approx(100.0 / 68.0)
+
+    figure = figures.plot_belief_spectrum(
+        scale,
+        eps=1e-6,
+        family="laplace_diagonal",
+    )
+    try:
+        floor_line = figure.axes[1].lines[1]
+        assert floor_line.get_ydata()[0] == pytest.approx(2e-12)
+    finally:
+        figures.plt.close(figure)
+
+
+def test_laplace_fisher_figure_labels_name_scale_precision() -> None:
+    from vfe3.viz import figures
+
+    geometry = figures.plot_geometry_health(
+        {"step": [0, 1], "fisher_trace_mean": [2.0, 1.0]},
+        family="laplace_diagonal",
+    )
+    validation = figures.plot_validation_sanity(
+        {"step": [0, 1], "val_fisher_trace_mean": [2.0, 1.0]},
+        family="laplace_diagonal",
+    )
+    try:
+        for dashboard in (geometry, validation):
+            text = " ".join(
+                [axis.get_ylabel() for axis in dashboard.axes]
+                + [
+                    item.get_text()
+                    for axis in dashboard.axes
+                    if axis.get_legend() is not None
+                    for item in axis.get_legend().texts
+                ]
+            )
+            assert r"b_k^{-2}" in text
+            assert r"\Sigma^{-1}" not in text
+    finally:
+        figures.plt.close(geometry)
+        figures.plt.close(validation)
+
+    publication_label = figures.pub_label(
+        "fisher_trace_mean",
+        family="laplace_diagonal",
+    )
+    assert r"b_k^{-2}" in publication_label
+    assert r"\Sigma^{-1}" not in publication_label
+
+
+def test_run_artifact_fisher_dashboards_receive_family(tmp_path, monkeypatch) -> None:
+    from vfe3.run_artifacts import _save_figures
+    from vfe3.viz import figures
+
+    received = {}
+
+    def _geometry(history, *, family=None, **kwargs):
+        received["geometry"] = family
+        return figures.plt.figure()
+
+    def _validation(history, *, family=None, **kwargs):
+        received["validation"] = family
+        return figures.plt.figure()
+
+    monkeypatch.setattr(figures, "plot_geometry_health", _geometry)
+    monkeypatch.setattr(figures, "plot_validation_sanity", _validation)
+    artifacts = SimpleNamespace(
+        run_dir=tmp_path,
+        history=[{
+            "step": 0,
+            "fisher_trace_mean": 1.0,
+            "val_fisher_trace_mean": 1.0,
+        }],
+        cfg=SimpleNamespace(
+            family="laplace_diagonal",
+            transport_mode="flat",
+        ),
+    )
+
+    _save_figures(artifacts, None, logging.getLogger("task-3-label-wiring"))
+
+    assert received == {
+        "geometry": "laplace_diagonal",
+        "validation": "laplace_diagonal",
+    }
 
 
 def test_laplace_model_diagnostics_use_family_statistics() -> None:

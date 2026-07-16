@@ -96,6 +96,11 @@ class DiagonalLaplace(BeliefParams):
         return 2.0 * dispersion.clamp(min=eps).square()
 
     @classmethod
+    def covariance_floor(cls, eps: float) -> float:
+        r"""Covariance floor ``2 eps^2`` induced by the Laplace scale floor ``eps``."""
+        return 2.0 * eps ** 2
+
+    @classmethod
     def mean_fisher_precision(
         cls,
         dispersion: torch.Tensor,                    # (..., K) Laplace scale b
@@ -105,6 +110,18 @@ class DiagonalLaplace(BeliefParams):
     ) -> torch.Tensor:
         r"""Mean-block Fisher precision ``I_mu = 1 / b^2``."""
         return dispersion.clamp(min=eps).square().reciprocal()
+
+    @classmethod
+    def mean_fisher_quadratic(
+        cls,
+        mu:         torch.Tensor,                    # (..., K) mean coordinates
+        dispersion: torch.Tensor,                    # (..., K) Laplace scale b
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:
+        r"""Mean Fisher quadratic contributions ``mu_k^2 / b_k^2``."""
+        return mu ** 2 / dispersion.clamp(min=eps).square()
 
     @classmethod
     def trust_region_scale(
@@ -130,8 +147,9 @@ class DiagonalLaplace(BeliefParams):
     @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:
         return {
-            "dispersion":          "Laplace scale b",
-            "covariance_spectrum": "marginal covariance variance",
+            "dispersion":             "Laplace scale b",
+            "covariance_spectrum":    "marginal covariance variance",
+            "half_mean_fisher_trace": r"Half Fisher trace $\frac{1}{2}\sum_k b_k^{-2}$",
         }
 
     @classmethod

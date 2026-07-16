@@ -1271,6 +1271,7 @@ def plot_geometry_health(
 
     *,
     transport_mode: str           = "flat",
+    family:         Optional[str] = None,
     path:           Optional[str] = None,
 ):
     r"""Gauge / SPD / Fisher geometry-health dashboard over training.
@@ -1284,6 +1285,7 @@ def plot_geometry_health(
     stays meaningful rather than degenerating to a flat cocycle (phi -> 0, an UNGAUGED transformer) or
     a guard-pinned fixed point. Each panel self-gates on column presence."""
     flat = transport_mode == "flat"
+    fisher_label = pub_label("fisher_trace_mean", family=family)
     panels = [
         {"title": ("Numerical closure of flat transport" if flat else "Holonomy / cocycle curvature"),
          "ylabel": ("numerical closure residual" if flat else "curvature"),
@@ -1326,8 +1328,8 @@ def plot_geometry_health(
             ("eff_rank_p5", "p5", _CB[2]),
             ("eff_rank_median", "median", _CB[0]),
             ("eff_rank_p95", "p95", _CB[4])]},
-        {"title": "Belief precision", "ylabel": r"Half Fisher trace $\langle\mathrm{tr}\,\Sigma^{-1}\rangle/2$",
-         "logy": True, "series": [("fisher_trace_mean", "Half Fisher trace", _CB[3])]},
+        {"title": "Belief precision", "ylabel": fisher_label,
+         "logy": True, "series": [("fisher_trace_mean", fisher_label, _CB[3])]},
         {"title": "Guard saturation", "ylabel": "fraction", "series": [
             ("guard_sigma_floor_frac", r"$\sigma$ floor", _CB[0]),
             ("guard_sigma_ceil_frac", r"$\sigma$ ceil", _CB[1]),
@@ -1387,6 +1389,7 @@ def plot_validation_sanity(
     history: Dict,                       # step + held-out generalization / positional / attention / geometry columns
 
     *,
+    family: Optional[str] = None,
     path:    Optional[str] = None,
 ):
     r"""Held-out validation-sanity dashboard over training.
@@ -1397,6 +1400,7 @@ def plot_validation_sanity(
     masses and head redundancy, and the held-out gauge / SPD / Fisher geometry (the more credible
     counterpart to the train-batch ``geometry_health`` figure). Each panel self-gates on column
     presence; eval-cadence columns draw only on their eval steps."""
+    fisher_label = pub_label("val_fisher_trace_mean", family=family)
     panels = [
         {"title": "Generalization gap", "ylabel": r"$\mathrm{CE}_{\mathrm{val}}-\mathrm{CE}_{\mathrm{train}}$",
          "series": [("generalization_gap", "gap", _CB[0])]},
@@ -1421,8 +1425,8 @@ def plot_validation_sanity(
          "series": [("val_gauge_invariant_spread", "gauge invariant", _CB[3])]},
         {"title": "Held-out conditioning", "ylabel": r"$\kappa(\Sigma)$", "logy": True,
          "series": [("val_belief_cond_p95", "p95", _CB[1])]},
-        {"title": "Held-out precision", "ylabel": r"Half Fisher trace $\langle\mathrm{tr}\,\Sigma^{-1}\rangle/2$",
-         "logy": True, "series": [("val_fisher_trace_mean", "Half Fisher trace", _CB[3])]},
+        {"title": "Held-out precision", "ylabel": fisher_label,
+         "logy": True, "series": [("val_fisher_trace_mean", fisher_label, _CB[3])]},
         {"title": "Held-out guard saturation", "ylabel": "fraction", "series": [
             ("val_guard_sigma_floor_frac", r"$\sigma$ floor", _CB[0]),
             ("val_guard_sigma_ceil_frac", r"$\sigma$ ceil", _CB[1]),
@@ -2705,11 +2709,8 @@ def plot_belief_spectrum(
         import torch
         from vfe3.families.base import get_family
         family_cls = get_family(family)
+        covariance_eps = family_cls.covariance_floor(eps)
         if family_cls.cov_kind == "diagonal":
-            covariance_eps = float(family_cls.covariance_diagonal(
-                torch.tensor([eps]),
-                eps=0.0,
-            )[0])
             if sigma_max is not None:
                 covariance_max = float(family_cls.covariance_diagonal(
                     torch.tensor([sigma_max]),
@@ -2744,6 +2745,7 @@ def plot_spd_ellipses(
     *,
     dims:     tuple = (0, 1),
     diagonal: Optional[bool] = None,
+    eps:      float          = 1e-12,
     family:   Optional[str]  = None,
     path:     Optional[str]  = None,
 ):
@@ -2772,6 +2774,7 @@ def plot_spd_ellipses(
     rank = _np(metrics.effective_rank_per_token(
         sigma,
         diagonal=diagonal,
+        eps=eps,
         family=family,
     ))
     norm = Normalize(vmin=rank.min(), vmax=rank.max() + 1e-12)
@@ -4087,7 +4090,8 @@ PUB_LABELS: Dict[str, str] = {
     "holonomy_deviation": r"holonomy $\langle\|H-I\|_F\rangle$ (frame-dependent)",
     "gauge_trace_spread": r"gauge spread $\mathrm{std}_i\,\log|\det\Omega_i|$",
     "belief_cond_median": r"belief conditioning $\mathrm{med}_i\,\kappa(\Sigma_i)$",
-    "fisher_trace_mean":  r"Half Fisher trace $\langle\mathrm{tr}\,\Sigma^{-1}\rangle/2$",
+    "fisher_trace_mean":  r"Half Fisher trace $\mathrm{tr}(I_\mu)/2$",
+    "val_fisher_trace_mean": r"Half Fisher trace $\mathrm{tr}(I_\mu)/2$",
     "grad_norm":          r"gradient norm $\|\nabla\|_2$",
     # -- losses / headline scalars --
     "train_ce":           "train cross-entropy (nats)",
@@ -4115,7 +4119,7 @@ PUB_LABELS: Dict[str, str] = {
     "phi_norm_mean":           r"gauge-frame norm $\langle\|\phi_i\|\rangle$",
     "belief_cond_p95":         r"belief conditioning $\kappa_{95}(\Sigma)$",
     "eff_rank_median":         r"belief effective rank $\mathrm{med}_i\,\mathrm{erank}(\Sigma_i)$",
-    "fisher_trace_median":     r"Half Fisher trace $\mathrm{med}_i\,\mathrm{tr}\,\Sigma_i^{-1}/2$",
+    "fisher_trace_median":     r"Half Fisher trace $\mathrm{med}_i\mathrm{tr}(I_{\mu,i})/2$",
     "nonfinite_frac":          "non-finite fraction",
     "renyi_band_frac":         "Renyi cancellation-band fraction",
     "attn_entropy_min":        r"min row entropy $\min_{i,h}H(\beta)$",
@@ -4138,11 +4142,23 @@ PUB_LABELS: Dict[str, str] = {
 }
 
 
-def pub_label(name: str) -> str:
+def pub_label(
+    name: str,
+
+    *,
+    family: Optional[str] = None,
+) -> str:
     r"""Publication-quality (mathtext) display label for a raw metric / column / scalar key.
 
-    Returns the :data:`PUB_LABELS` entry, else a humanized fallback (underscores and dots -> spaces)
-    so an unlisted column still renders a readable -- if non-mathematical -- axis."""
+    Returns the family-owned Fisher formula when ``family`` is supplied. Otherwise returns the
+    :data:`PUB_LABELS` entry or a humanized fallback (underscores and dots -> spaces)."""
+    if family is not None and name in {
+        "fisher_trace_mean",
+        "fisher_trace_median",
+        "val_fisher_trace_mean",
+    }:
+        from vfe3.families.base import get_family
+        return get_family(family).diagnostic_labels()["half_mean_fisher_trace"]
     return PUB_LABELS.get(name) or name.replace("_", " ").replace(".", " ")
 
 

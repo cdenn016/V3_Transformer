@@ -2905,6 +2905,7 @@ class VFEModel(nn.Module):
         metric_context = {
             "sigma":                     out.sigma,
             "diagonal":                  _diag,
+            "eps":                       cfg.eps,
             "family":                    cfg.family,
             "self_div":                  self_div,
             "energy":                    energy,

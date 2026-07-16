@@ -334,7 +334,8 @@ def generate_figures(
           cstate is not None)
     _emit("spd_ellipses",
           lambda p: figs.plot_spd_ellipses(
-              cstate["mu"], cstate["sigma"], family=cfg.family, path=p),
+              cstate["mu"], cstate["sigma"], eps=cfg.eps,
+              family=cfg.family, path=p),
           cstate is not None)
     _emit("holonomy_curvature",
           lambda p: figs.plot_holonomy_curvature(

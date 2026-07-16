@@ -106,8 +106,8 @@ class MahalanobisNorm:
                 sig_inv_mu = torch.where(ok.unsqueeze(-1), exact, fallback)
             s2 = (mu64 * sig_inv_mu).sum(dim=-1, keepdim=True).to(mu.dtype)
         else:                                   # diagonal variances (..., K)
-            precision = self.family.mean_fisher_precision(sigma, eps=self.eps)
-            s2 = (mu ** 2 * precision).sum(dim=-1, keepdim=True)
+            quadratic = self.family.mean_fisher_quadratic(mu, sigma, eps=self.eps)
+            s2 = quadratic.sum(dim=-1, keepdim=True)
         return mu * torch.sqrt(self.K / s2.clamp(min=self.eps))
 
 

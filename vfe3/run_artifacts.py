@@ -2169,6 +2169,7 @@ def _save_figures(
             fig = figs.plot_geometry_health(
                 hist_geom,
                 transport_mode=getattr(getattr(artifacts, "cfg", None), "transport_mode", "flat"),
+                family=getattr(getattr(artifacts, "cfg", None), "family", None),
                 path=str(run / "geometry_health.png"),
             )
             figs.plt.close(fig)
@@ -2195,7 +2196,11 @@ def _save_figures(
             "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max", "val_phi_exp_clamp_frac",
             "val_phi_exp_scale_min", "val_vertex_cond_p99"))
         if hist_val:
-            fig = figs.plot_validation_sanity(hist_val, path=str(run / "validation_sanity.png"))
+            fig = figs.plot_validation_sanity(
+                hist_val,
+                family=getattr(getattr(artifacts, "cfg", None), "family", None),
+                path=str(run / "validation_sanity.png"),
+            )
             figs.plt.close(fig)
         # Optimizer information-geometry dashboard: natural-gradient alignment, pullback conditioning,
         # per-role weight norms, and the synthesized update-to-weight ratio. Present only on a gauge

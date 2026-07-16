@@ -476,6 +476,17 @@ def _spectrum(
     return sigma
 
 
+def _covariance_eigenvalue_floor(
+    family: Optional[str],
+    eps:    float,
+) -> float:
+    r"""Covariance-unit floor corresponding to the configured stored-dispersion floor."""
+    if family is None:
+        return eps
+    from vfe3.families.base import get_family
+    return get_family(family).covariance_floor(eps)
+
+
 def effective_rank_per_token(
     sigma:    torch.Tensor,              # (..., K) diagonal OR (..., K, K) full covariance
 
@@ -490,9 +501,11 @@ def effective_rank_per_token(
     keeps the per-token distribution a single-seed run needs for a ridgeline/violin. Full
     covariances are passed through ``eigvalsh`` first.
     """
+    covariance_floor = _covariance_eigenvalue_floor(family, eps)
+    rank_floor = eps if family is None else covariance_floor ** 2
     return effective_rank(
         _spectrum(sigma, diagonal=diagonal, eps=eps, family=family),
-        eps=eps,
+        eps=rank_floor,
     )
 
 
@@ -516,15 +529,17 @@ def belief_spectrum(
     lam_max = lam_desc[..., 0]
     lam_min = lam_desc[..., -1]
     is_positive_definite = lam_min > 0.0
+    covariance_floor = _covariance_eigenvalue_floor(family, eps)
+    rank_floor = eps if family is None else covariance_floor ** 2
     condition = torch.where(
         is_positive_definite,
-        lam_max / lam_min.clamp(min=eps),
+        lam_max / lam_min.clamp(min=covariance_floor),
         torch.full_like(lam_min, float("inf")),
     )
     result: Dict[str, Any] = {
         "eigenvalues":            lam_desc,
         "condition":              condition,
-        "effective_rank":         effective_rank(lam.clamp(min=0.0), eps=eps),
+        "effective_rank":         effective_rank(lam.clamp(min=0.0), eps=rank_floor),
         "is_positive_definite":   is_positive_definite,
     }
     if family is not None:
@@ -1615,6 +1630,7 @@ def _m_eff_rank(
     *,
     sigma:    torch.Tensor,
     diagonal: bool,
+    eps:      float         = 1e-12,
     family:   Optional[str] = None,
     **kw,
 ) -> float:
@@ -1627,11 +1643,12 @@ def _m_eff_rank(
     ``diagonal`` is REQUIRED (no auto-inference): a diagonal (N, K) variance table with N == K is
     square in its last two axes, so shape-based auto-inference would misread it as a full (K, K)
     covariance and eigvalsh a variance vector. The caller passes the explicit flag (audit PB-07)."""
-    return float(effective_rank(_spectrum(
+    return float(effective_rank_per_token(
         sigma,
         diagonal=diagonal,
+        eps=eps,
         family=family,
-    )).mean())
+    ).mean())
 
 
 @register_metric("attention_entropy")

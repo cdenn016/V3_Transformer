@@ -146,6 +146,13 @@ class BeliefParams(ABC):
         )
 
     @classmethod
+    def covariance_floor(cls, eps: float) -> float:
+        r"""Smallest covariance eigenvalue induced by the stored-dispersion floor ``eps``."""
+        raise NotImplementedError(
+            f"{cls.__name__} does not provide covariance_floor"
+        )
+
+    @classmethod
     def mean_fisher_precision(
         cls,
         dispersion: torch.Tensor,                    # (..., K) diagonal or (..., K, K) full parameter
@@ -157,6 +164,22 @@ class BeliefParams(ABC):
         raise NotImplementedError(
             f"{cls.__name__} does not provide mean_fisher_precision"
         )
+
+    @classmethod
+    def mean_fisher_quadratic(
+        cls,
+        mu:         torch.Tensor,                    # (..., K) mean coordinates
+        dispersion: torch.Tensor,                    # (..., K) or (..., K, K) family parameter
+
+        *,
+        eps:        float = 1e-12,
+    ) -> torch.Tensor:                               # (..., K) contributions summing to mu^T I_mu mu
+        r"""Per-coordinate contributions to the mean-block Fisher quadratic."""
+        precision = cls.mean_fisher_precision(dispersion, eps=eps)
+        if cls.cov_kind == "full":
+            precision_mu = (precision @ mu.unsqueeze(-1)).squeeze(-1)
+            return mu * precision_mu
+        return mu ** 2 * precision
 
     @classmethod
     def trust_region_scale(

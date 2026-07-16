@@ -626,6 +626,7 @@ def across_layer_belief_trace(
     eff = metrics.effective_rank_per_token(
         sig_stack,
         diagonal=cfg.diagonal_covariance,
+        eps=cfg.eps,
         family=cfg.family,
     ).mean(dim=-1)                                                        # (L,)
     r_one = metrics.rank_one_residual(mu_stack)                          # (L,) Dong r(X) per layer (F2/EXP-7)
@@ -1022,8 +1023,11 @@ def model_channel_belief(
         "mu_std":     s_mu.std(dim=0).cpu(),                       # (K,)
         "sigma_mean": s_sigma.mean(dim=0).cpu(),                   # (K,)
         "spectrum":   lam.cpu(),                                   # (N, K)
-        "eff_rank":   metrics.effective_rank(
-            statistics["covariance_spectrum"],
+        "eff_rank":   metrics.effective_rank_per_token(
+            s_sigma,
+            diagonal=cfg.diagonal_covariance,
+            eps=cfg.eps,
+            family=cfg.family,
         ).cpu(),                                                     # (N,)
     }
     if not family.dispersion_is_covariance:
