@@ -28,8 +28,10 @@ def read_junit_counts(path: Path) -> Dict[str, int]:
     counts = {field: 0 for field in _COUNT_FIELDS}
     for suite in suites:
         for field in _COUNT_FIELDS:
+            if field not in suite.attrib:
+                raise ValueError(f"JUnit testsuite lacks the {field!r} count")
             try:
-                value = int(suite.attrib.get(field, "0"))
+                value = int(suite.attrib[field])
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"invalid JUnit {field!r} count") from exc
             if value < 0:
