@@ -72,6 +72,15 @@ def _write_full_run(d, *, ppl, seed, metrics=None, per_layer=None, research=None
         (d / "research.json").write_text(json.dumps(research))
 
 
+def _write_request(root, seeds):
+    (root / "multiseed_request.json").write_text(json.dumps({
+        "schema_version": 1,
+        "status": "complete",
+        "seeds": seeds,
+        "cells": [{"seed": seed, "status": "complete"} for seed in seeds],
+    }))
+
+
 def test_resolve_run_root_bare_name_under_vfe3_runs(tmp_path, monkeypatch):
     (tmp_path / "vfe3_runs" / "K=20_GL(10)").mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
@@ -187,6 +196,7 @@ def test_aggregate_scalar_reads_dotted_research_key(tmp_path):
 
 
 def test_aggregate_seed_curves_aligns_and_handles_nan(tmp_path):
+    _write_request(tmp_path, [1, 2])
     _write_full_run(tmp_path / "a", ppl=1.0, seed=1, metrics="step,x,y\n100,1,\n200,3,9\n")
     _write_full_run(tmp_path / "b", ppl=1.0, seed=2, metrics="step,x,y\n100,3,7\n200,5,11\n")
     curves = ms.aggregate_seed_curves(tmp_path, columns=["x", "y"])
@@ -201,6 +211,7 @@ def test_aggregate_seed_curves_aligns_and_handles_nan(tmp_path):
 
 
 def test_aggregate_per_layer(tmp_path):
+    _write_request(tmp_path, [1, 2])
     _write_full_run(tmp_path / "a", ppl=1.0, seed=1, per_layer="layer,self_coupling\n0,10\n")
     _write_full_run(tmp_path / "b", ppl=1.0, seed=2, per_layer="layer,self_coupling\n0,20\n")
     out = ms.aggregate_per_layer(tmp_path)

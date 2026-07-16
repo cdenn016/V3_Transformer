@@ -142,11 +142,48 @@ def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
     """Left-join the declared scaling cells to harvested results and classify every request."""
     path = input_dir / "scaling_design.json"
     raw = _read_json(path)
-    requested = raw.get("cells")
-    if raw.get("schema_version") != 1 or not isinstance(requested, list):
+    if not isinstance(raw, Mapping):
         return {
             "available": False,
-            "complete": None,
+            "complete": False,
+            "status": "unverifiable_design",
+            "cells": [],
+            "counts": {},
+        }
+    requested = raw.get("cells")
+    routes = raw.get("routes")
+    seeds = raw.get("seeds")
+    top_status = raw.get("status")
+    known_statuses = {
+        "pending", "running", "complete", "success", "incomplete", "failed",
+        "missing", "duplicate", "nonfinite", "unreadable",
+    }
+    valid_routes = (
+        isinstance(routes, list)
+        and bool(routes)
+        and all(isinstance(route, str) and bool(route) for route in routes)
+        and len(set(routes)) == len(routes)
+    )
+    valid_seeds = (
+        isinstance(seeds, list)
+        and bool(seeds)
+        and all(isinstance(seed, int) and not isinstance(seed, bool) for seed in seeds)
+        and len(set(seeds)) == len(seeds)
+    )
+    valid_header = (
+        path.is_file()
+        and raw.get("schema_version") == 1
+        and valid_routes
+        and valid_seeds
+        and isinstance(top_status, str)
+        and top_status in known_statuses
+        and isinstance(requested, list)
+        and bool(requested)
+    )
+    if not valid_header:
+        return {
+            "available": False,
+            "complete": False,
             "status": "unverifiable_design",
             "cells": [],
             "counts": {},
@@ -162,20 +199,48 @@ def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
 
     cells: List[Dict[str, Any]] = []
     counts: Dict[str, int] = {}
+    requested_keys: set[Tuple[str, str, int]] = set()
+    route_labels: set[Tuple[str, str]] = set()
+    schema_valid = True
     for item in requested:
         if not isinstance(item, Mapping):
             cell = {"status": "unreadable", "error": "design cell is not a mapping"}
+            schema_valid = False
         else:
             cell = dict(item)
-            try:
-                key = (str(cell["route"]), str(cell["label"]), int(cell["seed"]))
-            except (KeyError, TypeError, ValueError):
+            route = cell.get("route")
+            label = cell.get("label")
+            seed = cell.get("seed")
+            declared = cell.get("status")
+            if (
+                not isinstance(route, str)
+                or not route
+                or route not in routes
+                or not isinstance(label, str)
+                or not label
+                or not isinstance(seed, int)
+                or isinstance(seed, bool)
+                or seed not in seeds
+                or not isinstance(declared, str)
+                or declared not in known_statuses
+            ):
                 cell["status"] = "unreadable"
-                cell["error"] = "design cell lacks a valid route, label, or seed"
+                cell["error"] = "design cell lacks a valid route, label, seed, or status"
+                schema_valid = False
             else:
+                key = (route, label, seed)
+                route_labels.add((route, label))
+                duplicate_request = key in requested_keys
+                if duplicate_request:
+                    cell["status"] = "duplicate"
+                    cell["error"] = "design declares the same route, label, and seed more than once"
+                    schema_valid = False
+                else:
+                    requested_keys.add(key)
                 matches = observed.get(key, [])
-                declared = str(cell.get("status", "pending"))
-                if declared in {"failed", "nonfinite", "unreadable"}:
+                if duplicate_request:
+                    pass
+                elif declared not in {"complete", "success"}:
                     cell["status"] = declared
                 elif len(matches) > 1:
                     cell["status"] = "duplicate"
@@ -189,11 +254,28 @@ def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
         status = str(cell.get("status", "unreadable"))
         counts[status] = counts.get(status, 0) + 1
         cells.append(cell)
-    complete = bool(cells) and counts.get("complete", 0) == len(cells)
+
+    expected_keys = {
+        (route, label, seed)
+        for route, label in route_labels
+        for seed in seeds
+    }
+    schema_valid = (
+        schema_valid
+        and {route for route, _label in route_labels} == set(routes)
+        and requested_keys == expected_keys
+    )
+    complete = (
+        schema_valid
+        and top_status in {"complete", "success"}
+        and bool(cells)
+        and counts.get("complete", 0) == len(cells)
+    )
     return {
-        "available": True,
+        "available": schema_valid,
         "complete": complete,
-        "status": "complete" if complete else "incomplete",
+        "status": "complete" if complete else "incomplete" if schema_valid else "unverifiable_design",
+        "manifest_status": top_status,
         "cells": cells,
         "counts": counts,
     }
@@ -512,8 +594,26 @@ def analyze() -> None:
     print(f"\nVFE_3.0 scaling analysis\n  input:   {input_dir}\n  runs:    {len(rows)}"
           f"\n  csv:     {input_dir / 'scaling_points.csv'}")
 
-    points = aggregate_points(rows)
-    allow_parameter_fit = design["complete"] is not False
+    allow_parameter_fit = design.get("complete") is True
+    requested_keys = {
+        (cell["route"], cell["label"], int(cell["seed"]))
+        for cell in design.get("cells", [])
+        if cell.get("status") == "complete"
+        and isinstance(cell.get("route"), str)
+        and isinstance(cell.get("label"), str)
+        and isinstance(cell.get("seed"), int)
+        and not isinstance(cell.get("seed"), bool)
+    }
+    eligible_rows: List[Dict[str, Any]] = []
+    if allow_parameter_fit:
+        for row in rows:
+            try:
+                row_key = (str(row["route"]), str(row["label"]), int(row["seed"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if row_key in requested_keys:
+                eligible_rows.append(row)
+    points = aggregate_points(eligible_rows if allow_parameter_fit else rows)
     # PB-07: best_val_ppl-keyed validation points for the two registered supplementary figures --
     # best-effort: aggregate_validation_points keeps its fail-loud ValueError (an explicit-null
     # best_val_ppl beside finite sibling seeds is a data-integrity fault, never silently dropped or
@@ -521,7 +621,7 @@ def analyze() -> None:
     # never abort the legacy test-metric analysis below.
     if allow_parameter_fit:
         try:
-            validation_points: Optional[List[Dict[str, Any]]] = aggregate_validation_points(rows)
+            validation_points: Optional[List[Dict[str, Any]]] = aggregate_validation_points(eligible_rows)
         except Exception as exc:
             logger.warning("validation-point aggregation failed (%s); capacity_scaling/pareto_frontier withheld", exc)
             validation_points = None
@@ -541,7 +641,7 @@ def analyze() -> None:
         for p in fit_param_points
     }
     param_rows = [
-        r for r in rows
+        r for r in eligible_rows
         if (r["route"], r["label"]) in retained_param_cells
         and np.isfinite(_as_float(r.get("test_ce"))) and _as_float(r.get("test_ce")) > 0.0
     ]
@@ -580,7 +680,7 @@ def analyze() -> None:
     }
 
     weights_by_route: Dict[str, np.ndarray] = {}
-    if param_points:
+    if allow_parameter_fit and param_points:
         from vfe3.viz.figures import _scaling_sem_weights
         all_means = np.array([p["ce_mean"] for p in param_points], dtype=float)
         all_sem = np.array([p["ce_sem"] for p in param_points], dtype=float)

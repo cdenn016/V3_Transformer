@@ -512,6 +512,27 @@ def test_seed_aggregate_groups_seeds():
 
 # --------------------------------------------------------------------------- scaling summary report
 
+
+def _record_complete_scaling_cell(root, route, label, seed):
+    path = root / "scaling_design.json"
+    design = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {
+        "schema_version": 1,
+        "routes": [],
+        "seeds": [],
+        "status": "complete",
+        "cells": [],
+    }
+    design["routes"] = sorted(set([*design["routes"], route]))
+    design["seeds"] = sorted(set([*design["seeds"], seed]))
+    design["cells"].append({
+        "route": route,
+        "label": label,
+        "seed": seed,
+        "status": "complete",
+    })
+    path.write_text(json.dumps(design), encoding="utf-8")
+
+
 def _write_scaling_analysis_run(
     root,
     *,
@@ -564,6 +585,7 @@ def _write_scaling_analysis_run(
         "test_data_sha256": test_sha,
         "data_sha256": test_sha,
     }), encoding="utf-8")
+    _record_complete_scaling_cell(root, route, label, seed)
 
 
 def test_all_scaling_tables_and_overlays_share_estimator(tmp_path, monkeypatch):
@@ -901,6 +923,7 @@ def _write_scaling_validation_run(root, *, route, label, embed_dim, n_params, te
         "seed": seed, "git_sha": "git-a", "train_data_sha256": "train-a",
         "val_data_sha256": "val-a", "test_data_sha256": "test-a", "data_sha256": "test-a",
     }), encoding="utf-8")
+    _record_complete_scaling_cell(root, route, label, seed)
 
 
 def _stub_registered_figure(name, cap):

@@ -205,6 +205,27 @@ def test_cell_is_current_rejects_non_object_cell_metadata(tmp_path, malformed):
 # --------------------------------------------------------------------------- PB-07: end-to-end
 # registered scaling figures (capacity_scaling.png / pareto_frontier.png) driven by scaling_analysis
 
+
+def _record_complete_scaling_cell(root, route, label, seed):
+    path = root / "scaling_design.json"
+    design = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {
+        "schema_version": 1,
+        "routes": [],
+        "seeds": [],
+        "status": "complete",
+        "cells": [],
+    }
+    design["routes"] = sorted(set([*design["routes"], route]))
+    design["seeds"] = sorted(set([*design["seeds"], seed]))
+    design["cells"].append({
+        "route": route,
+        "label": label,
+        "seed": seed,
+        "status": "complete",
+    })
+    path.write_text(json.dumps(design), encoding="utf-8")
+
+
 def _write_val_run(root, *, route, scale_knob, label, seed, embed_dim, n_heads, n_layers,
                     n_params, best_val_ppl, wall_time_s):
     run = root / f"{route}_{label}_s{seed}"
@@ -231,6 +252,7 @@ def _write_val_run(root, *, route, scale_knob, label, seed, embed_dim, n_heads, 
         "seed": seed, "git_sha": "git-a", "train_data_sha256": "train-a",
         "val_data_sha256": "val-a", "test_data_sha256": "test-a", "data_sha256": "test-a",
     }), encoding="utf-8")
+    _record_complete_scaling_cell(root, route, label, seed)
 
 
 def test_scaling_analysis_emits_capacity_scaling_and_pareto_frontier_pngs(tmp_path, monkeypatch):

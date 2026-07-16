@@ -193,20 +193,133 @@ def _seed_dirs(root: Path) -> List[Path]:
     return out
 
 
-def _requested_seeds(root: Path, observed: List[int]) -> tuple[List[int], bool]:
+def _request_manifest(root: Path, observed: List[int]) -> Dict[str, Any]:
     request_path = root / "multiseed_request.json"
     request = _read_json(request_path)
     if not request_path.is_file():
-        return sorted(set(observed)), False
+        return {
+            "available": False,
+            "request_verified": False,
+            "requested_seeds": sorted(set(observed)),
+            "manifest_status": "unverifiable",
+            "declared_statuses": {},
+        }
     raw = request.get("seeds")
-    if request.get("schema_version") != 1 or not isinstance(raw, list) or not raw:
-        raise ValueError(f"invalid multi-seed request manifest at {request_path}")
-    if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in raw):
-        raise ValueError(f"multi-seed request seeds must be exact integers at {request_path}")
-    seeds = [int(seed) for seed in raw]
-    if len(set(seeds)) != len(seeds):
-        raise ValueError(f"multi-seed request seeds must be unique at {request_path}")
-    return seeds, True
+    raw_cells = request.get("cells")
+    top_status = request.get("status")
+    known_statuses = {
+        "pending", "running", "complete", "success", "incomplete", "failed",
+        "missing", "duplicate", "nonfinite", "unreadable",
+    }
+    seeds_valid = (
+        isinstance(raw, list)
+        and bool(raw)
+        and all(isinstance(seed, int) and not isinstance(seed, bool) for seed in raw)
+        and len(set(raw)) == len(raw)
+    )
+    seeds = [int(seed) for seed in raw] if seeds_valid else sorted(set(observed))
+    header_valid = (
+        request.get("schema_version") == 1
+        and seeds_valid
+        and isinstance(top_status, str)
+        and top_status in known_statuses
+        and isinstance(raw_cells, list)
+        and bool(raw_cells)
+    )
+    declared: Dict[int, str] = {}
+    cells_valid = header_valid
+    if header_valid:
+        for cell in raw_cells:
+            if not isinstance(cell, dict):
+                cells_valid = False
+                continue
+            seed = cell.get("seed")
+            status = cell.get("status")
+            if (
+                not isinstance(seed, int)
+                or isinstance(seed, bool)
+                or seed not in seeds
+                or seed in declared
+                or not isinstance(status, str)
+                or status not in known_statuses
+            ):
+                cells_valid = False
+                continue
+            declared[seed] = status
+        cells_valid = cells_valid and set(declared) == set(seeds)
+    if not cells_valid:
+        return {
+            "available": True,
+            "request_verified": False,
+            "requested_seeds": seeds,
+            "manifest_status": "unverifiable",
+            "declared_statuses": {},
+        }
+    return {
+        "available": True,
+        "request_verified": True,
+        "requested_seeds": seeds,
+        "manifest_status": top_status,
+        "declared_statuses": declared,
+    }
+
+
+def _requested_seeds(root: Path, observed: List[int]) -> tuple[List[int], bool]:
+    manifest = _request_manifest(root, observed)
+    return manifest["requested_seeds"], manifest["request_verified"]
+
+
+def _requested_seed_design(
+    root: Path,
+
+    *,
+    seed_file: str = "config.json",
+) -> Dict[str, Any]:
+    """Join one invocation-owned seed request to exactly one run directory per requested seed."""
+    run_dirs = _seed_dirs(root)
+    by_seed: Dict[int, List[Path]] = {}
+    for run_dir in run_dirs:
+        seed = _seed_for(run_dir, config_name=seed_file)
+        if seed is not None:
+            by_seed.setdefault(seed, []).append(run_dir)
+    manifest = _request_manifest(root, list(by_seed))
+    requested = manifest["requested_seeds"]
+    cells: List[Dict[str, Any]] = []
+    for seed in requested:
+        matches = by_seed.get(seed, [])
+        if not manifest["request_verified"]:
+            if manifest["available"]:
+                cells.append({"seed": seed, "status": "unreadable", "run_dir": None})
+            elif len(matches) == 1:
+                cells.append({"seed": seed, "status": "complete", "run_dir": str(matches[0])})
+            elif len(matches) > 1:
+                cells.append({"seed": seed, "status": "duplicate", "run_dir": None})
+            else:
+                cells.append({"seed": seed, "status": "missing", "run_dir": None})
+            continue
+        declared = manifest["declared_statuses"][seed]
+        if declared not in {"complete", "success"}:
+            cells.append({"seed": seed, "status": declared, "run_dir": None})
+        elif not matches:
+            cells.append({"seed": seed, "status": "missing", "run_dir": None})
+        elif len(matches) > 1:
+            cells.append({"seed": seed, "status": "duplicate", "run_dir": None})
+        else:
+            cells.append({"seed": seed, "status": "complete", "run_dir": str(matches[0])})
+    complete = (
+        manifest["request_verified"]
+        and manifest["manifest_status"] in {"complete", "success"}
+        and bool(cells)
+        and all(cell["status"] == "complete" for cell in cells)
+    )
+    return {
+        "requested_seeds": requested,
+        "request_verified": manifest["request_verified"],
+        "manifest_status": manifest["manifest_status"],
+        "status": "complete" if complete else "incomplete",
+        "complete": complete,
+        "cells": cells,
+    }
 
 
 def _aggregate_requested_metric(
@@ -217,26 +330,16 @@ def _aggregate_requested_metric(
     sources: tuple,
     seed_file: str = "config.json",
 ) -> Dict[str, Any]:
-    run_dirs = _seed_dirs(root)
-    by_seed: Dict[int, List[Path]] = {}
-    for run_dir in run_dirs:
-        seed = _seed_for(run_dir, config_name=seed_file)
-        if seed is not None:
-            by_seed.setdefault(seed, []).append(run_dir)
-    requested, verified_request = _requested_seeds(root, list(by_seed))
+    design = _requested_seed_design(root, seed_file=seed_file)
     values: List[float] = []
     value_seeds: List[int] = []
     cells: List[Dict[str, Any]] = []
-    for seed in requested:
-        matches = by_seed.get(seed, [])
-        if not matches:
-            cells.append({"seed": seed, "status": "missing", "value": None})
+    for design_cell in design["cells"]:
+        seed = design_cell["seed"]
+        if design_cell["status"] != "complete" or design_cell["run_dir"] is None:
+            cells.append({"seed": seed, "status": design_cell["status"], "value": None})
             continue
-        if len(matches) > 1:
-            cells.append({"seed": seed, "status": "duplicate", "value": None,
-                          "run_dirs": [str(path) for path in matches]})
-            continue
-        run_dir = matches[0]
+        run_dir = Path(design_cell["run_dir"])
         found = False
         invalid = False
         unreadable = False
@@ -269,10 +372,15 @@ def _aggregate_requested_metric(
     out = _summarize(values)
     out.update({
         "seeds": value_seeds,
-        "requested_seeds": requested,
-        "request_verified": verified_request,
+        "requested_seeds": design["requested_seeds"],
+        "request_verified": design["request_verified"],
+        "manifest_status": design["manifest_status"],
         "cells": cells,
-        "complete": bool(cells) and all(cell["status"] == "complete" for cell in cells),
+        "complete": (
+            design["complete"]
+            and bool(cells)
+            and all(cell["status"] == "complete" for cell in cells)
+        ),
     })
     return out
 
@@ -340,18 +448,27 @@ def aggregate_seed_curves(
     only the seeds that reported). ``columns=None`` -> every numeric column except ``x``.
     """
     root = _resolve_run_root(run_root)
+    design = _requested_seed_design(root)
+    if not design["complete"]:
+        return {}
     per_seed = []                                                # list of (steps[np], {col: vals[np]})
     all_cols: set = set()
-    for run_dir in _seed_dirs(root):
+    for cell in design["cells"]:
+        run_dir = Path(cell["run_dir"])
         f = run_dir / filename
-        if not f.exists():
-            continue
-        data = _read_csv_columns(f)
-        if x not in data:
-            continue
+        if not f.is_file():
+            return {}
+        try:
+            data = _read_csv_columns(f)
+        except (OSError, UnicodeError, csv.Error):
+            return {}
+        if x not in data or not data[x]:
+            return {}
         steps = np.array([np.nan if v is None else v for v in data[x]], float)
         keep = np.isfinite(steps)
         steps = steps[keep]
+        if not steps.size:
+            return {}
         cols = {}
         for c, vals in data.items():
             if c == x:
@@ -365,6 +482,9 @@ def aggregate_seed_curves(
     grid = np.unique(np.concatenate([s for s, _ in per_seed]))
     out: Dict[str, Dict[str, np.ndarray]] = {}
     for c in sel:
+        if any(c not in seed_cols or not np.any(np.isfinite(seed_cols[c]))
+               for _steps, seed_cols in per_seed):
+            continue
         stack = []
         for steps, cols in per_seed:
             row = np.full(grid.shape, np.nan)
@@ -387,29 +507,46 @@ def aggregate_per_layer(
     Returns ``{layer: {column: {mean, sd, n, values}}}`` with the ddof=1 SD across seeds.
     """
     root = _resolve_run_root(run_root)
-    acc: Dict[int, Dict[str, List[float]]] = {}
-    for run_dir in _seed_dirs(root):
+    design = _requested_seed_design(root)
+    if not design["complete"]:
+        return {}
+    per_seed: List[Dict[tuple[int, str], float]] = []
+    for cell in design["cells"]:
+        run_dir = Path(cell["run_dir"])
         f = run_dir / filename
-        if not f.exists():
-            continue
-        data = _read_csv_columns(f)
-        if layer_col not in data:
-            continue
+        if not f.is_file():
+            return {}
+        try:
+            data = _read_csv_columns(f)
+        except (OSError, UnicodeError, csv.Error):
+            return {}
+        if layer_col not in data or not data[layer_col]:
+            return {}
+        seed_values: Dict[tuple[int, str], float] = {}
         for i, lay in enumerate(data[layer_col]):
             if lay is None:
-                continue
+                return {}
             L = int(lay)
-            row = acc.setdefault(L, {})
             for c, vals in data.items():
-                if c == layer_col or vals[i] is None:
+                if c == layer_col:
                     continue
-                row.setdefault(c, []).append(vals[i])
+                value = vals[i]
+                if value is None:
+                    return {}
+                seed_values[(L, c)] = value
+        if not seed_values:
+            return {}
+        per_seed.append(seed_values)
+    keys = set(per_seed[0])
+    if any(set(seed_values) != keys for seed_values in per_seed[1:]):
+        return {}
     out: Dict[int, Dict[str, Dict[str, Any]]] = {}
-    for L, cols in acc.items():
-        out[L] = {}
-        for c, vals in cols.items():
-            s = _summarize(vals)
-            out[L][c] = {"mean": s["mean"], "sd": s["sd"], "n": s["n"], "values": vals}
+    for L, c in sorted(keys):
+        vals = [seed_values[(L, c)] for seed_values in per_seed]
+        s = _summarize(vals)
+        out.setdefault(L, {})[c] = {
+            "mean": s["mean"], "sd": s["sd"], "n": s["n"], "values": vals,
+        }
     return out
 
 
@@ -631,28 +768,45 @@ def main() -> None:
               f"(looked for summary.json / provenance.json / config.json)")
         return
     seeds = [_seed_for(d) for d in seed_dirs]
-    requested_seeds, request_verified = _requested_seeds(
-        root, [seed for seed in seeds if seed is not None]
-    )
+    request_design = _requested_seed_design(root)
     print(f"\n=== Multi-seed digest: {root}  ({len(seed_dirs)} seeds: {seeds}) ===\n")
 
-    scalars: Dict[str, Any] = {}
-    print(f"{'metric':<28}{'n':>3}{'mean':>14}{'sd':>13}{'2sd':>12}{'cv%':>9}")
-    print("-" * 79)
-    for k in SCALAR_KEYS:
-        a = aggregate_scalar(root, k)
-        if a["n"] == 0:
-            if a.get("request_verified"):
-                scalars[k] = a
-            continue
-        scalars[k] = a
-        cvpct = 100 * a["cv"] if math.isfinite(a["cv"]) else float("nan")
-        print(f"{k:<28}{a['n']:>3}{a['mean']:>14.4f}{_fnum(a['sd']):>13}"
-              f"{_fnum(a['two_sd']):>12}{_fnum(cvpct, '.3f'):>9}")
-    print(f"\nNOTE: {CAVEAT}\n")
-
+    scalar_candidates = {
+        key: aggregate_scalar(root, key)
+        for key in dict.fromkeys([CONFIG["key"], *SCALAR_KEYS])
+    }
+    headline = scalar_candidates[CONFIG["key"]]
     curves = aggregate_seed_curves(root)
     per_layer = aggregate_per_layer(root)
+    partial_scalars = [
+        key for key, aggregate in scalar_candidates.items()
+        if aggregate["n"] > 0 and not aggregate["complete"]
+    ]
+    publication_complete = (
+        request_design["complete"]
+        and headline["complete"]
+        and not partial_scalars
+        and bool(curves)
+        and bool(per_layer)
+    )
+    if publication_complete:
+        scalars = {
+            key: aggregate for key, aggregate in scalar_candidates.items()
+            if aggregate["n"] > 0 and aggregate["complete"]
+        }
+        print(f"{'metric':<28}{'n':>3}{'mean':>14}{'sd':>13}{'2sd':>12}{'cv%':>9}")
+        print("-" * 79)
+        for key, aggregate in scalars.items():
+            cvpct = 100 * aggregate["cv"] if math.isfinite(aggregate["cv"]) else float("nan")
+            print(f"{key:<28}{aggregate['n']:>3}{aggregate['mean']:>14.4f}"
+                  f"{_fnum(aggregate['sd']):>13}{_fnum(aggregate['two_sd']):>12}"
+                  f"{_fnum(cvpct, '.3f'):>9}")
+    else:
+        scalars = {}
+        curves = {}
+        per_layer = {}
+        print("requested multi-seed design is incomplete; aggregate values and figures withheld")
+    print(f"\nNOTE: {CAVEAT}\n")
 
     manifest = {
         "run_root": str(root),
@@ -662,11 +816,24 @@ def main() -> None:
         "n_seeds": len(seed_dirs),
         "seeds": seeds,
         "design": {
-            "requested_seeds": requested_seeds,
-            "request_verified": request_verified,
-            "complete": all(
-                scalar.get("complete", False) for scalar in scalars.values()
-            ) if scalars else False,
+            "requested_seeds": request_design["requested_seeds"],
+            "request_verified": request_design["request_verified"],
+            "manifest_status": request_design["manifest_status"],
+            "status": "complete" if publication_complete else "incomplete",
+            "complete": publication_complete,
+            "cells": headline["cells"],
+        },
+        "withheld": {
+            "scalars": not publication_complete,
+            "curves": not publication_complete,
+            "per_layer": not publication_complete,
+            "figures": not publication_complete,
+        },
+        "diagnostics": {
+            "headline": headline,
+            "partial_scalars": partial_scalars,
+            "curves_complete": bool(curves),
+            "per_layer_complete": bool(per_layer),
         },
         "caveat": CAVEAT,
         "scalars": scalars,
@@ -681,7 +848,8 @@ def main() -> None:
     for name in ("multiseed_summary.json", "multiseed_summary.csv", "MULTISEED_ANALYSIS.md"):
         print(f"  data    -> {root / name}")
 
-    _emit_figures(root, scalars, curves, per_layer)
+    if publication_complete:
+        _emit_figures(root, scalars, curves, per_layer)
 
 
 if __name__ == "__main__":

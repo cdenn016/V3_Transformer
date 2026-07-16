@@ -169,6 +169,19 @@ def _write_scaling_run(root: Path, label: str, seed: int, n_params: int, test_ce
     }), encoding="utf-8")
 
 
+def _complete_scaling_design() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "routes": ["route"],
+        "seeds": [1],
+        "status": "complete",
+        "cells": [
+            {"route": "route", "label": "small", "seed": 1, "status": "complete"},
+            {"route": "route", "label": "large", "seed": 1, "status": "complete"},
+        ],
+    }
+
+
 def test_scaling_analysis_refuses_survivor_only_fit_for_incomplete_design(tmp_path, monkeypatch):
     _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
     _write_scaling_run(tmp_path, "large", 1, 20, 1.5)
@@ -205,6 +218,93 @@ def test_scaling_analysis_refuses_survivor_only_fit_for_incomplete_design(tmp_pa
     assert figure_inputs == [([], [], None)]
 
 
+@pytest.mark.parametrize(
+    "manifest_case",
+    [
+        "missing",
+        "pending",
+        "running",
+        "incomplete",
+        "failed",
+        "unverifiable",
+        "missing_status",
+        "missing_routes",
+        "missing_seeds",
+        "missing_cells",
+        "missing_cell_status",
+        "missing_cell_route",
+        "missing_cell_label",
+        "missing_cell_seed",
+        "duplicate_cell",
+        "bad_schema",
+    ],
+)
+def test_scaling_analysis_withholds_all_fit_inputs_for_unfinished_or_malformed_manifest(
+    tmp_path, monkeypatch, manifest_case,
+):
+    _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
+    _write_scaling_run(tmp_path, "large", 1, 20, 1.5)
+    manifest = _complete_scaling_design()
+    if manifest_case in {"pending", "running", "incomplete", "failed", "unverifiable"}:
+        manifest["status"] = manifest_case
+    elif manifest_case == "missing_status":
+        manifest.pop("status")
+    elif manifest_case == "missing_routes":
+        manifest.pop("routes")
+    elif manifest_case == "missing_seeds":
+        manifest.pop("seeds")
+    elif manifest_case == "missing_cells":
+        manifest.pop("cells")
+    elif manifest_case.startswith("missing_cell_"):
+        field = manifest_case.removeprefix("missing_cell_")
+        manifest["cells"][0].pop(field)
+    elif manifest_case == "duplicate_cell":
+        manifest["cells"].append(dict(manifest["cells"][0]))
+    elif manifest_case == "bad_schema":
+        manifest["schema_version"] = 2
+    if manifest_case != "missing":
+        (tmp_path / "scaling_design.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    figure_inputs = []
+    monkeypatch.setattr(
+        scaling_analysis,
+        "_make_figures",
+        lambda param, infer, fig_dir, **kwargs: figure_inputs.append(
+            (param, infer, kwargs.get("validation_points"))
+        ),
+    )
+
+    scaling_analysis.analyze()
+
+    summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["design"]["complete"] is False
+    assert summary["n_fitted_param_points"] == 0
+    assert summary["pooled_fit"] is None
+    assert summary["pooled_fit_status"] == "incomplete_design"
+    assert summary["frontier_collapse"]["reason"] == "incomplete_design"
+    assert summary["estep_structural"] is None
+    assert figure_inputs == [([], [], None)]
+
+
+@pytest.mark.parametrize("status", ["complete", "success"])
+def test_scaling_design_accepts_only_explicit_success_terminal_statuses(tmp_path, status):
+    _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
+    manifest = _complete_scaling_design()
+    manifest["status"] = status
+    manifest["cells"] = [manifest["cells"][0]]
+    manifest["cells"][0]["status"] = status
+    (tmp_path / "scaling_design.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    design = scaling_analysis._requested_design(tmp_path, scaling_analysis.harvest(tmp_path))
+
+    assert design["available"] is True
+    assert design["complete"] is True
+    assert design["status"] == "complete"
+
+
 def _write_seed_run(root: Path, seed: int, value: float) -> None:
     run_dir = root / f"run_s{seed}"
     run_dir.mkdir()
@@ -215,11 +315,33 @@ def _write_seed_run(root: Path, seed: int, value: float) -> None:
     (run_dir / "provenance.json").write_text(json.dumps({"seed": seed}), encoding="utf-8")
 
 
-def test_multiseed_analysis_exposes_missing_and_nonfinite_requested_seeds(tmp_path):
-    (tmp_path / "multiseed_request.json").write_text(json.dumps({
+def _write_multiseed_manifest(
+    root: Path,
+    seeds: list[int],
+    *,
+    status: str = "complete",
+    cell_statuses: dict[int, str] | None = None,
+) -> None:
+    statuses = cell_statuses or {seed: "complete" for seed in seeds}
+    (root / "multiseed_request.json").write_text(json.dumps({
         "schema_version": 1,
-        "seeds": [1, 2, 3],
+        "status": status,
+        "seeds": seeds,
+        "cells": [{"seed": seed, "status": statuses[seed]} for seed in seeds],
     }), encoding="utf-8")
+
+
+def _write_seed_artifacts(root: Path, seed: int, value: float) -> None:
+    _write_seed_run(root, seed, value)
+    run_dir = root / f"run_s{seed}"
+    (run_dir / "metrics.csv").write_text("step,x\n1,1.0\n", encoding="utf-8")
+    (run_dir / "metrics_per_layer.csv").write_text(
+        "layer,self_coupling\n0,1.0\n", encoding="utf-8",
+    )
+
+
+def test_multiseed_analysis_exposes_missing_and_nonfinite_requested_seeds(tmp_path):
+    _write_multiseed_manifest(tmp_path, [1, 2, 3])
     _write_seed_run(tmp_path, 1, 10.0)
     _write_seed_run(tmp_path, 2, float("inf"))
 
@@ -254,9 +376,91 @@ def test_multiseed_analysis_exposes_missing_and_nonfinite_requested_seeds(tmp_pa
     assert not (launch_root / "multiseed_request.json").exists()
     assert json.loads((groups[0] / "multiseed_request.json").read_text()) == {
         "schema_version": 1,
+        "status": "complete",
         "seeds": [1, 2, 3],
+        "cells": [
+            {"seed": 1, "status": "complete"},
+            {"seed": 2, "status": "complete"},
+            {"seed": 3, "status": "complete"},
+        ],
     }
     assert calls == [(1, str(groups[0])), (2, str(groups[0])), (3, str(groups[0]))]
+
+
+def test_multiseed_launch_persists_failed_cell_status(tmp_path):
+    launch_root = tmp_path / "launches"
+
+    def fail_second_run(seed, logger, *, run_root=None):
+        del logger, run_root
+        if seed == 2:
+            raise RuntimeError("seed probe")
+
+    with (
+        mock.patch.object(train_vfe3, "RUN_ROOT", str(launch_root)),
+        mock.patch.object(train_vfe3, "NUM_RUNS", 3),
+        mock.patch.object(train_vfe3, "SEEDS", (1, 2, 3)),
+        mock.patch.object(train_vfe3, "_run_once", fail_second_run),
+        pytest.raises(RuntimeError, match="seed probe"),
+    ):
+        train_vfe3.main()
+
+    groups = [path for path in launch_root.iterdir() if path.is_dir()]
+    manifest = json.loads((groups[0] / "multiseed_request.json").read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["cells"] == [
+        {"seed": 1, "status": "complete"},
+        {"seed": 2, "status": "failed", "error": "seed probe"},
+        {"seed": 3, "status": "pending"},
+    ]
+
+
+@pytest.mark.parametrize("failure", ["missing", "failed", "unreadable", "nonfinite"])
+def test_multiseed_withholds_curves_layers_and_main_publication_for_bad_requested_seed(
+    tmp_path, monkeypatch, failure,
+):
+    top_status = "failed" if failure == "failed" else "complete"
+    statuses = {1: "complete", 2: "failed" if failure == "failed" else "complete"}
+    _write_multiseed_manifest(tmp_path, [1, 2], status=top_status, cell_statuses=statuses)
+    _write_seed_artifacts(tmp_path, 1, 10.0)
+    if failure == "failed":
+        _write_seed_artifacts(tmp_path, 2, 11.0)  # stale survivor must not override the manifest
+    elif failure == "unreadable":
+        _write_seed_artifacts(tmp_path, 2, 11.0)
+        run_dir = tmp_path / "run_s2"
+        (run_dir / "summary.json").write_text("{ not json", encoding="utf-8")
+        (run_dir / "metrics.csv").write_text("{ not csv", encoding="utf-8")
+        (run_dir / "metrics_per_layer.csv").write_text("{ not csv", encoding="utf-8")
+    elif failure == "nonfinite":
+        _write_seed_artifacts(tmp_path, 2, float("inf"))
+        run_dir = tmp_path / "run_s2"
+        (run_dir / "metrics.csv").write_text("step,x\n1,inf\n", encoding="utf-8")
+        (run_dir / "metrics_per_layer.csv").write_text(
+            "layer,self_coupling\n0,inf\n", encoding="utf-8",
+        )
+
+    assert multiseed_analysis.aggregate_seed_curves(tmp_path, columns=["x"]) == {}
+    assert multiseed_analysis.aggregate_per_layer(tmp_path) == {}
+
+    emitted = []
+    monkeypatch.setitem(multiseed_analysis.CONFIG, "run_root", str(tmp_path))
+    monkeypatch.setitem(multiseed_analysis.CONFIG, "key", "test_ppl")
+    monkeypatch.setattr(multiseed_analysis, "SCALAR_KEYS", ["test_ppl"])
+    monkeypatch.setattr(multiseed_analysis, "_emit_figures", lambda *args: emitted.append(args))
+
+    multiseed_analysis.main()
+
+    summary = json.loads((tmp_path / "multiseed_summary.json").read_text(encoding="utf-8"))
+    assert summary["design"]["complete"] is False
+    assert summary["scalars"] == {}
+    assert summary["curves_final_step"] == {}
+    assert summary["per_layer"] == {}
+    assert summary["withheld"] == {
+        "scalars": True,
+        "curves": True,
+        "per_layer": True,
+        "figures": True,
+    }
+    assert emitted == []
 
 
 def _controlled_bank() -> dict[str, torch.Tensor]:

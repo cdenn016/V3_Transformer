@@ -67,3 +67,25 @@ The final read-only diff review found that the first multi-seed manifest lived a
 After reserving a unique multi-seed group per invocation and gating all scaling analysis inputs, the same narrow command reported `2 passed in 0.31s`; JUnit recorded `tests=2 failures=0 errors=0 skipped=0 time=0.304`. The final complete focused module then reported `19 passed, 2 warnings in 4.55s`; JUnit recorded `tests=19 failures=0 errors=0 skipped=0 time=4.550`.
 
 These were selected neighboring runs, not the full or slow suite. `git diff --check` passed. A targeted Ruff unused-import check found only the pre-existing unused `coverage_lines` import in `scaling.py`; it was left untouched because Task 6 did not create it and the task requires surgical edits.
+
+## Q3 follow-up review repair
+
+The Q3 follow-up made both analysis paths fail closed against their invocation manifests. `scaling_analysis._requested_design` now requires a readable schema-version-1 manifest, explicit `complete` or `success` top-level status, nonempty unique route and seed declarations, exact typed cell identities, explicit recognized cell statuses, no duplicate cells, complete seed coverage for every declared route-label pair, exactly one harvested result per requested cell, and finite positive test cross-entropy. Missing, pending, running, incomplete, failed, malformed, and unverifiable designs now set `complete=false`; their parameter fits, validation points, frontier test, per-route estimates, inference correlations, fit weights, and figure inputs are empty. A completed design also filters fit inputs to declared cells, so unrelated stale summaries cannot join the analysis.
+
+Multi-seed launch manifests now begin with pending top-level and per-seed states, transition through running, finish as complete after every requested seed returns, and atomically record a failed cell plus error if a run raises. Scalar, curve, and per-layer aggregation use the same requested-seed design join. A declared failed seed overrides stale artifacts; a missing or duplicate requested run, unreadable CSV, or requested seed with no finite curve or per-layer values withholds the corresponding aggregate. `main()` publishes no survivor scalar table, curve summary, per-layer summary, or figures unless the requested design, headline scalar, curve artifacts, and per-layer artifacts are complete. Its JSON output records the incomplete design and explicit withheld flags.
+
+The strict RED command was:
+
+```text
+python -m pytest tests/test_2026_07_15_driver_reliability_remediation.py tests/test_multiseed.py --junitxml=C:\tmp\vfe3-task6-review2-red-20260716.xml
+```
+
+JUnit recorded `tests=62 failures=19 errors=0 skipped=0 time=5.972`; pytest reported `19 failed, 43 passed, 2 warnings in 5.98s`. The failures covered each unfinished or malformed scaling-manifest class, missing launcher status transitions, and survivor curve/per-layer publication for missing, failed, unreadable, and nonfinite requested seeds.
+
+The final named GREEN gate was:
+
+```text
+python -m pytest tests/test_2026_07_15_driver_reliability_remediation.py tests/test_multiseed.py tests/test_reporting_additions.py tests/test_scaling_mup.py --junitxml=C:\tmp\vfe3-task6-review2-green-final-20260716.xml
+```
+
+JUnit recorded `tests=113 failures=0 errors=0 skipped=0 time=12.284`; pytest reported `113 passed, 70 warnings in 12.29s`. The two pre-existing scaling-analysis fixture helpers now create explicit completed request manifests, preserving their positive-fit and figure-publication coverage under the fail-closed contract. The run covered only the focused Task 6 module and the directly affected multiseed and scaling-analysis modules, as requested.

@@ -717,6 +717,8 @@ def main() -> None:
     logger = logging.getLogger("train_vfe3")
     seeds = _resolve_seeds(config, seeds=SEEDS, num_runs=NUM_RUNS)
     run_root = None
+    request_manifest = None
+    request_path = None
     if RUN_ROOT is not None and len(seeds) > 1:
         from datetime import datetime
         from vfe3.run_artifacts import _write_json_atomic
@@ -725,15 +727,33 @@ def main() -> None:
             f"multiseed_{datetime.now().strftime('%Y%m%d-%H%M%S')}",
         )
         run_root = str(group)
-        _write_json_atomic(group / "multiseed_request.json", {
+        request_path = group / "multiseed_request.json"
+        request_manifest = {
             "schema_version": 1,
+            "status": "pending",
             "seeds": seeds,
-        })
+            "cells": [{"seed": seed, "status": "pending"} for seed in seeds],
+        }
+        _write_json_atomic(request_path, request_manifest)
         logger.info("Multi-seed run group: %s", group)
     for i, s in enumerate(seeds):
         if len(seeds) > 1:
             logger.info("\n%s\n# Run %d/%d  (seed=%d)\n%s", "#" * 64, i + 1, len(seeds), int(s), "#" * 64)
-        _run_once(int(s), logger, run_root=run_root)
+        try:
+            _run_once(int(s), logger, run_root=run_root)
+        except Exception as exc:
+            if request_manifest is not None and request_path is not None:
+                request_manifest["status"] = "failed"
+                request_manifest["cells"][i].update({
+                    "status": "failed",
+                    "error": str(exc),
+                })
+                _write_json_atomic(request_path, request_manifest)
+            raise
+        if request_manifest is not None and request_path is not None:
+            request_manifest["cells"][i]["status"] = "complete"
+            request_manifest["status"] = "complete" if i == len(seeds) - 1 else "running"
+            _write_json_atomic(request_path, request_manifest)
 
 
 if __name__ == "__main__":
