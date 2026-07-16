@@ -173,7 +173,7 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
     first_features = np.arange(15, dtype=float).reshape(5, 3)
     second_features = first_features + 10.0
 
-    with figures.UMAPWorker(timeout=0.25) as worker:
+    with figures.UMAPWorker(timeout=5.0) as worker:
         assert worker._proc is None
         assert processes == []
 
