@@ -38,12 +38,13 @@ def test_diagonal_retraction_positive_and_bounded():
     assert (out <= 5.0 + 1e-6).all()
 
 
-def test_full_retraction_stays_spd():
+def test_full_retraction_stays_spd(device: torch.device) -> None:
     g = torch.Generator().manual_seed(1)
     A = torch.randn(3, 4, 4, generator=g)
-    sigma = A @ A.transpose(-1, -2) + torch.eye(4)
+    identity = torch.eye(4)
+    sigma = (A @ A.transpose(-1, -2) + identity).to(device)
     D = torch.randn(3, 4, 4, generator=g)
-    delta = 0.5 * (D + D.transpose(-1, -2))
+    delta = (0.5 * (D + D.transpose(-1, -2))).to(device)
     out = retract_spd_full(sigma, delta)
     assert torch.allclose(out, out.transpose(-1, -2), atol=1e-4)
     assert (torch.linalg.eigvalsh(out) > 0).all()

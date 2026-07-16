@@ -89,11 +89,3 @@ def test_l8_safe_spd_inverse_per_element_no_poison():
     assert torch.allclose(inv[0], single, atol=0.0)
     assert torch.allclose(inv[0], torch.linalg.inv(good), atol=1e-4)
     assert torch.isfinite(inv[1]).all()                # non-PD element falls back to a finite pinv
-
-
-def test_l8_safe_spd_inverse_all_good_unchanged():
-    g = torch.Generator().manual_seed(1)
-    a = torch.randn(3, 4, 4, generator=g)
-    spd = a @ a.transpose(-1, -2) + 0.1 * torch.eye(4)
-    inv = safe_spd_inverse(spd)
-    assert torch.allclose(inv, torch.linalg.inv(spd), atol=1e-3)

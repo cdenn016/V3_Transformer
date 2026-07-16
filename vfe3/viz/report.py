@@ -40,6 +40,56 @@ from vfe3.viz.text import supports_english_linguistic_taxonomies
 
 CONTROLLED_BANK_TOKENS = 16_384
 
+_SINGLE_RUN_FIGURE_INVENTORY = (
+    "estep_convergence.png",
+    "belief_trajectories.png",
+    "belief_category_separation.png",
+    "attention_structure.png",
+    "per_layer_diagnostics.png",
+    "gauge_equivariance.png",
+    "gauge_head_specialization.png",
+    "belief_spectrum.png",
+    "spd_ellipses.png",
+    "holonomy_curvature.png",
+    "numerical_trust.png",
+    "s_channel_refinement.png",
+    "model_channel_belief.png",
+    "hyper_prior_centroid.png",
+    "hyper_prior_coupling.png",
+    "belief_umap_mu.png",
+    "belief_umap_sigma.png",
+    "belief_umap_phi.png",
+    "model_umap_mu.png",
+    "model_umap_sigma.png",
+    "model_umap_phi.png",
+    "vocab_probability_heatmap.png",
+    "vocab_calibration.png",
+    "vocab_confusion.png",
+    "decode_readout.png",
+    "reliability_diagram.png",
+    "sigma_stratified_error.png",
+    "sigma_ce_scatter.png",
+)
+
+_ENGLISH_ONLY_SINGLE_RUN_FIGURES = frozenset({
+    "belief_category_separation.png",
+    "vocab_confusion.png",
+})
+
+
+def plan_single_run_figures(
+    dataset:      str,
+    availability: Mapping[str, bool],
+) -> tuple[str, ...]:
+    """Return available single-run figure filenames in stable publication order."""
+    english_taxonomies = supports_english_linguistic_taxonomies(dataset)
+    return tuple(
+        filename
+        for filename in _SINGLE_RUN_FIGURE_INVENTORY
+        if availability.get(filename.removesuffix(".png"), False)
+        and (english_taxonomies or filename not in _ENGLISH_ONLY_SINGLE_RUN_FIGURES)
+    )
+
 
 @dataclass(frozen=True)
 class ArtifactPublicationResult:
@@ -345,6 +395,49 @@ def generate_figures(
         except Exception as exc:                                  # best-effort, like every figure input
             logger.warning("research.json reliability unreadable (%s); reliability figure skipped", exc)
 
+    model_channels = (("mu", "sigma", "phi")
+                      if mc_bank is not None and "phi" in mc_bank else ("mu", "sigma"))
+    belief_controlled_ready = (
+        not controlled_bank
+        or (bank is not None and bank["token_ids"].shape[0] == max_tokens)
+    )
+    model_controlled_ready = (
+        not controlled_bank
+        or (mc_bank is not None and mc_bank["token_ids"].shape[0] == max_tokens)
+    )
+    availability = {
+        "estep_convergence":          trace is not None,
+        "belief_trajectories":        trace is not None,
+        "belief_category_separation": bank is not None,
+        "attention_structure":        amaps is not None,
+        "per_layer_diagnostics":      per_layer is not None,
+        "gauge_equivariance":         cstate is not None,
+        "gauge_head_specialization":  cstate is not None,
+        "belief_spectrum":            cstate is not None,
+        "spd_ellipses":               cstate is not None,
+        "holonomy_curvature":         cstate is not None,
+        "numerical_trust":            cstate is not None,
+        "s_channel_refinement":       s_channel is not None,
+        "model_channel_belief":       mc_belief is not None,
+        "hyper_prior_centroid":       r_centroid is not None,
+        "hyper_prior_coupling":       h_coupling is not None,
+        "belief_umap_mu":             bank is not None and belief_controlled_ready,
+        "belief_umap_sigma":          bank is not None and belief_controlled_ready,
+        "belief_umap_phi":            bank is not None and belief_controlled_ready,
+        "model_umap_mu":              mc_bank is not None and model_controlled_ready,
+        "model_umap_sigma":           mc_bank is not None and model_controlled_ready,
+        "model_umap_phi":             (mc_bank is not None and model_controlled_ready
+                                       and "phi" in model_channels),
+        "vocab_probability_heatmap":  vstats is not None,
+        "vocab_calibration":          vstats is not None,
+        "vocab_confusion":            vstats is not None and decode is not None,
+        "decode_readout":             readout is not None,
+        "reliability_diagram":        reliability is not None,
+        "sigma_stratified_error":     ce_bank is not None,
+        "sigma_ce_scatter":           ce_bank is not None,
+    }
+    planned_figures = frozenset(plan_single_run_figures(dataset, availability))
+
     written: List[Path] = []
 
     def _emit(name: str, thunk: Callable[[str], object], available: bool) -> None:
@@ -376,28 +469,28 @@ def generate_figures(
 
     _emit("estep_convergence",
           lambda p: figs.plot_estep_convergence(trace, path=p),
-          trace is not None)
+          "estep_convergence.png" in planned_figures)
     _emit("belief_trajectories",
           lambda p: figs.plot_belief_trajectories(trace, layer_trace, path=p),
-          trace is not None)
+          "belief_trajectories.png" in planned_figures)
     _emit("belief_category_separation",
           lambda p: figs.plot_belief_category_separation(bank, decode=decode, path=p),
-          bank is not None and english_linguistic_diagnostics)
+          "belief_category_separation.png" in planned_figures)
     _emit("attention_structure",
           lambda p: figs.plot_attention_structure(amaps, path=p),
-          amaps is not None)
+          "attention_structure.png" in planned_figures)
     # Per-head beta/gamma attention heatmaps are NOT emitted here: training already writes them at
     # every eval_interval (RunArtifacts.save_attention_maps / save_gamma_attention_maps under
     # <run_dir>/attention/), so end-of-training copies in figures/ were redundant.
     _emit("per_layer_diagnostics",                               # the depth axis the aggregates collapse
           lambda p: figs.plot_per_layer_diagnostics(per_layer, path=p),
-          per_layer is not None)
+          "per_layer_diagnostics.png" in planned_figures)
     _emit("gauge_equivariance",
           lambda p: figs.plot_gauge_equivariance(metrics.gauge_equivariance_residual(
               cstate["mu"], cstate["sigma"], cstate["omega"], model.group,
               kappa=cfg.kappa_beta, renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
               diagonal=cfg.diagonal_covariance, divergence_family=cfg.divergence_family), path=p),
-          cstate is not None)
+          "gauge_equivariance.png" in planned_figures)
     _emit("gauge_head_specialization",
           lambda p: figs.plot_gauge_head_specialization(
               metrics.per_head_gauge_invariants(cstate["exp_phi"], model.group.irrep_dims),
@@ -405,54 +498,44 @@ def generate_figures(
               # per-head entropy (amaps[-1]) -- NOT the all-layer mean, which mismatched the depths.
               head_entropy=(metrics.attention_entropy_rows(amaps[-1]).mean(dim=-1) if amaps is not None else None),
               path=p),
-          cstate is not None)
+          "gauge_head_specialization.png" in planned_figures)
     _emit("belief_spectrum",
           lambda p: figs.plot_belief_spectrum(
               cstate["sigma"], eps=cfg.eps, sigma_max=cfg.sigma_max,
               family=cfg.family, path=p),
-          cstate is not None)
+          "belief_spectrum.png" in planned_figures)
     _emit("spd_ellipses",
           lambda p: figs.plot_spd_ellipses(
               cstate["mu"], cstate["sigma"], eps=cfg.eps,
               family=cfg.family, path=p),
-          cstate is not None)
+          "spd_ellipses.png" in planned_figures)
     _emit("holonomy_curvature",
           lambda p: figs.plot_holonomy_curvature(
               metrics.holonomy_deviation_sampled(cstate["omega"]),
               curvature=metrics.curvature_field(cstate["omega"]), path=p),   # Panel C: spatial curvature field
-          cstate is not None)
+          "holonomy_curvature.png" in planned_figures)
     _emit("numerical_trust",
           lambda p: figs.plot_numerical_trust(
               metrics.guard_saturation(cstate["sigma"], cstate["energy"], cstate["self_div"],
                                        eps=cfg.eps, sigma_max=cfg.sigma_max, kl_max=cfg.kl_max),
               health if health is not None else {},
               causal=(metrics.causal_sanity(amaps) if amaps is not None else None), path=p),
-          cstate is not None)
+          "numerical_trust.png" in planned_figures)
     _emit("s_channel_refinement",                                 # only when s_e_step=True (else None)
           lambda p: figs.plot_s_channel_refinement(s_channel, path=p),
-          s_channel is not None)
+          "s_channel_refinement.png" in planned_figures)
     # Model-channel (s / r / h) and gamma_ij figures: present whenever the model channel is active
     # (s table exists); the r/h figures additionally require the centroid r (lambda_h>0 OR s_e_step),
     # so their extractors return None and _emit skips them when r is absent.
     _emit("model_channel_belief",                                 # the s figure
           lambda p: figs.plot_model_channel_belief(mc_belief, path=p),
-          mc_belief is not None)
+          "model_channel_belief.png" in planned_figures)
     _emit("hyper_prior_centroid",                                 # the r figure
           lambda p: figs.plot_hyper_prior_centroid(r_centroid, path=p),
-          r_centroid is not None)
+          "hyper_prior_centroid.png" in planned_figures)
     _emit("hyper_prior_coupling",                                 # the h figure (lambda_h block)
           lambda p: figs.plot_hyper_prior_coupling(h_coupling, path=p),
-          h_coupling is not None)
-    model_channels = (("mu", "sigma", "phi")
-                      if mc_bank is not None and "phi" in mc_bank else ("mu", "sigma"))
-    belief_controlled_ready = (
-        not controlled_bank
-        or (bank is not None and bank["token_ids"].shape[0] == max_tokens)
-    )
-    model_controlled_ready = (
-        not controlled_bank
-        or (mc_bank is not None and mc_bank["token_ids"].shape[0] == max_tokens)
-    )
+          "hyper_prior_coupling.png" in planned_figures)
     if controlled_bank and bank is not None and not belief_controlled_ready:
         logger.warning(
             "controlled belief UMAP skipped: requested %d tokens but loader supplied %d",
@@ -475,7 +558,7 @@ def generate_figures(
                       umap_worker=umap_worker, path=p,
                       sidecar_path=(str(figdir / f"belief_umap_{ch}.json")
                                     if controlled_bank else None)),
-                  bank is not None and belief_controlled_ready)
+                  f"belief_umap_{ch}.png" in planned_figures)
         for ch in model_channels:                                  # phi only for independent phi_tilde
             _emit(f"model_umap_{ch}",
                   lambda p, ch=ch: figs.plot_belief_umap(
@@ -485,34 +568,34 @@ def generate_figures(
                       umap_worker=umap_worker, path=p,
                       sidecar_path=(str(figdir / f"model_umap_{ch}.json")
                                     if controlled_bank else None)),
-                  mc_bank is not None and model_controlled_ready)
+                  f"model_umap_{ch}.png" in planned_figures)
     # Next-token vocabulary-probability figures (single-arm here; the cross-run K70-vs-K120 contrast
     # is the two-arm vocab_comparison_figures driver). vocab_confusion needs the token decoder for its
     # category bucketing; decode_readout is None (skipped) on the use_prior_bank=True KL-decode path.
     _emit("vocab_probability_heatmap",
           lambda p: figs.plot_vocab_probability_heatmap([{**vstats, "label": run_label}], decode=decode, path=p),
-          vstats is not None)
+          "vocab_probability_heatmap.png" in planned_figures)
     _emit("vocab_calibration",
           lambda p: figs.plot_vocab_calibration([{**vstats, "label": run_label}], decode=decode, path=p),
-          vstats is not None)
+          "vocab_calibration.png" in planned_figures)
     _emit("vocab_confusion",
           lambda p: figs.plot_vocab_confusion([{**vstats, "label": run_label}], decode=decode, path=p),
-          vstats is not None and decode is not None and english_linguistic_diagnostics)
+          "vocab_confusion.png" in planned_figures)
     _emit("decode_readout",
           lambda p: figs.plot_decode_readout([{**readout, "label": run_label}], decode=decode, path=p),
-          readout is not None)
+          "decode_readout.png" in planned_figures)
 
     # B1/EXP-3 -- Sigma_q-as-calibrated-uncertainty: the decode-reliability control + the two
     # Sigma_q<->CE figures (stratified error curve, rho scatter) off the belief_ce_bank join.
     _emit("reliability_diagram",
           lambda p: figs.plot_reliability_diagram(reliability, path=p),
-          reliability is not None)
+          "reliability_diagram.png" in planned_figures)
     _emit("sigma_stratified_error",
           lambda p: figs.plot_sigma_stratified_error(ce_bank, path=p),
-          ce_bank is not None)
+          "sigma_stratified_error.png" in planned_figures)
     _emit("sigma_ce_scatter",
           lambda p: figs.plot_sigma_ce_scatter(ce_bank, path=p),
-          ce_bank is not None)
+          "sigma_ce_scatter.png" in planned_figures)
 
     # Per-layer metrics CSV (rows = inference depth): the metrics.csv is final-block-only, so this is
     # the only place the per-layer belief-channel free energy / holonomy / gauge / belief geometry is

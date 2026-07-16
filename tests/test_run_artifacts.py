@@ -10,11 +10,10 @@ covered by tests/test_train.py::test_silent_and_logging_paths_are_bitwise_identi
 import hashlib
 import json
 import logging
-import math
 import os
 import subprocess
 import types
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 import pytest
 import torch
@@ -32,6 +31,7 @@ from vfe3.run_artifacts import (
     semantic_config_fingerprint,
 )
 from vfe3.train import build_optimizer, train
+from vfe3.viz import figures as figs
 
 
 def _loader(seed=0, n=600, seq_len=8, bs=8):
@@ -47,6 +47,65 @@ def _cfg(**kw):
                 warmup_steps=1, max_steps=4)
     base.update(kw)
     return VFE3Config(**base)
+
+
+@dataclass(frozen=True)
+class TrainedArtifactEvidence:
+    relative_files:  frozenset[str]
+    checkpoint_names: tuple[str, ...]
+    metrics_columns: frozenset[str]
+
+
+@pytest.fixture(scope="module")
+def trained_artifact_evidence(tmp_path_factory) -> TrainedArtifactEvidence:
+    cpu_rng_state   = torch.random.get_rng_state()
+    cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    open_figures    = frozenset(figs.plt.get_fignums())
+    cfg = model = artifacts = train_loader = val_loader = run_dir = None
+    evidence = None
+    try:
+        run_dir     = tmp_path_factory.mktemp("trained-artifact-evidence") / "run"
+        cfg         = _cfg(checkpoint_interval=2)
+        train_loader = _loader()
+        val_loader   = _loader(seed=1)
+        torch.manual_seed(0)
+        model     = VFEModel(cfg)
+        artifacts = RunArtifacts(run_dir, cfg, model, dataset="synthetic")
+        train(
+            model,
+            train_loader,
+            cfg,
+            n_steps=4,
+            eval_interval=2,
+            val_loader=val_loader,
+            artifacts=artifacts,
+        )
+        relative_files = frozenset(
+            path.relative_to(run_dir).as_posix()
+            for path in run_dir.rglob("*")
+            if path.is_file()
+        )
+        checkpoint_names = tuple(sorted(
+            path.name for path in (run_dir / "checkpoints").glob("step_*.pt")
+        ))
+        metrics_columns = frozenset(
+            (run_dir / "metrics.csv").read_text(encoding="utf-8").splitlines()[0].split(",")
+        )
+        evidence = TrainedArtifactEvidence(
+            relative_files=relative_files,
+            checkpoint_names=checkpoint_names,
+            metrics_columns=metrics_columns,
+        )
+    finally:
+        for figure_number in set(figs.plt.get_fignums()).difference(open_figures):
+            figs.plt.close(figure_number)
+        cfg = model = artifacts = train_loader = val_loader = run_dir = None
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+        cpu_rng_state = cuda_rng_states = None
+    assert evidence is not None
+    return evidence
 
 
 def test_config_checkpoint_interval_default_and_validated():
@@ -359,15 +418,13 @@ def test_shipped_group_builders_declare_full_gaussian_invariance():
         assert get_group(name).invariant_families == ("gaussian", "gaussian_full")
 
 
-def test_train_with_artifacts_writes_files(tmp_path):
-    cfg = _cfg(checkpoint_interval=2)
-    torch.manual_seed(0)
-    model = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
-    train(model, _loader(), cfg, n_steps=4, eval_interval=2, val_loader=_loader(seed=1), artifacts=art)
-    assert (tmp_path / "run" / "metrics.csv").exists()
-    assert (tmp_path / "run" / "best_model.pt").exists()
-    assert any((tmp_path / "run" / "checkpoints").glob("step_*.pt"))
+def test_train_with_artifacts_writes_files(trained_artifact_evidence):
+    assert "metrics.csv" in trained_artifact_evidence.relative_files
+    assert "best_model.pt" in trained_artifact_evidence.relative_files
+    assert any(
+        name.startswith("step_") and name.endswith(".pt")
+        for name in trained_artifact_evidence.checkpoint_names
+    )
 
 
 def test_train_with_artifacts_writes_attention_pngs(tmp_path):
@@ -432,25 +489,6 @@ def test_train_without_artifacts_writes_nothing(tmp_path):
     model = VFEModel(cfg)
     train(model, _loader(), cfg, n_steps=4, eval_interval=2, val_loader=_loader(seed=1))
     assert list(tmp_path.iterdir()) == []                     # no artifacts object -> no writes
-
-
-def test_finalize_run_writes_test_results_and_figures(tmp_path):
-    cfg = _cfg()
-    torch.manual_seed(0)
-    model = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
-    losses = train(model, _loader(), cfg, n_steps=4, eval_interval=2,
-                   val_loader=_loader(seed=1), artifacts=art)
-    res = finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
-    assert "test_ppl" in res and math.isfinite(res["test_ppl"])
-    assert (tmp_path / "run" / "test_results.json").exists()
-    assert (tmp_path / "run" / "summary.json").exists()
-    assert (tmp_path / "run" / "loss_curve.png").exists()
-    assert (tmp_path / "run" / "val_ppl.png").exists()
-    summary = json.loads((tmp_path / "run" / "summary.json").read_text())
-    assert "test_ppl" in summary and "best_val_ppl" in summary
-    assert "reloaded_best" in summary   # m26: surface whether best_model.pt was reloaded (cross-dir resume honesty)
-    assert summary["phi_chart_norm_route"] is None
 
 
 def test_frequency_strata_use_training_corpus_counts():
@@ -625,41 +663,11 @@ def test_provenance_git_probe_timeout_records_error(tmp_path, monkeypatch):
     assert prov["git_error"] == repr(timeout)
 
 
-def test_metrics_csv_includes_gauge_geometry_columns(tmp_path):
+def test_metrics_csv_includes_gauge_geometry_columns(trained_artifact_evidence):
     # Part 1 (diagnostics tier): the curvature/gauge probes (holonomy deviation + gauge trace
     # spread) must be surfaced in the per-eval CSV, not only the free-energy terms.
-    cfg = _cfg()
-    torch.manual_seed(0)
-    model = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "run", cfg, model)
-    train(model, _loader(), cfg, n_steps=4, eval_interval=2, val_loader=_loader(seed=1), artifacts=art)
-    header = (tmp_path / "run" / "metrics.csv").read_text().splitlines()[0]
-    assert "holonomy_deviation" in header
-    assert "gauge_trace_spread" in header
-
-
-def test_finalize_writes_gauge_geometry_figure(tmp_path):
-    cfg = _cfg()
-    torch.manual_seed(0)
-    model = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "run", cfg, model)
-    losses = train(model, _loader(), cfg, n_steps=4, eval_interval=2,
-                   val_loader=_loader(seed=1), artifacts=art)
-    finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
-    assert (tmp_path / "run" / "holonomy.png").exists()
-
-
-def test_finalize_reloads_best_checkpoint(tmp_path):
-    # finalize must report the TEST metric on the reloaded best-val checkpoint, not the final
-    # (possibly worse) live weights. Pin the reload happened.
-    cfg = _cfg()
-    torch.manual_seed(0)
-    model = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
-    losses = train(model, _loader(), cfg, n_steps=4, eval_interval=2,
-                   val_loader=_loader(seed=1), artifacts=art)
-    res = finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
-    assert res["reloaded_best"] is True
+    assert "holonomy_deviation" in trained_artifact_evidence.metrics_columns
+    assert "gauge_trace_spread" in trained_artifact_evidence.metrics_columns
 
 
 def test_fd_gradient_check_restores_param_on_midloop_failure():

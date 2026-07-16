@@ -59,6 +59,83 @@ def test_read_junit_counts_sums_testsuites_root(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    ["tests", "failures", "errors", "skipped"],
+)
+def test_read_junit_counts_rejects_missing_required_attributes(
+    tmp_path:      Path,
+    missing_field: str,
+) -> None:
+    attributes = {
+        "tests": "4",
+        "failures": "0",
+        "errors": "0",
+        "skipped": "0",
+    }
+    del attributes[missing_field]
+    serialized = " ".join(f'{name}="{value}"' for name, value in attributes.items())
+    xml_path = tmp_path / f"missing-{missing_field}.xml"
+    xml_path.write_text(f"<testsuite {serialized}/>", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=rf"lacks the '{missing_field}' count"):
+        check_junit.read_junit_counts(xml_path)
+
+
+def test_run_pytest_junit_rejects_incomplete_xml_and_cleans_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_path: Path | None = None
+
+    def _fake_pytest_main(args: list[str]) -> pytest.ExitCode:
+        nonlocal observed_path
+        junit_arg = next(arg for arg in args if str(arg).startswith("--junitxml="))
+        observed_path = Path(str(junit_arg).split("=", 1)[1])
+        observed_path.write_text('<testsuite tests="22"/>', encoding="utf-8")
+        return pytest.ExitCode.OK
+
+    monkeypatch.setattr(pytest, "main", _fake_pytest_main)
+
+    with pytest.raises(ValueError, match="lacks the 'failures' count"):
+        check_junit.run_pytest_junit(["-m", "cuda"], prefix="incomplete-")
+    assert observed_path is not None
+    assert not observed_path.exists()
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {"tests": 0, "passes": 0, "failures": 0, "errors": 0, "skipped": 0},
+        {"tests": 4, "passes": 3, "failures": 1, "errors": 0, "skipped": 0},
+        {"tests": 4, "passes": 3, "failures": 0, "errors": 1, "skipped": 0},
+        {"tests": 4, "passes": 3, "failures": 0, "errors": 0, "skipped": 1},
+        {"tests": 4, "passes": 3, "failures": 0, "errors": 0, "skipped": 0},
+        {"tests": 3, "passes": 3, "failures": 0, "errors": 0, "skipped": 0},
+    ],
+    ids=["zero", "failure", "error", "skip", "inconsistent", "incomplete"],
+)
+def test_cuda_junit_predicate_rejects_incomplete_results(
+    counts: dict[str, int],
+) -> None:
+    predicate = getattr(check_junit, "junit_is_exact_all_pass", None)
+    assert callable(predicate)
+    assert predicate(counts, expected_tests=4) is False
+
+
+def test_cuda_junit_predicate_accepts_only_exact_all_pass_count() -> None:
+    predicate = getattr(check_junit, "junit_is_exact_all_pass", None)
+    assert callable(predicate)
+    counts = {
+        "tests": 4,
+        "passes": 4,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
+
+    assert predicate(counts, expected_tests=4) is True
+
+
 def test_run_pytest_junit_derives_counts_and_cleans_xml(monkeypatch):
     observed = {}
 

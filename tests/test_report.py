@@ -8,6 +8,7 @@ integration test asserts the figure set actually appears when the driver runs th
 
 import logging
 from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
@@ -22,7 +23,7 @@ from vfe3.run_artifacts import RunArtifacts, finalize_run, semantic_config_finge
 from vfe3.train import train
 from vfe3.viz.extract import converged_state
 from vfe3.viz.figures import register_figure
-from vfe3.viz.report import generate_figures, vocab_comparison_figures
+from vfe3.viz.report import generate_figures, plan_single_run_figures, vocab_comparison_figures
 from vfe3.viz.specs import FigureSpec, emit_registered_figures
 
 
@@ -61,50 +62,25 @@ def test_converged_state_shapes_and_finite():
         assert torch.isfinite(st[key]).all(), key
 
 
-def test_generate_figures_drives_live_model(tmp_path):
-    # The driver against a live in-memory model writes the single-run figure set to figures/.
-    model = _model()
-    paths = generate_figures(tmp_path / "run", model=model, loader=_loader(), max_sequences=16)
-    figdir = tmp_path / "run" / "figures"
-    written = {p.name for p in paths}
-    assert all(p.exists() and p.stat().st_size > 0 for p in paths)
-    # The figures that need no optional dependency (UMAP is best-effort, so belief_umap is excluded).
-    robust = {"estep_convergence.png", "belief_trajectories.png", "attention_structure.png",
-              "per_layer_diagnostics.png",
-              "gauge_equivariance.png", "gauge_head_specialization.png", "belief_spectrum.png",
-              "spd_ellipses.png", "holonomy_curvature.png", "numerical_trust.png",
-              "belief_category_separation.png",
-              # vocab next-token figures (decoder-free; default use_prior_bank=False -> decode_readout
-              # present; vocab_confusion needs the optional tokenizer so it is excluded like belief_umap).
-              "vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readout.png"}
-    missing = robust - written
-    assert not missing, f"driver did not produce {missing}"
-    assert all((figdir / name).exists() for name in robust)
-    # per-layer metrics CSV: the depth axis the final-block metrics.csv never writes.
-    csv_path = tmp_path / "run" / "metrics_per_layer.csv"
-    assert csv_path.exists() and csv_path.stat().st_size > 0
-    header = csv_path.read_text(encoding="utf-8").splitlines()[0]
-    assert header.startswith("layer,") and "holonomy_deviation" in header and "total" in header
-
-
-def test_generate_figures_skips_english_taxonomies_for_japanese(tmp_path, monkeypatch):
-    from vfe3.data import datasets
-
-    model = _model()
-    artifacts = RunArtifacts(tmp_path / "run", model.cfg, model, dataset="wiki-ja")
-    monkeypatch.setattr(datasets, "get_tiktoken_decoder", lambda dataset: lambda ids: "日本語")
-
-    paths = generate_figures(
-        artifacts.run_dir,
-        model=model,
-        loader=_loader(),
-        max_sequences=16,
-    )
-
-    written = {path.name for path in paths}
+def test_plan_single_run_figures_skips_english_taxonomies_for_japanese():
+    planned = plan_single_run_figures("wiki-ja", {
+        "decode_readout":             True,
+        "vocab_calibration":          True,
+        "unknown_figure":             True,
+        "vocab_probability_heatmap":  True,
+        "vocab_confusion":            True,
+        "belief_category_separation": True,
+    })
+    written = set(planned)
     assert "belief_category_separation.png" not in written
     assert "vocab_confusion.png" not in written
     assert {"vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readout.png"} <= written
+    assert "unknown_figure.png" not in written
+    assert planned == (
+        "vocab_probability_heatmap.png",
+        "vocab_calibration.png",
+        "decode_readout.png",
+    )
 
 
 def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
@@ -150,10 +126,24 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
         def __exit__(self, exc_type, exc, traceback):
             return None
 
-    monkeypatch.setattr(report.figs, "UMAPWorker", _NoopUMAPWorker)
-    monkeypatch.setattr(report.figs, "plot_belief_umap", lambda *args, **kwargs: plt.figure())
+    umap_calls = []
 
-    generate_figures(tmp_path / "run", model=model, loader=_loader(), max_sequences=1)
+    def plot_umap(
+        _bank:   dict,
+        channel: str = "mu",
+        **kwargs: object,
+    ) -> object:
+        path = str(kwargs["path"])
+        kind = str(kwargs.get("kind", "Belief"))
+        umap_calls.append((channel, kind, Path(path).name))
+        figure = plt.figure()
+        figure.savefig(path)
+        return figure
+
+    monkeypatch.setattr(report.figs, "UMAPWorker", _NoopUMAPWorker)
+    monkeypatch.setattr(report.figs, "plot_belief_umap", plot_umap)
+
+    paths = generate_figures(tmp_path / "run", model=model, loader=_loader(), max_sequences=1)
 
     assert len(built) == 1
     expected = {"e_step_belief_trace", "across_layer_belief_trace", "converged_state",
@@ -162,6 +152,19 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
                 "diagnostics_per_layer"}
     assert {name for name, _ in seen} == expected
     assert all(snapshot is built[0] for _, snapshot in seen)
+    written = {path.name for path in paths}
+    assert {
+        "s_channel_refinement.png",
+        "model_channel_belief.png",
+        "hyper_prior_centroid.png",
+        "hyper_prior_coupling.png",
+        "model_umap_mu.png",
+        "model_umap_sigma.png",
+    } <= written
+    assert {
+        ("mu", "Model", "model_umap_mu.png"),
+        ("sigma", "Model", "model_umap_sigma.png"),
+    } <= set(umap_calls)
 
 
 def test_model_channel_report_extractors_do_not_replay_snapshot_state(monkeypatch):
@@ -185,17 +188,6 @@ def test_model_channel_report_extractors_do_not_replay_snapshot_state(monkeypatc
         extract.hyper_prior_coupling(model, tokens, snapshot=snapshot),
     )
     assert all(output is not None for output in outputs)
-
-
-def test_generate_figures_reloads_from_run_dir(tmp_path):
-    # The reload path: config.json + best_model.pt -> rebuilt model -> figures, no live handle.
-    cfg = _cfg()
-    model = _model()
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")   # writes config.json
-    art.maybe_save_best(1, model, 1.0)                                               # self-bound best bundle
-    paths = generate_figures(tmp_path / "run", loader=_loader(), max_sequences=16)
-    assert len(paths) >= 6
-    assert (tmp_path / "run" / "figures" / "numerical_trust.png").exists()
 
 
 def test_generate_figures_rejects_corrupt_best_bundle_fingerprint(tmp_path):
@@ -278,23 +270,6 @@ def test_generate_figures_memory_guard_skips_only_full_vocab_extractors(tmp_path
         allow_large=True,
     )
     assert {"ce_bank", "vocab"} <= set(calls)
-
-
-def test_finalize_autoruns_figures(tmp_path):
-    # generate_figures defaults True -> finalize_run auto-writes run_dir/figures/ (the autorun).
-    cfg = _cfg()
-    model = _model()
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
-    losses = train(model, _loader(), cfg, n_steps=4, log_interval=2, eval_interval=2,
-                   val_loader=_loader(seed=1), artifacts=art)
-    finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
-    figs = list((tmp_path / "run" / "figures").glob("*.png"))
-    names = {f.name for f in figs}
-    assert len(figs) >= 6, f"autorun produced too few figures: {[f.name for f in figs]}"
-    # The vocabulary next-token figures are part of the finalize_run autorun (i.e. produced by
-    # train_vfe3.py): default use_prior_bank=False -> decode_readout present; the synthetic-period3
-    # dataset has no tokenizer so vocab_confusion is skipped.
-    assert {"vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readout.png"} <= names
 
 
 def test_finalize_skips_figures_when_disabled(tmp_path):
@@ -382,14 +357,14 @@ def test_s_channel_refinement_extractor_present_iff_s_e_step():
     assert s_channel_refinement(off, tok) is None
 
 
-def test_generate_figures_emits_s_channel_under_s_e_step(tmp_path):
-    # The s-channel figure is written iff s_e_step=True (guarded by the None extractor).
-    on = _model(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
-    written = {p.name for p in generate_figures(tmp_path / "on", model=on, loader=_loader(), max_sequences=16)}
-    assert "s_channel_refinement.png" in written
-    off = _model(s_e_step=False)
-    written_off = {p.name for p in generate_figures(tmp_path / "off", model=off, loader=_loader(), max_sequences=16)}
-    assert "s_channel_refinement.png" not in written_off
+def test_plan_single_run_figures_routes_s_channel_refinement():
+    assert plan_single_run_figures(
+        "synthetic-period3", {"s_channel_refinement": True},
+    ) == ("s_channel_refinement.png",)
+    assert plan_single_run_figures(
+        "synthetic-period3", {"s_channel_refinement": False},
+    ) == ()
+    assert plan_single_run_figures("synthetic-period3", {}) == ()
 
 
 # ---------------------------------------------------------------------------

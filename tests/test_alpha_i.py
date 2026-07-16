@@ -1,7 +1,23 @@
+from collections.abc import MutableMapping
+
 import pytest
 import torch
 
 from vfe3.alpha_i import alpha_regularizer, register_alpha, self_coupling_alpha
+
+
+_MISSING = object()
+
+
+def _restore_registry_entry(
+    registry: MutableMapping[str, object],
+    name:     str,
+    previous: object,
+) -> None:
+    if previous is _MISSING:
+        registry.pop(name, None)
+    else:
+        registry[name] = previous
 
 
 def test_constant_alpha_is_value_zero_reg():
@@ -30,17 +46,26 @@ def test_per_coord_alpha_uses_per_dimension_kl():
     assert torch.allclose(a, c0 / (b0 + kl), atol=1e-6)
 
 
+@pytest.mark.registry_mutation
 def test_new_form_with_novel_kwarg_reachable_without_editing_dispatcher():
     # Modularity: a registered form's OWN param must flow through the dispatcher's
     # **kwargs (not a hard-coded value/b0/c0 union), so a new form selects-with-config
     # without editing the call site.
-    @register_alpha("_test_scaled")
-    def _scaled(kl, *, scale=2.0, **kwargs):
-        return scale * torch.ones_like(kl), torch.zeros_like(kl)
+    from vfe3.alpha_i import _ALPHAS, _ALPHA_PER_COORD
+    name = "_test_scaled"
+    previous_alpha = _ALPHAS.get(name, _MISSING)
+    previous_flag = _ALPHA_PER_COORD.get(name, _MISSING)
+    try:
+        @register_alpha(name, override=previous_alpha is not _MISSING)
+        def _scaled(kl, *, scale=2.0, **kwargs):
+            return scale * torch.ones_like(kl), torch.zeros_like(kl)
 
-    kl = torch.zeros(3)
-    a, r = self_coupling_alpha(kl, mode="_test_scaled", scale=5.0)
-    assert torch.allclose(a, torch.full((3,), 5.0))
+        kl = torch.zeros(3)
+        a, r = self_coupling_alpha(kl, mode=name, scale=5.0)
+        assert torch.allclose(a, torch.full((3,), 5.0))
+    finally:
+        _restore_registry_entry(_ALPHAS, name, previous_alpha)
+        _restore_registry_entry(_ALPHA_PER_COORD, name, previous_flag)
 
 
 def test_alpha_is_per_coord_declares_reduction_need():
@@ -54,14 +79,21 @@ def test_alpha_is_per_coord_declares_reduction_need():
     assert alpha_is_per_coord("constant") is False
 
 
+@pytest.mark.registry_mutation
 def test_register_alpha_per_coord_flag_is_modular():
-    from vfe3.alpha_i import register_alpha, alpha_is_per_coord
+    from vfe3.alpha_i import _ALPHAS, _ALPHA_PER_COORD, alpha_is_per_coord, register_alpha
+    name = "_test_pc"
+    previous_alpha = _ALPHAS.get(name, _MISSING)
+    previous_flag = _ALPHA_PER_COORD.get(name, _MISSING)
+    try:
+        @register_alpha(name, per_coord=True, override=previous_alpha is not _MISSING)
+        def _pc(kl, **kwargs):
+            return kl, torch.zeros_like(kl)
 
-    @register_alpha("_test_pc", per_coord=True)
-    def _pc(kl, **kwargs):
-        return kl, torch.zeros_like(kl)
-
-    assert alpha_is_per_coord("_test_pc") is True
+        assert alpha_is_per_coord(name) is True
+    finally:
+        _restore_registry_entry(_ALPHAS, name, previous_alpha)
+        _restore_registry_entry(_ALPHA_PER_COORD, name, previous_flag)
 
 
 from vfe3.alpha_i import alpha_gradient_coefficient
@@ -90,11 +122,14 @@ def test_alpha_grad_coefficient_state_dependent_is_alpha_star():
 # share the guard and are mirrored below.
 
 
+@pytest.mark.registry_mutation
 def test_register_alpha_duplicate_raises_and_override_replaces():
     from vfe3.alpha_i import _ALPHAS, _ALPHA_PER_COORD
     name = "_test_dup_alpha"
+    previous_alpha = _ALPHAS.get(name, _MISSING)
+    previous_flag = _ALPHA_PER_COORD.get(name, _MISSING)
     try:
-        @register_alpha(name)
+        @register_alpha(name, override=previous_alpha is not _MISSING)
         def _first(kl, **kwargs):
             return torch.ones_like(kl), torch.zeros_like(kl)
 
@@ -111,15 +146,17 @@ def test_register_alpha_duplicate_raises_and_override_replaces():
 
         assert _ALPHAS[name] is _third                    # explicit override replaces
     finally:
-        _ALPHAS.pop(name, None)
-        _ALPHA_PER_COORD.pop(name, None)
+        _restore_registry_entry(_ALPHAS, name, previous_alpha)
+        _restore_registry_entry(_ALPHA_PER_COORD, name, previous_flag)
 
 
+@pytest.mark.registry_mutation
 def test_register_prior_duplicate_raises_and_override_replaces():
     from vfe3.attention_prior import _PRIORS, register_prior
     name = "_test_dup_prior"
+    previous = _PRIORS.get(name, _MISSING)
     try:
-        @register_prior(name)
+        @register_prior(name, override=previous is not _MISSING)
         def _first(n_query, n_key, **kwargs):
             return torch.zeros(n_query, n_key)
 
@@ -132,14 +169,16 @@ def test_register_prior_duplicate_raises_and_override_replaces():
 
         assert _PRIORS[name] is _second
     finally:
-        _PRIORS.pop(name, None)
+        _restore_registry_entry(_PRIORS, name, previous)
 
 
+@pytest.mark.registry_mutation
 def test_register_compose_duplicate_raises_and_override_replaces():
     from vfe3.geometry.lie_ops import _COMPOSE, register_compose
     name = "_test_dup_compose"
+    previous = _COMPOSE.get(name, _MISSING)
     try:
-        @register_compose(name)
+        @register_compose(name, override=previous is not _MISSING)
         def _first(phi1, phi2, generators, **kwargs):
             return phi1 + phi2
 
@@ -152,4 +191,4 @@ def test_register_compose_duplicate_raises_and_override_replaces():
 
         assert _COMPOSE[name] is _second
     finally:
-        _COMPOSE.pop(name, None)
+        _restore_registry_entry(_COMPOSE, name, previous)

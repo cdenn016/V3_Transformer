@@ -553,7 +553,7 @@ def test_generate_sigma_mc_synthetic_pass_runs_estimator_cpu(tmp_path, monkeypat
     assert torch.equal(out[:, :3], torch.tensor([[1, 2, 3]]))  # prompt preserved
 
 
-@pytest.mark.skipif(_DEVICE.type != "cuda",
+@pytest.mark.skipif(_DEVICE.type != "cuda" or not torch.cuda.is_available(),
                     reason="RTX 5090 CUDA smoke; set VFE3_TEST_DEVICE=cuda to run")
 def test_efe_rollout_sigma_mc_cuda_synthetic_pass(tmp_path, monkeypatch):
     # SYNTHETIC PASS plumbing ONLY (NOT an empirical sigma-arm validation): drives efe_rollout through

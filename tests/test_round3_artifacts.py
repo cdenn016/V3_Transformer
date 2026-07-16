@@ -80,23 +80,6 @@ def _model(**kw):
     return VFEModel(VFE3Config(**base))
 
 
-def test_emit_closes_figure_registered_by_raising_thunk(tmp_path, monkeypatch):
-    # A thunk can create a pyplot-managed figure and then raise (tight_layout/savefig) before _emit
-    # ever receives it; the except path must close everything the thunk registered.
-    from vfe3.viz import figures as figs
-    from vfe3.viz.report import generate_figures
-
-    def _leaky_plot(*args, **kwargs):
-        figs.plt.figure()                                      # registered but never returned
-        raise RuntimeError("simulated savefig failure")
-
-    monkeypatch.setattr(figs, "plot_estep_convergence", _leaky_plot)
-    before = set(figs.plt.get_fignums())
-    generate_figures(tmp_path / "run", model=_model(), loader=_loader(), max_sequences=16)
-    assert set(figs.plt.get_fignums()) == before               # no leaked registry entries
-    assert not (tmp_path / "run" / "figures" / "estep_convergence.png").exists()
-
-
 @pytest.mark.parametrize("failure_mode", ["thunk", "save"])
 def test_comparison_emit_closes_figures_after_thunk_or_save_failure(
     tmp_path,

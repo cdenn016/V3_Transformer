@@ -77,22 +77,24 @@ def test_stationarity_residual_constant_across_keys():
     assert torch.allclose(residual.mean(), reduced_free_energy(_E, log_prior=_B, tau=_TAU), atol=1e-5)
 
 
-def test_free_energy_entropy_exact_for_deep_finite_prior():
+def test_free_energy_entropy_exact_for_deep_finite_prior(
+    device: torch.device,
+) -> None:
     # m8: a finite prior entry below ~-27.6 nats (the old log-clamp floor) whose beta is non-negligible
     # made free_energy's entropy term deviate from the exact -tau logZ. With log_softmax the envelope
     # identity F == sum_i reduced_free_energy_i holds (self_div=0), and a -inf mask stays finite.
     from vfe3.free_energy import free_energy
     tau       = 1.0
-    energy    = torch.tensor([[1.0, 1.0, -35.0]] * 3)     # entry 2 attractive enough that beta_2 ~ 1/3
-    log_prior = torch.tensor([[0.0, 0.0, -35.0]] * 3)     # entry 2 finite but far below the -27.6 floor
-    self_div  = torch.zeros(3)
-    alpha     = torch.zeros(3)
+    energy    = torch.tensor([[1.0, 1.0, -35.0]] * 3).to(device)     # entry 2 attractive enough that beta_2 ~ 1/3
+    log_prior = torch.tensor([[0.0, 0.0, -35.0]] * 3).to(device)     # entry 2 finite but far below the -27.6 floor
+    self_div  = torch.zeros(3).to(device)
+    alpha     = torch.zeros(3).to(device)
     F = free_energy(self_div, energy, alpha, tau=tau, lambda_beta=1.0,
                     include_attention_entropy=True, log_prior=log_prior)
     fred = reduced_free_energy(energy, tau=tau, log_prior=log_prior).sum()
     assert torch.isfinite(F)
     assert torch.allclose(F, fred, atol=1e-4)             # RED pre-fix: the clamp distorts the deep entry
-    lp_masked = torch.tensor([[0.0, 0.0, float("-inf")]] * 3)   # -inf hard mask must not NaN (beta==0 there)
+    lp_masked = torch.tensor([[0.0, 0.0, float("-inf")]] * 3).to(device)   # -inf hard mask must not NaN (beta==0 there)
     Fm = free_energy(self_div, energy, alpha, tau=tau, lambda_beta=1.0,
                      include_attention_entropy=True, log_prior=lp_masked)
     assert torch.isfinite(Fm)
