@@ -144,6 +144,19 @@ def _resolve_bank_budget(
     return max_tokens, max_sequences, n_batches
 
 
+def _estimated_full_vocab_bank_bytes(cfg: VFE3Config, n_batches: int) -> int:
+    r"""Conservatively budget retained logits plus probability workspaces for every bank batch."""
+    if n_batches < 1:
+        raise ValueError(f"n_batches must be positive, got {n_batches}")
+    elements = (
+        int(cfg.vocab_size)
+        * int(cfg.max_seq_len)
+        * int(cfg.batch_size)
+        * int(n_batches)
+    )
+    return 2 * torch.empty((), dtype=torch.float32).element_size() * elements
+
+
 def generate_figures(
     run_dir:       'str | Path',
 
@@ -213,11 +226,11 @@ def generate_figures(
     if not report_batches:
         raise RuntimeError(f"loader for {dataset!r}/{split!r} yielded no batches")
 
-    full_vocab_gb = 8.0 * int(cfg.vocab_size) * int(cfg.max_seq_len) * int(cfg.batch_size) / 1e9
+    full_vocab_gb = _estimated_full_vocab_bank_bytes(cfg, n_batches) / 1e9
     skip_full_vocab = full_vocab_gb > 8.0 and not allow_large
     if skip_full_vocab:
         logger.warning(
-            "full-vocab figure inputs skipped: estimated logits+probabilities peak %.1f GB exceeds "
+            "full-vocab figure inputs skipped: aggregate bank+workspace estimate %.1f GB exceeds "
             "the 8 GB guard; pass allow_large=True to override",
             full_vocab_gb,
         )
@@ -237,12 +250,28 @@ def generate_figures(
         device=device,
         return_logits=not skip_full_vocab,
     ), "inference_bank")
+    if inference_bank is not None:
+        retained_bank_gb = extract.inference_bank_nbytes(inference_bank) / 1e9
+        logger.info(
+            "report inference bank retains %.3f GB across %d CPU-hosted batches",
+            retained_bank_gb,
+            len(inference_bank),
+        )
+        if retained_bank_gb > 8.0 and not allow_large and not skip_full_vocab:
+            logger.warning(
+                "full-vocab figure inputs skipped: retained inference bank %.1f GB exceeds the "
+                "8 GB guard; pass allow_large=True to override",
+                retained_bank_gb,
+            )
+            for record in inference_bank:
+                record["logits"] = None
+            skip_full_vocab = True
     token_batches = (
         [record["tokens"] for record in inference_bank]
         if inference_bank is not None
         else _collect_token_batches(report_batches, device, n_batches)
     )
-    tok = token_batches[0][:1]                                         # one sequence for the single-seq figures
+    tok = token_batches[0][:1].to(device)                              # one device-resident report sequence
 
     # ---- expensive model-replay inputs, each guarded (a failure skips only its figures) ----
     # The same-token diagnostics consume one captured forward. If capture itself fails, passing

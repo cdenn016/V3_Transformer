@@ -8,7 +8,7 @@ tensors / dicts that the pure metrics and the figure functions consume. Everythi
 ``torch.no_grad`` and OFF the training hot path.
 """
 
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -33,8 +33,8 @@ from vfe3.inference.e_step import (
 # Transport-mode state-routing sets (registry metadata, as model.py): the extractors below feed
 # mu/sigma to _transport by membership here, never by matching literal mode names.
 from vfe3.geometry.lie_ops import CompactBlockElement
-from vfe3.geometry.transport import (CompactFactoredTransport, _TRANSPORT_NEEDS_MU,
-                                     _TRANSPORT_NEEDS_SIGMA, transport_mean)
+from vfe3.geometry.transport import (_TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA,
+                                     transport_mean)
 from vfe3.model.block import vfe_block
 from vfe3.numerics import bounded_variance_from_log
 
@@ -44,6 +44,60 @@ if TYPE_CHECKING:
 
 def _model_device(model) -> torch.device:
     return model.prior_bank.mu_embed.device
+
+
+def _cpu_bank_value(value: object) -> object:
+    r"""Detach and CPU-host every tensor retained by one inference-bank record."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, CompactBlockElement):
+        return CompactBlockElement(
+            value.blocks.detach().cpu(),
+            value.K,
+            value.tied,
+        )
+    if isinstance(value, BeliefState):
+        return BeliefState(
+            mu=_cpu_bank_value(value.mu),
+            sigma=_cpu_bank_value(value.sigma),
+            phi=_cpu_bank_value(value.phi),
+            s=_cpu_bank_value(value.s) if value.s is not None else None,
+            r=_cpu_bank_value(value.r) if value.r is not None else None,
+            omega=_cpu_bank_value(value.omega) if value.omega is not None else None,
+            reflection=(_cpu_bank_value(value.reflection)
+                        if value.reflection is not None else None),
+            right_phi=(_cpu_bank_value(value.right_phi)
+                       if value.right_phi is not None else None),
+        )
+    return value
+
+
+def _inference_bank_tensors(value: object) -> Iterator[torch.Tensor]:
+    """Yield tensors nested in the stable list-of-records inference-bank API."""
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, CompactBlockElement):
+        yield value.blocks
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _inference_bank_tensors(item)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _inference_bank_tensors(item)
+
+
+def inference_bank_nbytes(records: List[Dict[str, object]]) -> int:
+    r"""Return aggregate bytes of unique tensor storages retained by an inference bank."""
+    total = 0
+    seen: set[tuple[str, Optional[int], int]] = set()
+    for tensor in _inference_bank_tensors(records):
+        storage = tensor.untyped_storage()
+        key = (tensor.device.type, tensor.device.index, storage.data_ptr())
+        if key in seen:
+            continue
+        seen.add(key)
+        total += storage.nbytes()
+    return total
 
 
 def _validate_bank_caps(
@@ -138,11 +192,11 @@ def collect_inference_bank(
 ) -> List[Dict[str, object]]:
     r"""Capture one authoritative belief inference per population batch for report reuse.
 
-    Each record retains the input/target tensors, raw stack output, optional CPU-hosted decode
-    logits, and the active model-channel state. CPU offload bounds accelerator residency to one
-    logit batch; population extractors move one record back only while consuming it. They therefore
-    avoid replaying ``forward_beliefs``, the E-step stack, or model-channel refinement without
-    retaining the whole full-vocabulary population on the accelerator.
+    Each record retains CPU-hosted input/target tensors, raw stack output, optional decode logits,
+    and the active model-channel state. Complete CPU offload bounds accelerator residency to the
+    current inference or consumer batch. Population extractors therefore avoid replaying
+    ``forward_beliefs``, the E-step stack, or model-channel refinement without retaining the whole
+    population on the accelerator.
     """
     device = device or _model_device(model)
     was_training = model.training
@@ -175,13 +229,13 @@ def collect_inference_bank(
                 if model.cfg.s_frame_mode == "phi_tilde":
                     model_phi = model._resolve_model_frame(tokens, prior.phi)
             records.append({
-                "tokens": tokens,
-                "targets": targets,
-                "out": out,
-                "logits": (logits.cpu() if logits is not None else None),
-                "s_mu": s_mu,
-                "s_sigma": s_sigma,
-                "model_phi": model_phi,
+                "tokens": _cpu_bank_value(tokens),
+                "targets": _cpu_bank_value(targets) if targets is not None else None,
+                "out": _cpu_bank_value(out),
+                "logits": _cpu_bank_value(logits) if logits is not None else None,
+                "s_mu": _cpu_bank_value(s_mu) if s_mu is not None else None,
+                "s_sigma": _cpu_bank_value(s_sigma) if s_sigma is not None else None,
+                "model_phi": _cpu_bank_value(model_phi) if model_phi is not None else None,
             })
             if max_batches is not None and i + 1 >= max_batches:
                 break
@@ -834,20 +888,7 @@ def numerical_health(
     # Build Omega under the ACTIVE connection regime (audit 2026-06-10 F8e): this previously
     # defaulted to flat transport, so under regime_ii the reported nan/beta/energy fractions
     # described a flat-transport belief, not the model that trained. Mirrors converged_state.
-    omega = _transport(
-        out.phi, model.group, transport_mode=cfg.transport_mode,
-        gauge_parameterization=cfg.gauge_parameterization,
-        omega=out.omega,
-        reflection=out.reflection,
-        right_phi=out.right_phi,
-        mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
-        sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
-        connection_W=getattr(model, "connection_W", None),
-        connection_M=getattr(model, "connection_M", None),
-        connection_L=getattr(model, "connection_L", None),
-        link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-        cocycle_relaxation=cfg.cocycle_relaxation,
-    )
+    omega = model._diagnostic_transport(out)
     # Wrap in RopeTransport under pos_rotation='rope' so the reported nan/energy/beta fractions
     # describe the RoPE-rotated belief the model runs, mirroring converged_state/diagnostics (r2 id11).
     fam = get_family(cfg.family)
@@ -899,7 +940,7 @@ def converged_state(
 
     *,
     snapshot: 'Optional[DiagnosticSnapshot]' = None,
-) -> Dict[str, torch.Tensor]:
+) -> Dict[str, object]:
     r"""The converged-belief diagnostic state of one sequence, as tensors for the figures.
 
     Mirrors :meth:`VFEModel.diagnostics` EXACTLY (same active config: transport mode,
@@ -907,10 +948,11 @@ def converged_state(
     diagnostics discard. The gauge-equivariance certificate, per-head gauge invariants, belief
     spectrum / SPD ellipses, and the guard-saturation / causal panels all read from these. Returns
     the converged ``mu`` (N, K), ``sigma`` (N, K) or (N, K, K), ``phi`` (N, n_gen), the active
-    per-token vertex factor under the compatibility key ``exp_phi`` (N, K, K), and the dense pre-rope
-    pairwise transport ``omega`` (N, N, K, K) that the equivariance/holonomy metrics consume,
-    the pairwise ``energy`` and attention ``beta`` ((N, N) or (H, N, N)), and the per-token
-    self-divergence ``self_div`` (N,) or (N, K).
+    per-token vertex factor under the compatibility key ``exp_phi`` (N, K, K), and the pre-rope
+    pairwise transport ``omega`` that the equivariance/holonomy metrics consume (compact-factored
+    when the compact phi-block path is active, otherwise dense), the pairwise ``energy`` and
+    attention ``beta`` ((N, N) or (H, N, N)), and the per-token self-divergence ``self_div``
+    (N,) or (N, K).
     """
     from vfe3.model.stack import vfe_stack
     from vfe3.geometry.transport import RopeTransport, build_factored_transport, compute_transport_operators
@@ -947,20 +989,7 @@ def converged_state(
         for _ in range(cfg.n_layers - 1):
             mu_p = (1.0 - rho) * mu_p + rho * out.mu
             sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
-        omega = _transport(                                            # active pairwise transport (pre-rope)
-            out.phi, model.group, transport_mode=cfg.transport_mode,
-            gauge_parameterization=cfg.gauge_parameterization,
-            omega=out.omega,
-            reflection=out.reflection,
-            right_phi=out.right_phi,
-            mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
-            sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
-            connection_W=getattr(model, "connection_W", None),
-            connection_M=getattr(model, "connection_M", None),
-            connection_L=getattr(model, "connection_L", None),
-            link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-            cocycle_relaxation=cfg.cocycle_relaxation,
-        )
+        omega = model._diagnostic_transport(out)                       # active pre-rope transport
         fam = get_family(cfg.family)
         if rope is not None:
             rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
@@ -1007,9 +1036,6 @@ def converged_state(
                 # left reflection R_i = diag(sign_i, 1, ...), exactly matching _transport's fold.
                 exp_phi = exp_phi.clone()
                 exp_phi[..., 0, :] *= out.reflection[..., None]
-        # ``report.py`` has legacy dense consumers (gauge-equivariance and curvature-field panels).
-        # Preserve their public tensor contract without forcing live inference to densify compact U.
-        omega_dense = omega.to_dense_omega() if isinstance(omega, CompactFactoredTransport) else omega
     finally:
         if was_training:
             model.train()
@@ -1018,7 +1044,7 @@ def converged_state(
         "sigma":    out.sigma,
         "phi":      out.phi,
         "exp_phi":  exp_phi,
-        "omega":    omega_dense,
+        "omega":    omega,
         "energy":   energy,
         "beta":     beta,
         "self_div": self_div,
@@ -1499,7 +1525,7 @@ def vocab_prediction_stats(
         sources = inference_bank if inference_bank is not None else token_batches
         for batch in sources:
             if inference_bank is not None:
-                tokens = batch["tokens"]
+                tokens = batch["tokens"].to(device)
                 decoded = batch["logits"]
                 if decoded is None:
                     raise ValueError(

@@ -3250,7 +3250,6 @@ class VFEModel(nn.Module):
         """
         if snapshot is not None:
             return self._validate_diagnostic_snapshot(token_ids, snapshot).beta_maps
-        from vfe3.inference.e_step import _transport
         from vfe3.geometry.transport import transport_mean
         from vfe3.families.base import get_family
         from vfe3.free_energy import pairwise_energy, attention_weights, attention_tau
@@ -3310,23 +3309,7 @@ class VFEModel(nn.Module):
             # Attention at the converged belief, recomputed exactly as diagnostics does: the
             # transport regime is matched so regime_ii reads the means + learned connection_W
             # (flat ignores both), and the energy is per-irrep-block (per-head).
-            omega = _transport(
-                belief.phi, self.group, transport_mode=cfg.transport_mode,
-                mu=(belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
-                sigma=(belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
-                connection_W=getattr(self, "connection_W", None),
-                connection_M=getattr(self, "connection_M", None),
-                connection_L=getattr(self, "connection_L", None),
-                link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-                clamp_monitor=cfg.transport_clamp_monitor,
-                validity_max_norm=cfg.transport_chart_max_norm,
-                exactness_out=self._transport_status,
-                cocycle_relaxation=cfg.cocycle_relaxation,
-                gauge_parameterization=cfg.gauge_parameterization,
-                omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
-                reflection=belief.reflection,                        # phi-path R_i Omega_ij R_j fold (None -> unchanged)
-                right_phi=belief.right_phi,
-            )                                                        # (N, N, K, K)
+            omega = self._diagnostic_transport(belief)
             if rope is not None:
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                                            on_value=cfg.rope_on_value)
@@ -3383,7 +3366,6 @@ class VFEModel(nn.Module):
         ``gauge_invariant_spread``, ``effective_rank``, ``attn_entropy``, ``belief_cond_median``,
         ``phi_norm_mean``.
         """
-        from vfe3.inference.e_step import _transport
         from vfe3.geometry.transport import transport_mean, compute_transport_operators
         from vfe3.families.base import get_family
         from vfe3.free_energy import (pairwise_energy, self_divergence_for_alpha,
@@ -3458,23 +3440,7 @@ class VFEModel(nn.Module):
                 belief = _sequence_belief(snapshot.layer_outputs[layer_index])
                 cap = {"converged": _sequence_belief(snapshot.layer_converged[layer_index])}
             _tau_c = self._beta_tau(belief.sigma, belief.mu, _tau)   # converged-belief tau (as diagnostics)
-            omega = _transport(                                       # (N, N, K, K) under the ACTIVE regime
-                belief.phi, self.group, transport_mode=cfg.transport_mode,
-                mu=(belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
-                sigma=(belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
-                connection_W=getattr(self, "connection_W", None),
-                connection_M=getattr(self, "connection_M", None),
-                connection_L=getattr(self, "connection_L", None),
-                link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
-                clamp_monitor=cfg.transport_clamp_monitor,
-                validity_max_norm=cfg.transport_chart_max_norm,
-                exactness_out=self._transport_status,
-                cocycle_relaxation=cfg.cocycle_relaxation,
-                gauge_parameterization=cfg.gauge_parameterization,
-                omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
-                reflection=belief.reflection,                        # phi-path R_i Omega_ij R_j fold (None -> unchanged)
-                right_phi=belief.right_phi,
-            )
+            omega = self._diagnostic_transport(belief)
             mu_tv = sigma_tv = None
             if rope is not None:
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,

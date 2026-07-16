@@ -1294,13 +1294,22 @@ def holonomy_wilson_sampled(
 
 
 def curvature_field(
-    omega:  torch.Tensor,                # (N, N, K, K) pairwise transport Omega_ij
+    omega:  'torch.Tensor | CompactFactoredTransport',
     anchor: int = 0,
 ) -> torch.Tensor:                       # (N, N) F_ij = ||Omega_ai Omega_ij Omega_ja - I||_F
     r"""Spatial curvature map for a fixed anchor a: F_ij = ||Omega_ai Omega_ij Omega_ja - I||_F.
 
     Shows where curvature concentrates (a Regime-II quantity; ~0 everywhere on the flat cocycle).
     """
+    if isinstance(omega, CompactFactoredTransport):
+        exp_blocks = omega.exp_blocks
+        inv_blocks = omega.inv_blocks
+        o_ai = exp_blocks[anchor] @ inv_blocks
+        o_ij = exp_blocks[:, None] @ inv_blocks[None, :]
+        o_ja = exp_blocks @ inv_blocks[anchor]
+        h = o_ai[:, None] @ o_ij @ o_ja[None, :]
+        eye = torch.eye(omega.block_dim, device=omega.device, dtype=omega.dtype)
+        return (h - eye).square().sum(dim=(-3, -2, -1)).sqrt()
     k = omega.shape[-1]
     eye = torch.eye(k, device=omega.device, dtype=omega.dtype)
     o_ai = omega[anchor].unsqueeze(1)                            # (N, 1, K, K) Omega_{a, i} (over i)
@@ -1495,7 +1504,7 @@ def bootstrap_token_ce_band(
 def gauge_equivariance_residual(
     mu:                torch.Tensor,     # (N, K) converged belief means
     sigma:             torch.Tensor,     # (N, K) diagonal OR (N, K, K) full covariances
-    omega:             torch.Tensor,     # (N, N, K, K) converged transport Omega_ij
+    omega:             'torch.Tensor | CompactFactoredTransport',
     group,                               # GaugeGroup (generators, irrep_dims)
 
     *,
@@ -1534,6 +1543,11 @@ def gauge_equivariance_residual(
     from vfe3.free_energy import attention_tau, attention_weights, pairwise_energy
     from vfe3.geometry.transport import transport_covariance, transport_mean
 
+    # The out-of-structure-group control intentionally mixes compact blocks, so this metric is the
+    # explicit dense compatibility boundary. Extraction and every other report replay remain compact.
+    if isinstance(omega, CompactFactoredTransport):
+        omega = omega.to_dense_omega()
+
     full = get_family("gaussian_full")
     is_full = _is_full_cov(sigma, diagonal)
     sigma0 = sigma if is_full else torch.diag_embed(sigma)                    # (N, K, K)
@@ -1568,10 +1582,12 @@ def gauge_equivariance_residual(
         c = scale * torch.randn(group.generators.shape[0], generator=gen, device=mu.device, dtype=mu.dtype)
         g_in = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", c, group.generators))
         re, rb = _residuals(g_in)
-        in_e.append(re); in_b.append(rb)
+        in_e.append(re)
+        in_b.append(rb)
         m = scale * torch.randn(k, k, generator=gen, device=mu.device, dtype=mu.dtype)
         re2, rb2 = _residuals(torch.linalg.matrix_exp(m))
-        out_e.append(re2); out_b.append(rb2)
+        out_e.append(re2)
+        out_b.append(rb2)
     return {
         "energy_in_group":  torch.cat(in_e),
         "energy_out_group": torch.cat(out_e),

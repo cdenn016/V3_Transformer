@@ -516,6 +516,63 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         cond_acc: List[torch.Tensor] = []
         omega_cond_acc: List[torch.Tensor] = []
         omega_sp_acc: List[torch.Tensor] = []
+
+        # Stage every direct-frame candidate across every omega parameter group before mutating
+        # any table, gradient, dirty mask, or cadence state. A late invalid candidate therefore
+        # rejects the whole manifold step atomically instead of leaving earlier groups committed.
+        omega_plans: Dict[int, list] = {}
+        omega_validation_failures: List[torch.Tensor] = []
+        K_full = self._generators.shape[-1]
+        from vfe3.geometry.lie_ops import extract_phi, retract_omega
+        for omega_group in self.param_groups:
+            if not omega_group.get("omega", False):
+                continue
+            lr = omega_group["lr"]
+            mode = getattr(self, "_omega_retract_mode", "lie_exp")
+            pending_updates = []
+            for p in omega_group["params"]:
+                if p.grad is None:
+                    continue
+                E = p.grad
+                U = p.data
+                untied_compact = U.dim() == 4
+                tied_compact = U.dim() == 3 and U.shape[-1] < K_full
+                act = E.reshape(E.shape[0], -1).abs().sum(dim=-1) > 0
+                Ua, Ea = U[act], E[act]
+                omega_validation_failures.append(_omega_validation_failure(Ua))
+                if untied_compact or tied_compact:
+                    d = Ua.shape[-1]
+                    Gd, gp = self._compact_gld_basis(d, U.device, U.dtype)
+                    Ua_r = Ua.reshape(-1, d, d)
+                    Ea_r = Ea.reshape(-1, d, d)
+                    xi = extract_phi(
+                        torch.einsum("...lk,...lm->...km", Ua_r, Ea_r),
+                        Gd,
+                        gram_pinv_=gp,
+                    )
+                    if tied_compact:
+                        xi = xi / (K_full // d)
+                    Ur = retract_omega(Ua_r, -lr * xi, Gd, mode=mode).reshape(Ua.shape)
+                else:
+                    Gd, full_gp = self._full_generator_basis(U.device, U.dtype)
+                    xi = extract_phi(
+                        torch.einsum("...lk,...lm->...km", Ua, Ea),
+                        Gd,
+                        gram_pinv_=full_gp,
+                    )
+                    Ur = retract_omega(Ua, -lr * xi, Gd, mode=mode)
+                omega_validation_failures.append(_omega_validation_failure(Ur))
+                if collect:
+                    omega_validation_failures.append(_omega_determinant_failure(Ur))
+                pending_updates.append((p, U, act, Ur, untied_compact, tied_compact))
+            omega_plans[id(omega_group)] = pending_updates
+
+        if (omega_validation_failures
+                and bool(torch.stack(omega_validation_failures).any())):
+            raise FloatingPointError(
+                "omega retraction produced a nonfinite or singular group element"
+            )
+
         for group in self.param_groups:
             if group.get("omega", False):
                 # omega_direct group: the params ARE stored GL(K) group elements U (shape (V, K, K)),
@@ -529,60 +586,7 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 # block-diagonal gl(K) step restricted to the blocks (the gl(K) generators have disjoint
                 # block support). Detecting tied by dim ALONE mis-routes (V,d,d) to the full path and
                 # crashes extract_phi with an einsum size mismatch -- hence the d < K test.
-                lr     = group["lr"]
-                mode   = getattr(self, "_omega_retract_mode", "lie_exp")
-                K_full = self._generators.shape[-1]                    # full frame dim K
-                from vfe3.geometry.lie_ops import extract_phi, retract_omega
-                pending_updates = []
-                validation_failures: List[torch.Tensor] = []
-                for p in group["params"]:
-                    if p.grad is None:
-                        continue
-                    E   = p.grad                                       # (V,K,K) full or (V,H,d,d)/(V,d,d) compact
-                    U   = p.data                                       # matching stored group elements
-                    untied_compact = U.dim() == 4                      # (V,H,d,d)
-                    tied_compact   = U.dim() == 3 and U.shape[-1] < K_full  # (V,d,d), d < K
-                    act = E.reshape(E.shape[0], -1).abs().sum(dim=-1) > 0   # (V,) rows with gradient
-                    Ua, Ea = U[act], E[act]                            # (A,K,K) / (A,H,d,d) / (A,d,d)
-                    validation_failures.append(_omega_validation_failure(Ua))
-                    if untied_compact or tied_compact:
-                        d      = Ua.shape[-1]
-                        Gd, gp = self._compact_gld_basis(d, U.device, U.dtype)   # gl(d) basis + cached gram_pinv
-                        # Untied: flatten the H block axis into the row axis so each of the A*H blocks
-                        # retracts independently. Tied: the active rows ARE the single (A,d,d) shared
-                        # blocks (encode's broadcast adjoint already SUMMED the H per-slot grads onto
-                        # them), so reshape(-1,d,d) is a no-op and each shared block retracts directly.
-                        Ua_r = Ua.reshape(-1, d, d)                    # (A*H,d,d) untied / (A,d,d) tied
-                        Ea_r = Ea.reshape(-1, d, d)
-                        # per-block natural-gradient tangent xi = Gram^{-1} proj_gl(d)(U_h^T E_h)
-                        xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua_r, Ea_r), Gd, gram_pinv_=gp)
-                        if tied_compact:
-                            # The full tied generators kron(I_H, E_ij) are nonzero in ALL H blocks, so
-                            # their Frobenius Gram is H*I and the full-tied natural gradient carries a
-                            # 1/H factor. The reduced gl(d) basis has Gram = I (no 1/H), and encode's
-                            # broadcast adjoint already SUMMED the H per-slot grads onto the shared block,
-                            # so WITHOUT this rescale the compact-tied step is H x too large. Divide by
-                            # H = K/d so the compact-tied retraction MATCHES the full-tied step exactly.
-                            # (The untied gl(d)^H generators are Gram = I, already correct -- do NOT scale.)
-                            xi = xi / (K_full // d)
-                        Ur = retract_omega(Ua_r, -lr * xi, Gd, mode=mode)
-                        Ur = Ur.reshape(Ua.shape)                      # back to (A,H,d,d) / (A,d,d)
-                    else:
-                        Gd, full_gp = self._full_generator_basis(U.device, U.dtype)
-                        # natural-gradient tangent xi = Gram^{-1} proj_g(U^T E); (U^T E)_{km} = sum_l U_{lk} E_{lm}
-                        xi = extract_phi(torch.einsum("...lk,...lm->...km", Ua, Ea), Gd, gram_pinv_=full_gp)
-                        Ur = retract_omega(Ua, -lr * xi, Gd, mode=mode)
-                    validation_failures.append(_omega_validation_failure(Ur))
-                    if collect:
-                        validation_failures.append(_omega_determinant_failure(Ur))
-                    pending_updates.append((
-                        p, U, act, Ur, untied_compact, tied_compact,
-                    ))
-
-                if validation_failures and bool(torch.stack(validation_failures).any()):
-                    raise FloatingPointError(
-                        "omega retraction produced a nonfinite or singular group element"
-                    )
+                pending_updates = omega_plans[id(group)]
 
                 for p, U, act, Ur, untied_compact, tied_compact in pending_updates:
                     U[act] = Ur                                        # U <- U retr(-lr xi), after validation

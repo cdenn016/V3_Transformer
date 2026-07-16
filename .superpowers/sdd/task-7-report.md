@@ -81,3 +81,54 @@ All checks passed!
 ## Review and ownership
 
 The independent read-only review reported no Critical issue. Its three Important findings were the compact no-snapshot trace fallback, early-halt snapshot depth, and multi-batch accelerator logit retention. Each received a RED regression and was closed before the final 11-test and 223-test GREEN runs. Task 7 did not edit the Research vault or daily ledger, did not run the full/slow suite, and did not push or merge.
+
+## Second blocking review closure
+
+The second blocking review found four remaining boundaries. The report-facing `converged_state`, `diagnostics_per_layer`, `numerical_health`, and no-snapshot `attention_maps` paths now use the model's compact-aware diagnostic transport builder. `converged_state` returns the compact transport instead of explicitly materializing a dense pairwise tensor, and the curvature report consumes that representation directly. The report driver continues to pass one diagnostic snapshot to same-sequence consumers and now moves only that current sequence to the model device after the shared inference bank is CPU-hosted.
+
+The inference bank keeps its list-of-records API but CPU-offloads tokens, targets, every `BeliefState` tensor including phi and compact omega blocks, logits, model-channel means and covariances, and the independent model frame. Its exact memory counter sums unique retained tensor storages across every batch. The full-vocabulary preflight guard scales with the entire bounded batch count, and the post-capture guard checks the exact aggregate bank bytes. Population consumers either remain on CPU or move only their current record to the model device.
+
+Eval-only cadence now enables sparse gauge diagnostics even when `artifacts=None` and logging and CSV output are disabled, so diagnostic determinant validation runs on evaluation steps. Direct-omega retractions are staged across every omega parameter group, validated with one aggregate decision, and only then committed. A singular later candidate leaves all earlier frame tables, dirty masks, gradients, and serialized optimizer state unchanged.
+
+The five second-review regressions were first run before these production changes and failed for their intended reasons:
+
+```text
+python -m pytest tests/test_2026_07_15_performance_remediation.py::test_compact_report_fallbacks_keep_transport_factored_end_to_end tests/test_2026_07_15_performance_remediation.py::test_shared_report_inference_bank_serves_all_population_consumers_once tests/test_2026_07_15_performance_remediation.py::test_full_vocab_memory_guard_scales_with_all_retained_batches tests/test_2026_07_15_performance_remediation.py::test_eval_only_step_runs_sparse_omega_determinant_validation tests/test_2026_07_15_performance_remediation.py::test_direct_omega_retraction_is_atomic_across_parameter_groups --junitxml=C:\tmp\task7-review2-red.xml
+Exit code: 1
+FFFFF                                                                    [100%]
+5 failed, 2 warnings in 1.10s
+```
+
+```xml
+<testsuite name="pytest" errors="0" failures="5" skipped="0" tests="5" time="1.101" timestamp="2026-07-16T13:49:28.126661-05:00" />
+```
+
+The literal failures reported four dense transport-builder calls, missing complete CPU transfer, an absent aggregate memory helper, zero eval-only determinant calls, and mutation of the first omega table before the later singular candidate failed.
+
+The final focused module passed from JUnit evidence:
+
+```text
+python -m pytest tests/test_2026_07_15_performance_remediation.py --junitxml=C:\tmp\task7-review2-focused-final.xml
+Exit code: 0
+...............                                                          [100%]
+15 passed, 2 warnings in 1.56s
+```
+
+```xml
+<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="15" time="1.562" timestamp="2026-07-16T13:55:19.137820-05:00" />
+```
+
+Only directly affected report, diagnostics, gauge optimizer, eval-cadence, and compact-transport neighbors were run. The slow report integration node remained skipped by its repository marker.
+
+```text
+python -m pytest tests/test_report.py::test_converged_state_shapes_and_finite tests/test_report.py::test_generate_figures_drives_live_model tests/test_report.py::test_generate_figures_reuses_one_same_token_snapshot tests/test_diagnostics.py tests/test_gauge_optim.py tests/test_train.py::test_train_caps_periodic_eval_at_eval_max_batches tests/test_omega_direct.py::test_compact_free_energy_and_diagnostics_never_dense_materialize --junitxml=C:\tmp\task7-review2-neighbors.xml
+Exit code: 0
+.s...........................                                            [100%]
+28 passed, 1 skipped, 1 warning in 6.07s
+```
+
+```xml
+<testsuite name="pytest" errors="0" failures="0" skipped="1" tests="29" time="6.072" timestamp="2026-07-16T13:53:26.261634-05:00" />
+```
+
+Targeted static verification passed with `ruff check --no-cache` over the seven production/test files changed by this review closure. The review-owned XML files are outside the repository and are deleted before commit. No full or slow suite was run, and this closure does not push or merge.

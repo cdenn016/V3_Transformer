@@ -6,19 +6,23 @@ import pytest
 import torch
 from torch import nn
 
+from vfe3 import metrics
 from vfe3.config import VFE3Config
 from vfe3.ema import EMA
 from vfe3.gauge_optim import GaugeNaturalGradAdamW, project_phi_parameter_rows_
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.lie_ops import extract_phi, gram_pinv, retract_omega
+from vfe3.geometry.transport import CompactFactoredTransport
 from vfe3.model.model import VFEModel
 from vfe3.train import evaluate
 from vfe3.viz import extract
+from vfe3.viz import report
 
 
 e_step_module = importlib.import_module("vfe3.inference.e_step")
 gauge_optim_module = importlib.import_module("vfe3.gauge_optim")
 lie_ops_module = importlib.import_module("vfe3.geometry.lie_ops")
+train_module = importlib.import_module("vfe3.train")
 
 
 def _tiny_config(**overrides: object) -> VFE3Config:
@@ -65,6 +69,18 @@ def _assert_mapping_close(actual: dict, expected: dict) -> None:
             assert actual_value == pytest.approx(expected_value, rel=2e-5, abs=2e-5)
         else:
             assert actual_value == expected_value
+
+
+def _record_tensors(value: object) -> list[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if hasattr(value, "blocks") and isinstance(value.blocks, torch.Tensor):
+        return [value.blocks]
+    if isinstance(value, dict):
+        return [tensor for item in value.values() for tensor in _record_tensors(item)]
+    if isinstance(value, (tuple, list)):
+        return [tensor for item in value for tensor in _record_tensors(item)]
+    return []
 
 
 def test_compact_diagnostics_keep_pairwise_transport_factored(
@@ -135,6 +151,69 @@ def test_compact_trace_fallback_keeps_free_energy_transport_factored(
 
     assert dense_pairwise_builds == 0
     _assert_mapping_close(actual, expected)
+
+
+def test_compact_report_fallbacks_keep_transport_factored_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(29)
+    dense_model = VFEModel(_tiny_config(compact_phi_block_transport=False)).eval()
+    compact_model = VFEModel(_tiny_config(compact_phi_block_transport=True)).eval()
+    compact_model.load_state_dict(dense_model.state_dict())
+    token_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+
+    expected_maps = dense_model.attention_maps(token_ids)
+    expected_layers = dense_model.diagnostics_per_layer(token_ids)
+    expected_health = extract.numerical_health(dense_model, token_ids)
+    expected_state = extract.converged_state(dense_model, token_ids)
+
+    dense_pairwise_builds = 0
+    dense_materializations = 0
+    original_transport = e_step_module._transport
+
+    def _transport_spy(*args: object, **kwargs: object) -> object:
+        nonlocal dense_pairwise_builds
+        dense_pairwise_builds += 1
+        return original_transport(*args, **kwargs)
+
+    def _dense_forbidden(self: CompactFactoredTransport) -> torch.Tensor:
+        del self
+        nonlocal dense_materializations
+        dense_materializations += 1
+        raise AssertionError("compact report fallback materialized pairwise transport")
+
+    monkeypatch.setattr(e_step_module, "_transport", _transport_spy)
+    monkeypatch.setattr(extract, "_transport", _transport_spy)
+    monkeypatch.setattr(CompactFactoredTransport, "to_dense_omega", _dense_forbidden)
+
+    actual_maps = compact_model.attention_maps(token_ids)
+    actual_layers = compact_model.diagnostics_per_layer(token_ids)
+    actual_health = extract.numerical_health(compact_model, token_ids)
+    actual_state = extract.converged_state(compact_model, token_ids)
+    compact_snapshot = compact_model.build_diagnostic_snapshot(token_ids)
+    snapshot_state = extract.converged_state(
+        compact_model,
+        token_ids,
+        snapshot=compact_snapshot,
+    )
+    actual_curvature = metrics.curvature_field(actual_state["omega"])
+
+    assert dense_pairwise_builds == 0
+    assert dense_materializations == 0
+    assert isinstance(actual_state["omega"], CompactFactoredTransport)
+    assert isinstance(snapshot_state["omega"], CompactFactoredTransport)
+    torch.testing.assert_close(actual_maps, expected_maps, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(
+        actual_curvature,
+        metrics.curvature_field(expected_state["omega"]),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    for key, expected_values in expected_layers.items():
+        assert actual_layers[key] == pytest.approx(expected_values, rel=2e-5, abs=2e-5), key
+    _assert_scalar_dict_close(actual_health, expected_health)
+    for key in ("mu", "sigma", "phi", "exp_phi", "energy", "beta", "self_div"):
+        torch.testing.assert_close(actual_state[key], expected_state[key], rtol=2e-5, atol=2e-5)
 
 
 def test_direct_omega_reuses_basis_factorization_and_defers_determinant_diagnostic(
@@ -491,7 +570,7 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
     expected_vocab = extract.vocab_prediction_stats(model, token_batches)
 
     inference_calls = 0
-    logit_cpu_calls = 0
+    cpu_transfer_ids: set[int] = set()
     real_forward_beliefs = model.forward_beliefs
     real_cpu = torch.Tensor.cpu
 
@@ -501,8 +580,7 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
         return real_forward_beliefs(*args, **kwargs)
 
     def _cpu_spy(value: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
-        nonlocal logit_cpu_calls
-        logit_cpu_calls += 1
+        cpu_transfer_ids.add(id(value))
         return real_cpu(value, *args, **kwargs)
 
     monkeypatch.setattr(model, "forward_beliefs", _forward_spy)
@@ -513,8 +591,24 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
         max_batches=len(loader),
         return_logits=True,
     )
-    assert logit_cpu_calls == len(loader)
-    assert all(record["logits"].device.type == "cpu" for record in inference_bank)
+    retained_tensors = [
+        tensor
+        for record in inference_bank
+        for tensor in _record_tensors(record)
+    ]
+    assert len(inference_bank) == len(loader)
+    assert retained_tensors
+    assert all(tensor.device.type == "cpu" for tensor in retained_tensors)
+    assert all(id(tensor) in cpu_transfer_ids for tensor in retained_tensors)
+    expected_bytes = 0
+    seen_storages: set[tuple[str, int]] = set()
+    for tensor in retained_tensors:
+        storage = tensor.untyped_storage()
+        storage_key = (str(tensor.device), storage.data_ptr())
+        if storage_key not in seen_storages:
+            expected_bytes += storage.nbytes()
+            seen_storages.add(storage_key)
+    assert extract.inference_bank_nbytes(inference_bank) == expected_bytes
     actual_belief = extract.belief_bank(
         model,
         token_batches,
@@ -542,6 +636,108 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
     assert actual_model is not None and expected_model is not None
     _assert_mapping_close(actual_model, expected_model)
     _assert_mapping_close(actual_vocab, expected_vocab)
+
+
+def test_full_vocab_memory_guard_scales_with_all_retained_batches() -> None:
+    cfg = _tiny_config(vocab_size=101, max_seq_len=7, batch_size=3)
+    one_batch = report._estimated_full_vocab_bank_bytes(cfg, 1)
+    four_batches = report._estimated_full_vocab_bank_bytes(cfg, 4)
+
+    assert one_batch == 8 * cfg.vocab_size * cfg.max_seq_len * cfg.batch_size
+    assert four_batches == 4 * one_batch
+
+
+def test_eval_only_step_runs_sparse_omega_determinant_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = VFEModel(_tiny_config(
+        gauge_parameterization="omega_direct",
+        omega_compact_storage=True,
+        m_phi_lr=0.01,
+        use_ema=False,
+    ))
+    batch = (
+        torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+    )
+    determinant_calls = 0
+    original = gauge_optim_module._omega_determinant_failure
+
+    def _determinant_spy(value: torch.Tensor) -> torch.Tensor:
+        nonlocal determinant_calls
+        determinant_calls += 1
+        return original(value)
+
+    monkeypatch.setattr(gauge_optim_module, "_omega_determinant_failure", _determinant_spy)
+    train_module.train(
+        model,
+        [batch],
+        model.cfg,
+        n_steps=1,
+        log_interval=None,
+        eval_interval=1,
+        val_loader=[batch],
+        artifacts=None,
+        generate_samples=False,
+    )
+
+    assert determinant_calls > 0
+
+
+def test_direct_omega_retraction_is_atomic_across_parameter_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = get_group("glk")(K=2, dtype=torch.float64)
+    first = nn.Parameter(torch.eye(2, dtype=torch.float64).unsqueeze(0))
+    second = nn.Parameter((1.1 * torch.eye(2, dtype=torch.float64)).unsqueeze(0))
+    optimizer = GaugeNaturalGradAdamW(
+        [
+            {"params": [first], "lr": 0.1, "omega": True, "weight_decay": 0.0},
+            {"params": [second], "lr": 0.1, "omega": True, "weight_decay": 0.0},
+        ],
+        group.generators,
+        group.irrep_dims,
+        gauge_momentum=0.0,
+        weight_decay=0.0,
+    )
+    first.grad = torch.full_like(first, 0.1)
+    second.grad = torch.full_like(second, 0.2)
+    first_before = first.detach().clone()
+    second_before = second.detach().clone()
+    first_grad_before = first.grad.clone()
+    second_grad_before = second.grad.clone()
+    optimizer_state_before = optimizer.state_dict()
+    omega_step_before = optimizer._omega_step
+    calls = 0
+
+    def _late_invalid_retraction(
+        value:      torch.Tensor,
+        tangent:    torch.Tensor,
+        generators: torch.Tensor,
+
+        *,
+        mode:       str,
+    ) -> torch.Tensor:
+        del tangent, generators, mode
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            return torch.zeros_like(value)
+        return value + 0.01 * torch.eye(2, dtype=value.dtype, device=value.device)
+
+    monkeypatch.setattr(lie_ops_module, "retract_omega", _late_invalid_retraction)
+
+    with pytest.raises(FloatingPointError, match="nonfinite or singular"):
+        optimizer.step()
+
+    assert calls == 2
+    assert torch.equal(first, first_before)
+    assert torch.equal(second, second_before)
+    assert torch.equal(first.grad, first_grad_before)
+    assert torch.equal(second.grad, second_grad_before)
+    assert not optimizer.state
+    assert optimizer.state_dict() == optimizer_state_before
+    assert optimizer._omega_step == omega_step_before
 
 
 def test_gamma_compatibility_surfaces_delegate_to_production_rows(

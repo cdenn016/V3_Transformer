@@ -1308,8 +1308,8 @@ def train(
         # Capture pre-clip gradient health only on a step that will log or persist, so the silent
         # hot path stays byte-identical (metrics_out=None -> no extra unscale_, no grad-norm pass).
         step_metrics: Optional[Dict[str, float]] = {} if (do_log or do_csv) else None
-        if hasattr(optimizer, "_collect_gauge_diag"):        # D1/EXP-8: gate the gauge M-step diagnostics
-            optimizer._collect_gauge_diag = bool(do_log or do_csv)   # to log/eval steps (silent path unchanged)
+        if hasattr(optimizer, "_collect_gauge_diag"):        # D1/EXP-8: sparse log/eval diagnostics
+            optimizer._collect_gauge_diag = bool(do_log or do_csv or do_eval)
             if optimizer._collect_gauge_diag:
                 # A nonfinite/otherwise skipped optimizer step must not leave the prior log step's
                 # health values visible as if they were collected for this attempt.
