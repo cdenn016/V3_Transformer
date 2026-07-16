@@ -58,6 +58,7 @@ class ChannelTrainingEvidence:
     metrics_columns: frozenset[str]
     metric_values:  tuple[tuple[str, tuple[float, ...]], ...]
     attention_names: frozenset[str]
+    row_count:       int
 
 
 def _build_channel_training_evidence(
@@ -117,6 +118,7 @@ def _build_channel_training_evidence(
             metrics_columns=metrics_columns,
             metric_values=metric_values,
             attention_names=attention_names,
+            row_count=len(rows),
         )
     finally:
         for figure_number in set(figs.plt.get_fignums()).difference(open_figures):
@@ -374,6 +376,7 @@ def test_model_channel_terms_figure_renders(tmp_path):
 # ---- (8) metrics.csv columns under an active channel, NONE on the pure path -----------------------
 
 def test_metrics_csv_has_model_channel_columns(active_channel_training_evidence):
+    assert active_channel_training_evidence.row_count > 0
     for col in ("hyper_prior", "gamma_coupling", "gamma_meta_entropy"):
         assert col in active_channel_training_evidence.metrics_columns, f"{col} column missing"
         values = next(
@@ -385,6 +388,7 @@ def test_metrics_csv_has_model_channel_columns(active_channel_training_evidence)
 
 
 def test_metrics_csv_pure_path_has_no_model_channel_columns(pure_channel_training_evidence):
+    assert pure_channel_training_evidence.row_count > 0
     assert not (
         {"hyper_prior", "gamma_coupling", "gamma_meta_entropy"}
         & pure_channel_training_evidence.metrics_columns
