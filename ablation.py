@@ -146,7 +146,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        Initialization
     #################################
     mu_init_std               = 0.065,     # std of the random mean table mu_embed
-    sigma_init                = 3,         # constant initial coordinate variance (sigma_log = log of this)
+    sigma_init                = 4,         # constant initial coordinate variance (sigma_log = log of this)
     phi_scale                 = 0.06,      # std
     
     
@@ -340,15 +340,15 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        Learning Rates
     #################################
         
-    m_p_mu_lr                 = 0.0125,   
+    m_p_mu_lr                 = 0.015,     #0.015
     m_p_sigma_lr              = 0.01,     
-    m_phi_lr                  = 0.010,   
+    m_phi_lr                  = 0.01,
     phi_mstep_max_matrix_norm = None,    # opt-in post-M-step projection bound; None leaves the chart unbounded
-   
+
     m_s_phi_lr                = 0.016,         # M-step LR for independent model-channel frame (phi_tilde)
     
-    weight_decay              = 0.02,
-    phi_weight_decay          = 0.035,
+    weight_decay              = 0.02,   #0.03
+    phi_weight_decay          = 0.03, #0.03
     
     min_lr                    = 0,       # absolute cosine-decay LR floor (0.0 = pure cosine)
     min_lr_frac               = 0.01,    # proportional LR floor, max(min_lr, frac*base); OFF
@@ -378,8 +378,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################     
     amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
         
-    log_interval              = 100000,       # console log every N steps (0 = off)
-    eval_interval             = 150000,      # periodic validation every N steps (0 = off)
+    log_interval              = 100,       # console log every N steps (0 = off)
+    eval_interval             = 1500,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
 
     generate_figures          = False,     # OFF: skip the heavy-compute figure set at finalize_run (UMAP
@@ -420,7 +420,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     # log N(mu_q; mu_v, Sigma_q + Sigma_v) - select it above under use_prior_bank=True.
     untie_decode_bank         = False,       # use_prior_bank=True only: decode reads its OWN cloned (V,K) tables
     z_loss_weight             = 0,           # z-loss on the decode partition: w * mean(logsumexp^2) (0 = OFF)
-    sigma_weight_decay        = None,        # AdamW decay for log-variance tables (None = inherit weight_decay;
+    sigma_weight_decay        = 0.01,           # AdamW decay for log-variance tables (None = inherit weight_decay;
                                              # 0.0 exempts sigma from the unintended log-sigma->0 pull)
 
     # --- attention / coupling ---
@@ -1121,7 +1121,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "sigma_max": {  # E1 / EXP-20: does the SPD variance ceiling ever bind? (read guard_sigma_ceil_frac)
         "description": "SPD variance ceiling sigma_max (binding vs slack) [E1/EXP-20]",
-        "param": "sigma_max", "values": [7.5, 10, 20],
+        "param": "sigma_max", "values": [15],
     },
     
     
@@ -1175,17 +1175,17 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === belief-table init scales (PriorBank) ===============================
     "mu_init_std": {
         "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
-        "param": "mu_init_std", "values": [0.010, 0.04, 0.06, 0.075, 0.1],
+        "param": "mu_init_std", "values": [0.01, 0.04, 0.065, 0.075, 0.1],
     },
     
     "sigma_init": {
         "description": "constant initial coordinate variance of the prior table (>0)",
-        "param": "sigma_init", "values": [0.5, 1, 2, 3, 4],
+        "param": "sigma_init", "values": [4, 4.25],
     },
     
     "phi_scale": {
         "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
-        "param": "phi_scale", "values": [0.01, 0.03, 0.05, 0.07, 0.09, 0.125],
+        "param": "phi_scale", "values": [0.01, 0.03, 0.05, 0.06, 0.07, 0.1, 0.15, 0.2],
     },
     
 
@@ -1204,20 +1204,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "lambda_beta": {
         "description": "belief-coupling block weight (1.0 = pure F)",
-        "param": "lambda_beta", "values": [0, 0.25, 0.5, 0.75, 1, 2],
+        "param": "lambda_beta", "values": [0, 0.5, 0.75, 1, 2],
     },
     
     
     
     "lambda_gamma": {
         "description": "model-channel coupling weight (>0 creates s tables)",
-        "param": "lambda_gamma", "values": [0.6, 0.7, 0.8],
+        "param": "lambda_gamma", "values": [0.5, 0.7, 0.75, 0.8],
     },
     
     
     "lambda_h": {
         "description": "hyper-prior weight lambda_h * mean_i KL(s_i||r) (>0 creates s/r tables)",
-        "param": "lambda_h", "values": [0.225, 0.25, 0.275],
+        "param": "lambda_h", "values": [0.2, 0.225, 0.25, 0.275],
     },
     
     
@@ -1287,7 +1287,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
     "m_p_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_p_mu_lr", "values": [0.012, 0.0125, 0.013],
+        "param": "m_p_mu_lr", "values": [0.014, 0.015, 0.016, 0.018],
     },
     
     "m_p_sigma_lr": {
@@ -1297,7 +1297,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.0095, 0.01, 0.011, 0.0125],
+        "param": "m_phi_lr", "values": [0.009, 0.0095, 0.01, 0.0105],
     },
     
 
@@ -1342,20 +1342,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "values": [0.03, 0.04],
+        "param": "weight_decay", "values": [0.015, 0.025],
     }, 
    
     
     
     "phi_weight_decay":{
         "description": "weight decay on phi",
-        "param": "phi_weight_decay", "values": [0.03, 0.04],
+        "param": "phi_weight_decay", "values": [0.02, 0.03, 0.035, 0.04, 0.05],
     },
 
     "sigma_weight_decay": {  # separate AdamW weight decay for the log-variance tables (None = inherit
         # weight_decay). Numeric radii -> LINE plot; the None (inherit) baseline runs via train_vfe3.
         "description": "AdamW weight decay on the log-variance (sigma) tables",
-        "param": "sigma_weight_decay", "values": [0.01, 0.035],
+        "param": "sigma_weight_decay", "values": [0, 0.01, 0.02, 0.035, 0.05],
     },
 
 
@@ -1367,7 +1367,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "mm_damping": {  # MM-exact E-step damping eta in (0,1]; 'requires' pins e_step_update='mm_exact' so the
         # damped coordinate-minimizer step is actually taken every cell (1.0 = full exact minimizer).
         "description": "MM-exact E-step damping eta in (0,1] (requires mm_exact E-step)",
-        "param": "mm_damping", "values": [0.7, 0.75, 0.8],
+        "param": "mm_damping", "values": [0.8, 0.85],
         "requires": {"e_step_update": "mm_exact"},
     },
 
@@ -1376,7 +1376,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "query_tau_c": {  # query-adaptive temperature strength c >= 0 (0 = inert); 'requires' forces
         # query_adaptive_tau=True so tau_i = tau_h (1 + c * tr_h Sigma_i / d_h) is live on every cell.
         "description": "query-adaptive temperature strength c (requires query_adaptive_tau=True)",
-        "param": "query_tau_c", "values": [0.5, 1.0, 2.0, 4.0],
+        "param": "query_tau_c", "values": [0, 0.5, 0.75, 1.0, 2.0, 4.0],
         "requires": {"query_adaptive_tau": True},
     },
 
@@ -1388,11 +1388,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "lambda_twohop", "values": [0.0, 0.001, 0.005, 0.01],
     },
 
-    
+      "gamma_prior_weight": {
+          "description": "gamma_prior_weight",
+          "param": "gamma_prior_weight", "values": [0.0, 0.1, 0.25, 0.5, 0.75, 1],
+      },
 
     "warmup_steps": {  # LR warmup length before the cosine decay (0 = no warmup, straight into cosine).
         "description": "LR warmup steps before cosine decay",
-        "param": "warmup_steps", "values": [0, 10, 100, 500, 1000, 5000],
+        "param": "warmup_steps", "values": [50, 150, 200, 1500],
     },
 
 
@@ -1463,80 +1466,81 @@ NON_SWEPT_FIELDS = (
 # CONFIG["sweep"]="<name>"); add or remove names to shape a session. Cheap-to-expensive is a good
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
-   #"e_s_sigma_lr",
-    #"e_s_mu_lr",
-   
-   "m_phi_lr",
-   
+   "gamma_prior_weight",
+  # "m_phi_lr",
+  #"weight_decay",
+  #"sigma_init",
+
+  # "m_p_mu_lr",
+  # "m_p_sigma_lr",
+
+   #"sigma_weight_decay",
+
+   #"phi_weight_decay",
+
+
+    #"mu_init_std",
+    #"phi_scale",
+
+
+  # "mm_damping",
+  # "query_tau_c",
    #"lambda_h",
    #"lambda_gamma",
-  # "lambda_alpha",
-  
-   "m_p_mu_lr",
-   "m_p_sigma_lr",
-   
-   "sigma_weight_decay",
-   "weight_decay",
-   "phi_weight_decay",
-    
-   #"mm_damping",
-  
-  
-     "mu_init_std",
-    "phi_scale",
-    "sigma_init", 
-   
-    
-   "query_tau_c",
-   
-    "lambda_beta",
-   "warmup_steps", 
+
+
+
+
+   # "lambda_beta",
+  # "warmup_steps",
   #"gauge_transport",
  # "attention_entropy",
  # "gauge_equivariance",
   #"cg_coupling",
  # "fisher_mu_precond",
-  
+
  # "n_e_steps_em",
  # "gauge_mstep_optim",
-  
-  #"m_phi_lr_natgrad",   havent run 
- 
+
+  #"m_phi_lr_natgrad",   havent run
+
  # "pos_extrapolation",
  # "rho_handoff",
-   
+
   #"kappa_beta_per_head",
-  
+
   # "precision_attention_b0",
   # "decode_tau",
-  
-   #"e_q_mu_lr",
-  
-  
- # "sigma_max",
-  
-   
-     
+
+
+
+
+   # "sigma_max",
+
+
+
    # "renyi_order",
-   
-   "e_mu_q_trust",
-   "e_mu_q_trust_ball",
 
-  
-    
+   #"e_mu_q_trust",
+   #"e_mu_q_trust_ball",
+
+   # "lambda_alpha",
+    #"e_s_sigma_lr",
+     #"e_s_mu_lr",
    #"e_q_sigma_lr",
+    #"e_q_mu_lr",
 
-    #"pos_phi_scale",  
-   
-   
+    #"pos_phi_scale",
+
+
    "lambda_twohop",
   # "kappa_beta",
-  # "kappa_gamma",   
-    
+  # "kappa_gamma",
+
    # "mass_phi",
    # "mstep_self_coupling_weight",
 
-   
+
 
 ]
 
