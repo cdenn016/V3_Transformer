@@ -351,10 +351,10 @@ Run `git diff --stat origin/main...HEAD`, `git diff --check origin/main...HEAD`,
 
 Record exact JUnit counts, benchmark results or the explicit resource blocker, files changed, and the preserved baseline failure in `docs/2026-07-15-edits.md`. Commit any final documentation-only change.
 
-- [ ] **Step 6: Push, merge, and update the live checkout safely**
+- [x] **Step 6: Push, merge, and update the live checkout safely**
 
 Push `codex/phi-projection-optimization-20260715`, fast-forward `main` to the verified task tip, push `origin/main`, fetch, and confirm the remote SHA. Fast-forward the user's live `main` checkout only if Git can do so without altering its pre-existing WIP. Never stash, restore, reset, clean, or rewrite the user's files.
 
-- [ ] **Step 7: Clean task-owned artifacts and report final state**
+- [x] **Step 7: Clean task-owned artifacts and report final state**
 
 Remove only task-owned JUnit and benchmark files from `C:\tmp`, remove the temporary worktree, delete the local task branch, and report the task commits, pushed branch, resulting `origin/main` SHA, machine-readable verification, safe live fast-forward result, and the live checkout's final `git status --short` with remaining files identified as user-owned.
