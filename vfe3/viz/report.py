@@ -105,11 +105,12 @@ def _collect_token_batches(
     device:   torch.device,
     n_batches: int,
 ) -> List[torch.Tensor]:
-    r"""Up to ``n_batches`` (B, N) token-id batches off the loader (drops the target tensor)."""
+    r"""Collect CPU-hosted token batches; consumers move only their current batch to ``device``."""
+    del device                                                        # retained private-call compatibility
     out: List[torch.Tensor] = []
     for batch in loader:
         tokens = batch[0] if isinstance(batch, (tuple, list)) else batch
-        out.append(tokens.to(device))
+        out.append(tokens.detach().cpu())
         if len(out) >= n_batches:
             break
     return out
@@ -395,7 +396,7 @@ def generate_figures(
           lambda p: figs.plot_gauge_equivariance(metrics.gauge_equivariance_residual(
               cstate["mu"], cstate["sigma"], cstate["omega"], model.group,
               kappa=cfg.kappa_beta, renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-              divergence_family=cfg.divergence_family), path=p),
+              diagonal=cfg.diagonal_covariance, divergence_family=cfg.divergence_family), path=p),
           cstate is not None)
     _emit("gauge_head_specialization",
           lambda p: figs.plot_gauge_head_specialization(

@@ -132,3 +132,70 @@ Exit code: 0
 ```
 
 Targeted static verification passed with `ruff check --no-cache` over the seven production/test files changed by this review closure. The review-owned XML files are outside the repository and are deleted before commit. No full or slow suite was run, and this closure does not push or merge.
+
+## Third blocking review closure
+
+The third blocking review found three remaining runtime boundaries. The report-facing gauge-equivariance residual now consumes `CompactFactoredTransport` through dense vertex factors and a bounded one-query-row contraction. It preserves the dense metric dictionary while never allocating or calling the compact transport's full `(N,N,K,K)` compatibility conversion. The report passes the configured covariance rank explicitly, avoiding the `N == K` ambiguity in rank inference.
+
+Inference-bank extraction now releases the previous batch's device tokens, targets, returned belief, decoded logits, captured output and prior, and model-channel locals before the next model forward. The vocabulary consumer likewise releases each batch's decoded logits, softmax probabilities, views, targets, and tokens before the next softmax. The no-bank report fallback retains detached CPU token batches; each consumer moves only its current batch to the model device.
+
+The direct-omega reorthogonalization cadence is now one optimizer-step clock. Candidate updates across all omega parameter groups still stage and validate before any commit. After every eligible group commits, the clock increments once; a cadence hit applies the polar projection to dirty rows in every omega group on that same step. The existing late-invalid-candidate regression continues to prove that validation failure leaves every group and the cadence state untouched.
+
+These five regressions were run before the production fixes and failed for the intended reasons:
+
+```text
+python -m pytest tests/test_2026_07_15_performance_remediation.py::test_compact_report_fallbacks_keep_transport_factored_end_to_end tests/test_2026_07_15_performance_remediation.py::test_inference_bank_releases_prior_device_batch_before_next_forward tests/test_2026_07_15_performance_remediation.py::test_vocab_consumer_releases_previous_logits_and_probabilities_before_softmax tests/test_2026_07_15_performance_remediation.py::test_report_token_fallback_keeps_all_collected_batches_off_device tests/test_2026_07_15_performance_remediation.py::test_direct_omega_reorth_cadence_is_one_clock_for_all_groups --junitxml=C:\tmp\task7-rereview-red.xml
+Exit code: 1
+FFFFF                                                                    [100%]
+5 failed, 1 warning in 1.28s
+```
+
+```xml
+<testsuite name="pytest" errors="0" failures="5" skipped="0" tests="5" time="1.278" timestamp="2026-07-16T14:09:55.186341-05:00" />
+```
+
+The failures respectively showed the forbidden pairwise compatibility conversion, a live prior inference workset at the next forward, live logits and probabilities at the next softmax, eager fallback device moves, and a two-group cadence clock advancing twice per optimizer step.
+
+The same five nodes then passed with machine-readable evidence:
+
+```text
+Exit code: 0
+.....                                                                    [100%]
+5 passed, 1 warning in 1.15s
+```
+
+```xml
+<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="5" time="1.147" timestamp="2026-07-16T14:24:02.284561-05:00" />
+```
+
+The complete focused Task 7 module passed:
+
+```text
+python -m pytest tests/test_2026_07_15_performance_remediation.py --junitxml=C:\tmp\task7-performance-green.xml
+Exit code: 0
+...................                                                      [100%]
+19 passed, 3 warnings in 1.21s
+```
+
+```xml
+<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="19" time="1.211" timestamp="2026-07-16T14:24:10.546582-05:00" />
+```
+
+Only directly affected metric, report, extraction, compact-transport, and gauge-optimizer neighbors were run:
+
+```text
+python -m pytest tests/test_gauge_optim.py tests/test_metrics.py::test_gauge_equivariance_residual_in_vs_out_group tests/test_omega_direct.py::test_compact_free_energy_and_diagnostics_never_dense_materialize tests/test_omega_direct.py::test_omega_reorth_projects_drifted_element_back_to_O_K tests/test_omega_direct.py::test_gauge_optim_omega_reorth_fires_on_cadence_for_single_block_skew tests/test_omega_direct.py::test_gauge_optim_omega_reorth_is_noop_for_irrep_tower tests/test_report.py::test_converged_state_shapes_and_finite tests/test_report.py::test_generate_figures_reuses_one_same_token_snapshot --junitxml=C:\tmp\task7-affected-green.xml
+Exit code: 0
+.........................                                                [100%]
+25 passed, 1 warning in 5.64s
+```
+
+```xml
+<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="25" time="5.637" timestamp="2026-07-16T14:24:27.089971-05:00" />
+```
+
+Targeted Ruff verification over the five changed production/test files passed with `ruff check --no-cache`.
+
+The P4 projection boundary was rechecked against `docs/superpowers/specs/2026-07-15-phi-projection-hot-path-optimization-design.md`. Current-batch row projection is not a valid replacement for the exact hard bound: AdamW first moments, natural-gradient momentum, and nonzero decay can move rows that are absent from the current batch. Task 7 therefore retains the approved exact global scan. Its certified diagonal-Gram route is `O(rows*n_gen)` rather than the rejected dense `O(rows*n_gen*K^2)` route, statistics use one aggregate transfer, and the feature remains default-off when `phi_mstep_max_matrix_norm=None`.
+
+No full or slow suite was run. This closure does not edit the daily ledger or Research vault, and it does not push or merge.

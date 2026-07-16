@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.geometry.transport import CompactFactoredTransport
 
 
@@ -1543,10 +1544,19 @@ def gauge_equivariance_residual(
     from vfe3.free_energy import attention_tau, attention_weights, pairwise_energy
     from vfe3.geometry.transport import transport_covariance, transport_mean
 
-    # The out-of-structure-group control intentionally mixes compact blocks, so this metric is the
-    # explicit dense compatibility boundary. Extraction and every other report replay remain compact.
+    compact_factors: Optional[
+        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
+    ] = None
     if isinstance(omega, CompactFactoredTransport):
-        omega = omega.to_dense_omega()
+        # A generic out-of-group control mixes the compact blocks, but it still acts on the two
+        # vertex factors independently. Expanding each vertex to (N,K,K) keeps the exact
+        # A_i B_j action without ever allocating the pairwise (N,N,K,K) transport.
+        compact_factors = (
+            CompactBlockElement(omega.exp_blocks, omega.K).to_dense(),
+            CompactBlockElement(omega.inv_blocks, omega.K).to_dense(),
+            None,
+            None,
+        )
 
     full = get_family("gaussian_full")
     is_full = _is_full_cov(sigma, diagonal)
@@ -1557,21 +1567,49 @@ def gauge_equivariance_residual(
     off = ~torch.eye(mu.shape[0], dtype=torch.bool, device=mu.device)
     gen = torch.Generator(device=mu.device).manual_seed(int(seed))
 
-    def _energy(mu_q: torch.Tensor, sig_q: torch.Tensor, om: torch.Tensor):
-        mu_t = transport_mean(om.unsqueeze(0), mu_q.unsqueeze(0))[0]          # (N, N, K)
-        sig_t = transport_covariance(om.unsqueeze(0), sig_q.unsqueeze(0))[0]  # (N, N, K, K)
+    def _energy(
+        mu_q:   torch.Tensor,
+        sig_q:  torch.Tensor,
+        om:     'torch.Tensor | Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]',
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(om, tuple):
+            left, right, gauge_left, gauge_right = om
+            mu_rows: List[torch.Tensor] = []
+            sig_rows: List[torch.Tensor] = []
+            for i in range(left.shape[0]):
+                omega_row = torch.einsum(
+                    "ikl,jlm->ijkm", left[i:i + 1], right)                  # (1, N, K, K)
+                if gauge_left is not None and gauge_right is not None:
+                    omega_row = torch.einsum(
+                        "kl,ijlm,mn->ijkn", gauge_left, omega_row, gauge_right)
+                mu_rows.append(transport_mean(omega_row, mu_q)[0])
+                sig_rows.append(transport_covariance(
+                    omega_row,
+                    sig_q,
+                    diagonal_out=sig_q.dim() == mu_q.dim(),
+                )[0])
+            mu_t = torch.stack(mu_rows, dim=0)                              # (N, N, K)
+            sig_t = torch.stack(sig_rows, dim=0)                            # (N, N, K[, K])
+        else:
+            mu_t = transport_mean(om.unsqueeze(0), mu_q.unsqueeze(0))[0]          # (N, N, K)
+            sig_t = transport_covariance(om.unsqueeze(0), sig_q.unsqueeze(0))[0]  # (N, N, K, K)
         e = pairwise_energy(full(mu_q, sig_q), full(mu_t, sig_t),
                             alpha=renyi_order, kl_max=kl_max, eps=eps,
                             divergence_family=divergence_family, irrep_dims=group.irrep_dims)
         return e, attention_weights(e, tau=tau)
 
-    e0, beta0 = _energy(mu, sigma0, omega)
+    base_transport = compact_factors if compact_factors is not None else omega
+    e0, beta0 = _energy(mu, sigma0, base_transport)
 
-    def _residuals(g: torch.Tensor):
+    def _residuals(g: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         g_inv = torch.linalg.inv(g)
         mu_g = mu @ g.transpose(-1, -2)                                       # (N, K) g mu_i
         sig_g = g @ sigma0 @ g.transpose(-1, -2)                              # (N, K, K) g Sigma g^T
-        om_g = torch.einsum("kl,ijlm,mn->ijkn", g, omega, g_inv)             # g Omega g^{-1}
+        if compact_factors is None:
+            om_g = torch.einsum("kl,ijlm,mn->ijkn", g, omega, g_inv)         # g Omega g^{-1}
+        else:
+            left, right, _, _ = compact_factors
+            om_g = (left, right, g, g_inv)                                    # g (A_i B_j) g^{-1}
         e, beta = _energy(mu_g, sig_g, om_g)
         r_e = ((e - e0).abs() / e0.abs().clamp(min=eps))
         r_b = (beta - beta0).abs()

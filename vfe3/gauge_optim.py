@@ -610,41 +610,6 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                         else:
                             omega_cond_acc.append(_omega_condition_values(updated).reshape(-1))
                     p.grad = None                                      # consumed: AdamW no-ops on it
-                # Orthogonality-drift control (default OFF: omega_reorth_every=0 -> byte-identical).
-                # Polar reorth guarantees O(K) membership, which equals the structure group ONLY for
-                # the single-block defining rep (so_k: rho(SO(K)) = SO(K), so the nearest-O(K) matrix
-                # _polar_orthogonalize returns is exactly the correct projection). For an irrep TOWER
-                # (so_n/sp_n, len(irrep_dims) > 1) the stored omega_embed is a faithful rho(SO(N))
-                # IMAGE -- a proper submanifold of O(K) -- so the nearest-O(K) matrix is NOT guaranteed
-                # to stay in that image; firing reorth there would silently relax the structure group.
-                # Towers are therefore excluded and left a no-op: their bounded drift is left to the
-                # retraction's own second-order stability (a faithful rho-image projection is
-                # deferred). Cadence is counted in M-steps (this branch runs once per optimizer.step()
-                # call), not in active-row updates, so drift accumulated over past steps is corrected
-                # on schedule even on a step with no gradient. The compact block groups
-                # (block_glk/tied_block_glk) are non-skew, so this never fires for a (V,H,d,d)/(V,d,d)
-                # table regardless of the block-count gate below.
-                if (self._skew_symmetric and self._omega_reorth_every > 0
-                        and len(self._irrep_dims) == 1):
-                    self._omega_step += 1
-                    if self._omega_step % self._omega_reorth_every == 0:
-                        for p in group["params"]:
-                            dirty = self.state[p].get("omega_dirty")
-                            if dirty is None:
-                                continue
-                            if dirty.shape != (p.shape[0],):
-                                raise ValueError(
-                                    f"optimizer omega_dirty has shape {tuple(dirty.shape)}, expected "
-                                    f"({p.shape[0]},)")
-                            if dirty.device != p.device or dirty.dtype != torch.bool:
-                                dirty = dirty.to(device=p.device, dtype=torch.bool)
-                                self.state[p]["omega_dirty"] = dirty
-                            if not bool(dirty.any()):
-                                continue
-                            projected = _polar_orthogonalize(p.data[dirty])
-                            _require_finite_nonsingular_omega(projected)
-                            p.data[dirty] = projected
-                            dirty.zero_()
                 continue
             if not group.get("gauge", False):
                 continue
@@ -713,6 +678,36 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                     buf.mul_(mom).add_(nat)                             # heavy-ball: m <- mom*m + nat
                     p.add_(buf, alpha=-lr)                             # phi <- phi - lr*m
                 p.grad = None                                          # consumed: AdamW no-ops on it
+        # Orthogonality-drift control (default OFF: omega_reorth_every=0 -> byte-identical).
+        # Polar reorth guarantees O(K) membership, which equals the structure group ONLY for the
+        # single-block defining rep (so_k: rho(SO(K)) = SO(K)). Irrep towers are excluded because
+        # their faithful rho(SO(N)) image is a proper submanifold of O(K). The cadence is one clock
+        # per optimizer step, after every omega group commits; when it fires, every eligible omega
+        # group is projected on that same step, including dirty rows accumulated without new grads.
+        if (self._has_omega_group and self._skew_symmetric and self._omega_reorth_every > 0
+                and len(self._irrep_dims) == 1):
+            self._omega_step += 1
+            if self._omega_step % self._omega_reorth_every == 0:
+                for omega_group in self.param_groups:
+                    if not omega_group.get("omega", False):
+                        continue
+                    for p in omega_group["params"]:
+                        dirty = self.state[p].get("omega_dirty")
+                        if dirty is None:
+                            continue
+                        if dirty.shape != (p.shape[0],):
+                            raise ValueError(
+                                f"optimizer omega_dirty has shape {tuple(dirty.shape)}, expected "
+                                f"({p.shape[0]},)")
+                        if dirty.device != p.device or dirty.dtype != torch.bool:
+                            dirty = dirty.to(device=p.device, dtype=torch.bool)
+                            self.state[p]["omega_dirty"] = dirty
+                        if not bool(dirty.any()):
+                            continue
+                        projected = _polar_orthogonalize(p.data[dirty])
+                        _require_finite_nonsingular_omega(projected)
+                        p.data[dirty] = projected
+                        dirty.zero_()
         if collect:
             if cos_acc:
                 self._gauge_diag["cos_nat_phi"] = sum(cos_acc) / len(cos_acc)

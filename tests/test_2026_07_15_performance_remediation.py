@@ -1,5 +1,7 @@
+import gc
 import importlib
 import math
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -166,6 +168,18 @@ def test_compact_report_fallbacks_keep_transport_factored_end_to_end(
     expected_layers = dense_model.diagnostics_per_layer(token_ids)
     expected_health = extract.numerical_health(dense_model, token_ids)
     expected_state = extract.converged_state(dense_model, token_ids)
+    compact_reference_state = extract.converged_state(compact_model, token_ids)
+    assert isinstance(compact_reference_state["omega"], CompactFactoredTransport)
+    expected_equivariance = metrics.gauge_equivariance_residual(
+        compact_reference_state["mu"],
+        compact_reference_state["sigma"],
+        compact_reference_state["omega"].to_dense_omega(),
+        compact_model.group,
+        kappa=compact_model.cfg.kappa_beta,
+        diagonal=compact_model.cfg.diagonal_covariance,
+        n_samples=2,
+        seed=7,
+    )
 
     dense_pairwise_builds = 0
     dense_materializations = 0
@@ -197,11 +211,23 @@ def test_compact_report_fallbacks_keep_transport_factored_end_to_end(
         snapshot=compact_snapshot,
     )
     actual_curvature = metrics.curvature_field(actual_state["omega"])
+    actual_equivariance = metrics.gauge_equivariance_residual(
+        actual_state["mu"],
+        actual_state["sigma"],
+        actual_state["omega"],
+        compact_model.group,
+        kappa=compact_model.cfg.kappa_beta,
+        diagonal=compact_model.cfg.diagonal_covariance,
+        n_samples=2,
+        seed=7,
+    )
 
     assert dense_pairwise_builds == 0
     assert dense_materializations == 0
     assert isinstance(actual_state["omega"], CompactFactoredTransport)
     assert isinstance(snapshot_state["omega"], CompactFactoredTransport)
+    torch.testing.assert_close(actual_state["mu"], compact_reference_state["mu"], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual_state["sigma"], compact_reference_state["sigma"], rtol=0.0, atol=0.0)
     torch.testing.assert_close(actual_maps, expected_maps, rtol=2e-5, atol=2e-5)
     torch.testing.assert_close(
         actual_curvature,
@@ -209,6 +235,14 @@ def test_compact_report_fallbacks_keep_transport_factored_end_to_end(
         rtol=2e-5,
         atol=2e-5,
     )
+    for key, expected_value in expected_equivariance.items():
+        torch.testing.assert_close(
+            actual_equivariance[key],
+            expected_value,
+            rtol=2e-4,
+            atol=(1e-3 if key.startswith("energy_") else 2e-5),
+            msg=lambda message, label=key: f"{label}\n{message}",
+        )
     for key, expected_values in expected_layers.items():
         assert actual_layers[key] == pytest.approx(expected_values, rel=2e-5, abs=2e-5), key
     _assert_scalar_dict_close(actual_health, expected_health)
@@ -638,6 +672,114 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
     _assert_mapping_close(actual_vocab, expected_vocab)
 
 
+def test_inference_bank_releases_prior_device_batch_before_next_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = VFEModel(_tiny_config(
+        n_heads=1,
+        prior_source="model_channel",
+        s_frame_mode="phi_tilde",
+        s_e_step=True,
+        lambda_h=1.0,
+        lambda_gamma=0.0,
+    )).eval()
+    loader = [
+        (torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]])),
+        (torch.tensor([[4, 3, 2, 1]]), torch.tensor([[3, 2, 1, 0]])),
+    ]
+    previous_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    liveness_checks: list[bool] = []
+    calls = 0
+    real_forward = model.forward_beliefs
+
+    def _forward_spy(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        if previous_refs:
+            gc.collect()
+            liveness_checks.append(all(ref() is None for ref in previous_refs))
+        result = real_forward(*args, **kwargs)
+        if calls == 0:
+            capture = kwargs["capture"]
+            tensors = (
+                result[0].mu,
+                result[1],
+                capture["out"].sigma,
+                capture["prior"].mu,
+                capture["prior"].phi,
+            )
+            previous_refs.extend(weakref.ref(tensor) for tensor in tensors)
+        calls += 1
+        return result
+
+    monkeypatch.setattr(model, "forward_beliefs", _forward_spy)
+    extract.collect_inference_bank(model, loader, return_logits=True)
+
+    assert calls == 2
+    assert liveness_checks == [True]
+
+
+def test_vocab_consumer_releases_previous_logits_and_probabilities_before_softmax(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = VFEModel(_tiny_config()).eval()
+    token_batches = [
+        torch.tensor([[0, 1, 2, 3]]),
+        torch.tensor([[4, 3, 2, 1]]),
+    ]
+    inference_bank = extract.collect_inference_bank(
+        model,
+        token_batches,
+        return_logits=True,
+    )
+    previous_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    liveness_checks: list[bool] = []
+    real_softmax = torch.softmax
+
+    def _softmax_spy(value: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+        if previous_refs:
+            gc.collect()
+            liveness_checks.append(all(ref() is None for ref in previous_refs))
+        result = real_softmax(value, *args, **kwargs)
+        previous_refs[:] = [weakref.ref(value), weakref.ref(result)]
+        return result
+
+    monkeypatch.setattr(torch, "softmax", _softmax_spy)
+    extract.vocab_prediction_stats(
+        model,
+        token_batches,
+        inference_bank=inference_bank,
+    )
+
+    assert liveness_checks == [True]
+
+
+def test_report_token_fallback_keeps_all_collected_batches_off_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_batches = [
+        torch.tensor([[0, 1, 2, 3]]),
+        torch.tensor([[4, 3, 2, 1]]),
+    ]
+    device_moves: list[int] = []
+
+    def _to_spy(value: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+        del args, kwargs
+        device_moves.append(id(value))
+        return value
+
+    monkeypatch.setattr(torch.Tensor, "to", _to_spy)
+    actual = report._collect_token_batches(
+        token_batches,
+        torch.device("cuda"),
+        len(token_batches),
+    )
+
+    assert device_moves == []
+    assert all(torch.equal(actual_batch, source_batch)
+               for actual_batch, source_batch in zip(actual, token_batches))
+    assert all(tokens.device.type == "cpu" for tokens in actual)
+
+
 def test_full_vocab_memory_guard_scales_with_all_retained_batches() -> None:
     cfg = _tiny_config(vocab_size=101, max_seq_len=7, batch_size=3)
     one_batch = report._estimated_full_vocab_bank_bytes(cfg, 1)
@@ -738,6 +880,49 @@ def test_direct_omega_retraction_is_atomic_across_parameter_groups(
     assert not optimizer.state
     assert optimizer.state_dict() == optimizer_state_before
     assert optimizer._omega_step == omega_step_before
+
+
+def test_direct_omega_reorth_cadence_is_one_clock_for_all_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = get_group("so_k")(K=2, dtype=torch.float64)
+    first = nn.Parameter(torch.eye(2, dtype=torch.float64).repeat(2, 1, 1))
+    second = nn.Parameter(torch.eye(2, dtype=torch.float64).repeat(2, 1, 1))
+    optimizer = GaugeNaturalGradAdamW(
+        [
+            {"params": [first], "lr": 0.05, "omega": True, "weight_decay": 0.0},
+            {"params": [second], "lr": 0.05, "omega": True, "weight_decay": 0.0},
+        ],
+        group.generators,
+        group.irrep_dims,
+        gauge_momentum=0.0,
+        skew_symmetric=True,
+        omega_reorth_every=2,
+        weight_decay=0.0,
+    )
+    polar_calls: list[torch.Size] = []
+    original_polar = gauge_optim_module._polar_orthogonalize
+
+    def _polar_spy(value: torch.Tensor) -> torch.Tensor:
+        polar_calls.append(value.shape)
+        return original_polar(value)
+
+    monkeypatch.setattr(gauge_optim_module, "_polar_orthogonalize", _polar_spy)
+    for parameter in (first, second):
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+
+    assert optimizer._omega_step == 1
+    assert polar_calls == []
+    assert all(bool(optimizer.state[p]["omega_dirty"].all()) for p in (first, second))
+
+    for parameter in (first, second):
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+
+    assert optimizer._omega_step == 2
+    assert polar_calls == [torch.Size([2, 2, 2]), torch.Size([2, 2, 2])]
+    assert all(not bool(optimizer.state[p]["omega_dirty"].any()) for p in (first, second))
 
 
 def test_gamma_compatibility_surfaces_delegate_to_production_rows(

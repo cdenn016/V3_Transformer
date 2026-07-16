@@ -213,7 +213,7 @@ def collect_inference_bank(
             tokens = tokens.to(device)
             targets = targets.to(device) if targets is not None else None
             capture: dict = {}
-            _, logits = model.forward_beliefs(
+            beliefs, logits = model.forward_beliefs(
                 tokens,
                 return_logits=return_logits,
                 capture=capture,
@@ -237,7 +237,12 @@ def collect_inference_bank(
                 "s_sigma": _cpu_bank_value(s_sigma) if s_sigma is not None else None,
                 "model_phi": _cpu_bank_value(model_phi) if model_phi is not None else None,
             })
-            if max_batches is not None and i + 1 >= max_batches:
+            stop = max_batches is not None and i + 1 >= max_batches
+            # The record now owns detached CPU copies. Release every accelerator-side inference
+            # workset before the next model forward instead of relying on the loop variable overwrite.
+            del batch, tokens, targets, capture, beliefs, logits, out, prior
+            del s_mu, s_sigma, model_phi
+            if stop:
                 break
     finally:
         if was_training:
@@ -1540,6 +1545,7 @@ def vocab_prediction_stats(
                 tokens = tokens.unsqueeze(0)
             b, n = tokens.shape
             if n < 2:
+                del batch, tokens, decoded
                 continue
             logits = decoded[:, :-1].float()                        # (B, N-1, V) drop last (no in-window target)
             targets = tokens[:, 1:]                                 # (B, N-1) true next token
@@ -1558,6 +1564,9 @@ def vocab_prediction_stats(
             if disp is None:
                 disp = _vocab_display_panel(probs[0], tokens[0], max_rows=max_rows,
                                             per_pos_k=per_pos_k, max_positions=max_positions)
+            # Aggregates and display samples are already detached onto their owning devices.
+            # Drop the full-vocabulary current-batch workset before the next decode/softmax.
+            del batch, tokens, decoded, logits, targets, probs, flatp, tgt_flat
     finally:
         if was_training:
             model.train()
