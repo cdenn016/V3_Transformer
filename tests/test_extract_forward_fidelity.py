@@ -135,9 +135,18 @@ def test_belief_bank_matches_forward_under_s_e_step():
     b, n = tokens.shape
     ref = _forward_reference(model, tokens)          # (B, N, K) raw stack output
     bank = extract.belief_bank(model, [tokens])
-    assert torch.allclose(bank["mu"],    ref.mu.reshape(b * n, -1),                       atol=1e-5)
-    assert torch.allclose(bank["sigma"], ref.sigma.reshape(b * n, *ref.sigma.shape[2:]), atol=1e-5)
-    assert torch.allclose(bank["phi"],   ref.phi.reshape(b * n, -1),                     atol=1e-5)
+    assert all(value.device.type == "cpu" for value in bank.values())
+    assert torch.allclose(
+        bank["mu"], ref.mu.reshape(b * n, -1).detach().cpu(), atol=1e-5,
+    )
+    assert torch.allclose(
+        bank["sigma"],
+        ref.sigma.reshape(b * n, *ref.sigma.shape[2:]).detach().cpu(),
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        bank["phi"], ref.phi.reshape(b * n, -1).detach().cpu(), atol=1e-5,
+    )
     # Discrimination guard: the PRE-fix bank body (no s-anchor, no fold) diverges from forward.
     with torch.no_grad():
         beliefs0 = model.prior_bank.encode(tokens)
@@ -172,9 +181,13 @@ def test_extractor_fold_and_anchor_are_noops_on_default_config():
         rope0 = model._rope_rotation(tokens.shape[1], tokens.device)
         out0 = _stack(model, beliefs0, raw_prior, rope0)
     b, n = tokens.shape
-    assert torch.equal(bank["mu"],    out0.mu.reshape(b * n, -1))
-    assert torch.equal(bank["sigma"], out0.sigma.reshape(b * n, *out0.sigma.shape[2:]))
-    assert torch.equal(bank["phi"],   out0.phi.reshape(b * n, -1))
+    assert all(value.device.type == "cpu" for value in bank.values())
+    assert torch.equal(bank["mu"], out0.mu.reshape(b * n, -1).detach().cpu())
+    assert torch.equal(
+        bank["sigma"],
+        out0.sigma.reshape(b * n, *out0.sigma.shape[2:]).detach().cpu(),
+    )
+    assert torch.equal(bank["phi"], out0.phi.reshape(b * n, -1).detach().cpu())
 
 
 def test_encode_one_matches_forward_under_refined_rope_gamma() -> None:
@@ -200,9 +213,15 @@ def test_belief_bank_matches_forward_under_refined_rope_gamma() -> None:
     bank = extract.belief_bank(model, [tokens])
     b, n = tokens.shape
 
-    assert torch.allclose(bank["mu"], ref.mu.reshape(b * n, -1), atol=1e-5, rtol=1e-5)
+    assert all(value.device.type == "cpu" for value in bank.values())
     assert torch.allclose(
-        bank["sigma"], ref.sigma.reshape(b * n, *ref.sigma.shape[2:]), atol=1e-5, rtol=1e-5,
+        bank["mu"], ref.mu.reshape(b * n, -1).detach().cpu(), atol=1e-5, rtol=1e-5,
+    )
+    assert torch.allclose(
+        bank["sigma"],
+        ref.sigma.reshape(b * n, *ref.sigma.shape[2:]).detach().cpu(),
+        atol=1e-5,
+        rtol=1e-5,
     )
 
 
@@ -216,8 +235,9 @@ def test_belief_ce_bank_matches_forward_sigma_under_refined_rope_gamma() -> None
     targets = torch.roll(tokens, shifts=-1, dims=1)
     ref = _forward_reference(model, tokens)
     bank = extract.belief_ce_bank(model, [(tokens, targets)], max_batches=1)
-    expected_trace = ref.sigma.sum(dim=-1).reshape(-1)
+    expected_trace = ref.sigma.sum(dim=-1).reshape(-1).detach().cpu()
 
+    assert all(value.device.type == "cpu" for value in bank.values())
     assert torch.allclose(bank["tr_sigma"], expected_trace, atol=1e-5, rtol=1e-5)
 
 
@@ -262,6 +282,14 @@ def test_model_channel_bank_matches_direct_rope_refine() -> None:
 
     assert bank is not None
     b, n = tokens.shape
-    assert torch.allclose(bank["mu"], expected_mu.reshape(b * n, -1), atol=1e-6, rtol=1e-6)
-    assert torch.allclose(bank["sigma"], expected_sigma.reshape(b * n, -1), atol=1e-6, rtol=1e-6)
+    assert all(value.device.type == "cpu" for value in bank.values())
+    assert torch.allclose(
+        bank["mu"], expected_mu.reshape(b * n, -1).detach().cpu(), atol=1e-6, rtol=1e-6,
+    )
+    assert torch.allclose(
+        bank["sigma"],
+        expected_sigma.reshape(b * n, -1).detach().cpu(),
+        atol=1e-6,
+        rtol=1e-6,
+    )
     assert not torch.allclose(expected_mu, unrotated_mu, atol=1e-6, rtol=1e-6)

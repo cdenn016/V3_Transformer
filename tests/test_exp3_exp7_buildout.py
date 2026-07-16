@@ -19,7 +19,6 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import pytest
 import torch
 
 import ablation
@@ -54,6 +53,7 @@ def test_belief_ce_bank_aligns_sigma_and_ce():
     model = _tiny_model()
     bank = belief_ce_bank(model, _loader(), device=DEVICE)
     tr, ce, tid = bank["tr_sigma"], bank["ce"], bank["token_ids"]
+    assert all(value.device.type == "cpu" for value in bank.values())
     assert tr.shape == ce.shape == tid.shape                        # one row per valid token
     assert tr.numel() == 2 * 2 * 12 - 2                             # 2 batches x 2 seqs x 12, 1 masked/batch
     assert torch.isfinite(tr).all() and torch.isfinite(ce).all()
@@ -64,6 +64,7 @@ def test_belief_ce_bank_aligns_sigma_and_ce():
 def test_belief_ce_bank_respects_max_batches():
     model = _tiny_model()
     bank = belief_ce_bank(model, _loader(n_batches=5), device=DEVICE, max_batches=1)
+    assert all(value.device.type == "cpu" for value in bank.values())
     assert bank["tr_sigma"].numel() == 2 * 12 - 1                   # only the first batch consumed
 
 
@@ -86,7 +87,8 @@ def test_belief_ce_bank_matches_forward_belief_under_s_e_step():
     tgt = torch.randint(0, 20, (1, 5), device=DEVICE)                # all valid (no -100)
     bank = belief_ce_bank(model, [(tok, tgt)], device=DEVICE)
     cs_tr = sigma_trace(converged_state(model, tok)["sigma"], diagonal=cfg.diagonal_covariance)
-    assert torch.allclose(bank["tr_sigma"], cs_tr.reshape(-1), atol=1e-5)
+    assert all(value.device.type == "cpu" for value in bank.values())
+    assert torch.allclose(bank["tr_sigma"], cs_tr.reshape(-1).detach().cpu(), atol=1e-5)
 
 
 def test_belief_ce_bank_feeds_spearman_and_cv():
@@ -94,6 +96,7 @@ def test_belief_ce_bank_feeds_spearman_and_cv():
     from vfe3.metrics import cv, spearman_rho
     model = _tiny_model()
     bank = belief_ce_bank(model, _loader(), device=DEVICE)
+    assert all(value.device.type == "cpu" for value in bank.values())
     rho = spearman_rho(bank["tr_sigma"], bank["ce"])
     spread = cv(bank["tr_sigma"])
     assert -1.0 <= rho <= 1.0
