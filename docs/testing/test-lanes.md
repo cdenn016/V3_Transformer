@@ -1,6 +1,6 @@
 # Test execution lanes
 
-The ordinary CPU entry point is the click-to-run driver. It accepts no command-line arguments, launches the fast and slow lanes as separate subprocesses, stops after the first nonzero result, and reports counts only from each lane's temporary JUnit XML file.
+The ordinary CPU entry point is the click-to-run driver. It accepts no command-line arguments, launches the 12-worker fast lane and 3-worker slow lane as separate subprocesses, stops after the first nonzero result, and reports counts only from each lane's temporary JUnit XML file. Both subprocesses receive every thread cap documented below.
 
 ```powershell
 python run_cpu_tests.py
@@ -60,24 +60,37 @@ Invoke-VFE3TestEnv $cpuParallelEnv {
 }
 ```
 
-CUDA is a dedicated serial lane. The default shell interpreter can have a CPU-only Torch build even when another environment contains CUDA Torch, so verify the selected interpreter before invoking pytest. On the development workstation the CUDA interpreter is `C:\anaconda\python.exe`; replace that path when the environment moves. The environment variable activates tests whose device is selected during module import, and the marker selects the explicit CUDA resource cohort.
+All eleven native UMAP integration tests were intentionally removed from the suite. Production UMAP support and the `umap-learn` visualization dependency remain, as do mocked worker-protocol tests and pure report-planning tests. The retained slow lane therefore contains exactly the three nodes selected by `tests/pytest_policy.py`; it is not a native UMAP lane.
+
+CUDA is a dedicated serial lane selected canonically with `-m cuda`. `tests/pytest_policy.py` currently defines six CUDA-only hardware tests and sixteen ordinary numerical contracts that join the CUDA marker only when the requested device type is CUDA. Collection policy, rather than a duplicated literal node list or a brittle hardcoded pass count, defines the executable matrix.
+
+The default shell interpreter can have a CPU-only Torch build even when another environment contains CUDA Torch. On the development workstation the CUDA interpreter is `C:\anaconda\python.exe`; replace that path when the environment moves. Both `VFE3_TEST_DEVICE=cuda` and `CUBLAS_WORKSPACE_CONFIG=:4096:8` must be present before that interpreter imports Torch. The lane then requires a nonempty JUnit suite with no failures, errors, or skips.
 
 ```powershell
 $cudaPython = "C:\anaconda\python.exe"
-& $cudaPython -c "import sys, torch; ok = torch.cuda.is_available(); name = torch.cuda.get_device_name(0) if ok else 'no CUDA device'; print(torch.__version__, ok, name); sys.exit(0 if ok and 'RTX 5090' in name else 1)"
-if ($LASTEXITCODE -ne 0) {
-    throw "The selected interpreter does not expose the intended RTX 5090 CUDA device."
+$cudaEnv = @{
+    VFE3_TEST_DEVICE       = "cuda"
+    CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 }
-Invoke-VFE3TestEnv @{ VFE3_TEST_DEVICE = "cuda" } {
+Invoke-VFE3TestEnv $cudaEnv {
+    & $cudaPython -c "import sys, torch; ok = torch.cuda.is_available(); name = torch.cuda.get_device_name(0) if ok else 'no CUDA device'; print(torch.__version__, ok, name); sys.exit(0 if ok and 'RTX 5090' in name else 1)"
+    if ($LASTEXITCODE -ne 0) {
+        throw "The selected interpreter does not expose the intended RTX 5090 CUDA device."
+    }
     & $cudaPython -m pytest -m cuda --junitxml=C:\tmp\vfe3-cuda.xml --durations=100
-}
-[xml]$cudaResult = Get-Content -Raw -LiteralPath C:\tmp\vfe3-cuda.xml
-$cudaSuite = $cudaResult.testsuites.testsuite
-if ([int]$cudaSuite.tests -ne 6 -or [int]$cudaSuite.failures -ne 0 `
-        -or [int]$cudaSuite.errors -ne 0 -or [int]$cudaSuite.skipped -ne 0) {
-    throw "CUDA lane did not execute all six tests successfully."
+    if ($LASTEXITCODE -ne 0) {
+        throw "CUDA pytest exited with code $LASTEXITCODE."
+    }
+    [xml]$cudaResult = Get-Content -Raw -LiteralPath C:\tmp\vfe3-cuda.xml
+    $cudaSuite = $cudaResult.testsuites.testsuite
+    if ([int]$cudaSuite.tests -le 0 -or [int]$cudaSuite.failures -ne 0 `
+            -or [int]$cudaSuite.errors -ne 0 -or [int]$cudaSuite.skipped -ne 0) {
+        throw "The canonical CUDA lane was empty or did not execute cleanly."
+    }
 }
 ```
+
+CPU goldens, host-side contracts, and the complete ordinary CPU lanes remain mandatory. CUDA adds a bounded device matrix for the six hardware-only tests and the dynamically mirrored numerical contracts; it does not replace CPU verification.
 
 The external identity probe is also a one-worker lane. Both files must exist and must be the independently generated branch-base and feature bundles described by `tests/hierarchy_identity_probe.py`.
 
@@ -93,11 +106,8 @@ Invoke-VFE3TestEnv @{
 Branch coverage is measured over `vfe3`. The checked-in configuration enables branch measurement and parallel data-file support. This command covers the complete available CPU union while excluding unavailable CUDA and external prerequisites.
 
 ```powershell
-Invoke-VFE3TestEnv @{
-    VFE3_TEST_DEVICE    = "cpu"
-    CUDA_VISIBLE_DEVICES = "-1"
-} {
-    python -m pytest --runslow -m "not cuda and not external" --cov=vfe3 --cov-branch --cov-report=term-missing --cov-report=xml:C:\tmp\vfe3-coverage.xml --junitxml=C:\tmp\vfe3-coverage-junit.xml
+Invoke-VFE3TestEnv $cpuParallelEnv {
+    python -m pytest --runslow -n 12 --dist loadscope -m "not cuda and not external" --cov=vfe3 --cov-branch --cov-report=xml:C:\tmp\vfe3-coverage.xml --junitxml=C:\tmp\vfe3-coverage-junit.xml --durations=25
 }
 ```
 
