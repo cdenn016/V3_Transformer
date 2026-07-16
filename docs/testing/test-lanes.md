@@ -1,6 +1,12 @@
 # Test execution lanes
 
-The authoritative compatibility check is the serial suite. Pytest already receives `-q`, strict configuration validation, and strict marker validation from `pyproject.toml`; do not add another `-q`, because `-qq` suppresses the terminal pass-count summary. Use JUnit XML whenever exact counts are reported. Define this helper once in the current PowerShell session; every lane below then restores each pre-existing environment value even when pytest fails.
+The ordinary CPU entry point is the click-to-run driver. It accepts no command-line arguments, launches the fast and slow lanes as separate subprocesses, stops after the first nonzero result, and reports counts only from each lane's temporary JUnit XML file.
+
+```powershell
+python run_cpu_tests.py
+```
+
+Pytest already receives `-q`, strict configuration validation, and strict marker validation from `pyproject.toml`; do not add another `-q`, because `-qq` suppresses the terminal pass-count summary. Use JUnit XML whenever exact counts are reported. For manual lane execution, define this helper once in the current PowerShell session; every lane below then restores each pre-existing environment value even when pytest fails.
 
 ```powershell
 function Invoke-VFE3TestEnv {
@@ -25,45 +31,32 @@ function Invoke-VFE3TestEnv {
 }
 ```
 
-The serial CPU commands pin `VFE3_TEST_DEVICE=cpu`, hide CUDA from libraries that probe it directly, and exclude the dedicated CUDA and external cohorts. This makes the selected nodes independent of the caller's environment and installed Torch build. Each native command gets its own wrapper call so a later trial cannot mask an earlier nonzero exit.
+Both CPU lanes pin `VFE3_TEST_DEVICE=cpu`, hide CUDA from libraries that probe it directly, and exclude the dedicated CUDA and external cohorts. Every supported native numerical-library thread control is set to one before pytest imports numerical libraries. Giving each xdist worker one native numerical thread prevents nested OpenMP and BLAS pools from oversubscribing the host's 24 logical processors.
 
-```powershell
-$cpuSerialEnv = @{
-    VFE3_TEST_DEVICE   = "cpu"
-    CUDA_VISIBLE_DEVICES = "-1"
-}
-Invoke-VFE3TestEnv $cpuSerialEnv {
-    python -m pytest -m "not cuda and not external" --junitxml=C:\tmp\vfe3-default-cpu.xml --durations=100
-}
-Invoke-VFE3TestEnv $cpuSerialEnv {
-    python -m pytest --runslow -m "not cuda and not external" --junitxml=C:\tmp\vfe3-full-cpu-serial.xml --durations=100
-}
-```
-
-The parallel CPU fast lane excludes every prerequisite-specific or heavyweight integration case. Cap numerical-library threads so each pytest worker does not create its own competing thread pool. Recorded trials on the development workstation completed in 67.69 seconds with two workers and 35.72 seconds with four workers, so four fixed workers are the repository default. Never use `-n auto`. `loadscope` keeps module-scoped immutable artifact evidence on one worker.
+The fast lane uses all 12 physical cores with an explicit worker count. Never use `-n auto`. `loadscope` keeps module-scoped immutable artifact evidence on one worker. Its manual equivalent is:
 
 ```powershell
 $cpuParallelEnv = @{
-    VFE3_TEST_DEVICE    = "cpu"
+    VFE3_TEST_DEVICE      = "cpu"
     CUDA_VISIBLE_DEVICES = "-1"
-    OMP_NUM_THREADS     = "1"
-    MKL_NUM_THREADS     = "1"
+    OMP_NUM_THREADS       = "1"
+    MKL_NUM_THREADS       = "1"
+    OPENBLAS_NUM_THREADS  = "1"
+    NUMEXPR_NUM_THREADS   = "1"
+    NUMBA_NUM_THREADS     = "1"
+    BLIS_NUM_THREADS      = "1"
+    VECLIB_MAXIMUM_THREADS = "1"
 }
 Invoke-VFE3TestEnv $cpuParallelEnv {
-    python -m pytest -n 4 --dist loadscope -m "not slow and not cuda and not external" --junitxml=C:\tmp\vfe3-fast-n4.xml --durations=100
+    python -m pytest -n 12 --dist loadscope -m "not slow and not cuda and not external" --junitxml=C:\tmp\vfe3-fast-n12.xml --durations=100
 }
 ```
 
-The slow CPU lane enables `--runslow` and uses `loadgroup`, which keeps the real UMAP cohort in one resource group while other slow nodes remain schedulable. It is the complement of the fast CPU lane for ordinary CPU verification.
+The remaining slow CPU lane contains only three tests. It enables `--runslow`, uses three explicit workers with `loadgroup`, and is the complement of the fast CPU lane for ordinary CPU verification. Its manual equivalent is:
 
 ```powershell
-Invoke-VFE3TestEnv @{
-    VFE3_TEST_DEVICE    = "cpu"
-    CUDA_VISIBLE_DEVICES = "-1"
-    OMP_NUM_THREADS     = "1"
-    MKL_NUM_THREADS     = "1"
-} {
-    python -m pytest --runslow -n 4 --dist loadgroup -m "slow and not cuda and not external" --junitxml=C:\tmp\vfe3-slow-cpu.xml --durations=100
+Invoke-VFE3TestEnv $cpuParallelEnv {
+    python -m pytest --runslow -n 3 --dist loadgroup -m "slow and not cuda and not external" --junitxml=C:\tmp\vfe3-slow-n3.xml --durations=100
 }
 ```
 
@@ -108,4 +101,4 @@ Invoke-VFE3TestEnv @{
 }
 ```
 
-A skipped prerequisite is not executed coverage. Report CUDA and external results from their own JUnit files, including exact skipped counts and reasons when their prerequisites are absent. The semantic suite is the union of fast CPU, slow CPU/UMAP, CUDA, and external lanes; speed comparisons must use identical marker expressions and fixed worker counts.
+A skipped prerequisite is not executed coverage. Report CUDA and external results from their own JUnit files, including exact skipped counts and reasons when their prerequisites are absent. The semantic suite is the union of fast CPU, the three-test slow CPU lane, CUDA, and external lanes; speed comparisons must use identical marker expressions and fixed worker counts.
