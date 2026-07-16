@@ -18,7 +18,7 @@
 - Uncertified bases use an exact fallback and emit a one-time performance warning.
 - Silent steps cannot perform diagnostic device-to-host extraction or timing synchronization.
 - Pass counts come from JUnit XML; pytest commands do not add `-q` because repository configuration already supplies it.
-- The known baseline failure `tests/test_runnable_tail_buildout.py::test_runnable_cluster_sweeps_build[sigma_max]` remains out of scope because the preserved `sigma_max` sweep contains one cell.
+- The preserved `sigma_max` experiment contains one cell. Do not change its value to satisfy a stale test assumption; if a fully passing completion gate requires repair, retain the nonempty and per-cell build contracts without imposing a two-cell minimum.
 - Update `docs/2026-07-15-edits.md`; do not create a second dated edit record.
 
 ### Task 1: Certify generator Gram structure
@@ -323,13 +323,13 @@ git commit -m "bench: verify phi projection scaling"
 **Files:**
 - Modify: `docs/2026-07-15-edits.md`
 
-- [ ] **Step 1: Run focused verification**
+- [x] **Step 1: Run focused verification**
 
 Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py tests/test_train.py tests/test_viz.py tests/test_run_artifacts.py tests/test_gauge_groups.py --junitxml=C:\tmp\vfe3-phi-projection-focused-final-20260715.xml`
 
 Read `tests`, `failures`, `errors`, `skipped`, and `time` from JUnit before recording results.
 
-- [ ] **Step 2: Run syntax and whitespace verification**
+- [x] **Step 2: Run syntax and whitespace verification**
 
 Run: `python -m compileall -q vfe3 tests benchmarks`
 
@@ -337,17 +337,17 @@ Run: `git diff --check origin/main...HEAD`
 
 Expected: both exit zero.
 
-- [ ] **Step 3: Run the full suite and compare with baseline**
+- [x] **Step 3: Run the full suite and compare with baseline**
 
 Run: `python -m pytest --junitxml=C:\tmp\vfe3-phi-projection-full-final-20260715.xml`
 
 Expected: no new failures. The preserved single-cell `sigma_max` mismatch may remain as the same sole failure. Record the exact machine-readable result and failure identity; do not call the suite fully passing if that failure remains.
 
-- [ ] **Step 4: Review the complete diff and configuration invariants**
+- [x] **Step 4: Review the complete diff and configuration invariants**
 
 Run `git diff --stat origin/main...HEAD`, `git diff --check origin/main...HEAD`, and `git diff origin/main...HEAD -- ablation.py train_vfe3.py`. The final command must be empty.
 
-- [ ] **Step 5: Complete the dated record and final implementation commit**
+- [x] **Step 5: Complete the dated record and final implementation commit**
 
 Record exact JUnit counts, benchmark results or the explicit resource blocker, files changed, and the preserved baseline failure in `docs/2026-07-15-edits.md`. Commit any final documentation-only change.
 

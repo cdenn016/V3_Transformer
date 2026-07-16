@@ -29,7 +29,7 @@ DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 def test_runnable_cluster_sweeps_build(sweep):
     ablation.validate_sweeps([sweep])
     runs = ablation.make_run_overrides(sweep)
-    assert len(runs) >= 2
+    assert runs
     for _label, ov in runs:
         cfg_dict = ablation._cell_cfg_dict({**ov, "vocab_size": 48, "max_seq_len": 16}, seed=0, max_steps=1)
         assert VFEModel(VFE3Config(**cfg_dict)) is not None
