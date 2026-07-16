@@ -373,6 +373,8 @@ _COMPARISON_FIELDS = (
     "schema_version",
     "mode",
     "sample.token_count",
+    "sample.sequence_count",
+    "sample.sequence_length",
     "sample.token_sha256",
     "channel.kind",
     "channel.name",

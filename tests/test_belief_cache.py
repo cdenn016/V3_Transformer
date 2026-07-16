@@ -33,6 +33,7 @@ def _supported_ns(**over):
         precision_weighted_attention=False, pos_rotation="none", use_head_mixer=False,
         use_cg_coupling=False, e_step_mu_precond="fisher", e_mu_q_trust=None,
         phi_reflection="off",
+        pos_phi="learned", pos_phi_compose="bch",
         # M3 (audit 2026-07-06): result-changing toggles the cache does not replicate, at their
         # cache-eligible defaults so _supported_ns() stays supported.
         lambda_twohop=0.0, e_step_update="gradient", skip_belief_sigma_update=False,

@@ -45,6 +45,7 @@ from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.geometry.transport import (CompactFactoredTransport, compute_transport_operators, group_element_inverse,
                                      transport_covariance, transport_mean)
 from vfe3.gradients.kernels import get_kernel
+from vfe3.inference.e_step import canonical_e_step_update
 
 # Belief priors that mask the future to exactly zero weight (j>i -> -inf -> exp = 0), the condition
 # under which appending a token leaves every context position's converged belief unchanged.
@@ -61,7 +62,9 @@ def cache_supported(cfg: 'object') -> bool:
     r"""Whether the prefix-cache fast path is verified exact for ``cfg`` (else the caller falls back to
     the full recompute). The conjunction of the golden-tested validity conditions (module docstring):
     one block, one E-step iteration, the closed-form filtering kernel, flat transport, a causal belief
-    prior, a frozen gauge frame, and none of the cross-position / non-kernel toggles active."""
+    prior, a frozen gauge frame, no independent right positional factor, and none of the
+    cross-position / non-kernel toggles active."""
+    e_step_update = canonical_e_step_update(cfg.e_step_update)
     return (
         cfg.n_layers == 1
         and cfg.n_e_steps == 1
@@ -81,10 +84,11 @@ def cache_supported(cfg: 'object') -> bool:
         and not cfg.use_cg_coupling
         and cfg.e_step_mu_precond == "fisher"
         and cfg.e_mu_q_trust is None
+        and not (cfg.pos_phi != "none" and cfg.pos_phi_compose == "group_product")
         # M3 (audit 2026-07-06): result-changing toggles the cached kernel does NOT replicate, so
         # caching under any of them would silently disagree with the full recompute it is pinned to.
         and cfg.lambda_twohop == 0.0            # the cached kernel forwards no two-hop coupling block
-        and cfg.e_step_update != "mm_exact"     # the cache always does the gradient step + retraction
+        and e_step_update != "mm_exact"         # the cache always does the gradient step + retraction
         and not cfg.skip_belief_sigma_update    # the cache always retracts sigma
         and not cfg.query_adaptive_tau          # the cache uses a static (non-query-adaptive) tau
         and not cfg.gamma_as_beta_prior         # the cache folds no gamma-as-beta prior

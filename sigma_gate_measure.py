@@ -13,12 +13,13 @@ that checkpoint, then run. Compute is a forward-pass eval over a few held-out ba
 The artifact is written to vfe3_policy_results/sigma_gate/<checkpoint_id>.json with the spec commit hash,
 so the policy_sigma_ambiguity_validated config flag can be bound to a matching PASS record (Guard 4).
 """
-import dataclasses
 import os
+from dataclasses import fields
+from typing import Mapping
 
 import torch
 
-from vfe3.config import VFE3Config
+from vfe3.config import VFE3Config, config_from_serialized
 from vfe3.data.datasets import make_dataloader
 from vfe3.inference.sigma_gate import (
     SEALED_MEASUREMENT_CONTEXT,
@@ -35,6 +36,8 @@ from vfe3.run_artifacts import (
 )
 
 SPEC = "docs/superpowers/specs/2026-06-28-active-inference-efe-policy-scorer-spec.md"
+_CHECKPOINT_CONFIG_SCHEMA = "vfe3config-exact-v1"
+_CHECKPOINT_CONFIG_FIELDS = frozenset(field.name for field in fields(VFE3Config))
 
 
 def _verify_sealed_config(cfg):
@@ -54,6 +57,27 @@ def _verify_sealed_config(cfg):
             raise ValueError(
                 f"sigma_gate_measure CONFIG[{key!r}]={got!r} differs from the sealed measurement context "
                 f"{want!r}; the gate must measure the pre-registered context (spec Sections 4.5/4.7).")
+
+
+def _config_from_checkpoint(
+    saved:  object,
+    source: str,
+) -> VFE3Config:
+    r"""Load only the exact registered sigma-gate config schema, without implicit defaults."""
+    if not isinstance(saved, Mapping):
+        raise ValueError(f"checkpoint {source!r} config must be a mapping")
+    actual = set(saved)
+    missing = sorted(_CHECKPOINT_CONFIG_FIELDS - actual)
+    unknown = sorted(str(key) for key in actual - _CHECKPOINT_CONFIG_FIELDS)
+    if missing or unknown:
+        raise ValueError(
+            f"unsupported checkpoint config schema for {source!r}; supported schema "
+            f"{_CHECKPOINT_CONFIG_SCHEMA!r} requires the exact current field set, got "
+            f"missing={missing}, unknown={unknown}. Add an explicit migration before "
+            f"measuring this checkpoint; current dataclass defaults are not a migration."
+        )
+    return config_from_serialized(saved, source=f"{source} checkpoint config")
+
 
 CONFIG = dict(
     checkpoint="",                       # REQUIRED: path to the operating-point checkpoint (.pt)
@@ -79,8 +103,7 @@ def load_model_from_checkpoint(path, device):
     saved = ckpt.get("config")
     if saved is None:
         raise ValueError(f"checkpoint {p!r} has no stored config; cannot rebuild the model arch")
-    fields = {f.name for f in dataclasses.fields(VFE3Config)}
-    cfg = VFE3Config(**{k: v for k, v in saved.items() if k in fields})
+    cfg = _config_from_checkpoint(saved, p)
     model = VFEModel(cfg).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

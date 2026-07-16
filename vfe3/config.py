@@ -2780,10 +2780,11 @@ def config_from_serialized(
     *,
     source: str,
 ) -> VFE3Config:
-    """Build an effective config while warning about fields unknown to this code version."""
+    """Build an effective config, normalizing booleans and warning about unknown fields."""
     if not isinstance(payload, Mapping):
         raise ValueError(f"serialized config from {source} must be a mapping")
-    known = {field.name for field in fields(VFE3Config)}
+    config_fields = {field.name: field for field in fields(VFE3Config)}
+    known = set(config_fields)
     unknown = sorted(str(key) for key in payload if key not in known)
     if unknown:
         warnings.warn(
@@ -2792,6 +2793,21 @@ def config_from_serialized(
             stacklevel=2,
         )
     migrated = {key: value for key, value in payload.items() if key in known}
+    bool_fields = {
+        name for name, field in config_fields.items()
+        if field.type is bool or field.type == Optional[bool]
+    }
+    for name in sorted(bool_fields & migrated.keys()):
+        value = migrated[name]
+        if type(value) is bool or (value is None and config_fields[name].type == Optional[bool]):
+            continue
+        if isinstance(value, str) and value.casefold() in ("false", "true"):
+            migrated[name] = value.casefold() == "true"
+            continue
+        raise ValueError(
+            f"serialized boolean field {name!r} from {source} must be a bool or the exact spelling "
+            f"'true'/'false' (case-insensitive), got {value!r}"
+        )
     if isinstance(migrated.get("policy_score_terms"), list):
         migrated["policy_score_terms"] = tuple(migrated["policy_score_terms"])
     return VFE3Config(**migrated)
