@@ -47,6 +47,9 @@ _PHI_PROJECTION_TEMPORARY_BYTES = 64 * 1024 * 1024
 def embedded_phi_frobenius_norm(
     phi:   torch.Tensor,                   # (..., n_gen) algebra coordinates
     group: GaugeGroup,
+
+    *,
+    warn_fallback: bool = True,
 ) -> torch.Tensor:                        # (...) ||sum_a phi_a G_a||_F
     r"""Exact embedded Frobenius norm through a certified diagonal Gram or dense fallback.
 
@@ -60,7 +63,8 @@ def embedded_phi_frobenius_norm(
             "embedded phi norm requires full generator coordinates; got coordinate width "
             f"{phi.shape[-1]} and {group.generators.shape[0]} generators"
         )
-    diagonal = group.gram_diagonal()
+    diagonal_fn = getattr(group, "gram_diagonal", None)
+    diagonal = diagonal_fn() if diagonal_fn is not None else None
     if diagonal is not None:
         uniform = group.gram_diagonal_uniform()
         if uniform is not None:
@@ -68,9 +72,10 @@ def embedded_phi_frobenius_norm(
         weights = diagonal.to(device=phi.device, dtype=phi.dtype)
         return (phi.square() * weights).sum(dim=-1).clamp_min(0.0).sqrt()
 
-    if not getattr(group, "_phi_norm_fallback_warned", False):
+    if warn_fallback and not getattr(group, "_phi_norm_fallback_warned", False):
         warnings.warn(
-            f"gauge group {group.name!r} has no diagonal generator-Gram certificate; "
+            f"gauge group {getattr(group, 'name', '<custom>')!r} has no diagonal "
+            "generator-Gram certificate; "
             "phi matrix norms use the exact dense_fallback route, which can be expensive",
             RuntimeWarning,
             stacklevel=2,
@@ -81,7 +86,7 @@ def embedded_phi_frobenius_norm(
     return torch.linalg.matrix_norm(embedded, ord="fro", dim=(-2, -1))
 
 
-def _phi_projection_chunk_rows(
+def phi_projection_chunk_rows(
     coordinate_width: int,
     matrix_width:     int,
     element_size:     int,
@@ -150,7 +155,7 @@ def project_phi_parameter_rows_(
                 f"{rows.shape[-1]} and {generators.shape[0]} generators"
             )
         total_rows += rows.shape[0]
-        rows_per_chunk = chunk_rows or _phi_projection_chunk_rows(
+        rows_per_chunk = chunk_rows or phi_projection_chunk_rows(
             rows.shape[-1],
             generators.shape[-1],
             rows.element_size(),

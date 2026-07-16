@@ -14,7 +14,6 @@ so a gradient step on the priors improves inference end to end. Click-to-run: ed
 import contextlib
 import logging
 import math
-import weakref
 from numbers import Real
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
@@ -35,7 +34,11 @@ from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.data.datasets import make_dataloader
 from vfe3.ema import EMA
 from vfe3.free_energy import attention_tau
-from vfe3.gauge_optim import project_phi_parameter_rows_
+from vfe3.gauge_optim import (
+    embedded_phi_frobenius_norm,
+    phi_projection_chunk_rows,
+    project_phi_parameter_rows_,
+)
 from vfe3.model.block import _as_coeff
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
@@ -47,46 +50,6 @@ from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source f
 
 _PHI_CLAMP_WARNED:   bool = False
 _S_PHI_CLAMP_WARNED: bool = False
-_PhiClampGramKey = Tuple[int, Tuple[int, ...], torch.device, torch.dtype, int]
-_PHI_CLAMP_GRAM_CACHE: Dict[
-    _PhiClampGramKey,
-    Tuple[weakref.ReferenceType, torch.Tensor],
-] = {}
-
-
-def _phi_clamp_gram_key(generators: torch.Tensor) -> _PhiClampGramKey:
-    r"""Metadata-only cache key; reads no tensor value and causes no CUDA host synchronization."""
-    return (
-        id(generators),
-        tuple(generators.shape),
-        generators.device,
-        generators.dtype,
-        generators._version,
-    )
-
-
-def _cached_phi_clamp_gram(generators: torch.Tensor) -> torch.Tensor:
-    r"""Reuse ``tr(G_a^T G_b)`` until the generator object or its metadata/version changes."""
-    key = _phi_clamp_gram_key(generators)
-    identity = key[0]
-    for stale_key, (generator_ref, _gram) in list(_PHI_CLAMP_GRAM_CACHE.items()):
-        if stale_key[0] == identity and (
-                stale_key != key or generator_ref() is not generators):
-            _PHI_CLAMP_GRAM_CACHE.pop(stale_key, None)
-
-    cached = _PHI_CLAMP_GRAM_CACHE.get(key)
-    if cached is not None and cached[0]() is generators:
-        return cached[1]
-
-    gram = torch.einsum("aij,bij->ab", generators, generators).detach()
-
-    def _cleanup(dead_ref: weakref.ReferenceType) -> None:
-        for cached_key, (generator_ref, _cached_gram) in list(_PHI_CLAMP_GRAM_CACHE.items()):
-            if cached_key[0] == identity and generator_ref is dead_ref:
-                _PHI_CLAMP_GRAM_CACHE.pop(cached_key, None)
-
-    _PHI_CLAMP_GRAM_CACHE[key] = (weakref.ref(generators, _cleanup), gram)
-    return gram
 
 
 def _warn_phi_transport_clamp(
@@ -97,14 +60,14 @@ def _warn_phi_transport_clamp(
     r"""Warn once per channel when a gauge-frame table exceeds the transport clamp.
 
     ``stable_matrix_exp_pair`` rescales any ``||M||_F > max_norm`` (the shared transport-clamp
-    default) and returns the
-    surrogate ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)``; its per-call monitor is opt-in because
+    default) and returns the surrogate ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)``; its per-call
+    monitor is opt-in because
     it costs a host sync on the E-step hot path. The M-step, however, steps ``phi_embed`` /
     ``pos_phi_free`` with NO trust region (``GaugeNaturalGradAdamW`` / plain AdamW), so a drifting
     row silently enters the surrogate regime (audit 2026-07-05 m8). This check runs only on
-    log/eval-cadence steps (off the hot path) and uses the Gram form
-    ``||sum_a phi^a G_a||_F^2 = phi^T Gram phi``, ``Gram_ab = tr(G_a^T G_b)`` -- one (rows, n_gen)
-    matmul, never materializing the (rows, K, K) embedding.
+    log/eval-cadence steps (off the hot path) and shares the exact norm kernel used by the projected
+    M-step. Certified orthogonal bases use their diagonal Gram; uncertified custom bases use the
+    dense exact fallback in bounded chunks.
     """
     global _PHI_CLAMP_WARNED, _S_PHI_CLAMP_WARNED
     gen = model.group.generators                       # (n_gen, K, K)
@@ -113,16 +76,29 @@ def _warn_phi_transport_clamp(
               ("belief.pos_phi_free", getattr(model, "pos_phi_free", None)),
               ("model.s_pos_phi_free", getattr(model, "s_pos_phi_free", None))]
     with torch.no_grad():
-        gram = _cached_phi_clamp_gram(gen)              # (n_gen, n_gen) = tr(G_a^T G_b)
         for name, tab in tables:
             if tab is None:
                 continue
             model_frame = name.startswith("model.")
             if (_S_PHI_CLAMP_WARNED if model_frame else _PHI_CLAMP_WARNED):
                 continue
-            phi = tab.reshape(-1, tab.shape[-1]).to(gram.dtype)
-            frob2_max = ((phi @ gram) * phi).sum(-1).max()
-            if bool(frob2_max > max_norm ** 2):        # host sync: log-cadence only
+            phi = tab.reshape(-1, tab.shape[-1])
+            route = getattr(model.group, "phi_norm_route", lambda: "dense_fallback")()
+            chunk_rows = phi_projection_chunk_rows(
+                phi.shape[-1],
+                gen.shape[-1],
+                phi.element_size(),
+                dense_fallback=route == "dense_fallback",
+            )
+            norm_max = torch.zeros((), device=phi.device, dtype=phi.dtype)
+            for start in range(0, phi.shape[0], chunk_rows):
+                norm = embedded_phi_frobenius_norm(
+                    phi[start:start + chunk_rows],
+                    model.group,
+                    warn_fallback=False,
+                )
+                norm_max.copy_(torch.maximum(norm_max, norm.max()))
+            if bool(norm_max > max_norm):              # host sync: log-cadence only
                 import warnings
                 remediation = (
                     "lower m_s_phi_lr or accept the surrogate model transport"
@@ -131,7 +107,7 @@ def _warn_phi_transport_clamp(
                 )
                 warnings.warn(
                     f"{name}: embedded gauge-frame Frobenius norm "
-                    f"{float(frob2_max.clamp(min=0.0).sqrt()):.2f} exceeds the transport clamp "
+                    f"{float(norm_max):.2f} exceeds the transport clamp "
                     f"max_norm={max_norm}; stable_matrix_exp_pair now returns the clamped surrogate "
                     f"exp(max_norm*M/||M||), not exp(M). {remediation}. Warned once for this "
                     "channel; further drift is not re-reported.",

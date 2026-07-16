@@ -164,27 +164,27 @@ git commit -m "perf: eliminate dense phi projection embedding"
 - `_warn_phi_transport_clamp` consumes `embedded_phi_frobenius_norm` and the same chunk-sizing helper as the projector.
 - Remove `_PHI_CLAMP_GRAM_CACHE`, `_phi_clamp_gram_key`, and `_cached_phi_clamp_gram` after their final consumer is migrated.
 
-- [ ] **Step 1: Write a failing shared-kernel routing test**
+- [x] **Step 1: Write a failing shared-kernel routing test**
 
 Patch `vfe3.train.embedded_phi_frobenius_norm` with a recording wrapper, run `_warn_phi_transport_clamp` on a certified small model, and assert that the helper receives coordinate chunks and that no dense `(n_gen, n_gen)` Gram is created.
 
-- [ ] **Step 2: Witness the current private Gram route**
+- [x] **Step 2: Witness the current private Gram route**
 
 Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py -k transport_clamp --junitxml=C:\tmp\vfe3-phi-clamp-red-20260715.xml`
 
 Expected: failure because `_warn_phi_transport_clamp` still calls `_cached_phi_clamp_gram`.
 
-- [ ] **Step 3: Migrate the warning to the shared norm definition**
+- [x] **Step 3: Migrate the warning to the shared norm definition**
 
 Chunk each eligible table, reduce the maximum on device, and retain the existing log-cadence-only host comparison and warning text. The warning path may synchronize once because it already runs only on metrics cadence; it may not allocate a dense generator Gram for certified K240 `block_glk`.
 
-- [ ] **Step 4: Run clamp and train diagnostics tests**
+- [x] **Step 4: Run clamp and train diagnostics tests**
 
 Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py tests/test_train.py --junitxml=C:\tmp\vfe3-phi-clamp-green-20260715.xml`
 
 Expected: zero failures and zero errors.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add vfe3/train.py tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py
