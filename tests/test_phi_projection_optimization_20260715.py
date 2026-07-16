@@ -5,6 +5,7 @@ from vfe3.config import VFE3Config
 import vfe3.gauge_optim as gauge_optim
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.model.model import VFEModel
+from vfe3.train import build_optimizer, train_step
 
 
 def _four_phi_table_model() -> VFEModel:
@@ -36,6 +37,26 @@ def _phi_tables(model: VFEModel) -> list[torch.Tensor]:
 def _dense_norm(phi: torch.Tensor, generators: torch.Tensor) -> torch.Tensor:
     embedded = torch.einsum("...a,aij->...ij", phi, generators)
     return torch.linalg.matrix_norm(embedded, ord="fro", dim=(-2, -1))
+
+
+def _projection_train_case() -> tuple:
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=1,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        pos_phi="none",
+        phi_mstep_max_matrix_norm=2.0,
+    )
+    model = VFEModel(cfg)
+    optimizer = build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    tokens = torch.tensor([[0, 1, 2, 3]])
+    targets = torch.tensor([[1, 2, 3, 4]])
+    return model, optimizer, scheduler, tokens, targets
 
 
 @pytest.mark.parametrize(
@@ -279,3 +300,81 @@ def test_transport_clamp_uses_shared_norm_kernel(monkeypatch) -> None:
     assert calls
     assert all(shape[-1] == model.group.generators.shape[0] for shape in calls)
     assert not hasattr(train_module, "_PHI_CLAMP_GRAM_CACHE")
+
+
+def test_silent_train_step_projects_without_collecting_stats(monkeypatch) -> None:
+    import vfe3.train as train_module
+
+    model, optimizer, scheduler, tokens, targets = _projection_train_case()
+    collect_stats = []
+
+    def _project(_model, _radius, **kwargs):
+        collect_stats.append(kwargs.get("collect_stats"))
+        return {}
+
+    monkeypatch.setattr(train_module, "project_phi_parameter_rows_", _project)
+
+    train_module.train_step(model, optimizer, scheduler, tokens, targets)
+
+    assert collect_stats == [False]
+
+
+def test_logged_train_step_records_projection_stats_and_cpu_timing(monkeypatch) -> None:
+    import vfe3.train as train_module
+
+    model, optimizer, scheduler, tokens, targets = _projection_train_case()
+    collect_stats = []
+
+    def _project(_model, _radius, **kwargs):
+        collect_stats.append(kwargs.get("collect_stats"))
+        return {
+            "phi_chart_projected_rows": 1.0,
+            "phi_chart_total_rows": 8.0,
+            "phi_chart_projected_fraction": 0.125,
+            "phi_chart_preproject_max": 2.5,
+            "phi_chart_projection_scale_min": 0.8,
+        }
+
+    monkeypatch.setattr(train_module, "project_phi_parameter_rows_", _project)
+    metrics = {}
+
+    train_module.train_step(
+        model,
+        optimizer,
+        scheduler,
+        tokens,
+        targets,
+        metrics_out=metrics,
+    )
+
+    assert collect_stats == [True]
+    assert metrics["phi_chart_projected_rows"] == 1.0
+    assert metrics["phi_chart_projection_stats_collected"] == 1.0
+    assert metrics["phi_chart_projection_ms"] >= 0.0
+
+
+def test_nonfinite_step_does_not_project(monkeypatch) -> None:
+    import vfe3.train as train_module
+
+    model, optimizer, scheduler, tokens, targets = _projection_train_case()
+    model.prior_bank.mu_embed.register_hook(
+        lambda grad: torch.full_like(grad, float("nan"))
+    )
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("skipped optimizer step projected phi")
+
+    monkeypatch.setattr(train_module, "project_phi_parameter_rows_", _unexpected)
+    metrics = {}
+
+    with pytest.warns(UserWarning, match="lr_scheduler.step"):
+        train_module.train_step(
+            model,
+            optimizer,
+            scheduler,
+            tokens,
+            targets,
+            metrics_out=metrics,
+        )
+
+    assert metrics["step_skipped"] == 1.0

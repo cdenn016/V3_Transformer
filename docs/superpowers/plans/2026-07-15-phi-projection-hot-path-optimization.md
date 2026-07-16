@@ -204,27 +204,27 @@ git commit -m "perf: share phi norm kernel with clamp diagnostics"
 - Silent accepted steps perform projection without CUDA-event creation, synchronization, or Python scalar extraction.
 - Skipped and disabled steps call neither the projector nor the timer.
 
-- [ ] **Step 1: Write failing logged, silent, skipped, and disabled integration tests**
+- [x] **Step 1: Write failing logged, silent, skipped, and disabled integration tests**
 
 Use a projector spy to assert the `collect_stats` value. Patch CUDA event construction in a CPU test to remain unreachable on silent steps. Preserve the existing disabled-path test and add an optimizer-step skip test.
 
-- [ ] **Step 2: Witness the current unconditional stats request**
+- [x] **Step 2: Witness the current unconditional stats request**
 
 Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py -k 'train_step or projection' --junitxml=C:\tmp\vfe3-phi-training-red-20260715.xml`
 
 Expected: failure because `train_step` does not pass `collect_stats` and records no timing fields.
 
-- [ ] **Step 3: Implement metrics-cadence-only timing**
+- [x] **Step 3: Implement metrics-cadence-only timing**
 
 On CUDA, create start and end events only when `metrics_out` is present, record around projection, synchronize the end event once, and store elapsed milliseconds. On CPU, use `time.perf_counter()` only on logged steps. Do not move projection relative to the accepted optimizer step, barycenter update, or scheduler step.
 
-- [ ] **Step 4: Run training integration tests**
+- [x] **Step 4: Run training integration tests**
 
-Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py tests/test_train.py tests/test_amp_skip.py --junitxml=C:\tmp\vfe3-phi-training-green-20260715.xml`
+Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py tests/test_train.py tests/test_fp16_gradscaler.py tests/test_round3_train_sync.py --junitxml=C:\tmp\vfe3-phi-training-green-20260715.xml`
 
 Expected: zero failures and zero errors.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add vfe3/train.py tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py

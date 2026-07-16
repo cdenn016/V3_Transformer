@@ -14,6 +14,7 @@ so a gradient step on the priors improves inference end to end. Click-to-run: ed
 import contextlib
 import logging
 import math
+import time
 from numbers import Real
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
@@ -662,12 +663,39 @@ def train_step(
     if did_step and _cfg.learnable_r and _cfg.r_update_mode == "barycenter":
         model.prior_bank.barycenter_r_()   # gated with the optimizer step: never M-step on poisoned grads
     if did_step and _cfg.phi_mstep_max_matrix_norm is not None:
-        projection_stats = project_phi_parameter_rows_(
-            model,
-            _cfg.phi_mstep_max_matrix_norm,
-        )
-        if metrics_out is not None:
+        collect_projection_stats = metrics_out is not None
+        if collect_projection_stats:
+            projection_device = model.group.generators.device
+            if projection_device.type == "cuda":
+                with torch.cuda.device(projection_device):
+                    projection_start = torch.cuda.Event(enable_timing=True)
+                    projection_end = torch.cuda.Event(enable_timing=True)
+                    projection_start.record()
+                    projection_stats = project_phi_parameter_rows_(
+                        model,
+                        _cfg.phi_mstep_max_matrix_norm,
+                        collect_stats=True,
+                    )
+                    projection_end.record()
+                    projection_end.synchronize()
+                    projection_ms = float(projection_start.elapsed_time(projection_end))
+            else:
+                projection_start_cpu = time.perf_counter()
+                projection_stats = project_phi_parameter_rows_(
+                    model,
+                    _cfg.phi_mstep_max_matrix_norm,
+                    collect_stats=True,
+                )
+                projection_ms = (time.perf_counter() - projection_start_cpu) * 1000.0
             metrics_out.update(projection_stats)
+            metrics_out["phi_chart_projection_ms"] = projection_ms
+            metrics_out["phi_chart_projection_stats_collected"] = 1.0
+        else:
+            project_phi_parameter_rows_(
+                model,
+                _cfg.phi_mstep_max_matrix_norm,
+                collect_stats=False,
+            )
     scheduler.step()                       # UNCONDITIONAL: resume rebuilds LambdaLR at last_epoch=start_step-1
     #                                        assuming exactly one scheduler.step per loop iteration
     return step_loss
