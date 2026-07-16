@@ -26,8 +26,10 @@ if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import csv
+import hashlib
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -48,7 +50,7 @@ INFERENCE_ROUTE = "inference"                                # flat-N routes, pl
 AXIS_ROUTES: Dict[str, str] = {"embed_dim": "grow_K", "n_heads": "blocksize", "n_layers": INFERENCE_ROUTE}
 
 CONFIG: Dict[str, Any] = {
-    "input_dir":   "vfe3_scaling_results/blocks_K48",      # where scaling.py wrote the run dirs
+    "input_dir":   "vfe3_scaling_results",                 # scaling.py's output root and design manifest
     "with_offset": True,                                   # headline fit: False -> A*N^-alpha; True -> E + A*N^-alpha
     "n_bootstrap": 2000,                                    # nested (points x seeds) bootstrap for the exponent CI
     "min_points":  2,                                       # a route needs this many sizes to get its own fit
@@ -68,6 +70,17 @@ _ROUTE_NOTES = {
     "blocks_K48_tied_2x": "tied structural ablation; not a strict full-covariance pure control",
 }
 
+_SCALING_CELL_SCHEMA_VERSION = 2
+_SCALING_REUSE_DIGEST_FIELD = "reuse_contract_sha256"
+_SCALING_SUMMARY_DIGEST_FIELD = "scaling_reuse_contract_sha256"
+_SCALING_SOURCE_SPLITS = ("train", "validation", "test")
+_SCALING_STRUCTURAL_FIELDS = (
+    "n_params", "scale_knob", "embed_dim", "n_heads", "n_layers", "n_e_steps",
+    "n_gen", "gauge_group", "family", "tokens_seen",
+    "git_sha", "git_dirty", "git_dirty_fingerprint",
+    "train_source_identity", "validation_source_identity", "test_source_identity",
+)
+
 
 # =============================================================================
 # HARVEST
@@ -80,6 +93,204 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _is_exact_nonnegative_seed(value: Any) -> bool:
+    """Whether ``value`` is a plain Python ``int`` seed in the supported domain."""
+    return type(value) is int and value >= 0
+
+
+def _canonical_json_sha256(value: object) -> str:
+    """SHA-256 of one finite JSON value under the scaling writer's canonical encoding."""
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validated_scaling_metrics(summary: Mapping[str, object]) -> Optional[Dict[str, object]]:
+    """Return the complete internally consistent metric payload bound by a scaling summary."""
+    scaling_point = summary.get("scaling_point")
+    if not isinstance(scaling_point, Mapping):
+        return None
+    required = ("n_params", "test_ce", "test_ppl", "test_bits_per_token", "test_bpc")
+    if any(key not in summary or key not in scaling_point for key in required):
+        return None
+    if any(summary[key] != scaling_point[key] for key in required):
+        return None
+    metrics = {key: scaling_point[key] for key in required}
+    n_params = metrics["n_params"]
+    test_ce = metrics["test_ce"]
+    test_ppl = metrics["test_ppl"]
+    test_bits = metrics["test_bits_per_token"]
+    test_bpc = metrics["test_bpc"]
+
+    def _finite_positive(value: object) -> bool:
+        return (not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and float(value) > 0.0)
+
+    if type(n_params) is not int or n_params <= 0:
+        return None
+    if not all(_finite_positive(value) for value in (test_ce, test_ppl, test_bits)):
+        return None
+    if test_bpc is not None and not _finite_positive(test_bpc):
+        return None
+    if (not math.isclose(
+            float(test_ppl), math.exp(min(float(test_ce), 20.0)), rel_tol=1e-9, abs_tol=1e-12)
+            or not math.isclose(
+                float(test_bits), float(test_ce) / math.log(2.0), rel_tol=1e-9, abs_tol=1e-12)):
+        return None
+    return metrics
+
+
+def _validated_bound_scaling_run(
+    run:        Path,
+    summary:    object,
+    config_json: object,
+    provenance: object,
+    cell:       object,
+) -> Optional[Dict[str, object]]:
+    """Validate the schema-2 generation contract that binds one scaling cell to its summary."""
+    if (run / "scaling_failure.json").exists():
+        return None
+    if not all(isinstance(value, Mapping) for value in (
+            summary, config_json, provenance, cell)):
+        return None
+    config = config_json.get("config")
+    if not isinstance(config, Mapping):
+        return None
+    if cell.get("schema_version") != _SCALING_CELL_SCHEMA_VERSION:
+        return None
+    dataset = cell.get("dataset")
+    if not isinstance(dataset, str) or not dataset or config_json.get("dataset") != dataset:
+        return None
+    try:
+        expected_config_sha256 = _canonical_json_sha256(dict(config))
+        contract = dict(cell)
+        saved_digest = contract.pop(_SCALING_REUSE_DIGEST_FIELD, None)
+        expected_digest = _canonical_json_sha256(contract)
+    except (TypeError, ValueError):
+        return None
+    if (not isinstance(saved_digest, str)
+            or len(saved_digest) != 64
+            or saved_digest != expected_digest
+            or summary.get(_SCALING_SUMMARY_DIGEST_FIELD) != saved_digest
+            or cell.get("config_sha256") != expected_config_sha256):
+        return None
+
+    code_identity = cell.get("code_identity")
+    if not isinstance(code_identity, Mapping):
+        return None
+    git_sha = code_identity.get("git_sha")
+    git_dirty = code_identity.get("git_dirty")
+    dirty_fingerprint = code_identity.get("git_dirty_fingerprint")
+    if (not isinstance(git_sha, str)
+            or not git_sha
+            or type(git_dirty) is not bool
+            or (git_dirty and (not isinstance(dirty_fingerprint, str) or not dirty_fingerprint))
+            or (not git_dirty and dirty_fingerprint is not None)
+            or provenance.get("git_sha") != git_sha
+            or provenance.get("git_dirty") != git_dirty
+            or provenance.get("git_dirty_fingerprint") != dirty_fingerprint):
+        return None
+
+    sources = cell.get("data_sources")
+    if not isinstance(sources, Mapping) or set(sources) != set(_SCALING_SOURCE_SPLITS):
+        return None
+    source_identities: Dict[str, str] = {}
+    for split in _SCALING_SOURCE_SPLITS:
+        source = sources[split]
+        if (not isinstance(source, Mapping)
+                or not isinstance(source.get("format"), str)
+                or not source["format"]
+                or type(source.get("size_bytes")) is not int
+                or source["size_bytes"] < 0
+                or not isinstance(source.get("sha256"), str)
+                or not source["sha256"]):
+            return None
+        source_identities[split] = json.dumps(
+            dict(source),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+    seeds = (cell.get("seed"), config.get("seed"), provenance.get("seed"))
+    if (not all(_is_exact_nonnegative_seed(seed) for seed in seeds)
+            or len(set(seeds)) != 1):
+        return None
+    for field in ("route", "label", "scale_knob"):
+        if type(cell.get(field)) is not str or not cell[field]:
+            return None
+    metrics = _validated_scaling_metrics(summary)
+    if metrics is None:
+        return None
+    return {
+        **metrics,
+        "seed": seeds[0],
+        "git_sha": git_sha,
+        "git_dirty": git_dirty,
+        "git_dirty_fingerprint": dirty_fingerprint,
+        **{
+            f"{split}_source_identity": source_identities[split]
+            for split in _SCALING_SOURCE_SPLITS
+        },
+    }
+
+
+def _structural_signature(row: Mapping[str, Any]) -> tuple:
+    """Exact typed identity of fields that must not vary among seeds of one scaling cell."""
+    return tuple(
+        (type(row.get(field)).__module__, type(row.get(field)).__qualname__, repr(row.get(field)))
+        for field in _SCALING_STRUCTURAL_FIELDS
+    )
+
+
+def _safe_manifest_component(value: object) -> bool:
+    """Whether a manifest route or label is one regular Windows path component."""
+    return (
+        type(value) is str
+        and bool(value)
+        and value == value.strip()
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and not value.endswith((".", " "))
+        and not os.path.isabs(value)
+        and not os.path.isreserved(value)
+    )
+
+
+def _exact_join_key(row: Mapping[str, Any]) -> Optional[Tuple[str, str, int]]:
+    """Return a scaling identity only when no route, label, or seed coercion is required."""
+    if not isinstance(row, Mapping):
+        return None
+    route = row.get("route")
+    label = row.get("label")
+    seed = row.get("seed")
+    if (
+        type(route) is not str
+        or not route
+        or type(label) is not str
+        or not label
+        or not _is_exact_nonnegative_seed(seed)
+    ):
+        return None
+    return route, label, seed
+
+
+def _observed_join_key(row: Mapping[str, Any]) -> Optional[Tuple[str, str, int]]:
+    """Return an exact join key only for a generation-bound harvested artifact."""
+    if not isinstance(row, Mapping) or row.get("artifact_verified") is not True:
+        return None
+    return _exact_join_key(row)
+
+
 def harvest(input_dir: Path) -> List[Dict[str, Any]]:
     r"""One row per run directory (a dir containing ``summary.json``). Pulls the scaling point, the
     held-out test numbers, the structural config, the cell's route/scale_knob, and provenance."""
@@ -89,20 +300,20 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
         summ = _read_json(summ_path)
         sp = summ.get("scaling_point", {})
         cfgj = _read_json(run / "config.json")
-        cfg = cfgj.get("config", {})
+        cfg = cfgj.get("config", {}) if isinstance(cfgj, Mapping) else {}
         prov = _read_json(run / "provenance.json")
         cell = _read_json(run / "scaling_cell.json")
-        test = _read_json(run / "test_results.json")
-        test_ce = sp.get("test_ce")                          # coalesce: dict.get's default fires only on
-        if test_ce is None:                                  # a MISSING key, not an explicit null, so a
-            test_ce = test.get("test_ce")                    # run with test_ce=null would drop a real value (r2 id14)
+        verified = _validated_bound_scaling_run(run, summ, cfgj, prov, cell)
+        if verified is None or not isinstance(sp, Mapping) or not isinstance(cfg, Mapping):
+            continue
         rows.append({
-            "run_dir":     str(run),
-            "route":       cell.get("route", "(unlabeled)"),
-            "scale_knob":  cell.get("scale_knob", "(unknown)"),
-            "label":       cell.get("label", run.name),
-            "seed":        prov.get("seed", cfg.get("seed")),
-            "n_params":    summ.get("n_params", sp.get("n_params")),
+            "run_dir":     str(run.resolve()),
+            "route":       cell["route"],
+            "scale_knob":  cell["scale_knob"],
+            "label":       cell["label"],
+            "seed":        verified["seed"],
+            "artifact_verified": True,
+            "n_params":    verified["n_params"],
             "n_learnable_params":      sp.get("n_learnable_params"),
             "embed_dim":   sp.get("embed_dim", cfg.get("embed_dim")),
             "n_heads":     sp.get("n_heads", cfg.get("n_heads")),
@@ -115,25 +326,23 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
             "est_flops_6ND":           sp.get("est_flops_6ND"),
             "est_flops_analytic":      sp.get("est_flops_analytic"),
             "active_params_per_token": sp.get("active_params_per_token"),
-            "test_ce":     test_ce,
-            "test_ppl":    test.get("test_ppl", sp.get("test_ppl")),
-            "test_bits_per_token": test.get(
-                "test_bits_per_token",
-                sp.get("test_bits_per_token", summ.get("test_bits_per_token")),
-            ),
-            "test_bpc": test.get(
-                "test_bpc", sp.get("test_bpc", summ.get("test_bpc"))),
-            "estep_final_f_per_token": (summ.get("estep_final_f_per_token")          # C2/EXP-5 join
-                                        if summ.get("estep_final_f_per_token") is not None
-                                        else test.get("estep_final_f_per_token")),
-            "best_val_ppl": (summ.get("best_val_ppl") if summ.get("best_val_ppl") is not None
-                             else test.get("best_val_ppl")),
+            "test_ce":     verified["test_ce"],
+            "test_ppl":    verified["test_ppl"],
+            "test_bits_per_token": verified["test_bits_per_token"],
+            "test_bpc": verified["test_bpc"],
+            "estep_final_f_per_token": summ.get("estep_final_f_per_token"),
+            "best_val_ppl": summ.get("best_val_ppl"),
             "wall_time_s": summ.get("wall_time_s", sp.get("wall_time_s")),
             "data_sha256": prov.get("data_sha256") or prov.get("test_data_sha256"),
             "train_data_sha256": prov.get("train_data_sha256"),
             "val_data_sha256": prov.get("val_data_sha256"),
             "test_data_sha256": prov.get("test_data_sha256") or prov.get("data_sha256"),
-            "git_sha":     prov.get("git_sha"),
+            "git_sha":     verified["git_sha"],
+            "git_dirty":   verified["git_dirty"],
+            "git_dirty_fingerprint": verified["git_dirty_fingerprint"],
+            "train_source_identity": verified["train_source_identity"],
+            "validation_source_identity": verified["validation_source_identity"],
+            "test_source_identity": verified["test_source_identity"],
         })
     return rows
 
@@ -141,6 +350,12 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
 def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Left-join the declared scaling cells to harvested results and classify every request."""
     path = input_dir / "scaling_design.json"
+    selected_route: Optional[str] = None
+    if not path.is_file():
+        parent_path = input_dir.parent / "scaling_design.json"
+        if parent_path.is_file():
+            path = parent_path
+            selected_route = input_dir.name
     raw = _read_json(path)
     if not isinstance(raw, Mapping):
         return {
@@ -151,23 +366,39 @@ def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
             "counts": {},
         }
     requested = raw.get("cells")
-    routes = raw.get("routes")
+    declared_routes = raw.get("routes")
+    routes = declared_routes
+    route_subset_valid = selected_route is None
+    if selected_route is not None and isinstance(declared_routes, list):
+        route_subset_valid = selected_route in declared_routes
+        routes = [selected_route]
+        if isinstance(requested, list):
+            requested = [
+                item for item in requested
+                if (
+                    not isinstance(item, Mapping)
+                    or item.get("route") == selected_route
+                    or type(item.get("route")) is not str
+                    or item.get("route") not in declared_routes
+                )
+            ]
     seeds = raw.get("seeds")
     top_status = raw.get("status")
     known_statuses = {
         "pending", "running", "complete", "success", "incomplete", "failed",
-        "missing", "duplicate", "nonfinite", "unreadable",
+        "missing", "duplicate", "nonfinite", "unreadable", "inconsistent",
     }
     valid_routes = (
-        isinstance(routes, list)
-        and bool(routes)
-        and all(isinstance(route, str) and bool(route) for route in routes)
-        and len(set(routes)) == len(routes)
+        isinstance(declared_routes, list)
+        and bool(declared_routes)
+        and all(type(route) is str and bool(route) for route in declared_routes)
+        and len(set(declared_routes)) == len(declared_routes)
+        and route_subset_valid
     )
     valid_seeds = (
         isinstance(seeds, list)
         and bool(seeds)
-        and all(isinstance(seed, int) and not isinstance(seed, bool) for seed in seeds)
+        and all(_is_exact_nonnegative_seed(seed) for seed in seeds)
         and len(set(seeds)) == len(seeds)
     )
     valid_header = (
@@ -191,16 +422,15 @@ def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
 
     observed: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = {}
     for row in rows:
-        try:
-            key = (str(row["route"]), str(row["label"]), int(row["seed"]))
-        except (KeyError, TypeError, ValueError):
+        key = _observed_join_key(row)
+        if key is None:
             continue
         observed.setdefault(key, []).append(row)
 
     cells: List[Dict[str, Any]] = []
-    counts: Dict[str, int] = {}
     requested_keys: set[Tuple[str, str, int]] = set()
     route_labels: set[Tuple[str, str]] = set()
+    matched_rows: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
     schema_valid = True
     for item in requested:
         if not isinstance(item, Mapping):
@@ -211,21 +441,34 @@ def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
             route = cell.get("route")
             label = cell.get("label")
             seed = cell.get("seed")
+            scale_knob = cell.get("scale_knob")
+            declared_run_dir = cell.get("run_dir")
             declared = cell.get("status")
+            expected_run_dir = (
+                f"{route}/{label}/s{seed}"
+                if (_safe_manifest_component(route)
+                    and _safe_manifest_component(label)
+                    and _is_exact_nonnegative_seed(seed))
+                else None
+            )
             if (
-                not isinstance(route, str)
-                or not route
+                not _safe_manifest_component(route)
                 or route not in routes
-                or not isinstance(label, str)
-                or not label
-                or not isinstance(seed, int)
-                or isinstance(seed, bool)
+                or not _safe_manifest_component(label)
+                or not _is_exact_nonnegative_seed(seed)
                 or seed not in seeds
+                or type(scale_knob) is not str
+                or not scale_knob
+                or type(declared_run_dir) is not str
+                or declared_run_dir != expected_run_dir
                 or not isinstance(declared, str)
                 or declared not in known_statuses
             ):
                 cell["status"] = "unreadable"
-                cell["error"] = "design cell lacks a valid route, label, seed, or status"
+                cell["error"] = (
+                    "design cell lacks a valid route, label, seed, scale_knob, canonical run_dir, "
+                    "or status"
+                )
                 schema_valid = False
             else:
                 key = (route, label, seed)
@@ -237,7 +480,13 @@ def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
                     schema_valid = False
                 else:
                     requested_keys.add(key)
-                matches = observed.get(key, [])
+                expected_path = (path.parent / declared_run_dir).resolve()
+                matches = [
+                    row for row in observed.get(key, [])
+                    if row.get("scale_knob") == scale_knob
+                    and isinstance(row.get("run_dir"), str)
+                    and Path(row["run_dir"]).resolve() == expected_path
+                ]
                 if duplicate_request:
                     pass
                 elif declared not in {"complete", "success"}:
@@ -251,9 +500,28 @@ def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
                     cell["status"] = (
                         "complete" if np.isfinite(value) and value > 0.0 else "nonfinite"
                     )
+                    if cell["status"] == "complete":
+                        matched_rows[key] = matches[0]
+        cells.append(cell)
+
+    structural_groups: Dict[Tuple[str, str], List[Tuple[Tuple[str, str, int], Dict[str, Any]]]] = {}
+    for key, row in matched_rows.items():
+        structural_groups.setdefault((key[0], key[1]), []).append((key, row))
+    inconsistent_groups = {
+        route_label
+        for route_label, entries in structural_groups.items()
+        if len({_structural_signature(row) for _key, row in entries}) != 1
+    }
+    if inconsistent_groups:
+        for cell in cells:
+            if ((cell.get("route"), cell.get("label")) in inconsistent_groups
+                    and cell.get("status") == "complete"):
+                cell["status"] = "inconsistent"
+                cell["error"] = "seed runs disagree on structural scaling identity"
+    counts: Dict[str, int] = {}
+    for cell in cells:
         status = str(cell.get("status", "unreadable"))
         counts[status] = counts.get(status, 0) + 1
-        cells.append(cell)
 
     expected_keys = {
         (route, label, seed)
@@ -384,20 +652,26 @@ def _frontier_verdict(frontier: Dict[str, Any]) -> str:
 
 def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     r"""Collapse seeds: one point per (route, label) carrying ``ce_seeds`` (the per-seed test CE) and
-    the shared structural fields. n_params is averaged across seeds (identical by construction; a
-    spread is warned about). Points with no finite positive CE are dropped."""
+    the exact shared structural fields. A structural disagreement withholds the cell instead of
+    synthesizing a mean-capacity model that was never run. Points with no finite positive CE are dropped."""
     groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for r in rows:
         groups.setdefault((r["route"], r["label"]), []).append(r)
     points: List[Dict[str, Any]] = []
     for (route, label), grp in sorted(groups.items()):
+        signatures = {_structural_signature(row) for row in grp}
+        if len(signatures) != 1:
+            logger.warning(
+                "structural identity varies across seeds for %s/%s; withholding the scaling cell",
+                route,
+                label,
+            )
+            continue
         ce = [_as_float(g["test_ce"]) for g in grp]
         ce = [c for c in ce if np.isfinite(c) and c > 0]
         if not ce:
             continue
         npars = [_as_float(g["n_params"]) for g in grp if np.isfinite(_as_float(g["n_params"]))]
-        if npars and (max(npars) - min(npars)) > 0:
-            logger.warning("n_params varies across seeds for %s/%s (%s); using the mean", route, label, npars)
         # C2/EXP-5: per-seed converged final E-step F/token and named bit metrics.
         f_seeds = [c for c in (_as_float(g.get("estep_final_f_per_token")) for g in grp) if np.isfinite(c)]
         bits_per_token = [
@@ -409,7 +683,7 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         ppl = [c for c in (_as_float(g.get("test_ppl")) for g in grp) if np.isfinite(c) and c > 0]
         points.append({
             "route": route, "label": label, "scale_knob": grp[0]["scale_knob"],
-            "n_params": float(np.mean(npars)) if npars else float("nan"),
+            "n_params": npars[0] if npars else float("nan"),
             "embed_dim": _as_float(grp[0].get("embed_dim")),         # F1/EXP-6 K axis
             "n_gen": _as_float(grp[0].get("n_gen")),
             "tokens_seen": _as_float(grp[0].get("tokens_seen")),
@@ -595,21 +869,16 @@ def analyze() -> None:
           f"\n  csv:     {input_dir / 'scaling_points.csv'}")
 
     allow_parameter_fit = design.get("complete") is True
-    requested_keys = {
-        (cell["route"], cell["label"], int(cell["seed"]))
-        for cell in design.get("cells", [])
-        if cell.get("status") == "complete"
-        and isinstance(cell.get("route"), str)
-        and isinstance(cell.get("label"), str)
-        and isinstance(cell.get("seed"), int)
-        and not isinstance(cell.get("seed"), bool)
-    }
+    requested_keys = set()
+    for cell in design.get("cells", []):
+        key = _exact_join_key(cell)
+        if cell.get("status") == "complete" and key is not None:
+            requested_keys.add(key)
     eligible_rows: List[Dict[str, Any]] = []
     if allow_parameter_fit:
         for row in rows:
-            try:
-                row_key = (str(row["route"]), str(row["label"]), int(row["seed"]))
-            except (KeyError, TypeError, ValueError):
+            row_key = _observed_join_key(row)
+            if row_key is None:
                 continue
             if row_key in requested_keys:
                 eligible_rows.append(row)

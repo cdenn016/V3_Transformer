@@ -170,6 +170,21 @@ def test_transport_permutation_exact_rotation_projects():
     assert not torch.allclose(bt_rot, torch.sort(b[0]).values, atol=1e-3)   # not any permutation of b
 
 
+def test_transport_zero_scale_uses_finite_zero_norm_subgradient():
+    scale = torch.tensor([[0.0, 2.0]], requires_grad=True)
+    omega = torch.eye(2).reshape(1, 1, 2, 2).requires_grad_()
+
+    transported = DiagonalLaplace.transport_dispersion(scale, omega)
+    transported.sum().backward()
+
+    assert torch.equal(transported, torch.tensor([[[0.0, 2.0]]]))
+    assert torch.equal(scale.grad, torch.tensor([[0.0, 1.0]]))
+    assert torch.equal(
+        omega.grad,
+        torch.tensor([[[[0.0, 0.0], [0.0, 2.0]]]]),
+    )
+
+
 # ---- end-to-end reachability ----------------------------------------------
 
 def test_oracle_gradients_finite_for_laplace():

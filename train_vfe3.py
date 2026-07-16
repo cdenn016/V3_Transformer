@@ -459,6 +459,13 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
     ])
 
 
+def _validated_data_seed() -> Optional[int]:
+    if DATA_SEED is not None and (type(DATA_SEED) is not int or DATA_SEED < 0):
+        raise ValueError(
+            f"DATA_SEED must be None or an exact non-negative integer, got {DATA_SEED!r}")
+    return DATA_SEED
+
+
 def _select_loader(
     dataset: str,
     cfg:     VFE3Config,
@@ -480,7 +487,8 @@ def _select_loader(
     cap = MAX_TOKENS if is_train else None
     # Fix the TRAIN shuffle order across seeds (EXP-1) only when DATA_SEED is set; None -> no generator
     # -> legacy global-RNG shuffle (byte-identical). Val/test do not shuffle, so a generator is moot there.
-    gen = torch.Generator().manual_seed(int(DATA_SEED)) if (is_train and DATA_SEED is not None) else None
+    data_seed = _validated_data_seed()
+    gen = torch.Generator().manual_seed(data_seed) if (is_train and data_seed is not None) else None
     return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
                            shuffle=is_train, drop_last=is_train, max_tokens=cap,
                            vocab_size=cfg.vocab_size, generator=gen)
@@ -687,24 +695,28 @@ def _resolve_seeds(
     """Resolve click-to-run seeds without silently overriding a one-run config seed."""
     if isinstance(num_runs, bool) or not isinstance(num_runs, int) or num_runs <= 0:
         raise ValueError(f"NUM_RUNS must be a positive integer, got {num_runs!r}")
+    config_seed = run_config.get("seed")
+    if type(config_seed) is not int or config_seed < 0:
+        raise ValueError(f"config seed must be an exact non-negative integer, got {config_seed!r}")
     if seeds:
+        if any(type(seed) is not int or seed < 0 for seed in seeds):
+            raise ValueError("SEEDS must contain exact non-negative integers")
+        if len(set(seeds)) != len(seeds):
+            raise ValueError(f"SEEDS must be unique, got {list(seeds)!r}")
         if len(seeds) < num_runs:
             raise ValueError(
                 f"SEEDS lists {len(seeds)} seed(s) but NUM_RUNS={num_runs}; "
                 "provide at least NUM_RUNS seeds"
             )
-        if num_runs == 1 and int(seeds[0]) != int(run_config["seed"]):
+        if num_runs == 1 and seeds[0] != config_seed:
             raise ValueError(
-                f"SEEDS[0]={int(seeds[0])} conflicts with config seed={int(run_config['seed'])}; "
+                f"SEEDS[0]={seeds[0]} conflicts with config seed={config_seed}; "
                 "make the one-run seed values agree"
             )
-        selected = [int(seed) for seed in seeds[:num_runs]]
-        if len(set(selected)) != len(selected):
-            raise ValueError(f"selected SEEDS must be unique, got {selected!r}")
-        return selected
+        return list(seeds[:num_runs])
     if num_runs != 1:
         raise ValueError(f"NUM_RUNS={num_runs} > 1 but SEEDS is empty; list one seed per run in SEEDS")
-    return [int(run_config["seed"])]
+    return [config_seed]
 
 
 def main() -> None:
@@ -715,6 +727,7 @@ def main() -> None:
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger = logging.getLogger("train_vfe3")
+    _validated_data_seed()                                  # before reserving any run/manifest directory
     seeds = _resolve_seeds(config, seeds=SEEDS, num_runs=NUM_RUNS)
     run_root = None
     request_manifest = None

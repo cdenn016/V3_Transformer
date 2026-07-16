@@ -4,18 +4,28 @@ import inspect
 import math
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
+from vfe3.data.datasets import TokenWindows
 from vfe3.free_energy import attention_weights, free_energy
 from vfe3.inference.e_step import free_energy_value
 from vfe3.model.block import _as_coeff
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
-from vfe3.train import _maybe_metropolis_omega, build_optimizer, lr_lambda, train, train_step
+from vfe3.train import (
+    _loader_data_identity,
+    _maybe_metropolis_omega,
+    build_optimizer,
+    lr_lambda,
+    train,
+    train_step,
+)
 
 
 def _model(*, seed: int = 0, perturb: bool = True, **overrides) -> VFEModel:
@@ -219,6 +229,120 @@ def test_scheduler_does_not_advance_after_rejected_update() -> None:
     assert scheduler.last_epoch == before_epoch
 
 
+def test_nonfinite_loss_blocks_enabled_gradscaler_step() -> None:
+    class FiniteGradientInfiniteLoss(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+            self.cfg = SimpleNamespace(
+                learnable_r=False,
+                phi_mstep_max_matrix_norm=None,
+            )
+
+        def forward(
+            self,
+            _tokens:         torch.Tensor,
+            _targets:        torch.Tensor,
+            *,
+            estep_grad_out:  Any = None,
+        ) -> tuple[None, torch.Tensor, None]:
+            del estep_grad_out
+            return None, self.weight + float("inf"), None
+
+    model = FiniteGradientInfiniteLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=2.0)
+    before_weight = model.weight.detach().clone()
+    before_epoch = scheduler.last_epoch
+    before_scale = float(scaler.get_scale())
+    status: dict[str, bool] = {}
+
+    result = train_step(
+        model,
+        optimizer,
+        scheduler,
+        torch.zeros(1, 1, dtype=torch.long),
+        torch.zeros(1, 1, dtype=torch.long),
+        grad_clip=0.0,
+        scaler=scaler,
+        status_out=status,
+    )
+
+    assert math.isinf(result)
+    assert status == {"did_step": False}
+    assert torch.equal(model.weight, before_weight)
+    assert scheduler.last_epoch == before_epoch
+    assert {group["successful_updates"] for group in optimizer.param_groups} == {0}
+    assert float(scaler.get_scale()) == before_scale
+
+
+def test_gradscaler_overflow_with_nonfinite_loss_backs_off_and_reports_gradient() -> None:
+    class InfiniteGradientInfiniteLoss(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+            self.cfg = SimpleNamespace(learnable_r=False, phi_mstep_max_matrix_norm=None)
+
+        def forward(self, _tokens, _targets, *, estep_grad_out=None):
+            del estep_grad_out
+            return None, self.weight * float("inf"), None
+
+    model = InfiniteGradientInfiniteLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    scaler = torch.amp.GradScaler(
+        device="cpu", enabled=True, init_scale=8.0, backoff_factor=0.5)
+    metrics: dict[str, float] = {}
+
+    train_step(
+        model,
+        optimizer,
+        scheduler,
+        torch.zeros(1, 1, dtype=torch.long),
+        torch.zeros(1, 1, dtype=torch.long),
+        scaler=scaler,
+        metrics_out=metrics,
+    )
+
+    assert float(scaler.get_scale()) == 4.0
+    assert metrics["grad_finite"] == 0.0
+    assert metrics["step_skipped"] == 1.0
+
+
+def test_finite_unlogged_gradscaler_step_does_not_scan_every_parameter_gradient(monkeypatch) -> None:
+    class ScalarModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+            self.cfg = SimpleNamespace(learnable_r=False, phi_mstep_max_matrix_norm=None)
+
+        def forward(self, _tokens, _targets, *, estep_grad_out=None):
+            del estep_grad_out
+            return None, self.weight.square(), None
+
+    model = ScalarModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=8.0)
+
+    def forbidden_explicit_scan(*_args, **_kwargs):
+        raise AssertionError("ordinary enabled-GradScaler steps must delegate overflow detection")
+
+    monkeypatch.setattr(torch, "isfinite", forbidden_explicit_scan)
+    train_step(
+        model,
+        optimizer,
+        scheduler,
+        torch.zeros(1, 1, dtype=torch.long),
+        torch.zeros(1, 1, dtype=torch.long),
+        grad_clip=0.0,
+        scaler=scaler,
+    )
+
+    assert model.weight < 1.0
+
+
 def test_successful_update_clock_persists_in_optimizer_state() -> None:
     model = _model(max_steps=4, warmup_steps=1)
     optimizer = build_optimizer(model, model.cfg)
@@ -249,8 +373,26 @@ def test_resumed_scheduler_uses_persisted_successful_update_clock(
     optimizer = build_optimizer(model, model.cfg)
     for group in optimizer.param_groups:
         group["successful_updates"] = 2
+    loader = DataLoader(
+        TokenWindows(torch.tensor([5, 0, 1, 5]), seq_len=3),
+        batch_size=1,
+        shuffle=False,
+        drop_last=True,
+    )
     artifacts = RunArtifacts(tmp_path / "source", model.cfg, model)
-    checkpoint = artifacts.save_checkpoint(5, model, optimizer, model.cfg)
+    checkpoint = artifacts.save_checkpoint(
+        5,
+        model,
+        optimizer,
+        model.cfg,
+        metropolis_generator=torch.Generator().manual_seed(model.cfg.seed),
+        data_state={
+            "epoch_start_generator_state": None,
+            "batches_consumed":            0,
+            "epoch":                       5,
+            "data_identity":               _loader_data_identity(loader, model.cfg.vocab_size),
+        },
+    )
 
     observed_last_epochs = []
     real_lambda_lr = torch.optim.lr_scheduler.LambdaLR
@@ -261,11 +403,9 @@ def test_resumed_scheduler_uses_persisted_successful_update_clock(
 
     monkeypatch.setattr(torch.optim.lr_scheduler, "LambdaLR", lambda_lr_spy)
     resumed = _model(max_steps=6, warmup_steps=1)
-    tokens = _tokens().repeat(2, 1)
-    targets = torch.roll(tokens, shifts=-1, dims=-1)
     train(
         resumed,
-        [(tokens, targets)],
+        loader,
         resumed.cfg,
         n_steps=6,
         resume_from=checkpoint,

@@ -30,14 +30,20 @@ WHAT THIS CAN AND CANNOT DO ON WIKITEXT (read before expecting a win):
 
 Run on the GPU (the iterative E-step is slow on CPU); it auto-uses CUDA when available.
 """
+import hashlib
+import io
+import json
+from dataclasses import fields
+from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
 
 import torch
 
-from vfe3.config import config_from_serialized
+from vfe3.config import VFE3Config, config_from_serialized
 from vfe3.data.datasets import tiktoken_encoding_name
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import _write_json_atomic, semantic_config_fingerprint
+from vfe3.runtime import deterministic_state
 
 # ---------------------------------- edit me ----------------------------------
 CONFIG = dict(
@@ -75,6 +81,97 @@ _POLICY_FIELDS = ("policy_mode", "policy_preference", "policy_score_terms",
                   "policy_sigma_ambiguity_validated", "policy_sigma_gate_artifact")
 
 
+def _validated_generation_paths(
+    cfg: Mapping[str, Any],
+) -> Tuple[Path, Optional[Path], Path]:
+    """Resolve input/output paths and reject any destructive publication alias."""
+    checkpoint = cfg.get("checkpoint")
+    if not isinstance(checkpoint, (str, Path)) or not str(checkpoint):
+        raise ValueError("set CONFIG['checkpoint'] to an existing checkpoint before generation")
+    output = cfg.get("output_path")
+    if not isinstance(output, str) or not output:
+        raise ValueError("output_path must be a non-empty path string")
+    config_from = cfg.get("config_from")
+    if config_from is not None and (
+        not isinstance(config_from, (str, Path)) or not str(config_from)
+    ):
+        raise ValueError("config_from must be None or a non-empty path")
+
+    checkpoint_path = Path(checkpoint).expanduser().resolve(strict=False)
+    config_from_path = (
+        Path(config_from).expanduser().resolve(strict=False)
+        if config_from is not None else None
+    )
+    output_path = Path(output).expanduser().resolve(strict=False)
+    input_paths = {checkpoint_path}
+    if config_from_path is not None:
+        input_paths.add(config_from_path)
+    if output_path in input_paths:
+        raise ValueError("output_path must not alias checkpoint or config_from input")
+    return checkpoint_path, config_from_path, output_path
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _generation_code_identity(root: Optional[Path] = None) -> str:
+    """Hash the generation entry point and every executable package Python source."""
+    base = Path(__file__).resolve().parent if root is None else Path(root).resolve()
+    sources = [base / "generate_efe.py"]
+    sources.extend(sorted(
+        path for path in (base / "vfe3").rglob("*.py")
+        if "__pycache__" not in path.parts
+    ))
+    digest = hashlib.sha256()
+    for path in sources:
+        relative = path.relative_to(base).as_posix().encode("utf-8")
+        content = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        for payload in (relative, content):
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+    return digest.hexdigest()
+
+
+def _runtime_identity(device: 'str | torch.device') -> dict:
+    """Return framework, determinism, and canonical execution-device provenance."""
+    resolved = torch.device(device)
+    index = resolved.index
+    name = None
+    if resolved.type == "cuda":
+        index = torch.cuda.current_device() if index is None else index
+        name = torch.cuda.get_device_name(index)
+    return {
+        "determinism": deterministic_state(),
+        "torch_version": str(torch.__version__),
+        "cuda_version": torch.version.cuda,
+        "device": {"type": resolved.type, "index": index, "name": name},
+    }
+
+
+def _model_state_sha256(state_dict: Mapping[str, torch.Tensor]) -> str:
+    """Hash tensor names, schemas, and bytes in a stable key order."""
+    digest = hashlib.sha256()
+    for name in sorted(state_dict):
+        tensor = state_dict[name]
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"model_state entry {name!r} is not a tensor")
+        owned = tensor.detach().cpu().contiguous()
+        header = json.dumps(
+            {"name": name, "dtype": str(owned.dtype), "shape": list(owned.shape)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(len(header).to_bytes(8, "little"))
+        digest.update(header)
+        digest.update(owned.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _bound_config(
     payload: Mapping[str, Any],
 
@@ -86,6 +183,16 @@ def _bound_config(
     if not isinstance(config, Mapping):
         raise ValueError(f"checkpoint {source} has no embedded config mapping")
     config_dict = dict(config)
+    known_fields = {field.name for field in fields(VFE3Config)}
+    unknown_fields = sorted(
+        repr(key) for key in config_dict
+        if type(key) is not str or key not in known_fields
+    )
+    if unknown_fields:
+        raise ValueError(
+            f"checkpoint {source} contains unknown config field(s) {unknown_fields}; "
+            "generation cannot prove how those fields affected the saved weights"
+        )
     computed = semantic_config_fingerprint(config_dict)
     stored = payload.get("config_fingerprint")
     if stored is not None and stored != computed:
@@ -110,12 +217,18 @@ def _state_dicts_equal(
 
 def _load_checkpoint(
     cfg: Mapping[str, Any],
+
+    *,
+    checkpoint_snapshot: Optional[bytes] = None,
+    config_from_snapshot: Optional[bytes] = None,
 ) -> Tuple[dict, Mapping[str, torch.Tensor]]:
     """Load a self-bound checkpoint or a legacy state explicitly bound to identical weights."""
     checkpoint = cfg.get("checkpoint")
     if not checkpoint:
         raise ValueError("set CONFIG['checkpoint'] to an existing checkpoint before generation")
-    obj = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    checkpoint_source = (
+        io.BytesIO(checkpoint_snapshot) if checkpoint_snapshot is not None else checkpoint)
+    obj = torch.load(checkpoint_source, map_location="cpu", weights_only=True)
     if not isinstance(obj, Mapping) or not obj:
         raise ValueError(f"checkpoint {checkpoint} is empty or malformed")
 
@@ -123,7 +236,10 @@ def _load_checkpoint(
         config_dict, fingerprint = _bound_config(obj, source=checkpoint)
         config_from = cfg.get("config_from")
         if config_from:
-            source_obj = torch.load(config_from, map_location="cpu", weights_only=True)
+            config_source = (
+                io.BytesIO(config_from_snapshot)
+                if config_from_snapshot is not None else config_from)
+            source_obj = torch.load(config_source, map_location="cpu", weights_only=True)
             if not isinstance(source_obj, Mapping):
                 raise ValueError(f"config_from checkpoint {config_from} is malformed")
             _, source_fingerprint = _bound_config(source_obj, source=config_from)
@@ -141,7 +257,9 @@ def _load_checkpoint(
         raise ValueError(
             f"{checkpoint} is a legacy pure state_dict with no bound config; set "
             "CONFIG['config_from'] to a checkpoint containing the identical model_state and config.")
-    source_obj = torch.load(config_from, map_location="cpu", weights_only=True)
+    config_source = (
+        io.BytesIO(config_from_snapshot) if config_from_snapshot is not None else config_from)
+    source_obj = torch.load(config_source, map_location="cpu", weights_only=True)
     if not isinstance(source_obj, Mapping):
         raise ValueError(f"config_from checkpoint {config_from} is malformed")
     config_dict, _ = _bound_config(source_obj, source=config_from)
@@ -240,11 +358,28 @@ def _run_generation_arms(
 
 def main() -> None:
     cfg = CONFIG
+    checkpoint_path, config_from_path, output_path = _validated_generation_paths(cfg)
+    checkpoint_snapshot = checkpoint_path.read_bytes()
+    checkpoint_sha256 = hashlib.sha256(checkpoint_snapshot).hexdigest()
+    config_from_snapshot = (
+        config_from_path.read_bytes() if config_from_path is not None else None)
+    config_from_sha256 = (
+        hashlib.sha256(config_from_snapshot).hexdigest()
+        if config_from_snapshot is not None else None)
+    code_identity_sha256 = _generation_code_identity()
     device = cfg["device"] or ("cuda" if torch.cuda.is_available() else "cpu")
     if device == "cpu":
         print("WARNING: running on CPU; the iterative E-step makes generation very slow. Use the GPU.")
 
-    config_dict, state_dict = _load_checkpoint(cfg)
+    config_dict, state_dict = _load_checkpoint(
+        cfg,
+        checkpoint_snapshot=checkpoint_snapshot,
+        config_from_snapshot=config_from_snapshot,
+    )
+    if (_sha256_file(checkpoint_path) != checkpoint_sha256
+            or (config_from_path is not None
+                and _sha256_file(config_from_path) != config_from_sha256)):
+        raise RuntimeError("generation input changed during checkpoint loading")
     enc = _tokenizer_for_dataset(cfg["dataset"], vocab_size=config_dict.get("vocab_size"))
     prompt_ids = torch.tensor([enc.encode(cfg["prompt"])], dtype=torch.long, device=device)
     print(f"checkpoint: {cfg['checkpoint']}")
@@ -255,6 +390,10 @@ def main() -> None:
     base_out, pol_out = _run_generation_arms(
         prompt_ids, config_dict, state_dict, cfg, device=device,
     )
+    if (_sha256_file(checkpoint_path) != checkpoint_sha256
+            or (config_from_path is not None
+                and _sha256_file(config_from_path) != config_from_sha256)):
+        raise RuntimeError("generation input changed during generation; refusing publication")
     print("=== BASE (policy_mode='none') ===")
     print(enc.decode([int(t) for t in base_out[0].tolist()]), "\n")
 
@@ -269,17 +408,34 @@ def main() -> None:
               + ("  (expected for flat + default score_terms: the score is constant -> base greedy)"
                  if same else "  (the reranker changed the continuation)"))
 
-    output_path = cfg.get("output_path")
-    if not isinstance(output_path, str) or not output_path:
-        raise ValueError("output_path must be a non-empty path string")
+    policy_contract = {
+        key: (list(cfg[key]) if key == "policy_score_terms" else cfg[key])
+        for key in _POLICY_FIELDS
+    }
     record = {
-        "schema_version": 1,
-        "checkpoint": str(cfg["checkpoint"]),
+        "schema_version": 3,
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": checkpoint_sha256,
+        "config_from": str(config_from_path) if config_from_path is not None else None,
+        "config_from_sha256": config_from_sha256,
+        "model_state_sha256": _model_state_sha256(state_dict),
         "config_fingerprint": semantic_config_fingerprint(config_dict),
+        "code_identity_sha256": code_identity_sha256,
+        "runtime_state": _runtime_identity(device),
         "generation_seed": int(cfg["generation_seed"]),
         "greedy": bool(cfg["greedy"]),
         "policy_mode": str(cfg["policy_mode"]),
         "policy_score_terms": list(cfg["policy_score_terms"]),
+        "generation_contract": {
+            "dataset": str(cfg["dataset"]),
+            "prompt": str(cfg["prompt"]),
+            "prompt_token_ids": prompt_ids.detach().cpu().tolist(),
+            "max_new_tokens": int(cfg["max_new_tokens"]),
+            "generation_seed": int(cfg["generation_seed"]),
+            "greedy": bool(cfg["greedy"]),
+            "device": str(device),
+            "policy": policy_contract,
+        },
         "outputs": {
             "base_token_ids": base_out.detach().cpu().tolist(),
             "policy_token_ids": (

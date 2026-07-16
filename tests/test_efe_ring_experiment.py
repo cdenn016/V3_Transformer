@@ -87,13 +87,40 @@ def _test_config(tmp_path, **overrides):
 
 def _run_checkpoint_output():
     # The (monkeypatched) arm-matrix output: the fields run_checkpoint contributes to a seed entry.
+    metrics = {arm: {"success": 0.5, "mean_steps_to_goal": 1.0, "frac_at_goal": 0.5,
+                     "mean_risk": 0.0, "mean_ambiguity": 0.0} for arm in EXPECTED_ARMS}
+    metrics["full_efe_tuned"]["success"] = 0.5002
+    primary_stat = {
+        "mcnemar_b": 1,
+        "mcnemar_c": 0,
+        "chi2": 0.0,
+        "p": 1.0,
+        "diff": 0.0002,
+        "ci": [0.0, 0.001],
+        "holm_pass": False,
+    }
     return {
         "gamma":       1.0,
         "temp":        1.0,
         "dev_success": 0.5,
-        "metrics":     {arm: {"success": 0.5, "mean_steps_to_goal": 1.0, "frac_at_goal": 0.5,
-                              "mean_risk": 0.0, "mean_ambiguity": 0.0} for arm in EXPECTED_ARMS},
-        "gates":       {"go": True, "closed_loop_causal": True},   # mirrors run_checkpoint's gate keys
+        "metrics":     metrics,
+        "gates": {
+            "primary": {
+                "p_data_control": {
+                    **primary_stat,
+                },
+                "temp_tuned_logprob": {
+                    **primary_stat,
+                },
+            },
+            "fdr_grid": {
+                arm: {"p": 1.0, "significant": False}
+                for arm in EXPECTED_ARMS if arm != "full_efe_tuned"
+            },
+            "random_clearly_beaten": False,
+            "closed_loop_causal": True,
+            "go": False,
+        },
     }
 
 
@@ -141,7 +168,7 @@ def test_trained_seed_bundle_skips_training_but_runs_evaluation(tmp_path, monkey
     semantic_cfg = exp._semantic_experiment_config(cfg)
     seed_dir = tmp_path / "seeds"
     seed_dir.mkdir(parents=True, exist_ok=True)
-    torch.manual_seed(0)
+    exp.seed_everything(0, deterministic=bool(cfg["deterministic"]))
     exp._save_seed_bundle(seed_dir / "seed_0.pt", _tiny_model(), semantic_cfg, None,
                           seed=0, adequacy=0.99, status="trained")
     train_counter, eval_counter = [0], [0]
@@ -160,7 +187,7 @@ def test_complete_seed_bundle_skips_training_and_evaluation(tmp_path, monkeypatc
     semantic_cfg = exp._semantic_experiment_config(cfg)
     seed_dir = tmp_path / "seeds"
     seed_dir.mkdir(parents=True, exist_ok=True)
-    torch.manual_seed(0)
+    exp.seed_everything(0, deterministic=bool(cfg["deterministic"]))
     exp._save_seed_bundle(seed_dir / "seed_0.pt", _tiny_model(), semantic_cfg, _complete_result(),
                           seed=0, adequacy=0.99, status="complete")
     train_counter, eval_counter = [0], [0]
@@ -188,6 +215,25 @@ def test_seed_bundle_rejects_code_or_experiment_drift(tmp_path, monkeypatch):
     # code drift: a changed executable code identity invalidates it
     monkeypatch.setattr(exp, "_efe_ring_code_identity", lambda root=None: "drifted-code-identity")
     assert exp._load_seed_bundle_if_current(path, semantic_cfg, dev, seed=0) is None
+
+
+@pytest.mark.parametrize("drift", ("determinism", "device"))
+def test_seed_bundle_rejects_runtime_or_device_drift(tmp_path, drift):
+    cfg = _test_config(tmp_path)
+    semantic_cfg = exp._semantic_experiment_config(cfg)
+    path = tmp_path / "seed_0.pt"
+    exp._save_seed_bundle(path, _tiny_model(), semantic_cfg, None,
+                          seed=0, adequacy=0.99, status="trained")
+    bundle = torch.load(path, weights_only=True)
+    if drift == "determinism":
+        determinism = bundle["runtime_state"].get("determinism", bundle["runtime_state"])
+        determinism["algorithms"] = not bool(determinism["algorithms"])
+    else:
+        bundle["runtime_state"]["device"] = {"type": "cuda", "index": 0}
+    torch.save(bundle, path)
+
+    assert exp._load_seed_bundle_if_current(
+        path, semantic_cfg, torch.device("cpu"), seed=0) is None
 
 
 def _corrupt_trained_nan_adequacy(b):
@@ -226,8 +272,83 @@ def _corrupt_nonfinite_success(b):
     b["result"]["metrics"]["random"]["success"] = float("inf")
 
 
+def _corrupt_nonfinite_arm_metric(b):
+    b["result"]["metrics"]["random"]["mean_steps_to_goal"] = float("nan")
+
+
+def _corrupt_missing_arm_metric(b):
+    del b["result"]["metrics"]["random"]["mean_risk"]
+
+
+def _corrupt_fraction_above_one(b):
+    b["result"]["metrics"]["random"]["frac_at_goal"] = 2.0
+
+
+def _corrupt_steps_above_budget(b):
+    b["result"]["metrics"]["random"]["mean_steps_to_goal"] = 11.0
+
+
+def _corrupt_zero_steps_to_goal(b):
+    b["result"]["metrics"]["random"]["mean_steps_to_goal"] = 0.0
+
+
+def _corrupt_negative_risk(b):
+    b["result"]["metrics"]["random"]["mean_risk"] = -1.0
+
+
+def _corrupt_negative_ambiguity(b):
+    b["result"]["metrics"]["random"]["mean_ambiguity"] = -1.0
+
+
+def _corrupt_missing_fdr_arm(b):
+    del b["result"]["gates"]["fdr_grid"]["random"]
+
+
+def _corrupt_nonfinite_fdr_p(b):
+    b["result"]["gates"]["fdr_grid"]["random"]["p"] = float("nan")
+
+
+def _corrupt_nonbool_fdr_significance(b):
+    b["result"]["gates"]["fdr_grid"]["random"]["significant"] = "false"
+
+
+def _corrupt_inconsistent_fdr_significance(b):
+    b["result"]["gates"]["fdr_grid"]["random"]["significant"] = True
+
+
 def _corrupt_adequacy_mismatch(b):
     b["result"]["adequacy"] = 0.5                            # top-level stays 0.99
+
+
+def _corrupt_admission_threshold(b):
+    b["adequacy"] = 0.1
+    b["result"]["adequacy"] = 0.1
+
+
+def _corrupt_success_above_one(b):
+    b["result"]["metrics"]["random"]["success"] = 2.0
+
+
+def _corrupt_inconsistent_go(b):
+    b["result"]["gates"]["go"] = True
+
+
+def _corrupt_inconsistent_random_gate(b):
+    b["result"]["gates"]["random_clearly_beaten"] = True
+
+
+def _corrupt_forged_primary_pass(b):
+    gate = b["result"]["gates"]["primary"]["p_data_control"]
+    gate["mcnemar_b"] = 5000
+    gate["mcnemar_c"] = 0
+    gate["chi2"] = 4998.0002
+    gate["p"] = 0.0
+    gate["diff"] = 1.0
+    gate["holm_pass"] = True
+
+
+def _corrupt_unregistered_tuning_value(b):
+    b["result"]["gamma"] = 3.14159
 
 
 MALFORMED_CASES = [
@@ -240,8 +361,36 @@ MALFORMED_CASES = [
     ("complete", _complete_result,   _corrupt_missing_gates),
     ("complete", _complete_result,   _corrupt_nonbool_go),
     ("complete", _complete_result,   _corrupt_nonfinite_success),
+    ("complete", _complete_result,   _corrupt_nonfinite_arm_metric),
+    ("complete", _complete_result,   _corrupt_missing_arm_metric),
+    ("complete", _complete_result,   _corrupt_fraction_above_one),
+    ("complete", _complete_result,   _corrupt_steps_above_budget),
+    ("complete", _complete_result,   _corrupt_zero_steps_to_goal),
+    ("complete", _complete_result,   _corrupt_negative_risk),
+    ("complete", _complete_result,   _corrupt_negative_ambiguity),
+    ("complete", _complete_result,   _corrupt_missing_fdr_arm),
+    ("complete", _complete_result,   _corrupt_nonfinite_fdr_p),
+    ("complete", _complete_result,   _corrupt_nonbool_fdr_significance),
+    ("complete", _complete_result,   _corrupt_inconsistent_fdr_significance),
     ("complete", _complete_result,   _corrupt_adequacy_mismatch),
+    ("complete", _complete_result,   _corrupt_admission_threshold),
+    ("complete", _complete_result,   _corrupt_success_above_one),
+    ("complete", _complete_result,   _corrupt_inconsistent_go),
+    ("complete", _complete_result,   _corrupt_inconsistent_random_gate),
+    ("complete", _complete_result,   _corrupt_forged_primary_pass),
+    ("complete", _complete_result,   _corrupt_unregistered_tuning_value),
 ]
+
+
+@pytest.mark.parametrize("seeds", ((), (1, 1), (True,), (1.5,), ("1",), (-1,)))
+def test_main_rejects_invalid_seed_contract_before_output(tmp_path, monkeypatch, seeds):
+    out_dir = tmp_path / "must-not-exist"
+    monkeypatch.setattr(exp, "CONFIG", _test_config(out_dir, seeds=seeds, out_dir=str(out_dir)))
+
+    with pytest.raises(ValueError, match="seeds"):
+        exp.main()
+
+    assert not out_dir.exists()
 
 
 @pytest.mark.parametrize("status,result_factory,mutate", MALFORMED_CASES,

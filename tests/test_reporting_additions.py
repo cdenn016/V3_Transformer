@@ -18,6 +18,7 @@ import csv as _csv
 import hashlib
 import json
 import logging
+import math
 import os
 import types
 
@@ -513,7 +514,7 @@ def test_seed_aggregate_groups_seeds():
 # --------------------------------------------------------------------------- scaling summary report
 
 
-def _record_complete_scaling_cell(root, route, label, seed):
+def _record_complete_scaling_cell(root, route, label, seed, scale_knob="n_params"):
     path = root / "scaling_design.json"
     design = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {
         "schema_version": 1,
@@ -528,6 +529,8 @@ def _record_complete_scaling_cell(root, route, label, seed):
         "route": route,
         "label": label,
         "seed": seed,
+        "scale_knob": scale_knob,
+        "run_dir": f"{route}/{label}/s{seed}",
         "status": "complete",
     })
     path.write_text(json.dumps(design), encoding="utf-8")
@@ -547,12 +550,53 @@ def _write_scaling_analysis_run(
     val_sha="val-a",
     test_sha="test-a",
 ):
-    run = root / f"{route}_{label}_s{seed}"
-    run.mkdir()
-    (run / "summary.json").write_text(json.dumps({
+    run = root / route / label / f"s{seed}"
+    run.mkdir(parents=True)
+    config = {
+        "seed": seed,
+        "embed_dim": 4,
+        "n_heads": 1,
+        "n_layers": 1,
+        "n_e_steps": 1,
+        "family": "gaussian_diagonal",
+    }
+    code_identity = {
+        "git_sha": git_sha,
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
+    cell = {
+        "schema_version": 2,
+        "route": route,
+        "scale_knob": "n_params",
+        "label": label,
+        "seed": seed,
+        "dataset": "synthetic",
+        "config_sha256": hashlib.sha256(json.dumps(
+            config, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
+        "code_identity": code_identity,
+        "data_sources": {
+            split: {"format": "pt", "size_bytes": len(split), "sha256": split[0] * 64}
+            for split in ("train", "validation", "test")
+        },
+    }
+    digest = hashlib.sha256(json.dumps(
+        cell, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    cell["reuse_contract_sha256"] = digest
+    metrics = {
         "n_params": n_params,
+        "test_ce": test_ce,
+        "test_ppl": math.exp(test_ce),
+        "test_bits_per_token": test_ce / math.log(2.0),
+        "test_bpc": None,
+    }
+    (run / "summary.json").write_text(json.dumps({
+        **metrics,
+        "scaling_reuse_contract_sha256": digest,
         "scaling_point": {
-            "n_params": n_params,
+            **metrics,
             "n_learnable_params": n_params,
             "embed_dim": 4,
             "n_heads": 1,
@@ -561,25 +605,16 @@ def _write_scaling_analysis_run(
             "n_layers": 1,
             "n_e_steps": 1,
             "tokens_seen": tokens_seen,
-            "test_ce": test_ce,
         },
     }), encoding="utf-8")
-    (run / "config.json").write_text(json.dumps({"config": {
-        "seed": seed,
-        "embed_dim": 4,
-        "n_heads": 1,
-        "n_layers": 1,
-        "n_e_steps": 1,
-        "family": "gaussian_diagonal",
-    }}), encoding="utf-8")
-    (run / "scaling_cell.json").write_text(json.dumps({
-        "route": route,
-        "scale_knob": "n_params",
-        "label": label,
+    (run / "config.json").write_text(json.dumps({
+        "dataset": "synthetic",
+        "config": config,
     }), encoding="utf-8")
+    (run / "scaling_cell.json").write_text(json.dumps(cell), encoding="utf-8")
     (run / "provenance.json").write_text(json.dumps({
         "seed": seed,
-        "git_sha": git_sha,
+        **code_identity,
         "train_data_sha256": train_sha,
         "val_data_sha256": val_sha,
         "test_data_sha256": test_sha,
@@ -900,30 +935,71 @@ def _write_scaling_validation_run(root, *, route, label, embed_dim, n_params, te
     ``aggregate_points`` reads (feeding the legacy scaling_ce_vs_params.png fit) and the
     top-level ``best_val_ppl`` / ``wall_time_s`` fields ``aggregate_validation_points`` reads
     (feeding the two PB-07 registered validation figures)."""
-    run = root / f"{route}_{label}_s{seed}"
-    run.mkdir()
-    (run / "summary.json").write_text(json.dumps({
-        "n_params":      n_params,
-        "best_val_ppl":  best_val_ppl,
-        "wall_time_s":   wall_time_s,
-        "scaling_point": {
-            "n_params": n_params, "n_learnable_params": n_params, "embed_dim": embed_dim,
-            "n_heads": 1, "n_gen": 16, "gauge_group": "glk", "n_layers": 1, "n_e_steps": 1,
-            "tokens_seen": 1000, "test_ce": test_ce,
-        },
-    }), encoding="utf-8")
-    (run / "config.json").write_text(json.dumps({"config": {
+    run = root / route / label / f"s{seed}"
+    run.mkdir(parents=True)
+    config = {
         "seed": seed, "embed_dim": embed_dim, "n_heads": 1, "n_layers": 1, "n_e_steps": 1,
         "family": "gaussian_diagonal",
-    }}), encoding="utf-8")
-    (run / "scaling_cell.json").write_text(json.dumps({
-        "route": route, "scale_knob": "embed_dim", "label": label,
+    }
+    code_identity = {
+        "git_sha": "git-a",
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
+    cell = {
+        "schema_version": 2,
+        "route": route,
+        "scale_knob": "embed_dim",
+        "label": label,
+        "seed": seed,
+        "dataset": "synthetic",
+        "config_sha256": hashlib.sha256(json.dumps(
+            config, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
+        "code_identity": code_identity,
+        "data_sources": {
+            split: {"format": "pt", "size_bytes": len(split), "sha256": split[0] * 64}
+            for split in ("train", "validation", "test")
+        },
+    }
+    digest = hashlib.sha256(json.dumps(
+        cell, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    cell["reuse_contract_sha256"] = digest
+    metrics = {
+        "n_params": n_params,
+        "test_ce": test_ce,
+        "test_ppl": math.exp(test_ce),
+        "test_bits_per_token": test_ce / math.log(2.0),
+        "test_bpc": None,
+    }
+    (run / "summary.json").write_text(json.dumps({
+        **metrics,
+        "best_val_ppl": best_val_ppl,
+        "wall_time_s": wall_time_s,
+        "scaling_reuse_contract_sha256": digest,
+        "scaling_point": {
+            **metrics,
+            "n_learnable_params": n_params,
+            "embed_dim": embed_dim,
+            "n_heads": 1,
+            "n_gen": 16,
+            "gauge_group": "glk",
+            "n_layers": 1,
+            "n_e_steps": 1,
+            "tokens_seen": 1000,
+        },
     }), encoding="utf-8")
+    (run / "config.json").write_text(json.dumps({
+        "dataset": "synthetic",
+        "config": config,
+    }), encoding="utf-8")
+    (run / "scaling_cell.json").write_text(json.dumps(cell), encoding="utf-8")
     (run / "provenance.json").write_text(json.dumps({
-        "seed": seed, "git_sha": "git-a", "train_data_sha256": "train-a",
+        "seed": seed, **code_identity, "train_data_sha256": "train-a",
         "val_data_sha256": "val-a", "test_data_sha256": "test-a", "data_sha256": "test-a",
     }), encoding="utf-8")
-    _record_complete_scaling_cell(root, route, label, seed)
+    _record_complete_scaling_cell(root, route, label, seed, "embed_dim")
 
 
 def _stub_registered_figure(name, cap):
@@ -1000,7 +1076,11 @@ def test_ablation_main_dispatches_registered_figures_by_name_and_keeps_legacy_ou
     def fake_run_single(label, overrides, run_dir, **kwargs):
         run_dir.mkdir(parents=True, exist_ok=True)
         result = {"label": label, "error_kind": None, "seed": 6,
-                  "overrides": ablation._jsonable(overrides)}
+                  "overrides": ablation._jsonable(overrides),
+                  "_loaded_data_sources": {
+                      split: _fake_ablation_source_ok("wikitext-103", split)
+                      for split in ("train", "validation")
+                  }}
         if kwargs.get("paired_token_bootstrap"):
             idx = list(forest_offsets).index(label)
             g = torch.Generator().manual_seed(1000 + idx)

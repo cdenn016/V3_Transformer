@@ -711,15 +711,15 @@ def test_group_element_inverse_rejects_invalid_residual_tol(group_name, residual
         group_element_inverse(omega, group, residual_tol=residual_tol)
 
 
-def test_element_transport_skew_group_uses_transpose_inverse():
+def test_element_transport_skew_group_uses_true_inverse_for_rounded_frame():
     grp = get_group("so_k")(K=4)                              # skew_symmetric=True -> U in O(4)
     g = torch.Generator().manual_seed(11)
     xi = 0.2 * torch.randn(1, 3, grp.generators.shape[0], generator=g)
     U = retract_omega(torch.eye(4).expand(1, 3, 4, 4).contiguous(), xi, grp.generators)  # in SO(4)
     built = build_transport_from_element(U, grp)              # single block -> dict
-    # atol=0 alone is NOT bitwise (default rtol=1e-5 masks the ~5e-7 inv-vs-transpose gap);
-    # rtol=0 too makes this a true bitwise check that only the transpose branch satisfies.
-    assert torch.allclose(built["exp_neg_phi"], U.transpose(-1, -2), atol=0, rtol=0)   # bitwise transpose fast path
+    true_inverse = torch.linalg.inv(U.double()).to(U.dtype)
+    torch.testing.assert_close(built["exp_neg_phi"], true_inverse, atol=0.0, rtol=0.0)
+    assert not torch.equal(built["exp_neg_phi"], U.transpose(-1, -2))
     # cocycle telescopes
     om = built["Omega"]
     assert torch.allclose(om[0, 0, 1] @ om[0, 1, 2], om[0, 0, 2], atol=1e-5)

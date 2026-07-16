@@ -2,7 +2,10 @@ import math
 
 import pytest
 import torch
+from torch.utils.data import DataLoader
+
 from vfe3.config import VFE3Config
+from vfe3.data.datasets import TokenWindows
 
 
 def _omega_cfg(**over):
@@ -280,9 +283,12 @@ def test_metropolis_generator_state_roundtrips(tmp_path, monkeypatch):
         model = _model(checkpoint_interval=2, max_steps=3, seed=17,
                        n_e_steps=1, m_phi_lr=0.0)
     cfg = model.cfg
-    tokens = torch.tensor([[0, 1, 2, 3]])
-    targets = torch.tensor([[1, 2, 3, 4]])
-    loader = [(tokens, targets)]
+    loader = DataLoader(
+        TokenWindows(torch.tensor([0, 1, 2, 3, 4]), seq_len=4),
+        batch_size=1,
+        shuffle=False,
+        drop_last=True,
+    )
     source_draws = []
 
     def _record_source(token_ids, *, generator):

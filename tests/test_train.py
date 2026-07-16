@@ -856,6 +856,29 @@ def test_validation_finalizer_records_validation_without_test_fields(tmp_path, m
     assert (tmp_path / "r" / "checkpoints" / f"step_{cfg.max_steps}.pt").exists()
 
 
+def test_validation_finalizer_uses_completed_terminal_step_not_configured_max(tmp_path, monkeypatch):
+    monkeypatch.setattr("vfe3.run_artifacts._git_code_identity",
+                        lambda *a, **k: {"git_sha": "0" * 40, "git_dirty": False,
+                                         "git_dirty_fingerprint": None})
+    cfg = _terminal_cfg(max_steps=4)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    state = _make_terminal_state(model, cfg)._replace(step=2)
+
+    mapping = finalize_validation_run(
+        model, art, cfg, _terminal_val_loader(), losses=[1.0, 0.9],
+        terminal_state=state, device=torch.device("cpu"))
+
+    summary = json.loads((tmp_path / "r" / "summary.json").read_text())
+    assert summary["n_steps"] == 2
+    assert summary["best_step"] == 2
+    assert Path(mapping["terminal_checkpoint"]).name == "step_2.pt"
+    assert not (tmp_path / "r" / "checkpoints" / "step_4.pt").exists()
+    with open(tmp_path / "r" / "metrics.csv", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows[-1]["step"] == "2"
+
+
 def test_validation_finalizer_appends_to_existing_metrics_schema(tmp_path, monkeypatch):
     monkeypatch.setattr("vfe3.run_artifacts._git_code_identity",
                         lambda *a, **k: {"git_sha": "0" * 40, "git_dirty": False,

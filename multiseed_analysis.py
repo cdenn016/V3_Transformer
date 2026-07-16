@@ -28,7 +28,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import numpy as np
 
@@ -40,6 +40,11 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _is_exact_nonnegative_seed(value: Any) -> bool:
+    """Whether ``value`` is a plain Python ``int`` seed in the supported domain."""
+    return type(value) is int and value >= 0
 
 
 def _strip_seed_keys(value: Any) -> Any:
@@ -165,17 +170,101 @@ def _seed_for(
     config_name: str = "config.json",
     prov_name:   str = "provenance.json",
 ) -> Optional[int]:
-    r"""The seed for one run dir: ``provenance.json["seed"]`` -> ``config.json["seed"]`` -> the
-    ``_s<NN>`` suffix of the dir name. None if every source is absent. (``config.json`` stores
-    ``null`` in current runs; the real seed lives in ``provenance.json``.)
+    r"""Return the one seed on which every present run identity agrees.
+
+    Provenance, flat or nested config, and the canonical ``_s<NN>`` directory suffix are independent
+    join keys. Missing/null identities are ignored, but a malformed or contradictory present value
+    makes the run unreadable instead of allowing priority order to hide provenance drift.
     """
     run_dir = Path(run_dir)
+    identities: List[int] = []
     for fname in (prov_name, config_name):
-        s = _read_json(run_dir / fname).get("seed")
-        if isinstance(s, (int, float)) and not isinstance(s, bool):
-            return int(s)
-    m = re.search(r"_s(\d+)$", run_dir.name)
-    return int(m.group(1)) if m else None
+        path = run_dir / fname
+        if not path.exists():
+            continue
+        if not path.is_file():
+            return None
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(artifact, dict):
+            return None
+        candidates: List[object] = []
+        if "seed" in artifact:
+            candidates.append(artifact["seed"])
+        if fname == config_name and "config" in artifact:
+            nested = artifact["config"]
+            if not isinstance(nested, Mapping):
+                return None
+            if "seed" in nested:
+                candidates.append(nested["seed"])
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if not _is_exact_nonnegative_seed(candidate):
+                return None
+            identities.append(candidate)
+    name_match = re.search(r"_s(\d+)(?:_\d+)?$", run_dir.name)
+    if name_match is not None:
+        identities.append(int(name_match.group(1)))
+    if not identities or len(set(identities)) != 1:
+        return None
+    return identities[0]
+
+
+def _provenance_contract(run_dir: Path) -> Dict[str, object]:
+    """Return the code/data contract required for a comparable across-seed run."""
+    path = Path(run_dir) / "provenance.json"
+    try:
+        provenance = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unreadable provenance at {path}") from exc
+    if not isinstance(provenance, Mapping):
+        raise ValueError(f"provenance at {path} must be an object")
+    seed = provenance.get("seed")
+    if not _is_exact_nonnegative_seed(seed):
+        raise ValueError(f"provenance at {path} has no exact nonnegative seed")
+    git_sha = provenance.get("git_sha")
+    git_dirty = provenance.get("git_dirty")
+    dirty_fingerprint = provenance.get("git_dirty_fingerprint")
+    if not isinstance(git_sha, str) or not git_sha or type(git_dirty) is not bool:
+        raise ValueError(f"provenance at {path} has no usable code identity")
+    if ((git_dirty and (not isinstance(dirty_fingerprint, str) or not dirty_fingerprint))
+            or (not git_dirty and dirty_fingerprint is not None)):
+        raise ValueError(f"provenance at {path} has an inconsistent dirty-tree identity")
+
+    contract: Dict[str, object] = {
+        "git_sha": git_sha,
+        "git_dirty": git_dirty,
+        "git_dirty_fingerprint": dirty_fingerprint,
+    }
+    for split in ("train", "val", "test"):
+        digest = provenance.get(f"{split}_data_sha256")
+        n_tokens = provenance.get(f"{split}_data_n_tokens")
+        if (not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None
+                or type(n_tokens) is not int
+                or n_tokens < 0):
+            raise ValueError(f"provenance at {path} has no usable {split} data identity")
+        contract[f"{split}_data_sha256"] = digest.lower()
+        contract[f"{split}_data_n_tokens"] = n_tokens
+
+    data_seed = provenance.get("data_seed")
+    max_tokens = provenance.get("max_tokens")
+    tokenizer_tag = provenance.get("tokenizer_tag")
+    if data_seed is not None and not _is_exact_nonnegative_seed(data_seed):
+        raise ValueError(f"provenance at {path} has an invalid data_seed")
+    if max_tokens is not None and (type(max_tokens) is not int or max_tokens <= 0):
+        raise ValueError(f"provenance at {path} has an invalid max_tokens")
+    if not isinstance(tokenizer_tag, str) or not tokenizer_tag:
+        raise ValueError(f"provenance at {path} has no tokenizer identity")
+    contract.update({
+        "data_seed": data_seed,
+        "max_tokens": max_tokens,
+        "tokenizer_tag": tokenizer_tag,
+    })
+    return contract
 
 
 def _seed_dirs(root: Path) -> List[Path]:
@@ -196,11 +285,21 @@ def _seed_dirs(root: Path) -> List[Path]:
 def _request_manifest(root: Path, observed: List[int]) -> Dict[str, Any]:
     request_path = root / "multiseed_request.json"
     request = _read_json(request_path)
+    observed_valid = all(_is_exact_nonnegative_seed(seed) for seed in observed)
+    observed_seeds = sorted(set(observed)) if observed_valid else []
     if not request_path.is_file():
         return {
             "available": False,
             "request_verified": False,
-            "requested_seeds": sorted(set(observed)),
+            "requested_seeds": observed_seeds,
+            "manifest_status": "unverifiable",
+            "declared_statuses": {},
+        }
+    if not isinstance(request, Mapping):
+        return {
+            "available": True,
+            "request_verified": False,
+            "requested_seeds": observed_seeds,
             "manifest_status": "unverifiable",
             "declared_statuses": {},
         }
@@ -214,10 +313,10 @@ def _request_manifest(root: Path, observed: List[int]) -> Dict[str, Any]:
     seeds_valid = (
         isinstance(raw, list)
         and bool(raw)
-        and all(isinstance(seed, int) and not isinstance(seed, bool) for seed in raw)
+        and all(_is_exact_nonnegative_seed(seed) for seed in raw)
         and len(set(raw)) == len(raw)
     )
-    seeds = [int(seed) for seed in raw] if seeds_valid else sorted(set(observed))
+    seeds = list(raw) if seeds_valid else observed_seeds
     header_valid = (
         request.get("schema_version") == 1
         and seeds_valid
@@ -236,8 +335,7 @@ def _request_manifest(root: Path, observed: List[int]) -> Dict[str, Any]:
             seed = cell.get("seed")
             status = cell.get("status")
             if (
-                not isinstance(seed, int)
-                or isinstance(seed, bool)
+                not _is_exact_nonnegative_seed(seed)
                 or seed not in seeds
                 or seed in declared
                 or not isinstance(status, str)
@@ -285,6 +383,7 @@ def _requested_seed_design(
     manifest = _request_manifest(root, list(by_seed))
     requested = manifest["requested_seeds"]
     cells: List[Dict[str, Any]] = []
+    provenance_contracts: Dict[int, Dict[str, object]] = {}
     for seed in requested:
         matches = by_seed.get(seed, [])
         if not manifest["request_verified"]:
@@ -305,10 +404,30 @@ def _requested_seed_design(
         elif len(matches) > 1:
             cells.append({"seed": seed, "status": "duplicate", "run_dir": None})
         else:
-            cells.append({"seed": seed, "status": "complete", "run_dir": str(matches[0])})
+            try:
+                contract = _provenance_contract(matches[0])
+            except ValueError:
+                cells.append({"seed": seed, "status": "unverifiable", "run_dir": str(matches[0])})
+            else:
+                provenance_contracts[seed] = contract
+                cells.append({"seed": seed, "status": "complete", "run_dir": str(matches[0])})
+    fingerprints = {
+        json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        for contract in provenance_contracts.values()
+    }
+    provenance_verified = (
+        bool(cells)
+        and len(provenance_contracts) == len(cells)
+        and len(fingerprints) == 1
+    )
+    if manifest["request_verified"] and len(fingerprints) > 1:
+        for cell in cells:
+            if cell["status"] == "complete":
+                cell["status"] = "unverifiable"
     complete = (
         manifest["request_verified"]
         and manifest["manifest_status"] in {"complete", "success"}
+        and provenance_verified
         and bool(cells)
         and all(cell["status"] == "complete" for cell in cells)
     )
@@ -316,6 +435,7 @@ def _requested_seed_design(
         "requested_seeds": requested,
         "request_verified": manifest["request_verified"],
         "manifest_status": manifest["manifest_status"],
+        "provenance_verified": provenance_verified,
         "status": "complete" if complete else "incomplete",
         "complete": complete,
         "cells": cells,
@@ -445,9 +565,11 @@ def aggregate_seed_curves(
 ) -> Dict[str, Dict[str, np.ndarray]]:
     r"""Across-seed per-step curves from each seed's ``metrics.csv``.
 
-    Returns ``{column: {steps, mean, sd, n}}`` on the shared ``x`` (step) grid. Every published
-    value requires one finite aligned observation from every requested seed at that step;
-    otherwise the curve set is withheld. ``columns=None`` selects every numeric column except ``x``.
+    Returns ``{column: {steps, mean, sd, n}}``. Each curve uses the subset of the shared ``x`` grid
+    where at least one seed records that metric; every requested seed must provide a finite aligned
+    observation at each such point or the curve set is withheld. This excludes rows that are
+    structurally blank for every seed at another metric's cadence. ``columns=None`` selects every
+    supported numeric column except ``x`` and ignores columns that are blank for all seeds.
     """
     root = _resolve_run_root(run_root)
     design = _requested_seed_design(root)
@@ -484,9 +606,6 @@ def aggregate_seed_curves(
     grid = np.unique(np.concatenate([s for s, _ in per_seed]))
     out: Dict[str, Dict[str, np.ndarray]] = {}
     for c in sel:
-        if any(c not in seed_cols or not np.any(np.isfinite(seed_cols[c]))
-               for _steps, seed_cols in per_seed):
-            return {}
         stack = []
         for steps, cols in per_seed:
             row = np.full(grid.shape, np.nan)
@@ -494,10 +613,16 @@ def aggregate_seed_curves(
                 row[np.searchsorted(grid, steps)] = cols[c]
             stack.append(row)
         matrix = np.vstack(stack)
+        active = np.any(np.isfinite(matrix), axis=0)
+        if not np.any(active):
+            if columns is not None:
+                return {}
+            continue
+        matrix = matrix[:, active]
         if not np.all(np.isfinite(matrix)):
             return {}
         mean, sd, n = _nan_mean_sd(matrix)
-        out[c] = {"steps": grid, "mean": mean, "sd": sd, "n": n}
+        out[c] = {"steps": grid[active], "mean": mean, "sd": sd, "n": n}
     return out
 
 
@@ -783,6 +908,23 @@ def main() -> None:
     headline = scalar_candidates[CONFIG["key"]]
     curves = aggregate_seed_curves(root)
     per_layer = aggregate_per_layer(root)
+    per_layer_requested = False
+    for cell in request_design["cells"]:
+        run_dir_value = cell.get("run_dir")
+        if run_dir_value is None:
+            continue
+        run_dir = Path(run_dir_value)
+        if (run_dir / "metrics_per_layer.csv").is_file():
+            per_layer_requested = True
+            break
+        try:
+            semantic_config = _semantic_config(run_dir / "config.json")
+        except ValueError:
+            continue
+        if semantic_config.get("generate_figures") is True:
+            per_layer_requested = True
+            break
+    per_layer_complete = not per_layer_requested or bool(per_layer)
     partial_scalars = [
         key for key, aggregate in scalar_candidates.items()
         if aggregate["n"] > 0 and not aggregate["complete"]
@@ -792,7 +934,6 @@ def main() -> None:
         and headline["complete"]
         and not partial_scalars
         and bool(curves)
-        and bool(per_layer)
     )
     if publication_complete:
         scalars = {
@@ -806,6 +947,8 @@ def main() -> None:
             print(f"{key:<28}{aggregate['n']:>3}{aggregate['mean']:>14.4f}"
                   f"{_fnum(aggregate['sd']):>13}{_fnum(aggregate['two_sd']):>12}"
                   f"{_fnum(cvpct, '.3f'):>9}")
+        if not per_layer_complete:
+            print("optional per-layer diagnostics are incomplete; that channel is withheld")
     else:
         scalars = {}
         curves = {}
@@ -831,14 +974,15 @@ def main() -> None:
         "withheld": {
             "scalars": not publication_complete,
             "curves": not publication_complete,
-            "per_layer": not publication_complete,
+            "per_layer": not publication_complete or not per_layer_complete,
             "figures": not publication_complete,
         },
         "diagnostics": {
             "headline": headline,
             "partial_scalars": partial_scalars,
             "curves_complete": bool(curves),
-            "per_layer_complete": bool(per_layer),
+            "per_layer_requested": per_layer_requested,
+            "per_layer_complete": per_layer_complete,
         },
         "caveat": CAVEAT,
         "scalars": scalars,

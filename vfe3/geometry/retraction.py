@@ -109,7 +109,8 @@ def _rel_gap_eps(
     A:     torch.Tensor,
 
     *,
-    rel:   Optional[float] = None,
+    rel:    Optional[float] = None,
+    floor:  Optional[float] = None,
 ) -> torch.Tensor:                         # (..., 1, 1) on-device tensor; no host-sync
     r"""Spectrum-relative ``gap_eps`` for :func:`_eigh_damped` on the SPD retraction paths (audit
     2026-06-13 L11). The fixed ``gap_eps=1e-8`` over-damps the eigh adjoint ``F_ij = 1/(w_j - w_i)``
@@ -117,15 +118,20 @@ def _rel_gap_eps(
     to ``(rel * ||A||_max)^2`` -- the squared fp32 noise floor of the spectrum -- damps only gaps
     below fp32 resolution (true degeneracy stays finite, ``F = 0``) and leaves resolvable gaps
     accurate. When omitted, ``rel`` is derived from the active dtype; ``finfo.tiny`` keeps a
-    near-zero spectrum finite without imposing a coordinate-scale floor. Each matrix receives its
-    own scale so unrelated batch elements cannot change its eigendecomposition adjoint. Returns
-    ``(..., 1, 1)`` on A's device/dtype to avoid a CUDA host-sync."""
+    near-zero spectrum finite without imposing a coordinate-scale floor. Passing an explicit
+    nonnegative ``floor`` preserves the diagnostic/test API; ``floor=0.0`` exposes the un-clamped
+    relative value. Each matrix receives its own scale so unrelated batch elements cannot change
+    its eigendecomposition adjoint. Returns ``(..., 1, 1)`` on A's device/dtype to avoid a CUDA
+    host-sync."""
     dtype_info = torch.finfo(A.dtype)
     relative = 8.0 * dtype_info.eps if rel is None else rel
     if not math.isfinite(relative) or relative <= 0.0:
         raise ValueError(f"rel must be None or finite and positive, got {rel!r}")
+    minimum = dtype_info.tiny if floor is None else floor
+    if not math.isfinite(minimum) or minimum < 0.0:
+        raise ValueError(f"floor must be None or finite and nonnegative, got {floor!r}")
     scale = A.detach().abs().amax(dim=(-2, -1), keepdim=True)
-    return (relative * scale).pow(2).clamp(min=dtype_info.tiny)
+    return (relative * scale).pow(2).clamp(min=minimum)
 
 
 def _spectral_values_and_derivatives(
@@ -388,13 +394,12 @@ def retract_spd_full(
         sigma_new = sigma_sqrt @ exp_R @ sigma_sqrt
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
-        if sigma_max is not None:
-            sigma_new = _symmetric_spectral_map(
-                sigma_new,
-                "project",
-                lower=eps,
-                upper=sigma_max,
-            )
+        sigma_new = _symmetric_spectral_map(
+            sigma_new,
+            "project",
+            lower=eps,
+            upper=sigma_max,
+        )
 
     sigma_new = sigma_new.to(orig_dtype)
     if len(orig_shape) == 4:

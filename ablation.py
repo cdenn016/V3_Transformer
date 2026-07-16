@@ -1738,6 +1738,7 @@ def get_loader(
     substitutes synthetic data for a missing real corpus -- that would mislabel synthetic numbers
     as a corpus measurement.
     """
+    data_seed_override = _validated_data_seed_override()
     cap = max_tokens if split == "train" else None
     key = (dataset, seq_len, batch_size, split, cap, vocab_size)
     if key in _LOADER_CACHE:
@@ -1749,7 +1750,10 @@ def get_loader(
     # when set (an explicit generator, as in train_vfe3._select_loader); None -> no generator ->
     # legacy global-RNG shuffle, pinned to cfg.seed by run_single's post-build reseed. The cached
     # generator's state advances across cells; run_single re-pins it to DATA_SEED per cell.
-    gen = torch.Generator().manual_seed(int(DATA_SEED)) if (split == "train" and DATA_SEED is not None) else None
+    gen = (
+        torch.Generator().manual_seed(data_seed_override)
+        if split == "train" and data_seed_override is not None else None
+    )
     loader = make_dataloader(dataset, split, seq_len, batch_size,
                              shuffle=(split == "train"), drop_last=(split == "train"),
                              max_tokens=cap, vocab_size=vocab_size, generator=gen)
@@ -1776,7 +1780,7 @@ def _cell_cfg_dict(
     d = copy.deepcopy(BASELINE_CONFIG)
     d.update(overrides)
     d["checkpoint_interval"] = 0                             # no per-cell step_N.pt blowup
-    d["seed"] = int(seed)
+    d["seed"] = _require_exact_seed(seed, "seed")
     if max_steps is not None:
         d["max_steps"] = int(max_steps)
     return d
@@ -1932,7 +1936,7 @@ def run_single(
     except (ValueError, NotImplementedError, TypeError) as exc:
         logger.warning("  [config rejected] %s: %s", label, exc)
         return {"label": label, "error_kind": "config", "error": str(exc),
-                "primary_val_ppl": float("inf"), "seed": int(seed),
+                "primary_val_ppl": float("inf"), "seed": seed,
                 "overrides": _jsonable(overrides)}
 
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
@@ -1943,6 +1947,12 @@ def run_single(
                               max_tokens=max_tokens, vocab_size=cfg.vocab_size)
     val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation",
                               vocab_size=cfg.vocab_size)
+    loaded_data_sources = _loader_ablation_source_identities(
+        train_loader,
+        val_loader,
+        dataset=dataset,
+        max_tokens=max_tokens,
+    )
 
     # Bits-per-CHARACTER correction for val BPC, mirroring train_vfe3. When normalization is
     # unavailable, BPC stays null and the separately named bits-per-token metric remains defined.
@@ -1963,7 +1973,8 @@ def run_single(
             # The train loader's DATA_SEED generator (get_loader) is re-pinned to DATA_SEED, not
             # cfg.seed: its state advanced across cells (memoised loader), and train_vfe3 hands
             # each run a FRESH generator at DATA_SEED -- reseeding here reproduces that exactly.
-            loader.generator.manual_seed(int(DATA_SEED) if (is_train and DATA_SEED is not None) else cfg.seed)
+            loader.generator.manual_seed(
+                _effective_data_seed(cfg.seed) if is_train else cfg.seed)
 
     print(f"    K={cfg.embed_dim} heads={len(model.group.irrep_dims)} group={cfg.gauge_group} "
           f"family={cfg.family} | steps={cfg.max_steps} batch={cfg.batch_size} | {n_params:,} params")
@@ -1987,7 +1998,7 @@ def run_single(
             tokens_per_char=val_tpc,
             train_loader=train_loader,
             losses=callback_losses,
-            data_seed=(int(DATA_SEED) if DATA_SEED is not None else int(cfg.seed)),
+            data_seed=_effective_data_seed(cfg.seed),
             max_tokens=max_tokens,
             tokenizer_tag=_tokenizer_tag(dataset),
             device=device,
@@ -2012,12 +2023,13 @@ def run_single(
     )
 
     result: Dict[str, Any] = {
-        "label":      label,
-        "error_kind": None,
-        "n_params":   n_params,
-        "seed":       int(cfg.seed),
-        "overrides":  _jsonable(overrides),
-        "max_tokens": (int(max_tokens) if max_tokens is not None else None),
+        "label":                label,
+        "error_kind":           None,
+        "n_params":             n_params,
+        "seed":                 int(cfg.seed),
+        "overrides":            _jsonable(overrides),
+        "max_tokens":           (int(max_tokens) if max_tokens is not None else None),
+        "_loaded_data_sources": loaded_data_sources,
     }
     result.update(terminal_result)                           # primary/final/best/terminal_checkpoint headline
 
@@ -2102,15 +2114,141 @@ _DIAGNOSTIC_RESULT_KEYS = {
 _CELL_CONTRACT_SCHEMA_VERSION = 1
 
 
+def _require_exact_seed(value: object, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field} must be an exact non-negative integer, got {value!r}")
+    return value
+
+
+def _validated_sweep_seeds(sweep: Mapping[str, object], fallback_seed: object) -> List[int]:
+    """Resolve one sweep's seed axis without bool/fraction/string coercion or duplicate cells."""
+    fallback = _require_exact_seed(fallback_seed, "seed")
+    if "seeds" not in sweep:
+        return [fallback]
+    raw = sweep["seeds"]
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError("sweep['seeds'] must be a non-empty list or tuple of unique integers")
+    seeds = [_require_exact_seed(seed, "sweep['seeds'] entry") for seed in raw]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"sweep['seeds'] must be unique, got {seeds!r}")
+    return seeds
+
+
+def _validated_data_seed_override() -> Optional[int]:
+    """Validate the optional global train-loader seed without coercion."""
+    if DATA_SEED is None:
+        return None
+    return _require_exact_seed(DATA_SEED, "DATA_SEED")
+
+
+def _effective_data_seed(fallback_seed: object) -> int:
+    """Return the validated override or one exact per-cell fallback seed."""
+    override = _validated_data_seed_override()
+    return override if override is not None else _require_exact_seed(fallback_seed, "seed")
+
+
+_ABLATION_SOURCE_SPLITS = ("train", "validation")
+
+
+def _validated_ablation_source_identities(
+    value: object,
+) -> Dict[str, Dict[str, object]]:
+    """Return a detached, JSON-safe identity for exactly the splits an ablation cell consumes."""
+    if not isinstance(value, Mapping) or set(value) != set(_ABLATION_SOURCE_SPLITS):
+        raise ValueError(
+            "ablation data source identities must contain exactly train and validation")
+    normalized: Dict[str, Dict[str, object]] = {}
+    for split in _ABLATION_SOURCE_SPLITS:
+        source = value[split]
+        if not isinstance(source, Mapping):
+            raise TypeError(f"{split} source identity must be a mapping")
+        detached = json.loads(json.dumps(
+            dict(source), sort_keys=True, ensure_ascii=False, allow_nan=False))
+        if (not isinstance(detached, dict)
+                or not isinstance(detached.get("format"), str)
+                or not detached["format"]
+                or type(detached.get("size_bytes")) is not int
+                or detached["size_bytes"] < 0
+                or not isinstance(detached.get("sha256"), str)
+                or not detached["sha256"]):
+            raise ValueError(f"{split} source identity is incomplete")
+        normalized[split] = detached
+    return normalized
+
+
+def _ablation_source_identities(
+    dataset:   str,
+    cache_dir: Optional[Path] = None,
+) -> Dict[str, Dict[str, object]]:
+    """Hash each corpus split once for a shared pre-sweep filesystem snapshot."""
+    return _validated_ablation_source_identities({
+        split: cache_source_identity(dataset, split, cache_dir=cache_dir)
+        for split in _ABLATION_SOURCE_SPLITS
+    })
+
+
+def _loader_ablation_source_identities(
+    train_loader: object,
+    val_loader:   object,
+
+    *,
+    dataset:    str,
+    max_tokens: Optional[int],
+) -> Optional[Dict[str, Dict[str, object]]]:
+    r"""Snapshot the identities attached to the immutable datasets actually used by one cell.
+
+    ``make_dataloader`` binds every loaded tensor to the source identity that remained stable across
+    its load. A custom loader without that contract remains usable by ``run_single`` directly, but
+    the sweep receives ``None`` and therefore refuses to publish a reusable success contract.
+    """
+    sources: Dict[str, object] = {}
+    try:
+        for split, loader, expected_cap in (
+            ("train", train_loader, max_tokens),
+            ("validation", val_loader, None),
+        ):
+            data_identity = getattr(getattr(loader, "dataset", None), "data_identity", None)
+            if (not isinstance(data_identity, Mapping)
+                    or data_identity.get("schema_version") != 2
+                    or data_identity.get("dataset") != dataset
+                    or data_identity.get("split") != split
+                    or data_identity.get("max_tokens") != expected_cap):
+                raise ValueError(f"{split} loader data identity is unavailable or mismatched")
+            sources[split] = data_identity.get("source")
+        return _validated_ablation_source_identities(sources)
+    except (TypeError, ValueError):
+        logger.warning("  [loaded corpus identity unavailable -> reuse contract forbidden]")
+        return None
+
+
+def _validated_ablation_code_identity(value: object) -> Dict[str, object]:
+    """Return one detached, usable Git identity for an ablation invocation."""
+    if not isinstance(value, Mapping):
+        raise TypeError("ablation code identity must be a mapping")
+    detached = json.loads(json.dumps(
+        dict(value), sort_keys=True, ensure_ascii=False, allow_nan=False))
+    git_sha = detached.get("git_sha")
+    git_dirty = detached.get("git_dirty")
+    fingerprint = detached.get("git_dirty_fingerprint")
+    if not isinstance(git_sha, str) or not git_sha or type(git_dirty) is not bool:
+        raise ValueError("ablation code identity is unavailable")
+    if ((git_dirty and (not isinstance(fingerprint, str) or not fingerprint))
+            or (not git_dirty and fingerprint is not None)):
+        raise ValueError("ablation code identity has an inconsistent dirty-tree fingerprint")
+    return detached
+
+
 def _cell_contract(
     cfg:              VFE3Config,
     dataset:          str,
     diagnostic_flags: Mapping[str, bool],
 
     *,
-    data_seed:  int,
-    max_tokens: Optional[int]  = None,
-    cache_dir:  Optional[Path] = None,
+    data_seed:         int,
+    max_tokens:        Optional[int]                  = None,
+    cache_dir:         Optional[Path]                 = None,
+    source_identities: Optional[Mapping[str, object]] = None,
+    code_identity:     Optional[Mapping[str, object]] = None,
 ) -> Dict[str, object]:
     r"""Build the versioned contract that authorizes reuse of one ablation cell.
 
@@ -2123,16 +2261,27 @@ def _cell_contract(
     diagnostic/extrapolation collections. ``cache_source_identity`` raises when a split's cache is
     absent, which the caller converts into "forbid reuse" rather than a stale hit.
     """
+    data_seed = _require_exact_seed(data_seed, "data_seed")
+    sources = (
+        _ablation_source_identities(dataset, cache_dir=cache_dir)
+        if source_identities is None
+        else _validated_ablation_source_identities(source_identities)
+    )
+    code = (
+        _validated_ablation_code_identity(_git_code_identity())
+        if code_identity is None
+        else _validated_ablation_code_identity(code_identity)
+    )
     return {
         "schema_version":              _CELL_CONTRACT_SCHEMA_VERSION,
         "semantic_config_fingerprint": semantic_config_fingerprint(asdict(cfg)),
         "dataset":                     dataset,
-        "data_seed":                   int(data_seed),
+        "data_seed":                   data_seed,
         "max_tokens":                  int(max_tokens) if max_tokens is not None else None,
         "tokenizer_tag":               _tokenizer_tag(dataset),
-        "train_source":                cache_source_identity(dataset, "train", cache_dir=cache_dir),
-        "validation_source":           cache_source_identity(dataset, "validation", cache_dir=cache_dir),
-        "code_identity":               _git_code_identity(),
+        "train_source":                sources["train"],
+        "validation_source":           sources["validation"],
+        "code_identity":               code,
         "diagnostic_flags":            dict(sorted(diagnostic_flags.items())),
     }
 
@@ -2142,9 +2291,11 @@ def _expected_cell_contract_or_none(
     dataset: str,
     diagnostic_flags: Mapping[str, bool],
     *,
-    seed: int,
-    max_steps: Optional[int] = None,
-    max_tokens: Optional[int] = None,
+    seed:              int,
+    max_steps:         Optional[int]                  = None,
+    max_tokens:        Optional[int]                  = None,
+    source_identities: Optional[Mapping[str, object]] = None,
+    code_identity:     Optional[Mapping[str, object]] = None,
 ) -> Optional[Dict[str, object]]:
     r"""Build the reuse contract inside the per-cell failure boundary, else forbid reuse.
 
@@ -2157,9 +2308,19 @@ def _expected_cell_contract_or_none(
     """
     try:
         cfg = VFE3Config(**_cell_cfg_dict(dict(overrides), seed=seed, max_steps=max_steps))
-        data_seed = int(DATA_SEED) if DATA_SEED is not None else int(seed)
-        return _cell_contract(cfg, dataset, diagnostic_flags,
-                              data_seed=data_seed, max_tokens=max_tokens)
+        data_seed = _require_exact_seed(
+            DATA_SEED if DATA_SEED is not None else seed,
+            "DATA_SEED" if DATA_SEED is not None else "seed",
+        )
+        return _cell_contract(
+            cfg,
+            dataset,
+            diagnostic_flags,
+            data_seed=data_seed,
+            max_tokens=max_tokens,
+            source_identities=source_identities,
+            code_identity=code_identity,
+        )
     except Exception as exc:                                  # unbuildable config / unhashable corpus
         logger.warning("  [contract unavailable -> reuse forbidden] %s", exc)
         return None
@@ -2187,6 +2348,9 @@ def _cell_is_current(
         return False
     if marker.get("status") != "success" or marker.get("error_kind") is not None:
         return False
+    expected_fingerprint = semantic_config_fingerprint(dict(expected_contract))
+    if marker.get("cell_contract_fingerprint") != expected_fingerprint:
+        return False
     try:
         terminal_ppl = float(marker["final_val_ppl"])
     except (KeyError, TypeError, ValueError):
@@ -2204,7 +2368,8 @@ def _cell_is_current(
         return False
     if loaded.get("schema_version") != _CELL_CONTRACT_SCHEMA_VERSION:
         return False
-    return dict(loaded) == dict(expected_contract)
+    return (dict(loaded) == dict(expected_contract)
+            and semantic_config_fingerprint(dict(loaded)) == expected_fingerprint)
 
 
 def _paired_token_artifact_is_current(run_dir: Path, *, required: bool) -> bool:
@@ -2309,6 +2474,37 @@ def _collect_sweep_results(sweep_dir: Path) -> List[Dict[str, Any]]:
     return results
 
 
+def _invalidate_code_drifted_cells(
+    sweep_dir: Path,
+    cells:     List[Tuple[str, Dict[str, Any], int]],
+    error:     str,
+) -> None:
+    """Atomically downgrade every successful current-invocation marker after terminal code drift."""
+    for label, _overrides, _seed in cells:
+        run_dir = sweep_dir / _sanitize(label)
+        marker_path = run_dir / "ablation_result.json"
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(marker, Mapping) or marker.get("status") != "success":
+            continue
+        failed = dict(marker)
+        failed.update({
+            "status":                    "failed",
+            "error_kind":                "code_identity_drift",
+            "error":                     error,
+            "cell_contract_fingerprint": None,
+        })
+        _write_json_atomic(marker_path, failed)
+        try:
+            (run_dir / "cell_contract.json").unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("  [%s] failed to remove drifted cell contract: %s", label, exc)
+
+
 def run_sweep(
     sweep_name:  str,
     output_dir:  Path,
@@ -2323,6 +2519,14 @@ def run_sweep(
 ) -> List[Dict[str, Any]]:
     r"""Run every cell of one sweep; per-cell failures are isolated so the sweep completes."""
     sweep = SWEEPS[sweep_name]
+    cell_seeds = _validated_sweep_seeds(sweep, seed)
+    _validated_data_seed_override()
+    try:
+        invocation_code_identity = _validated_ablation_code_identity(_git_code_identity())
+    except Exception as exc:
+        logger.error("  [pre-sweep code identity unavailable -> sweep aborted] %s", exc)
+        return []
+    contract_code_identity: Mapping[str, object] = invocation_code_identity
     sweep_dir = output_dir / sweep_name
     sweep_dir.mkdir(parents=True, exist_ok=True)
     runs = make_run_overrides(sweep_name)
@@ -2334,8 +2538,7 @@ def run_sweep(
     # (the seed also lives in the existing ``seed`` column), so the across-seed aggregate is a plain
     # group-by on the base label. A sweep WITHOUT ``seeds`` keeps the single-seed label/run-dir exactly,
     # so every existing sweep is byte-identical.
-    cell_seeds = [int(s) for s in sweep.get("seeds", [])] or [int(seed)]
-    multiseed = bool(sweep.get("seeds"))
+    multiseed = "seeds" in sweep
     cells = [((f"{label}__s{s}" if multiseed else label), overrides, s)
              for (label, overrides) in runs for s in cell_seeds]
 
@@ -2349,7 +2552,16 @@ def run_sweep(
         "collect_extrapolation":  collect_extrapolation,
         "paired_token_bootstrap": paired_token_bootstrap,
     }
-
+    try:
+        sweep_source_identities: Optional[Dict[str, Dict[str, object]]] = (
+            _ablation_source_identities(dataset))
+    except Exception as exc:                                  # missing/corrupt/unreadable source
+        logger.warning("  [pre-sweep corpus identity unavailable -> reuse forbidden] %s", exc)
+        sweep_source_identities = None
+    # An explicit empty mapping tells the contract builder that the invocation-owned snapshot failed.
+    # It must not fall back to per-cell filesystem hashing; every cell then fails closed at publication.
+    contract_source_identities: Mapping[str, object] = (
+        sweep_source_identities if sweep_source_identities is not None else {})
     results: List[Dict[str, Any]] = []
     for i, (label, overrides, cell_seed) in enumerate(cells):
         run_dir = sweep_dir / _sanitize(label)
@@ -2359,13 +2571,15 @@ def run_sweep(
 
         # Reuse is authorized only by a versioned contract that binds this cell to its code identity,
         # per-split corpus hashes, and semantic config (audit 2026-07-12 PB-01). The expected contract
-        # is built inside the per-cell failure boundary: an unbuildable config or unhashable corpus
-        # returns None, which forbids reuse (the cell re-runs) without breaching the sweep.
-        expected_contract: Optional[Dict[str, Any]] = None
+        # is built inside the per-cell failure boundary for every recomputation, not only resume.
+        # An unbuildable config or unhashable corpus returns None, which forbids both reuse and later
+        # success publication because the generation active at training start is unknown.
+        expected_contract = _expected_cell_contract_or_none(
+            overrides, dataset, diagnostic_flags, seed=cell_seed,
+            max_steps=max_steps, max_tokens=max_tokens,
+            source_identities=contract_source_identities,
+            code_identity=contract_code_identity)
         if resume and marker.exists():
-            expected_contract = _expected_cell_contract_or_none(
-                overrides, dataset, diagnostic_flags, seed=cell_seed,
-                max_steps=max_steps, max_tokens=max_tokens)
             # The contract binds the request (diagnostic_flags carries paired_token_bootstrap); a
             # separate post-contract validator binds the requested artifact's exact bytes/schema, so a
             # missing or drifted val_token_nats.pt forbids reuse even when the contract still matches.
@@ -2378,6 +2592,14 @@ def run_sweep(
             print(f"\n--- {i + 1}/{len(cells)}: {label}  [contract changed -> re-running] ---")
         else:
             print(f"\n--- {i + 1}/{len(cells)}: {label} ---")
+        # Invalidate any older completion marker BEFORE starting a recomputation. If the process
+        # crashes after publishing new contract metadata but before the new result, the next launch
+        # sees this non-success marker rather than pairing a prior result with a new generation.
+        _write_json_atomic(marker, {
+            "status": "running",
+            "label":  label,
+            "seed":   cell_seed,
+        })
         t0 = time.perf_counter()
         try:
             result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
@@ -2393,6 +2615,11 @@ def run_sweep(
         finally:
             _cleanup()
 
+        loaded_sources_raw = result.pop("_loaded_data_sources", None)
+        try:
+            loaded_source_identities = _validated_ablation_source_identities(loaded_sources_raw)
+        except (TypeError, ValueError):
+            loaded_source_identities = None
         result.setdefault("error_kind", None)
         result["collect_diagnostics"]   = collect_diagnostics
         result["collect_extrapolation"] = collect_extrapolation
@@ -2437,18 +2664,35 @@ def run_sweep(
                 logger.warning("  [%s] terminal checkpoint missing -> cell marked failed", label)
                 successful = False
 
-        # A successful cell is cached only when its contract can be rebuilt now: rebuild it (the
-        # pre-run build was skipped or lost a transient source race), and if it still cannot be built
-        # convert the cell to a failed result rather than publish an un-authorizable cache hit.
+        # A successful recomputation is cached only when its contract can be rebuilt now. Never
+        # publish the pre-run resume contract: code or corpus identity can drift while training. If
+        # a pre-run contract was available, require exact agreement with the post-run rebuild;
+        # otherwise convert the cell to a failed result rather than mix two generations.
         contract = None
         if successful:
-            contract = expected_contract if expected_contract is not None else \
-                _expected_cell_contract_or_none(
-                    overrides, dataset, diagnostic_flags, seed=cell_seed,
-                    max_steps=max_steps, max_tokens=max_tokens)
-            if contract is None:
+            if loaded_source_identities is None:
+                logger.warning(
+                    "  [%s] loaded corpus identity unavailable -> cell marked failed", label)
                 successful = False
+            else:
+                post_run_contract = _expected_cell_contract_or_none(
+                    overrides, dataset, diagnostic_flags, seed=cell_seed,
+                    max_steps=max_steps, max_tokens=max_tokens,
+                    source_identities=loaded_source_identities,
+                    code_identity=contract_code_identity)
+                if expected_contract is None or post_run_contract is None:
+                    successful = False
+                elif dict(post_run_contract) != dict(expected_contract):
+                    logger.warning(
+                        "  [%s] contract drifted during recomputation -> cell marked failed", label)
+                    successful = False
+                else:
+                    contract = post_run_contract
         result["status"] = "success" if successful else "failed"
+        result["cell_contract_fingerprint"] = (
+            semantic_config_fingerprint(contract)
+            if successful and contract is not None else None
+        )
         result["sweep"] = sweep_name
         result["wall_time_s"] = time.perf_counter() - t0
 
@@ -2472,6 +2716,22 @@ def run_sweep(
         # frame is live even mid-sweep.
         _write_sweep_csv(sweep_dir, _collect_sweep_results(sweep_dir))
 
+    try:
+        terminal_code_identity = _validated_ablation_code_identity(_git_code_identity())
+        terminal_code_identity_error = None
+    except Exception as exc:
+        terminal_code_identity = None
+        terminal_code_identity_error = f"terminal code identity snapshot failed: {exc}"
+    if terminal_code_identity_error is not None:
+        code_identity_error = terminal_code_identity_error
+    else:
+        code_identity_error = (
+            None if terminal_code_identity == invocation_code_identity
+            else "code identity drifted during the ablation invocation"
+        )
+    if code_identity_error is not None:
+        _invalidate_code_drifted_cells(sweep_dir, cells, code_identity_error)
+
     (sweep_dir / "sweep_meta.json").write_text(json.dumps({
         "sweep_name":  sweep_name,
         "description": sweep["description"],
@@ -2479,6 +2739,8 @@ def run_sweep(
         "dataset":     dataset,
         "seed":        (cell_seeds if multiseed else seed),
         "timestamp":   time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status":      ("incomplete" if code_identity_error is not None else "complete"),
+        "error":       code_identity_error,
         # PB-07 report metadata (null for ordinary sweeps): lets the ablation-forest / joint-LR-grid
         # adapters operate after a process restart, when only the persisted sweep view survives.
         "paired_token_bootstrap": paired_token_bootstrap,
@@ -2496,6 +2758,9 @@ def run_sweep(
     union = _collect_sweep_results(sweep_dir)
     _write_sweep_csv(sweep_dir, union)
 
+    if code_identity_error is not None:
+        print(f"\nSWEEP INCOMPLETE: {sweep_name}  ->  {code_identity_error}")
+        return []
     finished = [r for r in union if _as_float(r.get("primary_val_ppl")) < float("inf")]
     if finished:
         best = min(finished, key=lambda r: _as_float(r.get("primary_val_ppl")))
@@ -2614,6 +2879,15 @@ def analyze_sweep(sweep_dir: Path) -> None:
             print(f"{a['label']:<34}{a['n']:>4}{a['mean']:>12.3f}{a['sd']:>10.3f}{a['cv'] * 100:>8.1f}")
 
 
+def _sweep_is_complete(sweep_dir: Path) -> bool:
+    """Return true only when one persisted sweep explicitly completed its invocation."""
+    try:
+        meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(meta, Mapping) and meta.get("status") == "complete"
+
+
 def summarize_sweeps(output_dir: Path) -> None:
     r"""Cross-sweep comparison table: the best (lowest val PPL) cell of every persisted sweep.
 
@@ -2623,7 +2897,8 @@ def summarize_sweeps(output_dir: Path) -> None:
     """
     print(f"\n{'=' * 70}\nBEST PER SWEEP  ({output_dir})\n{'=' * 70}")
     sweep_dirs = [d for d in sorted(output_dir.iterdir())
-                  if d.is_dir() and (d / "sweep_results.csv").exists()]
+                  if (d.is_dir() and (d / "sweep_results.csv").exists()
+                      and _sweep_is_complete(d))]
     if not sweep_dirs:
         print("No completed sweeps found.")
         return
@@ -3108,7 +3383,8 @@ def _plot_sensitivity(output_dir: Path, fig_dir: Path) -> None:
     run's), matching the per-sweep figures' accumulated view.
     """
     sweep_dirs = [d for d in sorted(output_dir.iterdir())
-                  if d.is_dir() and (d / "sweep_results.csv").exists()]
+                  if (d.is_dir() and (d / "sweep_results.csv").exists()
+                      and _sweep_is_complete(d))]
     sensitivity: List[Tuple[str, float, str]] = []           # (sweep, ppl range, best label)
     for d in sweep_dirs:
         rows = [r for r in _read_sweep_csv(d) if _as_float(r.get("primary_val_ppl")) < float("inf")]
@@ -3191,7 +3467,15 @@ def main() -> None:
         # adapter returns None (missing baseline arm / incomplete grid) is skipped, never fabricated;
         # an ordinary sweep declares neither key, so `specs` is empty and this is a no-op.
         sweep = SWEEPS[name]
-        meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
+        try:
+            meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.error("sweep %s has no readable completion metadata: %s", name, exc)
+            return
+        if not isinstance(meta, Mapping) or meta.get("status") != "complete":
+            logger.error(
+                "sweep %s is incomplete; skipping all per-sweep and cross-sweep analysis", name)
+            return
         report_context = {
             "sweep_dir":     sweep_dir,
             "rows":          union,

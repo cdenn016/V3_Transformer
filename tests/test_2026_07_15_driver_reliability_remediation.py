@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import subprocess
 import sys
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from enum import IntEnum
 from pathlib import Path
 from unittest import mock
 
@@ -133,53 +136,206 @@ def test_ring_seed_bundle_persists_effective_runtime_state(tmp_path):
         status="trained",
     )
     bundle = torch.load(path, weights_only=True)
-    assert bundle["runtime_state"] == deterministic_state()
+    assert bundle["runtime_state"] == efe_ring_experiment._runtime_identity(torch.device("cpu"))
 
 
-def _write_scaling_run(root: Path, label: str, seed: int, n_params: int, test_ce: float) -> None:
-    run_dir = root / "route" / label / f"s{seed}"
+def _write_scaling_run(
+    root: Path,
+    label: str,
+    seed: int,
+    n_params: int,
+    test_ce: float,
+    *,
+    route: str = "route",
+) -> None:
+    run_dir = root / route / label / f"s{seed}"
     run_dir.mkdir(parents=True)
-    (run_dir / "summary.json").write_text(json.dumps({
+    config = {"seed": seed, "embed_dim": n_params}
+    code_identity = {
+        "git_sha": "same",
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
+    sources = {
+        split: {
+            "format": "pt",
+            "size_bytes": len(split),
+            "sha256": split[0] * 64,
+        }
+        for split in ("train", "validation", "test")
+    }
+    cell = {
+        "schema_version": 2,
+        "route": route,
+        "label": label,
+        "scale_knob": "embed_dim",
+        "seed": seed,
+        "dataset": "synthetic",
+        "config_sha256": hashlib.sha256(json.dumps(
+            config, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
+        "code_identity": code_identity,
+        "data_sources": sources,
+    }
+    digest = hashlib.sha256(json.dumps(
+        cell, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    cell["reuse_contract_sha256"] = digest
+    metrics = {
         "n_params": n_params,
+        "test_ce": test_ce,
+        "test_ppl": math.exp(test_ce),
+        "test_bits_per_token": test_ce / math.log(2.0),
+        "test_bpc": None,
+    }
+    (run_dir / "summary.json").write_text(json.dumps({
+        **metrics,
         "best_val_ppl": 10.0,
+        "scaling_reuse_contract_sha256": digest,
         "scaling_point": {
-            "test_ce": test_ce,
-            "test_ppl": float(np.exp(test_ce)),
-            "n_params": n_params,
+            **metrics,
             "n_gen": 4,
             "embed_dim": n_params,
             "tokens_seen": 100,
         },
     }), encoding="utf-8")
-    (run_dir / "test_results.json").write_text(json.dumps({"test_ce": test_ce}), encoding="utf-8")
+    (run_dir / "test_results.json").write_text(json.dumps(metrics), encoding="utf-8")
     (run_dir / "config.json").write_text(json.dumps({
-        "config": {"seed": seed, "embed_dim": n_params},
+        "dataset": "synthetic",
+        "config": config,
     }), encoding="utf-8")
     (run_dir / "provenance.json").write_text(json.dumps({
         "seed": seed,
-        "git_sha": "same",
+        **code_identity,
         "train_data_sha256": "train",
         "val_data_sha256": "val",
         "test_data_sha256": "test",
     }), encoding="utf-8")
-    (run_dir / "scaling_cell.json").write_text(json.dumps({
-        "route": "route",
-        "label": label,
-        "scale_knob": "embed_dim",
-    }), encoding="utf-8")
+    (run_dir / "scaling_cell.json").write_text(json.dumps(cell), encoding="utf-8")
 
 
-def _complete_scaling_design() -> dict[str, object]:
+def _complete_scaling_design(*, route: str = "route") -> dict[str, object]:
     return {
         "schema_version": 1,
-        "routes": ["route"],
+        "routes": [route],
         "seeds": [1],
         "status": "complete",
         "cells": [
-            {"route": "route", "label": "small", "seed": 1, "status": "complete"},
-            {"route": "route", "label": "large", "seed": 1, "status": "complete"},
+            {
+                "route": route,
+                "label": "small",
+                "seed": 1,
+                "scale_knob": "embed_dim",
+                "run_dir": f"{route}/small/s1",
+                "status": "complete",
+            },
+            {
+                "route": route,
+                "label": "large",
+                "seed": 1,
+                "scale_knob": "embed_dim",
+                "run_dir": f"{route}/large/s1",
+                "status": "complete",
+            },
         ],
     }
+
+
+@pytest.mark.parametrize("routes", ([], ["grow_K", "grow_K"]))
+def test_scaling_requires_nonempty_unique_routes(routes: list[str]) -> None:
+    with pytest.raises(ValueError, match="routes.*non-empty|routes.*unique"):
+        scaling._validated_scaling_routes(routes)
+
+
+@pytest.mark.parametrize("labels", ([""], ["same", "same"]))
+def test_scaling_requires_nonempty_unique_cell_labels(
+    labels:      list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        scaling,
+        "ROUTES",
+        {"probe": [{"label": label} for label in labels]},
+    )
+
+    with pytest.raises(ValueError, match="cell labels.*nonempty|cell labels.*unique"):
+        scaling._validated_scaling_routes(["probe"])
+
+
+@pytest.mark.parametrize("component_kind", ("route", "label"))
+@pytest.mark.parametrize(
+    "bad_component",
+    (
+        ".",
+        "..",
+        "../escape",
+        r"..\escape",
+        "nested/child",
+        r"nested\child",
+        "/absolute",
+        r"\absolute",
+        r"C:\absolute",
+        "C:drive-relative",
+        r"\\server\share",
+        "trailing.",
+        "trailing ",
+        "   ",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+    ),
+)
+def test_scaling_rejects_unsafe_path_components_before_output_creation(
+    tmp_path,
+    monkeypatch,
+    component_kind,
+    bad_component,
+):
+    route_name = bad_component if component_kind == "route" else "safe_route"
+    label = bad_component if component_kind == "label" else "safe_label"
+    monkeypatch.setattr(scaling, "ROUTES", {route_name: [{"label": label}]})
+    monkeypatch.setitem(scaling.CONFIG, "routes", [route_name])
+    output_dir = tmp_path / "must-not-exist"
+    monkeypatch.setitem(scaling.CONFIG, "output_dir", str(output_dir))
+
+    with pytest.raises(ValueError, match="safe single path component"):
+        scaling.main()
+
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("component_kind", ("route", "label"))
+def test_scaling_rejects_casefold_path_aliases_before_output_creation(
+    tmp_path,
+    monkeypatch,
+    component_kind,
+):
+    if component_kind == "route":
+        routes = ["Probe", "probe"]
+        registry = {
+            "Probe": [{"label": "first"}],
+            "probe": [{"label": "second"}],
+        }
+    else:
+        routes = ["safe_route"]
+        registry = {
+            "safe_route": [{"label": "Cell"}, {"label": "cell"}],
+        }
+    monkeypatch.setattr(scaling, "ROUTES", registry)
+    monkeypatch.setitem(scaling.CONFIG, "routes", routes)
+    output_dir = tmp_path / "must-not-exist"
+    monkeypatch.setitem(scaling.CONFIG, "output_dir", str(output_dir))
+
+    with pytest.raises(ValueError, match="filesystem aliases"):
+        scaling.main()
+
+    assert not output_dir.exists()
+
+
+def test_scaling_declared_route_and_label_components_remain_valid() -> None:
+    route_names = list(scaling.ROUTES)
+
+    assert scaling._validated_scaling_routes(route_names) == route_names
 
 
 def test_scaling_analysis_refuses_survivor_only_fit_for_incomplete_design(tmp_path, monkeypatch):
@@ -191,9 +347,12 @@ def test_scaling_analysis_refuses_survivor_only_fit_for_incomplete_design(tmp_pa
         "seeds": [1],
         "status": "incomplete",
         "cells": [
-            {"route": "route", "label": "small", "seed": 1, "status": "complete"},
-            {"route": "route", "label": "large", "seed": 1, "status": "complete"},
-            {"route": "route", "label": "failed", "seed": 1, "status": "failed",
+            {"route": "route", "label": "small", "seed": 1, "scale_knob": "embed_dim",
+             "run_dir": "route/small/s1", "status": "complete"},
+            {"route": "route", "label": "large", "seed": 1, "scale_knob": "embed_dim",
+             "run_dir": "route/large/s1", "status": "complete"},
+            {"route": "route", "label": "failed", "seed": 1, "scale_knob": "embed_dim",
+             "run_dir": "route/failed/s1", "status": "failed",
              "error_kind": "train", "error": "probe failure"},
         ],
     }), encoding="utf-8")
@@ -305,6 +464,224 @@ def test_scaling_design_accepts_only_explicit_success_terminal_statuses(tmp_path
     assert design["status"] == "complete"
 
 
+@pytest.mark.parametrize("bad_seed", [True, 1.5, "1", -1])
+def test_scaling_analysis_rejects_nonexact_or_negative_request_seed(
+    tmp_path, monkeypatch, bad_seed,
+):
+    (tmp_path / "scaling_design.json").write_text("{}", encoding="utf-8")
+    raw = _complete_scaling_design()
+    raw["seeds"] = [bad_seed]
+    raw["cells"] = [
+        {"route": "route", "label": "small", "seed": bad_seed, "status": "complete"},
+    ]
+    monkeypatch.setattr(scaling_analysis, "_read_json", lambda path: raw)
+
+    design = scaling_analysis._requested_design(tmp_path, [])
+
+    assert design["available"] is False
+    assert design["status"] == "unverifiable_design"
+
+
+def test_scaling_analysis_rejects_integer_enum_request_seed(tmp_path, monkeypatch):
+    class Seed(IntEnum):
+        ONE = 1
+
+    (tmp_path / "scaling_design.json").write_text("{}", encoding="utf-8")
+    raw = _complete_scaling_design()
+    raw["seeds"] = [Seed.ONE]
+    raw["cells"] = [
+        {"route": "route", "label": "small", "seed": Seed.ONE, "status": "complete"},
+    ]
+    monkeypatch.setattr(scaling_analysis, "_read_json", lambda path: raw)
+
+    assert scaling_analysis._requested_design(tmp_path, [])["available"] is False
+
+
+def test_scaling_analysis_rejects_integer_enum_request_cell_seed(tmp_path, monkeypatch):
+    class Seed(IntEnum):
+        ONE = 1
+
+    (tmp_path / "scaling_design.json").write_text("{}", encoding="utf-8")
+    raw = _complete_scaling_design()
+    raw["cells"] = [
+        {"route": "route", "label": "small", "seed": Seed.ONE, "status": "complete"},
+    ]
+    monkeypatch.setattr(scaling_analysis, "_read_json", lambda path: raw)
+
+    assert scaling_analysis._requested_design(tmp_path, [])["available"] is False
+
+
+class _StringLike:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class _StringSubclass(str):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("route",  _StringLike("route")),
+        ("route",  _StringSubclass("route")),
+        ("route",  ""),
+        ("label",  _StringLike("small")),
+        ("label",  _StringSubclass("small")),
+        ("label",  ""),
+        ("seed",   True),
+        ("seed",   1.5),
+        ("seed",   "1"),
+        ("seed",   -1),
+    ],
+)
+def test_scaling_analysis_does_not_coerce_observed_join_identity(
+    tmp_path, field, bad_value,
+):
+    (tmp_path / "scaling_design.json").write_text(
+        json.dumps(_complete_scaling_design()), encoding="utf-8",
+    )
+    row = {
+        "route": "route",
+        "label": "small",
+        "seed": 1,
+        "scale_knob": "embed_dim",
+        "run_dir": str((tmp_path / "route" / "small" / "s1").resolve()),
+        "artifact_verified": True,
+        "test_ce": 2.0,
+    }
+    row[field] = bad_value
+
+    design = scaling_analysis._requested_design(tmp_path, [row])
+
+    assert design["complete"] is False
+    assert design["cells"][0]["status"] == "missing"
+
+
+def test_scaling_analysis_rejects_integer_enum_observed_seed(tmp_path):
+    class Seed(IntEnum):
+        ONE = 1
+
+    (tmp_path / "scaling_design.json").write_text(
+        json.dumps(_complete_scaling_design()), encoding="utf-8",
+    )
+    row = {
+        "route": "route",
+        "label": "small",
+        "seed": Seed.ONE,
+        "scale_knob": "embed_dim",
+        "run_dir": str((tmp_path / "route" / "small" / "s1").resolve()),
+        "artifact_verified": True,
+        "test_ce": 2.0,
+    }
+
+    design = scaling_analysis._requested_design(tmp_path, [row])
+
+    assert design["complete"] is False
+    assert design["cells"][0]["status"] == "missing"
+
+
+def test_scaling_analysis_uses_root_manifest_for_explicit_route_subdirectory(
+    tmp_path, monkeypatch,
+):
+    route = "blocks_K48"
+    root = tmp_path / "vfe3_scaling_results"
+    route_dir = root / route
+    _write_scaling_run(root, "small", 1, 10, 2.0, route=route)
+    _write_scaling_run(root, "large", 1, 20, 1.5, route=route)
+    (root / "scaling_design.json").write_text(
+        json.dumps(_complete_scaling_design(route=route)),
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(route_dir))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setattr(scaling_analysis, "_make_figures", lambda *args, **kwargs: None)
+
+    scaling_analysis.analyze()
+
+    summary = json.loads((route_dir / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["design"]["available"] is True
+    assert summary["design"]["complete"] is True
+    assert summary["design"]["status"] == "complete"
+    assert summary["n_fitted_param_points"] == 2
+    assert summary["pooled_fit"] is not None
+    assert summary["pooled_fit_status"] == "clean"
+
+
+def test_scaling_analysis_parent_manifest_selects_only_requested_route_cells(
+    tmp_path, monkeypatch,
+):
+    selected_route = "blocks_K48"
+    other_route = "grow_K"
+    root = tmp_path / "vfe3_scaling_results"
+    for route in (selected_route, other_route):
+        _write_scaling_run(root, "small", 1, 10, 2.0, route=route)
+        _write_scaling_run(root, "large", 1, 20, 1.5, route=route)
+    (root / "scaling_design.json").write_text(json.dumps({
+        "schema_version": 1,
+        "routes": [selected_route, other_route],
+        "seeds": [1],
+        "status": "complete",
+        "cells": [
+            {
+                "route": route,
+                "label": label,
+                "seed": 1,
+                "scale_knob": "embed_dim",
+                "run_dir": f"{route}/{label}/s1",
+                "status": "complete",
+            }
+            for route in (selected_route, other_route)
+            for label in ("small", "large")
+        ],
+    }), encoding="utf-8")
+    selected_dir = root / selected_route
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(selected_dir))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setattr(scaling_analysis, "_make_figures", lambda *args, **kwargs: None)
+
+    scaling_analysis.analyze()
+
+    summary = json.loads((selected_dir / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["design"]["complete"] is True
+    assert {cell["route"] for cell in summary["design"]["cells"]} == {selected_route}
+    assert summary["n_fitted_param_points"] == 2
+    assert summary["pooled_fit"] is not None
+
+
+def test_scaling_analysis_checked_in_default_reads_scaling_default_output_root(
+    tmp_path, monkeypatch,
+):
+    output_root = Path(scaling.CONFIG["output_dir"])
+    analysis_input = Path(scaling_analysis.CONFIG["input_dir"])
+    assert analysis_input == output_root
+
+    route = scaling.CONFIG["routes"][0]
+    root = tmp_path / output_root
+    _write_scaling_run(root, "small", 1, 10, 2.0, route=route)
+    _write_scaling_run(root, "large", 1, 20, 1.5, route=route)
+    (root / "scaling_design.json").write_text(
+        json.dumps(_complete_scaling_design(route=route)),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setattr(scaling_analysis, "_make_figures", lambda *args, **kwargs: None)
+
+    scaling_analysis.analyze()
+
+    summary = json.loads((root / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["design"]["complete"] is True
+    assert summary["n_fitted_param_points"] == 2
+    assert summary["pooled_fit"] is not None
+
+
 def _write_seed_run(root: Path, seed: int, value: float) -> None:
     run_dir = root / f"run_s{seed}"
     run_dir.mkdir()
@@ -312,7 +689,21 @@ def _write_seed_run(root: Path, seed: int, value: float) -> None:
     (run_dir / "config.json").write_text(json.dumps({
         "config": {"seed": seed, "embed_dim": 20},
     }), encoding="utf-8")
-    (run_dir / "provenance.json").write_text(json.dumps({"seed": seed}), encoding="utf-8")
+    (run_dir / "provenance.json").write_text(json.dumps({
+        "seed": seed,
+        "git_sha": "a" * 40,
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+        "train_data_sha256": "b" * 64,
+        "train_data_n_tokens": 100,
+        "val_data_sha256": "c" * 64,
+        "val_data_n_tokens": 20,
+        "test_data_sha256": "d" * 64,
+        "test_data_n_tokens": 20,
+        "data_seed": 3,
+        "max_tokens": None,
+        "tokenizer_tag": "synthetic",
+    }), encoding="utf-8")
 
 
 def _write_multiseed_manifest(
@@ -566,6 +957,35 @@ def test_controlled_figure_survives_sidecar_failure_and_reports_both_artifacts(t
     figures.plt.close(figure)
 
 
+def test_controlled_figure_rejects_figure_sidecar_alias_before_publication(tmp_path):
+    destination = tmp_path / "controlled.json"
+    destination.write_bytes(b"SENTINEL")
+
+    with pytest.raises(ValueError, match="must not alias"):
+        figures.plot_belief_umap(
+            _controlled_bank(),
+            "mu",
+            controlled=True,
+            english_linguistic_diagnostics=False,
+            decode=lambda ids: f" token{int(ids[0])}",
+            umap_worker=_ProjectionWorker(),
+            path=str(destination),
+            sidecar_path=str(destination),
+        )
+
+    assert destination.read_bytes() == b"SENTINEL"
+
+
+def test_atomic_figure_save_preserves_suffixless_default_format(tmp_path):
+    figure, axis = figures.plt.subplots()
+    axis.plot([0, 1], [0, 1])
+    try:
+        figures._save(figure, str(tmp_path / "plot"))
+    finally:
+        figures.plt.close(figure)
+    assert (tmp_path / "plot.png").is_file()
+
+
 def test_cross_run_figure_survives_sidecar_failure_and_reports_both_artifacts(tmp_path, monkeypatch):
     left = tmp_path / "left.json"
     right = tmp_path / "right.json"
@@ -605,6 +1025,38 @@ def test_cross_run_figure_survives_sidecar_failure_and_reports_both_artifacts(tm
     assert result.outcomes["sidecar"]["published"] is False
 
 
+@pytest.mark.parametrize("alias_kind", ("outputs", "json_input", "figure_input"))
+def test_cross_run_comparison_rejects_destructive_path_aliases(tmp_path, monkeypatch, alias_kind):
+    left = tmp_path / "left.json"
+    right = tmp_path / "right.json"
+    left.write_text("{}", encoding="utf-8")
+    right.write_text("{}", encoding="utf-8")
+    output_json = tmp_path / "comparison.json"
+    output_figure = tmp_path / "comparison.png"
+    if alias_kind == "outputs":
+        output_figure = output_json
+    elif alias_kind == "json_input":
+        output_json = left
+    else:
+        output_figure = right
+    before = {left: left.read_bytes(), right: right.read_bytes()}
+    monkeypatch.setattr(
+        figures,
+        "plot_controlled_embedding_comparison",
+        lambda *args, **kwargs: pytest.fail("alias validation ran after rendering"),
+    )
+
+    with pytest.raises(ValueError, match="must not alias"):
+        report.compare_belief_umap_sidecars(
+            [left, right],
+            ["left", "right"],
+            json_path=output_json,
+            figure_path=output_figure,
+        )
+
+    assert {path: path.read_bytes() for path in before} == before
+
+
 @pytest.mark.parametrize("num_runs", [0, -1])
 def test_multiseed_request_count_must_be_positive(num_runs):
     with pytest.raises(ValueError, match="NUM_RUNS.*positive"):
@@ -614,6 +1066,66 @@ def test_multiseed_request_count_must_be_positive(num_runs):
 def test_multiseed_request_seeds_must_be_unique():
     with pytest.raises(ValueError, match="unique"):
         train_vfe3._resolve_seeds({"seed": 6}, seeds=(6, 6), num_runs=2)
+
+
+@pytest.mark.parametrize("bad_seed", [True, 1.5, "1", -1])
+def test_multiseed_request_rejects_coercible_or_negative_seeds(bad_seed):
+    with pytest.raises(ValueError, match="exact non-negative"):
+        train_vfe3._resolve_seeds({"seed": 6}, seeds=(bad_seed,), num_runs=1)
+
+
+@pytest.mark.parametrize("bad_seed", [True, 1.5, "1", -1])
+def test_single_run_config_rejects_coercible_or_negative_seed(bad_seed):
+    with pytest.raises(ValueError, match="config seed.*exact non-negative"):
+        train_vfe3._resolve_seeds({"seed": bad_seed}, seeds=(), num_runs=1)
+
+
+@pytest.mark.parametrize("bad_seed", [True, 1.5, "7", -1])
+def test_train_loader_rejects_invalid_data_seed_before_cache_access(monkeypatch, bad_seed):
+    monkeypatch.setattr(train_vfe3, "DATA_SEED", bad_seed)
+    monkeypatch.setattr(
+        train_vfe3,
+        "make_dataloader",
+        lambda *args, **kwargs: pytest.fail("invalid DATA_SEED reached cache loading"),
+    )
+
+    with pytest.raises(ValueError, match="DATA_SEED.*exact non-negative"):
+        train_vfe3._select_loader("wikitext-103", _tiny_config(), split="train")
+
+
+@pytest.mark.parametrize("bad_seed", [True, 1.5, "7", -1])
+def test_ablation_rejects_invalid_data_seed_before_output_or_cache(
+    tmp_path,
+    monkeypatch,
+    bad_seed,
+):
+    sweep_name = "invalid_data_seed"
+    monkeypatch.setattr(ablation, "DATA_SEED", bad_seed)
+    monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "seed validation"})
+
+    with pytest.raises(ValueError, match="DATA_SEED.*exact non-negative"):
+        ablation.run_sweep(
+            sweep_name,
+            tmp_path,
+            dataset="wikitext-103",
+            device=torch.device("cpu"),
+            seed=6,
+            resume=False,
+        )
+
+    assert not (tmp_path / sweep_name).exists()
+
+
+@pytest.mark.parametrize("bad_seed", [True, 1.5, "7", -1])
+def test_scaling_loader_rejects_invalid_data_seed_before_cache_access(monkeypatch, bad_seed):
+    monkeypatch.setattr(
+        scaling,
+        "make_dataloader",
+        lambda *args, **kwargs: pytest.fail("invalid data_seed reached cache loading"),
+    )
+
+    with pytest.raises(ValueError, match="data_seed.*exact nonnegative"):
+        scaling.get_loader("wikitext-103", 4, 1, "train", data_seed=bad_seed)
 
 
 def test_stochastic_generation_is_controlled_by_explicit_generation_seed(monkeypatch):
@@ -637,8 +1149,10 @@ def test_stochastic_generation_is_controlled_by_explicit_generation_seed(monkeyp
 
 def test_generation_main_atomically_persists_generation_seed_and_outputs(tmp_path, monkeypatch):
     output = tmp_path / "efe_generation.json"
+    checkpoint = tmp_path / "fake.pt"
+    checkpoint.write_bytes(b"checkpoint-bytes")
     cfg = dict(generate_efe.CONFIG)
-    cfg.update(checkpoint="fake.pt", dataset="synthetic", generation_seed=23,
+    cfg.update(checkpoint=str(checkpoint), dataset="synthetic", generation_seed=23,
                output_path=str(output), device="cpu")
 
     class _Tokenizer:
@@ -650,7 +1164,15 @@ def test_generation_main_atomically_persists_generation_seed_and_outputs(tmp_pat
             return " ".join(str(value) for value in values)
 
     monkeypatch.setattr(generate_efe, "CONFIG", cfg)
-    monkeypatch.setattr(generate_efe, "_load_checkpoint", lambda config: ({"vocab_size": 8}, {}))
+    monkeypatch.setattr(
+        generate_efe, "_load_checkpoint",
+        lambda config, **kwargs: ({"vocab_size": 8}, {}),
+    )
+    monkeypatch.setattr(generate_efe, "_generation_code_identity", lambda: "c" * 64)
+    monkeypatch.setattr(
+        generate_efe, "_runtime_identity",
+        lambda device: {"device": {"type": str(device)}},
+    )
     monkeypatch.setattr(generate_efe, "_tokenizer_for_dataset", lambda *args, **kwargs: _Tokenizer())
     monkeypatch.setattr(
         generate_efe,
@@ -661,9 +1183,128 @@ def test_generation_main_atomically_persists_generation_seed_and_outputs(tmp_pat
     generate_efe.main()
 
     record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["schema_version"] == 3
+    assert record["checkpoint_sha256"] == hashlib.sha256(b"checkpoint-bytes").hexdigest()
+    assert record["model_state_sha256"] == hashlib.sha256().hexdigest()
     assert record["generation_seed"] == 23
+    assert record["code_identity_sha256"] == "c" * 64
+    assert record["runtime_state"] == {"device": {"type": "cpu"}}
+    assert record["generation_contract"] == {
+        "dataset": "synthetic",
+        "prompt": cfg["prompt"],
+        "prompt_token_ids": [[1, 2]],
+        "max_new_tokens": cfg["max_new_tokens"],
+        "generation_seed": 23,
+        "greedy": cfg["greedy"],
+        "device": "cpu",
+        "policy": {
+            key: (list(cfg[key]) if key == "policy_score_terms" else cfg[key])
+            for key in generate_efe._POLICY_FIELDS
+        },
+    }
     assert record["outputs"] == {"base_token_ids": [[1, 2, 3]], "policy_token_ids": [[1, 2, 4]]}
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_generation_checkpoint_digest_binds_the_exact_loaded_snapshot(tmp_path):
+    checkpoint = tmp_path / "checkpoint.pt"
+    original = {
+        "config": {"vocab_size": 8},
+        "model_state": {"weight": torch.tensor([1.0])},
+    }
+    replacement = {
+        "config": {"vocab_size": 8},
+        "model_state": {"weight": torch.tensor([9.0])},
+    }
+    torch.save(original, checkpoint)
+    snapshot = checkpoint.read_bytes()
+    digest = hashlib.sha256(snapshot).hexdigest()
+    torch.save(replacement, checkpoint)
+
+    config, state = generate_efe._load_checkpoint(
+        {"checkpoint": str(checkpoint), "config_from": None},
+        checkpoint_snapshot=snapshot,
+    )
+
+    assert config == original["config"]
+    assert torch.equal(state["weight"], original["model_state"]["weight"])
+    assert digest == hashlib.sha256(snapshot).hexdigest()
+    assert not torch.equal(state["weight"], replacement["model_state"]["weight"])
+
+
+@pytest.mark.parametrize("drift_source", ("checkpoint", "config_from"))
+def test_generation_refuses_to_publish_if_an_input_changes_mid_run(
+    tmp_path,
+    monkeypatch,
+    drift_source,
+):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint-start")
+    config_from = tmp_path / "config.json"
+    config_from.write_bytes(b"config-start")
+    output = tmp_path / "generation.json"
+    output.write_bytes(b"SENTINEL")
+    cfg = dict(
+        generate_efe.CONFIG,
+        checkpoint=str(checkpoint),
+        config_from=str(config_from),
+        output_path=str(output),
+        dataset="synthetic",
+        device="cpu",
+    )
+
+    class _Tokenizer:
+        def encode(self, value):
+            del value
+            return [1]
+
+        def decode(self, values):
+            return str(values)
+
+    def mutate_input(*args, **kwargs):
+        del args, kwargs
+        target = checkpoint if drift_source == "checkpoint" else config_from
+        target.write_bytes(b"changed-during-generation")
+        return torch.tensor([[1, 2]]), None
+
+    monkeypatch.setattr(generate_efe, "CONFIG", cfg)
+    monkeypatch.setattr(
+        generate_efe, "_load_checkpoint",
+        lambda config, **kwargs: ({"vocab_size": 8}, {}),
+    )
+    monkeypatch.setattr(generate_efe, "_tokenizer_for_dataset", lambda *a, **k: _Tokenizer())
+    monkeypatch.setattr(generate_efe, "_run_generation_arms", mutate_input)
+
+    with pytest.raises(RuntimeError, match="changed during generation"):
+        generate_efe.main()
+
+    assert output.read_bytes() == b"SENTINEL"
+
+
+@pytest.mark.parametrize("alias_field", ("checkpoint", "config_from"))
+def test_generation_output_cannot_alias_input_checkpoint(
+    tmp_path,
+    monkeypatch,
+    alias_field,
+):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"trained-model")
+    cfg = dict(generate_efe.CONFIG, checkpoint=str(checkpoint), output_path=str(checkpoint))
+    if alias_field == "config_from":
+        other = tmp_path / "legacy.pt"
+        other.write_bytes(b"legacy-state")
+        cfg.update(checkpoint=str(other), config_from=str(checkpoint))
+    monkeypatch.setattr(generate_efe, "CONFIG", cfg)
+    monkeypatch.setattr(
+        generate_efe,
+        "_load_checkpoint",
+        lambda config: pytest.fail("alias validation ran after checkpoint loading"),
+    )
+
+    with pytest.raises(ValueError, match="must not alias"):
+        generate_efe.main()
+
+    assert checkpoint.read_bytes() == b"trained-model"
 
 
 def test_visualization_extra_declares_direct_networkx_dependency():
@@ -715,6 +1356,20 @@ def test_entry_points_offer_explicit_openmp_compatibility_opt_in():
     assert "KMP_PROBE='TRUE'" in probe.stdout
 
 
+def _fixture_scaling_sources() -> dict[str, dict[str, object]]:
+    return {
+        split: {
+            "format": "pt",
+            "tokenizer_tag": "synthetic",
+            "size_bytes": len(split),
+            "sha256": split[0] * 64,
+            "meta": None,
+            "meta_sha256": None,
+        }
+        for split in ("train", "validation", "test")
+    }
+
+
 def test_scaling_failure_is_persisted_and_returns_nonzero_without_success_banner(
     tmp_path, monkeypatch, capsys,
 ):
@@ -728,6 +1383,8 @@ def test_scaling_failure_is_persisted_and_returns_nonzero_without_success_banner
     monkeypatch.setitem(scaling.CONFIG, "max_steps", None)
     monkeypatch.setitem(scaling.CONFIG, "output_dir", str(tmp_path))
     monkeypatch.setattr(scaling, "_cleanup", lambda: None)
+    monkeypatch.setattr(scaling, "_data_source_identities",
+                        lambda dataset: _fixture_scaling_sources())
     monkeypatch.setattr(scaling, "run_cell", lambda *args, **kwargs: {
         "label": "probe",
         "route": "probe_route",
@@ -747,6 +1404,98 @@ def test_scaling_failure_is_persisted_and_returns_nonzero_without_success_banner
     assert json.loads(failure.read_text(encoding="utf-8"))["error"] == "audit probe"
     design = json.loads((tmp_path / "scaling_design.json").read_text(encoding="utf-8"))
     assert design["status"] == "incomplete"
+
+
+def _complete_scaling_result() -> dict[str, object]:
+    test_ce = 2.0
+    return {
+        "error_kind": None,
+        "n_params": 10,
+        "test_ce": test_ce,
+        "test_ppl": math.exp(test_ce),
+        "test_bits_per_token": test_ce / math.log(2.0),
+        "test_bpc": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("n_params", True),
+        ("n_params", 0),
+        ("n_params", 10.0),
+        ("test_ppl", None),
+        ("test_ppl", float("nan")),
+        ("test_ppl", 0.0),
+        ("test_bits_per_token", None),
+        ("test_bits_per_token", float("inf")),
+        ("test_bits_per_token", 0.0),
+        ("test_bpc", float("nan")),
+        ("test_bpc", 0.0),
+    ),
+)
+def test_scaling_completion_requires_a_complete_semantic_result(field, value):
+    result = _complete_scaling_result()
+    result[field] = value
+
+    assert scaling._scaling_result_status(result) != "complete"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("test_ppl", 2.0),
+        ("test_bits_per_token", 2.0),
+    ),
+)
+def test_scaling_completion_rejects_internally_inconsistent_metrics(field, value):
+    result = _complete_scaling_result()
+    result[field] = value
+
+    assert scaling._scaling_result_status(result) != "complete"
+
+
+def test_scaling_successful_rerun_removes_stale_failure_marker(tmp_path, monkeypatch):
+    cell = {"label": "probe", "route": "probe_route", "scale_knob": "embed_dim", "overrides": {}}
+    run_dir = tmp_path / "probe_route" / "probe" / "s6"
+    run_dir.mkdir(parents=True)
+    failure = run_dir / "scaling_failure.json"
+    failure.write_text(json.dumps({"error": "old failure"}), encoding="utf-8")
+    monkeypatch.setattr(scaling, "ROUTES", {"probe_route": [cell]})
+    monkeypatch.setitem(scaling.CONFIG, "routes", ["probe_route"])
+    monkeypatch.setitem(scaling.CONFIG, "seeds", [6])
+    monkeypatch.setitem(scaling.CONFIG, "device", "cpu")
+    monkeypatch.setitem(scaling.CONFIG, "dataset", "synthetic")
+    monkeypatch.setitem(scaling.CONFIG, "max_tokens", None)
+    monkeypatch.setitem(scaling.CONFIG, "max_steps", None)
+    monkeypatch.setitem(scaling.CONFIG, "output_dir", str(tmp_path))
+    monkeypatch.setattr(scaling, "_cleanup", lambda: None)
+    monkeypatch.setattr(scaling, "_data_source_identities",
+                        lambda dataset: _fixture_scaling_sources())
+    monkeypatch.setattr(scaling, "run_cell", lambda *args, **kwargs: {
+        **_complete_scaling_result(),
+        "label": "probe",
+        "route": "probe_route",
+        "scale_knob": "embed_dim",
+        "seed": 6,
+        "cached": False,
+    })
+
+    assert scaling.main() == 0
+    assert not failure.exists()
+
+
+def test_scaling_rejects_negative_seed_values():
+    with pytest.raises(ValueError, match="nonnegative"):
+        scaling._validated_scaling_seeds([6, -1])
+
+
+def test_scaling_rejects_integer_enum_seed_values():
+    class Seed(IntEnum):
+        ONE = 1
+
+    with pytest.raises(ValueError, match="exact integers"):
+        scaling._validated_scaling_seeds([Seed.ONE])
 
 
 def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repaired():

@@ -72,7 +72,10 @@ def _setup_cell(tmp_path: Path, monkeypatch, *, write_contract: bool = True):
     contract = ablation._cell_contract(cfg, DATASET, DIAG_FLAGS, data_seed=3, cache_dir=cache_dir)
     run_dir = tmp_path / "cell"
     run_dir.mkdir()
-    _write_marker(run_dir)
+    _write_marker(
+        run_dir,
+        cell_contract_fingerprint=ablation.semantic_config_fingerprint(contract),
+    )
     if write_contract:
         (run_dir / "cell_contract.json").write_text(json.dumps(contract), encoding="utf-8")
     return run_dir, contract
@@ -82,6 +85,14 @@ def _fake_source_ok(dataset, split, *, cache_dir=None):
     r"""A deterministic per-split source identity that needs no real corpus on disk."""
     return {"format": "pt", "tokenizer_tag": "tiktoken", "size_bytes": len(split),
             "sha256": "0" * 64 + split, "meta": None, "meta_sha256": None}
+
+
+def _fake_loaded_sources():
+    """The detached source contract a successful fake run_single must return to run_sweep."""
+    return {
+        split: _fake_source_ok(DATASET, split)
+        for split in ("train", "validation")
+    }
 
 
 # =============================================================================
@@ -123,6 +134,181 @@ def test_cell_reuse_rejects_code_identity_drift(tmp_path: Path, monkeypatch) -> 
     drifted = copy.deepcopy(contract)
     drifted["code_identity"]["git_sha"] = "b" * 40         # HEAD moved / tree changed
     assert ablation._cell_is_current(run_dir, drifted) is False
+
+
+def test_cell_reuse_rejects_new_contract_paired_with_old_success_marker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_dir, old_contract = _setup_cell(tmp_path, monkeypatch)
+    new_contract = copy.deepcopy(old_contract)
+    new_contract["semantic_config_fingerprint"] = "f" * 64
+    (run_dir / "cell_contract.json").write_text(json.dumps(new_contract), encoding="utf-8")
+
+    assert ablation._cell_is_current(run_dir, new_contract) is False
+
+
+@pytest.mark.parametrize("raw", ([], [1, 1], [True], [1.5], ["1"], [-1]))
+def test_declared_sweep_seeds_require_nonempty_unique_exact_nonnegative_integers(raw) -> None:
+    with pytest.raises(ValueError, match="seeds"):
+        ablation._validated_sweep_seeds({"seeds": raw}, 6)
+
+
+def test_recompute_invalidates_prior_success_marker_before_training(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sweep_name = "generation_invalidation"
+    monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "generation guard"})
+    monkeypatch.setattr(ablation, "make_run_overrides", lambda _name: [("cell", {})])
+    contract = {"schema_version": ablation._CELL_CONTRACT_SCHEMA_VERSION, "generation": "new"}
+    monkeypatch.setattr(
+        ablation, "_expected_cell_contract_or_none", lambda *args, **kwargs: contract)
+    monkeypatch.setattr(ablation, "_cell_is_current", lambda *args, **kwargs: False)
+
+    run_dir = tmp_path / sweep_name / ablation._sanitize("cell")
+    run_dir.mkdir(parents=True)
+    _write_marker(
+        run_dir,
+        cell_contract_fingerprint=ablation.semantic_config_fingerprint(contract),
+    )
+
+    def interrupted_run(*args, **kwargs):
+        del args, kwargs
+        marker = json.loads((run_dir / "ablation_result.json").read_text(encoding="utf-8"))
+        assert marker["status"] == "running"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ablation, "run_single", interrupted_run)
+    with pytest.raises(KeyboardInterrupt):
+        ablation.run_sweep(
+            sweep_name,
+            tmp_path,
+            dataset=DATASET,
+            device=None,
+            seed=6,
+            resume=True,
+        )
+
+    marker = json.loads((run_dir / "ablation_result.json").read_text(encoding="utf-8"))
+    assert marker["status"] == "running"
+
+
+def test_resumed_stale_cell_rejects_contract_drift_during_recompute(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sweep_name = "resumed_contract_drift"
+    monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "contract drift guard"})
+    monkeypatch.setattr(ablation, "make_run_overrides", lambda _name: [("cell", {})])
+    before = {
+        "schema_version": ablation._CELL_CONTRACT_SCHEMA_VERSION,
+        "code_identity": {"git_sha": "a" * 40},
+    }
+    after = copy.deepcopy(before)
+    after["code_identity"]["git_sha"] = "b" * 40
+    builds = []
+
+    def rebuild_contract(*args, **kwargs):
+        del args, kwargs
+        builds.append(None)
+        return copy.deepcopy(before if len(builds) == 1 else after)
+
+    monkeypatch.setattr(ablation, "_expected_cell_contract_or_none", rebuild_contract)
+    monkeypatch.setattr(ablation, "_cell_is_current", lambda *args, **kwargs: False)
+    monkeypatch.setattr(ablation, "_cleanup", lambda: None)
+    monkeypatch.setattr(
+        ablation,
+        "run_single",
+        lambda *args, **kwargs: {
+            "label": "cell",
+            "error_kind": None,
+            "primary_val_ppl": 8.0,
+            "final_val_ppl": 9.0,
+            "seed": 6,
+            "_loaded_data_sources": _fake_loaded_sources(),
+        },
+    )
+
+    run_dir = tmp_path / sweep_name / ablation._sanitize("cell")
+    run_dir.mkdir(parents=True)
+    _write_marker(run_dir, cell_contract_fingerprint="stale")
+    stale_contract = {
+        "schema_version": ablation._CELL_CONTRACT_SCHEMA_VERSION,
+        "generation": "stale",
+    }
+    (run_dir / "cell_contract.json").write_text(json.dumps(stale_contract), encoding="utf-8")
+
+    result = ablation.run_sweep(
+        sweep_name,
+        tmp_path,
+        dataset=DATASET,
+        device=None,
+        seed=6,
+        resume=True,
+    )
+
+    marker = json.loads((run_dir / "ablation_result.json").read_text(encoding="utf-8"))
+    assert len(builds) == 2
+    assert marker["status"] == "failed"
+    assert marker["cell_contract_fingerprint"] is None
+    assert json.loads((run_dir / "cell_contract.json").read_text(encoding="utf-8")) == stale_contract
+    assert result == []
+
+
+@pytest.mark.parametrize("resume", (False, True))
+def test_recomputation_without_marker_rejects_contract_drift(
+    tmp_path: Path,
+    monkeypatch,
+    resume: bool,
+) -> None:
+    sweep_name = f"fresh_contract_drift_{resume}"
+    monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "contract drift guard"})
+    monkeypatch.setattr(ablation, "make_run_overrides", lambda _name: [("cell", {})])
+    before = {
+        "schema_version": ablation._CELL_CONTRACT_SCHEMA_VERSION,
+        "code_identity": {"git_sha": "a" * 40},
+    }
+    after = copy.deepcopy(before)
+    after["code_identity"]["git_sha"] = "b" * 40
+    builds = []
+
+    def rebuild_contract(*args, **kwargs):
+        del args, kwargs
+        builds.append(None)
+        return copy.deepcopy(before if len(builds) == 1 else after)
+
+    monkeypatch.setattr(ablation, "_expected_cell_contract_or_none", rebuild_contract)
+    monkeypatch.setattr(ablation, "_cleanup", lambda: None)
+    monkeypatch.setattr(
+        ablation,
+        "run_single",
+        lambda *args, **kwargs: {
+            "label": "cell",
+            "error_kind": None,
+            "primary_val_ppl": 8.0,
+            "final_val_ppl": 9.0,
+            "seed": 6,
+            "_loaded_data_sources": _fake_loaded_sources(),
+        },
+    )
+
+    result = ablation.run_sweep(
+        sweep_name,
+        tmp_path,
+        dataset=DATASET,
+        device=None,
+        seed=6,
+        resume=resume,
+    )
+
+    run_dir = tmp_path / sweep_name / ablation._sanitize("cell")
+    marker = json.loads((run_dir / "ablation_result.json").read_text(encoding="utf-8"))
+    assert len(builds) == 2
+    assert marker["status"] == "failed"
+    assert marker["cell_contract_fingerprint"] is None
+    assert not (run_dir / "cell_contract.json").exists()
+    assert result == []
 
 
 def test_cell_reuse_rejects_train_or_validation_source_drift(tmp_path: Path, monkeypatch) -> None:
@@ -178,7 +364,8 @@ def test_missing_requested_diagnostics_output_forbids_contract_publication(tmp_p
 
     def fake_run_single(label, overrides, run_dir, **kwargs):
         result = {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
-                  "final_val_ppl": 9.0, "seed": 6}
+                  "final_val_ppl": 9.0, "seed": 6,
+                  "_loaded_data_sources": _fake_loaded_sources()}
         if label == "complete":
             result["attn_entropy"] = 1.0                    # requested diagnostics output present
             result["extrap_ce"] = []                        # requested extrapolation output present
@@ -255,7 +442,8 @@ def test_invalid_config_contract_forbids_reuse_without_aborting_sweep(tmp_path: 
             return {"label": label, "error_kind": "config", "error": "rejected",
                     "primary_val_ppl": float("inf"), "seed": 6}
         return {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
-                "final_val_ppl": 9.0, "seed": 6}
+                "final_val_ppl": 9.0, "seed": 6,
+                "_loaded_data_sources": _fake_loaded_sources()}
 
     monkeypatch.setattr(ablation, "run_single", fake_run_single)
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)
@@ -281,22 +469,16 @@ def test_missing_or_corrupt_source_contract_forbids_reuse_without_aborting_sweep
     monkeypatch.setattr(ablation, "cache_source_identity", raise_source)
     assert ablation._expected_cell_contract_or_none({}, DATASET, DIAG_FLAGS, seed=6) is None
 
-    # Transient race: the source is missing while one cell's post-run contract is built (that
-    # successful cell is converted to a failed result with no contract), then present for the next
-    # cell (which publishes its contract). The sweep completes either way.
-    state = {"ok": True}
-
-    def stateful_source(dataset, split, *, cache_dir=None):
-        if not state["ok"]:
-            raise FileNotFoundError("corpus vanished mid-run")
-        return _fake_source_ok(dataset, split, cache_dir=cache_dir)
-
-    monkeypatch.setattr(ablation, "cache_source_identity", stateful_source)
+    # The shared pre-sweep filesystem snapshot is available. A run whose loaders cannot return the
+    # identity of the data they actually loaded still fails closed, while the next run whose loaders
+    # return the matching identity publishes normally. No per-cell filesystem re-hash is needed.
+    monkeypatch.setattr(ablation, "cache_source_identity", _fake_source_ok)
 
     def fake_run_single(label, overrides, run_dir, **kwargs):
-        state["ok"] = (label != "race")
         return {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
-                "final_val_ppl": 9.0, "seed": 6}
+                "final_val_ppl": 9.0, "seed": 6,
+                "_loaded_data_sources": (
+                    None if label == "race" else _fake_loaded_sources())}
 
     sweep_name = "contract_source"
     monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "missing-source isolation"})
@@ -429,7 +611,8 @@ def test_run_single_finalizes_before_writing_success_contract(tmp_path, monkeypa
         run_dir.mkdir(parents=True, exist_ok=True)
         tc = str(real_ckpt) if label == "with_ckpt" else str(run_dir / "checkpoints" / "step_2.pt")
         return {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
-                "final_val_ppl": 9.0, "seed": 6, "terminal_checkpoint": tc}
+                "final_val_ppl": 9.0, "seed": 6, "terminal_checkpoint": tc,
+                "_loaded_data_sources": _fake_loaded_sources()}
 
     monkeypatch.setattr(ablation, "run_single", fake_run_single)
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)

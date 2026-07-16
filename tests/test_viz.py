@@ -1,5 +1,6 @@
 import logging
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -60,6 +61,37 @@ from vfe3.viz.text import installed_multilingual_sans_serif
 
 def _saved_nonempty(path):
     return path.exists() and path.stat().st_size > 0
+
+
+def test_atomic_save_preserves_existing_png_when_renderer_fails_mid_write(tmp_path):
+    class PartialWriteFailure:
+        def savefig(self, path):
+            Path(path).write_bytes(b"PARTIAL")
+            raise RuntimeError("renderer failed mid-write")
+
+    target = tmp_path / "publication.png"
+    target.write_bytes(b"SENTINEL")
+
+    with pytest.raises(RuntimeError, match="failed mid-write"):
+        figures_mod._save(PartialWriteFailure(), str(target))
+
+    assert target.read_bytes() == b"SENTINEL"
+    assert not list(tmp_path.glob(".publication.*.tmp.png"))
+
+
+def test_atomic_save_rejects_empty_renderer_output_without_replacing_existing_png(tmp_path):
+    class EmptyWrite:
+        def savefig(self, path):
+            Path(path).write_bytes(b"")
+
+    target = tmp_path / "publication.png"
+    target.write_bytes(b"SENTINEL")
+
+    with pytest.raises(RuntimeError, match="nonempty temporary output"):
+        figures_mod._save(EmptyWrite(), str(target))
+
+    assert target.read_bytes() == b"SENTINEL"
+    assert not list(tmp_path.glob(".publication.*.tmp.png"))
 
 
 def test_set_publication_style_runs():

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from vfe3 import metrics
@@ -472,7 +473,7 @@ class _EvaluationModel(nn.Module):
         return None, None, self.anchor.new_tensor(next(self._cross_entropies))
 
 
-def test_evaluate_transfers_one_aggregate_and_preserves_token_weighting(
+def test_evaluate_transfers_only_padding_buckets_and_aggregate_and_preserves_token_weighting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _EvaluationModel([0.5, 1.25, 2.0])
@@ -515,7 +516,9 @@ def test_evaluate_transfers_one_aggregate_and_preserves_token_weighting(
     assert result["bpc"] == pytest.approx(expected_ce / math.log(2.0) * 0.4)
     assert float_calls == 0
     assert int_calls == 0
-    assert cpu_calls == 1
+    # Two padded batches transfer their distinct valid-length buckets for correctness; all scalar
+    # metric totals still cross the device boundary together in one final aggregate transfer.
+    assert cpu_calls == 3
 
 
 def test_fixed_point_diagnostics_reuse_snapshot_and_run_only_one_new_iteration(
@@ -602,7 +605,11 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
     expected_belief = extract.belief_bank(model, token_batches)
     expected_ce = extract.belief_ce_bank(model, loader)
     expected_model = extract.model_channel_bank(model, token_batches)
-    expected_vocab = extract.vocab_prediction_stats(model, token_batches)
+    aligned_targets = torch.cat([targets.reshape(-1) for _, targets in loader])
+    aligned_probs = torch.cat([
+        model(tokens).reshape(-1, model.cfg.vocab_size).float().softmax(dim=-1)
+        for tokens, _ in loader
+    ])
 
     inference_calls = 0
     cpu_transfer_ids: set[int] = set()
@@ -670,7 +677,127 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
     _assert_mapping_close(actual_ce, expected_ce)
     assert actual_model is not None and expected_model is not None
     _assert_mapping_close(actual_model, expected_model)
-    _assert_mapping_close(actual_vocab, expected_vocab)
+    torch.testing.assert_close(actual_vocab["mean_pred_prob"], aligned_probs.mean(dim=0))
+    assert actual_vocab["n_positions"] == int(aligned_targets.numel())
+    assert torch.equal(actual_vocab["true_ids"], aligned_targets)
+    assert torch.equal(actual_vocab["pred_ids"], aligned_probs.argmax(dim=-1))
+
+
+def test_shared_population_consumers_drop_padding_and_keep_aligned_targets() -> None:
+    model = VFEModel(_tiny_config(
+        vocab_size=12,
+        n_heads=1,
+        prior_source="model_channel",
+        s_frame_mode="phi_tilde",
+        s_e_step=True,
+        lambda_h=1.0,
+        lambda_gamma=1.0,
+    )).eval()
+    loader = [
+        (
+            torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+            torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        ),
+        (
+            torch.tensor([[8, 0, 0, 0]], dtype=torch.long),
+            torch.tensor([[9, -100, -100, -100]], dtype=torch.long),
+        ),
+    ]
+    inference_bank = extract.collect_inference_bank(
+        model,
+        loader,
+        return_logits=True,
+    )
+
+    belief = extract.belief_bank(model, [], inference_bank=inference_bank)
+    model_channel = extract.model_channel_bank(model, [], inference_bank=inference_bank)
+    vocab = extract.vocab_prediction_stats(model, [], inference_bank=inference_bank)
+
+    assert model_channel is not None
+    for bank in (belief, model_channel):
+        assert {value.shape[0] for value in bank.values()} == {5}
+        assert bank["token_ids"].tolist() == [0, 1, 2, 3, 8]
+        assert bank["seq_idx"].tolist() == [0, 0, 0, 0, 1]
+        assert bank["pos_idx"].tolist() == [0, 1, 2, 3, 0]
+
+    valid_logits = torch.cat([
+        record["logits"][record["targets"] != -100]
+        for record in inference_bank
+    ])
+    expected_mean = valid_logits.float().softmax(dim=-1).mean(dim=0)
+    torch.testing.assert_close(vocab["mean_pred_prob"], expected_mean)
+    assert vocab["n_positions"] == 5
+    assert vocab["true_ids"].tolist() == [1, 2, 3, 4, 9]
+    assert vocab["disp_context_ids"].tolist() == [0, 1, 2, 3]
+    assert vocab["disp_target_ids"].tolist() == [1, 2, 3, 4]
+    assert vocab["unigram"].nonzero().flatten().tolist() == [1, 2, 3, 4, 9]
+
+
+def test_shared_belief_ce_honors_requested_device_and_releases_each_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = VFEModel(_tiny_config()).eval()
+    loader = [
+        (torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]])),
+        (torch.tensor([[4, 3, 2, 1]]), torch.tensor([[3, 2, 1, -100]])),
+    ]
+    expected = extract.belief_ce_bank(model, loader)
+    inference_bank = extract.collect_inference_bank(
+        model,
+        loader,
+        return_logits=True,
+    )
+    requested = torch.device("cuda")
+    requested_moves: list[int] = []
+    previous_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    liveness_checks: list[bool] = []
+    real_to = torch.Tensor.to
+    real_cross_entropy = F.cross_entropy
+
+    def _to_spy(
+        value: torch.Tensor,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        target = kwargs.get("device")
+        if args and isinstance(args[0], (str, torch.device)):
+            target = args[0]
+        if target is not None and torch.device(target) == requested:
+            requested_moves.append(id(value))
+            return value.clone()
+        return real_to(value, *args, **kwargs)
+
+    def _cross_entropy_spy(
+        logits:  torch.Tensor,
+        targets: torch.Tensor,
+
+        **kwargs: object,
+    ) -> torch.Tensor:
+        if previous_refs:
+            gc.collect()
+            liveness_checks.append(all(ref() is None for ref in previous_refs))
+        result = real_cross_entropy(logits, targets, **kwargs)
+        previous_refs[:] = [weakref.ref(logits), weakref.ref(targets)]
+        return result
+
+    monkeypatch.setattr(torch.Tensor, "to", _to_spy)
+    monkeypatch.setattr(F, "cross_entropy", _cross_entropy_spy)
+    actual = extract.belief_ce_bank(
+        model,
+        [],
+        device=requested,
+        inference_bank=inference_bank,
+    )
+
+    moved_sources = {
+        id(record[key])
+        for record in inference_bank
+        for key in ("targets", "logits")
+    }
+    assert set(requested_moves) == moved_sources
+    assert liveness_checks == [True]
+    assert all(value.device.type == "cpu" for value in actual.values())
+    _assert_mapping_close(actual, expected)
 
 
 def test_belief_ce_fallback_offloads_each_batch_before_next_forward(

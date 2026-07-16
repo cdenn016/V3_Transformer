@@ -67,18 +67,31 @@ def _successful_update_count(
     group metadata from the current run. A checkpoint written before this field existed falls back
     to its completed outer-step cursor.
     """
+    if type(legacy_default) is not int or legacy_default < 0:
+        raise ValueError("legacy successful-update default must be a non-negative integer")
     if not optimizer.param_groups:
         return legacy_default
-    value = optimizer.param_groups[0].get(_SUCCESSFUL_UPDATES_KEY, legacy_default)
-    return int(value)
+    present = [_SUCCESSFUL_UPDATES_KEY in group for group in optimizer.param_groups]
+    if any(present) and not all(present):
+        raise RuntimeError("successful_updates must be present on every optimizer group or none")
+    if not any(present):
+        return legacy_default
+    values = [group[_SUCCESSFUL_UPDATES_KEY] for group in optimizer.param_groups]
+    if any(type(value) is not int or value < 0 for value in values):
+        raise RuntimeError("successful_updates must be exact non-negative integers")
+    if len(set(values)) != 1:
+        raise RuntimeError("successful_updates must agree across all optimizer groups")
+    return values[0]
 
 
 def _set_successful_update_count(
     optimizer: torch.optim.Optimizer,
     count:     int,
 ) -> None:
+    if type(count) is not int or count < 0:
+        raise ValueError("successful-update count must be a non-negative integer")
     for group in optimizer.param_groups:
-        group[_SUCCESSFUL_UPDATES_KEY] = int(count)
+        group[_SUCCESSFUL_UPDATES_KEY] = count
 
 
 def _warn_phi_transport_clamp(
@@ -579,11 +592,23 @@ def train_step(
             step_loss += float(loss_mb.detach()) * w
             if metrics_out is not None:                               # CE synced only on a logged step (PERF)
                 step_ce += (float(ce_mb.detach()) if ce_mb is not None else float("nan")) * w
-    # Unscale once when EITHER clipping or metrics capture needs true-unit gradients; GradScaler
-    # tracks that unscale_ already ran so the later _scaler.step() does not re-unscale. With a
-    # disabled scaler (the default) unscale_ is a no-op, and with metrics_out=None this is
-    # byte-identical to the prior clip-only path.
-    need_unscale = (grad_clip is not None and grad_clip > 0) or (metrics_out is not None)
+    _scaler_enabled = scaler is not None and scaler.is_enabled()
+    # The enabled scaler's ordinary finite-loss path delegates overflow detection to GradScaler.
+    # Resolve the scalar loss first so the rare nonfinite-loss branch can explicitly inspect gradients
+    # and distinguish scale backoff (nonfinite gradients) from scale hold (finite gradients).
+    if _scaler_enabled:
+        if step_loss is None:
+            step_loss = float(_loss_det)
+        loss_finite = math.isfinite(step_loss)
+    else:
+        loss_finite = True                                  # resolved with the fused default-path scan below
+    # Unscale once when clipping/metrics needs true-unit gradients or the enabled scaler must classify
+    # a nonfinite scalar loss. GradScaler remembers that unscale_ ran; its later step does not repeat it.
+    need_unscale = (
+        (grad_clip is not None and grad_clip > 0)
+        or (metrics_out is not None)
+        or (_scaler_enabled and not loss_finite)
+    )
     if need_unscale:
         _scaler.unscale_(optimizer)
     # Finite-GRADIENT gate (audit 2026-07-01 F1): a FINITE scalar loss can still carry a NaN/Inf
@@ -591,22 +616,30 @@ def train_step(
     # would permanently poison the exp_avg/exp_avg_sq moment buffers. Checked on EVERY step on the
     # disabled-scaler default path; the deferred step-loss value and the grad-finite flag ride ONE
     # fused D2H transfer, so the default path keeps exactly one unconditional sync per step
-    # (audit 2026-07-01 round-3). The ENABLED fp16 scaler path already skips internally via
-    # found_inf, so it stays byte-identical and is not re-checked here.
-    _scaler_enabled = scaler is not None and scaler.is_enabled()
+    # (audit 2026-07-01 round-3). The enabled fp16 scaler path checks gradients internally via
+    # found_inf, but the scalar loss is still checked explicitly because it can be nonfinite while
+    # every parameter gradient is finite.
     grad_finite = True
-    if not _scaler_enabled:
-        _flags = [torch.isfinite(p.grad).all()
-                  for g in optimizer.param_groups
-                  for p in g["params"] if p.grad is not None]
-        if _flags and step_loss is None:                        # fuse the deferred loss read with the flag
-            _pair = torch.stack((_loss_det.float(), torch.stack(_flags).all().float())).tolist()
-            step_loss   = _pair[0]
-            grad_finite = bool(_pair[1])
-        elif _flags:                                            # accum path: step_loss already a Python float
-            grad_finite = bool(torch.stack(_flags).all())
+    explicit_grad_check = (
+        not _scaler_enabled
+        or metrics_out is not None
+        or not loss_finite
+    )
+    _flags = (
+        [torch.isfinite(p.grad).all()
+         for g in optimizer.param_groups
+         for p in g["params"] if p.grad is not None]
+        if explicit_grad_check else []
+    )
+    if not _scaler_enabled and _flags and step_loss is None:    # fuse default-path loss + grad flag
+        _pair = torch.stack((_loss_det.float(), torch.stack(_flags).all().float())).tolist()
+        step_loss   = _pair[0]
+        grad_finite = bool(_pair[1])
+    elif _flags:
+        grad_finite = bool(torch.stack(_flags).all())
     if step_loss is None:                                       # fp16 / no-grads fallback: one plain loss sync
         step_loss = float(_loss_det)
+    loss_finite = math.isfinite(step_loss)
     if metrics_out is not None:
         # Pre-clip gradient health -- the global L2 norm clip_grad_norm_ RETURNS-and-discards, plus
         # per-ROLE norms (mu/sigma/phi from each group's "role" tag in build_optimizer, aggregated in
@@ -643,18 +676,16 @@ def train_step(
         for _name, _total in _egrad_sums.items():
             metrics_out[f"estep_grad_norm_{_name}_microbatch_mean"] = (
                 _total / _egrad_counts[_name])
-        metrics_out["loss_finite"] = float(math.isfinite(step_loss))
+        metrics_out["loss_finite"] = float(loss_finite)
         metrics_out["train_ce"] = step_ce            # pre-step CE (matches step_loss; not a post-update re-forward)
         if _mb_tok:                                             # grad_accum_steps>1: token-spread bias check
             metrics_out["grad_accum_tok_spread"] = float(max(_mb_tok) - min(_mb_tok))
         if scaler is not None and scaler.is_enabled():          # fp16: surface the loss-scale (Tier-2 health)
             metrics_out["grad_scale"] = float(scaler.get_scale())
-    # NaN/Inf skip on the default (disabled-scaler) path: a non-finite loss OR a non-finite
-    # parameter gradient (grad_finite above -- a finite loss does NOT imply finite grads) would
-    # PERMANENTLY poison AdamW's moment buffers in a single step with no recovery. The fp16
-    # GradScaler path already skips internally via found_inf; mirror that here by dropping the
-    # grads and not stepping when the scaler is disabled (audits 2026-06-17 r2, 2026-07-01 F1).
-    skip_step = (not _scaler_enabled) and ((not math.isfinite(step_loss)) or (not grad_finite))
+    # A nonfinite scalar loss independently rejects every route. A finite loss does not imply finite
+    # gradients, so the disabled-scaler path additionally applies the explicit gradient gate. The
+    # enabled scaler performs its own gradient found_inf check inside step().
+    skip_step = (not loss_finite) or (explicit_grad_check and not grad_finite)
     if metrics_out is not None:
         metrics_out["grad_finite"] = float(grad_finite)
     if grad_clip is not None and grad_clip > 0 and not skip_step:
@@ -674,9 +705,15 @@ def train_step(
     scale_before = float(_scaler.get_scale()) if _scaler_enabled else None
     if skip_step:
         optimizer.zero_grad(set_to_none=True)                # drop poisoned grads; do NOT step AdamW
+        if _scaler_enabled and not grad_finite:
+            _scaler.update()                                 # found_inf drives the configured scale backoff
+        elif _scaler_enabled:
+            _scaler.update(new_scale=scale_before)           # finite grads + nonfinite loss: do not grow scale
+        else:
+            _scaler.update()
     else:
         _scaler.step(optimizer)
-    _scaler.update()
+        _scaler.update()
     did_step = not skip_step
     if scale_before is not None and float(_scaler.get_scale()) < scale_before:
         did_step = False
@@ -796,10 +833,33 @@ def evaluate(
         for i, (tokens, targets) in enumerate(loader):
             tokens = tokens.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            _, _, ce = model(tokens, targets)
-            n_b = (targets != -100).sum().to(dtype=torch.float64)
-            total_nats.add_(ce.detach().to(dtype=torch.float64) * n_b)
-            total_tok.add_(n_b)
+            valid = targets != -100
+            has_ignored = bool((~valid).any())
+            grouped_trailing_padding = False
+            if (has_ignored and tokens.ndim == 2 and targets.ndim == 2
+                    and tokens.shape == targets.shape):
+                valid_lengths = valid.sum(dim=1)
+                positions = torch.arange(targets.shape[1], device=targets.device).unsqueeze(0)
+                grouped_trailing_padding = torch.equal(
+                    valid,
+                    positions < valid_lengths.unsqueeze(1),
+                )
+            if grouped_trailing_padding:
+                for length in torch.unique(valid_lengths).cpu().tolist():
+                    if length == 0:
+                        continue
+                    rows = valid_lengths == length
+                    group_tokens = tokens[rows, :length]
+                    group_targets = targets[rows, :length]
+                    _, _, ce = model(group_tokens, group_targets)
+                    n_b = group_targets.numel()
+                    total_nats.add_(ce.detach().to(dtype=torch.float64) * n_b)
+                    total_tok.add_(n_b)
+            else:
+                _, _, ce = model(tokens, targets)
+                n_b = valid.sum().to(dtype=torch.float64)
+                total_nats.add_(ce.detach().to(dtype=torch.float64) * n_b)
+                total_tok.add_(n_b)
             if max_batches is not None and i + 1 >= max_batches:
                 break               # draw exactly max_batches (process-then-break; no extra pull)
         total_nats_value, total_tok_value = torch.stack((total_nats, total_tok)).cpu().tolist()
@@ -1023,46 +1083,86 @@ def _loader_data_identity(
     loader:     object,
     vocab_size: int,
 ) -> Dict[str, object]:
-    r"""Return the exact data contract bound to a shuffled iterator cursor.
+    r"""Return the exact data and iterator contract bound to a resumable cursor.
 
     Production loaders receive a cache-backed contract from ``make_dataloader``. A direct
     ``TokenWindows`` loader used by tests or library callers receives an equivalent in-memory
     contract whose bounded canonical digest still prevents splicing a different tensor at resume.
     """
     dataset = getattr(loader, "dataset", None)
+    tokens = getattr(dataset, "tokens", None)
+    if not isinstance(tokens, torch.Tensor):
+        raise RuntimeError(
+            "exact data resume requires loader.dataset.tokens or a cache-backed data identity")
+    for field in ("seq_len", "stride", "pad_final"):
+        if not hasattr(dataset, field):
+            raise RuntimeError(
+                f"exact data resume requires loader.dataset.{field} iterator metadata")
+
+    sampler = getattr(loader, "sampler", None)
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    if type(batch_sampler) is not torch.utils.data.BatchSampler:
+        raise RuntimeError("exact data resume requires the standard torch BatchSampler")
+    if type(sampler) is torch.utils.data.RandomSampler:
+        sampler_kind = "random"
+        sampler_replacement: Optional[bool] = bool(sampler.replacement)
+    elif type(sampler) is torch.utils.data.SequentialSampler:
+        sampler_kind = "sequential"
+        sampler_replacement = None
+    else:
+        raise RuntimeError(
+            "exact data resume supports only standard RandomSampler or SequentialSampler")
+    batch_size = getattr(loader, "batch_size", None)
+    drop_last = getattr(loader, "drop_last", None)
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise RuntimeError("exact data resume requires a positive integer loader.batch_size")
+    if not isinstance(drop_last, bool):
+        raise RuntimeError("exact data resume requires a boolean loader.drop_last")
+    if getattr(loader, "collate_fn", None) is not torch.utils.data.default_collate:
+        raise RuntimeError("exact data resume requires PyTorch's default collate function")
+
     identity = getattr(dataset, "data_identity", None)
     if identity is not None:
         normalized = json.loads(json.dumps(identity, sort_keys=True, separators=(",", ":")))
         if normalized.get("model_vocab_size") != int(vocab_size):
             raise RuntimeError(
                 "loader data identity model vocabulary does not match the active config")
-        return normalized
-
-    tokens = getattr(dataset, "tokens", None)
-    if not isinstance(tokens, torch.Tensor):
-        raise RuntimeError(
-            "exact shuffled resume requires loader.dataset.tokens or a cache-backed data identity")
-    from vfe3.run_artifacts import _loader_token_content_identity
-    digest, n_tokens = _loader_token_content_identity(loader)
-    assert digest is not None and n_tokens is not None
-    return {
-        "schema_version":       1,
-        "dataset":              f"in-memory:{type(dataset).__module__}.{type(dataset).__qualname__}",
-        "split":                "train",
-        "tokenizer_tag":        None,
-        "tokenizer_encoding":   None,
-        "tokenizer_vocab_size": None,
-        "model_vocab_size":     int(vocab_size),
-        "max_tokens":           None,
-        "source": {
-            "format":        "tensor",
-            "tokenizer_tag": None,
-            "size_bytes":    int(tokens.numel()) * int(tokens.element_size()),
-            "sha256":        digest,
-            "meta":          {"n_tokens": n_tokens, "dtype": str(tokens.dtype)},
-            "meta_sha256":   None,
-        },
+    else:
+        from vfe3.run_artifacts import _loader_token_content_identity
+        digest, n_tokens = _loader_token_content_identity(loader)
+        assert digest is not None and n_tokens is not None
+        normalized = {
+            "schema_version":       2,
+            "dataset":              f"in-memory:{type(dataset).__module__}.{type(dataset).__qualname__}",
+            "split":                "train",
+            "tokenizer_tag":        None,
+            "tokenizer_encoding":   None,
+            "tokenizer_vocab_size": None,
+            "model_vocab_size":     int(vocab_size),
+            "max_tokens":           None,
+            "source": {
+                "format":        "tensor",
+                "tokenizer_tag": None,
+                "size_bytes":    int(tokens.numel()) * int(tokens.element_size()),
+                "sha256":        digest,
+                "meta":          {"n_tokens": n_tokens, "dtype": str(tokens.dtype)},
+                "meta_sha256":   None,
+            },
+        }
+    normalized["schema_version"] = 2
+    normalized["iterator"] = {
+        "dataset_type":       f"{type(dataset).__module__}.{type(dataset).__qualname__}",
+        "seq_len":            int(dataset.seq_len),
+        "stride":             int(dataset.stride),
+        "pad_final":          bool(dataset.pad_final),
+        "n_windows":          int(len(dataset)),
+        "batch_size":         batch_size,
+        "drop_last":          drop_last,
+        "sampler":            sampler_kind,
+        "sampler_replacement": sampler_replacement,
+        "sampler_num_samples": int(len(sampler)),
     }
+    return normalized
 
 
 def _training_cursor_fields(
@@ -1149,15 +1249,44 @@ def train(
     loader_sampler = getattr(loader, "sampler", None)
     shuffled_loader = isinstance(loader_sampler, torch.utils.data.RandomSampler)
     loader_generator = getattr(loader, "generator", None)
+    try:
+        steps_per_epoch = int(len(loader))  # type: ignore[arg-type]
+    except (TypeError, AttributeError):
+        steps_per_epoch = 0
+    if steps_per_epoch < 0:
+        raise ValueError(f"loader length must be nonnegative, got {steps_per_epoch}")
+    periodic_checkpoint_requested = bool(
+        artifacts is not None
+        and cfg.checkpoint_interval > 0
+        and n_steps >= cfg.checkpoint_interval
+    )
+    cursor_requested = bool(
+        resume_path is not None
+        or terminal_callback is not None
+        or periodic_checkpoint_requested
+    )
+    cursor_supported = isinstance(
+        getattr(getattr(loader, "dataset", None), "tokens", None), torch.Tensor)
+    if cursor_requested and not cursor_supported:
+        raise RuntimeError(
+            "exact data persistence requires a supported DataLoader over a token-window dataset")
     loader_data_identity = (
         _loader_data_identity(loader, cfg.vocab_size)
-        if isinstance(loader_generator, torch.Generator) else None
+        if cursor_requested and cursor_supported else None
     )
+    selection_data_identity = None
+    if cursor_requested and artifacts is not None and val_loader is not None:
+        selection_data_identity = _loader_data_identity(val_loader, cfg.vocab_size)
+        artifacts.bind_selection_data_identity(selection_data_identity)
     resume_data_state: DataStateBuffer = {}
-    if (resume_path is not None and shuffled_loader
+    if (cursor_requested and shuffled_loader
             and not isinstance(loader_generator, torch.Generator)):
         raise RuntimeError(
             "exact shuffled resume requires loader.generator to expose a torch.Generator")
+    if (cursor_requested and shuffled_loader
+            and getattr(loader_sampler, "generator", None) is not loader_generator):
+        raise RuntimeError(
+            "exact shuffled resume requires sampler.generator to be loader.generator")
     # Metropolis det-sign sweep (opt-in, default OFF): a single persistent CPU generator, seeded
     # once from cfg.seed, threaded across every step so the accept/reject sequence is reproducible
     # (design spec Sec.6). It is constructed before resume so load_checkpoint can restore its private
@@ -1176,14 +1305,17 @@ def train(
     if resume_path is not None:
         from vfe3.run_artifacts import load_checkpoint           # local import avoids any import cycle
         start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
+                                     max_step=n_steps,
                                      scaler=scaler, cfg=cfg, ema=ema, artifacts=artifacts,
                                      metropolis_generator=metro_gen,
                                      data_state=resume_data_state,
-                                     expected_data_identity=loader_data_identity)
-        if shuffled_loader and not resume_data_state:
+                                     expected_data_identity=loader_data_identity,
+                                     expected_selection_data_identity=selection_data_identity,
+                                     expected_steps_per_epoch=steps_per_epoch)
+        if not resume_data_state:
             raise RuntimeError(
-                "exact shuffled resume requires checkpoint data_state; this checkpoint predates "
-                "shuffled iterator persistence")
+                "exact data resume requires checkpoint data_state; this checkpoint predates "
+                "iterator persistence")
         # LambdaLR with last_epoch != -1 requires 'initial_lr' on every group; set it from the configured
         # base (not the post-load group['lr'], which the restored optimizer state overwrote with base*cos).
         for group, base in zip(optimizer.param_groups, base_lrs):
@@ -1243,13 +1375,6 @@ def train(
             finally:
                 bar.close()
 
-    try:
-        steps_per_epoch = int(len(loader))  # type: ignore[arg-type]
-    except (TypeError, AttributeError):
-        steps_per_epoch = 0
-    if steps_per_epoch < 0:
-        raise ValueError(f"loader length must be nonnegative, got {steps_per_epoch}")
-
     epoch = 0
     batches_consumed = 0
     if resume_data_state:
@@ -1260,29 +1385,46 @@ def train(
         if missing_data_state:
             raise RuntimeError(
                 f"checkpoint data_state is missing required field(s) {sorted(missing_data_state)}")
-        if not isinstance(loader_generator, torch.Generator):
-            raise RuntimeError(
-                "exact data resume requires loader.generator to expose a torch.Generator")
         saved_generator_state = resume_data_state["epoch_start_generator_state"]
-        if not isinstance(saved_generator_state, torch.Tensor):
-            raise RuntimeError("checkpoint data_state epoch_start_generator_state must be a tensor")
         epoch = resume_data_state["epoch"]
         saved_batches_consumed = resume_data_state["batches_consumed"]
-        epoch_start_generator_state = saved_generator_state.cpu().clone()
-        loader_generator.set_state(epoch_start_generator_state)
+        if shuffled_loader:
+            if not isinstance(loader_generator, torch.Generator):
+                raise RuntimeError(
+                    "exact shuffled resume requires loader.generator to expose a torch.Generator")
+            if not isinstance(saved_generator_state, torch.Tensor):
+                raise RuntimeError(
+                    "shuffled checkpoint data_state requires an epoch generator tensor")
+            epoch_start_generator_state = saved_generator_state.cpu().clone()
+            loader_generator.set_state(epoch_start_generator_state)
+        else:
+            if saved_generator_state is not None:
+                raise RuntimeError(
+                    "sequential checkpoint data_state requires a null epoch generator state")
+            epoch_start_generator_state = None
     else:
         saved_batches_consumed = 0
-        epoch_start_generator_state = (loader_generator.get_state().clone()
-                                       if isinstance(loader_generator, torch.Generator) else None)
-    it = iter(loader)
-    for _ in range(saved_batches_consumed):
-        try:
-            next(it)
-        except StopIteration as exc:
-            raise RuntimeError(
-                "checkpoint data_state cannot be replayed by the current loader: "
-                "batches_consumed exceeds the saved epoch") from exc
-        batches_consumed += 1
+        epoch_start_generator_state = (
+            loader_generator.get_state().clone()
+            if shuffled_loader and isinstance(loader_generator, torch.Generator) else None)
+    # load_checkpoint restored the global RNG to the instant of publication. Reconstructing a
+    # DataLoader iterator consumes a CPU base-seed draw even for a deterministic sequential loader
+    # with num_workers=0; that draw already happened at the saved epoch start. Preserve the restored
+    # stream around resume-only reconstruction/skip so stochastic model behavior continues exactly.
+    replay_cpu_rng = torch.get_rng_state().clone() if resume_data_state else None
+    try:
+        it = iter(loader)
+        for _ in range(saved_batches_consumed):
+            try:
+                next(it)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "checkpoint data_state cannot be replayed by the current loader: "
+                    "batches_consumed exceeds the saved epoch") from exc
+            batches_consumed += 1
+    finally:
+        if replay_cpu_rng is not None:
+            torch.set_rng_state(replay_cpu_rng)
     timing_enabled = bool(log_interval) or (
         artifacts is not None and bool(eval_interval) and val_loader is not None
     )
@@ -1295,8 +1437,9 @@ def train(
         except StopIteration:
             epoch += 1
             batches_consumed = 0
-            epoch_start_generator_state = (loader_generator.get_state().clone()
-                                           if isinstance(loader_generator, torch.Generator) else None)
+            epoch_start_generator_state = (
+                loader_generator.get_state().clone()
+                if shuffled_loader and isinstance(loader_generator, torch.Generator) else None)
             it = iter(loader)
             tokens, targets = next(it)
         batches_consumed += 1
@@ -1443,7 +1586,7 @@ def train(
                 "batches_consumed":            batches_consumed,
                 "epoch":                       epoch,
                 "data_identity":               loader_data_identity,
-            } if epoch_start_generator_state is not None else None)
+            } if loader_data_identity is not None else None)
             artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler, ema=ema,
                                       metropolis_generator=metro_gen,
                                       data_state=checkpoint_data_state)
@@ -1652,7 +1795,7 @@ def train(
             "batches_consumed":            batches_consumed,
             "epoch":                       epoch,
             "data_identity":               loader_data_identity,
-        } if epoch_start_generator_state is not None else None)
+        } if loader_data_identity is not None else None)
         terminal_callback(
             TrainingTerminalState(
                 step=n_steps,

@@ -10,8 +10,11 @@ Tensors are accepted as torch or numpy; everything is detached to numpy for plot
 A registry (``register_figure``) lets a new figure slot in by name.
 """
 
+import os
+from pathlib import Path
 from types import TracebackType
 from typing import Callable, Dict, Mapping, Optional, Sequence
+from uuid import uuid4
 
 import matplotlib
 
@@ -63,9 +66,40 @@ def set_publication_style() -> None:
     })
 
 
+def _figure_target_path(path: 'str | Path') -> Path:
+    """Return Matplotlib's effective destination, including its default suffix."""
+    target = Path(path)
+    if not target.suffix:
+        default_format = str(plt.rcParams["savefig.format"]).lstrip(".")
+        target = target.with_suffix(f".{default_format}")
+    return target
+
+
+def _paths_alias(left: 'str | Path', right: 'str | Path') -> bool:
+    """Return whether two publication paths resolve to the same file or filesystem object."""
+    left_path = Path(left).expanduser().resolve(strict=False)
+    right_path = Path(right).expanduser().resolve(strict=False)
+    if left_path == right_path:
+        return True
+    try:
+        return left_path.exists() and right_path.exists() and os.path.samefile(left_path, right_path)
+    except OSError:
+        return False
+
+
 def _save(fig, path: Optional[str]):
     if path is not None:
-        fig.savefig(path)
+        target = _figure_target_path(path)
+        temporary = target.with_name(
+            f".{target.stem}.{uuid4().hex}.tmp{target.suffix}"
+        )
+        try:
+            fig.savefig(str(temporary))
+            if not temporary.is_file() or temporary.stat().st_size == 0:
+                raise RuntimeError("figure renderer did not write a nonempty temporary output")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
     return fig
 
 
@@ -2074,6 +2108,15 @@ def plot_belief_umap(
     """
     if sidecar_path is not None and not controlled:
         raise ValueError("sidecar_path is only valid for a controlled UMAP")
+    figure_target = _figure_target_path(path) if path is not None else None
+    sidecar_destination = None
+    if controlled and (sidecar_path is not None or path is not None):
+        sidecar_destination = (
+            Path(sidecar_path) if sidecar_path is not None
+            else Path(path).with_suffix(".json")
+        )
+        if figure_target is not None and _paths_alias(figure_target, sidecar_destination):
+            raise ValueError("controlled UMAP figure path must not alias its JSON sidecar path")
     feats = _belief_channel_features(bank, channel)
     X = _np(feats).astype(float)
     M = X.shape[0]
@@ -2317,19 +2360,17 @@ def plot_belief_umap(
     saved = _save(fig, path)
     publication_outcomes = {
         "figure": {
-            "path": str(path) if path is not None else None,
+            "path": str(figure_target) if figure_target is not None else None,
             "published": path is not None,
             "error": None,
         },
         "sidecar": {"path": None, "published": False, "error": None},
     }
-    if controlled and controlled_record is not None and (sidecar_path is not None or path is not None):
-        from pathlib import Path
+    if controlled and controlled_record is not None and sidecar_destination is not None:
         from vfe3.viz import embedding_comparison
-        destination = sidecar_path or str(Path(path).with_suffix(".json"))
-        publication_outcomes["sidecar"]["path"] = str(destination)
+        publication_outcomes["sidecar"]["path"] = str(sidecar_destination)
         try:
-            embedding_comparison.write_json_atomic(controlled_record, destination)
+            embedding_comparison.write_json_atomic(controlled_record, sidecar_destination)
             publication_outcomes["sidecar"]["published"] = True
         except Exception as exc:
             publication_outcomes["sidecar"]["error"] = str(exc)

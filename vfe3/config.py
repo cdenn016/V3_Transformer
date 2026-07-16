@@ -845,14 +845,24 @@ class VFE3Config:
 
     def __post_init__(self) -> None:
         # numerics
-        if self.eps <= 0.0:
-            raise ValueError(f"eps must be positive, got {self.eps}")
+        if not (math.isfinite(self.eps) and self.eps > 0.0):
+            raise ValueError(f"eps must be finite and positive, got {self.eps}")
         if not (math.isfinite(self.kl_max) and self.kl_max > 0.0):
             raise ValueError(f"kl_max must be finite and positive, got {self.kl_max}")
         if not (math.isfinite(self.rope_base) and self.rope_base > 0.0):
             raise ValueError(f"rope_base must be finite and positive, got {self.rope_base}")
         if not (math.isfinite(self.alibi_slope) and self.alibi_slope >= 0.0):
             raise ValueError(f"alibi_slope must be finite and nonnegative, got {self.alibi_slope}")
+        for name in ("mu_init_std", "phi_scale"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be >= 0 and finite, got {value}")
+        if self.pos_phi != "none" and not math.isfinite(self.pos_phi_scale):
+            raise ValueError(
+                f"pos_phi_scale must be finite when pos_phi is active, got {self.pos_phi_scale}")
+        if not math.isfinite(self.m_gauge_momentum):
+            raise ValueError(
+                f"m_gauge_momentum must be finite, got {self.m_gauge_momentum}")
         # sigma_max caps the covariance in the SPD retractions (clamp max=sigma_max); a nonfinite
         # or sub-eps cap would push the clamped covariance below eps / negative / NaN (audit
         # 2026-07-01 F2). None stays permissive (no cap).
@@ -1462,11 +1472,11 @@ class VFE3Config:
                 elif len(_v) != self.n_heads:
                     raise ValueError(
                         f"{_name} list must have length n_heads={self.n_heads}, got {len(_v)}")
-                if any(x <= 0.0 for x in _v):
-                    raise ValueError(f"{_name} entries must be > 0, got {_v}")
+                if any(not math.isfinite(x) or x <= 0.0 for x in _v):
+                    raise ValueError(f"{_name} entries must be finite and > 0, got {_v}")
             else:
-                if _v <= 0.0:
-                    raise ValueError(f"{_name} must be positive, got {_v}")
+                if not math.isfinite(_v) or _v <= 0.0:
+                    raise ValueError(f"{_name} must be finite and positive, got {_v}")
         # learnable_kappa_*: per-irrep-block learned temperatures (t5-exception family). On a
         # single-irrep-block group the per-head axis is vacuous (one scalar temperature is learned)
         # -- harmless and still valid, so warn rather than reject. The block count mirrors
@@ -1549,13 +1559,14 @@ class VFE3Config:
                 if len(_v) != self.embed_dim:
                     raise ValueError(
                         f"{name} list must have length embed_dim={self.embed_dim}, got {len(_v)}")
-                if any(x <= 0.0 for x in _v):
-                    raise ValueError(f"{name} entries must be > 0, got {_v}")
+                if any(not math.isfinite(x) or x <= 0.0 for x in _v):
+                    raise ValueError(f"{name} entries must be finite and > 0, got {_v}")
             else:
-                if _v <= 0.0:
-                    raise ValueError(f"{name} must be positive, got {_v}")
-        if self.sigma_init <= 0.0:
-            raise ValueError(f"sigma_init must be positive (log is taken), got {self.sigma_init}")
+                if not math.isfinite(_v) or _v <= 0.0:
+                    raise ValueError(f"{name} must be finite and positive, got {_v}")
+        if not math.isfinite(self.sigma_init) or self.sigma_init <= 0.0:
+            raise ValueError(
+                f"sigma_init must be positive and finite (log is taken), got {self.sigma_init}")
         for name in ("mu_init_std", "phi_scale"):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
@@ -1656,8 +1667,10 @@ class VFE3Config:
                 if len(_v) != self.embed_dim:
                     raise ValueError(
                         f"{name} list must have length embed_dim={self.embed_dim}, got {len(_v)}")
-                if any(x <= 0.0 for x in _v):
-                    raise ValueError(f"{name} entries must be > 0, got {_v}")
+                if any(not math.isfinite(x) or x <= 0.0 for x in _v):
+                    raise ValueError(f"{name} entries must be finite and > 0, got {_v}")
+            elif not math.isfinite(_v) or _v <= 0.0:
+                raise ValueError(f"{name} must be finite and positive, got {_v}")
         if lambda_h_is_per_coord(self.lambda_h_mode) and not family_is_diagonal:
             raise ValueError(
                 f"lambda_h_mode={self.lambda_h_mode!r} needs a per-coordinate hyper-prior divergence, "
@@ -1962,8 +1975,8 @@ class VFE3Config:
             )
 
         # decode / encode
-        if self.decode_tau <= 0.0:
-            raise ValueError(f"decode_tau must be positive, got {self.decode_tau}")
+        if not math.isfinite(self.decode_tau) or self.decode_tau <= 0.0:
+            raise ValueError(f"decode_tau must be finite and positive, got {self.decode_tau}")
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not the
         # static _VALID_*_MODES literals) so a newly registered kernel is config-selectable without
         # editing this validator (the add-by-registering contract, matching gauge_group / transport_mode
@@ -2132,9 +2145,11 @@ class VFE3Config:
                 UserWarning,
             )
         # precision_weighted_attention's per-key reliability -log(b0 + tr Sigma_j) needs a positive b0.
-        if self.precision_weighted_attention and self.precision_attention_b0 <= 0.0:
+        if self.precision_weighted_attention and not (
+            math.isfinite(self.precision_attention_b0) and self.precision_attention_b0 > 0.0
+        ):
             raise ValueError(
-                f"precision_attention_b0 must be positive (the b0 in the per-key reliability "
+                f"precision_attention_b0 must be finite and positive (the b0 in the per-key reliability "
                 f"-log(b0 + tr Sigma_j)), got {self.precision_attention_b0}")
         if self.precision_weighted_attention:
             import warnings
@@ -2500,21 +2515,24 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
-        if self.e_mu_q_trust is not None and self.e_mu_q_trust <= 0.0:
-            raise ValueError(f"e_mu_q_trust must be > 0 or None, got {self.e_mu_q_trust}")
+        if self.e_mu_q_trust is not None and not (
+            math.isfinite(self.e_mu_q_trust) and self.e_mu_q_trust > 0.0
+        ):
+            raise ValueError(
+                f"e_mu_q_trust must be finite and > 0 or None, got {self.e_mu_q_trust}")
         if self.mu_trust_mode not in ("box", "ball"):
             raise ValueError(f"mu_trust_mode must be 'box' or 'ball', got {self.mu_trust_mode!r}")
         if self.e_step_mu_precond not in ("fisher", "raw"):
             raise ValueError(f"e_step_mu_precond must be 'fisher' or 'raw', got {self.e_step_mu_precond!r}")
         for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "m_s_phi_lr", "weight_decay", "phi_weight_decay", "min_lr", "min_lr_frac"):
             v = getattr(self, name)
-            if v < 0.0 or v != v:                            # v != v rejects NaN (which passes < 0.0)
-                raise ValueError(f"{name} must be >= 0 (and not NaN), got {v}")
+            if not math.isfinite(v) or v < 0.0:
+                raise ValueError(f"{name} must be finite and >= 0, got {v}")
         if self.connection_weight_decay is not None and (
-                self.connection_weight_decay < 0.0
-                or self.connection_weight_decay != self.connection_weight_decay):
+                not math.isfinite(self.connection_weight_decay)
+                or self.connection_weight_decay < 0.0):
             raise ValueError(
-                f"connection_weight_decay must be >= 0 (and not NaN) or None, "
+                f"connection_weight_decay must be finite and >= 0 or None, "
                 f"got {self.connection_weight_decay}"
             )
         if self.batch_size < 1:
@@ -2597,12 +2615,15 @@ class VFE3Config:
                     UserWarning,
                     stacklevel=2,
                 )
-        if self.unigram_kappa < 0.0:
-            raise ValueError(f"unigram_kappa must be >= 0, got {self.unigram_kappa}")
-        _require(self.exp_fp64_mode, ("dim", "norm"), "exp_fp64_mode")
-        if self.exp_fp64_norm_threshold <= 0.0:
+        if not math.isfinite(self.unigram_kappa) or self.unigram_kappa < 0.0:
             raise ValueError(
-                f"exp_fp64_norm_threshold must be > 0, got {self.exp_fp64_norm_threshold}"
+                f"unigram_kappa must be finite and >= 0, got {self.unigram_kappa}")
+        _require(self.exp_fp64_mode, ("dim", "norm"), "exp_fp64_mode")
+        if (not math.isfinite(self.exp_fp64_norm_threshold)
+                or self.exp_fp64_norm_threshold <= 0.0):
+            raise ValueError(
+                "exp_fp64_norm_threshold must be finite and > 0, got "
+                f"{self.exp_fp64_norm_threshold}"
             )
         if self.randomize_e_steps:
             if type(self.e_steps_min) is not int or type(self.e_steps_max) is not int:
@@ -2619,9 +2640,11 @@ class VFE3Config:
             raise ValueError(
                 f"e_steps_backprop_last must be >= 0 (0 = OFF), got {self.e_steps_backprop_last}"
             )
-        if self.e_step_halt_tol is not None and self.e_step_halt_tol <= 0.0:
+        if self.e_step_halt_tol is not None and not (
+            math.isfinite(self.e_step_halt_tol) and self.e_step_halt_tol > 0.0
+        ):
             raise ValueError(
-                f"e_step_halt_tol must be > 0 or None, got {self.e_step_halt_tol}"
+                f"e_step_halt_tol must be finite and > 0 or None, got {self.e_step_halt_tol}"
             )
         if self.gamma_as_beta_prior:
             if self.lambda_gamma <= 0.0:
@@ -2652,13 +2675,14 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
-        if self.z_loss_weight < 0.0:
-            raise ValueError(f"z_loss_weight must be >= 0, got {self.z_loss_weight}")
-        if self.sigma_weight_decay is not None and (
-                self.sigma_weight_decay < 0.0
-                or self.sigma_weight_decay != self.sigma_weight_decay):
+        if not math.isfinite(self.z_loss_weight) or self.z_loss_weight < 0.0:
             raise ValueError(
-                f"sigma_weight_decay must be >= 0 (and not NaN) or None, "
+                f"z_loss_weight must be finite and >= 0, got {self.z_loss_weight}")
+        if self.sigma_weight_decay is not None and (
+                not math.isfinite(self.sigma_weight_decay)
+                or self.sigma_weight_decay < 0.0):
+            raise ValueError(
+                f"sigma_weight_decay must be finite and >= 0 or None, "
                 f"got {self.sigma_weight_decay}"
             )
         if self.untie_decode_bank and not self.use_prior_bank:

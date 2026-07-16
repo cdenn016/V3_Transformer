@@ -180,6 +180,14 @@ def test_run_sweep_markers_persist_requests_and_terminal_state(tmp_path: Path, m
                 "final_val_ppl": 9.0,
                 "attn_entropy": 1.0,
                 "extrap_ce": [],
+                "_loaded_data_sources": {
+                    split: {
+                        "format": "pt", "tokenizer_tag": "tiktoken",
+                        "size_bytes": len(split), "sha256": "0" * 64,
+                        "meta": None, "meta_sha256": None,
+                    }
+                    for split in ("train", "validation")
+                },
             }
         return {
             "label": label,

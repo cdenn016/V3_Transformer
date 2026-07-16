@@ -375,12 +375,23 @@ def _transport_qk(
     group:     GaugeGroup,
     query_right_phi: Optional[torch.Tensor] = None,
     key_right_phi:   Optional[torch.Tensor] = None,
+    validity_max_norm: Optional[float]      = None,
 ) -> torch.Tensor:                   # (N, N, K, K) Omega_ij = exp(phi_i^q) exp(-phi_j^k)
     r"""Mixed-frame transport for the FILTERED objective: the query frame phi_i is current
     (belief) and the key frame phi_j is frozen (keys). Reduces to ``_transport`` exactly when
     query_phi == key_phi (the global / keys-None case)."""
-    query = build_factored_transport(query_phi, group, right_phi=query_right_phi)
-    key = build_factored_transport(key_phi, group, right_phi=key_right_phi)
+    query = build_factored_transport(
+        query_phi,
+        group,
+        right_phi=query_right_phi,
+        validity_max_norm=validity_max_norm,
+    )
+    key = build_factored_transport(
+        key_phi,
+        group,
+        right_phi=key_right_phi,
+        validity_max_norm=validity_max_norm,
+    )
     if not isinstance(query, FactoredTransport) or not isinstance(key, FactoredTransport):
         raise TypeError("mixed-frame transport requires dense FactoredTransport factors")
     exp_q = query.exp_phi
@@ -443,6 +454,8 @@ def free_energy_value(
     connection_M:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii_covariant, Route B)
     connection_L:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii_link*)
     keys:                      Optional[BeliefState]  = None,   # None -> global F; else keys frozen at `keys`
+    transport_chart_max_norm:  Optional[float]        = None,   # fail-closed pre-clamp chart bound
+    transport_status:          Optional[dict]         = None,   # run-sticky covariant-feature status
 ) -> torch.Tensor:                   # scalar F
     r"""Scalar free energy of a belief. ``keys=None`` -> global F (keys = the belief);
     ``keys`` given -> F with the transported keys frozen at ``keys`` (the F_filt objective).
@@ -498,6 +511,8 @@ def free_energy_value(
             "transport_mean_per_head": transport_mean_per_head,
             "exp_fp64_mode": exp_fp64_mode,
             "exp_fp64_norm_threshold": exp_fp64_norm_threshold,
+            "validity_max_norm": transport_chart_max_norm,
+            "exactness_out": transport_status,
         }
         if compact_phi_block_transport:
             omega = build_belief_transport(
@@ -529,6 +544,7 @@ def free_energy_value(
             group,
             query_right_phi=belief.right_phi,
             key_right_phi=keys.right_phi,
+            validity_max_norm=transport_chart_max_norm,
         )
         # Filtered-transport reflection fold (phi path): the query slot carries the belief's sign s_i
         # and the KEY slot the frozen keys' sign s_j, so Omega_ij -> R_i Omega_ij R_j with independent
@@ -621,6 +637,8 @@ def phi_alignment_loss(
     connection_W: Optional[torch.Tensor] = None,      # learned regime_ii connection (held fixed here)
     connection_M: Optional[torch.Tensor] = None,      # learned regime_ii_covariant connection (Route B; held fixed here)
     connection_L: Optional[torch.Tensor] = None,      # learned regime_ii_link* direct link (held fixed here)
+    transport_chart_max_norm: Optional[float] = None, # fail-closed pre-clamp chart bound
+    transport_status:         Optional[dict]  = None, # run-sticky covariant-feature status
 ) -> torch.Tensor:
     r"""Canonical belief-coupling block as a function of phi (mu, sigma fixed), plus the
     gauge-frame penalty (manuscript Algorithm 1, line for nabla_phi F):
@@ -669,6 +687,8 @@ def phi_alignment_loss(
                                    exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                                    transport_mean_per_head=transport_mean_per_head,
                                    compact_phi_block_transport=compact_phi_block_transport,
+                                   validity_max_norm=transport_chart_max_norm,
+                                   exactness_out=transport_status,
                                    rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value)
     fam = get_family(family)
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
@@ -1073,6 +1093,8 @@ def e_step_iteration(
                 exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
                 compact_phi_block_transport=compact_phi_block_transport,
+                transport_chart_max_norm=transport_chart_max_norm,
+                transport_status=transport_status,
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]
         if grad_record is not None:                      # RAW phi-gradient norm (pre-precondition)
@@ -1088,6 +1110,38 @@ def e_step_iteration(
             mode=phi_retract_mode,
             compact_blocks=compact_phi_block_transport,
         )
+        if transport_chart_max_norm is not None:
+            # The phi objective validates the pre-step frame, but a large retraction can leave the
+            # opt-in validity chart on the final iteration. Validate the actual returned transport
+            # immediately; there may be no later iteration or diagnostic to catch it.
+            with torch.no_grad():
+                build_belief_transport(
+                    phi,
+                    group,
+                    transport_mode=transport_mode,
+                    gauge_parameterization=gauge_parameterization,
+                    omega=belief.omega,
+                    mu=mu,
+                    sigma=sigma,
+                    connection_W=connection_W,
+                    connection_M=connection_M,
+                    connection_L=connection_L,
+                    link_alpha=link_alpha,
+                    link_soft_cap=link_soft_cap,
+                    clamp_monitor=clamp_monitor,
+                    cocycle_relaxation=cocycle_relaxation,
+                    exp_fp64_mode=exp_fp64_mode,
+                    exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                    transport_mean_per_head=transport_mean_per_head,
+                    compact_phi_block_transport=compact_phi_block_transport,
+                    validity_max_norm=transport_chart_max_norm,
+                    reflection=belief.reflection,
+                    right_phi=belief.right_phi,
+                    exactness_out=transport_status,
+                    rope=rope,
+                    rope_on_cov=rope_on_cov,
+                    rope_on_value=rope_on_value,
+                )
 
     # _replace (not a fresh BeliefState): carry the untouched channels (omega frame, s/r) through the
     # rebuild. omega is the CONSTANT GL(K) frame under gauge_parameterization='omega_direct' -- the
@@ -1253,6 +1307,8 @@ def e_step(
                                      rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                                      gauge_parameterization=gauge_param_kw,
                                      compact_phi_block_transport=compact_phi_block_transport,
+                                     transport_chart_max_norm=transport_chart_max_norm,
+                                     transport_status=transport_status,
                                      **kwargs).detach()
 
     if state_record is not None:

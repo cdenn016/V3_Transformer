@@ -96,6 +96,23 @@ def test_full_retraction_float64_tiny_diagonal_tangent_matches_affine_exponentia
     torch.testing.assert_close(out, expected, rtol=0.0, atol=1e-12)
 
 
+@pytest.mark.parametrize("trust_region", [5.0, 0.0])
+def test_full_retraction_uncapped_path_retains_spd_floor(trust_region: float) -> None:
+    eps = 1e-6
+    sigma = eps * torch.eye(2).unsqueeze(0)
+    delta = -torch.eye(2).unsqueeze(0)
+
+    out = retract_spd_full(
+        sigma,
+        delta,
+        trust_region=trust_region,
+        eps=eps,
+        sigma_max=None,
+    )
+
+    assert (torch.linalg.eigvalsh(out) >= eps).all()
+
+
 # --- register_retraction / get_retraction seam (roadmap item 4) ------------
 def test_retraction_registry_round_trip():
     """register_retraction/get_retraction round-trip and the unknown-name KeyError."""

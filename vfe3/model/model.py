@@ -1269,6 +1269,8 @@ class VFEModel(nn.Module):
                 transport_mean_per_head=cfg.transport_mean_per_head,
                 rope=context.rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+                transport_chart_max_norm=cfg.transport_chart_max_norm,
+                transport_status=self._transport_status,
             )
             if cfg.lambda_h > 0.0 or cfg.lambda_gamma > 0.0:
                 s_belief = (
@@ -2029,6 +2031,8 @@ class VFEModel(nn.Module):
         hyper_prior_rows = None
         model_coupling_rows = None
         meta_entropy_rows = None
+        if s_belief is None:
+            s_belief = self.prior_bank.encode_s(token_ids)
         if cfg.lambda_h > 0.0:
             hyper_prior_rows = self._hyper_prior_weighted(
                 token_ids, s_belief=s_belief)

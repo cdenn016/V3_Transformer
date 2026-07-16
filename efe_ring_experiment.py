@@ -21,7 +21,7 @@ import time
 from dataclasses import asdict
 from numbers import Real
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -204,7 +204,7 @@ def run_checkpoint(model, cfg, device, seed):
         nb, nc, chi2, p = mcnemar(efe_correct, outs[name]["correct"])
         diff, lo, hi = bootstrap_diff_ci(efe_correct, outs[name]["correct"], alpha=cfg["alpha"])
         primaries[name] = dict(mcnemar_b=nb, mcnemar_c=nc, chi2=chi2, p=p, diff=diff, ci=[lo, hi])
-    ordered = sorted(primaries.items(), key=lambda kv: kv[1]["p"])
+    ordered = sorted(primaries.items(), key=lambda kv: (kv[1]["p"], kv[0]))
     m = len(ordered)
     holm_pass = {}
     holm_rejected = True                                      # Holm step-down: once one p fails, all higher-p fail
@@ -237,7 +237,7 @@ def run_checkpoint(model, cfg, device, seed):
 # same executable code, intact schema -- and fails closed (recomputes) on any absent/malformed/stale/
 # incompatible bundle. In-step optimizer resume is out of scope.
 
-_SEED_BUNDLE_SCHEMA_VERSION = 2
+_SEED_BUNDLE_SCHEMA_VERSION = 3
 
 
 def _semantic_experiment_config(cfg: Mapping[str, object]) -> Dict[str, object]:
@@ -284,13 +284,50 @@ def _efe_ring_code_identity(root: Optional[Path] = None) -> str:
     return digest.hexdigest()
 
 
-def _validated_complete_result(result: object, adequacy: float) -> Optional[Dict[str, object]]:
+def _runtime_identity(device: 'str | torch.device') -> Dict[str, object]:
+    """Return the determinism, framework, and canonical execution-device identity."""
+    resolved = torch.device(device)
+    index = resolved.index
+    name = None
+    if resolved.type == "cuda":
+        index = torch.cuda.current_device() if index is None else index
+        name = torch.cuda.get_device_name(index)
+    return {
+        "determinism": deterministic_state(),
+        "torch_version": str(torch.__version__),
+        "cuda_version": torch.version.cuda,
+        "device": {
+            "type":  resolved.type,
+            "index": index,
+            "name":  name,
+        },
+    }
+
+
+def _validated_seeds(value: object) -> Tuple[int, ...]:
+    """Return a nonempty unique sequence of exact nonnegative seed integers."""
+    if (not isinstance(value, Sequence) or isinstance(value, (str, bytes))
+            or len(value) == 0):
+        raise ValueError("CONFIG['seeds'] must be a non-empty sequence of unique integers")
+    seeds = tuple(value)
+    if any(type(seed) is not int or seed < 0 for seed in seeds):
+        raise ValueError("CONFIG['seeds'] must contain exact non-negative integers")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"CONFIG['seeds'] must be unique, got {seeds!r}")
+    return seeds
+
+
+def _validated_complete_result(
+    result:            object,
+    adequacy:          float,
+    experiment_config: Mapping[str, object],
+) -> Optional[Dict[str, object]]:
     """Return a safe aggregate-ready copy of one complete result, else None.
 
     Explicit so no restored mapping is indexed before validation: the top-level and result adequacy
     must agree as finite reals (never bools), ``admitted`` must be a real bool, and when admitted the
-    tuning scalars, the exact 12-arm metrics key set (each arm a finite ``success``), and a real-bool
-    ``gates["go"]`` must all be present.
+    tuning scalars, exact and bounded 12-arm metrics, multiplicity decisions, and gate booleans must
+    all be present and internally consistent.
     """
     if not isinstance(result, Mapping):
         return None
@@ -303,12 +340,36 @@ def _validated_complete_result(result: object, adequacy: float) -> Optional[Dict
     admitted_value = copied.get("admitted")
     if type(admitted_value) is not bool:
         return None
+    threshold = experiment_config.get("adequacy_threshold")
+    delta_min = experiment_config.get("delta_min")
+    alpha = experiment_config.get("alpha")
+    n_episodes = experiment_config.get("n_episodes")
+    budget = experiment_config.get("budget")
+    if (not isinstance(threshold, Real) or isinstance(threshold, bool)
+            or not math.isfinite(float(threshold))
+            or not isinstance(delta_min, Real) or isinstance(delta_min, bool)
+            or not math.isfinite(float(delta_min))
+            or not isinstance(alpha, Real) or isinstance(alpha, bool)
+            or not math.isfinite(float(alpha)) or not 0.0 < float(alpha) < 1.0
+            or type(n_episodes) is not int or n_episodes <= 0
+            or type(budget) is not int or budget <= 0):
+        return None
+    if admitted_value != (float(adequacy) >= float(threshold)):
+        return None
     if admitted_value:
         for name in ("gamma", "temp"):
             value = copied.get(name)
             if (not isinstance(value, Real) or isinstance(value, bool)
                     or not math.isfinite(float(value))):
                 return None
+        if (copied["gamma"] not in experiment_config.get("gamma_grid", ())
+                or copied["temp"] not in TEMP_GRID):
+            return None
+        dev_success = copied.get("dev_success")
+        if (not isinstance(dev_success, Real) or isinstance(dev_success, bool)
+                or not math.isfinite(float(dev_success))
+                or not 0.0 <= float(dev_success) <= 1.0):
+            return None
         metrics = copied.get("metrics")
         gates = copied.get("gates")
         expected_arms = {
@@ -316,17 +377,135 @@ def _validated_complete_result(result: object, adequacy: float) -> Optional[Dict
             "flat_pref", "p_data_control", "temp_tuned_logprob", "logprob_baseline",
             "nucleus", "typical", "greedy_ref", "random",
         }
+        expected_metric_fields = {
+            "success", "mean_steps_to_goal", "frac_at_goal", "mean_risk", "mean_ambiguity",
+        }
         if not isinstance(metrics, Mapping) or set(metrics) != expected_arms:
             return None
-        if not isinstance(gates, Mapping) or type(gates.get("go")) is not bool:
+        expected_gate_fields = {
+            "primary", "fdr_grid", "random_clearly_beaten", "closed_loop_causal", "go",
+        }
+        if not isinstance(gates, Mapping) or set(gates) != expected_gate_fields:
             return None
         for arm in metrics.values():
-            if not isinstance(arm, Mapping):
+            if not isinstance(arm, Mapping) or set(arm) != expected_metric_fields:
                 return None
-            success = arm.get("success")
-            if (not isinstance(success, Real) or isinstance(success, bool)
-                    or not math.isfinite(float(success))):
+            if any(not isinstance(value, Real) or isinstance(value, bool)
+                   or not math.isfinite(float(value)) for value in arm.values()):
                 return None
+            if (not 0.0 <= float(arm["success"]) <= 1.0
+                    or not 0.0 <= float(arm["frac_at_goal"]) <= 1.0
+                    or not 1.0 <= float(arm["mean_steps_to_goal"]) <= budget
+                    or float(arm["mean_risk"]) < 0.0
+                    or float(arm["mean_ambiguity"]) < 0.0):
+                return None
+        fdr_grid = gates.get("fdr_grid")
+        expected_fdr_arms = expected_arms - {"full_efe_tuned"}
+        if not isinstance(fdr_grid, Mapping) or set(fdr_grid) != expected_fdr_arms:
+            return None
+        fdr_p_values: Dict[str, float] = {}
+        for name, decision in fdr_grid.items():
+            if not isinstance(decision, Mapping) or set(decision) != {"p", "significant"}:
+                return None
+            p_value = decision["p"]
+            if (not isinstance(p_value, Real) or isinstance(p_value, bool)
+                    or not math.isfinite(float(p_value))
+                    or not 0.0 <= float(p_value) <= 1.0
+                    or type(decision["significant"]) is not bool):
+                return None
+            fdr_p_values[name] = float(p_value)
+        expected_fdr = bh_fdr(fdr_p_values, q=FDR_Q)
+        if any(fdr_grid[name]["significant"] != expected_fdr[name][1]
+               for name in expected_fdr_arms):
+            return None
+        primary = gates.get("primary")
+        primary_names = {"p_data_control", "temp_tuned_logprob"}
+        if not isinstance(primary, Mapping) or set(primary) != primary_names:
+            return None
+        primary_stats: Dict[str, Dict[str, object]] = {}
+        for name in sorted(primary_names):
+            gate = primary[name]
+            required = {"mcnemar_b", "mcnemar_c", "chi2", "p", "diff", "ci", "holm_pass"}
+            if not isinstance(gate, Mapping) or set(gate) != required:
+                return None
+            if (type(gate["mcnemar_b"]) is not int or gate["mcnemar_b"] < 0
+                    or type(gate["mcnemar_c"]) is not int or gate["mcnemar_c"] < 0
+                    or not isinstance(gate["chi2"], Real) or isinstance(gate["chi2"], bool)
+                    or not math.isfinite(float(gate["chi2"])) or float(gate["chi2"]) < 0.0
+                    or not isinstance(gate["p"], Real) or isinstance(gate["p"], bool)
+                    or not math.isfinite(float(gate["p"])) or not 0.0 <= float(gate["p"]) <= 1.0
+                    or not isinstance(gate["diff"], Real) or isinstance(gate["diff"], bool)
+                    or not math.isfinite(float(gate["diff"]))
+                    or not -1.0 <= float(gate["diff"]) <= 1.0
+                    or type(gate["holm_pass"]) is not bool):
+                return None
+            ci = gate["ci"]
+            if (not isinstance(ci, (list, tuple)) or len(ci) != 2
+                    or any(not isinstance(value, Real) or isinstance(value, bool)
+                           or not math.isfinite(float(value))
+                           or not -1.0 <= float(value) <= 1.0 for value in ci)
+                    or float(ci[0]) > float(ci[1])):
+                return None
+            b_count = gate["mcnemar_b"]
+            c_count = gate["mcnemar_c"]
+            discordant = b_count + c_count
+            if discordant > n_episodes:
+                return None
+            expected_diff = (b_count - c_count) / n_episodes
+            metric_diff = (
+                float(metrics["full_efe_tuned"]["success"])
+                - float(metrics[name]["success"])
+            )
+            if (not math.isclose(float(gate["diff"]), expected_diff, abs_tol=1e-7, rel_tol=0.0)
+                    or not math.isclose(metric_diff, expected_diff, abs_tol=1e-7, rel_tol=0.0)):
+                return None
+            expected_chi2 = (
+                0.0 if discordant == 0
+                else (abs(b_count - c_count) - 1) ** 2 / discordant
+            )
+            expected_p = (
+                1.0 if discordant == 0
+                else math.erfc(math.sqrt(expected_chi2 / 2.0))
+            )
+            if (not math.isclose(float(gate["chi2"]), expected_chi2, abs_tol=1e-12, rel_tol=1e-12)
+                    or not math.isclose(float(gate["p"]), expected_p,
+                                        abs_tol=1e-12, rel_tol=1e-12)):
+                return None
+            primary_stats[name] = dict(gate)
+        expected_primary_passes: Dict[str, bool] = {}
+        holm_rejected = True
+        ordered_primary = sorted(
+            primary_stats.items(), key=lambda item: (float(item[1]["p"]), item[0]))
+        for rank, (name, gate) in enumerate(ordered_primary):
+            holm_rejected = bool(
+                holm_rejected
+                and float(gate["p"]) < float(alpha) / (len(ordered_primary) - rank)
+            )
+            expected_primary_passes[name] = bool(
+                holm_rejected and float(gate["diff"]) > float(delta_min))
+            if gate["holm_pass"] != expected_primary_passes[name]:
+                return None
+            if not math.isclose(
+                fdr_p_values[name], float(gate["p"]), abs_tol=1e-12, rel_tol=1e-12,
+            ):
+                return None
+        random_expected = (
+            float(metrics["full_efe_tuned"]["success"])
+            - float(metrics["random"]["success"]) > float(delta_min)
+        )
+        if (type(gates.get("random_clearly_beaten")) is not bool
+                or gates["random_clearly_beaten"] != random_expected
+                or type(gates.get("closed_loop_causal")) is not bool
+                or gates["closed_loop_causal"] != bool(rt.closed_loop_causality_holds())
+                or type(gates.get("go")) is not bool):
+            return None
+        expected_go = bool(
+            all(expected_primary_passes.values())
+            and random_expected
+            and gates["closed_loop_causal"]
+        )
+        if gates["go"] != expected_go:
+            return None
     return copied
 
 
@@ -347,12 +526,13 @@ def _save_seed_bundle(
     so the trained and complete states are each independently publishable and a
     crash never leaves a truncated ``.pt`` at the final name.
     """
+    seed = _validated_seeds((seed,))[0]
     semantic     = dict(experiment_config)
     model_config = asdict(model.cfg)
     bundle = {
         "schema_version":              _SEED_BUNDLE_SCHEMA_VERSION,
         "status":                      status,
-        "seed":                        int(seed),
+        "seed":                        seed,
         "semantic_config":             semantic,
         "semantic_config_fingerprint": semantic_config_fingerprint(semantic),
         "code_identity_sha256":        _efe_ring_code_identity(),
@@ -361,7 +541,7 @@ def _save_seed_bundle(
         "model_state":                 model.state_dict(),
         "adequacy":                    float(adequacy),
         "result":                      (dict(result) if result is not None else None),
-        "runtime_state":               deterministic_state(),
+        "runtime_state":               _runtime_identity(next(model.parameters()).device),
     }
     with _unique_sibling_temp(path) as tmp:
         torch.save(bundle, tmp)
@@ -386,6 +566,7 @@ def _load_seed_bundle_if_current(
     schema/state-dict failures are caught, logged, and turned into None (the state machine then
     recomputes); programming errors surface.
     """
+    seed = _validated_seeds((seed,))[0]
     if not path.is_file():
         return None
     try:
@@ -397,11 +578,13 @@ def _load_seed_bundle_if_current(
         runtime_state = bundle.get("runtime_state")
         if not isinstance(runtime_state, Mapping):
             raise RuntimeError("runtime_state is not a mapping")
+        if dict(runtime_state) != _runtime_identity(device):
+            raise RuntimeError("runtime or execution-device identity drift")
         status = bundle.get("status")
         if status not in ("trained", "complete"):
             raise RuntimeError(f"status {status!r} is neither 'trained' nor 'complete'")
-        if bundle.get("seed") != int(seed):
-            raise RuntimeError(f"bundle seed {bundle.get('seed')!r} != requested {int(seed)}")
+        if bundle.get("seed") != seed:
+            raise RuntimeError(f"bundle seed {bundle.get('seed')!r} != requested {seed}")
         if bundle.get("semantic_config_fingerprint") != semantic_config_fingerprint(dict(experiment_config)):
             raise RuntimeError("semantic experiment config drift")
         if bundle.get("code_identity_sha256") != _efe_ring_code_identity():
@@ -417,7 +600,7 @@ def _load_seed_bundle_if_current(
                 raise RuntimeError("a trained bundle must not carry a result")
             validated_result = None
         else:
-            validated_result = _validated_complete_result(result, adequacy)
+            validated_result = _validated_complete_result(result, adequacy, experiment_config)
             if validated_result is None:
                 raise RuntimeError("complete-result schema validation failed")
         model_config = bundle.get("model_config")
@@ -441,8 +624,9 @@ def _load_seed_bundle_if_current(
 
 def main():
     cfg = CONFIG
+    seeds = _validated_seeds(cfg.get("seeds"))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device}  | sealed run: {cfg['seeds']} seeds x {cfg['steps']} steps, "
+    print(f"device={device}  | sealed run: {seeds} seeds x {cfg['steps']} steps, "
           f"{cfg['n_episodes']} test episodes/arm")
     if device.type == "cpu":
         print("WARNING: running on CPU; the iterative E-step makes this very slow. Run on the GPU.")
@@ -457,9 +641,9 @@ def main():
     semantic_cfg = _semantic_experiment_config(cfg)
     admitted = []
 
-    for seed in cfg["seeds"]:
-        seed_everything(int(seed), deterministic=bool(cfg["deterministic"]))
-        seed_path = seed_dir / f"seed_{int(seed)}.pt"
+    for seed in seeds:
+        seed_everything(seed, deterministic=bool(cfg["deterministic"]))
+        seed_path = seed_dir / f"seed_{seed}.pt"
         bundle = (_load_seed_bundle_if_current(seed_path, semantic_cfg, device, seed=seed)
                   if cfg["resume"] else None)
         if bundle is not None and bundle[1]["status"] == "complete":
@@ -507,7 +691,7 @@ def main():
             admitted.append(seed)
         results["checkpoints"][str(seed)] = entry
 
-    results["runtime_state"] = deterministic_state()
+    results["runtime_state"] = _runtime_identity(device)
 
     # cross-seed aggregate + overall go/no-go (all admitted seeds must individually pass)
     if admitted:

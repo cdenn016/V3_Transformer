@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
+from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
 
@@ -45,6 +47,12 @@ def _direct_batches() -> list[tuple[torch.Tensor, torch.Tensor]]:
     tokens = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long)
     targets = torch.tensor([[1, 2, 3, 4], [2, 3, 4, 5]], dtype=torch.long)
     return [(tokens, targets)]
+
+
+def _resumable_batches() -> DataLoader:
+    stream = torch.tensor([0, 1, 2, 3, 4, 1, 2, 3, 4, 5], dtype=torch.long)
+    dataset = TokenWindows(stream, 4, stride=5)
+    return DataLoader(dataset, batch_size=2, shuffle=False, drop_last=True)
 
 
 def test_cpu_timer_aggregates_and_resets_windows() -> None:
@@ -210,12 +218,12 @@ def test_train_timing_attributes_callbacks_to_triggering_pipeline_window(
 
     train_module.train(
         model,
-        _direct_batches(),
+        _resumable_batches(),
         cfg,
         n_steps=2,
         log_interval=1,
         eval_interval=1,
-        val_loader=_direct_batches(),
+        val_loader=_resumable_batches(),
         device=torch.device("cpu"),
         artifacts=artifacts,
         generate_samples=False,

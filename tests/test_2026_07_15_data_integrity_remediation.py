@@ -27,7 +27,7 @@ from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows, cache_path, cached_token_count, load_cached_tokens
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts, load_checkpoint
-from vfe3.train import build_optimizer, evaluate, train
+from vfe3.train import _loader_data_identity, build_optimizer, evaluate, train
 
 
 _DATASET = "wiki-en"
@@ -117,6 +117,91 @@ def test_binary_cache_requires_sidecar_before_mapping(
         load_cached_tokens(_DATASET, "train", cache_dir=tmp_path)
 
 
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, "2"])
+def test_load_cached_tokens_rejects_invalid_limit_before_cache_read(
+    tmp_path:   Path,
+    limit:      object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = cache_path(_DATASET, "train", suffix="pt", cache_dir=tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    monkeypatch.setattr(
+        datasets_mod.torch,
+        "load",
+        lambda *args, **kwargs: pytest.fail("invalid limit reached the cache reader"),
+    )
+    with pytest.raises((TypeError, ValueError), match="limit.*positive plain integer"):
+        load_cached_tokens(_DATASET, "train", cache_dir=tmp_path, limit=limit)
+
+
+@pytest.mark.parametrize("max_tokens", [0, -1, True, 1.5, "2"])
+def test_make_dataloader_rejects_invalid_max_tokens_before_cache_read(
+    max_tokens: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        datasets_mod,
+        "_load_identity_bound_tokens",
+        lambda *args, **kwargs: pytest.fail("invalid max_tokens reached the cache reader"),
+    )
+    with pytest.raises((TypeError, ValueError), match="max_tokens.*positive plain integer"):
+        datasets_mod.make_dataloader(
+            _DATASET,
+            "train",
+            2,
+            1,
+            max_tokens=max_tokens,
+        )
+
+
+def test_make_dataloader_persists_exact_validated_max_tokens(tmp_path: Path) -> None:
+    path = cache_path(_DATASET, "train", suffix="pt", cache_dir=tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.arange(8, dtype=torch.int32), path)
+
+    loader = datasets_mod.make_dataloader(
+        _DATASET,
+        "train",
+        2,
+        1,
+        shuffle=False,
+        drop_last=True,
+        cache_dir=tmp_path,
+        max_tokens=5,
+    )
+
+    assert loader.dataset.data_identity["max_tokens"] == 5
+    assert loader.dataset.tokens.tolist() == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("declared_dtype", (None, "<i4"))
+def test_binary_identity_canonicalizes_accepted_dtype_spellings(
+    tmp_path:       Path,
+    declared_dtype: str | None,
+) -> None:
+    path = _write_bin_cache(tmp_path, range(12), dtype="int32")
+    metadata = {"n_tokens": 12}
+    if declared_dtype is not None:
+        metadata["dtype"] = declared_dtype
+    Path(str(path) + ".meta.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    loader = datasets_mod.make_dataloader(
+        _DATASET,
+        "train",
+        3,
+        1,
+        shuffle=False,
+        drop_last=True,
+        cache_dir=tmp_path,
+        vocab_size=100277,
+    )
+    identity = _loader_data_identity(loader, 100277)
+
+    assert identity["source"]["meta"]["dtype"] == "int32"
+    assert artifacts_mod._normalized_data_identity(identity) == identity
+
+
 def test_padded_final_evaluation_window_emits_every_transition_once() -> None:
     tokens = torch.arange(10, dtype=torch.long)
     windows = TokenWindows(tokens, seq_len=4, stride=4, pad_final=True)
@@ -142,6 +227,39 @@ class _ConstantCEModel(torch.nn.Module):
     ) -> Tuple[None, None, torch.Tensor]:
         del tokens, targets
         return None, None, self.anchor * 0.0 + self.ce
+
+
+class _NoncausalContextCEModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+        self.prior_bank = type("PriorBankStub", (), {"mu_embed": self.anchor})()
+        self.call_shapes: List[Tuple[int, ...]] = []
+
+    def forward(
+        self,
+        tokens:  torch.Tensor,
+        targets: torch.Tensor,
+    ) -> Tuple[None, None, torch.Tensor]:
+        self.call_shapes.append(tuple(tokens.shape))
+        valid = targets != -100
+        context = tokens.to(torch.float32).mean(dim=-1, keepdim=True)
+        ce = context.expand_as(targets)[valid].mean()
+        return None, None, self.anchor * 0.0 + ce
+
+
+def test_evaluate_slices_trailing_padding_before_noncausal_model_calls() -> None:
+    model = _NoncausalContextCEModel()
+    batch = (
+        torch.tensor([[1, 2, 3, 4], [5, 6, 0, 0]], dtype=torch.long),
+        torch.tensor([[2, 3, 4, 5], [6, 7, -100, -100]], dtype=torch.long),
+    )
+
+    metrics = evaluate(model, [batch], tokens_per_char=None)
+
+    expected_ce = (4 * 2.5 + 2 * 5.5) / 6
+    assert metrics["ce"] == pytest.approx(expected_ce)
+    assert sorted(model.call_shapes) == [(1, 2), (1, 4)]
 
 
 def test_evaluate_marks_bpc_unavailable_and_names_bits_per_token() -> None:
@@ -199,10 +317,11 @@ def test_scaling_preserves_unavailable_character_normalization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cfg = SimpleNamespace(
+    cfg = VFE3Config(
         seed=3, embed_dim=4, n_heads=2, gauge_group="block_glk", max_steps=1,
         max_seq_len=4, batch_size=1, vocab_size=8, grad_clip=1.0,
         log_interval=1, eval_interval=1, deterministic=False,
+        use_prior_bank=False, use_head_mixer=False,
     )
     captured: Dict[str, object] = {}
 
@@ -238,6 +357,7 @@ def test_scaling_preserves_unavailable_character_normalization(
         )
         metrics = evaluate(_ConstantCEModel(math.log(2.0)), [batch], tokens_per_char=None)
         captured["published"] = metrics
+        (tmp_path / "run" / "summary.json").write_text("{}", encoding="utf-8")
         return {
             "test_ce":             metrics["ce"],
             "test_ppl":            metrics["ppl"],
@@ -274,11 +394,17 @@ def test_cached_scaling_harvest_preserves_named_bit_metrics(
 ) -> None:
     run_dir = tmp_path / "cached"
     run_dir.mkdir()
+    test_ce = 1.25 * math.log(2.0)
+    test_ppl = math.exp(test_ce)
     (run_dir / "summary.json").write_text(json.dumps({
+        "test_ce":             test_ce,
+        "test_ppl":            test_ppl,
         "test_bits_per_token": 1.25,
         "test_bpc":            None,
+        "n_params":            2,
         "scaling_point": {
-            "test_ce":             math.log(2.0),
+            "test_ce":             test_ce,
+            "test_ppl":            test_ppl,
             "test_bits_per_token": 1.25,
             "test_bpc":            None,
             "n_params":            2,
@@ -331,23 +457,55 @@ def test_scaling_analysis_and_multiseed_publish_named_bit_metrics(tmp_path: Path
 
     run_dir = tmp_path / "route" / "cell" / "s1"
     run_dir.mkdir(parents=True)
+    config = {"seed": 1}
+    code_identity = {
+        "git_sha": "a" * 40,
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
+    sources = {
+        split: {
+            "format": "pt",
+            "size_bytes": len(split),
+            "sha256": split[0] * 64,
+        }
+        for split in ("train", "validation", "test")
+    }
+    cell = {
+        "schema_version": 2,
+        "route": "route",
+        "label": "cell",
+        "scale_knob": "embed_dim",
+        "seed": 1,
+        "dataset": "synthetic",
+        "config_sha256": scaling_analysis._canonical_json_sha256(config),
+        "code_identity": code_identity,
+        "data_sources": sources,
+    }
+    reuse_digest = scaling_analysis._canonical_json_sha256(cell)
+    cell["reuse_contract_sha256"] = reuse_digest
+    test_ce = 1.5 * math.log(2.0)
+    metrics = {
+        "n_params": 10,
+        "test_ce": test_ce,
+        "test_ppl": math.exp(test_ce),
+        "test_bits_per_token": 1.5,
+        "test_bpc": None,
+    }
     (run_dir / "summary.json").write_text(json.dumps({
-        "n_params":             10,
-        "test_bits_per_token": 1.5,
-        "test_bpc":            None,
-        "scaling_point":       {"test_ce": math.log(2.0), "n_params": 10},
+        **metrics,
+        "scaling_point": {**metrics},
+        "scaling_reuse_contract_sha256": reuse_digest,
     }), encoding="utf-8")
-    (run_dir / "test_results.json").write_text(json.dumps({
-        "test_ce":             math.log(2.0),
-        "test_ppl":            2.0,
-        "test_bits_per_token": 1.5,
-        "test_bpc":            None,
+    (run_dir / "scaling_cell.json").write_text(json.dumps(cell), encoding="utf-8")
+    (run_dir / "config.json").write_text(json.dumps({
+        "dataset": "synthetic",
+        "config": config,
     }), encoding="utf-8")
-    (run_dir / "scaling_cell.json").write_text(json.dumps({
-        "route": "route", "label": "cell", "scale_knob": 1,
+    (run_dir / "provenance.json").write_text(json.dumps({
+        "seed": 1,
+        **code_identity,
     }), encoding="utf-8")
-    (run_dir / "config.json").write_text(json.dumps({"config": {}}), encoding="utf-8")
-    (run_dir / "provenance.json").write_text(json.dumps({"seed": 1}), encoding="utf-8")
 
     rows = scaling_analysis.harvest(tmp_path)
     assert rows[0]["test_bits_per_token"] == pytest.approx(1.5)
@@ -533,7 +691,7 @@ def _checkpoint_cfg() -> VFE3Config:
 
 def _data_identity() -> Dict[str, object]:
     return {
-        "schema_version":       1,
+        "schema_version":       2,
         "dataset":              _DATASET,
         "split":                "train",
         "tokenizer_tag":        "tiktoken_cl100k",
@@ -541,6 +699,18 @@ def _data_identity() -> Dict[str, object]:
         "tokenizer_vocab_size": 100277,
         "model_vocab_size":     16,
         "max_tokens":           4,
+        "iterator": {
+            "dataset_type":        "vfe3.data.datasets.TokenWindows",
+            "seq_len":             4,
+            "stride":              4,
+            "pad_final":           False,
+            "n_windows":           1,
+            "batch_size":          1,
+            "drop_last":           True,
+            "sampler":             "random",
+            "sampler_replacement": False,
+            "sampler_num_samples": 1,
+        },
         "source": {
             "format":        "bin",
             "tokenizer_tag": "tiktoken_cl100k",
@@ -554,7 +724,7 @@ def _data_identity() -> Dict[str, object]:
 
 _DELETE = object()
 _INVALID_IDENTITY_SCHEMA_CASES = [
-    pytest.param(("schema_version",), 2, id="unsupported-schema-version"),
+    pytest.param(("schema_version",), 3, id="unsupported-schema-version"),
     pytest.param(("tokenizer_tag",), "contradictory-tokenizer", id="top-tokenizer-contradiction"),
     pytest.param(
         ("source", "tokenizer_tag"),
@@ -572,6 +742,10 @@ _INVALID_IDENTITY_SCHEMA_CASES = [
     pytest.param(("source", "format"), "", id="empty-source-format"),
     pytest.param(("source", "sha256"), "", id="empty-content-digest"),
     pytest.param(("source", "size_bytes"), 15, id="inexact-binary-byte-identity"),
+    pytest.param(("iterator",), _DELETE, id="missing-iterator-contract"),
+    pytest.param(("iterator", "batch_size"), 0, id="invalid-iterator-batch-size"),
+    pytest.param(("iterator", "drop_last"), 1, id="invalid-iterator-drop-last"),
+    pytest.param(("iterator", "sampler"), "custom", id="unsupported-iterator-sampler"),
 ]
 
 
@@ -668,6 +842,9 @@ _VALID_IDENTITY_MISMATCH_CASES = [
     "binary-n-tokens",
     "binary-dtype",
     "metadata-digest",
+    "iterator-sequence-length",
+    "iterator-batch-size",
+    "iterator-sampler",
 ]
 
 
@@ -718,6 +895,13 @@ def _schema_valid_identity_mismatch(case: str) -> Dict[str, object]:
         source["meta_sha256"] = "c" * 64
     elif case == "metadata-digest":
         source["meta_sha256"] = "c" * 64
+    elif case == "iterator-sequence-length":
+        identity["iterator"]["seq_len"] = 8
+    elif case == "iterator-batch-size":
+        identity["iterator"]["batch_size"] = 2
+    elif case == "iterator-sampler":
+        identity["iterator"]["sampler"] = "sequential"
+        identity["iterator"]["sampler_replacement"] = None
     else:
         raise AssertionError(f"unknown identity mismatch case {case!r}")
     return identity

@@ -50,6 +50,21 @@ def test_diagonal_sigma_closed_form_is_A_squared():
     assert torch.allclose(sigma2, torch.tensor([[[5.0, 3.0]]]))
 
 
+def test_laplace_zero_mixer_row_uses_finite_zero_norm_subgradient():
+    mix = HeadMixer([1, 1], family="laplace_diagonal")
+    with torch.no_grad():
+        mix.mixer_delta.copy_(torch.tensor([[-1.0, 0.0], [0.0, 0.0]]))
+    dispersion = torch.tensor([[[2.0, 3.0]]], requires_grad=True)
+
+    mu_out, dispersion_out = mix(torch.tensor([[[1.0, 2.0]]]), dispersion)
+    (mu_out.sum() + dispersion_out.sum()).backward()
+
+    assert torch.equal(mu_out, torch.tensor([[[0.0, 2.0]]]))
+    assert torch.equal(dispersion_out, torch.tensor([[[0.0, 3.0]]]))
+    assert torch.equal(mix.mixer_delta.grad, torch.tensor([[1.0, 2.0], [1.0, 5.0]]))
+    assert torch.equal(dispersion.grad, torch.tensor([[[0.0, 1.0]]]))
+
+
 def test_full_cov_sandwich_matches_explicit_kron():
     torch.manual_seed(0)
     n, d = 2, 2

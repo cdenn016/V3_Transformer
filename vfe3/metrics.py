@@ -1310,7 +1310,7 @@ def curvature_field(
         o_ja = exp_blocks @ inv_blocks[anchor]
         h = o_ai[:, None] @ o_ij @ o_ja[None, :]
         eye = torch.eye(omega.block_dim, device=omega.device, dtype=omega.dtype)
-        return (h - eye).square().sum(dim=(-3, -2, -1)).sqrt()
+        return torch.linalg.vector_norm(h - eye, dim=(-3, -2, -1))
     k = omega.shape[-1]
     eye = torch.eye(k, device=omega.device, dtype=omega.dtype)
     o_ai = omega[anchor].unsqueeze(1)                            # (N, 1, K, K) Omega_{a, i} (over i)

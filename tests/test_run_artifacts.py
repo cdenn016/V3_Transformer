@@ -166,7 +166,13 @@ def test_best_model_bundle_embeds_semantic_config_fingerprint(tmp_path):
     assert art.maybe_save_best(1, model, 5.0) is True
     bundle = torch.load(art.best_path, weights_only=True)
 
-    assert set(bundle) == {"model_state", "config", "config_fingerprint"}
+    assert set(bundle) == {
+        "model_state", "config", "config_fingerprint", "code_identity_sha256",
+        "selection_data_identity",
+    }
+    assert isinstance(bundle["code_identity_sha256"], str)
+    assert len(bundle["code_identity_sha256"]) == 64
+    assert bundle["selection_data_identity"] is None
     assert bundle["config"] == asdict(cfg)
     assert bundle["config"]["grad_clip"] == cfg.grad_clip
     expected = hashlib.sha256(json.dumps(

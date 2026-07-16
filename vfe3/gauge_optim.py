@@ -530,6 +530,7 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
             lr = omega_group["lr"]
             mode = getattr(self, "_omega_retract_mode", "lie_exp")
             pending_updates = []
+            pending_zero_gradients = []
             for p in omega_group["params"]:
                 if p.grad is None:
                     continue
@@ -539,6 +540,9 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 tied_compact = U.dim() == 3 and U.shape[-1] < K_full
                 act = E.reshape(E.shape[0], -1).abs().sum(dim=-1) > 0
                 Ua, Ea = U[act], E[act]
+                if Ua.shape[0] == 0:
+                    pending_zero_gradients.append(p)
+                    continue
                 omega_validation_failures.append(_omega_validation_failure(Ua))
                 if untied_compact or tied_compact:
                     d = Ua.shape[-1]
@@ -565,7 +569,7 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 if collect:
                     omega_validation_failures.append(_omega_determinant_failure(Ur))
                 pending_updates.append((p, U, act, Ur, untied_compact, tied_compact))
-            omega_plans[id(omega_group)] = pending_updates
+            omega_plans[id(omega_group)] = (pending_updates, pending_zero_gradients)
 
         if (omega_validation_failures
                 and bool(torch.stack(omega_validation_failures).any())):
@@ -586,7 +590,7 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 # block-diagonal gl(K) step restricted to the blocks (the gl(K) generators have disjoint
                 # block support). Detecting tied by dim ALONE mis-routes (V,d,d) to the full path and
                 # crashes extract_phi with an einsum size mismatch -- hence the d < K test.
-                pending_updates = omega_plans[id(group)]
+                pending_updates, pending_zero_gradients = omega_plans[id(group)]
 
                 for p, U, act, Ur, untied_compact, tied_compact in pending_updates:
                     U[act] = Ur                                        # U <- U retr(-lr xi), after validation
@@ -610,6 +614,8 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                         else:
                             omega_cond_acc.append(_omega_condition_values(updated).reshape(-1))
                     p.grad = None                                      # consumed: AdamW no-ops on it
+                for p in pending_zero_gradients:
+                    p.grad = None                                      # zero gradient is still consumed
                 continue
             if not group.get("gauge", False):
                 continue

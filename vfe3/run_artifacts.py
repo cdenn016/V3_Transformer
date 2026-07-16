@@ -35,6 +35,8 @@ import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, fields
+from functools import lru_cache
+from numbers import Real
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
@@ -51,12 +53,12 @@ if TYPE_CHECKING:                                        # forward ref only: tra
 
 def _require_nonnegative_int(value: object, field: str) -> int:
     """Return an exact nonnegative integer cursor; reject coercible lookalikes."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         raise ValueError(f"data_state {field} must be a non-negative integer")
     return value
 
 
-_DATA_IDENTITY_SCHEMA_VERSION = 1
+_DATA_IDENTITY_SCHEMA_VERSION = 2
 _DATA_IDENTITY_FIELDS = {
     "schema_version",
     "dataset",
@@ -67,6 +69,7 @@ _DATA_IDENTITY_FIELDS = {
     "model_vocab_size",
     "max_tokens",
     "source",
+    "iterator",
 }
 _DATA_SOURCE_IDENTITY_FIELDS = {
     "format",
@@ -86,6 +89,18 @@ _BINARY_TOKEN_DTYPE_BYTES = {
 _TENSOR_TOKEN_DTYPE_BYTES = {
     f"torch.{name}": itemsize for name, itemsize in _BINARY_TOKEN_DTYPE_BYTES.items()
 }
+_DATA_ITERATOR_IDENTITY_FIELDS = {
+    "dataset_type",
+    "seq_len",
+    "stride",
+    "pad_final",
+    "n_windows",
+    "batch_size",
+    "drop_last",
+    "sampler",
+    "sampler_replacement",
+    "sampler_num_samples",
+}
 
 
 def _require_identity_sha256(value: object, field: str) -> str:
@@ -93,6 +108,35 @@ def _require_identity_sha256(value: object, field: str) -> str:
             or any(character not in "0123456789abcdefABCDEF" for character in value)):
         raise ValueError(f"data_state data_identity {field} must be a 64-digit SHA-256 hex digest")
     return value
+
+
+@lru_cache(maxsize=1)
+def _package_code_identity() -> str:
+    r"""Return one process-cached content identity for every executable ``vfe3/**/*.py`` source.
+
+    A run captures this digest once when its artifact owner is constructed. Generated files, tests,
+    documentation, Git metadata, and output directories are excluded, so artifact publication cannot
+    change the identity. New Python processes naturally recompute it after a source edit.
+    """
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    sources = sorted(
+        path for path in root.rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
+    if not sources:
+        raise RuntimeError("training code identity found no vfe3 Python sources")
+    for path in sources:
+        relative = path.relative_to(root.parent).as_posix().encode("utf-8")
+        try:
+            content = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        except OSError as exc:
+            raise RuntimeError(
+                f"training code identity cannot read {path.relative_to(root.parent)!s}") from exc
+        for payload in (relative, content):
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+    return digest.hexdigest()
 
 
 def _require_identity_positive_int(value: object, field: str) -> int:
@@ -143,6 +187,34 @@ def _normalized_data_identity(
     max_tokens = normalized.get("max_tokens")
     if max_tokens is not None:
         _require_identity_positive_int(max_tokens, "max_tokens")
+
+    iterator = normalized.get("iterator")
+    if not isinstance(iterator, dict):
+        raise ValueError("data_state data_identity iterator must be a mapping")
+    missing_iterator = sorted(_DATA_ITERATOR_IDENTITY_FIELDS - iterator.keys())
+    if missing_iterator:
+        raise ValueError(
+            f"data_state data_identity iterator is missing required field(s) {missing_iterator}")
+    if not isinstance(iterator.get("dataset_type"), str) or not iterator["dataset_type"]:
+        raise ValueError(
+            "data_state data_identity iterator dataset_type must be a nonempty string")
+    for field in ("seq_len", "stride", "n_windows", "batch_size", "sampler_num_samples"):
+        _require_identity_positive_int(iterator.get(field), f"iterator {field}")
+    for field in ("pad_final", "drop_last"):
+        if not isinstance(iterator.get(field), bool):
+            raise ValueError(f"data_state data_identity iterator {field} must be a boolean")
+    sampler = iterator.get("sampler")
+    replacement = iterator.get("sampler_replacement")
+    if sampler not in {"random", "sequential"}:
+        raise ValueError(
+            "data_state data_identity iterator sampler must be 'random' or 'sequential'")
+    if sampler == "random":
+        if not isinstance(replacement, bool):
+            raise ValueError(
+                "data_state data_identity iterator random sampler replacement must be a boolean")
+    elif replacement is not None:
+        raise ValueError(
+            "data_state data_identity iterator sequential sampler replacement must be null")
 
     source = normalized.get("source")
     if not isinstance(source, dict):
@@ -366,8 +438,9 @@ def _selection_semantic_config(
     r"""Project a config down to the fields that determine the SELECTED weights.
 
     Model selection depends on architecture, family/transport/decode, optimizer/schedule, and every
-    objective weight -- but NOT on resume bookkeeping (``resume_from``) or output cadence
-    (``log_interval``, ``checkpoint_interval``, ``generate_figures``). Comparing this projection lets
+    objective weight -- but NOT on resume bookkeeping/policy (``resume_from``,
+    ``trust_resume_checkpoint``) or output cadence (``log_interval``, ``checkpoint_interval``,
+    ``generate_figures``). Comparing this projection lets
     a cross-run resume carry otherwise-identical selected weights even when the resumed run changed
     its resume path or figure/log cadence, while every architecture/objective difference still
     invalidates the bundle.
@@ -392,9 +465,93 @@ def _selection_semantic_config(
     else:
         raise TypeError(
             f"_selection_semantic_config expects a VFE3Config or mapping, got {type(config).__name__}")
-    for key in ("resume_from", "log_interval", "checkpoint_interval", "generate_figures"):
+    for key in (
+        "resume_from",
+        "trust_resume_checkpoint",
+        "log_interval",
+        "checkpoint_interval",
+        "generate_figures",
+    ):
         normalized.pop(key, None)
     return normalized
+
+
+def _validate_best_model_mapping(
+    bundle:               object,
+    cfg:                  Optional[VFE3Config],
+    expected_model_state: Mapping[str, torch.Tensor],
+    context:              str,
+) -> Dict[str, object]:
+    """Validate an already-loaded selected-weights mapping without mutating live state."""
+    legacy_fields = {"model_state", "config", "config_fingerprint"}
+    current_fields = legacy_fields | {"code_identity_sha256", "selection_data_identity"}
+    if not isinstance(bundle, Mapping) or set(bundle) not in (legacy_fields, current_fields):
+        raise RuntimeError(f"{context} is not a semantic best-model mapping")
+    saved_config = bundle["config"]
+    if not isinstance(saved_config, Mapping):
+        raise RuntimeError(f"{context} has a non-mapping config")
+    if bundle["config_fingerprint"] != semantic_config_fingerprint(saved_config):
+        raise RuntimeError(f"{context} has a config fingerprint mismatch")
+    if (cfg is not None
+            and semantic_config_fingerprint(_selection_semantic_config(saved_config))
+            != semantic_config_fingerprint(_selection_semantic_config(cfg))):
+        raise RuntimeError(f"{context} does not match the active selection config")
+    saved_state = bundle["model_state"]
+    if not isinstance(saved_state, Mapping):
+        raise RuntimeError(f"{context} has a non-mapping model_state")
+    if set(saved_state) != set(expected_model_state):
+        raise RuntimeError(f"{context} model_state keys do not match the live model")
+    for key, expected in expected_model_state.items():
+        actual = saved_state[key]
+        if not isinstance(actual, torch.Tensor):
+            raise RuntimeError(f"{context} entry {key!r} is not a tensor")
+        if (actual.shape != expected.shape or actual.dtype != expected.dtype
+                or actual.layout != expected.layout):
+            raise RuntimeError(
+                f"{context} entry {key!r} has an incompatible shape/dtype/layout")
+    validated = dict(bundle)
+    if set(bundle) == current_fields:
+        code_identity = bundle["code_identity_sha256"]
+        if (not isinstance(code_identity, str) or len(code_identity) != 64
+                or any(character not in "0123456789abcdef" for character in code_identity)):
+            raise RuntimeError(f"{context} has an invalid executable-code identity")
+        selection_identity = bundle["selection_data_identity"]
+        if selection_identity is not None:
+            try:
+                validated["selection_data_identity"] = _normalized_data_identity(selection_identity)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"{context} has an invalid validation-data identity") from exc
+    return validated
+
+
+def _best_selection_is_portable(
+    bundle:                           Mapping[str, object],
+    cfg:                              Optional[VFE3Config],
+    expected_code_identity:           str,
+    expected_selection_data_identity: Optional[Mapping[str, object]],
+) -> bool:
+    """Return whether selected weights were measured under this code/config/validation contract."""
+    if set(bundle) != {
+            "model_state", "config", "config_fingerprint",
+            "code_identity_sha256", "selection_data_identity"}:
+        return False
+    if bundle.get("code_identity_sha256") != expected_code_identity:
+        return False
+    if expected_selection_data_identity is None or bundle.get("selection_data_identity") is None:
+        return False
+    try:
+        saved_selection_identity = _normalized_data_identity(bundle["selection_data_identity"])
+        live_selection_identity = _normalized_data_identity(expected_selection_data_identity)
+        if saved_selection_identity != live_selection_identity:
+            return False
+        if (cfg is not None
+                and semantic_config_fingerprint(
+                    _selection_semantic_config(bundle["config"]))
+                != semantic_config_fingerprint(_selection_semantic_config(cfg))):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _read_best_model_bundle(
@@ -414,34 +571,349 @@ def _read_best_model_bundle(
     ``expected_model_state`` is mutated, and no state is loaded into any model. Returns the validated
     bundle as a plain ``dict``."""
     bundle = torch.load(path, map_location=map_location, weights_only=True)
-    if not isinstance(bundle, Mapping) or set(bundle) != {
-            "model_state", "config", "config_fingerprint"}:
-        raise RuntimeError(f"best-model bundle at {path} is not a semantic best-model mapping")
-    saved_config = bundle["config"]
-    if not isinstance(saved_config, Mapping):
-        raise RuntimeError(f"best-model bundle at {path} has a non-mapping config")
-    if bundle["config_fingerprint"] != semantic_config_fingerprint(saved_config):
-        raise RuntimeError(f"best-model bundle at {path} has a config fingerprint mismatch")
-    if (semantic_config_fingerprint(_selection_semantic_config(saved_config))
-            != semantic_config_fingerprint(_selection_semantic_config(cfg))):
-        raise RuntimeError(
-            f"best-model bundle at {path} does not match the active selection config")
-    saved_state = bundle["model_state"]
+    return _validate_best_model_mapping(
+        bundle, cfg, expected_model_state, f"best-model bundle at {path}")
+
+
+def _validate_checkpoint_model_state(
+    saved_state:          object,
+    expected_model_state: Mapping[str, torch.Tensor],
+    checkpoint_path:      Path,
+) -> Mapping[str, torch.Tensor]:
+    """Validate a checkpoint model state completely before any live tensor is copied."""
     if not isinstance(saved_state, Mapping):
-        raise RuntimeError(f"best-model bundle at {path} has a non-mapping model_state")
+        raise RuntimeError(f"checkpoint {checkpoint_path} has a non-mapping model_state")
     if set(saved_state) != set(expected_model_state):
         raise RuntimeError(
-            f"best-model bundle at {path} model_state keys do not match the live model")
+            f"checkpoint {checkpoint_path} model_state keys do not match the live model")
     for key, expected in expected_model_state.items():
         actual = saved_state[key]
         if not isinstance(actual, torch.Tensor):
-            raise RuntimeError(f"best-model bundle at {path} entry {key!r} is not a tensor")
-        if actual.shape != expected.shape or actual.dtype != expected.dtype:
             raise RuntimeError(
-                f"best-model bundle at {path} entry {key!r} has an incompatible shape/dtype "
-                f"(got {tuple(actual.shape)}/{actual.dtype}, expected "
-                f"{tuple(expected.shape)}/{expected.dtype})")
-    return dict(bundle)
+                f"checkpoint {checkpoint_path} model_state entry {key!r} is not a tensor")
+        if (actual.shape != expected.shape or actual.dtype != expected.dtype
+                or actual.layout != expected.layout):
+            raise RuntimeError(
+                f"checkpoint {checkpoint_path} model_state entry {key!r} has an incompatible "
+                f"shape/dtype/layout")
+    return saved_state
+
+
+def _validated_saved_successful_updates(
+    saved_groups: object,
+    saved_step:   int,
+) -> Optional[int]:
+    """Validate the all-or-none accepted-update clock on serialized optimizer groups."""
+    if not isinstance(saved_groups, list) or not all(
+            isinstance(group, Mapping) for group in saved_groups):
+        raise RuntimeError("checkpoint optimizer_state param_groups must be a list of mappings")
+    present = ["successful_updates" in group for group in saved_groups]
+    if any(present) and not all(present):
+        raise RuntimeError(
+            "checkpoint optimizer_state successful_updates must be present on every group or none")
+    if not any(present):
+        return None
+    values = [group["successful_updates"] for group in saved_groups]
+    if any(type(value) is not int or value < 0 for value in values):
+        raise RuntimeError(
+            "checkpoint optimizer_state successful_updates must be exact non-negative integers")
+    if len(set(values)) != 1:
+        raise RuntimeError(
+            "checkpoint optimizer_state successful_updates must agree across all groups")
+    count = values[0]
+    if count > saved_step:
+        raise RuntimeError(
+            "checkpoint optimizer_state successful_updates cannot exceed checkpoint step")
+    return count
+
+
+def _validate_optimizer_state(
+    saved_state: object,
+    optimizer:   torch.optim.Optimizer,
+    saved_step:  int,
+    slot_manifest: object,
+) -> Mapping[str, object]:
+    """Preflight optimizer topology and populated per-parameter slots without mutation."""
+    if not isinstance(saved_state, Mapping):
+        raise RuntimeError("checkpoint optimizer_state must be a mapping when optimizer is supplied")
+    saved_groups = saved_state.get("param_groups")
+    saved_slots = saved_state.get("state")
+    has_optimizer_extra = hasattr(optimizer, "_omega_step")
+    expected_top_level = {"state", "param_groups"} | (
+        {"optimizer_extra"} if has_optimizer_extra else set())
+    if set(saved_state) != expected_top_level:
+        raise RuntimeError("checkpoint optimizer_state has an invalid top-level schema")
+    successful_updates = _validated_saved_successful_updates(saved_groups, saved_step)
+    maximum_slot_step = successful_updates if successful_updates is not None else saved_step
+    if has_optimizer_extra:
+        extra = saved_state["optimizer_extra"]
+        if (not isinstance(extra, Mapping)
+                or set(extra) != {"omega_step", "omega_dirty_format"}
+                or type(extra["omega_step"]) is not int
+                or extra["omega_step"] < 0
+                or extra["omega_step"] > maximum_slot_step
+                or type(extra["omega_dirty_format"]) is not int
+                or extra["omega_dirty_format"] != 1):
+            raise RuntimeError("checkpoint optimizer_state optimizer_extra is invalid")
+    if not isinstance(saved_slots, Mapping):
+        raise RuntimeError("checkpoint optimizer_state state must be a mapping")
+    if (not isinstance(slot_manifest, Mapping)
+            or set(slot_manifest) != {"parameter_ids", "sha256"}):
+        raise RuntimeError("checkpoint optimizer populated-slot manifest is missing or invalid")
+    manifest_ids = slot_manifest["parameter_ids"]
+    if (not isinstance(manifest_ids, list)
+            or any(type(value) is not int for value in manifest_ids)
+            or manifest_ids != sorted(set(manifest_ids))):
+        raise RuntimeError("checkpoint optimizer populated-slot manifest ids are invalid")
+    encoded_manifest = json.dumps(
+        manifest_ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    manifest_sha256 = hashlib.sha256(encoded_manifest).hexdigest()
+    if slot_manifest["sha256"] != manifest_sha256:
+        raise RuntimeError("checkpoint optimizer populated-slot manifest fingerprint mismatch")
+    populated_ids = sorted(
+        parameter_id for parameter_id, state in saved_slots.items()
+        if isinstance(state, Mapping) and bool(state)
+    )
+    if populated_ids != manifest_ids:
+        raise RuntimeError("checkpoint optimizer populated parameter slots do not match the manifest")
+    if len(saved_groups) != len(optimizer.param_groups):
+        raise RuntimeError("checkpoint optimizer_state parameter-group count mismatch")
+
+    parameter_by_id: Dict[int, Tuple[torch.Tensor, Mapping[str, object]]] = {}
+    for saved_group, live_group in zip(saved_groups, optimizer.param_groups):
+        saved_ids = saved_group.get("params")
+        live_parameters = live_group.get("params")
+        if not isinstance(saved_ids, list) or not isinstance(live_parameters, list):
+            raise RuntimeError("checkpoint optimizer_state group params must be lists")
+        if len(saved_ids) != len(live_parameters):
+            raise RuntimeError("checkpoint optimizer_state parameter topology mismatch")
+        for parameter_id, parameter in zip(saved_ids, live_parameters):
+            if type(parameter_id) is not int or parameter_id in parameter_by_id:
+                raise RuntimeError("checkpoint optimizer_state parameter ids are invalid")
+            parameter_by_id[parameter_id] = (parameter, saved_group)
+
+    for parameter_id, state in saved_slots.items():
+        if type(parameter_id) is not int or parameter_id not in parameter_by_id:
+            raise RuntimeError("checkpoint optimizer_state contains an unknown parameter id")
+        if not isinstance(state, Mapping):
+            raise RuntimeError("checkpoint optimizer_state parameter slot must be a mapping")
+        if not state:
+            continue
+        parameter, group = parameter_by_id[parameter_id]
+        keys = set(state)
+        if keys & {"step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"}:
+            required = {"step", "exp_avg", "exp_avg_sq"}
+            if not required.issubset(keys):
+                raise RuntimeError("checkpoint optimizer_state has incomplete AdamW slots")
+            step = state["step"]
+            expected_step_device = (
+                parameter.device
+                if bool(group.get("fused", False)) or bool(group.get("capturable", False))
+                else torch.device("cpu")
+            )
+            valid_step = (
+                isinstance(step, torch.Tensor)
+                and step.device == expected_step_device
+                and step.dtype == torch.float32
+                and step.layout == torch.strided
+                and step.ndim == 0
+                and bool(torch.isfinite(step))
+                and float(step) >= 0.0
+                and float(step).is_integer()
+                and float(step) <= maximum_slot_step
+            )
+            if not valid_step:
+                raise RuntimeError("checkpoint optimizer_state AdamW step is invalid")
+            tensor_slots = ["exp_avg", "exp_avg_sq"]
+            if bool(group.get("amsgrad", False)):
+                if "max_exp_avg_sq" not in state:
+                    raise RuntimeError("checkpoint optimizer_state is missing max_exp_avg_sq")
+                tensor_slots.append("max_exp_avg_sq")
+            for name in tensor_slots:
+                value = state[name]
+                if (not isinstance(value, torch.Tensor)
+                        or value.shape != parameter.shape
+                        or value.dtype != parameter.dtype
+                        or value.layout != parameter.layout
+                        or not bool(torch.isfinite(value).all())):
+                    raise RuntimeError(
+                        f"checkpoint optimizer_state {name} is incompatible with its parameter")
+        elif bool(group.get("gauge", False)):
+            if "gauge_mom" in state:
+                tensor_slots = ["gauge_mom"]
+            elif {"gauge_m", "gauge_v", "gauge_step"}.issubset(keys):
+                tensor_slots = ["gauge_m", "gauge_v"]
+                gauge_step = state["gauge_step"]
+                if (type(gauge_step) is not int or gauge_step < 0
+                        or gauge_step > maximum_slot_step):
+                    raise RuntimeError("checkpoint optimizer_state gauge_step is invalid")
+            else:
+                raise RuntimeError("checkpoint optimizer_state has incomplete gauge slots")
+            for name in tensor_slots:
+                value = state[name]
+                if (not isinstance(value, torch.Tensor)
+                        or value.shape != parameter.shape
+                        or value.dtype != parameter.dtype
+                        or value.layout != parameter.layout
+                        or not bool(torch.isfinite(value).all())):
+                    raise RuntimeError(
+                        f"checkpoint optimizer_state {name} is incompatible with its parameter")
+        elif bool(group.get("omega", False)):
+            dirty = state.get("omega_dirty")
+            if (keys != {"omega_dirty"} or not isinstance(dirty, torch.Tensor)
+                    or dirty.dtype != torch.bool or dirty.shape != (parameter.shape[0],)):
+                raise RuntimeError("checkpoint optimizer_state omega_dirty is invalid")
+        else:
+            raise RuntimeError("checkpoint optimizer_state contains unsupported parameter slots")
+    return saved_state
+
+
+def _optimizer_populated_slot_manifest(
+    optimizer_state: Mapping[str, object],
+) -> Dict[str, object]:
+    """Bind the exact set of populated per-parameter optimizer slots independently of slot bytes."""
+    slots = optimizer_state.get("state")
+    if not isinstance(slots, Mapping):
+        raise RuntimeError("optimizer state has no state mapping")
+    parameter_ids = sorted(
+        parameter_id for parameter_id, state in slots.items()
+        if type(parameter_id) is int and isinstance(state, Mapping) and bool(state)
+    )
+    encoded = json.dumps(parameter_ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return {
+        "parameter_ids": parameter_ids,
+        "sha256":        hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _validate_scaler_state(
+    saved_state: object,
+    scaler:      'torch.amp.GradScaler',
+) -> Mapping[str, object]:
+    if not isinstance(saved_state, Mapping):
+        raise RuntimeError("checkpoint scaler_state is required for an enabled GradScaler")
+    required = {"scale", "growth_factor", "backoff_factor", "growth_interval", "_growth_tracker"}
+    if set(saved_state) != required:
+        raise RuntimeError("checkpoint scaler_state has an invalid schema")
+    scale = saved_state["scale"]
+    growth = saved_state["growth_factor"]
+    backoff = saved_state["backoff_factor"]
+    interval = saved_state["growth_interval"]
+    tracker = saved_state["_growth_tracker"]
+    if (not isinstance(scale, Real) or isinstance(scale, bool)
+            or not math.isfinite(float(scale)) or float(scale) <= 0.0):
+        raise RuntimeError("checkpoint scaler_state scale must be a finite positive real")
+    if (not isinstance(growth, Real) or isinstance(growth, bool)
+            or not math.isfinite(float(growth)) or float(growth) <= 1.0):
+        raise RuntimeError("checkpoint scaler_state growth_factor must be greater than one")
+    if (not isinstance(backoff, Real) or isinstance(backoff, bool)
+            or not math.isfinite(float(backoff)) or not 0.0 < float(backoff) < 1.0):
+        raise RuntimeError("checkpoint scaler_state backoff_factor must lie in (0, 1)")
+    if type(interval) is not int or interval <= 0:
+        raise RuntimeError("checkpoint scaler_state growth_interval must be a positive integer")
+    if type(tracker) is not int or not 0 <= tracker < interval:
+        raise RuntimeError(
+            "checkpoint scaler_state _growth_tracker must lie in [0, growth_interval)")
+    return saved_state
+
+
+def _validate_ema_state(
+    saved_state: object,
+    ema:         EMA,
+
+    *,
+    require_state: bool = False,
+) -> Optional[Mapping[str, object]]:
+    if saved_state is None:
+        if require_state:
+            raise RuntimeError("checkpoint ema_state is required for exact EMA resume")
+        return None
+    if not isinstance(saved_state, Mapping) or set(saved_state) != {"decay", "shadow"}:
+        raise RuntimeError("checkpoint ema_state has an invalid schema")
+    decay = saved_state["decay"]
+    if (not isinstance(decay, Real) or isinstance(decay, bool)
+            or not math.isfinite(float(decay)) or float(decay) != float(ema.decay)):
+        raise RuntimeError("checkpoint ema_state decay does not match the active EMA")
+    shadow = saved_state["shadow"]
+    if not isinstance(shadow, Mapping) or set(shadow) != set(ema.shadow):
+        raise RuntimeError("checkpoint ema_state shadow keys do not match the active EMA")
+    for name, expected in ema.shadow.items():
+        actual = shadow[name]
+        if (not isinstance(actual, torch.Tensor)
+                or actual.shape != expected.shape
+                or actual.dtype != expected.dtype
+                or actual.layout != expected.layout
+                or not bool(torch.isfinite(actual).all())):
+            raise RuntimeError(f"checkpoint ema_state shadow entry {name!r} is incompatible")
+    return saved_state
+
+
+def _validate_rng_state(
+    rng_state: object,
+) -> Mapping[str, object]:
+    if not isinstance(rng_state, Mapping) or "cpu" not in rng_state or "cuda" not in rng_state:
+        raise RuntimeError("checkpoint rng_state must contain cpu and cuda states")
+    cpu = rng_state["cpu"]
+    if (not isinstance(cpu, torch.Tensor) or cpu.device.type != "cpu"
+            or cpu.dtype != torch.uint8):
+        raise RuntimeError("checkpoint rng_state cpu state must be a CPU ByteTensor")
+    try:
+        torch.Generator(device="cpu").set_state(cpu)
+    except RuntimeError as exc:
+        raise RuntimeError("checkpoint rng_state cpu state is invalid") from exc
+    cuda = rng_state["cuda"]
+    if torch.cuda.is_available() and cuda is None:
+        raise RuntimeError("checkpoint rng_state must contain every active CUDA RNG state")
+    if cuda is not None:
+        if not isinstance(cuda, (list, tuple)):
+            raise RuntimeError("checkpoint rng_state cuda states must be a sequence or null")
+        if torch.cuda.is_available() and len(cuda) != torch.cuda.device_count():
+            raise RuntimeError(
+                "checkpoint rng_state CUDA state count does not match the active device count")
+        for index, state in enumerate(cuda):
+            if (not isinstance(state, torch.Tensor) or state.device.type != "cpu"
+                    or state.dtype != torch.uint8):
+                raise RuntimeError("checkpoint rng_state CUDA states must be CPU ByteTensors")
+            if torch.cuda.is_available() and index < torch.cuda.device_count():
+                try:
+                    torch.Generator(device=f"cuda:{index}").set_state(state)
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"checkpoint rng_state CUDA state {index} is invalid") from exc
+    return rng_state
+
+
+def _validate_generator_state(
+    state: object,
+    field: str,
+) -> torch.Tensor:
+    if (not isinstance(state, torch.Tensor) or state.device.type != "cpu"
+            or state.dtype != torch.uint8):
+        raise RuntimeError(f"checkpoint {field} must be a CPU ByteTensor")
+    try:
+        torch.Generator(device="cpu").set_state(state)
+    except RuntimeError as exc:
+        raise RuntimeError(f"checkpoint {field} is invalid") from exc
+    return state
+
+
+def _validate_epoch_generator_state(
+    state:         object,
+    data_identity: Mapping[str, object],
+) -> Optional[torch.Tensor]:
+    """Validate the epoch-start generator state against the iterator's sampler semantics."""
+    iterator = data_identity.get("iterator")
+    if not isinstance(iterator, Mapping):
+        raise RuntimeError("checkpoint data identity iterator must be a mapping")
+    sampler = iterator.get("sampler")
+    if sampler == "random":
+        return _validate_generator_state(state, "data_state epoch_start_generator_state")
+    if sampler == "sequential":
+        if state is not None:
+            raise RuntimeError(
+                "checkpoint sequential data_state requires a null epoch generator state")
+        return None
+    raise RuntimeError("checkpoint data identity carries an unsupported sampler")
 
 
 def _publish_best_model_bundle(
@@ -487,6 +959,8 @@ class RunArtifacts:
         self.csv_path = self.run_dir / "metrics.csv"
         self.best_path = self.run_dir / "best_model.pt"
         self.cfg = cfg                                       # kept for figure scaling (lambda_beta) + guards
+        self.code_identity_sha256 = _package_code_identity()
+        self.selection_data_identity: Optional[Dict[str, object]] = None
 
         self.best_val_ppl: float = float("inf")
         self.best_step: Optional[int] = None
@@ -500,6 +974,15 @@ class RunArtifacts:
             "device":    str(device),
             "timestamp": timestamp,
         })
+
+    def bind_selection_data_identity(self, identity: Mapping[str, object]) -> None:
+        """Bind every selected-weight comparison in this run to one validation data contract."""
+        normalized = _normalized_data_identity(identity)
+        if (self.selection_data_identity is not None
+                and self.selection_data_identity != normalized):
+            raise RuntimeError(
+                "one RunArtifacts instance cannot compare model selections across validation data")
+        self.selection_data_identity = normalized
 
     def save_json(self, name: str, obj: dict) -> Path:
         r"""Write ``obj`` as pretty JSON to ``run_dir/name`` (non-serializable -> str).
@@ -546,6 +1029,8 @@ class RunArtifacts:
                 "model_state":        model.state_dict(),
                 "config":             config,
                 "config_fingerprint": semantic_config_fingerprint(config),
+                "code_identity_sha256": self.code_identity_sha256,
+                "selection_data_identity": self.selection_data_identity,
             }
             with _unique_sibling_temp(self.best_path) as tmp:
                 torch.save(bundle, tmp)
@@ -686,9 +1171,10 @@ class RunArtifacts:
         atomic (same-dir tmp + ``os.replace``) so a crash never leaves a corrupt ``step_<N>.pt``.
         ``metropolis_generator`` carries the private accept/reject stream independently of the
         global CPU/CUDA RNG so a resumed discrete-reflection sweep continues at the next draw.
-        ``data_state`` records the current epoch's starting loader-generator state and cursor;
-        the state tensor is cloned into the bundle so later generator advances cannot mutate it.
+        ``data_state`` records the current epoch's cursor and data/iterator identity. Its optional
+        generator state is cloned for random sampling; deterministic sequential sampling stores null.
         """
+        step = _require_nonnegative_int(step, "step")
         path = self.ckpt_dir / f"step_{step}.pt"
         rng_state = {
             "cpu":  torch.get_rng_state(),
@@ -700,12 +1186,14 @@ class RunArtifacts:
                 data_state["batches_consumed"], "batches_consumed")
             epoch = _require_nonnegative_int(data_state["epoch"], "epoch")
             generator_state = data_state["epoch_start_generator_state"]
-            if not isinstance(generator_state, torch.Tensor):
+            if generator_state is not None and not isinstance(generator_state, torch.Tensor):
                 raise ValueError(
-                    "data_state epoch_start_generator_state must be a tensor")
+                    "data_state epoch_start_generator_state must be a tensor or null")
             data_identity = _normalized_data_identity(data_state.get("data_identity"))
+            generator_state = _validate_epoch_generator_state(generator_state, data_identity)
             saved_data_state = {
-                "epoch_start_generator_state": generator_state.clone(),
+                "epoch_start_generator_state": (generator_state.clone()
+                                                  if generator_state is not None else None),
                 "batches_consumed":            batches_consumed,
                 "epoch":                       epoch,
                 "data_identity":               data_identity,
@@ -728,15 +1216,20 @@ class RunArtifacts:
             best_model_bundle  = None
             saved_best_val_ppl = float("inf")
             saved_best_step    = None
+        optimizer_state = optimizer.state_dict()
+        optimizer_slot_manifest = _optimizer_populated_slot_manifest(optimizer_state)
         with _unique_sibling_temp(path) as tmp:
             torch.save({
-                "step":            int(step),
+                "step":            step,
                 "model_state":     model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
+                "optimizer_state": optimizer_state,
+                "optimizer_populated_slot_manifest": optimizer_slot_manifest,
                 "rng_state":       rng_state,
                 "metropolis_rng_state": (metropolis_generator.get_state()
                                           if metropolis_generator is not None else None),
                 "config":          asdict(cfg),
+                "code_identity_sha256": self.code_identity_sha256,
+                "selection_data_identity": self.selection_data_identity,
                 "scaler_state":    (scaler.state_dict()
                                     if scaler is not None and scaler.is_enabled() else None),
                 "ema_state":       (ema.state_dict() if ema is not None else None),
@@ -755,6 +1248,7 @@ def _restore_best_selection(
     artifacts:            'RunArtifacts',
     expected_model_state: Mapping[str, torch.Tensor],
     map_location:         'str | torch.device',
+    inherit_selection:    bool,
 ) -> None:
     r"""Restore portable best-model selection state into ``artifacts`` from a loaded checkpoint (PB-03).
 
@@ -770,6 +1264,19 @@ def _restore_best_selection(
     embedded = ckpt.get("best_model_bundle")
     ckpt_best_ppl = ckpt.get("best_val_ppl")
     had_finite_best = ckpt_best_ppl is not None and math.isfinite(float(ckpt_best_ppl))
+
+    if not inherit_selection:
+        artifacts.best_val_ppl = float("inf")
+        artifacts.best_step = None
+        if had_finite_best:
+            warnings.warn(
+                f"resume from {checkpoint_path.name} carried a selected model measured under a "
+                f"different or unbound code/config/validation-data contract; raw training state "
+                f"was restored, but model selection restarts from this run.",
+                UserWarning,
+                stacklevel=3,
+            )
+        return
 
     # (1) Modern checkpoint carrying an embedded validated bundle.
     if isinstance(embedded, Mapping):
@@ -809,6 +1316,97 @@ def _restore_best_selection(
         )
 
 
+def _preflight_best_selection(
+    ckpt:                 Mapping[str, object],
+    checkpoint_path:      Path,
+    cfg:                  Optional[VFE3Config],
+    expected_model_state: Mapping[str, torch.Tensor],
+    map_location:         'str | torch.device',
+    saved_step:           int,
+    expected_code_identity: str,
+    expected_selection_data_identity: Optional[Mapping[str, object]],
+) -> bool:
+    """Validate selection scalars and all reachable selected weights before live restoration."""
+    if "best_val_ppl" not in ckpt or "best_step" not in ckpt:
+        raise RuntimeError("checkpoint best-model selection metadata is missing")
+    best_ppl = ckpt["best_val_ppl"]
+    best_step = ckpt["best_step"]
+    embedded_present = "best_model_bundle" in ckpt
+    embedded = ckpt.get("best_model_bundle")
+    if (not isinstance(best_ppl, Real) or isinstance(best_ppl, bool)
+            or math.isnan(float(best_ppl)) or float(best_ppl) == float("-inf")):
+        raise RuntimeError("checkpoint best-model selection PPL must be finite or positive infinity")
+    selected = math.isfinite(float(best_ppl))
+    candidate: Optional[Dict[str, object]] = None
+    if selected:
+        if float(best_ppl) <= 0.0:
+            raise RuntimeError("checkpoint best-model selection PPL must be positive")
+        if type(best_step) is not int or best_step < 0 or best_step > saved_step:
+            raise RuntimeError(
+                "checkpoint best-model selection step must be a non-negative integer no later "
+                "than the checkpoint step")
+        if embedded_present:
+            if not isinstance(embedded, Mapping):
+                raise RuntimeError(
+                    "checkpoint best-model selection has no reachable embedded weight bundle")
+            candidate = _validate_best_model_mapping(
+                embedded, None, expected_model_state,
+                f"checkpoint {checkpoint_path} best-model selection bundle",
+            )
+        else:
+            sibling = checkpoint_path.parent.parent / "best_model.pt"
+            if not sibling.is_file():
+                raise RuntimeError(
+                    "checkpoint best-model selection has no reachable legacy sibling weights")
+            bundle = torch.load(sibling, map_location=map_location, weights_only=True)
+            candidate = _validate_best_model_mapping(
+                bundle, None, expected_model_state,
+                f"checkpoint {checkpoint_path} legacy best-model selection bundle",
+            )
+    elif best_step is not None or embedded is not None:
+        raise RuntimeError(
+            "checkpoint empty best-model selection must use best_step=None and no weight bundle")
+    if not selected or candidate is None:
+        return False
+    if not _best_selection_is_portable(
+            candidate, cfg, expected_code_identity, expected_selection_data_identity):
+        return False
+    checkpoint_code_identity = ckpt.get("code_identity_sha256")
+    checkpoint_selection_identity = ckpt.get("selection_data_identity")
+    if (checkpoint_code_identity != candidate.get("code_identity_sha256")
+            or checkpoint_selection_identity is None):
+        return False
+    try:
+        if (_normalized_data_identity(checkpoint_selection_identity)
+                != _normalized_data_identity(candidate["selection_data_identity"])):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _preflight_resume_config(
+    saved_config: object,
+    cfg:          VFE3Config,
+) -> Tuple[Mapping[str, object], List[str]]:
+    """Validate serialized config keys and compute deterministic drift before any live mutation."""
+    if not isinstance(saved_config, Mapping):
+        raise RuntimeError("checkpoint config must be a mapping when cfg is supplied")
+    if any(not isinstance(key, str) for key in saved_config):
+        raise RuntimeError("checkpoint config keys must be strings")
+    known = {field.name for field in fields(VFE3Config)}
+    unknown = sorted(set(saved_config) - known)
+    if unknown:
+        raise RuntimeError(f"checkpoint config contains unknown field(s) {unknown}")
+    current = asdict(cfg)
+    drift = sorted(
+        key for key in (set(saved_config) | set(current))
+        if key not in ("resume_from", "trust_resume_checkpoint")
+        and saved_config.get(key) != current.get(key)
+    )
+    return saved_config, drift
+
+
 def load_checkpoint(
     path:      'str | Path',
     model:     torch.nn.Module,
@@ -816,6 +1414,7 @@ def load_checkpoint(
 
     *,
     map_location:         'Optional[str | torch.device]'   = None,
+    max_step:             Optional[int]                    = None,
     restore_rng:          bool                             = True,
     scaler:               Optional['torch.amp.GradScaler'] = None,
     cfg:                  Optional[VFE3Config]             = None,
@@ -824,6 +1423,8 @@ def load_checkpoint(
     metropolis_generator: Optional[torch.Generator]        = None,
     data_state:            Optional[DataStateBuffer]        = None,
     expected_data_identity: Optional[Mapping[str, object]]   = None,
+    expected_selection_data_identity: Optional[Mapping[str, object]] = None,
+    expected_steps_per_epoch: Optional[int]                  = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
@@ -865,9 +1466,19 @@ def load_checkpoint(
         raise FileNotFoundError(f"checkpoint file not found: {checkpoint_path}")
     if map_location is None:
         map_location = next(model.parameters()).device
+    # A checkpoint mixes parameter tensors with CPU-only state: torch CPU RNG, DataLoader and
+    # Metropolis generator states, and non-fused/non-capturable Adam step scalars. Loading the whole
+    # bundle onto a CUDA target corrupts those storage contracts before validation. Validate from a
+    # CPU snapshot; model.load_state_dict and optimizer.load_state_dict perform the deliberate
+    # parameter-slot transfer to the live model device below.
+    checkpoint_load_location = "cpu"
     trust = bool(getattr(cfg, "trust_resume_checkpoint", False))
     try:
-        ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+        ckpt = torch.load(
+            checkpoint_path,
+            map_location=checkpoint_load_location,
+            weights_only=True,
+        )
     except Exception as exc:                                    # safe load rejected a non-tensor object
         if not trust:
             raise RuntimeError(
@@ -876,7 +1487,20 @@ def load_checkpoint(
                 f"trust_resume_checkpoint=True to allow the legacy weights_only=False load (which can "
                 f"execute arbitrary code embedded in the pickle)."
             ) from exc
-        ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+        ckpt = torch.load(
+            checkpoint_path,
+            map_location=checkpoint_load_location,
+            weights_only=False,
+        )
+    if not isinstance(ckpt, Mapping):
+        raise RuntimeError("checkpoint payload must be a mapping")
+    saved_step = _require_nonnegative_int(ckpt.get("step"), "step")
+    if max_step is not None:
+        max_step = _require_nonnegative_int(max_step, "max_step")
+        if saved_step > max_step:
+            raise ValueError(
+                f"checkpoint step {saved_step} exceeds requested n_steps={max_step} "
+                f"(max_step={max_step})")
     saved_data_state = ckpt.get("data_state")
     saved_data_identity: Optional[Dict[str, object]] = None
     if saved_data_state is None and expected_data_identity is not None:
@@ -890,9 +1514,10 @@ def load_checkpoint(
             saved_data_state["batches_consumed"], "batches_consumed")
         saved_epoch = _require_nonnegative_int(saved_data_state["epoch"], "epoch")
         saved_generator_state = saved_data_state.get("epoch_start_generator_state")
-        if not isinstance(saved_generator_state, torch.Tensor):
+        if (saved_generator_state is not None
+                and not isinstance(saved_generator_state, torch.Tensor)):
             raise RuntimeError(
-                "checkpoint data_state epoch_start_generator_state must be a tensor")
+                "checkpoint data_state epoch_start_generator_state must be a tensor or null")
         if "data_identity" not in saved_data_state:
             raise RuntimeError(
                 "checkpoint data_state is missing its data identity contract; exact resume is unsafe")
@@ -909,13 +1534,78 @@ def load_checkpoint(
             raise RuntimeError(
                 f"checkpoint data identity mismatch for field(s) {differing}; refusing to restore "
                 "model, optimizer, cursor, or RNG state")
-    model.load_state_dict(ckpt["model_state"])
-    if optimizer is not None and ckpt.get("optimizer_state") is not None:
-        saved_optimizer_state = ckpt["optimizer_state"]
-        saved_groups = saved_optimizer_state.get("param_groups", [])
-        successful_updates = (
-            saved_groups[0].get("successful_updates") if saved_groups else None
+        saved_generator_state = _validate_epoch_generator_state(
+            saved_generator_state, live_data_identity)
+        if expected_steps_per_epoch is None:
+            iterator_identity = live_data_identity["iterator"]
+            n_samples = iterator_identity["sampler_num_samples"]
+            batch_size = iterator_identity["batch_size"]
+            expected_steps_per_epoch = (
+                n_samples // batch_size
+                if iterator_identity["drop_last"]
+                else (n_samples + batch_size - 1) // batch_size
+            )
+        if type(expected_steps_per_epoch) is not int or expected_steps_per_epoch <= 0:
+            raise RuntimeError("exact resume requires a positive integer steps-per-epoch")
+        if saved_batches_consumed > expected_steps_per_epoch:
+            raise RuntimeError(
+                "checkpoint batches_consumed exceeds the live loader epoch length")
+        expected_step = saved_epoch * expected_steps_per_epoch + saved_batches_consumed
+        if saved_step != expected_step:
+            raise RuntimeError(
+                f"checkpoint step {saved_step} is inconsistent with epoch {saved_epoch} and "
+                f"batches_consumed {saved_batches_consumed} for "
+                f"{expected_steps_per_epoch} steps per epoch")
+    saved_model_state = _validate_checkpoint_model_state(
+        ckpt.get("model_state"), model.state_dict(), checkpoint_path)
+    saved_optimizer_state = None
+    successful_updates = None
+    if optimizer is not None:
+        saved_optimizer_state = _validate_optimizer_state(
+            ckpt.get("optimizer_state"), optimizer, saved_step,
+            ckpt.get("optimizer_populated_slot_manifest"))
+        successful_updates = _validated_saved_successful_updates(
+            saved_optimizer_state["param_groups"], saved_step)
+    saved_scaler_state = ckpt.get("scaler_state")
+    if scaler is not None and scaler.is_enabled():
+        saved_scaler_state = _validate_scaler_state(saved_scaler_state, scaler)
+    saved_ema_state = ckpt.get("ema_state")
+    if ema is not None:
+        saved_ema_state = _validate_ema_state(
+            saved_ema_state,
+            ema,
+            require_state=(expected_data_identity is not None),
         )
+    saved_rng_state = None
+    if restore_rng:
+        saved_rng_state = _validate_rng_state(ckpt.get("rng_state"))
+    saved_metropolis_state = None
+    if restore_rng and metropolis_generator is not None:
+        saved_metropolis_state = _validate_generator_state(
+            ckpt.get("metropolis_rng_state"), "metropolis_rng_state")
+    active_selection_cfg = cfg if cfg is not None else (
+        artifacts.cfg if artifacts is not None else None)
+    if expected_selection_data_identity is None and artifacts is not None:
+        expected_selection_data_identity = artifacts.selection_data_identity
+    expected_code_identity = (
+        artifacts.code_identity_sha256 if artifacts is not None else _package_code_identity())
+    inherit_selection = _preflight_best_selection(
+        ckpt,
+        checkpoint_path,
+        active_selection_cfg,
+        model.state_dict(),
+        map_location,
+        saved_step,
+        expected_code_identity,
+        expected_selection_data_identity,
+    )
+    saved_config = None
+    config_drift: List[str] = []
+    if cfg is not None:
+        saved_config, config_drift = _preflight_resume_config(ckpt.get("config"), cfg)
+
+    model.load_state_dict(saved_model_state)
+    if optimizer is not None:
         fresh = [{k: v for k, v in group.items() if k != "params"}
                  for group in optimizer.param_groups]
         optimizer.load_state_dict(saved_optimizer_state)
@@ -925,19 +1615,19 @@ def load_checkpoint(
             group.update(metadata)
             group["params"] = params
             if successful_updates is not None:
-                group["successful_updates"] = int(successful_updates)
-    if scaler is not None and ckpt.get("scaler_state") is not None:
-        scaler.load_state_dict(ckpt["scaler_state"])
+                group["successful_updates"] = successful_updates
+    if scaler is not None and scaler.is_enabled():
+        scaler.load_state_dict(saved_scaler_state)
     # EMA shadow: restore it so a resumed run continues the SAME running average instead of re-seeding
     # from the resumed iterate. When the bundle carries no ema_state (a use_ema=False or legacy
     # checkpoint), the shadow was constructed from the PRE-load fresh init (EMA is built before this
     # load overwrites the model), so reseed it from the just-loaded weights -- otherwise the running
     # average blends real weights into random-init noise (audit 2026-07-01 C3).
     if ema is not None:
-        if ckpt.get("ema_state") is not None:
-            ema.load_state_dict(ckpt["ema_state"])
+        if saved_ema_state is None:
+            ema.reset(model)
         else:
-            ema.reset(model)   # no bundled shadow: reseed from the just-loaded weights, not the pre-load init
+            ema.load_state_dict(saved_ema_state)
     # Portable best-val model-selection state (PB-03, extends audit 2026-07-01 C2): restore
     # best_val_ppl/best_step AND make the selected weights reachable in the resumed run's directory,
     # so a cross-run_dir resume no longer restores best metadata whose best_model.pt is missing. The
@@ -946,33 +1636,28 @@ def load_checkpoint(
     #   (2) a legacy checkpoint (no such field) validates <old_run>/best_model.pt and publishes it;
     #   (3) neither -> the selection state resets to empty, and any unreachable finite scalar is dropped.
     if artifacts is not None:
-        _restore_best_selection(ckpt, checkpoint_path, artifacts, model.state_dict(), map_location)
-    if cfg is not None and ckpt.get("config") is not None:
-        saved = ckpt["config"]
-        current = asdict(cfg)
-        # resume_from is run bookkeeping (the resumed run necessarily sets it; the saved run
-        # rarely did) -- not semantic drift.
-        drift = sorted(k for k in (saved.keys() | current.keys())
-                       if k not in ("resume_from", "trust_resume_checkpoint")
-                       and saved.get(k) != current.get(k))
-        if drift:
+        _restore_best_selection(
+            ckpt, checkpoint_path, artifacts, model.state_dict(), map_location,
+            inherit_selection)
+    if cfg is not None:
+        if config_drift:
             import warnings
             warnings.warn(
                 f"resume config drift: the checkpoint at {Path(path).name} was written under a "
-                f"different config for field(s) {drift}; the resumed run uses the CURRENT values "
+                f"different config for field(s) {config_drift}; the resumed run uses the CURRENT values "
                 f"(weights/optimizer load strictly, but semantic knobs are not restored from the "
                 f"bundle).",
                 UserWarning,
                 stacklevel=2,
             )
-    if restore_rng and ckpt.get("rng_state") is not None:
-        rng = ckpt["rng_state"]
+    if restore_rng:
+        rng = saved_rng_state
         # RNG tensors must be CPU ByteTensors regardless of map_location (set_rng_state asserts this).
         torch.set_rng_state(rng["cpu"].cpu() if hasattr(rng["cpu"], "cpu") else rng["cpu"])
         if rng.get("cuda") is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
-    if restore_rng and metropolis_generator is not None and ckpt.get("metropolis_rng_state") is not None:
-        metro_state = ckpt["metropolis_rng_state"]
+    if restore_rng and metropolis_generator is not None:
+        metro_state = saved_metropolis_state
         metropolis_generator.set_state(
             metro_state.cpu() if hasattr(metro_state, "cpu") else metro_state)
     if data_state is not None:
@@ -984,7 +1669,7 @@ def load_checkpoint(
                 "epoch":                       saved_epoch,
                 "data_identity":               saved_data_identity,
             })
-    return int(ckpt["step"])
+    return saved_step
 
 
 def _git_environment(
@@ -1897,12 +2582,17 @@ def finalize_validation_run(
     ``primary_val_ppl`` is the minimum of the finite run-wide best and the final validation PPL (or the
     final value when no earlier best exists); after ``maybe_save_best`` it equals the selected finite best.
     """
-    from vfe3.train import evaluate                              # local import avoids an import cycle
+    from vfe3.train import _loader_data_identity, evaluate       # local import avoids an import cycle
 
     logger = logger or logging.getLogger(__name__)
     if device is None:
         device = next(model.parameters()).device
     ema = terminal_state.ema if terminal_state is not None else None
+    completed_step = _require_nonnegative_int(
+        terminal_state.step if terminal_state is not None else cfg.max_steps,
+        "terminal step",
+    )
+    artifacts.bind_selection_data_identity(_loader_data_identity(val_loader, cfg.vocab_size))
 
     # Reachability guard (PB-03): entering with FINITE best metadata (a resumed periodic best) requires
     # a reachable best_model.pt. A recomputed ablation cell instead enters with INFINITE metadata even
@@ -1930,7 +2620,7 @@ def finalize_validation_run(
         # Terminal metrics row: compatible with an empty history (defines the schema) OR an established
         # training schema (its five keys are a subset of the training columns, so the append is clean).
         terminal_row = {
-            "step":       int(cfg.max_steps),
+            "step":       completed_step,
             "train_loss": float(losses[-1]) if losses else float("nan"),
             "val_ce":     final_ce,
             "val_ppl":    final_ppl,
@@ -1941,7 +2631,7 @@ def finalize_validation_run(
         # the final validation, so after maybe_save_best it equals the selected finite best.
         prior_best = artifacts.best_val_ppl
         artifacts.log_metrics(terminal_row)
-        artifacts.maybe_save_best(cfg.max_steps, model, final_ppl)
+        artifacts.maybe_save_best(completed_step, model, final_ppl)
         # After the terminal save the selection is live and MUST be reachable: maybe_save_best either
         # atomically replaced any stale file with the terminal weights (a recomputed cell) or left an
         # already-reachable earlier best (guarded above). Fail closed before publishing the success
@@ -1987,7 +2677,7 @@ def finalize_validation_run(
     terminal_checkpoint: Optional[str] = None
     if terminal_state is not None:
         checkpoint_path = artifacts.save_checkpoint(
-            int(cfg.max_steps), model, terminal_state.optimizer, cfg,
+            completed_step, model, terminal_state.optimizer, cfg,
             scaler=terminal_state.scaler, ema=ema,
             metropolis_generator=terminal_state.metropolis_generator,
             data_state=terminal_state.data_state,
@@ -2004,7 +2694,7 @@ def finalize_validation_run(
         "final_val_bpc":       final_bpc,
         "best_val_ppl":        best_val_ppl,
         "best_step":           artifacts.best_step,
-        "n_steps":             int(cfg.max_steps),
+        "n_steps":             completed_step,
         "n_params":            n_params,
         "final_train_loss":    final_train_loss,
         "wall_time_s":         (float(wall_time) if wall_time is not None else None),

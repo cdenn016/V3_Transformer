@@ -346,6 +346,31 @@ def test_compact_omega_condition_captures_cross_block_scale():
     assert opt._gauge_diag["omega_condition_max"] == pytest.approx(1.0e4, rel=1e-6)
 
 
+def test_zero_omega_gradient_is_consumed_without_empty_diagnostics():
+    from vfe3.geometry.groups import get_group
+
+    group = get_group("glk")(K=3)
+    omega = nn.Parameter(torch.eye(3).repeat(5, 1, 1))
+    optimizer = GaugeNaturalGradAdamW(
+        [{"params": [omega], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
+        group.generators,
+        group.irrep_dims,
+        group_name=group.name,
+        weight_decay=0.0,
+    )
+    optimizer._collect_gauge_diag = True
+    optimizer._gauge_diag = {"omega_condition_max": 123.0}
+    before = omega.detach().clone()
+    omega.grad = torch.zeros_like(omega)
+
+    optimizer.step()
+
+    assert torch.equal(omega, before)
+    assert omega.grad is None
+    assert optimizer._gauge_diag == {}
+    assert not optimizer.state
+
+
 def test_attempted_diagnostic_step_clears_stale_gauge_health():
     group = generate_glk_multihead(4, 2).float()
     phi = nn.Parameter(torch.zeros(3, group.shape[0]))

@@ -32,10 +32,12 @@ if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
 
 import copy
 import gc
+import hashlib
 import json
 import logging
 import math
 import time
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import asdict
 from dataclasses import fields as _dc_fields
@@ -57,6 +59,10 @@ from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, train
 
 logger = logging.getLogger("scaling")
+
+_SCALING_CELL_SCHEMA_VERSION = 2
+_SCALING_REUSE_DIGEST_FIELD = "reuse_contract_sha256"
+_SCALING_SUMMARY_DIGEST_FIELD = "scaling_reuse_contract_sha256"
 
 
 # =============================================================================
@@ -616,6 +622,12 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
 _LOADER_CACHE: Dict[Tuple[Any, ...], Any] = {}
 
 
+def _require_scaling_seed(value: object, field: str = "seed") -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field} must be an exact nonnegative integer, got {value!r}")
+    return value
+
+
 def get_loader(
     dataset:    str,
     seq_len:    int,
@@ -636,10 +648,11 @@ def get_loader(
     split only. No synthetic substitution for a missing real corpus."""
     cap = max_tokens if split == "train" else None
     seeded = split == "train" and data_seed is not None
+    validated_data_seed = _require_scaling_seed(data_seed, "data_seed") if seeded else None
     key = (dataset, seq_len, batch_size, split, cap, vocab_size,
-           int(data_seed) if seeded else None)
+           validated_data_seed)
     if key not in _LOADER_CACHE:
-        generator = torch.Generator().manual_seed(int(data_seed)) if seeded else None
+        generator = torch.Generator().manual_seed(validated_data_seed) if seeded else None
         _LOADER_CACHE[key] = make_dataloader(dataset, split, seq_len, batch_size,
                                              shuffle=(split == "train"), drop_last=(split == "train"),
                                              max_tokens=cap, vocab_size=vocab_size,
@@ -656,7 +669,7 @@ def _cell_cfg_dict(overrides: Dict[str, Any], seed: int, max_steps: Optional[int
     source of truth, shared by ``run_cell`` and the resume staleness check."""
     d = copy.deepcopy(dict(BASELINE))
     d.update(overrides)
-    d["seed"] = int(seed)
+    d["seed"] = _require_scaling_seed(seed)
     d["checkpoint_interval"] = 0                             # no per-cell step_N.pt blowup
     d["generate_figures"] = False                           # single-run replay figures are off the scaling path
     if max_steps is not None:
@@ -669,29 +682,150 @@ def _current_code_identity() -> Dict[str, object]:
     return _git_code_identity(Path(__file__).resolve().parent)
 
 
+def _validated_scaling_code_identity(value: object) -> Dict[str, object]:
+    """Return one detached, usable Git identity for a scaling invocation."""
+    if not isinstance(value, Mapping):
+        raise TypeError("scaling code identity must be a mapping")
+    detached = json.loads(json.dumps(
+        dict(value), sort_keys=True, ensure_ascii=False, allow_nan=False))
+    git_sha = detached.get("git_sha")
+    git_dirty = detached.get("git_dirty")
+    fingerprint = detached.get("git_dirty_fingerprint")
+    if not isinstance(git_sha, str) or not git_sha or type(git_dirty) is not bool:
+        raise ValueError("scaling code identity is unavailable")
+    if ((git_dirty and (not isinstance(fingerprint, str) or not fingerprint))
+            or (not git_dirty and fingerprint is not None)):
+        raise ValueError("scaling code identity has an inconsistent dirty-tree fingerprint")
+    return detached
+
+
+_SCALING_SOURCE_SPLITS = ("train", "validation", "test")
+
+
+def _validated_data_source_identities(value: object) -> Dict[str, Dict[str, object]]:
+    """Return a detached, JSON-safe identity for exactly the splits scaling consumes."""
+    if not isinstance(value, Mapping) or set(value) != set(_SCALING_SOURCE_SPLITS):
+        raise ValueError(
+            "scaling data source identities must contain exactly train, validation, and test")
+    normalized: Dict[str, Dict[str, object]] = {}
+    for split in _SCALING_SOURCE_SPLITS:
+        source = value[split]
+        if not isinstance(source, Mapping):
+            raise TypeError(f"{split} source identity must be a mapping")
+        detached = json.loads(json.dumps(
+            dict(source), sort_keys=True, ensure_ascii=False, allow_nan=False))
+        if (not isinstance(detached, dict)
+                or not isinstance(detached.get("format"), str)
+                or not detached["format"]
+                or type(detached.get("size_bytes")) is not int
+                or detached["size_bytes"] < 0
+                or not isinstance(detached.get("sha256"), str)
+                or not detached["sha256"]):
+            raise ValueError(f"{split} source identity is incomplete")
+        normalized[split] = detached
+    return normalized
+
+
 def _data_source_identities(dataset: str) -> Dict[str, Dict[str, object]]:
     """Current cached corpus identities for every split consumed by a scaling cell."""
-    return {
+    return _validated_data_source_identities({
         split: cache_source_identity(dataset, split)
-        for split in ("train", "validation", "test")
-    }
+        for split in _SCALING_SOURCE_SPLITS
+    })
 
 
-def _cell_is_current(run_dir: Path, cfg: VFE3Config, dataset: str, max_tokens: Optional[int] = None) -> bool:
+def _loader_data_source_identities(
+    train_loader: object,
+    val_loader:   object,
+    test_loader:  object,
+
+    *,
+    dataset:    str,
+    max_tokens: Optional[int],
+) -> Dict[str, Dict[str, object]]:
+    """Return source identities from the immutable loader datasets actually used by one cell."""
+    sources: Dict[str, object] = {}
+    for split, loader, expected_cap in (
+        ("train", train_loader, max_tokens),
+        ("validation", val_loader, None),
+        ("test", test_loader, None),
+    ):
+        data_identity = getattr(getattr(loader, "dataset", None), "data_identity", None)
+        if (not isinstance(data_identity, Mapping)
+                or data_identity.get("schema_version") != 2
+                or data_identity.get("dataset") != dataset
+                or data_identity.get("split") != split
+                or data_identity.get("max_tokens") != expected_cap):
+            raise RuntimeError(f"{split} loader data identity is unavailable or mismatched")
+        sources[split] = data_identity.get("source")
+    return _validated_data_source_identities(sources)
+
+
+def _canonical_json_sha256(value: object) -> str:
+    """SHA-256 of one finite, JSON-safe value under a stable canonical encoding."""
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _scaling_reuse_contract_sha256(cellmeta: Mapping[str, object]) -> str:
+    """Digest a scaling-cell reuse contract without its self-referential digest field."""
+    contract = dict(cellmeta)
+    contract.pop(_SCALING_REUSE_DIGEST_FIELD, None)
+    return _canonical_json_sha256(contract)
+
+
+def _cached_scaling_metrics(summary: Mapping[str, object]) -> Dict[str, object]:
+    """Return the internally consistent metric payload served by the cached-cell path."""
+    scaling_point = summary.get("scaling_point")
+    if not isinstance(scaling_point, Mapping):
+        return {}
+    required = ("n_params", "test_ce", "test_ppl", "test_bits_per_token", "test_bpc")
+    if any(key not in summary or key not in scaling_point for key in required):
+        return {}
+    if any(summary[key] != scaling_point[key] for key in required):
+        return {}
+    return {key: scaling_point[key] for key in required}
+
+
+def _cell_is_current(
+    run_dir: Path,
+    cfg:     VFE3Config,
+    dataset: str,
+
+    max_tokens: Optional[int] = None,
+
+    *,
+    source_identities: Optional[Mapping[str, object]] = None,
+    code_identity:     Optional[Mapping[str, object]] = None,
+) -> bool:
     r"""True iff the run dir already holds a summary.json AND its config.json equals the config we would
     build now (guards resume against baseline drift / a changed dataset). ``max_tokens`` is a loader
     seam, not a VFE3Config field, so it never lands in config.json; it is compared against the
-    persisted scaling_cell.json (a missing/old cell meta or key fails closed -> re-run). The saved
-    code identity must match the current HEAD; dirty reuse additionally requires equal nonempty
-    dirty-tree fingerprints."""
-    if not (run_dir / "summary.json").exists() or not (run_dir / "config.json").exists():
+    persisted scaling_cell.json (a missing/old cell meta or key fails closed -> re-run). The summary
+    must carry the exact digest of that reuse contract, including its config, data, and code identity,
+    plus a complete, internally consistent metric payload. ``main`` supplies one invocation-owned
+    source snapshot so this check does not re-hash the corpus for every cached cell; standalone API
+    calls without a supplied snapshot retain the fresh per-call check. A persisted failure marker
+    invalidates reuse. The saved code identity must match the current HEAD; dirty reuse additionally
+    requires equal nonempty dirty-tree fingerprints."""
+    if (not (run_dir / "summary.json").exists()
+            or not (run_dir / "config.json").exists()
+            or (run_dir / "scaling_failure.json").exists()):
         return False
     try:
         saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
         built = json.loads(json.dumps(asdict(cfg), default=str))
     except Exception:
         return False
-    if saved.get("dataset") != dataset or saved.get("config") != built:
+    if (not isinstance(saved, Mapping) or not isinstance(summary, Mapping)
+            or saved.get("dataset") != dataset or saved.get("config") != built):
         return False
     try:
         cellmeta = json.loads((run_dir / "scaling_cell.json").read_text(encoding="utf-8"))
@@ -700,18 +834,46 @@ def _cell_is_current(run_dir: Path, cfg: VFE3Config, dataset: str, max_tokens: O
             return False
     except Exception:
         return False
+    if cellmeta.get("schema_version") != _SCALING_CELL_SCHEMA_VERSION:
+        return False
+    if cellmeta.get("dataset") != dataset:
+        return False
+    try:
+        built_sha256 = _canonical_json_sha256(built)
+        contract_sha256 = _scaling_reuse_contract_sha256(cellmeta)
+    except (TypeError, ValueError):
+        return False
+    saved_contract_sha256 = cellmeta.get(_SCALING_REUSE_DIGEST_FIELD)
+    if (not isinstance(saved_contract_sha256, str)
+            or len(saved_contract_sha256) != 64
+            or saved_contract_sha256 != contract_sha256
+            or summary.get(_SCALING_SUMMARY_DIGEST_FIELD) != saved_contract_sha256
+            or cellmeta.get("config_sha256") != built_sha256):
+        return False
+    if _scaling_result_status(_cached_scaling_metrics(summary)) != "complete":
+        return False
     if cellmeta.get("max_tokens", None) != (int(max_tokens) if max_tokens is not None else None):
         return False
     saved_sources = cellmeta.get("data_sources")
     if not isinstance(saved_sources, Mapping):
         return False
     try:
-        current_sources = _data_source_identities(dataset)
+        current_sources = (
+            _data_source_identities(dataset)
+            if source_identities is None
+            else _validated_data_source_identities(source_identities)
+        )
+        current = (
+            _validated_scaling_code_identity(_current_code_identity())
+            if code_identity is None
+            else _validated_scaling_code_identity(code_identity)
+        )
     except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError):
         return False
     if dict(saved_sources) != current_sources:
         return False
-    current = _current_code_identity()
+    if cellmeta.get("code_identity") != current:
+        return False
     saved_sha = provenance.get("git_sha")
     current_sha = current.get("git_sha")
     if not isinstance(saved_sha, str) or not saved_sha or saved_sha != current_sha:
@@ -734,14 +896,25 @@ def run_cell(
     seed:       int,
 
     *,
-    dataset:    str,
-    device:     torch.device,
-    max_tokens: Optional[int] = None,
-    max_steps:  Optional[int] = None,
+    dataset:            str,
+    device:             torch.device,
+    max_tokens:         Optional[int]                  = None,
+    max_steps:          Optional[int]                  = None,
+    source_identities:  Optional[Mapping[str, object]] = None,
+    code_identity:      Optional[Mapping[str, object]] = None,
 ) -> Dict[str, Any]:
     r"""Build a fresh model from baseline+overrides, train it, score the held-out TEST split via
     ``finalize_run``, and return a harvest dict. A cross-field config violation is caught and returned
     as ``error_kind='config'`` (not raised), keeping it distinct from a training crash."""
+    seed = _require_scaling_seed(seed)
+    invocation_sources = (
+        None if source_identities is None
+        else _validated_data_source_identities(source_identities)
+    )
+    invocation_code_identity = (
+        None if code_identity is None
+        else _validated_scaling_code_identity(code_identity)
+    )
     label = cell["label"]
     cfg_dict = _cell_cfg_dict(cell["overrides"], seed, max_steps)
     try:
@@ -749,22 +922,21 @@ def run_cell(
     except (ValueError, NotImplementedError, TypeError) as exc:
         logger.warning("  [config rejected] %s: %s", label, exc)
         return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
-                "error_kind": "config", "error": str(exc), "seed": int(seed),
+                "error_kind": "config", "error": str(exc), "seed": seed,
                 "test_ce": None, "test_ppl": None, "test_bits_per_token": None,
                 "test_bpc": None, "n_params": None}
 
-    if CONFIG["resume"] and _cell_is_current(run_dir, cfg, dataset, max_tokens=max_tokens):
+    if CONFIG["resume"] and _cell_is_current(
+            run_dir, cfg, dataset, max_tokens=max_tokens,
+            source_identities=invocation_sources,
+            code_identity=invocation_code_identity):
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-        sp = summary.get("scaling_point", {})
-        print(f"    [CACHED] {label} s{seed}  test_ce={sp.get('test_ce')}  N={sp.get('n_params')}")
+        metrics = _cached_scaling_metrics(summary)
+        print(f"    [CACHED] {label} s{seed}  test_ce={metrics['test_ce']}  "
+              f"N={metrics['n_params']}")
         return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
-                "error_kind": None, "seed": int(seed), "cached": True,
-                "test_ce": sp.get("test_ce", summary.get("test_ce")),
-                "test_ppl": sp.get("test_ppl", summary.get("test_ppl")),
-                "test_bits_per_token": sp.get(
-                    "test_bits_per_token", summary.get("test_bits_per_token")),
-                "test_bpc": sp.get("test_bpc", summary.get("test_bpc")),
-                "n_params": sp.get("n_params", summary.get("n_params"))}
+                "error_kind": None, "seed": seed, "cached": True,
+                **metrics}
 
     pred_n, n_gen = predict_n_params(cfg)
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
@@ -781,6 +953,26 @@ def run_cell(
     test_loader  = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "test",
                               vocab_size=cfg.vocab_size)
 
+    if invocation_sources is not None:
+        loaded_sources = _loader_data_source_identities(
+            train_loader,
+            val_loader,
+            test_loader,
+            dataset=dataset,
+            max_tokens=max_tokens,
+        )
+        if loaded_sources != invocation_sources:
+            raise RuntimeError(
+                "scaling corpus identity drifted between the invocation snapshot and loader build")
+    else:
+        # Direct API callers retain the historical behavior: take one fresh source snapshot for this
+        # standalone cell. ``main`` always supplies its invocation-owned shared snapshot instead.
+        loaded_sources = _data_source_identities(dataset)
+    cell_code_identity = (
+        _validated_scaling_code_identity(_current_code_identity())
+        if invocation_code_identity is None else invocation_code_identity
+    )
+
     # Order-INDEPENDENT data stream: model build consumed config-dependent RNG, so reseed AFTER it and
     # re-seed each loader's generator so every cell sees the same batch sequence regardless of grid
     # position (per-seed variance is then init/optimization variance, not a data-order artifact).
@@ -794,13 +986,21 @@ def run_cell(
     artifacts = RunArtifacts(run_dir, cfg, model, dataset=dataset, device=device,
                              timestamp=datetime.now().isoformat(timespec="seconds"))
     # Cell provenance the per-run config.json does not carry: which ROUTE / scale knob produced this N.
-    artifacts.save_json("scaling_cell.json", {
+    cellmeta: Dict[str, object] = {
+        "schema_version": _SCALING_CELL_SCHEMA_VERSION,
         "label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
         "overrides": json.loads(json.dumps(cell["overrides"], default=str)),
-        "predicted_n_params": pred_n, "n_gen": n_gen, "seed": int(seed),
+        "predicted_n_params": pred_n, "n_gen": n_gen, "seed": seed,
         "max_tokens": (int(max_tokens) if max_tokens is not None else None),
-        "data_sources": _data_source_identities(dataset),
-    })
+        "dataset": dataset,
+        "config_sha256": _canonical_json_sha256(
+            json.loads(json.dumps(asdict(cfg), default=str))),
+        "code_identity": cell_code_identity,
+        "data_sources": loaded_sources,
+    }
+    reuse_contract_sha256 = _scaling_reuse_contract_sha256(cellmeta)
+    cellmeta[_SCALING_REUSE_DIGEST_FIELD] = reuse_contract_sha256
+    artifacts.save_json("scaling_cell.json", cellmeta)
 
     val_tpc = _tokens_per_char(dataset, "validation")
     test_tpc = _tokens_per_char(dataset, "test")
@@ -827,6 +1027,13 @@ def run_cell(
         wall_time=wall,
         logger=logger,
     )
+    summary_path = run_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not isinstance(summary, Mapping):
+        raise RuntimeError("scaling summary must be a JSON object")
+    bound_summary = dict(summary)
+    bound_summary[_SCALING_SUMMARY_DIGEST_FIELD] = reuse_contract_sha256
+    _write_json_atomic(summary_path, bound_summary)
     return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
             "error_kind": None, "seed": int(cfg.seed), "cached": False,
             "test_ce": results.get("test_ce"), "test_ppl": results.get("test_ppl"),
@@ -865,12 +1072,85 @@ def validate_routes() -> None:
 def _validated_scaling_seeds(raw_seeds: object) -> List[int]:
     if not isinstance(raw_seeds, (list, tuple)) or not raw_seeds:
         raise ValueError("CONFIG['seeds'] must be a non-empty list or tuple of unique integers")
-    if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in raw_seeds):
+    if any(type(seed) is not int for seed in raw_seeds):
         raise ValueError("CONFIG['seeds'] must contain exact integers")
-    seeds = [int(seed) for seed in raw_seeds]
+    seeds = list(raw_seeds)
+    if any(seed < 0 for seed in seeds):
+        raise ValueError("CONFIG['seeds'] must contain nonnegative integers")
     if len(set(seeds)) != len(seeds):
         raise ValueError(f"CONFIG['seeds'] must be unique, got {seeds!r}")
     return seeds
+
+
+_WINDOWS_RESERVED_PATH_STEMS = {
+    "aux",
+    "con",
+    "nul",
+    "prn",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+
+
+def _scaling_path_component_key(value: str, *, field: str) -> str:
+    """Validate one portable directory name and return its collision key."""
+    invalid_windows_chars = '<>:"/\\|?*'
+    platform_reserved = getattr(os.path, "isreserved", None)
+    invalid = (
+        not value
+        or value != value.strip()
+        or value in {".", ".."}
+        or len(value) > 255
+        or any(ord(char) < 32 for char in value)
+        or any(char in invalid_windows_chars for char in value)
+        or value[-1] in {" ", "."}
+        or value.split(".", maxsplit=1)[0].casefold() in _WINDOWS_RESERVED_PATH_STEMS
+        or (platform_reserved is not None and platform_reserved(value))
+    )
+    if invalid:
+        raise ValueError(
+            f"{field} must be a safe single path component, got {value!r}"
+        )
+    return unicodedata.normalize("NFC", value).casefold()
+
+
+def _validated_scaling_routes(raw_routes: object) -> List[str]:
+    if not isinstance(raw_routes, (list, tuple)) or not raw_routes:
+        raise ValueError("CONFIG['routes'] must be a non-empty list or tuple of unique route names")
+    if any(not isinstance(name, str) or not name for name in raw_routes):
+        raise ValueError("CONFIG['routes'] must contain nonempty strings")
+    route_names = list(raw_routes)
+    if len(set(route_names)) != len(route_names):
+        raise ValueError(f"CONFIG['routes'] must be unique, got {route_names!r}")
+    route_keys = [
+        _scaling_path_component_key(name, field="scaling route name")
+        for name in route_names
+    ]
+    if len(set(route_keys)) != len(route_keys):
+        raise ValueError(
+            f"CONFIG['routes'] must not contain filesystem aliases, got {route_names!r}"
+        )
+    for name in route_names:
+        if name not in ROUTES:
+            raise ValueError(f"unknown route {name!r}; choose from {sorted(ROUTES)}")
+        cells = ROUTES[name]
+        if not cells:
+            raise ValueError(f"route {name!r} must contain at least one scaling cell")
+        labels = [cell.get("label") if isinstance(cell, Mapping) else None for cell in cells]
+        if any(not isinstance(label, str) or not label for label in labels):
+            raise ValueError(f"route {name!r} cell labels must be nonempty strings")
+        if len(set(labels)) != len(labels):
+            raise ValueError(f"route {name!r} cell labels must be unique, got {labels!r}")
+        label_keys = [
+            _scaling_path_component_key(label, field=f"route {name!r} cell label")
+            for label in labels
+        ]
+        if len(set(label_keys)) != len(label_keys):
+            raise ValueError(
+                f"route {name!r} cell labels must not contain filesystem aliases, "
+                f"got {labels!r}"
+            )
+    return route_names
 
 
 def _scaling_design(route_names: List[str], seeds: List[int]) -> Dict[str, Any]:
@@ -898,26 +1178,54 @@ def _scaling_design(route_names: List[str], seeds: List[int]) -> Dict[str, Any]:
 def _scaling_result_status(result: Mapping[str, Any]) -> str:
     if result.get("error_kind") is not None:
         return "failed"
-    value = result.get("test_ce")
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(float(value)) or float(value) <= 0.0):
+
+    def _finite_positive(value: object) -> bool:
+        return (not isinstance(value, bool) and isinstance(value, (int, float))
+                and math.isfinite(float(value)) and float(value) > 0.0)
+
+    if type(result.get("n_params")) is not int or result["n_params"] <= 0:
+        return "nonfinite"
+    required_metrics = ("test_ce", "test_ppl", "test_bits_per_token", "test_bpc")
+    if any(key not in result for key in required_metrics):
+        return "nonfinite"
+    test_ce = result["test_ce"]
+    test_ppl = result["test_ppl"]
+    test_bits = result["test_bits_per_token"]
+    test_bpc = result["test_bpc"]
+    if not all(_finite_positive(value) for value in (test_ce, test_ppl, test_bits)):
+        return "nonfinite"
+    if test_bpc is not None and not _finite_positive(test_bpc):
+        return "nonfinite"
+    expected_ppl = math.exp(min(float(test_ce), 20.0))
+    expected_bits = float(test_ce) / math.log(2.0)
+    if (not math.isclose(float(test_ppl), expected_ppl, rel_tol=1e-9, abs_tol=1e-12)
+            or not math.isclose(float(test_bits), expected_bits, rel_tol=1e-9, abs_tol=1e-12)):
         return "nonfinite"
     return "complete"
 
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    route_names = _validated_scaling_routes(CONFIG["routes"])
+    seeds = _validated_scaling_seeds(CONFIG["seeds"])
+    validate_routes()
+    try:
+        invocation_code_identity = _validated_scaling_code_identity(
+            _current_code_identity())
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        logger.error("scaling code identity snapshot failed before execution: %s", exc)
+        return 1
+    try:
+        invocation_sources = _validated_data_source_identities(
+            _data_source_identities(CONFIG["dataset"]))
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        logger.error("scaling source identity snapshot failed before execution: %s", exc)
+        return 1
     device = (torch.device("cuda" if torch.cuda.is_available() else "cpu")
               if CONFIG["device"] == "auto" else torch.device(CONFIG["device"]))
     output_dir = Path(CONFIG["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    route_names = list(CONFIG["routes"])
-    for name in route_names:
-        if name not in ROUTES:
-            raise ValueError(f"unknown route {name!r}; choose from {sorted(ROUTES)}")
-    validate_routes()
-    seeds = _validated_scaling_seeds(CONFIG["seeds"])
     design = _scaling_design(route_names, seeds)
     design_path = output_dir / "scaling_design.json"
     _write_json_atomic(design_path, design)
@@ -939,7 +1247,9 @@ def main() -> int:
                 run_dir = output_dir / name / cell["label"] / f"s{seed}"
                 try:
                     res = run_cell(cell, run_dir, int(seed), dataset=CONFIG["dataset"], device=device,
-                                   max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"])
+                                   max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"],
+                                   source_identities=invocation_sources,
+                                   code_identity=invocation_code_identity)
                 except Exception as exc:                     # a training crash must not kill the suite
                     logger.exception("route %s / %s s%d crashed", name, cell["label"], seed)
                     res = {"label": cell["label"], "route": name, "error_kind": "train",
@@ -955,12 +1265,18 @@ def main() -> int:
                     if published.get("error_kind") is None:
                         published["error_kind"] = "nonfinite"
                     if published.get("error") is None:
-                        published["error"] = "test_ce is absent, non-finite, or non-positive"
+                        published["error"] = (
+                            "scaling result is incomplete, non-finite, non-positive, or inconsistent")
                 run_dir.mkdir(parents=True, exist_ok=True)
                 _write_json_atomic(run_dir / "scaling_result.json", published)
                 if status != "complete":
                     _write_json_atomic(run_dir / "scaling_failure.json", published)
                     incomplete = True
+                else:
+                    try:
+                        (run_dir / "scaling_failure.json").unlink()
+                    except FileNotFoundError:
+                        pass
                 manifest_cell = design_cells[(name, cell["label"], int(seed))]
                 manifest_cell.update({
                     "status": status,
@@ -972,6 +1288,26 @@ def main() -> int:
                 if status == "complete" and not res.get("cached"):
                     print(f"      -> test_ce={res.get('test_ce')}  ppl={res.get('test_ppl')}  "
                           f"({res.get('wall_time_s', 0.0):.0f}s)")
+
+    invocation_errors: List[str] = []
+    try:
+        terminal_sources = _validated_data_source_identities(
+            _data_source_identities(CONFIG["dataset"]))
+        if terminal_sources != invocation_sources:
+            invocation_errors.append(
+                "data source identities drifted during the scaling invocation")
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        invocation_errors.append(f"terminal data source identity snapshot failed: {exc}")
+    try:
+        terminal_code_identity = _validated_scaling_code_identity(_current_code_identity())
+        if terminal_code_identity != invocation_code_identity:
+            invocation_errors.append(
+                "code identity drifted during the scaling invocation")
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        invocation_errors.append(f"terminal code identity snapshot failed: {exc}")
+    if invocation_errors:
+        incomplete = True
+        design["error"] = "; ".join(invocation_errors)
 
     design["status"] = "incomplete" if incomplete else "complete"
     _write_json_atomic(design_path, design)

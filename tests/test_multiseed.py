@@ -5,6 +5,7 @@ research scalars, figure set) added 2026-06-22.
 """
 import json
 import math
+from enum import IntEnum
 
 import numpy as np
 import pytest
@@ -63,7 +64,21 @@ def _write_full_run(d, *, ppl, seed, metrics=None, per_layer=None, research=None
     (d / "summary.json").write_text(json.dumps({"test_ppl": ppl}))
     config = {"seed": None} if config is None else config
     (d / "config.json").write_text(json.dumps(config))                    # real seed lives in provenance
-    (d / "provenance.json").write_text(json.dumps({"seed": seed}))
+    (d / "provenance.json").write_text(json.dumps({
+        "seed": seed,
+        "git_sha": "a" * 40,
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+        "train_data_sha256": "b" * 64,
+        "train_data_n_tokens": 100,
+        "val_data_sha256": "c" * 64,
+        "val_data_n_tokens": 20,
+        "test_data_sha256": "d" * 64,
+        "test_data_n_tokens": 20,
+        "data_seed": 3,
+        "max_tokens": None,
+        "tokenizer_tag": "synthetic",
+    }))
     if metrics is not None:
         (d / "metrics.csv").write_text(metrics)
     if per_layer is not None:
@@ -94,8 +109,8 @@ def test_resolve_run_root_prefers_existing_literal(tmp_path, monkeypatch):
     assert ms._resolve_run_root("explicit").resolve() == (tmp_path / "explicit").resolve()
 
 
-def test_seed_for_prefers_provenance_over_config(tmp_path):
-    d = tmp_path / "run_s3"
+def test_seed_for_accepts_agreeing_provenance_and_directory_identity(tmp_path):
+    d = tmp_path / "run_s99"
     d.mkdir()
     (d / "provenance.json").write_text(json.dumps({"seed": 99}))
     (d / "config.json").write_text(json.dumps({"seed": None}))
@@ -110,6 +125,91 @@ def test_seed_for_falls_back_to_config_then_dirname(tmp_path):
     name = tmp_path / "wikitext_K20_s42"
     name.mkdir()
     assert ms._seed_for(name) == 42
+
+
+@pytest.mark.parametrize("bad_seed", [True, 1.5, "1", -1])
+def test_seed_for_rejects_malformed_high_priority_seed_without_fallback(tmp_path, bad_seed):
+    run = tmp_path / "run_s42"
+    run.mkdir()
+    (run / "provenance.json").write_text(json.dumps({"seed": bad_seed}), encoding="utf-8")
+    (run / "config.json").write_text(json.dumps({"seed": 5}), encoding="utf-8")
+
+    assert ms._seed_for(run) is None
+
+
+def test_seed_for_rejects_malformed_high_priority_json_without_fallback(tmp_path):
+    run = tmp_path / "run_s42"
+    run.mkdir()
+    (run / "provenance.json").write_text("{ not json", encoding="utf-8")
+    (run / "config.json").write_text(json.dumps({"seed": 5}), encoding="utf-8")
+
+    assert ms._seed_for(run) is None
+
+
+def test_seed_for_explicit_none_or_absent_key_allows_agreeing_fallback(tmp_path):
+    explicit_none = tmp_path / "none_s5"
+    explicit_none.mkdir()
+    (explicit_none / "provenance.json").write_text(json.dumps({"seed": None}), encoding="utf-8")
+    (explicit_none / "config.json").write_text(json.dumps({"seed": 5}), encoding="utf-8")
+    absent_key = tmp_path / "absent_s42"
+    absent_key.mkdir()
+    (absent_key / "provenance.json").write_text(json.dumps({"git_sha": "abc"}), encoding="utf-8")
+
+    assert ms._seed_for(explicit_none) == 5
+    assert ms._seed_for(absent_key) == 42
+
+
+@pytest.mark.parametrize("bad_seed", [True, 1.5, "1", -1])
+def test_multiseed_manifest_rejects_nonexact_or_negative_requested_seed(
+    tmp_path, monkeypatch, bad_seed,
+):
+    request_path = tmp_path / "multiseed_request.json"
+    request_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(ms, "_read_json", lambda path: {
+        "schema_version": 1,
+        "status": "complete",
+        "seeds": [bad_seed],
+        "cells": [{"seed": bad_seed, "status": "complete"}],
+    })
+
+    manifest = ms._request_manifest(tmp_path, [7])
+
+    assert manifest["request_verified"] is False
+    assert manifest["requested_seeds"] == [7]
+
+
+def test_multiseed_manifest_rejects_integer_enum_requested_seed(tmp_path, monkeypatch):
+    class Seed(IntEnum):
+        ONE = 1
+
+    request_path = tmp_path / "multiseed_request.json"
+    request_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(ms, "_read_json", lambda path: {
+        "schema_version": 1,
+        "status": "complete",
+        "seeds": [Seed.ONE],
+        "cells": [{"seed": Seed.ONE, "status": "complete"}],
+    })
+
+    assert ms._request_manifest(tmp_path, [7])["request_verified"] is False
+
+
+def test_multiseed_manifest_rejects_integer_enum_observed_seed(tmp_path):
+    class Seed(IntEnum):
+        ONE = 1
+
+    manifest = ms._request_manifest(tmp_path, [Seed.ONE])
+
+    assert manifest["request_verified"] is False
+    assert manifest["requested_seeds"] == []
+
+
+@pytest.mark.parametrize("bad_seed", [True, 1.5, "1", -1])
+def test_multiseed_manifest_rejects_invalid_observed_seed_without_request(tmp_path, bad_seed):
+    manifest = ms._request_manifest(tmp_path, [bad_seed])
+
+    assert manifest["request_verified"] is False
+    assert manifest["requested_seeds"] == []
 
 
 def test_aggregate_seed_metric_uses_provenance_seed(tmp_path):
@@ -245,6 +345,140 @@ def test_aggregate_seed_curves_aligns_every_requested_seed(tmp_path):
     np.testing.assert_allclose(curves["x"]["n"], [2, 2])
     np.testing.assert_allclose(curves["y"]["mean"], [6.0, 10.0])
     np.testing.assert_allclose(curves["y"]["n"], [2, 2])
+
+
+def test_aggregate_seed_curves_respects_metric_specific_cadence(tmp_path, monkeypatch):
+    _write_request(tmp_path, [1, 2])
+    per_layer = "layer,self_coupling\n0,1\n"
+    _write_full_run(
+        tmp_path / "a",
+        ppl=1.0,
+        seed=1,
+        metrics=(
+            "step,train_ce,val_ppl,unsupported\n"
+            "100,5,,\n"
+            "200,4,10,\n"
+            "300,3,,\n"
+        ),
+        per_layer=per_layer,
+    )
+    _write_full_run(
+        tmp_path / "b",
+        ppl=1.0,
+        seed=2,
+        metrics=(
+            "step,train_ce,val_ppl,unsupported\n"
+            "100,7,,\n"
+            "200,6,14,\n"
+            "300,5,,\n"
+        ),
+        per_layer=per_layer,
+    )
+
+    curves = ms.aggregate_seed_curves(tmp_path)
+
+    assert set(curves) == {"train_ce", "val_ppl"}
+    np.testing.assert_allclose(curves["train_ce"]["steps"], [100, 200, 300])
+    np.testing.assert_allclose(curves["train_ce"]["mean"], [6.0, 5.0, 4.0])
+    np.testing.assert_allclose(curves["train_ce"]["n"], [2, 2, 2])
+    np.testing.assert_allclose(curves["val_ppl"]["steps"], [200])
+    np.testing.assert_allclose(curves["val_ppl"]["mean"], [12.0])
+    np.testing.assert_allclose(curves["val_ppl"]["n"], [2])
+
+    emitted = []
+    monkeypatch.setitem(ms.CONFIG, "run_root", str(tmp_path))
+    monkeypatch.setitem(ms.CONFIG, "key", "test_ppl")
+    monkeypatch.setattr(ms, "SCALAR_KEYS", ["test_ppl"])
+    monkeypatch.setattr(ms, "_emit_figures", lambda *args: emitted.append(args))
+
+    ms.main()
+
+    summary = json.loads((tmp_path / "multiseed_summary.json").read_text(encoding="utf-8"))
+    assert summary["design"]["complete"] is True
+    assert summary["diagnostics"]["curves_complete"] is True
+    assert summary["withheld"] == {
+        "scalars": False,
+        "curves": False,
+        "per_layer": False,
+        "figures": False,
+    }
+    assert set(summary["curves_final_step"]) == {"train_ce", "val_ppl"}
+    assert len(emitted) == 1
+
+
+def test_main_publishes_complete_nonlayer_channels_when_run_figures_are_disabled(
+    tmp_path, monkeypatch,
+):
+    _write_request(tmp_path, [1, 2])
+    for seed, ppl, train_ce in ((1, 10.0, 5.0), (2, 12.0, 7.0)):
+        _write_full_run(
+            tmp_path / f"run_s{seed}",
+            ppl=ppl,
+            seed=seed,
+            metrics=f"step,train_ce\n100,{train_ce}\n",
+            config={"config": {"seed": seed, "generate_figures": False}},
+        )
+
+    emitted = []
+    monkeypatch.setitem(ms.CONFIG, "run_root", str(tmp_path))
+    monkeypatch.setitem(ms.CONFIG, "key", "test_ppl")
+    monkeypatch.setattr(ms, "SCALAR_KEYS", ["test_ppl"])
+    monkeypatch.setattr(ms, "_emit_figures", lambda *args: emitted.append(args))
+
+    ms.main()
+
+    summary = json.loads((tmp_path / "multiseed_summary.json").read_text(encoding="utf-8"))
+    assert summary["design"]["complete"] is True
+    assert summary["scalars"]["test_ppl"]["mean"] == pytest.approx(11.0)
+    assert summary["curves_final_step"]["train_ce"]["mean"] == pytest.approx(6.0)
+    assert summary["per_layer"] == {}
+    assert summary["withheld"] == {
+        "scalars": False,
+        "curves": False,
+        "per_layer": False,
+        "figures": False,
+    }
+    assert summary["diagnostics"]["per_layer_requested"] is False
+    assert summary["diagnostics"]["per_layer_complete"] is True
+    assert len(emitted) == 1
+    assert emitted[0][3] == {}
+
+
+def test_main_withholds_only_partial_optional_per_layer_channel(tmp_path, monkeypatch):
+    _write_request(tmp_path, [1, 2])
+    for seed, ppl, train_ce in ((1, 10.0, 5.0), (2, 12.0, 7.0)):
+        _write_full_run(
+            tmp_path / f"run_s{seed}",
+            ppl=ppl,
+            seed=seed,
+            metrics=f"step,train_ce\n100,{train_ce}\n",
+            per_layer="layer,self_coupling\n0,1\n" if seed == 1 else None,
+            config={"config": {"seed": seed, "generate_figures": False}},
+        )
+
+    emitted = []
+    monkeypatch.setitem(ms.CONFIG, "run_root", str(tmp_path))
+    monkeypatch.setitem(ms.CONFIG, "key", "test_ppl")
+    monkeypatch.setattr(ms, "SCALAR_KEYS", ["test_ppl"])
+    monkeypatch.setattr(ms, "_emit_figures", lambda *args: emitted.append(args))
+
+    ms.main()
+
+    summary = json.loads((tmp_path / "multiseed_summary.json").read_text(encoding="utf-8"))
+    assert summary["design"]["complete"] is True
+    assert summary["scalars"]["test_ppl"]["mean"] == pytest.approx(11.0)
+    assert summary["curves_final_step"]["train_ce"]["mean"] == pytest.approx(6.0)
+    assert summary["per_layer"] == {}
+    assert summary["withheld"] == {
+        "scalars": False,
+        "curves": False,
+        "per_layer": True,
+        "figures": False,
+    }
+    assert summary["diagnostics"]["per_layer_requested"] is True
+    assert summary["diagnostics"]["per_layer_complete"] is False
+    assert len(emitted) == 1
+    assert emitted[0][3] == {}
 
 
 @pytest.mark.parametrize(

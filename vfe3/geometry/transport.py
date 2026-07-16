@@ -1168,6 +1168,10 @@ def stable_matrix_exp_pair(
 
     with torch.no_grad():
         raw_mat_norm = matrix.norm(dim=(-2, -1), keepdim=True)
+        if validity_max_norm is not None and bool((~torch.isfinite(raw_mat_norm)).any()):
+            raise ValueError(
+                "transport chart validity bound encountered a nonfinite matrix norm"
+            )
         if validity_max_norm is not None and bool((raw_mat_norm > validity_max_norm).any()):
             observed = float(raw_mat_norm.max())
             raise ValueError(
@@ -1394,13 +1398,13 @@ def group_element_inverse(
     *,
     residual_tol: float = 1e-4,
 ) -> 'torch.Tensor | CompactBlockElement':
-    r"""Group-element inverse with a rowwise orthogonality-residual gate.
+    r"""Group-element inverse with a rowwise exact-orthogonality gate.
 
-    For a skew-generator group, the transpose approximation is used only when
-    ``||U^T U - I||_F <= residual_tol`` for that row. The residual is evaluated in a bounded
-    float64 island. Unless a row is exactly orthogonal, this fast path approximates rather than
-    equals its inverse. Drifted skew rows and every non-skew row use a true float64 inverse. The
-    public result is cast back to ``omega.dtype`` so the surrounding float32 path is unchanged.
+    For a skew-generator group, the transpose is used only when ``U^T U`` equals the identity
+    exactly for that represented row in a bounded float64 check. Every row with any represented
+    orthogonality drift, and every non-skew row, uses a true float64 inverse. ``residual_tol`` is
+    retained for call compatibility and validation; it never widens the exact predicate. The public
+    result is cast back to ``omega.dtype`` so the surrounding float32 path is unchanged.
     """
     if not math.isfinite(residual_tol) or residual_tol < 0.0:
         raise ValueError(
@@ -1422,12 +1426,9 @@ def group_element_inverse(
     with torch.no_grad(), torch.amp.autocast(omega.device.type, enabled=False):
         omega_check = omega_flat.detach().double()
         eye = torch.eye(K, device=omega.device, dtype=torch.float64)
-        residual = (
-            omega_check.transpose(-1, -2) @ omega_check - eye
-        ).norm(dim=(-2, -1))
-        dtype_tol = 4.0 * K * torch.finfo(omega.dtype).eps
-        exact_tol = min(residual_tol, dtype_tol)
-        drifted = ~torch.isfinite(residual) | (residual > exact_tol)
+        gram = omega_check.transpose(-1, -2) @ omega_check
+        exactly_orthogonal = (gram == eye).all(dim=(-2, -1))
+        drifted = ~exactly_orthogonal
 
     if not bool(drifted.any()):
         return omega.transpose(-1, -2)
@@ -1453,9 +1454,9 @@ def build_transport_from_element(
     directly. CompactBlockElement inputs invert their d x d blocks and return
     CompactFactoredTransport, so every contraction remains compact.
 
-    U_j^{-1} uses :func:`group_element_inverse`: non-skew rows and drifted skew rows enter a bounded
-    float64 inverse island, while skew rows satisfying the orthogonality-residual tolerance use the
-    transpose approximation fast path. Public inverse factors return to the input dtype. For
+    U_j^{-1} uses :func:`group_element_inverse`: non-skew rows and any skew rows with represented
+    orthogonality drift enter a bounded float64 inverse island. Only rows whose float64 Gram matrix
+    is exactly the identity use the transpose fast path. Public inverse factors return to the input dtype. For
     equal-block dense groups (block_glk) a FactoredTransport is returned so the per-head fast paths
     run; for a compact equal-block element, CompactFactoredTransport is returned; for a single block
     (glk), the dense {'exp_phi','exp_neg_phi','Omega'} dict is returned (matching
@@ -1498,6 +1499,10 @@ def _stable_compact_glk_exp_pair(
         )
     with torch.no_grad():
         raw_mat_norm = blocks.square().sum(dim=(-3, -2, -1), keepdim=True).sqrt()
+        if validity_max_norm is not None and bool((~torch.isfinite(raw_mat_norm)).any()):
+            raise ValueError(
+                "transport chart validity bound encountered a nonfinite matrix norm"
+            )
         if validity_max_norm is not None and bool((raw_mat_norm > validity_max_norm).any()):
             observed = float(raw_mat_norm.max())
             raise ValueError(
@@ -1845,7 +1850,10 @@ def transport_scale(
         scale.square(),
         diagonal_out=diagonal_out,
     )
-    return variance_proxy.clamp(min=0.0).sqrt()
+    variance_proxy = variance_proxy.clamp_min(0.0)
+    positive = variance_proxy > 0.0
+    safe_variance = torch.where(positive, variance_proxy, torch.ones_like(variance_proxy))
+    return torch.where(positive, safe_variance.sqrt(), torch.zeros_like(safe_variance))
 
 
 def _direct_link_mean(

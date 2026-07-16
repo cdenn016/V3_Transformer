@@ -15,6 +15,7 @@ optimizer momentum (exp_avg/exp_avg_sq), or the scheduler's ``last_epoch``.
 
 import math
 from dataclasses import asdict
+from enum import IntEnum
 from pathlib import Path
 
 import pytest
@@ -32,7 +33,11 @@ from vfe3.run_artifacts import (
     load_checkpoint,
     semantic_config_fingerprint,
 )
-from vfe3.train import TrainingTerminalState, _loader_data_identity, build_optimizer, train
+from vfe3.train import TrainingTerminalState, _loader_data_identity, build_optimizer, train, train_step
+
+
+class _StepEnum(IntEnum):
+    ONE = 1
 
 
 def _const_loader(seq_len: int = 8, bs: int = 4) -> DataLoader:
@@ -81,6 +86,307 @@ def test_load_checkpoint_restores_model_and_returns_step(tmp_path):
         assert torch.equal(restored, original)                 # exact model-state restore
 
 
+@pytest.mark.parametrize("bad_step", (True, -1, 1.5, "1", _StepEnum.ONE))
+def test_save_checkpoint_rejects_noninteger_or_negative_step(tmp_path, bad_step):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model)
+
+    with pytest.raises(ValueError, match="step.*non-negative integer"):
+        artifacts.save_checkpoint(bad_step, model, build_optimizer(model, cfg), cfg)
+
+    assert not list(artifacts.ckpt_dir.glob("*.pt"))
+
+
+@pytest.mark.parametrize("bad_step", (True, -4, 2.9, "3", _StepEnum.ONE))
+def test_load_checkpoint_rejects_bad_step_before_model_mutation(tmp_path, bad_step):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "run", cfg, source)
+    checkpoint = artifacts.save_checkpoint(1, source, build_optimizer(source, cfg), cfg)
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["step"] = bad_step
+    malformed = tmp_path / "malformed-step.pt"
+    torch.save(bundle, malformed)
+
+    target = VFEModel(cfg)
+    before = _params(target)
+    load_cfg = _cfg(trust_resume_checkpoint=isinstance(bad_step, IntEnum))
+    with pytest.raises(ValueError, match="step.*non-negative integer"):
+        load_checkpoint(malformed, target, cfg=load_cfg)
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
+def test_load_checkpoint_rejects_step_above_bound_before_any_mutation(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        2, source, build_optimizer(source, cfg), cfg)
+    target = VFEModel(cfg)
+    before = _params(target)
+    torch.manual_seed(999)
+    rng_before = torch.get_rng_state().clone()
+
+    with pytest.raises(ValueError, match="checkpoint step 2.*max_step=1"):
+        load_checkpoint(checkpoint, target, restore_rng=True, max_step=1)
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+
+
+def test_load_checkpoint_rejects_malformed_model_state_without_partial_mutation(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, build_optimizer(source, cfg), cfg)
+    bundle = torch.load(checkpoint, weights_only=True)
+    keys = list(bundle["model_state"])
+    bundle["model_state"][keys[0]] = bundle["model_state"][keys[0]] + 7.0
+    del bundle["model_state"][keys[-1]]
+    malformed = tmp_path / "malformed-model-state.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="model_state keys"):
+        load_checkpoint(malformed, target)
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
+@pytest.mark.parametrize("clock_case", ("fraction", "partial", "disagree", "beyond_step"))
+def test_load_checkpoint_rejects_invalid_successful_update_clocks(tmp_path, clock_case):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, build_optimizer(source, cfg), cfg)
+    bundle = torch.load(checkpoint, weights_only=True)
+    groups = bundle["optimizer_state"]["param_groups"]
+    if clock_case == "fraction":
+        for group in groups:
+            group["successful_updates"] = 0.5
+    elif clock_case == "partial":
+        groups[0]["successful_updates"] = 0
+    elif clock_case == "disagree":
+        for index, group in enumerate(groups):
+            group["successful_updates"] = index % 2
+    else:
+        for group in groups:
+            group["successful_updates"] = 2
+    malformed = tmp_path / f"bad-clock-{clock_case}.pt"
+    torch.save(bundle, malformed)
+
+    target = VFEModel(cfg)
+    with pytest.raises(RuntimeError, match="successful_updates"):
+        load_checkpoint(malformed, target, build_optimizer(target, cfg))
+
+
+def test_load_checkpoint_requires_optimizer_state_when_optimizer_is_supplied(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, build_optimizer(source, cfg), cfg)
+    bundle = torch.load(checkpoint, weights_only=True)
+    del bundle["optimizer_state"]
+    malformed = tmp_path / "missing-optimizer.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+
+    with pytest.raises(RuntimeError, match="optimizer_state"):
+        load_checkpoint(malformed, target, build_optimizer(target, cfg))
+
+
+def test_load_checkpoint_rejects_malformed_adam_slots_before_mutation(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    optimizer = build_optimizer(source, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    tokens, targets = next(iter(_const_loader()))
+    train_step(source, optimizer, scheduler, tokens, targets)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, optimizer, cfg)
+    bundle = torch.load(checkpoint, weights_only=True)
+    populated = next(state for state in bundle["optimizer_state"]["state"].values()
+                     if "exp_avg" in state)
+    del populated["exp_avg"]
+    malformed = tmp_path / "missing-exp-avg.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="optimizer_state"):
+        load_checkpoint(malformed, target, build_optimizer(target, cfg))
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
+def _populated_optimizer_checkpoint(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    optimizer = build_optimizer(source, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    tokens, targets = next(iter(_const_loader()))
+    train_step(source, optimizer, scheduler, tokens, targets)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, optimizer, cfg)
+    return cfg, source, checkpoint
+
+
+def test_load_checkpoint_rejects_deleted_populated_optimizer_slot_before_mutation(tmp_path):
+    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
+    bundle = torch.load(checkpoint, weights_only=True)
+    populated_id = next(
+        parameter_id for parameter_id, state in bundle["optimizer_state"]["state"].items()
+        if state)
+    del bundle["optimizer_state"]["state"][populated_id]
+    malformed = tmp_path / "deleted-populated-slot.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="populated parameter slots"):
+        load_checkpoint(malformed, target, build_optimizer(target, cfg))
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
+def test_load_checkpoint_rejects_parameter_step_beyond_successful_updates(tmp_path):
+    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
+    bundle = torch.load(checkpoint, weights_only=True)
+    populated = next(
+        state for state in bundle["optimizer_state"]["state"].values()
+        if "step" in state)
+    populated["step"] = torch.tensor(999.0)
+    malformed = tmp_path / "future-parameter-clock.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="AdamW step"):
+        load_checkpoint(malformed, target, build_optimizer(target, cfg))
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
+def test_load_checkpoint_rejects_invalid_rng_state_before_model_mutation(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, build_optimizer(source, cfg), cfg)
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["rng_state"]["cpu"] = torch.zeros(1, dtype=torch.uint8)
+    malformed = tmp_path / "bad-rng.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="rng_state"):
+        load_checkpoint(malformed, target)
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
+def test_load_checkpoint_requires_cuda_rng_states_on_an_active_cuda_host(tmp_path, monkeypatch):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, build_optimizer(source, cfg), cfg)
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["rng_state"]["cuda"] = None
+    malformed = tmp_path / "missing-cuda-rng.pt"
+    torch.save(bundle, malformed)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    target = VFEModel(cfg)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="active CUDA RNG"):
+        load_checkpoint(malformed, target)
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
+def test_load_checkpoint_rejects_nonstring_config_key_before_model_mutation(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, build_optimizer(source, cfg), cfg)
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["config"][7] = "invalid"
+    malformed = tmp_path / "nonstring-config-key.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="config keys must be strings"):
+        load_checkpoint(malformed, target, cfg=cfg)
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
+def test_load_checkpoint_rejects_invalid_scaler_state_before_model_mutation(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=8.0)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, build_optimizer(source, cfg), cfg, scaler=scaler)
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["scaler_state"]["scale"] = "oops"
+    bundle["scaler_state"]["_growth_tracker"] = -3
+    malformed = tmp_path / "bad-scaler.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="scaler_state"):
+        load_checkpoint(
+            malformed,
+            target,
+            build_optimizer(target, cfg),
+            scaler=torch.amp.GradScaler(device="cpu", enabled=True),
+        )
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
+def test_load_checkpoint_rejects_invalid_ema_state_before_model_mutation(tmp_path):
+    cfg = _cfg(use_ema=True, ema_decay=0.9)
+    source = VFEModel(cfg)
+    source_ema = EMA(source, decay=cfg.ema_decay)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, build_optimizer(source, cfg), cfg, ema=source_ema)
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["ema_state"]["decay"] = "0.5"
+    del bundle["ema_state"]["shadow"][next(iter(bundle["ema_state"]["shadow"]))]
+    malformed = tmp_path / "bad-ema.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    target_ema = EMA(target, decay=cfg.ema_decay)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="ema_state"):
+        load_checkpoint(
+            malformed,
+            target,
+            build_optimizer(target, cfg),
+            cfg=cfg,
+            ema=target_ema,
+        )
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
 def test_load_checkpoint_restores_optimizer_state(tmp_path):
     # Drive a real train() run so the checkpoint is written from the actual internal optimizer's
     # populated AdamW state (exp_avg/exp_avg_sq/step), then reload it into a fresh optimizer.
@@ -88,14 +394,21 @@ def test_load_checkpoint_restores_optimizer_state(tmp_path):
     torch.manual_seed(0)
     model = VFEModel(cfg)
     art = RunArtifacts(tmp_path / "r", cfg, model)
-    train(model, _const_loader(), cfg, n_steps=3, artifacts=art)
+    loader = _const_loader()
+    train(model, loader, cfg, n_steps=3, artifacts=art)
     ckpt = tmp_path / "r" / "checkpoints" / "step_3.pt"
     assert ckpt.exists()
 
     fresh = VFEModel(cfg)
     fresh_opt = build_optimizer(fresh, cfg)
     assert len(fresh_opt.state) == 0                            # fresh optimizer has no momentum yet
-    load_checkpoint(ckpt, fresh, fresh_opt)
+    load_checkpoint(
+        ckpt,
+        fresh,
+        fresh_opt,
+        data_state={},
+        expected_data_identity=_loader_data_identity(loader, cfg.vocab_size),
+    )
     assert len(fresh_opt.state) > 0                             # AdamW momentum buffers restored from the run
     # the restored 'step' counter matches the number of completed optimizer steps
     any_state = next(iter(fresh_opt.state.values()))
@@ -194,7 +507,7 @@ def test_resume_matches_uninterrupted_run_geometric_mstep(tmp_path):
 
 
 def _shuffled_loader(seq_len: int = 8, bs: int = 4, n: int = 480,
-                     data_seed: int = 123, loader_seed: int = 0) -> DataLoader:
+                      data_seed: int = 123, loader_seed: int = 0) -> DataLoader:
     # NONCONSTANT random stream + shuffle=True (RandomSampler): distinct windows, so the batch
     # sequence actually depends on the sampler's in-flight epoch permutation.
     dg = torch.Generator().manual_seed(data_seed)
@@ -202,6 +515,286 @@ def _shuffled_loader(seq_len: int = 8, bs: int = 4, n: int = 480,
     base = torch.randint(0, 6, (n,), generator=dg)
     ds = TokenWindows(base.to(torch.long), seq_len)
     return DataLoader(ds, batch_size=bs, shuffle=True, drop_last=True, generator=g)
+
+
+def _sequential_loader(seq_len: int = 8, bs: int = 4, n: int = 105,
+                       data_seed: int = 123, loader_seed: int | None = None) -> DataLoader:
+    generator = torch.Generator().manual_seed(data_seed)
+    tokens = torch.randint(0, 6, (n,), generator=generator)
+    loader_generator = (
+        torch.Generator().manual_seed(loader_seed) if loader_seed is not None else None)
+    return DataLoader(
+        TokenWindows(tokens.to(torch.long), seq_len),
+        batch_size=bs,
+        shuffle=False,
+        drop_last=True,
+        generator=loader_generator,
+    )
+
+
+def test_loader_data_identity_binds_full_iterator_contract() -> None:
+    tokens = torch.arange(160, dtype=torch.long) % 6
+
+    def loader(
+        *,
+        seq_len:   int  = 8,
+        batch_size: int = 4,
+        stride:    int | None = None,
+        shuffle:   bool = True,
+        drop_last: bool = True,
+    ) -> DataLoader:
+        dataset = TokenWindows(
+            tokens,
+            seq_len,
+            stride=stride,
+            pad_final=(not shuffle and not drop_last),
+        )
+        generator = torch.Generator().manual_seed(0) if shuffle else None
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            generator=generator,
+        )
+
+    reference = _loader_data_identity(loader(), 6)
+    variants = (
+        loader(batch_size=2),
+        loader(seq_len=4),
+        loader(stride=4),
+        loader(drop_last=False),
+        loader(shuffle=False),
+        loader(shuffle=False, drop_last=False),
+    )
+
+    assert all(_loader_data_identity(variant, 6) != reference for variant in variants)
+
+
+def test_sequential_resume_matches_uninterrupted_nonconstant_stream(tmp_path) -> None:
+    cfg = _cfg(checkpoint_interval=2, max_steps=6)
+
+    torch.manual_seed(0)
+    uninterrupted = VFEModel(cfg)
+    uninterrupted_losses = train(uninterrupted, _sequential_loader(), cfg, n_steps=6)
+    uninterrupted_parameters = _params(uninterrupted)
+
+    torch.manual_seed(0)
+    partial = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "partial", cfg, partial)
+    partial_losses = train(partial, _sequential_loader(), cfg, n_steps=2, artifacts=artifacts)
+    checkpoint = tmp_path / "partial" / "checkpoints" / "step_2.pt"
+    saved_data_state = torch.load(checkpoint, weights_only=True)["data_state"]
+
+    assert saved_data_state is not None
+    assert saved_data_state["epoch_start_generator_state"] is None
+    assert saved_data_state["batches_consumed"] == 2
+
+    resumed = VFEModel(cfg)
+    resumed_losses = train(
+        resumed,
+        _sequential_loader(),
+        cfg,
+        n_steps=6,
+        resume_from=checkpoint,
+    )
+
+    assert partial_losses + resumed_losses == uninterrupted_losses
+    for expected, actual in zip(uninterrupted_parameters, _params(resumed)):
+        assert torch.equal(expected, actual)
+
+
+def test_sequential_resume_ignores_non_sampling_loader_generator(tmp_path) -> None:
+    cfg = _cfg(checkpoint_interval=2, max_steps=6)
+
+    torch.manual_seed(0)
+    uninterrupted = VFEModel(cfg)
+    uninterrupted_losses = train(
+        uninterrupted, _sequential_loader(loader_seed=77), cfg, n_steps=6)
+    uninterrupted_parameters = _params(uninterrupted)
+
+    torch.manual_seed(0)
+    partial = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "partial", cfg, partial)
+    partial_losses = train(
+        partial, _sequential_loader(loader_seed=77), cfg, n_steps=2, artifacts=artifacts)
+    checkpoint = tmp_path / "partial" / "checkpoints" / "step_2.pt"
+
+    saved_data_state = torch.load(checkpoint, weights_only=True)["data_state"]
+    assert saved_data_state["epoch_start_generator_state"] is None
+
+    resumed = VFEModel(cfg)
+    resumed_losses = train(
+        resumed,
+        _sequential_loader(loader_seed=77),
+        cfg,
+        n_steps=6,
+        resume_from=checkpoint,
+    )
+
+    assert partial_losses + resumed_losses == uninterrupted_losses
+    for expected, actual in zip(uninterrupted_parameters, _params(resumed)):
+        assert torch.equal(expected, actual)
+
+
+def test_sequential_resume_replay_does_not_consume_restored_global_rng(tmp_path) -> None:
+    cfg = _cfg(checkpoint_interval=2, max_steps=2)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "partial", cfg, model)
+    train(model, _sequential_loader(), cfg, n_steps=2, artifacts=artifacts)
+    checkpoint = tmp_path / "partial" / "checkpoints" / "step_2.pt"
+    expected_rng = torch.load(checkpoint, weights_only=True)["rng_state"]["cpu"]
+
+    torch.manual_seed(991)
+    resumed = VFEModel(cfg)
+    train(
+        resumed,
+        _sequential_loader(),
+        cfg,
+        n_steps=2,
+        resume_from=checkpoint,
+    )
+
+    assert torch.equal(torch.get_rng_state(), expected_rng)
+
+
+def test_resume_rejects_checkpoint_beyond_requested_terminal_step(tmp_path) -> None:
+    cfg = _cfg(checkpoint_interval=2, max_steps=2)
+    source = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "source", cfg, source)
+    train(source, _const_loader(), cfg, n_steps=2, artifacts=artifacts)
+    checkpoint = tmp_path / "source" / "checkpoints" / "step_2.pt"
+    callbacks = []
+
+    with pytest.raises(ValueError, match="checkpoint step 2.*n_steps=1"):
+        train(
+            VFEModel(cfg),
+            _const_loader(),
+            cfg,
+            n_steps=1,
+            resume_from=checkpoint,
+            terminal_callback=lambda *args: callbacks.append(args),
+        )
+
+    assert callbacks == []
+
+
+def test_resume_rejects_step_cursor_chronology_mismatch_before_model_mutation(tmp_path) -> None:
+    cfg = _cfg(checkpoint_interval=2)
+    loader = _sequential_loader()
+    source = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "source", cfg, source)
+    train(source, loader, cfg, n_steps=2, artifacts=artifacts)
+    checkpoint = tmp_path / "source" / "checkpoints" / "step_2.pt"
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["data_state"]["epoch"] = 0
+    bundle["data_state"]["batches_consumed"] = 1
+    malformed = tmp_path / "bad-cursor-chronology.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="step.*epoch.*batches_consumed"):
+        load_checkpoint(
+            malformed,
+            target,
+            data_state={},
+            expected_data_identity=_loader_data_identity(loader, cfg.vocab_size),
+            expected_steps_per_epoch=len(loader),
+        )
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
+def test_fresh_periodic_checkpoint_rejects_loader_without_exact_cursor_identity(tmp_path) -> None:
+    cfg = _cfg(checkpoint_interval=1)
+    model = VFEModel(cfg)
+    tokens = torch.ones((2, 8), dtype=torch.long)
+    loader = [(tokens, tokens.clone())]
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model)
+
+    with pytest.raises(RuntimeError, match="exact data.*supported DataLoader"):
+        train(model, loader, cfg, n_steps=1, artifacts=artifacts)
+
+    assert not list(artifacts.ckpt_dir.glob("*.pt"))
+
+
+def test_generic_iterables_allow_artifacts_until_a_checkpoint_is_due(tmp_path) -> None:
+    r"""Metrics/validation artifacts do not imply a resumable data-cursor contract."""
+    cfg = _cfg()  # default checkpoint interval is beyond this one-step diagnostic run
+    model = VFEModel(cfg)
+    tokens = torch.ones((2, 8), dtype=torch.long)
+    batches = [(tokens, tokens.clone())]
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model)
+
+    losses = train(
+        model,
+        batches,
+        cfg,
+        n_steps=1,
+        eval_interval=1,
+        val_loader=batches,
+        artifacts=artifacts,
+        generate_samples=False,
+    )
+
+    assert len(losses) == 1
+    assert artifacts.best_path.is_file()
+    assert artifacts.selection_data_identity is None
+    assert not list(artifacts.ckpt_dir.glob("*.pt"))
+
+
+def test_exact_random_resume_rejects_distinct_sampler_generator(tmp_path) -> None:
+    cfg = _cfg(checkpoint_interval=1)
+    dataset = TokenWindows(torch.arange(105, dtype=torch.long) % 6, seq_len=8)
+    sampler = torch.utils.data.RandomSampler(
+        dataset, generator=torch.Generator().manual_seed(1))
+    loader = DataLoader(
+        dataset,
+        batch_size=4,
+        sampler=sampler,
+        drop_last=True,
+        generator=torch.Generator().manual_seed(2),
+    )
+    model = VFEModel(cfg)
+
+    with pytest.raises(RuntimeError, match="sampler.generator.*loader.generator"):
+        train(
+            model,
+            loader,
+            cfg,
+            n_steps=1,
+            artifacts=RunArtifacts(tmp_path / "run", cfg, model),
+        )
+
+
+def test_exact_resume_rejects_custom_collate_contract(tmp_path) -> None:
+    cfg = _cfg(checkpoint_interval=1)
+    dataset = TokenWindows(torch.arange(105, dtype=torch.long) % 6, seq_len=8)
+
+    def reverse_batch(batch):
+        tokens, targets = torch.utils.data.default_collate(batch)
+        return tokens.flip(0), targets.flip(0)
+
+    loader = DataLoader(
+        dataset,
+        batch_size=4,
+        shuffle=False,
+        drop_last=True,
+        collate_fn=reverse_batch,
+    )
+    model = VFEModel(cfg)
+
+    with pytest.raises(RuntimeError, match="default collate"):
+        train(
+            model,
+            loader,
+            cfg,
+            n_steps=1,
+            artifacts=RunArtifacts(tmp_path / "run", cfg, model),
+        )
 
 
 def test_shuffled_resume_matches_uninterrupted_run(tmp_path):
@@ -255,14 +848,9 @@ def test_exact_shuffled_resume_requires_loader_generator(tmp_path):
     loader.generator = None
     loader.sampler.generator = None
     art = RunArtifacts(tmp_path / "run", cfg, model)
-    train(model, loader, cfg, n_steps=1, artifacts=art)
-
-    resume_loader = _shuffled_loader()
-    resume_loader.generator = None
-    resume_loader.sampler.generator = None
     with pytest.raises(RuntimeError, match="exact shuffled resume.*generator"):
-        train(VFEModel(cfg), resume_loader, cfg, n_steps=2,
-              resume_from=tmp_path / "run" / "checkpoints" / "step_1.pt")
+        train(model, loader, cfg, n_steps=1, artifacts=art)
+    assert not (tmp_path / "run" / "checkpoints" / "step_1.pt").exists()
 
 
 @pytest.mark.parametrize(("field", "bad_value"), [
@@ -323,6 +911,37 @@ def test_load_checkpoint_rejects_malformed_data_cursor(tmp_path, field, bad_valu
         )
 
 
+def test_load_checkpoint_rejects_invalid_shuffled_epoch_generator_before_mutation(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    identity = _loader_data_identity(_shuffled_loader(), cfg.vocab_size)
+    data_state = {
+        "epoch_start_generator_state": torch.Generator().manual_seed(0).get_state(),
+        "batches_consumed":            0,
+        "epoch":                       0,
+        "data_identity":               identity,
+    }
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        0, source, build_optimizer(source, cfg), cfg, data_state=data_state)
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["data_state"]["epoch_start_generator_state"] = torch.zeros(1, dtype=torch.uint8)
+    malformed = tmp_path / "invalid-epoch-generator.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    before = _params(target)
+
+    with pytest.raises(RuntimeError, match="epoch_start_generator_state is invalid"):
+        load_checkpoint(
+            malformed,
+            target,
+            data_state={},
+            expected_data_identity=identity,
+        )
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+
+
 def test_resume_restores_best_val_state(tmp_path):
     r"""C2 (audit 2026-07-01): best_val_ppl/best_step are bundled by save_checkpoint and restored
     into the RunArtifacts passed to load_checkpoint, so a resumed continuation with no post-resume
@@ -332,37 +951,38 @@ def test_resume_restores_best_val_state(tmp_path):
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     art = RunArtifacts(tmp_path / "a", cfg, model)
+    selection_identity = _loader_data_identity(_eval_loader(), cfg.vocab_size)
+    art.bind_selection_data_identity(selection_identity)
     assert art.maybe_save_best(3, model, 8.5) is True           # model-selection state to carry over
     art.save_checkpoint(4, model, opt, cfg)
 
     fresh = VFEModel(cfg)
     new_art = RunArtifacts(tmp_path / "b", cfg, fresh)
+    new_art.bind_selection_data_identity(selection_identity)
     assert new_art.best_val_ppl == float("inf") and new_art.best_step is None
     load_checkpoint(tmp_path / "a" / "checkpoints" / "step_4.pt", fresh, artifacts=new_art)
     assert new_art.best_val_ppl == 8.5
     assert new_art.best_step == 3
 
 
-def test_resume_with_ema_from_non_ema_ckpt_shadow_tracks_loaded_weights(tmp_path):
-    r"""C3 (audit 2026-07-01): resuming a use_ema=True run from a use_ema=False checkpoint (no
-    bundled ema_state) must reseed the shadow from the LOADED weights, not the pre-load fresh
-    init. With zero remaining steps the final ``copy_to`` writes the shadow into the model, so
-    the resumed model must sit exactly at the checkpoint weights."""
+def test_resume_with_ema_rejects_non_ema_checkpoint(tmp_path):
+    r"""Exact EMA continuation requires the saved shadow; implicit reseeding changes the run."""
     cfg_a = _cfg(checkpoint_interval=2, use_ema=False)
     torch.manual_seed(0)
     model_a = VFEModel(cfg_a)
     art = RunArtifacts(tmp_path / "run", cfg_a, model_a)
     train(model_a, _const_loader(), cfg_a, n_steps=2, artifacts=art)
-    saved = _params(model_a)
     ckpt = tmp_path / "run" / "checkpoints" / "step_2.pt"
     assert torch.load(ckpt, weights_only=False)["ema_state"] is None   # genuinely a non-EMA bundle
 
     cfg_b = _cfg(checkpoint_interval=2, use_ema=True, ema_decay=0.9)
     torch.manual_seed(1)                                        # a DIFFERENT fresh init than the saved weights
     model_b = VFEModel(cfg_b)
-    train(model_b, _const_loader(), cfg_b, n_steps=2, resume_from=ckpt)   # zero remaining steps
-    for s, b in zip(saved, _params(model_b)):
-        assert torch.equal(s, b)                                # shadow == loaded weights, not fresh init
+    before = _params(model_b)
+    with pytest.raises(RuntimeError, match="ema_state"):
+        train(model_b, _const_loader(), cfg_b, n_steps=2, resume_from=ckpt)
+    for expected, actual in zip(before, _params(model_b)):
+        assert torch.equal(expected, actual)
 
 
 def test_resume_from_cfg_field_is_picked_up(tmp_path):
@@ -449,6 +1069,7 @@ def _build_embedded_best_checkpoint(run_dir, cfg, *, best_ppl=5.0, best_step=2, 
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     art = RunArtifacts(run_dir, cfg, model)
+    art.bind_selection_data_identity(_loader_data_identity(_eval_loader(), cfg.vocab_size))
     with torch.no_grad():
         model.prior_bank.mu_embed.add_(0.5)                     # BEST weights
     best_state = {n: p.detach().clone() for n, p in model.named_parameters()}
@@ -467,6 +1088,39 @@ def _strip_to_legacy(ckpt_path) -> None:
     torch.save(bundle, ckpt_path)
 
 
+@pytest.mark.parametrize("corruption", (
+    "string_ppl", "bool_ppl", "string_step", "step_after_checkpoint", "empty_with_step",
+))
+def test_resume_rejects_invalid_best_selection_metadata_before_mutation(tmp_path, corruption):
+    cfg = _cfg()
+    checkpoint, _, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
+    bundle = torch.load(checkpoint, weights_only=True)
+    if corruption == "string_ppl":
+        bundle["best_val_ppl"] = "5.0"
+    elif corruption == "bool_ppl":
+        bundle["best_val_ppl"] = True
+    elif corruption == "string_step":
+        bundle["best_step"] = "2"
+    elif corruption == "step_after_checkpoint":
+        bundle["best_step"] = bundle["step"] + 1
+    else:
+        bundle["best_val_ppl"] = float("inf")
+        bundle["best_step"] = 1
+        bundle["best_model_bundle"] = None
+    malformed = tmp_path / f"bad-selection-{corruption}.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    before = _params(target)
+    artifacts = RunArtifacts(tmp_path / "B", cfg, target)
+
+    with pytest.raises(RuntimeError, match="best-model selection"):
+        load_checkpoint(malformed, target, artifacts=artifacts)
+
+    for expected, actual in zip(before, _params(target)):
+        assert torch.equal(expected, actual)
+    assert not artifacts.best_path.exists()
+
+
 def test_cross_run_resume_restores_embedded_best_bundle(tmp_path):
     cfg = _cfg()
     ckpt, best_state, final_state = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
@@ -474,6 +1128,7 @@ def test_cross_run_resume_restores_embedded_best_bundle(tmp_path):
 
     fresh = VFEModel(cfg)                                        # a different init, a NEW run_dir
     new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
+    new_art.bind_selection_data_identity(_loader_data_identity(_eval_loader(), cfg.vocab_size))
     assert new_art.best_val_ppl == float("inf") and new_art.best_step is None
     load_checkpoint(ckpt, fresh, artifacts=new_art)
 
@@ -487,6 +1142,32 @@ def test_cross_run_resume_restores_embedded_best_bundle(tmp_path):
         assert torch.equal(live[n].detach(), v)                 # the model itself got the checkpoint weights
 
 
+@pytest.mark.parametrize("drift", ("code", "validation"))
+def test_cross_run_resume_drops_best_selection_on_identity_drift(tmp_path, drift):
+    cfg = _cfg()
+    ckpt, _, final_state = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
+    if drift == "code":
+        bundle = torch.load(ckpt, weights_only=True)
+        bundle["code_identity_sha256"] = "0" * 64
+        bundle["best_model_bundle"]["code_identity_sha256"] = "0" * 64
+        torch.save(bundle, ckpt)
+
+    fresh = VFEModel(cfg)
+    new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
+    selection_loader = _eval_loader(seq_len=4) if drift == "validation" else _eval_loader()
+    new_art.bind_selection_data_identity(
+        _loader_data_identity(selection_loader, cfg.vocab_size))
+
+    with pytest.warns(UserWarning, match="model selection restarts"):
+        load_checkpoint(ckpt, fresh, artifacts=new_art)
+
+    assert new_art.best_val_ppl == float("inf") and new_art.best_step is None
+    assert not new_art.best_path.exists()
+    live = dict(fresh.named_parameters())
+    for name, value in final_state.items():
+        assert torch.equal(live[name].detach(), value)          # raw training resume still succeeds
+
+
 def test_legacy_cross_run_resume_imports_sibling_best_bundle(tmp_path):
     cfg = _cfg()
     ckpt, best_state, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
@@ -496,6 +1177,7 @@ def test_legacy_cross_run_resume_imports_sibling_best_bundle(tmp_path):
 
     fresh = VFEModel(cfg)
     new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
+    new_art.bind_selection_data_identity(_loader_data_identity(_eval_loader(), cfg.vocab_size))
     load_checkpoint(ckpt, fresh, artifacts=new_art)
 
     assert new_art.best_val_ppl == 5.0 and new_art.best_step == 2
@@ -505,7 +1187,7 @@ def test_legacy_cross_run_resume_imports_sibling_best_bundle(tmp_path):
         assert torch.equal(published[n], v)                     # sibling best imported into the new run
 
 
-def test_resume_without_best_weights_drops_unreachable_best_metadata(tmp_path):
+def test_resume_without_best_weights_rejects_unreachable_selection(tmp_path):
     cfg = _cfg()
     ckpt, _, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
     _strip_to_legacy(ckpt)
@@ -513,10 +1195,10 @@ def test_resume_without_best_weights_drops_unreachable_best_metadata(tmp_path):
 
     fresh = VFEModel(cfg)
     new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
-    with pytest.warns(UserWarning):
+    with pytest.raises(RuntimeError, match="best-model selection"):
         load_checkpoint(ckpt, fresh, artifacts=new_art)
 
-    assert new_art.best_val_ppl == float("inf")                 # unreachable best scalar dropped
+    assert new_art.best_val_ppl == float("inf")
     assert new_art.best_step is None
     assert not new_art.best_path.exists()
 
@@ -620,6 +1302,14 @@ def test_selection_projection_migrates_missing_defaults_and_rejects_unknown_fiel
         _selection_semantic_config(newer)
 
 
+def test_selection_projection_excludes_checkpoint_trust_policy() -> None:
+    from vfe3.run_artifacts import _selection_semantic_config
+
+    assert _selection_semantic_config(_cfg(trust_resume_checkpoint=False)) == (
+        _selection_semantic_config(_cfg(trust_resume_checkpoint=True))
+    )
+
+
 def test_selection_projection_grad_clip_migrates_to_default_and_differentiates():
     r"""PB-15 cross-plan regression: a raw legacy mapping predating grad_clip (simulated by
     stripping the field from asdict(VFE3Config())) migrates through _selection_semantic_config
@@ -664,18 +1354,21 @@ def test_resume_from_only_difference_survives_finalization(tmp_path, monkeypatch
     cfg_b = _cfg(generate_figures=False, resume_from=str(ckpt))
     model_b = VFEModel(cfg_b)
     new_art = RunArtifacts(tmp_path / "B", cfg_b, model_b)
+    new_art.bind_selection_data_identity(_loader_data_identity(_eval_loader(), cfg_b.vocab_size))
     load_checkpoint(ckpt, model_b, artifacts=new_art, cfg=cfg_b)
     assert new_art.best_val_ppl == 5.0                         # imported despite the resume_from diff
     assert new_art.best_path.is_file()
     res = finalize_run(model_b, new_art, cfg_b, test_loader=_const_loader())
     assert res["reloaded_best"] is True                        # finalize reloaded the imported best
 
-    # Control: a behavior-field difference (decode_tau) must REJECT the same bundle.
+    # Control: raw resume is allowed, but a behavior-field difference cannot inherit selection.
     cfg_c = _cfg(generate_figures=False, decode_tau=2.0)
     model_c = VFEModel(cfg_c)
     art_c = RunArtifacts(tmp_path / "C", cfg_c, model_c)
-    with pytest.raises(RuntimeError):
+    art_c.bind_selection_data_identity(_loader_data_identity(_eval_loader(), cfg_c.vocab_size))
+    with pytest.warns(UserWarning, match="model selection restarts"):
         load_checkpoint(ckpt, model_c, artifacts=art_c, cfg=cfg_c)
+    assert art_c.best_val_ppl == float("inf") and art_c.best_step is None
 
 
 def test_stale_contract_rerun_replaces_old_unselected_best(tmp_path, monkeypatch):

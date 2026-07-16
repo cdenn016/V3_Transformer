@@ -131,6 +131,21 @@ def _slice_bank_to_cap(
     return {key: value[:limit] for key, value in bank.items()}
 
 
+def _inference_record_valid_positions(
+    tokens:  torch.Tensor,
+    targets: Optional[torch.Tensor],
+) -> torch.Tensor:
+    r"""Return the token-position mask carried by an inference record's targets."""
+    if targets is None:
+        return torch.ones_like(tokens, dtype=torch.bool)
+    if targets.shape != tokens.shape:
+        raise ValueError(
+            "inference record targets must have the same shape as tokens, got "
+            f"{tuple(targets.shape)} and {tuple(tokens.shape)}"
+        )
+    return targets.to(tokens.device) != -100
+
+
 def _snapshot_sequence(belief: BeliefState, index: int = 0) -> BeliefState:
     r"""Select one batch row while preserving every optional belief/frame channel."""
     return belief._replace(
@@ -270,6 +285,8 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         transport_mean_per_head=cfg.transport_mean_per_head,
         exp_fp64_mode=cfg.exp_fp64_mode,
         exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+        transport_chart_max_norm=cfg.transport_chart_max_norm,
+        transport_status=model._transport_status,
         log_prior=log_prior,
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
@@ -293,6 +310,8 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
         compact_phi_block_transport=model._compact_phi_blocks_enabled(),
+        transport_chart_max_norm=cfg.transport_chart_max_norm,
+        transport_status=model._transport_status,
         log_prior=log_prior,
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
     )
@@ -381,22 +400,24 @@ def belief_ce_bank(
     sigma-validation gate (``vfe3.inference.sigma_gate``), and the Sigma-stratified-error /
     Sigma-CE-scatter figures consume. ``max_batches`` caps the join.
     """
+    device = device or _model_device(model)
     if inference_bank is not None:
         tr_sig, ces, tids, confs, corrects = [], [], [], [], []
         for i, record in enumerate(inference_bank):
-            tokens = record["tokens"]
-            targets = record["targets"]
-            logits = record["logits"]
+            record_targets = record["targets"]
+            record_logits = record["logits"]
             out = record["out"]
-            if targets is None or logits is None:
+            if record_targets is None or record_logits is None:
                 raise ValueError(
                     "belief_ce_bank inference records require targets and decoded logits"
                 )
-            logits = logits.to(targets.device)
+            targets = record_targets.to(device)
+            logits = record_logits.to(device)
             flat_logits = logits.reshape(-1, logits.shape[-1]).float()
+            tgt = targets.reshape(-1)
             per = F.cross_entropy(
                 flat_logits,
-                targets.reshape(-1),
+                tgt,
                 ignore_index=-100,
                 reduction="none",
             )
@@ -406,14 +427,17 @@ def belief_ce_bank(
                 diagonal=model.cfg.diagonal_covariance,
                 family=model.cfg.family,
             ).reshape(-1)
-            tgt = targets.reshape(-1)
             valid = tgt != -100
-            tr_sig.append(trs[valid])
-            ces.append(per[valid])
-            tids.append(tgt[valid])
-            confs.append(conf_flat[valid])
-            corrects.append((pred_flat[valid] == tgt[valid]).float())
-            if max_batches is not None and i + 1 >= max_batches:
+            valid_cpu = record_targets.reshape(-1) != -100
+            tr_sig.append(_cpu_bank_value(trs[valid_cpu]))
+            ces.append(_cpu_bank_value(per[valid]))
+            tids.append(_cpu_bank_value(tgt[valid]))
+            confs.append(_cpu_bank_value(conf_flat[valid]))
+            corrects.append(_cpu_bank_value((pred_flat[valid] == tgt[valid]).float()))
+            stop = max_batches is not None and i + 1 >= max_batches
+            del targets, logits, flat_logits, tgt, per, conf_flat, pred_flat
+            del trs, valid, valid_cpu
+            if stop:
                 break
         return {
             "tr_sigma": torch.cat(tr_sig),
@@ -424,7 +448,6 @@ def belief_ce_bank(
         }
 
     from vfe3.model.stack import vfe_stack
-    device = device or _model_device(model)
     cfg = model.cfg
     was_training = model.training
     model.eval()
@@ -521,8 +544,9 @@ def belief_bank(
     stacks the per-token converged ``mu`` (M, K), ``sigma`` (M, K) or (M, K, K), ``phi``
     (M, n_gen), with ``token_ids`` (M,), ``seq_idx`` (M,), and within-sequence ``pos_idx``
     (M,). ``max_tokens`` and ``max_sequences`` are mutually exclusive; either cap is applied
-    exactly to every aligned field. Feeds the mu / Sigma / phi UMAP triptych and the at-scale
-    clustering scores.
+    exactly to every aligned field. Shared inference records retain only positions whose aligned
+    target is not ``-100``; ``token_ids`` remains the input token encoded by that belief row. Feeds
+    the mu / Sigma / phi UMAP triptych and the at-scale clustering scores.
     """
     _validate_bank_caps(max_tokens=max_tokens, max_sequences=max_sequences)
     if inference_bank is not None:
@@ -532,18 +556,22 @@ def belief_bank(
             tokens = record["tokens"]
             out = record["out"]
             b, n = tokens.shape
-            mus.append(out.mu.reshape(b * n, -1))
-            sigmas.append(out.sigma.reshape(b * n, *out.sigma.shape[2:]))
-            phis.append(out.phi.reshape(b * n, -1))
-            tids.append(tokens.reshape(b * n))
+            valid = _inference_record_valid_positions(
+                tokens,
+                record["targets"],
+            ).reshape(-1)
+            mus.append(out.mu.reshape(b * n, -1)[valid])
+            sigmas.append(out.sigma.reshape(b * n, *out.sigma.shape[2:])[valid])
+            phis.append(out.phi.reshape(b * n, -1)[valid])
+            tids.append(tokens.reshape(b * n)[valid])
             sidx.append(
                 torch.arange(
                     seq_counter,
                     seq_counter + b,
                     device=tokens.device,
-                ).repeat_interleave(n)
+                ).repeat_interleave(n)[valid]
             )
-            pidx.append(torch.arange(n, device=tokens.device).repeat(b))
+            pidx.append(torch.arange(n, device=tokens.device).repeat(b)[valid])
             seq_counter += b
             token_count = sum(batch.shape[0] for batch in tids)
             if ((max_tokens is not None and token_count >= max_tokens)
@@ -1349,7 +1377,8 @@ def model_channel_bank(
     ``s_frame_mode='phi_tilde'`` the bank also carries the independently resolved model frame
     ``phi`` (M, n_gen), enabling a model-frame UMAP. Tied mode omits that duplicate channel. Feeds
     ``plot_belief_umap`` directly, so the redesigned cluster-and-distinctive-token view applies to the
-    slow channel.
+    slow channel. Shared inference records retain only positions whose aligned target is not
+    ``-100``; ``token_ids`` remains the input token encoded by that model-channel row.
     NB i and j are token POSITIONS, not separate channels: this single bank embeds every s_i (all positions);
     the i<->j pairing lives only in the gamma_ij model-coupling attention (see :func:`gamma_attention`).
     """
@@ -1368,24 +1397,28 @@ def model_channel_bank(
                     "model_channel_bank inference records require model-channel beliefs"
                 )
             b, n = tokens.shape
-            mus.append(s_mu.reshape(b * n, -1))
-            sigmas.append(s_sigma.reshape(b * n, -1))
+            valid = _inference_record_valid_positions(
+                tokens,
+                record["targets"],
+            ).reshape(-1)
+            mus.append(s_mu.reshape(b * n, -1)[valid])
+            sigmas.append(s_sigma.reshape(b * n, -1)[valid])
             if model.cfg.s_frame_mode == "phi_tilde":
                 model_phi = record["model_phi"]
                 if model_phi is None:
                     raise ValueError(
                         "model_channel_bank inference records require independent model frames"
                     )
-                phis.append(model_phi.reshape(b * n, -1))
-            tids.append(tokens.reshape(b * n))
+                phis.append(model_phi.reshape(b * n, -1)[valid])
+            tids.append(tokens.reshape(b * n)[valid])
             sidx.append(
                 torch.arange(
                     seq_counter,
                     seq_counter + b,
                     device=tokens.device,
-                ).repeat_interleave(n)
+                ).repeat_interleave(n)[valid]
             )
-            pidx.append(torch.arange(n, device=tokens.device).repeat(b))
+            pidx.append(torch.arange(n, device=tokens.device).repeat(b)[valid])
             seq_counter += b
             token_count = sum(batch.shape[0] for batch in tids)
             if ((max_tokens is not None and token_count >= max_tokens)
@@ -1463,8 +1496,9 @@ def model_channel_bank(
 
 
 def _vocab_display_panel(
-    probs:   torch.Tensor,               # (P0, V) per-position softmax for ONE sequence
-    tokens:  torch.Tensor,               # (N,)    that sequence's input token ids
+    probs:    torch.Tensor,               # (P0, V) per-position softmax for ONE sequence
+    tokens:   torch.Tensor,               # (N,)    that sequence's input token ids
+    targets:  Optional[torch.Tensor] = None,  # (P0,) aligned gold ids; None -> tokens[1:]
 
     *,
     max_rows:      int = 40,
@@ -1474,16 +1508,17 @@ def _vocab_display_panel(
     r"""Select a compact ``(R, P)`` probability sub-grid for the Seq x top-k heatmap.
 
     The full ``p(o_{n+1} | o_{<=n})`` over ``V = 50257`` tokens is illegible, so the y-axis is the
-    union of each shown position's top-``per_pos_k`` predicted token ids together with the true
-    next-token id, ranked by summed probability over the shown positions and capped at
-    ``max_rows``; the x-axis is the first ``max_positions`` positions. ``disp_truth_row`` gives,
-    per position, the row index of the true next token (-1 when it falls outside the shown rows),
-    for the ground-truth overlay.
+    union of each shown position's top-``per_pos_k`` predicted token ids together with its aligned
+    target, ranked by summed probability over the shown positions and capped at ``max_rows``; the
+    x-axis is the first ``max_positions`` positions. When ``targets`` is absent, the token-only
+    caller supplies the historical in-window shift ``tokens[1:]``. ``disp_truth_row`` gives, per
+    position, the row index of the true next token (-1 when it falls outside the shown rows), for
+    the ground-truth overlay.
     """
     P = min(int(probs.shape[0]), max_positions)
     p = probs[:P]                                                # (P, V)
     context_ids = tokens[:P]                                     # (P,) token AT each shown position
-    target_ids  = tokens[1:P + 1]                               # (P,) the true next token
+    target_ids = tokens[1:P + 1] if targets is None else targets[:P]
     topk = p.topk(min(per_pos_k, p.shape[-1]), dim=-1).indices.reshape(-1)   # (P*k,)
     cand = torch.cat([topk, target_ids]).unique()               # (C,) candidate row ids
     mass = p[:, cand].sum(dim=0)                                # (C,) total mass per candidate
@@ -1517,9 +1552,10 @@ def vocab_prediction_stats(
     r"""Next-token predictive distributions over the vocabulary, for the vocab-probability figures.
 
     Runs the inference forward (``model(tokens)`` -> ``(B, N, V)`` logits) and softmaxes to
-    ``p(o_{n+1} | o_{<=n})``. Logit row ``n`` predicts token ``n+1``, so the aggregate uses
-    positions ``0..N-2`` with targets ``tokens[:, 1:]``; the final position's target lies outside
-    the window and is dropped.
+    ``p(o_{n+1} | o_{<=n})``. The token-only path preserves its historical in-window contract:
+    positions ``0..N-2`` use ``tokens[:, 1:]`` and the final position is dropped. A shared
+    inference record instead supplies the evaluation target aligned with every logit row; positions
+    carrying ``-100`` are excluded and a final real target outside the input window is retained.
 
     Returns one dict feeding three figures:
       display (first sequence) -- ``disp_context_ids`` (P,), ``disp_target_ids`` (P,),
@@ -1546,6 +1582,8 @@ def vocab_prediction_stats(
     try:
         sources = inference_bank if inference_bank is not None else token_batches
         for batch in sources:
+            stored_targets = None
+            valid = None
             if inference_bank is not None:
                 tokens = batch["tokens"].to(device)
                 decoded = batch["logits"]
@@ -1554,20 +1592,35 @@ def vocab_prediction_stats(
                         "vocab_prediction_stats inference records require decoded logits"
                     )
                 decoded = decoded.to(device)
+                if batch["targets"] is not None:
+                    stored_targets = batch["targets"].to(device)
             else:
                 tokens = batch[0] if isinstance(batch, (tuple, list)) else batch
                 tokens = tokens.to(device)
                 decoded = model(tokens)
             if tokens.dim() == 1:
                 tokens = tokens.unsqueeze(0)
+            if stored_targets is not None and stored_targets.dim() == 1:
+                stored_targets = stored_targets.unsqueeze(0)
             b, n = tokens.shape
-            if n < 2:
-                del batch, tokens, decoded
-                continue
-            logits = decoded[:, :-1].float()                        # (B, N-1, V) drop last (no in-window target)
-            targets = tokens[:, 1:]                                 # (B, N-1) true next token
-            probs = torch.softmax(logits, dim=-1)                   # (B, N-1, V)
-            flatp = probs.reshape(-1, V)                            # (B*(N-1), V)
+            if stored_targets is not None:
+                valid = _inference_record_valid_positions(tokens, stored_targets)
+                valid_flat = valid.reshape(-1)
+                if not bool(valid_flat.any()):
+                    del batch, tokens, decoded, stored_targets, valid, valid_flat
+                    continue
+                logits = decoded.reshape(-1, V)[valid_flat].float()
+                targets = stored_targets.reshape(-1)[valid_flat]
+                probs = torch.softmax(logits, dim=-1)
+                flatp = probs
+            else:
+                if n < 2:
+                    del batch, tokens, decoded, stored_targets
+                    continue
+                logits = decoded[:, :-1].float()                    # (B, N-1, V) drop last (no in-window target)
+                targets = tokens[:, 1:]                             # (B, N-1) true next token
+                probs = torch.softmax(logits, dim=-1)               # (B, N-1, V)
+                flatp = probs.reshape(-1, V)                        # (B*(N-1), V)
             prob_sum += flatp.sum(dim=0).double()
             ent_sum += -(flatp * flatp.clamp_min(1e-12).log()).sum(dim=-1).sum().double()
             tgt_flat = targets.reshape(-1)
@@ -1579,11 +1632,31 @@ def vocab_prediction_stats(
                 pred_ids.append(flatp[:take].argmax(dim=-1).cpu())
                 n_pairs += take
             if disp is None:
-                disp = _vocab_display_panel(probs[0], tokens[0], max_rows=max_rows,
-                                            per_pos_k=per_pos_k, max_positions=max_positions)
+                if stored_targets is None:
+                    disp = _vocab_display_panel(
+                        probs[0],
+                        tokens[0],
+                        max_rows=max_rows,
+                        per_pos_k=per_pos_k,
+                        max_positions=max_positions,
+                    )
+                else:
+                    row = int(valid.any(dim=1).nonzero()[0, 0])
+                    offset = int(valid[:row].sum())
+                    length = int(valid[row].sum())
+                    disp = _vocab_display_panel(
+                        flatp[offset:offset + length],
+                        tokens[row][valid[row]],
+                        stored_targets[row][valid[row]],
+                        max_rows=max_rows,
+                        per_pos_k=per_pos_k,
+                        max_positions=max_positions,
+                    )
             # Aggregates and display samples are already detached onto their owning devices.
             # Drop the full-vocabulary current-batch workset before the next decode/softmax.
-            del batch, tokens, decoded, logits, targets, probs, flatp, tgt_flat
+            del batch, tokens, decoded, stored_targets, logits, targets, probs, flatp, tgt_flat
+            if valid is not None:
+                del valid, valid_flat
     finally:
         if was_training:
             model.train()

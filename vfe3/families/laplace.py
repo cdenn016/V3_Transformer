@@ -148,7 +148,10 @@ class DiagonalLaplace(BeliefParams):
     ) -> torch.Tensor:
         r"""Moment-matched scale ``b'_m = sqrt(sum_n A_mn^2 b_n^2)``."""
         mixed_b2 = torch.einsum("mn,...nd->...md", mixing.square(), dispersion.square())
-        return mixed_b2.clamp_min(0.0).sqrt()
+        mixed_b2 = mixed_b2.clamp_min(0.0)
+        positive = mixed_b2 > 0.0
+        safe_b2 = torch.where(positive, mixed_b2, torch.ones_like(mixed_b2))
+        return torch.where(positive, safe_b2.sqrt(), torch.zeros_like(safe_b2))
 
     @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:

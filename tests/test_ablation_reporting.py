@@ -189,7 +189,11 @@ def _stub_sweep_identity(monkeypatch):
 
     def fake_run_single(label, overrides, run_dir, **kwargs):
         return {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
-                "final_val_ppl": 9.0, "seed": 6, "overrides": ablation._jsonable(overrides)}
+                "final_val_ppl": 9.0, "seed": 6, "overrides": ablation._jsonable(overrides),
+                "_loaded_data_sources": {
+                    split: _fake_source_ok(DATASET, split)
+                    for split in ("train", "validation")
+                }}
 
     monkeypatch.setattr(ablation, "run_single", fake_run_single)
 

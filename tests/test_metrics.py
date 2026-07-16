@@ -4,7 +4,7 @@ import torch
 
 import vfe3.metrics as metrics_module
 from vfe3.geometry.groups import get_group
-from vfe3.geometry.transport import compute_transport_operators
+from vfe3.geometry.transport import CompactFactoredTransport, compute_transport_operators
 from vfe3.metrics import (
     attention_distance_decay,
     attention_entropy,
@@ -302,6 +302,17 @@ def test_curvature_field_flat_is_zero():
     grp = get_group("glk")(3)
     omega = compute_transport_operators(0.2 * torch.randn(1, 6, grp.generators.shape[0]), grp)["Omega"][0]
     assert float(curvature_field(omega, anchor=0).abs().max()) < 1e-3
+
+
+def test_compact_curvature_field_flat_backward_is_finite():
+    exp_blocks = torch.eye(2).reshape(1, 1, 2, 2).expand(3, 1, 2, 2).clone().requires_grad_()
+    inv_blocks = torch.eye(2).reshape(1, 1, 2, 2).expand(3, 1, 2, 2).clone().requires_grad_()
+    compact = CompactFactoredTransport(exp_blocks, inv_blocks, K=2)
+
+    curvature_field(compact).sum().backward()
+
+    assert torch.isfinite(exp_blocks.grad).all()
+    assert torch.isfinite(inv_blocks.grad).all()
 
 
 def test_holonomy_wilson_flat_cocycle_is_unity():

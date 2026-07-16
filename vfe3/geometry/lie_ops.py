@@ -331,6 +331,17 @@ def _fail_if_bch_residual_exceeds(
         residual = torch.linalg.matrix_norm(approximate - exact)
         reference = torch.linalg.matrix_norm(exact).clamp(min=eps)
         relative = residual / reference
+        finite = torch.stack((
+            torch.isfinite(exact).all(),
+            torch.isfinite(approximate).all(),
+            torch.isfinite(residual).all(),
+            torch.isfinite(relative).all(),
+        )).all()
+        if not bool(finite):
+            raise ValueError(
+                "BCH residual validity bound encountered a nonfinite exact product, "
+                "approximation, or residual"
+            )
         if bool((relative > residual_max).any()):
             observed = float(relative.max())
             raise ValueError(
@@ -665,7 +676,7 @@ def compose_phi(
         "gram_pinv_": gram_pinv_,
         "block_dims": block_dims,
     }
-    if residual_max is not None:
+    if residual_max is not None and mode == "bch":
         kwargs["residual_max"] = residual_max
     if compact_blocks:
         kwargs["compact_blocks"] = True

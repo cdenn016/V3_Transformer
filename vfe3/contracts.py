@@ -126,7 +126,7 @@ class EStepGradientOutput(TypedDict, total=False):
 class DataStateBuffer(TypedDict, total=False):
     """Load-time buffer populated only when a checkpoint carries iterator state."""
 
-    epoch_start_generator_state: torch.Tensor
+    epoch_start_generator_state: Optional[torch.Tensor]
     batches_consumed:            int
     epoch:                       int
     data_identity:               Dict[str, object]
@@ -135,7 +135,7 @@ class DataStateBuffer(TypedDict, total=False):
 class DataState(TypedDict):
     """Required iterator state written into a resumable checkpoint."""
 
-    epoch_start_generator_state: torch.Tensor
+    epoch_start_generator_state: Optional[torch.Tensor]
     batches_consumed:            int
     epoch:                       int
     data_identity:               Dict[str, object]

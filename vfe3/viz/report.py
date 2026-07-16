@@ -628,16 +628,22 @@ def compare_belief_umap_sidecars(
     figure_path: 'str | Path',
 ) -> ArtifactPublicationResult:
     """Validate controlled sidecars and write a metric-only JSON/PNG cross-run comparison."""
+    input_paths = [Path(sidecar) for sidecar in sidecars]
+    output_json = Path(json_path)
+    output_figure = figs._figure_target_path(figure_path)
+    if figs._paths_alias(output_json, output_figure):
+        raise ValueError("comparison JSON and figure outputs must not alias each other")
+    for input_path in input_paths:
+        if (figs._paths_alias(output_json, input_path)
+                or figs._paths_alias(output_figure, input_path)):
+            raise ValueError("comparison outputs must not alias an input sidecar")
     records = []
-    for sidecar in sidecars:
-        path = Path(sidecar)
+    for path in input_paths:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, Mapping):
             raise ValueError(f"controlled sidecar {path} is not a JSON object")
         records.append(payload)
     summary = embedding_comparison.comparison_summary(records, labels)
-    output_json = Path(json_path)
-    output_figure = Path(figure_path)
     output_figure.parent.mkdir(parents=True, exist_ok=True)
     outcomes: Dict[str, Dict[str, object]] = {
         "figure": {"path": str(output_figure), "published": False, "error": None},
@@ -757,7 +763,7 @@ def vocab_comparison_figures(
         try:
             path = out / f"{name}.png"
             fig = thunk()
-            fig.savefig(str(path))
+            figs._save(fig, str(path))
             written.append(path)
             logger.info("figure -> %s", path)
         except Exception as exc:

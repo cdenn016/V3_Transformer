@@ -10,13 +10,14 @@ divergence was live on the committed workload, not merely under opt-in toggles.
 
 import inspect
 
+import pytest
 import torch
 
 from vfe3.config import VFE3Config
 from vfe3.inference.e_step import e_step_iteration, free_energy_value
 from vfe3.model.block import e_step_shared_kwargs
 from vfe3.model.model import VFEModel
-from vfe3.viz.extract import _fe_kwargs, _iter_kwargs
+from vfe3.viz.extract import _fe_kwargs, _iter_kwargs, e_step_belief_trace
 
 _TOKEN_IDS = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long)
 
@@ -54,6 +55,26 @@ def test_fe_kwargs_threads_lambda_twohop() -> None:
     fkw = _fe_kwargs(model, log_prior=None)
     assert fkw["lambda_twohop"] == 0.05
     assert fkw["e_step_update"] == "mm_exact"          # accepted-and-ignored, rides the shared bag
+
+
+def test_configured_chart_bound_reaches_direct_extractor_evaluators() -> None:
+    cfg = VFE3Config(
+        vocab_size=9,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=5,
+        n_layers=1,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        pos_phi="none",
+        transport_chart_max_norm=0.1,
+    )
+    model = _build_model(cfg)
+    with torch.no_grad():
+        model.prior_bank.phi_embed.fill_(1.0)
+
+    with pytest.raises(ValueError, match="transport chart validity bound"):
+        e_step_belief_trace(model, _TOKEN_IDS)
 
 
 def test_shared_bag_accepted_by_both_consumers() -> None:

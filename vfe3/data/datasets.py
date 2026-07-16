@@ -128,7 +128,9 @@ def _binary_cache_metadata(
         raise ValueError(
             f"binary token cache {path} file bytes={actual_bytes}; expected exactly "
             f"{expected_bytes} from n_tokens={n_tokens} and dtype={dtype}")
-    return dict(meta), dtype
+    canonical_meta = dict(meta)
+    canonical_meta["dtype"] = dtype.name
+    return canonical_meta, dtype
 
 
 def cache_source_identity(
@@ -208,6 +210,19 @@ def _require_supported_numpy_token_dtype(dtype: np.dtype, source: Path) -> None:
         raise TypeError(f"token cache {source} has dtype {dtype}; expected one of {names}")
 
 
+def _validated_token_limit(
+    name:  str,
+    value: Optional[int],
+) -> Optional[int]:
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise TypeError(f"{name} must be a positive plain integer or None, got {value!r}")
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive plain integer or None, got {value!r}")
+    return value
+
+
 def load_cached_tokens(
     dataset:    str,
     split:      str            = "validation",
@@ -227,6 +242,7 @@ def load_cached_tokens(
     floating / complex caches are rejected rather than silently reinterpreted as token ids.
     Raises FileNotFoundError if neither cache is present.
     """
+    limit = _validated_token_limit("limit", limit)
     pt = cache_path(dataset, split, suffix="pt", cache_dir=cache_dir)
     if pt.exists():
         tokens = torch.load(pt, weights_only=True, mmap=True)
@@ -264,7 +280,11 @@ def _load_identity_bound_tokens(
 ) -> Tuple[torch.Tensor, Dict[str, object]]:
     r"""Load tokens only when the exact source identity is stable across the load."""
     identity_before = cache_source_identity(dataset, split, cache_dir=cache_dir)
-    tokens = load_cached_tokens(dataset, split, cache_dir=cache_dir, limit=limit)
+    tokens = (
+        load_cached_tokens(dataset, split, cache_dir=cache_dir)
+        if limit is None
+        else load_cached_tokens(dataset, split, cache_dir=cache_dir, limit=limit)
+    )
     identity_after = cache_source_identity(dataset, split, cache_dir=cache_dir)
     if identity_before != identity_after:
         differing = sorted(
@@ -507,6 +527,7 @@ def make_dataloader(
     ``train.evaluate`` is order-independent, but a dropped tail and a randomly-varying drawn subset
     are not -- see _select_loader). ``max_tokens`` is applied while loading; when supplied,
     ``vocab_size`` rejects cached ids that cannot index the model's vocabulary-sized tables."""
+    max_tokens = _validated_token_limit("max_tokens", max_tokens)
     tokens, source_identity = _load_identity_bound_tokens(
         dataset, split, cache_dir=cache_dir, limit=max_tokens)
     if vocab_size is not None:
@@ -518,14 +539,14 @@ def make_dataloader(
         pad_final=(not shuffle and not drop_last),
     )
     ds.data_identity = {
-        "schema_version":       1,
+        "schema_version":       2,
         "dataset":              dataset,
         "split":                split,
         "tokenizer_tag":        _tokenizer_tag(dataset),
         "tokenizer_encoding":   tiktoken_encoding_name(dataset),
         "tokenizer_vocab_size": tokenizer_vocab_size(dataset),
         "model_vocab_size":     (int(vocab_size) if vocab_size is not None else None),
-        "max_tokens":           (int(max_tokens) if max_tokens is not None else None),
+        "max_tokens":           max_tokens,
         "source":               source_identity,
     }
     # pin_memory only when a CUDA device exists (it would pin host pages uselessly on a CPU-only

@@ -2,7 +2,9 @@ r"""Tests for the muP width-stability scaling route (F1/EXP-6) added 2026-06-21.
 
 route_grow_k_mup emits a matched fixed-LR vs muP pair per width, each with the per-cell kl_max=8*K
 confound fix, and every cell builds a valid VFE3Config/VFEModel."""
+import hashlib
 import json
+import math
 from dataclasses import asdict
 
 import pytest
@@ -15,9 +17,28 @@ from vfe3.model.model import VFEModel
 
 
 _SOURCE_IDENTITIES = {
-    split: {"split": split, "sha256": split * 8}
+    split: {
+        "format": "pt",
+        "tokenizer_tag": "tiktoken",
+        "size_bytes": len(split),
+        "sha256": split * 8,
+        "meta": None,
+        "meta_sha256": None,
+    }
     for split in ("train", "validation", "test")
 }
+
+
+def _complete_scaling_summary():
+    test_ce = 2.0
+    metrics = {
+        "n_params": 10,
+        "test_ce": test_ce,
+        "test_ppl": math.exp(test_ce),
+        "test_bits_per_token": test_ce / math.log(2.0),
+        "test_bpc": None,
+    }
+    return {**metrics, "scaling_point": dict(metrics)}
 
 
 def _patch_source_identity(monkeypatch):
@@ -26,6 +47,30 @@ def _patch_source_identity(monkeypatch):
         "cache_source_identity",
         lambda dataset, split: dict(_SOURCE_IDENTITIES[split]),
     )
+
+
+def _bind_scaling_reuse_contract(run_dir, cfg, dataset, code_identity):
+    built = json.loads(json.dumps(asdict(cfg), default=str))
+    cellmeta = json.loads((run_dir / "scaling_cell.json").read_text(encoding="utf-8"))
+    cellmeta.pop("reuse_contract_sha256", None)
+    cellmeta.update({
+        "schema_version": 2,
+        "dataset": dataset,
+        "config_sha256": hashlib.sha256(
+            json.dumps(built, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "code_identity": code_identity,
+    })
+    digest = hashlib.sha256(
+        json.dumps(cellmeta, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    cellmeta["reuse_contract_sha256"] = digest
+    (run_dir / "scaling_cell.json").write_text(json.dumps(cellmeta), encoding="utf-8")
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    summary.update(_complete_scaling_summary())
+    summary["scaling_reuse_contract_sha256"] = digest
+    (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    return digest
 
 
 def test_grow_k_mup_registered():
@@ -75,20 +120,23 @@ def test_cell_is_current_checks_max_tokens(tmp_path, monkeypatch):
     (run_dir / "scaling_cell.json").write_text(json.dumps({
         "label": "cell", "max_tokens": 1000, "data_sources": _SOURCE_IDENTITIES,
     }), encoding="utf-8")
-    (run_dir / "provenance.json").write_text(json.dumps({
+    code_identity = {
         "git_sha": "current-head",
         "git_dirty": False,
         "git_dirty_fingerprint": None,
-    }), encoding="utf-8")
-    monkeypatch.setattr(scaling, "_current_code_identity", lambda: {
-        "git_sha": "current-head",
-        "git_dirty": False,
-        "git_dirty_fingerprint": None,
-    })
+    }
+    (run_dir / "provenance.json").write_text(json.dumps(code_identity), encoding="utf-8")
+    _bind_scaling_reuse_contract(run_dir, cfg, ds, code_identity)
+    monkeypatch.setattr(scaling, "_current_code_identity", lambda: dict(code_identity))
     _patch_source_identity(monkeypatch)
 
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is True
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=None) is False
+    (run_dir / "scaling_failure.json").write_text(
+        json.dumps({"status": "failed", "error": "stale failure"}), encoding="utf-8")
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
+    (run_dir / "scaling_failure.json").unlink()
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is True
 
 
 def test_cell_is_current_rejects_missing_or_mismatched_code_identity(tmp_path, monkeypatch):
@@ -96,6 +144,11 @@ def test_cell_is_current_rejects_missing_or_mismatched_code_identity(tmp_path, m
     run_dir.mkdir()
     ds = "wikitext-103"
     cfg = VFE3Config(**scaling._cell_cfg_dict({"vocab_size": 64}, 0, 1))
+    code_identity = {
+        "git_sha": "current-head",
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
     (run_dir / "summary.json").write_text("{}", encoding="utf-8")
     (run_dir / "config.json").write_text(json.dumps({
         "dataset": ds,
@@ -104,11 +157,8 @@ def test_cell_is_current_rejects_missing_or_mismatched_code_identity(tmp_path, m
     (run_dir / "scaling_cell.json").write_text(json.dumps({
         "label": "cell", "max_tokens": 1000, "data_sources": _SOURCE_IDENTITIES,
     }), encoding="utf-8")
-    monkeypatch.setattr(scaling, "_current_code_identity", lambda: {
-        "git_sha": "current-head",
-        "git_dirty": False,
-        "git_dirty_fingerprint": None,
-    })
+    _bind_scaling_reuse_contract(run_dir, cfg, ds, code_identity)
+    monkeypatch.setattr(scaling, "_current_code_identity", lambda: dict(code_identity))
     _patch_source_identity(monkeypatch)
 
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
@@ -136,22 +186,64 @@ def test_cell_is_current_rejects_missing_or_mismatched_code_identity(tmp_path, m
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
     _patch_source_identity(monkeypatch)
 
-    monkeypatch.setattr(scaling, "_current_code_identity", lambda: {
+    dirty_identity = {
         "git_sha": "current-head",
         "git_dirty": True,
         "git_dirty_fingerprint": "current-dirty",
-    })
+    }
+    _bind_scaling_reuse_contract(run_dir, cfg, ds, dirty_identity)
+    monkeypatch.setattr(scaling, "_current_code_identity", lambda: dict(dirty_identity))
     (run_dir / "provenance.json").write_text(json.dumps({
         "git_sha": "current-head",
         "git_dirty": True,
         "git_dirty_fingerprint": "saved-dirty",
     }), encoding="utf-8")
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
-    (run_dir / "provenance.json").write_text(json.dumps({
+    (run_dir / "provenance.json").write_text(json.dumps(dirty_identity), encoding="utf-8")
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is True
+
+
+def test_cell_is_current_rejects_summary_from_another_reuse_contract(tmp_path, monkeypatch):
+    run_dir = tmp_path / "cell"
+    run_dir.mkdir()
+    ds = "wikitext-103"
+    cfg = VFE3Config(**scaling._cell_cfg_dict({"vocab_size": 64}, 0, 1))
+    code_identity = {
         "git_sha": "current-head",
-        "git_dirty": True,
-        "git_dirty_fingerprint": "current-dirty",
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
+    (run_dir / "summary.json").write_text("{}", encoding="utf-8")
+    (run_dir / "config.json").write_text(json.dumps({
+        "dataset": ds,
+        "config": json.loads(json.dumps(asdict(cfg), default=str)),
     }), encoding="utf-8")
+    (run_dir / "scaling_cell.json").write_text(json.dumps({
+        "label": "cell", "max_tokens": 1000, "data_sources": _SOURCE_IDENTITIES,
+    }), encoding="utf-8")
+    (run_dir / "provenance.json").write_text(json.dumps(code_identity), encoding="utf-8")
+    digest = _bind_scaling_reuse_contract(run_dir, cfg, ds, code_identity)
+    monkeypatch.setattr(scaling, "_current_code_identity", lambda: dict(code_identity))
+    _patch_source_identity(monkeypatch)
+    valid_summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+
+    (run_dir / "summary.json").write_text(json.dumps({
+        "scaling_reuse_contract_sha256": "0" * 64,
+    }), encoding="utf-8")
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
+    (run_dir / "summary.json").write_text(json.dumps({
+        "scaling_reuse_contract_sha256": digest,
+    }), encoding="utf-8")
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
+
+    corrupt_summary = dict(valid_summary)
+    corrupt_summary["test_ppl"] = 2.0
+    corrupt_summary["scaling_point"] = dict(valid_summary["scaling_point"])
+    corrupt_summary["scaling_point"]["test_ppl"] = 2.0
+    (run_dir / "summary.json").write_text(json.dumps(corrupt_summary), encoding="utf-8")
+    assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
+
+    (run_dir / "summary.json").write_text(json.dumps(valid_summary), encoding="utf-8")
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is True
 
 
@@ -206,7 +298,7 @@ def test_cell_is_current_rejects_non_object_cell_metadata(tmp_path, malformed):
 # registered scaling figures (capacity_scaling.png / pareto_frontier.png) driven by scaling_analysis
 
 
-def _record_complete_scaling_cell(root, route, label, seed):
+def _record_complete_scaling_cell(root, route, label, seed, scale_knob):
     path = root / "scaling_design.json"
     design = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {
         "schema_version": 1,
@@ -221,6 +313,8 @@ def _record_complete_scaling_cell(root, route, label, seed):
         "route": route,
         "label": label,
         "seed": seed,
+        "scale_knob": scale_knob,
+        "run_dir": f"{route}/{label}/s{seed}",
         "status": "complete",
     })
     path.write_text(json.dumps(design), encoding="utf-8")
@@ -228,31 +322,72 @@ def _record_complete_scaling_cell(root, route, label, seed):
 
 def _write_val_run(root, *, route, scale_knob, label, seed, embed_dim, n_heads, n_layers,
                     n_params, best_val_ppl, wall_time_s):
-    run = root / f"{route}_{label}_s{seed}"
-    run.mkdir()
-    (run / "summary.json").write_text(json.dumps({
-        "n_params": n_params,
-        "best_val_ppl": best_val_ppl,
-        "wall_time_s": wall_time_s,
-        "scaling_point": {
-            "n_params": n_params, "n_learnable_params": n_params,
-            "embed_dim": embed_dim, "n_heads": n_heads, "n_gen": 4,
-            "gauge_group": "glk", "n_layers": n_layers, "n_e_steps": 1,
-            "tokens_seen": 1000, "test_ce": 3.0,
-        },
-    }), encoding="utf-8")
-    (run / "config.json").write_text(json.dumps({"config": {
+    run = root / route / label / f"s{seed}"
+    run.mkdir(parents=True)
+    config = {
         "seed": seed, "embed_dim": embed_dim, "n_heads": n_heads, "n_layers": n_layers,
         "n_e_steps": 1, "family": "gaussian_diagonal",
-    }}), encoding="utf-8")
-    (run / "scaling_cell.json").write_text(json.dumps({
-        "route": route, "scale_knob": scale_knob, "label": label,
+    }
+    code_identity = {
+        "git_sha": "git-a",
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
+    cell = {
+        "schema_version": 2,
+        "route": route,
+        "scale_knob": scale_knob,
+        "label": label,
+        "seed": seed,
+        "dataset": "synthetic",
+        "config_sha256": hashlib.sha256(json.dumps(
+            config, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
+        "code_identity": code_identity,
+        "data_sources": {
+            split: {"format": "pt", "size_bytes": len(split), "sha256": split[0] * 64}
+            for split in ("train", "validation", "test")
+        },
+    }
+    digest = hashlib.sha256(json.dumps(
+        cell, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    cell["reuse_contract_sha256"] = digest
+    test_ce = 3.0
+    metrics = {
+        "n_params": n_params,
+        "test_ce": test_ce,
+        "test_ppl": math.exp(test_ce),
+        "test_bits_per_token": test_ce / math.log(2.0),
+        "test_bpc": None,
+    }
+    (run / "summary.json").write_text(json.dumps({
+        **metrics,
+        "best_val_ppl": best_val_ppl,
+        "wall_time_s": wall_time_s,
+        "scaling_reuse_contract_sha256": digest,
+        "scaling_point": {
+            **metrics,
+            "n_learnable_params": n_params,
+            "embed_dim": embed_dim,
+            "n_heads": n_heads,
+            "n_gen": 4,
+            "gauge_group": "glk",
+            "n_layers": n_layers,
+            "n_e_steps": 1,
+            "tokens_seen": 1000,
+        },
     }), encoding="utf-8")
+    (run / "config.json").write_text(json.dumps({
+        "dataset": "synthetic",
+        "config": config,
+    }), encoding="utf-8")
+    (run / "scaling_cell.json").write_text(json.dumps(cell), encoding="utf-8")
     (run / "provenance.json").write_text(json.dumps({
-        "seed": seed, "git_sha": "git-a", "train_data_sha256": "train-a",
+        "seed": seed, **code_identity, "train_data_sha256": "train-a",
         "val_data_sha256": "val-a", "test_data_sha256": "test-a", "data_sha256": "test-a",
     }), encoding="utf-8")
-    _record_complete_scaling_cell(root, route, label, seed)
+    _record_complete_scaling_cell(root, route, label, seed, scale_knob)
 
 
 def test_scaling_analysis_emits_capacity_scaling_and_pareto_frontier_pngs(tmp_path, monkeypatch):

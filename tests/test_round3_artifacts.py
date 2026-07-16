@@ -107,6 +107,7 @@ def test_comparison_emit_closes_figures_after_thunk_or_save_failure(
             raise RuntimeError("simulated comparison thunk failure")
 
         def _fail_save(*save_args, **save_kwargs):
+            Path(save_args[0]).write_bytes(b"PARTIAL")
             raise RuntimeError("simulated comparison save failure")
 
         fig.savefig = _fail_save
@@ -114,10 +115,16 @@ def test_comparison_emit_closes_figures_after_thunk_or_save_failure(
 
     monkeypatch.setattr(figs, "plot_vocab_probability_heatmap", _failing_plot)
     before = set(figs.plt.get_fignums())
+    comparison_dir = tmp_path / "comparison"
+    comparison_dir.mkdir()
+    target = comparison_dir / "vocab_probability_heatmap_compare.png"
+    target.write_bytes(b"SENTINEL")
 
-    report.vocab_comparison_figures([art.run_dir], tmp_path / "comparison")
+    report.vocab_comparison_figures([art.run_dir], comparison_dir)
 
     assert set(figs.plt.get_fignums()) == before
+    assert target.read_bytes() == b"SENTINEL"
+    assert not list(comparison_dir.glob(".vocab_probability_heatmap_compare.*.tmp.png"))
 
 
 # ---------------------------------------------------------------- sigma-gate slug collision (punch item 7)

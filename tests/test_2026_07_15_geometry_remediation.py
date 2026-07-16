@@ -10,12 +10,14 @@ from vfe3.geometry.groups import get_group
 from vfe3.geometry.lie_ops import compose_phi, embed_phi, retract_omega
 from vfe3.geometry.retraction import _eigh_damped, _rel_gap_eps, retract_spd_full
 from vfe3.geometry.transport import (
+    _stable_compact_glk_exp_pair,
     gauge_invariant_edge_features,
     get_transport,
     group_element_inverse,
     stable_matrix_exp_pair,
 )
 from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
+from vfe3.inference.e_step import e_step_iteration, free_energy_value, phi_alignment_loss
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts, _pure_path_report
 
@@ -198,6 +200,55 @@ def test_transport_chart_bound_config_requires_positive_finite_value(bound: floa
         VFE3Config(transport_chart_max_norm=bound)
 
 
+def test_phi_substep_rejects_retracted_frame_outside_chart_bound() -> None:
+    group = get_group("glk")(K=2)
+    mu = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    sigma = torch.ones(2, 2)
+    belief = BeliefState(
+        mu=mu,
+        sigma=sigma,
+        phi=torch.zeros(2, group.generators.shape[0]),
+    )
+
+    with pytest.raises(ValueError, match="transport chart validity bound"):
+        e_step_iteration(
+            belief,
+            mu.clone(),
+            sigma.clone(),
+            group,
+            e_q_mu_lr=0.0,
+            e_q_sigma_lr=0.0,
+            e_phi_lr=0.1,
+            transport_chart_max_norm=0.01,
+        )
+
+
+@pytest.mark.parametrize("evaluator", ("alignment", "free-energy"))
+def test_objective_evaluators_honor_transport_chart_bound(evaluator: str) -> None:
+    group = get_group("glk")(K=2)
+    mu = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    sigma = torch.ones(2, 2)
+    phi = torch.ones(2, group.generators.shape[0])
+
+    with pytest.raises(ValueError, match="transport chart validity bound"):
+        if evaluator == "alignment":
+            phi_alignment_loss(
+                mu,
+                sigma,
+                phi,
+                group,
+                transport_chart_max_norm=0.1,
+            )
+        else:
+            free_energy_value(
+                BeliefState(mu=mu, sigma=sigma, phi=phi),
+                mu,
+                sigma,
+                group,
+                transport_chart_max_norm=0.1,
+            )
+
+
 def test_bch_residual_bound_fails_closed() -> None:
     group = get_group("so_k")(K=3)
     left = torch.tensor([1.0, 0.5, -0.3])
@@ -214,6 +265,56 @@ def test_bch_residual_bound_fails_closed() -> None:
         )
 
 
+def test_bch_residual_bound_rejects_nonfinite_group_product() -> None:
+    group = get_group("glk")(K=1)
+
+    with pytest.raises(ValueError, match="nonfinite"):
+        compose_phi(
+            torch.tensor([1000.0]),
+            torch.tensor([1000.0]),
+            group.generators,
+            mode="bch",
+            order=4,
+            residual_max=1.0e-4,
+        )
+
+
+def test_euclidean_positional_composition_ignores_bch_residual_bound() -> None:
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=2,
+        n_heads=1,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        pos_phi="frozen",
+        pos_phi_compose="euclidean",
+        bch_residual_max=0.1,
+    )
+
+    logits = VFEModel(cfg)(torch.tensor([[0, 1, 2, 3]]))
+
+    assert torch.isfinite(logits).all()
+
+
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+@pytest.mark.parametrize("compact", (False, True))
+def test_transport_chart_bound_rejects_nonfinite_matrix_norm(
+    value:   float,
+    compact: bool,
+) -> None:
+    matrix = torch.tensor([[value, 0.0], [0.0, 0.0]])
+
+    with pytest.raises(ValueError, match="nonfinite"):
+        if compact:
+            _stable_compact_glk_exp_pair(
+                matrix.reshape(1, 2, 2),
+                validity_max_norm=1.0,
+            )
+        else:
+            stable_matrix_exp_pair(matrix, validity_max_norm=1.0)
+
+
 def test_near_orthogonal_frame_uses_true_inverse_for_exact_cocycle() -> None:
     group = get_group("so_k")(K=3)
     omega = torch.eye(3)
@@ -224,6 +325,19 @@ def test_near_orthogonal_frame_uses_true_inverse_for_exact_cocycle() -> None:
 
     assert torch.linalg.matrix_norm(residual) < 2.0e-7
     assert torch.allclose(inverse, torch.linalg.inv(omega.double()).float(), atol=1.0e-7, rtol=0.0)
+
+
+def test_high_dimensional_near_orthogonal_frame_uses_true_inverse() -> None:
+    dimension = 100
+    group = get_group("so_k")(K=dimension)
+    omega = torch.eye(dimension)
+    omega[0, 0] = 1.0 + 2.1458e-5
+
+    inverse = group_element_inverse(omega, group)
+    reference = torch.linalg.inv(omega.double()).float()
+
+    torch.testing.assert_close(inverse, reference, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(omega @ inverse, torch.eye(dimension), atol=0.0, rtol=0.0)
 
 
 def test_omega_retraction_dispatches_through_registry() -> None:
