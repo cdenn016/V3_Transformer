@@ -368,13 +368,13 @@ _TOKENS_PER_CHAR_CACHE: dict = {}
 
 
 def tokens_per_char(
-    dataset:    str,
-    split:      str,
+    dataset:      str,
+    split:        str,
 
     *,
-    chunk_tokens: int = 64 * 1024,
+    chunk_tokens: int            = 64 * 1024,
 
-    cache_dir: Optional[Path] = None,
+    cache_dir:    Optional[Path] = None,
 ) -> Optional[float]:
     r"""Corpus constant ``n_tokens / n_unicode_codepoints`` for ``dataset``/``split``, or None.
 
@@ -430,13 +430,13 @@ class TokenWindows(Dataset):
 
     def __init__(
         self,
-        tokens:  torch.Tensor,           # (T,) 1-D token-id stream
-        seq_len: int,
+        tokens:    torch.Tensor,           # (T,) 1-D token-id stream
+        seq_len:   int,
 
         *,
-        pad_final: bool = False,  # eval: pad the final partial window, target pad=-100
+        pad_final: bool          = False,  # eval: pad the final partial window, target pad=-100
 
-        stride: Optional[int] = None,   # None -> non-overlapping seq_len stride
+        stride:    Optional[int] = None,   # None -> non-overlapping seq_len stride
     ) -> None:
         if tokens.dim() != 1:
             raise ValueError(f"tokens must be 1-D, got shape {tuple(tokens.shape)}")

@@ -149,3 +149,15 @@ python -m pytest tests/test_scaling_mup.py tests/test_reporting_additions.py tes
 ```
 
 Pytest reported `74 passed, 26 warnings in 8.30s`; JUnit recorded `tests=74 failures=0 errors=0 skipped=0 time=8.300`. `git diff --check` produced no whitespace errors. Ruff was not available in this environment (`No module named ruff`). No broad, full, or slow suite was run, and no configuration default was changed.
+
+## Final signature-style pass
+
+The final Minor review finding was formatting-only. The `tokens_per_char` and `TokenWindows.__init__` signatures now vertically align parameter names, type annotations, equals signs, and trailing comments while retaining the required defined-before-optional order. No executable expression, default, annotation, parameter name, or call site changed.
+
+The public signature/order regression and focused data module command was:
+
+```text
+python -m pytest tests/test_2026_07_15_data_integrity_remediation.py::test_data_integrity_signatures_follow_defined_before_optional_order tests/test_data.py --junitxml=C:\tmp\vfe3-task4-style-green-20260716.xml
+```
+
+Pytest reported `13 passed, 1 warning in 0.25s`; JUnit recorded `tests=13 failures=0 errors=0 skipped=0 time=0.244`.
