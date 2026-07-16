@@ -275,13 +275,21 @@ def test_resumed_scheduler_uses_persisted_successful_update_clock(
     assert observed_last_epochs == [1]
 
 
-def test_inner_oracle_derivative_construction_stays_fp32_under_outer_autocast(
+def test_outer_estep_autocast_and_inner_oracle_fp32_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vfe3.gradients.oracle as oracle
+    import vfe3.model.block as block
 
-    seen = []
+    outer_autocast = []
+    inner_calls = []
+    real_e_step = block.e_step
     real_pairwise_energy = oracle.pairwise_energy
+
+    def e_step_spy(*args: Any, **kwargs: Any) -> Any:
+        belief = args[0]
+        outer_autocast.append(torch.is_autocast_enabled(belief.mu.device.type))
+        return real_e_step(*args, **kwargs)
 
     def pairwise_spy(
         query:  Any,
@@ -289,9 +297,16 @@ def test_inner_oracle_derivative_construction_stays_fp32_under_outer_autocast(
         *args:  Any,
         **kwargs: Any,
     ) -> torch.Tensor:
-        seen.append((query.mu.dtype, query.sigma.dtype, target.mu.dtype, target.sigma.dtype))
+        inner_calls.append((
+            torch.is_autocast_enabled(query.mu.device.type),
+            query.mu.dtype,
+            query.sigma.dtype,
+            target.mu.dtype,
+            target.sigma.dtype,
+        ))
         return real_pairwise_energy(query, target, *args, **kwargs)
 
+    monkeypatch.setattr(block, "e_step", e_step_spy)
     monkeypatch.setattr(oracle, "pairwise_energy", pairwise_spy)
     model = _model(amp_dtype="bf16", gradient_mode="smoothing")
     tokens = _tokens().repeat(2, 1)
@@ -300,8 +315,10 @@ def test_inner_oracle_derivative_construction_stays_fp32_under_outer_autocast(
     _, loss, _ = model(tokens, targets)
 
     assert torch.isfinite(loss)
-    assert seen
-    assert all(dtype == torch.float32 for call in seen for dtype in call)
+    assert outer_autocast and all(outer_autocast)
+    assert inner_calls
+    assert all(not call[0] for call in inner_calls)
+    assert all(dtype == torch.float32 for call in inner_calls for dtype in call[1:])
 
 
 def test_rejected_update_cannot_mutate_metropolis_state_or_rng(

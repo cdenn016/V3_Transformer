@@ -1009,9 +1009,11 @@ class VFEModel(nn.Module):
         # CUDA throughput. amp_dtype=None (default) -> nullcontext -> NO autocast object is ever
         # instantiated on the default path, so logits/loss are byte-identical to the no-AMP build.
         # device_type is resolved from the runtime tensors (not hardcoded 'cuda') so the path is
-        # exercised on whatever device the tokens live on; the matrix_exp / SPD islands inside
-        # vfe_stack keep their own autocast(enabled=False) fp32 guards regardless. The decode + CE
-        # below are protected separately (their inputs are .float()-ed; see _amp_off_context).
+        # exercised on whatever device the tokens live on. The outer autocast remains active through
+        # transport construction, model-channel refinement, and vfe_stack; only the existing
+        # matrix-exp/SPD kernels and the autograd oracle's inner objective/derivative builder enter
+        # their own narrow fp32 islands. Decode + CE are protected separately below (their inputs are
+        # .float()-ed; see _amp_off_context).
         amp = self._amp_context(token_ids.device)
         with run, amp:
             shared_omega = None
@@ -1028,34 +1030,28 @@ class VFEModel(nn.Module):
                 # gauge-RoPE into both channels, so the unwrapped shared transport cannot serve either
                 # rotated hoist. Outside the guard each e_step keeps its own authoritative build.
                 from vfe3.inference.e_step import build_belief_transport
-                with self._amp_off_context(token_ids.device):
-                    shared_omega = build_belief_transport(
-                        (beliefs.phi.float()
-                         if self.cfg.amp_dtype is not None else beliefs.phi), self.group,
-                        transport_mode="flat",
-                        gauge_parameterization=self.cfg.gauge_parameterization, omega=beliefs.omega,
-                        right_phi=beliefs.right_phi,
-                        reflection=beliefs.reflection if beliefs.reflection is not None else None,   # phi-path reflection fold (None -> byte-identical)
-                        clamp_monitor=self.cfg.transport_clamp_monitor,
-                        # Tier-1 transport perf toggles: the shared build must carry the same island
-                        # keying / per-head mean flag the per-e_step hoists would have used.
-                        transport_mean_per_head=self.cfg.transport_mean_per_head,
-                        compact_phi_block_transport=self._compact_phi_blocks_enabled(),
-                        exp_fp64_mode=self.cfg.exp_fp64_mode,
-                        exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
-                    )
+                shared_omega = build_belief_transport(
+                    beliefs.phi, self.group,
+                    transport_mode="flat",
+                    gauge_parameterization=self.cfg.gauge_parameterization, omega=beliefs.omega,
+                    right_phi=beliefs.right_phi,
+                    reflection=beliefs.reflection if beliefs.reflection is not None else None,   # phi-path reflection fold (None -> byte-identical)
+                    clamp_monitor=self.cfg.transport_clamp_monitor,
+                    # Tier-1 transport perf toggles: the shared build must carry the same island
+                    # keying / per-head mean flag the per-e_step hoists would have used.
+                    transport_mean_per_head=self.cfg.transport_mean_per_head,
+                    compact_phi_block_transport=self._compact_phi_blocks_enabled(),
+                    exp_fp64_mode=self.cfg.exp_fp64_mode,
+                    exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
+                )
             s_belief = None
             if self.cfg.s_e_step:
                 # Live model channel: refine s (phi0 fixed), then anchor the belief to it -- q0 and
                 # the belief prior (mu_p, sigma_p) both become the refined s1. The belief E-step
                 # self-couples to its prior every iteration, so s reaches mu_final even at n_e_steps=1.
-                with self._amp_off_context(token_ids.device):
-                    s_mu1, s_sigma1 = self._refine_s(
-                        token_ids,
-                        (model_phi.float()
-                         if self.cfg.amp_dtype is not None else model_phi),
-                        e_step_gradient=e_step_gradient,
-                        rope=rope, prebuilt_transport=shared_omega)
+                s_mu1, s_sigma1 = self._refine_s(
+                    token_ids, model_phi, e_step_gradient=e_step_gradient,
+                    rope=rope, prebuilt_transport=shared_omega)
                 s_belief = (s_mu1, s_sigma1)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
             # Effective belief-channel attention prior: fold the DETACHED precision-weighted reliability
@@ -1091,29 +1087,20 @@ class VFEModel(nn.Module):
             grad_rec: Optional[EStepGradientRecord] = (
                 {} if estep_grad_out is not None else None
             )                                                       # E-step belief-grad capture (gated, off by default)
-            with self._amp_off_context(token_ids.device):
-                out = vfe_stack(
-                    beliefs,
-                    (beliefs.mu.float()
-                     if self.cfg.amp_dtype is not None else beliefs.mu),
-                    (beliefs.sigma.float()
-                     if self.cfg.amp_dtype is not None else beliefs.sigma),
-                    self.group, self.cfg,
-                    log_prior=(log_prior.float()
-                               if log_prior is not None and self.cfg.amp_dtype is not None
-                               else log_prior),
-                    block_norm=self.block_norm,
-                    head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
-                    lambda_beta=lambda_beta,
-                    connection_W=connection_W, connection_M=connection_M,
-                    connection_L=connection_L,
-                    e_step_gradient=e_step_gradient,
-                    rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
-                    rope_on_value=self.cfg.rope_on_value,
-                    capture=capture, grad_record=grad_rec,
-                    prebuilt_transport=shared_omega,
-                    gauge_parameterization=self.cfg.gauge_parameterization,
-                    kappa_beta_override=self.effective_kappa_beta(token_ids.device))
+            out = vfe_stack(
+                beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
+                log_prior=log_prior, block_norm=self.block_norm,
+                head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
+                lambda_beta=lambda_beta,
+                connection_W=connection_W, connection_M=connection_M,
+                connection_L=connection_L,
+                e_step_gradient=e_step_gradient,
+                rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
+                rope_on_value=self.cfg.rope_on_value,
+                capture=capture, grad_record=grad_rec,
+                prebuilt_transport=shared_omega,
+                gauge_parameterization=self.cfg.gauge_parameterization,
+                kappa_beta_override=self.effective_kappa_beta(token_ids.device))
         if estep_grad_out is not None:                           # one host sync, only when requested
             for _gk in ("mu", "sigma", "phi"):
                 _gv = grad_rec.get(_gk) if grad_rec is not None else None

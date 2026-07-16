@@ -34,6 +34,40 @@ from vfe3.geometry.transport import (
 )
 
 
+def _transport_to_float(
+    omega: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport',
+) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport':
+    r"""Cast only an oracle island's transport tensors to fp32, preserving its representation."""
+    if isinstance(omega, torch.Tensor):
+        return omega.float()
+    if isinstance(omega, CompactFactoredTransport):
+        return CompactFactoredTransport(
+            omega.exp_blocks.float(), omega.inv_blocks.float(), omega.K,
+            mean_per_head=omega.mean_per_head,
+        )
+    if isinstance(omega, DirectLinkTransport):
+        return DirectLinkTransport(
+            exp_link=omega.exp_link.float(),
+            exp_phi=(omega.exp_phi.float() if omega.exp_phi is not None else None),
+            exp_neg_phi=(omega.exp_neg_phi.float() if omega.exp_neg_phi is not None else None),
+        )
+    if isinstance(omega, FactoredTransport):
+        return FactoredTransport(
+            exp_phi=omega.exp_phi.float(),
+            exp_neg_phi=omega.exp_neg_phi.float(),
+            irrep_dims=omega.irrep_dims,
+            mean_per_head=omega.mean_per_head,
+        )
+    if isinstance(omega, RopeTransport):
+        return RopeTransport(
+            base=_transport_to_float(omega.base),
+            rope=omega.rope.float(),
+            on_cov=omega.on_cov,
+            on_value=omega.on_value,
+        )
+    raise TypeError(f"unsupported transport type {type(omega).__name__!r}")
+
+
 # The belief update is part of the model FORWARD (iterative belief minimization), so this
 # oracle must produce a gradient even when the caller runs the forward under no_grad -- the
 # eval() / diagnostics() / generate() regime (evaluate is @torch.no_grad) and the detached
@@ -94,15 +128,22 @@ def belief_gradients_autograd(
     E-step) -- a pre-built omega is constant w.r.t. the local leaves and silently drops it. The
     key-role semantics carry over exactly: under filtering the builder receives detached key
     slots (query-side d delta/d mu_i only -- mean-field coordinate ascent); under smoothing both
-    slots share the live leaves (full gradient, the stationary point of the global F)."""
+    slots share the live leaves (full gradient, the stationary point of the global F).
+
+    Under an outer AMP context, only this inner objective/derivative construction is re-entered with
+    autocast disabled and fp32 belief/prior inputs. The surrounding E-step remains under its caller's
+    autocast context, preserving mixed-precision transport, iteration, and state-update operations.
+    """
     if torch.is_autocast_enabled(mu.device.type):
         # The outer training autocast scales only the final loss. Inner derivative construction has
         # already happened by then, so a bf16/fp16 transport or objective here cannot be recovered by
-        # GradScaler. Re-enter under an explicit fp32 island; recursion terminates immediately because
-        # autocast is disabled in the nested call. Tensor casts retain the graph for create_graph=True.
+        # GradScaler. Re-enter only this oracle under an explicit fp32 island; recursion terminates
+        # immediately because autocast is disabled in the nested call. Tensor casts retain the graph
+        # for create_graph=True, while the caller resumes its outer autocast context after return.
         with torch.autocast(device_type=mu.device.type, enabled=False):
             return belief_gradients_autograd(
-                mu.float(), sigma.float(), mu_p.float(), sigma_p.float(), omega,
+                mu.float(), sigma.float(), mu_p.float(), sigma_p.float(),
+                _transport_to_float(omega),
                 tau=(tau.float() if isinstance(tau, torch.Tensor) else tau),
                 lambda_beta=(lambda_beta.float()
                              if isinstance(lambda_beta, torch.Tensor) else lambda_beta),

@@ -30,7 +30,7 @@ Gamma-to-beta prior mixing now masks forbidden beta support before row normaliza
 
 `train_step` now derives one `did_step` decision and gates scheduler advancement, projection, barycenter, EMA, and downstream Metropolis behavior on it. The accepted-update count is persisted in optimizer parameter-group metadata, explicitly preserved by checkpoint loading, and used to reconstruct LambdaLR on resume. Legacy checkpoints fall back to the existing outer-step cursor. Metropolis cadence now consumes the zero-based accepted-update index and returns before state mutation or RNG use after a rejected update.
 
-The inner E-step and oracle derivative construction now execute in autocast-disabled fp32 islands only when AMP is configured, while the outer forward/loss autocast remains active and the default non-AMP path retains its prior dtype behavior. Diagnostics now expose `gamma_direct_frame_grad_active = 0.0`, accurately recording the intentionally passive direct gamma-frame route.
+The outer E-step remains under configured autocast. Only the autograd oracle's inner objective and derivative construction re-enters with autocast disabled, casting its belief, prior, coefficient, log-prior, and representation-preserving transport inputs to fp32. Existing matrix-exp, SPD, decode, and cross-entropy islands remain narrow and unchanged. The default non-AMP path retains its prior dtype behavior. Diagnostics now expose `gamma_direct_frame_grad_active = 0.0`, accurately recording the intentionally passive direct gamma-frame route.
 
 Neighbor tests were updated only where they encoded the superseded clamped-entropy derivative, compared grad-enabled inference with no-grad inference, or independently reconstructed the old belief-only Metropolis objective.
 
@@ -65,3 +65,93 @@ JUnit reported `tests=11`, `failures=0`, `errors=0`, and `skipped=0`. The target
 - `tests/test_train.py`
 - `tests/test_phi_reflection_objective_parity_20260712.py`
 - `tests/test_hierarchical_probabilistic_completeness_20260712.py`
+
+## Review follow-up: narrow AMP boundary
+
+The first implementation disabled autocast around transport construction, `_refine_s`, and the complete `vfe_stack`. A strengthened regression separately observes the outer `vfe3.model.block.e_step` entry and the inner `vfe3.gradients.oracle.pairwise_energy` call. Before the review fix, the exact command was:
+
+```text
+python -m pytest tests/test_objective_state_transitions_20260715.py::test_outer_estep_autocast_and_inner_oracle_fp32_boundary
+```
+
+The literal captured RED output included:
+
+```text
+F                                                                        [100%]
+__________ test_outer_estep_autocast_and_inner_oracle_fp32_boundary ___________
+>       assert outer_autocast and all(outer_autocast)
+E       assert ([False] and False)
+E        +  where False = all([False])
+FAILED tests/test_objective_state_transitions_20260715.py::test_outer_estep_autocast_and_inner_oracle_fp32_boundary
+1 failed, 1 warning in 0.74s
+```
+
+Removing the overbroad wrappers exposed the transport side of the same inner boundary rather than a reason to restore the wrappers. The next literal failing line was:
+
+```text
+>           return _VF.einsum(equation, operands)  # type: ignore[attr-defined]
+E           RuntimeError: expected scalar type BFloat16 but found Float
+FAILED tests/test_objective_state_transitions_20260715.py::test_outer_estep_autocast_and_inner_oracle_fp32_boundary
+1 failed, 1 warning in 0.22s
+```
+
+The repair removes the three whole-E-step `_amp_off_context` wrappers and their eager casts. `_transport_to_float` now reconstructs dense, factored, compact-factored, direct-link, and RoPE transport representations with fp32 tensors only inside the oracle recursion. The strengthened test requires outer autocast to be enabled and inner pairwise objective construction to have autocast disabled with fp32 belief and prior tensors.
+
+## Reproduced original RED evidence
+
+The original raw XML had already been removed under the task-artifact cleanup contract. To avoid reconstructing output from memory, a detached temporary worktree was created at base commit `541fff6`, and the current regression file was copied into it. Source and reproduction copies had the identical SHA-256 `5C1D7B48803DB30D4ED8DD54907E8E60F43AA02F0AC28603BF6702CD96C2F229`. The task branch was not changed, and the temporary worktree was removed after capture.
+
+The exact reproduction command was:
+
+```text
+python -m pytest tests/test_objective_state_transitions_20260715.py
+```
+
+The literal captured base output was:
+
+```text
+FFFFFFFFFF                                                               [100%]
+E       assert -0.0005972981452941895 > 0.0
+E       assert not True
+E       AssertionError: Tensor-likes are not close!
+E       Greatest absolute difference: 0.3333333134651184 at index (0, 0) (up to 1e-05 allowed)
+E       AssertionError: Tensor-likes are not close!
+E       Greatest absolute difference: 5.524901517761266e-14 at index (0, 1) (up to 1e-20 allowed)
+E       assert 1 == 0
+E       KeyError: 'successful_updates'
+E       assert [4] == [1]
+E       assert False
+E       assert 'did_step' in mappingproxy(OrderedDict({'model': <Parameter "model: vfe3.model.model.VFEModel">, 'token_ids': <Parameter "token_ids: torch.Tensor">, 'step': <Parameter "step: int">, 'generator': <Parameter "generator: torch._C.Generator">}))
+E       KeyError: 'gamma_direct_frame_grad_active'
+FAILED tests/test_objective_state_transitions_20260715.py::test_metropolis_uses_complete_joint_objective_when_gamma_reverses_belief_decision
+FAILED tests/test_objective_state_transitions_20260715.py::test_gamma_energy_changes_when_rope_transport_is_active
+FAILED tests/test_objective_state_transitions_20260715.py::test_gamma_prior_mix_normalizes_after_applying_active_support
+FAILED tests/test_objective_state_transitions_20260715.py::test_entropy_tail_derivative_matches_analytic_envelope_coefficient
+FAILED tests/test_objective_state_transitions_20260715.py::test_scheduler_does_not_advance_after_rejected_update
+FAILED tests/test_objective_state_transitions_20260715.py::test_successful_update_clock_persists_in_optimizer_state
+FAILED tests/test_objective_state_transitions_20260715.py::test_resumed_scheduler_uses_persisted_successful_update_clock
+FAILED tests/test_objective_state_transitions_20260715.py::test_outer_estep_autocast_and_inner_oracle_fp32_boundary
+FAILED tests/test_objective_state_transitions_20260715.py::test_rejected_update_cannot_mutate_metropolis_state_or_rng
+FAILED tests/test_objective_state_transitions_20260715.py::test_diagnostics_report_passive_direct_gamma_frame_gradient
+10 failed, 2 warnings in 1.24s
+```
+
+All failure lines above are copied verbatim from the reproduction output.
+
+## Review GREEN evidence
+
+The focused Task 1 regressions and behavior-level AMP/autocast coverage were run together:
+
+```text
+python -m pytest tests/test_objective_state_transitions_20260715.py tests/test_amp.py tests/test_fp16_gradscaler.py tests/test_fix_model_audit.py tests/test_audit_fixes_2026_07_05.py tests/test_p1_compact_phi_block_transport_20260711.py --junitxml=C:\tmp\vfe3-task1-review-green-20260715.xml
+```
+
+The literal console summary was:
+
+```text
+........................................................................ [ 85%]
+............                                                             [100%]
+84 passed, 13 warnings in 1.16s
+```
+
+JUnit reported `tests=84`, `failures=0`, `errors=0`, `skipped=0`, and `time=1.158`.
