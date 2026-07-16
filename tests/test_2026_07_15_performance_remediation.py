@@ -24,6 +24,7 @@ from vfe3.viz import report
 e_step_module = importlib.import_module("vfe3.inference.e_step")
 gauge_optim_module = importlib.import_module("vfe3.gauge_optim")
 lie_ops_module = importlib.import_module("vfe3.geometry.lie_ops")
+stack_module = importlib.import_module("vfe3.model.stack")
 train_module = importlib.import_module("vfe3.train")
 
 
@@ -670,6 +671,168 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
     assert actual_model is not None and expected_model is not None
     _assert_mapping_close(actual_model, expected_model)
     _assert_mapping_close(actual_vocab, expected_vocab)
+
+
+def test_belief_ce_fallback_offloads_each_batch_before_next_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = VFEModel(_tiny_config()).eval()
+    loader = [
+        (torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]])),
+        (torch.tensor([[4, 3, 2, 1]]), torch.tensor([[3, 2, 1, 0]])),
+    ]
+    expected = extract.belief_ce_bank(model, loader)
+    previous_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    liveness_checks: list[bool] = []
+    forward_calls = 0
+    first_batch_offloads = 0
+    real_forward = model.forward
+    real_stack = stack_module.vfe_stack
+    real_cpu_value = extract._cpu_bank_value
+
+    def _forward_spy(*args: object, **kwargs: object) -> torch.Tensor:
+        nonlocal forward_calls
+        if previous_refs:
+            gc.collect()
+            liveness_checks.append(all(ref() is None for ref in previous_refs))
+        result = real_forward(*args, **kwargs)
+        if forward_calls == 0:
+            previous_refs.append(weakref.ref(result))
+        forward_calls += 1
+        return result
+
+    def _stack_spy(*args: object, **kwargs: object) -> object:
+        result = real_stack(*args, **kwargs)
+        if forward_calls == 1:
+            previous_refs.extend(
+                weakref.ref(tensor)
+                for tensor in (result.mu, result.sigma, result.phi)
+            )
+        return result
+
+    def _cpu_value_spy(value: object) -> object:
+        nonlocal first_batch_offloads
+        if forward_calls == 1:
+            first_batch_offloads += 1
+        return real_cpu_value(value)
+
+    monkeypatch.setattr(model, "forward", _forward_spy)
+    monkeypatch.setattr(stack_module, "vfe_stack", _stack_spy)
+    monkeypatch.setattr(extract, "_cpu_bank_value", _cpu_value_spy)
+    actual = extract.belief_ce_bank(model, loader)
+
+    assert forward_calls == 2
+    assert first_batch_offloads == 5
+    assert liveness_checks == [True]
+    assert all(value.device.type == "cpu" for value in actual.values())
+    _assert_mapping_close(actual, expected)
+
+
+def test_belief_fallback_offloads_each_batch_before_next_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = VFEModel(_tiny_config()).eval()
+    token_batches = [
+        torch.tensor([[0, 1, 2, 3]]),
+        torch.tensor([[4, 3, 2, 1]]),
+    ]
+    expected = extract.belief_bank(model, token_batches)
+    previous_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    liveness_checks: list[bool] = []
+    stack_calls = 0
+    first_batch_offloads = 0
+    real_stack = stack_module.vfe_stack
+    real_cpu_value = extract._cpu_bank_value
+
+    def _stack_spy(*args: object, **kwargs: object) -> object:
+        nonlocal stack_calls
+        if previous_refs:
+            gc.collect()
+            liveness_checks.append(all(ref() is None for ref in previous_refs))
+        result = real_stack(*args, **kwargs)
+        if stack_calls == 0:
+            previous_refs.extend(
+                weakref.ref(tensor)
+                for tensor in (result.mu, result.sigma, result.phi)
+            )
+        stack_calls += 1
+        return result
+
+    def _cpu_value_spy(value: object) -> object:
+        nonlocal first_batch_offloads
+        if stack_calls == 1:
+            first_batch_offloads += 1
+        return real_cpu_value(value)
+
+    monkeypatch.setattr(stack_module, "vfe_stack", _stack_spy)
+    monkeypatch.setattr(extract, "_cpu_bank_value", _cpu_value_spy)
+    actual = extract.belief_bank(model, token_batches)
+
+    assert stack_calls == 2
+    assert first_batch_offloads == 6
+    assert liveness_checks == [True]
+    assert all(value.device.type == "cpu" for value in actual.values())
+    _assert_mapping_close(actual, expected)
+
+
+def test_model_channel_fallback_offloads_each_batch_before_next_refine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = VFEModel(_tiny_config(
+        n_heads=1,
+        prior_source="model_channel",
+        s_frame_mode="phi_tilde",
+        s_e_step=True,
+        lambda_h=1.0,
+        lambda_gamma=0.0,
+    )).eval()
+    token_batches = [
+        torch.tensor([[0, 1, 2, 3]]),
+        torch.tensor([[4, 3, 2, 1]]),
+    ]
+    expected = extract.model_channel_bank(model, token_batches)
+    previous_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    liveness_checks: list[bool] = []
+    refine_calls = 0
+    first_batch_offloads = 0
+    real_refine = model._refine_s
+    real_cpu_value = extract._cpu_bank_value
+
+    def _refine_spy(
+        tokens:    torch.Tensor,
+        model_phi: torch.Tensor,
+
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal refine_calls
+        if previous_refs:
+            gc.collect()
+            liveness_checks.append(all(ref() is None for ref in previous_refs))
+        result = real_refine(tokens, model_phi, **kwargs)
+        if refine_calls == 0:
+            previous_refs.extend(
+                weakref.ref(tensor)
+                for tensor in (*result, *_record_tensors(model_phi))
+            )
+        refine_calls += 1
+        return result
+
+    def _cpu_value_spy(value: object) -> object:
+        nonlocal first_batch_offloads
+        if refine_calls == 1:
+            first_batch_offloads += 1
+        return real_cpu_value(value)
+
+    monkeypatch.setattr(model, "_refine_s", _refine_spy)
+    monkeypatch.setattr(extract, "_cpu_bank_value", _cpu_value_spy)
+    actual = extract.model_channel_bank(model, token_batches)
+
+    assert actual is not None and expected is not None
+    assert refine_calls == 2
+    assert first_batch_offloads == 6
+    assert liveness_checks == [True]
+    assert all(value.device.type == "cpu" for value in actual.values())
+    _assert_mapping_close(actual, expected)
 
 
 def test_inference_bank_releases_prior_device_batch_before_next_forward(

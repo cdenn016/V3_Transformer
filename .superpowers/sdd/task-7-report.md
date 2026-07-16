@@ -199,3 +199,54 @@ Targeted Ruff verification over the five changed production/test files passed wi
 The P4 projection boundary was rechecked against `docs/superpowers/specs/2026-07-15-phi-projection-hot-path-optimization-design.md`. Current-batch row projection is not a valid replacement for the exact hard bound: AdamW first moments, natural-gradient momentum, and nonzero decay can move rows that are absent from the current batch. Task 7 therefore retains the approved exact global scan. Its certified diagonal-Gram route is `O(rows*n_gen)` rather than the rejected dense `O(rows*n_gen*K^2)` route, statistics use one aggregate transfer, and the feature remains default-off when `phi_mstep_max_matrix_norm=None`.
 
 No full or slow suite was run. This closure does not edit the daily ledger or Research vault, and it does not push or merge.
+
+## Fourth blocking review closure
+
+The fourth review identified one remaining population-extraction residency gap. When no shared inference bank was supplied, `belief_ce_bank`, `belief_bank`, and `model_channel_bank` retained every batch's selected outputs on the model device until the final concatenation. Each no-bank loop now detaches and CPU-hosts every retained field immediately through `_cpu_bank_value`. After the CPU copies enter the accumulation lists, the loop releases that batch's logits, converged belief outputs, model-channel outputs and frame, intermediate beliefs, and other device-local work before the next forward, stack, or model-channel refinement. Each consumer still moves only its current input batch to the selected device. The shared `inference_bank` branches and their default behavior are unchanged.
+
+The three regressions compare every returned field with the pre-spy numerical result, require all retained results to be CPU tensors, count the first batch's five, six, and six explicit offloads, and use weak references to prove that its logits, converged belief outputs, refined model-channel outputs, and independent model frame are dead at the second compute boundary. They were first run against the unmodified fallback loops and failed for the intended zero-offload condition:
+
+```text
+python -m pytest tests/test_2026_07_15_performance_remediation.py::test_belief_ce_fallback_offloads_each_batch_before_next_forward tests/test_2026_07_15_performance_remediation.py::test_belief_fallback_offloads_each_batch_before_next_stack tests/test_2026_07_15_performance_remediation.py::test_model_channel_fallback_offloads_each_batch_before_next_refine --junitxml=C:\tmp\task7-fallback-consumers-red.xml
+Exit code: 1
+FFF                                                                      [100%]
+3 failed, 1 warning in 0.61s
+```
+
+```xml
+<testsuite name="pytest" errors="0" failures="3" skipped="0" tests="3" time="0.613" timestamp="2026-07-16T14:39:35.045877-05:00" />
+```
+
+The same nodes passed after the fallback-only implementation:
+
+```text
+Exit code: 0
+...                                                                      [100%]
+3 passed, 1 warning in 0.52s
+```
+
+```xml
+<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="3" time="0.517" timestamp="2026-07-16T14:40:17.067344-05:00" />
+```
+
+The complete focused Task 7 module passed with machine-readable evidence:
+
+```text
+python -m pytest tests/test_2026_07_15_performance_remediation.py --junitxml=C:\tmp\task7-performance-module-green.xml
+Exit code: 0
+......................                                                   [100%]
+22 passed, 4 warnings in 1.71s
+```
+
+```xml
+<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="22" time="1.710" timestamp="2026-07-16T14:45:10.891648-05:00" />
+```
+
+Direct extraction, report, forward-fidelity, covariance/CE, and model-frame semantics neighbors recorded 51 tests, zero failures or errors, and five repository-marked skips. The directly affected population-cap nodes recorded nine tests with zero failures, errors, or skips.
+
+```xml
+<testsuite name="pytest" errors="0" failures="0" skipped="5" tests="51" time="26.714" timestamp="2026-07-16T14:43:24.106324-05:00" />
+<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="9" time="0.314" timestamp="2026-07-16T14:44:09.523671-05:00" />
+```
+
+Targeted Ruff verification passed with `ruff check --no-cache vfe3/viz/extract.py tests/test_2026_07_15_performance_remediation.py`. The available Torch build was `2.11.0+cpu`, so the regressions exercise the device-independent offload calls and lifetime boundary but could not execute a CUDA allocation in this interpreter. The review-owned XML files remain outside the repository and are deleted before commit. No full or slow suite was run, and this closure does not push or merge.

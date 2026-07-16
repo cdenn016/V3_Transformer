@@ -47,7 +47,7 @@ def _model_device(model) -> torch.device:
 
 
 def _cpu_bank_value(value: object) -> object:
-    r"""Detach and CPU-host every tensor retained by one inference-bank record."""
+    r"""Detach and CPU-host every tensor retained by a bank record or field."""
     if isinstance(value, torch.Tensor):
         return value.detach().cpu()
     if isinstance(value, CompactBlockElement):
@@ -447,6 +447,7 @@ def belief_ce_bank(
             model_phi = model._resolve_model_frame(tokens, beliefs.phi)
             rope = model._rope_rotation(n, device)
             s_belief = None
+            s_mu1 = s_sigma1 = None
             if cfg.s_e_step:                                       # anchor belief to the refined model channel
                 s_mu1, s_sigma1 = model._refine_s(tokens, model_phi, rope=rope)
                 s_belief = (s_mu1, s_sigma1)
@@ -478,12 +479,16 @@ def belief_ce_bank(
             ).reshape(-1)                                                    # (B*N,)
             tgt = targets.reshape(-1)
             valid = tgt != -100
-            tr_sig.append(trs[valid])
-            ces.append(per[valid])
-            tids.append(tgt[valid])
-            confs.append(conf_flat[valid])
-            corrects.append((pred_flat[valid] == tgt[valid]).float())
-            if max_batches is not None and i + 1 >= max_batches:
+            tr_sig.append(_cpu_bank_value(trs[valid]))
+            ces.append(_cpu_bank_value(per[valid]))
+            tids.append(_cpu_bank_value(tgt[valid]))
+            confs.append(_cpu_bank_value(conf_flat[valid]))
+            corrects.append(_cpu_bank_value((pred_flat[valid] == tgt[valid]).float()))
+            stop = max_batches is not None and i + 1 >= max_batches
+            del tokens, targets, logits, flat_logits, per, conf_flat, pred_flat
+            del beliefs, model_phi, rope, s_belief, s_mu1, s_sigma1, log_prior
+            del out, trs, tgt, valid
+            if stop:
                 break
     finally:
         if was_training:
@@ -577,6 +582,7 @@ def belief_bank(
             n = tokens.shape[1]
             rope = model._rope_rotation(n, device)
             s_belief = None
+            s_mu1 = s_sigma1 = None
             if cfg.s_e_step:                                       # anchor belief to the refined model channel
                 s_mu1, s_sigma1 = model._refine_s(tokens, model_phi, rope=rope)
                 s_belief = (s_mu1, s_sigma1)
@@ -602,16 +608,21 @@ def belief_bank(
                 gauge_parameterization=cfg.gauge_parameterization,
             )
             b = tokens.shape[0]
-            mus.append(out.mu.reshape(b * n, -1))
-            sigmas.append(out.sigma.reshape(b * n, *out.sigma.shape[2:]))
-            phis.append(out.phi.reshape(b * n, -1))
-            tids.append(tokens.reshape(b * n))
-            sidx.append(torch.arange(seq_counter, seq_counter + b, device=device).repeat_interleave(n))
-            pidx.append(torch.arange(n, device=device).repeat(b))
+            mus.append(_cpu_bank_value(out.mu.reshape(b * n, -1)))
+            sigmas.append(_cpu_bank_value(out.sigma.reshape(b * n, *out.sigma.shape[2:])))
+            phis.append(_cpu_bank_value(out.phi.reshape(b * n, -1)))
+            tids.append(_cpu_bank_value(tokens.reshape(b * n)))
+            sidx.append(_cpu_bank_value(
+                torch.arange(seq_counter, seq_counter + b, device=device).repeat_interleave(n)
+            ))
+            pidx.append(_cpu_bank_value(torch.arange(n, device=device).repeat(b)))
             seq_counter += b
             token_count = sum(batch.shape[0] for batch in tids)
-            if ((max_tokens is not None and token_count >= max_tokens)
-                    or (max_sequences is not None and seq_counter >= max_sequences)):
+            stop = ((max_tokens is not None and token_count >= max_tokens)
+                    or (max_sequences is not None and seq_counter >= max_sequences))
+            del tokens, beliefs, model_phi, rope, s_belief, s_mu1, s_sigma1
+            del log_prior, out
+            if stop:
                 break
     finally:
         if was_training:
@@ -1406,25 +1417,31 @@ def model_channel_bank(
             s_mu, s_sigma = model.prior_bank.encode_s(tokens)         # (B, N, K) static model channel
             b, n = tokens.shape
             model_phi = None
+            belief_phi = None
+            rope = None
             if model.cfg.s_e_step:                                    # refine -> position-dependent, like q
                 belief_phi = model._apply_pos_phi(model.prior_bank.encode(tokens).phi)
                 model_phi = model._resolve_model_frame(tokens, belief_phi)
                 rope = model._rope_rotation(n, device)
                 s_mu, s_sigma = model._refine_s(tokens, model_phi, rope=rope)
-            mus.append(s_mu.reshape(b * n, -1))
-            sigmas.append(s_sigma.reshape(b * n, -1))
+            mus.append(_cpu_bank_value(s_mu.reshape(b * n, -1)))
+            sigmas.append(_cpu_bank_value(s_sigma.reshape(b * n, -1)))
             if model.cfg.s_frame_mode == "phi_tilde":
                 if model_phi is None:
                     belief_phi = model._apply_pos_phi(model.prior_bank.encode(tokens).phi)
                     model_phi = model._resolve_model_frame(tokens, belief_phi)
-                phis.append(model_phi.reshape(b * n, -1))
-            tids.append(tokens.reshape(b * n))
-            sidx.append(torch.arange(seq_counter, seq_counter + b, device=device).repeat_interleave(n))
-            pidx.append(torch.arange(n, device=device).repeat(b))
+                phis.append(_cpu_bank_value(model_phi.reshape(b * n, -1)))
+            tids.append(_cpu_bank_value(tokens.reshape(b * n)))
+            sidx.append(_cpu_bank_value(
+                torch.arange(seq_counter, seq_counter + b, device=device).repeat_interleave(n)
+            ))
+            pidx.append(_cpu_bank_value(torch.arange(n, device=device).repeat(b)))
             seq_counter += b
             token_count = sum(batch.shape[0] for batch in tids)
-            if ((max_tokens is not None and token_count >= max_tokens)
-                    or (max_sequences is not None and seq_counter >= max_sequences)):
+            stop = ((max_tokens is not None and token_count >= max_tokens)
+                    or (max_sequences is not None and seq_counter >= max_sequences))
+            del tokens, s_mu, s_sigma, model_phi, belief_phi, rope
+            if stop:
                 break
     finally:
         if was_training:
