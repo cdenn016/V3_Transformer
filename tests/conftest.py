@@ -1,7 +1,7 @@
 import os
 import sys
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import Any, Iterator
 
 
@@ -36,9 +36,6 @@ if _requests_cuda(_REQUESTED_DEVICE_NAME):
 
 import pytest
 import torch
-
-
-pytest_plugins = ("tests.pytest_policy",)
 
 
 @contextmanager
@@ -100,11 +97,30 @@ def _deterministic_cuda_policy(
             cudnn.allow_tf32 = cudnn_tf32
 
 
+def _start_deterministic_cuda_policy(
+    torch_module:          Any,
+    requested_device_name: str,
+) -> AbstractContextManager[None]:
+    """Enter the process CUDA policy before pytest begins collection."""
+    policy_context = _deterministic_cuda_policy(torch_module, requested_device_name)
+    policy_context.__enter__()
+    return policy_context
+
+
+_DETERMINISTIC_CUDA_POLICY_CONTEXT = _start_deterministic_cuda_policy(
+    torch,
+    _REQUESTED_DEVICE_NAME,
+)
+
+pytest_plugins = ("tests.pytest_policy",)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def deterministic_cuda_policy() -> Iterator[None]:
-    requested_device_name = os.environ.get("VFE3_TEST_DEVICE", "cpu")
-    with _deterministic_cuda_policy(torch, requested_device_name):
+    try:
         yield
+    finally:
+        _DETERMINISTIC_CUDA_POLICY_CONTEXT.__exit__(None, None, None)
 
 
 @pytest.fixture

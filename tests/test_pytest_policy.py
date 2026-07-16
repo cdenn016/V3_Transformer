@@ -1,8 +1,9 @@
 import ast
+from contextlib import contextmanager
 from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 
@@ -337,6 +338,83 @@ def test_deterministic_policy_fixture_is_session_autouse() -> None:
     assert metadata is not None
     assert metadata.scope == "session"
     assert metadata.autouse is True
+
+
+def test_conftest_starts_cuda_policy_during_initialization_before_plugins() -> None:
+    conftest_path = Path(__file__).with_name("conftest.py")
+    tree = _source_tree(conftest_path)
+    start_assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_DETERMINISTIC_CUDA_POLICY_CONTEXT"
+            for target in node.targets
+        )
+    )
+    plugin_assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "pytest_plugins"
+            for target in node.targets
+        )
+    )
+    fixture_definition = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "deterministic_cuda_policy"
+    )
+
+    assert isinstance(start_assignment.value, ast.Call)
+    assert isinstance(start_assignment.value.func, ast.Name)
+    assert start_assignment.value.func.id == "_start_deterministic_cuda_policy"
+    assert _torch_import_line(tree) < start_assignment.lineno
+    assert start_assignment.lineno < plugin_assignment.lineno
+    assert start_assignment.lineno < fixture_definition.lineno
+
+
+def test_session_fixture_only_closes_already_started_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    @contextmanager
+    def _recording_policy(
+        _torch_module:          Any,
+        _requested_device_name: str,
+    ) -> Iterator[None]:
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    monkeypatch.setattr(
+        test_conftest,
+        "_deterministic_cuda_policy",
+        _recording_policy,
+    )
+    starter = getattr(test_conftest, "_start_deterministic_cuda_policy", None)
+    assert callable(starter)
+
+    started_policy = starter(object(), "cuda:0")
+    assert events == ["enter"]
+    monkeypatch.setattr(
+        test_conftest,
+        "_DETERMINISTIC_CUDA_POLICY_CONTEXT",
+        started_policy,
+    )
+
+    fixture_lifetime = test_conftest.deterministic_cuda_policy.__wrapped__()
+    next(fixture_lifetime)
+    assert events == ["enter"]
+    with pytest.raises(StopIteration):
+        next(fixture_lifetime)
+    assert events == ["enter", "exit"]
 
 
 def test_cpu_deterministic_policy_is_inert(monkeypatch: pytest.MonkeyPatch) -> None:

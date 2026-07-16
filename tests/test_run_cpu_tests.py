@@ -116,8 +116,8 @@ def test_run_lane_uses_fresh_subprocess_and_junit_path_per_lane(
     monkeypatch.setattr(run_cpu_tests.os, "cpu_count", _expected_logical_cpu_count)
     monkeypatch.setattr(run_cpu_tests.subprocess, "run", _fake_run)
 
-    assert run_cpu_tests.run_lane("fast", child_environment) == 0
-    assert run_cpu_tests.run_lane("slow", child_environment) == 0
+    assert run_cpu_tests.run_lane("fast", child_environment, 24) == 0
+    assert run_cpu_tests.run_lane("slow", child_environment, 24) == 0
 
     assert len(calls) == 2
     paths = [_junit_path(command) for command, _, _ in calls]
@@ -138,13 +138,17 @@ def test_main_stops_after_first_nonzero_lane_and_passes_exact_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     child_environment = {"EXACT": "child"}
-    calls: list[tuple[str, Mapping[str, str]]] = []
+    calls: list[tuple[str, Mapping[str, str], int | None]] = []
 
     def _fake_build_cpu_environment(_parent: Mapping[str, str]) -> dict[str, str]:
         return child_environment
 
-    def _fake_run_lane(lane: str, environment: Mapping[str, str]) -> int:
-        calls.append((lane, environment))
+    def _fake_run_lane(
+        lane:              str,
+        environment:       Mapping[str, str],
+        logical_cpu_count: int | None,
+    ) -> int:
+        calls.append((lane, environment, logical_cpu_count))
         return 7
 
     monkeypatch.setattr(
@@ -152,11 +156,47 @@ def test_main_stops_after_first_nonzero_lane_and_passes_exact_environment(
         "build_cpu_environment",
         _fake_build_cpu_environment,
     )
+    monkeypatch.setattr(run_cpu_tests.os, "cpu_count", _expected_logical_cpu_count)
     monkeypatch.setattr(run_cpu_tests, "run_lane", _fake_run_lane)
 
     assert run_cpu_tests.main() == 7
-    assert calls == [("fast", child_environment)]
+    assert calls == [("fast", child_environment, 24)]
     assert calls[0][1] is child_environment
+
+
+@pytest.mark.parametrize(
+    "worker_setting",
+    ["FAST_WORKERS", "SLOW_WORKERS"],
+    ids=["fast", "slow"],
+)
+def test_main_preflights_all_worker_configurations_before_work(
+    monkeypatch:     pytest.MonkeyPatch,
+    capsys:          pytest.CaptureFixture[str],
+    worker_setting: str,
+) -> None:
+    environment_calls: list[Mapping[str, str]] = []
+
+    def _fake_build_cpu_environment(
+        parent_environment: Mapping[str, str],
+    ) -> dict[str, str]:
+        environment_calls.append(parent_environment)
+        return {"EXACT": "child"}
+
+    def _unexpected_subprocess(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("pytest subprocess started before CPU worker preflight completed")
+
+    monkeypatch.setattr(run_cpu_tests.os, "cpu_count", _expected_logical_cpu_count)
+    monkeypatch.setattr(run_cpu_tests, worker_setting, 25)
+    monkeypatch.setattr(
+        run_cpu_tests,
+        "build_cpu_environment",
+        _fake_build_cpu_environment,
+    )
+    monkeypatch.setattr(run_cpu_tests.subprocess, "run", _unexpected_subprocess)
+
+    assert run_cpu_tests.main() != 0
+    assert environment_calls == []
+    assert "CPU lane preflight failed" in capsys.readouterr().err
 
 
 def test_run_lane_cleans_junit_path_when_subprocess_launch_fails(
@@ -179,7 +219,7 @@ def test_run_lane_cleans_junit_path_when_subprocess_launch_fails(
     monkeypatch.setattr(run_cpu_tests.os, "cpu_count", _expected_logical_cpu_count)
     monkeypatch.setattr(run_cpu_tests.subprocess, "run", _raise_oserror)
 
-    assert run_cpu_tests.run_lane("fast", {"EXACT": "child"}) == 1
+    assert run_cpu_tests.run_lane("fast", {"EXACT": "child"}, 24) == 1
     assert len(junit_paths) == 1
     assert not junit_paths[0].exists()
 
@@ -218,6 +258,6 @@ def test_run_lane_rejects_missing_malformed_failing_or_nonzero_results(
     monkeypatch.setattr(run_cpu_tests.os, "cpu_count", _expected_logical_cpu_count)
     monkeypatch.setattr(run_cpu_tests.subprocess, "run", _fake_run)
 
-    assert run_cpu_tests.run_lane("fast", {"EXACT": "child"}) != 0
+    assert run_cpu_tests.run_lane("fast", {"EXACT": "child"}, 24) != 0
     assert len(junit_paths) == 1
     assert not junit_paths[0].exists()

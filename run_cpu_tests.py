@@ -58,6 +58,18 @@ def build_cpu_environment(parent_environment: Mapping[str, str]) -> dict[str, st
     return child_environment
 
 
+def preflight_cpu_lane_workers(logical_cpu_count: int | None) -> None:
+    """Validate every configured CPU lane against one topology snapshot."""
+    for lane, configured_workers in (
+        ("fast", FAST_WORKERS),
+        ("slow", SLOW_WORKERS),
+    ):
+        try:
+            resolve_cpu_workers(configured_workers, logical_cpu_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{lane} lane worker configuration is invalid: {exc}") from exc
+
+
 def build_cpu_lane_command(
     lane:              str,
     junit_path:        Path,
@@ -129,7 +141,11 @@ def _read_junit_counts(path: Path) -> dict[str, int]:
     return counts
 
 
-def run_lane(lane: str, environment: Mapping[str, str]) -> int:
+def run_lane(
+    lane:              str,
+    environment:       Mapping[str, str],
+    logical_cpu_count: int | None,
+) -> int:
     """Run one lane in a fresh subprocess and validate its JUnit result."""
     handle = tempfile.NamedTemporaryFile(
         prefix=f"vfe3-{lane}-",
@@ -142,7 +158,7 @@ def run_lane(lane: str, environment: Mapping[str, str]) -> int:
     junit_path.unlink(missing_ok=True)
 
     try:
-        command = build_cpu_lane_command(lane, junit_path, os.cpu_count())
+        command = build_cpu_lane_command(lane, junit_path, logical_cpu_count)
         try:
             completed = subprocess.run(
                 command,
@@ -174,9 +190,16 @@ def run_lane(lane: str, environment: Mapping[str, str]) -> int:
 
 def main() -> int:
     """Run the configured CPU lanes in order, stopping at the first failure."""
+    logical_cpu_count = os.cpu_count()
+    try:
+        preflight_cpu_lane_workers(logical_cpu_count)
+    except (TypeError, ValueError) as exc:
+        print(f"CPU lane preflight failed: {exc}", file=sys.stderr)
+        return 1
+
     child_environment = build_cpu_environment(os.environ)
     for lane in RUN_LANES:
-        status = run_lane(lane, child_environment)
+        status = run_lane(lane, child_environment, logical_cpu_count)
         if status != 0:
             return status
     return 0
