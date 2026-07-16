@@ -249,7 +249,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 
     pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
     pos_rotation              = "none",              # "none" | "rope" (block-diagonal positional rotation folded into transport)
-    pos_phi_compose           = "bch",               # composition chart: "bch" | "euclidean"
+    pos_phi_compose           = "bch",               # composition: "bch" | "euclidean" | exact "group_product"
                
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
     
@@ -343,6 +343,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     m_p_mu_lr                 = 0.0125,   
     m_p_sigma_lr              = 0.01,     
     m_phi_lr                  = 0.010,   
+    phi_mstep_max_matrix_norm = None,    # opt-in post-M-step projection bound; None leaves the chart unbounded
    
     m_s_phi_lr                = 0.016,         # M-step LR for independent model-channel frame (phi_tilde)
     
@@ -510,6 +511,71 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "n_e_steps": {
         "description": "E-step inner iterations T per block",
         "param": "n_e_steps", "values": [1, 2, 3, 5],
+    },
+
+    "estep_depth_damping": {
+        "description": "fixed versus randomized MM-exact inference depth and damping",
+        "collect_diagnostics": True,
+        "seeds": [6, 64, 23],
+        "requires": {
+            "e_step_update": "mm_exact",
+            "e_steps_backprop_last": 0,
+            "e_step_halt_tol": None,
+        },
+        "configs": [
+            {"label": "fixed_T1_eta1.00", "n_e_steps": 1, "mm_damping": 1.0,
+             "randomize_e_steps": False},
+            {"label": "fixed_T3_eta1.00", "n_e_steps": 3, "mm_damping": 1.0,
+             "randomize_e_steps": False},
+            {"label": "fixed_T5_eta1.00", "n_e_steps": 5, "mm_damping": 1.0,
+             "randomize_e_steps": False},
+            {"label": "fixed_T5_eta0.75", "n_e_steps": 5, "mm_damping": 0.75,
+             "randomize_e_steps": False},
+            {"label": "random_T1-5_evalT5_eta1.00", "n_e_steps": 5, "mm_damping": 1.0,
+             "randomize_e_steps": True, "e_steps_min": 1, "e_steps_max": 5},
+            {"label": "random_T1-5_evalT5_eta0.75", "n_e_steps": 5, "mm_damping": 0.75,
+             "randomize_e_steps": True, "e_steps_min": 1, "e_steps_max": 5},
+        ],
+    },
+
+    "phi_chart_control": {
+        "description": "matched phi chart regularization, step scale, natural gradient, and projection",
+        "collect_diagnostics": True,
+        "seeds": [6, 64, 23],
+        "requires": {
+            "gauge_parameterization": "phi",
+            "e_phi_lr": 0.0,
+            "mass_phi": 0.0,
+            "m_phi_natural_grad": False,
+            "phi_precond_mode": "pullback_per_block",
+            "phi_mstep_max_matrix_norm": None,
+        },
+        "configs": [
+            {"label": "adamw_unbounded", "m_phi_lr": 0.01},
+            {"label": "adamw_mass0.01", "m_phi_lr": 0.01, "mass_phi": 0.01},
+            {"label": "adamw_lr0.003", "m_phi_lr": 0.003},
+            {"label": "pullback_natgrad_lr0.0015", "m_phi_lr": 0.0015,
+             "m_phi_natural_grad": True},
+            {"label": "adamw_projected_norm5", "m_phi_lr": 0.01,
+             "phi_mstep_max_matrix_norm": 5.0},
+        ],
+    },
+
+    "pos_phi_composition": {
+        "description": "truncated BCH versus exact group product versus no positional gauge factor",
+        "collect_diagnostics": True,
+        "seeds": [6, 64, 23],
+        "requires": {
+            "gauge_parameterization": "phi",
+            "transport_mode": "flat",
+            "s_frame_mode": "tied",
+            "pos_rotation": "none",
+        },
+        "configs": [
+            {"label": "bch", "pos_phi": "learned", "pos_phi_compose": "bch"},
+            {"label": "group_product", "pos_phi": "learned", "pos_phi_compose": "group_product"},
+            {"label": "none", "pos_phi": "none", "pos_phi_compose": "bch"},
+        ],
     },
 
     

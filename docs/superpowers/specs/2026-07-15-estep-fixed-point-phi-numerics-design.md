@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-15
 
-**Status:** Approved in concept by the user; written specification awaiting review before implementation.
+**Status:** Implemented and verified on 2026-07-15.
 
 ## Purpose
 
@@ -125,8 +125,8 @@ The existing `bch` and `euclidean` modes retain their current coordinate-composi
 
 The ablation registry gains three explicit, runnable experiment groups:
 
-1. `estep_depth_damping`: matched retraining at fixed depths 1, 2, and 4 under damping 0.75 and 1.0, plus randomized depth 1 through 4. Each arm records its trained depth regime.
-2. `phi_chart_control`: baseline, `mass_phi` controls, lower phi learning rate, natural-gradient control, and finite `phi_mstep_max_matrix_norm` arms. The chart-bound values are screened with the BCH-fidelity metrics before a multiseed run.
+1. `estep_depth_damping`: matched retraining at fixed depths 1, 3, and 5, including damping 0.75 and 1.0 at depth 5, plus randomized training depth 1 through 5 evaluated at depth 5 under both damping values. Each arm records its trained depth regime.
+2. `phi_chart_control`: unbounded AdamW, `mass_phi=0.01`, lower phi learning rate, pullback natural-gradient, and finite `phi_mstep_max_matrix_norm=5` arms.
 3. `pos_phi_composition`: BCH, exact group product, and positional-off controls under the otherwise matched flat phi route.
 
 The implementation makes these arms runnable but does not claim results from unexecuted long training jobs.
