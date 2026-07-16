@@ -40,7 +40,7 @@ Invoke-VFE3TestEnv $cpuSerialEnv {
 }
 ```
 
-The parallel CPU fast lane excludes every prerequisite-specific or heavyweight integration case. Cap numerical-library threads so each pytest worker does not create its own competing thread pool. Use a fixed worker count selected from recorded two-worker and four-worker trials; never use `-n auto` as a repository default. `loadscope` keeps module-scoped immutable artifact evidence on one worker.
+The parallel CPU fast lane excludes every prerequisite-specific or heavyweight integration case. Cap numerical-library threads so each pytest worker does not create its own competing thread pool. Recorded trials on the development workstation completed in 67.69 seconds with two workers and 35.72 seconds with four workers, so four fixed workers are the repository default. Never use `-n auto`. `loadscope` keeps module-scoped immutable artifact evidence on one worker.
 
 ```powershell
 $cpuParallelEnv = @{
@@ -48,9 +48,6 @@ $cpuParallelEnv = @{
     CUDA_VISIBLE_DEVICES = "-1"
     OMP_NUM_THREADS     = "1"
     MKL_NUM_THREADS     = "1"
-}
-Invoke-VFE3TestEnv $cpuParallelEnv {
-    python -m pytest -n 2 --dist loadscope -m "not slow and not cuda and not external" --junitxml=C:\tmp\vfe3-fast-n2.xml --durations=100
 }
 Invoke-VFE3TestEnv $cpuParallelEnv {
     python -m pytest -n 4 --dist loadscope -m "not slow and not cuda and not external" --junitxml=C:\tmp\vfe3-fast-n4.xml --durations=100
@@ -70,11 +67,16 @@ Invoke-VFE3TestEnv @{
 }
 ```
 
-CUDA is a dedicated one-worker lane. Run it only when the selected Python interpreter has a CUDA-enabled Torch build and the RTX 5090 is available. The environment variable activates tests whose device is selected during module import; the marker selects the explicit CUDA resource cohort.
+CUDA is a dedicated serial lane. The default shell interpreter can have a CPU-only Torch build even when another environment contains CUDA Torch, so verify the selected interpreter before invoking pytest. On the development workstation the CUDA interpreter is `C:\anaconda\python.exe`; replace that path when the environment moves. The environment variable activates tests whose device is selected during module import, and the marker selects the explicit CUDA resource cohort.
 
 ```powershell
+$cudaPython = "C:\anaconda\python.exe"
+& $cudaPython -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no CUDA device')"
+if ($LASTEXITCODE -ne 0) {
+    throw "CUDA interpreter check failed with code $LASTEXITCODE."
+}
 Invoke-VFE3TestEnv @{ VFE3_TEST_DEVICE = "cuda" } {
-    python -m pytest -n 1 -m cuda --junitxml=C:\tmp\vfe3-cuda.xml --durations=100
+    & $cudaPython -m pytest -m cuda --junitxml=C:\tmp\vfe3-cuda.xml --durations=100
 }
 ```
 
@@ -85,7 +87,7 @@ Invoke-VFE3TestEnv @{
     VFE3_BASELINE_BUNDLE = "C:\path\to\baseline.pt"
     VFE3_FEATURE_BUNDLE  = "C:\path\to\feature.pt"
 } {
-    python -m pytest -n 1 -m external --junitxml=C:\tmp\vfe3-external.xml
+    python -m pytest -m external --junitxml=C:\tmp\vfe3-external.xml
 }
 ```
 
