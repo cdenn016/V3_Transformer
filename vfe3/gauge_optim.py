@@ -31,11 +31,72 @@ group. Only ACTIVE rows (nonzero gradient -- the batch's tokens) are preconditio
 per-token metric solves touch the batch, not the whole vocabulary.
 """
 
+import math
+import warnings
 from typing import Dict, List, Optional
 
 import torch
 
+from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient, pullback_metric_per_block
+
+
+_PHI_PROJECTION_TEMPORARY_BYTES = 64 * 1024 * 1024
+
+
+def embedded_phi_frobenius_norm(
+    phi:   torch.Tensor,                   # (..., n_gen) algebra coordinates
+    group: GaugeGroup,
+) -> torch.Tensor:                        # (...) ||sum_a phi_a G_a||_F
+    r"""Exact embedded Frobenius norm through a certified diagonal Gram or dense fallback.
+
+    If ``group`` certifies ``<G_a,G_b>_F = 0`` for ``a != b``, then
+    ``||sum_a phi_a G_a||_F^2 = sum_a phi_a^2 ||G_a||_F^2``. Uncertified bases retain the exact
+    dense embedding; they are correct but can be prohibitively expensive for a per-step global
+    projection.
+    """
+    if phi.shape[-1] != group.generators.shape[0]:
+        raise ValueError(
+            "embedded phi norm requires full generator coordinates; got coordinate width "
+            f"{phi.shape[-1]} and {group.generators.shape[0]} generators"
+        )
+    diagonal = group.gram_diagonal()
+    if diagonal is not None:
+        uniform = group.gram_diagonal_uniform()
+        if uniform is not None:
+            return torch.linalg.vector_norm(phi, dim=-1) * math.sqrt(uniform)
+        weights = diagonal.to(device=phi.device, dtype=phi.dtype)
+        return (phi.square() * weights).sum(dim=-1).clamp_min(0.0).sqrt()
+
+    if not getattr(group, "_phi_norm_fallback_warned", False):
+        warnings.warn(
+            f"gauge group {group.name!r} has no diagonal generator-Gram certificate; "
+            "phi matrix norms use the exact dense_fallback route, which can be expensive",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        group._phi_norm_fallback_warned = True
+    basis = group.generators.to(device=phi.device, dtype=phi.dtype)
+    embedded = torch.einsum("...a,aij->...ij", phi, basis)
+    return torch.linalg.matrix_norm(embedded, ord="fro", dim=(-2, -1))
+
+
+def _phi_projection_chunk_rows(
+    coordinate_width: int,
+    matrix_width:     int,
+    element_size:     int,
+    temporary_bytes:  int = _PHI_PROJECTION_TEMPORARY_BYTES,
+
+    *,
+    dense_fallback:   bool = False,
+) -> int:
+    """Rows whose norm and scale temporaries fit within the requested approximate byte budget."""
+    if temporary_bytes < 1:
+        raise ValueError(f"temporary_bytes must be positive, got {temporary_bytes}")
+    working_elements = 2 * coordinate_width
+    if dense_fallback:
+        working_elements += matrix_width * matrix_width
+    return max(1, temporary_bytes // max(working_elements * element_size, 1))
 
 
 @torch.no_grad()
@@ -44,7 +105,9 @@ def project_phi_parameter_rows_(
     max_matrix_norm: float,
 
     *,
-    chunk_rows:      int = 64,
+    temporary_bytes: int  = _PHI_PROJECTION_TEMPORARY_BYTES,
+    collect_stats:   bool = True,
+    chunk_rows:      Optional[int] = None,
 ) -> Dict[str, float]:
     r"""Project every trainable phi-table row to an embedded Frobenius-norm ball.
 
@@ -52,12 +115,14 @@ def project_phi_parameter_rows_(
     optimizer moments unchanged. It covers belief token frames, independent model-channel frames,
     and both learned positional tables when present.
     """
-    if not torch.isfinite(torch.tensor(max_matrix_norm)) or max_matrix_norm <= 0.0:
+    if not math.isfinite(max_matrix_norm) or max_matrix_norm <= 0.0:
         raise ValueError(
             f"max_matrix_norm must be finite and positive, got {max_matrix_norm}"
         )
-    if type(chunk_rows) is not int or chunk_rows < 1:
+    if chunk_rows is not None and (type(chunk_rows) is not int or chunk_rows < 1):
         raise ValueError(f"chunk_rows must be a positive int, got {chunk_rows!r}")
+    if type(temporary_bytes) is not int or temporary_bytes < 1:
+        raise ValueError(f"temporary_bytes must be a positive int, got {temporary_bytes!r}")
     tables = [
         getattr(model.prior_bank, "phi_embed", None),
         getattr(model.prior_bank, "s_phi_embed", None),
@@ -71,11 +136,12 @@ def project_phi_parameter_rows_(
             unique.append(table)
             seen.add(id(table))
 
-    generators = model.group.generators
+    group = model.group
+    generators = group.generators
     total_rows = 0
-    projected_rows = 0
-    norm_max_before = 0.0
-    minimum_scale = 1.0
+    projected_rows = torch.zeros((), device=generators.device, dtype=torch.long)
+    norm_max_before = torch.zeros((), device=generators.device, dtype=generators.dtype)
+    minimum_scale = torch.ones((), device=generators.device, dtype=generators.dtype)
     for table in unique:
         rows = table.reshape(-1, table.shape[-1])
         if rows.shape[-1] != generators.shape[0]:
@@ -83,23 +149,32 @@ def project_phi_parameter_rows_(
                 "phi chart projection requires full generator coordinates; got table width "
                 f"{rows.shape[-1]} and {generators.shape[0]} generators"
             )
-        basis = generators.to(device=rows.device, dtype=rows.dtype)
         total_rows += rows.shape[0]
-        for start in range(0, rows.shape[0], chunk_rows):
-            chunk = rows[start : start + chunk_rows]
-            embedded = torch.einsum("ra,aij->rij", chunk, basis)
-            norm = torch.linalg.matrix_norm(embedded, ord="fro", dim=(-2, -1))
+        rows_per_chunk = chunk_rows or _phi_projection_chunk_rows(
+            rows.shape[-1],
+            generators.shape[-1],
+            rows.element_size(),
+            temporary_bytes,
+            dense_fallback=group.phi_norm_route() == "dense_fallback",
+        )
+        for start in range(0, rows.shape[0], rows_per_chunk):
+            chunk = rows[start : start + rows_per_chunk]
+            norm = embedded_phi_frobenius_norm(chunk, group)
             scale = (max_matrix_norm / norm.clamp(min=1e-12)).clamp(max=1.0)
-            projected_rows += int((scale < 1.0).sum())
-            norm_max_before = max(norm_max_before, float(norm.max()))
-            minimum_scale = min(minimum_scale, float(scale.min()))
+            if collect_stats:
+                projected_rows.add_((scale < 1.0).sum())
+                norm_max_before.copy_(torch.maximum(norm_max_before, norm.max()))
+                minimum_scale.copy_(torch.minimum(minimum_scale, scale.min()))
             chunk.mul_(scale.unsqueeze(-1))
+    if not collect_stats:
+        return {}
+    projected_rows_value = float(projected_rows)
     return {
-        "phi_chart_projected_rows":     float(projected_rows),
+        "phi_chart_projected_rows":     projected_rows_value,
         "phi_chart_total_rows":         float(total_rows),
-        "phi_chart_projected_fraction": projected_rows / max(total_rows, 1),
-        "phi_chart_preproject_max":     norm_max_before,
-        "phi_chart_projection_scale_min": minimum_scale,
+        "phi_chart_projected_fraction": projected_rows_value / max(total_rows, 1),
+        "phi_chart_preproject_max":     float(norm_max_before),
+        "phi_chart_projection_scale_min": float(minimum_scale),
     }
 
 

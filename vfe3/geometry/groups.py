@@ -44,6 +44,7 @@ class GaugeGroup:
     algebra:              Optional[str]          = None      # irrep-registry algebra key ('so' | 'sp'); None = label-less
     phi_coordinate_layout: Optional[str]         = None      # explicit packed-coordinate capability; None = unknown
     frobenius_gram_diagonal: bool                = False     # certified <G_a,G_b>_F=0 for a != b
+    frobenius_gram_uniform: Optional[float]      = None      # known common diagonal weight; None = nonuniform/unknown
 
     # Cached pseudo-inverse of the generator Frobenius Gram (computed once, off __init__/eq/repr).
     _gram_pinv_cache:     Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
@@ -69,17 +70,35 @@ class GaugeGroup:
             return None
         key = self._generator_cache_key()
         if self._gram_diagonal_cache is None or self._gram_diagonal_key != key:
-            self._gram_diagonal_cache = self.generators.square().sum(dim=(-2, -1)).detach()
+            first_read = self._gram_diagonal_key is None
+            if first_read and self.frobenius_gram_uniform is not None:
+                self._gram_diagonal_cache = torch.full(
+                    (self.generators.shape[0],),
+                    self.frobenius_gram_uniform,
+                    device=self.generators.device,
+                    dtype=self.generators.dtype,
+                )
+            else:
+                self._gram_diagonal_cache = torch.einsum(
+                    "aij,aij->a", self.generators, self.generators
+                ).detach()
             self._gram_diagonal_key = key
-            self._gram_uniform_cache = None
-            self._gram_uniform_key = None
-            self._gram_uniform_ready = False
+            if first_read and self.frobenius_gram_uniform is not None:
+                self._gram_uniform_cache = self.frobenius_gram_uniform
+                self._gram_uniform_key = key
+                self._gram_uniform_ready = True
+            else:
+                self._gram_uniform_cache = None
+                self._gram_uniform_key = None
+                self._gram_uniform_ready = False
         return self._gram_diagonal_cache
 
     def gram_diagonal_uniform(self) -> Optional[float]:
         r"""Return the common diagonal weight when all certified weights are exactly equal."""
         diagonal = self.gram_diagonal()
         if diagonal is None or diagonal.numel() == 0:
+            return None
+        if self.frobenius_gram_uniform is None:
             return None
         key = self._generator_cache_key()
         if not self._gram_uniform_ready or self._gram_uniform_key != key:
@@ -214,6 +233,7 @@ def _build_glk(
         irrep_dims=[K],
         skew_symmetric=False,
         frobenius_gram_diagonal=True,
+        frobenius_gram_uniform=1.0,
     )
 
 
@@ -259,6 +279,7 @@ def _build_block_glk(
         phi_coordinate_layout=("block_head_row_major"
                                if n_heads > 1 and not cross_couplings else None),
         frobenius_gram_diagonal=not close_basis,
+        frobenius_gram_uniform=(None if close_basis else 1.0),
     )
 
 
@@ -294,6 +315,7 @@ def _build_tied_block_glk(
         irrep_dims=[d_head] * n_heads,
         skew_symmetric=False,
         frobenius_gram_diagonal=True,
+        frobenius_gram_uniform=float(n_heads),
     )
 
 
@@ -317,6 +339,7 @@ def _build_so_k(
         irrep_dims=[K],
         skew_symmetric=True,
         frobenius_gram_diagonal=True,
+        frobenius_gram_uniform=2.0,
     )
 
 

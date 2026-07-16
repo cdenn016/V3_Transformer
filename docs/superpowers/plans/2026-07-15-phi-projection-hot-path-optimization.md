@@ -96,7 +96,7 @@ git commit -m "feat: certify diagonal generator Gram bases"
 - `chunk_rows=None` selects a coordinate-width-aware chunk; an explicit positive integer remains available for deterministic tests and compatibility.
 - The returned dictionary is empty when `collect_stats=False`; with `True`, the five historical numeric keys retain their meanings.
 
-- [ ] **Step 1: Write failing dense-oracle and dispatch tests**
+- [x] **Step 1: Write failing dense-oracle and dispatch tests**
 
 ```python
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -124,29 +124,29 @@ def test_silent_projection_matches_dense_oracle_and_returns_no_stats():
     assert_model_phi_tables_close(model, expected)
 ```
 
-- [ ] **Step 2: Witness dense-only behavior or missing interfaces**
+- [x] **Step 2: Witness dense-only behavior or missing interfaces**
 
 Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py --junitxml=C:\tmp\vfe3-phi-projection-kernel-red-20260715.xml`
 
 Expected: failures for the missing norm helper, missing silent mode, and missing automatic chunking.
 
-- [ ] **Step 3: Implement the exact fast and fallback routes**
+- [x] **Step 3: Implement the exact fast and fallback routes**
 
 For a uniform certified diagonal, calculate `torch.linalg.vector_norm(phi, dim=-1) * sqrt(weight)`. For a nonuniform diagonal, calculate `sqrt(sum(phi.square() * weights))`. For uncertified bases, retain `einsum("ra,aij->rij")` and matrix Frobenius norm. Warn once per group instance on the fallback route.
 
 The projector selects a chunk size bounded by `temporary_bytes`, accumulates count and extrema in zero-dimensional device tensors, and calls no `int(tensor)`, `float(tensor)`, `.item()`, `nonzero()`, or CPU transfer inside the chunk loop. Extract the five historic metrics once after all tables only when `collect_stats=True`.
 
-- [ ] **Step 4: Add coverage for all tables, below-bound identity, invalid arguments, deduplication, and exact metric values**
+- [x] **Step 4: Add coverage for all tables, below-bound identity, invalid arguments, deduplication, and exact metric values**
 
 Use dense embedding only in test oracles. Exercise explicit `chunk_rows=3`, automatic chunks, float32, float64, certified `sp` nonuniform weights, and the nonorthogonal fallback.
 
-- [ ] **Step 5: Run projector tests**
+- [x] **Step 5: Run projector tests**
 
 Run: `python -m pytest tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py --junitxml=C:\tmp\vfe3-phi-projection-kernel-green-20260715.xml`
 
 Expected: zero failures and zero errors.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add vfe3/gauge_optim.py tests/test_phi_projection_optimization_20260715.py tests/test_phi_numerics_buildout_20260715.py
