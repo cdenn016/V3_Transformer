@@ -4,11 +4,13 @@ import torch
 from vfe3.divergence import safe_kl_clamp
 
 
-def test_safe_kl_clamp_bounds_and_nan():
-    x = torch.tensor([-1.0, 0.5, 1e9, float("nan"), float("inf"), float("-inf")])
+def test_safe_kl_clamp_bounds_and_nan(device: torch.device) -> None:
+    x = torch.tensor(
+        [-1.0, 0.5, 1e9, float("nan"), float("inf"), float("-inf")]
+    ).to(device)
     out = safe_kl_clamp(x, kl_max=100.0)
     assert torch.equal(
-        out, torch.tensor([0.0, 0.5, 100.0, 100.0, 100.0, 0.0])
+        out, torch.tensor([0.0, 0.5, 100.0, 100.0, 100.0, 0.0]).to(device)
     )
 
 
