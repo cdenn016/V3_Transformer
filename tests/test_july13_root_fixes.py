@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 
 import numpy as np
 import pytest
@@ -100,6 +102,122 @@ def test_umap_embed_can_reuse_one_isolated_worker() -> None:
 
     assert worker.calls == 2
     assert first.shape == second.shape == (4, 2)
+
+
+def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
+    processes = []
+
+    class _Stdin:
+        def __init__(self) -> None:
+            self.requests = []
+            self.inputs = []
+            self.outputs = []
+            self.flush_count = 0
+            self.closed = False
+
+        def write(self, line: str) -> int:
+            request = json.loads(line)
+            features = np.load(request["input"])
+            n_components = int(request["n_components"])
+            output = np.stack(
+                [features[:, component % features.shape[1]]
+                 + float(request["seed"]) + component * float(request["min_dist"])
+                 for component in range(n_components)],
+                axis=1,
+            )
+            np.save(request["output"], output)
+            with open(request["status"], "w", encoding="utf-8") as handle:
+                json.dump({"ok": True}, handle)
+            self.requests.append(request)
+            self.inputs.append(features.copy())
+            self.outputs.append(output.copy())
+            return len(line)
+
+        def flush(self) -> None:
+            self.flush_count += 1
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _Process:
+        def __init__(self, args, **kwargs) -> None:
+            self.args = args
+            self.kwargs = kwargs
+            self.stdin = _Stdin()
+            self.wait_timeouts = []
+            self.kill_count = 0
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            return 0
+
+        def kill(self) -> None:
+            self.kill_count += 1
+
+    def _popen(args, **kwargs):
+        process = _Process(args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+    first_features = np.arange(15, dtype=float).reshape(5, 3)
+    second_features = first_features + 10.0
+
+    with figures.UMAPWorker(timeout=0.25) as worker:
+        assert worker._proc is None
+        assert processes == []
+
+        first = worker.embed(
+            first_features,
+            n_neighbors=3,
+            min_dist=0.2,
+            n_components=2,
+            seed=7,
+        )
+        process = worker._proc
+        workdir = worker._workdir
+        second = worker.embed(
+            second_features,
+            n_neighbors=4,
+            min_dist=0.4,
+            n_components=2,
+            seed=11,
+        )
+
+        assert len(processes) == 1
+        assert worker._proc is process
+        assert worker._counter == 2
+        assert process.stdin.flush_count == 2
+        assert process.stdin.inputs[0].tolist() == first_features.tolist()
+        assert process.stdin.inputs[1].tolist() == second_features.tolist()
+        assert [
+            {key: request[key] for key in ("n_neighbors", "min_dist", "n_components", "seed")}
+            for request in process.stdin.requests
+        ] == [
+            {"n_neighbors": 3, "min_dist": 0.2, "n_components": 2, "seed": 7},
+            {"n_neighbors": 4, "min_dist": 0.4, "n_components": 2, "seed": 11},
+        ]
+        assert np.array_equal(first, process.stdin.outputs[0])
+        assert np.array_equal(second, process.stdin.outputs[1])
+        assert all(
+            not any(os.path.exists(path) for path in (
+                request["input"], request["output"], request["status"],
+                f"{request['status']}.tmp",
+            ))
+            for request in process.stdin.requests
+        )
+        assert os.path.isdir(workdir)
+
+    assert process.stdin.closed
+    assert process.wait_timeouts == [5.0]
+    assert process.kill_count == 0
+    assert worker._proc is None
+    assert worker._stderr_handle is None
+    assert worker._workdir is None
+    assert not os.path.exists(workdir)
 
 
 def test_umap_worker_reuses_one_process_for_two_embeddings() -> None:
