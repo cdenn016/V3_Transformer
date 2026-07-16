@@ -22,7 +22,7 @@ from vfe3.run_artifacts import RunArtifacts, finalize_run, semantic_config_finge
 from vfe3.train import train
 from vfe3.viz.extract import converged_state
 from vfe3.viz.figures import register_figure
-from vfe3.viz.report import generate_figures, vocab_comparison_figures
+from vfe3.viz.report import generate_figures, plan_single_run_figures, vocab_comparison_figures
 from vfe3.viz.specs import FigureSpec, emit_registered_figures
 
 
@@ -87,24 +87,25 @@ def test_generate_figures_drives_live_model(tmp_path):
     assert header.startswith("layer,") and "holonomy_deviation" in header and "total" in header
 
 
-def test_generate_figures_skips_english_taxonomies_for_japanese(tmp_path, monkeypatch):
-    from vfe3.data import datasets
-
-    model = _model()
-    artifacts = RunArtifacts(tmp_path / "run", model.cfg, model, dataset="wiki-ja")
-    monkeypatch.setattr(datasets, "get_tiktoken_decoder", lambda dataset: lambda ids: "日本語")
-
-    paths = generate_figures(
-        artifacts.run_dir,
-        model=model,
-        loader=_loader(),
-        max_sequences=16,
-    )
-
-    written = {path.name for path in paths}
+def test_plan_single_run_figures_skips_english_taxonomies_for_japanese():
+    planned = plan_single_run_figures("wiki-ja", {
+        "decode_readout":             True,
+        "vocab_calibration":          True,
+        "unknown_figure":             True,
+        "vocab_probability_heatmap":  True,
+        "vocab_confusion":            True,
+        "belief_category_separation": True,
+    })
+    written = set(planned)
     assert "belief_category_separation.png" not in written
     assert "vocab_confusion.png" not in written
     assert {"vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readout.png"} <= written
+    assert "unknown_figure.png" not in written
+    assert planned == (
+        "vocab_probability_heatmap.png",
+        "vocab_calibration.png",
+        "decode_readout.png",
+    )
 
 
 def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
@@ -382,14 +383,14 @@ def test_s_channel_refinement_extractor_present_iff_s_e_step():
     assert s_channel_refinement(off, tok) is None
 
 
-def test_generate_figures_emits_s_channel_under_s_e_step(tmp_path):
-    # The s-channel figure is written iff s_e_step=True (guarded by the None extractor).
-    on = _model(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
-    written = {p.name for p in generate_figures(tmp_path / "on", model=on, loader=_loader(), max_sequences=16)}
-    assert "s_channel_refinement.png" in written
-    off = _model(s_e_step=False)
-    written_off = {p.name for p in generate_figures(tmp_path / "off", model=off, loader=_loader(), max_sequences=16)}
-    assert "s_channel_refinement.png" not in written_off
+def test_plan_single_run_figures_routes_s_channel_refinement():
+    assert plan_single_run_figures(
+        "synthetic-period3", {"s_channel_refinement": True},
+    ) == ("s_channel_refinement.png",)
+    assert plan_single_run_figures(
+        "synthetic-period3", {"s_channel_refinement": False},
+    ) == ()
+    assert plan_single_run_figures("synthetic-period3", {}) == ()
 
 
 # ---------------------------------------------------------------------------

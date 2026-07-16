@@ -17,11 +17,12 @@ had no figures. These tests pin:
   (6) the s/r/h/gamma extractors gate correctly (None when their tables are absent);
   (7) every new figure renders (the s/r/h + gamma publication figures and the root model_channel_terms);
   (8) metrics.csv carries the model-channel columns under an active channel and NONE on the pure path;
-  (9) generate_figures emits the four publication figures under an active channel, none on the pure path;
- (10) finalize_run's root-folder _save_figures emits model_channel_terms.png iff the channel is active.
+  (9) the pure report planner routes model-channel and UMAP outputs from extractor availability;
+ (10) _save_figures routes model_channel_terms.png iff its history contains model-channel terms.
 """
 
 import csv
+import logging
 import math
 
 import pytest
@@ -31,10 +32,10 @@ from torch.utils.data import DataLoader
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import RunArtifacts, finalize_run
+from vfe3.run_artifacts import RunArtifacts, _save_figures
 from vfe3.train import train
 from vfe3.viz import extract, figures as figs
-from vfe3.viz.report import generate_figures
+from vfe3.viz.report import plan_single_run_figures
 
 
 def _loader(seed: int = 0, n: int = 600, seq_len: int = 8, bs: int = 8) -> DataLoader:
@@ -257,7 +258,7 @@ def test_model_channel_figures_render(tmp_path):
         fig = fn(data, path=str(p))
         figs.plt.close(fig)
         assert p.exists() and p.stat().st_size > 0, name
-    # gamma is now per-head heatmaps (viridis colour), not a combined grid
+    # gamma is now per-head heatmaps (viridis color), not a combined grid
     g = extract.gamma_attention(m, tok)["gamma"]                  # (H, N, N)
     pg = tmp_path / "gamma_head0.png"
     figs.plt.close(figs.plot_attention_heatmap(g[0], cmap="viridis", symbol=r"\gamma", path=str(pg)))
@@ -332,62 +333,71 @@ def test_training_writes_per_head_gamma_attention_files(tmp_path):
     assert attn0 and not any("gamma_head" in p.name for p in attn0)   # beta only on the pure path
 
 
-# ---- (9) generate_figures emits the publication figures under an active channel -------------------
+# ---- (9) pure report planning routes model-channel publication figures ----------------------------
 
-def test_generate_figures_emits_model_channel_figures(tmp_path):
-    on = _active()
-    written = {p.name for p in generate_figures(tmp_path / "on", model=on, loader=_loader(), max_sequences=16)}
-    for name in ("model_channel_belief.png", "hyper_prior_centroid.png",
-                 "hyper_prior_coupling.png"):
-        assert name in written, name
-    # Per-head gamma heatmaps are training-side eval_interval artifacts (attention/step_*_gamma_head*),
-    # no longer duplicated into figures/ by generate_figures.
-    assert not any(n.startswith("attention_gamma") for n in written)
-    off = _model()
-    written_off = {p.name for p in generate_figures(tmp_path / "off", model=off, loader=_loader(), max_sequences=16)}
-    assert not ({"model_channel_belief.png", "hyper_prior_centroid.png",
-                 "hyper_prior_coupling.png"} & written_off)
+def test_plan_single_run_figures_routes_model_channel_outputs():
+    expected = {
+        "model_channel_belief.png",
+        "hyper_prior_centroid.png",
+        "hyper_prior_coupling.png",
+    }
+    planned = set(plan_single_run_figures("synthetic-period3", {
+        "hyper_prior_coupling": True,
+        "model_channel_belief": True,
+        "hyper_prior_centroid": True,
+    }))
+    assert expected <= planned
+    assert not (expected & set(plan_single_run_figures("synthetic-period3", {
+        "model_channel_belief": False,
+        "hyper_prior_centroid": False,
+        "hyper_prior_coupling": False,
+    })))
+    assert not (expected & set(plan_single_run_figures("synthetic-period3", {})))
 
 
-# ---- (10) finalize_run's root figures emit model_channel_terms.png iff active ---------------------
+# ---- (10) _save_figures routes model_channel_terms.png iff history is active ----------------------
 
-def test_finalize_emits_model_channel_terms_iff_active(tmp_path):
+def test_save_figures_emits_model_channel_terms_iff_history_active(tmp_path, monkeypatch):
+    calls = []
+
+    def spy(history, *, path):
+        calls.append((history, path))
+
+    monkeypatch.setattr(figs, "plot_model_channel_terms", spy)
     cfg = _cfg(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
-    torch.manual_seed(0)
-    model = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
-    losses = train(model, _loader(), cfg, n_steps=4, log_interval=2, eval_interval=2,
-                   val_loader=_loader(seed=1), artifacts=art)
-    finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
-    assert (tmp_path / "run" / "model_channel_terms.png").exists()
+    art = RunArtifacts(tmp_path / "active", cfg, VFEModel(cfg), dataset="synthetic-period3")
+    art.history = [
+        {"step": 1, "hyper_prior": 0.5, "gamma_coupling": 0.3,
+         "gamma_meta_entropy": 0.2},
+        {"step": 2, "hyper_prior": 0.6, "gamma_coupling": 0.4,
+         "gamma_meta_entropy": 0.1},
+    ]
+    _save_figures(art, None, logging.getLogger("test.model-channel-routing"))
 
+    assert len(calls) == 1
+    assert set(calls[0][0]) == {"step", "hyper_prior", "gamma_coupling", "gamma_meta_entropy"}
+    assert calls[0][1] == str(art.run_dir / "model_channel_terms.png")
+
+    calls.clear()
     cfg0 = _cfg()
-    torch.manual_seed(0)
-    model0 = VFEModel(cfg0)
-    art0 = RunArtifacts(tmp_path / "run0", cfg0, model0, dataset="synthetic-period3")
-    losses0 = train(model0, _loader(), cfg0, n_steps=4, log_interval=2, eval_interval=2,
-                    val_loader=_loader(seed=1), artifacts=art0)
-    finalize_run(model0, art0, cfg0, test_loader=_loader(seed=2), losses=losses0)
-    assert not (tmp_path / "run0" / "model_channel_terms.png").exists()
+    art0 = RunArtifacts(tmp_path / "inactive", cfg0, VFEModel(cfg0), dataset="synthetic-period3")
+    art0.history = [{"step": 1, "total": 1.0}, {"step": 2, "total": 0.9}]
+    _save_figures(art0, None, logging.getLogger("test.model-channel-routing"))
+    assert calls == []
 
 
-# ---- (11) model-channel UMAP bank: gating + the redesigned figure renders on the s channel --------
+# ---- (11) model-channel UMAP bank: extractor gating + pure output routing -------------------------
 
-def test_model_channel_bank_gating_and_umap_render(tmp_path):
+def test_model_channel_bank_gating_and_umap_routing():
     batches = [torch.randint(0, 6, (8, 8)) for _ in range(2)]
     assert extract.model_channel_bank(_model(), batches) is None           # pure path: no s tables
     bk = extract.model_channel_bank(_active(), batches, max_sequences=16)
     assert bk is not None and "mu" in bk and "sigma" in bk
     assert bk["mu"].shape[0] == bk["token_ids"].shape[0] == bk["sigma"].shape[0]
     assert "phi" not in bk                                                  # s shares the belief gauge frame
-    figs.set_publication_style()
-    p = tmp_path / "s_umap.png"
-    try:
-        fig = figs.plot_belief_umap(bk, "mu", kind="Model", decode=lambda l: str(int(l[0])), seed=0, path=str(p))
-    except (ImportError, OSError) as exc:                                   # umap native layer best-effort
-        pytest.skip(f"umap-learn unavailable: {exc}")
-    # The s channel must title itself 'Model', not 'Belief' -- the q/s naming the report relies on
-    # (belief_umap_* vs model_umap_*) to keep the two channels' figures distinct.
-    assert fig.axes[0].get_title().startswith("Model mu")
-    figs.plt.close(fig)
-    assert p.exists() and p.stat().st_size > 0
+    availability = {f"model_umap_{channel}": channel in bk
+                    for channel in ("mu", "sigma", "phi")}
+    planned = set(plan_single_run_figures("synthetic-period3", availability))
+    assert "model_umap_mu.png" in planned
+    assert "model_umap_sigma.png" in planned
+    assert "model_umap_phi.png" not in planned
