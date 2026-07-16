@@ -720,6 +720,7 @@ class VFEModel(nn.Module):
             project_slk=self.cfg.pos_phi_project_slk,
             compact_blocks=self._compact_phi_blocks_enabled(),
             pos_phi_free=getattr(self, "pos_phi_free", None),
+            bch_residual_max=self.cfg.bch_residual_max,
         )
 
     def _pos_phi_right(self, phi: torch.Tensor) -> Optional[torch.Tensor]:
@@ -752,6 +753,7 @@ class VFEModel(nn.Module):
             pos_phi=self.cfg.pos_phi,
             compose_mode=self.cfg.pos_phi_compose,
             bch_order=self.cfg.bch_pe_order,
+            bch_residual_max=self.cfg.bch_residual_max,
             pos_phi_scale=self.cfg.pos_phi_scale,
             project_slk=self.cfg.pos_phi_project_slk,
             compact_blocks=self._compact_phi_blocks_enabled(),

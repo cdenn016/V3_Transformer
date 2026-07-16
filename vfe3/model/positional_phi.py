@@ -121,19 +121,20 @@ def positional_phi_coords(
 
 
 def apply_positional_phi(
-    phi:   torch.Tensor,                  # (..., N, n_gen) token gauge frame
-    group: GaugeGroup,
+    phi:              torch.Tensor,             # (..., N, n_gen) token gauge frame
+    group:            GaugeGroup,
 
     *,
-    mode:           str                    = "none",
-    compose_mode:   str                    = "bch",
-    order:          int                    = 4,
-    scale:          float                  = 0.02,
-    frozen_axis:    int                    = 0,
-    project_slk:    bool                   = False,
-    compact_blocks: bool                   = False,  # canonical block_glk: packed BCH embedding
-    pos_phi_free:   Optional[torch.Tensor] = None,
-    **kwargs,                             # variant params flow through to the builder
+    mode:             str                    = "none",
+    compose_mode:     str                    = "bch",
+    order:            int                    = 4,
+    scale:            float                  = 0.02,
+    frozen_axis:      int                    = 0,
+    project_slk:      bool                   = False,
+    compact_blocks:   bool                   = False,  # canonical block_glk: packed BCH embedding
+    pos_phi_free:     Optional[torch.Tensor] = None,
+    bch_residual_max: Optional[float]        = None,   # opt-in BCH/group-product residual gate
+    **kwargs,                                                  # variant params flow through to the builder
 ) -> torch.Tensor:
     r"""Compose the per-position element into ``phi`` via ``compose_phi`` (BCH by default).
 
@@ -161,4 +162,5 @@ def apply_positional_phi(
     # graph). compose_euclidean ignores it; single-block groups pass [K] and stay dense.
     return compose_phi(phi, coords, group.generators, order=order, mode=compose_mode,
                        gram_pinv_=(None if use_compact else group.gram_pinv()),
-                       block_dims=list(group.irrep_dims), compact_blocks=use_compact)
+                       block_dims=list(group.irrep_dims), compact_blocks=use_compact,
+                       residual_max=bch_residual_max)

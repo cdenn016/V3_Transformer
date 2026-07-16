@@ -93,16 +93,19 @@ def diagonal_kl_pair_stats(
 
     delta_tq = mu_t_f - mu_q_f.unsqueeze(-2)
 
+    sigma_q_reduce = sigma_q_safe.double()
+    sigma_t_reduce = sigma_t_safe.double()
+    delta_reduce = delta_tq.double()
     trace_term = _reduce_coordinate_term(
-        sigma_q_safe.unsqueeze(-2) / sigma_t_safe,
+        sigma_q_reduce.unsqueeze(-2) / sigma_t_reduce,
         irrep_dims=irrep_dims,
     )
     mahal_term = _reduce_coordinate_term(
-        (delta_tq ** 2) / sigma_t_safe,
+        (delta_reduce ** 2) / sigma_t_reduce,
         irrep_dims=irrep_dims,
     )
     logdet_term = _reduce_coordinate_term(
-        torch.log(sigma_t_safe) - torch.log(sigma_q_safe).unsqueeze(-2),
+        torch.log(sigma_t_reduce) - torch.log(sigma_q_reduce).unsqueeze(-2),
         irrep_dims=irrep_dims,
     )
     if irrep_dims is None or len(irrep_dims) == 1:
@@ -113,6 +116,7 @@ def diagonal_kl_pair_stats(
         head_shape = (1,) * (trace_term.dim() - 3) + (len(irrep_dims), 1, 1)
         coordinate_dim = trace_term.new_tensor(irrep_dims).reshape(head_shape)
     raw_energy = 0.5 * (trace_term + mahal_term - coordinate_dim + logdet_term)
+    raw_energy = raw_energy.to(mu_q_f.dtype)
     energy = safe_kl_clamp(raw_energy, kl_max=kl_max)
     pair_mask = ((energy > 0.0) & (energy < kl_max)).to(energy.dtype)
     inv_sigma_t = 1.0 / sigma_t_safe

@@ -109,19 +109,135 @@ def _rel_gap_eps(
     A:     torch.Tensor,
 
     *,
-    rel:   float = 1e-6,
-    floor: float = 1e-12,
+    rel:   Optional[float] = None,
 ) -> torch.Tensor:                         # (..., 1, 1) on-device tensor; no host-sync
     r"""Spectrum-relative ``gap_eps`` for :func:`_eigh_damped` on the SPD retraction paths (audit
     2026-06-13 L11). The fixed ``gap_eps=1e-8`` over-damps the eigh adjoint ``F_ij = 1/(w_j - w_i)``
     for MEANINGFUL gaps near the variance floor -- a resolvable gap of 1e-4 is biased ~50%. Scaling
     to ``(rel * ||A||_max)^2`` -- the squared fp32 noise floor of the spectrum -- damps only gaps
     below fp32 resolution (true degeneracy stays finite, ``F = 0``) and leaves resolvable gaps
-    accurate. ``rel`` is a few machine epsilons; ``floor`` keeps a tiny near-zero spectrum finite.
-    Each matrix receives its own scale so unrelated batch elements cannot change its eigendecomposition
-    adjoint. Returns ``(..., 1, 1)`` on A's device/dtype to avoid a CUDA host-sync."""
+    accurate. When omitted, ``rel`` is derived from the active dtype; ``finfo.tiny`` keeps a
+    near-zero spectrum finite without imposing a coordinate-scale floor. Each matrix receives its
+    own scale so unrelated batch elements cannot change its eigendecomposition adjoint. Returns
+    ``(..., 1, 1)`` on A's device/dtype to avoid a CUDA host-sync."""
+    dtype_info = torch.finfo(A.dtype)
+    relative = 8.0 * dtype_info.eps if rel is None else rel
+    if not math.isfinite(relative) or relative <= 0.0:
+        raise ValueError(f"rel must be None or finite and positive, got {rel!r}")
     scale = A.detach().abs().amax(dim=(-2, -1), keepdim=True)
-    return (rel * scale).pow(2).clamp(min=floor)
+    return (relative * scale).pow(2).clamp(min=dtype_info.tiny)
+
+
+def _spectral_values_and_derivatives(
+    eigenvalues: torch.Tensor,
+    kind:        str,
+    lower:       float,
+    upper:       Optional[float],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Return ``f(lambda)`` and ``f'(lambda)`` for one bounded scalar matrix function."""
+    if kind == "sqrt_floor":
+        bounded = eigenvalues.clamp(min=lower)
+        values = torch.sqrt(bounded)
+        derivatives = torch.where(
+            eigenvalues >= lower,
+            0.5 / values,
+            torch.zeros_like(values),
+        )
+    elif kind == "inv_sqrt_floor":
+        bounded = eigenvalues.clamp(min=lower)
+        values = torch.rsqrt(bounded)
+        derivatives = torch.where(
+            eigenvalues >= lower,
+            -0.5 * values / bounded,
+            torch.zeros_like(values),
+        )
+    elif kind == "exp_bounded":
+        if upper is None:
+            raise ValueError("exp_bounded requires an upper bound")
+        bounded = eigenvalues.clamp(min=lower, max=upper)
+        values = torch.exp(bounded)
+        active = (eigenvalues >= lower) & (eigenvalues <= upper)
+        derivatives = torch.where(active, values, torch.zeros_like(values))
+    elif kind == "project":
+        values = eigenvalues.clamp(min=lower) if upper is None else eigenvalues.clamp(
+            min=lower,
+            max=upper,
+        )
+        active = eigenvalues >= lower
+        if upper is not None:
+            active = active & (eigenvalues <= upper)
+        derivatives = active.to(eigenvalues.dtype)
+    else:
+        raise ValueError(f"unknown symmetric spectral function {kind!r}")
+    return values, derivatives
+
+
+class _SymmetricSpectralMap(torch.autograd.Function):
+    r"""Symmetric matrix function with Loewner divided differences in the adjoint."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        matrix: torch.Tensor,
+        kind:   str,
+        lower:  float,
+        upper:  Optional[float],
+    ) -> torch.Tensor:
+        symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
+        eigenvalues, eigenvectors = _eigh_damped(symmetric, _rel_gap_eps(symmetric))
+        values, _ = _spectral_values_and_derivatives(eigenvalues, kind, lower, upper)
+        ctx.save_for_backward(eigenvalues, eigenvectors)
+        ctx.kind = kind
+        ctx.lower = lower
+        ctx.upper = upper
+        return eigenvectors * values.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        eigenvalues, eigenvectors = ctx.saved_tensors
+        values, _ = _spectral_values_and_derivatives(
+            eigenvalues,
+            ctx.kind,
+            ctx.lower,
+            ctx.upper,
+        )
+        lambda_i = eigenvalues.unsqueeze(-1)
+        lambda_j = eigenvalues.unsqueeze(-2)
+        gap = lambda_i - lambda_j
+        value_gap = values.unsqueeze(-1) - values.unsqueeze(-2)
+        scale = torch.maximum(lambda_i.abs(), lambda_j.abs())
+        resolution = (
+            8.0 * torch.finfo(eigenvalues.dtype).eps * scale
+        ).clamp(min=torch.finfo(eigenvalues.dtype).tiny)
+        repeated = gap.abs() <= resolution
+        safe_gap = torch.where(repeated, torch.ones_like(gap), gap)
+        divided_difference = value_gap / safe_gap
+        midpoint = 0.5 * (lambda_i + lambda_j)
+        _, repeated_limit = _spectral_values_and_derivatives(
+            midpoint,
+            ctx.kind,
+            ctx.lower,
+            ctx.upper,
+        )
+        divided_difference = torch.where(repeated, repeated_limit, divided_difference)
+
+        eigenvectors_t = eigenvectors.transpose(-1, -2)
+        symmetric_grad = 0.5 * (grad_output + grad_output.transpose(-1, -2))
+        inner = eigenvectors_t @ symmetric_grad @ eigenvectors
+        grad_matrix = eigenvectors @ (divided_difference * inner) @ eigenvectors_t
+        grad_matrix = 0.5 * (grad_matrix + grad_matrix.transpose(-1, -2))
+        return grad_matrix, None, None, None
+
+
+def _symmetric_spectral_map(
+    matrix: torch.Tensor,
+    kind:   str,
+
+    *,
+    lower:  float,
+    upper:  Optional[float] = None,
+) -> torch.Tensor:
+    return _SymmetricSpectralMap.apply(matrix, kind, lower, upper)
 
 
 def _frechet_log_spd(
@@ -159,7 +275,8 @@ def _frechet_log_spd(
     lambda_j = eigenvalues.unsqueeze(-2)
     gap = lambda_i - lambda_j
     gap_scale = torch.maximum(lambda_i, lambda_j)
-    near_repeated = gap.abs() <= math.sqrt(torch.finfo(eigenvalues.dtype).eps) * gap_scale
+    resolution = 8.0 * torch.finfo(eigenvalues.dtype).eps * gap_scale
+    near_repeated = gap.abs() <= resolution
     safe_gap = torch.where(near_repeated, torch.ones_like(gap), gap)
     divided_difference = (
         log_eigenvalues.unsqueeze(-1) - log_eigenvalues.unsqueeze(-2)
@@ -244,12 +361,16 @@ def retract_spd_full(
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
         delta_sigma = 0.5 * (delta_sigma + delta_sigma.transpose(-1, -2))
 
-        eigenvalues, eigenvectors = _eigh_damped(sigma, _rel_gap_eps(sigma))
-        eigenvalues = eigenvalues.clamp(min=eps)
-        sqrt_eig     = torch.sqrt(eigenvalues)
-        inv_sqrt_eig = 1.0 / sqrt_eig
-        sigma_sqrt     = eigenvectors * sqrt_eig.unsqueeze(-2)     @ eigenvectors.transpose(-1, -2)
-        sigma_inv_sqrt = eigenvectors * inv_sqrt_eig.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
+        sigma_sqrt = _symmetric_spectral_map(
+            sigma,
+            "sqrt_floor",
+            lower=eps,
+        )
+        sigma_inv_sqrt = _symmetric_spectral_map(
+            sigma,
+            "inv_sqrt_floor",
+            lower=eps,
+        )
 
         R = sigma_inv_sqrt @ (step_size * delta_sigma) @ sigma_inv_sqrt
         R = 0.5 * (R + R.transpose(-1, -2))
@@ -257,16 +378,23 @@ def retract_spd_full(
             R_norm = torch.linalg.norm(R, ord='fro', dim=(-2, -1), keepdim=True)
             R = R * torch.clamp(trust_region / (R_norm + eps), max=1.0)
 
-        R_eval, R_evec = _eigh_damped(R, _rel_gap_eps(R))
-        R_eval = R_eval.clamp(-50.0, 50.0)
-        exp_R = R_evec * torch.exp(R_eval).unsqueeze(-2) @ R_evec.transpose(-1, -2)
+        exp_R = _symmetric_spectral_map(
+            R,
+            "exp_bounded",
+            lower=-50.0,
+            upper=50.0,
+        )
 
         sigma_new = sigma_sqrt @ exp_R @ sigma_sqrt
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
-        eig_new, vec_new = _eigh_damped(sigma_new, _rel_gap_eps(sigma_new))
-        eig_new = eig_new.clamp(min=eps) if sigma_max is None else eig_new.clamp(min=eps, max=sigma_max)
-        sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
+        if sigma_max is not None:
+            sigma_new = _symmetric_spectral_map(
+                sigma_new,
+                "project",
+                lower=eps,
+                upper=sigma_max,
+            )
 
     sigma_new = sigma_new.to(orig_dtype)
     if len(orig_shape) == 4:

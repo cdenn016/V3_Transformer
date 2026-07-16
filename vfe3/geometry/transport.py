@@ -406,8 +406,9 @@ def gauge_invariant_edge_features(
     cov_kt: torch.Tensor,             # (..., K, K) transported key covariances (SPD)
 
     *,
-    eps:    float = 1e-6,
-) -> torch.Tensor:                    # (..., 3) [Mahalanobis, trace, log-det] edge features
+    eps:              float = 1e-6,
+    return_exactness: bool  = False,
+) -> 'torch.Tensor | Tuple[torch.Tensor, torch.Tensor]':
     r"""Gauge-invariant edge features for the covariant Regime-II (Route B) connection.
 
     The three components of $D_{KL}(\mathcal N(\mu_q, \Sigma_q) \| \mathcal N(\mu_{kt}, S))$
@@ -436,10 +437,25 @@ def gauge_invariant_edge_features(
     K             = mu_q.shape[-1]
     mu_q,  cov_q  = mu_q.double(),  cov_q.double()
     mu_kt, cov_kt = mu_kt.double(), cov_kt.double()
-    eye = torch.eye(K, dtype=cov_kt.dtype, device=cov_kt.device)
+    def _factor_with_status(
+        covariance: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        symmetric = 0.5 * (covariance + covariance.transpose(-1, -2))
+        factor, info = torch.linalg.cholesky_ex(symmetric)
+        exact = info == 0
+        ok = exact
+        if not bool(exact.all()):
+            recovered_factor, recovered_ok = safe_cholesky(symmetric, eps=eps, rounds=5)
+            factor = torch.where(
+                ((~exact) & recovered_ok).unsqueeze(-1).unsqueeze(-1),
+                recovered_factor,
+                factor,
+            )
+            ok = recovered_ok
+        return factor, ok, exact
 
-    L_s, ok_s = safe_cholesky(cov_kt + eps * eye, rounds=5)   # S = cov_kt = L_s L_s^T
-    L_q, ok_q = safe_cholesky(cov_q  + eps * eye, rounds=5)
+    L_s, ok_s, exact_s = _factor_with_status(cov_kt)   # S = cov_kt = L_s L_s^T
+    L_q, ok_q, exact_q = _factor_with_status(cov_q)
 
     delta_mu = (mu_q - mu_kt).unsqueeze(-1)                # (..., K, 1) prediction error
     sol      = torch.cholesky_solve(delta_mu, L_s)         # S^{-1} (mu_q - mu_kt)
@@ -455,7 +471,10 @@ def gauge_invariant_edge_features(
     feats = torch.stack((mahal, trace, logdet), dim=-1)    # (..., 3)
     ok    = (ok_s & ok_q).unsqueeze(-1)                    # (..., 1) PD on both factors
     feats = torch.where(ok, feats, feats.new_tensor(float("nan")))   # non-PD edge -> NaN -> kl_max
-    return feats.to(orig_dtype)                            # back to the caller's working dtype
+    feats = feats.to(orig_dtype)                           # back to the caller's working dtype
+    if return_exactness:
+        return feats, exact_s & exact_q
+    return feats
 
 
 def _soft_cap_frobenius(
@@ -702,6 +721,7 @@ def _build_regime_ii_covariant(
     connection_M:       Optional[torch.Tensor]    = None,        # (n_gen, 3) learned invariant-feature map (NN exception)
     mu_key:             Optional[torch.Tensor]    = None,        # (B, N, K) KEY means (None -> mu; oracle detaches)
     sigma_key:          Optional[torch.Tensor]    = None,        # (B, N, ...) KEY covariance (None -> sigma)
+    exactness_out:       Optional[Dict]            = None,        # opt-in numerical-status sink
     **kwargs,                                                    # tolerated (shares the flat builder's call shape)
 ) -> TransportDict:
     r"""Regime-II COVARIANT (Route B): a gauge-COVARIANT non-flat edge-relaxed transport.
@@ -735,7 +755,9 @@ def _build_regime_ii_covariant(
     the invariants. Opt-in / diagnostic; the default flat transport never reaches this builder.
 
     Returns the SAME dict shape as the flat builder: 'exp_phi' (B,N,K,K), 'exp_neg_phi' (B,N,K,K),
-    'Omega' (B,N,N,K,K).
+    'Omega' (B,N,N,K,K). When ``exactness_out`` is supplied, the builder records whether every
+    edge feature used exact Cholesky factors rather than jitter recovery without changing that
+    pinned output shape.
     """
     # Flat fast path (mirrors regime_ii): no connection or alpha=0. Trivial vertex factors retain
     # the invariant edge factor exp(delta_ij . G), matching the charted direct-link contract.
@@ -743,6 +765,9 @@ def _build_regime_ii_covariant(
     # but d Omega / d M at M=0 is the generator structure (exp'(0)=I), so the generic path keeps M
     # in the autograd graph (it would otherwise freeze at init).
     if connection_M is None or cocycle_relaxation == 0.0:
+        if exactness_out is not None:
+            exactness_out["regime_ii_covariant_feature_exact"] = torch.ones(
+                (), dtype=torch.bool, device=phi.device)
         return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
 
     # Contract guard (audit 2026-06-18): with a connection the edge features need the query belief
@@ -775,6 +800,7 @@ def _build_regime_ii_covariant(
     # There is no cross-query reduction, so each (i, j) operator is identical to a single-chunk build
     # (chunk >= N collapses to the original code path, bit-for-bit).
     omega_chunks: List[torch.Tensor] = []
+    feature_exact = torch.ones((), dtype=torch.bool, device=mu.device)
     for i0 in range(0, N, chunk):
         i1        = min(i0 + chunk, N)
         exp_phi_c = exp_phi[:, i0:i1]                                          # (B, C, K, K)
@@ -798,7 +824,14 @@ def _build_regime_ii_covariant(
             cov_q_c  = sigma[:, i0:i1].unsqueeze(2).double()                  # (B, C, 1, K, K)
             cov_kt_c = torch.einsum("bijkl,bjlm,bijnm->bijkn", omega0_c, sigma_k.double(), omega0_c)
 
-        feats_c = gauge_invariant_edge_features(mu_q_c, cov_q_c, mu_kt_c, cov_kt_c)        # (B, C, N, 3) f64
+        feats_c, exact_c = gauge_invariant_edge_features(
+            mu_q_c,
+            cov_q_c,
+            mu_kt_c,
+            cov_kt_c,
+            return_exactness=True,
+        )
+        feature_exact = feature_exact & exact_c.all()
         feats_c = feats_c.to(exp_phi.dtype)                                   # back to the working dtype
         delta_c = cocycle_relaxation * torch.einsum("bijf,af->bija", feats_c, connection_M)   # (B, C, N, n_gen)
 
@@ -823,7 +856,13 @@ def _build_regime_ii_covariant(
             torch.einsum("bikl,bijlm,bjmn->bijkn", exp_phi_c, exp_delta_c, exp_neg_phi))
 
     omega = torch.cat(omega_chunks, dim=1) if len(omega_chunks) > 1 else omega_chunks[0]
-    return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
+    if exactness_out is not None:
+        exactness_out["regime_ii_covariant_feature_exact"] = feature_exact
+    return {
+        "exp_phi": exp_phi,
+        "exp_neg_phi": exp_neg_phi,
+        "Omega": omega,
+    }
 
 
 def _direct_link_edge_exp(
@@ -1037,6 +1076,7 @@ def stable_matrix_exp_pair(
     clamp_monitor:           bool                = False,    # opt-in: warn when the Frobenius clamp fires (host sync)
     block_dims:              Optional[List[int]] = None,     # per-block sizes (sum==d) for a block-diagonal M
     exp_dim:                 Optional[int]       = None,     # dimension for the float64-island decision (None -> d)
+    validity_max_norm:       Optional[float]     = None,     # opt-in fail-closed pre-clamp chart bound
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""exp(M) and optionally exp(-M) with Frobenius-norm clamp + float64 upcast.
 
@@ -1083,8 +1123,23 @@ def stable_matrix_exp_pair(
     # the unrolled oracle's create_graph path). Where the clamp is inactive (scale == 1.0 -- the
     # soft-capped regime_ii edge factor and any ||phi|| < max_norm) multiplying by the detached
     # constant 1.0 is byte-identical to the previous through-graph multiply.
+    if validity_max_norm is not None and (
+        not math.isfinite(validity_max_norm) or validity_max_norm <= 0.0
+    ):
+        raise ValueError(
+            "validity_max_norm must be None or finite and positive, got "
+            f"{validity_max_norm!r}"
+        )
+
     with torch.no_grad():
-        mat_norm = matrix.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+        raw_mat_norm = matrix.norm(dim=(-2, -1), keepdim=True)
+        if validity_max_norm is not None and bool((raw_mat_norm > validity_max_norm).any()):
+            observed = float(raw_mat_norm.max())
+            raise ValueError(
+                "transport chart validity bound exceeded before matrix-exponential clamp: "
+                f"observed ||M||_F={observed:.6g} > {validity_max_norm:.6g}"
+            )
+        mat_norm = raw_mat_norm.clamp(min=1e-8)
         scale = (max_norm / mat_norm).clamp(max=1.0)
         if clamp_monitor:
             frac = (scale < 1.0).float().mean()
@@ -1333,7 +1388,9 @@ def group_element_inverse(
         residual = (
             omega_check.transpose(-1, -2) @ omega_check - eye
         ).norm(dim=(-2, -1))
-        drifted = ~torch.isfinite(residual) | (residual > residual_tol)
+        dtype_tol = 4.0 * K * torch.finfo(omega.dtype).eps
+        exact_tol = min(residual_tol, dtype_tol)
+        drifted = ~torch.isfinite(residual) | (residual > exact_tol)
 
     if not bool(drifted.any()):
         return omega.transpose(-1, -2)

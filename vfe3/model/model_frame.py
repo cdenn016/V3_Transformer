@@ -51,18 +51,19 @@ def _tied_model_frame(
 
 @register_model_frame("phi_tilde")
 def _independent_model_frame(
-    belief_phi: torch.Tensor,
+    belief_phi:       torch.Tensor,
 
     *,
-    pos_phi_scale:  float                  = 0.02,
-    bch_order:      int                    = 4,
-    project_slk:    bool                   = False,
-    compact_blocks: bool                   = False,
-    pos_phi:        str                    = "none",
-    compose_mode:   str                    = "bch",
-    model_phi:      Optional[torch.Tensor] = None,
-    group:          Optional[GaugeGroup]   = None,
-    pos_phi_free:   Optional[torch.Tensor] = None,
+    pos_phi_scale:   float                  = 0.02,
+    bch_order:       int                    = 4,
+    project_slk:     bool                   = False,
+    compact_blocks:  bool                   = False,
+    pos_phi:         str                    = "none",
+    compose_mode:    str                    = "bch",
+    model_phi:       Optional[torch.Tensor] = None,
+    group:           Optional[GaugeGroup]   = None,
+    pos_phi_free:    Optional[torch.Tensor] = None,
+    bch_residual_max: Optional[float]        = None,
     **kwargs,
 ) -> torch.Tensor:
     r"""Compose the independently stored model token and positional frame coordinates."""
@@ -79,24 +80,26 @@ def _independent_model_frame(
         project_slk=project_slk,
         compact_blocks=compact_blocks,
         pos_phi_free=pos_phi_free,
+        bch_residual_max=bch_residual_max,
     )
 
 
 def resolve_model_frame(
-    belief_phi: torch.Tensor,
+    belief_phi:       torch.Tensor,
 
     *,
-    mode:           str,
+    mode:             str,
 
-    pos_phi_scale:  float                  = 0.02,
-    bch_order:      int                    = 4,
-    project_slk:    bool                   = False,
-    compact_blocks: bool                  = False,
-    pos_phi:        str                    = "none",
-    compose_mode:   str                    = "bch",
-    model_phi:      Optional[torch.Tensor] = None,
-    group:          Optional[GaugeGroup]   = None,
-    pos_phi_free:   Optional[torch.Tensor] = None,
+    pos_phi_scale:   float                  = 0.02,
+    bch_order:       int                    = 4,
+    project_slk:     bool                   = False,
+    compact_blocks:  bool                   = False,
+    pos_phi:         str                    = "none",
+    compose_mode:    str                    = "bch",
+    model_phi:       Optional[torch.Tensor] = None,
+    group:           Optional[GaugeGroup]   = None,
+    pos_phi_free:    Optional[torch.Tensor] = None,
+    bch_residual_max: Optional[float]        = None,
 ) -> torch.Tensor:
     r"""Dispatch model-frame resolution without teaching consumers about frame storage."""
     frame_kwargs = {
@@ -109,6 +112,8 @@ def resolve_model_frame(
         "pos_phi_scale": pos_phi_scale,
         "project_slk": project_slk,
     }
+    if bch_residual_max is not None:
+        frame_kwargs["bch_residual_max"] = bch_residual_max
     if compact_blocks:
         frame_kwargs["compact_blocks"] = True
     return get_model_frame(mode)(belief_phi, **frame_kwargs)

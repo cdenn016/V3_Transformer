@@ -25,7 +25,6 @@ _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_PRIOR_SOURCES       = ("token", "model_channel")
 _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
 _VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
-_VALID_OMEGA_RETRACT       = ("lie_exp", "cayley")
 _VALID_OMEGA_REFLECTION    = ("off", "init_seed", "metropolis")
 # det<0 seeding is group-specific; reject where the ambient diag(-1,1,...) seed is not a valid,
 # tie-respecting, det<0 element of the structure group (deferred cases -> Phase 2b). Shared by
@@ -214,6 +213,7 @@ class VFE3Config:
     pos_phi_compose:           str   = "bch"       # composition chart: bch (default) | euclidean
     
     bch_pe_order:              int   = 4           # BCH Dynkin truncation order (compose_phi order) 4 is just as good as 6
+    bch_residual_max:          Optional[float] = None  # opt-in fail-closed BCH/group-product relative residual
    
     pos_phi_scale:             float = 0.02        # learned-table init scale AND frozen per-position step
     pos_phi_project_slk:       bool  = False       # per-block trace projection (det Omega = 1)
@@ -878,6 +878,13 @@ class VFE3Config:
                 f"gauge_parameterization={self.gauge_parameterization!r}, "
                 f"transport_mode={self.transport_mode!r}, s_frame_mode={self.s_frame_mode!r}."
             )
+        if self.bch_residual_max is not None and not (
+            math.isfinite(self.bch_residual_max) and self.bch_residual_max > 0.0
+        ):
+            raise ValueError(
+                "bch_residual_max must be None or finite and positive, got "
+                f"{self.bch_residual_max!r}"
+            )
 
         # gauge_transport ablation meta-toggle (A1 / EXP-2). Coerce the gauge-frame fields UP FRONT so
         # every downstream validation and the optimizer/table wiring see the resolved state. 'on' is a
@@ -1142,7 +1149,12 @@ class VFE3Config:
         # config <- transport <- groups import cycle (matching the retraction pattern below).
         from vfe3.geometry.transport import _TRANSPORTS
         _require(self.transport_mode, tuple(sorted(_TRANSPORTS)), "transport_mode")
-        _require(self.omega_retract_mode, _VALID_OMEGA_RETRACT, "omega_retract_mode")
+        from vfe3.geometry.lie_ops import _OMEGA_RETRACTIONS
+        _require(
+            self.omega_retract_mode,
+            tuple(sorted(_OMEGA_RETRACTIONS)),
+            "omega_retract_mode",
+        )
         if type(self.omega_compact_storage) is not bool:
             raise ValueError(
                 "omega_compact_storage must be a bool, got "

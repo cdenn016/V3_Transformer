@@ -1782,6 +1782,34 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     family_group_invariant = cfg.family in invariant_families
     transport_registration = get_transport_registration(cfg.transport_mode)
     fixed_prior_surrogate = bool(cfg.precision_weighted_attention)
+    covariance_feature_exact = _last("regime_ii_covariant_feature_exact")
+    feature_jitter_recovered = covariance_feature_exact is not None and covariance_feature_exact < 0.5
+    if cfg.transport_mode != "regime_ii_covariant":
+        regime_ii_covariant_exact = True
+        regime_ii_covariant_exactness = "not_applicable"
+    elif not family_group_invariant:
+        regime_ii_covariant_exact = False
+        regime_ii_covariant_exactness = "diagonal_projection_approximation"
+    elif feature_jitter_recovered:
+        regime_ii_covariant_exact = False
+        regime_ii_covariant_exactness = "jitter_recovered_approximation"
+    else:
+        regime_ii_covariant_exact = True
+        regime_ii_covariant_exactness = "exact_valid_spd_factorization"
+
+    spd_retract_mode = getattr(cfg, "spd_retract_mode", "spd_affine")
+    sigma_max = getattr(cfg, "sigma_max", 10.0)
+    spd_retraction_exact = sigma_max is None
+    if spd_retract_mode == "spd_affine":
+        spd_retraction_route = (
+            "airm_exact" if spd_retraction_exact else "airm_projected_spectral_cap"
+        )
+    else:
+        spd_retraction_route = (
+            "log_euclidean_exact"
+            if spd_retraction_exact
+            else "log_euclidean_projected_spectral_cap"
+        )
 
     pure_flags = {
         "canonical_attention_entropy": bool(cfg.include_attention_entropy),
@@ -1845,8 +1873,10 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             # regime_ii_covariant under gaussian_diagonal is a CONTROLLED APPROXIMATION (the
             # diagonal cone is not closed under GL congruence Omega Sigma Omega^T -- audit C5),
             # so a diagonal covariant run is never reported as exact Route B.
-            "regime_ii_covariant_exact":    (cfg.transport_mode != "regime_ii_covariant")
-                                            or family_group_invariant,
+            "regime_ii_covariant_exact":    regime_ii_covariant_exact,
+            "regime_ii_covariant_exactness": regime_ii_covariant_exactness,
+            "spd_retraction_route":         spd_retraction_route,
+            "spd_retraction_exact":         spd_retraction_exact,
             # Covariance class of the ACTIVE transport (audit C7), owned by its complete registry
             # record. An unregistered mode fails closed instead of inventing report metadata.
             "transport_covariance_class":   transport_registration.covariance_class,

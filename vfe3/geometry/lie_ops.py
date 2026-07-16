@@ -308,6 +308,37 @@ def _from_equal_diag_blocks(
     return out
 
 
+def _fail_if_bch_residual_exceeds(
+    phi1:       torch.Tensor,
+    phi2:       torch.Tensor,
+    composed:   torch.Tensor,
+    generators: torch.Tensor,
+
+    *,
+    eps:          float,
+    residual_max: Optional[float] = None,
+) -> None:
+    r"""Fail closed when finite BCH coordinates miss the exact group product beyond a bound."""
+    if residual_max is None:
+        return
+    with torch.no_grad(), torch.amp.autocast(phi1.device.type, enabled=False):
+        generators64 = generators.detach().double()
+        left64 = embed_phi(phi1.detach().double(), generators64)
+        right64 = embed_phi(phi2.detach().double(), generators64)
+        composed64 = embed_phi(composed.detach().double(), generators64)
+        exact = torch.linalg.matrix_exp(left64) @ torch.linalg.matrix_exp(right64)
+        approximate = torch.linalg.matrix_exp(composed64)
+        residual = torch.linalg.matrix_norm(approximate - exact)
+        reference = torch.linalg.matrix_norm(exact).clamp(min=eps)
+        relative = residual / reference
+        if bool((relative > residual_max).any()):
+            observed = float(relative.max())
+            raise ValueError(
+                "BCH residual validity bound exceeded: "
+                f"relative residual {observed:.6g} > {residual_max:.6g}"
+            )
+
+
 @dataclass
 class CompactBlockElement:
     r"""A compact equal-block group element without a dense :math:`K\times K` allocation.
@@ -493,6 +524,7 @@ def compose_bch(
     _autocast_guarded: bool                = False,
     gram_pinv_:     Optional[torch.Tensor] = None,
     block_dims:     Optional[List[int]]    = None,   # group irrep_dims; >1 equal blocks -> blocked brackets
+    residual_max:   Optional[float]        = None,   # opt-in fail-closed group-product residual bound
 ) -> torch.Tensor:
     r"""BCH chart correction: coords of log(exp(embed phi1) exp(embed phi2)).
 
@@ -528,6 +560,13 @@ def compose_bch(
     closed (default direct-sum) basis the residual is ~0 so the guard is silent and the
     returned phi is unchanged.
     """
+    if residual_max is not None and (
+        not math.isfinite(residual_max) or residual_max <= 0.0
+    ):
+        raise ValueError(
+            f"residual_max must be None or finite and positive, got {residual_max!r}"
+        )
+
     if (not _autocast_guarded
             and phi1.dtype == torch.float32
             and phi2.dtype == torch.float32
@@ -544,6 +583,7 @@ def compose_bch(
                 _autocast_guarded=True,
                 gram_pinv_=gram_pinv_,
                 block_dims=block_dims,
+                residual_max=residual_max,
             )
 
     blocked = (
@@ -567,6 +607,9 @@ def compose_bch(
         # The explicit block_head_row_major capability is set only by the canonical direct-sum
         # gl(d)^H builder, whose elementary matrix basis is bracket-closed by construction.
         # Skipping the generic closure scan here also avoids its dense Gram projection.
+        _fail_if_bch_residual_exceeds(
+            phi1, phi2, phi, generators, residual_max=residual_max, eps=eps,
+        )
         return phi
 
     X = embed_phi(phi1, generators)
@@ -596,6 +639,9 @@ def compose_bch(
     # O(K^4) OOM) are skipped as closed-by-construction; small non-closed cross_couplings chains scan.
     warn_if_basis_not_closed(generators, where="compose_bch",
                              closure_tol=closure_tol, eps=eps, gram_pinv_=gram_pinv_)
+    _fail_if_bch_residual_exceeds(
+        phi1, phi2, phi, generators, residual_max=residual_max, eps=eps,
+    )
     return phi
 
 
@@ -610,14 +656,20 @@ def compose_phi(
     compact_blocks: bool                   = False,  # canonical block_glk packed-coordinate BCH
     gram_pinv_:     Optional[torch.Tensor] = None,
     block_dims:     Optional[List[int]]    = None,   # group irrep_dims (compose_bch blocked brackets)
+    residual_max:   Optional[float]        = None,   # opt-in BCH-to-group-product residual gate
 ) -> torch.Tensor:
     r"""Dispatch to the registered composition rule `mode`."""
     compose = get_compose(mode)
+    kwargs = {
+        "order": order,
+        "gram_pinv_": gram_pinv_,
+        "block_dims": block_dims,
+    }
+    if residual_max is not None:
+        kwargs["residual_max"] = residual_max
     if compact_blocks:
-        return compose(phi1, phi2, generators, order=order, gram_pinv_=gram_pinv_,
-                       block_dims=block_dims, compact_blocks=True)
-    return compose(phi1, phi2, generators, order=order, gram_pinv_=gram_pinv_,
-                   block_dims=block_dims)
+        kwargs["compact_blocks"] = True
+    return compose(phi1, phi2, generators, **kwargs)
 
 
 def _retract_core(
@@ -779,6 +831,50 @@ def clamp_phi_trace(
     return phi + torch.einsum("...h,hg->...g", delta, V)
 
 
+_OMEGA_RETRACTIONS: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {}
+
+
+def register_omega_retraction(
+    name: str,
+
+    *,
+    override: bool = False,
+) -> Callable:
+    r"""Register a group-element retraction applied to one embedded algebra step."""
+    def _wrap(fn: Callable[[torch.Tensor], torch.Tensor]) -> Callable[[torch.Tensor], torch.Tensor]:
+        if name in _OMEGA_RETRACTIONS and not override:
+            raise KeyError(
+                f"omega retraction {name!r} already registered; pass override=True to replace"
+            )
+        _OMEGA_RETRACTIONS[name] = fn
+        return fn
+    return _wrap
+
+
+def get_omega_retraction(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
+    r"""Return a registered group-element retraction."""
+    if name not in _OMEGA_RETRACTIONS:
+        raise KeyError(
+            f"no omega retraction {name!r}; available: {sorted(_OMEGA_RETRACTIONS)}"
+        )
+    return _OMEGA_RETRACTIONS[name]
+
+
+@register_omega_retraction("lie_exp")
+def _omega_retract_lie_exp(algebra_step: torch.Tensor) -> torch.Tensor:
+    return torch.linalg.matrix_exp(algebra_step)
+
+
+@register_omega_retraction("cayley")
+def _omega_retract_cayley(algebra_step: torch.Tensor) -> torch.Tensor:
+    K = algebra_step.shape[-1]
+    eye = torch.eye(K, dtype=algebra_step.dtype, device=algebra_step.device)
+    max_fro = 1.9
+    fro = algebra_step.norm(dim=(-2, -1), keepdim=True)
+    algebra_step = algebra_step * (max_fro / fro.clamp(min=max_fro))
+    return torch.linalg.solve(eye - 0.5 * algebra_step, eye + 0.5 * algebra_step)
+
+
 def retract_omega(
     U:          torch.Tensor,             # (..., K, K) current group element
     xi:         torch.Tensor,             # (..., n_gen) descent step in algebra coords (already -lr scaled)
@@ -813,16 +909,5 @@ def retract_omega(
     :math:`U\,\mathrm{retr}(\xi^a G_a)` keeps :math:`U`'s block structure exactly.
     """
     A = embed_phi(xi, generators)                             # (..., K, K) algebra matrix sum_a xi^a G_a
-    if mode == "lie_exp":
-        step = torch.linalg.matrix_exp(A)                     # (..., K, K) exp of the step
-    elif mode == "cayley":
-        K   = A.shape[-1]
-        eye = torch.eye(K, dtype=A.dtype, device=A.device)
-        # Clamp A to Cayley's valid domain ||A||_F < 2 (keeps I - A/2 invertible, det>0 -> in-component).
-        max_fro = 1.9
-        fro = A.norm(dim=(-2, -1), keepdim=True)                  # (..., 1, 1) per-element Frobenius norm
-        A   = A * (max_fro / fro.clamp(min=max_fro))             # identity when ||A||_F <= max_fro, else scale down
-        step = torch.linalg.solve(eye - 0.5 * A, eye + 0.5 * A)   # (I - A/2)^{-1}(I + A/2)
-    else:
-        raise ValueError(f"omega retract mode must be 'lie_exp' or 'cayley', got {mode!r}")
+    step = get_omega_retraction(mode)(A)
     return U @ step
