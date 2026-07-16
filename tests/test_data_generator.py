@@ -11,6 +11,10 @@ import vfe3.data.datasets as ds
 def _patch_tokens(monkeypatch, n=2000):
     monkeypatch.setattr(ds, "load_cached_tokens",
                         lambda *a, **k: torch.arange(n, dtype=torch.long))
+    monkeypatch.setattr(ds, "cache_source_identity", lambda *a, **k: {
+        "format": "pt", "tokenizer_tag": "fixture", "size_bytes": n * 8,
+        "sha256": "0" * 64, "meta": None, "meta_sha256": None,
+    })
 
 
 def _full_order(loader):

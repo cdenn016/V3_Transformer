@@ -1,6 +1,6 @@
 """Shared type contracts for mutable runtime dictionaries."""
 
-from typing import List, NamedTuple, Optional, Tuple, TypedDict
+from typing import Dict, List, NamedTuple, Optional, Tuple, TypedDict
 
 import torch
 
@@ -129,6 +129,7 @@ class DataStateBuffer(TypedDict, total=False):
     epoch_start_generator_state: torch.Tensor
     batches_consumed:            int
     epoch:                       int
+    data_identity:               Dict[str, object]
 
 
 class DataState(TypedDict):
@@ -137,3 +138,4 @@ class DataState(TypedDict):
     epoch_start_generator_state: torch.Tensor
     batches_consumed:            int
     epoch:                       int
+    data_identity:               Dict[str, object]

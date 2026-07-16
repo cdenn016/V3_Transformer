@@ -32,7 +32,7 @@ from vfe3.run_artifacts import (
     load_checkpoint,
     semantic_config_fingerprint,
 )
-from vfe3.train import TrainingTerminalState, build_optimizer, train
+from vfe3.train import TrainingTerminalState, _loader_data_identity, build_optimizer, train
 
 
 def _const_loader(seq_len: int = 8, bs: int = 4) -> DataLoader:
@@ -222,7 +222,10 @@ def test_shuffled_resume_matches_uninterrupted_run(tmp_path):
     ckpt = tmp_path / "run" / "checkpoints" / "step_3.pt"
     assert ckpt.exists()
     saved_data_state = torch.load(ckpt, weights_only=True)["data_state"]
-    assert set(saved_data_state) == {"epoch_start_generator_state", "batches_consumed", "epoch"}
+    assert set(saved_data_state) == {
+        "epoch_start_generator_state", "batches_consumed", "epoch", "data_identity",
+    }
+    assert saved_data_state["data_identity"] == _loader_data_identity(loader_b, cfg.vocab_size)
     assert torch.equal(saved_data_state["epoch_start_generator_state"], epoch_start_generator_state)
     assert saved_data_state["batches_consumed"] == 3
     assert saved_data_state["epoch"] == 0
@@ -278,6 +281,7 @@ def test_save_checkpoint_rejects_malformed_data_cursor(tmp_path, field, bad_valu
         "epoch_start_generator_state": torch.Generator().manual_seed(0).get_state(),
         "batches_consumed":            0,
         "epoch":                       0,
+        "data_identity":               _loader_data_identity(_shuffled_loader(), cfg.vocab_size),
     }
     data_state[field] = bad_value
 
@@ -301,6 +305,7 @@ def test_load_checkpoint_rejects_malformed_data_cursor(tmp_path, field, bad_valu
         "epoch_start_generator_state": torch.Generator().manual_seed(0).get_state(),
         "batches_consumed":            0,
         "epoch":                       0,
+        "data_identity":               _loader_data_identity(_shuffled_loader(), cfg.vocab_size),
     }
     checkpoint = art.save_checkpoint(
         1, model, build_optimizer(model, cfg), cfg, data_state=valid_data_state)
@@ -310,7 +315,12 @@ def test_load_checkpoint_rejects_malformed_data_cursor(tmp_path, field, bad_valu
     torch.save(bundle, malformed_checkpoint)
 
     with pytest.raises(ValueError, match=rf"{field}.*non-negative integer"):
-        load_checkpoint(malformed_checkpoint, VFEModel(cfg), data_state={})
+        load_checkpoint(
+            malformed_checkpoint,
+            VFEModel(cfg),
+            data_state={},
+            expected_data_identity=valid_data_state["data_identity"],
+        )
 
 
 def test_resume_restores_best_val_state(tmp_path):
@@ -561,9 +571,9 @@ def test_validation_finalizer_scores_terminal_ema_before_best_selection(tmp_path
 
     calls = []
 
-    def fake_evaluate(m, loader, *, tokens_per_char=1.0, device=None):
+    def fake_evaluate(m, loader, *, tokens_per_char=None, device=None):
         calls.append({name: t.detach().clone() for name, t in m.state_dict().items()})
-        return {"ce": 2.0, "ppl": 9.0, "bpc": 2.5}
+        return {"ce": 2.0, "ppl": 9.0, "bits_per_token": 2.0 / math.log(2.0), "bpc": None}
 
     monkeypatch.setattr("vfe3.train.evaluate", fake_evaluate)
 

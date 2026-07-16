@@ -352,10 +352,11 @@ def test_evaluate_returns_finite_ppl_bpc_consistent_with_ce():
     cfg = _structured_cfg()
     model = VFEModel(cfg)
     loader = _periodic_loader(seed=0)
-    m = evaluate(model, loader)
-    assert set(m.keys()) == {"ce", "ppl", "bpc"}
+    m = evaluate(model, loader, tokens_per_char=1.0)
+    assert set(m.keys()) == {"ce", "ppl", "bits_per_token", "bpc"}
     assert all(math.isfinite(v) for v in m.values())
     assert m["ppl"] == pytest.approx(math.exp(min(m["ce"], 20.0)))
+    assert m["bits_per_token"] == pytest.approx(m["ce"] / math.log(2.0))
     assert m["bpc"] == pytest.approx(m["ce"] / math.log(2.0))
 
 
@@ -832,7 +833,8 @@ def test_validation_finalizer_records_validation_without_test_fields(tmp_path, m
     assert summary["selection_split"] == "validation"
     for forbidden in ("test_ce", "test_ppl", "test_bpc"):
         assert forbidden not in summary
-    for required in ("primary_val_ppl", "final_val_ce", "final_val_ppl", "final_val_bpc",
+    for required in ("primary_val_ppl", "final_val_ce", "final_val_ppl",
+                     "final_val_bits_per_token", "final_val_bpc",
                      "best_val_ppl", "best_step", "n_steps", "n_params", "final_train_loss",
                      "wall_time_s", "terminal_checkpoint", "figures_written",
                      "phi_chart_norm_route"):
@@ -844,7 +846,8 @@ def test_validation_finalizer_records_validation_without_test_fields(tmp_path, m
     assert vr["selection_split"] == "validation"
     assert "test_ppl" not in vr
 
-    assert set(mapping) == {"primary_val_ppl", "final_val_ppl", "final_val_ce", "final_val_bpc",
+    assert set(mapping) == {"primary_val_ppl", "final_val_ppl", "final_val_ce",
+                            "final_val_bits_per_token", "final_val_bpc",
                             "best_val_ppl", "best_step", "final_train_loss", "n_params",
                             "terminal_checkpoint"}
     # After the terminal maybe_save_best the primary equals the selected finite best (no earlier best).
@@ -862,9 +865,10 @@ def test_validation_finalizer_appends_to_existing_metrics_schema(tmp_path, monke
     model = VFEModel(cfg)
     art = RunArtifacts(tmp_path / "r", cfg, model)
     # An established (richer) training schema locks the CSV fieldnames on its first row; the terminal
-    # row's five keys are a SUBSET, so the append writes blanks for the extra columns rather than crashing.
+    # row's metric keys are a subset, so the append writes blanks for other columns.
     art.log_metrics({"step": 1, "train_loss": 1.0, "train_ce": 1.0, "val_ce": float("nan"),
-                     "val_ppl": float("nan"), "val_bpc": float("nan"), "lr_mu": 0.01,
+                     "val_ppl": float("nan"), "val_bits_per_token": float("nan"),
+                     "val_bpc": float("nan"), "lr_mu": 0.01,
                      "attn_entropy": 0.5})
     state = _make_terminal_state(model, cfg)
     finalize_validation_run(model, art, cfg, _terminal_val_loader(), losses=[1.0, 0.9],

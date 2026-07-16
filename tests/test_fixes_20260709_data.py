@@ -266,14 +266,11 @@ def test_cached_token_count_pt_uses_mmap(tmp_path, monkeypatch):
     assert seen == [True]
 
 
-def test_cached_token_count_bin_reads_metadata_only(tmp_path):
-    # an EMPTY .bin file with an n_tokens=7 sidecar: the count must come from the
-    # metadata alone (any materialization of the stream would see 0 tokens or fail)
-    p = cache_path("wiki-en", "train", suffix="bin", cache_dir=tmp_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.touch()
-    (p.parent / (p.name + ".meta.json")).write_text(
-        json.dumps({"n_tokens": 7, "dtype": "int32"}))
+def test_cached_token_count_bin_validates_metadata_without_mapping(tmp_path, monkeypatch):
+    # Count retrieval validates exact bytes against metadata but never constructs a memmap.
+    _write_bin_cache(tmp_path, dataset="wiki-en", split="train", n=7)
+    monkeypatch.setattr(dsmod.np, "memmap",
+                        lambda *a, **k: pytest.fail("token count must not map the corpus"))
     assert cached_token_count("wiki-en", "train", cache_dir=tmp_path) == 7
 
 
@@ -290,6 +287,10 @@ def test_make_dataloader_threads_max_tokens_as_limit(monkeypatch):
         return torch.arange(30 if limit is None else limit, dtype=torch.long)
 
     monkeypatch.setattr(dsmod, "load_cached_tokens", fake_load)
+    monkeypatch.setattr(dsmod, "cache_source_identity", lambda *a, **k: {
+        "format": "pt", "tokenizer_tag": "tiktoken", "size_bytes": 30,
+        "sha256": "0" * 64, "meta": None, "meta_sha256": None,
+    })
     loader = make_dataloader("ds", "train", 4, 2, max_tokens=10)
     assert seen["limit"] == 10                       # cap reached the loader, not a post-hoc slice
     assert loader.dataset.tokens.numel() == 10
@@ -394,6 +395,10 @@ def test_production_loader_calls_keep_vocab_size_guard(
 def test_make_dataloader_vocab_size_guard(monkeypatch):
     monkeypatch.setattr(dsmod, "load_cached_tokens",
                         lambda *a, **k: torch.arange(30, dtype=torch.long))   # ids 0..29
+    monkeypatch.setattr(dsmod, "cache_source_identity", lambda *a, **k: {
+        "format": "pt", "tokenizer_tag": "tiktoken", "size_bytes": 30,
+        "sha256": "0" * 64, "meta": None, "meta_sha256": None,
+    })
     with pytest.raises(ValueError):
         make_dataloader("ds", "train", 4, 2, vocab_size=8)
     ok = make_dataloader("ds", "train", 4, 2, vocab_size=64)                 # 29 < 64: fine

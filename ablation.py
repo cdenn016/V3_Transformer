@@ -1711,7 +1711,9 @@ def get_loader(
     as a corpus measurement.
     """
     cap = max_tokens if split == "train" else None
-    key = (dataset, seq_len, batch_size, split, cap, vocab_size)
+    source_identity = cache_source_identity(dataset, split)
+    source_key = json.dumps(source_identity, sort_keys=True, separators=(",", ":"))
+    key = (dataset, seq_len, batch_size, split, cap, vocab_size, source_key)
     if key in _LOADER_CACHE:
         return _LOADER_CACHE[key]
     # Split-aware loader semantics, mirroring train_vfe3._select_loader: only the train stream is
@@ -1916,9 +1918,9 @@ def run_single(
     val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation",
                               vocab_size=cfg.vocab_size)
 
-    # Bits-per-CHARACTER correction for the val BPC, mirroring train_vfe3 (None -- synthetic / no
-    # tiktoken / cache absent -- keeps 1.0 = honest bits-per-token). Memoized, so cells share it.
-    val_tpc = tokens_per_char(dataset, "validation") or 1.0
+    # Bits-per-CHARACTER correction for val BPC, mirroring train_vfe3. When normalization is
+    # unavailable, BPC stays null and the separately named bits-per-token metric remains defined.
+    val_tpc = tokens_per_char(dataset, "validation")
 
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts = RunArtifacts(run_dir, cfg, model, dataset=dataset, device=device)
@@ -2054,7 +2056,7 @@ def _cleanup() -> None:
 # =============================================================================
 _CSV_COLUMNS = [
     "sweep", "label", "error_kind", "primary_val_ppl", "final_val_ppl",
-    "final_val_ce", "final_val_bpc", "best_val_ppl", "final_train_loss",
+    "final_val_ce", "final_val_bits_per_token", "final_val_bpc", "best_val_ppl", "final_train_loss",
     "n_params",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",

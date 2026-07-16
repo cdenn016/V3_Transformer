@@ -34,7 +34,7 @@ import subprocess
 import time
 from dataclasses import asdict, fields
 from pathlib import Path, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -52,6 +52,159 @@ def _require_nonnegative_int(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"data_state {field} must be a non-negative integer")
     return value
+
+
+_DATA_IDENTITY_SCHEMA_VERSION = 1
+_DATA_IDENTITY_FIELDS = {
+    "schema_version",
+    "dataset",
+    "split",
+    "tokenizer_tag",
+    "tokenizer_encoding",
+    "tokenizer_vocab_size",
+    "model_vocab_size",
+    "max_tokens",
+    "source",
+}
+_DATA_SOURCE_IDENTITY_FIELDS = {
+    "format",
+    "tokenizer_tag",
+    "size_bytes",
+    "sha256",
+    "meta",
+    "meta_sha256",
+}
+_BINARY_TOKEN_DTYPE_BYTES = {
+    "uint8":  1,
+    "int8":   1,
+    "int16":  2,
+    "int32":  4,
+    "int64":  8,
+}
+_TENSOR_TOKEN_DTYPE_BYTES = {
+    f"torch.{name}": itemsize for name, itemsize in _BINARY_TOKEN_DTYPE_BYTES.items()
+}
+
+
+def _require_identity_sha256(value: object, field: str) -> str:
+    if (not isinstance(value, str) or len(value) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in value)):
+        raise ValueError(f"data_state data_identity {field} must be a 64-digit SHA-256 hex digest")
+    return value
+
+
+def _require_identity_positive_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"data_state data_identity {field} must be a positive integer")
+    return value
+
+
+def _normalized_data_identity(
+    value: object,
+) -> Dict[str, object]:
+    r"""Return an owned JSON-normalized data contract or fail closed.
+
+    JSON normalization prevents a caller from mutating nested checkpoint identity state after the
+    save boundary and gives equality one canonical set of scalar/container semantics.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError("data_state data_identity must be a mapping")
+    try:
+        normalized = json.loads(json.dumps(dict(value), sort_keys=True, separators=(",", ":")))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("data_state data_identity must contain only JSON-compatible values") from exc
+    if not isinstance(normalized, dict):
+        raise ValueError("data_state data_identity must normalize to a mapping")
+    missing = sorted(_DATA_IDENTITY_FIELDS - normalized.keys())
+    if missing:
+        raise ValueError(f"data_state data_identity is missing required field(s) {missing}")
+    if normalized.get("schema_version") != _DATA_IDENTITY_SCHEMA_VERSION:
+        raise ValueError(
+            f"data_state data_identity schema_version must be {_DATA_IDENTITY_SCHEMA_VERSION}")
+    for field in ("dataset", "split"):
+        if not isinstance(normalized.get(field), str) or not normalized[field]:
+            raise ValueError(f"data_state data_identity {field} must be a nonempty string")
+    tokenizer_tag = normalized.get("tokenizer_tag")
+    tokenizer_encoding = normalized.get("tokenizer_encoding")
+    tokenizer_vocab_size = normalized.get("tokenizer_vocab_size")
+    if tokenizer_tag is not None and (not isinstance(tokenizer_tag, str) or not tokenizer_tag):
+        raise ValueError(
+            "data_state data_identity tokenizer_tag must be a nonempty string or null")
+    if (tokenizer_encoding is not None
+            and (not isinstance(tokenizer_encoding, str) or not tokenizer_encoding)):
+        raise ValueError(
+            "data_state data_identity tokenizer_encoding must be a nonempty string or null")
+    if tokenizer_vocab_size is not None:
+        _require_identity_positive_int(tokenizer_vocab_size, "tokenizer_vocab_size")
+    _require_identity_positive_int(normalized.get("model_vocab_size"), "model_vocab_size")
+    max_tokens = normalized.get("max_tokens")
+    if max_tokens is not None:
+        _require_identity_positive_int(max_tokens, "max_tokens")
+
+    source = normalized.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("data_state data_identity source must be a mapping")
+    missing_source = sorted(_DATA_SOURCE_IDENTITY_FIELDS - source.keys())
+    if missing_source:
+        raise ValueError(
+            f"data_state data_identity source is missing required field(s) {missing_source}")
+    source_format = source.get("format")
+    if source_format not in {"pt", "bin", "tensor"}:
+        raise ValueError(
+            "data_state data_identity source format must be one of 'pt', 'bin', or 'tensor'")
+    source_tokenizer = source.get("tokenizer_tag")
+    if source_format in {"pt", "bin"}:
+        if not isinstance(source_tokenizer, str) or not source_tokenizer:
+            raise ValueError(
+                "data_state data_identity source tokenizer_tag must be a nonempty string")
+        if (not isinstance(tokenizer_tag, str) or not tokenizer_tag
+                or not isinstance(tokenizer_encoding, str) or not tokenizer_encoding):
+            raise ValueError(
+                "data_state data_identity file sources require tokenizer tag and encoding")
+        _require_identity_positive_int(tokenizer_vocab_size, "tokenizer_vocab_size")
+    elif source_tokenizer is not None and (
+            not isinstance(source_tokenizer, str) or not source_tokenizer):
+        raise ValueError(
+            "data_state data_identity source tokenizer_tag must be a nonempty string or null")
+    size_bytes = _require_identity_positive_int(source.get("size_bytes"), "source size_bytes")
+    _require_identity_sha256(source.get("sha256"), "source sha256")
+
+    meta = source.get("meta")
+    meta_sha256 = source.get("meta_sha256")
+    if source_format == "pt":
+        if meta is not None or meta_sha256 is not None:
+            raise ValueError(
+                "data_state data_identity pt source metadata fields must be null")
+    else:
+        if not isinstance(meta, dict):
+            raise ValueError(
+                f"data_state data_identity {source_format} source meta must be a mapping")
+        missing_meta = sorted({"n_tokens", "dtype"} - meta.keys())
+        if missing_meta:
+            raise ValueError(
+                f"data_state data_identity source meta is missing required field(s) {missing_meta}")
+        n_tokens = _require_identity_positive_int(
+            meta.get("n_tokens"), "source meta n_tokens")
+        dtype = meta.get("dtype")
+        dtype_bytes = (
+            _BINARY_TOKEN_DTYPE_BYTES.get(dtype)
+            if source_format == "bin"
+            else _TENSOR_TOKEN_DTYPE_BYTES.get(dtype)
+        )
+        if dtype_bytes is None:
+            raise ValueError(
+                f"data_state data_identity source meta dtype {dtype!r} is unsupported")
+        expected_bytes = n_tokens * dtype_bytes
+        if size_bytes != expected_bytes:
+            raise ValueError(
+                "data_state data_identity source size_bytes must equal "
+                f"n_tokens * dtype.itemsize ({expected_bytes})")
+        if source_format == "bin":
+            _require_identity_sha256(meta_sha256, "source meta_sha256")
+        elif meta_sha256 is not None:
+            raise ValueError(
+                "data_state data_identity tensor source meta_sha256 must be null")
+    return normalized
 
 
 def semantic_config_fingerprint(
@@ -514,10 +667,16 @@ class RunArtifacts:
             batches_consumed = _require_nonnegative_int(
                 data_state["batches_consumed"], "batches_consumed")
             epoch = _require_nonnegative_int(data_state["epoch"], "epoch")
+            generator_state = data_state["epoch_start_generator_state"]
+            if not isinstance(generator_state, torch.Tensor):
+                raise ValueError(
+                    "data_state epoch_start_generator_state must be a tensor")
+            data_identity = _normalized_data_identity(data_state.get("data_identity"))
             saved_data_state = {
-                "epoch_start_generator_state": data_state["epoch_start_generator_state"].clone(),
+                "epoch_start_generator_state": generator_state.clone(),
                 "batches_consumed":            batches_consumed,
                 "epoch":                       epoch,
+                "data_identity":               data_identity,
             }
         # Portable best-model selection state (PB-03): a finite best_val_ppl means best_model.pt IS the
         # selected checkpoint, so its validated bundle is embedded here and travels with the checkpoint
@@ -631,6 +790,7 @@ def load_checkpoint(
     artifacts:            'Optional[RunArtifacts]'         = None,
     metropolis_generator: Optional[torch.Generator]        = None,
     data_state:            Optional[DataStateBuffer]        = None,
+    expected_data_identity: Optional[Mapping[str, object]]   = None,
 ) -> int:
     r"""Restore a ``save_checkpoint`` bundle into ``model`` (and optionally ``optimizer``); return the saved step.
 
@@ -655,8 +815,9 @@ def load_checkpoint(
     ``<old_run>/best_model.pt``) is published into the resumed run's directory and the
     ``best_val_ppl``/``best_step`` scalars are set; when no reachable bundle exists the selection state
     resets to ``inf``/``None`` with one warning, so an unreachable best scalar is never retained. When a
-    mutable ``data_state`` mapping is supplied, it is filled from the bundled iterator cursor; older
-    checkpoints leave it empty.
+    mutable ``data_state`` mapping is supplied, it is filled from the bundled iterator cursor.
+    Supplying ``expected_data_identity`` requests exact data resume: a legacy bundle without
+    ``data_state`` or a bundle whose identity differs is rejected before any mutable state is restored.
 
     The bundle is loaded with ``weights_only=True`` by default, which refuses to execute arbitrary
     pickle reductions: our bundle carries only tensors, an ``asdict`` config dict, and RNG tensors
@@ -684,10 +845,37 @@ def load_checkpoint(
             ) from exc
         ckpt = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     saved_data_state = ckpt.get("data_state")
+    saved_data_identity: Optional[Dict[str, object]] = None
+    if saved_data_state is None and expected_data_identity is not None:
+        raise RuntimeError(
+            "checkpoint is missing data_state required for exact resume; refusing to restore "
+            "model, optimizer, cursor, or RNG state")
     if saved_data_state is not None:
+        if not isinstance(saved_data_state, Mapping):
+            raise RuntimeError("checkpoint data_state must be a mapping")
         saved_batches_consumed = _require_nonnegative_int(
             saved_data_state["batches_consumed"], "batches_consumed")
         saved_epoch = _require_nonnegative_int(saved_data_state["epoch"], "epoch")
+        saved_generator_state = saved_data_state.get("epoch_start_generator_state")
+        if not isinstance(saved_generator_state, torch.Tensor):
+            raise RuntimeError(
+                "checkpoint data_state epoch_start_generator_state must be a tensor")
+        if "data_identity" not in saved_data_state:
+            raise RuntimeError(
+                "checkpoint data_state is missing its data identity contract; exact resume is unsafe")
+        saved_data_identity = _normalized_data_identity(saved_data_state["data_identity"])
+        if expected_data_identity is None:
+            raise RuntimeError(
+                "checkpoint carries a data cursor, but no live expected data identity was supplied")
+        live_data_identity = _normalized_data_identity(expected_data_identity)
+        if saved_data_identity != live_data_identity:
+            differing = sorted(
+                key for key in (saved_data_identity.keys() | live_data_identity.keys())
+                if saved_data_identity.get(key) != live_data_identity.get(key)
+            )
+            raise RuntimeError(
+                f"checkpoint data identity mismatch for field(s) {differing}; refusing to restore "
+                "model, optimizer, cursor, or RNG state")
     model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and ckpt.get("optimizer_state") is not None:
         saved_optimizer_state = ckpt["optimizer_state"]
@@ -761,6 +949,7 @@ def load_checkpoint(
                 "epoch_start_generator_state": saved_data_state["epoch_start_generator_state"],
                 "batches_consumed":            saved_batches_consumed,
                 "epoch":                       saved_epoch,
+                "data_identity":               saved_data_identity,
             })
     return int(ckpt["step"])
 
@@ -872,6 +1061,50 @@ def _sha256_tensor_content(
     return digest.hexdigest()
 
 
+def _loader_token_content_identity(
+    loader: Optional[Iterable],
+) -> 'Tuple[Optional[str], Optional[int]]':
+    r"""Return one immutable loader split's canonical token digest and count.
+
+    ``ablation.get_loader`` reuses the same ``TokenWindows`` instance across cells. Cache the
+    canonical int64 digest on that dataset after its first bounded hash so every later finalization
+    reuses the exact value instead of rereading the unchanged mapped corpus.
+    """
+    dataset = getattr(loader, "dataset", None)
+    tokens = getattr(dataset, "tokens", None)
+    if tokens is None:
+        return None, None
+    cached = getattr(dataset, "_vfe3_token_content_sha256", None)
+    if cached is None:
+        cached = _sha256_tensor_content(tokens)
+        setattr(dataset, "_vfe3_token_content_sha256", cached)
+    return str(cached), int(tokens.numel())
+
+
+def _bincount_token_chunks(
+    tokens: torch.Tensor,
+
+    *,
+    vocab_size:   int,
+    chunk_tokens: int = 128 * 1024,
+) -> torch.Tensor:
+    r"""Accumulate exact training-token counts with a bounded host-int64 working chunk."""
+    if vocab_size <= 0:
+        raise ValueError("vocab_size must be positive")
+    if chunk_tokens <= 0:
+        raise ValueError("chunk_tokens must be positive")
+    flat = tokens.detach().reshape(-1)
+    counts = torch.zeros(vocab_size, dtype=torch.long, device="cpu")
+    for start in range(0, flat.numel(), chunk_tokens):
+        chunk = flat[start:start + chunk_tokens].to(device="cpu", dtype=torch.long)
+        partial = torch.bincount(chunk, minlength=vocab_size)
+        if partial.numel() != vocab_size:
+            raise ValueError(
+                f"training token id exceeds vocab_size={vocab_size}; validate the cache first")
+        counts.add_(partial)
+    return counts
+
+
 def _write_provenance(
     artifacts: RunArtifacts,
     cfg:       VFE3Config,
@@ -905,15 +1138,10 @@ def _write_provenance(
         n_key = f"{split}_data_n_tokens"
         prov[sha_key], prov[n_key] = None, None
         try:
-            dataset = getattr(loader, "dataset", None)
-            tokens = getattr(dataset, "tokens", None)
-            if tokens is not None:
-                # Hash the CONTENT, not the storage: TokenWindows may hold the stream in its
-                # native cache dtype (int32 memmap) or int64 (capped load), and the pooled
-                # data_sha256 feeds scaling_analysis's mixed_corpus gate -- normalize to int64
-                # so identical corpora hash identically regardless of storage width.
-                prov[sha_key] = _sha256_tensor_content(tokens)
-                prov[n_key] = int(tokens.numel())
+            # Hash the CONTENT, not the storage: TokenWindows may hold the stream in its native
+            # cache dtype (int32 memmap) or int64 (capped load). Normalize to int64 once, then reuse
+            # that immutable split digest across every ablation cell sharing the loader.
+            prov[sha_key], prov[n_key] = _loader_token_content_identity(loader)
         except (AttributeError, RuntimeError, TypeError, ValueError, OSError, MemoryError) as exc:
             # Best-effort provenance, narrowed to the realistic hash-path failures (audit
             # 2026-07-12 N2): exotic loader/dtype/allocation errors must not crash finalize, but
@@ -1074,9 +1302,9 @@ def _write_research_artifacts(
         train_tokens = getattr(train_dataset, "tokens", None)
         if train_tokens is None:
             raise ValueError("training loader dataset does not expose corpus tokens")
-        corpus_counts = torch.bincount(
-            train_tokens.detach().reshape(-1).to(device="cpu", dtype=torch.long),
-            minlength=int(cfg.vocab_size),
+        corpus_counts = _bincount_token_chunks(
+            train_tokens,
+            vocab_size=int(cfg.vocab_size),
         )
         out.update(_calibration_and_strata(corpus_counts, model, test_loader, device))
     except Exception as exc:
@@ -1192,7 +1420,7 @@ def finalize_run(
     cfg:         VFE3Config,
 
     *,
-    tokens_per_char: float                    = 1.0,   # test BPC char-correction (1.0 = bits/token)
+    tokens_per_char: Optional[float]           = None,  # None -> BPC unavailable; BPT remains defined
     train_loader:    Optional[Iterable]       = None,
     val_loader:      Optional[Iterable]       = None,
     test_loader:     Optional[Iterable]       = None,
@@ -1253,9 +1481,17 @@ def finalize_run(
     results: Dict[str, object] = {}                             # mixes float / Optional[float|int] / bool
     if test_loader is not None:
         m = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
-        results = {"test_ce": m["ce"], "test_ppl": m["ppl"], "test_bpc": m["bpc"]}
-        logger.info("Test (held-out) | CE: %.4f | PPL: %.2f | BPC: %.4f",
-                    m["ce"], m["ppl"], m["bpc"])
+        results = {
+            "test_ce":             m["ce"],
+            "test_ppl":            m["ppl"],
+            "test_bits_per_token": m["bits_per_token"],
+            "test_bpc":            m["bpc"],
+        }
+        logger.info(
+            "Test (held-out) | CE: %.4f | PPL: %.2f | BPT: %.4f | BPC: %s",
+            m["ce"], m["ppl"], m["bits_per_token"],
+            (f"{float(m['bpc']):.4f}" if m["bpc"] is not None else "unavailable"),
+        )
     best_val_ppl = artifacts.best_val_ppl if artifacts.best_val_ppl != float("inf") else None
     results.update({"best_val_ppl": best_val_ppl, "best_step": artifacts.best_step,
                     "reloaded_best": reloaded_best})
@@ -1379,6 +1615,7 @@ def finalize_run(
         "reloaded_best": results.get("reloaded_best"),   # m26: False on a cross-run-dir resume whose best_model.pt is elsewhere
         "test_ppl":     results.get("test_ppl"),
         "test_ce":      results.get("test_ce"),
+        "test_bits_per_token": results.get("test_bits_per_token"),
         "test_bpc":     results.get("test_bpc"),
         "test_ce_no_estep":    results.get("test_ce_no_estep"),
         "estep_capacity_gain": results.get("estep_capacity_gain"),
@@ -1588,7 +1825,7 @@ def finalize_validation_run(
     val_loader:  Iterable,
 
     *,
-    tokens_per_char: float                    = 1.0,
+    tokens_per_char: Optional[float]           = None,
     train_loader:    Optional[Iterable]       = None,
     losses:          Optional[List[float]]    = None,
     data_seed:       Optional[int]            = None,
@@ -1619,8 +1856,8 @@ def finalize_validation_run(
     returned-model behavior. A validation/checkpoint failure restores the raw weights/RNG and re-raises,
     publishing no summary (and, via the caller, no success contract).
 
-    Returns the exact ablation merge mapping ``{"primary_val_ppl", "final_val_ppl", "final_val_ce",
-    "final_val_bpc", "best_val_ppl", "best_step", "final_train_loss", "n_params", "terminal_checkpoint"}``.
+    Returns the ablation merge mapping with both ``final_val_bits_per_token`` and nullable
+    ``final_val_bpc`` alongside the validation/selection/checkpoint fields.
     ``primary_val_ppl`` is the minimum of the finite run-wide best and the final validation PPL (or the
     final value when no earlier best exists); after ``maybe_save_best`` it equals the selected finite best.
     """
@@ -1649,8 +1886,10 @@ def finalize_validation_run(
             ema.copy_to(model)
 
         metrics = evaluate(model, val_loader, tokens_per_char=tokens_per_char, device=device)
-        final_ce, final_ppl, final_bpc = (
-            float(metrics["ce"]), float(metrics["ppl"]), float(metrics["bpc"]))
+        final_ce = float(metrics["ce"])
+        final_ppl = float(metrics["ppl"])
+        final_bits_per_token = float(metrics["bits_per_token"])
+        final_bpc = (float(metrics["bpc"]) if metrics["bpc"] is not None else None)
 
         # Terminal metrics row: compatible with an empty history (defines the schema) OR an established
         # training schema (its five keys are a subset of the training columns, so the append is clean).
@@ -1659,7 +1898,8 @@ def finalize_validation_run(
             "train_loss": float(losses[-1]) if losses else float("nan"),
             "val_ce":     final_ce,
             "val_ppl":    final_ppl,
-            "val_bpc":    final_bpc,
+            "val_bits_per_token": final_bits_per_token,
+            "val_bpc":    (final_bpc if final_bpc is not None else float("nan")),
         }
         # Run-wide best BEFORE the terminal save: primary is the better of the finite periodic best and
         # the final validation, so after maybe_save_best it equals the selected finite best.
@@ -1679,6 +1919,7 @@ def finalize_validation_run(
             "selection_split": "validation",
             "val_ce":          final_ce,
             "val_ppl":         final_ppl,
+            "val_bits_per_token": final_bits_per_token,
             "val_bpc":         final_bpc,
             "primary_val_ppl": float(primary_val_ppl),
             "best_val_ppl":    best_val_ppl,
@@ -1723,6 +1964,7 @@ def finalize_validation_run(
         "primary_val_ppl":     float(primary_val_ppl),
         "final_val_ce":        final_ce,
         "final_val_ppl":       final_ppl,
+        "final_val_bits_per_token": final_bits_per_token,
         "final_val_bpc":       final_bpc,
         "best_val_ppl":        best_val_ppl,
         "best_step":           artifacts.best_step,
@@ -1742,6 +1984,7 @@ def finalize_validation_run(
         "primary_val_ppl":     float(primary_val_ppl),
         "final_val_ppl":       final_ppl,
         "final_val_ce":        final_ce,
+        "final_val_bits_per_token": final_bits_per_token,
         "final_val_bpc":       final_bpc,
         "best_val_ppl":        best_val_ppl,
         "best_step":           artifacts.best_step,

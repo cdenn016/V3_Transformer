@@ -573,9 +573,9 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     # Bits-per-CHARACTER correction so PPL/BPC compare across tokenizers and languages (gpt2 vs
     # cl100k; en/ja/ar -- a cl100k token spans ~3 Japanese codepoints). tokens_per_char =
     # n_tokens/n_codepoints from the held-out stream; None (synthetic / no tiktoken / cache absent)
-    # -> 1.0 = honest bits-per-token. One cheap decode pass over the small val/test stream.
+    # -> BPC unavailable, while evaluate publishes the always-defined bits_per_token separately.
     from vfe3.data.datasets import tokens_per_char as _tokens_per_char
-    val_tpc = _tokens_per_char(DATASET, "validation") or 1.0
+    val_tpc = _tokens_per_char(DATASET, "validation")
 
     # Run-artifacts directory (config.json, metrics.csv, checkpoints/, best_model.pt, figures).
     # None disables persistence (RUN_ROOT = None); the synthetic fallback also runs unsaved-free.
@@ -623,15 +623,16 @@ def _run_once(seed: int, logger: logging.Logger) -> None:
     m = evaluate(model, val_loader, tokens_per_char=val_tpc, device=torch.device(DEVICE))
     logger.info("=" * 64)
     logger.info(                                          # val-only summary; CE is the loss (no separate train loss here)
-        "Final (val) | CE: %.4f | PPL: %.1f | BPC: %.4f",
-        m["ce"], m["ppl"], m["bpc"],
+        "Final (val) | CE: %.4f | PPL: %.1f | BPT: %.4f | BPC: %s",
+        m["ce"], m["ppl"], m["bits_per_token"],
+        (f"{float(m['bpc']):.4f}" if m["bpc"] is not None else "unavailable"),
     )
 
     # End-of-run held-out TEST evaluation on the reloaded best-val checkpoint, plus summary +
     # figures, on the dataset's test split (a missing cache raises -- no synthetic substitution).
     if artifacts is not None:
         test_loader = _select_loader(DATASET, cfg, split="test")
-        test_tpc = _tokens_per_char(DATASET, "test") or 1.0
+        test_tpc = _tokens_per_char(DATASET, "test")
         results = finalize_run(
             model,
             artifacts,

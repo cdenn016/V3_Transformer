@@ -143,7 +143,12 @@ def test_make_dataloader_eval_keeps_tail_and_is_sequential(monkeypatch):
     import vfe3.data.datasets as dsmod
 
     monkeypatch.setattr(dsmod, "load_cached_tokens", lambda *a, **k: torch.arange(30))
-    seq_len, batch_size = 4, 3                       # 30 tokens -> 7 windows; 7 % 3 = 1 (partial tail)
+    monkeypatch.setattr(dsmod, "cache_source_identity", lambda *a, **k: {
+        "format": "pt", "tokenizer_tag": "tiktoken", "size_bytes": 30,
+        "sha256": "0" * 64, "meta": None, "meta_sha256": None,
+    })
+    # Evaluation covers 29 transitions in 8 windows; training keeps its legacy 7 full windows.
+    seq_len, batch_size = 4, 3
 
     val = dsmod.make_dataloader("ds", "validation", seq_len, batch_size, shuffle=False, drop_last=False)
     n_full = len(val.dataset)

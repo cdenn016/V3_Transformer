@@ -794,8 +794,8 @@ def run_cell(
         "data_sources": _data_source_identities(dataset),
     })
 
-    val_tpc = _tokens_per_char(dataset, "validation") or 1.0
-    test_tpc = _tokens_per_char(dataset, "test") or 1.0
+    val_tpc = _tokens_per_char(dataset, "validation")
+    test_tpc = _tokens_per_char(dataset, "test")
     t0 = time.perf_counter()
     losses = train(model, train_loader, cfg, n_steps=cfg.max_steps,
                    grad_clip=cfg.grad_clip,

@@ -133,6 +133,10 @@ def test_get_loader_threads_split_aware_shuffle_drop_last(monkeypatch) -> None:
         return object()                                      # a non-None sentinel get_loader caches
 
     monkeypatch.setattr(ablation, "make_dataloader", fake_make_dataloader)
+    monkeypatch.setattr(ablation, "cache_source_identity", lambda dataset, split: {
+        "format": "pt", "tokenizer_tag": "fixture", "size_bytes": len(split),
+        "sha256": "0" * 64, "meta": None, "meta_sha256": None,
+    })
     ablation._LOADER_CACHE.clear()
     ablation.get_loader("wikitext-103", 16, 4, "validation")
     ablation.get_loader("wikitext-103", 16, 4, "train", max_tokens=None)

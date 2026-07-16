@@ -12,6 +12,7 @@ so a gradient step on the priors improves inference end to end. Click-to-run: ed
 """
 
 import contextlib
+import json
 import logging
 import math
 import time
@@ -766,23 +767,24 @@ def evaluate(
 
     *,
     max_batches:     Optional[int]          = None,
-    tokens_per_char: float                  = 1.0,
+    tokens_per_char: Optional[float]        = None,
     device:          Optional[torch.device] = None,
-) -> Dict[str, float]:
-    r"""Token-weighted corpus evaluation. Returns ``{ce, ppl, bpc}`` (CE in nats).
+) -> Dict[str, Optional[float]]:
+    r"""Token-weighted corpus evaluation with distinct token and character bit metrics.
 
     .. math::
         \mathrm{CE} = \frac{\sum_b n_b\, \mathrm{ce}_b}{\sum_b n_b},\quad
         \mathrm{PPL} = e^{\min(\mathrm{CE},\,20)},\quad
-        \mathrm{BPC} = \frac{\mathrm{CE}}{\ln 2}\,\cdot\,\mathrm{tokens\_per\_char},
+        \mathrm{BPT} = \frac{\mathrm{CE}}{\ln 2},\quad
+        \mathrm{BPC} = \mathrm{BPT}\,\cdot\,\mathrm{tokens\_per\_char},
 
     with ``n_b`` the number of non-ignored (``!= -100``) target tokens in batch ``b``.
     Aggregating by token count (not per-batch mean) reproduces one cross-entropy over
     the concatenated corpus, including a partial last batch. ``tokens_per_char`` is the
     bits-per-CHARACTER correction (``n_tokens / n_codepoints`` from
-    :func:`vfe3.data.datasets.tokens_per_char`); the default 1.0 leaves the honest
-    bits-per-TOKEN value (correct for a character-level / synthetic stream, and the value
-    to pass when the char count is unavailable).
+    :func:`vfe3.data.datasets.tokens_per_char`). ``bits_per_token`` is always published under its
+    own name. When character normalization is unavailable, ``tokens_per_char=None`` leaves ``bpc``
+    null rather than silently relabeling bits per token as bits per character.
     """
     if device is None:
         device = model.prior_bank.mu_embed.device
@@ -804,10 +806,13 @@ def evaluate(
     finally:
         if was_training:
             model.train()
+    bits_per_token = ce / math.log(2.0)
     return {
-        "ce":  ce,
-        "ppl": math.exp(min(ce, 20.0)),
-        "bpc": (ce / math.log(2.0)) * tokens_per_char,
+        "ce":             ce,
+        "ppl":            math.exp(min(ce, 20.0)),
+        "bits_per_token": bits_per_token,
+        "bpc":            (bits_per_token * tokens_per_char
+                           if tokens_per_char is not None else None),
     }
 
 
@@ -1013,6 +1018,52 @@ class TrainingTerminalState(NamedTuple):
     rng_state:            Dict[str, object]
 
 
+def _loader_data_identity(
+    loader:     object,
+    vocab_size: int,
+) -> Dict[str, object]:
+    r"""Return the exact data contract bound to a shuffled iterator cursor.
+
+    Production loaders receive a cache-backed contract from ``make_dataloader``. A direct
+    ``TokenWindows`` loader used by tests or library callers receives an equivalent in-memory
+    contract whose bounded canonical digest still prevents splicing a different tensor at resume.
+    """
+    dataset = getattr(loader, "dataset", None)
+    identity = getattr(dataset, "data_identity", None)
+    if identity is not None:
+        normalized = json.loads(json.dumps(identity, sort_keys=True, separators=(",", ":")))
+        if normalized.get("model_vocab_size") != int(vocab_size):
+            raise RuntimeError(
+                "loader data identity model vocabulary does not match the active config")
+        return normalized
+
+    tokens = getattr(dataset, "tokens", None)
+    if not isinstance(tokens, torch.Tensor):
+        raise RuntimeError(
+            "exact shuffled resume requires loader.dataset.tokens or a cache-backed data identity")
+    from vfe3.run_artifacts import _loader_token_content_identity
+    digest, n_tokens = _loader_token_content_identity(loader)
+    assert digest is not None and n_tokens is not None
+    return {
+        "schema_version":       1,
+        "dataset":              f"in-memory:{type(dataset).__module__}.{type(dataset).__qualname__}",
+        "split":                "train",
+        "tokenizer_tag":        None,
+        "tokenizer_encoding":   None,
+        "tokenizer_vocab_size": None,
+        "model_vocab_size":     int(vocab_size),
+        "max_tokens":           None,
+        "source": {
+            "format":        "tensor",
+            "tokenizer_tag": None,
+            "size_bytes":    int(tokens.numel()) * int(tokens.element_size()),
+            "sha256":        digest,
+            "meta":          {"n_tokens": n_tokens, "dtype": str(tokens.dtype)},
+            "meta_sha256":   None,
+        },
+    }
+
+
 def _training_cursor_fields(
     completed_step:  int,
     steps_per_epoch: int,
@@ -1043,7 +1094,7 @@ def train(
     log_interval:    Optional[int]            = None,
     eval_interval:   Optional[int]            = None,
     val_loader:      Optional[Iterable]       = None,
-    tokens_per_char: float                    = 1.0,    # val BPC char-correction (1.0 = bits/token)
+    tokens_per_char: Optional[float]           = None,   # None -> BPC unavailable; BPT remains defined
     device:          Optional[torch.device]   = None,
     logger:          Optional[logging.Logger] = None,
     artifacts:       Optional["RunArtifacts"] = None,
@@ -1097,6 +1148,10 @@ def train(
     loader_sampler = getattr(loader, "sampler", None)
     shuffled_loader = isinstance(loader_sampler, torch.utils.data.RandomSampler)
     loader_generator = getattr(loader, "generator", None)
+    loader_data_identity = (
+        _loader_data_identity(loader, cfg.vocab_size)
+        if isinstance(loader_generator, torch.Generator) else None
+    )
     resume_data_state: DataStateBuffer = {}
     if (resume_path is not None and shuffled_loader
             and not isinstance(loader_generator, torch.Generator)):
@@ -1122,7 +1177,8 @@ def train(
         start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
                                      scaler=scaler, cfg=cfg, ema=ema, artifacts=artifacts,
                                      metropolis_generator=metro_gen,
-                                     data_state=resume_data_state)
+                                     data_state=resume_data_state,
+                                     expected_data_identity=loader_data_identity)
         if shuffled_loader and not resume_data_state:
             raise RuntimeError(
                 "exact shuffled resume requires checkpoint data_state; this checkpoint predates "
@@ -1147,7 +1203,11 @@ def train(
     if cfg.decode_unigram_prior:
         _tok = getattr(getattr(loader, "dataset", None), "tokens", None)
         if _tok is not None:
-            _counts = torch.bincount(_tok.reshape(-1), minlength=cfg.vocab_size).to(torch.float32)
+            from vfe3.run_artifacts import _bincount_token_chunks
+            _counts = _bincount_token_chunks(
+                _tok,
+                vocab_size=cfg.vocab_size,
+            ).to(torch.float32)
             model.prior_bank.set_unigram_log_prior(_counts.to(device))
         else:
             import warnings
@@ -1192,7 +1252,9 @@ def train(
     epoch = 0
     batches_consumed = 0
     if resume_data_state:
-        required_data_state = {"epoch_start_generator_state", "batches_consumed", "epoch"}
+        required_data_state = {
+            "epoch_start_generator_state", "batches_consumed", "epoch", "data_identity",
+        }
         missing_data_state = required_data_state - resume_data_state.keys()
         if missing_data_state:
             raise RuntimeError(
@@ -1224,7 +1286,7 @@ def train(
         artifacts is not None and bool(eval_interval) and val_loader is not None
     )
     timer = TrainingTimer(device) if timing_enabled else None
-    last_val: Dict[str, float] = {}                  # most recent validation, carried into each CSV row
+    last_val: Dict[str, Optional[float]] = {}        # most recent validation, carried into each CSV row
     last_val_diag: Dict[str, float] = {k: float("nan") for k in _VAL_DIAG_KEYS}   # held-out probes, carried forward
     for step in _step_indices():
         try:
@@ -1296,10 +1358,14 @@ def train(
                 step + 1, n_steps, losses[-1], ce, d["attn_entropy"],
                 train_timing.train_steps_per_s, math.exp(min(ce, 20.0)),
             )
+            bit_value = ce / math.log(2.0)
+            bit_label = "BPT" if tokens_per_char is None else "BPC"
+            if tokens_per_char is not None:
+                bit_value *= tokens_per_char
             logger.info(
-                "    F: self %.4f | belief %.4f | entropy %.4f | total %.4f | eff_rank %.2f | BPC %.4f",
+                "    F: self %.4f | belief %.4f | entropy %.4f | total %.4f | eff_rank %.2f | %s %.4f",
                 d["self_coupling"], d["belief_coupling"], d["attention_entropy"],
-                d["total"], d["effective_rank"], (ce / math.log(2.0)) * tokens_per_char,
+                d["total"], d["effective_rank"], bit_label, bit_value,
             )
 
         if do_eval:
@@ -1310,8 +1376,10 @@ def train(
                          tokens_per_char=tokens_per_char, device=device)
             logger.info(" \n Validation @ step %d:", step + 1)
             logger.info(                                         # val has no separate loss; CE is the loss
-                "\n       CE: %.4f \n      Val PPL: %.1f \n       BPC: %.4f \n\n",
-                m["ce"], m["ppl"], m["bpc"],
+                "\n       CE: %.4f \n      Val PPL: %.1f \n       BPT: %.4f%s \n\n",
+                m["ce"], m["ppl"], m["bits_per_token"],
+                (f"\n       BPC: {float(m['bpc']):.4f}" if m["bpc"] is not None
+                 else "\n       BPC: unavailable"),
             )
             # Sample text directly below the BPC value. ``generate_samples=False`` forces the pure
             # silent path (no generation, no Sample line). Otherwise the decoder is an explicit
@@ -1331,7 +1399,12 @@ def train(
                     logger.info("       Sample: %r  ->  %r\n", p_txt, c_txt)
                 except Exception as exc:                                          # never let sampling kill training
                     logger.warning("       (sample generation failed: %s)", exc)
-            last_val = {"ce": m["ce"], "ppl": m["ppl"], "bpc": m["bpc"]}
+            last_val = {
+                "ce":             m["ce"],
+                "ppl":            m["ppl"],
+                "bits_per_token": m["bits_per_token"],
+                "bpc":            m["bpc"],
+            }
             if artifacts is not None:
                 # Held-out per-eval probes (validation F decomposition, attention-map structure,
                 # E-step convergence certificate, per-position loss). Best-effort: a replay error
@@ -1366,6 +1439,7 @@ def train(
                 "epoch_start_generator_state": epoch_start_generator_state,
                 "batches_consumed":            batches_consumed,
                 "epoch":                       epoch,
+                "data_identity":               loader_data_identity,
             } if epoch_start_generator_state is not None else None)
             artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler, ema=ema,
                                       metropolis_generator=metro_gen,
@@ -1394,7 +1468,10 @@ def train(
                 "lr_phi":            float(lrs[2]),           # group 2 = phi_embed         (m_phi_lr)
                 "val_ce":            last_val["ce"]  if do_eval else float("nan"),  # eval-cadence: fresh on
                 "val_ppl":           last_val["ppl"] if do_eval else float("nan"),  # an eval step (last_val just
-                "val_bpc":           last_val["bpc"] if do_eval else float("nan"),  # refreshed), blank otherwise
+                "val_bits_per_token": (last_val["bits_per_token"] if do_eval
+                                       else float("nan")),
+                "val_bpc":           (last_val["bpc"] if do_eval and last_val["bpc"] is not None
+                                      else float("nan")),
                 "attn_entropy":       d["attn_entropy"],
                 "self_coupling":      d["self_coupling"]     / n_tok,   # alpha-regularized F self-term sum_i[alpha_i D + R(alpha_i)]
                 "self_divergence":    d["self_divergence"]   / n_tok,   # raw sum_i D(q_i||p_i) drift; == self_coupling only at lambda_alpha_mode='constant'
@@ -1571,6 +1648,7 @@ def train(
             "epoch_start_generator_state": epoch_start_generator_state,
             "batches_consumed":            batches_consumed,
             "epoch":                       epoch,
+            "data_identity":               loader_data_identity,
         } if epoch_start_generator_state is not None else None)
         terminal_callback(
             TrainingTerminalState(

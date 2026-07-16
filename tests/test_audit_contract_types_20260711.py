@@ -49,11 +49,13 @@ def test_shared_contracts_pin_only_the_cited_mutable_dict_schemas() -> None:
             "epoch_start_generator_state": torch.Tensor,
             "batches_consumed": int,
             "epoch": int,
+            "data_identity": Dict[str, object],
         },
         contracts.DataState: {
             "epoch_start_generator_state": torch.Tensor,
             "batches_consumed": int,
             "epoch": int,
+            "data_identity": Dict[str, object],
         },
     }
 
